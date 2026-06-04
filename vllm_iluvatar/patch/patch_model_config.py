@@ -51,5 +51,20 @@ def apply() -> None:
                 arch,
             )
 
+        # iluvatar default: cuda graph is OFF (enforce_eager=True) unless the
+        # user opts in via VLLM_ENFORCE_CUDA_GRAPH, mirroring the internal
+        # fork's ModelConfig.__post_init__ tail.
+        import os
+
+        enforce_cuda_graph = os.environ.get("VLLM_ENFORCE_CUDA_GRAPH", None)
+        if enforce_cuda_graph is not None and enforce_cuda_graph in ("1", "y", "Y"):
+            self.enforce_eager = False
+        else:
+            self.enforce_eager = True
+            logger.warning_once(
+                "vllm-iluvatar: export VLLM_ENFORCE_CUDA_GRAPH=1 to enable "
+                "cuda graph; for now --enforce-eager is forced on."
+            )
+
     patched_post_init._ilu_patched = True  # type: ignore[attr-defined]
     ModelConfig.__post_init__ = patched_post_init  # type: ignore[assignment]

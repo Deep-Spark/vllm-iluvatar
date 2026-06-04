@@ -26,4 +26,7 @@ include = ["vllm_iluvatar*"]
 exclude = ["tests*"]
 
 [tool.setuptools.package-data]
-vllm_iluvatar = ["_replacements/*.py"]
+vllm_iluvatar = [
+    "_replacements/*.py",
+    "_vllm_overrides/**/*.py",
+]

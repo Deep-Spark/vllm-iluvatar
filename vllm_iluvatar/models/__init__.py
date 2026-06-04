@@ -1,28 +1,45 @@
-"""Register the ilu DeepSeek-V4 architecture with vLLM's ModelRegistry."""
+"""Register iluvatar model architectures with vLLM's ModelRegistry.
+
+Community vLLM already registers the stock architectures (Qwen3, DeepseekV2/V3,
+GLM4Moe, GptOss, Step3p5, ...) by name; because the override finder redirects
+those model modules to our mirror-tree copies, those archs automatically use
+the iluvatar implementations -- no re-registration needed.
+
+Only genuinely NEW architecture names have to be registered here. The internal
+fork adds exactly one::
+
+    IluDeepseekV4ForCausalLM -> vllm.models.deepseek_v4:IluDeepseekV4ForCausalLM
+
+The target module path is a stock ``vllm.*`` path served by the override
+finder, so the registration uses the full internal implementation.
+"""
 
 from __future__ import annotations
 
+# arch name -> "module:ClassName" (lazy; resolved on first checkpoint load).
+_ILU_MODELS = {
+    "IluDeepseekV4ForCausalLM": ("vllm.models.deepseek_v4:IluDeepseekV4ForCausalLM"),
+}
+
 
 def register_model() -> None:
-    """Add ``IluDeepseekV4ForCausalLM`` to ``ModelRegistry``.
-
-    Uses a fully-qualified string path so the model module (which pulls
-    in ixformer, the new attention layer and the W4A8 quant config) is
-    only imported when a checkpoint with this architecture is actually
-    loaded.
-    """
     from vllm import ModelRegistry
     from vllm.logger import init_logger
 
     logger = init_logger(__name__)
 
-    name = "IluDeepseekV4ForCausalLM"
-    if name in ModelRegistry.get_supported_archs():
-        logger.info("vllm-iluvatar: %s already registered; skipping", name)
-        return
+    supported = set(ModelRegistry.get_supported_archs())
+    registered = []
+    for name, target in _ILU_MODELS.items():
+        if name in supported:
+            continue
+        ModelRegistry.register_model(name, target)
+        registered.append(name)
 
-    ModelRegistry.register_model(
-        name,
-        "vllm_iluvatar.models.ilu_deepseek_v4:IluDeepseekV4ForCausalLM",
-    )
-    logger.info("vllm-iluvatar: registered model architecture %s", name)
+    if registered:
+        logger.info(
+            "vllm-iluvatar: registered model architectures %s",
+            ", ".join(registered),
+        )
+    else:
+        logger.info("vllm-iluvatar: model architectures already registered")

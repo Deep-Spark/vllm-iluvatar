@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm_iluvatar"
+description = "Iluvatar CoreX plugin package for vLLM (out-of-tree platform plugin)"
+requires-python = ">=3.10"
+# torch / ixformer are provided by the corex environment, not installed via pip.
+dependencies = []
+dynamic = ["version"]
+
+[project.entry-points."vllm.platform_plugins"]
+iluvatar = "vllm_iluvatar:register_platform"
+
+[project.entry-points."vllm.general_plugins"]
+iluvatar = "vllm_iluvatar:register_general"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vllm_iluvatar*"]
+
+[tool.ruff.lint.per-file-ignores]
+"vllm_iluvatar/version.py" = ["F401"]
+
+[tool.ruff.lint]
+select = [
+    # pycodestyle
+    "E",
+    # Pyflakes
+    "F",
+    # pyupgrade
+    "UP",
+    # flake8-bugbear
+    "B",
+    # flake8-implicit-str-concat
+    "ISC",
+    # flake8-simplify
+    "SIM",
+    # isort
+    "I",
+    # flake8-logging-format
+    "G",
+]
+ignore = [
+    # star imports
+    "F405", "F403",
+    # lambda expression assignment
+    "E731",
+    # zip without `strict=`
+    "B905",
+    # Loop control variable not used within loop body
+    "B007",
+    # f-string format
+    "UP032",
+]
+
+[tool.ruff.format]
+docstring-code-format = true

@@ -1,2 +1,0 @@
-# Runtime deps are provided by the surrounding vLLM/Iluvatar install
-# (torch, ixformer, ixinfer, etc.). This plugin does not pin them.

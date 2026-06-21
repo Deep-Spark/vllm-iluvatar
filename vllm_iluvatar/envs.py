@@ -175,6 +175,36 @@ _ILU_ENV_ALIASES: dict[str, Callable[[], Any]] = {
 }
 
 
+_TRUE_VALS = ("1", "true", "yes", "on")
+
+
+def _bool_reader(name: str, default: str) -> Callable[[], bool]:
+    return lambda: os.environ.get(name, default).strip().lower() in _TRUE_VALS
+
+
+# Iluvatar plugin control vars that are read directly via os.environ where they
+# are used (NOT through this module) — registered here only so that
+# vllm.envs.validate_environ() recognises them and does not warn (or, with
+# fail_on_environ_validation, hard-fail) about "Unknown vLLM environment
+# variable". Sources:
+#   VLLM_ILU_PATCH_CHECK_SIGNATURE / _CHECK_FINGERPRINT / _VERBOSE
+#       -> vllm_iluvatar/ilu_patch/general_patch.py
+#   VLLM_ILUVATAR_ENABLE_STARTUP_PATCH
+#       -> vllm_iluvatar/__init__.py (STARTUP_PATCH_ENV)
+_ILU_GUARD_ENV_VARS: dict[str, Callable[[], Any]] = {
+    "VLLM_ILU_PATCH_CHECK_SIGNATURE": _bool_reader(
+        "VLLM_ILU_PATCH_CHECK_SIGNATURE", "1"
+    ),
+    "VLLM_ILU_PATCH_CHECK_FINGERPRINT": _bool_reader(
+        "VLLM_ILU_PATCH_CHECK_FINGERPRINT", "1"
+    ),
+    "VLLM_ILU_PATCH_VERBOSE": _bool_reader("VLLM_ILU_PATCH_VERBOSE", "0"),
+    "VLLM_ILUVATAR_ENABLE_STARTUP_PATCH": _bool_reader(
+        "VLLM_ILUVATAR_ENABLE_STARTUP_PATCH", "0"
+    ),
+}
+
+
 def apply() -> None:
     """Inject Iluvatar env defaults and register canonical + legacy readers."""
     for key, value in _ILU_DEFAULTS.items():
@@ -185,8 +215,10 @@ def apply() -> None:
 
     envs.environment_variables.update(_ILU_ENV_VARS)
     envs.environment_variables.update(_ILU_ENV_ALIASES)
+    envs.environment_variables.update(_ILU_GUARD_ENV_VARS)
     logger.debug(
-        "ILU envs: registered %d canonical + %d legacy-alias env vars",
+        "ILU envs: registered %d canonical + %d legacy-alias + %d guard env vars",
         len(_ILU_ENV_VARS),
         len(_ILU_ENV_ALIASES),
+        len(_ILU_GUARD_ENV_VARS),
     )

@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Corresponds to: vllm/distributed/stateless_coordinator.py
+
+ILU general-plugins patch (auto-discovered and applied via ``register()`` from
+``vllm_iluvatar.ilu_patch.apply_general_patches`` during ``register_general``).
+
+This patch is a pure module-global rebind with no override implementation of its
+own, so it is a single ``*_patch.py`` module (no impl sibling).
+
+Target   : vllm.distributed.stateless_coordinator (module-global
+           ``CudaCommunicator`` symbol used by StatelessGroupCoordinator.__init__)
+Baseline : main_e0871ad2259
+Why      : the stateless / elastic-EP path hardcodes CudaCommunicator and asserts
+           ``device_comm_cls == CudaCommunicator``, rejecting OOT communicators.
+           IluPlatform returns IluCommunicator, so the assert would fail.
+How      : rebind the module-global ``CudaCommunicator`` name to IluCommunicator
+           (zero method-body copy). Both the assert (``device_comm_cls ==
+           CudaCommunicator``) and the construction (``CudaCommunicator(...)``)
+           then resolve to IluCommunicator. The whole __init__ body keeps coming
+           from community and tracks upstream automatically.
+Scope    : only when enable_elastic_ep (StatelessGroupCoordinator is constructed).
+Remove   : when upstream stateless path instantiates the resolved
+           device_comm_cls(...) (then this rebind degrades to a no-op).
+"""
+
+from __future__ import annotations
+
+import logging
+
+from vllm_iluvatar.ilu_patch import general_patch as p
+
+logger = logging.getLogger(__name__)
+
+
+def register() -> None:
+    """Register the CudaCommunicator -> IluCommunicator rebind.
+
+    Delegates to ``general_patch.register_once``; auto-discovered and invoked by
+    ``apply_general_patches()``.
+    """
+    p.register_once(__name__, _apply, detail="CudaCommunicator rebind")
+
+
+def _apply() -> None:
+    import vllm.distributed.stateless_coordinator as _m
+
+    if not hasattr(_m, "CudaCommunicator"):
+        logger.warning(
+            "ILU stateless_coordinator patch: community module has no "
+            "'CudaCommunicator' symbol; skipping rebind."
+        )
+        return
+
+    from vllm_iluvatar.distributed.device_communicators.ilu_communicator import (
+        IluCommunicator,
+    )
+
+    # [ILU override] stateless_coordinator.CudaCommunicator -> IluCommunicator
+    # delta: make the hardcoded CudaCommunicator assert/construction use the
+    # Iluvatar communicator without copying StatelessGroupCoordinator.__init__.
+    _m.CudaCommunicator = IluCommunicator

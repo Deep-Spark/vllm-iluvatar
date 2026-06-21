@@ -97,12 +97,16 @@ def register_general() -> None:
     register_platform(); the guard here is purely defensive.
 
     NOTE: the custom_ops override is applied earlier via the import-hook
-    (register_platform -> _load_import_compat_patch), NOT here, so this entry is
-    currently a near-empty placeholder for future late-phase patches.
+    (register_platform -> _load_import_compat_patch), NOT here. This entry
+    applies the late-phase (general_plugins) patches that only need an
+    initialised vLLM — distributed function patches auto-discovered from the
+    mirror tree (see vllm_iluvatar.ilu_patch.apply_general_patches).
     """
     try:
         import ixformer  # noqa: F401
     except ImportError:
         return
 
-    import vllm_iluvatar.ilu_patch  # noqa: F401 — late-phase patch registration center
+    from vllm_iluvatar.ilu_patch import apply_general_patches
+
+    apply_general_patches()

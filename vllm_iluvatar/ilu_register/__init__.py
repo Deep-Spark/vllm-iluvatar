@@ -47,6 +47,8 @@ logger = logging.getLogger(__name__)
 # Op packages register via import-time decorators (no hook).
 _OOT_OP_PACKAGES = [
     "vllm_iluvatar.model_executor.layers",
+    # Quantization configs register via @register_quantization_config at import.
+    "vllm_iluvatar.model_executor.layers.quantization",
 ]
 # Model packages register via a module-level ``register_model()`` hook.
 _OOT_MODEL_PACKAGES = [

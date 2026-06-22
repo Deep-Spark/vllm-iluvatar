@@ -79,6 +79,10 @@ def register_platform() -> str:
     os.environ.setdefault(STARTUP_PATCH_ENV, "1")
     _load_import_compat_patch()
 
+    from vllm_iluvatar.platforms.ilu_platform import register_attention_backends
+
+    register_attention_backends()
+
     # Inject Iluvatar env defaults + canonical/legacy readers (needs vllm.envs,
     # so it is done here rather than at .pth-time startup).
     from vllm_iluvatar.envs import apply as _apply_ilu_envs

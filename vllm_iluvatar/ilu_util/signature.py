@@ -108,3 +108,83 @@ def validate_patch_signatures(
             raise SignatureMismatchError(msg)
         else:
             logger.warning(msg)
+
+
+def validate_oot_override(
+    community_cls: type,
+    ilu_cls: type,
+    method_name: str,
+    strict: bool = True,
+) -> None:
+    """Check an OOT subclass method is *prefix-compatible* with the community one.
+
+    OOT subclasses (``@RMSNorm.register_oot`` etc.) replace the community class
+    wholesale; there is no copied method body, so no fingerprint applies. We only
+    guard the call interface with a positional-prefix rule:
+
+      1. The override has at least as many parameters as the community method.
+      2. The first N parameters (N = community parameter count) align by
+         position — same names, same order.
+      3. Any extra trailing parameters must have defaults (so community callers
+         that omit them still work).
+
+    This admits intentional Iluvatar extensions appended at the tail (e.g.
+    ``GemmaRMSNorm.forward_cuda``'s ``fused_int8_quant`` / ``return_origin_output``)
+    without a whitelist, while still catching real interface drift.
+
+    If ``community_cls`` has no such method (e.g. a plugin-only op), there is
+    nothing to compare and the check is skipped.
+
+    Args:
+        community_cls: The upstream base class.
+        ilu_cls:       The Iluvatar OOT subclass.
+        method_name:   Method to compare (e.g. "forward_cuda").
+        strict:        If True, raise on mismatch; else log a WARNING.
+
+    Raises:
+        SignatureMismatchError: When strict=True and the prefix rule is violated.
+    """
+    comm_fn = getattr(community_cls, method_name, None)
+    ilu_fn = ilu_cls.__dict__.get(method_name)
+
+    if comm_fn is None or ilu_fn is None:
+        # Plugin-only method or not actually overridden — nothing to compare.
+        return
+
+    try:
+        comm_params = list(inspect.signature(comm_fn).parameters.values())
+        ilu_params = list(inspect.signature(ilu_fn).parameters.values())
+    except (ValueError, TypeError):
+        return
+
+    n = len(comm_params)
+    errors: list[str] = []
+
+    if len(ilu_params) < n:
+        errors.append(
+            f"  override has {len(ilu_params)} params, fewer than community {n}"
+        )
+    else:
+        for i in range(n):
+            if ilu_params[i].name != comm_params[i].name:
+                errors.append(
+                    f"  position {i}: community '{comm_params[i].name}' != "
+                    f"override '{ilu_params[i].name}'"
+                )
+        for extra in ilu_params[n:]:
+            if extra.default is inspect.Parameter.empty:
+                errors.append(
+                    f"  trailing param '{extra.name}' has no default — "
+                    f"community callers cannot omit it"
+                )
+
+    if errors:
+        msg = (
+            f"ILU OOT signature check failed for "
+            f"{ilu_cls.__name__}.{method_name} vs "
+            f"{community_cls.__name__}.{method_name} "
+            f"(must be prefix-compatible):\n" + "\n".join(errors)
+        )
+        if strict:
+            raise SignatureMismatchError(msg)
+        logger.warning(msg)

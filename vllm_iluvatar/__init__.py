@@ -98,9 +98,19 @@ def register_general() -> None:
 
     NOTE: the custom_ops override is applied earlier via the import-hook
     (register_platform -> _load_import_compat_patch), NOT here. This entry
-    applies the late-phase (general_plugins) patches that only need an
-    initialised vLLM — distributed function patches auto-discovered from the
-    mirror tree (see vllm_iluvatar.ilu_patch.apply_general_patches).
+    applies the late-phase (general_plugins) work that only needs an initialised
+    vLLM, in order:
+
+      1. apply_general_patches()    — runtime monkey-patches auto-discovered from
+                                      the mirror tree (vllm_iluvatar.ilu_patch).
+      2. apply_oot_registrations()  — official OOT extension points
+                                      (CustomOp.register_oot / register_model)
+                                      auto-discovered from the model_executor
+                                      mirror tree (vllm_iluvatar.ilu_register).
+
+    Patches run first so any monkey-patched symbols are in place before the OOT
+    modules import. Both finish before the model is loaded, which is when
+    register_oot / register_model take effect.
     """
     try:
         import ixformer  # noqa: F401
@@ -108,5 +118,7 @@ def register_general() -> None:
         return
 
     from vllm_iluvatar.ilu_patch import apply_general_patches
+    from vllm_iluvatar.ilu_register import apply_oot_registrations
 
     apply_general_patches()
+    apply_oot_registrations()

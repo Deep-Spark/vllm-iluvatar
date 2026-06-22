@@ -27,6 +27,44 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_ATTN_BACKENDS_REGISTERED = False
+
+
+def register_attention_backends() -> None:
+    """Override community AttentionBackendEnum paths with Iluvatar backends.
+
+    Backend classes report community enum names via ``get_name()`` so
+    ``AttentionBackendEnum[backend.get_name()]`` in attention.py keeps working
+    without custom ILU_* enum members in the community registry.
+    """
+    global _ATTN_BACKENDS_REGISTERED
+    if _ATTN_BACKENDS_REGISTERED:
+        return
+
+    from vllm.v1.attention.backends.registry import (
+        AttentionBackendEnum,
+        register_backend,
+    )
+
+    register_backend(
+        AttentionBackendEnum.FLASH_ATTN,
+        "vllm.v1.attention.backends.ilu_flash_attn.IluFlashAttentionBackend",
+    )
+    register_backend(
+        AttentionBackendEnum.FLASHMLA,
+        "vllm.v1.attention.backends.mla.ilu_mla.IluMLABackend",
+    )
+    register_backend(
+        AttentionBackendEnum.FLASHMLA_SPARSE,
+        "vllm.v1.attention.backends.mla.ilu_flashmla_sparse.IluFlashMLASparseBackend",
+    )
+    register_backend(
+        AttentionBackendEnum.FLASHMLA_SPARSE_DSV4,
+        "vllm.v1.attention.backends.mla.ilu_flashmla_sparse."
+        "IluDeepseekV4FlashMLASparseBackend",
+    )
+    _ATTN_BACKENDS_REGISTERED = True
+
 
 def _make_iluvatar_platform():
     """Build IluPlatform at first import of this module."""
@@ -53,8 +91,6 @@ def _make_iluvatar_platform():
         logger.debug("ILU: re-enabled cudnn sdp (undoing cuda.py disable)")
     except Exception:
         pass
-
-    from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
     class IluPlatform(CudaPlatform):
         """Iluvatar GPU platform.
@@ -109,6 +145,10 @@ def _make_iluvatar_platform():
             attn_selector_config: AttentionSelectorConfig,
             num_heads: int | None = None,
         ) -> str:
+            from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+            register_attention_backends()
+
             if selected_backend is not None:
                 logger.info("Using %s backend (user-selected).", selected_backend)
                 return selected_backend.get_path()
@@ -118,12 +158,12 @@ def _make_iluvatar_platform():
 
             if use_mla:
                 backend = (
-                    AttentionBackendEnum.ILU_FLASHMLA_SPARSE
+                    AttentionBackendEnum.FLASHMLA_SPARSE
                     if use_sparse
-                    else AttentionBackendEnum.ILU_MLA
+                    else AttentionBackendEnum.FLASHMLA
                 )
             else:
-                backend = AttentionBackendEnum.ILU_FLASH_ATTN
+                backend = AttentionBackendEnum.FLASH_ATTN
 
             logger.info_once("Using %s attention backend.", backend.name)
             return backend.get_path()

@@ -122,6 +122,42 @@ def _make_iluvatar_platform():
             pass
 
         @classmethod
+        def import_ir_kernels(cls) -> None:
+            # fork interface.py: keep the community providers (vllm_c backs the
+            # rms_norm fallback via torch.ops._C) AND register the Iluvatar
+            # provider. This is the official hook that makes "iluvatar" visible
+            # before KernelConfig.ir_op_priority is validated/applied.
+            import vllm.kernels  # noqa: F401
+
+            import vllm_iluvatar.kernels  # noqa: F401  registers "iluvatar"
+
+        @classmethod
+        def get_default_ir_op_priority(cls, vllm_config):
+            # fork cuda.py get_default_ir_op_priority: prepend the "iluvatar"
+            # provider so ir.ops.{rms_norm,fused_add_rms_norm} dispatch to
+            # ixformer first. Under inductor compilation, defer to native (let
+            # inductor fuse), mirroring the community CUDA default.
+            from vllm.config.compilation import CompilationMode
+            from vllm.config.kernel import IrOpPriorityConfig
+
+            cc = vllm_config.compilation_config
+            using_inductor = (
+                cc.backend == "inductor" and cc.mode != CompilationMode.NONE
+            )
+            if using_inductor:
+                return IrOpPriorityConfig.with_default(["native"])
+            # rms_norm keeps vllm_c as a fallback (its torch.ops._C.rms_norm is
+            # provided by vllm_iluvatar._C); fused_add_rms_norm drops vllm_c
+            # because community vllm_c.fused_add_rms_norm calls
+            # torch.ops._C.fused_add_rms_norm, which the plugin _C does not
+            # register.
+            return IrOpPriorityConfig.with_default(
+                ["iluvatar", "native"],
+                rms_norm=["iluvatar", "vllm_c", "native"],
+                fused_add_rms_norm=["iluvatar", "native"],
+            )
+
+        @classmethod
         def opaque_attention_op(cls) -> bool:
             # fork cuda.py: True -> False.
             return False

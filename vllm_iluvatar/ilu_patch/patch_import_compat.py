@@ -100,6 +100,19 @@ def _register_import_hooks() -> None:
     import vllm_iluvatar.ilu_patch.patch_custom_ops  # noqa: F401
 
 
+def _load_native_torch_ops() -> None:
+    # Import the native ``vllm_iluvatar._C`` extension so its TORCH_LIBRARY static
+    # registrations populate ``torch.ops._C.{rms_norm, weak_ref_tensor,
+    # get_cuda_view_from_cpu_tensor}`` BEFORE unmodified community code
+    # (vllm/kernels/vllm_c.py, vllm/utils/torch_utils.py) first calls them.
+    # Non-fatal in non-strict mode: a missing build degrades gracefully (the
+    # community call would then raise with a clear torch error), and dev hosts
+    # without the compiled extension still import the plugin.
+    from vllm_iluvatar.ilu_util.torch_ops_c import load_native_ops
+
+    load_native_ops(strict=False)
+
+
 def apply() -> None:
     """Apply all early compat shims.  Idempotent and defensive."""
     global _applied
@@ -111,6 +124,7 @@ def apply() -> None:
         _stub_symmetric_memory()
         _disable_unsupported_symmetric_memory()
         _register_import_hooks()
+        _load_native_torch_ops()
     except Exception:
         # Compat shims must never break interpreter / vLLM startup.
         pass

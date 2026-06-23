@@ -51,8 +51,11 @@ _OOT_OP_PACKAGES = [
     "vllm_iluvatar.model_executor.layers.quantization",
 ]
 # Model packages register via a module-level ``register_model()`` hook.
+# Sub-packages are not auto-discovered (``_iter_package_modules`` skips them),
+# so multi-file model packages must be listed explicitly.
 _OOT_MODEL_PACKAGES = [
     "vllm_iluvatar.model_executor.models",
+    "vllm_iluvatar.model_executor.models.deepseek_v4",
 ]
 
 __all__ = ["apply_oot_registrations"]

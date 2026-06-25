@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("vllm_iluvatar._C")
-
-import torch  # noqa: E402
+# Native extension is a MANDATORY dep: a missing build is an environment error
+# (collection-time ImportError), never a silent skip.
+import torch
+import vllm_iluvatar._C  # noqa: F401
 
 if not torch.cuda.is_available():
     pytest.skip("Iluvatar/CUDA device required", allow_module_level=True)

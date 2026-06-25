@@ -4,8 +4,8 @@
 Mirrors the rms_norm portion of upstream tests/kernels/core/test_layernorm.py,
 but exercises the plugin's ``torch.ops._C.rms_norm`` directly (the operator the
 reverted community vllm/kernels/vllm_c.py calls) and checks it against a plain
-PyTorch reference. Requires an Iluvatar GPU + ixformer kernels, so it is skipped
-on CPU-only / non-native hosts.
+PyTorch reference. The native build is a mandatory dep (missing -> hard import
+error); only the actual GPU device is gated via skip.
 
 The plugin does NOT implement fused_add_rms_norm (the residual path is handled
 by the IluRMSNorm OOT override via vllm._custom_ops), so only the no-residual
@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import pytest
 
-# Native extension is mandatory; importing it registers torch.ops._C.rms_norm.
-pytest.importorskip("vllm_iluvatar._C")
-
-import torch  # noqa: E402
+# Native extension is a MANDATORY dep (importing it registers
+# torch.ops._C.rms_norm): a missing build is an environment error
+# (collection-time ImportError), never a silent skip.
+import torch
+import torch.library
+import vllm_iluvatar._C  # noqa: F401
 
 if not torch.cuda.is_available():
     pytest.skip("Iluvatar/CUDA device required", allow_module_level=True)
@@ -81,7 +83,7 @@ def test_rms_norm(
 @torch.inference_mode()
 def test_rms_norm_opcheck(dtype: torch.dtype) -> None:
     """torch.library.opcheck: schema/alias/fake consistency for rms_norm."""
-    opcheck = pytest.importorskip("torch.library").opcheck
+    opcheck = torch.library.opcheck
 
     torch.set_default_device("cuda:0")
     hidden_size = 768

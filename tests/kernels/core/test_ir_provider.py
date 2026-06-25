@@ -9,25 +9,24 @@ plus the IluPlatform overrides (import_ir_kernels / get_default_ir_op_priority):
   eager mode and falls back to "native" under inductor compilation.
 - numerics: the iluvatar impl matches the IR native reference (needs GPU + ixformer).
 
-ixformer / vllm are required to import the provider, so the module is skipped
-when they are unavailable; the numeric test additionally needs a CUDA device.
+ixformer / vllm are mandatory deps to import the provider: if either is missing
+the module fails to import (a hard error, not a skip). Only the numeric test is
+additionally gated on an actual CUDA device being present.
 """
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 
+# ixformer + vllm are MANDATORY deps of this build: a missing one is an
+# environment error (collection-time ImportError), never a silent skip.
+import ixformer  # noqa: F401
 import pytest
-
-# Importing the provider module pulls in ixformer + vllm.ir; skip if missing.
-pytest.importorskip("ixformer")
-pytest.importorskip("vllm")
-
-import torch  # noqa: E402
-from vllm import ir  # noqa: E402
+import torch
+from vllm import ir
 
 # Registers the "iluvatar" provider for both IR ops as an import side effect.
-import vllm_iluvatar.kernels  # noqa: E402,F401
+import vllm_iluvatar.kernels  # noqa: F401
 
 
 def test_provider_registered() -> None:

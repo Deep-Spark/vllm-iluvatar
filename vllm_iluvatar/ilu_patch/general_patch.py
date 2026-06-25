@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import sys
 import textwrap
 from collections.abc import Callable
 
@@ -122,6 +123,39 @@ def check_fingerprint(
         raise RuntimeError(
             f"ILU patch: community {symbol} source changed vs baseline. {resync_hint}"
         )
+
+
+def rebind_module_func(module: object, name: str, new_obj: object) -> None:
+    """Rebind a module-level function override, propagating to copied refs.
+
+    ``setattr`` the override onto ``module``, then walk ``sys.modules`` and
+    replace any attribute ``name`` that still holds the *original* object (by
+    identity ``is``) within the same top-level package. This fixes
+    ``from module import name`` consumers that copied the reference into their
+    own namespace before the patch ran (a plain ``setattr`` on ``module`` would
+    miss them). Identity matching means homonymous-but-distinct symbols in
+    sibling modules are never touched.
+
+    Use this for *module-level free functions* whose upstream consumers use
+    ``from module import name``. Class methods only need ``setattr`` on the class
+    (instances resolve through it at call time); import-time-CALLED symbols
+    cannot be fixed here at all (the branch already ran) and must be handled via
+    an early shim / import hook instead.
+    """
+    old = getattr(module, name, None)
+    setattr(module, name, new_obj)
+    if old is None:
+        # New symbol injection: nothing previously imported it by reference.
+        return
+    top = getattr(module, "__name__", "").split(".", 1)[0]
+    if not top:
+        return
+    for mod in list(sys.modules.values()):
+        mod_name = getattr(mod, "__name__", "")
+        if not isinstance(mod_name, str) or not mod_name.startswith(top):
+            continue
+        if getattr(mod, name, None) is old:
+            setattr(mod, name, new_obj)
 
 
 _APPLIED: set[str] = set()

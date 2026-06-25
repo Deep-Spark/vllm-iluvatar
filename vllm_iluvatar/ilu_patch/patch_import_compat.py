@@ -24,6 +24,13 @@ Shims (no-ops on stock CUDA torch):
      during GroupCoordinator init.  We pre-inject a stub and force-disable
      symmetric-memory allreduce via ``VLLM_ALLREDUCE_USE_SYMM_MEM=0``.
 
+Then installs module *stand-in* shims (``_install_import_shims`` ->
+``import_shims.install_all``): whole community modules that would otherwise be
+imported at *import time* and fail on corex are replaced in ``sys.modules`` with
+ixformer-backed equivalents (e.g. ``vllm.vllm_flash_attn``, imported by the
+community fa_utils ``is_cuda()`` branch since IluPlatform is cuda-like).  Each
+stand-in mirrors the upstream module name under ``import_shims/``.
+
 Finally registers post-import splat hooks (``_register_import_hooks`` ->
 ``patch_custom_ops``): ILU overrides for community modules whose functions
 are called at *import time* (e.g. ``vllm._custom_ops`` used by ``w8a8_utils``
@@ -90,6 +97,19 @@ def _disable_unsupported_symmetric_memory() -> None:
         os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
 
 
+def _install_import_shims() -> None:
+    # Inject module *stand-in* shims into sys.modules BEFORE any deep
+    # ``import vllm``.  Unlike the attribute-level shims above, these replace a
+    # whole community module that would otherwise be imported at import-time and
+    # fail / pull NV-specific code on corex (e.g. vllm.vllm_flash_attn, imported
+    # by the community fa_utils ``is_cuda()`` branch — IluPlatform is cuda-like,
+    # so that branch runs).  Each stand-in lives in import_shims/ mirroring the
+    # upstream module name; install_all() auto-discovers and injects them.
+    from vllm_iluvatar.ilu_patch.import_shims import install_all
+
+    install_all()
+
+
 def _register_import_hooks() -> None:
     # Register post-import splat hooks (e.g. vllm._custom_ops) so ILU overrides
     # apply the moment the target community module finishes importing — early
@@ -123,6 +143,7 @@ def apply() -> None:
         _patch_torch_accelerator()
         _stub_symmetric_memory()
         _disable_unsupported_symmetric_memory()
+        _install_import_shims()
         _register_import_hooks()
         _load_native_torch_ops()
     except Exception:

@@ -28,7 +28,8 @@ vllm-iluvatar/
     ├── platforms/          # IluPlatform：Iluvatar OOT 平台 + attention backend 注册（见 §2.3、第 7 章）
     ├── distributed/        # 镜像 vllm/distributed/：通信器 + general patch 落点（见 §2.4、第 4 章）
     ├── model_executor/     # 镜像 vllm/model_executor/：算子 / 量化 / 模型 OOT 实现（见第 5、6、8 章）
-    ├── ilu_patch/          # 运行期挂接层：general patch 编排 + import hook（见第 3、4 章）
+    ├── v1/                 # 镜像 vllm/v1/：attention backend 能力函数 override + 接线（如 v1/attention/backends/fa_utils*，见第 4 章）
+    ├── ilu_patch/          # 运行期挂接层：general patch 编排 + import hook + 模块替身 shim（import_shims/，见第 3、4 章）
     ├── ilu_register/       # OOT 注册编排层：算子 register_oot + 量化 register_quantization_config + 模型 register_model（见第 5、6、8 章）
     └── ilu_util/           # 公共工具：签名 / 前缀兼容校验 + 原生算子加载器 torch_ops_c.py（见第 9 章）
 ```
@@ -63,7 +64,7 @@ iluvatar = "vllm_iluvatar:register_general"
 | 平台 / 通信器 | 官方 entry point + `get_device_communicator_cls()` 字符串解析 | `current_platform` 首次访问 |
 | Attention backend 覆盖 | `register_backend` 覆盖官方 `AttentionBackendEnum` 成员路径（见第 7 章） | `register_platform()` / `get_attn_backend_cls()` 时 |
 | 算子覆盖（`vllm._custom_ops`） | 自研 import hook（meta_path splat） | 目标模块 import 那一刻 |
-| 早期 torch/分布式兼容 shim | `.pth`（worker）+ `register_platform()`（主进程） | 深层 `import vllm` 之前 |
+| 早期兼容 shim（两类：属性级 compat shim + 模块替身 shim `import_shims/`，见第 3 章） | `.pth`（worker）+ `register_platform()`（主进程） | 深层 `import vllm` 之前 |
 | `torch.ops._C` 原生算子 | 自研 C++ 扩展（`TORCH_LIBRARY` 注册 `_C` 命名空间，见第 9 章） | 早期 `import vllm_iluvatar._C` 时（早于社区首次调用） |
 | IR provider 注册 / 优先级 | `IluPlatform.import_ir_kernels` 注册 `iluvatar` provider + `get_default_ir_op_priority` 设优先级（见第 10 章） | `VllmConfig` 初始化与 worker 启动时 |
 | 分布式 function 级覆盖 | general patch（`register_general()` 自动发现并应用，见第 4 章） | vLLM 初始化完成后 |
@@ -187,14 +188,26 @@ spawn worker 子进程路径:
 
 1. `_patch_torch_accelerator()`：把 vLLM 用到的 `torch.accelerator` 子集映射到 `torch.cuda` 等价物。
 2. `_stub_symmetric_memory()` + `_disable_unsupported_symmetric_memory()`：为 corex 上不完整的 `torch.distributed._symmetric_memory` 注入 stub,并置 `VLLM_ALLREDUCE_USE_SYMM_MEM=0`。
-3. `_register_import_hooks()`：`import vllm_iluvatar.ilu_patch.patch_custom_ops`，触发其注册 import hook（见 §3.5 与第 2.2 节）。
-4. `_load_native_torch_ops()`：`import vllm_iluvatar._C`,触发原生扩展的 `TORCH_LIBRARY` 静态注册,使 `torch.ops._C.{rms_norm, weak_ref_tensor, get_cuda_view_from_cpu_tensor}` 在社区 `vllm_c.py` / `torch_utils.py` 首次调用之前就绪（见第 9 章）。
+3. `_install_import_shims()`：调用 `import_shims.install_all()` 向 `sys.modules` 注入**模块替身 shim**（如 `vllm.vllm_flash_attn`）,在深层 `import vllm` 之前兜住那些会在 import-time 崩溃 / 拉起 NV 专有代码的整模块（见 §3.6）。
+4. `_register_import_hooks()`：`import vllm_iluvatar.ilu_patch.patch_custom_ops`，触发其注册 import hook（见 §3.5 与第 2.2 节）。
+5. `_load_native_torch_ops()`：`import vllm_iluvatar._C`,触发原生扩展的 `TORCH_LIBRARY` 静态注册,使 `torch.ops._C.{rms_norm, weak_ref_tensor, get_cuda_view_from_cpu_tensor}` 在社区 `vllm_c.py` / `torch_utils.py` 首次调用之前就绪（见第 9 章）。
 
 `apply()` 自身带 `_applied` 幂等守卫,且整体 `try/except` 包裹——兼容 shim 绝不能让解释器或 vLLM 启动失败。
 
 ### 3.5 算子覆盖的 import hook 机制
 
 `ilu_patch/import_hook.py` 实现了一个挂在 `sys.meta_path` 最前端的 finder：当目标模块（如 `vllm._custom_ops`）被 import 时，它先让真实 finder 构建 spec，再包裹 `exec_module`，在目标模块执行完毕（函数已定义）后立即触发回调。`patch_custom_ops.py` 在 import 时调用 `register("vllm._custom_ops", _patch_custom_ops)`；回调把 `_custom_ops.py` 的 `_ILU_OVERRIDES`（覆盖社区同名函数）与 `_ILU_ADDED`（新增函数）逐一 `setattr` 到社区模块，并在此之前完成签名校验。`_custom_ops.py`（及 ixformer）只在回调中惰性 import，使启动保持轻量且不强制平台解析。
+
+### 3.6 模块替身 shim（import_shims）
+
+§3.4 第 1、2 步的 `torch.accelerator` / `_symmetric_memory` 是**属性级 compat shim**——给一个已存在的模块补 / 改属性，inline 在 `patch_import_compat.py` 里。但有时需要替换的是**整个社区模块**：它在 import-time 就会崩溃或拉起 NV 专有代码，补属性救不了。这类**模块替身 shim** 统一归到 `ilu_patch/import_shims/` 子包,与属性级 compat shim 分开维护。
+
+- `import_shims/__init__.py` 的 `install_all()`：`pkgutil.iter_modules` 自动发现本包下每个 `*.py`,读取其 `SHIM_KEY`（要替身的 `sys.modules` 键）与 `build_module()`,若该键不在 `sys.modules` 则注入,并尽量绑定到已 import 的父包属性上。新增替身只需丢一个文件,编排不动。
+- 由 `patch_import_compat.apply()` 第 3 步 `_install_import_shims()` 在深层 `import vllm` **之前**调用。
+
+**示例 `import_shims/vllm_flash_attn.py`（fa_utils 的 import-time delta）**：`IluPlatform` 是 cuda-like（`_enum=CUDA`、`is_cuda()=True`,见 §5.4）,故社区 `vllm/v1/attention/backends/fa_utils.py` 会进 `if current_platform.is_cuda():` 分支,在 **import-time** 执行 `from vllm.vllm_flash_attn import flash_attn_varlen_func, get_scheduler_metadata`;而 corex 上 `vllm/vllm_flash_attn/__init__.py` 缺 `_vllm_fa2_C` / `_vllm_fa3_C` 会直接 `raise ImportError`。因此用模块替身在 import 前把 `sys.modules["vllm.vllm_flash_attn"]` 换成暴露 ixformer 版 `flash_attn_varlen_func` + `get_scheduler_metadata`(stub) 的替身——import-hook 的「import 后 splat」此处来不及（整模块在 import 那一刻就崩）。
+
+> 对比:成熟插件路线若用 OOT 平台（`is_cuda()=False`）会天然跳过该 cuda 分支、无需 shim。本插件选 cuda-like 路线以全面复用 CUDA 执行路径（见 §5.4）,模块替身 shim 即是该路线的必然配套。
 
 ---
 
@@ -218,14 +231,21 @@ spawn worker 子进程路径:
   有官方扩展点?
     -> 有: 用官方扩展点（platform plugin / 通信器字符串解析 / CustomOp.register_oot /
            ModelRegistry.register_model / entry point / envs）
-    -> 无: 目标符号是否在 import-time 就被调用?
-           -> 是（general patch 来不及）: 用 .pth import hook（第 3 章）
+    -> 无: 目标符号是否在 import-time 就被调用 / 绑定?
+           -> 是（general patch 来不及）:
+                整模块在 import 前不可用 / 会崩  -> import_shims 模块替身（§3.6）
+                符号在"已 import 的社区模块"里被调用 -> .pth import hook splat（§3.5）
            -> 否（初始化或运行期才调用）: 用 general patch（本章）
+                再按"符号消费方式"选改写落点（见下）
 ```
 
 - **首选官方扩展点**：platform plugin、`get_device_communicator_cls()` 字符串解析、`CustomOp.register_oot`、entry point、`envs` 等都不算 patch,优先走它们。
-- **必须运行期挂接时,优先 general patch,尽量避免 .pth**：`.pth` 在全局 site 启动期执行、影响面大、须 env-gate 才安全、调试困难、维护成本高（详见 §3.2）。只有「import-time 调用、general patch 来不及」才用 `.pth`。
+- **必须运行期挂接时,优先 general patch,尽量避免 .pth**：`.pth` 在全局 site 启动期执行、影响面大、须 env-gate 才安全、调试困难、维护成本高（详见 §3.2）。只有「import-time 调用、general patch 来不及」才用 `.pth` / import_shims。
 - **两类 patch 整体都要克制**：它们是运行期等价改写,随上游升级易碎;delta 越小越好,优先 rebind / wrapper,尽量不整方法 copy。
+- **general patch 内部按"符号消费方式"选改写落点**（决定 setattr 改哪里、要不要传播）：
+  - **类方法** → `setattr(cls, name, ...)`（实例经类解析;OOT 掉包同理）。
+  - **模块级自由函数、被 `from module import name` 消费** → `rebind_module_func`（传播改绑,见 §4.3）;只 setattr 目标模块会漏掉已被 `from-import` 拷走的引用。
+  - **import-time 绑定 / 调用** → 不属 general patch,回到上面的 import_shims / import hook。
 
 ### 4.2 patch 文件规则（对齐上游）
 
@@ -241,6 +261,7 @@ spawn worker 子进程路径:
 - **自动发现,无需手工编排**：落在 `_PATCH_PACKAGES`（默认 `vllm_iluvatar.distributed`）顶层、定义了 `register()` 的模块（即 `*_patch.py`）,会被 `apply_general_patches()` 自动扫描并调用（见 `ilu_patch/__init__.py`）;同目录的纯实现 `xxx.py`（无 `register()`）会被扫到但跳过。新增 patch 只需新建符合规则的文件,不必改编排代码。
 - **统一形态**：`xxx_patch.py` 的 `register()` 只委托 `general_patch.register_once(__name__, _apply, detail=…)`;patch 专属逻辑全部放进 `_apply()`,override 实现引用同名 `xxx.py`（见 `ilu_patch/general_patch.py`）。
 - **写法 delta 优先**：rebind（符号重绑）> wrapper（包裹委托）> 整方法 copy。只有整方法 copy 才需在 `_apply()` 里先 `check_fingerprint`（源码漂移校验:核对内联基线快照与社区源码是否一致）+ `check_signatures`（核对签名）;delegation 型 wrapper 天然兼容,可免显式校验。
+- **传播改绑 `rebind_module_func`（覆盖模块级自由函数时用）**：`general_patch.rebind_module_func(module, name, new_obj)` 先 `setattr` 目标模块,再按对象身份遍历 `sys.modules`,把已 `from module import name` 拷走的旧引用一并替换（解决 from-import 失效;身份匹配避免误伤同名异物）。与 `stateless_coordinator_patch` 那种"类级符号重绑（`setattr` 改类）"的区别:后者改类、实例自然解析到新类;前者改的是模块函数,且必须传播到拷贝引用。
 - **lazy import**：`import vllm.*` 与重依赖只在 `_apply()` 内部 import,保证模块在自动发现 import 期不拉起 vllm。
 - **幂等**：由 `register_once` 的进程级 `_APPLIED` 集合保证,patch 模块不再各自维护幂等标志。
 - **env 开关（经 `vllm.envs` 读取）**：`VLLM_ILU_PATCH_CHECK_SIGNATURE` / `VLLM_ILU_PATCH_CHECK_FINGERPRINT`（默认开）、`VLLM_ILU_PATCH_VERBOSE`（默认关,开启则以 `INFO` 打印应用详情）。这些变量的 reader 与默认值登记在 `envs.py` 的 `_ILU_GUARD_ENV_VARS`,既供 `vllm.envs` 读取,又避免 `validate_environ()` 把它们当未知 `VLLM_` 变量告警。
@@ -255,6 +276,21 @@ spawn worker 子进程路径:
 | `parallel_state.py` / `parallel_state_patch.py` | `GroupCoordinator.broadcast_tensor_dict` | 整方法 copy（基线快照内联于 `parallel_state_patch.py`） | 源码漂移 + 签名 |
 | （无实现）/ `stateless_coordinator_patch.py` | `CudaCommunicator` → `IluCommunicator` | 符号重绑 | 签名 |
 | `utils.py` / `utils_patch.py` | `create_tcp_store` | wrapper | 签名 |
+
+### 4.5 worked example：fa_utils（还原公版 + 插件覆盖全部 delta）
+
+`vllm/v1/attention/backends/fa_utils.py` 是「社区源码还原上游公版 + 插件零侵入覆盖」的样板:把社区该文件还原到上游 baseline（字节一致）,改动全部由插件承接。同一文件相对魔改版的三类 delta 恰好分别落到三种机制,正好横跨第 3、4 章:
+
+| delta | 消费方式 | 落到的机制 |
+| --- | --- | --- |
+| cuda 分支 import 块（绑定 ixformer `flash_attn_varlen_func` / `get_scheduler_metadata`） | **import-time** 绑定（整模块 `vllm.vllm_flash_attn` 在 corex 会 `raise`） | `import_shims/vllm_flash_attn.py` 模块替身（§3.6） |
+| `get_flash_attn_version`→`None`、`flash_attn_supports_sinks`→`True` | **运行期**,被 `from fa_utils import` 消费 | general patch + `rebind_module_func`（本章;`v1/attention/backends/fa_utils.py` / `fa_utils_patch.py`,`_apply()` 用 `rebind_module_func` + `check_signatures(strict=True)`） |
+| 公版无的 re-export `flash_attn_with_kvcache` / `flash_attn_varlen_int8_func` | **import-time** 被 fork 文件 `ilu_flash_attn.py` 经 fa_utils 二次导出消费 | 改**消费方**直接 `from ixformer.contrib.vllm_flash_attn import ...`（正本清源），不让 fa_utils 继续转发 |
+
+要点:
+
+- 两个能力函数是「**有意脱钩的整体替换**」——ixformer flash_attn 无上游 FA 版本派发,故无条件 `return None` / `True`,不跟踪上游逻辑（实现里只保留前缀兼容签名,不做源码漂移校验）。
+- 还原公版会**暴露隐藏的 re-export 依赖**:原魔改版把 ixformer 专有符号塞进 fa_utils 的 cuda 分支再被别处 `from fa_utils import`;还原后这些符号在公版不存在。处理范式是把消费方指向符号真身（ixformer）,而非在 fa_utils 上重建转发。
 
 ---
 
@@ -516,7 +552,7 @@ W4A8 的选用基于 checkpoint 的 `quant_method`、与模型 arch 解耦:`IluD
 
 ### 9.3 注册时序（构建期 + 运行期）
 
-运行期注册发生在**早期 shim 阶段**(`patch_import_compat.apply()` 第 4 步,见 §3.4):主进程经 `register_platform → _load_import_compat_patch`、spawn worker 经 `.pth`（见第 3 章），两条路径都在社区 `vllm_c.py` / `torch_utils.py` **首次调用之前**完成 `torch.ops._C.*` 注册。
+运行期注册发生在**早期 shim 阶段**(`patch_import_compat.apply()` 第 5 步,见 §3.4):主进程经 `register_platform → _load_import_compat_patch`、spawn worker 经 `.pth`（见第 3 章），两条路径都在社区 `vllm_c.py` / `torch_utils.py` **首次调用之前**完成 `torch.ops._C.*` 注册。
 
 ```text
 构建期:
@@ -649,8 +685,9 @@ IluPlatform.import_ir_kernels / get_default_ir_op_priority
    - `_custom_ops.py`（对应 `vllm/_custom_ops.py`）
    - `envs.py`（对应 `vllm/envs.py`）
    - `distributed/device_communicators/all2all.py`（对应上游同名文件）
-   - general patch 的 override 实现文件同理用上游同名（如 `distributed/parallel_state.py`、`distributed/utils.py`，见第 4 章）。
+   - general patch 的 override 实现文件同理用上游同名（如 `distributed/parallel_state.py`、`distributed/utils.py`、`v1/attention/backends/fa_utils.py`，见第 4 章）。
    - OOT 注册的实现文件也镜像上游同名（如 `model_executor/layers/layernorm.py`、`model_executor/models/qwen3.py`、`model_executor/layers/quantization/ilu_deepseek_v4_w4a8.py`、`model_executor/models/deepseek_v4/`，保留社区架构类名,见第 5、6、8 章）。
+   - **模块替身 shim `ilu_patch/import_shims/` 内部文件镜像被替身的上游模块同名**（如 `vllm_flash_attn.py` ↔ `vllm/vllm_flash_attn/`），便于对照;这是规则 4「`ilu_` 文件夹内部不缀」之外、为「整模块替身」保留上游名的特例（与 `csrc/` 镜像上游同理,见 §3.6）。
    - **原生扩展 `csrc/` 同样严格镜像上游 `vllm/csrc`** 的目录层级、文件名与注册范式（`core/registration.h`、`ops.h`、`torch_bindings.cpp`、`layernorm.cpp`、`cuda_view.cu`），唯一插件特有的 `ixformer_ops.h` 例外（ixformer 未 ship `infer/` 头,需自带前置声明,见第 9 章）。
 2. **general patch 接线 -> 上游同名 + `_patch` 后缀**：
    - `distributed/parallel_state_patch.py`、`distributed/utils_patch.py`（含 `register()`/`_apply()`,被自动发现接入;整方法 copy 的基线快照内联其中）。
@@ -686,9 +723,10 @@ IluPlatform.import_ir_kernels / get_default_ir_op_priority
 
 ```text
 对齐上游同名      ->  _custom_ops.py / envs.py / all2all.py / parallel_state.py / layernorm.py / qwen3.py
-                       / quantization/ilu_deepseek_v4_w4a8.py / models/deepseek_v4/
-general patch 接线 ->  <上游同名>_patch.py（parallel_state_patch.py / utils_patch.py；
+                       / quantization/ilu_deepseek_v4_w4a8.py / models/deepseek_v4/ / v1/attention/backends/fa_utils.py
+general patch 接线 ->  <上游同名>_patch.py（parallel_state_patch.py / utils_patch.py / fa_utils_patch.py；
                        纯 rebind/wrapper 单文件 stateless_coordinator_patch.py；基线快照内联其中）
+模块替身 shim     ->  ilu_patch/import_shims/<被替身上游模块同名>.py（如 vllm_flash_attn.py）
 镜像目录新增文件  ->  ilu_<name>.py（ilu_platform.py / ilu_communicator.py）
 新增文件夹        ->  ilu_<name>/，内部不缀（ilu_patch/ / ilu_register/ / ilu_util/）
 包基础设施        ->  __init__.py / version.py（不变）
@@ -740,3 +778,22 @@ ruff 的规则集与上游对齐,定义在 `pyproject.toml` 的 `[tool.ruff.lint
 - `ignore`：`F405`/`F403`（star import）、`E731`、`B905`、`B007`、`UP032`、`E501`（行宽,与上游 ruff-check 行为对齐——formatter 不强拆长行,故 linter 不再就此报错）。
 - `format`：`docstring-code-format = true`。
 - `per-file-ignores`：`vllm_iluvatar/version.py` 忽略 `F401`。
+
+---
+
+## 13. 测试约定
+
+呼应第 1 章「硬件强约束」,测试侧也遵循同一原则:**依赖缺失即报错,绝不静默跳过**。
+
+### 13.1 依赖强制，缺失即报错
+
+- `ixformer` / `vllm` / 原生 `vllm_iluvatar._C` 是本 build 的**强依赖**。需要它们的测试**直接 `import`**,缺失时在 collection 期抛 `ImportError`、被 pytest 计为 **ERROR**,从而暴露环境问题。
+- **不使用 `pytest.importorskip(...)` 跳过缺失依赖**——那会把「环境装错」伪装成「125 passed, 1 skipped」,掩盖问题。
+
+### 13.2 仅硬件用 skip gating
+
+唯一允许 skip 的是**物理 CUDA / Iluvatar 设备不在**:数值 / kernel 用例确实无法在无卡机跑。统一用 [tests/conftest.py](../../tests/conftest.py) 的 `requires_cuda` mark 与 `cuda_device` fixture（内部 `torch.cuda.is_available()` 判定）gating。
+
+### 13.3 纯 Python 机制写 CPU-only 用例
+
+不依赖 GPU 的机制（如 `rebind_module_func` 的传播 / 身份匹配、签名校验）应写成 CPU-only 用例,无卡环境也能跑通。例:`tests/v1/attention/backends/test_fa_utils_patch.py` 用合成伪模块验证 `rebind_module_func` 同时改到源模块与已 `from-import` 的拷贝引用、且按身份不误伤同名异物。

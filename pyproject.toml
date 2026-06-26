@@ -70,3 +70,7 @@ docstring-code-format = true
 [tool.typos.default.extend-identifiers]
 # Functional scale-format literal (compared against quant config); not a typo.
 ue8m0 = "ue8m0"
+
+[tool.typos.default.extend-words]
+# MOE (Mixture of Experts) + W (Weight); typos splits IluMOEW16A16 into sub-words.
+MOEW = "MOEW"

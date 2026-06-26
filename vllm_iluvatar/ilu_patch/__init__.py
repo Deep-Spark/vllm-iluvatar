@@ -36,7 +36,10 @@ logger = logging.getLogger(__name__)
 # Packages whose top-level modules are scanned for ``register()`` callables.
 # A module here that defines ``register()`` is treated as a general-plugins
 # patch and applied during ``register_general``.
-_PATCH_PACKAGES = ["vllm_iluvatar.distributed"]
+_PATCH_PACKAGES = [
+    "vllm_iluvatar.distributed",
+    "vllm_iluvatar.model_executor.layers.fused_moe",
+]
 
 _applied = False
 

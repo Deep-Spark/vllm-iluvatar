@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Corresponds to: vllm/distributed/stateless_coordinator.py
+"""Wiring for the stateless coordinator communicator rebind.
 
-ILU general-plugins patch (auto-discovered and applied via ``register()`` from
-``vllm_iluvatar.ilu_patch.apply_general_patches`` during ``register_general``).
+Corresponds to: vllm/distributed/stateless_coordinator.py
+
+ILU general-plugins patch, auto-discovered from the centralized
+``ilu_patch.general_patches`` package during ``register_general``.
 
 This patch is a pure module-global rebind with no override implementation of its
-own, so it is a single ``*_patch.py`` module (no impl sibling).
+own, so no upstream-mirrored implementation sibling is needed.
 
 Target   : vllm.distributed.stateless_coordinator (module-global
            ``CudaCommunicator`` symbol used by StatelessGroupCoordinator.__init__)
@@ -33,11 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 def register() -> None:
-    """Register the CudaCommunicator -> IluCommunicator rebind.
-
-    Delegates to ``general_patch.register_once``; auto-discovered and invoked by
-    ``apply_general_patches()``.
-    """
+    """Register the CudaCommunicator -> IluCommunicator rebind."""
     p.register_once(__name__, _apply, detail="CudaCommunicator rebind")
 
 

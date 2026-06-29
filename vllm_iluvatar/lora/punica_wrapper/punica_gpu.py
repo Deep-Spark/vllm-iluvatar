@@ -4,8 +4,8 @@
 ILU override implementation for ``PunicaWrapperGPU.add_lora_linear``. This
 module holds ONLY the override implementation; the wiring (register/_apply,
 signature guard, fallback binding, and class-level replacement) lives in the
-sibling ``punica_gpu_patch.py``, which is auto-discovered and applied via
-``register()`` during ``register_general``.
+centralized ``ilu_patch.general_patches.patch_punica_gpu`` module and is
+auto-discovered during ``register_general``.
 
 Target   : vllm.lora.punica_wrapper.punica_gpu.PunicaWrapperGPU.add_lora_linear
 Baseline : main_e0871ad2259
@@ -22,8 +22,8 @@ Remove   : when upstream exposes a Punica LoRA backend hook or the ixformer
 
 The wrapper references the live community ``add_lora_linear`` through
 ``_ORIGINAL_ADD_LORA_LINEAR``. It is a placeholder here and is bound by
-``punica_gpu_patch._apply()`` at register-time (kept lazy so importing this
-module never pulls in vllm).
+``patch_punica_gpu._apply()`` at register-time (kept lazy so importing this module
+never pulls in vllm).
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from collections.abc import Callable
 
 import torch
 
-# Community fallback used by the wrapper; bound by punica_gpu_patch._apply()
+# Community fallback used by patch_punica_gpu._apply()
 # before PunicaWrapperGPU.add_lora_linear is replaced. Kept lazy so this impl
 # module can be imported without importing vllm.
 _ORIGINAL_ADD_LORA_LINEAR: Callable | None = None

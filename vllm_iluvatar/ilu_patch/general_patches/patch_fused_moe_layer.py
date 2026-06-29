@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Corresponds to: vllm/model_executor/layers/fused_moe/layer.py
+"""Wiring for fused MoE runner/shared-expert rebinds.
+
+Corresponds to: vllm/model_executor/layers/fused_moe/layer.py
                    vllm/model_executor/layers/fused_moe/runner/moe_runner.py
                    vllm/model_executor/layers/fused_moe/runner/shared_experts.py
 
-ILU general-plugins patch (auto-discovered and applied via ``register()`` from
-``vllm_iluvatar.ilu_patch.apply_general_patches`` during ``register_general``).
+ILU general-plugins patch, auto-discovered from the centralized
+``ilu_patch.general_patches`` package during ``register_general``.
 
-This patch is a pure module-global rebind with no override implementation of its
-own, so it is a single ``*_patch.py`` module (no impl sibling).
+This patch is a pure module-global rebind with no method-body copy.
 
 Target   : vllm.model_executor.layers.fused_moe.layer.MoERunner
            vllm.model_executor.layers.fused_moe.runner.moe_runner.MoERunner
@@ -32,11 +33,7 @@ from vllm_iluvatar.ilu_patch import general_patch as p
 
 
 def register() -> None:
-    """Register IluMoERunner and IluSharedExperts overrides.
-
-    Delegates to ``general_patch.register_once``; auto-discovered and invoked by
-    ``apply_general_patches()``.
-    """
+    """Register IluMoERunner and IluSharedExperts overrides."""
     p.register_once(
         __name__,
         _apply,

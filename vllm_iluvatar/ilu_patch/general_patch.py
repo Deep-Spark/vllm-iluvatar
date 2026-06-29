@@ -17,11 +17,11 @@ os.environ read is used as a fallback if vllm.envs is unavailable):
 
 Disable a switch with any of: 0 / false / no / off (case-insensitive).
 
-Convention: each general-plugins patch lives in a ``*_patch.py`` module that
-exposes ``register()`` delegating to ``register_once(__name__, _apply,
-detail=...)``; the patch-specific work lives in ``_apply()``. The override
-implementation itself stays in the upstream-named sibling module (e.g.
-``parallel_state.py`` for ``parallel_state_patch.py``).
+Convention: each general-plugins patch wiring module lives under
+``ilu_patch.general_patches`` and exposes ``register()`` delegating to
+``register_once(__name__, _apply, detail=...)``; the patch-specific work lives in
+``_apply()``. Override implementations stay in upstream-mirrored modules such as
+``vllm_iluvatar.distributed.parallel_state``.
 """
 
 from __future__ import annotations

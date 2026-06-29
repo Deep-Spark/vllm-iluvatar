@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Wiring for the Punica GPU ILU LoRA-fusion override (auto-discovered and
-applied via ``register()`` from
-``vllm_iluvatar.ilu_patch.apply_general_patches`` during ``register_general``).
+"""Wiring for the Punica GPU ILU LoRA-fusion override.
 
-The override implementation lives in the sibling ``punica_gpu.py``; this module
-only does the register-time wiring: signature guard, binding the live community
-method as the fallback, and installing the wrapper onto ``PunicaWrapperGPU``.
+Corresponds to: vllm/lora/punica_wrapper/punica_gpu.py
+
+ILU general-plugins patch, auto-discovered from the centralized
+``ilu_patch.general_patches`` package during ``register_general``.
+
+The override implementation lives in
+``vllm_iluvatar.lora.punica_wrapper.punica_gpu``; this module only does the
+register-time wiring: signature guard, binding the live community method as the
+fallback, and installing the wrapper onto ``PunicaWrapperGPU``.
 
 Target   : vllm.lora.punica_wrapper.punica_gpu.PunicaWrapperGPU.add_lora_linear
 Baseline : main_e0871ad2259
@@ -94,11 +98,7 @@ ADD_LORA_LINEAR = '''    def add_lora_linear(
 
 
 def register() -> None:
-    """Register the ILU Punica GPU LoRA fusion wrapper.
-
-    Delegates to ``general_patch.register_once``; auto-discovered and invoked by
-    ``apply_general_patches()``.
-    """
+    """Register the ILU Punica GPU LoRA fusion wrapper."""
     p.register_once(
         __name__,
         _apply,
@@ -121,7 +121,7 @@ def _apply() -> None:
         ADD_LORA_LINEAR,
         resync_hint=(
             "Re-sync the ADD_LORA_LINEAR baseline in "
-            "vllm_iluvatar/lora/punica_wrapper/punica_gpu_patch.py to the new "
+            "ilu_patch/general_patches/patch_punica_gpu.py to the new "
             "community source of PunicaWrapperGPU.add_lora_linear."
         ),
     )

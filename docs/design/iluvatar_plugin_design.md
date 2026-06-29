@@ -250,32 +250,33 @@ spawn worker 子进程路径:
 ### 4.2 patch 文件规则（对齐上游）
 
 - **镜像树 + 同名**：override 实现文件落在与上游同路径的镜像位置、文件名与上游一致,便于逐文件对照。例:`vllm/distributed/parallel_state.py` → `vllm_iluvatar/distributed/parallel_state.py`。
-- **实现 / 接线分离（一个上游模块两个文件）**:override 实现放在上游同名 `xxx.py`（**不含 `register()`**）;`register()` + `_apply()` 接线放在同目录的 `xxx_patch.py`。自动发现据「是否定义 `register()`」区分二者（见 §4.3）。
-- **无自有实现的 patch 用单文件**:纯 rebind / 纯 wrapper（其覆盖逻辑只引用社区符号、无自己的实现体）没有需要镜像的实现,直接写成单个 `xxx_patch.py`,不保留空的实现兄弟文件。例:`stateless_coordinator_patch.py`。
-- **整方法 copy 的基线快照**内联在对应 `xxx_patch.py` 内,以字符串常量（三单引号）保存社区原方法源码,与源码漂移校验放在一处。例:`parallel_state_patch.py` 内的 `BROADCAST_TENSOR_DICT`。
-- **模块 docstring 固定字段**:`Corresponds to`（上游文件）、`Target`（覆盖符号）、`Baseline`（社区基线 commit）、`Why`、`How`、`Scope`、`Remove`（何时可移除）;整方法 copy 在其 `*_patch.py` 内追加 `Fingerprint`。
+- **实现 / 接线分离**:override 实现放在上游同名 `xxx.py`（**不含 `register()`**）;`register()` + `_apply()` 接线统一放在 `ilu_patch/general_patches/` 下。实现目录保持上游镜像,接线目录集中管理。
+- **无自有实现的 patch 只写接线文件**:纯 rebind / 纯 wrapper（其覆盖逻辑只引用社区符号、无自己的实现体）没有需要镜像的实现,只在 `ilu_patch/general_patches/` 下放一个接线模块,不保留空的实现兄弟文件。例:`patch_stateless_coordinator.py`。
+- **整方法 copy 的基线快照**内联在对应接线模块内,以字符串常量（三单引号）保存社区原方法源码,与源码漂移校验放在一处。例:`general_patches/patch_parallel_state.py` 内的 `BROADCAST_TENSOR_DICT`。
+- **模块 docstring 固定字段**:`Corresponds to`（上游文件）、`Target`（覆盖符号）、`Baseline`（社区基线 commit）、`Why`、`How`、`Scope`、`Remove`（何时可移除）;整方法 copy 在其接线模块内追加 `Fingerprint`。
 - **改动标注**:每处覆盖以 `# [ILU override] <symbol> — delta: …` 标注;整方法 copy 内的实际改动用 `# >>> ILU MODIFICATION >>>` … `# <<< ILU MODIFICATION <<<` 框出,使 delta 在大段 copy 中一眼可见。
 
 ### 4.3 register 规则
 
-- **自动发现,无需手工编排**：落在 `_PATCH_PACKAGES`（默认 `vllm_iluvatar.distributed`）顶层、定义了 `register()` 的模块（即 `*_patch.py`）,会被 `apply_general_patches()` 自动扫描并调用（见 `ilu_patch/__init__.py`）;同目录的纯实现 `xxx.py`（无 `register()`）会被扫到但跳过。新增 patch 只需新建符合规则的文件,不必改编排代码。
-- **统一形态**：`xxx_patch.py` 的 `register()` 只委托 `general_patch.register_once(__name__, _apply, detail=…)`;patch 专属逻辑全部放进 `_apply()`,override 实现引用同名 `xxx.py`（见 `ilu_patch/general_patch.py`）。
+- **自动发现,无需手工编排**：`ilu_patch/general_patches/` 顶层、定义了 `register()` 的模块会被 `apply_general_patches()` 自动扫描并调用（见 `ilu_patch/__init__.py`）。新增 general patch 只需新增一个接线模块,不必改编排代码。
+- **统一形态**：接线模块的 `register()` 只委托 `general_patch.register_once(__name__, _apply, detail=…)`;patch 专属逻辑全部放进 `_apply()`,override 实现引用上游镜像实现模块（见 `ilu_patch/general_patch.py`）。
 - **写法 delta 优先**：rebind（符号重绑）> wrapper（包裹委托）> 整方法 copy。只有整方法 copy 才需在 `_apply()` 里先 `check_fingerprint`（源码漂移校验:核对内联基线快照与社区源码是否一致）+ `check_signatures`（核对签名）;delegation 型 wrapper 天然兼容,可免显式校验。
-- **传播改绑 `rebind_module_func`（覆盖模块级自由函数时用）**：`general_patch.rebind_module_func(module, name, new_obj)` 先 `setattr` 目标模块,再按对象身份遍历 `sys.modules`,把已 `from module import name` 拷走的旧引用一并替换（解决 from-import 失效;身份匹配避免误伤同名异物）。与 `stateless_coordinator_patch` 那种"类级符号重绑（`setattr` 改类）"的区别:后者改类、实例自然解析到新类;前者改的是模块函数,且必须传播到拷贝引用。
+- **传播改绑 `rebind_module_func`（覆盖模块级自由函数时用）**：`general_patch.rebind_module_func(module, name, new_obj)` 先 `setattr` 目标模块,再按对象身份遍历 `sys.modules`,把已 `from module import name` 拷走的旧引用一并替换（解决 from-import 失效;身份匹配避免误伤同名异物）。与 `patch_stateless_coordinator` 那种"类级符号重绑（`setattr` 改类）"的区别:后者改类、实例自然解析到新类;前者改的是模块函数,且必须传播到拷贝引用。
 - **lazy import**：`import vllm.*` 与重依赖只在 `_apply()` 内部 import,保证模块在自动发现 import 期不拉起 vllm。
 - **幂等**：由 `register_once` 的进程级 `_APPLIED` 集合保证,patch 模块不再各自维护幂等标志。
 - **env 开关（经 `vllm.envs` 读取）**：`VLLM_ILU_PATCH_CHECK_SIGNATURE` / `VLLM_ILU_PATCH_CHECK_FINGERPRINT`（默认开）、`VLLM_ILU_PATCH_VERBOSE`（默认关,开启则以 `INFO` 打印应用详情）。这些变量的 reader 与默认值登记在 `envs.py` 的 `_ILU_GUARD_ENV_VARS`,既供 `vllm.envs` 读取,又避免 `validate_environ()` 把它们当未知 `VLLM_` 变量告警。
 
-### 4.4 示例：三个 general patch
+### 4.4 示例：general patch
 
-镜像在 `vllm_iluvatar/distributed/` 下的三个 patch,恰好示范 copy / rebind / wrapper 三种写法,均经 `general_patch` 脚手架 + 自动发现接入。下表「实现 / 接线」列分别给出 override 实现文件与 `register()` 接线文件:
+general patch 示范 copy / rebind 写法,均经 `general_patch` 脚手架 + `ilu_patch/general_patches/` 自动发现接入。下表「实现 / 接线」列分别给出 override 实现文件与集中接线文件:
 
 | 实现 / 接线 | 覆盖符号 | 写法 | 校验 |
 | --- | --- | --- | --- |
-| `parallel_state.py` / `parallel_state_patch.py` | `GroupCoordinator.broadcast` | wrapper | 签名 |
-| `parallel_state.py` / `parallel_state_patch.py` | `GroupCoordinator.broadcast_tensor_dict` | 整方法 copy（基线快照内联于 `parallel_state_patch.py`） | 源码漂移 + 签名 |
-| （无实现）/ `stateless_coordinator_patch.py` | `CudaCommunicator` → `IluCommunicator` | 符号重绑 | 签名 |
-| `utils.py` / `utils_patch.py` | `create_tcp_store` | wrapper | 签名 |
+| `distributed/parallel_state.py` / `general_patches/patch_parallel_state.py` | `GroupCoordinator.broadcast` | wrapper | 签名 |
+| `distributed/parallel_state.py` / `general_patches/patch_parallel_state.py` | `GroupCoordinator.broadcast_tensor_dict` | 整方法 copy（基线快照内联于接线模块） | 源码漂移 + 签名 |
+| （无实现）/ `general_patches/patch_stateless_coordinator.py` | `CudaCommunicator` → `IluCommunicator` | 符号重绑 | 签名 |
+
+`create_tcp_store` 由 `ilu_patch/patch_platform_import_hooks.py` 在 platform 阶段注册 post-import hook:目标模块仍由 vLLM 自然导入,导入完成后立即 wrap `create_tcp_store`,避免 `register_platform()` 期间 eager import `vllm.distributed.utils`。
 
 ### 4.5 worked example：fa_utils（还原公版 + 插件覆盖全部 delta）
 
@@ -284,7 +285,7 @@ spawn worker 子进程路径:
 | delta | 消费方式 | 落到的机制 |
 | --- | --- | --- |
 | cuda 分支 import 块（绑定 ixformer `flash_attn_varlen_func` / `get_scheduler_metadata`） | **import-time** 绑定（整模块 `vllm.vllm_flash_attn` 在 corex 会 `raise`） | `import_shims/vllm_flash_attn.py` 模块替身（§3.6） |
-| `get_flash_attn_version`→`None`、`flash_attn_supports_sinks`→`True` | **运行期**,被 `from fa_utils import` 消费 | general patch + `rebind_module_func`（本章;`v1/attention/backends/fa_utils.py` / `fa_utils_patch.py`,`_apply()` 用 `rebind_module_func` + `check_signatures(strict=True)`） |
+| `get_flash_attn_version`→`None`、`flash_attn_supports_sinks`→`True` | **运行期**,被 `from fa_utils import` 消费 | general patch + `rebind_module_func`（本章;实现 `v1/attention/backends/fa_utils.py`,接线 `general_patches/patch_fa_utils.py`,`_apply()` 用 `rebind_module_func` + `check_signatures(strict=True)`） |
 | 公版无的 re-export `flash_attn_with_kvcache` / `flash_attn_varlen_int8_func` | **import-time** 被 fork 文件 `ilu_flash_attn.py` 经 fa_utils 二次导出消费 | 改**消费方**直接 `from ixformer.contrib.vllm_flash_attn import ...`（正本清源），不让 fa_utils 继续转发 |
 
 要点:
@@ -689,14 +690,14 @@ IluPlatform.import_ir_kernels / get_default_ir_op_priority
    - OOT 注册的实现文件也镜像上游同名（如 `model_executor/layers/layernorm.py`、`model_executor/models/qwen3.py`、`model_executor/layers/quantization/ilu_deepseek_v4_w4a8.py`、`model_executor/models/deepseek_v4/`，保留社区架构类名,见第 5、6、8 章）。
    - **模块替身 shim `ilu_patch/import_shims/` 内部文件镜像被替身的上游模块同名**（如 `vllm_flash_attn.py` ↔ `vllm/vllm_flash_attn/`），便于对照;这是规则 4「`ilu_` 文件夹内部不缀」之外、为「整模块替身」保留上游名的特例（与 `csrc/` 镜像上游同理,见 §3.6）。
    - **原生扩展 `csrc/` 同样严格镜像上游 `vllm/csrc`** 的目录层级、文件名与注册范式（`core/registration.h`、`ops.h`、`torch_bindings.cpp`、`layernorm.cpp`、`cuda_view.cu`），唯一插件特有的 `ixformer_ops.h` 例外（ixformer 未 ship `infer/` 头,需自带前置声明,见第 9 章）。
-2. **general patch 接线 -> 上游同名 + `_patch` 后缀**：
-   - `distributed/parallel_state_patch.py`、`distributed/utils_patch.py`（含 `register()`/`_apply()`,被自动发现接入;整方法 copy 的基线快照内联其中）。
-   - 无自有实现的纯 rebind/wrapper patch 也用此命名且为单文件:`distributed/stateless_coordinator_patch.py`。
+2. **general patch 接线 -> 集中到 `ilu_patch/general_patches/`**：
+   - 文件名统一使用 `patch_<target>.py`,例如 `patch_parallel_state.py`、`patch_stateless_coordinator.py`、`patch_fused_moe_layer.py`、`patch_fa_utils.py`。
+   - 接线模块含 `register()`/`_apply()`、签名/指纹校验和基线快照;override 实现仍放在上游镜像目录。
 3. **上游为「按后端分文件」的镜像目录中、我们新增的后端实现 -> `ilu_` 前缀**：
    - `platforms/ilu_platform.py`（`platforms/` 镜像 `vllm/platforms/`）
    - `distributed/device_communicators/ilu_communicator.py`
 4. **新增文件夹（上游无对应概念）-> 文件夹以 `ilu_` 开头,内部子目录/文件不再加 `ilu`**（文件夹本身即标识）：
-   - `ilu_patch/`（内含 `general_patch.py`、`import_hook.py`、`patch_custom_ops.py`、`patch_import_compat.py`）
+   - `ilu_patch/`（内含 `general_patch.py`、`general_patches/`、`import_hook.py`、`patch_custom_ops.py`、`patch_import_compat.py`、`patch_platform_import_hooks.py`）
    - `ilu_register/`（OOT 注册编排，见第 5、6、8 章）
    - `ilu_util/`（内含 `signature.py`）
 5. **Python 包基础设施保持原名**：`__init__.py`、`version.py`。
@@ -715,7 +716,8 @@ IluPlatform.import_ir_kernels / get_default_ir_op_priority
 
 不同接入路径的「接线」入口名各异,据此即可判断一个模块走哪条路径:
 
-- general patch:`*_patch.py` 暴露 `register()`（见 §4.3）。
+- general patch:`ilu_patch/general_patches/*.py` 暴露 `register()`（见 §4.3）。
+- platform-stage post-import hook:`ilu_patch/patch_platform_import_hooks.py` 中登记 `_HOOKS`（见 §3、§4.4）。
 - 模型 OOT:模型模块暴露 `register_model()` 钩子（见 §6.2）。
 - 算子 OOT:**无钩子**,靠模块级 `@<Base>.register_oot` / `@CustomOp.register` 装饰器（见 §5.2）。
 
@@ -724,14 +726,16 @@ IluPlatform.import_ir_kernels / get_default_ir_op_priority
 ```text
 对齐上游同名      ->  _custom_ops.py / envs.py / all2all.py / parallel_state.py / layernorm.py / qwen3.py
                        / quantization/ilu_deepseek_v4_w4a8.py / models/deepseek_v4/ / v1/attention/backends/fa_utils.py
-general patch 接线 ->  <上游同名>_patch.py（parallel_state_patch.py / utils_patch.py / fa_utils_patch.py；
-                       纯 rebind/wrapper 单文件 stateless_coordinator_patch.py；基线快照内联其中）
+general patch 接线 ->  ilu_patch/general_patches/patch_<target>.py
+                       （patch_parallel_state.py / patch_fa_utils.py；
+                       基线快照内联其中）
+platform import hook ->  ilu_patch/patch_platform_import_hooks.py（平台确认后注册、目标模块 import 后回调）
 模块替身 shim     ->  ilu_patch/import_shims/<被替身上游模块同名>.py（如 vllm_flash_attn.py）
 镜像目录新增文件  ->  ilu_<name>.py（ilu_platform.py / ilu_communicator.py）
 新增文件夹        ->  ilu_<name>/，内部不缀（ilu_patch/ / ilu_register/ / ilu_util/）
 包基础设施        ->  __init__.py / version.py（不变）
 类名              ->  Ilu 前缀（含 OOT 子类 IluRMSNorm 等）；按名挂回社区的符号保留社区名
-接线钩子          ->  register()（general patch）/ register_model()（模型 OOT）/ 装饰器（算子 OOT）
+接线钩子          ->  register()（general patch）/ _HOOKS（platform import hook）/ register_model()（模型 OOT）/ 装饰器（算子 OOT）
 ```
 
 ---

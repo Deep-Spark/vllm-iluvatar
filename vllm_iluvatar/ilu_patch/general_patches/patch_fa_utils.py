@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Wiring for the fa_utils ILU overrides (auto-discovered and applied via
-``register()`` from ``vllm_iluvatar.ilu_patch.apply_general_patches`` during
-``register_general``).
+"""Wiring for fa_utils ILU overrides.
 
-The override implementations live in the sibling ``fa_utils.py``; this module
-only does the register-time wiring: a strict signature guard plus a propagating
-rebind of the two helpers onto the community module.
+Corresponds to: vllm/v1/attention/backends/fa_utils.py
+
+ILU general-plugins patch, auto-discovered from the centralized
+``ilu_patch.general_patches`` package during ``register_general``.
+
+The override implementations live in
+``vllm_iluvatar.v1.attention.backends.fa_utils``; this module only does the
+register-time wiring: a strict signature guard plus a propagating rebind of the
+two helpers onto the community module.
 
 Target   : vllm.v1.attention.backends.fa_utils.{get_flash_attn_version,
            flash_attn_supports_sinks}
@@ -29,11 +33,7 @@ _OVERRIDES = ["get_flash_attn_version", "flash_attn_supports_sinks"]
 
 
 def register() -> None:
-    """Register the fa_utils ILU overrides.
-
-    Delegates to ``general_patch.register_once``; auto-discovered and invoked by
-    ``apply_general_patches()``.
-    """
+    """Register the fa_utils ILU overrides."""
     p.register_once(
         __name__,
         _apply,

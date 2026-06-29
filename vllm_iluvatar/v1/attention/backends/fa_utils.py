@@ -4,9 +4,9 @@
 ILU override implementations for the flash-attn capability helpers
 ``get_flash_attn_version`` and ``flash_attn_supports_sinks``. This module holds
 ONLY the override implementations; the wiring (register/_apply + signature guard
-+ propagating rebind) lives in the sibling ``fa_utils_patch.py``, which is the
-module auto-discovered and applied via ``register()`` during
-``register_general``.
++ propagating rebind) lives in
+``ilu_patch.general_patches.patch_fa_utils`` and is auto-discovered
+during ``register_general``.
 
 Target   : vllm.v1.attention.backends.fa_utils.{get_flash_attn_version,
            flash_attn_supports_sinks}
@@ -20,7 +20,7 @@ Why      : IluPlatform is cuda-like (``is_cuda()`` is True), so community
 How      : full replacement (NOT a wrapper or full-method copy) — the override
            bodies do not reference the community implementation, so there is no
            source-drift fingerprint to track; only a prefix-compatible signature
-           is validated (see fa_utils_patch.py / §5.5).
+           is validated (see patch_fa_utils.py / §5.5).
 Scope    : all attention backends on Iluvatar that consult these helpers
            (flash_attn / MLA prefill / mm-encoder / turboquant / diffkv ...).
 Remove   : when the plugin ships its own attention backend that no longer routes

@@ -2,9 +2,10 @@
 """Corresponds to: vllm/distributed/utils.py
 
 ILU override implementation for create_tcp_store. This module holds ONLY the
-override implementation; the wiring (register/_apply) lives in the sibling
-``utils_patch.py``, which is auto-discovered and applied via ``register()``
-during ``register_general``.
+override implementation; the platform-stage wiring lives in
+``vllm_iluvatar.ilu_patch.patch_platform_import_hooks`` so the target community
+module can be patched right after import without being eagerly imported during
+platform resolution.
 
 Target   : vllm.distributed.utils.create_tcp_store
 Baseline : main_e0871ad2259

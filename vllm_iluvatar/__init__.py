@@ -89,20 +89,11 @@ def register_platform() -> str:
 
     _apply_ilu_envs()
 
-    # Register a post-import patch instead of importing vllm.distributed.utils
-    # here.  register_platform() runs during platform detection, and importing
-    # distributed utils eagerly can pull in more vLLM modules while the platform
-    # is still being resolved.  The hook patches create_tcp_store as soon as the
-    # community module is actually loaded, before Elastic EP creates a TCPStore
-    # from a pre-bound listen fd (which requires use_libuv=False on CoreX).
-    from vllm_iluvatar.ilu_patch import import_hook
+    from vllm_iluvatar.ilu_patch.patch_platform_import_hooks import (
+        register_platform_import_hooks,
+    )
 
-    def _patch_distributed_utils(module):
-        from vllm_iluvatar.distributed.utils import _make_create_tcp_store
-
-        module.create_tcp_store = _make_create_tcp_store(module.create_tcp_store)
-
-    import_hook.register("vllm.distributed.utils", _patch_distributed_utils)
+    register_platform_import_hooks()
 
 
     return "vllm_iluvatar.platforms.ilu_platform.IluPlatform"

@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Wiring for the parallel_state ILU override (auto-discovered and applied via
-``register()`` from ``vllm_iluvatar.ilu_patch.apply_general_patches`` during
-``register_general``).
+"""Wiring for the parallel_state ILU override.
 
-The override implementations live in the sibling ``parallel_state.py``; this
-module only does the register-time wiring: fingerprint + signature guards,
+Corresponds to: vllm/distributed/parallel_state.py
+
+ILU general-plugins patch, auto-discovered from the centralized
+``ilu_patch.general_patches`` package during ``register_general``.
+
+The override implementations live in ``vllm_iluvatar.distributed.parallel_state``;
+this module only does register-time wiring: fingerprint + signature guards,
 binding the community globals onto the impl module, and installing the
 overrides onto GroupCoordinator.
 
@@ -120,12 +123,7 @@ BROADCAST_TENSOR_DICT = '''    def broadcast_tensor_dict(
 
 
 def register() -> None:
-    """Register ILU GroupCoordinator overrides (broadcast wrapper +
-    broadcast_tensor_dict full-method copy).
-
-    Delegates to ``general_patch.register_once``; auto-discovered and invoked by
-    ``apply_general_patches()``.
-    """
+    """Register ILU GroupCoordinator overrides."""
     p.register_once(
         __name__, _apply, detail="broadcast wrapper, broadcast_tensor_dict copy"
     )
@@ -146,9 +144,9 @@ def _apply() -> None:
         BROADCAST_TENSOR_DICT,
         resync_hint=(
             "Re-sync vllm_iluvatar/distributed/parallel_state.py (the copy) and "
-            "the BROADCAST_TENSOR_DICT baseline in parallel_state_patch.py to "
-            "the new community source of "
-            "GroupCoordinator.broadcast_tensor_dict."
+            "the BROADCAST_TENSOR_DICT baseline in "
+            "ilu_patch/general_patches/patch_parallel_state.py to the new "
+            "community source of GroupCoordinator.broadcast_tensor_dict."
         ),
     )
 

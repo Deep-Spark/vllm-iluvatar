@@ -4,8 +4,8 @@
 ILU override implementations for GroupCoordinator.{broadcast,
 broadcast_tensor_dict}. This module holds ONLY the override implementations;
 the wiring (register/_apply, fingerprint + signature guards, global binding)
-lives in the sibling ``parallel_state_patch.py``, which is the module
-auto-discovered and applied via ``register()`` during ``register_general``.
+lives in ``ilu_patch.general_patches.patch_parallel_state`` and is
+auto-discovered during ``register_general``.
 
 Target   : vllm.distributed.parallel_state.GroupCoordinator.{broadcast,
            broadcast_tensor_dict}
@@ -22,15 +22,15 @@ Remove   : when upstream GroupCoordinator broadcasts via device_communicator
 
 The copied ``broadcast_tensor_dict`` references community globals (torch,
 TensorMetadata, _split_tensor_dict). They are placeholders here and bound onto
-this module by ``parallel_state_patch._apply()`` at register-time (kept lazy so
-importing this module never pulls in vllm/torch).
+this module by ``patch_parallel_state._apply()`` at register-time (kept
+lazy so importing this module never pulls in vllm/torch).
 """
 
 from __future__ import annotations
 
 # Community globals used by the copied broadcast_tensor_dict body; bound by
-# parallel_state_patch._apply() (kept lazy so importing this module never pulls
-# in vllm/torch).
+# patch_parallel_state._apply() (kept lazy so importing this module never
+# pulls in vllm/torch).
 torch = None
 TensorMetadata = None
 _split_tensor_dict = None

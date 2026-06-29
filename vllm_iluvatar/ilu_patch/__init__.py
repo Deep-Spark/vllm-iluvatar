@@ -11,18 +11,17 @@ Two kinds of patches live here:
      symbols called at *import time* (e.g. ``vllm._custom_ops``).
 
   2. Late-phase (general_plugins) patches that only need an initialised vLLM
-     (module/class objects present).  These live as ``*_patch.py`` modules
-     exposing ``register()`` in the mirror tree (see ``_PATCH_PACKAGES``); the
-     override implementation itself stays in the upstream-named sibling module
-     (e.g. ``parallel_state.py`` for ``parallel_state_patch.py``).  They are
-     auto-discovered + applied by ``apply_general_patches()`` from
-     ``register_general`` (the ``vllm.general_plugins`` entry point).
+     (module/class objects present).  Wiring modules live in
+     ``ilu_patch.general_patches`` and expose ``register()``; override
+     implementations stay in upstream-mirrored packages such as
+     ``vllm_iluvatar.distributed``. They are auto-discovered + applied by
+     ``apply_general_patches()`` from ``register_general`` (the
+     ``vllm.general_plugins`` entry point).
 
 To add a late-phase patch: put the override implementation in the
-upstream-named module and drop a sibling ``<name>_patch.py`` exposing
-``def register() -> None`` at the top level of a package listed in
-``_PATCH_PACKAGES`` (default ``vllm_iluvatar.distributed``).  Modules without
-``register()`` (the impl siblings) are scanned but skipped — no edit here.
+upstream-mirrored module, then add one small wiring module under
+``ilu_patch.general_patches`` exposing ``def register() -> None``. The wiring
+module should perform lazy imports, guards, and rebinding only.
 """
 
 from __future__ import annotations
@@ -34,11 +33,10 @@ import pkgutil
 logger = logging.getLogger(__name__)
 
 # Packages whose top-level modules are scanned for ``register()`` callables.
-# A module here that defines ``register()`` is treated as a general-plugins
-# patch and applied during ``register_general``.
+# Centralising wiring here keeps upstream-mirrored implementation directories
+# from accumulating ``*_patch.py`` files as the plugin grows.
 _PATCH_PACKAGES = [
-    "vllm_iluvatar.distributed",
-    "vllm_iluvatar.model_executor.layers.fused_moe",
+    "vllm_iluvatar.ilu_patch.general_patches",
 ]
 
 _applied = False
@@ -47,8 +45,7 @@ _applied = False
 def apply_general_patches() -> None:
     """Auto-discover and apply all general-plugins patches (idempotent).
 
-    Scans each package in ``_PATCH_PACKAGES`` (non-recursively, so sibling
-    sub-packages such as ``device_communicators`` are skipped) and calls
+    Scans each package in ``_PATCH_PACKAGES`` non-recursively and calls
     ``register()`` on every top-level module that defines it.
     """
     global _applied

@@ -332,7 +332,7 @@ class IluDeepseekV4W4A8Config(QuantizationConfig):
 
         if isinstance(layer, RoutedExperts):
             if _is_routed_expert(prefix):
-                from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.iluvatar.ilu_compressed_tensors_moe_w4a8_int8 import (  # noqa: E501
+                from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.ilu_compressed_tensors_moe_w4a8_int8 import (  # noqa: E501
                     IluCompressedTensorsW4A8Int8MoEMethod,
                 )
 
@@ -346,7 +346,7 @@ class IluDeepseekV4W4A8Config(QuantizationConfig):
                 # In V4 shared_experts is a plain MLP, not a FusedMoE; we keep
                 # this branch in case a future variant re-routes shared_experts
                 # through FusedMoE.
-                from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.iluvatar.ilu_compressed_tensors_moe_w8a8_int8 import (  # noqa: E501
+                from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.ilu_compressed_tensors_moe_w8a8_int8 import (  # noqa: E501
                     IluCompressedTensorsW8A8Int8MoEMethod,
                 )
 

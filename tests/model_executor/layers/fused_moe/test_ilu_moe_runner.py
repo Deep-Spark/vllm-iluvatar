@@ -72,6 +72,10 @@ def _make_stub_runner(
     return obj
 
 
+class UnquantizedFusedMoEMethod:
+    pass
+
+
 # ---------------------------------------------------------------------------
 # CPU-only tests
 # ---------------------------------------------------------------------------
@@ -172,6 +176,42 @@ class TestMaybeApplyRoutedScaleToOutput:
             shared, fused
         )
         torch.testing.assert_close(out_shared, shared)
+
+    def test_unquantized_bf16_scales_fused_output_with_runner_scale(self):
+        runner = _make_stub_runner(in_dtype=torch.bfloat16)
+        runner.routed_experts.quant_method = UnquantizedFusedMoEMethod()
+        runner.routed_experts.routed_scaling_factor = 3.0
+        runner.shared_experts_scaling_factor = 0.5
+        shared = torch.ones(4, dtype=torch.bfloat16)
+        fused = torch.ones(4, dtype=torch.bfloat16)
+
+        out_shared, out_fused = runner._maybe_apply_routed_scale_to_output(
+            shared, fused
+        )
+
+        torch.testing.assert_close(out_shared, shared)
+        torch.testing.assert_close(
+            out_fused,
+            torch.full((4,), 3.0, dtype=torch.bfloat16),
+        )
+
+    def test_fp16_shared_output_uses_init_reset_unquantized_scale(self):
+        runner = _make_stub_runner(in_dtype=torch.float16)
+        runner.routed_experts.quant_method = UnquantizedFusedMoEMethod()
+        runner.routed_experts.routed_scaling_factor = 1.0
+        runner.shared_experts_scaling_factor = 0.5
+        shared = torch.ones(4, dtype=torch.float16)
+        fused = torch.ones(4, dtype=torch.float16)
+
+        out_shared, out_fused = runner._maybe_apply_routed_scale_to_output(
+            shared, fused
+        )
+
+        torch.testing.assert_close(
+            out_shared,
+            torch.full((4,), 0.5, dtype=torch.float16),
+        )
+        torch.testing.assert_close(out_fused, fused)
 
     def test_none_shared_output(self):
         runner = _make_stub_runner(in_dtype=torch.float16)

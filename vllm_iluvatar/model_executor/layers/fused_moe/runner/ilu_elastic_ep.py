@@ -9,9 +9,9 @@ Baseline : main_e0871ad2259
 Contains:
   ilu_eplb_map_and_record       pure-torch EPLB mapping (replaces Triton kernel)
   ilu_rearrange_expert_weights  all_gather reshuffling (replaces ncclSend/Recv)
-  ilu_is_monolithic             monolithic W16A16 kernel detection
+  ilu_is_monolithic             wrapped unquantized W16A16 detection
   ilu_kernel_handles_own_dispatch  dispatch ownership check
-  ilu_modular_apply             monolithic apply path for wrapped W16A16
+  ilu_modular_apply             W16A16 ixformer path after modular wrap
   install_ilu_elastic_ep_patches  entry point (called from IluMoERunner.__init__)
 """
 
@@ -130,21 +130,19 @@ def ilu_rearrange_expert_weights_allgather(
 
 
 # -----------------------------------------------------------------------
-# Monolithic W16A16 kernel helpers
+# Modular W16A16 helpers
 # -----------------------------------------------------------------------
 def ilu_is_monolithic(modular_method) -> bool:
-    """Whether a ``FusedMoEModularMethod`` wraps the Iluvatar W16A16
-    monolithic kernel."""
+    """Whether a ``FusedMoEModularMethod`` wraps the W16A16 unquantized path.
+
+    Elastic EP may wrap ``UnquantizedFusedMoEMethod`` into
+    ``FusedMoEModularMethod``. That wrapper's community apply path would call
+    ``moe_kernel.apply``; for Iluvatar W16A16 we instead keep using the plugin's
+    ixformer path.
+    """
     cached = getattr(modular_method, "_ilu_is_monolithic", None)
     if cached is None:
-        from vllm.model_executor.layers.fused_moe.experts.ilu_w16a16_moe import (  # noqa: E501
-            IluMOEW16A16,
-        )
-
-        cached = isinstance(
-            getattr(modular_method.moe_kernel, "fused_experts", None),
-            IluMOEW16A16,
-        )
+        cached = modular_method.__class__.__name__ == "UnquantizedFusedMoEMethod"
         modular_method._ilu_is_monolithic = cached
     return cached
 
@@ -169,26 +167,31 @@ def ilu_modular_apply(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
 ) -> torch.Tensor | None:
-    """Run the monolithic ``ilu_apply`` path for a wrapped W16A16 layer.
+    """Run the plugin-local W16A16 path after elastic EP modular wrapping.
 
-    Returns the fused output for monolithic layers, else None so the
-    caller takes the regular modular path."""
+    Returns the fused output for wrapped unquantized layers, else None so the
+    caller takes the regular modular path.
+    """
     if not ilu_is_monolithic(modular_method):
         return None
-    return (
-        modular_method.moe_kernel.ilu_apply(
-            hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            activation=layer.activation,
-            apply_router_weight_on_input=layer.apply_router_weight_on_input,
-            global_num_experts=layer.global_num_experts,
-            expert_map=layer.expert_map,
-            quant_config=modular_method.moe_quant_config,
-        )
-        * layer.runner_scaling_factor
+
+    # Fork delta formerly patched community fused_moe.py. Keep this dispatch in
+    # the plugin so community fused_moe.py stays identical to upstream main.
+    from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe import (
+        ilu_w16a16_fused_experts,
+    )
+
+    return ilu_w16a16_fused_experts(
+        hidden_states=x,
+        w1=layer.w13_weight,
+        w2=layer.w2_weight,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        activation=layer.activation,
+        apply_router_weight_on_input=layer.apply_router_weight_on_input,
+        global_num_experts=layer.global_num_experts,
+        expert_map=layer.expert_map,
+        quant_config=modular_method.moe_quant_config,
     )
 
 
@@ -280,8 +283,12 @@ def _install_eplb_map_patches() -> None:
 
 
 def _install_modular_method_patches() -> None:
-    """Patch ``FusedMoEModularMethod.apply`` so wrapped Iluvatar W16A16
-    layers keep using the monolithic ``ilu_apply`` path. Idempotent."""
+    """Patch ``FusedMoEModularMethod.apply`` for wrapped W16A16 layers.
+
+    The W16A16 path no longer lives in community modular kernels. This wrapper
+    intercepts only modular wrappers around ``UnquantizedFusedMoEMethod`` and
+    lets every other modular quant method fall through unchanged.
+    """
     from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
         FusedMoEModularMethod,
     )

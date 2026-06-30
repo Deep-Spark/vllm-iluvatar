@@ -15,9 +15,10 @@ Target   : vllm.model_executor.layers.fused_moe.layer.MoERunner
            vllm.model_executor.layers.fused_moe.runner.shared_experts.SharedExperts
 Baseline : main_e0871ad2259
 Why      : MoERunner is not a CustomOp (no register_oot); Iluvatar needs
-           elastic-EP, input_ids dispatch, FP16 scaling, and fused norm-quant
-           tuple support. SharedExperts needs to always allow multi-stream
-           overlap (community disables it under eplb/flashinfer conditions).
+           elastic-EP, input_ids dispatch, FP16 scaling, fused norm-quant tuple
+           support, and the fork's RoutedExperts scaling placement. SharedExperts
+           needs to always allow multi-stream overlap (community disables it
+           under eplb/flashinfer conditions).
 How      : rebind module-global ``MoERunner`` / ``SharedExperts`` names to
            ``IluMoERunner`` / ``IluSharedExperts`` (inheritance-based, zero
            method-body copy). Uses ``rebind_module_func`` to propagate to

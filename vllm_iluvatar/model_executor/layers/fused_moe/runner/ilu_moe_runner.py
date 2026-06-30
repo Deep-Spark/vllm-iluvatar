@@ -7,7 +7,8 @@ Delta    : ~250 lines vs. the original 1010-line full-class copy
 
 Override summary (each marked with ``# [ILU override]`` in-line):
 
-  __init__                          elastic-EP install + FP16 scaling
+  __init__                          elastic-EP install + FP16 scaling /
+                                    RoutedExperts scale placement
   _select_forward                   bypass torch.compile custom ops
   forward                           tuple hidden_states (fused norm-quant)
   _apply_quant_method               fused shared output path
@@ -47,7 +48,8 @@ class IluMoERunner(MoERunner):
     """
 
     # [ILU override] __init__ — delta: elastic-EP patch install + FP16
-    # scaling redistribution (shared_experts_scaling_factor).
+    # scaling redistribution. Also preserves the fork layer.py behavior that
+    # controls which scaling factor is visible to RoutedExperts.
     def __init__(self, *args, routed_scaling_factor: float = 1.0, **kwargs):
         super().__init__(*args, routed_scaling_factor=routed_scaling_factor, **kwargs)
         logger.info_once("Use Iluvatar MoERunner.")
@@ -58,14 +60,32 @@ class IluMoERunner(MoERunner):
             )
 
             install_ilu_elastic_ep_patches()
+            
+        '''
+        apply_routed_scale_to_output
+        - True
+            1. scaling_factor放到runner中处理
+                计算公式分成两种情况：
+                (1) fp16 + shared_experts
+                    检测到后，不走shared融合，且scaling_factor置为1，都放到_maybe_apply_routed_scale_to_output处理
+                    output = fused_output + shared_output / scaling_factor
+                (2) 其他情况
+                    output = fused_output * scaling_factor + shared_output(若存在)
+            2. router中的scaling_factor被设置为1传入
+        - False
+            1. scaling_factor放到router中处理，目前只有grouped topk + fused topk bias会使用
+            2. runner中的scaling_factor被设置为1传入
+        '''
 
         self.shared_experts_scaling_factor = 1.0
+        self.routed_experts.routed_scaling_factor = routed_scaling_factor
         if (
             self._shared_experts is not None
             and self.moe_config.in_dtype == torch.float16
         ):
             self.routed_scaling_factor = 1.0
             self.shared_experts_scaling_factor = 1.0 / routed_scaling_factor
+            self.routed_experts.routed_scaling_factor = 1.0
 
     # [ILU override] _select_forward — delta: corex does not support
     # torch.compile; always use the Python wrapper.
@@ -140,8 +160,12 @@ class IluMoERunner(MoERunner):
         return self._maybe_add_zero_expert_output(result)
 
     # [ILU override] _apply_quant_method — delta: fused shared output
-    # optimisation; when NO_OVERLAP and not FP16 and not naive dispatch,
-    # fuse the shared-expert add into the MoE kernel.
+    # optimisation; unquantized W16A16 stays unfused so runner-side routed
+    # scaling applies only to the routed output, not the shared residual.
+    def _is_unquantized_fused_moe_method(self) -> bool:
+        quant_method = self._quant_method
+        return quant_method.__class__.__name__ == "UnquantizedFusedMoEMethod"
+
     def _apply_quant_method(
         self,
         hidden_states: torch.Tensor,
@@ -311,6 +335,8 @@ class IluMoERunner(MoERunner):
         assert self.moe_config.in_dtype == fused_output.dtype
         if shared_output is not None and fused_output.dtype == torch.float16:
             shared_output = shared_output * self.shared_experts_scaling_factor
+        if self._is_unquantized_fused_moe_method():
+            fused_output = fused_output * self.routed_experts.routed_scaling_factor
         return shared_output, fused_output
 
     # [ILU override] do_naive_dispatch_combine — delta: drop the

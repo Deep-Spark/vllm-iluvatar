@@ -93,7 +93,7 @@ vLLM 进程启动
      -> 量化注册: register_quantization_config 装饰器
      -> 模型注册: ModelRegistry.register_model
   -> apply_kv_transfer_registrations（KV connector 注册）
-     -> KVConnectorFactory.register_connector("IluNixlConnector", ...)
+     -> KVConnectorFactory.register_connector("IluNixl*", ...)
 ```
 
 ### 2.3 平台设计：IluPlatform
@@ -134,7 +134,9 @@ MoE 场景的 All2All 由 `all2all.py` 提供 `NaiveAll2AllManager`（基于 all
 
 `distributed/kv_transfer/kv_connector/v1/ilu_nixl/` 镜像上游 `vllm/distributed/kv_transfer/kv_connector/v1/nixl/` 的拆分方式，提供 `IluNixlConnector` / `IluNixlPullConnector`。它继承社区 NIXL pull 连接器，复用官方传输、heartbeat 与握手基础设施，只在 Iluvatar 需要的异构 PP/HMA region 映射、PP-aware handshake metadata 和 descriptor 选择上保留 delta。
 
-注册函数放在 `distributed.kv_transfer` 包内，由 `register_general()` 的第三步 `apply_kv_transfer_registrations()` 调用。它使用 vLLM 官方 `KVConnectorFactory.register_connector`，使 `--kv-transfer-config '{"kv_connector":"IluNixlConnector", ...}'` 能解析到插件实现。
+`distributed/kv_transfer/kv_connector/v1/ilu_nixl_push/` 提供 `IluNixlPushConnector`，用于 Iluvatar NIXL push 传输路径。
+
+注册函数放在 `distributed.kv_transfer` 包内，由 `register_general()` 的第三步 `apply_kv_transfer_registrations()` 调用。它集中使用 vLLM 官方 `KVConnectorFactory.register_connector` 注册 pull / push connector 名称，使 `--kv-transfer-config '{"kv_connector":"IluNixlConnector", ...}'`、`IluNixlPullConnector` 或 `IluNixlPushConnector` 都能解析到插件实现。各 connector 包内不再保留单独的 `nixl_patch.py` 注册入口，避免重复注册。
 
 ---
 

@@ -13,7 +13,7 @@ This is the third late-phase mechanism, kept deliberately separate from
                        copies)
 
 ``apply_oot_registrations()`` is invoked from ``register_general`` after
-``apply_general_patches()``. It drives two distinct registration paths, kept
+``apply_general_patches()``. It drives two distinct OOT registration paths, kept
 separate because their mechanisms differ:
 
   1. Op OOT registration (``_register_ops``): import every module under

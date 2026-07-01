@@ -95,7 +95,6 @@ def register_platform() -> str:
 
     register_platform_import_hooks()
 
-
     return "vllm_iluvatar.platforms.ilu_platform.IluPlatform"
 
 
@@ -118,6 +117,9 @@ def register_general() -> None:
                                       (CustomOp.register_oot / register_model)
                                       auto-discovered from the model_executor
                                       mirror tree (vllm_iluvatar.ilu_register).
+      3. apply_kv_transfer_registrations()
+                                    — KVConnectorFactory registrations for
+                                      Ilu NIXL connectors.
 
     Patches run first so any monkey-patched symbols are in place before the OOT
     modules import. Both finish before the model is loaded, which is when
@@ -128,8 +130,12 @@ def register_general() -> None:
     except ImportError:
         return
 
+    from vllm_iluvatar.distributed.kv_transfer import (
+        apply_kv_transfer_registrations,
+    )
     from vllm_iluvatar.ilu_patch import apply_general_patches
     from vllm_iluvatar.ilu_register import apply_oot_registrations
 
     apply_general_patches()
     apply_oot_registrations()
+    apply_kv_transfer_registrations()

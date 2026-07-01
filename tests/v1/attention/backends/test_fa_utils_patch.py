@@ -104,6 +104,7 @@ def test_vllm_flash_attn_shim_is_importable_without_ixformer():
     assert shim.SHIM_KEY == "vllm.vllm_flash_attn"
     assert hasattr(module, "flash_attn_varlen_func")
     assert module.get_scheduler_metadata() is None
+    assert module.compile_flash_attn_varlen_func_from_specs() is None
     try:
         from ixformer.contrib.vllm_flash_attn import (  # noqa: F401
             flash_attn_varlen_func,

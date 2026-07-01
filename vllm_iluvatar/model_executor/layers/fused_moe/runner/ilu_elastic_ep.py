@@ -37,6 +37,7 @@ def ilu_eplb_map_and_record(
     logical_to_physical_map: torch.Tensor,
     logical_replica_count: torch.Tensor,
     record_enabled: torch.Tensor,
+    num_unpadded_tokens: torch.Tensor | None = None,
     knuth_multiplier: int = ILU_EPLB_KNUTH_MULTIPLIER,
 ) -> torch.Tensor:
     """Pure-torch equivalent of ``_eplb_map_and_record_i32_kernel``."""
@@ -67,6 +68,11 @@ def ilu_eplb_map_and_record(
     )
 
     rec_mask = (physical_id >= 0) & (physical_id < out_size)
+    if num_unpadded_tokens is not None:
+        is_unpadded = idx < (
+            num_unpadded_tokens.reshape(-1)[0].to(torch.int64) * num_active_experts
+        )
+        rec_mask &= is_unpadded
     rec_flag = record_enabled.reshape(-1)[0].to(expert_load_view.dtype)
     safe_phys = torch.where(rec_mask, physical_id, torch.zeros_like(physical_id)).to(
         torch.long

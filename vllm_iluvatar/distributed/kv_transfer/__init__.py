@@ -18,6 +18,11 @@ _ILU_KV_CONNECTORS = (
         "vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl",
         "IluNixlPullConnector",
     ),
+    (
+        "IluNixlPushConnector",
+        "vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_push",
+        "IluNixlPushConnector",
+    ),
 )
 
 __all__ = ["apply_kv_transfer_registrations"]

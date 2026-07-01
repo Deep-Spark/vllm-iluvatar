@@ -49,6 +49,7 @@ from vllm.config import (
     get_current_vllm_config,
 )
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
@@ -890,7 +891,12 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             out.zero_()
             return
 
-        # 5) Run the sparse MLA forward into the pre-allocated ``out`` buffer
+        # 5) Until this, all kv cache are wrote, do kv transfer if needed
+        if has_kv_transfer_group():
+            connector = get_kv_transfer_group()
+            connector.save_kv_layer("layer_name", "kv_cache", "attn_metadata")
+
+        # 6) Run the sparse MLA forward into the pre-allocated ``out`` buffer
         #    (shape ``(T, n_local_heads, head_dim)``). No head-count padding:
         #    ixformer kernels (``ds4_flash_mla_sparse_fwd`` /
         #    ``ds4_flash_mla_with_kvcache``) accept arbitrary ``h_q``.

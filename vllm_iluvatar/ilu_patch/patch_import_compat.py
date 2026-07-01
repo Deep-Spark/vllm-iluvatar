@@ -58,6 +58,7 @@ def _patch_torch_accelerator() -> None:
         "device_count": torch.cuda.device_count,
         "set_device_index": torch.cuda.set_device,
         "current_device_index": torch.cuda.current_device,
+        "get_memory_info": torch.cuda.mem_get_info,
         "memory_stats": torch.cuda.memory_stats,
         "memory_reserved": torch.cuda.memory_reserved,
         "max_memory_allocated": torch.cuda.max_memory_allocated,

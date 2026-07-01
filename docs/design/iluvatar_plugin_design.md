@@ -26,7 +26,7 @@ vllm-iluvatar/
     ├── __init__.py         # 插件入口（register_platform / register_general）+ 早期 shim 加载器
     ├── _custom_ops.py / envs.py / version.py # 算子实现 / 环境变量 / 版本（对齐上游）
     ├── platforms/          # IluPlatform：Iluvatar OOT 平台 + attention backend 注册（见 §2.3、第 7 章）
-    ├── distributed/        # 镜像 vllm/distributed/：通信器 + general patch 落点（见 §2.4、第 4 章）
+    ├── distributed/        # 镜像 vllm/distributed/：通信器 + KV connector + general patch 落点（见 §2.4、§2.7、第 4 章）
     ├── model_executor/     # 镜像 vllm/model_executor/：算子 / 量化 / 模型 OOT 实现（见第 5、6、8 章）
     ├── v1/                 # 镜像 vllm/v1/：attention backend 能力函数 override + 接线（如 v1/attention/backends/fa_utils*，见第 4 章）
     ├── ilu_patch/          # 运行期挂接层：general patch 编排 + import hook + 模块替身 shim（import_shims/，见第 3、4 章）
@@ -53,11 +53,11 @@ iluvatar = "vllm_iluvatar:register_general"
 ```
 
 - `register_platform()`：vLLM 在首次解析 `current_platform` 时调用,返回平台类路径字符串。
-- `register_general()`：vLLM 在 `load_general_plugins()`（所有模块初始化后）调用，作为 late phase 入口，依次执行 `apply_general_patches()`（general patch，见第 4 章）与 `apply_oot_registrations()`（OOT 注册，见第 5、6 章）。
+- `register_general()`：vLLM 在 `load_general_plugins()`（所有模块初始化后）调用，作为 late phase 入口，依次执行 `apply_general_patches()`（general patch，见第 4 章）、`apply_oot_registrations()`（OOT 注册，见第 5、6 章）与 `apply_kv_transfer_registrations()`（KV connector 注册，见 §2.7）。
 
-### 2.2 十条接入路径（按生效时机划分）
+### 2.2 十一条接入路径（按生效时机划分）
 
-插件核心适配分为十条路径，在不同阶段生效：
+插件核心适配分为十一条路径，在不同阶段生效：
 
 | 适配对象 | 机制 | 生效时机 |
 | --- | --- | --- |
@@ -71,6 +71,7 @@ iluvatar = "vllm_iluvatar:register_general"
 | CustomOp 算子 OOT 替换 | `CustomOp.register_oot`（`register_general` 自动发现，见第 5 章） | 对应 layer 实例化时 |
 | 量化方法注册 | `register_quantization_config` 装饰器（`_OOT_OP_PACKAGES` import 触发，见第 8 章） | `register_general` 后、量化探测时 |
 | 模型 OOT 替换 | `ModelRegistry.register_model`（`register_model()` 钩子，见第 6 章） | 模型加载时 |
+| KV connector 注册 | `KVConnectorFactory.register_connector`（`apply_kv_transfer_registrations()` 显式注册，见 §2.7） | `register_general` 后、创建 KV connector 前 |
 
 ```text
 vLLM 进程启动
@@ -91,6 +92,8 @@ vLLM 进程启动
      -> 算子 OOT: CustomOp.register_oot
      -> 量化注册: register_quantization_config 装饰器
      -> 模型注册: ModelRegistry.register_model
+  -> apply_kv_transfer_registrations（KV connector 注册）
+     -> KVConnectorFactory.register_connector("IluNixlConnector", ...)
 ```
 
 ### 2.3 平台设计：IluPlatform
@@ -126,6 +129,12 @@ MoE 场景的 All2All 由 `all2all.py` 提供 `NaiveAll2AllManager`（基于 all
 ### 2.6 一致性保障：签名校验
 
 `ilu_util/signature.py` 的 `validate_patch_signatures` 在启动期比对「覆盖函数」与「社区原函数」的签名。`_custom_ops` 与 `IluCommunicator` 的覆盖都会经过严格校验（`strict=True`）：若社区升级导致签名变化而插件未跟进，启动会立即 fail-fast，避免运行期隐蔽错误。少数有意偏离社区签名的接口通过显式白名单跳过校验。
+
+### 2.7 KV connector：IluNixlConnector
+
+`distributed/kv_transfer/kv_connector/v1/ilu_nixl/` 镜像上游 `vllm/distributed/kv_transfer/kv_connector/v1/nixl/` 的拆分方式，提供 `IluNixlConnector` / `IluNixlPullConnector`。它继承社区 NIXL pull 连接器，复用官方传输、heartbeat 与握手基础设施，只在 Iluvatar 需要的异构 PP/HMA region 映射、PP-aware handshake metadata 和 descriptor 选择上保留 delta。
+
+注册函数放在 `distributed.kv_transfer` 包内，由 `register_general()` 的第三步 `apply_kv_transfer_registrations()` 调用。它使用 vLLM 官方 `KVConnectorFactory.register_connector`，使 `--kv-transfer-config '{"kv_connector":"IluNixlConnector", ...}'` 能解析到插件实现。
 
 ---
 
@@ -696,6 +705,7 @@ IluPlatform.import_ir_kernels / get_default_ir_op_priority
 3. **上游为「按后端分文件」的镜像目录中、我们新增的后端实现 -> `ilu_` 前缀**：
    - `platforms/ilu_platform.py`（`platforms/` 镜像 `vllm/platforms/`）
    - `distributed/device_communicators/ilu_communicator.py`
+   - `distributed/kv_transfer/kv_connector/v1/ilu_nixl/`（镜像上游 `distributed/kv_transfer/kv_connector/v1/nixl/` 的 connector 拆分）
 4. **新增文件夹（上游无对应概念）-> 文件夹以 `ilu_` 开头,内部子目录/文件不再加 `ilu`**（文件夹本身即标识）：
    - `ilu_patch/`（内含 `general_patch.py`、`general_patches/`、`import_hook.py`、`patch_custom_ops.py`、`patch_import_compat.py`、`patch_platform_import_hooks.py`）
    - `ilu_register/`（OOT 注册编排，见第 5、6、8 章）
@@ -732,7 +742,7 @@ general patch 接线 ->  ilu_patch/general_patches/patch_<target>.py
 platform import hook ->  ilu_patch/patch_platform_import_hooks.py（平台确认后注册、目标模块 import 后回调）
 模块替身 shim     ->  ilu_patch/import_shims/<被替身上游模块同名>.py（如 vllm_flash_attn.py）
 镜像目录新增文件  ->  ilu_<name>.py（ilu_platform.py / ilu_communicator.py）
-新增文件夹        ->  ilu_<name>/，内部不缀（ilu_patch/ / ilu_register/ / ilu_util/）
+新增文件夹        ->  ilu_<name>/，内部不缀（ilu_patch/ / ilu_register/ / ilu_util/ / kv_connector/v1/ilu_nixl/）
 包基础设施        ->  __init__.py / version.py（不变）
 类名              ->  Ilu 前缀（含 OOT 子类 IluRMSNorm 等）；按名挂回社区的符号保留社区名
 接线钩子          ->  register()（general patch）/ _HOOKS（platform import hook）/ register_model()（模型 OOT）/ 装饰器（算子 OOT）

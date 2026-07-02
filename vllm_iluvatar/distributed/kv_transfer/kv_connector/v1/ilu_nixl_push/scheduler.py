@@ -6,6 +6,7 @@ import asyncio
 import threading
 import time
 import traceback
+from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 import msgspec
@@ -77,14 +78,14 @@ class NixlConnectorScheduler:
         self.block_size = vllm_config.cache_config.block_size
         self.engine_id: EngineId = engine_id
         self.kv_cache_config = kv_cache_config
-        self.side_channel_host = envs.VLLM_ILU_NIXL_SIDE_CHANNEL_HOST
+        self.side_channel_host = envs.VLLM_NIXL_SIDE_CHANNEL_HOST
         self.side_channel_port = (
-            envs.VLLM_ILU_NIXL_SIDE_CHANNEL_PORT
+            envs.VLLM_NIXL_SIDE_CHANNEL_PORT
             + vllm_config.parallel_config.data_parallel_index
         )
         assert vllm_config.kv_transfer_config is not None
         if current_platform.device_type == "cpu":
-            assert False, "iluvatar nixl only support cuda device"
+            raise AssertionError("iluvatar nixl only support cuda device")
         logger.info("Initializing NIXL Scheduler %s", engine_id)
 
         # ---- hybrid kv ----
@@ -301,11 +302,11 @@ class NixlConnectorScheduler:
         if ratio == 1:
             return block_ids
 
-        kernel_block_arange = np.arange(ratio)
+        kernel_block_offsets = np.arange(ratio)
         return [
             (
                 np.array(blocks, dtype=np.int32).reshape(-1, 1) * ratio
-                + kernel_block_arange
+                + kernel_block_offsets
             ).reshape(-1)[: cdiv(token_lens, block_sizes[i])]
             if self.remap_to_kernel_size[i] > 0
             else np.array(blocks)
@@ -777,67 +778,65 @@ class NixlConnectorScheduler:
             # send a empty list to remote prefill node to help them writing blocks.
 
             # no need to let worker return finished info about this request.
-            if remote_engine_id := params.get("remote_engine_id", None):
-                if remote_engine_id not in self.peer_node_metas:
-                    with zmq_ctx(zmq.REQ, envs.VLLM_ILU_NIXL_PROXY_ADDR) as sock:
-                        sock.setsockopt(zmq.RCVTIMEO, 5000)
-                        try:
-                            peer_infos: dict[str, Any] = msgspec.msgpack.decode(
-                                zmq_comm2proxy(
-                                    sock,
-                                    msgspec.msgpack.encode(
-                                        (GET_NODE_META_MSG, remote_engine_id)
-                                    ),
-                                    need_recv=True,
-                                    logger=logger,
-                                )
+            remote_engine_id = params.get("remote_engine_id", None)
+            if remote_engine_id and remote_engine_id not in self.peer_node_metas:
+                with zmq_ctx(zmq.REQ, envs.VLLM_ILU_NIXL_PROXY_ADDR) as sock:
+                    sock.setsockopt(zmq.RCVTIMEO, 5000)
+                    try:
+                        peer_infos: dict[str, Any] = msgspec.msgpack.decode(
+                            zmq_comm2proxy(
+                                sock,
+                                msgspec.msgpack.encode(
+                                    (GET_NODE_META_MSG, remote_engine_id)
+                                ),
+                                need_recv=True,
+                                logger=logger,
                             )
-                        # remote has be removed, do not need send connect/block id to remote, return.
-                        except NodeError:
-                            return False, {}
+                        )
+                    # remote has be removed, do not need send connect/block id to remote, return.
+                    except NodeError:
+                        return False, {}
 
-                    remote_physical_block_size = peer_infos["physical_block_size"]
-                    # after set xfer handshake metadata, the block_size is set to physical_block_size
-                    block_size_ratio = min(
-                        1, self.block_size // remote_physical_block_size
-                    )
-                    remote_ratio, remote_block_size = (
-                        block_size_ratio * self.physical_blocks_per_logical_kv_block,
-                        self.block_size // block_size_ratio,
-                    )
-                    remote_addr = peer_infos["side_channel_addr"]
+                remote_physical_block_size = peer_infos["physical_block_size"]
+                # after set xfer handshake metadata, the block_size is set to physical_block_size
+                block_size_ratio = min(1, self.block_size // remote_physical_block_size)
+                remote_ratio, remote_block_size = (
+                    block_size_ratio * self.physical_blocks_per_logical_kv_block,
+                    self.block_size // block_size_ratio,
+                )
+                remote_addr = peer_infos["side_channel_addr"]
 
-                    # make a socket direct connect to remote node for send infos
-                    assert remote_addr != self.side_channel_host + str(
-                        self.side_channel_port
-                    )
-                    peer_path = make_zmq_path("tcp", remote_addr)
-                    peer_socket = make_zmq_socket(
-                        path=peer_path,
-                        ctx=self.ctx,
-                        socket_type=zmq.REQ,
-                        bind=False,
-                    )
-                    node_meta = NodeMeta(
-                        pp_size=self.node_info["pp_size"],
-                        tp_size=self.node_info["tp_size"],
-                        engine_id=self.engine_id,
-                        dp_rank=self.node_info["dp_rank"],
-                        pp_split=self.node_info["pp_split"],
-                        expire_time=self._kv_lease_duration,
-                        kv_group_infos=self.kv_group_infos,
-                    )
-                    self.peer_node_metas[remote_engine_id] = PeerMeta(
-                        addr=remote_addr,
-                        block_ratio=remote_ratio,
-                        block_size=remote_block_size,
-                        socket=peer_socket,
-                    )
-                    # first, send D node connect msg to P node
-                    self._async_loop.call_soon_threadsafe(
-                        self.send_to_peer_infos.put_nowait,
-                        (remote_engine_id, ("connect", node_meta)),
-                    )
+                # make a socket direct connect to remote node for send infos
+                assert remote_addr != self.side_channel_host + str(
+                    self.side_channel_port
+                )
+                peer_path = make_zmq_path("tcp", remote_addr)
+                peer_socket = make_zmq_socket(
+                    path=peer_path,
+                    ctx=self.ctx,
+                    socket_type=zmq.REQ,
+                    bind=False,
+                )
+                node_meta = NodeMeta(
+                    pp_size=self.node_info["pp_size"],
+                    tp_size=self.node_info["tp_size"],
+                    engine_id=self.engine_id,
+                    dp_rank=self.node_info["dp_rank"],
+                    pp_split=self.node_info["pp_split"],
+                    expire_time=self._kv_lease_duration,
+                    kv_group_infos=self.kv_group_infos,
+                )
+                self.peer_node_metas[remote_engine_id] = PeerMeta(
+                    addr=remote_addr,
+                    block_ratio=remote_ratio,
+                    block_size=remote_block_size,
+                    socket=peer_socket,
+                )
+                # first, send D node connect msg to P node
+                self._async_loop.call_soon_threadsafe(
+                    self.send_to_peer_infos.put_nowait,
+                    (remote_engine_id, ("connect", node_meta)),
+                )
             self._async_loop.call_soon_threadsafe(
                 self.send_to_peer_infos.put_nowait,
                 (remote_engine_id, ("block_ids", (request.request_id, [[]]))),
@@ -892,7 +891,7 @@ class NixlConnectorScheduler:
 
         try:
             self._async_loop.run_until_complete(tasks())
-        except:
+        except Exception:
             logger.fatal("An exception occurred in the scheduler background thread")
             traceback.print_exc()
 
@@ -918,7 +917,7 @@ class NixlConnectorScheduler:
                 await writer.drain()
                 await reader.readexactly(1)
             except Exception as e:
-                logger.error(f"{e}")
+                logger.error("%s", e)
                 logger.error("Cannot connect to: %s(use PORT+1 to keep alive)", addr)
                 await asyncio.sleep(1)
             finally:
@@ -950,7 +949,9 @@ class NixlConnectorScheduler:
             # get sub from worker
             for _ in range(self.node_info["tp_size"] * self.node_info["pp_size"]):
                 if await publish_to_connector.recv() != b"\x01":
-                    raise "NIXL handshake listener failed to connect to connector"
+                    raise RuntimeError(
+                        "NIXL handshake listener failed to connect to connector"
+                    )
             await publish_to_connector.send(b"READY")
             recv_from.setsockopt(zmq.RCVTIMEO, 1000)
 
@@ -971,7 +972,7 @@ class NixlConnectorScheduler:
                     if self._stop_event.is_set():
                         break
                     continue
-                except:
+                except Exception:
                     pass
 
     async def _run_send_infos(self):
@@ -979,18 +980,14 @@ class NixlConnectorScheduler:
             remote_engine_id, send_infos = await self.send_to_peer_infos.get()
             if send_infos is None:
                 peer_meta: PeerMeta = self.peer_node_metas.pop(remote_engine_id)
-                try:
+                with suppress(BaseException):
                     peer_meta.socket.close()
-                except:
-                    pass
                 continue
             # when remote disconnect, send_to_peer_infos may still have some infos to send, we drop these infos.
             peer_meta: PeerMeta = self.peer_node_metas.get(remote_engine_id, None)
             if peer_meta is not None:
                 await peer_meta.socket.send(msgspec.msgpack.encode(send_infos))
-                try:
+                with suppress(BaseException):
                     # remote may closed when before get disconnect msg, recv msg form a closed remote socket will
                     # get a error
                     await peer_meta.socket.recv()
-                except:
-                    pass

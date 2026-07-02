@@ -140,7 +140,7 @@ class NixlConnectorWorker:
             )
 
         if self.device_type == "cpu":
-            assert False, "iluvatar nixl only support cuda device"
+            raise AssertionError("iluvatar nixl only support cuda device")
 
         # support for oot platform which can't register nixl memory
         # type based on kv_buffer_device
@@ -264,7 +264,7 @@ class NixlConnectorWorker:
                     "error when create kv cache info from kv_cache_config.kv_cache_groups, error: %s",
                     e,
                 )
-                raise RuntimeError("Create NixlConnectorScheduler error!")
+                raise RuntimeError("Create NixlConnectorScheduler error!") from e
             current_group_info = [
                 (layer_index_mapping[layer_name], layer_name, layer_kv_spec)
                 for layer_name, layer_kv_spec in kv_cache_specs.items()
@@ -363,7 +363,7 @@ class NixlConnectorWorker:
                         num_blocks=1, block_size=16, num_kv_heads=1, head_size=1
                     )
                     self.attn_backend = backend
-                except:
+                except Exception:
                     pass
         else:
             raise RuntimeError("can not find an appropriate attention backend ")
@@ -672,8 +672,8 @@ class NixlConnectorWorker:
         for index, (
             l_desc,
             r_desc,
-            local_block_len,
-            remote_block_len,
+            local_block_bytes,
+            remote_block_bytes,
             kv_spec,
         ) in enumerate(
             zip(local_desc, remote_desc, local_block_len, remote_block_len, layer_desc)
@@ -684,17 +684,17 @@ class NixlConnectorWorker:
             # so the validate codes are the same for them.
             new_l_desc: list[tuple[int, int]] = []
             new_r_desc: list[tuple[int, int]] = []
-            if (
-                isinstance(kv_spec, MLAAttentionSpec)
-                or isinstance(kv_spec, SlidingWindowMLASpec)
-                or (is_local_kv_replicated and is_remote_kv_replicated)
+            if isinstance(kv_spec, (MLAAttentionSpec, SlidingWindowMLASpec)) or (
+                is_local_kv_replicated and is_remote_kv_replicated
             ):
                 if local_block_bigger:
-                    assert local_block_len // block_size_ratio == remote_block_len, (
+                    assert (
+                        local_block_bytes // block_size_ratio == remote_block_bytes
+                    ), (
                         "KV cache sizes must match between P and D when replicated kv head or MLA model"
                     )
-                    new_local_block_len[index] = local_block_len // block_size_ratio
-                    new_remote_block_len[index] = remote_block_len
+                    new_local_block_len[index] = local_block_bytes // block_size_ratio
+                    new_remote_block_len[index] = remote_block_bytes
                     local_block_num_ratios[index] = block_size_ratio
                     for l_desc_per_ptr, r_desc_per_ptr in zip(l_desc, r_desc):
                         l_start, l_len = l_desc_per_ptr
@@ -704,11 +704,13 @@ class NixlConnectorWorker:
                         new_l_desc.append((l_start, l_len // block_size_ratio))
                         new_r_desc.append((r_start, r_len))
                 else:
-                    assert local_block_len == remote_block_len // block_size_ratio, (
+                    assert (
+                        local_block_bytes == remote_block_bytes // block_size_ratio
+                    ), (
                         "KV cache sizes must match between P and D when replicated kv head or MLA model"
                     )
-                    new_local_block_len[index] = local_block_len
-                    new_remote_block_len[index] = remote_block_len // block_size_ratio
+                    new_local_block_len[index] = local_block_bytes
+                    new_remote_block_len[index] = remote_block_bytes // block_size_ratio
                     remote_block_num_ratios[index] = block_size_ratio
                     for l_desc_per_ptr, r_desc_per_ptr in zip(l_desc, r_desc):
                         l_start, l_len = l_desc_per_ptr
@@ -734,8 +736,8 @@ class NixlConnectorWorker:
                     local_repeat_times = max(
                         self.tp_world_size // self.total_num_kv_heads, 1
                     )
-                    new_local_block_len[index] = local_block_len
-                    new_remote_block_len[index] = remote_block_len
+                    new_local_block_len[index] = local_block_bytes
+                    new_remote_block_len[index] = remote_block_bytes
                     if not is_local_kv_replicated:
                         for l_desc_per_ptr, r_desc_per_ptr in zip(l_desc, r_desc):
                             l_start, l_len = l_desc_per_ptr
@@ -775,7 +777,7 @@ class NixlConnectorWorker:
                                         l_len,
                                     )
                                 )
-                            # some additional logice here, because only some local tp will write date to remote
+                            # some additional logic here, because only some local tp will write data to remote
                             tp_msg_resize = local_repeat_times
                             remote_tp_notify_msg = remote_tp_notify_msg.format(
                                 remote_tp_rank * (tp_ratio // local_repeat_times),
@@ -783,8 +785,8 @@ class NixlConnectorWorker:
                             )
                         else:
                             pass
-                    assert remote_block_len == (
-                        local_block_len * (tp_ratio // local_repeat_times)
+                    assert remote_block_bytes == (
+                        local_block_bytes * (tp_ratio // local_repeat_times)
                     ), (
                         "Remote P worker KV layer cache must be of shape [2, N, "
                         "local_kv_heads*tp_ratio, block_size, head_dim] and same dtype."
@@ -794,8 +796,8 @@ class NixlConnectorWorker:
                     remote_repeat_times = max(
                         remote_tp_size // self.total_num_kv_heads, 1
                     )
-                    new_remote_block_len[index] = remote_block_len
-                    new_local_block_len[index] = local_block_len
+                    new_remote_block_len[index] = remote_block_bytes
+                    new_local_block_len[index] = local_block_bytes
                     for l_desc_per_ptr, r_desc_per_ptr in zip(l_desc, r_desc):
                         l_start, l_len = l_desc_per_ptr
                         r_start, r_len = r_desc_per_ptr
@@ -823,8 +825,8 @@ class NixlConnectorWorker:
                     remote_tp_notify_msg = remote_tp_notify_msg.format(
                         self.tp_rank, self.tp_rank + 1
                     )
-                    assert remote_block_len == (
-                        local_block_len // (tp_ratio // remote_repeat_times)
+                    assert remote_block_bytes == (
+                        local_block_bytes // (tp_ratio // remote_repeat_times)
                     ), (
                         "Remote P worker KV layer cache must be of shape [2, N, "
                         "local_kv_heads//tp_ratio, block_size, head_dim] and same dtype."
@@ -1137,22 +1139,21 @@ class NixlConnectorWorker:
                         ]  # offset, len
                         remote_desc_info = remote_layer_desc_mapping[layer_name]
 
-                        if self._has_mamba:
-                            if isinstance(layer_spec, MambaSpec) or not isinstance(
-                                layer_spec, MLAAttentionSpec
-                            ):
-                                # NOTE(gyf): for local tp size == remote tp size, register con + ssm as one memory
-                                # 1 for mamba or full-attention, 2 for full-attention with scale,
-                                assert (
-                                    len(local_desc_info) == 1
-                                    and len(remote_desc_info) == 1
-                                )
-                                if self.tp_world_size == remote_tp_world_size:
-                                    local_desc_info[0] = local_desc_info[0][-1:]
-                                    remote_desc_info[0] = remote_desc_info[0][-1:]
-                                else:
-                                    local_desc_info[0] = local_desc_info[0][:-1]
-                                    remote_desc_info[0] = remote_desc_info[0][:-1]
+                        if self._has_mamba and (
+                            isinstance(layer_spec, MambaSpec)
+                            or not isinstance(layer_spec, MLAAttentionSpec)
+                        ):
+                            # NOTE(gyf): for local tp size == remote tp size, register con + ssm as one memory
+                            # 1 for mamba or full-attention, 2 for full-attention with scale,
+                            assert (
+                                len(local_desc_info) == 1 and len(remote_desc_info) == 1
+                            )
+                            if self.tp_world_size == remote_tp_world_size:
+                                local_desc_info[0] = local_desc_info[0][-1:]
+                                remote_desc_info[0] = remote_desc_info[0][-1:]
+                            else:
+                                local_desc_info[0] = local_desc_info[0][:-1]
+                                remote_desc_info[0] = remote_desc_info[0][:-1]
 
                         local_desc_infos[group_id].extend(local_desc_info)
                         remote_desc_infos[group_id].extend(remote_desc_info)
@@ -1863,7 +1864,7 @@ class NixlConnectorWorker:
                             ]
                         )
                     else:
-                        # NOTE(gyf): this kv spec may padded, but we transfor all data.
+                        # NOTE(gyf): this kv spec may be padded, but we transfer all data.
                         desc_cur_layer.append((0, physical_page_size))
                 self.layer_desc_mapping[layer_name].append(desc_cur_layer)
                 if exist:
@@ -2069,10 +2070,10 @@ class NixlConnectorWorker:
             return
 
         token_lens = req_meta.prompt_token_len
-        kernel_block_arange = np.arange(block_size_ratio)
-        block_size = self.block_size // kernel_block_arange
+        kernel_block_offsets = np.arange(block_size_ratio)
+        block_size = self.block_size // block_size_ratio
         req_meta.local_block_ids_np = [
-            (blocks.reshape(-1, 1) * block_size_ratio + kernel_block_arange).reshape(
+            (blocks.reshape(-1, 1) * block_size_ratio + kernel_block_offsets).reshape(
                 -1
             )[: cdiv(token_lens, block_size)]
             if self.remap_to_kernel_size[i] > 0
@@ -2275,8 +2276,7 @@ class NixlConnectorWorker:
             return
 
         # save kv layer will be called after start_load_kv
-        connector_metadata: NixlConnectorMetadata = None
-        if not (connector_metadata := self._connector_metadata):
+        if not self._connector_metadata:
             return
 
         layer_index = self.layer_index
@@ -2288,12 +2288,11 @@ class NixlConnectorWorker:
 
         self.layer_index += 1
         self.un_send_layer_nums -= 1
-        if not self.un_send_layer_nums:
-            if reqs := self._reqs_to_send_per_rank:
-                self._async_loop.call_soon_threadsafe(
-                    self._reqs_to_send.put_nowait,
-                    (reqs, -1, torch.cuda.current_stream().record_event()),
-                )
+        if not self.un_send_layer_nums and (reqs := self._reqs_to_send_per_rank):
+            self._async_loop.call_soon_threadsafe(
+                self._reqs_to_send.put_nowait,
+                (reqs, -1, torch.cuda.current_stream().record_event()),
+            )
 
     def save_kv_layer_host(
         self,
@@ -2306,8 +2305,7 @@ class NixlConnectorWorker:
             return
 
         # save kv layer is call after start_load_kv
-        connector_metadata: NixlConnectorMetadata = None
-        if not (connector_metadata := self._connector_metadata):
+        if not self._connector_metadata:
             return
 
         # bnd means shape: [B, Head_nums, head_dims]
@@ -2752,7 +2750,7 @@ class NixlConnectorWorker:
 
         try:
             self._async_loop.run_until_complete(tasks())
-        except:
+        except Exception:
             logger.fatal("An exception occurred in the connecter background thread")
             traceback.print_exc()
 
@@ -2764,7 +2762,9 @@ class NixlConnectorWorker:
             # subscribe to scheduler
             await recv_from_scheduler.send(b"\x01")
             if await recv_from_scheduler.recv() != b"READY":
-                raise "NIXL worker listener failed to connect to scheduler"
+                raise RuntimeError(
+                    "NIXL worker listener failed to connect to scheduler"
+                )
             recv_from_scheduler.setsockopt(zmq.RCVTIMEO, 1000)
 
             while True:
@@ -2801,10 +2801,12 @@ class NixlConnectorWorker:
                         self._remote_agents_per_rank[node_meta.engine_id] = (
                             per_rank_info
                         )
-                        logger.info(f"connect to remote engine: {node_meta.engine_id}")
+                        logger.info("connect to remote engine: %s", node_meta.engine_id)
                     else:
                         logger.info(
-                            f"get a unsupported op: {op_type}, supported ops: block_ids, connect, disconnect, check_helper"
+                            "get a unsupported op: %s, supported ops: block_ids, "
+                            "connect, disconnect, check_helper",
+                            op_type,
                         )
                 except Exception as e:
                     logger.info("error on fun _scheduler_listener: %s", e)
@@ -2847,7 +2849,7 @@ class NixlConnectorWorker:
                 for engine_id in engine_to_rm:
                     all_disconnect_to_checks.pop(engine_id)
                     logger.info(
-                        "remote engine id : %s removed during 300s afer get disconnected info, if any msgs come from that remote, this process will crash."
+                        "remote engine id : %s removed during 300s after get disconnected info, if any msgs come from that remote, this process will crash."
                         "the upper developer should ensure this",
                         engine_id,
                     )

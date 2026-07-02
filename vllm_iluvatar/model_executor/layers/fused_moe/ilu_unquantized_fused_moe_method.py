@@ -4,16 +4,16 @@
 Corresponds to:
     vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py
 
-Target   : UnquantizedFusedMoEMethod.apply
-           UnquantizedFusedMoEMethod.forward_native
-Baseline : main_e0871ad2259 + fork ILUVATAR_W16A16 delta
+Target   : vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method.
+           UnquantizedFusedMoEMethod
+Baseline : main_93d8f834dd8 + fork ILUVATAR_W16A16 delta
 Why      : preserve the fork-only ILUVATAR_W16A16 ``ilu_apply`` dispatch without
            editing community vLLM source.
-How      : ``patch_unquantized_fused_moe_method`` installs these methods onto
-           the community class after vLLM has initialised. ``forward_native``
-           calls ``ilu_w16a16_fused_experts`` directly, replacing the fork's
-           temporary community ``fused_moe.py`` edit.
-Scope    : late general-plugin patch during ``register_general()``.
+How      : ``@UnquantizedFusedMoEMethod.register_oot()`` installs an official
+           CustomOp OOT subclass. ``forward_native`` calls
+           ``ilu_w16a16_fused_experts`` directly, replacing the fork's temporary
+           community ``fused_moe.py`` edit.
+Scope    : imported during ``apply_oot_registrations()``.
 Safety   : this implementation is intentionally only for ILUVATAR_W16A16. Do
            not add generic community fallback logic here; use the upstream method
            when running a non-Iluvatar backend.
@@ -27,6 +27,9 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+    UnquantizedFusedMoEMethod,
+)
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
 )
@@ -35,8 +38,9 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
 
-class IluUnquantizedFusedMoEMethod:
-    """ILUVATAR_W16A16 surface installed onto UnquantizedFusedMoEMethod."""
+@UnquantizedFusedMoEMethod.register_oot()
+class IluUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+    """ILUVATAR_W16A16 OOT implementation of UnquantizedFusedMoEMethod."""
 
     def apply(
         self,

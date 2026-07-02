@@ -4,7 +4,7 @@
 Migrated from upstream ``vllm/model_executor/layers/fused_moe/iluvatar_runner/
 ilu_elastic_ep.py`` + ``vllm/distributed/eplb/ilu_rebalance.py``.
 
-Baseline : main_e0871ad2259
+Baseline : main_93d8f834dd8
 
 Contains:
   ilu_eplb_map_and_record       pure-torch EPLB mapping (replaces Triton kernel)
@@ -142,7 +142,12 @@ def ilu_is_monolithic(modular_method) -> bool:
     """
     cached = getattr(modular_method, "_ilu_is_monolithic", None)
     if cached is None:
-        cached = modular_method.__class__.__name__ == "UnquantizedFusedMoEMethod"
+        quant_method = getattr(modular_method, "old_quant_method", modular_method)
+        from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+            UnquantizedFusedMoEMethod,
+        )
+
+        cached = isinstance(quant_method, UnquantizedFusedMoEMethod)
         modular_method._ilu_is_monolithic = cached
     return cached
 

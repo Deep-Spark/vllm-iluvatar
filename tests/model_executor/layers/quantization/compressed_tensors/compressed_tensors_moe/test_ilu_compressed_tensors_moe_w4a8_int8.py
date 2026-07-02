@@ -42,7 +42,8 @@ def _non_ep_layer():
         top_k=1,
         local_num_experts=4,
         global_num_experts=4,
-        routed_scaling_factor=1.0,
+        routed_scaling_factor=9.0,
+        _ilu_output_scale=2.5,
         activation=SimpleNamespace(value="silu"),
         w13_weight=torch.empty((4, 2, 5)),
         w2_weight=torch.empty((4, 5, 5)),
@@ -134,6 +135,7 @@ def test_w4a8_non_ep_uses_regular_token_index_and_group_gemm(monkeypatch):
     )
 
     assert result is expected
+    assert fake_ixfops.moe_output_reduce_sum.call_args.kwargs["scaling_factor"] == 2.5
     fake_ixfops.moe_compute_token_index.assert_called_once()
     assert fake_ixfops.moe_w4a8_group_gemm.call_count == 2
     fake_ixfops.moe_w4a8_group_gemv.assert_not_called()
@@ -179,6 +181,7 @@ def test_w4a8_decode_uses_decode_token_index_and_group_gemv(monkeypatch):
     )
 
     assert result is expected
+    assert fake_ixfops.moe_output_reduce_sum.call_args.kwargs["scaling_factor"] == 2.5
     fake_ixfops.moe_compute_token_index_for_decode.assert_called_once()
     assert fake_ixfops.moe_w4a8_group_gemv.call_count == 2
     fake_ixfops.moe_w4a8_group_gemm.assert_not_called()

@@ -39,6 +39,10 @@ from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
 logger = init_logger(__name__)
 
 
+def _get_ilu_output_scale(layer: RoutedExperts) -> float:
+    return getattr(layer, "_ilu_output_scale", 1.0)
+
+
 def _is_supported_decode_metadata(value) -> bool:
     """Accept community metadata plus Iluvatar fork metadata by class name."""
     return isinstance(value, MLACommonMetadata) or (
@@ -375,7 +379,7 @@ class IluCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
             final_hidden_states = ixfops.moe_output_reduce_sum(
                 input=pt_output_3.view(num_tokens, layer.top_k, -1),
                 topk_weight=topk_weights,
-                scaling_factor=layer.routed_scaling_factor,
+                scaling_factor=_get_ilu_output_scale(layer),
                 extra_residual=shared_experts_input,
             )
         else:
@@ -460,7 +464,7 @@ class IluCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 final_hidden_states = ixfops.moe_output_reduce_sum(
                     input=pt_output_3.view(num_tokens, layer.top_k, -1),
                     topk_weight=topk_weights,
-                    scaling_factor=layer.routed_scaling_factor,
+                    scaling_factor=_get_ilu_output_scale(layer),
                     mask=reduce_mask,
                     extra_residual=shared_experts_input,
                 )
@@ -481,7 +485,7 @@ class IluCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 final_hidden_states = ixfops.moe_output_reduce_sum(
                     input=pt_output_3.view(num_tokens, layer.top_k, -1),
                     topk_weight=topk_weights,
-                    scaling_factor=layer.routed_scaling_factor,
+                    scaling_factor=_get_ilu_output_scale(layer),
                     extra_residual=shared_experts_input,
                 )
 

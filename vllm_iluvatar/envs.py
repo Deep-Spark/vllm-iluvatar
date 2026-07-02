@@ -64,7 +64,6 @@ if TYPE_CHECKING:
     VLLM_ILU_MLA_CUSTOMIZE: bool = True
     VLLM_ILU_MIX_QUANTIZATION_TYPE: str = ""
     VLLM_ILU_ENFORCE_CUDA_GRAPH: bool = False
-    VLLM_ILU_MOE_OPT_LEVEL: int = 0
     VLLM_ILU_LINEAR_OPT_LEVEL: int = 0
     VLLM_ILU_OPT_EXCLUDE_LAYERS: str = ""
     VLLM_ILU_LINEAR_SPECIFIED_LAYERS: str = ""
@@ -111,9 +110,6 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
     ).upper(),
     "VLLM_ILU_ENFORCE_CUDA_GRAPH": lambda: bool(
         int(_get("VLLM_ILU_ENFORCE_CUDA_GRAPH", "VLLM_ENFORCE_CUDA_GRAPH", "0"))
-    ),
-    "VLLM_ILU_MOE_OPT_LEVEL": lambda: int(
-        _get("VLLM_ILU_MOE_OPT_LEVEL", "VLLM_MOE_OPT_LEVEL", "0")
     ),
     "VLLM_ILU_LINEAR_OPT_LEVEL": lambda: int(
         _get("VLLM_ILU_LINEAR_OPT_LEVEL", "VLLM_LINEAR_OPT_LEVEL", "0")

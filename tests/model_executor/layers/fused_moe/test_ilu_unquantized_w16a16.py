@@ -7,7 +7,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-import importlib
+from vllm.model_executor.custom_op import op_registry_oot
+from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+    UnquantizedFusedMoEMethod,
+)
 
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_unquantized_fused_moe_method import (  # noqa: E501
     IluUnquantizedFusedMoEMethod,
@@ -34,6 +37,11 @@ def _layer(*, routed_scaling_factor: float = 7.0):
     layer.global_num_experts = 1
     layer.expert_map = None
     return layer
+
+
+def test_unquantized_method_uses_custom_op_oot_registration():
+    assert issubclass(IluUnquantizedFusedMoEMethod, UnquantizedFusedMoEMethod)
+    assert op_registry_oot["UnquantizedFusedMoEMethod"] is IluUnquantizedFusedMoEMethod
 
 
 def test_apply_adds_shared_residual_without_runner_scale():
@@ -97,14 +105,3 @@ def test_w16_helper_rejects_quantized_config():
             quant_config=quant_config,
         )
 
-
-def test_general_patch_imports_renamed_impl_module():
-    patch_module = importlib.import_module(
-        "vllm_iluvatar.ilu_patch.general_patches."
-        "patch_unquantized_fused_moe_method"
-    )
-
-    impl = importlib.import_module(patch_module._IMPL_MODULE)
-
-    assert patch_module._IMPL_MODULE.endswith(".ilu_unquantized_fused_moe_method")
-    assert impl.IluUnquantizedFusedMoEMethod is IluUnquantizedFusedMoEMethod

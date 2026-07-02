@@ -71,6 +71,26 @@ class TestKernelHandlesOwnDispatch:
 
 
 class TestIluIsMonolithic:
+    def test_detects_wrapped_unquantized_method(self):
+        """FusedMoEModularMethod stores the original method on old_quant_method."""
+        from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+            UnquantizedFusedMoEMethod,
+        )
+
+        class IluUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+            pass
+
+        quant = MagicMock()
+        quant._ilu_is_monolithic = None
+        quant.old_quant_method = IluUnquantizedFusedMoEMethod.__new__(
+            IluUnquantizedFusedMoEMethod
+        )
+
+        result = ilu_is_monolithic(quant)
+
+        assert result is True
+        assert quant._ilu_is_monolithic is True
+
     def test_caches_result(self):
         """ilu_is_monolithic must cache its result on the modular_method."""
         quant = MagicMock()

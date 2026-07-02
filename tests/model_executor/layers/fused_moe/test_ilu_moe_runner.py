@@ -9,12 +9,17 @@ added when the full environment is available.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
+    MoERunner,
     _moe_forward_shared,
+)
+from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+    UnquantizedFusedMoEMethod as CommunityUnquantizedFusedMoEMethod,
 )
 
 from vllm_iluvatar.model_executor.layers.fused_moe.runner.ilu_moe_runner import (
@@ -72,8 +77,9 @@ def _make_stub_runner(
     return obj
 
 
-class UnquantizedFusedMoEMethod:
-    pass
+class UnquantizedFusedMoEMethod(CommunityUnquantizedFusedMoEMethod):
+    def __init__(self):
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +111,58 @@ class TestSelectForward:
 class TestFP16ScalingFactor:
     """When dtype is FP16 and shared_experts is present, __init__ must
     redistribute the scaling factor to avoid FP16 overflow."""
+
+    def test_init_sets_runner_aligned_routed_experts_scale(self):
+        routed = MagicMock()
+        moe_config = MagicMock()
+        moe_config.in_dtype = torch.bfloat16
+
+        def fake_super_init(self, *args, routed_scaling_factor, **kwargs):
+            self.routed_scaling_factor = routed_scaling_factor
+            self.routed_experts = routed
+            self.routed_experts.routed_scaling_factor = 9.0
+            self._shared_experts = MagicMock()
+            self.moe_config = moe_config
+
+        vllm_config = MagicMock()
+        vllm_config.parallel_config.enable_elastic_ep = False
+        with patch.object(MoERunner, "__init__", fake_super_init), patch(
+            "vllm_iluvatar.model_executor.layers.fused_moe.runner"
+            ".ilu_moe_runner.get_current_vllm_config",
+            return_value=vllm_config,
+        ):
+            runner = IluMoERunner(routed_scaling_factor=4.0)
+
+        assert runner.routed_scaling_factor == 4.0
+        assert runner.shared_experts_scaling_factor == 1.0
+        assert routed.routed_scaling_factor == 9.0
+        assert routed._ilu_output_scale == 4.0
+
+    def test_init_fp16_shared_resets_routed_experts_scale(self):
+        routed = MagicMock()
+        moe_config = MagicMock()
+        moe_config.in_dtype = torch.float16
+
+        def fake_super_init(self, *args, routed_scaling_factor, **kwargs):
+            self.routed_scaling_factor = routed_scaling_factor
+            self.routed_experts = routed
+            self.routed_experts.routed_scaling_factor = 9.0
+            self._shared_experts = MagicMock()
+            self.moe_config = moe_config
+
+        vllm_config = MagicMock()
+        vllm_config.parallel_config.enable_elastic_ep = False
+        with patch.object(MoERunner, "__init__", fake_super_init), patch(
+            "vllm_iluvatar.model_executor.layers.fused_moe.runner"
+            ".ilu_moe_runner.get_current_vllm_config",
+            return_value=vllm_config,
+        ):
+            runner = IluMoERunner(routed_scaling_factor=4.0)
+
+        assert runner.routed_scaling_factor == 1.0
+        assert runner.shared_experts_scaling_factor == pytest.approx(0.25)
+        assert routed.routed_scaling_factor == 9.0
+        assert routed._ilu_output_scale == 1.0
 
     def test_fp16_with_shared_experts(self):
         runner = _make_stub_runner(
@@ -180,7 +238,7 @@ class TestMaybeApplyRoutedScaleToOutput:
     def test_unquantized_bf16_scales_fused_output_with_runner_scale(self):
         runner = _make_stub_runner(in_dtype=torch.bfloat16)
         runner.routed_experts.quant_method = UnquantizedFusedMoEMethod()
-        runner.routed_experts.routed_scaling_factor = 3.0
+        runner.routed_experts._ilu_output_scale = 3.0
         runner.shared_experts_scaling_factor = 0.5
         shared = torch.ones(4, dtype=torch.bfloat16)
         fused = torch.ones(4, dtype=torch.bfloat16)
@@ -198,7 +256,7 @@ class TestMaybeApplyRoutedScaleToOutput:
     def test_fp16_shared_output_uses_init_reset_unquantized_scale(self):
         runner = _make_stub_runner(in_dtype=torch.float16)
         runner.routed_experts.quant_method = UnquantizedFusedMoEMethod()
-        runner.routed_experts.routed_scaling_factor = 1.0
+        runner.routed_experts._ilu_output_scale = 1.0
         runner.shared_experts_scaling_factor = 0.5
         shared = torch.ones(4, dtype=torch.float16)
         fused = torch.ones(4, dtype=torch.float16)
@@ -259,3 +317,75 @@ class TestKernelHandlesOwnDispatch:
             return_value=True,
         ):
             assert runner._kernel_handles_own_dispatch is True
+
+
+class TestForward:
+    def test_non_tuple_hidden_states_delegate_to_community_forward(self):
+        runner = _make_stub_runner()
+        hidden_states = torch.ones((2, 3))
+        router_logits = torch.ones((2, 4))
+        input_ids = torch.arange(2)
+        expected = torch.full((2, 3), 5.0)
+
+        with patch.object(MoERunner, "forward", return_value=expected) as forward:
+            result = runner.forward(hidden_states, router_logits, input_ids)
+
+        assert result is expected
+        forward.assert_called_once_with(hidden_states, router_logits, input_ids)
+
+
+class TestForwardImpl:
+    def test_fused_gate_uses_combined_gate_weight(self):
+        runner = _make_stub_runner(has_shared_experts=False)
+        runner.gate = MagicMock(return_value=(torch.full((2, 3), -1.0), None))
+        runner._fse_fuse_gate = True
+        runner._combined_gate_weight = torch.tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 2.0, 0.0],
+            ]
+        )
+        runner._maybe_fuse_gate_weights = MagicMock()
+        runner._sequence_parallel_context = nullcontext
+
+        hidden_states = torch.tensor(
+            [
+                [1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0],
+            ]
+        )
+        original_router_logits = torch.zeros(2, 2)
+        expected_router_logits = torch.tensor(
+            [
+                [1.0, 4.0],
+                [4.0, 10.0],
+            ]
+        )
+
+        runner._maybe_sync_shared_experts_stream = MagicMock()
+        runner._maybe_dispatch = MagicMock(
+            side_effect=lambda hidden, logits, input_ids: (
+                hidden,
+                logits,
+                input_ids,
+            )
+        )
+        runner._apply_quant_method = MagicMock(
+            return_value=(None, torch.full((2, 3), 7.0))
+        )
+        runner._maybe_combine = MagicMock(return_value=torch.full((2, 3), 7.0))
+
+        result = runner._forward_impl(
+            hidden_states=hidden_states,
+            router_logits=original_router_logits,
+            shared_experts_input=None,
+            input_ids=None,
+        )
+
+        runner._maybe_fuse_gate_weights.assert_called_once_with()
+        runner.gate.assert_not_called()
+        torch.testing.assert_close(
+            runner._apply_quant_method.call_args.kwargs["router_logits"],
+            expected_router_logits,
+        )
+        torch.testing.assert_close(result, torch.full((2, 3), 7.0))

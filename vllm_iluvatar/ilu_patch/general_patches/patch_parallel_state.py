@@ -13,7 +13,7 @@ overrides onto GroupCoordinator.
 
 Target   : vllm.distributed.parallel_state.GroupCoordinator.{broadcast,
            broadcast_tensor_dict}
-Baseline : main_e0871ad2259
+Baseline : main_93d8f834dd8
 How      : broadcast            -> wrapper delegating to the community method;
            broadcast_tensor_dict -> full-method copy (in parallel_state.py),
                                     guarded by a source fingerprint against the
@@ -37,7 +37,7 @@ from vllm_iluvatar.ilu_patch import general_patch as p
 # parallel_state.py together. Triple-SINGLE quotes are required because the
 # method body contains a triple-double-quoted docstring.
 #
-# Baseline: main_e0871ad2259
+# Baseline: main_93d8f834dd8
 BROADCAST_TENSOR_DICT = '''    def broadcast_tensor_dict(
         self,
         tensor_dict: dict[str, torch.Tensor | Any] | None = None,

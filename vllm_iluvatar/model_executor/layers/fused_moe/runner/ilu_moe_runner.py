@@ -2,7 +2,7 @@
 """Iluvatar MoERunner — inherits community MoERunner, overrides only the
 delta methods required for corex / Iluvatar hardware.
 
-Baseline : community ``runner/moe_runner.py`` @ main_e0871ad2259
+Baseline : community ``runner/moe_runner.py`` @ main_93d8f834dd8
 Delta    : ~250 lines vs. the original 1010-line full-class copy
 
 Override summary (each marked with ``# [ILU override]`` in-line):
@@ -25,6 +25,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import torch
+import torch.nn.functional as F
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_ep_group, get_pcp_group
 from vllm.logger import init_logger
@@ -47,9 +48,8 @@ class IluMoERunner(MoERunner):
     logic differs on corex / Iluvatar hardware.
     """
 
-    # [ILU override] __init__ — delta: elastic-EP patch install + FP16
-    # scaling redistribution. Also preserves the fork layer.py behavior that
-    # controls which scaling factor is visible to RoutedExperts.
+    # [ILU override] __init__ — delta: elastic-EP patch install + private
+    # Iluvatar output scale placement for kernels that scale after reduction.
     def __init__(self, *args, routed_scaling_factor: float = 1.0, **kwargs):
         super().__init__(*args, routed_scaling_factor=routed_scaling_factor, **kwargs)
         logger.info_once("Use Iluvatar MoERunner.")
@@ -60,32 +60,18 @@ class IluMoERunner(MoERunner):
             )
 
             install_ilu_elastic_ep_patches()
-            
-        '''
-        apply_routed_scale_to_output
-        - True
-            1. scaling_factor放到runner中处理
-                计算公式分成两种情况：
-                (1) fp16 + shared_experts
-                    检测到后，不走shared融合，且scaling_factor置为1，都放到_maybe_apply_routed_scale_to_output处理
-                    output = fused_output + shared_output / scaling_factor
-                (2) 其他情况
-                    output = fused_output * scaling_factor + shared_output(若存在)
-            2. router中的scaling_factor被设置为1传入
-        - False
-            1. scaling_factor放到router中处理，目前只有grouped topk + fused topk bias会使用
-            2. runner中的scaling_factor被设置为1传入
-        '''
 
         self.shared_experts_scaling_factor = 1.0
-        self.routed_experts.routed_scaling_factor = routed_scaling_factor
+        # Keep RoutedExperts.routed_scaling_factor router-aligned per upstream.
+        # Iluvatar kernels read this private field as their output-side scale.
+        self.routed_experts._ilu_output_scale = routed_scaling_factor
         if (
             self._shared_experts is not None
             and self.moe_config.in_dtype == torch.float16
         ):
             self.routed_scaling_factor = 1.0
             self.shared_experts_scaling_factor = 1.0 / routed_scaling_factor
-            self.routed_experts.routed_scaling_factor = 1.0
+            self.routed_experts._ilu_output_scale = 1.0
 
     # [ILU override] _select_forward — delta: corex does not support
     # torch.compile; always use the Python wrapper.
@@ -102,30 +88,25 @@ class IluMoERunner(MoERunner):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if isinstance(hidden_states, tuple):
-            assert len(hidden_states) == 3, (
-                "Expected hidden_states tuple of "
-                "(quantized_output, output_scales, fp_output)"
-            )
-            shared_experts_input = (
-                *hidden_states[:2],
-                hidden_states[-1].dtype,
-            )
-            hidden_states = hidden_states[-1]
-            hidden_states, _ = super().apply_routed_input_transform(hidden_states)
-            # Pass None so community _maybe_pad_hidden_states skips
-            # .shape[-1] on the tuple; safe because routed_output_transform
-            # is None on Iluvatar.
-            hidden_states, og_pre, og_post = self._maybe_pad_hidden_states(
-                None, hidden_states
-            )
-        else:
-            hidden_states, shared_experts_input = super().apply_routed_input_transform(
-                hidden_states
-            )
-            hidden_states, og_pre, og_post = self._maybe_pad_hidden_states(
-                shared_experts_input, hidden_states
-            )
+        if not isinstance(hidden_states, tuple):
+            return super().forward(hidden_states, router_logits, input_ids)
+
+        assert len(hidden_states) == 3, (
+            "Expected hidden_states tuple of "
+            "(quantized_output, output_scales, fp_output)"
+        )
+        shared_experts_input = (
+            *hidden_states[:2],
+            hidden_states[-1].dtype,
+        )
+        hidden_states = hidden_states[-1]
+        hidden_states, _ = super().apply_routed_input_transform(hidden_states)
+        # Pass None so community _maybe_pad_hidden_states skips
+        # .shape[-1] on the tuple; safe because routed_output_transform
+        # is None on Iluvatar.
+        hidden_states, og_pre, og_post = self._maybe_pad_hidden_states(
+            None, hidden_states
+        )
 
         result = self._forward_entry(
             hidden_states,
@@ -163,8 +144,11 @@ class IluMoERunner(MoERunner):
     # optimisation; unquantized W16A16 stays unfused so runner-side routed
     # scaling applies only to the routed output, not the shared residual.
     def _is_unquantized_fused_moe_method(self) -> bool:
-        quant_method = self._quant_method
-        return quant_method.__class__.__name__ == "UnquantizedFusedMoEMethod"
+        from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+            UnquantizedFusedMoEMethod,
+        )
+
+        return isinstance(self._quant_method, UnquantizedFusedMoEMethod)
 
     def _apply_quant_method(
         self,
@@ -249,7 +233,11 @@ class IluMoERunner(MoERunner):
         self._maybe_sync_shared_experts_stream(shared_experts_input)
 
         if self.gate is not None:
-            router_logits, _ = self.gate(hidden_states)
+            if self._fse_fuse_gate:
+                self._maybe_fuse_gate_weights()
+                router_logits = F.linear(hidden_states, self._combined_gate_weight)
+            else:
+                router_logits, _ = self.gate(hidden_states)
 
         with self._sequence_parallel_context():
             hidden_states, router_logits, input_ids = self._maybe_dispatch(
@@ -336,7 +324,7 @@ class IluMoERunner(MoERunner):
         if shared_output is not None and fused_output.dtype == torch.float16:
             shared_output = shared_output * self.shared_experts_scaling_factor
         if self._is_unquantized_fused_moe_method():
-            fused_output = fused_output * self.routed_experts.routed_scaling_factor
+            fused_output = fused_output * self.routed_experts._ilu_output_scale
         return shared_output, fused_output
 
     # [ILU override] do_naive_dispatch_combine — delta: drop the

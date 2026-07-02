@@ -9,7 +9,7 @@ auto-discovered during ``register_general``.
 
 Target   : vllm.distributed.parallel_state.GroupCoordinator.{broadcast,
            broadcast_tensor_dict}
-Baseline : main_e0871ad2259
+Baseline : main_93d8f834dd8
 Why      : route broadcast / GPU-tensor broadcast through the device
            communicator so Iluvatar (ixformer) collectives are used instead of
            torch.distributed defaults.
@@ -54,11 +54,11 @@ def _make_broadcast(orig):
 # the lines inside the MODIFICATION blocks differ from community.
 def broadcast_tensor_dict(
     self,
-    tensor_dict=None,
-    src=0,
-    group=None,
-    metadata_group=None,
-):
+    tensor_dict: dict[str, torch.Tensor | Any] | None = None,
+    src: int = 0,
+    group: ProcessGroup | None = None,
+    metadata_group: ProcessGroup | None = None,
+) -> dict[str, torch.Tensor | Any] | None:
     """Broadcast the input tensor dictionary.
     NOTE: `src` is the local rank of the source rank.
     """
@@ -72,7 +72,7 @@ def broadcast_tensor_dict(
 
     rank_in_group = self.rank_in_group
     if rank_in_group == src:
-        metadata_list = []
+        metadata_list: list[tuple[Any, Any]] = []
         assert isinstance(tensor_dict, dict), (
             f"Expecting a dictionary, got {type(tensor_dict)}"
         )
@@ -117,7 +117,9 @@ def broadcast_tensor_dict(
         async_handles = []
         for key, value in metadata_list:
             if isinstance(value, TensorMetadata):
-                tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+                tensor = torch.empty(
+                    value.size, dtype=value.dtype, device=value.device
+                )
                 if tensor.numel() == 0:
                     # Skip broadcasting empty tensors.
                     tensor_dict[key] = tensor

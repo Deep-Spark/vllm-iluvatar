@@ -9,9 +9,13 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-
+from vllm_iluvatar.ilu_patch import general_patch as p
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
     ilu_compressed_tensors_moe as ilu_moe,
+)
+
+_MAIN_93D_SCHEME_DISCOVERY_PREFIX_SHA = (
+    "5d77ca86af26fe1381f7d00825ca648176edf35d6834544323638fe96494fa06"
 )
 
 
@@ -39,6 +43,12 @@ def _install_fake_method_module(monkeypatch, module_name: str, class_name: str):
     module = types.ModuleType(module_name)
     setattr(module, class_name, _FakeMoEMethod)
     monkeypatch.setitem(sys.modules, module_name, module)
+
+
+def test_scheme_discovery_fingerprint_baseline_matches_declared_main_93d_source():
+    assert p.source_sha(ilu_moe._SCHEME_DISCOVERY_PREFIX_BASELINE) == (
+        _MAIN_93D_SCHEME_DISCOVERY_PREFIX_SHA
+    )
 
 
 def test_scheme_none_returns_unquantized_fused_moe_method(monkeypatch):

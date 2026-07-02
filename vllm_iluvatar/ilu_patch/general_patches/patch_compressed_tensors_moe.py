@@ -15,7 +15,7 @@ the wrapper and preserves the live community method as fallback.
 
 Target   : vllm.model_executor.layers.quantization.compressed_tensors.
            compressed_tensors_moe.compressed_tensors_moe.CompressedTensorsMoEMethod
-Baseline : main_e0871ad2259
+Baseline : main_93d8f834dd8
 Why      : community vLLM has no vendor hook for selecting Iluvatar W4A8/W8A8
            MoE methods from compressed-tensors configs.
 How      : install an Iluvatar wrapper for get_moe_method(); unsupported cases
@@ -61,8 +61,10 @@ def _apply() -> None:
         strict=True,
     )
 
+    original_get_moe_method = community.CompressedTensorsMoEMethod.get_moe_method
+    ilu_impl.check_scheme_discovery_fingerprint(original_get_moe_method)
     ilu_impl.set_original_get_moe_method(
-        community.CompressedTensorsMoEMethod.get_moe_method
+        original_get_moe_method
     )
     community.CompressedTensorsMoEMethod.get_moe_method = staticmethod(
         ilu_impl.IluCompressedTensorsMoEMethod.get_moe_method

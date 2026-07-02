@@ -6,7 +6,7 @@ overrides.  Implementation layer — no side effects on import.
 Corresponds to: vllm/envs.py
 Applied by:      vllm_iluvatar.register_platform()
 
-Naming policy (dual-name for backward compatibility):
+Naming policy:
   - Canonical name: VLLM_ILU_<suffix> (Iluvatar namespace, kept apart from
     real community vars).
   - Legacy alias:   VLLM_<suffix> (the original, non-standard fork name).
@@ -14,13 +14,17 @@ Naming policy (dual-name for backward compatibility):
     both OS env keys are honoured (VLLM_ILU_X preferred, then VLLM_X, then
     default).  Existing call sites (envs.VLLM_X) and launch scripts keep
     working unchanged; new code should migrate to VLLM_ILU_X.
+  - NIXL community vars are used directly with their community names.
+  - Iluvatar-only NIXL vars use VLLM_ILU_NIXL_* only and do not register
+    legacy aliases.
 
 Contents:
   1. _ILU_DEFAULTS    — community vars whose default differs for Iluvatar
                         (NOT renamed; they are real community vars).
-  2. _ILU_ENV_VARS    — new Iluvatar-only env vars, keyed by canonical name.
-  3. _ILU_ENV_ALIASES — legacy VLLM_* names mapped to the same readers.
-  4. apply()          — inject defaults + register canonical/alias readers.
+  2. _ILU_ENV_VARS    — new Iluvatar env vars with legacy aliases.
+  3. _ILU_CANONICAL_ONLY_ENV_VARS — Iluvatar-only vars without aliases.
+  4. _ILU_ENV_ALIASES — legacy VLLM_* names mapped to aliased readers.
+  5. apply()          — inject defaults + register env readers.
 """
 
 from __future__ import annotations
@@ -31,6 +35,13 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 logger = logging.getLogger(__name__)
+
+_TRUE_VALS = ("1", "true", "yes", "on")
+
+
+def _bool_reader(name: str, default: str) -> Callable[[], bool]:
+    return lambda: os.environ.get(name, default).strip().lower() in _TRUE_VALS
+
 
 # Community default -> Iluvatar default. These are real community vars, so they
 # are NOT renamed; we only change their default via os.environ.setdefault.
@@ -75,19 +86,25 @@ if TYPE_CHECKING:
     VLLM_ILU_VIT_ATTN_OPT_LEVEL: int = 0
     VLLM_ILU_VIT_ATTN_LAYER: str = ""
     VLLM_ILU_DS4_PREFILL_OPT: bool = False
-
+    VLLM_ILU_NIXL_WRITE_USE_HOST_BUFFER: bool = False
+    VLLM_ILU_NIXL_HOST_DTYPE: str = "auto"
+    VLLM_ILU_NIXL_PROXY_ADDR: str = ""
+    VLLM_ILU_NIXL_SCHEDULER_ADDR: str = ""
+    VLLM_ILU_NIXL_FORCE_PER_RANK_SEND: bool = False
+    VLLM_ILU_NIXL_SERVER_ADDR: str = ""
+    VLLM_ILU_NIXL_DS32_QUANT_AFTER_TRANSFER: bool = False
 
 # Canonical (VLLM_ILU_*) readers. Each lambda preserves the exact parsing the
 # fork used in vllm/envs.py, and reads VLLM_ILU_* first then the legacy VLLM_*.
 _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
-    "VLLM_ILU_W8A8_MOE_USE_W4A8": lambda: _get(
-        "VLLM_ILU_W8A8_MOE_USE_W4A8", "VLLM_W8A8_MOE_USE_W4A8", "0"
-    ).lower()
-    in ("1", "true"),
-    "VLLM_ILU_WNA16_MOE_USE_W4A8": lambda: _get(
-        "VLLM_ILU_WNA16_MOE_USE_W4A8", "VLLM_WNA16_MOE_USE_W4A8", "0"
-    ).lower()
-    in ("1", "true"),
+    "VLLM_ILU_W8A8_MOE_USE_W4A8": lambda: (
+        _get("VLLM_ILU_W8A8_MOE_USE_W4A8", "VLLM_W8A8_MOE_USE_W4A8", "0").lower()
+        in ("1", "true")
+    ),
+    "VLLM_ILU_WNA16_MOE_USE_W4A8": lambda: (
+        _get("VLLM_ILU_WNA16_MOE_USE_W4A8", "VLLM_WNA16_MOE_USE_W4A8", "0").lower()
+        in ("1", "true")
+    ),
     "VLLM_ILU_W4A8_FORMAT": lambda: _get(
         "VLLM_ILU_W4A8_FORMAT", "VLLM_W4A8_FORMAT", "TN"
     ).upper(),
@@ -97,14 +114,14 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_W8A8_FORMAT": lambda: _get(
         "VLLM_ILU_W8A8_FORMAT", "VLLM_W8A8_FORMAT", "TN"
     ).upper(),
-    "VLLM_ILU_USE_INT8_MLA": lambda: _get(
-        "VLLM_ILU_USE_INT8_MLA", "VLLM_USE_INT8_MLA", "0"
-    ).lower()
-    in ("1", "true", "yes"),
-    "VLLM_ILU_MLA_CUSTOMIZE": lambda: _get(
-        "VLLM_ILU_MLA_CUSTOMIZE", "VLLM_MLA_CUSTOMIZE", "1"
-    ).lower()
-    in ("1", "true", "yes"),
+    "VLLM_ILU_USE_INT8_MLA": lambda: (
+        _get("VLLM_ILU_USE_INT8_MLA", "VLLM_USE_INT8_MLA", "0").lower()
+        in ("1", "true", "yes")
+    ),
+    "VLLM_ILU_MLA_CUSTOMIZE": lambda: (
+        _get("VLLM_ILU_MLA_CUSTOMIZE", "VLLM_MLA_CUSTOMIZE", "1").lower()
+        in ("1", "true", "yes")
+    ),
     "VLLM_ILU_MIX_QUANTIZATION_TYPE": lambda: _get(
         "VLLM_ILU_MIX_QUANTIZATION_TYPE", "VLLM_MIX_QUANTIZATION_TYPE", ""
     ).upper(),
@@ -138,10 +155,10 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
         "VLLM_ATTN_STATIC_QUANT_SCALE_FILE_PATH",
         "",
     ),
-    "VLLM_ILU_USE_LORA_FUSION": lambda: _get(
-        "VLLM_ILU_USE_LORA_FUSION", "VLLM_USE_LORA_FUSION", "0"
-    ).lower()
-    in ("1", "true"),
+    "VLLM_ILU_USE_LORA_FUSION": lambda: (
+        _get("VLLM_ILU_USE_LORA_FUSION", "VLLM_USE_LORA_FUSION", "0").lower()
+        in ("1", "true")
+    ),
     # ViT attention quantization level
     "VLLM_ILU_VIT_ATTN_OPT_LEVEL": lambda: int(
         _get("VLLM_ILU_ATTN_OPT_LEVEL", "VLLM_VIT_ATTN_OPT_LEVEL", "0")
@@ -151,10 +168,33 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_VIT_ATTN_LAYER": lambda: _get(
         "VLLM_ILU_VIT_ATTN_LAYER", "VLLM_VIT_ATTN_LAYER", ""
     ).upper(),
-    "VLLM_ILU_DS4_PREFILL_OPT": lambda: _get(
-        "VLLM_ILU_DS4_PREFILL_OPT", "VLLM_DS4_PREFILL_OPT", "0"
-    ).lower()
-    in ("1", "true"),
+    "VLLM_ILU_DS4_PREFILL_OPT": lambda: (
+        _get("VLLM_ILU_DS4_PREFILL_OPT", "VLLM_DS4_PREFILL_OPT", "0").lower()
+        in ("1", "true")
+    ),
+}
+
+
+_ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
+    "VLLM_ILU_NIXL_WRITE_USE_HOST_BUFFER": _bool_reader(
+        "VLLM_ILU_NIXL_WRITE_USE_HOST_BUFFER", "0"
+    ),
+    "VLLM_ILU_NIXL_HOST_DTYPE": lambda: os.environ.get(
+        "VLLM_ILU_NIXL_HOST_DTYPE", "auto"
+    ).lower(),
+    "VLLM_ILU_NIXL_PROXY_ADDR": lambda: os.environ.get("VLLM_ILU_NIXL_PROXY_ADDR", ""),
+    "VLLM_ILU_NIXL_SCHEDULER_ADDR": lambda: os.environ.get(
+        "VLLM_ILU_NIXL_SCHEDULER_ADDR", ""
+    ),
+    "VLLM_ILU_NIXL_FORCE_PER_RANK_SEND": _bool_reader(
+        "VLLM_ILU_NIXL_FORCE_PER_RANK_SEND", "0"
+    ),
+    "VLLM_ILU_NIXL_SERVER_ADDR": lambda: os.environ.get(
+        "VLLM_ILU_NIXL_SERVER_ADDR", ""
+    ),
+    "VLLM_ILU_NIXL_DS32_QUANT_AFTER_TRANSFER": _bool_reader(
+        "VLLM_ILU_NIXL_DS32_QUANT_AFTER_TRANSFER", "0"
+    ),
 }
 
 
@@ -169,13 +209,6 @@ _ILU_ENV_ALIASES: dict[str, Callable[[], Any]] = {
     _canonical_to_legacy(canonical): reader
     for canonical, reader in _ILU_ENV_VARS.items()
 }
-
-
-_TRUE_VALS = ("1", "true", "yes", "on")
-
-
-def _bool_reader(name: str, default: str) -> Callable[[], bool]:
-    return lambda: os.environ.get(name, default).strip().lower() in _TRUE_VALS
 
 
 # Iluvatar plugin control vars that are read directly via os.environ where they
@@ -202,7 +235,7 @@ _ILU_GUARD_ENV_VARS: dict[str, Callable[[], Any]] = {
 
 
 def apply() -> None:
-    """Inject Iluvatar env defaults and register canonical + legacy readers."""
+    """Inject Iluvatar env defaults and register env readers."""
     for key, value in _ILU_DEFAULTS.items():
         os.environ.setdefault(key, value)
         logger.debug("ILU envs: setdefault %s=%s", key, value)
@@ -211,10 +244,13 @@ def apply() -> None:
 
     envs.environment_variables.update(_ILU_ENV_VARS)
     envs.environment_variables.update(_ILU_ENV_ALIASES)
+    envs.environment_variables.update(_ILU_CANONICAL_ONLY_ENV_VARS)
     envs.environment_variables.update(_ILU_GUARD_ENV_VARS)
     logger.debug(
-        "ILU envs: registered %d canonical + %d legacy-alias + %d guard env vars",
+        "ILU envs: registered %d canonical + %d legacy-alias + "
+        "%d canonical-only + %d guard env vars",
         len(_ILU_ENV_VARS),
         len(_ILU_ENV_ALIASES),
+        len(_ILU_CANONICAL_ONLY_ENV_VARS),
         len(_ILU_GUARD_ENV_VARS),
     )

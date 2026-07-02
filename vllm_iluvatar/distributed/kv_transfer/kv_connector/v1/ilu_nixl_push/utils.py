@@ -75,14 +75,17 @@ def zmq_comm2proxy(socket: zmq.Socket, send_msg: bytes, need_recv: bool, logger:
             raise NodeError()
         if msg != b"success":
             logger.error(
-                f"Proxy failed to handle message: {msg}, please check the message format or proxy status"
+                "Proxy failed to handle message: %s, please check the "
+                "message format or proxy status",
+                msg,
             )
         if need_recv:
             msg = socket.recv()
             return msg
     except zmq.ZMQError as e:
         logger.error(
-            f"Failed to communicate with proxy: {e}, please check the proxy status"
+            "Failed to communicate with proxy: %s, please check the proxy status",
+            e,
         )
 
 
@@ -157,9 +160,19 @@ class TransferStatusChecker:
                 )
         else:
             logger.error(
-                f"recv a tp, pp layer(rank), should not write to this pp rank, get tp: {tp}, should satisfy {self.tp_start} <= tp < {self.tp_end}, "
-                f"layer/rank: {pp}, should satisfy {self.pp_start} <= pp < {self.pp_end}, "
-                f"transfer_index: {transfer_index}, transfer_nums: {transfer_nums}, should both satisfy <= {self.num_groups}"
+                "recv a tp, pp layer(rank), should not write to this pp rank, "
+                "get tp: %s, should satisfy %s <= tp < %s, layer/rank: %s, "
+                "should satisfy %s <= pp < %s, transfer_index: %s, "
+                "transfer_nums: %s, should both satisfy <= %s",
+                tp,
+                self.tp_start,
+                self.tp_end,
+                pp,
+                self.pp_start,
+                self.pp_end,
+                transfer_index,
+                transfer_nums,
+                self.num_groups,
             )
 
     def is_done(self):

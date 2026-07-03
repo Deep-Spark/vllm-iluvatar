@@ -6,7 +6,7 @@ Corresponds to:
     compressed_tensors_moe/compressed_tensors_moe.py
 
 Target   : CompressedTensorsMoEMethod.get_moe_method
-Baseline : main_93d8f834dd8
+Baseline : main_4875b4456b5
 Why      : preserve the fork's Iluvatar W4A8/W8A8 MoE method dispatch without
            editing community vLLM source.
 How      : ``patch_compressed_tensors_moe`` installs this staticmethod wrapper;

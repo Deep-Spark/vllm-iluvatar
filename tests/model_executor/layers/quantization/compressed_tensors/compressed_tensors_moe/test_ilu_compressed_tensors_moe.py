@@ -14,7 +14,7 @@ from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compres
     ilu_compressed_tensors_moe as ilu_moe,
 )
 
-_MAIN_93D_SCHEME_DISCOVERY_PREFIX_SHA = (
+_MAIN_4875_SCHEME_DISCOVERY_PREFIX_SHA = (
     "5d77ca86af26fe1381f7d00825ca648176edf35d6834544323638fe96494fa06"
 )
 
@@ -45,9 +45,9 @@ def _install_fake_method_module(monkeypatch, module_name: str, class_name: str):
     monkeypatch.setitem(sys.modules, module_name, module)
 
 
-def test_scheme_discovery_fingerprint_baseline_matches_declared_main_93d_source():
+def test_scheme_discovery_fingerprint_baseline_matches_declared_main_4875_source():
     assert p.source_sha(ilu_moe._SCHEME_DISCOVERY_PREFIX_BASELINE) == (
-        _MAIN_93D_SCHEME_DISCOVERY_PREFIX_SHA
+        _MAIN_4875_SCHEME_DISCOVERY_PREFIX_SHA
     )
 
 

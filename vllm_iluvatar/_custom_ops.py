@@ -84,8 +84,20 @@ def silu_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
     ixf_ops.silu_and_mul(x, out)
 
 
-def silu_and_mul_with_clamp(out: torch.Tensor, x: torch.Tensor, limit: float) -> None:
-    ixf_ops.silu_and_mul_with_clamp(input=x, output=out, limit=limit)
+def silu_and_mul_with_clamp(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    limit: float,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+) -> None:
+    if alpha == 1.0 and beta == 0.0:
+        ixf_ops.silu_and_mul_with_clamp(input=x, output=out, limit=limit)
+        return
+    d = x.shape[-1] // 2
+    gate = torch.clamp(x[..., :d], max=limit)
+    up = torch.clamp(x[..., d:], min=-limit, max=limit)
+    out.copy_(gate * torch.sigmoid(alpha * gate) * (up + beta))
 
 
 def gelu_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:

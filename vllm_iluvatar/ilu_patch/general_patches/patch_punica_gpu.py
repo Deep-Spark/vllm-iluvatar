@@ -12,7 +12,7 @@ register-time wiring: signature guard, binding the live community method as the
 fallback, and installing the wrapper onto ``PunicaWrapperGPU``.
 
 Target   : vllm.lora.punica_wrapper.punica_gpu.PunicaWrapperGPU.add_lora_linear
-Baseline : main_93d8f834dd8
+Baseline : main_4875b4456b5
 How      : add_lora_linear -> wrapper delegating to the community method when
                               ixformer fusion is disabled or unsupported.
 Fingerprint: add_lora_linear community source is hashed at register-time
@@ -32,7 +32,7 @@ import vllm_iluvatar.ilu_patch.general_patch as p
 # PunicaWrapperGPU.add_lora_linear (4-space method indent, trailing newline),
 # used as the drift anchor by the fingerprint guard.
 #
-# Baseline: main_93d8f834dd8
+# Baseline: main_4875b4456b5
 ADD_LORA_LINEAR = '''    def add_lora_linear(
         self,
         y: torch.Tensor,

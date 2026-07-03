@@ -6,7 +6,7 @@
 Iluvatar OOT replacement for routed expert weight loading.
 
 Target     : vllm.model_executor.layers.fused_moe.routed_experts.RoutedExperts
-Baseline   : main_93d8f834dd8 ``RoutedExperts.weight_loader``
+Baseline   : main_4875b4456b5 ``RoutedExperts.weight_loader``
 Why        : preserve the fork's MoE loading deltas without editing community
              vLLM source.
 How        : @PluggableLayer.register_oot subclass. ``weight_loader`` is a

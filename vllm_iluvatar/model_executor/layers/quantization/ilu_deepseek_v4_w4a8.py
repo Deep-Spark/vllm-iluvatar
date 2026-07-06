@@ -52,7 +52,7 @@ Dispatch (``get_quant_method``):
   :class:`IluCompressedTensorsW8A8Int8MoEMethod`
 - ``LinearBase`` whose prefix matches a shared-experts target ->
   :class:`_IluV4W8A8LinearMethod` (W8A8 INT8 channel via
-  :class:`CompressedTensorsW8A8Int8` scheme).
+  :class:`IluCompressedTensorsW8A8Int8` scheme).
 - (v2) ``LinearBase`` whose prefix matches ``bmm_w8a16_layers.targets`` ->
   :class:`_IluV4W8A16BMMLinearMethod` (INT8 weight + bf16 act via
   ``ixf_ops.marlin_w8a16``; the layer stores W_repacked / W_scale and the
@@ -380,7 +380,7 @@ class IluDeepseekV4W4A8Config(QuantizationConfig):
 class _IluV4W8A8LinearMethod(LinearMethodBase):
     """Thin W8A8 INT8 channel-symmetric linear method.
 
-    Reuses ``CompressedTensorsW8A8Int8`` as the per-layer scheme so we get
+    Reuses ``IluCompressedTensorsW8A8Int8`` as the per-layer scheme so we get
     the same kernel selection / state layout as the compressed-tensors
     config path, without paying for the full ``CompressedTensorsConfig``
     plumbing.
@@ -401,15 +401,14 @@ class _IluV4W8A8LinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import (  # noqa: E501
-            CompressedTensorsW8A8Int8,
+        from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes import (  # noqa: E501
+            IluCompressedTensorsW8A8Int8,
         )
 
-        scheme = CompressedTensorsW8A8Int8(
+        scheme = IluCompressedTensorsW8A8Int8(
             strategy=QuantizationStrategy.CHANNEL.value,
             is_static_input_scheme=False,
             input_symmetric=True,
-            is_w4a8_linear=False,
         )
         layer.scheme = scheme  # type: ignore[attr-defined]
 

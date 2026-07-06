@@ -15,6 +15,9 @@ from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.metadata imp
     IluNixlConnectorMetadata,
     IluNixlTransferRegion,
 )
+from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.pp_utils import (
+    infer_pp_split,
+)
 
 
 class _TestIluNixlBaseConnector(IluNixlBaseConnector):
@@ -42,6 +45,32 @@ def test_pp_layer_range_and_targets():
     assert IluNixlWorkerMixin._pp_layer_range("2,3,4", 1) == (2, 5)
     assert IluNixlWorkerMixin._target_pp_ranks("3,3", 0, "2,2,2") == [0, 1]
     assert IluNixlWorkerMixin._overlap_pp_count(1, "2,2,2", "3,3") == 2
+
+
+def test_infer_pp_split_single_stage_without_env(monkeypatch):
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        model_config=SimpleNamespace(
+            hf_text_config=None,
+            hf_config=SimpleNamespace(num_hidden_layers=43),
+        ),
+    )
+
+    assert infer_pp_split(vllm_config) == "43"
+
+
+def test_infer_pp_split_respects_env(monkeypatch):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "21,22")
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+        model_config=SimpleNamespace(
+            hf_text_config=None,
+            hf_config=SimpleNamespace(num_hidden_layers=43),
+        ),
+    )
+
+    assert infer_pp_split(vllm_config) == "21,22"
 
 
 def test_cache_identity_and_region_range_selection():

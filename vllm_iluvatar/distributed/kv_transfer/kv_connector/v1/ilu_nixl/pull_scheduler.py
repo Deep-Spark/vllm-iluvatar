@@ -8,6 +8,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler import (
 )
 
 from .base_scheduler import IluNixlBaseConnectorScheduler
+from .pp_utils import infer_pp_split
 
 
 class IluNixlPullConnectorScheduler(
@@ -28,5 +29,7 @@ class IluNixlPullConnectorScheduler(
         delay_free_blocks, params = super().request_finished(request, block_ids)
         if params is not None:
             params["pp_size"] = self.vllm_config.parallel_config.pipeline_parallel_size
-            params["pp_split"] = envs.VLLM_PP_LAYER_PARTITION or ""
+            params["pp_split"] = envs.VLLM_PP_LAYER_PARTITION or infer_pp_split(
+                self.vllm_config
+            )
         return delay_free_blocks, params

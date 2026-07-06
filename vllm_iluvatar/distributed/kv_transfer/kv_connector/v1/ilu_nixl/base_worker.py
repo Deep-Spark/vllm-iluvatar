@@ -31,6 +31,7 @@ from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpecs
 
 from .metadata import IluNixlAgentMetadata, IluNixlTransferRegion
+from .pp_utils import infer_pp_split
 
 logger = init_logger(__name__)
 
@@ -79,17 +80,10 @@ class IluNixlWorkerMixin:
             self.pp_size = original_pp_size
         self.pp_rank = get_pp_group().rank_in_group
         self.pp_world_size = get_pp_group().world_size
-        pp_split = envs.VLLM_PP_LAYER_PARTITION
-        if pp_split is None and self.pp_world_size > 1:
-            raise ValueError(
-                "VLLM_PP_LAYER_PARTITION must be set when using "
-                "IluNixlConnector with PP."
-            )
-        self.pp_split = pp_split or "0"
-        if self.pp_world_size > 1:
-            assert len(self.pp_split.split(",")) == self.pp_world_size, (
-                "VLLM_PP_LAYER_PARTITION split count must equal pp_size"
-            )
+        self.pp_split = envs.VLLM_PP_LAYER_PARTITION or infer_pp_split(self.vllm_config)
+        assert len(self.pp_split.split(",")) == self.pp_world_size, (
+            "PP split count must equal pp_size"
+        )
         self.layer_region_ids: dict[str, list[int]] = {}
         self.region_ids_by_group: list[np.ndarray] = []
         self.transfer_regions: list[IluNixlTransferRegion] = []

@@ -1,0 +1,122 @@
+# vLLM Iluvatar Plugin
+
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
+[![vLLM Plugin](https://img.shields.io/badge/vLLM-plugin-green)](https://github.com/vllm-project/vllm)
+
+`vllm_iluvatar` is an out-of-tree [vLLM](https://github.com/vllm-project/vllm)
+plugin for the Iluvatar CoreX platform. It adds platform integration,
+`ixformer`-backed communication and IR operators, selected `torch.ops._C`
+compatibility bindings, model and quantization support, runtime patches, and
+NIXL KV-transfer connectors—without modifying the upstream vLLM source tree.
+
+## Architecture Overview
+
+vLLM loads the plugin through two entry points:
+
+- `vllm.platform_plugins`: `register_platform()` activates `IluPlatform`,
+  early compatibility shims, runtime configuration registration, attention backend
+  registration, and worker startup hooks.
+- `vllm.general_plugins`: `register_general()` applies late runtime patches and
+  registers out-of-tree `CustomOp` implementations, models, quantization
+  methods, and KV-transfer connectors.
+
+The package includes:
+
+- `IluPlatform`, a CUDA-compatible CoreX platform adapter.
+- `IluCommunicator`, backed by `ixformer.distributed` collectives.
+- `vllm_iluvatar._C`, a native extension providing vLLM-compatible `_C`
+  operators such as `rms_norm`, `weak_ref_tensor`, and
+  `get_cuda_view_from_cpu_tensor`.
+- `vllm_iluvatar.kernels`, an Iluvatar IR operator provider for vLLM V1.
+- Runtime import hooks and compatibility shims required during worker startup.
+- Out-of-tree model and quantization support for Qwen3 and DeepSeek-V4.
+- `IluNixlConnector`, `IluNixlPullConnector`, and `IluNixlPushConnector` for
+  disaggregated prefill/decode deployments.
+
+For implementation details, see the [plugin design](docs/design/iluvatar_plugin_design.md).
+
+## Quick Start
+
+### Prerequisites
+
+- An Iluvatar CoreX GPU environment with `corex`, `torch`, and `ixformer`.
+- Python 3.10 or newer.
+- A vLLM version compatible with this plugin branch.
+- CMake and Ninja for building the native extension.
+
+The CoreX environment must provide `torch` and `ixformer`; this package does
+not install them.
+
+### Install vLLM
+
+Install the upstream vLLM version that matches this plugin branch and your
+runtime environment:
+
+```bash
+pip3 install vllm --no-deps
+```
+
+### Install vllm_iluvatar
+
+For development, use an editable installation:
+
+```bash
+bash install_vllm_iluvatar_editable.sh
+```
+
+For a wheel-based installation:
+
+```bash
+bash build_vllm_iluvatar.sh
+bash install_vllm_iluvatar.sh
+```
+
+### Verify
+
+```bash
+python3 -c "from vllm.platforms import current_platform; print(current_platform)"
+```
+
+The output or startup logs should confirm that the Iluvatar platform plugin is
+active.
+
+## Usage
+
+After installing the plugin, launch models with the standard `vllm serve`
+command. Model-specific launch scripts can define arguments in a `SERVE_ARGS`
+array and pass them through together with the serving port:
+
+```bash
+vllm serve /path/to/model "${SERVE_ARGS[@]}" --port 8000
+```
+
+Example launch configurations:
+
+```bash
+# Qwen3-14B dense
+vllm serve /path/to/qwen3_model \
+  --tensor-parallel-size 2 \
+  --trust-remote-code \
+  --gpu-memory-utilization 0.90 \
+  --max-num-batched-tokens 2048 \
+  --no-async-scheduling
+
+# DeepSeek-V4-Flash W4A8 (TN layout)
+
+vllm serve /path/to/deepseek_v4_model \
+  --tensor-parallel-size 4 \
+  --pipeline-parallel-size 2 \
+  --trust-remote-code \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.90 \
+  --no-enable-prefix-caching \
+  --max-num-batched-tokens 2048
+```
+
+For NIXL KV transfer, use vLLM's `--kv-transfer-config` option to select
+`IluNixlConnector`, `IluNixlPullConnector`, or `IluNixlPushConnector`, depending
+on the deployment topology.
+
+## Documentation
+
+- [Plugin Design](docs/design/iluvatar_plugin_design.md) — Detailed implementation notes

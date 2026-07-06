@@ -33,14 +33,12 @@ logger = logging.getLogger(__name__)
 # must be excluded from strict signature validation (validation compares
 # against community, but in this build the callers of these functions are still
 # the fork's own modules, which call with the fork convention):
-#   - rotary_embedding: fork uses `rotary_dim`; community uses
-#     `rope_dim_offset` / `inverse`.
 #   - awq_gemm: fork omits community's `split_k_iters` and adds a no-default
 #     `pack_factor`.
 # TODO(iluvatar): once these functions' callers are migrated to community
 # baseline, switch the ILU impls to the community signature and remove them
 # from this set so they are strict-validated again.
-_SKIP_SIGCHECK: set[str] = {"rotary_embedding", "awq_gemm"}
+_SKIP_SIGCHECK: set[str] = {"awq_gemm"}
 
 
 def _patch_custom_ops(module=None) -> None:

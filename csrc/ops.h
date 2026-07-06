@@ -21,4 +21,14 @@ torch::Tensor weak_ref_tensor(torch::Tensor& tensor);
 // Maps a (pinned) CPU tensor into the CUDA address space and returns a view.
 torch::Tensor get_cuda_view_from_cpu_tensor(torch::Tensor& cpu_tensor);
 
+// rotary_embedding(Tensor positions, Tensor! query, Tensor!? key,
+//                  int head_size, Tensor cos_sin_cache, bool is_neox,
+//                  int rope_dim_offset=0, bool inverse=False) -> ()
+// Self-contained CUDA kernel (no ixformer dependency); rotates query/key in
+// place. Semantics mirror vLLM upstream pos_encoding_kernels.cu.
+void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
+                      c10::optional<torch::Tensor> key, int64_t head_size,
+                      torch::Tensor& cos_sin_cache, bool is_neox,
+                      int64_t rope_dim_offset, bool inverse);
+
 }  // namespace vllm_iluvatar

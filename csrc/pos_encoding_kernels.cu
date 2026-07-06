@@ -254,6 +254,76 @@ void launch_rotary_embedding(
 #undef VLLM_ILU_LAUNCH_ROPE
 }
 
+// --- apply_rotary_emb (flash-attn style: separate cos/sin, out-of-place) ------
+// Rotates the first ``rot_dim`` channels of each head using per-seq cos/sin
+// tables. Unlike ``rotary_embedding`` above there is no positions gather: token
+// at flat index t uses row ``t % seqlen`` of cos/sin (x laid out as
+// [batch, seqlen, num_heads, head_dim] row-major). The pass-through channels
+// ``x[..., rot_dim:]`` are already carried over by the caller's clone, so the
+// kernel only touches the rotary slice. Reuses ``apply_token_rotary_embedding``
+// (fp32 accumulate) which already accepts separate cos/sin pointers.
+template <typename scalar_t, typename cache_t, bool IS_NEOX, int PACK_NUM>
+__global__ void apply_rotary_emb_kernel(
+    scalar_t* __restrict__ out, const cache_t* __restrict__ cos,
+    const cache_t* __restrict__ sin, const int seqlen, const int rot_dim,
+    const int num_heads, const int64_t token_stride,
+    const int64_t head_stride) {
+  const int token_idx = blockIdx.x;
+  const int s = token_idx % seqlen;
+  const int embed_dim = rot_dim / 2;
+  const cache_t* cos_ptr = cos + static_cast<int64_t>(s) * embed_dim;
+  const cache_t* sin_ptr = sin + static_cast<int64_t>(s) * embed_dim;
+
+  const int nq = num_heads * embed_dim;
+  for (int i = threadIdx.x * PACK_NUM; i < nq; i += blockDim.x * PACK_NUM) {
+    const int head_idx = i / embed_dim;
+    const int64_t token_head =
+        static_cast<int64_t>(token_idx) * token_stride + head_idx * head_stride;
+    const int rot_offset = i % embed_dim;
+    apply_token_rotary_embedding<scalar_t, cache_t, IS_NEOX, PACK_NUM>(
+        out + token_head, cos_ptr, sin_ptr, rot_offset, embed_dim,
+        /*inverse=*/false);
+  }
+}
+
+template <typename scalar_t, typename cache_t>
+void launch_apply_rotary_emb(scalar_t* out, const cache_t* cos,
+                             const cache_t* sin, int seqlen, int rot_dim,
+                             int num_heads, int64_t token_stride,
+                             int64_t head_stride, bool is_neox, int num_tokens,
+                             cudaStream_t stream) {
+  dim3 grid(num_tokens);
+  dim3 block(std::min<int64_t>(static_cast<int64_t>(num_heads) * rot_dim / 2,
+                               512));
+
+#define VLLM_ILU_LAUNCH_APPLY_ROPE(NEOX, PACK)                             \
+  apply_rotary_emb_kernel<scalar_t, cache_t, NEOX, PACK>                   \
+      <<<grid, block, 0, stream>>>(out, cos, sin, seqlen, rot_dim,         \
+                                   num_heads, token_stride, head_stride)
+
+  if constexpr (sizeof(scalar_t) == 2) {
+    const bool can_pack = (rot_dim % 4 == 0) && (token_stride % 2 == 0) &&
+                          (head_stride % 2 == 0);
+    if (is_neox) {
+      if (can_pack)
+        VLLM_ILU_LAUNCH_APPLY_ROPE(true, 2);
+      else
+        VLLM_ILU_LAUNCH_APPLY_ROPE(true, 1);
+    } else {
+      if (can_pack)
+        VLLM_ILU_LAUNCH_APPLY_ROPE(false, 2);
+      else
+        VLLM_ILU_LAUNCH_APPLY_ROPE(false, 1);
+    }
+  } else {
+    if (is_neox)
+      VLLM_ILU_LAUNCH_APPLY_ROPE(true, 1);
+    else
+      VLLM_ILU_LAUNCH_APPLY_ROPE(false, 1);
+  }
+#undef VLLM_ILU_LAUNCH_APPLY_ROPE
+}
+
 }  // namespace
 
 void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
@@ -359,6 +429,101 @@ void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
 
 #undef VLLM_ILU_DISPATCH_CACHE
 #undef VLLM_ILU_DISPATCH_ROPE
+}
+
+// apply_rotary_emb(Tensor x, Tensor cos, Tensor sin, bool interleaved) -> Tensor
+//
+// Plugin-internal op (community torch.ops._C has NO such op): serves the
+// ApplyRotaryEmb OOT override (vllm_iluvatar/model_executor/layers/
+// rotary_embedding/common.py). Mirrors the community forward_static /
+// vllm_flash_attn apply_rotary_emb semantics so it can replace the native
+// PyTorch fallback with a real kernel while staying CUDA-compatible.
+//   x         : [batch, seqlen, num_heads, head_dim]  (3D [seqlen, H, D] ok too)
+//   cos / sin : [seqlen, rot_dim / 2]  (broadcast across batch and heads)
+//   interleaved=false -> Neox (first/second half); true -> GPT-J (even/odd).
+// Returns a new tensor (out-of-place); rot_dim (= cos.size(-1) * 2) may be
+// smaller than head_dim (partial rotary), with x[..., rot_dim:] copied through.
+torch::Tensor apply_rotary_emb(torch::Tensor& x, torch::Tensor& cos,
+                               torch::Tensor& sin, bool interleaved) {
+  TORCH_CHECK(x.dim() == 3 || x.dim() == 4,
+              "x must be [seqlen, num_heads, head_dim] or "
+              "[batch, seqlen, num_heads, head_dim]");
+  TORCH_CHECK(cos.dim() == 2 && sin.dim() == 2,
+              "cos and sin must be [seqlen, rot_dim / 2]");
+  TORCH_CHECK(cos.scalar_type() == sin.scalar_type(),
+              "cos and sin must share the same dtype");
+  TORCH_CHECK(cos.size(0) == sin.size(0) && cos.size(1) == sin.size(1),
+              "cos and sin must have the same shape");
+
+  const int64_t head_dim = x.size(-1);
+  const int64_t num_heads = x.size(-2);
+  const int64_t seqlen = cos.size(0);
+  const int64_t rot_dim = cos.size(1) * 2;
+  TORCH_CHECK(rot_dim % 2 == 0, "rot_dim must be even");
+  TORCH_CHECK(rot_dim <= head_dim, "rot_dim must not exceed head_dim");
+
+  const int64_t num_tokens = x.numel() / (num_heads * head_dim);
+  TORCH_CHECK(seqlen > 0 && num_tokens % seqlen == 0,
+              "x token count must be a multiple of cos/sin seqlen");
+
+  // Out-of-place: clone carries the pass-through channels; rotate in place.
+  auto out = x.contiguous().clone();
+  if (num_tokens == 0 || num_heads == 0 || rot_dim == 0) return out;
+
+  const int64_t token_stride = num_heads * head_dim;
+  const int64_t head_stride = head_dim;
+
+  const at::cuda::OptionalCUDAGuard device_guard(x.device());
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  const auto x_type = out.scalar_type();
+  const auto cache_type = cos.scalar_type();
+  void* out_ptr = out.data_ptr();
+  const void* cos_ptr = cos.contiguous().data_ptr();
+  const void* sin_ptr = sin.contiguous().data_ptr();
+
+#define VLLM_ILU_DISPATCH_APPLY_ROPE(XT, CT)                                 \
+  launch_apply_rotary_emb<XT, CT>(                                           \
+      reinterpret_cast<XT*>(out_ptr), reinterpret_cast<const CT*>(cos_ptr),  \
+      reinterpret_cast<const CT*>(sin_ptr), static_cast<int>(seqlen),        \
+      static_cast<int>(rot_dim), static_cast<int>(num_heads), token_stride,  \
+      head_stride, /*is_neox=*/!interleaved, static_cast<int>(num_tokens),   \
+      stream)
+
+#define VLLM_ILU_DISPATCH_APPLY_CACHE(XT)                                    \
+  do {                                                                       \
+    if (cache_type == at::kFloat) {                                          \
+      VLLM_ILU_DISPATCH_APPLY_ROPE(XT, float);                               \
+    } else if (cache_type == at::kHalf) {                                    \
+      VLLM_ILU_DISPATCH_APPLY_ROPE(XT, half);                                \
+    } else if (cache_type == at::kBFloat16) {                               \
+      VLLM_ILU_DISPATCH_APPLY_ROPE(XT, __nv_bfloat16);                       \
+    } else {                                                                 \
+      TORCH_CHECK(false, "unsupported cos/sin dtype: ", cache_type);         \
+    }                                                                        \
+  } while (0)
+
+  if (x_type == at::kFloat) {
+    VLLM_ILU_DISPATCH_APPLY_CACHE(float);
+  } else if (x_type == at::kHalf) {
+    VLLM_ILU_DISPATCH_APPLY_CACHE(half);
+  } else if (x_type == at::kBFloat16) {
+    VLLM_ILU_DISPATCH_APPLY_CACHE(__nv_bfloat16);
+  } else {
+    TORCH_CHECK(false, "unsupported x dtype: ", x_type);
+  }
+
+#undef VLLM_ILU_DISPATCH_APPLY_CACHE
+#undef VLLM_ILU_DISPATCH_APPLY_ROPE
+
+  return out;
+}
+
+torch::Tensor apply_rotary_emb_meta(torch::Tensor& x, torch::Tensor& /*cos*/,
+                                    torch::Tensor& /*sin*/,
+                                    bool /*interleaved*/) {
+  // Out-of-place op: the result has the same shape/dtype as x.
+  return at::empty_like(x, x.options(), at::MemoryFormat::Contiguous);
 }
 
 }  // namespace vllm_iluvatar

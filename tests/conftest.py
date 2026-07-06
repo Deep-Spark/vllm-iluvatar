@@ -35,3 +35,17 @@ def cuda_device() -> str:
     if not _cuda_available():
         pytest.skip("CUDA device required")
     return "cuda:0"
+
+
+@pytest.fixture()
+def default_vllm_config():
+    """Set a default VllmConfig for tests that directly construct CustomOps.
+
+    CustomOp.__init__ calls get_current_vllm_config(), which asserts a config
+    context is active. Mirrors the upstream vllm tests/conftest.py fixture.
+    """
+    from vllm.config import VllmConfig, set_current_vllm_config
+
+    config = VllmConfig()
+    with set_current_vllm_config(config):
+        yield config

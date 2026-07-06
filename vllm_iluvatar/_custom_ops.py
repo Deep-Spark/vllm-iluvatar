@@ -44,7 +44,6 @@ _ILU_OVERRIDES: list[str] = [
     "fused_add_rms_norm",
     "reshape_and_cache_flash",
     "rms_norm",
-    "rotary_embedding",
     "scaled_int8_quant",
     "topk_hash_softplus_sqrt",
     "topk_sigmoid",
@@ -144,18 +143,9 @@ def mul_and_silu(out: torch.Tensor, x: torch.Tensor) -> None:
 
 
 # pos encoding ops
-def rotary_embedding(
-    positions: torch.Tensor,
-    query: torch.Tensor,
-    key: torch.Tensor | None,
-    head_size: int,
-    cos_sin_cache: torch.Tensor,
-    is_neox: bool,
-    rotary_dim: int = -1,
-) -> None:
-    ixf_ops.vllm_rotary_embedding(
-        positions, query, key, head_size, cos_sin_cache, is_neox, rotary_dim=rotary_dim
-    )
+# rotary_embedding is now provided by the plugin's native torch.ops._C kernel
+# (csrc/pos_encoding_kernels.cu), which matches the community signature exactly,
+# so community vllm._custom_ops.rotary_embedding is used unchanged (no override).
 
 
 # layer norm ops

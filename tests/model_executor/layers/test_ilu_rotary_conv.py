@@ -1,139 +1,65 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU-only tests for Iluvatar rotary and Conv3D OOT replacements."""
+"""CPU-only tests for Iluvatar rotary and Conv3D OOT replacements.
+
+The 10 base RotaryEmbedding ``forward_cuda`` OOT overrides were removed once the
+plugin gained a native community-signature ``torch.ops._C.rotary_embedding``
+(csrc/pos_encoding_kernels.cu): the community ``RotaryEmbedding.forward_cuda``
+now works unchanged, so those subclasses must NOT be in ``op_registry_oot`` and
+the plugin's ``_custom_ops`` no longer defines ``rotary_embedding``. The numeric
+kernel correctness is covered by tests/kernels/core/test_pos_encoding.py.
+"""
 
 from __future__ import annotations
 
-import inspect
 from unittest.mock import MagicMock
 
 import torch
 from vllm.model_executor.custom_op import op_registry_oot
-from vllm.model_executor.layers.conv import Conv3dLayer
-from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
+from vllm.model_executor.layers.conv import Conv3dLayer  # noqa: F401
+from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb  # noqa: F401
 
 import vllm_iluvatar._custom_ops as ilu_ops
 from vllm_iluvatar.model_executor.layers.conv import IluConv3dLayer
-from vllm_iluvatar.model_executor.layers.rotary_embedding.base import (
-    IluDynamicNTKAlphaRotaryEmbedding,
-    IluDynamicNTKScalingRotaryEmbedding,
-    IluFourierRotaryEmbedding,
-    IluGemma4RotaryEmbedding,
-    IluLinearScalingRotaryEmbedding,
-    IluLlama3RotaryEmbedding,
-    IluNTKScalingRotaryEmbedding,
-    IluRotaryEmbedding,
-    IluTeleChat3RoPEScaledRotaryEmbedding,
-    IluYaRNScalingRotaryEmbedding,
-    forward_cuda as ilu_rotary_forward_cuda,
-)
 from vllm_iluvatar.model_executor.layers.rotary_embedding.common import (
     IluApplyRotaryEmb,
 )
 
-
-def test_rotary_embedding_preserves_explicit_rotary_dim(monkeypatch):
-    calls = []
-
-    def fake_rotary_embedding(*args, **kwargs):
-        calls.append((args, kwargs))
-
-    monkeypatch.setattr(ilu_ops.ixf_ops, "vllm_rotary_embedding", fake_rotary_embedding)
-
-    ilu_ops.rotary_embedding(
-        torch.tensor([0], dtype=torch.int64),
-        torch.empty((1, 1, 8)),
-        None,
-        head_size=8,
-        cos_sin_cache=torch.empty((4, 6)),
-        is_neox=False,
-        rotary_dim=4,
-    )
-
-    assert calls[0][1]["rotary_dim"] == 4
+# The base RotaryEmbedding classes the plugin used to override with
+# per-subclass forward_cuda deltas (now handled by the native _C kernel).
+_REMOVED_ROPE_OOT_KEYS = [
+    "RotaryEmbedding",
+    "Llama3RotaryEmbedding",
+    "LinearScalingRotaryEmbedding",
+    "NTKScalingRotaryEmbedding",
+    "DynamicNTKAlphaRotaryEmbedding",
+    "DynamicNTKScalingRotaryEmbedding",
+    "FourierRotaryEmbedding",
+    "YaRNScalingRotaryEmbedding",
+    "TeleChat3RoPEScaledRotaryEmbedding",
+    "Gemma4RotaryEmbedding",
+]
 
 
-def test_rotary_embedding_oot_passes_rotary_dim(monkeypatch):
-    assert op_registry_oot["RotaryEmbedding"] is IluRotaryEmbedding
-
-    calls = []
-
-    def fake_rotary_embedding(*args):
-        calls.append(args)
-
-    monkeypatch.setattr("vllm._custom_ops.rotary_embedding", fake_rotary_embedding)
-    op = object.__new__(IluRotaryEmbedding)
-    op.use_flashinfer = False
-    op.head_size = 8
-    op.rotary_dim = 6
-    op.is_neox_style = True
-    cos_sin_cache = torch.empty((4, 6))
-    op._match_cos_sin_cache_dtype = MagicMock(return_value=cos_sin_cache)
-    positions = torch.tensor([0, 1], dtype=torch.int64)
-    query = torch.empty((2, 1, 8))
-    key = torch.empty((2, 1, 8))
-
-    assert IluRotaryEmbedding.forward_cuda(op, positions, query, key) == (query, key)
-
-    op._match_cos_sin_cache_dtype.assert_called_once_with(query)
-    assert calls == [
-        (positions, query, key, 8, cos_sin_cache, True, 6),
-    ]
+def test_base_rotary_overrides_removed():
+    """The 10 base rope forward_cuda overrides are gone (native _C kernel)."""
+    for key in _REMOVED_ROPE_OOT_KEYS:
+        assert key not in op_registry_oot, (
+            f"{key} should no longer be OOT-overridden; the community "
+            f"forward_cuda now calls torch.ops._C.rotary_embedding directly"
+        )
 
 
-def test_rotary_embedding_subclass_oot_passes_rotary_dim(monkeypatch):
-    assert op_registry_oot["Llama3RotaryEmbedding"] is IluLlama3RotaryEmbedding
-
-    calls = []
-
-    def fake_rotary_embedding(*args):
-        calls.append(args)
-
-    monkeypatch.setattr("vllm._custom_ops.rotary_embedding", fake_rotary_embedding)
-    op = object.__new__(IluLlama3RotaryEmbedding)
-    op.use_flashinfer = False
-    op.head_size = 8
-    op.rotary_dim = 6
-    op.is_neox_style = True
-    cos_sin_cache = torch.empty((4, 6))
-    op._match_cos_sin_cache_dtype = MagicMock(return_value=cos_sin_cache)
-    positions = torch.tensor([0, 1], dtype=torch.int64)
-    query = torch.empty((2, 1, 8))
-    key = torch.empty((2, 1, 8))
-
-    assert IluLlama3RotaryEmbedding.forward_cuda(op, positions, query, key) == (
-        query,
-        key,
-    )
-    assert calls == [
-        (positions, query, key, 8, cos_sin_cache, True, 6),
-    ]
+def test_plugin_custom_ops_has_no_rotary_embedding():
+    """Plugin _custom_ops no longer overrides rotary_embedding."""
+    assert not hasattr(ilu_ops, "rotary_embedding")
+    assert "rotary_embedding" not in ilu_ops._ILU_OVERRIDES
+    assert "rotary_embedding" not in ilu_ops._ILU_ADDED
 
 
-def test_rotary_embedding_subclass_oot_registrations():
-    assert op_registry_oot["LinearScalingRotaryEmbedding"] is (
-        IluLinearScalingRotaryEmbedding
-    )
-    assert op_registry_oot["NTKScalingRotaryEmbedding"] is IluNTKScalingRotaryEmbedding
-    assert op_registry_oot["DynamicNTKAlphaRotaryEmbedding"] is (
-        IluDynamicNTKAlphaRotaryEmbedding
-    )
-    assert op_registry_oot["DynamicNTKScalingRotaryEmbedding"] is (
-        IluDynamicNTKScalingRotaryEmbedding
-    )
-    assert op_registry_oot["FourierRotaryEmbedding"] is IluFourierRotaryEmbedding
-    assert op_registry_oot["YaRNScalingRotaryEmbedding"] is (
-        IluYaRNScalingRotaryEmbedding
-    )
-    assert op_registry_oot["TeleChat3RoPEScaledRotaryEmbedding"] is (
-        IluTeleChat3RoPEScaledRotaryEmbedding
-    )
-    assert op_registry_oot["Gemma4RotaryEmbedding"] is IluGemma4RotaryEmbedding
+def test_rotary_embedding_not_in_skip_sigcheck():
+    from vllm_iluvatar.ilu_patch.patch_custom_ops import _SKIP_SIGCHECK
 
-
-def test_rotary_embedding_forward_cuda_ilu_delta():
-    assert "self.is_neox_style,\n        self.rotary_dim," in (
-        inspect.getsource(ilu_rotary_forward_cuda)
-    )
+    assert "rotary_embedding" not in _SKIP_SIGCHECK
 
 
 def test_apply_rotary_emb_oot_uses_native_cuda_path():

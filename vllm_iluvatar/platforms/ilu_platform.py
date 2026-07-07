@@ -185,6 +185,7 @@ def _make_iluvatar_platform():
             model_config = getattr(vllm_config, "model_config", None)
             if model_config is None:
                 return
+
             try:
                 archs = model_config.architectures or []
             except Exception:

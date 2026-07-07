@@ -49,6 +49,7 @@ _OOT_OP_PACKAGES = [
     "vllm_iluvatar.model_executor.layers",
     "vllm_iluvatar.model_executor.layers.fused_moe",
     "vllm_iluvatar.model_executor.layers.fused_moe.router",
+    "vllm_iluvatar.model_executor.layers.mamba.gdn",
     "vllm_iluvatar.model_executor.layers.rotary_embedding",
     # Quantization configs register via @register_quantization_config at import.
     "vllm_iluvatar.model_executor.layers.quantization",

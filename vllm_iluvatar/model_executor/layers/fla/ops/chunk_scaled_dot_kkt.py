@@ -8,9 +8,13 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
+import torch
+
 from vllm.triton_utils import tl, triton
 
+from vllm.model_executor.layers.fla.ops.index import prepare_chunk_indices
 from vllm.model_executor.layers.fla.ops.op import exp
+from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
 
 
 @triton.heuristics(
@@ -79,9 +83,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
         )
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_kb = b_k * b_beta[:, None]
-        # >>> ILU MODIFICATION >>>
         b_A += tl.dot(b_kb.to(b_k.dtype), tl.trans(b_k))
-        # <<< ILU MODIFICATION <<<
 
     if USE_G:
         p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
@@ -95,3 +97,37 @@ def chunk_scaled_dot_kkt_fwd_kernel(
         A + (bos * H + i_h) * BT, (T, BT), (BT * H, 1), (i_t * BT, 0), (BT, BT), (1, 0)
     )
     tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
+
+
+def chunk_scaled_dot_kkt_fwd(
+    k: torch.Tensor,
+    g: torch.Tensor | None = None,
+    beta: torch.Tensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    chunk_size: int = FLA_CHUNK_SIZE,
+    output_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Compute beta * K * K^T with the Iluvatar Triton dtype path."""
+    B, T, Hg, K = k.shape
+    H = beta.shape[-1]
+    BT = chunk_size
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+
+    A = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
+    chunk_scaled_dot_kkt_fwd_kernel[(NT, B * H)](
+        k=k,
+        g=g,
+        beta=beta,
+        A=A,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        T=T,
+        H=H,
+        Hg=Hg,
+        K=K,
+        BT=BT,
+    )
+    return A

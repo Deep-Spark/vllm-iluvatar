@@ -69,6 +69,8 @@ def _patch_torch_accelerator() -> None:
     for name, func in patch_map.items():
         if not hasattr(accel, name):
             setattr(accel, name, func)
+    if not hasattr(torch, "float4_e2m1fn_x2"):
+        torch.float4_e2m1fn_x2 = "float4_e2m1fn_x2"
 
 
 def _stub_symmetric_memory() -> None:
@@ -98,6 +100,47 @@ def _disable_unsupported_symmetric_memory() -> None:
         os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
 
 
+def _patch_triton_gdc_symbols() -> None:
+    """Provide no-op Triton GDC symbols for CoreX AST dependency scanning.
+
+    vLLM's LoRA Triton kernels reference ``tl.extra.cuda.gdc_*`` inside
+    constexpr-gated branches. Even when PDL/GDC is disabled at runtime, Triton
+    still resolves those helper symbols while building the JIT cache key. CoreX
+    Triton does not expose them, so install no-op helpers early enough for the
+    dependency scan to succeed.
+    """
+    try:
+        import triton
+        import triton.language as tl
+    except Exception:
+        return
+
+    extra = getattr(tl, "extra", None)
+    if extra is None:
+        return
+
+    cuda_extra = getattr(extra, "cuda", None)
+    if cuda_extra is None:
+        cuda_extra = types.SimpleNamespace()
+        extra.cuda = cuda_extra
+
+    if not hasattr(cuda_extra, "gdc_wait"):
+
+        @triton.jit
+        def _ilu_gdc_wait():
+            pass
+
+        cuda_extra.gdc_wait = _ilu_gdc_wait
+
+    if not hasattr(cuda_extra, "gdc_launch_dependents"):
+
+        @triton.jit
+        def _ilu_gdc_launch_dependents():
+            pass
+
+        cuda_extra.gdc_launch_dependents = _ilu_gdc_launch_dependents
+
+
 def _install_import_shims() -> None:
     # Inject module *stand-in* shims into sys.modules BEFORE any deep
     # ``import vllm``.  Unlike the attribute-level shims above, these replace a
@@ -119,6 +162,7 @@ def _register_import_hooks() -> None:
     # NOT imported here, so no heavy deps / platform resolution / ixformer are
     # forced.  Each patch_<target>.py calls import_hook.register(...) at import.
     import vllm_iluvatar.ilu_patch.patch_custom_ops  # noqa: F401
+    import vllm_iluvatar.ilu_patch.patch_pynvml  # noqa: F401
 
 
 def _load_native_torch_ops() -> None:
@@ -141,6 +185,7 @@ def apply() -> None:
         return
     _applied = True
     try:
+        _patch_triton_gdc_symbols()
         _patch_torch_accelerator()
         _stub_symmetric_memory()
         _disable_unsupported_symmetric_memory()

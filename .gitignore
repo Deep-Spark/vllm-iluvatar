@@ -30,3 +30,6 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+
+# so files
+*.so

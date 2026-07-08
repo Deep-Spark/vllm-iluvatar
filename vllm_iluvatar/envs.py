@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     VLLM_ILU_NIXL_FORCE_PER_RANK_SEND: bool = False
     VLLM_ILU_NIXL_SERVER_ADDR: str = ""
     VLLM_ILU_NIXL_DS32_QUANT_AFTER_TRANSFER: bool = False
+    VLLM_ILU_LINEAR_BACKEND: str = ""
 
 # Canonical (VLLM_ILU_*) readers. Each lambda preserves the exact parsing the
 # fork used in vllm/envs.py, and reads VLLM_ILU_* first then the legacy VLLM_*.
@@ -167,6 +168,12 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_NIXL_DS32_QUANT_AFTER_TRANSFER": _bool_reader(
         "VLLM_ILU_NIXL_DS32_QUANT_AFTER_TRANSFER", "0"
     ),
+    "VLLM_ILU_LINEAR_BACKEND": lambda: os.environ.get(
+        "VLLM_ILU_LINEAR_BACKEND", ""
+    )
+    .strip()
+    .lower()
+    .replace("-", "_"),
 }
 
 

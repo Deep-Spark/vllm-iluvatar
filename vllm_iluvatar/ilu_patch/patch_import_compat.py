@@ -23,7 +23,18 @@ Shims (no-ops on stock CUDA torch):
      ``symm_mem_available=True`` and later crashes at ``torch_symm_mem.empty``
      during GroupCoordinator init.  We pre-inject a stub and force-disable
      symmetric-memory allreduce via ``VLLM_ALLREDUCE_USE_SYMM_MEM=0``.
-
+  3. torch.fx._graph_pickler — the CoreX Torch build used here ships
+     GraphPickler but not Options. Community ``vllm.compilation.caching``
+     imports both at module scope, so patch the missing Options symbol before
+     vLLM imports it.
+  4. torch._inductor.config / torch._functorch.config — some CoreX Torch builds
+     lack config keys that upstream vLLM patches or serializes during compile
+     setup/cache-key creation, so add compatible no-op defaults before vLLM
+     builds the config.
+  5. torch.ops._C compile-only quant schemas — compilation fusion modules bind
+     several FP8 quant op overloads at import time. Register missing schemas as
+     real dispatcher ops so FX matchers can import even when CoreX does not ship
+     these CUDA kernels.
 Then installs module *stand-in* shims (``_install_import_shims`` ->
 ``import_shims.install_all``): whole community modules that would otherwise be
 imported at *import time* and fail on corex are replaced in ``sys.modules`` with
@@ -45,14 +56,98 @@ import os
 import types
 
 _applied = False
+_torch_c_schema_libraries: list[object] = []
+
+_TORCH_C_COMPILE_SCHEMA_OPS = {
+    "static_scaled_fp8_quant": (
+        "static_scaled_fp8_quant(Tensor! result, Tensor input, Tensor scale, "
+        "int[]? group_shape=None) -> ()"
+    ),
+    "dynamic_scaled_fp8_quant": (
+        "dynamic_scaled_fp8_quant(Tensor! result, Tensor input, Tensor! scale) -> ()"
+    ),
+    "dynamic_per_token_scaled_fp8_quant": (
+        "dynamic_per_token_scaled_fp8_quant(Tensor! result, Tensor input, "
+        "Tensor! scale, Tensor? scale_ub) -> ()"
+    ),
+    "rms_norm_static_fp8_quant": (
+        "rms_norm_static_fp8_quant(Tensor! result, Tensor input, Tensor weight, "
+        "Tensor scale, float epsilon) -> ()"
+    ),
+    "fused_add_rms_norm": (
+        "fused_add_rms_norm(Tensor! input, Tensor! residual, Tensor? weight, "
+        "float epsilon) -> ()"
+    ),
+    "fused_add_rms_norm_static_fp8_quant": (
+        "fused_add_rms_norm_static_fp8_quant(Tensor! result, Tensor input, "
+        "Tensor! residual, Tensor weight, Tensor scale, float epsilon) -> ()"
+    ),
+    "rms_norm_dynamic_per_token_quant": (
+        "rms_norm_dynamic_per_token_quant(Tensor! result, Tensor input, "
+        "Tensor weight, Tensor! scale, float epsilon, Tensor? scale_ub, "
+        "Tensor!? residual) -> ()"
+    ),
+    "rms_norm_per_block_quant": (
+        "rms_norm_per_block_quant(Tensor! result, Tensor input, Tensor weight, "
+        "Tensor! scale, float epsilon, Tensor? scale_ub, Tensor!? residual, "
+        "int group_size, bool is_scale_transposed) -> ()"
+    ),
+    "fused_qk_norm_rope": (
+        "fused_qk_norm_rope(Tensor! qkv, int num_heads_q, int num_heads_k, "
+        "int num_heads_v, int head_dim, float eps, Tensor q_weight, "
+        "Tensor k_weight, Tensor cos_sin_cache, bool is_neox, "
+        "Tensor position_ids, int forced_token_heads_per_warp=-1) -> ()"
+    ),
+    "scaled_fp4_quant": (
+        "scaled_fp4_quant(Tensor input, Tensor input_scale, "
+        "bool is_sf_swizzled_layout) -> (Tensor, Tensor)"
+    ),
+    "scaled_fp4_quant.out": (
+        "scaled_fp4_quant.out(Tensor input, Tensor input_scale, "
+        "bool is_sf_swizzled_layout, *, Tensor(a!) output, "
+        "Tensor(b!) output_scale) -> ()"
+    ),
+    "silu_and_mul_quant": (
+        "silu_and_mul_quant(Tensor! result, Tensor input, Tensor scale) -> ()"
+    ),
+    "silu_and_mul": "silu_and_mul(Tensor! result, Tensor input) -> ()",
+    "silu_and_mul_nvfp4_quant": (
+        "silu_and_mul_nvfp4_quant(Tensor! result, Tensor! result_block_scale, "
+        "Tensor input, Tensor input_global_scale) -> ()"
+    ),
+    "silu_and_mul_per_block_quant": (
+        "silu_and_mul_per_block_quant(Tensor! out, Tensor input, Tensor! scales, "
+        "int group_size, Tensor? scale_ub=None, "
+        "bool is_scale_transposed=False) -> ()"
+    ),
+}
 
 
-def _patch_torch_accelerator() -> None:
+def _has_torch_c_op(torch_ops_c: object, name: str) -> bool:
+    base_name, sep, overload_name = name.partition(".")
+    if not hasattr(torch_ops_c, base_name):
+        return False
+    if not sep:
+        return True
+    return hasattr(getattr(torch_ops_c, base_name), overload_name)
+
+
+def _patch_torch() -> None:
     import torch
+
+    if getattr(torch._C, "_accelerator_setAllocatorSettings", None) is None:
+        torch._C._accelerator_setAllocatorSettings = lambda *args, **kwargs: None
+
+    if not hasattr(torch, "float4_e2m1fn_x2"):
+        torch.float4_e2m1fn_x2 = "float4_e2m1fn_x2"
+
+    _patch_torch_fx_graph_pickler()
+    _patch_torch_inductor_config()
+    _patch_torch_functorch_config()
 
     if not hasattr(torch, "accelerator"):
         torch.accelerator = types.ModuleType("torch.accelerator")
-    accel = torch.accelerator
+    target_module = torch.accelerator
     patch_map = {
         "empty_cache": torch.cuda.empty_cache,
         "device_count": torch.cuda.device_count,
@@ -67,10 +162,137 @@ def _patch_torch_accelerator() -> None:
         "device_index": torch.cuda.device,
     }
     for name, func in patch_map.items():
-        if not hasattr(accel, name):
-            setattr(accel, name, func)
-    if not hasattr(torch, "float4_e2m1fn_x2"):
-        torch.float4_e2m1fn_x2 = "float4_e2m1fn_x2"
+        if not hasattr(target_module, name):
+            setattr(target_module, name, func)
+
+
+def _ensure_graph_pickler_options(module: types.ModuleType) -> None:
+    if hasattr(module, "Options"):
+        return
+
+    class Options:
+        def __init__(self, ops_filter=None):
+            self.ops_filter = ops_filter
+
+    module.Options = Options
+    existing_all = getattr(module, "__all__", None)
+    if isinstance(existing_all, list) and "Options" not in existing_all:
+        existing_all.append("Options")
+
+
+def _patch_torch_fx_graph_pickler() -> None:
+    try:
+        import torch.fx._graph_pickler as graph_pickler
+    except Exception:
+        return
+    _ensure_graph_pickler_options(graph_pickler)
+
+
+def _ensure_torch_config_key(
+    config_module: types.ModuleType,
+    key: str,
+    default: object,
+    value_type: type,
+) -> bool:
+    config = getattr(config_module, "_config", None)
+    if not isinstance(config, dict) or key in config:
+        return False
+
+    try:
+        from torch.utils._config_module import Config
+    except Exception:
+        return False
+
+    for entry in config.values():
+        entry_type = type(entry)
+        try:
+            config[key] = entry_type(Config(default, value_type=value_type))
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _patch_torch_inductor_config() -> None:
+    """Add CoreX-missing Inductor config keys consumed by upstream vLLM.
+
+    Community ``CompilationConfig`` may pass ``alignment_asserts`` to
+    ``torch._inductor.config.patch``. Some CoreX Torch builds lack that key, so
+    patching would raise before a late general patch can help. Keep this as an
+    early, defensive Torch-runtime compatibility shim.
+    """
+    try:
+        import torch._inductor.config as inductor_config
+    except Exception:
+        return
+
+    _ensure_torch_config_key(
+        inductor_config,
+        "alignment_asserts",
+        False,
+        bool,
+    )
+
+
+def _patch_torch_functorch_config() -> None:
+    """Add CoreX-missing Functorch config keys consumed by upstream vLLM.
+
+    Community ``compiler_interface`` patches and serializes functorch config
+    keys while computing compile config and cache keys. Some CoreX Torch builds
+    lack those keys, so add defaults early instead of overriding vLLM's compiler
+    helpers with a late general patch.
+    """
+    try:
+        import torch._functorch.config as functorch_config
+    except Exception:
+        return
+
+    for key in (
+        "bundled_autograd_cache",
+        "autograd_cache_normalize_inputs",
+    ):
+        _ensure_torch_config_key(functorch_config, key, False, bool)
+
+
+def _define_missing_torch_c_compile_schema_ops() -> list[str]:
+    """Register missing compile-time ``torch.ops._C`` schemas.
+
+    These ops are used as FX pattern/replacement targets by upstream compilation
+    passes. They must be real dispatcher overloads, not Python stand-ins, because
+    matcher tables type them as ``OpOverload``. This intentionally defines only
+    schemas for ops still missing after ``vllm_iluvatar._C`` has loaded; if a
+    future native implementation registers an op, this shim skips it.
+    """
+    try:
+        import torch
+        from torch.library import Library
+    except Exception:
+        return []
+
+    missing = [
+        (name, schema)
+        for name, schema in _TORCH_C_COMPILE_SCHEMA_OPS.items()
+        if not _has_torch_c_op(torch.ops._C, name)
+    ]
+    if not missing:
+        return []
+
+    try:
+        lib = Library("_C", "FRAGMENT")
+    except Exception:
+        return []
+
+    registered: list[str] = []
+    for name, schema in missing:
+        try:
+            lib.define(schema)
+        except Exception:
+            continue
+        registered.append(name)
+
+    if registered:
+        _torch_c_schema_libraries.append(lib)
+    return registered
 
 
 def _stub_symmetric_memory() -> None:
@@ -87,8 +309,9 @@ def _stub_symmetric_memory() -> None:
     import sys
 
     key = "torch.distributed._symmetric_memory"
-    if key not in sys.modules:
-        sys.modules[key] = types.ModuleType(key)
+    module = sys.modules.setdefault(key, types.ModuleType(key))
+    if not hasattr(module, "enable_symm_mem_for_group"):
+        module.enable_symm_mem_for_group = lambda *args, **kwargs: None
 
 
 def _disable_unsupported_symmetric_memory() -> None:
@@ -185,13 +408,14 @@ def apply() -> None:
         return
     _applied = True
     try:
+        _patch_torch()
         _patch_triton_gdc_symbols()
-        _patch_torch_accelerator()
         _stub_symmetric_memory()
         _disable_unsupported_symmetric_memory()
         _install_import_shims()
         _register_import_hooks()
         _load_native_torch_ops()
+        _define_missing_torch_c_compile_schema_ops()
     except Exception:
         # Compat shims must never break interpreter / vLLM startup.
         pass

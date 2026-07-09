@@ -7,6 +7,24 @@ import ixformer.inference.functions as ixf_ops
 import torch
 
 
+def process_unquantized_weights_after_loading(
+    self: object,
+    layer: torch.nn.Module,
+) -> None:
+    from vllm.model_executor.parameter import ModelWeightParameter
+
+    weight = getattr(layer, "weight", None)
+    if not isinstance(weight, ModelWeightParameter):
+        return
+
+    new_weight = torch.nn.Parameter(
+        weight.as_subclass(torch.Tensor),
+        requires_grad=weight.requires_grad,
+    )
+    new_weight.__dict__.update(getattr(weight, "__dict__", {}))
+    layer.register_parameter("weight", new_weight)
+
+
 def default_unquantized_gemm(
     layer: torch.nn.Module,
     x: torch.Tensor,

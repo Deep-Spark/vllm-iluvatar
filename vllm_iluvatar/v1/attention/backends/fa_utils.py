@@ -10,7 +10,7 @@ during ``register_general``.
 
 Target   : vllm.v1.attention.backends.fa_utils.{get_flash_attn_version,
            flash_attn_supports_sinks}
-Baseline : main_4875b4456b5
+Baseline : main_88e5e2c57be8
 Why      : IluPlatform is cuda-like (``is_cuda()`` is True), so community
            fa_utils takes the CUDA path whose helpers query upstream
            FlashAttention version dispatch (FA2/FA3/FA4). Iluvatar's ixformer

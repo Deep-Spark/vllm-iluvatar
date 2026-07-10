@@ -5,7 +5,7 @@ Corresponds to:
     vllm/model_executor/layers/fused_moe/fused_moe.py
 
 Target   : fused_experts / fused_experts_impl W16A16 unquantized path
-Baseline : main_4875b4456b5 + fork fused_moe.py ixformer delta
+Baseline : main_88e5e2c57be8 + fork fused_moe.py ixformer delta
 Why      : keep the fork's ixformer W16A16 MoE execution out of community vLLM
            while preserving the Iluvatar unquantized MoE path.
 How      : callers in ``IluUnquantizedFusedMoEMethod`` and elastic-EP wrappers
@@ -17,9 +17,8 @@ Remove   : when upstream exposes a vendor fused-experts backend hook.
 
 from __future__ import annotations
 
-import torch
-
 import ixformer.inference.functions as ixfops  # type: ignore
+import torch
 from vllm.distributed import get_ep_group
 from vllm.forward_context import get_forward_context
 

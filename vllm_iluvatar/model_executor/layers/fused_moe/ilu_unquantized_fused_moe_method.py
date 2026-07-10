@@ -6,7 +6,7 @@ Corresponds to:
 
 Target   : vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method.
            UnquantizedFusedMoEMethod
-Baseline : main_4875b4456b5 + fork ILUVATAR_W16A16 delta
+Baseline : main_88e5e2c57be8 + fork ILUVATAR_W16A16 delta
 Why      : preserve the fork-only ILUVATAR_W16A16 ``ilu_apply`` dispatch without
            editing community vLLM source.
 How      : ``@UnquantizedFusedMoEMethod.register_oot()`` installs an official
@@ -26,12 +26,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-
-from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
-    UnquantizedFusedMoEMethod,
-)
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
+)
+from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+    UnquantizedFusedMoEMethod,
 )
 
 if TYPE_CHECKING:
@@ -44,7 +43,7 @@ class IluUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
     def apply(
         self,
-        layer: "RoutedExperts",
+        layer: RoutedExperts,
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
@@ -68,7 +67,7 @@ class IluUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
     def forward_native(
         self,
-        layer: "RoutedExperts",
+        layer: RoutedExperts,
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,

@@ -6,7 +6,7 @@
 Iluvatar OOT replacement for routed expert weight loading.
 
 Target     : vllm.model_executor.layers.fused_moe.routed_experts.RoutedExperts
-Baseline   : main_4875b4456b5 ``RoutedExperts.weight_loader``
+Baseline   : main_88e5e2c57be8 ``RoutedExperts.weight_loader``
 Why        : preserve the fork's MoE loading deltas without editing community
              vLLM source.
 How        : @PluggableLayer.register_oot subclass. ``weight_loader`` is a
@@ -24,11 +24,11 @@ import inspect
 from typing import Literal, overload
 
 import torch
-
 from vllm.model_executor.layers.fused_moe.routed_experts import (
     FusedMoeWeightScaleSupported,
     RoutedExperts,
 )
+
 from vllm_iluvatar.ilu_patch import general_patch as p
 
 _ROUTED_EXPERTS_WEIGHT_LOADER_BASELINE = """\
@@ -331,7 +331,6 @@ def _check_weight_loader_fingerprint() -> None:
 
 
 _check_weight_loader_fingerprint()
-
 
 
 @RoutedExperts.register_oot()

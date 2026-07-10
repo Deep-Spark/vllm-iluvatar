@@ -15,7 +15,7 @@ live community method as fallback.
 
 Target   : vllm.model_executor.layers.quantization.compressed_tensors.
            compressed_tensors.CompressedTensorsConfig._get_scheme_from_parts
-Baseline : main_4875b4456b5
+Baseline : main_88e5e2c57be8
 Why      : community vLLM has no vendor hook for selecting Iluvatar W4A8/W8A8
            linear schemes from compressed-tensors configs.
 How      : install an Iluvatar wrapper for _get_scheme_from_parts(); unsupported

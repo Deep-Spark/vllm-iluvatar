@@ -424,12 +424,13 @@ def topk_sigmoid(
     gating_output: torch.Tensor,
     renormalize: bool = False,
     e_score_correction_bias: torch.Tensor | None = None,
+    routed_scaling_factor: float = 1.0,
 ) -> None:
     ixf_ops.moe_fused_topk_bias(
         gating_output=gating_output,
         topk=topk_weights.shape[-1],
         scoring_func="sigmoid",
-        routed_scaling_factor=1,
+        routed_scaling_factor=routed_scaling_factor,
         renormalize=renormalize,
         e_score_correction_bias=e_score_correction_bias,
         topk_weight=topk_weights,

@@ -9,7 +9,7 @@ auto-discovered during ``register_general``.
 
 Target   : vllm.distributed.parallel_state.GroupCoordinator.{broadcast,
            broadcast_tensor_dict}
-Baseline : main_4875b4456b5
+Baseline : main_88e5e2c57be8
 Why      : route broadcast / GPU-tensor broadcast through the device
            communicator so Iluvatar (ixformer) collectives are used instead of
            torch.distributed defaults.
@@ -27,6 +27,11 @@ lazy so importing this module never pulls in vllm/torch).
 """
 
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
 
 # Community globals used by the copied broadcast_tensor_dict body; bound by
 # patch_parallel_state._apply() (kept lazy so importing this module never
@@ -117,9 +122,7 @@ def broadcast_tensor_dict(
         async_handles = []
         for key, value in metadata_list:
             if isinstance(value, TensorMetadata):
-                tensor = torch.empty(
-                    value.size, dtype=value.dtype, device=value.device
-                )
+                tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
                 if tensor.numel() == 0:
                     # Skip broadcasting empty tensors.
                     tensor_dict[key] = tensor

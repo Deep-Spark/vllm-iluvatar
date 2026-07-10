@@ -28,7 +28,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import make_zmq_path
-from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpecs
 
 from .metadata import IluNixlAgentMetadata, IluNixlTransferRegion
 
@@ -39,7 +39,44 @@ class IluNixlWorkerMixin:
     """Mixin that makes the official NIXL worker homogeneous-PP aware."""
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        vllm_config = args[0] if args else kwargs.get("vllm_config")
+        kv_cache_config = args[2] if len(args) > 2 else kwargs.get("kv_cache_config")
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        original_pp_size = getattr(parallel_config, "pipeline_parallel_size", 1)
+        should_bypass_upstream_pp_hma_guard = (
+            original_pp_size > 1
+            and vllm_config is not None
+            and kv_cache_config is not None
+            and not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+            and any(
+                not isinstance(group.kv_cache_spec, FullAttentionSpec)
+                for group in kv_cache_config.kv_cache_groups
+            )
+        )
+
+        self._bypass_upstream_pp_hma_guard = should_bypass_upstream_pp_hma_guard
+        if should_bypass_upstream_pp_hma_guard:
+            # vLLM 0.24 added a PP>1 + HMA guard in the generic NIXL worker for
+            # upstream push-mode region slicing. IluNixl builds its own PP-aware
+            # HMA region metadata below, so only mask PP during the upstream
+            # constructor and restore it immediately afterwards.
+            try:
+                parallel_config.pipeline_parallel_size = 1
+            except Exception:
+                object.__setattr__(parallel_config, "pipeline_parallel_size", 1)
+        try:
+            super().__init__(*args, **kwargs)
+        finally:
+            if should_bypass_upstream_pp_hma_guard:
+                try:
+                    parallel_config.pipeline_parallel_size = original_pp_size
+                except Exception:
+                    object.__setattr__(
+                        parallel_config, "pipeline_parallel_size", original_pp_size
+                    )
+
+        if should_bypass_upstream_pp_hma_guard:
+            self.pp_size = original_pp_size
         self.pp_rank = get_pp_group().rank_in_group
         self.pp_world_size = get_pp_group().world_size
         pp_split = envs.VLLM_PP_LAYER_PARTITION
@@ -307,7 +344,18 @@ class IluNixlWorkerMixin:
         return transfer_regions
 
     def register_kv_caches(self, kv_caches: dict[str, Any]):
-        super().register_kv_caches(kv_caches)
+        if self._bypass_upstream_pp_hma_guard:
+            original_pp_size = self.pp_size
+            # vLLM 0.24's generic NIXL register path assumes uniform regions per
+            # PP layer slice. HMA violates that assumption, and IluNixl builds
+            # semantic PP/HMA region metadata below instead.
+            self.pp_size = 1
+            try:
+                super().register_kv_caches(kv_caches)
+            finally:
+                self.pp_size = original_pp_size
+        else:
+            super().register_kv_caches(kv_caches)
 
         self.layer_region_ids = self._build_layer_region_ids_from_kv_caches(kv_caches)
         self.region_ids_by_group = self._build_region_ids_by_group(

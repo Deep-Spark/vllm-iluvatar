@@ -476,8 +476,19 @@ class IluDeepseekCompressor(DeepseekCompressor):
         state_metadata = cast(
             CompressorMetadata, attn_metadata[self.state_cache.prefix]
         )
-        token_to_req_indices = state_metadata.token_to_req_indices
-        slot_mapping = state_metadata.slot_mapping
+        # CUDA graph replay may pad hidden states while metadata only covers
+        # actual tokens. ixformer compressor ops require all per-token inputs
+        # to share the same leading dimension.
+        num_tokens = min(
+            kv.shape[0],
+            positions.shape[0],
+            state_metadata.slot_mapping.shape[0],
+        )
+        kv = kv[:num_tokens]
+        score = score[:num_tokens]
+        positions = positions[:num_tokens]
+        token_to_req_indices = state_metadata.token_to_req_indices[:num_tokens]
+        slot_mapping = state_metadata.slot_mapping[:num_tokens]
         block_table = state_metadata.block_table
         block_size = state_metadata.block_size
 
@@ -506,6 +517,7 @@ class IluDeepseekCompressor(DeepseekCompressor):
         # short-circuits the rest.
         cos_sin_cache = rotary_emb.cos_sin_cache
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
+        kv_slot_mapping = k_cache_metadata.slot_mapping[:num_tokens]
         kv_cache = self._static_forward_context[self.k_cache_prefix].kv_cache
 
         # ixformer accepts bf16/fp16 ``rms_norm_weight`` directly (T_W
@@ -524,7 +536,7 @@ class IluDeepseekCompressor(DeepseekCompressor):
             rms_norm_weight=self.norm.weight,
             cos_sin_cache=cos_sin_cache,
             k_cache=kv_cache,
-            kv_slot_mapping=k_cache_metadata.slot_mapping,
+            kv_slot_mapping=kv_slot_mapping,
             compress_ratio=self.compress_ratio,
             rope_head_dim=self.rope_head_dim,
             rms_norm_eps=self.rms_norm_eps,

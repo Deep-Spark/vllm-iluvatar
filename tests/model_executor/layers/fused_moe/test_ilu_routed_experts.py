@@ -11,11 +11,11 @@ from vllm.model_executor.custom_op import op_registry_oot
 
 from vllm_iluvatar.ilu_patch import general_patch as p
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_routed_experts import (
-    IluRoutedExperts,
     _ROUTED_EXPERTS_WEIGHT_LOADER_BASELINE,
+    IluRoutedExperts,
 )
 
-_MAIN_4875_WEIGHT_LOADER_SHA = (
+_MAIN_88E5_WEIGHT_LOADER_SHA = (
     "4fe62b9495581504f5cedadd6ae9ba6f8f8ba5422f1959c181c4a6b3b0dfee14"
 )
 
@@ -48,9 +48,9 @@ def test_routed_experts_oot_registration_uses_upstream_class_name():
     assert op_registry_oot["RoutedExperts"] is IluRoutedExperts
 
 
-def test_weight_loader_fingerprint_baseline_matches_declared_main_4875_source():
+def test_weight_loader_fingerprint_baseline_matches_declared_main_88e5_source():
     assert p.source_sha(_ROUTED_EXPERTS_WEIGHT_LOADER_BASELINE) == (
-        _MAIN_4875_WEIGHT_LOADER_SHA
+        _MAIN_88E5_WEIGHT_LOADER_SHA
     )
 
 

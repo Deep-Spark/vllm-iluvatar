@@ -9,12 +9,13 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+
 from vllm_iluvatar.ilu_patch import general_patch as p
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
     ilu_compressed_tensors_moe as ilu_moe,
 )
 
-_MAIN_4875_SCHEME_DISCOVERY_PREFIX_SHA = (
+_MAIN_88E5_SCHEME_DISCOVERY_PREFIX_SHA = (
     "5d77ca86af26fe1381f7d00825ca648176edf35d6834544323638fe96494fa06"
 )
 
@@ -45,9 +46,9 @@ def _install_fake_method_module(monkeypatch, module_name: str, class_name: str):
     monkeypatch.setitem(sys.modules, module_name, module)
 
 
-def test_scheme_discovery_fingerprint_baseline_matches_declared_main_4875_source():
+def test_scheme_discovery_fingerprint_baseline_matches_declared_main_88e5_source():
     assert p.source_sha(ilu_moe._SCHEME_DISCOVERY_PREFIX_BASELINE) == (
-        _MAIN_4875_SCHEME_DISCOVERY_PREFIX_SHA
+        _MAIN_88E5_SCHEME_DISCOVERY_PREFIX_SHA
     )
 
 
@@ -118,7 +119,9 @@ def test_w4a8_legacy_env_selects_ilu_w4a8_method(monkeypatch):
     _install_fake_method_module(
         monkeypatch, module_name, "IluCompressedTensorsW4A8Int8MoEMethod"
     )
-    monkeypatch.setattr(ilu_moe.envs, "VLLM_ILU_W8A8_MOE_USE_W4A8", False, raising=False)
+    monkeypatch.setattr(
+        ilu_moe.envs, "VLLM_ILU_W8A8_MOE_USE_W4A8", False, raising=False
+    )
     monkeypatch.setattr(ilu_moe.envs, "VLLM_W8A8_MOE_USE_W4A8", True, raising=False)
     weight_quant = SimpleNamespace(num_bits=8)
     input_quant = SimpleNamespace(num_bits=8)
@@ -146,7 +149,9 @@ def test_wna16_env_selects_ilu_w4a8_method(monkeypatch):
     _install_fake_method_module(
         monkeypatch, module_name, "IluCompressedTensorsW4A8Int8MoEMethod"
     )
-    monkeypatch.setattr(ilu_moe.envs, "VLLM_ILU_W8A8_MOE_USE_W4A8", False, raising=False)
+    monkeypatch.setattr(
+        ilu_moe.envs, "VLLM_ILU_W8A8_MOE_USE_W4A8", False, raising=False
+    )
     monkeypatch.setattr(ilu_moe.envs, "VLLM_W8A8_MOE_USE_W4A8", False, raising=False)
     monkeypatch.setattr(
         ilu_moe.envs, "VLLM_ILU_WNA16_MOE_USE_W4A8", True, raising=False
@@ -173,7 +178,9 @@ def test_wna16_env_selects_ilu_w4a8_method(monkeypatch):
 
 
 def test_wna16_env_rejects_unsupported_format(monkeypatch):
-    monkeypatch.setattr(ilu_moe.envs, "VLLM_ILU_W8A8_MOE_USE_W4A8", False, raising=False)
+    monkeypatch.setattr(
+        ilu_moe.envs, "VLLM_ILU_W8A8_MOE_USE_W4A8", False, raising=False
+    )
     monkeypatch.setattr(ilu_moe.envs, "VLLM_W8A8_MOE_USE_W4A8", False, raising=False)
     monkeypatch.setattr(
         ilu_moe.envs, "VLLM_ILU_WNA16_MOE_USE_W4A8", True, raising=False
@@ -204,7 +211,9 @@ def test_dynamic_token_w8a8_selects_ilu_w8a8_method(monkeypatch):
     _install_fake_method_module(
         monkeypatch, module_name, "IluCompressedTensorsW8A8Int8MoEMethod"
     )
-    monkeypatch.setattr(ilu_moe.envs, "VLLM_ILU_W8A8_MOE_USE_W4A8", False, raising=False)
+    monkeypatch.setattr(
+        ilu_moe.envs, "VLLM_ILU_W8A8_MOE_USE_W4A8", False, raising=False
+    )
     monkeypatch.setattr(ilu_moe.envs, "VLLM_W8A8_MOE_USE_W4A8", False, raising=False)
     weight_quant = SimpleNamespace(num_bits=8)
     input_quant = SimpleNamespace(num_bits=8)

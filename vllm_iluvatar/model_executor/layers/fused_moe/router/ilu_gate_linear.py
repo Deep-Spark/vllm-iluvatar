@@ -5,7 +5,7 @@
 Corresponds to: vllm/model_executor/layers/fused_moe/router/gate_linear.py
 
 Target   : vllm.model_executor.layers.fused_moe.router.gate_linear.GateLinear
-Baseline : main_4875b4456b5
+Baseline : main_88e5e2c57be8
 Why      : community GateLinear enables CUDA/Hopper/Blackwell router GEMM
            branches that are NVIDIA-specific; Iluvatar should preserve the
            dispatch semantics but use equivalent torch implementations for
@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import torch
 from torch.nn.parameter import Parameter
-
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 
 

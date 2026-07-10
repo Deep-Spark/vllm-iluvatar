@@ -6,7 +6,7 @@ Corresponds to:
     compressed_tensors_moe/compressed_tensors_moe.py
 
 Target   : CompressedTensorsMoEMethod.get_moe_method
-Baseline : main_4875b4456b5
+Baseline : main_88e5e2c57be8
 Why      : preserve the fork's Iluvatar W4A8/W8A8 MoE method dispatch without
            editing community vLLM source.
 How      : ``patch_compressed_tensors_moe`` installs this staticmethod wrapper;
@@ -25,14 +25,14 @@ import inspect
 from collections.abc import Callable
 
 import torch
-from compressed_tensors import CompressionFormat
-
 import vllm.envs as envs
+from compressed_tensors import CompressionFormat
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (  # noqa: E501
     WNA16_SUPPORTED_BITS,
 )
+
 from vllm_iluvatar.ilu_patch import general_patch as p
 
 logger = init_logger(__name__)
@@ -177,36 +177,34 @@ class IluCompressedTensorsMoEMethod:
                 weight_quant, input_quant, layer.moe_config
             )
 
-        if _env_enabled("VLLM_ILU_WNA16_MOE_USE_W4A8", "VLLM_WNA16_MOE_USE_W4A8"):
-            if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
-                group_size = weight_quant.group_size or -1
-                valid_format_and_bits = (
-                    weight_quant.num_bits in WNA16_SUPPORTED_BITS
-                    and format_ == CompressionFormat.pack_quantized.value
-                )
-                if not valid_format_and_bits:
-                    raise ValueError(
-                        "For Fused MoE layers, only format: ",
-                        f"{CompressionFormat.pack_quantized.value} ",
-                        f" and bits: {WNA16_SUPPORTED_BITS} is supported ",
-                        f"but got format: {format_} "
-                        f" and bits: {weight_quant.num_bits}",
-                    )
-
-                assert weight_quant.num_bits == 4 and group_size == -1, (
-                    "VLLM_ILU_WNA16_MOE_USE_W4A8 only supports channel-wise "
-                    "W4A16 -> W4A8 MoE"
-                )
-                from .ilu_compressed_tensors_moe_w4a8_int8 import (
-                    IluCompressedTensorsW4A8Int8MoEMethod,
+        if _env_enabled(
+            "VLLM_ILU_WNA16_MOE_USE_W4A8", "VLLM_WNA16_MOE_USE_W4A8"
+        ) and quant_config._is_wNa16_group_channel(weight_quant, input_quant):
+            group_size = weight_quant.group_size or -1
+            valid_format_and_bits = (
+                weight_quant.num_bits in WNA16_SUPPORTED_BITS
+                and format_ == CompressionFormat.pack_quantized.value
+            )
+            if not valid_format_and_bits:
+                raise ValueError(
+                    "For Fused MoE layers, only format: ",
+                    f"{CompressionFormat.pack_quantized.value} ",
+                    f" and bits: {WNA16_SUPPORTED_BITS} is supported ",
+                    f"but got format: {format_}  and bits: {weight_quant.num_bits}",
                 )
 
-                logger.info_once(
-                    "Using Iluvatar WNA16->W4A8 compressed-tensors MoE method"
-                )
-                return IluCompressedTensorsW4A8Int8MoEMethod(
-                    weight_quant, input_quant, layer.moe_config
-                )
+            assert weight_quant.num_bits == 4 and group_size == -1, (
+                "VLLM_ILU_WNA16_MOE_USE_W4A8 only supports channel-wise "
+                "W4A16 -> W4A8 MoE"
+            )
+            from .ilu_compressed_tensors_moe_w4a8_int8 import (
+                IluCompressedTensorsW4A8Int8MoEMethod,
+            )
+
+            logger.info_once("Using Iluvatar WNA16->W4A8 compressed-tensors MoE method")
+            return IluCompressedTensorsW4A8Int8MoEMethod(
+                weight_quant, input_quant, layer.moe_config
+            )
 
         if quant_config._is_dynamic_token_w8a8(weight_quant, input_quant):
             from .ilu_compressed_tensors_moe_w8a8_int8 import (
@@ -219,4 +217,3 @@ class IluCompressedTensorsMoEMethod:
             )
 
         return _fallback_get_moe_method(quant_config, layer, layer_name)
-

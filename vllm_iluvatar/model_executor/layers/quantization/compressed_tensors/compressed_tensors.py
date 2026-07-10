@@ -6,7 +6,7 @@ Corresponds to:
     compressed_tensors.py
 
 Target   : CompressedTensorsConfig._get_scheme_from_parts
-Baseline : main_4875b4456b5
+Baseline : main_88e5e2c57be8
 Why      : preserve the fork's Iluvatar W4A8/W8A8 linear scheme dispatch without
            editing community vLLM source.
 How      : ``patch_compressed_tensors`` installs this method wrapper; community
@@ -24,13 +24,13 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from compressed_tensors.quantization import QuantizationArgs
-
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a8_int import (  # noqa: E501
     CompressedTensorsW4A8Int,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import (  # noqa: E501
     CompressedTensorsW8A8Int8,
 )
+
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes import (  # noqa: E501
     IluCompressedTensorsW4A8Int,
     IluCompressedTensorsW8A8Int8,

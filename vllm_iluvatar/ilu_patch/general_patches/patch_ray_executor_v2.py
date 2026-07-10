@@ -4,11 +4,17 @@
 Corresponds to: vllm/v1/executor/ray_executor_v2.py
 
 Target   : RayWorkerProc.initialize_worker
+Baseline : main_88e5e2c57be8
 Why      : some Iluvatar communication paths need the platform device-control
            environment variable narrowed before WorkerProc initializes NCCL.
 How      : wrap the worker initialization method and add the env var from
            ``assigned_physical_gpu_ids``. The Ray executor orchestration remains
            community-owned.
+Scope    : RayExecutorV2 worker process initialization on Iluvatar.
+Safety   : wrapper only changes the env dict passed to the live community
+           method; no copied method body or fingerprint snapshot is needed.
+Remove   : when community RayExecutorV2 exposes a platform hook for deriving
+           worker device-control env vars from assigned physical GPU IDs.
 """
 
 from __future__ import annotations
@@ -33,6 +39,8 @@ def _apply() -> None:
 
     original = _m.RayWorkerProc.initialize_worker
     wrapped = wrap_initialize_worker(original)
+    # [ILU override] RayWorkerProc.initialize_worker - delta: inject the
+    # platform device-control env before delegating to the community method.
     if inspect.signature(original) != inspect.signature(wrapped):
         raise RuntimeError(
             "ILU patch: RayWorkerProc.initialize_worker signature mismatch: "

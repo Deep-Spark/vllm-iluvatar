@@ -15,6 +15,15 @@ class IluNixlPullConnectorScheduler(
 ):
     """Pull scheduler that includes PP topology in transfer params."""
 
+    set_xfer_handshake_metadata = (
+        IluNixlBaseConnectorScheduler.set_xfer_handshake_metadata
+    )
+    _nixl_handshake_listener = staticmethod(
+        IluNixlBaseConnectorScheduler._nixl_handshake_listener
+    )
+    on_new_request = IluNixlBaseConnectorScheduler.on_new_request
+    build_connector_meta = IluNixlBaseConnectorScheduler.build_connector_meta
+
     def request_finished(self, request, block_ids):
         delay_free_blocks, params = super().request_finished(request, block_ids)
         if params is not None:

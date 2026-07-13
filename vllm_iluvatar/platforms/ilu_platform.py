@@ -36,13 +36,18 @@ def register_attention_backends() -> None:
     Backend classes report community enum names via ``get_name()`` so
     ``AttentionBackendEnum[backend.get_name()]`` in attention.py keeps working
     without custom ILU_* enum members in the community registry.
+
+    GDN is env-gated because the Iluvatar implementation requires plugin-owned
+    metadata. When the gate is disabled, ``GDN_ATTN`` keeps the community path.
     """
     global _ATTN_BACKENDS_REGISTERED
     if _ATTN_BACKENDS_REGISTERED:
         return
 
+    import vllm.envs as envs
     from vllm.v1.attention.backends.registry import (
         AttentionBackendEnum,
+        MambaAttentionBackendEnum,
         register_backend,
     )
 
@@ -63,6 +68,13 @@ def register_attention_backends() -> None:
         "vllm.v1.attention.backends.mla.ilu_flashmla_sparse."
         "IluDeepseekV4FlashMLASparseBackend",
     )
+    # Reuse the official GDN_ATTN enum member; do not introduce an ILU_* enum.
+    if envs.VLLM_ILU_GDN_ATTN_BACKEND:
+        register_backend(
+            MambaAttentionBackendEnum.GDN_ATTN,
+            "vllm_iluvatar.v1.attention.backends.ilu_gdn_attn.IluGDNAttentionBackend",
+            is_mamba=True,
+        )
     _ATTN_BACKENDS_REGISTERED = True
 
 

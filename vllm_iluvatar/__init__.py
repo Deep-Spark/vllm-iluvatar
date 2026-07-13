@@ -64,8 +64,8 @@ def register_platform() -> str:
     than a silent fall-through to the builtin CUDA platform.
 
     Enables the startup hook for spawned workers, applies the early compat
-    shims now (current_platform is resolved before parallel_state import), then
-    injects the Iluvatar env config and returns the IluPlatform class path.
+    shims now (current_platform is resolved before parallel_state import),
+    injects the Iluvatar env config, then returns the IluPlatform class path.
     """
     try:
         import ixformer  # noqa: F401 — presence means Iluvatar hardware
@@ -79,15 +79,17 @@ def register_platform() -> str:
     os.environ.setdefault(STARTUP_PATCH_ENV, "1")
     _load_import_compat_patch()
 
-    from vllm_iluvatar.platforms.ilu_platform import register_attention_backends
-
-    register_attention_backends()
-
     # Inject Iluvatar env defaults + canonical/legacy readers (needs vllm.envs,
     # so it is done here rather than at .pth-time startup).
     from vllm_iluvatar.envs import apply as _apply_ilu_envs
 
     _apply_ilu_envs()
+
+    # Backend registration reads Iluvatar env gates, so env readers must be
+    # installed before overriding any official community backend enum member.
+    from vllm_iluvatar.platforms.ilu_platform import register_attention_backends
+
+    register_attention_backends()
 
     from vllm_iluvatar.ilu_patch.patch_platform_import_hooks import (
         register_platform_import_hooks,

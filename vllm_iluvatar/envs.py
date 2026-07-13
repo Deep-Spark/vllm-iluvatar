@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     VLLM_ILU_USE_LORA_FUSION: bool = False
     VLLM_ILU_VIT_ATTN_OPT_LEVEL: int = 0
     VLLM_ILU_VIT_ATTN_LAYER: str = ""
+    VLLM_ILU_GDN_ATTN_BACKEND: bool = False
     VLLM_ILU_DS4_PREFILL_OPT: bool = False
     VLLM_ILU_NIXL_WRITE_USE_HOST_BUFFER: bool = False
     VLLM_ILU_NIXL_HOST_DTYPE: str = "auto"
@@ -141,6 +142,12 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_VIT_ATTN_LAYER": lambda: _get(
         "VLLM_ILU_VIT_ATTN_LAYER", "VLLM_VIT_ATTN_LAYER", ""
     ).upper(),
+    # Gate the Iluvatar GDN attention backend. Community GDN remains the default
+    # unless the deployment explicitly opts into the plugin metadata/kernel path.
+    "VLLM_ILU_GDN_ATTN_BACKEND": lambda: (
+        _get("VLLM_ILU_GDN_ATTN_BACKEND", "VLLM_GDN_ATTN_BACKEND", "0").lower()
+        in _TRUE_VALS
+    ),
     "VLLM_ILU_DS4_PREFILL_OPT": lambda: (
         _get("VLLM_ILU_DS4_PREFILL_OPT", "VLLM_DS4_PREFILL_OPT", "0").lower()
         in ("1", "true")
@@ -168,9 +175,7 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_NIXL_DS32_QUANT_AFTER_TRANSFER": _bool_reader(
         "VLLM_ILU_NIXL_DS32_QUANT_AFTER_TRANSFER", "0"
     ),
-    "VLLM_ILU_LINEAR_BACKEND": lambda: os.environ.get(
-        "VLLM_ILU_LINEAR_BACKEND", ""
-    )
+    "VLLM_ILU_LINEAR_BACKEND": lambda: os.environ.get("VLLM_ILU_LINEAR_BACKEND", "")
     .strip()
     .lower()
     .replace("-", "_"),

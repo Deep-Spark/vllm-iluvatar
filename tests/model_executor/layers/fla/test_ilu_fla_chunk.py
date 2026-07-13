@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU-only tests for the Iluvatar FLA chunk wrapper."""
+"""Tests for the Iluvatar FLA chunk wrapper and KKT kernel."""
 
 from __future__ import annotations
 
+import importlib
 from types import SimpleNamespace
 
+from conftest import requires_cuda
+
 from vllm_iluvatar.model_executor.layers.fla.ops import chunk as ilu_chunk
+
+torch = importlib.import_module("torch")
 
 
 def test_chunk_gated_delta_rule_fwd_uses_ilu_scaled_dot_kkt(monkeypatch):
@@ -84,3 +89,58 @@ def test_chunk_gated_delta_rule_fwd_uses_ilu_scaled_dot_kkt(monkeypatch):
             "output_dtype": ilu_chunk.torch.float32,
         },
     )
+
+
+def _chunk_scaled_dot_kkt_reference(
+    k: torch.Tensor,
+    beta: torch.Tensor,
+    g: torch.Tensor,
+    chunk_size: int,
+) -> torch.Tensor:
+    B, T, Hg, K = k.shape
+    H = beta.shape[-1]
+    out = torch.zeros(B, T, H, chunk_size, device=k.device, dtype=torch.float32)
+
+    for b in range(B):
+        for h in range(H):
+            hg = h // (H // Hg)
+            for chunk_start in range(0, T, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, T)
+                for row in range(chunk_start, chunk_end):
+                    local_row = row - chunk_start
+                    for col in range(local_row):
+                        col_abs = chunk_start + col
+                        k_row = (k[b, row, hg].float() * beta[b, row, h].float()).to(
+                            k.dtype
+                        )
+                        k_col = k[b, col_abs, hg].float()
+                        gate = torch.exp(
+                            g[b, row, h].float() - g[b, col_abs, h].float()
+                        )
+                        out[b, row, h, col] = (k_row.float() * k_col).sum() * gate
+    return out
+
+
+@requires_cuda
+def test_chunk_scaled_dot_kkt_matches_torch_reference(cuda_device):
+    chunk_size = 64
+    seq_len = 64
+    k = torch.full(
+        (1, seq_len, 2, 64),
+        1.0,
+        device=cuda_device,
+        dtype=torch.bfloat16,
+    )
+    beta = torch.full((1, seq_len, 2), 1.003, device=cuda_device, dtype=torch.float32)
+    g = torch.zeros(1, seq_len, 2, device=cuda_device, dtype=torch.float32)
+    expected = _chunk_scaled_dot_kkt_reference(k, beta, g, chunk_size)
+
+    actual = ilu_chunk.chunk_scaled_dot_kkt_fwd(
+        k=k,
+        beta=beta,
+        g=g,
+        chunk_size=chunk_size,
+        output_dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Iluvatar DeepSeek-V4 MLA attention layer (W4A8, BF16 KV cache).
+"""Iluvatar DeepSeek-V4 MLA attention layer (W4A8, BF16/FP8 KV cache).
 
 Adapted from :mod:`vllm.model_executor.layers.deepseek_v4_attention` so the
 ilu-fork W4A8 path can evolve independently. Stage 1 of the rollout (this
@@ -15,13 +15,13 @@ once the bf16 MLA / sparse SWA / indexer kernels are stabilised.
 
 Behavioural deltas vs the upstream V4 attention layer:
 
-1. ``swa_cache_layer`` is :class:`IluDeepseekV4SWACache` with
-   ``dtype=torch.bfloat16``.
+1. ``swa_cache_layer`` is :class:`IluDeepseekV4SWACache`; its dtype is
+   selected by ``cache_config.cache_dtype`` (``bfloat16`` or ``uint8``
+   for ``fp8_ds_mla``).
 2. ``IluDeepseekV4MLAAttention`` accepts any ``cache_config.cache_dtype`` and
-   defaults to ``bfloat16``; the upstream "fp8 only" assertion is dropped.
-   Its ``get_kv_cache_spec`` returns a bf16 :class:`MLAAttentionSpec` with
-   ``cache_dtype_str="bfloat16"`` and ``model_version=None`` (the upstream
-   ``"deepseek_v4"`` token is fp8-specific).
+   defaults to ``bfloat16``; ``fp8`` is mapped to ``fp8_ds_mla``.
+   Its ``get_kv_cache_spec`` returns the appropriate :class:`MLAAttentionSpec`
+   with matching ``cache_dtype_str`` and ``model_version``.
 3. ``IluDeepseekV4IndexerCache`` is bf16 and pages without the fp8 scale
    padding (``head_size = config.index_head_dim`` directly).
 4. ``IluDeepseekV4Indexer`` hardcodes ``use_fp4_kv = False`` and skips the
@@ -518,29 +518,39 @@ class IluDeepseekCompressor(DeepseekCompressor):
         cos_sin_cache = rotary_emb.cos_sin_cache
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         kv_slot_mapping = k_cache_metadata.slot_mapping[:num_tokens]
-        kv_cache = self._static_forward_context[self.k_cache_prefix].kv_cache
-
-        # ixformer accepts bf16/fp16 ``rms_norm_weight`` directly (T_W
-        # templated, T2F-cast on load) and always-fp32 ``cos_sin_cache``.
-        # The fp32 cos_sin contract matches DS-V4's RotaryEmbedding, which
-        # registers the RoPE table as a single fp32 buffer shared across
-        # all 60 layers (see DeepseekV4ScalingRotaryEmbedding "stored as
-        # fp32 for higher precision RoPE"); down-casting it per-layer
-        # would cost ~256MB temp alloc on the 1M-context path.
-        ixfops.ds4_compressor_pool_norm_rope_insert(
-            state_cache=state_cache,
-            token_to_req_indices=token_to_req_indices,
-            positions=positions,
-            slot_mapping=slot_mapping,
-            block_table=block_table,
-            rms_norm_weight=self.norm.weight,
-            cos_sin_cache=cos_sin_cache,
-            k_cache=kv_cache,
-            kv_slot_mapping=kv_slot_mapping,
-            compress_ratio=self.compress_ratio,
-            rope_head_dim=self.rope_head_dim,
-            rms_norm_eps=self.rms_norm_eps,
-        )
+        mla_layer = self._static_forward_context[self.k_cache_prefix]
+        kv_cache = mla_layer.kv_cache
+        kv_cache_dtype = getattr(mla_layer, "kv_cache_dtype", "bfloat16")
+        if kv_cache_dtype == "fp8_ds_mla":
+            ixfops.ds4_compressor_pool_norm_rope_fp8_kv_insert(
+                state_cache=state_cache,
+                token_to_req_indices=token_to_req_indices,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                block_table=block_table,
+                rms_norm_weight=self.norm.weight,
+                cos_sin_cache=cos_sin_cache,
+                k_cache=kv_cache,
+                kv_slot_mapping=kv_slot_mapping,
+                compress_ratio=self.compress_ratio,
+                rope_head_dim=self.rope_head_dim,
+                rms_norm_eps=self.rms_norm_eps,
+            )
+        else:
+            ixfops.ds4_compressor_pool_norm_rope_insert(
+                state_cache=state_cache,
+                token_to_req_indices=token_to_req_indices,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                block_table=block_table,
+                rms_norm_weight=self.norm.weight,
+                cos_sin_cache=cos_sin_cache,
+                k_cache=kv_cache,
+                kv_slot_mapping=kv_slot_mapping,
+                compress_ratio=self.compress_ratio,
+                rope_head_dim=self.rope_head_dim,
+                rms_norm_eps=self.rms_norm_eps,
+            )
 
 
 @dataclass
@@ -644,21 +654,27 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # Per-head RMS normalization for Q (no learnable weights).
         self.q_head_norm = RMSNorm(head_dim, eps=self.eps, has_weight=False)
 
-        # head_bytes is forward-time data only; preserved so a stage-2 forward
-        # can reuse the upstream bookkeeping when we wire bf16 kernels.
-        self.head_bytes = self.head_dim * 2  # bf16 byte count
-
         self.aux_stream = mla_modules.aux_stream
         self.ln_events: list[torch.cuda.Event] = []  # populated at stage 2
 
         assert cache_config is not None, (
             "ilu DeepseekV4 attention requires cache_config"
         )
-        # bf16 SWA cache (uint8 in upstream); ilu fork stage 1 always uses bf16.
+        kv_cache_dtype = cache_config.cache_dtype or "bfloat16"
+        if kv_cache_dtype == "auto":
+            kv_cache_dtype = "bfloat16"
+        if kv_cache_dtype == "fp8":
+            kv_cache_dtype = "fp8_ds_mla"
+
+        self.head_bytes = 584 if kv_cache_dtype == "fp8_ds_mla" else self.head_dim * 2
+
+        swa_dtype = (
+            torch.uint8 if kv_cache_dtype == "fp8_ds_mla" else torch.bfloat16
+        )
         self.swa_cache_layer = IluDeepseekV4SWACache(
             head_dim=self.head_dim,
             window_size=self.window_size,
-            dtype=torch.bfloat16,
+            dtype=swa_dtype,
             prefix=f"{prefix}.swa_cache",
             cache_config=cache_config,
         )
@@ -706,6 +722,7 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 prefix=f"{prefix}.compressor",
                 k_cache_prefix=self.mla_attn.prefix,
             )
+            self.compressor.kv_cache_dtype = self.mla_attn.kv_cache_dtype
 
     def forward(
         self,
@@ -778,7 +795,7 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             # v2 W8A16 marlin path (set by _IluV4W8A16BMMLinearMethod):
             # input stays bf16; weight is INT8 in Marlin layout +
             # per-(group,N) channel scale. The 3D batched signature mirrors
-            # R1's _k_up_proj_w8a8 (vllm/v1/attention/backends/mla/ilu_mla.py).
+            # R1's _k_up_proj_w8a8 (vllm_iluvatar/v1/attention/backends/mla/ilu_mla.py).
             z = ixfops.marlin_w8a16(
                 o_view,
                 self.wo_a.W_repacked,
@@ -955,22 +972,32 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
 
         swa_kv_cache = self.swa_cache_layer.kv_cache
-        # ``ds4_fused_qnorm_rope_kv_insert`` accepts both the 3D
-        # ``(num_blocks, block_size, head_dim)`` and the flattened 2D
-        # ``(num_blocks, block_size * head_dim)`` layouts; the upstream
-        # vLLM op uses the flattened form, so we mirror it here for parity.
-        swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
 
-        ixfops.ds4_fused_qnorm_rope_kv_insert(
-            q,
-            kv,
-            swa_kv_cache_2d,
-            swa_metadata.slot_mapping,
-            positions,
-            self.rotary_emb.cos_sin_cache,
-            self.eps,
-            swa_metadata.block_size,
-        )
+        if self.mla_attn.kv_cache_dtype == "fp8_ds_mla":
+            # Pass the 3D uint8 cache directly; the CUDA insert kernel uses
+            # stride(0) and must not flatten padded (non-contiguous) blocks.
+            ixfops.ds4_fused_qnorm_rope_fp8_kv_insert(
+                q,
+                kv,
+                swa_kv_cache,
+                swa_metadata.slot_mapping,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.eps,
+                swa_metadata.block_size,
+            )
+        else:
+            swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
+            ixfops.ds4_fused_qnorm_rope_kv_insert(
+                q,
+                kv,
+                swa_kv_cache_2d,
+                swa_metadata.slot_mapping,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.eps,
+                swa_metadata.block_size,
+            )
 
 
 class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
@@ -1029,9 +1056,6 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         )
         self.max_model_len = vllm_config.model_config.max_model_len
 
-        # ilu fork: bf16 KV cache by default. Reject explicit fp8 selection so
-        # operators get a loud error instead of silently routing into the V4
-        # fp8_ds_mla layout.
         kv_cache_dtype = (
             cache_config.cache_dtype
             if cache_config is not None and cache_config.cache_dtype not in (None, "")
@@ -1039,12 +1063,8 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         )
         if kv_cache_dtype == "auto":
             kv_cache_dtype = "bfloat16"
-        if kv_cache_dtype.startswith("fp8"):
-            raise ValueError(
-                "IluDeepseekV4MLAAttention does not support fp8 KV cache; "
-                f"got kv_cache_dtype={kv_cache_dtype!r}. Use "
-                "--kv-cache-dtype bfloat16."
-            )
+        if kv_cache_dtype == "fp8":
+            kv_cache_dtype = "fp8_ds_mla"
         self.kv_cache_dtype = kv_cache_dtype
         if cache_config is not None:
             cache_config.cache_dtype = kv_cache_dtype
@@ -1061,28 +1081,23 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         return IluDeepseekV4FlashMLASparseBackend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
-        # SWA-only layers don't allocate their own cache (the SWA cache is a
-        # separate KVCacheSpec owned by IluDeepseekV4SWACache).
         if self.compress_ratio <= 1:
             return None
-        # ``model_version`` is left at None: with ``cache_dtype_str="bfloat16"``
-        # MLAAttentionSpec.real_page_size_bytes already falls through to the
-        # default ``storage_block_size * head_size * dtype_size`` formula,
-        # which is what we want for the single-latent bf16 store. Mirroring
-        # the SWA spec keeps both layers in the same KVCacheGroup at
-        # ``page_size_bytes == 65536`` (storage_block_size=64 / head_size=512
-        # for C4A), so they continue sharing one physical tensor.
-        #
-        # NOTE: no ``alignment``. Same rationale as
-        # ``IluDeepseekV4SWACache.get_kv_cache_spec``: the ilu MLA path
-        # dispatches through ixformer kernels (e.g. ``ds4_flash_mla_with_kvcache``
-        # / ``ds4_fused_qnorm_rope_kv_insert``) which require a contiguous
-        # paged layout. ``alignment=576`` would set ``page_size_padded`` and
-        # take ``_reshape_kv_cache_tensors`` down the ``as_strided`` branch,
-        # producing a non-contiguous tensor that the kernels' strict
-        # ``is_contiguous()`` checks reject. The natural ``storage_block_size *
-        # head_size * dtype_size`` is what every ilu kernel reads/writes
-        # directly.
+
+        if self.kv_cache_dtype == "fp8_ds_mla":
+            return MLAAttentionSpec(
+                block_size=vllm_config.cache_config.block_size,
+                num_kv_heads=1,
+                head_size=self.head_dim,
+                dtype=torch.uint8,
+                compress_ratio=self.compress_ratio,
+                cache_dtype_str="fp8_ds_mla",
+                model_version="deepseek_v4",
+                # Ilu fp8 attention kernels require 64B-aligned block bases.
+                # C128 pages (2*584=1168) pad to 1216; C4/SWA are already aligned.
+                alignment=64,
+            )
+
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
@@ -1261,29 +1276,78 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         # sparse MLA kernel can attend over per-token topk slices.
         q = q.unsqueeze(1)
 
-        # ``ds4_flash_mla_with_kvcache`` needs the cache reshaped to
-        # ``(num_blocks, page_block_size, 1, head_dim)``; ``unsqueeze(-2)``
-        # preserves strides (handles padded blocks correctly). The kernel
-        # accepts different ``page_block_size`` between ``k_cache`` (SWA, 64)
-        # and ``extra_k_cache`` (C4A storage_block=64 / C128A storage_block=2)
-        # — each cache flattens independently to ``[num_slots, d]`` and the
-        # global slot id in ``extra_indices`` indexes the extra cache only.
-        swa_cache = self.swa_cache_layer.kv_cache.unsqueeze(-2)
-        if kv_cache is not None:
-            kv_cache = kv_cache.unsqueeze(-2)
+        if self.kv_cache_dtype == "fp8_ds_mla":
+            # fp8_ds_mla cache is already (num_blocks, block_size, 584);
+            # the fp8 attention kernel accepts 3D directly.
+            swa_cache = self.swa_cache_layer.kv_cache
+            ixfops.ds4_flash_mla_with_fp8_kvcache(
+                q=q,
+                k_cache=swa_cache,
+                indices=swa_indices,
+                topk_length=swa_lens,
+                sm_scale=self.scale,
+                attn_sink=self.attn_sink,
+                extra_k_cache=kv_cache if not swa_only else None,
+                extra_indices=topk_indices,
+                extra_topk_length=topk_lens,
+                output=output.unsqueeze(1),
+            )
+        else:
+            # bf16 cache: reshape to (num_blocks, page_block_size, 1, head_dim)
+            swa_cache = self.swa_cache_layer.kv_cache.unsqueeze(-2)
+            if kv_cache is not None:
+                kv_cache = kv_cache.unsqueeze(-2)
 
-        ixfops.ds4_flash_mla_with_kvcache(
-            q=q,
-            k_cache=swa_cache,
-            indices=swa_indices,
-            topk_length=swa_lens,
-            sm_scale=self.scale,
-            attn_sink=self.attn_sink,
-            extra_k_cache=kv_cache if not swa_only else None,
-            extra_indices=topk_indices,
-            extra_topk_length=topk_lens,
-            output=output.unsqueeze(1),
-        )
+            ixfops.ds4_flash_mla_with_kvcache(
+                q=q,
+                k_cache=swa_cache,
+                indices=swa_indices,
+                topk_length=swa_lens,
+                sm_scale=self.scale,
+                attn_sink=self.attn_sink,
+                extra_k_cache=kv_cache if not swa_only else None,
+                extra_indices=topk_indices,
+                extra_topk_length=topk_lens,
+                output=output.unsqueeze(1),
+            )
+
+    def _gather_k_cache(
+        self,
+        out: torch.Tensor,
+        k_cache: torch.Tensor,
+        seq_lens: torch.Tensor,
+        gather_lens: torch.Tensor | None,
+        block_table: torch.Tensor,
+        block_size: int,
+        offset: int,
+    ) -> None:
+        """Gather K cache into bf16 workspace, dispatching by cache format.
+
+        When ``kv_cache_dtype == "fp8_ds_mla"``, uses
+        ``ds4_gather_fp8_k_cache`` which dequantizes FP8 NoPE dims and
+        copies bf16 RoPE dims into the bf16 output workspace.
+        Otherwise, calls the standard ``ds4_gather_k_cache`` for bf16 cache.
+        """
+        if self.kv_cache_dtype == "fp8_ds_mla":
+            ixfops.ds4_gather_fp8_k_cache(
+                out=out,
+                k_cache=k_cache,
+                seq_lens=seq_lens,
+                gather_lens=gather_lens,
+                block_table=block_table,
+                block_size=block_size,
+                offset=offset,
+            )
+        else:
+            ixfops.ds4_gather_k_cache(
+                out=out,
+                k_cache=k_cache,
+                seq_lens=seq_lens,
+                gather_lens=gather_lens,
+                block_table=block_table,
+                block_size=block_size,
+                offset=offset,
+            )
 
     def _forward_prefill(
         self,
@@ -1391,7 +1455,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 assert attn_metadata is not None
                 assert compressed_k_cache is not None
                 block_table = attn_metadata.block_table[num_decodes:]
-                ixfops.ds4_gather_k_cache(
+                self._gather_k_cache(
                     kv[:chunk_size],
                     compressed_k_cache,
                     seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
@@ -1406,7 +1470,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             #    the compressed pool inside the workspace row).
             # ------------------------------------------------------------
             swa_block_table = swa_metadata.block_table[num_decodes:]
-            ixfops.ds4_gather_k_cache(
+            self._gather_k_cache(
                 kv[:chunk_size],
                 swa_k_cache,
                 seq_lens=seq_lens[chunk_start:chunk_end],

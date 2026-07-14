@@ -65,22 +65,6 @@ from vllm_iluvatar.model_executor.models.ilu_glm.model import (
 
 logger = init_logger(__name__)
 
-# [MTP-DBG] global call counter to throttle debug logging.
-_MTP_DBG_N = 0
-
-
-def _dbg_stats(t):
-    """[MTP-DBG] tensor sanity: shape/mean/std/min/max/nan/inf."""
-    if t is None:
-        return "None"
-    tf = t.detach().float()
-    return (
-        f"shape={tuple(t.shape)} mean={tf.mean().item():.4f} "
-        f"std={tf.std().item():.4f} min={tf.min().item():.4f} "
-        f"max={tf.max().item():.4f} "
-        f"nan={bool(tf.isnan().any())} inf={bool(tf.isinf().any())}"
-    )
-
 
 class IluGlmMoeDsaMultiTokenPredictorLayer(nn.Module):
     def __init__(
@@ -138,30 +122,12 @@ class IluGlmMoeDsaMultiTokenPredictorLayer(nn.Module):
             torch.cat([inputs_embeds, previous_hidden_states], dim=-1)
         )
 
-        global _MTP_DBG_N
-        _MTP_DBG_N += 1
-        if _MTP_DBG_N <= 20:
-            logger.info(
-                "[MTP-DBG-layer #%d] emb_after_enorm=%s | prev_after_hnorm=%s | "
-                "eh_proj_out=%s",
-                _MTP_DBG_N,
-                _dbg_stats(inputs_embeds),
-                _dbg_stats(previous_hidden_states),
-                _dbg_stats(hidden_states),
-            )
-
         hidden_states, residual = self.mtp_block(
             positions=positions,
             hidden_states=hidden_states,
             residual=None,
         )
         hidden_states = residual + hidden_states  # pre-final-norm (logits hidden)
-        if _MTP_DBG_N <= 20:
-            logger.info(
-                "[MTP-DBG-layer #%d] mtp_block_out(pre-final-norm)=%s",
-                _MTP_DBG_N,
-                _dbg_stats(hidden_states),
-            )
         # Return (logits_hidden, recycle_hidden): the first (pre-final-norm) is
         # fed to compute_logits (which applies shared_head == one final norm);
         # the second (post-final-norm) is recycled as the next spec step's

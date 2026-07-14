@@ -1945,19 +1945,16 @@ class IluDeepseekV4Indexer(nn.Module):
         if md.num_decodes > 0:
             decode_md = md.decode
             assert decode_md is not None
-            if decode_md.requires_padding:
-                # ``requires_padding`` now flags only *genuinely ragged* decode
-                # batches (real requests with differing query lengths, e.g.
-                # variable accepted spec tokens). Uniform decode / uniform MTP
-                # with CUDA-graph trailing zero-length padding rows are handled
-                # natively (the metadata builder zero-fills padding spans and
-                # the kernels no-op them), so they do NOT set this flag. Ragged
-                # batches would need a pack/unpack path; surface loudly instead
-                # of silently degrading.
-                raise NotImplementedError(
-                    "ilu DeepSeek-V4 indexer does not support ragged "
-                    "(non-uniform query length) decode batches"
-                )
+            # Ragged (non-uniform query length) decode batches -- e.g. K>=2 MTP
+            # where requests carry a variable number of accepted/proposed spec
+            # tokens -- are supported natively. ``dsa_indexer_mqa_logits_with_blocks_bf16``
+            # iterates requests via ``cu_seqlens_q`` (the same variable-q path
+            # prefill uses) and ``cu_seqlen_ks/ke`` carry one causal span per
+            # query token, so each decode token is an independent logits/topk
+            # row. No pack/unpack is required (that is only needed by the
+            # community paged-MQA kernel which expects a uniform ``[B, next_n]``
+            # layout). ``requires_padding`` is kept on the metadata only as a
+            # diagnostic flag.
             num_decode_tokens = md.num_decode_tokens
             if decode_md.max_context_len == 0:
                 # Early decode steps can have no compressed C4A entries yet.

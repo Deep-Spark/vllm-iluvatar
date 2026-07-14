@@ -542,15 +542,14 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             is_same_class = len(value_types) == 1
             if is_same_class:
                 assert deepseek_instance
-                only_decode = not use_ep and all(
+                only_decode = all(
                     t.num_decodes > 0 and t.num_prefills == 0
                     for t in list(attn_metadata.values())
                 )
             else:
                 if deepseek_instance:
                     only_decode = (
-                        not use_ep
-                        and deepseek_instance.num_decodes > 0
+                        deepseek_instance.num_decodes > 0
                         and deepseek_instance.num_prefills == 0
                     )
                 else:
@@ -565,6 +564,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 shared_experts_input=shared_experts_input,
+                run_decode=only_decode,
             )
 
         # ---- Decode-optimized path ----
@@ -593,6 +593,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
+        run_decode: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 
         ep_rank = layer.moe_config.ep_rank
@@ -607,24 +608,49 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         num_experts = layer.global_num_experts
         hidden_size = x.shape[1]
 
-        (
-            src_to_dst,
-            sorted_token_ids,
-            expert_sizes_gpu,
-            expert_sizes_cpu,
-            expand_tokens,
-        ) = ixfops.moe_compute_token_index_ep(
-            topk_ids=topk_ids,
-            num_experts=num_experts,
-            start_expert_id=start_eid,
-            end_expert_id=end_eid,
-        )
-        if expert_sizes_cpu.sum() == 0:
+        if run_decode:
+            (
+                src_to_dst,
+                sorted_token_ids,
+                expert_sizes_gpu,
+                expert_sizes_cpu,
+                expand_tokens,
+                dense_expert_sizes_gpu,
+            ) = ixfops.moe_compute_token_index_ep(
+                topk_ids=topk_ids,
+                num_experts=num_experts,
+                start_expert_id=start_eid,
+                end_expert_id=end_eid,
+                graph_safe=run_decode,
+                return_dense_expert_sizes=True,
+            )
+        else:
+            dense_expert_sizes_gpu = None
+            (
+                src_to_dst,
+                sorted_token_ids,
+                expert_sizes_gpu,
+                expert_sizes_cpu,
+                expand_tokens,
+            ) = ixfops.moe_compute_token_index_ep(
+                topk_ids=topk_ids,
+                num_experts=num_experts,
+                start_expert_id=start_eid,
+                end_expert_id=end_eid,
+                graph_safe=run_decode,
+            )
+
+        # only prefill stage has expert_sizes_cpu info
+        if not run_decode and expert_sizes_cpu.sum() == 0:
             return torch.zeros(
                 (num_tokens, hidden_size),
                 device=x.device,
                 dtype=x.dtype,
             )
+
+        # for decode, we need to expand the tokens to the full number of tokens
+        if run_decode:
+            expand_tokens = num_tokens * layer.top_k
 
         i8_hidden_states, a_scale = self._expand_and_quant(
             layer=layer,
@@ -632,50 +658,89 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             expand_tokens=expand_tokens,
             sorted_token_ids=sorted_token_ids,
             src_to_dst=src_to_dst,
+            output_format=1 if run_decode else 0,
+            check_valid=run_decode,
         )
 
-        pt_output_1 = ixfops.moe_w4a8_group_gemm(
-            input=i8_hidden_states,
-            weight=layer.w13_weight,
-            i_scales=a_scale,
-            w_scales=layer.w13_weight_scale,
-            output_dtype=dtype,
-            tokens_per_experts=expert_sizes_cpu,
-            w_i8scales=layer.w13_i8_weight_scale,
-            w_i8zeros=layer.w13_i8_weight_zero,
-            dst_to_src=None,
-            bias=layer.w13_bias,
-            format=self.gemm1_info.format,
-            group_size=self.group_size,
-            version=self.version,
-        )
+        if run_decode:
+            pt_output_1 = ixfops.moe_w4a8_group_gemv(
+                input=i8_hidden_states,
+                weight=layer.w13_weight,
+                i_scales=a_scale,
+                w_scales=layer.w13_weight_scale,
+                output_dtype=dtype,
+                tokens_per_experts=expert_sizes_gpu,
+                w_i8scales=layer.w13_i8_weight_scale,
+                w_i8zeros=layer.w13_i8_weight_zero,
+                dst_to_src=None,
+                bias=layer.w13_bias,
+                format=self.gemm1_info.format,
+                group_size=self.group_size,
+                dense_tokens_per_experts=dense_expert_sizes_gpu,
+            )
+        else:
+            pt_output_1 = ixfops.moe_w4a8_group_gemm(
+                input=i8_hidden_states,
+                weight=layer.w13_weight,
+                i_scales=a_scale,
+                w_scales=layer.w13_weight_scale,
+                output_dtype=dtype,
+                tokens_per_experts=expert_sizes_cpu,
+                w_i8scales=layer.w13_i8_weight_scale,
+                w_i8zeros=layer.w13_i8_weight_zero,
+                dst_to_src=None,
+                bias=layer.w13_bias,
+                format=self.gemm1_info.format,
+                group_size=self.group_size,
+                version=self.version,
+            )
 
         pt_output_2, a2_scale = self._activation_and_quant(
             layer=layer,
             input=pt_output_1,
             sorted_token_ids=sorted_token_ids,
+            output_format=1 if run_decode else 0,
+            check_valid=run_decode,
         )
         pt_output_3 = torch.empty(
             (num_tokens * layer.top_k, self.gemm2_info.get_pad_n()),
             device=x.device,
             dtype=x.dtype,
         )
-        ixfops.moe_w4a8_group_gemm(
-            input=pt_output_2,
-            weight=layer.w2_weight,
-            i_scales=a2_scale,
-            w_scales=layer.w2_weight_scale,
-            output_dtype=dtype,
-            tokens_per_experts=expert_sizes_cpu,
-            w_i8scales=layer.w2_i8_weight_scale,
-            w_i8zeros=layer.w2_i8_weight_zero,
-            dst_to_src=sorted_token_ids,
-            bias=layer.w2_bias,
-            format=self.gemm2_info.format,
-            group_size=self.group_size,
-            version=self.version,
-            output=pt_output_3,
-        )
+        if run_decode:
+            ixfops.moe_w4a8_group_gemv(
+                input=pt_output_2,
+                weight=layer.w2_weight,
+                i_scales=a2_scale,
+                w_scales=layer.w2_weight_scale,
+                output_dtype=dtype,
+                tokens_per_experts=expert_sizes_gpu,
+                w_i8scales=layer.w2_i8_weight_scale,
+                w_i8zeros=layer.w2_i8_weight_zero,
+                dst_to_src=sorted_token_ids,
+                bias=layer.w2_bias,
+                format=self.gemm2_info.format,
+                group_size=self.group_size,
+                output=pt_output_3,
+                dense_tokens_per_experts=dense_expert_sizes_gpu,
+            )
+        else:
+            ixfops.moe_w4a8_group_gemm(
+                input=pt_output_2,
+                weight=layer.w2_weight,
+                i_scales=a2_scale,
+                w_scales=layer.w2_weight_scale,
+                output_dtype=dtype,
+                tokens_per_experts=expert_sizes_cpu,
+                w_i8scales=layer.w2_i8_weight_scale,
+                w_i8zeros=layer.w2_i8_weight_zero,
+                dst_to_src=sorted_token_ids,
+                bias=layer.w2_bias,
+                format=self.gemm2_info.format,
+                group_size=self.group_size,
+                version=self.version,
+                output=pt_output_3,
+            )
         pt_output_3 = unpad_tensor(pt_output_3, self.gemm2_info.get_n(), contiguous=False)
 
         reduce_mask = src_to_dst == -1
@@ -850,6 +915,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
     # expand + quant + pad
     def _expand_and_quant(
         self, layer, input, expand_tokens, sorted_token_ids, src_to_dst, output_format=0,
+        check_valid=False,
     ):
         output, scale = ixfops.moe_expand_input_dynamic_scaled_int8(
             hidden_states=input,
@@ -860,6 +926,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             topk_ids=None,
             smooth_scales=layer.w13_input_scale,
             output_format=output_format,
+            check_valid=check_valid,
         )
 
         if output.shape[-1] != self.gemm1_info.pad_k:
@@ -869,7 +936,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
 
     # act + quant + pad
     def _activation_and_quant(
-        self, layer, input, sorted_token_ids, output_format=None,
+        self, layer, input, sorted_token_ids, output_format=None, check_valid=False,
     ):
         # unpad
         input = unpad_tensor(input, self.gemm1_info.get_n(), contiguous=True)
@@ -903,6 +970,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         )
         if output_format is not None:
             kwargs["output_format"] = output_format
+        kwargs["check_valid"] = check_valid
 
         # Explicit dispatch with whitelist — unknown activations must raise
         # rather than silently falling back to ``swiglu`` and producing wrong

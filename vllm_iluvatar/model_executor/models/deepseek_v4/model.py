@@ -184,6 +184,15 @@ class IluDeepseekV4MLP(nn.Module):
             self.act_fn = SiluAndMulWithClamp(swiglu_limit)
         else:
             self.act_fn = SiluAndMul()
+        
+         # add fused check for act + quant
+        if isinstance(self.act_fn, SiluAndMulWithClamp) and \
+                hasattr(self.down_proj, 'scheme'):
+            from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes import (
+                IluCompressedTensorsW8A8Int8,
+            )
+            if isinstance(self.down_proj.scheme, IluCompressedTensorsW8A8Int8):
+                self.act_fn.enable_fuse_quant()
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)

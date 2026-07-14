@@ -60,6 +60,7 @@ _OOT_OP_PACKAGES = [
 _OOT_MODEL_PACKAGES = [
     "vllm_iluvatar.model_executor.models",
     "vllm_iluvatar.model_executor.models.deepseek_v4",
+    "vllm_iluvatar.model_executor.models.ilu_glm",
 ]
 
 __all__ = ["apply_oot_registrations"]

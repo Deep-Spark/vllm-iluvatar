@@ -607,9 +607,9 @@ def register_model() -> None:
 
     Invoked by ``vllm_iluvatar.ilu_register.apply_oot_registrations`` during
     register_general. The class paths are resolved lazily by ModelRegistry, so
-    importing this module's heavy attention deps (``IluSparseAttnIndexer`` and
-    the ``vllm::sparse_attn_indexer`` op) -- and ``mtp.py`` -- is deferred until
-    the model is loaded.
+    importing this module's heavy attention deps (the plugin-local
+    ``vllm::ilu_glm_sparse_attn_indexer`` op) -- and ``mtp.py`` -- is deferred
+    until the model is loaded.
     """
     from vllm import ModelRegistry
 

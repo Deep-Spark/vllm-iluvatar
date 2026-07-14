@@ -40,6 +40,17 @@ Schema (in checkpoint's ``config.json::quantization_config``)::
             "input_dtype": "bfloat16"
         },
 
+        # NEW for GLM-5.2: MLA ``kv_b_proj`` -- one INT8 weight that the
+        # sparse-MLA attention splits into W_UK (k-up) / W_UV (v-up) and
+        # consumes via two grouped ``ixf_ops.marlin_w8a16`` GEMMs. Distinct
+        # from ``bmm_w8a16_layers`` (a single grouped weight) because kv_b_proj
+        # produces two derived weights.
+        "mla_bmm_w8a16": {              # optional; GLM-5.2 only
+            "targets": ["re:.*\\.self_attn\\.kv_b_proj$"],
+            "num_bits": 8, "strategy": "channel", "symmetric": true, ...,
+            "input_activations": null
+        },
+
         "bf16_layers": [<regex...>],    # informational; runtime same as ignore
         "ignore":      [<regex...>]
     }
@@ -57,6 +68,10 @@ Dispatch (``get_quant_method``):
   :class:`_IluV4W8A16BMMLinearMethod` (INT8 weight + bf16 act via
   ``ixf_ops.marlin_w8a16``; the layer stores W_repacked / W_scale and the
   attention wrapper does the marlin GEMM directly).
+- (GLM-5.2) ``LinearBase`` whose prefix matches ``mla_bmm_w8a16.targets``
+  (``kv_b_proj``) -> :class:`_IluGlmKVBProjW8A16Method` (one INT8 weight split
+  into W_UK/W_UV, each Marlin-repacked; the sparse-MLA attention consumes them
+  via two ``ixf_ops.marlin_w8a16`` grouped GEMMs).
 - (v2) ``LinearBase`` whose prefix matches ``dense_linears.targets`` ->
   :class:`_IluV4W8A8LinearMethod` (same path as shared experts).
 - Everything else (``bf16_layers`` / ``ignore`` / unmatched) ->
@@ -204,6 +219,7 @@ class IluDeepseekV4W4A8Config(QuantizationConfig):
         pack_version: int,
         dense_section: dict[str, Any] | None = None,
         bmm_w8a16_section: dict[str, Any] | None = None,
+        mla_bmm_section: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.format_str = format_str
@@ -214,6 +230,7 @@ class IluDeepseekV4W4A8Config(QuantizationConfig):
         self.shared_section = shared_section or {}
         self.dense_section = dense_section or {}
         self.bmm_w8a16_section = bmm_w8a16_section or {}
+        self.mla_bmm_section = mla_bmm_section or {}
         self.bf16_layers_raw: list[str] = list(bf16_layers)
         self.ignore_raw: list[str] = list(ignore)
 
@@ -256,6 +273,13 @@ class IluDeepseekV4W4A8Config(QuantizationConfig):
         self.bmm_w8a16_gemm_format = str(
             self.bmm_w8a16_section.get("gemm_format", "k16n16")
         )
+        # GLM-5.2 MLA kv_b_proj -- grouped W8A16 marlin (split into W_UK/W_UV).
+        # Distinct from ``bmm_w8a16_layers`` (V4 wo_a: a single grouped weight):
+        # kv_b_proj must be split into two derived weights, so it dispatches to
+        # ``_IluGlmKVBProjW8A16Method`` instead of ``_IluV4W8A16BMMLinearMethod``.
+        self.mla_bmm_targets: list[re.Pattern] = _compile_targets(
+            self.mla_bmm_section
+        )
 
     # ----- QuantizationConfig boilerplate ----------------------------------
 
@@ -283,6 +307,8 @@ class IluDeepseekV4W4A8Config(QuantizationConfig):
         # v2 optional sections; absent in v1 ckpts (defaults to {}).
         dense = config.get("dense_linears", {}) or {}
         bmm_w8a16 = config.get("bmm_w8a16_layers", {}) or {}
+        # GLM-5.2 kv_b_proj grouped W8A16 (split W_UK/W_UV); absent for V4.
+        mla_bmm = config.get("mla_bmm_w8a16", {}) or {}
         bf16_layers = list(config.get("bf16_layers", []) or [])
         ignore = list(config.get("ignore", []) or [])
         format_str = str(config.get("format", "ilu-mixed-w4a8"))
@@ -300,6 +326,7 @@ class IluDeepseekV4W4A8Config(QuantizationConfig):
             pack_version=pack_version,
             dense_section=dense,
             bmm_w8a16_section=bmm_w8a16,
+            mla_bmm_section=mla_bmm,
         )
 
     @classmethod
@@ -363,6 +390,10 @@ class IluDeepseekV4W4A8Config(QuantizationConfig):
         if isinstance(layer, LinearBase):
             if _is_shared_expert(prefix):
                 return _IluV4W8A8LinearMethod(self)
+            # GLM-5.2 MLA ``kv_b_proj`` -- grouped W8A16 marlin split into
+            # W_UK/W_UV. Match before dense_linears (more specific).
+            if any(p.search(prefix) for p in self.mla_bmm_targets):
+                return _IluGlmKVBProjW8A16Method(self)
             # v2: ``attn.wo_a`` (grouped einsum / BMM) -- W8A16 marlin.
             # Match before dense_linears so the more specific regex wins.
             if any(p.search(prefix) for p in self.bmm_w8a16_targets):
@@ -576,4 +607,154 @@ class _IluV4W8A16BMMLinearMethod(LinearMethodBase):
             "_IluV4W8A16BMMLinearMethod.apply must not be called; "
             "wo_a is consumed by IluDeepseekV4MultiHeadLatentAttentionWrapper "
             "via marlin_w8a16(W_repacked, W_scale_repacked)."
+        )
+
+
+class _IluGlmKVBProjW8A16Method(LinearMethodBase):
+    """W8A16 grouped-BMM linear method for GLM-5.2 ``kv_b_proj``.
+
+    ``kv_b_proj`` is the absorbed MLA up-projection: a single INT8 weight
+    ``[num_heads * (qk_nope + v), kv_lora]`` that the self-contained sparse-MLA
+    attention (``ilu_glm/attention.py``) splits into ``W_UK`` (k-up) and
+    ``W_UV`` (v-up) and consumes via two grouped ``ixf_ops.marlin_w8a16`` GEMMs
+    -- exactly R1's ``_k_up_proj_w8a8`` / ``_v_up_proj_w8a8`` template
+    (``vllm/v1/attention/backends/mla/ilu_mla.py``).
+
+    Unlike ``_IluV4W8A16BMMLinearMethod`` (V4 ``wo_a``: one grouped weight, one
+    repack) this method produces TWO repacked weights from a single flat
+    parameter. The split+repack runs here in
+    :meth:`process_weights_after_loading` (deterministic, loader-driven, like
+    V4 -- not a first-forward lazy path), so it is cuda-graph friendly.
+
+    On-disk format is identical to the dense W8A8 path (INT8 ``weight`` +
+    per-row ``weight_scale``); only the runtime consumption differs (grouped
+    BMM, no activation quantization).
+
+    The attention wrapper attaches ``layer.bmm_geom`` (a SimpleNamespace with
+    ``num_heads`` / ``qk_nope_head_dim`` / ``v_head_dim`` / ``kv_lora_rank``,
+    all TP-local) at construction time -- the flat 2D shape cannot recover the
+    per-head grouping on its own.
+
+    Result attributes (on the layer), read by the attention:
+    - ``W_UK`` / ``W_UK_S`` -- k-up: INT8 marlin (``k16n16_grouped_n``) + scale
+    - ``W_UV`` / ``W_UV_S`` -- v-up: INT8 marlin (``k16n16``) + scale
+    ``layer.weight`` / ``layer.weight_scale`` are deleted to free memory.
+    """
+
+    def __init__(self, parent_config: IluDeepseekV4W4A8Config) -> None:
+        self.parent_config = parent_config
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        from vllm.model_executor.parameter import (
+            ChannelQuantScaleParameter,
+            ModelWeightParameter,
+        )
+
+        out_total = sum(output_partition_sizes)
+        layer.logical_widths = output_partition_sizes
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        # INT8 weight [out = num_heads*(nope+v), in = kv_lora]; column-parallel
+        # sharding (output_dim=0) splits along the head-major output axis.
+        weight = ModelWeightParameter(
+            data=torch.empty(out_total, input_size_per_partition, dtype=torch.int8),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight", weight)
+
+        weight_scale = ChannelQuantScaleParameter(
+            data=torch.empty((out_total, 1), dtype=torch.float32),
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight_scale", weight_scale)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Split ``kv_b_proj`` into W_UK/W_UV and Marlin-repack each.
+
+        The on-disk weight is ``[num_heads*(nope+v), kv_lora]`` (out, in). We
+        view it as ``[num_heads, nope+v, kv_lora]`` and split the middle axis
+        into the k-up (``nope``) and v-up (``v``) halves. These are exactly the
+        tensors R1 produces (R1 starts from a transposed ``[kv_lora, num_heads,
+        nope+v]`` layout and permutes; we start from ``(out, in)`` and reach the
+        identical ``[num_heads, K, N]`` grouping without a transpose):
+
+        - k-up wants per-group ``(K=nope, N=kv_lora)`` -> ``W_UK`` directly.
+          The per-row scale sits on the ``nope`` (contraction) axis, so k-up
+          uses the ``k16n16_grouped_n`` format (scale-on-K).
+        - v-up wants per-group ``(K=kv_lora, N=v)`` -> ``W_UV.permute(0,2,1)``.
+        """
+        import ixformer.inference.functions as ixf_ops
+
+        geom = getattr(layer, "bmm_geom", None)
+        assert geom is not None, (
+            "_IluGlmKVBProjW8A16Method requires layer.bmm_geom to be set by "
+            "the attention wrapper before process_weights_after_loading."
+        )
+        num_heads: int = geom.num_heads
+        nope: int = geom.qk_nope_head_dim
+        v: int = geom.v_head_dim
+        kv_lora: int = geom.kv_lora_rank
+
+        weight = layer.weight.data  # [num_heads*(nope+v), kv_lora]
+        weight_scale = layer.weight_scale.data  # [num_heads*(nope+v), 1]
+
+        assert weight.shape == (num_heads * (nope + v), kv_lora), (
+            f"kv_b_proj weight shape {tuple(weight.shape)} does not match "
+            f"({num_heads} * ({nope} + {v}), {kv_lora}) implied by "
+            f"bmm_geom={geom!r}"
+        )
+        assert weight_scale.shape == (num_heads * (nope + v), 1), (
+            f"kv_b_proj weight_scale shape {tuple(weight_scale.shape)} != "
+            f"({num_heads * (nope + v)}, 1)"
+        )
+
+        w = weight.view(num_heads, nope + v, kv_lora)
+        s = weight_scale.view(num_heads, nope + v, 1)
+        W_UK, W_UV = w.split([nope, v], dim=1)  # (H,nope,L), (H,v,L)
+        W_UK_S, W_UV_S = s.split([nope, v], dim=1)  # (H,nope,1), (H,v,1)
+
+        # k-up: (H, K=nope, N=kv_lora); scale on K axis -> grouped_n.
+        layer.W_UK = ixf_ops.marlin_w8_weight_repack(
+            weights=W_UK.contiguous(),
+            weight_format="int8",
+            reformat="k16n16_grouped_n",
+        )
+        layer.W_UK_S = W_UK_S.contiguous()
+        # v-up: (H, K=kv_lora, N=v).
+        layer.W_UV = ixf_ops.marlin_w8_weight_repack(
+            weights=W_UV.permute(0, 2, 1).contiguous(),
+            weight_format="int8",
+            reformat="k16n16",
+        )
+        layer.W_UV_S = W_UV_S.contiguous()
+
+        # Free the flat parameters -- the attention only reads W_UK / W_UV.
+        delattr(layer, "weight")
+        delattr(layer, "weight_scale")
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # ``LinearBase.forward`` must never reach here -- kv_b_proj is consumed
+        # by IluGlmMoeDsaSparseMLA._k_up_proj / _v_up_proj via marlin_w8a16 on
+        # layer.W_UK / layer.W_UV directly.
+        raise NotImplementedError(
+            "_IluGlmKVBProjW8A16Method.apply must not be called; kv_b_proj is "
+            "consumed by IluGlmMoeDsaSparseMLA via "
+            "marlin_w8a16(W_UK/W_UV, W_UK_S/W_UV_S)."
         )

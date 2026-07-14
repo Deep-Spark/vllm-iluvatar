@@ -11,12 +11,16 @@ from vllm.model_executor.custom_op import op_registry_oot
 
 from vllm_iluvatar.ilu_patch import general_patch as p
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_routed_experts import (
+    _ROUTED_EXPERTS_LOAD_WEIGHTS_BASELINE,
     _ROUTED_EXPERTS_WEIGHT_LOADER_BASELINE,
     IluRoutedExperts,
 )
 
 _MAIN_88E5_WEIGHT_LOADER_SHA = (
     "4fe62b9495581504f5cedadd6ae9ba6f8f8ba5422f1959c181c4a6b3b0dfee14"
+)
+_MAIN_88E5_LOAD_WEIGHTS_SHA = (
+    "4c935079e68c0723a98f39253cbc3ccd16f1a737ed68a85c18f7a47cbd908453"
 )
 
 
@@ -39,6 +43,7 @@ def _uninitialized_routed_experts() -> IluRoutedExperts:
     obj.__dict__["quant_config"] = None
     obj.__dict__["quant_method"] = OtherMoEMethod()
     obj.__dict__["opt_level"] = 0
+    obj.__dict__["layer_name"] = "layer"
     obj.__dict__["_map_global_expert_id_to_local_expert_id"] = lambda _: 0
     obj.__dict__["_load_model_weight_or_group_weight_scale"] = MagicMock()
     return obj
@@ -51,6 +56,9 @@ def test_routed_experts_oot_registration_uses_upstream_class_name():
 def test_weight_loader_fingerprint_baseline_matches_declared_main_88e5_source():
     assert p.source_sha(_ROUTED_EXPERTS_WEIGHT_LOADER_BASELINE) == (
         _MAIN_88E5_WEIGHT_LOADER_SHA
+    )
+    assert p.source_sha(_ROUTED_EXPERTS_LOAD_WEIGHTS_BASELINE) == (
+        _MAIN_88E5_LOAD_WEIGHTS_SHA
     )
 
 
@@ -83,6 +91,105 @@ def test_weight_loader_uses_parameter_shard_dim_override():
         routed._load_model_weight_or_group_weight_scale.call_args.kwargs["shard_dim"]
         == 1
     )
+
+
+def _recording_param(
+    calls: list[tuple[str, torch.Size]], label: str = ""
+) -> torch.nn.Parameter:
+    param = torch.nn.Parameter(torch.empty(0), requires_grad=False)
+
+    def weight_loader(**kwargs):
+        calls.append((label or kwargs["weight_name"], kwargs["loaded_weight"].shape))
+        return True
+
+    param.weight_loader = weight_loader
+    return param
+
+
+def test_load_weights_trims_fused_w13_weight_scale_to_half_intermediate():
+    routed = _uninitialized_routed_experts()
+    routed.moe_config.hidden_dim_unpadded = 2048
+    routed.get_expert_mapping = lambda include_fused=True: [
+        ("experts.w13_weight_scale", "experts.w13.weight_scale", 0, "w1"),
+        ("experts.w13_weight_scale", "experts.w13.weight_scale", 1, "w3"),
+        ("experts.w13_weight", "experts.w13", 0, "w1"),
+        ("experts.w13_weight", "experts.w13", 1, "w3"),
+    ]
+    calls: list[tuple[str, torch.Size]] = []
+    routed.__dict__["experts.w13_weight"] = _recording_param(calls)
+    routed.__dict__["experts.w13_weight_scale"] = _recording_param(
+        calls, "w13_weight_scale"
+    )
+    routed.__dict__["experts.w13_weight.weight_scale"] = _recording_param(calls)
+
+    list(
+        routed.load_weights(
+            [
+                ("experts.w13", torch.empty((128, 3072, 2048))),
+                ("experts.w13.weight_scale", torch.empty((128, 3072, 2))),
+            ]
+        )
+    )
+
+    scale_shapes = [shape for name, shape in calls if name == "w13_weight_scale"]
+    assert scale_shapes
+    assert set(scale_shapes) == {torch.Size([1, 1536])}
+
+
+def test_load_weights_keeps_fused_w13_weight_scale_when_dim_differs():
+    routed = _uninitialized_routed_experts()
+    routed.moe_config.hidden_dim_unpadded = 2048
+    routed.get_expert_mapping = lambda include_fused=True: [
+        ("experts.w13_weight_scale", "experts.w13.weight_scale", 0, "w1"),
+        ("experts.w13_weight", "experts.w13", 0, "w1"),
+    ]
+    calls: list[tuple[str, torch.Size]] = []
+    routed.__dict__["experts.w13_weight"] = _recording_param(calls)
+    routed.__dict__["experts.w13_weight_scale"] = _recording_param(
+        calls, "w13_weight_scale"
+    )
+    routed.__dict__["experts.w13_weight.weight_scale"] = _recording_param(calls)
+
+    list(
+        routed.load_weights(
+            [
+                ("experts.w13", torch.empty((128, 3072, 2048))),
+                ("experts.w13.weight_scale", torch.empty((128, 4096, 2))),
+            ]
+        )
+    )
+
+    scale_shapes = [shape for name, shape in calls if name == "w13_weight_scale"]
+    assert scale_shapes
+    assert set(scale_shapes) == {torch.Size([1, 4096])}
+
+
+def test_load_weights_transposes_fused_w2_weight_scale_layout():
+    routed = _uninitialized_routed_experts()
+    routed.moe_config.hidden_dim_unpadded = 2048
+    routed.get_expert_mapping = lambda include_fused=True: [
+        ("experts.w2_weight_scale", "experts.w2.weight_scale", 0, "w2"),
+        ("experts.w2_weight", "experts.w2", 0, "w2"),
+    ]
+    calls: list[tuple[str, torch.Size]] = []
+    routed.__dict__["experts.w2_weight"] = _recording_param(calls)
+    routed.__dict__["experts.w2_weight_scale"] = _recording_param(
+        calls, "w2_weight_scale"
+    )
+    routed.__dict__["experts.w2_weight.weight_scale"] = _recording_param(calls)
+
+    list(
+        routed.load_weights(
+            [
+                ("experts.w2", torch.empty((128, 3072, 2048))),
+                ("experts.w2.weight_scale", torch.empty((128, 2048, 1))),
+            ]
+        )
+    )
+
+    scale_shapes = [shape for name, shape in calls if name == "w2_weight_scale"]
+    assert scale_shapes
+    assert set(scale_shapes) == {torch.Size([1, 2048])}
 
 
 def test_weight_loader_keeps_moe_loading_marker():

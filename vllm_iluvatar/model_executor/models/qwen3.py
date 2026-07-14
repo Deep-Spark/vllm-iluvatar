@@ -36,7 +36,7 @@ class _Qwen3AttentionFusedMixin:
     """Provides the fused q/k norm forward for Qwen3 attention.
 
     Requires a ``qk_norm`` (:class:`RMSNormQK`) attribute on the instance,
-    attached by :func:`install_qwen3_attention_fusion` after the community
+    attached by :func:`qwen3_attention_fusion` after the community
     ``__init__`` has built ``q_norm`` / ``k_norm``.
     """
 
@@ -67,7 +67,7 @@ class Qwen3Attention(_Qwen3AttentionFusedMixin, _Qwen3Attention):
     """Qwen3Attention with fused q/k RMSNorm."""
 
 
-def install_qwen3_attention_fusion(model) -> None:
+def qwen3_attention_fusion(model) -> None:
     """Swap each decoder layer's ``self_attn`` to the fused subclass.
 
     ``__class__`` reassignment preserves all weights / state and only changes the
@@ -91,7 +91,7 @@ class Qwen3ForCausalLM(_Qwen3ForCausalLM):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        install_qwen3_attention_fusion(self.model)
+        qwen3_attention_fusion(self.model)
 
 
 def register_model() -> None:

@@ -468,42 +468,16 @@ def topk_hash_softplus_sqrt(
          applies the scale internally).
       4. ``token_expert_indices[t, j] = j`` (positional helper).
     """
-    n_routed_experts = gating_output.shape[-1]
-    num_tokens, top_k = topk_weights.shape
-
-    scores = torch.nn.functional.softplus(gating_output).sqrt()
-
-    if hash_indices_table is not None:
-        assert input_tokens is not None, (
-            "hash routing requires input_tokens to look up the hash table"
-        )
-        ids = hash_indices_table[input_tokens]
-    else:
-        if e_score_correction_bias is not None:
-            scores_for_choice = scores.view(-1, n_routed_experts) + (
-                e_score_correction_bias.unsqueeze(0)
-            )
-        else:
-            scores_for_choice = scores.view(-1, n_routed_experts)
-        use_sorted = envs.VLLM_BATCH_INVARIANT
-        ids = torch.topk(scores_for_choice, k=top_k, dim=-1, sorted=use_sorted)[1]
-
-    weights = scores.gather(1, ids.long()).to(torch.float32)
-    if renormalize:
-        weights = weights / weights.sum(dim=-1, keepdim=True)
-    if routed_scaling_factor != 1.0:
-        weights = weights * routed_scaling_factor
-
-    topk_weights.copy_(weights)
-    topk_indices.copy_(ids.to(topk_indices.dtype))
-    token_expert_indices.copy_(
-        torch.arange(
-            top_k,
-            device=token_expert_indices.device,
-            dtype=token_expert_indices.dtype,
-        )
-        .unsqueeze(0)
-        .expand(num_tokens, top_k)
+    return ixf_ops.topk_hash_softplus_sqrt(
+        topk_weights=topk_weights,
+        topk_indices=topk_indices,
+        token_expert_indices=token_expert_indices,
+        gating_output=gating_output,
+        renormalize=renormalize,
+        routed_scaling_factor=routed_scaling_factor,
+        e_score_correction_bias=e_score_correction_bias,
+        input_tokens=input_tokens,
+        hash_indices_table=hash_indices_table,
     )
 
 

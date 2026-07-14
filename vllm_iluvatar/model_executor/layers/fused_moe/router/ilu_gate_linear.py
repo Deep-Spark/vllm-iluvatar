@@ -11,7 +11,8 @@ Why      : community GateLinear enables CUDA/Hopper/Blackwell router GEMM
            dispatch semantics but use equivalent torch implementations for
            unsupported kernels.
 How      : @GateLinear.register_oot subclass; keep community initialization
-           intact and override only forward.
+           intact and override only forward.  The ixformer bf16×bf16→fp32
+           GEMM path replaces community Tier 3 (cuBLAS bf16→fp32).
 Scope    : imported during ``apply_oot_registrations()``.
 Remove   : when Iluvatar provides compatible router GEMM kernels for these
            GateLinear dispatch branches.
@@ -33,6 +34,24 @@ class IluGateLinear(GateLinear):
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         if self.out_dtype is not None and x.dtype != self.weight.dtype:
             x = x.to(self.weight.dtype)
+
+        # [ILU override] GateLinear.forward — delta: ixformer bf16×bf16→fp32
+        # GEMM for mixed-precision router logits (replaces community Tier 3
+        # cuBLAS path on NVIDIA).
+        if (
+            self.out_dtype is not None
+            and self.out_dtype == torch.float32
+            and x.dtype == torch.bfloat16
+            and self.weight.dtype == torch.bfloat16
+        ):
+            import ixformer.inference.functions as ixfops
+
+            output = ixfops.gemm_bf16_bf16_fp32(
+                x, self.weight, format="TN"
+            )
+            output_bias = self.bias if self.skip_bias_add else None
+            return output, output_bias
+
         output, output_bias = super(GateLinear, self).forward(x)
         if self.out_dtype is not None and output.dtype != self.out_dtype:
             output = output.to(self.out_dtype)

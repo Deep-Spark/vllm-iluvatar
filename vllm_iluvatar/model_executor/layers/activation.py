@@ -10,9 +10,10 @@ Why      : Iluvatar activation kernels are exposed through the plugin's
            ``vllm._custom_ops`` overrides rather than community ``torch.ops._C``
            registrations.
 How      : @<Base>.register_oot subclasses override initialization to bind
-           ``self.op`` to ``vllm._custom_ops``. No forward body is copied except
-           ``SiluAndMulWithClamp.forward_cuda``, whose community signature passes
-           alpha/beta values unsupported by the Iluvatar custom op.
+           ``self.op`` to ``vllm._custom_ops``.  ``IluSiluAndMulWithClamp``
+           additionally overrides ``forward_cuda`` (fuse_quant branch via
+           ixformer ``swiglu_limit_dynamic_scaled_int8`` + alpha/beta op args)
+           and exposes ``enable_fuse_quant`` for downstream W8A8 linears.
 Scope    : activation CustomOps instantiated on Iluvatar.
 Remove   : when community activation dispatch routes through a backend hook or
            Iluvatar implements the exact community ``torch.ops._C`` schemas.
@@ -20,6 +21,7 @@ Remove   : when community activation dispatch routes through a backend hook or
 
 from __future__ import annotations
 
+import torch
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.activation import (
     FastGELU,
@@ -72,6 +74,8 @@ class IluSiluAndMulWithClamp(SiluAndMulWithClamp):
         compile_native: bool = True,
     ):
         CustomOp.__init__(self, compile_native=compile_native)
+        self.fuse_quant = False
+        self.fuse_quant_output_padding = 0
         self.swiglu_limit = float(swiglu_limit)
         self.alpha = float(alpha)
         self.beta = float(beta)
@@ -86,6 +90,33 @@ class IluSiluAndMulWithClamp(SiluAndMulWithClamp):
         elif current_platform.is_cpu():
             self._forward_method = self.forward_native
 
+    def enable_fuse_quant(self, output_padding: int = 0):
+        """Enable fused activation + int8 quantization.  When enabled,
+        forward_cuda returns (x_q, x_s, out_dtype) instead of a plain
+        tensor so the downstream W8A8 linear can skip its own quant step."""
+        self.fuse_quant = True
+        self.fuse_quant_output_padding = output_padding
+
+    # [ILU override] SiluAndMulWithClamp.forward_cuda — delta: fuse_quant
+    # branch (ixformer swiglu_limit_dynamic_scaled_int8) + alpha/beta op args.
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        if self.fuse_quant:
+            import ixformer.inference.functions as ixf_ops
+
+            out_dtype = x.dtype
+            x_q, x_s = ixf_ops.swiglu_limit_dynamic_scaled_int8(
+                input=x,
+                limit=self.swiglu_limit,
+                output_padding=self.fuse_quant_output_padding,
+            )
+            return (x_q, x_s, out_dtype)
+
+        d = x.shape[-1] // 2
+        out = torch.empty(
+            x.shape[:-1] + (d,), dtype=x.dtype, device=x.device
+        )
+        self.op(out, x, self.swiglu_limit, self.alpha, self.beta)
+        return out
 
 @MulAndSilu.register_oot
 class IluMulAndSilu(MulAndSilu):

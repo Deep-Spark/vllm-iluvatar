@@ -6,27 +6,29 @@
 Iluvatar OOT replacement for routed expert weight loading.
 
 Target     : vllm.model_executor.layers.fused_moe.routed_experts.RoutedExperts
-Baseline   : main_88e5e2c57be8 ``RoutedExperts.weight_loader``
+Baseline   : main_88e5e2c57be8 ``RoutedExperts.weight_loader`` and
+             ``RoutedExperts.load_weights``
 Why        : preserve the fork's MoE loading deltas without editing community
              vLLM source.
-How        : @PluggableLayer.register_oot subclass. ``weight_loader`` is a
-             full-method copy pinned to the community baseline; Iluvatar-only
-             metadata needs are kept in the small override below.
+How        : @PluggableLayer.register_oot subclass. Copied methods are pinned
+             to the community baseline; Iluvatar-only deltas are marked inline.
 Scope      : imported during ``apply_oot_registrations()``.
-Fingerprint: ``RoutedExperts.weight_loader`` community source is checked at
-             import time against the baseline below; gated by
+Fingerprint: ``RoutedExperts.weight_loader`` and ``RoutedExperts.load_weights``
+             community sources are checked at import time; gated by
              VLLM_ILU_PATCH_CHECK_FINGERPRINT.
 Remove     : when upstream supports ``IluAutoGPTQMoEMethod`` intermediate-size
              parameters and parameter-provided MoE shard dimensions natively.
 """
 
 import inspect
+from collections.abc import Iterable
 from typing import Literal, overload
 
 import torch
 from vllm.model_executor.layers.fused_moe.routed_experts import (
     FusedMoeWeightScaleSupported,
     RoutedExperts,
+    logger,
 )
 
 from vllm_iluvatar.ilu_patch import general_patch as p
@@ -317,8 +319,73 @@ _ROUTED_EXPERTS_WEIGHT_LOADER_BASELINE = """\
         return False if return_success else None
 """
 
+_ROUTED_EXPERTS_LOAD_WEIGHTS_BASELINE = """\
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[str]:
+        expert_mapping = self.get_expert_mapping(include_fused=True)
+        unpadded_hidden = self.moe_config.hidden_dim_unpadded
+        for expert_name, loaded_weight in weights:
+            qual_name = f"{self.layer_name}.{expert_name}"
+            # Fused expert weights can be identified by their 3D tensors
+            is_fused = loaded_weight.dim() == 3
+            matched = False
+            for param_name, weight_name, expert_id, shard_id in expert_mapping:
+                if weight_name not in qual_name:
+                    if matched and is_fused:
+                        break
+                    continue
+                matched = True
+                weight_name = qual_name.replace(weight_name, param_name)
+                param_name = weight_name.removeprefix(f"{self.layer_name}.")
+                param = getattr(self, param_name)
+                if is_fused:
+                    # w1 and w3 share one fused tensor; use a local copy so the
+                    # transpose below doesn't mutate loaded_weight across
+                    # iterations (else w3 is transposed twice and wrongly chunked)
+                    fused_weight = loaded_weight
+                    if shard_id in {"w1", "w3"}:
+                        if fused_weight.shape[-1] != unpadded_hidden:
+                            # [..., hidden, intermediate] -> [..., intermediate, hidden]
+                            fused_weight = fused_weight.transpose(-1, -2)
+                        # Repurpose expert_id for deconcatenating w1 and w3
+                        experts_shard = fused_weight.chunk(2, dim=1)[expert_id]
+                    else:
+                        if fused_weight.shape[-2] != unpadded_hidden:
+                            # [..., intermediate, hidden] -> [..., hidden, intermediate]
+                            fused_weight = fused_weight.transpose(-1, -2)
+                        experts_shard = fused_weight
+                    start = 0
+                else:
+                    # loaded_weight is a single expert weight, so we add a dummy expert
+                    # dimension to unify the loading logic with the fused case
+                    experts_shard = loaded_weight.unsqueeze(0)
+                    start = expert_id
 
-def _check_weight_loader_fingerprint() -> None:
+                # Unified loading logic for fused and non-fused experts
+                loaded_experts = experts_shard.unbind()
+                for expert_id, loaded_expert in enumerate(loaded_experts, start=start):
+                    success = param.weight_loader(
+                        param=param,
+                        loaded_weight=loaded_expert,
+                        weight_name=weight_name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                        return_success=True,
+                    )
+                    if success:
+                        logger.debug(
+                            "Loaded expert %d of shard %s into %s for layer %s",
+                            expert_id,
+                            shard_id,
+                            param_name,
+                            self.layer_name,
+                        )
+                        yield param_name
+"""
+
+
+def _check_routed_experts_fingerprints() -> None:
     p.check_fingerprint(
         "RoutedExperts.weight_loader",
         inspect.getsource(RoutedExperts.weight_loader),
@@ -328,9 +395,18 @@ def _check_weight_loader_fingerprint() -> None:
             "baseline or replace the copy with an upstream shard-dim hook."
         ),
     )
+    p.check_fingerprint(
+        "RoutedExperts.load_weights",
+        inspect.getsource(RoutedExperts.load_weights),
+        _ROUTED_EXPERTS_LOAD_WEIGHTS_BASELINE,
+        resync_hint=(
+            "Resync IluRoutedExperts.load_weights with the community "
+            "baseline or move the fused-scale normalization to an upstream hook."
+        ),
+    )
 
 
-_check_weight_loader_fingerprint()
+_check_routed_experts_fingerprints()
 
 
 @RoutedExperts.register_oot()
@@ -344,6 +420,99 @@ class IluRoutedExperts(RoutedExperts):
             quant_method.__class__.__name__ == "IluAutoGPTQMoEMethod"
             or super()._needs_intermediate_size_param(quant_method)
         )
+
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[str]:
+        expert_mapping = self.get_expert_mapping(include_fused=True)
+        unpadded_hidden = self.moe_config.hidden_dim_unpadded
+        fused_w13_intermediate_dim = None
+        for expert_name, loaded_weight in weights:
+            qual_name = f"{self.layer_name}.{expert_name}"
+            # Fused expert weights can be identified by their 3D tensors
+            is_fused = loaded_weight.dim() == 3
+            matched = False
+            for param_name, weight_name, expert_id, shard_id in expert_mapping:
+                if weight_name not in qual_name:
+                    if matched and is_fused:
+                        break
+                    continue
+                matched = True
+                weight_name = qual_name.replace(weight_name, param_name)
+                param_name = weight_name.removeprefix(f"{self.layer_name}.")
+                param = getattr(self, param_name)
+                if is_fused:
+                    # w1 and w3 share one fused tensor; use a local copy so the
+                    # transpose below doesn't mutate loaded_weight across
+                    # iterations (else w3 is transposed twice and wrongly chunked)
+                    fused_weight = loaded_weight
+                    # >>> ILU MODIFICATION >>>
+                    # record fused w13 full dim
+                    if "weight_scale" not in param_name:
+                        if "w13_weight" in param_name:
+                            fused_w13_intermediate_dim = (
+                                fused_weight.shape[-2]
+                                if fused_weight.shape[-1] == unpadded_hidden
+                                else fused_weight.shape[-1]
+                            )
+                    # <<< ILU MODIFICATION <<<
+                    if shard_id in {"w1", "w3"}:
+                        if fused_weight.shape[-1] != unpadded_hidden:
+                            # [..., hidden, intermediate] -> [..., intermediate, hidden]
+                            fused_weight = fused_weight.transpose(-1, -2)
+                        # >>> ILU MODIFICATION >>>
+                        # trim fused w13 scale dim
+                        if (
+                            "w13_weight_scale" in param_name
+                            and fused_weight.shape[-2] == 2
+                            and fused_w13_intermediate_dim is not None
+                            and fused_weight.shape[-1] == fused_w13_intermediate_dim
+                            and fused_weight.shape[-1] % 2 == 0
+                        ):
+                            fused_weight = fused_weight.narrow(
+                                -1, 0, fused_weight.shape[-1] // 2
+                            )
+                        # <<< ILU MODIFICATION <<<
+                        # Repurpose expert_id for deconcatenating w1 and w3
+                        experts_shard = fused_weight.chunk(2, dim=1)[expert_id]
+                    else:
+                        # >>> ILU MODIFICATION >>>
+                        # handle fused w2 scale layout
+                        if fused_weight.shape[-2] != unpadded_hidden or (
+                            "w2_weight_scale" in param_name
+                            and fused_weight.shape[-1] == 1
+                        ):
+                            # <<< ILU MODIFICATION <<<
+                            # [..., intermediate, hidden] -> [..., hidden, intermediate]
+                            fused_weight = fused_weight.transpose(-1, -2)
+                        experts_shard = fused_weight
+                    start = 0
+                else:
+                    # loaded_weight is a single expert weight, so we add a dummy expert
+                    # dimension to unify the loading logic with the fused case
+                    experts_shard = loaded_weight.unsqueeze(0)
+                    start = expert_id
+
+                # Unified loading logic for fused and non-fused experts
+                loaded_experts = experts_shard.unbind()
+                for expert_id, loaded_expert in enumerate(loaded_experts, start=start):
+                    success = param.weight_loader(
+                        param=param,
+                        loaded_weight=loaded_expert,
+                        weight_name=weight_name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                        return_success=True,
+                    )
+                    if success:
+                        logger.debug(
+                            "Loaded expert %d of shard %s into %s for layer %s",
+                            expert_id,
+                            shard_id,
+                            param_name,
+                            self.layer_name,
+                        )
+                        yield param_name
 
     @overload
     def weight_loader(

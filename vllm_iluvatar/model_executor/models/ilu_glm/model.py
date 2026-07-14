@@ -603,16 +603,21 @@ class IluGlmMoeDsaForCausalLM(nn.Module, SupportsPP):
 
 
 def register_model() -> None:
-    """Register the Iluvatar GLM-5.2 W4A8 causal-LM arch.
+    """Register the Iluvatar GLM-5.2 W4A8 causal-LM and MTP draft archs.
 
     Invoked by ``vllm_iluvatar.ilu_register.apply_oot_registrations`` during
-    register_general. The class path is resolved lazily by ModelRegistry, so
+    register_general. The class paths are resolved lazily by ModelRegistry, so
     importing this module's heavy attention deps (``IluSparseAttnIndexer`` and
-    the ``vllm::sparse_attn_indexer`` op) is deferred until the model is loaded.
+    the ``vllm::sparse_attn_indexer`` op) -- and ``mtp.py`` -- is deferred until
+    the model is loaded.
     """
     from vllm import ModelRegistry
 
     ModelRegistry.register_model(
         "IluGlmMoeDsaForCausalLM",
         "vllm_iluvatar.model_executor.models.ilu_glm.model:IluGlmMoeDsaForCausalLM",
+    )
+    ModelRegistry.register_model(
+        "IluGlmMoeDsaMTPModel",
+        "vllm_iluvatar.model_executor.models.ilu_glm.mtp:IluGlmMoeDsaMTP",
     )

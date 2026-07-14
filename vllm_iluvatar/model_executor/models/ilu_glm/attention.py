@@ -593,6 +593,16 @@ class IluGlmMoeDsaMLAAttention(nn.Module):
             else:
                 self.skip_topk = False
 
+        # MTP draft layers (layer_id >= num_hidden_layers) must always build a
+        # ``full`` indexer: they compute their own top-k at draft step 0 and the
+        # proposer toggles skip_topk at runtime for steps 1+
+        # (index_share_for_mtp_iteration). Starting with skip_topk=True here
+        # would leave no indexer built and the draft reading a never-written
+        # top-k buffer. Mirrors community deepseek_v2.py's is_mtp_layer handling.
+        _num_hidden_layers = getattr(config, "num_hidden_layers", None)
+        if _num_hidden_layers is not None and layer_id >= _num_hidden_layers:
+            self.skip_topk = False
+
         if not self.skip_topk:
             self.indexer = IluGlmMoeDsaIndexer(
                 vllm_config,

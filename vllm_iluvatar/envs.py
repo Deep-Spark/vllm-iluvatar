@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     VLLM_ILU_VIT_ATTN_LAYER: str = ""
     VLLM_ILU_GDN_ATTN_BACKEND: bool = False
     VLLM_ILU_DS4_PREFILL_OPT: bool = False
+    VLLM_ILU_DS4_PREFILL_AS_DECODE: bool = False
     VLLM_ILU_NIXL_WRITE_USE_HOST_BUFFER: bool = False
     VLLM_ILU_NIXL_HOST_DTYPE: str = "auto"
     VLLM_ILU_NIXL_PROXY_ADDR: str = ""
@@ -151,6 +152,14 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ILU_DS4_PREFILL_OPT": lambda: (
         _get("VLLM_ILU_DS4_PREFILL_OPT", "VLLM_DS4_PREFILL_OPT", "0").lower()
+        in ("1", "true")
+    ),
+    # Route DeepSeek-V4 prefill through the per-token *decode* sparse MLA
+    # kernel (ds4_flash_mla_with_kvcache) instead of the workspace-gather
+    # prefill kernel. bf16 KV cache only. See
+    # IluDeepseekV4MLAAttention._forward_prefill_as_decode.
+    "VLLM_ILU_DS4_PREFILL_AS_DECODE": lambda: (
+        _get("VLLM_ILU_DS4_PREFILL_AS_DECODE", "VLLM_DS4_PREFILL_AS_DECODE", "0").lower()
         in ("1", "true")
     ),
 }

@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     VLLM_ILU_NIXL_SERVER_ADDR: str = ""
     VLLM_ILU_NIXL_DS32_QUANT_AFTER_TRANSFER: bool = False
     VLLM_ILU_LINEAR_BACKEND: str = ""
+    VLLM_ILU_DP_LB_EXACT_INFLIGHT: bool = False
 
 # Canonical (VLLM_ILU_*) readers. Each lambda preserves the exact parsing the
 # fork used in vllm/envs.py, and reads VLLM_ILU_* first then the legacy VLLM_*.
@@ -179,6 +180,9 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     .strip()
     .lower()
     .replace("-", "_"),
+    "VLLM_ILU_DP_LB_EXACT_INFLIGHT": _bool_reader(
+        "VLLM_ILU_DP_LB_EXACT_INFLIGHT", "0"
+    ),
 }
 
 

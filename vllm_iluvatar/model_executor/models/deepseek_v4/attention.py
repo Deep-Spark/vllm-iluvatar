@@ -1194,7 +1194,22 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             prefill_q = q[num_decode_tokens:]
             prefill_out = output[num_decode_tokens:]
 
-            if envs.VLLM_ILU_DS4_PREFILL_OPT:
+            # bf16-only experimental path: run prefill through the per-token
+            # decode sparse MLA kernel (ds4_flash_mla_with_kvcache).
+            prefill_as_decode = (
+                envs.VLLM_ILU_DS4_PREFILL_AS_DECODE
+                and self.kv_cache_dtype != "fp8_ds_mla"
+            )
+            if prefill_as_decode:
+                self._forward_prefill_as_decode(
+                    q=prefill_q,
+                    kv_cache=self_kv_cache,
+                    swa_metadata=swa_metadata,
+                    attn_metadata=flashmla_metadata if not swa_only else None,
+                    swa_only=swa_only,
+                    output=prefill_out,
+                )
+            elif envs.VLLM_ILU_DS4_PREFILL_OPT:
                 self._forward_prefill_opt(
                     q=prefill_q,
                     swa_k_cache=swa_kv_cache,
@@ -1373,6 +1388,128 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 block_size=block_size,
                 offset=offset,
             )
+
+    def _forward_prefill_as_decode(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor | None,
+        swa_metadata: DeepseekSparseSWAMetadata,
+        attn_metadata: IluFlashMLASparseMetadata | None,
+        swa_only: bool,
+        output: torch.Tensor,
+    ) -> None:
+        """Prefill-side sparse MLA via the per-token *decode* kernel (bf16 only).
+
+        Experimental alternative to :meth:`_forward_prefill` /
+        :meth:`_forward_prefill_opt` (gated by ``VLLM_ILU_DS4_PREFILL_AS_DECODE``):
+        instead of gathering a shared bf16 workspace and calling
+        ``ds4_flash_mla_sparse_fwd``, treat every prefill query token as its own
+        batch element (``b = num_prefill_tokens``, ``s_q = 1``) and reuse the
+        decode kernel ``ds4_flash_mla_with_kvcache``.
+
+        This is well-defined because the per-token SWA window and compressed
+        top-k slot sourcing are purely position-based and identical for decode
+        and prefill tokens:
+
+        - SWA indices/lens come from ``swa_metadata.prefill_swa_indices`` /
+          ``prefill_swa_lens`` (the SWA metadata builder now computes these for
+          the prefill token range when the flag is set), already in global
+          paged-slot form.
+        - C4A (``compress_ratio == 4``): the indexer wrote per-prefill-token
+          *local* compressed indices into ``self.topk_indices_buffer``; we map
+          them to global paged slots with
+          ``ixfops.ds4_compute_global_topk_indices_and_lens`` -- the same op the
+          decode path uses.
+        - C128A (``compress_ratio == 128``): the FlashMLA sparse builder
+          pre-computed per-prefill-token *local* compressed indices in
+          ``attn_metadata.c128a_prefill_topk_indices``; we map them to global
+          paged slots the same way.
+
+        Unlike the decode path (where request ids are 0-based within the decode
+        prefix), prefill ``token_to_req_indices`` carry *global* request ids, so
+        the full (unsliced) ``block_table`` is handed to the global-index op.
+
+        Only the bf16 KV cache path is supported; the caller guards on
+        ``kv_cache_dtype != "fp8_ds_mla"``.
+        """
+        num_decode_tokens = swa_metadata.num_decode_tokens
+        num_prefill_tokens = swa_metadata.num_prefill_tokens
+        if num_prefill_tokens == 0:
+            return
+
+        swa_indices = swa_metadata.prefill_swa_indices
+        swa_lens = swa_metadata.prefill_swa_lens
+        assert swa_indices is not None and swa_lens is not None, (
+            "prefill_swa_indices / prefill_swa_lens must be populated when "
+            "VLLM_ILU_DS4_PREFILL_AS_DECODE is enabled; check the SWA metadata "
+            "builder."
+        )
+
+        token_end = num_decode_tokens + num_prefill_tokens
+
+        topk_indices: torch.Tensor | None = None
+        topk_lens: torch.Tensor | None = None
+        if not swa_only:
+            assert attn_metadata is not None, (
+                "FlashMLASparseMetadata is required when compress_ratio > 1; "
+                f"prefix={self.prefix!r}"
+            )
+            assert swa_metadata.is_valid_token is not None
+            assert swa_metadata.token_to_req_indices is not None
+            block_size = attn_metadata.block_size // self.compress_ratio
+            is_valid = swa_metadata.is_valid_token[num_decode_tokens:token_end]
+            # Prefill tokens carry *global* request ids, so pass the full
+            # block_table (rows are indexed by the global req id directly).
+            token_to_req = swa_metadata.token_to_req_indices[
+                num_decode_tokens:token_end
+            ]
+            if self.compress_ratio == 4:
+                # C4A: per-layer local topk indices written by the indexer.
+                assert self.topk_indices_buffer is not None
+                local_topk = self.topk_indices_buffer[num_decode_tokens:token_end]
+            elif self.compress_ratio == 128:
+                # C128A: per-prefill-token local compressed indices from the
+                # FlashMLA sparse builder.
+                local_topk = attn_metadata.c128a_prefill_topk_indices
+                assert local_topk is not None
+                local_topk = local_topk[:num_prefill_tokens]
+            else:
+                raise ValueError(
+                    f"Unsupported compress_ratio={self.compress_ratio}; "
+                    "expected 1, 4, or 128."
+                )
+            global_indices, topk_lens = (
+                ixfops.ds4_compute_global_topk_indices_and_lens(
+                    local_topk,
+                    token_to_req,
+                    attn_metadata.block_table,
+                    block_size,
+                    is_valid,
+                )
+            )
+            topk_indices = global_indices.view(num_prefill_tokens, 1, -1)
+
+        # Each prefill query token is its own batch element (s_q = 1), matching
+        # the decode kernel's per-token layout.
+        q = q.unsqueeze(1)
+
+        # bf16 cache: reshape to (num_blocks, page_block_size, 1, head_dim).
+        swa_cache = self.swa_cache_layer.kv_cache.unsqueeze(-2)
+        if kv_cache is not None:
+            kv_cache = kv_cache.unsqueeze(-2)
+
+        ixfops.ds4_flash_mla_with_kvcache(
+            q=q,
+            k_cache=swa_cache,
+            indices=swa_indices,
+            topk_length=swa_lens,
+            sm_scale=self.scale,
+            attn_sink=self.attn_sink,
+            extra_k_cache=kv_cache if not swa_only else None,
+            extra_indices=topk_indices,
+            extra_topk_length=topk_lens,
+            output=output.unsqueeze(1),
+        )
 
     def _forward_prefill(
         self,

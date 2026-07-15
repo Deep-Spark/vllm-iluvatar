@@ -492,6 +492,31 @@ class IluDeepseekCompressor(DeepseekCompressor):
         block_table = state_metadata.block_table
         block_size = state_metadata.block_size
 
+        # Drop trailing data-parallel padding rows.
+        #
+        # The model forward runs on ``num_tokens_padded`` rows (so ``x`` /
+        # ``positions`` / ``kv`` / ``score`` all have that length), but the
+        # attention metadata is only padded to the CUDA-graph batch size when
+        # the step is dispatched in FULL cudagraph mode (``pad_attn``). Under
+        # data-parallel, ranks agree on a common per-step ``num_tokens_across_dp``
+        # and one rank running a prefill / non-uniform-decode batch forces the
+        # *whole* DP group onto the eager (non-FULL) path. On the decode ranks
+        # that means ``x``/``positions`` are DP-padded while ``slot_mapping`` /
+        # ``token_to_req_indices`` stay at the unpadded ``num_actual`` length,
+        # so ``kv.size(0) != slot_mapping.size(0)`` and the strict ixformer op
+        # ``ds4_compressor_save_partial_states`` aborts with
+        # "slot_mapping shape must be [num_tokens]".
+        #
+        # The padding rows are no-op tokens, so slice ``kv``/``score``/
+        # ``positions`` back down to ``num_actual`` to keep every compressor
+        # kernel argument the same length. In FULL cudagraph mode
+        # ``num_actual == kv.size(0)`` and these slices are captured no-ops.
+        num_actual = slot_mapping.shape[0]
+        if kv.shape[0] != num_actual:
+            kv = kv[:num_actual]
+            score = score[:num_actual]
+            positions = positions[:num_actual]
+
         # ``state_cache`` shape: [num_blocks, block_size, 2 * coff * head_dim]
         # (kv_state | score_state). fp32 by construction (see
         # ``CompressorStateCache``).

@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from types import SimpleNamespace
 
+import ixformer
 import ixformer.inference.functions as ixf_ops
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
@@ -77,7 +79,62 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
             is_static_input_scheme=self.is_static_input_scheme,
             input_symmetric=self.input_symmetric,
         )
+        self.arch = ixformer.cuda.cuda_arch
         self.format = "TN"
+        self.perf_mode = os.getenv("VLLM_W8A8_GEMM_MODE", "PERF").upper()
+        assert self.perf_mode in ["NORMAL", "PERF"], f"Invalid perf_mode:{self.perf_mode}"
+        logger.info_once(
+            f"[IluCompressedTensorsW8A8Int8] perf_mode:{self.perf_mode} arch:{self.arch}"
+        )
+
+        self.perf_table = {
+            "ivcore30": {
+                # n, k
+                (2048, 7168): {
+                    "format": "TN",
+                    "func" : [(0, ixf_ops.w8a8_gemv), (17, ixf_ops.w8a8_gemm)],
+                },
+                (4096, 1536): {
+                    "format": "TN",
+                    "func" : [(0, ixf_ops.w8a8_gemv), (17, ixf_ops.w8a8_gemm)],
+                },
+                # deepseekv4 pro tp8
+                (8192, 1536): {
+                    "format": "TN",
+                    "func" : [(0, ixf_ops.w8a8_gemv), (17, ixf_ops.w8a8_gemm)],
+                },
+                (7168, 2048): {
+                    "format": "TN",
+                    "func" : [(0, ixf_ops.w8a8_gemv), (17, ixf_ops.w8a8_gemm)],
+                },
+                (768, 7168): {
+                    "format": "TN",
+                    "func" : [(0, ixf_ops.w8a8_gemv), (17, ixf_ops.w8a8_gemm)],
+                },
+                (7168, 384): {
+                    "format": "TN",
+                    "func" : [(0, ixf_ops.w8a8_gemm),],
+                },
+                # deepseekv4 pro tp4
+                (16384, 1536): {
+                    "format": "TN",
+                    "func" : [(0, ixf_ops.w8a8_gemv), (17, ixf_ops.w8a8_gemm)],
+                },
+                (7168, 4096): {
+                    "format": "TN",
+                    "func" : [(0, ixf_ops.w8a8_gemv), (17, ixf_ops.w8a8_gemm)],
+                },
+                (1536, 7168): {
+                    "format": "TN",
+                    "func" : [(0, ixf_ops.w8a8_gemv), (17, ixf_ops.w8a8_gemm)],
+                },
+                (7168, 768): {
+                    "format": "TN",
+                    "func" : [(0, ixf_ops.w8a8_gemv), (17, ixf_ops.w8a8_gemm)],
+                },
+            },
+            "ivcore11": {}
+        }
 
     def _get_layer_params(
         self, layer: torch.nn.Module
@@ -90,6 +147,44 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
             getattr(layer, i_zp, None),
             getattr(layer, azp_adj, None),
         )
+
+    def _get_perf_entry(self, n: int, k: int):
+        """Look up perf_table by arch, then by (n, k). Returns None if missing."""
+        arch_table = self.perf_table.get(self.arch)
+        if not arch_table:
+            return None
+        return arch_table.get((n, k))
+
+    def _choose_format(self, n: int, k: int) -> str:
+        """Choose weight layout format. In PERF mode, use perf_table if shape
+        matches; otherwise fall back to auto-selection."""
+        if self.perf_mode == "PERF":
+            entry = self._get_perf_entry(n, k)
+            if entry is not None:
+                return entry["format"]
+        if n % 64 == 0 and k % 64 == 0:
+            return "NN"
+        return "TN"
+
+    def _get_perf_func(self, n: int, k: int, m: int):
+        """In PERF mode, select the best kernel for the given m from
+        perf_table.  Returns None when PERF mode is off or shape not in
+        table, signalling the caller to use the default w8a8 path."""
+        if self.perf_mode != "PERF":
+            return None
+        entry = self._get_perf_entry(n, k)
+        if entry is None:
+            return None
+        func_list = entry["func"]
+        chosen = None
+        for min_m, fn in func_list:
+            if m >= min_m:
+                chosen = fn
+        assert chosen is not None, (
+            f"No kernel found for arch:{self.arch} n:{n} k:{k} m:{m} "
+            f"func_list:{func_list}"
+        )
+        return chosen
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -164,13 +259,11 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
         config = self.config
         # WEIGHT
         weight = getattr(layer, w_q_name)
-        self.format = "TN"
         n, k = weight.shape
-        '''
-            auto choose format now
-        '''
-        if n % 64 == 0 and k % 64 == 0:
-            self.format = "NN"
+        self.format = self._choose_format(n, k)
+        logger.info_once(f"[IluCompressedTensorsW8A8Int8 process_weights_after_loading] choose format:{self.format} n:{n} k:{k}")
+
+        if self.format == "NN":
             self.gemm_info = W8A8GemmInfo(
                 format_str="NN",
                 k=k,
@@ -180,7 +273,6 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
                 layer, w_q_name,
                 torch.nn.Parameter(weight.data.t().contiguous(),
                                     requires_grad=False))
-            logger.info_once(f"[IluCompressedTensorsW8A8Int8 process_weights_after_loading weight] use NN format out_size:{n} in_size:{k} weight:{weight.shape} -> {getattr(layer, w_q_name).shape}")
         else:
             self.gemm_info = W8A8GemmInfo(
                 format_str="TN",
@@ -343,8 +435,15 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
                 "IluCompressedTensorsW8A8Int8 only supports 2D or 3D inputs, "
                 f"got {x_q.dim()}D"
             )
-        ixf_ops.w8a8(x_q, w_q, x_s, w_s, bias, format=self.gemm_info.format_str,
-                     output=out, out_dtype=out_dtype)
+
+        perf_fn = self._get_perf_func(self.gemm_info.n, self.gemm_info.k, x_q.shape[0])
+        if perf_fn is not None:
+            perf_fn(x_q, w_q, x_s, w_s, bias,
+                    output=out, format=self.gemm_info.format_str,
+                    out_dtype=out_dtype)
+        else:
+            ixf_ops.w8a8(x_q, w_q, x_s, w_s, bias, format=self.gemm_info.format_str,
+                    output=out, out_dtype=out_dtype)
 
         # unpad tensor
         if out.dim() == 2:

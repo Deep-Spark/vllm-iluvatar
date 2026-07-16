@@ -53,6 +53,20 @@ class _HYV3AttentionFusedMixin:
     Mirrors the community non-HPC fallback in
     ``vllm.model_executor.models.hy_v3.HYV3Attention.forward``, with the two
     separate ``q_norm`` / ``k_norm`` passes replaced by one fused op.
+
+    TODO:
+    The original logic is as follows:
+    q/k bf16                          ->
+    q_norm/k_norm weight bf16 -> f32  -> norm (calculated in f32) -> rope with cos_sin float32 -> bf16 write
+
+    Our logic is as follows:
+    q/k bf16                          ->
+    q_norm/k_norm bf16                -> norm (calculated in f32) -> q/k norm bf16 write -> rope (calculated in f32) -> bf16 write
+    Thus, a pair of redundant reciprocal operations are executed:
+    __float2bfloat16(q/k) in the norm kernel -> q/k bf16 (norm results) -> __bfloat162float(q/k) in the rotary kernel -> q/k bf16 (final results)
+
+    For more details, please refer to the following code:
+    https://github.com/Tencent/hpc-ops/blob/main/src/rope/rope.cu#L80-L344
     """
 
     def forward(

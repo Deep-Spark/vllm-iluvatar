@@ -63,11 +63,11 @@ from vllm.utils.torch_utils import (
     kv_cache_dtype_str_to_dtype,
 )
 from vllm.v1.attention.backend import AttentionBackend
-from vllm.v1.attention.backends.mla.ilu_flashmla_sparse import (
+from vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse import (
     IluFlashMLASparseBackend,
     IluFlashMLASparseMetadata,
 )
-from vllm.v1.attention.backends.mla.ilu_indexer import (
+from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
     IluDeepseekV32IndexerBackend,
     IluDeepseekV32IndexerMetadata,
 )

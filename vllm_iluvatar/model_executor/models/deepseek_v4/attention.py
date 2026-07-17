@@ -63,16 +63,16 @@ from vllm.models.deepseek_v4.compressor import (
 )
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend
-from vllm.v1.attention.backends.mla.ilu_flashmla_sparse import (
+from vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse import (
     IluDeepseekV4FlashMLASparseBackend,
     IluFlashMLASparseMetadata,
 )
-from vllm.v1.attention.backends.mla.ilu_indexer import (
+from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
     IluDeepseekV4IndexerBackend,
     IluDeepseekV32IndexerMetadata,
     get_max_prefill_buffer_size,
 )
-from vllm.v1.attention.backends.mla.ilu_sparse_swa import (
+from vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa import (
     IluDeepseekV4SWACache,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import (

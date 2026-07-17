@@ -479,7 +479,7 @@ class _IluV4W8A16BMMLinearMethod(LinearMethodBase):
 
     A 2D ``ixf_ops.w8a8`` GEMM does not apply. We follow R1's
     ``_v_up_proj_w8a8`` / ``_k_up_proj_w8a8`` template
-    (vllm/v1/attention/backends/mla/ilu_mla.py) and use
+    (vllm_iluvatar/v1/attention/backends/mla/ilu_mla.py) and use
     ``ixf_ops.marlin_w8a16``: weight is stored as INT8 per-channel on disk
     (identical to the dense W8A8 path), but the input stays BF16 and the
     weight is repacked into Marlin layout in

@@ -57,15 +57,15 @@ def register_attention_backends() -> None:
     )
     register_backend(
         AttentionBackendEnum.FLASHMLA,
-        "vllm.v1.attention.backends.mla.ilu_mla.IluMLABackend",
+        "vllm_iluvatar.v1.attention.backends.mla.ilu_mla.IluMLABackend",
     )
     register_backend(
         AttentionBackendEnum.FLASHMLA_SPARSE,
-        "vllm.v1.attention.backends.mla.ilu_flashmla_sparse.IluFlashMLASparseBackend",
+        "vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse.IluFlashMLASparseBackend",
     )
     register_backend(
         AttentionBackendEnum.FLASHMLA_SPARSE_DSV4,
-        "vllm.v1.attention.backends.mla.ilu_flashmla_sparse."
+        "vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse."
         "IluDeepseekV4FlashMLASparseBackend",
     )
     # Reuse the official GDN_ATTN enum member; do not introduce an ILU_* enum.

@@ -177,19 +177,7 @@ def broadcast_tensor_dict(
 # ivcore30: blocking send/recv for PP tensor exchange
 # ---------------------------------------------------------------------------
 
-_is_ivcore30: bool | None = None
-
-
-def _check_ivcore30() -> bool:
-    """Cache the arch check so ixformer is imported at most once."""
-    global _is_ivcore30
-    if _is_ivcore30 is None:
-        try:
-            from ixformer import cuda
-            _is_ivcore30 = cuda.cuda_arch == "ivcore30"
-        except ImportError:
-            _is_ivcore30 = False
-    return _is_ivcore30
+from vllm_iluvatar.ilu_util.arch import is_ivcore30 as _is_ivcore30_fn
 
 
 # [ILU override] GroupCoordinator.isend_tensor_dict — delta: on ivcore30,
@@ -346,7 +334,7 @@ def _make_isend_tensor_dict(orig):
     """Wrapper: ivcore30 → blocking send; ivcore11 → community isend."""
     def isend_tensor_dict(self, tensor_dict, dst=None,
                           all_gather_group=None, all_gather_tensors=None):
-        if _check_ivcore30():
+        if _is_ivcore30_fn():
             return _ilu_isend_tensor_dict_sync(
                 self, tensor_dict, dst, all_gather_group, all_gather_tensors
             )
@@ -358,7 +346,7 @@ def _make_irecv_tensor_dict(orig):
     """Wrapper: ivcore30 → blocking recv; ivcore11 → community irecv."""
     def irecv_tensor_dict(self, src=None,
                           all_gather_group=None, all_gather_tensors=None):
-        if _check_ivcore30():
+        if _is_ivcore30_fn():
             return _ilu_irecv_tensor_dict_sync(
                 self, src, all_gather_group, all_gather_tensors
             )

@@ -91,6 +91,7 @@ if TYPE_CHECKING:
     VLLM_ILU_NIXL_DS32_QUANT_AFTER_TRANSFER: bool = False
     VLLM_ILU_LINEAR_BACKEND: str = ""
     VLLM_ILU_DP_LB_EXACT_INFLIGHT: bool = False
+    VLLM_ILU_W8A8_GEMM_MODE: str = "PERF"
 
 # Canonical (VLLM_ILU_*) readers. Each lambda preserves the exact parsing the
 # fork used in vllm/envs.py, and reads VLLM_ILU_* first then the legacy VLLM_*.
@@ -162,6 +163,9 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
         _get("VLLM_ILU_DS4_PREFILL_AS_DECODE", "VLLM_DS4_PREFILL_AS_DECODE", "0").lower()
         in ("1", "true")
     ),
+    "VLLM_ILU_W8A8_GEMM_MODE": lambda: _get(
+        "VLLM_ILU_W8A8_GEMM_MODE", "VLLM_W8A8_GEMM_MODE", "PERF"
+    ).upper(),
 }
 
 

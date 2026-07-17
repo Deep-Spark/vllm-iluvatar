@@ -87,14 +87,14 @@ def _patch_env(monkeypatch):
 
 @pytest.fixture()
 def _set_ivcore30(monkeypatch):
-    """Force _check_ivcore30() to return True."""
-    monkeypatch.setattr(impl, "_is_ivcore30", True)
+    """Force is_ivcore30() to return True."""
+    monkeypatch.setattr(impl, "_is_ivcore30_fn", lambda: True)
 
 
 @pytest.fixture()
 def _set_ivcore11(monkeypatch):
-    """Force _check_ivcore30() to return False."""
-    monkeypatch.setattr(impl, "_is_ivcore30", False)
+    """Force is_ivcore30() to return False."""
+    monkeypatch.setattr(impl, "_is_ivcore30_fn", lambda: False)
 
 
 @pytest.fixture()
@@ -289,9 +289,11 @@ class TestIrecvTensorDict:
 
 class TestArchCaching:
 
-    def test_check_ivcore30_caches_result(self, monkeypatch):
-        """_check_ivcore30 should cache after first call."""
-        monkeypatch.setattr(impl, "_is_ivcore30", None)
+    def test_is_ivcore30_caches_result(self, monkeypatch):
+        """ilu_util.arch.is_ivcore30 should cache after first call."""
+        import vllm_iluvatar.ilu_util.arch as arch_mod
+        monkeypatch.setattr(arch_mod, "_resolved", False)
+        monkeypatch.setattr(arch_mod, "_cuda_arch", None)
 
         ixformer_cuda = MagicMock()
         ixformer_cuda.cuda_arch = "ivcore30"
@@ -300,16 +302,18 @@ class TestArchCaching:
 
         monkeypatch.setitem(sys.modules, "ixformer", ixformer_mod)
 
-        assert impl._check_ivcore30() is True
-        assert impl._is_ivcore30 is True
+        assert arch_mod.is_ivcore30() is True
+        assert arch_mod._resolved is True
 
         # Second call should use cache, not re-import.
         monkeypatch.delitem(sys.modules, "ixformer")
-        assert impl._check_ivcore30() is True
+        assert arch_mod.is_ivcore30() is True
 
-    def test_check_ivcore11_returns_false(self, monkeypatch):
-        """ivcore11 arch should make _check_ivcore30 return False."""
-        monkeypatch.setattr(impl, "_is_ivcore30", None)
+    def test_ivcore11_returns_false(self, monkeypatch):
+        """ivcore11 arch should make is_ivcore30 return False."""
+        import vllm_iluvatar.ilu_util.arch as arch_mod
+        monkeypatch.setattr(arch_mod, "_resolved", False)
+        monkeypatch.setattr(arch_mod, "_cuda_arch", None)
 
         ixformer_cuda = MagicMock()
         ixformer_cuda.cuda_arch = "ivcore11"
@@ -318,8 +322,8 @@ class TestArchCaching:
 
         monkeypatch.setitem(sys.modules, "ixformer", ixformer_mod)
 
-        assert impl._check_ivcore30() is False
-        assert impl._is_ivcore30 is False
+        assert arch_mod.is_ivcore30() is False
+        assert arch_mod.cuda_arch() == "ivcore11"
 
 
 # ---------------------------------------------------------------------------

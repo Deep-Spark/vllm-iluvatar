@@ -194,6 +194,13 @@ def _make_iluvatar_platform():
             # VllmConfig.__post_init__, before the tokenizer is built).
             super().check_and_update_config(vllm_config)
 
+            pc = getattr(vllm_config, "parallel_config", None)
+            if pc is not None and pc.worker_cls == "vllm.v1.worker.gpu_worker.Worker":
+                pc.worker_cls = "vllm_iluvatar.v1.worker.gpu_worker.IluWorker"
+                logger.info(
+                    "ILU: set worker_cls to IluWorker (DP dummy-batch optimisation)"
+                )
+
             model_config = getattr(vllm_config, "model_config", None)
             if model_config is None:
                 return

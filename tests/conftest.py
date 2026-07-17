@@ -30,6 +30,20 @@ requires_cuda = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _inject_ilu_module_aliases():
+    """Inject sys.modules aliases that ``register_general()`` would set up.
+
+    In production the plugin's ``register_general()`` installs these before any
+    model import.  Tests skip that boot path, so the aliases must be injected
+    here to prevent ModuleNotFoundError when community code (e.g.
+    deepseek_v2.py) transitively imports migrated ilu_* modules via the old
+    ``vllm.*`` paths.
+    """
+    from vllm_iluvatar import _inject_ilu_module_aliases as _inject
+    _inject()
+
+
 @pytest.fixture()
 def cuda_device() -> str:
     if not _cuda_available():

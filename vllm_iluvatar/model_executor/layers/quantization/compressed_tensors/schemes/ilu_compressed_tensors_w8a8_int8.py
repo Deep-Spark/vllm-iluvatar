@@ -4,12 +4,11 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from types import SimpleNamespace
 
-import ixformer
 import ixformer.inference.functions as ixf_ops
+from ixformer.inference.functions.w8a8 import w8a8_gemm, w8a8_gemv
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
 
@@ -79,9 +78,11 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
             is_static_input_scheme=self.is_static_input_scheme,
             input_symmetric=self.input_symmetric,
         )
-        self.arch = ixformer.cuda.cuda_arch
+        from vllm_iluvatar.ilu_util.arch import cuda_arch
+        self.arch = cuda_arch()
         self.format = "TN"
-        self.perf_mode = os.getenv("VLLM_W8A8_GEMM_MODE", "PERF").upper()
+        from vllm import envs
+        self.perf_mode = envs.VLLM_ILU_W8A8_GEMM_MODE
         assert self.perf_mode in ["NORMAL", "PERF"], f"Invalid perf_mode:{self.perf_mode}"
         logger.info_once(
             f"[IluCompressedTensorsW8A8Int8] perf_mode:{self.perf_mode} arch:{self.arch}"
@@ -92,45 +93,45 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
                 # n, k
                 (2048, 7168): {
                     "format": "TN",
-                    "func" : [(0, ixf_ops.w8a8_gemv), (17, ixf_ops.w8a8_gemm)],
+                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 (4096, 1536): {
                     "format": "TN",
-                    "func" : [(0, ixf_ops.w8a8_gemv), (17, ixf_ops.w8a8_gemm)],
+                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 # deepseekv4 pro tp8
                 (8192, 1536): {
                     "format": "TN",
-                    "func" : [(0, ixf_ops.w8a8_gemv), (17, ixf_ops.w8a8_gemm)],
+                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 (7168, 2048): {
                     "format": "TN",
-                    "func" : [(0, ixf_ops.w8a8_gemv), (17, ixf_ops.w8a8_gemm)],
+                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 (768, 7168): {
                     "format": "TN",
-                    "func" : [(0, ixf_ops.w8a8_gemv), (17, ixf_ops.w8a8_gemm)],
+                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 (7168, 384): {
                     "format": "TN",
-                    "func" : [(0, ixf_ops.w8a8_gemm),],
+                    "func" : [(0, w8a8_gemm),],
                 },
                 # deepseekv4 pro tp4
                 (16384, 1536): {
                     "format": "TN",
-                    "func" : [(0, ixf_ops.w8a8_gemv), (17, ixf_ops.w8a8_gemm)],
+                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 (7168, 4096): {
                     "format": "TN",
-                    "func" : [(0, ixf_ops.w8a8_gemv), (17, ixf_ops.w8a8_gemm)],
+                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 (1536, 7168): {
                     "format": "TN",
-                    "func" : [(0, ixf_ops.w8a8_gemv), (17, ixf_ops.w8a8_gemm)],
+                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 (7168, 768): {
                     "format": "TN",
-                    "func" : [(0, ixf_ops.w8a8_gemv), (17, ixf_ops.w8a8_gemm)],
+                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
             },
             "ivcore11": {}

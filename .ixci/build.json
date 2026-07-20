@@ -1,0 +1,17 @@
+{
+  "env": {
+    "VLLM_ILUVATAR_CUDA_ARCHITECTURES": "ivcore11",
+    "VLLM_ILUVATAR_ENABLE_CUINFER": "1",
+    "VLLM_ILUVATAR_INSTALL_RUNTIME_DEPS": "1",
+    "CMAKE_BUILD_TYPE": "Release",
+    "VLLM_SOURCE_REPO": "ssh://git@bitbucket.iluvatar.ai:7999/swapp/vllm.git",
+    "VLLM_SOURCE_REF": "iluvatar_main",
+    "VLLM_SOURCE_DIR": "../vllm-source"
+  },
+  "steps": {
+    "config":  "bash .ixci/prepare_vllm_source.sh",
+    "build":   "pip3 install numpy~=1.26.0 && bash build_vllm_iluvatar.sh",
+    "install": "bash install_vllm_iluvatar.sh",
+    "clean":   "bash clean_vllm_iluvatar.sh && rm -rf ${VLLM_SOURCE_DIR}"
+  }
+}

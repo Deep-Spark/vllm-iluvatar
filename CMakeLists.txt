@@ -16,6 +16,21 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
   set(CMAKE_CUDA_ARCHITECTURES "ivcore11" CACHE STRING "Iluvatar CoreX architecture" FORCE)
 endif()
 
+# Mirror ixformer's CoreX-friendly pre-project() setup:
+#   * CMAKE_CUDA_COMPILER_FORCED=TRUE   — skip CMake's nvcc probe (CoreX has no
+#                                          nvcc; clang++ handles .cu).
+#   * CMAKE_CUDA_RUNTIME_LIBRARY=NONE   — do not auto-link cudart_static; CoreX
+#                                          ships its own cudart and packaging
+#                                          hosts may not expose the toolkit dir
+#                                          CMake would otherwise search.
+#   * include(FindCOREXCOMPILER)        — point CMAKE_C/CXX/CUDA_COMPILER at
+#                                          the CoreX clang(++) before project()
+#                                          enables the CUDA language.
+set(CMAKE_CUDA_COMPILER_FORCED TRUE)
+set(CMAKE_CUDA_RUNTIME_LIBRARY NONE)
+list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(FindCOREXCOMPILER)
+
 project(vllm_iluvatar_extensions LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -23,8 +38,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "Export compile_commands.json" FORCE)
-
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 message(STATUS "vllm_iluvatar: CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES}")
 

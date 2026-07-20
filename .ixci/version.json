@@ -1,0 +1,25 @@
+{
+  "name": "vllm-iluvatar",
+  "description": "Iluvatar CoreX plugin package for vLLM (out-of-tree platform plugin)",
+  "version": "0.1.0",
+  "buildDependencies": {
+    "pytorch":             ">=2.1.0",
+    "triton":              "",
+    "torchvision":         "",
+    "ixformer":            "",
+    "ixinfer":             "",
+    "ixdriver":            ">=4.5.0",
+    "ixsdk":               "",
+    "ixdnn":               "",
+    "ixpti":               "",
+    "ixsparse":            "",
+    "ixfft":               "",
+    "ixrand":              "",
+    "ixblas":              "",
+    "ixccl":               "",
+    "ixshmem":             "",
+    "ixrtc":               "",
+    "ixattention-backend": ""
+  },
+  "runtimeDependencies": {}
+}

@@ -1,0 +1,5 @@
+{
+    "dist_packages": [
+      "build_pip/vllm_*.whl"
+    ]
+}

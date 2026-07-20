@@ -10,7 +10,8 @@
 #include <torch/library.h>
 
 #include "core/registration.h"
-#include "ops.h"
+#include "community/ops.h"
+#include "plugin/ops.h"
 
 // Schemas are copied verbatim from vLLM upstream:
 //   * rms_norm: csrc/libtorch_stable/torch_bindings.cpp

@@ -7,7 +7,7 @@ import importlib
 
 from conftest import requires_cuda
 
-from vllm_iluvatar.model_executor.layers.fla.ops import ilu_l2norm
+from vllm_iluvatar.third_party.flash_linear_attention.ops import ilu_l2norm
 
 torch = importlib.import_module("torch")
 

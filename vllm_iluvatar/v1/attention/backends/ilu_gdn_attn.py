@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Iluvatar GDN attention backend metadata.
 Corresponds to: vllm/v1/attention/backends/gdn_attn.py
-Baseline: main_88e5e2c57be8
+Baseline: main_dcfebf93f4e
 Why: Iluvatar GDN kernels need CPU query starts and an output reordering index
      for mixed speculative/non-speculative batches.
 How: Reuse the official ``GDN_ATTN`` enum member via platform backend

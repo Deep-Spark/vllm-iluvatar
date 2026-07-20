@@ -9,7 +9,7 @@ guards, binding) lives in
 ``register_general``.
 
 Target   : vllm.v1.engine.core_client.DPLBAsyncMPClient.get_core_engine_for_request
-Baseline : main_88e5e2c57be8
+Baseline : main_dcfebf93f4e
 Why      : The community LB relies on coordinator-reported (waiting, running)
            counts that lag ~100 ms.  With a single API server the client
            already holds an exact, real-time record of every in-flight request.
@@ -47,9 +47,7 @@ def _ilu_get_core_engine_for_request(self, request):
         # >>> ILU MODIFICATION — exact-inflight LB (env-gated) >>>
         if self._ilu_use_exact_inflight:
             counts = [0] * num_engines
-            index_of = {
-                eng: i for i, eng in enumerate(self.core_engines)
-            }
+            index_of = {eng: i for i, eng in enumerate(self.core_engines)}
             for eng in self.reqs_in_flight.values():
                 i = index_of.get(eng)
                 if i is not None:
@@ -68,9 +66,7 @@ def _ilu_get_core_engine_for_request(self, request):
                     min_score = score
                     eng_index = idx
             current_counts[eng_index][0] += self.client_count
-            self.eng_start_index = (
-                self.eng_start_index + 1
-            ) % num_engines
+            self.eng_start_index = (self.eng_start_index + 1) % num_engines
 
     chosen_engine = self.core_engines[eng_index]
     self.reqs_in_flight[request.request_id] = chosen_engine

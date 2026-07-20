@@ -45,7 +45,6 @@ from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -57,17 +56,14 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
     _encode_layer_name,
     direct_register_custom_op,
     kv_cache_dtype_str_to_dtype,
 )
 from vllm.v1.attention.backend import AttentionBackend
-from vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse import (
-    IluFlashMLASparseBackend,
-    IluFlashMLASparseMetadata,
-)
-from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
+from vllm.v1.attention.backends.mla.ilu_indexer import (
     IluDeepseekV32IndexerBackend,
     IluDeepseekV32IndexerMetadata,
 )
@@ -76,6 +72,11 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 )
 from vllm.v1.attention.ops.flashmla import flash_mla_sparse_prefill
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
+
+from vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse import (
+    IluFlashMLASparseBackend,
+    IluFlashMLASparseMetadata,
+)
 
 logger = init_logger(__name__)
 
@@ -447,8 +448,7 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         # ilu fork: BF16 KV cache. Reject explicit fp8 selection loudly.
         kv_cache_dtype = (
             cache_config.cache_dtype
-            if cache_config is not None
-            and cache_config.cache_dtype not in (None, "")
+            if cache_config is not None and cache_config.cache_dtype not in (None, "")
             else "auto"
         )
         if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):

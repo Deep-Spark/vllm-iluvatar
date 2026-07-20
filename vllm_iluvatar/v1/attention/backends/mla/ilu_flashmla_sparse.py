@@ -3,35 +3,32 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
+import ixformer.inference.functions as ixfops
 import numpy as np
 import torch
-
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
+    MLACommonMetadata,
     get_mla_dims,
 )
-from vllm.model_executor.layers.attention.mla_attention import (
-    MLACommonBackend,
-    MLACommonImpl,
-    MLACommonMetadata,
+from vllm.model_executor.layers.attention.sparse_mla_attention import (
+    SparseMLACommonImpl,
+    SparseMLACommonMetadataBuilder,
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
-from vllm.utils.platform_utils import num_compute_units
-from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
     AttentionLayer,
     AttentionMetadata,
-    AttentionMetadataBuilder,
     CommonAttentionMetadata,
     MultipleOf,
-    SparseMLAAttentionImpl,
 )
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_compressed_slot_mapping,
@@ -40,20 +37,9 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
 )
 from vllm.v1.attention.backends.utils import (
-    reshape_attn_output_for_spec_decode,
-    reshape_query_for_spec_decode,
     split_decodes_and_prefills,
-    split_prefill_chunks,
 )
-from vllm.utils.math_utils import cdiv
-
-import ixformer.inference.functions as ixfops
-from vllm.v1.attention.ops.flashmla import (
-    FlashMLASchedMeta,
-    flash_mla_sparse_prefill,
-    flash_mla_with_kvcache,
-    get_mla_metadata,
-)
+from vllm.v1.attention.ops.flashmla import flash_mla_sparse_prefill
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -169,7 +155,7 @@ class IluFlashMLASparseMetadata(AttentionMetadata):
     # Prefill rows: local indices [0, n-1, -1, ...] consumed by
     # ds4_combine_topk_swa_indices.
     c128a_prefill_topk_indices: torch.Tensor | None = None
-    
+
 
 def get_prefill_workspace_size(max_model_len: int):
     # NOTE(Lucas): 5 is a magic number for controlling the prefill buffer size.
@@ -184,7 +170,9 @@ def get_prefill_workspace_size(max_model_len: int):
 _C128A_TOPK_ALIGNMENT = 128
 
 
-class IluFlashMLASparseMetadataBuilder(AttentionMetadataBuilder[IluFlashMLASparseMetadata]):
+class IluFlashMLASparseMetadataBuilder(
+    SparseMLACommonMetadataBuilder[IluFlashMLASparseMetadata]
+):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(
@@ -196,7 +184,6 @@ class IluFlashMLASparseMetadataBuilder(AttentionMetadataBuilder[IluFlashMLASpars
     ) -> None:
         self.vllm_config = vllm_config
         self.layer_names = layer_names
-        cache_config = vllm_config.cache_config
         self.kv_cache_spec = kv_cache_spec
         self.model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
@@ -397,7 +384,7 @@ class IluFlashMLASparseMetadataBuilder(AttentionMetadataBuilder[IluFlashMLASpars
         return metadata
 
 
-class IluFlashMLASparseImpl(SparseMLAAttentionImpl[IluFlashMLASparseMetadata]):
+class IluFlashMLASparseImpl(SparseMLACommonImpl[IluFlashMLASparseMetadata]):
     def __init__(
         self,
         num_heads: int,
@@ -445,20 +432,21 @@ class IluFlashMLASparseImpl(SparseMLAAttentionImpl[IluFlashMLASparseMetadata]):
         (self.q_concat_buffer,) = current_workspace_manager().get_simultaneous(
             (q_concat_shape, torch.bfloat16),
         )
-        
+
     def _k_up_proj(self, q_nope: torch.Tensor) -> torch.Tensor:
         # q_nope: (B, N, P), self.W_UK_T: (N, P, L)
-        q_t = q_nope.transpose(0, 1)          # (N, B, P)
-        ql = torch.bmm(q_t, self.W_UK_T)      # (N, B, L)
-        return ql.transpose(0, 1)              # (B, N, L)
+        q_t = q_nope.transpose(0, 1)  # (N, B, P)
+        ql = torch.bmm(q_t, self.W_UK_T)  # (N, B, L)
+        return ql.transpose(0, 1)  # (B, N, L)
 
-    def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor | None = None
-                   ) -> torch.Tensor:
+    def _v_up_proj(
+        self, x: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         # x: (B, N, L), self.W_UV: (N, L, V)
         x_t = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
-        result = torch.bmm(x_t, self.W_UV)    # (N, B, V)
-        return result.transpose(0, 1)          # (B, N, V)
-    
+        result = torch.bmm(x_t, self.W_UV)  # (N, B, V)
+        return result.transpose(0, 1)  # (B, N, V)
+
     def forward_full(
         self,
         layer: "MLAAttention",
@@ -481,19 +469,27 @@ class IluFlashMLASparseImpl(SparseMLAAttentionImpl[IluFlashMLASparseMetadata]):
         """
         if attn_metadata is None:
             _ = torch.empty(
-                (layer.chunked_prefill_workspace_size, self.num_heads,
-                 self.qk_nope_head_dim + self.v_head_dim),
-                device=k_c_normed.device, dtype=k_c_normed.dtype)
+                (
+                    layer.chunked_prefill_workspace_size,
+                    self.num_heads,
+                    self.qk_nope_head_dim + self.v_head_dim,
+                ),
+                device=k_c_normed.device,
+                dtype=k_c_normed.dtype,
+            )
             output = torch.empty(
-                output.shape[0], self.v_head_dim * self.num_heads,
-                device=q.device, dtype=q.dtype)
+                output.shape[0],
+                self.v_head_dim * self.num_heads,
+                device=q.device,
+                dtype=q.dtype,
+            )
             return output
 
         if self.dcp_world_size == -1:
             self.dcp_world_size = get_dcp_group().world_size
-            
+
         num_actual_toks = attn_metadata.num_actual_tokens
-            # Inputs and outputs may be padded for CUDA graphs
+        # Inputs and outputs may be padded for CUDA graphs
         k_pe = k_pe.unsqueeze(1)
         q = q[:num_actual_toks, ...]
         k_c_normed = k_c_normed[:num_actual_toks, ...]
@@ -519,13 +515,16 @@ class IluFlashMLASparseImpl(SparseMLAAttentionImpl[IluFlashMLASparseMetadata]):
                     kv_cache_dtype=self.kv_cache_dtype,
                     scale=layer._k_scale,
                 )
-            attn_out= self.forward_mqa(q, kv_cache, attn_metadata, self)
-            output = torch.empty(output.shape[0],
-                            self.num_heads, self.v_head_dim, 
-                            device=q.device,
-                            dtype=q.dtype)
+            attn_out = self.forward_mqa(q, kv_cache, attn_metadata, self)
+            output = torch.empty(
+                output.shape[0],
+                self.num_heads,
+                self.v_head_dim,
+                device=q.device,
+                dtype=q.dtype,
+            )
             output[:num_actual_toks] = self._v_up_proj(attn_out)
-            
+
             return output.view(output.shape[0], self.v_head_dim * self.num_heads)
 
     def _forward_bf16_kv(
@@ -546,7 +545,6 @@ class IluFlashMLASparseImpl(SparseMLAAttentionImpl[IluFlashMLASparseMetadata]):
         )
 
         return self._bf16_flash_mla_kernel(q, kv_c_and_k_pe_cache, topk_indices)
-
 
     def _bf16_flash_mla_kernel(
         self,
@@ -577,7 +575,7 @@ class IluFlashMLASparseImpl(SparseMLAAttentionImpl[IluFlashMLASparseMetadata]):
         )
         output = output[:, : self.num_heads, :]
         return output
-    
+
     def setup_projections(
         self,
         layer: "MLAAttention",
@@ -626,7 +624,10 @@ class IluFlashMLASparseImpl(SparseMLAAttentionImpl[IluFlashMLASparseMetadata]):
 
 class IluDeepseekV4FlashMLASparseBackend(IluFlashMLASparseBackend):
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
-        "auto", "bfloat16", "fp8_ds_mla", "fp8",
+        "auto",
+        "bfloat16",
+        "fp8_ds_mla",
+        "fp8",
     ]
 
     @staticmethod
@@ -636,7 +637,7 @@ class IluDeepseekV4FlashMLASparseBackend(IluFlashMLASparseBackend):
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [256]
-    
+
     @staticmethod
     def get_kv_cache_shape(
         num_blocks: int,

@@ -12,7 +12,7 @@ the draft architecture to them *after* the public routing runs, keyed on the
 target model's original architecture, so the community MTP path stays untouched
 for non-ilu models.
 
-Baseline : main_88e5e2c57be8
+Baseline : main_dcfebf93f4e
 """
 
 from __future__ import annotations

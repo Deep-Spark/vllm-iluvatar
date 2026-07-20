@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 from conftest import requires_cuda
 
-from vllm_iluvatar.model_executor.layers.fla.ops import chunk as ilu_chunk
+from vllm_iluvatar.third_party.flash_linear_attention.ops import chunk as ilu_chunk
 
 torch = importlib.import_module("torch")
 

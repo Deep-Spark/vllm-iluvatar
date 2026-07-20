@@ -9,12 +9,10 @@
 # ruff: noqa: E501
 
 import torch
-
+from vllm.third_party.flash_linear_attention.ops.index import prepare_chunk_indices
+from vllm.third_party.flash_linear_attention.ops.op import exp
+from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.triton_utils import tl, triton
-
-from vllm.model_executor.layers.fla.ops.index import prepare_chunk_indices
-from vllm.model_executor.layers.fla.ops.op import exp
-from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
 
 
 @triton.heuristics(
@@ -94,7 +92,12 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)
     b_A = tl.where(m_A, b_A, 0)
     p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT, (T, BT), (BT * H, 1), (i_t * BT, 0), (BT, BT), (1, 0)
+        A + (bos * H + i_h) * BT,
+        (T, BT),
+        (BT * H, 1),
+        (i_t * BT, 0),
+        (BT, BT),
+        (1, 0),
     )
     tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
 

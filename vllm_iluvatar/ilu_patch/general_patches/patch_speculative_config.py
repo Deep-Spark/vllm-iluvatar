@@ -10,7 +10,7 @@ The override implementation lives in ``vllm_iluvatar.config.speculative``; this
 module only performs register-time wiring.
 
 Target   : vllm.config.speculative.SpeculativeConfig.hf_config_override
-Baseline : main_88e5e2c57be8
+Baseline : main_dcfebf93f4e
 Why      : re-point the MTP draft architecture to the ilu W4A8 self-contained
            MTP models (IluGlmMoeDsaMTPModel / IluDeepSeekV4MTPModel) for the ilu
            target archs, without modifying community source.

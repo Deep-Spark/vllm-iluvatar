@@ -63,23 +63,24 @@ from vllm.models.deepseek_v4.compressor import (
 )
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend
-from vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse import (
-    IluDeepseekV4FlashMLASparseBackend,
-    IluFlashMLASparseMetadata,
-)
-from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
+from vllm.v1.attention.backends.mla.ilu_indexer import (
     IluDeepseekV4IndexerBackend,
     IluDeepseekV32IndexerMetadata,
     get_max_prefill_buffer_size,
-)
-from vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa import (
-    IluDeepseekV4SWACache,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadata,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm.v1.worker.workspace import current_workspace_manager
+
+from vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse import (
+    IluDeepseekV4FlashMLASparseBackend,
+    IluFlashMLASparseMetadata,
+)
+from vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa import (
+    IluDeepseekV4SWACache,
+)
 
 logger = init_logger(__name__)
 
@@ -693,9 +694,7 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         self.head_bytes = 584 if kv_cache_dtype == "fp8_ds_mla" else self.head_dim * 2
 
-        swa_dtype = (
-            torch.uint8 if kv_cache_dtype == "fp8_ds_mla" else torch.bfloat16
-        )
+        swa_dtype = torch.uint8 if kv_cache_dtype == "fp8_ds_mla" else torch.bfloat16
         self.swa_cache_layer = IluDeepseekV4SWACache(
             head_dim=self.head_dim,
             window_size=self.window_size,
@@ -1478,14 +1477,12 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     f"Unsupported compress_ratio={self.compress_ratio}; "
                     "expected 1, 4, or 128."
                 )
-            global_indices, topk_lens = (
-                ixfops.ds4_compute_global_topk_indices_and_lens(
-                    local_topk,
-                    token_to_req,
-                    attn_metadata.block_table,
-                    block_size,
-                    is_valid,
-                )
+            global_indices, topk_lens = ixfops.ds4_compute_global_topk_indices_and_lens(
+                local_topk,
+                token_to_req,
+                attn_metadata.block_table,
+                block_size,
+                is_valid,
             )
             topk_indices = global_indices.view(num_prefill_tokens, 1, -1)
 

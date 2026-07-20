@@ -8,8 +8,8 @@ community bugfixes are inherited automatically.
 
 Target   : vllm.model_executor.models.hy_v3.HYV3ForCausalLM (arch
            "HYV3ForCausalLM")
-Baseline : main_88e5e2c57be8 (the fork hy_v3.py is byte-identical to community
-           88e5e2c57be, which already carries upstream #47797)
+Baseline : main_dcfebf93f4e (the fork hy_v3.py is byte-identical to community
+           dcfebf93f4e, which already carries upstream #47797)
 Why      : the only Iluvatar delta vs community is fusing the two separate
            q_norm/k_norm passes into one fused q/k RMSNorm (ixformer
            rms_norm_qk).  The MoE router optionally runs bf16 to match the

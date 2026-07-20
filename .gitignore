@@ -33,3 +33,6 @@ htmlcov/
 
 # so files
 *.so
+
+# logs
+*.log

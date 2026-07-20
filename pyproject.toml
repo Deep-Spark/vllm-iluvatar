@@ -74,3 +74,9 @@ ue8m0 = "ue8m0"
 [tool.typos.default.extend-words]
 # MOE (Mixture of Experts) + W (Weight); typos splits IluMOEW16A16 into sub-words.
 MOEW = "MOEW"
+# ``mis-unpacked`` is intentional: "incorrectly unpacked".
+mis = "mis"
+# UE8M0 is a scale-format literal used by fp8_ds_mla layouts.
+UE = "UE"
+# Existing GDN metadata uses ``*_indx`` field names; keep the spelling stable.
+indx = "indx"

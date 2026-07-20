@@ -5,7 +5,7 @@ Corresponds to: vllm/model_executor/layers/activation.py
 
 Target   : vllm.model_executor.layers.activation activation CustomOps that call
            ``torch.ops._C`` on CUDA-like platforms.
-Baseline : main_88e5e2c57be8
+Baseline : main_dcfebf93f4e
 Why      : Iluvatar activation kernels are exposed through the plugin's
            ``vllm._custom_ops`` overrides rather than community ``torch.ops._C``
            registrations.
@@ -112,11 +112,10 @@ class IluSiluAndMulWithClamp(SiluAndMulWithClamp):
             return (x_q, x_s, out_dtype)
 
         d = x.shape[-1] // 2
-        out = torch.empty(
-            x.shape[:-1] + (d,), dtype=x.dtype, device=x.device
-        )
+        out = torch.empty(x.shape[:-1] + (d,), dtype=x.dtype, device=x.device)
         self.op(out, x, self.swiglu_limit, self.alpha, self.beta)
         return out
+
 
 @MulAndSilu.register_oot
 class IluMulAndSilu(MulAndSilu):

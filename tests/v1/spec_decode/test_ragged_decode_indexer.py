@@ -23,8 +23,7 @@ agnostic tensor function, so no GPU / ixformer kernels are required.
 from __future__ import annotations
 
 import torch
-
-from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import kv_spans_from_batches
+from vllm.v1.attention.backends.mla.ilu_indexer import kv_spans_from_batches
 
 CPU = torch.device("cpu")
 

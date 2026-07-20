@@ -12,29 +12,10 @@ for ``AttentionBackendEnum.FLASHMLA``.
 import functools
 from typing import TYPE_CHECKING, ClassVar
 
-import torch
-
-import vllm.envs as envs
-from vllm import _custom_ops as ops
-from vllm.config.cache import CacheDType
-from vllm.distributed.parallel_state import get_dcp_group
-from vllm.logger import init_logger
-from vllm.model_executor.layers.attention.mla_attention import (
-    MLACommonBackend,
-    MLACommonImpl,
-    MLACommonMetadata,
-)
-from vllm.platforms import current_platform
-from vllm.platforms.interface import DeviceCapability
-from vllm.utils.torch_utils import is_quantized_kv_cache
-from vllm.v1.attention.backend import (
-    AttentionType,
-    MultipleOf,
-    SparseMLAAttentionImpl,
-)
-from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
-
 import ixformer.inference.functions as ixf_ops
+import torch
+import vllm.envs as envs
+
 # Iluvatar 上 vLLM 默认的 merge_attn_states 会走
 # `torch.ops._C.merge_attn_states`，该 op 在 Corex 上没有注册。
 # 这里直接用 ixformer 自带的 `merge_attn_states`，签名是
@@ -44,6 +25,26 @@ import ixformer.inference.functions as ixf_ops
 from ixformer.contrib.vllm_flash_attn import (  # type: ignore[import]
     merge_attn_states as ixf_merge_attn_states,
 )
+from vllm import _custom_ops as ops
+from vllm.config.cache import CacheDType
+from vllm.distributed.parallel_state import get_dcp_group
+from vllm.logger import init_logger
+from vllm.model_executor.layers.attention.mla_attention import (
+    MLACommonBackend,
+    MLACommonImpl,
+    MLACommonMetadata,
+)
+from vllm.model_executor.layers.attention.sparse_mla_attention import (
+    SparseMLACommonImpl,
+)
+from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
+from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.v1.attention.backend import (
+    AttentionType,
+    MultipleOf,
+)
+from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention.mla_attention import MLAAttention
@@ -52,9 +53,7 @@ logger = init_logger(__name__)
 
 
 class IluMLABackend(MLACommonBackend):
-    supported_dtypes: ClassVar[list[torch.dtype]] = [
-        torch.float16, torch.bfloat16
-    ]
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "bfloat16",
@@ -83,9 +82,7 @@ class IluMLABackend(MLACommonBackend):
         return IluMLAImpl
 
     @classmethod
-    def supports_compute_capability(
-        cls, capability: DeviceCapability
-    ) -> bool:
+    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return True
 
 
@@ -106,7 +103,6 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
         kv_sharing_target_layer_name: str | None,
         **mla_args,
     ) -> None:
-
         super().__init__(
             num_heads,
             head_size,
@@ -138,7 +134,7 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
         if self.kv_cache_dtype.startswith("fp8"):
             raise NotImplementedError("FP8 ILU MLA not yet supported")
-        
+
     def reorg_kvcache(
         self,
         allgatered_kv_c_normed: torch.Tensor,
@@ -360,41 +356,39 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
                     kv_lora_rank=self.kv_lora_rank,
                     dst=workspace,
                     block_table=prefill_metadata.block_table,
-                    cu_seq_lens=(
-                        prefill_metadata.chunked_context.cu_seq_lens[i]),
+                    cu_seq_lens=(prefill_metadata.chunked_context.cu_seq_lens[i]),
                     batch_size=attn_metadata.num_prefills,
-                    seq_starts=(
-                        prefill_metadata.chunked_context.starts[i]),
+                    seq_starts=(prefill_metadata.chunked_context.starts[i]),
                 )
             else:
                 ixf_ops.vllm_cp_gather_cache(
                     src_cache=kv_c_and_k_pe_cache,
                     dst=workspace,
                     block_table=prefill_metadata.block_table,
-                    cu_seq_lens=(
-                        prefill_metadata.chunked_context.cu_seq_lens[i]),
+                    cu_seq_lens=(prefill_metadata.chunked_context.cu_seq_lens[i]),
                     batch_size=attn_metadata.num_prefills,
-                    seq_starts=(
-                        prefill_metadata.chunked_context.starts[i]),
+                    seq_starts=(prefill_metadata.chunked_context.starts[i]),
                 )
 
-            kv_c_normed = workspace[:toks][..., :self.kv_lora_rank]
-            k_pe = workspace[:toks][..., self.kv_lora_rank:].unsqueeze(1)
+            kv_c_normed = workspace[:toks][..., : self.kv_lora_rank]
+            k_pe = workspace[:toks][..., self.kv_lora_rank :].unsqueeze(1)
 
             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
-                -1, self.num_heads,
+                -1,
+                self.num_heads,
                 self.qk_nope_head_dim + self.v_head_dim,
             )
-            k_nope, v = kv_nope.split(
-                [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
             k = self._concat_k_nope_k_pe(k_nope, k_pe)
 
-            attn_output, attn_softmax_lse = attn_metadata.prefill.prefill_backend.run_prefill_context_chunk(
-                chunk_idx=i,
-                q=q,
-                k=k,
-                v=v,
+            attn_output, attn_softmax_lse = (
+                attn_metadata.prefill.prefill_backend.run_prefill_context_chunk(
+                    chunk_idx=i,
+                    q=q,
+                    k=k,
+                    v=v,
+                )
             )
 
             if output is None:
@@ -413,16 +407,17 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
     def _k_up_proj(self, q_nope: torch.Tensor) -> torch.Tensor:
         # q_nope: (B, N, P), self.W_UK_T: (N, P, L)
-        q_t = q_nope.transpose(0, 1)          # (N, B, P)
-        ql = torch.bmm(q_t, self.W_UK_T)      # (N, B, L)
-        return ql.transpose(0, 1)              # (B, N, L)
+        q_t = q_nope.transpose(0, 1)  # (N, B, P)
+        ql = torch.bmm(q_t, self.W_UK_T)  # (N, B, L)
+        return ql.transpose(0, 1)  # (B, N, L)
 
-    def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor | None = None
-                   ) -> torch.Tensor:
+    def _v_up_proj(
+        self, x: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         # x: (B, N, L), self.W_UV: (N, L, V)
         x_t = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
-        result = torch.bmm(x_t, self.W_UV)    # (N, B, V)
-        return result.transpose(0, 1)          # (B, N, V)
+        result = torch.bmm(x_t, self.W_UV)  # (N, B, V)
+        return result.transpose(0, 1)  # (B, N, V)
 
     # ------------------------------------------------------------------
     # forward_full: full prefill+decode path (moved from
@@ -450,20 +445,29 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
         """
         if attn_metadata is None:
             _ = torch.empty(
-                (layer.chunked_prefill_workspace_size, self.num_heads,
-                 self.qk_nope_head_dim + self.v_head_dim),
-                device=k_c_normed.device, dtype=k_c_normed.dtype)
+                (
+                    layer.chunked_prefill_workspace_size,
+                    self.num_heads,
+                    self.qk_nope_head_dim + self.v_head_dim,
+                ),
+                device=k_c_normed.device,
+                dtype=k_c_normed.dtype,
+            )
             output = torch.empty(
-                output.shape[0], self.v_head_dim * self.num_heads,
-                device=q.device, dtype=q.dtype)
+                output.shape[0],
+                self.v_head_dim * self.num_heads,
+                device=q.device,
+                dtype=q.dtype,
+            )
             return output
 
         if self.dcp_world_size == -1:
             self.dcp_world_size = get_dcp_group().world_size
 
         fp8_attention = is_quantized_kv_cache(self.kv_cache_dtype)
-        assert not isinstance(self, SparseMLAAttentionImpl), (
-            "SparseMLAAttentionImpl is not supported with Iluvatar MLA")
+        assert not isinstance(self, SparseMLACommonImpl), (
+            "SparseMLACommonImpl is not supported with Iluvatar MLA"
+        )
 
         assert (
             attn_metadata.num_decodes is not None
@@ -489,25 +493,24 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
             if has_decode:
                 decode_q_pe, decode_k_pe = layer.rotary_emb(
                     positions[:num_decode_tokens],
-                    decode_q[..., self.qk_nope_head_dim:],
+                    decode_q[..., self.qk_nope_head_dim :],
                     k_pe[:num_decode_tokens],
                 )
                 if is_int8_mla:
                     kc_int8, kc_s, _ = ops.scaled_int8_quant(
-                        k_c_normed[:num_decode_tokens])
-                    kpe_int8, kpe_s, _ = ops.scaled_int8_quant(
-                        decode_k_pe.contiguous())
+                        k_c_normed[:num_decode_tokens]
+                    )
+                    kpe_int8, kpe_s, _ = ops.scaled_int8_quant(decode_k_pe.contiguous())
                     ops.concat_and_cache_mla_int8(
                         kv_c_int8=kc_int8,
                         kv_c_scale=kc_s[..., 0],
                         k_pe_int8=kpe_int8,
-                        k_pe_scale=kpe_s[..., 0].view(
-                            -1, kpe_int8.shape[-2]),
+                        k_pe_scale=kpe_s[..., 0].view(-1, kpe_int8.shape[-2]),
                         kv_cache=kv_cache,
                         kv_cache_scale=kv_cache_scale,
                         slot_mapping=(
-                            attn_metadata.slot_mapping.flatten()[
-                                :num_decode_tokens]),
+                            attn_metadata.slot_mapping.flatten()[:num_decode_tokens]
+                        ),
                         kv_cache_dtype=self.kv_cache_dtype,
                         scale=layer._k_scale,
                     )
@@ -516,28 +519,24 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
                         k_c_normed[:num_decode_tokens],
                         decode_k_pe,
                         kv_cache,
-                        attn_metadata.slot_mapping.flatten()[
-                            :num_decode_tokens],
+                        attn_metadata.slot_mapping.flatten()[:num_decode_tokens],
                         kv_cache_dtype=self.kv_cache_dtype,
                         scale=layer._k_scale,
                     )
                 else:
-                    write_kv_cache = (
-                        k_c_normed[:num_decode_tokens], decode_k_pe)
+                    write_kv_cache = (k_c_normed[:num_decode_tokens], decode_k_pe)
 
             if has_prefill:
                 ixf_ops.mla_rope(
                     positions[num_decode_tokens:],
-                    prefill_q[..., self.qk_nope_head_dim:],
+                    prefill_q[..., self.qk_nope_head_dim :],
                     prefill_k_pe.squeeze(1),
-                    prefill_k[..., self.qk_nope_head_dim:],
+                    prefill_k[..., self.qk_nope_head_dim :],
                     layer.rotary_emb.cos_sin_cache,
                 )
                 if is_int8_mla:
-                    pkc_int8, pkc_s, _ = ops.scaled_int8_quant(
-                        prefill_k_c_normed)
-                    pkpe = prefill_k[
-                        ..., self.qk_nope_head_dim:].contiguous()
+                    pkc_int8, pkc_s, _ = ops.scaled_int8_quant(prefill_k_c_normed)
+                    pkpe = prefill_k[..., self.qk_nope_head_dim :].contiguous()
                     pkpe_int8, pkpe_s, _ = ops.scaled_int8_quant(pkpe)
                     ops.concat_and_cache_mla_int8(
                         pkc_int8,
@@ -546,64 +545,71 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
                         pkpe_s[..., 0].view(-1, pkpe_int8.shape[-2]),
                         kv_cache,
                         kv_cache_scale,
-                        attn_metadata.slot_mapping.flatten()[
-                            num_decode_tokens:],
+                        attn_metadata.slot_mapping.flatten()[num_decode_tokens:],
                         self.kv_cache_dtype,
                         layer._k_scale,
                     )
                 else:
                     ops.concat_and_cache_mla(
                         prefill_k_c_normed,
-                        prefill_k[..., self.qk_nope_head_dim:],
+                        prefill_k[..., self.qk_nope_head_dim :],
                         kv_cache,
-                        attn_metadata.slot_mapping.flatten()[
-                            num_decode_tokens:],
+                        attn_metadata.slot_mapping.flatten()[num_decode_tokens:],
                         kv_cache_dtype=self.kv_cache_dtype,
                         scale=layer._k_scale,
                     )
 
         output = torch.empty(
-            output.shape[0], self.num_heads, self.v_head_dim,
-            device=q.device, dtype=q.dtype)
+            output.shape[0],
+            self.num_heads,
+            self.v_head_dim,
+            device=q.device,
+            dtype=q.dtype,
+        )
 
         if fp8_attention and self.kv_cache_dtype != "fp8_ds_mla":
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
         if has_prefill:
             kv_nope = self.kv_b_proj(prefill_k_c_normed)[0].view(
-                -1, self.num_heads,
-                self.qk_nope_head_dim + self.v_head_dim)
-            k_nope, v = kv_nope.split(
-                [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            prefill_k[..., :self.qk_nope_head_dim] = k_nope
+                -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+            )
+            k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            prefill_k[..., : self.qk_nope_head_dim] = k_nope
 
             has_context = (
                 attn_metadata.prefill is not None
                 and attn_metadata.prefill.chunked_context is not None
             )
 
-            output_prefill = attn_metadata.prefill.prefill_backend.run_prefill_new_tokens(
-                q=prefill_q, k=prefill_k, v=v,
-                return_softmax_lse=has_context,
+            output_prefill = (
+                attn_metadata.prefill.prefill_backend.run_prefill_new_tokens(
+                    q=prefill_q,
+                    k=prefill_k,
+                    v=v,
+                    return_softmax_lse=has_context,
+                )
             )
 
             if has_context:
                 suffix_output, suffix_lse = output_prefill
                 if self.dcp_world_size > 1:
                     context_output, context_lse = (
-                        self
-                        ._context_parallel_compute_prefill_context(
-                            prefill_q, kv_cache, attn_metadata,
+                        self._context_parallel_compute_prefill_context(
+                            prefill_q,
+                            kv_cache,
+                            attn_metadata,
                             k_scale=None,
                             dcp_world_size=self.dcp_world_size,
                         )
                     )
                 else:
-                    context_output, context_lse = (
-                        self._compute_prefill_context(
-                            prefill_q, kv_cache, attn_metadata,
-                            layer._k_scale,
-                            kv_c_and_k_pe_cache_scale=kv_cache_scale)
+                    context_output, context_lse = self._compute_prefill_context(
+                        prefill_q,
+                        kv_cache,
+                        attn_metadata,
+                        layer._k_scale,
+                        kv_c_and_k_pe_cache_scale=kv_cache_scale,
                     )
                 merged = torch.empty_like(suffix_output)
                 merged = ixf_merge_attn_states(
@@ -622,24 +628,22 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
             mqa_q = decode_q
 
             attn_out, lse = self.forward_mqa(
-                mqa_q[..., :self.qk_nope_head_dim],
+                mqa_q[..., : self.qk_nope_head_dim],
                 decode_q_pe,
-                kv_cache, attn_metadata,
+                kv_cache,
+                attn_metadata,
                 *write_kv_cache,
                 kv_c_and_k_pe_cache_scale=kv_cache_scale,
             )
             if self.dcp_world_size > 1:
                 assert lse is not None
-                attn_out = cp_lse_ag_out_rs(
-                    attn_out, lse, get_dcp_group())
-                output[:num_decode_tokens] = (
-                    self._v_up_proj(attn_out))
+                attn_out = cp_lse_ag_out_rs(attn_out, lse, get_dcp_group())
+                output[:num_decode_tokens] = self._v_up_proj(attn_out)
             else:
                 assert lse is None
                 output[:num_decode_tokens] = attn_out
 
-        return output.view(
-            output.shape[0], self.v_head_dim * self.num_heads)
+        return output.view(output.shape[0], self.v_head_dim * self.num_heads)
 
     # ------------------------------------------------------------------
     # setup_projections: ixformer marlin weight repacking (moved from
@@ -660,26 +664,33 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
         kv_b_proj_module = self.kv_b_proj
         quant_method_name = (
             kv_b_proj_module.quant_method.__class__.__name__
-            if kv_b_proj_module.quant_method is not None else None
+            if kv_b_proj_module.quant_method is not None
+            else None
         )
 
-        if (hasattr(kv_b_proj_module, "scheme")
-                and kv_b_proj_module.scheme.__class__.__name__
-                == "IluCompressedTensorsW8A8Int8"):
+        if (
+            hasattr(kv_b_proj_module, "scheme")
+            and kv_b_proj_module.scheme.__class__.__name__
+            == "IluCompressedTensorsW8A8Int8"
+        ):
             kv_b_proj_weight = kv_b_proj_module.weight
             kv_b_proj_weight_scale = kv_b_proj_module.weight_scale
             kv_b_proj_weight = kv_b_proj_weight.view(
-                self.kv_lora_rank, self.num_heads,
+                self.kv_lora_rank,
+                self.num_heads,
                 self.qk_nope_head_dim + self.v_head_dim,
             )
             W_UK, W_UV = kv_b_proj_weight.split(
-                [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+                [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+            )
             kv_b_proj_weight_scale = kv_b_proj_weight_scale.view(
                 self.num_heads,
-                self.qk_nope_head_dim + self.v_head_dim, 1,
+                self.qk_nope_head_dim + self.v_head_dim,
+                1,
             )
             W_UK_S, W_UV_S = kv_b_proj_weight_scale.split(
-                [self.qk_nope_head_dim, self.v_head_dim], dim=1)
+                [self.qk_nope_head_dim, self.v_head_dim], dim=1
+            )
 
             self.W_UK = ixf_ops.marlin_w8_weight_repack(
                 weights=W_UK.permute(1, 2, 0).contiguous(),
@@ -696,104 +707,130 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
             def _v_up_proj_w8a8(impl_self, x, out=None):
                 return ixf_ops.marlin_w8a16(
-                    x, impl_self.W_UV, impl_self.W_UV_S,
-                    group_size=-1, format="k16n16", batch_first=False,
+                    x,
+                    impl_self.W_UV,
+                    impl_self.W_UV_S,
+                    group_size=-1,
+                    format="k16n16",
+                    batch_first=False,
                 )
 
             def _k_up_proj_w8a8(impl_self, x_nope):
                 return ixf_ops.marlin_w8a16(
-                    x_nope, impl_self.W_UK, impl_self.W_UK_S,
-                    group_size=-1, format="k16n16_grouped_n",
+                    x_nope,
+                    impl_self.W_UK,
+                    impl_self.W_UK_S,
+                    group_size=-1,
+                    format="k16n16_grouped_n",
                     batch_first=False,
                 )
 
-            self._v_up_proj = functools.partial(
-                _v_up_proj_w8a8, self)
-            self._k_up_proj = functools.partial(
-                _k_up_proj_w8a8, self)
+            self._v_up_proj = functools.partial(_v_up_proj_w8a8, self)
+            self._k_up_proj = functools.partial(_k_up_proj_w8a8, self)
             return True
 
         elif quant_method_name == "IluAWQMarlinLinearMethod":
-            def split_4bit_matrix(qweight, scales, qzeros,
-                                  num_heads, head_dim_1, head_dim_2):
+
+            def split_4bit_matrix(
+                qweight, scales, qzeros, num_heads, head_dim_1, head_dim_2
+            ):
                 assert head_dim_1 % 8 == 0
                 assert head_dim_2 % 8 == 0
-                qweight = qweight.view(
-                    -1, num_heads, (head_dim_1 + head_dim_2) // 8)
-                w1, w2 = qweight.split(
-                    [head_dim_1 // 8, head_dim_2 // 8], dim=-1)
-                scales = scales.view(
-                    -1, num_heads, head_dim_1 + head_dim_2)
+                qweight = qweight.view(-1, num_heads, (head_dim_1 + head_dim_2) // 8)
+                w1, w2 = qweight.split([head_dim_1 // 8, head_dim_2 // 8], dim=-1)
+                scales = scales.view(-1, num_heads, head_dim_1 + head_dim_2)
                 s1, s2 = scales.split([head_dim_1, head_dim_2], dim=-1)
-                qzeros = qzeros.view(
-                    -1, num_heads, (head_dim_1 + head_dim_2) // 8)
-                z1, z2 = qzeros.split(
-                    [head_dim_1 // 8, head_dim_2 // 8], dim=-1)
-                return (w1.contiguous().view(w1.shape[0], -1),
-                        s1.contiguous().view(s1.shape[0], -1),
-                        z1.contiguous().view(z1.shape[0], -1),
-                        w2.contiguous().view(w2.shape[0], -1),
-                        s2.contiguous().view(s2.shape[0], -1),
-                        z2.contiguous().view(z2.shape[0], -1))
+                qzeros = qzeros.view(-1, num_heads, (head_dim_1 + head_dim_2) // 8)
+                z1, z2 = qzeros.split([head_dim_1 // 8, head_dim_2 // 8], dim=-1)
+                return (
+                    w1.contiguous().view(w1.shape[0], -1),
+                    s1.contiguous().view(s1.shape[0], -1),
+                    z1.contiguous().view(z1.shape[0], -1),
+                    w2.contiguous().view(w2.shape[0], -1),
+                    s2.contiguous().view(s2.shape[0], -1),
+                    z2.contiguous().view(z2.shape[0], -1),
+                )
 
-            (W_UK, W_UK_S, W_UK_Z,
-             W_UV, W_UV_S, W_UV_Z) = split_4bit_matrix(
-                kv_b_proj_module.qweight, kv_b_proj_module.scales,
+            (W_UK, W_UK_S, W_UK_Z, W_UV, W_UV_S, W_UV_Z) = split_4bit_matrix(
+                kv_b_proj_module.qweight,
+                kv_b_proj_module.scales,
                 kv_b_proj_module.qzeros,
-                self.num_heads, self.qk_nope_head_dim, self.v_head_dim)
+                self.num_heads,
+                self.qk_nope_head_dim,
+                self.v_head_dim,
+            )
 
-            W_UK = W_UK.reshape(
-                self.kv_lora_rank, self.num_heads, -1
-            ).permute(1, 2, 0).contiguous()
-            W_UK_S = W_UK_S.reshape(
-                W_UK_S.shape[0], self.num_heads, -1
-            ).permute(1, 0, 2).contiguous()
-            W_UK_Z = W_UK_Z.reshape(
-                W_UK_Z.shape[0], self.num_heads, -1
-            ).permute(1, 0, 2).contiguous()
-            (self.W_UK, self.W_UK_S,
-             self.W_UK_Z) = ixf_ops.marlin_w4_weight_repack(
-                weights=W_UK, scales=W_UK_S, zeros=W_UK_Z,
+            W_UK = (
+                W_UK.reshape(self.kv_lora_rank, self.num_heads, -1)
+                .permute(1, 2, 0)
+                .contiguous()
+            )
+            W_UK_S = (
+                W_UK_S.reshape(W_UK_S.shape[0], self.num_heads, -1)
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+            W_UK_Z = (
+                W_UK_Z.reshape(W_UK_Z.shape[0], self.num_heads, -1)
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+            (self.W_UK, self.W_UK_S, self.W_UK_Z) = ixf_ops.marlin_w4_weight_repack(
+                weights=W_UK,
+                scales=W_UK_S,
+                zeros=W_UK_Z,
                 weight_format="gptq_grouped_n",
                 reformat="k16n32_grouped_n",
             )
 
-            W_UV = W_UV.reshape(
-                self.kv_lora_rank, self.num_heads, -1
-            ).permute(1, 0, 2).contiguous()
-            W_UV_S = W_UV_S.reshape(
-                W_UV_S.shape[0], self.num_heads, -1
-            ).permute(1, 0, 2).contiguous()
-            W_UV_Z = W_UV_Z.reshape(
-                W_UV_Z.shape[0], self.num_heads, -1
-            ).permute(1, 0, 2).contiguous()
-            (self.W_UV, self.W_UV_S,
-             self.W_UV_Z) = ixf_ops.marlin_w4_weight_repack(
-                weights=W_UV, scales=W_UV_S, zeros=W_UV_Z,
-                weight_format="awq", reformat="k16n32",
+            W_UV = (
+                W_UV.reshape(self.kv_lora_rank, self.num_heads, -1)
+                .permute(1, 0, 2)
+                .contiguous()
             )
-            w4_group_size = kv_b_proj_module.quant_method.quant_config\
-                .group_size
+            W_UV_S = (
+                W_UV_S.reshape(W_UV_S.shape[0], self.num_heads, -1)
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+            W_UV_Z = (
+                W_UV_Z.reshape(W_UV_Z.shape[0], self.num_heads, -1)
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+            (self.W_UV, self.W_UV_S, self.W_UV_Z) = ixf_ops.marlin_w4_weight_repack(
+                weights=W_UV,
+                scales=W_UV_S,
+                zeros=W_UV_Z,
+                weight_format="awq",
+                reformat="k16n32",
+            )
+            w4_group_size = kv_b_proj_module.quant_method.quant_config.group_size
 
             def _v_up_proj_w4a16(impl_self, x, out=None):
                 return ixf_ops.marlin_w4a16(
-                    x, impl_self.W_UV, impl_self.W_UV_S, impl_self.W_UV_Z,
-                    group_size=w4_group_size, format="k16n32",
-                    batch_first=False)
+                    x,
+                    impl_self.W_UV,
+                    impl_self.W_UV_S,
+                    impl_self.W_UV_Z,
+                    group_size=w4_group_size,
+                    format="k16n32",
+                    batch_first=False,
+                )
 
             def _k_up_proj_w4a16(impl_self, x_nope):
                 return ixf_ops.marlin_w4a16(
-                    x_nope, impl_self.W_UK, impl_self.W_UK_S,
+                    x_nope,
+                    impl_self.W_UK,
+                    impl_self.W_UK_S,
                     impl_self.W_UK_Z,
                     group_size=w4_group_size,
                     format="k16n32_grouped_n",
                     batch_first=False,
                 )
 
-            self._v_up_proj = functools.partial(
-                _v_up_proj_w4a16, self)
-            self._k_up_proj = functools.partial(
-                _k_up_proj_w4a16, self)
+            self._v_up_proj = functools.partial(_v_up_proj_w4a16, self)
+            self._k_up_proj = functools.partial(_k_up_proj_w4a16, self)
             return True
 
         return False
@@ -830,21 +867,26 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
             q = torch.cat([q_nope, q_pe], dim=-1)
             q = get_dcp_group().all_gather(q, dim=1)
             o = torch.empty(
-                B, q.shape[1], self.kv_lora_rank,
-                dtype=q_nope.dtype, device=q_nope.device)
+                B,
+                q.shape[1],
+                self.kv_lora_rank,
+                dtype=q_nope.dtype,
+                device=q_nope.device,
+            )
             if is_int8_mla:
                 q_int8, q_scale = ops.quant_kv(q)
-                attn_out, softmax_lse = (
-                    ixf_ops.vllm_paged_attention_mla_int8(
-                        o, q_int8, q_scale,
-                        kv_c_and_k_pe_cache,
-                        kv_c_and_k_pe_cache_scale,
-                        self.scale,
-                        decode_meta.block_table,
-                        decode_meta.seq_lens,
-                        max_decode_seq_len,
-                        return_softmax_lse=True,
-                    ))
+                attn_out, softmax_lse = ixf_ops.vllm_paged_attention_mla_int8(
+                    o,
+                    q_int8,
+                    q_scale,
+                    kv_c_and_k_pe_cache,
+                    kv_c_and_k_pe_cache_scale,
+                    self.scale,
+                    decode_meta.block_table,
+                    decode_meta.seq_lens,
+                    max_decode_seq_len,
+                    return_softmax_lse=True,
+                )
             else:
                 attn_out, softmax_lse = ixf_ops.vllm_paged_attention_mla(
                     output=o,
@@ -859,21 +901,27 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
             return attn_out, softmax_lse
 
         o = torch.empty(
-            B, self.num_heads, self.kv_lora_rank,
-            dtype=q_nope.dtype, device=q_nope.device)
+            B,
+            self.num_heads,
+            self.kv_lora_rank,
+            dtype=q_nope.dtype,
+            device=q_nope.device,
+        )
 
         if is_int8_mla:
             q = torch.cat([q_nope, q_pe], dim=-1)
             q_int8, q_scale = ops.quant_kv(q)
             ixf_ops.vllm_paged_attention_mla_int8(
-                o, q_int8, q_scale,
+                o,
+                q_int8,
+                q_scale,
                 kv_c_and_k_pe_cache,
                 kv_c_and_k_pe_cache_scale,
                 self.scale,
                 decode_meta.block_table,
                 decode_meta.seq_lens,
                 max_decode_seq_len,
-                decode_meta.use_cuda_graph
+                decode_meta.use_cuda_graph,
             )
         else:
             if k_c_normed is None:
@@ -902,5 +950,5 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
                     k_pe=k_pe,
                     use_cuda_graph=decode_meta.use_cuda_graph,
                 )
-            
+
         return self._v_up_proj(o), None

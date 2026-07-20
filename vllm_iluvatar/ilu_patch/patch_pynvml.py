@@ -9,7 +9,7 @@ use it. We only replace that module's ``CDLL`` global, not ``ctypes.CDLL``
 process-wide.
 
 Target   : vllm.third_party.pynvml.CDLL
-Baseline : main_88e5e2c57be8
+Baseline : main_dcfebf93f4e
 Why      : Iluvatar environments provide the NVML-compatible ixML library as
            ``libixml.so`` rather than NVIDIA's ``libnvidia-ml.so.1``.
 How      : wrap the module-local ``CDLL`` so only that library name is

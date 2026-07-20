@@ -105,7 +105,9 @@ def test_ilu_chunk_gated_delta_rule_registers_and_forces_plugin_native(monkeypat
         calls.append(kwargs)
         return "plugin-output"
 
-    fake_chunk_module = ModuleType("vllm_iluvatar.model_executor.layers.fla.ops.chunk")
+    fake_chunk_module = ModuleType(
+        "vllm_iluvatar.third_party.flash_linear_attention.ops.chunk"
+    )
     fake_chunk_module.chunk_gated_delta_rule = fake_chunk_gated_delta_rule
     monkeypatch.setitem(sys.modules, fake_chunk_module.__name__, fake_chunk_module)
 
@@ -257,11 +259,11 @@ def _identity_causal_conv1d_update(x, *args, **kwargs):
 
 
 def _build_split_and_plugin_chunk_metadata(module, query_lens, state_indices, device):
-    from vllm.model_executor.layers.fla.ops.index import (
+    from vllm.third_party.flash_linear_attention.ops.index import (
         prepare_chunk_indices,
         prepare_chunk_offsets,
     )
-    from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
+    from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
     from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
 
     query_start_loc_cpu = torch.tensor(

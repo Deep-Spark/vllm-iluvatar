@@ -10,7 +10,7 @@ during ``register_general``.
 
 Target   : vllm.distributed.parallel_state.GroupCoordinator.{broadcast,
            broadcast_tensor_dict, isend_tensor_dict, irecv_tensor_dict}
-Baseline : main_88e5e2c57be8
+Baseline : main_dcfebf93f4e
 Why      : 1) route broadcast / GPU-tensor broadcast through the device
               communicator so Iluvatar (ixformer) collectives are used instead
               of torch.distributed defaults.
@@ -41,6 +41,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from vllm_iluvatar.ilu_util.arch import is_ivcore30 as _is_ivcore30_fn
+
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
@@ -52,6 +54,7 @@ TensorMetadata = None
 _split_tensor_dict = None
 Handle = None
 Callable = None
+GroupCoordinator = None
 
 
 # [ILU override] GroupCoordinator.broadcast — delta: prefer
@@ -176,21 +179,17 @@ def broadcast_tensor_dict(
 # ---------------------------------------------------------------------------
 # ivcore30: blocking send/recv for PP tensor exchange
 # ---------------------------------------------------------------------------
-
-from vllm_iluvatar.ilu_util.arch import is_ivcore30 as _is_ivcore30_fn
-
-
 # [ILU override] GroupCoordinator.isend_tensor_dict — delta: on ivcore30,
 # use blocking torch.distributed.send instead of isend and return empty
 # handles.  Full-method copy of the baseline; only the lines inside the
 # MODIFICATION blocks differ from community.
 def _ilu_isend_tensor_dict_sync(
     self,
-    tensor_dict: dict[str, "torch.Tensor | Any"],
+    tensor_dict: dict[str, torch.Tensor | Any],
     dst: int | None = None,
-    all_gather_group: "GroupCoordinator | None" = None,
+    all_gather_group: GroupCoordinator | None = None,
     all_gather_tensors: dict[str, bool] | None = None,
-) -> "list[Handle]":
+) -> list[Handle]:
     if self.world_size <= 1:
         return []
 
@@ -207,9 +206,7 @@ def _ilu_isend_tensor_dict_sync(
         return []
 
     all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size
-    all_gather_rank = (
-        0 if all_gather_group is None else all_gather_group.rank_in_group
-    )
+    all_gather_rank = 0 if all_gather_group is None else all_gather_group.rank_in_group
 
     group = self.device_group
     metadata_group = self.cpu_group
@@ -232,9 +229,7 @@ def _ilu_isend_tensor_dict_sync(
 
         comm_group = metadata_group if tensor.is_cpu else group
         # >>> ILU MODIFICATION >>>
-        torch.distributed.send(
-            tensor, dst=self.ranks[dst], group=comm_group
-        )
+        torch.distributed.send(tensor, dst=self.ranks[dst], group=comm_group)
         # <<< ILU MODIFICATION <<<
         if tensor.is_cuda:
             tensor.record_stream(torch.cuda.current_stream(tensor.device))
@@ -249,9 +244,11 @@ def _ilu_isend_tensor_dict_sync(
 def _ilu_irecv_tensor_dict_sync(
     self,
     src: int | None = None,
-    all_gather_group: "GroupCoordinator | None" = None,
+    all_gather_group: GroupCoordinator | None = None,
     all_gather_tensors: dict[str, bool] | None = None,
-) -> "tuple[dict[str, torch.Tensor | Any] | None, list[Handle], list[Callable[[], None]]]":
+) -> tuple[
+    dict[str, torch.Tensor | Any] | None, list[Handle], list[Callable[[], None]]
+]:
     if not torch.distributed.is_initialized() or self.world_size == 1:
         return None, [], []
 
@@ -268,9 +265,7 @@ def _ilu_irecv_tensor_dict_sync(
         return sync_tensor_dict, [], []
 
     all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size
-    all_gather_rank = (
-        0 if all_gather_group is None else all_gather_group.rank_in_group
-    )
+    all_gather_rank = 0 if all_gather_group is None else all_gather_group.rank_in_group
 
     group = self.device_group
     metadata_group = self.cpu_group
@@ -293,9 +288,7 @@ def _ilu_irecv_tensor_dict_sync(
                 key, full_tensor.numel(), all_gather_group, all_gather_tensors
             ):
                 orig_shape = full_tensor.shape
-                slice_tensor = full_tensor.reshape(all_gather_size, -1)[
-                    all_gather_rank
-                ]
+                slice_tensor = full_tensor.reshape(all_gather_size, -1)[all_gather_rank]
                 comm_group = metadata_group if slice_tensor.is_cpu else group
                 # >>> ILU MODIFICATION >>>
                 torch.distributed.recv(
@@ -332,23 +325,29 @@ def _ilu_irecv_tensor_dict_sync(
 
 def _make_isend_tensor_dict(orig):
     """Wrapper: ivcore30 → blocking send; ivcore11 → community isend."""
-    def isend_tensor_dict(self, tensor_dict, dst=None,
-                          all_gather_group=None, all_gather_tensors=None):
+
+    def isend_tensor_dict(
+        self, tensor_dict, dst=None, all_gather_group=None, all_gather_tensors=None
+    ):
         if _is_ivcore30_fn():
             return _ilu_isend_tensor_dict_sync(
                 self, tensor_dict, dst, all_gather_group, all_gather_tensors
             )
         return orig(self, tensor_dict, dst, all_gather_group, all_gather_tensors)
+
     return isend_tensor_dict
 
 
 def _make_irecv_tensor_dict(orig):
     """Wrapper: ivcore30 → blocking recv; ivcore11 → community irecv."""
-    def irecv_tensor_dict(self, src=None,
-                          all_gather_group=None, all_gather_tensors=None):
+
+    def irecv_tensor_dict(
+        self, src=None, all_gather_group=None, all_gather_tensors=None
+    ):
         if _is_ivcore30_fn():
             return _ilu_irecv_tensor_dict_sync(
                 self, src, all_gather_group, all_gather_tensors
             )
         return orig(self, src, all_gather_group, all_gather_tensors)
+
     return irecv_tensor_dict

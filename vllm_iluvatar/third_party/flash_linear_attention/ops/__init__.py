@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Songlin Yang, Yu Zhang
+
+from .chunk import chunk_gated_delta_rule
+
+__all__ = ["chunk_gated_delta_rule"]

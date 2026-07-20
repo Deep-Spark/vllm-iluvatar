@@ -8,7 +8,7 @@ Target:
     vllm.model_executor.models.qwen3_moe.Qwen3MoeForCausalLM
     (arch "Qwen3MoeForCausalLM").
 Baseline:
-    main_88e5e2c57be8.
+    main_dcfebf93f4e.
 Why:
     The fork replaces the two separate q_norm/k_norm passes in
     ``Qwen3MoeAttention.forward`` with one fused q/k RMSNorm, and keeps the MoE

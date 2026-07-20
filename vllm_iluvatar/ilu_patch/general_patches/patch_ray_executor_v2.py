@@ -4,7 +4,7 @@
 Corresponds to: vllm/v1/executor/ray_executor_v2.py
 
 Target   : RayWorkerProc.initialize_worker
-Baseline : main_88e5e2c57be8
+Baseline : main_dcfebf93f4e
 Why      : some Iluvatar communication paths need the platform device-control
            environment variable narrowed before WorkerProc initializes NCCL.
 How      : wrap the worker initialization method and add the env var from

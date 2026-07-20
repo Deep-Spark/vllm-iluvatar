@@ -8,7 +8,7 @@ centralized ``ilu_patch.general_patches.patch_punica_gpu`` module and is
 auto-discovered during ``register_general``.
 
 Target   : vllm.lora.punica_wrapper.punica_gpu.PunicaWrapperGPU.add_lora_linear
-Baseline : main_88e5e2c57be8
+Baseline : main_dcfebf93f4e
 Why      : use ixformer fused LoRA GEMV on Iluvatar when
            VLLM_ILU_USE_LORA_FUSION / legacy VLLM_USE_LORA_FUSION is enabled
            and the request shape satisfies ixformer's optimized condition.

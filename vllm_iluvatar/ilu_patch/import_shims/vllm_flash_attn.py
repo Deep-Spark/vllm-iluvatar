@@ -5,7 +5,7 @@ Module stand-in injected as ``sys.modules["vllm.vllm_flash_attn"]`` at startup
 (see ``vllm_iluvatar.ilu_patch.import_shims.install_all``).
 
 Target  : sys.modules["vllm.vllm_flash_attn"]
-Baseline: main_88e5e2c57be8
+Baseline: main_dcfebf93f4e
 Why     : IluPlatform is cuda-like (``is_cuda()`` is True), so community
           ``vllm.v1.attention.backends.fa_utils`` takes its ``is_cuda()`` branch
           and runs a module-level

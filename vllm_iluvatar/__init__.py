@@ -111,18 +111,14 @@ def _inject_ilu_module_aliases() -> None:
     import sys
 
     _ALIASES = {
-        "vllm.v1.attention.backends.mla.ilu_indexer":
-            "vllm_iluvatar.v1.attention.backends.mla.ilu_indexer",
-        "vllm.v1.attention.backends.mla.ilu_flashmla_sparse":
-            "vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse",
-        "vllm.v1.attention.backends.mla.ilu_mla":
-            "vllm_iluvatar.v1.attention.backends.mla.ilu_mla",
-        "vllm.v1.attention.backends.mla.ilu_sparse_swa":
-            "vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa",
+        "vllm.v1.attention.backends.mla.ilu_flashmla_sparse": "vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse",
+        "vllm.v1.attention.backends.mla.ilu_mla": "vllm_iluvatar.v1.attention.backends.mla.ilu_mla",
+        "vllm.v1.attention.backends.mla.ilu_sparse_swa": "vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa",
     }
     for alias, real in _ALIASES.items():
         if alias not in sys.modules:
             import importlib
+
             try:
                 mod = importlib.import_module(real)
                 sys.modules[alias] = mod

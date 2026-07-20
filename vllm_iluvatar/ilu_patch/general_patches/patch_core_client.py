@@ -7,7 +7,7 @@ ILU general-plugins patch, auto-discovered from the centralized
 ``ilu_patch.general_patches`` package during ``register_general``.
 
 Target   : vllm.v1.engine.core_client.DPLBAsyncMPClient.get_core_engine_for_request
-Baseline : main_88e5e2c57be8
+Baseline : main_dcfebf93f4e
 Why      : The community LB relies on coordinator-reported (waiting, running)
            counts that lag ~100 ms.  With a single API server
            (``client_count == 1``) the client already holds an exact, real-time
@@ -38,8 +38,8 @@ from vllm_iluvatar.ilu_patch import general_patch as p
 # DPLBAsyncMPClient.get_core_engine_for_request (4-space method indent),
 # used as the drift anchor by the fingerprint guard.
 #
-# Baseline: main_88e5e2c57be8
-GET_CORE_ENGINE_FOR_REQUEST = '''\
+# Baseline: main_dcfebf93f4e
+GET_CORE_ENGINE_FOR_REQUEST = """\
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.
         if (eng_index := request.data_parallel_rank) is None and (
@@ -75,7 +75,7 @@ GET_CORE_ENGINE_FOR_REQUEST = '''\
         # Record which engine is chosen for this request, to handle aborts.
         self.reqs_in_flight[request.request_id] = chosen_engine
         return chosen_engine
-'''
+"""
 
 
 def register() -> None:
@@ -117,7 +117,8 @@ def _apply() -> None:
         get_core_engine_for_request=impl._ilu_get_core_engine_for_request,
     )
     p.check_signatures(
-        DPLBAsyncMPClient, _ilu_ns,
+        DPLBAsyncMPClient,
+        _ilu_ns,
         ["get_core_engine_for_request"],
         strict=True,
     )

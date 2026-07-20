@@ -20,7 +20,7 @@
 - [4. 端到端步骤](#4-端到端步骤)
   - [4.1 定位天数 delta](#41-定位天数-delta)
   - [4.2 子类化社区模型](#42-子类化社区模型)
-  - [4.3 用 __class__ 交换重写 forward + 安装天数 op](#43-用-__class__-交换重写-forward--安装天数-op)
+  - [4.3 用 **class** 交换重写 forward + 安装天数 op](#43-用-__class__-交换重写-forward--安装天数-op)
   - [4.4 隔离可选精度取舍](#44-隔离可选精度取舍)
   - [4.5 register_model 覆盖社区 arch](#45-register_model-覆盖社区-arch)
   - [4.6 量化加载（W4A8）](#46-量化加载w4a8)
@@ -62,10 +62,10 @@
 - **文件布局**：单文件 `vllm_iluvatar/model_executor/models/<arch>.py`（如 `hy_v3.py` / `qwen3.py`），无需建子包。
 - **许可头 + 溯源 docstring**：保留 Apache 许可头，并写溯源 docstring，字段对齐 `qwen3.py`：
 
-  ```
+  ```text
   Corresponds to: vllm/model_executor/models/<arch>.py
   Target   : 社区目标类与 arch 名
-  Baseline : 对齐的社区基线 commit（如 88e5e2c57be）
+  Baseline : 对齐的社区基线 commit（如 dcfebf93f4e）
   Why      : 相对社区的天数 delta 是什么
   How      : 如何接入（register_model 指向子类；__init__ 后交换 self_attn.__class__ 等）
   Scope    : 适用范围
@@ -83,7 +83,7 @@
 
 整体流程：
 
-```
+```text
 4.1 定位 delta  →  4.2 子类化模型  →  4.3 交换 forward + 安装 op
                                        └─▶ 4.4 隔离可选取舍(overrides)  →  4.5 register_model  →  4.6 量化加载(继承，无需改)
 ```
@@ -92,7 +92,7 @@
 
 ### 4.1 定位天数 delta
 
-先把 fork 的社区源文件与其社区基线做**逐字节对比**，找出真正的功能差异，避免把无关改动一并塞进覆盖。以 hy_v3 为例，相对社区基线 `88e5e2c57be` 的唯一有效 delta 是：attention fallback 路径里两次独立 `q_norm`/`k_norm` → 一次融合 `rms_norm_qk`。其余"改动"（如强制 `rope_support=False` 的死代码）不应带入子类。
+先把 fork 的社区源文件与其社区基线做**逐字节对比**，找出真正的功能差异，避免把无关改动一并塞进覆盖。以 hy_v3 为例，相对社区基线 `dcfebf93f4e` 的唯一有效 delta 是：attention fallback 路径里两次独立 `q_norm`/`k_norm` → 一次融合 `rms_norm_qk`。其余"改动"（如强制 `rope_support=False` 的死代码）不应带入子类。
 
 只有确认了 delta，才能决定要覆盖哪个类的哪个方法。
 

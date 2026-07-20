@@ -11,21 +11,20 @@ remaining FLA stages stay upstream-owned.
 from __future__ import annotations
 
 import torch
-
-from vllm.model_executor.layers.fla.ops.chunk_delta_h import (
+from vllm.third_party.flash_linear_attention.ops.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h,
 )
-from vllm.model_executor.layers.fla.ops.chunk_o import chunk_fwd_o
-from vllm.model_executor.layers.fla.ops.cumsum import chunk_local_cumsum
-from vllm.model_executor.layers.fla.ops.l2norm import l2norm_fwd
-from vllm.model_executor.layers.fla.ops.solve_tril import solve_tril
-from vllm.model_executor.layers.fla.ops.utils import (
+from vllm.third_party.flash_linear_attention.ops.chunk_o import chunk_fwd_o
+from vllm.third_party.flash_linear_attention.ops.cumsum import chunk_local_cumsum
+from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
+from vllm.third_party.flash_linear_attention.ops.solve_tril import solve_tril
+from vllm.third_party.flash_linear_attention.ops.utils import (
     FLA_CHUNK_SIZE,
     SUPPRESS_LEVEL,
 )
-from vllm.model_executor.layers.fla.ops.wy_fast import recompute_w_u_fwd
+from vllm.third_party.flash_linear_attention.ops.wy_fast import recompute_w_u_fwd
 
-from vllm_iluvatar.model_executor.layers.fla.ops.chunk_scaled_dot_kkt import (
+from vllm_iluvatar.third_party.flash_linear_attention.ops.chunk_scaled_dot_kkt import (
     chunk_scaled_dot_kkt_fwd,
 )
 

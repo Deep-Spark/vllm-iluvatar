@@ -33,12 +33,12 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.triton_utils import tl, triton
 
-from vllm_iluvatar.model_executor.layers.fla.ops.ilu_l2norm import (
-    l2norm_fwd_inplace as l2norm_fwd,
-)
 from vllm_iluvatar.model_executor.layers.mamba.ops.ilu_causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
+)
+from vllm_iluvatar.third_party.flash_linear_attention.ops.ilu_l2norm import (
+    l2norm_fwd_inplace as l2norm_fwd,
 )
 from vllm_iluvatar.v1.attention.backends.ilu_gdn_attn import (
     IluGDNAttentionMetadata,
@@ -85,7 +85,7 @@ class IluChunkGatedDeltaRule(ChunkGatedDeltaRule):
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: Any = None,
     ):
-        from vllm_iluvatar.model_executor.layers.fla.ops.chunk import (
+        from vllm_iluvatar.third_party.flash_linear_attention.ops.chunk import (
             chunk_gated_delta_rule,
         )
 

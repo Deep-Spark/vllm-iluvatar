@@ -5,7 +5,7 @@
 Corresponds to: vllm/model_executor/layers/fused_moe/router/gate_linear.py
 
 Target   : vllm.model_executor.layers.fused_moe.router.gate_linear.GateLinear
-Baseline : main_88e5e2c57be8
+Baseline : main_dcfebf93f4e
 Why      : community GateLinear enables CUDA/Hopper/Blackwell router GEMM
            branches that are NVIDIA-specific; Iluvatar should preserve the
            dispatch semantics but use equivalent torch implementations for
@@ -46,9 +46,7 @@ class IluGateLinear(GateLinear):
         ):
             import ixformer.inference.functions as ixfops
 
-            output = ixfops.gemm_bf16_bf16_fp32(
-                x, self.weight, format="TN"
-            )
+            output = ixfops.gemm_bf16_bf16_fp32(x, self.weight, format="TN")
             output_bias = self.bias if self.skip_bias_add else None
             return output, output_bias
 

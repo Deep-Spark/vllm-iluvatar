@@ -13,7 +13,7 @@ overrides onto GroupCoordinator.
 
 Target   : vllm.distributed.parallel_state.GroupCoordinator.{broadcast,
            broadcast_tensor_dict, isend_tensor_dict, irecv_tensor_dict}
-Baseline : main_88e5e2c57be8
+Baseline : main_dcfebf93f4e
 How      : broadcast            -> wrapper delegating to the community method;
            broadcast_tensor_dict -> full-method copy (in parallel_state.py),
                                     guarded by a source fingerprint against the
@@ -43,7 +43,7 @@ from vllm_iluvatar.ilu_patch import general_patch as p
 # parallel_state.py together. Triple-SINGLE quotes are required because the
 # method body contains a triple-double-quoted docstring.
 #
-# Baseline: main_88e5e2c57be8
+# Baseline: main_dcfebf93f4e
 BROADCAST_TENSOR_DICT = '''    def broadcast_tensor_dict(
         self,
         tensor_dict: dict[str, torch.Tensor | Any] | None = None,
@@ -129,8 +129,8 @@ BROADCAST_TENSOR_DICT = '''    def broadcast_tensor_dict(
 
 # Verbatim community-baseline source of GroupCoordinator.isend_tensor_dict
 # (4-space method indent, trailing newline), used as the drift anchor.
-# Baseline: main_88e5e2c57be8
-ISEND_TENSOR_DICT = '''    def isend_tensor_dict(
+# Baseline: main_dcfebf93f4e
+ISEND_TENSOR_DICT = """    def isend_tensor_dict(
         self,
         tensor_dict: dict[str, torch.Tensor | Any],
         dst: int | None = None,
@@ -186,12 +186,12 @@ ISEND_TENSOR_DICT = '''    def isend_tensor_dict(
             handles.append(handle)
 
         return handles
-'''
+"""
 
 # Verbatim community-baseline source of GroupCoordinator.irecv_tensor_dict
 # (4-space method indent, trailing newline), used as the drift anchor.
-# Baseline: main_88e5e2c57be8
-IRECV_TENSOR_DICT = '''    def irecv_tensor_dict(
+# Baseline: main_dcfebf93f4e
+IRECV_TENSOR_DICT = """    def irecv_tensor_dict(
         self,
         src: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
@@ -276,7 +276,7 @@ IRECV_TENSOR_DICT = '''    def irecv_tensor_dict(
                 tensor_dict[key] = value
 
         return tensor_dict, handles, postprocess
-'''
+"""
 
 
 def register() -> None:
@@ -285,12 +285,13 @@ def register() -> None:
         __name__,
         _apply,
         detail="broadcast wrapper, broadcast_tensor_dict copy, "
-               "isend/irecv_tensor_dict ivcore30 sync wrapper",
+        "isend/irecv_tensor_dict ivcore30 sync wrapper",
     )
 
 
 def _apply() -> None:
     import collections.abc as _abc
+
     import torch as _torch
     import vllm.distributed.parallel_state as _m
 

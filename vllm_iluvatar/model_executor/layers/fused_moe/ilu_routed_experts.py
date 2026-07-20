@@ -6,7 +6,7 @@
 Iluvatar OOT replacement for routed expert weight loading.
 
 Target     : vllm.model_executor.layers.fused_moe.routed_experts.RoutedExperts
-Baseline   : main_88e5e2c57be8 ``RoutedExperts.weight_loader`` and
+Baseline   : main_dcfebf93f4e ``RoutedExperts.weight_loader`` and
              ``RoutedExperts.load_weights``
 Why        : preserve the fork's MoE loading deltas without editing community
              vLLM source.
@@ -448,13 +448,12 @@ class IluRoutedExperts(RoutedExperts):
                     fused_weight = loaded_weight
                     # >>> ILU MODIFICATION >>>
                     # record fused w13 full dim
-                    if "weight_scale" not in param_name:
-                        if "w13_weight" in param_name:
-                            fused_w13_intermediate_dim = (
-                                fused_weight.shape[-2]
-                                if fused_weight.shape[-1] == unpadded_hidden
-                                else fused_weight.shape[-1]
-                            )
+                    if "weight_scale" not in param_name and "w13_weight" in param_name:
+                        fused_w13_intermediate_dim = (
+                            fused_weight.shape[-2]
+                            if fused_weight.shape[-1] == unpadded_hidden
+                            else fused_weight.shape[-1]
+                        )
                     # <<< ILU MODIFICATION <<<
                     if shard_id in {"w1", "w3"}:
                         if fused_weight.shape[-1] != unpadded_hidden:

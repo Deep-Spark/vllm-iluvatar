@@ -21,7 +21,7 @@ vllm-iluvatar/
 ├── .pre-commit-config.yaml # 提交检查（见第 12 章）
 ├── CMakeLists.txt          # 原生 _C 扩展的 CMake 构建（见第 9 章）
 ├── cmake/                  # FindIXFORMER.cmake：定位已安装 ixformer 包（见第 9 章）
-├── csrc/                   # 原生 _C 扩展源码（镜像上游 vllm/csrc，见第 9 章）
+├── csrc/                   # 原生 _C 扩展源码（community/ + plugin/ 分目录，见第 9 章）
 └── vllm_iluvatar/
     ├── __init__.py         # 插件入口（register_platform / register_general）+ 早期 shim 加载器
     ├── _custom_ops.py / envs.py / version.py # 算子实现 / 环境变量 / 版本（对齐上游）
@@ -555,25 +555,28 @@ W4A8 的选用基于 checkpoint 的 `quant_method`、与模型 arch 解耦：`Il
 
 社区代码（`vllm/kernels/vllm_c.py`、`vllm/utils/torch_utils.py` 等）直接调用 `torch.ops._C.rms_norm`、`torch.ops._C.rotary_embedding`、`torch.ops._C.weak_ref_tensor`、`torch.ops._C.get_cuda_view_from_cpu_tensor`。若想保持这些社区文件与上游字节一致（符合「零社区源码改动」总原则，见第 1 章），就必须由插件自行提供这些 `_C` 算子，而非去 patch 调用点。此外，插件还注册了一个内部算子 `apply_rotary_emb`（非社区 `torch.ops._C` 算子，仅供插件 OOT override 使用）。
 
-### 9.2 文件架构（镜像上游 vllm/csrc）
+### 9.2 文件架构（按功能分目录）
 
-`csrc/` **严格镜像上游 `vllm/csrc` 的目录结构、文件名与注册范式**，便于逐文件对照（见第 11 章命名规则）：
+`csrc/` 按**社区兼容算子（`community/`）与插件独有算子（`plugin/`）**分目录组织，头文件就近放置，各目录完全自治：
 
 | 文件 | 作用 | 对应上游 |
 | --- | --- | --- |
 | `core/registration.h` | `REGISTER_EXTENSION` / `TORCH_LIBRARY_*_EXPAND` 宏 | `csrc/core/registration.h`（镜像） |
-| `ops.h` | 声明全部算子（`vllm_iluvatar` 命名空间） | `csrc/ops.h`（同概念） |
 | `torch_bindings.cpp` | `TORCH_LIBRARY_FRAGMENT` 定义 schema + `TORCH_LIBRARY_IMPL` 按设备注册 + `REGISTER_EXTENSION(_C)` | `csrc/torch_bindings.cpp`（同范式） |
-| `layernorm.cpp` | `rms_norm` 实现：薄封装调 `ixformer::infer::rms_norm` | `csrc/layernorm.cpp`（同名） |
-| `pos_encoding_kernels.cu` | `rotary_embedding` / `apply_rotary_emb` 实现：自带 CUDA kernel（不依赖 ixformer） | `csrc/pos_encoding_kernels.cu`（同名） |
-| `cuda_view.cu` | `weak_ref_tensor` / `get_cuda_view_from_cpu_tensor` 自带实现（torch + CUDA） | 上游 `cuda_view.cu` 等价 |
-| `ixformer_ops.h` | **插件特有**：前置声明 `ixformer::infer::rms_norm` | 无（ixformer 只 ship `kernels/` / `comm/` 头，不含 `infer/`） |
+| `community/ops.h` | 声明社区兼容算子（`vllm_iluvatar` 命名空间） | `csrc/ops.h`（同概念） |
+| `community/ixformer_ops.h` | **插件特有**：前置声明 `ixformer::infer::rms_norm` | 无（ixformer 只 ship `kernels/` / `comm/` 头，不含 `infer/`） |
+| `community/layernorm.cpp` | `rms_norm` 实现：薄封装调 `ixformer::infer::rms_norm` | `csrc/layernorm.cpp`（同名） |
+| `community/pos_encoding_kernels.cu` | `rotary_embedding` 实现：自带 CUDA kernel（不依赖 ixformer） | `csrc/pos_encoding_kernels.cu`（同名） |
+| `community/cuda_view.cu` | `weak_ref_tensor` / `get_cuda_view_from_cpu_tensor` 自带实现（torch + CUDA） | 上游 `cuda_view.cu` 等价 |
+| `plugin/ops.h` | 声明插件独有算子（`apply_rotary_emb`、`apply_rotary_emb_meta`） | 无 |
+| `plugin/apply_rotary_emb.cu` | `apply_rotary_emb` + Meta impl：自带 CUDA kernel（不依赖 ixformer） | 无 |
 
 要点：
 
-- **`rms_norm` 借力 ixformer**：`layernorm.cpp` 经 `ixformer_ops.h` 前置声明、薄封装直接调 `ixformer::infer::rms_norm`，把 dtype dispatch 等复杂逻辑交给 ixformer 高层封装；构建期 link `libixformer.so`，由 `cmake/FindIXFORMER.cmake` 定位已安装的 ixformer 包并设置 rpath（运行期解析 `.so`）。
-- **rotary / view 算子自带实现**：`rotary_embedding`、`apply_rotary_emb`、`weak_ref_tensor`、`get_cuda_view_from_cpu_tensor` 逻辑相对简单，直接在 `pos_encoding_kernels.cu` / `cuda_view.cu` 实现，不依赖 ixformer kernel。
-- **构建集成**：`setup.py` 用 `CMakeExtension` / `CMakeBuildExt` 驱动 `CMakeLists.txt`，源文件经 `file(GLOB_RECURSE ... CONFIGURE_DEPENDS csrc/*.cc/*.cpp/*.cu)` 收集；支持 Ninja 增量编译、按 CUDA arch / build type 分桶。该扩展始终构建（缺 CMake 即构建失败，与硬件强约束一致）。
+- **`rms_norm` 借力 ixformer**：`community/layernorm.cpp` 经 `ixformer_ops.h` 前置声明、薄封装直接调 `ixformer::infer::rms_norm`，把 dtype dispatch 等复杂逻辑交给 ixformer 高层封装；构建期 link `libixformer.so`，由 `cmake/FindIXFORMER.cmake` 定位已安装的 ixformer 包并设置 rpath（运行期解析 `.so`）。
+- **rotary / view 算子自带实现**：`rotary_embedding`、`weak_ref_tensor`、`get_cuda_view_from_cpu_tensor` 逻辑相对简单，直接在 `community/pos_encoding_kernels.cu` / `community/cuda_view.cu` 实现，不依赖 ixformer kernel。
+- **插件独有算子单独存放**：`apply_rotary_emb`（非社区 `torch.ops._C` 算子）置于 `plugin/apply_rotary_emb.cu`，与社区兼容算子物理分离。
+- **构建集成**：`setup.py` 用 `CMakeExtension` / `CMakeBuildExt` 驱动 `CMakeLists.txt`，源文件经 `file(GLOB_RECURSE ... CONFIGURE_DEPENDS csrc/*.cc/*.cpp/*.cu)` 递归收集 `community/` 和 `plugin/` 子目录；支持 Ninja 增量编译、按 CUDA arch / build type 分桶。该扩展始终构建（缺 CMake 即构建失败，与硬件强约束一致）。
 
 ### 9.3 注册时序（构建期 + 运行期）
 
@@ -598,8 +601,8 @@ W4A8 的选用基于 checkpoint 的 `quant_method`、与模型 arch 解耦：`Il
 
 当又有社区文件直接调 `torch.ops._C.<name>` 且需 Iluvatar 实现时：
 
-1. **声明**：在 `csrc/ops.h` 的 `vllm_iluvatar` 命名空间加函数声明。
-2. **实现**：借 ixformer kernel 的仿照 `layernorm.cpp`（必要时在 `ixformer_ops.h` 补前置声明）；自带实现的仿照 `cuda_view.cu`。新增 `.cpp` / `.cu` 文件会被 `GLOB_RECURSE CONFIGURE_DEPENDS` 自动纳入，无需改 `CMakeLists.txt`。
+1. **声明**：在 `csrc/community/ops.h`（社区兼容算子）或 `csrc/plugin/ops.h`（插件独有算子）的 `vllm_iluvatar` 命名空间加函数声明。
+2. **实现**：借 ixformer kernel 的仿照 `community/layernorm.cpp`（必要时在 `community/ixformer_ops.h` 补前置声明）；自带实现的仿照 `community/cuda_view.cu`。新增 `.cpp` / `.cu` 文件会被 `GLOB_RECURSE CONFIGURE_DEPENDS` 自动纳入，无需改 `CMakeLists.txt`。
 3. **注册**：在 `csrc/torch_bindings.cpp` 用 `ops.def("<schema>")`（schema **逐字抄上游 `vllm/csrc`**）定义，并在对应设备段（CUDA / CPU）`ops.impl(...)`。
 4. **重新编译**（增量）。
 5. **测试**：必须在 `tests/kernels/core/` 添加数值/行为用例。
@@ -713,7 +716,7 @@ IluPlatform.import_ir_kernels / get_default_ir_op_priority
    - general patch 的 override 实现文件同理用上游同名（如 `distributed/parallel_state.py`、`distributed/utils.py`、`v1/attention/backends/fa_utils.py`，见第 4 章）。
    - OOT 注册的实现文件也镜像上游同名（如 `model_executor/layers/layernorm.py`、`model_executor/models/qwen3.py`、`model_executor/layers/quantization/ilu_deepseek_v4_w4a8.py`、`model_executor/models/deepseek_v4/`，保留社区架构类名，见第 5、6、8 章）。
    - **模块替身 shim `ilu_patch/import_shims/` 内部文件镜像被替身的上游模块同名**（如 `vllm_flash_attn.py` ↔ `vllm/vllm_flash_attn/`），便于对照；这是规则 4「`ilu_` 文件夹内部不缀」之外、为「整模块替身」保留上游名的特例（与 `csrc/` 镜像上游同理，见 §3.6）。
-   - **原生扩展 `csrc/` 同样严格镜像上游 `vllm/csrc`** 的目录层级、文件名与注册范式（`core/registration.h`、`ops.h`、`torch_bindings.cpp`、`layernorm.cpp`、`pos_encoding_kernels.cu`、`cuda_view.cu`），唯一插件特有的 `ixformer_ops.h` 例外（ixformer 未 ship `infer/` 头，需自带前置声明，见第 9 章）。
+   - **原生扩展 `csrc/` 按 community / plugin 分目录**：`community/` 内的文件名与上游 `vllm/csrc` 对应（`layernorm.cpp`、`pos_encoding_kernels.cu`、`cuda_view.cu`）；`plugin/` 存放插件独有算子（`apply_rotary_emb.cu`）；注册入口 `torch_bindings.cpp` 与 `core/registration.h` 保持在根，唯一插件特有的 `ixformer_ops.h` 置于 `community/`（ixformer 未 ship `infer/` 头，需自带前置声明，见第 9 章）。
 2. **general patch 接线 -> 集中到 `ilu_patch/general_patches/`**：
    - 文件名统一使用 `patch_<target>.py`，例如 `patch_parallel_state.py`、`patch_stateless_coordinator.py`、`patch_fused_moe_layer.py`、`patch_fa_utils.py`。
    - 接线模块含 `register()`/`_apply()`、签名/指纹校验和基线快照；override 实现仍放在上游镜像目录。

@@ -79,7 +79,9 @@ add_library(_C MODULE ${VLLM_ILUVATAR_EXT_SRC})
 target_include_directories(_C PRIVATE
   ${TORCH_INCLUDE_DIRS}
   ${IXFORMER_INCLUDE_DIR}
-  "${CMAKE_CURRENT_SOURCE_DIR}/csrc")
+  "${CMAKE_CURRENT_SOURCE_DIR}/csrc"
+  "${CMAKE_CURRENT_SOURCE_DIR}/csrc/community"
+  "${CMAKE_CURRENT_SOURCE_DIR}/csrc/plugin")
 
 target_link_libraries(_C PRIVATE Python::Module)
 

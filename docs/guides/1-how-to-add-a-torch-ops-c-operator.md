@@ -1,120 +1,144 @@
-# 在 vllm-iluvatar 新增 torch.ops._C 算子
+# 新增一个 torch.ops._C 算子
 
-> **How-to 指南** · 让上游 vLLM 代码零改动运行 · 以 `rotary_embedding` 为例
-
-本文说明如何在 `vllm-iluvatar` 插件里自己实现一个底层算子，把它注册进
-`torch.ops._C` 命名空间，从而让**上游 vLLM 代码零改动**就能调用到天数（Iluvatar）
-的实现。全程只在插件仓库内改动，不需要修改上游 vLLM。
-
-| | |
-| --- | --- |
-| **适用对象** | 任何上游 vLLM 通过 `vllm._custom_ops` → `torch.ops._C.<op>` 调用的底层算子 |
-| **改动范围** | 仅 `vllm-iluvatar` 插件仓库，不改上游 vLLM |
-| **参考实现** | `rotary_embedding`（本仓库已完整落地） |
+> **开发者指南** · community / plugin 两条主线 · 全程仅改插件仓库
 
 ---
 
 ## 目录
 
-- [1. 背景与目标](#1-背景与目标)
-- [2. 原理与调用链](#2-原理与调用链)
-- [3. 移植前：抄准社区接口](#3-移植前抄准社区接口)
-- [4. 端到端步骤（rotary_embedding 主线）](#4-端到端步骤rotary_embedding-主线)
-  - [4.1 实现内核 `csrc/pos_encoding_kernels.cu`](#41-实现内核-csrcpos_encoding_kernelscu)
-  - [4.2 在 `csrc/ops.h` 声明函数](#42-在-csrcopsh-声明函数)
-  - [4.3 在 `csrc/torch_bindings.cpp` 注册](#43-在-csrctorch_bindingscpp-注册)
-  - [4.4 构建：新增 `.cu` 无需改 CMake](#44-构建新增-cu-无需改-cmake)
-  - [4.5（可选）清理 Python 侧 override](#45可选仅当替换已有-oot-覆盖时清理-python-侧-override)
-- [5. 测试](#5-测试)
-- [6. 附录](#6-附录)
+- [1. 背景](#1-背景)
+- [2. 前置判断：community 还是 plugin](#2-前置判断community-还是-plugin)
+- [3. community 算子完整流程](#3-community-算子完整流程)（示例 `rotary_embedding`）
+  - [3.1 调用链](#31-调用链)
+  - [3.2 确认上游 schema](#32-确认上游-schema)
+  - [3.3 编写 CUDA 内核](#33-编写-cuda-内核)
+  - [3.4 声明函数签名](#34-声明函数签名)
+  - [3.5 注册 schema 与 dispatch](#35-注册-schema-与-dispatch)
+  - [3.6 构建](#36-构建)
+  - [3.7 （可选）清理旧 OOT 覆盖](#37-可选清理旧-oot-覆盖)
+  - [3.8 测试](#38-测试)
+- [4. plugin 算子完整流程](#4-plugin-算子完整流程)（示例 `apply_rotary_emb`）
+  - [4.1 调用链](#41-调用链)
+  - [4.2 定义 schema](#42-定义-schema)
+  - [4.3 编写 CUDA 内核 + Meta impl](#43-编写-cuda-内核--meta-impl)
+  - [4.4 声明函数签名](#44-声明函数签名)
+  - [4.5 注册 schema 与 dispatch](#45-注册-schema-与-dispatch)
+  - [4.6 编写 OOT override](#46-编写-oot-override)
+  - [4.7 构建](#47-构建)
+  - [4.8 测试](#48-测试)
+- [5. 附录](#5-附录)
 
 ---
 
-## 1. 背景与目标
+## 1. 背景
 
-上游 vLLM 的很多算子最终都落到一个 C++/CUDA 扩展上。调用形态是：
+上游 vLLM 的底层算子通过 `torch.ops._C.<op>` 调用，由编译期静态注册的 C++ 扩展提供实现。在 `vllm-iluvatar` 中，这个扩展是 `vllm_iluvatar._C`。
 
-- Python 层通过 `vllm._custom_ops`（简称 `ops`）里的包装函数调用；
-- 包装函数内部再调 `torch.ops._C.<op>(...)`；
-- `torch.ops._C.<op>` 由某个已编译的扩展在 import 时静态注册。
+根据上游是否已有同名算子，插件中的 `_C` 算子分为两类，**调用机制和开发流程有本质区别**：
 
-在 `vllm-iluvatar` 里，这个扩展就是 `vllm_iluvatar._C`。只要我们用**与上游完全一致的
-schema**在 `_C` 命名空间里注册同名算子，上游的 Python 调用点就会自动解析到我们的实现，
-无需改上游一行代码，也不再需要为每个类写 out-of-tree（OOT）覆盖。
+| | community 算子 | plugin 算子 |
+| --- | --- | --- |
+| **含义** | 上游 vLLM 已有同名同 schema 的 `torch.ops._C` 算子 | 上游没有，由插件自行新增的算子 |
+| **调用机制** | 照抄上游 schema 后，社区 Python 代码通过 PyTorch dispatcher **自动命中**插件实现，无需改动上层 | 社区代码不会自动调用；**必须新增 OOT override** 将社区调用点接到插件实现 |
+| **维护负担** | 低——上游升级时上层代码自动跟随 | 较高——OOT override 随上游变更需自行维护 |
 
-本文的目标就是把这套"新增算子 → 注册进 `_C` → 上游零改动调用"的流程讲清楚。
+两条开发主线：
 
----
-
-## 2. 原理与调用链
-
-关键机制：**`import vllm_iluvatar._C` 会触发扩展里的 `TORCH_LIBRARY_FRAGMENT`
-静态注册**，于是社区的 `torch.ops._C.*` 调用点在运行时解析到插件实现。
-
-以 `rotary_embedding` 为例，从模型到内核的完整调用链（纯文本）：
-
-```
-Model 前向（如 Qwen3Attention.forward）
-  └─ self.rotary_emb(positions, q, k)              # RotaryEmbedding.__call__
-       └─ RotaryEmbedding.forward_cuda(...)        # 社区实现，未改动
-            └─ vllm._custom_ops.rotary_embedding(...)   # 社区包装函数，未改动
-                 └─ torch.ops._C.rotary_embedding(...)  # PyTorch dispatcher
-                      └─ vllm_iluvatar::rotary_embedding(...)  # 插件 CUDA 实现（本仓库）
-```
-
-要点：
-- 上游 `RotaryEmbedding.forward_cuda` 和 `vllm._custom_ops.rotary_embedding` 全都
-  **保持原样**；
-- 我们只提供最底层的 `torch.ops._C.rotary_embedding` 实现；
-- 因此上游一旦升级，这些上层代码自动跟随，不留维护包袱。
+- 上游有同名算子 → 走 [第 3 节 community 流程](#3-community-算子完整流程)
+- 上游没有 → 走 [第 4 节 plugin 流程](#4-plugin-算子完整流程)
 
 ---
 
-## 3. 移植前：抄准社区接口
+## 2. 前置判断：community 还是 plugin
 
-新增算子的第一步是**照抄上游 schema**，一个字都不能差（参数名、顺序、默认值、
-in-place 标记）。schema 来源是上游 vLLM 仓库的 `csrc/libtorch_stable/torch_bindings.cpp`。
+新增算子前先确定归属：
 
-以 `rotary_embedding` 为例，上游 schema 为：
-
+```text
+上游 torch.ops._C 有同名同 schema 的算子？
+  ├── 是 → community/（社区兼容算子）→ 第 3 节
+  └── 否 → plugin/（插件独有算子）  → 第 4 节
 ```
+
+两类算子的差异对照：
+
+| | community/ | plugin/ |
+| --- | --- | --- |
+| **定义** | 上游 vLLM 已有的 `torch.ops._C` 算子 | 上游没有、插件自行新增的算子 |
+| **schema 来源** | 逐字照抄上游 `libtorch_stable/torch_bindings.cpp` | 自行定义 |
+| **源文件位置** | `csrc/community/<op>.cu` 或 `.cpp` | `csrc/plugin/<op>.cu` |
+| **头文件声明** | `csrc/community/ops.h` | `csrc/plugin/ops.h` |
+| **Meta impl** | 上游已有，一般不需要 | **必须提供**（torch.compile / opcheck 需要） |
+| **OOT override** | **不需要**（社区代码自动命中）；常需**清理**旧的 | **必须新增**（否则社区调用点无法触达） |
+| **测试对照** | 对齐上游同名测试 + 补硬件特有边界 | 自行设计参考实现 |
+| **典型示例** | `rms_norm`、`rotary_embedding`、`weak_ref_tensor` | `apply_rotary_emb` |
+
+目录结构全貌：
+
+```text
+csrc/
+├── core/registration.h              # 注册宏
+├── community/                       # 社区兼容算子
+│   ├── ops.h                       # 函数声明
+│   ├── ixformer_ops.h              # ixformer 外部符号
+│   ├── layernorm.cpp               # rms_norm（委托 ixformer）
+│   ├── pos_encoding_kernels.cu     # rotary_embedding
+│   └── cuda_view.cu               # weak_ref_tensor / get_cuda_view_from_cpu_tensor
+├── plugin/                          # 插件独有算子
+│   ├── ops.h                       # 函数声明
+│   └── apply_rotary_emb.cu        # apply_rotary_emb + Meta impl
+└── torch_bindings.cpp               # 统一注册入口
+```
+
+---
+
+## 3. community 算子完整流程
+
+> 示例：`rotary_embedding` · 参考实现：[`csrc/community/pos_encoding_kernels.cu`](../../csrc/community/pos_encoding_kernels.cu)
+
+### 3.1 调用链
+
+`import vllm_iluvatar._C` 触发 `TORCH_LIBRARY_FRAGMENT` 静态注册，社区调用点在运行时通过 PyTorch dispatcher 自动解析到插件实现，**上层代码无需改动**。
+
+以 `rotary_embedding` 为例：
+
+```text
+Qwen3Attention.forward
+  └─ self.rotary_emb(positions, q, k)
+       └─ RotaryEmbedding.forward_cuda(...)          # 社区代码，不改
+            └─ vllm._custom_ops.rotary_embedding(...)     # 社区包装，不改
+                 └─ torch.ops._C.rotary_embedding(...)    # PyTorch dispatcher
+                      └─ vllm_iluvatar::rotary_embedding(...)  # 我们的实现
+```
+
+我们只提供最底层实现，上层全部复用社区代码。上游版本升级时，这些上层代码自动跟随，无维护负担。
+
+### 3.2 确认上游 schema
+
+community 算子的第一步是照抄上游 schema，一字不差。
+
+Schema 来源：上游 vLLM 仓库 `csrc/libtorch_stable/torch_bindings.cpp`。
+
+以 `rotary_embedding` 为例：
+
+```text
 rotary_embedding(Tensor positions, Tensor! query, Tensor!? key,
                  int head_size, Tensor cos_sin_cache, bool is_neox,
                  int rope_dim_offset=0, bool inverse=False) -> ()
 ```
 
-抄 schema 时需同时确认的几件事：
+确认要点：
 
-- **in-place 语义**：`Tensor!` 表示原地修改（`query` 原地旋转写回），`Tensor!?`
-  表示可选且原地（`key` 可为 `None`）；返回 `-> ()` 即无返回值。
-- **参数默认值**：`rope_dim_offset=0`、`inverse=False` 必须与上游一致，否则调用点
-  少传参数时行为会不同。
-- **dtype / shape 约定**：`positions` 为 int64、支持 1D `[num_tokens]` 或 2D
-  `[batch, seq]`；`query`/`key` 支持扁平 `[*, H*D]` 或带头维 `[*, H, D]`（最高 4D）；
-  `cos_sin_cache` 的 dtype 可以与 `q/k` 不同（如 fp32 cache 配 bf16 的 q/k）。
+- **in-place 标记**：`Tensor!` = 原地修改；`Tensor!?` = 可选且原地；`-> ()` = 无返回值。
+- **默认值**：`rope_dim_offset=0`、`inverse=False` 必须与上游一致。
+- **dtype / shape 约定**：在上游实现文件中确认 positions 类型（int64）、query 布局（扁平 `[*, H*D]` 或带头维 `[*, H, D]`）、cache dtype 是否可异构等。
 
-把这些约定确认清楚后，实现时严格照做即可保证与上游行为对齐。
+### 3.3 编写 CUDA 内核
 
----
+在 `csrc/community/` 下新增 `.cu` 文件，实现 `vllm_iluvatar` 命名空间中的 host 函数。
 
-## 4. 端到端步骤（rotary_embedding 主线）
+host 端负责 shape / stride 推导与校验（建议逐行对齐上游同名内核的 host 逻辑），device 端负责实际计算。
 
-整体流程（前 4 步必做，第 5 步按需）：
-
-```
-4.1 写内核 .cu  →  4.2 ops.h 声明  →  4.3 torch_bindings 注册  →  4.4 构建
-                                                                    └─▶ 4.5（可选）清理旧 OOT 覆盖
-```
-
-### 4.1 实现内核 `csrc/pos_encoding_kernels.cu`
-
-在 `csrc/` 下新增一个 `.cu` 文件，实现 `vllm_iluvatar` 命名空间下的 host 函数。
-host 端负责**shape / stride 推导与校验**（建议逐行对齐上游同名内核的 host 逻辑），
-device 端负责实际计算。文件位于
-[`csrc/pos_encoding_kernels.cu`](../../csrc/pos_encoding_kernels.cu)。
-
-host 函数签名与上游一致，内部完成派生量推导（num_tokens / num_heads /
-num_kv_heads / rot_dim / 各 stride）与校验：
+参考：[`csrc/community/pos_encoding_kernels.cu`](../../csrc/community/pos_encoding_kernels.cu)
 
 ```cpp
 void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
@@ -122,36 +146,27 @@ void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
                       torch::Tensor& cos_sin_cache, bool is_neox,
                       int64_t rope_dim_offset, bool inverse) {
   const int64_t num_tokens = positions.numel();
-  const int positions_ndim = positions.dim();
-  TORCH_CHECK(positions_ndim == 1 || positions_ndim == 2, ...);
   TORCH_CHECK(positions.scalar_type() == at::kLong, "positions must be int64");
 
   const int num_heads = (query.numel() / num_tokens) / head_size;
-  const int num_kv_heads = key.has_value()
-      ? (key->numel() / num_tokens) / head_size : num_heads;
   const int rot_dim = cos_sin_cache.size(1);
   TORCH_CHECK((rot_dim + rope_dim_offset) <= head_size, ...);
 
-  // 头维 stride：带头维 [*, H, D] 用 stride(-2)（支持 padded/sliced）；
-  // 扁平 [*, H*D] 时各头是长度 head_size 的连续块。
   const int64_t head_stride =
-      (query.dim() == positions_ndim + 2) ? query.stride(-2) : head_size;
+      (query.dim() == positions.dim() + 2) ? query.stride(-2) : head_size;
   ...
 }
 ```
 
 实现要点：
 
-- **dtype dispatch**：分别对 `query` dtype（fp32/fp16/bf16）与 `cos_sin_cache`
-  dtype 派发，允许二者不同；累加统一用 fp32 保证精度。
-- **向量化**：连续布局下可按 `PACK_NUM`（如 2）向量化访存，非连续时回退到标量
-  （`PACK=1`）路径。
-- **原地写回**：直接对 `query`/`key` 的存储写回，符合 `Tensor!` 语义。
+- **dtype dispatch**：对 query dtype（fp32/fp16/bf16）与 cache dtype 分别派发，累加用 fp32 保精度。
+- **向量化**：连续布局下按 `PACK_NUM=2` 向量化访存，非连续时回退到标量路径。
+- **原地写回**：`Tensor!` 语义要求直接修改 query/key 的存储。
 
-### 4.2 在 `csrc/ops.h` 声明函数
+### 3.4 声明函数签名
 
-在 [`csrc/ops.h`](../../csrc/ops.h) 的 `vllm_iluvatar` 命名空间里补上声明，
-注释里附上对应的社区 schema，并**带上默认参数值**：
+在 [`csrc/community/ops.h`](../../csrc/community/ops.h) 中补充声明（注释附上社区 schema 原文）：
 
 ```cpp
 namespace vllm_iluvatar {
@@ -167,11 +182,12 @@ void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
 }  // namespace vllm_iluvatar
 ```
 
-### 4.3 在 `csrc/torch_bindings.cpp` 注册
+### 3.5 注册 schema 与 dispatch
 
-在 [`csrc/torch_bindings.cpp`](../../csrc/torch_bindings.cpp) 里做两件事：
-用 `ops.def(...)` 声明 schema（与上游逐字一致），用 `ops.impl(...)` 把它绑定到
-4.1 的实现，并**选对 dispatch key**（CUDA 算子注册在 `CUDA` 键上）。
+在 [`csrc/torch_bindings.cpp`](../../csrc/torch_bindings.cpp) 中完成两件事：
+
+1. `ops.def(...)` 声明 schema（与上游逐字一致）
+2. `ops.impl(...)` 绑定到实现（选对 dispatch key）
 
 ```cpp
 TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
@@ -179,25 +195,22 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
       "rotary_embedding(Tensor positions, Tensor! query, Tensor!? key, "
       "int head_size, Tensor cos_sin_cache, bool is_neox, "
       "int rope_dim_offset=0, bool inverse=False) -> ()");
-  // ... 其它算子 ...
 }
 
 TORCH_LIBRARY_IMPL_EXPAND(_C, CUDA, ops) {
   ops.impl("rotary_embedding", &vllm_iluvatar::rotary_embedding);
-  // ... 其它算子 ...
 }
 ```
 
-说明：
-- 使用 `TORCH_LIBRARY_FRAGMENT`（而非 `TORCH_LIBRARY`）——插件只是**扩展** `_C`
-  命名空间，不独占，避免与其它定义冲突。
-- 若算子输入是 CPU 张量，则应注册到 `CPU` 键（参考同文件里
-  `get_cuda_view_from_cpu_tensor` 的写法）。
+注意：
 
-### 4.4 构建：新增 `.cu` 无需改 CMake
+- 使用 `TORCH_LIBRARY_FRAGMENT`（非 `TORCH_LIBRARY`）——插件**扩展** `_C` 命名空间，不独占。
+- CUDA 算子注册到 `CUDA` key；CPU 输入的算子注册到 `CPU` key（如 `get_cuda_view_from_cpu_tensor`）。
+- community 算子的 Meta impl 由上游提供，插件侧一般不需要注册。
 
-[`CMakeLists.txt`](../../CMakeLists.txt) 用 `GLOB_RECURSE ... CONFIGURE_DEPENDS`
-自动收集 `csrc/` 下所有 `.cc/.cpp/.cu`：
+### 3.6 构建
+
+[`CMakeLists.txt`](../../CMakeLists.txt) 用 `GLOB_RECURSE ... CONFIGURE_DEPENDS` 递归收集 `csrc/` 下所有源文件：
 
 ```cmake
 file(GLOB_RECURSE VLLM_ILUVATAR_EXT_SRC CONFIGURE_DEPENDS
@@ -206,108 +219,258 @@ file(GLOB_RECURSE VLLM_ILUVATAR_EXT_SRC CONFIGURE_DEPENDS
   "${CMAKE_CURRENT_SOURCE_DIR}/csrc/*.cu")
 ```
 
-因此新增 `pos_encoding_kernels.cu` **不需要**手动改 CMake；`CONFIGURE_DEPENDS`
-让 CMake 在下次构建时自动发现新文件并重新配置。
+新增的 `.cu` / `.cpp` 文件会被自动发现，**不需要手动改 CMake**。
 
-### 4.5（可选，仅当替换已有 OOT 覆盖时）清理 Python 侧 override
+### 3.7 （可选）清理旧 OOT 覆盖
 
-如果新增的算子是用来**取代插件里已有的 OOT 覆盖**（而不是全新算子），还需要清理旧路径，
-让上游 Python 代码直接走到新的 `_C` 实现；纯新增算子可跳过本步。
+community 算子注册后，社区调用点会自动通过 PyTorch dispatcher 命中插件实现。如果插件里此前已有 Python 层的 OOT 覆盖来实现同一功能，现在可以清理掉。纯新增算子跳过此步。
 
-以 `rotary_embedding` 为例，涉及三处：
+清理三处：
 
-- **`vllm_iluvatar/_custom_ops.py`**：删除该算子的 Python override 函数，并从
-  `_ILU_OVERRIDES` 清单里移除对应条目。这样社区 `vllm._custom_ops.rotary_embedding`
-  会原样使用、并分发到我们的 `_C` 实现。当前文件里保留了一条说明性注释：
+1. **`vllm_iluvatar/_custom_ops.py`**：删除该算子的 override 函数，从 `_ILU_OVERRIDES` 移除对应条目。
+2. **OOT 子类文件**：删除 `model_executor/layers/` 下逐类的 `forward_cuda` 子类。
+3. **`vllm_iluvatar/ilu_patch/patch_custom_ops.py`**：从 `_SKIP_SIGCHECK` 移除该算子名（签名已对齐，不再需要豁免）。
 
-  ```python
-  # rotary_embedding is now provided by the plugin's native torch.ops._C kernel
-  # (csrc/pos_encoding_kernels.cu), which matches the community signature exactly,
-  # so community vllm._custom_ops.rotary_embedding is used unchanged (no override).
-  ```
+### 3.8 测试
 
-- **`vllm_iluvatar/model_executor/layers/.../base.py`**：删除逐类的
-  `forward_cuda` OOT 子类（rope 场景下是 10 个 `RotaryEmbedding` 子类）。
+**文件位置**：`tests/kernels/core/test_<op>.py`
 
-- **`vllm_iluvatar/ilu_patch/patch_custom_ops.py`**：从 `_SKIP_SIGCHECK` 集合里移除
-  该算子名。签名已与社区对齐后，就应恢复严格签名校验（不再豁免）。
+**两层测试策略**：
+
+- **模块级**：通过上游构建函数（如 `get_rope`）构造完整模块，验证 `forward_cuda` → `_C` 内核的完整路径。
+- **裸算子级**：直接调用 `torch.ops._C.<op>`，与纯 torch 参考实现对比，覆盖模块级测不到的边界。
+
+**覆盖范围**——对齐上游同名测试的场景，再补 Iluvatar 特有边界：
+
+- `rope_dim_offset > 0`、`inverse=True`
+- GQA（`num_kv_heads < num_heads`）
+- cache dtype 与 q/k 异构（fp32 cache + bf16 q/k）
+- 非连续（strided）张量
+
+**注意事项**：构造 `CustomOp`（如 `RotaryEmbedding`）需要活跃的 `VllmConfig` 上下文，使用 [`tests/conftest.py`](../../tests/conftest.py) 中的 `default_vllm_config` fixture 即可。
 
 ---
 
-## 5. 测试
+## 4. plugin 算子完整流程
 
-### 放置位置
+> 示例：`apply_rotary_emb` · 参考实现：[`csrc/plugin/apply_rotary_emb.cu`](../../csrc/plugin/apply_rotary_emb.cu)
 
-- 内核数值测试：`tests/kernels/core/test_<op>.py`（rope 为
-  [`tests/kernels/core/test_pos_encoding.py`](../../tests/kernels/core/test_pos_encoding.py)）。
-- 若做了 4.5 的 OOT 清理，把"覆盖已移除"的断言更新到对应
-  `tests/model_executor/...` 测试里。
+plugin 算子是上游 `torch.ops._C` 中**不存在**的算子，由插件自行新增。社区 Python 代码不会自动调用它，因此除了 C++ 侧的内核实现外，还**必须编写 OOT override** 将社区调用点接到新算子。
 
-### 两层测试
+### 4.1 调用链
 
-- **模块级**：通过 `get_rope` 构造真实的 rope 模块，调用 `forward_cuda`
-  （即走 `ops.rotary_embedding` → 我们的 `_C` 内核），与 `forward_native`（纯 torch
-  参考）对比。这验证的是"删掉 OOT 覆盖之后的完整路径"。
-- **裸算子级**：直接调用 `torch.ops._C.rotary_embedding`，与手写的纯 torch 参考实现
-  对比，覆盖模块级测不到的维度。
+与 community 算子不同，plugin 算子多了一层**插件侧的 OOT override**（`@<CustomOp>.register_oot` 子类），由它在 `forward_cuda` 中调用 `torch.ops._C.<plugin_op>`。
 
-### 对齐社区测试并补边界
+以 `apply_rotary_emb` 为例：
 
-先对照上游 `tests/kernels/core/test_pos_encoding.py`，把它覆盖的场景搬过来
-（`is_neox` 两种、扁平/带头维/padded 布局、`key=None`、奇数头数、大 `seq_len`、
-partial rotary dim、fp16/bf16/fp32），再补上天数/DeepSeek 特有的边界：
-
-- `rope_dim_offset > 0`；
-- `inverse=True`；
-- GQA（`num_kv_heads < num_heads`）；
-- `cos_sin_cache` dtype 与 `q/k` 不同（fp32 cache + bf16/fp16 q/k）；
-- 非连续（strided）的 `query`/`key`。
-
-### CustomOp 需要 VllmConfig 上下文
-
-直接构造 `CustomOp`（如 `RotaryEmbedding`）时，`CustomOp.__init__` 会调用
-`get_current_vllm_config()`，要求有活跃的 config 上下文，否则报
-`Current vLLM config is not set`。测试通过
-[`tests/conftest.py`](../../tests/conftest.py) 的 `default_vllm_config` fixture 提供：
-
-```python
-@pytest.fixture()
-def default_vllm_config():
-    from vllm.config import VllmConfig, set_current_vllm_config
-    config = VllmConfig()
-    with set_current_vllm_config(config):
-        yield config
+```text
+Qwen3Attention.forward
+  └─ self.rotary_emb(positions, q, k)
+       └─ RotaryEmbedding.forward_cuda(...)
+            └─ ApplyRotaryEmb.forward_cuda(...)        # 社区 CustomOp
+                 └─ IluApplyRotaryEmb.forward_cuda(...)    # 插件 OOT override
+                      └─ torch.ops._C.apply_rotary_emb(...)   # PyTorch dispatcher
+                           └─ vllm_iluvatar::apply_rotary_emb(...)  # 我们的实现
 ```
 
-在需要构造 rope 模块的测试里把它作为参数注入即可。
+注意：`IluApplyRotaryEmb` 是插件自行编写维护的 OOT 子类。上游 `ApplyRotaryEmb` 的接口变更时，此 override 需要同步更新。
+
+### 4.2 定义 schema
+
+plugin 算子在上游没有对应的 schema，需要自行定义。设计 schema 时注意：
+
+- 参数类型和语义要与社区调用侧的数据流吻合（OOT override 会从社区拿到数据再传给 `_C` 算子）。
+- 选择 in-place（`Tensor!`、`-> ()`）还是 out-of-place（`-> Tensor`）需考虑调用语义。
+- out-of-place 算子**必须**配套 Meta impl（见 4.3）。
+
+以 `apply_rotary_emb` 为例，它是 out-of-place 的（返回新 Tensor）：
+
+```text
+apply_rotary_emb(Tensor x, Tensor cos, Tensor sin, bool interleaved) -> Tensor
+```
+
+### 4.3 编写 CUDA 内核 + Meta impl
+
+在 `csrc/plugin/` 下新增 `.cu` 文件，在同一文件中实现**两个**函数：
+
+1. **CUDA 实现**：`vllm_iluvatar::apply_rotary_emb` —— 实际的 GPU 计算。
+2. **Meta impl**：`vllm_iluvatar::apply_rotary_emb_meta` —— 仅做 shape 推导，用于 torch.compile / FakeTensor / opcheck。
+
+参考：[`csrc/plugin/apply_rotary_emb.cu`](../../csrc/plugin/apply_rotary_emb.cu)
+
+CUDA 实现（host 入口）：
+
+```cpp
+torch::Tensor apply_rotary_emb(torch::Tensor& x, torch::Tensor& cos,
+                               torch::Tensor& sin, bool interleaved) {
+  TORCH_CHECK(x.dim() == 3 || x.dim() == 4, ...);
+  TORCH_CHECK(cos.dim() == 2 && sin.dim() == 2, ...);
+
+  const int64_t rot_dim = cos.size(1) * 2;
+  auto out = x.contiguous().clone();
+  if (num_tokens == 0 || num_heads == 0 || rot_dim == 0) return out;
+  // ... launch kernel ...
+  return out;
+}
+```
+
+Meta impl：
+
+```cpp
+torch::Tensor apply_rotary_emb_meta(torch::Tensor& x, torch::Tensor& /*cos*/,
+                                    torch::Tensor& /*sin*/,
+                                    bool /*interleaved*/) {
+  return at::empty_like(x, x.options(), at::MemoryFormat::Contiguous);
+}
+```
+
+### 4.4 声明函数签名
+
+在 [`csrc/plugin/ops.h`](../../csrc/plugin/ops.h) 中补充声明，**包含 CUDA 实现和 Meta impl 两个签名**：
+
+```cpp
+namespace vllm_iluvatar {
+
+// apply_rotary_emb(Tensor x, Tensor cos, Tensor sin, bool interleaved) -> Tensor
+torch::Tensor apply_rotary_emb(torch::Tensor& x, torch::Tensor& cos,
+                               torch::Tensor& sin, bool interleaved);
+
+torch::Tensor apply_rotary_emb_meta(torch::Tensor& x, torch::Tensor& cos,
+                                    torch::Tensor& sin, bool interleaved);
+
+}  // namespace vllm_iluvatar
+```
+
+### 4.5 注册 schema 与 dispatch
+
+在 [`csrc/torch_bindings.cpp`](../../csrc/torch_bindings.cpp) 中完成**三件事**（比 community 多一个 Meta 注册）：
+
+1. `ops.def(...)` 声明自定义 schema
+2. `ops.impl(...)` 绑定 CUDA 实现
+3. `ops.impl(...)` 绑定 Meta impl
+
+```cpp
+TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
+  ops.def(
+      "apply_rotary_emb(Tensor x, Tensor cos, Tensor sin, bool interleaved) "
+      "-> Tensor");
+}
+
+TORCH_LIBRARY_IMPL_EXPAND(_C, CUDA, ops) {
+  ops.impl("apply_rotary_emb", &vllm_iluvatar::apply_rotary_emb);
+}
+
+TORCH_LIBRARY_IMPL_EXPAND(_C, Meta, ops) {
+  ops.impl("apply_rotary_emb", &vllm_iluvatar::apply_rotary_emb_meta);
+}
+```
+
+注意：**Meta impl 是 plugin 算子的必要条件**。没有它，torch.compile 和 opcheck 都会报错。community 算子的 Meta impl 由上游提供，这里不需要。
+
+### 4.6 编写 OOT override
+
+这是 plugin 算子与 community 算子最大的区别。社区代码不会自动调用 plugin 算子，必须通过 vLLM 的 CustomOp OOT 扩展点将调用接入。
+
+具体做法：在 `vllm_iluvatar/model_executor/layers/` 下对应模块中编写 `@<CustomOp>.register_oot` 子类，重写 `forward_cuda`。
+
+参考：[`vllm_iluvatar/model_executor/layers/rotary_embedding/common.py`](../../vllm_iluvatar/model_executor/layers/rotary_embedding/common.py)
+
+```python
+from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
+
+@ApplyRotaryEmb.register_oot
+class IluApplyRotaryEmb(ApplyRotaryEmb):
+    def forward_cuda(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        x, cos, sin, origin_shape, origin_dtype = self._pre_process(x, cos, sin)
+        interleaved = not self.is_neox_style
+        output = torch.ops._C.apply_rotary_emb(x, cos, sin, interleaved)
+        return self._post_process(output, origin_shape, origin_dtype)
+```
+
+编写要点：
+
+- **最大化复用社区逻辑**：只替换社区 `forward_cuda` 中无法在 Iluvatar 上运行的部分（本例是 flash-attn 的 `apply_rotary_emb` import），其余逻辑（`_pre_process` / `_post_process`）直接复用。
+- **标注删除条件**：在文件头部注释说明何时可以移除此 override（如"当社区 flash-attn rotary 在 Iluvatar 可用时"），便于后续清理。
+- **维护义务**：上游 `ApplyRotaryEmb` 接口变更时，此 override 需同步更新。
+
+### 4.7 构建
+
+与 community 算子相同，CMake `GLOB_RECURSE` 会自动发现 `csrc/plugin/` 下新增的源文件，**不需要手动改 CMake**。
+
+但 OOT override 的 Python 文件（如 `model_executor/layers/rotary_embedding/common.py`）需确保被插件的入口逻辑加载（通常通过 `vllm_iluvatar/ilu_register/` 中的自动导入机制完成）。
+
+### 4.8 测试
+
+**文件位置**：`tests/kernels/core/test_<op>.py`
+
+**两层测试策略**：
+
+- **裸算子级**：直接调用 `torch.ops._C.<op>`，与纯 torch 参考实现对比，验证内核数值正确性。
+- **模块级**：通过 OOT override 所在的 CustomOp 模块（如 `ApplyRotaryEmb`）进行端到端验证，确认 override → `_C` 内核的完整路径。
+
+plugin 算子没有上游同名测试可以对齐，需自行设计参考实现和覆盖范围。
+
+**注意事项**：构造 `CustomOp` 需要活跃的 `VllmConfig` 上下文，使用 [`tests/conftest.py`](../../tests/conftest.py) 中的 `default_vllm_config` fixture 即可。
 
 ---
 
-## 6. 附录
+## 5. 附录
 
 ### 关键文件清单
 
+**community 算子相关：**
+
 | 作用 | 所在仓库 | 文件 |
 | --- | --- | --- |
-| 调用我们算子的社区接口包装函数 | 上游 vllm | `vllm/_custom_ops.py` |
-| schema 来源（照抄用） | 上游 vllm | `csrc/libtorch_stable/torch_bindings.cpp` |
-| 内核实现（host + device） | vllm-iluvatar | [`csrc/pos_encoding_kernels.cu`](../../csrc/pos_encoding_kernels.cu) |
-| 函数声明 | vllm-iluvatar | [`csrc/ops.h`](../../csrc/ops.h) |
-| schema 定义 + impl 绑定 | vllm-iluvatar | [`csrc/torch_bindings.cpp`](../../csrc/torch_bindings.cpp) |
-| 构建（自动收集 `.cu`） | vllm-iluvatar | [`CMakeLists.txt`](../../CMakeLists.txt) |
-| Python override 清单（可选清理） | vllm-iluvatar | [`vllm_iluvatar/_custom_ops.py`](../../vllm_iluvatar/_custom_ops.py) |
-| 签名校验豁免集合（可选清理） | vllm-iluvatar | [`vllm_iluvatar/ilu_patch/patch_custom_ops.py`](../../vllm_iluvatar/ilu_patch/patch_custom_ops.py) |
-| 内核测试 | vllm-iluvatar | [`tests/kernels/core/test_pos_encoding.py`](../../tests/kernels/core/test_pos_encoding.py) |
-| 测试 fixture | vllm-iluvatar | [`tests/conftest.py`](../../tests/conftest.py) |
+| schema 来源 | 上游 vllm | `csrc/libtorch_stable/torch_bindings.cpp` |
+| 社区包装函数 | 上游 vllm | `vllm/_custom_ops.py` |
+| 内核实现（示例） | vllm-iluvatar | [`csrc/community/pos_encoding_kernels.cu`](../../csrc/community/pos_encoding_kernels.cu) |
+| 函数声明 | vllm-iluvatar | [`csrc/community/ops.h`](../../csrc/community/ops.h) |
+| 统一注册入口 | vllm-iluvatar | [`csrc/torch_bindings.cpp`](../../csrc/torch_bindings.cpp) |
+| 内核测试（示例） | vllm-iluvatar | [`tests/kernels/core/test_pos_encoding.py`](../../tests/kernels/core/test_pos_encoding.py) |
+
+**plugin 算子相关：**
+
+| 作用 | 所在仓库 | 文件 |
+| --- | --- | --- |
+| 内核实现 + Meta impl（示例） | vllm-iluvatar | [`csrc/plugin/apply_rotary_emb.cu`](../../csrc/plugin/apply_rotary_emb.cu) |
+| 函数声明 | vllm-iluvatar | [`csrc/plugin/ops.h`](../../csrc/plugin/ops.h) |
+| 统一注册入口 | vllm-iluvatar | [`csrc/torch_bindings.cpp`](../../csrc/torch_bindings.cpp) |
+| OOT override（示例） | vllm-iluvatar | [`vllm_iluvatar/model_executor/layers/rotary_embedding/common.py`](../../vllm_iluvatar/model_executor/layers/rotary_embedding/common.py) |
+| 内核测试（示例） | vllm-iluvatar | [`tests/kernels/core/test_apply_rotary_emb.py`](../../tests/kernels/core/test_apply_rotary_emb.py) |
+
+**共用：**
+
+| 作用 | 文件 |
+| --- | --- |
+| 构建 | [`CMakeLists.txt`](../../CMakeLists.txt) |
+| 注册宏 | [`csrc/core/registration.h`](../../csrc/core/registration.h) |
 
 ### 步骤速览
 
-1. 抄准上游 schema（`csrc/libtorch_stable/torch_bindings.cpp`）。
-2. 新增 `csrc/<op>_kernels.cu` 实现 host + device。
-3. 在 `csrc/ops.h` 声明函数。
-4. 在 `csrc/torch_bindings.cpp` 用 `ops.def` + `ops.impl`（选对 dispatch key）注册。
-5. 直接构建，`CONFIGURE_DEPENDS` 自动收新文件。
-6.（可选）替换已有 OOT 覆盖时，清理 `_custom_ops.py` / `base.py` / `_SKIP_SIGCHECK`。
-7. 加 `tests/kernels/core/test_<op>.py`，模块级 + 裸算子级两层测试。
+**community 算子**（上游有同名 op）：
 
-`rotary_embedding` 是一个已完整落地的参考实现，可直接对照上述文件学习。
+1. 照抄上游 schema（来源：`csrc/libtorch_stable/torch_bindings.cpp`）。
+2. 在 `csrc/community/` 新增 `.cu` / `.cpp` 实现。
+3. 在 `csrc/community/ops.h` 声明函数。
+4. 在 `csrc/torch_bindings.cpp` 注册 schema + CUDA dispatch。
+5. 构建（CMake 自动发现）。
+6. （可选）清理旧 OOT 覆盖。
+7. 添加 `tests/kernels/core/test_<op>.py`，模块级 + 裸算子级两层测试。
+
+**plugin 算子**（上游无同名 op）：
+
+1. 自行定义 schema。
+2. 在 `csrc/plugin/` 新增 `.cu` 实现（含 **Meta impl**）。
+3. 在 `csrc/plugin/ops.h` 声明函数（含 meta 声明）。
+4. 在 `csrc/torch_bindings.cpp` 注册 schema + CUDA dispatch + **Meta impl**。
+5. **编写 OOT override**（`@<CustomOp>.register_oot` 子类）。
+6. 构建（CMake 自动发现 C++ 文件；确保 OOT override Python 文件被加载）。
+7. 添加 `tests/kernels/core/test_<op>.py`，裸算子级 + OOT override 模块级两层测试。
+
+`rotary_embedding`（`csrc/community/`）和 `apply_rotary_emb`（`csrc/plugin/`）分别是两类算子的完整参考实现。

@@ -400,23 +400,35 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: IluFlashMLASparseMetadata,
     ) -> torch.Tensor:
+        """DSA sparse MLA via ixformer ``dsa_flash_mla_sparse_fwd`` (qk=576, v=512).
+
+        On ivcore11 the registry selects ``ixformer_native``.
+        """
         num_tokens = q.shape[0]
         topk_indices = self.topk_indices_buffer[:num_tokens]
-        # Per-request indices -> global paged slots.
-        topk_indices = triton_convert_req_index_to_global_index(
+        # Per-request indices -> global paged slots (+ per-token valid counts).
+        topk_indices, topk_length = triton_convert_req_index_to_global_index(
             attn_metadata.req_id_per_token,
             attn_metadata.block_table,
             topk_indices,
             BLOCK_SIZE=attn_metadata.block_size,
             NUM_TOPK_TOKENS=topk_indices.shape[1],
+            return_valid_counts=True,
         )
 
         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
             -1, 1, kv_c_and_k_pe_cache.shape[-1]
         )
         topk_indices = topk_indices.view(num_tokens, 1, -1)
-        return self.flash_mla_sparse_prefill(
-            q, kv_c_and_k_pe_cache, topk_indices, self.softmax_scale
+        # Sparse MLA returns latent V (kv_lora_rank=512); v_up_proj maps to
+        # v_head_dim afterwards. Do not pass self.v_head_dim (256 on GLM-5.2).
+        return ixf_ops.dsa_flash_mla_sparse_fwd(
+            q,
+            kv_c_and_k_pe_cache,
+            topk_indices,
+            self.softmax_scale,
+            d_v=self.kv_lora_rank,
+            topk_length=topk_length,
         )
 
     def forward(

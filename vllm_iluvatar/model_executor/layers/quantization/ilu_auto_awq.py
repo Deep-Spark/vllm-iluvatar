@@ -9,7 +9,7 @@ decorator at import time, so community ``vllm`` does not need method literal or
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Union
+from typing import TYPE_CHECKING, Any
 
 import ixformer.inference.functions as ixfops
 import torch
@@ -17,16 +17,16 @@ from torch.nn import Parameter
 from vllm import _custom_ops as ops
 from vllm import envs
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.config import (
-    FusedMoEConfig,
-    FusedMoEQuantConfig,
-)
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
     RoutedExperts,
     SharedExperts,
     UnquantizedFusedMoEMethod,
+)
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEConfig,
+    FusedMoEQuantConfig,
 )
 from vllm.model_executor.layers.linear import (
     LinearBase,
@@ -47,13 +47,16 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     check_marlin_supports_layer,
     check_moe_marlin_supports_layer,
     get_marlin_input_dtype,
-    marlin_make_workspace_new,
     verify_marlin_supported,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-from vllm.scalar_type import scalar_types
 from vllm.platforms import current_platform
+from vllm.scalar_type import scalar_types
+
+from vllm_iluvatar.model_executor.layers.fused_moe.ilu_decode_metadata import (
+    _is_only_decode,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -63,6 +66,66 @@ logger = init_logger(__name__)
 
 def _get_ilu_output_scale(layer: RoutedExperts) -> float:
     return getattr(layer, "_ilu_output_scale", 1.0)
+
+
+def _apply_decode_w4a16_awq(
+    *,
+    x: torch.Tensor,
+    layer: RoutedExperts,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    group_size: int,
+    num_tokens: int,
+    num_experts: int,
+) -> torch.Tensor:
+    """Decode-only AWQ MoE path using GEMV and avoiding D2H sync."""
+    expand_tokens = num_tokens * layer.top_k
+    (
+        src_to_dst,
+        sorted_token_ids,
+        expert_sizes_gpu,
+    ) = ixfops.moe_compute_token_index_for_decode(
+        topk_ids=topk_ids,
+        num_experts=num_experts,
+    )
+    expand_hidden_states = ixfops.moe_expand_input(
+        hidden_states=x,
+        dst_to_src=sorted_token_ids,
+        dst_tokens=expand_tokens,
+        topk=layer.top_k,
+        src_to_dst=src_to_dst,
+    )
+    pt_output_1 = ixfops.moe_w4a16_group_gemv(
+        input=expand_hidden_states,
+        weight=layer.w13_qweight,
+        w_scales=layer.w13_scales,
+        quant_type="awq",
+        w_zeros=layer.w13_qzeros,
+        group_size=group_size,
+        dst_to_src=None,
+        format="NN",
+        tokens_per_experts_gpu=expert_sizes_gpu,
+    )
+    pt_output_2 = ixfops.silu_and_mul(pt_output_1)
+    pt_output_3 = ixfops.moe_w4a16_group_gemv(
+        input=pt_output_2,
+        weight=layer.w2_qweight,
+        w_scales=layer.w2_scales,
+        quant_type="awq",
+        w_zeros=layer.w2_qzeros,
+        group_size=group_size,
+        dst_to_src=sorted_token_ids,
+        format="NN",
+        tokens_per_experts_gpu=expert_sizes_gpu,
+    )
+    return ixfops.moe_output_reduce_sum(
+        input=pt_output_3.view(num_tokens, layer.top_k, -1),
+        topk_weight=topk_weights,
+        scaling_factor=_get_ilu_output_scale(layer),
+        extra_residual=shared_experts_input,
+    )
+
 
 @register_quantization_config("auto_awq")
 @register_quantization_config("awq")
@@ -74,6 +137,7 @@ class IluAutoAWQConfig(AutoAWQConfig):
     ``awq_marlin`` keep their upstream behavior unless a checkpoint or user
     explicitly asks for the ``ilu_*`` methods.
     """
+
     def __repr__(self) -> str:
         return (
             f"IluAutoAWQConfig(quant_type={self.quant_type}, "
@@ -84,11 +148,11 @@ class IluAutoAWQConfig(AutoAWQConfig):
         )
 
     @classmethod
-    def get_name(cls) -> "QuantizationMethods":
+    def get_name(cls) -> QuantizationMethods:
         return "auto_awq"
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "IluAutoAWQConfig":
+    def from_config(cls, config: dict[str, Any]) -> IluAutoAWQConfig:
         weight_bits = cls.get_from_keys(config, ["w_bit", "bits"])
         group_size = cls.get_from_keys(config, ["q_group_size", "group_size"])
         zero_point = cls.get_from_keys(config, ["zero_point"])
@@ -115,7 +179,7 @@ class IluAutoAWQConfig(AutoAWQConfig):
         self,
         layer: torch.nn.Module,
         prefix: str,
-    ) -> Union["LinearMethodBase", "QuantizeMethodBase"] | None:
+    ) -> LinearMethodBase | QuantizeMethodBase | None:
         if isinstance(layer, LinearBase) or (
             isinstance(layer, ParallelLMHead) and self.lm_head_quantized
         ):
@@ -192,10 +256,10 @@ class IluAWQMarlinLinearMethod(BaseAWQLinearMethod):
         self.quant_type = scalar_types.uint4
         self.input_dtype = None
         verify_marlin_supported(
-                quant_type=self.quant_config.quant_type,
-                group_size=self.quant_config.group_size,
-                has_zp=self.quant_config.zero_point,
-            )
+            quant_type=self.quant_config.quant_type,
+            group_size=self.quant_config.group_size,
+            has_zp=self.quant_config.zero_point,
+        )
 
     def create_weights(
         self,
@@ -439,21 +503,8 @@ class IluAutoAWQMoEMethod(FusedMoEMethodBase):
             attn_metadata = get_forward_context().attn_metadata
         except AssertionError:
             attn_metadata = None
-
-        if attn_metadata:
-            if isinstance(attn_metadata, dict):
-                only_decode = not use_ep and all(
-                    t.num_decodes > 0 and t.num_prefills == 0
-                    for t in attn_metadata.values()
-                )
-            else:
-                only_decode = (
-                    not use_ep
-                    and attn_metadata.num_decodes > 0
-                    and attn_metadata.num_prefills == 0
-                )
-        else:
-            only_decode = False
+        # unsupported ep now
+        only_decode = not use_ep and _is_only_decode(attn_metadata)
 
         if use_ep:
             start_eid = layer.ep_rank * layer.local_num_experts
@@ -470,6 +521,20 @@ class IluAutoAWQMoEMethod(FusedMoEMethodBase):
 
         num_tokens = topk_ids.shape[0]
         num_experts = layer.global_num_experts
+
+        # Decode-optimized path (CG-safe).
+        if only_decode:
+            return _apply_decode_w4a16_awq(
+                x=x,
+                layer=layer,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                shared_experts_input=shared_experts_input,
+                group_size=self.quant_config.group_size,
+                num_tokens=num_tokens,
+                num_experts=num_experts,
+            )
+        # ---- General / EP path ----
         if use_ep:
             hidden_size = x.shape[1]
             (
@@ -509,38 +574,6 @@ class IluAutoAWQMoEMethod(FusedMoEMethodBase):
             topk=layer.top_k,
             src_to_dst=src_to_dst,
         )
-
-        if only_decode:
-            pt_output_1 = ixfops.moe_w4a16_group_gemv(
-                input=expand_hidden_states,
-                weight=layer.w13_qweight,
-                w_scales=layer.w13_scales,
-                quant_type="awq",
-                w_zeros=layer.w13_qzeros,
-                group_size=self.quant_config.group_size,
-                dst_to_src=None,
-                format="NN",
-                tokens_per_experts_gpu=expert_sizes_gpu,
-            )
-            pt_output_2 = ixfops.silu_and_mul(pt_output_1)
-
-            pt_output_3 = ixfops.moe_w4a16_group_gemv(
-                input=pt_output_2,
-                weight=layer.w2_qweight,
-                w_scales=layer.w2_scales,
-                quant_type="awq",
-                w_zeros=layer.w2_qzeros,
-                group_size=self.quant_config.group_size,
-                dst_to_src=sorted_token_ids,
-                format="NN",
-                tokens_per_experts_gpu=expert_sizes_gpu,
-            )
-            return ixfops.moe_output_reduce_sum(
-                input=pt_output_3.view(num_tokens, layer.top_k, -1),
-                topk_weight=topk_weights,
-                scaling_factor=_get_ilu_output_scale(layer),
-                extra_residual=shared_experts_input,
-            )
 
         expert_sizes_cpu = expert_sizes_gpu.cpu()
         pt_output_1 = ixfops.moe_w4a16_group_gemm(

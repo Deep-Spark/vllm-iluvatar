@@ -11,7 +11,6 @@ from compressed_tensors.quantization import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
 from vllm.model_executor.layers.fused_moe import (
     FusedMoeWeightScaleSupported,
     RoutedExperts,
@@ -34,6 +33,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 
+from vllm_iluvatar.model_executor.layers.fused_moe.ilu_decode_metadata import (
+    _is_only_decode,
+)
+
 logger = init_logger(__name__)
 
 
@@ -41,10 +44,89 @@ def _get_ilu_output_scale(layer: RoutedExperts) -> float:
     return getattr(layer, "_ilu_output_scale", 1.0)
 
 
-def _is_supported_decode_metadata(value) -> bool:
-    """Accept community metadata plus Iluvatar fork metadata by class name."""
-    return isinstance(value, MLACommonMetadata) or (
-        value.__class__.__name__ == "IluFlashAttentionMetadata"
+def _pad_last_dim(input: torch.Tensor, target_dim: int) -> torch.Tensor:
+    if input.shape[-1] == target_dim:
+        return input
+    padding = target_dim - input.shape[-1]
+    return torch.nn.functional.pad(input, (0, padding), mode="constant", value=0)
+
+
+def _apply_decode_w8a8_int8_nn(
+    *,
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    src_to_dst: torch.Tensor,
+    expert_sizes_gpu: torch.Tensor,
+    expand_tokens: int,
+    shared_experts_input: torch.Tensor | None,
+    dtype: torch.dtype,
+    group_size: int,
+    num_tokens: int,
+) -> torch.Tensor:
+    """Decode-only W8A8 NN path using GEMV and avoiding D2H sync."""
+    i8_hidden_states, a_scale = ixfops.moe_expand_input_dynamic_scaled_int8(
+        hidden_states=x,
+        dst_to_src=sorted_token_ids,
+        dst_tokens=expand_tokens,
+        topk=layer.top_k,
+        src_to_dst=src_to_dst,
+        topk_ids=None,
+        smooth_scales=layer.w13_input_scale,
+    )
+
+    i8_hidden_states = _pad_last_dim(i8_hidden_states, layer.w13_weight.shape[-2])
+    pt_output_1 = ixfops.moe_w8a8_group_gemv(
+        input=i8_hidden_states,
+        weight=layer.w13_weight,
+        i_scales=a_scale,
+        w_scales=layer.w13_weight_scale,
+        output_dtype=dtype,
+        tokens_per_experts=expert_sizes_gpu,
+        dst_to_src=None,
+        bias=layer.w13_bias,
+        format=0,
+        group_size=group_size,
+    )
+
+    if layer.activation.value == "swigluoai":
+        pt_output_2, a2_scale = ixfops.activation_swigluoai_dynamic_scaled_int8(
+            input=pt_output_1,
+            bias=None,
+            smooth_scales=layer.w2_input_scale,
+            dst_to_src=sorted_token_ids,
+            topk_ids=None,
+        )
+    else:
+        pt_output_2, a2_scale = ixfops.activation_dynamic_scaled_int8(
+            input=pt_output_1,
+            bias=None,
+            smooth_scales=layer.w2_input_scale,
+            dst_to_src=sorted_token_ids,
+            topk_ids=None,
+            act_type="swiglu",
+        )
+
+    pt_output_2 = _pad_last_dim(pt_output_2, layer.w2_weight.shape[-2])
+    pt_output_3 = ixfops.moe_w8a8_group_gemv(
+        input=pt_output_2,
+        weight=layer.w2_weight,
+        i_scales=a2_scale,
+        w_scales=layer.w2_weight_scale,
+        output_dtype=dtype,
+        tokens_per_experts=expert_sizes_gpu,
+        dst_to_src=sorted_token_ids,
+        bias=layer.w2_bias,
+        format=0,
+        group_size=group_size,
+    )
+
+    return ixfops.moe_output_reduce_sum(
+        input=pt_output_3.view(num_tokens, layer.top_k, -1),
+        topk_weight=topk_weights,
+        scaling_factor=_get_ilu_output_scale(layer),
+        extra_residual=shared_experts_input,
     )
 
 
@@ -275,35 +357,7 @@ class IluCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
         attn_metadata = get_forward_context().attn_metadata
         use_ep = layer.expert_map is not None
         # unsupported ep now
-        if attn_metadata:
-            deepseek_instance = None
-            for value in attn_metadata.values():
-                if (
-                    _is_supported_decode_metadata(value)
-                    and hasattr(value, "num_prefills")
-                    and hasattr(value, "num_decodes")
-                ):
-                    deepseek_instance = value
-                    break
-            value_types = {type(value).__name__ for value in attn_metadata.values()}
-            is_same_class = len(value_types) == 1
-            if is_same_class:
-                assert deepseek_instance
-                only_decode = not use_ep and all(
-                    t.num_decodes > 0 and t.num_prefills == 0
-                    for t in list(attn_metadata.values())
-                )
-            else:
-                if deepseek_instance:
-                    only_decode = (
-                        not use_ep
-                        and deepseek_instance.num_decodes > 0
-                        and deepseek_instance.num_prefills == 0
-                    )
-                else:
-                    only_decode = False
-        else:
-            only_decode = False
+        only_decode = not use_ep and _is_only_decode(attn_metadata)
 
         if use_ep:
             ep_rank = layer.moe_config.ep_rank
@@ -349,85 +403,18 @@ class IluCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
             )
 
         if only_decode and self.gemm_format == "NN":
-            # expand + reorder + quant
-            i8_hidden_states, a_scale = ixfops.moe_expand_input_dynamic_scaled_int8(
-                hidden_states=x,
-                dst_to_src=sorted_token_ids,
-                dst_tokens=expand_tokens,
-                topk=layer.top_k,
+            final_hidden_states = _apply_decode_w8a8_int8_nn(
+                layer=layer,
+                x=x,
+                topk_weights=topk_weights,
+                sorted_token_ids=sorted_token_ids,
                 src_to_dst=src_to_dst,
-                topk_ids=None,
-                smooth_scales=layer.w13_input_scale,
-            )
-
-            if i8_hidden_states.shape[-1] != layer.w13_weight.shape[-2]:
-                padding = layer.w13_weight.shape[-2] - i8_hidden_states.shape[-1]
-                i8_hidden_states_align = torch.nn.functional.pad(
-                    i8_hidden_states, (0, padding), mode="constant", value=0
-                )
-            else:
-                i8_hidden_states_align = i8_hidden_states
-
-            # w8a8 group gemm 1
-            pt_output_1 = ixfops.moe_w8a8_group_gemv(
-                input=i8_hidden_states_align,
-                weight=layer.w13_weight,
-                i_scales=a_scale,
-                w_scales=layer.w13_weight_scale,
-                output_dtype=dtype,
-                tokens_per_experts=expert_sizes_gpu,
-                dst_to_src=None,
-                bias=layer.w13_bias,
-                format=0,
+                expert_sizes_gpu=expert_sizes_gpu,
+                expand_tokens=expand_tokens,
+                shared_experts_input=shared_experts_input,
+                dtype=dtype,
                 group_size=self.group_size,
-            )
-
-            # act + quant
-            if layer.activation.value == "swigluoai":
-                pt_output_2, a2_scale = ixfops.activation_swigluoai_dynamic_scaled_int8(
-                    input=pt_output_1,
-                    bias=None,
-                    smooth_scales=layer.w2_input_scale,
-                    dst_to_src=sorted_token_ids,
-                    topk_ids=None,
-                )
-            else:
-                pt_output_2, a2_scale = ixfops.activation_dynamic_scaled_int8(
-                    input=pt_output_1,
-                    bias=None,
-                    smooth_scales=layer.w2_input_scale,
-                    dst_to_src=sorted_token_ids,
-                    topk_ids=None,
-                    act_type="swiglu",
-                )
-
-            if pt_output_2.shape[-1] != layer.w2_weight.shape[-2]:
-                padding = layer.w2_weight.shape[-2] - pt_output_2.shape[-1]
-                pt_output_2_align = torch.nn.functional.pad(
-                    pt_output_2, (0, padding), mode="constant", value=0
-                )
-            else:
-                pt_output_2_align = pt_output_2
-
-            # w8a8 group gemm 2 + reorder
-            pt_output_3 = ixfops.moe_w8a8_group_gemv(
-                input=pt_output_2_align,
-                weight=layer.w2_weight,
-                i_scales=a2_scale,
-                w_scales=layer.w2_weight_scale,
-                output_dtype=dtype,
-                tokens_per_experts=expert_sizes_gpu,
-                dst_to_src=sorted_token_ids,
-                bias=layer.w2_bias,
-                format=0,
-                group_size=self.group_size,
-            )
-
-            final_hidden_states = ixfops.moe_output_reduce_sum(
-                input=pt_output_3.view(num_tokens, layer.top_k, -1),
-                topk_weight=topk_weights,
-                scaling_factor=_get_ilu_output_scale(layer),
-                extra_residual=shared_experts_input,
+                num_tokens=num_tokens,
             )
         else:
             expert_sizes_cpu = expert_sizes_gpu.cpu()

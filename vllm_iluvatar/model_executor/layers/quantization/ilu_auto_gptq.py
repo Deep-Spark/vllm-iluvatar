@@ -8,15 +8,12 @@ the official ``@register_quantization_config`` decorator.
 
 from copy import deepcopy
 
+import ixformer.inference.functions as ixfops
 import torch
-from vllm import _custom_ops as ops
-
 import vllm.model_executor.layers.fused_moe  # noqa
+from vllm import _custom_ops as ops
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
-from vllm_iluvatar.model_executor.kernels.linear import (
-    MPLinearLayerConfig,
-    choose_mp_linear_kernel,
-)
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
     FusedMoEMethodBase,
@@ -26,13 +23,12 @@ from vllm.model_executor.layers.fused_moe import (
     SharedExperts,
     UnquantizedFusedMoEMethod,
 )
-
 from vllm.model_executor.layers.linear import LinearMethodBase, set_weight_attrs
 from vllm.model_executor.layers.quantization import (
     register_quantization_config,
 )
-from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization.utils.gptq_utils import (
     get_dynamic_override,
@@ -53,9 +49,14 @@ from vllm.model_executor.parameter import (
     RowvLLMParameter,
 )
 from vllm.scalar_type import scalar_types
-from vllm.forward_context import get_forward_context
 
-import ixformer.inference.functions as ixfops
+from vllm_iluvatar.model_executor.kernels.linear import (
+    MPLinearLayerConfig,
+    choose_mp_linear_kernel,
+)
+from vllm_iluvatar.model_executor.layers.fused_moe.ilu_decode_metadata import (
+    _is_only_decode,
+)
 
 logger = init_logger(__name__)
 
@@ -64,9 +65,56 @@ def _get_ilu_output_scale(layer: RoutedExperts) -> float:
     return getattr(layer, "_ilu_output_scale", 1.0)
 
 
-#[B,K//8,N] ->[B,K,N]
+def _apply_decode_w4a16_gptq(
+    *,
+    expand_hidden_states: torch.Tensor,
+    layer: RoutedExperts,
+    topk_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_sizes_gpu: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    group_size: int,
+    num_tokens: int,
+) -> torch.Tensor:
+    """Decode-only GPTQ MoE path using GEMV and avoiding D2H sync."""
+    pt_output_1 = ixfops.moe_w4a16_group_gemv(
+        input=expand_hidden_states,
+        weight=layer.w13_qweight,
+        w_scales=layer.w13_scales,
+        quant_type="awq",
+        w_zeros=layer.w13_qzeros,
+        group_size=group_size,
+        dst_to_src=None,
+        format="NN",
+        tokens_per_experts_gpu=expert_sizes_gpu,
+    )
+    pt_output_2 = ixfops.silu_and_mul(pt_output_1)
+
+    pt_output_3 = ixfops.moe_w4a16_group_gemv(
+        input=pt_output_2,
+        weight=layer.w2_qweight,
+        w_scales=layer.w2_scales,
+        quant_type="awq",
+        w_zeros=layer.w2_qzeros,
+        group_size=group_size,
+        dst_to_src=sorted_token_ids,
+        format="NN",
+        tokens_per_experts_gpu=expert_sizes_gpu,
+    )
+
+    return ixfops.moe_output_reduce_sum(
+        input=pt_output_3.view(num_tokens, layer.top_k, -1),
+        topk_weight=topk_weights,
+        scaling_factor=_get_ilu_output_scale(layer),
+        extra_residual=shared_experts_input,
+    )
+
+
+# [B,K//8,N] ->[B,K,N]
 # less memmory
-def unpack_k_batch_opt(packed_w: torch.Tensor, num_bits: int = 4, chunk_size: int = 2) -> torch.Tensor:
+def unpack_k_batch_opt(
+    packed_w: torch.Tensor, num_bits: int = 4, chunk_size: int = 2
+) -> torch.Tensor:
     """
     Memory-efficient unpacking for 3D tensor.
     Converts [B, K // pack_factor, N] int32 tensor → [B, K, N] int8 tensor,
@@ -91,7 +139,9 @@ def unpack_k_batch_opt(packed_w: torch.Tensor, num_bits: int = 4, chunk_size: in
     # Process bit chunks iteratively to save memory
     for i in range(0, pack_factor, chunk_size):
         # Precompute shifts for this chunk
-        shift_vals = num_bits * torch.arange(i, min(i + chunk_size, pack_factor), device=packed_w.device)
+        shift_vals = num_bits * torch.arange(
+            i, min(i + chunk_size, pack_factor), device=packed_w.device
+        )
         # [chunk_size, 1, 1, 1]
         shifts = shift_vals.view(-1, 1, 1, 1)
         # Compute small chunk only
@@ -100,11 +150,12 @@ def unpack_k_batch_opt(packed_w: torch.Tensor, num_bits: int = 4, chunk_size: in
         # chunk: [chunk_size, B, k_packed, N]
         # write into output
         for j in range(chunk.shape[0]):
-            unpacked[:, (i + j)::pack_factor, :] = chunk[j]
+            unpacked[:, (i + j) :: pack_factor, :] = chunk[j]
 
         del chunk  # release memory early
 
     return unpacked
+
 
 # more memmory
 def unpack_k_batch(packed_w: torch.Tensor, num_bits: int = 4) -> torch.Tensor:
@@ -126,7 +177,9 @@ def unpack_k_batch(packed_w: torch.Tensor, num_bits: int = 4) -> torch.Tensor:
     mask = (1 << num_bits) - 1
 
     # [pack_factor, 1, 1, 1]
-    shifts = (num_bits * torch.arange(pack_factor, device=packed_w.device)).view(-1, 1, 1, 1)
+    shifts = (num_bits * torch.arange(pack_factor, device=packed_w.device)).view(
+        -1, 1, 1, 1
+    )
 
     # [1, B, k_packed, N]
     packed_expanded = packed_w.unsqueeze(0)
@@ -140,9 +193,11 @@ def unpack_k_batch(packed_w: torch.Tensor, num_bits: int = 4) -> torch.Tensor:
     return unpacked
 
 
-#[B,K,N] ->[B,K,N//8]
+# [B,K,N] ->[B,K,N//8]
 # less memmory
-def pack_n_batch_opt(x: torch.Tensor, pack_num: int = 8, order_map=None, chunk_size: int = 2) -> torch.Tensor:
+def pack_n_batch_opt(
+    x: torch.Tensor, pack_num: int = 8, order_map=None, chunk_size: int = 2
+) -> torch.Tensor:
     """
     Memory-efficient batch packing with correct bit order.
     [B, K, N] int4 -> [B, K, N//pack_num] int32.
@@ -156,7 +211,9 @@ def pack_n_batch_opt(x: torch.Tensor, pack_num: int = 8, order_map=None, chunk_s
         order_map = list(range(pack_num))
     order_map = torch.tensor(order_map, device=x.device)
 
-    shifts = unit * torch.arange(pack_num, device=x.device)  # always 0..unit*(pack_num-1)
+    shifts = unit * torch.arange(
+        pack_num, device=x.device
+    )  # always 0..unit*(pack_num-1)
     packed = torch.zeros((B, K, cols), dtype=torch.int32, device=x.device)
     x_reshape = x.view(B, K, cols, pack_num) & 0xF
 
@@ -166,11 +223,15 @@ def pack_n_batch_opt(x: torch.Tensor, pack_num: int = 8, order_map=None, chunk_s
         idx_chunk = order_map[start:end]
         shift_chunk = shifts[start:end]
 
-        vals = torch.gather(x_reshape, 3, idx_chunk.view(1,1,1,-1).expand(B,K,cols,-1)).to(torch.int32)
+        vals = torch.gather(
+            x_reshape, 3, idx_chunk.view(1, 1, 1, -1).expand(B, K, cols, -1)
+        ).to(torch.int32)
         for j in range(vals.shape[-1]):
             packed.add_(vals[..., j] << shift_chunk[j])
 
     return packed
+
+
 ## more memmory
 def pack_n_batch(x: torch.Tensor, pack_num: int = 8, order_map=None) -> torch.Tensor:
     """
@@ -184,7 +245,7 @@ def pack_n_batch(x: torch.Tensor, pack_num: int = 8, order_map=None) -> torch.Te
     Returns:
         torch.int32 tensor of shape [B, K, N//pack_num].
     """
-    
+
     B, K, N = x.shape
     assert N % pack_num == 0, "N must be divisible by pack_num"
     cols = N // pack_num
@@ -216,6 +277,7 @@ def pack_n_batch(x: torch.Tensor, pack_num: int = 8, order_map=None) -> torch.Te
 
     return packed
 
+
 def get_moe_quant_method(
     config: "IluAutoGPTQConfig",
     layer: RoutedExperts,
@@ -240,7 +302,6 @@ def get_moe_quant_method(
         override_config(cloned_config, prefix=prefix)
 
     return moe_method_cls(cloned_config, layer.moe_config)
-
 
 
 @register_quantization_config("auto_gptq")
@@ -462,7 +523,7 @@ class IluAutoGPTQMoEMethod(FusedMoEMethodBase):
         super().__init__(moe)
         self.quant_config = quant_config
         if self.quant_config.quant_type.size_bits != 4:
-            raise ValueError("IluAutoGPTQMoEMethod only supports int4 now.")   
+            raise ValueError("IluAutoGPTQMoEMethod only supports int4 now.")
         self.quant_type = scalar_types.uint4
         self.input_dtype = None
         self.use_marlin = True
@@ -633,27 +694,41 @@ class IluAutoGPTQMoEMethod(FusedMoEMethodBase):
             layer.w13_scales.data = layer.w13_scales.data * 512
             layer.w2_scales.data = layer.w2_scales.data * 512
 
-        
         if self.quant_config.desc_act:
             raise NotImplementedError(
-                "GPTQMarlinMoEMethod now not support  desc_act. please fix it")   
+                "GPTQMarlinMoEMethod now not support  desc_act. please fix it"
+            )
         w13_qweight_unpacked = unpack_k_batch(layer.w13_qweight)
-        w13_qweight_repacked = pack_n_batch(w13_qweight_unpacked,self.quant_config.pack_factor,order_map=[0, 2, 4, 6, 1, 3, 5, 7])
+        w13_qweight_repacked = pack_n_batch(
+            w13_qweight_unpacked,
+            self.quant_config.pack_factor,
+            order_map=[0, 2, 4, 6, 1, 3, 5, 7],
+        )
         replace_parameter(layer, "w13_qweight", w13_qweight_repacked)
-        
-        w13_zp = torch.full_like(layer.w13_scales, self.quant_config.quant_type.bias, dtype=torch.int32)
-        w13_zp_pack = pack_n_batch(w13_zp, self.quant_config.pack_factor, order_map=[0, 2, 4, 6, 1, 3, 5, 7]).contiguous()
-        replace_parameter(layer, "w13_qzeros", w13_zp_pack)
-        
-        w2_qweight_unpacked = unpack_k_batch(layer.w2_qweight)
-        w2_qweight_repacked = pack_n_batch(w2_qweight_unpacked,self.quant_config.pack_factor,order_map=[0, 2, 4, 6, 1, 3, 5, 7])
-        replace_parameter(layer, "w2_qweight", w2_qweight_repacked)
-        
-        w2_zp = torch.full_like(layer.w2_scales, self.quant_config.quant_type.bias, dtype=torch.int32)
-        w2_zp_pack = pack_n_batch(w2_zp, self.quant_config.pack_factor, order_map=[0, 2, 4, 6, 1, 3, 5, 7]).contiguous()
-        replace_parameter(layer, "w2_qzeros", w2_zp_pack)
 
-    
+        w13_zp = torch.full_like(
+            layer.w13_scales, self.quant_config.quant_type.bias, dtype=torch.int32
+        )
+        w13_zp_pack = pack_n_batch(
+            w13_zp, self.quant_config.pack_factor, order_map=[0, 2, 4, 6, 1, 3, 5, 7]
+        ).contiguous()
+        replace_parameter(layer, "w13_qzeros", w13_zp_pack)
+
+        w2_qweight_unpacked = unpack_k_batch(layer.w2_qweight)
+        w2_qweight_repacked = pack_n_batch(
+            w2_qweight_unpacked,
+            self.quant_config.pack_factor,
+            order_map=[0, 2, 4, 6, 1, 3, 5, 7],
+        )
+        replace_parameter(layer, "w2_qweight", w2_qweight_repacked)
+
+        w2_zp = torch.full_like(
+            layer.w2_scales, self.quant_config.quant_type.bias, dtype=torch.int32
+        )
+        w2_zp_pack = pack_n_batch(
+            w2_zp, self.quant_config.pack_factor, order_map=[0, 2, 4, 6, 1, 3, 5, 7]
+        ).contiguous()
+        replace_parameter(layer, "w2_qzeros", w2_zp_pack)
 
     def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:
         from vllm.model_executor.layers.fused_moe.config import (
@@ -697,21 +772,20 @@ class IluAutoGPTQMoEMethod(FusedMoEMethodBase):
         assert layer.activation.value == "silu", "Only SiLU activation is supported."
         use_ep = layer.expert_map is not None
         attn_metadata = get_forward_context().attn_metadata
-        if attn_metadata:
-            if isinstance(attn_metadata, dict):
-                only_decode = (use_ep == False and all(t.num_decodes > 0 and t.num_prefills ==0 for t in list(attn_metadata.values())))
-            else:
-                only_decode = use_ep == False and attn_metadata.num_decodes > 0 and attn_metadata.num_prefills == 0
-        else:
-            only_decode = False
+        # unsupported ep now
+        only_decode = not use_ep and _is_only_decode(attn_metadata)
         if use_ep:
             start_eid = layer.ep_rank * layer.local_num_experts
-            end_eid = min((layer.ep_rank + 1) * layer.local_num_experts, layer.global_num_experts)
+            end_eid = min(
+                (layer.ep_rank + 1) * layer.local_num_experts,
+                layer.global_num_experts,
+            )
         if layer.apply_router_weight_on_input:
             raise NotImplementedError(
-                "Apply router weight on input is not supported for"
-                "fused Marlin MoE method.")
-       
+                "Apply router weight on input is not supported for "
+                "fused Marlin MoE method."
+            )
+
         num_tokens = topk_ids.shape[0]
         num_experts = layer.global_num_experts
         if use_ep:
@@ -756,38 +830,15 @@ class IluAutoGPTQMoEMethod(FusedMoEMethodBase):
             src_to_dst=src_to_dst,
         )
         if only_decode:
-            pt_output_1 = ixfops.moe_w4a16_group_gemv(
-                input=expand_hidden_states,
-                weight=layer.w13_qweight,
-                w_scales=layer.w13_scales,
-                quant_type="awq",
-                w_zeros=layer.w13_qzeros,
+            final_hidden_states = _apply_decode_w4a16_gptq(
+                expand_hidden_states=expand_hidden_states,
+                layer=layer,
+                topk_weights=topk_weights,
+                sorted_token_ids=sorted_token_ids,
+                expert_sizes_gpu=expert_sizes_gpu,
+                shared_experts_input=shared_experts_input,
                 group_size=self.quant_config.group_size,
-                dst_to_src=None,
-                format="NN",
-                tokens_per_experts_gpu=expert_sizes_gpu,
-            )
-            pt_output_2 = ixfops.silu_and_mul(pt_output_1)
-
-            pt_output_3 = ixfops.moe_w4a16_group_gemv(
-                    input=pt_output_2,
-                    weight=layer.w2_qweight,
-                    w_scales=layer.w2_scales,
-                    quant_type="awq",
-                    w_zeros=layer.w2_qzeros,
-                    group_size=self.quant_config.group_size,
-                    dst_to_src=sorted_token_ids,
-                    format="NN",
-                    tokens_per_experts_gpu=expert_sizes_gpu,
-                )
-
-                # mul + reduce_sum
-                # final_hidden_states: (num_tokens, k)
-            final_hidden_states = ixfops.moe_output_reduce_sum(
-                input=pt_output_3.view(num_tokens, layer.top_k, -1),
-                topk_weight=topk_weights,
-                scaling_factor=_get_ilu_output_scale(layer),
-                extra_residual=shared_experts_input,
+                num_tokens=num_tokens,
             )
         else:
             expert_sizes_cpu = expert_sizes_gpu.cpu()

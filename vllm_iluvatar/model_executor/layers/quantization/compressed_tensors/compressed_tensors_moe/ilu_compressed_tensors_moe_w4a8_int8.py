@@ -20,12 +20,17 @@ from compressed_tensors.quantization import (
     QuantizationArgs,
     QuantizationStrategy,
 )
+from vllm.config import CUDAGraphMode
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoeWeightScaleSupported,
     RoutedExperts,
     SharedExperts,
+    FusedMoeWeightScaleSupported,
+    FusedMoEPrepareAndFinalizeModular,
+    FusedMoEExpertsModular,
+    FusedMoEActivationFormat,
 )
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -51,6 +56,32 @@ logger = init_logger(__name__)
 
 def _get_ilu_output_scale(layer: RoutedExperts) -> float:
     return getattr(layer, "_ilu_output_scale", 1.0)
+
+
+def int4_w4a8_moe_quant_config(
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
+    w1_zp: torch.Tensor | None = None,
+    w2_zp: torch.Tensor | None = None,
+    g1_alphas: torch.Tensor | None = None,
+    g2_alphas: torch.Tensor | None = None,
+) -> FusedMoEQuantConfig:
+    """Construct the modular MoE quant config for INT8 activations + INT4 weights."""
+    return FusedMoEQuantConfig.make(
+        torch.int8,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_bias=w1_bias,
+        w2_bias=w2_bias,
+        w1_zp=w1_zp,
+        w2_zp=w2_zp,
+        g1_alphas=g1_alphas,
+        g2_alphas=g2_alphas,
+        per_act_token_quant=True,
+        weight_dtype="int4",
+    )
 
 
 class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
@@ -491,7 +522,16 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
-        return None
+        return int4_w4a8_moe_quant_config(
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            g1_alphas=layer.w13_i8_weight_scale,
+            g2_alphas=layer.w2_i8_weight_scale,
+            w1_zp=layer.w13_i8_weight_zero,
+            w2_zp=layer.w2_i8_weight_zero,
+            w1_bias=layer.w13_bias,
+            w2_bias=layer.w2_bias,
+        )
 
     def apply(
         self,
@@ -502,7 +542,14 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        attn_metadata = get_forward_context().attn_metadata
+        shared_experts_input = self._valid_extra_residual(
+            x=x,
+            shared_experts_input=shared_experts_input,
+        )
+        if shared_experts_input is None:
+            shared_experts = None
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
         use_ep = layer.expert_map is not None
         only_decode = _is_only_decode(attn_metadata)
 
@@ -892,6 +939,58 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             output = pad_tensor(output, self.gemm1_info.pad_k)
 
         return output, scale
+
+    def select_gemm_impl(
+        self,
+        prepare_finalize: FusedMoEPrepareAndFinalizeModular,
+        layer: torch.nn.Module,
+    ) -> FusedMoEExpertsModular:
+        experts_kwargs = dict(
+            moe_config=self.moe,
+            quant_config=self.moe_quant_config,
+            quant_mode="w4a8",
+            gemm1_info=self.gemm1_info,
+            gemm2_info=self.gemm2_info,
+            w13_input_scale=layer.w13_input_scale,
+            w2_input_scale=layer.w2_input_scale,
+            runner_scaling_factor=_get_ilu_output_scale(layer),
+            format=self.gemm1_info.format_str,
+            version=self.version,
+            group_size=self.group_size,
+            swiglu_limit=getattr(layer, "swiglu_limit", None),
+            max_num_tokens=prepare_finalize.max_num_tokens_per_rank(),
+            num_dispatchers=prepare_finalize.num_dispatchers(),
+        )
+
+        if (
+            prepare_finalize.activation_format
+            == FusedMoEActivationFormat.BatchedExperts
+        ):
+            from .ilu_moe_batch_experts_w4a8 import IluMoEBatchedExpertsW4A8
+
+            return IluMoEBatchedExpertsW4A8(**experts_kwargs)
+
+        if prepare_finalize.activation_format == FusedMoEActivationFormat.Standard:
+            from .ilu_moe_standard_experts_w4a8 import IluMoEStandardExpertsW4A8
+
+            return IluMoEStandardExpertsW4A8(**experts_kwargs)
+
+        raise NotImplementedError(
+            f"Unsupported activation format: {prepare_finalize.activation_format}"
+        )
+
+    @staticmethod
+    def _valid_extra_residual(
+        x: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if shared_experts_input is None:
+            return None
+        if shared_experts_input.shape[0] == x.shape[0]:
+            return shared_experts_input
+        # Naive DP/EP gathers routed inputs across DP ranks before the W4A8
+        # kernel, while shared experts are still combined separately per rank.
+        return None
 
     # act + quant + pad
     def _activation_and_quant(

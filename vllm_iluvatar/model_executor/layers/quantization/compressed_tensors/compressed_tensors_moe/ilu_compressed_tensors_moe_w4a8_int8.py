@@ -13,20 +13,19 @@ Key env vars:
   - VLLM_W4A8_VERSION: 2 (default) or 1
 """
 
+import ixformer.inference.functions as ixfops  # type: ignore
 import torch
+import vllm.envs as envs
 from compressed_tensors.quantization import (
     QuantizationArgs,
     QuantizationStrategy,
 )
-
-import ixformer.inference.functions as ixfops  # type: ignore
-import vllm.envs as envs
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
+    FusedMoeWeightScaleSupported,
     RoutedExperts,
     SharedExperts,
-    FusedMoeWeightScaleSupported,
 )
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -36,33 +35,22 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
     CompressedTensorsMoEMethod,
 )
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
-# DeepSeek-V4 sparse SWA metadata carries num_decodes/num_prefills, which the
-# decode-vs-general dispatch below relies on. Without it the V4 metadata dict
-# (IluFlashMLASparseMetadata + DeepseekSparseSWAMetadata) fails the isinstance
-# whitelist and forces every batch through `_apply_general`, which contains a
-# `expert_sizes_gpu.cpu()` D2H sync that is illegal during CUDA graph capture
-# and yields garbage shapes (negative dims / OOM). See cuda-graph notes.
-from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
-from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_utils import W4A8GroupGemmInfo, pad_tensor, replace_with_padded, unpad_tensor
+
+from vllm_iluvatar.model_executor.layers.fused_moe.ilu_decode_metadata import (
+    _is_only_decode,
+)
+from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_utils import (
+    W4A8GroupGemmInfo,
+    pad_tensor,
+    replace_with_padded,
+    unpad_tensor,
+)
+
 logger = init_logger(__name__)
 
 
 def _get_ilu_output_scale(layer: RoutedExperts) -> float:
     return getattr(layer, "_ilu_output_scale", 1.0)
-
-
-def _is_supported_decode_metadata(value) -> bool:
-    """Accept community metadata plus Iluvatar fork metadata by class name.
-
-    The fork-only metadata classes live outside community vLLM. Avoid importing
-    them at module import time so this plugin remains usable with an unmodified
-    vLLM checkout.
-    """
-    return isinstance(value, (MLACommonMetadata, DeepseekSparseSWAMetadata)) or (
-        value.__class__.__name__
-        in {"IluFlashAttentionMetadata", "IluDeepseekV32IndexerMetadata"}
-    )
 
 
 class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
@@ -96,21 +84,24 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         self.weight_symmetric = self.weight_quant.symmetric
         self.gemm_format = envs.VLLM_W4A8_FORMAT
         self.version = envs.VLLM_W4A8_VERSION
-        assert self.version == 2, "IluCompressedTensorsW4A8Int8MoEMethod only supports version 2"
-        assert self.gemm_format in ["TN", "NN"], "IluCompressedTensorsW4A8Int8MoEMethod only supports format TN or NN"
-        if not envs.VLLM_WNA16_MOE_USE_W4A8:
-            if not (
-                (
-                    self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-                    or self.weight_quant.strategy == QuantizationStrategy.GROUP
-                )
-                and self.input_quant.strategy == QuantizationStrategy.TOKEN
-            ):
-                raise ValueError(
-                    "For INT4 pack2 Fused MoE layers, only per-channel or group "
-                    "scales for weights and per-token scales for activations are "
-                    f"supported. Found {self.weight_quant}, {self.input_quant}"
-                )
+        assert self.version == 2, (
+            "IluCompressedTensorsW4A8Int8MoEMethod only supports version 2"
+        )
+        assert self.gemm_format in ["TN", "NN"], (
+            "IluCompressedTensorsW4A8Int8MoEMethod only supports format TN or NN"
+        )
+        if not envs.VLLM_WNA16_MOE_USE_W4A8 and not (
+            (
+                self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+                or self.weight_quant.strategy == QuantizationStrategy.GROUP
+            )
+            and self.input_quant.strategy == QuantizationStrategy.TOKEN
+        ):
+            raise ValueError(
+                "For INT4 pack2 Fused MoE layers, only per-channel or group "
+                "scales for weights and per-token scales for activations are "
+                f"supported. Found {self.weight_quant}, {self.input_quant}"
+            )
         if envs.VLLM_WNA16_MOE_USE_W4A8:
             self.static_input_scales = False
         else:
@@ -155,7 +146,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, base_attrs)
         if self.gemm1_info.format_str == "NN":
-            setattr(w13_weight, "shard_dim", 1)
+            w13_weight.shard_dim = 1
 
         w2_weight = torch.nn.Parameter(
             torch.empty(w2_shape, dtype=weight_dtype), requires_grad=False
@@ -163,7 +154,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, base_attrs)
         if self.gemm2_info.format_str == "NN":
-            setattr(w2_weight, "shard_dim", 0)
+            w2_weight.shard_dim = 0
 
         # [3] Register weight scales (w13_weight_scale / w2_weight_scale).
         scale_groups_w13 = (
@@ -181,7 +172,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             requires_grad=False,
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
-        setattr(w13_weight_scale, "shard_dim", 1)
+        w13_weight_scale.shard_dim = 1
 
         scale_groups_w2 = (
             1
@@ -198,7 +189,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             requires_grad=False,
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
-        setattr(w2_weight_scale, "shard_dim", 0)
+        w2_weight_scale.shard_dim = 0
 
         weight_scale_attrs = {
             **base_attrs,
@@ -232,10 +223,8 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                     ),
                     requires_grad=False,
                 )
-                layer.register_parameter(
-                    "w13_i8_weight_scale", w13_i8_weight_scale
-                )
-                setattr(w13_i8_weight_scale, "shard_dim", 1)
+                layer.register_parameter("w13_i8_weight_scale", w13_i8_weight_scale)
+                w13_i8_weight_scale.shard_dim = 1
                 set_weight_attrs(w13_i8_weight_scale, aux_scale_attrs)
 
             if not self.weight_symmetric:
@@ -252,10 +241,8 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                     ),
                     requires_grad=False,
                 )
-                layer.register_parameter(
-                    "w13_i8_weight_zero", w13_i8_weight_zero
-                )
-                setattr(w13_i8_weight_zero, "shard_dim", 1)
+                layer.register_parameter("w13_i8_weight_zero", w13_i8_weight_zero)
+                w13_i8_weight_zero.shard_dim = 1
                 set_weight_attrs(w13_i8_weight_zero, aux_scale_attrs)
 
             if self.group_size != -1:
@@ -268,10 +255,8 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                     ),
                     requires_grad=False,
                 )
-                layer.register_parameter(
-                    "w2_i8_weight_scale", w2_i8_weight_scale
-                )
-                setattr(w2_i8_weight_scale, "shard_dim", 0)
+                layer.register_parameter("w2_i8_weight_scale", w2_i8_weight_scale)
+                w2_i8_weight_scale.shard_dim = 0
                 set_weight_attrs(w2_i8_weight_scale, aux_scale_attrs)
 
             if not self.weight_symmetric:
@@ -281,26 +266,23 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                         (
                             1
                             if self.group_size == -1
-                            else self.gemm2_info.get_k()
-                            // self.group_size
+                            else self.gemm2_info.get_k() // self.group_size
                         ),
                         self.gemm2_info.get_n(),
                         dtype=torch.int32,
                     ),
                     requires_grad=False,
                 )
-                layer.register_parameter(
-                    "w2_i8_weight_zero", w2_i8_weight_zero
-                )
-                setattr(w2_i8_weight_zero, "shard_dim", 0)
+                layer.register_parameter("w2_i8_weight_zero", w2_i8_weight_zero)
+                w2_i8_weight_zero.shard_dim = 0
                 set_weight_attrs(w2_i8_weight_zero, aux_scale_attrs)
 
         if not (self.version == 2 and self.group_size != -1):
-            setattr(layer, "w13_i8_weight_scale", None)
-            setattr(layer, "w2_i8_weight_scale", None)
+            layer.w13_i8_weight_scale = None
+            layer.w2_i8_weight_scale = None
         if not (self.version == 2 and not self.weight_symmetric):
-            setattr(layer, "w13_i8_weight_zero", None)
-            setattr(layer, "w2_i8_weight_zero", None)
+            layer.w13_i8_weight_zero = None
+            layer.w2_i8_weight_zero = None
 
         # [5] Register bias and optional static input scales.
         if self.has_bias:
@@ -326,8 +308,8 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             layer.register_parameter("w2_bias", w2_bias)
             set_weight_attrs(w2_bias, base_attrs)
         else:
-            setattr(layer, "w13_bias", None)
-            setattr(layer, "w2_bias", None)
+            layer.w13_bias = None
+            layer.w2_bias = None
 
         if self.static_input_scales:
             input_scale_attrs = {
@@ -335,9 +317,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 "quant_method": FusedMoeWeightScaleSupported.CHANNEL.value,
             }
             w13_input_scale = torch.nn.Parameter(
-                torch.empty(
-                    num_experts, self.gemm1_info.get_k(), dtype=torch.float32
-                ),
+                torch.empty(num_experts, self.gemm1_info.get_k(), dtype=torch.float32),
                 requires_grad=False,
             )
             layer.register_parameter("w13_input_scale", w13_input_scale)
@@ -359,10 +339,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         def _log_prefix(branch: str, tensor_kind: str) -> str:
-            return (
-                "[w4a8][process_weights_after_loading]"
-                f"[{branch}][{tensor_kind}]"
-            )
+            return f"[w4a8][process_weights_after_loading][{branch}][{tensor_kind}]"
 
         # [1] Pad core expert weights.
         w13_target_shape = (
@@ -527,35 +504,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         attn_metadata = get_forward_context().attn_metadata
         use_ep = layer.expert_map is not None
-
-        if attn_metadata:
-            deepseek_instance = None
-            for value in attn_metadata.values():
-                if _is_supported_decode_metadata(value) and hasattr(value, "num_prefills") and hasattr(
-                    value, "num_decodes"
-                ):
-                    deepseek_instance = value
-                    break
-            value_types = {
-                type(value).__name__ for value in attn_metadata.values()
-            }
-            is_same_class = len(value_types) == 1
-            if is_same_class:
-                assert deepseek_instance
-                only_decode = all(
-                    t.num_decodes > 0 and t.num_prefills == 0
-                    for t in list(attn_metadata.values())
-                )
-            else:
-                if deepseek_instance:
-                    only_decode = (
-                        deepseek_instance.num_decodes > 0
-                        and deepseek_instance.num_prefills == 0
-                    )
-                else:
-                    only_decode = False
-        else:
-            only_decode = False
+        only_decode = _is_only_decode(attn_metadata)
 
         if use_ep:
             return self._apply_ep(
@@ -595,7 +544,6 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         shared_experts_input: torch.Tensor | None,
         run_decode: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-
         ep_rank = layer.moe_config.ep_rank
         start_eid = ep_rank * layer.local_num_experts
         end_eid = min(
@@ -741,7 +689,9 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 version=self.version,
                 output=pt_output_3,
             )
-        pt_output_3 = unpad_tensor(pt_output_3, self.gemm2_info.get_n(), contiguous=False)
+        pt_output_3 = unpad_tensor(
+            pt_output_3, self.gemm2_info.get_n(), contiguous=False
+        )
 
         reduce_mask = src_to_dst == -1
         return ixfops.moe_output_reduce_sum(
@@ -823,7 +773,9 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             group_size=self.group_size,
             dense_tokens_per_experts=dense_expert_sizes_gpu,
         )
-        pt_output_3 = unpad_tensor(pt_output_3, self.gemm2_info.get_n(), contiguous=False)
+        pt_output_3 = unpad_tensor(
+            pt_output_3, self.gemm2_info.get_n(), contiguous=False
+        )
 
         return ixfops.moe_output_reduce_sum(
             input=pt_output_3.view(num_tokens, layer.top_k, -1),
@@ -840,7 +792,6 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-
         dtype = x.dtype
         num_tokens = topk_ids.shape[0]
         num_experts = layer.global_num_experts
@@ -902,7 +853,9 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             group_size=self.group_size,
             version=self.version,
         )
-        pt_output_3 = unpad_tensor(pt_output_3, self.gemm2_info.get_n(), contiguous=False)
+        pt_output_3 = unpad_tensor(
+            pt_output_3, self.gemm2_info.get_n(), contiguous=False
+        )
 
         result = ixfops.moe_output_reduce_sum(
             input=pt_output_3.view(num_tokens, layer.top_k, -1),
@@ -914,7 +867,13 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
 
     # expand + quant + pad
     def _expand_and_quant(
-        self, layer, input, expand_tokens, sorted_token_ids, src_to_dst, output_format=0,
+        self,
+        layer,
+        input,
+        expand_tokens,
+        sorted_token_ids,
+        src_to_dst,
+        output_format=0,
         check_valid=False,
     ):
         output, scale = ixfops.moe_expand_input_dynamic_scaled_int8(
@@ -936,7 +895,12 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
 
     # act + quant + pad
     def _activation_and_quant(
-        self, layer, input, sorted_token_ids, output_format=None, check_valid=False,
+        self,
+        layer,
+        input,
+        sorted_token_ids,
+        output_format=None,
+        check_valid=False,
     ):
         # unpad
         input = unpad_tensor(input, self.gemm1_info.get_n(), contiguous=True)
@@ -1009,5 +973,3 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             output = pad_tensor(output, self.gemm2_info.pad_k)
 
         return output, scale
-
-    

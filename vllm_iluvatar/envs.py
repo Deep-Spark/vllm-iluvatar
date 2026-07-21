@@ -64,6 +64,11 @@ def _get(new: str, old: str, default: str) -> str:
     return os.environ.get(old, default)
 
 
+def _maybe_stripped(value: str) -> str | None:
+    value = value.strip()
+    return value or None
+
+
 if TYPE_CHECKING:
     # Canonical names (new code should use these).
     VLLM_ILU_W8A8_MOE_USE_W4A8: bool = False
@@ -92,6 +97,14 @@ if TYPE_CHECKING:
     VLLM_ILU_LINEAR_BACKEND: str = ""
     VLLM_ILU_DP_LB_EXACT_INFLIGHT: bool = False
     VLLM_ILU_W8A8_GEMM_MODE: str = "PERF"
+    VLLM_ILU_DEEPEP_USE_INT8: int = 0
+    VLLM_ILU_DISABLE_DEEPEP: bool = False
+    VLLM_ILU_DEEPEP_USE_SCATTER: bool = True
+    VLLM_ILU_LL_FUSED_AG_AR: bool = True
+    VLLM_ILU_DECODE_EP_BACKEND: str | None = None
+    VLLM_ILU_DP_ROUND_ROBIN_LB: bool = False
+    VLLM_ILU_DP_ROUND_ROBIN_LB_FILE: str = ""
+    VLLM_ILU_MOE_EP_LL_MOE_ALGO: str = "GEMV"
 
 # Canonical (VLLM_ILU_*) readers. Each lambda preserves the exact parsing the
 # fork used in vllm/envs.py, and reads VLLM_ILU_* first then the legacy VLLM_*.
@@ -196,6 +209,26 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_DP_LB_EXACT_INFLIGHT": _bool_reader(
         "VLLM_ILU_DP_LB_EXACT_INFLIGHT", "0"
     ),
+    "VLLM_ILU_DEEPEP_USE_INT8": lambda: int(
+        os.environ.get("VLLM_ILU_DEEPEP_USE_INT8", "0")
+    ),
+    "VLLM_ILU_DISABLE_DEEPEP": _bool_reader("VLLM_ILU_DISABLE_DEEPEP", "0"),
+    "VLLM_ILU_DEEPEP_USE_SCATTER": _bool_reader(
+        "VLLM_ILU_DEEPEP_USE_SCATTER", "1"
+    ),
+    "VLLM_ILU_LL_FUSED_AG_AR": _bool_reader("VLLM_ILU_LL_FUSED_AG_AR", "1"),
+    "VLLM_ILU_DECODE_EP_BACKEND": lambda: _maybe_stripped(
+        os.environ.get("VLLM_ILU_DECODE_EP_BACKEND", "")
+    ),
+    "VLLM_ILU_DP_ROUND_ROBIN_LB": _bool_reader(
+        "VLLM_ILU_DP_ROUND_ROBIN_LB", "0"
+    ),
+    "VLLM_ILU_DP_ROUND_ROBIN_LB_FILE": lambda: os.environ.get(
+        "VLLM_ILU_DP_ROUND_ROBIN_LB_FILE", ""
+    ),
+    "VLLM_ILU_MOE_EP_LL_MOE_ALGO": lambda: os.environ.get(
+        "VLLM_ILU_MOE_EP_LL_MOE_ALGO", "GEMV"
+    ).upper(),
 }
 
 

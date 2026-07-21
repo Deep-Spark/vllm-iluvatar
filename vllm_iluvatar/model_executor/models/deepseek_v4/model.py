@@ -95,6 +95,9 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.multi_stream_utils import AuxStreamType
 
+from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
+    IluFusedMoEEP,
+)
 from vllm_iluvatar.model_executor.models.deepseek_v4.attention import (
     IluDeepseekV4Indexer,
     IluDeepseekV4MLAModules,
@@ -184,13 +187,15 @@ class IluDeepseekV4MLP(nn.Module):
             self.act_fn = SiluAndMulWithClamp(swiglu_limit)
         else:
             self.act_fn = SiluAndMul()
-        
-         # add fused check for act + quant
-        if isinstance(self.act_fn, SiluAndMulWithClamp) and \
-                hasattr(self.down_proj, 'scheme'):
+
+        # add fused check for act + quant
+        if isinstance(self.act_fn, SiluAndMulWithClamp) and hasattr(
+            self.down_proj, "scheme"
+        ):
             from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes import (
                 IluCompressedTensorsW8A8Int8,
             )
+
             if isinstance(self.down_proj.scheme, IluCompressedTensorsW8A8Int8):
                 self.act_fn.enable_fuse_quant()
 
@@ -201,7 +206,7 @@ class IluDeepseekV4MLP(nn.Module):
         return x
 
 
-class IluDeepseekV4MoE(nn.Module):
+class IluDeepseekV4MoE(nn.Module, IluFusedMoEEP):
     """Routed + shared expert MoE for ilu fork (FusedMoE only)."""
 
     def __init__(
@@ -269,6 +274,7 @@ class IluDeepseekV4MoE(nn.Module):
             )
 
         self._init_fused_moe_experts(config, quant_config, prefix)
+        self.init_ep()
 
     def _init_fused_moe_experts(
         self,
@@ -311,6 +317,10 @@ class IluDeepseekV4MoE(nn.Module):
             input_ids = input_ids.to(dtype=self.hash_indices_dtype)
 
         org_shape = hidden_states.shape
+        if self._should_use_forward_dp_ep():
+            final_hidden_states = self.forward_dp_ep(hidden_states, input_ids)
+            return final_hidden_states.view(org_shape)
+
         if self.experts.is_internal_router:
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,

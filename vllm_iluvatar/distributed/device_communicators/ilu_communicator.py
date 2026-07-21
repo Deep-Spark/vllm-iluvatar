@@ -74,6 +74,22 @@ class IluCommunicator(CudaCommunicator):
                 self.all2all_manager = AgRsAll2AllManager(
                     self.cpu_group, tcp_store_group
                 )
+            elif self.all2all_backend == "deepep_high_throughput":
+                from vllm_iluvatar.distributed.device_communicators.all2all import (
+                    DeepEPHTAll2AllManager,
+                )
+
+                self.all2all_manager = DeepEPHTAll2AllManager(
+                    self.cpu_group, tcp_store_group
+                )
+            elif self.all2all_backend == "deepep_low_latency":
+                from vllm_iluvatar.distributed.device_communicators.all2all import (
+                    DeepEPLLAll2AllManager,
+                )
+
+                self.all2all_manager = DeepEPLLAll2AllManager(
+                    self.cpu_group, tcp_store_group
+                )
 
     # ------------------------------------------------------------------
     # Communication primitives — override with ixfd

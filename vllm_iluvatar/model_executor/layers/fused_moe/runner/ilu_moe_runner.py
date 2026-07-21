@@ -195,7 +195,9 @@ class IluMoERunner(MoERunner):
                 x=hidden_states,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
-                shared_experts=self._shared_experts,
+                shared_experts=(
+                    self._shared_experts if can_fused_shared_output else None
+                ),
                 shared_experts_input=fused_shared_output,
             )
 
@@ -216,7 +218,13 @@ class IluMoERunner(MoERunner):
         )
 
         return (
-            self._shared_experts.output if return_shared_output else None,
+            self._shared_experts.output
+            if (
+                self._shared_experts is not None
+                and return_shared_output
+                and not can_fused_shared_output
+            )
+            else None,
             fused_out,
         )
 

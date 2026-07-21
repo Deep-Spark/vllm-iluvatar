@@ -17,7 +17,6 @@ import math
 import ixformer.inference.functions as ixf_ops  # type: ignore[import]
 import torch
 import torch.nn.functional as F
-import vllm.envs as envs
 from ixformer.core import config
 from vllm.logger import init_logger
 
@@ -366,6 +365,8 @@ def scaled_int8_quant(
         assert symmetric == (azp is None), (
             "azp must only be provided for asymmetric quantization."
         )
+        if scale.dtype != torch.float32:
+            scale = scale.to(dtype=torch.float32)
         ixf_ops.static_scaled_int8_quant(output, input, scale)
         return output, scale, azp
 
@@ -468,7 +469,23 @@ def topk_hash_softplus_sqrt(
          applies the scale internally).
       4. ``token_expert_indices[t, j] = j`` (positional helper).
     """
-    return ixf_ops.topk_hash_softplus_sqrt(
+    # ixformer expects int32 index tensors. topk_indices/token_expert_indices
+    # are output buffers, so use temporaries only when needed and copy back into
+    # the original buffers after the kernel writes them.
+    orig_topk_indices = topk_indices
+    orig_token_expert_indices = token_expert_indices
+    if orig_topk_indices.dtype != torch.int32:
+        topk_indices = torch.empty_like(orig_topk_indices, dtype=torch.int32)
+    if orig_token_expert_indices.dtype != torch.int32:
+        token_expert_indices = torch.empty_like(
+            orig_token_expert_indices, dtype=torch.int32
+        )
+    if input_tokens is not None and input_tokens.dtype != torch.int32:
+        input_tokens = input_tokens.to(dtype=torch.int32)
+    if hash_indices_table is not None and hash_indices_table.dtype != torch.int32:
+        hash_indices_table = hash_indices_table.to(dtype=torch.int32)
+
+    ixf_ops.topk_hash_softplus_sqrt(
         topk_weights=topk_weights,
         topk_indices=topk_indices,
         token_expert_indices=token_expert_indices,
@@ -479,6 +496,10 @@ def topk_hash_softplus_sqrt(
         input_tokens=input_tokens,
         hash_indices_table=hash_indices_table,
     )
+    if topk_indices is not orig_topk_indices:
+        orig_topk_indices.copy_(topk_indices)
+    if token_expert_indices is not orig_token_expert_indices:
+        orig_token_expert_indices.copy_(token_expert_indices)
 
 
 def reshape_and_cache_flash(

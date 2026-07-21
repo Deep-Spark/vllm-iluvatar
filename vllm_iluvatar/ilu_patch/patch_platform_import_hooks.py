@@ -38,9 +38,26 @@ def _patch_distributed_utils(module: object) -> None:
     module.create_tcp_store = _make_create_tcp_store(module.create_tcp_store)
 
 
+def _patch_pixtral_use_xformers_ops(module: object) -> None:
+    """Force Pixtral vision code to build xformers block-diagonal metadata.
+
+    Target : vllm.model_executor.models.pixtral.USE_XFORMERS_OPS
+    Why    : Iluvatar swaps Pixtral vision attention to ixformer unpadded flash
+             attention, but still needs the community xformers
+             BlockDiagonalMask sequence metadata (q_seqinfo/k_seqinfo).
+    How    : patch the community module-level flag after import so its
+             VisionTransformer.forward creates BlockDiagonalMask instead of a
+             dense Tensor attention mask.
+    Remove : when the Iluvatar Pixtral attention path no longer depends on
+             xformers BlockDiagonalMask metadata.
+    """
+    module.USE_XFORMERS_OPS = True
+
+
 _HOOKS: tuple[tuple[str, _HookCallback], ...] = (
     # Keep this manifest as the only edit point for platform-stage hooks.
     ("vllm.distributed.utils", _patch_distributed_utils),
+    ("vllm.model_executor.models.pixtral", _patch_pixtral_use_xformers_ops),
 )
 
 

@@ -22,6 +22,10 @@ import torch
 from vllm.distributed import get_ep_group
 from vllm.forward_context import get_forward_context
 
+from vllm_iluvatar.model_executor.layers.fused_moe.ilu_decode_metadata import (
+    _is_only_decode,
+)
+
 
 def _activation_name(activation) -> str:
     return getattr(activation, "value", activation)
@@ -66,6 +70,63 @@ def _apply_activation(x: torch.Tensor, activation: str, top_k: int) -> torch.Ten
     raise ValueError(f"Unsupported activation: {activation}")
 
 
+def _apply_decode_w16a16(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str,
+    w1_bias,
+    w2_bias,
+) -> torch.Tensor:
+    """Decode-only path: GPU token-index + GEMV, no D2H sync (CG-safe)."""
+    num_tokens = topk_ids.shape[0]
+    num_experts = w1.size(0)
+    top_k = topk_weights.size(1)
+    expand_tokens = num_tokens * top_k
+
+    (
+        src_to_dst,
+        sorted_token_ids,
+        expert_sizes_gpu,
+    ) = ixfops.moe_compute_token_index_for_decode(
+        topk_ids=topk_ids,
+        num_experts=num_experts,
+    )
+
+    expanded = ixfops.moe_expand_input(
+        hidden_states=hidden_states,
+        dst_to_src=sorted_token_ids,
+        dst_tokens=expand_tokens,
+        topk=top_k,
+        src_to_dst=src_to_dst,
+    )
+    pt_output_1 = ixfops.moe_w16a16_group_gemv(
+        input=expanded,
+        weight=w1,
+        output_dtype=hidden_states.dtype,
+        tokens_per_experts_gpu=expert_sizes_gpu,
+        dst_to_src=None,
+        bias=w1_bias,
+        format="TN",
+    )
+    pt_output_2 = _apply_activation(pt_output_1, activation, top_k)
+    pt_output_3 = ixfops.moe_w16a16_group_gemv(
+        input=pt_output_2,
+        weight=w2,
+        output_dtype=hidden_states.dtype,
+        tokens_per_experts_gpu=expert_sizes_gpu,
+        dst_to_src=sorted_token_ids,
+        bias=w2_bias,
+        format="TN",
+    )
+    return ixfops.moe_output_reduce_sum(
+        input=pt_output_3.view(num_tokens, top_k, -1),
+        topk_weight=topk_weights,
+    )
+
+
 def ilu_w16a16_fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -91,19 +152,25 @@ def ilu_w16a16_fused_experts(
 
     attn_metadata = get_forward_context().attn_metadata
     use_ep = expert_map is not None
-    if attn_metadata:
-        only_decode = not use_ep and all(
-            t.num_decodes > 0 and t.num_prefills == 0
-            for t in list(attn_metadata.values())
-        )
-    else:
-        only_decode = False
+    only_decode = not use_ep and _is_only_decode(attn_metadata)
 
     assert topk_weights.size() == topk_ids.size(), "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.stride(-1) == 1, "Stride of last dimension must be 1"
     assert w2.stride(-1) == 1, "Stride of last dimension must be 1"
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
+
+    if only_decode:
+        return _apply_decode_w16a16(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=activation,
+            w1_bias=w1_bias,
+            w2_bias=w2_bias,
+        )
 
     num_tokens = hidden_states.size(0)
     num_experts = w1.size(0)
@@ -152,32 +219,6 @@ def ilu_w16a16_fused_experts(
         topk=top_k,
         src_to_dst=src_to_dst,
     )
-
-    if only_decode:
-        pt_output_1 = ixfops.moe_w16a16_group_gemv(
-            input=hidden_states,
-            weight=w1,
-            output_dtype=hidden_states.dtype,
-            tokens_per_experts_gpu=expert_sizes_gpu,
-            dst_to_src=None,
-            bias=w1_bias,
-            format="TN",
-        )
-        pt_output_2 = _apply_activation(pt_output_1, activation, top_k)
-        pt_output_3 = ixfops.moe_w16a16_group_gemv(
-            input=pt_output_2,
-            weight=w2,
-            output_dtype=hidden_states.dtype,
-            tokens_per_experts_gpu=expert_sizes_gpu,
-            dst_to_src=sorted_token_ids,
-            bias=w2_bias,
-            format="TN",
-        )
-        return ixfops.moe_output_reduce_sum(
-            input=pt_output_3.view(num_tokens, top_k, -1),
-            topk_weight=topk_weights,
-        )
-
     expert_sizes_cpu = expert_sizes_gpu.cpu()
     pt_output_1 = ixfops.moe_w16a16_group_gemm(
         input=hidden_states,

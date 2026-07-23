@@ -79,8 +79,8 @@ if TYPE_CHECKING:
     VLLM_ILU_USE_INT8_MLA: bool = False
     VLLM_ILU_MLA_CUSTOMIZE: bool = True
     VLLM_ILU_MIX_QUANTIZATION_TYPE: str = ""
-    VLLM_ILU_ATTN_OPT_LEVEL: int = 0
-    VLLM_ILU_ATTN_STATIC_QUANT_SCALE_FILE_PATH: str = ""
+    VLLM_ILU_FLASH_ATTN_QUANT_TYPE: str = ""
+    VLLM_ILU_FLASH_ATTN_V_SCALE_PATH: str = ""
     VLLM_ILU_USE_LORA_FUSION: bool = False
     VLLM_ILU_VIT_ATTN_OPT_LEVEL: int = 0
     VLLM_ILU_VIT_ATTN_LAYER: str = ""
@@ -137,21 +137,13 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_MIX_QUANTIZATION_TYPE": lambda: _get(
         "VLLM_ILU_MIX_QUANTIZATION_TYPE", "VLLM_MIX_QUANTIZATION_TYPE", ""
     ).upper(),
-    "VLLM_ILU_ATTN_OPT_LEVEL": lambda: int(
-        _get("VLLM_ILU_ATTN_OPT_LEVEL", "VLLM_ATTN_OPT_LEVEL", "0")
-    ),
-    "VLLM_ILU_ATTN_STATIC_QUANT_SCALE_FILE_PATH": lambda: _get(
-        "VLLM_ILU_ATTN_STATIC_QUANT_SCALE_FILE_PATH",
-        "VLLM_ATTN_STATIC_QUANT_SCALE_FILE_PATH",
-        "",
-    ),
     "VLLM_ILU_USE_LORA_FUSION": lambda: (
         _get("VLLM_ILU_USE_LORA_FUSION", "VLLM_USE_LORA_FUSION", "0").lower()
         in ("1", "true")
     ),
     # ViT attention quantization level
     "VLLM_ILU_VIT_ATTN_OPT_LEVEL": lambda: int(
-        _get("VLLM_ILU_ATTN_OPT_LEVEL", "VLLM_VIT_ATTN_OPT_LEVEL", "0")
+        _get("VLLM_ILU_VIT_ATTN_OPT_LEVEL", "VLLM_VIT_ATTN_OPT_LEVEL", "0")
     ),
     # Comma-separated ViT block indices on which VLLM_VIT_ATTN_OPT_LEVEL
     # takes effect (e.g. "0,1,2,5,10").
@@ -183,6 +175,12 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
 
 
 _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
+    "VLLM_ILU_FLASH_ATTN_QUANT_TYPE": lambda: os.environ.get(
+        "VLLM_ILU_FLASH_ATTN_QUANT_TYPE", ""
+    ).upper(),
+    "VLLM_ILU_FLASH_ATTN_V_SCALE_PATH": lambda: os.environ.get(
+        "VLLM_ILU_FLASH_ATTN_V_SCALE_PATH", ""
+    ),
     "VLLM_ILU_NIXL_WRITE_USE_HOST_BUFFER": _bool_reader(
         "VLLM_ILU_NIXL_WRITE_USE_HOST_BUFFER", "0"
     ),

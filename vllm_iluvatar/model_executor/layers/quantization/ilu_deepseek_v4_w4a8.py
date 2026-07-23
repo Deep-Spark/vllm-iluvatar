@@ -123,7 +123,12 @@ def _is_routed_expert(prefix: str) -> bool:
 
 
 def _is_shared_expert(prefix: str) -> bool:
-    return ".shared_experts." in prefix or prefix.endswith(".shared_experts")
+    return (
+        ".shared_experts." in prefix
+        or prefix.endswith(".shared_experts")
+        or ".shared_expert." in prefix
+        or prefix.endswith(".shared_expert")
+    )
 
 
 def _build_quant_args(

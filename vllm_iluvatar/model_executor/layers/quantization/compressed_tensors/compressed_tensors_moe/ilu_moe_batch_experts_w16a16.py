@@ -1,3 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Iluvatar batched W16A16 MoE expert implementation.
+
+Corresponds to:
+    vllm/model_executor/layers/quantization/compressed_tensors/
+    compressed_tensors_moe/*
+Target   : W16A16 batched expert kernel for Iluvatar MoE.
+Baseline : plugin/vllm 0.24.0 runtime source
+Why      : Iluvatar DP+EP MoE uses ixformer grouped GEMM/GEMV kernels for
+           batched W16A16 experts.
+How      : subclass ``BaseBatchExperts`` and delegate compute to ixformer
+           inference functions.
+Scope    : Iluvatar compressed-tensors MoE W16A16 paths.
+Remove   : when community compressed-tensors MoE supports this vendor kernel.
+"""
+
 import ixformer.inference.functions as ixff
 import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk

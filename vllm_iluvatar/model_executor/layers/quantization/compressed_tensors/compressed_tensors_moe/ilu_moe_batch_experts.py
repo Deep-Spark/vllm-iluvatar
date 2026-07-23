@@ -1,3 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Iluvatar batched MoE expert base implementations.
+
+Corresponds to:
+    vllm/model_executor/layers/fused_moe/modular_kernel.py
+    vllm/model_executor/layers/quantization/compressed_tensors/
+    compressed_tensors_moe/*
+Target   : batched expert kernels selected by Iluvatar compressed-tensors MoE.
+Baseline : plugin/vllm 0.24.0 runtime source
+Why      : Iluvatar W4A8/W16A16 DP+EP kernels consume batched expert layouts and
+           may own activation quantization internally.
+How      : plugin-only modular-kernel expert classes selected by
+           ``ilu_compressed_tensors_moe`` method dispatch.
+Scope    : Iluvatar compressed-tensors MoE quantization paths.
+Remove   : when community modular MoE exposes equivalent vendor expert kernels.
+"""
+
 from typing import Literal
 
 import ixformer.inference.functions as ixff

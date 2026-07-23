@@ -29,8 +29,8 @@ Round-robin validation:
   - Model perf checks showed RR mainly helps multi-API-server DP+EP traffic by
     avoiding stale least-loaded counts and distributing requests more evenly.
 
-Community globals (sys, get_late_interaction_engine_index) are bound onto this
-module by ``patch_core_client._apply()`` at register-time (kept lazy so
+Community globals (envs, sys, get_late_interaction_engine_index) are bound onto
+this module by ``patch_core_client._apply()`` at register-time (kept lazy so
 importing this module never pulls in vllm).
 """
 
@@ -42,9 +42,8 @@ import mmap
 import os
 import struct
 
-from vllm import envs
-
 # Community globals bound by patch_core_client._apply().
+envs = None
 sys = None
 get_late_interaction_engine_index = None
 

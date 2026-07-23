@@ -1,3 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Iluvatar batched W4A8 MoE expert implementation.
+
+Corresponds to:
+    vllm/model_executor/layers/quantization/compressed_tensors/
+    compressed_tensors_moe/*
+Target   : W4A8 batched expert kernel for Iluvatar MoE.
+Baseline : plugin/vllm 0.24.0 runtime source
+Why      : Iluvatar DP+EP MoE uses ixformer grouped kernels and fork metadata
+           for W4A8 expert dispatch.
+How      : subclass ``BaseBatchExperts`` and route W4A8 compute through ixformer
+           inference functions.
+Scope    : Iluvatar compressed-tensors MoE W4A8 paths.
+Remove   : when community compressed-tensors MoE supports this vendor kernel.
+"""
+
 import ixformer.inference.functions as ixff
 import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk

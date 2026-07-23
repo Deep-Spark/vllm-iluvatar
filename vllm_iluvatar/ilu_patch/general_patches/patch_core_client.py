@@ -124,6 +124,7 @@ def _apply() -> None:
     )
 
     # Bind community globals onto the impl module.
+    impl.envs = envs
     impl.sys = _sys
     impl.get_late_interaction_engine_index = get_late_interaction_engine_index
 

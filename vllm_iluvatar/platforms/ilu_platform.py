@@ -53,7 +53,7 @@ def register_attention_backends() -> None:
 
     register_backend(
         AttentionBackendEnum.FLASH_ATTN,
-        "vllm.v1.attention.backends.ilu_flash_attn.IluFlashAttentionBackend",
+        "vllm_iluvatar.v1.attention.backends.ilu_flash_attn.IluFlashAttentionBackend",
     )
     register_backend(
         AttentionBackendEnum.FLASHMLA,
@@ -191,10 +191,18 @@ def _make_iluvatar_platform():
             super().check_and_update_config(vllm_config)
 
             pc = getattr(vllm_config, "parallel_config", None)
+            import sys
+            print(
+                f"[ILU platform] check_and_update_config: "
+                f"pc={pc is not None}, "
+                f"worker_cls={getattr(pc, 'worker_cls', '<none>')!r}",
+                file=sys.stderr, flush=True,
+            )
             if pc is not None and pc.worker_cls == "vllm.v1.worker.gpu_worker.Worker":
                 pc.worker_cls = "vllm_iluvatar.v1.worker.gpu_worker.IluWorker"
-                logger.info(
-                    "ILU: set worker_cls to IluWorker (DP dummy-batch optimisation)"
+                print(
+                    "[ILU platform] set worker_cls -> IluWorker",
+                    file=sys.stderr, flush=True,
                 )
 
         @classmethod

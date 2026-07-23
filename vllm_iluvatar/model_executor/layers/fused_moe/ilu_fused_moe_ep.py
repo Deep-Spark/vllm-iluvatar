@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # EP implementation notes:
 # 1. Simplified MoE EP flow: enabled by this file by default, centered on
 #    Dispatch -> MoE -> Combine.
@@ -653,7 +655,7 @@ class IluFusedMoEEP:
             shared_experts_scaling_factor = runner.shared_experts_scaling_factor
 
         # fused combine + all gather + all reduce
-        if use_fused_ag_ar:
+        if tp_size > 1 and use_fused_ag_ar:
             from ixformer.distributed import nvsm_ep
 
             comm = prepare_finalize.buffer

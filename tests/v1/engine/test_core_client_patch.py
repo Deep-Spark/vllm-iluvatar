@@ -25,6 +25,8 @@ def _setup_modules(monkeypatch, use_exact_inflight: bool):
     # Mock vllm.envs
     envs_module = ModuleType("vllm.envs")
     envs_module.VLLM_ILU_DP_LB_EXACT_INFLIGHT = use_exact_inflight
+    envs_module.VLLM_ILU_DP_ROUND_ROBIN_LB = False
+    envs_module.VLLM_ILU_DP_ROUND_ROBIN_LB_FILE = ""
 
     # Mock get_late_interaction_engine_index (always returns None)
     pool_module = ModuleType("vllm.v1.pool.late_interaction")

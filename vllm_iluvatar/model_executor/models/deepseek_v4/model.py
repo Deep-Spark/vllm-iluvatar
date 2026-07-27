@@ -957,15 +957,7 @@ class IluDeepseekV4ForCausalLM(nn.Module, SupportsPP):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        if input_ids.shape[0] in [1, 1024]:
-            torch.cuda.profiler.start()
-            result = self.model(
-                input_ids, positions, intermediate_tensors, inputs_embeds
-            )
-            torch.cuda.profiler.stop()
-            return result
-        else:
-            return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return getattr(self.model, "_mtp_hidden_buffer", None)

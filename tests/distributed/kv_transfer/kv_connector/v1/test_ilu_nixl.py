@@ -4,7 +4,11 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec
 
+from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl import (
+    base_worker as base_worker_module,
+)
 from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.base_worker import (
     IluNixlWorkerMixin,
 )
@@ -25,6 +29,28 @@ class _TestIluNixlBaseConnector(IluNixlBaseConnector):
         pass
 
 
+class _FakeUpstreamNixlWorker:
+    def __init__(self, vllm_config, engine_id, kv_cache_config):
+        self.vllm_config = vllm_config
+        self.pp_seen_during_init = vllm_config.parallel_config.pipeline_parallel_size
+        is_hma_required = any(
+            not isinstance(group.kv_cache_spec, FullAttentionSpec)
+            for group in kv_cache_config.kv_cache_groups
+        )
+        if self.pp_seen_during_init > 1 and is_hma_required:
+            raise NotImplementedError("upstream PP + HMA guard")
+        if (
+            self.pp_seen_during_init > 1
+            and vllm_config.kv_transfer_config.kv_role == "kv_consumer"
+        ):
+            raise NotImplementedError("upstream consumer PP guard")
+        self.pp_size = self.pp_seen_during_init
+
+
+class _TestIluNixlWorker(IluNixlWorkerMixin, _FakeUpstreamNixlWorker):
+    pass
+
+
 def _region(
     region_id: int,
     block_len: int,
@@ -39,6 +65,80 @@ def _region(
         cache_kinds=[],
         identities=identities,
     )
+
+
+@pytest.mark.parametrize(
+    ("pp_size", "role", "requires_hma", "expected_init_pp", "mask_register"),
+    [
+        (2, "kv_consumer", False, 1, False),
+        (2, "kv_producer", False, 2, False),
+        (2, "kv_producer", True, 1, True),
+        (1, "kv_consumer", False, 1, False),
+    ],
+)
+def test_upstream_pp_guards_are_masked_by_phase(
+    monkeypatch,
+    pp_size,
+    role,
+    requires_hma,
+    expected_init_pp,
+    mask_register,
+):
+    monkeypatch.setenv(
+        "VLLM_PP_LAYER_PARTITION",
+        ",".join("1" for _ in range(pp_size)),
+    )
+    monkeypatch.setattr(
+        base_worker_module,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=pp_size),
+    )
+
+    full_attention_spec = object.__new__(FullAttentionSpec)
+    kv_cache_spec = SimpleNamespace() if requires_hma else full_attention_spec
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=kv_cache_spec)]
+    )
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(pipeline_parallel_size=pp_size),
+        kv_transfer_config=SimpleNamespace(kv_role=role),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+    )
+
+    worker = _TestIluNixlWorker(vllm_config, "engine", kv_cache_config)
+
+    assert worker.pp_seen_during_init == expected_init_pp
+    assert vllm_config.parallel_config.pipeline_parallel_size == pp_size
+    assert worker.pp_size == pp_size
+    assert worker._mask_pp_during_register is mask_register
+
+
+def test_dsv2_mla_consumer_pp_bypasses_upstream_init_guard(monkeypatch):
+    """DSV2 MLA is a FullAttentionSpec but decode PP is rejected upstream."""
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "14,13")
+    monkeypatch.setattr(
+        base_worker_module,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=2),
+    )
+
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(kv_cache_spec=object.__new__(MLAAttentionSpec))
+        ]
+    )
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+        kv_transfer_config=SimpleNamespace(kv_role="kv_consumer"),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+    )
+
+    worker = _TestIluNixlWorker(vllm_config, "dsv2-decode", kv_cache_config)
+
+    assert worker.pp_seen_during_init == 1
+    assert vllm_config.parallel_config.pipeline_parallel_size == 2
+    assert worker.pp_size == 2
+    assert worker._mask_pp_during_register is False
 
 
 def test_pp_layer_range_and_targets():

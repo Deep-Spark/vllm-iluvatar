@@ -662,17 +662,19 @@ def test_shared_expert_intermediate_round_up_is_a_no_op(moe_factory):
 # ---------------------------------------------------------------------------
 
 
-def test_shared_expert_activation_is_a_placeholder(moe_factory):
-    """Regression fence for the construction-time landmine (design §4.4.1 / R10).
+def test_shared_expert_activation_is_a_torch_swiglu(moe_factory):
+    """The ``act_fn`` slot is a parameter-free torch SwiGLU (Module 4), not a
+    community activation ``CustomOp`` (design §4.4.1 / R10).
 
     Community ``SiluAndMulWithClamp.__init__``
     (``vllm/model_executor/layers/activation.py:186-195``) resolves
     ``torch.ops._C.silu_and_mul_with_clamp`` while it is being constructed, and
     the ``is_cuda_alike()`` branch has no fallback. ``IluPlatform`` derives from
     ``CudaPlatform`` so that branch always wins, and Iluvatar has no such symbol
-    -- building this layer used to die with ``AttributeError`` before a single
-    parameter existed. Stage 1 therefore builds no activation module at all; the
-    slot holds a parameter-free placeholder that raises the group-C stub.
+    -- building one would die with ``AttributeError`` before a single parameter
+    existed. So the slot holds ``_Fp8SwiGLU``, a plain ``nn.Module`` that does
+    the clamped SwiGLU in torch: no ``torch.ops._C`` handle, no parameter, no
+    buffer, and it actually computes (it no longer raises the group-C stub).
 
     Asserted on the *class*, not on ``isinstance``, so the community classes stay
     unimported here -- importing them is harmless, instantiating them is not.
@@ -692,18 +694,12 @@ def test_shared_expert_activation_is_a_placeholder(moe_factory):
         assert list(act_fn.named_parameters()) == []
         assert list(act_fn.named_buffers()) == []
 
-        with pytest.raises(NotImplementedError) as excinfo:
-            act_fn(torch.zeros(1, 2 * _SHARED_I, dtype=BF16))
-    assert "TODO(ilu_fp8_C1)" in str(excinfo.value)
-
-
-def test_shared_expert_mlp_forward_raises_the_c1_todo(moe_factory):
-    """The MLP forward has no real body left either: its activation is gone, so
-    it stops at the same group-C number instead of half-running ``gate_up_proj``."""
-    with moe_factory(BIAS_LAYER_ID) as (moe, _):
-        with pytest.raises(NotImplementedError) as excinfo:
-            moe.shared_experts.forward(torch.zeros(1, _H, dtype=BF16))
-    assert "TODO(ilu_fp8_C1)" in str(excinfo.value)
+        # Wired: pure torch, runs on CPU. gate/up halves -> [., _SHARED_I].
+        out = act_fn(torch.zeros(2, 2 * _SHARED_I, dtype=BF16))
+        assert tuple(out.shape) == (2, _SHARED_I)
+        assert out.dtype is BF16
+        # silu(0) * 0 == 0, a cheap sanity value that needs no kernel.
+        assert torch.allclose(out, torch.zeros_like(out))
 
 
 # ---------------------------------------------------------------------------
@@ -743,15 +739,3 @@ def test_gate_weight_shape_and_router_output_dtype(moe_factory):
         assert tuple(moe.gate.weight.shape) == (_N_ROUTED_EXPERTS, _H)
         # design §5.3 / community nvidia/model.py:545-551: the router runs fp32
         assert moe.gate.out_dtype is FP32
-
-
-# ---------------------------------------------------------------------------
-# C1 stays a stub (design §7): task 3.4 builds parameters, not a forward
-# ---------------------------------------------------------------------------
-
-
-def test_moe_forward_still_raises_the_c1_todo(moe_factory):
-    with moe_factory(BIAS_LAYER_ID) as (moe, _):
-        with pytest.raises(NotImplementedError) as excinfo:
-            moe.forward(None)
-    assert "TODO(ilu_fp8_C1)" in str(excinfo.value)

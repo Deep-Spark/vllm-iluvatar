@@ -38,8 +38,12 @@ import torch
 # "主 MLA per-token 字节" / "SWA per-token 字节"
 #   = 448B FP8 NoPE + 128B bf16 RoPE + 8B UE8M0 scale
 EXPECTED_PER_TOKEN_BYTES = 584
-# "alignment（主 MLA / SWA / indexer / compressor state）"
+# "alignment": SWA / indexer / compressor-state community caches page at 576.
+# The main MLA spec was retuned in Module 3 to 64 (the ixformer fp8 kernels'
+# block-base alignment, matching the sibling W4A8 fork); 576 is itself a
+# multiple of 64, so the two only differ in per-page padding.
 EXPECTED_ALIGNMENT = 576
+EXPECTED_MAIN_MLA_ALIGNMENT = 64
 # "model_version" — design §5.1 sources it from attention.py:619 (main MLA) and
 # sparse_swa.py:102 (SWA) only. The indexer / compressor-state specs deliberately
 # leave it unset: SlidingWindowMLASpec.real_page_size_bytes switches to the 584B
@@ -189,7 +193,7 @@ def test_main_mla_spec_page_algebra(compress_ratio):
         spec = _main_mla_spec(vllm_config, compress_ratio=compress_ratio)
 
     assert _per_token_bytes(spec) == EXPECTED_PER_TOKEN_BYTES
-    assert spec.alignment == EXPECTED_ALIGNMENT
+    assert spec.alignment == EXPECTED_MAIN_MLA_ALIGNMENT
     assert spec.model_version == EXPECTED_MODEL_VERSION
     assert spec.cache_dtype_str == EXPECTED_CACHE_DTYPE_STR
     assert spec.dtype == EXPECTED_KV_TENSOR_DTYPE

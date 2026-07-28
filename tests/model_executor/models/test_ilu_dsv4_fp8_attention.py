@@ -188,8 +188,9 @@ _EXPECTED_BASE: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
     # RowParallelLinear(o_groups * o_lora_rank = 8192, 256)
     "wo_b.weight": ((256, 8192), FP8),
     "wo_b.weight_scale_inv": ((2, 64), E8M0),
-    # full((padded_heads,), -inf, float32)
-    "attn_sink": ((EXPECTED_PADDED_HEADS,), FP32),
+    # Module 3 (plan §1.3): no head padding -- attn_sink carries exactly
+    # n_local_heads values. full((n_local_heads,), -inf, float32).
+    "attn_sink": ((MINI_N_LOCAL_HEADS,), FP32),
 }
 
 # compressor: coff = 1 + (cr == 4); head_dim = 512
@@ -650,23 +651,23 @@ def test_get_padded_num_q_heads_pads_to_64():
     assert IluDeepseekV4Fp8Attention.get_padded_num_q_heads(65) == 128
 
 
-def test_attn_sink_shape_is_padded_head_count():
+def test_attn_sink_shape_is_local_head_count():
+    """Module 3 (plan §1.3): no head padding -- attn_sink is n_local_heads."""
     with build_mini_fp8_attention(LAYER_CR4) as (layer, _):
         assert layer.n_local_heads == MINI_N_LOCAL_HEADS
-        assert layer.padded_heads == EXPECTED_PADDED_HEADS
-        assert tuple(layer.attn_sink.shape) == (EXPECTED_PADDED_HEADS,)
+        assert tuple(layer.attn_sink.shape) == (MINI_N_LOCAL_HEADS,)
         assert layer.attn_sink.dtype is FP32
 
 
 def test_attn_sink_is_initialised_to_negative_inf():
-    """Construction-time init only. Weight loading fills the first
-    ``n_local_heads`` slots and leaves the rest at -inf; that is task 4.4."""
+    """Construction-time init only. Weight loading fills all ``n_local_heads``
+    slots (no padding after Module 3); that is task 4.4."""
     # Values need real storage, so build on CPU. The dense flavour is used
     # because it pulls in neither compressor nor indexer.
     with build_mini_fp8_attention(LAYER_DENSE, device="cpu") as (layer, _):
         attn_sink = layer.attn_sink.detach()
 
-    assert attn_sink.shape == (EXPECTED_PADDED_HEADS,)
+    assert attn_sink.shape == (MINI_N_LOCAL_HEADS,)
     assert attn_sink.dtype is FP32
     assert torch.isneginf(attn_sink).all(), (
         f"attn_sink must start as all -inf, got {attn_sink}"

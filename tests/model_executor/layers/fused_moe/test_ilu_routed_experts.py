@@ -16,10 +16,10 @@ from vllm_iluvatar.model_executor.layers.fused_moe.ilu_routed_experts import (
     IluRoutedExperts,
 )
 
-_MAIN_DCFEBF_WEIGHT_LOADER_SHA = (
-    "4fe62b9495581504f5cedadd6ae9ba6f8f8ba5422f1959c181c4a6b3b0dfee14"
+_MAIN_61AC3680210_WEIGHT_LOADER_SHA = (
+    "9fddc37887de08d3804778d78d7a7d1b343b32949350b03672b02c5910887484"
 )
-_MAIN_DCFEBF_LOAD_WEIGHTS_SHA = (
+_MAIN_61AC3680210_LOAD_WEIGHTS_SHA = (
     "4c935079e68c0723a98f39253cbc3ccd16f1a737ed68a85c18f7a47cbd908453"
 )
 
@@ -53,12 +53,12 @@ def test_routed_experts_oot_registration_uses_upstream_class_name():
     assert op_registry_oot["RoutedExperts"] is IluRoutedExperts
 
 
-def test_weight_loader_fingerprint_baseline_matches_declared_main_dcfebf_source():
+def test_weight_loader_fingerprint_baseline_matches_declared_main_61ac3680210_source():
     assert p.source_sha(_ROUTED_EXPERTS_WEIGHT_LOADER_BASELINE) == (
-        _MAIN_DCFEBF_WEIGHT_LOADER_SHA
+        _MAIN_61AC3680210_WEIGHT_LOADER_SHA
     )
     assert p.source_sha(_ROUTED_EXPERTS_LOAD_WEIGHTS_BASELINE) == (
-        _MAIN_DCFEBF_LOAD_WEIGHTS_SHA
+        _MAIN_61AC3680210_LOAD_WEIGHTS_SHA
     )
 
 

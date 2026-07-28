@@ -4,7 +4,7 @@
 Corresponds to: vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py
 
 Target   : vllm.model_executor.layers.fused_moe.router.grouped_topk_router.grouped_topk
-Baseline : main_dcfebf93f4e
+Baseline : main_61ac3680210
 Why      : Iluvatar uses ixformer's grouped-topk kernel instead of community
            CUDA/Torch grouped-topk paths.
 How      : general patch rebinds the module-level ``grouped_topk`` function to

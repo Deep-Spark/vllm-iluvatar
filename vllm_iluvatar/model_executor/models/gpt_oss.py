@@ -4,7 +4,7 @@
 Corresponds to: vllm/model_executor/models/gpt_oss.py
 Target   : vllm.model_executor.models.gpt_oss.GptOssForCausalLM
            (arch "GptOssForCausalLM")
-Baseline : main_dcfebf93f4e
+Baseline : main_61ac3680210
 Why      : Iluvatar W4A8/W8A8 GPT-OSS checkpoints use padded routed-expert
            tensors and plugin env-controlled layouts that community GPT-OSS
            loaders do not understand.

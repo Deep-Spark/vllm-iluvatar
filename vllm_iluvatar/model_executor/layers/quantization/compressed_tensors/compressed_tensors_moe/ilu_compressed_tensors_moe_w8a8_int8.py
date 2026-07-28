@@ -34,6 +34,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_decode_metadata import (
+    _ensure_cuda_graph_safe_dispatch,
     _is_only_decode,
 )
 
@@ -358,6 +359,7 @@ class IluCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
         use_ep = layer.expert_map is not None
         # unsupported ep now
         only_decode = not use_ep and _is_only_decode(attn_metadata)
+        _ensure_cuda_graph_safe_dispatch(only_decode, attn_metadata)
 
         if use_ep:
             ep_rank = layer.moe_config.ep_rank

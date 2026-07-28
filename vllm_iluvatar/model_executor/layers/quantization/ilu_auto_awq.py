@@ -55,6 +55,7 @@ from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_decode_metadata import (
+    _ensure_cuda_graph_safe_dispatch,
     _is_only_decode,
 )
 
@@ -505,6 +506,7 @@ class IluAutoAWQMoEMethod(FusedMoEMethodBase):
             attn_metadata = None
         # unsupported ep now
         only_decode = not use_ep and _is_only_decode(attn_metadata)
+        _ensure_cuda_graph_safe_dispatch(only_decode, attn_metadata)
 
         if use_ep:
             start_eid = layer.ep_rank * layer.local_num_experts

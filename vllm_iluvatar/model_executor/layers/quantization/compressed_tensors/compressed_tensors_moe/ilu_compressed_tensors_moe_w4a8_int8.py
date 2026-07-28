@@ -42,6 +42,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_decode_metadata import (
+    _ensure_cuda_graph_safe_dispatch,
     _is_only_decode,
 )
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_utils import (
@@ -552,6 +553,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         attn_metadata = forward_context.attn_metadata
         use_ep = layer.expert_map is not None
         only_decode = _is_only_decode(attn_metadata)
+        _ensure_cuda_graph_safe_dispatch(only_decode, attn_metadata)
 
         if use_ep:
             return self._apply_ep(

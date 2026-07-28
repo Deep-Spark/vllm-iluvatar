@@ -55,6 +55,7 @@ from vllm_iluvatar.model_executor.kernels.linear import (
     choose_mp_linear_kernel,
 )
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_decode_metadata import (
+    _ensure_cuda_graph_safe_dispatch,
     _is_only_decode,
 )
 
@@ -774,6 +775,7 @@ class IluAutoGPTQMoEMethod(FusedMoEMethodBase):
         attn_metadata = get_forward_context().attn_metadata
         # unsupported ep now
         only_decode = not use_ep and _is_only_decode(attn_metadata)
+        _ensure_cuda_graph_safe_dispatch(only_decode, attn_metadata)
         if use_ep:
             start_eid = layer.ep_rank * layer.local_num_experts
             end_eid = min(

@@ -11,16 +11,16 @@ from types import ModuleType, SimpleNamespace
 from vllm_iluvatar.ilu_patch import general_patch as p
 from vllm_iluvatar.ilu_patch.general_patches import patch_rejection_sampler
 
-_MAIN_DCFEBF_REJECTION_GREEDY_SAMPLE_KERNEL_SHA = (
+_MAIN_61AC3680210_REJECTION_GREEDY_SAMPLE_KERNEL_SHA = (
     "9cd5a8f8fe5a065937797b59a1fede6aadb711391d3288a09fc7ffa65cfc5551"
 )
-_MAIN_DCFEBF_REJECTION_RANDOM_SAMPLE_KERNEL_SHA = (
+_MAIN_61AC3680210_REJECTION_RANDOM_SAMPLE_KERNEL_SHA = (
     "63a939862a8810443cdd667248e16b8aba6c33e0f921812b5b6a34cc597d2bad"
 )
-_MAIN_DCFEBF_REJECTION_SAMPLE_SHA = (
+_MAIN_61AC3680210_REJECTION_SAMPLE_SHA = (
     "35d7236c81a06800520691e8eb79014b33653e05ce5e982901fdb68ea003a1ea"
 )
-_MAIN_DCFEBF_GENERATE_UNIFORM_PROBS_SHA = (
+_MAIN_61AC3680210_GENERATE_UNIFORM_PROBS_SHA = (
     "f3e8fbcf4f6e8332bbe61141fad916087b61256f4dada65663d274b48e27524b"
 )
 
@@ -160,13 +160,13 @@ def _load_impl(monkeypatch) -> ModuleType:
 
 def test_rejection_sampler_fingerprint_baselines_match_declared_main_source():
     assert patch_rejection_sampler._BASELINE_SOURCE_SHAS == {
-        "rejection_sample": _MAIN_DCFEBF_REJECTION_SAMPLE_SHA,
-        "generate_uniform_probs": _MAIN_DCFEBF_GENERATE_UNIFORM_PROBS_SHA,
+        "rejection_sample": _MAIN_61AC3680210_REJECTION_SAMPLE_SHA,
+        "generate_uniform_probs": _MAIN_61AC3680210_GENERATE_UNIFORM_PROBS_SHA,
         "rejection_greedy_sample_kernel": (
-            _MAIN_DCFEBF_REJECTION_GREEDY_SAMPLE_KERNEL_SHA
+            _MAIN_61AC3680210_REJECTION_GREEDY_SAMPLE_KERNEL_SHA
         ),
         "rejection_random_sample_kernel": (
-            _MAIN_DCFEBF_REJECTION_RANDOM_SAMPLE_KERNEL_SHA
+            _MAIN_61AC3680210_REJECTION_RANDOM_SAMPLE_KERNEL_SHA
         ),
     }
 

@@ -405,6 +405,7 @@ def topk_softmax(
     gating_output: torch.Tensor,
     renormalize: bool = False,
     e_score_correction_bias: torch.Tensor | None = None,
+    is_padding: torch.Tensor | None = None,
 ) -> None:
     ixf_ops.moe_fused_topk_bias(
         gating_output=gating_output,
@@ -416,6 +417,7 @@ def topk_softmax(
         topk_weight=topk_weights,
         topk_ids=topk_ids,
     )
+    _mask_topk_padding(topk_weights, topk_ids, is_padding)
 
 
 def topk_sigmoid(
@@ -426,6 +428,7 @@ def topk_sigmoid(
     renormalize: bool = False,
     e_score_correction_bias: torch.Tensor | None = None,
     routed_scaling_factor: float = 1.0,
+    is_padding: torch.Tensor | None = None,
 ) -> None:
     ixf_ops.moe_fused_topk_bias(
         gating_output=gating_output,
@@ -437,6 +440,7 @@ def topk_sigmoid(
         topk_weight=topk_weights,
         topk_ids=topk_ids,
     )
+    _mask_topk_padding(topk_weights, topk_ids, is_padding)
 
 
 def topk_hash_softplus_sqrt(
@@ -449,6 +453,7 @@ def topk_hash_softplus_sqrt(
     e_score_correction_bias: torch.Tensor | None = None,
     input_tokens: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
+    is_padding: torch.Tensor | None = None,
 ) -> None:
     """PyTorch equivalent of ``torch.ops._moe_C.topk_softplus_sqrt``.
 
@@ -496,10 +501,24 @@ def topk_hash_softplus_sqrt(
         input_tokens=input_tokens,
         hash_indices_table=hash_indices_table,
     )
+    _mask_topk_padding(topk_weights, topk_indices, is_padding)
     if topk_indices is not orig_topk_indices:
         orig_topk_indices.copy_(topk_indices)
     if token_expert_indices is not orig_token_expert_indices:
         orig_token_expert_indices.copy_(token_expert_indices)
+
+
+def _mask_topk_padding(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    is_padding: torch.Tensor | None,
+) -> None:
+    if is_padding is None:
+        return
+    padding = is_padding.to(device=topk_weights.device, dtype=torch.bool)
+    padding = padding[: topk_weights.shape[0]].view(-1, 1)
+    topk_weights.masked_fill_(padding, 0.0)
+    topk_ids.masked_fill_(padding.to(device=topk_ids.device), -1)
 
 
 def reshape_and_cache_flash(

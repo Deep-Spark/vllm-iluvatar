@@ -9,17 +9,16 @@ the Load_Verifier, and the arch registration. Every forward entry stops at a
 numbered TODO; no kernel is wired, the vendor kernel package is not imported, and
 no torch custom op is registered.
 
-What is deliberately *not* here yet
------------------------------------
-* ``IluDeepseekV4Fp8MoE.forward`` stays a numbered stub (group C of design §7):
-  task 3.4 only builds the parameters (gate, shared experts, the four routed
-  MXFP4 params), not the routing / grouped-GEMM path.
-* no activation module is constructed anywhere. The community SwiGLU CustomOps
-  bind ``torch.ops._C.*`` inside ``__init__`` with no fallback on a CUDA-like
-  platform, so building one would crash the shared-expert MLP at construction
-  time on Iluvatar; ``_Fp8ActivationNotWired`` holds the slot (design §4.4).
-* nothing about *how* the weights are used: loading is byte-level only, no
-  dequantisation and no cross-dtype ``copy_()`` anywhere on the path.
+Stage 2 wiring status
+---------------------
+* ``IluDeepseekV4Fp8MoE.forward`` is wired (Module 4): a torch-equivalent FFN
+  (gate GEMM -> sqrtsoftplus top-k -> local routed experts with on-the-fly
+  MXFP4 dequant + grouped MLP -> ``+ shared`` -> EP/TP all-reduce), bypassing
+  the community ``FusedMoE`` runner whose kernels are absent on Iluvatar.
+* the shared-expert activation is a plain torch SwiGLU (``_Fp8SwiGLU``), not a
+  community ``CustomOp``: those bind ``torch.ops._C.*`` inside ``__init__`` with
+  no fallback on a CUDA-like platform, so building one would crash at
+  construction time on Iluvatar (design §4.4).
 
 Weight loading is split over the two classes: ``IluDeepseekV4Fp8Model.load_weights``
 holds the stacked / experts / ``attn_sink`` main loop (design §4.5.1-§4.5.4, task
@@ -65,9 +64,9 @@ Design references (``.kiro/specs/deepseek-v4-fp8-weight-loading/design.md``):
   ``process_weights_after_loading`` early-returns instead of swizzling them.
 * §5.3 / §5.4 -- MoE and model-level parameter shapes.
 * §6.2 -- component checklist.
-* §7 -- TODO numbering: ``E1``..``E5`` here plus the group-C number, raised from
-  the single ``_raise_ffn_not_wired()`` site that the MoE forward, the
-  shared-expert MLP forward and the activation placeholder all delegate to.
+* §7 -- TODO numbering: ``E1``..``E5`` (model orchestration) were wired in
+  Module 1 and the group-C MoE FFN gap was wired in Module 4, so this file no
+  longer carries a ``TODO(ilu_fp8_*)`` stub.
 
 Risk notes
 ----------
@@ -91,11 +90,13 @@ from itertools import islice
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -129,6 +130,9 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 
+from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (  # noqa: E501
+    _e8m0_to_fp32,
+)
 from vllm_iluvatar.model_executor.models.deepseek_v4 import fp8_load_stats, fp8_mhc
 from vllm_iluvatar.model_executor.models.deepseek_v4.fp8_attention import (
     IluDeepseekV4Fp8Attention,
@@ -228,78 +232,88 @@ def _make_fp8_weights_mapper() -> WeightsMapper:
     )
 
 
-def _raise_ffn_not_wired() -> typing.NoReturn:
-    """The single group-C raise site (design §7).
+# --- Module 4 (FFN/MoE, C1) torch-equivalent helpers ------------------------
+# FP4 E2M1 magnitude lookup (3-bit magnitude -> fp32), sign applied separately.
+# Same table community ``nvfp4_emulation_utils.break_fp4_bytes`` uses.
+_FP4_E2M1_LUT = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
+)
 
-    Three entry points share it -- ``IluDeepseekV4Fp8MoE.forward``,
-    ``IluDeepseekV4Fp8MLP.forward`` and ``_Fp8ActivationNotWired.forward`` --
-    because they are one capability gap (the whole FFN: routing, routed experts,
-    shared-expert MLP and its activation) and requirement 5.3 wants every number
-    to exist exactly once in the source. So the number lives here and the three
-    entries delegate; design §7 does not allocate a separate number to the MLP
-    or to the activation placeholder.
+# MXFP4 microscaling block size (32 fp4 values share one e8m0 exponent scale).
+_MXFP4_BLOCK = 32
 
-    Community counterparts: ``DeepseekV4MoE.forward``
-    (``vllm/models/deepseek_v4/nvidia/model.py:693-753`` -- gate -> fused top-k
-    router -> routed experts -> shared experts, all-reduced by ``FusedMoE``) and
-    ``DeepseekV4MLP.forward`` (``:133-139`` -- ``gate_up_proj`` -> SwiGLU ->
-    ``down_proj``).
+
+def _dequant_mxfp4_to_bf16(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    block: int = _MXFP4_BLOCK,
+) -> torch.Tensor:
+    """Pure-torch MXFP4 -> bf16 dequant for one routed expert's weight.
+
+    ``weight`` ``[out, in // 2]`` uint8: two fp4 (e2m1) nibbles per byte, low
+    nibble first (community ``break_fp4_bytes`` order). ``scale`` ``[out,
+    in // block]`` e8m0 (exponent-only) block scale. Returns ``[out, in]``
+    bf16. Reuses module 2's ``_e8m0_to_fp32`` for the exponent decode; there is
+    no MXFP4 global scale (unlike NVFP4).
     """
-    raise NotImplementedError(
-        "TODO(ilu_fp8_C1): the MoE FFN path (gate / top-k / routed experts / "
-        "shared-expert MLP including its SwiGLU activation) is not wired in "
-        "Stage 1 (weight loading only)."
-    )
+    low = weight & 0x0F
+    high = (weight >> 4) & 0x0F
+    # element 2i = low nibble of byte i, element 2i+1 = high nibble
+    codes = torch.stack((low, high), dim=-1).flatten(start_dim=-2)  # [out, in]
+    sign = torch.where((codes & 0x08) != 0, -1.0, 1.0)
+    mag = (codes & 0x07).long()
+    lut = _FP4_E2M1_LUT.to(weight.device)
+    vals = lut[mag] * sign  # fp32 [out, in]
+
+    in_dim = codes.shape[-1]
+    scale_f32 = _e8m0_to_fp32(scale)  # [out, in // block] fp32
+    vals = vals.reshape(*vals.shape[:-1], in_dim // block, block)
+    vals = vals * scale_f32.unsqueeze(-1)
+    return vals.reshape(*vals.shape[:-2], in_dim).to(torch.bfloat16)
 
 
-class _Fp8ActivationNotWired(nn.Module):
-    """Placeholder in the slot where the shared expert's SwiGLU would live.
+def _swiglu_clamp(x: torch.Tensor, limit: float | None) -> torch.Tensor:
+    """Torch equivalent of ``SiluAndMulWithClamp.forward_native`` (alpha=1,
+    beta=0): ``gate=clamp(x[:d], max=limit)``, ``up=clamp(x[d:], +-limit)``,
+    ``silu(gate) * up``. Computed in fp32, cast back to the input dtype.
+    """
+    d = x.shape[-1] // 2
+    gate = x[..., :d].to(torch.float32)
+    up = x[..., d:].to(torch.float32)
+    if limit is not None:
+        gate = gate.clamp(max=float(limit))
+        up = up.clamp(min=-float(limit), max=float(limit))
+    out = gate * torch.sigmoid(gate) * up
+    return out.to(x.dtype)
 
-    Why Stage 1 constructs *no* activation module
-    ---------------------------------------------
-    Community ``SiluAndMulWithClamp.__init__``
-    (``vllm/model_executor/layers/activation.py:186-195``) binds its kernel
-    **at construction time**::
 
-        if current_platform.is_rocm() or current_platform.is_xpu():
-            self._forward_method = self.forward_native
-        elif current_platform.is_cuda_alike():
-            self.op = torch.ops._C.silu_and_mul_with_clamp
-        elif current_platform.is_cpu():
-            self._forward_method = self.forward_native
+class _Fp8SwiGLU(nn.Module):
+    """SwiGLU-with-clamp activation for the shared-expert MLP (Module 4).
 
-    ROCm / XPU / CPU degrade to ``forward_native``; the ``is_cuda_alike()``
-    branch has no "op missing" fallback. ``IluPlatform`` derives from
-    ``CudaPlatform``, so ``is_cuda_alike()`` is always True, and Iluvatar CoreX
-    does not export ``silu_and_mul_with_clamp`` from ``vllm._C`` -- constructing
-    the module raises ``AttributeError: '_OpNamespace' '_C' object has no
-    attribute 'silu_and_mul_with_clamp'`` before a single weight exists.
-    ``SiluAndMul`` has the same shape (``activation.py:131-137``).
+    Torch equivalent of community ``SiluAndMulWithClamp`` (alpha=1, beta=0), i.e.
+    ``silu(clamp(gate, max=limit)) * clamp(up, +-limit)`` -- see
+    ``_swiglu_clamp``. It is a plain ``nn.Module``, **not** a ``CustomOp``: the
+    community activations resolve ``torch.ops._C.silu_and_mul_with_clamp`` inside
+    ``__init__`` on any CUDA-like platform with no fallback, and Iluvatar CoreX
+    does not export that symbol, so constructing one crashes before a single
+    weight exists (design §4.4.1 / risk R10). The plugin's OOT
+    ``IluSiluAndMulWithClamp`` would instead bind an ``ixformer`` kernel; doing
+    the SwiGLU in torch keeps this module tree kernel-free and vendor-free.
 
-    The plugin does ship an OOT override
-    (``vllm_iluvatar/model_executor/layers/activation.py``
-    ``IluSiluAndMulWithClamp``), but leaning on it is not an option either: it
-    binds ``vllm._custom_ops.silu_and_mul_with_clamp``, which is the splatted
-    Iluvatar wrapper around an ``ixformer`` kernel. That would wire a vendor
-    kernel during Stage 1 construction, which is exactly what Stage 1 forbids
-    (requirement 5.5 / design §2 C2). So the activation slot stays empty and the
-    group-C stub covers it.
-
-    The attribute is kept (same name, same slot) so the module tree, ``repr`` and
-    Stage 2's diff against community stay 1:1; it holds no parameter and no
-    buffer, so it is invisible to ``named_parameters()`` and to the loader.
+    Holds no parameter and no buffer, so it stays invisible to
+    ``named_parameters()`` / the loader; occupies the same ``act_fn`` slot the
+    community MLP uses so the module tree diff stays 1:1.
     """
 
     def __init__(self, swiglu_limit: float | None = None) -> None:
         super().__init__()
-        # Kept for Stage 2: the clamp limit the community activation would take.
         self.swiglu_limit = swiglu_limit
 
     def extra_repr(self) -> str:
-        return f"swiglu_limit={self.swiglu_limit!r}, wired=False"
+        return f"swiglu_limit={self.swiglu_limit!r}"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        _raise_ffn_not_wired()
+        return _swiglu_clamp(x, self.swiglu_limit)
 
 
 class IluDeepseekV4Fp8MLP(nn.Module):
@@ -319,14 +333,12 @@ class IluDeepseekV4Fp8MLP(nn.Module):
     has to stay, because the loader's zero-fill of the trailing ranks
     (``_pad_shared_expert_weight``) is only correct if the two agree.
 
-    ``forward`` is a stub, and so is ``act_fn``. Stage 1 constructs no activation
-    module at all -- the community ones bind their kernel in ``__init__`` and
-    have no fallback on a CUDA-like platform, see ``_Fp8ActivationNotWired``. The
-    slot holds that placeholder instead, and both it and this ``forward``
-    delegate to ``_raise_ffn_not_wired()``, i.e. the same group-C number design
-    §7 assigns to the MoE forward: they are one gap, and in practice
-    ``IluDeepseekV4Fp8MoE.forward`` raises first anyway, before the shared branch
-    is ever reached.
+    ``forward`` (Module 4) runs ``gate_up_proj`` -> SwiGLU(clamp) ->
+    ``down_proj``. The two projections are block-FP8 and dispatch to module 2's
+    ``IluFp8BlockScaledMMKernel``; the SwiGLU is done in torch by ``act_fn``
+    (``_Fp8SwiGLU``), which is a plain ``nn.Module`` rather than a community
+    activation ``CustomOp`` (those bind ``torch.ops._C`` in ``__init__`` with no
+    Iluvatar fallback, see ``_Fp8SwiGLU``).
     """
 
     def __init__(
@@ -369,16 +381,22 @@ class IluDeepseekV4Fp8MLP(nn.Module):
                 "for now."
             )
         # Community builds ``SiluAndMulWithClamp(swiglu_limit)`` /
-        # ``SiluAndMul()`` here (``nvidia/model.py:130-133``). Stage 1 must not:
-        # both bind ``torch.ops._C.*`` inside ``__init__`` on any CUDA-like
-        # platform and Iluvatar has no such symbol, so the layer would die at
-        # construction time. Full reasoning on ``_Fp8ActivationNotWired``.
-        self.act_fn = _Fp8ActivationNotWired(swiglu_limit)
+        # ``SiluAndMul()`` here (``nvidia/model.py:130-133``); both bind
+        # ``torch.ops._C.*`` inside ``__init__`` on any CUDA-like platform and
+        # Iluvatar has no such symbol, so we use a plain torch SwiGLU module
+        # instead. Full reasoning on ``_Fp8SwiGLU``.
+        self.act_fn = _Fp8SwiGLU(swiglu_limit)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # No activation module exists in Stage 1, so there is no real body left
-        # to run -- stop before ``gate_up_proj`` instead of half-way through.
-        _raise_ffn_not_wired()
+        # Module 4: gate_up_proj -> SwiGLU(clamp) -> down_proj. The two
+        # projections are block-FP8 and run through module 2's
+        # ``IluFp8BlockScaledMMKernel``; ``act_fn`` does the SwiGLU in torch.
+        # ``down_proj`` has ``reduce_results=False`` -- the MoE forward owns the
+        # single EP/TP all-reduce.
+        gate_up, _ = self.gate_up_proj(x)
+        act = self.act_fn(gate_up)
+        out, _ = self.down_proj(act)
+        return out
 
 
 class IluDeepseekV4Fp8MoE(nn.Module):
@@ -556,11 +574,113 @@ class IluDeepseekV4Fp8MoE(nn.Module):
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Community: vllm/models/deepseek_v4/nvidia/model.py:693-753
-        # (DeepseekV4MoE.forward -- gate -> fused top-k router -> routed experts
-        # -> shared experts, all-reduced by FusedMoE). The group-C number lives
-        # on ``_raise_ffn_not_wired`` so it stays unique across the file.
-        _raise_ffn_not_wired()
+        # Module 4 (C1): torch-equivalent FFN aligned to NV
+        # ``DeepseekV4MoE.forward`` (``nvidia/model.py:702-730``). We bypass the
+        # community ``FusedMoE.forward`` / ``MoERunner`` (their gate GEMM, top-k
+        # and EP dispatch all bind kernels Iluvatar lacks) and implement the
+        # path in torch, reading the parameters directly:
+        #   gate GEMM -> sqrtsoftplus top-k -> local routed experts (MXFP4
+        #   dequant + grouped MLP, weighted by topk) -> + shared -> EP/TP
+        #   all-reduce.
+        # NV semantics: ``final = routed + shared`` (routed_scaling_factor is
+        # multiplied into topk_weights, not the output); shared is dense per
+        # token with ``reduce_results=False`` so the single all-reduce below
+        # reduces both the expert-parallel routed partial and the TP-sharded
+        # shared partial at once.
+        org_shape = hidden_states.shape
+        x = hidden_states.view(-1, self.hidden_size)
+
+        topk_ids, topk_weights = self._route(x, input_ids)
+        routed = self._routed_experts(x, topk_ids, topk_weights)
+
+        if self.shared_experts is not None:
+            out = routed + self.shared_experts(x)
+        else:
+            out = routed
+
+        if self.tp_size > 1:
+            out = tensor_model_parallel_all_reduce(out)
+        return out.view(org_shape)
+
+    def _route(
+        self,
+        x: torch.Tensor,
+        input_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """gate GEMM + top-k, torch equivalent of ``fused_topk_bias`` /
+        ``_topk_softplus_sqrt_torch`` (``router/fused_topk_bias_router.py``).
+
+        Returns ``topk_ids`` ``[T, k]`` (long, global expert ids) and
+        ``topk_weights`` ``[T, k]`` (input dtype, already scaled). Bias is used
+        for expert *selection* only; weights come from the unbiased scores.
+        """
+        # gate GEMM in fp32 (weight is bf16, unquantised); done here rather than
+        # via ``self.gate(...)`` because ``GateLinear.forward`` dispatches to
+        # cuteDSL/dsv3 GEMMs absent on Iluvatar.
+        logits = torch.matmul(x.to(torch.float32), self.gate.weight.t().to(torch.float32))
+        scores = torch.sqrt(F.softplus(logits))
+
+        if self.gate.tid2eid is not None:
+            # hash layer: expert ids come from the lookup table
+            assert input_ids is not None, "hash MoE layer needs input_ids"
+            ids = input_ids.view(-1).long()
+            topk_ids = self.gate.tid2eid[ids].long()
+            topk_weights = scores.gather(1, topk_ids)
+        else:
+            bias = self.gate.e_score_correction_bias
+            scores_for_choice = scores + bias.to(torch.float32) if bias is not None else scores
+            _, topk_ids = torch.topk(
+                scores_for_choice, k=self.n_activated_experts, dim=-1
+            )
+            topk_ids = topk_ids.long()
+            topk_weights = scores.gather(1, topk_ids)
+
+        if self.renormalize:
+            topk_weights = topk_weights / topk_weights.sum(
+                dim=-1, keepdim=True
+            ).clamp(min=1e-20)
+        topk_weights = (topk_weights * self.routed_scaling_factor).to(x.dtype)
+        return topk_ids, topk_weights
+
+    def _routed_experts(
+        self,
+        x: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Local routed-expert contribution (torch equivalent).
+
+        For each expert owned by this rank ``[experts_start_idx,
+        experts_end_idx)``, dequant its MXFP4 ``w13``/``w2`` to bf16 on the fly,
+        run ``w13 -> SwiGLU(clamp) -> w2`` on the tokens routed to it, weight by
+        ``topk_weights`` and scatter-add into a ``[T, H]`` partial. Non-local
+        experts contribute zero; the caller's all-reduce sums the EP partials.
+        Dequant is per expert (no full-layer cache) to bound peak memory.
+        """
+        re = self.experts.routed_experts
+        routed = torch.zeros_like(x)
+        for local_eid in range(self.n_local_experts):
+            global_eid = self.experts_start_idx + local_eid
+            sel = topk_ids == global_eid
+            if not bool(sel.any()):
+                continue
+            tok_idx, slot_idx = sel.nonzero(as_tuple=True)
+            xin = x[tok_idx]
+
+            w13 = _dequant_mxfp4_to_bf16(
+                re.w13_weight[local_eid], re.w13_weight_scale[local_eid]
+            )
+            gate_up = torch.matmul(xin, w13.t())
+            act = _swiglu_clamp(gate_up, self.swiglu_limit)
+
+            w2 = _dequant_mxfp4_to_bf16(
+                re.w2_weight[local_eid], re.w2_weight_scale[local_eid]
+            )
+            y = torch.matmul(act.to(w2.dtype), w2.t())
+
+            wgt = topk_weights[tok_idx, slot_idx].unsqueeze(-1).to(y.dtype)
+            routed.index_add_(0, tok_idx, (y * wgt).to(routed.dtype))
+        return routed
 
 
 class IluDeepseekV4Fp8DecoderLayer(nn.Module):
@@ -1284,7 +1404,7 @@ class IluDeepseekV4Fp8ForCausalLM(nn.Module, SupportsPP):
 
         Three closing steps, in this order -- statistics first so the numbers are
         on record even when a check below fails, and the raise last so the
-        WARNING it would otherwise hide is already out:·
+        WARNING it would otherwise hide is already out:
 
         1. **statistics** (requirement 3.6/3.7): the seven checkpoint-side
            categories plus the total, one ``key=value`` line each. Classification

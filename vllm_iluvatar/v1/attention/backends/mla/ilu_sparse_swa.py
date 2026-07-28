@@ -44,7 +44,11 @@ from vllm.v1.attention.ops.flashmla import (
     _is_flashmla_available,
     get_mla_metadata,
 )
-from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowMLASpec
+from vllm.v1.kv_cache_interface import (
+    KVCacheSpec,
+    SlidingWindowMLASpec,
+    get_kv_quant_mode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +101,16 @@ class IluDeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
                 cache_dtype_str="fp8_ds_mla",
                 model_version="deepseek_v4",
                 # Ilu fp8 attention kernels require 64B-aligned block bases.
+                # NOTE: the ilu SWA page is the contiguous 584B/token layout with
+                # no per-page padding (37376B == 64*584, already 64-aligned), so
+                # the KV-cache reshape falls into the plain ``.view()`` branch.
+                # ``kv_quant_mode`` MUST be set so ``initialize_kv_cache_tensors``
+                # passes ``cache_dtype_str="fp8_ds_mla"`` to ``get_kv_cache_shape``
+                # (which then returns the 584-wide shape). Leaving it at the NONE
+                # default makes the runner fall back to ``head_size`` (512) and the
+                # view fails with a 584-vs-512 page-size mismatch.
                 alignment=64,
+                kv_quant_mode=get_kv_quant_mode(cache_dtype),
             )
         return SlidingWindowMLASpec(
             block_size=self.block_size,

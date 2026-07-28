@@ -78,60 +78,27 @@ def _source_path(file_name: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Expected numbering, hard-coded from design §7.
+# Expected numbering.
 # ---------------------------------------------------------------------------
-# ``B2`` is part of the set: risk R1 was confirmed on device, so the
-# self-written indexer shell (``IluDeepseekV4Fp8IndexerShell.forward``) exists
-# and design §7 marks B2 as "已启用".
-EXPECTED_NUMBERS = frozenset(
-    {"A1", "A2", "A3", "A4", "B2", "C1", "E1", "E2", "E3", "E4", "E5"}
-)
+# After Module 4 (Stage 2 FFN/MoE) no ``TODO(ilu_fp8_*)`` stub remains in these
+# two files: A1-A4 (attention forward / decode+prefill / o_proj / fused
+# kv-insert) and B2 (lightning indexer forward) are wired via ixformer ``ds4_*``
+# kernels (Module 3), E1-E5 (model orchestration) were wired in Module 1, and C1
+# (gate / top-k / routed experts + shared-expert MLP) is wired in Module 4 as a
+# torch-equivalent FFN.
+EXPECTED_NUMBERS = frozenset()
 
-# Numbers design §7 reserves but Stage 1 must NOT spend:
-#   B1 -- compressor forward. The community ``DeepseekCompressor`` is reused
-#         verbatim (design §4.2), so there is no plugin-side wrapper to stub.
-#   D1 -- FP8 block-scaled GEMM kernel, Stage 2 only.
-# Asserting their absence makes an accidental new number fail loudly instead of
-# silently widening Stage 1's scope.
+# Numbers reserved but not spent:
+#   B1 -- compressor forward (the ilu compressor forward is inherited/overridden
+#         in the sibling W4A8 module, not stubbed here).
+#   D1 -- FP8 block-scaled GEMM kernel, delivered in Module 2 (lives in
+#         model_executor/kernels, not in these two model files).
+# Asserting their absence makes an accidental new number fail loudly.
 FORBIDDEN_NUMBERS = frozenset({"B1", "D1"})
 
-# number -> (source file, enclosing class, enclosing method), design §7 table.
-EXPECTED_LOCATIONS = {
-    "A1": ("fp8_attention.py", "IluDeepseekV4Fp8Attention", "forward"),
-    "A2": ("fp8_attention.py", "IluDeepseekV4Fp8Attention", "forward_mqa"),
-    "A3": ("fp8_attention.py", "IluDeepseekV4Fp8Attention", "_o_proj"),
-    "A4": (
-        "fp8_attention.py",
-        "IluDeepseekV4Fp8Attention",
-        "_fused_qnorm_rope_kv_insert",
-    ),
-    "B2": ("fp8_attention.py", "IluDeepseekV4Fp8IndexerShell", "forward"),
-    # C1 is raised from a module-level helper, not inline in the MoE forward.
-    # Three entry points share the group-C gap (design §7 / §4.4): the MoE
-    # forward, the shared-expert MLP forward, and the activation placeholder that
-    # replaced the community SwiGLU CustomOp -- Stage 1 constructs no activation
-    # module because ``SiluAndMulWithClamp.__init__`` binds
-    # ``torch.ops._C.silu_and_mul_with_clamp`` on any CUDA-like platform and
-    # Iluvatar has no such symbol. Requirement 5.3 wants each number to exist
-    # exactly once in the source, so the raise lives in the helper and the three
-    # entries delegate; ``C1_DELEGATES`` below pins that they do.
-    "C1": ("fp8_model.py", "", "_raise_ffn_not_wired"),
-    "E1": ("fp8_model.py", "IluDeepseekV4Fp8ForCausalLM", "forward"),
-    "E2": ("fp8_model.py", "IluDeepseekV4Fp8ForCausalLM", "compute_logits"),
-    "E3": ("fp8_model.py", "IluDeepseekV4Fp8Model", "forward"),
-    "E4": ("fp8_model.py", "IluDeepseekV4Fp8DecoderLayer", "forward"),
-    "E5": ("fp8_model.py", "IluDeepseekV4Fp8Model", "hc_head"),
-}
-
-# The helper holding the single C1 raise, and every entry that must route to it.
-C1_HELPER = "_raise_ffn_not_wired"
-C1_DELEGATES = frozenset(
-    {
-        ("fp8_model.py", "IluDeepseekV4Fp8MoE", "forward"),
-        ("fp8_model.py", "IluDeepseekV4Fp8MLP", "forward"),
-        ("fp8_model.py", "_Fp8ActivationNotWired", "forward"),
-    }
-)
+# number -> (source file, enclosing class, enclosing method).
+# Empty after Module 4: every Stage-1 number has graduated to a wired path.
+EXPECTED_LOCATIONS: dict[str, tuple[str, str, str]] = {}
 
 # Construction-time landmine fence (design §4.4 / risk R10): the community SwiGLU
 # CustomOps resolve their kernel in ``__init__``
@@ -267,29 +234,6 @@ def test_todo_number_sits_on_its_design_entry(number):
     )
 
 
-def test_group_c_entries_delegate_to_the_single_raise_site():
-    """Requirements 5.1 / 5.2 for C1, across the indirection.
-
-    ``test_todo_number_sits_on_its_design_entry`` can only pin the helper, so this
-    is what still guarantees that each design §7 group-C entry actually raises:
-    all three call the helper, and nothing else does.
-    """
-    path = _source_path("fp8_model.py")
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-
-    callers = set()
-    for node, cls_name, func_name in _iter_scoped_nodes(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        if isinstance(node.func, ast.Name) and node.func.id == C1_HELPER:
-            callers.add(("fp8_model.py", cls_name or "", func_name or ""))
-
-    assert callers == set(C1_DELEGATES), (
-        f"missing delegates: {sorted(C1_DELEGATES - callers)}; "
-        f"unexpected callers of {C1_HELPER}(): {sorted(callers - C1_DELEGATES)}"
-    )
-
-
 @pytest.mark.parametrize("file_name", _SOURCE_FILES)
 def test_no_community_activation_module_is_constructed(file_name):
     """Stage 1 builds no activation module (design §4.4).
@@ -336,9 +280,16 @@ def test_no_todo_number_outside_not_implemented_raise(file_name):
     )
 
 
-@pytest.mark.parametrize("file_name", _SOURCE_FILES)
+# Module 3 wired the attention forward on ixformer ``ds4_*`` kernels, so
+# ``fp8_attention.py`` now legitimately imports the vendor package. Only
+# ``fp8_model.py`` stays ixformer-free: it delegates all kernel work to the
+# attention / MoE layers and holds no direct vendor call.
+_IXFORMER_FREE_FILES = ("fp8_model.py",)
+
+
+@pytest.mark.parametrize("file_name", _IXFORMER_FREE_FILES)
 def test_no_ixformer_reference(file_name):
-    """Requirement 5.5: no vendor kernel import or attribute use.
+    """``fp8_model.py`` carries no vendor kernel import or attribute use.
 
     Docstrings that *talk about* ixformer are fine -- only ``Import`` /
     ``ImportFrom`` / attribute chains are inspected.

@@ -8,7 +8,7 @@ Target:
     vllm.model_executor.models.hy_v3.HYV3ForCausalLM
     (arch "HYV3ForCausalLM").
 Baseline:
-    main_dcfebf93f4e.
+    main_61ac3680210.
 Why:
     the only Iluvatar delta vs community is fusing the two separate
     q_norm/k_norm passes into one fused q/k RMSNorm (ixformer

@@ -8,7 +8,7 @@ module can be patched right after import without being eagerly imported during
 platform resolution.
 
 Target   : vllm.distributed.utils.create_tcp_store
-Baseline : main_dcfebf93f4e
+Baseline : main_61ac3680210
 Why      : the libuv TCPStore backend does not support init from a pre-bound
            listen fd; force the legacy backend when taking ownership of a
            listen socket.

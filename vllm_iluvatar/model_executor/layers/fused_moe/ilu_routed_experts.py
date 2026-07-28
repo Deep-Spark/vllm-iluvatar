@@ -6,7 +6,7 @@
 Iluvatar OOT replacement for routed expert weight loading.
 
 Target     : vllm.model_executor.layers.fused_moe.routed_experts.RoutedExperts
-Baseline   : main_dcfebf93f4e ``RoutedExperts.weight_loader`` and
+Baseline   : main_61ac3680210 ``RoutedExperts.weight_loader`` and
              ``RoutedExperts.load_weights``
 Why        : preserve the fork's MoE loading deltas without editing community
              vLLM source.
@@ -142,6 +142,25 @@ _ROUTED_EXPERTS_WEIGHT_LOADER_BASELINE = """\
             shard_dim += 1
 
         expert_data = param.data if full_load else param.data[expert_id]
+
+        if "bias" in weight_name:
+            self._loaded_expert_biases.add(weight_name.rsplit(".", 1)[-1])
+            if shard_id == "w2":
+                expert_data = self._narrow_expert_data_for_padding(
+                    expert_data,
+                    loaded_weight,
+                    hidden_dim=0,
+                )
+                expert_data.copy_(loaded_weight)
+            else:
+                self._load_w13(
+                    shard_id=shard_id,
+                    shard_dim=0,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=self.moe_config.tp_rank,
+                )
+            return True if return_success else None
 
         # Case input scale: input_scale loading is only supported for fp8
         if "input_scale" in weight_name:

@@ -9,7 +9,7 @@ guards, binding) lives in
 ``register_general``.
 
 Target   : vllm.v1.engine.core_client.DPLBAsyncMPClient.get_core_engine_for_request
-Baseline : main_dcfebf93f4e
+Baseline : main_61ac3680210
 Why      : The community LB relies on coordinator-reported (waiting, running)
            counts that lag ~100 ms.  Exact-inflight removes that lag for one
            client; global round-robin gives stable request distribution across
@@ -126,22 +126,22 @@ def _ilu_get_core_engine_for_request(self, request):
                 self.eng_start_index,
             )
         elif self._ilu_use_exact_inflight:
-            counts = [0] * num_engines
-            index_of = {eng: i for i, eng in enumerate(self.core_engines)}
-            for eng in self.reqs_in_flight.values():
-                i = index_of.get(eng)
-                if i is not None:
-                    counts[i] += 1
-            eng_index = min(range(num_engines), key=lambda i: counts[i])
+            eng_index = min(
+                range(num_engines),
+                key=lambda i: self.engine_inflight[self.core_engines[i]],
+            )
         # <<< ILU MODIFICATION <<<
         else:
             current_counts = self.lb_engines
-            min_score = sys.maxsize
+            min_score: float = sys.maxsize
             eng_index = 0
             for i in range(num_engines):
                 idx = (self.eng_start_index + i) % num_engines
-                waiting, running = current_counts[idx]
-                score = waiting * 4 + running
+                waiting, running, kv_cache_usage = current_counts[idx]
+                inflight = self.engine_inflight[self.core_engines[idx]]
+                score: float = max(self.client_count * inflight, waiting + running)
+                if waiting:
+                    score += waiting * 6.0 * max(0.0, kv_cache_usage - 0.5)
                 if score < min_score:
                     min_score = score
                     eng_index = idx
@@ -150,4 +150,5 @@ def _ilu_get_core_engine_for_request(self, request):
 
     chosen_engine = self.core_engines[eng_index]
     self.reqs_in_flight[request.request_id] = chosen_engine
+    self.engine_inflight[chosen_engine] += 1
     return chosen_engine

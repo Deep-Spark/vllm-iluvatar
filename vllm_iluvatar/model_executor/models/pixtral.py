@@ -5,7 +5,7 @@ Corresponds to: vllm/model_executor/models/pixtral.py
 
 Target   : vllm.model_executor.models.pixtral.PixtralForConditionalGeneration
            (arch "PixtralForConditionalGeneration")
-Baseline : main_dcfebf93f4e
+Baseline : main_61ac3680210
 Why      : Iluvatar uses ixformer unpadded flash attention for the Pixtral vision
            encoder while reusing the community xformers block-diagonal sequence
            metadata.

@@ -8,7 +8,7 @@ Target:
     vllm.model_executor.models.hy_v3_mtp.HYV3MTP
     (arch "HYV3MTPModel").
 Baseline:
-    main_dcfebf93f4e.
+    main_61ac3680210.
 Why:
     The MoE router optionally runs bf16 to match the
     ixformer grouped-topk kernel (see

@@ -7,7 +7,7 @@ ILU general-plugins patch, auto-discovered from the centralized
 ``ilu_patch.general_patches`` package during ``register_general``.
 
 Target   : vllm.model_executor.layers.fused_moe.router.grouped_topk_router.grouped_topk
-Baseline : main_dcfebf93f4e
+Baseline : main_61ac3680210
 Why      : community vLLM has no backend hook for the grouped-topk routing
            function; Iluvatar needs the ixformer grouped-topk kernel.
 How      : strict signature check, then ``rebind_module_func`` on the

@@ -13,7 +13,7 @@ two helpers onto the community module.
 
 Target   : vllm.v1.attention.backends.fa_utils.{get_flash_attn_version,
            flash_attn_supports_sinks}
-Baseline : main_dcfebf93f4e
+Baseline : main_61ac3680210
 How      : full replacement (see fa_utils.py); installed with
            ``general_patch.rebind_module_func`` so already-imported
            ``from fa_utils import <name>`` references in community attention

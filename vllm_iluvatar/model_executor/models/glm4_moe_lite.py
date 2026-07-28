@@ -5,7 +5,7 @@ Corresponds to: vllm/model_executor/models/glm4_moe_lite.py
 
 Target   : vllm.model_executor.models.glm4_moe_lite.Glm4MoeLiteForCausalLM
            (arch "Glm4MoeLiteForCausalLM")
-Baseline : main_dcfebf93f4e
+Baseline : main_61ac3680210
 Why      : GLM-4.7-Flash on Iluvatar needs bf16 MoE router logits for the
            ixformer grouped-topk kernel, and performs a post-load q/kv projection
            fusion for supported quantization methods.

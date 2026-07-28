@@ -14,7 +14,7 @@ so they are removed from ``NCCLLibrary.exported_functions`` before
 
 Target   : vllm.distributed.device_communicators.pynccl_wrapper.
            NCCLLibrary.exported_functions
-Baseline : main_dcfebf93f4e
+Baseline : main_61ac3680210
 Why      : ``ncclCommWindowRegister`` / ``ncclCommWindowDeregister`` are only
            needed for NCCL symmetric memory and may be absent in vendor NCCL
            builds. Missing them should not disable the ordinary PyNCCL API.

@@ -7,7 +7,7 @@ ILU general-plugins patch, auto-discovered from the centralized
 ``ilu_patch.general_patches`` package during ``register_general``.
 
 Target   : vllm.v1.engine.core_client.DPLBAsyncMPClient.get_core_engine_for_request
-Baseline : main_dcfebf93f4e
+Baseline : main_61ac3680210
 Why      : The community LB relies on coordinator-reported (waiting, running)
            counts that lag ~100 ms.  With a single API server
            (``client_count == 1``) the client already holds an exact, real-time
@@ -38,7 +38,7 @@ from vllm_iluvatar.ilu_patch import general_patch as p
 # DPLBAsyncMPClient.get_core_engine_for_request (4-space method indent),
 # used as the drift anchor by the fingerprint guard.
 #
-# Baseline: main_dcfebf93f4e
+# Baseline: main_61ac3680210
 GET_CORE_ENGINE_FOR_REQUEST = """\
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.
@@ -50,14 +50,30 @@ GET_CORE_ENGINE_FOR_REQUEST = """\
             current_counts = self.lb_engines
             # TODO use P2C alg for larger DP sizes
             num_engines = len(current_counts)
-            min_score = sys.maxsize
+            min_score: float = sys.maxsize
             eng_index = 0
             for i in range(num_engines):
                 # Start from client_index to help with balancing when engines
                 # are empty.
                 idx = (self.eng_start_index + i) % num_engines
-                waiting, running = current_counts[idx]
-                score = waiting * 4 + running
+                waiting, running, kv_cache_usage = current_counts[idx]
+                # Estimate engine load as the greater of the coordinator's
+                # latest (waiting + running) snapshot and this client's own
+                # in-flight count (scaled by the number of clients). The
+                # in-flight floor is exact and can't be erased by a snapshot
+                # rebind, so a burst spreads round-robin even when snapshots
+                # race with routing decisions; the snapshot raises the score
+                # when other clients or stale requests load the engine.
+                inflight = self.engine_inflight[self.core_engines[idx]]
+                score: float = max(self.client_count * inflight, waiting + running)
+                if waiting:
+                    # Waiting requests are penalized in proportion to KV cache
+                    # pressure: a queue on a KV-bound engine drains slowly, so
+                    # new requests should strongly prefer other engines. With
+                    # low KV usage the queue is transient (e.g. mid-burst) and
+                    # the penalty stays off, preserving exact round-robin.
+                    # Ramps from 0 at <=50% usage to 3x waiting at 100%.
+                    score += waiting * 6.0 * max(0.0, kv_cache_usage - 0.5)
                 if score < min_score:
                     min_score = score
                     eng_index = idx
@@ -74,6 +90,7 @@ GET_CORE_ENGINE_FOR_REQUEST = """\
         chosen_engine = self.core_engines[eng_index]
         # Record which engine is chosen for this request, to handle aborts.
         self.reqs_in_flight[request.request_id] = chosen_engine
+        self.engine_inflight[chosen_engine] += 1
         return chosen_engine
 """
 

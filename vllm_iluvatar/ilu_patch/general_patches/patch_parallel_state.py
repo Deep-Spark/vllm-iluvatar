@@ -13,7 +13,7 @@ overrides onto GroupCoordinator.
 
 Target   : vllm.distributed.parallel_state.GroupCoordinator.{broadcast,
            broadcast_tensor_dict, isend_tensor_dict, irecv_tensor_dict}
-Baseline : main_dcfebf93f4e
+Baseline : main_61ac3680210
 How      : broadcast            -> wrapper delegating to the community method;
            broadcast_tensor_dict -> full-method copy (in parallel_state.py),
                                     guarded by a source fingerprint against the
@@ -43,7 +43,7 @@ from vllm_iluvatar.ilu_patch import general_patch as p
 # parallel_state.py together. Triple-SINGLE quotes are required because the
 # method body contains a triple-double-quoted docstring.
 #
-# Baseline: main_dcfebf93f4e
+# Baseline: main_61ac3680210
 BROADCAST_TENSOR_DICT = '''    def broadcast_tensor_dict(
         self,
         tensor_dict: dict[str, torch.Tensor | Any] | None = None,
@@ -129,7 +129,7 @@ BROADCAST_TENSOR_DICT = '''    def broadcast_tensor_dict(
 
 # Verbatim community-baseline source of GroupCoordinator.isend_tensor_dict
 # (4-space method indent, trailing newline), used as the drift anchor.
-# Baseline: main_dcfebf93f4e
+# Baseline: main_61ac3680210
 ISEND_TENSOR_DICT = """    def isend_tensor_dict(
         self,
         tensor_dict: dict[str, torch.Tensor | Any],
@@ -190,7 +190,7 @@ ISEND_TENSOR_DICT = """    def isend_tensor_dict(
 
 # Verbatim community-baseline source of GroupCoordinator.irecv_tensor_dict
 # (4-space method indent, trailing newline), used as the drift anchor.
-# Baseline: main_dcfebf93f4e
+# Baseline: main_61ac3680210
 IRECV_TENSOR_DICT = """    def irecv_tensor_dict(
         self,
         src: int | None = None,

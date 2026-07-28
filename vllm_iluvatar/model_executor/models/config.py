@@ -2,7 +2,7 @@
 """Iluvatar model config override helpers.
 
 Corresponds to: vllm/model_executor/models/config.py
-Baseline : main_dcfebf93f4e
+Baseline : main_61ac3680210
 Target   : vllm.model_executor.models.config.Gemma4Config.verify_and_update_config
 Why      : Gemma4 heterogeneous head-dim models should avoid the community
            TRITON_ATTN fallback on Iluvatar/CoreX when FA4 is unavailable.

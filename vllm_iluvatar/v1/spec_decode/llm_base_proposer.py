@@ -10,7 +10,7 @@ ilu GLM-5.2 MTP draft ``IluGlmMoeDsaMTPModel`` is a DeepSeek-V3.2 standard MTP
 and follows the same tuple contract, so this wrapper returns ``True`` for it
 and otherwise delegates to the community implementation unchanged.
 
-Baseline : main_dcfebf93f4e
+Baseline : main_61ac3680210
 """
 
 from __future__ import annotations

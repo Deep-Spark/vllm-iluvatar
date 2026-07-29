@@ -29,6 +29,7 @@ from contextlib import nullcontext
 import ixformer.distributed as ixfd
 import torch
 from vllm import envs
+from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     get_dp_group,
     get_ep_group,
@@ -131,10 +132,13 @@ class IluFusedMoEEP:
             handle = ll_manager.get_handle(all_to_all_args)
             IluFusedMoEEP._dp_ep_ll_all2all_handle = handle
             IluFusedMoEEP._dp_ep_ll_all2all_handle_args = all_to_all_args
+
         if hasattr(handle, "buffer") and handle.buffer is None:
             from ixformer.distributed import nvsm_ep
 
-            max_tokens_per_rank = moe_config.max_num_tokens
+            max_tokens_per_rank = (
+                get_current_vllm_config().scheduler_config.max_num_seqs
+            )
             if VLLM_ILU_LL_FUSED_AG_AR or VLLM_ILU_DEEPEP_USE_SCATTER:
                 max_tokens_per_rank //= get_tensor_model_parallel_world_size()
 

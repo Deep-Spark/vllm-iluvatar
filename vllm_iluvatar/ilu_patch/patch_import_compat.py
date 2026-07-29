@@ -31,7 +31,11 @@ Shims (no-ops on stock CUDA torch):
      lack config keys that upstream vLLM patches or serializes during compile
      setup/cache-key creation, so add compatible no-op defaults before vLLM
      builds the config.
-  5. torch.ops._C compile-only quant schemas — compilation fusion modules bind
+  5. Triton Gluon import surface — community ``vllm.triton_utils`` imports
+     ``triton.experimental.gluon`` and ``triton.language.core._aggregate`` at
+     module scope. Older CoreX Triton builds do not ship those symbols, so add
+     import-only stand-ins before ``vllm.triton_utils`` is imported.
+  6. torch.ops._C compile-only quant schemas — compilation fusion modules bind
      several FP8 quant op overloads at import time. Register missing schemas as
      real dispatcher ops so FX matchers can import even when CoreX does not ship
      these CUDA kernels.
@@ -53,6 +57,7 @@ Env injection (``ilu_envs.apply()``) is intentionally NOT done here; it needs
 """
 
 import os
+import sys
 import types
 
 _applied = False
@@ -364,6 +369,82 @@ def _patch_triton_gdc_symbols() -> None:
         cuda_extra.gdc_launch_dependents = _ilu_gdc_launch_dependents
 
 
+class _IluGluonPlaceholder:
+    """Import-only placeholder for unavailable Triton Gluon symbols."""
+
+    def __getattr__(self, _name: str):
+        return self
+
+    def __call__(self, *args, **kwargs):
+        del kwargs
+        if len(args) == 1 and callable(args[0]):
+            return args[0]
+        return self
+
+
+def _identity_aggregate(obj=None, *args, **kwargs):
+    del args, kwargs
+    if obj is None:
+        return lambda wrapped: wrapped
+    return obj
+
+
+def _patch_triton_gluon_symbols() -> None:
+    """Provide import-time Triton Gluon symbols missing in older CoreX Triton.
+
+    These stand-ins are intentionally minimal. They let community modules that
+    merely import ``vllm.triton_utils`` start up; they are not a real Gluon
+    backend implementation.
+    """
+    try:
+        import triton  # noqa: F401
+        import triton.language.core as tl_core
+    except Exception:
+        return
+
+    if not hasattr(tl_core, "_aggregate"):
+        tl_core._aggregate = _identity_aggregate
+
+    try:
+        from triton.experimental import gluon as _gluon  # noqa: F401
+        from triton.experimental.gluon import language as _gl  # noqa: F401
+        return
+    except Exception:
+        pass
+
+    experimental = sys.modules.setdefault(
+        "triton.experimental", types.ModuleType("triton.experimental")
+    )
+    gluon_module = sys.modules.setdefault(
+        "triton.experimental.gluon", types.ModuleType("triton.experimental.gluon")
+    )
+    language_module = sys.modules.setdefault(
+        "triton.experimental.gluon.language",
+        types.ModuleType("triton.experimental.gluon.language"),
+    )
+    for module in (experimental, gluon_module, language_module):
+        module.__file__ = "<vllm_iluvatar.triton_gluon_shim>"
+
+    placeholder = _IluGluonPlaceholder()
+    for name in ("jit", "constexpr_function"):
+        if not hasattr(gluon_module, name):
+            setattr(gluon_module, name, _identity_aggregate)
+    if not hasattr(gluon_module, "language"):
+        gluon_module.language = language_module
+
+    def _language_getattr(_name: str):
+        if _name.startswith("__"):
+            raise AttributeError(_name)
+        return placeholder
+
+    language_module.__getattr__ = _language_getattr
+    if not hasattr(language_module, "constexpr"):
+        language_module.constexpr = placeholder
+
+    if not hasattr(experimental, "gluon"):
+        experimental.gluon = gluon_module
+
+
 def _install_import_shims() -> None:
     # Inject module *stand-in* shims into sys.modules BEFORE any deep
     # ``import vllm``.  Unlike the attribute-level shims above, these replace a
@@ -409,6 +490,7 @@ def apply() -> None:
     _applied = True
     try:
         _patch_torch()
+        _patch_triton_gluon_symbols()
         _patch_triton_gdc_symbols()
         _stub_symmetric_memory()
         _disable_unsupported_symmetric_memory()

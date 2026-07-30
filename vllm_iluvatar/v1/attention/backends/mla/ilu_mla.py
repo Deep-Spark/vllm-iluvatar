@@ -134,6 +134,7 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
         if self.kv_cache_dtype.startswith("fp8"):
             raise NotImplementedError("FP8 ILU MLA not yet supported")
+        self.use_int8_mla = envs.VLLM_ILU_MLA_ATTN_QUANT_TYPE == "INT8"
 
     def reorg_kvcache(
         self,
@@ -340,8 +341,6 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
         prefill_metadata = attn_metadata.prefill
         assert prefill_metadata.chunked_context is not None
 
-        use_int8_mla = envs.VLLM_USE_INT8_MLA
-
         output = None
         output_lse = None
         iters = len(prefill_metadata.chunked_context.seq_tot)
@@ -349,7 +348,7 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
-            if use_int8_mla:
+            if self.use_int8_mla:
                 ops.gather_cache_int8(
                     src_cache=kv_c_and_k_pe_cache,
                     src_cache_scale=kv_c_and_k_pe_cache_scale,
@@ -488,7 +487,8 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
         prefill_k = torch.empty_like(prefill_q)
 
         write_kv_cache = (None, None)
-        is_int8_mla = envs.VLLM_USE_INT8_MLA
+        if kv_cache_scale:
+            kv_cache_scale = kv_cache_scale[0]
         if kv_cache.numel() > 0:
             if has_decode:
                 decode_q_pe, decode_k_pe = layer.rotary_emb(
@@ -496,7 +496,7 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
                     decode_q[..., self.qk_nope_head_dim :],
                     k_pe[:num_decode_tokens],
                 )
-                if is_int8_mla:
+                if self.use_int8_mla:
                     kc_int8, kc_s, _ = ops.scaled_int8_quant(
                         k_c_normed[:num_decode_tokens]
                     )
@@ -534,7 +534,7 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
                     prefill_k[..., self.qk_nope_head_dim :],
                     layer.rotary_emb.cos_sin_cache,
                 )
-                if is_int8_mla:
+                if self.use_int8_mla:
                     pkc_int8, pkc_s, _ = ops.scaled_int8_quant(prefill_k_c_normed)
                     pkpe = prefill_k[..., self.qk_nope_head_dim :].contiguous()
                     pkpe_int8, pkpe_s, _ = ops.scaled_int8_quant(pkpe)
@@ -855,7 +855,6 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
             raise NotImplementedError("FP8 ILU MLA not yet supported")
 
         decode_meta = attn_metadata.decode
-        is_int8_mla = envs.VLLM_USE_INT8_MLA
 
         q_nope = self._k_up_proj(q_nope)
         q_nope = q_nope.view(-1, self.num_heads, self.kv_lora_rank)
@@ -873,7 +872,7 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
                 dtype=q_nope.dtype,
                 device=q_nope.device,
             )
-            if is_int8_mla:
+            if self.use_int8_mla:
                 q_int8, q_scale = ops.quant_kv(q)
                 attn_out, softmax_lse = ixf_ops.vllm_paged_attention_mla_int8(
                     o,
@@ -908,7 +907,7 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
             device=q_nope.device,
         )
 
-        if is_int8_mla:
+        if self.use_int8_mla:
             q = torch.cat([q_nope, q_pe], dim=-1)
             q_int8, q_scale = ops.quant_kv(q)
             ixf_ops.vllm_paged_attention_mla_int8(

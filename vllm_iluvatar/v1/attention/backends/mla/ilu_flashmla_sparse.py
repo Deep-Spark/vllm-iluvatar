@@ -3,9 +3,11 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
+import ixformer.inference.functions as ixf_ops
 import ixformer.inference.functions as ixfops
 import numpy as np
 import torch
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
@@ -431,6 +433,7 @@ class IluFlashMLASparseImpl(SparseMLACommonImpl[IluFlashMLASparseMetadata]):
         (self.q_concat_buffer,) = current_workspace_manager().get_simultaneous(
             (q_concat_shape, torch.bfloat16),
         )
+        self.use_int8_mla = envs.VLLM_ILU_MLA_ATTN_QUANT_TYPE == "INT8"
 
     def _k_up_proj(self, q_nope: torch.Tensor) -> torch.Tensor:
         # q_nope: (B, N, P), self.W_UK_T: (N, P, L)
@@ -456,7 +459,7 @@ class IluFlashMLASparseImpl(SparseMLACommonImpl[IluFlashMLASparseMetadata]):
         attn_metadata: MLACommonMetadata,
         output: torch.Tensor,
         positions: torch.Tensor | None = None,
-        kv_cache_scale: torch.Tensor | None = None,
+        kv_cache_scale: list[torch.Tensor] | None = None,
     ) -> torch.Tensor | None:
         """Iluvatar-optimized forward_impl aligned with v0.17.0.
 
@@ -495,6 +498,8 @@ class IluFlashMLASparseImpl(SparseMLACommonImpl[IluFlashMLASparseMetadata]):
         k_pe = k_pe[:num_actual_toks, ...]
         positions = positions[:num_actual_toks, ...]
         num_mqa_tokens = q.size(0)
+        if kv_cache_scale:
+            kv_cache_scale = kv_cache_scale[0]
         if num_mqa_tokens > 0:
             q = q[:num_mqa_tokens]
             q_nope, q_pe = q.split(
@@ -506,15 +511,38 @@ class IluFlashMLASparseImpl(SparseMLACommonImpl[IluFlashMLASparseMetadata]):
             q_nope = q_nope.view(-1, self.num_heads, self.kv_lora_rank)
             q = torch.cat([q_nope, q_pe], dim=-1)
             if kv_cache.numel() > 0:
-                ops.concat_and_cache_mla(
-                    k_c_normed,
-                    k_pe,
-                    kv_cache,
-                    attn_metadata.slot_mapping.flatten(),
-                    kv_cache_dtype=self.kv_cache_dtype,
-                    scale=layer._k_scale,
-                )
-            attn_out = self.forward_mqa(q, kv_cache, attn_metadata, self)
+                if self.use_int8_mla:
+                    # block_num, block_size, 2 = kv_cache_scale.shape
+                    nope_scale_cache, rope_scale_cache = kv_cache_scale.unbind(2)
+                    nope_scale_cache = nope_scale_cache.unsqueeze(-1)
+                    rope_scale_cache = rope_scale_cache.unsqueeze(-1)
+                    nope_i8, nope_scale = ixf_ops.scaled_int8_quant_for_attn(
+                        k_c_normed.unsqueeze(1), 2
+                    )
+                    rope_i8, rope_scale = ixf_ops.scaled_int8_quant_for_attn(k_pe, 2)
+                    kv_i8 = torch.cat([nope_i8, rope_i8], dim=-1).squeeze(1)
+                    kv_cache_scale = (nope_scale_cache, rope_scale_cache)
+                    torch.ops._C.concat_and_cache_dsa_int8(
+                        kv_i8,
+                        nope_scale,
+                        rope_scale,
+                        kv_cache,
+                        nope_scale_cache,
+                        rope_scale_cache,
+                        attn_metadata.slot_mapping.flatten(),
+                    )
+                else:
+                    ops.concat_and_cache_mla(
+                        k_c_normed,
+                        k_pe,
+                        kv_cache,
+                        attn_metadata.slot_mapping.flatten(),
+                        kv_cache_dtype=self.kv_cache_dtype,
+                        scale=layer._k_scale,
+                    )
+            attn_out = self.forward_mqa(
+                q, kv_cache, attn_metadata, self, kv_cache_scale
+            )
             output = torch.empty(
                 output.shape[0],
                 self.num_heads,
@@ -604,6 +632,60 @@ class IluFlashMLASparseImpl(SparseMLACommonImpl[IluFlashMLASparseMetadata]):
         output = output[:, : self.num_heads, :]
         return output
 
+    def _forward_int8_kv(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        attn_metadata: IluFlashMLASparseMetadata,
+        kv_cache_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        # Convert per-request indices to global slots (decode) or workspace
+        # offsets (prefill).
+        topk_indices = triton_convert_req_index_to_global_index(
+            attn_metadata.req_id_per_token,
+            attn_metadata.block_table,
+            topk_indices,
+            BLOCK_SIZE=attn_metadata.block_size,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+        )
+
+        return self._int8_flash_mla_kernel(
+            q, kv_c_and_k_pe_cache, topk_indices, kv_cache_scale
+        )
+
+    def _int8_flash_mla_kernel(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        kv_cache_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        num_tokens = q.shape[0]
+        topk_indices = topk_indices.view(num_tokens, 1, -1)
+        kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.reshape(
+            -1, 1, kv_c_and_k_pe_cache.shape[-1]
+        )
+        nope_scale_cache, rope_scale_cache = kv_cache_scale
+        nope_scale_cache = nope_scale_cache.reshape(-1, 1)
+        rope_scale_cache = rope_scale_cache.reshape(-1, 1)
+        i8_q, q_scale = ixf_ops.scaled_int8_quant_for_attn(
+            q,
+            2,
+            transpose_scale=False,
+        )
+        return ixf_ops.sparse_flash_attn_int8(
+            i8_q,
+            kv_c_and_k_pe_cache,
+            kv_c_and_k_pe_cache[..., :512],
+            q_scale,
+            nope_scale_cache,
+            rope_scale_cache,
+            topk_indices,
+            self.softmax_scale,
+            output_dtype=q.dtype,
+        )
+
     def setup_projections(
         self,
         layer: "MLAAttention",
@@ -617,6 +699,7 @@ class IluFlashMLASparseImpl(SparseMLACommonImpl[IluFlashMLASparseMetadata]):
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: IluFlashMLASparseMetadata,
         layer: AttentionLayer,
+        kv_cache_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # NOTE(lucas): for the sparse FlashMLA kernels the kernels want to use
         # MQA 576/512 approach for both prefill and decode
@@ -633,9 +716,14 @@ class IluFlashMLASparseImpl(SparseMLACommonImpl[IluFlashMLASparseMetadata]):
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
-        attn_out = self._forward_bf16_kv(
-            q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
-        )
+        if self.use_int8_mla:
+            attn_out = self._forward_int8_kv(
+                q, kv_c_and_k_pe_cache, topk_indices, attn_metadata, kv_cache_scale
+            )
+        else:
+            attn_out = self._forward_bf16_kv(
+                q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
+            )
 
         return attn_out
 

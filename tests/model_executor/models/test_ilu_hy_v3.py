@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the Iluvatar OOT HunYuan-V3 (no-MTP) model.
+"""Tests for the Iluvatar OOT HunYuan-V3 model.
 
 Covers:
   * OOT registration: ``HYV3ForCausalLM`` resolves to the plugin subclass, which

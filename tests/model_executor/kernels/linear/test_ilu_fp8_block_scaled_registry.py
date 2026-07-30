@@ -8,7 +8,8 @@ without a GPU):
   ``_POSSIBLE_FP8_BLOCK_KERNELS[CUDA]`` and is idempotent + arch-gated
   (corex30 / ivcore30 only);
 * ``is_supported`` gates on the module-level ``_is_ivcore30_fn`` predicate;
-* ``apply_block_scaled_mm`` reproduces the block dequant + matmul reference
+* ``_apply_block_scaled_mm_torch`` (the retained pure-torch block reference, no
+  longer on the runtime path) reproduces the block dequant + matmul reference
   (K/N group indexing, per-token/per-block scale broadcast, e8m0 decode and the
   non-divisible tail-block edge).
 
@@ -34,15 +35,23 @@ from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_kernel(gn: int, gk: int, out_dtype: torch.dtype) -> IluFp8BlockScaledMMKernel:
+def _make_kernel(
+    gn: int,
+    gk: int,
+    out_dtype: torch.dtype,
+    apply_input_quant: bool = True,
+) -> IluFp8BlockScaledMMKernel:
     """Build a kernel without running ``__init__`` (which needs a full config).
 
-    ``apply_block_scaled_mm`` only reads ``weight_group_shape`` and
-    ``config.out_dtype``.
+    ``_apply_block_scaled_mm_torch`` only reads ``weight_group_shape``,
+    ``config.out_dtype`` and ``apply_input_quant``. The block reference tests here
+    pass a per-block activation scale ``As``, so ``apply_input_quant`` defaults to
+    True to exercise the full dequant-both math.
     """
     k = IluFp8BlockScaledMMKernel.__new__(IluFp8BlockScaledMMKernel)
     k.weight_group_shape = (gn, gk)
     k.config = types.SimpleNamespace(out_dtype=out_dtype)
+    k.apply_input_quant = apply_input_quant
     return k
 
 
@@ -215,7 +224,7 @@ def test_dequant_matches_reference(M, N, K, gn, gk):
     Bs = torch.rand(n_tiles, k_tiles, dtype=torch.float32) * 0.5 + 0.1
 
     kernel = _make_kernel(gn, gk, torch.float32)
-    out = kernel.apply_block_scaled_mm(A, B, As, Bs)
+    out = kernel._apply_block_scaled_mm_torch(A, B, As, Bs)
     ref = _ref_block_mm(A, B, As, Bs, gn, gk, torch.float32)
 
     assert out.shape == (M, N)
@@ -233,7 +242,7 @@ def test_dequant_e8m0_weight_scale():
     Bs = exps.view(torch.float8_e8m0fnu)
 
     kernel = _make_kernel(gn, gk, torch.float32)
-    out = kernel.apply_block_scaled_mm(A, B, As, Bs)
+    out = kernel._apply_block_scaled_mm_torch(A, B, As, Bs)
     ref = _ref_block_mm(A, B, As, Bs, gn, gk, torch.float32)
 
     torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-3)
@@ -247,5 +256,5 @@ def test_returns_configured_out_dtype():
     Bs = torch.rand(1, 1, dtype=torch.float32) * 0.5 + 0.1
 
     kernel = _make_kernel(gn, gk, torch.bfloat16)
-    out = kernel.apply_block_scaled_mm(A, B, As, Bs)
+    out = kernel._apply_block_scaled_mm_torch(A, B, As, Bs)
     assert out.dtype == torch.bfloat16

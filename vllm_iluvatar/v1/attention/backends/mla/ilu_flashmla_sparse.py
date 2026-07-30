@@ -157,6 +157,16 @@ class IluFlashMLASparseMetadata(AttentionMetadata):
     # ds4_combine_topk_swa_indices.
     c128a_prefill_topk_indices: torch.Tensor | None = None
 
+    # fp8-only (dormant for W4A8, stays None): merged all-token global-paged
+    # C128A top-k, i.e. decode-global rows concatenated with globalized prefill
+    # rows over ``[0:num_actual_tokens]``. Populated once per step by
+    # ``IluDeepseekV4Fp8FlashMLASparseMetadataBuilder`` (方案 A) so the fp8
+    # ``forward_mqa`` reads the ready-to-use extra top-k directly instead of
+    # re-globalizing/merging per C128 layer. Both are views of fixed-address
+    # builder buffers for CUDA-graph capture/replay.
+    c128a_global_topk_indices: torch.Tensor | None = None  # [num_actual, W] int32
+    c128a_topk_lens: torch.Tensor | None = None  # [num_actual] int32
+
 
 def get_prefill_workspace_size(max_model_len: int):
     # NOTE(Lucas): 5 is a magic number for controlling the prefill buffer size.

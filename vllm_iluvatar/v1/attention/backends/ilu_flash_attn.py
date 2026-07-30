@@ -1,64 +1,81 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Attention layer with FlashAttention for Iluvatar platform."""
+"""Iluvatar Flash Attention backend metadata.
+Corresponds to: vllm/v1/attention/backends/flash_attn.py
+Baseline: main_dcfebf93f4e
+Why: Iluvatar optimized flash attention kernels.
+How: Reuse the official ``FLASH_ATTN`` enum member via platform backend
+     registration.
+Scope: always enabled if a model contains Attention Module.
+Remove: No.
+"""
 
 import copy
 from dataclasses import dataclass
-from typing import ClassVar,Union, List
+from enum import Enum
+from typing import ClassVar
 
+import ixformer.inference.functions as ixf_ops
 import numpy as np
 import torch
-
-from vllm.model_executor.layers.attention import Attention
-from vllm.utils.torch_utils import is_quantized_kv_cache
-from vllm.v1.attention.backend import (
-    AttentionBackend,
-    AttentionImpl,
-    AttentionType,
-    MultipleOf,
-)
-from vllm.v1.attention.backends.fa_utils import (
-    flash_attn_supports_sinks,
+import vllm.envs as envs
+from ixformer.contrib.vllm_flash_attn import (
     flash_attn_varlen_func,
-    get_flash_attn_version,
-    is_flash_attn_varlen_func_available,
-    reshape_and_cache_flash,
-)
-from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
-from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
-from ixformer.contrib.vllm_flash_attn import (  # type: ignore[import]
     flash_attn_varlen_int8_func,
     flash_attn_with_kvcache,
     merge_attn_states,
 )
-
-import vllm.envs as envs
+from vllm import _custom_ops as ops  # type: ignore[import]
 from vllm.config import (
     VllmConfig,
-    get_current_vllm_config,
     get_current_vllm_config_or_none,
     get_layers_from_vllm_config,
 )
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms.interface import DeviceCapability
-from vllm.utils.math_utils import cdiv, round_up
+from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
+    AttentionBackend,
     AttentionCGSupport,
+    AttentionImpl,
     AttentionMetadataBuilder,
+    AttentionType,
     CommonAttentionMetadata,
+    MultipleOf,
+)
+from vllm.v1.attention.backends.fa_utils import (
+    is_flash_attn_varlen_func_available,
 )
 from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     get_kv_cache_layout,
     split_decodes_and_prefills,
 )
+from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.kv_cache_interface import AttentionSpec
-from vllm import _custom_ops as ops  # type: ignore[import]
-import ixformer.inference.functions as ixf_ops
+
+from vllm_iluvatar.v1.attention.ilu_static_quant import StaticQuantManager
+
 logger = init_logger(__name__)
-from enum import Enum
+
+
+def get_flash_attn_version(
+    requires_alibi: bool = False,
+    head_size: int | None = None,
+    head_size_v: int | None = None,
+    has_sinks: bool = False,
+) -> int | None:
+    return None
+
+
+def flash_attn_supports_sinks() -> bool:
+    return True
+
 
 class QueryLenSupport(Enum):
     """Defines the level of query length support for an attention backend's
@@ -75,6 +92,7 @@ class QueryLenSupport(Enum):
     SINGLE_ONLY = "single_only"
     UNIFORM = "uniform"
     VARLEN = "varlen"
+
 
 class IluFlashAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
@@ -97,7 +115,7 @@ class IluFlashAttentionBackend(AttentionBackend):
         # prepare_kernel_block_sizes pick 192 and triggered CUINFER_STATUS_BAD_PARAM.
         return [16, 32, 64, 128, 256]
 
-    forward_includes_kv_cache_update: bool = False
+    forward_includes_kv_cache_update: bool = True
 
     @staticmethod
     def get_name() -> str:
@@ -138,8 +156,8 @@ class IluFlashAttentionBackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
-        if envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE == "KVINT8":
-            return (2, num_blocks, num_kv_heads, block_size, head_size)
+        if envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE == "KINT8":
+            return (3, num_blocks, num_kv_heads, block_size, head_size)
         return (2, num_blocks, num_kv_heads, block_size, head_size)
 
     @staticmethod
@@ -173,9 +191,7 @@ class IluFlashAttentionBackend(AttentionBackend):
         return head_size in cls.SUPPORTED_HEAD_SIZES
 
     @classmethod
-    def supports_kv_cache_dtype(
-        cls, kv_cache_dtype: CacheDType | None
-    ) -> bool:
+    def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
         if kv_cache_dtype is None:
             return True
         if kv_cache_dtype in ("fp8", "fp8_e4m3"):
@@ -189,9 +205,7 @@ class IluFlashAttentionBackend(AttentionBackend):
         return flash_attn_supports_sinks()
 
     @classmethod
-    def supports_compute_capability(
-        cls, capability: DeviceCapability
-    ) -> bool:
+    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return capability >= DeviceCapability(8, 0)
 
     @classmethod
@@ -245,7 +259,6 @@ class IluFlashAttentionMetadata:
     num_decodes: int
     num_decode_tokens: int
     num_prefills: int
-    
 
     use_cascade: bool
     common_prefix_len: int
@@ -314,9 +327,7 @@ class IluFlashAttentionMetadataBuilder(
         self.num_heads_q = self.model_config.get_num_attention_heads(
             self.parallel_config
         )
-        self.num_heads_kv = self.model_config.get_num_kv_heads(
-            self.parallel_config
-        )
+        self.num_heads_kv = self.model_config.get_num_kv_heads(self.parallel_config)
         self.kv_cache_dtype = kv_cache_spec.dtype
         self.headdim = self.model_config.get_head_size()
         self.block_size = kv_cache_spec.block_size
@@ -340,16 +351,30 @@ class IluFlashAttentionMetadataBuilder(
         self.use_full_cuda_graph = (
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
         )
-        self.max_cudagraph_size = (
-            self.compilation_config.max_cudagraph_capture_size
+        self.max_cudagraph_size = self.compilation_config.max_cudagraph_capture_size
+        self.has_spec = (
+            self.vllm_config.speculative_config is not None
+            and self.vllm_config.speculative_config.num_speculative_tokens is not None
         )
         # Align decode/prefill split threshold with speculative decode query length
         # when backend supports treating spec requests as decode.
         supports_spec_decode = self.query_len_support != QueryLenSupport.SINGLE_ONLY
-        self._init_reorder_batch_threshold(self.reorder_batch_threshold, supports_spec_decode)
+        self._init_reorder_batch_threshold(
+            self.reorder_batch_threshold, supports_spec_decode
+        )
 
+        max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+        self.decode_cu_seqlens_q = torch.arange(
+            vllm_config.scheduler_config.max_num_seqs + 1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.decode_cu_seqlens_k = torch.zeros(
+            vllm_config.scheduler_config.max_num_seqs + 1,
+            dtype=torch.int32,
+            device=self.device,
+        )
         if self.dcp_world_size > 1:
-            max_num_reqs = vllm_config.scheduler_config.max_num_seqs
             self._dcp_context_kv_lens = torch.zeros(
                 max_num_reqs,
                 dtype=torch.int32,
@@ -379,17 +404,16 @@ class IluFlashAttentionMetadataBuilder(
         slot_mapping = common_attn_metadata.slot_mapping
         causal = common_attn_metadata.causal
 
-        key_start_loc = torch.zeros(
-            num_reqs + 1, dtype=torch.int32, device=self.device
-        )
+        key_start_loc = torch.zeros(num_reqs + 1, dtype=torch.int32, device=self.device)
         torch.cumsum(seq_lens[:num_reqs], dim=0, out=key_start_loc[1:])
 
-        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = \
+        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
                 common_attn_metadata,
                 decode_threshold=self.reorder_batch_threshold,
                 require_uniform=(self.query_len_support != QueryLenSupport.VARLEN),
             )
+        )
         assert num_decodes + num_prefills == num_reqs
         assert num_decode_tokens + num_prefill_tokens == num_actual_tokens
 
@@ -429,9 +453,7 @@ class IluFlashAttentionMetadataBuilder(
             )
             dcp_cu_seqlens_k = self._dcp_cu_seqlens_k[: num_reqs + 1]
 
-            num_partitions = (
-                self.dcp_world_size * self.cp_kv_cache_interleave_size
-            )
+            num_partitions = self.dcp_world_size * self.cp_kv_cache_interleave_size
             max_dcp_context_kv_len = (
                 (max_seq_len + num_partitions - 1) // num_partitions
             ) * self.cp_kv_cache_interleave_size
@@ -461,9 +483,7 @@ class IluFlashAttentionMetadataBuilder(
         if num_prefills > 0:
             prefill_metadata = IluFlashAttentionPrefillMetadata(
                 block_table=block_table_tensor[num_decodes:],
-                query_start_loc=(
-                    query_start_loc[num_decodes:] - num_decode_tokens
-                ),
+                query_start_loc=(query_start_loc[num_decodes:] - num_decode_tokens),
                 key_start_loc=(
                     key_start_loc[num_decodes:] - key_start_loc[num_decodes]
                 ),
@@ -471,22 +491,13 @@ class IluFlashAttentionMetadataBuilder(
             )
 
         if num_decodes > 0:
-            decode_query_start_loc = query_start_loc[:num_decodes + 1]
-            decode_query_lens = (
-                decode_query_start_loc[1:] - decode_query_start_loc[:-1]
-            )
+            decode_query_start_loc = query_start_loc[: num_decodes + 1]
+            decode_query_lens = decode_query_start_loc[1:] - decode_query_start_loc[:-1]
             decode_seq_lens = seq_lens[:num_decodes]
-            decode_cu_seqlens_q = torch.arange(
-                0,
-                num_decodes + 1,
-                dtype=torch.int32,
-                device=seq_lens.device,
-            )
-            decode_cu_seqlens_k = torch.zeros(
-                num_decodes + 1,
-                dtype=torch.int32,
-                device=seq_lens.device,
-            )
+            decode_cu_seqlens_q = self.decode_cu_seqlens_q[: num_decodes + 1]
+            if self.has_spec:
+                decode_cu_seqlens_q[1:] = decode_query_lens.cumsum(0)
+            decode_cu_seqlens_k = self.decode_cu_seqlens_k[: num_decodes + 1]
             decode_cu_seqlens_k[1:] = decode_seq_lens.cumsum(0)
             decode_metadata = IluFlashAttentionDecodeMetadata(
                 block_table=block_table_tensor[:num_decodes],
@@ -620,12 +631,35 @@ class IluFlashAttentionImpl(AttentionImpl):
             if self.vllm_flash_attn_version is not None
             else False
         )
-        _supported_quant = {"", "KVINT8"}
-        self.quant_type = envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE
-        assert self.quant_type in _supported_quant, (
-            f"VLLM_ILU_FLASH_ATTN_QUANT_TYPE only supports {_supported_quant}, "
-            f"got {self.quant_type!r}"
+        supported_quant_types = {"", "KVINT8", "KINT8"}
+        attn_quant_type = envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE
+        assert attn_quant_type in supported_quant_types, (
+            "VLLM_ILU_FLASH_ATTN_QUANT_TYPE only supports '', 'KVINT8', "
+            f"or 'KINT8', but got {attn_quant_type!r}"
         )
+        self.quant_type = attn_quant_type
+        post_quant_kv_int8_path = envs.VLLM_ILU_FLASH_ATTN_V_SCALE_PATH
+        if post_quant_kv_int8_path != "":
+            assert attn_quant_type in ["", "KVINT8"]
+            self.is_post_quant_kv_int8 = attn_quant_type == ""
+            import os
+
+            assert self.is_post_quant_kv_int8 != os.path.exists(post_quant_kv_int8_path)
+            self.post_quant_kv_int8_path = post_quant_kv_int8_path
+        else:
+            self.is_post_quant_kv_int8 = False
+            self.post_quant_kv_int8_path = None
+        if self.quant_type == "KVINT8":
+            assert self.post_quant_kv_int8_path is not None and os.path.exists(
+                post_quant_kv_int8_path
+            )
+        self.forward = {
+            "": self._forward_unquantized
+            if not self.is_post_quant_kv_int8
+            else self._forward_unquantized_with_post_quant,
+            "KVINT8": self._forward_kv_int8,
+            "KINT8": self._forward_k_int8,
+        }[attn_quant_type]
 
         vllm_config = get_current_vllm_config_or_none()
         dcp_a2a = (
@@ -633,9 +667,25 @@ class IluFlashAttentionImpl(AttentionImpl):
             and vllm_config.parallel_config.decode_context_parallel_size > 1
             and vllm_config.parallel_config.dcp_comm_backend == "a2a"
         )
-        self.dcp_combine = (
-            dcp_a2a_lse_reduce if dcp_a2a else cp_lse_ag_out_rs
-        )
+        # for static quant.
+        hf_config = vllm_config.model_config.hf_config
+        try_get_kv_head_nums = [
+            "num_key_value_heads",
+        ]
+        self.total_num_kv_heads = None
+        for name in try_get_kv_head_nums:
+            if hasattr(hf_config, "text_config"):
+                hf_config = hf_config.text_config
+            if (num_kv_heads := getattr(hf_config, name, None)) is not None:
+                self.total_num_kv_heads = num_kv_heads
+                break
+        if self.is_post_quant_kv_int8:
+            if self.total_num_kv_heads is None:
+                self.total_num_kv_heads = envs.VLLM_ILU_FLASH_ATTN_TOTAL_KV_HEADS
+            assert self.total_num_kv_heads > 0, (
+                f"The total kv heads(config.json) must > 0, but get {self.total_num_kv_heads}"
+            )
+        self.dcp_combine = dcp_a2a_lse_reduce if dcp_a2a else cp_lse_ag_out_rs
 
     def forward(
         self,
@@ -646,40 +696,35 @@ class IluFlashAttentionImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         attn_metadata: IluFlashAttentionMetadata,
         output: torch.Tensor,
-        kv_cache_scale: Union[torch.Tensor, List[torch.Tensor]] | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Forward pass with FlashAttention (ixformer backend).
+        return self._forward_unquantized(
+            layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output,
+            output_scale,
+            output_block_scale,
+        )
 
-        Args:
-            query: shape = [num_tokens, num_heads, head_size]
-            key: shape = [num_tokens, num_kv_heads, head_size]
-            value: shape = [num_tokens, num_kv_heads, head_size]
-            kv_cache: shape =
-                [2, num_blocks, num_kv_heads, block_size, head_size]
-            attn_metadata: Metadata for attention.
-            kv_cache_scale = [num_blocks, num_kv_heads, block_size] + [num_kv_heads, head_size]
-        Returns:
-            shape = [num_tokens, num_heads * head_size]
-        """
-        if output_scale is not None or output_block_scale is not None:
-            raise NotImplementedError(
-                "fused output quantization is not yet supported"
-            )
-
+    def _maybe_forward_encoder(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: IluFlashAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor | None:
         if attn_metadata is None:
             return output.fill_(0)
 
-        softmax_scale: float = self.scale
-        window_size = self.sliding_window
-        alibi_slopes: torch.Tensor = self.alibi_slopes
-        logits_soft_cap: float = self.logits_soft_cap
-
-        attn_type = self.attn_type
         num_actual_tokens = attn_metadata.num_actual_tokens
-
-        if attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
+        if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             return self._forward_encoder_attention(
                 query[:num_actual_tokens],
                 key[:num_actual_tokens],
@@ -688,277 +733,17 @@ class IluFlashAttentionImpl(AttentionImpl):
                 attn_metadata,
                 layer,
             )
+        return None
 
-        has_decode = attn_metadata.num_decodes > 0
-        has_prefill = attn_metadata.num_prefills > 0
-        num_decode_tokens = attn_metadata.num_decode_tokens
-
-        decode_only = has_decode and not has_prefill
-        if self.quant_type == "KVINT8":
-            i8_key_cache, i8_value_cache = kv_cache.unbind(0)
-            num_blocks, num_kv_heads, block_size, head_size = i8_key_cache.shape
-
-            scale_dict = getattr(layer, "kv_cache_scale", None)
-            assert scale_dict is not None, (
-                "KVINT8 requires layer.kv_cache_scale to be set by "
-                "IluvatarGPUModelRunner.initialize_kv_cache_tensors"
-            )
-            key_scale_cache = scale_dict["k_scale_cache"]
-            value_scale_cache = scale_dict["v_scale"]
-            value_cache_info = (i8_value_cache, value_scale_cache)
-        else:
-            key_cache, value_cache = kv_cache.unbind(0)
-            
-
-        if is_quantized_kv_cache(self.kv_cache_dtype):
-            dtype = IluFlashAttentionBackend.get_fp8_dtype_for_flashattn(
-                self.kv_cache_dtype
-            )
-            key_cache = key_cache.view(dtype)
-            value_cache = value_cache.view(dtype)
-
-        if not attn_metadata.use_cascade:
-            prefill_output = output[num_decode_tokens:]
-            decode_output = output[:num_decode_tokens]
-
-            if self.quant_type == "KVINT8":
-                if decode_only:
-                    int8_query, query_scale = ixf_ops.scaled_int8_quant_for_attn(
-                        query, 2, transpose_scale=False
-                    )
-                    i8_key, key_scale = ixf_ops.scaled_int8_quant_for_attn(
-                        key, 2, transpose_scale=False
-                    )
-                    i8_value, _value_scale = ixf_ops.scaled_int8_quant_for_attn(
-                        value, 0, transpose_scale=False, scale=value_cache_info[1]
-                    )
-                else:
-                    int8_query, query_scale = ixf_ops.scaled_int8_quant_for_attn(
-                        query, 2, transpose_scale=True
-                    )
-                    i8_key, key_scale = ixf_ops.scaled_int8_quant_for_attn(
-                        key, 2, transpose_scale=False
-                    )
-                    i8_value, _value_scale = ixf_ops.scaled_int8_quant_for_attn(
-                        value, 0, transpose_scale=False, scale=value_cache_info[1]
-                    )
-
-            if (
-                self.kv_sharing_target_layer_name is None
-                and key is not None
-                and value is not None
-            ):
-                if self.quant_type == "KVINT8":
-                    if has_prefill:
-                        if not hasattr(self, '_kvint8_cache_logged'):
-                            import sys
-                            self._kvint8_cache_logged = True
-                            print(
-                                f"[KVINT8 cache_write] "
-                                f"key={i8_key.shape}, value={i8_value.shape}, "
-                                f"k_scale={key_scale.shape}, "
-                                f"key_cache={i8_key_cache.shape}, "
-                                f"value_cache={value_cache_info[0].shape}, "
-                                f"key_scale_cache={key_scale_cache.shape}, "
-                                f"slot_mapping={attn_metadata.slot_mapping.shape}",
-                                file=sys.stderr, flush=True,
-                            )
-                        ixf_ops.reshape_and_cache_flash_int8(
-                            key=i8_key,
-                            value=i8_value,
-                            k_scale=key_scale,
-                            key_cache=i8_key_cache,
-                            value_cache=value_cache_info[0],
-                            key_scale_cache=key_scale_cache,
-                            slot_mapping=attn_metadata.slot_mapping,
-                            kv_cache_dtype="",
-                        )
-                else:
-                    ops.reshape_and_cache_flash(
-                        key,
-                        value,
-                        key_cache,
-                        value_cache,
-                        attn_metadata.slot_mapping,
-                        self.kv_cache_dtype,
-                        layer._k_scale,
-                        layer._v_scale,
-                    )
-
-            if has_prefill and attn_metadata.prefill is not None:
-                prefill_q = query[num_decode_tokens:num_actual_tokens]
-                prefill_k = key[num_decode_tokens:num_actual_tokens]
-                prefill_v = value[num_decode_tokens:num_actual_tokens]
-                prefill_out_slice = prefill_output[: prefill_q.shape[0]]
-                sliding_window_size = (
-                    list(self.sliding_window)
-                    if self.sliding_window is not None
-                    else (-1, -1)
-                )
-                if self.dcp_world_size > 1:
-                    if self.quant_type == "KVINT8":
-                        raise NotImplementedError(
-                            "DCP prefill is not supported with int8 attention yet"
-                        )
-                    self._forward_prefill_with_dcp(
-                        prefill_q,
-                        prefill_k,
-                        prefill_v,
-                        prefill_out_slice,
-                        attn_metadata,
-                    )
-                elif self.quant_type == "KVINT8":
-                    flash_attn_varlen_int8_func(
-                        q=int8_query[num_decode_tokens:],
-                        k=i8_key_cache,
-                        v=value_cache_info[0],
-                        q_scale=query_scale[:, num_decode_tokens:],
-                        k_scale=key_scale_cache,
-                        v_scale=value_cache_info[1],
-                        cu_seqlens_q=attn_metadata.prefill.query_start_loc,
-                        cu_seqlens_k=attn_metadata.prefill.key_start_loc,
-                        max_seqlen_q=attn_metadata.prefill.max_query_len,
-                        max_seqlen_k=attn_metadata.max_seq_len,
-                        softmax_scale=softmax_scale,
-                        causal=attn_metadata.causal,
-                        window_size=sliding_window_size,
-                        alibi_slopes=alibi_slopes,
-                        softcap=logits_soft_cap,
-                        out=prefill_out_slice,
-                        block_table=attn_metadata.prefill.block_table,
-                        output_dtype=query.dtype,
-                    )
-                else:
-                    flash_attn_varlen_func(
-                        q=prefill_q,
-                        k=key_cache,
-                        v=value_cache,
-                        out=prefill_out_slice,
-                        cu_seqlens_q=attn_metadata.prefill.query_start_loc,
-                        cu_seqlens_k=attn_metadata.prefill.key_start_loc,
-                        max_seqlen_q=attn_metadata.prefill.max_query_len,
-                        max_seqlen_k=attn_metadata.max_seq_len,
-                        softmax_scale=softmax_scale,
-                        causal=attn_metadata.causal,
-                        alibi_slopes=alibi_slopes,
-                        sinks=self.sinks,
-                        window_size=sliding_window_size,
-                        block_table=attn_metadata.prefill.block_table,
-                        softcap=logits_soft_cap,
-                    )
-
-            if has_decode and attn_metadata.decode is not None:
-                if self.dcp_world_size > 1:
-                    self._forward_with_dcp(
-                        query[:num_decode_tokens],
-                        key[:num_decode_tokens],
-                        value[:num_decode_tokens],
-                        key_cache,
-                        value_cache,
-                        decode_output,
-                        attn_metadata,
-                    )
-                elif self.quant_type == "KVINT8":
-                    para_dict = dict(
-                        output=decode_output,
-                        query=int8_query[:num_decode_tokens],
-                        key_cache=i8_key_cache,
-                        query_scale=query_scale[:num_decode_tokens] if decode_only else query_scale[:, :num_decode_tokens].t().contiguous(),
-                        key_scale_cache=key_scale_cache,
-                        num_kv_heads=self.num_kv_heads,
-                        scale=softmax_scale,
-                        block_tables=attn_metadata.decode.block_table,
-                        context_lens=attn_metadata.decode.seq_lens,
-                        block_size=i8_key_cache.shape[-2],
-                        softcap=logits_soft_cap,
-                        alibi_slopes=alibi_slopes,
-                        causal=True,
-                        window_left=window_size[0],
-                        window_right=window_size[1],
-                        use_cuda_graph=attn_metadata.decode.use_graph if decode_only else False,
-                        max_context_len=attn_metadata.decode.max_decode_seq_len,
-                        cu_query_lens=attn_metadata.decode.query_start_loc,
-                        max_query_len=attn_metadata.decode.max_query_len,
-                        value_cache=value_cache_info[0],
-                        value_scale_cache=value_cache_info[1],
-                    )
-                    if decode_only:
-                        para_dict.update(
-                            dict(
-                                save_key=i8_key[:num_decode_tokens],
-                                save_value=i8_value[:num_decode_tokens],
-                                save_key_scale=key_scale[:num_decode_tokens],
-                            )
-                        )
-                    if not hasattr(self, '_kvint8_logged'):
-                        import sys
-                        self._kvint8_logged = True
-                        print(
-                            f"[KVINT8 paged_attn] decode_only={decode_only}, "
-                            f"max_query_len={para_dict.get('max_query_len')}, "
-                            f"block_size={para_dict['block_size']}, "
-                            f"query={para_dict['query'].shape} {para_dict['query'].dtype}, "
-                            f"key_cache={para_dict['key_cache'].shape}, "
-                            f"value_cache={para_dict['value_cache'].shape}, "
-                            f"query_scale={para_dict['query_scale'].shape}, "
-                            f"key_scale_cache={para_dict['key_scale_cache'].shape}, "
-                            f"value_scale_cache={para_dict['value_scale_cache'].shape}, "
-                            f"block_tables={para_dict['block_tables'].shape}, "
-                            f"context_lens={para_dict['context_lens'].shape} "
-                            f"max={para_dict['context_lens'].max().item()}, "
-                            f"max_context_len={para_dict['max_context_len']}, "
-                            f"num_kv_heads={para_dict['num_kv_heads']}, "
-                            f"save_key={'present' if para_dict.get('save_key') is not None else 'None'}, "
-                            f"cu_query_lens={para_dict.get('cu_query_lens') is not None}",
-                            file=sys.stderr, flush=True,
-                        )
-                    ixf_ops.vllm_paged_attention_int8(**para_dict)
-                else:
-                    decode_q = query[:num_decode_tokens]
-                    if self.head_size >= 512:
-                        sliding_window_size = (
-                            list(self.sliding_window)
-                            if self.sliding_window is not None
-                            else (-1, -1)
-                        )
-                        flash_attn_varlen_func(
-                            q=decode_q,
-                            k=key_cache,
-                            v=value_cache,
-                            out=decode_output,
-                            cu_seqlens_q=attn_metadata.decode.cu_seqlens_q,
-                            cu_seqlens_k=attn_metadata.decode.cu_seqlens_k,
-                            max_seqlen_q=1,
-                            max_seqlen_k=attn_metadata.decode.max_decode_seq_len,
-                            softmax_scale=softmax_scale,
-                            causal=True,
-                            alibi_slopes=alibi_slopes,
-                            window_size=sliding_window_size,
-                            block_table=attn_metadata.decode.block_table,
-                            softcap=logits_soft_cap,
-                        )
-                    else:
-                        flash_attn_with_kvcache(
-                            q=decode_q.unsqueeze(1),
-                            k_cache=key_cache,
-                            v_cache=value_cache,
-                            block_table=attn_metadata.decode.block_table,
-                            cache_seqlens=attn_metadata.decode.seq_lens,
-                            max_query_len=attn_metadata.decode.max_query_len,
-                            cu_query_lens=attn_metadata.decode.query_start_loc,
-                            softmax_scale=softmax_scale,
-                            causal=True,
-                            window_size=window_size,
-                            alibi_slopes=alibi_slopes,
-                            softcap=logits_soft_cap,
-                            sinks=self.sinks,
-                            out=decode_output.unsqueeze(1),
-                            use_cuda_graph=attn_metadata.decode.use_graph,
-                            max_context_len=attn_metadata.decode.max_decode_seq_len,
-                        )
-
-            return output
-
+    def _forward_cascade(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: IluFlashAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        num_actual_tokens = attn_metadata.num_actual_tokens
         cascade_attention(
             output[:num_actual_tokens],
             query[:num_actual_tokens],
@@ -980,6 +765,478 @@ class IluFlashAttentionImpl(AttentionImpl):
         )
         return output
 
+    def _forward_unquantized(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: IluFlashAttentionMetadata,
+        output: torch.Tensor,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if output_scale is not None or output_block_scale is not None:
+            raise NotImplementedError("fused output quantization is not yet supported")
+        early_output = self._maybe_forward_encoder(
+            layer, query, key, value, attn_metadata, output
+        )
+        if early_output is not None:
+            return early_output
+
+        key_cache, value_cache = kv_cache.unbind(0)
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            dtype = IluFlashAttentionBackend.get_fp8_dtype_for_flashattn(
+                self.kv_cache_dtype
+            )
+            key_cache = key_cache.view(dtype)
+            value_cache = value_cache.view(dtype)
+
+        if attn_metadata.use_cascade:
+            return self._forward_cascade(
+                query, key_cache, value_cache, attn_metadata, output
+            )
+
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        prefill_output = output[num_decode_tokens:]
+        decode_output = output[:num_decode_tokens]
+
+        if (
+            self.kv_sharing_target_layer_name is None
+            and key is not None
+            and value is not None
+        ):
+            ops.reshape_and_cache_flash(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                attn_metadata.slot_mapping,
+                self.kv_cache_dtype,
+                layer._k_scale,
+                layer._v_scale,
+            )
+
+        if attn_metadata.num_prefills > 0 and attn_metadata.prefill is not None:
+            prefill_q = query[num_decode_tokens:num_actual_tokens]
+            prefill_k = key[num_decode_tokens:num_actual_tokens]
+            prefill_v = value[num_decode_tokens:num_actual_tokens]
+            prefill_out_slice = prefill_output[: prefill_q.shape[0]]
+            sliding_window_size = (
+                list(self.sliding_window)
+                if self.sliding_window is not None
+                else (-1, -1)
+            )
+            if self.dcp_world_size > 1:
+                self._forward_prefill_with_dcp(
+                    prefill_q,
+                    prefill_k,
+                    prefill_v,
+                    prefill_out_slice,
+                    attn_metadata,
+                )
+            else:
+                flash_attn_varlen_func(
+                    q=prefill_q,
+                    k=key_cache,
+                    v=value_cache,
+                    out=prefill_out_slice,
+                    cu_seqlens_q=attn_metadata.prefill.query_start_loc,
+                    cu_seqlens_k=attn_metadata.prefill.key_start_loc,
+                    max_seqlen_q=attn_metadata.prefill.max_query_len,
+                    max_seqlen_k=attn_metadata.max_seq_len,
+                    softmax_scale=self.scale,
+                    causal=attn_metadata.causal,
+                    alibi_slopes=self.alibi_slopes,
+                    sinks=self.sinks,
+                    window_size=sliding_window_size,
+                    block_table=attn_metadata.prefill.block_table,
+                    softcap=self.logits_soft_cap,
+                )
+
+        if attn_metadata.num_decodes > 0 and attn_metadata.decode is not None:
+            if self.dcp_world_size > 1:
+                self._forward_with_dcp(
+                    query[:num_decode_tokens],
+                    key[:num_decode_tokens],
+                    value[:num_decode_tokens],
+                    key_cache,
+                    value_cache,
+                    decode_output,
+                    attn_metadata,
+                )
+            else:
+                decode_q = query[:num_decode_tokens]
+                if self.head_size >= 512:
+                    sliding_window_size = (
+                        list(self.sliding_window)
+                        if self.sliding_window is not None
+                        else (-1, -1)
+                    )
+                    flash_attn_varlen_func(
+                        q=decode_q,
+                        k=key_cache,
+                        v=value_cache,
+                        out=decode_output,
+                        cu_seqlens_q=attn_metadata.decode.cu_seqlens_q,
+                        cu_seqlens_k=attn_metadata.decode.cu_seqlens_k,
+                        max_seqlen_q=1,
+                        max_seqlen_k=attn_metadata.decode.max_decode_seq_len,
+                        softmax_scale=self.scale,
+                        causal=True,
+                        alibi_slopes=self.alibi_slopes,
+                        window_size=sliding_window_size,
+                        block_table=attn_metadata.decode.block_table,
+                        softcap=self.logits_soft_cap,
+                    )
+                else:
+                    flash_attn_with_kvcache(
+                        q=decode_q.unsqueeze(1),
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        block_table=attn_metadata.decode.block_table,
+                        cache_seqlens=attn_metadata.decode.seq_lens,
+                        max_query_len=attn_metadata.decode.max_query_len,
+                        cu_query_lens=attn_metadata.decode.query_start_loc,
+                        softmax_scale=self.scale,
+                        causal=True,
+                        window_size=self.sliding_window,
+                        alibi_slopes=self.alibi_slopes,
+                        softcap=self.logits_soft_cap,
+                        sinks=self.sinks,
+                        out=decode_output.unsqueeze(1),
+                        use_cuda_graph=attn_metadata.decode.use_graph,
+                        max_context_len=attn_metadata.decode.max_decode_seq_len,
+                    )
+        return output
+
+    def _forward_unquantized_with_post_quant(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: IluFlashAttentionMetadata,
+        output: torch.Tensor,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if (quant_manager := getattr(layer, "quant_manager", None)) is None:
+            layer_idx = extract_layer_index(layer.layer_name)
+            if "mtp" in layer.layer_name:
+                layer_idx = f"mtp.{layer_idx}"
+            else:
+                layer_idx = f"{layer_idx}"
+            quant_manager = StaticQuantManager(
+                self.total_num_kv_heads,
+                layer_id=layer_idx,
+                shape=(layer.num_kv_heads, layer.head_size_v),
+                dtype=torch.float32,
+                file_save_path=self.post_quant_kv_int8_path,
+            )
+            layer.quant_manager = quant_manager
+        output = self._forward_unquantized(
+            layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output,
+            output_scale,
+            output_block_scale,
+        )
+
+        _, value_scale = ixf_ops.scaled_int8_quant_for_attn(
+            value, 0, transpose_scale=False
+        )
+        quant_manager.update_data(value_scale)
+        return output
+
+    def _forward_kv_int8(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: IluFlashAttentionMetadata,
+        output: torch.Tensor,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if output_scale is not None or output_block_scale is not None:
+            raise NotImplementedError("fused output quantization is not yet supported")
+        early_output = self._maybe_forward_encoder(
+            layer, query, key, value, attn_metadata, output
+        )
+        if early_output is not None:
+            return early_output
+        if attn_metadata.use_cascade:
+            raise NotImplementedError("Cascade attention is not supported with KVINT8")
+        if self.dcp_world_size > 1:
+            raise NotImplementedError("DCP attention is not supported with KVINT8")
+        kv_scale_cache = getattr(layer, "kv_cache_scale", None)
+        assert kv_scale_cache is not None
+
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        decode_only = attn_metadata.num_decodes > 0 and attn_metadata.num_prefills == 0
+        prefill_output = output[num_decode_tokens:]
+        decode_output = output[:num_decode_tokens]
+
+        i8_key_cache, i8_value_cache = kv_cache.unbind(0)
+        num_blocks, num_kv_heads, block_size, head_size = i8_key_cache.shape
+        key_scale_cache, value_scale_cache = kv_scale_cache
+        assert (
+            key_scale_cache.shape
+            == (
+                num_blocks,
+                num_kv_heads,
+                block_size,
+            )
+            and key_scale_cache.dtype == torch.float32
+        ), (
+            f"key_scale_cache.shape {key_scale_cache.shape} != "
+            f"{(num_blocks, num_kv_heads, block_size)} or "
+            f"key_scale_cache.dtype {key_scale_cache.dtype} != torch.float32"
+        )
+        assert (
+            value_scale_cache.shape
+            == (
+                num_kv_heads,
+                head_size,
+            )
+            and value_scale_cache.dtype == torch.float32
+        ), (
+            f"value_scale_cache.shape {value_scale_cache.shape} != "
+            f"{(num_kv_heads, head_size)} or "
+            f"value_scale_cache.dtype {value_scale_cache.dtype} != torch.float32"
+        )
+
+        int8_query, query_scale = ixf_ops.scaled_int8_quant_for_attn(
+            query, 2, transpose_scale=not decode_only
+        )
+        i8_key, key_scale = ixf_ops.scaled_int8_quant_for_attn(
+            key, 2, transpose_scale=False
+        )
+        i8_value, _value_scale = ixf_ops.scaled_int8_quant_for_attn(
+            value, 0, transpose_scale=False, scale=value_scale_cache
+        )
+
+        if (
+            self.kv_sharing_target_layer_name is None
+            and key is not None
+            and value is not None
+            and attn_metadata.num_prefills > 0
+        ):
+            ixf_ops.reshape_and_cache_flash_int8(
+                key=i8_key,
+                value=i8_value,
+                k_scale=key_scale,
+                key_cache=i8_key_cache,
+                value_cache=i8_value_cache,
+                key_scale_cache=key_scale_cache,
+                slot_mapping=attn_metadata.slot_mapping,
+                kv_cache_dtype="",
+            )
+
+        if attn_metadata.num_prefills > 0 and attn_metadata.prefill is not None:
+            prefill_q = query[num_decode_tokens : attn_metadata.num_actual_tokens]
+            sliding_window_size = (
+                list(self.sliding_window)
+                if self.sliding_window is not None
+                else (-1, -1)
+            )
+            flash_attn_varlen_int8_func(
+                q=int8_query[num_decode_tokens:],
+                k=i8_key_cache,
+                v=i8_value_cache,
+                q_scale=query_scale[:, num_decode_tokens:],
+                k_scale=key_scale_cache,
+                v_scale=value_scale_cache,
+                cu_seqlens_q=attn_metadata.prefill.query_start_loc,
+                cu_seqlens_k=attn_metadata.prefill.key_start_loc,
+                max_seqlen_q=attn_metadata.prefill.max_query_len,
+                max_seqlen_k=attn_metadata.max_seq_len,
+                softmax_scale=self.scale,
+                causal=attn_metadata.causal,
+                window_size=sliding_window_size,
+                alibi_slopes=self.alibi_slopes,
+                softcap=self.logits_soft_cap,
+                out=prefill_output[: prefill_q.shape[0]],
+                block_table=attn_metadata.prefill.block_table,
+                output_dtype=query.dtype,
+            )
+
+        if attn_metadata.num_decodes > 0 and attn_metadata.decode is not None:
+            para_dict = dict(
+                output=decode_output,
+                query=int8_query[:num_decode_tokens],
+                key_cache=i8_key_cache,
+                query_scale=query_scale[:num_decode_tokens]
+                if decode_only
+                else query_scale[:, :num_decode_tokens].t().contiguous(),
+                key_scale_cache=key_scale_cache,
+                num_kv_heads=self.num_kv_heads,
+                scale=self.scale,
+                block_tables=attn_metadata.decode.block_table,
+                context_lens=attn_metadata.decode.seq_lens,
+                block_size=i8_key_cache.shape[-2],
+                softcap=self.logits_soft_cap,
+                alibi_slopes=self.alibi_slopes,
+                causal=True,
+                window_left=self.sliding_window[0],
+                window_right=self.sliding_window[1],
+                use_cuda_graph=attn_metadata.decode.use_graph if decode_only else False,
+                max_context_len=attn_metadata.decode.max_decode_seq_len,
+                cu_query_lens=attn_metadata.decode.query_start_loc,
+                max_query_len=attn_metadata.decode.max_query_len,
+                value_cache=i8_value_cache,
+                value_scale_cache=value_scale_cache,
+            )
+            if decode_only:
+                para_dict.update(
+                    dict(
+                        save_key=i8_key[:num_decode_tokens],
+                        save_value=i8_value[:num_decode_tokens],
+                        save_key_scale=key_scale[:num_decode_tokens],
+                    )
+                )
+            ixf_ops.vllm_paged_attention_int8(**para_dict)
+        return output
+
+    def _forward_k_int8(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: IluFlashAttentionMetadata,
+        output: torch.Tensor,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if output_scale is not None or output_block_scale is not None:
+            raise NotImplementedError("fused output quantization is not yet supported")
+        early_output = self._maybe_forward_encoder(
+            layer, query, key, value, attn_metadata, output
+        )
+        if early_output is not None:
+            return early_output
+        if attn_metadata.use_cascade:
+            raise NotImplementedError("Cascade attention is not supported with KINT8")
+        if self.dcp_world_size > 1:
+            raise NotImplementedError("DCP attention is not supported with KINT8")
+
+        kv_scale_cache = getattr(layer, "kv_cache_scale", None)
+        assert kv_scale_cache is not None
+
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        decode_only = attn_metadata.num_decodes > 0 and attn_metadata.num_prefills == 0
+        prefill_output = output[num_decode_tokens:]
+        decode_output = output[:num_decode_tokens]
+
+        i8_key_cache = kv_cache[0]
+        num_blocks, num_kv_heads, block_size, head_size = i8_key_cache.shape
+        value_cache = (
+            kv_cache[1:]
+            .view(query.dtype)
+            .reshape(num_blocks, num_kv_heads, block_size, head_size)
+        )
+        key_scale_cache = kv_scale_cache[0]
+
+        int8_query, query_scale = ixf_ops.scaled_int8_quant_for_attn(
+            query, 2, transpose_scale=not decode_only
+        )
+        i8_key, key_scale = ixf_ops.scaled_int8_quant_for_attn(
+            key, 2, transpose_scale=False
+        )
+
+        if (
+            self.kv_sharing_target_layer_name is None
+            and key is not None
+            and value is not None
+            and attn_metadata.num_prefills > 0
+        ):
+            ixf_ops.reshape_and_cache_flash_mix(
+                key=i8_key,
+                value=value,
+                k_scale=key_scale,
+                key_cache=i8_key_cache,
+                value_cache=value_cache,
+                key_scale_cache=key_scale_cache,
+                slot_mapping=attn_metadata.slot_mapping,
+                kv_cache_dtype="",
+            )
+
+        if attn_metadata.num_prefills > 0 and attn_metadata.prefill is not None:
+            prefill_q = query[num_decode_tokens : attn_metadata.num_actual_tokens]
+            sliding_window_size = (
+                list(self.sliding_window)
+                if self.sliding_window is not None
+                else (-1, -1)
+            )
+            flash_attn_varlen_int8_func(
+                q=int8_query[num_decode_tokens:],
+                k=i8_key_cache,
+                v=value_cache,
+                q_scale=query_scale[:, num_decode_tokens:],
+                k_scale=key_scale_cache,
+                v_scale=None,
+                cu_seqlens_q=attn_metadata.prefill.query_start_loc,
+                cu_seqlens_k=attn_metadata.prefill.key_start_loc,
+                max_seqlen_q=attn_metadata.prefill.max_query_len,
+                max_seqlen_k=attn_metadata.max_seq_len,
+                softmax_scale=self.scale,
+                causal=attn_metadata.causal,
+                window_size=sliding_window_size,
+                alibi_slopes=self.alibi_slopes,
+                softcap=self.logits_soft_cap,
+                out=prefill_output[: prefill_q.shape[0]],
+                block_table=attn_metadata.prefill.block_table,
+                output_dtype=query.dtype,
+            )
+
+        if attn_metadata.num_decodes > 0 and attn_metadata.decode is not None:
+            para_dict = dict(
+                output=decode_output,
+                query=int8_query[:num_decode_tokens],
+                key_cache=i8_key_cache,
+                query_scale=query_scale[:num_decode_tokens]
+                if decode_only
+                else query_scale[:, :num_decode_tokens].t().contiguous(),
+                key_scale_cache=key_scale_cache,
+                num_kv_heads=self.num_kv_heads,
+                scale=self.scale,
+                block_tables=attn_metadata.decode.block_table,
+                context_lens=attn_metadata.decode.seq_lens,
+                block_size=i8_key_cache.shape[-2],
+                softcap=self.logits_soft_cap,
+                alibi_slopes=self.alibi_slopes,
+                causal=True,
+                window_left=self.sliding_window[0],
+                window_right=self.sliding_window[1],
+                use_cuda_graph=attn_metadata.decode.use_graph if decode_only else False,
+                max_context_len=attn_metadata.decode.max_decode_seq_len,
+                cu_query_lens=attn_metadata.decode.query_start_loc,
+                max_query_len=attn_metadata.decode.max_query_len,
+                value_cache=value_cache,
+            )
+            if decode_only:
+                para_dict.update(
+                    dict(
+                        save_key=i8_key[:num_decode_tokens],
+                        save_value=value[:num_decode_tokens].contiguous(),
+                        save_key_scale=key_scale[:num_decode_tokens],
+                    )
+                )
+            ixf_ops.vllm_paged_attention_mix(**para_dict)
+        return output
+
     def do_kv_cache_update(
         self,
         layer: torch.nn.Module,
@@ -991,7 +1248,7 @@ class IluFlashAttentionImpl(AttentionImpl):
         if self.attn_type in (
             AttentionType.ENCODER_ONLY,
             AttentionType.ENCODER,
-        ): 
+        ):
             return
 
         key_cache, value_cache = kv_cache.unbind(0)
@@ -1026,9 +1283,7 @@ class IluFlashAttentionImpl(AttentionImpl):
         query = query.contiguous()
         query_across_dcp = get_dcp_group().all_gather(query, dim=1)
         sliding_window_size = (
-            list(self.sliding_window)
-            if self.sliding_window is not None
-            else None
+            list(self.sliding_window) if self.sliding_window is not None else None
         )
 
         # dcp_cu_seqlens_k is prepared in metadata build() so this forward path
@@ -1060,9 +1315,7 @@ class IluFlashAttentionImpl(AttentionImpl):
             get_dcp_group(),
             return_lse=True,
         )
-        context_lse_cor = (
-            context_lse_cor.transpose(0, 1).contiguous().to(torch.float32)
-        )
+        context_lse_cor = context_lse_cor.transpose(0, 1).contiguous().to(torch.float32)
 
         query_fa_kwargs: dict = dict(
             q=query,
@@ -1092,7 +1345,7 @@ class IluFlashAttentionImpl(AttentionImpl):
             query_lse,
             output,
         )
-        
+
     def _forward_prefill_dcp_attention(
         self,
         query: torch.Tensor,
@@ -1105,9 +1358,7 @@ class IluFlashAttentionImpl(AttentionImpl):
     ) -> None:
         query = query.contiguous()
         sliding_window_size = (
-            list(self.sliding_window)
-            if self.sliding_window is not None
-            else None
+            list(self.sliding_window) if self.sliding_window is not None else None
         )
         query_fa_kwargs: dict = dict(
             q=query,
@@ -1127,8 +1378,6 @@ class IluFlashAttentionImpl(AttentionImpl):
             return_softmax_lse=False,
         )
         flash_attn_varlen_func(**query_fa_kwargs)
-        
-        
 
     def _forward_prefill_with_dcp(
         self,
@@ -1180,7 +1429,6 @@ class IluFlashAttentionImpl(AttentionImpl):
             query_causal=True,
         )
 
-
     def _forward_encoder_attention(
         self,
         query: torch.Tensor,
@@ -1202,9 +1450,7 @@ class IluFlashAttentionImpl(AttentionImpl):
         max_seqlen_k = attn_metadata.max_query_len
 
         sliding_window_size = (
-            list(self.sliding_window)
-            if self.sliding_window is not None
-            else None
+            list(self.sliding_window) if self.sliding_window is not None else None
         )
         flash_attn_varlen_func(
             q=query,
@@ -1336,6 +1582,4 @@ def cascade_attention(
         return_softmax_lse=True,
     )
 
-    merge_attn_states(
-        prefix_output, prefix_lse, suffix_output, suffix_lse, output
-    )
+    merge_attn_states(prefix_output, prefix_lse, suffix_output, suffix_lse, output)

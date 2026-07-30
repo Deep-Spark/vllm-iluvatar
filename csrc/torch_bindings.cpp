@@ -32,6 +32,22 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
   ops.def(
       "apply_rotary_emb(Tensor x, Tensor cos, Tensor sin, bool interleaved) "
       "-> Tensor");
+  ops.def(
+      "fused_qk_rmsnorm_rope_gate("
+      "Tensor q_gate, Tensor k, Tensor q_weight, Tensor k_weight, "
+      "Tensor cos_sin_cache, Tensor positions, float epsilon, "
+      "int num_q_heads, int num_kv_heads, int head_dim, int rotary_dim"
+      ") -> (Tensor, Tensor, Tensor)");
+  ops.def(
+      "fused_qk_rmsnorm_gate("
+      "Tensor q_gate, Tensor k, Tensor q_weight, Tensor k_weight, "
+      "float epsilon, int num_q_heads, int num_kv_heads, int head_dim"
+      ") -> (Tensor, Tensor, Tensor)");
+  ops.def(
+      "concat_and_cache_dsa_int8("
+      "Tensor kv_int8, Tensor nope_scale, Tensor rope_scale, "
+      "Tensor! kv_cache, Tensor! nope_scale_cache, Tensor! rope_scale_cache, "
+      "Tensor slot_mapping) -> ()");
   ops.def("weak_ref_tensor(Tensor input) -> Tensor");
   ops.def("get_cuda_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor");
 }
@@ -40,6 +56,12 @@ TORCH_LIBRARY_IMPL_EXPAND(_C, CUDA, ops) {
   ops.impl("rms_norm", &vllm_iluvatar::rms_norm);
   ops.impl("rotary_embedding", &vllm_iluvatar::rotary_embedding);
   ops.impl("apply_rotary_emb", &vllm_iluvatar::apply_rotary_emb);
+  ops.impl("fused_qk_rmsnorm_rope_gate",
+           &vllm_iluvatar::fused_qk_rmsnorm_rope_gate);
+  ops.impl("fused_qk_rmsnorm_gate",
+           &vllm_iluvatar::fused_qk_rmsnorm_gate);
+  ops.impl("concat_and_cache_dsa_int8",
+           &vllm_iluvatar::concat_and_cache_dsa_int8);
   // Aliasing a CUDA tensor's storage; registered on the CUDA key like upstream.
   ops.impl("weak_ref_tensor", &vllm_iluvatar::weak_ref_tensor);
 }
@@ -54,6 +76,10 @@ TORCH_LIBRARY_IMPL_EXPAND(_C, Meta, ops) {
   // Shape propagation for the out-of-place apply_rotary_emb (torch.compile /
   // FakeTensor / opcheck): output mirrors x's shape.
   ops.impl("apply_rotary_emb", &vllm_iluvatar::apply_rotary_emb_meta);
+  ops.impl("fused_qk_rmsnorm_rope_gate",
+           &vllm_iluvatar::fused_qk_rmsnorm_rope_gate_meta);
+  ops.impl("fused_qk_rmsnorm_gate",
+           &vllm_iluvatar::fused_qk_rmsnorm_gate_meta);
 }
 
 REGISTER_EXTENSION(_C)

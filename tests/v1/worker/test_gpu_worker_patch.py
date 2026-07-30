@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import sys
 from types import ModuleType
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -13,6 +12,16 @@ import pytest
 @pytest.fixture(autouse=True)
 def _stub_gpu_worker(monkeypatch):
     """Stub vllm.v1.worker.gpu_worker.Worker so IluWorker can be imported."""
+
+    def make_package(name):
+        package = ModuleType(name)
+        package.__path__ = []
+        return package
+
+    vllm_mod = make_package("vllm")
+    vllm_v1_mod = make_package("vllm.v1")
+    worker_package = make_package("vllm.v1.worker")
+
     gpu_worker_mod = ModuleType("vllm.v1.worker.gpu_worker")
 
     class _FakeWorker:
@@ -21,11 +30,23 @@ def _stub_gpu_worker(monkeypatch):
 
     gpu_worker_mod.Worker = _FakeWorker
 
-    for name in ("vllm", "vllm.v1", "vllm.v1.worker"):
-        monkeypatch.setitem(sys.modules, name, ModuleType(name))
-    monkeypatch.setitem(
-        sys.modules, "vllm.v1.worker.gpu_worker", gpu_worker_mod
-    )
+    gpu_model_runner_mod = ModuleType("vllm.v1.worker.gpu_model_runner")
+    gpu_model_runner_mod.GPUModelRunner = type("GPUModelRunner", (), {})
+
+    vllm_mod.v1 = vllm_v1_mod
+    vllm_v1_mod.worker = worker_package
+    worker_package.gpu_worker = gpu_worker_mod
+    worker_package.gpu_model_runner = gpu_model_runner_mod
+
+    modules = {
+        "vllm": vllm_mod,
+        "vllm.v1": vllm_v1_mod,
+        "vllm.v1.worker": worker_package,
+        "vllm.v1.worker.gpu_model_runner": gpu_model_runner_mod,
+        "vllm.v1.worker.gpu_worker": gpu_worker_mod,
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
 
     # Invalidate any cached import of the plugin module so the stub is used.
     monkeypatch.delitem(

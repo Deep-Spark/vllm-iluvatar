@@ -76,11 +76,11 @@ if TYPE_CHECKING:
     VLLM_ILU_W4A8_FORMAT: str = "TN"
     VLLM_ILU_W4A8_VERSION: int = 2
     VLLM_ILU_W8A8_FORMAT: str = "TN"
-    VLLM_ILU_USE_INT8_MLA: bool = False
     VLLM_ILU_MLA_CUSTOMIZE: bool = True
     VLLM_ILU_MIX_QUANTIZATION_TYPE: str = ""
     VLLM_ILU_FLASH_ATTN_QUANT_TYPE: str = ""
     VLLM_ILU_FLASH_ATTN_V_SCALE_PATH: str = ""
+    VLLM_ILU_MLA_ATTN_QUANT_TYPE: str = ""
     VLLM_ILU_USE_LORA_FUSION: bool = False
     VLLM_ILU_VIT_ATTN_OPT_LEVEL: int = 0
     VLLM_ILU_VIT_ATTN_LAYER: str = ""
@@ -126,10 +126,6 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_W8A8_FORMAT": lambda: _get(
         "VLLM_ILU_W8A8_FORMAT", "VLLM_W8A8_FORMAT", "TN"
     ).upper(),
-    "VLLM_ILU_USE_INT8_MLA": lambda: (
-        _get("VLLM_ILU_USE_INT8_MLA", "VLLM_USE_INT8_MLA", "0").lower()
-        in ("1", "true", "yes")
-    ),
     "VLLM_ILU_MLA_CUSTOMIZE": lambda: (
         _get("VLLM_ILU_MLA_CUSTOMIZE", "VLLM_MLA_CUSTOMIZE", "1").lower()
         in ("1", "true", "yes")
@@ -165,7 +161,9 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
     # prefill kernel. bf16 KV cache only. See
     # IluDeepseekV4MLAAttention._forward_prefill_as_decode.
     "VLLM_ILU_DS4_PREFILL_AS_DECODE": lambda: (
-        _get("VLLM_ILU_DS4_PREFILL_AS_DECODE", "VLLM_DS4_PREFILL_AS_DECODE", "0").lower()
+        _get(
+            "VLLM_ILU_DS4_PREFILL_AS_DECODE", "VLLM_DS4_PREFILL_AS_DECODE", "0"
+        ).lower()
         in ("1", "true")
     ),
     "VLLM_ILU_W8A8_GEMM_MODE": lambda: _get(
@@ -177,6 +175,12 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
 _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_FLASH_ATTN_QUANT_TYPE": lambda: os.environ.get(
         "VLLM_ILU_FLASH_ATTN_QUANT_TYPE", ""
+    ).upper(),
+    "VLLM_ILU_FLASH_ATTN_TOTAL_KV_HEADS": lambda: int(
+        os.environ.get("VLLM_ILU_FLASH_ATTN_TOTAL_KV_HEADS", "-1")
+    ),
+    "VLLM_ILU_MLA_ATTN_QUANT_TYPE": lambda: os.environ.get(
+        "VLLM_ILU_MLA_ATTN_QUANT_TYPE", ""
     ).upper(),
     "VLLM_ILU_FLASH_ATTN_V_SCALE_PATH": lambda: os.environ.get(
         "VLLM_ILU_FLASH_ATTN_V_SCALE_PATH", ""
@@ -204,23 +208,17 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     .strip()
     .lower()
     .replace("-", "_"),
-    "VLLM_ILU_DP_LB_EXACT_INFLIGHT": _bool_reader(
-        "VLLM_ILU_DP_LB_EXACT_INFLIGHT", "0"
-    ),
+    "VLLM_ILU_DP_LB_EXACT_INFLIGHT": _bool_reader("VLLM_ILU_DP_LB_EXACT_INFLIGHT", "0"),
     "VLLM_ILU_DEEPEP_USE_INT8": lambda: int(
         os.environ.get("VLLM_ILU_DEEPEP_USE_INT8", "0")
     ),
     "VLLM_ILU_DISABLE_DEEPEP": _bool_reader("VLLM_ILU_DISABLE_DEEPEP", "0"),
-    "VLLM_ILU_DEEPEP_USE_SCATTER": _bool_reader(
-        "VLLM_ILU_DEEPEP_USE_SCATTER", "1"
-    ),
+    "VLLM_ILU_DEEPEP_USE_SCATTER": _bool_reader("VLLM_ILU_DEEPEP_USE_SCATTER", "1"),
     "VLLM_ILU_LL_FUSED_AG_AR": _bool_reader("VLLM_ILU_LL_FUSED_AG_AR", "1"),
     "VLLM_ILU_DECODE_EP_BACKEND": lambda: _maybe_stripped(
         os.environ.get("VLLM_ILU_DECODE_EP_BACKEND", "")
     ),
-    "VLLM_ILU_DP_ROUND_ROBIN_LB": _bool_reader(
-        "VLLM_ILU_DP_ROUND_ROBIN_LB", "0"
-    ),
+    "VLLM_ILU_DP_ROUND_ROBIN_LB": _bool_reader("VLLM_ILU_DP_ROUND_ROBIN_LB", "0"),
     "VLLM_ILU_DP_ROUND_ROBIN_LB_FILE": lambda: os.environ.get(
         "VLLM_ILU_DP_ROUND_ROBIN_LB_FILE", ""
     ),

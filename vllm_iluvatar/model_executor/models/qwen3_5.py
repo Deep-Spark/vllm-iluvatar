@@ -7,7 +7,7 @@ Iluvatar OOT Qwen3.5 models: optimize
 Target   : vllm.model_executor.models.qwen3_5.
            Qwen3_5ForConditionalGeneration and
            Qwen3_5MoeForConditionalGeneration (arches with the same names)
-Baseline : main_dcfebf93f4e
+Baseline : main_61ac3680210
 Why      : the fork replaces the Torch implementation of q/k RMSNorm, rotary
            embedding, and output-gate projection with fused Iluvatar kernels.
 How      : ModelRegistry.register_model points both arches at the subclasses

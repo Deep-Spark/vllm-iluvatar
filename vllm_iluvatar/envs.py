@@ -69,6 +69,15 @@ def _maybe_stripped(value: str) -> str | None:
     return value or None
 
 
+def _hybrid_dp_sync_prefills_default() -> bool:
+    return (
+        os.environ.get("VLLM_ILU_DECODE_EP_BACKEND", "").strip()
+        == "deepep_low_latency"
+        and os.environ.get("VLLM_ILU_DP_ROUND_ROBIN_LB", "0").strip().lower()
+        in _TRUE_VALS
+    )
+
+
 if TYPE_CHECKING:
     # Canonical names (new code should use these).
     VLLM_ILU_W8A8_MOE_USE_W4A8: bool = False
@@ -105,6 +114,9 @@ if TYPE_CHECKING:
     VLLM_ILU_DECODE_EP_BACKEND: str | None = None
     VLLM_ILU_DP_ROUND_ROBIN_LB: bool = False
     VLLM_ILU_DP_ROUND_ROBIN_LB_FILE: str = ""
+    VLLM_ILU_DP_ENABLE_SYNC_PREFILLS: bool = False
+    VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS: int = 8
+    VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS: float = 0.0
     VLLM_ILU_MOE_EP_LL_MOE_ALGO: str = "GEMV"
     VLLM_ILU_ENABLE_PP_MTP: bool = False
     VLLM_ILU_MXFP4_MOE_BACKEND: str = "ixmm"
@@ -224,6 +236,28 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_DP_ROUND_ROBIN_LB": _bool_reader("VLLM_ILU_DP_ROUND_ROBIN_LB", "0"),
     "VLLM_ILU_DP_ROUND_ROBIN_LB_FILE": lambda: os.environ.get(
         "VLLM_ILU_DP_ROUND_ROBIN_LB_FILE", ""
+    ),
+    "VLLM_ILU_DP_ENABLE_SYNC_PREFILLS": _bool_reader(
+        "VLLM_ILU_DP_ENABLE_SYNC_PREFILLS",
+        "1" if _hybrid_dp_sync_prefills_default() else "0",
+    ),
+    "VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS": lambda: max(
+        0,
+        int(
+            os.environ.get(
+                "VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS",
+                "8",
+            )
+        ),
+    ),
+    "VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS": lambda: max(
+        0.0,
+        float(
+            os.environ.get(
+                "VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS",
+                "5" if _hybrid_dp_sync_prefills_default() else "0",
+            )
+        )
     ),
     "VLLM_ILU_MOE_EP_LL_MOE_ALGO": lambda: os.environ.get(
         "VLLM_ILU_MOE_EP_LL_MOE_ALGO", "GEMV"

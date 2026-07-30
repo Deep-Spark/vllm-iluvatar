@@ -440,12 +440,107 @@ class IluRoutedExperts(RoutedExperts):
             or super()._needs_intermediate_size_param(quant_method)
         )
 
+    # >>> ILU MODIFICATION >>>
+    # Isolate W4A8 fused w13 / w13 scale physical-layout loading.
+    def _load_w4a8_fused_w13_shard(
+        self,
+        *,
+        fused_weight: torch.Tensor,
+        param_name: str,
+        expert_id: int,
+        unpadded_hidden: int,
+    ) -> torch.Tensor:
+        """Split W4A8 fused w13/w13-scale tensors by physical layout."""
+
+        w4a8_format = getattr(self.quant_method, "gemm_format", None)
+
+        if "weight_scale" not in param_name and "w13_weight" in param_name:
+            # TN: [num_experts, hidden_size // 2, 2 * moe_intermediate_size] or [num_experts, 2 * moe_intermediate_size, hidden_size // 2]
+            # NN: [num_experts, hidden_size, moe_intermediate_size] or [num_experts, moe_intermediate_size, hidden_size]
+            if w4a8_format == "NN":
+                if fused_weight.shape[-2] != unpadded_hidden:
+                    fused_weight = fused_weight.transpose(-1, -2)
+                chunk_dim = -1
+            elif w4a8_format == "TN":
+                if fused_weight.shape[-1] != unpadded_hidden // 2:
+                    fused_weight = fused_weight.transpose(-1, -2)
+                chunk_dim = -2
+            else:
+                raise ValueError(
+                    "Unsupported W4A8 MoE format "
+                    f"{w4a8_format!r} for fused w13 loading."
+                )
+            return fused_weight.chunk(2, dim=chunk_dim)[
+                expert_id
+            ]
+        elif "weight_scale" in param_name:
+            # TN: [num_experts, 2, 2 * moe_intermediate_size] or [num_experts, 2 * moe_intermediate_size, 2]
+            # NN: [num_experts, 2, moe_intermediate_size] or [num_experts, moe_intermediate_size, 2]
+            if w4a8_format == "TN" or w4a8_format == "NN":
+                assert fused_weight.shape[-2] == 2 or fused_weight.shape[-1] == 2, f"fused_weight.shape: {fused_weight.shape}"
+                if fused_weight.shape[-1] == 2:
+                    fused_weight = fused_weight.transpose(-1, -2)
+                if fused_weight.shape[-1] == 2 * self.moe_config.intermediate_size:
+                    fused_weight = fused_weight.narrow(-1, 0, fused_weight.shape[-1] // 2)
+                return fused_weight.chunk(2, dim=-2)[expert_id]
+            else:
+                raise ValueError(
+                    "Unsupported W4A8 MoE format "
+                    f"{w4a8_format!r} for fused w13_scale loading."
+                )
+
+        raise ValueError(f"Unsupported W4A8 fused w13 parameter {param_name!r}.")
+
+    # Isolate W4A8 fused w2 / w2 scale physical-layout loading.
+    def _load_w4a8_fused_w2_shard(
+        self,
+        *,
+        fused_weight: torch.Tensor,
+        param_name: str,
+        unpadded_hidden: int,
+    ) -> torch.Tensor:
+        """Split W4A8 fused w2/w2-scale tensors by physical layout."""
+
+        w4a8_format = getattr(self.quant_method, "gemm_format", None)
+
+        if "weight_scale" not in param_name and "w2_weight" in param_name:
+            # TN: [num_experts, moe_intermediate_size // 2, hidden_size] or [num_experts, hidden_size, moe_intermediate_size // 2]
+            # NN: [num_experts, moe_intermediate_size, hidden_size//2] or [num_experts, hidden_size//2, moe_intermediate_size]
+            if w4a8_format == "NN":
+                if fused_weight.shape[-1] != unpadded_hidden // 2:
+                    fused_weight = fused_weight.transpose(-1, -2)
+            elif w4a8_format == "TN":
+                if fused_weight.shape[-2] != unpadded_hidden:
+                    fused_weight = fused_weight.transpose(-1, -2)
+            else:
+                raise ValueError(
+                    "Unsupported W4A8 MoE format "
+                    f"{w4a8_format!r} for fused w2 loading."
+                )
+            return fused_weight
+
+        elif "weight_scale" in param_name:
+            # TN: [num_experts, 1, hidden_size] or [num_experts, hidden_size, 1]
+            # NN: [num_experts, 1, hidden_size // 2] or [num_experts, hidden_size // 2, 1]
+            if w4a8_format == "TN" or w4a8_format == "NN":
+                assert fused_weight.shape[-2] == 1 or fused_weight.shape[-1] == 1, f"fused_weight.shape: {fused_weight.shape}"
+                if fused_weight.shape[-1] == 1:
+                    fused_weight = fused_weight.transpose(-1, -2)
+                return fused_weight
+            else:
+                raise ValueError(
+                    "Unsupported W4A8 MoE format "
+                    f"{w4a8_format!r} for fused w2_scale loading."
+                )
+        raise ValueError(f"Unsupported W4A8 fused w2 parameter {param_name!r}.")
+    # <<< ILU MODIFICATION <<<
+
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[str]:
         expert_mapping = self.get_expert_mapping(include_fused=True)
         unpadded_hidden = self.moe_config.hidden_dim_unpadded
-        fused_w13_intermediate_dim = None
+        quant_method_name = self.quant_method.__class__.__name__
         for expert_name, loaded_weight in weights:
             qual_name = f"{self.layer_name}.{expert_name}"
             # Fused expert weights can be identified by their 3D tensors
@@ -465,45 +560,49 @@ class IluRoutedExperts(RoutedExperts):
                     # transpose below doesn't mutate loaded_weight across
                     # iterations (else w3 is transposed twice and wrongly chunked)
                     fused_weight = loaded_weight
-                    # >>> ILU MODIFICATION >>>
-                    # record fused w13 full dim
-                    if "weight_scale" not in param_name and "w13_weight" in param_name:
-                        fused_w13_intermediate_dim = (
-                            fused_weight.shape[-2]
-                            if fused_weight.shape[-1] == unpadded_hidden
-                            else fused_weight.shape[-1]
-                        )
-                    # <<< ILU MODIFICATION <<<
                     if shard_id in {"w1", "w3"}:
-                        if fused_weight.shape[-1] != unpadded_hidden:
-                            # [..., hidden, intermediate] -> [..., intermediate, hidden]
-                            fused_weight = fused_weight.transpose(-1, -2)
-                        # >>> ILU MODIFICATION >>>
-                        # trim fused w13 scale dim
                         if (
-                            "w13_weight_scale" in param_name
-                            and fused_weight.shape[-2] == 2
-                            and fused_w13_intermediate_dim is not None
-                            and fused_weight.shape[-1] == fused_w13_intermediate_dim
-                            and fused_weight.shape[-1] % 2 == 0
+                            quant_method_name
+                            == "IluCompressedTensorsW4A8Int8MoEMethod"
                         ):
-                            fused_weight = fused_weight.narrow(
-                                -1, 0, fused_weight.shape[-1] // 2
+                            # >>> ILU MODIFICATION >>>
+                            # W4A8 fused w13 tensors may already be in ixformer
+                            # kernel layout; delegate format-specific splitting.
+                            experts_shard = (
+                                self._load_w4a8_fused_w13_shard(
+                                    fused_weight=fused_weight,
+                                    param_name=param_name,
+                                    expert_id=expert_id,
+                                    unpadded_hidden=unpadded_hidden
+                                )
                             )
-                        # <<< ILU MODIFICATION <<<
-                        # Repurpose expert_id for deconcatenating w1 and w3
-                        experts_shard = fused_weight.chunk(2, dim=1)[expert_id]
-                    else:
-                        # >>> ILU MODIFICATION >>>
-                        # handle fused w2 scale layout
-                        if fused_weight.shape[-2] != unpadded_hidden or (
-                            "w2_weight_scale" in param_name
-                            and fused_weight.shape[-1] == 1
-                        ):
                             # <<< ILU MODIFICATION <<<
-                            # [..., intermediate, hidden] -> [..., hidden, intermediate]
-                            fused_weight = fused_weight.transpose(-1, -2)
-                        experts_shard = fused_weight
+                        else:
+                            if fused_weight.shape[-1] != unpadded_hidden:
+                                # [..., hidden, intermediate] -> [..., intermediate, hidden]
+                                fused_weight = fused_weight.transpose(-1, -2)
+                            experts_shard = fused_weight.chunk(2, dim=1)[expert_id]
+                    else:
+                        if (
+                            quant_method_name
+                            == "IluCompressedTensorsW4A8Int8MoEMethod"
+                        ):
+                            # >>> ILU MODIFICATION >>>
+                            # W4A8 fused w2 tensors may already be in ixformer
+                            # kernel layout; delegate format-specific handling.
+                            experts_shard = (
+                                self._load_w4a8_fused_w2_shard(
+                                    fused_weight=fused_weight,
+                                    param_name=param_name,
+                                    unpadded_hidden=unpadded_hidden,
+                                )
+                            )
+                            # <<< ILU MODIFICATION <<<
+                        else:
+                            if fused_weight.shape[-2] != unpadded_hidden:
+                                # [..., intermediate, hidden] -> [..., hidden, intermediate]
+                                fused_weight = fused_weight.transpose(-1, -2)
+                            experts_shard = fused_weight
                     start = 0
                 else:
                     # loaded_weight is a single expert weight, so we add a dummy expert
@@ -669,6 +768,25 @@ class IluRoutedExperts(RoutedExperts):
             shard_dim += 1
 
         expert_data = param.data if full_load else param.data[expert_id]
+
+        if "bias" in weight_name:
+            self._loaded_expert_biases.add(weight_name.rsplit(".", 1)[-1])
+            if shard_id == "w2":
+                expert_data = self._narrow_expert_data_for_padding(
+                    expert_data,
+                    loaded_weight,
+                    hidden_dim=0,
+                )
+                expert_data.copy_(loaded_weight)
+            else:
+                self._load_w13(
+                    shard_id=shard_id,
+                    shard_dim=0,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=self.moe_config.tp_rank,
+                )
+            return True if return_success else None
 
         # Case input scale: input_scale loading is only supported for fp8
         if "input_scale" in weight_name:

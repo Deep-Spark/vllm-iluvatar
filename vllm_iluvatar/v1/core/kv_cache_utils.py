@@ -5,7 +5,7 @@ ILU override implementation for Attention quantization support.
 
 Target   : vllm.v1.core.kv_cache_utils.get_kv_cache_configs
            vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
-Baseline : main_dcfebf93f4e
+Baseline : main_61ac3680210
 Why      : Iluvatar attention quantization Int8 support.
            For allocating kv cache scales and adjust the num gpu blocks.
 How      : get_kv_cache_configs: full-method copy with one delta.

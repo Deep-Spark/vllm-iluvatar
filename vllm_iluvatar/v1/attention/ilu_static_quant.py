@@ -156,7 +156,7 @@ def load_static_v_scales(
     head_size: int,
     device: torch.device,
     layer_idx: str | None = None,
-) -> dict[int, torch.Tensor]:
+) -> dict[str, torch.Tensor]:
     """Load static V cache scales from the calibration file.
 
     Returns {layer_idx: [num_kv_heads, head_size] fp32 scale tensor}.

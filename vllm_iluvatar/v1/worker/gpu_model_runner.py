@@ -157,10 +157,19 @@ def _reshape_attention_kv_cache_with_scale(
                     raise RuntimeError(
                         "For KVINT8, the none mtp model must have v_scale in the provided v_scale file"
                     )
-                fallback_idx = max(static_value_caches_scales)
+                base_layer_keys = [
+                    key
+                    for key in static_value_caches_scales
+                    if key.isdecimal()
+                ]
+                if not base_layer_keys:
+                    raise RuntimeError(
+                        "No numeric base-layer key found in the KVINT8 V scale file"
+                    )
+                fallback_idx = max(base_layer_keys, key=int)
                 logger.warning(
-                    "[KVINT8] layer_idx=%d not in v_scale file, "
-                    "fallback to layer_idx:%d",
+                    "[KVINT8] layer_idx=%s not in v_scale file, "
+                    "fallback to layer_idx:%s",
                     layer_idx,
                     fallback_idx,
                 )

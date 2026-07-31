@@ -64,6 +64,69 @@ from vllm_iluvatar.v1.attention.ilu_static_quant import StaticQuantManager
 logger = init_logger(__name__)
 
 
+def _get_k_int8_cache_views(
+    kv_cache: torch.Tensor,
+    value_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return zero-copy KINT8 key and value views for either cache layout."""
+    assert kv_cache.ndim == 5 and kv_cache.shape[0] == 3
+    assert value_dtype in (torch.float16, torch.bfloat16)
+
+    i8_key_cache = kv_cache[0]
+    value_cache_bytes = kv_cache[1:]
+
+    # Hybrid Attention + Mamba uses blocks-first physical storage while
+    # retaining the backend's logical (planes, blocks, ...) shape. Move the
+    # block dimension first so each block's two BF16 value-byte planes can be
+    # merged without materializing a contiguous copy.
+    if kv_cache.stride(0) < kv_cache.stride(1):
+        value_cache_bytes = value_cache_bytes.movedim(1, 0)
+
+    num_blocks, num_kv_heads, block_size, head_size = i8_key_cache.shape
+    value_cache = value_cache_bytes.view(value_dtype).view(
+        num_blocks, num_kv_heads, block_size, head_size
+    )
+    return i8_key_cache, value_cache
+
+
+def _reshape_and_cache_k_int8(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_scale: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    key_scale_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    """Write KINT8 cache entries for contiguous or block-strided caches."""
+    if key_cache.is_contiguous() and value_cache.is_contiguous():
+        ixf_ops.reshape_and_cache_flash_mix(
+            key=key,
+            value=value,
+            k_scale=key_scale,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            key_scale_cache=key_scale_cache,
+            slot_mapping=slot_mapping,
+            kv_cache_dtype="",
+        )
+        return
+
+    # The current ixformer mixed-cache writer requires contiguous caches.
+    # Hybrid Attention + Mamba deliberately adds a gap between cache blocks,
+    # so use stride-aware indexed writes for prefill. Decode cache updates are
+    # handled by vllm_paged_attention_mix, which supports strided caches.
+    valid_token_indices = torch.where(slot_mapping >= 0)[0]
+    valid_slots = slot_mapping[valid_token_indices]
+    block_size = key_cache.shape[2]
+    block_indices = torch.div(valid_slots, block_size, rounding_mode="floor")
+    block_offsets = valid_slots % block_size
+
+    key_cache[block_indices, :, block_offsets, :] = key[valid_token_indices]
+    value_cache[block_indices, :, block_offsets, :] = value[valid_token_indices]
+    key_scale_cache[block_indices, :, block_offsets] = key_scale[valid_token_indices]
+
+
 def get_flash_attn_version(
     requires_alibi: bool = False,
     head_size: int | None = None,
@@ -1140,13 +1203,8 @@ class IluFlashAttentionImpl(AttentionImpl):
         prefill_output = output[num_decode_tokens:]
         decode_output = output[:num_decode_tokens]
 
-        i8_key_cache = kv_cache[0]
+        i8_key_cache, value_cache = _get_k_int8_cache_views(kv_cache, query.dtype)
         num_blocks, num_kv_heads, block_size, head_size = i8_key_cache.shape
-        value_cache = (
-            kv_cache[1:]
-            .view(query.dtype)
-            .reshape(num_blocks, num_kv_heads, block_size, head_size)
-        )
         key_scale_cache = kv_scale_cache[0]
 
         int8_query, query_scale = ixf_ops.scaled_int8_quant_for_attn(
@@ -1162,15 +1220,14 @@ class IluFlashAttentionImpl(AttentionImpl):
             and value is not None
             and attn_metadata.num_prefills > 0
         ):
-            ixf_ops.reshape_and_cache_flash_mix(
+            _reshape_and_cache_k_int8(
                 key=i8_key,
                 value=value,
-                k_scale=key_scale,
+                key_scale=key_scale,
                 key_cache=i8_key_cache,
                 value_cache=value_cache,
                 key_scale_cache=key_scale_cache,
                 slot_mapping=attn_metadata.slot_mapping,
-                kv_cache_dtype="",
             )
 
         if attn_metadata.num_prefills > 0 and attn_metadata.prefill is not None:

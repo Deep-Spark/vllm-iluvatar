@@ -206,6 +206,38 @@ def _reshape_attention_kv_cache_with_scale(
 
 
 class IluvatarGPUModelRunner(GPUModelRunner):
+    # [ILU override] _update_hybrid_attention_mamba_layout
+    # Delta: correct the upstream two-plane stride for ILU's three-plane KINT8
+    # cache after delegating the common hybrid-layout handling to vLLM.
+    def _update_hybrid_attention_mamba_layout(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        kernel_block_sizes: list[int],
+    ) -> None:
+        super()._update_hybrid_attention_mamba_layout(
+            kv_caches, kernel_block_sizes
+        )
+
+        for kv_cache in kv_caches.values():
+            # Upstream has already aligned all two-plane attention caches.
+            # ILU KINT8 is the only five-dimensional three-plane cache:
+            # one INT8 K plane plus two byte planes storing BF16 V.
+            if (
+                kv_cache.ndim != 5
+                or kv_cache.shape[0] != 3
+                or kv_cache.stride(0) >= kv_cache.stride(1)
+            ):
+                continue
+            page_plane_size = kv_cache.shape[2:].numel()
+            kv_cache.as_strided_(
+                size=kv_cache.shape,
+                stride=(
+                    page_plane_size,
+                    kv_cache.shape[0] * page_plane_size,
+                    *kv_cache.stride()[2:],
+                ),
+            )
+
     def initialize_kv_cache(
         self,
         kv_cache_config: KVCacheConfig,

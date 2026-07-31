@@ -301,6 +301,17 @@ class IluFlashMLASparseMetadataBuilder(
         assert cm.positions is not None, (
             "positions is required for C128A metadata build"
         )
+        # ixformer requires positions / slot_mapping / token_to_req to share
+        # the same leading dimension (= num_total). CUDA-graph capture may
+        # allocate longer tensors; always slice to the active token count.
+        assert cm.slot_mapping.shape[0] >= num_total, (
+            f"C128A slot_mapping length {cm.slot_mapping.shape[0]} < "
+            f"num_total={num_total}"
+        )
+        assert req_id_per_token.shape[0] >= num_total, (
+            f"C128A req_id_per_token length {req_id_per_token.shape[0]} < "
+            f"num_total={num_total}"
+        )
 
         # Compressed-domain block size used by the kernel for paged lookup.
         # ``self.kv_cache_spec.block_size`` is the per-group kernel-aligned block
@@ -316,10 +327,10 @@ class IluFlashMLASparseMetadataBuilder(
                 positions_int32,
                 self.compress_ratio,
                 num_decode_tokens,
-                req_id_per_token,
+                req_id_per_token[:num_total],
                 cm.block_table_tensor[:num_decodes],
                 block_size,
-                cm.slot_mapping,
+                cm.slot_mapping[:num_total],
                 self.c128a_global_decode_buffer,
                 self.c128a_decode_lens_buffer,
                 self.c128a_prefill_buffer,

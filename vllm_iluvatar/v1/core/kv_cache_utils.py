@@ -20,15 +20,65 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.core import kv_cache_utils
 from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
+    MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
 
 logger = init_logger("vllm." + __name__)
 
 origin_get_kv_cache_config_from_groups = kv_cache_utils.get_kv_cache_config_from_groups
+
+_SCALE_KV_SPEC_TYPES = (FullAttentionSpec, MLAAttentionSpec)
+
+
+def _get_shared_scale_kv_spec(
+    shared_by: list[str],
+    kv_cache_specs: dict[str, KVCacheSpec],
+) -> Any | None:
+    """Return the scale-aware spec after validating a shared KV tensor.
+
+    Scale-unaware specs such as Mamba may share the main allocation with an
+    attention spec, but only the attention layer owns and consumes the
+    separately allocated scale cache.
+    """
+    scale_specs: set[Any] = set()
+    scale_layers: list[str] = []
+    scale_unaware_layers: list[str] = []
+
+    for layer_name in shared_by:
+        layer_kv_spec = kv_cache_specs[layer_name]
+        spec_name = layer_kv_spec.__class__.__name__
+        if isinstance(layer_kv_spec, _SCALE_KV_SPEC_TYPES):
+            scale_specs.add(layer_kv_spec)
+            scale_layers.append(f"{layer_name} ({spec_name})")
+        else:
+            scale_unaware_layers.append(f"{layer_name} ({spec_name})")
+
+    if len(scale_specs) > 1:
+        raise ValueError(
+            "Scale-aware layers sharing one KV cache tensor must have the "
+            f"same KV spec, but got: {scale_layers}."
+        )
+
+    if not scale_specs:
+        logger.debug(
+            "KV cache tensor does not need a scale cache; shared_by=%s",
+            scale_unaware_layers,
+        )
+        return None
+
+    if scale_unaware_layers:
+        logger.debug(
+            "Allocating a scale cache only for scale-aware layers %s; "
+            "scale-unaware sharing layers are %s",
+            scale_layers,
+            scale_unaware_layers,
+        )
+    return next(iter(scale_specs))
 
 
 def get_kv_cache_configs(
@@ -182,7 +232,6 @@ def get_kv_cache_config_from_groups(
         vllm_config, kv_cache_groups, available_memory
     )
     # graph capture mode
-    supported_kv_specs = ["FullAttentionSpec", "MLAAttentionSpec"]
     num_blocks = config.num_blocks
 
     kv_cache_specs = {}
@@ -203,28 +252,19 @@ def get_kv_cache_config_from_groups(
     # calculate the total size of the kv cache and the total size of the kv cache with scale
     total_size = 0
     total_size_with_scale = 0
-    for kv_cache_tensors in config.kv_cache_tensors:
-        total_size += kv_cache_tensors.size
-        total_size_with_scale += kv_cache_tensors.size
-        current_kv_spec = set[Any]()
-        for share_layer_name in kv_cache_tensors.shared_by:
-            layer_kv_spec = kv_cache_specs[share_layer_name]
-            if any(
-                (layer_kv_spec.__class__.__name__ == kv_spec)
-                for kv_spec in supported_kv_specs
-            ):
-                current_kv_spec.add(layer_kv_spec)
+    scale_specs_by_tensor: list[Any | None] = []
+    for kv_cache_tensor in config.kv_cache_tensors:
+        total_size += kv_cache_tensor.size
+        total_size_with_scale += kv_cache_tensor.size
+        layer_kv_spec = _get_shared_scale_kv_spec(
+            kv_cache_tensor.shared_by, kv_cache_specs
+        )
+        scale_specs_by_tensor.append(layer_kv_spec)
 
-        if current_kv_spec:
-            assert len(current_kv_spec) == 1, (
-                "The kv spec of one shared layer must be the same"
-            )
-            layer_kv_spec = current_kv_spec.pop()
+        if layer_kv_spec is not None:
             total_size_with_scale += (
                 layer_kv_spec.scale_page_size_bytes
             ) * num_blocks + layer_kv_spec.fixed_size_bytes
-        else:
-            logger.warning("unsupported kv spec: %s", layer_kv_spec.__class__.__name__)
 
     # shrink the num blocks
     total_used_memory = total_size
@@ -245,24 +285,17 @@ def get_kv_cache_config_from_groups(
 
     # adjust the size of the kv cache tensors and add kv scale and fixed size to kv_cache_tensors
     # scale_size and fixed_size are only used on gpu model runner and will not influence the others.
-    for kv_cache_tensors in config.kv_cache_tensors:
-        assert kv_cache_tensors.size % num_blocks == 0
-        kv_cache_tensors.size = kv_cache_tensors.size // num_blocks * new_blocks
-        current_kv_spec = set[Any]()
-        for share_layer_name in kv_cache_tensors.shared_by:
-            layer_kv_spec = kv_cache_specs[share_layer_name]
-            if any(
-                (layer_kv_spec.__class__.__name__ == kv_spec)
-                for kv_spec in supported_kv_specs
-            ):
-                current_kv_spec.add(layer_kv_spec)
+    for kv_cache_tensor, layer_kv_spec in zip(
+        config.kv_cache_tensors, scale_specs_by_tensor
+    ):
+        assert kv_cache_tensor.size % num_blocks == 0
+        kv_cache_tensor.size = kv_cache_tensor.size // num_blocks * new_blocks
 
-        if current_kv_spec:
-            layer_kv_spec = current_kv_spec.pop()
-            kv_cache_tensors.scale_size = (
+        if layer_kv_spec is not None:
+            kv_cache_tensor.scale_size = (
                 layer_kv_spec.scale_page_size_bytes * new_blocks
             )
-            kv_cache_tensors.fixed_size = layer_kv_spec.fixed_size_bytes
+            kv_cache_tensor.fixed_size = layer_kv_spec.fixed_size_bytes
 
     config.num_blocks = new_blocks
     return config

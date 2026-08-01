@@ -11,10 +11,17 @@ no torch custom op is registered.
 
 Stage 2 wiring status
 ---------------------
-* ``IluDeepseekV4Fp8MoE.forward`` is wired (Module 4): a torch-equivalent FFN
-  (gate GEMM -> sqrtsoftplus top-k -> local routed experts with on-the-fly
-  MXFP4 dequant + grouped MLP -> ``+ shared`` -> EP/TP all-reduce), bypassing
-  the community ``FusedMoE`` runner whose kernels are absent on Iluvatar.
+* ``IluDeepseekV4Fp8MoE.forward`` is wired (Module 4, converged in Module 4.1):
+  the whole FFN goes through the community ``FusedMoE`` runner exactly like the
+  W4A8 fork, so router / top-k / EP orchestration / shared experts / the single
+  all-reduce are all community code reaching Iluvatar kernels through the
+  plugin's normal extension points -- ``IluGateLinear`` for the gate GEMM,
+  ``ops.topk_hash_softplus_sqrt`` for the top-k, and ``IluMxfp4MoEMethod`` ->
+  ``ilu_mxfp4_fused_experts()`` for the routed MXFP4 experts. Module 4's
+  hand-written ``_route`` / ``_routed_experts`` / ``_dequant_mxfp4_to_bf16`` are
+  gone; the expert compute now lives in
+  ``layers/fused_moe/ilu_mxfp4_fused_moe.py`` (still torch in Phase 1, ixformer
+  ``ep_moe`` + ``group_gemm_fp4`` in Phase 2).
 * the shared-expert activation is a plain torch SwiGLU (``_Fp8SwiGLU``), not a
   community ``CustomOp``: those bind ``torch.ops._C.*`` inside ``__init__`` with
   no fallback on a CUDA-like platform, so building one would crash at
@@ -28,18 +35,25 @@ Load_Verifier -- statistics, unconsumed-tensor report, strict reverse check
 ``fp8_load_stats``, ported from the offline scanner that produced the acceptance
 numbers.
 
-Construction-order constraint (task 3.3 / 3.4)
-----------------------------------------------
-``IluDeepseekV4Fp8MoE`` builds a community ``FusedMoE``, whose
-``Mxfp4MoEMethod.__init__`` calls ``select_deepseek_v4_mxfp4_moe_backend``
-during construction. Off ROCm that community function never returns
-``Mxfp4MoeBackend.NONE`` -- it raises ``NotImplementedError("No MXFP4 MoE
-backend supports the deployment configuration.")``. So the P1 wrapper patch
-(``ilu_patch/general_patches/patch_dsv4_mxfp4_backend.py``) must already be
-applied when the first layer is built. In production that is guaranteed by
-``apply_general_patches()`` running from the ``vllm.general_plugins`` entry
-point, well before the model loader instantiates anything; unit tests have to
-call ``register()`` themselves before constructing a MoE layer.
+Quantization-config constraint (module 4.1)
+-------------------------------------------
+``IluDeepseekV4Fp8MoE`` builds a community ``FusedMoE``, and which MoE method its
+routed experts get is decided entirely by ``vllm_config.quant_config``. It has to
+be ``IluDeepseekV4FP8Config``
+(``layers/quantization/ilu_deepseek_v4_fp8.py``, registered under the community
+name ``deepseek_v4_fp8``), which returns ``IluMxfp4MoEMethod``. In production that
+is automatic: the checkpoint's ``quant_method="fp8"`` plus
+``model_type="deepseek_v4"`` resolve to ``deepseek_v4_fp8``, and the plugin's
+registration shadows the community class. Unit tests must build their
+``VllmConfig`` with the ILU config for the same reason.
+
+With the community ``DeepseekV4FP8Config`` instead, construction dies inside
+``Mxfp4MoEMethod.__init__`` -> ``select_deepseek_v4_mxfp4_moe_backend``, which off
+ROCm raises ``NotImplementedError("No MXFP4 MoE backend supports the deployment
+configuration.")``. Module 4 worked around that with patch P1
+(``patch_dsv4_mxfp4_backend``) plus P3 (``patch_dsv4_moe_modular_kernel``); both
+were retired in module 4.1 because ``IluMxfp4MoEMethod`` never calls the backend
+oracle and never sets ``experts_cls``.
 
 Design references (``.kiro/specs/deepseek-v4-fp8-weight-loading/design.md``):
 
@@ -58,10 +72,12 @@ Design references (``.kiro/specs/deepseek-v4-fp8-weight-loading/design.md``):
   logic. Discovered automatically by ``ilu_register._register_models()`` because
   this file is a top-level module of an already-registered package -- no
   ``_OOT_MODEL_PACKAGES`` edit needed.
-* §4.4 -- MoE skeleton: community ``Mxfp4MoEMethod`` forced onto
-  ``Mxfp4MoeBackend.NONE``, so ``create_weights`` builds the four routed
-  ``uint8`` parameters at exactly the checkpoint shapes and
-  ``process_weights_after_loading`` early-returns instead of swizzling them.
+* §4.4 -- MoE skeleton: ``IluMxfp4MoEMethod`` inherits community
+  ``Mxfp4MoEMethod.create_weights`` unchanged, so the four routed ``uint8``
+  parameters are built at exactly the checkpoint shapes, and its
+  ``process_weights_after_loading`` is a no-op instead of swizzling them.
+  (Module 4 achieved the same through the community method pinned to
+  ``Mxfp4MoeBackend.NONE`` by patch P1; module 4.1 owns the method instead.)
 * §5.3 / §5.4 -- MoE and model-level parameter shapes.
 * §6.2 -- component checklist.
 * §7 -- TODO numbering: ``E1``..``E5`` (model orchestration) were wired in
@@ -90,13 +106,11 @@ from itertools import islice
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -130,9 +144,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 
-from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (  # noqa: E501
-    _e8m0_to_fp32,
-)
+from vllm_iluvatar.model_executor.layers.activation import swiglu_clamp
 from vllm_iluvatar.model_executor.models.deepseek_v4 import fp8_load_stats, fp8_mhc
 from vllm_iluvatar.model_executor.models.deepseek_v4.fp8_attention import (
     IluDeepseekV4Fp8Attention,
@@ -232,59 +244,14 @@ def _make_fp8_weights_mapper() -> WeightsMapper:
     )
 
 
-# --- Module 4 (FFN/MoE, C1) torch-equivalent helpers ------------------------
-# FP4 E2M1 magnitude lookup (3-bit magnitude -> fp32), sign applied separately.
-# Same table community ``nvfp4_emulation_utils.break_fp4_bytes`` uses.
-_FP4_E2M1_LUT = torch.tensor(
-    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
-)
-
-# MXFP4 microscaling block size (32 fp4 values share one e8m0 exponent scale).
-_MXFP4_BLOCK = 32
-
-
-def _dequant_mxfp4_to_bf16(
-    weight: torch.Tensor,
-    scale: torch.Tensor,
-    block: int = _MXFP4_BLOCK,
-) -> torch.Tensor:
-    """Pure-torch MXFP4 -> bf16 dequant for one routed expert's weight.
-
-    ``weight`` ``[out, in // 2]`` uint8: two fp4 (e2m1) nibbles per byte, low
-    nibble first (community ``break_fp4_bytes`` order). ``scale`` ``[out,
-    in // block]`` e8m0 (exponent-only) block scale. Returns ``[out, in]``
-    bf16. Reuses module 2's ``_e8m0_to_fp32`` for the exponent decode; there is
-    no MXFP4 global scale (unlike NVFP4).
-    """
-    low = weight & 0x0F
-    high = (weight >> 4) & 0x0F
-    # element 2i = low nibble of byte i, element 2i+1 = high nibble
-    codes = torch.stack((low, high), dim=-1).flatten(start_dim=-2)  # [out, in]
-    sign = torch.where((codes & 0x08) != 0, -1.0, 1.0)
-    mag = (codes & 0x07).long()
-    lut = _FP4_E2M1_LUT.to(weight.device)
-    vals = lut[mag] * sign  # fp32 [out, in]
-
-    in_dim = codes.shape[-1]
-    scale_f32 = _e8m0_to_fp32(scale)  # [out, in // block] fp32
-    vals = vals.reshape(*vals.shape[:-1], in_dim // block, block)
-    vals = vals * scale_f32.unsqueeze(-1)
-    return vals.reshape(*vals.shape[:-2], in_dim).to(torch.bfloat16)
-
-
-def _swiglu_clamp(x: torch.Tensor, limit: float | None) -> torch.Tensor:
-    """Torch equivalent of ``SiluAndMulWithClamp.forward_native`` (alpha=1,
-    beta=0): ``gate=clamp(x[:d], max=limit)``, ``up=clamp(x[d:], +-limit)``,
-    ``silu(gate) * up``. Computed in fp32, cast back to the input dtype.
-    """
-    d = x.shape[-1] // 2
-    gate = x[..., :d].to(torch.float32)
-    up = x[..., d:].to(torch.float32)
-    if limit is not None:
-        gate = gate.clamp(max=float(limit))
-        up = up.clamp(min=-float(limit), max=float(limit))
-    out = gate * torch.sigmoid(gate) * up
-    return out.to(x.dtype)
+# --- Module 4 (FFN/MoE) helpers ---------------------------------------------
+#
+# The MXFP4 dequant and the routed-expert loop that used to live here moved to
+# ``layers/fused_moe/ilu_mxfp4_fused_moe.py`` in module 4.1: the routed experts
+# are now driven by ``IluMxfp4MoEMethod`` through the community runner, so that
+# compute belongs to the quantization format rather than to this model.
+# ``_swiglu_clamp`` moved to ``layers/activation.py::swiglu_clamp`` because both
+# that compute layer and ``_Fp8SwiGLU`` below need the identical formula.
 
 
 class _Fp8SwiGLU(nn.Module):
@@ -292,8 +259,9 @@ class _Fp8SwiGLU(nn.Module):
 
     Torch equivalent of community ``SiluAndMulWithClamp`` (alpha=1, beta=0), i.e.
     ``silu(clamp(gate, max=limit)) * clamp(up, +-limit)`` -- see
-    ``_swiglu_clamp``. It is a plain ``nn.Module``, **not** a ``CustomOp``: the
-    community activations resolve ``torch.ops._C.silu_and_mul_with_clamp`` inside
+    ``layers/activation.py::swiglu_clamp``. It is a plain ``nn.Module``, **not** a
+    ``CustomOp``: the community activations resolve
+    ``torch.ops._C.silu_and_mul_with_clamp`` inside
     ``__init__`` on any CUDA-like platform with no fallback, and Iluvatar CoreX
     does not export that symbol, so constructing one crashes before a single
     weight exists (design §4.4.1 / risk R10). The plugin's OOT
@@ -313,7 +281,7 @@ class _Fp8SwiGLU(nn.Module):
         return f"swiglu_limit={self.swiglu_limit!r}"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _swiglu_clamp(x, self.swiglu_limit)
+        return swiglu_clamp(x, self.swiglu_limit)
 
 
 class IluDeepseekV4Fp8MLP(nn.Module):
@@ -532,6 +500,14 @@ class IluDeepseekV4Fp8MoE(nn.Module):
             f"n_physical_experts={self.n_physical_experts} must be divisible by "
             f"tp_size={self.tp_size}. Adjust num_redundant_experts."
         )
+        # Bookkeeping only -- these three are *not* the authority on expert
+        # ownership. ``FusedMoE`` derives the real split from
+        # ``FusedMoEParallelConfig.make`` and publishes it as
+        # ``routed_experts.expert_map`` / ``.local_num_experts``, which is what
+        # ``ilu_mxfp4_fused_experts()`` reads. Module 4's routed-expert loop used
+        # the contiguous ``[experts_start_idx, experts_end_idx)`` range computed
+        # here; module 4.1 dropped that assumption because it is wrong for
+        # round-robin expert placement and for EPLB's physical-id remapping.
         self.n_local_experts = self.n_physical_experts // self.tp_size
         self.experts_start_idx = self.tp_rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
@@ -546,9 +522,9 @@ class IluDeepseekV4Fp8MoE(nn.Module):
         # names -- ``named_modules(remove_duplicate=True)`` visits the direct
         # children first and then skips the aliased subtrees under ``experts``.
         #
-        # Timing: ``Mxfp4MoEMethod.__init__`` runs inside this call and asks
-        # ``select_deepseek_v4_mxfp4_moe_backend`` for a backend -- patch P1 has
-        # to be applied already, see the module docstring.
+        # ``quant_config.get_quant_method`` runs inside this call and decides the
+        # routed-expert method; it must be ``IluDeepseekV4FP8Config`` so we get
+        # ``IluMxfp4MoEMethod``. See the module docstring.
         self.experts = FusedMoE(
             shared_experts=self.shared_experts,
             gate=self.gate,
@@ -574,113 +550,53 @@ class IluDeepseekV4Fp8MoE(nn.Module):
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Module 4 (C1): torch-equivalent FFN aligned to NV
-        # ``DeepseekV4MoE.forward`` (``nvidia/model.py:702-730``). We bypass the
-        # community ``FusedMoE.forward`` / ``MoERunner`` (their gate GEMM, top-k
-        # and EP dispatch all bind kernels Iluvatar lacks) and implement the
-        # path in torch, reading the parameters directly:
-        #   gate GEMM -> sqrtsoftplus top-k -> local routed experts (MXFP4
-        #   dequant + grouped MLP, weighted by topk) -> + shared -> EP/TP
-        #   all-reduce.
-        # NV semantics: ``final = routed + shared`` (routed_scaling_factor is
-        # multiplied into topk_weights, not the output); shared is dense per
-        # token with ``reduce_results=False`` so the single all-reduce below
-        # reduces both the expert-parallel routed partial and the TP-sharded
-        # shared partial at once.
+        """Hand the whole FFN to the community runner (module 4.1).
+
+        Same shape as the W4A8 fork's ``IluDeepseekV4MoE.forward``
+        (``deepseek_v4/model.py:302-327``), which is itself community
+        ``DeepseekV4MoE.forward``. Everything module 4 used to do by hand now
+        happens inside ``IluMoERunner``:
+
+        * gate GEMM      -> ``IluGateLinear`` -> ``ixfops.gemm_bf16_bf16_fp32``
+        * top-k          -> ``FusedTopKBiasRouter`` -> ``ops.topk_hash_softplus_sqrt``
+        * routed experts -> ``IluMxfp4MoEMethod.apply`` ->
+                            ``ilu_mxfp4_fused_experts()``
+        * shared experts -> ``SharedExperts`` (aux stream when the batch is
+                            small, otherwise folded into the routed reduce)
+        * the single EP/TP all-reduce -> ``_maybe_reduce_final_output``
+
+        In particular there is **no** ``tensor_model_parallel_all_reduce`` here
+        any more: the runner owns it, and reducing again would double every
+        partial (module 4.1 design §4.2). ``routed_scaling_factor`` likewise is
+        not applied here -- the router multiplies it into ``topk_weights`` (§4.1).
+
+        ``is_internal_router`` is true because ``FusedMoE`` was constructed with
+        ``gate=self.gate``, so ``router_logits`` is a placeholder and the real
+        gate GEMM runs inside the runner. The ``else`` branch is kept for parity
+        with community/W4A8 in case that ever changes.
+        """
+        if self.gate.tid2eid is not None:
+            if input_ids is None:
+                raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
+            input_ids = input_ids.to(dtype=self.hash_indices_dtype)
+
         org_shape = hidden_states.shape
         x = hidden_states.view(-1, self.hidden_size)
 
-        topk_ids, topk_weights = self._route(x, input_ids)
-        routed = self._routed_experts(x, topk_ids, topk_weights)
-
-        if self.shared_experts is not None:
-            out = routed + self.shared_experts(x)
+        if self.experts.is_internal_router:
+            final_hidden_states = self.experts(
+                hidden_states=x,
+                router_logits=x,
+                input_ids=input_ids,
+            )
         else:
-            out = routed
-
-        if self.tp_size > 1:
-            out = tensor_model_parallel_all_reduce(out)
-        return out.view(org_shape)
-
-    def _route(
-        self,
-        x: torch.Tensor,
-        input_ids: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """gate GEMM + top-k, torch equivalent of ``fused_topk_bias`` /
-        ``_topk_softplus_sqrt_torch`` (``router/fused_topk_bias_router.py``).
-
-        Returns ``topk_ids`` ``[T, k]`` (long, global expert ids) and
-        ``topk_weights`` ``[T, k]`` (input dtype, already scaled). Bias is used
-        for expert *selection* only; weights come from the unbiased scores.
-        """
-        # gate GEMM in fp32 (weight is bf16, unquantised); done here rather than
-        # via ``self.gate(...)`` because ``GateLinear.forward`` dispatches to
-        # cuteDSL/dsv3 GEMMs absent on Iluvatar.
-        logits = torch.matmul(x.to(torch.float32), self.gate.weight.t().to(torch.float32))
-        scores = torch.sqrt(F.softplus(logits))
-
-        if self.gate.tid2eid is not None:
-            # hash layer: expert ids come from the lookup table
-            assert input_ids is not None, "hash MoE layer needs input_ids"
-            ids = input_ids.view(-1).long()
-            topk_ids = self.gate.tid2eid[ids].long()
-            topk_weights = scores.gather(1, topk_ids)
-        else:
-            bias = self.gate.e_score_correction_bias
-            scores_for_choice = scores + bias.to(torch.float32) if bias is not None else scores
-            _, topk_ids = torch.topk(
-                scores_for_choice, k=self.n_activated_experts, dim=-1
+            router_logits, _ = self.gate(x)
+            final_hidden_states = self.experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                input_ids=input_ids,
             )
-            topk_ids = topk_ids.long()
-            topk_weights = scores.gather(1, topk_ids)
-
-        if self.renormalize:
-            topk_weights = topk_weights / topk_weights.sum(
-                dim=-1, keepdim=True
-            ).clamp(min=1e-20)
-        topk_weights = (topk_weights * self.routed_scaling_factor).to(x.dtype)
-        return topk_ids, topk_weights
-
-    def _routed_experts(
-        self,
-        x: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        """Local routed-expert contribution (torch equivalent).
-
-        For each expert owned by this rank ``[experts_start_idx,
-        experts_end_idx)``, dequant its MXFP4 ``w13``/``w2`` to bf16 on the fly,
-        run ``w13 -> SwiGLU(clamp) -> w2`` on the tokens routed to it, weight by
-        ``topk_weights`` and scatter-add into a ``[T, H]`` partial. Non-local
-        experts contribute zero; the caller's all-reduce sums the EP partials.
-        Dequant is per expert (no full-layer cache) to bound peak memory.
-        """
-        re = self.experts.routed_experts
-        routed = torch.zeros_like(x)
-        for local_eid in range(self.n_local_experts):
-            global_eid = self.experts_start_idx + local_eid
-            sel = topk_ids == global_eid
-            if not bool(sel.any()):
-                continue
-            tok_idx, slot_idx = sel.nonzero(as_tuple=True)
-            xin = x[tok_idx]
-
-            w13 = _dequant_mxfp4_to_bf16(
-                re.w13_weight[local_eid], re.w13_weight_scale[local_eid]
-            )
-            gate_up = torch.matmul(xin, w13.t())
-            act = _swiglu_clamp(gate_up, self.swiglu_limit)
-
-            w2 = _dequant_mxfp4_to_bf16(
-                re.w2_weight[local_eid], re.w2_weight_scale[local_eid]
-            )
-            y = torch.matmul(act.to(w2.dtype), w2.t())
-
-            wgt = topk_weights[tok_idx, slot_idx].unsqueeze(-1).to(y.dtype)
-            routed.index_add_(0, tok_idx, (y * wgt).to(routed.dtype))
-        return routed
+        return final_hidden_states.view(org_shape)
 
 
 class IluDeepseekV4Fp8DecoderLayer(nn.Module):

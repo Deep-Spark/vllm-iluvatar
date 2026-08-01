@@ -1,10 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Torch-equivalent MHC (multi-head channel) ops for the raw-FP8 DS-V4 model.
 
-Stage 2, module 1 (design: ``整个框架适配计划/模块1-编排骨架.md``). These are pure
-PyTorch ports of the community NVIDIA MHC kernels, kept behind the *same*
-interface so a later pass can swap them for the Iluvatar ``ixfops.ds4_mhc_*``
-kernels without touching the orchestration in ``fp8_model.py``.
+**Not on the production path.** Module 5 moved the model onto the ixformer
+kernels, which ``fp8_model.py`` now calls directly (``ixfops.ds4_mhc_pre_v2`` /
+``ds4_mhc_post`` / ``ds4_hc_head``). What is left here is the reference
+implementation: the cross-check oracle for those kernels and the written record
+of the MHC semantics, exercised by
+``整个框架适配计划/test_fp8_mhc.py`` (pure torch, runs on CPU). ``mhc_pre``'s
+``norm_weight`` argument and ``mhc_fused_post_pre`` have no kernel counterpart --
+they exist to prove that module 5's un-fused, W4A8-shaped orchestration is
+value-identical to NVIDIA's fused one.
+
+Written for Stage 2, module 1 (design: ``整个框架适配计划/模块1-编排骨架.md``) as
+pure PyTorch ports of the community NVIDIA MHC kernels.
 
 Sources (byte-for-byte semantic reference):
 

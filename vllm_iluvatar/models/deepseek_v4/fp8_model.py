@@ -5,12 +5,20 @@ Stage 1 scope (spec ``deepseek-v4-fp8-weight-loading``, tasks 2.2 / 3.4 / 4.4 /
 4.5): build the three-layer module tree (``ForCausalLM`` / ``Model`` /
 ``DecoderLayer``) plus the MoE FFN (``IluDeepseekV4Fp8MoE``), the
 ``WeightsMapper`` that renames the checkpoint keys, the weight-loading rules and
-the Load_Verifier, and the arch registration. Every forward entry stops at a
-numbered TODO; no kernel is wired, the vendor kernel package is not imported, and
-no torch custom op is registered.
+the Load_Verifier, and the arch registration. Stage 2 then wired every forward
+(modules 1 / 3 / 4 / 5), so no ``TODO(ilu_fp8_*)`` stub is left here. This module
+still registers no torch custom op.
 
 Stage 2 wiring status
 ---------------------
+* MHC (``hc_pre`` / ``hc_post`` / ``hc_head``) runs on the ixformer kernels
+  ``ixfops.ds4_mhc_pre_v2`` / ``ds4_mhc_post`` / ``ds4_hc_head`` (Module 5). The
+  orchestration matches the W4A8 fork (``deepseek_v4/model.py:561-635``,
+  ``:757-772``): each sub-layer does its own ``hc_post`` and ``attn_norm`` /
+  ``ffn_norm`` are called explicitly, rather than NVIDIA's cross-sub-layer
+  ``mhc_fused_post_pre`` with the norm folded into the pre. The two are exactly
+  value-preserving (same ops, same order, same bf16 rounding points); the module-1
+  torch ports in ``fp8_mhc.py`` remain as the cross-check oracle.
 * ``IluDeepseekV4Fp8MoE.forward`` is wired (Module 4, converged in Module 4.1):
   the whole FFN goes through the community ``FusedMoE`` runner exactly like the
   W4A8 fork, so router / top-k / EP orchestration / shared experts / the single
@@ -22,10 +30,11 @@ Stage 2 wiring status
   gone; the expert compute now lives in
   ``layers/fused_moe/ilu_mxfp4_fused_moe.py`` (still torch in Phase 1, ixformer
   ``ep_moe`` + ``group_gemm_fp4`` in Phase 2).
-* the shared-expert activation is a plain torch SwiGLU (``_Fp8SwiGLU``), not a
-  community ``CustomOp``: those bind ``torch.ops._C.*`` inside ``__init__`` with
-  no fallback on a CUDA-like platform, so building one would crash at
-  construction time on Iluvatar (design §4.4).
+* the shared-expert activation is the community ``SiluAndMulWithClamp``, which
+  resolves to the plugin's OOT ``IluSiluAndMulWithClamp`` (Module 5). Design
+  §4.4.1 assumed constructing it would die looking up ``torch.ops._C`` on
+  Iluvatar; the OOT override binds ``vllm._custom_ops`` instead and the W4A8 fork
+  has been running it in production, so the torch stand-in was dropped.
 
 Weight loading is split over the two classes: ``IluDeepseekV4Fp8Model.load_weights``
 holds the stacked / experts / ``attn_sink`` main loop (design §4.5.1-§4.5.4, task
@@ -74,8 +83,9 @@ Design references (``.kiro/specs/deepseek-v4-fp8-weight-loading/design.md``):
   ``_OOT_MODEL_PACKAGES`` edit needed.
 * §4.4 -- MoE skeleton: ``IluMxfp4MoEMethod`` inherits community
   ``Mxfp4MoEMethod.create_weights`` unchanged, so the four routed ``uint8``
-  parameters are built at exactly the checkpoint shapes, and its
-  ``process_weights_after_loading`` is a no-op instead of swizzling them.
+  parameters are built at exactly the checkpoint shapes; its
+  ``process_weights_after_loading`` normalises their dtypes and (module 4.2)
+  converts them to the ixmm layout instead of community's swizzle.
   (Module 4 achieved the same through the community method pinned to
   ``Mxfp4MoeBackend.NONE`` by patch P1; module 4.1 owns the method instead.)
 * §5.3 / §5.4 -- MoE and model-level parameter shapes.
@@ -93,8 +103,8 @@ Risk notes
   from the W4A8 pair (``IluDeepseekV4ForCausalLM`` / ``IluDeepSeekV4MTPModel``).
 * R9: ``topk_indices_buffer`` is allocated with an explicit ``device=`` (the
   W4A8 fork's choice, ``model.py:658-663``) rather than community's implicit CPU
-  allocation (``nvidia/model.py:991-995``). Stage 1 never reads the buffer;
-  Stage 2 has to confirm the placement at first use.
+  allocation (``nvidia/model.py:991-995``). Confirmed correct in Module 3, where
+  the indexer became its first reader.
 """
 
 from __future__ import annotations
@@ -104,6 +114,7 @@ import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
 
+import ixformer.inference.functions as ixfops  # type: ignore[import]
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
@@ -113,6 +124,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     fused_moe_make_expert_params_mapping,
@@ -144,8 +156,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 
-from vllm_iluvatar.model_executor.layers.activation import swiglu_clamp
-from vllm_iluvatar.model_executor.models.deepseek_v4 import fp8_load_stats, fp8_mhc
+from vllm_iluvatar.model_executor.models.deepseek_v4 import fp8_load_stats
 from vllm_iluvatar.model_executor.models.deepseek_v4.fp8_attention import (
     IluDeepseekV4Fp8Attention,
 )
@@ -244,46 +255,6 @@ def _make_fp8_weights_mapper() -> WeightsMapper:
     )
 
 
-# --- Module 4 (FFN/MoE) helpers ---------------------------------------------
-#
-# The MXFP4 dequant and the routed-expert loop that used to live here moved to
-# ``layers/fused_moe/ilu_mxfp4_fused_moe.py`` in module 4.1: the routed experts
-# are now driven by ``IluMxfp4MoEMethod`` through the community runner, so that
-# compute belongs to the quantization format rather than to this model.
-# ``_swiglu_clamp`` moved to ``layers/activation.py::swiglu_clamp`` because both
-# that compute layer and ``_Fp8SwiGLU`` below need the identical formula.
-
-
-class _Fp8SwiGLU(nn.Module):
-    """SwiGLU-with-clamp activation for the shared-expert MLP (Module 4).
-
-    Torch equivalent of community ``SiluAndMulWithClamp`` (alpha=1, beta=0), i.e.
-    ``silu(clamp(gate, max=limit)) * clamp(up, +-limit)`` -- see
-    ``layers/activation.py::swiglu_clamp``. It is a plain ``nn.Module``, **not** a
-    ``CustomOp``: the community activations resolve
-    ``torch.ops._C.silu_and_mul_with_clamp`` inside
-    ``__init__`` on any CUDA-like platform with no fallback, and Iluvatar CoreX
-    does not export that symbol, so constructing one crashes before a single
-    weight exists (design §4.4.1 / risk R10). The plugin's OOT
-    ``IluSiluAndMulWithClamp`` would instead bind an ``ixformer`` kernel; doing
-    the SwiGLU in torch keeps this module tree kernel-free and vendor-free.
-
-    Holds no parameter and no buffer, so it stays invisible to
-    ``named_parameters()`` / the loader; occupies the same ``act_fn`` slot the
-    community MLP uses so the module tree diff stays 1:1.
-    """
-
-    def __init__(self, swiglu_limit: float | None = None) -> None:
-        super().__init__()
-        self.swiglu_limit = swiglu_limit
-
-    def extra_repr(self) -> str:
-        return f"swiglu_limit={self.swiglu_limit!r}"
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return swiglu_clamp(x, self.swiglu_limit)
-
-
 class IluDeepseekV4Fp8MLP(nn.Module):
     """Shared-expert MLP: block-FP8 ``gate_up_proj`` + ``down_proj``.
 
@@ -301,12 +272,11 @@ class IluDeepseekV4Fp8MLP(nn.Module):
     has to stay, because the loader's zero-fill of the trailing ranks
     (``_pad_shared_expert_weight``) is only correct if the two agree.
 
-    ``forward`` (Module 4) runs ``gate_up_proj`` -> SwiGLU(clamp) ->
-    ``down_proj``. The two projections are block-FP8 and dispatch to module 2's
-    ``IluFp8BlockScaledMMKernel``; the SwiGLU is done in torch by ``act_fn``
-    (``_Fp8SwiGLU``), which is a plain ``nn.Module`` rather than a community
-    activation ``CustomOp`` (those bind ``torch.ops._C`` in ``__init__`` with no
-    Iluvatar fallback, see ``_Fp8SwiGLU``).
+    ``forward`` runs ``gate_up_proj`` -> SwiGLU(clamp) -> ``down_proj``. The two
+    projections are block-FP8 and dispatch to module 2's
+    ``IluFp8BlockScaledMMKernel``; ``act_fn`` is the community
+    ``SiluAndMulWithClamp``, i.e. the plugin's OOT ``IluSiluAndMulWithClamp``
+    (Module 5), same as the W4A8 fork (``deepseek_v4/model.py:186-189``).
     """
 
     def __init__(
@@ -348,18 +318,22 @@ class IluDeepseekV4Fp8MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported "
                 "for now."
             )
-        # Community builds ``SiluAndMulWithClamp(swiglu_limit)`` /
-        # ``SiluAndMul()`` here (``nvidia/model.py:130-133``); both bind
-        # ``torch.ops._C.*`` inside ``__init__`` on any CUDA-like platform and
-        # Iluvatar has no such symbol, so we use a plain torch SwiGLU module
-        # instead. Full reasoning on ``_Fp8SwiGLU``.
-        self.act_fn = _Fp8SwiGLU(swiglu_limit)
+        # DS-V4 always ships ``swiglu_limit``, so unlike community
+        # (``nvidia/model.py:130-133``) there is no plain-``SiluAndMul`` branch.
+        # ``SiluAndMulWithClamp`` resolves to the plugin's OOT
+        # ``IluSiluAndMulWithClamp`` (``layers/activation.py:95``), which binds
+        # ``vllm._custom_ops.silu_and_mul_with_clamp``; the OOT registration is
+        # guaranteed to be in place because ``ilu_register`` imports
+        # ``model_executor.layers`` before any model module.
+        assert swiglu_limit is not None, (
+            "DeepSeek-V4 FP8 shared-expert MLP requires config.swiglu_limit"
+        )
+        self.act_fn = SiluAndMulWithClamp(swiglu_limit)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Module 4: gate_up_proj -> SwiGLU(clamp) -> down_proj. The two
-        # projections are block-FP8 and run through module 2's
-        # ``IluFp8BlockScaledMMKernel``; ``act_fn`` does the SwiGLU in torch.
-        # ``down_proj`` has ``reduce_results=False`` -- the MoE forward owns the
+        # gate_up_proj -> SwiGLU(clamp) -> down_proj. The two projections are
+        # block-FP8 and run through module 2's ``IluFp8BlockScaledMMKernel``.
+        # ``down_proj`` has ``reduce_results=False`` -- the MoE runner owns the
         # single EP/TP all-reduce.
         gate_up, _ = self.gate_up_proj(x)
         act = self.act_fn(gate_up)
@@ -373,8 +347,8 @@ class IluDeepseekV4Fp8MoE(nn.Module):
     Community counterpart: ``DeepseekV4MoE.__init__`` /
     ``_init_fused_moe_experts`` (``vllm/models/deepseek_v4/nvidia/model.py``
     ``:513-603`` and ``:647-691``), minus the MegaMoE branch
-    (``kernel_config.moe_backend == "deep_gemm_mega_moe"`` needs EP plus a
-    DeepGEMM kernel; Stage 1 has neither).
+    (``kernel_config.moe_backend == "deep_gemm_mega_moe"`` needs a DeepGEMM
+    kernel Iluvatar does not have; never enabled here).
 
     Owned parameters (design §5.3; the ``experts`` ones are created by community
     ``Mxfp4MoEMethod.create_weights``, ``quantization/mxfp4.py:530-622``):
@@ -399,15 +373,13 @@ class IluDeepseekV4Fp8MoE(nn.Module):
     (requirement 7.6).
 
     The routed shapes above are the design §5.3 numbers, i.e. 32 local experts
-    holding the *full* intermediate size. That layout is what community
-    ``FusedMoE`` produces when the experts are expert-parallel over the 8 ranks
-    (``num_local_experts = 256 / 8``, ``intermediate_size_per_partition =
-    2048``). Nothing here forces that split: ``FusedMoE`` derives it from
-    ``FusedMoEParallelConfig.make``, so a TP-only launch would instead give
-    ``[256, 512, 2048]`` / ``[256, 4096, 128]`` (same element count, different
-    axis). The Stage 1 8-card run (task 5.3) is what pins which of the two the
-    checkpoint slicing has to match; the shared-expert MLP is TP-sharded either
-    way.
+    holding the *full* intermediate size -- confirmed by the 8-card run, where
+    the experts are expert-parallel over the 8 ranks (``num_local_experts =
+    256 / 8``, ``intermediate_size_per_partition = 2048``). Nothing here forces
+    that split: ``FusedMoE`` derives it from ``FusedMoEParallelConfig.make``, so
+    a TP-only launch would instead give ``[256, 512, 2048]`` /
+    ``[256, 4096, 128]`` (same element count, different axis) and the checkpoint
+    slicing has to follow. The shared-expert MLP is TP-sharded either way.
     """
 
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -416,17 +388,11 @@ class IluDeepseekV4Fp8MoE(nn.Module):
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
 
-        self.prefix = prefix
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.tp_rank = get_tensor_model_parallel_rank()
 
         self.hidden_size = config.hidden_size
         self.n_routed_experts = config.n_routed_experts
-        self.n_activated_experts = config.num_experts_per_tok
-        self.moe_intermediate_size = config.moe_intermediate_size
-        self.n_shared_experts = config.n_shared_experts or 0
         self.swiglu_limit = config.swiglu_limit
-        self.renormalize = config.norm_topk_prob
         self.scoring_func = getattr(config, "scoring_func", "sqrtsoftplus")
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
 
@@ -492,25 +458,16 @@ class IluDeepseekV4Fp8MoE(nn.Module):
             )
 
         # --- routed experts (community nvidia/model.py:647-691) -------------
+        # The real expert split is owned by ``FusedMoE``
+        # (``FusedMoEParallelConfig.make`` -> ``routed_experts.expert_map`` /
+        # ``.local_num_experts``, which is what ``ilu_mxfp4_fused_experts()``
+        # reads); only the divisibility precondition is checked here.
         eplb_config = parallel_config.eplb_config
-        self.n_redundant_experts = eplb_config.num_redundant_experts
-        self.n_logical_experts = self.n_routed_experts
-        self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
-        assert self.n_physical_experts % self.tp_size == 0, (
-            f"n_physical_experts={self.n_physical_experts} must be divisible by "
+        n_physical_experts = self.n_routed_experts + eplb_config.num_redundant_experts
+        assert n_physical_experts % self.tp_size == 0, (
+            f"n_physical_experts={n_physical_experts} must be divisible by "
             f"tp_size={self.tp_size}. Adjust num_redundant_experts."
         )
-        # Bookkeeping only -- these three are *not* the authority on expert
-        # ownership. ``FusedMoE`` derives the real split from
-        # ``FusedMoEParallelConfig.make`` and publishes it as
-        # ``routed_experts.expert_map`` / ``.local_num_experts``, which is what
-        # ``ilu_mxfp4_fused_experts()`` reads. Module 4's routed-expert loop used
-        # the contiguous ``[experts_start_idx, experts_end_idx)`` range computed
-        # here; module 4.1 dropped that assumption because it is wrong for
-        # round-robin expert placement and for EPLB's physical-id remapping.
-        self.n_local_experts = self.n_physical_experts // self.tp_size
-        self.experts_start_idx = self.tp_rank * self.n_local_experts
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
 
         # ``FusedMoE`` is a factory returning a ``MoERunner``; the four routed
         # parameters live on its ``routed_experts`` child, so their qualified
@@ -581,18 +538,16 @@ class IluDeepseekV4Fp8MoE(nn.Module):
             input_ids = input_ids.to(dtype=self.hash_indices_dtype)
 
         org_shape = hidden_states.shape
-        x = hidden_states.view(-1, self.hidden_size)
-
         if self.experts.is_internal_router:
             final_hidden_states = self.experts(
-                hidden_states=x,
-                router_logits=x,
+                hidden_states=hidden_states,
+                router_logits=hidden_states,
                 input_ids=input_ids,
             )
         else:
-            router_logits, _ = self.gate(x)
+            router_logits, _ = self.gate(hidden_states)
             final_hidden_states = self.experts(
-                hidden_states=x,
+                hidden_states=hidden_states,
                 router_logits=router_logits,
                 input_ids=input_ids,
             )
@@ -632,8 +587,8 @@ class IluDeepseekV4Fp8DecoderLayer(nn.Module):
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
 
-        # MHC (multi-head channel) scalars kept under community names so Stage 2
-        # can call the kernels without renaming anything.
+        # MHC (multi-head channel) scalars kept under community names, so the
+        # ixformer kernels take them straight (``hc_pre`` / ``hc_post`` below).
         self.hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
@@ -664,99 +619,110 @@ class IluDeepseekV4Fp8DecoderLayer(nn.Module):
             torch.empty(3, dtype=torch.float32), requires_grad=False
         )
 
+    def hc_pre(
+        self,
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """MHC pre: ``(T, hc_mult, H)`` -> sub-layer input + the two mixes.
+
+        Same call as the W4A8 fork (``deepseek_v4/model.py:561-587``), pinned to
+        the default operator version ``ds4_mhc_pre_v2`` (bf16 GEMM + a single
+        fp32 epilogue). ``layer_input`` comes back **un-normed** -- the kernel has
+        no ``norm_weight`` parameter, so ``attn_norm`` / ``ffn_norm`` are applied
+        explicitly in ``forward``.
+
+        Returns ``(layer_input (T,H), post_mix (T,hc_mult,1) fp32,
+        comb_mix (T,hc_mult,hc_mult) fp32)`` -- note the kernel itself returns
+        ``layer_input`` last; the order here follows W4A8.
+        """
+        post_mix, comb_mix, layer_input = ixfops.ds4_mhc_pre_v2(
+            residual=x,
+            fn=hc_fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            rms_eps=self.rms_norm_eps,
+            hc_pre_eps=self.hc_eps,
+            hc_sinkhorn_eps=self.hc_eps,
+            hc_post_mult_value=self.hc_post_alpha,
+            sinkhorn_repeat=self.hc_sinkhorn_iters,
+        )
+        return layer_input, post_mix, comb_mix
+
+    def hc_post(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+    ) -> torch.Tensor:
+        """MHC post: fold the sub-layer output back into the ``hc_mult`` streams.
+
+        ``out[t,o,h] = post[t,o,0] * x[t,h] + sum_i comb[t,i,o] * residual[t,i,h]``
+        (W4A8 ``deepseek_v4/model.py:589-596``). ``comb`` is
+        ``[token, in_stream, out_stream]``; transposing it silently changes the
+        result, so it is passed through untouched.
+        """
+        return ixfops.ds4_mhc_post(x, residual, post, comb)
+
     def forward(
         self,
         x: torch.Tensor,
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
-        post_mix: torch.Tensor | None = None,
-        res_mix: torch.Tensor | None = None,
-        residual: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """MHC pre/post around attention and MoE, aligned to community NVIDIA.
+    ) -> torch.Tensor:
+        """MHC pre/post around attention and MoE (module 5).
 
-        Structure mirrors ``DeepseekV4DecoderLayer.forward``
-        (``vllm/models/deepseek_v4/nvidia/model.py:868-957``): the previous
-        sub-layer's post is deferred and fused with the current sub-layer's pre
-        (``mhc_fused_post_pre``); ``attn_norm`` / ``ffn_norm`` are folded into
-        ``mhc_pre`` (so they are *not* called separately here). The MHC ops are
-        the torch equivalents in ``fp8_mhc`` (module 1); the kernel swap to
-        ``ixfops.ds4_mhc_*`` is a later optimisation behind the same interface.
+        Structure follows the W4A8 fork (``deepseek_v4/model.py:597-635``): each
+        sub-layer runs ``hc_pre -> norm -> sub-layer -> hc_post`` and carries no
+        state across the layer boundary -- ``x`` is always the full
+        ``(T, hc_mult, H)`` residual stream.
 
-        The first layer arrives with ``residual is None`` and ``x`` already
-        expanded to ``(T, hc_mult, H)`` by ``Model.forward`` (the ``repeat``
-        there makes the community ``x.dim() == 3`` standalone-``mhc_pre`` branch
-        apply, so no broadcast special-case / ``fn_broadcast`` is needed).
-
-        Returns the carried state ``(x, residual, post_mix, res_mix)``; the
-        final ``mhc_post`` that reconstructs the last deferred post runs once in
-        ``Model.forward`` after the loop.
+        NVIDIA instead defers each ``mhc_post`` and fuses it into the next
+        sub-layer's ``mhc_pre`` (``nvidia/model.py:868-957``), with the norm
+        folded in as well. That is the same operator sequence in the same order
+        with the same bf16 rounding points, so the two forms are exactly
+        value-preserving; ixformer has no fused post+pre op, so nothing would be
+        gained by keeping the deferred shape here (design note:
+        ``模块5-mhc优化.md`` §2.2 / §2.4, cross-checked by ``test_fp8_mhc.py``).
         """
+        # ``ds4_mhc_pre_v2`` feeds ``fn`` straight into a same-dtype GEMM, so the
+        # fp32 checkpoint weights are cast once on the first forward and cached
+        # in place (W4A8 ``model.py:605-612``). ``hc_head_fn`` must stay fp32 --
+        # ``ds4_hc_head`` validates it as float32.
+        if self.hc_attn_fn.dtype != x.dtype:
+            self.hc_attn_fn.data = self.hc_attn_fn.data.to(x.dtype)
+        if self.hc_ffn_fn.dtype != x.dtype:
+            self.hc_ffn_fn.data = self.hc_ffn_fn.data.to(x.dtype)
+
         # --- attention sub-layer -------------------------------------------
-        if residual is None:
-            residual = x
-            post_mix, res_mix, x = fp8_mhc.mhc_pre(
-                x,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                self.rms_norm_eps,
-                self.hc_eps,
-                self.hc_eps,
-                self.hc_post_alpha,
-                self.hc_sinkhorn_iters,
-                norm_weight=self.attn_norm.weight,
-                norm_eps=self.attn_norm.variance_epsilon,
-            )
-        else:
-            residual, post_mix, res_mix, x = fp8_mhc.mhc_fused_post_pre(
-                x,
-                residual,
-                post_mix,
-                res_mix,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                self.rms_norm_eps,
-                self.hc_eps,
-                self.hc_eps,
-                self.hc_post_alpha,
-                self.hc_sinkhorn_iters,
-                norm_weight=self.attn_norm.weight,
-                norm_eps=self.attn_norm.variance_epsilon,
-            )
-
-        x = self.attn(positions, x, None)
-
-        # --- FFN sub-layer: attn's post fused with the ffn pre --------------
-        residual, post_mix, res_mix, x = fp8_mhc.mhc_fused_post_pre(
-            x,
-            residual,
-            post_mix,
-            res_mix,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
-            self.rms_norm_eps,
-            self.hc_eps,
-            self.hc_eps,
-            self.hc_post_alpha,
-            self.hc_sinkhorn_iters,
-            norm_weight=self.ffn_norm.weight,
-            norm_eps=self.ffn_norm.variance_epsilon,
+        residual = x
+        x, post, comb = self.hc_pre(
+            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
+        x = self.attn_norm(x)
+        x = self.attn(positions, x, None)
+        x = self.hc_post(x, residual, post, comb)
 
+        # --- FFN sub-layer --------------------------------------------------
+        residual = x
+        x, post, comb = self.hc_pre(
+            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+        )
+        x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
-        return x, residual, post_mix, res_mix
+        return self.hc_post(x, residual, post, comb)
 
 
 class IluDeepseekV4Fp8Model(nn.Module):
     """Embedding + 43 decoder layers + final norm + the global MHC head.
 
     Community counterpart: ``DeepseekV4Model``
-    (``vllm/models/deepseek_v4/nvidia/model.py:960-1055``), minus the three aux
-    streams (design §6.1 keeps Stage 1 single-stream) and minus the MegaMoE /
-    Eagle plumbing.
+    (``vllm/models/deepseek_v4/nvidia/model.py:960-1055``), single-stream
+    (design §6.1; the W4A8 fork's attention aux stream is not wired here) and
+    without the MegaMoE / Eagle plumbing.
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -776,9 +742,8 @@ class IluDeepseekV4Fp8Model(nn.Module):
 
         # Shared across every indexer layer (community: nvidia/model.py:991).
         # Risk R9: community allocates this on CPU, the W4A8 fork passes an
-        # explicit device (model.py:658-663). Following the fork -- Stage 1 never
-        # reads the buffer, so the choice only has to be revisited when Stage 2
-        # first consumes it.
+        # explicit device (model.py:658-663). Following the fork; confirmed
+        # correct once the indexer became its reader in module 3.
         self.device = current_platform.device_type
         self.topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
@@ -863,15 +828,17 @@ class IluDeepseekV4Fp8Model(nn.Module):
 
         Community: ``vllm/models/deepseek_v4/nvidia/model.py:1137-1144``
         (``hc_head_fused_kernel_tilelang`` over ``hc_head_fn`` / ``_scale`` /
-        ``_base``); implemented via the torch equivalent in ``fp8_mhc``.
+        ``_base``); here the ixformer kernel, as in W4A8 ``model.py:765-772``.
+        ``hc_head_fn`` stays fp32 -- unlike the per-layer ``hc_*_fn`` it is
+        validated as float32 by the kernel, so it must not be cast.
         """
-        return fp8_mhc.hc_head(
+        return ixfops.ds4_hc_head(
             hidden_states,
             self.hc_head_fn,
             self.hc_head_scale,
             self.hc_head_base,
-            self.rms_norm_eps,
-            self.hc_eps,
+            rms_norm_eps=self.rms_norm_eps,
+            hc_eps=self.hc_eps,
         )
 
     def forward(
@@ -881,15 +848,15 @@ class IluDeepseekV4Fp8Model(nn.Module):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        """Embed -> 43 decoder layers -> final mhc_post -> hc_head -> norm.
+        """Embed -> 43 decoder layers -> hc_head -> norm.
 
         Mirrors ``DeepseekV4Model.forward``
-        (``vllm/models/deepseek_v4/nvidia/model.py:1080-1145``), minus the aux
-        streams and the MTP buffer (design §6.1). The token embedding is
-        expanded to ``hc_mult`` streams before the loop (W4A8
-        ``model.py:750``); the ``(residual, post_mix, res_mix)`` triple is
-        threaded through the layers so the fused post/pre boundaries line up,
-        and the last deferred post is reconstructed once after the loop.
+        (``vllm/models/deepseek_v4/nvidia/model.py:1080-1145``) / W4A8
+        ``model.py:738-772``, minus the aux streams and the MTP buffer
+        (design §6.1). The token embedding is expanded to ``hc_mult`` streams
+        before the loop and stays that shape all the way to ``hc_head``: each
+        layer does its own closing ``hc_post`` (module 5), so unlike NVIDIA there
+        is no per-layer state to thread and no deferred post to reconstruct here.
         """
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -897,31 +864,19 @@ class IluDeepseekV4Fp8Model(nn.Module):
             else:
                 hidden_states = self.embed_input_ids(input_ids)
             # (T, H) -> (T, hc_mult, H): every stream starts identical, which
-            # makes the plain mhc_pre equivalent to community's broadcast pre.
+            # makes the plain hc_pre equivalent to community's broadcast pre.
+            # ``repeat`` also gives the contiguous tensor the kernels require.
             hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
-        residual: torch.Tensor | None = None
-        post_mix: torch.Tensor | None = None
-        res_mix: torch.Tensor | None = None
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states, residual, post_mix, res_mix = layer(
-                hidden_states,
-                positions,
-                input_ids,
-                post_mix,
-                res_mix,
-                residual,
-            )
+            hidden_states = layer(hidden_states, positions, input_ids)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
-        # Reconstruct the last sub-layer's deferred post (community
-        # nvidia/model.py:1126-1128), then collapse the streams and norm.
-        hidden_states = fp8_mhc.mhc_post(hidden_states, residual, post_mix, res_mix)
         hidden_states = self.hc_head(hidden_states)
         hidden_states = self.norm(hidden_states)
         return hidden_states
@@ -932,7 +887,7 @@ class IluDeepseekV4Fp8Model(nn.Module):
         Community counterpart: ``DeepseekV4Model.get_expert_mapping``
         (``nvidia/model.py:1277-1291``) minus its MegaMoE branch --
         ``make_deepseek_v4_expert_params_mapping`` is only for
-        ``use_mega_moe``, which Stage 1 never enables (design §4.4).
+        ``use_mega_moe``, which this model never enables (design §4.4).
 
         The returned 4-tuples are ``(param_name, weight_name, expert_id,
         shard_id)`` where both names are **fragments**, e.g.

@@ -42,18 +42,11 @@ def swiglu_clamp(x: torch.Tensor, limit: float | None) -> torch.Tensor:
     ``gate = clamp(x[..., :d], max=limit)``, ``up = clamp(x[..., d:], +-limit)``,
     result ``silu(gate) * up``. Computed in fp32 and cast back to ``x.dtype``.
 
-    Lives here rather than next to either caller because two unrelated
-    DeepSeek-V4 FP8 paths need the same formula and must not drift apart:
-
-    * the shared-expert MLP activation ``_Fp8SwiGLU``
-      (``models/deepseek_v4/fp8_model.py``), which cannot be a community
-      ``CustomOp`` because those bind ``torch.ops._C.silu_and_mul_with_clamp``
-      in ``__init__`` with no Iluvatar fallback;
-    * the routed-expert activation in ``ilu_mxfp4_fused_experts()``
-      (``layers/fused_moe/ilu_mxfp4_fused_moe.py``), Phase 1 torch path.
-
-    ``IluSiluAndMulWithClamp`` below is the kernel-backed ``CustomOp`` for the
-    same math; this function is the reference both torch paths share.
+    Used by the routed-expert activation in ``ilu_mxfp4_fused_experts()``
+    (``layers/fused_moe/ilu_mxfp4_fused_moe.py``) and as the reference the
+    kernel-backed ``IluSiluAndMulWithClamp`` below is checked against. (The
+    DeepSeek-V4 FP8 shared-expert MLP used it too until module 5 moved that slot
+    onto ``SiluAndMulWithClamp``.)
     """
     d = x.shape[-1] // 2
     gate = x[..., :d].to(torch.float32)

@@ -18,25 +18,38 @@ How      : callers (currently ``IluMxfp4MoEMethod.apply``) call
            GPT-OSS-MXFP4 or compressed-tensors-W4A4-MXFP4 method only has to
            write its own wiring.
 Scope    : routed MXFP4 experts on Iluvatar.
-Remove   : never as a whole -- Phase 2 replaces the *body* (ixformer ``ep_moe``
-           pipeline + two ``group_gemm_fp4`` calls) while the signature and every
-           caller stay put.
+Remove   : never as a whole -- it is the only implementation of this compute.
 
-Phase 1 vs Phase 2
-------------------
-This file holds **both** the Phase 1 implementation (now renamed
-``ilu_mxfp4_fused_experts_torch``) and the Phase 2 Stage 2A implementation
-(``_ilu_mxfp4_fused_experts_ixformer``), selected at call time by the
-``ilu_mxfp4_fused_experts`` dispatcher (see module 4.2 §3).
+Two implementations, one dispatcher
+-----------------------------------
+``ilu_mxfp4_fused_experts`` is the public entry point. It resolves a backend
+(``_resolve_backend``) and delegates to one of:
 
-Phase 1 (``..._torch``) is a pure-torch, on-the-fly MXFP4 -> bf16 dequant per
-expert plus a grouped MLP. It is a straight move of what used to live in
-``IluDeepseekV4Fp8MoE._routed_experts`` / ``_dequant_mxfp4_to_bf16``,
-generalised on three axes so it stops being DeepSeek-V4-specific:
+* ``_ilu_mxfp4_fused_experts_ixformer`` -- the production path. Six device
+  kernels, no bf16 weight materialisation::
 
-* expert ownership comes from ``expert_map`` (the community global -> local map)
-  instead of the model's own ``experts_start_idx`` / ``n_local_experts``, which
-  are no longer authoritative once ``FusedMoEParallelConfig`` decides the split;
+      moe_compute_token_index_ep_group_layout
+        -> moe_expand_input_dynamic_scaled_fp8
+        -> group_gemm_fp4(w13) -> swiglu_limit_dynamic_scaled_fp8
+        -> group_gemm_fp4(w2)  -> moe_gather_output_reduce_sum(extra_residual=...)
+
+  The ``group_gemm_fp4`` backend is ``ixmm`` by default
+  (``VLLM_ILU_MXFP4_MOE_BACKEND``), which consumes the ix30 layout that
+  ``preprocess_weight_for_ixmm`` produces once at load time. ``ixformer_native``
+  consumes the original MXFP4 layout instead and must be requested explicitly:
+  its kernel is GEMV-shaped and unusable at prefill scale.
+
+* ``ilu_mxfp4_fused_experts_torch`` -- pure torch, per-expert MXFP4 -> bf16
+  dequant plus a grouped MLP. Not a dead migration artefact; see its docstring
+  for the three roles it still serves.
+
+Three invariants both implementations share:
+
+* expert ownership comes from ``expert_map`` (the community global -> local map),
+  not from a model's own ``experts_start_idx`` / ``n_local_experts``, which are
+  not authoritative once ``FusedMoEParallelConfig`` decides the split. The
+  ixformer path forwards ``expert_map`` straight into the routing op, which does
+  the remap on device;
 * the shared-expert output arrives as ``extra_residual`` and must be folded in
   here, because on the fused-shared path the runner returns ``shared_output ==
   None`` and nobody adds it later (see module 4.1 design §4.2);
@@ -44,20 +57,9 @@ generalised on three axes so it stops being DeepSeek-V4-specific:
   which is ``1.0``) -- never ``layer.routed_scaling_factor``, which is the
   router-aligned ``1.5`` and would double-scale the result (design §4.1).
 
-Phase 2 Stage 2A (``_ilu_mxfp4_fused_experts_ixformer``) replaces the body with:
-
-    moe_compute_token_index_ep_group_layout
-      -> moe_expand_input_dynamic_scaled_fp8
-      -> group_gemm_fp4(w13) -> swiglu_limit_dynamic_scaled_fp8
-      -> group_gemm_fp4(w2)  -> moe_gather_output_reduce_sum(extra_residual=...)
-
-Stage 2A uses the ``ixformer_native`` / ``torch`` ``group_gemm_fp4`` backends
-for correctness. The production default is Stage 2B's ``ixmm`` backend:
-weights are converted once by ``preprocess_weight_for_ixmm`` at load time.
-
-ixformer is deliberately **not** imported at module scope: Phase 1 must stay
-importable (and testable) on a plain CPU host. The ixformer import lives inside
-``_ilu_mxfp4_fused_experts_ixformer`` and behind the dispatcher's CUDA/arch
+ixformer is deliberately **not** imported at module scope: the torch path must
+stay importable (and testable) on a plain CPU host. The ixformer import lives
+inside ``_ilu_mxfp4_fused_experts_ixformer``, behind the dispatcher's CUDA/arch
 gate.
 """
 
@@ -133,8 +135,12 @@ def _to_local_expert_ids(
 
     Deliberately driven by ``expert_map`` rather than an ``[start, end)`` range:
     it is correct for every ``expert_placement_strategy`` (round-robin included)
-    and for EPLB's physical-id remapping, both of which break the contiguous-range
-    assumption the old ``IluDeepseekV4Fp8MoE._routed_experts`` made.
+    and for EPLB's physical-id remapping, both of which break the
+    contiguous-range assumption.
+
+    Only the torch path uses this. The ixformer path forwards ``expert_map`` to
+    ``moe_compute_token_index_ep_group_layout``, which applies the same formula
+    inside the routing kernel.
     """
     ids = topk_ids.long()
     if expert_map is None:
@@ -160,16 +166,17 @@ def ilu_mxfp4_fused_experts_torch(
 ) -> torch.Tensor:
     """Run the routed MXFP4 experts owned by this rank (pure-torch oracle).
 
-    This is the **Phase 1** implementation, retained verbatim under a new name
-    (module 4.2 §3.4). It serves three roles simultaneously:
+    Not on the production hot path, but not removable either -- it serves three
+    roles simultaneously:
 
-    1. the migration / numerical oracle for ``_ilu_mxfp4_fused_experts_ixformer``;
+    1. the numerical oracle for ``_ilu_mxfp4_fused_experts_ixformer``;
     2. the only runnable path on non-ivcore30 hosts or when the ixmm wheel is
-       unavailable (module 4.2 §2.8 conclusion 2 -- cuBLAS bf16 matmul on the
-       dequantised weights is faster than the naive ``ixformer_native`` kernel
-       at prefill scale);
-    3. the absolute accuracy baseline for Stage 2B (§2.3: ixmm's per-256
-       re-quantisation can only be compared against this, never assumed equal).
+       unavailable (module 4.2 §2.8 -- cuBLAS bf16 matmul on the dequantised
+       weights beats the naive ``ixformer_native`` kernel at prefill scale);
+    3. the absolute accuracy baseline for the ixmm path, whose per-256
+       re-quantisation loses precision against the checkpoint's per-32 block
+       scales and so can only be compared against this, never assumed equal
+       (module 4.2 §2.3).
 
     Args:
         hidden_states: ``[T, H]``, contiguous, activation dtype (bf16).
@@ -238,7 +245,7 @@ def ilu_mxfp4_fused_experts_torch(
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 Stage 2A: ixformer ep_moe + group_gemm_fp4 pipeline
+# ixformer ep_moe + group_gemm_fp4 pipeline
 # ---------------------------------------------------------------------------
 
 # Backend names accepted by the dispatcher. Kept as plain strings (not an
@@ -412,7 +419,7 @@ def _ilu_mxfp4_fused_experts_ixformer(
     gemm_backend: str,
     gemm_mode: int,
 ) -> torch.Tensor:
-    """Phase 2 Stage 2A ixformer pipeline (module 4.2 §3.3).
+    """The ixformer pipeline (module 4.2 §3.3).
 
     Six steps: routing -> expand+E4M3 -> GEMM1 -> clamp+SwiGLU+E4M3 -> GEMM2
     -> gather+reduce. Stays in compact expert order between GEMM1 and the
@@ -420,8 +427,9 @@ def _ilu_mxfp4_fused_experts_ixformer(
     community w13 layout is gate-then-up, not 16-column interleaved.
 
     ``gemm_backend`` is one of ``"torch"`` / ``"ixformer_native"`` / ``"ixmm"``
-    and is forwarded verbatim to ``group_gemm_fp4``. Stage 2A callers pass
-    ``"ixformer_native"`` or ``"torch"``; Stage 2B passes ``"ixmm"``.
+    and is forwarded verbatim to ``group_gemm_fp4``. It also selects how the
+    weight shapes are read: ``ixmm`` consumes the preprocessed ``[E, K/2, N]``
+    layout, the other two the original ``[E, N, K/2]``.
     """
     # Lazy import: keeps this module importable on a CPU host / when ixformer
     # is absent. The dispatcher only reaches here on the CUDA + ivcore30 path.
@@ -462,16 +470,21 @@ def _ilu_mxfp4_fused_experts_ixformer(
         "'no clamp' mode"
     )
     assert w13_bias is None and w2_bias is None, (
-        "Stage 2A does not wire bias into group_gemm_fp4"
+        "bias is not wired into group_gemm_fp4; the dispatcher should have "
+        "fallen back to the torch path"
     )
-    assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
 
-    # --- 1) Routing (§2.6): keep expert_map semantics, feed a contiguous ---
-    #     interval to the routing op by remapping to local ids first.
-    local_ids = topk_ids if expert_map is None else expert_map[topk_ids.long()]
-    local_ids = local_ids.to(torch.int32).contiguous()
+    # --- 1) Routing: the op owns the global -> local remap ----------------
+    #     ``expert_map`` is forwarded as-is: ``None`` for pure TP / single card
+    #     (ids are already local), otherwise the community
+    #     ``[global_num_experts]`` int32 map with ``-1`` for remote experts.
+    #     Remote and out-of-range routes come back as ``-1`` in ``src_to_dst``
+    #     and are skipped by the final gather, so no host-side early-out is
+    #     needed even when this rank owns none of the routed experts.
     src_to_dst, dst_to_src, group_layout = (
-        ixfops.moe_compute_token_index_ep_group_layout(local_ids, 0, E_local)
+        ixfops.moe_compute_token_index_ep_group_layout(
+            topk_ids, 0, E_local, expert_map=expert_map
+        )
     )
 
     # --- 2) Expand + per-token E4M3 -------------------------------------
@@ -546,16 +559,16 @@ def ilu_mxfp4_fused_experts(
 ) -> torch.Tensor:
     """Dispatcher for the routed MXFP4 expert compute (module 4.2 §3.4).
 
-    Signature is the Phase 1 ``ilu_mxfp4_fused_experts`` plus two kw-only
-    args: ``run_decode`` (recorded in Stage 2A, consumed by Stage 2B's
-    ``mode=1`` decode tile) and ``backend`` (force a ``group_gemm_fp4``
-    backend; ``None`` defers to ``VLLM_ILU_MXFP4_MOE_BACKEND``, whose default
-    is ``ixmm``).
+    Takes the same arguments as ``ilu_mxfp4_fused_experts_torch`` plus two
+    kw-only ones:
+
+    * ``run_decode``: reserved for the ``group_gemm_fp4(mode=1)`` decode tile,
+      not consumed yet (see the ``del`` below);
+    * ``backend``: force a ``group_gemm_fp4`` backend. ``None`` defers to
+      ``VLLM_ILU_MXFP4_MOE_BACKEND``, whose default is ``ixmm``.
 
     Returns the ``[T, H]`` rank-local partial; the runner's all-reduce
-    completes the EP/TP partials. See ``ilu_mxfp4_fused_experts_torch`` for
-    the torch oracle semantics and ``_ilu_mxfp4_fused_experts_ixformer``
-    for the ixformer pipeline.
+    completes the EP/TP partials.
     """
     be = _resolve_backend(
         backend,
@@ -584,9 +597,13 @@ def ilu_mxfp4_fused_experts(
             w13_bias=w13_bias,
             w2_bias=w2_bias,
         )
-    # Stage 2A: gemm_mode is always 0. Stage 2B will derive 1 from run_decode
-    # under the §2.5 bound (T <= 64).
-    del run_decode  # unused in Stage 2A; kept in the signature for Stage 2B.
+    # ``gemm_mode`` is still hardcoded to 0 (all nine M tiles). Enabling the
+    # decode tile is ``gemm_mode = 1 if run_decode and T <= 64 else 0``: top-k
+    # picks distinct experts per token, so no expert can receive more than T
+    # rows, which is exactly the mode=1 contract (module 4.2 §2.5). It is not
+    # switched on yet because the win is unmeasured and the contract is not
+    # runtime-checked -- violating it is silently wrong.
+    del run_decode
     return _ilu_mxfp4_fused_experts_ixformer(
         hidden_states,
         w13_weight,

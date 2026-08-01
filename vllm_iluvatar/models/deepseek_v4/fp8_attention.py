@@ -11,8 +11,7 @@ Iluvatar stack rejects). The lightning indexer is the self-contained
 ``IluDeepseekV4Fp8Indexer`` with a grouped fp8 K cache.
 
 Deviations from the NV public version are marked inline with
-``TODO(ilu_fp8_align_*)`` (indexer K-insert, no head padding, single-stream,
-no custom op).
+``TODO(ilu_fp8_align_*)`` (no head padding, single-stream, no custom op).
 """
 
 from __future__ import annotations
@@ -202,8 +201,8 @@ class IluDeepseekV4Fp8Indexer(nn.Module):
     """Self-contained fp8 lightning indexer (grouped fp8 K cache).
 
     Sub-module names/shapes match the W4A8 ``IluDeepseekV4Indexer`` so weight
-    loading is unchanged. The K-insert step still uses a torch equivalent
-    (TODO(ilu_fp8_align_indexer_fp8)).
+    loading is unchanged. All three compute steps (q rope+quant, K insert, paged
+    mqa-logits) run on ixformer fp8 kernels.
     """
 
     def __init__(
@@ -265,8 +264,8 @@ class IluDeepseekV4Fp8Indexer(nn.Module):
             k_cache_prefix=self.k_cache.prefix,
         )
         logger.info_once(
-            "Ilu DeepSeek V4 fp8 indexer: grouped fp8 K cache with "
-            "torch-equivalent K-insert (TODO(ilu_fp8_align_indexer_fp8))."
+            "Ilu DeepSeek V4 fp8 indexer: grouped fp8 K cache, ixformer "
+            "q-rope-quant / K-insert / paged mqa-logits kernels."
         )
 
     def forward(

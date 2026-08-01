@@ -436,48 +436,38 @@ def test_shared_expert_intermediate_round_up_is_a_no_op(moe_factory):
 
 
 # ---------------------------------------------------------------------------
-# design §4.4.1: no activation module is constructed
+# Module 5: the shared-expert activation is the kernel-backed CustomOp
 # ---------------------------------------------------------------------------
 
 
-def test_shared_expert_activation_is_a_torch_swiglu(moe_factory):
-    """The ``act_fn`` slot is a parameter-free torch SwiGLU (Module 4), not a
-    community activation ``CustomOp`` (design §4.4.1 / R10).
+def test_shared_expert_activation_is_the_oot_clamped_swiglu(moe_factory):
+    """``act_fn`` is ``SiluAndMulWithClamp``, i.e. the plugin's OOT subclass.
 
-    Community ``SiluAndMulWithClamp.__init__``
-    (``vllm/model_executor/layers/activation.py:186-195``) resolves
-    ``torch.ops._C.silu_and_mul_with_clamp`` while it is being constructed, and
-    the ``is_cuda_alike()`` branch has no fallback. ``IluPlatform`` derives from
-    ``CudaPlatform`` so that branch always wins, and Iluvatar has no such symbol
-    -- building one would die with ``AttributeError`` before a single parameter
-    existed. So the slot holds ``_Fp8SwiGLU``, a plain ``nn.Module`` that does
-    the clamped SwiGLU in torch: no ``torch.ops._C`` handle, no parameter, no
-    buffer, and it actually computes (it no longer raises the group-C stub).
+    Design §4.4.1 / R10 assumed constructing a community activation ``CustomOp``
+    would die on Iluvatar, because ``SiluAndMulWithClamp.__init__`` resolves its
+    kernel while being built and the ``is_cuda_alike()`` branch has no fallback.
+    That is only true without the plugin: ``IluSiluAndMulWithClamp``
+    (``vllm_iluvatar/model_executor/layers/activation.py``) overrides that branch
+    to bind ``vllm._custom_ops.silu_and_mul_with_clamp``, ``ilu_register`` applies
+    it before any model module is imported, and the W4A8 fork has been running it
+    in production. Module 5 therefore dropped the torch stand-in.
 
-    Asserted on the *class*, not on ``isinstance``, so the community classes stay
-    unimported here -- importing them is harmless, instantiating them is not.
+    ``fuse_quant`` must stay off: that path returns a ``(q, scale, dtype)`` tuple
+    for a downstream int8 linear, which the block-FP8 ``down_proj`` cannot take.
     """
-    from vllm.model_executor.custom_op import CustomOp
+    from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 
     with moe_factory(BIAS_LAYER_ID) as (moe, _):
         act_fn = moe.shared_experts.act_fn
 
-        assert not isinstance(act_fn, CustomOp), (
-            "act_fn must not be a community activation CustomOp -- those bind "
-            f"torch.ops._C in __init__; got {type(act_fn).__name__}"
-        )
-        # A kernel handle would mean something was resolved at construction time.
-        assert getattr(act_fn, "op", None) is None
+        assert isinstance(act_fn, SiluAndMulWithClamp)
+        # The OOT subclass, not the community class itself.
+        assert type(act_fn) is not SiluAndMulWithClamp
+        assert act_fn.swiglu_limit == float(MINI_CONFIG_FIELDS["swiglu_limit"])
+        assert act_fn.fuse_quant is False
         # No parameter / buffer, so the loader and the shape tables are unaffected.
         assert list(act_fn.named_parameters()) == []
         assert list(act_fn.named_buffers()) == []
-
-        # Wired: pure torch, runs on CPU. gate/up halves -> [., _SHARED_I].
-        out = act_fn(torch.zeros(2, 2 * _SHARED_I, dtype=BF16))
-        assert tuple(out.shape) == (2, _SHARED_I)
-        assert out.dtype is BF16
-        # silu(0) * 0 == 0, a cheap sanity value that needs no kernel.
-        assert torch.allclose(out, torch.zeros_like(out))
 
 
 # ---------------------------------------------------------------------------

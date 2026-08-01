@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     VLLM_ILU_GDN_ATTN_BACKEND: bool = False
     VLLM_ILU_DS4_PREFILL_OPT: bool = False
     VLLM_ILU_DS4_PREFILL_AS_DECODE: bool = False
+    VLLM_ILU_DS4_MQA_QUANT_TYPE: str = ""
     VLLM_ILU_NIXL_WRITE_USE_HOST_BUFFER: bool = False
     VLLM_ILU_NIXL_HOST_DTYPE: str = "auto"
     VLLM_ILU_NIXL_PROXY_ADDR: str = ""
@@ -239,6 +240,12 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     )
     .strip()
     .lower(),
+    # DeepSeek-V4 fp8 MQA Q quant mode. Empty = bf16 Q (default).
+    # "Q_NOPE_FP8" = dynamically quantize Q NoPE [0:448] to fp8 then dequant
+    # before ds4_flash_mla_with_fp8_kvcache (module 3.3.1 validation path).
+    "VLLM_ILU_DS4_MQA_QUANT_TYPE": lambda: os.environ.get(
+        "VLLM_ILU_DS4_MQA_QUANT_TYPE", ""
+    ).upper(),
 }
 
 

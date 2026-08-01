@@ -756,7 +756,7 @@ def _install_fake_ixfops(monkeypatch):
     fake_ixfops = MagicMock()
     _routing_out = {}
 
-    def _routing(topk_ids, start, end):
+    def _routing(topk_ids, start, end, expert_map=None):
         M = topk_ids.numel()
         src_to_dst = torch.arange(M, dtype=torch.int32)
         dst_to_src = torch.arange(M, dtype=torch.int32)
@@ -838,13 +838,14 @@ def test_ixformer_pipeline_wires_args_correctly(weights, hidden_states, monkeypa
 
     src_to_dst, dst_to_src, group_layout = routing_out["v"]
 
-    # 1) routing: local_ids passed as int32, start=0, end=E_local.
+    # 1) routing: topk_ids forwarded untouched, start=0, end=E_local, and the
+    # expert_map remap delegated to the op (module 4.2.1 §5.1).
     routing_call = fake_ixfops.moe_compute_token_index_ep_group_layout
     routing_call.assert_called_once()
     r_args = routing_call.call_args.args
+    assert r_args[0] is topk_ids
     assert r_args[1] == 0 and r_args[2] == w13_n.shape[0]
-    assert r_args[0].dtype is torch.int32
-    assert r_args[0].is_contiguous()
+    assert routing_call.call_args.kwargs["expert_map"] is None
 
     # 2) expand: dst_to_src + top_k forwarded.
     expand_call = fake_ixfops.moe_expand_input_dynamic_scaled_fp8
@@ -915,3 +916,53 @@ def test_ixmm_pipeline_uses_preprocessed_weight_dimensions(
     gemm_calls = fake_ixfops.group_gemm_fp4.call_args_list
     assert gemm_calls[0].args[5].shape == (_TOKENS * _TOPK, 2 * _I)
     assert gemm_calls[1].args[5].shape == (_TOKENS * _TOPK, _H)
+
+
+def test_ixformer_pipeline_forwards_expert_map_without_remapping(
+    weights, hidden_states, monkeypatch
+):
+    """``expert_map`` goes to the routing op verbatim (module 4.2.1 §5.1).
+
+    The global -> local remap used to happen here as
+    ``expert_map[topk_ids.long()].to(torch.int32)``; the op owns it now. Pinning
+    ``r_args[0] is topk_ids`` is what keeps that Python gather from creeping
+    back: an equality assertion would still pass on a remapped copy.
+    """
+    w13, w13_scale, w2, w2_scale = weights
+    expert_count = w13.shape[0]
+    topk_weights, topk_ids = _rand_routing(_TOKENS, 4 * expert_count, _TOPK, seed=31)
+    # Community layout: local index for owned experts, -1 for remote ones. Here
+    # this rank owns every 4th global expert (round-robin placement), which no
+    # contiguous [start, end) interval could describe.
+    expert_map = torch.full((4 * expert_count,), -1, dtype=torch.int32)
+    expert_map[::4] = torch.arange(expert_count, dtype=torch.int32)
+
+    fake_ixfops, _ = _install_fake_ixfops(monkeypatch)
+    fake_ixfops.moe_gather_output_reduce_sum.return_value = torch.zeros(
+        _TOKENS, _H, dtype=torch.bfloat16
+    )
+
+    _ilu_mxfp4_fused_experts_ixformer(
+        hidden_states,
+        w13.data.view(torch.int8),
+        w13_scale.data.view(torch.float8_e8m0fnu),
+        w2.data.view(torch.int8),
+        w2_scale.data.view(torch.float8_e8m0fnu),
+        topk_weights,
+        topk_ids,
+        swiglu_limit=_SWIGLU_LIMIT,
+        expert_map=expert_map,
+        output_scale=1.0,
+        extra_residual=None,
+        w13_bias=None,
+        w2_bias=None,
+        gemm_backend="ixformer_native",
+        gemm_mode=0,
+    )
+
+    routing_call = fake_ixfops.moe_compute_token_index_ep_group_layout
+    routing_call.assert_called_once()
+    assert routing_call.call_args.args[0] is topk_ids
+    assert routing_call.call_args.args[1] == 0
+    assert routing_call.call_args.args[2] == expert_count
+    assert routing_call.call_args.kwargs["expert_map"] is expert_map

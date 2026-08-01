@@ -7,15 +7,17 @@ text. Nothing is imported from ``torch`` / ``vllm`` / ``vllm_iluvatar``, so the
 test runs identically on a laptop and inside the Iluvatar container -- which is
 the whole point: it is the cheapest possible regression fence around design §7.
 
-Why ``ast`` rather than plain text matching for the two prohibitions
--------------------------------------------------------------------
-Requirements 5.5 (no ``ixformer`` reference) and 5.8 (no torch custom op) are
-about *code*, not about prose. Both source files carry long docstrings that
-explain exactly why the vendor kernel package is not imported and why no op is
-registered, and Stage 2 notes will keep mentioning both words. A text grep would
-flag those explanations as violations, so imports / calls / attribute chains are
-matched on the parse tree instead, where docstrings and comments simply are not
-reachable.
+Why ``ast`` rather than plain text matching for the custom-op prohibition
+------------------------------------------------------------------------
+Requirement 5.8 (no torch custom op) is about *code*, not about prose: both
+source files carry long docstrings explaining why no op is registered, and a text
+grep would flag those explanations as violations. Imports / calls / attribute
+chains are therefore matched on the parse tree, where docstrings and comments are
+not reachable.
+
+Requirement 5.5 (``fp8_model.py`` must not reference ``ixformer``) was a Stage-1
+fence and is gone: module 5 put the MHC kernels in that file, exactly as the W4A8
+fork does.
 
 The TODO numbers themselves are collected *both* ways on purpose:
 
@@ -27,7 +29,7 @@ The TODO numbers themselves are collected *both* ways on purpose:
   keeps "编号唯一" (requirement 5.3) honest, since ``ast`` alone would happily
   ignore a duplicate hidden in a comment.
 
-Validates: Requirements 5.1, 5.2, 5.3, 5.4, 5.5, 5.8
+Validates: Requirements 5.1, 5.2, 5.3, 5.4, 5.8
 """
 
 from __future__ import annotations
@@ -100,18 +102,20 @@ FORBIDDEN_NUMBERS = frozenset({"B1", "D1"})
 # Empty after Module 4: every Stage-1 number has graduated to a wired path.
 EXPECTED_LOCATIONS: dict[str, tuple[str, str, str]] = {}
 
-# Construction-time landmine fence (design §4.4 / risk R10): the community SwiGLU
-# CustomOps resolve their kernel in ``__init__``
-# (``activation.py:131-137`` / ``:186-195``) and the ``is_cuda_alike()`` branch has
-# no fallback, so instantiating one on Iluvatar raises AttributeError before any
-# weight exists. Stage 1 therefore constructs no activation module at all -- not
-# even through the plugin's OOT override, which would bind an ixformer kernel.
-FORBIDDEN_ACTIVATION_CLASSES = frozenset({"SiluAndMul", "SiluAndMulWithClamp"})
+# Two Stage-1 fences graduated in Module 5 and are deliberately *not* replaced:
+#
+# * "no community activation CustomOp": design §4.4 / R10 assumed
+#   ``SiluAndMulWithClamp.__init__`` would die looking up ``torch.ops._C`` on
+#   Iluvatar. The plugin's OOT ``IluSiluAndMulWithClamp`` binds
+#   ``vllm._custom_ops`` instead and the W4A8 fork ships it, so the shared-expert
+#   MLP now builds it like every other model.
+# * "``fp8_model.py`` is ixformer-free": the MHC ops are ixformer kernels called
+#   from this file (as in the W4A8 fork), so the vendor import is expected here
+#   exactly like it already was in ``fp8_attention.py``.
 
 # Requirement 5.1: the exact message shape.
 TODO_RE = re.compile(r"TODO\(ilu_fp8_([A-E]\d+)\)")
 
-FORBIDDEN_VENDOR_ROOT = "ixformer"
 FORBIDDEN_OP_HELPER = "direct_register_custom_op"
 # Requirement 5.8 -- the low-level registration entry points, in case someone
 # bypasses vLLM's helper.
@@ -235,36 +239,6 @@ def test_todo_number_sits_on_its_design_entry(number):
 
 
 @pytest.mark.parametrize("file_name", _SOURCE_FILES)
-def test_no_community_activation_module_is_constructed(file_name):
-    """Stage 1 builds no activation module (design §4.4).
-
-    Imports *and* bare name uses are both rejected: the failure mode this guards
-    is a construction-time ``torch.ops._C`` lookup, so merely referencing the
-    class in code is enough to reintroduce it. Docstring prose that explains the
-    ban is untouched -- only the parse tree is inspected.
-    """
-    path = _source_path(file_name)
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-
-    offenders: list[str] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                if alias.name in FORBIDDEN_ACTIVATION_CLASSES:
-                    offenders.append(f"line {node.lineno}: import {alias.name}")
-        elif isinstance(node, ast.Name) and node.id in FORBIDDEN_ACTIVATION_CLASSES:
-            offenders.append(f"line {node.lineno}: {node.id}")
-        elif isinstance(node, ast.Attribute):
-            if node.attr in FORBIDDEN_ACTIVATION_CLASSES:
-                offenders.append(f"line {node.lineno}: .{node.attr}")
-
-    assert not offenders, (
-        f"{file_name} references a community activation CustomOp: {offenders}; "
-        "these bind torch.ops._C in __init__ and have no fallback on Iluvatar"
-    )
-
-
-@pytest.mark.parametrize("file_name", _SOURCE_FILES)
 def test_no_todo_number_outside_not_implemented_raise(file_name):
     """Every textual occurrence must be a stub message, not a comment or log.
 
@@ -280,43 +254,9 @@ def test_no_todo_number_outside_not_implemented_raise(file_name):
     )
 
 
-# Module 3 wired the attention forward on ixformer ``ds4_*`` kernels, so
-# ``fp8_attention.py`` now legitimately imports the vendor package. Only
-# ``fp8_model.py`` stays ixformer-free: it delegates all kernel work to the
-# attention / MoE layers and holds no direct vendor call.
-_IXFORMER_FREE_FILES = ("fp8_model.py",)
-
-
-@pytest.mark.parametrize("file_name", _IXFORMER_FREE_FILES)
-def test_no_ixformer_reference(file_name):
-    """``fp8_model.py`` carries no vendor kernel import or attribute use.
-
-    Docstrings that *talk about* ixformer are fine -- only ``Import`` /
-    ``ImportFrom`` / attribute chains are inspected.
-    """
-    path = _source_path(file_name)
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-
-    offenders: list[str] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name.split(".")[0] == FORBIDDEN_VENDOR_ROOT:
-                    offenders.append(f"line {node.lineno}: import {alias.name}")
-        elif isinstance(node, ast.ImportFrom):
-            module = node.module or ""
-            if module.split(".")[0] == FORBIDDEN_VENDOR_ROOT:
-                offenders.append(f"line {node.lineno}: from {module} import ...")
-        elif isinstance(node, ast.Attribute):
-            if _root_name(node) == FORBIDDEN_VENDOR_ROOT:
-                offenders.append(f"line {node.lineno}: {FORBIDDEN_VENDOR_ROOT} attr")
-
-    assert not offenders, f"{file_name} references ixformer: {offenders}"
-
-
 @pytest.mark.parametrize("file_name", _SOURCE_FILES)
 def test_no_custom_op_registration(file_name):
-    """Requirement 5.8: Stage 1 registers no torch custom op.
+    """Requirement 5.8: this model registers no torch custom op.
 
     ``direct_register_custom_op`` is checked as an import, as a call and as a
     bare reference; ``torch.library.{define,impl,custom_op}`` covers the route

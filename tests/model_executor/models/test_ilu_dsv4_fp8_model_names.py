@@ -528,7 +528,7 @@ _EXPECTED_MODEL_LEVEL: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
 # --------------------------------------------------------------------------- #
 # design §5.3 (task 3.5): FFN parameters, folded to the mini config
 # --------------------------------------------------------------------------- #
-# Same folding as ``test_ilu_dsv4_fp8_moe_patch.py`` (task 3.4), reproduced here
+# Same folding as ``test_ilu_dsv4_fp8_moe.py`` (task 3.4), reproduced here
 # instead of imported so a silent change on either side shows up as a literal
 # mismatch rather than as two tables agreeing on the wrong number.
 #
@@ -697,57 +697,6 @@ def build_expected_shape_table() -> dict[str, tuple[tuple[int, ...], torch.dtype
 # model construction
 # --------------------------------------------------------------------------- #
 @contextlib.contextmanager
-def p1_mxfp4_backend_patch():
-    """Apply the P1 MXFP4-backend patch for the duration of the block.
-
-    Needed since task 3.4: ``IluDeepseekV4Fp8MoE`` builds a community
-    ``FusedMoE``, and ``Mxfp4MoEMethod.__init__`` asks
-    ``select_deepseek_v4_mxfp4_moe_backend`` for a backend during construction.
-    Unpatched and off ROCm that raises ``NotImplementedError("No MXFP4 MoE
-    backend supports the deployment configuration.")``, so the model cannot be
-    built at all. The platform gate is forced on because the test host is not an
-    Iluvatar device.
-
-    Everything is undone on exit -- the patch rewrites community module globals
-    (``rebind_module_func`` walks ``sys.modules``), and
-    ``test_ilu_dsv4_fp8_moe_patch.py`` asserts on exactly those globals. This
-    module sorts *before* that one, so a leak would break it.
-    """
-    import sys
-
-    import vllm.model_executor.layers.fused_moe.oracle.mxfp4 as oracle_mod
-    import vllm.model_executor.layers.quantization.mxfp4  # noqa: F401
-
-    from vllm_iluvatar.ilu_patch import general_patch
-    from vllm_iluvatar.ilu_patch.general_patches import patch_dsv4_mxfp4_backend
-    from vllm_iluvatar.model_executor.layers.fused_moe.oracle import ilu_mxfp4
-
-    symbol = "select_deepseek_v4_mxfp4_moe_backend"
-    original = getattr(oracle_mod, symbol)
-    holders = [
-        mod
-        for mod in list(sys.modules.values())
-        if getattr(mod, symbol, None) is original
-    ]
-    patch_name = patch_dsv4_mxfp4_backend.__name__
-    was_applied = patch_name in general_patch._APPLIED
-    original_gate = ilu_mxfp4._is_iluvatar_platform
-
-    general_patch._APPLIED.discard(patch_name)
-    try:
-        patch_dsv4_mxfp4_backend.register()
-        ilu_mxfp4._is_iluvatar_platform = lambda: True
-        yield
-    finally:
-        ilu_mxfp4._is_iluvatar_platform = original_gate
-        for mod in holders:
-            setattr(mod, symbol, original)
-        general_patch._APPLIED.discard(patch_name)
-        if was_applied:
-            general_patch._APPLIED.add(patch_name)
-
-
-@contextlib.contextmanager
 def build_mini_fp8_model():
     """Build ``IluDeepseekV4Fp8ForCausalLM`` on ``meta`` under the mini config."""
     from vllm.config import set_current_vllm_config
@@ -758,11 +707,13 @@ def build_mini_fp8_model():
     )
 
     vllm_config = make_mini_vllm_config()
-    with p1_mxfp4_backend_patch():
-        with set_default_torch_dtype(BF16), set_current_vllm_config(vllm_config):
-            with torch.device("meta"):
-                model = IluDeepseekV4Fp8ForCausalLM(vllm_config=vllm_config)
-            yield model, vllm_config
+    # No patch registration needed since module 4.1: ``make_mini_vllm_config``
+    # hands out ``IluDeepseekV4FP8Config``, so the routed experts land on
+    # ``IluMxfp4MoEMethod`` and nothing asks the community MXFP4 backend oracle.
+    with set_default_torch_dtype(BF16), set_current_vllm_config(vllm_config):
+        with torch.device("meta"):
+            model = IluDeepseekV4Fp8ForCausalLM(vllm_config=vllm_config)
+        yield model, vllm_config
 
 
 def _actual_param_table(model) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:

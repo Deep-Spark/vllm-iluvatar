@@ -485,9 +485,26 @@ def make_mini_model_config(hf_config=None, *, model_cls=None):
 
 
 def make_mini_vllm_config():
-    """A VllmConfig carrying the mini hf_config plus the DS-V4 FP8 quant config."""
+    """A VllmConfig carrying the mini hf_config plus the DS-V4 FP8 quant config.
+
+    Uses the **plugin** config ``IluDeepseekV4FP8Config`` rather than community
+    ``DeepseekV4FP8Config``, because that is what a real Iluvatar run resolves to
+    (it is registered under the same name ``deepseek_v4_fp8`` and shadows the
+    community class). Only the routed-MXFP4 branch of ``get_quant_method``
+    differs -- it returns ``IluMxfp4MoEMethod`` -- so every non-MoE layer built
+    from this config, attention included, is unaffected.
+
+    Module 4.1 note: with the community config, constructing a DS-V4 MoE layer
+    off ROCm dies inside ``Mxfp4MoEMethod.__init__`` ->
+    ``select_deepseek_v4_mxfp4_moe_backend``. That used to be worked around by
+    registering patch P1 around every construction site; the plugin config makes
+    the workaround unnecessary.
+    """
     from vllm.config import VllmConfig
-    from vllm.models.deepseek_v4.quant_config import DeepseekV4FP8Config
+
+    from vllm_iluvatar.model_executor.layers.quantization.ilu_deepseek_v4_fp8 import (
+        IluDeepseekV4FP8Config,
+    )
 
     vllm_config = VllmConfig()
     vllm_config.model_config = make_mini_model_config()
@@ -495,7 +512,7 @@ def make_mini_vllm_config():
     # (requirement 10.2): with cache_dtype == "auto" it asserts out.
     vllm_config.cache_config.cache_dtype = "fp8_ds_mla"
     vllm_config.cache_config.block_size = 64
-    vllm_config.quant_config = DeepseekV4FP8Config(
+    vllm_config.quant_config = IluDeepseekV4FP8Config(
         is_checkpoint_fp8_serialized=True,
         activation_scheme="dynamic",
         weight_block_size=[128, 128],

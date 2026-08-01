@@ -98,7 +98,6 @@ from test_ilu_dsv4_fp8_attention import (
 from test_ilu_dsv4_fp8_model_names import (
     MINI_NUM_ROUTED_EXPERTS,
     iter_checkpoint_names,
-    p1_mxfp4_backend_patch,
 )
 
 INT8 = torch.int8
@@ -408,9 +407,8 @@ def mini_model():
     )
 
     vllm_config = make_mini_vllm_config()
-    with p1_mxfp4_backend_patch():
-        with set_default_torch_dtype(BF16), set_current_vllm_config(vllm_config):
-            model = IluDeepseekV4Fp8ForCausalLM(vllm_config=vllm_config)
+    with set_default_torch_dtype(BF16), set_current_vllm_config(vllm_config):
+        model = IluDeepseekV4Fp8ForCausalLM(vllm_config=vllm_config)
     return model
 
 

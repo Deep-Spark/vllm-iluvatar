@@ -1,78 +1,49 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU-only tests (T8) for the P1 MXFP4-backend-selection patch.
+"""CPU-only tests for ``IluDeepseekV4Fp8MoE`` construction and its MoE method.
 
-Design §4.4 / §6.3: community
-``vllm.model_executor.layers.fused_moe.oracle.mxfp4.select_deepseek_v4_mxfp4_moe_backend``
-(``oracle/mxfp4.py:566``) can never return ``Mxfp4MoeBackend.NONE`` off-ROCm —
-``_get_priority_backends()`` yields TRTLLM / DEEPGEMM / MARLIN / BATCHED_MARLIN and,
-when none of them supports the config, the function ends in
-``raise NotImplementedError("No MXFP4 MoE backend supports the deployment
-configuration.")``. Stage 1 wants ``NONE`` precisely because
-``Mxfp4MoEMethod.process_weights_after_loading`` early-returns on it, leaving the
-four routed MXFP4 params byte-identical to the checkpoint.
+Successor of ``test_ilu_dsv4_fp8_moe_patch.py``. That file paired two things:
+the P1 backend-selection patch and the parameters it existed for. Module 4.1
+retired P1 -- the routed experts now land on ``IluMxfp4MoEMethod`` because
+``IluDeepseekV4FP8Config`` returns it, with no community module globals rewritten
+-- so the patch half is gone and the construction half moved here under a name
+that no longer claims to test a patch.
 
-So P1 is a **wrapper** patch: on the Iluvatar platform return
-``(Mxfp4MoeBackend.NONE, None)``, otherwise delegate to the community function.
-Because ``quantization/mxfp4.py:21-27`` is a ``from ... import
-select_deepseek_v4_mxfp4_moe_backend`` consumer, patching only the defining
-module is a no-op for the code path that actually calls it
-(``Mxfp4MoEMethod.__init__``, ``quantization/mxfp4.py:484``) — hence
-``general_patch.rebind_module_func``.
+What is asserted
+----------------
+1. **Method selection** -- the routed experts get ``IluMxfp4MoEMethod``, the
+   method reports ``mxfp4_backend == NONE``, defines **no** ``experts_cls``, and
+   answers ``is_monolithic``/``supports_eplb``/``get_fused_moe_quant_config``/
+   ``maybe_make_prepare_finalize`` the way the runner needs. These are the exact
+   properties that let patches P1 and P3 be deleted, so they are pinned here
+   rather than left implicit.
+2. **Parameter shapes** (design §5.3) -- the four routed ``uint8`` MXFP4
+   parameters and the two shared-expert block-FP8 pairs, at the mini-config
+   folding of the §5.3 numbers.
+3. **``process_weights_after_loading`` moves nothing** -- same ``data_ptr()``,
+   shape and dtype before and after, and ``w13/w2_weight_scale`` survive as
+   registered parameters. This is what Phase 2's zero-copy
+   ``.view(torch.int8)`` -> ``group_gemm_fp4`` depends on.
+4. **Gate branching on ``layer_id``** (requirement 7.6) -- hash layers get
+   ``tid2eid``, the rest get ``e_score_correction_bias``, never both.
+5. **The shared-expert activation stays a plain torch module** (design §4.4.1).
 
-Contract this file pins for Task 3.3 (implementation)
------------------------------------------------------
+Pure CPU: no GPU, no vendor kernel library, no patch registration.
 
-``vllm_iluvatar/model_executor/layers/fused_moe/oracle/ilu_mxfp4.py``:
-
-* ``make_select_deepseek_v4_mxfp4_moe_backend(orig) -> wrapper`` — factory taking
-  the community function and returning a ``functools.wraps(orig)``-decorated
-  wrapper (mirrors ``vllm_iluvatar/config/speculative.py::make_hf_config_override``).
-* ``_is_iluvatar_platform() -> bool`` — module-level platform gate, read as a
-  **module global at call time** (so tests / other callers can monkeypatch it,
-  mirroring ``distributed/parallel_state.py::_is_ivcore30_fn``). Its production
-  body is expected to be ``current_platform.device_name == "iluvatar"``:
-  ``IluPlatform`` (``platforms/ilu_platform.py:115``) sets that class attribute and
-  it stays a cheap string compare — ``isinstance(current_platform, IluPlatform)``
-  would need importing ``platforms/ilu_platform.py``, which builds the platform
-  class as an import side effect. ``is_cuda()`` is unusable as a gate because
-  ``IluPlatform`` subclasses ``CudaPlatform`` (design §4.2 makes the same point).
-
-``vllm_iluvatar/ilu_patch/general_patches/patch_dsv4_mxfp4_backend.py``:
-
-* ``register()`` delegating to ``general_patch.register_once(__name__, _apply, ...)``
-* ``_apply()`` doing the ``rebind_module_func`` on the oracle module.
-
-Test-hygiene notes:
-
-* Plugin imports are deferred into helpers/fixtures (``importlib.import_module``),
-  as in the 1.x / 2.x test files, so collection of this file does not blow up
-  before Task 3.3 lands — the tests fail individually with ``ModuleNotFoundError``
-  instead.
-* The patch mutates community module globals, so every test that applies it goes
-  through the ``unregistered_patch`` fixture, which snapshots *all* holders of the
-  original symbol (``rebind_module_func`` walks ``sys.modules``) and writes them
-  back afterwards, and also clears this patch's entry from
-  ``general_patch._APPLIED``. Without that, one test applying the patch would
-  leak into every later test in the same pytest process.
-* Pure CPU: no GPU, no vendor kernel library, no model construction.
-
-Validates: Requirements 6.4, 6.5
+Validates: Requirements 7.1, 7.2, 7.4, 7.5, 7.6
 """
 
 from __future__ import annotations
 
 import contextlib
-import importlib
-import sys
 
 import pytest
 import torch
 
-# Task 3.4 only. Reused from task 1.2: ``_tp1_distributed_env`` is a
-# session-scoped autouse fixture and importing it here is what makes it apply to
-# this module's tests too (parallel linear layers read the TP world size).
-# ``make_mini_vllm_config`` carries the mini DS-V4 hf_config plus the
-# ``DeepseekV4FP8Config`` that routes the experts to ``Mxfp4MoEMethod``.
+# Reused from task 1.2: ``_tp1_distributed_env`` is a session-scoped autouse
+# fixture and importing it here is what makes it apply to this module's tests too
+# (parallel linear layers read the TP world size). ``make_mini_vllm_config``
+# carries the mini DS-V4 hf_config plus ``IluDeepseekV4FP8Config``, which is what
+# routes the routed experts to ``IluMxfp4MoEMethod``.
 from test_ilu_dsv4_fp8_attention import (  # noqa: F401  (fixture injection)
     BF16,
     E8M0,
@@ -86,282 +57,20 @@ from test_ilu_dsv4_fp8_attention import (  # noqa: F401  (fixture injection)
     make_mini_vllm_config,
 )
 
-# ---------------------------------------------------------------------------
-# module / symbol names under test
-# ---------------------------------------------------------------------------
-
-ORACLE_MODULE = "vllm.model_executor.layers.fused_moe.oracle.mxfp4"
-QUANT_MODULE = "vllm.model_executor.layers.quantization.mxfp4"
-SYMBOL = "select_deepseek_v4_mxfp4_moe_backend"
-
-ILU_IMPL_MODULE = "vllm_iluvatar.model_executor.layers.fused_moe.oracle.ilu_mxfp4"
-PATCH_MODULE = "vllm_iluvatar.ilu_patch.general_patches.patch_dsv4_mxfp4_backend"
-
-FACTORY = "make_select_deepseek_v4_mxfp4_moe_backend"
-PLATFORM_GATE = "_is_iluvatar_platform"
-
-
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
-
-
-def _oracle_module():
-    return importlib.import_module(ORACLE_MODULE)
-
-
-def _quant_module():
-    return importlib.import_module(QUANT_MODULE)
-
 
 def _backend_none():
-    return _oracle_module().Mxfp4MoeBackend.NONE
+    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
 
-
-def _impl_module():
-    """Import the P1 implementation module (lands in Task 3.3)."""
-    return importlib.import_module(ILU_IMPL_MODULE)
-
-
-def _patch_module():
-    """Import the P1 patch wiring module (lands in Task 3.3)."""
-    return importlib.import_module(PATCH_MODULE)
-
-
-def _symbol_holders(original) -> list:
-    """Every imported module whose ``SYMBOL`` attribute *is* ``original``.
-
-    ``rebind_module_func`` rebinds exactly this set (identity match inside the
-    ``vllm`` top-level package), so it is also the set to restore.
-    """
-    return [
-        m
-        for m in list(sys.modules.values())
-        if getattr(m, SYMBOL, None) is original
-    ]
-
-
-def _wrapper_chain(func) -> list:
-    """``func`` plus its ``__wrapped__`` ancestors (``functools.wraps`` chain)."""
-    chain = [func]
-    while (inner := getattr(chain[-1], "__wrapped__", None)) is not None:
-        chain.append(inner)
-    return chain
-
-
-class _SentinelConfig:
-    """Stand-in for ``FusedMoEConfig``.
-
-    The wrapper must not introspect the config on the Iluvatar branch, and must
-    forward it untouched on the delegation branch, so an opaque object is enough.
-    """
-
-
-# ---------------------------------------------------------------------------
-# fixtures
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture()
-def community_symbol():
-    """Yield the pristine community function and restore every holder after."""
-    oracle_mod = _oracle_module()
-    _quant_module()  # ensure the from-import consumer is in sys.modules
-
-    original = getattr(oracle_mod, SYMBOL)
-    holders = _symbol_holders(original)
-    # Sanity: the consumer that actually calls it must be part of the snapshot,
-    # otherwise this test file would silently stop covering Requirement 6.3/6.5.
-    assert _quant_module() in holders, (
-        f"{QUANT_MODULE} no longer holds a from-import copy of {SYMBOL}; "
-        "update this test and design §6.3"
-    )
-    try:
-        yield original
-    finally:
-        for mod in holders:
-            setattr(mod, SYMBOL, original)
-
-
-@pytest.fixture()
-def unregistered_patch(community_symbol):
-    """Make ``register()`` behave as if it had never run in this process."""
-    from vllm_iluvatar.ilu_patch import general_patch
-
-    was_applied = PATCH_MODULE in general_patch._APPLIED
-    general_patch._APPLIED.discard(PATCH_MODULE)
-    try:
-        yield community_symbol
-    finally:
-        general_patch._APPLIED.discard(PATCH_MODULE)
-        if was_applied:
-            general_patch._APPLIED.add(PATCH_MODULE)
-
-
-# ---------------------------------------------------------------------------
-# Requirement 6.5 / 6.3: both references point at the wrapper
-# ---------------------------------------------------------------------------
-
-
-def test_register_rebinds_the_defining_module(unregistered_patch):
-    original = unregistered_patch
-    _patch_module().register()
-
-    patched = getattr(_oracle_module(), SYMBOL)
-    assert patched is not original, f"{ORACLE_MODULE}.{SYMBOL} was not rebound"
-    assert getattr(patched, "__wrapped__", None) is original, (
-        "wrapper must expose the community function via __wrapped__ "
-        "(functools.wraps(orig))"
-    )
-
-
-def test_register_propagates_to_the_from_import_consumer(unregistered_patch):
-    """The branch that matters: ``Mxfp4MoEMethod.__init__`` calls the *copy* in
-    ``quantization/mxfp4.py``, not the attribute on the oracle module."""
-    original = unregistered_patch
-    _patch_module().register()
-
-    oracle_ref = getattr(_oracle_module(), SYMBOL)
-    quant_ref = getattr(_quant_module(), SYMBOL)
-
-    assert quant_ref is not original, (
-        f"{QUANT_MODULE}.{SYMBOL} still holds the community function; "
-        "rebind_module_func was not used"
-    )
-    assert quant_ref is oracle_ref, (
-        "both references must be the same wrapper object, otherwise the two "
-        "call sites can disagree"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Requirement 6.4: idempotence
-# ---------------------------------------------------------------------------
-
-
-def test_register_twice_applies_only_once(unregistered_patch, monkeypatch):
-    """``register_once`` keys on the module name in ``general_patch._APPLIED``;
-    the second call must be a no-op, not a second wrap."""
-    from vllm_iluvatar.ilu_patch import general_patch
-
-    patch_mod = _patch_module()
-    calls: list[int] = []
-    real_apply = patch_mod._apply
-
-    def counting_apply() -> None:
-        calls.append(1)
-        real_apply()
-
-    # register() resolves ``_apply`` as a module global at call time.
-    monkeypatch.setattr(patch_mod, "_apply", counting_apply)
-
-    patch_mod.register()
-    after_first = getattr(_oracle_module(), SYMBOL)
-    patch_mod.register()
-    after_second = getattr(_oracle_module(), SYMBOL)
-
-    assert len(calls) == 1, f"_apply ran {len(calls)} times, expected exactly 1"
-    assert after_second is after_first, "second register() replaced the wrapper"
-    assert PATCH_MODULE in general_patch._APPLIED
-
-
-def test_repeated_register_does_not_stack_wrappers(unregistered_patch):
-    original = unregistered_patch
-    patch_mod = _patch_module()
-
-    patch_mod.register()
-    patch_mod.register()
-    patch_mod.register()
-
-    chain = _wrapper_chain(getattr(_oracle_module(), SYMBOL))
-    assert chain[-1] is original
-    assert len(chain) == 2, (
-        "expected exactly one wrapper layer over the community function, got a "
-        f"chain of {len(chain)}: {[getattr(f, '__qualname__', f) for f in chain]}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Requirement 6.2 / 6.5: platform branching
-# ---------------------------------------------------------------------------
-
-
-def test_iluvatar_branch_returns_backend_none_without_calling_original(monkeypatch):
-    impl = _impl_module()
-    monkeypatch.setattr(impl, PLATFORM_GATE, lambda: True)
-
-    def original(config):
-        raise AssertionError("community function must not run on Iluvatar")
-
-    wrapper = getattr(impl, FACTORY)(original)
-
-    assert wrapper(_SentinelConfig()) == (_backend_none(), None)
-
-
-def test_non_iluvatar_branch_delegates_to_the_original(monkeypatch):
-    impl = _impl_module()
-    monkeypatch.setattr(impl, PLATFORM_GATE, lambda: False)
-
-    config = _SentinelConfig()
-    seen: list[object] = []
-    delegated = ("delegated-backend", "delegated-cls")
-
-    def original(cfg):
-        seen.append(cfg)
-        return delegated
-
-    wrapper = getattr(impl, FACTORY)(original)
-
-    assert wrapper(config) is delegated, "non-Iluvatar must return the community result"
-    assert seen == [config], "the config must be forwarded unchanged"
-
-
-def test_patched_symbol_honours_the_platform_gate(unregistered_patch, monkeypatch):
-    """End-to-end through the rebound attribute: the gate has to be read as a
-    module global at call time, not captured when the wrapper was built."""
-    impl = _impl_module()
-    _patch_module().register()
-    monkeypatch.setattr(impl, PLATFORM_GATE, lambda: True)
-
-    for holder in (_oracle_module(), _quant_module()):
-        assert getattr(holder, SYMBOL)(_SentinelConfig()) == (_backend_none(), None)
-
-
-def test_platform_gate_is_a_zero_arg_predicate():
-    gate = getattr(_impl_module(), PLATFORM_GATE)
-    assert isinstance(gate(), bool)
-
-
-def test_wrapper_keeps_the_community_identity_metadata(monkeypatch):
-    """``functools.wraps`` is what lets ``check_signatures`` and any debug output
-    still see the community name/signature after the rebind."""
-    import inspect
-
-    impl = _impl_module()
-    original = getattr(_oracle_module(), SYMBOL)
-    wrapper = getattr(impl, FACTORY)(original)
-
-    assert wrapper.__name__ == SYMBOL
-    assert inspect.signature(wrapper) == inspect.signature(original)
+    return Mxfp4MoeBackend.NONE
 
 
 # ###########################################################################
-# Task 3.4 -- ``IluDeepseekV4Fp8MoE``: the parameters P1 exists for
-# ###########################################################################
-#
-# These live in this file rather than in a new one on purpose: every assertion
-# below only holds *because* P1 is applied. Without it,
-# ``Mxfp4MoEMethod.__init__`` raises before a single parameter is created, so
-# the construction fixture is the end-to-end proof that the patch does its job.
-#
-# Ordering contract (design §4.4, task 3.3): ``register()`` first, then build.
-# ``_moe_layer`` enforces it structurally -- the MoE is only constructed inside
-# the fixture body, after both the rebind and the platform-gate monkeypatch.
-#
 # Mini-config folding of design §5.3
-# ----------------------------------
-# ``Mxfp4MoEMethod.create_weights`` (``quantization/mxfp4.py:530-622``) builds
-# the four parameters from three numbers and a fixed 32-element scale block:
+# ###########################################################################
+#
+# ``Mxfp4MoEMethod.create_weights`` (``quantization/mxfp4.py:530-622``, inherited
+# unchanged by ``IluMxfp4MoEMethod``) builds the four parameters from three
+# numbers and a fixed 32-element scale block:
 #
 #     mxfp4_block = 32
 #     E_local     = n_routed_experts // ep_size
@@ -389,14 +98,17 @@ def test_wrapper_keeps_the_community_identity_metadata(monkeypatch):
 #
 # ``maybe_roundup_sizes`` is the identity on both columns: under
 # ``Mxfp4MoeBackend.NONE`` it reduces to ``round_up(I_local, 64)``, and 2048 /
-# 256 are both multiples of 64 (that is what task 3.1's T6 pins).
+# 256 are both multiples of 64 (that is what ``test_ilu_dsv4_fp8_mxfp4_roundup``
+# pins). ``IluMxfp4MoEMethod`` keeps ``mxfp4_backend = NONE`` precisely so this
+# stays true.
 #
 # The 8-rank column assumes the experts are split expert-wise (32 local experts
 # holding the full intermediate size), which is what ``FusedMoE`` produces when
 # EP covers the 8 ranks. A TP-only launch would instead give
 # ``[256, 512, 2048]`` / ``[256, 4096, 128]`` -- the same element count on a
 # different axis. At TP1 the two collapse into one, so nothing here depends on
-# the distinction; task 5.3's 8-card run is where it has to be settled.
+# the distinction.
+
 
 MXFP4_BLOCK = 32
 UINT8 = torch.uint8
@@ -490,16 +202,15 @@ def _build_mini_moe(layer_id: int):
 
 
 @pytest.fixture()
-def moe_factory(unregistered_patch, monkeypatch):
-    """Apply P1, force the Iluvatar branch, and only then hand out a builder.
+def moe_factory():
+    """Hand out the MoE builder.
 
-    The gate is monkeypatched because the test host is not an Iluvatar device;
-    the wrapper reads ``_is_iluvatar_platform`` as a module global at call time,
-    so patching the module attribute is enough (see
-    ``test_patched_symbol_honours_the_platform_gate``).
+    No patch registration and no platform-gate monkeypatching since module 4.1:
+    ``make_mini_vllm_config`` supplies ``IluDeepseekV4FP8Config``, whose
+    ``get_quant_method`` returns ``IluMxfp4MoEMethod`` unconditionally for routed
+    MXFP4 experts. Nothing consults ``current_platform``, so construction behaves
+    identically on an Iluvatar device and on this CI host.
     """
-    _patch_module().register()
-    monkeypatch.setattr(_impl_module(), PLATFORM_GATE, lambda: True)
     yield _build_mini_moe
 
 
@@ -525,20 +236,86 @@ def _routed_experts(moe):
 # ---------------------------------------------------------------------------
 
 
-def test_routed_experts_use_the_community_mxfp4_method_on_backend_none(moe_factory):
-    """Precondition for everything below: the NONE backend really was selected.
+def test_routed_experts_use_the_ilu_mxfp4_method(moe_factory):
+    """Precondition for everything below: our method really was selected.
 
-    If this fails, the remaining routed assertions are meaningless -- another
-    backend would have swizzled or freed the weights.
+    If this fails the remaining routed assertions are meaningless -- a community
+    backend would have swizzled or freed the weights, and construction would most
+    likely have raised in ``select_deepseek_v4_mxfp4_moe_backend`` first.
     """
-    backend_none = _backend_none()
+    from vllm_iluvatar.model_executor.layers.quantization.ilu_mxfp4 import (
+        IluMxfp4MoEMethod,
+    )
+
     with moe_factory(BIAS_LAYER_ID) as (moe, _):
         quant_method = _routed_experts(moe).quant_method
-        assert type(quant_method).__name__ == "Mxfp4MoEMethod", (
-            "routed experts must land on the community Mxfp4MoEMethod, got "
+        assert isinstance(quant_method, IluMxfp4MoEMethod), (
+            "routed experts must land on IluMxfp4MoEMethod, got "
             f"{type(quant_method).__name__}"
         )
-        assert quant_method.mxfp4_backend == backend_none
+        # NONE is load-bearing: maybe_roundup_sizes / skip_forward_padding /
+        # has_unpadded_output all read it (see the folding table above).
+        assert quant_method.mxfp4_backend == _backend_none()
+
+
+def test_method_defines_no_experts_cls(moe_factory):
+    """Why patch P3 could be deleted.
+
+    Community ``FusedMoEMethodBase.is_monolithic``
+    (``fused_moe_method_base.py:163-170``) does
+    ``if hasattr(self, "experts_cls"): return self.experts_cls.is_monolithic()``
+    when ``moe_kernel is None``. ``Mxfp4MoEMethod.__init__`` (``mxfp4.py:481``)
+    assigns ``None`` there, so the guard passes and the attribute access raises
+    ``AttributeError`` -- the EP-only crash P3 worked around. Our ``__init__``
+    must leave the attribute undefined.
+    """
+    with moe_factory(BIAS_LAYER_ID) as (moe, _):
+        quant_method = _routed_experts(moe).quant_method
+        assert not hasattr(quant_method, "experts_cls")
+        assert quant_method.moe_kernel is None
+        # The property that P3 used to crash on must simply answer.
+        assert quant_method.is_monolithic is False
+
+
+def test_method_opts_out_of_community_kernel_and_modular_wrapping(moe_factory):
+    """The four answers ``IluMoERunner`` needs to take the modular ILU path.
+
+    * ``get_fused_moe_quant_config -> None`` keeps ``topk_indices_dtype`` at
+      ``None`` (``fused_moe_method_base.py:135-140``), so the router emits int32
+      ids -- the dtype ``ilu_mxfp4_fused_experts`` expects.
+    * ``maybe_make_prepare_finalize -> None`` stops
+      ``MoERunner.maybe_init_modular_kernel`` from wrapping us into a
+      ``FusedMoEModularMethod`` whose ``apply`` would expect a real kernel.
+    * ``supports_internal_mk`` stays False, so the runner asks for the
+      prepare/finalize at all rather than assuming we own a kernel.
+    * ``supports_eplb -> False`` makes an EPLB launch fail loudly instead of
+      silently not rebalancing (Phase 1 records no expert load).
+    """
+    with moe_factory(BIAS_LAYER_ID) as (moe, _):
+        experts = _routed_experts(moe)
+        quant_method = experts.quant_method
+        assert quant_method.get_fused_moe_quant_config(experts) is None
+        assert quant_method.maybe_make_prepare_finalize() is None
+        assert quant_method.supports_internal_mk is False
+        assert quant_method.supports_eplb is False
+        assert quant_method.topk_indices_dtype is None
+
+
+def test_maybe_init_modular_kernel_is_a_no_op_without_p3(moe_factory):
+    """End-to-end proof that P3 is unnecessary.
+
+    ``BaseDeviceCommunicator.prepare_communication_buffer_for_model`` calls this
+    on every MoE module under expert parallelism, and it is where the P3 crash
+    happened. With our method it has to return without touching anything.
+    """
+    with moe_factory(BIAS_LAYER_ID) as (moe, _):
+        experts = _routed_experts(moe)
+        before = type(experts.quant_method)
+        moe.experts.maybe_init_modular_kernel()
+        assert type(experts.quant_method) is before, (
+            "quant_method was replaced -- maybe_init_modular_kernel wrapped us "
+            "into a modular method, which Phase 1 cannot execute"
+        )
 
 
 def test_four_routed_params_are_present_in_named_parameters(moe_factory):
@@ -574,13 +351,14 @@ def test_routed_param_shapes_and_dtypes_match_design_5_3(moe_factory):
 
 
 def test_process_weights_after_loading_keeps_data_ptr_shape_and_params(moe_factory):
-    """The NONE early-return (``quantization/mxfp4.py:727-738``) in action.
+    """``IluMxfp4MoEMethod.process_weights_after_loading`` is a no-op.
 
-    Any other backend would run ``_setup_kernel`` ->
+    Any community backend would run ``_setup_kernel`` ->
     ``convert_weight_to_mxfp4_moe_kernel_format`` (new storage, new pointer) and
     the TRITON backends additionally ``del layer.w13_weight_scale``. Comparing
     ``data_ptr()`` is what distinguishes "left alone" from "rebuilt with the same
-    shape".
+    shape" -- and "left alone" is what Phase 1's dequant reads and what Phase 2
+    needs for a zero-copy ``.view(torch.int8)`` into ``group_gemm_fp4``.
     """
     names = list(EXPECTED_ROUTED_PARAMS)
 
@@ -601,7 +379,7 @@ def test_process_weights_after_loading_keeps_data_ptr_shape_and_params(moe_facto
         still_there = [name for name in names if getattr(experts, name, None) is None]
         assert not still_there, (
             "process_weights_after_loading dropped routed parameters "
-            f"(w13_weight_scale must survive on backend NONE): {still_there}"
+            f"(w13_weight_scale must survive): {still_there}"
         )
 
         after = {

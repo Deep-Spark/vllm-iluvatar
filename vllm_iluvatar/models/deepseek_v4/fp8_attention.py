@@ -22,6 +22,7 @@ from typing import ClassVar
 import ixformer.inference.functions as ixfops
 import torch
 import torch.nn as nn
+import vllm.envs as envs
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
@@ -749,18 +750,45 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
             )
             extra_k_cache = self.kv_cache
 
-        ixfops.ds4_flash_mla_with_fp8_kvcache(
-            q=q.unsqueeze(1),
-            k_cache=self.swa_cache_layer.kv_cache,
-            indices=swa_indices,
-            topk_length=swa_lens,
-            sm_scale=self.scale,
-            attn_sink=self.attn_sink,
-            extra_k_cache=extra_k_cache,
-            extra_indices=extra_indices,
-            extra_topk_length=extra_topk_length,
-            output=output.unsqueeze(1),
-        )
+        q_4d = q.unsqueeze(1)
+        out_4d = output.unsqueeze(1)
+        quant_type = envs.VLLM_ILU_DS4_MQA_QUANT_TYPE
+        if quant_type == "Q_NOPE_FP8":
+            q_nope_fp8, q_scales, q_rope = ixfops.ds4_dynamic_quant_mla_q_nope_fp8(
+                q_4d
+            )
+            ixfops.ds4_flash_mla_with_fp8_q_nope_kvcache(
+                q_nope_fp8=q_nope_fp8,
+                q_scales=q_scales,
+                q_rope=q_rope,
+                k_cache=self.swa_cache_layer.kv_cache,
+                indices=swa_indices,
+                topk_length=swa_lens,
+                sm_scale=self.scale,
+                attn_sink=self.attn_sink,
+                extra_k_cache=extra_k_cache,
+                extra_indices=extra_indices,
+                extra_topk_length=extra_topk_length,
+                output=out_4d,
+            )
+        elif quant_type == "":
+            ixfops.ds4_flash_mla_with_fp8_kvcache(
+                q=q_4d,
+                k_cache=self.swa_cache_layer.kv_cache,
+                indices=swa_indices,
+                topk_length=swa_lens,
+                sm_scale=self.scale,
+                attn_sink=self.attn_sink,
+                extra_k_cache=extra_k_cache,
+                extra_indices=extra_indices,
+                extra_topk_length=extra_topk_length,
+                output=out_4d,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported VLLM_ILU_DS4_MQA_QUANT_TYPE={quant_type!r}; "
+                'expected "" or "Q_NOPE_FP8".'
+            )
 
     def _build_extra_topk(
         self,

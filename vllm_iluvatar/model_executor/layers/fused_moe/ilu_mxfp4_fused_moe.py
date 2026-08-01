@@ -417,7 +417,7 @@ def _ilu_mxfp4_fused_experts_ixformer(
     w13_bias: torch.Tensor | None,
     w2_bias: torch.Tensor | None,
     gemm_backend: str,
-    gemm_mode: int,
+    gemm_mode: int | None,
 ) -> torch.Tensor:
     """The ixformer pipeline (module 4.2 §3.3).
 
@@ -430,6 +430,10 @@ def _ilu_mxfp4_fused_experts_ixformer(
     and is forwarded verbatim to ``group_gemm_fp4``. It also selects how the
     weight shapes are read: ``ixmm`` consumes the preprocessed ``[E, K/2, N]``
     layout, the other two the original ``[E, N, K/2]``.
+
+    ``gemm_mode`` is forwarded to ``group_gemm_fp4``: ``None`` (default)
+    auto-selects gemv when ``M <= 128``, else gemm; explicit ``0`` / ``1``
+    override that choice.
     """
     # Lazy import: keeps this module importable on a CPU host / when ixformer
     # is absent. The dispatcher only reaches here on the CUDA + ivcore30 path.
@@ -562,8 +566,8 @@ def ilu_mxfp4_fused_experts(
     Takes the same arguments as ``ilu_mxfp4_fused_experts_torch`` plus two
     kw-only ones:
 
-    * ``run_decode``: reserved for the ``group_gemm_fp4(mode=1)`` decode tile,
-      not consumed yet (see the ``del`` below);
+    * ``run_decode``: reserved / unused; ``group_gemm_fp4`` now auto-selects
+      gemv/gemm via ``mode=None`` (``M <= 128`` -> gemv);
     * ``backend``: force a ``group_gemm_fp4`` backend. ``None`` defers to
       ``VLLM_ILU_MXFP4_MOE_BACKEND``, whose default is ``ixmm``.
 
@@ -597,12 +601,8 @@ def ilu_mxfp4_fused_experts(
             w13_bias=w13_bias,
             w2_bias=w2_bias,
         )
-    # ``gemm_mode`` is still hardcoded to 0 (all nine M tiles). Enabling the
-    # decode tile is ``gemm_mode = 1 if run_decode and T <= 64 else 0``: top-k
-    # picks distinct experts per token, so no expert can receive more than T
-    # rows, which is exactly the mode=1 contract (module 4.2 §2.5). It is not
-    # switched on yet because the win is unmeasured and the contract is not
-    # runtime-checked -- violating it is silently wrong.
+    # ``gemm_mode=None`` lets ``group_gemm_fp4`` auto-select: gemv when
+    # ``M = T * top_k <= 128``, else gemm.
     del run_decode
     return _ilu_mxfp4_fused_experts_ixformer(
         hidden_states,
@@ -619,5 +619,5 @@ def ilu_mxfp4_fused_experts(
         w13_bias=w13_bias,
         w2_bias=w2_bias,
         gemm_backend=be,
-        gemm_mode=0,
+        gemm_mode=None,
     )

@@ -309,8 +309,8 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
     # output arrives through ``shared_experts_input`` instead -- see
     # ``ilu_mxfp4_fused_experts``' ``extra_residual``.
     #
-    # ``run_decode`` is plumbed in for ``group_gemm_fp4(mode=1)``;
-    # Stage 2A records it but the dispatcher ignores it (gemm_mode is always 0).
+    # ``run_decode`` is still plumbed in for signature compatibility but unused;
+    # ``group_gemm_fp4`` auto-selects gemv/gemm via ``mode=None``.
     # ``backend=None`` lets ``VLLM_ILU_MXFP4_MOE_BACKEND`` decide (default ixmm).
     def apply(
         self,

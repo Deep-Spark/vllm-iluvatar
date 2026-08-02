@@ -1,39 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU-only tests (T1) for the DeepSeek-V4 FP8 ``WeightsMapper``.
+"""CPU-only tests for the DeepSeek-V4 FP8 ``WeightsMapper``.
 
-Covers design §4.5.5 (``_make_fp8_weights_mapper()``), the plugin-side equivalent
-of the community ``_make_deepseek_v4_weights_mapper("fp4")``
+Covers ``_make_fp8_weights_mapper()``, the plugin-side equivalent of the
+community ``_make_deepseek_v4_weights_mapper("fp4")``
 (``vllm/models/deepseek_v4/nvidia/model.py:1311-1341``).
 
 The mapper is a pure string transform: no GPU, no distributed init, no config.
 
-Sample set construction
------------------------
-``SAMPLES`` holds exactly one representative checkpoint name per **distinct
-pattern** of ``weight_inspect/scan_report.md`` (82 patterns: 2 + 2 + 2 + 2 + 13 +
-13 + 48), ``mtp.*`` patterns included. ``EXTRA_SAMPLES`` adds a handful of
-same-pattern variants that probe the tricky interactions (routed ``w2`` vs shared
-``w2``, ``hc_*_scale`` vs ``.scale``). Every expected name is hard-coded from the
-design §4.5.5 mapping table — never read back from the code under test.
+``SAMPLES`` holds exactly one representative checkpoint name per distinct
+pattern (82 patterns, ``mtp.*`` included).  ``EXTRA_SAMPLES`` adds variants
+that probe tricky interactions (routed ``w2`` vs shared ``w2``, ``hc_*_scale``
+vs ``.scale``).  Every expected name is hard-coded -- never read back from the
+code under test.
 
-Application order (community ``WeightsMapper._map_name_with_shard``,
-``vllm/model_executor/models/utils.py:67-115``): renaming -> **regex** -> substr
--> stacked -> **prefix** -> **suffix**. Prefix runs before suffix, which is why
-``embed.weight`` becomes ``model.embed_tokens.weight``. The public entry points
-are ``apply()`` (name/tensor pairs) and ``apply_list()`` (names only); this file
-uses ``apply_list``.
-
-Note on ``hc_head``: design §4.5.5's snippet writes the replacement with a
-trailing dot (``"model.hc_head."``), which would turn ``hc_head_fn`` into
-``model.hc_head._fn``. The parameters are named ``hc_head_fn`` / ``hc_head_base``
-/ ``hc_head_scale`` (design §5.4) and the community mapper uses
-``"hc_head": "model.hc_head"``, so the dot-less form is the one asserted here.
-
-``fp8_model.py`` is Task 2.2's deliverable, so the module import lives inside a
-helper (TDD: these assertions go green once 2.2 lands, without breaking
-collection of the rest of the suite).
-
-Validates: Requirements 2.2, 2.3
+``hc_head`` uses the dot-less prefix form (``"hc_head": "model.hc_head"``);
+a trailing dot would turn ``hc_head_fn`` into ``model.hc_head._fn``.
 """
 
 from __future__ import annotations
@@ -46,7 +27,7 @@ import pytest
 FP8_MODEL_MODULE = "vllm_iluvatar.model_executor.models.deepseek_v4.fp8_model"
 
 # ---------------------------------------------------------------------------
-# Expected mapping tables, hard-coded from design §4.5.5.
+# Expected mapping tables.
 # ---------------------------------------------------------------------------
 
 # ``orig_to_new_regex`` must be an *ordered* mapping: the MXFP4 experts rule has
@@ -72,11 +53,11 @@ EXPECTED_SUBSTR = {
     ".shared_experts.w2": ".shared_experts.down_proj",
 }
 
-# scan_report.md: "distinct patterns: 82"
+# Acceptance baseline: "distinct patterns: 82"
 EXPECTED_PATTERN_COUNT = 82
 
 # ---------------------------------------------------------------------------
-# Sample set: (scan_report pattern, checkpoint name, expected mapped name)
+# Sample set: (pattern, checkpoint name, expected mapped name)
 # ---------------------------------------------------------------------------
 
 # routed_expert_weight (2 patterns)
@@ -109,7 +90,7 @@ _ROUTED_EXPERT_SCALE = [
 
 # shared_expert_weight (2 patterns) -> only ``w2`` is renamed (``down_proj``);
 # ``w1`` / ``w3`` stay put and are fused into ``gate_up_proj`` by the loader's
-# stacked mapping (design §4.5.1), not by the mapper.
+# stacked mapping, not by the mapper.
 _SHARED_EXPERT_WEIGHT = [
     (
         "layers.*.ffn.shared_experts.w*.weight",
@@ -524,7 +505,7 @@ def _map_one(mapper, name: str) -> str | None:
 
 
 def _normalise_pattern(name: str) -> str:
-    """scan_v4_weights.py's ``normalise_pattern``: digit runs become ``*``."""
+    """``normalise_pattern``: digit runs become ``*``."""
     return re.sub(r"\d+", "*", name)
 
 
@@ -533,7 +514,7 @@ def _normalise_pattern(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def test_sample_set_covers_every_scan_report_pattern():
+def test_sample_set_covers_every_baseline_pattern():
     patterns = [pattern for pattern, _, _ in SAMPLES]
     assert len(set(patterns)) == EXPECTED_PATTERN_COUNT
     # one representative per pattern, no accidental duplicates
@@ -542,7 +523,7 @@ def test_sample_set_covers_every_scan_report_pattern():
 
 def test_sample_set_includes_mtp_patterns():
     mtp_patterns = {p for p, _, _ in SAMPLES if p.startswith("mtp.")}
-    # scan_report.md: 1 + 1 + 1 + 1 + 7 + 7 + 19 mtp patterns
+    # baseline report: 1 + 1 + 1 + 1 + 7 + 7 + 19 mtp patterns
     assert len(mtp_patterns) == 37
 
 

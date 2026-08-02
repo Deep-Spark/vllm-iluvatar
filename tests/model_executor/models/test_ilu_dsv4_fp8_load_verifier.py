@@ -1,42 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU regression test for the Load_Verifier bookkeeping of
-``IluDeepseekV4Fp8ForCausalLM.load_weights`` (design §4.5.6, requirements
-3.4-3.7). Part of task 4.6.
+``IluDeepseekV4Fp8ForCausalLM.load_weights``.
 
-What this pins, and why it did not exist before
------------------------------------------------
-The 8-card run of task 5.3 printed, on all 8 ranks::
-
-    66516 checkpoint tensor(s) were not consumed by any loading rule ...
-
-while the weights had in fact loaded correctly (no strict-reverse-check raise,
-19.78 GiB resident, 148.66 GiB / 8). 66516 is *exactly* the number of trunk
-tensors that the stacked branch (468) plus the routed-expert branch (66048)
-handle, so the report -- not the loading -- was wrong. Two independent defects,
-both invisible to every test that existed at the time:
-
-1. ``AutoWeightsLoader._load_module`` calls the child's ``load_weights`` **once
-   per contiguous run of ``model.*`` names**: ``_groupby_prefix`` groups with
-   ``itertools.groupby``, which only merges *adjacent* keys. The checkpoint's
-   ``head.weight`` maps to ``lm_head.weight``, i.e. a different top-level prefix,
-   and it sits in the middle of the ``model.*`` tensors -- so the run is split and
-   ``IluDeepseekV4Fp8Model.load_weights`` is entered twice. It used to rebind
-   ``self.consumed_ckpt_names`` to a fresh set on entry, so the *last* run (a
-   single tensor in the real checkpoint's file layout) discarded everything the
-   first run had recorded.
-
-2. The verifier then did ``consumed |= loaded``, unioning the whole
-   **parameter-side** result into a **checkpoint-side** set. For every 1:1 tensor
-   the mapped checkpoint name *equals* the parameter name, so those names were
-   silently restored and only the many-to-one families (stacked fusion, routed
-   experts) still showed up as unconsumed. That alias is what made the failure
-   look branch-specific and hid defect 1 for an entire task.
-
-Both defects are key-space defects: ``seen`` is keyed by mapped checkpoint names,
-``consumed`` must be keyed the same way, and every earlier test only ever
-exercised one side of that equality (T1 the mapper alone, T2 the parameter names
-alone, T6 the statistics classifier alone). This module closes the gap: it drives
-the *real* ``ForCausalLM.load_weights`` -- real mapper, real
+Drives the *real* ``ForCausalLM.load_weights`` -- real mapper, real
 ``AutoWeightsLoader``, real four-branch loop, real verifier -- over a synthetic
 stream of the mini config's checkpoint tensors, and asserts
 
@@ -44,34 +10,19 @@ stream of the mini config's checkpoint tensors, and asserts
   * ``total_trunk_tensor`` equals the number of non-``mtp.`` tensors fed in,
   * the two key sets are the same set (modulo ``lm_head.weight``),
 
-for three stream orderings, including the one that reproduces the 8-card file
-layout (``head.weight`` second-to-last, so the trailing ``model.*`` run holds one
-tensor). Against the pre-fix source, ``head_before_tail`` reports 66516-style
-losses and ``head_early`` loses the first run as well; the fixed source keeps the
-books straight for any ordering.
+for three stream orderings, including the one that reproduces the multi-card
+file layout (``head.weight`` second-to-last, so the trailing ``model.*`` run
+holds one tensor).
 
-Why the weight loaders are neutralised
---------------------------------------
 ``_neutralised_weight_loaders`` swaps every parameter's ``weight_loader`` for a
-recording no-op. The subject here is the *name* plumbing: which checkpoint name
-each rule claims, and in which namespace that claim is recorded. Byte-level
-loading behaviour is covered elsewhere and deliberately not re-tested here --
-T3 (e8m0 ``view`` vs ``copy_``), T7 (shared-expert pad), T4/T5 (attention and MoE
-shapes). Keeping the copies out means this test needs no accelerator, no kernel
-and no dtype-conversion support, so it runs anywhere the model can be built.
+recording no-op.  The subject here is the *name* plumbing: which checkpoint
+name each rule claims, and in which namespace that claim is recorded.  This
+test needs no accelerator, no kernel and no dtype-conversion support.
 
 Two paths stay real because they do not go through ``weight_loader``:
 ``attn_sink`` (the loop copies the head slice itself) and
-``_pad_shared_expert_weight``; the synthetic tensors are shaped and typed so both
-behave exactly as they do on the real checkpoint.
-
-The synthetic stream is shaped from design §5.2 / §5.3 / §5.4 folded to the mini
-config -- the same tables ``test_ilu_dsv4_fp8_attention`` /
-``test_ilu_dsv4_fp8_model_names`` transcribe -- and typed from
-``weight_inspect/scan_report.md``, so the statistics classification is exercised
-on realistic ``(pattern, dtype)`` pairs rather than on placeholders.
-
-Validates: Requirements 3.4, 3.5, 3.6, 3.7
+``_pad_shared_expert_weight``; the synthetic tensors are shaped and typed so
+both behave exactly as they do on the real checkpoint.
 """
 
 from __future__ import annotations
@@ -144,7 +95,7 @@ def _fp8_pair(name: str, shape: tuple[int, int]) -> dict:
 
 # Layer-flavour independent tensors, keyed by the name below ``layers.{i}.``.
 _LAYER_SPECS_ALWAYS: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
-    # --- attention, block-FP8 (design §5.2) --------------------------------
+    # --- attention, block-FP8 ------------------------------------------------
     **_fp8_pair("attn.wq_a", (_Q_LORA, _H)),
     **_fp8_pair("attn.wkv", (_HEAD_DIM, _H)),
     **_fp8_pair("attn.wq_b", (_HEADS * _HEAD_DIM, _Q_LORA)),
@@ -152,7 +103,7 @@ _LAYER_SPECS_ALWAYS: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
     **_fp8_pair("attn.wo_b", (_H, _O_GROUPS * _O_LORA)),
     # --- attention, plain --------------------------------------------------
     # all heads live in the checkpoint; the loop narrows this rank's slice and
-    # front-fills a [padded_heads] parameter (design §4.5.3)
+    # front-fills a [padded_heads] parameter
     "attn.attn_sink": ((_HEADS,), FP32),
     "attn.q_norm.weight": ((_Q_LORA,), BF16),
     "attn.kv_norm.weight": ((_HEAD_DIM,), BF16),
@@ -182,7 +133,7 @@ def _compressor_specs(
 
     ``wkv`` / ``wgate`` are the two shards of ``compressor.fused_wkv_wgate``, so
     each is half of the parameter's rows -- the numbers agree with the
-    ``[2 * coff * head_dim, H]`` fused shapes of design §5.2 (transcribed in
+    ``[2 * coff * head_dim, H]`` fused shapes (transcribed in
     ``test_ilu_dsv4_fp8_attention``).
     """
     coff = 1 + (compress_ratio == 4)
@@ -201,7 +152,7 @@ _INDEXER_SPECS: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
     **_compressor_specs("attn.indexer.compressor", 4, _INDEX_HEAD_DIM),
 }
 
-# MXFP4 routed experts (scan_report.md: weight I8 packed 2/byte, scale E8M0 with
+# MXFP4 routed experts (weight I8 packed 2/byte, scale E8M0 with
 # one exponent per 32 values). w1/w3 are ``[I, H/2]``, w2 is ``[H, I/2]``.
 _EXPERT_SPECS: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
     "w1.weight": ((_MOE_I, _H // 2), INT8),
@@ -222,7 +173,7 @@ _GLOBAL_SPECS: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
 }
 
 # ``mtp.*`` never reaches a loading rule (AutoWeightsLoader ``skip_substrs``), so
-# its shapes are irrelevant -- only its presence matters (requirement 3.4).
+# its shapes are irrelevant -- only its presence matters.
 _MTP_SPEC: tuple[tuple[int, ...], torch.dtype] = ((1,), FP32)
 
 
@@ -466,7 +417,7 @@ def test_stream_reproduces_the_grouping_the_bug_needed(mini_model, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# requirement 3.4 / 3.5 -- the unconsumed report must be empty
+# unconsumed report must be empty
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("order", sorted(ORDERINGS))
 def test_no_checkpoint_tensor_is_reported_unconsumed(mini_model, order, monkeypatch):
@@ -510,7 +461,7 @@ def test_consumed_and_seen_share_one_key_space(mini_model, order, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# requirement 3.6 / 3.7 -- the eight statistics lines
+# the eight statistics lines
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("order", sorted(ORDERINGS))
 def test_statistics_cover_every_trunk_tensor(mini_model, order, monkeypatch):

@@ -1,48 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU-only test for the load-statistics classifier (task 4.5, design §4.5.6).
+"""CPU-only test for the load-statistics classifier.
 
-Why this file exists
---------------------
-The 8-card acceptance check (requirement 3.7, task 5.2) compares the loader's
-statistics log against seven hard-coded integers::
-
-    routed_expert_weight  33024      other_fp8_weight  236
-    routed_expert_scale   33024      other_fp8_scale   236
-    shared_expert_weight    129      plain_tensor      834
-    shared_expert_scale     129      total           67612
-
-Those numbers are not derived from anything the loader does -- they were counted
-by the offline scanner
-``my_tests/deepseek/deepseek-v4/fp8原始权重适配/weight_inspect/scan_v4_weights.py``
-and published in ``scan_report.md``. The comparison therefore only means
-something while the loader buckets tensors **exactly** the way that scanner did.
-So the classifier was ported verbatim into
-``vllm_iluvatar/model_executor/models/deepseek_v4/fp8_load_stats.py``, and this
-file pins the port against the report: every row of ``SCAN_REPORT_ROWS`` below is
-a (pattern, dtype, category) triple copied out of ``scan_report.md``, covering
-all seven categories.
+Pins the classifier (``fp8_load_stats.classify``) against the acceptance
+baseline.  Every row of ``SCAN_REPORT_ROWS`` below is a (pattern, dtype,
+category) triple covering all seven categories.
 
 Three properties are checked per row:
 
-1. ``normalise_pattern(sample_name)`` reproduces the report's ``pattern`` column
-   -- i.e. the loader and the scanner agree on what a "pattern" is;
-2. ``classify`` puts the row in the report's category, using the report's own
-   safetensors dtype spelling (``F8_E4M3`` / ``F8_E8M0`` / ``I8`` / ``BF16`` ...);
-3. the same row still lands in that category with the **torch** dtype spelling
-   the loader actually has (``float8_e4m3fn`` / ``float8_e8m0fnu`` / ``int8`` /
-   ``bfloat16`` ...), and with the name as rewritten by the ``WeightsMapper``
-   (``.scale`` -> ``.weight_scale[_inv]``, ``model.`` prefix,
-   ``.shared_experts.w2`` -> ``.shared_experts.down_proj``) -- because that pair
-   is what the loader passes in.
+1. ``normalise_pattern(sample_name)`` reproduces the report's ``pattern``;
+2. ``classify`` puts the row in the expected category using the safetensors
+   dtype spelling;
+3. the same row still lands in that category with the torch dtype spelling and
+   the mapped name the loader actually sees.
 
-Property 3 is the one that would break silently: the report was produced from raw
-checkpoint keys, the loader only ever sees mapped keys and torch dtypes.
-
-No torch, no vLLM, no GPU: ``fp8_load_stats`` is deliberately torch-free, so
-everything here is plain Python (one test uses real ``torch.dtype`` objects and
-skips if torch is unavailable).
-
-Validates: Requirements 3.4, 3.5, 3.6
+No torch, no vLLM, no GPU: ``fp8_load_stats`` is torch-free, so everything
+here is plain Python (one test uses real ``torch.dtype`` objects and skips if
+torch is unavailable).
 """
 
 from __future__ import annotations
@@ -67,7 +40,7 @@ from vllm_iluvatar.model_executor.models.deepseek_v4.fp8_load_stats import (
 )
 
 # ---------------------------------------------------------------------------
-# Rows copied from weight_inspect/scan_report.md.
+# Rows copied from the acceptance baseline report.
 #
 # (sample_name, pattern, safetensors_dtype, torch_dtype, category)
 #
@@ -294,11 +267,10 @@ ROW_IDS = [f"{row[4]}:{row[0]}" for row in SCAN_REPORT_ROWS]
 def _mapped_name(name: str) -> str:
     """Apply the loader's ``WeightsMapper`` rules to a checkpoint key.
 
-    A local transcription of ``_make_fp8_weights_mapper()`` (design §4.5.5) --
-    importing ``fp8_model`` would drag in torch and vLLM, and the rules are four
-    lines. The mapper itself is already covered by
-    ``test_ilu_dsv4_fp8_mapper.py``; what matters here is only that classification
-    is invariant under it.
+    A local transcription of ``_make_fp8_weights_mapper()`` -- importing
+    ``fp8_model`` would drag in torch and vLLM, and the rules are four lines.
+    The mapper itself is already covered by ``test_ilu_dsv4_fp8_mapper.py``;
+    what matters here is only that classification is invariant under it.
     """
     name = re.sub(r"(\.experts\.\d+\.w[123])\.scale$", r"\1.weight_scale", name)
     if name.endswith(".scale"):
@@ -430,7 +402,7 @@ def test_uint8_scale_is_still_a_scale():
 
 
 # ---------------------------------------------------------------------------
-# LoadStats: the log contract task 5.2 parses.
+# LoadStats: the log contract downstream parsers rely on.
 # ---------------------------------------------------------------------------
 
 
@@ -462,7 +434,7 @@ def test_log_lines_are_eight_parseable_key_values():
         assert match is not None, line
         parsed[match.group(1)] = int(match.group(2))
 
-    # Key spelling and order are frozen: task 5.2 greps them.
+    # Key spelling and order are frozen.
     assert list(parsed) == list(STATS_KEYS)
     assert parsed == stats.as_dict()
     assert parsed[TOTAL_KEY] == sum(parsed[key] for key in CATEGORY_KEYS)
@@ -490,13 +462,13 @@ def test_unclassifiable_tensor_is_counted_and_named():
     assert note is not None
     assert "model.layers.0.attn.mystery" in note
     # The total still counts it, so the seven printed categories stop summing to
-    # the total -- which is exactly the signal task 5.2 should trip on.
+    # the total -- a discrepancy the statistics consumer should flag.
     assert stats.total == 1
     assert sum(stats.as_dict()[key] for key in CATEGORY_KEYS) == 0
 
 
-def test_expected_trunk_counts_are_requirement_3_7_table():
-    """The baseline constant, pinned against requirement 3.7 / scan_report.md."""
+def test_expected_trunk_counts_are_baseline_table():
+    """The baseline constant, pinned against the acceptance report."""
     assert EXPECTED_TRUNK_COUNTS == {
         "routed_expert_weight": 33024,
         "routed_expert_scale": 33024,

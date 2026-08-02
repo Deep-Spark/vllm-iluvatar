@@ -7,11 +7,11 @@ weighted by ``topk_weights``.
 
 The suite is organised around the three things that could go wrong silently:
 
-1. **Migration equivalence** -- the function is a move of module 4's
+1. **Migration equivalence** -- the function was extracted from
    ``IluDeepseekV4Fp8MoE._routed_experts`` / ``_dequant_mxfp4_to_bf16``. A
    reference implementation written the old way (contiguous
    ``[start, end)`` expert range, no ``expert_map``) is kept here and compared
-   element-wise, so the move is pinned rather than assumed.
+   element-wise, so the refactor is pinned rather than assumed.
 2. **Expert ownership** -- the new code reads ``expert_map`` instead of a
    contiguous range. Tested against a non-contiguous (round-robin style) map,
    which is exactly the case the old range-based code got wrong.
@@ -102,7 +102,7 @@ def _reference_routed_experts(
     experts_start_idx: int,
     swiglu_limit: float | None,
 ) -> torch.Tensor:
-    """Module 4's ``IluDeepseekV4Fp8MoE._routed_experts``, verbatim in shape.
+    """``IluDeepseekV4Fp8MoE._routed_experts``, verbatim in shape.
 
     Kept as the migration oracle: a contiguous ``[experts_start_idx, ...)`` range
     of local experts, global-id comparison, per-expert dequant, ``index_add_``
@@ -214,7 +214,7 @@ def test_matches_module_4_reference_without_ep(weights, hidden_states):
 
 
 def test_matches_module_4_reference_with_contiguous_ep_shard(weights, hidden_states):
-    """The case module 4 handled: local experts are a contiguous global range.
+    """Contiguous EP shard: local experts are a contiguous global range.
 
     Rank 1 of 2 owns globals ``[2, 4)``. ``expert_map`` expresses the same thing,
     so the two implementations must agree, and tokens routed elsewhere must
@@ -254,7 +254,7 @@ def test_matches_module_4_reference_with_contiguous_ep_shard(weights, hidden_sta
 
 
 def test_non_contiguous_expert_map_is_honoured(weights, hidden_states):
-    """Where the new code is strictly better than module 4's range arithmetic.
+    """Non-contiguous map -- strictly better than the old range arithmetic.
 
     A round-robin placement (rank 0 of 2 owning globals 0, 2, 4, 6) has no
     contiguous ``[start, end)`` description at all. Building the equivalent
@@ -477,7 +477,7 @@ def test_w13_bias_changes_the_result(weights, hidden_states):
 
 
 # ---------------------------------------------------------------------------
-# Stage 2A: dispatcher + dtype normalisation + ixformer pipeline wiring
+# dispatcher + dtype normalisation + ixformer pipeline wiring
 # ---------------------------------------------------------------------------
 
 
@@ -506,7 +506,7 @@ def _resolve_auto(
 ):
     """Call ``_resolve_backend`` on the explicit ``auto`` path with the
     ``is_ivcore30`` gate forced True, so the only variables are the fallback
-    conditions listed in module 4.2 §3.4.
+    conditions.
 
     ``_resolve_backend`` imports ``is_ivcore30`` lazily from
     ``vllm_iluvatar.ilu_util.arch`` at call time, so patching that module's
@@ -839,7 +839,7 @@ def test_ixformer_pipeline_wires_args_correctly(weights, hidden_states, monkeypa
     src_to_dst, dst_to_src, group_layout = routing_out["v"]
 
     # 1) routing: topk_ids forwarded untouched, start=0, end=E_local, and the
-    # expert_map remap delegated to the op (module 4.2.1 §5.1).
+    # expert_map remap delegated to the op.
     routing_call = fake_ixfops.moe_compute_token_index_ep_group_layout
     routing_call.assert_called_once()
     r_args = routing_call.call_args.args
@@ -921,7 +921,7 @@ def test_ixmm_pipeline_uses_preprocessed_weight_dimensions(
 def test_ixformer_pipeline_forwards_expert_map_without_remapping(
     weights, hidden_states, monkeypatch
 ):
-    """``expert_map`` goes to the routing op verbatim (module 4.2.1 §5.1).
+    """``expert_map`` goes to the routing op verbatim.
 
     The global -> local remap used to happen here as
     ``expert_map[topk_ids.long()].to(torch.int32)``; the op owns it now. Pinning

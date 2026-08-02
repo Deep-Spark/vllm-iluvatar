@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU-only tests for ``IluMxfp4MoEMethod.process_weights_after_loading``.
 
-Covers module 4.2 §3.2 (Stage 2A dtype normalisation): the four routed uint8
+Covers dtype normalisation: the four routed uint8
 parameters are re-labelled in place to the dtypes the ixformer pipeline / torch
 oracle expect, without moving a single byte. The two silent-failure modes this
 guards against are:
@@ -70,7 +70,7 @@ def _make_layer():
 
 @pytest.fixture(autouse=True)
 def _force_original_layout(monkeypatch):
-    """Most tests below pin the Stage 2A zero-copy fallback."""
+    """Most tests below pin the zero-copy fallback."""
     import vllm.envs as envs
 
     monkeypatch.setattr(envs, "VLLM_ILU_MXFP4_MOE_BACKEND", "torch", raising=False)
@@ -90,7 +90,7 @@ def test_process_weights_relables_dtypes():
 
 def test_process_weights_is_zero_copy():
     """``view(dtype)`` must not move storage: ``data_ptr()`` is unchanged and
-    shapes are preserved (module 4.2 §3.2 zero-copy claim)."""
+    shapes are preserved (zero-copy claim)."""
     method = _make_method()
     layer, (w13, s13, w2, s2) = _make_layer()
 

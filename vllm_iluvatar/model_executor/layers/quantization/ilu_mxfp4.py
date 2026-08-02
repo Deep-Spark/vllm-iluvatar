@@ -32,8 +32,8 @@ Overrides (five, each marked ``[ILU override]`` inline)
                                   ``experts_cls`` attribute at all
 ``is_monolithic``                 hard ``False`` (we are a modular method)
 ``supports_eplb``                 hard ``False`` (Phase 1 records no expert load)
-``process_weights_after_loading`` Stage 2A fallback: zero-copy dtype re-label;
-                                  default Stage 2B: chunked
+``process_weights_after_loading`` fallback: zero-copy dtype re-label;
+                                  default: chunked
                                   ``preprocess_weight_for_ixmm`` on ivcore30
 ``get_fused_moe_quant_config``    ``None`` -> no community MoE kernel is built
 ``maybe_make_prepare_finalize``   ``None`` -> never wrapped into
@@ -163,9 +163,8 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
         return False
 
     # [ILU override] Mxfp4MoEMethod.process_weights_after_loading — delta:
-    # Stage 2A re-labels original MXFP4 tensors for native/torch; Stage 2B
-    # converts them once at load time to ixmm's ix30 layout. The selected
-    # backend therefore always sees the layout matching its dtype contract.
+    # Re-labels or converts MXFP4 tensors to the target layout at load time.
+    # The selected backend always sees the layout matching its dtype contract.
     #
     #   w*_weight       uint8 [E, n, k/2] -> int8
     #       Reason §2.2: ``group_gemm_fp4`` dispatches on ``weight.dtype``; the

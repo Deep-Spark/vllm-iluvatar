@@ -415,9 +415,9 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
         self.n_groups = config.o_groups
         self.n_local_groups = self.n_groups // tp_size
         self.window_size = config.sliding_window
-        # compress_ratios has num_hidden_layers + 1 entries (trailing one is the
-        # MTP layer) and dense layers store 0; both degrade to 1.
-        if layer_id < config.num_hidden_layers:
+        # compress_ratios has num_hidden_layers + num_nextn_predict_layers
+        # entries; dense layers and MTP store 0, which degrades to 1.
+        if layer_id < len(config.compress_ratios):
             self.compress_ratio = max(1, config.compress_ratios[layer_id])
         else:
             self.compress_ratio = 1

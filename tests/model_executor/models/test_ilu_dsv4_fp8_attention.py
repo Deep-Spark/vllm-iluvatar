@@ -2,15 +2,9 @@
 """T2 (attention part): parameter-name / shape reconciliation for the DS-V4-Flash
 raw-FP8 attention skeleton (``IluDeepseekV4Fp8Attention``).
 
-Spec: ``.kiro/specs/deepseek-v4-fp8-weight-loading`` task 1.2
-  * design §5.2 (attention sub-module shape table), §6.1 (component design),
-    §7 (TODO numbering)
-  * requirements 2.6 (name + shape match the table), 4.9, 5.1 / 5.2 (every
-    forward entry raises ``NotImplementedError("TODO(ilu_fp8_XX)")``)
-
 What is covered
   1. The parameter-name set of the three layer flavours (dense / ``cr=128`` /
-     ``cr=4``) matches design §5.2 exactly -- no extra, no missing entry.
+     ``cr=4``) -- no extra, no missing entry.
      A dense layer has neither ``compressor`` nor ``indexer`` params; a
      ``cr=128`` layer has ``compressor`` but no ``indexer``; a ``cr=4`` layer
      has both.
@@ -20,10 +14,8 @@ What is covered
      get_padded_num_q_heads(n_local_heads) == 64`` (``64 if n <= 64 else 128``;
      the mini config shrinks ``n_local_heads``, so this is 64 regardless of TP),
      dtype fp32, and every slot initialised to ``-inf``. Weight loading later
-     overwrites only the first ``n_local_heads`` slots -- that behaviour is
-     verified by task 4.4, here we only pin construction-time shape + init.
-  4. The four forward entries raise ``NotImplementedError`` carrying
-     ``TODO(ilu_fp8_A1)``..``A4``.
+     overwrites only the first ``n_local_heads`` slots -- here we only pin
+     construction-time shape + init.
 
 Runtime notes
   * No kernel runs. Structural assertions build on ``meta``; the ``attn_sink``
@@ -42,9 +34,9 @@ Runtime notes
     only shape / dtype / name are checked -- so nothing here is skipped for it.
   * A TP1 process group is needed (parallel linear layers read the TP world size
     even on ``meta``); it is created over gloo, see ``_tp1_distributed_env``.
-  * Expected names/shapes below are transcribed from design §5.2 by hand. They
-    are never read back out of the implementation.
-  * ``make_mini_vllm_config`` / ``build_mini_fp8_attention`` are reused by tasks
+  * Expected names/shapes below are hand-transcribed and never read back out
+    of the implementation.
+  * ``make_mini_vllm_config`` / ``build_mini_fp8_attention`` are reused by other
     2.3 and 3.5, hence the module-level (importable) definitions. They live here
     rather than in a ``conftest.py`` because ``tests/`` is already on
     ``sys.path`` and a second ``conftest`` module in this directory would shadow
@@ -166,7 +158,7 @@ MINI_N_LOCAL_HEADS = MINI_NUM_HEADS // MINI_TP_SIZE  # 8
 EXPECTED_PADDED_HEADS = 64
 
 # --------------------------------------------------------------------------- #
-# expected parameter tables (hand-transcribed from design §5.2)
+# expected parameter tables
 # --------------------------------------------------------------------------- #
 # H = 256, n_heads = 8, head_dim = 512, q_lora = o_lora = 1024, o_groups = 8,
 # block quant = [128, 128] so a scale dim is ceil(size / 128).
@@ -188,8 +180,8 @@ _EXPECTED_BASE: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
     # RowParallelLinear(o_groups * o_lora_rank = 8192, 256)
     "wo_b.weight": ((256, 8192), FP8),
     "wo_b.weight_scale_inv": ((2, 64), E8M0),
-    # Module 3 (plan §1.3): no head padding -- attn_sink carries exactly
-    # n_local_heads values. full((n_local_heads,), -inf, float32).
+    # No head padding -- attn_sink carries exactly n_local_heads values.
+    # full((n_local_heads,), -inf, float32).
     "attn_sink": ((MINI_N_LOCAL_HEADS,), FP32),
 }
 
@@ -395,7 +387,7 @@ def make_mini_model_config(hf_config=None, *, model_cls=None):
 
     ``model_cls`` is the class ``_ModelInfo`` is derived from; it defaults to
     ``IluDeepseekV4Fp8ForCausalLM``, which is what the engine resolves the
-    ``DeepseekV4ForCausalLM`` architecture to on this platform (design §4.6).
+    ``DeepseekV4ForCausalLM`` architecture to on this platform.
     """
     from vllm.config import ModelConfig
     from vllm.model_executor.models.registry import _ModelInfo
@@ -494,7 +486,7 @@ def make_mini_vllm_config():
     differs -- it returns ``IluMxfp4MoEMethod`` -- so every non-MoE layer built
     from this config, attention included, is unaffected.
 
-    Module 4.1 note: with the community config, constructing a DS-V4 MoE layer
+    Note: with the community config, constructing a DS-V4 MoE layer
     off ROCm dies inside ``Mxfp4MoEMethod.__init__`` ->
     ``select_deepseek_v4_mxfp4_moe_backend``. That used to be worked around by
     registering patch P1 around every construction site; the plugin config makes
@@ -509,7 +501,7 @@ def make_mini_vllm_config():
     vllm_config = VllmConfig()
     vllm_config.model_config = make_mini_model_config()
     # fp8_ds_mla is a hard precondition of the DS-V4 attention layer
-    # (requirement 10.2): with cache_dtype == "auto" it asserts out.
+    # with cache_dtype == "auto" it asserts out.
     vllm_config.cache_config.cache_dtype = "fp8_ds_mla"
     vllm_config.cache_config.block_size = 64
     vllm_config.quant_config = IluDeepseekV4FP8Config(
@@ -592,9 +584,9 @@ def test_attention_param_names_match_design_table(layer_id: int):
 
     missing = sorted(set(expected) - set(actual))
     unexpected = sorted(set(actual) - set(expected))
-    assert not missing, f"layer {layer_id}: parameters missing vs design §5.2: {missing}"
+    assert not missing, f"layer {layer_id}: parameters missing: {missing}"
     assert not unexpected, (
-        f"layer {layer_id}: parameters not in design §5.2: {unexpected}"
+        f"layer {layer_id}: unexpected parameters: {unexpected}"
     )
 
 
@@ -669,7 +661,7 @@ def test_get_padded_num_q_heads_pads_to_64():
 
 
 def test_attn_sink_shape_is_local_head_count():
-    """Module 3 (plan §1.3): no head padding -- attn_sink is n_local_heads."""
+    """No head padding -- attn_sink is n_local_heads."""
     with build_mini_fp8_attention(LAYER_CR4) as (layer, _):
         assert layer.n_local_heads == MINI_N_LOCAL_HEADS
         assert tuple(layer.attn_sink.shape) == (MINI_N_LOCAL_HEADS,)
@@ -678,7 +670,7 @@ def test_attn_sink_shape_is_local_head_count():
 
 def test_attn_sink_is_initialised_to_negative_inf():
     """Construction-time init only. Weight loading fills all ``n_local_heads``
-    slots (no padding after Module 3); that is task 4.4."""
+    slots (no padding); weight loading fills all ``n_local_heads`` slots."""
     # Values need real storage, so build on CPU. The dense flavour is used
     # because it pulls in neither compressor nor indexer.
     with build_mini_fp8_attention(LAYER_DENSE, device="cpu") as (layer, _):
@@ -692,7 +684,7 @@ def test_attn_sink_is_initialised_to_negative_inf():
 
 
 # --------------------------------------------------------------------------- #
-# 4. forward entries are TODO-gated (design §7 group A)
+# 4. forward entries are TODO-gated
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize(
     "method_name, expected_tag",

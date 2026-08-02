@@ -64,7 +64,7 @@ import torch
 # Block-quantised FP8 linears hold ``weight`` as [N, K] =
 # [output_size_per_partition, input_size_per_partition], and ``weight_scale_inv``
 # as [ceil(N / block_n), ceil(K / block_k)] with block_shape = [128, 128]
-# (design §4.3 / §5.2: the DS-V4-Flash checkpoint scale layout is
+# (the DS-V4-Flash checkpoint scale layout is
 # [ceil(N/128), ceil(K/128)]).
 #
 # N = 256 -> 256 / 128 = 2 scale rows (>1, so a wrong row/col swap is visible)

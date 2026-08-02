@@ -2,7 +2,7 @@
 """CPU-only tests for ``IluDeepseekV4Fp8MoE`` construction and its MoE method.
 
 Successor of ``test_ilu_dsv4_fp8_moe_patch.py``. That file paired two things:
-the P1 backend-selection patch and the parameters it existed for. Module 4.1
+the P1 backend-selection patch and the parameters it existed for. A refactor
 retired P1 -- the routed experts now land on ``IluMxfp4MoEMethod`` because
 ``IluDeepseekV4FP8Config`` returns it, with no community module globals rewritten
 -- so the patch half is gone and the construction half moved here under a name
@@ -16,20 +16,19 @@ What is asserted
    ``maybe_make_prepare_finalize`` the way the runner needs. These are the exact
    properties that let patches P1 and P3 be deleted, so they are pinned here
    rather than left implicit.
-2. **Parameter shapes** (design §5.3) -- the four routed ``uint8`` MXFP4
+2. **Parameter shapes** -- the four routed ``uint8`` MXFP4
    parameters and the two shared-expert block-FP8 pairs, at the mini-config
-   folding of the §5.3 numbers.
+   folding.
 3. **``process_weights_after_loading`` moves nothing** -- same ``data_ptr()``,
    shape and dtype before and after, and ``w13/w2_weight_scale`` survive as
    registered parameters. This is what Phase 2's zero-copy
    ``.view(torch.int8)`` -> ``group_gemm_fp4`` depends on.
-4. **Gate branching on ``layer_id``** (requirement 7.6) -- hash layers get
+4. **Gate branching on ``layer_id``** -- hash layers get
    ``tid2eid``, the rest get ``e_score_correction_bias``, never both.
-5. **The shared-expert activation stays a plain torch module** (design §4.4.1).
+5. **The shared-expert activation stays a plain torch module**.
 
 Pure CPU: no GPU, no vendor kernel library, no patch registration.
 
-Validates: Requirements 7.1, 7.2, 7.4, 7.5, 7.6
 """
 
 from __future__ import annotations
@@ -39,11 +38,11 @@ import contextlib
 import pytest
 import torch
 
-# Reused from task 1.2: ``_tp1_distributed_env`` is a session-scoped autouse
-# fixture and importing it here is what makes it apply to this module's tests too
-# (parallel linear layers read the TP world size). ``make_mini_vllm_config``
-# carries the mini DS-V4 hf_config plus ``IluDeepseekV4FP8Config``, which is what
-# routes the routed experts to ``IluMxfp4MoEMethod``.
+# ``_tp1_distributed_env`` is a session-scoped autouse fixture and importing it
+# here is what makes it apply to this module's tests too (parallel linear layers
+# read the TP world size). ``make_mini_vllm_config`` carries the mini DS-V4
+# hf_config plus ``IluDeepseekV4FP8Config``, which is what routes the routed
+# experts to ``IluMxfp4MoEMethod``.
 from test_ilu_dsv4_fp8_attention import (  # noqa: F401  (fixture injection)
     BF16,
     E8M0,
@@ -65,7 +64,7 @@ def _backend_none():
 
 
 # ###########################################################################
-# Mini-config folding of design §5.3
+# Mini-config folding
 # ###########################################################################
 #
 # ``Mxfp4MoEMethod.create_weights`` (``quantization/mxfp4.py:530-622``, inherited
@@ -85,7 +84,7 @@ def _backend_none():
 # (``H // 2`` / ``I_local // 2`` because MXFP4 packs two 4-bit values per byte.)
 #
 # ==================  ============================  =====================
-# quantity            design §5.3 (8 ranks)         mini config (TP1)
+# quantity            full config (8 ranks)         mini config (TP1)
 # ==================  ============================  =====================
 # E_local             256 // 8   = 32               8 // 1   = 8
 # H                   4096                          256
@@ -127,7 +126,7 @@ _H = MINI_HIDDEN_SIZE
 
 ROUTED_PARAM_PREFIX = "experts.routed_experts."
 
-# design §5.3, folded per the table above. Written out rather than computed in a
+# Folded per the table above. Written out rather than computed in a
 # loop so a wrong formula shows up as a literal mismatch.
 EXPECTED_ROUTED_PARAMS: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
     "w13_weight": ((_E_LOCAL, 2 * _I_LOCAL, _H // 2), UINT8),
@@ -151,9 +150,9 @@ def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
 
 
-# design §5.3 shared-expert rows. Block-FP8 scale dims are
+# Shared-expert rows. Block-FP8 scale dims are
 # ``ceil(size / block)`` with ``block = [128, 128]``; the intermediate round-up
-# (design §4.5.4) is a no-op here exactly as it is at TP8.
+# is a no-op here exactly as it is at TP8.
 _SHARED_I = (_MOE_INTERMEDIATE_SIZE * _N_SHARED_EXPERTS) // MINI_TP_SIZE
 EXPECTED_SHARED_PARAMS: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
     "gate_up_proj.weight": ((2 * _SHARED_I, _H), FP8),
@@ -205,7 +204,7 @@ def _build_mini_moe(layer_id: int):
 def moe_factory():
     """Hand out the MoE builder.
 
-    No patch registration and no platform-gate monkeypatching since module 4.1:
+    No patch registration and no platform-gate monkeypatching needed:
     ``make_mini_vllm_config`` supplies ``IluDeepseekV4FP8Config``, whose
     ``get_quant_method`` returns ``IluMxfp4MoEMethod`` unconditionally for routed
     MXFP4 experts. Nothing consults ``current_platform``, so construction behaves
@@ -232,7 +231,7 @@ def _routed_experts(moe):
 
 
 # ---------------------------------------------------------------------------
-# Requirement 7.1: the four routed parameters exist, uint8, at design shapes
+# The four routed parameters exist, uint8, at expected shapes
 # ---------------------------------------------------------------------------
 
 
@@ -346,7 +345,7 @@ def test_routed_param_shapes_and_dtypes_match_design_5_3(moe_factory):
 
 
 # ---------------------------------------------------------------------------
-# Requirement 7.2: process_weights_after_loading moves nothing
+# process_weights_after_loading moves nothing
 # ---------------------------------------------------------------------------
 
 
@@ -412,7 +411,7 @@ def test_w13_weight_scale_survives_as_a_registered_parameter(moe_factory):
 
 
 # ---------------------------------------------------------------------------
-# Requirement 7.5: shared experts
+# Shared experts
 # ---------------------------------------------------------------------------
 
 
@@ -429,28 +428,28 @@ def test_shared_expert_params_match_design_5_3(moe_factory):
 
 
 def test_shared_expert_intermediate_round_up_is_a_no_op(moe_factory):
-    """Requirement 7.4's construction-side half: the block-FP8 round-up must not
-    change the intermediate size on this checkpoint's numbers."""
+    """The block-FP8 round-up must not change the intermediate size on this
+    checkpoint's numbers."""
     with moe_factory(BIAS_LAYER_ID) as (moe, _):
         assert moe.shared_experts.intermediate_size == _SHARED_I
 
 
 # ---------------------------------------------------------------------------
-# Module 5: the shared-expert activation is the kernel-backed CustomOp
+# The shared-expert activation is the kernel-backed CustomOp
 # ---------------------------------------------------------------------------
 
 
 def test_shared_expert_activation_is_the_oot_clamped_swiglu(moe_factory):
     """``act_fn`` is ``SiluAndMulWithClamp``, i.e. the plugin's OOT subclass.
 
-    Design §4.4.1 / R10 assumed constructing a community activation ``CustomOp``
+    An earlier assumption was that constructing a community activation ``CustomOp``
     would die on Iluvatar, because ``SiluAndMulWithClamp.__init__`` resolves its
     kernel while being built and the ``is_cuda_alike()`` branch has no fallback.
     That is only true without the plugin: ``IluSiluAndMulWithClamp``
     (``vllm_iluvatar/model_executor/layers/activation.py``) overrides that branch
     to bind ``vllm._custom_ops.silu_and_mul_with_clamp``, ``ilu_register`` applies
     it before any model module is imported, and the W4A8 fork has been running it
-    in production. Module 5 therefore dropped the torch stand-in.
+    in production. The torch stand-in was therefore dropped.
 
     ``fuse_quant`` must stay off: that path returns a ``(q, scale, dtype)`` tuple
     for a downstream int8 linear, which the block-FP8 ``down_proj`` cannot take.
@@ -471,7 +470,7 @@ def test_shared_expert_activation_is_the_oot_clamped_swiglu(moe_factory):
 
 
 # ---------------------------------------------------------------------------
-# Requirement 7.6: gate branches on layer_id
+# Gate branches on layer_id
 # ---------------------------------------------------------------------------
 
 
@@ -505,5 +504,5 @@ def test_non_hash_layer_gate_has_correction_bias_and_no_tid2eid(moe_factory):
 def test_gate_weight_shape_and_router_output_dtype(moe_factory):
     with moe_factory(BIAS_LAYER_ID) as (moe, _):
         assert tuple(moe.gate.weight.shape) == (_N_ROUTED_EXPERTS, _H)
-        # design §5.3 / community nvidia/model.py:545-551: the router runs fp32
+        # community nvidia/model.py:545-551: the router runs fp32
         assert moe.gate.out_dtype is FP32

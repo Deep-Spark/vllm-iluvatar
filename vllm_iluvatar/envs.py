@@ -242,7 +242,7 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     .lower(),
     # DeepSeek-V4 fp8 MQA Q quant mode. Empty = bf16 Q (default).
     # "Q_NOPE_FP8" = dynamically quantize Q NoPE [0:448] to fp8 then dequant
-    # before ds4_flash_mla_with_fp8_kvcache (module 3.3.1 validation path).
+    # before ds4_flash_mla_with_fp8_kvcache.
     "VLLM_ILU_DS4_MQA_QUANT_TYPE": lambda: os.environ.get(
         "VLLM_ILU_DS4_MQA_QUANT_TYPE", ""
     ).upper(),

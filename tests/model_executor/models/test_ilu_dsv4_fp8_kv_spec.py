@@ -1,18 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU-only tests (T5) for the DeepSeek-V4 FP8 KV cache specs and page algebra.
 
-Covers design §5.1 ("KV cache / page 结构" 取值表) for the four spec flavours that
-Stage 1 must expose:
+Covers the four KV cache spec flavours:
 
 * main MLA        -> ``IluDeepseekV4Fp8Attention.get_kv_cache_spec()``
 * SWA             -> community ``DeepseekV4SWACache``
 * indexer K cache -> community ``DeepseekV4IndexerCache``
 * compressor state-> community ``CompressorStateCache``
 
-Every expected number below is hard-coded from design §5.1 on purpose: reading it
-back from the code under test would make the assertion vacuous.
+Every expected number below is hard-coded on purpose: reading it back from the
+code under test would make the assertion vacuous.
 
-The three cache holders are community classes reused verbatim (design §4.2), so
+The three cache holders are community classes reused verbatim, so
 they are constructed directly here. The main MLA spec is exercised through the
 plugin class' ``get_kv_cache_spec`` bound to a minimal duck-typed ``self`` — the
 method only reads ``compress_ratio`` / ``head_dim`` / ``kv_cache_dtype`` /
@@ -32,19 +31,19 @@ import pytest
 import torch
 
 # ---------------------------------------------------------------------------
-# Expected values, hard-coded from design §5.1 (one constant per table row).
+# Expected values, hard-coded (one constant per table row).
 # ---------------------------------------------------------------------------
 
 # "主 MLA per-token 字节" / "SWA per-token 字节"
 #   = 448B FP8 NoPE + 128B bf16 RoPE + 8B UE8M0 scale
 EXPECTED_PER_TOKEN_BYTES = 584
 # "alignment": SWA / indexer / compressor-state community caches page at 576.
-# The main MLA spec was retuned in Module 3 to 64 (the ixformer fp8 kernels'
+# The main MLA spec was retuned to 64 (the ixformer fp8 kernels'
 # block-base alignment, matching the sibling W4A8 fork); 576 is itself a
 # multiple of 64, so the two only differ in per-page padding.
 EXPECTED_ALIGNMENT = 576
 EXPECTED_MAIN_MLA_ALIGNMENT = 64
-# "model_version" — design §5.1 sources it from attention.py:619 (main MLA) and
+# "model_version" — sourced from attention.py:619 (main MLA) and
 # sparse_swa.py:102 (SWA) only. The indexer / compressor-state specs deliberately
 # leave it unset: SlidingWindowMLASpec.real_page_size_bytes switches to the 584B
 # per-token formula as soon as model_version == "deepseek_v4", which would be
@@ -171,7 +170,7 @@ def _compressor_state_cache(
 ):
     from vllm.models.deepseek_v4.compressor import CompressorStateCache
 
-    # design §5.1: coff = 1 + (compress_ratio == 4); state_dim = 2 * coff * head_dim
+    # coff = 1 + (compress_ratio == 4); state_dim = 2 * coff * head_dim
     coff = 1 + (compress_ratio == 4)
     state_dim = 2 * coff * EXPECTED_MAIN_HEAD_SIZE
     return CompressorStateCache(
@@ -291,7 +290,7 @@ def test_compressor_state_cache_spec(compress_ratio):
 
 
 def test_compressor_state_dim_matches_design_table():
-    """state_dim = 2 * coff * head_dim -> cr=4: 2048; cr=128: 1024 (design §5.1)."""
+    """state_dim = 2 * coff * head_dim -> cr=4: 2048; cr=128: 1024."""
     with _config_ctx():
         c4 = _compressor_state_cache(
             compress_ratio=4, prefix="layers.0.attn.compressor.state_cache"

@@ -44,9 +44,7 @@ def swiglu_clamp(x: torch.Tensor, limit: float | None) -> torch.Tensor:
 
     Used by the routed-expert activation in ``ilu_mxfp4_fused_experts()``
     (``layers/fused_moe/ilu_mxfp4_fused_moe.py``) and as the reference the
-    kernel-backed ``IluSiluAndMulWithClamp`` below is checked against. (The
-    DeepSeek-V4 FP8 shared-expert MLP used it too until module 5 moved that slot
-    onto ``SiluAndMulWithClamp``.)
+    kernel-backed ``IluSiluAndMulWithClamp`` below is checked against.
     """
     d = x.shape[-1] // 2
     gate = x[..., :d].to(torch.float32)

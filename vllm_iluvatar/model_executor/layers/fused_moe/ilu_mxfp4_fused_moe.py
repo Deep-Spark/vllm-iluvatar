@@ -52,10 +52,10 @@ Three invariants both implementations share:
   the remap on device;
 * the shared-expert output arrives as ``extra_residual`` and must be folded in
   here, because on the fused-shared path the runner returns ``shared_output ==
-  None`` and nobody adds it later (see module 4.1 design §4.2);
+  None`` and nobody adds it later;
 * the output scale arrives as ``output_scale`` (``layer._ilu_output_scale``,
   which is ``1.0``) -- never ``layer.routed_scaling_factor``, which is the
-  router-aligned ``1.5`` and would double-scale the result (design §4.1).
+  router-aligned ``1.5`` and would double-scale the result.
 
 ixformer is deliberately **not** imported at module scope: the torch path must
 stay importable (and testable) on a plain CPU host. The ixformer import lives
@@ -94,12 +94,12 @@ def dequant_mxfp4_to_bf16(
     ``[out, in // block]`` is an e8m0 (exponent-only) block scale. Returns
     ``[out, in]`` bf16.
 
-    Reuses module 2's ``_e8m0_to_fp32`` for the exponent decode. Unlike NVFP4
+    Reuses ``_e8m0_to_fp32`` for the exponent decode. Unlike NVFP4
     there is no global scale.
 
     Accepts ``weight`` as either ``uint8`` (raw checkpoint) or ``int8``
-    (post-``process_weights_after_loading`` view, see module 4.2 §2.2), and
-    ``scale`` as either ``uint8`` or ``float8_e8m0fnu`` (see §2.1). Both are
+    (post-``process_weights_after_loading`` view), and ``scale`` as either
+    ``uint8`` or ``float8_e8m0fnu``.  Both are
     normalised to ``uint8`` here so the nibble arithmetic below is independent
     of the dtype label the caller carries.
     """
@@ -171,12 +171,11 @@ def ilu_mxfp4_fused_experts_torch(
 
     1. the numerical oracle for ``_ilu_mxfp4_fused_experts_ixformer``;
     2. the only runnable path on non-ivcore30 hosts or when the ixmm wheel is
-       unavailable (module 4.2 §2.8 -- cuBLAS bf16 matmul on the dequantised
-       weights beats the naive ``ixformer_native`` kernel at prefill scale);
+       unavailable (cuBLAS bf16 matmul on the dequantised weights beats the
+       naive ``ixformer_native`` kernel at prefill scale);
     3. the absolute accuracy baseline for the ixmm path, whose per-256
        re-quantisation loses precision against the checkpoint's per-32 block
-       scales and so can only be compared against this, never assumed equal
-       (module 4.2 §2.3).
+       scales and so can only be compared against this, never assumed equal.
 
     Args:
         hidden_states: ``[T, H]``, contiguous, activation dtype (bf16).
@@ -419,7 +418,7 @@ def _ilu_mxfp4_fused_experts_ixformer(
     gemm_backend: str,
     gemm_mode: int | None,
 ) -> torch.Tensor:
-    """The ixformer pipeline (module 4.2 §3.3).
+    """The ixformer pipeline.
 
     Six steps: routing -> expand+E4M3 -> GEMM1 -> clamp+SwiGLU+E4M3 -> GEMM2
     -> gather+reduce. Stays in compact expert order between GEMM1 and the
@@ -561,7 +560,7 @@ def ilu_mxfp4_fused_experts(
     run_decode: bool = False,
     backend: str | None = None,
 ) -> torch.Tensor:
-    """Dispatcher for the routed MXFP4 expert compute (module 4.2 §3.4).
+    """Dispatcher for the routed MXFP4 expert compute.
 
     Takes the same arguments as ``ilu_mxfp4_fused_experts_torch`` plus two
     kw-only ones:

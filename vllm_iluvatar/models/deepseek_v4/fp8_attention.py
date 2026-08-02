@@ -10,8 +10,8 @@ variants (community ones build NV-shaped metadata or launch Triton kernels the
 Iluvatar stack rejects). The lightning indexer is the self-contained
 ``IluDeepseekV4Fp8Indexer`` with a grouped fp8 K cache.
 
-Deviations from the NV public version are marked inline with
-``TODO(ilu_fp8_align_*)`` (no head padding, single-stream, no custom op).
+Deviations from the NV public version: no head padding, single-stream, no
+custom op.
 """
 
 from __future__ import annotations
@@ -424,9 +424,8 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
         self.eps = config.rms_norm_eps
         self.scale = self.head_dim**-0.5
 
-        # No head padding (TODO(ilu_fp8_align_head_pad)): the ixformer sparse
-        # MLA kernels accept an arbitrary ``h_q``, so ``attn_sink`` carries
-        # exactly ``n_local_heads`` values.
+        # No head padding: the ixformer sparse MLA kernels accept an arbitrary
+        # ``h_q``, so ``attn_sink`` carries exactly ``n_local_heads`` values.
         self.attn_sink = nn.Parameter(
             torch.full((self.n_local_heads,), -float("inf"), dtype=torch.float32),
             requires_grad=False,
@@ -609,7 +608,7 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
         """Sparse MLA attention forward (raw-FP8 checkpoint, fp8_ds_mla KV).
 
         Calls ``attention_impl`` directly rather than dispatching through a
-        torch custom op (TODO(ilu_fp8_align_custom_op)).
+        torch custom op.
         """
         qr_kv, _ = self.fused_wqa_wkv(hidden_states)
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
@@ -636,8 +635,8 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
     ) -> None:
         """Sequential sparse-MLA body.
 
-        No aux-stream overlap (TODO(ilu_fp8_align_single_stream)): indexer /
-        compressor / kv-insert run in order on the default stream.
+        No aux-stream overlap: indexer / compressor / kv-insert run in order
+        on the default stream.
         """
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata

@@ -543,7 +543,9 @@ class IluDeepseekCompressor(DeepseekCompressor):
         # short-circuits the rest.
         cos_sin_cache = rotary_emb.cos_sin_cache
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
-        kv_slot_mapping = k_cache_metadata.slot_mapping[:num_tokens]
+        # Use num_actual (not num_tokens) so pad tokens are excluded, matching
+        # the indexer compressor. Required for MTP verify (q_len > 1).
+        kv_slot_mapping = k_cache_metadata.slot_mapping[:num_actual]
         mla_layer = self._static_forward_context[self.k_cache_prefix]
         kv_cache = mla_layer.kv_cache
         kv_cache_dtype = getattr(mla_layer, "kv_cache_dtype", "bfloat16")

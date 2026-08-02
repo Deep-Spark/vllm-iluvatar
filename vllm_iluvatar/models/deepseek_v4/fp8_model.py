@@ -49,8 +49,9 @@ Coexistence
 ``ilu_register._iter_package_modules`` imports every top-level module of this
 package at start-up, so this module coexists with the W4A8 ``model.py`` /
 ``attention.py``.  It therefore registers no torch custom op and no quantization
-config, and its arch name (``DeepseekV4ForCausalLM``) differs from the W4A8
-pair (``IluDeepseekV4ForCausalLM`` / ``IluDeepSeekV4MTPModel``).
+config.  Arch names override the community pair
+(``DeepseekV4ForCausalLM`` / ``DeepSeekV4MTPModel``) and do not collide with the
+W4A8 pair (``IluDeepseekV4ForCausalLM`` / ``IluDeepSeekV4MTPModel``).
 """
 
 from __future__ import annotations
@@ -691,6 +692,19 @@ class IluDeepseekV4Fp8Model(nn.Module):
             torch.empty(1, dtype=torch.float32), requires_grad=False
         )
 
+        # Pre-hc_head residual stream buffer for the MTP draft. Only allocated
+        # on the last PP rank -- that's where MTP target hidden states are
+        # produced (W4A8 ``model.py:712-723``).
+        if get_pp_group().is_last_rank:
+            self._mtp_hidden_buffer = torch.empty(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                self.hc_dim,
+                dtype=vllm_config.model_config.dtype,
+                device=self.device,
+            )
+        else:
+            self._mtp_hidden_buffer = None
+
         # Filled by ``load_weights``, read by the Load_Verifier on
         # ``IluDeepseekV4Fp8ForCausalLM``: the checkpoint-side names
         # (post-mapper, pre-fusion) that the main loop handled.  Accumulated
@@ -750,7 +764,7 @@ class IluDeepseekV4Fp8Model(nn.Module):
 
         Mirrors ``DeepseekV4Model.forward``
         (``vllm/models/deepseek_v4/nvidia/model.py:1080-1145``) / W4A8
-        ``model.py:738-772``, minus the aux streams and the MTP buffer.
+        ``model.py:738-772``, minus the aux streams.
         The token embedding is expanded to ``hc_mult`` streams before the loop
         and stays that shape all the way to ``hc_head``: each layer does its own
         closing ``hc_post``, so unlike NVIDIA there is no per-layer state to
@@ -774,6 +788,11 @@ class IluDeepseekV4Fp8Model(nn.Module):
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
+
+        # Stash pre-hc_head residual for the MTP draft (only on last rank).
+        num_tokens = hidden_states.shape[0]
+        assert self._mtp_hidden_buffer is not None
+        self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
         hidden_states = self.hc_head(hidden_states)
         hidden_states = self.norm(hidden_states)
@@ -1080,6 +1099,9 @@ class IluDeepseekV4Fp8ForCausalLM(nn.Module, SupportsPP):
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
 
+    def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
+        return getattr(self.model, "_mtp_hidden_buffer", None)
+
     def _tap_weight_names(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
@@ -1213,6 +1235,10 @@ def register_model() -> None:
     and ``tokenizer_mode`` is still auto-selected as ``"deepseek_v4"`` by
     community ``ModelConfig``.  Does not collide with the sibling W4A8 fork,
     which registers ``IluDeepseekV4ForCausalLM`` / ``IluDeepSeekV4MTPModel``.
+
+    Also overrides community ``DeepSeekV4MTPModel`` with the FP8 MTP draft so
+    ``--speculative-config method=mtp`` resolves without touching
+    ``_ILU_MTP_ARCH_MAP`` (that map only remaps the W4A8 ``Ilu*`` target archs).
     """
     from vllm import ModelRegistry
 
@@ -1220,4 +1246,9 @@ def register_model() -> None:
         "DeepseekV4ForCausalLM",
         "vllm_iluvatar.model_executor.models.deepseek_v4.fp8_model:"
         "IluDeepseekV4Fp8ForCausalLM",
+    )
+    ModelRegistry.register_model(
+        "DeepSeekV4MTPModel",
+        "vllm_iluvatar.model_executor.models.deepseek_v4.fp8_mtp:"
+        "IluDeepseekV4Fp8MTP",
     )

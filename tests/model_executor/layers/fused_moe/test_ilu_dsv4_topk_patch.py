@@ -36,7 +36,6 @@ IMPL_MODULE = "vllm_iluvatar.model_executor.layers.fused_moe.router.ilu_dsv4_top
 PATCH_MODULE = "vllm_iluvatar.ilu_patch.general_patches.patch_dsv4_topk"
 
 FACTORY = "make_can_use_dsv4_topk"
-PLATFORM_GATE = "is_iluvatar_platform"
 
 # DeepSeek-V4-Flash router shapes: 256 routed experts, top-6, fp32 logits, fp32
 # ``[256]`` correction bias, int32 indices, renormalize on. Community
@@ -137,43 +136,18 @@ def test_community_predicate_is_true_for_real_dsv4_bias_layers(community_symbol)
 
 
 # ---------------------------------------------------------------------------
-# platform branching
+# wrapper: always False, never calls the community predicate
 # ---------------------------------------------------------------------------
 
 
-def test_iluvatar_branch_returns_false_without_calling_the_original(monkeypatch):
-    impl = _impl_module()
-    monkeypatch.setattr(impl, PLATFORM_GATE, lambda: True)
+def test_wrapper_returns_false_without_calling_the_original():
+    """``make_can_use_dsv4_topk`` unconditionally closes the Triton path."""
 
     def original(*args, **kwargs):
-        raise AssertionError("community predicate must not run on Iluvatar")
+        raise AssertionError("community predicate must not run after the patch")
 
-    wrapper = getattr(impl, FACTORY)(original)
+    wrapper = getattr(_impl_module(), FACTORY)(original)
     assert wrapper(*_real_model_args()) is False
-
-
-def test_non_iluvatar_branch_delegates_with_arguments_unchanged(monkeypatch):
-    impl = _impl_module()
-    monkeypatch.setattr(impl, PLATFORM_GATE, lambda: False)
-
-    seen: list[tuple] = []
-
-    def original(*args):
-        seen.append(args)
-        return "delegated"
-
-    args = _real_model_args()
-    wrapper = getattr(impl, FACTORY)(original)
-    assert wrapper(*args) == "delegated"
-    assert len(seen) == 1
-    assert seen[0][0] is args[0]
-    assert seen[0][1] is args[1]
-    assert seen[0][2:] == args[2:]
-
-
-def test_platform_gate_is_a_zero_arg_predicate():
-    gate = getattr(_impl_module(), PLATFORM_GATE)
-    assert isinstance(gate(), bool)
 
 
 # ---------------------------------------------------------------------------
@@ -211,24 +185,12 @@ def test_register_propagates_to_the_from_import_consumer(unregistered_patch):
     )
 
 
-def test_patched_symbol_honours_the_platform_gate(unregistered_patch, monkeypatch):
-    """End-to-end through the rebound attribute: the gate must be read as a
-    module global at call time, not captured when the wrapper was built."""
-    impl = _impl_module()
+def test_patched_symbol_returns_false(unregistered_patch):
+    """End-to-end through the rebound attribute on both holders."""
     _patch_module().register()
-    monkeypatch.setattr(impl, PLATFORM_GATE, lambda: True)
 
     for holder in (_defining_module(), _consumer_module()):
         assert getattr(holder, SYMBOL)(*_real_model_args()) is False
-
-
-def test_patch_is_transparent_off_iluvatar(unregistered_patch, monkeypatch):
-    """A real CUDA run must keep taking the Triton branch."""
-    impl = _impl_module()
-    _patch_module().register()
-    monkeypatch.setattr(impl, PLATFORM_GATE, lambda: False)
-
-    assert getattr(_consumer_module(), SYMBOL)(*_real_model_args()) is True
 
 
 # ---------------------------------------------------------------------------

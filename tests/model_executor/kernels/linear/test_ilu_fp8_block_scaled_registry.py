@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU-only tests for the Iluvatar FP8 block-scaled dense linear kernel.
 
-Covers the pure-Python / pure-torch mechanisms (design doc §13.3, runnable
+Covers the pure-Python / pure-torch mechanisms (runnable
 without a GPU):
 
 * the general patch inserts ``IluFp8BlockScaledMMKernel`` at the head of

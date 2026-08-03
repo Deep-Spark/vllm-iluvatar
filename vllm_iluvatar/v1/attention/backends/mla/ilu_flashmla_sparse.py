@@ -39,7 +39,6 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
-from vllm.v1.attention.ops.flashmla import flash_mla_sparse_prefill
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -546,6 +545,35 @@ class IluFlashMLASparseImpl(SparseMLACommonImpl[IluFlashMLASparseMetadata]):
 
         return self._bf16_flash_mla_kernel(q, kv_c_and_k_pe_cache, topk_indices)
 
+    def flash_mla_sparse_prefill(
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        indices: torch.Tensor,
+        sm_scale: float,
+        d_v: int = 512,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Sparse attention prefill kernel
+
+        Args:
+        - q: [s_q, h_q, d_qk], bfloat16
+        - kv: [s_kv, h_kv, d_qk], bfloat16
+        - indices: [s_q, h_kv, topk], int32.
+            Invalid indices should be set to -1 or numbers >= s_kv
+        - sm_scale: float
+        - d_v: The dimension of value vectors. Can only be 512
+
+        Returns:
+        - (output, max_logits, lse)
+            About the definition of output,
+            max_logits and lse, please refer to README.md
+        - output: [s_q, h_q, d_v], bfloat16
+        - max_logits:  [s_q, h_q], float
+        - lse: [s_q, h_q], float, 2-based log-sum-exp
+        """
+        results = ops.sparse_prefill_fwd(q, kv, indices, sm_scale, d_v)
+        return results
+
     def _bf16_flash_mla_kernel(
         self,
         q: torch.Tensor,
@@ -570,7 +598,7 @@ class IluFlashMLASparseImpl(SparseMLACommonImpl[IluFlashMLASparseMetadata]):
             q = q_padded
 
         topk_indices = topk_indices.view(num_tokens, 1, -1)
-        output = flash_mla_sparse_prefill(
+        output = self.flash_mla_sparse_prefill(
             q, kv_c_and_k_pe_cache, topk_indices, self.softmax_scale
         )
         output = output[:, : self.num_heads, :]

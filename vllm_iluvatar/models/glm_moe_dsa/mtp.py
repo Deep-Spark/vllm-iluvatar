@@ -59,7 +59,7 @@ from vllm.model_executor.models.utils import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
-from vllm_iluvatar.model_executor.models.ilu_glm.model import (
+from vllm_iluvatar.models.glm_moe_dsa.model import (
     IluGlmMoeDsaDecoderLayer,
 )
 

@@ -80,7 +80,7 @@ from vllm.model_executor.models.utils import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
-from vllm_iluvatar.model_executor.models.ilu_glm.attention import (
+from vllm_iluvatar.models.glm_moe_dsa.attention import (
     IluGlmMoeDsaMLAAttention,
 )
 
@@ -310,9 +310,7 @@ class IluGlmMoeDsaDecoderLayer(nn.Module):
 
         hidden_states = self.self_attn(positions, hidden_states)
 
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual
-        )
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -615,9 +613,9 @@ def register_model() -> None:
 
     ModelRegistry.register_model(
         "IluGlmMoeDsaForCausalLM",
-        "vllm_iluvatar.model_executor.models.ilu_glm.model:IluGlmMoeDsaForCausalLM",
+        "vllm_iluvatar.models.glm_moe_dsa.model:IluGlmMoeDsaForCausalLM",
     )
     ModelRegistry.register_model(
         "IluGlmMoeDsaMTPModel",
-        "vllm_iluvatar.model_executor.models.ilu_glm.mtp:IluGlmMoeDsaMTP",
+        "vllm_iluvatar.models.glm_moe_dsa.mtp:IluGlmMoeDsaMTP",
     )

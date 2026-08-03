@@ -6,9 +6,10 @@ Corresponds to: vllm/v1/spec_decode/llm_base_proposer.py ::
 
 The community method returns ``True`` (draft forward yields the
 ``(logit_hidden, recycle_hidden)`` tuple) only for ``DeepSeekMTPModel``. The
-ilu GLM-5.2 MTP draft ``IluGlmMoeDsaMTPModel`` is a DeepSeek-V3.2 standard MTP
-and follows the same tuple contract, so this wrapper returns ``True`` for it
-and otherwise delegates to the community implementation unchanged.
+ilu GLM-5.2 MTP draft ``IluGlmMoeDsaMTPModel`` and the plugin DeepSeek V3.2
+draft ``DeepseekV32MTPModel`` follow the same tuple contract, so this wrapper
+returns ``True`` for them and otherwise delegates to the community implementation
+unchanged.
 
 Baseline : main_61ac3680210
 """
@@ -20,7 +21,7 @@ from collections.abc import Callable
 
 # Ilu MTP draft archs that follow the DeepSeek-family (logit, recycle) tuple
 # forward contract.
-_ILU_TUPLE_MTP_ARCHS = ("IluGlmMoeDsaMTPModel",)
+_ILU_TUPLE_MTP_ARCHS = ("IluGlmMoeDsaMTPModel", "DeepseekV32MTPModel")
 
 
 def make_model_returns_tuple(orig: Callable[..., bool]) -> Callable[..., bool]:

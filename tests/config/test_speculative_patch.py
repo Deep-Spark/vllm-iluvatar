@@ -65,14 +65,24 @@ def test_remaps_glm_after_community_routing():
     assert result.architectures == ["IluGlmMoeDsaMTPModel"]
 
 
+def test_remaps_deepseek_v32_after_community_routing():
+    orig = _make_orig([], out_architectures=["DeepSeekMTPModel"])
+    wrapped = make_hf_config_override(orig)
+
+    cfg = _FakeHFConfig(["DeepseekV32ForCausalLM"])
+    result = wrapped(cfg)
+
+    assert result.architectures == ["DeepseekV32MTPModel"]
+
+
 def test_remaps_deepseek_v4_after_community_routing():
     orig = _make_orig([], out_architectures=["DeepSeekV4MTPModel"])
     wrapped = make_hf_config_override(orig)
 
-    cfg = _FakeHFConfig(["IluDeepseekV4ForCausalLM"])
+    cfg = _FakeHFConfig(["DeepseekV4ForCausalLM"])
     result = wrapped(cfg)
 
-    assert result.architectures == ["IluDeepSeekV4MTPModel"]
+    assert result.architectures == ["DeepSeekV4MTPModel"]
 
 
 # --- factory: non-ilu passthrough ------------------------------------------
@@ -149,7 +159,9 @@ def test_patch_binds_wrapper_as_staticmethod():
     patch_speculative_config.register()
 
     static = inspect.getattr_static(SpeculativeConfig, "hf_config_override")
-    assert isinstance(static, staticmethod), "hf_config_override must stay a staticmethod"
+    assert isinstance(static, staticmethod), (
+        "hf_config_override must stay a staticmethod"
+    )
     assert hasattr(SpeculativeConfig.hf_config_override, "__wrapped__"), (
         "hf_config_override not wrapped by the ilu override"
     )

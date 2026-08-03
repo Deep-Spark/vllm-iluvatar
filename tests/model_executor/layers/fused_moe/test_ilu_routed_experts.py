@@ -6,6 +6,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 from vllm.model_executor.custom_op import op_registry_oot
 
@@ -30,6 +31,11 @@ class IluAutoGPTQMoEMethod:
 
 class OtherMoEMethod:
     pass
+
+
+class IluCompressedTensorsW4A8Int8MoEMethod:
+    def __init__(self, gemm_format: str):
+        self.gemm_format = gemm_format
 
 
 def _uninitialized_routed_experts() -> IluRoutedExperts:
@@ -106,9 +112,20 @@ def _recording_param(
     return param
 
 
-def test_load_weights_trims_fused_w13_weight_scale_to_half_intermediate():
+@pytest.mark.parametrize(
+    ("gemm_format", "scale_shape"),
+    [
+        ("TN", (128, 3072, 2)),
+        ("NN", (128, 1536, 2)),
+    ],
+)
+def test_load_weights_trims_fused_w13_weight_scale_to_half_intermediate(
+    gemm_format, scale_shape
+):
     routed = _uninitialized_routed_experts()
     routed.moe_config.hidden_dim_unpadded = 2048
+    routed.moe_config.intermediate_size = 1536
+    routed.__dict__["quant_method"] = IluCompressedTensorsW4A8Int8MoEMethod(gemm_format)
     routed.get_expert_mapping = lambda include_fused=True: [
         ("experts.w13_weight_scale", "experts.w13.weight_scale", 0, "w1"),
         ("experts.w13_weight_scale", "experts.w13.weight_scale", 1, "w3"),
@@ -126,7 +143,7 @@ def test_load_weights_trims_fused_w13_weight_scale_to_half_intermediate():
         routed.load_weights(
             [
                 ("experts.w13", torch.empty((128, 3072, 2048))),
-                ("experts.w13.weight_scale", torch.empty((128, 3072, 2))),
+                ("experts.w13.weight_scale", torch.empty(scale_shape)),
             ]
         )
     )
@@ -164,9 +181,20 @@ def test_load_weights_keeps_fused_w13_weight_scale_when_dim_differs():
     assert set(scale_shapes) == {torch.Size([1, 4096])}
 
 
-def test_load_weights_transposes_fused_w2_weight_scale_layout():
+@pytest.mark.parametrize(
+    ("gemm_format", "scale_shape", "expected_shape"),
+    [
+        ("TN", (128, 2048, 1), torch.Size([1, 2048])),
+        ("NN", (128, 1024, 1), torch.Size([1, 1024])),
+    ],
+)
+def test_load_weights_transposes_fused_w2_weight_scale_layout(
+    gemm_format, scale_shape, expected_shape
+):
     routed = _uninitialized_routed_experts()
     routed.moe_config.hidden_dim_unpadded = 2048
+    routed.moe_config.intermediate_size = 1536
+    routed.__dict__["quant_method"] = IluCompressedTensorsW4A8Int8MoEMethod(gemm_format)
     routed.get_expert_mapping = lambda include_fused=True: [
         ("experts.w2_weight_scale", "experts.w2.weight_scale", 0, "w2"),
         ("experts.w2_weight", "experts.w2", 0, "w2"),
@@ -182,14 +210,14 @@ def test_load_weights_transposes_fused_w2_weight_scale_layout():
         routed.load_weights(
             [
                 ("experts.w2", torch.empty((128, 3072, 2048))),
-                ("experts.w2.weight_scale", torch.empty((128, 2048, 1))),
+                ("experts.w2.weight_scale", torch.empty(scale_shape)),
             ]
         )
     )
 
     scale_shapes = [shape for name, shape in calls if name == "w2_weight_scale"]
     assert scale_shapes
-    assert set(scale_shapes) == {torch.Size([1, 2048])}
+    assert set(scale_shapes) == {expected_shape}
 
 
 def test_weight_loader_keeps_moe_loading_marker():

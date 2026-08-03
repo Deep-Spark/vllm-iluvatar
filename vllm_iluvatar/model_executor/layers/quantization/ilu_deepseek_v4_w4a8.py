@@ -277,9 +277,7 @@ class IluDeepseekV4W4A8Config(QuantizationConfig):
         # Distinct from ``bmm_w8a16_layers`` (V4 wo_a: a single grouped weight):
         # kv_b_proj must be split into two derived weights, so it dispatches to
         # ``_IluGlmKVBProjW8A16Method`` instead of ``_IluV4W8A16BMMLinearMethod``.
-        self.mla_bmm_targets: list[re.Pattern] = _compile_targets(
-            self.mla_bmm_section
-        )
+        self.mla_bmm_targets: list[re.Pattern] = _compile_targets(self.mla_bmm_section)
 
     # ----- QuantizationConfig boilerplate ----------------------------------
 
@@ -615,7 +613,7 @@ class _IluGlmKVBProjW8A16Method(LinearMethodBase):
 
     ``kv_b_proj`` is the absorbed MLA up-projection: a single INT8 weight
     ``[num_heads * (qk_nope + v), kv_lora]`` that the self-contained sparse-MLA
-    attention (``ilu_glm/attention.py``) splits into ``W_UK`` (k-up) and
+    attention (``glm_moe_dsa/attention.py``) splits into ``W_UK`` (k-up) and
     ``W_UV`` (v-up) and consumes via two grouped ``ixf_ops.marlin_w8a16`` GEMMs
     -- exactly R1's ``_k_up_proj_w8a8`` / ``_v_up_proj_w8a8`` template
     (``vllm/v1/attention/backends/mla/ilu_mla.py``).

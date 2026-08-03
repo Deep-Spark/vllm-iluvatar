@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Self-contained GLM-5.2 (GlmMoeDsa = DeepSeek-V3.2) MLA + DSA attention.
 
-Aligned with ``vllm_iluvatar.model_executor.models.deepseek_v4.attention``: the
+Aligned with ``vllm_iluvatar.models.deepseek_v4.attention``: the
 whole attention *algorithm* chain lives in the plugin, so GLM never dispatches
 through the community ``MultiHeadLatentAttentionWrapper`` / ``MLAAttention`` /
 community ``SparseMLAAttentionImpl``. Only *infrastructure* is reused
 (``*Linear`` / ``RMSNorm`` / ``get_rope`` / the fork ``IluFlashMLASparseBackend``
 metadata, ``IluDeepseekV32IndexerBackend`` cache and the ixformer / FlashMLA
-sparse kernels). The DSA top-k step is a plugin-local opaque op
-(``vllm::ilu_glm_sparse_attn_indexer``, defined in this module).
+sparse kernels). The DSA top-k step uses the plugin ``SparseAttnIndexer``
+registered as ``vllm::ilu_sparse_attn_indexer``.
 
 Three layers, mirroring V4:
 
@@ -26,8 +26,8 @@ Three layers, mirroring V4:
   attn_sink / C128A / DCP / quantized-output paths). Analogue of
   ``IluDeepseekV4MLAAttention``.
 - :class:`IluGlmMoeDsaIndexer` / :class:`IluGlmMoeDsaIndexerCache` -- the DSA
-  lightning indexer, driving the plugin-local
-  ``vllm::ilu_glm_sparse_attn_indexer`` op defined above.
+  lightning indexer, driving the shared plugin ``vllm::ilu_sparse_attn_indexer``
+  op.
 
 The ``q_a_proj`` + ``kv_a_proj_with_mqa`` fusion is done at *load time* via a
 ``MergedColumnParallelLinear`` named ``fused_qkv_a_proj`` (see ``model.py``
@@ -56,26 +56,22 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.platforms import current_platform
-from vllm.utils.torch_utils import (
-    _encode_layer_name,
-    direct_register_custom_op,
-    kv_cache_dtype_str_to_dtype,
-)
+from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import AttentionBackend
-from vllm.v1.attention.backends.mla.ilu_indexer import (
-    IluDeepseekV32IndexerBackend,
-    IluDeepseekV32IndexerMetadata,
-)
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
 )
-from vllm.v1.attention.ops.flashmla import flash_mla_sparse_prefill
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
+from vllm_iluvatar.model_executor.layers.sparse_attn_indexer import (
+    IluSparseAttnIndexer,
+)
 from vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse import (
     IluFlashMLASparseBackend,
     IluFlashMLASparseMetadata,
+)
+from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
+    IluDeepseekV32IndexerBackend,
 )
 
 logger = init_logger(__name__)
@@ -85,151 +81,6 @@ def _yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
-
-
-def _ilu_glm_sparse_attn_indexer(
-    hidden_states: torch.Tensor,
-    k_cache_prefix: str,
-    kv_cache: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    weights: torch.Tensor,
-    topk_tokens: int,
-    head_dim: int,
-    max_model_len: int,
-    total_seq_lens: int,
-    topk_indices_buffer: torch.Tensor | None,
-) -> torch.Tensor:
-    """Plugin-local DSA lightning-indexer top-k op for GLM-5.2.
-
-    Self-contained analogue of the community/fork ``sparse_attn_indexer`` custom
-    op (registered under a distinct name ``ilu_glm_sparse_attn_indexer`` so it
-    can coexist with the fork ``vllm::ilu_sparse_attn_indexer``). Wrapping the
-    data-dependent control flow (top-k, per-chunk loops, ``attn_metadata`` dict
-    access) in an opaque custom op keeps it CUDA-graph / torch.compile safe --
-    mirroring how ``deepseek_v4`` folds its indexer into
-    ``vllm::ilu_deepseek_v4_attention``.
-    """
-    # careful! this will be None in dummy run
-    attn_metadata = get_forward_context().attn_metadata
-    if not isinstance(attn_metadata, dict):
-        return _ilu_glm_sparse_attn_indexer_fake(
-            hidden_states,
-            k_cache_prefix,
-            kv_cache,
-            q,
-            k,
-            weights,
-            topk_tokens,
-            head_dim,
-            max_model_len,
-            total_seq_lens,
-            topk_indices_buffer,
-        )
-    attn_metadata = attn_metadata[k_cache_prefix]
-    assert isinstance(attn_metadata, IluDeepseekV32IndexerMetadata)
-    slot_mapping = attn_metadata.slot_mapping
-    has_decode = attn_metadata.num_decodes > 0
-    has_prefill = attn_metadata.num_prefills > 0
-    num_decode_tokens = attn_metadata.num_decode_tokens
-
-    # Grid follows slot_mapping's (CUDA-graph padded) length; truncate k if it
-    # is longer. Padding rows carry slot_mapping == -1 and are skipped in the
-    # kernel (see vllm_indexer_k_cache.cu ``if (slot_idx < 0) return;``).
-    num_tokens = slot_mapping.shape[0]
-    k = k[:num_tokens]
-    ops.indexer_k_cache(k, kv_cache, slot_mapping)
-
-    if has_prefill:
-        prefill_metadata = attn_metadata.prefill
-        for chunk in prefill_metadata.chunks:
-            if chunk.max_context_len == 0:
-                # CUDA-graph warmup can produce all-padding chunks with no KV
-                # entries; the indexer is a no-op there.
-                continue
-            logits = ixf_ops.dsa_indexer_mqa_logits_with_blocks(
-                q[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlens_q,
-                chunk.cu_seq_lens,
-                kv_cache,
-                chunk.block_table,
-                weights[chunk.token_start : chunk.token_end],
-                max_q_len=chunk.max_q_len,
-                max_kv_len=chunk.max_kv_len,
-                max_context_len=chunk.max_context_len,
-            )
-            ixf_ops.dsa_update_topk_indices(
-                logits,
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-                topk_tokens,
-                topk_indices_buffer[chunk.token_start : chunk.token_end],
-            )
-
-    if has_decode:
-        decode_metadata = attn_metadata.decode
-        # Ragged (non-uniform query length) decode batches are supported
-        # natively: ``dsa_indexer_mqa_logits_with_blocks`` iterates requests via
-        # ``cu_seqlens_q`` (the same variable-q path prefill uses), and
-        # ``cu_seqlen_ks/ke`` carry one causal span per query token, so each
-        # decode token is an independent logits/topk row. No pack/unpack is
-        # needed (unlike the community ``sparse_attn_indexer`` whose paged-MQA
-        # kernel requires a uniform ``[B, next_n]`` layout). ``requires_padding``
-        # is kept on the metadata only as a diagnostic flag.
-
-        if decode_metadata.max_context_len == 0:
-            # Early decode steps can have no KV entries yet: no top-k
-            # candidates, and the logits kernel cannot materialize a matrix
-            # with zero columns. Write -1 (no selection) and return.
-            topk_indices_buffer[:num_decode_tokens].fill_(-1)
-            return topk_indices_buffer
-
-        logits = ixf_ops.dsa_indexer_mqa_logits_with_blocks(
-            q[:num_decode_tokens],
-            decode_metadata.cu_seqlens_q,
-            decode_metadata.cu_seqlens_kv,
-            kv_cache,
-            decode_metadata.block_table,
-            weights[:num_decode_tokens],
-            max_q_len=decode_metadata.max_q_len,
-            max_kv_len=decode_metadata.max_kv_len,
-            max_context_len=decode_metadata.max_context_len,
-        )
-
-        ixf_ops.dsa_update_topk_indices(
-            logits,
-            decode_metadata.cu_seqlen_ks,
-            decode_metadata.cu_seqlen_ke,
-            topk_tokens,
-            topk_indices_buffer[:num_decode_tokens],
-        )
-
-    return topk_indices_buffer
-
-
-def _ilu_glm_sparse_attn_indexer_fake(
-    hidden_states: torch.Tensor,
-    k_cache_prefix: str,
-    kv_cache: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    weights: torch.Tensor,
-    topk_tokens: int,
-    head_dim: int,
-    max_model_len: int,
-    total_seq_lens: int,
-    topk_indices_buffer: torch.Tensor | None,
-) -> torch.Tensor:
-    return topk_indices_buffer
-
-
-direct_register_custom_op(
-    op_name="ilu_glm_sparse_attn_indexer",
-    op_func=_ilu_glm_sparse_attn_indexer,
-    mutates_args=["topk_indices_buffer"],
-    fake_impl=_ilu_glm_sparse_attn_indexer_fake,
-    dispatch_key=current_platform.dispatch_key,
-)
 
 
 class IluGlmMoeDsaIndexerCache(torch.nn.Module, AttentionLayerBase):
@@ -277,9 +128,8 @@ class IluGlmMoeDsaIndexer(nn.Module):
     Only built on ``full`` indexer layers. ``wq_b`` is W8A8 INT8; ``wk`` +
     ``weights_proj`` are fused into a single BF16 ``wk_weights_proj`` (the
     GLM checkpoint ships both as BF16, so no FP8 upcast path is needed). Topk
-    is computed by the plugin-local ``vllm::ilu_glm_sparse_attn_indexer`` op
-    (which writes into the shared ``topk_indices_buffer`` consumed by the
-    sparse MLA layer).
+    is computed by the shared plugin ``SparseAttnIndexer`` (which writes into
+    the ``topk_indices_buffer`` consumed by the sparse MLA layer).
     """
 
     def __init__(
@@ -338,9 +188,21 @@ class IluGlmMoeDsaIndexer(nn.Module):
         self.max_model_len = vllm_config.model_config.max_model_len
         self.prefix = prefix
 
-        from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
+        from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
+            get_max_prefill_buffer_size,
+        )
 
         self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)
+        self.indexer_op = IluSparseAttnIndexer(
+            self.k_cache,
+            self.quant_block_size,
+            self.scale_fmt,
+            self.topk_tokens,
+            self.head_dim,
+            self.max_model_len,
+            self.max_total_seq_len,
+            self.topk_indices_buffer,
+        )
 
     def forward(
         self,
@@ -377,18 +239,11 @@ class IluGlmMoeDsaIndexer(nn.Module):
         weights = weights.unsqueeze(-1) * self.softmax_scale * self.n_head_scale
         weights = weights.squeeze(-1)
 
-        return torch.ops.vllm.ilu_glm_sparse_attn_indexer(
+        return self.indexer_op(
             hidden_states,
-            _encode_layer_name(self.k_cache.prefix),
-            self.k_cache.kv_cache,
             q,
             k,
             weights,
-            self.topk_tokens,
-            self.head_dim,
-            self.max_model_len,
-            self.max_total_seq_len,
-            self.topk_indices_buffer,
         )
 
 
@@ -511,6 +366,36 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
             batch_first=False,
         )  # (B, N, V)
 
+    @staticmethod
+    def flash_mla_sparse_prefill(
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        indices: torch.Tensor,
+        sm_scale: float,
+        d_v: int = 512,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Sparse attention prefill kernel
+
+        Args:
+        - q: [s_q, h_q, d_qk], bfloat16
+        - kv: [s_kv, h_kv, d_qk], bfloat16
+        - indices: [s_q, h_kv, topk], int32.
+            Invalid indices should be set to -1 or numbers >= s_kv
+        - sm_scale: float
+        - d_v: The dimension of value vectors. Can only be 512
+
+        Returns:
+        - (output, max_logits, lse)
+            About the definition of output,
+            max_logits and lse, please refer to README.md
+        - output: [s_q, h_q, d_v], bfloat16
+        - max_logits:  [s_q, h_q], float
+        - lse: [s_q, h_q], float, 2-based log-sum-exp
+        """
+        results = ops.sparse_prefill_fwd(q, kv, indices, sm_scale, d_v)
+        return results
+
     def _sparse_mla_kernel(
         self,
         q: torch.Tensor,
@@ -532,7 +417,7 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
             -1, 1, kv_c_and_k_pe_cache.shape[-1]
         )
         topk_indices = topk_indices.view(num_tokens, 1, -1)
-        return flash_mla_sparse_prefill(
+        return self.flash_mla_sparse_prefill(
             q, kv_c_and_k_pe_cache, topk_indices, self.softmax_scale
         )
 
@@ -612,10 +497,9 @@ class IluGlmMoeDsaMLAAttention(nn.Module):
     Self-contained analogue of the community
     ``MultiHeadLatentAttentionWrapper.forward_opt``: a single fused
     ``fused_qkv_a_proj`` GEMM produces ``[q_lora | kv_lora | rope]``, then q/kv
-    norms, the DSA indexer (:class:`IluGlmMoeDsaIndexer` driving the
-    plugin-local ``vllm::ilu_glm_sparse_attn_indexer`` op), the inner
-    :class:`IluGlmMoeDsaSparseMLA` and ``o_proj``. No community wrapper /
-    ``MLAAttention`` in the chain.
+    norms, the DSA indexer (:class:`IluGlmMoeDsaIndexer` driving the shared
+    plugin ``SparseAttnIndexer``), the inner :class:`IluGlmMoeDsaSparseMLA`
+    and ``o_proj``. No community wrapper / ``MLAAttention`` in the chain.
     """
 
     def __init__(

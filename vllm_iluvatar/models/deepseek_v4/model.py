@@ -8,9 +8,8 @@ diverges in three places:
    ``my_tests/deepseek/deepseek-v4/convert_w4a8/convert_v4_to_w4a8.py``,
    which write a fresh ``quantization_config`` block whose
    ``quant_method == "ilu_deepseek_v4_w4a8"`` (handled by
-   :class:`IluDeepseekV4W4A8Config`). Only ``IluDeepseekV4ForCausalLM``
-   should be paired with that config; the upstream ``DeepseekV4ForCausalLM``
-   continues to handle the original FP4/FP8 layouts.
+   :class:`IluDeepseekV4W4A8Config`). ``DeepseekV4ForCausalLM`` resolves to
+   this Iluvatar implementation when the plugin registry override is applied.
 
 2. **MegaMoE removed** - the deep-gemm MegaMoE path, its triton input
    staging kernel, the bespoke expert params mapping and the
@@ -20,7 +19,7 @@ diverges in three places:
 3. **Attention path** - imports :class:`IluDeepseekV4Indexer` /
    :class:`IluDeepseekV4MLAModules` /
    :class:`IluDeepseekV4MultiHeadLatentAttentionWrapper` from
-   :mod:`vllm_iluvatar.model_executor.models.deepseek_v4.attention`. KV cache is
+   :mod:`vllm_iluvatar.models.deepseek_v4.attention`. KV cache is
    bf16 throughout (no ``fp8_ds_mla``).
 
 Registration: ``register_model()`` below is invoked by
@@ -98,7 +97,7 @@ from vllm.utils.multi_stream_utils import AuxStreamType
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
     IluFusedMoEEP,
 )
-from vllm_iluvatar.model_executor.models.deepseek_v4.attention import (
+from vllm_iluvatar.models.deepseek_v4.attention import (
     IluDeepseekV4Indexer,
     IluDeepseekV4MLAModules,
     IluDeepseekV4MultiHeadLatentAttentionWrapper,
@@ -137,11 +136,10 @@ elif _DS4_MHC_PRE_VERSION == "v3":
 # We deliberately do NOT `from vllm.model_executor.models.deepseek_v4 import ...`,
 # because that module pulls in `vllm.model_executor.layers.deepseek_v4_attention`
 # -> `vllm.model_executor.layers.sparse_attn_indexer`, which calls
-# `direct_register_custom_op("vllm::sparse_attn_indexer", ...)`. The ilu fork
-# also registers the same op name via
-# `vllm.model_executor.layers.ilu_sparse_attn_indexer`
-# (pulled in by `deepseek_v2.py`), so importing both leads to a duplicate
-# torch.library schema registration at worker startup.
+# `direct_register_custom_op("vllm::sparse_attn_indexer", ...)`. The Iluvatar
+# plugin uses the distinct ``vllm::ilu_sparse_attn_indexer`` op in
+# `vllm_iluvatar.model_executor.layers.sparse_attn_indexer`, so it can coexist
+# with the community indexer schema.
 #
 # `IluDeepseekV4MLP` is byte-identical to upstream. The model-output multi-head
 # fusion (originally `hc_head` eager PyTorch) is replaced by the fused
@@ -1024,11 +1022,10 @@ def register_model() -> None:
     from vllm import ModelRegistry
 
     ModelRegistry.register_model(
-        "IluDeepseekV4ForCausalLM",
-        "vllm_iluvatar.model_executor.models.deepseek_v4.model:"
-        "IluDeepseekV4ForCausalLM",
+        "DeepseekV4ForCausalLM",
+        "vllm_iluvatar.models.deepseek_v4.model:IluDeepseekV4ForCausalLM",
     )
     ModelRegistry.register_model(
-        "IluDeepSeekV4MTPModel",
-        "vllm_iluvatar.model_executor.models.deepseek_v4.mtp:IluDeepSeekV4MTP",
+        "DeepSeekV4MTPModel",
+        "vllm_iluvatar.models.deepseek_v4.mtp:IluDeepSeekV4MTP",
     )

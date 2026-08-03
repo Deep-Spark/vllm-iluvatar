@@ -188,10 +188,6 @@ def _make_iluvatar_platform():
 
         @classmethod
         def check_and_update_config(cls, vllm_config) -> None:
-            # Community ModelConfig only auto-selects the deepseek_v4 tokenizer
-            # for the upstream "DeepseekV4ForCausalLM" arch. The Iluvatar W4A8
-            # arch is OOT-registered, so set its tokenizer_mode here (runs in
-            # VllmConfig.__post_init__, before the tokenizer is built).
             super().check_and_update_config(vllm_config)
 
             pc = getattr(vllm_config, "parallel_config", None)
@@ -199,23 +195,6 @@ def _make_iluvatar_platform():
                 pc.worker_cls = "vllm_iluvatar.v1.worker.gpu_worker.IluWorker"
                 logger.info(
                     "ILU: set worker_cls to IluWorker (DP dummy-batch optimisation)"
-                )
-
-            model_config = getattr(vllm_config, "model_config", None)
-            if model_config is None:
-                return
-
-            try:
-                archs = model_config.architectures or []
-            except Exception:
-                archs = []
-            if (
-                "IluDeepseekV4ForCausalLM" in archs
-                and model_config.tokenizer_mode == "auto"
-            ):
-                model_config.tokenizer_mode = "deepseek_v4"
-                logger.info(
-                    "ILU: set tokenizer_mode='deepseek_v4' for IluDeepseekV4ForCausalLM"
                 )
 
         @classmethod

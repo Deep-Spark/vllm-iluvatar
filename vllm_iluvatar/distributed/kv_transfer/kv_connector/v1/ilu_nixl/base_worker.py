@@ -28,7 +28,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import make_zmq_path
-from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from .metadata import IluNixlAgentMetadata, IluNixlTransferRegion
 from .pp_utils import infer_pp_split
@@ -225,23 +225,51 @@ class IluNixlWorkerMixin:
         actual_to_virtual = self._actual_to_virtual_region_ids()
 
         layer_region_ids: dict[str, list[int]] = defaultdict(list)
-        for layer_name, cache_or_caches in xfer_buffers.items():
-            layer_spec = self._layer_specs.get(layer_name)
-            if layer_spec is None:
+        for layer_name, cache in xfer_buffers.items():
+            # Layers with no spec of their own share another layer's KV cache;
+            # upstream `register_kv_caches` skips them, so no region is emitted.
+            if self._layer_specs.get(layer_name) is None:
                 continue
-            if isinstance(layer_spec, UniformTypeKVCacheSpecs):
-                layer_spec = layer_spec.kv_cache_specs[layer_name]
-            cache_list = self.transfer_topo.get_transfer_cache_regions(
-                cache_or_caches, layer_spec
-            )
-            for cache in cache_list:
-                actual_region_id = base_addr_to_actual_region.get(cache.data_ptr())
-                if actual_region_id is None:
-                    continue
-                for region_id in actual_to_virtual[actual_region_id]:
-                    if region_id not in layer_region_ids[layer_name]:
-                        layer_region_ids[layer_name].append(region_id)
+            actual_region_id = base_addr_to_actual_region.get(cache.data_ptr())
+            if actual_region_id is None:
+                continue
+            for region_id in actual_to_virtual[actual_region_id]:
+                if region_id not in layer_region_ids[layer_name]:
+                    layer_region_ids[layer_name].append(region_id)
+        self._validate_layer_region_ids(
+            layer_region_ids, xfer_buffers, actual_to_virtual
+        )
         return dict(layer_region_ids)
+
+    def _validate_layer_region_ids(
+        self,
+        layer_region_ids: dict[str, list[int]],
+        xfer_buffers: dict[str, Any],
+        actual_to_virtual: dict[int, list[int]],
+    ) -> None:
+        missing = [
+            layer_name
+            for layer_name in xfer_buffers
+            if self._layer_specs.get(layer_name) is not None
+            and not layer_region_ids.get(layer_name)
+        ]
+        if missing:
+            raise RuntimeError(
+                "IluNixl failed to map layers onto registered NIXL regions. "
+                "Those layers would never be transferred. "
+                f"layers_without_region={missing}, "
+                f"num_regions={self.num_regions}"
+            )
+        num_virtual_regions = sum(len(ids) for ids in actual_to_virtual.values())
+        covered = {region_id for ids in layer_region_ids.values() for region_id in ids}
+        if len(covered) != num_virtual_regions:
+            logger.warning(
+                "IluNixl region mapping does not cover every registered NIXL "
+                "region: mapped=%d, expected=%d. Uncovered regions are excluded "
+                "from PP/HMA transfer metadata.",
+                len(covered),
+                num_virtual_regions,
+            )
 
     def _build_region_ids_by_group(
         self, layer_region_ids: dict[str, list[int]]

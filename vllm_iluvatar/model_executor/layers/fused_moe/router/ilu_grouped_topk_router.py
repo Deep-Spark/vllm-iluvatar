@@ -6,7 +6,8 @@ Corresponds to: vllm/model_executor/layers/fused_moe/router/grouped_topk_router.
 Target   : vllm.model_executor.layers.fused_moe.router.grouped_topk_router.grouped_topk
 Baseline : main_61ac3680210
 Why      : Iluvatar uses ixformer's grouped-topk kernel instead of community
-           CUDA/Torch grouped-topk paths.
+           CUDA/Torch grouped-topk paths. ixformer requires the noaux_tc
+           correction bias dtype to match the router logits dtype.
 How      : general patch rebinds the module-level ``grouped_topk`` function to
            this implementation. No community method body is copied.
 Scope    : grouped-topk MoE routing on Iluvatar.
@@ -36,6 +37,12 @@ def grouped_topk(
     )
 
     # [ILU override] grouped_topk - delta: route selection through ixformer.
+    if (
+        e_score_correction_bias is not None
+        and e_score_correction_bias.dtype != gating_output.dtype
+    ):
+        e_score_correction_bias = e_score_correction_bias.to(dtype=gating_output.dtype)
+
     topk_weights, topk_ids = _ixf_grouped_topk(
         gating_output,
         topk,

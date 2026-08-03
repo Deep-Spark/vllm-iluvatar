@@ -59,8 +59,9 @@ _OOT_OP_PACKAGES = [
 # so multi-file model packages must be listed explicitly.
 _OOT_MODEL_PACKAGES = [
     "vllm_iluvatar.model_executor.models",
-    "vllm_iluvatar.model_executor.models.deepseek_v4",
-    "vllm_iluvatar.model_executor.models.ilu_glm",
+    "vllm_iluvatar.models.deepseek_v32",
+    "vllm_iluvatar.models.deepseek_v4",
+    "vllm_iluvatar.models.glm_moe_dsa",
 ]
 
 __all__ = ["apply_oot_registrations"]

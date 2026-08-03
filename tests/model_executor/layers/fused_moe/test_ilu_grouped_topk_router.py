@@ -39,7 +39,7 @@ def test_grouped_topk_calls_ixformer_and_applies_routed_scale(monkeypatch):
         return raw_weights, raw_ids
 
     _install_fake_ixformer(monkeypatch, fake_grouped_topk)
-    gating_output = torch.tensor([[0.1, 0.2, 0.3, 0.4]], dtype=torch.float32)
+    gating_output = torch.tensor([[0.1, 0.2, 0.3, 0.4]], dtype=torch.bfloat16)
     bias = torch.ones(4, dtype=torch.float32)
 
     topk_weights, topk_ids = ilu_grouped_topk_router.grouped_topk(
@@ -56,12 +56,10 @@ def test_grouped_topk_calls_ixformer_and_applies_routed_scale(monkeypatch):
 
     torch.testing.assert_close(topk_weights, raw_weights * 3.0)
     assert topk_ids is raw_ids
-    assert calls == [
-        (
-            (gating_output, 2, 2, 1, "sigmoid", bias),
-            {"renormalize": True},
-        )
-    ]
+    args, kwargs = calls[0]
+    assert args[:5] == (gating_output, 2, 2, 1, "sigmoid")
+    assert args[5].dtype is torch.bfloat16
+    assert kwargs == {"renormalize": True}
 
 
 def test_grouped_topk_patch_rebinds_module_function_and_new_custom_op():

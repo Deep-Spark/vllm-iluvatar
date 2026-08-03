@@ -63,11 +63,6 @@ from vllm.models.deepseek_v4.compressor import (
 )
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend
-from vllm.v1.attention.backends.mla.ilu_indexer import (
-    IluDeepseekV4IndexerBackend,
-    IluDeepseekV32IndexerMetadata,
-    get_max_prefill_buffer_size,
-)
 from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadata,
 )
@@ -77,6 +72,11 @@ from vllm.v1.worker.workspace import current_workspace_manager
 from vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse import (
     IluDeepseekV4FlashMLASparseBackend,
     IluFlashMLASparseMetadata,
+)
+from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
+    IluDeepseekV4IndexerBackend,
+    IluDeepseekV32IndexerMetadata,
+    get_max_prefill_buffer_size,
 )
 from vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa import (
     IluDeepseekV4SWACache,
@@ -2045,7 +2045,7 @@ class IluDeepseekV4Indexer(nn.Module):
         # ixformer's stateless calls. The K-cache insertion is also
         # offloaded to ``self.compressor`` (which already writes the bf16
         # indexer cache), so the legacy ``ops.indexer_k_cache`` step from
-        # ``IluSparseAttnIndexer`` is intentionally dropped.
+        # ``SparseAttnIndexer`` is intentionally dropped.
 
     def forward(
         self,

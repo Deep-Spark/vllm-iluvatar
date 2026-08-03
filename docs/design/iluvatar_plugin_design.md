@@ -320,7 +320,7 @@ general patch 示范 copy / rebind 写法，均经 `general_patch` 脚手架 + `
 `register_general()` 在 `apply_general_patches()` 之后调用 `apply_oot_registrations()`，它按机制不同分两条独立路径自动发现：
 
 - **算子 / 量化 OOT**（`_register_ops`，本章 + 第 8 章）：`import` `_OOT_OP_PACKAGES`（当前包括 `model_executor.layers`、`layers.fused_moe`、`layers.fused_moe.router`、`layers.mamba.gdn`、`layers.rotary_embedding`、`layers.quantization`）下的每个模块，注册靠模块级装饰器副作用完成（`@<Base>.register_oot` / `@register_quantization_config`），**无钩子**。
-- **模型注册**（`_register_models`，第 6 章）：`import` `_OOT_MODEL_PACKAGES`（当前包括 `model_executor.models`、`models.deepseek_v4`、`models.ilu_glm`；多文件模型子包需显式登记，见 §6.5）下的模块后，调用其 `register_model()` 钩子。
+- **模型注册**（`_register_models`，第 6 章）：`import` `_OOT_MODEL_PACKAGES`（当前包括 `model_executor.models`、`models.deepseek_v4`、`models.glm_moe_dsa`；多文件模型子包需显式登记，见 §6.5）下的模块后，调用其 `register_model()` 钩子。
 
 ```text
 register_general
@@ -437,7 +437,7 @@ def check_and_update_config(cls, vllm_config) -> None:
 
 ### 6.6 其他已接入模型与新增指南
 
-除 qwen3（§6.4，覆盖社区已有架构）和 deepseek_v4（§6.5，全新 arch）外，当前还接入了以下模型：`hy_v3`、`qwen2_5_vl`、`qwen3_moe`、`qwen3_vl_moe`、`ilu_glm`。它们分别属于上述两类范式之一。
+除 qwen3（§6.4，覆盖社区已有架构）和 deepseek_v4（§6.5，全新 arch）外，当前还接入了以下模型：`hy_v3`、`qwen2_5_vl`、`qwen3_moe`、`qwen3_vl_moe`、`glm_moe_dsa`。它们分别属于上述两类范式之一。
 
 新增模型的具体步骤参见：
 

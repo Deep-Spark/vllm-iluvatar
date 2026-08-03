@@ -6,8 +6,6 @@ from __future__ import annotations
 import sys
 from types import ModuleType, SimpleNamespace
 
-import pytest
-
 from vllm_iluvatar.ilu_patch.general_patches import patch_core_client
 
 
@@ -36,11 +34,10 @@ def _setup_modules(monkeypatch, use_exact_inflight: bool):
         def __init__(self, engines, client_count=1, client_index=0):
             self.core_engines = engines
             self.client_count = client_count
-            self.eng_start_index = (
-                len(engines) * client_index
-            ) // client_count
+            self.eng_start_index = (len(engines) * client_index) // client_count
             self.reqs_in_flight: dict[str, bytes] = {}
-            self.lb_engines = [[0, 0] for _ in engines]
+            self.engine_inflight = {engine: 0 for engine in engines}
+            self.lb_engines = [[0, 0, 0.0] for _ in engines]
 
         def get_core_engine_for_request(self, request):
             raise NotImplementedError("should be patched")
@@ -55,18 +52,10 @@ def _setup_modules(monkeypatch, use_exact_inflight: bool):
     monkeypatch.setitem(sys.modules, "vllm", ModuleType("vllm"))
     monkeypatch.setitem(sys.modules, "vllm.envs", envs_module)
     monkeypatch.setitem(sys.modules, "vllm.v1", ModuleType("vllm.v1"))
-    monkeypatch.setitem(
-        sys.modules, "vllm.v1.engine", ModuleType("vllm.v1.engine")
-    )
-    monkeypatch.setitem(
-        sys.modules, "vllm.v1.engine.core_client", core_client_module
-    )
-    monkeypatch.setitem(
-        sys.modules, "vllm.v1.pool", ModuleType("vllm.v1.pool")
-    )
-    monkeypatch.setitem(
-        sys.modules, "vllm.v1.pool.late_interaction", pool_module
-    )
+    monkeypatch.setitem(sys.modules, "vllm.v1.engine", ModuleType("vllm.v1.engine"))
+    monkeypatch.setitem(sys.modules, "vllm.v1.engine.core_client", core_client_module)
+    monkeypatch.setitem(sys.modules, "vllm.v1.pool", ModuleType("vllm.v1.pool"))
+    monkeypatch.setitem(sys.modules, "vllm.v1.pool.late_interaction", pool_module)
 
     patch_core_client._apply()
     return FakeDPLBAsyncMPClient
@@ -82,6 +71,7 @@ class TestExactInflightLB:
 
         # Simulate engine 0 has 2 in-flight, engine 1 has 1, engine 2 has 0.
         client.reqs_in_flight = {"a": engines[0], "b": engines[0], "c": engines[1]}
+        client.engine_inflight = {engines[0]: 2, engines[1]: 1, engines[2]: 0}
 
         chosen = client.get_core_engine_for_request(_make_request("d"))
         assert chosen == engines[2], "should route to engine with 0 in-flight"
@@ -111,9 +101,9 @@ class TestCoordinatorLBWithTieBreaking:
         Cls = _setup_modules(monkeypatch, use_exact_inflight=False)
         engines = [b"\x00\x00", b"\x01\x00"]
         client = Cls(engines)
-        # Engine 0: waiting=5, running=1  -> score=21
-        # Engine 1: waiting=1, running=2  -> score=6
-        client.lb_engines = [[5, 1], [1, 2]]
+        # Engine 0: waiting=5, running=1, kv=0.0 -> score=6
+        # Engine 1: waiting=1, running=2, kv=0.0 -> score=3
+        client.lb_engines = [[5, 1, 0.0], [1, 2, 0.0]]
 
         chosen = client.get_core_engine_for_request(_make_request("a"))
         assert chosen == engines[1]
@@ -122,14 +112,14 @@ class TestCoordinatorLBWithTieBreaking:
         Cls = _setup_modules(monkeypatch, use_exact_inflight=False)
         engines = [b"\x00\x00", b"\x01\x00", b"\x02\x00"]
         client = Cls(engines)
-        client.lb_engines = [[0, 0], [0, 0], [0, 0]]
+        client.lb_engines = [[0, 0, 0.0], [0, 0, 0.0], [0, 0, 0.0]]
         start = client.eng_start_index
 
         client.get_core_engine_for_request(_make_request("a"))
         assert client.eng_start_index == (start + 1) % 3
 
         # Reset counts for next round.
-        client.lb_engines = [[0, 0], [0, 0], [0, 0]]
+        client.lb_engines = [[0, 0, 0.0], [0, 0, 0.0], [0, 0, 0.0]]
         client.get_core_engine_for_request(_make_request("b"))
         assert client.eng_start_index == (start + 2) % 3
 
@@ -137,7 +127,7 @@ class TestCoordinatorLBWithTieBreaking:
         Cls = _setup_modules(monkeypatch, use_exact_inflight=False)
         engines = [b"\x00\x00", b"\x01\x00"]
         client = Cls(engines, client_count=2)
-        client.lb_engines = [[0, 0], [0, 0]]
+        client.lb_engines = [[0, 0, 0.0], [0, 0, 0.0]]
 
         client.get_core_engine_for_request(_make_request("a"))
         # Chosen engine's waiting count should be incremented by client_count.

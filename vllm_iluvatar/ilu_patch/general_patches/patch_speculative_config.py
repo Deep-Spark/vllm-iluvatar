@@ -11,9 +11,10 @@ module only performs register-time wiring.
 
 Target   : vllm.config.speculative.SpeculativeConfig.hf_config_override
 Baseline : main_61ac3680210
-Why      : re-point the MTP draft architecture to the ilu W4A8 self-contained
-           MTP models (IluGlmMoeDsaMTPModel / IluDeepSeekV4MTPModel) for the ilu
-           target archs, without modifying community source.
+Why      : re-point the MTP draft architecture to the iluvatar self-contained
+           MTP models (DeepseekV32MTPModel / IluGlmMoeDsaMTPModel /
+           DeepSeekV4MTPModel) for iluvatar-routed target archs, without
+           modifying community source.
 How      : wrap the staticmethod with ``make_hf_config_override`` and setattr it
            back onto the class as a staticmethod.
 Scope    : SpeculativeConfig MTP draft-arch routing on Iluvatar.
@@ -45,7 +46,8 @@ def _apply() -> None:
 
     # Accessing the staticmethod on the class yields the underlying function.
     orig = SpeculativeConfig.hf_config_override
-    # [ILU override] hf_config_override - delta: route ilu target archs
-    # (IluGlmMoeDsaForCausalLM / IluDeepseekV4ForCausalLM) to their dedicated
-    # ilu MTP draft models after the community routing runs.
+    # [ILU override] hf_config_override - delta: route iluvatar target archs
+    # (DeepseekV32ForCausalLM / IluGlmMoeDsaForCausalLM /
+    # DeepseekV4ForCausalLM) to their dedicated MTP draft models after the
+    # community routing runs.
     SpeculativeConfig.hf_config_override = staticmethod(make_hf_config_override(orig))

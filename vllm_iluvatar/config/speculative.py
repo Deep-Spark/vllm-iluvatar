@@ -7,10 +7,10 @@ Corresponds to: vllm/config/speculative.py ::
 The community/public method maps ``glm_moe_dsa`` -> ``DeepSeekMTPModel`` and
 ``deepseek_v4`` -> ``DeepSeekV4MTPModel``. On Iluvatar the W4A8 forks of those
 models ship dedicated, self-contained MTP draft archs
-(``IluGlmMoeDsaMTPModel`` / ``IluDeepSeekV4MTPModel``); this wrapper re-points
-the draft architecture to them *after* the public routing runs, keyed on the
-target model's original architecture, so the community MTP path stays untouched
-for non-ilu models.
+(``IluGlmMoeDsaMTPModel`` / ``DeepSeekV4MTPModel`` /
+``DeepseekV32MTPModel``); this wrapper re-points the draft architecture to
+them *after* the public routing runs, keyed on the target model's original
+architecture, so the community MTP path stays untouched for non-ilu models.
 
 Baseline : main_61ac3680210
 """
@@ -26,8 +26,9 @@ if TYPE_CHECKING:
 
 # Target causal-LM arch -> ilu MTP draft arch.
 _ILU_MTP_ARCH_MAP = {
+    "DeepseekV32ForCausalLM": "DeepseekV32MTPModel",
     "IluGlmMoeDsaForCausalLM": "IluGlmMoeDsaMTPModel",
-    "IluDeepseekV4ForCausalLM": "IluDeepSeekV4MTPModel",
+    "DeepseekV4ForCausalLM": "DeepSeekV4MTPModel",
 }
 
 

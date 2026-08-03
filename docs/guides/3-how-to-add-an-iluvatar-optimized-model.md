@@ -1,14 +1,14 @@
 # 在 vllm-iluvatar 接入天数优化模型
 
-> **How-to 指南** · 新注册一个 `IluXXX` arch · 模型部分完全重写、尽量不走社区接口 · 以 GLM-5.2（`IluGlmMoeDsa`）为落地参考
+> **How-to 指南** · 通过 OOT registry 路由到 Iluvatar 实现 · 模型部分完全重写、尽量不走社区接口 · 以 GLM-5.2（`glm_moe_dsa`）为落地参考
 
-本文说明如何在 `vllm-iluvatar` 插件里接入一个**天数（Iluvatar）专有优化模型**。与"复用社区模型 + 逐类覆盖"不同，天数优化模型的思路是：**新注册一个 `IluXXX` 架构，把模型算法链完全重写在插件内**，运行时尽量走 `vllm-iluvatar` 自己的接口（ilu attention backend、`ixf_ops` marlin / W4A8 kernel、plugin-local opaque op），而非社区的通用封装。改动全部落在插件仓库内，社区 vLLM 源码保持零改动。
+本文说明如何在 `vllm-iluvatar` 插件里接入一个**天数（Iluvatar）专有优化模型**。与"复用社区模型 + 逐类覆盖"不同，天数优化模型的思路是：**通过 `ModelRegistry.register_model` 把目标架构路由到插件内的 Iluvatar 实现，并把模型算法链完全重写在插件内**，运行时尽量走 `vllm-iluvatar` 自己的接口（ilu attention backend、`ixf_ops` marlin / W4A8 kernel、plugin-local opaque op），而非社区的通用封装。改动全部落在插件仓库内，社区 vLLM 源码保持零改动。
 
 | | |
 | --- | --- |
 | **适用对象** | 需要做天数专有优化、且优化深入到 attention / 量化 / 投机解码算法链的模型 |
 | **改动范围** | 仅 `vllm-iluvatar` 插件仓库，不改上游 vLLM |
-| **参考实现** | GLM-5.2 `IluGlmMoeDsaForCausalLM`（MLA + DSA lightning indexer + fine-grained MoE，W4A8 混合量化，支持 MTP），布局对齐 `deepseek_v4` |
+| **参考实现** | GLM-5.2 `glm_moe_dsa` 包中的 `IluGlmMoeDsaForCausalLM`（MLA + DSA lightning indexer + fine-grained MoE，W4A8 混合量化，支持 MTP），布局对齐 `deepseek_v4` |
 
 ---
 
@@ -31,7 +31,7 @@
 
 天数优化模型的接入遵循三条硬性原则：
 
-1. **新注册 `IluXXX` arch，不覆盖社区模型**。天数模型是一个**新增**架构（如 `IluGlmMoeDsaForCausalLM`），通过 `ModelRegistry.register_model` 挂进注册表。社区 `deepseek_v2.py` 等源文件保持逐字节不变；checkpoint 的 `config.json::architectures` 指向 `IluXXX` 名字，加载时即解析到插件实现。
+1. **通过 registry 路由到插件实现，不改社区源码**。优先使用 checkpoint / 社区已经暴露的目标 arch（如 `DeepseekV4ForCausalLM`、`DeepseekV32ForCausalLM`）作为 registry key，指向插件内的 `Ilu...` 实现类；如果是社区没有的新增架构，也可以注册新的 `IluXXXForCausalLM`。社区 `deepseek_v2.py` 等源文件保持逐字节不变；checkpoint 的 `config.json::architectures` 指向 registry key，加载时即解析到插件实现。
 
 2. **模型算法链完全重写，尽量走插件接口**。运行路径走 `vllm-iluvatar` 内部接口，**不走社区**的 `MultiHeadLatentAttentionWrapper` / `MLAAttention` / `SparseMLAAttentionImpl` / `sparse_attn_indexer`。attention 的 rope、吸收 up-proj、sparse kernel、indexer top-k 全部由插件自行实现或经 `ixf_ops` / ilu backend 完成。只有**基础设施**（`*Linear` / `RMSNorm` / `get_rope` / ilu FlashMLA backend 的 metadata 与 cache）才复用。
 
@@ -40,17 +40,18 @@
    - **`ilu_patch`**：运行期 monkey-patch（带指纹 / 签名校验）；
    - **`ilu_register`**：官方 OOT 扩展点，即 `ModelRegistry.register_model` 与 `@register_quantization_config`（无指纹，因为它们是替换性的注册项，而非方法拷贝）。
 
-   接入一个新模型主要用到 `ilu_register`（模型 + 量化配置），外加少量 `ilu_patch.general_patches`（仅投机解码需要）。新增模型无需改 `ilu_register/__init__.py` 本身：把模型包加入 `_OOT_MODEL_PACKAGES`、并在包内暴露 `register_model()` 即可被自动发现。
+   接入一个新模型主要用到 `ilu_register`（模型 + 量化配置），外加少量 `ilu_patch.general_patches`（仅投机解码需要）。多文件模型包需要显式加入 `_OOT_MODEL_PACKAGES`，并在包内暴露 `register_model()`，这样 `apply_oot_registrations()` 才能自动发现并注册它。
 
 ---
 
 ## 2. 命名与目录约定
 
-- **arch 命名**：causal-LM 用 `IluXXXForCausalLM`，MTP draft 用 `IluXXXMTPModel`（`XXX` 为模型代号，如 `GlmMoeDsa`）。名字须与社区原 arch 明确区分，以保证"新增而非覆盖"。
-- **包布局**：每个天数模型是 `vllm_iluvatar/model_executor/models/ilu_xxx/` 下的一个**多文件包**，布局对齐 `deepseek_v4`：
+- **arch 命名**：registry key 使用"要让 checkpoint 命中的名字"。已有社区 arch 时优先复用社区名（如 `DeepseekV4ForCausalLM` → `IluDeepseekV4ForCausalLM`）；新增架构时再使用 `IluXXXForCausalLM`。MTP draft 同理，优先使用稳定的模型语义名（如 `DeepseekV32MTPModel`、`DeepSeekV4MTPModel`），不强制带 `Ilu`。
+- **包命名**：`vllm_iluvatar/models/` 下的包名按模型/架构语义命名，尽量对齐 HF `model_type` 或社区包名，例如 `deepseek_v32`、`deepseek_v4`、`glm_moe_dsa`；不要用 `ilu_` 前缀作为包名。
+- **包布局**：每个天数模型是 `vllm_iluvatar/models/<model_type>/` 下的一个**多文件包**，布局对齐 `deepseek_v4`：
 
   ```
-  vllm_iluvatar/model_executor/models/ilu_xxx/
+  vllm_iluvatar/models/<model_type>/
     __init__.py     # 包说明；模块由 ilu_register 自动 import
     model.py        # 模型图 + 权重加载 + register_model() 钩子
     attention.py    # 自包含 attention 算法链（含 plugin-local opaque op）
@@ -62,8 +63,9 @@
   ```python
   _OOT_MODEL_PACKAGES = [
       "vllm_iluvatar.model_executor.models",
-      "vllm_iluvatar.model_executor.models.deepseek_v4",
-      "vllm_iluvatar.model_executor.models.ilu_glm",   # <- 新模型包
+      "vllm_iluvatar.models.deepseek_v32",
+      "vllm_iluvatar.models.deepseek_v4",
+      "vllm_iluvatar.models.glm_moe_dsa",
   ]
   ```
 
@@ -82,14 +84,14 @@
 
 ### 3.1 权重转换（BF16/FP8 → W4A8 混合量化）
 
-天数优化通常伴随一次**离线权重转换**：把原始 checkpoint（BF16 或 FP8-block）重量化成天数专有的 W4A8 混合方案，并改写 `config.json` 把模型指向 `IluXXX` arch。
+天数优化通常伴随一次**离线权重转换**：把原始 checkpoint（BF16 或 FP8-block）重量化成天数专有的 W4A8 混合方案，并按需要改写 `config.json` 的 `architectures`，使其命中插件注册的 registry key。
 
 转换器产出三部分：
 
 1. **量化后的 safetensors**：按下表做混合量化。
 2. **重建的 `model.safetensors.index.json`**：按新 shard 的实际 dtype/shape 重新计算 `total_size` 与 `weight_map`。
 3. **改写的 `config.json`**：
-   - `architectures` 改为 `["IluXXXForCausalLM"]`；
+   - `architectures` 改为目标 registry key，例如 `["DeepseekV4ForCausalLM"]`、`["DeepseekV32ForCausalLM"]` 或新增的 `["IluXXXForCausalLM"]`；
    - 写入 `quantization_config`，其 `quant_method="ilu_deepseek_v4_w4a8"`（复用统一的混合量化 schema，见 [3.4](#34-moe-与混合量化)）。
 
 混合量化布局（以 GLM-5.2 为例）：
@@ -118,7 +120,7 @@
 
 ### 3.2 模型适配
 
-以 [`ilu_glm/model.py`](../../vllm_iluvatar/model_executor/models/ilu_glm/model.py) 为模板搭建模型图与权重加载：
+以 [`glm_moe_dsa/model.py`](../../vllm_iluvatar/models/glm_moe_dsa/model.py) 为模板搭建模型图与权重加载：
 
 - **类结构**：`IluXXXForCausalLM(nn.Module, SupportsPP)` → `IluXXXModel` → `IluXXXDecoderLayer` → `MoE` / `MLP`。顶层持有 `lm_head` / `logits_processor`，`model_cls` 指向内层 `Model`。
 - **`register_model()` 钩子**：在文件末尾注册 causal-LM 与 MTP 两个 arch，用**字符串路径惰性引用**类，把 attention / mtp 的重依赖延迟到模型真正加载时：
@@ -127,12 +129,12 @@
   def register_model() -> None:
       from vllm import ModelRegistry
       ModelRegistry.register_model(
-          "IluXXXForCausalLM",
-          "vllm_iluvatar.model_executor.models.ilu_xxx.model:IluXXXForCausalLM",
+          "<TargetArchForCausalLM>",
+          "vllm_iluvatar.models.<model_type>.model:IluXXXForCausalLM",
       )
       ModelRegistry.register_model(
-          "IluXXXMTPModel",
-          "vllm_iluvatar.model_executor.models.ilu_xxx.mtp:IluXXXMTP",
+          "<TargetMTPModel>",
+          "vllm_iluvatar.models.<model_type>.mtp:IluXXXMTP",
       )
   ```
 
@@ -142,7 +144,7 @@
 
 ### 3.3 attention 抽离
 
-这是天数优化的核心。以 [`ilu_glm/attention.py`](../../vllm_iluvatar/model_executor/models/ilu_glm/attention.py) 为模板，把整条 attention 算法链**自包含**在插件内，分三层（对齐 `deepseek_v4`）：
+这是天数优化的核心。以 [`glm_moe_dsa/attention.py`](../../vllm_iluvatar/models/glm_moe_dsa/attention.py) 为模板，把整条 attention 算法链**自包含**在插件内，分三层（对齐 `deepseek_v4`）：
 
 - **外层 `IluXXXMLAAttention`**（`nn.Module`）：持有投影（`fused_qkv_a_proj` / `q_b_proj` / `kv_b_proj` / `o_proj`）、norms、DSA indexer，等价于社区 `MultiHeadLatentAttentionWrapper.forward_opt` 的 pre/post 处理，但**不引入社区 wrapper**。
 - **内层 `IluXXXSparseMLA`**（`nn.Module, AttentionLayerBase`）：负责 `get_attn_backend` / `get_kv_cache_spec`，驱动 rope + 吸收 k-up + `concat_and_cache_mla` + FlashMLA sparse kernel + v-up。吸收的 up-proj 是 grouped W8A16 marlin：k-up / v-up 直接读 `kv_b_proj.W_UK` / `W_UV`（加载期由量化 method 拆好并 repack）并调 `ixf_ops.marlin_w8a16`。它注册为 `AttentionLayerBase`，由 runner 为其分配 paged KV cache 并按 `prefix` 建 metadata。
@@ -206,7 +208,7 @@ direct_register_custom_op(
 
 **（3）MTP —— 多 token 投机解码（可叠加 cuda-graph）**
 
-新增 [`ilu_glm/mtp.py`](../../vllm_iluvatar/model_executor/models/ilu_glm/mtp.py)，实现 `IluXXXMTP`（标准 DeepSeek-V3.2 MTP 布局：`enorm` / `hnorm` + 融合 `eh_proj` + `shared_head` + 一个 `mtp_block` 解码层）。要点：
+新增 [`glm_moe_dsa/mtp.py`](../../vllm_iluvatar/models/glm_moe_dsa/mtp.py)，实现 `IluXXXMTP`（标准 DeepSeek-V3.2 MTP 布局：`enorm` / `hnorm` + 融合 `eh_proj` + `shared_head` + 一个 `mtp_block` 解码层）。要点：
 
 - **`mtp_block` 复用 target 的 ilu 解码层**（`IluXXXDecoderLayer`），使 draft 与 target 共享同一套 ilu attention / W8A16 `kv_b_proj` / DSA kernel，不引入社区 `DeepseekV2DecoderLayer`。
 - `eh_proj` 用 `ReplicatedLinear` 并绑 `quant_config`（离线转换把它量化成 INT8 W8A8）。
@@ -215,8 +217,8 @@ direct_register_custom_op(
 
 MTP 还需两个 `ilu_patch.general_patches`（各暴露 `register()`，由 `apply_general_patches` 在 `register_general` 期自动发现）：
 
-- [`patch_speculative_config.py`](../../vllm_iluvatar/ilu_patch/general_patches/patch_speculative_config.py)：包装社区 `SpeculativeConfig.hf_config_override`，在社区路由跑完后，把 ilu target arch 的 MTP draft arch 重定向到 `IluXXXMTPModel`（实现见 [`config/speculative.py`](../../vllm_iluvatar/config/speculative.py) 的 `_ILU_MTP_ARCH_MAP`）。
-- [`patch_llm_base_proposer.py`](../../vllm_iluvatar/ilu_patch/general_patches/patch_llm_base_proposer.py)：包装 `SpecDecodeBaseProposer.model_returns_tuple`，让 proposer 识别 `IluXXXMTPModel` 的 `(logit_hidden, recycle_hidden)` tuple 返回契约（实现见 [`v1/spec_decode/llm_base_proposer.py`](../../vllm_iluvatar/v1/spec_decode/llm_base_proposer.py)）。
+- [`patch_speculative_config.py`](../../vllm_iluvatar/ilu_patch/general_patches/patch_speculative_config.py)：包装社区 `SpeculativeConfig.hf_config_override`，在社区路由跑完后，把 target arch 的 MTP draft arch 重定向到插件专用 draft arch（实现见 [`config/speculative.py`](../../vllm_iluvatar/config/speculative.py) 的 `_ILU_MTP_ARCH_MAP`，例如 `DeepseekV32MTPModel`、`DeepSeekV4MTPModel`、`IluGlmMoeDsaMTPModel`）。
+- [`patch_llm_base_proposer.py`](../../vllm_iluvatar/ilu_patch/general_patches/patch_llm_base_proposer.py)：包装 `SpecDecodeBaseProposer.model_returns_tuple`，让 proposer 识别插件 draft arch 的 `(logit_hidden, recycle_hidden)` tuple 返回契约（实现见 [`v1/spec_decode/llm_base_proposer.py`](../../vllm_iluvatar/v1/spec_decode/llm_base_proposer.py)）。
 
 启动约束（以通用形式给出，具体拓扑按部署环境调整）：
 
@@ -245,9 +247,9 @@ MTP 还需两个 `ilu_patch.general_patches`（各暴露 `register()`，由 `app
 | 作用 | 文件 |
 | --- | --- |
 | OOT 注册入口（登记模型包） | [`vllm_iluvatar/ilu_register/__init__.py`](../../vllm_iluvatar/ilu_register/__init__.py) |
-| 模型图 + 权重加载 + `register_model()` | [`vllm_iluvatar/model_executor/models/ilu_glm/model.py`](../../vllm_iluvatar/model_executor/models/ilu_glm/model.py) |
-| 自包含 attention 链 + plugin-local opaque op | [`vllm_iluvatar/model_executor/models/ilu_glm/attention.py`](../../vllm_iluvatar/model_executor/models/ilu_glm/attention.py) |
-| MTP draft 模型 | [`vllm_iluvatar/model_executor/models/ilu_glm/mtp.py`](../../vllm_iluvatar/model_executor/models/ilu_glm/mtp.py) |
+| 模型图 + 权重加载 + `register_model()` | [`vllm_iluvatar/models/glm_moe_dsa/model.py`](../../vllm_iluvatar/models/glm_moe_dsa/model.py) |
+| 自包含 attention 链 + plugin-local opaque op | [`vllm_iluvatar/models/glm_moe_dsa/attention.py`](../../vllm_iluvatar/models/glm_moe_dsa/attention.py) |
+| MTP draft 模型 | [`vllm_iluvatar/models/glm_moe_dsa/mtp.py`](../../vllm_iluvatar/models/glm_moe_dsa/mtp.py) |
 | 混合量化 config（W4A8/W8A8/W8A16 分发） | [`vllm_iluvatar/model_executor/layers/quantization/ilu_deepseek_v4_w4a8.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_deepseek_v4_w4a8.py) |
 | MTP draft-arch 重定向实现 | [`vllm_iluvatar/config/speculative.py`](../../vllm_iluvatar/config/speculative.py) |
 | MTP tuple 返回契约实现 | [`vllm_iluvatar/v1/spec_decode/llm_base_proposer.py`](../../vllm_iluvatar/v1/spec_decode/llm_base_proposer.py) |
@@ -255,8 +257,8 @@ MTP 还需两个 `ilu_patch.general_patches`（各暴露 `register()`，由 `app
 
 ### 步骤速览
 
-1. **权重转换**：混合量化产出 safetensors + 重建 index + 改写 `config.json`（`architectures` → `IluXXXForCausalLM`，`quant_method` → `ilu_deepseek_v4_w4a8`）。
-2. **模型适配**：按 `model.py` 模板搭 `IluXXXForCausalLM`，实现融合参数映射与严格 reverse 校验，`register_model()` 注册 causal-LM + MTP，并把包加入 `_OOT_MODEL_PACKAGES`。
+1. **权重转换**：混合量化产出 safetensors + 重建 index + 按需改写 `config.json`（`architectures` → 目标 registry key，`quant_method` → `ilu_deepseek_v4_w4a8`）。
+2. **模型适配**：按 `model.py` 模板搭 Iluvatar 实现类（通常命名为 `IluXXXForCausalLM`），实现融合参数映射与严格 reverse 校验，`register_model()` 注册 causal-LM + MTP，并把包加入 `_OOT_MODEL_PACKAGES`。
 3. **attention 抽离**：三层自包含 attention，数据依赖控制流用 `direct_register_custom_op` 封成 plugin-local opaque op（独立算子名、padding 行保护）。
 4. **MoE / 量化**：复用 `ilu_deepseek_v4_w4a8`，`kv_b_proj` 走 `_IluGlmKVBProjW8A16Method` 拆 `W_UK/W_UV`，grouped-BMM method 的 `apply` 抛 `NotImplementedError`。
 5. **三种模式**：先 eager 打基线；再用 `--compilation-config` 开 `FULL_DECODE_ONLY` cuda-graph；最后加 `mtp.py` + 两个 general patch 开 MTP（注意 `draft_pipeline_parallel_size: 1` 与 PP 首层须为 full 层）。

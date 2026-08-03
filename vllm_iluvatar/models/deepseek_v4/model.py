@@ -133,6 +133,81 @@ elif _DS4_MHC_PRE_VERSION == "v3":
     )
 
 
+# attn_norm / ffn_norm folded into the mhc_pre epilogue (ds4_mhc_pre_v2
+# need_rms). On by default for every step the kernel supports;
+# IXFORMER_DS4_HC_PRE_NORM_FUSION=0 opts out for A/B against the standalone
+# rms_norm call.
+_DS4_HC_PRE_NORM_FUSION = os.environ.get("IXFORMER_DS4_HC_PRE_NORM_FUSION", "1") == "1"
+
+
+def _hc_pre_norm_fusion_available() -> bool:
+    """Static half of the hc_pre + RMSNorm fusion decision.
+
+    Only ds4_mhc_pre_v2 implements the fusion, and the env var above opts out.
+    Whether a given *step* fuses additionally depends on the layer geometry and
+    the token count, which is ixformer's ``enable_hc_pre_norm_fusion``.
+    """
+    return _DS4_HC_PRE_NORM_FUSION and _DS4_MHC_PRE_VERSION == "v2"
+
+
+class _HcPreNormFusion:
+    """Per-step state for folding attn_norm / ffn_norm into the mhc_pre epilogue.
+
+    Owns the two things every fused call needs:
+
+    * The per-step verdict. ``need_rms=True`` routes ds4_mhc_pre_v2 into its
+      single-launch GEMV + epilogue kernel, which is only built for small token
+      counts, so decode steps fuse while a large prefill step falls back to the
+      standalone rms_norm. ixformer holds the exact condition; this class only
+      caches the layer geometry to feed it once per forward.
+    * A zeroed uint32 sync flag per call. The epilogue blocks spin on that
+      counter until the GEMV blocks bump it, and it is left non-zero on return,
+      so a flag cannot be reused before it is zeroed again. One buffer covering
+      the whole step (two calls per decoder layer) is zeroed up front instead of
+      allocating + zeroing one flag per call.
+    """
+
+    def __init__(
+        self,
+        num_layers: int,
+        n_hc: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        device: str | torch.device,
+    ) -> None:
+        self._flags = torch.zeros(2 * num_layers, dtype=torch.int32, device=device)
+        self._n_hc = n_hc
+        self._hidden_size = hidden_size
+        self._dtype = dtype
+        self._next = 0
+        self.enabled = False
+
+    def begin_step(self, num_tokens: int) -> None:
+        """Decide whether this step fuses and, if so, refresh the sync flags."""
+        self.enabled = ixfops.enable_hc_pre_norm_fusion(
+            num_tokens=num_tokens,
+            n_hc=self._n_hc,
+            hidden_size=self._hidden_size,
+            dtype=self._dtype,
+        )
+        if self.enabled:
+            self._flags.zero_()
+            self._next = 0
+
+    def acquire(self) -> torch.Tensor | None:
+        """Next zeroed flag, or None to let ixformer allocate a private one."""
+        if self._next >= self._flags.numel():
+            logger.warning_once(
+                "DeepSeek-V4 hc_pre: ran out of pre-zeroed RMSNorm fusion sync "
+                "flags (pool size %d); falling back to per-call allocation.",
+                self._flags.numel(),
+            )
+            return None
+        flag = self._flags[self._next : self._next + 1]
+        self._next += 1
+        return flag
+
+
 # ---------------------------------------------------------------------------
 # Inlined helpers (originally in vllm.model_executor.models.deepseek_v4).
 # ---------------------------------------------------------------------------
@@ -522,6 +597,7 @@ class IluDeepseekV4DecoderLayer(nn.Module):
         prefix: str,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream] | None = None,
+        hc_pre_fusion: _HcPreNormFusion | None = None,
     ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -571,6 +647,26 @@ class IluDeepseekV4DecoderLayer(nn.Module):
             torch.empty(3, dtype=torch.float32), requires_grad=False
         )
 
+        # The fused epilogue always scales by a full-width weight, so it can
+        # only stand in for a plain weighted RMSNorm over the whole hidden_size.
+        # The target model hands its fusion state down to all of its layers and
+        # opens the step once; the MTP draft builds a bare decoder layer
+        # (mtp.py), which falls back to private state it opens itself.
+        self.hc_pre_fusion = None
+        self.owns_hc_pre_fusion = False
+        if _hc_pre_norm_fusion_available() and all(
+            norm.has_weight and norm.variance_size_override is None
+            for norm in (self.attn_norm, self.ffn_norm)
+        ):
+            self.owns_hc_pre_fusion = hc_pre_fusion is None
+            self.hc_pre_fusion = hc_pre_fusion or _HcPreNormFusion(
+                num_layers=1,
+                n_hc=self.hc_mult,
+                hidden_size=self.hidden_size,
+                dtype=vllm_config.model_config.dtype,
+                device=current_platform.device_type,
+            )
+
     def hc_pre(
         self,
         x: torch.Tensor,
@@ -597,6 +693,43 @@ class IluDeepseekV4DecoderLayer(nn.Module):
         )
         return layer_input, post_mix, comb_mix
 
+    def hc_pre_norm(
+        self,
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm: RMSNorm,
+    ):
+        """hc_pre followed by the sublayer ``norm``, fused where supported.
+
+        ds4_mhc_pre_v2 can normalize ``layer_input`` while it is still in
+        registers after the weighted sum (``need_rms=True``), which saves a
+        (T, hidden_size) global-memory round-trip vs. calling ``norm`` on the
+        kernel's output. Whether this step qualifies was settled by
+        ``_HcPreNormFusion.begin_step``.
+        """
+        if self.hc_pre_fusion is not None and self.hc_pre_fusion.enabled:
+            post_mix, comb_mix, layer_input = ixfops.ds4_mhc_pre_v2(
+                residual=x,
+                fn=hc_fn,
+                hc_scale=hc_scale,
+                hc_base=hc_base,
+                rms_eps=self.rms_norm_eps,
+                hc_pre_eps=self.hc_eps,
+                hc_sinkhorn_eps=self.hc_eps,
+                hc_post_mult_value=self.hc_post_alpha,
+                sinkhorn_repeat=self.hc_sinkhorn_iters,
+                workspace=self.hc_pre_fusion.acquire(),
+                need_rms=True,
+                rms_weight=norm.weight.data,
+                layer_rms_eps=norm.variance_epsilon,
+            )
+            return layer_input, post_mix, comb_mix
+
+        layer_input, post_mix, comb_mix = self.hc_pre(x, hc_fn, hc_scale, hc_base)
+        return norm(layer_input), post_mix, comb_mix
+
     def hc_post(
         self,
         x: torch.Tensor,
@@ -622,25 +755,28 @@ class IluDeepseekV4DecoderLayer(nn.Module):
             if self.hc_ffn_fn.dtype != x.dtype:
                 self.hc_ffn_fn.data = self.hc_ffn_fn.data.to(x.dtype)
 
+        if self.owns_hc_pre_fusion:
+            self.hc_pre_fusion.begin_step(x.shape[0])
+
         residual = x
-        x, post, comb = self.hc_pre(
+        x, post, comb = self.hc_pre_norm(
             x,
             self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
+            self.attn_norm,
         )
-        x = self.attn_norm(x)
         x = self.attn(positions, x, None)
         x = self.hc_post(x, residual, post, comb)
 
         residual = x
-        x, post, comb = self.hc_pre(
+        x, post, comb = self.hc_pre_norm(
             x,
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
+            self.ffn_norm,
         )
-        x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
         x = self.hc_post(x, residual, post, comb)
         return x
@@ -683,6 +819,26 @@ class IluDeepseekV4Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        # Shared hc_pre + RMSNorm fusion state: one sync flag per fused call
+        # (every decoder layer makes two, attn + ffn), refreshed once per
+        # forward in forward() below for the steps that qualify.
+        self.hc_pre_fusion = (
+            _HcPreNormFusion(
+                num_layers=config.num_hidden_layers,
+                n_hc=self.hc_mult,
+                hidden_size=config.hidden_size,
+                dtype=vllm_config.model_config.dtype,
+                device=self.device,
+            )
+            if _hc_pre_norm_fusion_available()
+            else None
+        )
+        if self.hc_pre_fusion is not None:
+            logger.info(
+                "DeepSeek-V4 hc_pre: attn_norm / ffn_norm folded into the "
+                "ds4_mhc_pre_v2 epilogue on steps ixformer supports it"
+            )
+
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: IluDeepseekV4DecoderLayer(
@@ -690,6 +846,7 @@ class IluDeepseekV4Model(nn.Module):
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
                 aux_stream_dict=self.aux_stream_dict,
+                hc_pre_fusion=self.hc_pre_fusion,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -762,6 +919,9 @@ class IluDeepseekV4Model(nn.Module):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
+
+        if self.hc_pre_fusion is not None:
+            self.hc_pre_fusion.begin_step(hidden_states.shape[0])
 
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states = layer(hidden_states, positions, input_ids)

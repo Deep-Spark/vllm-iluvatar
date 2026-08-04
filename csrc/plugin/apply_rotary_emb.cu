@@ -18,66 +18,18 @@
 #include <algorithm>
 
 #include "ops.h"
+#include "utils.cuh"
 
 namespace vllm_iluvatar {
 namespace {
-
-// --- minimal, self-contained type helpers (mirror ixformer TypeTraits) -------
-template <typename T, int PACK_NUM>
-struct RopeVec {};
-template <>
-struct RopeVec<float, 1> {
-  using type = float;
-};
-template <>
-struct RopeVec<float, 2> {
-  using type = float2;
-};
-template <>
-struct RopeVec<half, 1> {
-  using type = half;
-};
-template <>
-struct RopeVec<half, 2> {
-  using type = half2;
-};
-template <>
-struct RopeVec<__nv_bfloat16, 1> {
-  using type = __nv_bfloat16;
-};
-template <>
-struct RopeVec<__nv_bfloat16, 2> {
-  using type = __nv_bfloat162;
-};
-
-__device__ __forceinline__ float rope_to_float(float x) { return x; }
-__device__ __forceinline__ float rope_to_float(half x) { return __half2float(x); }
-__device__ __forceinline__ float rope_to_float(__nv_bfloat16 x) {
-  return __bfloat162float(x);
-}
-
-template <typename T>
-__device__ __forceinline__ T rope_from_float(float x);
-template <>
-__device__ __forceinline__ float rope_from_float<float>(float x) {
-  return x;
-}
-template <>
-__device__ __forceinline__ half rope_from_float<half>(float x) {
-  return __float2half_rn(x);
-}
-template <>
-__device__ __forceinline__ __nv_bfloat16 rope_from_float<__nv_bfloat16>(float x) {
-  return __float2bfloat16_rn(x);
-}
 
 template <typename scalar_t, typename cache_t, bool IS_NEOX, int PACK_NUM>
 __device__ __forceinline__ void apply_token_rotary_embedding(
     scalar_t* __restrict__ arr, const cache_t* __restrict__ cos_ptr,
     const cache_t* __restrict__ sin_ptr, int rot_offset, int embed_dim,
     bool inverse) {
-  using vtype = typename RopeVec<scalar_t, PACK_NUM>::type;
-  using ctype = typename RopeVec<cache_t, PACK_NUM>::type;
+  using vtype = typename TypeTraits<scalar_t, PACK_NUM>::type;
+  using ctype = typename TypeTraits<cache_t, PACK_NUM>::type;
 
   if constexpr (IS_NEOX) {
     const int x_index = rot_offset;
@@ -89,15 +41,15 @@ __device__ __forceinline__ void apply_token_rotary_embedding(
     vtype x_result, y_result;
 #pragma unroll
     for (int i = 0; i < PACK_NUM; i++) {
-      const float x_f = rope_to_float(reinterpret_cast<scalar_t*>(&x)[i]);
-      const float y_f = rope_to_float(reinterpret_cast<scalar_t*>(&y)[i]);
-      const float cos_f = rope_to_float(reinterpret_cast<cache_t*>(&cos)[i]);
-      float sin_f = rope_to_float(reinterpret_cast<cache_t*>(&sin)[i]);
+      const float x_f = to_float(reinterpret_cast<scalar_t*>(&x)[i]);
+      const float y_f = to_float(reinterpret_cast<scalar_t*>(&y)[i]);
+      const float cos_f = to_float(reinterpret_cast<cache_t*>(&cos)[i]);
+      float sin_f = to_float(reinterpret_cast<cache_t*>(&sin)[i]);
       if (inverse) sin_f = -sin_f;
       reinterpret_cast<scalar_t*>(&x_result)[i] =
-          rope_from_float<scalar_t>(x_f * cos_f - y_f * sin_f);
+          from_float<scalar_t>(x_f * cos_f - y_f * sin_f);
       reinterpret_cast<scalar_t*>(&y_result)[i] =
-          rope_from_float<scalar_t>(y_f * cos_f + x_f * sin_f);
+          from_float<scalar_t>(y_f * cos_f + x_f * sin_f);
     }
     reinterpret_cast<vtype*>(arr + x_index)[0] = x_result;
     reinterpret_cast<vtype*>(arr + y_index)[0] = y_result;
@@ -111,37 +63,37 @@ __device__ __forceinline__ void apply_token_rotary_embedding(
     vtype xy2 = reinterpret_cast<const vtype*>(arr + index2)[0];
     vtype r1, r2;
     if constexpr (PACK_NUM == 2) {
-      float x_f = rope_to_float(reinterpret_cast<scalar_t*>(&xy1)[0]);
-      float y_f = rope_to_float(reinterpret_cast<scalar_t*>(&xy1)[1]);
-      float cos_f = rope_to_float(reinterpret_cast<cache_t*>(&cos)[0]);
-      float sin_f = rope_to_float(reinterpret_cast<cache_t*>(&sin)[0]);
+      float x_f = to_float(reinterpret_cast<scalar_t*>(&xy1)[0]);
+      float y_f = to_float(reinterpret_cast<scalar_t*>(&xy1)[1]);
+      float cos_f = to_float(reinterpret_cast<cache_t*>(&cos)[0]);
+      float sin_f = to_float(reinterpret_cast<cache_t*>(&sin)[0]);
       if (inverse) sin_f = -sin_f;
       reinterpret_cast<scalar_t*>(&r1)[0] =
-          rope_from_float<scalar_t>(x_f * cos_f - y_f * sin_f);
+          from_float<scalar_t>(x_f * cos_f - y_f * sin_f);
       reinterpret_cast<scalar_t*>(&r1)[1] =
-          rope_from_float<scalar_t>(y_f * cos_f + x_f * sin_f);
+          from_float<scalar_t>(y_f * cos_f + x_f * sin_f);
       reinterpret_cast<vtype*>(arr + index1)[0] = r1;
 
-      x_f = rope_to_float(reinterpret_cast<scalar_t*>(&xy2)[0]);
-      y_f = rope_to_float(reinterpret_cast<scalar_t*>(&xy2)[1]);
-      cos_f = rope_to_float(reinterpret_cast<cache_t*>(&cos)[1]);
-      sin_f = rope_to_float(reinterpret_cast<cache_t*>(&sin)[1]);
+      x_f = to_float(reinterpret_cast<scalar_t*>(&xy2)[0]);
+      y_f = to_float(reinterpret_cast<scalar_t*>(&xy2)[1]);
+      cos_f = to_float(reinterpret_cast<cache_t*>(&cos)[1]);
+      sin_f = to_float(reinterpret_cast<cache_t*>(&sin)[1]);
       if (inverse) sin_f = -sin_f;
       reinterpret_cast<scalar_t*>(&r2)[0] =
-          rope_from_float<scalar_t>(x_f * cos_f - y_f * sin_f);
+          from_float<scalar_t>(x_f * cos_f - y_f * sin_f);
       reinterpret_cast<scalar_t*>(&r2)[1] =
-          rope_from_float<scalar_t>(y_f * cos_f + x_f * sin_f);
+          from_float<scalar_t>(y_f * cos_f + x_f * sin_f);
       reinterpret_cast<vtype*>(arr + index2)[0] = r2;
     } else {
-      const float x_f = rope_to_float(reinterpret_cast<scalar_t*>(&xy1)[0]);
-      const float y_f = rope_to_float(reinterpret_cast<scalar_t*>(&xy2)[0]);
-      const float cos_f = rope_to_float(reinterpret_cast<cache_t*>(&cos)[0]);
-      float sin_f = rope_to_float(reinterpret_cast<cache_t*>(&sin)[0]);
+      const float x_f = to_float(reinterpret_cast<scalar_t*>(&xy1)[0]);
+      const float y_f = to_float(reinterpret_cast<scalar_t*>(&xy2)[0]);
+      const float cos_f = to_float(reinterpret_cast<cache_t*>(&cos)[0]);
+      float sin_f = to_float(reinterpret_cast<cache_t*>(&sin)[0]);
       if (inverse) sin_f = -sin_f;
       reinterpret_cast<scalar_t*>(&r1)[0] =
-          rope_from_float<scalar_t>(x_f * cos_f - y_f * sin_f);
+          from_float<scalar_t>(x_f * cos_f - y_f * sin_f);
       reinterpret_cast<scalar_t*>(&r2)[0] =
-          rope_from_float<scalar_t>(y_f * cos_f + x_f * sin_f);
+          from_float<scalar_t>(y_f * cos_f + x_f * sin_f);
       reinterpret_cast<vtype*>(arr + index1)[0] = r1;
       reinterpret_cast<vtype*>(arr + index2)[0] = r2;
     }

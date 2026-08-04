@@ -1011,11 +1011,10 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 swa_metadata.block_size,
             )
         else:
-            swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
             ixfops.ds4_fused_qnorm_rope_kv_insert(
                 q,
                 kv,
-                swa_kv_cache_2d,
+                swa_kv_cache,
                 swa_metadata.slot_mapping,
                 positions,
                 self.rotary_emb.cos_sin_cache,

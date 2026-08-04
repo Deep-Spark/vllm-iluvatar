@@ -89,44 +89,6 @@ def _get_k_int8_cache_views(
     return i8_key_cache, value_cache
 
 
-def _reshape_and_cache_k_int8(
-    key: torch.Tensor,
-    value: torch.Tensor,
-    key_scale: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    key_scale_cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-) -> None:
-    """Write KINT8 cache entries for contiguous or block-strided caches."""
-    if key_cache.is_contiguous() and value_cache.is_contiguous():
-        ixf_ops.reshape_and_cache_flash_mix(
-            key=key,
-            value=value,
-            k_scale=key_scale,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            key_scale_cache=key_scale_cache,
-            slot_mapping=slot_mapping,
-            kv_cache_dtype="",
-        )
-        return
-
-    # The current ixformer mixed-cache writer requires contiguous caches.
-    # Hybrid Attention + Mamba deliberately adds a gap between cache blocks,
-    # so use stride-aware indexed writes for prefill. Decode cache updates are
-    # handled by vllm_paged_attention_mix, which supports strided caches.
-    valid_token_indices = torch.where(slot_mapping >= 0)[0]
-    valid_slots = slot_mapping[valid_token_indices]
-    block_size = key_cache.shape[2]
-    block_indices = torch.div(valid_slots, block_size, rounding_mode="floor")
-    block_offsets = valid_slots % block_size
-
-    key_cache[block_indices, :, block_offsets, :] = key[valid_token_indices]
-    value_cache[block_indices, :, block_offsets, :] = value[valid_token_indices]
-    key_scale_cache[block_indices, :, block_offsets] = key_scale[valid_token_indices]
-
-
 def get_flash_attn_version(
     requires_alibi: bool = False,
     head_size: int | None = None,
@@ -1095,15 +1057,14 @@ class IluFlashAttentionImpl(AttentionImpl):
             and value is not None
             and attn_metadata.num_prefills > 0
         ):
-            ixf_ops.reshape_and_cache_flash_int8(
-                key=i8_key,
-                value=i8_value,
-                k_scale=key_scale,
-                key_cache=i8_key_cache,
-                value_cache=i8_value_cache,
-                key_scale_cache=key_scale_cache,
-                slot_mapping=attn_metadata.slot_mapping,
-                kv_cache_dtype="",
+            torch.ops._C.reshape_and_cache_with_scale(
+                i8_key,
+                i8_value,
+                key_scale,
+                i8_key_cache,
+                i8_value_cache,
+                key_scale_cache,
+                attn_metadata.slot_mapping,
             )
 
         if attn_metadata.num_prefills > 0 and attn_metadata.prefill is not None:
@@ -1204,7 +1165,6 @@ class IluFlashAttentionImpl(AttentionImpl):
         decode_output = output[:num_decode_tokens]
 
         i8_key_cache, value_cache = _get_k_int8_cache_views(kv_cache, query.dtype)
-        num_blocks, num_kv_heads, block_size, head_size = i8_key_cache.shape
         key_scale_cache = kv_scale_cache[0]
 
         int8_query, query_scale = ixf_ops.scaled_int8_quant_for_attn(
@@ -1220,14 +1180,14 @@ class IluFlashAttentionImpl(AttentionImpl):
             and value is not None
             and attn_metadata.num_prefills > 0
         ):
-            _reshape_and_cache_k_int8(
-                key=i8_key,
-                value=value,
-                key_scale=key_scale,
-                key_cache=i8_key_cache,
-                value_cache=value_cache,
-                key_scale_cache=key_scale_cache,
-                slot_mapping=attn_metadata.slot_mapping,
+            torch.ops._C.reshape_and_cache_mix(
+                i8_key,
+                value,
+                key_scale,
+                i8_key_cache,
+                value_cache,
+                key_scale_cache,
+                attn_metadata.slot_mapping,
             )
 
         if attn_metadata.num_prefills > 0 and attn_metadata.prefill is not None:

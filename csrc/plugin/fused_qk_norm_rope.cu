@@ -15,6 +15,7 @@
 #include <tuple>
 
 #include "ops.h"
+#include "utils.cuh"
 
 namespace vllm_iluvatar {
 namespace {
@@ -22,62 +23,16 @@ namespace {
 constexpr int kWarpSize = 64;
 constexpr int kMaxWarpsPerBlock = 16;
 
-__device__ __forceinline__ float to_float(half x) {
-  return __half2float(x);
-}
-
-__device__ __forceinline__ float to_float(__nv_bfloat16 x) {
-  return __bfloat162float(x);
-}
-
-__device__ __forceinline__ float to_float(float x) { return x; }
-
-template <typename T>
-__device__ __forceinline__ T from_float(float x);
-
-template <>
-__device__ __forceinline__ half from_float<half>(float x) {
-  return __float2half_rn(x);
-}
-
-template <>
-__device__ __forceinline__ __nv_bfloat16 from_float<__nv_bfloat16>(float x) {
-  return __float2bfloat16_rn(x);
-}
-
-template <>
-__device__ __forceinline__ float from_float<float>(float x) {
-  return x;
-}
-
-template <typename T>
-struct PackedType;
-
-template <>
-struct PackedType<float> {
-  using type = float2;
-};
-
-template <>
-struct PackedType<half> {
-  using type = half2;
-};
-
-template <>
-struct PackedType<__nv_bfloat16> {
-  using type = __nv_bfloat162;
-};
-
 template <typename T>
 __device__ __forceinline__ float2 packed_to_float2(
-    typename PackedType<T>::type packed) {
+    typename TypeTraits<T, 2>::type packed) {
   return make_float2(to_float(packed.x), to_float(packed.y));
 }
 
 template <typename T>
-__device__ __forceinline__ typename PackedType<T>::type float2_to_packed(
+__device__ __forceinline__ typename TypeTraits<T, 2>::type float2_to_packed(
     float2 value) {
-  using packed_t = typename PackedType<T>::type;
+  using packed_t = typename TypeTraits<T, 2>::type;
   packed_t packed;
   packed.x = from_float<T>(value.x);
   packed.y = from_float<T>(value.y);
@@ -118,8 +73,8 @@ __global__ void fused_qk_rmsnorm_rope_gate_kernel(
              : k_out + (static_cast<int64_t>(token) * num_kv_heads +
                         local_head) *
                            HEAD_DIM;
-    using scalar_pack_t = typename PackedType<scalar_t>::type;
-    using cache_pack_t = typename PackedType<cache_t>::type;
+    using scalar_pack_t = typename TypeTraits<scalar_t, 2>::type;
+    using cache_pack_t = typename TypeTraits<cache_t, 2>::type;
     const scalar_pack_t* packed_row =
         reinterpret_cast<const scalar_pack_t*>(row);
     const scalar_pack_t* packed_weight =
@@ -279,7 +234,7 @@ __global__ void fused_qk_rmsnorm_gate_kernel(
   const int num_warps = blockDim.x / kWarpSize;
   const int total_heads = num_q_heads + num_kv_heads;
   constexpr int UNROLL = HEAD_DIM / 128;
-  using scalar_pack_t = typename PackedType<scalar_t>::type;
+  using scalar_pack_t = typename TypeTraits<scalar_t, 2>::type;
 
   for (int head = warp; head < total_heads; head += num_warps) {
     const bool is_q = head < num_q_heads;

@@ -64,4 +64,16 @@ void concat_and_cache_dsa_int8(torch::Tensor& kv_int8,
     torch::Tensor& rope_scale_cache,
     torch::Tensor& slot_mapping);
 
+// Write int8 K/V and per-token K scales into paged caches.
+void reshape_and_cache_with_scale(
+    torch::Tensor& key, torch::Tensor& value, torch::Tensor& key_scale,
+    torch::Tensor& key_cache, torch::Tensor& value_cache,
+    torch::Tensor& key_scale_cache, torch::Tensor& slot_mapping);
+
+// Mixed cache writer: int8 K, fp16/bf16 V, and fp32 per-token K scales.
+void reshape_and_cache_mix(
+    torch::Tensor& key, torch::Tensor& value, torch::Tensor& key_scale,
+    torch::Tensor& key_cache, torch::Tensor& value_cache,
+    torch::Tensor& key_scale_cache, torch::Tensor& slot_mapping);
+
 }  // namespace vllm_iluvatar

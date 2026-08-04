@@ -48,6 +48,16 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
       "Tensor kv_int8, Tensor nope_scale, Tensor rope_scale, "
       "Tensor! kv_cache, Tensor! nope_scale_cache, Tensor! rope_scale_cache, "
       "Tensor slot_mapping) -> ()");
+  ops.def(
+      "reshape_and_cache_with_scale("
+      "Tensor key, Tensor value, Tensor key_scale, Tensor! key_cache, "
+      "Tensor! value_cache, Tensor! key_scale_cache, Tensor slot_mapping) "
+      "-> ()");
+  ops.def(
+      "reshape_and_cache_mix("
+      "Tensor key, Tensor value, Tensor key_scale, Tensor! key_cache, "
+      "Tensor! value_cache, Tensor! key_scale_cache, Tensor slot_mapping) "
+      "-> ()");
   ops.def("weak_ref_tensor(Tensor input) -> Tensor");
   ops.def("get_cuda_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor");
 }
@@ -62,6 +72,10 @@ TORCH_LIBRARY_IMPL_EXPAND(_C, CUDA, ops) {
            &vllm_iluvatar::fused_qk_rmsnorm_gate);
   ops.impl("concat_and_cache_dsa_int8",
            &vllm_iluvatar::concat_and_cache_dsa_int8);
+  ops.impl("reshape_and_cache_with_scale",
+           &vllm_iluvatar::reshape_and_cache_with_scale);
+  ops.impl("reshape_and_cache_mix",
+           &vllm_iluvatar::reshape_and_cache_mix);
   // Aliasing a CUDA tensor's storage; registered on the CUDA key like upstream.
   ops.impl("weak_ref_tensor", &vllm_iluvatar::weak_ref_tensor);
 }

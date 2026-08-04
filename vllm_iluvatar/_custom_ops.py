@@ -67,7 +67,6 @@ _ILU_ADDED: list[str] = [
     "ref_paged_mqa_logits",
     "rejection_greedy_sample_torch",
     "rejection_random_sample_torch",
-    "reshape_and_cache_flash_mix",
     "rms_norm_qk",
     "router_gemm_bf16_fp32",
     "silu_and_mul",
@@ -540,28 +539,6 @@ def reshape_and_cache_flash(
         kv_cache_dtype,
         1.0,
         1.0,
-    )
-
-
-def reshape_and_cache_flash_mix(
-    key: torch.Tensor,
-    value: torch.Tensor,
-    key_scale: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    key_scale_cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    kv_cache_dtype: str,
-):
-    ixf_ops.reshape_and_cache_flash_mix(
-        key,
-        value,
-        key_scale,
-        key_cache,
-        value_cache,
-        key_scale_cache,
-        slot_mapping,
-        kv_cache_dtype,
     )
 
 

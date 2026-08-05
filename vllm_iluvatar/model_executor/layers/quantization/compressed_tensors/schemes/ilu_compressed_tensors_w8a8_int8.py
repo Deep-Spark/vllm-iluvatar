@@ -133,6 +133,59 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
                     "format": "TN",
                     "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
+                # deepseekv4 flash
+                (512, 4096): {
+                    "format": "TN",
+                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                },
+                (1024, 4096): {
+                    "format": "TN",
+                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                },
+                (1536, 4096): {
+                    "format": "TN",
+                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                },
+                (2048, 4096): {
+                    "format": "TN",
+                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                },
+                (4096, 256): {
+                    "format": "TN",
+                    "func" : [(0, w8a8_gemv), (2, w8a8_gemm)],
+                },
+                (4096, 512): {
+                    "format": "TN",
+                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                },
+                (4096, 1024): {
+                    "format": "TN",
+                    "func" : [(0, w8a8_gemv), (2, w8a8_gemm)],
+                },
+                (4096, 2048): {
+                    "format": "TN",
+                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                },
+                (4096, 4096): {
+                    "format": "TN",
+                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                },
+                (4096, 8192): {
+                    "format": "TN",
+                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                },
+                (8192, 1024): {
+                    "format": "TN",
+                    "func" : [(0, w8a8_gemv), (2, w8a8_gemm)],
+                },
+                (16384, 1024): {
+                    "format": "NN",
+                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                },
+                (32768, 1024): {
+                    "format": "NN",
+                    "func" : [(0, w8a8_gemv), (9, w8a8_gemm)],
+                },
             },
             "ivcore11": {}
         }

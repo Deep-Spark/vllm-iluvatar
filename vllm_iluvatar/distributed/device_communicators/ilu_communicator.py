@@ -194,9 +194,14 @@ class IluCommunicator(CudaCommunicator):
                 output_tensor = torch.empty(
                     output_size, dtype=inp_c.dtype, device=inp_c.device
                 )
-                torch.distributed.all_gather_into_tensor(
-                    output_tensor, inp_c, group=comm.device_group
-                )
+                if comm.use_vllm_comm:
+                    ixfd.all_gather_into_tensor(
+                        output_tensor, inp_c, group=comm.ixfd_group, async_op=True
+                    )
+                else:
+                    torch.distributed.all_gather_into_tensor(
+                        output_tensor, inp_c, group=comm.device_group
+                    )
                 return output_tensor
 
             if isinstance(input_, torch.Tensor):
@@ -224,9 +229,14 @@ class IluCommunicator(CudaCommunicator):
                 dtype=inp_c.dtype,
                 device=inp_c.device,
             )
-            torch.distributed.all_gather_into_tensor(
-                gathered, padded, group=comm.device_group
-            )
+            if comm.use_vllm_comm:
+                ixfd.all_gather_into_tensor(
+                    gathered, padded, group=comm.ixfd_group, async_op=True
+                )
+            else:
+                torch.distributed.all_gather_into_tensor(
+                    gathered, padded, group=comm.device_group
+                )
             gathered = gathered.view((world_size, max_size) + rest)
             parts = [gathered[r, : sizes[r]] for r in range(world_size)]
             return torch.cat(parts, dim=0)
@@ -283,9 +293,14 @@ class IluCommunicator(CudaCommunicator):
             output = torch.empty(
                 output_shape, dtype=input_tensor.dtype, device=input_tensor.device
             )
-            torch.distributed.reduce_scatter_tensor(
-                output, input_tensor, group=comm.device_group
-            )
+            if comm.use_vllm_comm:
+                ixfd.reduce_scatter_tensor(
+                    output, input_tensor, group=comm.ixfd_group, async_op=True
+                )
+            else:
+                torch.distributed.reduce_scatter_tensor(
+                    output, input_tensor, group=comm.device_group
+                )
             return output.movedim(0, dim).contiguous()
 
         # Variable-length reduce-scatter (DP ranks carry different token counts):
@@ -311,7 +326,10 @@ class IluCommunicator(CudaCommunicator):
         out = torch.empty(
             (max_size,) + rest, dtype=input_tensor.dtype, device=input_tensor.device
         )
-        torch.distributed.reduce_scatter_tensor(out, padded, group=comm.device_group)
+        if comm.use_vllm_comm:
+            ixfd.reduce_scatter_tensor(out, padded, group=comm.ixfd_group, async_op=True)
+        else:
+            torch.distributed.reduce_scatter_tensor(out, padded, group=comm.device_group)
         out = out[: sizes[comm.rank_in_group]]
         return out.movedim(0, dim).contiguous()
 

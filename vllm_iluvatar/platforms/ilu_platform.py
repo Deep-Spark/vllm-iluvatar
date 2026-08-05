@@ -28,6 +28,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _ATTN_BACKENDS_REGISTERED = False
+_ILU_MLA_PREFILL_FLASH_ATTN_BACKEND = (
+    "vllm_iluvatar.v1.attention.backends.mla.prefill.flash_attn.FlashAttnPrefillBackend"
+)
 
 
 def register_attention_backends() -> None:
@@ -45,10 +48,19 @@ def register_attention_backends() -> None:
         return
 
     import vllm.envs as envs
+    from vllm.v1.attention.backends.mla.prefill.registry import (
+        MLAPrefillBackendEnum,
+        register_mla_prefill_backend,
+    )
     from vllm.v1.attention.backends.registry import (
         AttentionBackendEnum,
         MambaAttentionBackendEnum,
         register_backend,
+    )
+
+    register_mla_prefill_backend(
+        MLAPrefillBackendEnum.FLASH_ATTN,
+        _ILU_MLA_PREFILL_FLASH_ATTN_BACKEND,
     )
 
     register_backend(
@@ -192,17 +204,20 @@ def _make_iluvatar_platform():
 
             pc = getattr(vllm_config, "parallel_config", None)
             import sys
+
             print(
                 f"[ILU platform] check_and_update_config: "
                 f"pc={pc is not None}, "
                 f"worker_cls={getattr(pc, 'worker_cls', '<none>')!r}",
-                file=sys.stderr, flush=True,
+                file=sys.stderr,
+                flush=True,
             )
             if pc is not None and pc.worker_cls == "vllm.v1.worker.gpu_worker.Worker":
                 pc.worker_cls = "vllm_iluvatar.v1.worker.gpu_worker.IluWorker"
                 print(
                     "[ILU platform] set worker_cls -> IluWorker",
-                    file=sys.stderr, flush=True,
+                    file=sys.stderr,
+                    flush=True,
                 )
 
         @classmethod

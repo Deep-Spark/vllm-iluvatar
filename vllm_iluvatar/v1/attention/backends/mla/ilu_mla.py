@@ -10,6 +10,7 @@ for ``AttentionBackendEnum.FLASHMLA``.
 """
 
 import functools
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
 import ixformer.inference.functions as ixf_ops
@@ -26,13 +27,17 @@ from ixformer.contrib.vllm_flash_attn import (  # type: ignore[import]
     merge_attn_states as ixf_merge_attn_states,
 )
 from vllm import _custom_ops as ops
+from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonBackend,
+    MLACommonDecodeMetadata,
     MLACommonImpl,
     MLACommonMetadata,
+    MLACommonMetadataBuilder,
+    QueryLenSupport,
 )
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SparseMLACommonImpl,
@@ -41,15 +46,202 @@ from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
+    AttentionCGSupport,
     AttentionType,
     MultipleOf,
 )
+from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class IluMLACommonDecodeMetadata(MLACommonDecodeMetadata):
+    """Decode metadata with the CUDA-graph flag consumed by ixformer kernels."""
+
+    use_cuda_graph: bool = False
+
+
+class IluMLACommonMetadataBuilder(MLACommonMetadataBuilder):
+    """Iluvatar FLASHMLA metadata builder.
+
+    Keeps the dense FLASHMLA spec-decode and CUDA-graph behavior next to the
+    backend that consumes it, matching the community backend layout.
+    """
+
+    query_len_support = QueryLenSupport.UNIFORM
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        cudagraph_mode = self.vllm_config.compilation_config.cudagraph_mode
+        self.decode_use_graph = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+        self.use_full_cuda_graph = cudagraph_mode.has_full_cudagraphs()
+        self._spec_decode_expand_block_table_buf: torch.Tensor | None = None
+        self._spec_decode_expand_seq_lens_buf: torch.Tensor | None = None
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata,
+        fast_build: bool = False,
+    ):
+        _, num_prefills, _, _ = split_decodes_and_prefills(
+            common_attn_metadata,
+            decode_threshold=self.reorder_batch_threshold,
+            require_uniform=(self.query_len_support != QueryLenSupport.VARLEN),
+            treat_short_extends_as_decodes=not self.use_pcp,
+        )
+        self._ilu_current_decode_use_cuda_graph = (
+            num_prefills == 0 and self.decode_use_graph
+        )
+        try:
+            return super().build(common_prefix_len, common_attn_metadata, fast_build)
+        finally:
+            self._ilu_current_decode_use_cuda_graph = False
+
+    def _build_decode(
+        self,
+        block_table_tensor: torch.Tensor,
+        seq_lens_device: torch.Tensor,
+        max_seq_len: int,
+        query_start_loc_cpu: torch.Tensor,
+        query_start_loc_device: torch.Tensor,
+        num_decode_tokens: int,
+        dcp_tot_seq_lens_device: torch.Tensor | None,
+    ) -> IluMLACommonDecodeMetadata:
+        del max_seq_len
+        del query_start_loc_device
+
+        num_decodes = block_table_tensor.shape[0]
+        decode_block_table = block_table_tensor
+        decode_seq_lens_device = seq_lens_device
+
+        speculative_config = self.vllm_config.speculative_config
+        use_spec_decode = (
+            speculative_config is not None
+            and speculative_config.num_speculative_tokens is not None
+            and speculative_config.num_speculative_tokens > 0
+        )
+        if (
+            use_spec_decode
+            and self.dcp_world_size == 1
+            and num_decode_tokens > num_decodes
+        ):
+            decode_block_table, decode_seq_lens_device = (
+                self._expand_spec_decode_metadata(
+                    block_table_tensor,
+                    seq_lens_device,
+                    query_start_loc_cpu,
+                    num_decode_tokens,
+                )
+            )
+
+        return IluMLACommonDecodeMetadata(
+            block_table=decode_block_table,
+            seq_lens=decode_seq_lens_device,
+            dcp_tot_seq_lens=dcp_tot_seq_lens_device,
+            use_cuda_graph=getattr(self, "_ilu_current_decode_use_cuda_graph", False),
+        )
+
+    def _expand_spec_decode_metadata(
+        self,
+        block_table_tensor: torch.Tensor,
+        seq_lens_device: torch.Tensor,
+        query_start_loc_cpu: torch.Tensor,
+        num_decode_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Expand request-level decode rows to token-level speculative rows."""
+        num_decodes = block_table_tensor.shape[0]
+        decode_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        decode_lens_device_long = decode_lens_cpu.to(
+            device=block_table_tensor.device,
+            dtype=torch.long,
+        )
+        req_ids = torch.repeat_interleave(
+            torch.arange(num_decodes, device=block_table_tensor.device),
+            decode_lens_device_long,
+        )
+        if req_ids.numel() != num_decode_tokens:
+            return block_table_tensor, seq_lens_device
+
+        expanded_block_table = block_table_tensor.index_select(0, req_ids)
+
+        query_start_loc_long = query_start_loc_cpu.to(
+            device=block_table_tensor.device,
+            dtype=torch.long,
+        )
+        token_starts = torch.repeat_interleave(
+            query_start_loc_long[:-1],
+            decode_lens_device_long,
+        )
+        token_pos_in_req = (
+            torch.arange(
+                num_decode_tokens,
+                device=block_table_tensor.device,
+                dtype=torch.long,
+            )
+            - token_starts
+        )
+
+        seq_lens_device_long = seq_lens_device.to(
+            device=block_table_tensor.device,
+            dtype=torch.long,
+        )
+        context_lens_long = seq_lens_device_long - decode_lens_device_long
+        expanded_seq_lens = (
+            context_lens_long.index_select(0, req_ids) + token_pos_in_req + 1
+        ).to(dtype=seq_lens_device.dtype)
+
+        if self.decode_use_graph or self.use_full_cuda_graph:
+            return self._copy_expanded_metadata_to_graph_buffers(
+                expanded_block_table,
+                expanded_seq_lens,
+                block_table_tensor.dtype,
+                seq_lens_device.dtype,
+            )
+        return expanded_block_table, expanded_seq_lens
+
+    def _copy_expanded_metadata_to_graph_buffers(
+        self,
+        expanded_block_table: torch.Tensor,
+        expanded_seq_lens: torch.Tensor,
+        block_table_dtype: torch.dtype,
+        seq_lens_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        nrows, ncols = expanded_block_table.shape
+        max_rows = self.vllm_config.scheduler_config.max_num_batched_tokens
+        assert nrows <= max_rows, (
+            f"spec-decode expanded decode rows {nrows} > "
+            f"max_num_batched_tokens {max_rows}"
+        )
+        if (
+            self._spec_decode_expand_block_table_buf is None
+            or self._spec_decode_expand_block_table_buf.shape[0] < max_rows
+            or self._spec_decode_expand_block_table_buf.shape[1] != ncols
+        ):
+            self._spec_decode_expand_block_table_buf = torch.zeros(
+                max_rows,
+                ncols,
+                dtype=block_table_dtype,
+                device=self.device,
+            )
+            self._spec_decode_expand_seq_lens_buf = torch.zeros(
+                max_rows,
+                dtype=seq_lens_dtype,
+                device=self.device,
+            )
+        self._spec_decode_expand_block_table_buf[:nrows].copy_(expanded_block_table)
+        assert self._spec_decode_expand_seq_lens_buf is not None
+        self._spec_decode_expand_seq_lens_buf[:nrows].copy_(expanded_seq_lens)
+        return (
+            self._spec_decode_expand_block_table_buf[:nrows],
+            self._spec_decode_expand_seq_lens_buf[:nrows],
+        )
 
 
 class IluMLABackend(MLACommonBackend):
@@ -66,6 +258,10 @@ class IluMLABackend(MLACommonBackend):
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [MultipleOf(16)]
+
+    @staticmethod
+    def get_builder_cls() -> type[IluMLACommonMetadataBuilder]:
+        return IluMLACommonMetadataBuilder
 
     @classmethod
     def supports_block_size(cls, block_size: int | None) -> bool:
@@ -135,6 +331,12 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
         if self.kv_cache_dtype.startswith("fp8"):
             raise NotImplementedError("FP8 ILU MLA not yet supported")
         self.use_int8_mla = envs.VLLM_ILU_MLA_ATTN_QUANT_TYPE == "INT8"
+        speculative_config = get_current_vllm_config().speculative_config
+        self.use_spec_decode = (
+            speculative_config is not None
+            and speculative_config.num_speculative_tokens is not None
+            and speculative_config.num_speculative_tokens > 0
+        )
 
     def reorg_kvcache(
         self,
@@ -514,7 +716,7 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
                         kv_cache_dtype=self.kv_cache_dtype,
                         scale=layer._k_scale,
                     )
-                elif self.dcp_world_size > 1 or layer.use_spec_decode:
+                elif self.dcp_world_size > 1 or self.use_spec_decode:
                     ops.concat_and_cache_mla(
                         k_c_normed[:num_decode_tokens],
                         decode_k_pe,
@@ -920,7 +1122,7 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
                 decode_meta.block_table,
                 decode_meta.seq_lens,
                 max_decode_seq_len,
-                decode_meta.use_cuda_graph,
+                getattr(decode_meta, "use_cuda_graph", False),
             )
         else:
             if k_c_normed is None:
@@ -933,7 +1135,7 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
                     block_tables=decode_meta.block_table,
                     context_lens=decode_meta.seq_lens,
                     max_context_len=max_decode_seq_len,
-                    use_cuda_graph=decode_meta.use_cuda_graph,
+                    use_cuda_graph=getattr(decode_meta, "use_cuda_graph", False),
                 )
             else:
                 ixf_ops.vllm_paged_attention_mla_fused(
@@ -947,7 +1149,7 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
                     max_context_len=max_decode_seq_len,
                     k_c_normed=k_c_normed,
                     k_pe=k_pe,
-                    use_cuda_graph=decode_meta.use_cuda_graph,
+                    use_cuda_graph=getattr(decode_meta, "use_cuda_graph", False),
                 )
 
         return self._v_up_proj(o), None

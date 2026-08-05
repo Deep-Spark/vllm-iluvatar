@@ -56,6 +56,28 @@ def _process_engine_step(self) -> bool:
     return model_executed
 '''
 
+HANDLE_CLIENT_REQUEST = '''\
+def _handle_client_request(
+    self, request_type: EngineCoreRequestType, request: Any
+) -> None:
+    if request_type == EngineCoreRequestType.START_DP_WAVE:
+        if self.ignore_start_dp_wave:
+            return
+        new_wave, exclude_eng_index = request
+        if exclude_eng_index != self.engine_index and (
+            new_wave >= self.current_wave
+        ):
+            self.current_wave = new_wave
+            if not self.engines_running:
+                logger.debug(
+                    "EngineCore starting idle loop for wave %d.",
+                    new_wave,
+                )
+                self.engines_running = True
+    else:
+        super()._handle_client_request(request_type, request)
+'''
+
 
 def register() -> None:
     p.register_once(
@@ -94,6 +116,15 @@ def _apply() -> None:
             "and refresh PROCESS_ENGINE_STEP."
         ),
     )
+    p.check_fingerprint(
+        "DPEngineCoreProc._handle_client_request",
+        inspect.getsource(DPEngineCoreProc._handle_client_request),
+        HANDLE_CLIENT_REQUEST,
+        resync_hint=(
+            "Review _make_handle_client_request against the new community "
+            "wave-start policy and refresh HANDLE_CLIENT_REQUEST."
+        ),
+    )
 
     should_throttle = impl._make_should_throttle_prefills(
         DPEngineCoreProc._should_throttle_prefills
@@ -101,16 +132,25 @@ def _apply() -> None:
     process_step = impl._make_process_engine_step(
         DPEngineCoreProc._process_engine_step
     )
+    handle_client_request = impl._make_handle_client_request(
+        DPEngineCoreProc._handle_client_request
+    )
     ilu_methods = types.SimpleNamespace(
         _should_throttle_prefills=should_throttle,
         _process_engine_step=process_step,
+        _handle_client_request=handle_client_request,
     )
     p.check_signatures(
         DPEngineCoreProc,
         ilu_methods,
-        ["_should_throttle_prefills", "_process_engine_step"],
+        [
+            "_should_throttle_prefills",
+            "_process_engine_step",
+            "_handle_client_request",
+        ],
         strict=True,
     )
 
     DPEngineCoreProc._should_throttle_prefills = should_throttle  # type: ignore[method-assign]
     DPEngineCoreProc._process_engine_step = process_step  # type: ignore[method-assign]
+    DPEngineCoreProc._handle_client_request = handle_client_request  # type: ignore[method-assign]

@@ -66,7 +66,7 @@ def _apply_decode_w8a8_int8_nn(
     num_tokens: int,
 ) -> torch.Tensor:
     """Decode-only W8A8 NN path using GEMV and avoiding D2H sync."""
-    i8_hidden_states, a_scale = ixfops.moe_expand_input_dynamic_scaled_int8(
+    act, a_scale = ixfops.moe_expand_input_dynamic_scaled_int8(
         hidden_states=x,
         dst_to_src=sorted_token_ids,
         dst_tokens=expand_tokens,
@@ -76,9 +76,9 @@ def _apply_decode_w8a8_int8_nn(
         smooth_scales=layer.w13_input_scale,
     )
 
-    i8_hidden_states = _pad_last_dim(i8_hidden_states, layer.w13_weight.shape[-2])
-    pt_output_1 = ixfops.moe_w8a8_group_gemv(
-        input=i8_hidden_states,
+    act = _pad_last_dim(act, layer.w13_weight.shape[-2])
+    act = ixfops.moe_w8a8_group_gemv(
+        input=act,
         weight=layer.w13_weight,
         i_scales=a_scale,
         w_scales=layer.w13_weight_scale,
@@ -91,16 +91,16 @@ def _apply_decode_w8a8_int8_nn(
     )
 
     if layer.activation.value == "swigluoai":
-        pt_output_2, a2_scale = ixfops.activation_swigluoai_dynamic_scaled_int8(
-            input=pt_output_1,
+        act, a_scale = ixfops.activation_swigluoai_dynamic_scaled_int8(
+            input=act,
             bias=None,
             smooth_scales=layer.w2_input_scale,
             dst_to_src=sorted_token_ids,
             topk_ids=None,
         )
     else:
-        pt_output_2, a2_scale = ixfops.activation_dynamic_scaled_int8(
-            input=pt_output_1,
+        act, a_scale = ixfops.activation_dynamic_scaled_int8(
+            input=act,
             bias=None,
             smooth_scales=layer.w2_input_scale,
             dst_to_src=sorted_token_ids,
@@ -108,11 +108,11 @@ def _apply_decode_w8a8_int8_nn(
             act_type="swiglu",
         )
 
-    pt_output_2 = _pad_last_dim(pt_output_2, layer.w2_weight.shape[-2])
-    pt_output_3 = ixfops.moe_w8a8_group_gemv(
-        input=pt_output_2,
+    act = _pad_last_dim(act, layer.w2_weight.shape[-2])
+    act = ixfops.moe_w8a8_group_gemv(
+        input=act,
         weight=layer.w2_weight,
-        i_scales=a2_scale,
+        i_scales=a_scale,
         w_scales=layer.w2_weight_scale,
         output_dtype=dtype,
         tokens_per_experts=expert_sizes_gpu,
@@ -123,7 +123,7 @@ def _apply_decode_w8a8_int8_nn(
     )
 
     return ixfops.moe_output_reduce_sum(
-        input=pt_output_3.view(num_tokens, layer.top_k, -1),
+        input=act.view(num_tokens, layer.top_k, -1),
         topk_weight=topk_weights,
         scaling_factor=_get_ilu_output_scale(layer),
         extra_residual=shared_experts_input,
@@ -419,7 +419,7 @@ class IluCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
         else:
             expert_sizes_cpu = expert_sizes_gpu.cpu()
             # expand + reorder + quant
-            i8_hidden_states, a_scale = ixfops.moe_expand_input_dynamic_scaled_int8(
+            act, a_scale = ixfops.moe_expand_input_dynamic_scaled_int8(
                 hidden_states=x,
                 dst_to_src=sorted_token_ids,
                 dst_tokens=expand_tokens,
@@ -429,20 +429,15 @@ class IluCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 smooth_scales=layer.w13_input_scale,
             )
 
-            if i8_hidden_states.shape[-1] != layer.w13_weight.shape[self.padding_dim]:
-                padding = (
-                    layer.w13_weight.shape[self.padding_dim]
-                    - i8_hidden_states.shape[-1]
+            if act.shape[-1] != layer.w13_weight.shape[self.padding_dim]:
+                padding = layer.w13_weight.shape[self.padding_dim] - act.shape[-1]
+                act = torch.nn.functional.pad(
+                    act, (0, padding), mode="constant", value=0
                 )
-                i8_hidden_states_align = torch.nn.functional.pad(
-                    i8_hidden_states, (0, padding), mode="constant", value=0
-                )
-            else:
-                i8_hidden_states_align = i8_hidden_states
 
             # w8a8 group gemm 1
-            pt_output_1 = ixfops.moe_w8a8_group_gemm(
-                input=i8_hidden_states_align,
+            act = ixfops.moe_w8a8_group_gemm(
+                input=act,
                 weight=layer.w13_weight,
                 i_scales=a_scale,
                 w_scales=layer.w13_weight_scale,
@@ -455,16 +450,16 @@ class IluCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
 
             # act + quant
             if layer.activation.value == "swigluoai":
-                pt_output_2, a2_scale = ixfops.activation_swigluoai_dynamic_scaled_int8(
-                    input=pt_output_1,
+                act, a_scale = ixfops.activation_swigluoai_dynamic_scaled_int8(
+                    input=act,
                     bias=None,
                     smooth_scales=layer.w2_input_scale,
                     dst_to_src=sorted_token_ids,
                     topk_ids=None,
                 )
             else:
-                pt_output_2, a2_scale = ixfops.activation_dynamic_scaled_int8(
-                    input=pt_output_1,
+                act, a_scale = ixfops.activation_dynamic_scaled_int8(
+                    input=act,
                     bias=None,
                     smooth_scales=layer.w2_input_scale,
                     dst_to_src=sorted_token_ids,
@@ -472,49 +467,45 @@ class IluCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
                     act_type="swiglu",
                 )
 
-            if pt_output_2.shape[-1] != layer.w2_weight.shape[self.padding_dim]:
-                padding = (
-                    layer.w2_weight.shape[self.padding_dim] - pt_output_2.shape[-1]
+            if act.shape[-1] != layer.w2_weight.shape[self.padding_dim]:
+                padding = layer.w2_weight.shape[self.padding_dim] - act.shape[-1]
+                act = torch.nn.functional.pad(
+                    act, (0, padding), mode="constant", value=0
                 )
-                pt_output_2_align = torch.nn.functional.pad(
-                    pt_output_2, (0, padding), mode="constant", value=0
-                )
-            else:
-                pt_output_2_align = pt_output_2
 
             # w8a8 group gemm 2 + reorder
             if use_ep:
-                pt_output_3 = torch.empty(
+                out = torch.empty(
                     (num_tokens * layer.top_k, hidden_size),
                     device=x.device,
                     dtype=x.dtype,
                 )
                 ixfops.moe_w8a8_group_gemm(
-                    input=pt_output_2_align,
+                    input=act,
                     weight=layer.w2_weight,
-                    i_scales=a2_scale,
+                    i_scales=a_scale,
                     w_scales=layer.w2_weight_scale,
                     output_dtype=dtype,
                     tokens_per_experts=expert_sizes_cpu,
                     dst_to_src=sorted_token_ids,
                     bias=layer.w2_bias,
                     format=self.gemm_format,
-                    output=pt_output_3,
+                    output=out,
                 )
 
                 reduce_mask = src_to_dst == -1
                 final_hidden_states = ixfops.moe_output_reduce_sum(
-                    input=pt_output_3.view(num_tokens, layer.top_k, -1),
+                    input=out.view(num_tokens, layer.top_k, -1),
                     topk_weight=topk_weights,
                     scaling_factor=_get_ilu_output_scale(layer),
                     mask=reduce_mask,
                     extra_residual=shared_experts_input,
                 )
             else:
-                pt_output_3 = ixfops.moe_w8a8_group_gemm(
-                    input=pt_output_2_align,
+                act = ixfops.moe_w8a8_group_gemm(
+                    input=act,
                     weight=layer.w2_weight,
-                    i_scales=a2_scale,
+                    i_scales=a_scale,
                     w_scales=layer.w2_weight_scale,
                     output_dtype=dtype,
                     tokens_per_experts=expert_sizes_cpu,
@@ -525,7 +516,7 @@ class IluCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
 
                 # mul + reduce_sum
                 final_hidden_states = ixfops.moe_output_reduce_sum(
-                    input=pt_output_3.view(num_tokens, layer.top_k, -1),
+                    input=act.view(num_tokens, layer.top_k, -1),
                     topk_weight=topk_weights,
                     scaling_factor=_get_ilu_output_scale(layer),
                     extra_residual=shared_experts_input,

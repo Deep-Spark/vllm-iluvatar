@@ -647,7 +647,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         if run_decode:
             expand_tokens = num_tokens * layer.top_k
 
-        i8_hidden_states, a_scale = self._expand_and_quant(
+        act, a_scale = self._expand_and_quant(
             layer=layer,
             input=x,
             expand_tokens=expand_tokens,
@@ -658,8 +658,8 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         )
 
         if run_decode:
-            pt_output_1 = ixfops.moe_w4a8_group_gemv(
-                input=i8_hidden_states,
+            act = ixfops.moe_w4a8_group_gemv(
+                input=act,
                 weight=layer.w13_weight,
                 i_scales=a_scale,
                 w_scales=layer.w13_weight_scale,
@@ -674,8 +674,8 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 dense_tokens_per_experts=dense_expert_sizes_gpu,
             )
         else:
-            pt_output_1 = ixfops.moe_w4a8_group_gemm(
-                input=i8_hidden_states,
+            act = ixfops.moe_w4a8_group_gemm(
+                input=act,
                 weight=layer.w13_weight,
                 i_scales=a_scale,
                 w_scales=layer.w13_weight_scale,
@@ -690,23 +690,23 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 version=self.version,
             )
 
-        pt_output_2, a2_scale = self._activation_and_quant(
+        act, a_scale = self._activation_and_quant(
             layer=layer,
-            input=pt_output_1,
+            input=act,
             sorted_token_ids=sorted_token_ids,
             output_format=1 if run_decode else 0,
             check_valid=run_decode,
         )
-        pt_output_3 = torch.empty(
+        out = torch.empty(
             (num_tokens * layer.top_k, self.gemm2_info.get_pad_n()),
             device=x.device,
             dtype=x.dtype,
         )
         if run_decode:
             ixfops.moe_w4a8_group_gemv(
-                input=pt_output_2,
+                input=act,
                 weight=layer.w2_weight,
-                i_scales=a2_scale,
+                i_scales=a_scale,
                 w_scales=layer.w2_weight_scale,
                 output_dtype=dtype,
                 tokens_per_experts=expert_sizes_gpu,
@@ -716,14 +716,14 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 bias=layer.w2_bias,
                 format=self.gemm2_info.format,
                 group_size=self.group_size,
-                output=pt_output_3,
+                output=out,
                 dense_tokens_per_experts=dense_expert_sizes_gpu,
             )
         else:
             ixfops.moe_w4a8_group_gemm(
-                input=pt_output_2,
+                input=act,
                 weight=layer.w2_weight,
-                i_scales=a2_scale,
+                i_scales=a_scale,
                 w_scales=layer.w2_weight_scale,
                 output_dtype=dtype,
                 tokens_per_experts=expert_sizes_cpu,
@@ -734,15 +734,13 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 format=self.gemm2_info.format,
                 group_size=self.group_size,
                 version=self.version,
-                output=pt_output_3,
+                output=out,
             )
-        pt_output_3 = unpad_tensor(
-            pt_output_3, self.gemm2_info.get_n(), contiguous=False
-        )
+        out = unpad_tensor(out, self.gemm2_info.get_n(), contiguous=False)
 
         reduce_mask = src_to_dst == -1
         return ixfops.moe_output_reduce_sum(
-            input=pt_output_3.view(num_tokens, layer.top_k, -1),
+            input=out.view(num_tokens, layer.top_k, -1),
             topk_weight=topk_weights,
             scaling_factor=_get_ilu_output_scale(layer),
             mask=reduce_mask,
@@ -773,7 +771,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             return_dense_expert_sizes=True,
         )
 
-        i8_hidden_states, a_scale = self._expand_and_quant(
+        act, a_scale = self._expand_and_quant(
             layer=layer,
             input=x,
             expand_tokens=expand_tokens,
@@ -782,8 +780,8 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             output_format=1,
         )
 
-        pt_output_1 = ixfops.moe_w4a8_group_gemv(
-            input=i8_hidden_states,
+        act = ixfops.moe_w4a8_group_gemv(
+            input=act,
             weight=layer.w13_weight,
             i_scales=a_scale,
             w_scales=layer.w13_weight_scale,
@@ -798,17 +796,17 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             dense_tokens_per_experts=dense_expert_sizes_gpu,
         )
 
-        pt_output_2, a2_scale = self._activation_and_quant(
+        act, a_scale = self._activation_and_quant(
             layer=layer,
-            input=pt_output_1,
+            input=act,
             sorted_token_ids=sorted_token_ids,
             output_format=1,
         )
 
-        pt_output_3 = ixfops.moe_w4a8_group_gemv(
-            input=pt_output_2,
+        act = ixfops.moe_w4a8_group_gemv(
+            input=act,
             weight=layer.w2_weight,
-            i_scales=a2_scale,
+            i_scales=a_scale,
             w_scales=layer.w2_weight_scale,
             output_dtype=dtype,
             tokens_per_experts=expert_sizes_gpu,
@@ -820,12 +818,10 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             group_size=self.group_size,
             dense_tokens_per_experts=dense_expert_sizes_gpu,
         )
-        pt_output_3 = unpad_tensor(
-            pt_output_3, self.gemm2_info.get_n(), contiguous=False
-        )
+        act = unpad_tensor(act, self.gemm2_info.get_n(), contiguous=False)
 
         return ixfops.moe_output_reduce_sum(
-            input=pt_output_3.view(num_tokens, layer.top_k, -1),
+            input=act.view(num_tokens, layer.top_k, -1),
             topk_weight=topk_weights,
             scaling_factor=_get_ilu_output_scale(layer),
             extra_residual=shared_experts_input,
@@ -855,7 +851,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         )
 
         expert_sizes_cpu = expert_sizes_gpu.cpu()
-        i8_hidden_states, a_scale = self._expand_and_quant(
+        act, a_scale = self._expand_and_quant(
             layer=layer,
             input=x,
             expand_tokens=expand_tokens,
@@ -863,8 +859,8 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             src_to_dst=src_to_dst,
         )
 
-        pt_output_1 = ixfops.moe_w4a8_group_gemm(
-            input=i8_hidden_states,
+        act = ixfops.moe_w4a8_group_gemm(
+            input=act,
             weight=layer.w13_weight,
             i_scales=a_scale,
             w_scales=layer.w13_weight_scale,
@@ -879,16 +875,16 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             version=self.version,
         )
 
-        pt_output_2, a2_scale = self._activation_and_quant(
+        act, a_scale = self._activation_and_quant(
             layer=layer,
-            input=pt_output_1,
+            input=act,
             sorted_token_ids=sorted_token_ids,
         )
 
-        pt_output_3 = ixfops.moe_w4a8_group_gemm(
-            input=pt_output_2,
+        act = ixfops.moe_w4a8_group_gemm(
+            input=act,
             weight=layer.w2_weight,
-            i_scales=a2_scale,
+            i_scales=a_scale,
             w_scales=layer.w2_weight_scale,
             output_dtype=dtype,
             tokens_per_experts=expert_sizes_cpu,
@@ -900,12 +896,10 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             group_size=self.group_size,
             version=self.version,
         )
-        pt_output_3 = unpad_tensor(
-            pt_output_3, self.gemm2_info.get_n(), contiguous=False
-        )
+        act = unpad_tensor(act, self.gemm2_info.get_n(), contiguous=False)
 
         result = ixfops.moe_output_reduce_sum(
-            input=pt_output_3.view(num_tokens, layer.top_k, -1),
+            input=act.view(num_tokens, layer.top_k, -1),
             topk_weight=topk_weights,
             scaling_factor=_get_ilu_output_scale(layer),
             extra_residual=shared_experts_input,

@@ -8,6 +8,7 @@ import queue
 from types import SimpleNamespace
 
 import torch.distributed as dist
+from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.core import DPEngineCoreProc
 
 from vllm_iluvatar.ilu_patch import general_patch
@@ -26,6 +27,9 @@ def test_community_method_fingerprints_match():
     assert general_patch.source_sha(
         inspect.getsource(DPEngineCoreProc._process_engine_step)
     ) == general_patch.source_sha(patch_core.PROCESS_ENGINE_STEP)
+    assert general_patch.source_sha(
+        inspect.getsource(DPEngineCoreProc._handle_client_request)
+    ) == general_patch.source_sha(patch_core.HANDLE_CLIENT_REQUEST)
 
 
 def _engine(
@@ -36,15 +40,19 @@ def _engine(
     grace_s=0.0,
     max_defer_steps=8,
     initialized=True,
+    engines_running=True,
 ):
     scheduler = SimpleNamespace(
         waiting=list(waiting),
         skipped_waiting=[],
         running=list(running),
-        has_unfinished_requests=lambda: bool(scheduler.waiting),
+        has_unfinished_requests=lambda: bool(
+            scheduler.waiting or scheduler.running
+        ),
     )
     engine = SimpleNamespace(
         scheduler=scheduler,
+        engines_running=engines_running,
         dp_group=object(),
         dp_store=object(),
         dp_size=4,
@@ -121,7 +129,7 @@ def test_prefill_sync_state_is_initialized_once_from_env(monkeypatch):
 
 
 def test_partial_prefill_is_deferred_while_peers_decode(monkeypatch):
-    engine = _engine(waiting=[object()])
+    engine = _engine(waiting=[object()], engines_running=False)
     called = False
 
     def orig(_self):
@@ -138,6 +146,7 @@ def test_partial_prefill_is_deferred_while_peers_decode(monkeypatch):
 
     assert wrapped(engine) is False
     assert called is False
+    assert engine.engines_running is True
     assert engine._ilu_dp_prefill_sync_state.force_throttle is True
 
 
@@ -199,3 +208,50 @@ def test_throttle_wrapper_preserves_upstream_decision():
 
     engine._ilu_dp_prefill_sync_state.force_throttle = True
     assert wrapped(engine) is True
+
+
+def test_idle_engine_skips_prefill_collective(monkeypatch):
+    engine = _engine(engines_running=False)
+
+    def unexpected_all_reduce(*args, **kwargs):
+        raise AssertionError("idle rank entered prefill collective")
+
+    monkeypatch.setattr(dist, "all_reduce", unexpected_all_reduce)
+    wrapped = core._make_process_engine_step(lambda _self: False)
+
+    assert wrapped(engine) is False
+    assert engine.engines_running is False
+
+
+def test_sync_prefill_start_wave_does_not_exclude_target():
+    captured = []
+
+    def orig(_self, request_type, request):
+        captured.append((request_type, request))
+
+    engine = _engine()
+    wrapped = core._make_handle_client_request(orig)
+    wrapped(
+        engine,
+        EngineCoreRequestType.START_DP_WAVE,
+        (7, 2),
+    )
+
+    assert captured == [(EngineCoreRequestType.START_DP_WAVE, (7, None))]
+
+
+def test_disabled_sync_preserves_start_wave_exclusion():
+    captured = []
+
+    def orig(_self, request_type, request):
+        captured.append((request_type, request))
+
+    engine = _engine(sync=False)
+    wrapped = core._make_handle_client_request(orig)
+    wrapped(
+        engine,
+        EngineCoreRequestType.START_DP_WAVE,
+        (7, 2),
+    )
+
+    assert captured == [(EngineCoreRequestType.START_DP_WAVE, (7, 2))]

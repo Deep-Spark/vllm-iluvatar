@@ -28,6 +28,10 @@ from vllm.model_executor.layers.mla import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
+from vllm_iluvatar.model_executor.layers.attention.mla_attention import (
+    install_ilu_mla_attention_overrides,
+)
+
 
 @MultiHeadLatentAttentionWrapper.register_oot()
 class IluMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
@@ -64,9 +68,9 @@ class IluMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             prefix,
             skip_topk,
         )
-        # [ILU override] MLAAttention.rotary_emb - delta: plugin backends apply
-        # rope inside MLAAttention when positions are passed through forward().
-        self.mla_attn.rotary_emb = self.rotary_emb
+        # [ILU override] plugin MLA backends apply rope/cache updates inside
+        # MLAAttention.forward_full when positions are passed through forward().
+        install_ilu_mla_attention_overrides(self.mla_attn, self.rotary_emb)
 
     def forward(
         self,

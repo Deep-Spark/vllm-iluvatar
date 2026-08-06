@@ -133,6 +133,11 @@ class IluFlashMLASparseMetadata(AttentionMetadata):
     max_query_len: int
     max_seq_len: int
 
+    # Decode/prefill split of the (already reordered) batch. Consumed by the
+    # MoE decode dispatch (``_is_only_decode``) to pick the GEMV path.
+    num_decodes: int
+    num_prefills: int
+
     num_actual_tokens: int  # Number of tokens excluding padding.
     query_start_loc: torch.Tensor
     query_start_loc_cpu: torch.Tensor | None
@@ -281,17 +286,11 @@ class IluFlashMLASparseMetadataBuilder(
         self,
         cm: CommonAttentionMetadata,
         req_id_per_token: torch.Tensor,
+        num_decodes: int,
+        num_decode_tokens: int,
+        num_prefill_tokens: int,
     ) -> dict[str, torch.Tensor | None]:
         """Pre-compute C128A topk metadata (decode + prefill in a single launch)."""
-        # Match SWA's decode split (no `require_uniform=True`) so the per-token
-        # output rows line up with `q` in `_forward_decode` / `_forward_prefill`.
-        (num_decodes, _, num_decode_tokens, num_prefill_tokens) = (
-            split_decodes_and_prefills(
-                cm,
-                decode_threshold=self.reorder_batch_threshold or 1,
-            )
-        )
-
         num_total = num_decode_tokens + num_prefill_tokens
         if num_total == 0:
             return {}
@@ -380,14 +379,34 @@ class IluFlashMLASparseMetadataBuilder(
                 out=self.compressed_slot_mapping_buffer,
             )
 
+        # Match SWA's decode split (no `require_uniform=True`) so the per-token
+        # output rows line up with `q` in `_forward_decode` / `_forward_prefill`.
+        (
+            num_decodes,
+            num_prefills,
+            num_decode_tokens,
+            num_prefill_tokens,
+        ) = split_decodes_and_prefills(
+            cm,
+            decode_threshold=self.reorder_batch_threshold or 1,
+        )
+
         c128a_fields: dict[str, torch.Tensor | None] = {}
         if self.is_deepseek_v4 and self.compress_ratio == 128:
-            c128a_fields = self._build_c128a_metadata(cm, req_id_per_token)
+            c128a_fields = self._build_c128a_metadata(
+                cm,
+                req_id_per_token,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+                num_prefill_tokens=num_prefill_tokens,
+            )
 
         metadata = IluFlashMLASparseMetadata(
             num_reqs=cm.num_reqs,
             max_query_len=cm.max_query_len,
             max_seq_len=cm.max_seq_len,
+            num_decodes=num_decodes,
+            num_prefills=num_prefills,
             num_actual_tokens=cm.num_actual_tokens,
             query_start_loc=cm.query_start_loc,
             query_start_loc_cpu=cm.query_start_loc_cpu,

@@ -707,6 +707,8 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
 
         # only prefill stage has expert_sizes_cpu info
         if not run_decode and expert_sizes_cpu.sum() == 0:
+            if shared_experts_input is not None:
+                return shared_experts_input.clone()
             return torch.zeros(
                 (num_tokens, hidden_size),
                 device=x.device,

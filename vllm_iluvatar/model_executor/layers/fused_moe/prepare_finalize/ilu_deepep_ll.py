@@ -203,9 +203,10 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
             if isinstance(self.buffer, BufferWrapper):
                 if self.buffer.buffer is None:
+                    tp_size = get_tensor_model_parallel_world_size()
                     max_tokens_per_rank = self.max_tokens_per_rank
                     if VLLM_ILU_LL_FUSED_AG_AR or VLLM_ILU_DEEPEP_USE_SCATTER:
-                        max_tokens_per_rank //= get_tensor_model_parallel_world_size()
+                        max_tokens_per_rank //= tp_size
 
                     self.buffer.buffer = nvsm_ep.nvsm_init_ep_comm(
                         max_num_tokens=max_tokens_per_rank,
@@ -215,6 +216,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                         dtype=torch.bfloat16,
                         use_int8=self.use_int8_dispatch,
                         group=self.buffer.group,
+                        tp_size=tp_size,
                     )
                 self.buffer = self.buffer.buffer
 

@@ -136,11 +136,12 @@ class IluFusedMoEEP:
         if hasattr(handle, "buffer") and handle.buffer is None:
             from ixformer.distributed import nvsm_ep
 
+            tp_size = get_tensor_model_parallel_world_size()
             max_tokens_per_rank = (
                 get_current_vllm_config().scheduler_config.max_num_seqs
             )
             if VLLM_ILU_LL_FUSED_AG_AR or VLLM_ILU_DEEPEP_USE_SCATTER:
-                max_tokens_per_rank //= get_tensor_model_parallel_world_size()
+                max_tokens_per_rank //= tp_size
 
             handle.buffer = nvsm_ep.nvsm_init_ep_comm(
                 max_num_tokens=max_tokens_per_rank,
@@ -150,6 +151,7 @@ class IluFusedMoEEP:
                 dtype=torch.bfloat16,
                 use_int8=bool(envs.VLLM_ILU_DEEPEP_USE_INT8),
                 group=handle.group,
+                tp_size=tp_size,
             )
         return ll_manager, handle
 
@@ -230,22 +232,34 @@ class IluFusedMoEEP:
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        shared_gate_up_input: tuple[torch.Tensor, torch.Tensor, torch.dtype]
+        | None = None,
     ) -> torch.Tensor:
         all2all_backend = self.experts.moe_config.moe_parallel_config.all2all_backend
         all_ranks_decode_only = self._is_all_ranks_decode_only()
 
         if _DS4_DECODE_EP_BACKEND is not None and all_ranks_decode_only:
             if _DS4_DECODE_EP_BACKEND == "deepep_low_latency":
-                return self.forward_dp_ep_deep_ep(hidden_states, input_ids)
+                return self.forward_dp_ep_deep_ep(
+                    hidden_states,
+                    input_ids,
+                    shared_gate_up_input=shared_gate_up_input,
+                )
             raise ValueError(
                 f"Invalid VLLM_ILU_DECODE_EP_BACKEND: {_DS4_DECODE_EP_BACKEND!r}, "
                 f"allowed value is 'deepep_low_latency'."
             )
 
         if all2all_backend == "deepep_low_latency":
-            return self.forward_dp_ep_deep_ep(hidden_states, input_ids)
+            return self.forward_dp_ep_deep_ep(
+                hidden_states,
+                input_ids,
+                shared_gate_up_input=shared_gate_up_input,
+            )
 
+        assert shared_gate_up_input is None
         if all2all_backend == "deepep_high_throughput":
+            assert shared_gate_up_input is None
             return self.forward_dp_ep_deep_ep(
                 hidden_states,
                 input_ids,
@@ -259,7 +273,9 @@ class IluFusedMoEEP:
             "ag-rs",
             "ag_rs",
         ):
+            assert shared_gate_up_input is None
             return self.forward_dp_ep_naive(hidden_states, input_ids)
+        assert shared_gate_up_input is None
         return self.forward_dp_ep_modular(hidden_states, input_ids)
 
     def forward_dp_ep_modular(
@@ -289,6 +305,12 @@ class IluFusedMoEEP:
         input_ids: torch.Tensor | None = None,
         enable_fused_ag_ar: bool = True,
         moe_kernel=None,
+        # Optional dynamic-INT8 view of the normalized BF16 shared-expert
+        # input. Only gate_up consumes this tuple; routing and dispatch keep
+        # using ``hidden_states`` so their numerical and communication
+        # contracts are unchanged.
+        shared_gate_up_input: tuple[torch.Tensor, torch.Tensor, torch.dtype]
+        | None = None,
     ) -> torch.Tensor:
         org_shape = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, org_shape[-1])
@@ -336,10 +358,6 @@ class IluFusedMoEEP:
 
         runner.routed_experts._ensure_moe_quant_config_init()
 
-        if shared_experts is not None:
-            assert shared_experts_input is not None
-            shared_experts.maybe_sync_shared_experts_stream(shared_experts_input)
-
         if runner.gate is not None:
             router_logits, _ = runner.gate(hidden_states)
         else:
@@ -371,6 +389,7 @@ class IluFusedMoEEP:
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 shared_experts_input=shared_experts_input,
+                shared_gate_up_input=shared_gate_up_input,
                 pre_xform_trunc_size=pre_xform_trunc_size,
                 enable_fused_ag_ar=enable_fused_ag_ar,
                 moe_kernel=moe_kernel,
@@ -539,6 +558,8 @@ class IluFusedMoEEP:
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
+        shared_gate_up_input: tuple[torch.Tensor, torch.Tensor, torch.dtype]
+        | None = None,
         pre_xform_trunc_size: int = None,
         enable_fused_ag_ar: bool = True,
         moe_kernel=None,
@@ -599,6 +620,35 @@ class IluFusedMoEEP:
         )
         if prepare_hook is not None:
             prepare_hook()
+
+        if shared_gate_up_input is not None:
+            assert shared_experts_input is not None
+            quantized, scales, out_dtype = shared_gate_up_input
+            assert shared_experts_input.dtype == torch.bfloat16
+            assert out_dtype == shared_experts_input.dtype
+            assert quantized.dtype == torch.int8
+            assert quantized.shape == shared_experts_input.shape
+            assert scales.dtype == torch.float32
+            assert scales.numel() == (
+                shared_experts_input.numel() // shared_experts_input.shape[-1]
+            )
+
+        shared_output = None
+        if runner.shared_experts is not None:
+            assert shared_experts_input is not None
+            # This is the accepted dispatch-window schedule: dispatch is
+            # launched first, shared experts run before the receiver waits for
+            # dispatch completion, and routed experts run afterward. Backends
+            # with independent communication progress can overlap that window.
+            # Do not move shared experts to their auxiliary stream here: the
+            # extra CUDA Graph fork/join was substantially slower per layer.
+            shared_layer_input = (
+                shared_experts_input
+                if shared_gate_up_input is None
+                else shared_gate_up_input
+            )
+            shared_output = runner.shared_experts._layer(shared_layer_input)
+
         (
             a1q,
             a1q_scale,
@@ -637,18 +687,6 @@ class IluFusedMoEEP:
             expert_tokens_meta=expert_tokens_meta,
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
-
-        # do shared experts
-        shared_output = None
-        if runner.shared_experts is not None:
-            assert shared_experts_input is not None
-            runner.shared_experts(
-                shared_experts_input,
-                runner.shared_experts._determine_shared_experts_order(
-                    shared_experts_input
-                ),
-            )
-            shared_output = runner.shared_experts.output
 
         if pre_xform_trunc_size is not None:
             fused_output = fused_output[..., :pre_xform_trunc_size]

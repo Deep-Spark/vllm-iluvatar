@@ -34,6 +34,7 @@ Behavioural deltas vs the upstream V4 attention layer:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, cast
@@ -57,6 +58,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.compressor import (
     CompressorMetadata,
     DeepseekCompressor,
@@ -69,6 +71,10 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
+from vllm_iluvatar import _custom_ops as ilu_ops
+from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes import (
+    IluCompressedTensorsW8A8Int8,
+)
 from vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse import (
     IluDeepseekV4FlashMLASparseBackend,
     IluFlashMLASparseMetadata,
@@ -83,6 +89,91 @@ from vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa import (
 )
 
 logger = init_logger(__name__)
+
+DynamicInt8Input = tuple[torch.Tensor, torch.Tensor, torch.dtype]
+_C4A_OUTER_Q_N = 16384
+_C4A_INDEXER_Q_N = 8192
+_C4A_Q_K = 1536
+_DS4_COMPRESSOR_SAVE_POOL_FUSION = (
+    os.environ.get("IXFORMER_DS4_COMPRESSOR_SAVE_POOL_FUSION", "1") == "1"
+)
+_DS4_QK_NORM_QUANT_FUSION = (
+    os.environ.get("IXFORMER_DS4_QK_NORM_QUANT_FUSION", "1") == "1"
+)
+_DS4_C4A_MERGED_WQ_B = (
+    os.environ.get("IXFORMER_DS4_C4A_MERGED_WQ_B", "0") == "1"
+)
+_DS4_SHARED_QR_QUANT = (
+    os.environ.get("IXFORMER_DS4_SHARED_QR_QUANT", "1") == "1"
+)
+
+
+def _can_fuse_qr_norm_quant(
+    wrapper: Any,
+    qr: torch.Tensor,
+    kv: torch.Tensor,
+    attn_metadata: Any,
+) -> bool:
+    if not (
+        _DS4_QK_NORM_QUANT_FUSION
+        and wrapper.is_main_decoder_layer
+        and qr.dtype == torch.bfloat16
+        and kv.dtype == torch.bfloat16
+        and wrapper.q_norm.weight.dtype == torch.bfloat16
+        and wrapper.kv_norm.weight.dtype == torch.bfloat16
+        and qr.dim() == 2
+        and kv.dim() == 2
+        and 1 <= qr.shape[0] <= 8
+        and qr.shape == (kv.shape[0], _C4A_Q_K)
+        and kv.shape[1] == 512
+        and qr.stride(-1) == 1
+        and kv.stride(-1) == 1
+        and isinstance(
+            getattr(wrapper.wq_b, "scheme", None),
+            IluCompressedTensorsW8A8Int8,
+        )
+        and isinstance(attn_metadata, dict)
+    ):
+        return False
+
+    if wrapper.indexer is not None and not isinstance(
+        getattr(wrapper.indexer.wq_b, "scheme", None),
+        IluCompressedTensorsW8A8Int8,
+    ):
+        return False
+
+    swa_metadata = attn_metadata.get(wrapper.swa_cache_layer.prefix)
+    return swa_metadata is not None and swa_metadata.num_prefills == 0
+
+
+def _can_merge_c4a_wq_b(
+    wrapper: Any,
+    qr_projection_input: torch.Tensor | DynamicInt8Input,
+    attn_metadata: Any,
+) -> bool:
+    if not (
+        _DS4_C4A_MERGED_WQ_B
+        and wrapper.is_main_decoder_layer
+        and wrapper.indexer is not None
+        and wrapper._c4a_merged_wq_b_weight is not None
+        and wrapper._c4a_merged_wq_b_scale is not None
+        and isinstance(qr_projection_input, tuple)
+        and isinstance(attn_metadata, dict)
+    ):
+        return False
+
+    qr_int8, qr_scale, out_dtype = qr_projection_input
+    if not (
+        qr_int8.dtype == torch.int8
+        and qr_int8.shape == (1, _C4A_Q_K)
+        and qr_scale.dtype == torch.float32
+        and qr_scale.numel() == 1
+        and out_dtype == torch.bfloat16
+    ):
+        return False
+
+    swa_metadata = attn_metadata.get(wrapper.swa_cache_layer.prefix)
+    return swa_metadata is not None and swa_metadata.num_prefills == 0
 
 
 # Bound on bf16-gather workspace allocated at prefill.  Mirrors the
@@ -523,24 +614,6 @@ class IluDeepseekCompressor(DeepseekCompressor):
         # ``CompressorStateCache``).
         state_cache = self.state_cache.kv_cache
 
-        # Step 2 — write fp32 partial states (kv | score+ape) into the paged
-        # state cache. PAD tokens (slot_mapping[t] < 0) are skipped inside the
-        # op.
-        ixfops.ds4_compressor_save_partial_states(
-            kv=kv,
-            score=score,
-            ape=self.ape,
-            positions=positions,
-            slot_mapping=slot_mapping,
-            state_cache=state_cache,
-            block_size=block_size,
-            compress_ratio=self.compress_ratio,
-        )
-
-        # Step 3 — pool window + RMSNorm + GPT-J RoPE + dense bf16/fp16 K
-        # cache insert. Only window-right-end tokens
-        # (``(pos + 1) % compress_ratio == 0``) actually write; the op
-        # short-circuits the rest.
         cos_sin_cache = rotary_emb.cos_sin_cache
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         # Use num_actual (not num_tokens) so pad tokens are excluded, matching
@@ -550,6 +623,16 @@ class IluDeepseekCompressor(DeepseekCompressor):
         kv_cache = mla_layer.kv_cache
         kv_cache_dtype = getattr(mla_layer, "kv_cache_dtype", "bfloat16")
         if kv_cache_dtype == "fp8_ds_mla":
+            ixfops.ds4_compressor_save_partial_states(
+                kv=kv,
+                score=score,
+                ape=self.ape,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                state_cache=state_cache,
+                block_size=block_size,
+                compress_ratio=self.compress_ratio,
+            )
             ixfops.ds4_compressor_pool_norm_rope_fp8_kv_insert(
                 state_cache=state_cache,
                 token_to_req_indices=token_to_req_indices,
@@ -564,8 +647,33 @@ class IluDeepseekCompressor(DeepseekCompressor):
                 rope_head_dim=self.rope_head_dim,
                 rms_norm_eps=self.rms_norm_eps,
             )
+        elif (
+            _DS4_COMPRESSOR_SAVE_POOL_FUSION
+            and num_tokens > 0
+            and kv_cache.dtype == torch.bfloat16
+        ):
+            ixfops.ds4_compressor_save_pool_norm_rope_insert(
+                kv=kv,
+                score=score,
+                ape=self.ape,
+                state_cache=state_cache,
+                token_to_req_indices=token_to_req_indices,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                block_table=block_table,
+                rms_norm_weight=self.norm.weight,
+                cos_sin_cache=cos_sin_cache,
+                k_cache=kv_cache,
+                kv_slot_mapping=kv_slot_mapping,
+                compress_ratio=self.compress_ratio,
+                rope_head_dim=self.rope_head_dim,
+                rms_norm_eps=self.rms_norm_eps,
+            )
         else:
-            ixfops.ds4_compressor_pool_norm_rope_insert(
+            ixfops.ref_ds4_compressor_save_pool_norm_rope_insert(
+                kv=kv,
+                score=score,
+                ape=self.ape,
                 state_cache=state_cache,
                 token_to_req_indices=token_to_req_indices,
                 positions=positions,
@@ -678,6 +786,18 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.topk_indices_buffer = mla_modules.topk_indices_buffer
 
         self.indexer = mla_modules.indexer
+        layer_id = extract_layer_index(prefix)
+        self.is_main_decoder_layer = 0 <= layer_id < config.num_hidden_layers
+        self.register_buffer(
+            "_c4a_merged_wq_b_weight",
+            None,
+            persistent=False,
+        )
+        self.register_buffer(
+            "_c4a_merged_wq_b_scale",
+            None,
+            persistent=False,
+        )
 
         # Per-head RMS normalization for Q (no learnable weights).
         self.q_head_norm = RMSNorm(head_dim, eps=self.eps, has_weight=False)
@@ -750,11 +870,65 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
             self.compressor.kv_cache_dtype = self.mla_attn.kv_cache_dtype
 
+    def _ensure_c4a_wq_b_merge(self) -> None:
+        if (
+            not _DS4_C4A_MERGED_WQ_B
+            or not self.is_main_decoder_layer
+            or self.indexer is None
+            or self._c4a_merged_wq_b_weight is not None
+        ):
+            return
+
+        outer_weight = getattr(self.wq_b, "weight", None)
+        outer_scale = getattr(self.wq_b, "weight_scale", None)
+        indexer_weight = getattr(self.indexer.wq_b, "weight", None)
+        indexer_scale = getattr(self.indexer.wq_b, "weight_scale", None)
+        if any(
+            value is None
+            for value in (
+                outer_weight,
+                outer_scale,
+                indexer_weight,
+                indexer_scale,
+            )
+        ):
+            return
+
+        if (
+            outer_weight.shape != (_C4A_OUTER_Q_N, _C4A_Q_K)
+            or indexer_weight.shape != (_C4A_INDEXER_Q_N, _C4A_Q_K)
+        ):
+            return
+
+        self._c4a_merged_wq_b_weight = torch.cat(
+            (outer_weight.detach(), indexer_weight.detach()),
+            dim=0,
+        )
+        self._c4a_merged_wq_b_scale = torch.cat(
+            (outer_scale.detach(), indexer_scale.detach()),
+            dim=0,
+        )
+
+    def _apply_c4a_merged_wq_b(
+        self,
+        qr_projection_input: DynamicInt8Input,
+    ) -> torch.Tensor:
+        qr_int8, qr_scale, out_dtype = qr_projection_input
+        return ixfops.w8a8(
+            qr_int8,
+            self._c4a_merged_wq_b_weight,
+            qr_scale,
+            self._c4a_merged_wq_b_scale,
+            format="TN",
+            out_dtype=out_dtype,
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
+        fused_wqa_wkv_input: DynamicInt8Input | None = None,
     ) -> torch.Tensor:
         """Sparse MLA attention forward (BF16, ilu V4 W4A8).
 
@@ -787,7 +961,13 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
            outputs and runs the row-parallel projection back to
            ``hidden_size`` (with TP all-reduce inside ``RowParallelLinear``).
         """
-        qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+        self._ensure_c4a_wq_b_merge()
+        projection_input = (
+            hidden_states
+            if fused_wqa_wkv_input is None
+            else fused_wqa_wkv_input
+        )
+        qr_kv, _ = self.fused_wqa_wkv(projection_input)
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
 
         num_tokens = hidden_states.shape[0]
@@ -896,28 +1076,82 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # qr = self.q_norm(qr)
         # kv = self.kv_norm(kv)
 
-        # 2. fused impl
-        qr, kv = ixfops.rms_norm_qk(
-            qr,
-            kv,
-            self.q_norm.weight,
-            self.kv_norm.weight,
-            self.eps,
-        )
+        qr_projection_input: torch.Tensor | DynamicInt8Input
+        if _can_fuse_qr_norm_quant(self, qr, kv, attn_metadata):
+            qr, kv, qr_int8, qr_scale = (
+                ixfops.rms_norm_qk_dynamic_int8(
+                    qr,
+                    kv,
+                    self.q_norm.weight,
+                    self.kv_norm.weight,
+                    self.eps,
+                )
+            )
+            qr_projection_input = (qr_int8, qr_scale, qr.dtype)
+        else:
+            qr, kv = ixfops.rms_norm_qk(
+                qr,
+                kv,
+                self.q_norm.weight,
+                self.kv_norm.weight,
+                self.eps,
+            )
+            qr_projection_input = qr
+            can_share_qr_quant = (
+                _DS4_SHARED_QR_QUANT
+                and self.indexer is not None
+                and isinstance(
+                    getattr(self.wq_b, "scheme", None),
+                    IluCompressedTensorsW8A8Int8,
+                )
+                and isinstance(
+                    getattr(self.indexer.wq_b, "scheme", None),
+                    IluCompressedTensorsW8A8Int8,
+                )
+            )
+            if can_share_qr_quant:
+                qr_int8, qr_scale, _ = ilu_ops.scaled_int8_quant(qr.contiguous())
+                qr_projection_input = (qr_int8, qr_scale, qr.dtype)
 
         # 2) Q projection: (T, q_lora_rank) -> (T, n_local_heads, head_dim)
-        q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+        use_merged_c4a_wq_b = _can_merge_c4a_wq_b(
+            self,
+            qr_projection_input,
+            attn_metadata,
+        )
+        indexer_q = None
+        if use_merged_c4a_wq_b:
+            assert isinstance(qr_projection_input, tuple)
+            merged_q = self._apply_c4a_merged_wq_b(qr_projection_input)
+            q, indexer_q = merged_q.split(
+                [_C4A_OUTER_Q_N, _C4A_INDEXER_Q_N],
+                dim=-1,
+            )
+            q = q.view(-1, self.n_local_heads, self.head_dim)
+        else:
+            q = self.wq_b(qr_projection_input).view(
+                -1, self.n_local_heads, self.head_dim
+            )
 
         # 3) Per-layer-type sequencing.
         if self.indexer is not None:
             # C4A layer: indexer (own compressor + topk) + main compressor
             #            (writes main MLA cache) + SWA insert.
-            self.indexer(
-                hidden_states,
-                qr,
-                positions,
-                self.indexer_rotary_emb,
-            )
+            if indexer_q is None:
+                self.indexer(
+                    hidden_states,
+                    qr_projection_input,
+                    positions,
+                    self.indexer_rotary_emb,
+                )
+            else:
+                self.indexer(
+                    hidden_states,
+                    qr_projection_input,
+                    positions,
+                    self.indexer_rotary_emb,
+                    projected_q=indexer_q,
+                )
             assert self.compressor is not None
             self.compressor(hidden_states, positions, self.rotary_emb)
             self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
@@ -2051,9 +2285,10 @@ class IluDeepseekV4Indexer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        qr: torch.Tensor,
+        qr: torch.Tensor | DynamicInt8Input,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
+        projected_q: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         """Lightning indexer forward (bf16, ilu V4 W4A8).
 
@@ -2084,7 +2319,10 @@ class IluDeepseekV4Indexer(nn.Module):
         kernel work and return the buffer untouched, matching the
         upstream V3.2 ilu pattern.
         """
-        q, _ = self.wq_b(qr)
+        if projected_q is None:
+            q, _ = self.wq_b(qr)
+        else:
+            q = projected_q
         q = q.view(-1, self.n_head, self.head_dim)
 
         # Compressor returns ``None`` for the V4 path (it just writes the

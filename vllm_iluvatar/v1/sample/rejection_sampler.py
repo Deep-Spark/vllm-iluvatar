@@ -159,9 +159,16 @@ def rejection_sample_deterministic_draft_torch(
     recovered_draft_token_ids: list[int] = []
 
     for req_idx, n in enumerate(num_draft_tokens):
-        if n == 0:
-            continue
         if is_greedy is not None and bool(is_greedy[req_idx].item()):
+            # Already handled by rejection_greedy_sample_kernel.
+            continue
+        if n == 0:
+            # No draft to verify (e.g. the step right after prefill), but the
+            # request still has a sampled token to emit, carried as the bonus
+            # token. rejection_greedy_sample_kernel stores it at offset
+            # num_draft_tokens, so do the same here instead of skipping the
+            # request and dropping its first token.
+            output_token_ids[req_idx, 0] = bonus_token_ids[req_idx]
             continue
 
         start_idx = 0 if req_idx == 0 else int(cu_num_draft_tokens[req_idx - 1].item())

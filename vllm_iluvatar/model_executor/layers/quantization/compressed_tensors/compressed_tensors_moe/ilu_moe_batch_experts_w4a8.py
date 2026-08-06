@@ -170,11 +170,6 @@ class IluMoEBatchedExpertsW4A8(BaseBatchExperts):
                 f"got {expert_num_tokens_gpu.numel()}"
             )
 
-        dense_tokens_per_experts = ixff.moe_make_padded_dense_tokens_per_experts(
-            expert_num_tokens_gpu,
-            max_num_tokens_per_expert,
-        )
-
         if hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]:
             hidden_states, a1q_scale = ixff.scaled_int8_quant(hidden_states)
             a1q_scale = a1q_scale.flatten()
@@ -187,7 +182,11 @@ class IluMoEBatchedExpertsW4A8(BaseBatchExperts):
             f"got hidden_states: {hidden_states.shape}, scales: {a1q_scale.shape}"
         )
 
-        input_1, scale_1 = ixff.moe_group_gemv_reformat_input(
+        (
+            input_1,
+            scale_1,
+            dense_tokens_per_experts,
+        ) = ixff.moe_group_gemv_reformat_input_fused_dense(
             input=hidden_states,
             input_scales=a1q_scale,
             expert_num_tokens=expert_num_tokens_gpu,

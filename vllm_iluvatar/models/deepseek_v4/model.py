@@ -56,6 +56,7 @@ import ixformer.inference.functions as ixfops  # type: ignore[import]
 import regex as re
 import torch
 import torch.nn as nn
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
@@ -100,6 +101,9 @@ from vllm.utils.multi_stream_utils import AuxStreamType
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
     IluFusedMoEEP,
 )
+from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes import (
+    IluCompressedTensorsW8A8Int8,
+)
 from vllm_iluvatar.models.deepseek_v4.attention import (
     IluDeepseekV4Indexer,
     IluDeepseekV4MLAModules,
@@ -138,6 +142,7 @@ elif _DS4_MHC_PRE_VERSION == "v3":
 # IXFORMER_DS4_HC_PRE_NORM_FUSION=0 opts out for A/B against the standalone
 # rms_norm call.
 _DS4_HC_PRE_NORM_FUSION = os.environ.get("IXFORMER_DS4_HC_PRE_NORM_FUSION", "1") == "1"
+_DS4_MHC_DYNAMIC_INT8 = os.environ.get("IXFORMER_DS4_MHC_DYNAMIC_INT8", "0") == "1"
 
 
 def _hc_pre_norm_fusion_available() -> bool:
@@ -275,6 +280,12 @@ class IluDeepseekV4MLP(nn.Module):
             if isinstance(self.down_proj.scheme, IluCompressedTensorsW8A8Int8):
                 self.act_fn.enable_fuse_quant()
 
+    def supports_prequantized_gate_up(self) -> bool:
+        return isinstance(
+            getattr(self.gate_up_proj, "scheme", None),
+            IluCompressedTensorsW8A8Int8,
+        )
+
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
@@ -386,6 +397,8 @@ class IluDeepseekV4MoE(nn.Module, IluFusedMoEEP):
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        shared_gate_up_input: tuple[torch.Tensor, torch.Tensor, torch.dtype]
+        | None = None,
     ) -> torch.Tensor:
         if self.gate.tid2eid is not None:
             if input_ids is None:
@@ -394,9 +407,14 @@ class IluDeepseekV4MoE(nn.Module, IluFusedMoEEP):
 
         org_shape = hidden_states.shape
         if self._should_use_forward_dp_ep():
-            final_hidden_states = self.forward_dp_ep(hidden_states, input_ids)
+            final_hidden_states = self.forward_dp_ep(
+                hidden_states,
+                input_ids,
+                shared_gate_up_input=shared_gate_up_input,
+            )
             return final_hidden_states.view(org_shape)
 
+        assert shared_gate_up_input is None
         if self.experts.is_internal_router:
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
@@ -586,8 +604,15 @@ class IluDeepseekV4Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None,
+        fused_wqa_wkv_input: tuple[torch.Tensor, torch.Tensor, torch.dtype]
+        | None = None,
     ):
-        return self.mla_attn(positions, hidden_states, llama_4_scaling)
+        return self.mla_attn(
+            positions,
+            hidden_states,
+            llama_4_scaling,
+            fused_wqa_wkv_input=fused_wqa_wkv_input,
+        )
 
 
 class IluDeepseekV4DecoderLayer(nn.Module):
@@ -615,6 +640,19 @@ class IluDeepseekV4DecoderLayer(nn.Module):
             ),
         )
         self.ffn = IluDeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
+        layer_id = extract_layer_index(prefix)
+        self.attn_pre_quant_enabled = (
+            0 <= layer_id < config.num_hidden_layers
+            and isinstance(
+                getattr(self.attn.fused_wqa_wkv, "scheme", None),
+                IluCompressedTensorsW8A8Int8,
+            )
+        )
+        self.ffn_pre_shared_quant_enabled = (
+            envs.VLLM_ILU_DECODE_EP_BACKEND == "deepep_low_latency"
+            and self.ffn.shared_experts is not None
+            and self.ffn.shared_experts.supports_prequantized_gate_up()
+        )
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -700,6 +738,7 @@ class IluDeepseekV4DecoderLayer(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
         norm: RMSNorm,
+        emit_dynamic_int8: bool = False,
     ):
         """hc_pre followed by the sublayer ``norm``, fused where supported.
 
@@ -710,7 +749,7 @@ class IluDeepseekV4DecoderLayer(nn.Module):
         ``_HcPreNormFusion.begin_step``.
         """
         if self.hc_pre_fusion is not None and self.hc_pre_fusion.enabled:
-            post_mix, comb_mix, layer_input = ixfops.ds4_mhc_pre_v2(
+            outputs = ixfops.ds4_mhc_pre_v2(
                 residual=x,
                 fn=hc_fn,
                 hc_scale=hc_scale,
@@ -724,11 +763,18 @@ class IluDeepseekV4DecoderLayer(nn.Module):
                 need_rms=True,
                 rms_weight=norm.weight.data,
                 layer_rms_eps=norm.variance_epsilon,
+                emit_dynamic_int8=emit_dynamic_int8,
             )
-            return layer_input, post_mix, comb_mix
+            if emit_dynamic_int8:
+                post_mix, comb_mix, layer_input, quantized, scales = outputs
+                dynamic_int8_input = (quantized, scales, layer_input.dtype)
+            else:
+                post_mix, comb_mix, layer_input = outputs
+                dynamic_int8_input = None
+            return layer_input, post_mix, comb_mix, dynamic_int8_input
 
         layer_input, post_mix, comb_mix = self.hc_pre(x, hc_fn, hc_scale, hc_base)
-        return norm(layer_input), post_mix, comb_mix
+        return norm(layer_input), post_mix, comb_mix, None
 
     def hc_post(
         self,
@@ -758,26 +804,49 @@ class IluDeepseekV4DecoderLayer(nn.Module):
         if self.owns_hc_pre_fusion:
             self.hc_pre_fusion.begin_step(x.shape[0])
 
+        decode_only = self.ffn._is_all_ranks_decode_only()
+
         residual = x
-        x, post, comb = self.hc_pre_norm(
+        emit_attn_quant = (
+            _DS4_MHC_DYNAMIC_INT8
+            and self.attn_pre_quant_enabled
+            and decode_only
+        )
+        x, post, comb, attention_input = self.hc_pre_norm(
             x,
             self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
             self.attn_norm,
+            emit_dynamic_int8=emit_attn_quant,
         )
-        x = self.attn(positions, x, None)
+        x = self.attn(
+            positions,
+            x,
+            None,
+            fused_wqa_wkv_input=attention_input,
+        )
         x = self.hc_post(x, residual, post, comb)
 
         residual = x
-        x, post, comb = self.hc_pre_norm(
+        emit_ffn_quant = (
+            _DS4_MHC_DYNAMIC_INT8
+            and self.ffn_pre_shared_quant_enabled
+            and decode_only
+        )
+        x, post, comb, shared_gate_up_input = self.hc_pre_norm(
             x,
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
             self.ffn_norm,
+            emit_dynamic_int8=emit_ffn_quant,
         )
-        x = self.ffn(x, input_ids)
+        x = self.ffn(
+            x,
+            input_ids,
+            shared_gate_up_input=shared_gate_up_input,
+        )
         x = self.hc_post(x, residual, post, comb)
         return x
 

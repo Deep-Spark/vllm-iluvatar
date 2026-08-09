@@ -1543,6 +1543,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 self._forward_prefill_as_decode(
                     q=prefill_q,
                     kv_cache=self_kv_cache,
+                    positions=positions[num_decode_tokens:],
                     swa_metadata=swa_metadata,
                     attn_metadata=flashmla_metadata if not swa_only else None,
                     swa_only=swa_only,
@@ -1571,6 +1572,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             self._forward_decode(
                 q=q[:num_decode_tokens],
                 kv_cache=self_kv_cache,
+                positions=positions[:num_decode_tokens],
                 swa_metadata=swa_metadata,
                 attn_metadata=flashmla_metadata if not swa_only else None,
                 swa_only=swa_only,
@@ -1581,6 +1583,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self,
         q: torch.Tensor,
         kv_cache: torch.Tensor | None,
+        positions: torch.Tensor,
         swa_metadata: DeepseekSparseSWAMetadata,
         attn_metadata: IluFlashMLASparseMetadata | None,
         swa_only: bool,
@@ -1635,6 +1638,8 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                         attn_metadata.block_table[:num_decodes],
                         block_size,
                         is_valid,
+                        positions,
+                        self.compress_ratio,
                     )
                 )
                 topk_indices = global_indices.view(num_decode_tokens, 1, -1)
@@ -1732,6 +1737,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self,
         q: torch.Tensor,
         kv_cache: torch.Tensor | None,
+        positions: torch.Tensor,
         swa_metadata: DeepseekSparseSWAMetadata,
         attn_metadata: IluFlashMLASparseMetadata | None,
         swa_only: bool,
@@ -1823,6 +1829,8 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 attn_metadata.block_table,
                 block_size,
                 is_valid,
+                positions,
+                self.compress_ratio,
             )
             topk_indices = global_indices.view(num_prefill_tokens, 1, -1)
 

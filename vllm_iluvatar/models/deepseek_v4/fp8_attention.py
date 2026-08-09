@@ -50,13 +50,13 @@ from vllm.v1.kv_cache_interface import (
     get_kv_quant_mode,
 )
 
-from vllm_iluvatar.model_executor.models.deepseek_v4.attention import (
+from vllm_iluvatar.models.deepseek_v4.attention import (
     IluDeepseekCompressor,
 )
-from vllm_iluvatar.model_executor.models.deepseek_v4.flashmla_sparse import (
+from vllm_iluvatar.models.deepseek_v4.flashmla_sparse import (
     IluDeepseekV4Fp8FlashMLASparseBackend,
 )
-from vllm_iluvatar.model_executor.models.deepseek_v4.sparse_swa import (
+from vllm_iluvatar.models.deepseek_v4.sparse_swa import (
     IluDeepseekV4Fp8SWACache,
 )
 from vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse import (

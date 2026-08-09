@@ -40,7 +40,7 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.attention import _resolve_dsv4_kv_cache_dtype
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
-from vllm.v1.attention.backends.mla.ilu_indexer import (
+from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
     IluDeepseekV32IndexerMetadata,
     IluDeepseekV4IndexerBackend,
 )

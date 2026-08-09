@@ -50,6 +50,33 @@ def _uses_ilu_w8a8_int8(proj: Any) -> bool:
     )
 
 
+# Sentinel forwarded to the ixmm SwiGLU when a layer wants *no* clamp; see
+# ``ilu_modelopt_nvfp4._SWIGLU_NO_CLAMP``.
+_SWIGLU_NO_CLAMP = 1e30
+
+
+def _wire_swiglu_limit(routed_experts: Any) -> None:
+    """Translate the community activation string to a numeric SwiGLU limit.
+
+    Community ``FusedMoEBlock`` encodes Step3.5's per-layer routed SwiGLU as an
+    ``activation`` string (``step3p5.py:350-368``): ``"swiglustep"`` (limit 7,
+    asserted) or ``"silu"`` (no clamp). The Iluvatar ixmm MoE path
+    (``ilu_mxfp4_fused_experts`` via ``IluModelOptNvFp4MoEMethod.apply``) instead
+    reads a numeric ``swiglu_limit`` and has no no-clamp mode, so map:
+    ``swiglustep`` -> ``7.0``; ``silu`` -> a large sentinel (clamp is a no-op).
+
+    Must target the ``RoutedExperts`` object: ``apply`` is invoked with the
+    runner's ``routed_experts`` as ``layer`` and reads
+    ``getattr(layer, "swiglu_limit", None)``. ``activation`` also lives there
+    (``routed_experts.py:103``); the runner only re-exports it via a read-only
+    property. Harmless for non-ixmm methods (W8A8), which never read it.
+    """
+    activation = getattr(routed_experts, "activation", "silu")
+    routed_experts.swiglu_limit = (
+        7.0 if activation == "swiglustep" else _SWIGLU_NO_CLAMP
+    )
+
+
 class IluStep3p5MLP(_Step3p5MLP):
     """Community MLP with W8A8 fused-input capability detection."""
 
@@ -139,6 +166,11 @@ class IluStep3p5DecoderLayer(_Step3p5DecoderLayer):
         layer.self_attn.__class__ = IluStep3p5Attention
         if layer.use_moe:
             layer.moe.__class__ = IluFusedMoEBlock
+            # Inject the numeric routed SwiGLU limit the ixmm MoE path reads;
+            # community only stored the activation string on the experts. The
+            # method reads it off ``routed_experts`` (the ``layer`` arg of
+            # ``apply``), not the MoE runner, so wire it there.
+            _wire_swiglu_limit(layer.moe.experts.routed_experts)
         else:
             layer.mlp.__class__ = IluStep3p5MLP
 

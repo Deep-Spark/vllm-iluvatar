@@ -993,9 +993,15 @@ class IluDeepseekV4Model(nn.Module):
                 "DeepSeek-V4 mhc_pre: using ds4_mhc_pre_v3 (bf16 GEMM + split epilogue)"
             )
 
-        self.topk_indices_buffer = torch.empty(
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            config.index_topk,
+        # -1 is the "no token" sentinel. Consumers bound each row by the
+        # token's position, so they never read a row the indexer skipped, but
+        # an index buffer should still not start out as uninitialised memory.
+        self.topk_indices_buffer = torch.full(
+            (
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                config.index_topk,
+            ),
+            -1,
             dtype=torch.int32,
             device=self.device,
         )

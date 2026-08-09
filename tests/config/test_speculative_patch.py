@@ -79,10 +79,10 @@ def test_remaps_deepseek_v4_after_community_routing():
     orig = _make_orig([], out_architectures=["DeepSeekV4MTPModel"])
     wrapped = make_hf_config_override(orig)
 
-    cfg = _FakeHFConfig(["DeepseekV4ForCausalLM"])
+    cfg = _FakeHFConfig(["IluDeepseekV4ForCausalLM"])
     result = wrapped(cfg)
 
-    assert result.architectures == ["DeepSeekV4MTPModel"]
+    assert result.architectures == ["IluDeepSeekV4MTPModel"]
 
 
 # --- factory: non-ilu passthrough ------------------------------------------

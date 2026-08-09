@@ -8,8 +8,11 @@ diverges in three places:
    ``my_tests/deepseek/deepseek-v4/convert_w4a8/convert_v4_to_w4a8.py``,
    which write a fresh ``quantization_config`` block whose
    ``quant_method == "ilu_deepseek_v4_w4a8"`` (handled by
-   :class:`IluDeepseekV4W4A8Config`). ``DeepseekV4ForCausalLM`` resolves to
-   this Iluvatar implementation when the plugin registry override is applied.
+   :class:`IluDeepseekV4W4A8Config`). ``IluDeepseekV4ForCausalLM`` resolves to
+   this Iluvatar implementation when the plugin registry override is applied
+   (the community ``DeepseekV4ForCausalLM`` arch is owned by the raw-FP8 fork,
+   so the W4A8 checkpoint's ``config.json`` must carry the ``Ilu``-prefixed
+   arch name).
 
 2. **MegaMoE removed** - the deep-gemm MegaMoE path, its triton input
    staging kernel, the bespoke expert params mapping and the
@@ -1022,10 +1025,10 @@ def register_model() -> None:
     from vllm import ModelRegistry
 
     ModelRegistry.register_model(
-        "DeepseekV4ForCausalLM",
+        "IluDeepseekV4ForCausalLM",
         "vllm_iluvatar.models.deepseek_v4.model:IluDeepseekV4ForCausalLM",
     )
     ModelRegistry.register_model(
-        "DeepSeekV4MTPModel",
+        "IluDeepSeekV4MTPModel",
         "vllm_iluvatar.models.deepseek_v4.mtp:IluDeepSeekV4MTP",
     )

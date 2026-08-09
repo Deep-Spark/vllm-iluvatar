@@ -114,6 +114,7 @@ if TYPE_CHECKING:
     VLLM_ILU_GDN_ATTN_BACKEND: bool = False
     VLLM_ILU_DS4_PREFILL_OPT: bool = False
     VLLM_ILU_DS4_PREFILL_AS_DECODE: bool = False
+    VLLM_ILU_DS4_C4A_FUSED_INDEXCOMPRESS: bool = False
     VLLM_ILU_DS4_MQA_QUANT_TYPE: str = ""
     VLLM_ILU_FUSE_NORM_QUANT: bool = True
     VLLM_ILU_FUSE_MOE_W13: bool = True
@@ -189,6 +190,22 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
         ).lower()
         in ("1", "true")
     ),
+    # Collapse a C4A layer's indexer compressor + weights_proj + main
+    # compressor into the single ``ds4_c4a_indexcompress`` op (one concatenated
+    # GEMM plus one task-split paged post). Only eligible on decode batches
+    # (plain or MTP verify) with a bf16 main KV cache; see
+    # IluDeepseekV4MultiHeadLatentAttentionWrapper._use_c4a_fused.
+    "VLLM_ILU_DS4_C4A_FUSED_INDEXCOMPRESS": lambda: (
+        _get(
+            "VLLM_ILU_DS4_C4A_FUSED_INDEXCOMPRESS",
+            "VLLM_DS4_C4A_FUSED_INDEXCOMPRESS",
+            "0",
+        ).lower()
+        in ("1", "true")
+    ),
+    "VLLM_ILU_W8A8_GEMM_MODE": lambda: _get(
+        "VLLM_ILU_W8A8_GEMM_MODE", "VLLM_W8A8_GEMM_MODE", "PERF"
+    ).upper(),
 }
 
 

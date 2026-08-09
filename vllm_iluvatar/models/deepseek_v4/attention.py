@@ -535,6 +535,17 @@ class IluDeepseekCompressor(DeepseekCompressor):
     metadata-driven and CUDA-graph friendly.
     """
 
+    def k_cache_layer(self):
+        """The attention layer this compressor writes its K cache into.
+
+        ``DeepseekCompressor`` resolves it through the static forward context
+        captured at construction time (``get_current_vllm_config()`` is not
+        available in ``forward``). Exposed as a method so the C4A fused path,
+        which drives a second compressor's cache, does not have to reach into
+        another module's private attribute.
+        """
+        return self._static_forward_context[self.k_cache_prefix]
+
     def forward(
         self,
         x: torch.Tensor,  # [num_tokens, hidden_size]
@@ -873,6 +884,16 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
             self.compressor.kv_cache_dtype = self.mla_attn.kv_cache_dtype
 
+        self._c4a_fused_supported = (
+            envs.VLLM_ILU_DS4_C4A_FUSED_INDEXCOMPRESS
+            and self._c4a_fused_layer_eligible()
+        )
+        if self.indexer is not None and envs.VLLM_ILU_DS4_C4A_FUSED_INDEXCOMPRESS:
+            logger.info_once(
+                "ilu DeepSeek-V4: C4A fused index+compress %s.",
+                "enabled" if self._c4a_fused_supported else "unsupported on this layer",
+            )
+
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
         self._ensure_c4a_wq_b_merge()
 
@@ -927,6 +948,42 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             self._c4a_merged_wq_b_scale,
             format="TN",
             out_dtype=out_dtype,
+        )
+
+    def _c4a_fused_layer_eligible(self) -> bool:
+        """Whether this layer's geometry is the one the fused op is built for.
+
+        ``ds4_c4a_indexcompress`` hardcodes the C4A shapes -- compress_ratio 4,
+        coff 2, 64x128 index heads, a 512-wide main head and a 64-wide RoPE
+        band, i.e. a ``[2624, hidden]`` concatenated projection. It is bf16
+        only (its projection runs on ``gemm_bf16_bf16_fp32``), writes both K
+        caches in that dtype, and takes a single cos/sin table for the indexer
+        q RoPE and both compressor pools. So it cannot serve a C128A layer, an
+        fp8_ds_mla main cache, or a model that gives the indexer its own rotary
+        embedding.
+
+        The C++ layer re-checks the resulting shapes, but that only fires once
+        a batch is already in flight; deciding here keeps an unsupported
+        checkpoint on the per-op path instead of aborting the first decode.
+        """
+        if self.indexer is None or self.compressor is None:
+            return False
+        if self.compress_ratio != 4 or self.rope_head_dim != 64:
+            return False
+        if self.mla_attn.kv_cache_dtype == "fp8_ds_mla":
+            return False
+        if self.compressor.norm.weight.dtype != torch.bfloat16:
+            return False
+        if self.indexer_rotary_emb is not self.rotary_emb:
+            return False
+        indexer_compressor = self.indexer.compressor
+        return (
+            self.indexer.n_head == 64
+            and self.indexer.head_dim == 128
+            and indexer_compressor.head_dim == 128
+            and indexer_compressor.coff == 2
+            and self.compressor.head_dim == 512
+            and self.compressor.coff == 2
         )
 
     def forward(
@@ -1115,7 +1172,11 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 qr_projection_input = (qr_int8, qr_scale, qr.dtype)
 
         # 2) Q projection: (T, q_lora_rank) -> (T, n_local_heads, head_dim)
-        use_merged_c4a_wq_b = _can_merge_c4a_wq_b(
+        # ``ds4_c4a_indexcompress`` projects the indexer's q itself, in bf16,
+        # and takes no pre-projected q, so merging wq_b ahead of it would be
+        # dead work. Where both paths apply, the fused one wins.
+        use_c4a_fused = self.indexer is not None and self._use_c4a_fused(attn_metadata)
+        use_merged_c4a_wq_b = not use_c4a_fused and _can_merge_c4a_wq_b(
             self,
             qr_projection_input,
             attn_metadata,
@@ -1138,13 +1199,23 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         if self.indexer is not None:
             # C4A layer: indexer (own compressor + topk) + main compressor
             #            (writes main MLA cache) + SWA insert.
-            if indexer_q is None:
+            assert self.compressor is not None
+            if use_c4a_fused:
+                self.indexer.forward_c4a_fused(
+                    hidden_states,
+                    qr,
+                    positions,
+                    self.indexer_rotary_emb,
+                    self.compressor,
+                )
+            elif indexer_q is None:
                 self.indexer(
                     hidden_states,
                     qr_projection_input,
                     positions,
                     self.indexer_rotary_emb,
                 )
+                self.compressor(hidden_states, positions, self.rotary_emb)
             else:
                 self.indexer(
                     hidden_states,
@@ -1153,8 +1224,7 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                     self.indexer_rotary_emb,
                     projected_q=indexer_q,
                 )
-            assert self.compressor is not None
-            self.compressor(hidden_states, positions, self.rotary_emb)
+                self.compressor(hidden_states, positions, self.rotary_emb)
             self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
         elif self.compressor is not None:
             # C128A layer: main compressor + SWA insert. No indexer.
@@ -1191,6 +1261,40 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         #    ixformer kernels (``ds4_flash_mla_sparse_fwd`` /
         #    ``ds4_flash_mla_with_kvcache``) accept arbitrary ``h_q``.
         self.mla_attn(q, kv, positions, output=out)
+
+    def _use_c4a_fused(self, attn_metadata) -> bool:
+        """Whether this batch may go through ``ds4_c4a_indexcompress``.
+
+        The fused post pass launches both compressors' ``save_partial`` and
+        both ``pool_norm_rope_insert`` phases as sibling block groups of a
+        single kernel with no grid barrier between them. That is safe because
+        a pooling block never waits on a sibling: it takes *every* window row
+        this batch produces straight from the projection output, and only rows
+        written by an earlier step from the paged state cache. Resolving an
+        in-batch row is positional -- the row at ``pos - d`` is token ``t - d``
+        when that token is the same request sitting at that position -- so the
+        only thing the op needs is vLLM's own batch layout, a request's query
+        tokens contiguous and ascending. Plain decode (one token per request)
+        and MTP / spec-decode verify steps (``next_n`` consecutive tokens) both
+        satisfy it.
+
+        Prefill stays on the per-op path. It would be correct by the same rule,
+        but the launch geometry (five block groups of one block per token, and
+        one whole block per pooled token) is sized for decode-length batches.
+
+        Dummy / profiling runs are routed through the fused path as well so it
+        can build its concatenated weight matrix and reserve the projection
+        workspace before CUDA-graph capture.
+        """
+        if not self._c4a_fused_supported:
+            return False
+        if not isinstance(attn_metadata, dict):
+            return True
+        assert self.indexer is not None
+        md = attn_metadata.get(self.indexer.k_cache.prefix)
+        if not isinstance(md, IluDeepseekV32IndexerMetadata):
+            return False
+        return md.num_prefills == 0 and md.decode is not None
 
     def _fused_qnorm_rope_kv_insert(
         self,
@@ -2273,6 +2377,9 @@ class IluDeepseekV4Indexer(nn.Module):
             k_cache_prefix=self.k_cache.prefix,
             use_fp4_cache=self.use_fp4_kv,
         )
+        # Concatenated projection matrix for ``forward_c4a_fused``; built on
+        # the first fused call, once the checkpoint weights are in place.
+        self._cmp_a: torch.Tensor | None = None
 
         # Stage 2: we do *not* register a SparseAttnIndexer custom op here.
         # The indexer's forward inlines the bf16 mqa-logits + topk kernels
@@ -2354,6 +2461,18 @@ class IluDeepseekV4Indexer(nn.Module):
             inplace_q=False,
         )
 
+        return self._topk_tail(q, weights)
+
+    def _topk_tail(
+        self,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """MQA logits + top-k over the compressed indexer K cache.
+
+        Shared by :meth:`forward` and :meth:`forward_c4a_fused`; both only
+        differ in how ``q`` / ``weights`` are produced.
+        """
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
             # Profiling / dummy run: caller (wrapper.forward) handles the
@@ -2445,6 +2564,149 @@ class IluDeepseekV4Indexer(nn.Module):
             )
 
         return topk_buffer
+
+    def _build_cmp_a(self, main_compressor: IluDeepseekCompressor) -> torch.Tensor:
+        """Concatenate the three projections ``ds4_c4a_indexcompress`` expects
+        into one ``[2624, hidden_size]`` matrix: indexer kv|score (512),
+        indexer weights (64), main kv|score (2048).
+
+        The source parameters are re-pointed at row views of the result so the
+        weights live in one buffer instead of being stored twice. Both
+        compressors use ``disable_tp=True`` and ``weights_proj`` is replicated,
+        so the row count is TP-invariant.
+        """
+        ic_w = self.compressor.fused_wkv_wgate.weight
+        wt_w = self.weights_proj.weight
+        main_w = main_compressor.fused_wkv_wgate.weight
+        assert ic_w.dtype == wt_w.dtype == main_w.dtype, (
+            "C4A fused index+compress needs one dtype across the three "
+            f"projections, got {ic_w.dtype}/{wt_w.dtype}/{main_w.dtype}; a "
+            "quantized compressor or weights_proj is not supported"
+        )
+        assert ic_w.shape[1] == wt_w.shape[1] == main_w.shape[1], (
+            "C4A fused index+compress needs the three projections to share a "
+            f"reduction dim, got {ic_w.shape}/{wt_w.shape}/{main_w.shape}"
+        )
+        cmp_a = torch.cat([ic_w, wt_w, main_w], dim=0)
+        n_ic, n_wt = ic_w.shape[0], wt_w.shape[0]
+        self.compressor.fused_wkv_wgate.weight.data = cmp_a[:n_ic]
+        self.weights_proj.weight.data = cmp_a[n_ic : n_ic + n_wt]
+        main_compressor.fused_wkv_wgate.weight.data = cmp_a[n_ic + n_wt :]
+        return cmp_a
+
+    def forward_c4a_fused(
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_emb: nn.Module,
+        main_compressor: IluDeepseekCompressor,
+    ) -> torch.Tensor | None:
+        """Fused replacement for ``indexer(...)`` plus the C4A layer's main
+        ``compressor(...)``: one concatenated GEMM and one task-split paged
+        post pass instead of two GEMMs and five per-op launches.
+
+        ``ds4_c4a_indexcompress`` covers the indexer ``save_partial`` +
+        ``pool_norm_rope_insert``, ``weights_proj`` + its scale, the indexer q
+        RoPE, and the main compressor's ``save_partial`` +
+        ``pool_norm_rope_insert``. MQA logits and top-k stay on the per-op
+        path (:meth:`_topk_tail`).
+
+        Eligibility is decided by the caller
+        (``IluDeepseekV4MultiHeadLatentAttentionWrapper._use_c4a_fused``); this
+        method assumes a decode batch whose query tokens are contiguous and
+        ascending per request (plain decode or an MTP verify step) and a bf16
+        main KV cache.
+        """
+        if self._cmp_a is None:
+            # Concatenating reallocates the three checkpoint weights, so this
+            # cannot happen under graph capture. The dummy run is routed here
+            # (see ``_use_c4a_fused``) precisely so that it happens first;
+            # assert rather than let capture record a stale pointer.
+            assert not torch.cuda.is_current_stream_capturing(), (
+                "C4A fused index+compress: the concatenated projection matrix "
+                "must be built before CUDA-graph capture, but no dummy run "
+                "reached forward_c4a_fused"
+            )
+            self._cmp_a = self._build_cmp_a(main_compressor)
+
+        q, _ = self.wq_b(qr)
+        q = q.view(-1, self.n_head, self.head_dim)
+        num_tokens = q.shape[0]
+
+        # Shared, monotonically growing workspace: the projection output is
+        # dead once the post pass has run, so every layer reuses the same
+        # bytes. Requested on dummy runs too, so the buffer is already at full
+        # size before CUDA-graph capture locks it.
+        (cmp_out,) = current_workspace_manager().get_simultaneous(
+            ((num_tokens, self._cmp_a.shape[0]), torch.float32),
+        )
+
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return self.topk_indices_buffer
+
+        ic_md = cast(
+            CompressorMetadata,
+            attn_metadata[self.compressor.state_cache.prefix],
+        )
+        main_md = cast(
+            CompressorMetadata,
+            attn_metadata[main_compressor.state_cache.prefix],
+        )
+        idx_k_md = cast(Any, attn_metadata[self.compressor.k_cache_prefix])
+        main_k_md = cast(Any, attn_metadata[main_compressor.k_cache_prefix])
+        main_k = main_compressor.k_cache_layer().kv_cache
+
+        # The op requires every per-token argument to have the same leading
+        # dim. Under data parallelism the model forward runs on DP-padded rows
+        # while the metadata stays at ``num_actual``, so trim to the shortest
+        # (same reasoning as ``IluDeepseekCompressor.forward``; in FULL
+        # cudagraph mode these slices are captured no-ops).
+        num_actual = min(
+            num_tokens,
+            positions.shape[0],
+            ic_md.slot_mapping.shape[0],
+            main_md.slot_mapping.shape[0],
+            idx_k_md.slot_mapping.shape[0],
+            main_k_md.slot_mapping.shape[0],
+        )
+
+        # Sized like ``q`` rather than like the op's input, because
+        # ``_topk_tail`` slices both with the same token counts. Only the first
+        # ``num_actual`` rows are written; the DP-padding tail is never read,
+        # exactly as for ``q``.
+        weights = torch.empty(
+            (num_tokens, self.n_head), dtype=q.dtype, device=q.device
+        )
+        ixfops.ds4_c4a_indexcompress(
+            cmp_a=self._cmp_a,
+            cmp_x=hidden_states[:num_actual],
+            cmp_out=cmp_out[:num_actual],
+            index_q=q[:num_actual],
+            weights=weights[:num_actual],
+            positions=positions[:num_actual],
+            ape_ic=self.compressor.ape,
+            ape_main=main_compressor.ape,
+            rms_ic=self.compressor.norm.weight,
+            rms_main=main_compressor.norm.weight,
+            cos_sin=rotary_emb.cos_sin_cache,
+            ic_state=self.compressor.state_cache.kv_cache,
+            main_state=main_compressor.state_cache.kv_cache,
+            idx_k=self.k_cache.kv_cache,
+            main_k=main_k,
+            token_to_req_indices=ic_md.token_to_req_indices[:num_actual],
+            ic_block_table=ic_md.block_table,
+            main_block_table=main_md.block_table,
+            ic_state_slot_mapping=ic_md.slot_mapping[:num_actual],
+            main_state_slot_mapping=main_md.slot_mapping[:num_actual],
+            idx_k_slot_mapping=idx_k_md.slot_mapping[:num_actual],
+            main_k_slot_mapping=main_k_md.slot_mapping[:num_actual],
+            ic_block_size=ic_md.block_size,
+            main_block_size=main_md.block_size,
+            rms_norm_eps=self.compressor.rms_norm_eps,
+        )
+        return self._topk_tail(q, weights)
 
 
 # ---------------------------------------------------------------------------

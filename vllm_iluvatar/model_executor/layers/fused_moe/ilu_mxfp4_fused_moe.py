@@ -256,6 +256,14 @@ _IXMM_BACKEND = "ixmm"
 _VALID_BACKENDS = (_TORCH_BACKEND, _IXFORMER_NATIVE_BACKEND, _IXMM_BACKEND)
 _AUTO_BACKEND = "auto"
 
+# SwiGLU activation variants for the ixformer step-4 fusion. The default keeps
+# the DeepSeek-V4 / MXFP4 behaviour (clamp before silu, no no-clamp mode) so
+# existing callers are unaffected; Step-3.7 NVFP4 selects the community
+# ``swiglustep`` semantics (clamp after silu, ``limit <= 0`` = plain SwiGLU).
+_DSV4_CLAMP_VARIANT = "dsv4_clamp"
+_STEP3_SWIGLUSTEP_VARIANT = "step3_swiglustep"
+_VALID_SWIGLU_VARIANTS = (_DSV4_CLAMP_VARIANT, _STEP3_SWIGLUSTEP_VARIANT)
+
 
 def _ixmm_backend_available() -> bool:
     """True iff the ixmm ``group_gemm_fp4`` backend is usable on this build.
@@ -417,13 +425,14 @@ def _ilu_mxfp4_fused_experts_ixformer(
     w2_bias: torch.Tensor | None,
     gemm_backend: str,
     gemm_mode: int | None,
+    swiglu_variant: str,
 ) -> torch.Tensor:
     """The ixformer pipeline.
 
-    Six steps: routing -> expand+E4M3 -> GEMM1 -> clamp+SwiGLU+E4M3 -> GEMM2
+    Six steps: routing -> expand+E4M3 -> GEMM1 -> SwiGLU+E4M3 -> GEMM2
     -> gather+reduce. Stays in compact expert order between GEMM1 and the
-    final gather; ``fuse_swiglu=False`` because DSv4 needs the clamp and the
-    community w13 layout is gate-then-up, not 16-column interleaved.
+    final gather; ``fuse_swiglu=False`` because the SwiGLU needs the clamp and
+    the community w13 layout is gate-then-up, not 16-column interleaved.
 
     ``gemm_backend`` is one of ``"torch"`` / ``"ixformer_native"`` / ``"ixmm"``
     and is forwarded verbatim to ``group_gemm_fp4``. It also selects how the
@@ -433,6 +442,12 @@ def _ilu_mxfp4_fused_experts_ixformer(
     ``gemm_mode`` is forwarded to ``group_gemm_fp4``: ``None`` (default)
     auto-selects gemv when ``M <= 128``, else gemm; explicit ``0`` / ``1``
     override that choice.
+
+    ``swiglu_variant`` selects the step-4 activation op:
+    ``"dsv4_clamp"`` (default) -> ``swiglu_limit_dynamic_scaled_fp8`` (DSv4
+    clamp-before-silu); ``"step3_swiglustep"`` ->
+    ``swiglustep_dynamic_scaled_fp8`` (clamp-after-silu, ``limit <= 0`` =
+    plain SwiGLU).
     """
     # Lazy import: keeps this module importable on a CPU host / when ixformer
     # is absent. The dispatcher only reaches here on the CUDA + ivcore30 path.
@@ -468,9 +483,15 @@ def _ilu_mxfp4_fused_experts_ixformer(
         "ixformer MoE pipeline requires bf16 activation "
         f"(got {hidden_states.dtype}); dispatcher should have fallen back."
     )
-    assert swiglu_limit is not None, (
-        "swiglu_limit must be set: swiglu_limit_dynamic_scaled_fp8 has no "
-        "'no clamp' mode"
+    assert swiglu_variant in _VALID_SWIGLU_VARIANTS, (
+        f"unknown swiglu_variant {swiglu_variant!r}; expected one of "
+        f"{_VALID_SWIGLU_VARIANTS}"
+    )
+    # Only the DSv4 op lacks a no-clamp mode. ``step3_swiglustep`` treats
+    # ``None`` / ``0`` as plain SwiGLU natively (layers 3-42).
+    assert swiglu_variant != _DSV4_CLAMP_VARIANT or swiglu_limit is not None, (
+        "swiglu_limit must be set for swiglu_variant='dsv4_clamp': "
+        "swiglu_limit_dynamic_scaled_fp8 has no 'no clamp' mode"
     )
     assert w13_bias is None and w2_bias is None, (
         "bias is not wired into group_gemm_fp4; the dispatcher should have "
@@ -512,10 +533,17 @@ def _ilu_mxfp4_fused_experts_ixformer(
         backend=gemm_backend,
     )
 
-    # --- 4) clamp + SwiGLU + E4M3 ---------------------------------------
-    a2_fp8, a2_scale = ixfops.swiglu_limit_dynamic_scaled_fp8(
-        gemm1_out, dst_to_src, float(swiglu_limit)
-    )
+    # --- 4) SwiGLU + E4M3 -----------------------------------------------
+    if swiglu_variant == _STEP3_SWIGLUSTEP_VARIANT:
+        # Step-3.5 swiglustep: clamp after silu; ``limit <= 0`` = plain SwiGLU.
+        a2_fp8, a2_scale = ixfops.swiglustep_dynamic_scaled_fp8(
+            gemm1_out, dst_to_src, float(swiglu_limit or 0.0)
+        )
+    else:
+        # DSv4 / MXFP4: clamp before silu (unchanged legacy behaviour).
+        a2_fp8, a2_scale = ixfops.swiglu_limit_dynamic_scaled_fp8(
+            gemm1_out, dst_to_src, float(swiglu_limit)
+        )
 
     # --- 5) GEMM2 -------------------------------------------------------
     gemm2_out = torch.empty((M, H), dtype=torch.bfloat16, device=hidden_states.device)
@@ -559,16 +587,21 @@ def ilu_mxfp4_fused_experts(
     w2_bias: torch.Tensor | None = None,
     run_decode: bool = False,
     backend: str | None = None,
+    swiglu_variant: str = _DSV4_CLAMP_VARIANT,
 ) -> torch.Tensor:
     """Dispatcher for the routed MXFP4 expert compute.
 
-    Takes the same arguments as ``ilu_mxfp4_fused_experts_torch`` plus two
+    Takes the same arguments as ``ilu_mxfp4_fused_experts_torch`` plus three
     kw-only ones:
 
     * ``run_decode``: reserved / unused; ``group_gemm_fp4`` now auto-selects
       gemv/gemm via ``mode=None`` (``M <= 128`` -> gemv);
     * ``backend``: force a ``group_gemm_fp4`` backend. ``None`` defers to
       ``VLLM_ILU_MXFP4_MOE_BACKEND``, whose default is ``ixmm``.
+    * ``swiglu_variant``: step-4 activation semantics. ``"dsv4_clamp"``
+      (default, DSv4/MXFP4, unchanged) or ``"step3_swiglustep"`` (Step-3.7
+      NVFP4, clamp-after-silu + native no-clamp). Only affects the ixformer
+      path; the torch fallback ignores it (see below).
 
     Returns the ``[T, H]`` rank-local partial; the runner's all-reduce
     completes the EP/TP partials.
@@ -619,4 +652,5 @@ def ilu_mxfp4_fused_experts(
         w2_bias=w2_bias,
         gemm_backend=be,
         gemm_mode=None,
+        swiglu_variant=swiglu_variant,
     )

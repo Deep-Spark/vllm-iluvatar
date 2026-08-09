@@ -79,12 +79,12 @@ _NVFP4_GROUP_SIZE = 16
 _IXMM_GROUP_SIZE = 256
 _FP4_MAX_MAG = 6.0
 
-# Sentinel forwarded to ``swiglu_limit_dynamic_scaled_fp8`` when the layer wants
-# *no* clamp. That op has no no-clamp mode, but its output scale is
-# ``amax(|y|)/448`` (independent of the limit), so a huge finite limit turns the
-# clamp into an identity without perturbing the quantisation. See the plan's
-# "swiglu_limit_dynamic_scaled_fp8 源码确认" note.
-_SWIGLU_NO_CLAMP = 1e30
+# Step-3.5 routed SwiGLU clamp bound. Community ``FusedMoEBlock`` stores the
+# per-layer activation as a string on ``RoutedExperts`` (``step3p5.py:350-368``):
+# ``"swiglustep"`` (clamp at 7) or ``"silu"`` (no clamp). ``swiglustep_dynamic_
+# scaled_fp8`` clamps after silu and reads a numeric limit with ``limit <= 0`` =
+# no clamp, so we derive it here directly from ``activation``.
+_SWIGLUSTEP_CLAMP = 7.0
 
 
 def preprocess_nvfp4_weight_for_ixmm(
@@ -319,9 +319,11 @@ class IluModelOptNvFp4MoEMethod(ModelOptNvFp4FusedMoE):
 
     # [ILU override] ModelOptNvFp4FusedMoE.apply — delta: wiring only. Community
     # delegates to ``self.moe_kernel.apply``; we call the plugin's ixmm compute
-    # with explicit tensors. NVFP4 experts carry no bias, and the shared output
-    # arrives through ``shared_experts_input`` (``extra_residual``), so
-    # ``shared_experts`` is accepted for signature compatibility but unused.
+    # with explicit tensors, selecting the Step-3.5 ``step3_swiglustep`` variant
+    # and deriving its numeric clamp from ``layer.activation``. NVFP4 experts
+    # carry no bias, and the shared output arrives through
+    # ``shared_experts_input`` (``extra_residual``), so ``shared_experts`` is
+    # accepted for signature compatibility but unused.
     def apply(
         self,
         layer: RoutedExperts,
@@ -331,6 +333,13 @@ class IluModelOptNvFp4MoEMethod(ModelOptNvFp4FusedMoE):
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
+        # Step-3.5 routed SwiGLU: read the community activation string off the
+        # experts and map it to the numeric clamp the ``step3_swiglustep`` op
+        # expects (``"swiglustep"`` -> 7.0, ``"silu"`` -> 0.0 = no clamp). This
+        # keeps all SwiGLU semantics in the method + ixformer op, so the model
+        # file carries no swiglu wiring.
+        activation = getattr(layer, "activation", "silu")
+        swiglu_limit = _SWIGLUSTEP_CLAMP if activation == "swiglustep" else 0.0
         return ilu_mxfp4_fused_experts(
             hidden_states=x,
             w13_weight=layer.w13_weight,
@@ -339,13 +348,14 @@ class IluModelOptNvFp4MoEMethod(ModelOptNvFp4FusedMoE):
             w2_weight_scale=layer.w2_weight_scale,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            swiglu_limit=getattr(layer, "swiglu_limit", None),
+            swiglu_limit=swiglu_limit,
             expert_map=layer.expert_map,
             output_scale=_get_ilu_output_scale(layer),
             extra_residual=shared_experts_input,
             w13_bias=None,
             w2_bias=None,
             backend="ixmm",
+            swiglu_variant="step3_swiglustep",
         )
 
 

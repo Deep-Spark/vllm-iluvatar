@@ -103,8 +103,8 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 
-from vllm_iluvatar.model_executor.models.deepseek_v4 import fp8_load_stats
-from vllm_iluvatar.model_executor.models.deepseek_v4.fp8_attention import (
+from vllm_iluvatar.models.deepseek_v4 import fp8_load_stats
+from vllm_iluvatar.models.deepseek_v4.fp8_attention import (
     IluDeepseekV4Fp8Attention,
 )
 
@@ -1244,11 +1244,11 @@ def register_model() -> None:
 
     ModelRegistry.register_model(
         "DeepseekV4ForCausalLM",
-        "vllm_iluvatar.model_executor.models.deepseek_v4.fp8_model:"
+        "vllm_iluvatar.models.deepseek_v4.fp8_model:"
         "IluDeepseekV4Fp8ForCausalLM",
     )
     ModelRegistry.register_model(
         "DeepSeekV4MTPModel",
-        "vllm_iluvatar.model_executor.models.deepseek_v4.fp8_mtp:"
+        "vllm_iluvatar.models.deepseek_v4.fp8_mtp:"
         "IluDeepseekV4Fp8MTP",
     )

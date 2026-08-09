@@ -32,6 +32,7 @@ from vllm.model_executor.layers.activation import (
     QuickGELU,
     SiluAndMul,
     SiluAndMulWithClamp,
+    SwigluStepAndMul,
 )
 from vllm.platforms import current_platform
 
@@ -135,6 +136,34 @@ class IluSiluAndMulWithClamp(SiluAndMulWithClamp):
         out = torch.empty(x.shape[:-1] + (d,), dtype=x.dtype, device=x.device)
         self.op(out, x, self.swiglu_limit, self.alpha, self.beta)
         return out
+
+
+@SwigluStepAndMul.register_oot
+class IluSwigluStepAndMul(SwigluStepAndMul):
+    """Step-3.5 shared-expert SwiGLU (clamp-after-silu), layers 43/44.
+
+    Community ``SwigluStepAndMul.forward_cuda`` calls the triton kernel
+    directly (not via ``self.op``), so we override ``forward_cuda`` to route to
+    the ixformer registry facade (default ``ixformer_native``). Reaching the
+    OOT subclass already implies the Iluvatar backend, so no
+    ``current_platform`` branch is needed; ``forward_native`` (inherited) stays
+    the clamp-after-silu semantic baseline.
+    """
+
+    def __init__(self, limit: float = 7.0, *, compile_native: bool = True):
+        CustomOp.__init__(self, compile_native=compile_native)
+        if limit is None:
+            raise ValueError("SwigluStepAndMul requires limit to be set.")
+        self.limit = float(limit)
+
+    # [ILU override] SwigluStepAndMul.forward_cuda — delta: call ixformer
+    # swiglustep_and_mul facade instead of the community triton kernel.
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        import ixformer.inference.functions as ixf_ops
+
+        d = x.shape[-1] // 2
+        out = torch.empty(x.shape[:-1] + (d,), dtype=x.dtype, device=x.device)
+        return ixf_ops.swiglustep_and_mul(input=x, output=out, limit=self.limit)
 
 
 @MulAndSilu.register_oot

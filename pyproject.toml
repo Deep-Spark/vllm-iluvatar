@@ -80,3 +80,5 @@ mis = "mis"
 UE = "UE"
 # Existing GDN metadata uses ``*_indx`` field names; keep the spelling stable.
 indx = "indx"
+# ``arange`` (torch.arange / np.arange) is a valid API name, not ``arrange``.
+arange = "arange"

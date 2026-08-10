@@ -105,6 +105,7 @@ if TYPE_CHECKING:
     VLLM_ILU_DP_ROUND_ROBIN_LB: bool = False
     VLLM_ILU_DP_ROUND_ROBIN_LB_FILE: str = ""
     VLLM_ILU_MOE_EP_LL_MOE_ALGO: str = "GEMV"
+    VLLM_ILU_ENABLE_PP_MTP: bool = False
 
 # Canonical (VLLM_ILU_*) readers. Each lambda preserves the exact parsing the
 # fork used in vllm/envs.py, and reads VLLM_ILU_* first then the legacy VLLM_*.
@@ -225,6 +226,10 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_MOE_EP_LL_MOE_ALGO": lambda: os.environ.get(
         "VLLM_ILU_MOE_EP_LL_MOE_ALGO", "GEMV"
     ).upper(),
+    # Opt-in gate for the PP + MTP / speculative-decode compatibility
+    # patch (ilu_patch/general_patches/patch_pp_mtp.py). Default off so the
+    # plugin leaves community vLLM untouched unless explicitly enabled.
+    "VLLM_ILU_ENABLE_PP_MTP": _bool_reader("VLLM_ILU_ENABLE_PP_MTP", "0"),
 }
 
 

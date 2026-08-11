@@ -12,7 +12,7 @@ from vllm_iluvatar.ilu_patch.general_patches import patch_pp_mtp
 from vllm_iluvatar.v1.core.sched import scheduler as scheduler_impl
 from vllm_iluvatar.v1.engine import core as core_impl
 from vllm_iluvatar.v1.outputs import install_draft_token_ids_field
-from vllm_iluvatar.v1.worker import pp_mtp as runner_impl
+from vllm_iluvatar.v1.worker import gpu_model_runner as runner_impl
 
 _BASELINE_SHAS = {
     "schedule": "b60b5eed705c4d84dc51be525c5350d8bb6c529607b970bfaab5a68d1904ac92",

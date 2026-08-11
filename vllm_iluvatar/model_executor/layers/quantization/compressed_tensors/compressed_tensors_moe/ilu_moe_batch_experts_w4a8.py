@@ -64,10 +64,47 @@ class IluMoEBatchedExpertsW4A8(BaseBatchExperts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None = None,
         apply_router_weight_on_input: bool = False,
     ):
-        assert self.g1_alphas is None
-        assert self.w1_zp is None
-        assert self.w1_bias is None
+        del (
+            topk_weights,
+            topk_ids,
+            global_num_experts,
+            expert_map,
+            a2_scale,
+            workspace13,
+            workspace2,
+            apply_router_weight_on_input,
+        )
+
+        if activation != MoEActivation.SILU:
+            raise NotImplementedError(
+                "ixformer fused W4A8 MoE supports SILU activation only"
+            )
+        if expert_tokens_meta is None:
+            raise ValueError("expert_tokens_meta is required for fused decode MoE")
+        if any(
+            value is not None
+            for value in (
+                self.g1_alphas,
+                self.g2_alphas,
+                self.w1_zp,
+                self.w2_zp,
+                self.w1_bias,
+                self.w2_bias,
+            )
+        ):
+            raise NotImplementedError(
+                "ixformer fused W4A8 MoE does not support bias, zero-point, "
+                "or auxiliary weight scales"
+            )
         assert self.quant_mode == "w4a8", "only support w4a8 for fused moe."
+        if self.version != 2 or self.group_size != -1:
+            raise NotImplementedError(
+                "ixformer fused W4A8 MoE requires version=2 and group_size=-1"
+            )
+        if self.out_dtype != torch.bfloat16:
+            raise NotImplementedError(
+                "ixformer fused W4A8 MoE requires bfloat16 output"
+            )
 
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         output = output.reshape(-1, output.shape[-1])
@@ -79,7 +116,7 @@ class IluMoEBatchedExpertsW4A8(BaseBatchExperts):
 
         w1_scale = self.w1_scale
         w2_scale = self.w2_scale
-        if MOE_ALGO == "FUSED" and w1_scale.ndim == 3 and w1_scale.shape[1] == 1:
+        if w1_scale.ndim == 3 and w1_scale.shape[1] == 1:
             w1_scale = w1_scale.reshape(w1_scale.shape[0], w1_scale.shape[-1])
             w2_scale = w2_scale.reshape(w2_scale.shape[0], w2_scale.shape[-1])
 
@@ -92,9 +129,9 @@ class IluMoEBatchedExpertsW4A8(BaseBatchExperts):
             w2_scale=w2_scale,
             expert_num_tokens=expert_tokens_meta.expert_num_tokens,
             max_num_tokens_per_expert=max_num_tokens_per_expert,
-            output_dtype=self.out_dtype,
             format=self.format,
             output=output,
+            limit=self.swiglu_limit,
         )
 
         return ixff.fused_moe_w4a8(**kwargs)

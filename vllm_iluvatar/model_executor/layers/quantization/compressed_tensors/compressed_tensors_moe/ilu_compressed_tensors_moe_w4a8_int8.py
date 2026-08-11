@@ -14,6 +14,9 @@ Key env vars:
 """
 
 import ixformer.inference.functions as ixfops  # type: ignore
+from ixformer.inference.functions.fused_moe import (
+    _prepack_fused_moe_w4a8_tn_weights_,
+)
 import torch
 import vllm.envs as envs
 from compressed_tensors.quantization import (
@@ -520,6 +523,20 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 log_prefix=_log_prefix("w2", "input_scale"),
             )
 
+        if envs.VLLM_ILU_MOE_EP_LL_MOE_ALGO == "FUSED":
+            if (
+                self.gemm_format != "TN"
+                or self.version != 2
+                or self.group_size != -1
+            ):
+                raise NotImplementedError(
+                    "ixformer fused MoE requires TN, version=2, group_size=-1"
+                )
+            _prepack_fused_moe_w4a8_tn_weights_(
+                layer.w13_weight,
+                layer.w2_weight,
+            )
+
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
@@ -583,6 +600,70 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             topk_ids=topk_ids,
             shared_experts_input=shared_experts_input,
         )
+
+    def apply_fused_moe(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the ixformer fused routed-MoE prefill for this EP rank.
+        It is called in compressed_tensors_moe.py
+        """
+        if self.gemm_format != "TN" or self.version != 2 or self.group_size != -1:
+            raise NotImplementedError(
+                "ixformer fused prefill requires TN, version=2, group_size=-1"
+            )
+        if x.dtype != torch.bfloat16:
+            raise NotImplementedError(
+                "ixformer fused prefill requires bfloat16 activations"
+            )
+        if layer.activation.value not in ("silu", "swiglu"):
+            raise NotImplementedError(
+                "ixformer fused prefill supports SILU/SwiGLU activation only"
+            )
+        if any(
+            value is not None
+            for value in (
+                layer.w13_i8_weight_scale,
+                layer.w2_i8_weight_scale,
+                layer.w13_i8_weight_zero,
+                layer.w2_i8_weight_zero,
+                layer.w13_bias,
+                layer.w2_bias,
+            )
+        ):
+            raise NotImplementedError(
+                "ixformer fused prefill does not support bias, zero-point, "
+                "or auxiliary weight scales"
+            )
+
+        w1_scale = layer.w13_weight_scale
+        w2_scale = layer.w2_weight_scale
+        if w1_scale.ndim == 3 and w1_scale.shape[1] == 1:
+            w1_scale = w1_scale.reshape(w1_scale.shape[0], w1_scale.shape[-1])
+            w2_scale = w2_scale.reshape(w2_scale.shape[0], w2_scale.shape[-1])
+
+        ep_rank = layer.moe_config.ep_rank
+        start_expert_id = ep_rank * layer.local_num_experts
+        output = ixfops.fused_moe_w4a8_prefill(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            start_expert_id=start_expert_id,
+            format=self.gemm_format,
+            limit=getattr(layer, "swiglu_limit", None),
+        )
+
+        output_scale = _get_ilu_output_scale(layer)
+        if output_scale != 1.0:
+            output.mul_(output_scale)
+        return output
 
     def _apply_ep(
         self,

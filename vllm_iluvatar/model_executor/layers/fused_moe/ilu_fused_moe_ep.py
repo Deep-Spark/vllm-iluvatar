@@ -49,6 +49,7 @@ from vllm_iluvatar.model_executor.layers.fused_moe.prepare_finalize.ilu_deepep_l
 logger = init_logger(__name__)
 
 _DS4_DECODE_EP_BACKEND = envs.VLLM_ILU_DECODE_EP_BACKEND
+_USE_FUSED_MOE = envs.VLLM_ILU_MOE_EP_LL_MOE_ALGO == "FUSED"
 
 
 class IluFusedMoEEP:
@@ -492,13 +493,26 @@ class IluFusedMoEEP:
                 input_ids=router_input_ids,
             )
             shared_output = None
-            fused_output = runner.routed_experts.forward_modular(
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts=None,
-                shared_experts_input=None,
+            apply_fused_moe = (
+                getattr(quant_method, "apply_fused_moe", None)
+                if _USE_FUSED_MOE
+                else None
             )
+            if apply_fused_moe is None:
+                fused_output = runner.routed_experts.forward_modular(
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=None,
+                    shared_experts_input=None,
+                )
+            else:
+                fused_output = apply_fused_moe(
+                    layer=runner.routed_experts,
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                )
             if shared_experts is not None:
                 assert shared_experts_input is not None
                 shared_experts(

@@ -524,17 +524,25 @@ class IluFlashAttentionMetadataBuilder(
                 decode_cu_seqlens_q[1:] = decode_query_lens.cumsum(0)
             decode_cu_seqlens_k = self.decode_cu_seqlens_k[: num_decodes + 1]
             decode_cu_seqlens_k[1:] = decode_seq_lens.cumsum(0)
+            use_graph = (
+                self.use_full_cuda_graph
+                and self.max_cudagraph_size is not None
+                and num_actual_tokens <= self.max_cudagraph_size
+            )
+            # In full CUDA graph mode, max_context_len is a Python scalar baked at
+            # capture time. Use the paged KV capacity as a fixed upper bound so
+            # replay does not truncate the KV context.
+            if use_graph:
+                max_decode_seq_len = block_table_tensor.shape[1] * self.block_size
+            else:
+                max_decode_seq_len = int(decode_seq_lens.max().item())
             decode_metadata = IluFlashAttentionDecodeMetadata(
                 block_table=block_table_tensor[:num_decodes],
                 query_start_loc=decode_query_start_loc,
                 seq_lens=decode_seq_lens,
                 max_query_len=decode_query_lens.max().item(),
-                max_decode_seq_len=int(decode_seq_lens.max().item()),
-                use_graph=(
-                    self.use_full_cuda_graph
-                    and self.max_cudagraph_size is not None
-                    and num_actual_tokens <= self.max_cudagraph_size
-                ),
+                max_decode_seq_len=max_decode_seq_len,
+                use_graph=use_graph,
                 cu_seqlens_q=decode_cu_seqlens_q,
                 cu_seqlens_k=decode_cu_seqlens_k,
             )

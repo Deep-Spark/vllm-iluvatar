@@ -111,7 +111,7 @@ def _wire_patches() -> None:
     from vllm_iluvatar.v1.core.sched import scheduler as scheduler_impl
     from vllm_iluvatar.v1.engine import core as core_impl
     from vllm_iluvatar.v1.outputs import install_draft_token_ids_field
-    from vllm_iluvatar.v1.worker import pp_mtp as runner_impl
+    from vllm_iluvatar.v1.worker import gpu_model_runner as runner_impl
 
     install_draft_token_ids_field(ModelRunnerOutput)
 

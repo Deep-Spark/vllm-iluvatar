@@ -2,8 +2,9 @@
 """Wiring for Iluvatar DP EngineCore scheduling wrappers.
 
 Corresponds to: vllm/v1/engine/core.py
-Target   : DPEngineCoreProc.{_should_throttle_prefills,_process_engine_step}
-Baseline : main_dcfebf93f4e
+Target   : DPEngineCoreProc.{
+           _should_throttle_prefills,_process_engine_step,_handle_client_request}
+Baseline : main_91eacae36dd
 Why      : Align replacement prefills across DP ranks before EP execution and
            avoid entering a dummy batch during the short replacement round trip.
            The patch is installed only when VLLM_ILU_DP_ENABLE_SYNC_PREFILLS

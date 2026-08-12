@@ -52,6 +52,7 @@ import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
 
+import ixformer.cuda as ixcuda
 import ixformer.inference.functions as ixfops  # type: ignore[import]
 import regex as re
 import torch
@@ -142,7 +143,13 @@ elif _DS4_MHC_PRE_VERSION == "v3":
 # IXFORMER_DS4_HC_PRE_NORM_FUSION=0 opts out for A/B against the standalone
 # rms_norm call.
 _DS4_HC_PRE_NORM_FUSION = os.environ.get("IXFORMER_DS4_HC_PRE_NORM_FUSION", "1") == "1"
-_DS4_MHC_DYNAMIC_INT8 = os.environ.get("IXFORMER_DS4_MHC_DYNAMIC_INT8", "0") == "1"
+_DS4_MHC_DYNAMIC_INT8 = (
+    os.environ.get(
+        "IXFORMER_DS4_MHC_DYNAMIC_INT8",
+        "1" if ixcuda.cuda_arch == "ivcore30" else "0",
+    )
+    == "1"
+)
 
 
 def _hc_pre_norm_fusion_available() -> bool:

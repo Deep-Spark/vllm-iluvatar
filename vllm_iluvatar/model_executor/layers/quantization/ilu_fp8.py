@@ -120,6 +120,19 @@ def preprocess_fp8_block_weight_for_ixmm(
     # block scale back to element granularity, clipping the trailing partial
     # block when n / k are not exact multiples of the block size.
     block_n, block_k = block
+    # Pin the block grid explicitly. Without this a transposed or mis-sized
+    # scale can survive: ``repeat_interleave`` followed by a slice silently
+    # truncates whenever the expanded tensor is longer than the weight.
+    expected_scale_shape = (
+        expert,
+        (n_dim + block_n - 1) // block_n,
+        (k + block_k - 1) // block_k,
+    )
+    assert tuple(weight_scale_inv.shape) == expected_scale_shape, (
+        f"weight_scale_inv must be {expected_scale_shape} for a [{expert}, "
+        f"{n_dim}, {k}] weight with block {block}, got "
+        f"{tuple(weight_scale_inv.shape)}"
+    )
     scale = weight_scale_inv.to(torch.float32)
     scale = scale.repeat_interleave(block_n, dim=1)[:, :n_dim, :]
     scale = scale.repeat_interleave(block_k, dim=2)[:, :, :k]

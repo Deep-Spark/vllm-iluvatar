@@ -65,12 +65,17 @@ gate.
 
 from __future__ import annotations
 
+import functools
+
 import torch
+from vllm.logger import init_logger
 
 from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (  # noqa: E501
     _e8m0_to_fp32,
 )
 from vllm_iluvatar.model_executor.layers.activation import swiglu_clamp
+
+logger = init_logger(__name__)
 
 # MXFP4 microscaling block size: 32 fp4 (e2m1) values share one e8m0 exponent.
 MXFP4_BLOCK = 32
@@ -265,13 +270,14 @@ _STEP3_SWIGLUSTEP_VARIANT = "step3_swiglustep"
 _VALID_SWIGLU_VARIANTS = (_DSV4_CLAMP_VARIANT, _STEP3_SWIGLUSTEP_VARIANT)
 
 
+@functools.lru_cache(maxsize=1)
 def _ixmm_backend_available() -> bool:
     """True iff the ixmm ``group_gemm_fp4`` backend is usable on this build.
 
     Mirrors ixformer's own ``_ixmm_available`` (``gemm.py:620``) but goes
     through the public registry so a missing ixformer import degrades to
-    ``False`` rather than raising. Called only from the dispatcher's ``auto``
-    branch, so the lazy ``ixformer`` import is fine.
+    ``False`` rather than raising. Cached because it is consulted per layer per
+    step in ``auto`` mode and the answer is fixed for the process.
     """
     try:
         import ixformer.inference.backend_registry as _registry  # type: ignore
@@ -280,6 +286,14 @@ def _ixmm_backend_available() -> bool:
     try:
         return _IXMM_BACKEND in _registry.registry.available_backends("group_gemm_fp4")
     except Exception:
+        # Not "ixmm is absent" but "the probe itself broke". Silently degrading
+        # here costs an order of magnitude of throughput with nothing in the
+        # log, so say it once.
+        logger.warning(
+            "Failed to probe the ixmm group_gemm_fp4 backend; falling back to "
+            "the torch MXFP4 path.",
+            exc_info=True,
+        )
         return False
 
 
@@ -366,8 +380,6 @@ def _resolve_backend(
         return torch_fallback("device architecture could not be determined")
     if not ivcore30:
         return torch_fallback("device architecture is not ivcore30")
-    if hidden_states.shape[0] == 0:
-        return torch_fallback("the token batch is empty")
     if hidden_states.dtype is not torch.bfloat16:
         return torch_fallback(f"activation dtype is {hidden_states.dtype}, not bf16")
     if swiglu_limit is None:
@@ -585,17 +597,14 @@ def ilu_mxfp4_fused_experts(
     extra_residual: torch.Tensor | None = None,
     w13_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
-    run_decode: bool = False,
     backend: str | None = None,
     swiglu_variant: str = _DSV4_CLAMP_VARIANT,
 ) -> torch.Tensor:
     """Dispatcher for the routed MXFP4 expert compute.
 
-    Takes the same arguments as ``ilu_mxfp4_fused_experts_torch`` plus three
+    Takes the same arguments as ``ilu_mxfp4_fused_experts_torch`` plus two
     kw-only ones:
 
-    * ``run_decode``: reserved / unused; ``group_gemm_fp4`` now auto-selects
-      gemv/gemm via ``mode=None`` (``M <= 128`` -> gemv);
     * ``backend``: force a ``group_gemm_fp4`` backend. ``None`` defers to
       ``VLLM_ILU_MXFP4_MOE_BACKEND``, whose default is ``ixmm``.
     * ``swiglu_variant``: step-4 activation semantics. ``"dsv4_clamp"``
@@ -603,9 +612,20 @@ def ilu_mxfp4_fused_experts(
       NVFP4, clamp-after-silu + native no-clamp). Only affects the ixformer
       path; the torch fallback ignores it (see below).
 
+    There is no ``run_decode``: ``group_gemm_fp4`` picks gemv vs gemm itself
+    from ``M`` (``mode=None``, ``M <= 128`` -> gemv).
+
     Returns the ``[T, H]`` rank-local partial; the runner's all-reduce
     completes the EP/TP partials.
     """
+    if hidden_states.shape[0] == 0:
+        # An empty batch has no backend-specific behaviour, and routing it into
+        # ``_resolve_backend`` would turn it into a hard error once the weights
+        # are in ixmm's layout (no torch fallback from there).
+        empty = torch.zeros_like(hidden_states)
+        if extra_residual is not None:
+            empty = empty + extra_residual
+        return empty
     be = _resolve_backend(
         backend,
         hidden_states,
@@ -635,7 +655,6 @@ def ilu_mxfp4_fused_experts(
         )
     # ``gemm_mode=None`` lets ``group_gemm_fp4`` auto-select: gemv when
     # ``M = T * top_k <= 128``, else gemm.
-    del run_decode
     return _ilu_mxfp4_fused_experts_ixformer(
         hidden_states,
         w13_weight,

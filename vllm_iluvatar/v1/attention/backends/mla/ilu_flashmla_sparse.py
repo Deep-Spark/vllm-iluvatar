@@ -230,11 +230,34 @@ class IluFlashMLASparseMetadataBuilder(
             (max_num_seqs, 1), dtype=torch.int32, device=self.device
         )
 
-        self.req_id_per_token_buffer = torch.empty(
+        # Zero-initialised so the CUDA-graph padding tail stays zero without a
+        # full-buffer fill on every step; only ``[:num_tokens]`` is rewritten.
+        self.req_id_per_token_buffer = torch.zeros(
             (max_num_batched_tokens,),
             dtype=torch.int32,
             device=device,
         )
+        # Pinned staging for the above. Uploading straight from the numpy
+        # result would copy from pageable memory, which blocks the host until
+        # the previous step's CUDA graph has drained.
+        #
+        # Round-robin over one buffer per in-flight step, matching
+        # UvaBufferPool: the upload is non_blocking and we keep these buffers
+        # alive, so nothing stops the host from reaching the next build before
+        # the GPU has run the previous copy. Reusing a single buffer lets that
+        # write land in the copy the GPU has not read yet.
+        self._req_id_per_token_depth = max(2, vllm_config.max_concurrent_batches)
+        self._req_id_per_token_hosts = [
+            torch.zeros(
+                (max_num_batched_tokens,),
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=True,
+            )
+            for _ in range(self._req_id_per_token_depth)
+        ]
+        self._req_id_per_token_nps = [t.numpy() for t in self._req_id_per_token_hosts]
+        self._req_id_per_token_slot = 0
 
         # DeepSeek-V4 detection: hf_config carries compress_ratios for V4.
         hf_config = vllm_config.model_config.hf_config
@@ -347,6 +370,36 @@ class IluFlashMLASparseMetadataBuilder(
             result["c128a_prefill_topk_indices"] = prefill_local
         return result
 
+    def _stage_req_id_per_token(
+        self, query_start_loc_cpu: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
+        """Upload this step's token -> request index map.
+
+        Staging rotates over one pinned buffer per in-flight step. The upload is
+        non-blocking and these buffers outlive the step, so a single shared
+        buffer would let the next build's host write land in a copy the GPU has
+        not executed yet.
+        """
+        starts = np.asarray(query_start_loc_cpu, dtype=np.int32)
+        seg_lengths = np.diff(starts)
+        req_id_per_token = np.repeat(
+            np.arange(seg_lengths.shape[0], dtype=np.int32), seg_lengths
+        )
+        num_real = req_id_per_token.shape[0]
+
+        self._req_id_per_token_slot = (
+            self._req_id_per_token_slot + 1
+        ) % self._req_id_per_token_depth
+        host = self._req_id_per_token_hosts[self._req_id_per_token_slot]
+        host_np = self._req_id_per_token_nps[self._req_id_per_token_slot]
+        host_np[:num_real] = req_id_per_token
+        # Zero-fill the cudagraph padding tail.
+        host_np[num_real:num_tokens] = 0
+        self.req_id_per_token_buffer[:num_tokens].copy_(
+            host[:num_tokens], non_blocking=True
+        )
+        return self.req_id_per_token_buffer[:num_tokens]
+
     def build(
         self,
         common_prefix_len: int,
@@ -355,17 +408,9 @@ class IluFlashMLASparseMetadataBuilder(
     ) -> IluFlashMLASparseMetadata:
         cm = common_attn_metadata
         num_tokens = cm.num_actual_tokens
-        starts = np.asarray(cm.query_start_loc_cpu, dtype=np.int32)
-        seg_lengths = np.diff(starts)
-        req_id_per_token = np.repeat(
-            np.arange(seg_lengths.shape[0], dtype=np.int32), seg_lengths
+        req_id_per_token = self._stage_req_id_per_token(
+            cm.query_start_loc_cpu, num_tokens
         )
-        # Zero-fill for cudagraphs
-        self.req_id_per_token_buffer.fill_(0)
-        self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
-            torch.from_numpy(req_id_per_token), non_blocking=True
-        )
-        req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
 
         # V4 main MLA: convert raw token slot_mapping to compressed-domain so
         # ``DeepseekCompressor._fused_kernel`` writes to the right cache slot.

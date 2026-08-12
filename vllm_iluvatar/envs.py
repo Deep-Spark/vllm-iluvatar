@@ -317,6 +317,9 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_GLM_DSA_FP8_KV_SCALE_PATH": lambda: os.environ.get(
         "VLLM_ILU_GLM_DSA_FP8_KV_SCALE_PATH", ""
     ),
+    # Optional override for MessageQueue max_chunks (see patch_message_queue).
+    # Empty / unset → auto: broadcast max(10, 2*n_reader+8), response max 48.
+    "VLLM_ILU_MQ_MAX_CHUNKS": lambda: os.environ.get("VLLM_ILU_MQ_MAX_CHUNKS", ""),
 }
 
 

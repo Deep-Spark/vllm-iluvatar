@@ -78,8 +78,13 @@ class IluFusedMoEEP:
     _dp_ep_ll_all2all_manager = None
     _dp_ep_ll_all2all_handle = None
     _dp_ep_ll_all2all_handle_args = None
+    # Captured at model-build time (set_current_vllm_config active). Used as a
+    # fallback for the DeepEP LL dispatch buffer size during cudagraph/profiling
+    # forwards, where get_current_vllm_config() is not set.
+    _dp_ep_ll_max_tokens_per_rank = None
 
     def init_ep(self):
+        self._capture_dp_ep_ll_max_tokens_per_rank()
         if self._should_preinit_dp_ep_ll_handle():
             runner = self.experts
             # moe_quant_config is None during model construction because it needs
@@ -106,6 +111,29 @@ class IluFusedMoEEP:
                 runner,
             )
             runner._ilu_nvsm_init_patched = True
+
+    @staticmethod
+    def _ll_decode_max_tokens_per_rank_from_config(vllm_config) -> int:
+        # Uniform decode query length is (1 + num_speculative_tokens). With MTP
+        # enabled, each seq can contribute multiple tokens per decode step.
+        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        num_spec_tokens = 0
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if speculative_config is not None:
+            num_spec_tokens = int(
+                getattr(speculative_config, "num_speculative_tokens", 0) or 0
+            )
+        return max_num_seqs * (1 + num_spec_tokens)
+
+    @staticmethod
+    def _capture_dp_ep_ll_max_tokens_per_rank():
+        if IluFusedMoEEP._dp_ep_ll_max_tokens_per_rank is not None:
+            return
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is not None:
+            IluFusedMoEEP._dp_ep_ll_max_tokens_per_rank = (
+                IluFusedMoEEP._ll_decode_max_tokens_per_rank_from_config(vllm_config)
+            )
 
     def _should_use_forward_dp_ep(self) -> bool:
         moe_parallel_config = self.experts.moe_config.moe_parallel_config
@@ -194,10 +222,28 @@ class IluFusedMoEEP:
         if hasattr(handle, "buffer") and handle.buffer is None:
             from ixformer.distributed import nvsm_ep
 
+            # CUDA-graph dummy_run / profiling may call MoE forward without a
+            # set_current_vllm_config() context. Prefer the live config, then the
+            # decode-token budget captured at model-build time.
+            # moe_config.max_num_tokens is the wrong (chunked-prefill) size for
+            # the LL decode buffer and can overflow GEMV metadata limits.
+            vllm_config = get_current_vllm_config_or_none()
+            if vllm_config is not None:
+                max_tokens_per_rank = (
+                    IluFusedMoEEP._ll_decode_max_tokens_per_rank_from_config(
+                        vllm_config
+                    )
+                )
+            elif IluFusedMoEEP._dp_ep_ll_max_tokens_per_rank is not None:
+                max_tokens_per_rank = IluFusedMoEEP._dp_ep_ll_max_tokens_per_rank
+            else:
+                max_tokens_per_rank = moe_config.max_num_tokens
+            # After TP scatter / fused AG-AR, each rank only holds a shard.
+            # Use ceil division to match the uneven chunking in flatten().
             tp_size = get_tensor_model_parallel_world_size()
-            max_tokens_per_rank = _get_max_num_seqs()
             if VLLM_ILU_LL_FUSED_AG_AR or VLLM_ILU_DEEPEP_USE_SCATTER:
-                max_tokens_per_rank //= tp_size
+                tp_size = get_tensor_model_parallel_world_size()
+                max_tokens_per_rank = (max_tokens_per_rank + tp_size - 1) // tp_size
 
             dispatch_quant_kwargs = self._nvsm_dispatch_quant_kwargs()
             handle.buffer = nvsm_ep.nvsm_init_ep_comm(

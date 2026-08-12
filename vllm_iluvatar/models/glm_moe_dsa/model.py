@@ -88,6 +88,39 @@ from vllm_iluvatar.models.glm_moe_dsa.attention import (
 
 logger = init_logger("vllm." + __name__)
 
+_FUSE_NORM_QUANT_WARNED = False
+
+
+def _residual_rms_norm_with_quant(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    return_normed: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor] | None:
+    """Call ixformer fused residual/RMSNorm+INT8; None on import/runtime failure."""
+    global _FUSE_NORM_QUANT_WARNED
+    try:
+        import ixformer.inference.functions as ixf_ops
+
+        return ixf_ops.residual_rms_norm_with_quant(
+            hidden_states,
+            weight,
+            residual=residual,
+            eps=eps,
+            return_normed=return_normed,
+        )
+    except Exception as exc:  # noqa: BLE001 — fail-closed to split path
+        if not _FUSE_NORM_QUANT_WARNED:
+            logger.warning(
+                "IluGlm fused residual_rms_norm_with_quant unavailable (%s); "
+                "falling back to split RMSNorm",
+                exc,
+            )
+            _FUSE_NORM_QUANT_WARNED = True
+        return None
+
 
 @IluvatarQuantRegistry.register_method
 class IluGlmKVBProjW8A16Method(LinearMethodBase):
@@ -326,17 +359,41 @@ class IluGlmMoeDsaMoE(nn.Module):
             router_logits_dtype=self.gate.out_dtype,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
+    def forward(
+        self,
+        hidden_states: torch.Tensor
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        # Fused norm-quant may pass (int8, scales, bf16_normed). Gate/router
+        # need BF16; IluMoERunner.forward accepts the packed tuple for experts.
+        experts_in: torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        if isinstance(hidden_states, tuple):
+            if len(hidden_states) != 3:
+                raise ValueError(
+                    "MoE fused-norm-quant input must be "
+                    "(int8, scales, bf16_normed), "
+                    f"got len={len(hidden_states)}"
+                )
+            q, scales, normed = hidden_states
+            num_tokens, hidden_dim = normed.shape
+            normed = normed.view(-1, hidden_dim)
+            q = q.view(-1, q.shape[-1]) if q.ndim >= 2 else q
+            scales = scales.view(-1, scales.shape[-1]) if scales.ndim >= 2 else scales
+            experts_in = (q, scales, normed)
+            router_in = normed
+        else:
+            num_tokens, hidden_dim = hidden_states.shape
+            router_in = hidden_states.view(-1, hidden_dim)
+            experts_in = router_in
+
         if self.experts.is_internal_router:
             final_hidden_states = self.experts(
-                hidden_states=hidden_states, router_logits=hidden_states
+                hidden_states=experts_in, router_logits=router_in
             )
         else:
-            router_logits, _ = self.gate(hidden_states)
+            router_logits, _ = self.gate(router_in)
             final_hidden_states = self.experts(
-                hidden_states=hidden_states, router_logits=router_logits
+                hidden_states=experts_in, router_logits=router_logits
             )
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -380,6 +437,7 @@ class IluGlmMoeDsaDecoderLayer(nn.Module):
             config.n_routed_experts is not None
             and layer_idx >= config.first_k_dense_replace
         )
+        self.is_moe_layer = is_moe_layer
         if is_moe_layer:
             self.mlp = IluGlmMoeDsaMoE(
                 config=config,
@@ -400,13 +458,47 @@ class IluGlmMoeDsaDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+    def _pack_norm_quant_for_w8a8(
+        self,
+        q: torch.Tensor,
+        scales: torch.Tensor,
+        out_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.dtype]:
+        return (q, scales, out_dtype)
+
+    def _pack_norm_quant_for_moe(
+        self,
+        q: torch.Tensor,
+        scales: torch.Tensor,
+        normed: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (q, scales, normed)
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
+        # Norm+INT8 fusion is always on for IluGlm (GO); fail-closed to split.
+
+        # --- input layernorm (+ fused INT8 for attn W8A8) ---
+        # Always return_normed so indexer can consume BF16 while W8A8 gemm
+        # uses the int8 tuple (unpacked in attention.forward).
+        fused = _residual_rms_norm_with_quant(
+            hidden_states,
+            residual,
+            self.input_layernorm.weight,
+            self.input_layernorm.variance_epsilon,
+            return_normed=True,
+        )
+
+        if fused is not None:
+            q, normed, residual, scales = fused
+            assert normed is not None
+            # (int8, scales, bf16_normed) — attn unpacks for W8A8 vs indexer
+            hidden_states = self._pack_norm_quant_for_moe(q, scales, normed)
+        elif residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
@@ -414,7 +506,28 @@ class IluGlmMoeDsaDecoderLayer(nn.Module):
 
         hidden_states = self.self_attn(positions, hidden_states)
 
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        # --- post-attn layernorm (+ fused INT8 for dense/MoE) ---
+        out_dtype = residual.dtype
+        fused = _residual_rms_norm_with_quant(
+            hidden_states,
+            residual,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.variance_epsilon,
+            return_normed=self.is_moe_layer,
+        )
+
+        if fused is not None:
+            q, normed, residual, scales = fused
+            if self.is_moe_layer:
+                assert normed is not None
+                hidden_states = self._pack_norm_quant_for_moe(q, scales, normed)
+            else:
+                hidden_states = self._pack_norm_quant_for_w8a8(q, scales, out_dtype)
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 

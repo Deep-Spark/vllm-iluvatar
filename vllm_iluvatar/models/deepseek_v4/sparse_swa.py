@@ -80,6 +80,17 @@ class IluDeepseekV4Fp8SWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> IluFp8SWAMetadata:
+        # The community builder branches on ``causal`` and switches to a
+        # non-causal kernel with wider index buffers for DSpark. This builder
+        # only implements the causal window, so reject the other mode instead
+        # of silently computing the wrong windows.
+        if not getattr(common_attn_metadata, "causal", True):
+            raise NotImplementedError(
+                "IluDeepseekV4Fp8SWAMetadataBuilder only supports causal "
+                "attention; the non-causal (DSpark) path is not implemented "
+                "for the raw-FP8 DeepSeek-V4 model."
+            )
+
         seq_lens = common_attn_metadata.seq_lens
         query_start_loc = common_attn_metadata.query_start_loc
         block_table = common_attn_metadata.block_table_tensor

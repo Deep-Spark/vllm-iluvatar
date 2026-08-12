@@ -67,7 +67,6 @@ import torch
 # Same import surface community ``quantization/mxfp4.py:8-15`` uses -- the
 # package root, not the defining modules, which is what keeps this free of the
 # fused_moe <-> quantization import cycle.
-from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
     FusedMoEMethodBase,
@@ -82,9 +81,6 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
 from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 from vllm.model_executor.utils import replace_parameter
 
-from vllm_iluvatar.model_executor.layers.fused_moe.ilu_decode_metadata import (
-    _is_only_decode,
-)
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
     _ixmm_backend_available,
     ilu_mxfp4_fused_experts,
@@ -308,8 +304,9 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
     # output arrives through ``shared_experts_input`` instead -- see
     # ``ilu_mxfp4_fused_experts``' ``extra_residual``.
     #
-    # ``run_decode`` is still plumbed in for signature compatibility but unused;
-    # ``group_gemm_fp4`` auto-selects gemv/gemm via ``mode=None``.
+    # ``run_decode`` is not passed: ``group_gemm_fp4`` auto-selects gemv/gemm via
+    # ``mode=None``, and computing it cost a ``torch.cuda.is_available()`` plus a
+    # scan of the whole ``attn_metadata`` dict for every MoE layer on every step.
     # ``backend=None`` lets ``VLLM_ILU_MXFP4_MOE_BACKEND`` decide (default ixmm).
     def apply(
         self,
@@ -334,6 +331,5 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
             extra_residual=shared_experts_input,
             w13_bias=getattr(layer, "w13_bias", None),
             w2_bias=getattr(layer, "w2_bias", None),
-            run_decode=_is_only_decode(get_forward_context().attn_metadata),
             backend=None,
         )

@@ -4,8 +4,8 @@
 ILU wrappers for DP prefill synchronization and replacement-request handling.
 
 Target   : vllm.v1.engine.core.DPEngineCoreProc.{
-           _should_throttle_prefills,_process_engine_step}
-Baseline : main_dcfebf93f4e
+           _should_throttle_prefills,_process_engine_step,_handle_client_request}
+Baseline : main_91eacae36dd
 Why      : Closed-loop traffic can deliver replacement prefills to DP ranks at
            different decode steps. Letting the first ready rank immediately
            prefill splits a global EP step into real-prefill and dummy/decode

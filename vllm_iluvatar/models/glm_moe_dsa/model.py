@@ -82,6 +82,9 @@ from vllm.model_executor.models.utils import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
+    IluFusedMoEEP,
+)
 from vllm_iluvatar.model_executor.layers.quantization import IluvatarQuantRegistry
 from vllm_iluvatar.models.glm_moe_dsa.attention import (
     IluGlmMoeDsaMLAAttention,
@@ -293,7 +296,7 @@ class IluGlmMoeDsaMLP(nn.Module):
         return x
 
 
-class IluGlmMoeDsaMoE(nn.Module):
+class IluGlmMoeDsaMoE(nn.Module, IluFusedMoEEP):
     """Fine-grained MoE (256 routed / 8 activated + 1 shared) for GLM-5.2.
 
     sigmoid scoring + ``noaux_tc`` correction bias + grouped top-k (n_group=1).
@@ -312,6 +315,7 @@ class IluGlmMoeDsaMoE(nn.Module):
     ) -> None:
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.prefix = prefix
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.n_routed_experts: int = config.n_routed_experts
         self.n_shared_experts: int = config.n_shared_experts
@@ -369,11 +373,20 @@ class IluGlmMoeDsaMoE(nn.Module):
             e_score_correction_bias=self.gate.e_score_correction_bias,
             router_logits_dtype=self.gate.out_dtype,
         )
+        self.init_ep()
 
     def forward(
         self,
         hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
+        # Align with IluDeepseekV4MoE: route DP+EP through
+        # IluFusedMoEEP.forward_dp_ep (naive / ag-rs / DeepEP). Plain BF16 only;
+        # fused-norm-quant tuples stay on the non-EP path below.
+        if not isinstance(hidden_states, tuple) and self._should_use_forward_dp_ep():
+            org_shape = hidden_states.shape
+            final_hidden_states = self.forward_dp_ep(hidden_states)
+            return final_hidden_states.view(org_shape)
+
         # Fused norm-quant may pass (int8, scales, bf16_normed). Gate/router
         # need BF16; IluMoERunner.forward accepts the packed tuple for experts.
         experts_in: torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -385,15 +398,16 @@ class IluGlmMoeDsaMoE(nn.Module):
                     f"got len={len(hidden_states)}"
                 )
             q, scales, normed = hidden_states
-            num_tokens, hidden_dim = normed.shape
+            org_shape = normed.shape
+            hidden_dim = org_shape[-1]
             normed = normed.view(-1, hidden_dim)
             q = q.view(-1, q.shape[-1]) if q.ndim >= 2 else q
             scales = scales.view(-1, scales.shape[-1]) if scales.ndim >= 2 else scales
             experts_in = (q, scales, normed)
             router_in = normed
         else:
-            num_tokens, hidden_dim = hidden_states.shape
-            router_in = hidden_states.view(-1, hidden_dim)
+            org_shape = hidden_states.shape
+            router_in = hidden_states.view(-1, org_shape[-1])
             experts_in = router_in
 
         if self.experts.is_internal_router:
@@ -405,7 +419,7 @@ class IluGlmMoeDsaMoE(nn.Module):
             final_hidden_states = self.experts(
                 hidden_states=experts_in, router_logits=router_logits
             )
-        return final_hidden_states.view(num_tokens, hidden_dim)
+        return final_hidden_states.view(org_shape)
 
 
 class IluGlmMoeDsaDecoderLayer(nn.Module):

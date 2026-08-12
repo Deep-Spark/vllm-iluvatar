@@ -25,10 +25,6 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    import torch
 
 
 def make_can_use_dsv4_topk(
@@ -39,16 +35,14 @@ def make_can_use_dsv4_topk(
     ``functools.wraps`` keeps the community name / signature / ``__wrapped__``
     visible after the rebind, which is what lets ``check_signatures`` and any
     debug output still line up.
+
+    The body reads no arguments, so it takes ``*args, **kwargs`` rather than
+    restating the community parameter list: upstream adding a parameter would
+    otherwise turn every call into a ``TypeError`` at runtime.
     """
 
     @functools.wraps(orig)
-    def can_use_dsv4_topk(
-        gating_output: torch.Tensor,
-        correction_bias: torch.Tensor | None,
-        topk: int,
-        renormalize: bool,
-        indices_dtype: torch.dtype,
-    ) -> bool:
+    def can_use_dsv4_topk(*args: object, **kwargs: object) -> bool:
         # [ILU override] can_use_dsv4_topk — delta: close the Triton fast path
         # so ``fused_topk_bias`` falls through to ``vllm_topk_softplus_sqrt``
         # -> ``ops.topk_hash_softplus_sqrt``, which the plugin's

@@ -309,10 +309,41 @@ class IluDeepseekV4Fp8Indexer(nn.Module):
         kv_cache = self.k_cache.kv_cache
         topk_buffer = self.topk_indices_buffer
 
+        # Only C4A feeds this buffer into ``_build_extra_topk``; C128A takes its
+        # prefill indices from the metadata builder and cr == 1 never calls
+        # ``_build_extra_topk`` at all. Under C128A the skip below fires for
+        # every prompt shorter than 128 tokens and the chunk can span the whole
+        # batch, so resetting there would cost ``index_topk`` int32 per token,
+        # per layer, for rows nobody reads.
+        #
+        # The reset is a stopgap. ixformer a9d172e2 (branch yd_opt_fusion, not
+        # yet on the ixformer mainline this plugin builds against) gives
+        # ``ds4_compute_global_topk_indices_and_lens`` optional ``positions`` /
+        # ``compress_ratio`` args and bounds each row by
+        # ``min((positions[t] + 1) / compress_ratio, topk)``. That makes a
+        # never-written row unrepresentable at the point of use instead of
+        # asking the caller to scrub a buffer whose lifetime it does not own,
+        # and it is faster for short contexts. Once it lands: thread
+        # ``positions`` (already a ``forward_mqa`` arg, int64 is accepted)
+        # through ``_build_extra_topk`` and delete both this flag and the
+        # reset below.
+        topk_buffer_is_read = self.compress_ratio == 4
+
         if md.num_prefills > 0:
             assert md.prefill is not None
             for chunk in md.prefill.chunks:
                 if chunk.max_context_len == 0:
+                    # No compressed KV for any request in this chunk (C4A:
+                    # every seq_len <= 3), so the kernels below are skipped.
+                    # The buffer is torch.empty and only ever rewritten in
+                    # place, so leaving these rows alone keeps the previous
+                    # step's slots; ``ds4_compute_global_topk_indices_and_lens``
+                    # would then index this step's block_table with them. The
+                    # is_valid gate does not cover it -- these are real tokens
+                    # with real slots, unlike the all-padding warmup chunks.
+                    # -1 is the invalid sentinel that makes topk_lens zero.
+                    if topk_buffer_is_read:
+                        topk_buffer[chunk.token_start : chunk.token_end].fill_(-1)
                     continue
                 logits = ixfops.dsa_indexer_mqa_logits_with_blocks_fp8(
                     q_fp8[chunk.token_start : chunk.token_end],
@@ -377,17 +408,6 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
     )
     # UE8M0 block-scaled fp8 packed as uint8 (`fp8_ds_mla`).
     use_fp8_ds_mla_layout: ClassVar[bool] = True
-
-    @classmethod
-    def get_padded_num_q_heads(cls, num_heads: int) -> int:
-        """Q head count NV pads to (``64 if n <= 64 else 128``). Kept as a
-        helper only; this module does not pad."""
-        if num_heads > 128:
-            raise ValueError(
-                f"DeepseekV4 FlashMLA does not support {num_heads} heads "
-                "(FP8 decode kernel requires h_q in {64, 128})."
-            )
-        return 64 if num_heads <= 64 else 128
 
     def __init__(
         self,
@@ -839,6 +859,29 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
             "or 128."
         )
 
+    def _require_bmm_weights(self) -> None:
+        """Check the grouped fp8 views ``_o_proj`` needs actually got attached.
+
+        Only ``IluFp8BlockScaledMMKernel.process_weights_after_loading`` attaches
+        them, and only when it sees ``is_bmm`` with a non-empty ``bmm_geom``. A
+        different arch, linear backend or LinearMethod leaves them off, and the
+        bare attribute access below would surface as an AttributeError deep in
+        the first forward with no hint about kernel selection.
+        """
+        missing = [
+            name
+            for name in ("bmm_b_fp8", "bmm_bs")
+            if getattr(self.wo_a, name, None) is None
+        ]
+        if missing:
+            raise RuntimeError(
+                f"{self.prefix}.wo_a is missing {missing}, so the fused fp8 "
+                "o-projection cannot run. These are attached by "
+                "IluFp8BlockScaledMMKernel.process_weights_after_loading; make "
+                "sure it is the active linear kernel (ivcore30 + "
+                "VLLM_ILU_LINEAR_BACKEND selecting the block-scaled fp8 path)."
+            )
+
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Fused inverse-RoPE + fp8 grouped ``wo_a`` + row-parallel ``wo_b``.
 
@@ -847,6 +890,7 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
         scale ``as_scale`` [G, T] fp32); ``fp8_per_channel_einsum`` contracts it
         with the load-time per-channel fp8 weight into ``z`` [T, G, D] bf16.
         """
+        self._require_bmm_weights()
         a, as_scale = ixfops.ds4_inv_rope_fp8_quant(
             o,
             positions,

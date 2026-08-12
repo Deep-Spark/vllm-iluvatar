@@ -27,7 +27,6 @@ import types
 import pytest
 import torch
 from conftest import requires_cuda
-
 from vllm.model_executor.kernels.linear.scaled_mm.BlockScaledMMLinearKernel import (
     Fp8BlockScaledMMLinearKernel,
 )
@@ -38,7 +37,6 @@ from vllm_iluvatar.model_executor.kernels.linear.scaled_mm import (
 from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (  # noqa: E501
     IluFp8BlockScaledMMKernel,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -95,7 +93,7 @@ def test_process_weights_after_loading_calls_requant_op(monkeypatch, scale_dtype
         return fp8_output, out_scale
 
     monkeypatch.setattr(
-        ixfops, "fp8_weight_block_to_channel_requant", fake_requant, raising=False
+        ixfops, "fp8_weight_block_to_channel_requant", fake_requant
     )
 
     layer = _make_layer(weight, block_scale)
@@ -139,7 +137,7 @@ def test_process_weights_after_loading_skips_bmm_layer(monkeypatch):
         raise AssertionError("requant op must not be called for is_bmm layers")
 
     monkeypatch.setattr(
-        ixfops, "fp8_weight_block_to_channel_requant", boom, raising=False
+        ixfops, "fp8_weight_block_to_channel_requant", boom
     )
 
     N, K, gn, gk = 256, 256, 128, 128
@@ -199,7 +197,7 @@ def test_process_weights_after_loading_bmm_layer_builds_grouped_views(
         return fp8_output, out_scale
 
     monkeypatch.setattr(
-        ixfops, "fp8_weight_block_to_channel_requant", fake_requant, raising=False
+        ixfops, "fp8_weight_block_to_channel_requant", fake_requant
     )
 
     layer = _make_layer(weight, block_scale)
@@ -273,9 +271,9 @@ def test_apply_block_scaled_mm_per_channel_path(monkeypatch):
         return torch.full((m, n), 2.0, dtype=torch.bfloat16, device=A.device)
 
     monkeypatch.setattr(
-        ixfops, "fp8_per_token_dynamic_scaled", fake_quant, raising=False
+        ixfops, "fp8_per_token_dynamic_scaled", fake_quant
     )
-    monkeypatch.setattr(ixfops, "fp8_per_channel_mm", fake_mm, raising=False)
+    monkeypatch.setattr(ixfops, "fp8_per_channel_mm", fake_mm)
 
     M, N, K = 4, 8, 128
     kernel = _make_kernel(128, 128, torch.bfloat16)

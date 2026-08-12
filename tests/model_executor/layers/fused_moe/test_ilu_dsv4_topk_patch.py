@@ -248,4 +248,25 @@ def test_wrapper_keeps_the_community_identity_metadata():
     wrapper = getattr(impl, FACTORY)(original)
 
     assert wrapper.__name__ == SYMBOL
-    assert inspect.signature(wrapper) == inspect.signature(original)
+    # ``functools.wraps`` sets ``__wrapped__``, and ``inspect.signature``
+    # follows it by default -- comparing the two that way is a tautology.
+    # What matters is that the wrapper still *accepts* the community call, so
+    # bind the community signature's parameters against the raw wrapper.
+    assert wrapper.__wrapped__ is original
+    raw = inspect.signature(wrapper, follow_wrapped=False)
+    community = inspect.signature(original)
+    raw.bind(
+        *[
+            object()
+            for p in community.parameters.values()
+            if p.kind
+            in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+            and p.default is p.empty
+        ]
+    )
+    assert any(
+        p.kind is p.VAR_POSITIONAL for p in raw.parameters.values()
+    ), (
+        "the wrapper reads none of its arguments, so it should take "
+        "*args/**kwargs and survive upstream adding a parameter"
+    )

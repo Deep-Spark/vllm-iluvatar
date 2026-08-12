@@ -215,6 +215,15 @@ class IluFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         #                              so ``As`` is an unused placeholder).
         #   B  [N, K]      fp8_e4m3    per-output-channel requantized weight.
         #   Bs [N]         fp32        per-output-channel weight scale.
+        # A layer skipped by ``process_weights_after_loading`` still carries a
+        # 2-D block scale here; feeding that to ``fp8_per_channel_mm`` (which
+        # wants ``[N]``) would be silently wrong rather than an error.
+        if Bs.dim() != 1:
+            raise RuntimeError(
+                "IluFp8BlockScaledMMKernel.apply_block_scaled_mm expects a "
+                f"per-channel [N] weight scale, got shape {list(Bs.shape)}. The "
+                "load-time requant did not run for this layer."
+            )
         # Deferred import keeps ixformer off the non-ivcore30 eager import path
         # (matches the patch/is_supported arch gate).
         import ixformer.inference.functions as ixfops

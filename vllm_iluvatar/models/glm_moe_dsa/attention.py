@@ -690,7 +690,23 @@ class IluGlmMoeDsaMLAAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        q_latent_kpe = self.fused_qkv_a_proj(hidden_states)[0]
+        # Unpack fused norm-quant tuple: W8A8 gemm wants (q,s,dtype);
+        # indexer wk is BF16 and needs the normed activation.
+        hidden_bf16: torch.Tensor
+        if isinstance(hidden_states, tuple):
+            x_q, x_s, third = hidden_states
+            if isinstance(third, torch.Tensor):
+                hidden_bf16 = third
+                gemm_in: torch.Tensor | tuple = (x_q, x_s, third.dtype)
+            else:
+                gemm_in = (x_q, x_s, third)
+                # No BF16 payload: indexer (if any) must not run on int8.
+                hidden_bf16 = x_q  # placeholder; has_indexer path needs bf16
+        else:
+            hidden_bf16 = hidden_states
+            gemm_in = hidden_states
+
+        q_latent_kpe = self.fused_qkv_a_proj(gemm_in)[0]
         output_padding_size = getattr(self.fused_qkv_a_proj, "output_padding_size", 0)
         q_c, kv_a, k_pe, _ = q_latent_kpe.split(
             [
@@ -706,7 +722,7 @@ class IluGlmMoeDsaMLAAttention(nn.Module):
         kv_c_normed = self.kv_a_layernorm(kv_a)
 
         if self.indexer is not None and not self.skip_topk:
-            self.indexer(hidden_states, q_c, positions, self.rotary_emb)
+            self.indexer(hidden_bf16, q_c, positions, self.rotary_emb)
 
         attn_out = self.mla_attn(q, kv_c_normed, k_pe, positions)
         return self.o_proj(attn_out)[0]

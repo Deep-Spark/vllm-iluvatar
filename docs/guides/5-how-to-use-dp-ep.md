@@ -11,6 +11,7 @@ Parallel（EP），重点说明 DeepSeek-V4 的 Hybrid EP 配置、环境变量�
    - [基本执行流程](#21-基本执行流程)
    - [Hybrid EP 的目的](#22-hybrid-ep-的目的)
    - [必须保持的安全不变量](#23-必须保持的安全不变量)
+   - [在模型中接入不同的 Prefill 和 Decode backend](#24-在模型中接入不同的-prefill-和-decode-backend)
 3. [环境变量](#3-环境变量)
    - [Hybrid backend](#31-hybrid-backend)
    - [DP 请求分配与 Prefill 同步](#32-dp-请求分配与-prefill-同步)
@@ -120,6 +121,101 @@ Hybrid EP 必须满足：
 当各 DP rank 处于 Prefill/Decode 混合状态时，实现还会同步关闭该 step 的
 CUDA Graph replay，并使用 CUDA Graph padding 之前的 token 数计算 DP
 padding，避免 rank 间进入不同执行路径。
+
+### 2.4 在模型中接入混合 EP Backend
+
+模型需要通过 `IluFusedMoEEP` 接入 Hybrid EP。参考提交
+[`6752b169`](http://bitbucket.iluvatar.ai:7990/projects/AS/repos/vllm-iluvatar/commits/6752b1698841567fc98b12c465fbba8632e8de23#vllm_iluvatar/model_executor/models/deepseek_v4/model.py)
+对 DeepSeek-V4 MoE 的修改，接入步骤如下。
+
+1. 导入 `IluFusedMoEEP`，让模型的 MoE 类同时继承 `nn.Module` 和
+   `IluFusedMoEEP`。完成 routed experts、shared experts、quant method
+   和 `prefix` 初始化后调用 `self.init_ep()`。
+
+   ```python
+   from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
+       IluFusedMoEEP,
+   )
+
+
+   class ModelMoE(nn.Module, IluFusedMoEEP):
+       def __init__(self, config, ...):
+           super().__init__()
+           self.experts = ...
+
+           # 需要在最后
+           self.init_ep()
+   ```
+
+2. 在 MoE `forward()` 中先通过 `_should_use_forward_dp_ep()` 判断是否进入
+   DP + EP 路径，再调用 `forward_dp_ep()`；未进入时保留模型原有的
+   `FusedMoE` forward。如果模型复用了 shared-expert 的预量化输入，应继续
+   传递 `shared_gate_up_input`。
+
+   ```python
+   org_shape = hidden_states.shape
+   if self._should_use_forward_dp_ep():
+       final_hidden_states = self.forward_dp_ep(
+           hidden_states,
+           input_ids,
+       )
+       return final_hidden_states.view(org_shape)
+   ```
+
+合并后的示例如下：
+
+```python
+from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
+    IluFusedMoEEP,
+)
+
+
+class ModelMoE(nn.Module, IluFusedMoEEP):
+    def __init__(self, config, ...):
+        super().__init__()
+        self.experts = ...
+
+        # 需要在最后
+        self.init_ep()
+
+    def forward(self, hidden_states, input_ids=None):
+        org_shape = hidden_states.shape
+        if self._should_use_forward_dp_ep():
+            final_hidden_states = self.forward_dp_ep(
+                hidden_states,
+                input_ids,
+            )
+            return final_hidden_states.view(org_shape)
+
+        # 保留模型原有的 FusedMoE forward。
+        final_hidden_states = ...
+        return final_hidden_states.view(org_shape)
+```
+
+当配置的 Prefill backend 不是 LL、Decode override 为 LL 时，`init_ep()`
+会提前创建并缓存 LL manager 和通信 handle，避免在 CUDA Graph capture
+中初始化通信资源。未进入 DP + EP 路径时，应保留模型原有的 `FusedMoE`
+forward。
+
+模型层只负责接入 `IluFusedMoEEP`，不应自行根据本 rank 的 token 数判断
+Prefill 或 Decode。`forward_dp_ep()` 会读取同步后的
+`DPMetadata.all_ranks_decode_only`，统一选择 Prefill 或 Decode backend。
+例如：
+
+```bash
+export VLLM_ILU_DECODE_EP_BACKEND=deepep_low_latency
+
+vllm serve /path/to/model \
+  --enable-expert-parallel \
+  --all2all_backend=allgather_reducescatter
+```
+
+该配置下，Prefill 或 Prefill/Decode 混合 step 使用
+`allgather_reducescatter`；所有 DP rank 都是 decode-only 时使用
+`deepep_low_latency`。
+
+当前 DeepSeek-V4 对应实现位于
+[`models/deepseek_v4/model.py`](../../vllm_iluvatar/models/deepseek_v4/model.py)。
 
 ## 3. 环境变量
 

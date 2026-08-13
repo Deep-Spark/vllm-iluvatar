@@ -930,6 +930,39 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         return attn_metadata
 
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> IluDeepseekV32IndexerMetadata:
+        # Under FULL_DECODE_ONLY CUDA graph the decode ``max_context_len`` /
+        # ``max_kv_len`` are Python scalars baked into the graph at capture:
+        # they size the indexer logits width and the KV loop bound for
+        # ``dsa_indexer_mqa_logits_with_blocks`` and DO NOT update on replay.
+        # ``build_decode_metadata`` derives them from ``seq_lens.max()``, so the
+        # captured value tracks whatever dummy seq_len ``_dummy_run`` used. With
+        # the community ``seq_lens = max_query_len`` (tiny), the baked bound
+        # truncates the top-k candidate window on every real replay -> the
+        # sparse MLA only attends to a short recent window -> accuracy collapse
+        #
+        # Force a fixed, capture-safe upper bound equal to the compressed
+        # paged-KV capacity (max_model_len // compress_ratio). This exactly
+        # reproduces the known-good ``seq_lens = max_model_len`` capture value
+        # but locally, so ``_dummy_run`` may keep the community small seq_len.
+        # It only widens the (padded) logits matrix; the per-token causal length
+        # fed to ``dsa_update_topk_indices`` is ``cu_seqlen_ke - cu_seqlen_ks``
+        # (refreshed each step from real seq_lens), so unused columns never
+        # enter the top-k selection. Replay-time ``build`` still runs to refresh
+        # the address-stable GPU buffers; its scalar is ignored by the graph.
+        attn_metadata = self.build(
+            common_prefix_len=0, common_attn_metadata=common_attn_metadata
+        )
+        if attn_metadata.decode is not None:
+            max_context_len = self.vllm_config.model_config.max_model_len
+            if self.compress_ratio > 1:
+                max_context_len = max_context_len // self.compress_ratio
+            attn_metadata.decode.max_context_len = max_context_len
+            attn_metadata.decode.max_kv_len = max_context_len
+        return attn_metadata
+
 
 # ---------------------------------------------------------------------------
 # DeepSeek-V4 (ilu W4A8) indexer backend

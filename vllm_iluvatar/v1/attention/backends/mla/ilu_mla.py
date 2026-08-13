@@ -1062,7 +1062,20 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
         q_nope = q_nope.view(-1, self.num_heads, self.kv_lora_rank)
 
         B = q_nope.shape[0]
-        max_decode_seq_len = int(decode_meta.seq_lens.max().item())
+        use_cuda_graph = getattr(decode_meta, "use_cuda_graph", False)
+        # In full CUDA graph mode, ``max_context_len`` is a Python scalar baked
+        # into the graph at capture time; it configures the kernel's KV-context
+        # loop bound and does NOT update on replay. Deriving it from
+        # ``seq_lens.max()`` would freeze it at the (tiny) dummy-run seq len and
+        # truncate every real request's context on replay. Use the paged KV
+        # capacity (blocks-per-request * block_size) as a fixed upper bound so
+        # the captured bound covers any real sequence length; the per-request
+        # ``seq_lens`` GPU tensor (refreshed each step) still masks the tail.
+        if use_cuda_graph:
+            block_size = kv_c_and_k_pe_cache.shape[1]
+            max_decode_seq_len = decode_meta.block_table.shape[1] * block_size
+        else:
+            max_decode_seq_len = int(decode_meta.seq_lens.max().item())
 
         if self.dcp_world_size > 1:
             q = torch.cat([q_nope, q_pe], dim=-1)

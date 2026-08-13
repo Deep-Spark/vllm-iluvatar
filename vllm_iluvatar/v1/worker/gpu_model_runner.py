@@ -2636,7 +2636,7 @@ def _ilu__dummy_run(
             elif dcp_dummy_context_len > 0:
                 seq_lens = max_query_len + dcp_dummy_context_len  # type: ignore[assignment]
             else:
-                seq_lens = self.max_model_len  # type: ignore[assignment]
+                seq_lens = max_query_len  # type: ignore[assignment]
             self.optimistic_seq_lens_cpu[:num_reqs] = seq_lens
             self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
             self.seq_lens.copy_(self.optimistic_seq_lens_cpu, non_blocking=True)

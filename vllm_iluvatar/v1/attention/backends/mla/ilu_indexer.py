@@ -298,7 +298,14 @@ def kv_spans_from_batches(
         local_pos = L_uncomp_expand - m_expand + pos_within
     end_location = start_tensor + local_pos  # exclusive end
 
-    return start_tensor.int().to(device), end_location.int().to(device)
+    # Pin before uploading: a plain ``.to(device)`` from pageable memory is a
+    # blocking copy, and in the decode steady state this runs while the CUDA
+    # graph of the previous step is still executing, so it stalls the host
+    # until the GPU drains instead of just enqueuing the transfer.
+    return (
+        start_tensor.int().pin_memory().to(device, non_blocking=True),
+        end_location.int().pin_memory().to(device, non_blocking=True),
+    )
 
 
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):
@@ -605,8 +612,16 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # Fill cu_seqlens_q buffer in-place (address-stable for CUDA graph).
         # Per-request query offsets, e.g. plain decode -> [0, 1, ..., num_decodes],
         # uniform MTP (next_n=2) -> [0, 2, 4, ..., 2*num_decodes].
-        self.cu_seqlens_q_buffer[: num_decodes + 1] = decode_qsl_cpu.to(
-            dtype=torch.int32, device=self.device
+        # Derived from the device-side ``query_start_loc`` rather than the host
+        # one: the host tensor is not pinned, so uploading it blocks until the
+        # previous step's CUDA graph has drained. This is the first GPU-touching
+        # statement of a decode step, so that stall costs a whole forward pass
+        # of host/device overlap.
+        qsl_gpu = common_attn_metadata.query_start_loc
+        torch.sub(
+            qsl_gpu[: num_decodes + 1],
+            qsl_gpu[0],
+            out=self.cu_seqlens_q_buffer[: num_decodes + 1],
         )
         cu_seqlens_q = self.cu_seqlens_q_buffer[: num_decodes + 1]
 
@@ -639,24 +654,32 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         cu_seqlen_ks = self.cu_seqlen_ks_buffer[:num_decode_tokens]
         cu_seqlen_ke = self.cu_seqlen_ke_buffer[:num_decode_tokens]
 
-        # cu_seqlens_kv: prefix sum of compressed seq_lens, with leading 0.
-        self.cu_seqlens_kv_buffer[0] = 0
-        seq_lens_decode_gpu = seq_lens_decode.to(dtype=torch.int32, device=self.device)
-        self.cu_seqlens_kv_buffer[1 : num_decodes + 1] = torch.cumsum(
-            seq_lens_decode_gpu, dim=0
-        )
-        cu_seqlens_kv = self.cu_seqlens_kv_buffer[: num_decodes + 1]
-
         # Fill compressed seq_lens buffer in-place for address stability.
         # ``decode_metadata.seq_lens`` is consumed by topk-update / paged-mqa
         # kernels for the per-token causal masks.
         if compress_ratio > 1:
-            self.decode_compressed_seq_lens_buffer[:num_decodes] = (
-                common_attn_metadata.seq_lens[:num_decodes] // compress_ratio
+            torch.div(
+                common_attn_metadata.seq_lens[:num_decodes],
+                compress_ratio,
+                rounding_mode="floor",
+                out=self.decode_compressed_seq_lens_buffer[:num_decodes],
             )
             decode_seq_lens = self.decode_compressed_seq_lens_buffer[:num_decodes]
         else:
             decode_seq_lens = common_attn_metadata.seq_lens[:num_decodes]
+
+        # cu_seqlens_kv: prefix sum of compressed seq_lens, with leading 0.
+        # Summing the device-side compressed lengths computed just above keeps
+        # this off the host: the equivalent host tensor is not pinned, so
+        # uploading it would block until the previous CUDA graph drained.
+        self.cu_seqlens_kv_buffer[:1].zero_()
+        torch.cumsum(
+            decode_seq_lens,
+            dim=0,
+            dtype=torch.int32,
+            out=self.cu_seqlens_kv_buffer[1 : num_decodes + 1],
+        )
+        cu_seqlens_kv = self.cu_seqlens_kv_buffer[: num_decodes + 1]
 
         decode_metadata = IluDeepSeekV32IndexerDecodeMetadata(
             block_table=common_attn_metadata.block_table_tensor[:num_decodes, ...],

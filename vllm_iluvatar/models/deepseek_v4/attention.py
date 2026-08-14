@@ -1049,7 +1049,8 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
            ``bmm_batch_size=n_local_groups``).
         5. ``self.wo_b(z.flatten(1))`` collapses the per-group lora
            outputs and runs the row-parallel projection back to
-           ``hidden_size`` (with TP all-reduce inside ``RowParallelLinear``).
+           ``hidden_size``. The decoder layer may fuse its TP all-reduce
+           with the following MHC post operation.
         """
         projection_input = (
             hidden_states if fused_wqa_wkv_input is None else fused_wqa_wkv_input

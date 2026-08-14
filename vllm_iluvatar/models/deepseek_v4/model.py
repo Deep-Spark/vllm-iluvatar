@@ -61,6 +61,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
@@ -248,6 +249,9 @@ _DS4_MHC_DYNAMIC_INT8 = (
         "1" if ixcuda.cuda_arch == "ivcore30" else "0",
     )
     == "1"
+)
+_DS4_ALLREDUCE_MHC_POST = (
+    os.environ.get("IXFORMER_DS4_ALLREDUCE_MHC_POST", "1") == "1"
 )
 
 
@@ -623,6 +627,7 @@ class IluDeepseekV4Attention(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=not _DS4_ALLREDUCE_MHC_POST,
             return_bias=False,
             prefix=f"{prefix}.wo_b",
         )
@@ -888,7 +893,19 @@ class IluDeepseekV4DecoderLayer(nn.Module):
         residual: torch.Tensor,
         post: torch.Tensor,
         comb: torch.Tensor,
+        *,
+        reduce_x: bool = False,
     ):
+        if reduce_x:
+            out = torch.empty_like(residual)
+            return ixfops.allreduce_mhc_post(
+                x,
+                residual,
+                post,
+                comb,
+                out,
+                group=get_tp_group().device_group,
+            )
         return ixfops.ds4_mhc_post(x, residual, post, comb)
 
     def forward(
@@ -930,7 +947,13 @@ class IluDeepseekV4DecoderLayer(nn.Module):
             None,
             fused_wqa_wkv_input=attention_input,
         )
-        x = self.hc_post(x, residual, post, comb)
+        x = self.hc_post(
+            x,
+            residual,
+            post,
+            comb,
+            reduce_x=_DS4_ALLREDUCE_MHC_POST,
+        )
 
         residual = x
         emit_ffn_quant = (

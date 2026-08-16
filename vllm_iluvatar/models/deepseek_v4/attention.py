@@ -102,6 +102,14 @@ _DS4_QK_NORM_QUANT_FUSION = (
 )
 _DS4_C4A_MERGED_WQ_B = os.environ.get("IXFORMER_DS4_C4A_MERGED_WQ_B", "0") == "1"
 _DS4_SHARED_QR_QUANT = os.environ.get("IXFORMER_DS4_SHARED_QR_QUANT", "1") == "1"
+# q_lora_rank values the fused norm+quant kernel handles: 1536 (Pro), 1024
+# (Flash).  Must stay in sync with the TORCH_CHECK in
+# ixformer/src/ixformer/infer/rms_norm.cpp.
+_QK_NORM_QUANT_Q_K = (1024, 1536)
+# The fusion replaces rms_norm_qk + scaled_int8_quant with a single kernel, so
+# its GPU-time win grows with the batch (measured 5.4us at T=1 rising to 8.1us
+# at T=16 on both widths).  Cap at the largest decode batch per rank.
+_QK_NORM_QUANT_MAX_TOKENS = 16
 
 
 def _can_fuse_qr_norm_quant(
@@ -119,8 +127,9 @@ def _can_fuse_qr_norm_quant(
         and wrapper.kv_norm.weight.dtype == torch.bfloat16
         and qr.dim() == 2
         and kv.dim() == 2
-        and 1 <= qr.shape[0] <= 8
-        and qr.shape == (kv.shape[0], _C4A_Q_K)
+        and 1 <= qr.shape[0] <= _QK_NORM_QUANT_MAX_TOKENS
+        and qr.shape[0] == kv.shape[0]
+        and qr.shape[1] in _QK_NORM_QUANT_Q_K
         and kv.shape[1] == 512
         and qr.stride(-1) == 1
         and kv.stride(-1) == 1

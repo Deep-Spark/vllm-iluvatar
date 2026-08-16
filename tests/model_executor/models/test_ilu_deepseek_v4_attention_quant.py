@@ -20,12 +20,12 @@ def _w8a8_scheme() -> IluCompressedTensorsW8A8Int8:
     return object.__new__(IluCompressedTensorsW8A8Int8)
 
 
-def _wrapper(*, c4a: bool = False, main_decoder: bool = True):
+def _wrapper(*, c4a: bool = False, main_decoder: bool = True, q_k: int = 1536):
     scheme = _w8a8_scheme()
     indexer = SimpleNamespace(wq_b=SimpleNamespace(scheme=scheme)) if c4a else None
     return SimpleNamespace(
         is_main_decoder_layer=main_decoder,
-        q_norm=SimpleNamespace(weight=torch.empty(1536, dtype=torch.bfloat16)),
+        q_norm=SimpleNamespace(weight=torch.empty(q_k, dtype=torch.bfloat16)),
         kv_norm=SimpleNamespace(weight=torch.empty(512, dtype=torch.bfloat16)),
         wq_b=SimpleNamespace(scheme=scheme),
         indexer=indexer,
@@ -43,10 +43,14 @@ def _decode_metadata():
     return {"swa": SimpleNamespace(num_prefills=0)}
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
-def test_qr_norm_quant_decode_guard_accepts_supported_batches(num_tokens: int):
-    wrapper = _wrapper()
-    qr = torch.empty(num_tokens, 1536, dtype=torch.bfloat16)
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 12, 16])
+@pytest.mark.parametrize("q_k", [1024, 1536])
+def test_qr_norm_quant_decode_guard_accepts_supported_batches(
+    num_tokens: int,
+    q_k: int,
+):
+    wrapper = _wrapper(q_k=q_k)
+    qr = torch.empty(num_tokens, q_k, dtype=torch.bfloat16)
     kv = torch.empty(num_tokens, 512, dtype=torch.bfloat16)
 
     assert _can_fuse_qr_norm_quant(wrapper, qr, kv, _decode_metadata())
@@ -54,7 +58,7 @@ def test_qr_norm_quant_decode_guard_accepts_supported_batches(num_tokens: int):
 
 @pytest.mark.parametrize(
     ("num_tokens", "main_decoder", "num_prefills"),
-    [(0, True, 0), (9, True, 0), (1, False, 0), (1, True, 1)],
+    [(0, True, 0), (17, True, 0), (1, False, 0), (1, True, 1)],
 )
 def test_qr_norm_quant_decode_guard_rejects_fallback_cases(
     num_tokens: int,
@@ -67,6 +71,15 @@ def test_qr_norm_quant_decode_guard_rejects_fallback_cases(
     metadata = {"swa": SimpleNamespace(num_prefills=num_prefills)}
 
     assert not _can_fuse_qr_norm_quant(wrapper, qr, kv, metadata)
+
+
+def test_qr_norm_quant_decode_guard_rejects_unsupported_q_k():
+    """The kernel only implements the two DeepSeek-V4 q_lora_rank widths."""
+    wrapper = _wrapper(q_k=2048)
+    qr = torch.empty(1, 2048, dtype=torch.bfloat16)
+    kv = torch.empty(1, 512, dtype=torch.bfloat16)
+
+    assert not _can_fuse_qr_norm_quant(wrapper, qr, kv, _decode_metadata())
 
 
 def test_qr_norm_quant_c4a_requires_both_w8a8_consumers():

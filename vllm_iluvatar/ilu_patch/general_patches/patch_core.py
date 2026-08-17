@@ -28,7 +28,12 @@ from __future__ import annotations
 import inspect
 import types
 
+from vllm.logger import init_logger
+
 from vllm_iluvatar.ilu_patch import general_patch as p
+
+
+logger = init_logger(__name__)
 
 
 SHOULD_THROTTLE_PREFILLS = '''\
@@ -158,6 +163,15 @@ def _apply() -> None:
         strict=True,
     )
 
+    # [ILU override] Add the rank-synchronized prefill throttle decision.
     DPEngineCoreProc._should_throttle_prefills = should_throttle  # type: ignore[method-assign]
+    # [ILU override] Synchronize prefill admission and wait for replacements.
     DPEngineCoreProc._process_engine_step = process_step  # type: ignore[method-assign]
+    # [ILU override] Start synchronized prefill waves on every DP rank.
     DPEngineCoreProc._handle_client_request = handle_client_request  # type: ignore[method-assign]
+    logger.info(
+        "Enabled ILU synchronized DP prefills: max_defer_steps=%d, "
+        "max_replacement_wait_ms=%g.",
+        envs.VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS,
+        replacement_wait_ms,
+    )

@@ -1164,6 +1164,7 @@ class IluDeepseekV4ForCausalLM(nn.Module, SupportsPP):
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.config = config
+        self.model_dtype = vllm_config.model_config.dtype
         # No expert_dtype dispatch -- this class is bound to W4A8 only.
         self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
@@ -1230,6 +1231,10 @@ class IluDeepseekV4ForCausalLM(nn.Module, SupportsPP):
                 f"{len(missing)} parameter(s) were not initialized from the "
                 f"checkpoint. Showing up to 20:\n  " + "\n  ".join(preview)
             )
+
+        for module in self.modules():
+            if isinstance(module, IluDeepseekV4MultiHeadLatentAttentionWrapper):
+                module.process_weights_after_loading(self.model_dtype)
 
         # Optional sanity stats (helps first-run dispatch verification: routed
         # vs. shared expert vs. bf16 base counts should be plausible).

@@ -115,6 +115,8 @@ if TYPE_CHECKING:
     VLLM_ILU_DS4_PREFILL_OPT: bool = False
     VLLM_ILU_DS4_PREFILL_AS_DECODE: bool = False
     VLLM_ILU_DS4_MQA_QUANT_TYPE: str = ""
+    VLLM_ILU_FUSE_NORM_QUANT: bool = True
+    VLLM_ILU_FUSE_MOE_W13: bool = True
     VLLM_ILU_NIXL_WRITE_USE_HOST_BUFFER: bool = False
     VLLM_ILU_NIXL_HOST_DTYPE: str = "auto"
     VLLM_ILU_NIXL_PROXY_ADDR: str = ""
@@ -138,6 +140,10 @@ if TYPE_CHECKING:
     VLLM_ILU_ENABLE_PP_MTP: bool = False
     VLLM_ILU_MXFP4_MOE_BACKEND: str = "ixmm"
     VLLM_ILU_REJECTION_SAMPLER_MAX_CHUNK_BYTES: int = 128 * 1024 * 1024
+    # GLM DSA fp8 KV: single float shared by ALL layers. Prefer PATH for
+    # per-layer tables; empty -> online amax/448 on first eager insert.
+    VLLM_ILU_GLM_DSA_FP8_KV_SCALE: str = ""
+    VLLM_ILU_GLM_DSA_FP8_KV_SCALE_PATH: str = ""
 
 # Canonical (VLLM_ILU_*) readers. Each lambda preserves the exact parsing the
 # fork used in vllm/envs.py, and reads VLLM_ILU_* first then the legacy VLLM_*.
@@ -224,10 +230,9 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_NIXL_DS32_QUANT_AFTER_TRANSFER": _bool_reader(
         "VLLM_ILU_NIXL_DS32_QUANT_AFTER_TRANSFER", "0"
     ),
-    "VLLM_ILU_LINEAR_BACKEND": lambda: os.environ.get("VLLM_ILU_LINEAR_BACKEND", "")
-    .strip()
-    .lower()
-    .replace("-", "_"),
+    "VLLM_ILU_LINEAR_BACKEND": lambda: (
+        os.environ.get("VLLM_ILU_LINEAR_BACKEND", "").strip().lower().replace("-", "_")
+    ),
     "VLLM_ILU_DP_LB_EXACT_INFLIGHT": _bool_reader("VLLM_ILU_DP_LB_EXACT_INFLIGHT", "0"),
     "VLLM_ILU_DEEPEP_USE_INT8": lambda: int(
         os.environ.get("VLLM_ILU_DEEPEP_USE_INT8", "0")
@@ -290,9 +295,28 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_DS4_MQA_QUANT_TYPE": lambda: os.environ.get(
         "VLLM_ILU_DS4_MQA_QUANT_TYPE", ""
     ).upper(),
-    # Opt-in compact-row W13+SwiGLU+INT8 fusion (native ixformer). Default off
-    # until TP8 / TP8+EP8 service ITL A/B confirms benefit.
-    "VLLM_ILU_FUSE_MOE_W13": _bool_reader("VLLM_ILU_FUSE_MOE_W13", "0"),
+    # IluGlm residual/RMSNorm+INT8 fusion. Default on (TP8 Graph ITL benefit);
+    # set 0 to force the split RMSNorm path. Fail-closed at the call site.
+    "VLLM_ILU_FUSE_NORM_QUANT": lambda: (
+        _get("VLLM_ILU_FUSE_NORM_QUANT", "VLLM_FUSE_NORM_QUANT", "1").strip().lower()
+        in _TRUE_VALS
+    ),
+    # Compact-row W13+SwiGLU+INT8 fusion (native ixformer). Default on after
+    # TP8 Graph ITL A/B showed benefit; set 0 for the split GEMV path.
+    # Fail-closed for unsupported shapes / runtime errors.
+    "VLLM_ILU_FUSE_MOE_W13": lambda: (
+        _get("VLLM_ILU_FUSE_MOE_W13", "VLLM_FUSE_MOE_W13", "1").strip().lower()
+        in _TRUE_VALS
+    ),
+    # GLM DSA 640B fp8 packed KV scale. A non-empty float applies the SAME
+    # scale to every layer (not per-layer). Prefer PATH for per-layer JSON
+    # ``{prefix: {"kv": float}}``. Empty + empty PATH -> online amax/448.
+    "VLLM_ILU_GLM_DSA_FP8_KV_SCALE": lambda: os.environ.get(
+        "VLLM_ILU_GLM_DSA_FP8_KV_SCALE", ""
+    ),
+    "VLLM_ILU_GLM_DSA_FP8_KV_SCALE_PATH": lambda: os.environ.get(
+        "VLLM_ILU_GLM_DSA_FP8_KV_SCALE_PATH", ""
+    ),
 }
 
 

@@ -290,6 +290,9 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_DS4_MQA_QUANT_TYPE": lambda: os.environ.get(
         "VLLM_ILU_DS4_MQA_QUANT_TYPE", ""
     ).upper(),
+    # Opt-in compact-row W13+SwiGLU+INT8 fusion (native ixformer). Default off
+    # until TP8 / TP8+EP8 service ITL A/B confirms benefit.
+    "VLLM_ILU_FUSE_MOE_W13": _bool_reader("VLLM_ILU_FUSE_MOE_W13", "0"),
 }
 
 

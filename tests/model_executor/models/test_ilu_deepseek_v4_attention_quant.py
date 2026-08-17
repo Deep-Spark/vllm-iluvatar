@@ -8,8 +8,8 @@ import torch
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes import (
     IluCompressedTensorsW8A8Int8,
 )
-from vllm_iluvatar.model_executor.models.deepseek_v4 import attention
-from vllm_iluvatar.model_executor.models.deepseek_v4.attention import (
+from vllm_iluvatar.models.deepseek_v4 import attention
+from vllm_iluvatar.models.deepseek_v4.attention import (
     IluDeepseekV4MultiHeadLatentAttentionWrapper,
     _can_fuse_qr_norm_quant,
     _can_merge_c4a_wq_b,

@@ -11,7 +11,7 @@ Parallel（EP），重点说明 DeepSeek-V4 的 Hybrid EP 配置、环境变量�
    - [基本执行流程](#21-基本执行流程)
    - [Hybrid EP 的目的](#22-hybrid-ep-的目的)
    - [必须保持的安全不变量](#23-必须保持的安全不变量)
-   - [在模型中接入不同的 Prefill 和 Decode backend](#24-在模型中接入不同的-prefill-和-decode-backend)
+   - [在模型中接入混合 EP Backend](#24-在模型中接入混合-ep-backend)
 3. [环境变量](#3-环境变量)
    - [Hybrid backend](#31-hybrid-backend)
    - [DP 请求分配与 Prefill 同步](#32-dp-请求分配与-prefill-同步)
@@ -124,9 +124,10 @@ padding，避免 rank 间进入不同执行路径。
 
 ### 2.4 在模型中接入混合 EP Backend
 
-模型需要通过 `IluFusedMoEEP` 接入 Hybrid EP。参考提交
-[`6752b169`](http://bitbucket.iluvatar.ai:7990/projects/AS/repos/vllm-iluvatar/commits/6752b1698841567fc98b12c465fbba8632e8de23#vllm_iluvatar/model_executor/models/deepseek_v4/model.py)
-对 DeepSeek-V4 MoE 的修改，接入步骤如下。
+模型需要通过 `IluFusedMoEEP` 接入 Hybrid EP。参考当前 DeepSeek-V4 MoE
+实现
+[`models/deepseek_v4/model.py`](../../vllm_iluvatar/models/deepseek_v4/model.py)，
+接入步骤如下。
 
 1. 导入 `IluFusedMoEEP`，让模型的 MoE 类同时继承 `nn.Module` 和
    `IluFusedMoEEP`。完成 routed experts、shared experts、quant method
@@ -213,9 +214,6 @@ vllm serve /path/to/model \
 该配置下，Prefill 或 Prefill/Decode 混合 step 使用
 `allgather_reducescatter`；所有 DP rank 都是 decode-only 时使用
 `deepep_low_latency`。
-
-当前 DeepSeek-V4 对应实现位于
-[`models/deepseek_v4/model.py`](../../vllm_iluvatar/models/deepseek_v4/model.py)。
 
 ## 3. 环境变量
 
@@ -320,11 +318,12 @@ PID，默认文件也不会共享；此时若需要跨 server 的全局 round-ro
 - 参考脚本：显式设为 `1`。
 - 作用：在调度前同步各 DP EngineCore 的 Prefill-ready 和 Decode-busy
   状态；当只有部分 rank ready 时，有界推迟该 Prefill wave。
-- 对应提交：当前 rebase 后的逻辑后继为 `f1784180`，rebase 前用于评审的
-  版本为
-  [`6955334c`](http://bitbucket.iluvatar.ai:7990/projects/AS/repos/vllm-iluvatar/commits/6955334ce3c4182873297bd0a3ce211bff505e59)。
-- collective 顺序修复：当前 rebase 后为 `6c4bf064`，rebase 前为
-  `f97a08a8`。
+- 安装条件：还须 `VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS > 0`，否则
+  EngineCore wrapper 不会安装，本开关单独开启无效。
+- 对应提交：
+  [`76d338dd`](http://bitbucket.iluvatar.ai:7990/projects/AS/repos/vllm-iluvatar/commits/76d338dd7b10d4d7b7be8e371e4ec9413ce377a0)。
+- collective 顺序修复：
+  [`924613a5`](http://bitbucket.iluvatar.ai:7990/projects/AS/repos/vllm-iluvatar/commits/924613a55c0d0a5a9adc77ba702f4f19f2040cac)。
 
 同步使用独立 CPU process group。参与一次 Prefill 同步的每个 rank 都必须
 继续执行且只执行一个真实或 dummy worker step，否则 EngineCore collective
@@ -336,8 +335,8 @@ PID，默认文件也不会共享；此时若需要跨 server 的全局 round-ro
 - 负值处理：限制为 `0`。
 - 作用：部分 DP rank 有 Prefill、其它 rank 仍 Decode 时，允许等待的最大
   模型 step 数；超过上限后 fail-open，避免 Prefill 饥饿。
-- 对应提交：当前逻辑后继为 `f1784180`，rebase 前评审版本为
-  [`6955334c`](http://bitbucket.iluvatar.ai:7990/projects/AS/repos/vllm-iluvatar/commits/6955334ce3c4182873297bd0a3ce211bff505e59)。
+- 对应提交：
+  [`76d338dd`](http://bitbucket.iluvatar.ai:7990/projects/AS/repos/vllm-iluvatar/commits/76d338dd7b10d4d7b7be8e371e4ec9413ce377a0)。
 
 当部分 rank ready 但没有 rank Decode 时，实现最多只短暂聚合两个 step，
 同时仍受该上限约束。
@@ -348,12 +347,13 @@ PID，默认文件也不会共享；此时若需要跨 server 的全局 round-ro
 - 负值处理：限制为 `0`。
 - 作用：某个 rank 执行完模型并清空本地 scheduler 后，短暂等待后台线程把
   replacement request 放入输入队列，避免过早进入 dummy batch。
-- 对应提交：当前逻辑后继为 `f1784180`，rebase 前评审版本为
-  [`6955334c`](http://bitbucket.iluvatar.ai:7990/projects/AS/repos/vllm-iluvatar/commits/6955334ce3c4182873297bd0a3ce211bff505e59)。
+- 对应提交：
+  [`76d338dd`](http://bitbucket.iluvatar.ai:7990/projects/AS/repos/vllm-iluvatar/commits/76d338dd7b10d4d7b7be8e371e4ec9413ce377a0)。
 
 该等待解决短请求完成后的输入投递竞态；长输出下的 DP phase drift 仍需由
 `VLLM_ILU_DP_ENABLE_SYNC_PREFILLS` 解决。不要用较大的固定 sleep 代替跨
-rank 同步。
+rank 同步。`patch_core.py` 只在本变量大于 0 且
+`VLLM_ILU_DP_ENABLE_SYNC_PREFILLS` 开启时安装 wrapper。
 
 ### 3.3 DP + EP MoE 计算
 
@@ -367,7 +367,8 @@ rank 同步。
   fused W4A8 MoE；否则回退到 modular 路径。
 - 初始提交：
   [`6752b169`](http://bitbucket.iluvatar.ai:7990/projects/AS/repos/vllm-iluvatar/commits/6752b1698841567fc98b12c465fbba8632e8de23)。
-- 当前 fused 路径补充提交：`aed9d125`。
+- 当前 fused 路径补充提交：
+  [`c6e9872e`](http://bitbucket.iluvatar.ai:7990/projects/AS/repos/vllm-iluvatar/commits/c6e9872e978bb934839d1bba0420fdc1c6b2cadb)。
 
 当前 W4A8 fused MoE 要求 `format=TN`、`version=2`、`group_size=-1`。
 其它格式会在加载期报 `NotImplementedError`，不应静默使用。
@@ -378,8 +379,8 @@ rank 同步。
 
 当 `VLLM_ILU_DISABLE_DEEPEP=1`、LL 使用 `BufferWrapper`/NVSM 路径时，
 Hybrid LL buffer 使用 `scheduler_config.max_num_seqs` 估算每个 rank 的
-最大 token 容量，而不是使用 `max_num_batched_tokens`。对应提交为当前
-rebase 后的 `7714288d`，rebase 前为 `8608ca32`。
+最大 token 容量，而不是使用 `max_num_batched_tokens`。对应提交：
+[`4f22186d`](http://bitbucket.iluvatar.ai:7990/projects/AS/repos/vllm-iluvatar/commits/4f22186df9a4b7d385d72093b47f4102e4e69a59)。
 
 当前实现中，当 TP scatter 或 fused AG/AR 开启时，容量还会除以 TP size。
 
@@ -501,6 +502,7 @@ wave 会被拆成两个昂贵的全局 EP step。
 4. 是否需要暂时 throttle 当前 partial Prefill wave。
 
 当所有 rank 都 ready 时一起释放 Prefill；超过 defer 上限后 fail-open。
+被 skip 的 waiting 请求不计入 Prefill-ready。
 
 ### 6.3 已验证结果
 
@@ -550,14 +552,15 @@ kernel 做大范围 profiling。
    初始支持 DP + EP、Hybrid EP backend 和 round-robin LB。
 2. [`3f2a6e81`](http://bitbucket.iluvatar.ai:7990/projects/AS/repos/vllm-iluvatar/commits/3f2a6e812df442b0d6d961ae433905929d935463)：
    补充 DP + EP 测试、边界检查和说明。
-3. `7714288d`（rebase 前 `8608ca32`）：
+3. [`4f22186d`](http://bitbucket.iluvatar.ai:7990/projects/AS/repos/vllm-iluvatar/commits/4f22186df9a4b7d385d72093b47f4102e4e69a59)：
    Hybrid LL buffer 容量改用 `max_num_seqs`。
-4. `f1784180`（rebase 后逻辑后继；rebase 前评审版本为
-   [`6955334c`](http://bitbucket.iluvatar.ai:7990/projects/AS/repos/vllm-iluvatar/commits/6955334ce3c4182873297bd0a3ce211bff505e59)）：
+4. [`76d338dd`](http://bitbucket.iluvatar.ai:7990/projects/AS/repos/vllm-iluvatar/commits/76d338dd7b10d4d7b7be8e371e4ec9413ce377a0)：
    优化 DP Prefill 调度，增加同步 admission 和 replacement wait。
-5. `6c4bf064`（rebase 后逻辑后继；rebase 前评审版本为 `f97a08a8`）：
+5. [`924613a5`](http://bitbucket.iluvatar.ai:7990/projects/AS/repos/vllm-iluvatar/commits/924613a55c0d0a5a9adc77ba702f4f19f2040cac)：
    修复 Prefill 同步中的 collective 顺序，保证每轮同步对应一个 worker
    step。
+6. [`c6e9872e`](http://bitbucket.iluvatar.ai:7990/projects/AS/repos/vllm-iluvatar/commits/c6e9872e978bb934839d1bba0420fdc1c6b2cadb)：
+   naive/AG-RS 路径补充 fused MoE。
 
 ## 9. 附录
 

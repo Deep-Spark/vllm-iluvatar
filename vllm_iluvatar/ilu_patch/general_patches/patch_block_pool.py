@@ -6,12 +6,14 @@ Target   : BlockPool.free_blocks
 Baseline : main_4cd213ead
 Why      : Community commit a82f1b388fe changed the free-queue ordering for
            blocks released while prefix caching is disabled.
-How      : Replace the class method with a fingerprinted copy of the
-           pre-a82f1b388fe implementation, including its original comments.
+How      : Fingerprint the current community ``BlockPool.free_blocks``
+           (post-a82f1b388fe), then rebind it to the pre-a82f1b388fe hash
+           split in ``vllm_iluvatar.v1.core.block_pool``.
 Scope    : KV-cache block release and reuse ordering.
 Remove   : When community vLLM reverts a82f1b388fe or provides an equivalent fix.
-Fingerprint: the community ``BlockPool.free_blocks`` source is checked before
-           rebinding; gated by VLLM_ILU_PATCH_CHECK_FINGERPRINT.
+Fingerprint: the live community ``BlockPool.free_blocks`` source is checked
+           against ``FREE_BLOCKS`` before rebinding; gated by
+           VLLM_ILU_PATCH_CHECK_FINGERPRINT.
 """
 
 from __future__ import annotations
@@ -67,7 +69,8 @@ def _apply() -> None:
         inspect.getsource(BlockPool.free_blocks),
         FREE_BLOCKS,
         resync_hint=(
-            "Review the pre-a82f1b388fe behavior and refresh FREE_BLOCKS."
+            "Refresh FREE_BLOCKS to the new community source, then review "
+            "whether the pre-a82f1b388fe override still applies."
         ),
     )
     p.check_signatures(BlockPool, impl, ["free_blocks"], strict=True)

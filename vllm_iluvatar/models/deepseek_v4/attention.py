@@ -670,10 +670,17 @@ class IluDeepseekCompressor(DeepseekCompressor):
                 rms_norm_eps=self.rms_norm_eps,
             )
         else:
-            ixfops.ref_ds4_compressor_save_pool_norm_rope_insert(
+            ixfops.ds4_compressor_save_partial_states(
                 kv=kv,
                 score=score,
                 ape=self.ape,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                state_cache=state_cache,
+                block_size=block_size,
+                compress_ratio=self.compress_ratio,
+            )
+            ixfops.ds4_compressor_pool_norm_rope_insert(
                 state_cache=state_cache,
                 token_to_req_indices=token_to_req_indices,
                 positions=positions,
@@ -870,6 +877,9 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
             self.compressor.kv_cache_dtype = self.mla_attn.kv_cache_dtype
 
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        self._ensure_c4a_wq_b_merge()
+
     def _ensure_c4a_wq_b_merge(self) -> None:
         if (
             not _DS4_C4A_MERGED_WQ_B
@@ -961,7 +971,6 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
            outputs and runs the row-parallel projection back to
            ``hidden_size`` (with TP all-reduce inside ``RowParallelLinear``).
         """
-        self._ensure_c4a_wq_b_merge()
         projection_input = (
             hidden_states
             if fused_wqa_wkv_input is None

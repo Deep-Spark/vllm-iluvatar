@@ -609,7 +609,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
         """Run the ixformer fused routed-MoE prefill for this EP rank.
-        It is called in compressed_tensors_moe.py
+        It is called in ilu_fused_moe_ep.py.
         """
         if self.gemm_format != "TN" or self.version != 2 or self.group_size != -1:
             raise NotImplementedError(

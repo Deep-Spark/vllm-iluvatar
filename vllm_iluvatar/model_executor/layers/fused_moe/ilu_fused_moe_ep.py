@@ -60,6 +60,12 @@ class IluFusedMoEEP:
     def init_ep(self):
         if self._should_preinit_dp_ep_ll_handle():
             self._get_forward_dp_ep_ll_all2all()
+            logger.info_once(
+                "Initialized Hybrid EP low-latency decode backend "
+                "(configured_backend=%s, decode_override=%s).",
+                self.experts.moe_config.moe_parallel_config.all2all_backend,
+                _DS4_DECODE_EP_BACKEND,
+            )
 
     def _should_use_forward_dp_ep(self) -> bool:
         moe_parallel_config = self.experts.moe_config.moe_parallel_config

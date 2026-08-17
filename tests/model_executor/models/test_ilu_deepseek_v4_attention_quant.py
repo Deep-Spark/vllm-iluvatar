@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -101,10 +101,17 @@ def test_c4a_merged_weight_disabled_does_not_allocate(
 ):
     monkeypatch.setattr(attention, "_DS4_C4A_MERGED_WQ_B", False)
     wrapper = SimpleNamespace()
+    wrapper._ensure_c4a_wq_b_merge = MethodType(
+        IluDeepseekV4MultiHeadLatentAttentionWrapper._ensure_c4a_wq_b_merge,
+        wrapper,
+    )
 
-    IluDeepseekV4MultiHeadLatentAttentionWrapper._ensure_c4a_wq_b_merge(wrapper)
+    IluDeepseekV4MultiHeadLatentAttentionWrapper.process_weights_after_loading(
+        wrapper,
+        torch.bfloat16,
+    )
 
-    assert vars(wrapper) == {}
+    assert not hasattr(wrapper, "_c4a_merged_wq_b_weight")
 
 
 def test_c4a_merged_weight_lifecycle_concatenates_once(
@@ -126,8 +133,15 @@ def test_c4a_merged_weight_lifecycle_concatenates_once(
         _c4a_merged_wq_b_weight=None,
         _c4a_merged_wq_b_scale=None,
     )
+    wrapper._ensure_c4a_wq_b_merge = MethodType(
+        IluDeepseekV4MultiHeadLatentAttentionWrapper._ensure_c4a_wq_b_merge,
+        wrapper,
+    )
 
-    IluDeepseekV4MultiHeadLatentAttentionWrapper._ensure_c4a_wq_b_merge(wrapper)
+    IluDeepseekV4MultiHeadLatentAttentionWrapper.process_weights_after_loading(
+        wrapper,
+        torch.bfloat16,
+    )
     first_weight = wrapper._c4a_merged_wq_b_weight
 
     assert first_weight.shape == (24576, 1536)
@@ -142,5 +156,8 @@ def test_c4a_merged_weight_lifecycle_concatenates_once(
         wrapper.indexer.wq_b.weight_scale,
     )
 
-    IluDeepseekV4MultiHeadLatentAttentionWrapper._ensure_c4a_wq_b_merge(wrapper)
+    IluDeepseekV4MultiHeadLatentAttentionWrapper.process_weights_after_loading(
+        wrapper,
+        torch.bfloat16,
+    )
     assert wrapper._c4a_merged_wq_b_weight is first_weight

@@ -449,6 +449,19 @@ vllm serve "${MODEL}" \
   --served-model-name DeepSeek
 ```
 
+### 4.3 确认配置生效
+
+服务启动时检查以下 INFO 日志：
+
+1. `Enabled ILU synchronized DP prefills`：sync-prefill patch 已安装；日志同时
+   输出 `max_defer_steps` 和 `max_replacement_wait_ms`。
+2. `Initialized Hybrid EP low-latency decode backend`：LL decode backend 和
+   通信 handle 已初始化。
+
+若缺少第一条，检查 `VLLM_ILU_DP_ENABLE_SYNC_PREFILLS=1` 且
+`VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS > 0`；若缺少第二条，检查
+`VLLM_ILU_DECODE_EP_BACKEND=deepep_low_latency` 和 DP + EP 是否启用。
+
 ## 5. Backend 选择规则
 
 当前 DP + EP 自定义路径要求同时满足：

@@ -18,10 +18,13 @@ Three layers, mirroring V4:
   processing. Analogue of ``IluDeepseekV4MultiHeadLatentAttentionWrapper``.
 - :class:`IluGlmMoeDsaSparseMLA` -- inner sparse MLA (``AttentionLayerBase``).
   Owns ``get_attn_backend`` / ``get_kv_cache_spec`` and drives rope + absorbed
-  k-up + ``concat_and_cache_mla`` + the FlashMLA sparse kernel + v-up. The
-  absorbed up-proj is grouped W8A16 marlin: k-up / v-up read
-  ``kv_b_proj.W_UK`` / ``W_UV`` (repacked at load time by
-  ``IluGlmKVBProjW8A16Method ``) and call ``ixf_ops.marlin_w8a16``. Slimmed
+  k-up + KV insert + sparse MLA + v-up. Default KV is bf16 latent (576) via
+  ``concat_and_cache_mla`` + ``dsa_flash_mla_sparse_fwd``. With
+  ``--kv-cache-dtype fp8`` it uses the GLM DSA 640-byte packed path
+  (``glm_dsa_fp8_kv_insert`` + ``dsa_flash_mla_with_fp8_kvcache`` /
+  ``sparse_flash_attn_fp8``). The absorbed up-proj is grouped W8A16 marlin:
+  k-up / v-up read ``kv_b_proj.W_UK`` / ``W_UV`` (repacked at load time by
+  ``_IluGlmKVBProjW8A16Method``) and call ``ixf_ops.marlin_w8a16``. Slimmed
   fork of ``IluFlashMLASparseImpl`` (GLM/V3.2 only: no compress_ratio / SWA /
   attn_sink / C128A / DCP / quantized-output paths). Analogue of
   ``IluDeepseekV4MLAAttention``.
@@ -34,12 +37,15 @@ The ``q_a_proj`` + ``kv_a_proj_with_mqa`` fusion is done at *load time* via a
 ``load_weights``); there is no runtime ``_inject_merge_qkv_a`` monkeypatch.
 """
 
+import json
 import math
+from functools import lru_cache
 from types import SimpleNamespace
 
 import ixformer.inference.functions as ixf_ops
 import torch
 import torch.nn as nn
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -73,6 +79,75 @@ from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
     IluDeepseekV32IndexerBackend,
 )
 
+# GLM DSA fp8 packed latent: 512 e4m3 NoPE + 64 bf16 RoPE = 640 bytes.
+_GLM_DSA_FP8_ROW_BYTES = 640
+_GLM_DSA_FP8_Q_HEADS = 64
+_GLM_DSA_FP8_E4M3_MAX = 448.0
+
+logger = init_logger(__name__)
+
+
+@lru_cache(maxsize=4)
+def _load_glm_dsa_fp8_kv_scale_table(path: str) -> dict[str, float]:
+    """Load per-layer GLM DSA fp8 KV scales: ``{layer.self_attn.attn: {kv: float}}``."""
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"VLLM_ILU_GLM_DSA_FP8_KV_SCALE_PATH={path!r}: expected a JSON "
+            f"object of layer -> {{'kv': float}}, got {type(raw).__name__}"
+        )
+    out: dict[str, float] = {}
+    for key, val in raw.items():
+        if isinstance(val, dict) and "kv" in val:
+            out[key] = float(val["kv"])
+        elif isinstance(val, (int, float)):
+            out[key] = float(val)
+        else:
+            raise ValueError(
+                f"VLLM_ILU_GLM_DSA_FP8_KV_SCALE_PATH={path!r}: entry "
+                f"{key!r} must be {{'kv': float}} or a float, got {val!r}"
+            )
+    logger.info("Loaded %d GLM DSA fp8 KV scales from %s", len(out), path)
+    return out
+
+
+def _resolve_glm_dsa_fp8_kv_scale(prefix: str) -> tuple[float | None, str]:
+    """Resolve GLM DSA fp8 KV dequant scale for one attention layer.
+
+    Priority:
+      1. ``VLLM_ILU_GLM_DSA_FP8_KV_SCALE`` — a single float shared by **all**
+         layers (not per-layer). Prefer this only for quick bring-up.
+      2. ``VLLM_ILU_GLM_DSA_FP8_KV_SCALE_PATH`` — JSON table keyed by layer
+         prefix (``{prefix: {"kv": float}}`` or ``{prefix: float}``).
+      3. Otherwise ``None`` → online ``amax/448`` on the first eager KV insert
+         (skipped during CUDA-graph capture; prefer 1/2 for production).
+    """
+    scale_env = envs.VLLM_ILU_GLM_DSA_FP8_KV_SCALE
+    if scale_env.strip():
+        return float(scale_env), "VLLM_ILU_GLM_DSA_FP8_KV_SCALE"
+
+    path = envs.VLLM_ILU_GLM_DSA_FP8_KV_SCALE_PATH
+    if path.strip():
+        table = _load_glm_dsa_fp8_kv_scale_table(path.strip())
+        candidates = [
+            prefix,
+            prefix.removeprefix("model."),
+            f"model.{prefix}" if not prefix.startswith("model.") else prefix,
+        ]
+        for cand in candidates:
+            if cand in table:
+                return table[cand], f"{path}:{cand}"
+        logger.warning(
+            "VLLM_ILU_GLM_DSA_FP8_KV_SCALE_PATH=%r has no entry for %r "
+            "(tried %s); falling back to online amax/448 calibration",
+            path,
+            prefix,
+            candidates,
+        )
+        return None, "online_amax_missing_json_key"
+
+    return None, "online_amax"
 
 
 def _yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -246,14 +321,23 @@ class IluGlmMoeDsaIndexer(nn.Module):
 
 
 class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
-    """Sparse MLA inner attention for GLM-5.2 (ilu W4A8, BF16 KV cache).
+    """Sparse MLA inner attention for GLM-5.2 (ilu W4A8).
 
     Self-contained slim fork of ``IluFlashMLASparseImpl`` -- keeps only the
-    GLM/V3.2 path: rope + absorbed k-up + ``concat_and_cache_mla`` + FlashMLA
-    sparse kernel (single MQA path for prefill & decode) + v-up. Drops
-    compress_ratio / SWA / attn_sink / C128A / DCP / quantized output.
-    Registered as an ``AttentionLayerBase`` so the runner allocates its paged
-    KV cache and builds :class:`IluFlashMLASparseMetadata` keyed on ``prefix``.
+    GLM/V3.2 path: rope + absorbed k-up + KV insert + sparse MLA (single MQA
+    path for prefill & decode) + v-up. Drops compress_ratio / SWA / attn_sink /
+    C128A / DCP / quantized output. Registered as an ``AttentionLayerBase`` so
+    the runner allocates its paged KV cache and builds
+    :class:`IluFlashMLASparseMetadata` keyed on ``prefix``.
+
+    KV cache modes:
+      * default / ``bfloat16`` — 576-wide bf16 latent via
+        ``concat_and_cache_mla`` + ``dsa_flash_mla_sparse_fwd``.
+      * ``fp8`` / ``fp8_e4m3`` / ``fp8_glm_dsa`` — 640-byte packed rows
+        (512 e4m3 NoPE + 64 bf16 RoPE) via ``glm_dsa_fp8_kv_insert`` and
+        either ``dsa_flash_mla_with_fp8_kvcache`` (local q_heads <= 32) or
+        ``sparse_flash_attn_fp8`` (64-head tile). Not DeepSeek-V4
+        ``fp8_ds_mla`` (584B).
 
     ``kv_b_proj`` is grouped W8A16 marlin: :class:`IluGlmKVBProjW8A16Method `
     (in ``compressed-tensors`` / ``IluQuantConfig``) splits it into ``W_UK`` / ``W_UV`` and repacks
@@ -289,7 +373,8 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         self.v_head_dim = v_head_dim
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
-        # MLA latent K/V share a single 576-wide vector (kv_lora + rope).
+        # Semantic MLA latent width (kv_lora + rope). FP8 packed rows use
+        # ``_GLM_DSA_FP8_ROW_BYTES`` as the physical cache head size instead.
         self.head_size = kv_lora_rank + qk_rope_head_dim
         self.scale = float(scale)
         self.softmax_scale = float(scale)
@@ -298,23 +383,73 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         self.topk_indices_buffer = topk_indices_buffer
         self.prefix = prefix
 
-        # ilu fork: BF16 KV cache. Reject explicit fp8 selection loudly.
         kv_cache_dtype = (
             cache_config.cache_dtype
             if cache_config is not None and cache_config.cache_dtype not in (None, "")
             else "auto"
         )
-        if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
+        if kv_cache_dtype == "auto":
+            kv_cache_dtype = "bfloat16"
+        if kv_cache_dtype == "fp8_ds_mla":
             raise ValueError(
-                "IluGlmMoeDsaSparseMLA does not support fp8 KV cache; "
-                f"got kv_cache_dtype={kv_cache_dtype!r}. Use --kv-cache-dtype "
-                "bfloat16."
+                "IluGlmMoeDsaSparseMLA does not use DeepSeek-V4 fp8_ds_mla "
+                "(584B) layout. Pass --kv-cache-dtype fp8 for the GLM DSA "
+                "640-byte packed path, or bfloat16 for the bf16 latent."
             )
+        self.use_fp8_attn = kv_cache_dtype in ("fp8", "fp8_e4m3", "fp8_glm_dsa")
+        init_scale = 1.0
+        self._fp8_kv_scale_frozen = False
+        # q_heads > 32: fmha (fixed 64-head tile). Else dsv4 (h_q % 16 == 0).
+        self._fp8_use_dsv4 = self.use_fp8_attn and self.num_heads <= 32
+        self._fp8_q_heads = (
+            max(16, (self.num_heads + 15) // 16 * 16)
+            if self._fp8_use_dsv4
+            else _GLM_DSA_FP8_Q_HEADS
+        )
+        if self.use_fp8_attn:
+            kv_cache_dtype = "fp8"
+            if self.num_heads > _GLM_DSA_FP8_Q_HEADS:
+                raise ValueError(
+                    "FP8 sparse MLA requires <= "
+                    f"{_GLM_DSA_FP8_Q_HEADS} local Q heads; got {self.num_heads}"
+                )
+            resolved, source = _resolve_glm_dsa_fp8_kv_scale(prefix)
+            if resolved is not None:
+                init_scale = resolved
+                self._fp8_kv_scale_frozen = True
+                logger.info(
+                    "GLM DSA fp8 KV scale for %s = %.8g (%s)",
+                    prefix,
+                    init_scale,
+                    source,
+                )
+            elif prefix.endswith(".layers.0.self_attn.attn") or prefix.endswith(
+                "layers.0.self_attn.attn"
+            ):
+                logger.warning(
+                    "GLM DSA fp8 KV scale for %s uses online amax/448 "
+                    "(%s). Prefer VLLM_ILU_GLM_DSA_FP8_KV_SCALE_PATH "
+                    "(per-layer) or VLLM_ILU_GLM_DSA_FP8_KV_SCALE "
+                    "(single float shared by ALL layers). Online scale "
+                    "freezes on the first eager insert and is skipped "
+                    "during CUDA-graph capture.",
+                    prefix,
+                    source,
+                )
+            if prefix.endswith(".layers.0.self_attn.attn") or prefix.endswith(
+                "layers.0.self_attn.attn"
+            ):
+                logger.info(
+                    "GLM DSA fp8 attn = %s (local q_heads=%d)",
+                    "dsv4" if self._fp8_use_dsv4 else "fmha",
+                    self.num_heads,
+                )
         self.kv_cache_dtype = kv_cache_dtype
 
-        # BF16 cache -> concat_and_cache_mla scale is a no-op 1.0.
         self.register_buffer(
-            "_k_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False
+            "_k_scale",
+            torch.full((1,), init_scale, dtype=torch.float32),
+            persistent=False,
         )
 
         self.kv_cache = torch.tensor([])
@@ -328,6 +463,14 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         return IluFlashMLASparseBackend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        if self.use_fp8_attn:
+            return MLAAttentionSpec(
+                block_size=vllm_config.cache_config.block_size,
+                num_kv_heads=1,
+                head_size=_GLM_DSA_FP8_ROW_BYTES,
+                dtype=torch.uint8,
+                cache_dtype_str="fp8",
+            )
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
@@ -394,19 +537,43 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         results = ops.sparse_prefill_fwd(q, kv, indices, sm_scale, d_v)
         return results
 
-    def _sparse_mla_kernel(
-        self,
-        q: torch.Tensor,
-        kv_c_and_k_pe_cache: torch.Tensor,
-        attn_metadata: IluFlashMLASparseMetadata,
-    ) -> torch.Tensor:
-        """DSA sparse MLA via ixformer ``dsa_flash_mla_sparse_fwd`` (qk=576, v=512).
+    def _maybe_init_fp8_kv_scale(self, kv_c: torch.Tensor) -> None:
+        """Freeze kv_scale from the first eager insert; skip CUDA-graph capture.
 
-        On ivcore11 the registry selects ``ixformer_native``.
+        Online calibration is a bring-up fallback. Prefer
+        ``VLLM_ILU_GLM_DSA_FP8_KV_SCALE_PATH`` / ``VLLM_ILU_GLM_DSA_FP8_KV_SCALE``
+        so scale is fixed before graph capture. If the first inserts happen
+        only under capture, scale stays at the init value (usually 1.0).
         """
-        num_tokens = q.shape[0]
+        if self._fp8_kv_scale_frozen or kv_c.numel() == 0:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            if not getattr(self, "_fp8_kv_scale_capture_warned", False):
+                logger.warning(
+                    "GLM DSA fp8 KV scale for %s is still unfrozen during "
+                    "CUDA-graph capture; keeping scale=%s. Warm up with an "
+                    "eager insert or set VLLM_ILU_GLM_DSA_FP8_KV_SCALE(_PATH).",
+                    self.prefix,
+                    float(self._k_scale.item()),
+                )
+                self._fp8_kv_scale_capture_warned = True
+            return
+        amax = kv_c.detach().float().abs().amax().clamp_min(1e-12)
+        scale = (amax / _GLM_DSA_FP8_E4M3_MAX).reshape(1)
+        self._k_scale.copy_(scale)
+        self._fp8_kv_scale_frozen = True
+        logger.info(
+            "GLM DSA fp8 KV scale for %s frozen online = %.8g (amax/448)",
+            self.prefix,
+            float(scale.item()),
+        )
+
+    def _global_topk(
+        self,
+        num_tokens: int,
+        attn_metadata: IluFlashMLASparseMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         topk_indices = self.topk_indices_buffer[:num_tokens]
-        # Per-request indices -> global paged slots (+ per-token valid counts).
         topk_indices, topk_length = triton_convert_req_index_to_global_index(
             attn_metadata.req_id_per_token,
             attn_metadata.block_table,
@@ -415,13 +582,20 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
             NUM_TOPK_TOKENS=topk_indices.shape[1],
             return_valid_counts=True,
         )
+        return topk_indices.view(num_tokens, 1, -1), topk_length
 
+    def _sparse_mla_kernel(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: IluFlashMLASparseMetadata,
+    ) -> torch.Tensor:
+        """DSA sparse MLA via ixformer ``dsa_flash_mla_sparse_fwd`` (qk=576, v=512)."""
+        num_tokens = q.shape[0]
+        topk_indices, topk_length = self._global_topk(num_tokens, attn_metadata)
         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
             -1, 1, kv_c_and_k_pe_cache.shape[-1]
         )
-        topk_indices = topk_indices.view(num_tokens, 1, -1)
-        # Sparse MLA returns latent V (kv_lora_rank=512); v_up_proj maps to
-        # v_head_dim afterwards. Do not pass self.v_head_dim (256 on GLM-5.2).
         return ixf_ops.dsa_flash_mla_sparse_fwd(
             q,
             kv_c_and_k_pe_cache,
@@ -430,6 +604,48 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
             d_v=self.kv_lora_rank,
             topk_length=topk_length,
         )
+
+    def _sparse_mla_kernel_fp8(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: IluFlashMLASparseMetadata,
+    ) -> torch.Tensor:
+        """Packed 640B sparse MLA. ``q_heads > 32``: fmha; else dsv4."""
+        num_tokens = q_nope.shape[0]
+        q_heads = self._fp8_q_heads
+        topk_indices, topk_length = self._global_topk(num_tokens, attn_metadata)
+        q_packed = q_nope.new_empty(
+            (num_tokens, q_heads, _GLM_DSA_FP8_ROW_BYTES), dtype=torch.uint8
+        )
+        q_scale = torch.empty(
+            (num_tokens, q_heads), dtype=torch.float32, device=q_nope.device
+        )
+        ixf_ops.glm_dsa_fp8_q_pack(q_nope, q_pe, q_packed, q_scale)
+        if self._fp8_use_dsv4:
+            out = ixf_ops.dsa_flash_mla_with_fp8_kvcache(
+                q_packed.view(num_tokens, 1, q_heads, _GLM_DSA_FP8_ROW_BYTES),
+                kv_cache.unsqueeze(2),
+                topk_indices,
+                topk_length,
+                q_scale,
+                self._k_scale,
+                self.softmax_scale,
+            ).squeeze(1)
+        else:
+            out = ixf_ops.sparse_flash_attn_fp8(
+                q_packed,
+                kv_cache.view(-1, 1, kv_cache.shape[-1]),
+                topk_indices,
+                q_scale,
+                self._k_scale,
+                self.softmax_scale,
+                topk_length=topk_length,
+            )
+        if self.num_heads == q_heads:
+            return out
+        return out[:, : self.num_heads, :].contiguous()
 
     def forward(
         self,
@@ -479,24 +695,41 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        # Absorbed k-up: (B, N, P) -> (B, N, kv_lora_rank), concat with rope.
+        # Absorbed k-up: (B, N, P) -> (B, N, kv_lora_rank).
         q_nope = self._k_up_proj(q_nope)
         q_nope = q_nope.view(-1, self.num_heads, self.kv_lora_rank)
-        q = torch.cat([q_nope, q_pe], dim=-1)
 
         if kv_cache.numel() > 0:
-            ops.concat_and_cache_mla(
-                kv_c_normed,
-                k_pe,
-                kv_cache,
-                attn_metadata.slot_mapping.flatten(),
-                kv_cache_dtype=self.kv_cache_dtype,
-                scale=self._k_scale,
+            slot_mapping = attn_metadata.slot_mapping.flatten()[:num_actual_toks]
+            if self.use_fp8_attn:
+                self._maybe_init_fp8_kv_scale(kv_c_normed)
+                ixf_ops.glm_dsa_fp8_kv_insert(
+                    kv_c_normed,
+                    k_pe,
+                    kv_cache,
+                    slot_mapping,
+                    self._k_scale,
+                    attn_metadata.block_size,
+                )
+            else:
+                ops.concat_and_cache_mla(
+                    kv_c_normed,
+                    k_pe,
+                    kv_cache,
+                    slot_mapping,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale=self._k_scale,
+                )
+
+        if self.use_fp8_attn:
+            attn_out = self._sparse_mla_kernel_fp8(
+                q_nope, q_pe, kv_cache, attn_metadata
             )
+        else:
+            q = torch.cat([q_nope, q_pe], dim=-1)
+            attn_out = self._sparse_mla_kernel(q, kv_cache, attn_metadata)
 
-        attn_out = self._sparse_mla_kernel(q, kv_cache, attn_metadata)
-
-        output = q.new_empty((num_tokens, self.num_heads, self.v_head_dim))
+        output = q_nope.new_empty((num_tokens, self.num_heads, self.v_head_dim))
         output[:num_actual_toks] = self._v_up_proj(attn_out)
         return output.view(num_tokens, self.num_heads * self.v_head_dim)
 

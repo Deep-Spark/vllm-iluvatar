@@ -46,6 +46,7 @@ from typing import Any, cast
 
 import torch
 import torch.nn as nn
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -91,6 +92,10 @@ logger = init_logger("vllm." + __name__)
 _FUSE_NORM_QUANT_WARNED = False
 
 
+def _fuse_norm_quant_enabled() -> bool:
+    return bool(getattr(envs, "VLLM_ILU_FUSE_NORM_QUANT", True))
+
+
 def _residual_rms_norm_with_quant(
     hidden_states: torch.Tensor,
     residual: torch.Tensor | None,
@@ -99,7 +104,13 @@ def _residual_rms_norm_with_quant(
     *,
     return_normed: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor] | None:
-    """Call ixformer fused residual/RMSNorm+INT8; None on import/runtime failure."""
+    """Call ixformer fused residual/RMSNorm+INT8; None → split path.
+
+    Honors ``VLLM_ILU_FUSE_NORM_QUANT`` (default on). Runtime failures also
+    return None (fail-closed).
+    """
+    if not _fuse_norm_quant_enabled():
+        return None
     global _FUSE_NORM_QUANT_WARNED
     try:
         import ixformer.inference.functions as ixf_ops
@@ -361,8 +372,7 @@ class IluGlmMoeDsaMoE(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor
-        | tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         # Fused norm-quant may pass (int8, scales, bf16_normed). Gate/router
         # need BF16; IluMoERunner.forward accepts the packed tuple for experts.
@@ -480,7 +490,8 @@ class IluGlmMoeDsaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Norm+INT8 fusion is always on for IluGlm (GO); fail-closed to split.
+        # Norm+INT8 fusion gated by VLLM_ILU_FUSE_NORM_QUANT (default on);
+        # fail-closed to split when disabled or when the ixformer op fails.
 
         # --- input layernorm (+ fused INT8 for attn W8A8) ---
         # Always return_normed so indexer can consume BF16 while W8A8 gemm

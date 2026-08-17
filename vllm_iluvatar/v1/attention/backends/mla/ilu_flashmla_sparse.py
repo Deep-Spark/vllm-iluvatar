@@ -102,7 +102,9 @@ class IluFlashMLASparseBackend(AttentionBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        return [576]
+        # 576: bf16 latent (kv_lora + rope). 640: GLM DSA fp8 packed row
+        # (512 e4m3 bytes + 64 bf16 RoPE values as uint8).
+        return [576, 640]
 
     @classmethod
     def is_mla(cls) -> bool:

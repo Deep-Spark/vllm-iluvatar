@@ -11,10 +11,16 @@ Why      : Align replacement prefills across DP ranks before EP execution and
            is enabled and VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS is positive.
            VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS bounds the fail-open delay.
 How      : Delegation wrappers installed on DPEngineCoreProc only.
-           Both community method bodies are fingerprinted before wrapping so
-           upstream scheduling changes fail fast and require a wrapper review.
+           All three community method bodies are fingerprinted before wrapping
+           so upstream scheduling changes fail fast and require a wrapper review.
+           Installation requires both VLLM_ILU_DP_ENABLE_SYNC_PREFILLS and a
+           positive VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS; either off is a no-op.
 Scope    : Env-gated Iluvatar hybrid DP+EP serving.
 Remove   : When upstream provides equivalent synchronized prefill scheduling.
+Fingerprint: DPEngineCoreProc._should_throttle_prefills, _process_engine_step,
+           and _handle_client_request community sources are hashed at
+           register-time against the snapshots below; gated by
+           VLLM_ILU_PATCH_CHECK_FINGERPRINT.
 """
 
 from __future__ import annotations

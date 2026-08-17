@@ -314,6 +314,10 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     return max_model_len * 40
 
 
+def get_max_decode_context_len(vllm_config: VllmConfig, compress_ratio: int) -> int:
+    return cdiv(vllm_config.model_config.max_model_len, compress_ratio)
+
+
 class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     reorder_batch_threshold: int = 1
     natively_supported_next_n: list[int] = [1, 2]
@@ -349,6 +353,9 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.compress_ratio = 1
         if isinstance(self.kv_cache_spec, MLAAttentionSpec):
             self.compress_ratio = self.kv_cache_spec.compress_ratio
+        self.max_decode_context_len = get_max_decode_context_len(
+            self.vllm_config, self.compress_ratio
+        )
 
         # Pre-allocate compressed slot_mapping buffer for CUDA graph address
         # stability when this group needs compression (V4 indexer cache).
@@ -590,7 +597,9 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             seq_lens_decode = seq_lens_decode_uncomp // compress_ratio
         else:
             seq_lens_decode = seq_lens_decode_uncomp
-        max_context_len = int(seq_lens_decode.max().item())
+        # These host scalars are fixed at CUDA graph capture time. Actual
+        # per-request lengths remain device-driven through cu_seqlens_kv.
+        max_context_len = self.max_decode_context_len
         max_kv_len = max_context_len
 
         # Fill cu_seqlens_q buffer in-place (address-stable for CUDA graph).

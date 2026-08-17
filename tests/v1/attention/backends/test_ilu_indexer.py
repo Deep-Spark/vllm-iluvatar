@@ -9,6 +9,7 @@ import torch
 
 from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
     IluDeepseekV32IndexerBackend,
+    get_max_decode_context_len,
     get_max_prefill_buffer_size,
     kv_spans_from_batches,
     split_indexer_prefill_chunks,
@@ -104,3 +105,12 @@ def test_get_max_prefill_buffer_size_scales_with_model_len():
     )
 
     assert get_max_prefill_buffer_size(vllm_config) == 163840 * 40
+
+
+def test_get_max_decode_context_len_uses_cache_domain_upper_bound():
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=4097),
+    )
+
+    assert get_max_decode_context_len(vllm_config, compress_ratio=1) == 4097
+    assert get_max_decode_context_len(vllm_config, compress_ratio=4) == 1025

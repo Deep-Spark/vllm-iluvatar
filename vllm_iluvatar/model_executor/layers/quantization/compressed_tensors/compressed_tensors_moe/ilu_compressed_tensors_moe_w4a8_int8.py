@@ -7,6 +7,7 @@ describes 4-bit weights with 8-bit activations. Layout is taken from
 ``iluvatar.gemm_format`` and ``iluvatar.pack_version``.
 """
 
+import os
 from typing import Any
 
 import ixformer.inference.functions as ixfops  # type: ignore
@@ -51,9 +52,54 @@ from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_uti
 
 logger = init_logger("vllm." + __name__)
 
+_FUSE_W13_ENGAGED_LOGGED = False
+_FUSE_W13_SKIP_LOGGED = False
+_SUPPORTED_W13_INTERMEDIATES = (256, 512, 1024, 2048)
+_SUPPORTED_W13_EXPERTS = (32, 64, 128, 256)
+_SUPPORTED_W13_ROWS = (1, 2, 4, 8)
+
 
 def _get_ilu_output_scale(layer: RoutedExperts) -> float:
     return getattr(layer, "_ilu_output_scale", 1.0)
+
+
+def _fuse_moe_w13_enabled() -> bool:
+    return bool(getattr(envs, "VLLM_ILU_FUSE_MOE_W13", False))
+
+
+def _log_fuse_w13_skip(reason: str) -> None:
+    global _FUSE_W13_SKIP_LOGGED
+    if _FUSE_W13_SKIP_LOGGED:
+        return
+    logger.warning("fuse_moe_w13 skip: %s", reason)
+    mark_path = os.environ.get("ILU_W13_FUSE_MARK_PATH")
+    if mark_path:
+        try:
+            with open(mark_path, "a", encoding="utf-8") as handle:
+                handle.write(f"fuse_moe_w13 skip: {reason}\n")
+        except OSError:
+            pass
+    _FUSE_W13_SKIP_LOGGED = True
+
+
+def _log_fuse_w13_engaged(num_experts: int, hidden: int, intermediate: int, rows: int) -> None:
+    global _FUSE_W13_ENGAGED_LOGGED
+    if _FUSE_W13_ENGAGED_LOGGED:
+        return
+    msg = (
+        f"fuse_moe_w13 engaged E={num_experts} H={hidden} "
+        f"I={intermediate} rows={rows}"
+    )
+    logger.warning(msg)
+    mark_path = os.environ.get("ILU_W13_FUSE_MARK_PATH")
+    if mark_path:
+        try:
+            with open(mark_path, "a", encoding="utf-8") as handle:
+                handle.write(msg + "\n")
+        except OSError:
+            pass
+    _FUSE_W13_ENGAGED_LOGGED = True
+
 
 
 def int4_w4a8_moe_quant_config(
@@ -730,21 +776,39 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         )
 
         if run_decode:
-            act = ixfops.moe_w4a8_group_gemv(
-                input=act,
-                weight=layer.w13_weight,
-                i_scales=a_scale,
-                w_scales=layer.w13_weight_scale,
-                output_dtype=dtype,
-                tokens_per_experts=expert_sizes_gpu,
-                w_i8scales=layer.w13_i8_weight_scale,
-                w_i8zeros=layer.w13_i8_weight_zero,
-                dst_to_src=None,
-                bias=layer.w13_bias,
-                format=self.gemm1_info.format,
-                group_size=self.group_size,
-                dense_tokens_per_experts=dense_expert_sizes_gpu,
+            fused = self._try_fused_w13_swiglu_quant(
+                layer=layer,
+                act=act,
+                a_scale=a_scale,
+                dense_expert_sizes_gpu=dense_expert_sizes_gpu,
+                aggregate_rows=expand_tokens,
+                sorted_token_ids=sorted_token_ids,
             )
+            if fused is None:
+                act = ixfops.moe_w4a8_group_gemv(
+                    input=act,
+                    weight=layer.w13_weight,
+                    i_scales=a_scale,
+                    w_scales=layer.w13_weight_scale,
+                    output_dtype=dtype,
+                    tokens_per_experts=expert_sizes_gpu,
+                    w_i8scales=layer.w13_i8_weight_scale,
+                    w_i8zeros=layer.w13_i8_weight_zero,
+                    dst_to_src=None,
+                    bias=layer.w13_bias,
+                    format=self.gemm1_info.format,
+                    group_size=self.group_size,
+                    dense_tokens_per_experts=dense_expert_sizes_gpu,
+                )
+                act, a_scale = self._activation_and_quant(
+                    layer=layer,
+                    input=act,
+                    sorted_token_ids=sorted_token_ids,
+                    output_format=1,
+                    check_valid=True,
+                )
+            else:
+                act, a_scale = fused
         else:
             act = ixfops.moe_w4a8_group_gemm(
                 input=act,
@@ -761,14 +825,13 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 group_size=self.group_size,
                 version=self.version,
             )
-
-        act, a_scale = self._activation_and_quant(
-            layer=layer,
-            input=act,
-            sorted_token_ids=sorted_token_ids,
-            output_format=1 if run_decode else 0,
-            check_valid=run_decode,
-        )
+            act, a_scale = self._activation_and_quant(
+                layer=layer,
+                input=act,
+                sorted_token_ids=sorted_token_ids,
+                output_format=0,
+                check_valid=False,
+            )
         out = torch.empty(
             (num_tokens * layer.top_k, self.gemm2_info.get_pad_n()),
             device=x.device,
@@ -852,28 +915,38 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             output_format=1,
         )
 
-        act = ixfops.moe_w4a8_group_gemv(
-            input=act,
-            weight=layer.w13_weight,
-            i_scales=a_scale,
-            w_scales=layer.w13_weight_scale,
-            output_dtype=dtype,
-            tokens_per_experts=expert_sizes_gpu,
-            w_i8scales=layer.w13_i8_weight_scale,
-            w_i8zeros=layer.w13_i8_weight_zero,
-            dst_to_src=None,
-            bias=layer.w13_bias,
-            format=self.gemm1_info.format,
-            group_size=self.group_size,
-            dense_tokens_per_experts=dense_expert_sizes_gpu,
-        )
-
-        act, a_scale = self._activation_and_quant(
+        fused = self._try_fused_w13_swiglu_quant(
             layer=layer,
-            input=act,
+            act=act,
+            a_scale=a_scale,
+            dense_expert_sizes_gpu=dense_expert_sizes_gpu,
+            aggregate_rows=expand_tokens,
             sorted_token_ids=sorted_token_ids,
-            output_format=1,
         )
+        if fused is None:
+            act = ixfops.moe_w4a8_group_gemv(
+                input=act,
+                weight=layer.w13_weight,
+                i_scales=a_scale,
+                w_scales=layer.w13_weight_scale,
+                output_dtype=dtype,
+                tokens_per_experts=expert_sizes_gpu,
+                w_i8scales=layer.w13_i8_weight_scale,
+                w_i8zeros=layer.w13_i8_weight_zero,
+                dst_to_src=None,
+                bias=layer.w13_bias,
+                format=self.gemm1_info.format,
+                group_size=self.group_size,
+                dense_tokens_per_experts=dense_expert_sizes_gpu,
+            )
+            act, a_scale = self._activation_and_quant(
+                layer=layer,
+                input=act,
+                sorted_token_ids=sorted_token_ids,
+                output_format=1,
+            )
+        else:
+            act, a_scale = fused
 
         act = ixfops.moe_w4a8_group_gemv(
             input=act,
@@ -979,6 +1052,95 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         return result
 
     # expand + quant + pad
+    def _try_fused_w13_swiglu_quant(
+        self,
+        layer: RoutedExperts,
+        act: torch.Tensor,
+        a_scale: torch.Tensor,
+        dense_expert_sizes_gpu: torch.Tensor,
+        aggregate_rows: int,
+        sorted_token_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Fail-closed compact-row W13+SwiGLU+INT8 fusion; None → split path."""
+        if not _fuse_moe_w13_enabled():
+            return None
+        if dense_expert_sizes_gpu is None:
+            _log_fuse_w13_skip("missing dense_expert_sizes")
+            return None
+        if self.version != 2 or self.group_size != -1:
+            _log_fuse_w13_skip(
+                f"version={self.version} group_size={self.group_size}"
+            )
+            return None
+        if self.gemm1_info.format_str != "TN":
+            _log_fuse_w13_skip(f"format={self.gemm1_info.format_str}")
+            return None
+        if getattr(layer, "w13_bias", None) is not None:
+            _log_fuse_w13_skip("w13_bias present")
+            return None
+        if getattr(layer, "w13_i8_weight_zero", None) is not None:
+            _log_fuse_w13_skip("w13_i8_weight_zero present")
+            return None
+        if getattr(layer, "w2_input_scale", None) is not None:
+            _log_fuse_w13_skip("w2_input_scale present")
+            return None
+        act_value = layer.activation.value
+        if act_value not in ("silu", "swiglu"):
+            _log_fuse_w13_skip(f"activation={act_value}")
+            return None
+
+        num_experts = int(layer.w13_weight.shape[0])
+        hidden_size = int(act.shape[-1])
+        intermediate_size = int(layer.w13_weight_scale.shape[-1] // 2)
+        rows = int(aggregate_rows)
+        if hidden_size != 6144:
+            _log_fuse_w13_skip(f"H={hidden_size}")
+            return None
+        if intermediate_size not in _SUPPORTED_W13_INTERMEDIATES:
+            _log_fuse_w13_skip(f"I={intermediate_size}")
+            return None
+        if num_experts not in _SUPPORTED_W13_EXPERTS:
+            _log_fuse_w13_skip(f"E={num_experts}")
+            return None
+        if rows not in _SUPPORTED_W13_ROWS:
+            _log_fuse_w13_skip(f"M={rows}")
+            return None
+        if act.shape[0] != rows or a_scale.numel() != rows:
+            _log_fuse_w13_skip(
+                f"act/scale rows mismatch act={tuple(act.shape)} "
+                f"scale={a_scale.numel()} M={rows}"
+            )
+            return None
+
+        try:
+            fused = ixfops.moe_w4a8_group_gemv_swiglu_quant
+        except AttributeError:
+            _log_fuse_w13_skip("ixformer op unavailable")
+            return None
+
+        limit = getattr(layer, "swiglu_limit", None)
+        try:
+            i8_out, scales = fused(
+                input=act,
+                weight=layer.w13_weight,
+                i_scales=a_scale,
+                w_scales=layer.w13_weight_scale,
+                dense_tokens_per_experts=dense_expert_sizes_gpu,
+                aggregate_rows=rows,
+                limit=limit,
+            )
+        except Exception as exc:  # noqa: BLE001 — fail-closed
+            _log_fuse_w13_skip(f"runtime error: {exc}")
+            return None
+
+        if i8_out.shape[-1] != self.gemm2_info.pad_k:
+            i8_out = pad_tensor(i8_out, self.gemm2_info.pad_k)
+        # Keep sorted_token_ids referenced so callers stay symmetric with
+        # the split activation path (check_valid / mask semantics).
+        del sorted_token_ids
+        _log_fuse_w13_engaged(num_experts, hidden_size, intermediate_size, rows)
+        return i8_out, scales
+
     def _expand_and_quant(
         self,
         layer,

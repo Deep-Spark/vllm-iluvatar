@@ -17,7 +17,6 @@ Remove   : when community compressed-tensors MoE supports this vendor kernel.
 import ixformer.inference.functions as ixff
 import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import MoEActivation
 
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.ilu_moe_batch_experts import (
@@ -26,14 +25,6 @@ from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compres
     _group_gemv_format,
     grouped_act_int8,
 )
-
-logger = init_logger(__name__)
-_FUSE_MOE_W13_WARNED = False
-
-
-def _moe_w13_fusion_available() -> bool:
-    """True when ixformer exposes the fused W13+SwiGLU/quant GEMV."""
-    return hasattr(ixff, "moe_w4a8_gemv_swiglu_quant")
 
 
 class IluMoEBatchedExpertsW4A8(BaseBatchExperts):
@@ -145,31 +136,6 @@ class IluMoEBatchedExpertsW4A8(BaseBatchExperts):
 
         return ixff.fused_moe_w4a8(**kwargs)
 
-    def workspace_shapes(
-        self,
-        M: int,
-        N: int,
-        K: int,
-        topk: int,
-        global_num_experts: int,
-        local_num_experts: int,
-        expert_tokens_meta: mk.ExpertTokensMetadata | None,
-        activation: MoEActivation,
-    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        # Batched layout: M == E * max_tok. Fused W13 (default for GLM W4A8
-        # GEMV) needs y1 [M, N] bf16 (N == 2*I). Split path uses zero-size
-        # workspace1 when the fused op is unavailable.
-        if _moe_w13_fusion_available():
-            workspace1 = (M, N)
-            workspace2 = (0, K)
-        else:
-            workspace1 = (0, N // 2)
-            workspace2 = (0, K)
-
-        max_num_tokens = M // local_num_experts
-        output = (local_num_experts, max_num_tokens, K)
-        return workspace1, workspace2, output
-
     def apply_group_gemv(
         self,
         output: torch.Tensor,
@@ -188,7 +154,7 @@ class IluMoEBatchedExpertsW4A8(BaseBatchExperts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None = None,
         apply_router_weight_on_input: bool = False,
     ):
-        del global_num_experts, expert_map, a2_scale, workspace2
+        del global_num_experts, expert_map, a2_scale, workspace13, workspace2
 
         assert topk_weights.size() == topk_ids.size(), "topk shape mismatch"
         assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
@@ -253,81 +219,41 @@ class IluMoEBatchedExpertsW4A8(BaseBatchExperts):
             f"got hidden_states: {hidden_states.shape}, scales: {a1q_scale.shape}"
         )
 
-        dense_tokens_per_experts = ixff.moe_make_padded_dense_tokens_per_experts(
-            expert_num_tokens_gpu,
-            max_num_tokens_per_expert,
+        (
+            input_1,
+            scale_1,
+            dense_tokens_per_experts,
+        ) = ixff.moe_group_gemv_reformat_input_fused_dense(
+            input=hidden_states,
+            input_scales=a1q_scale,
+            expert_num_tokens=expert_num_tokens_gpu,
+            max_num_tokens_per_expert=max_num_tokens_per_expert,
         )
 
         w1_bias = self.w1_bias
         w2_bias = self.w2_bias
 
-        use_fuse_w13 = (
-            w1_bias is None
-            and _moe_w13_fusion_available()
+        output_1 = ixff.moe_w4a8_group_gemv(
+            input=input_1,
+            weight=w1,
+            i_scales=scale_1,
+            w_scales=self.w1_scale,
+            w_i8scales=self.g1_alphas,
+            w_i8zeros=self.w1_zp,
+            output_dtype=self.out_dtype,
+            tokens_per_experts=expert_num_tokens_gpu,
+            dst_to_src=None,
+            bias=w1_bias,
+            format=gemv_format,
+            group_size=self.group_size,
+            dense_tokens_per_experts=dense_tokens_per_experts,
         )
-        fused_ok = False
-        if use_fuse_w13:
-            global _FUSE_MOE_W13_WARNED
-            try:
-                y1 = None
-                y1_cols = int(self.w1_scale.shape[-1])  # 2 * intermediate
-                need = num_tokens * y1_cols
-                if workspace13 is not None and workspace13.numel() >= need:
-                    y1 = workspace13.reshape(-1)[:need].view(num_tokens, y1_cols)
-                output_2, a2_scale = ixff.moe_w4a8_gemv_swiglu_quant(
-                    input=hidden_states,
-                    weight=w1,
-                    i_scales=a1q_scale,
-                    w_scales=self.w1_scale,
-                    expert_num_tokens=expert_num_tokens_gpu,
-                    max_num_tokens_per_expert=max_num_tokens_per_expert,
-                    format=gemv_format,
-                    y1_workspace=y1,
-                )
-                fused_ok = True
-            except Exception as exc:  # noqa: BLE001 — fail-closed
-                if not _FUSE_MOE_W13_WARNED:
-                    logger.warning(
-                        "IluMoE fused moe_w4a8_gemv_swiglu_quant failed (%s); "
-                        "falling back to split GEMV+SwiGLU",
-                        exc,
-                    )
-                    _FUSE_MOE_W13_WARNED = True
 
-        if not fused_ok:
-            del workspace13
-            (
-                input_1,
-                scale_1,
-                dense_tokens_per_experts,
-            ) = ixff.moe_group_gemv_reformat_input_fused_dense(
-                input=hidden_states,
-                input_scales=a1q_scale,
-                expert_num_tokens=expert_num_tokens_gpu,
-                max_num_tokens_per_expert=max_num_tokens_per_expert,
-            )
-
-            output_1 = ixff.moe_w4a8_group_gemv(
-                input=input_1,
-                weight=w1,
-                i_scales=scale_1,
-                w_scales=self.w1_scale,
-                w_i8scales=self.g1_alphas,
-                w_i8zeros=self.w1_zp,
-                output_dtype=self.out_dtype,
-                tokens_per_experts=expert_num_tokens_gpu,
-                dst_to_src=None,
-                bias=w1_bias,
-                format=gemv_format,
-                group_size=self.group_size,
-                dense_tokens_per_experts=dense_tokens_per_experts,
-            )
-
-            output_2, a2_scale = ixff.moe_group_gemv_swiglu_quant(
-                input=output_1,
-                expert_num_tokens=expert_num_tokens_gpu,
-                max_num_tokens_per_expert=max_num_tokens_per_expert,
-            )
+        output_2, a2_scale = ixff.moe_group_gemv_swiglu_quant(
+            input=output_1,
+            expert_num_tokens=expert_num_tokens_gpu,
+            max_num_tokens_per_expert=max_num_tokens_per_expert,
+        )
 
         ixff.moe_w4a8_group_gemv(
             input=output_2,

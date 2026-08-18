@@ -100,12 +100,8 @@ _DS4_COMPRESSOR_SAVE_POOL_FUSION = (
 _DS4_QK_NORM_QUANT_FUSION = (
     os.environ.get("IXFORMER_DS4_QK_NORM_QUANT_FUSION", "1") == "1"
 )
-_DS4_C4A_MERGED_WQ_B = (
-    os.environ.get("IXFORMER_DS4_C4A_MERGED_WQ_B", "0") == "1"
-)
-_DS4_SHARED_QR_QUANT = (
-    os.environ.get("IXFORMER_DS4_SHARED_QR_QUANT", "1") == "1"
-)
+_DS4_C4A_MERGED_WQ_B = os.environ.get("IXFORMER_DS4_C4A_MERGED_WQ_B", "0") == "1"
+_DS4_SHARED_QR_QUANT = os.environ.get("IXFORMER_DS4_SHARED_QR_QUANT", "1") == "1"
 
 
 def _can_fuse_qr_norm_quant(
@@ -904,9 +900,9 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         ):
             return
 
-        if (
-            outer_weight.shape != (_C4A_OUTER_Q_N, _C4A_Q_K)
-            or indexer_weight.shape != (_C4A_INDEXER_Q_N, _C4A_Q_K)
+        if outer_weight.shape != (_C4A_OUTER_Q_N, _C4A_Q_K) or indexer_weight.shape != (
+            _C4A_INDEXER_Q_N,
+            _C4A_Q_K,
         ):
             return
 
@@ -972,9 +968,7 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
            ``hidden_size`` (with TP all-reduce inside ``RowParallelLinear``).
         """
         projection_input = (
-            hidden_states
-            if fused_wqa_wkv_input is None
-            else fused_wqa_wkv_input
+            hidden_states if fused_wqa_wkv_input is None else fused_wqa_wkv_input
         )
         qr_kv, _ = self.fused_wqa_wkv(projection_input)
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
@@ -1007,7 +1001,7 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             num_tokens, self.n_local_groups, heads_per_group * self.head_dim
         )
         if hasattr(self.wo_a, "W_repacked"):
-            # v2 W8A16 marlin path (set by _IluV4W8A16BMMLinearMethod):
+            # v2 W8A16 marlin path (set by IluV4W8A16BMMLinearMethod):
             # input stays bf16; weight is INT8 in Marlin layout +
             # per-(group,N) channel scale. The 3D batched signature mirrors
             # R1's _k_up_proj_w8a8 (vllm_iluvatar/v1/attention/backends/mla/ilu_mla.py).
@@ -1087,14 +1081,12 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         qr_projection_input: torch.Tensor | DynamicInt8Input
         if _can_fuse_qr_norm_quant(self, qr, kv, attn_metadata):
-            qr, kv, qr_int8, qr_scale = (
-                ixfops.rms_norm_qk_dynamic_int8(
-                    qr,
-                    kv,
-                    self.q_norm.weight,
-                    self.kv_norm.weight,
-                    self.eps,
-                )
+            qr, kv, qr_int8, qr_scale = ixfops.rms_norm_qk_dynamic_int8(
+                qr,
+                kv,
+                self.q_norm.weight,
+                self.kv_norm.weight,
+                self.eps,
             )
             qr_projection_input = (qr_int8, qr_scale, qr.dtype)
         else:

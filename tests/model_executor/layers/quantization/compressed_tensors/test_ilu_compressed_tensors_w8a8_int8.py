@@ -119,6 +119,11 @@ def test_IluCompressedTensorsW8A8Int8(
         strategy=strategy,
         is_static_input_scheme=False,
         input_symmetric=True,
+        ilu_params={
+            "mixed_strategy": "CHANNEL",
+            "gemm_format": "TN",
+            "gemm_mode": "PERF",
+        },
     )
     scheme.create_weights(
         layer=layer,

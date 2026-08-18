@@ -21,10 +21,11 @@ _MAIN_61AC3680210_SCHEME_DISCOVERY_PREFIX_SHA = (
 
 
 class _FakeMoEMethod:
-    def __init__(self, weight_quant, input_quant, moe_config):
+    def __init__(self, weight_quant, input_quant, moe_config, ilu_params=None):
         self.weight_quant = weight_quant
         self.input_quant = input_quant
         self.moe_config = moe_config
+        self.ilu_params = ilu_params
 
 
 class _FakeUnquantizedFusedMoEMethod:
@@ -82,7 +83,7 @@ def test_mismatched_moe_projection_schemes_raise():
         )
 
 
-def test_w4a8_canonical_env_selects_ilu_w4a8_method(monkeypatch):
+def test_w8a8_config_selects_ilu_w4a8_method(monkeypatch):
     module_name = (
         "vllm_iluvatar.model_executor.layers.quantization.compressed_tensors."
         "compressed_tensors_moe.ilu_compressed_tensors_moe_w4a8_int8"
@@ -90,15 +91,15 @@ def test_w4a8_canonical_env_selects_ilu_w4a8_method(monkeypatch):
     _install_fake_method_module(
         monkeypatch, module_name, "IluCompressedTensorsW4A8Int8MoEMethod"
     )
-    monkeypatch.setattr(ilu_moe.envs, "VLLM_ILU_W8A8_MOE_USE_W4A8", True, raising=False)
-    monkeypatch.setattr(ilu_moe.envs, "VLLM_W8A8_MOE_USE_W4A8", False, raising=False)
     weight_quant = SimpleNamespace(num_bits=8)
     input_quant = SimpleNamespace(num_bits=8)
-    quant_config = _quant_config_with_schemes(
-        {"weights": weight_quant, "input_activations": input_quant},
-        {"weights": weight_quant, "input_activations": input_quant},
-        {"weights": weight_quant, "input_activations": input_quant},
-    )
+    ilu_params = {"w8a8_use_w4a8": True}
+    scheme = {
+        "weights": weight_quant,
+        "input_activations": input_quant,
+        "ilu_params": ilu_params,
+    }
+    quant_config = _quant_config_with_schemes(scheme, scheme, scheme)
     layer = SimpleNamespace(moe_config=object())
 
     method = ilu_moe.IluCompressedTensorsMoEMethod.get_moe_method(
@@ -109,39 +110,34 @@ def test_w4a8_canonical_env_selects_ilu_w4a8_method(monkeypatch):
     assert method.weight_quant is weight_quant
     assert method.input_quant is input_quant
     assert method.moe_config is layer.moe_config
+    assert method.ilu_params is ilu_params
 
 
-def test_w4a8_legacy_env_selects_ilu_w4a8_method(monkeypatch):
-    module_name = (
-        "vllm_iluvatar.model_executor.layers.quantization.compressed_tensors."
-        "compressed_tensors_moe.ilu_compressed_tensors_moe_w4a8_int8"
-    )
-    _install_fake_method_module(
-        monkeypatch, module_name, "IluCompressedTensorsW4A8Int8MoEMethod"
-    )
+def test_w8a8_config_does_not_select_ilu_w4a8_by_default(monkeypatch):
+    fallback = object()
     monkeypatch.setattr(
-        ilu_moe.envs, "VLLM_ILU_W8A8_MOE_USE_W4A8", False, raising=False
+        ilu_moe,
+        "_ORIGINAL_GET_MOE_METHOD",
+        lambda quant_config, layer, layer_name: fallback,
     )
-    monkeypatch.setattr(ilu_moe.envs, "VLLM_W8A8_MOE_USE_W4A8", True, raising=False)
     weight_quant = SimpleNamespace(num_bits=8)
     input_quant = SimpleNamespace(num_bits=8)
-    quant_config = _quant_config_with_schemes(
-        {"weights": weight_quant, "input_activations": input_quant},
-        {"weights": weight_quant, "input_activations": input_quant},
-        {"weights": weight_quant, "input_activations": input_quant},
-    )
+    scheme = {
+        "weights": weight_quant,
+        "input_activations": input_quant,
+        "ilu_params": {},
+    }
+    quant_config = _quant_config_with_schemes(scheme, scheme, scheme)
     layer = SimpleNamespace(moe_config=object())
 
     method = ilu_moe.IluCompressedTensorsMoEMethod.get_moe_method(
         quant_config, layer, "model.layers.0.mlp.experts"
     )
 
-    assert isinstance(method, _FakeMoEMethod)
-    assert method.weight_quant is weight_quant
-    assert method.input_quant is input_quant
+    assert method is fallback
 
 
-def test_wna16_env_selects_ilu_w4a8_method(monkeypatch):
+def test_wna16_config_selects_ilu_w4a8_method(monkeypatch):
     module_name = (
         "vllm_iluvatar.model_executor.layers.quantization.compressed_tensors."
         "compressed_tensors_moe.ilu_compressed_tensors_moe_w4a8_int8"
@@ -149,20 +145,18 @@ def test_wna16_env_selects_ilu_w4a8_method(monkeypatch):
     _install_fake_method_module(
         monkeypatch, module_name, "IluCompressedTensorsW4A8Int8MoEMethod"
     )
-    monkeypatch.setattr(
-        ilu_moe.envs, "VLLM_ILU_W8A8_MOE_USE_W4A8", False, raising=False
-    )
-    monkeypatch.setattr(ilu_moe.envs, "VLLM_W8A8_MOE_USE_W4A8", False, raising=False)
-    monkeypatch.setattr(
-        ilu_moe.envs, "VLLM_ILU_WNA16_MOE_USE_W4A8", True, raising=False
-    )
-    monkeypatch.setattr(ilu_moe.envs, "VLLM_WNA16_MOE_USE_W4A8", False, raising=False)
     weight_quant = SimpleNamespace(num_bits=4, group_size=None)
     input_quant = SimpleNamespace(num_bits=16)
+    ilu_params = {
+        "wna16_use_w4a8": True,
+        "gemm_format": "TN",
+        "pack_version": 2,
+    }
     scheme = {
         "weights": weight_quant,
         "input_activations": input_quant,
         "format": ilu_moe.CompressionFormat.pack_quantized.value,
+        "ilu_params": ilu_params,
     }
     quant_config = _quant_config_with_schemes(scheme, scheme, scheme)
     quant_config._is_wNa16_group_channel.return_value = True
@@ -175,23 +169,17 @@ def test_wna16_env_selects_ilu_w4a8_method(monkeypatch):
     assert isinstance(method, _FakeMoEMethod)
     assert method.weight_quant is weight_quant
     assert method.input_quant is input_quant
+    assert method.ilu_params is ilu_params
 
 
-def test_wna16_env_rejects_unsupported_format(monkeypatch):
-    monkeypatch.setattr(
-        ilu_moe.envs, "VLLM_ILU_W8A8_MOE_USE_W4A8", False, raising=False
-    )
-    monkeypatch.setattr(ilu_moe.envs, "VLLM_W8A8_MOE_USE_W4A8", False, raising=False)
-    monkeypatch.setattr(
-        ilu_moe.envs, "VLLM_ILU_WNA16_MOE_USE_W4A8", True, raising=False
-    )
-    monkeypatch.setattr(ilu_moe.envs, "VLLM_WNA16_MOE_USE_W4A8", False, raising=False)
+def test_wna16_config_rejects_unsupported_format():
     weight_quant = SimpleNamespace(num_bits=4, group_size=None)
     input_quant = SimpleNamespace(num_bits=16)
     scheme = {
         "weights": weight_quant,
         "input_activations": input_quant,
         "format": "unsupported",
+        "ilu_params": {"wna16_use_w4a8": True},
     }
     quant_config = _quant_config_with_schemes(scheme, scheme, scheme)
     quant_config._is_wNa16_group_channel.return_value = True
@@ -211,17 +199,15 @@ def test_dynamic_token_w8a8_selects_ilu_w8a8_method(monkeypatch):
     _install_fake_method_module(
         monkeypatch, module_name, "IluCompressedTensorsW8A8Int8MoEMethod"
     )
-    monkeypatch.setattr(
-        ilu_moe.envs, "VLLM_ILU_W8A8_MOE_USE_W4A8", False, raising=False
-    )
-    monkeypatch.setattr(ilu_moe.envs, "VLLM_W8A8_MOE_USE_W4A8", False, raising=False)
     weight_quant = SimpleNamespace(num_bits=8)
     input_quant = SimpleNamespace(num_bits=8)
-    quant_config = _quant_config_with_schemes(
-        {"weights": weight_quant, "input_activations": input_quant},
-        {"weights": weight_quant, "input_activations": input_quant},
-        {"weights": weight_quant, "input_activations": input_quant},
-    )
+    ilu_params = {"gemm_format": "TN"}
+    scheme = {
+        "weights": weight_quant,
+        "input_activations": input_quant,
+        "ilu_params": ilu_params,
+    }
+    quant_config = _quant_config_with_schemes(scheme, scheme, scheme)
     quant_config._is_dynamic_token_w8a8.return_value = True
     layer = SimpleNamespace(moe_config=object())
 
@@ -232,3 +218,4 @@ def test_dynamic_token_w8a8_selects_ilu_w8a8_method(monkeypatch):
     assert isinstance(method, _FakeMoEMethod)
     assert method.weight_quant is weight_quant
     assert method.input_quant is input_quant
+    assert method.ilu_params is ilu_params

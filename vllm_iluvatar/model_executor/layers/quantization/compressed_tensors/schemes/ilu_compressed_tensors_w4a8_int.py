@@ -5,11 +5,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
 
 import ixformer.inference.functions as ixf_ops
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
-
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_scheme import (  # noqa: E501
@@ -21,6 +21,7 @@ from vllm.model_executor.parameter import (
     PerTensorScaleParameter,
 )
 from vllm.scalar_type import scalar_types
+
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_utils import (  # noqa: E501
     W4A8GemmInfo,
     pad_tensor,
@@ -37,6 +38,7 @@ W4A8_SUPPORTED_TYPES_MAP = {
 }
 W4A8_SUPPORTED_BITS = list(W4A8_SUPPORTED_TYPES_MAP.keys())
 
+
 class IluCompressedTensorsW4A8Int(CompressedTensorsScheme):
     def __init__(
         self,
@@ -45,13 +47,14 @@ class IluCompressedTensorsW4A8Int(CompressedTensorsScheme):
         group_size: int | None = None,
         is_static_input_scheme: bool = False,
         input_symmetric: bool = True,
+        ilu_params: dict[str, Any] | None = None,
     ):
+        ilu_params = ilu_params or {}
         if strategy != QuantizationStrategy.CHANNEL:
             raise ValueError(
-                "IluCompressedTensorsW4A8Int only supports channel-wise "
-                "quantization"
+                "IluCompressedTensorsW4A8Int only supports channel-wise quantization"
             )
-        if group_size != -1:
+        if group_size not in (None, -1):
             raise ValueError("IluCompressedTensorsW4A8Int only supports group_size=-1")
         self.strategy = strategy
         self.group_size = -1 if group_size is None else group_size
@@ -68,11 +71,21 @@ class IluCompressedTensorsW4A8Int(CompressedTensorsScheme):
             "weight",
             "weight_scale",
         ]
-        self.format = "NN"
+        # ``format`` is reserved by Compressed-Tensors for the serialization
+        # format (for example ``pack-quantized``).  Use a distinct extension
+        # key for the Iluvatar GEMM layout.
+        self.format = ilu_params.get("gemm_format", "")
+        assert self.format == "NN", f"Invalid format:{self.format}"
 
     def _get_layer_params(
         self, layer: torch.nn.Module
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
         w_q, w_s = self.layer_param_names
         return (
             getattr(layer, w_q),
@@ -99,9 +112,8 @@ class IluCompressedTensorsW4A8Int(CompressedTensorsScheme):
             k=input_size_per_partition,
             n=sum(output_partition_sizes),
         )
-        weight = ModelWeightParameter(data=torch.empty(
-            self.gemm_info.get_weight_shape(),
-            dtype=torch.int8),
+        weight = ModelWeightParameter(
+            data=torch.empty(self.gemm_info.get_weight_shape(), dtype=torch.int8),
             input_dim=0,
             output_dim=1,
             weight_loader=weight_loader,
@@ -146,7 +158,7 @@ class IluCompressedTensorsW4A8Int(CompressedTensorsScheme):
                 pad_value=0,
                 log_prefix="[IluCompressedTensorsW4A8Int process_weights_after_loading bias]",
             )
-        
+
         # WEIGHT SCALE
         if self.strategy == QuantizationStrategy.CHANNEL:
             weight_scale = getattr(layer, w_s_name)
@@ -163,7 +175,6 @@ class IluCompressedTensorsW4A8Int(CompressedTensorsScheme):
     def apply_weights(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None
     ) -> torch.Tensor:
-
         w_q, w_s = self._get_layer_params(layer)
         i_s, i_zp, azp_adj = None, None, None
         symmetric = azp_adj is None
@@ -177,25 +188,33 @@ class IluCompressedTensorsW4A8Int(CompressedTensorsScheme):
             x_q, x_s, x_zp = ops.scaled_int8_quant(
                 x.contiguous(), i_s, i_zp, symmetric=symmetric
             )
-        assert x_zp is None, "IluCompressedTensorsW4A8Int does not support asymmetric quantization for input"
+        assert x_zp is None, (
+            "IluCompressedTensorsW4A8Int does not support asymmetric quantization for input"
+        )
 
         # pad tensor
         if x_q.shape[-1] != self.gemm_info.pad_k:
             x_q = pad_tensor(x_q, self.gemm_info.pad_k)
 
         # w4a8 call
-        out = torch.empty((x_q.shape[0], self.gemm_info.get_pad_n()), dtype=out_dtype, device=x_q.device)
-        ixf_ops.w4a8(input=x_q, 
-                     weight=w_q, 
-                     i_scales=x_s, 
-                     w_scales=w_s, 
-                     w_i8scales=None,
-                     w_i8zeros=None,
-                     bias=bias,
-                     output=out, 
-                     format=self.gemm_info.format_str,
-                     group_size=self.group_size,
-                     output_dtype=out_dtype)
+        out = torch.empty(
+            (x_q.shape[0], self.gemm_info.get_pad_n()),
+            dtype=out_dtype,
+            device=x_q.device,
+        )
+        ixf_ops.w4a8(
+            input=x_q,
+            weight=w_q,
+            i_scales=x_s,
+            w_scales=w_s,
+            w_i8scales=None,
+            w_i8zeros=None,
+            bias=bias,
+            output=out,
+            format=self.gemm_info.format_str,
+            group_size=self.group_size,
+            output_dtype=out_dtype,
+        )
 
         # unpad tensor
         out = unpad_tensor(out, self.gemm_info.get_n(), contiguous=True)

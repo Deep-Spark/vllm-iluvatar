@@ -139,6 +139,7 @@ def test_IluCompressedTensorsW4A8Int(
         group_size=-1,
         is_static_input_scheme=False,
         input_symmetric=True,
+        ilu_params={"gemm_format": "NN"},
     )
     scheme.create_weights(
         layer=layer,

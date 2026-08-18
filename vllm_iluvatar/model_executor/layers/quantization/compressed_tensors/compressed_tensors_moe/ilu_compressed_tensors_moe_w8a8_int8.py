@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import Any
 
 import ixformer.inference.functions as ixfops  # type: ignore
 import torch
-import vllm.envs as envs
 from compressed_tensors.quantization import (
     QuantizationArgs,
     QuantizationStrategy,
@@ -140,8 +140,10 @@ class IluCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
         input_quant: QuantizationArgs,
         moe: FusedMoEConfig,
         layer_name: str | None = None,
+        ilu_params: dict[str, Any] | None = None,
     ):
         super().__init__(moe)
+        ilu_params = ilu_params or {}
         self.has_bias = self.moe.has_bias
         self.weight_quant = weight_quant
         self.input_quant = input_quant
@@ -149,7 +151,7 @@ class IluCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
         self.group_size = (
             -1 if self.weight_quant.group_size is None else self.weight_quant.group_size
         )
-        self.gemm_format = envs.VLLM_W8A8_FORMAT
+        self.gemm_format = ilu_params.get("gemm_format", "")
         assert self.gemm_format in ["TN", "NN"], (
             f"W8A8 INT8 MoE only supports TN or NN format, but got {self.gemm_format}"
         )

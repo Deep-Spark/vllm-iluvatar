@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "name": "step3p7_flash",
+  "load_device": "requested",
+  "default_action": "keep",
+  "rules": [
+    {
+      "id": "dense_bf16_to_fp8_per_channel",
+      "priority": 900,
+      "match": {
+        "regex": [
+          "^model\\.layers\\.\\d+\\.self_attn\\.(q_proj|k_proj|v_proj|g_proj|o_proj)\\.weight$",
+          "^model\\.layers\\.\\d+\\.share_expert\\.(gate_proj|up_proj|down_proj)\\.weight$",
+          "^model\\.layers\\.[0-2]\\.mlp\\.(gate_proj|up_proj|down_proj)\\.weight$"
+        ],
+        "dtypes": [
+          "bfloat16"
+        ],
+        "ndims": [
+          2
+        ]
+      },
+      "action": "convert",
+      "dequant": {
+        "method": "identity"
+      },
+      "quant": {
+        "method": "fp8_per_channel",
+        "options": {
+          "dtype": "float8_e4m3fn",
+          "gemm_format": "TN",
+          "transport": false
+        }
+      },
+      "outputs": {
+        "weight_scale": ".weight_scale"
+      }
+    },
+    {
+      "id": "keep_router_gate",
+      "priority": 800,
+      "match": {
+        "regex": [
+          "^model\\.layers\\.\\d+\\.moe\\.(gate\\.weight|router_bias)$"
+        ]
+      },
+      "action": "keep"
+    },
+    {
+      "id": "keep_unquantized",
+      "priority": 0,
+      "match": {
+        "regex": [
+          ".*"
+        ]
+      },
+      "action": "keep"
+    }
+  ]
+}

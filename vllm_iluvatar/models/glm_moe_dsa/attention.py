@@ -21,8 +21,8 @@ Three layers, mirroring V4:
   k-up + KV insert + sparse MLA + v-up. Default KV is bf16 latent (576) via
   ``concat_and_cache_mla`` + ``dsa_flash_mla_sparse_fwd``. With
   ``--kv-cache-dtype fp8`` it uses the GLM DSA 640-byte packed path
-  (``glm_dsa_fp8_kv_insert`` + ``dsa_flash_mla_with_fp8_kvcache`` /
-  ``sparse_flash_attn_fp8``). The absorbed up-proj is grouped W8A16 marlin:
+  (``glm_dsa_fp8_kv_insert`` + ``dsa_flash_mla_with_fp8_kvcache``). The
+  absorbed up-proj is grouped W8A16 marlin:
   k-up / v-up read ``kv_b_proj.W_UK`` / ``W_UV`` (repacked at load time by
   ``_IluGlmKVBProjW8A16Method``) and call ``ixf_ops.marlin_w8a16``. Slimmed
   fork of ``IluFlashMLASparseImpl`` (GLM/V3.2 only: no compress_ratio / SWA /
@@ -334,9 +334,9 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
       * default / ``bfloat16`` — 576-wide bf16 latent via
         ``concat_and_cache_mla`` + ``dsa_flash_mla_sparse_fwd``.
       * ``fp8`` / ``fp8_e4m3`` / ``fp8_glm_dsa`` — 640-byte packed rows
-        (512 e4m3 NoPE + 64 bf16 RoPE) via ``glm_dsa_fp8_kv_insert`` and
-        either ``dsa_flash_mla_with_fp8_kvcache`` (local q_heads <= 32) or
-        ``sparse_flash_attn_fp8`` (64-head tile). Not DeepSeek-V4
+        (512 e4m3 NoPE + 64 bf16 RoPE) via ``glm_dsa_fp8_kv_insert`` +
+        ``dsa_flash_mla_with_fp8_kvcache``; ixinfer picks DSV4 vs FMHA from the
+        local ``q_heads`` (16-aligned for <= 32, else 64). Not DeepSeek-V4
         ``fp8_ds_mla`` (584B).
 
     ``kv_b_proj`` is grouped W8A16 marlin: :class:`IluGlmKVBProjW8A16Method `
@@ -399,13 +399,7 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         self.use_fp8_attn = kv_cache_dtype in ("fp8", "fp8_e4m3", "fp8_glm_dsa")
         init_scale = 1.0
         self._fp8_kv_scale_frozen = False
-        # q_heads > 32: fmha (fixed 64-head tile). Else dsv4 (h_q % 16 == 0).
-        self._fp8_use_dsv4 = self.use_fp8_attn and self.num_heads <= 32
-        self._fp8_q_heads = (
-            max(16, (self.num_heads + 15) // 16 * 16)
-            if self._fp8_use_dsv4
-            else _GLM_DSA_FP8_Q_HEADS
-        )
+        self._fp8_q_heads = self.num_heads
         if self.use_fp8_attn:
             kv_cache_dtype = "fp8"
             if self.num_heads > _GLM_DSA_FP8_Q_HEADS:
@@ -413,6 +407,12 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
                     "FP8 sparse MLA requires <= "
                     f"{_GLM_DSA_FP8_Q_HEADS} local Q heads; got {self.num_heads}"
                 )
+            # ixinfer: <=32 DSV4 (h_q % 16 == 0); >32 FMHA (pad to 64).
+            self._fp8_q_heads = (
+                _GLM_DSA_FP8_Q_HEADS
+                if self.num_heads > 32
+                else max(16, (self.num_heads + 15) // 16 * 16)
+            )
             resolved, source = _resolve_glm_dsa_fp8_kv_scale(prefix)
             if resolved is not None:
                 init_scale = resolved
@@ -440,9 +440,9 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
                 "layers.0.self_attn.attn"
             ):
                 logger.info(
-                    "GLM DSA fp8 attn = %s (local q_heads=%d)",
-                    "dsv4" if self._fp8_use_dsv4 else "fmha",
+                    "GLM DSA fp8 attn: local q_heads=%d -> padded q_heads=%d",
                     self.num_heads,
+                    self._fp8_q_heads,
                 )
         self.kv_cache_dtype = kv_cache_dtype
 
@@ -596,6 +596,8 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
             -1, 1, kv_c_and_k_pe_cache.shape[-1]
         )
+        # Sparse MLA returns latent V (kv_lora_rank=512); v_up_proj maps to
+        # v_head_dim afterwards. Do not pass self.v_head_dim (256 on GLM-5.2).
         return ixf_ops.dsa_flash_mla_sparse_fwd(
             q,
             kv_c_and_k_pe_cache,
@@ -612,37 +614,31 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         kv_cache: torch.Tensor,
         attn_metadata: IluFlashMLASparseMetadata,
     ) -> torch.Tensor:
-        """Packed 640B sparse MLA. ``q_heads > 32``: fmha; else dsv4."""
+        """Packed 640B sparse MLA via ``dsa_flash_mla_with_fp8_kvcache``."""
         num_tokens = q_nope.shape[0]
         q_heads = self._fp8_q_heads
         topk_indices, topk_length = self._global_topk(num_tokens, attn_metadata)
+
         q_packed = q_nope.new_empty(
-            (num_tokens, q_heads, _GLM_DSA_FP8_ROW_BYTES), dtype=torch.uint8
+            (num_tokens, q_heads, _GLM_DSA_FP8_ROW_BYTES),
+            dtype=torch.uint8,
         )
         q_scale = torch.empty(
-            (num_tokens, q_heads), dtype=torch.float32, device=q_nope.device
+            (num_tokens, q_heads),
+            dtype=torch.float32,
+            device=q_nope.device,
         )
         ixf_ops.glm_dsa_fp8_q_pack(q_nope, q_pe, q_packed, q_scale)
-        if self._fp8_use_dsv4:
-            out = ixf_ops.dsa_flash_mla_with_fp8_kvcache(
-                q_packed.view(num_tokens, 1, q_heads, _GLM_DSA_FP8_ROW_BYTES),
-                kv_cache.unsqueeze(2),
-                topk_indices,
-                topk_length,
-                q_scale,
-                self._k_scale,
-                self.softmax_scale,
-            ).squeeze(1)
-        else:
-            out = ixf_ops.sparse_flash_attn_fp8(
-                q_packed,
-                kv_cache.view(-1, 1, kv_cache.shape[-1]),
-                topk_indices,
-                q_scale,
-                self._k_scale,
-                self.softmax_scale,
-                topk_length=topk_length,
-            )
+
+        out = ixf_ops.dsa_flash_mla_with_fp8_kvcache(
+            q_packed.view(num_tokens, 1, q_heads, _GLM_DSA_FP8_ROW_BYTES),
+            kv_cache.unsqueeze(2),
+            topk_indices,
+            topk_length,
+            q_scale,
+            self._k_scale,
+            self.softmax_scale,
+        ).squeeze(1)
         if self.num_heads == q_heads:
             return out
         return out[:, : self.num_heads, :].contiguous()

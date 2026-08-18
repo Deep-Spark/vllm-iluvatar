@@ -128,11 +128,10 @@ def _sparse_mla_stub(*, num_heads: int, use_fp8: bool, prefix: str):
     mla.head_size = 576
     mla.use_fp8_attn = use_fp8
     mla.kv_cache_dtype = "fp8" if use_fp8 else "bfloat16"
-    mla._fp8_use_dsv4 = use_fp8 and num_heads <= 32
     mla._fp8_q_heads = (
-        max(16, (num_heads + 15) // 16 * 16)
-        if mla._fp8_use_dsv4
-        else attn_mod._GLM_DSA_FP8_Q_HEADS
+        attn_mod._GLM_DSA_FP8_Q_HEADS
+        if num_heads > 32
+        else max(16, (num_heads + 15) // 16 * 16)
     )
     mla.prefix = prefix
     return mla
@@ -176,21 +175,20 @@ def test_bf16_kv_cache_spec_keeps_576_latent(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("num_heads", "expect_dsv4", "expect_q_heads"),
+    ("num_heads", "expect_q_heads"),
     [
-        (8, True, 16),  # TP8 local heads
-        (32, True, 32),
-        (64, False, 64),  # fmha 64-head tile
+        (8, 16),  # TP8 local heads, 16-aligned for DSV4
+        (32, 32),
+        (64, 64),  # fmha 64-head tile
     ],
 )
-def test_fp8_dispatch_dsv4_vs_fmha(num_heads, expect_dsv4, expect_q_heads):
+def test_fp8_q_heads_padding(num_heads, expect_q_heads):
     mla = _sparse_mla_stub(
         num_heads=num_heads,
         use_fp8=True,
         prefix="model.layers.0.self_attn.attn",
     )
 
-    assert mla._fp8_use_dsv4 is expect_dsv4
     assert mla._fp8_q_heads == expect_q_heads
 
 

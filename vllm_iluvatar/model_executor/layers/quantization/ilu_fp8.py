@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Iluvatar block-FP8 MoE quantization method (routed experts).
+"""Iluvatar FP8 linear and block-FP8 MoE quantization methods.
 
 Corresponds to: vllm/model_executor/layers/quantization/fp8.py
 
 Target   : vllm.model_executor.layers.quantization.fp8.Fp8Config
-           (registered under the name ``fp8``) and its block-wise
-           ``Fp8MoEMethod`` routed-expert branch.
+           (registered under the name ``fp8``), its serialized linear branch,
+           and its block-wise ``Fp8MoEMethod`` routed-expert branch.
 Baseline : main_9c12a81ac
 Why      : the block-FP8 checkpoint (``quant_method="fp8"`` +
            ``weight_block_size=[128,128]`` + ``activation_scheme="dynamic"``)
@@ -15,15 +15,15 @@ Why      : the block-FP8 checkpoint (``quant_method="fp8"`` +
            raises or lands on a backend that crashes at runtime (same failure
            class as NVFP4 landing on MARLIN).
 How      : ``@register_quantization_config("fp8")`` on a subclass whose
-           ``get_quant_method`` overrides *only* the block-wise routed-expert
-           branch to return ``IluFp8MoEMethod``; that method skips the community
-           backend selection, dequantises the block-FP8 weights and re-quantises
-           them into the ixmm ix30 layout at load time, then routes ``apply`` to
-           ``ilu_mxfp4_fused_experts()``. Everything else (linear layers,
-           attention, KV cache, per-tensor FP8, skipped layers) delegates to
-           ``super()``.
-Scope    : block-wise FP8 routed experts on Iluvatar (ivcore30 + ixmm); selected
-           by ``IluFp8Config.get_quant_method``.
+           ``get_quant_method`` returns ``IluFp8LinearMethod`` for serialized
+           linear layers, ``IluFp8PerChannelOnlineLinearMethod`` for online
+           linear layers, and ``IluFp8MoEMethod`` for block-wise routed experts.
+           Linear weights dispatch directly to FP8 GEMM/GEMV. The MoE method
+           converts weights to the ix30 FP4 layout and calls
+           ``ilu_mxfp4_fused_experts()``. Attention, KV cache and skipped layers
+           delegate to ``super()``.
+Scope    : online and serialized FP8 linear layers plus block-wise FP8 routed
+           experts on Iluvatar (ivcore30).
 Remove   : when community exposes a vendor FP8 MoE backend hook, or a native
            grouped block-FP8 GEMM lands (plan phase 2, removing the fp8 -> fp4
            requant loss).
@@ -48,13 +48,19 @@ implementation" case, mirroring ``IluModelOptNvFp4Config`` covering
 ``modelopt_fp4`` and ``IluDeepseekV4FP8Config`` covering ``deepseek_v4_fp8``.
 ``register_quantization_config`` permits shadowing a built-in name;
 ``get_quantization_config`` resolves the customized map last, so our class wins.
-Since the shadow covers *all* ``fp8`` models, ``get_quant_method`` narrows to the
-block-wise routed-expert branch and delegates everything else to ``super()``.
+Since the shadow covers *all* ``fp8`` models, ``get_quant_method`` explicitly
+narrows the overrides to serialized linear and block-wise routed-expert branches.
 """
 
 from __future__ import annotations
 
+import copy
+from typing import Any
+
+import ixformer.inference.functions as ixfops
 import torch
+from ixformer.inference.functions.fp8 import fp8_per_token_dynamic_scaled
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
     FusedMoEQuantConfig,
@@ -64,15 +70,31 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEPrepareAndFinalizeModular,
 )
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.quantization import register_quantization_config
-from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+from vllm.model_executor.layers.quantization.fp8 import (
+    Fp8Config,
+    Fp8LinearMethod,
+    Fp8MoEMethod,
+)
+from vllm.model_executor.layers.quantization.online.fp8 import _Fp8OnlineLinearBase
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    create_fp8_scale_parameter,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+from vllm.model_executor.parameter import (
+    ChannelQuantScaleParameter,
+)
 from vllm.model_executor.utils import replace_parameter
 
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
     _ixmm_backend_available,
     ilu_mxfp4_fused_experts,
 )
+from vllm_iluvatar.model_executor.layers.quantization import IluvatarQuantRegistry
 from vllm_iluvatar.model_executor.layers.quantization.ilu_modelopt_nvfp4 import (
     _SWIGLUSTEP_CLAMP,
     _get_ilu_output_scale,
@@ -84,6 +106,225 @@ from vllm_iluvatar.model_executor.layers.quantization.ilu_modelopt_nvfp4 import 
 _IXMM_EXPERT_CHUNK = 4
 _IXMM_GROUP_SIZE = 256
 _FP4_MAX_MAG = 6.0
+_IXMM_FP8_GEMV_MAX_M = 16
+
+logger = init_logger(__name__)
+
+
+@IluvatarQuantRegistry.register_method
+class IluFp8PerChannelOnlineLinearMethod(_Fp8OnlineLinearBase):
+    """Load floating-point weights and quantize them for ixmm after loading.
+
+    The public name follows vLLM's online per-channel method. ixmm's FP8 linear
+    epilogue consumes one weight scale per output channel, so the materialized
+    ``[N, K]`` weight is quantized row-wise.
+    """
+
+    uses_meta_device: bool = True
+
+    def __init__(self, quant_config: IluFp8Config) -> None:
+        super().__init__()
+        self.quant_config = quant_config
+        self.gemm_format = quant_config.gemm_format.upper()
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        super().create_weights(
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        scale = create_fp8_scale_parameter(
+            ChannelQuantScaleParameter,
+            output_partition_sizes,
+            input_size_per_partition,
+            None,
+            weight_loader,
+        )
+        layer.register_parameter("weight_scale", scale)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+
+        layer.input_scale = None
+        qweight, weight_scale = fp8_per_token_dynamic_scaled(layer.weight)
+        layer._can_use_gemm = (
+            qweight.shape[0] % 32 == 0
+            if self.gemm_format == "TN"
+            else qweight.shape[1] % 64 == 0
+        )
+
+        replace_parameter(layer, "weight", qweight)
+        replace_parameter(layer, "weight_scale", weight_scale)
+        layer._already_called_process_weights_after_loading = True
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x_2d = x.reshape(-1, x.shape[-1])
+        qx, scale_x = fp8_per_token_dynamic_scaled(x_2d)
+
+        output = torch.empty(
+            (x_2d.shape[0], layer.output_size_per_partition),
+            dtype=torch.bfloat16,
+            device=x.device,
+        )
+        bias = None if bias is None else bias.to(torch.bfloat16)
+
+        scale_w = layer.weight_scale
+        m = qx.shape[0]
+        can_use_gemm = getattr(layer, "_can_use_gemm", False)
+
+        if can_use_gemm and m <= _IXMM_FP8_GEMV_MAX_M:
+            ixfops.fp8_per_channel_gemv(
+                qx,
+                layer.weight,
+                scale_x,
+                scale_w,
+                output,
+                bias,
+                format=self.gemm_format,
+                backend="ixmm",
+            )
+        else:
+            ixfops.fp8_per_channel_mm(
+                qx, layer.weight, scale_x, scale_w, output, bias, backend="ixmm"
+            )
+
+        result = output.to(x.dtype) if x.dtype != torch.bfloat16 else output
+        return result.view(*x.shape[:-1], layer.output_size_per_partition)
+
+
+@IluvatarQuantRegistry.register_method
+class IluFp8LinearMethod(Fp8LinearMethod):
+    """Serialized FP8 linear method backed directly by GEMM/GEMV.
+
+    Checkpoint weights remain in their native TN layout, ``[N, K]``. Block
+    quantization dispatches to DeepGEMM; non-block checkpoints are exposed
+    to per-channel epilogue.
+    """
+
+    def __init__(self, quant_config: IluFp8Config) -> None:
+        super().__init__(quant_config)
+        self.gemm_format = quant_config.gemm_format.upper()
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        super().create_weights(
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        scale = create_fp8_scale_parameter(
+            ChannelQuantScaleParameter,
+            output_partition_sizes,
+            input_size_per_partition,
+            None,
+            weight_loader,
+        )
+        replace_parameter(layer, "weight_scale", None)
+        layer.register_parameter("weight_scale", scale)
+        weight = layer.weight
+        layer._can_use_gemm = (
+            weight.shape[0] % 32 == 0
+            if self.gemm_format == "TN"
+            else weight.shape[1] % 64 == 0
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Keep weights unchanged and materialize per-channel scales."""
+
+        scale = layer.weight_scale.to(torch.float32).reshape(-1)
+        n = layer.output_size_per_partition
+        if scale.numel() == n:
+            channel_scale = scale.contiguous()
+        elif scale.numel() == 1:
+            channel_scale = scale.expand(n).contiguous()
+        elif scale.numel() == len(layer.logical_widths):
+            channel_scale = torch.repeat_interleave(
+                scale,
+                torch.tensor(
+                    layer.logical_widths,
+                    dtype=torch.int64,
+                    device=scale.device,
+                ),
+            ).contiguous()
+        else:
+            raise ValueError(
+                f"Cannot map weight_scale shape {tuple(layer.weight_scale.shape)} "
+                f"to {n} output channels"
+            )
+
+        replace_parameter(layer, "weight_scale", channel_scale)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x_2d = x.reshape(-1, x.shape[-1])
+        qx, scale_x = fp8_per_token_dynamic_scaled(x_2d)
+
+        output = torch.empty(
+            (x_2d.shape[0], layer.output_size_per_partition),
+            dtype=torch.bfloat16,
+            device=x.device,
+        )
+        bias = None if bias is None else bias.to(torch.bfloat16)
+
+        scale_w = layer.weight_scale
+        m = qx.shape[0]
+        can_use_gemm = getattr(layer, "_can_use_gemm", False)
+
+        if can_use_gemm and m <= _IXMM_FP8_GEMV_MAX_M:
+            ixfops.fp8_per_channel_gemv(
+                qx,
+                layer.weight,
+                scale_x,
+                scale_w,
+                output,
+                bias,
+                format=self.gemm_format,
+                backend="ixmm",
+            )
+        else:
+            ixfops.fp8_per_channel_mm(
+                qx, layer.weight, scale_x, scale_w, output, bias, backend="ixmm"
+            )
+
+        result = output.to(x.dtype) if x.dtype != torch.bfloat16 else output
+        return result.view(*x.shape[:-1], layer.output_size_per_partition)
 
 
 def preprocess_fp8_block_weight_for_ixmm(
@@ -160,6 +401,7 @@ def preprocess_fp8_block_weight_for_ixmm(
     return ixmm_weight, ixmm_scale
 
 
+@IluvatarQuantRegistry.register_method
 class IluFp8MoEMethod(Fp8MoEMethod):
     """Block-FP8 routed-expert method backed by ``ilu_mxfp4_fused_experts()``."""
 
@@ -172,7 +414,21 @@ class IluFp8MoEMethod(Fp8MoEMethod):
     # ``FusedMoEMethodBase.is_monolithic`` never dereferences it; the explicit
     # ``is_monolithic`` override below makes the answer independent of that
     # subtlety regardless. See ``ilu_modelopt_nvfp4.py``.
-    def __init__(self, quant_config: Fp8Config, layer: RoutedExperts) -> None:
+    def __init__(
+        self,
+        quant_config: Fp8Config | Any,
+        layer: RoutedExperts,
+        ilu_params: dict[str, Any] | None = None,
+    ) -> None:
+        if not isinstance(quant_config, Fp8Config):
+            ilu_params = ilu_params or {}
+            weight_block_size = ilu_params.get("weight_block_size", [128, 128])
+            quant_config = Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                activation_scheme="dynamic",
+                weight_block_size=weight_block_size,
+            )
+
         # Skip Fp8MoEMethod.__init__, run its base directly.
         FusedMoEMethodBase.__init__(self, layer.moe_config)
         self.quant_config = quant_config
@@ -347,30 +603,117 @@ class IluFp8MoEMethod(Fp8MoEMethod):
 
 @register_quantization_config("fp8")
 class IluFp8Config(Fp8Config):
-    """FP8 config whose block-wise routed experts land on Iluvatar kernels.
+    """FP8 config whose routed experts and linear layers use Iluvatar kernels.
 
-    Inherits ``__init__`` / ``from_config`` / ``get_name`` /
-    ``get_cache_scale_mapper`` unchanged, so checkpoint detection and every
-    linear / attention / KV branch stay community behaviour.
+    ``weight_block_size`` describes routed experts. The optional
+    ``none_moe_weight_block_size`` independently selects block scaling for
+    ordinary Linear layers; ``null`` selects per-channel scaling.
     """
 
-    # [ILU override] Fp8Config.get_quant_method — delta: block-wise routed
-    # experts (not skipped, not the mxfp4 store path) return IluFp8MoEMethod
-    # instead of community Fp8MoEMethod. Everything else -- linear layers,
-    # attention, per-tensor FP8 MoE, skipped layers -- is left to super() so
-    # non-block FP8 models are untouched (plan §7 R1).
+    def __init__(
+        self,
+        is_checkpoint_fp8_serialized: bool = False,
+        activation_scheme: str = "dynamic",
+        ignored_layers: list[str] | None = None,
+        weight_block_size: list[int] | None = None,
+        store_dtype: str | None = None,
+        gemm_format: str = "TN",
+        none_moe_use_weight_block_size: bool = False,
+        none_moe_is_checkpoint_fp8_serialized: bool = False,
+    ) -> None:
+        super().__init__(
+            is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
+            activation_scheme=activation_scheme,
+            ignored_layers=ignored_layers,
+            weight_block_size=weight_block_size,
+            store_dtype=store_dtype,
+        )
+        self.gemm_format = gemm_format
+        self.none_moe_use_weight_block_size = none_moe_use_weight_block_size
+        self.none_moe_is_checkpoint_fp8_serialized = (
+            none_moe_is_checkpoint_fp8_serialized
+        )
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> IluFp8Config:
+        quant_method = cls.get_from_keys(config, ["quant_method"])
+        is_checkpoint_fp8_serialized = "fp8" in quant_method
+        activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
+        ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
+        weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
+        store_dtype = cls.get_from_keys_or(config, ["store_dtype"], None)
+        gemm_format = cls.get_from_keys_or(config, ["gemm_format"], "TN")
+        gemm_format = gemm_format.upper()
+        # for models that not the all weights are fp8, those layer's name are passed with ignored_layers
+        # if we want to use fp8 for whose layers, we can do:
+        #    1. offline quant those layers and remove those layer's names from ignored_layers,
+        #       add none_moe_use_weight_block_size: False to config.json
+        #    2. remove those layer's names from ignored_layers and add none_moe_is_checkpoint_fp8_serialized: False and
+        #       none_moe_use_weight_block_size: False to config.json to enable online fp8 quantization for those layers
+        # default to True so official vllm can use the default behavior.
+        none_moe_use_weight_block_size = cls.get_from_keys_or(
+            config, ["none_moe_use_weight_block_size"], True
+        )
+        none_moe_is_checkpoint_fp8_serialized = bool(
+            cls.get_from_keys_or(
+                config, ["none_moe_is_checkpoint_fp8_serialized"], True
+            )
+        )
+        if not ignored_layers:
+            ignored_layers = cls.get_from_keys_or(
+                config, ["modules_to_not_convert"], None
+            )
+        if gemm_format != "TN":
+            raise ValueError("IluFp8Config only supports tn gemm_format for now")
+        return cls(
+            is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
+            activation_scheme=activation_scheme,
+            ignored_layers=ignored_layers,
+            weight_block_size=weight_block_size,
+            store_dtype=store_dtype,
+            gemm_format=gemm_format,
+            none_moe_use_weight_block_size=none_moe_use_weight_block_size,
+            none_moe_is_checkpoint_fp8_serialized=none_moe_is_checkpoint_fp8_serialized,
+        )
+
+    def _is_layer_skipped(self, prefix: str) -> bool:
+        """Match exact exclusions and parent-module exclusions."""
+        if is_layer_skipped(
+            prefix=prefix,
+            ignored_layers=self.ignored_layers,
+            fused_mapping=self.packed_modules_mapping,
+        ):
+            return True
+        return any(prefix.startswith(f"{name}.") for name in self.ignored_layers)
+
+    # [ILU override] Fp8Config.get_quant_method — delta: online LinearBase
+    # layers use IluFp8PerTensorOnlineLinearMethod, serialized LinearBase layers
+    # use IluFp8LinearMethod, and block-wise routed experts use IluFp8MoEMethod.
+    # Skipped layers, attention and KV cache remain delegated to the community.
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        if isinstance(layer, LinearBase):
+            if self._is_layer_skipped(prefix):
+                return UnquantizedLinearMethod()
+
+            new_quant = copy.deepcopy(self)
+            new_quant.weight_block_size = (
+                self.weight_block_size if self.none_moe_use_weight_block_size else None
+            )
+            if (
+                self.none_moe_is_checkpoint_fp8_serialized
+                and self.is_checkpoint_fp8_serialized
+            ):
+                method = IluFp8LinearMethod(new_quant)
+            else:
+                method = IluFp8PerChannelOnlineLinearMethod(new_quant)
+            return method
+
         if (
             isinstance(layer, RoutedExperts)
             and self.is_checkpoint_fp8_serialized
             and self.weight_block_size is not None
             and self.store_dtype != "mxfp4"
+            and not self._is_layer_skipped(prefix)
         ):
-            skipped = is_layer_skipped(
-                prefix=prefix,
-                ignored_layers=self.ignored_layers,
-                fused_mapping=self.packed_modules_mapping,
-            )
-            if not skipped:
-                return IluFp8MoEMethod(self, layer)
+            return IluFp8MoEMethod(self, layer)
         return super().get_quant_method(layer, prefix)

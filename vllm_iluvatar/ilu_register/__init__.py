@@ -53,6 +53,7 @@ _OOT_OP_PACKAGES = [
     "vllm_iluvatar.model_executor.layers.rotary_embedding",
     # Quantization configs register via @register_quantization_config at import.
     "vllm_iluvatar.model_executor.layers.quantization",
+    "vllm_iluvatar.model_executor.layers.quantization.compressed_tensors",
 ]
 # Model packages register via a module-level ``register_model()`` hook.
 # Sub-packages are not auto-discovered (``_iter_package_modules`` skips them),

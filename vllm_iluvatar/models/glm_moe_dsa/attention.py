@@ -21,7 +21,7 @@ Three layers, mirroring V4:
   k-up + ``concat_and_cache_mla`` + the FlashMLA sparse kernel + v-up. The
   absorbed up-proj is grouped W8A16 marlin: k-up / v-up read
   ``kv_b_proj.W_UK`` / ``W_UV`` (repacked at load time by
-  ``_IluGlmKVBProjW8A16Method``) and call ``ixf_ops.marlin_w8a16``. Slimmed
+  ``IluGlmKVBProjW8A16Method ``) and call ``ixf_ops.marlin_w8a16``. Slimmed
   fork of ``IluFlashMLASparseImpl`` (GLM/V3.2 only: no compress_ratio / SWA /
   attn_sink / C128A / DCP / quantized-output paths). Analogue of
   ``IluDeepseekV4MLAAttention``.
@@ -257,8 +257,8 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
     Registered as an ``AttentionLayerBase`` so the runner allocates its paged
     KV cache and builds :class:`IluFlashMLASparseMetadata` keyed on ``prefix``.
 
-    ``kv_b_proj`` is grouped W8A16 marlin: :class:`_IluGlmKVBProjW8A16Method`
-    (in ``ilu_deepseek_v4_w4a8``) splits it into ``W_UK`` / ``W_UV`` and repacks
+    ``kv_b_proj`` is grouped W8A16 marlin: :class:`IluGlmKVBProjW8A16Method `
+    (in ``iluvatar-compressed-tensors``) splits it into ``W_UK`` / ``W_UV`` and repacks
     each into Marlin layout at load time (deterministic, loader-driven). The
     k-up / v-up here just read ``self.kv_b_proj.W_UK`` / ``W_UV`` and call
     ``ixf_ops.marlin_w8a16`` -- mirroring R1's ``_k_up_proj_w8a8`` /
@@ -561,7 +561,7 @@ class IluGlmMoeDsaMLAAttention(nn.Module):
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         # kv_b_proj is grouped W8A16 marlin (absorbed MLA up-proj): the ilu
-        # ``_IluGlmKVBProjW8A16Method`` splits it into W_UK/W_UV and repacks
+        # ``IluGlmKVBProjW8A16Method `` splits it into W_UK/W_UV and repacks
         # each at load time. Attach ``bmm_geom`` here (always -- the method
         # reads it in process_weights_after_loading) so the flat 2D weight can
         # be re-grouped per head. All dims are TP-local.

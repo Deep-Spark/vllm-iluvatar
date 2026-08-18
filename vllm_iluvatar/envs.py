@@ -71,8 +71,7 @@ def _maybe_stripped(value: str) -> str | None:
 
 def _hybrid_dp_sync_prefills_default() -> bool:
     return (
-        os.environ.get("VLLM_ILU_DECODE_EP_BACKEND", "").strip()
-        == "deepep_low_latency"
+        os.environ.get("VLLM_ILU_DECODE_EP_BACKEND", "").strip() == "deepep_low_latency"
         and os.environ.get("VLLM_ILU_DP_ROUND_ROBIN_LB", "0").strip().lower()
         in _TRUE_VALS
     )
@@ -80,11 +79,6 @@ def _hybrid_dp_sync_prefills_default() -> bool:
 
 if TYPE_CHECKING:
     # Canonical names (new code should use these).
-    VLLM_ILU_W8A8_MOE_USE_W4A8: bool = False
-    VLLM_ILU_WNA16_MOE_USE_W4A8: bool = False
-    VLLM_ILU_W4A8_FORMAT: str = "TN"
-    VLLM_ILU_W4A8_VERSION: int = 2
-    VLLM_ILU_W8A8_FORMAT: str = "TN"
     VLLM_ILU_MLA_CUSTOMIZE: bool = True
     VLLM_ILU_MIX_QUANTIZATION_TYPE: str = ""
     VLLM_ILU_FLASH_ATTN_QUANT_TYPE: str = ""
@@ -107,7 +101,6 @@ if TYPE_CHECKING:
     VLLM_ILU_NIXL_DS32_QUANT_AFTER_TRANSFER: bool = False
     VLLM_ILU_LINEAR_BACKEND: str = ""
     VLLM_ILU_DP_LB_EXACT_INFLIGHT: bool = False
-    VLLM_ILU_W8A8_GEMM_MODE: str = "PERF"
     VLLM_ILU_DEEPEP_USE_INT8: int = 0
     VLLM_ILU_DISABLE_DEEPEP: bool = False
     VLLM_ILU_DEEPEP_USE_SCATTER: bool = True
@@ -125,23 +118,6 @@ if TYPE_CHECKING:
 # Canonical (VLLM_ILU_*) readers. Each lambda preserves the exact parsing the
 # fork used in vllm/envs.py, and reads VLLM_ILU_* first then the legacy VLLM_*.
 _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
-    "VLLM_ILU_W8A8_MOE_USE_W4A8": lambda: (
-        _get("VLLM_ILU_W8A8_MOE_USE_W4A8", "VLLM_W8A8_MOE_USE_W4A8", "0").lower()
-        in ("1", "true")
-    ),
-    "VLLM_ILU_WNA16_MOE_USE_W4A8": lambda: (
-        _get("VLLM_ILU_WNA16_MOE_USE_W4A8", "VLLM_WNA16_MOE_USE_W4A8", "0").lower()
-        in ("1", "true")
-    ),
-    "VLLM_ILU_W4A8_FORMAT": lambda: _get(
-        "VLLM_ILU_W4A8_FORMAT", "VLLM_W4A8_FORMAT", "TN"
-    ).upper(),
-    "VLLM_ILU_W4A8_VERSION": lambda: int(
-        _get("VLLM_ILU_W4A8_VERSION", "VLLM_W4A8_VERSION", "2")
-    ),
-    "VLLM_ILU_W8A8_FORMAT": lambda: _get(
-        "VLLM_ILU_W8A8_FORMAT", "VLLM_W8A8_FORMAT", "TN"
-    ).upper(),
     "VLLM_ILU_MLA_CUSTOMIZE": lambda: (
         _get("VLLM_ILU_MLA_CUSTOMIZE", "VLLM_MLA_CUSTOMIZE", "1").lower()
         in ("1", "true", "yes")
@@ -182,9 +158,6 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
         ).lower()
         in ("1", "true")
     ),
-    "VLLM_ILU_W8A8_GEMM_MODE": lambda: _get(
-        "VLLM_ILU_W8A8_GEMM_MODE", "VLLM_W8A8_GEMM_MODE", "PERF"
-    ).upper(),
 }
 
 
@@ -262,7 +235,7 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
                 "VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS",
                 "5" if _hybrid_dp_sync_prefills_default() else "0",
             )
-        )
+        ),
     ),
     "VLLM_ILU_MOE_EP_LL_MOE_ALGO": lambda: os.environ.get(
         "VLLM_ILU_MOE_EP_LL_MOE_ALGO", "GEMV"

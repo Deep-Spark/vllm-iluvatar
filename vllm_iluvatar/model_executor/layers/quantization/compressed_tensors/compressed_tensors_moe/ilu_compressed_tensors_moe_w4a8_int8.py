@@ -13,27 +13,27 @@ Key env vars:
   - VLLM_W4A8_VERSION: 2 (default) or 1
 """
 
+from typing import Any
+
 import ixformer.inference.functions as ixfops  # type: ignore
-from ixformer.inference.functions.fused_moe import (
-    _prepack_fused_moe_w4a8_tn_weights_,
-)
 import torch
 import vllm.envs as envs
 from compressed_tensors.quantization import (
     QuantizationArgs,
     QuantizationStrategy,
 )
-from vllm.config import CUDAGraphMode
+from ixformer.inference.functions.fused_moe import (
+    _prepack_fused_moe_w4a8_tn_weights_,
+)
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
+    FusedMoEActivationFormat,
+    FusedMoEExpertsModular,
+    FusedMoEPrepareAndFinalizeModular,
     FusedMoeWeightScaleSupported,
     RoutedExperts,
     SharedExperts,
-    FusedMoeWeightScaleSupported,
-    FusedMoEPrepareAndFinalizeModular,
-    FusedMoEExpertsModular,
-    FusedMoEActivationFormat,
 )
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -103,8 +103,10 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         input_quant: QuantizationArgs,
         moe: FusedMoEConfig,
         layer_name: str | None = None,
+        ilu_params: dict[str, Any] | None = None,
     ):
         super().__init__(moe)
+        ilu_params = ilu_params or {}
         self.has_bias = self.moe.has_bias
         self.weight_quant = weight_quant
         self.input_quant = input_quant
@@ -117,15 +119,17 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         #     raise ValueError("This method only supports 4-bit weights (num_bits=4).")
 
         self.weight_symmetric = self.weight_quant.symmetric
-        self.gemm_format = envs.VLLM_W4A8_FORMAT
-        self.version = envs.VLLM_W4A8_VERSION
+        self.gemm_format = ilu_params.get("gemm_format", "")
+        self.version = ilu_params.get("pack_version", -1)
         assert self.version == 2, (
             "IluCompressedTensorsW4A8Int8MoEMethod only supports version 2"
         )
         assert self.gemm_format in ["TN", "NN"], (
             "IluCompressedTensorsW4A8Int8MoEMethod only supports format TN or NN"
         )
-        if not envs.VLLM_WNA16_MOE_USE_W4A8 and not (
+        wna16_use_w4a8 = ilu_params.get("wna16_use_w4a8", None)
+        assert wna16_use_w4a8 is not None
+        if not wna16_use_w4a8 and not (
             (
                 self.weight_quant.strategy == QuantizationStrategy.CHANNEL
                 or self.weight_quant.strategy == QuantizationStrategy.GROUP
@@ -137,7 +141,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 "scales for weights and per-token scales for activations are "
                 f"supported. Found {self.weight_quant}, {self.input_quant}"
             )
-        if envs.VLLM_WNA16_MOE_USE_W4A8:
+        if wna16_use_w4a8:
             self.static_input_scales = False
         else:
             self.static_input_scales = not self.input_quant.dynamic
@@ -524,11 +528,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             )
 
         if envs.VLLM_ILU_MOE_EP_LL_MOE_ALGO == "FUSED":
-            if (
-                self.gemm_format != "TN"
-                or self.version != 2
-                or self.group_size != -1
-            ):
+            if self.gemm_format != "TN" or self.version != 2 or self.group_size != -1:
                 raise NotImplementedError(
                     "ixformer fused MoE requires TN, version=2, group_size=-1"
                 )
@@ -564,8 +564,6 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             x=x,
             shared_experts_input=shared_experts_input,
         )
-        if shared_experts_input is None:
-            shared_experts = None
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         use_ep = layer.expert_map is not None

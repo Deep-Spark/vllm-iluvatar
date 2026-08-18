@@ -6,12 +6,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from types import SimpleNamespace
+from typing import Any
 
 import ixformer.inference.functions as ixf_ops
-from ixformer.inference.functions.w8a8 import w8a8_gemm, w8a8_gemv
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
-
+from ixformer.inference.functions.w8a8 import w8a8_gemm, w8a8_gemv
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_scheme import (  # noqa: E501
@@ -27,6 +27,7 @@ from vllm.model_executor.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
+
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_utils import (  # noqa: E501
     W8A8GemmInfo,
     pad_tensor,
@@ -36,19 +37,13 @@ from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_uti
 
 logger = init_logger(__name__)
 
-def _mixed_quantization_strategy(default_strategy: str):
-    import vllm.envs as envs
 
-    mix_type = getattr(
-        envs,
-        "VLLM_ILU_MIX_QUANTIZATION_TYPE",
-        getattr(envs, "VLLM_MIX_QUANTIZATION_TYPE", ""),
-    )
-    if mix_type == "TENSOR":
+def _mixed_quantization_strategy(mix_type: str):
+    if mix_type.upper() == "TENSOR":
         return QuantizationStrategy.TENSOR
-    if mix_type == "CHANNEL":
+    if mix_type.upper() == "CHANNEL":
         return QuantizationStrategy.CHANNEL
-    return default_strategy
+    return None
 
 
 class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
@@ -57,12 +52,15 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
         strategy: str,
         is_static_input_scheme: bool,
         input_symmetric: bool,
+        ilu_params: dict[str, Any] | None = None,
     ):
-        self.strategy = _mixed_quantization_strategy(strategy)
+        ilu_params = ilu_params or {}
+        mixed_strategy = ilu_params.get("mixed_strategy", None)
+        assert mixed_strategy is not None
+        self.strategy = _mixed_quantization_strategy(mixed_strategy)
         if self.strategy != QuantizationStrategy.CHANNEL:
             raise ValueError(
-                "IluCompressedTensorsW8A8Int8 only supports channel-wise "
-                "quantization"
+                "IluCompressedTensorsW8A8Int8 only supports channel-wise quantization"
             )
         self.is_static_input_scheme = is_static_input_scheme
         self.input_symmetric = input_symmetric
@@ -79,11 +77,14 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
             input_symmetric=self.input_symmetric,
         )
         from vllm_iluvatar.ilu_util.arch import cuda_arch
+
         self.arch = cuda_arch()
-        self.format = "TN"
-        from vllm import envs
-        self.perf_mode = envs.VLLM_ILU_W8A8_GEMM_MODE
-        assert self.perf_mode in ["NORMAL", "PERF"], f"Invalid perf_mode:{self.perf_mode}"
+        self.format = ilu_params.get("gemm_format", "")
+        assert self.format in ["TN", "NN"], f"Invalid format:{self.format}"
+        self.perf_mode = ilu_params.get("gemm_mode", "")
+        assert self.perf_mode in ["NORMAL", "PERF"], (
+            f"Invalid perf_mode:{self.perf_mode}"
+        )
         logger.info_once(
             f"[IluCompressedTensorsW8A8Int8] perf_mode:{self.perf_mode} arch:{self.arch}"
         )
@@ -93,106 +94,114 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
                 # n, k
                 (2048, 7168): {
                     "format": "TN",
-                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 (4096, 1536): {
                     "format": "TN",
-                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 # deepseekv4 pro tp8
                 (8192, 1536): {
                     "format": "TN",
-                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 (7168, 2048): {
                     "format": "TN",
-                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 (768, 7168): {
                     "format": "TN",
-                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 (7168, 384): {
                     "format": "TN",
-                    "func" : [(0, w8a8_gemm),],
+                    "func": [
+                        (0, w8a8_gemm),
+                    ],
                 },
                 # deepseekv4 pro tp4
                 (16384, 1536): {
                     "format": "TN",
-                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 (7168, 4096): {
                     "format": "TN",
-                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 (1536, 7168): {
                     "format": "TN",
-                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 (7168, 768): {
                     "format": "TN",
-                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 # deepseekv4 flash
                 (512, 4096): {
                     "format": "TN",
-                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 (1024, 4096): {
                     "format": "TN",
-                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 (1536, 4096): {
                     "format": "TN",
-                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 (2048, 4096): {
                     "format": "TN",
-                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 (4096, 256): {
                     "format": "TN",
-                    "func" : [(0, w8a8_gemv), (2, w8a8_gemm)],
+                    "func": [(0, w8a8_gemv), (2, w8a8_gemm)],
                 },
                 (4096, 512): {
                     "format": "TN",
-                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 (4096, 1024): {
                     "format": "TN",
-                    "func" : [(0, w8a8_gemv), (2, w8a8_gemm)],
+                    "func": [(0, w8a8_gemv), (2, w8a8_gemm)],
                 },
                 (4096, 2048): {
                     "format": "TN",
-                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 (4096, 4096): {
                     "format": "TN",
-                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 (4096, 8192): {
                     "format": "TN",
-                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 (8192, 1024): {
                     "format": "TN",
-                    "func" : [(0, w8a8_gemv), (2, w8a8_gemm)],
+                    "func": [(0, w8a8_gemv), (2, w8a8_gemm)],
                 },
                 (16384, 1024): {
                     "format": "NN",
-                    "func" : [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
                 },
                 (32768, 1024): {
                     "format": "NN",
-                    "func" : [(0, w8a8_gemv), (9, w8a8_gemm)],
+                    "func": [(0, w8a8_gemv), (9, w8a8_gemm)],
                 },
             },
-            "ivcore11": {}
+            "ivcore11": {},
         }
 
     def _get_layer_params(
         self, layer: torch.nn.Module
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
         w_q, w_s, i_s, i_zp, azp_adj = self.layer_param_names
         return (
             getattr(layer, w_q),
@@ -260,9 +269,7 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
         # TN format
         weight = ModelWeightParameter(
             data=torch.empty(
-                sum(output_partition_sizes),
-                input_size_per_partition,
-                dtype=torch.int8
+                sum(output_partition_sizes), input_size_per_partition, dtype=torch.int8
             ),
             input_dim=1,
             output_dim=0,
@@ -315,7 +322,9 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
         weight = getattr(layer, w_q_name)
         n, k = weight.shape
         self.format = self._choose_format(n, k)
-        logger.info_once(f"[IluCompressedTensorsW8A8Int8 process_weights_after_loading] choose format:{self.format} n:{n} k:{k}")
+        logger.info_once(
+            f"[IluCompressedTensorsW8A8Int8 process_weights_after_loading] choose format:{self.format} n:{n} k:{k}"
+        )
 
         if self.format == "NN":
             self.gemm_info = W8A8GemmInfo(
@@ -324,9 +333,10 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
                 n=n,
             )
             replace_parameter(
-                layer, w_q_name,
-                torch.nn.Parameter(weight.data.t().contiguous(),
-                                    requires_grad=False))
+                layer,
+                w_q_name,
+                torch.nn.Parameter(weight.data.t().contiguous(), requires_grad=False),
+            )
         else:
             self.gemm_info = W8A8GemmInfo(
                 format_str="TN",
@@ -367,16 +377,18 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
             torch.nn.Parameter(weight_scale.data, requires_grad=False),
         )
 
-        if self.strategy == QuantizationStrategy.CHANNEL:
-            if weight_scale.shape[0] != self.gemm_info.get_pad_n():
-                target_shape = (self.gemm_info.get_pad_n(), weight_scale.shape[1])
-                replace_with_padded(
-                    layer,
-                    w_s_name,
-                    target_shape,
-                    pad_value=1,
-                    log_prefix="[IluCompressedTensorsW8A8Int8 process_weights_after_loading weight_scale]",
-                )
+        if (
+            self.strategy == QuantizationStrategy.CHANNEL
+            and weight_scale.shape[0] != self.gemm_info.get_pad_n()
+        ):
+            target_shape = (self.gemm_info.get_pad_n(), weight_scale.shape[1])
+            replace_with_padded(
+                layer,
+                w_s_name,
+                target_shape,
+                pad_value=1,
+                log_prefix="[IluCompressedTensorsW8A8Int8 process_weights_after_loading weight_scale]",
+            )
 
         # INPUT SCALE
         if config.is_static_input_scheme:
@@ -492,12 +504,27 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
 
         perf_fn = self._get_perf_func(self.gemm_info.n, self.gemm_info.k, x_q.shape[0])
         if perf_fn is not None:
-            perf_fn(x_q, w_q, x_s, w_s, bias,
-                    output=out, format=self.gemm_info.format_str,
-                    out_dtype=out_dtype)
+            perf_fn(
+                x_q,
+                w_q,
+                x_s,
+                w_s,
+                bias,
+                output=out,
+                format=self.gemm_info.format_str,
+                out_dtype=out_dtype,
+            )
         else:
-            ixf_ops.w8a8(x_q, w_q, x_s, w_s, bias, format=self.gemm_info.format_str,
-                    output=out, out_dtype=out_dtype)
+            ixf_ops.w8a8(
+                x_q,
+                w_q,
+                x_s,
+                w_s,
+                bias,
+                format=self.gemm_info.format_str,
+                output=out,
+                out_dtype=out_dtype,
+            )
 
         # unpad tensor
         if out.dim() == 2:

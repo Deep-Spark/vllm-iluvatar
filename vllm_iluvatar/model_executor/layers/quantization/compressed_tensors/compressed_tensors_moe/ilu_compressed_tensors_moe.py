@@ -152,14 +152,16 @@ class IluCompressedTensorsMoEMethod:
         input_quant = scheme_dict.get("input_activations")
         format_ = scheme_dict.get("format")
 
-        if _env_enabled("VLLM_ILU_W8A8_MOE_USE_W4A8", "VLLM_W8A8_MOE_USE_W4A8"):
+        ilu_params = scheme_dict.get("ilu_params", {})
+
+        if ilu_params.get("w8a8_use_w4a8", False):
             from .ilu_compressed_tensors_moe_w4a8_int8 import (
                 IluCompressedTensorsW4A8Int8MoEMethod,
             )
 
             logger.info_once("Using Iluvatar W4A8 compressed-tensors MoE method")
             return IluCompressedTensorsW4A8Int8MoEMethod(
-                weight_quant, input_quant, layer.moe_config
+                weight_quant, input_quant, layer.moe_config, ilu_params=ilu_params
             )
 
         if (
@@ -174,11 +176,11 @@ class IluCompressedTensorsMoEMethod:
 
             logger.info_once("Using Iluvatar W4A8 compressed-tensors MoE method")
             return IluCompressedTensorsW4A8Int8MoEMethod(
-                weight_quant, input_quant, layer.moe_config
+                weight_quant, input_quant, layer.moe_config, ilu_params=ilu_params
             )
 
-        if _env_enabled(
-            "VLLM_ILU_WNA16_MOE_USE_W4A8", "VLLM_WNA16_MOE_USE_W4A8"
+        if ilu_params.get(
+            "wna16_use_w4a8", False
         ) and quant_config._is_wNa16_group_channel(weight_quant, input_quant):
             group_size = weight_quant.group_size or -1
             valid_format_and_bits = (
@@ -203,7 +205,7 @@ class IluCompressedTensorsMoEMethod:
 
             logger.info_once("Using Iluvatar WNA16->W4A8 compressed-tensors MoE method")
             return IluCompressedTensorsW4A8Int8MoEMethod(
-                weight_quant, input_quant, layer.moe_config
+                weight_quant, input_quant, layer.moe_config, ilu_params=ilu_params
             )
 
         if quant_config._is_dynamic_token_w8a8(weight_quant, input_quant):
@@ -213,7 +215,7 @@ class IluCompressedTensorsMoEMethod:
 
             logger.info_once("Using Iluvatar W8A8 compressed-tensors MoE method")
             return IluCompressedTensorsW8A8Int8MoEMethod(
-                weight_quant, input_quant, layer.moe_config
+                weight_quant, input_quant, layer.moe_config, ilu_params=ilu_params
             )
 
         return _fallback_get_moe_method(quant_config, layer, layer_name)

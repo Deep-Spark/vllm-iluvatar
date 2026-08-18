@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "name": "kimi_k25",
+  "load_device": "requested",
+  "model_config_patch": {
+    "text_config.quantization_config": null
+  },
+  "default_action": "keep",
+  "rules": [
+    {
+      "id": "drop_expert_packed_companions",
+      "priority": 1000,
+      "match": {
+        "regex": [
+          "^language_model\\.model\\.layers\\.\\d+\\.mlp\\.experts\\.\\d+\\.(gate_proj|up_proj|down_proj)\\.(weight_scale|weight_shape)$"
+        ]
+      },
+      "action": "drop"
+    },
+    {
+      "id": "keep_sensitive_tensor",
+      "priority": 950,
+      "match": {
+        "regex": [
+          "^language_model\\.lm_head\\.weight$",
+          "^language_model\\.model\\.embed_tokens\\.weight$",
+          "^language_model\\.model\\.norm\\.weight$",
+          "^language_model\\.model\\.layers\\.\\d+\\.(input_layernorm|post_attention_layernorm)\\.weight$",
+          "^language_model\\.model\\.layers\\.\\d+\\.self_attn\\.(q_a_layernorm|kv_a_layernorm)\\.weight$",
+          "^language_model\\.model\\.layers\\.\\d+\\.mlp\\.gate\\.weight$",
+          "^language_model\\.model\\.layers\\.\\d+\\.mlp\\.gate\\.e_score_correction_bias$"
+        ]
+      },
+      "action": "keep"
+    },
+    {
+      "id": "routed_packed_int4_to_w4a8",
+      "priority": 900,
+      "match": {
+        "regex": [
+          "^language_model\\.model\\.layers\\.\\d+\\.mlp\\.experts\\.\\d+\\.(gate_proj|up_proj|down_proj)\\.weight_packed$"
+        ],
+        "dtypes": ["int32"]
+      },
+      "action": "convert",
+      "scale": {
+        "from_suffix": ".weight_packed",
+        "to_suffix": ".weight_scale"
+      },
+      "dequant": {
+        "method": "int4_group",
+        "options": {
+          "num_bits": 4,
+          "group_size": 32
+        }
+      },
+      "quant": {
+        "method": "int4_moe",
+        "options": {
+          "group_size": -1,
+          "symmetric": true,
+          "gemm_format": "TN",
+          "pack_version": 2,
+          "scale_layout": "row"
+        }
+      },
+      "iluvatar": {
+        "wna16_use_w4a8": false
+      },
+      "outputs": {
+        "weight": ".weight",
+        "weight_scale": ".weight_scale",
+        "i8_weight_scale": ".i8_weight_scale",
+        "i8_weight_zero": ".i8_weight_zero"
+      },
+      "work_device": "cuda"
+    },
+    {
+      "id": "dense_float_to_w8a8",
+      "priority": 800,
+      "match": {
+        "regex": [
+          "^language_model\\.model\\.layers\\.\\d+\\.self_attn\\.(q_a_proj|q_b_proj|kv_a_proj_with_mqa|kv_b_proj|o_proj)\\.weight$",
+          "^language_model\\.model\\.layers\\.0\\.mlp\\.(gate_proj|up_proj|down_proj)\\.weight$",
+          "^language_model\\.model\\.layers\\.\\d+\\.mlp\\.shared_experts\\.(gate_proj|up_proj|down_proj)\\.weight$"
+        ]
+      },
+      "action": "convert",
+      "dequant": {"method": "to_float32"},
+      "quant": {
+        "method": "int8_per_channel",
+        "options": {
+          "group_size": -1,
+          "symmetric": true,
+          "gemm_format": "TN"
+        }
+      },
+      "iluvatar": {
+        "mixed_strategy": "CHANNEL",
+        "gemm_mode": "PERF"
+      },
+      "outputs": {"weight_scale": ".weight_scale"},
+      "work_device": "cuda"
+    }
+  ]
+}

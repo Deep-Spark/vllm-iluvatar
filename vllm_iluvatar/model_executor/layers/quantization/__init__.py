@@ -7,3 +7,9 @@ official ``@register_quantization_config`` decorator at import time, so no
 community-source edits to ``vllm/model_executor/layers/quantization/__init__.py``
 or ``vllm/config/model.py`` are required.
 """
+
+from vllm_iluvatar.model_executor.layers.quantization.ilu_quant_registry import (
+    IluvatarQuantRegistry,
+)
+
+__all__ = ["IluvatarQuantRegistry"]

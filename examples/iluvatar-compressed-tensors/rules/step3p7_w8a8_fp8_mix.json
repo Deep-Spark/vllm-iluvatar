@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "name": "step3p7_flash_w8a8",
+  "load_device": "requested",
+  "default_action": "keep",
+  "rules": [
+    {
+      "id": "dense_bf16_to_w8a8",
+      "priority": 900,
+      "match": {
+        "regex": [
+          "^model\\.layers\\.\\d+\\.self_attn\\.(q_proj|k_proj|v_proj|g_proj|o_proj)\\.weight$",
+          "^model\\.layers\\.\\d+\\.share_expert\\.(gate_proj|up_proj|down_proj)\\.weight$",
+          "^model\\.layers\\.[0-2]\\.mlp\\.(gate_proj|up_proj|down_proj)\\.weight$"
+        ],
+        "dtypes": [
+          "bfloat16"
+        ],
+        "ndims": [
+          2
+        ]
+      },
+      "action": "convert",
+      "config_group": "dense_linears",
+      "dequant": {
+        "method": "identity"
+      },
+      "quant": {
+        "method": "int8_per_channel",
+        "options": {
+          "group_size": -1,
+          "symmetric": true,
+          "gemm_format": "TN"
+        }
+      },
+      "iluvatar": {
+        "mixed_strategy": "CHANNEL",
+        "gemm_mode": "PERF"
+      },
+      "outputs": {
+        "weight_scale": ".weight_scale"
+      }
+    },
+    {
+      "id": "keep_block_fp8_routed_experts",
+      "priority": 850,
+      "match": {
+        "regex": [
+          "^model\\.layers\\.\\d+\\.moe\\.(gate_proj|up_proj|down_proj)\\.weight$"
+        ]
+      },
+      "action": "keep"
+    },
+    {
+      "id": "keep_router_gate",
+      "priority": 800,
+      "match": {
+        "regex": [
+          "^model\\.layers\\.\\d+\\.moe\\.(gate\\.weight|router_bias)$"
+        ]
+      },
+      "action": "keep"
+    },
+    {
+      "id": "keep_unquantized",
+      "priority": 0,
+      "match": {
+        "regex": [
+          ".*"
+        ]
+      },
+      "action": "keep"
+    }
+  ]
+}

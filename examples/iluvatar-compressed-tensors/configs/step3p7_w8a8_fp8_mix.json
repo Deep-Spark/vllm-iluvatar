@@ -1,0 +1,78 @@
+{
+  "quant_method": "iluvatar-compressed-tensors",
+  "format": "iluvatar-mixed",
+  "config_groups": {
+    "routed_experts": {
+      "targets": [
+        "re:.*\\.moe\\.experts"
+      ],
+      "weights": {
+        "num_bits": 8,
+        "type": "float",
+        "symmetric": true,
+        "strategy": "block",
+        "block_structure": [
+          128,
+          128
+        ],
+        "dynamic": false
+      },
+      "input_activations": {
+        "num_bits": 8,
+        "type": "float",
+        "symmetric": true,
+        "strategy": "group",
+        "group_size": 128,
+        "dynamic": true
+      },
+      "output_activations": null,
+      "iluvatar": {
+        "method": "IluFp8MoEMethod",
+        "weight_block_size": [
+          128,
+          128
+        ]
+      }
+    },
+    "dense_linears": {
+      "format": "int-quantized",
+      "targets": [
+        "re:.*\\.self_attn\\.(qkv_proj|g_proj|o_proj)$",
+        "re:.*\\.share_expert\\.(gate_up_proj|down_proj)$",
+        "re:.*\\.[0-2]\\.mlp\\.(gate_up_proj|down_proj)$"
+      ],
+      "weights": {
+        "num_bits": 8,
+        "type": "int",
+        "symmetric": true,
+        "strategy": "channel",
+        "group_size": null,
+        "dynamic": false
+      },
+      "input_activations": {
+        "num_bits": 8,
+        "type": "int",
+        "symmetric": true,
+        "strategy": "token",
+        "group_size": null,
+        "dynamic": true
+      },
+      "output_activations": null,
+      "iluvatar": {
+        "gemm_format": "TN",
+        "mixed_strategy": "CHANNEL",
+        "gemm_mode": "PERF"
+      }
+    }
+  },
+  "ignore": [
+    "lm_head",
+    "re:.*\\.embed_tokens$",
+    "re:.*norm.*",
+    "re:.*\\.moe\\.gate$",
+    "re:.*\\.mtp_block\\..*",
+    "re:.*\\.shared_head\\..*",
+    "re:.*\\.vision_model\\..*",
+    "re:.*\\.vit_large_projector\\..*"
+  ]
+}

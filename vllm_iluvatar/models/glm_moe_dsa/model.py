@@ -3,7 +3,7 @@
 
 Implements GLM-5.2 (``GlmMoeDsa`` arch = DeepSeek-V3.2: MLA + DSA lightning
 indexer + fine-grained MoE) bound to the W4A8 mixed-quant scheme
-(``ilu_deepseek_v4_w4a8``). The attention *algorithm* chain is fully
+(``iluvatar-compressed-tensors``). The attention *algorithm* chain is fully
 self-contained in :mod:`.attention` (no community
 ``MultiHeadLatentAttentionWrapper`` / ``MLAAttention`` / ``SparseMLAAttentionImpl``
 in the runtime path), aligned with ``deepseek_v4``.
@@ -30,7 +30,7 @@ W4A8 mixed quant (produced by
 - routed experts -> INT4 W4A8 (``IluCompressedTensorsW4A8Int8MoEMethod``),
 - shared experts / dense MLP / MLA fused_qkv_a/q_b/o_proj / indexer.wq_b ->
   INT8 W8A8 (``IluCompressedTensorsW8A8Int8``),
-- kv_b_proj -> INT8 W8A16 grouped marlin (``_IluGlmKVBProjW8A16Method``: split
+- kv_b_proj -> INT8 W8A16 grouped marlin (``IluGlmKVBProjW8A16Method ``: split
   into W_UK/W_UV, consumed via ``ixf_ops.marlin_w8a16``),
 - indexer wk/weights_proj + norms/embed/head/gate -> BF16.
 
@@ -42,7 +42,7 @@ separate, so no re-conversion is needed and there is no runtime merge.
 
 from collections.abc import Callable, Iterable
 from itertools import islice
-from typing import cast
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -58,6 +58,7 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
+    LinearMethodBase,
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
@@ -80,11 +81,114 @@ from vllm.model_executor.models.utils import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from vllm_iluvatar.model_executor.layers.quantization import IluvatarQuantRegistry
 from vllm_iluvatar.models.glm_moe_dsa.attention import (
     IluGlmMoeDsaMLAAttention,
 )
 
 logger = init_logger(__name__)
+
+
+@IluvatarQuantRegistry.register_method
+class IluGlmKVBProjW8A16Method(LinearMethodBase):
+    """W8A16 grouped-BMM method for GLM-5.2 ``kv_b_proj``."""
+
+    def __init__(self, parent_config, ilu_params: dict[str, Any]) -> None:
+        self.parent_config = parent_config
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        from vllm.model_executor.parameter import (
+            ChannelQuantScaleParameter,
+            ModelWeightParameter,
+        )
+
+        out_total = sum(output_partition_sizes)
+        layer.logical_widths = output_partition_sizes
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        weight = ModelWeightParameter(
+            data=torch.empty(out_total, input_size_per_partition, dtype=torch.int8),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight", weight)
+
+        weight_scale = ChannelQuantScaleParameter(
+            data=torch.empty((out_total, 1), dtype=torch.float32),
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight_scale", weight_scale)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Split ``kv_b_proj`` into W_UK/W_UV and Marlin-repack each."""
+        import ixformer.inference.functions as ixf_ops
+
+        geom = getattr(layer, "bmm_geom", None)
+        assert geom is not None, (
+            "IluGlmKVBProjW8A16Method requires layer.bmm_geom to be set by "
+            "the attention wrapper before process_weights_after_loading."
+        )
+        num_heads: int = geom.num_heads
+        nope: int = geom.qk_nope_head_dim
+        v: int = geom.v_head_dim
+        kv_lora: int = geom.kv_lora_rank
+
+        weight = layer.weight.data
+        weight_scale = layer.weight_scale.data
+
+        assert weight.shape == (num_heads * (nope + v), kv_lora), (
+            f"kv_b_proj weight shape {tuple(weight.shape)} does not match "
+            f"({num_heads} * ({nope} + {v}), {kv_lora}) implied by "
+            f"bmm_geom={geom!r}"
+        )
+        assert weight_scale.shape == (num_heads * (nope + v), 1), (
+            f"kv_b_proj weight_scale shape {tuple(weight_scale.shape)} != "
+            f"({num_heads * (nope + v)}, 1)"
+        )
+
+        w = weight.view(num_heads, nope + v, kv_lora)
+        s = weight_scale.view(num_heads, nope + v, 1)
+        w_uk, w_uv = w.split([nope, v], dim=1)
+        w_uk_s, w_uv_s = s.split([nope, v], dim=1)
+
+        layer.W_UK = ixf_ops.marlin_w8_weight_repack(
+            weights=w_uk.contiguous(),
+            weight_format="int8",
+            reformat="k16n16_grouped_n",
+        )
+        layer.W_UK_S = w_uk_s.contiguous()
+        layer.W_UV = ixf_ops.marlin_w8_weight_repack(
+            weights=w_uv.permute(0, 2, 1).contiguous(),
+            weight_format="int8",
+            reformat="k16n16",
+        )
+        layer.W_UV_S = w_uv_s.contiguous()
+
+        delattr(layer, "weight")
+        delattr(layer, "weight_scale")
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError(
+            "IluGlmKVBProjW8A16Method.apply must not be called; kv_b_proj is "
+            "consumed by IluGlmMoeDsaSparseMLA via "
+            "marlin_w8a16(W_UK/W_UV, W_UK_S/W_UV_S)."
+        )
 
 
 def _get_moe_router_dtype(config) -> torch.dtype | None:
@@ -560,8 +664,7 @@ class IluGlmMoeDsaForCausalLM(nn.Module, SupportsPP):
 
         # Strict reverse check: every nn.Parameter (except skipped MTP / PP
         # missing) must be filled from the checkpoint. vLLM's DefaultModelLoader
-        # only runs this when ``model_config.quantization is None``; under
-        # ``--quantization ilu_deepseek_v4_w4a8`` we must do it ourselves so a
+        # only runs this when ``model_config.quantization is None``; we must do it ourselves so a
         # missing scale / name-mapping does not silently fall back to init.
         expected: set[str] = set()
         for name, _ in self.named_parameters():
@@ -581,7 +684,7 @@ class IluGlmMoeDsaForCausalLM(nn.Module, SupportsPP):
             )
 
         # NOTE: the absorbed MLA up-proj (kv_b_proj -> W_UK/W_UV marlin) is now
-        # built deterministically by ``_IluGlmKVBProjW8A16Method.process_weights_after_loading``,
+        # built deterministically by ``IluGlmKVBProjW8A16Method .process_weights_after_loading``,
         # invoked by the loader's ``utils.process_weights_after_loading`` pass
         # (kv_b_proj is a Linear with a quant_method). No explicit early call
         # here -- and no BF16 absorb fallback.

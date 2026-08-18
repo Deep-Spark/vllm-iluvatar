@@ -7,12 +7,10 @@ diverges in three places:
 1. **Quantization scheme** - this model expects checkpoints converted by
    ``my_tests/deepseek/deepseek-v4/convert_w4a8/convert_v4_to_w4a8.py``,
    which write a fresh ``quantization_config`` block whose
-   ``quant_method == "ilu_deepseek_v4_w4a8"`` (handled by
-   :class:`IluDeepseekV4W4A8Config`). ``IluDeepseekV4ForCausalLM`` resolves to
-   this Iluvatar implementation when the plugin registry override is applied
-   (the community ``DeepseekV4ForCausalLM`` arch is owned by the raw-FP8 fork,
-   so the W4A8 checkpoint's ``config.json`` must carry the ``Ilu``-prefixed
-   arch name).
+   ``quant_method == "iluvatar-compressed-tensors"`` (handled by
+   :class:`IluQuantConfig`). Only ``IluDeepseekV4ForCausalLM``
+   should be paired with that config; the upstream ``DeepseekV4ForCausalLM``
+   continues to handle the original FP4/FP8 layouts.
 
 2. **MegaMoE removed** - the deep-gemm MegaMoE path, its triton input
    staging kernel, the bespoke expert params mapping and the
@@ -48,9 +46,9 @@ The weights mapper accounts for three concrete differences vs upstream:
 """
 
 import os
-import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
+from typing import Any, cast
 
 import ixformer.cuda as ixcuda
 import ixformer.inference.functions as ixfops  # type: ignore[import]
@@ -74,6 +72,7 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    LinearMethodBase,
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
@@ -102,6 +101,7 @@ from vllm.utils.multi_stream_utils import AuxStreamType
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
     IluFusedMoEEP,
 )
+from vllm_iluvatar.model_executor.layers.quantization import IluvatarQuantRegistry
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes import (
     IluCompressedTensorsW8A8Int8,
 )
@@ -112,6 +112,113 @@ from vllm_iluvatar.models.deepseek_v4.attention import (
 )
 
 logger = init_logger(__name__)
+
+
+@IluvatarQuantRegistry.register_method
+class IluV4W8A16BMMLinearMethod(LinearMethodBase):
+    """W8A16 grouped-BMM method for DeepSeek-V4 ``attn.wo_a``."""
+
+    def __init__(self, parent_config, ilu_params: dict[str, Any]) -> None:
+        self.parent_config = parent_config
+        try:
+            self.gemm_format = ilu_params.get("bmm_w8a16_gemm_format", "")
+            assert self.gemm_format != ""
+        except KeyError as exc:
+            raise ValueError(
+                "IluV4W8A16BMMLinearMethod requires "
+                "`bmm_w8a16_gemm_format` in its config group"
+            ) from exc
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        from vllm.model_executor.parameter import (
+            ChannelQuantScaleParameter,
+            ModelWeightParameter,
+        )
+
+        out_total = sum(output_partition_sizes)
+        layer.logical_widths = output_partition_sizes
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        weight = ModelWeightParameter(
+            data=torch.empty(out_total, input_size_per_partition, dtype=torch.int8),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight", weight)
+
+        weight_scale = ChannelQuantScaleParameter(
+            data=torch.empty((out_total, 1), dtype=torch.float32),
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight_scale", weight_scale)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Reshape and Marlin-repack ``wo_a.weight`` for grouped W8A16."""
+        import ixformer.inference.functions as ixf_ops
+
+        bmm_geom = getattr(layer, "bmm_geom", None)
+        assert bmm_geom is not None, (
+            "IluV4W8A16BMMLinearMethod requires layer.bmm_geom to be set "
+            "by the attention wrapper before process_weights_after_loading."
+        )
+        n_local_groups: int = bmm_geom.n_local_groups
+        o_lora_rank: int = bmm_geom.o_lora_rank
+        k_per_group: int = bmm_geom.heads_per_group * bmm_geom.head_dim
+
+        weight = layer.weight.data
+        weight_scale = layer.weight_scale.data
+
+        assert weight.shape == (n_local_groups * o_lora_rank, k_per_group), (
+            f"wo_a weight shape {tuple(weight.shape)} does not match "
+            f"({n_local_groups} * {o_lora_rank}, {k_per_group}) implied by "
+            f"bmm_geom={bmm_geom!r}"
+        )
+        assert weight_scale.shape == (n_local_groups * o_lora_rank, 1), (
+            f"wo_a weight_scale shape {tuple(weight_scale.shape)} != "
+            f"({n_local_groups * o_lora_rank}, 1)"
+        )
+
+        w_grouped = (
+            weight.view(n_local_groups, o_lora_rank, k_per_group)
+            .permute(0, 2, 1)
+            .contiguous()
+        )
+        s_grouped = weight_scale.view(n_local_groups, o_lora_rank, 1).contiguous()
+
+        layer.W_repacked = ixf_ops.marlin_w8_weight_repack(
+            weights=w_grouped,
+            weight_format="int8",
+            reformat=self.gemm_format,
+        )
+        layer.W_scale_repacked = s_grouped
+        layer.W_format = self.gemm_format
+
+        delattr(layer, "weight")
+        delattr(layer, "weight_scale")
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError(
+            "IluV4W8A16BMMLinearMethod.apply must not be called; "
+            "wo_a is consumed by IluDeepseekV4MultiHeadLatentAttentionWrapper "
+            "via marlin_w8a16(W_repacked, W_scale_repacked)."
+        )
+
 
 # A/B/C switch for the mhc_pre operator via IXFORMER_DS4_MHC_PRE ∈ {v1,v2,v3}:
 #   v1 (default) : original fused ds4_mhc_pre
@@ -528,7 +635,7 @@ class IluDeepseekV4Attention(nn.Module):
             prefix=f"{prefix}.wo_b",
         )
         self.softmax_scale = self.head_dim**-0.5
-        # The new ilu_deepseek_v4_w4a8 quant_config doesn't carry scale_fmt;
+        # The new iluvatar-compressed-tensors quant_config doesn't carry scale_fmt;
         # default to ue8m0 for forward-time helpers (stage 1 doesn't use it).
         self.scale_fmt = (
             (config.quantization_config or {}).get("scale_fmt", "ue8m0")
@@ -815,9 +922,7 @@ class IluDeepseekV4DecoderLayer(nn.Module):
 
         residual = x
         emit_attn_quant = (
-            _DS4_MHC_DYNAMIC_INT8
-            and self.attn_pre_quant_enabled
-            and decode_only
+            _DS4_MHC_DYNAMIC_INT8 and self.attn_pre_quant_enabled and decode_only
         )
         x, post, comb, attention_input = self.hc_pre_norm(
             x,
@@ -837,9 +942,7 @@ class IluDeepseekV4DecoderLayer(nn.Module):
 
         residual = x
         emit_ffn_quant = (
-            _DS4_MHC_DYNAMIC_INT8
-            and self.ffn_pre_shared_quant_enabled
-            and decode_only
+            _DS4_MHC_DYNAMIC_INT8 and self.ffn_pre_shared_quant_enabled and decode_only
         )
         x, post, comb, shared_gate_up_input = self.hc_pre_norm(
             x,
@@ -1072,9 +1175,7 @@ class IluDeepseekV4Model(nn.Module):
                             continue
                         name_mapped = name.replace(weight_name, param_name)
                         param = params_dict[name_mapped]
-                        weight_loader = typing.cast(
-                            Callable[..., bool], param.weight_loader
-                        )
+                        weight_loader = cast(Callable[..., bool], param.weight_loader)
                         success = weight_loader(
                             param,
                             loaded_weight,
@@ -1211,8 +1312,7 @@ class IluDeepseekV4ForCausalLM(nn.Module, SupportsPP):
         # Strict reverse check: every nn.Parameter must be filled from the
         # checkpoint. vLLM's DefaultModelLoader only runs this check when
         # ``model_config.quantization is None`` (see
-        # ``vllm/model_executor/model_loader/default_loader.py``), so for
-        # ``--quantization ilu_deepseek_v4_w4a8`` we have to do it ourselves.
+        # ``vllm/model_executor/model_loader/default_loader.py``), we have to do it ourselves.
         # Without this guard a missing scale / weight name mapping silently
         # falls back to the parameter's init value and produces wrong results.
         expected: set[str] = set()

@@ -470,18 +470,28 @@ class IluRoutedExperts(RoutedExperts):
                     "Unsupported W4A8 MoE format "
                     f"{w4a8_format!r} for fused w13 loading."
                 )
-            return fused_weight.chunk(2, dim=chunk_dim)[
-                expert_id
-            ]
+            return fused_weight.chunk(2, dim=chunk_dim)[expert_id]
         elif "weight_scale" in param_name:
-            # TN: [num_experts, 2, 2 * moe_intermediate_size] or [num_experts, 2 * moe_intermediate_size, 2]
+            # TN: [num_experts, 1, 2 * moe_intermediate_size] or [num_experts, 2 * moe_intermediate_size, 1]
             # NN: [num_experts, 2, moe_intermediate_size] or [num_experts, moe_intermediate_size, 2]
             if w4a8_format == "TN" or w4a8_format == "NN":
-                assert fused_weight.shape[-2] == 2 or fused_weight.shape[-1] == 2, f"fused_weight.shape: {fused_weight.shape}"
+                support_shapes = [1, 2]
+                assert (
+                    fused_weight.shape[-2] in support_shapes
+                    or fused_weight.shape[-1] in support_shapes
+                ), f"fused_weight.shape: {fused_weight.shape}"
+                if fused_weight.shape[-2] == 1:
+                    fused_weight = fused_weight.view(
+                        -1, 2, self.moe_config.intermediate_size
+                    )
+                if fused_weight.shape[-1] == 1:
+                    fused_weight = fused_weight.view(
+                        -1, 2, self.moe_config.intermediate_size
+                    )
                 if fused_weight.shape[-1] == 2:
                     fused_weight = fused_weight.transpose(-1, -2)
-                if fused_weight.shape[-1] == 2 * self.moe_config.intermediate_size:
-                    fused_weight = fused_weight.narrow(-1, 0, fused_weight.shape[-1] // 2)
+                assert fused_weight.shape[-1] == self.moe_config.intermediate_size
+                assert fused_weight.shape[-2] == 2
                 return fused_weight.chunk(2, dim=-2)[expert_id]
             else:
                 raise ValueError(
@@ -514,8 +524,7 @@ class IluRoutedExperts(RoutedExperts):
                     fused_weight = fused_weight.transpose(-1, -2)
             else:
                 raise ValueError(
-                    "Unsupported W4A8 MoE format "
-                    f"{w4a8_format!r} for fused w2 loading."
+                    f"Unsupported W4A8 MoE format {w4a8_format!r} for fused w2 loading."
                 )
             return fused_weight
 
@@ -523,7 +532,9 @@ class IluRoutedExperts(RoutedExperts):
             # TN: [num_experts, 1, hidden_size] or [num_experts, hidden_size, 1]
             # NN: [num_experts, 1, hidden_size // 2] or [num_experts, hidden_size // 2, 1]
             if w4a8_format == "TN" or w4a8_format == "NN":
-                assert fused_weight.shape[-2] == 1 or fused_weight.shape[-1] == 1, f"fused_weight.shape: {fused_weight.shape}"
+                assert fused_weight.shape[-2] == 1 or fused_weight.shape[-1] == 1, (
+                    f"fused_weight.shape: {fused_weight.shape}"
+                )
                 if fused_weight.shape[-1] == 1:
                     fused_weight = fused_weight.transpose(-1, -2)
                 return fused_weight
@@ -533,6 +544,7 @@ class IluRoutedExperts(RoutedExperts):
                     f"{w4a8_format!r} for fused w2_scale loading."
                 )
         raise ValueError(f"Unsupported W4A8 fused w2 parameter {param_name!r}.")
+
     # <<< ILU MODIFICATION <<<
 
     def load_weights(
@@ -561,20 +573,15 @@ class IluRoutedExperts(RoutedExperts):
                     # iterations (else w3 is transposed twice and wrongly chunked)
                     fused_weight = loaded_weight
                     if shard_id in {"w1", "w3"}:
-                        if (
-                            quant_method_name
-                            == "IluCompressedTensorsW4A8Int8MoEMethod"
-                        ):
+                        if quant_method_name == "IluCompressedTensorsW4A8Int8MoEMethod":
                             # >>> ILU MODIFICATION >>>
                             # W4A8 fused w13 tensors may already be in ixformer
                             # kernel layout; delegate format-specific splitting.
-                            experts_shard = (
-                                self._load_w4a8_fused_w13_shard(
-                                    fused_weight=fused_weight,
-                                    param_name=param_name,
-                                    expert_id=expert_id,
-                                    unpadded_hidden=unpadded_hidden
-                                )
+                            experts_shard = self._load_w4a8_fused_w13_shard(
+                                fused_weight=fused_weight,
+                                param_name=param_name,
+                                expert_id=expert_id,
+                                unpadded_hidden=unpadded_hidden,
                             )
                             # <<< ILU MODIFICATION <<<
                         else:
@@ -583,19 +590,14 @@ class IluRoutedExperts(RoutedExperts):
                                 fused_weight = fused_weight.transpose(-1, -2)
                             experts_shard = fused_weight.chunk(2, dim=1)[expert_id]
                     else:
-                        if (
-                            quant_method_name
-                            == "IluCompressedTensorsW4A8Int8MoEMethod"
-                        ):
+                        if quant_method_name == "IluCompressedTensorsW4A8Int8MoEMethod":
                             # >>> ILU MODIFICATION >>>
                             # W4A8 fused w2 tensors may already be in ixformer
                             # kernel layout; delegate format-specific handling.
-                            experts_shard = (
-                                self._load_w4a8_fused_w2_shard(
-                                    fused_weight=fused_weight,
-                                    param_name=param_name,
-                                    unpadded_hidden=unpadded_hidden,
-                                )
+                            experts_shard = self._load_w4a8_fused_w2_shard(
+                                fused_weight=fused_weight,
+                                param_name=param_name,
+                                unpadded_hidden=unpadded_hidden,
                             )
                             # <<< ILU MODIFICATION <<<
                         else:

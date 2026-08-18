@@ -533,17 +533,17 @@ get_attn_backend_cls 选官方成员
 
 > 注意：量化探测发生在 `ModelConfig.__post_init__`，**早于** `IluPlatform.check_and_update_config`；故量化只能走 `register_quantization_config`，无法像 tokenizer_mode（§6.5）那样在 `check_and_update_config` 里补。
 
-### 8.5 示例：ilu_deepseek_v4_w4a8
+### 8.5 示例：iluvatar-compressed-tensors
 
-`model_executor/layers/quantization/ilu_deepseek_v4_w4a8.py`：
+`model_executor/layers/quantization/compressed_tensors/compressed_tensors.py`：
 
 ```python
-@register_quantization_config("ilu_deepseek_v4_w4a8")
-class IluDeepseekV4W4A8Config(QuantizationConfig):
+@register_quantization_config("iluvatar-compressed-tensors")
+class IluQuantConfig(QuantizationConfig):
     ...
 ```
 
-W4A8 的选用基于 checkpoint 的 `quant_method`、与模型 arch 解耦：`IluDeepseekV4ForCausalLM`（§6.5）负责架构，`ilu_deepseek_v4_w4a8` 负责权重量化方案，两条注册路径相互独立。
+W4A8 的选用基于 checkpoint 的 `quant_method`、与模型 arch 解耦：`IluDeepseekV4ForCausalLM`（§6.5）负责架构，`IluQuantConfig` 负责权重量化方案，两条注册路径相互独立。
 
 ---
 
@@ -714,7 +714,7 @@ IluPlatform.import_ir_kernels / get_default_ir_op_priority
    - `envs.py`（对应 `vllm/envs.py`）
    - `distributed/device_communicators/all2all.py`（对应上游同名文件）
    - general patch 的 override 实现文件同理用上游同名（如 `distributed/parallel_state.py`、`distributed/utils.py`、`v1/attention/backends/fa_utils.py`，见第 4 章）。
-   - OOT 注册的实现文件也镜像上游同名（如 `model_executor/layers/layernorm.py`、`model_executor/models/qwen3.py`、`model_executor/layers/quantization/ilu_deepseek_v4_w4a8.py`、`model_executor/models/deepseek_v4/`，保留社区架构类名，见第 5、6、8 章）。
+   - OOT 注册的实现文件也镜像上游同名（如 `model_executor/layers/layernorm.py`、`model_executor/models/qwen3.py`、`model_executor/layers/quantization/compressed_tensors/compressed_tensors.py`、`model_executor/models/deepseek_v4/`，保留社区架构类名，见第 5、6、8 章）。
    - **模块替身 shim `ilu_patch/import_shims/` 内部文件镜像被替身的上游模块同名**（如 `vllm_flash_attn.py` ↔ `vllm/vllm_flash_attn/`），便于对照；这是规则 4「`ilu_` 文件夹内部不缀」之外、为「整模块替身」保留上游名的特例（与 `csrc/` 镜像上游同理，见 §3.6）。
    - **原生扩展 `csrc/` 按 community / plugin 分目录**：`community/` 内的文件名与上游 `vllm/csrc` 对应（`layernorm.cpp`、`pos_encoding_kernels.cu`、`cuda_view.cu`）；`plugin/` 存放插件独有算子（`apply_rotary_emb.cu`）；注册入口 `torch_bindings.cpp` 与 `core/registration.h` 保持在根，唯一插件特有的 `ixformer_ops.h` 置于 `community/`（ixformer 未 ship `infer/` 头，需自带前置声明，见第 9 章）。
 2. **general patch 接线 -> 集中到 `ilu_patch/general_patches/`**：
@@ -754,7 +754,7 @@ IluPlatform.import_ir_kernels / get_default_ir_op_priority
 
 ```text
 对齐上游同名      ->  _custom_ops.py / envs.py / all2all.py / parallel_state.py / layernorm.py / qwen3.py
-                       / quantization/ilu_deepseek_v4_w4a8.py / models/deepseek_v4/ / v1/attention/backends/fa_utils.py
+                       / quantization/compressed_tensors/compressed_tensors.py / models/deepseek_v4/
 general patch 接线 ->  ilu_patch/general_patches/patch_<target>.py
                        （patch_parallel_state.py / patch_fa_utils.py；
                        基线快照内联其中）

@@ -50,7 +50,7 @@
 - **包命名**：`vllm_iluvatar/models/` 下的包名按模型/架构语义命名，尽量对齐 HF `model_type` 或社区包名，例如 `deepseek_v32`、`deepseek_v4`、`glm_moe_dsa`；不要用 `ilu_` 前缀作为包名。
 - **包布局**：每个天数模型是 `vllm_iluvatar/models/<model_type>/` 下的一个**多文件包**，布局对齐 `deepseek_v4`：
 
-  ```
+  ```text
   vllm_iluvatar/models/<model_type>/
     __init__.py     # 包说明；模块由 ilu_register 自动 import
     model.py        # 模型图 + 权重加载 + register_model() 钩子
@@ -77,7 +77,7 @@
 
 整体流程（前 4 步必做，第 5 步的 MTP 按需）：
 
-```
+```text
 3.1 权重转换  →  3.2 模型适配  →  3.3 attention 抽离  →  3.4 MoE/量化
                                                           └─▶ 3.5 三种模式接入（eager / cuda-graph / MTP）
 ```
@@ -91,8 +91,8 @@
 1. **量化后的 safetensors**：按下表做混合量化。
 2. **重建的 `model.safetensors.index.json`**：按新 shard 的实际 dtype/shape 重新计算 `total_size` 与 `weight_map`。
 3. **改写的 `config.json`**：
-   - `architectures` 改为目标 registry key，例如 `["DeepseekV4ForCausalLM"]`、`["DeepseekV32ForCausalLM"]` 或新增的 `["IluXXXForCausalLM"]`；
-   - 写入 `quantization_config`，其 `quant_method="ilu_deepseek_v4_w4a8"`（复用统一的混合量化 schema，见 [3.4](#34-moe-与混合量化)）。
+   - `architectures` 改为 `["IluXXXForCausalLM"]`；
+   - 写入 `quantization_config`，其 `quant_method="iluvatar-compressed-tensors"`（复用统一的混合量化 schema，见 [3.4](#34-moe-与混合量化)）。
 
 混合量化布局（以 GLM-5.2 为例）：
 
@@ -139,7 +139,7 @@
   ```
 
 - **融合参数映射**：`packed_modules_mapping` 与 `load_weights` 中的 `stacked_params_mapping` 定义加载期融合——`gate_up_proj`（gate+up）、`fused_qkv_a_proj`（q_a + kv_a）、`wk_weights_proj`（indexer wk + weights_proj）；expert 权重走 `fused_moe_make_expert_params_mapping`。
-- **严格 reverse 校验**：量化模式下，vLLM 的 `DefaultModelLoader` 只在 `quantization is None` 时才检查"是否所有参数都被填充"。天数模型在 `--quantization ilu_deepseek_v4_w4a8` 下须自行补齐该检查：遍历所有 `nn.Parameter`（排除跳过的 MTP 层与 PP-missing），凡有未从 checkpoint 加载的即报错，避免缺 scale / 命名不匹配时静默回退到随机初始化。
+- **严格 reverse 校验**：量化模式下，vLLM 的 `DefaultModelLoader` 只在 `quantization is None` 时才检查"是否所有参数都被填充"。天数模型在 `--quantization iluvatar-compressed-tensors` 下须自行确定所有层都有正确的后端方法， 避免缺 scale / 命名不匹配时静默回退到随机初始化。
 - **MoE 要点**：sigmoid 打分 + `noaux_tc` 校正 bias（`e_score_correction_bias`）+ grouped top-k；`routed_scaling_factor` 在**输出侧**应用（`apply_routed_scale_to_output`，避免 router 侧重复缩放）。
 
 ### 3.3 attention 抽离
@@ -172,27 +172,19 @@ direct_register_custom_op(
 
 ### 3.4 MoE 与混合量化
 
-混合量化配置以 [`ilu_deepseek_v4_w4a8.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_deepseek_v4_w4a8.py) 为模板。它是统一的量化 config，新模型可直接复用（转换阶段把 `quant_method` 写成 `ilu_deepseek_v4_w4a8` 即可）：
+混合量化配置以 [`compressed_tensors.py`](../../vllm_iluvatar/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py) 为模板。它是统一的量化 config，新模型可直接复用.
 
-- **注册与激活**：类上标注 `@register_quantization_config("ilu_deepseek_v4_w4a8")`（由 `ilu_register` 在 import 期触发），并实现 `override_quantization_method`——只要 checkpoint 的 `quantization_config.quant_method` 命中即自动激活，社区的 quantization 注册表与 `config/model.py` 保持零改动。
-- **`get_quant_method` 分发**（按 layer 类型 + prefix 正则）：
-  - `RoutedExperts` 且命中 routed target → W4A8 INT8 MoE method；
-  - `LinearBase` 且 `.shared_experts.` / `dense_linears` 命中 → `_IluV4W8A8LinearMethod`（W8A8 INT8）；
-  - `LinearBase` 且 `mla_bmm_w8a16` 命中（`kv_b_proj`）→ `_IluGlmKVBProjW8A16Method`；
-  - `LinearBase` 且 `bmm_w8a16_layers` 命中（如 V4 的 `wo_a`）→ `_IluV4W8A16BMMLinearMethod`；
-  - 其余 → `UnquantizedLinearMethod` / `UnquantizedFusedMoEMethod`（BF16）。
-- **`kv_b_proj` 的 W8A16 grouped marlin**（`_IluGlmKVBProjW8A16Method`）：磁盘上是单个 INT8 权重 `[num_heads*(nope+v), kv_lora]`，在 `process_weights_after_loading`（loader 确定性触发，非首前向懒执行，因而 cuda-graph 友好）里拆成 `W_UK`（k-up）/ `W_UV`（v-up），各自 `ixf_ops.marlin_w8_weight_repack` 成 Marlin 布局，再由 attention 的 `_k_up_proj` / `_v_up_proj` 经 `ixf_ops.marlin_w8a16` 消费。
-- **约束**：这些 grouped-BMM method 的 `apply` 须抛 `NotImplementedError`——权重由 attention 直接读 `W_UK/W_UV`（或 `W_repacked`）消费，**不走 `LinearBase.forward`**。attention 在构造期把 `bmm_geom`（per-head 的 `num_heads/qk_nope_head_dim/v_head_dim/kv_lora_rank`）挂到 Linear 上，供 `process_weights_after_loading` 恢复分组。
+- **注册与激活**：类上标注 `@register_quantization_config("iluvatar-compressed-tensors")`（由 `ilu_register` 在 import 期触发），并实现 `override_quantization_method`——只要 checkpoint 的 `quantization_config.quant_method` 命中即自动激活，社区的 quantization 注册表与 `config/model.py` 保持零改动。详细内容，请见[`6-how-to-use-and-provide-iluvatar-extend-compress-tensors.md`](../guides/6-how-to-use-and-provide-iluvatar-extend-compress-tensors.md)
 
 ### 3.5 三种运行模式：eager / cuda-graph / MTP
 
 三种运行模式由浅入深，通常按此顺序逐个打通。
 
-**（1）eager —— 基线**
+#### （1）eager —— 基线
 
 用 `--enforce-eager` 关闭 cuda-graph，先验证权重加载、attention 数值、MoE 路由正确。这是精度对齐与调试的基准。
 
-**（2）cuda-graph —— decode 整图**
+#### （2）cuda-graph —— decode 整图
 
 若模型没有 `@support_torch_compile`（天数模型通常不加），则无法走需要 torch.compile 的 piecewise 路径，只能捕获 decode 整图。用 `--compilation-config` 显式指定：
 
@@ -206,7 +198,7 @@ direct_register_custom_op(
 
 前提：[3.3](#33-attention-抽离) 中 opaque op 的 padding 行保护、以及底层 kernel（如 `indexer_k_cache`）对 `slot_idx < 0` 的跳过必须已就位，否则 cuda-graph 下 padding 行会越界 / 读脏。
 
-**（3）MTP —— 多 token 投机解码（可叠加 cuda-graph）**
+#### （3）MTP —— 多 token 投机解码（可叠加 cuda-graph）
 
 新增 [`glm_moe_dsa/mtp.py`](../../vllm_iluvatar/models/glm_moe_dsa/mtp.py)，实现 `IluXXXMTP`（标准 DeepSeek-V3.2 MTP 布局：`enorm` / `hnorm` + 融合 `eh_proj` + `shared_head` + 一个 `mtp_block` 解码层）。要点：
 
@@ -247,20 +239,20 @@ MTP 还需两个 `ilu_patch.general_patches`（各暴露 `register()`，由 `app
 | 作用 | 文件 |
 | --- | --- |
 | OOT 注册入口（登记模型包） | [`vllm_iluvatar/ilu_register/__init__.py`](../../vllm_iluvatar/ilu_register/__init__.py) |
-| 模型图 + 权重加载 + `register_model()` | [`vllm_iluvatar/models/glm_moe_dsa/model.py`](../../vllm_iluvatar/models/glm_moe_dsa/model.py) |
-| 自包含 attention 链 + plugin-local opaque op | [`vllm_iluvatar/models/glm_moe_dsa/attention.py`](../../vllm_iluvatar/models/glm_moe_dsa/attention.py) |
-| MTP draft 模型 | [`vllm_iluvatar/models/glm_moe_dsa/mtp.py`](../../vllm_iluvatar/models/glm_moe_dsa/mtp.py) |
-| 混合量化 config（W4A8/W8A8/W8A16 分发） | [`vllm_iluvatar/model_executor/layers/quantization/ilu_deepseek_v4_w4a8.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_deepseek_v4_w4a8.py) |
+| 模型图 + 权重加载 + `register_model()` | [`vllm_iluvatar/model_executor/models/ilu_glm/model.py`](../../vllm_iluvatar/model_executor/models/ilu_glm/model.py) |
+| 自包含 attention 链 + plugin-local opaque op | [`vllm_iluvatar/model_executor/models/ilu_glm/attention.py`](../../vllm_iluvatar/model_executor/models/ilu_glm/attention.py) |
+| MTP draft 模型 | [`vllm_iluvatar/model_executor/models/ilu_glm/mtp.py`](../../vllm_iluvatar/model_executor/models/ilu_glm/mtp.py) |
+| 混合量化 config（W4A8/W8A8/W8A16 分发） | [`vllm_iluvatar/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py`](../../vllm_iluvatar/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py) |
 | MTP draft-arch 重定向实现 | [`vllm_iluvatar/config/speculative.py`](../../vllm_iluvatar/config/speculative.py) |
 | MTP tuple 返回契约实现 | [`vllm_iluvatar/v1/spec_decode/llm_base_proposer.py`](../../vllm_iluvatar/v1/spec_decode/llm_base_proposer.py) |
 | MTP 两个 patch 的 register-time 接线 | [`patch_speculative_config.py`](../../vllm_iluvatar/ilu_patch/general_patches/patch_speculative_config.py) · [`patch_llm_base_proposer.py`](../../vllm_iluvatar/ilu_patch/general_patches/patch_llm_base_proposer.py) |
 
 ### 步骤速览
 
-1. **权重转换**：混合量化产出 safetensors + 重建 index + 按需改写 `config.json`（`architectures` → 目标 registry key，`quant_method` → `ilu_deepseek_v4_w4a8`）。
-2. **模型适配**：按 `model.py` 模板搭 Iluvatar 实现类（通常命名为 `IluXXXForCausalLM`），实现融合参数映射与严格 reverse 校验，`register_model()` 注册 causal-LM + MTP，并把包加入 `_OOT_MODEL_PACKAGES`。
+1. **权重转换**：混合量化产出 safetensors + 重建 index + 改写 `config.json`（`architectures` → `IluXXXForCausalLM`，`quant_method` → `iluvatar-compressed-tensors`）。
+2. **模型适配**：按 `model.py` 模板搭 `IluXXXForCausalLM`，实现融合参数映射与严格 reverse 校验，`register_model()` 注册 causal-LM + MTP，并把包加入 `_OOT_MODEL_PACKAGES`。
 3. **attention 抽离**：三层自包含 attention，数据依赖控制流用 `direct_register_custom_op` 封成 plugin-local opaque op（独立算子名、padding 行保护）。
-4. **MoE / 量化**：复用 `ilu_deepseek_v4_w4a8`，`kv_b_proj` 走 `_IluGlmKVBProjW8A16Method` 拆 `W_UK/W_UV`，grouped-BMM method 的 `apply` 抛 `NotImplementedError`。
+4. **MoE / 量化**：复用 `iluvatar-compressed-tensors`，`kv_b_proj` 走 `IluGlmKVBProjW8A16Method` 拆 `W_UK/W_UV`，grouped-BMM method 的 `apply` 抛 `NotImplementedError`。
 5. **三种模式**：先 eager 打基线；再用 `--compilation-config` 开 `FULL_DECODE_ONLY` cuda-graph；最后加 `mtp.py` + 两个 general patch 开 MTP（注意 `draft_pipeline_parallel_size: 1` 与 PP 首层须为 full 层）。
 
 本文的所有代码引用均来自 GLM-5.2（`IluGlmMoeDsa`）这一落地实现，可作为对照。

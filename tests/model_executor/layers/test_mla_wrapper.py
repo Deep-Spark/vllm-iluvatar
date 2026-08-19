@@ -88,6 +88,8 @@ def test_ilu_mla_wrapper_sets_inner_rotary_emb(monkeypatch):
                 None,
                 "",
                 False,
+                False,
+                False,
             ),
             {},
         )

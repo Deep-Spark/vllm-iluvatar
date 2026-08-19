@@ -7,7 +7,7 @@ ILU general-plugins patch, auto-discovered from the centralized
 ``ilu_patch.general_patches`` package during ``register_general``.
 
 Target   : vllm.v1.spec_decode.utils.eagle_prepare_next_token_padded_kernel
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 Why      : Iluvatar Triton can infer ``tl.sum(bool_mask)`` as ``int1``, causing
            a phi-node dtype mismatch with the discarded-request branch.
 How      : rebind the module-level Triton kernel and propagate to from-import
@@ -31,7 +31,7 @@ _OVERRIDES = ["eagle_prepare_next_token_padded_kernel"]
 # vllm.v1.spec_decode.utils.eagle_prepare_next_token_padded_kernel,
 # used as the drift anchor by the fingerprint guard.
 #
-# Baseline: main_61ac3680210
+# Baseline: main_6e448d0
 _EAGLE_PREPARE_NEXT_TOKEN_PADDED_KERNEL_BASELINE = """\
 @triton.jit
 def eagle_prepare_next_token_padded_kernel(

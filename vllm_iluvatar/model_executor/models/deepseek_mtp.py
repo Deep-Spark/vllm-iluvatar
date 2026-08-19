@@ -5,7 +5,7 @@ Corresponds to: vllm/model_executor/models/deepseek_mtp.py ::
 ``DeepSeekMTP`` PP support marker.
 
 Target   : ``vllm.model_executor.models.deepseek_mtp.DeepSeekMTP``
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 Why      : Iluvatar PP+MTP runs need the DeepSeek MTP draft architecture to be
            recognised as pipeline-parallel capable, while the community source
            stays upstream-like.

@@ -3,7 +3,7 @@
 """PP + speculative-decode Scheduler implementation.
 
 Corresponds to: vllm/v1/core/sched/scheduler.py
-Baseline     : main_61ac3680210
+Baseline     : main_6e448d0
 
 The copied method is necessary because the PP timing correction is located in
 Scheduler.schedule's local token-budget loop, which has no upstream hook.
@@ -189,7 +189,11 @@ SCHEDULE_BASELINE = r"""def schedule(self, throttle_prefills: bool = False) -> S
                 else:
                     preempted_req = self.running.pop()
 
-                self._preempt_request(preempted_req, scheduled_timestamp)
+                self._preempt_request(
+                    preempted_req,
+                    scheduled_timestamp,
+                    drop_stale_output=self.requires_kv_delivery,
+                )
                 preempted_reqs.append(preempted_req)
                 if preempted_req == request:
                     # No more request to preempt. Cannot schedule this request.
@@ -277,6 +281,17 @@ SCHEDULE_BASELINE = r"""def schedule(self, throttle_prefills: bool = False) -> S
                         "%s is still in WAITING_FOR_REMOTE_KVS state.",
                         request_id,
                     )
+                request_queue.pop_request()
+                step_skipped_waiting.prepend_request(request)
+                continue
+
+            if (
+                request.num_stale_output_tokens > 0
+                and not request.drop_stale_output
+            ):
+                # Deliverable stale output still in flight: resuming now
+                # could resample a position that output later delivers.
+                # It drains within the pipeline depth.
                 request_queue.pop_request()
                 step_skipped_waiting.prepend_request(request)
                 continue
@@ -994,7 +1009,11 @@ def _ilu_schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
                 else:
                     preempted_req = self.running.pop()
 
-                self._preempt_request(preempted_req, scheduled_timestamp)
+                self._preempt_request(
+                    preempted_req,
+                    scheduled_timestamp,
+                    drop_stale_output=self.requires_kv_delivery,
+                )
                 preempted_reqs.append(preempted_req)
                 if preempted_req == request:
                     # No more request to preempt. Cannot schedule this request.
@@ -1082,6 +1101,17 @@ def _ilu_schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
                         "%s is still in WAITING_FOR_REMOTE_KVS state.",
                         request_id,
                     )
+                request_queue.pop_request()
+                step_skipped_waiting.prepend_request(request)
+                continue
+
+            if (
+                request.num_stale_output_tokens > 0
+                and not request.drop_stale_output
+            ):
+                # Deliverable stale output still in flight: resuming now
+                # could resample a position that output later delivers.
+                # It drains within the pipeline depth.
                 request_queue.pop_request()
                 step_skipped_waiting.prepend_request(request)
                 continue

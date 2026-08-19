@@ -10,7 +10,7 @@ during ``register_general``.
 
 Target   : vllm.distributed.parallel_state.GroupCoordinator.{broadcast,
            broadcast_tensor_dict, isend_tensor_dict, irecv_tensor_dict}
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 Why      : 1) route broadcast / GPU-tensor broadcast through the device
               communicator so Iluvatar (ixformer) collectives are used instead
               of torch.distributed defaults.

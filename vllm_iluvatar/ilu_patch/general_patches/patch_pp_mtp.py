@@ -8,7 +8,7 @@ Corresponds to:
     vllm/v1/worker/gpu_model_runner.py
 
 Target   : PP batch queue with speculative decode / MTP.
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 Why      : a pipeline batch queue schedules the next batch before the prior
            output updates request state. Draft tokens must therefore travel in
            ModelRunnerOutput and non-last PP ranks must avoid drafter paths.

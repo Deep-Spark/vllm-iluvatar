@@ -632,7 +632,10 @@ def test_resolve_backend_auto_ixmm_format_selects_ixmm(monkeypatch):
     assert _resolve_auto(hs, w13_weight_dtype=torch.uint8) == "ixmm"
 
 
-def test_resolve_backend_explicit_ixmm_rejects_original_layout():
+def test_resolve_backend_explicit_ixmm_rejects_original_layout(monkeypatch):
+    import vllm_iluvatar.ilu_util.arch as arch
+
+    monkeypatch.setattr(arch, "is_ivcore30", lambda: True)
     hs = _FakeHidden(is_cuda=True)
     match = (
         "device architecture is not ivcore30"

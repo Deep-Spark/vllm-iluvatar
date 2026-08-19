@@ -4,7 +4,7 @@
 ILU override implementation for Attention quantization support.
 
 Target   : FullAttentionSpec / MLAAttentionSpec / KVCacheTensor
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 Why      : Iluvatar attention quantization Int8 support.
            Provide meta information for allocating kv cache scales and adjust the num gpu blocks.
 How      : FullAttentionSpec: add two properties and replace one property for kv cache calculation.

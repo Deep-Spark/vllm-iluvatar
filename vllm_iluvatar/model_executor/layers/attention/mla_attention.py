@@ -5,7 +5,7 @@
 Corresponds to: vllm/model_executor/layers/attention/mla_attention.py
 
 Target   : ``MLAAttention`` instances created by the plugin MLA wrapper.
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 Why      : Iluvatar MLA backends apply rope/cache updates inside the backend
            ``forward_full`` path and need speculative-decode decode rows expanded
            to token granularity. Keep those deltas out of community vLLM.

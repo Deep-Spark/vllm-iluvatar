@@ -5,7 +5,7 @@ Corresponds to:
     vllm/v1/attention/ops/vit_attn_wrappers.py
 
 Baseline:
-    main_61ac3680210.
+    main_6e448d0.
 Why:
     Iluvatar's Qwen2.5-VL OOT model fuses packed QKV split, rotary, and
     head-dim padding before calling the community MM encoder attention op.

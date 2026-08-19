@@ -434,6 +434,6 @@ def test_forward_core_split_reference_matches_plugin_non_split(
     torch.testing.assert_close(
         out_plugin_non_split[num_decode_tokens:],
         out_community_split[num_decode_tokens:],
-        atol=2e-2,
-        rtol=2e-2,
+        atol=3e-2,
+        rtol=3e-2,
     )

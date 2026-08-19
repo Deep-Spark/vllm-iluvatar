@@ -31,7 +31,7 @@ Remove   : When upstream offers rank-synchronized prefill scheduling and a
            bounded post-completion input-queue wait.
 
 This module also contains the PP + speculative-decode wrappers corresponding
-to the ``main_61ac3680210`` baseline.
+to the ``main_6e448d0`` baseline.
 """
 
 from __future__ import annotations

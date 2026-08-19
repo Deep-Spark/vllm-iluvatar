@@ -5,7 +5,7 @@ Corresponds to: vllm/model_executor/layers/attention/attention.py
 Target   : vllm.model_executor.layers.attention.attention.Attention.__init__,
            vllm.model_executor.layers.attention.attention.Attention.forward,
            Attention.process_weights_after_loading
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 Why      : CoreX TorchDynamo cannot trace the community ``torch.Size`` call
            used by Attention's default output-shape allocation path. Ixformer
            torch ops also require the community opaque attention custom-op

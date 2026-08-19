@@ -9,7 +9,7 @@ guards, binding) lives in
 ``register_general``.
 
 Target   : vllm.v1.engine.core_client.DPLBAsyncMPClient.get_core_engine_for_request
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 Why      : The community LB relies on coordinator-reported (waiting, running)
            counts that lag ~100 ms.  Exact-inflight removes that lag for one
            client; global round-robin gives stable request distribution across

@@ -5,7 +5,7 @@ Corresponds to: vllm/model_executor/models/glm4_moe_lite.py
 
 Target   : vllm.model_executor.models.glm4_moe_lite.Glm4MoeLiteForCausalLM
            (arch "Glm4MoeLiteForCausalLM")
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 Why      : GLM-4.7-Flash on Iluvatar needs bf16 MoE router logits for the
            ixformer grouped-topk kernel.
 How      : Use the official ``ModelRegistry.register_model`` hook. The subclass

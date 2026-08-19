@@ -10,7 +10,7 @@ The override implementation lives in ``vllm_iluvatar.config.speculative``; this
 module only performs register-time wiring.
 
 Target   : vllm.config.speculative.SpeculativeConfig.hf_config_override
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 Why      : re-point the MTP draft architecture to the iluvatar self-contained
            MTP models (DeepseekV32MTPModel / IluGlmMoeDsaMTPModel /
            DeepSeekV4MTPModel) for iluvatar-routed target archs, without

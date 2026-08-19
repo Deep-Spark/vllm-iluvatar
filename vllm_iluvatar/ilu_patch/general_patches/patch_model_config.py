@@ -10,7 +10,7 @@ The override implementation lives in ``vllm_iluvatar.model_executor.models.confi
 this module only performs register-time wiring.
 
 Target   : vllm.model_executor.models.config.Gemma4Config.verify_and_update_config
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 Why      : keep community vLLM on its upstream Gemma4 fallback while selecting the
            Iluvatar-preferred FLASH_ATTN fallback from the plugin package.
 How      : wrap the staticmethod after community config module import; the wrapper

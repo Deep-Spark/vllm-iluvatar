@@ -7,7 +7,7 @@ ILU general-plugins patch, auto-discovered from the centralized
 ``ilu_patch.general_patches`` package during ``register_general``.
 
 Target   : vllm.v1.engine.core_client.DPLBAsyncMPClient.get_core_engine_for_request
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 Why      : The community LB relies on coordinator-reported (waiting, running)
            counts that lag ~100 ms.  With a single API server
            (``client_count == 1``) the client already holds an exact, real-time
@@ -38,7 +38,7 @@ from vllm_iluvatar.ilu_patch import general_patch as p
 # DPLBAsyncMPClient.get_core_engine_for_request (4-space method indent),
 # used as the drift anchor by the fingerprint guard.
 #
-# Baseline: main_61ac3680210
+# Baseline: main_6e448d0
 GET_CORE_ENGINE_FOR_REQUEST = """\
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.

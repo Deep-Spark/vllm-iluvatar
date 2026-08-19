@@ -10,7 +10,7 @@ mask. Iluvatar Triton can keep that reduction as ``int1``, which conflicts with
 the discarded-request branch. This mirrored kernel keeps the upstream logic but
 pins ``valid_count`` to int32 on both branches.
 
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 """
 
 from __future__ import annotations

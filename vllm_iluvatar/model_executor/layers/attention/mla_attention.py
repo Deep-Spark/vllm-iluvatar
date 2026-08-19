@@ -19,6 +19,7 @@ Remove   : when upstream exposes backend-owned rope/cache-update hooks and
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from types import MethodType
 from typing import TYPE_CHECKING
 
@@ -27,6 +28,7 @@ import vllm.envs as envs
 import vllm.model_executor.layers.attention.mla_attention as _mla
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
     from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 
 
@@ -34,6 +36,22 @@ _COMMUNITY_FORWARD = _mla.MLAAttention.forward
 _COMMUNITY_PROCESS_WEIGHTS_AFTER_LOADING = (
     _mla.MLAAttention.process_weights_after_loading
 )
+
+
+def wrap_determine_chunked_prefill_workspace_size(
+    community_func: Callable[["VllmConfig"], int],
+) -> Callable[["VllmConfig"], int]:
+    """Cap workspace rows at ``VLLM_ILU_MLA_CHUNKED_PREFILL_MAX_WS_SIZE``."""
+
+    def determine_chunked_prefill_workspace_size(vllm_config: "VllmConfig") -> int:
+        original_size = community_func(vllm_config)
+        max_ws = envs.VLLM_ILU_MLA_CHUNKED_PREFILL_MAX_WS_SIZE
+        if max_ws > 0:
+            return min(original_size, max_ws)
+        return original_size
+
+    return determine_chunked_prefill_workspace_size
+
 
 
 def install_ilu_mla_attention_overrides(

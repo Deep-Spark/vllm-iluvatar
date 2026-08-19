@@ -8,7 +8,7 @@ Target   : vllm.v1.core.kv_cache_utils.get_kv_cache_configs
            vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
            vllm.v1.core.kv_cache_utils._get_kv_cache_config_packed
            vllm.v1.core.kv_cache_utils._pool_bytes_per_block
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 Why      : Iluvatar attention quantization Int8 support.
            For allocating kv cache scales and adjust the num gpu blocks.
            DeepSeek-V4 cannot use the community packed layout, which lets cache

@@ -8,7 +8,7 @@ Target:
     vllm.model_executor.models.qwen3_vl_moe.Qwen3VLMoeForConditionalGeneration
     (arch "Qwen3VLMoeForConditionalGeneration").
 Baseline:
-    main_61ac3680210.
+    main_6e448d0.
 Why:
     Some Qwen3-VL-MoE text configs do not carry ``architectures``. The normal
     Iluvatar vLLM baseline constructs the embedded language model with

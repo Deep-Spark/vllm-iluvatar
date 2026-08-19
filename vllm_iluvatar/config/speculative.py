@@ -12,7 +12,7 @@ models ship dedicated, self-contained MTP draft archs
 them *after* the public routing runs, keyed on the target model's original
 architecture, so the community MTP path stays untouched for non-ilu models.
 
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 """
 
 from __future__ import annotations

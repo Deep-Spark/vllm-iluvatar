@@ -577,7 +577,7 @@ class IluvatarGPUModelRunner(GPUModelRunner):
 # (SchedulerOutput, CachedRequestState, torch, ...) that are intentionally
 # undefined in this file -- hence the module-level ``ruff: noqa: F821``.
 #
-# Baseline: main_61ac3680210. Re-sync the copies and baselines before moving to
+# Baseline: main_6e448d0. Re-sync the copies and baselines before moving to
 # a newer community vLLM revision. Enabled only when ``VLLM_ILU_ENABLE_PP_MTP=1``.
 # =============================================================================
 
@@ -2043,6 +2043,7 @@ def _dummy_run(
     is_graph_capturing: bool = False,
     num_active_loras: int = 0,
     profile_seq_lens: int | None = None,
+    randomize_inputs: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Run a dummy forward pass to warm up/profile run or capture the
@@ -2272,7 +2273,13 @@ def _dummy_run(
                 num_reqs=num_reqs_padded,
                 max_query_len=max_query_len,
                 ubatch_slices=(ubatch_slices_padded if pad_attn else ubatch_slices),
-                for_cudagraph_capture=is_graph_capturing,
+                # FULL replay reads capture-time metadata buffers. Re-stage them
+                # from the zeroed dummy block tables instead of retaining state
+                # indices from the previous real batch.
+                for_cudagraph_capture=(
+                    is_graph_capturing
+                    or cudagraph_runtime_mode == CUDAGraphMode.FULL
+                ),
                 slot_mappings=slot_mappings_by_group,
                 use_spec_decode=self.speculative_config is not None,
             )
@@ -2334,7 +2341,9 @@ def _dummy_run(
                 num_tokens_across_dp[:] = num_tokens_padded
 
         with (
-            self.maybe_randomize_inputs(input_ids, inputs_embeds),
+            self.maybe_randomize_inputs(
+                input_ids, inputs_embeds, randomize_inputs=randomize_inputs
+            ),
             set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -2447,6 +2456,7 @@ def _ilu__dummy_run(
     is_graph_capturing: bool = False,
     num_active_loras: int = 0,
     profile_seq_lens: int | None = None,
+    randomize_inputs: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Run a dummy forward pass to warm up/profile run or capture the
@@ -2675,7 +2685,13 @@ def _ilu__dummy_run(
                 num_reqs=num_reqs_padded,
                 max_query_len=max_query_len,
                 ubatch_slices=(ubatch_slices_padded if pad_attn else ubatch_slices),
-                for_cudagraph_capture=is_graph_capturing,
+                # FULL replay reads capture-time metadata buffers. Re-stage them
+                # from the zeroed dummy block tables instead of retaining state
+                # indices from the previous real batch.
+                for_cudagraph_capture=(
+                    is_graph_capturing
+                    or cudagraph_runtime_mode == CUDAGraphMode.FULL
+                ),
                 slot_mappings=slot_mappings_by_group,
                 use_spec_decode=self.speculative_config is not None,
             )
@@ -2735,7 +2751,9 @@ def _ilu__dummy_run(
                 num_tokens_across_dp[:] = num_tokens_padded
 
         with (
-            self.maybe_randomize_inputs(input_ids, inputs_embeds),
+            self.maybe_randomize_inputs(
+                input_ids, inputs_embeds, randomize_inputs=randomize_inputs
+            ),
             set_forward_context(
                 attn_metadata,
                 self.vllm_config,

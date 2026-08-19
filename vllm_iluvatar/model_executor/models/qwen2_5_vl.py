@@ -7,7 +7,7 @@ Corresponds to:
 Target:
     ``Qwen2_5_VLForConditionalGeneration``.
 Baseline:
-    main_61ac3680210.
+    main_6e448d0.
 Why:
     The fork fused QKV split, rotary, and head-dim padding for Qwen2.5-VL ViT
     attention, and accepted CUDA-graph ``max_seqlen`` metadata that may arrive as

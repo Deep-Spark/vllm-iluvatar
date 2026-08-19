@@ -3,7 +3,7 @@
 
 Corresponds to: vllm/model_executor/models/step3p5.py
 Target   : arch ``Step3p5ForCausalLM``
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 Why      : Iluvatar W8A8 uses fused dynamic-INT8 norm outputs, fused Q/K
            RMSNorm and head-wise gating kernels, and must transport the residual
            stream across pipeline-parallel ranks. DP/EP MoE must use the same

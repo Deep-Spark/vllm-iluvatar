@@ -5,7 +5,7 @@ Corresponds to: vllm/model_executor/layers/activation.py
 
 Target   : vllm.model_executor.layers.activation activation CustomOps that call
            ``torch.ops._C`` on CUDA-like platforms.
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 Why      : Iluvatar activation kernels are exposed through the plugin's
            ``vllm._custom_ops`` overrides rather than community ``torch.ops._C``
            registrations.

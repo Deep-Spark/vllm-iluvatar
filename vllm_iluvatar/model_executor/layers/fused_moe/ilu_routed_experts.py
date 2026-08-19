@@ -6,7 +6,7 @@
 Iluvatar OOT replacement for routed expert weight loading.
 
 Target     : vllm.model_executor.layers.fused_moe.routed_experts.RoutedExperts
-Baseline   : main_61ac3680210 ``RoutedExperts.weight_loader`` and
+Baseline   : main_6e448d0 ``RoutedExperts.weight_loader`` and
              ``RoutedExperts.load_weights``
 Why        : preserve the fork's MoE loading deltas without editing community
              vLLM source.
@@ -78,7 +78,6 @@ _ROUTED_EXPERTS_WEIGHT_LOADER_BASELINE = """\
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
         if quant_method_name in (
-            "CompressedTensorsWNA16MarlinMoEMethod",
             "CompressedTensorsWNA16MoEMethod",
             "CompressedTensorsWNA16RDNA3MoEMethod",
             "CompressedTensorsW4A16FlydslMoEMethod",
@@ -343,7 +342,9 @@ _ROUTED_EXPERTS_LOAD_WEIGHTS_BASELINE = """\
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[str]:
         expert_mapping = self.get_expert_mapping(include_fused=True)
-        unpadded_hidden = self.moe_config.hidden_dim_unpadded
+        unpadded_hidden = (
+            self.moe_config.hidden_dim_unpadded or self.moe_config.hidden_dim
+        )
         for expert_name, loaded_weight in weights:
             qual_name = f"{self.layer_name}.{expert_name}"
             # Fused expert weights can be identified by their 3D tensors
@@ -362,17 +363,13 @@ _ROUTED_EXPERTS_LOAD_WEIGHTS_BASELINE = """\
                     # w1 and w3 share one fused tensor; use a local copy so the
                     # transpose below doesn't mutate loaded_weight across
                     # iterations (else w3 is transposed twice and wrongly chunked)
-                    fused_weight = loaded_weight
+                    fused_weight = self._orient_fused_weight(
+                        loaded_weight, shard_id, unpadded_hidden
+                    )
                     if shard_id in {"w1", "w3"}:
-                        if fused_weight.shape[-1] != unpadded_hidden:
-                            # [..., hidden, intermediate] -> [..., intermediate, hidden]
-                            fused_weight = fused_weight.transpose(-1, -2)
                         # Repurpose expert_id for deconcatenating w1 and w3
                         experts_shard = fused_weight.chunk(2, dim=1)[expert_id]
                     else:
-                        if fused_weight.shape[-2] != unpadded_hidden:
-                            # [..., intermediate, hidden] -> [..., hidden, intermediate]
-                            fused_weight = fused_weight.transpose(-1, -2)
                         experts_shard = fused_weight
                     start = 0
                 else:
@@ -555,7 +552,9 @@ class IluRoutedExperts(RoutedExperts):
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[str]:
         expert_mapping = self.get_expert_mapping(include_fused=True)
-        unpadded_hidden = self.moe_config.hidden_dim_unpadded
+        unpadded_hidden = (
+            self.moe_config.hidden_dim_unpadded or self.moe_config.hidden_dim
+        )
         quant_method_name = self.quant_method.__class__.__name__
         for expert_name, loaded_weight in weights:
             qual_name = f"{self.layer_name}.{expert_name}"
@@ -703,7 +702,6 @@ class IluRoutedExperts(RoutedExperts):
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
         if quant_method_name in (
-            "CompressedTensorsWNA16MarlinMoEMethod",
             "CompressedTensorsWNA16MoEMethod",
             "CompressedTensorsWNA16RDNA3MoEMethod",
             "CompressedTensorsW4A16FlydslMoEMethod",

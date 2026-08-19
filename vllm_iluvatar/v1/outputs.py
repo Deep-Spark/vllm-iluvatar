@@ -2,7 +2,7 @@
 """Iluvatar extensions for :mod:`vllm.v1.outputs`.
 
 Corresponds to: vllm/v1/outputs.py
-Baseline     : main_61ac3680210
+Baseline     : main_6e448d0
 
 The upstream output object is a cross-process transport contract.  PP with a
 batch queue must carry fresh speculative draft tokens in that contract instead

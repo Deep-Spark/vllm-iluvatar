@@ -6,7 +6,7 @@ Corresponds to: vllm/model_executor/layers/attention/mm_encoder_attention.py
 
 Target   : vllm.model_executor.layers.attention.mm_encoder_attention.
            MMEncoderAttention
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 Why      : CoreX ViT FlashAttention benefits from padded head dimensions and
            needs optional ixformer/sageattention INT8 paths controlled by
            Iluvatar env vars.

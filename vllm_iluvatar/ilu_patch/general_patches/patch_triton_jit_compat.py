@@ -5,7 +5,7 @@ Corresponds to:
     vllm/models/minimax_m3/common/ops/{index_topk,sparse_attn}.py
 
 Target   : ``triton.jit`` as imported through ``vllm.triton_utils``.
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 Why      : community MiniMax-M3 kernels pass
            ``do_not_specialize_on_alignment`` to ``triton.jit``. Older Triton
            builds used in the Iluvatar runtime reject that keyword at import

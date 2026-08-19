@@ -8,7 +8,7 @@ ILU general-plugins patch, auto-discovered from the centralized
 
 Target   : vllm.compilation.backends.VllmBackend.__call__,
            vllm.compilation.backends.wrap_with_cudagraph_if_needed
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 Why      : Some CoreX Torch builds invoke custom torch.compile backends with
            extra keyword arguments such as ``options``. Upstream vLLM's backend
            callable accepts only ``(graph, example_inputs)``. Also, with

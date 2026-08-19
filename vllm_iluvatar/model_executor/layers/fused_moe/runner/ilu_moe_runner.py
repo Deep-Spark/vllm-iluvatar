@@ -2,7 +2,7 @@
 """Iluvatar MoERunner — inherits community MoERunner, overrides only the
 delta methods required for corex / Iluvatar hardware.
 
-Baseline : community ``runner/moe_runner.py`` @ main_61ac3680210
+Baseline : community ``runner/moe_runner.py`` @ main_6e448d0
 Delta    : ~250 lines vs. the original 1010-line full-class copy
 
 Override summary (each marked with ``# [ILU override]`` in-line):

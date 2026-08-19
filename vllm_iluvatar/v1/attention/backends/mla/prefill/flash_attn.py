@@ -3,7 +3,7 @@
 
 Corresponds to: vllm/v1/attention/backends/mla/prefill/flash_attn.py
 Target        : FlashAttnPrefillBackend._flash_attn_varlen_diff_headdims
-Baseline      : main_61ac3680210
+Baseline      : main_6e448d0
 Why           : the paired Iluvatar runtime ``flash_attn_varlen_func`` rejects
                 the community ``output_scale`` kwarg, while ILU MLA still needs
                 the V-dim padding behavior to stay outside community vLLM.

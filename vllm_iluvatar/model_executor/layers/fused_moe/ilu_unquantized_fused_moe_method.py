@@ -6,7 +6,7 @@ Corresponds to:
 
 Target   : vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method.
            UnquantizedFusedMoEMethod
-Baseline : main_61ac3680210 + fork ILUVATAR_W16A16 delta
+Baseline : main_6e448d0 + fork ILUVATAR_W16A16 delta
 Why      : preserve the fork-only ILUVATAR_W16A16 ``ilu_apply`` dispatch without
            editing community vLLM source.
 How      : ``@UnquantizedFusedMoEMethod.register_oot()`` installs an official

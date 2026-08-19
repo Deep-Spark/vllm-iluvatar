@@ -15,12 +15,12 @@ from vllm_iluvatar.v1.outputs import install_draft_token_ids_field
 from vllm_iluvatar.v1.worker import gpu_model_runner as runner_impl
 
 _BASELINE_SHAS = {
-    "schedule": "b60b5eed705c4d84dc51be525c5350d8bb6c529607b970bfaab5a68d1904ac92",
+    "schedule": "2e35d747a76d483f899fa924dd463f81412323c93fc53ca31b209699213ac0e2",
     "update_states": "cb8fa7b1dfef46fd6e5142078a8d29ccb7ca32a2e93f4d9ead7f4eecb1a9ac7c",
     "build_attention_metadata": (
         "41580949c5c29971486dce920d4e7de2089f7a8973476c4359e719504e26a4c2"
     ),
-    "dummy_run": "c2b39a457023fb65f098f3689fccca01c74a9ab327202f72faa7e7bb6f3d58b7",
+    "dummy_run": "d70dcbf27ec5c7f0637de5020998cf7c4d44ca55f8bf2c579bba05204de46e95",
 }
 
 
@@ -48,7 +48,7 @@ def test_runner_copies_keep_pp_rank_and_intermediate_tensor_guards():
     assert "not is_last_rank" in update_states_source
     assert "get_pp_group().is_last_rank" in metadata_source
     assert "isinstance(hidden_states, IntermediateTensors)" in dummy_run_source
-    # assert "seq_lens = self.max_model_len" in dummy_run_source TODO: fix this
+    assert "seq_lens = max_query_len" in dummy_run_source
     assert "get_pp_group().is_last_rank" in dummy_run_source
 
 

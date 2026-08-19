@@ -73,7 +73,7 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoE,
+    FusedMoEFactory,
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
@@ -399,7 +399,7 @@ class IluDeepseekV4Fp8MoE(nn.Module):
         # ``quant_config.get_quant_method`` runs inside this call and decides the
         # routed-expert method; it must be ``IluDeepseekV4FP8Config`` so we get
         # ``IluMxfp4MoEMethod``. See the module docstring.
-        self.experts = FusedMoE(
+        self.experts = FusedMoEFactory(
             shared_experts=self.shared_experts,
             gate=self.gate,
             num_experts=config.n_routed_experts,

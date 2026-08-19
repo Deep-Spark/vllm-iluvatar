@@ -13,7 +13,7 @@ register-time wiring.
 Target   : vllm.model_executor.layers.utils.default_unquantized_gemm,
            vllm.model_executor.layers.linear.UnquantizedLinearMethod.
            process_weights_after_loading
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 Why      : unquantized GEMM on Iluvatar should use ixformer kernels for FP16/BF16
            inputs, while preserving the community torch path for FP32.
 How      : rebind the module-level helper with ``general_patch.rebind_module_func``

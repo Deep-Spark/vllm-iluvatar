@@ -6,7 +6,7 @@ Corresponds to:
     compressed_tensors.py
 
 Target   : Replace CompressedTensorsConfig with IluQuantConfig
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 Why      : Official CompressedTensors standards cannot cover
            distribution specific quantization implementations.
 How      : IluQuantConfig extends the CompressedTensorsConfig and

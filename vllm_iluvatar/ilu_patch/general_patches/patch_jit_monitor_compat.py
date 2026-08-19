@@ -5,7 +5,7 @@ Corresponds to: vllm/utils/jit_monitor.py
 
 Target   : vllm.utils.jit_monitor.{_setup_triton_autotuning_print,
            _setup_triton_jit_hook}
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 Why      : community jit_monitor imports ``triton.knobs`` to register Triton
            autotune/JIT hooks. Older Triton builds used in the Iluvatar runtime
            do not expose ``knobs``, so worker startup fails during

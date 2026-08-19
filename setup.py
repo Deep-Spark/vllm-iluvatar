@@ -57,6 +57,33 @@ def _load_version() -> str:
     return str(version)
 
 
+def get_requirements() -> list[str]:
+    """Resolve runtime dependencies from ``requirements/*.txt``.
+
+    Mirrors vLLM's setup.py: supports ``-r other.txt`` includes and skips blank
+    lines, comments (``#``) and pip options (``--``). torch / ixformer are
+    intentionally NOT listed (provided by the corex environment).
+    """
+    requirements_dir = ROOT_DIR / "requirements"
+
+    def _read_requirements(filename: str) -> list[str]:
+        resolved: list[str] = []
+        with open(requirements_dir / filename, encoding="utf-8") as f:
+            lines = f.read().strip().split("\n")
+        for line in lines:
+            if line.startswith("-r "):
+                resolved += _read_requirements(line.split()[1])
+            elif (
+                not line.startswith("--")
+                and not line.startswith("#")
+                and line.strip() != ""
+            ):
+                resolved.append(line.strip())
+        return resolved
+
+    return _read_requirements("common.txt")
+
+
 class CMakeExtension(Extension):
     def __init__(self, name: str, cmake_lists_dir: str = ".") -> None:
         super().__init__(name, sources=[])
@@ -237,6 +264,7 @@ EXT_MODULES = [CMakeExtension(name="vllm_iluvatar._C")]
 
 setup(
     version=_load_version(),
+    install_requires=get_requirements(),
     ext_modules=EXT_MODULES,
     cmdclass=CMDCLASS,
 )

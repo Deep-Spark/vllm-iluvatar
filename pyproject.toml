@@ -7,8 +7,8 @@ name = "vllm_iluvatar"
 description = "Iluvatar CoreX plugin package for vLLM (out-of-tree platform plugin)"
 requires-python = ">=3.10"
 # torch / ixformer are provided by the corex environment, not installed via pip.
-dependencies = []
-dynamic = ["version"]
+# Runtime deps are resolved dynamically in setup.py from requirements/*.txt.
+dynamic = ["version", "dependencies"]
 
 [project.entry-points."vllm.platform_plugins"]
 iluvatar = "vllm_iluvatar:register_platform"

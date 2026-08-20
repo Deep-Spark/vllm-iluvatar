@@ -29,7 +29,7 @@ from contextlib import nullcontext
 import ixformer.distributed as ixfd
 import torch
 from vllm import envs
-from vllm.config import get_current_vllm_config
+from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import (
     get_dp_group,
     get_ep_group,
@@ -44,12 +44,33 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm_iluvatar.model_executor.layers.fused_moe.prepare_finalize.ilu_deepep_ll import (
     VLLM_ILU_DEEPEP_USE_SCATTER,
     VLLM_ILU_LL_FUSED_AG_AR,
+    nvsm_dispatch_quant_kwargs,
 )
 
 logger = init_logger(__name__)
 
 _DS4_DECODE_EP_BACKEND = envs.VLLM_ILU_DECODE_EP_BACKEND
 _USE_FUSED_MOE = envs.VLLM_ILU_MOE_EP_LL_MOE_ALGO == "FUSED"
+_MAX_NUM_SEQS: int | None = None
+
+
+def set_max_num_seqs(max_num_seqs: int) -> None:
+    global _MAX_NUM_SEQS
+    if max_num_seqs <= 0:
+        raise ValueError("max_num_seqs must be positive")
+    _MAX_NUM_SEQS = max_num_seqs
+
+
+def _get_max_num_seqs() -> int:
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is not None:
+        return vllm_config.scheduler_config.max_num_seqs
+    if _MAX_NUM_SEQS is not None:
+        return _MAX_NUM_SEQS
+    raise RuntimeError(
+        "max_num_seqs is unavailable; call set_max_num_seqs() during "
+        "model initialization"
+    )
 
 
 class IluFusedMoEEP:
@@ -105,6 +126,17 @@ class IluFusedMoEEP:
             and self._should_use_forward_dp_ep()
         )
 
+    def _nvsm_dispatch_quant_kwargs(self) -> dict[str, object]:
+        quant_method = self.experts._quant_method
+        base_quant_method = getattr(quant_method, "old_quant_method", quant_method)
+        quant_config = base_quant_method.moe_quant_config
+        if quant_config is not None:
+            return nvsm_dispatch_quant_kwargs(quant_config)
+        return {
+            "use_int8": bool(envs.VLLM_ILU_DEEPEP_USE_INT8),
+            "use_fp8": False,
+        }
+
     def _get_forward_dp_ep_ll_all2all(self):
         from vllm_iluvatar.distributed.device_communicators.all2all import (
             DeepEPLLAll2AllManager,
@@ -144,21 +176,20 @@ class IluFusedMoEEP:
             from ixformer.distributed import nvsm_ep
 
             tp_size = get_tensor_model_parallel_world_size()
-            max_tokens_per_rank = (
-                get_current_vllm_config().scheduler_config.max_num_seqs
-            )
+            max_tokens_per_rank = _get_max_num_seqs()
             if VLLM_ILU_LL_FUSED_AG_AR or VLLM_ILU_DEEPEP_USE_SCATTER:
                 max_tokens_per_rank //= tp_size
 
+            dispatch_quant_kwargs = self._nvsm_dispatch_quant_kwargs()
             handle.buffer = nvsm_ep.nvsm_init_ep_comm(
                 max_num_tokens=max_tokens_per_rank,
                 hidden_size=moe_config.hidden_dim,
                 num_experts=moe_config.num_experts,
                 topk=moe_config.experts_per_token,
                 dtype=torch.bfloat16,
-                use_int8=bool(envs.VLLM_ILU_DEEPEP_USE_INT8),
                 group=handle.group,
                 tp_size=tp_size,
+                **dispatch_quant_kwargs,
             )
         return ll_manager, handle
 
@@ -176,10 +207,8 @@ class IluFusedMoEEP:
         from vllm.model_executor.layers.fused_moe.modular_kernel import (
             FusedMoEKernel,
         )
-        from vllm.platforms import current_platform
 
         from vllm_iluvatar.model_executor.layers.fused_moe.prepare_finalize.ilu_deepep_ll import (  # noqa: E501
-            DEEPEP_QUANT_BLOCK_SHAPE,
             DeepEPLLPrepareAndFinalize,
         )
 
@@ -197,11 +226,7 @@ class IluFusedMoEEP:
         moe_config = runner.moe_config
         ll_manager, handle = self._get_forward_dp_ep_ll_all2all()
 
-        use_fp8_dispatch = (
-            quant_config is not None
-            and quant_config.quant_dtype == current_platform.fp8_dtype()
-            and quant_config.block_shape == DEEPEP_QUANT_BLOCK_SHAPE
-        )
+        use_fp8_dispatch = bool(self._nvsm_dispatch_quant_kwargs()["use_fp8"])
         prepare_finalize = DeepEPLLPrepareAndFinalize(
             handle,
             max_tokens_per_rank=moe_config.max_num_tokens,
@@ -339,7 +364,6 @@ class IluFusedMoEEP:
                     "DeepEP LL-style modular kernel path. "
                     f"Got quant method {quant_method.__class__.__name__}."
                 )
-        shared_experts = runner.shared_experts
         shared_experts_input = hidden_states
 
         hidden_states, routed_shared_input = runner.apply_routed_input_transform(

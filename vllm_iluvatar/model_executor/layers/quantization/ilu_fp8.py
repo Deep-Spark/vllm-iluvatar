@@ -19,7 +19,8 @@ How      : ``@register_quantization_config("fp8")`` on a subclass whose
            linear layers, ``IluFp8PerChannelOnlineLinearMethod`` for online
            linear layers, and ``IluFp8MoEMethod`` for block-wise routed experts.
            Linear weights dispatch directly to FP8 GEMM/GEMV. The MoE method
-           converts weights to the ix30 FP4 layout and calls
+           converts weights to ix30 FP4. DP+EP uses
+           ``IluMoEBatchedExpertsFp8`` with FP8 activations; the legacy path calls
            ``ilu_mxfp4_fused_experts()``. Attention, KV cache and skipped layers
            delegate to ``super()``.
 Scope    : online and serialized FP8 linear layers plus block-wise FP8 routed
@@ -38,7 +39,8 @@ That format is produced by dequantising the checkpoint and re-quantising per
 compatible with the ones the MXFP4/NVFP4 compute path already accepts, so the
 whole GEMM / SwiGLU / gather pipeline is reused with no change; the only
 FP8-specific work is the block dequant in
-``preprocess_fp8_block_weight_for_ixmm`` below.
+``preprocess_fp8_block_weight_for_ixmm`` below. Both legacy and modular DP+EP
+paths consume this FP4 weight representation with FP8 activations.
 
 Why the community name (not a new ``ilu_*``)
 --------------------------------------------
@@ -62,12 +64,17 @@ import torch
 from ixformer.inference.functions.fp8 import fp8_per_token_dynamic_scaled
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
+    FusedMoEActivationFormat,
     FusedMoEMethodBase,
     FusedMoEQuantConfig,
     RoutedExperts,
     SharedExperts,
 )
+from vllm.model_executor.layers.fused_moe.config import (
+    mxfp4_w4a8_moe_quant_config,
+)
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
+    FusedMoEExpertsModular,
     FusedMoEPrepareAndFinalizeModular,
 )
 from vllm.model_executor.layers.linear import (
@@ -485,7 +492,7 @@ class IluFp8MoEMethod(Fp8MoEMethod):
         self,
         routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> FusedMoEPrepareAndFinalizeModular | None:
-        return None
+        return FusedMoEMethodBase.maybe_make_prepare_finalize(self, routing_tables)
 
     # [ILU override] Fp8MoEMethod.get_fused_moe_quant_config — delta: None. A
     # ``FusedMoEQuantConfig`` only configures a community modular kernel, which
@@ -495,7 +502,39 @@ class IluFp8MoEMethod(Fp8MoEMethod):
     def get_fused_moe_quant_config(
         self, layer: RoutedExperts
     ) -> FusedMoEQuantConfig | None:
-        return None
+        activation = getattr(layer.activation, "value", layer.activation)
+        swiglu_limit = _SWIGLUSTEP_CLAMP if activation == "swiglustep" else None
+        return mxfp4_w4a8_moe_quant_config(
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            gemm1_clamp_limit=swiglu_limit,
+        )
+
+    def select_gemm_impl(
+        self,
+        prepare_finalize: FusedMoEPrepareAndFinalizeModular,
+        layer: RoutedExperts,
+    ) -> FusedMoEExpertsModular:
+        from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8_batch_experts import (
+            IluMoEBatchedExpertsFp8,
+        )
+
+        if prepare_finalize.activation_format != FusedMoEActivationFormat.BatchedExperts:
+            raise NotImplementedError(
+                "IluMoEBatchedExpertsFp8 requires the batched activation format, "
+                f"got {prepare_finalize.activation_format}"
+            )
+        max_num_tokens = prepare_finalize.max_num_tokens_per_rank()
+        if max_num_tokens is None:
+            raise ValueError("batched FP8 experts require max_num_tokens")
+        assert self.moe_quant_config is not None
+        return IluMoEBatchedExpertsFp8(
+            moe_config=self.moe,
+            quant_config=self.moe_quant_config,
+            max_num_tokens=max_num_tokens,
+            num_dispatchers=prepare_finalize.num_dispatchers(),
+            swiglu_limit=self.moe_quant_config.gemm1_clamp_limit,
+        )
 
     # [ILU override] Fp8MoEMethod.process_weights_after_loading — delta: replace
     # community's ``select_fp8_moe_backend`` + kernel build with a block-FP8 ->

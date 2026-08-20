@@ -168,6 +168,9 @@ class IluMoERunner(MoERunner):
             and self.moe_config.in_dtype != torch.float16
             and not self.do_naive_dispatch_combine
         )
+        use_mk_internal_shared_experts = (
+            experts_order == SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
+        )
 
         self._maybe_apply_shared_experts(
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
@@ -196,9 +199,15 @@ class IluMoERunner(MoERunner):
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 shared_experts=(
-                    self._shared_experts if can_fused_shared_output else None
+                    self._shared_experts
+                    if can_fused_shared_output or use_mk_internal_shared_experts
+                    else None
                 ),
-                shared_experts_input=fused_shared_output,
+                shared_experts_input=(
+                    shared_experts_input
+                    if use_mk_internal_shared_experts
+                    else fused_shared_output
+                ),
             )
 
         self._maybe_apply_shared_experts(
@@ -207,7 +216,11 @@ class IluMoERunner(MoERunner):
         )
 
         return_shared_output = (
-            experts_order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+            experts_order
+            in (
+                SharedExpertsOrder.MK_INTERNAL_OVERLAPPED,
+                SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+            )
             or (
                 experts_order == SharedExpertsOrder.NO_OVERLAP
                 and (

@@ -6,10 +6,12 @@ Target   : arch ``Step3p5ForCausalLM``
 Baseline : main_61ac3680210
 Why      : Iluvatar W8A8 uses fused dynamic-INT8 norm outputs, fused Q/K
            RMSNorm and head-wise gating kernels, and must transport the residual
-           stream across pipeline-parallel ranks.
+           stream across pipeline-parallel ranks. DP/EP MoE must use the same
+           flatten path as DeepSeek-V4 so shared experts overlap dispatch.
 How      : Small model-owned subclasses are promoted after community
            construction and selected with ``ModelRegistry.register_model``.
-Scope    : Step3.5 on Iluvatar, including W8A8 and PP execution.
+           MoE blocks mixin ``IluFusedMoEEP`` after promotion.
+Scope    : Step3.5 on Iluvatar, including W8A8, PP, and DP/EP execution.
 Remove   : when upstream supports these Iluvatar kernel and PP contracts.
 """
 
@@ -41,6 +43,11 @@ from vllm.model_executor.models.utils import (
     make_empty_intermediate_tensors_factory,
 )
 from vllm.sequence import IntermediateTensors
+
+from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
+    IluFusedMoEEP,
+    set_max_num_seqs,
+)
 
 
 def _uses_ilu_w8a8_int8(proj: Any) -> bool:
@@ -113,7 +120,7 @@ class IluReplicatedLinear(ReplicatedLinear):
         return output.to(torch.float32), output_bias
 
 
-class IluFusedMoEBlock(_FusedMoEBlock):
+class IluFusedMoEBlock(_FusedMoEBlock, IluFusedMoEEP):
     """Community MoE block that preserves the fused W8A8 input tuple."""
 
     @staticmethod
@@ -137,7 +144,12 @@ class IluFusedMoEBlock(_FusedMoEBlock):
             hidden_states[-1] if isinstance(hidden_states, tuple) else hidden_states
         )
         num_tokens, hidden_dim = origin.shape
-        if self.experts.is_internal_router:
+        # W8A8 fused MoE input is (int8, scale, origin). forward_dp_ep expects
+        # a BF16 tensor plus optional (int8, scale, dtype), so keep the tuple
+        # on the community runner path until that packing is wired.
+        if self._should_use_forward_dp_ep() and isinstance(hidden_states, torch.Tensor):
+            final_hidden_states = self.forward_dp_ep(hidden_states)
+        elif self.experts.is_internal_router:
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
                 router_logits=hidden_states,
@@ -162,6 +174,8 @@ class IluStep3p5DecoderLayer(_Step3p5DecoderLayer):
         if layer.use_moe:
             layer.moe.__class__ = IluFusedMoEBlock
             IluFusedMoEBlock.promote(layer.moe)
+            layer.moe.prefix = f"{layer.prefix}.moe"
+            layer.moe.init_ep()
         else:
             layer.mlp.__class__ = IluStep3p5MLP
 
@@ -271,6 +285,7 @@ class IluStep3p5ForCausalLM(_Step3p5ForCausalLM):
         vllm_config: VllmConfig,
         prefix: str = "",
     ) -> None:
+        set_max_num_seqs(vllm_config.scheduler_config.max_num_seqs)
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         IluStep3p5Model.promote(self.model)
         # The community CausalLM caches this factory before ``self.model`` is

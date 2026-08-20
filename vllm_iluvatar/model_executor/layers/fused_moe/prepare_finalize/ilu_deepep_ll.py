@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -13,6 +14,7 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
 )
+from vllm.platforms import current_platform
 from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
     dbo_enabled,
@@ -24,6 +26,9 @@ from vllm_iluvatar.distributed.device_communicators.all2all import (
     BufferWrapper,
 )
 
+if TYPE_CHECKING:
+    import deep_ep
+
 logger = init_logger(__name__)
 
 DEEPEP_QUANT_BLOCK_SIZE = 128
@@ -31,6 +36,35 @@ DEEPEP_QUANT_BLOCK_SHAPE = [DEEPEP_QUANT_BLOCK_SIZE, DEEPEP_QUANT_BLOCK_SIZE]
 
 VLLM_ILU_DEEPEP_USE_SCATTER = envs.VLLM_ILU_DEEPEP_USE_SCATTER
 VLLM_ILU_LL_FUSED_AG_AR = envs.VLLM_ILU_LL_FUSED_AG_AR and envs.VLLM_ILU_DISABLE_DEEPEP
+
+
+def nvsm_dispatch_quant_kwargs(
+    quant_config: FusedMoEQuantConfig,
+) -> dict[str, object]:
+    quant_dtype = quant_config.quant_dtype
+    weight_quant_dtype = quant_config.weight_quant_dtype
+    dispatch_dtype = quant_dtype if quant_dtype is not None else weight_quant_dtype
+    use_int8 = dispatch_dtype in (torch.int8, "int4", "int8", "mxint8")
+    use_fp8 = dispatch_dtype == current_platform.fp8_dtype() or dispatch_dtype in (
+        "fp4",
+        "fp8",
+        "mxfp4",
+        "mxfp8",
+        "mxfp8_e4m3",
+        "mxfp8_e5m2",
+        "nvfp4",
+    )
+
+    kwargs: dict[str, object] = {
+        "use_int8": use_int8,
+        "use_fp8": use_fp8,
+    }
+    if use_fp8:
+        kwargs.update(
+            fp8_format=current_platform.fp8_dtype(),
+            fp8_group_size=None,
+        )
+    return kwargs
 
 
 class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
@@ -83,7 +117,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         self.buffer = buffer
         self.max_tokens_per_rank = max_tokens_per_rank
-        self.use_fp8_dispatch = False
+        self.use_fp8_dispatch = use_fp8_dispatch
         # The dispatch function returns a handle that the combine function
         # requires. We store the handle here so it is available to the
         # combine function.
@@ -101,7 +135,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.physical_to_global = _maybe_cast(physical_to_global)
         self.local_expert_global_ids = _maybe_cast(local_expert_global_ids)
 
-        self.use_int8_dispatch = envs.VLLM_ILU_DEEPEP_USE_INT8
+        self.use_int8_dispatch = False
 
         # We don't have enough information to determine if we should dispatch
         # activation scales in a packed ue8m0 format during object construction
@@ -187,6 +221,9 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             f"Hidden Size {hidden_size} not in supported list of hidden sizes"
             f"{self.SUPPORTED_HIDDEN_SIZES}"
         )
+        dispatch_quant_kwargs = nvsm_dispatch_quant_kwargs(quant_config)
+        self.use_int8_dispatch = bool(dispatch_quant_kwargs["use_int8"])
+        self.use_fp8_dispatch = bool(dispatch_quant_kwargs["use_fp8"])
 
         a2a_idx = dbo_current_ubatch_id()
 
@@ -205,8 +242,6 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 if self.buffer.buffer is None:
                     tp_size = get_tensor_model_parallel_world_size()
                     max_tokens_per_rank = self.max_tokens_per_rank
-                    if VLLM_ILU_LL_FUSED_AG_AR or VLLM_ILU_DEEPEP_USE_SCATTER:
-                        max_tokens_per_rank //= tp_size
 
                     self.buffer.buffer = nvsm_ep.nvsm_init_ep_comm(
                         max_num_tokens=max_tokens_per_rank,
@@ -214,9 +249,9 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                         num_experts=num_experts,
                         topk=topk_ids.shape[1],
                         dtype=torch.bfloat16,
-                        use_int8=self.use_int8_dispatch,
                         group=self.buffer.group,
                         tp_size=tp_size,
+                        **dispatch_quant_kwargs,
                     )
                 self.buffer = self.buffer.buffer
 

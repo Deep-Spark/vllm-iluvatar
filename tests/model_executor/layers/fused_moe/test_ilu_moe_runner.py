@@ -18,6 +18,9 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
     MoERunner,
     _moe_forward_shared,
 )
+from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+    SharedExpertsOrder,
+)
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod as CommunityUnquantizedFusedMoEMethod,
 )
@@ -278,6 +281,38 @@ class TestMaybeApplyRoutedScaleToOutput:
         out_shared, out_fused = runner._maybe_apply_routed_scale_to_output(None, fused)
         assert out_shared is None
         torch.testing.assert_close(out_fused, fused)
+
+
+class TestApplyQuantMethod:
+    def test_mk_internal_overlap_runs_and_returns_shared_experts(self):
+        runner = _make_stub_runner()
+        shared_output = torch.full((2, 3), 2.0)
+        fused_output = torch.full((2, 3), 3.0)
+        shared_input = torch.full((2, 3), 1.0)
+        topk_weights = torch.full((2, 1), 0.5)
+        topk_ids = torch.zeros((2, 1), dtype=torch.int32)
+
+        runner._shared_experts._determine_shared_experts_order.return_value = (
+            SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
+        )
+        runner._shared_experts.output = shared_output
+        runner._maybe_apply_shared_experts = MagicMock()
+        runner.router = MagicMock()
+        runner.router.select_experts.return_value = (topk_weights, topk_ids)
+        runner.routed_experts.quant_method.is_monolithic = False
+        runner.routed_experts.forward_modular.return_value = fused_output
+
+        returned_shared, returned_fused = runner._apply_quant_method(
+            hidden_states=shared_input,
+            router_logits=torch.zeros((2, 4)),
+            shared_experts_input=shared_input,
+        )
+
+        call_kwargs = runner.routed_experts.forward_modular.call_args.kwargs
+        assert call_kwargs["shared_experts"] is runner._shared_experts
+        assert call_kwargs["shared_experts_input"] is shared_input
+        assert returned_shared is shared_output
+        assert returned_fused is fused_output
 
 
 class TestDoNaiveDispatchCombine:

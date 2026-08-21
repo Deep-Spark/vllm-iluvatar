@@ -6,7 +6,7 @@
     128,
     128
   ],
-  "none_moe_weight_block_size": null,
+  "none_moe_weight_block_size": false,
   "gemm_format": "tn",
   "modules_to_not_convert": [
     "lm_head",

@@ -1,0 +1,16 @@
+{
+  "activation_scheme": "dynamic",
+  "fmt": "float8_e4m3fn",
+  "quant_method": "fp8",
+  "weight_block_size": [
+    128,
+    128
+  ],
+  "none_moe_use_weight_block_size": false,
+  "gemm_format": "tn",
+  "modules_to_not_convert": [
+    "gate",
+    "e_score_correction_bias",
+    "lm_head"
+  ]
+}

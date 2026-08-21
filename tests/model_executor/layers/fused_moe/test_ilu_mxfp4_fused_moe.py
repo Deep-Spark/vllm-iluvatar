@@ -30,6 +30,8 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+import vllm_iluvatar._C  # noqa: F401
+from conftest import COMPILED_CUDA_ARCH
 
 from vllm_iluvatar.model_executor.layers.activation import swiglu_clamp
 from vllm_iluvatar.model_executor.layers.fused_moe import (
@@ -632,7 +634,12 @@ def test_resolve_backend_auto_ixmm_format_selects_ixmm(monkeypatch):
 
 def test_resolve_backend_explicit_ixmm_rejects_original_layout():
     hs = _FakeHidden(is_cuda=True)
-    with pytest.raises(RuntimeError, match="preprocess_weight_for_ixmm"):
+    match = (
+        "device architecture is not ivcore30"
+        if COMPILED_CUDA_ARCH != "ivcore30"
+        else "preprocess_weight_for_ixmm"
+    )
+    with pytest.raises(RuntimeError, match=match):
         _resolve_backend(
             "ixmm",
             hs,

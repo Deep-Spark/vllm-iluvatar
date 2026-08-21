@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "name": "minimax_m25_fp8",
+  "model_config_patch": {
+    "compression_config": null
+  },
+  "default_action": "keep",
+  "rules": [
+    {
+      "id": "drop_consumed_scale",
+      "priority": 1000,
+      "match": {
+        "regex": [
+          "\\.self_attn\\.(q_proj|k_proj|v_proj|o_proj)\\.weight_scale_inv$"
+        ]
+      },
+      "action": "drop"
+    },
+    {
+      "id": "routed_fp8_to_w4a8",
+      "priority": 900,
+      "match": {
+        "regex": [
+          "\\.block_sparse_moe\\.experts\\.\\d+\\.w[123]\\.weight$"
+        ],
+        "dtypes": [
+          "float8_e4m3fn"
+        ]
+      },
+      "action": "keep"
+    },
+    {
+      "id": "dense_fp8_to_w8a8",
+      "priority": 800,
+      "match": {
+        "regex": [
+          "\\.self_attn\\.(q_proj|k_proj|v_proj|o_proj)\\.weight$"
+        ],
+        "dtypes": [
+          "float8_e4m3fn"
+        ]
+      },
+      "action": "convert",
+      "scale": {
+        "from_suffix": ".weight",
+        "to_suffix": ".weight_scale_inv"
+      },
+      "dequant": {
+        "method": "fp8_block",
+        "options": {
+          "block_size": 128
+        }
+      },
+      "quant": {
+        "method": "fp8_per_channel",
+        "options": {
+          "dtype": "float8_e4m3fn",
+          "gemm_format": "TN",
+          "transport": false
+        }
+      },
+      "outputs": {
+        "weight_scale": ".weight_scale"
+      }
+    }
+  ]
+}

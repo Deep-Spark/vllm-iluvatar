@@ -20,12 +20,12 @@ import numpy as np
 import torch
 import vllm.envs as envs
 from ixformer.contrib.vllm_flash_attn import (
-    flash_attn_varlen_fp8_func,
     flash_attn_varlen_func,
     flash_attn_varlen_int8_func,
     flash_attn_with_kvcache,
     merge_attn_states,
 )
+from ixformer.inference.functions import flash_attn_varlen_fp8_func
 from vllm import _custom_ops as ops  # type: ignore[import]
 from vllm.config import (
     VllmConfig,

@@ -59,13 +59,14 @@ def test_rms_norm(
 ) -> None:
     torch.manual_seed(seed)
     device = "cuda:0"
-    torch.set_default_device(device)
 
-    weight = torch.empty(hidden_size, dtype=dtype).normal_(mean=1.0, std=0.1)
+    weight = torch.empty(hidden_size, dtype=dtype, device=device).normal_(
+        mean=1.0, std=0.1
+    )
     epsilon = 1e-6
     scale = 1 / (2 * hidden_size)
     last_dim = 2 * hidden_size if strided_input else hidden_size
-    x = torch.randn(num_tokens, last_dim, dtype=dtype)
+    x = torch.randn(num_tokens, last_dim, dtype=dtype, device=device)
     x = x[..., :hidden_size]
     assert x.is_contiguous() != strided_input
     x *= scale
@@ -85,9 +86,13 @@ def test_rms_norm_opcheck(dtype: torch.dtype) -> None:
     """torch.library.opcheck: schema/alias/fake consistency for rms_norm."""
     opcheck = torch.library.opcheck
 
-    torch.set_default_device("cuda:0")
+    device = "cuda:0"
     hidden_size = 768
-    weight = torch.empty(hidden_size, dtype=dtype).normal_(mean=1.0, std=0.1)
-    x = torch.randn(83, hidden_size, dtype=dtype) * (1 / (2 * hidden_size))
+    weight = torch.empty(hidden_size, dtype=dtype, device=device).normal_(
+        mean=1.0, std=0.1
+    )
+    x = torch.randn(83, hidden_size, dtype=dtype, device=device) * (
+        1 / (2 * hidden_size)
+    )
     out = torch.empty_like(x)
     opcheck(torch.ops._C.rms_norm, (out, x, weight, 1e-6))

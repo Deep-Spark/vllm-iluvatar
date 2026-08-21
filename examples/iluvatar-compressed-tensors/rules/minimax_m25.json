@@ -20,8 +20,12 @@
       "id": "routed_fp8_to_w4a8",
       "priority": 900,
       "match": {
-        "regex": ["\\.block_sparse_moe\\.experts\\.\\d+\\.w[123]\\.weight$"],
-        "dtypes": ["float8_e4m3fn"]
+        "regex": [
+          "\\.block_sparse_moe\\.experts\\.\\d+\\.w[123]\\.weight$"
+        ],
+        "dtypes": [
+          "float8_e4m3fn"
+        ]
       },
       "action": "convert",
       "work_device": "cuda",
@@ -31,7 +35,9 @@
       },
       "dequant": {
         "method": "fp8_block",
-        "options": {"block_size": 128}
+        "options": {
+          "block_size": 128
+        }
       },
       "quant": {
         "method": "int4_moe",
@@ -42,9 +48,6 @@
           "pack_version": 2,
           "scale_layout": "row"
         }
-      },
-      "iluvatar": {
-        "wna16_use_w4a8": false
       },
       "outputs": {
         "weight_scale": ".weight_scale",
@@ -59,7 +62,9 @@
         "regex": [
           "\\.self_attn\\.(q_proj|k_proj|v_proj|o_proj)\\.weight$"
         ],
-        "dtypes": ["float8_e4m3fn"]
+        "dtypes": [
+          "float8_e4m3fn"
+        ]
       },
       "action": "convert",
       "scale": {
@@ -68,7 +73,9 @@
       },
       "dequant": {
         "method": "fp8_block",
-        "options": {"block_size": 128}
+        "options": {
+          "block_size": 128
+        }
       },
       "quant": {
         "method": "int8_per_channel",
@@ -82,7 +89,9 @@
         "mixed_strategy": "CHANNEL",
         "gemm_mode": "PERF"
       },
-      "outputs": {"weight_scale": ".weight_scale"}
+      "outputs": {
+        "weight_scale": ".weight_scale"
+      }
     }
   ]
 }

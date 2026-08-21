@@ -490,6 +490,10 @@ class IluRoutedExperts(RoutedExperts):
                     )
                 if fused_weight.shape[-1] == 2:
                     fused_weight = fused_weight.transpose(-1, -2)
+                if fused_weight.shape[-1] == 2 * self.moe_config.intermediate_size:
+                    fused_weight = fused_weight.narrow(
+                        -1, 0, self.moe_config.intermediate_size
+                    )
                 assert fused_weight.shape[-1] == self.moe_config.intermediate_size
                 assert fused_weight.shape[-2] == 2
                 return fused_weight.chunk(2, dim=-2)[expert_id]

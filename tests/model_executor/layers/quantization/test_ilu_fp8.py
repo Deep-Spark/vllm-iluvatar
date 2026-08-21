@@ -26,6 +26,7 @@ import sys
 import types
 
 import pytest
+import torch
 
 
 def _install_fake_ixformer(monkeypatch) -> None:
@@ -187,3 +188,37 @@ def test_method_init_skips_backend_selection(monkeypatch):
     assert method.maybe_make_prepare_finalize() is None
     assert method.get_fused_moe_quant_config(layer) is None
     assert not hasattr(method, "experts_cls")
+
+
+def test_preprocess_pads_k_to_ixmm_group_boundary(monkeypatch):
+    mod = _load_ilu_fp8(monkeypatch)
+
+    captured = {}
+
+    def _quantize_fp4(x):
+        captured["normalized"] = x
+        return torch.zeros_like(x, dtype=torch.uint8)
+
+    fake_gemm = types.SimpleNamespace(
+        _quantize_fp4=_quantize_fp4,
+        _pack_nibbles_ix30=lambda x: x[:, ::2, :],
+        preprocess_group_scale_for_running_acc=lambda x: x,
+    )
+    fp4_module = types.ModuleType("ixformer.inference.functions.fp4")
+    gemm_module = types.ModuleType("ixformer.inference.functions.fp4.gemm")
+    gemm_module.gemm = fake_gemm
+    monkeypatch.setitem(sys.modules, "ixformer.inference.functions.fp4", fp4_module)
+    monkeypatch.setitem(
+        sys.modules, "ixformer.inference.functions.fp4.gemm", gemm_module
+    )
+
+    weight = torch.ones((1, 2, 640), dtype=torch.float32)
+    scale_inv = torch.ones((1, 1, 5), dtype=torch.float32)
+    ixmm_weight, ixmm_scale = mod.preprocess_fp8_block_weight_for_ixmm(
+        weight, scale_inv, (128, 128), allow_k_padding=True
+    )
+
+    assert ixmm_weight.shape == (1, 384, 2)
+    assert ixmm_scale.shape == (1, 3, 2)
+    assert captured["normalized"].shape == (1, 768, 2)
+    assert torch.count_nonzero(captured["normalized"][:, 640:, :]) == 0

@@ -7,9 +7,22 @@ import pytest
 import torch
 import torch.library
 import vllm_iluvatar._C  # noqa: F401
+from conftest import COMPILED_CUDA_ARCH
 
 if not torch.cuda.is_available():
     pytest.skip("Iluvatar/CUDA device required", allow_module_level=True)
+
+# The FP8 E4M3 cache/quant kernels exist on ivcore30 only; elsewhere the ops
+# stay bound but raise, so each direction gets its own gate.
+ON_FP8_ARCH = COMPILED_CUDA_ARCH == "ivcore30"
+requires_fp8_arch = pytest.mark.skipif(
+    not ON_FP8_ARCH,
+    reason=f"FP8 kernels need an ivcore30 build, got {COMPILED_CUDA_ARCH}",
+)
+requires_non_fp8_arch = pytest.mark.skipif(
+    ON_FP8_ARCH,
+    reason="only meaningful on a build without the ivcore30 FP8 kernels",
+)
 
 NUM_TOKENS = [1, 17, 128]
 NUM_HEADS = [16]
@@ -28,6 +41,8 @@ def _make_tensor(
         tensor = torch.empty(shape, dtype=dtype, device="cuda")
     if dtype == torch.int8:
         tensor.random_(-128, 128)
+    elif dtype == torch.float8_e4m3fn:
+        tensor.copy_(torch.randn(shape, dtype=torch.bfloat16, device="cuda"))
     else:
         tensor.normal_()
     # PyTorch ignores the stride of singleton dimensions when determining
@@ -47,6 +62,8 @@ def _make_cache(
         cache = torch.empty(shape, dtype=dtype, device="cuda")
     if dtype == torch.int8:
         cache.random_(-128, 128)
+    elif dtype == torch.float8_e4m3fn:
+        cache.copy_(torch.randn(shape, dtype=torch.bfloat16, device="cuda"))
     else:
         cache.normal_()
     assert cache.is_contiguous() != strided
@@ -242,3 +259,164 @@ def test_reshape_and_cache_opcheck(op_name: str, value_dtype: torch.dtype) -> No
             slot_mapping,
         ),
     )
+
+
+@requires_fp8_arch
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("head_size", [13, 128])
+@pytest.mark.parametrize("strided_input", [False, True])
+@pytest.mark.parametrize("scale_value", [0.125, 0.001])
+@torch.inference_mode()
+def test_static_scaled_fp8_quant(
+    dtype: torch.dtype,
+    head_size: int,
+    strided_input: bool,
+    scale_value: float,
+) -> None:
+    torch.manual_seed(43)
+    num_tokens, num_heads = 17, 16
+    storage = torch.randn(
+        num_tokens,
+        2,
+        num_heads,
+        head_size,
+        dtype=dtype,
+        device="cuda",
+    )
+    input_tensor = storage[:, 0]
+    if not strided_input:
+        input_tensor = input_tensor.contiguous()
+
+    scale = torch.tensor([scale_value], dtype=torch.float32, device="cuda")
+    output = torch.empty(
+        input_tensor.shape,
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    reference = (
+        (input_tensor.float() / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+    )
+
+    torch.ops._C.static_scaled_fp8_quant(output, input_tensor, scale)
+
+    torch.testing.assert_close(output.float(), reference.float(), rtol=0, atol=0)
+
+
+@requires_fp8_arch
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_tokens", [1, 17, 128, 1024])
+@pytest.mark.parametrize("diff_kv", [True, False])
+@pytest.mark.parametrize("strided_cache", [True, False])
+@pytest.mark.parametrize("num_padded_tokens", [0, 7])
+@torch.inference_mode()
+def test_reshape_and_cache_fp8(
+    dtype: torch.dtype,
+    num_tokens: int,
+    diff_kv: bool,
+    strided_cache: bool,
+    num_padded_tokens: int,
+) -> None:
+    torch.manual_seed(43)
+    num_heads, head_size = 16, 128
+    num_blocks, block_size = 64, 16
+    fp8_dtype = torch.float8_e4m3fn
+
+    # unbind keeps the ixformer test's padded token stride while the last two
+    # dimensions remain contiguous. Extra rows reproduce V1 CUDA-graph padding:
+    # slot_mapping still describes only the real tokens that should be cached.
+    kv = torch.randn(
+        num_tokens + num_padded_tokens,
+        2,
+        num_heads,
+        head_size,
+        dtype=dtype,
+        device="cuda",
+    )
+    key, value = kv.unbind(dim=1)
+    if diff_kv:
+        value = value[..., :96]
+
+    cache_shape = (num_blocks, num_heads, block_size, head_size)
+    key_cache = _make_cache(cache_shape, fp8_dtype, strided_cache)
+    value_cache = _make_cache(cache_shape, fp8_dtype, strided_cache)
+    slot_mapping = _make_slot_mapping(num_tokens, num_blocks, block_size)
+    key_scale = torch.tensor([0.125], dtype=torch.float32, device="cuda")
+    value_scale = torch.tensor([0.25], dtype=torch.float32, device="cuda")
+
+    ref_key_cache = key_cache.clone()
+    ref_value_cache = value_cache.clone()
+    fp8_max = torch.finfo(fp8_dtype).max
+    quantized_key = (key.float() / key_scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+    quantized_value = (
+        (value.float() / value_scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+    )
+    valid = slot_mapping >= 0
+    token_indices = torch.where(valid)[0]
+    slots = slot_mapping[valid]
+    block_indices = torch.div(slots, block_size, rounding_mode="floor")
+    block_offsets = slots % block_size
+    ref_key_cache[block_indices, :, block_offsets, :] = quantized_key[token_indices]
+    ref_value_cache[block_indices, :, block_offsets, : value.size(2)] = quantized_value[
+        token_indices
+    ]
+
+    torch.ops._C.reshape_and_cache_fp8(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        "fp8",
+        key_scale,
+        value_scale,
+    )
+
+    torch.testing.assert_close(key_cache.float(), ref_key_cache.float(), rtol=0, atol=0)
+    torch.testing.assert_close(
+        value_cache.float(), ref_value_cache.float(), rtol=0, atol=0
+    )
+
+
+def test_fp8_ops_are_bound_on_every_arch() -> None:
+    """The FP8 kernels are ivcore30-only, but their schemas never disappear."""
+    assert COMPILED_CUDA_ARCH in ("ivcore10", "ivcore11", "ivcore20", "ivcore30")
+    assert hasattr(torch.ops._C, "static_scaled_fp8_quant")
+    assert hasattr(torch.ops._C, "reshape_and_cache_fp8")
+
+
+@requires_non_fp8_arch
+@torch.inference_mode()
+def test_fp8_ops_raise_without_ivcore30_kernels() -> None:
+    """Off ivcore30 the bound ops must fail loudly, naming the missing arch."""
+    num_tokens, num_heads, head_size = 4, 2, 128
+    num_blocks, block_size = 2, 16
+    fp8_dtype = torch.float8_e4m3fn
+
+    key = torch.randn(
+        num_tokens, num_heads, head_size, dtype=torch.float16, device="cuda"
+    )
+    value = torch.randn_like(key)
+    cache_shape = (num_blocks, num_heads, block_size, head_size)
+    # Left uninitialised: writing FP8 values needs the very kernels this build
+    # lacks, and the ops must reject the call before touching the buffers.
+    key_cache = torch.empty(cache_shape, dtype=fp8_dtype, device="cuda")
+    value_cache = torch.empty(cache_shape, dtype=fp8_dtype, device="cuda")
+    quantized = torch.empty(key.shape, dtype=fp8_dtype, device="cuda")
+    slot_mapping = _make_slot_mapping(num_tokens, num_blocks, block_size)
+    scale = torch.tensor([0.125], dtype=torch.float32, device="cuda")
+
+    with pytest.raises(RuntimeError, match="ivcore30"):
+        torch.ops._C.static_scaled_fp8_quant(quantized, key, scale)
+
+    with pytest.raises(RuntimeError, match="ivcore30"):
+        torch.ops._C.reshape_and_cache_fp8(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            "fp8",
+            scale,
+            scale,
+        )

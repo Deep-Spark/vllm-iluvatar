@@ -12,6 +12,8 @@ Why      : Official CompressedTensors standards cannot cover
 How      : IluQuantConfig extends the CompressedTensorsConfig and
            overrides the get_quant_method and get_scheme methods
            to add Iluvatar specific quantization implementations.
+           Legacy ``ilu_deepseek_v4_w4a8`` checkpoints are registered on
+           the same class and rewritten to config_groups in ``from_config``.
 Scope    : register_quantization_config during file import time.
 Safety   : Mainly call super methods, unsupported schemes return the original community scheme unchanged.
 Remove   : when community compressed-tensors give an oot-like
@@ -21,7 +23,7 @@ Remove   : when community compressed-tensors give an oot-like
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, cast
+from typing import Any
 
 import torch
 from compressed_tensors.quantization import QuantizationArgs
@@ -48,44 +50,130 @@ from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes
 )
 
 logger = init_logger(__name__)
+
 QUANTIZATION_SCHEME_MAP_TYPE = dict[str, dict[str, QuantizationArgs] | None]
 _ORIGINAL_GET_SCHEME_FROM_PARTS: Callable | None = None
 
+_LEGACY_QUANT_METHOD = "ilu_deepseek_v4_w4a8"
+_DEFAULT_W8A8_ILU_PARAMS = {
+    "gemm_format": "TN",
+    "mixed_strategy": "CHANNEL",
+    "gemm_mode": "PERF",
+}
 
-@register_quantization_config("iluvatar-compressed-tensors")
+
+def _is_legacy_ilu_deepseek_v4_w4a8(config: dict[str, Any]) -> bool:
+    if config.get("quant_method") == _LEGACY_QUANT_METHOD:
+        return True
+    return "config_groups" not in config and "routed_experts" in config
+
+
+def _legacy_tensor_args(
+    section: dict[str, Any], *, dynamic_default: bool
+) -> dict[str, Any]:
+    return {
+        "num_bits": int(section["num_bits"]),
+        "type": section.get("type", "int"),
+        "symmetric": bool(section.get("symmetric", True)),
+        "strategy": section.get("strategy", "channel"),
+        "group_size": section.get("group_size"),
+        "dynamic": bool(section.get("dynamic", dynamic_default)),
+    }
+
+
+def _legacy_input_activations(section: dict[str, Any]) -> dict[str, Any] | None:
+    act = section.get("input_activations")
+    if not act:
+        return None
+    return _legacy_tensor_args(act, dynamic_default=True)
+
+
+def _legacy_w8a8_group(targets: list[str], section: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "format": "int-quantized",
+        "targets": targets,
+        "weights": _legacy_tensor_args(section, dynamic_default=False),
+        "input_activations": _legacy_input_activations(section),
+        "output_activations": None,
+        "iluvatar": dict(_DEFAULT_W8A8_ILU_PARAMS),
+    }
+
+
+def _convert_legacy_ilu_deepseek_v4_w4a8(config: dict[str, Any]) -> dict[str, Any]:
+    """Map the removed ``ilu_deepseek_v4_w4a8`` schema onto config_groups."""
+    groups: dict[str, Any] = {}
+
+    routed = config.get("routed_experts") or {}
+    if routed:
+        groups["routed_experts"] = {
+            "targets": ["re:.*\\.experts"],
+            "weights": _legacy_tensor_args(routed, dynamic_default=False),
+            "input_activations": _legacy_input_activations(routed),
+            "output_activations": None,
+            "iluvatar": {
+                "gemm_format": str(routed.get("gemm_format", "TN")),
+                "pack_version": int(routed.get("pack_version", 2)),
+            },
+        }
+
+    shared = config.get("shared_experts") or {}
+    if shared:
+        groups["shared_experts"] = _legacy_w8a8_group(
+            ["re:.*\\.shared_expert(?:s)?(?:\\.|$)"],
+            shared,
+        )
+
+    dense = config.get("dense_linears") or {}
+    if dense and dense.get("targets"):
+        groups["dense_linears"] = _legacy_w8a8_group(list(dense["targets"]), dense)
+
+    bmm = config.get("bmm_w8a16_layers") or {}
+    if bmm and bmm.get("targets"):
+        groups["wo_a_w8a16"] = {
+            "targets": list(bmm["targets"]),
+            "weights": _legacy_tensor_args(bmm, dynamic_default=False),
+            "input_activations": None,
+            "output_activations": None,
+            "iluvatar": {
+                "method": "IluV4W8A16BMMLinearMethod",
+                "bmm_w8a16_gemm_format": str(bmm.get("gemm_format", "k16n16")),
+            },
+        }
+
+    mla_bmm = config.get("mla_bmm_w8a16") or {}
+    if mla_bmm and mla_bmm.get("targets"):
+        groups["kv_b_w8a16"] = {
+            "targets": list(mla_bmm["targets"]),
+            "weights": _legacy_tensor_args(mla_bmm, dynamic_default=False),
+            "input_activations": None,
+            "output_activations": None,
+            "iluvatar": {
+                "method": "IluGlmKVBProjW8A16Method",
+            },
+        }
+
+    ignore: list[str] = []
+    for name in list(config.get("ignore") or []) + list(
+        config.get("bf16_layers") or []
+    ):
+        if name not in ignore:
+            ignore.append(name)
+
+    ignore.append("lm_head")
+    return {
+        "quant_method": "compressed-tensors",
+        "format": "iluvatar-mixed",
+        "config_groups": groups,
+        "ignore": ignore,
+    }
+
+
+@register_quantization_config(_LEGACY_QUANT_METHOD)
+@register_quantization_config("compressed-tensors")
 class IluQuantConfig(CompressedTensorsConfig):
     """
     Custom mixed-precision quant config for Iluvatar opt quant / model.
     """
-
-    def __init__(
-        self,
-        target_scheme_map: dict[str, Any],
-        ignore: list[str],
-        quant_format: str,
-        kv_cache_scheme: dict[str, Any] | None = None,
-        config: dict[str, Any] | None = None,
-        transform_config: dict[str, Any] | None = None,
-        total_num_heads: int | None = None,
-        total_num_kv_heads: int | None = None,
-    ) -> None:
-        super().__init__(
-            target_scheme_map=target_scheme_map,
-            ignore=ignore,
-            quant_format=quant_format,
-            kv_cache_scheme=kv_cache_scheme,
-            config=config,
-            transform_config=transform_config,
-            total_num_heads=total_num_heads,
-            total_num_kv_heads=total_num_kv_heads,
-        )
-
-    @classmethod
-    def get_name(cls):  # type: ignore[override]
-        return "iluvatar-compressed-tensors"
-
-    def get_supported_act_dtypes(self) -> list[torch.dtype]:
-        return [torch.bfloat16, torch.float16]
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -93,42 +181,18 @@ class IluQuantConfig(CompressedTensorsConfig):
         # generous to let ilu Iluvatar / consumer Hopper run.
         return 75
 
-    @staticmethod
-    def get_config_filenames() -> list[str]:
-        return []
-
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> IluQuantConfig:
-        if "config_groups" in config:
-            grps_without_attn_quant = {}
-            for k, v in config["config_groups"].items():
-                # e.g. LlamaAttention, Qwen3Attention, etc.
-                if len(v["targets"]) == 1 and v["targets"][0].endswith("Attention"):
-                    logger.warning(
-                        "Skipping CompressedTensors config group for %s. Attention "
-                        "quant is coupled with KV-cache quantization in vLLM.",
-                        v["targets"][0],
-                    )
-                    continue
-                grps_without_attn_quant[k] = v
-            config["config_groups"] = grps_without_attn_quant
-
-        ignore: list[str] = cast(list[str], config.get("ignore", []))
-        quant_format = cast(str, config.get("format"))
-        target_scheme_map = cls._quantization_scheme_map_from_config(config=config)
-
-        CompressedTensorsConfig._parse_sparsity_config(config=config)
-
-        return cls(
-            target_scheme_map=target_scheme_map,
-            ignore=ignore,
-            quant_format=quant_format,
-            config=config,
-            transform_config=config.get("transform_config"),
-            kv_cache_scheme=config.get("kv_cache_scheme"),
-            total_num_heads=config.get("total_num_heads"),
-            total_num_kv_heads=config.get("total_num_kv_heads"),
-        )
+        if _is_legacy_ilu_deepseek_v4_w4a8(config):
+            logger.info_once(
+                "ilu_deepseek_v4_w4a8 is deprecated and only used for some key clients, please use compressed-tensors instead"
+            )
+            logger.info_once(
+                "Converting legacy quant_method %r to compressed-tensors",
+                _LEGACY_QUANT_METHOD,
+            )
+            config = _convert_legacy_ilu_deepseek_v4_w4a8(config)
+        return super().from_config(config)
 
     @classmethod
     def _quantization_scheme_map_from_config(
@@ -191,7 +255,6 @@ class IluQuantConfig(CompressedTensorsConfig):
         layer_name: str | None = None,
         ilu_params: dict[str, Any] | None = None,
     ):
-        ilu_params = ilu_params or {}
         scheme = super()._get_scheme_from_parts(
             weight_quant=weight_quant,
             input_quant=input_quant,
@@ -199,6 +262,8 @@ class IluQuantConfig(CompressedTensorsConfig):
             format=format,
             layer_name=layer_name,
         )
+        if not ilu_params:
+            return scheme
 
         # [ILU override] W8A8 INT8 linear scheme - delta: use Iluvatar kernel
         # layout, padding, and ixformer execution while preserving upstream
@@ -243,7 +308,14 @@ class IluQuantConfig(CompressedTensorsConfig):
 
         # Use the new get_quant_args method to extract QuantizationArgs
         scheme_dict = self.get_scheme_dict(layer, layer_name)
+        if not scheme_dict:
+            return super().get_scheme(layer, layer_name)
 
+        ilu_params = dict(scheme_dict.get("ilu_params", {}))
+        if not ilu_params:
+            return super().get_scheme(layer, layer_name)
+
+        # the following code is copied from original code, but we add the ilu_params to the scheme_dict
         weight_quant = None
         input_quant = None
         output_quant = None
@@ -266,7 +338,7 @@ class IluQuantConfig(CompressedTensorsConfig):
                 output_quant=output_quant,
                 format=format,
                 layer_name=layer_name,
-                ilu_params=dict(scheme_dict["ilu_params"]),
+                ilu_params=ilu_params,
             )
 
         # Raise error if device does not support the scheme

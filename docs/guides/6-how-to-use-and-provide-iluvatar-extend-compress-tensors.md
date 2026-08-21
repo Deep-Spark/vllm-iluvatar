@@ -4,22 +4,30 @@ SPDX-FileCopyrightText: Copyright (c) 2026 Iluvatar CoreX. All Rights Reserved.
 -->
 # Iluvatar 量化使用指南
 
-本文介绍 Iluvatar 针对 MoE 和 Linear 层提供的量化优化。这些优化主要通过扩展 Compressed-Tensors 实现，用于适配已有量化方案或接入新的量化类型。对于新增或调整的量化类型，需要在插件中注册相应实现，并在运行前更新模型配置，从而完成特定模型的量化适配。
+本文介绍 Iluvatar 针对 MoE 和 Linear 层提供的量化优化。这些优化主要通过扩展 Compressed-Tensors 实现：在官方 `weights` / `input_activations` / `output_activations` 描述之上，于每个 config group 中增加 `iluvatar` 字段，将匹配到的层分发到 Iluvatar 后端。
 
 | 项目 | 说明 |
 | --- | --- |
-| **适用对象** | 所有 Iluvatar 或官方支持的量化类型 |
-| **改动范围** | `vllm-iluvatar` 插件仓库；通过 Compressed-Tensors 扩展配置分发到 Iluvatar 特定量化后端 |
+| **适用对象** | 使用 AWQ、GPTQ、 Compressed-Tensors 等量化模型的推理与适配 |
+| **改动范围** | `vllm-iluvatar` 插件仓库。插件将官方 `compressed-tensors` 配置类替换为 `IluQuantConfig` |
+
+使用路径：
+
+1. **已有量化权重**：模型 `config.json` 中的 `quantization_config` 会在加载时自动生效，一般不需要额外环境变量或 `--quantization`。确认顶层 `quant_method` 为 `compressed-tensors` 后，直接 `vllm serve`。
+2. **需要生成 Iluvatar 布局的权重**：使用 `examples/iluvatar-compressed-tensors/quant.py`，用 configs + rules 做离线转换，再加载转换后的模型。
+3. **适配新模型或新量化类型**：编写 configs / rules，必要时在 `IluvatarQuantRegistry` 中注册实现。见 [第 6 节](#6-离线量化与示例)。
 
 ---
 
 ## 目录
 
 1. [背景：量化](#1-背景量化)
-2. [MoE 量化](#2-moe-量化)
-3. [Linear 量化](#3-linear-量化)
-4. [示例与参考](#4-示例与参考)
-5. [附录](#5-附录)
+2. [运行时如何选择后端](#2-运行时如何选择后端)
+3. [MoE 量化](#3-moe-量化)
+4. [Linear 量化](#4-linear-量化)
+5. [特殊量化与混合量化](#5-特殊量化与混合量化)
+6. [离线量化与示例](#6-离线量化与示例)
+7. [附录](#7-附录)
 
 ---
 
@@ -40,7 +48,7 @@ vLLM 对量化模型的支持大致可以分为以下两类：
 
 > W、A 后的数字分别表示权重（Weight）和激活（Activation）的位宽。例如，W4A8 表示 4 bit 权重和 8 bit 激活。WNA16 中的 N 是权重位宽的占位符，具体值由量化配置决定。
 
-Iluvatar 在 vLLM 现有 AWQ、GPTQ 和 Compressed-Tensors 支持的基础上，结合硬件的数据布局与整数计算能力，对 W8A8、W4A8 等方案增加了专用实现。对于官方已有格式，尽量复用其权重和配置；对于需要特定布局或算子的方案，则通过扩展 Compressed-Tensors 配置将模型分发到 Iluvatar 后端。
+Iluvatar 在 vLLM 现有 AWQ、GPTQ 和 Compressed-Tensors 支持的基础上，结合硬件的数据布局与整数计算能力，对 W8A8、W4A8 等方案增加了优化实现，并保留对官方已有格式的支持。对于需要 Iluvatar 布局或算子的层，在对应 config group 中填写 `iluvatar` 字段即可分发到优化后端。
 
 ### 1.1 Compressed-Tensors 介绍
 
@@ -53,7 +61,7 @@ Compressed-Tensors 是一套声明式的压缩模型配置规范。它不只记�
 | `num_bits` | 量化位宽 | `4`、`8` |
 | `type` | 量化数据类型 | `int`、`float` |
 | `symmetric` | 是否使用对称量化 | `true`、`false` |
-| `strategy` | scale/zero-point 的量化粒度 | `tensor`、`channel`、`group`、`block` |
+| `strategy` | scale/zero-point 的量化粒度 | `tensor`、`channel`、`group`、`block`、`token` |
 | `group_size` | 分组量化时每组包含的元素数 | `128`、`-1`、`null` |
 | `block_structure` | 块量化的块形状 | `[128, 128]`、`null` |
 | `dynamic` | 量化参数是否在运行时动态计算 | `true`、`false` |
@@ -69,52 +77,56 @@ Compressed-Tensors 是一套声明式的压缩模型配置规范。它不只记�
 - `input_activations`：输入激活量化方式；
 - `output_activations`：输出激活量化方式；不量化时为 `null` 或省略。
 
-并非每种方案都必须同时配置这三项。例如，WNA16 通常只需要描述 `weights`，而 W8A8/W4A8 还需要描述 `input_activations`。下面的配置片段表示：匹配 `Linear` 的层使用 8 bit 对称静态量化，输入激活采用 per-tensor 粒度，权重采用 per-channel 粒度。
+并非每种方案都必须同时配置这三项。例如，WNA16 通常只需要描述 `weights`，而 W8A8/W4A8 还需要描述 `input_activations`。Iluvatar 优化的 W8A8 / W4A8 通常使用 **权重 per-channel 静态量化 + 输入激活 per-token 动态量化**，如下所示：
 
 ```json
 {
-  "input_activations": {
-    "dynamic": false,
-    "num_bits": 8,
-    "observer": "minmax",
-    "observer_kwargs": {},
-    "strategy": "tensor",
-    "symmetric": true,
-    "type": "int"
-  },
-  "output_activations": null,
   "targets": ["Linear"],
+  "format": "int-quantized",
   "weights": {
-    "dynamic": false,
     "num_bits": 8,
-    "observer": "minmax",
-    "observer_kwargs": {},
-    "strategy": "channel",
+    "type": "int",
     "symmetric": true,
-    "type": "int"
-  }
+    "strategy": "channel",
+    "group_size": null,
+    "dynamic": false
+  },
+  "input_activations": {
+    "num_bits": 8,
+    "type": "int",
+    "symmetric": true,
+    "strategy": "token",
+    "group_size": null,
+    "dynamic": true
+  },
+  "output_activations": null
 }
 ```
 
-`targets` 指定该配置组匹配的层类型或层名称。一个模型可以定义多个配置组，使不同层采用不同的量化方式；模型加载时，各组会分别匹配对应的目标层。`ignore` 用于排除不适合量化的层，例如保留 `lm_head` 使用默认的非量化实现。
+`targets` 指定该配置组匹配的层类型或层名称，可以是模块类名、完整层名，或 `re:` 开头的正则。一个模型可以定义多个配置组，使不同层采用不同的量化方式。`ignore` 用于排除不适合量化的层，例如保留 `lm_head` 使用默认的非量化实现。
 
-完整配置位于模型 `config.json` 的 `quantization_config` 中，结构示例如下：
+完整配置位于模型 `config.json` 的 `quantization_config` 中。Iluvatar 扩展字段必须写在 **config group 内**，写在 `quantization_config` 顶层不会生效：
 
 ```json
 {
   "quantization_config": {
+    "quant_method": "compressed-tensors",
+    "format": "iluvatar-mixed",
     "config_groups": {
       "group_0": {
         "targets": ["Linear"],
+        "format": "int-quantized",
         "input_activations": {},
         "output_activations": null,
-        "weights": {}
+        "weights": {},
+        "iluvatar": {}
       },
       "group_1": {
         "targets": ["re:.*\\.experts"],
         "input_activations": {},
         "output_activations": null,
-        "weights": {}
+        "weights": {},
+        "iluvatar": {}
       }
     },
     "ignore": ["lm_head"]
@@ -124,77 +136,114 @@ Compressed-Tensors 是一套声明式的压缩模型配置规范。它不只记�
 
 这里的 `{}` 仅用于省略具体量化属性；实际配置必须填写后端识别该量化方案所需的字段。配置只负责描述量化方式和目标层，权重文件本身还必须具有与该配置及执行后端一致的量化数据和布局，否则无法正确加载或计算。
 
-## 2. MoE 量化
+## 2. 运行时如何选择后端
 
-### 2.1 非 Compressed-Tensors 量化
+插件在 import 时用 `IluQuantConfig` 注册并替换官方 `compressed-tensors` 配置类。加载模型时，对每个 Linear / MoE 层按下面的顺序选择后端。量化方案本身仍由官方的 `weights`、`input_activations`、`output_activations`（以及 group 级 `format`）识别；`iluvatar` 只决定是否改用 Iluvatar 实现，以及该实现需要的布局参数。
 
-对于 AWQ、GPTQ 等非 Compressed-Tensors 量化类型，可以直接使用与开源实现相同的权重数据。模型创建完成后，再按需对权重执行自定义处理；其使用方式与官方实现一致。
+```text
+IluQuantConfig.get_quant_method(layer, prefix)
+  │
+  ├─ 匹配到的 config group 含 iluvatar.method
+  │     → 从 IluvatarQuantRegistry 实例化该类，跳过官方 scheme 选择
+  │
+  ├─ Linear
+  │     ├─ 无 iluvatar            → 官方 Compressed-Tensors scheme
+  │     └─ 有 iluvatar
+  │           ├─ 官方识别为 W8A8 INT8 / W4A8 INT → 换成 Iluvatar Linear scheme
+  │           └─ 其他 scheme                    → 保持官方 scheme
+  │
+  └─ MoE（RoutedExperts）
+        ├─ 无 iluvatar            → 官方 CompressedTensorsMoEMethod
+        └─ 有 iluvatar
+              ├─ weights=4bit 且 input=8bit → Iluvatar W4A8 MoE
+              ├─ 官方动态 token W8A8        → Iluvatar W8A8 MoE
+              └─ 其他 scheme                → 保持官方 scheme
+```
 
-### 2.2 Compressed-Tensors 量化
+注意事项：
 
-对于 W8A8、W4A8 等通过 Compressed-Tensors 描述的量化类型，Iluvatar 支持多种权重数据布局，因此需要通过离线量化生成与目标算子匹配的布局。官方实现根据 Compressed-Tensors 配置选择后端；Iluvatar 在继承该机制的基础上进行扩展，以支持额外的数据布局和算子。
+- **共享专家通常是 Linear，不是 MoE。** 例如 DeepSeek-V4 的 `shared_experts` 走 W8A8 Linear；`re:.*\\.experts` 只应匹配路由专家。
+- **`iluvatar` 没有默认值。** 选用 Iluvatar 后端时，该实现要求的字段必须显式填写；缺少或取值非法会在加载时报错，避免静默使用与离线权重不一致的缺省布局。
+- **离线 `gemm_format` / `pack_version` 必须与运行时 `iluvatar` 中的值一致。**
 
-Iluvatar 在每个 config group 中增加扩展字段 `iluvatar`，用于配置量化实现的选择及其后端参数。目前，MoE config group 支持以下字段：
-
-| 字段 | 适用类型 | 值 |
-| --- | --- | --- |
-| `gemm_format` | W4A8 / W8A8 | `TN` / `NN` |
-| `pack_version` | W4A8 | `1` / `2` |
-| `wna16_use_w4a8` | W4A8 | `true` / `false` |
-
-各实现会校验自身所需字段及其取值范围；缺少必填字段或使用非法值可能导致模型加载失败。请确保在 `iluvatar` 字段中提供所选后端需要的全部参数。
-
-## 3. Linear 量化
+## 3. MoE 量化
 
 ### 3.1 非 Compressed-Tensors 量化
 
-与 MoE 量化类似，AWQ、GPTQ 等方案的使用方式与官方实现一致。
+对于 AWQ、GPTQ 等非 Compressed-Tensors 量化类型，可以直接使用与开源实现相同的权重数据。模型创建完成后，再按需对权重执行自定义处理；其使用方式与官方实现一致。
 
 ### 3.2 Compressed-Tensors 量化
 
-Linear 量化与 MoE 量化使用相同的扩展机制。Linear config group 支持以下字段：
+Iluvatar 支持多种 MoE 权重布局，需要通过离线量化生成与目标算子匹配的数据。当路由专家所在 config group 包含非空 `iluvatar` 时，使用 Iluvatar MoE 后端；否则回落到官方实现。
 
-| 字段 | 适用类型 | 值 |
+方案由官方 `weights` / `input_activations` 识别，不使用额外开关字段：
+
+| 官方描述 | Iluvatar 后端 |
+| --- | --- |
+| 权重 4 bit、激活 8 bit | W4A8 MoE |
+| 动态 per-token W8A8 | W8A8 MoE |
+
+`iluvatar` 中与 MoE 相关的字段：
+
+| 字段 | 适用类型 | 必填 | 值 | 说明 |
+| --- | --- | --- | --- | --- |
+| `gemm_format` | W4A8 / W8A8 | 是 | `TN` / `NN` | 权重布局，必须与离线量化一致 |
+| `pack_version` | W4A8 | 是 | `1` / `2` | 打包版本；当前 W4A8 MoE 实现使用 `2` |
+
+W4A8 MoE 还要求权重量化粒度为 per-channel 或 per-group，激活为 per-token。当前实现使用 `pack_version=2`。
+
+## 4. Linear 量化
+
+### 4.1 非 Compressed-Tensors 量化
+
+与 MoE 量化类似，AWQ、GPTQ 等方案的使用方式与官方实现一致。
+
+### 4.2 Compressed-Tensors 量化
+
+Linear 使用与 MoE 相同的扩展机制：config group 中存在 `iluvatar` 时，若官方 scheme 识别为 W8A8 INT8 或 W4A8 INT，则换成 Iluvatar Linear 实现。量化为 W4A8/W8A8 的非 MoE Linear 还应在该 group 中设置 `format: int-quantized`。
+
+| 字段 | 适用类型 | 必填 | 值 | 说明 |
+| --- | --- | --- | --- | --- |
+| `gemm_format` | W8A8 | 是 | `TN` / `NN` | 必须与离线量化一致 |
+| `gemm_format` | W4A8 | 是 | `NN` | Linear W4A8 仅支持 `NN` |
+| `mixed_strategy` | W8A8 | 是 | `CHANNEL` | 当前仅支持 per-channel |
+| `gemm_mode` | W8A8 | 是 | `NORMAL` / `PERF` | `PERF` 按层形状选择更优 kernel；`NORMAL` 走通用路径 |
+
+## 5. 特殊量化与混合量化
+
+除第 3、4 节的 W8A8 / W4A8 字段外，config group 的 `iluvatar.method` 用于选择 Iluvatar 特定量化实现。配置该字段后，会跳过官方 scheme 选择，直接从 [`IluvatarQuantRegistry`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_quant_registry.py) 加载对应类。
+
+该方法主要用于：
+
+- 接入官方 Compressed-Tensors 中不存在的量化类型，避免每次新增类型时修改分发逻辑；
+- 在同一份 `compressed-tensors` 配置里混用官方无法组合的方案，例如 Linear W8A8 + FP8 MoE。
+
+`method` 在对应模型或量化模块 import 时注册。目前提供的方法包括：
+
+| `method` | 典型目标 | 额外 `iluvatar` 字段 |
 | --- | --- | --- |
-| `gemm_format` | W4A8 / W8A8 | W4A8 使用 `NN`；W8A8 使用 `TN` / `NN` |
-| `mixed_strategy` | W8A8 | `CHANNEL` / `TENSOR` |
-| `gemm_mode` | W8A8 | `NORMAL` / `PERF` |
+| `IluV4W8A16BMMLinearMethod` | DeepSeek-V4 `attn.wo_a` | `bmm_w8a16_gemm_format`（必填） |
+| `IluGlmKVBProjW8A16Method` | GLM-5.2 `kv_b_proj` | 无 |
+| `IluFp8MoEMethod` | 块缩放 FP8 路由专家 | `weight_block_size`，例如 `[128, 128]` |
 
-同样，各实现会校验自身所需字段及其取值范围。
+未注册的 `method` 会在加载时抛出 `ValueError`。
 
-### 3.3 特殊量化
-
-除 3.1 和 3.2 节涉及的字段外，目前还提供实验性字段 `method`，用于选择 Iluvatar 特定量化实现。配置该字段后，会跳过官方 scheme 的选择流程，并根据 `method` 加载对应的实现类。
-
-#### 3.3.1 特殊类型接入
-
-该机制的目的之一，在于接入官方实现中不存在的量化类型，避免每次新增量化类型时重复修改分发逻辑。`method` 目前主要面向特定模型，通过 [`IluvatarQuantRegistry`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_quant_registry.py) 注册。相关方法在对应的模型模块中注册，并随模型模块加载。目前提供的方法包括：
-
-- `IluV4W8A16BMMLinearMethod`
-- `IluGlmKVBProjW8A16Method`
-
-#### 3.3.2 混合量化扩展
-
-目前 vLLM 官方不支持混用非 Compressed-Tensors 与 Compressed-Tensors 描述的量化类型。通过 `IluvatarQuantRegistry` 注册实现并配置转换规则，可以在 Iluvatar 平台上支持 W8A8 + FP8 MoE 等混合量化方案。
-
-## 4. 示例与参考
-
-### 4.1 标准介绍
+## 6. 离线量化与示例
 
 `quant.py` 是统一的离线量化入口。它将运行时量化配置与离线权重转换规则拆分为两个外部文件，避免不同模型的量化脚本重复实现权重分类、反量化、再量化和配置生成逻辑。具体量化算法及其注册表位于 `examples/iluvatar-compressed-tensors/methods.py`；`quant.py` 只负责规则解析、任务调度和模型文件 I/O。
 
-#### 4.1.1 configs：运行时量化配置
+### 6.1 configs：运行时量化配置
 
-`examples/iluvatar-compressed-tensors/configs/*.json` 是直接写入模型 `config.json` 中 `quantization_config` 的 Compressed-Tensors 配置，主要描述：
+`examples/iluvatar-compressed-tensors/configs/*.json` 会直接写入模型 `config.json` 的 `quantization_config`，主要描述：
 
 - Compressed-Tensors 的 `config_groups`、`targets` 和权重/激活量化字段；
-- Iluvatar 的 `gemm_format`、`pack_version`、`method` 等扩展字段。
+- 每个 group 的 `iluvatar` 扩展字段（`gemm_format`、`pack_version`、`method` 等）。
 
-configs 不包含离线转换方法、checkpoint 名称匹配规则或模型配置 patch。后端量化方法仍按照 `get_quant_method -> get_scheme -> _get_scheme_from_parts` 的流程进行选择。`IluQuantConfig` 继承自 `CompressedTensorsConfig`，复用父类的 scheme 选择逻辑，并将 config group 中的扩展字段传递给 Iluvatar 优化实现。
+configs 不包含离线转换方法、checkpoint 名称匹配规则或模型配置 patch。`IluQuantConfig` 继承自 `CompressedTensorsConfig`，复用父类的 scheme 选择逻辑，并将 config group 中的 `iluvatar` 传递给 Iluvatar 实现。
 
-对于 `weights`、`input_activations`、`output_activations` 这三类描述，建议从 rules 下的对应文件中引用相关参数，以保证离线量化参数与运行时配置一致。例如：
+对于 `weights` 中需要与离线量化保持一致的参数，建议用 `$rules` 引用 rules 字段：
 
-**config.json：**
+**config：**
 
 ```json
 {
@@ -214,7 +263,7 @@ configs 不包含离线转换方法、checkpoint 名称匹配规则或模型配�
 }
 ```
 
-**rules 文件：**
+**rules：**
 
 ```json
 {
@@ -230,9 +279,9 @@ configs 不包含离线转换方法、checkpoint 名称匹配规则或模型配�
 }
 ```
 
-对于 `iluvatar` 字段，同样建议引用 rules 中的对应参数，以确保配置一致：
+`iluvatar` 同样建议引用 rules，以保证离线布局与运行时一致。下面是普通 W8A8 Linear 的写法，不要把只用于特殊层的 `method` 写进同一组：
 
-**config.json：**
+**config：**
 
 ```json
 {
@@ -250,7 +299,7 @@ configs 不包含离线转换方法、checkpoint 名称匹配规则或模型配�
 }
 ```
 
-**rules 文件：**
+**rules：**
 
 ```json
 {
@@ -265,16 +314,29 @@ configs 不包含离线转换方法、checkpoint 名称匹配规则或模型配�
   },
   "iluvatar": {
     "mixed_strategy": "CHANNEL",
-    "gemm_mode": "PERF",
-    "method": "IluV4W8A16BMMLinearMethod",
-    "bmm_w8a16_gemm_format": "k16n16"
+    "gemm_mode": "PERF"
+  }
+}
+```
+
+需要 `method` 的层应使用独立的 config group 和对应 rule。例如 `attn.wo_a`：
+
+```json
+{
+  "iluvatar": {
+    "method": {
+      "$rules": "rules.wo_a_fp8_to_w8a16.iluvatar.method"
+    },
+    "bmm_w8a16_gemm_format": {
+      "$rules": "rules.wo_a_fp8_to_w8a16.iluvatar.bmm_w8a16_gemm_format"
+    }
   }
 }
 ```
 
 由于离线权重转换不涉及输入、输出激活量化，`input_activations` 和 `output_activations` 如有需要，应直接在 config 文件中配置。
 
-#### 4.1.2 rules：离线转换规则
+### 6.2 rules：离线转换规则
 
 `examples/iluvatar-compressed-tensors/rules/*.json` 按 checkpoint tensor 名称选择离线转换 pipeline。每条规则主要包含：
 
@@ -312,7 +374,7 @@ configs 不包含离线转换方法、checkpoint 名称匹配规则或模型配�
   - `options`：`dtype` 默认为 `float8_e4m3fn`；`round_through_bfloat16` 和 `transport` 含义与 `int8_per_channel` 相同。
 - `int4_moe`：先生成 per-channel INT8，再通过 ixformer 重排为 MoE INT4，并按版本生成 scale、`i8_weight_scale` 和 `i8_weight_zero`。
   - `options`：`group_size`、`symmetric`、`gemm_format`、`pack_version`、`scale_layout` 和 `transport`；当 `scale_layout` 为 `row` 时，scale 会 reshape 为 `(1, *)`。
-- `pack_int4_moe`：处理三维专家权重，即所有专家位于同一个 tensor 中的情况；该方法会逐个专家调用 `int4_moe`，`options` 包括 `int4_moe` 参数外，提供：`packed`: gate_up 为 True, down 为 False；`chunk_dim` gate_up 的拆分维度。
+- `pack_int4_moe`：处理三维专家权重，即所有专家位于同一个 tensor 中的情况；该方法会逐个专家调用 `int4_moe`。`options` 在 `int4_moe` 参数之外还包括：`packed`（gate_up 为 `true`，down 为 `false`）；`chunk_dim`（gate_up 的拆分维度）。
 
 对于不同的量化方法，需要同步调整 configs 和 rules，以保证离线量化参数与运行时配置一致。除了手动同步，还可以在 configs 中通过 `$rules` 引用 rules 字段。这样，修改离线量化参数后，运行时配置会自动更新。例如：
 
@@ -330,7 +392,7 @@ configs 不包含离线转换方法、checkpoint 名称匹配规则或模型配�
 }
 ```
 
-#### 4.1.3 量化流程总览
+### 6.3 量化流程总览
 
 ```text
 伪代码如下：
@@ -353,37 +415,37 @@ configs 不包含离线转换方法、checkpoint 名称匹配规则或模型配�
       )
 ```
 
-#### 4.1.4 约定
+### 6.4 约定
 
-1. 顶层 `quant_method` 使用 `iluvatar-compressed-tensors`，`format` 使用 `iluvatar-mixed`。
-2. 对于量化为 W4A8/W8A8 的非 MoE Linear，应在对应 config group 中设置 `format: int-quantized`，并提供该实现需要的参数。
-3. 所有传递给 `iluvatar` 后端量化方法的参数，统一放在每个 group 的 `iluvatar` 字段中。
-4. 4.1.2 节提到的反量化和量化算法均注册在 `examples/iluvatar-compressed-tensors/methods.py` 中。适配新模型时应优先复用已注册算法；确实无法满足需求时，再新增算法并注册。
+1. 顶层 `quant_method` 使用 `compressed-tensors`，保持扩展语义；`format` 使用 `iluvatar-mixed`。
+2. 对于量化为 W4A8/W8A8 的非 MoE Linear，应在对应 config group 中设置 `format: int-quantized`，并提供该实现需要的 `iluvatar` 参数。
+3. 所有传递给 Iluvatar 后端的参数，统一放在每个 group 的 `iluvatar` 字段中。
+4. 6.2 节提到的反量化和量化算法均注册在 `examples/iluvatar-compressed-tensors/methods.py` 中。适配新模型时应优先复用已注册算法；确实无法满足需求时，再新增算法并注册。
 5. configs 中的 `targets` 匹配 vLLM 运行时模块前缀，rules 中的 `match` 匹配 checkpoint tensor 名称。两者所处阶段不同，不应直接复制彼此的正则表达式。
 
-#### 4.1.5 MTP 约定
+### 6.5 MTP 约定
 
 当前示例对 MTP 层和非 MTP 层采用相同的量化方式。若 MTP 层需要独立的精度、布局或运行时实现，应分别调整 rules 和 configs。
 
-#### 4.1.6 多模态部分约定
+### 6.6 多模态部分约定
 
 如果模型包含 visual 等模块，示例默认不对其进行量化；如有需要，请自行调整。
 
-### 4.2 新模型适配检查清单
+### 6.7 新模型适配检查清单
 
 1. **检查源模型**：确认 `config.json`、权重索引、tensor 名称、dtype、shape 及 companion scale 后缀。大型索引应通过定向搜索或流式统计分析，避免整体打印。
-2. **划分权重类别**：区分路由专家、共享专家、dense Linear、Attention、norm、router、embedding 和输出头等。
+2. **划分权重类别**：区分路由专家、共享专家、dense Linear、Attention、norm、router、embedding 和输出头等。共享专家按 Linear 处理，不要与路由专家共用 MoE 配置组。
 3. **编写 rules**：使用 checkpoint tensor 名称编写匹配条件；优先添加 dtype 约束和精确后缀，避免已转换权重被重复转换。
 4. **复用转换算法**：优先使用 `methods.py` 中已有方法；新增方法时，应先使用小型张量或单个真实 tensor 验证反量化结果。
-5. **编写 configs**：使用 vLLM 运行时模块前缀编写 `targets`。例如，专家通常匹配 `re:.*\\.experts`，不要直接复制包含专家编号或 `w1/w2/w3` 的 checkpoint 正则表达式。
+5. **编写 configs**：使用 vLLM 运行时模块前缀编写 `targets`。例如，路由专家通常匹配 `re:.*\\.experts`，不要直接复制包含专家编号或 `w1/w2/w3` 的 checkpoint 正则表达式。
 6. **同步参数**：通过 `$rules` 对齐 `group_size`、`symmetric`、`gemm_format`、`pack_version` 等离线和运行时参数。
 7. **执行小规模验证**：先验证 JSON、规则加载和匹配统计，再对少量 shard 或代表性 tensor 进行转换。
 8. **验证输出**：检查输出 tensor 名称、dtype、shape、scale 后缀、权重索引和最终 `quantization_config`。
 9. **启动推理**：使用目标并行配置加载模型，并至少执行一次短输入推理以验证后端选择和数值有效性。
 
-### 4.3 模型示例：基于 DeepSeek-V4-Flash
+### 6.8 模型示例：基于 DeepSeek-V4-Flash
 
-#### 4.3.1 rules
+#### 6.8.1 rules
 
 完整内容见 `examples/iluvatar-compressed-tensors/rules/deepseek_v4.json`。
 
@@ -398,19 +460,19 @@ configs 不包含离线转换方法、checkpoint 名称匹配规则或模型配�
 
 第 5 类规则可以匹配第 2、4 类中的 FP8 权重，但其默认优先级最低，因此不会覆盖更具体的规则。如需让这些权重保留为 BF16，可以提高第 5 类规则的优先级。路由专家的源权重为 MXFP4，不受该 FP8 fallback 规则影响。
 
-#### 4.3.2 configs
+#### 6.8.2 configs
 
 完整内容见 `examples/iluvatar-compressed-tensors/configs/deepseek_v4.json`。
 
 该文件指定以下运行时量化方式：
 
-1. 共享专家：W8A8；
-2. 路由专家：W4A8；
+1. 共享专家：W8A8 Linear；
+2. 路由专家：W4A8 MoE；
 3. `attn.wo_a`：使用 `IluV4W8A16BMMLinearMethod`；
-4. 其他 Attention 及相关 dense 层：W8A8；
+4. 其他 Attention 及相关 dense 层：W8A8 Linear；
 5. 其他层：使用 vLLM 默认的非量化后端。
 
-#### 4.3.3 转换前验证
+#### 6.8.3 转换前验证
 
 ```bash
 python3 examples/iluvatar-compressed-tensors/quant.py \
@@ -423,7 +485,7 @@ python3 examples/iluvatar-compressed-tensors/quant.py \
 
 该命令不会执行实际转换，而是根据 configs 和 rules 进行匹配，并将各规则的匹配结果写入 `match-report` 文件，用于转换前的快速验证。
 
-#### 4.3.4 转换
+#### 6.8.4 转换
 
 ```bash
 python3 examples/iluvatar-compressed-tensors/quant.py \
@@ -433,19 +495,19 @@ python3 examples/iluvatar-compressed-tensors/quant.py \
   --rules examples/iluvatar-compressed-tensors/rules/deepseek_v4.json
 ```
 
-#### 4.3.5 运行
+#### 6.8.5 运行
 
 ```bash
-# 无需设置额外环境变量；后端根据 Compressed-Tensors 配置中的字段进行选择。
+# 后端根据 quantization_config 选择，无需额外环境变量。
 vllm serve /path/to/DeepSeek-V4-flash-0731-quant \
   -tp 2 \
   -pp 4 \
   --enforce-eager
 ```
 
-## 5. 附录
+## 7. 附录
 
-### 5.1 文件职责速查
+### 7.1 文件职责速查
 
 | 文件 | 主要职责 | 不应包含 |
 | --- | --- | --- |
@@ -466,7 +528,7 @@ rules 文件还包含以下顶层字段：
 | `model_config_patch` | 写出模型配置前应用的 patch；键支持点分路径，值为 `null` 时删除对应字段 |
 | `default_action` | 权重未命中任何规则时执行的动作，可选 `keep` 或 `drop` |
 
-### 5.2 `$rules` 引用
+### 7.2 `$rules` 引用
 
 rules 是离线量化参数的事实来源。configs 可以通过 `$rules` 引用具体规则中的字段，以避免离线参数和运行时参数不一致：
 
@@ -488,7 +550,7 @@ rules 是离线量化参数的事实来源。configs 可以通过 `$rules` 引�
 - 具体参数应写在 rules 中，configs 通过 `$rules` 引用；不要在 rules 中反向使用 `$config`。
 - 被引用的 rule ID 和字段必须存在，否则量化任务会在读取配置时失败。
 
-### 5.3 命令行参数
+### 7.3 命令行参数
 
 | 参数 | 说明 |
 | --- | --- |
@@ -504,11 +566,11 @@ rules 是离线量化参数的事实来源。configs 可以通过 `$rules` 引�
 
 只有完整转换全部输入 shard 时，脚本才会重建 `model.safetensors.index.json` 并写入最终 `config.json`。分片任务的输出在完成合并和最终索引生成前不能直接用于推理。
 
-### 5.4 常见问题
+### 7.4 常见问题
 
 #### 量化运行报错
 
-- 方法不存在：检查方法是否已在 `methods.py` 中注册，或特殊量化实现是否已在 `IluvatarQuantRegistry` 中注册。
+- 方法不存在：检查离线方法是否已在 `methods.py` 中注册，或 `iluvatar.method` 对应的实现是否已在 `IluvatarQuantRegistry` 中注册（需加载对应模型/量化模块）。
 - OOM：运行时设置 `--device cpu`；对于需要在命令行指定设备上执行量化的算法，在对应 rule 中设置 `"work_device": cuda`。
 
 #### 规则未命中预期权重
@@ -520,9 +582,11 @@ rules 是离线量化参数的事实来源。configs 可以通过 `$rules` 引�
 
 #### 运行时无法选择或选择了错误的量化实现
 
+- 检查顶层 `quant_method` 是否为 `compressed-tensors`。
 - 检查 configs 的 `targets` 是否匹配 vLLM 构造后的模块前缀，而不是原始 checkpoint tensor 名称。
-- 检查 `format`、权重/激活量化字段以及 Iluvatar 扩展字段是否与目标 scheme 一致。
-- 对特殊实现，确认 `iluvatar.method` 对应的实现已注册到 `IluvatarQuantRegistry`。
+- 检查 `format`、权重/激活量化字段以及 `iluvatar` 是否与目标 scheme 一致，且 `iluvatar` 写在对应 config group 内。
+- 对特殊实现，确认 `iluvatar.method` 已注册到 `IluvatarQuantRegistry`。
+- MoE 配置了 `iluvatar` 但官方描述既不是 W4A8 也不是动态 token W8A8 时，会抛出 `Unsupported FusedMoe scheme`。
 
 #### 加载时找不到 weight / scale
 

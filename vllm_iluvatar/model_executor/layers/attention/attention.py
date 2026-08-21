@@ -75,3 +75,30 @@ def make_forward(original_forward: Callable[..., Any]) -> Callable[..., Any]:
         )
 
     return _ilu_forward
+
+
+def make_process_weights_after_loading(
+    original_process_weights_after_loading: Callable[..., Any],
+) -> Callable[..., Any]:
+    """Let the Iluvatar flash-attention impl bind external FP8 scales."""
+
+    @wraps(original_process_weights_after_loading)
+    def _ilu_process_weights_after_loading(self: Any, act_dtype: Any) -> None:
+        scale_path = os.environ.get("VLLM_ILU_FLASH_ATTN_FP8_SCALE_PATH", "")
+        if (
+            scale_path
+            and os.path.isfile(scale_path)
+            and getattr(self.impl, "supports_ilu_external_fp8_scales", False)
+        ):
+            handled = self.impl.process_weights_after_loading(
+                act_dtype,
+                layer=self,
+            )
+            if handled:
+                # The community method would reset scales to 1.0 when the
+                # checkpoint has no official KV-cache quant method.
+                return
+
+        original_process_weights_after_loading(self, act_dtype)
+
+    return _ilu_process_weights_after_loading

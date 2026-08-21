@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""KV cache int8 quantization utilities for flash attention KVINT8 quantization.
+"""Static scale utilities for Iluvatar flash-attention quantization.
 
 Provides V-scale calibration used by the ilu_flash_attn backend (ilu_flash_attn.py).
 Provides V-scale loading used by the model runner (gpu_model_runner.py).
+Also provides per-layer Q/K/V per-tensor FP8 calibration and loading.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 import os
 
 import torch
+import torch.distributed as dist
 import vllm.envs as envs
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -19,6 +21,9 @@ from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 
 logger = init_logger("vllm." + __name__)
+
+_FP8_SCALE_NAMES = ("q", "k", "v")
+_fp8_scale_file_cache: dict[str, dict[str, torch.Tensor]] = {}
 
 
 class StaticQuantManager:
@@ -149,6 +154,146 @@ class StaticQuantManager:
                         self.update_count,
                     )
                     StaticQuantManager.runtime_scales = {}
+
+
+class FP8StaticQuantManager:
+    """Collect and persist per-layer, per-tensor Q/K/V FP8 scales."""
+
+    init_layer_index_count: dict[str, int] = {}
+    init_layer_index_count_backup: list[str] = []
+    runtime_scales: dict[str, torch.Tensor] = {}
+
+    def __init__(
+        self,
+        layer_id: str,
+        file_save_path: str,
+        device: torch.device,
+        save_step: int = 100,
+        info_step: int = 100,
+    ) -> None:
+        if layer_id in FP8StaticQuantManager.init_layer_index_count:
+            raise RuntimeError(
+                f"layer_id already recorded in FP8StaticQuantManager: {layer_id}"
+            )
+        FP8StaticQuantManager.init_layer_index_count[layer_id] = 1
+        FP8StaticQuantManager.init_layer_index_count_backup.append(layer_id)
+
+        assert file_save_path, "file_save_path should not be empty"
+        para_dir = os.path.dirname(file_save_path) or "."
+        assert os.path.exists(para_dir), (
+            f"FP8StaticQuantManager workdir {para_dir} does not exist"
+        )
+        assert not os.path.exists(file_save_path), "file_save_path should not exist"
+
+        tp_group = get_tp_group()
+        self.operator = tp_group.rank_in_group == 0
+        self.file_save_path = file_save_path
+        self.layer_id = layer_id
+        self.save_step = save_step
+        self.info_step = info_step
+        self.update_count = 0
+        self.warmup_done = False
+        self.total_layer_index: list[str] = []
+        self.scales = torch.zeros(3, dtype=torch.float32, device=device)
+
+    def update_data(self, scales: torch.Tensor) -> None:
+        """Update running maxima from ``[q_scale, k_scale, v_scale]``."""
+        assert scales.shape == (3,) and scales.dtype == torch.float32
+        scales = scales.detach().clone()
+
+        if not self.warmup_done:
+            warmup_done = all(
+                value == 0
+                for value in FP8StaticQuantManager.init_layer_index_count.values()
+            )
+            if warmup_done:
+                self.warmup_done = True
+                self.total_layer_index = (
+                    FP8StaticQuantManager.init_layer_index_count_backup
+                )
+                self.operator = self.operator and (
+                    self.layer_id == self.total_layer_index[-1]
+                )
+                logger.info(
+                    "FP8StaticQuantManager init done, layers: %s",
+                    self.total_layer_index,
+                )
+            else:
+                FP8StaticQuantManager.init_layer_index_count[self.layer_id] -= 1
+                return
+
+        self.scales = torch.max(self.scales.unsqueeze(0), scales.unsqueeze(0)).squeeze(
+            0
+        )
+        self.update_count += 1
+        if self.update_count % self.info_step == 0 and self.operator:
+            logger.info("FP8StaticQuantManager collected %d steps", self.update_count)
+
+        if self.update_count % self.save_step != 0:
+            return
+        tp_group = get_tp_group()
+        reduced_scales = self.scales.clone()
+        if tp_group.world_size > 1:
+            dist.all_reduce(
+                reduced_scales,
+                op=dist.ReduceOp.MAX,
+                group=tp_group.device_group,
+            )
+        if tp_group.rank_in_group == 0:
+            FP8StaticQuantManager.runtime_scales[self.layer_id] = reduced_scales.cpu()
+        if self.operator and len(FP8StaticQuantManager.runtime_scales) == len(
+            self.total_layer_index
+        ):
+            torch.save(
+                FP8StaticQuantManager.runtime_scales,
+                self.file_save_path,
+            )
+            logger.info(
+                "FP8StaticQuantManager saved Q/K/V scales to %s at step %d",
+                self.file_save_path,
+                self.update_count,
+            )
+            FP8StaticQuantManager.runtime_scales = {}
+
+
+def load_static_fp8_qkv_scales(
+    layer_idx: str,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Load one layer's per-tensor Q/K/V FP8 dequantization scales."""
+    scale_path = envs.VLLM_ILU_FLASH_ATTN_FP8_SCALE_PATH
+    if not scale_path or not os.path.isfile(scale_path):
+        raise ValueError(
+            "FP8 attention requires a calibrated scale file, got "
+            f"VLLM_ILU_FLASH_ATTN_FP8_SCALE_PATH={scale_path!r}"
+        )
+    if scale_path not in _fp8_scale_file_cache:
+        raw = torch.load(scale_path, map_location="cpu")
+        if not isinstance(raw, dict) or not raw:
+            raise ValueError(f"Invalid FP8 attention scale file: {scale_path}")
+        _fp8_scale_file_cache[scale_path] = raw
+
+    raw_scales = _fp8_scale_file_cache[scale_path]
+    if layer_idx not in raw_scales:
+        raise KeyError(
+            f"Layer {layer_idx!r} is missing from FP8 scale file {scale_path}"
+        )
+    scales = raw_scales[layer_idx].float().flatten()
+    if scales.numel() != 3 or not torch.isfinite(scales).all() or (scales <= 0).any():
+        raise ValueError(
+            f"Layer {layer_idx!r} must contain three positive finite "
+            f"Q/K/V scales, got {scales}"
+        )
+    scales = scales.to(device=device).contiguous()
+    logger.info_once(
+        "[FP8 attention] loaded %s scales for layer %s: %s",
+        "/".join(_FP8_SCALE_NAMES),
+        layer_idx,
+        tuple(scales.tolist()),
+        scope=f"fp8-attention-layer-{layer_idx}",
+    )
+    q_scale, k_scale, v_scale = scales.unbind()
+    return q_scale.reshape(1), k_scale.reshape(1), v_scale.reshape(1)
 
 
 def load_static_v_scales(

@@ -62,28 +62,34 @@ def test_concat_and_cache_dsa_int8(
     strided_input: bool,
 ) -> None:
     torch.manual_seed(seed)
-    torch.set_default_device("cuda:0")
+    device = "cuda:0"
 
     input_width = 2 * kv_dim if strided_input else kv_dim
     scale_width = 2 if strided_input else 1
-    kv_int8 = torch.randint(-128, 128, (num_tokens, input_width), dtype=torch.int8)
+    kv_int8 = torch.randint(
+        -128, 128, (num_tokens, input_width), dtype=torch.int8, device=device
+    )
     kv_int8 = kv_int8[..., :kv_dim]
-    nope_scale = torch.randn(num_tokens, scale_width)[..., :1]
-    rope_scale = torch.randn(num_tokens, scale_width)[..., :1]
+    nope_scale = torch.randn(num_tokens, scale_width, device=device)[..., :1]
+    rope_scale = torch.randn(num_tokens, scale_width, device=device)[..., :1]
     assert kv_int8.is_contiguous() != strided_input
     assert nope_scale.is_contiguous() != strided_input
     assert rope_scale.is_contiguous() != strided_input
 
     # Non-zero initialization also verifies that unmapped slots stay untouched.
     kv_cache = torch.randint(
-        -128, 128, (num_blocks, block_size, kv_dim), dtype=torch.int8
+        -128,
+        128,
+        (num_blocks, block_size, kv_dim),
+        dtype=torch.int8,
+        device=device,
     )
-    nope_scale_cache = torch.randn(num_blocks, block_size, 1)
-    rope_scale_cache = torch.randn(num_blocks, block_size, 1)
+    nope_scale_cache = torch.randn(num_blocks, block_size, 1, device=device)
+    rope_scale_cache = torch.randn(num_blocks, block_size, 1, device=device)
 
     # Duplicate slots would make parallel last-writer ordering ambiguous.
     total_slots = num_blocks * block_size
-    slot_mapping = torch.randperm(total_slots, dtype=torch.int64)[
+    slot_mapping = torch.randperm(total_slots, dtype=torch.int64, device=device)[
         :num_tokens
     ].contiguous()
 
@@ -118,17 +124,21 @@ def test_concat_and_cache_dsa_int8(
 @torch.inference_mode()
 def test_concat_and_cache_dsa_int8_opcheck() -> None:
     """torch.library.opcheck: schema/alias/fake consistency for the cache op."""
-    torch.set_default_device("cuda:0")
+    device = "cuda:0"
     num_tokens, kv_dim, block_size, num_blocks = 83, 576, 64, 2
-    kv_int8 = torch.randint(-128, 128, (num_tokens, kv_dim), dtype=torch.int8)
-    nope_scale = torch.randn(num_tokens, 1)
-    rope_scale = torch.randn(num_tokens, 1)
-    kv_cache = torch.zeros(num_blocks, block_size, kv_dim, dtype=torch.int8)
-    nope_scale_cache = torch.zeros(num_blocks, block_size, 1)
-    rope_scale_cache = torch.zeros(num_blocks, block_size, 1)
-    slot_mapping = torch.randperm(num_blocks * block_size, dtype=torch.int64)[
-        :num_tokens
-    ]
+    kv_int8 = torch.randint(
+        -128, 128, (num_tokens, kv_dim), dtype=torch.int8, device=device
+    )
+    nope_scale = torch.randn(num_tokens, 1, device=device)
+    rope_scale = torch.randn(num_tokens, 1, device=device)
+    kv_cache = torch.zeros(
+        num_blocks, block_size, kv_dim, dtype=torch.int8, device=device
+    )
+    nope_scale_cache = torch.zeros(num_blocks, block_size, 1, device=device)
+    rope_scale_cache = torch.zeros(num_blocks, block_size, 1, device=device)
+    slot_mapping = torch.randperm(
+        num_blocks * block_size, dtype=torch.int64, device=device
+    )[:num_tokens]
 
     torch.library.opcheck(
         torch.ops._C.concat_and_cache_dsa_int8,

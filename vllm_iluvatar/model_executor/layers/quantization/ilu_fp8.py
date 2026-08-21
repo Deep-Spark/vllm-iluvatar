@@ -331,6 +331,7 @@ def preprocess_fp8_block_weight_for_ixmm(
     weight: torch.Tensor,
     weight_scale_inv: torch.Tensor,
     block: tuple[int, int],
+    allow_k_padding: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Convert one expert-chunk of block-FP8 weights to the ixmm ix30 format.
 
@@ -355,7 +356,13 @@ def preprocess_fp8_block_weight_for_ixmm(
     from ixformer.inference.functions.fp4.gemm import gemm as ixmm_gemm
 
     expert, n_dim, k = weight.shape
-    assert k % _IXMM_GROUP_SIZE == 0, f"k={k} must be a multiple of {_IXMM_GROUP_SIZE}"
+    if allow_k_padding:
+        padded_k = (k + _IXMM_GROUP_SIZE - 1) // _IXMM_GROUP_SIZE * _IXMM_GROUP_SIZE
+    else:
+        assert k % _IXMM_GROUP_SIZE == 0, (
+            f"k={k} must be a multiple of {_IXMM_GROUP_SIZE}"
+        )
+        padded_k = k
 
     # 1-2. Block dequant: fp8 magnitude * per-block float32 scale. Expand the
     # block scale back to element granularity, clipping the trailing partial
@@ -379,18 +386,24 @@ def preprocess_fp8_block_weight_for_ixmm(
     scale = scale.repeat_interleave(block_k, dim=2)[:, :, :k]
     weight_float = weight.to(torch.float32) * scale
 
-    # 3. Transpose [E, n, k] -> [E, k, n].
+    # 3. Transpose [E, n, k] -> [E, k, n], then may zero-pad K to the ixmm
+    # group boundary. The compute path pads the corresponding activation to
+    # the packed weight's K, so the added columns contribute exactly zero.
     weight_float = weight_float.transpose(1, 2).contiguous()
+    if padded_k != k:
+        padded_weight = weight_float.new_zeros((expert, padded_k, n_dim))
+        padded_weight[:, :k, :] = weight_float
+        weight_float = padded_weight
 
     # 4. Per-256 absolute scale: amax / FP4_MAX_MAG.
-    groups_256 = k // _IXMM_GROUP_SIZE
+    groups_256 = padded_k // _IXMM_GROUP_SIZE
     grouped = weight_float.reshape(expert, groups_256, _IXMM_GROUP_SIZE, n_dim)
     amax = grouped.abs().amax(dim=2)  # [E, groups, n]
     ixmm_scale = (amax / _FP4_MAX_MAG).clamp(min=1e-12)
 
     # 5. Re-quantise to fp4 nibbles [E, k, n].
     normalized = grouped / ixmm_scale.unsqueeze(2)
-    new_nibbles = ixmm_gemm._quantize_fp4(normalized.reshape(expert, k, n_dim))
+    new_nibbles = ixmm_gemm._quantize_fp4(normalized.reshape(expert, padded_k, n_dim))
 
     # 6. Pack into ix30 layout [E, k/2, n].
     ixmm_weight = ixmm_gemm._pack_nibbles_ix30(new_nibbles)
@@ -514,26 +527,42 @@ class IluFp8MoEMethod(Fp8MoEMethod):
 
             weight_parts: list[torch.Tensor] = []
             scale_parts: list[torch.Tensor] = []
+            allow_k_padding = w_name == "w2_weight"
             for begin in range(0, w.shape[0], _IXMM_EXPERT_CHUNK):
                 end = min(begin + _IXMM_EXPERT_CHUNK, w.shape[0])
                 ixmm_weight, ixmm_scale = preprocess_fp8_block_weight_for_ixmm(
                     w[begin:end],
                     s[begin:end],
                     block,
+                    allow_k_padding,
                 )
                 weight_parts.append(ixmm_weight)
                 scale_parts.append(ixmm_scale)
 
             ixmm_weight = torch.cat(weight_parts, dim=0).contiguous()
             ixmm_scale = torch.cat(scale_parts, dim=0).contiguous()
-            # Un-packed input [E, n, k] -> ix30 weight [E, k/2, n] + scale
-            # [E, k/256, n].
-            expected_weight_shape = (w.shape[0], w.shape[2] // 2, w.shape[1])
-            expected_scale_shape = (
-                w.shape[0],
-                w.shape[2] // _IXMM_GROUP_SIZE,
-                w.shape[1],
-            )
+            if not allow_k_padding:
+                # Un-packed input [E, n, k] -> ix30 weight [E, k/2, n] + scale
+                # [E, k/256, n].
+                expected_weight_shape = (w.shape[0], w.shape[2] // 2, w.shape[1])
+                expected_scale_shape = (
+                    w.shape[0],
+                    w.shape[2] // _IXMM_GROUP_SIZE,
+                    w.shape[1],
+                )
+            else:
+                padded_k = (
+                    (w.shape[2] + _IXMM_GROUP_SIZE - 1)
+                    // _IXMM_GROUP_SIZE
+                    * _IXMM_GROUP_SIZE
+                )
+                expected_weight_shape = (w.shape[0], padded_k // 2, w.shape[1])
+                expected_scale_shape = (
+                    w.shape[0],
+                    padded_k // _IXMM_GROUP_SIZE,
+                    w.shape[1],
+                )
+
             if tuple(ixmm_weight.shape) != expected_weight_shape:
                 raise ValueError(
                     f"preprocess_fp8_block_weight_for_ixmm returned shape "

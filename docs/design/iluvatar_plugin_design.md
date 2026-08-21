@@ -533,17 +533,17 @@ get_attn_backend_cls 选官方成员
 
 > 注意：量化探测发生在 `ModelConfig.__post_init__`，**早于** `IluPlatform.check_and_update_config`；故量化只能走 `register_quantization_config`，无法像 tokenizer_mode（§6.5）那样在 `check_and_update_config` 里补。
 
-### 8.5 示例：iluvatar-compressed-tensors
+### 8.5 示例：compressed-tensors（IluQuantConfig）
 
 `model_executor/layers/quantization/compressed_tensors/compressed_tensors.py`：
 
 ```python
-@register_quantization_config("iluvatar-compressed-tensors")
-class IluQuantConfig(QuantizationConfig):
+@register_quantization_config("compressed-tensors")
+class IluQuantConfig(CompressedTensorsConfig):
     ...
 ```
 
-W4A8 的选用基于 checkpoint 的 `quant_method`、与模型 arch 解耦：`IluDeepseekV4ForCausalLM`（§6.5）负责架构，`IluQuantConfig` 负责权重量化方案，两条注册路径相互独立。
+插件用 `IluQuantConfig` 替换官方同名配置类。W4A8 / W8A8 的选用基于 checkpoint 的 `quantization_config`（`quant_method` 为 `compressed-tensors`），与模型 arch 解耦：`IluDeepseekV4ForCausalLM`（§6.5）负责架构，`IluQuantConfig` 负责权重量化方案，两条注册路径相互独立。详细字段与分发见 [`docs/guides/6-how-to-use-and-provide-iluvatar-extend-compress-tensors.md`](../guides/6-how-to-use-and-provide-iluvatar-extend-compress-tensors.md)。
 
 ---
 

@@ -40,7 +40,9 @@
         "regex": [
           "^language_model\\.model\\.layers\\.\\d+\\.mlp\\.experts\\.\\d+\\.(gate_proj|up_proj|down_proj)\\.weight_packed$"
         ],
-        "dtypes": ["int32"]
+        "dtypes": [
+          "int32"
+        ]
       },
       "action": "convert",
       "scale": {
@@ -64,9 +66,6 @@
           "scale_layout": "row"
         }
       },
-      "iluvatar": {
-        "wna16_use_w4a8": false
-      },
       "outputs": {
         "weight": ".weight",
         "weight_scale": ".weight_scale",
@@ -86,7 +85,9 @@
         ]
       },
       "action": "convert",
-      "dequant": {"method": "to_float32"},
+      "dequant": {
+        "method": "to_float32"
+      },
       "quant": {
         "method": "int8_per_channel",
         "options": {
@@ -99,7 +100,9 @@
         "mixed_strategy": "CHANNEL",
         "gemm_mode": "PERF"
       },
-      "outputs": {"weight_scale": ".weight_scale"},
+      "outputs": {
+        "weight_scale": ".weight_scale"
+      },
       "work_device": "cuda"
     }
   ]

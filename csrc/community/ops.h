@@ -6,6 +6,10 @@
 
 #include <torch/all.h>
 
+#include <optional>
+#include <string>
+#include <vector>
+
 namespace vllm_iluvatar {
 
 // rms_norm(Tensor! result, Tensor input, Tensor weight, float epsilon) -> ()
@@ -30,5 +34,25 @@ void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
                       c10::optional<torch::Tensor> key, int64_t head_size,
                       torch::Tensor& cos_sin_cache, bool is_neox,
                       int64_t rope_dim_offset, bool inverse);
+
+// static_scaled_fp8_quant(
+//     Tensor! result, Tensor input, Tensor scale, int[]? group_shape=None) -> ()
+// Per-tensor static FP8 E4M3 quantization used by the FP8 attention query path.
+// ivcore30 only; raises on every other arch.
+void static_scaled_fp8_quant(
+    torch::Tensor& result, torch::Tensor& input, torch::Tensor& scale,
+    const std::optional<std::vector<int64_t>>& group_shape);
+
+// reshape_and_cache_fp8(
+//     Tensor key, Tensor value, Tensor! key_cache, Tensor! value_cache,
+//     Tensor slot_mapping, str kv_cache_dtype, Tensor k_scale, Tensor v_scale)
+//     -> ()
+// Quantizes FP16/BF16 K/V and stores FP8 E4M3 values in an HND paged cache.
+// ivcore30 only; raises on every other arch.
+void reshape_and_cache_fp8(
+    torch::Tensor& key, torch::Tensor& value, torch::Tensor& key_cache,
+    torch::Tensor& value_cache, torch::Tensor& slot_mapping,
+    const std::string& kv_cache_dtype, torch::Tensor& k_scale,
+    torch::Tensor& v_scale);
 
 }  // namespace vllm_iluvatar

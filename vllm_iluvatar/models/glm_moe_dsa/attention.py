@@ -258,7 +258,7 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
     KV cache and builds :class:`IluFlashMLASparseMetadata` keyed on ``prefix``.
 
     ``kv_b_proj`` is grouped W8A16 marlin: :class:`IluGlmKVBProjW8A16Method `
-    (in ``iluvatar-compressed-tensors``) splits it into ``W_UK`` / ``W_UV`` and repacks
+    (in ``compressed-tensors`` / ``IluQuantConfig``) splits it into ``W_UK`` / ``W_UV`` and repacks
     each into Marlin layout at load time (deterministic, loader-driven). The
     k-up / v-up here just read ``self.kv_b_proj.W_UK`` / ``W_UV`` and call
     ``ixf_ops.marlin_w8a16`` -- mirroring R1's ``_k_up_proj_w8a8`` /

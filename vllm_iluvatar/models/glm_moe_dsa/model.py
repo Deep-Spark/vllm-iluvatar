@@ -3,7 +3,7 @@
 
 Implements GLM-5.2 (``GlmMoeDsa`` arch = DeepSeek-V3.2: MLA + DSA lightning
 indexer + fine-grained MoE) bound to the W4A8 mixed-quant scheme
-(``iluvatar-compressed-tensors``). The attention *algorithm* chain is fully
+(``compressed-tensors`` / ``IluQuantConfig``). The attention *algorithm* chain is fully
 self-contained in :mod:`.attention` (no community
 ``MultiHeadLatentAttentionWrapper`` / ``MLAAttention`` / ``SparseMLAAttentionImpl``
 in the runtime path), aligned with ``deepseek_v4``.

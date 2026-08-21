@@ -520,9 +520,7 @@ def _resolve_auto(
         w13 = type("_W", (), {"dtype": w13_weight_dtype})()
         w2 = type("_W", (), {"dtype": w13_weight_dtype})()
         scale_dtype = (
-            torch.float32
-            if w13_weight_dtype is torch.uint8
-            else torch.float8_e8m0fnu
+            torch.float32 if w13_weight_dtype is torch.uint8 else torch.float8_e8m0fnu
         )
         s13 = type("_S", (), {"dtype": scale_dtype})()
         s2 = type("_S", (), {"dtype": scale_dtype})()
@@ -569,13 +567,9 @@ def test_resolve_backend_unknown_name_is_rejected():
             w13_bias=None,
             w2_bias=None,
             w13_weight=type("_W", (), {"dtype": torch.int8})(),
-            w13_weight_scale=type(
-                "_S", (), {"dtype": torch.float8_e8m0fnu}
-            )(),
+            w13_weight_scale=type("_S", (), {"dtype": torch.float8_e8m0fnu})(),
             w2_weight=type("_W", (), {"dtype": torch.int8})(),
-            w2_weight_scale=type(
-                "_S", (), {"dtype": torch.float8_e8m0fnu}
-            )(),
+            w2_weight_scale=type("_S", (), {"dtype": torch.float8_e8m0fnu})(),
         )
 
 
@@ -600,13 +594,9 @@ def test_resolve_backend_auto_non_ivcore30_falls_back_to_torch(monkeypatch):
             w13_bias=None,
             w2_bias=None,
             w13_weight=type("_W", (), {"dtype": torch.int8})(),
-            w13_weight_scale=type(
-                "_S", (), {"dtype": torch.float8_e8m0fnu}
-            )(),
+            w13_weight_scale=type("_S", (), {"dtype": torch.float8_e8m0fnu})(),
             w2_weight=type("_W", (), {"dtype": torch.int8})(),
-            w2_weight_scale=type(
-                "_S", (), {"dtype": torch.float8_e8m0fnu}
-            )(),
+            w2_weight_scale=type("_S", (), {"dtype": torch.float8_e8m0fnu})(),
         )
         == "torch"
     )
@@ -650,13 +640,9 @@ def test_resolve_backend_explicit_ixmm_rejects_original_layout():
             w13_bias=None,
             w2_bias=None,
             w13_weight=type("_W", (), {"dtype": torch.int8})(),
-            w13_weight_scale=type(
-                "_S", (), {"dtype": torch.float8_e8m0fnu}
-            )(),
+            w13_weight_scale=type("_S", (), {"dtype": torch.float8_e8m0fnu})(),
             w2_weight=type("_W", (), {"dtype": torch.int8})(),
-            w2_weight_scale=type(
-                "_S", (), {"dtype": torch.float8_e8m0fnu}
-            )(),
+            w2_weight_scale=type("_S", (), {"dtype": torch.float8_e8m0fnu})(),
         )
 
 
@@ -834,6 +820,7 @@ def test_ixformer_pipeline_wires_args_correctly(weights, hidden_states, monkeypa
         w2_bias=None,
         gemm_backend="ixformer_native",
         gemm_mode=0,
+        swiglu_variant="dsv4_clamp",
     )
 
     src_to_dst, dst_to_src, group_layout = routing_out["v"]
@@ -877,22 +864,41 @@ def test_ixformer_pipeline_wires_args_correctly(weights, hidden_states, monkeypa
     assert gather_call.call_args.args[1].dtype is torch.float32
 
 
-def test_ixmm_pipeline_uses_preprocessed_weight_dimensions(
-    hidden_states, monkeypatch
-):
-    """ixmm stores weights as [E, K/2, N], unlike the original [E, N, K/2]."""
+def test_ixmm_pipeline_pads_only_w2_k(monkeypatch):
+    """w13 keeps its K while w2 and the SwiGLU activation pad 640 to 768."""
     expert_count = 4
+    hidden_size = 256
+    logical_inter_size = 640
+    padded_inter_size = 768
+    hidden_states = torch.zeros(_TOKENS, hidden_size, dtype=torch.bfloat16)
     w13 = torch.zeros(
-        expert_count, _H // 2, 2 * _I, dtype=torch.uint8
+        expert_count, hidden_size // 2, 2 * logical_inter_size, dtype=torch.uint8
     )
-    s13 = torch.ones(expert_count, 1, 2 * _I, dtype=torch.float32)
-    w2 = torch.zeros(expert_count, _I // 2, _H, dtype=torch.uint8)
-    s2 = torch.ones(expert_count, 1, _H, dtype=torch.float32)
+    s13 = torch.ones(
+        expert_count, hidden_size // 256, 2 * logical_inter_size, dtype=torch.float32
+    )
+    w2 = torch.zeros(
+        expert_count, padded_inter_size // 2, hidden_size, dtype=torch.uint8
+    )
+    s2 = torch.ones(
+        expert_count,
+        padded_inter_size // 256,
+        hidden_size,
+        dtype=torch.float32,
+    )
     topk_weights, topk_ids = _rand_routing(_TOKENS, expert_count, _TOPK, seed=25)
 
     fake_ixfops, _ = _install_fake_ixfops(monkeypatch)
+    fake_ixfops.moe_expand_input_dynamic_scaled_fp8.return_value = (
+        torch.empty(_TOKENS * _TOPK, hidden_size, dtype=torch.float8_e4m3fn),
+        torch.ones(_TOKENS * _TOPK, dtype=torch.float32),
+    )
+    fake_ixfops.swiglu_limit_dynamic_scaled_fp8.return_value = (
+        torch.empty(_TOKENS * _TOPK, logical_inter_size, dtype=torch.float8_e4m3fn),
+        torch.ones(_TOKENS * _TOPK, dtype=torch.float32),
+    )
     fake_ixfops.moe_gather_output_reduce_sum.return_value = torch.zeros(
-        _TOKENS, _H, dtype=torch.bfloat16
+        _TOKENS, hidden_size, dtype=torch.bfloat16
     )
 
     _ilu_mxfp4_fused_experts_ixformer(
@@ -911,11 +917,24 @@ def test_ixmm_pipeline_uses_preprocessed_weight_dimensions(
         w2_bias=None,
         gemm_backend="ixmm",
         gemm_mode=0,
+        swiglu_variant="dsv4_clamp",
     )
 
+    expand_input = fake_ixfops.moe_expand_input_dynamic_scaled_fp8.call_args.args[0]
+    assert expand_input is hidden_states
+
     gemm_calls = fake_ixfops.group_gemm_fp4.call_args_list
-    assert gemm_calls[0].args[5].shape == (_TOKENS * _TOPK, 2 * _I)
-    assert gemm_calls[1].args[5].shape == (_TOKENS * _TOPK, _H)
+    assert w13.shape[1] * 2 == hidden_size
+    assert gemm_calls[0].args[0].shape[-1] == hidden_size
+    assert gemm_calls[0].args[5].shape == (
+        _TOKENS * _TOPK,
+        2 * logical_inter_size,
+    )
+    assert gemm_calls[1].args[0].shape[-1] == padded_inter_size
+    assert (
+        torch.count_nonzero(gemm_calls[1].args[0][:, logical_inter_size:].float()) == 0
+    )
+    assert gemm_calls[1].args[5].shape == (_TOKENS * _TOPK, hidden_size)
 
 
 def test_ixformer_pipeline_forwards_expert_map_without_remapping(
@@ -958,6 +977,7 @@ def test_ixformer_pipeline_forwards_expert_map_without_remapping(
         w2_bias=None,
         gemm_backend="ixformer_native",
         gemm_mode=0,
+        swiglu_variant="dsv4_clamp",
     )
 
     routing_call = fake_ixfops.moe_compute_token_index_ep_group_layout

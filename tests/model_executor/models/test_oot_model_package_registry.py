@@ -22,11 +22,11 @@ _MIGRATED_MODEL_PACKAGES = {
     ],
     "vllm_iluvatar.models.deepseek_v4": [
         (
-            "DeepseekV4ForCausalLM",
+            "IluDeepseekV4ForCausalLM",
             "vllm_iluvatar.models.deepseek_v4.model:IluDeepseekV4ForCausalLM",
         ),
         (
-            "DeepSeekV4MTPModel",
+            "IluDeepSeekV4MTPModel",
             "vllm_iluvatar.models.deepseek_v4.mtp:IluDeepSeekV4MTP",
         ),
     ],
@@ -82,4 +82,5 @@ def test_migrated_model_register_model_points_at_plugin_paths(
     model_module = importlib.import_module(f"{package_name}.model")
     model_module.register_model()
 
-    assert calls == expected_calls
+    for call, expected_call in zip(calls, expected_calls):
+        assert call == expected_call

@@ -30,6 +30,28 @@ requires_cuda = pytest.mark.skipif(
 )
 
 
+def _compiled_cuda_arch() -> str | None:
+    """The ivcore arch ``vllm_iluvatar._C`` was compiled for, e.g. "ivcore30".
+
+    Arch-gated kernels are selected at compile time, so the extension itself is
+    asked rather than the runtime device: that is exactly what decides whether
+    an op runs or raises. Tests gate on the returned value. None means there is
+    no device, in which case they are skipped by ``requires_cuda`` anyway; with
+    a device, a failing import/attribute lookup is an environment error and is
+    left to propagate per the policy above.
+    """
+    if not _cuda_available():
+        return None
+
+    import torch
+    import vllm_iluvatar._C  # noqa: F401
+
+    return str(torch.ops._C.compiled_cuda_arch())
+
+
+COMPILED_CUDA_ARCH = _compiled_cuda_arch()
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _inject_ilu_module_aliases():
     """Inject sys.modules aliases that ``register_general()`` would set up.
@@ -41,6 +63,7 @@ def _inject_ilu_module_aliases():
     ``vllm.*`` paths.
     """
     from vllm_iluvatar import _inject_ilu_module_aliases as _inject
+
     _inject()
 
 

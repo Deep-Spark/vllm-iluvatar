@@ -3,7 +3,9 @@
   "name": "deepseek_v4_v2",
   "model_config_patch": {
     "expert_dtype": "w4a8",
-    "architectures": ["IluDeepseekV4ForCausalLM"]
+    "architectures": [
+      "IluDeepseekV4ForCausalLM"
+    ]
   },
   "default_action": "keep",
   "rules": [
@@ -11,7 +13,9 @@
       "id": "drop_consumed_scale",
       "priority": 1000,
       "match": {
-        "suffixes": [".scale"]
+        "suffixes": [
+          ".scale"
+        ]
       },
       "action": "drop"
     },
@@ -19,8 +23,13 @@
       "id": "routed_mxfp4_to_w4a8",
       "priority": 900,
       "match": {
-        "regex": ["\\.experts\\.\\d+\\.w[123]\\.weight$"],
-        "dtypes": ["int8", "uint8"]
+        "regex": [
+          "\\.experts\\.\\d+\\.w[123]\\.weight$"
+        ],
+        "dtypes": [
+          "int8",
+          "uint8"
+        ]
       },
       "action": "convert",
       "scale": {
@@ -40,9 +49,6 @@
           "scale_layout": "row"
         }
       },
-      "iluvatar": {
-        "wna16_use_w4a8": false
-      },
       "outputs": {
         "weight_scale": ".weight_scale",
         "i8_weight_scale": ".i8_weight_scale",
@@ -53,8 +59,12 @@
       "id": "shared_fp8_to_w8a8",
       "priority": 800,
       "match": {
-        "regex": ["\\.shared_experts\\.w[123]\\.weight$"],
-        "dtypes": ["float8_e4m3fn"]
+        "regex": [
+          "\\.shared_experts\\.w[123]\\.weight$"
+        ],
+        "dtypes": [
+          "float8_e4m3fn"
+        ]
       },
       "action": "convert",
       "scale": {
@@ -63,7 +73,9 @@
       },
       "dequant": {
         "method": "fp8_block_e8m0",
-        "options": {"block_size": 128}
+        "options": {
+          "block_size": 128
+        }
       },
       "quant": {
         "method": "int8_per_channel",
@@ -92,7 +104,9 @@
           "\\.main_proj\\.weight$",
           "\\.attn\\.wo_a\\.weight$"
         ],
-        "dtypes": ["float8_e4m3fn"]
+        "dtypes": [
+          "float8_e4m3fn"
+        ]
       },
       "action": "convert",
       "scale": {
@@ -101,7 +115,9 @@
       },
       "dequant": {
         "method": "fp8_block_e8m0",
-        "options": {"block_size": 128}
+        "options": {
+          "block_size": 128
+        }
       },
       "quant": {
         "method": "int8_per_channel",
@@ -126,8 +142,12 @@
       "id": "remaining_fp8_to_bfloat16",
       "priority": 100,
       "match": {
-        "dtypes": ["float8_e4m3fn"],
-        "suffixes": [".weight"]
+        "dtypes": [
+          "float8_e4m3fn"
+        ],
+        "suffixes": [
+          ".weight"
+        ]
       },
       "action": "convert",
       "scale": {
@@ -136,11 +156,15 @@
       },
       "dequant": {
         "method": "fp8_block_e8m0",
-        "options": {"block_size": 128}
+        "options": {
+          "block_size": 128
+        }
       },
       "quant": {
         "method": "cast",
-        "options": {"dtype": "bfloat16"}
+        "options": {
+          "dtype": "bfloat16"
+        }
       },
       "outputs": {}
     }

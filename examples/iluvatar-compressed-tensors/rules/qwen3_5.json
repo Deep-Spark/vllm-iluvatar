@@ -1,0 +1,142 @@
+{
+    "schema_version": 1,
+    "name": "qwen3_5_official",
+    "load_device": "cpu",
+    "model_config_patch": {
+        "compression_config": null
+    },
+    "default_action": "keep",
+    "rules": [
+        {
+            "id": "keep_sensitive_tensor",
+            "priority": 1000,
+            "match": {
+                "regex": [
+                    "^lm_head\\.weight$",
+                    "^model\\.language_model\\.embed_tokens\\.weight$",
+                    "^model\\.language_model\\.norm\\.weight$",
+                    "^model\\.language_model\\.layers\\.\\d+\\.(input_layernorm|post_attention_layernorm)\\.weight$",
+                    "^model\\.language_model\\.layers\\.\\d+\\.self_attn\\.(q_norm|k_norm)\\.weight$",
+                    "^model\\.language_model\\.layers\\.\\d+\\.mlp\\.(gate|shared_expert_gate)\\.weight$",
+                    "^model\\.language_model\\.layers\\.\\d+\\.mlp\\.shared_expert\\..*$",
+                    "^model\\.language_model\\.layers\\.\\d+\\.linear_attn\\..*$",
+                    "^model\\.visual\\..*$",
+                    "^mtp\\..*$"
+                ]
+            },
+            "action": "keep"
+        },
+        {
+            "id": "routed_experts_gate_up_to_w4a8",
+            "priority": 900,
+            "match": {
+                "regex": [
+                    "^model\\.language_model\\.layers\\.\\d+\\.mlp\\.experts\\.gate_up_proj$"
+                ],
+                "dtypes": [
+                    "bfloat16"
+                ],
+                "ndims": [
+                    3
+                ]
+            },
+            "action": "convert",
+            "config_group": "routed_experts",
+            "work_device": true,
+            "dequant": {
+                "method": "to_float32"
+            },
+            "quant": {
+                "method": "pack_int4_moe",
+                "options": {
+                    "group_size": -1,
+                    "symmetric": true,
+                    "gemm_format": "TN",
+                    "pack_version": 2,
+                    "scale_layout": "row",
+                    "chunk_last_dim": true
+                }
+            },
+            "iluvatar": {
+                "wna16_use_w4a8": false
+            },
+            "outputs": {
+                "weight_scale": "_scale"
+            }
+        },
+        {
+            "id": "routed_experts_down_to_w4a8",
+            "priority": 899,
+            "match": {
+                "regex": [
+                    "^model\\.language_model\\.layers\\.\\d+\\.mlp\\.experts\\.down_proj$"
+                ],
+                "dtypes": [
+                    "bfloat16"
+                ],
+                "ndims": [
+                    3
+                ]
+            },
+            "action": "convert",
+            "config_group": "routed_experts",
+            "work_device": true,
+            "dequant": {
+                "method": "to_float32"
+            },
+            "quant": {
+                "method": "pack_int4_moe",
+                "options": {
+                    "group_size": -1,
+                    "symmetric": true,
+                    "gemm_format": "TN",
+                    "pack_version": 2,
+                    "scale_layout": "row",
+                    "chunk_last_dim": false
+                }
+            },
+            "iluvatar": {
+                "wna16_use_w4a8": false
+            },
+            "outputs": {
+                "weight_scale": "_scale"
+            }
+        },
+        {
+            "id": "dense_float_to_w8a8",
+            "priority": 800,
+            "match": {
+                "regex": [
+                    "^model\\.language_model\\.layers\\.\\d+\\.self_attn\\.(q_proj|k_proj|v_proj|o_proj)\\.weight$"
+                ],
+                "dtypes": [
+                    "bfloat16"
+                ],
+                "ndims": [
+                    2
+                ]
+            },
+            "action": "convert",
+            "config_group": "dense_linears",
+            "work_device": true,
+            "dequant": {
+                "method": "to_float32"
+            },
+            "quant": {
+                "method": "int8_per_channel",
+                "options": {
+                    "group_size": -1,
+                    "symmetric": true,
+                    "gemm_format": "TN"
+                }
+            },
+            "iluvatar": {
+                "mixed_strategy": "CHANNEL",
+                "gemm_mode": "PERF"
+            },
+            "outputs": {
+                "weight_scale": ".weight_scale"
+            }
+        }
+    ]
+}

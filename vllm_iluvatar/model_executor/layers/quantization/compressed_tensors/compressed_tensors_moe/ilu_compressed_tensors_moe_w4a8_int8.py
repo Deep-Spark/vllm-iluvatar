@@ -1,16 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Iluvatar W4A8 MoE method for compressed-tensors models (e.g. DeepSeek-R1).
+Iluvatar W4A8 MoE method for compressed-tensors models.
 
-Ported from iluvatar_v0.17.0 CompressedTensorsW4A8MoEMethod.
-
-Triggered by VLLM_W8A8_MOE_USE_W4A8=1.
-The checkpoint is described as W8A8 but we run it through ixformer's
-native W4A8 kernels (INT4-packed weights + dynamic INT8 activations).
-
-Key env vars:
-  - VLLM_W4A8_FORMAT: "TN" (default) or "NN"
-  - VLLM_W4A8_VERSION: 2 (default) or 1
+Selected when a config group has an ``iluvatar`` block and Compressed-Tensors
+describes 4-bit weights with 8-bit activations. Layout is taken from
+``iluvatar.gemm_format`` and ``iluvatar.pack_version``.
 """
 
 from typing import Any
@@ -127,9 +121,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         assert self.gemm_format in ["TN", "NN"], (
             "IluCompressedTensorsW4A8Int8MoEMethod only supports format TN or NN"
         )
-        wna16_use_w4a8 = ilu_params.get("wna16_use_w4a8", None)
-        assert wna16_use_w4a8 is not None
-        if not wna16_use_w4a8 and not (
+        if not (
             (
                 self.weight_quant.strategy == QuantizationStrategy.CHANNEL
                 or self.weight_quant.strategy == QuantizationStrategy.GROUP
@@ -141,10 +133,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 "scales for weights and per-token scales for activations are "
                 f"supported. Found {self.weight_quant}, {self.input_quant}"
             )
-        if wna16_use_w4a8:
-            self.static_input_scales = False
-        else:
-            self.static_input_scales = not self.input_quant.dynamic
+        self.static_input_scales = not self.input_quant.dynamic
 
     def create_weights(
         self,

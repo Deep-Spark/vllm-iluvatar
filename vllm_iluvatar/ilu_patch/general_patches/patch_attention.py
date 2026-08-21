@@ -3,7 +3,8 @@
 
 Corresponds to: vllm/model_executor/layers/attention/attention.py
 Target   : vllm.model_executor.layers.attention.attention.Attention.__init__,
-           vllm.model_executor.layers.attention.attention.Attention.forward
+           vllm.model_executor.layers.attention.attention.Attention.forward,
+           Attention.process_weights_after_loading
 Baseline : main_61ac3680210
 Why      : CoreX TorchDynamo cannot trace the community ``torch.Size`` call
            used by Attention's default output-shape allocation path. Ixformer
@@ -38,6 +39,7 @@ def _apply() -> None:
     from vllm_iluvatar.model_executor.layers.attention.attention import (
         make_forward,
         make_init,
+        make_process_weights_after_loading,
     )
 
     # [ILU override] Attention.__init__ - delta: preserve the opaque custom-op
@@ -45,3 +47,7 @@ def _apply() -> None:
     Attention.__init__ = make_init(Attention.__init__)
     # [ILU override] Attention.forward - delta: avoid torch.Size in traced path.
     Attention.forward = make_forward(Attention.forward)
+    # [ILU override] Bind externally calibrated FP8 Q/K/V scales after loading.
+    Attention.process_weights_after_loading = make_process_weights_after_loading(
+        Attention.process_weights_after_loading
+    )

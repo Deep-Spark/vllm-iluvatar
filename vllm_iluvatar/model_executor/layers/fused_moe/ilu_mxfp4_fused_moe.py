@@ -79,12 +79,23 @@ logger = init_logger(__name__)
 
 # MXFP4 microscaling block size: 32 fp4 (e2m1) values share one e8m0 exponent.
 MXFP4_BLOCK = 32
+_IXMM_GROUP_SIZE = 256
 
 # FP4 E2M1 magnitude lookup (3-bit magnitude -> fp32); the sign bit is applied
 # separately. Same table community ``nvfp4_emulation_utils.break_fp4_bytes`` uses.
 _FP4_E2M1_LUT = torch.tensor(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
 )
+
+
+def _zero_pad_last_dim(x: torch.Tensor, size: int) -> torch.Tensor:
+    """Right-pad the last dimension with zeros, preserving dtype and device."""
+    if x.shape[-1] == size:
+        return x
+    assert x.shape[-1] < size, f"cannot pad dimension {x.shape[-1]} to {size}"
+    padded = x.new_zeros((*x.shape[:-1], size))
+    padded[..., : x.shape[-1]] = x
+    return padded
 
 
 def dequant_mxfp4_to_bf16(
@@ -449,7 +460,9 @@ def _ilu_mxfp4_fused_experts_ixformer(
     ``gemm_backend`` is one of ``"torch"`` / ``"ixformer_native"`` / ``"ixmm"``
     and is forwarded verbatim to ``group_gemm_fp4``. It also selects how the
     weight shapes are read: ``ixmm`` consumes the preprocessed ``[E, K/2, N]``
-    layout, the other two the original ``[E, N, K/2]``.
+    layout, the other two the original ``[E, N, K/2]``. For ixmm, K may include
+    right-padding to a 256-element group boundary; the matching activation is
+    zero-padded here before each GEMM.
 
     ``gemm_mode`` is forwarded to ``group_gemm_fp4``: ``None`` (default)
     auto-selects gemv when ``M <= 128``, else gemm; explicit ``0`` / ``1``
@@ -477,8 +490,17 @@ def _ilu_mxfp4_fused_experts_ixformer(
         w13_out = w13_weight.shape[2]
         inter_size = w13_out // 2
         assert w13_out % 2 == 0
-        assert w2_weight.shape[1] * 2 == inter_size
+        w2_k = w2_weight.shape[1] * 2
+        expected_w2_k = (
+            (inter_size + _IXMM_GROUP_SIZE - 1) // _IXMM_GROUP_SIZE * _IXMM_GROUP_SIZE
+        )
+        assert w2_k == expected_w2_k
         assert w2_weight.shape[2] == H
+        assert w2_weight_scale.shape == (
+            E_local,
+            w2_k // _IXMM_GROUP_SIZE,
+            H,
+        )
     else:
         # Original layout: [E, N, K/2].
         assert w13_weight.dtype is torch.int8
@@ -489,6 +511,7 @@ def _ilu_mxfp4_fused_experts_ixformer(
         assert w13_out % 2 == 0
         assert w2_weight.shape[2] * 2 == inter_size
         assert w2_weight.shape[1] == H
+        w2_k = inter_size
 
     # --- 0) Preconditions (each guards a "wrong but no error" case) -------
     assert hidden_states.dtype is torch.bfloat16, (
@@ -556,6 +579,7 @@ def _ilu_mxfp4_fused_experts_ixformer(
         a2_fp8, a2_scale = ixfops.swiglu_limit_dynamic_scaled_fp8(
             gemm1_out, dst_to_src, float(swiglu_limit)
         )
+    a2_fp8 = _zero_pad_last_dim(a2_fp8, w2_k)
 
     # --- 5) GEMM2 -------------------------------------------------------
     gemm2_out = torch.empty((M, H), dtype=torch.bfloat16, device=hidden_states.device)

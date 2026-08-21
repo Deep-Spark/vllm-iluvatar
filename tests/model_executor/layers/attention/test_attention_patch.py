@@ -9,6 +9,7 @@ import torch
 from vllm_iluvatar.model_executor.layers.attention.attention import (
     make_forward,
     make_init,
+    make_process_weights_after_loading,
 )
 
 
@@ -89,3 +90,56 @@ def test_attention_wrapper_preserves_model_supplied_output_shape():
     wrapped(Attention(), torch.zeros(4, 6), None, None, output_shape=shape)
 
     assert captured["shape"] is shape
+
+
+def test_attention_post_load_preserves_community_path_without_external_scales(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("VLLM_ILU_FLASH_ATTN_FP8_SCALE_PATH", raising=False)
+    calls: list[str] = []
+
+    def original(self, act_dtype):
+        calls.append("community")
+
+    class Impl:
+        supports_ilu_external_fp8_scales = True
+
+        def process_weights_after_loading(self, act_dtype, *, layer):
+            calls.append("ilu")
+            return True
+
+    class Attention:
+        impl = Impl()
+
+    make_process_weights_after_loading(original)(Attention(), torch.bfloat16)
+    assert calls == ["community"]
+
+
+def test_attention_post_load_binds_external_scales_before_community_reset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    scale_path = tmp_path / "fp8_scales.pt"
+    scale_path.touch()
+    monkeypatch.setenv(
+        "VLLM_ILU_FLASH_ATTN_FP8_SCALE_PATH",
+        str(scale_path),
+    )
+    calls: list[tuple[str, object]] = []
+
+    def original(self, act_dtype):
+        calls.append(("community", self))
+
+    class Impl:
+        supports_ilu_external_fp8_scales = True
+
+        def process_weights_after_loading(self, act_dtype, *, layer):
+            calls.append(("ilu", layer))
+            return True
+
+    class Attention:
+        impl = Impl()
+
+    attention = Attention()
+    make_process_weights_after_loading(original)(attention, torch.bfloat16)
+    assert calls == [("ilu", attention)]

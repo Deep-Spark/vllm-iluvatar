@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     VLLM_ILU_MIX_QUANTIZATION_TYPE: str = ""
     VLLM_ILU_FLASH_ATTN_QUANT_TYPE: str = ""
     VLLM_ILU_FLASH_ATTN_V_SCALE_PATH: str = ""
+    VLLM_ILU_FLASH_ATTN_FP8_SCALE_PATH: str = ""
     VLLM_ILU_MLA_ATTN_QUANT_TYPE: str = ""
     VLLM_ILU_MLA_CHUNKED_PREFILL_MAX_WS_SIZE: int = 0
     VLLM_ILU_USE_LORA_FUSION: bool = False
@@ -177,6 +178,9 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ILU_FLASH_ATTN_V_SCALE_PATH": lambda: os.environ.get(
         "VLLM_ILU_FLASH_ATTN_V_SCALE_PATH", ""
+    ),
+    "VLLM_ILU_FLASH_ATTN_FP8_SCALE_PATH": lambda: os.environ.get(
+        "VLLM_ILU_FLASH_ATTN_FP8_SCALE_PATH", ""
     ),
     "VLLM_ILU_NIXL_WRITE_USE_HOST_BUFFER": _bool_reader(
         "VLLM_ILU_NIXL_WRITE_USE_HOST_BUFFER", "0"

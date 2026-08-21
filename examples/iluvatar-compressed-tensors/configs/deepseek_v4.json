@@ -1,9 +1,11 @@
 {
-  "quant_method": "iluvatar-compressed-tensors",
+  "quant_method": "compressed-tensors",
   "format": "iluvatar-mixed",
   "config_groups": {
     "routed_experts": {
-      "targets": ["re:.*\\.experts"],
+      "targets": [
+        "re:.*\\.experts"
+      ],
       "weights": {
         "num_bits": 4,
         "type": "int",
@@ -32,15 +34,14 @@
         },
         "pack_version": {
           "$rules": "rules.routed_mxfp4_to_w4a8.quant.options.pack_version"
-        },
-        "wna16_use_w4a8": {
-          "$rules": "rules.routed_mxfp4_to_w4a8.iluvatar.wna16_use_w4a8"
         }
       }
     },
     "shared_experts": {
       "format": "int-quantized",
-      "targets": ["re:.*\\.shared_experts\\.(gate_up_proj|down_proj)$"],
+      "targets": [
+        "re:.*\\.shared_experts\\.(gate_up_proj|down_proj)$"
+      ],
       "weights": {
         "num_bits": 8,
         "type": "int",
@@ -118,7 +119,9 @@
       }
     },
     "wo_a_w8a16": {
-      "targets": ["re:.*\\.attn\\.wo_a$"],
+      "targets": [
+        "re:.*\\.attn\\.wo_a$"
+      ],
       "weights": {
         "num_bits": 8,
         "type": "int",
@@ -146,7 +149,7 @@
   },
   "ignore": [
     "embed",
-    "head",
+    "lm_head",
     "re:.*norm.*",
     "re:hc_head_(base|fn|scale)$",
     "re:.*\\.attn\\.attn_sink$",

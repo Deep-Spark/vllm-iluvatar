@@ -41,6 +41,26 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "Export compile_commands.json" F
 
 message(STATUS "vllm_iluvatar: CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES}")
 
+# Platform mapping: ivcore arch -> BUILD_ON_* (names aligned with ixformer /
+# ixinfer). Sources use these to compile arch-specific kernels (e.g. the FP8
+# E4M3 cache path, which only exists on ivcore30) while still defining and
+# binding every operator on every arch. The arch string itself is handed to the
+# sources as VLLM_ILUVATAR_CUDA_ARCH and re-exported by compiled_cuda_arch().
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "ivcore10")
+  set(VLLM_ILUVATAR_BUILD_ON_FLAG "BUILD_ON_BI")
+elseif(CMAKE_CUDA_ARCHITECTURES STREQUAL "ivcore11")
+  set(VLLM_ILUVATAR_BUILD_ON_FLAG "BUILD_ON_MR")
+elseif(CMAKE_CUDA_ARCHITECTURES STREQUAL "ivcore20")
+  set(VLLM_ILUVATAR_BUILD_ON_FLAG "BUILD_ON_QS")
+elseif(CMAKE_CUDA_ARCHITECTURES STREQUAL "ivcore30")
+  set(VLLM_ILUVATAR_BUILD_ON_FLAG "BUILD_ON_CQ")
+else()
+  message(FATAL_ERROR
+    "vllm_iluvatar: unsupported CMAKE_CUDA_ARCHITECTURES: ${CMAKE_CUDA_ARCHITECTURES}")
+endif()
+
+message(STATUS "vllm_iluvatar: platform=${VLLM_ILUVATAR_BUILD_ON_FLAG}")
+
 if(NOT DEFINED ENV{TORCH_CUDA_ARCH_LIST} OR "$ENV{TORCH_CUDA_ARCH_LIST}" STREQUAL "")
   set(ENV{TORCH_CUDA_ARCH_LIST} "${CMAKE_CUDA_ARCHITECTURES}")
 endif()
@@ -120,6 +140,8 @@ set_target_properties(_C PROPERTIES
 
 target_compile_definitions(_C PRIVATE
   TORCH_EXTENSION_NAME=_C
+  ${VLLM_ILUVATAR_BUILD_ON_FLAG}
+  VLLM_ILUVATAR_CUDA_ARCH="${CMAKE_CUDA_ARCHITECTURES}"
   _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX11_ABI})
 
 target_compile_options(_C PRIVATE

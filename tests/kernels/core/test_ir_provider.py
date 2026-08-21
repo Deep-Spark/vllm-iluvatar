@@ -82,10 +82,14 @@ def test_rms_norm_matches_native(
     num_tokens: int, hidden_size: int, dtype: torch.dtype
 ) -> None:
     torch.manual_seed(0)
-    torch.set_default_device("cuda:0")
+    device = "cuda:0"
 
-    weight = torch.empty(hidden_size, dtype=dtype).normal_(mean=1.0, std=0.1)
-    x = torch.randn(num_tokens, hidden_size, dtype=dtype) * (1 / (2 * hidden_size))
+    weight = torch.empty(hidden_size, dtype=dtype, device=device).normal_(
+        mean=1.0, std=0.1
+    )
+    x = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device) * (
+        1 / (2 * hidden_size)
+    )
     epsilon = 1e-6
 
     ilu = ir.ops.rms_norm.impls["iluvatar"].impl_fn(x, weight, epsilon)
@@ -101,11 +105,17 @@ def test_fused_add_rms_norm_matches_native(
     num_tokens: int, hidden_size: int, dtype: torch.dtype
 ) -> None:
     torch.manual_seed(0)
-    torch.set_default_device("cuda:0")
+    device = "cuda:0"
 
-    weight = torch.empty(hidden_size, dtype=dtype).normal_(mean=1.0, std=0.1)
-    x = torch.randn(num_tokens, hidden_size, dtype=dtype) * (1 / (2 * hidden_size))
-    residual = torch.randn(num_tokens, hidden_size, dtype=dtype) * (1 / hidden_size)
+    weight = torch.empty(hidden_size, dtype=dtype, device=device).normal_(
+        mean=1.0, std=0.1
+    )
+    x = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device) * (
+        1 / (2 * hidden_size)
+    )
+    residual = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device) * (
+        1 / hidden_size
+    )
     epsilon = 1e-6
 
     # The iluvatar impl is in-place (inplace=True), so clone per call.

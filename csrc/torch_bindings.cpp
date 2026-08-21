@@ -9,6 +9,7 @@
 // to the Iluvatar implementations.
 #include <torch/library.h>
 
+#include "build_info.h"
 #include "core/registration.h"
 #include "community/ops.h"
 #include "plugin/ops.h"
@@ -25,6 +26,19 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
       "rotary_embedding(Tensor positions, Tensor! query, Tensor!? key, "
       "int head_size, Tensor cos_sin_cache, bool is_neox, "
       "int rope_dim_offset=0, bool inverse=False) -> ()");
+  ops.def(
+      "static_scaled_fp8_quant(Tensor! result, Tensor input, Tensor scale, "
+      "int[]? group_shape=None) -> ()");
+  // Plugin-internal query op: arch-gated operators (e.g. the FP8 pair, which
+  // only carries kernels on ivcore30) are bound on every arch, so callers and
+  // tests need a way to ask which build this is. Device-independent, hence a
+  // catch-all kernel registered together with the schema.
+  ops.def("compiled_cuda_arch() -> str", &vllm_iluvatar::compiled_cuda_arch);
+  ops.def(
+      "reshape_and_cache_fp8("
+      "Tensor key, Tensor value, Tensor! key_cache, Tensor! value_cache, "
+      "Tensor slot_mapping, str kv_cache_dtype, Tensor k_scale, Tensor v_scale"
+      ") -> ()");
   // Plugin-internal op (NOT a community torch.ops._C op): backs the
   // ApplyRotaryEmb OOT override; consumed only by the plugin, never by
   // community source. Kept in the ``_C`` namespace alongside the other native
@@ -65,6 +79,10 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
 TORCH_LIBRARY_IMPL_EXPAND(_C, CUDA, ops) {
   ops.impl("rms_norm", &vllm_iluvatar::rms_norm);
   ops.impl("rotary_embedding", &vllm_iluvatar::rotary_embedding);
+  ops.impl("static_scaled_fp8_quant",
+           &vllm_iluvatar::static_scaled_fp8_quant);
+  ops.impl("reshape_and_cache_fp8",
+           &vllm_iluvatar::reshape_and_cache_fp8);
   ops.impl("apply_rotary_emb", &vllm_iluvatar::apply_rotary_emb);
   ops.impl("fused_qk_rmsnorm_rope_gate",
            &vllm_iluvatar::fused_qk_rmsnorm_rope_gate);

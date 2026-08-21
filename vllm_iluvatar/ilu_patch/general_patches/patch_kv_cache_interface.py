@@ -42,12 +42,15 @@ def _apply() -> None:
     #  get_kv_cache_config_from_groups from vllm_iluvatar.v1.core.kv_cache_utils
     #  _reshape_kv_cache_tensors_with_scales from vllm_iluvatar.v1.worker.gpu_model_runner
     if envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE != "":
-        from vllm.v1.kv_cache_interface import FullAttentionSpec
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
         from vllm_iluvatar.v1.kv_cache_interface import (
             _full_attention_fixed_size_bytes,
             _full_attention_real_page_size_bytes,
             _full_attention_scale_page_size_bytes,
+            _sliding_window_fixed_size_bytes,
+            _sliding_window_real_page_size_bytes,
+            _sliding_window_scale_page_size_bytes,
         )
 
         FullAttentionSpec.real_page_size_bytes = property(
@@ -57,6 +60,13 @@ def _apply() -> None:
             _full_attention_scale_page_size_bytes
         )
         FullAttentionSpec.fixed_size_bytes = property(_full_attention_fixed_size_bytes)
+        SlidingWindowSpec.real_page_size_bytes = property(
+            _sliding_window_real_page_size_bytes
+        )
+        SlidingWindowSpec.scale_page_size_bytes = property(
+            _sliding_window_scale_page_size_bytes
+        )
+        SlidingWindowSpec.fixed_size_bytes = property(_sliding_window_fixed_size_bytes)
 
     if envs.VLLM_ILU_MLA_ATTN_QUANT_TYPE != "":
         from vllm.v1.kv_cache_interface import MLAAttentionSpec

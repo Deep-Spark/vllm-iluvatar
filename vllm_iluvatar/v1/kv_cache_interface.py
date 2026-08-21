@@ -70,6 +70,57 @@ def _full_attention_fixed_size_bytes(self) -> int:
     return 0
 
 
+# Iluvatar Sliding Window Attention scale part
+def _sliding_window_real_page_size_bytes(self) -> int:
+    import vllm.v1.kv_cache_interface as _m
+
+    # NOTE >>> iluvatar attention quantization
+    if envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE == "KVINT8":
+        return (
+            self.block_size * self.num_kv_heads * self.head_size
+            + self.block_size * self.num_kv_heads * self.head_size_v
+        )
+    elif envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE == "KINT8":
+        return (
+            self.block_size * self.num_kv_heads * self.head_size
+            + self.block_size
+            * self.num_kv_heads
+            * self.head_size_v
+            * _m.get_dtype_size(self.dtype)
+        )
+    # <<< iluvatar attention quantization
+    if self.kv_quant_mode.is_nvfp4:
+        last_dim = _m.nvfp4_kv_cache_full_dim(
+            self.head_size
+        ) + _m.nvfp4_kv_cache_full_dim(self.head_size_v)
+        return (
+            self.block_size
+            * self.num_kv_heads
+            * last_dim
+            * _m.get_dtype_size(self.dtype)
+        )
+    return (
+        self.block_size
+        * self.num_kv_heads
+        * (self.head_size + self.head_size_v)
+        * _m.get_dtype_size(self.dtype)
+    )
+
+
+def _sliding_window_scale_page_size_bytes(self) -> int:
+    import vllm.v1.kv_cache_interface as _m
+
+    return self.block_size * self.num_kv_heads * _m.get_dtype_size(torch.float32)
+
+
+def _sliding_window_fixed_size_bytes(self) -> int:
+    import vllm.v1.kv_cache_interface as _m
+
+    if envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE == "KVINT8":
+        return self.num_kv_heads * self.head_size_v * _m.get_dtype_size(torch.float32)
+    return 0
+
+
 # Iluvatar MLA Attention scale part
 def _mla_attention_real_page_size_bytes(self) -> int:
     import vllm.v1.kv_cache_interface as _m

@@ -18,8 +18,10 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from torch.nn.parameter import Parameter
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.models.step3p5 import (
     FusedMoEBlock as _FusedMoEBlock,
 )
@@ -101,8 +103,28 @@ class IluStep3p5Attention(_Step3p5Attention):
         return output
 
 
+class IluReplicatedLinear(ReplicatedLinear):
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        # assert self.weight.dtype != torch.float32
+        output, output_bias = super().forward(x)
+        return output.to(torch.float32), output_bias
+
+
 class IluFusedMoEBlock(_FusedMoEBlock):
     """Community MoE block that preserves the fused W8A8 input tuple."""
+
+    @staticmethod
+    def promote(layer: _FusedMoEBlock) -> None:
+        gate_weight = layer.gate.weight
+        if gate_weight.dtype == torch.float32:
+            gate_weight = gate_weight.to(torch.get_default_dtype())
+            from vllm.model_executor.utils import replace_parameter
+
+            replace_parameter(layer.gate, "weight", gate_weight)
+            layer.gate.__class__ = IluReplicatedLinear
 
     def check_fused_quant_for_input(self) -> bool:
         return _uses_ilu_w8a8_int8(self.share_expert.gate_up_proj)
@@ -139,6 +161,7 @@ class IluStep3p5DecoderLayer(_Step3p5DecoderLayer):
         layer.self_attn.__class__ = IluStep3p5Attention
         if layer.use_moe:
             layer.moe.__class__ = IluFusedMoEBlock
+            IluFusedMoEBlock.promote(layer.moe)
         else:
             layer.mlp.__class__ = IluStep3p5MLP
 

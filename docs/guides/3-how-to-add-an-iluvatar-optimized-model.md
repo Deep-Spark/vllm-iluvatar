@@ -31,7 +31,7 @@
 
 天数优化模型的接入遵循三条硬性原则：
 
-1. **通过 registry 路由到插件实现，不改社区源码**。优先使用 checkpoint / 社区已经暴露的目标 arch（如 `DeepseekV4ForCausalLM`、`DeepseekV32ForCausalLM`）作为 registry key，指向插件内的 `Ilu...` 实现类；如果是社区没有的新增架构，也可以注册新的 `IluXXXForCausalLM`。社区 `deepseek_v2.py` 等源文件保持逐字节不变；checkpoint 的 `config.json::architectures` 指向 registry key，加载时即解析到插件实现。
+1. **通过 registry 路由到插件实现，不改社区源码**。优先使用 checkpoint / 社区已经暴露的目标 arch（如 `DeepseekV4ForCausalLM`、`DeepseekV32ForCausalLM`）作为 registry key，指向插件内的**同等社区模型位置**实现类；如果是社区没有的新增架构，也可以注册新的 `IluXXXForCausalLM`。社区 `deepseek_v2.py` 等源文件保持逐字节不变；checkpoint 的 `config.json::architectures` 指向 registry key，加载时即解析到插件实现。
 
 2. **模型算法链完全重写，尽量走插件接口**。运行路径走 `vllm-iluvatar` 内部接口，**不走社区**的 `MultiHeadLatentAttentionWrapper` / `MLAAttention` / `SparseMLAAttentionImpl` / `sparse_attn_indexer`。attention 的 rope、吸收 up-proj、sparse kernel、indexer top-k 全部由插件自行实现或经 `ixf_ops` / ilu backend 完成。只有**基础设施**（`*Linear` / `RMSNorm` / `get_rope` / ilu FlashMLA backend 的 metadata 与 cache）才复用。
 
@@ -91,8 +91,8 @@
 1. **量化后的 safetensors**：按下表做混合量化。
 2. **重建的 `model.safetensors.index.json`**：按新 shard 的实际 dtype/shape 重新计算 `total_size` 与 `weight_map`。
 3. **改写的 `config.json`**：
-   - `architectures` 改为 `["IluXXXForCausalLM"]`；
-   - 写入 `quantization_config`，其 `quant_method="iluvatar-compressed-tensors"`（复用统一的混合量化 schema，见 [3.4](#34-moe-与混合量化)）。
+   - 修改或增加 `quantization_config`，其 `quant_method="compressed-tensors"`（复用统一的混合量化 schema，见 [3.4](#34-moe-与混合量化)）。
+   - 保持其它部分不变。
 
 混合量化布局（以 GLM-5.2 为例）：
 
@@ -139,7 +139,7 @@
   ```
 
 - **融合参数映射**：`packed_modules_mapping` 与 `load_weights` 中的 `stacked_params_mapping` 定义加载期融合——`gate_up_proj`（gate+up）、`fused_qkv_a_proj`（q_a + kv_a）、`wk_weights_proj`（indexer wk + weights_proj）；expert 权重走 `fused_moe_make_expert_params_mapping`。
-- **严格 reverse 校验**：量化模式下，vLLM 的 `DefaultModelLoader` 只在 `quantization is None` 时才检查"是否所有参数都被填充"。天数模型在 `--quantization iluvatar-compressed-tensors` 下须自行确定所有层都有正确的后端方法， 避免缺 scale / 命名不匹配时静默回退到随机初始化。
+- **严格 reverse 校验**：量化模式下，vLLM 的 `DefaultModelLoader` 只在 `quantization is None` 时才检查"是否所有参数都被填充"。天数模型在 `--quantization compressed-tensors` 下须自行确定所有层都有正确的后端方法， 避免缺 scale / 命名不匹配时静默回退到随机初始化。
 - **MoE 要点**：sigmoid 打分 + `noaux_tc` 校正 bias（`e_score_correction_bias`）+ grouped top-k；`routed_scaling_factor` 在**输出侧**应用（`apply_routed_scale_to_output`，避免 router 侧重复缩放）。
 
 ### 3.3 attention 抽离
@@ -174,7 +174,7 @@ direct_register_custom_op(
 
 混合量化配置以 [`compressed_tensors.py`](../../vllm_iluvatar/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py) 为模板。它是统一的量化 config，新模型可直接复用.
 
-- **注册与激活**：类上标注 `@register_quantization_config("iluvatar-compressed-tensors")`（由 `ilu_register` 在 import 期触发），并实现 `override_quantization_method`——只要 checkpoint 的 `quantization_config.quant_method` 命中即自动激活，社区的 quantization 注册表与 `config/model.py` 保持零改动。详细内容，请见[`6-how-to-use-and-provide-iluvatar-extend-compress-tensors.md`](../guides/6-how-to-use-and-provide-iluvatar-extend-compress-tensors.md)
+- **注册与激活**：`IluQuantConfig` 标注 `@register_quantization_config("compressed-tensors")`（由 `ilu_register` 在 import 期触发），替换官方同名配置类。checkpoint 的 `quantization_config.quant_method` 为 `compressed-tensors` 时自动走插件后端，社区的 quantization 注册表与 `config/model.py` 保持零改动。详细内容，请见[`6-how-to-use-and-provide-iluvatar-extend-compress-tensors.md`](../guides/6-how-to-use-and-provide-iluvatar-extend-compress-tensors.md)
 
 ### 3.5 三种运行模式：eager / cuda-graph / MTP
 
@@ -239,9 +239,9 @@ MTP 还需两个 `ilu_patch.general_patches`（各暴露 `register()`，由 `app
 | 作用 | 文件 |
 | --- | --- |
 | OOT 注册入口（登记模型包） | [`vllm_iluvatar/ilu_register/__init__.py`](../../vllm_iluvatar/ilu_register/__init__.py) |
-| 模型图 + 权重加载 + `register_model()` | [`vllm_iluvatar/model_executor/models/ilu_glm/model.py`](../../vllm_iluvatar/model_executor/models/ilu_glm/model.py) |
-| 自包含 attention 链 + plugin-local opaque op | [`vllm_iluvatar/model_executor/models/ilu_glm/attention.py`](../../vllm_iluvatar/model_executor/models/ilu_glm/attention.py) |
-| MTP draft 模型 | [`vllm_iluvatar/model_executor/models/ilu_glm/mtp.py`](../../vllm_iluvatar/model_executor/models/ilu_glm/mtp.py) |
+| 模型图 + 权重加载 + `register_model()` | [`vllm_iluvatar/models/glm_moe_dsa/model.py`](../../vllm_iluvatar/models/glm_moe_dsa/model.py) |
+| 自包含 attention 链 + plugin-local opaque op | [`vllm_iluvatar/models/glm_moe_dsa/attention.py`](../../vllm_iluvatar/models/glm_moe_dsa/attention.py) |
+| MTP draft 模型 | [`vllm_iluvatar/models/glm_moe_dsa/mtp.py`](../../vllm_iluvatar/models/glm_moe_dsa/mtp.py) |
 | 混合量化 config（W4A8/W8A8/W8A16 分发） | [`vllm_iluvatar/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py`](../../vllm_iluvatar/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py) |
 | MTP draft-arch 重定向实现 | [`vllm_iluvatar/config/speculative.py`](../../vllm_iluvatar/config/speculative.py) |
 | MTP tuple 返回契约实现 | [`vllm_iluvatar/v1/spec_decode/llm_base_proposer.py`](../../vllm_iluvatar/v1/spec_decode/llm_base_proposer.py) |
@@ -249,10 +249,10 @@ MTP 还需两个 `ilu_patch.general_patches`（各暴露 `register()`，由 `app
 
 ### 步骤速览
 
-1. **权重转换**：混合量化产出 safetensors + 重建 index + 改写 `config.json`（`architectures` → `IluXXXForCausalLM`，`quant_method` → `iluvatar-compressed-tensors`）。
+1. **权重转换**：混合量化产出 safetensors + 重建 index + 改写 `config.json`。
 2. **模型适配**：按 `model.py` 模板搭 `IluXXXForCausalLM`，实现融合参数映射与严格 reverse 校验，`register_model()` 注册 causal-LM + MTP，并把包加入 `_OOT_MODEL_PACKAGES`。
 3. **attention 抽离**：三层自包含 attention，数据依赖控制流用 `direct_register_custom_op` 封成 plugin-local opaque op（独立算子名、padding 行保护）。
-4. **MoE / 量化**：复用 `iluvatar-compressed-tensors`，`kv_b_proj` 走 `IluGlmKVBProjW8A16Method` 拆 `W_UK/W_UV`，grouped-BMM method 的 `apply` 抛 `NotImplementedError`。
+4. **MoE / 量化**：复用 `compressed-tensors`（`IluQuantConfig`），`kv_b_proj` 走 `IluGlmKVBProjW8A16Method` 拆 `W_UK/W_UV`，grouped-BMM method 的 `apply` 抛 `NotImplementedError`。
 5. **三种模式**：先 eager 打基线；再用 `--compilation-config` 开 `FULL_DECODE_ONLY` cuda-graph；最后加 `mtp.py` + 两个 general patch 开 MTP（注意 `draft_pipeline_parallel_size: 1` 与 PP 首层须为 full 层）。
 
 本文的所有代码引用均来自 GLM-5.2（`IluGlmMoeDsa`）这一落地实现，可作为对照。

@@ -8,9 +8,11 @@ import importlib
 import sys
 from types import MethodType, ModuleType, SimpleNamespace
 
+import pytest
 import torch
 import vllm.envs as envs
-from conftest import requires_cuda
+import vllm_iluvatar._C  # noqa: F401
+from conftest import COMPILED_CUDA_ARCH, requires_cuda
 
 import vllm_iluvatar.ilu_register as ilu_register
 
@@ -23,6 +25,12 @@ KEY_DIM = NUM_K_HEADS * HEAD_K_DIM
 VALUE_DIM = NUM_V_HEADS * HEAD_V_DIM
 CONV_DIM = 2 * KEY_DIM + VALUE_DIM
 CONV_KERNEL = 4
+
+supported_architectures = ["ivcore11"]
+test_forward_core = pytest.mark.skipif(
+    COMPILED_CUDA_ARCH not in supported_architectures,
+    reason=f"ixinfer gdn kernel need {supported_architectures} build, got {COMPILED_CUDA_ARCH}",
+)
 
 
 def _install_fake_community_gdn(monkeypatch):
@@ -327,6 +335,7 @@ def _build_community_chunk_rule(community_module):
         return community_module.ChunkGatedDeltaRule()
 
 
+@test_forward_core
 @requires_cuda
 def test_forward_core_split_reference_matches_plugin_non_split(
     cuda_device, monkeypatch

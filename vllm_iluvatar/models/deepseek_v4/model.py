@@ -7,7 +7,7 @@ diverges in three places:
 1. **Quantization scheme** - this model expects checkpoints converted by
    ``my_tests/deepseek/deepseek-v4/convert_w4a8/convert_v4_to_w4a8.py``,
    which write a fresh ``quantization_config`` block whose
-   ``quant_method == "iluvatar-compressed-tensors"`` (handled by
+   ``quant_method == "compressed-tensors"`` (handled by
    :class:`IluQuantConfig`). Only ``IluDeepseekV4ForCausalLM``
    should be paired with that config; the upstream ``DeepseekV4ForCausalLM``
    continues to handle the original FP4/FP8 layouts.
@@ -635,7 +635,7 @@ class IluDeepseekV4Attention(nn.Module):
             prefix=f"{prefix}.wo_b",
         )
         self.softmax_scale = self.head_dim**-0.5
-        # The new iluvatar-compressed-tensors quant_config doesn't carry scale_fmt;
+        # The compressed-tensors IluQuantConfig path doesn't carry scale_fmt;
         # default to ue8m0 for forward-time helpers (stage 1 doesn't use it).
         self.scale_fmt = (
             (config.quantization_config or {}).get("scale_fmt", "ue8m0")

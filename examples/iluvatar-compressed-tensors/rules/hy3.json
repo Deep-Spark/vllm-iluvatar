@@ -11,7 +11,9 @@
       "id": "drop_static_scale",
       "priority": 1000,
       "match": {
-        "suffixes": ["_scale"]
+        "suffixes": [
+          "_scale"
+        ]
       },
       "action": "drop"
     },
@@ -39,7 +41,9 @@
         "regex": [
           "^model\\.layers\\.\\d+\\.mlp\\.experts\\.\\d+\\.(gate_proj|up_proj|down_proj)\\.weight$"
         ],
-        "dtypes": ["float8_e4m3fn"]
+        "dtypes": [
+          "float8_e4m3fn"
+        ]
       },
       "action": "convert",
       "scale": {
@@ -48,7 +52,9 @@
       },
       "dequant": {
         "method": "fp8_static",
-        "options": {"block_size": -1}
+        "options": {
+          "block_size": -1
+        }
       },
       "quant": {
         "method": "int4_moe",
@@ -59,9 +65,6 @@
           "pack_version": 2,
           "scale_layout": "row"
         }
-      },
-      "iluvatar": {
-        "wna16_use_w4a8": false
       },
       "outputs": {
         "weight_scale": ".weight_scale",
@@ -78,7 +81,9 @@
         ]
       },
       "action": "convert",
-      "dequant": {"method": "to_float32"},
+      "dequant": {
+        "method": "to_float32"
+      },
       "quant": {
         "method": "int4_moe",
         "options": {
@@ -88,9 +93,6 @@
           "pack_version": 2,
           "scale_layout": "row"
         }
-      },
-      "iluvatar": {
-        "wna16_use_w4a8": false
       },
       "outputs": {
         "weight_scale": ".weight_scale",
@@ -107,7 +109,9 @@
           "^model\\.layers\\.0\\.mlp\\.(gate_proj|up_proj|down_proj)\\.weight$",
           "^model\\.layers\\.\\d+\\.mlp\\.shared_mlp\\.(gate_proj|up_proj|down_proj)\\.weight$"
         ],
-        "dtypes": ["float8_e4m3fn"]
+        "dtypes": [
+          "float8_e4m3fn"
+        ]
       },
       "action": "convert",
       "scale": {
@@ -116,7 +120,9 @@
       },
       "dequant": {
         "method": "fp8_static",
-        "options": {"block_size": -1}
+        "options": {
+          "block_size": -1
+        }
       },
       "quant": {
         "method": "int8_per_channel",
@@ -130,7 +136,9 @@
         "mixed_strategy": "CHANNEL",
         "gemm_mode": "PERF"
       },
-      "outputs": {"weight_scale": ".weight_scale"}
+      "outputs": {
+        "weight_scale": ".weight_scale"
+      }
     },
     {
       "id": "dense_float_to_w8a8",
@@ -143,7 +151,9 @@
         ]
       },
       "action": "convert",
-      "dequant": {"method": "to_float32"},
+      "dequant": {
+        "method": "to_float32"
+      },
       "quant": {
         "method": "int8_per_channel",
         "options": {
@@ -156,7 +166,9 @@
         "mixed_strategy": "CHANNEL",
         "gemm_mode": "PERF"
       },
-      "outputs": {"weight_scale": ".weight_scale"}
+      "outputs": {
+        "weight_scale": ".weight_scale"
+      }
     }
   ]
 }

@@ -45,7 +45,7 @@
 
 | 维度 | 快速适配社区模型（本文） | 天数优化模型（[3-...](3-how-to-add-an-iluvatar-optimized-model.md)） |
 | --- | --- | --- |
-| arch 命名 | 沿用社区名覆盖（`HYV3ForCausalLM`） | 新注册 `IluXXXForCausalLM` |
+| arch 命名 | 沿用社区名覆盖（`HYV3ForCausalLM`） | 保持使用 `XXXForCausalLM` |
 | 与社区关系 | 子类化，继承为主 + 逐类最小覆盖 | 模型算法链完全重写，尽量不走社区接口 |
 | 天数差异规模 | 少数算子（如一处 norm 融合） | attention / 量化 / 投机解码全链路优化 |
 | 文件布局 | 单文件 `models/<arch>.py` | 多文件包 `models/ilu_xxx/` |

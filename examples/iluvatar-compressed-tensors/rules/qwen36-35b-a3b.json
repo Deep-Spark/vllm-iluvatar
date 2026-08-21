@@ -59,9 +59,6 @@
                     "chunk_dim": -2
                 }
             },
-            "iluvatar": {
-                "wna16_use_w4a8": false
-            },
             "outputs": {
                 "weight_scale": "_scale"
             }
@@ -95,9 +92,6 @@
                     "scale_layout": "row",
                     "packed": false
                 }
-            },
-            "iluvatar": {
-                "wna16_use_w4a8": false
             },
             "outputs": {
                 "weight_scale": "_scale"

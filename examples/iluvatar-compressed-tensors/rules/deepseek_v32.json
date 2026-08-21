@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "name": "deepseek_v32_ct",
+  "load_device": "requested",
+  "model_config_patch": {
+    "quantization_config": null,
+    "compression_config": null,
+    "architectures": ["DeepseekV32ForCausalLM"]
+  },
+  "default_action": "keep",
+  "rules": [
+    {
+      "id": "drop_consumed_scale",
+      "priority": 1000,
+      "match": {
+        "suffixes": [".weight_scale_inv"]
+      },
+      "action": "drop"
+    },
+    {
+      "id": "routed_fp8_to_w4a8",
+      "priority": 900,
+      "match": {
+        "regex": [
+          "^model\\.layers\\.\\d+\\.mlp\\.experts\\.\\d+\\.(gate_proj|up_proj|down_proj)\\.weight$"
+        ],
+        "dtypes": ["float8_e4m3fn"]
+      },
+      "action": "convert",
+      "scale": {
+        "from_suffix": ".weight",
+        "to_suffix": ".weight_scale_inv"
+      },
+      "dequant": {
+        "method": "fp8_block",
+        "options": {"block_size": 128}
+      },
+      "quant": {
+        "method": "int4_moe",
+        "options": {
+          "group_size": -1,
+          "symmetric": true,
+          "gemm_format": "TN",
+          "pack_version": 2,
+          "scale_layout": "row"
+        }
+      },
+      "iluvatar": {
+        "wna16_use_w4a8": false
+      },
+      "outputs": {
+        "weight_scale": ".weight_scale",
+        "i8_weight_scale": ".i8_weight_scale",
+        "i8_weight_zero": ".i8_weight_zero"
+      }
+    },
+    {
+      "id": "dense_fp8_to_w8a8",
+      "priority": 800,
+      "match": {
+        "regex": [
+          "^model\\.layers\\.\\d+\\.mlp\\.(gate_proj|up_proj|down_proj)\\.weight$",
+          "^model\\.layers\\.\\d+\\.mlp\\.shared_experts\\.(gate_proj|up_proj|down_proj)\\.weight$",
+          "^model\\.layers\\.\\d+\\.self_attn\\.(q_a_proj|q_b_proj|kv_a_proj_with_mqa|o_proj)\\.weight$",
+          "^model\\.layers\\.\\d+\\.self_attn\\.indexer\\.wq_b\\.weight$"
+        ],
+        "dtypes": ["float8_e4m3fn"]
+      },
+      "action": "convert",
+      "scale": {
+        "from_suffix": ".weight",
+        "to_suffix": ".weight_scale_inv"
+      },
+      "dequant": {
+        "method": "fp8_block",
+        "options": {"block_size": 128}
+      },
+      "quant": {
+        "method": "int8_per_channel",
+        "options": {
+          "group_size": -1,
+          "symmetric": true,
+          "gemm_format": "TN"
+        }
+      },
+      "iluvatar": {
+        "mixed_strategy": "CHANNEL",
+        "gemm_mode": "PERF"
+      },
+      "outputs": {
+        "weight_scale": ".weight_scale"
+      }
+    },
+    {
+      "id": "remaining_fp8_to_bfloat16",
+      "priority": 100,
+      "match": {
+        "dtypes": ["float8_e4m3fn"],
+        "suffixes": [".weight"]
+      },
+      "action": "convert",
+      "scale": {
+        "from_suffix": ".weight",
+        "to_suffix": ".weight_scale_inv"
+      },
+      "dequant": {
+        "method": "fp8_block",
+        "options": {"block_size": 128}
+      },
+      "quant": {
+        "method": "cast",
+        "options": {"dtype": "bfloat16"}
+      },
+      "outputs": {}
+    }
+  ]
+}

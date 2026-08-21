@@ -1,5 +1,5 @@
 {
-  "quant_method": "iluvatar-compressed-tensors",
+  "quant_method": "compressed-tensors",
   "format": "iluvatar-mixed",
   "config_groups": {
     "routed_experts": {
@@ -34,9 +34,6 @@
         },
         "pack_version": {
           "$rules": "rules.routed_experts_to_w4a8.quant.options.pack_version"
-        },
-        "wna16_use_w4a8": {
-          "$rules": "rules.routed_experts_to_w4a8.iluvatar.wna16_use_w4a8"
         }
       }
     },

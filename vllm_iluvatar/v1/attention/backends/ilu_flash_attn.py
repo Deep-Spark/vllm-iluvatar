@@ -10,6 +10,7 @@ Remove: No.
 """
 
 import copy
+import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import ClassVar
@@ -19,6 +20,7 @@ import numpy as np
 import torch
 import vllm.envs as envs
 from ixformer.contrib.vllm_flash_attn import (
+    flash_attn_varlen_fp8_func,
     flash_attn_varlen_func,
     flash_attn_varlen_int8_func,
     flash_attn_with_kvcache,
@@ -59,7 +61,11 @@ from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.kv_cache_interface import AttentionSpec
 
-from vllm_iluvatar.v1.attention.ilu_static_quant import StaticQuantManager
+from vllm_iluvatar.v1.attention.ilu_static_quant import (
+    FP8StaticQuantManager,
+    StaticQuantManager,
+    load_static_fp8_qkv_scales,
+)
 
 logger = init_logger(__name__)
 
@@ -129,6 +135,8 @@ class IluFlashAttentionBackend(AttentionBackend):
         "auto",
         "float16",
         "bfloat16",
+        "fp8",
+        "fp8_e4m3",
     ]
 
     @staticmethod
@@ -219,9 +227,7 @@ class IluFlashAttentionBackend(AttentionBackend):
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
         if kv_cache_dtype is None:
             return True
-        if kv_cache_dtype in ("fp8", "fp8_e4m3"):
-            return False
-        return kv_cache_dtype in ["auto", "float16", "bfloat16"]
+        return kv_cache_dtype in cls.supported_kv_cache_dtypes
 
     @classmethod
     def supports_sink(cls) -> bool:
@@ -603,6 +609,7 @@ class IluFlashAttentionMetadataBuilder(
 
 class IluFlashAttentionImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
+    supports_ilu_external_fp8_scales: bool = True
 
     def __init__(
         self,
@@ -632,6 +639,7 @@ class IluFlashAttentionImpl(AttentionImpl):
         else:
             self.sliding_window = (sliding_window - 1, 0)
         self.kv_cache_dtype = kv_cache_dtype
+        self.is_fp8 = kv_cache_dtype in ("fp8", "fp8_e4m3")
         if logits_soft_cap is None:
             logits_soft_cap = 0
         self.logits_soft_cap = logits_soft_cap
@@ -658,7 +666,10 @@ class IluFlashAttentionImpl(AttentionImpl):
             )
             assert self.sinks.shape[0] == num_heads
 
-        self.supports_quant_query_input = True
+        # FP8 Q is quantized below after the calibrated per-layer scale is
+        # loaded. Letting Attention quantize it first would use its default
+        # checkpoint scale before this backend can bind the calibration value.
+        self.supports_quant_query_input = False
         self.supports_per_head_quant_scales = (
             self.vllm_flash_attn_version >= 3
             if self.vllm_flash_attn_version is not None
@@ -670,29 +681,65 @@ class IluFlashAttentionImpl(AttentionImpl):
             "VLLM_ILU_FLASH_ATTN_QUANT_TYPE only supports '', 'KVINT8', "
             f"or 'KINT8', but got {attn_quant_type!r}"
         )
-        self.quant_type = attn_quant_type
-        post_quant_kv_int8_path = envs.VLLM_ILU_FLASH_ATTN_V_SCALE_PATH
-        if post_quant_kv_int8_path != "":
-            assert attn_quant_type in ["", "KVINT8"]
-            self.is_post_quant_kv_int8 = attn_quant_type == ""
-            import os
-
-            assert self.is_post_quant_kv_int8 != os.path.exists(post_quant_kv_int8_path)
-            self.post_quant_kv_int8_path = post_quant_kv_int8_path
-        else:
-            self.is_post_quant_kv_int8 = False
-            self.post_quant_kv_int8_path = None
-        if self.quant_type == "KVINT8":
-            assert self.post_quant_kv_int8_path is not None and os.path.exists(
-                post_quant_kv_int8_path
+        self.is_post_quant = False
+        fp8_scale_path = envs.VLLM_ILU_FLASH_ATTN_FP8_SCALE_PATH
+        v_scale_path = envs.VLLM_ILU_FLASH_ATTN_V_SCALE_PATH
+        self.post_quant_qkv_path = fp8_scale_path or None
+        self.post_quant_kv_int8_path = v_scale_path or None
+        if self.is_fp8:
+            assert attn_quant_type == "", (
+                "FP8 attention must not set VLLM_ILU_FLASH_ATTN_QUANT_TYPE"
             )
+            assert not v_scale_path, (
+                "FP8 inference must not set VLLM_ILU_FLASH_ATTN_V_SCALE_PATH"
+            )
+            if fp8_scale_path and not os.path.isfile(fp8_scale_path):
+                raise ValueError(
+                    "FP8 inference requires "
+                    "VLLM_ILU_FLASH_ATTN_FP8_SCALE_PATH to reference an "
+                    "existing calibrated scale file"
+                )
+            self.quant_type = "FP8"
+        elif attn_quant_type == "":
+            assert not (fp8_scale_path and v_scale_path), (
+                "VLLM_ILU_FLASH_ATTN_FP8_SCALE_PATH and "
+                "VLLM_ILU_FLASH_ATTN_V_SCALE_PATH are mutually exclusive "
+                "during post quantization"
+            )
+            if fp8_scale_path:
+                assert not os.path.exists(fp8_scale_path), (
+                    "FP8 post-quant scale path must not already exist"
+                )
+                self.quant_type = "FP8"
+                self.is_post_quant = True
+            elif v_scale_path:
+                assert not os.path.exists(v_scale_path), (
+                    "KV post-quant scale path must not already exist"
+                )
+                self.quant_type = ""
+                self.is_post_quant = True
+            else:
+                self.quant_type = ""
+        else:
+            self.quant_type = attn_quant_type
+            if self.quant_type == "KVINT8":
+                assert not fp8_scale_path, (
+                    "KVINT8 inference must not set VLLM_ILU_FLASH_ATTN_FP8_SCALE_PATH"
+                )
+                assert v_scale_path and os.path.isfile(v_scale_path), (
+                    "KVINT8 inference requires an existing "
+                    "VLLM_ILU_FLASH_ATTN_V_SCALE_PATH"
+                )
         self.forward = {
             "": self._forward_unquantized
-            if not self.is_post_quant_kv_int8
-            else self._forward_unquantized_with_post_quant,
+            if not self.is_post_quant
+            else self._forward_unquantized_with_int8_post_quant,
             "KVINT8": self._forward_kv_int8,
             "KINT8": self._forward_k_int8,
-        }[attn_quant_type]
+            "FP8": self._forward_unquantized_with_fp8_post_quant
+            if self.is_post_quant
+            else self._forward_fp8,
+        }[self.quant_type]
 
         vllm_config = get_current_vllm_config_or_none()
         dcp_a2a = (
@@ -702,23 +749,70 @@ class IluFlashAttentionImpl(AttentionImpl):
         )
         # for static quant.
         hf_config = vllm_config.model_config.hf_config
-        try_get_kv_head_nums = [
-            "num_key_value_heads",
-        ]
+        try_get_kv_head_nums = ["num_key_value_heads", "num_attention_groups"]
         self.total_num_kv_heads = None
+        if hasattr(hf_config, "text_config"):
+            hf_config = hf_config.text_config
         for name in try_get_kv_head_nums:
-            if hasattr(hf_config, "text_config"):
-                hf_config = hf_config.text_config
             if (num_kv_heads := getattr(hf_config, name, None)) is not None:
                 self.total_num_kv_heads = num_kv_heads
                 break
-        if self.is_post_quant_kv_int8:
+        if self.is_post_quant and self.quant_type == "":
             if self.total_num_kv_heads is None:
                 self.total_num_kv_heads = envs.VLLM_ILU_FLASH_ATTN_TOTAL_KV_HEADS
             assert self.total_num_kv_heads > 0, (
                 f"The total kv heads(config.json) must > 0, but get {self.total_num_kv_heads}"
             )
         self.dcp_combine = dcp_a2a_lse_reduce if dcp_a2a else cp_lse_ag_out_rs
+
+    @staticmethod
+    def _fp8_dequant_scale(tensor: torch.Tensor) -> torch.Tensor:
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        return (
+            (tensor.detach().abs().amax().float() / fp8_max)
+            .clamp_min(torch.finfo(torch.float32).tiny)
+            .reshape(1)
+        )
+
+    @staticmethod
+    def _layer_scale_id(layer: torch.nn.Module) -> str:
+        layer_idx = extract_layer_index(layer.layer_name)
+        return f"mtp.{layer_idx}" if "mtp" in layer.layer_name else str(layer_idx)
+
+    def process_weights_after_loading(
+        self,
+        act_dtype: torch.dtype,
+        *,
+        layer: torch.nn.Module | None = None,
+    ) -> bool:
+        """Load externally calibrated FP8 scales into an Attention layer.
+
+        Official checkpoint scales are processed earlier by KVCacheMethod. This
+        hook only overrides them when the Iluvatar FP8 scale path is configured.
+        """
+        del act_dtype
+        scale_path = envs.VLLM_ILU_FLASH_ATTN_FP8_SCALE_PATH
+        if not scale_path or layer is None or not self.is_fp8:
+            return False
+
+        q_scale, k_scale, v_scale = load_static_fp8_qkv_scales(
+            self._layer_scale_id(layer),
+            layer._q_scale.device,
+        )
+        q_scale = q_scale.view(layer._q_scale.shape)
+        k_scale = k_scale.view(layer._k_scale.shape)
+        v_scale = v_scale.view(layer._v_scale.shape)
+        layer._q_scale.copy_(q_scale)
+        layer._k_scale.copy_(k_scale)
+        layer._v_scale.copy_(v_scale)
+        layer._q_scale_float = q_scale.item()
+        layer._k_scale_float = k_scale.item()
+        layer._v_scale_float = v_scale.item()
+        layer._k_scale_cpu.fill_(layer._k_scale_float)
+        layer._v_scale_cpu.fill_(layer._v_scale_float)
+        layer.calculate_kv_scales = False
+
+        return True
 
     def forward(
         self,
@@ -945,7 +1039,7 @@ class IluFlashAttentionImpl(AttentionImpl):
                     )
         return output
 
-    def _forward_unquantized_with_post_quant(
+    def _forward_unquantized_with_int8_post_quant(
         self,
         layer: torch.nn.Module,
         query: torch.Tensor,
@@ -987,6 +1081,163 @@ class IluFlashAttentionImpl(AttentionImpl):
             value, 0, transpose_scale=False
         )
         quant_manager.update_data(value_scale)
+        return output
+
+    def _forward_unquantized_with_fp8_post_quant(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: IluFlashAttentionMetadata,
+        output: torch.Tensor,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run regular attention and collect static FP8 Q/K/V scales."""
+        result = self._forward_unquantized(
+            layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output,
+            output_scale,
+            output_block_scale,
+        )
+        if attn_metadata is None or key is None or value is None:
+            return result
+
+        quant_manager = getattr(layer, "fp8_quant_manager", None)
+        if quant_manager is None:
+            quant_manager = FP8StaticQuantManager(
+                layer_id=self._layer_scale_id(layer),
+                file_save_path=self.post_quant_qkv_path,
+                device=query.device,
+            )
+            layer.fp8_quant_manager = quant_manager
+
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        qkv_scales = torch.cat(
+            (
+                self._fp8_dequant_scale(query[:num_actual_tokens]),
+                self._fp8_dequant_scale(key[:num_actual_tokens]),
+                self._fp8_dequant_scale(value[:num_actual_tokens]),
+            )
+        )
+        quant_manager.update_data(qkv_scales)
+        return result
+
+    def _forward_fp8(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: IluFlashAttentionMetadata,
+        output: torch.Tensor,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Static per-tensor FP8 Q/K/V attention."""
+        if output_scale is not None or output_block_scale is not None:
+            raise NotImplementedError("fused output quantization is not yet supported")
+        early_output = self._maybe_forward_encoder(
+            layer, query, key, value, attn_metadata, output
+        )
+        if early_output is not None:
+            return early_output
+        if attn_metadata.use_cascade:
+            raise NotImplementedError("Cascade attention is not supported with FP8")
+        if self.pcp_world_size > 1:
+            raise NotImplementedError("PCP attention is not supported with FP8")
+        if self.dcp_world_size > 1:
+            raise NotImplementedError("DCP attention is not supported with FP8")
+        if self.alibi_slopes is not None:
+            raise NotImplementedError("ALiBi is not supported with FP8 attention")
+        if self.logits_soft_cap:
+            raise NotImplementedError("Logits soft cap is not supported with FP8")
+        if self.sinks is not None:
+            raise NotImplementedError("Attention sinks are not supported with FP8")
+
+        query_scale = layer._q_scale.reshape(1)
+        key_scale = layer._k_scale.reshape(1)
+        value_scale = layer._v_scale.reshape(1)
+
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        fp8_dtype = IluFlashAttentionBackend.get_fp8_dtype_for_flashattn(
+            self.kv_cache_dtype
+        )
+        fp8_query = torch.empty(query.shape, dtype=fp8_dtype, device=query.device)
+        torch.ops._C.static_scaled_fp8_quant(fp8_query, query, query_scale)
+
+        key_cache, value_cache = kv_cache.unbind(0)
+        key_cache = key_cache.view(fp8_dtype)
+        value_cache = value_cache.view(fp8_dtype)
+        if (
+            self.kv_sharing_target_layer_name is None
+            and key is not None
+            and value is not None
+        ):
+            torch.ops._C.reshape_and_cache_fp8(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                attn_metadata.slot_mapping,
+                self.kv_cache_dtype,
+                key_scale,
+                value_scale,
+            )
+
+        sliding_window_size = (
+            list(self.sliding_window) if self.sliding_window is not None else [-1, -1]
+        )
+        if attn_metadata.num_prefills > 0 and attn_metadata.prefill is not None:
+            prefill_q = fp8_query[num_decode_tokens:num_actual_tokens]
+            flash_attn_varlen_fp8_func(
+                q=prefill_q,
+                k=key_cache,
+                v=value_cache,
+                q_scale=query_scale,
+                k_scale=key_scale,
+                v_scale=value_scale,
+                cu_seqlens_q=attn_metadata.prefill.query_start_loc,
+                cu_seqlens_k=attn_metadata.prefill.key_start_loc,
+                max_seqlen_q=attn_metadata.prefill.max_query_len,
+                max_seqlen_k=attn_metadata.max_seq_len,
+                softmax_scale=self.scale,
+                causal=attn_metadata.causal,
+                window_size=sliding_window_size,
+                block_table=attn_metadata.prefill.block_table,
+                out=output[num_decode_tokens : num_decode_tokens + prefill_q.shape[0]],
+                output_dtype=query.dtype,
+            )
+
+        if attn_metadata.num_decodes > 0 and attn_metadata.decode is not None:
+            decode_q = fp8_query[:num_decode_tokens]
+            flash_attn_varlen_fp8_func(
+                q=decode_q,
+                k=key_cache,
+                v=value_cache,
+                q_scale=query_scale,
+                k_scale=key_scale,
+                v_scale=value_scale,
+                cu_seqlens_q=attn_metadata.decode.cu_seqlens_q,
+                cu_seqlens_k=attn_metadata.decode.cu_seqlens_k,
+                max_seqlen_q=attn_metadata.decode.max_query_len,
+                max_seqlen_k=attn_metadata.decode.max_decode_seq_len,
+                softmax_scale=self.scale,
+                causal=True,
+                window_size=sliding_window_size,
+                block_table=attn_metadata.decode.block_table,
+                out=output[:num_decode_tokens],
+                output_dtype=query.dtype,
+            )
         return output
 
     def _forward_kv_int8(

@@ -148,7 +148,7 @@ def test_rotary_embedding_module(
     max_position = 8192
 
     torch.manual_seed(seed)
-    torch.set_default_device("cuda:0")
+    device = "cuda:0"
 
     rope_parameters = {
         "rope_type": "default",
@@ -156,13 +156,13 @@ def test_rotary_embedding_module(
         "partial_rotary_factor": rotary_dim / head_size,
     }
     rope = get_rope(head_size, max_position, is_neox_style, rope_parameters)
-    rope = rope.to(dtype=dtype, device=torch.get_default_device())
+    rope = rope.to(dtype=dtype, device=device)
     # forward_cuda must exercise the native kernel, not flashinfer.
     rope.use_flashinfer = False
 
-    positions = torch.randint(0, max_position, (batch_size, seq_len))
+    positions = torch.randint(0, max_position, (batch_size, seq_len), device=device)
     query_shape = tensor_shape_fn(batch_size, seq_len, num_heads, head_size)
-    query = torch.randn(query_shape, dtype=dtype)[..., :head_size]
+    query = torch.randn(query_shape, dtype=dtype, device=device)[..., :head_size]
     key = torch.randn_like(query) if use_key else None
 
     # Reference first (custom kernel is in-place).
@@ -230,9 +230,7 @@ def test_rotary_embedding_op_gqa_partial(
 
     out_q = query.clone()
     out_k = key.clone() if key is not None else None
-    torch.ops._C.rotary_embedding(
-        positions, out_q, out_k, head_size, cache, is_neox
-    )
+    torch.ops._C.rotary_embedding(positions, out_q, out_k, head_size, cache, is_neox)
 
     atol, rtol = _atol_rtol(dtype)
     torch.testing.assert_close(out_q, ref_q, atol=atol, rtol=rtol)

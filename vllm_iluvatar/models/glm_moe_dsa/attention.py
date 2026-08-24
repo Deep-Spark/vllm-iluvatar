@@ -86,6 +86,9 @@ _GLM_DSA_FP8_E4M3_MAX = 448.0
 
 logger = init_logger(__name__)
 
+_RMS_ROPE_FP8_KV_ENGAGE_LOGGED = False
+_RMS_ROPE_FP8_KV_SKIP_LOGGED = False
+
 
 @lru_cache(maxsize=4)
 def _load_glm_dsa_fp8_kv_scale_table(path: str) -> dict[str, float]:
@@ -452,6 +455,58 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
             persistent=False,
         )
 
+        fusion_requested = envs.VLLM_ILU_GLM52_RMS_ROPE_FP8_KV
+        # Prefer the native Torch schema over the Python facade: the facade can
+        # exist from a Python-only ixformer update while `_ixformer_C` still
+        # lacks the ivcore30 kernel. Kernel contract is H in {8,16,32}.
+        fusion_op_available = False
+        try:
+            import torch
+
+            fusion_op_available = hasattr(
+                torch.ops._ixformer_C, "fused_glm_dsa_rmsnorm_rope_fp8_kv_insert"
+            )
+        except Exception:
+            fusion_op_available = False
+        fusion_heads_supported = self.num_heads in (8, 16, 32)
+        self.use_rms_rope_fp8_kv_fusion = (
+            fusion_requested
+            and self.use_fp8_attn
+            and self._fp8_kv_scale_frozen
+            and fusion_op_available
+            and fusion_heads_supported
+        )
+        if fusion_requested and not self.use_rms_rope_fp8_kv_fusion:
+            global _RMS_ROPE_FP8_KV_SKIP_LOGGED
+            if not _RMS_ROPE_FP8_KV_SKIP_LOGGED:
+                reasons = []
+                if not self.use_fp8_attn:
+                    reasons.append("KV cache is not fp8")
+                if not self._fp8_kv_scale_frozen:
+                    reasons.append("KV scale is not frozen")
+                if not fusion_op_available:
+                    reasons.append("ixformer native op is unavailable")
+                if not fusion_heads_supported:
+                    reasons.append(
+                        f"local Q heads={self.num_heads} not in {{8,16,32}}"
+                    )
+                logger.warning(
+                    "GLM-5.2 RMSNorm+RoPE+FP8 KV fusion requested but not "
+                    "armed (%s). Falling back to split path. Further layers "
+                    "will not repeat this warning.",
+                    ", ".join(reasons) or "unknown",
+                )
+                _RMS_ROPE_FP8_KV_SKIP_LOGGED = True
+        elif self.use_rms_rope_fp8_kv_fusion:
+            global _RMS_ROPE_FP8_KV_ENGAGE_LOGGED
+            if not _RMS_ROPE_FP8_KV_ENGAGE_LOGGED:
+                logger.info(
+                    "GLM-5.2 RMSNorm+RoPE+FP8 KV fusion armed "
+                    "(VLLM_ILU_GLM52_RMS_ROPE_FP8_KV=1)"
+                )
+                _RMS_ROPE_FP8_KV_ENGAGE_LOGGED = True
+
+
         self.kv_cache = torch.tensor([])
         self._vllm_config = get_current_vllm_config()
         compilation_config = self._vllm_config.compilation_config
@@ -646,15 +701,17 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
     def forward(
         self,
         q: torch.Tensor,
-        kv_c_normed: torch.Tensor,
+        kv_c: torch.Tensor,
         k_pe: torch.Tensor,
         positions: torch.Tensor,
+        kv_rms_weight: torch.Tensor | None = None,
+        kv_rms_eps: float | None = None,
     ) -> torch.Tensor:
         """Sparse MLA forward. Returns ``(T, num_heads * v_head_dim)``.
 
-        ``q``: ``(T, num_heads, qk_head_dim)``; ``kv_c_normed``: ``(T, kv_lora)``;
-        ``k_pe``: ``(T, qk_rope_head_dim)``. Rope is applied here (not in the
-        wrapper), matching the fork ``forward_full`` contract.
+        ``kv_c`` is already RMS-normalized unless ``kv_rms_weight`` is provided,
+        in which case the FP8 fusion consumes the raw latent. RoPE is applied
+        here (or inside the fused kernel when armed).
         """
         num_tokens = q.shape[0]
         forward_context = get_forward_context()
@@ -684,12 +741,25 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
 
         k_pe = k_pe.unsqueeze(1)
         q = q[:num_actual_toks]
-        kv_c_normed = kv_c_normed[:num_actual_toks]
+        kv_c = kv_c[:num_actual_toks]
         k_pe = k_pe[:num_actual_toks]
         positions = positions[:num_actual_toks]
 
+        use_rms_rope_fp8_kv_fusion = (
+            self.use_rms_rope_fp8_kv_fusion
+            and kv_rms_weight is not None
+            and kv_cache.numel() > 0
+        )
+        if kv_rms_weight is not None and kv_rms_eps is None:
+            raise ValueError("kv_rms_eps is required with kv_rms_weight")
+        if kv_rms_weight is not None and not use_rms_rope_fp8_kv_fusion:
+            kv_c_normed = ixf_ops.rms_norm(kv_c, kv_rms_weight, kv_rms_eps)
+        else:
+            kv_c_normed = kv_c
+
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        if not use_rms_rope_fp8_kv_fusion:
+            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         # Absorbed k-up: (B, N, P) -> (B, N, kv_lora_rank).
         q_nope = self._k_up_proj(q_nope)
@@ -698,15 +768,30 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         if kv_cache.numel() > 0:
             slot_mapping = attn_metadata.slot_mapping.flatten()[:num_actual_toks]
             if self.use_fp8_attn:
-                self._maybe_init_fp8_kv_scale(kv_c_normed)
-                ixf_ops.glm_dsa_fp8_kv_insert(
-                    kv_c_normed,
-                    k_pe,
-                    kv_cache,
-                    slot_mapping,
-                    self._k_scale,
-                    attn_metadata.block_size,
-                )
+                if use_rms_rope_fp8_kv_fusion:
+                    ixf_ops.fused_glm_dsa_rmsnorm_rope_fp8_kv_insert(
+                        q_pe,
+                        k_pe,
+                        kv_c,
+                        kv_rms_weight,
+                        kv_rms_eps,
+                        kv_cache,
+                        slot_mapping,
+                        positions,
+                        self.rotary_emb._match_cos_sin_cache_dtype(q_pe),
+                        self._k_scale,
+                        attn_metadata.block_size,
+                    )
+                else:
+                    self._maybe_init_fp8_kv_scale(kv_c_normed)
+                    ixf_ops.glm_dsa_fp8_kv_insert(
+                        kv_c_normed,
+                        k_pe,
+                        kv_cache,
+                        slot_mapping,
+                        self._k_scale,
+                        attn_metadata.block_size,
+                    )
             else:
                 ops.concat_and_cache_mla(
                     kv_c_normed,
@@ -948,10 +1033,20 @@ class IluGlmMoeDsaMLAAttention(nn.Module):
         )
         q_c = self.q_a_layernorm(q_c)
         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-        kv_c_normed = self.kv_a_layernorm(kv_a)
 
         if self.indexer is not None and not self.skip_topk:
             self.indexer(hidden_bf16, q_c, positions, self.rotary_emb)
 
-        attn_out = self.mla_attn(q, kv_c_normed, k_pe, positions)
+        if self.mla_attn.use_rms_rope_fp8_kv_fusion:
+            attn_out = self.mla_attn(
+                q,
+                kv_a,
+                k_pe,
+                positions,
+                self.kv_a_layernorm.weight,
+                self.kv_a_layernorm.variance_epsilon,
+            )
+        else:
+            kv_c_normed = self.kv_a_layernorm(kv_a)
+            attn_out = self.mla_attn(q, kv_c_normed, k_pe, positions)
         return self.o_proj(attn_out)[0]

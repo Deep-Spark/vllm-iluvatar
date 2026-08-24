@@ -220,3 +220,96 @@ def test_maybe_init_fp8_kv_scale_skips_during_capture(monkeypatch):
     assert mla._fp8_kv_scale_frozen is False
     assert float(mla._k_scale.item()) == pytest.approx(1.0)
     assert mla._fp8_kv_scale_capture_warned is True
+
+
+def _resolve_rms_rope_fp8_kv_fusion(
+    *,
+    env_enabled: bool,
+    use_fp8_attn: bool,
+    scale_frozen: bool,
+    op_available: bool,
+    num_heads: int = 8,
+) -> bool:
+    """Mirror IluGlmMoeDsaSparseMLA init-time fusion arming rules."""
+    return bool(
+        env_enabled
+        and use_fp8_attn
+        and scale_frozen
+        and op_available
+        and num_heads in (8, 16, 32)
+    )
+
+
+@pytest.mark.parametrize(
+    ("env_enabled", "use_fp8", "frozen", "op_ok", "num_heads", "expect"),
+    [
+        (True, True, True, True, 8, True),
+        (True, True, True, True, 16, True),
+        (True, True, True, True, 32, True),
+        (True, True, True, True, 64, False),
+        (True, True, False, True, 8, False),
+        (True, False, True, True, 8, False),
+        (False, True, True, True, 8, False),
+        (True, True, True, False, 8, False),
+    ],
+)
+def test_rms_rope_fp8_kv_fusion_arm_matrix(
+    env_enabled, use_fp8, frozen, op_ok, num_heads, expect
+):
+    assert (
+        _resolve_rms_rope_fp8_kv_fusion(
+            env_enabled=env_enabled,
+            use_fp8_attn=use_fp8,
+            scale_frozen=frozen,
+            op_available=op_ok,
+            num_heads=num_heads,
+        )
+        is expect
+    )
+
+
+def test_wrapper_skips_external_kv_rmsnorm_when_fusion_armed():
+    """Mirror IluGlmMoeDsaMLAAttention forward branch: fusion skips external RMS."""
+    called = {"norm": False, "mla": None}
+
+    class _Norm:
+        weight = torch.ones(512)
+        variance_epsilon = 1e-6
+
+        def __call__(self, *_args, **_kwargs):
+            called["norm"] = True
+            raise AssertionError("external kv_a_layernorm must be skipped")
+
+    class _MlaAttn:
+        use_rms_rope_fp8_kv_fusion = True
+
+        def __call__(self, q, kv, k_pe, positions, kv_rms_weight=None, kv_rms_eps=None):
+            called["mla"] = (
+                kv_rms_weight is kv_a_layernorm.weight,
+                kv_rms_eps == kv_a_layernorm.variance_epsilon,
+                kv is kv_a,
+            )
+            return torch.zeros(1, 8)
+
+    kv_a_layernorm = _Norm()
+    mla_attn = _MlaAttn()
+    kv_a = torch.randn(2, 512)
+    q = torch.randn(2, 8, 576)
+    k_pe = torch.randn(2, 64)
+    positions = torch.arange(2)
+
+    if mla_attn.use_rms_rope_fp8_kv_fusion:
+        out = mla_attn(
+            q,
+            kv_a,
+            k_pe,
+            positions,
+            kv_a_layernorm.weight,
+            kv_a_layernorm.variance_epsilon,
+        )
+    else:
+        kv_a_layernorm(kv_a)
+        out = None
+    assert out is not None
+    assert called["norm"] is False
+    assert called["mla"] == (True, True, True)

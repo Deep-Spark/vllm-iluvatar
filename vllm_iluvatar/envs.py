@@ -117,6 +117,7 @@ if TYPE_CHECKING:
     VLLM_ILU_DS4_MQA_QUANT_TYPE: str = ""
     VLLM_ILU_FUSE_NORM_QUANT: bool = True
     VLLM_ILU_FUSE_MOE_W13: bool = True
+    VLLM_ILU_GLM52_RMS_ROPE_FP8_KV: bool = True
     VLLM_ILU_NIXL_WRITE_USE_HOST_BUFFER: bool = False
     VLLM_ILU_NIXL_HOST_DTYPE: str = "auto"
     VLLM_ILU_NIXL_PROXY_ADDR: str = ""
@@ -306,6 +307,18 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Fail-closed for unsupported shapes / runtime errors.
     "VLLM_ILU_FUSE_MOE_W13": lambda: (
         _get("VLLM_ILU_FUSE_MOE_W13", "VLLM_FUSE_MOE_W13", "1").strip().lower()
+        in _TRUE_VALS
+    ),
+    # Fuse kv_a RMSNorm + Q/K RoPE + FP8 KV pack/insert for GLM DSA.
+    # Default on; requires FP8 KV + frozen scale + ixformer op. Set 0 to disable.
+    "VLLM_ILU_GLM52_RMS_ROPE_FP8_KV": lambda: (
+        _get(
+            "VLLM_ILU_GLM52_RMS_ROPE_FP8_KV",
+            "VLLM_GLM52_RMS_ROPE_FP8_KV",
+            "1",
+        )
+        .strip()
+        .lower()
         in _TRUE_VALS
     ),
     # GLM DSA 640B fp8 packed KV scale. A non-empty float applies the SAME

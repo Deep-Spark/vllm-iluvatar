@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
+    _ixmm_backend_available,
     ilu_mxfp4_fused_experts,
 )
 from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8_batch_experts import (
@@ -15,7 +16,20 @@ from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8_batch_experts impo
 )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an Iluvatar GPU")
+def _has_ixmm_ivcore30() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        from vllm_iluvatar.ilu_util.arch import is_ivcore30
+
+        return is_ivcore30() and _ixmm_backend_available()
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(
+    not _has_ixmm_ivcore30(), reason="requires an ivcore30 GPU with ixmm backend"
+)
 def test_batched_fp8_experts_match_legacy_fp4_fp8_path():
     torch.manual_seed(7)
     device = torch.device("cuda")

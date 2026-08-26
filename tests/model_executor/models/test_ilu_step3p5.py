@@ -88,6 +88,8 @@ def test_decoder_promote_attaches_moe_ep(monkeypatch):
     layer.use_moe = True
     layer.prefix = "model.layers.3"
     layer.moe = _DummyModule()
+    layer.moe.gate = _DummyModule()
+    layer.moe.gate.weight = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32))
     layer.self_attn = _DummyModule()
     init_ep = MagicMock()
     monkeypatch.setattr(IluFusedMoEEP, "init_ep", init_ep)

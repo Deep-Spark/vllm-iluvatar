@@ -461,8 +461,6 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         # lacks the ivcore30 kernel. Kernel contract is H in {8,16,32}.
         fusion_op_available = False
         try:
-            import torch
-
             fusion_op_available = hasattr(
                 torch.ops._ixformer_C, "fused_glm_dsa_rmsnorm_rope_fp8_kv_insert"
             )

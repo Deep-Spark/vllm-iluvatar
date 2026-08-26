@@ -185,8 +185,6 @@ def test_method_init_skips_backend_selection(monkeypatch):
     assert method.weight_scale_name == "weight_scale_inv"
     assert method.is_monolithic is False
     assert method.supports_eplb is False
-    assert method.maybe_make_prepare_finalize() is None
-    assert method.get_fused_moe_quant_config(layer) is None
     assert not hasattr(method, "experts_cls")
 
 

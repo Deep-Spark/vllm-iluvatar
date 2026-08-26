@@ -11,7 +11,6 @@ IluWorker — subclass of the community Worker with following overrides:
 
 from __future__ import annotations
 
-import vllm.v1.worker.gpu_model_runner as _gpu_model_runner
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu_worker import Worker
@@ -23,6 +22,9 @@ class IluWorker(Worker):
     def _try_replace_model_runner_class(self) -> type[object]:
         import vllm.envs as envs
 
+        # Preserve the actual runner class. With VLLM_USE_V2_MODEL_RUNNER=1,
+        # self.model_runner is the V2 GPUModelRunner; restoring the legacy class
+        # here corrupts the instance and makes V2 initialization call V1 methods.
         orig_cls = self.model_runner.__class__
         is_v1_runner = isinstance(self.model_runner, _gpu_model_runner.GPUModelRunner)
 

@@ -25,6 +25,7 @@
 
 
 from contextlib import nullcontext
+from types import MethodType
 
 import ixformer.distributed as ixfd
 import torch
@@ -80,13 +81,31 @@ class IluFusedMoEEP:
 
     def init_ep(self):
         if self._should_preinit_dp_ep_ll_handle():
-            self._get_forward_dp_ep_ll_all2all()
-            logger.info_once(
-                "Initialized Hybrid EP low-latency decode backend "
-                "(configured_backend=%s, decode_override=%s).",
-                self.experts.moe_config.moe_parallel_config.all2all_backend,
-                _DS4_DECODE_EP_BACKEND,
+            runner = self.experts
+            # moe_quant_config is None during model construction because it needs
+            # post-processed weight scales. Defer NVSM initialization until after
+            # weight processing, but before CUDA graph capture; patch only once.
+            if getattr(runner, "_ilu_nvsm_init_patched", False):
+                return
+
+            original_init = runner.maybe_init_modular_kernel
+
+            def init_modular_kernel_and_nvsm(runner_self):
+                original_init()
+                runner_self.routed_experts._ensure_moe_quant_config_init()
+                self._get_forward_dp_ep_ll_all2all()
+                logger.info_once(
+                    "Initialized Hybrid EP low-latency decode backend "
+                    "(configured_backend=%s, decode_override=%s).",
+                    runner_self.moe_config.moe_parallel_config.all2all_backend,
+                    _DS4_DECODE_EP_BACKEND,
+                )
+
+            runner.maybe_init_modular_kernel = MethodType(
+                init_modular_kernel_and_nvsm,
+                runner,
             )
+            runner._ilu_nvsm_init_patched = True
 
     def _should_use_forward_dp_ep(self) -> bool:
         moe_parallel_config = self.experts.moe_config.moe_parallel_config

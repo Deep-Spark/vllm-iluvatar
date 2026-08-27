@@ -2,7 +2,7 @@
 """Build entry point for the vllm_iluvatar plugin.
 
 Project metadata lives in pyproject.toml (PEP 621); the version is loaded from
-vllm_iluvatar/version.py.
+version.json.
 
 Two build-time customisations:
   1. An env-gated startup-patch ``.pth`` so spawned vLLM worker subprocesses
@@ -16,6 +16,7 @@ Two build-time customisations:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -49,12 +50,15 @@ PTH_CONTENT = (
 
 
 def _load_version() -> str:
-    version_file = ROOT_DIR / "vllm_iluvatar" / "version.py"
-    namespace: dict[str, str] = {}
-    exec(version_file.read_text(encoding="utf-8"), namespace)  # noqa: S102
-    version = namespace.get("__version__")
+    """Read the version from ``version.json``, the release spec's data source.
+
+    Baking it into the wheel metadata here is what lets ``version.py`` recover
+    it at runtime, when version.json itself is no longer around.
+    """
+    version_file = ROOT_DIR / "version.json"
+    version = json.loads(version_file.read_text(encoding="utf-8")).get("version")
     if not version:
-        raise RuntimeError(f"__version__ not found in {version_file}")
+        raise RuntimeError(f"'version' not found in {version_file}")
     return str(version)
 
 

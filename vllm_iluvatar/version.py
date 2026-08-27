@@ -1,8 +1,35 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Single source of truth for the vllm_iluvatar package version.
+"""Expose the package version, which is defined in the repo-root version.json.
 
-Read by setup.py at build time and by ``vllm_iluvatar.__version__`` at runtime.
-Update this file manually when cutting a release.
+``version.json`` is the single source of truth mandated by the release spec, so
+it must not be duplicated here. It ships outside the package though, and is
+therefore unavailable once the wheel is installed -- in that case the version
+is read back from the installed distribution metadata, which setup.py filled in
+from the very same file at build time.
 """
 
-__version__ = "0.1.0"
+from __future__ import annotations
+
+import json
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _distribution_version
+from pathlib import Path
+
+_VERSION_JSON = Path(__file__).resolve().parent.parent / "version.json"
+
+
+def _resolve_version() -> str:
+    try:
+        return _distribution_version("vllm_iluvatar")
+    except PackageNotFoundError:
+        pass
+    # Not installed: running straight from a source checkout.
+    if _VERSION_JSON.is_file():
+        return str(json.loads(_VERSION_JSON.read_text(encoding="utf-8"))["version"])
+    raise RuntimeError(
+        "cannot determine the vllm_iluvatar version: the package is not "
+        f"installed and {_VERSION_JSON} is missing"
+    )
+
+
+__version__ = _resolve_version()

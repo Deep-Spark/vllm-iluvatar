@@ -26,7 +26,6 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 import torch
-import vllm.envs as envs
 from vllm.distributed import (
     get_dp_group,
     get_pcp_group,
@@ -76,6 +75,18 @@ def padding_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
 
 def _route_expert_name(name: str) -> str:
     return name.replace(".mlp.experts.", ".mlp.experts.routed_experts.", 1)
+
+
+def _expert_loader_layout(model: torch.nn.Module) -> tuple[bool, str]:
+    for module_name, module in model.named_modules():
+        if not module_name.endswith("mlp.experts.routed_experts"):
+            continue
+        quant_method = getattr(module, "quant_method", None)
+        weight_quant = getattr(quant_method, "weight_quant", None)
+        w4a8_enabled = getattr(weight_quant, "num_bits", None) == 4
+        gemm_format = str(getattr(quant_method, "gemm_format", "TN") or "TN").upper()
+        return w4a8_enabled, gemm_format
+    raise RuntimeError("Unable to resolve GPT-OSS expert quant layout from config")
 
 
 def _weight_slice_for_expert(
@@ -147,9 +158,8 @@ class GptOssModel(_GptOssModel):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
-        pack_factor = 2 if envs.VLLM_W8A8_MOE_USE_W4A8 else 1
-        w4a8_enabled = envs.VLLM_W8A8_MOE_USE_W4A8
-        gemm_format = envs.VLLM_W8A8_FORMAT
+        w4a8_enabled, gemm_format = _expert_loader_layout(self)
+        pack_factor = 2 if w4a8_enabled else 1
         expert_permute_dims = None if gemm_format == "NN" else (0, 2, 1)
         scale_permute_dims = None if w4a8_enabled else (0, 2, 1)
 

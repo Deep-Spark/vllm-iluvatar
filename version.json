@@ -1,0 +1,16 @@
+{
+  "name": "vllm-iluvatar",
+  "description": "Iluvatar CoreX plugin package for vLLM (out-of-tree platform plugin)",
+  "version": "0.26.0",
+  "changelog": "./changelog.md",
+  "dependencies": {
+    "vllm": ">=0.26.0,<0.27.0",
+    "torch": ">=2.10.0",
+    "ixformer": ">=0.7.0",
+    "ixruntime": ">=5.0.0",
+    "ixdriver": ">=5.0.0",
+    "ixcc": ">=22.1.0",
+    "ixsdk": ">=22.1.0"
+  },
+  "requirements": "./requirements.txt"
+}

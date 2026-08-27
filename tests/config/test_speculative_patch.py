@@ -16,7 +16,13 @@ No GPU required.
 
 from __future__ import annotations
 
-from vllm_iluvatar.config.speculative import make_hf_config_override, make_post_init
+from types import SimpleNamespace
+
+from vllm_iluvatar.config.speculative import (
+    make_create_draft_parallel_config,
+    make_hf_config_override,
+    make_post_init,
+)
 
 
 class _FakeHFConfig:
@@ -209,6 +215,68 @@ def test_post_init_skips_non_dspark_methods():
     assert cfg.update_arch_calls == 0
 
 
+# --- factory: draft PP=1 ---------------------------------------------------
+
+
+def test_draft_parallel_config_forces_pp1_on_two_arg_orig():
+    from dataclasses import dataclass
+
+    @dataclass
+    class _Cfg:
+        pipeline_parallel_size: int
+        tensor_parallel_size: int
+
+    def orig(target, tp):
+        return _Cfg(
+            pipeline_parallel_size=target.pipeline_parallel_size,
+            tensor_parallel_size=tp,
+        )
+
+    wrapped = make_create_draft_parallel_config(orig)
+    out = wrapped(SimpleNamespace(pipeline_parallel_size=8), 4)
+    assert out.pipeline_parallel_size == 1
+    assert out.tensor_parallel_size == 4
+
+
+def test_draft_parallel_config_passes_pp_to_three_arg_orig():
+    from dataclasses import dataclass
+
+    @dataclass
+    class _Cfg:
+        pipeline_parallel_size: int
+        tensor_parallel_size: int
+
+    def orig(target, tp, speculative_draft_pipeline_parallel_size):
+        return _Cfg(
+            pipeline_parallel_size=speculative_draft_pipeline_parallel_size,
+            tensor_parallel_size=tp,
+        )
+
+    wrapped = make_create_draft_parallel_config(orig)
+    out = wrapped(SimpleNamespace(pipeline_parallel_size=8), 4, 8)
+    assert out.pipeline_parallel_size == 1
+
+
+def test_draft_parallel_config_keeps_pp1_when_target_is_pp1():
+    from dataclasses import dataclass
+
+    @dataclass
+    class _Cfg:
+        pipeline_parallel_size: int
+        tensor_parallel_size: int
+
+    def orig(target, tp):
+        return _Cfg(
+            pipeline_parallel_size=target.pipeline_parallel_size,
+            tensor_parallel_size=tp,
+        )
+
+    wrapped = make_create_draft_parallel_config(orig)
+    out = wrapped(SimpleNamespace(pipeline_parallel_size=1), 4)
+    assert out.pipeline_parallel_size == 1
+    assert out.tensor_parallel_size == 4
+
+
 # --- wiring: general patch binds onto the real class -----------------------
 
 
@@ -231,6 +299,15 @@ def test_patch_binds_wrapper_as_staticmethod():
     assert hasattr(SpeculativeConfig.__post_init__, "__wrapped__"), (
         "__post_init__ not wrapped by the ilu override"
     )
+    draft_pp = inspect.getattr_static(
+        SpeculativeConfig, "create_draft_parallel_config"
+    )
+    assert isinstance(draft_pp, staticmethod), (
+        "create_draft_parallel_config must stay a staticmethod"
+    )
+    assert hasattr(SpeculativeConfig.create_draft_parallel_config, "__wrapped__"), (
+        "create_draft_parallel_config not wrapped by the ilu override"
+    )
 
 
 def test_patch_register_is_idempotent():
@@ -241,8 +318,10 @@ def test_patch_register_is_idempotent():
     patch_speculative_config.register()
     first = SpeculativeConfig.hf_config_override
     first_post_init = SpeculativeConfig.__post_init__
+    first_draft_pp = SpeculativeConfig.create_draft_parallel_config
     patch_speculative_config.register()
     patch_speculative_config.register()
 
     assert SpeculativeConfig.hf_config_override is first
     assert SpeculativeConfig.__post_init__ is first_post_init
+    assert SpeculativeConfig.create_draft_parallel_config is first_draft_pp

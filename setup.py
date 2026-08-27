@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -58,30 +59,28 @@ def _load_version() -> str:
 
 
 def get_requirements() -> list[str]:
-    """Resolve runtime dependencies from ``requirements/*.txt``.
+    """Resolve runtime dependencies from ``requirements.txt``.
 
     Mirrors vLLM's setup.py: supports ``-r other.txt`` includes and skips blank
     lines, comments (``#``) and pip options (``--``). torch / ixformer are
     intentionally NOT listed (provided by the corex environment).
     """
-    requirements_dir = ROOT_DIR / "requirements"
 
     def _read_requirements(filename: str) -> list[str]:
         resolved: list[str] = []
-        with open(requirements_dir / filename, encoding="utf-8") as f:
+        with open(ROOT_DIR / filename, encoding="utf-8") as f:
             lines = f.read().strip().split("\n")
         for line in lines:
             if line.startswith("-r "):
                 resolved += _read_requirements(line.split()[1])
-            elif (
-                not line.startswith("--")
-                and not line.startswith("#")
-                and line.strip() != ""
-            ):
-                resolved.append(line.strip())
+                continue
+            # pip treats " #" as the start of an inline comment
+            spec = re.split(r"\s+#", line, maxsplit=1)[0].strip()
+            if spec and not spec.startswith(("--", "#")):
+                resolved.append(spec)
         return resolved
 
-    return _read_requirements("common.txt")
+    return _read_requirements("requirements.txt")
 
 
 class CMakeExtension(Extension):

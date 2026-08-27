@@ -1,38 +1,40 @@
 # ==============================================================================
-# vllm-iluvatar runtime requirements  (mirror of vllm/requirements/common.txt +
-# vllm/requirements/cuda.txt, with the iluvatar-only overrides described below).
+# vllm-iluvatar runtime requirements -- SINGLE SOURCE OF TRUTH.
 #
-# Not used by the wheel's METADATA (setup.py strips Requires-Dist by default so
-# `pip install <wheel>` doesn't fight the CoreX SDK stack).  ``install_vllm_
-# iluvatar.sh`` picks this up after the wheel install; see that script for the
-# full install order, including the ``--no-deps`` pins that pip's requirements
-# parser cannot express inline.
+# Mirrors vllm/requirements/common.txt + vllm/requirements/cuda.txt with the
+# iluvatar-only overrides described below.  This file feeds BOTH:
+#   * ``install_vllm_iluvatar.sh`` (runtime install), and
+#   * the wheel's ``Requires-Dist`` via ``setup.py:get_requirements()``.
+# It supersedes the former ``requirements/common.txt``, which had drifted from
+# this file (ray / diskcache / numba / loguru / pycountry / apache-tvm-ffi were
+# only here; llguidance / xgrammar / compressed-tensors were only there).
 #
 # Iluvatar deltas vs. upstream vllm/requirements/*.txt:
 #
-#   * ``numpy`` is commented out below -- installed out-of-band by
-#     ``install_vllm_iluvatar.sh`` (needs a manual ``<2`` pin to match
-#     CoreX torch's NumPy 1.x C ABI).
-#   * ``mistral_common`` / ``opencv-python-headless`` / ``compressed-tensors``
-#     are commented out and installed with ``--no-deps`` by the shell script
-#     (their upstream dep specs would otherwise force pip to downgrade
-#     CoreX-verified packages such as numpy / pillow / requests).
-#   * ``xgrammar`` is also ``--no-deps`` installed: it declares
-#     ``torch>=1.10.0`` and pip's resolver would drag in NVIDIA ``nvidia-*``
-#     wheels (~1.5 GB) because it cannot see the CoreX torch already staged
-#     at ``TARGET_DIR/lib/python3/dist-packages``.
-#   * ``llguidance`` is also ``--no-deps`` installed: developer hosts get it
-#     from CoreX SDK's Python bundle, but the ``-t TARGET_DIR`` install path
-#     used for packaging leaves pip blind to that bundle, so vLLM's
-#     ``import llguidance`` at guidance-backend module load fails without an
-#     explicit install here.
-#   * All ``nvidia-*`` / flashinfer / torch cuda.txt entries are dropped
-#     (CoreX platform, not NVIDIA).
-#   * A "transitive gap-fillers" section near the bottom (e.g. ``loguru``,
-#     ``pycountry``) explicitly lists the deps that the --no-deps quartet
-#     would normally have brought in but that vLLM actually imports at
-#     module load time. Extend that section (not the --no-deps list) when
-#     a new "X requires Y, which is not installed" surfaces at runtime.
+#   * ``numpy`` is pinned ``<2``.  CoreX torch is built against the NumPy 1.x
+#     C ABI, but its wheel METADATA declares no numpy dependency at all, so
+#     pip cannot infer the bound -- it has to be stated here (and mirrored in
+#     the image's PIP_CONSTRAINT file).
+#   * ``opencv-python-headless`` is held at 4.11.0.86.  Upstream asks for
+#     >= 4.13.0, but every release from 4.13 on declares ``numpy>=2``, which
+#     is unsatisfiable against the pin above.
+#   * ``mistral_common`` is pinned without upstream's ``[image]`` extra: that
+#     extra resolves opencv on its own and would fight the pin above.
+#   * ``compressed-tensors`` is held at 0.15.0.1 (upstream moved to 0.17.0).
+#   * ``apache-tvm-ffi`` is a floor rather than upstream's ``==0.1.10`` pin;
+#     it is pulled in by xgrammar.
+#   * All torch / torchvision / torchaudio / torchcodec / nvidia-* /
+#     flashinfer / nvtx / quack / cutlass-dsl / tokenspeed / humming entries
+#     from cuda.txt are dropped -- CoreX platform, not NVIDIA.
+#   * ``tilelang`` and ``fastsafetensors`` are also dropped.  Both are guarded
+#     by optional-import shims upstream, and the iluvatar MHC path uses
+#     ixformer's ``ds4_mhc_pre_*`` kernels rather than the tilelang ones.
+#   * ``ray`` and ``diskcache`` are additions -- upstream 0.26.0 no longer
+#     lists ray in common.txt, and diskcache backs the outlines disk cache.
+#   * ``loguru`` / ``pycountry`` are transitive gap-fillers, kept explicit so
+#     the ``--no-deps`` install path in install_vllm_iluvatar.sh does not
+#     leave them out.  Extend that group (not the --no-deps list) when a new
+#     "X requires Y, which is not installed" surfaces at runtime.
 # ==============================================================================
 
 # ---- vllm/requirements/common.txt (upstream mirror) -------------------------
@@ -40,10 +42,7 @@ regex # Replace re for higher-performance regex matching
 cachetools
 psutil
 sentencepiece  # Required for LLaMA tokenizer.
-# numpy                                # iluvatar delta: installed manually
-#                                      # (see install_vllm_iluvatar.sh, needs
-#                                      # ``numpy<2`` to match CoreX torch's
-#                                      # NumPy 1.x C ABI).
+numpy < 2 # iluvatar delta: CoreX torch is built against the NumPy 1.x C ABI
 ray
 requests >= 2.26.0
 tqdm
@@ -63,36 +62,24 @@ pillow  # Required for image processing
 prometheus-fastapi-instrumentator >= 8.0.0 # v8 unblocks starlette >= 1.0
 tiktoken >= 0.6.0  # Required for DBRX tokenizer
 lm-format-enforcer == 0.11.3
-# llguidance >= 1.7.0, < 1.8.0         # iluvatar delta: --no-deps install
-#                                      # (see install_vllm_iluvatar.sh).
-#                                      # CoreX SDK provides it on dev hosts
-#                                      # but the -t TARGET_DIR install path
-#                                      # can't see the SDK bundle.
+llguidance >= 1.7.0, < 1.8.0; platform_machine == "x86_64" or platform_machine == "arm64" or platform_machine == "aarch64" or platform_machine == "ppc64le" or platform_machine == "s390x"
 outlines_core == 0.2.14
-# required for outlines backend disk cache
-diskcache == 5.6.3
+diskcache == 5.6.3 # iluvatar delta: required for outlines backend disk cache
 lark == 1.2.2
-# xgrammar >= 0.2.1, < 1.0.0; ...      # iluvatar delta: --no-deps install
-#                                      # (see install_vllm_iluvatar.sh).
-#                                      # xgrammar declares torch>=1.10.0 which
-#                                      # pip's resolver walks against PyPI even
-#                                      # with PYTHONPATH pointing at CoreX
+xgrammar >= 0.2.1, < 1.0.0; platform_machine == "x86_64" or platform_machine == "aarch64" or platform_machine == "arm64" or platform_machine == "s390x" or platform_machine == "ppc64le"
 typing_extensions >= 4.10
 filelock >= 3.16.1 # need to contain https://github.com/tox-dev/filelock/pull/317
 partial-json-parser # used for parsing partial JSON outputs
 jsonschema >= 4.23.0 # required for MiniMax M3 tool schema validation
 pyzmq >= 25.0.0
 msgspec
-# mistral_common == 1.11.5             # iluvatar delta: --no-deps install
-#                                      # (see install_vllm_iluvatar.sh).
-# opencv-python-headless == 4.11.0.86  # iluvatar delta: --no-deps install
-#                                      # (see install_vllm_iluvatar.sh).
+mistral_common == 1.11.5 # iluvatar delta: upstream is mistral_common[image] >= 1.11.5; the [image] extra resolves opencv and fights the pin below
+opencv-python-headless == 4.11.0.86 # iluvatar delta: upstream >= 4.13.0, but 4.13+ declares numpy>=2
 pyyaml
 six>=1.16.0; python_version > '3.11' # transitive dependency of pandas that needs to be the latest version for python 3.12
 setuptools>=77.0.3,<81.0.0; python_version > '3.11' # Setuptools is used by triton, we need to ensure a modern version is installed for 3.12+ so that it does not try to import distutils, which was removed in 3.12
 einops # Required for Qwen2-VL.
-# compressed-tensors == 0.15.0.1       # iluvatar delta: --no-deps install
-#                                      # (see install_vllm_iluvatar.sh).
+compressed-tensors == 0.15.0.1 # iluvatar delta: upstream is == 0.17.0
 depyf==0.20.0 # required for profiling and debugging with compilation config
 cloudpickle # allows pickling lambda functions in model_executor/models/registry.py
 watchfiles # required for http server to monitor the updates of TLS files
@@ -113,14 +100,12 @@ opentelemetry-semantic-conventions-ai >= 0.4.1
 
 # ---- vllm/requirements/cuda.txt (upstream mirror, iluvatar-adapted) ---------
 numba == 0.65.0 # Required for N-gram speculative decoding
-# All nvidia-* / torch / flashinfer / tokenspeed / humming / quack / cutlass
-# entries from upstream cuda.txt are dropped (NVIDIA-only, not applicable to
-# the CoreX platform).
+apache-tvm-ffi>=0.1.9 # pulled in by xgrammar; upstream cuda.txt pins == 0.1.10
+# All nvidia-* / torch / torchvision / torchaudio / torchcodec / flashinfer /
+# nvtx / tokenspeed / humming / quack / cutlass entries from upstream cuda.txt
+# are dropped (NVIDIA-only, not applicable to the CoreX platform), as are
+# tilelang and fastsafetensors (optional imports, unused on this platform).
 
-# ---- iluvatar transitive gap-fillers for --no-deps installs ------------------
-# compressed-tensors imports loguru at module load for logging.
-loguru
-# mistral_common -> pydantic_extra_types.language_code -> pycountry; triggered
-pycountry
-#xgrammar -> torch>=1.10.0
-apache-tvm-ffi>=0.1.9
+# ---- iluvatar transitive gap-fillers ----------------------------------------
+loguru # compressed-tensors imports loguru at module load for logging
+pycountry # mistral_common -> pydantic_extra_types.language_code -> pycountry

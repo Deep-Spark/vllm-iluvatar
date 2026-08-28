@@ -11,7 +11,8 @@ from typing import Any
 import ixformer.inference.functions as ixf_ops
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
-from ixformer.inference.functions.w8a8 import w8a8_gemm, w8a8_gemv
+from ixformer.inference.functions.w8a8 import w8a8_gemm
+from ixformer.inference.functions.w8a8_shapes import w8a8_perf_gemv_supported
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_scheme import (  # noqa: E501
@@ -36,6 +37,44 @@ from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_uti
 )
 
 logger = init_logger(__name__)
+
+
+def _w8a8_ixformer_perf(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    i_scales: torch.Tensor,
+    w_scales: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
+    format: str = "TN",
+    persistent: bool = False,
+    out_dtype: torch.dtype | None = None,
+):
+    """CQ native TN GEMV via the ``w8a8`` facade (``backend="ixformer_perf"``).
+
+    ``w8a8_gemv`` is the ixinfer path and still caps M at 16. Measured PERF
+    cutovers (17 / 33 / 65) target ``ixformer_perf`` (M up to 64, or 16 for
+    ``(32768, 1024)``), which requires 2D TN input. Flatten leading dims so
+    rank-3 activations match that contract.
+    """
+    del persistent
+    orig_leading = input.shape[:-1]
+    x2d = input.reshape(-1, input.shape[-1])
+    out2d = None if output is None else output.reshape(-1, output.shape[-1])
+    result = ixf_ops.w8a8(
+        x2d,
+        weight,
+        i_scales,
+        w_scales,
+        bias,
+        output=out2d,
+        format=format,
+        out_dtype=out_dtype,
+        backend="ixformer_perf",
+    )
+    if output is not None:
+        return output
+    return result.view(*orig_leading, result.shape[-1])
 
 
 def _mixed_quantization_strategy(mix_type: str):
@@ -91,103 +130,106 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
 
         self.perf_table = {
             "ivcore30": {
-                # n, k
+                # n, k -- small-M rows use explicit backend="ixformer_perf"
+                # (CQ TN GEMV); larger M uses w8a8_gemm. Cutoffs match measured
+                # native kernels (M up to 64, except (32768, 1024) capped at 16).
                 (2048, 7168): {
                     "format": "TN",
-                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, _w8a8_ixformer_perf), (65, w8a8_gemm)],
                 },
                 (4096, 1536): {
                     "format": "TN",
-                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, _w8a8_ixformer_perf), (33, w8a8_gemm)],
                 },
                 # deepseekv4 pro tp8
                 (8192, 1536): {
                     "format": "TN",
-                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, _w8a8_ixformer_perf), (17, w8a8_gemm)],
                 },
                 (7168, 2048): {
                     "format": "TN",
-                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, _w8a8_ixformer_perf), (17, w8a8_gemm)],
                 },
                 (768, 7168): {
                     "format": "TN",
-                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, _w8a8_ixformer_perf), (65, w8a8_gemm)],
                 },
                 (7168, 384): {
                     "format": "TN",
                     "func": [
-                        (0, w8a8_gemm),
+                        (0, _w8a8_ixformer_perf),
+                        (17, w8a8_gemm),
                     ],
                 },
                 # deepseekv4 pro tp4
                 (16384, 1536): {
                     "format": "TN",
-                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, _w8a8_ixformer_perf), (17, w8a8_gemm)],
                 },
                 (7168, 4096): {
                     "format": "TN",
-                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, _w8a8_ixformer_perf), (33, w8a8_gemm)],
                 },
                 (1536, 7168): {
                     "format": "TN",
-                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, _w8a8_ixformer_perf), (65, w8a8_gemm)],
                 },
                 (7168, 768): {
                     "format": "TN",
-                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, _w8a8_ixformer_perf), (17, w8a8_gemm)],
                 },
                 # deepseekv4 flash
                 (512, 4096): {
                     "format": "TN",
-                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, _w8a8_ixformer_perf), (33, w8a8_gemm)],
                 },
                 (1024, 4096): {
                     "format": "TN",
-                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, _w8a8_ixformer_perf), (33, w8a8_gemm)],
                 },
                 (1536, 4096): {
                     "format": "TN",
-                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, _w8a8_ixformer_perf), (33, w8a8_gemm)],
                 },
                 (2048, 4096): {
                     "format": "TN",
-                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, _w8a8_ixformer_perf), (65, w8a8_gemm)],
                 },
                 (4096, 256): {
                     "format": "TN",
-                    "func": [(0, w8a8_gemv), (2, w8a8_gemm)],
+                    "func": [(0, _w8a8_ixformer_perf), (2, w8a8_gemm)],
                 },
                 (4096, 512): {
                     "format": "TN",
-                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, _w8a8_ixformer_perf), (17, w8a8_gemm)],
                 },
                 (4096, 1024): {
                     "format": "TN",
-                    "func": [(0, w8a8_gemv), (2, w8a8_gemm)],
+                    "func": [(0, _w8a8_ixformer_perf), (17, w8a8_gemm)],
                 },
                 (4096, 2048): {
                     "format": "TN",
-                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, _w8a8_ixformer_perf), (33, w8a8_gemm)],
                 },
                 (4096, 4096): {
                     "format": "TN",
-                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, _w8a8_ixformer_perf), (65, w8a8_gemm)],
                 },
                 (4096, 8192): {
                     "format": "TN",
-                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "func": [(0, _w8a8_ixformer_perf), (65, w8a8_gemm)],
                 },
                 (8192, 1024): {
                     "format": "TN",
-                    "func": [(0, w8a8_gemv), (2, w8a8_gemm)],
+                    "func": [(0, _w8a8_ixformer_perf), (17, w8a8_gemm)],
                 },
                 (16384, 1024): {
-                    "format": "NN",
-                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                    "format": "TN",
+                    "func": [(0, _w8a8_ixformer_perf), (17, w8a8_gemm)],
                 },
                 (32768, 1024): {
-                    "format": "NN",
-                    "func": [(0, w8a8_gemv), (9, w8a8_gemm)],
+                    "format": "TN",
+                    "func": [(0, _w8a8_ixformer_perf), (17, w8a8_gemm)],
                 },
             },
             "ivcore11": {},
@@ -232,7 +274,13 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
     def _get_perf_func(self, n: int, k: int, m: int):
         """In PERF mode, select the best kernel for the given m from
         perf_table.  Returns None when PERF mode is off or shape not in
-        table, signalling the caller to use the default w8a8 path."""
+        table, signalling the caller to use the default w8a8 path.
+
+        ``m`` is the kernel batch after flattening leading dims
+        (``numel // k``), not ``x.shape[0]``. Small-M rows go to
+        ``ixformer_perf`` (legal M ``<= 64``, or ``<= 16`` for
+        ``(32768, 1024)``); larger M uses ``w8a8_gemm``.
+        """
         if self.perf_mode != "PERF":
             return None
         entry = self._get_perf_entry(n, k)
@@ -247,7 +295,24 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
             f"No kernel found for arch:{self.arch} n:{n} k:{k} m:{m} "
             f"func_list:{func_list}"
         )
+        if (
+            chosen is _w8a8_ixformer_perf
+            and m > 0
+            and not w8a8_perf_gemv_supported(m, n, k)
+        ):
+            return w8a8_gemm
         return chosen
+
+    @staticmethod
+    def _kernel_m(x: torch.Tensor) -> int:
+        """Batch size seen by ``ixformer_perf`` / ``w8a8_gemm`` after flatten.
+
+        Both paths consume ``input.view(-1, k)``, so M is ``numel // k``.
+        Rank-3+ activations split that batch across leading dims; using
+        ``shape[0]`` undercounts M and can pick the GEMV past its legal
+        batch (64, or 16 for ``(32768, 1024)``).
+        """
+        return x.numel() // x.shape[-1]
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -502,7 +567,8 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
                 f"got {x_q.dim()}D"
             )
 
-        perf_fn = self._get_perf_func(self.gemm_info.n, self.gemm_info.k, x_q.shape[0])
+        kernel_m = self._kernel_m(x_q)
+        perf_fn = self._get_perf_func(self.gemm_info.n, self.gemm_info.k, kernel_m)
         if perf_fn is not None:
             perf_fn(
                 x_q,

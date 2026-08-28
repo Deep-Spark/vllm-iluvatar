@@ -237,14 +237,6 @@ if _DS4_MHC_PRE_VERSION not in ("v1", "v2", "v3"):
         _DS4_MHC_PRE_VERSION,
     )
     _DS4_MHC_PRE_VERSION = "v1"
-if _DS4_MHC_PRE_VERSION == "v2":
-    logger.info("DeepSeek-V4 mhc_pre: using ds4_mhc_pre_v2 (bf16 GEMM + epilogue)")
-elif _DS4_MHC_PRE_VERSION == "v3":
-    logger.info(
-        "DeepSeek-V4 mhc_pre: using ds4_mhc_pre_v3 (bf16 GEMM + split epilogue)"
-    )
-
-
 # attn_norm / ffn_norm folded into the mhc_pre epilogue (ds4_mhc_pre_v2
 # need_rms). On by default for every step the kernel supports;
 # IXFORMER_DS4_HC_PRE_NORM_FUSION=0 opts out for A/B against the standalone
@@ -981,6 +973,17 @@ class IluDeepseekV4Model(nn.Module):
         }
 
         self.device = current_platform.device_type
+        if _DS4_MHC_PRE_VERSION == "v2":
+            logger.info(
+                "DeepSeek-V4 mhc_pre: using ds4_mhc_pre_v2 "
+                "(bf16 GEMM + epilogue)"
+            )
+        elif _DS4_MHC_PRE_VERSION == "v3":
+            logger.info(
+                "DeepSeek-V4 mhc_pre: using ds4_mhc_pre_v3 "
+                "(bf16 GEMM + split epilogue)"
+            )
+
         self.topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
             config.index_topk,

@@ -62,7 +62,6 @@ from typing import Any
 import ixformer.inference.functions as ixfops
 import torch
 from ixformer.inference.functions.fp8 import fp8_per_token_dynamic_scaled
-from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEActivationFormat,
     FusedMoEMethodBase,
@@ -115,7 +114,6 @@ _IXMM_GROUP_SIZE = 256
 _FP4_MAX_MAG = 6.0
 _IXMM_FP8_GEMV_MAX_M = 16
 
-logger = init_logger(__name__)
 
 
 @IluvatarQuantRegistry.register_method

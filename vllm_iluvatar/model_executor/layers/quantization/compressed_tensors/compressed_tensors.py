@@ -49,7 +49,7 @@ from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes
     IluCompressedTensorsW8A8Int8,
 )
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 QUANTIZATION_SCHEME_MAP_TYPE = dict[str, dict[str, QuantizationArgs] | None]
 _ORIGINAL_GET_SCHEME_FROM_PARTS: Callable | None = None

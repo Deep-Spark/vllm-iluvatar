@@ -29,7 +29,7 @@ from vllm_iluvatar.distributed.device_communicators.all2all import (
 if TYPE_CHECKING:
     import deep_ep
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 DEEPEP_QUANT_BLOCK_SIZE = 128
 DEEPEP_QUANT_BLOCK_SHAPE = [DEEPEP_QUANT_BLOCK_SIZE, DEEPEP_QUANT_BLOCK_SIZE]

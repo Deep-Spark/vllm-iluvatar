@@ -18,9 +18,7 @@ import ixformer.inference.functions as ixf_ops  # type: ignore[import]
 import torch
 import torch.nn.functional as F
 from ixformer.core import config
-from vllm.logger import init_logger
 
-logger = init_logger(__name__)
 _USE_TORCH_OPS = config.IXFORMER_USE_TORCH_OPS
 
 # ---------------------------------------------------------------------------

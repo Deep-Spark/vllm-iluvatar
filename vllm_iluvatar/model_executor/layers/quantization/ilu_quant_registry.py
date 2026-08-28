@@ -9,7 +9,7 @@ from typing import overload
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 QuantMethodClass = type[QuantizeMethodBase]
 

@@ -9,7 +9,7 @@ from vllm.logger import init_logger
 
 from .base_worker import IluNixlWorkerMixin
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 
 class IluNixlPullConnectorWorker(IluNixlWorkerMixin, NixlPullConnectorWorker):

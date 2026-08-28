@@ -14,7 +14,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.logger import init_logger
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 ReqId = str
 

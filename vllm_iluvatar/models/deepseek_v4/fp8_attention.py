@@ -63,7 +63,7 @@ from vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse import (
     IluFlashMLASparseMetadata,
 )
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 
 # 4-byte fp32 ue8m0 scale per token (quant_block_size == index_head_dim).

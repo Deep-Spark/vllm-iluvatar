@@ -31,7 +31,7 @@ from vllm.model_executor.layers.fused_moe import UnquantizedFusedMoEMethod
 
 from vllm_iluvatar.ilu_patch import general_patch as p
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 _ORIGINAL_GET_MOE_METHOD: Callable | None = None
 

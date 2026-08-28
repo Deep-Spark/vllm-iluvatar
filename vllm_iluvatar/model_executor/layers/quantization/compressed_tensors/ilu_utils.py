@@ -1,5 +1,5 @@
 from vllm.logger import init_logger
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 import torch
 from vllm.model_executor.layers.quantization.utils import replace_parameter

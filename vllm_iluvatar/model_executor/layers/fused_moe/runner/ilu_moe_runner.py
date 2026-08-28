@@ -38,7 +38,7 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExpertsOrder,
 )
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 
 class IluMoERunner(MoERunner):

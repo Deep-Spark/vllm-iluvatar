@@ -35,7 +35,7 @@ from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_uti
     unpad_tensor,
 )
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 
 def _mixed_quantization_strategy(mix_type: str):

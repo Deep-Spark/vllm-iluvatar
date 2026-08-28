@@ -5,7 +5,6 @@ from dataclasses import dataclass
 import torch
 import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
@@ -30,7 +29,6 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 from vllm.v1.worker.cp_utils import get_kv_cache_shard_count
 
-logger = init_logger(__name__)
 
 
 @triton.jit

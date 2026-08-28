@@ -61,7 +61,7 @@ if TYPE_CHECKING:
     from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 
 class NixlConnectorScheduler:

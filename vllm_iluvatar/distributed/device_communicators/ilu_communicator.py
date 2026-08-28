@@ -22,9 +22,7 @@ from vllm.distributed.device_communicators.cuda_communicator import (
     CudaCommunicator,
 )
 from vllm.distributed.utils import StatelessProcessGroup
-from vllm.logger import init_logger
 
-logger = init_logger(__name__)
 
 
 class IluCommunicator(CudaCommunicator):

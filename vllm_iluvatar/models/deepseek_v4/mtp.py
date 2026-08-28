@@ -53,7 +53,8 @@ from vllm.utils.multi_stream_utils import AuxStreamType
 
 from .model import IluDeepseekV4DecoderLayer
 
-logger = init_logger(__name__)
+# Keep the plugin logger under ``vllm.`` so INFO messages use vLLM's handler.
+logger = init_logger(f"vllm.{__name__}")
 
 
 class IluDeepSeekV4MultiTokenPredictorLayer(nn.Module):

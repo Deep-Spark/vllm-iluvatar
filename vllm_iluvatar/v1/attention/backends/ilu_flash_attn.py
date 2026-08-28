@@ -67,7 +67,7 @@ from vllm_iluvatar.v1.attention.ilu_static_quant import (
     load_static_fp8_qkv_scales,
 )
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 
 def _get_k_int8_cache_views(

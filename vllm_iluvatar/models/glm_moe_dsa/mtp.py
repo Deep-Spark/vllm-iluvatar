@@ -63,7 +63,7 @@ from vllm_iluvatar.models.glm_moe_dsa.model import (
     IluGlmMoeDsaDecoderLayer,
 )
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 
 class IluGlmMoeDsaMultiTokenPredictorLayer(nn.Module):

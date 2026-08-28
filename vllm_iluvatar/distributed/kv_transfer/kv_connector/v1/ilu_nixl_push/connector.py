@@ -51,7 +51,7 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 
 class NixlConnector(KVConnectorBase_V1, SupportsHMA):

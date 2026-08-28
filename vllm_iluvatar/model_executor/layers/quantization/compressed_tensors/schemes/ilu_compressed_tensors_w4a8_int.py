@@ -11,7 +11,6 @@ import ixformer.inference.functions as ixf_ops
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
 from vllm import _custom_ops as ops
-from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_scheme import (  # noqa: E501
     CompressedTensorsScheme,
 )
@@ -29,7 +28,6 @@ from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_uti
     unpad_tensor,
 )
 
-logger = init_logger(__name__)
 
 __all__ = ["IluCompressedTensorsW4A8Int"]
 

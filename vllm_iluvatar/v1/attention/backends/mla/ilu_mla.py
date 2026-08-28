@@ -30,7 +30,6 @@ from vllm import _custom_ops as ops
 from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import get_dcp_group
-from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonBackend,
     MLACommonDecodeMetadata,
@@ -56,7 +55,6 @@ from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 
-logger = init_logger(__name__)
 
 
 @dataclass

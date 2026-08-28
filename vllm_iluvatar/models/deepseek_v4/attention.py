@@ -88,7 +88,7 @@ from vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa import (
     IluDeepseekV4SWACache,
 )
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 DynamicInt8Input = tuple[torch.Tensor, torch.Tensor, torch.dtype]
 _C4A_OUTER_Q_N = 16384

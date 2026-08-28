@@ -48,7 +48,7 @@ from vllm_iluvatar.model_executor.layers.fused_moe.prepare_finalize.ilu_deepep_l
     nvsm_dispatch_quant_kwargs,
 )
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 _DS4_DECODE_EP_BACKEND = envs.VLLM_ILU_DECODE_EP_BACKEND
 _USE_FUSED_MOE = envs.VLLM_ILU_MOE_EP_LL_MOE_ALGO == "FUSED"

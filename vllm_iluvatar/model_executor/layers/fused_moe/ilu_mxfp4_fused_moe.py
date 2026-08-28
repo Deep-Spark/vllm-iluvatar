@@ -75,7 +75,7 @@ from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_
 )
 from vllm_iluvatar.model_executor.layers.activation import swiglu_clamp
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 # MXFP4 microscaling block size: 32 fp4 (e2m1) values share one e8m0 exponent.
 MXFP4_BLOCK = 32

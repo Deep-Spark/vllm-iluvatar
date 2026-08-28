@@ -33,7 +33,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 from .metadata import IluNixlAgentMetadata, IluNixlTransferRegion
 from .pp_utils import infer_pp_split
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 
 class IluNixlWorkerMixin:

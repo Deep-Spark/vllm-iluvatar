@@ -111,7 +111,7 @@ from vllm_iluvatar.models.deepseek_v4.attention import (
     IluDeepseekV4MultiHeadLatentAttentionWrapper,
 )
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 
 @IluvatarQuantRegistry.register_method

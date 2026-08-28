@@ -58,7 +58,7 @@ from vllm.utils.math_utils import cdiv
 
 from .fp8_model import IluDeepseekV4Fp8DecoderLayer
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 # MoE expert scales land on Mxfp4MoEMethod's ``w{1,2,3}_weight_scale``; every
 # other FP8 linear scale is Fp8LinearMethod's ``weight_scale_inv``.  Same rule

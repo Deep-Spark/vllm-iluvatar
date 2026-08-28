@@ -34,7 +34,7 @@ from vllm.v1.worker.ubatch_utils import (
     is_last_ubatch_empty,
 )
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 # [ILU addition] Last synchronized all-DP decode-only bit.  The
 # ``DPMetadata.make`` / ``set_forward_context`` wrappers attach this value to

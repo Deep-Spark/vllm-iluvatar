@@ -86,7 +86,7 @@ from vllm_iluvatar.models.glm_moe_dsa.attention import (
     IluGlmMoeDsaMLAAttention,
 )
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 
 @IluvatarQuantRegistry.register_method

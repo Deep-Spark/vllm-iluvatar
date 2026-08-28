@@ -8,7 +8,6 @@ import ixformer.inference.functions as ixfops
 import torch
 from vllm import _custom_ops as ops
 from vllm.forward_context import get_forward_context
-from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.platforms import current_platform
@@ -18,7 +17,6 @@ from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
     IluDeepseekV32IndexerMetadata,
 )
 
-logger = init_logger(__name__)
 
 
 def ilu_sparse_attn_indexer(

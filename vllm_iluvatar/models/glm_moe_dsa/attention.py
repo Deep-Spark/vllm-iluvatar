@@ -44,7 +44,6 @@ from vllm import _custom_ops as ops
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
-from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -74,7 +73,6 @@ from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
     IluDeepseekV32IndexerBackend,
 )
 
-logger = init_logger(__name__)
 
 
 def _yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:

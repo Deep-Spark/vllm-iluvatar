@@ -122,7 +122,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
 
 
 DISABLE_DEEPEP = envs.VLLM_ILU_DISABLE_DEEPEP
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 
 class DeepEPAll2AllManagerBase(All2AllManagerBase):

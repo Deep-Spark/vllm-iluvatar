@@ -79,7 +79,7 @@ if TYPE_CHECKING:
 from nixl._api import nixl_agent as NixlWrapper
 from nixl._api import nixl_agent_config, nixl_prepped_dlist_handle
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 
 class NixlConnectorWorker:

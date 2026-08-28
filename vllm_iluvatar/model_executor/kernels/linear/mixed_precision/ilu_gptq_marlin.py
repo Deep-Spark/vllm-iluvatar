@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import torch
 from vllm import _custom_ops as ops
-from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
     MPLinearKernel,
     MPLinearLayerConfig,
@@ -32,7 +31,6 @@ from vllm.model_executor.parameter import BasevLLMParameter, permute_param_layou
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 
-logger = init_logger(__name__)
 
 
 def unpack_rows(packed_w: torch.Tensor, num_bits: int) -> torch.Tensor:

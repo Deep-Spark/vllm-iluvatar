@@ -62,7 +62,7 @@ from vllm_iluvatar.model_executor.layers.fused_moe.ilu_decode_metadata import (
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization import QuantizationMethods
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 
 def _get_ilu_output_scale(layer: RoutedExperts) -> float:

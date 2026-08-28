@@ -24,7 +24,7 @@ from vllm.utils.network_utils import make_zmq_path
 
 from .metadata import HeartbeatInfo, IluNixlConnectorMetadata
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 
 class IluNixlBaseConnectorScheduler(NixlBaseConnectorScheduler):

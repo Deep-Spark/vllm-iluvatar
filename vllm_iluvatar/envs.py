@@ -47,11 +47,9 @@ def _bool_reader(name: str, default: str) -> Callable[[], bool]:
 # are NOT renamed; we only change their default via os.environ.setdefault.
 #   VLLM_USE_FLASHINFER_SAMPLER       : "1"   -> "0"
 #   VLLM_DISABLE_SHARED_EXPERTS_STREAM: "0"   -> "1"
-#   VLLM_USE_V2_MODEL_RUNNER          : unset -> "0"
 _ILU_DEFAULTS: dict[str, str] = {
     "VLLM_USE_FLASHINFER_SAMPLER": "0",
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": "1",
-    "VLLM_USE_V2_MODEL_RUNNER": "0",
 }
 
 

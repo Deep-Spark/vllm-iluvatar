@@ -4,7 +4,7 @@
 The KV path is ``fp8_ds_mla`` and the heavy ops reuse ixformer ``ds4_*`` /
 ``dsa_*`` kernels; input/output projections run on the block-fp8 LinearMethod
 (``wo_a`` uses the fp8 grouped-einsum path, see ``_o_proj``). ``forward_mqa``
-runs a single unified ``ds4_flash_mla_with_fp8_kvcache`` over all tokens
+runs a single unified ``ds4_sparse_mla_fp8_decode`` over all tokens
 (prefill == decode). The SWA/main-MLA caches and compressor use the ilu
 variants (community ones build NV-shaped metadata or launch Triton kernels the
 Iluvatar stack rejects). The lightning indexer is the self-contained
@@ -22,7 +22,6 @@ from typing import ClassVar
 import ixformer.inference.functions as ixfops
 import torch
 import torch.nn as nn
-import vllm.envs as envs
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
@@ -40,10 +39,6 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.attention import _resolve_dsv4_kv_cache_dtype
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
-from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
-    IluDeepseekV32IndexerMetadata,
-    IluDeepseekV4IndexerBackend,
-)
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
@@ -62,12 +57,36 @@ from vllm_iluvatar.models.deepseek_v4.sparse_swa import (
 from vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse import (
     IluFlashMLASparseMetadata,
 )
+from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
+    IluDeepseekV4IndexerBackend,
+    IluDeepseekV32IndexerMetadata,
+)
 
 logger = init_logger("vllm." + __name__)
 
 
 # 4-byte fp32 ue8m0 scale per token (quant_block_size == index_head_dim).
 _INDEXER_FP8_SCALE_BYTES = 4
+# ds4_sparse_mla_fp8_decode: h_q is a kernel bucket; indices.stride(0) % 256 == 0.
+_SPARSE_DECODE_H_Q = (1, 8, 16, 32, 64, 128)
+_SPARSE_DECODE_INDEX_ALIGN = 256
+
+
+def _as_sparse_decode_indices(indices: torch.Tensor) -> torch.Tensor:
+    """``(T, 1, K)`` or ``(T, K)`` → ``(T, K)`` with ``stride(0) % 256 == 0``."""
+    if indices.dim() == 3:
+        indices = indices.squeeze(1)
+    if (
+        indices.dim() != 2
+        or indices.stride(1) != 1
+        or indices.stride(0) % _SPARSE_DECODE_INDEX_ALIGN != 0
+    ):
+        raise ValueError(
+            "ds4_sparse_mla_fp8_decode requires 2D indices with stride(1)==1 "
+            f"and stride(0)%{_SPARSE_DECODE_INDEX_ALIGN}==0; got "
+            f"shape={tuple(indices.shape)} stride={indices.stride()}"
+        )
+    return indices
 
 
 class IluDeepseekV4Fp8IndexerCache(nn.Module, AttentionLayerBase):
@@ -76,7 +95,7 @@ class IluDeepseekV4Fp8IndexerCache(nn.Module, AttentionLayerBase):
     uint8 paged cache with ``head_size = index_head_dim + 4``. Per block the
     ``[block_size, 128]`` e4m3 K region and ``[block_size]`` fp32 ue8m0 scale
     region are stored *grouped* (not interleaved per token) so each K row is
-    128B/16-aligned, which the ixmma SME matrix loader on ix30 requires.
+    128B/16-aligned, which the ixmma matrix loader on ix30 requires.
     """
 
     def __init__(
@@ -248,7 +267,9 @@ class IluDeepseekV4Fp8Indexer(nn.Module):
             prefix=f"{prefix}.weights_proj",
         )
 
-        assert cache_config is not None, "Ilu DeepSeek V4 fp8 indexer needs cache_config"
+        assert cache_config is not None, (
+            "Ilu DeepSeek V4 fp8 indexer needs cache_config"
+        )
         self.k_cache = IluDeepseekV4Fp8IndexerCache(
             head_dim=self.head_dim,
             prefix=f"{prefix}.k_cache",
@@ -444,8 +465,8 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
         self.eps = config.rms_norm_eps
         self.scale = self.head_dim**-0.5
 
-        # No head padding: the ixformer sparse MLA kernels accept an arbitrary
-        # ``h_q``, so ``attn_sink`` carries exactly ``n_local_heads`` values.
+        # No head padding: packed decode buckets ``h_q`` exactly (no pad);
+        # ``attn_sink`` carries ``n_local_heads`` values.
         self.attn_sink = nn.Parameter(
             torch.full((self.n_local_heads,), -float("inf"), dtype=torch.float32),
             requires_grad=False,
@@ -706,8 +727,9 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
         positions: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        """Unified sparse MLA forward: a single ``ds4_flash_mla_with_fp8_kvcache``
-        call over *all* tokens (prefill == decode).
+        """Unified sparse MLA forward over *all* tokens (prefill == decode).
+
+        Packed Q + ``ds4_sparse_mla_fp8_decode``.
 
         ``kv`` is unused (the rotated K rows were already written by the
         compressor / ``_fused_qnorm_rope_kv_insert`` step); it is kept for the
@@ -769,45 +791,28 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
             )
             extra_k_cache = self.kv_cache
 
-        q_4d = q.unsqueeze(1)
-        out_4d = output.unsqueeze(1)
-        quant_type = envs.VLLM_ILU_DS4_MQA_QUANT_TYPE
-        if quant_type == "Q_NOPE_FP8":
-            q_nope_fp8, q_scales, q_rope = ixfops.ds4_dynamic_quant_mla_q_nope_fp8(
-                q_4d
-            )
-            ixfops.ds4_flash_mla_with_fp8_q_nope_kvcache(
-                q_nope_fp8=q_nope_fp8,
-                q_scales=q_scales,
-                q_rope=q_rope,
-                k_cache=self.swa_cache_layer.kv_cache,
-                indices=swa_indices,
-                topk_length=swa_lens,
-                sm_scale=self.scale,
-                attn_sink=self.attn_sink,
-                extra_k_cache=extra_k_cache,
-                extra_indices=extra_indices,
-                extra_topk_length=extra_topk_length,
-                output=out_4d,
-            )
-        elif quant_type == "":
-            ixfops.ds4_flash_mla_with_fp8_kvcache(
-                q=q_4d,
-                k_cache=self.swa_cache_layer.kv_cache,
-                indices=swa_indices,
-                topk_length=swa_lens,
-                sm_scale=self.scale,
-                attn_sink=self.attn_sink,
-                extra_k_cache=extra_k_cache,
-                extra_indices=extra_indices,
-                extra_topk_length=extra_topk_length,
-                output=out_4d,
-            )
-        else:
-            raise ValueError(
-                f"Unsupported VLLM_ILU_DS4_MQA_QUANT_TYPE={quant_type!r}; "
-                'expected "" or "Q_NOPE_FP8".'
-            )
+        h_q = q.shape[1]
+        assert h_q in _SPARSE_DECODE_H_Q, (
+            f"ds4_sparse_mla_fp8_decode requires h_q in {_SPARSE_DECODE_H_Q}, got {h_q}"
+        )
+        indices = _as_sparse_decode_indices(swa_indices)
+        extra_idx = (
+            None if extra_indices is None else _as_sparse_decode_indices(extra_indices)
+        )
+        q_packed, q_scales = ixfops.ds4_dynamic_quant_mla_q_packed_fp8(q)
+        ixfops.ds4_sparse_mla_fp8_decode(
+            q_packed=q_packed,
+            q_scales=q_scales,
+            k_cache=self.swa_cache_layer.kv_cache,
+            indices=indices,
+            sm_scale=self.scale,
+            topk_length=swa_lens,
+            attn_sink=self.attn_sink,
+            extra_k_cache=extra_k_cache,
+            extra_indices=extra_idx,
+            extra_topk_length=extra_topk_length,
+            output=output,
+        )
 
     def _build_extra_topk(
         self,
@@ -818,7 +823,8 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
         """Build global compressed top-k indices/lens for the real tokens.
 
         Returns ``(extra_indices [num_actual, 1, topk] int32, extra_topk_length
-        [num_actual] int32)`` in global paged-slot form for the main MLA cache.
+        [num_actual] int32)``; ``forward_mqa`` squeezes extra_indices to 2D
+        for ``ds4_sparse_mla_fp8_decode``.
 
         - **C4A**: globalize the indexer's per-token local slots over the whole
           ``[0:num_actual]`` range in one call.
@@ -831,7 +837,7 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
             topk_lens = attn_metadata.c128a_topk_lens
             assert global_indices is not None and topk_lens is not None
             return (
-                global_indices[:num_actual].view(num_actual, 1, -1),
+                global_indices[:num_actual].unsqueeze(1),
                 topk_lens[:num_actual],
             )
 
@@ -843,20 +849,17 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
         if self.compress_ratio == 4:
             assert self.topk_indices_buffer is not None
             block_size = attn_metadata.block_size // self.compress_ratio
-            global_indices, topk_lens = (
-                ixfops.ds4_compute_global_topk_indices_and_lens(
-                    self.topk_indices_buffer[:num_actual],
-                    token_to_req,
-                    attn_metadata.block_table,
-                    block_size,
-                    is_valid,
-                )
+            global_indices, topk_lens = ixfops.ds4_compute_global_topk_indices_and_lens(
+                self.topk_indices_buffer[:num_actual],
+                token_to_req,
+                attn_metadata.block_table,
+                block_size,
+                is_valid,
             )
             return global_indices.view(num_actual, 1, -1), topk_lens
 
         raise ValueError(
-            f"Unsupported compress_ratio={self.compress_ratio}; expected 1, 4, "
-            "or 128."
+            f"Unsupported compress_ratio={self.compress_ratio}; expected 1, 4, or 128."
         )
 
     def _require_bmm_weights(self) -> None:

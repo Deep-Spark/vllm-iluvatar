@@ -69,6 +69,8 @@ def test_ragged_decode_spans_compressed_ratio4():
 
     kv_lens = [e - s for s, e in zip(ks, ke)]
     assert kv_lens == [9, 9, 9, 10, 11, 11, 11, 12, 7]
+    # valid_lens == ke - ks; MTP next_n=4 first request pos 36..39 → (pos+1)//4
+    assert kv_lens[:4] == [(p + 1) // 4 for p in range(36, 40)]
 
 
 def test_ragged_matches_per_request_independent():

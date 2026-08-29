@@ -156,6 +156,7 @@ class IluDeepseekV32IndexerPrefillChunkMetadata:
     block_table: torch.Tensor
     cu_seqlen_ks: torch.Tensor
     cu_seqlen_ke: torch.Tensor
+    valid_lens: torch.Tensor
     cu_seq_lens: torch.Tensor
     cu_seqlens_q: torch.Tensor
     token_to_seq: torch.Tensor
@@ -187,6 +188,7 @@ class IluDeepSeekV32IndexerDecodeMetadata:
     # schedule_metadata: torch.Tensor
     cu_seqlen_ks: torch.Tensor
     cu_seqlen_ke: torch.Tensor
+    valid_lens: torch.Tensor
     cu_seqlens_kv: torch.Tensor
     cu_seqlens_q: torch.Tensor
     max_context_len: int
@@ -429,6 +431,11 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
+        self.valid_lens_buffer = torch.empty(
+            (scheduler_config.max_num_batched_tokens,),
+            dtype=torch.int32,
+            device=self.device,
+        )
         self.decode_compressed_seq_lens_buffer = torch.empty(
             (scheduler_config.max_num_seqs,),
             dtype=torch.int32,
@@ -522,9 +529,16 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             )
             max_q_len = sub_m
 
+        chunk_ks = cu_seqlen_ks[query_slice]
+        chunk_ke = cu_seqlen_ke[query_slice]
+        # Prefill is not CUDA-graph captured (FULL_DECODE_ONLY). Still produce
+        # valid_lens here so forward never subtracts.
+        valid_lens = chunk_ke - chunk_ks
+
         return IluDeepseekV32IndexerPrefillChunkMetadata(
-            cu_seqlen_ks=cu_seqlen_ks[query_slice],
-            cu_seqlen_ke=cu_seqlen_ke[query_slice],
+            cu_seqlen_ks=chunk_ks,
+            cu_seqlen_ke=chunk_ke,
+            valid_lens=valid_lens,
             cu_seq_lens=cu_seq_lens,
             token_to_seq=token_to_seq,
             total_seq_lens=total_seq_lens,
@@ -653,6 +667,12 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.cu_seqlen_ke_buffer[num_real_decode_tokens:num_decode_tokens] = 0
         cu_seqlen_ks = self.cu_seqlen_ks_buffer[:num_decode_tokens]
         cu_seqlen_ke = self.cu_seqlen_ke_buffer[:num_decode_tokens]
+        torch.sub(
+            cu_seqlen_ke,
+            cu_seqlen_ks,
+            out=self.valid_lens_buffer[:num_decode_tokens],
+        )
+        valid_lens = self.valid_lens_buffer[:num_decode_tokens]
 
         # Fill compressed seq_lens buffer in-place for address stability.
         # ``decode_metadata.seq_lens`` is consumed by topk-update / paged-mqa
@@ -688,6 +708,7 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             requires_padding=requires_padding,
             cu_seqlen_ks=cu_seqlen_ks,
             cu_seqlen_ke=cu_seqlen_ke,
+            valid_lens=valid_lens,
             cu_seqlens_kv=cu_seqlens_kv,
             cu_seqlens_q=cu_seqlens_q,
             max_context_len=max_context_len,

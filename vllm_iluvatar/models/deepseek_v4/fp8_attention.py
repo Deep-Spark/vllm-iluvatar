@@ -376,6 +376,7 @@ class IluDeepseekV4Fp8Indexer(nn.Module):
                     max_q_len=chunk.max_q_len,
                     max_kv_len=chunk.max_kv_len,
                     max_context_len=chunk.max_context_len,
+                    valid_lens=chunk.valid_lens,
                 )
                 ixfops.dsa_update_topk_indices(
                     logits,
@@ -402,6 +403,7 @@ class IluDeepseekV4Fp8Indexer(nn.Module):
                 max_q_len=decode_md.max_q_len,
                 max_kv_len=decode_md.max_kv_len,
                 max_context_len=decode_md.max_context_len,
+                valid_lens=decode_md.valid_lens,
             )
             ixfops.dsa_update_topk_indices(
                 logits,

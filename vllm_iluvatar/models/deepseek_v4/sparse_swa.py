@@ -2,7 +2,7 @@
 """fp8-only sliding-window-attention (SWA) stack for DeepSeek-V4.
 
 The fp8 attention unifies prefill and decode onto a single
-``ds4_flash_mla_with_fp8_kvcache`` call over all tokens, which needs a
+``ds4_sparse_mla_fp8_decode`` call over all tokens, which needs a
 contiguous ``[0:num_actual]`` SWA index buffer covering both. So fp8 gets its
 own lean ``IluFp8SWAMetadata`` and a builder that fully overrides ``build()``
 (one position-based SWA pass over the full token range) while still subclassing
@@ -18,7 +18,6 @@ from typing import TYPE_CHECKING
 
 import ixformer.inference.functions as ixfops
 import torch
-
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadataBuilder
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
@@ -31,6 +30,11 @@ from vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa import (
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
+# Packed decode checks indices.stride(0)%256==0 (storage width), not size(1).
+# Widen the backing row to 256 but expose [:window_size] so size(1) stays
+# window_size; padding -1 past size(1) must not enter the K loop.
+_FP8_SWA_INDEX_ALIGN = 256
+
 
 @dataclass
 class IluFp8SWAMetadata:
@@ -41,8 +45,8 @@ class IluFp8SWAMetadata:
     valid.
     """
 
-    # Contiguous all-token (decode + prefill) SWA window slots / lengths, the
-    # sole ``indices`` / ``topk_length`` args of ``ds4_flash_mla_with_fp8_kvcache``.
+    # Contiguous all-token (decode + prefill) SWA window slots / lengths.
+    # Logical last dim is window_size; backing row may be 256-strided.
     all_swa_indices: torch.Tensor  # [num_tokens, 1, window_size] int32
     all_swa_lens: torch.Tensor  # [num_tokens] int32
 
@@ -69,10 +73,29 @@ class IluFp8SWAMetadata:
 class IluDeepseekV4Fp8SWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
     """fp8-only SWA metadata builder for the unified (single-call) MQA path.
 
-    Subclasses the community base only to reuse its ``__init__``; ``build()`` is
-    fully overridden and returns the lean ``IluFp8SWAMetadata`` with the
-    contiguous ``[0:num_tokens]`` SWA slices.
+    Reuses the community ``__init__`` write buffer (``size(-1)==window_size``).
+    ``build()`` is fully overridden and, when ``window_size`` is not 256-aligned,
+    copies into a 256-stride backing buffer then narrows to ``window_size``.
     """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        src_width = self.window_size
+        aligned = (
+            (src_width + _FP8_SWA_INDEX_ALIGN - 1)
+            // _FP8_SWA_INDEX_ALIGN
+            * _FP8_SWA_INDEX_ALIGN
+        )
+        if aligned != src_width:
+            max_tokens, _, _ = self.decode_swa_indices.shape
+            self._packed_swa_indices = torch.full(
+                (max_tokens, 1, aligned),
+                -1,
+                dtype=torch.int32,
+                device=self.decode_swa_indices.device,
+            )
+        else:
+            self._packed_swa_indices = None
 
     def build(
         self,
@@ -134,9 +157,21 @@ class IluDeepseekV4Fp8SWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
                 block_size=self.block_size,
                 num_decode_tokens=num_swa_tokens,
             )
+            if self._packed_swa_indices is not None:
+                self._packed_swa_indices[:num_swa_tokens, :, : self.window_size].copy_(
+                    self.decode_swa_indices[:num_swa_tokens]
+                )
+
+        # Narrow to window_size: squeezed 2D view is (T, window_size) with
+        # stride(0) 256-aligned.
+        all_swa_indices = (
+            self._packed_swa_indices[:num_swa_tokens, :, : self.window_size]
+            if self._packed_swa_indices is not None
+            else self.decode_swa_indices[:num_swa_tokens]
+        )
 
         return IluFp8SWAMetadata(
-            all_swa_indices=self.decode_swa_indices[:num_swa_tokens],
+            all_swa_indices=all_swa_indices,
             all_swa_lens=self.decode_swa_lens[:num_swa_tokens],
             is_valid_token=is_valid_token,
             token_to_req_indices=token_to_req_indices,

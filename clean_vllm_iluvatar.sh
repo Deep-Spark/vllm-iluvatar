@@ -24,5 +24,6 @@ rm -f compile_commands.json
 
 echo "INFO: Removing in-place native extensions"
 rm -f vllm_iluvatar/_C*.so
+rm -f vllm_iluvatar/_onchip_check*.so
 
 echo "INFO: Clean complete"

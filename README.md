@@ -27,6 +27,8 @@ The package includes:
 - `vllm_iluvatar._C`, a native extension providing vLLM-compatible `_C`
   operators such as `rms_norm`, `weak_ref_tensor`, and
   `get_cuda_view_from_cpu_tensor`.
+- `vllm_iluvatar._onchip_check`, an optional SLB/register/L1/L2 integrity
+  checker integrated with the GPU Worker lifecycle.
 - `vllm_iluvatar.kernels`, an Iluvatar IR operator provider for vLLM V1.
 - Runtime import hooks and compatibility shims required during worker startup.
 - Out-of-tree model and quantization support for Qwen3 and DeepSeek-V4.
@@ -148,6 +150,35 @@ vllm serve /path/to/deepseek_v4_model \
 For NIXL KV transfer, use vLLM's `--kv-transfer-config` option to select
 `IluNixlConnector`, `IluNixlPullConnector`, or `IluNixlPushConnector`, depending
 on the deployment topology.
+
+### On-chip storage integrity checking
+
+The checker is disabled by default. Enable it before starting vLLM:
+
+```bash
+export VLLM_ILU_ONCHIP_CHECK=1
+vllm serve /path/to/model ...
+```
+
+When enabled, every GPU Worker runs a strict check after model warmup, one
+synchronous check before each non-empty GPU batch, and a log-only check during
+shutdown. `FAULT` and CUDA failures stop startup or online execution.
+`INCOMPLETE` means coverage was inconclusive rather than successful: startup
+retries and then fails, while online execution logs it with rate limiting and
+continues the current batch.
+
+Optional settings:
+
+- `VLLM_ILU_ONCHIP_CHECK_LEVEL_MASK` — bit mask for SLB/REG/L1/L2; `0` tests all.
+- `VLLM_ILU_ONCHIP_CHECK_KMSG` — report faults through `/dev/itrctl` XID.
+- `VLLM_ILU_ONCHIP_CHECK_STARTUP_RETRIES` — default `2`.
+- `VLLM_ILU_ONCHIP_CHECK_RETRY_DELAY_MS` — default `100`.
+- `VLLM_ILU_ONCHIP_CHECK_INCOMPLETE_LOG_INTERVAL` — default `100`.
+
+The full check retains about 17 MiB per Worker and synchronizes its compute
+stream on every checked batch (about 180 microseconds on BI-V150 under an idle
+GPU). A BI-V150 exposes its two dies as two GPU devices, so each associated
+Worker maintains and runs its own checker.
 
 ## Documentation
 

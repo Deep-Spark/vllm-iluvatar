@@ -146,7 +146,7 @@ class CMakeBuildExt(build_ext):
             return
 
         if shutil.which("cmake") is None:
-            raise RuntimeError("CMake is required to build vllm_iluvatar._C")
+            raise RuntimeError("CMake is required to build vllm_iluvatar extensions")
 
         cuda_architectures = self._cuda_architectures()
         cfg = os.environ.get("CMAKE_BUILD_TYPE", "RelWithDebInfo")
@@ -193,16 +193,21 @@ class CMakeBuildExt(build_ext):
         num_jobs = self._num_jobs()
         cmake_env.setdefault("CMAKE_BUILD_PARALLEL_LEVEL", str(num_jobs))
 
-        configure_cmd = ["cmake", ext.cmake_lists_dir, *generator_args, *cmake_args]
-        logging.info("Running CMake configure: %s", " ".join(configure_cmd))
-        subprocess.run(configure_cmd, cwd=build_temp, env=cmake_env, check=True)
+        configured_build_dirs = getattr(self, "_configured_build_dirs", set())
+        if build_temp not in configured_build_dirs:
+            configure_cmd = ["cmake", ext.cmake_lists_dir, *generator_args, *cmake_args]
+            logging.info("Running CMake configure: %s", " ".join(configure_cmd))
+            subprocess.run(configure_cmd, cwd=build_temp, env=cmake_env, check=True)
+            configured_build_dirs.add(build_temp)
+            self._configured_build_dirs = configured_build_dirs
 
+        target = ext.name.rsplit(".", 1)[-1]
         build_cmd = [
             "cmake",
             "--build",
             ".",
             "--target",
-            "_C",
+            target,
             "--parallel",
             str(num_jobs),
         ]
@@ -264,7 +269,10 @@ if editable_wheel is not None:
     CMDCLASS["editable_wheel"] = EditableWheelWithStartupPatch
 
 
-EXT_MODULES = [CMakeExtension(name="vllm_iluvatar._C")]
+EXT_MODULES = [
+    CMakeExtension(name="vllm_iluvatar._C"),
+    CMakeExtension(name="vllm_iluvatar._onchip_check"),
+]
 
 
 setup(

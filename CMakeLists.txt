@@ -104,6 +104,8 @@ file(GLOB_RECURSE VLLM_ILUVATAR_EXT_SRC CONFIGURE_DEPENDS
   "${CMAKE_CURRENT_SOURCE_DIR}/csrc/*.cc"
   "${CMAKE_CURRENT_SOURCE_DIR}/csrc/*.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/csrc/*.cu")
+list(FILTER VLLM_ILUVATAR_EXT_SRC EXCLUDE REGEX
+  "/csrc/plugin/onchip_check/")
 
 add_library(_C MODULE ${VLLM_ILUVATAR_EXT_SRC})
 
@@ -162,5 +164,40 @@ endif()
 
 if(CMAKE_LIBRARY_OUTPUT_DIRECTORY)
   set_target_properties(_C PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
+endif()
+
+# --- On-chip storage checker ----------------------------------------------
+# This is a lifecycle API, not a torch dispatcher operator. Keep it in its own
+# Python module so importing _C does not initialize or otherwise affect it.
+set(ONCHIP_CHECK_SRC
+  "${CMAKE_CURRENT_SOURCE_DIR}/csrc/plugin/onchip_check/onchip_check.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/csrc/plugin/onchip_check/onchip_check_bindings.cpp")
+
+add_library(_onchip_check MODULE ${ONCHIP_CHECK_SRC})
+
+target_include_directories(_onchip_check PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/csrc/plugin/onchip_check"
+  "${COREX_ROOT}/include")
+
+target_link_libraries(_onchip_check PRIVATE Python::Module cudart)
+target_link_directories(_onchip_check PRIVATE "${COREX_ROOT}/lib")
+
+target_compile_options(_onchip_check PRIVATE
+  $<$<COMPILE_LANGUAGE:CXX>:-O3 -fpermissive>
+  $<$<COMPILE_LANGUAGE:CUDA>:-x ivcore -std=c++20 -O3 -fpermissive>)
+
+set_target_properties(_onchip_check PROPERTIES
+  PREFIX ""
+  BUILD_RPATH "${COREX_ROOT}/lib"
+  INSTALL_RPATH "${COREX_ROOT}/lib")
+
+if(PYTHON_EXTENSION_SUFFIX)
+  set_target_properties(_onchip_check PROPERTIES
+    SUFFIX "${PYTHON_EXTENSION_SUFFIX}")
+endif()
+
+if(CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+  set_target_properties(_onchip_check PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
 endif()

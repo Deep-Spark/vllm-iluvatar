@@ -152,6 +152,12 @@ if TYPE_CHECKING:
     # per-layer tables; empty -> online amax/448 on first eager insert.
     VLLM_ILU_GLM_DSA_FP8_KV_SCALE: str = ""
     VLLM_ILU_GLM_DSA_FP8_KV_SCALE_PATH: str = ""
+    VLLM_ILU_ONCHIP_CHECK: bool = False
+    VLLM_ILU_ONCHIP_CHECK_LEVEL_MASK: int = 0
+    VLLM_ILU_ONCHIP_CHECK_KMSG: bool = False
+    VLLM_ILU_ONCHIP_CHECK_STARTUP_RETRIES: int = 2
+    VLLM_ILU_ONCHIP_CHECK_RETRY_DELAY_MS: float = 100.0
+    VLLM_ILU_ONCHIP_CHECK_INCOMPLETE_LOG_INTERVAL: int = 100
 
 # Canonical (VLLM_ILU_*) readers. Each lambda preserves the exact parsing the
 # fork used in vllm/envs.py, and reads VLLM_ILU_* first then the legacy VLLM_*.
@@ -381,6 +387,22 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Optional override for MessageQueue max_chunks (see patch_message_queue).
     # Empty / unset → auto: broadcast max(10, 2*n_reader+8), response max 48.
     "VLLM_ILU_MQ_MAX_CHUNKS": lambda: os.environ.get("VLLM_ILU_MQ_MAX_CHUNKS", ""),
+    "VLLM_ILU_ONCHIP_CHECK": _bool_reader("VLLM_ILU_ONCHIP_CHECK", "0"),
+    "VLLM_ILU_ONCHIP_CHECK_LEVEL_MASK": lambda: int(
+        os.environ.get("VLLM_ILU_ONCHIP_CHECK_LEVEL_MASK", "0"), 0
+    ),
+    "VLLM_ILU_ONCHIP_CHECK_KMSG": _bool_reader("VLLM_ILU_ONCHIP_CHECK_KMSG", "0"),
+    "VLLM_ILU_ONCHIP_CHECK_STARTUP_RETRIES": lambda: max(
+        0, int(os.environ.get("VLLM_ILU_ONCHIP_CHECK_STARTUP_RETRIES", "2"))
+    ),
+    "VLLM_ILU_ONCHIP_CHECK_RETRY_DELAY_MS": lambda: max(
+        0.0,
+        float(os.environ.get("VLLM_ILU_ONCHIP_CHECK_RETRY_DELAY_MS", "100")),
+    ),
+    "VLLM_ILU_ONCHIP_CHECK_INCOMPLETE_LOG_INTERVAL": lambda: max(
+        1,
+        int(os.environ.get("VLLM_ILU_ONCHIP_CHECK_INCOMPLETE_LOG_INTERVAL", "100")),
+    ),
 }
 
 

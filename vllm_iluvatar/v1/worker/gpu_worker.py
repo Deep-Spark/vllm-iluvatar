@@ -5,8 +5,10 @@ IluWorker — subclass of the community Worker with following overrides:
 
 1. ``determine_available_memory`` for attention quantisation support.
 2. ``initialize_from_config`` for attention quantisation support.
-3. ``shutdown`` for attention quantisation support.
-4. ``execute_dummy_batch`` for Iluvatar DP idle-rank optimisation.
+3. ``compile_or_warm_up_model`` / ``execute_model`` / ``shutdown`` for the
+   optional on-chip storage integrity checker.
+4. ``shutdown`` for attention quantisation support.
+5. ``execute_dummy_batch`` for Iluvatar DP idle-rank optimisation.
 """
 
 from __future__ import annotations
@@ -66,11 +68,41 @@ class IluWorker(Worker):
         finally:
             self.model_runner.__class__ = orig_cls
 
+    def _get_onchip_checker(self):
+        checker = getattr(self, "_onchip_checker", None)
+        if checker is None:
+            from vllm_iluvatar.ilu_util.onchip_check import OnchipChecker
+
+            checker = OnchipChecker()
+            self._onchip_checker = checker
+        return checker
+
+    def compile_or_warm_up_model(self):
+        result = super().compile_or_warm_up_model()
+        self._get_onchip_checker().start(self.device)
+        return result
+
+    def execute_model(self, scheduler_output):
+        if scheduler_output.total_num_scheduled_tokens > 0:
+            self._get_onchip_checker().before_batch()
+        return super().execute_model(scheduler_output)
+
     def shutdown(self) -> None:
         orig_cls = self._try_replace_model_runner_class()
+        checker = getattr(self, "_onchip_checker", None)
         try:
+            if checker is not None:
+                try:
+                    checker.check_shutdown()
+                except Exception:
+                    logger.exception("On-chip shutdown check failed")
             super().shutdown()
         finally:
+            if checker is not None:
+                try:
+                    checker.free()
+                except Exception:
+                    logger.exception("Failed to free on-chip checker")
             self.model_runner.__class__ = orig_cls
 
     def execute_dummy_batch(self) -> None:

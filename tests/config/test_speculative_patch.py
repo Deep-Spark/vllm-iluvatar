@@ -16,7 +16,7 @@ No GPU required.
 
 from __future__ import annotations
 
-from vllm_iluvatar.config.speculative import make_hf_config_override
+from vllm_iluvatar.config.speculative import make_hf_config_override, make_post_init
 
 
 class _FakeHFConfig:
@@ -28,6 +28,26 @@ class _FakeHFConfig:
     def update(self, updates):
         for key, value in updates.items():
             setattr(self, key, value)
+
+
+class _FakeModelConfig:
+    def __init__(self, architectures):
+        self.architectures = list(architectures)
+        self.hf_config = _FakeHFConfig(architectures)
+
+
+class _FakeSpeculativeConfig:
+    def __init__(self, *, method="dspark", target_architectures=None):
+        self.method = method
+        self.target_model_config = _FakeModelConfig(target_architectures or [])
+        self.draft_model_config = _FakeModelConfig(["DSparkDraftModel"])
+        self.update_arch_calls = 0
+
+    def update_arch_(self):
+        self.update_arch_calls += 1
+        self.draft_model_config.architectures = list(
+            self.draft_model_config.hf_config.architectures
+        )
 
 
 def _make_orig(records, *, out_architectures=None):
@@ -146,6 +166,49 @@ def test_preserves_orig_metadata():
     assert wrapped.__name__ == "hf_config_override"
 
 
+# --- factory: DSpark post-init remap ----------------------------------------
+
+
+def test_post_init_remaps_dspark_draft_for_ilu_deepseek_v4():
+    calls = []
+
+    def orig(self):
+        calls.append(self)
+
+    wrapped = make_post_init(orig)
+    cfg = _FakeSpeculativeConfig(target_architectures=["IluDeepseekV4ForCausalLM"])
+
+    wrapped(cfg)
+
+    assert calls == [cfg]
+    assert cfg.draft_model_config.hf_config.architectures == ["IluDSparkDraftModel"]
+    assert cfg.draft_model_config.architectures == ["IluDSparkDraftModel"]
+    assert cfg.update_arch_calls == 1
+
+
+def test_post_init_leaves_non_ilu_dspark_draft_unchanged():
+    wrapped = make_post_init(lambda self: None)
+    cfg = _FakeSpeculativeConfig(target_architectures=["DeepseekV32ForCausalLM"])
+
+    wrapped(cfg)
+
+    assert cfg.draft_model_config.hf_config.architectures == ["DSparkDraftModel"]
+    assert cfg.update_arch_calls == 0
+
+
+def test_post_init_skips_non_dspark_methods():
+    wrapped = make_post_init(lambda self: None)
+    cfg = _FakeSpeculativeConfig(
+        method="mtp",
+        target_architectures=["IluDeepseekV4ForCausalLM"],
+    )
+
+    wrapped(cfg)
+
+    assert cfg.draft_model_config.hf_config.architectures == ["DSparkDraftModel"]
+    assert cfg.update_arch_calls == 0
+
+
 # --- wiring: general patch binds onto the real class -----------------------
 
 
@@ -165,6 +228,9 @@ def test_patch_binds_wrapper_as_staticmethod():
     assert hasattr(SpeculativeConfig.hf_config_override, "__wrapped__"), (
         "hf_config_override not wrapped by the ilu override"
     )
+    assert hasattr(SpeculativeConfig.__post_init__, "__wrapped__"), (
+        "__post_init__ not wrapped by the ilu override"
+    )
 
 
 def test_patch_register_is_idempotent():
@@ -174,7 +240,9 @@ def test_patch_register_is_idempotent():
 
     patch_speculative_config.register()
     first = SpeculativeConfig.hf_config_override
+    first_post_init = SpeculativeConfig.__post_init__
     patch_speculative_config.register()
     patch_speculative_config.register()
 
     assert SpeculativeConfig.hf_config_override is first
+    assert SpeculativeConfig.__post_init__ is first_post_init

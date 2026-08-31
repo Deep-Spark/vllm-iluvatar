@@ -23,12 +23,9 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_compressed_slot_mapping,
 )
-from vllm.v1.attention.backends.utils import (
-    split_decodes_and_prefills,
-)
+from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 from vllm.v1.worker.cp_utils import get_kv_cache_shard_count
-
 
 
 @triton.jit

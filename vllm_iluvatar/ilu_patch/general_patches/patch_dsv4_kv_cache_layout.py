@@ -3,7 +3,7 @@
 
 Target   : vllm.v1.core.kv_cache_utils._get_kv_cache_config_packed
            vllm.v1.core.kv_cache_utils._pool_bytes_per_block
-Baseline : main_61ac3680210
+Baseline : main_6e448d0
 Why      : The packed layout restarts every cache group's byte offsets at 0
            inside one block slab, so groups whose page sizes differ nest into
            each other. For DeepSeek-V4 (pages of 1168 / 37376 / 149504 B) a
@@ -24,7 +24,7 @@ from vllm_iluvatar.ilu_patch import general_patch as p
 # Community source this patch is pinned against. Only the branch that routes
 # DeepSeek-V4 into the packed planner matters here: if it disappears, rebinding
 # the planner silently stops taking effect.
-_USE_PACKED_BASELINE = '''
+_USE_PACKED_BASELINE = """
 def _use_packed_kv_cache_config(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -45,7 +45,7 @@ def _use_packed_kv_cache_config(
         str(extra_config.get("enable_cross_layers_blocks", "False")).lower() == "true"
     )
     return is_dsv4 or (enable_cross_layers and len(kv_cache_groups) > 1)
-'''
+"""
 
 
 def register() -> None:

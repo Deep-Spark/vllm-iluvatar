@@ -43,6 +43,28 @@ def _bool_reader(name: str, default: str) -> Callable[[], bool]:
     return lambda: os.environ.get(name, default).strip().lower() in _TRUE_VALS
 
 
+def _int_reader(
+    name: str,
+    default: int,
+    *,
+    minimum: int | None = None,
+) -> Callable[[], int]:
+    def read() -> int:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            logger.warning("Invalid %s=%r; using %d", name, raw, default)
+            return default
+        if minimum is not None:
+            return max(minimum, value)
+        return value
+
+    return read
+
+
 # Community default -> Iluvatar default. These are real community vars, so they
 # are NOT renamed; we only change their default via os.environ.setdefault.
 #   VLLM_USE_FLASHINFER_SAMPLER       : "1"   -> "0"
@@ -115,6 +137,7 @@ if TYPE_CHECKING:
     VLLM_ILU_MOE_EP_LL_MOE_ALGO: str = "GEMV"
     VLLM_ILU_ENABLE_PP_MTP: bool = False
     VLLM_ILU_MXFP4_MOE_BACKEND: str = "ixmm"
+    VLLM_ILU_REJECTION_SAMPLER_MAX_CHUNK_BYTES: int = 128 * 1024 * 1024
 
 # Canonical (VLLM_ILU_*) readers. Each lambda preserves the exact parsing the
 # fork used in vllm/envs.py, and reads VLLM_ILU_* first then the legacy VLLM_*.
@@ -256,6 +279,11 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     )
     .strip()
     .lower(),
+    "VLLM_ILU_REJECTION_SAMPLER_MAX_CHUNK_BYTES": _int_reader(
+        "VLLM_ILU_REJECTION_SAMPLER_MAX_CHUNK_BYTES",
+        128 * 1024 * 1024,
+        minimum=1,
+    ),
     # DeepSeek-V4 fp8 MQA Q quant mode. Empty = bf16 Q (default).
     # "Q_NOPE_FP8" = dynamically quantize Q NoPE [0:448] to fp8 then dequant
     # before ds4_flash_mla_with_fp8_kvcache.

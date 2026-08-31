@@ -84,7 +84,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import SupportsPP
+from vllm.model_executor.models.interfaces import SupportsEagle3, SupportsPP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -953,6 +953,17 @@ class IluDeepseekV4DecoderLayer(nn.Module):
         return x
 
 
+def default_aux_hidden_state_layers(hf_config) -> tuple[int, ...]:
+    """Aux capture layers for a DSpark draft.
+
+    ``dspark_target_layer_ids`` names the *source* decoder layers; capture
+    happens after that layer runs, so the runner-facing ids are shifted by one
+    (same convention as community eagle3 / DFlash).
+    """
+    layer_ids = getattr(hf_config, "dspark_target_layer_ids", None) or ()
+    return tuple(i + 1 for i in layer_ids)
+
+
 class IluDeepseekV4Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -975,13 +986,11 @@ class IluDeepseekV4Model(nn.Module):
         self.device = current_platform.device_type
         if _DS4_MHC_PRE_VERSION == "v2":
             logger.info(
-                "DeepSeek-V4 mhc_pre: using ds4_mhc_pre_v2 "
-                "(bf16 GEMM + epilogue)"
+                "DeepSeek-V4 mhc_pre: using ds4_mhc_pre_v2 (bf16 GEMM + epilogue)"
             )
         elif _DS4_MHC_PRE_VERSION == "v3":
             logger.info(
-                "DeepSeek-V4 mhc_pre: using ds4_mhc_pre_v3 "
-                "(bf16 GEMM + split epilogue)"
+                "DeepSeek-V4 mhc_pre: using ds4_mhc_pre_v3 (bf16 GEMM + split epilogue)"
             )
 
         self.topk_indices_buffer = torch.empty(
@@ -1032,6 +1041,10 @@ class IluDeepseekV4Model(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
+        # Populated by IluDeepseekV4ForCausalLM.set_aux_hidden_state_layers when
+        # a DSpark draft is active. Empty => forward keeps its single-tensor
+        # return, so MTP and non-speculative paths are unaffected.
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
@@ -1105,13 +1118,19 @@ class IluDeepseekV4Model(nn.Module):
         if self.hc_pre_fusion is not None:
             self.hc_pre_fusion.begin_step(hidden_states.shape[0])
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        aux_hidden_states: list[torch.Tensor] = []
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer), self.start_layer
+        ):
             hidden_states = layer(hidden_states, positions, input_ids)
+            if (idx + 1) in self.aux_hidden_state_layers:
+                # hc streams are already folded by the ilu layer; mean-pool the
+                # hc_mult copies to the [T, H] the DSpark combiner expects.
+                aux_hidden_states.append(hidden_states.mean(dim=1))
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
-        # Stash pre-hc_head residual for the MTP draft (only on last rank).
         num_tokens = hidden_states.shape[0]
         self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
@@ -1124,6 +1143,8 @@ class IluDeepseekV4Model(nn.Module):
             hc_eps=self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1258,7 +1279,7 @@ def _make_ilu_deepseek_v4_weights_mapper() -> WeightsMapper:
     )
 
 
-class IluDeepseekV4ForCausalLM(nn.Module, SupportsPP):
+class IluDeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     """Top-level causal-LM for ilu fork's W4A8 DeepSeek-V4."""
 
     model_cls = IluDeepseekV4Model
@@ -1304,6 +1325,12 @@ class IluDeepseekV4ForCausalLM(nn.Module, SupportsPP):
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = tuple(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return default_aux_hidden_state_layers(self.config)
+
     # NOTE: applied uniformly to skip_substrs in AutoWeightsLoader and to
     # the post-load missing-param check below.
     _LOAD_SKIP_SUBSTRS: tuple[str, ...] = ("mtp.",)
@@ -1330,7 +1357,7 @@ class IluDeepseekV4ForCausalLM(nn.Module, SupportsPP):
         if missing:
             preview = sorted(missing)[:20]
             raise ValueError(
-                f"[IluDeepseekV4ForCausalLM.load_weights] "
+                "[IluDeepseekV4ForCausalLM.load_weights] "
                 f"{len(missing)} parameter(s) were not initialized from the "
                 f"checkpoint. Showing up to 20:\n  " + "\n  ".join(preview)
             )
@@ -1359,12 +1386,13 @@ class IluDeepseekV4ForCausalLM(nn.Module, SupportsPP):
 
 
 def register_model() -> None:
-    """Register the Iluvatar DeepSeek-V4 W4A8 causal-LM and MTP draft archs.
+    """Register the Iluvatar DeepSeek-V4 W4A8 causal-LM, MTP, and DSpark draft archs.
 
     Invoked by ``vllm_iluvatar.ilu_register.apply_oot_registrations`` during
     register_general. The class paths are resolved lazily by ModelRegistry, so
-    importing mtp.py / attention.py is deferred until the model is loaded (the
-    ``vllm::ilu_deepseek_v4_attention`` custom op registers on that import).
+    importing mtp.py / dspark.py / attention.py is deferred until the model is
+    loaded (the ``vllm::ilu_deepseek_v4_attention`` custom op registers on that
+    import).
     """
     from vllm import ModelRegistry
 
@@ -1375,4 +1403,8 @@ def register_model() -> None:
     ModelRegistry.register_model(
         "IluDeepSeekV4MTPModel",
         "vllm_iluvatar.models.deepseek_v4.mtp:IluDeepSeekV4MTP",
+    )
+    ModelRegistry.register_model(
+        "IluDSparkDraftModel",
+        "vllm_iluvatar.models.deepseek_v4.dspark:IluDSparkDeepseekV4ForCausalLM",
     )

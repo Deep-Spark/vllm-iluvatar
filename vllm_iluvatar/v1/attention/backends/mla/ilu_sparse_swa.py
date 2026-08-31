@@ -21,17 +21,16 @@ the decode kernel ``ds4_flash_mla_with_kvcache`` for prefill).
 
 from __future__ import annotations
 
-import logging
 from typing import ClassVar
 
 import ixformer.inference.functions as ixfops
 import torch
 import vllm.envs as envs
-
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionBackend, CommonAttentionMetadata
 from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWABackend,
@@ -50,11 +49,82 @@ from vllm.v1.kv_cache_interface import (
     get_kv_quant_mode,
 )
 
-logger = logging.getLogger(__name__)
-
 _LAYER_TYPE_SWAONLY = "swaonly"
 _LAYER_TYPE_C4A = "c4a"
 _LAYER_TYPE_C128A = "c128a"
+
+
+def build_dspark_noncausal_swa_indices(
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    block_table: torch.Tensor,
+    is_valid_token: torch.Tensor,
+    block_size: int,
+    window_size: int,
+    index_width: int,
+    num_decode_tokens: int,
+    device: torch.device,
+    out_indices: torch.Tensor | None = None,
+    out_lens: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-token SWA key slots for a DSpark draft block (non-causal).
+
+    Every query token in a request's draft block attends to the same key set:
+    the trailing ``window_size`` context keys plus *all* block keys, including
+    tokens that follow it. Slots beyond a token's length are ``-1``, and
+    padding tokens get length 0.
+
+    Reproduces ``_compute_dspark_noncausal_swa_indices_kernel``
+    (vllm/v1/attention/backends/mla/sparse_swa.py:816-856, baseline
+    main_6e448d0) in Torch. Correctness first; an ixformer kernel can
+    replace it once the numerics are pinned down.
+    """
+    if out_indices is None:
+        indices = torch.full(
+            (num_decode_tokens, 1, index_width), -1, dtype=torch.int32, device=device
+        )
+    else:
+        assert out_indices.shape[0] >= num_decode_tokens
+        assert out_indices.shape[1:] == (1, index_width)
+        indices = out_indices[:num_decode_tokens]
+        indices.fill_(-1)
+
+    if out_lens is None:
+        lens = torch.zeros(num_decode_tokens, dtype=torch.int32, device=device)
+    else:
+        assert out_lens.shape[0] >= num_decode_tokens
+        lens = out_lens[:num_decode_tokens]
+        lens.zero_()
+
+    seq_lens_cpu = seq_lens.tolist()
+    qsl_cpu = query_start_loc.tolist()
+    block_table_cpu = block_table.tolist()
+    is_valid_cpu = is_valid_token.tolist()
+
+    for req_idx in range(len(qsl_cpu) - 1):
+        start, end = qsl_cpu[req_idx], qsl_cpu[req_idx + 1]
+        if start >= num_decode_tokens:
+            break
+        end = min(end, num_decode_tokens)
+        query_len = end - start
+        if query_len <= 0:
+            continue
+        seq_len = seq_lens_cpu[req_idx]
+        prefix_len = seq_len - query_len
+        start_pos = max(prefix_len - window_size, 0)
+        positions = list(range(start_pos, seq_len))[:index_width]
+        slots = [
+            block_table_cpu[req_idx][p // block_size] * block_size + p % block_size
+            for p in positions
+        ]
+        slot_t = torch.tensor(slots, dtype=torch.int32, device=device)
+        for token_idx in range(start, end):
+            if not is_valid_cpu[token_idx]:
+                continue
+            indices[token_idx, 0, : slot_t.numel()] = slot_t
+            lens[token_idx] = slot_t.numel()
+
+    return indices, lens
 
 
 class IluDeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
@@ -138,6 +208,31 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
     the affected metadata computation to ixformer.
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        spec_config = get_current_vllm_config().speculative_config
+        self.is_dspark = spec_config is not None and spec_config.use_dspark()
+        # The kernel pads the q-head count, so the index width must be a
+        # multiple of 128 (matches community sparse_swa.py).
+        self.noncausal_index_width = (
+            cdiv(self.window_size + self.num_speculative_tokens, 128) * 128
+            if self.is_dspark
+            else 0
+        )
+        self._decode_swa_indices_noncausal = (
+            torch.empty(
+                (
+                    self.max_num_batched_tokens,
+                    1,
+                    self.noncausal_index_width,
+                ),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            if self.is_dspark
+            else None
+        )
+
     def build(
         self,
         common_prefix_len: int,
@@ -153,7 +248,9 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
 
         (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
             split_decodes_and_prefills(
-                common_attn_metadata, decode_threshold=self.decode_threshold
+                common_attn_metadata,
+                decode_threshold=self.decode_threshold,
+                treat_short_extends_as_decodes=True,
             )
         )
 
@@ -167,18 +264,38 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
         decode_swa_indices = self.decode_swa_indices
         if num_decode_tokens > 0:
             self.decode_swa_lens[num_decode_tokens:] = 0
-            ixfops.ds4_compute_swa_decode_indices_and_lens(
-                swa_indices=self.decode_swa_indices,
-                swa_lens=self.decode_swa_lens,
-                window_size=self.window_size,
-                query_start_loc=query_start_loc,
-                seq_lens=seq_lens,
-                token_to_req_indices=token_to_req_indices,
-                is_valid_token=is_valid_token,
-                block_table=block_table,
-                block_size=self.block_size,
-                num_decode_tokens=num_decode_tokens,
-            )
+            if not common_attn_metadata.causal:
+                assert self.is_dspark, (
+                    "Non-causal DeepseekV4 SWA is only supported for the DSpark "
+                    "speculation mode, but causal=False was set without DSpark."
+                )
+                noncausal_indices, noncausal_lens = build_dspark_noncausal_swa_indices(
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
+                    block_table=block_table,
+                    is_valid_token=is_valid_token,
+                    block_size=self.block_size,
+                    window_size=self.window_size,
+                    index_width=self.noncausal_index_width,
+                    num_decode_tokens=num_decode_tokens,
+                    device=self.device,
+                    out_indices=self._decode_swa_indices_noncausal,
+                    out_lens=self.decode_swa_lens,
+                )
+                decode_swa_indices = noncausal_indices
+            else:
+                ixfops.ds4_compute_swa_decode_indices_and_lens(
+                    swa_indices=self.decode_swa_indices,
+                    swa_lens=self.decode_swa_lens,
+                    window_size=self.window_size,
+                    query_start_loc=query_start_loc,
+                    seq_lens=seq_lens,
+                    token_to_req_indices=token_to_req_indices,
+                    is_valid_token=is_valid_token,
+                    block_table=block_table,
+                    block_size=self.block_size,
+                    num_decode_tokens=num_decode_tokens,
+                )
 
         deepseek_v4_fields = self._build_ilu_deepseek_v4_metadata(
             num_decodes,
@@ -235,6 +352,11 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
         if envs.VLLM_ILU_DS4_PREFILL_AS_DECODE:
             self._populate_prefill_swa_as_decode(metadata)
 
+        # DFlash/DSpark proposers assert ``attn_metadata.causal is False`` when
+        # drafting a non-causal block. Community ``DeepseekSparseSWAMetadata``
+        # has no ``causal`` field (FA/FlashInfer do); expose it so the assert
+        # can verify this builder honored ``CommonAttentionMetadata.causal``.
+        metadata.causal = common_attn_metadata.causal
         return metadata
 
     def build_tile_scheduler(
@@ -373,20 +495,29 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
             num_decode_tokens=num_swa_tokens,
         )
 
-        metadata.prefill_swa_indices = (
-            self.decode_swa_indices[num_decode_tokens:num_swa_tokens]
-        )
-        metadata.prefill_swa_lens = (
-            self.decode_swa_lens[num_decode_tokens:num_swa_tokens]
-        )
+        metadata.prefill_swa_indices = self.decode_swa_indices[
+            num_decode_tokens:num_swa_tokens
+        ]
+        metadata.prefill_swa_lens = self.decode_swa_lens[
+            num_decode_tokens:num_swa_tokens
+        ]
 
 
 class IluDeepseekSparseSWABackend(DeepseekSparseSWABackend):
     """SWA backend supporting bf16 and fp8_ds_mla cache."""
 
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
-        "auto", "bfloat16", "fp8_ds_mla", "fp8",
+        "auto",
+        "bfloat16",
+        "fp8_ds_mla",
+        "fp8",
     ]
+
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        # DSpark draft blocks attend bidirectionally within the query window;
+        # the builder encodes that via non-causal SWA indices.
+        return True
 
     @staticmethod
     def get_name() -> str:

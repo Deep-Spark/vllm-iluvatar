@@ -52,21 +52,6 @@ def _compiled_cuda_arch() -> str | None:
 COMPILED_CUDA_ARCH = _compiled_cuda_arch()
 
 
-@pytest.fixture(autouse=True, scope="session")
-def _inject_ilu_module_aliases():
-    """Inject sys.modules aliases that ``register_general()`` would set up.
-
-    In production the plugin's ``register_general()`` installs these before any
-    model import.  Tests skip that boot path, so the aliases must be injected
-    here to prevent ModuleNotFoundError when community code (e.g.
-    deepseek_v2.py) transitively imports migrated ilu_* modules via the old
-    ``vllm.*`` paths.
-    """
-    from vllm_iluvatar import _inject_ilu_module_aliases as _inject
-
-    _inject()
-
-
 def _apply_triton_jit_compat_patch() -> None:
     """Drop the unsupported Triton ``do_not_specialize_on_alignment`` kwarg.
 

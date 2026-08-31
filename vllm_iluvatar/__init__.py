@@ -99,33 +99,6 @@ def register_platform() -> str:
 
     return "vllm_iluvatar.platforms.ilu_platform.IluPlatform"
 
-
-def _inject_ilu_module_aliases() -> None:
-    """Make plugin modules accessible under their original vllm.* paths.
-
-    Some ILU-specific modules were migrated from vllm to the plugin, but
-    other ILU-modified files still in vllm import them via the old
-    ``vllm.*`` path.  Injecting ``sys.modules`` aliases lets those imports
-    resolve transparently without modifying vllm source.
-    """
-    import sys
-
-    _ALIASES = {
-        "vllm.v1.attention.backends.mla.ilu_flashmla_sparse": "vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse",
-        "vllm.v1.attention.backends.mla.ilu_mla": "vllm_iluvatar.v1.attention.backends.mla.ilu_mla",
-        "vllm.v1.attention.backends.mla.ilu_sparse_swa": "vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa",
-    }
-    for alias, real in _ALIASES.items():
-        if alias not in sys.modules:
-            import importlib
-
-            try:
-                mod = importlib.import_module(real)
-                sys.modules[alias] = mod
-            except Exception:
-                pass
-
-
 def register_general() -> None:
     """vllm.general_plugins entry point for Iluvatar hardware.
 
@@ -164,7 +137,6 @@ def register_general() -> None:
     from vllm_iluvatar.ilu_patch import apply_general_patches
     from vllm_iluvatar.ilu_register import apply_oot_registrations
 
-    _inject_ilu_module_aliases()
     apply_general_patches()
     apply_oot_registrations()
     apply_kv_transfer_registrations()

@@ -71,6 +71,9 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm_iluvatar.model_executor.layers.sparse_attn_indexer import (
     IluSparseAttnIndexer,
 )
+from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes import (
+    IluCompressedTensorsW8A8Int8,
+)
 from vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse import (
     IluFlashMLASparseBackend,
     IluFlashMLASparseMetadata,
@@ -86,8 +89,55 @@ _GLM_DSA_FP8_E4M3_MAX = 448.0
 
 logger = init_logger(__name__)
 
+DynamicInt8Input = tuple[torch.Tensor, torch.Tensor, torch.dtype]
 _RMS_ROPE_FP8_KV_ENGAGE_LOGGED = False
 _RMS_ROPE_FP8_KV_SKIP_LOGGED = False
+_Q_A_NORM_QUANT_FAILED = False
+
+
+def _can_fuse_q_a_norm_quant(
+    attn: "IluGlmMoeDsaMLAAttention",
+    q_c: torch.Tensor,
+) -> bool:
+    if (
+        _Q_A_NORM_QUANT_FAILED
+        or not envs.VLLM_ILU_FUSE_NORM_QUANT
+        or q_c.dim() != 2
+        or q_c.stride(-1) != 1
+        or not isinstance(
+            getattr(attn.q_b_proj, "scheme", None),
+            IluCompressedTensorsW8A8Int8,
+        )
+    ):
+        return False
+    return attn.indexer is None or isinstance(
+        getattr(attn.indexer.wq_b, "scheme", None),
+        IluCompressedTensorsW8A8Int8,
+    )
+
+
+def _fuse_q_a_norm_quant(
+    attn: "IluGlmMoeDsaMLAAttention",
+    q_c: torch.Tensor,
+) -> DynamicInt8Input | None:
+    if not _can_fuse_q_a_norm_quant(attn, q_c):
+        return None
+    global _Q_A_NORM_QUANT_FAILED
+    try:
+        q_int8, _, _, scales = ixf_ops.residual_rms_norm_with_quant(
+            q_c,
+            attn.q_a_layernorm.weight,
+            eps=attn.q_a_layernorm.variance_epsilon,
+        )
+        return q_int8, scales, q_c.dtype
+    except Exception as exc:  # noqa: BLE001 - fail closed to the BF16 path
+        logger.warning(
+            "GLM-5.2 q_a RMSNorm+INT8 fusion unavailable (%s); "
+            "falling back to split RMSNorm",
+            exc,
+        )
+        _Q_A_NORM_QUANT_FAILED = True
+        return None
 
 
 @lru_cache(maxsize=4)
@@ -283,7 +333,7 @@ class IluGlmMoeDsaIndexer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        qr: torch.Tensor,
+        qr: torch.Tensor | DynamicInt8Input,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
     ) -> torch.Tensor:
@@ -434,8 +484,8 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
                     "(%s). Prefer VLLM_ILU_GLM_DSA_FP8_KV_SCALE_PATH "
                     "(per-layer) or VLLM_ILU_GLM_DSA_FP8_KV_SCALE "
                     "(single float shared by ALL layers). Online scale "
-                    "freezes on the first eager insert and is skipped "
-                    "during CUDA-graph capture.",
+                    "freezes on the first eager insert with amax>0; "
+                    "capture and all-zero dummy tensors are skipped.",
                     prefix,
                     source,
                 )
@@ -591,34 +641,31 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         return results
 
     def _maybe_init_fp8_kv_scale(self, kv_c: torch.Tensor) -> None:
-        """Freeze kv_scale from the first eager insert; skip CUDA-graph capture.
+        """Freeze kv_scale from the first eager insert that has a real amax.
 
         Online calibration is a bring-up fallback. Prefer
-        ``VLLM_ILU_GLM_DSA_FP8_KV_SCALE_PATH`` / ``VLLM_ILU_GLM_DSA_FP8_KV_SCALE``
-        so scale is fixed before graph capture. If the first inserts happen
-        only under capture, scale stays at the init value (usually 1.0).
+        ``VLLM_ILU_GLM_DSA_FP8_KV_SCALE_PATH`` / ``VLLM_ILU_GLM_DSA_FP8_KV_SCALE``.
+
+        Skip CUDA-graph capture (no reduction / D2H). Skip non-finite or
+        non-positive amax: PP stages > 0 see an all-zero recv buffer during
+        the profiling dummy run; freezing ``clamp(0)/448`` saturates later
+        real tokens. Prefill stays eager under ``FULL_DECODE_ONLY``, so the
+        first real insert still calibrates.
         """
         if self._fp8_kv_scale_frozen or kv_c.numel() == 0:
             return
         if torch.cuda.is_current_stream_capturing():
-            if not getattr(self, "_fp8_kv_scale_capture_warned", False):
-                logger.warning(
-                    "GLM DSA fp8 KV scale for %s is still unfrozen during "
-                    "CUDA-graph capture; keeping scale=%s. Warm up with an "
-                    "eager insert or set VLLM_ILU_GLM_DSA_FP8_KV_SCALE(_PATH).",
-                    self.prefix,
-                    float(self._k_scale.item()),
-                )
-                self._fp8_kv_scale_capture_warned = True
             return
-        amax = kv_c.detach().float().abs().amax().clamp_min(1e-12)
-        scale = (amax / _GLM_DSA_FP8_E4M3_MAX).reshape(1)
-        self._k_scale.copy_(scale)
+        amax = float(kv_c.detach().float().abs().amax())
+        if not math.isfinite(amax) or amax <= 0.0:
+            return
+        scale = amax / _GLM_DSA_FP8_E4M3_MAX
+        self._k_scale.fill_(scale)
         self._fp8_kv_scale_frozen = True
         logger.info(
             "GLM DSA fp8 KV scale for %s frozen online = %.8g (amax/448)",
             self.prefix,
-            float(scale.item()),
+            scale,
         )
 
     def _global_topk(
@@ -1029,11 +1076,15 @@ class IluGlmMoeDsaMLAAttention(nn.Module):
             ],
             dim=1,
         )
-        q_c = self.q_a_layernorm(q_c)
-        q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+        q_projection_input = _fuse_q_a_norm_quant(self, q_c)
+        if q_projection_input is None:
+            q_projection_input = self.q_a_layernorm(q_c)
+        q = self.q_b_proj(q_projection_input)[0].view(
+            -1, self.num_local_heads, self.qk_head_dim
+        )
 
         if self.indexer is not None and not self.skip_topk:
-            self.indexer(hidden_bf16, q_c, positions, self.rotary_emb)
+            self.indexer(hidden_bf16, q_projection_input, positions, self.rotary_emb)
 
         if self.mla_attn.use_rms_rope_fp8_kv_fusion:
             attn_out = self.mla_attn(

@@ -3,7 +3,7 @@
 
 Corresponds to: vllm/v1/core/block_pool.py
 Target   : BlockPool.free_blocks
-Baseline : main_4cd213ead
+Baseline : main_6e448d0
 Why      : Community commit a82f1b388fe changed the free-queue ordering for
            blocks released while prefix caching is disabled.
 How      : Fingerprint the current community ``BlockPool.free_blocks``
@@ -21,7 +21,6 @@ from __future__ import annotations
 import inspect
 
 from vllm_iluvatar.ilu_patch import general_patch as p
-
 
 FREE_BLOCKS = '''\
 def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:

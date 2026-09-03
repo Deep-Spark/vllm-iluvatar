@@ -21,8 +21,9 @@ def test_new_ilu_env_readers_are_registered(monkeypatch):
     monkeypatch.delenv("VLLM_ILU_GDN_ATTN_BACKEND", raising=False)
     monkeypatch.delenv("VLLM_GDN_ATTN_BACKEND", raising=False)
     monkeypatch.delenv("USE_DEFAULT_FLA_NORM", raising=False)
-    monkeypatch.delenv("VLLM_ILU_GLM52_RMS_ROPE_FP8_KV", raising=False)
-    monkeypatch.delenv("VLLM_GLM52_RMS_ROPE_FP8_KV", raising=False)
+    monkeypatch.delenv("VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV", raising=False)
+    monkeypatch.delenv("VLLM_ILU_FUSE_NORM_QUANT", raising=False)
+    monkeypatch.delenv("VLLM_ILU_FUSE_MOE_W13", raising=False)
 
     envs.apply()
 
@@ -39,14 +40,23 @@ def test_new_ilu_env_readers_are_registered(monkeypatch):
     monkeypatch.setenv("VLLM_ILU_GDN_ATTN_BACKEND", "0")
     assert registered["VLLM_ILU_GDN_ATTN_BACKEND"]() is False
 
-    rms_rope_reader = registered["VLLM_ILU_GLM52_RMS_ROPE_FP8_KV"]
-    assert rms_rope_reader is registered["VLLM_GLM52_RMS_ROPE_FP8_KV"]
+    assert "VLLM_GLM52_RMS_ROPE_FP8_KV" not in registered
+    assert "VLLM_FUSE_NORM_QUANT" not in registered
+    assert "VLLM_FUSE_MOE_W13" not in registered
+
+    rms_rope_reader = registered["VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV"]
     assert rms_rope_reader() is True
-    monkeypatch.setenv("VLLM_ILU_GLM52_RMS_ROPE_FP8_KV", "0")
+    monkeypatch.setenv("VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV", "0")
     assert rms_rope_reader() is False
-    monkeypatch.setenv("VLLM_GLM52_RMS_ROPE_FP8_KV", "true")
-    monkeypatch.delenv("VLLM_ILU_GLM52_RMS_ROPE_FP8_KV", raising=False)
-    assert rms_rope_reader() is True
+
+    fuse_norm = registered["VLLM_ILU_FUSE_NORM_QUANT"]
+    fuse_w13 = registered["VLLM_ILU_FUSE_MOE_W13"]
+    assert fuse_norm() is True
+    assert fuse_w13() is True
+    monkeypatch.setenv("VLLM_ILU_FUSE_NORM_QUANT", "0")
+    monkeypatch.setenv("VLLM_ILU_FUSE_MOE_W13", "0")
+    assert fuse_norm() is False
+    assert fuse_w13() is False
 
 
 def test_register_attention_backends_gates_gdn_backend(monkeypatch):

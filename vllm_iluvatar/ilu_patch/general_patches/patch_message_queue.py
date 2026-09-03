@@ -7,6 +7,7 @@ Corresponds to: vllm/distributed/device_communicators/shm_broadcast.py
 ILU general-plugins patch, auto-discovered during ``register_general``.
 
 Target   : MessageQueue.__init__ default max_chunks
+Baseline : main_6e448d0
 Why      : Community default max_chunks=10. With PP, EngineCore fills
            batch_queue to pp_size and enqueues execute_model + sample_tokens
            per batch (2 RPCs). For tp1pp16 that is ~32 in-flight broadcast
@@ -26,12 +27,37 @@ Remove   : when upstream sizes max_chunks from max_concurrent_batches.
 
 from __future__ import annotations
 
-import os
+import functools
+import inspect
+from types import SimpleNamespace
 
 from vllm_iluvatar.ilu_patch import general_patch as p
 
 _COMMUNITY_DEFAULT_CHUNKS = 10
 _RESPONSE_MAX_CHUNK_BYTES = 4 * 1024 * 1024
+
+
+def _scaled_mq_limits(
+    n_reader: int,
+    max_chunks: int,
+    max_chunk_bytes: int,
+    env_raw: str = "",
+) -> tuple[int, int]:
+    """Scale default-10 rings; leave explicit caller sizes unchanged."""
+    if max_chunks != _COMMUNITY_DEFAULT_CHUNKS:
+        return max_chunks, max_chunk_bytes
+    env_raw = env_raw.strip()
+    if env_raw.isdigit():
+        return max(_COMMUNITY_DEFAULT_CHUNKS, int(env_raw)), max_chunk_bytes
+    if n_reader > 1:
+        return (
+            max(_COMMUNITY_DEFAULT_CHUNKS, 2 * int(n_reader) + 8),
+            max_chunk_bytes,
+        )
+    chunks = max(_COMMUNITY_DEFAULT_CHUNKS, 48)
+    if max_chunk_bytes > _RESPONSE_MAX_CHUNK_BYTES:
+        max_chunk_bytes = _RESPONSE_MAX_CHUNK_BYTES
+    return chunks, max_chunk_bytes
 
 
 def register() -> None:
@@ -43,52 +69,42 @@ def register() -> None:
 
 
 def _apply() -> None:
+    import vllm.envs as envs
     from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
     from vllm.logger import init_logger
 
     logger = init_logger(__name__)
     orig_init = MessageQueue.__init__
 
-    def __init__(
-        self,
-        n_reader,
-        n_local_reader,
-        local_reader_ranks=None,
-        max_chunk_bytes: int = 1024 * 1024 * 24,
-        max_chunks: int = _COMMUNITY_DEFAULT_CHUNKS,
-        connect_ip: str | None = None,
-    ):
-        if max_chunks == _COMMUNITY_DEFAULT_CHUNKS:
-            env_raw = os.environ.get("VLLM_ILU_MQ_MAX_CHUNKS", "").strip()
-            if env_raw.isdigit():
-                max_chunks = max(_COMMUNITY_DEFAULT_CHUNKS, int(env_raw))
-            elif n_reader > 1:
-                # rpc_broadcast_mq: readers == world_size (e.g. pp*tp).
-                max_chunks = max(
-                    _COMMUNITY_DEFAULT_CHUNKS, 2 * int(n_reader) + 8
-                )
-            else:
-                # worker_response_mq (only output_rank actually enqueues).
-                max_chunks = max(_COMMUNITY_DEFAULT_CHUNKS, 48)
-                if max_chunk_bytes > _RESPONSE_MAX_CHUNK_BYTES:
-                    max_chunk_bytes = _RESPONSE_MAX_CHUNK_BYTES
-
-            logger.info(
+    # [ILU override] MessageQueue.__init__ — delta: enlarge default max_chunks
+    # for deep PP rpc/response rings; optional VLLM_ILU_MQ_MAX_CHUNKS override.
+    @functools.wraps(orig_init)
+    def __init__(self, *args, **kwargs):
+        bound = inspect.signature(orig_init).bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        n_reader = bound.arguments["n_reader"]
+        max_chunks = bound.arguments["max_chunks"]
+        max_chunk_bytes = bound.arguments["max_chunk_bytes"]
+        env_raw = str(getattr(envs, "VLLM_ILU_MQ_MAX_CHUNKS", "") or "")
+        new_chunks, new_bytes = _scaled_mq_limits(
+            n_reader, max_chunks, max_chunk_bytes, env_raw
+        )
+        if (new_chunks, new_bytes) != (max_chunks, max_chunk_bytes):
+            bound.arguments["max_chunks"] = new_chunks
+            bound.arguments["max_chunk_bytes"] = new_bytes
+            logger.debug(
                 "ILU: MessageQueue max_chunks=%s n_reader=%s "
                 "max_chunk_bytes=%s (deep PP rpc ring)",
-                max_chunks,
+                new_chunks,
                 n_reader,
-                max_chunk_bytes,
+                new_bytes,
             )
+        return orig_init(*bound.args, **bound.kwargs)
 
-        return orig_init(
-            self,
-            n_reader,
-            n_local_reader,
-            local_reader_ranks,
-            max_chunk_bytes,
-            max_chunks,
-            connect_ip,
-        )
-
+    p.check_signatures(
+        MessageQueue,
+        SimpleNamespace(__init__=__init__),
+        ["__init__"],
+        strict=True,
+    )
     MessageQueue.__init__ = __init__  # type: ignore[method-assign]

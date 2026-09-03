@@ -39,6 +39,8 @@ Timing   : ``load_general_plugins()`` runs inside ``create_engine_config``,
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from vllm_iluvatar.ilu_patch import general_patch as p
 
 
@@ -62,21 +64,42 @@ def _apply() -> None:
         make_post_init,
     )
 
-    orig = SpeculativeConfig.hf_config_override
-    # [ILU override] hf_config_override - delta: route iluvatar target archs
+    orig_hf = SpeculativeConfig.hf_config_override
+    orig_post_init = SpeculativeConfig.__post_init__
+    orig_draft_pp = SpeculativeConfig.create_draft_parallel_config
+    orig_create = EngineArgs.create_speculative_config
+
+    # [ILU override] hf_config_override — delta: route iluvatar target archs
     # to their dedicated MTP draft models after the community routing runs.
-    SpeculativeConfig.hf_config_override = staticmethod(make_hf_config_override(orig))
-
-    # [ILU override] __post_init__ - delta: re-point the DSpark draft arch at
+    wrapped_hf = make_hf_config_override(orig_hf)
+    # [ILU override] __post_init__ — delta: re-point the DSpark draft arch at
     # IluDSparkDraftModel after community assigns DSparkDraftModel.
-    SpeculativeConfig.__post_init__ = make_post_init(SpeculativeConfig.__post_init__)
-
-    # [ILU override] create_draft_parallel_config - delta: draft PP=1 when
+    wrapped_post_init = make_post_init(orig_post_init)
+    # [ILU override] create_draft_parallel_config — delta: draft PP=1 when
     # target PP>1.
-    SpeculativeConfig.create_draft_parallel_config = staticmethod(
-        make_create_draft_parallel_config(SpeculativeConfig.create_draft_parallel_config)
+    wrapped_draft_pp = make_create_draft_parallel_config(orig_draft_pp)
+    # [ILU override] EngineArgs.create_speculative_config — delta: drop
+    # draft_pipeline_parallel_size on older SpeculativeConfig.
+    wrapped_create = make_create_speculative_config(orig_create)
+
+    p.check_signatures(
+        SpeculativeConfig,
+        SimpleNamespace(
+            hf_config_override=wrapped_hf,
+            __post_init__=wrapped_post_init,
+            create_draft_parallel_config=wrapped_draft_pp,
+        ),
+        ["hf_config_override", "__post_init__", "create_draft_parallel_config"],
+        strict=True,
+    )
+    p.check_signatures(
+        EngineArgs,
+        SimpleNamespace(create_speculative_config=wrapped_create),
+        ["create_speculative_config"],
+        strict=True,
     )
 
-    EngineArgs.create_speculative_config = make_create_speculative_config(
-        EngineArgs.create_speculative_config
-    )
+    SpeculativeConfig.hf_config_override = staticmethod(wrapped_hf)
+    SpeculativeConfig.__post_init__ = wrapped_post_init
+    SpeculativeConfig.create_draft_parallel_config = staticmethod(wrapped_draft_pp)
+    EngineArgs.create_speculative_config = wrapped_create

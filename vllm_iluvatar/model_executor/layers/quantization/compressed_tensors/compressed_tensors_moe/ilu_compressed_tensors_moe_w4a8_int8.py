@@ -7,7 +7,6 @@ describes 4-bit weights with 8-bit activations. Layout is taken from
 ``iluvatar.gemm_format`` and ``iluvatar.pack_version``.
 """
 
-import os
 from typing import Any
 
 import ixformer.inference.functions as ixfops  # type: ignore
@@ -71,14 +70,7 @@ def _log_fuse_w13_skip(reason: str) -> None:
     global _FUSE_W13_SKIP_LOGGED
     if _FUSE_W13_SKIP_LOGGED:
         return
-    logger.warning("fuse_moe_w13 skip: %s", reason)
-    mark_path = os.environ.get("ILU_W13_FUSE_MARK_PATH")
-    if mark_path:
-        try:
-            with open(mark_path, "a", encoding="utf-8") as handle:
-                handle.write(f"fuse_moe_w13 skip: {reason}\n")
-        except OSError:
-            pass
+    logger.debug("fuse_moe_w13 skip: %s", reason)
     _FUSE_W13_SKIP_LOGGED = True
 
 
@@ -86,18 +78,13 @@ def _log_fuse_w13_engaged(num_experts: int, hidden: int, intermediate: int, rows
     global _FUSE_W13_ENGAGED_LOGGED
     if _FUSE_W13_ENGAGED_LOGGED:
         return
-    msg = (
-        f"fuse_moe_w13 engaged E={num_experts} H={hidden} "
-        f"I={intermediate} rows={rows}"
+    logger.debug(
+        "fuse_moe_w13 engaged E=%s H=%s I=%s rows=%s",
+        num_experts,
+        hidden,
+        intermediate,
+        rows,
     )
-    logger.warning(msg)
-    mark_path = os.environ.get("ILU_W13_FUSE_MARK_PATH")
-    if mark_path:
-        try:
-            with open(mark_path, "a", encoding="utf-8") as handle:
-                handle.write(msg + "\n")
-        except OSError:
-            pass
     _FUSE_W13_ENGAGED_LOGGED = True
 
 

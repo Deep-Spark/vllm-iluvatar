@@ -219,7 +219,6 @@ def test_maybe_init_fp8_kv_scale_skips_during_capture(monkeypatch):
 
     assert mla._fp8_kv_scale_frozen is False
     assert float(mla._k_scale.item()) == pytest.approx(1.0)
-    assert mla._fp8_kv_scale_capture_warned is True
 
 
 def _resolve_rms_rope_fp8_kv_fusion(

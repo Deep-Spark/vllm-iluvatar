@@ -284,6 +284,7 @@ def test_patch_binds_wrapper_as_staticmethod():
     import inspect
 
     from vllm.config.speculative import SpeculativeConfig
+    from vllm.engine.arg_utils import EngineArgs
 
     from vllm_iluvatar.ilu_patch.general_patches import patch_speculative_config
 
@@ -308,10 +309,14 @@ def test_patch_binds_wrapper_as_staticmethod():
     assert hasattr(SpeculativeConfig.create_draft_parallel_config, "__wrapped__"), (
         "create_draft_parallel_config not wrapped by the ilu override"
     )
+    assert hasattr(EngineArgs.create_speculative_config, "__wrapped__"), (
+        "create_speculative_config not wrapped by the ilu override"
+    )
 
 
 def test_patch_register_is_idempotent():
     from vllm.config.speculative import SpeculativeConfig
+    from vllm.engine.arg_utils import EngineArgs
 
     from vllm_iluvatar.ilu_patch.general_patches import patch_speculative_config
 
@@ -319,9 +324,11 @@ def test_patch_register_is_idempotent():
     first = SpeculativeConfig.hf_config_override
     first_post_init = SpeculativeConfig.__post_init__
     first_draft_pp = SpeculativeConfig.create_draft_parallel_config
+    first_create = EngineArgs.create_speculative_config
     patch_speculative_config.register()
     patch_speculative_config.register()
 
     assert SpeculativeConfig.hf_config_override is first
     assert SpeculativeConfig.__post_init__ is first_post_init
     assert SpeculativeConfig.create_draft_parallel_config is first_draft_pp
+    assert EngineArgs.create_speculative_config is first_create

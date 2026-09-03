@@ -506,7 +506,7 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
             persistent=False,
         )
 
-        fusion_requested = envs.VLLM_ILU_GLM52_RMS_ROPE_FP8_KV
+        fusion_requested = envs.VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV
         # Prefer the native Torch schema over the Python facade: the facade can
         # exist from a Python-only ixformer update while `_ixformer_C` still
         # lacks the ivcore30 kernel. Kernel contract is H in {8,16,32}.
@@ -550,8 +550,8 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
             global _RMS_ROPE_FP8_KV_ENGAGE_LOGGED
             if not _RMS_ROPE_FP8_KV_ENGAGE_LOGGED:
                 logger.info(
-                    "GLM-5.2 RMSNorm+RoPE+FP8 KV fusion armed "
-                    "(VLLM_ILU_GLM52_RMS_ROPE_FP8_KV=1)"
+                    "GLM DSA RMSNorm+RoPE+FP8 KV fusion armed "
+                    "(VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV=1)"
                 )
                 _RMS_ROPE_FP8_KV_ENGAGE_LOGGED = True
 

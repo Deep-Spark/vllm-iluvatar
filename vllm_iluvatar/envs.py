@@ -117,7 +117,7 @@ if TYPE_CHECKING:
     VLLM_ILU_DS4_MQA_QUANT_TYPE: str = ""
     VLLM_ILU_FUSE_NORM_QUANT: bool = True
     VLLM_ILU_FUSE_MOE_W13: bool = True
-    VLLM_ILU_GLM52_RMS_ROPE_FP8_KV: bool = True
+    VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV: bool = True
     VLLM_ILU_NIXL_WRITE_USE_HOST_BUFFER: bool = False
     VLLM_ILU_NIXL_HOST_DTYPE: str = "auto"
     VLLM_ILU_NIXL_PROXY_ADDR: str = ""
@@ -298,28 +298,15 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     ).upper(),
     # IluGlm residual/RMSNorm+INT8 fusion. Default on (TP8 Graph ITL benefit);
     # set 0 to force the split RMSNorm path. Fail-closed at the call site.
-    "VLLM_ILU_FUSE_NORM_QUANT": lambda: (
-        _get("VLLM_ILU_FUSE_NORM_QUANT", "VLLM_FUSE_NORM_QUANT", "1").strip().lower()
-        in _TRUE_VALS
-    ),
+    "VLLM_ILU_FUSE_NORM_QUANT": _bool_reader("VLLM_ILU_FUSE_NORM_QUANT", "1"),
     # Compact-row W13+SwiGLU+INT8 fusion (native ixformer). Default on after
     # TP8 Graph ITL A/B showed benefit; set 0 for the split GEMV path.
     # Fail-closed for unsupported shapes / runtime errors.
-    "VLLM_ILU_FUSE_MOE_W13": lambda: (
-        _get("VLLM_ILU_FUSE_MOE_W13", "VLLM_FUSE_MOE_W13", "1").strip().lower()
-        in _TRUE_VALS
-    ),
+    "VLLM_ILU_FUSE_MOE_W13": _bool_reader("VLLM_ILU_FUSE_MOE_W13", "1"),
     # Fuse kv_a RMSNorm + Q/K RoPE + FP8 KV pack/insert for GLM DSA.
     # Default on; requires FP8 KV + frozen scale + ixformer op. Set 0 to disable.
-    "VLLM_ILU_GLM52_RMS_ROPE_FP8_KV": lambda: (
-        _get(
-            "VLLM_ILU_GLM52_RMS_ROPE_FP8_KV",
-            "VLLM_GLM52_RMS_ROPE_FP8_KV",
-            "1",
-        )
-        .strip()
-        .lower()
-        in _TRUE_VALS
+    "VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV": _bool_reader(
+        "VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV", "1"
     ),
     # GLM DSA 640B fp8 packed KV scale. A non-empty float applies the SAME
     # scale to every layer (not per-layer). Prefer PATH for per-layer JSON

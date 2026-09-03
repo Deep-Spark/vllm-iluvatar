@@ -17,7 +17,7 @@
       "action": "drop"
     },
     {
-      "id": "routed_fp8_to_w4a8",
+      "id": "routed_fp4_to_w4a8",
       "priority": 900,
       "match": {
         "regex": [

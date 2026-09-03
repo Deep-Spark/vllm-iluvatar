@@ -17,7 +17,7 @@
       "action": "drop"
     },
     {
-      "id": "routed_fp8_to_w4a8",
+      "id": "routed_fp4_keep",
       "priority": 900,
       "match": {
         "regex": [
@@ -30,7 +30,7 @@
       "action": "keep"
     },
     {
-      "id": "dense_fp8_to_w8a8",
+      "id": "dense_group_fp8_to_channel_fp8",
       "priority": 800,
       "match": {
         "regex": [

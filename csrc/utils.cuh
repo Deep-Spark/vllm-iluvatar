@@ -87,4 +87,58 @@ from_float<__nv_bfloat16>(float value) {
   return __float2bfloat16_rn(value);
 }
 
+// Packed (2-element) converters aligned with to_float / from_float naming.
+// Distinct from fused_qk_norm_rope.cu's local packed_to_float2 / float2_to_packed.
+template <typename T>
+__device__ __forceinline__ float2 to_float2(
+    typename TypeTraits<T, 2>::type packed) {
+  return make_float2(to_float(packed.x), to_float(packed.y));
+}
+
+template <typename T>
+__device__ __forceinline__ typename TypeTraits<T, 2>::type from_float2(
+    float2 value) {
+  using packed_t = typename TypeTraits<T, 2>::type;
+  packed_t packed;
+  packed.x = from_float<T>(value.x);
+  packed.y = from_float<T>(value.y);
+  return packed;
+}
+
+// Warp-level fp32 sum reduction. Uses the compile-time constant warpSize
+// (Iluvatar=64, NV=32); never hard-code 32 or 64.
+__device__ __forceinline__ float warp_reduce_sum(float value) {
+#pragma unroll
+  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    value += __shfl_xor(value, offset);
+  }
+  return value;
+}
+
+// Max threads per block for block_reduce_sum smem sizing.
+constexpr int kMaxThreadsPerBlock = 1024;
+
+// Block-level fp32 sum reduction. ``smem`` must hold at least
+// ``kMaxThreadsPerBlock / warpSize`` floats. Returns the block sum to every
+// thread (broadcast via smem[0] + __syncthreads).
+__device__ __forceinline__ float block_reduce_sum(float value, float* smem) {
+  const int lane = threadIdx.x % warpSize;
+  const int warpid = threadIdx.x / warpSize;
+  const int num_warps = blockDim.x / warpSize;
+
+  value = warp_reduce_sum(value);
+  if (lane == 0) {
+    smem[warpid] = value;
+  }
+  __syncthreads();
+
+  value = (lane < num_warps) ? smem[lane] : 0.0f;
+  value = warp_reduce_sum(value);
+  if (threadIdx.x == 0) {
+    smem[0] = value;
+  }
+  __syncthreads();
+  return smem[0];
+}
+
 }  // namespace vllm_iluvatar

@@ -380,7 +380,7 @@ def test_reshape_and_cache_fp8(
 
 def test_fp8_ops_are_bound_on_every_arch() -> None:
     """The FP8 kernels are ivcore30-only, but their schemas never disappear."""
-    assert COMPILED_CUDA_ARCH in ("ivcore10", "ivcore11", "ivcore20", "ivcore30")
+    assert COMPILED_CUDA_ARCH in ("ivcore11", "ivcore30")
     assert hasattr(torch.ops._C, "static_scaled_fp8_quant")
     assert hasattr(torch.ops._C, "reshape_and_cache_fp8")
 

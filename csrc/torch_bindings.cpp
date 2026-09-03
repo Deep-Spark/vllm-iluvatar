@@ -72,6 +72,12 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
       "Tensor key, Tensor value, Tensor key_scale, Tensor! key_cache, "
       "Tensor! value_cache, Tensor! key_scale_cache, Tensor slot_mapping) "
       "-> ()");
+  // MiniMax QK-Norm two-stage ops (plugin-internal, TP>1 path).
+  ops.def("minimax_qk_var(Tensor qkv, int q_size, int kv_size) -> Tensor");
+  ops.def(
+      "minimax_qk_rms_apply(Tensor qkv, Tensor qk_var, Tensor q_weight, "
+      "Tensor k_weight, int q_size, int kv_size, int tp_world, "
+      "float epsilon) -> (Tensor, Tensor)");
   ops.def("weak_ref_tensor(Tensor input) -> Tensor");
   ops.def("get_cuda_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor");
 }
@@ -94,6 +100,8 @@ TORCH_LIBRARY_IMPL_EXPAND(_C, CUDA, ops) {
            &vllm_iluvatar::reshape_and_cache_with_scale);
   ops.impl("reshape_and_cache_mix",
            &vllm_iluvatar::reshape_and_cache_mix);
+  ops.impl("minimax_qk_var", &vllm_iluvatar::minimax_qk_var);
+  ops.impl("minimax_qk_rms_apply", &vllm_iluvatar::minimax_qk_rms_apply);
   // Aliasing a CUDA tensor's storage; registered on the CUDA key like upstream.
   ops.impl("weak_ref_tensor", &vllm_iluvatar::weak_ref_tensor);
 }
@@ -112,6 +120,9 @@ TORCH_LIBRARY_IMPL_EXPAND(_C, Meta, ops) {
            &vllm_iluvatar::fused_qk_rmsnorm_rope_gate_meta);
   ops.impl("fused_qk_rmsnorm_gate",
            &vllm_iluvatar::fused_qk_rmsnorm_gate_meta);
+  ops.impl("minimax_qk_var", &vllm_iluvatar::minimax_qk_var_meta);
+  ops.impl("minimax_qk_rms_apply",
+           &vllm_iluvatar::minimax_qk_rms_apply_meta);
 }
 
 REGISTER_EXTENSION(_C)

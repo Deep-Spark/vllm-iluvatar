@@ -10,10 +10,10 @@
 // tokens.
 //
 // FP8 E4M3 is an ivcore30 (corex30) feature, so the kernels below are compiled
-// only under BUILD_ON_CQ. Both operators are still declared and bound on every
-// arch -- on the other platforms they raise instead of silently disappearing
-// from torch.ops._C. torch.ops._C.compiled_cuda_arch() tells callers which
-// build they are on.
+// only under ILUVATAR_HAS_FP8_FP4. Both operators are still declared and
+// bound on every arch -- on the other platforms they raise instead of silently
+// disappearing from torch.ops._C. torch.ops._C.compiled_cuda_arch() tells
+// callers which build they are on.
 
 #include <torch/all.h>
 
@@ -26,7 +26,7 @@
 
 #include "ops.h"
 
-#ifdef BUILD_ON_CQ
+#ifdef ILUVATAR_HAS_FP8_FP4
 #include <cuda_fp8.h>
 
 #include "utils.cuh"
@@ -34,7 +34,7 @@
 
 namespace vllm_iluvatar {
 
-#ifdef BUILD_ON_CQ
+#ifdef ILUVATAR_HAS_FP8_FP4
 namespace {
 
 constexpr int kElemsPerVec = 8;
@@ -319,12 +319,12 @@ void check_static_scaled_fp8_quant_args(
 }
 
 }  // namespace
-#endif  // BUILD_ON_CQ
+#endif  // ILUVATAR_HAS_FP8_FP4
 
 void static_scaled_fp8_quant(
     torch::Tensor& result, torch::Tensor& input, torch::Tensor& scale,
     const std::optional<std::vector<int64_t>>& group_shape) {
-#ifndef BUILD_ON_CQ
+#ifndef ILUVATAR_HAS_FP8_FP4
   TORCH_CHECK(false,
               "static_scaled_fp8_quant requires the ivcore30 (corex30) FP8 "
               "kernels; this vllm_iluvatar._C was built for ",
@@ -378,7 +378,7 @@ void static_scaled_fp8_quant(
     }
   }
 #undef LAUNCH_STATIC_SCALED_FP8_QUANT
-#endif  // BUILD_ON_CQ
+#endif  // ILUVATAR_HAS_FP8_FP4
 }
 
 void reshape_and_cache_fp8(
@@ -386,7 +386,7 @@ void reshape_and_cache_fp8(
     torch::Tensor& value_cache, torch::Tensor& slot_mapping,
     const std::string& kv_cache_dtype, torch::Tensor& k_scale,
     torch::Tensor& v_scale) {
-#ifndef BUILD_ON_CQ
+#ifndef ILUVATAR_HAS_FP8_FP4
   TORCH_CHECK(false,
               "reshape_and_cache_fp8 requires the ivcore30 (corex30) FP8 "
               "kernels; this vllm_iluvatar._C was built for ",
@@ -447,7 +447,7 @@ void reshape_and_cache_fp8(
     }
   }
 #undef LAUNCH_RESHAPE_AND_CACHE_FP8
-#endif  // BUILD_ON_CQ
+#endif  // ILUVATAR_HAS_FP8_FP4
 }
 
 }  // namespace vllm_iluvatar

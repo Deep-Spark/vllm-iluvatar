@@ -11,9 +11,8 @@
 namespace vllm_iluvatar {
 
 // compiled_cuda_arch() -> str
-// The Iluvatar architecture this extension was compiled for -- "ivcore10",
-// "ivcore11", "ivcore20" or "ivcore30" -- i.e. CMAKE_CUDA_ARCHITECTURES as seen
-// at configure time.
+// The Iluvatar architecture this extension was compiled for -- "ivcore11" or
+// "ivcore30" -- i.e. CMAKE_CUDA_ARCHITECTURES as seen at configure time.
 std::string compiled_cuda_arch();
 
 }  // namespace vllm_iluvatar

@@ -247,7 +247,6 @@ class IluFusedMoEEP:
         )
 
         base_quant_method = getattr(quant_method, "old_quant_method", quant_method)
-        quant_config = base_quant_method.moe_quant_config
         global_to_physical = physical_to_global = local_expert_global_ids = None
         routing_tables = runner._expert_routing_tables()
         if routing_tables is not None:

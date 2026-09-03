@@ -76,4 +76,45 @@ void reshape_and_cache_mix(
     torch::Tensor& key_cache, torch::Tensor& value_cache,
     torch::Tensor& key_scale_cache, torch::Tensor& slot_mapping);
 
+// ---------------------------------------------------------------------------
+// MiniMax QK-Norm two-stage ops (TP>1 path). Portable CUDA, no corex30-only
+// intrinsics. All-reduce stays in Python between the two stages.
+//
+// Shared constraints:
+//   dtype   : qkv / q_weight / k_weight are fp16 or bf16 and share dtype;
+//             qk_var is fp32.
+//   shape   : qkv is 2D [T, >= q_size + 2*kv_size];
+//             q_weight.numel() == q_size, k_weight.numel() == kv_size,
+//             both 1D contiguous; qk_var is contiguous [T, 2].
+//   stride  : qkv.stride(1) == 1 (outer stride arbitrary).
+//   packing : PACKED=2 when q_size, kv_size, row_stride are even and pointers
+//             are 4-byte aligned; otherwise scalar PACKED=1.
+//   values  : q_size > 0, kv_size > 0, tp_world >= 1, epsilon > 0,
+//             T <= INT_MAX.
+// ---------------------------------------------------------------------------
+
+// minimax_qk_var(Tensor qkv, int q_size, int kv_size) -> Tensor
+// Returns contiguous fp32 [T, 2]: [:,0]=q mean-of-squares, [:,1]=k.
+torch::Tensor minimax_qk_var(torch::Tensor& qkv, int64_t q_size,
+                             int64_t kv_size);
+
+torch::Tensor minimax_qk_var_meta(torch::Tensor& qkv, int64_t q_size,
+                                  int64_t kv_size);
+
+// minimax_qk_rms_apply(Tensor qkv, Tensor qk_var, Tensor q_weight,
+//                      Tensor k_weight, int q_size, int kv_size,
+//                      int tp_world, float epsilon) -> (Tensor, Tensor)
+// Returns contiguous q_out [T, q_size], k_out [T, kv_size], dtype == qkv.
+// qk_var is the all-reduced sum of per-shard means; /tp_world is folded into
+// rsqrt.
+std::tuple<torch::Tensor, torch::Tensor> minimax_qk_rms_apply(
+    torch::Tensor& qkv, torch::Tensor& qk_var, torch::Tensor& q_weight,
+    torch::Tensor& k_weight, int64_t q_size, int64_t kv_size,
+    int64_t tp_world, double epsilon);
+
+std::tuple<torch::Tensor, torch::Tensor> minimax_qk_rms_apply_meta(
+    torch::Tensor& qkv, torch::Tensor& qk_var, torch::Tensor& q_weight,
+    torch::Tensor& k_weight, int64_t q_size, int64_t kv_size,
+    int64_t tp_world, double epsilon);
+
 }  // namespace vllm_iluvatar

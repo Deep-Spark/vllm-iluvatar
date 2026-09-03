@@ -11,6 +11,14 @@
 
 ## [Unreleased]
 
+### Changed
+
+- GLM / DeepSeek-V4 MoE 构造改为社区 `FusedMoEFactory`（0.27 去掉 `FusedMoE` 导出）。
+- `IluMultiHeadLatentAttentionWrapper.__init__` 增加
+  `non_causal_multi_token_decode` 与
+  `allow_short_prefill_indexer_scoring_skip`，满足 OOT 前缀签名检查。
+- `IluCommunicator` 接受并转发 `use_all2all`，对齐 0.27 `GroupCoordinator`。
+
 ## [0.26.0] - 2026-08-27
 
 首个正式标记的版本，适配 vLLM 0.26.0 / CoreX 5.0.0。

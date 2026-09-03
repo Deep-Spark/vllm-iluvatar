@@ -140,6 +140,7 @@ if TYPE_CHECKING:
     VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS: float = 0.0
     VLLM_ILU_MOE_EP_LL_MOE_ALGO: str = "GEMV"
     VLLM_ILU_ENABLE_PP_MTP: bool = False
+    VLLM_ILU_ENABLE_V2_PP_MTP: bool = False
     VLLM_ILU_MXFP4_MOE_BACKEND: str = "ixmm"
     VLLM_ILU_REJECTION_SAMPLER_MAX_CHUNK_BYTES: int = 128 * 1024 * 1024
     # GLM DSA fp8 KV: single float shared by ALL layers. Prefer PATH for
@@ -291,6 +292,10 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # patch (ilu_patch/general_patches/patch_pp_mtp.py). Default off so the
     # plugin leaves community vLLM untouched unless explicitly enabled.
     "VLLM_ILU_ENABLE_PP_MTP": _bool_reader("VLLM_ILU_ENABLE_PP_MTP", "0"),
+    # Opt-in gate for V2 ModelRunner PP + MTP compatibility
+    # (ilu_patch/general_patches/patch_v2_pp_mtp.py). Kept separate from the
+    # legacy V1 PP+MTP patch because the patched code paths are different.
+    "VLLM_ILU_ENABLE_V2_PP_MTP": _bool_reader("VLLM_ILU_ENABLE_V2_PP_MTP", "0"),
     # Selects the ilu_mxfp4_fused_experts compute backend. Defaults to "ixmm";
     # "auto" -> ixmm when available else torch; "torch" forces the pure-torch
     # fallback; "ixformer_native" is the correctness-only native kernel.

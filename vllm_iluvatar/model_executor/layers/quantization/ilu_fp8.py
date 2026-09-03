@@ -115,7 +115,6 @@ _FP4_MAX_MAG = 6.0
 _IXMM_FP8_GEMV_MAX_M = 16
 
 
-
 @IluvatarQuantRegistry.register_method
 class IluFp8PerChannelOnlineLinearMethod(_Fp8OnlineLinearBase):
     """Load floating-point weights and quantize them for ixmm after loading.
@@ -517,7 +516,10 @@ class IluFp8MoEMethod(Fp8MoEMethod):
             IluMoEBatchedExpertsFp8,
         )
 
-        if prepare_finalize.activation_format != FusedMoEActivationFormat.BatchedExperts:
+        if (
+            prepare_finalize.activation_format
+            != FusedMoEActivationFormat.BatchedExperts
+        ):
             raise NotImplementedError(
                 "IluMoEBatchedExpertsFp8 requires the batched activation format, "
                 f"got {prepare_finalize.activation_format}"

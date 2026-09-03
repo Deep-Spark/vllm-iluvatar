@@ -11,6 +11,7 @@ IluWorker — subclass of the community Worker with following overrides:
 
 from __future__ import annotations
 
+import vllm.v1.worker.gpu_model_runner as _gpu_model_runner
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu_worker import Worker

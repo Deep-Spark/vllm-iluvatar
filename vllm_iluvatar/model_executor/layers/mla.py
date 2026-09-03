@@ -5,7 +5,7 @@
 Corresponds to: vllm/model_executor/layers/mla.py
 
 Target   : vllm.model_executor.layers.mla.MultiHeadLatentAttentionWrapper
-Baseline : main_6e448d0
+Baseline : main_6e448d0 / vLLM 0.27.1
 Why      : Iluvatar MLA backends apply rope and cache updates inside
            ``MLAAttention`` using ``positions`` and the layer ``rotary_emb``.
 How      : @MultiHeadLatentAttentionWrapper.register_oot subclass. Community
@@ -69,8 +69,8 @@ class IluMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             quant_config,
             prefix,
             skip_topk,
-            non_causal_multi_token_decode,
-            allow_short_prefill_indexer_scoring_skip,
+            non_causal_multi_token_decode=non_causal_multi_token_decode,
+            allow_short_prefill_indexer_scoring_skip=allow_short_prefill_indexer_scoring_skip,
         )
         # [ILU override] plugin MLA backends apply rope/cache updates inside
         # MLAAttention.forward_full when positions are passed through forward().

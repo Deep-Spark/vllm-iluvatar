@@ -7,9 +7,9 @@ import pytest
 
 from vllm_iluvatar.ilu_util.onchip_check import (
     OnchipChecker,
-    OnchipCheckError,
     OnchipResult,
     OnchipStatus,
+    WorkerHealthCheckError,
 )
 
 
@@ -39,7 +39,10 @@ class _FakeNative:
         return {"status": OnchipStatus.OK, "errors": [0, 0, 0, 0]}
 
     def config(self):
-        return {}
+        return {
+            "pci_bdf": "0000:07:00.0",
+            "uuid": "GPU-01234567-89ab-cdef-0123-456789abcdef",
+        }
 
     def free(self):
         self.calls.append("free")
@@ -86,9 +89,20 @@ def test_start_retries_incomplete(configured_env, monkeypatch):
     )
     monkeypatch.setattr(checker, "_run", lambda: next(results))
 
-    checker.start(3)
+    checker.start(
+        3,
+        rank=5,
+        local_rank=3,
+        logical_device=3,
+        physical_gpu=27,
+    )
 
     assert checker._initialized
+    assert checker._device_context() == (
+        "rank=5 local_rank=3 logical_device=3 physical_gpu=27 "
+        "device=cuda:3 PCI=0000:07:00.0 "
+        "UUID=GPU-01234567-89ab-cdef-0123-456789abcdef"
+    )
     assert native.calls[0] == (
         "init",
         {"device": 3, "level_mask": 0, "kmsg": False},
@@ -100,7 +114,7 @@ def test_start_fails_after_incomplete_retries(configured_env, monkeypatch):
     checker._native = _FakeNative()
     monkeypatch.setattr(checker, "_run", lambda: _result(OnchipStatus.INCOMPLETE))
 
-    with pytest.raises(OnchipCheckError, match="after 3 attempt"):
+    with pytest.raises(WorkerHealthCheckError, match="after 3 attempt"):
         checker.start(0)
 
 
@@ -117,7 +131,9 @@ def test_start_fault_fails_without_retry(configured_env, monkeypatch):
 
     monkeypatch.setattr(checker, "_run", run_fault)
 
-    with pytest.raises(OnchipCheckError, match="Startup on-chip check failed"):
+    with pytest.raises(
+        WorkerHealthCheckError, match="Startup worker health check failed"
+    ):
         checker.start(0)
 
     assert calls == 1
@@ -130,7 +146,7 @@ def test_fault_before_batch_raises(configured_env, monkeypatch):
     checker._device_index = 1
     monkeypatch.setattr(checker, "_run", lambda: _result(OnchipStatus.FAULT))
 
-    with pytest.raises(OnchipCheckError, match="failed before batch"):
+    with pytest.raises(WorkerHealthCheckError, match="failed before batch"):
         checker.before_batch()
 
 

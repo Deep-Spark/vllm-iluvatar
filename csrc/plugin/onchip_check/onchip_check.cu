@@ -733,7 +733,7 @@ static void report_kmsg(int rc, const OnchipResult *r) {
     g.reported |= levels;
     unsigned x = r->firstExpected ^ r->firstGot;
     snprintf(msg, sizeof msg,
-             "onchip_check FAULT SLB=%u REG=%u L1=%u L2=%u first=%s "
+             "worker_health_check FAULT SLB=%u REG=%u L1=%u L2=%u first=%s "
              "b=%u t=%u w=%u e=%08x g=%08x xor=%08x bits=%d",
              r->errors[ONCHIP_LV_SLB], r->errors[ONCHIP_LV_REG],
              r->errors[ONCHIP_LV_L1], r->errors[ONCHIP_LV_L2],
@@ -752,7 +752,7 @@ static void report_kmsg(int rc, const OnchipResult *r) {
     if (g.levels & (1u << ONCHIP_LV_REG))
       snprintf(reg, sizeof reg, " REG %u/%d", r->arrivedReg, g.regGrid);
     snprintf(msg, sizeof msg,
-             "onchip_check INCOMPLETE:%s%s (%s, GPU probably shared)",
+             "worker_health_check INCOMPLETE:%s%s (%s, GPU probably shared)",
              slb, reg,
              r->coverageIncomplete ? "rendezvous timeout"
                                    : "rendezvous uncleared");

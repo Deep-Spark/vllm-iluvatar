@@ -41,7 +41,7 @@ class OnchipResult:
     def from_native(cls, raw: dict[str, Any]) -> OnchipResult:
         errors = tuple(int(value) for value in raw.get("errors", (0, 0, 0, 0)))
         if len(errors) != 4:
-            raise RuntimeError(f"Invalid on-chip error vector: {errors!r}")
+            raise RuntimeError(f"Invalid worker health result vector: {errors!r}")
         return cls(
             status=OnchipStatus(int(raw["status"])),
             errors=errors,  # type: ignore[arg-type]
@@ -58,7 +58,7 @@ class OnchipResult:
         )
 
 
-class OnchipCheckError(RuntimeError):
+class WorkerHealthCheckError(RuntimeError):
     pass
 
 
@@ -70,6 +70,12 @@ class OnchipChecker:
         self._native: Any | None = None
         self._initialized = False
         self._device_index: int | None = None
+        self._rank: int | None = None
+        self._local_rank: int | None = None
+        self._logical_device: int | None = None
+        self._physical_gpu: int | None = None
+        self._pci_bdf = ""
+        self._uuid = ""
         self._seed = (os.getpid() ^ time.monotonic_ns()) & 0xFFFFFFFF
         self._incomplete_count = 0
 
@@ -84,8 +90,8 @@ class OnchipChecker:
             try:
                 from vllm_iluvatar import _onchip_check
             except ImportError as exc:
-                raise OnchipCheckError(
-                    "On-chip checking is enabled but "
+                raise WorkerHealthCheckError(
+                    "Worker health checking is enabled but "
                     "vllm_iluvatar._onchip_check could not be imported. "
                     "Rebuild the plugin and verify the CoreX runtime libraries."
                 ) from exc
@@ -98,7 +104,9 @@ class OnchipChecker:
             return device
         index = getattr(device, "index", None)
         if index is None:
-            raise OnchipCheckError(f"Cannot determine GPU index from {device!r}")
+            raise WorkerHealthCheckError(
+                f"Cannot determine GPU index from {device!r}"
+            )
         return int(index)
 
     @staticmethod
@@ -118,6 +126,24 @@ class OnchipChecker:
         self._seed = (self._seed + 0x9E3779B9) & 0xFFFFFFFF
         return self._seed
 
+    def _device_context(self) -> str:
+        parts = []
+        if self._rank is not None:
+            parts.append(f"rank={self._rank}")
+        if self._local_rank is not None:
+            parts.append(f"local_rank={self._local_rank}")
+        if self._logical_device is not None:
+            parts.append(f"logical_device={self._logical_device}")
+        if self._physical_gpu is not None:
+            parts.append(f"physical_gpu={self._physical_gpu}")
+        if self._device_index is not None:
+            parts.append(f"device=cuda:{self._device_index}")
+        if self._pci_bdf:
+            parts.append(f"PCI={self._pci_bdf}")
+        if self._uuid:
+            parts.append(f"UUID={self._uuid}")
+        return " ".join(parts) or "device=unknown"
+
     def _run(self) -> OnchipResult:
         import torch
         from vllm.utils.gpu_sync_debug import gpu_sync_allowed
@@ -129,16 +155,29 @@ class OnchipChecker:
             )
         return OnchipResult.from_native(raw)
 
-    def start(self, device: Any) -> None:
+    def start(
+        self,
+        device: Any,
+        *,
+        rank: int | None = None,
+        local_rank: int | None = None,
+        logical_device: int | None = None,
+        physical_gpu: int | None = None,
+    ) -> None:
         if not self.enabled():
             return
 
         import vllm.envs as envs
 
         device_index = self._resolve_device_index(device)
+        self._device_index = device_index
+        self._rank = rank
+        self._local_rank = local_rank
+        self._logical_device = logical_device
+        self._physical_gpu = physical_gpu
         level_mask = int(envs.VLLM_ILU_ONCHIP_CHECK_LEVEL_MASK)
         if not 0 <= level_mask <= 0xF:
-            raise OnchipCheckError(
+            raise WorkerHealthCheckError(
                 f"VLLM_ILU_ONCHIP_CHECK_LEVEL_MASK must be between 0 and 15, "
                 f"got {level_mask}"
             )
@@ -150,22 +189,24 @@ class OnchipChecker:
             )
             init_result = OnchipResult.from_native(raw)
             if init_result.status is not OnchipStatus.OK:
-                raise OnchipCheckError(
-                    "Failed to initialize on-chip checker: "
+                raise WorkerHealthCheckError(
+                    f"Failed to initialize worker health checker "
+                    f"({self._device_context()}): "
                     + self._format_result(init_result)
                 )
             self._initialized = True
-            self._device_index = device_index
             config = self._native.config()
+            self._pci_bdf = str(config.get("pci_bdf", ""))
+            self._uuid = str(config.get("uuid", ""))
             kmsg_ready = (
                 not envs.VLLM_ILU_ONCHIP_CHECK_KMSG or self._native.kmsg_ready()
             )
 
         if not kmsg_ready:
             logger.warning(
-                "On-chip XID reporting was requested on device %d, but "
+                "Worker health XID reporting was requested for %s, but "
                 "/dev/itrctl is unavailable",
-                device_index,
+                self._device_context(),
             )
 
         retries = envs.VLLM_ILU_ONCHIP_CHECK_STARTUP_RETRIES
@@ -181,15 +222,15 @@ class OnchipChecker:
         assert result is not None
         if result.status is not OnchipStatus.OK:
             message = (
-                f"Startup on-chip check failed on device {device_index} "
+                f"Startup worker health check failed ({self._device_context()}) "
                 f"after {retries + 1} attempt(s): {self._format_result(result)}"
             )
             self.free()
-            raise OnchipCheckError(message)
+            raise WorkerHealthCheckError(message)
         logger.info(
-            "On-chip checker ready on device %d: CU=%s, "
+            "Worker health checker ready (%s): CU=%s, "
             "SLB=%s bytes, REG=%s/%s bytes, L1=%s bytes, L2=%s bytes",
-            device_index,
+            self._device_context(),
             config.get("cu_count"),
             config.get("slb_bytes_total"),
             config.get("reg_bytes_total"),
@@ -202,7 +243,9 @@ class OnchipChecker:
         if not self.enabled():
             return
         if not self._initialized:
-            raise OnchipCheckError("On-chip checker is not initialized")
+            raise WorkerHealthCheckError(
+                "Worker health checker is not initialized"
+            )
 
         import vllm.envs as envs
 
@@ -214,15 +257,16 @@ class OnchipChecker:
             interval = envs.VLLM_ILU_ONCHIP_CHECK_INCOMPLETE_LOG_INTERVAL
             if self._incomplete_count == 1 or self._incomplete_count % interval == 0:
                 logger.warning(
-                    "On-chip check was inconclusive before batch on device %s "
-                    "(count=%d); continuing this batch: %s",
-                    self._device_index,
+                    "Worker health check was inconclusive before batch "
+                    "(%s, count=%d); continuing this batch: %s",
+                    self._device_context(),
                     self._incomplete_count,
                     self._format_result(result),
                 )
             return
-        raise OnchipCheckError(
-            f"On-chip check failed before batch on device {self._device_index}: "
+        raise WorkerHealthCheckError(
+            f"Worker health check failed before batch "
+            f"({self._device_context()}): "
             f"{self._format_result(result)}"
         )
 
@@ -232,8 +276,8 @@ class OnchipChecker:
         result = self._run()
         if result.status is not OnchipStatus.OK:
             logger.error(
-                "On-chip shutdown check on device %s: %s",
-                self._device_index,
+                "Worker health shutdown check (%s): %s",
+                self._device_context(),
                 self._format_result(result),
             )
 
@@ -244,3 +288,9 @@ class OnchipChecker:
             self._native.free()
             self._initialized = False
             self._device_index = None
+            self._rank = None
+            self._local_rank = None
+            self._logical_device = None
+            self._physical_gpu = None
+            self._pci_bdf = ""
+            self._uuid = ""

@@ -165,7 +165,10 @@ synchronous check before each non-empty GPU batch, and a log-only check during
 shutdown. `FAULT` and CUDA failures stop startup or online execution.
 `INCOMPLETE` means coverage was inconclusive rather than successful: startup
 retries and then fails, while online execution logs it with rate limiting and
-continues the current batch.
+continues the current batch. Runtime messages identify the affected Worker with
+global rank, local rank, logical device, physical GPU ID, CUDA device index,
+PCI BDF, and GPU UUID, so no `CUDA_VISIBLE_DEVICES` mapping is needed during
+diagnosis.
 
 Optional settings:
 

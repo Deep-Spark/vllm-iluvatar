@@ -53,6 +53,17 @@ def _stub_gpu_worker(monkeypatch):
     logger_mod = ModuleType("vllm.logger")
     logger_mod.init_logger = logging.getLogger
 
+    platforms_mod = ModuleType("vllm.platforms")
+    platforms_mod.current_platform = type(
+        "FakePlatform",
+        (),
+        {
+            "device_id_to_physical_device_id": staticmethod(
+                lambda device_id: device_id + 24
+            )
+        },
+    )()
+
     vllm_mod.v1 = vllm_v1_mod
     vllm_v1_mod.worker = worker_package
     worker_package.gpu_worker = gpu_worker_mod
@@ -66,6 +77,7 @@ def _stub_gpu_worker(monkeypatch):
         "vllm.v1.worker.gpu_worker": gpu_worker_mod,
         "vllm.v1.kv_cache_interface": kv_cache_interface_mod,
         "vllm.logger": logger_mod,
+        "vllm.platforms": platforms_mod,
     }
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
@@ -140,8 +152,25 @@ class _FakeChecker:
     def __init__(self):
         self.calls = []
 
-    def start(self, device):
-        self.calls.append(("start", device))
+    def start(
+        self,
+        device,
+        *,
+        rank=None,
+        local_rank=None,
+        logical_device=None,
+        physical_gpu=None,
+    ):
+        self.calls.append(
+            (
+                "start",
+                device,
+                rank,
+                local_rank,
+                logical_device,
+                physical_gpu,
+            )
+        )
 
     def before_batch(self):
         self.calls.append("before_batch")
@@ -153,17 +182,31 @@ class _FakeChecker:
         self.calls.append("free")
 
 
-def test_compile_starts_checker_after_parent():
+def test_compile_starts_checker_before_parent():
     worker = _make_worker(object())
     checker = _FakeChecker()
+    started_before_parent = []
+
+    def start(
+        device, *, rank=None, local_rank=None, logical_device=None, physical_gpu=None
+    ):
+        started_before_parent.append(not worker.base_calls)
+        checker.calls.append(
+            ("start", device, rank, local_rank, logical_device, physical_gpu)
+        )
+
+    checker.start = start
     worker._onchip_checker = checker
     worker.device = "cuda:3"
+    worker.rank = 7
+    worker.local_rank = 3
 
     result = worker.compile_or_warm_up_model()
 
     assert result == "compilation-times"
+    assert started_before_parent == [True]
     assert worker.base_calls == ["compile"]
-    assert checker.calls == [("start", "cuda:3")]
+    assert checker.calls == [("start", "cuda:3", 7, 3, 3, 27)]
 
 
 @pytest.mark.parametrize("num_tokens", [0, 4])

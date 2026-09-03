@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import vllm.v1.worker.gpu_model_runner as _gpu_model_runner
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu_worker import Worker
 
@@ -78,9 +79,15 @@ class IluWorker(Worker):
         return checker
 
     def compile_or_warm_up_model(self):
-        result = super().compile_or_warm_up_model()
-        self._get_onchip_checker().start(self.device)
-        return result
+        physical_gpu = current_platform.device_id_to_physical_device_id(self.local_rank)
+        self._get_onchip_checker().start(
+            self.device,
+            rank=self.rank,
+            local_rank=self.local_rank,
+            logical_device=self.local_rank,
+            physical_gpu=physical_gpu,
+        )
+        return super().compile_or_warm_up_model()
 
     def execute_model(self, scheduler_output):
         if scheduler_output.total_num_scheduled_tokens > 0:
@@ -95,14 +102,14 @@ class IluWorker(Worker):
                 try:
                     checker.check_shutdown()
                 except Exception:
-                    logger.exception("On-chip shutdown check failed")
+                    logger.exception("Worker health shutdown check failed")
             super().shutdown()
         finally:
             if checker is not None:
                 try:
                     checker.free()
                 except Exception:
-                    logger.exception("Failed to free on-chip checker")
+                    logger.exception("Failed to free worker health checker")
             self.model_runner.__class__ = orig_cls
 
     def execute_dummy_batch(self) -> None:

@@ -2,6 +2,7 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+#include <cstdio>
 #include <cstdint>
 
 #include "onchip_check.h"
@@ -119,12 +120,37 @@ PyObject *py_run(PyObject *, PyObject *args, PyObject *kwargs) {
 PyObject *py_config(PyObject *, PyObject *) {
   OnchipConfig config = {};
   const int status = onchip_check_config(&config);
+  int device = -1;
+  char pci_bdf[32] = "";
+  char uuid[48] = "";
+  char identity[128] = "";
+  cudaDeviceProp properties = {};
+  if (status == ONCHIP_OK && cudaGetDevice(&device) == cudaSuccess &&
+      cudaGetDeviceProperties(&properties, device) == cudaSuccess) {
+    const auto *u =
+        reinterpret_cast<const unsigned char *>(properties.uuid.bytes);
+    std::snprintf(pci_bdf, sizeof(pci_bdf), "%04x:%02x:%02x.0",
+                  properties.pciDomainID, properties.pciBusID,
+                  properties.pciDeviceID);
+    std::snprintf(
+        uuid, sizeof(uuid),
+        "GPU-%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
+        "%02x%02x%02x%02x%02x%02x",
+        u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10],
+        u[11], u[12], u[13], u[14], u[15]);
+    std::snprintf(identity, sizeof(identity), "device=cuda:%d PCI=%s UUID=%s",
+                  device, pci_bdf, uuid);
+  }
   PyObject *dict = PyDict_New();
   if (dict == nullptr)
     return nullptr;
 
   const bool ok =
       set_item(dict, "status", PyLong_FromLong(status)) &&
+      set_item(dict, "device_index", PyLong_FromLong(device)) &&
+      set_item(dict, "pci_bdf", PyUnicode_FromString(pci_bdf)) &&
+      set_item(dict, "uuid", PyUnicode_FromString(uuid)) &&
+      set_item(dict, "identity", PyUnicode_FromString(identity)) &&
       set_item(dict, "cu_count", PyLong_FromLong(config.cuCount)) &&
       set_item(dict, "slb_grid", PyLong_FromLong(config.slbGrid)) &&
       set_item(dict, "slb_threads", PyLong_FromLong(config.slbThreads)) &&
@@ -180,7 +206,7 @@ PyMethodDef methods[] = {
 PyModuleDef module = {
     PyModuleDef_HEAD_INIT,
     "_onchip_check",
-    "Iluvatar on-chip storage integrity checker.",
+    "Iluvatar worker health checker.",
     -1,
     methods,
 };

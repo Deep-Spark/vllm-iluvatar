@@ -18,7 +18,6 @@ from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
 )
 
 
-
 def ilu_sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
@@ -92,11 +91,6 @@ def ilu_sparse_attn_indexer(
     if has_decode:
         decode_metadata = attn_metadata.decode
         assert decode_metadata is not None
-        # TODO: support speculative decode padding.
-        if decode_metadata.requires_padding:
-            raise NotImplementedError(
-                "Sparse attention indexer does not support requires_padding"
-            )
         if decode_metadata.max_context_len == 0:
             # Early decode steps can have no KV entries yet: no top-k
             # candidates, and the logits kernel cannot materialize a matrix
@@ -104,6 +98,10 @@ def ilu_sparse_attn_indexer(
             topk_indices_buffer[:num_decode_tokens].fill_(-1)
             return topk_indices_buffer
 
+        # Ragged MTP decode batches (for example query lengths [4, 1]) are
+        # represented by cu_seqlens_q plus one causal [ks, ke) span per query
+        # token. The same variable-query logits kernel used for prefill can
+        # therefore handle requires_padding=True without an explicit pack step.
         logits = ixfops.dsa_indexer_mqa_logits_with_blocks(
             q[:num_decode_tokens],
             decode_metadata.cu_seqlens_q,

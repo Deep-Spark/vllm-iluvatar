@@ -52,6 +52,7 @@ from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import (
     get_spec_layer_idx_from_weight_name,
 )
+from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     maybe_prefix,
@@ -241,7 +242,7 @@ class IluGlmMoeDsaMultiTokenPredictor(nn.Module):
         return logits
 
 
-class IluGlmMoeDsaMTP(nn.Module):
+class IluGlmMoeDsaMTP(nn.Module, SupportsPP):
     """Top-level ilu GLM-5.2 W4A8 MTP draft model (``IluGlmMoeDsaMTPModel``)."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):

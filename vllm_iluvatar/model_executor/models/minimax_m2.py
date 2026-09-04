@@ -3,6 +3,7 @@
 
 Corresponds to: vllm/model_executor/models/minimax_m2.py
 Target   : arch ``MiniMaxM2ForCausalLM``
+Baseline : main_4cd213ead42e
 Why      : Iluvatar keeps the router weight in BF16 while returning FP32
            logits, and routes DP/EP MoE execution through ``IluFusedMoEEP``.
 How      : Promote community MoE and gate modules in place after construction,
@@ -78,14 +79,18 @@ class IluMiniMaxM2MoE(_MiniMaxM2MoE, IluFusedMoEEP):
 
 
 def minimax_m2_moe_overrides(model) -> None:
-    """Promote every local MiniMax-M2 MoE block to the Iluvatar subclass."""
+    """Promote MiniMax-M2 MoE blocks for BF16 routing and Iluvatar DP/EP.
+
+    Remove this override when the community router supports BF16 weights with
+    FP32 logits and its MoE path supports Iluvatar DP/EP execution.
+    """
     for layer in getattr(model, "layers", []):
         moe = getattr(layer, "block_sparse_moe", None)
         if isinstance(moe, _MiniMaxM2MoE):
             IluMiniMaxM2MoE.promote(moe)
 
 
-class IluMiniMaxM2ForCausalLM(_MiniMaxM2ForCausalLM):
+class MiniMaxM2ForCausalLM(_MiniMaxM2ForCausalLM):
     """MiniMax-M2 causal LM wired for Iluvatar router and DP/EP behavior."""
 
     def __init__(
@@ -105,5 +110,5 @@ def register_model() -> None:
 
     ModelRegistry.register_model(
         "MiniMaxM2ForCausalLM",
-        "vllm_iluvatar.model_executor.models.minimax_m2:IluMiniMaxM2ForCausalLM",
+        "vllm_iluvatar.model_executor.models.minimax_m2:MiniMaxM2ForCausalLM",
     )

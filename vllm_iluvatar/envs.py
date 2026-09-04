@@ -203,9 +203,6 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
         ).lower()
         in ("1", "true")
     ),
-    "VLLM_ILU_W8A8_GEMM_MODE": lambda: _get(
-        "VLLM_ILU_W8A8_GEMM_MODE", "VLLM_W8A8_GEMM_MODE", "PERF"
-    ).upper(),
 }
 
 

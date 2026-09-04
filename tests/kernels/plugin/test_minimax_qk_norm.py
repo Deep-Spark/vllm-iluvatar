@@ -18,6 +18,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest import mock
 
+import ixformer  # noqa: F401
 import pytest
 import torch
 import vllm_iluvatar._C  # noqa: F401
@@ -202,8 +203,6 @@ def test_forward_qkv_tp1_vs_torch(
     q_size: int,
     kv_size: int,
 ) -> None:
-    pytest.importorskip("ixformer")
-
     qkv = _make_qkv(num_tokens, q_size, kv_size, dtype, strided=True)
     q_w, k_w = _make_weights(q_size, kv_size, dtype)
     q_norm = SimpleNamespace(weight=q_w, variance_epsilon=EPS)

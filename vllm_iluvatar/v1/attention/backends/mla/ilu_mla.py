@@ -56,7 +56,6 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 
 
-
 @dataclass
 class IluMLACommonDecodeMetadata(MLACommonDecodeMetadata):
     """Decode metadata with the CUDA-graph flag consumed by ixformer kernels."""
@@ -164,7 +163,8 @@ class IluMLACommonMetadataBuilder(MLACommonMetadataBuilder):
             torch.arange(num_decodes, device=block_table_tensor.device),
             decode_lens_device_long,
         )
-        if req_ids.numel() != num_decode_tokens:
+        num_real_decode_tokens = req_ids.numel()
+        if num_real_decode_tokens > num_decode_tokens:
             return block_table_tensor, seq_lens_device
 
         expanded_block_table = block_table_tensor.index_select(0, req_ids)
@@ -179,7 +179,7 @@ class IluMLACommonMetadataBuilder(MLACommonMetadataBuilder):
         )
         token_pos_in_req = (
             torch.arange(
-                num_decode_tokens,
+                num_real_decode_tokens,
                 device=block_table_tensor.device,
                 dtype=torch.long,
             )
@@ -201,6 +201,28 @@ class IluMLACommonMetadataBuilder(MLACommonMetadataBuilder):
                 expanded_seq_lens,
                 block_table_tensor.dtype,
                 seq_lens_device.dtype,
+                num_decode_tokens,
+            )
+        if num_real_decode_tokens < num_decode_tokens:
+            # CUDA graph padding can make q longer than the real repeated rows.
+            # Keep the metadata token-level and append no-op rows instead of
+            # falling back to request-level metadata, which misaligns q rows.
+            pad_rows = num_decode_tokens - num_real_decode_tokens
+            expanded_block_table = torch.cat(
+                (
+                    expanded_block_table,
+                    expanded_block_table.new_zeros(
+                        pad_rows, expanded_block_table.shape[1]
+                    ),
+                ),
+                dim=0,
+            )
+            expanded_seq_lens = torch.cat(
+                (
+                    expanded_seq_lens,
+                    expanded_seq_lens.new_zeros(pad_rows),
+                ),
+                dim=0,
             )
         return expanded_block_table, expanded_seq_lens
 
@@ -210,11 +232,14 @@ class IluMLACommonMetadataBuilder(MLACommonMetadataBuilder):
         expanded_seq_lens: torch.Tensor,
         block_table_dtype: torch.dtype,
         seq_lens_dtype: torch.dtype,
+        output_rows: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if output_rows is None:
+            output_rows = expanded_block_table.shape[0]
         nrows, ncols = expanded_block_table.shape
         max_rows = self.vllm_config.scheduler_config.max_num_batched_tokens
-        assert nrows <= max_rows, (
-            f"spec-decode expanded decode rows {nrows} > "
+        assert output_rows <= max_rows, (
+            f"spec-decode expanded decode rows {output_rows} > "
             f"max_num_batched_tokens {max_rows}"
         )
         if (
@@ -236,9 +261,12 @@ class IluMLACommonMetadataBuilder(MLACommonMetadataBuilder):
         self._spec_decode_expand_block_table_buf[:nrows].copy_(expanded_block_table)
         assert self._spec_decode_expand_seq_lens_buf is not None
         self._spec_decode_expand_seq_lens_buf[:nrows].copy_(expanded_seq_lens)
+        if nrows < output_rows:
+            self._spec_decode_expand_block_table_buf[nrows:output_rows].zero_()
+            self._spec_decode_expand_seq_lens_buf[nrows:output_rows].zero_()
         return (
-            self._spec_decode_expand_block_table_buf[:nrows],
-            self._spec_decode_expand_seq_lens_buf[:nrows],
+            self._spec_decode_expand_block_table_buf[:output_rows],
+            self._spec_decode_expand_seq_lens_buf[:output_rows],
         )
 
 

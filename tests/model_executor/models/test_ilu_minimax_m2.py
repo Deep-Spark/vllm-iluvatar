@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -18,36 +17,25 @@ from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
 from vllm_iluvatar.model_executor.models import minimax_m2 as ilu_minimax_m2
 
 
-def test_minimax_m2_constructor_exposes_vllm_config_and_initializes_ep_limit():
-    parameters = inspect.signature(
-        ilu_minimax_m2.IluMiniMaxM2ForCausalLM.__init__
-    ).parameters
-    source = inspect.getsource(ilu_minimax_m2.IluMiniMaxM2ForCausalLM.__init__)
+def test_minimax_m2_oot_registration_points_at_plugin_subclass():
+    from vllm import ModelRegistry
 
-    assert parameters["vllm_config"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert parameters["prefix"].default == ""
-    assert source.index("set_max_num_seqs") < source.index("super().__init__")
+    from vllm_iluvatar.ilu_register import apply_oot_registrations
+
+    apply_oot_registrations()
+    entry = ModelRegistry.models["MiniMaxM2ForCausalLM"]
+    assert entry.module_name == "vllm_iluvatar.model_executor.models.minimax_m2"
+    assert entry.class_name == "MiniMaxM2ForCausalLM"
 
 
-def test_minimax_m2_register_model(monkeypatch):
-    calls = []
-
-    import vllm
-
-    monkeypatch.setattr(
-        vllm.ModelRegistry,
-        "register_model",
-        lambda arch, path: calls.append((arch, path)),
+def test_minimax_m2_plugin_class_subclasses_community():
+    from vllm.model_executor.models.minimax_m2 import (
+        MiniMaxM2ForCausalLM as _CommunityMiniMaxM2ForCausalLM,
     )
 
-    ilu_minimax_m2.register_model()
+    from vllm_iluvatar.model_executor.models.minimax_m2 import MiniMaxM2ForCausalLM
 
-    assert calls == [
-        (
-            "MiniMaxM2ForCausalLM",
-            "vllm_iluvatar.model_executor.models.minimax_m2:IluMiniMaxM2ForCausalLM",
-        )
-    ]
+    assert issubclass(MiniMaxM2ForCausalLM, _CommunityMiniMaxM2ForCausalLM)
 
 
 def test_minimax_m2_moe_mro_includes_ep_mixin():

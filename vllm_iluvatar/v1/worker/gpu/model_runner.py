@@ -85,6 +85,9 @@ def _wrap_speculator_propose(model_runner: Any) -> None:
 
     @wraps(original_propose)
     def _ilu_propose(input_batch: InputBatch, *args: Any, **kwargs: Any):
+        # TO DO:Isolation only: force DeepSeek MTP drafter propose() to eager while
+        # leaving the target model CUDA graph controlled by server config.
+        kwargs["is_profile"] = True
         draft_tokens = original_propose(input_batch, *args, **kwargs)
         # The proposed drafts are produced only on the last PP rank. Relay them on
         # the same side stream/group as sampled tokens so peer ranks verify the

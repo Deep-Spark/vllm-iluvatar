@@ -1,5 +1,5 @@
 {
-  "quant_method": "iluvatar-compressed-tensors",
+  "quant_method": "compressed-tensors",
   "format": "iluvatar-mixed",
   "config_groups": {
     "routed_experts": {

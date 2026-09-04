@@ -12,6 +12,7 @@ module only performs register-time wiring.
 
 Target   : vllm.model_executor.layers.minimax_rms_norm.rms_norm_tp
            .MiniMaxText01RMSNormTP.forward_qkv
+Baseline : main_4cd213ead42e
 Why      : the community ``forward_qkv`` routes TP>1 through
            ``torch.ops.vllm.minimax_qk_norm_fusion`` (Lamport / ROCm AITER /
            Triton). On Iluvatar corex the Lamport op is unregistered, AITER is

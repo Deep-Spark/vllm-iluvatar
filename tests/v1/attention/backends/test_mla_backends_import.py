@@ -11,8 +11,10 @@ CPU-only — no GPU or ixformer required for the import-level checks.
 from __future__ import annotations
 
 import importlib
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 
 @pytest.mark.parametrize(
@@ -73,3 +75,41 @@ def test_attention_py_imports_resolve():
     assert IluDeepseekV4FlashMLASparseBackend is not None
     assert IluDeepseekV4SWACache is not None
     assert IluDeepseekSparseSWABackend is not None
+
+
+def test_ilu_mla_spec_decode_expand_pads_graph_rows():
+    """Spec decode metadata must stay token-level when CUDA graph pads rows."""
+    from vllm_iluvatar.v1.attention.backends.mla.ilu_mla import (
+        IluMLACommonMetadataBuilder,
+    )
+
+    builder = IluMLACommonMetadataBuilder.__new__(IluMLACommonMetadataBuilder)
+    builder.decode_use_graph = True
+    builder.use_full_cuda_graph = False
+    builder._spec_decode_expand_block_table_buf = None
+    builder._spec_decode_expand_seq_lens_buf = None
+    builder.device = torch.device("cpu")
+    builder.vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=16)
+    )
+
+    block_table = torch.tensor([[10, 11], [20, 21], [0, 0]], dtype=torch.int32)
+    seq_lens = torch.tensor([10, 12, 0], dtype=torch.int32)
+    query_start_loc_cpu = torch.tensor([0, 2, 4, 4], dtype=torch.int32)
+
+    expanded_block_table, expanded_seq_lens = builder._expand_spec_decode_metadata(
+        block_table,
+        seq_lens,
+        query_start_loc_cpu,
+        num_decode_tokens=6,
+    )
+
+    assert expanded_block_table.tolist() == [
+        [10, 11],
+        [10, 11],
+        [20, 21],
+        [20, 21],
+        [0, 0],
+        [0, 0],
+    ]
+    assert expanded_seq_lens.tolist() == [9, 10, 11, 12, 0, 0]

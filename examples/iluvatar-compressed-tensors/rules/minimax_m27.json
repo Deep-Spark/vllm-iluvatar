@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "name": "minimax_m27",
+  "model_config_patch": {
+    "compression_config": null
+  },
+  "default_action": "keep",
+  "rules": [
+    {
+      "id": "drop_consumed_scale",
+      "priority": 1000,
+      "match": {
+        "suffixes": [
+          "weight_scale_inv"
+        ]
+      },
+      "action": "drop"
+    },
+    {
+      "id": "routed_fp8_to_w4a8",
+      "priority": 900,
+      "match": {
+        "regex": [
+          "\\.block_sparse_moe\\.experts\\.\\d+\\.w[123]\\.weight$"
+        ],
+        "dtypes": [
+          "float8_e4m3fn"
+        ]
+      },
+      "action": "convert",
+      "work_device": "cuda",
+      "scale": {
+        "from_suffix": ".weight",
+        "to_suffix": ".weight_scale_inv"
+      },
+      "dequant": {
+        "method": "fp8_block",
+        "options": {
+          "block_size": 128
+        }
+      },
+      "quant": {
+        "method": "int4_moe",
+        "options": {
+          "group_size": -1,
+          "symmetric": true,
+          "gemm_format": "TN",
+          "pack_version": 2,
+          "scale_layout": "row"
+        }
+      },
+      "outputs": {
+        "weight_scale": ".weight_scale",
+        "i8_weight_scale": ".i8_weight_scale",
+        "i8_weight_zero": ".i8_weight_zero"
+      }
+    },
+    {
+      "id": "dense_fp8_to_w8a8",
+      "priority": 800,
+      "match": {
+        "regex": [
+          "\\.self_attn\\.(q_proj|k_proj|v_proj|o_proj)\\.weight$"
+        ],
+        "dtypes": [
+          "float8_e4m3fn"
+        ]
+      },
+      "action": "convert",
+      "scale": {
+        "from_suffix": ".weight",
+        "to_suffix": ".weight_scale_inv"
+      },
+      "dequant": {
+        "method": "fp8_block",
+        "options": {
+          "block_size": 128
+        }
+      },
+      "quant": {
+        "method": "int8_per_channel",
+        "options": {
+          "group_size": -1,
+          "symmetric": true,
+          "gemm_format": "TN"
+        }
+      },
+      "iluvatar": {
+        "mixed_strategy": "CHANNEL",
+        "gemm_mode": "PERF"
+      },
+      "outputs": {
+        "weight_scale": ".weight_scale"
+      }
+    }
+  ]
+}

@@ -17,6 +17,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compress
 from vllm.model_executor.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
+    PackedvLLMParameter,
     PerTensorScaleParameter,
 )
 from vllm.scalar_type import scalar_types
@@ -35,6 +36,18 @@ W4A8_SUPPORTED_TYPES_MAP = {
     4: scalar_types.int4,
 }
 W4A8_SUPPORTED_BITS = list(W4A8_SUPPORTED_TYPES_MAP.keys())
+
+# Dense W4A8 checkpoints store kernel-packed NN ``[K, N/2]``.
+# ``w4a8_gemm_quant_repack_int4`` transposes to ``[K, N]``, permutes 32x32 tiles
+# and nibble-packs column ``i`` with ``i + 16``. Writing the axes as
+# ``n = d3*32 + d4*16 + d5`` and ``k = d0*32 + d1*16 + d2``, the packed element
+# lands at row ``d0*32 + d4*16 + d2`` and column ``d3*16 + d5``. The packed
+# column does not depend on ``d4``, and ``d1`` only selects the nibble, so a
+# 32-aligned N boundary maps onto a 16-aligned packed column and a 32-aligned K
+# boundary maps 1:1 onto packed rows. Under that alignment, TP and fused QKV /
+# gate_up can slice in the packed domain.
+_PACK_ALIGN = 32
+_WEIGHT_LAYOUT_PACKED_NN = "packed_nn"
 
 
 class IluCompressedTensorsW4A8Int(CompressedTensorsScheme):
@@ -74,6 +87,13 @@ class IluCompressedTensorsW4A8Int(CompressedTensorsScheme):
         # key for the Iluvatar GEMM layout.
         self.format = ilu_params.get("gemm_format", "")
         assert self.format == "NN", f"Invalid format:{self.format}"
+        # Only ``packed_nn`` enables PackedvLLMParameter fused/TP slicing;
+        # missing or unknown layouts stay ``None``.
+        self.weight_layout = (
+            _WEIGHT_LAYOUT_PACKED_NN
+            if ilu_params.get("weight_layout", None) == _WEIGHT_LAYOUT_PACKED_NN
+            else None
+        )
 
     def _get_layer_params(
         self, layer: torch.nn.Module
@@ -94,6 +114,20 @@ class IluCompressedTensorsW4A8Int(CompressedTensorsScheme):
     def get_min_capability(cls) -> int:
         return 1
 
+    @staticmethod
+    def _check_pack_alignment(
+        output_partition_sizes: list[int], input_size_per_partition: int
+    ) -> None:
+        """Reject shards that would split a 32x32 pack tile."""
+        bad_n = [size for size in output_partition_sizes if size % _PACK_ALIGN]
+        if bad_n or input_size_per_partition % _PACK_ALIGN:
+            raise ValueError(
+                "dense W4A8 packed_nn requires every shard to be "
+                f"{_PACK_ALIGN}-aligned so packed-domain slicing stays exact, "
+                f"got output_partition_sizes={output_partition_sizes} and "
+                f"input_size_per_partition={input_size_per_partition}."
+            )
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -105,17 +139,33 @@ class IluCompressedTensorsW4A8Int(CompressedTensorsScheme):
         weight_loader: Callable,
         **kwargs,
     ):
+        layer.logical_widths = output_partition_sizes
+        n = sum(output_partition_sizes)
+        k = input_size_per_partition
         self.gemm_info = W4A8GemmInfo(
             format_str=self.format,
-            k=input_size_per_partition,
-            n=sum(output_partition_sizes),
+            k=k,
+            n=n,
         )
-        weight = ModelWeightParameter(
-            data=torch.empty(self.gemm_info.get_weight_shape(), dtype=torch.int8),
-            input_dim=0,
-            output_dim=1,
-            weight_loader=weight_loader,
-        )
+        if self.weight_layout == _WEIGHT_LAYOUT_PACKED_NN:
+            self._check_pack_alignment(output_partition_sizes, k)
+            # Checkpoint is kernel-packed NN ``[K, N/2]``. PackedvLLMParameter
+            # halves fused QKV / gate_up shard offsets along output_dim.
+            weight = PackedvLLMParameter(
+                data=torch.empty(self.gemm_info.get_weight_shape(), dtype=torch.int8),
+                input_dim=0,
+                output_dim=1,
+                packed_dim=1,
+                packed_factor=2,
+                weight_loader=weight_loader,
+            )
+        else:
+            weight = ModelWeightParameter(
+                data=torch.empty(self.gemm_info.get_weight_shape(), dtype=torch.int8),
+                input_dim=0,
+                output_dim=1,
+                weight_loader=weight_loader,
+            )
         layer.register_parameter("weight", weight)
 
         # WEIGHT SCALE

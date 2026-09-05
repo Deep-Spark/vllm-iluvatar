@@ -106,6 +106,32 @@ def test_get_scheme_selects_iluvatar_linear_implementation(
     assert scheme.format == iluvatar["gemm_format"]
 
 
+def test_w4a8_weight_layout_packed_nn_or_unset():
+    packed = IluCompressedTensorsW4A8Int(
+        strategy="channel",
+        num_bits=4,
+        group_size=-1,
+        ilu_params={"gemm_format": "NN", "weight_layout": "packed_nn"},
+    )
+    assert packed.weight_layout == "packed_nn"
+
+    omitted = IluCompressedTensorsW4A8Int(
+        strategy="channel",
+        num_bits=4,
+        group_size=-1,
+        ilu_params={"gemm_format": "NN"},
+    )
+    assert omitted.weight_layout is None
+
+    other = IluCompressedTensorsW4A8Int(
+        strategy="channel",
+        num_bits=4,
+        group_size=-1,
+        ilu_params={"gemm_format": "NN", "weight_layout": "future_layout"},
+    )
+    assert other.weight_layout is None
+
+
 class _CustomQuantMethod(QuantizeMethodBase):
     def __init__(self, parent_config, ilu_params):
         self.parent_config = parent_config

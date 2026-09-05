@@ -1,0 +1,51 @@
+{
+  "quant_method": "compressed-tensors",
+  "format": "iluvatar-mixed",
+  "config_groups": {
+    "dense_linears": {
+      "format": "int-quantized",
+      "targets": [
+        "re:.*\\.self_attn\\.(q_proj|k_proj|v_proj|o_proj)$",
+        "re:.*\\.mlp\\.(gate_proj|up_proj|down_proj)$"
+      ],
+      "weights": {
+        "num_bits": 4,
+        "type": "int",
+        "symmetric": {
+          "$rules": "rules.dense_float_to_w4a8.quant.options.symmetric"
+        },
+        "strategy": "channel",
+        "group_size": {
+          "$rules": "rules.dense_float_to_w4a8.quant.options.group_size",
+          "none_as": -1
+        },
+        "dynamic": false
+      },
+      "input_activations": {
+        "num_bits": 8,
+        "type": "int",
+        "symmetric": true,
+        "strategy": "token",
+        "group_size": null,
+        "dynamic": true
+      },
+      "output_activations": null,
+      "iluvatar": {
+        "gemm_format": {
+          "$rules": "rules.dense_float_to_w4a8.quant.options.gemm_format"
+        },
+        "weight_layout": {
+          "$rules": "rules.dense_float_to_w4a8.quant.options.weight_layout"
+        }
+      }
+    }
+  },
+  "ignore": [
+    "lm_head",
+    "re:.*\\.embed_tokens$",
+    "re:.*\\.linear_attn\\..*",
+    "re:.*\\.mlp\\.gate$",
+    "re:.*norm.*",
+    "re:.*\\.visual\\..*"
+  ]
+}

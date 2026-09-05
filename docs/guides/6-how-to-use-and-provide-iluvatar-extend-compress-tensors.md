@@ -206,8 +206,31 @@ Linear 使用与 MoE 相同的扩展机制：config group 中存在 `iluvatar` �
 | --- | --- | --- | --- | --- |
 | `gemm_format` | W8A8 | 是 | `TN` / `NN` | 必须与离线量化一致 |
 | `gemm_format` | W4A8 | 是 | `NN` | Linear W4A8 仅支持 `NN` |
+| `weight_layout` | W4A8 | 否 | `packed_nn` | 离线导出的 ckpt 布局，默认即 `packed_nn`：磁盘与常驻均为 kernel-pack 后的 `[K, N/2]` |
 | `mixed_strategy` | W8A8 | 是 | `CHANNEL` | 当前仅支持 per-channel |
 | `gemm_mode` | W8A8 | 是 | `NORMAL` / `PERF` | `PERF` 按层形状选择更优 kernel；`NORMAL` 走通用路径 |
+
+#### Dense Linear W4A8：离线导出 packed_nn
+
+dense Linear W4A8 的权重**离线量化时就要 pack 成 `[K, N/2]`**，加载路径不再做 repack。导出方法是 `int4_per_channel`（见 §6.2）：先按输出通道做对称 INT4，再调用 `w4a8_gemm_quant_repack_int4` 写成 packed NN。
+
+Qwen3.8-27B 完整示例：
+
+```bash
+python3 examples/iluvatar-compressed-tensors/quant.py \
+  --input  /path/to/Qwen3.8-27B \
+  --output /path/to/Qwen3.8-27B-W4A8 \
+  --configs examples/iluvatar-compressed-tensors/configs/qwen3_8.json \
+  --rules   examples/iluvatar-compressed-tensors/rules/qwen3_8.json \
+  --device cpu
+```
+
+`rules/qwen3_8.json` 只量化 `self_attn.{q,k,v,o}_proj` 与 `mlp.{gate,up,down}_proj`；`linear_attn`（GDN）、`embed_tokens`、`lm_head`、norm、visual 保持 BF16。`configs/qwen3_8.json` 的 `iluvatar.weight_layout` 通过 `$rules` 与离线选项对齐为 `packed_nn`。
+
+N、K 以及 TP / fused 分片边界必须是 32 的倍数。`create_weights` 用 `PackedvLLMParameter(packed_dim=1, packed_factor=2)` 承载 fused QKV / `gate_up` 的 shard 减半；不对齐会直接报错。packed 域切片与「先切再 pack」的等价性由
+`tests/model_executor/layers/quantization/compressed_tensors/test_ilu_compressed_tensors_w4a8_int.py` 中的 `test_packed_domain_*` 在真实形状上按 TP=1/2/8 逐字节验证。
+
+不要用 `int4_moe` / `pack_int4_moe` 量化 dense Linear：那两条路径按 MoE TN 沿 K pack，布局不同。
 
 ## 5. 特殊量化与混合量化
 
@@ -370,6 +393,9 @@ configs 不包含离线转换方法、checkpoint 名称匹配规则或模型配�
   - `options`：`dtype`。
 - `int8_per_channel`：按输出通道执行对称 INT8 量化，并生成对应 scale；
   - `options`：`round_through_bfloat16` 控制是否先转换为 BF16 进行截断；`transport` 为 `true` 时交换输入 tensor 的第 0、1 维。
+- `int4_per_channel`：dense Linear W4A8。按输出通道做对称 INT4 后，调用 `w4a8_gemm_quant_repack_int4` 写成 packed NN `[K, N/2]`。`weight_scale` 为 `(amax/7)/scale_div`，默认 `scale_div=18`，用于抵消 dense W4A8 kernel 的 `alpha=18`。N、K 必须是 32 的倍数。
+  - `options`：`group_size` 仅支持 `-1`；`symmetric` 必须为 `true`；`gemm_format` 为 `NN`；`weight_layout` 为 `packed_nn`；`scale_div` 默认 `18`；`round_through_bfloat16` 和 `transport` 含义与 `int8_per_channel` 相同。
+  - 不要用 `int4_moe` / `pack_int4_moe` 量化 dense Linear：那两条路径会按 MoE TN 做 kernel pack。
 - `fp8_per_channel`：使用每个输出通道的绝对最大值执行对称 FP8 量化，并生成 FP32 scale；
   - `options`：`dtype` 默认为 `float8_e4m3fn`；`round_through_bfloat16` 和 `transport` 含义与 `int8_per_channel` 相同。
 - `int4_moe`：先生成 per-channel INT8，再通过 ixformer 重排为 MoE INT4，并按版本生成 scale、`i8_weight_scale` 和 `i8_weight_zero`。
@@ -438,7 +464,7 @@ configs 不包含离线转换方法、checkpoint 名称匹配规则或模型配�
 3. **编写 rules**：使用 checkpoint tensor 名称编写匹配条件；优先添加 dtype 约束和精确后缀，避免已转换权重被重复转换。
 4. **复用转换算法**：优先使用 `methods.py` 中已有方法；新增方法时，应先使用小型张量或单个真实 tensor 验证反量化结果。
 5. **编写 configs**：使用 vLLM 运行时模块前缀编写 `targets`。例如，路由专家通常匹配 `re:.*\\.experts`，不要直接复制包含专家编号或 `w1/w2/w3` 的 checkpoint 正则表达式。
-6. **同步参数**：通过 `$rules` 对齐 `group_size`、`symmetric`、`gemm_format`、`pack_version` 等离线和运行时参数。
+6. **同步参数**：通过 `$rules` 对齐 `group_size`、`symmetric`、`gemm_format`、`pack_version`、`weight_layout` 等离线和运行时参数。
 7. **执行小规模验证**：先验证 JSON、规则加载和匹配统计，再对少量 shard 或代表性 tensor 进行转换。
 8. **验证输出**：检查输出 tensor 名称、dtype、shape、scale 后缀、权重索引和最终 `quantization_config`。
 9. **启动推理**：使用目标并行配置加载模型，并至少执行一次短输入推理以验证后端选择和数值有效性。

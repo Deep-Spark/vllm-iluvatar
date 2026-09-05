@@ -244,6 +244,50 @@ def _int8_per_channel(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return quantized, scale.float()
 
 
+# Dense W4A8 kernel ``alpha`` (``w4a8.cpp``). Stored scale is ``true_scale / alpha``
+# so GEMM ``(x @ q) * i_scale * w_scale * 18`` reconstructs the int4 range.
+_W4A8_KERNEL_ALPHA = 18.0
+_INT4_QMAX = 7.0
+_PACK_ALIGN = 32
+
+
+def _int4_per_channel(
+    value: torch.Tensor, scale_div: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric per-channel INT4 into int8 ``[N, K]``; caller kernel-packs."""
+    if value.dim() != 2:
+        raise ValueError(f"per-channel quantization expects 2-D input: {value.shape}")
+    if scale_div <= 0:
+        raise ValueError(f"scale_div must be positive, got {scale_div}")
+    abs_max = value.abs().amax(dim=-1, keepdim=True)
+    qscale = abs_max / _INT4_QMAX
+    qscale = torch.where(qscale > 0, qscale, torch.ones_like(qscale))
+    quantized = torch.round(value / qscale).clamp(-8, 7).to(torch.int8)
+    return quantized, (qscale / scale_div).float()
+
+
+def _pack_int4_nn(weight: torch.Tensor) -> torch.Tensor:
+    """Kernel-pack INT4-in-int8 ``[N, K]`` into NN ``[K, N/2]``."""
+    import ixformer.inference.functions as ixfop
+
+    n, k = weight.shape
+    if n % _PACK_ALIGN or k % _PACK_ALIGN:
+        raise ValueError(
+            "int4_per_channel packed_nn requires N and K to be multiples of "
+            f"{_PACK_ALIGN} so TP / fused shards stay sliceable in the packed "
+            f"domain, got [N={n}, K={k}]."
+        )
+    packed, _, _ = ixfop.w4a8_gemm_quant_repack_int4(
+        # group_size == -1 path internally uses x / 18 -> int4, so q*18 keeps
+        # the already-quantized int4 values after packing.
+        weight.to(torch.float32) * _W4A8_KERNEL_ALPHA,
+        -1,
+        2,
+        "NN",
+    )
+    return packed.contiguous()
+
+
 def _fp8_per_channel(
     value: torch.Tensor, dtype: torch.dtype
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -290,6 +334,40 @@ def quant_int8_per_channel(
         value = value.transpose(0, 1)
     weight, scale = _int8_per_channel(value)
     return QuantResult(weight=weight, weight_scale=scale)
+
+
+@register_quant("int4_per_channel")
+def quant_int4_per_channel(
+    value: torch.Tensor, options: Mapping[str, Any]
+) -> QuantResult:
+    """Dense Linear W4A8: symmetric per-channel INT4, kernel-packed ``[K, N/2]``.
+
+    Scale is divided by 18 to cancel the dense W4A8 kernel ``alpha``. N and K
+    must be 32-aligned so TP and fused QKV / gate_up can slice in the packed
+    domain. Do not use ``int4_moe`` here: that path packs along K for MoE TN.
+    """
+    if options.get("round_through_bfloat16", False):
+        value = value.to(torch.bfloat16).float()
+    transport = bool(options.get("transport", False))
+    if transport:
+        value = value.transpose(0, 1)
+    group_size = int(options.get("group_size", -1))
+    if group_size not in (-1,):
+        raise ValueError(
+            "int4_per_channel only supports group_size=-1, "
+            f"got {group_size}"
+        )
+    if not bool(options.get("symmetric", True)):
+        raise ValueError("int4_per_channel only supports symmetric quantization")
+    weight_layout = str(options.get("weight_layout", "packed_nn"))
+    if weight_layout != "packed_nn":
+        raise ValueError(
+            "int4_per_channel only exports packed_nn ([K, N/2] int8), "
+            f"got weight_layout={weight_layout!r}"
+        )
+    scale_div = float(options.get("scale_div", _W4A8_KERNEL_ALPHA))
+    weight, scale = _int4_per_channel(value, scale_div)
+    return QuantResult(weight=_pack_int4_nn(weight), weight_scale=scale)
 
 
 @register_quant("fp8_per_channel")

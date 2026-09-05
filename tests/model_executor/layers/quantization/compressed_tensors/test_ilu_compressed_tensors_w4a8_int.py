@@ -210,3 +210,246 @@ def test_IluCompressedTensorsW4A8Int(
         f"max_diff:{max(diff_list):.4f} min_diff:{min(diff_list):.4f} "
         f"avg_diff:{sum(diff_list) / len(diff_list):.4f}"
     )
+
+
+def _pack_w4_weight(weight_i4: torch.Tensor) -> torch.Tensor:
+    packed_weight, _, _ = w4a8_gemm_quant_repack_int4(
+        x=weight_i4.to(torch.float32) * 18.0,
+        group_size=-1,
+        version=2,
+        format="NN",
+    )
+    return packed_weight.contiguous()
+
+
+def _make_scheme() -> IluCompressedTensorsW4A8Int:
+    return IluCompressedTensorsW4A8Int(
+        strategy=QuantizationStrategy.CHANNEL,
+        num_bits=4,
+        group_size=-1,
+        is_static_input_scheme=False,
+        input_symmetric=True,
+        ilu_params={"gemm_format": "NN", "weight_layout": "packed_nn"},
+    )
+
+
+def _create_layer_weights(
+    scheme: IluCompressedTensorsW4A8Int,
+    layer: torch.nn.Module,
+    in_out_features: tuple[int, int],
+    *,
+    output_partition_sizes: list[int] | None = None,
+    dtype: torch.dtype = torch.float16,
+) -> None:
+    in_features, out_features = in_out_features
+    scheme.create_weights(
+        layer=layer,
+        output_size=out_features,
+        input_size=in_features,
+        output_partition_sizes=output_partition_sizes or [out_features],
+        input_size_per_partition=in_features,
+        params_dtype=dtype,
+        weight_loader=lambda *_args, **_kwargs: None,
+    )
+
+
+def _packed_layer(
+    in_features: int, output_partition_sizes: list[int]
+) -> tuple[IluCompressedTensorsW4A8Int, torch.nn.Module]:
+    layer = _DummyLinear(logical_widths=list(output_partition_sizes))
+    scheme = _make_scheme()
+    _create_layer_weights(
+        scheme,
+        layer,
+        (in_features, sum(output_partition_sizes)),
+        output_partition_sizes=output_partition_sizes,
+    )
+    return scheme, layer
+
+
+# Qwen3.8-27B dense Linear shapes as (n, k), i.e. torch ``[out, in]``.
+_QWEN38_27B_DENSE_SHAPES = {
+    "q_proj": (12288, 5120),
+    "k_proj": (1024, 5120),
+    "v_proj": (1024, 5120),
+    "o_proj": (5120, 6144),
+    "gate_proj": (17408, 5120),
+    "up_proj": (17408, 5120),
+    "down_proj": (5120, 17408),
+}
+
+
+def _rand_i4(n: int, k: int) -> torch.Tensor:
+    return torch.randint(-8, 8, (n, k), dtype=torch.int8, device="cuda")
+
+
+@pytest.mark.parametrize("name", sorted(_QWEN38_27B_DENSE_SHAPES))
+@pytest.mark.parametrize("tp_size", [1, 2, 8])
+def test_packed_domain_column_slice_matches_full_pack(name: str, tp_size: int):
+    """Splitting N before packing == slicing packed columns at ``offset // 2``."""
+    torch.manual_seed(0)
+    n, k = _QWEN38_27B_DENSE_SHAPES[name]
+    shard = n // tp_size
+    assert shard % 32 == 0, f"{name} shard {shard} is not 32-aligned at TP={tp_size}"
+
+    weight = _rand_i4(n, k)
+    full = _pack_w4_weight(weight)
+    parts = [_pack_w4_weight(weight[i : i + shard]) for i in range(0, n, shard)]
+    torch.testing.assert_close(torch.cat(parts, dim=1), full, atol=0, rtol=0)
+    for rank, part in enumerate(parts):
+        start = rank * shard // 2
+        torch.testing.assert_close(
+            part, full[:, start : start + shard // 2], atol=0, rtol=0
+        )
+
+
+@pytest.mark.parametrize("name", ["o_proj", "down_proj", "q_proj"])
+@pytest.mark.parametrize("tp_size", [1, 2, 8])
+def test_packed_domain_row_slice_matches_full_pack(name: str, tp_size: int):
+    torch.manual_seed(0)
+    n, k = _QWEN38_27B_DENSE_SHAPES[name]
+    shard = k // tp_size
+    assert shard % 32 == 0, f"{name} shard {shard} is not 32-aligned at TP={tp_size}"
+
+    weight = _rand_i4(n, k)
+    full = _pack_w4_weight(weight)
+    parts = [_pack_w4_weight(weight[:, i : i + shard]) for i in range(0, k, shard)]
+    torch.testing.assert_close(torch.cat(parts, dim=0), full, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 8])
+def test_packed_domain_fused_qkv_concat(tp_size: int):
+    torch.manual_seed(0)
+    k = _QWEN38_27B_DENSE_SHAPES["q_proj"][1]
+    sizes = [
+        _QWEN38_27B_DENSE_SHAPES[name][0] // tp_size
+        for name in ("q_proj", "k_proj", "v_proj")
+    ]
+    shards = [_rand_i4(n, k) for n in sizes]
+    fused = _pack_w4_weight(torch.cat(shards, dim=0))
+    piecewise = torch.cat([_pack_w4_weight(w) for w in shards], dim=1)
+    torch.testing.assert_close(piecewise, fused, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 8])
+def test_packed_domain_fused_gate_up_concat(tp_size: int):
+    torch.manual_seed(0)
+    n, k = _QWEN38_27B_DENSE_SHAPES["gate_proj"]
+    shard = n // tp_size
+    gate = _rand_i4(shard, k)
+    up = _rand_i4(shard, k)
+    fused = _pack_w4_weight(torch.cat([gate, up], dim=0))
+    piecewise = torch.cat([_pack_w4_weight(gate), _pack_w4_weight(up)], dim=1)
+    torch.testing.assert_close(piecewise, fused, atol=0, rtol=0)
+
+
+def test_packed_nn_load_merged_column_gate_up():
+    torch.manual_seed(0)
+    in_features = 256
+    n_gate = 128
+    n_up = 128
+    scheme, layer = _packed_layer(in_features, [n_gate, n_up])
+
+    assert tuple(layer.weight.shape) == (in_features, (n_gate + n_up) // 2)
+    assert layer.weight.packed_dim == layer.weight.output_dim == 1
+    assert layer.weight.packed_factor == 2
+
+    gate = torch.randint(-8, 8, (n_gate, in_features), dtype=torch.int8)
+    up = torch.randint(-8, 8, (n_up, in_features), dtype=torch.int8)
+    layer.weight.load_merged_column_weight(
+        _pack_w4_weight(gate), shard_offset=0, shard_size=n_gate
+    )
+    layer.weight.load_merged_column_weight(
+        _pack_w4_weight(up), shard_offset=n_gate, shard_size=n_up
+    )
+    fused = _pack_w4_weight(torch.cat([gate, up], dim=0))
+    torch.testing.assert_close(layer.weight.data, fused, atol=0, rtol=0)
+
+
+def test_packed_nn_load_qkv_weight():
+    torch.manual_seed(0)
+    in_features = 256
+    n_q, n_k, n_v = 256, 128, 128
+    scheme, layer = _packed_layer(in_features, [n_q, n_k, n_v])
+
+    q = torch.randint(-8, 8, (n_q, in_features), dtype=torch.int8)
+    k = torch.randint(-8, 8, (n_k, in_features), dtype=torch.int8)
+    v = torch.randint(-8, 8, (n_v, in_features), dtype=torch.int8)
+    layer.weight.load_qkv_weight(
+        _pack_w4_weight(q), shard_offset=0, shard_size=n_q, shard_id="q", num_heads=2
+    )
+    layer.weight.load_qkv_weight(
+        _pack_w4_weight(k), shard_offset=n_q, shard_size=n_k, shard_id="k", num_heads=2
+    )
+    layer.weight.load_qkv_weight(
+        _pack_w4_weight(v),
+        shard_offset=n_q + n_k,
+        shard_size=n_v,
+        shard_id="v",
+        num_heads=2,
+    )
+    fused = _pack_w4_weight(torch.cat([q, k, v], dim=0))
+    torch.testing.assert_close(layer.weight.data, fused, atol=0, rtol=0)
+
+
+def test_packed_nn_column_parallel_tp2(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 1
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: 2
+    )
+    torch.manual_seed(0)
+    in_features = 256
+    n_full = 256
+    n_part = n_full // 2
+    scheme, layer = _packed_layer(in_features, [n_part])
+    full = torch.randint(-8, 8, (n_full, in_features), dtype=torch.int8)
+    layer.weight.load_column_parallel_weight(_pack_w4_weight(full))
+    torch.testing.assert_close(
+        layer.weight.data, _pack_w4_weight(full[n_part:]), atol=0, rtol=0
+    )
+
+
+def test_packed_nn_row_parallel_tp2(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 1
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: 2
+    )
+    torch.manual_seed(0)
+    k_full = 256
+    k_part = k_full // 2
+    n = 128
+    scheme, layer = _packed_layer(k_part, [n])
+    full = torch.randint(-8, 8, (n, k_full), dtype=torch.int8)
+    layer.weight.load_row_parallel_weight(_pack_w4_weight(full))
+    torch.testing.assert_close(
+        layer.weight.data, _pack_w4_weight(full[:, k_part:]), atol=0, rtol=0
+    )
+
+
+@pytest.mark.parametrize(
+    "output_partition_sizes,input_size_per_partition",
+    [
+        ([48], 256),
+        ([128], 48),
+        ([128, 48], 256),
+    ],
+)
+def test_packed_nn_rejects_unaligned_shards(
+    output_partition_sizes: list[int], input_size_per_partition: int
+):
+    layer = _DummyLinear(logical_widths=list(output_partition_sizes))
+    scheme = _make_scheme()
+    with pytest.raises(ValueError, match="32-aligned"):
+        scheme.create_weights(
+            layer=layer,
+            output_size=sum(output_partition_sizes),
+            input_size=input_size_per_partition,
+            output_partition_sizes=output_partition_sizes,
+            input_size_per_partition=input_size_per_partition,
+            params_dtype=torch.float16,
+            weight_loader=lambda *_args, **_kwargs: None,
+        )

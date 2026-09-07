@@ -12,7 +12,11 @@ MAX_JOBS="${VLLM_ILUVATAR_MAX_JOBS:-${MAX_JOBS:-$(nproc --all)}}"
 
 export VLLM_ILUVATAR_MAX_JOBS="${MAX_JOBS}"
 export MAX_JOBS="${MAX_JOBS}"
-export VLLM_ILUVATAR_CUDA_ARCHITECTURES="${VLLM_ILUVATAR_CUDA_ARCHITECTURES:-ivcore11}"
+# Same as ixformer / ixmm: COREX_ARCH from the SDK, CUDA_ARCH as explicit override.
+# Do not default to ivcore11 here — a wrong-arch _C.so loads but produces garbage.
+if [[ -z "${CUDA_ARCH:-}" && -n "${COREX_ARCH:-}" ]]; then
+  export CUDA_ARCH="${COREX_ARCH}"
+fi
 export VLLM_ILUVATAR_ENABLE_CUINFER="${VLLM_ILUVATAR_ENABLE_CUINFER:-1}"
 export CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 export VLLM_ILUVATAR_BUILD_OUTPUT="${VLLM_ILUVATAR_BUILD_OUTPUT:-stdout}"
@@ -20,7 +24,8 @@ export NINJA_STATUS="${NINJA_STATUS:-[running=%r started=%s finished=%f total=%t
 
 echo "INFO: python=${PYTHON_PATH}"
 echo "INFO: CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
-echo "INFO: VLLM_ILUVATAR_CUDA_ARCHITECTURES=${VLLM_ILUVATAR_CUDA_ARCHITECTURES}"
+echo "INFO: COREX_ARCH=${COREX_ARCH:-<unset>}"
+echo "INFO: CUDA_ARCH=${CUDA_ARCH:-<unset, resolved by setup.py>}"
 echo "INFO: VLLM_ILUVATAR_ENABLE_CUINFER=${VLLM_ILUVATAR_ENABLE_CUINFER}"
 echo "INFO: MAX_JOBS=${MAX_JOBS}"
 

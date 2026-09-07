@@ -102,8 +102,10 @@ class CMakeBuildExt(build_ext):
     """
 
     def _cuda_architectures(self) -> str:
+        # Same order as ixformer / ixmm: CUDA_ARCH, then COREX_ARCH from the SDK.
         override = (
-            os.environ.get("VLLM_ILUVATAR_CUDA_ARCHITECTURES")
+            os.environ.get("CUDA_ARCH")
+            or os.environ.get("COREX_ARCH")
             or os.environ.get("CMAKE_CUDA_ARCHITECTURES")
             or os.environ.get("TORCH_CUDA_ARCH_LIST")
         )

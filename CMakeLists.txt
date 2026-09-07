@@ -13,7 +13,13 @@
 cmake_minimum_required(VERSION 3.25)
 
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
-  set(CMAKE_CUDA_ARCHITECTURES "ivcore11" CACHE STRING "Iluvatar CoreX architecture" FORCE)
+  if(DEFINED ENV{CUDA_ARCH} AND NOT "$ENV{CUDA_ARCH}" STREQUAL "")
+    set(CMAKE_CUDA_ARCHITECTURES "$ENV{CUDA_ARCH}" CACHE STRING "Iluvatar CoreX architecture" FORCE)
+  elseif(DEFINED ENV{COREX_ARCH} AND NOT "$ENV{COREX_ARCH}" STREQUAL "")
+    set(CMAKE_CUDA_ARCHITECTURES "$ENV{COREX_ARCH}" CACHE STRING "Iluvatar CoreX architecture" FORCE)
+  else()
+    set(CMAKE_CUDA_ARCHITECTURES "ivcore11" CACHE STRING "Iluvatar CoreX architecture" FORCE)
+  endif()
 endif()
 
 # Mirror ixformer's CoreX-friendly pre-project() setup:

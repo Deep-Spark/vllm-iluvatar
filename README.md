@@ -71,6 +71,27 @@ bash build_vllm_iluvatar.sh
 bash install_vllm_iluvatar.sh
 ```
 
+#### Target architecture
+
+`_C.so` contains CUDA kernels (RoPE, KV-cache ops), so it must be compiled for
+the ivcore architecture of the machine it will run on. `setup.py` resolves the
+target in this order (same as ixformer / ixmm):
+
+```text
+CUDA_ARCH -> COREX_ARCH -> CMAKE_CUDA_ARCHITECTURES
+  -> TORCH_CUDA_ARCH_LIST -> torch.corex_arch -> "ivcore11"
+```
+
+The final fallback makes a build silently target `ivcore11` whenever `torch` is
+not importable in the build environment. A wrong-arch `_C.so` does not fail to
+load: the kernels run and return wrong values, which surfaces much later as a
+model that generates degenerate text with no crash and no NaN. Pass the
+architecture explicitly:
+
+```bash
+COREX_ARCH=ivcore30 bash install_vllm_iluvatar_editable.sh
+```
+
 ### Verify
 
 ```bash
@@ -79,6 +100,17 @@ python3 -c "from vllm.platforms import current_platform; print(current_platform)
 
 The output or startup logs should confirm that the Iluvatar platform plugin is
 active.
+
+Also confirm the extension was built for this machine. The build directory name
+carries the architecture, so compare it against the hardware:
+
+```bash
+python3 -c "import torch; print('hardware:', torch.corex_arch)"
+ls -d build/Release-*        # e.g. Release-py312-ivcore30
+```
+
+A mismatch means `_C.so` must be rebuilt with `COREX_ARCH` set; remove the stale
+`build/Release-*` directory first so the old objects are not reused.
 
 ## Usage
 

@@ -278,7 +278,46 @@ _AUTO_BACKEND = "auto"
 # ``swiglustep`` semantics (clamp after silu, ``limit <= 0`` = plain SwiGLU).
 _DSV4_CLAMP_VARIANT = "dsv4_clamp"
 _STEP3_SWIGLUSTEP_VARIANT = "step3_swiglustep"
-_VALID_SWIGLU_VARIANTS = (_DSV4_CLAMP_VARIANT, _STEP3_SWIGLUSTEP_VARIANT)
+# MiniMax-M3 routes its experts through community
+# ``swigluoai_uninterleave``, whose math matches neither of the above: gate/up
+# are *packed* halves (``x[..., :d]`` / ``x[..., d:]``, as emitted by a
+# MergedColumnParallelLinear gate_up_proj), the gate carries an ``alpha`` inside
+# the sigmoid, and the up branch is offset by ``beta`` --
+# ``gate.clamp(max=limit) * sigmoid(alpha * gate) * (up.clamp(±limit) + beta)``.
+# Note ixformer's ``swigluoai_and_mul`` is the *interleaved* gpt-oss split and
+# must not be used here. No ixformer op fuses this math with the FP8 quant, so
+# unlike the other two variants this one is composed in torch +
+# ``fp8_per_token_dynamic_scaled``.
+_SWIGLUOAI_VARIANT = "swigluoai"
+_VALID_SWIGLU_VARIANTS = (
+    _DSV4_CLAMP_VARIANT,
+    _STEP3_SWIGLUSTEP_VARIANT,
+    _SWIGLUOAI_VARIANT,
+)
+# Defaults of community ``SiluAndMulWithClamp``
+# (vllm/model_executor/layers/activation.py), which is the class that backs
+# ``MoEActivation.SWIGLUOAI_UNINTERLEAVE`` -- NOT the interleaved
+# ``SwigluOAIAndMul`` (1.702 / 1.0). These mean "the caller passed nothing",
+# i.e. plain ``silu(gate) * up``, and are deliberately NOT MiniMax-M3's values:
+# otherwise a caller that forgets to thread alpha/beta silently gets M3's
+# activation applied to some other checkpoint. Callers that require the real
+# values guard for ``None`` themselves (see ``IluModelOptMxFp8FusedMoE.apply``).
+_SWIGLUOAI_ALPHA = 1.0
+_SWIGLUOAI_BETA = 0.0
+
+
+def _swigluoai_uninterleave(
+    input: torch.Tensor,
+    limit: float,
+    *,
+    alpha: float = _SWIGLUOAI_ALPHA,
+    beta: float = _SWIGLUOAI_BETA,
+) -> torch.Tensor:
+    """MiniMax-M3 packed-halves SwiGLU-OAI activation."""
+    d = input.shape[-1] // 2
+    gate = input[..., :d].clamp(max=limit)
+    up = input[..., d:].clamp(min=-limit, max=limit)
+    return gate * torch.sigmoid(alpha * gate) * (up + beta)
 
 
 @functools.lru_cache(maxsize=1)
@@ -449,6 +488,8 @@ def _ilu_mxfp4_fused_experts_ixformer(
     gemm_backend: str,
     gemm_mode: int | None,
     swiglu_variant: str,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
 ) -> torch.Tensor:
     """The ixformer pipeline.
 
@@ -528,6 +569,15 @@ def _ilu_mxfp4_fused_experts_ixformer(
         "swiglu_limit must be set for swiglu_variant='dsv4_clamp': "
         "swiglu_limit_dynamic_scaled_fp8 has no 'no clamp' mode"
     )
+    # ``swigluoai`` clamps unconditionally (community default 7.0), so a missing
+    # or non-positive limit would silently change the activation rather than
+    # disable a clamp.
+    assert swiglu_variant != _SWIGLUOAI_VARIANT or (
+        swiglu_limit is not None and swiglu_limit > 0
+    ), (
+        "swiglu_limit must be a positive clamp bound for "
+        f"swiglu_variant='{_SWIGLUOAI_VARIANT}', got {swiglu_limit!r}"
+    )
     assert w13_bias is None and w2_bias is None, (
         "bias is not wired into group_gemm_fp4; the dispatcher should have "
         "fallen back to the torch path"
@@ -569,7 +619,25 @@ def _ilu_mxfp4_fused_experts_ixformer(
     )
 
     # --- 4) SwiGLU + E4M3 -----------------------------------------------
-    if swiglu_variant == _STEP3_SWIGLUSTEP_VARIANT:
+    if swiglu_variant == _SWIGLUOAI_VARIANT:
+        # Composed in torch: no ixformer op carries this exact math. Both
+        # candidates are wrong here -- ``swigluoai_and_mul`` splits gate/up
+        # interleaved (gpt-oss ``SWIGLUOAI``), while ``silu_and_mul_with_clamp``
+        # is packed but has no alpha/beta. MiniMax-M3 tags its experts
+        # ``SWIGLUOAI_UNINTERLEAVE``, i.e. packed halves with alpha and beta.
+        act = _swigluoai_uninterleave(
+            gemm1_out,
+            float(swiglu_limit),
+            alpha=_SWIGLUOAI_ALPHA if swiglu_alpha is None else float(swiglu_alpha),
+            beta=_SWIGLUOAI_BETA if swiglu_beta is None else float(swiglu_beta),
+        )
+        # The fused ops write FP8 zeros / scale 1.0 for rows whose route is < 0;
+        # composing skips that, and GEMM1 wrote those rows from an uninitialized
+        # buffer. The final gather drops them either way, but an all-NaN row
+        # would first produce a NaN per-token amax here, so zero them explicitly.
+        act = torch.where((dst_to_src >= 0).unsqueeze(-1), act, act.new_zeros(()))
+        a2_fp8, a2_scale = ixfops.fp8_per_token_dynamic_scaled(act)
+    elif swiglu_variant == _STEP3_SWIGLUSTEP_VARIANT:
         # Step-3.5 swiglustep: clamp after silu; ``limit <= 0`` = plain SwiGLU.
         a2_fp8, a2_scale = ixfops.swiglustep_dynamic_scaled_fp8(
             gemm1_out, dst_to_src, float(swiglu_limit or 0.0)
@@ -623,6 +691,8 @@ def ilu_mxfp4_fused_experts(
     w2_bias: torch.Tensor | None = None,
     backend: str | None = None,
     swiglu_variant: str = _DSV4_CLAMP_VARIANT,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
 ) -> torch.Tensor:
     """Dispatcher for the routed MXFP4 expert compute.
 
@@ -632,9 +702,11 @@ def ilu_mxfp4_fused_experts(
     * ``backend``: force a ``group_gemm_fp4`` backend. ``None`` defers to
       ``VLLM_ILU_MXFP4_MOE_BACKEND``, whose default is ``ixmm``.
     * ``swiglu_variant``: step-4 activation semantics. ``"dsv4_clamp"``
-      (default, DSv4/MXFP4, unchanged) or ``"step3_swiglustep"`` (Step-3.7
-      NVFP4, clamp-after-silu + native no-clamp). Only affects the ixformer
-      path; the torch fallback ignores it (see below).
+      (default, DSv4/MXFP4, unchanged), ``"step3_swiglustep"`` (Step-3.7
+      NVFP4, clamp-after-silu + native no-clamp), or ``"swigluoai"``
+      (MiniMax-M3 MXFP8, community ``swigluoai_uninterleave`` semantics:
+      packed-halves gate/up, alpha inside the sigmoid, ``up + 1``). Only affects
+      the ixformer path; the torch fallback ignores it (see below).
 
     There is no ``run_decode``: ``group_gemm_fp4`` picks gemv vs gemm itself
     from ``M`` (``mode=None``, ``M <= 128`` -> gemv).
@@ -696,4 +768,6 @@ def ilu_mxfp4_fused_experts(
         gemm_backend=be,
         gemm_mode=None,
         swiglu_variant=swiglu_variant,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
     )

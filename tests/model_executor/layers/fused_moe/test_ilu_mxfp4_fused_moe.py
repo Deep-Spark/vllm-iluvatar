@@ -40,6 +40,7 @@ from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
     MXFP4_BLOCK,
     _ilu_mxfp4_fused_experts_ixformer,
     _resolve_backend,
+    _swigluoai_uninterleave,
     dequant_mxfp4_to_bf16,
     ilu_mxfp4_fused_experts,
     ilu_mxfp4_fused_experts_torch,
@@ -52,6 +53,48 @@ _I = 32
 _TOPK = 2
 _TOKENS = 5
 _SWIGLU_LIMIT = 7.0
+
+
+_M3_ALPHA = 1.702
+_M3_BETA = 1.0
+
+
+def test_swigluoai_uninterleave_uses_packed_halves_alpha_and_beta():
+    # First half is gate, second half is up. An interleaved split would pair
+    # [1, 2] and [3, 4] instead and produce a visibly different result.
+    x = torch.tensor([[1.0, 2.0, 3.0, 4.0]], dtype=torch.float32)
+
+    actual = _swigluoai_uninterleave(x, _SWIGLU_LIMIT, alpha=_M3_ALPHA, beta=_M3_BETA)
+
+    gate = x[:, :2].clamp(max=_SWIGLU_LIMIT)
+    up = x[:, 2:].clamp(min=-_SWIGLU_LIMIT, max=_SWIGLU_LIMIT)
+    expected = gate * torch.sigmoid(_M3_ALPHA * gate) * (up + _M3_BETA)
+    interleaved = (
+        x[:, 0::2] * torch.sigmoid(_M3_ALPHA * x[:, 0::2]) * (x[:, 1::2] + _M3_BETA)
+    )
+    torch.testing.assert_close(actual, expected)
+    assert not torch.allclose(actual, interleaved)
+
+
+def test_swigluoai_defaults_match_community_silu_and_mul_with_clamp():
+    """Unset alpha/beta must mean "community fallback", not "MiniMax-M3".
+
+    ``MoEActivation.SWIGLUOAI_UNINTERLEAVE`` is backed by
+    ``SiluAndMulWithClamp`` (alpha 1.0, beta 0.0), i.e. plain
+    ``silu(gate) * up`` -- not the interleaved ``SwigluOAIAndMul`` whose
+    defaults are 1.702 / 1.0. Baking M3's values in as the default would apply
+    M3's activation to any other checkpoint that forgot to pass them.
+    """
+    x = torch.tensor([[0.5, -1.5, 2.0, -0.25]], dtype=torch.float32)
+
+    actual = _swigluoai_uninterleave(x, _SWIGLU_LIMIT)
+
+    gate = x[:, :2].clamp(max=_SWIGLU_LIMIT)
+    up = x[:, 2:].clamp(min=-_SWIGLU_LIMIT, max=_SWIGLU_LIMIT)
+    torch.testing.assert_close(actual, torch.nn.functional.silu(gate) * up)
+    # And the default is genuinely not M3's, or the guard above is pointless.
+    m3 = _swigluoai_uninterleave(x, _SWIGLU_LIMIT, alpha=_M3_ALPHA, beta=_M3_BETA)
+    assert not torch.allclose(actual, m3)
 
 
 def _rand_mxfp4(

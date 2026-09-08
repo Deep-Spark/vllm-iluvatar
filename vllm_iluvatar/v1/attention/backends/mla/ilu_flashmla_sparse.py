@@ -500,11 +500,17 @@ class IluFlashMLASparseImpl(SparseMLACommonImpl[IluFlashMLASparseMetadata]):
         self.v_head_dim = mla_args["v_head_dim"]
         self.kv_b_proj = mla_args["kv_b_proj"]
         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
+        # Keep the indexer, not just the buffer the base class snapshots from it:
+        # under MTP+PP the indexer swaps its buffer between the target and draft
+        # passes, so forward_mqa has to re-read it rather than use the snapshot.
+        self._indexer = indexer
         self.softmax_scale = scale
         # The indexer carries the shared buffer for normal layers; skip-topk
         # layers reuse the explicitly-passed buffer from the previous layer.
         self.topk_indices_buffer: torch.Tensor | None = (
-            indexer.topk_indices_buffer if indexer is not None else topk_indices_buffer
+            self._indexer.topk_indices_buffer
+            if self._indexer is not None
+            else topk_indices_buffer
         )
         # Prefill BF16 kernel requires 64 on Hopper, 128 on Blackwell
         self.prefill_padding = (

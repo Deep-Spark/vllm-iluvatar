@@ -40,6 +40,17 @@ _MIGRATED_MODEL_PACKAGES = {
             "vllm_iluvatar.models.glm_moe_dsa.mtp:IluGlmMoeDsaMTP",
         ),
     ],
+    "vllm_iluvatar.models.minimax_m3": [
+        (
+            "MiniMaxM3SparseForCausalLM",
+            "vllm_iluvatar.models.minimax_m3.model:MiniMaxM3SparseForCausalLM",
+        ),
+        (
+            "MiniMaxM3SparseForConditionalGeneration",
+            "vllm_iluvatar.models.minimax_m3.model:"
+            "MiniMaxM3SparseForConditionalGeneration",
+        ),
+    ],
 }
 
 

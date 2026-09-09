@@ -30,7 +30,7 @@ from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compres
     BaseStandardExperts,
 )
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_utils import (
-    pad_tensor,
+    hidden_padding,
     unpad_tensor,
 )
 
@@ -216,10 +216,8 @@ class IluMoEStandardExpertsW4A8(BaseStandardExperts):
             topk_ids=None,
             smooth_scales=self.w13_input_scale,
             output_format=output_format,
+            output_padding=hidden_padding(input.shape[-1], self.gemm1_info.pad_k),
         )
-
-        if output.shape[-1] != self.gemm1_info.pad_k:
-            output = pad_tensor(output, self.gemm1_info.pad_k)
 
         return output, scale
 
@@ -249,6 +247,9 @@ class IluMoEStandardExpertsW4A8(BaseStandardExperts):
         )
         if output_format is not None:
             kwargs["output_format"] = output_format
+        kwargs["output_padding"] = hidden_padding(
+            self.gemm1_info.get_n() // 2, self.gemm2_info.pad_k
+        )
 
         if use_fused_swiglu_limit:
             output, scale = ixff.swiglu_limit_dynamic_scaled_int8(
@@ -271,8 +272,5 @@ class IluMoEStandardExpertsW4A8(BaseStandardExperts):
                 f"activation {act_value!r}. Supported activations: "
                 f"'silu', 'swiglu', 'swiglustep', 'swigluoai'."
             )
-
-        if output.shape[-1] != self.gemm2_info.pad_k:
-            output = pad_tensor(output, self.gemm2_info.pad_k)
 
         return output, scale

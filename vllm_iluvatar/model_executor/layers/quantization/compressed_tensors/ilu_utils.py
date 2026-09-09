@@ -184,6 +184,13 @@ class W8A8GemmInfo(GemmInfo):
             # k, n
             return (self.k, self.n)
 
+
+def hidden_padding(real_k: int, pad_k: int) -> int:
+    """Extra hidden elements needed to reach kernel-aligned pad_k."""
+    assert pad_k >= real_k, f"pad_k ({pad_k}) must be >= real_k ({real_k})"
+    return pad_k - real_k
+
+
 def pad_tensor(input: torch.Tensor, pad_dim: int):
     # tokens, hidden_size
     assert input.dim() == 2

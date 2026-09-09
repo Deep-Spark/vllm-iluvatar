@@ -44,6 +44,7 @@ from vllm_iluvatar.model_executor.layers.fused_moe.ilu_decode_metadata import (
 )
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_utils import (
     W4A8GroupGemmInfo,
+    hidden_padding,
     pad_tensor,
     replace_with_padded,
     unpad_tensor,
@@ -1120,6 +1121,8 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             _log_fuse_w13_skip(f"runtime error: {exc}")
             return None
 
+        # moe_w4a8_group_gemv_swiglu_quant returns [M, I] and has no
+        # output_padding; keep the follow-up pad so W2 still sees pad_k.
         if i8_out.shape[-1] != self.gemm2_info.pad_k:
             i8_out = pad_tensor(i8_out, self.gemm2_info.pad_k)
         # Keep sorted_token_ids referenced so callers stay symmetric with
@@ -1147,11 +1150,9 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             topk_ids=None,
             smooth_scales=layer.w13_input_scale,
             output_format=output_format,
+            output_padding=hidden_padding(input.shape[-1], self.gemm1_info.pad_k),
             check_valid=check_valid,
         )
-
-        if output.shape[-1] != self.gemm1_info.pad_k:
-            output = pad_tensor(output, self.gemm1_info.pad_k)
 
         return output, scale
 
@@ -1249,6 +1250,11 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         if output_format is not None:
             kwargs["output_format"] = output_format
         kwargs["check_valid"] = check_valid
+        # SwiGLU halves gemm1.N; fuse K-align pad into the quant kernel
+        # instead of a follow-up pad_tensor launch.
+        kwargs["output_padding"] = hidden_padding(
+            self.gemm1_info.get_n() // 2, self.gemm2_info.pad_k
+        )
 
         # Explicit dispatch with whitelist — unknown activations must raise
         # rather than silently falling back to ``swiglu`` and producing wrong
@@ -1282,8 +1288,5 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 f"activation {act_value!r}. Supported activations: "
                 f"'silu', 'swiglu', 'swiglustep', 'swigluoai'."
             )
-
-        if output.shape[-1] != self.gemm2_info.pad_k:
-            output = pad_tensor(output, self.gemm2_info.pad_k)
 
         return output, scale

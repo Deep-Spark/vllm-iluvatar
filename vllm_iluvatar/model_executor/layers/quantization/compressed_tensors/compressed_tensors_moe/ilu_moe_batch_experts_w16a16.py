@@ -5,7 +5,7 @@ Corresponds to:
     vllm/model_executor/layers/quantization/compressed_tensors/
     compressed_tensors_moe/*
 Target   : W16A16 batched expert kernel for Iluvatar MoE.
-Baseline : plugin/vllm 0.24.0 runtime source
+Baseline : plugin/vllm 0.28.0 runtime source
 Why      : Iluvatar DP+EP MoE uses ixformer grouped GEMM/GEMV kernels for
            batched W16A16 experts.
 How      : subclass ``BaseBatchExperts`` and delegate compute to ixformer
@@ -64,7 +64,6 @@ class IluMoEBatchedExpertsW16A16(BaseBatchExperts):
             torch.int8,
         ]
 
-        origin_shape = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
 
         num_tokens, hidden_size = hidden_states.size()
@@ -72,7 +71,6 @@ class IluMoEBatchedExpertsW16A16(BaseBatchExperts):
             return hidden_states
 
         num_experts, N, _ = w1.size()
-        top_k = topk_weights.size(1)
 
         w1_bias = self.w1_bias
         w2_bias = self.w2_bias

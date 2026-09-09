@@ -1,30 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 """Corresponds to: vllm/v1/core/kv_cache_utils.py
 
-ILU override implementations for Attention quantization support and for the
-DeepSeek-V4 KV cache tensor layout.
+ILU override implementations for attention quantization (Int8 KV cache
+scale) support.
 
 Target   : vllm.v1.core.kv_cache_utils.get_kv_cache_configs
            vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
-           vllm.v1.core.kv_cache_utils._get_kv_cache_config_packed
-           vllm.v1.core.kv_cache_utils._pool_bytes_per_block
-Baseline : main_6e448d0
-Why      : Iluvatar attention quantization Int8 support.
-           For allocating kv cache scales and adjust the num gpu blocks.
-           DeepSeek-V4 cannot use the community packed layout, which lets cache
-           groups of unequal page size nest inside one block slab.
-How      : get_kv_cache_configs: full-method copy with one delta.
-           get_kv_cache_config_from_groups: super method call with deltas.
-           _get_kv_cache_config_packed / _pool_bytes_per_block: DeepSeek-V4 gets
-           one tensor per (page size, slot); other layouts defer to community.
-Scope    : quantization overrides are enabled if attention quantization is
-           enabled; the layout overrides are always installed and select
-           DeepSeek-V4 per worker at plan time.
-Remove   : When upstream support int8 kv cache quantization, and when upstream
-           stops planning DeepSeek-V4 through the packed layout.
+Baseline : main_a67969c5a0
+Why      : Iluvatar attention quantization Int8 support — for allocating
+           KV cache scales and adjusting the num gpu blocks.
+How      : get_kv_cache_configs: full-method copy with one delta (shrink the
+           kv scale size proportionally when clamping num_blocks to the min
+           across workers).
+           get_kv_cache_config_from_groups: super method call with deltas
+           (size the K-scale buffer and recompute num_blocks against the
+           scale-aware memory budget).
+Scope    : only active when attention quantization is enabled
+           (VLLM_ILU_FLASH_ATTN_QUANT_TYPE / VLLM_ILU_MLA_ATTN_QUANT_TYPE);
+           see ilu_patch/general_patches/patch_kv_cache_utils.py.
+Remove   : When upstream supports int8 kv cache quantization.
+
+NOTE: the DeepSeek-V4 packed-layout override that previously rebound
+``_get_kv_cache_config_packed`` and ``_pool_bytes_per_block`` (installed by
+``ilu_patch/general_patches/patch_dsv4_kv_cache_layout.py``) has been
+removed; this module now imports ``_pool_bytes_per_block`` straight from the
+community and only keeps the attention-quantization deltas.
 """
 
-from collections import defaultdict
 from typing import Any
 
 from vllm.config import VllmConfig
@@ -35,7 +37,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
-    KVCacheTensor,
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -43,8 +44,6 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 origin_get_kv_cache_config_from_groups = kv_cache_utils.get_kv_cache_config_from_groups
-origin_get_kv_cache_config_packed = kv_cache_utils._get_kv_cache_config_packed
-origin_pool_bytes_per_block = kv_cache_utils._pool_bytes_per_block
 
 _SCALE_KV_SPEC_TYPES = (FullAttentionSpec, MLAAttentionSpec)
 
@@ -313,109 +312,3 @@ def get_kv_cache_config_from_groups(
 
     config.num_blocks = new_blocks
     return config
-
-
-def _cross_layers_blocks_opt_in(vllm_config: VllmConfig) -> bool:
-    """Mirror the community opt-in for the packed cross-layer block slab."""
-    kv_transfer_config = vllm_config.kv_transfer_config
-    extra_config = (
-        kv_transfer_config.kv_connector_extra_config
-        if kv_transfer_config is not None
-        else {}
-    )
-    return (
-        str(extra_config.get("enable_cross_layers_blocks", "False")).lower() == "true"
-    )
-
-
-def _use_dsv4_kv_cache_layout(
-    vllm_config: VllmConfig,
-    kv_cache_groups: list[KVCacheGroupSpec],
-) -> bool:
-    """Whether these groups get the DeepSeek-V4 layout instead of packed.
-
-    Community reaches the packed layout either for DeepSeek-V4 (every group
-    carrying ``UniformTypeKVCacheSpecs``) or for an explicit
-    ``enable_cross_layers_blocks`` opt-in. Only the former is replaced, so the
-    opt-in keeps getting exactly what it asked for.
-    """
-    if len(kv_cache_groups) <= 1:
-        return False
-    if not all(
-        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-        for group in kv_cache_groups
-    ):
-        return False
-    return not _cross_layers_blocks_opt_in(vllm_config)
-
-
-def _bucket_layers_by_page_size(
-    kv_cache_groups: list[KVCacheGroupSpec],
-) -> dict[int, list[list[str]]]:
-    """Bucket layers so that ``result[page_size][slot_idx]`` lists layer names.
-
-    Layers meet in a slot only when their page sizes are equal, so every layer
-    sharing a tensor carves it identically. Groups have independent block
-    tables, so their block IDs never collide within a shared tensor.
-    """
-    buckets: dict[int, list[list[str]]] = defaultdict(list)
-    for group in kv_cache_groups:
-        spec = group.kv_cache_spec
-        slot_count: dict[int, int] = defaultdict(int)
-        for layer_name in group.layer_names:
-            if isinstance(spec, UniformTypeKVCacheSpecs):
-                page_size = spec.kv_cache_specs[layer_name].page_size_bytes
-            else:
-                page_size = spec.page_size_bytes
-            slot_idx = slot_count[page_size]
-            slot_count[page_size] += 1
-            if slot_idx == len(buckets[page_size]):
-                buckets[page_size].append([])
-            buckets[page_size][slot_idx].append(layer_name)
-    return buckets
-
-
-def _dsv4_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
-    buckets = _bucket_layers_by_page_size(kv_cache_groups)
-    return sum(page_size * len(slots) for page_size, slots in buckets.items())
-
-
-def _get_kv_cache_config_packed(
-    vllm_config: VllmConfig,
-    kv_cache_groups: list[KVCacheGroupSpec],
-    available_memory: int,
-) -> tuple[int, list[KVCacheTensor]]:
-    """Give DeepSeek-V4 one tensor per (page size, slot); else defer upstream.
-
-    The community packed layout restarts every group's byte offsets at 0 inside
-    one shared block slab, so groups whose page sizes differ nest into each
-    other: for DeepSeek-V4 the 20 ratio-128 layers (1168 B pages) all sit inside
-    the first ratio-4 page (37376 B). A block's bytes then only have a meaning
-    once you know which group currently owns that block ID. Emitting a separate
-    tensor per (page size, slot) keeps the meaning unambiguous, paying a larger
-    per-block footprint for it.
-    """
-    if not _use_dsv4_kv_cache_layout(vllm_config, kv_cache_groups):
-        return origin_get_kv_cache_config_packed(
-            vllm_config, kv_cache_groups, available_memory
-        )
-
-    buckets = _bucket_layers_by_page_size(kv_cache_groups)
-    num_blocks = available_memory // _dsv4_bytes_per_block(kv_cache_groups)
-    num_blocks = kv_cache_utils.may_override_num_blocks(vllm_config, num_blocks)
-
-    kv_cache_tensors = [
-        KVCacheTensor(size=page_size * num_blocks, shared_by=slot)
-        for page_size, slots in buckets.items()
-        for slot in slots
-    ]
-    return num_blocks, kv_cache_tensors
-
-
-def _pool_bytes_per_block(
-    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
-) -> int:
-    """Keep the capacity divisor in step with the layout chosen above."""
-    if _use_dsv4_kv_cache_layout(vllm_config, kv_cache_groups):
-        return _dsv4_bytes_per_block(kv_cache_groups)
-    return origin_pool_bytes_per_block(vllm_config, kv_cache_groups)

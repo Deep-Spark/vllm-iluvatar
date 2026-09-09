@@ -76,7 +76,7 @@ def build_dspark_noncausal_swa_indices(
 
     Reproduces ``_compute_dspark_noncausal_swa_indices_kernel``
     (vllm/v1/attention/backends/mla/sparse_swa.py:816-856, baseline
-    main_6e448d0) in Torch. Correctness first; an ixformer kernel can
+    main_a67969c5a0) in Torch. Correctness first; an ixformer kernel can
     replace it once the numerics are pinned down.
     """
     if out_indices is None:

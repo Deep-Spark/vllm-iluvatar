@@ -3,7 +3,7 @@
 
 Corresponds to: vllm/model_executor/models/step3p5_mtp.py
 Target   : arch ``Step3p5MTP``
-Baseline : main_6e448d0
+Baseline : main_a67969c5a0
 Why      : Iluvatar Step3.5 decoder layers retain a separate residual stream
            and return ``(hidden_states, residual)``.
 How      : Promote only the MTP decoder block and consume its first output.

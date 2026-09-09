@@ -9,6 +9,12 @@
 # ``grid_thw`` is the standard HuggingFace vision-model identifier for the
 # (temporal, height, width) grid; ``thw`` is not a typo.
 thw = "thw"
-# ``UE8M0`` (Unsigned Exponent 8M0) is the FP8 block-scale format name used by
-# compressed-tensors; ``UE`` is not a typo of ``USE``/``DUE``.
-UE = "UE"
+# ``spec_token_indx`` / ``non_spec_token_indx`` are existing ILU variable
+# names (short for "index"); ``indx`` is not a typo we want to force-rename.
+indx = "indx"
+# ``UE8M0`` is the unsigned exponent-only 8-bit / 0-mantissa FP8 layout
+# (used by fp8_ds_mla); ``UE`` is not a typo.
+ue = "ue"
+# ``mis-`` prefix (mis-unpacked / mis-sized / mis-aligned, meaning "wrongly")
+# is split by typos on the hyphen and the bare ``mis`` flagged as a typo.
+mis = "mis"

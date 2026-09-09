@@ -4,7 +4,7 @@
 Corresponds to: vllm/v1/engine/core.py
 Target   : DPEngineCoreProc.{
            _should_throttle_prefills,_process_engine_step,_handle_client_request}
-Baseline : main_91eacae36dd
+Baseline : main_a67969c5a0
 Why      : Align replacement prefills across DP ranks before EP execution and
            avoid entering a dummy batch during the short replacement round trip.
            The patch is installed only when VLLM_ILU_DP_ENABLE_SYNC_PREFILLS

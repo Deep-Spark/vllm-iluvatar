@@ -6,7 +6,7 @@ Corresponds to:
     vllm/v1/attention/backends/mla/sparse_swa.py
 
 Target   : ``vllm.v1.attention.backends.mla.sparse_swa``.
-Baseline : main_6e448d0
+Baseline : main_a67969c5a0
 Why      : community warmup imports ``_compute_prefill_metadata_kernel`` from
            ``sparse_swa`` and launches it with Triton kernel syntax. The
            Iluvatar ``sparse_swa`` fork replaces that Triton kernel with

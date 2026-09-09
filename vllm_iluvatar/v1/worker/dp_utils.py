@@ -8,7 +8,7 @@ and signature checks live in
 ``register_general``.
 
 Target   : vllm.v1.worker.dp_utils.coordinate_batch_across_dp
-Baseline : plugin/vllm 0.24.0 runtime source
+Baseline : plugin/vllm 0.28.0 runtime source
 Why      : DeepSeek-V4 hybrid DP+EP must know whether every DP rank is in
            decode-only mode before switching decode to the LL collective path.
            The same coordination also disables CUDA graph replay when any DP

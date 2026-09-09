@@ -6,7 +6,7 @@ Corresponds to:
     the community ``Mxfp4MoeBackend`` kernels own)
 
 Target   : routed MXFP4 expert execution for Iluvatar
-Baseline : main_9c12a81ac
+Baseline : main_a67969c5a0
 Why      : none of the community MXFP4 MoE backends (TRTLLM / DeepGEMM / Marlin /
            FlashInfer / AITER) has an Iluvatar implementation, so the plugin owns
            the compute. Keeping it in a standalone function -- rather than inside

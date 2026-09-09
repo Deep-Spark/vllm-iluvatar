@@ -387,19 +387,16 @@ class IluFusedMoEEP:
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         org_shape = hidden_states.shape
-        if self.experts.is_internal_router:
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=hidden_states,
-                input_ids=input_ids,
-            )
-        else:
-            router_logits, _ = self.gate(hidden_states)
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-            )
+        # Adapted to vLLM 0.28.0: the runner always holds the gate (it was
+        # constructed via ``FusedMoEFactory(gate=gate, ...)``), so it computes
+        # ``router_logits`` internally. ``router_logits=hidden_states`` is the
+        # community ``_forward_fused_moe`` placeholder convention; the
+        # ``is_internal_router`` branch was dropped in the community.
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            router_logits=hidden_states,
+            input_ids=input_ids,
+        )
         return final_hidden_states.view(org_shape)
 
     def forward_dp_ep_deep_ep(

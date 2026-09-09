@@ -5,7 +5,7 @@ ILU wrappers for DP prefill synchronization and replacement-request handling.
 
 Target   : vllm.v1.engine.core.DPEngineCoreProc.{
            _should_throttle_prefills,_process_engine_step,_handle_client_request}
-Baseline : main_91eacae36dd
+Baseline : main_a67969c5a0
 Why      : Closed-loop traffic can deliver replacement prefills to DP ranks at
            different decode steps. Letting the first ready rank immediately
            prefill splits a global EP step into real-prefill and dummy/decode
@@ -29,19 +29,14 @@ How      : Before scheduling, all DP EngineCore ranks synchronize two CPU
 Scope    : Hybrid low-latency decode with plugin global round-robin enabled.
 Remove   : When upstream offers rank-synchronized prefill scheduling and a
            bounded post-completion input-queue wait.
-
-This module also contains the PP + speculative-decode wrappers corresponding
-to the ``main_6e448d0`` baseline.
 """
 
 from __future__ import annotations
 
 import queue
 import time
-from collections.abc import Callable
 from dataclasses import dataclass, field
-from functools import wraps
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
@@ -105,9 +100,7 @@ def _local_prefill_state(scheduler) -> tuple[bool, bool]:
     prefill_ready = bool(scheduler.waiting) or any(
         request.is_prefill_chunk for request in scheduler.running
     )
-    running_decode = any(
-        not request.is_prefill_chunk for request in scheduler.running
-    )
+    running_decode = any(not request.is_prefill_chunk for request in scheduler.running)
     return prefill_ready, running_decode
 
 
@@ -173,8 +166,6 @@ def _make_process_engine_step(orig):
             self.engines_running or self.scheduler.has_unfinished_requests()
         )
         if sync_active:
-            import torch
-
             waiting, running_decode = _local_prefill_state(self.scheduler)
             state = prefill_sync_state.sync_tensor
             assert state is not None
@@ -192,11 +183,7 @@ def _make_process_engine_step(orig):
             # execute exactly one real or dummy worker step. Otherwise worker
             # and EngineCore collectives can advance in different orders.
             self.engines_running = True
-            if (
-                prefill_sync_state.force_throttle
-                and waiting
-                and not running_decode
-            ):
+            if prefill_sync_state.force_throttle and waiting and not running_decode:
                 return False
 
         executed = orig(self)
@@ -220,36 +207,3 @@ def _make_process_engine_step(orig):
         return executed
 
     return _process_engine_step
-
-
-def make_init(original_init: Callable[..., None]) -> Callable[..., None]:
-    """Set the inline-draft transport mode after community initialization."""
-
-    @wraps(original_init)
-    def _ilu_init(self: Any, *args: Any, **kwargs: Any) -> None:
-        original_init(self, *args, **kwargs)
-        # [ILU override] EngineCore.__init__ - delta: PP batch-queue outputs
-        # carry drafts inline rather than through the delayed worker RPC.
-        self.draft_in_model_output = (
-            self.batch_queue is not None and self.use_spec_decode
-        )
-
-    return _ilu_init
-
-
-def make_post_step(original_post_step: Callable[..., None]) -> Callable[..., None]:
-    """Skip the stale draft-token RPC when outputs already carry drafts."""
-
-    @wraps(original_post_step)
-    def _ilu_post_step(self: Any, model_executed: bool) -> None:
-        # [ILU override] EngineCore.post_step - delta: Scheduler receives
-        # draft tokens from ModelRunnerOutput in update_from_output.
-        if getattr(
-            self,
-            "draft_in_model_output",
-            self.batch_queue is not None and self.use_spec_decode,
-        ):
-            return
-        original_post_step(self, model_executed)
-
-    return _ilu_post_step

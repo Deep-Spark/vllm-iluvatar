@@ -438,15 +438,15 @@ class IluGlmMoeDsaMoE(nn.Module, IluFusedMoEEP):
         else:
             experts_in = router_in
 
-        if self.experts.is_internal_router:
-            final_hidden_states = self.experts(
-                hidden_states=experts_in, router_logits=router_in
-            )
-        else:
-            router_logits, _ = self.gate(router_in)
-            final_hidden_states = self.experts(
-                hidden_states=experts_in, router_logits=router_logits
-            )
+        # Adapted to vLLM 0.28.0: the runner always holds the gate (it was
+        # constructed via ``FusedMoEFactory(gate=self.gate, ...)``), so it
+        # computes ``router_logits`` internally. ``router_logits=router_in``
+        # is the community ``_forward_fused_moe`` placeholder convention (the
+        # runner overwrites it with ``self.gate(hidden_states)``); the
+        # ``is_internal_router`` branch was dropped in the community.
+        final_hidden_states = self.experts(
+            hidden_states=experts_in, router_logits=router_in
+        )
         return final_hidden_states.view(org_shape)
 
 

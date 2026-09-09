@@ -49,7 +49,7 @@ from vllm.model_executor.models.deepseek_v2 import (
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.utils.multi_stream_utils import AuxStreamType
+from vllm.utils.multi_stream_utils import EventType
 
 from .model import IluDeepseekV4DecoderLayer
 
@@ -64,7 +64,7 @@ class IluDeepSeekV4MultiTokenPredictorLayer(nn.Module):
         vllm_config: VllmConfig,
         topk_indices_buffer: torch.Tensor,
         prefix: str,
-        aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream] | None = None,
+        aux_stream_dict: dict[EventType, torch.cuda.Stream] | None = None,
     ) -> None:
         super().__init__()
 
@@ -172,10 +172,10 @@ class IluDeepSeekV4MultiTokenPredictor(nn.Module):
         )
 
         # Single Attention aux stream, mirroring IluDeepseekV4Model (the ilu
-        # decoder layer only consumes AuxStreamType.Attention).
+        # decoder layer only consumes EventType.Attention).
         aux_stream_list = [torch.cuda.Stream() for _ in range(1)]
-        aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream] = {
-            AuxStreamType.Attention: aux_stream_list[0],
+        aux_stream_dict: dict[EventType, torch.cuda.Stream] = {
+            EventType.Attention: aux_stream_list[0],
         }
 
         # to map the exact layer index from weights

@@ -8,7 +8,7 @@ Corresponds to:
         SparseMLACommonMetadataBuilder.determine_chunked_prefill_workspace_size
 
 Target   : community MLA / sparse-MLA metadata builders.
-Baseline : main_6e448d0
+Baseline : main_a67969c5a0
 Why      : Iluvatar deployments sometimes need a smaller workspace cap than
            the community 64k formula (e.g. W8A8 kv_b_proj peak memory).
 How      : replace both builders'

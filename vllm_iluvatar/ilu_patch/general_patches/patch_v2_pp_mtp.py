@@ -6,7 +6,7 @@ Corresponds to:
     vllm/v1/worker/gpu/model_runner.py
 
 Target   : V2 GPU model runner under pipeline parallelism + MTP.
-Baseline : main_6e448d0
+Baseline : main_a67969c5a0
 Why      : non-last PP ranks need sampled-token broadcasts with a fixed width
            and need the proposed draft tokens relayed from the last PP rank.
 How      : wrap the small PPHandler methods and GPUModelRunner hooks at

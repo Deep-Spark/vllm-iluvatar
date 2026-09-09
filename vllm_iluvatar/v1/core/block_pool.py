@@ -3,7 +3,7 @@
 
 Corresponds to: vllm/v1/core/block_pool.py
 Target   : BlockPool.free_blocks
-Baseline : main_4cd213ead
+Baseline : main_a67969c5a0
 Why      : Community commit a82f1b388fe changed the free-queue ordering for
            blocks released while prefix caching is disabled.
 How      : Restore the pre-a82f1b388fe hash split and its original comments.

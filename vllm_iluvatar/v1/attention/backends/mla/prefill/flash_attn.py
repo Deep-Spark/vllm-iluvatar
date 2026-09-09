@@ -3,7 +3,7 @@
 
 Corresponds to: vllm/v1/attention/backends/mla/prefill/flash_attn.py
 Target        : FlashAttnPrefillBackend._flash_attn_varlen_diff_headdims
-Baseline      : main_6e448d0
+Baseline      : main_a67969c5a0
 Why           : the paired Iluvatar runtime ``flash_attn_varlen_func`` rejects
                 the community ``output_scale`` kwarg, while ILU MLA still needs
                 the V-dim padding behavior to stay outside community vLLM.
@@ -33,7 +33,7 @@ from vllm_iluvatar.ilu_patch import general_patch as p
 # FlashAttnPrefillBackend._flash_attn_varlen_diff_headdims (4-space method
 # indent), used as the drift anchor by the fingerprint guard.
 #
-# Baseline: main_b35ff5f7739e
+# Baseline: main_a67969c5a0
 _FLASH_ATTN_VARLEN_DIFF_HEADDIMS_BASELINE = """\
     def _flash_attn_varlen_diff_headdims(
         self,

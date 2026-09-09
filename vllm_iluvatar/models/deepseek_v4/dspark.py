@@ -48,7 +48,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.platforms import current_platform
-from vllm.utils.multi_stream_utils import AuxStreamType
+from vllm.utils.multi_stream_utils import EventType
 
 from .model import IluDeepseekV4DecoderLayer
 
@@ -97,7 +97,7 @@ class IluDSparkDeepseekV4Model(nn.Module):
     """Iluvatar DeepSeek-V4 backbone used by the DSpark draft."""
 
     # Ported from vllm/models/deepseek_v4/nvidia/dspark.py:57-198 at
-    # main_6e448d0, with the Iluvatar substitutions documented above.
+    # main_a67969c5a0, with the Iluvatar substitutions documented above.
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None
@@ -132,7 +132,7 @@ class IluDSparkDeepseekV4Model(nn.Module):
             dtype=torch.int32,
             device=current_platform.device_type,
         )
-        aux_stream_dict = {AuxStreamType.Attention: torch.cuda.Stream()}
+        aux_stream_dict = {EventType.Attention: torch.cuda.Stream()}
 
         current_vllm_config = get_current_vllm_config()
         self.layers = nn.ModuleList(
@@ -280,7 +280,7 @@ class IluDSparkDeepseekV4ForCausalLM(nn.Module):
     draft_id_to_target_id = None
 
     # Ported from vllm/models/deepseek_v4/nvidia/dspark.py:268-344 at
-    # main_6e448d0, with the Iluvatar backbone and loader below.
+    # main_a67969c5a0, with the Iluvatar backbone and loader below.
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None

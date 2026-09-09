@@ -22,7 +22,7 @@ assigns the arch, so the community path stays untouched for non-ilu models:
 ``create_draft_parallel_config`` keeps the draft on a single PP stage: ilu MTP
 drafts are one layer and do not implement ``SupportsPP``.
 
-Baseline : main_6e448d0
+Baseline : main_a67969c5a0
 """
 
 from __future__ import annotations

@@ -5,7 +5,7 @@
 Corresponds to: vllm/model_executor/layers/attention/mla_attention.py
 
 Target   : ``MLAAttention`` instances created by the plugin MLA wrapper.
-Baseline : main_6e448d0
+Baseline : main_a67969c5a0
 Why      : Iluvatar MLA backends apply rope/cache updates inside the backend
            ``forward_full`` path and need speculative-decode decode rows expanded
            to token granularity. Keep those deltas out of community vLLM.
@@ -39,11 +39,11 @@ _COMMUNITY_PROCESS_WEIGHTS_AFTER_LOADING = (
 
 
 def wrap_determine_chunked_prefill_workspace_size(
-    community_func: Callable[["VllmConfig"], int],
-) -> Callable[["VllmConfig"], int]:
+    community_func: Callable[[VllmConfig], int],
+) -> Callable[[VllmConfig], int]:
     """Cap workspace rows at ``VLLM_ILU_MLA_CHUNKED_PREFILL_MAX_WS_SIZE``."""
 
-    def determine_chunked_prefill_workspace_size(vllm_config: "VllmConfig") -> int:
+    def determine_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
         original_size = community_func(vllm_config)
         max_ws = envs.VLLM_ILU_MLA_CHUNKED_PREFILL_MAX_WS_SIZE
         if max_ws > 0:
@@ -51,7 +51,6 @@ def wrap_determine_chunked_prefill_workspace_size(
         return original_size
 
     return determine_chunked_prefill_workspace_size
-
 
 
 def install_ilu_mla_attention_overrides(

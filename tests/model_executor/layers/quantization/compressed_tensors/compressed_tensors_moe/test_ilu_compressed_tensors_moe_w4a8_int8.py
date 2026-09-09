@@ -187,3 +187,180 @@ def test_w4a8_decode_uses_decode_token_index_and_group_gemv(monkeypatch):
     fake_ixfops.moe_w4a8_group_gemm.assert_not_called()
     fake_ixfops.moe_compute_token_index.assert_not_called()
     fake_ixfops.moe_compute_token_index_ep.assert_not_called()
+
+
+class _PadGemm1:
+    pad_k = 256
+
+    @staticmethod
+    def get_n():
+        return 384
+
+
+class _PadGemm2:
+    pad_k = 256
+
+
+def _method_with_pad_gemm():
+    method = w4a8_moe.IluCompressedTensorsW4A8Int8MoEMethod.__new__(
+        w4a8_moe.IluCompressedTensorsW4A8Int8MoEMethod
+    )
+    method.gemm1_info = _PadGemm1()
+    method.gemm2_info = _PadGemm2()
+    return method
+
+
+def test_expand_and_quant_fuses_k_padding(monkeypatch):
+    method = _method_with_pad_gemm()
+    captured: dict[str, object] = {}
+
+    def fake_expand(**kwargs):
+        captured.update(kwargs)
+        hidden = kwargs["hidden_states"].shape[-1]
+        padding = kwargs["output_padding"]
+        dst_tokens = kwargs["dst_tokens"]
+        return (
+            torch.zeros((dst_tokens, hidden + padding), dtype=torch.int8),
+            torch.ones(dst_tokens),
+        )
+
+    monkeypatch.setattr(
+        w4a8_moe,
+        "ixfops",
+        SimpleNamespace(moe_expand_input_dynamic_scaled_int8=fake_expand),
+    )
+    monkeypatch.setattr(
+        w4a8_moe,
+        "pad_tensor",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("pad_tensor should not run after fused output_padding")
+        ),
+    )
+
+    hidden = torch.ones((2, 192), dtype=torch.float32)
+    output, _scale = method._expand_and_quant(
+        layer=SimpleNamespace(top_k=8, w13_input_scale=None),
+        input=hidden,
+        expand_tokens=16,
+        sorted_token_ids=torch.arange(16, dtype=torch.int32),
+        src_to_dst=torch.arange(16, dtype=torch.int32),
+        output_format=1,
+        check_valid=True,
+    )
+
+    assert captured["output_padding"] == 64
+    assert captured["output_format"] == 1
+    assert captured["check_valid"] is True
+    assert tuple(output.shape) == (16, 256)
+
+
+def test_activation_and_quant_fuses_k_padding(monkeypatch):
+    method = _method_with_pad_gemm()
+    captured: dict[str, object] = {}
+
+    def fake_act(**kwargs):
+        captured.update(kwargs)
+        rows = kwargs["input"].shape[0]
+        valid = kwargs["input"].shape[-1] // 2
+        padding = kwargs["output_padding"]
+        return (
+            torch.zeros((rows, valid + padding), dtype=torch.int8),
+            torch.ones(rows),
+        )
+
+    monkeypatch.setattr(
+        w4a8_moe,
+        "ixfops",
+        SimpleNamespace(activation_dynamic_scaled_int8=fake_act),
+    )
+    monkeypatch.setattr(
+        w4a8_moe,
+        "pad_tensor",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("pad_tensor should not run after fused output_padding")
+        ),
+    )
+
+    act_in = torch.ones((4, 384), dtype=torch.float32)
+    output, _scale = method._activation_and_quant(
+        layer=SimpleNamespace(
+            activation=SimpleNamespace(value="silu"),
+            w2_input_scale=None,
+        ),
+        input=act_in,
+        sorted_token_ids=torch.arange(4, dtype=torch.int32),
+        output_format=1,
+        check_valid=False,
+    )
+
+    assert captured["output_padding"] == 64
+    assert captured["output_format"] == 1
+    assert captured["act_type"] == "swiglu"
+    assert tuple(output.shape) == (4, 256)
+
+
+def test_standard_experts_expand_and_act_fuse_k_padding(monkeypatch):
+    from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
+        ilu_moe_standard_experts_w4a8 as std_w4a8,
+    )
+
+    experts = std_w4a8.IluMoEStandardExpertsW4A8.__new__(
+        std_w4a8.IluMoEStandardExpertsW4A8
+    )
+    experts.gemm1_info = _PadGemm1()
+    experts.gemm2_info = _PadGemm2()
+    experts.w13_input_scale = None
+    experts.w2_input_scale = None
+    experts.swiglu_limit = None
+
+    expand_kw: dict[str, object] = {}
+    act_kw: dict[str, object] = {}
+
+    def fake_expand(**kwargs):
+        expand_kw.update(kwargs)
+        hidden = kwargs["hidden_states"].shape[-1]
+        padding = kwargs["output_padding"]
+        dst_tokens = kwargs["dst_tokens"]
+        return (
+            torch.zeros((dst_tokens, hidden + padding), dtype=torch.int8),
+            torch.ones(dst_tokens),
+        )
+
+    def fake_act(**kwargs):
+        act_kw.update(kwargs)
+        rows = kwargs["input"].shape[0]
+        valid = kwargs["input"].shape[-1] // 2
+        padding = kwargs["output_padding"]
+        return (
+            torch.zeros((rows, valid + padding), dtype=torch.int8),
+            torch.ones(rows),
+        )
+
+    monkeypatch.setattr(
+        std_w4a8,
+        "ixff",
+        SimpleNamespace(
+            moe_expand_input_dynamic_scaled_int8=fake_expand,
+            activation_dynamic_scaled_int8=fake_act,
+        ),
+    )
+
+    expand_out, _ = experts._expand_and_quant(
+        input=torch.ones((2, 192), dtype=torch.float32),
+        expand_tokens=16,
+        sorted_token_ids=torch.arange(16, dtype=torch.int32),
+        src_to_dst=torch.arange(16, dtype=torch.int32),
+        output_format=0,
+        topk=8,
+    )
+    act_out, _ = experts._activation_and_quant(
+        input=torch.ones((4, 384), dtype=torch.float32),
+        sorted_token_ids=torch.arange(4, dtype=torch.int32),
+        output_format=1,
+        activation=SimpleNamespace(value="swiglu"),
+    )
+
+    assert expand_kw["output_padding"] == 64
+    assert tuple(expand_out.shape) == (16, 256)
+    assert act_kw["output_padding"] == 64
+    assert tuple(act_out.shape) == (4, 256)

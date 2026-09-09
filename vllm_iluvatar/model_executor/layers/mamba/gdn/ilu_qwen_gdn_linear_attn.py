@@ -117,7 +117,7 @@ class IluChunkGatedDeltaRule(ChunkGatedDeltaRule):
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: Any = None,
     ):
-        from vllm_iluvatar.third_party.flash_linear_attention.ops.chunk import (
+        from vllm.third_party.flash_linear_attention.ops.chunk import (
             chunk_gated_delta_rule,
         )
 

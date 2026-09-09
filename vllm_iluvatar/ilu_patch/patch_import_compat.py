@@ -31,11 +31,7 @@ Shims (no-ops on stock CUDA torch):
      lack config keys that upstream vLLM patches or serializes during compile
      setup/cache-key creation, so add compatible no-op defaults before vLLM
      builds the config.
-  5. Triton Gluon import surface — community ``vllm.triton_utils`` imports
-     ``triton.experimental.gluon`` and ``triton.language.core._aggregate`` at
-     module scope. Older CoreX Triton builds do not ship those symbols, so add
-     import-only stand-ins before ``vllm.triton_utils`` is imported.
-  6. torch.ops._C compile-only quant schemas — compilation fusion modules bind
+  5. torch.ops._C compile-only quant schemas — compilation fusion modules bind
      several FP8 quant op overloads at import time. Register missing schemas as
      real dispatcher ops so FX matchers can import even when CoreX does not ship
      these CUDA kernels.
@@ -316,7 +312,6 @@ def _stub_symmetric_memory() -> None:
     ``_disable_unsupported_symmetric_memory`` (below) ensures the actual usage
     is gated off via ``VLLM_ALLREDUCE_USE_SYMM_MEM=0``.
     """
-    import sys
 
     key = "torch.distributed._symmetric_memory"
     module = sys.modules.setdefault(key, types.ModuleType(key))
@@ -333,121 +328,41 @@ def _disable_unsupported_symmetric_memory() -> None:
         os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
 
 
-def _patch_triton_gdc_symbols() -> None:
-    """Provide no-op Triton GDC symbols for CoreX AST dependency scanning.
+def _install_import_shims() -> None:
+    # Inject module *stand-in* shims into sys.modules BEFORE any deep
+    # ``import vllm``.  Unlike the attribute-level shims above, these replace a
+    # whole community module that would otherwise be imported at import-time and
+    # fail / pull NV-specific code on corex (e.g. vllm.vllm_flash_attn, imported
+    # by the community fa_utils ``is_cuda()`` branch — IluPlatform is cuda-like,
+    # so that branch runs).  Each stand-in lives in import_shims/ mirroring the
+    # upstream module name; install_all() auto-discovers and injects them.
+    from vllm_iluvatar.ilu_patch.import_shims import install_all
 
-    vLLM's LoRA Triton kernels reference ``tl.extra.cuda.gdc_*`` inside
-    constexpr-gated branches. Even when PDL/GDC is disabled at runtime, Triton
-    still resolves those helper symbols while building the JIT cache key. CoreX
-    Triton does not expose them, so install no-op helpers early enough for the
-    dependency scan to succeed.
-    """
-    try:
-        import triton
-        import triton.language as tl
-    except Exception:
-        return
-
-    extra = getattr(tl, "extra", None)
-    if extra is None:
-        return
-
-    cuda_extra = getattr(extra, "cuda", None)
-    if cuda_extra is None:
-        cuda_extra = types.SimpleNamespace()
-        extra.cuda = cuda_extra
-
-    if not hasattr(cuda_extra, "gdc_wait"):
-
-        @triton.jit
-        def _ilu_gdc_wait():
-            pass
-
-        cuda_extra.gdc_wait = _ilu_gdc_wait
-
-    if not hasattr(cuda_extra, "gdc_launch_dependents"):
-
-        @triton.jit
-        def _ilu_gdc_launch_dependents():
-            pass
-
-        cuda_extra.gdc_launch_dependents = _ilu_gdc_launch_dependents
+    install_all()
 
 
-class _IluGluonPlaceholder:
-    """Import-only placeholder for unavailable Triton Gluon symbols."""
-
-    def __getattr__(self, _name: str):
-        return self
-
-    def __call__(self, *args, **kwargs):
-        del kwargs
-        if len(args) == 1 and callable(args[0]):
-            return args[0]
-        return self
+def _register_import_hooks() -> None:
+    # Register post-import splat hooks (e.g. vllm._custom_ops) so ILU overrides
+    # apply the moment the target community module finishes importing — early
+    # enough for import-time uses in spawned subprocesses, where general_plugins
+    # would run too late.  This only REGISTERS the hooks; the target modules are
+    # NOT imported here, so no heavy deps / platform resolution / ixformer are
+    # forced.  Each patch_<target>.py calls import_hook.register(...) at import.
+    import vllm_iluvatar.ilu_patch.patch_custom_ops  # noqa: F401
+    import vllm_iluvatar.ilu_patch.patch_pynvml  # noqa: F401
 
 
-def _identity_aggregate(obj=None, *args, **kwargs):
-    del args, kwargs
-    if obj is None:
-        return lambda wrapped: wrapped
-    return obj
+def _load_native_torch_ops() -> None:
+    # Import the native ``vllm_iluvatar._C`` extension so its TORCH_LIBRARY static
+    # registrations populate ``torch.ops._C.{rms_norm, weak_ref_tensor,
+    # get_cuda_view_from_cpu_tensor}`` BEFORE unmodified community code
+    # (vllm/kernels/vllm_c.py, vllm/utils/torch_utils.py) first calls them.
+    # Non-fatal in non-strict mode: a missing build degrades gracefully (the
+    # community call would then raise with a clear torch error), and dev hosts
+    # without the compiled extension still import the plugin.
+    from vllm_iluvatar.ilu_util.torch_ops_c import load_native_ops
 
-
-def _patch_triton_gluon_symbols() -> None:
-    """Provide import-time Triton Gluon symbols missing in older CoreX Triton.
-
-    These stand-ins are intentionally minimal. They let community modules that
-    merely import ``vllm.triton_utils`` start up; they are not a real Gluon
-    backend implementation.
-    """
-    try:
-        import triton  # noqa: F401
-        import triton.language.core as tl_core
-    except Exception:
-        return
-
-    if not hasattr(tl_core, "_aggregate"):
-        tl_core._aggregate = _identity_aggregate
-
-    try:
-        from triton.experimental import gluon as _gluon  # noqa: F401
-        from triton.experimental.gluon import language as _gl  # noqa: F401
-        return
-    except Exception:
-        pass
-
-    experimental = sys.modules.setdefault(
-        "triton.experimental", types.ModuleType("triton.experimental")
-    )
-    gluon_module = sys.modules.setdefault(
-        "triton.experimental.gluon", types.ModuleType("triton.experimental.gluon")
-    )
-    language_module = sys.modules.setdefault(
-        "triton.experimental.gluon.language",
-        types.ModuleType("triton.experimental.gluon.language"),
-    )
-    for module in (experimental, gluon_module, language_module):
-        module.__file__ = "<vllm_iluvatar.triton_gluon_shim>"
-
-    placeholder = _IluGluonPlaceholder()
-    for name in ("jit", "constexpr_function"):
-        if not hasattr(gluon_module, name):
-            setattr(gluon_module, name, _identity_aggregate)
-    if not hasattr(gluon_module, "language"):
-        gluon_module.language = language_module
-
-    def _language_getattr(_name: str):
-        if _name.startswith("__"):
-            raise AttributeError(_name)
-        return placeholder
-
-    language_module.__getattr__ = _language_getattr
-    if not hasattr(language_module, "constexpr"):
-        language_module.constexpr = placeholder
-
-    if not hasattr(experimental, "gluon"):
-        experimental.gluon = gluon_module
+    load_native_ops(strict=False)
 
 
 class _IluMiniMaxM3NvidiaPlaceholder:
@@ -461,7 +376,6 @@ class _IluMiniMaxM3NvidiaPlaceholder:
         if len(args) == 1 and callable(args[0]):
             return args[0]
         return self
-
 
 
 def _patch_minimax_m3_nvidia_entrypoints() -> None:
@@ -525,43 +439,6 @@ def _patch_minimax_m3_nvidia_entrypoints() -> None:
     mtp_module.__getattr__ = _model_getattr
 
 
-def _install_import_shims() -> None:
-    # Inject module *stand-in* shims into sys.modules BEFORE any deep
-    # ``import vllm``.  Unlike the attribute-level shims above, these replace a
-    # whole community module that would otherwise be imported at import-time and
-    # fail / pull NV-specific code on corex (e.g. vllm.vllm_flash_attn, imported
-    # by the community fa_utils ``is_cuda()`` branch — IluPlatform is cuda-like,
-    # so that branch runs).  Each stand-in lives in import_shims/ mirroring the
-    # upstream module name; install_all() auto-discovers and injects them.
-    from vllm_iluvatar.ilu_patch.import_shims import install_all
-
-    install_all()
-
-
-def _register_import_hooks() -> None:
-    # Register post-import splat hooks (e.g. vllm._custom_ops) so ILU overrides
-    # apply the moment the target community module finishes importing — early
-    # enough for import-time uses in spawned subprocesses, where general_plugins
-    # would run too late.  This only REGISTERS the hooks; the target modules are
-    # NOT imported here, so no heavy deps / platform resolution / ixformer are
-    # forced.  Each patch_<target>.py calls import_hook.register(...) at import.
-    import vllm_iluvatar.ilu_patch.patch_custom_ops  # noqa: F401
-    import vllm_iluvatar.ilu_patch.patch_pynvml  # noqa: F401
-
-
-def _load_native_torch_ops() -> None:
-    # Import the native ``vllm_iluvatar._C`` extension so its TORCH_LIBRARY static
-    # registrations populate ``torch.ops._C.{rms_norm, weak_ref_tensor,
-    # get_cuda_view_from_cpu_tensor}`` BEFORE unmodified community code
-    # (vllm/kernels/vllm_c.py, vllm/utils/torch_utils.py) first calls them.
-    # Non-fatal in non-strict mode: a missing build degrades gracefully (the
-    # community call would then raise with a clear torch error), and dev hosts
-    # without the compiled extension still import the plugin.
-    from vllm_iluvatar.ilu_util.torch_ops_c import load_native_ops
-
-    load_native_ops(strict=False)
-
-
 def apply() -> None:
     """Apply all early compat shims.  Idempotent and defensive."""
     global _applied
@@ -570,8 +447,6 @@ def apply() -> None:
     _applied = True
     try:
         _patch_torch()
-        _patch_triton_gluon_symbols()
-        _patch_triton_gdc_symbols()
         _stub_symmetric_memory()
         _disable_unsupported_symmetric_memory()
         _patch_minimax_m3_nvidia_entrypoints()

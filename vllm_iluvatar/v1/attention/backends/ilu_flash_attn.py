@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Iluvatar Flash Attention backend metadata.
 Corresponds to: vllm/v1/attention/backends/flash_attn.py
-Baseline: main_6e448d0
+Baseline: main_a67969c5a0
 Why: Iluvatar optimized flash attention kernels.
 How: Reuse the official ``FLASH_ATTN`` enum member via platform backend
      registration.

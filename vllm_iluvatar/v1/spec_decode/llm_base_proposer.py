@@ -11,7 +11,7 @@ draft ``DeepseekV32MTPModel`` follow the same tuple contract, so this wrapper
 returns ``True`` for them and otherwise delegates to the community implementation
 unchanged.
 
-Baseline : main_6e448d0
+Baseline : main_a67969c5a0
 """
 
 from __future__ import annotations

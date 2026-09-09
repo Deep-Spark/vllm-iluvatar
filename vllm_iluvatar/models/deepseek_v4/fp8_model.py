@@ -431,9 +431,12 @@ class IluDeepseekV4Fp8MoE(nn.Module):
         EP/TP all-reduce.  ``routed_scaling_factor`` is likewise handled by the
         router (multiplied into ``topk_weights``).
 
-        ``is_internal_router`` is true because ``FusedMoE`` was constructed with
-        ``gate=self.gate``, so ``router_logits`` is a placeholder and the real
-        gate GEMM runs inside the runner.
+        Adapted to vLLM 0.28.0: the runner always holds the gate (it was
+        constructed via ``FusedMoEFactory(gate=self.gate, ...)``), so
+        ``router_logits`` is a placeholder (``hidden_states``) and the real
+        gate GEMM runs inside the runner (see ``MoERunner._forward_impl``).
+        The community dropped the ``is_internal_router`` branch, so it is
+        dropped here too.
         """
         if self.gate.tid2eid is not None:
             if input_ids is None:
@@ -441,19 +444,11 @@ class IluDeepseekV4Fp8MoE(nn.Module):
             input_ids = input_ids.to(dtype=self.hash_indices_dtype)
 
         org_shape = hidden_states.shape
-        if self.experts.is_internal_router:
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=hidden_states,
-                input_ids=input_ids,
-            )
-        else:
-            router_logits, _ = self.gate(hidden_states)
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-            )
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            router_logits=hidden_states,
+            input_ids=input_ids,
+        )
         return final_hidden_states.view(org_shape)
 
 

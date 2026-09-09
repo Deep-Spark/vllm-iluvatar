@@ -6,7 +6,7 @@ Corresponds to: vllm/model_executor/layers/quantization/fp8.py
 Target   : vllm.model_executor.layers.quantization.fp8.Fp8Config
            (registered under the name ``fp8``), its serialized linear branch,
            and its block-wise ``Fp8MoEMethod`` routed-expert branch.
-Baseline : main_9c12a81ac
+Baseline : main_a67969c5a0
 Why      : the block-FP8 checkpoint (``quant_method="fp8"`` +
            ``weight_block_size=[128,128]`` + ``activation_scheme="dynamic"``)
            routes routed experts to community ``Fp8MoEMethod.__init__``, which

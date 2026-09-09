@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Iluvatar SharedExperts override.
 
-Baseline : community ``runner/shared_experts.py`` @ main_6e448d0
+Baseline : community ``runner/shared_experts.py`` @ main_a67969c5a0
 Delta    : override ``_disable_shared_experts_overlap`` to always allow
            multi-stream overlap (controlled by VLLM_DISABLE_SHARED_EXPERTS_STREAM
            env var instead of the community eplb / flashinfer checks).

@@ -97,7 +97,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.utils.multi_stream_utils import AuxStreamType
+from vllm.utils.multi_stream_utils import EventType
 
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
     IluFusedMoEEP,
@@ -528,19 +528,19 @@ class IluDeepseekV4MoE(nn.Module, IluFusedMoEEP):
             return final_hidden_states.view(org_shape)
 
         assert shared_gate_up_input is None
-        if self.experts.is_internal_router:
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=hidden_states,
-                input_ids=input_ids,
-            )
-        else:
-            router_logits, _ = self.gate(hidden_states)
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-            )
+        # Adapted to vLLM 0.28.0: the runner always holds the gate (it was
+        # passed via ``FusedMoEFactory(gate=self.gate, ...)``), so it computes
+        # ``router_logits`` internally. ``router_logits=hidden_states`` is the
+        # community ``_forward_fused_moe`` placeholder convention; the runner
+        # overwrites it with ``self.gate(hidden_states)`` (see MoERunner
+        # ``_forward_impl``). The old ``is_internal_router`` branch (and the
+        # model-side ``self.gate`` call) is gone in the community, so it is
+        # dropped here too.
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            router_logits=hidden_states,
+            input_ids=input_ids,
+        )
         return final_hidden_states.view(org_shape)
 
 
@@ -735,7 +735,7 @@ class IluDeepseekV4DecoderLayer(nn.Module):
         vllm_config: VllmConfig,
         prefix: str,
         topk_indices_buffer: torch.Tensor | None = None,
-        aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream] | None = None,
+        aux_stream_dict: dict[EventType, torch.cuda.Stream] | None = None,
         hc_pre_fusion: _HcPreNormFusion | None = None,
     ) -> None:
         super().__init__()
@@ -748,7 +748,7 @@ class IluDeepseekV4DecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
             aux_stream=(
-                aux_stream_dict.get(AuxStreamType.Attention)
+                aux_stream_dict.get(EventType.Attention)
                 if aux_stream_dict is not None
                 else None
             ),
@@ -1005,8 +1005,8 @@ class IluDeepseekV4Model(nn.Module):
         self.rms_norm_eps = config.rms_norm_eps
 
         aux_stream_list = [torch.cuda.Stream() for _ in range(1)]
-        self.aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream] = {
-            AuxStreamType.Attention: aux_stream_list[0],
+        self.aux_stream_dict: dict[EventType, torch.cuda.Stream] = {
+            EventType.Attention: aux_stream_list[0],
         }
 
         self.device = current_platform.device_type

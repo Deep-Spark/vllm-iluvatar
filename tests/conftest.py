@@ -52,23 +52,6 @@ def _compiled_cuda_arch() -> str | None:
 COMPILED_CUDA_ARCH = _compiled_cuda_arch()
 
 
-def _apply_triton_jit_compat_patch() -> None:
-    """Drop the unsupported Triton ``do_not_specialize_on_alignment`` kwarg.
-
-    Community kernels (e.g. ``vllm.model_executor.layers.mamba.ops.causal_conv1d``)
-    call ``@triton.jit(do_not_specialize_on_alignment=...)`` at import time, which
-    the Iluvatar Triton build rejects. In production this shim runs via
-    ``register_general()``; tests skip that boot path, so apply it at conftest
-    import (before any test module is collected/imported).
-    """
-    from vllm_iluvatar.ilu_patch.general_patches import patch_triton_jit_compat
-
-    patch_triton_jit_compat.register()
-
-
-_apply_triton_jit_compat_patch()
-
-
 @pytest.fixture(autouse=True)
 def reset_default_torch_device():
     """Restore the default torch device after each test.

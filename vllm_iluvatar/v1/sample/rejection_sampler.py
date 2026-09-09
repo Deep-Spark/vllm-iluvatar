@@ -12,13 +12,12 @@ CoreX also needs float32 uniform randoms because float64 CUDA tensors are not
 reliable on this backend, and deterministic draft sampling avoids the upstream
 NO_DRAFT_PROBS Triton recovered-token path that produces wrong tokens here.
 
-Baseline : main_6e448d0
+Baseline : main_a67969c5a0
 """
 
 from __future__ import annotations
 
 import torch
-
 from vllm.triton_utils import tl, triton
 from vllm.v1.sample import rejection_sampler as _community
 from vllm.v1.sample.metadata import SamplingMetadata

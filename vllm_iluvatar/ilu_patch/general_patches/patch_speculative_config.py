@@ -13,7 +13,7 @@ Target   : vllm.config.speculative.SpeculativeConfig.hf_config_override
            vllm.config.speculative.SpeculativeConfig.__post_init__
            vllm.config.speculative.SpeculativeConfig.create_draft_parallel_config
            vllm.engine.arg_utils.EngineArgs.create_speculative_config
-Baseline : main_6e448d0
+Baseline : main_a67969c5a0
 Why      : re-point the draft architecture to the ilu W4A8 self-contained draft
            models (DeepseekV32MTPModel / IluGlmMoeDsaMTPModel /
            DeepSeekV4MTPModel for MTP, IluDSparkDraftModel for DSpark) for the

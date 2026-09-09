@@ -6,7 +6,7 @@ Corresponds to:
     compressed_tensors_moe/compressed_tensors_moe.py
 
 Target   : CompressedTensorsMoEMethod.get_moe_method
-Baseline : main_6e448d0
+Baseline : main_a67969c5a0
 Why      : select Iluvatar W4A8/W8A8 MoE methods from Compressed-Tensors
            weight/activation args plus the per-group ``iluvatar`` block.
 How      : ``patch_compressed_tensors_moe`` installs this staticmethod wrapper;

@@ -104,7 +104,6 @@ def test_decoder_promote_attaches_moe_ep(monkeypatch):
 def _make_stub_moe_block() -> ilu_step3p5.IluFusedMoEBlock:
     block = ilu_step3p5.IluFusedMoEBlock.__new__(ilu_step3p5.IluFusedMoEBlock)
     block.experts = MagicMock()
-    block.experts.is_internal_router = True
     block.gate = MagicMock()
     return block
 

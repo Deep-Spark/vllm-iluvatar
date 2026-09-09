@@ -7,7 +7,7 @@ signature checks live in
 ``register_general``.
 
 Target   : vllm.v1.worker.gpu.pp_utils.PPHandler
-Baseline : main_6e448d0
+Baseline : main_a67969c5a0
 Why      : Under PP + MTP, non-last PP ranks must receive the last rank's
            sampled tokens and proposed draft tokens before their next decode
            verification step. NCCL broadcast also requires every rank to enter

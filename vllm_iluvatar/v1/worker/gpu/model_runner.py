@@ -7,7 +7,7 @@ Runtime wiring and signature checks live in
 ``register_general``.
 
 Target   : vllm.v1.worker.gpu.model_runner.GPUModelRunner
-Baseline : main_6e448d0
+Baseline : main_a67969c5a0
 Why      : In PP+MTP, the draft model/proposer runs on the last PP rank, but
            non-last ranks build later verification inputs too. They therefore
            need the last rank's proposed draft tokens written into

@@ -4,7 +4,7 @@
 Corresponds to: vllm/v1/worker/gpu_model_runner.py
 
 Target   : GPUModelRunner.__init__
-Baseline : main_6e448d0
+Baseline : main_a67969c5a0
 Why      : Community only creates the event under async scheduling. PP
            keeps pp_size in-flight batches, so non-blocking H2D of the
            shared pinned input buffers can race the next step (worse
@@ -54,9 +54,7 @@ def _apply() -> None:
     @functools.wraps(orig_init)
     def __init__(self, *args, **kwargs) -> None:
         orig_init(self, *args, **kwargs)
-        _maybe_arm_prepare_inputs_event(
-            self, lambda: torch.cuda.Event(blocking=True)
-        )
+        _maybe_arm_prepare_inputs_event(self, lambda: torch.cuda.Event(blocking=True))
 
     p.check_signatures(
         GPUModelRunner,

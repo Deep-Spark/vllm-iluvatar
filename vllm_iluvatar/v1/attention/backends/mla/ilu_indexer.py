@@ -310,6 +310,71 @@ def kv_spans_from_batches(
     )
 
 
+def kv_spans_from_batches_device(
+    cu_seqlens_q: torch.Tensor,
+    seq_len_per_batch: torch.Tensor,
+    token_arange_p1: torch.Tensor,
+    num_tokens: int,
+    compress_ratio: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Device-side ``kv_spans_from_batches`` for the decode path.
+
+    Same math as the host version, but every input already lives on the GPU.
+    The host one needs ``seq_lens`` on the CPU, and the spec-decode proposer
+    invalidates ``CommonAttentionMetadata._seq_lens_cpu`` after each draft step
+    (it mutates ``seq_lens`` on device), so reading ``seq_lens_cpu`` there costs
+    a blocking D2H per draft step -- the same stall ``cu_seqlens_q`` and
+    ``cu_seqlens_kv`` above were already moved off the host to avoid.
+
+    Batches here are small enough that every op is launch-bound, and this runs
+    once per model forward plus once per draft step, so the expression is
+    arranged to keep the op count down rather than to read like the host
+    version: ``pos_within``'s ``-q[b]`` cancels the one inside ``counts[b]``,
+    which removes ``counts`` and one gather, and ``batch_id`` comes from a
+    searchsorted over ``cu_seqlens_q`` instead of a repeat_interleave, which
+    would internally redo the prefix sum ``cu_seqlens_q`` already is.
+
+    Args:
+      cu_seqlens_q: int32 [B+1] on device, query start loc relative to the
+                    first decode token.
+      seq_len_per_batch: int32 [B] on device, **uncompressed** sequence length.
+      token_arange_p1: cached int32 ``arange(1, ...)``, at least ``num_tokens``
+                    long. 1-based so the ``+1`` of the within-block position
+                    comes for free; doubles as the searchsorted key.
+      num_tokens: N, the unpadded decode token count. Known on the host from
+                  ``query_start_loc_cpu``, so no sync is needed to size the
+                  slice below.
+    """
+    num_reqs = seq_len_per_batch.numel()
+    if num_tokens == 0:
+        empty = seq_len_per_batch.new_empty(0, dtype=torch.int32)
+        return empty, empty.clone()
+
+    q_end = cu_seqlens_q[1 : num_reqs + 1]
+    positions = token_arange_p1[:num_tokens]
+
+    seq_lens_comp = (
+        seq_len_per_batch // compress_ratio
+        if compress_ratio > 1
+        else seq_len_per_batch
+    )
+    kv_starts_per_batch = torch.cumsum(seq_lens_comp, dim=0, dtype=torch.int32)
+    kv_starts_per_batch -= seq_lens_comp
+
+    # Token i belongs to the first request whose exclusive end exceeds i, i.e.
+    # the first ``q_end`` at or above the 1-based position. Requests
+    # contributing no tokens leave duplicates in ``q_end`` and are skipped.
+    batch_id = torch.searchsorted(q_end, positions)
+    start_tensor = kv_starts_per_batch[batch_id]
+
+    # 1-based position within the selected (last) block, uncompressed domain.
+    local_pos = (seq_len_per_batch - q_end)[batch_id] + positions
+    if compress_ratio > 1:
+        local_pos //= compress_ratio
+
+    return start_tensor, start_tensor + local_pos
+
+
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     max_model_len = vllm_config.model_config.max_model_len
     # NOTE(Chen): 40 is a magic number for controlling the prefill buffer size.
@@ -400,6 +465,14 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             )
         self.decode_position_offsets_buffer = torch.arange(
             scheduler_config.max_num_seqs * next_n,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        # 1-based arange for the device-side cu_seqlen_ks/ke build, kept int32
+        # so that whole computation stays in one dtype.
+        self.decode_token_arange_p1_buffer = torch.arange(
+            1,
+            scheduler_config.max_num_batched_tokens + 1,
             dtype=torch.int32,
             device=self.device,
         )
@@ -560,7 +633,7 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # MTP the verify step schedules ``next_n = 1 + num_speculative_tokens``
         # query tokens per request, so each request emits multiple decode
         # tokens. We mirror ``build_one_prefill_chunk``: build per-query-token
-        # ``cu_seqlen_ks/ke`` via ``kv_spans_from_batches`` and a per-request
+        # ``cu_seqlen_ks/ke`` via ``kv_spans_from_batches_device`` and a per-request
         # ``cu_seqlens_q`` so the (shared with prefill) kernel
         # ``dsa_indexer_mqa_logits_with_blocks`` handles >1 query per request.
         #
@@ -606,18 +679,6 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             and (nonzero_lens.max() != nonzero_lens.min()).item()
         )
 
-        # Calculate decode metadata parameters in **compressed** domain when
-        # the indexer cache uses compression (V4: compress_ratio == 4).
-        # ``seq_lens_decode_uncomp`` is what vLLM tracks in token domain;
-        # the indexer kernels (dsa_indexer_mqa_logits_with_blocks /
-        # dsa_update_topk_indices) and the K-cache itself live in the
-        # compressed domain.
-        compress_ratio = self.compress_ratio
-        seq_lens_decode_uncomp = common_attn_metadata.seq_lens_cpu[:num_decodes]
-        if compress_ratio > 1:
-            seq_lens_decode = seq_lens_decode_uncomp // compress_ratio
-        else:
-            seq_lens_decode = seq_lens_decode_uncomp
         # These host scalars are fixed at CUDA graph capture time. Actual
         # per-request lengths remain device-driven through cu_seqlens_kv.
         max_context_len = self.max_decode_context_len
@@ -639,16 +700,20 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         )
         cu_seqlens_q = self.cu_seqlens_q_buffer[: num_decodes + 1]
 
-        # ``kv_spans_from_batches`` treats the selected tokens of a request as
-        # the *last* ``decode_lens[b]`` positions of its sequence, emitting one
+        # ``kv_spans_from_batches_device`` treats the selected tokens of a
+        # request as the *last* ``decode_lens[b]`` positions, emitting one
         # causal ``[ks, ke)`` span per query token in the compressed domain.
         # For MTP this is exactly the per-token causal structure: token j of
         # request b attends to ``L_b - next_n + j + 1`` KV positions.
-        cu_seqlen_ks_tmp, cu_seqlen_ke_tmp = kv_spans_from_batches(
-            decode_qsl_cpu,
-            seq_lens_decode_uncomp,
-            self.device,
-            compress_ratio=compress_ratio,
+        # Built device-side: the host variant needs ``seq_lens_cpu``, which the
+        # spec-decode proposer invalidates every draft step, so it would cost a
+        # blocking D2H per step.
+        cu_seqlen_ks_tmp, cu_seqlen_ke_tmp = kv_spans_from_batches_device(
+            cu_seqlens_q,
+            common_attn_metadata.seq_lens[:num_decodes],
+            self.decode_token_arange_p1_buffer,
+            num_real_decode_tokens,
+            compress_ratio=self.compress_ratio,
         )
 
         # Copy into persistent buffers for CUDA graph address stability. There
@@ -676,11 +741,15 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         # Fill compressed seq_lens buffer in-place for address stability.
         # ``decode_metadata.seq_lens`` is consumed by topk-update / paged-mqa
-        # kernels for the per-token causal masks.
-        if compress_ratio > 1:
+        # kernels for the per-token causal masks. Those kernels
+        # (dsa_indexer_mqa_logits_with_blocks / dsa_update_topk_indices) and the
+        # K-cache itself live in the **compressed** domain when the indexer
+        # cache uses compression (V4: compress_ratio == 4), while vLLM tracks
+        # the token domain.
+        if self.compress_ratio > 1:
             torch.div(
                 common_attn_metadata.seq_lens[:num_decodes],
-                compress_ratio,
+                self.compress_ratio,
                 rounding_mode="floor",
                 out=self.decode_compressed_seq_lens_buffer[:num_decodes],
             )

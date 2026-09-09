@@ -1,10 +1,10 @@
 {
   "name": "vllm-iluvatar",
   "description": "Iluvatar CoreX plugin package for vLLM (out-of-tree platform plugin)",
-  "version": "0.26.0",
+  "version": "0.27.1",
   "changelog": "./changelog.md",
   "dependencies": {
-    "vllm": ">=0.26.0,<0.27.0",
+    "vllm": ">=0.27.1,<0.28.0",
     "torch": ">=2.10.0",
     "ixformer": ">=0.7.0",
     "ixruntime": ">=5.0.0",
@@ -12,5 +12,15 @@
     "ixcc": ">=22.1.0",
     "ixsdk": ">=22.1.0"
   },
-  "requirements": "./requirements.txt"
+  "requirements": "./requirements.txt",
+  "pins": {
+    "ixformer": {
+      "branch": "chore/add-ixinfer-ixmm-submodules",
+      "commit": "da239de727b78c983df466214b61a4f482f50acb"
+    },
+    "vllm": {
+      "branch": "iluvatar_main",
+      "commit": "a04c2a2b62dbde7928dd76bb80c7553308d760d9"
+    }
+  }
 }

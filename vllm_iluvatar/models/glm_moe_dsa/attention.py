@@ -859,6 +859,41 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         return output.view(num_tokens, self.num_heads * self.v_head_dim)
 
 
+def glm_dsa_layer_skip_topk(config, layer_id: int) -> bool:
+    """Whether ``layer_id`` reuses a previous ``full`` layer's top-k indices.
+
+    ``full`` layers build a DSA indexer and write ``topk_indices_buffer``;
+    ``shared`` layers only read it. The per-layer ``indexer_types`` list is the
+    source of truth; the ``index_topk_pattern`` ("S") / frequency formula is a
+    fallback for config variants lacking it (both agree on GLM-5.2).
+
+    MTP draft layers (``layer_id >= num_hidden_layers``) always return False:
+    they compute their own top-k at draft step 0 and the proposer toggles
+    ``skip_topk`` for steps 1+ (``index_share_for_mtp_iteration``). True here
+    would leave no indexer built and the draft reading a never-written buffer.
+    Mirrors community deepseek_v2.py's is_mtp_layer.
+
+    ``IluGlmMoeDsaModel`` also uses this to pick which PP stage boundaries
+    carry the buffer, so both callers must agree.
+    """
+    num_hidden_layers = getattr(config, "num_hidden_layers", None)
+    if num_hidden_layers is not None and layer_id >= num_hidden_layers:
+        return False
+
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is not None and 0 <= layer_id < len(indexer_types):
+        return indexer_types[layer_id] != "full"
+
+    index_topk_pattern = getattr(config, "index_topk_pattern", None)
+    if index_topk_pattern is None:
+        index_topk_freq = getattr(config, "index_topk_freq", 1)
+        index_skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
+        return max(layer_id - index_skip_topk_offset + 1, 0) % index_topk_freq != 0
+    if 0 <= layer_id < len(index_topk_pattern):
+        return index_topk_pattern[layer_id] == "S"
+    return False
+
+
 class IluGlmMoeDsaMLAAttention(nn.Module):
     """MLA + DSA attention wrapper for a GLM-5.2 decoder layer (ilu W4A8).
 
@@ -978,40 +1013,10 @@ class IluGlmMoeDsaMLAAttention(nn.Module):
             mscale = _yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
 
-        # DSA indexer is only built on ``full`` layers; ``skip_topk`` (``shared``)
-        # layers reuse the previous full layer's topk buffer, so no indexer is
-        # built there. GLM-5.2 ships an explicit per-layer ``indexer_types``
-        # list ("full"/"shared"), which is the source of truth. Fall back to the
-        # ``index_topk_pattern`` ("S") / frequency formula only if it is absent
-        # (the two are equivalent for the current config, but the explicit list
-        # is more robust to config variants).
+        # DSA indexer is only built on ``full`` layers; ``skip_topk``
+        # (``shared``) layers reuse the previous full layer's topk buffer.
         layer_id = extract_layer_index(prefix)
-        _indexer_types = getattr(config, "indexer_types", None)
-        if _indexer_types is not None and 0 <= layer_id < len(_indexer_types):
-            self.skip_topk = _indexer_types[layer_id] != "full"
-        else:
-            _index_topk_freq = getattr(config, "index_topk_freq", 1)
-            _index_topk_pattern = getattr(config, "index_topk_pattern", None)
-            _index_skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
-            if _index_topk_pattern is None:
-                self.skip_topk = (
-                    max(layer_id - _index_skip_topk_offset + 1, 0) % _index_topk_freq
-                    != 0
-                )
-            elif 0 <= layer_id < len(_index_topk_pattern):
-                self.skip_topk = _index_topk_pattern[layer_id] == "S"
-            else:
-                self.skip_topk = False
-
-        # MTP draft layers (layer_id >= num_hidden_layers) must always build a
-        # ``full`` indexer: they compute their own top-k at draft step 0 and the
-        # proposer toggles skip_topk at runtime for steps 1+
-        # (index_share_for_mtp_iteration). Starting with skip_topk=True here
-        # would leave no indexer built and the draft reading a never-written
-        # top-k buffer. Mirrors community deepseek_v2.py's is_mtp_layer handling.
-        _num_hidden_layers = getattr(config, "num_hidden_layers", None)
-        if _num_hidden_layers is not None and layer_id >= _num_hidden_layers:
-            self.skip_topk = False
+        self.skip_topk = glm_dsa_layer_skip_topk(config, layer_id)
 
         if not self.skip_topk:
             self.indexer = IluGlmMoeDsaIndexer(

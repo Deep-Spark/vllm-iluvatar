@@ -75,7 +75,6 @@ from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
     is_pp_missing_parameter,
-    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
@@ -88,9 +87,14 @@ from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
 from vllm_iluvatar.model_executor.layers.quantization import IluvatarQuantRegistry
 from vllm_iluvatar.models.glm_moe_dsa.attention import (
     IluGlmMoeDsaMLAAttention,
+    glm_dsa_layer_skip_topk,
 )
 
 logger = init_logger(__name__)
+
+# IntermediateTensors key carrying the DSA top-k buffer across a PP stage
+# boundary whose first layer is ``shared`` (see ``IluGlmMoeDsaModel``).
+_TOPK_INDICES_KEY = "topk_indices"
 
 _FUSE_NORM_QUANT_WARNED = False
 
@@ -571,7 +575,7 @@ class IluGlmMoeDsaModel(nn.Module):
 
         # GLM-5.2 is always sparse (V3.2 DSA indexer): the shared top-k buffer
         # is written by ``full`` layers and reused by ``skip_topk`` layers.
-        topk_indices_buffer = torch.empty(
+        self.topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
             config.index_topk,
             dtype=torch.int32,
@@ -593,7 +597,7 @@ class IluGlmMoeDsaModel(nn.Module):
             lambda prefix: IluGlmMoeDsaDecoderLayer(
                 vllm_config=vllm_config,
                 prefix=prefix,
-                topk_indices_buffer=topk_indices_buffer,
+                topk_indices_buffer=self.topk_indices_buffer,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -602,9 +606,32 @@ class IluGlmMoeDsaModel(nn.Module):
             self.norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], self.hidden_size
+
+        # ``topk_indices_buffer`` is PP-rank local while the ``full``/``shared``
+        # split is global: a stage starting on a ``shared`` layer would read
+        # stale contents of its own buffer. Carry it across exactly those
+        # boundaries; a partition starting every stage on ``full`` sends nothing.
+        self.recv_topk = not get_pp_group().is_first_rank and glm_dsa_layer_skip_topk(
+            config, self.start_layer
         )
+        self.send_topk = not get_pp_group().is_last_rank and glm_dsa_layer_skip_topk(
+            config, self.end_layer
+        )
+
+    def make_empty_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        tensors = {
+            key: torch.zeros((batch_size, self.hidden_size), dtype=dtype, device=device)
+            for key in ("hidden_states", "residual")
+        }
+        if self.recv_topk:
+            tensors[_TOPK_INDICES_KEY] = torch.zeros(
+                (batch_size, self.config.index_topk),
+                dtype=torch.int32,
+                device=device,
+            )
+        return IntermediateTensors(tensors)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -626,14 +653,19 @@ class IluGlmMoeDsaModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+            if self.recv_topk:
+                topk_indices = intermediate_tensors[_TOPK_INDICES_KEY]
+                self.topk_indices_buffer[: topk_indices.shape[0]].copy_(topk_indices)
 
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            tensors = {"hidden_states": hidden_states, "residual": residual}
+            if self.send_topk:
+                num_tokens = hidden_states.shape[0]
+                tensors[_TOPK_INDICES_KEY] = self.topk_indices_buffer[:num_tokens]
+            return IntermediateTensors(tensors)
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states

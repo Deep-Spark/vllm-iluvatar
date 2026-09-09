@@ -3,13 +3,21 @@
 本文件记录 `vllm-iluvatar` 的版本变更。格式参考
 [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/)。
 
-**版本号与所适配的 vLLM 版本对齐**：`0.26.0` 适配 vLLM 0.26.0，vLLM 走到
-0.27.0 时插件同步跳到 0.27.0。同一个 vLLM 版本窗口内插件不再手工改版本号，
-其间的日常构建由 CI 追加 `-<git日期>.<git短哈希>-<构建版本>` 后缀区分。
+**版本号与适配的 vLLM 版本保持一致**：`0.26.0` 适配 vLLM 0.26.0;当 vLLM
+更新至 0.27.x 时,插件版本号同步更新。同一 vLLM 版本窗口内不再手工修改插件
+版本号,其间的日常构建由 CI 追加 `-<git 日期>.<git 短哈希>-<构建版本>`
+后缀加以区分。
 
 本文件自 0.26.0 起开始维护，此前的变更请查阅 git 历史。
 
 ## [Unreleased]
+
+### Added
+
+- `version.json` 新增 `pins`,用于在 Docker 构建时固定 ixformer 与 vllm 的 commit。
+- 新增 `third_party/ixformer` 与 `third_party/vllm` 两个 submodule,由本仓库统一管理其版本。
+- 新增 `scripts/build_third_party.sh`,按 submodule 锁定的 commit 编译并安装 ixformer 与 vllm(仅用于开发,不参与打包)。
+- 新增《如何搭建 vllm-iluvatar 开发环境》开发文档。
 
 ### Changed
 

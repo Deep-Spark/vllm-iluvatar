@@ -85,7 +85,8 @@ def _get_k_int8_cache_views(
     # retaining the backend's logical (planes, blocks, ...) shape. Move the
     # block dimension first so each block's two BF16 value-byte planes can be
     # merged without materializing a contiguous copy.
-    if kv_cache.stride(0) < kv_cache.stride(1):
+    blocks_first = kv_cache.stride(0) < kv_cache.stride(1)
+    if blocks_first:
         value_cache_bytes = value_cache_bytes.movedim(1, 0)
 
     num_blocks, num_kv_heads, block_size, head_size = i8_key_cache.shape
@@ -740,6 +741,15 @@ class IluFlashAttentionImpl(AttentionImpl):
             if self.is_post_quant
             else self._forward_fp8,
         }[self.quant_type]
+
+        logger.info_once(
+            "IluFlashAttention quant dispatch: "
+            "VLLM_ILU_FLASH_ATTN_QUANT_TYPE=%r -> quant_type=%r -> forward=%s",
+            envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE,
+            self.quant_type,
+            getattr(self.forward, "__func__", self.forward).__name__,
+            scope="local",
+        )
 
         vllm_config = get_current_vllm_config_or_none()
         dcp_a2a = (

@@ -247,8 +247,13 @@ class IluMoERunner(MoERunner):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         self.routed_experts._ensure_moe_quant_config_init()
-        self._maybe_sync_shared_experts_stream(shared_experts_input)
-
+        # vLLM 0.29.0 removed ``_maybe_sync_shared_experts_stream`` (the
+        # 0.28.0-era pre-dispatch aux-stream sync) and replaced it with
+        # ``SharedExperts.maybe_forward_async`` + ``wait``. ILU does NOT use
+        # pre-dispatch async shared experts — ``_apply_quant_method`` below
+        # orchestrates shared experts synchronously via ``_maybe_apply_shared_experts``
+        # (NO_OVERLAP before routed experts, MULTI_STREAM_OVERLAPPED after), so
+        # there is nothing to sync here. Drop the stale call.
         if self.gate is not None:
             if self._fse_fuse_gate:
                 self._maybe_fuse_gate_weights()

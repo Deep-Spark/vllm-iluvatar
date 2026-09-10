@@ -46,6 +46,7 @@ _ILU_OVERRIDES: list[str] = [
     "topk_hash_softplus_sqrt",
     "topk_sigmoid",
     "topk_softmax",
+    "vocab_parallel_embedding",
 ]
 
 _ILU_ADDED: list[str] = [
@@ -895,3 +896,42 @@ def sparse_prefill_fwd(
     return ixf_ops.sparse_flash_attn(
         q, kv, indices, sm_scale, d_v, topk_length=topk_length
     )
+
+
+# Fused vocab-parallel embedding lookup (pure-torch ILU fallback).
+# Community 0.29.0 added a fused ``torch.ops._C.vocab_parallel_embedding`` kernel
+# (commit e2c8eeac40, "[kernel] Fused embedding kernel") used by
+# VocabParallelEmbedding.forward when ``use_fused_embedding`` is True (TP>1 +
+# cuda + unquantized). The Iluvatar plugin _C does not register that op, so
+# replicate the kernel's semantics — range mask, id shift, gather, out-of-shard
+# zeroing — in pure torch. This mirrors the community
+# ``get_masked_input_and_mask`` + ``embedding`` + masked_fill path that 0.28.0
+# used; an all-reduce over TP ranks still yields the full embedding.
+def vocab_parallel_embedding(
+    input_ids: torch.Tensor,
+    weight: torch.Tensor,
+    org_vocab_start_index: int,
+    org_vocab_end_index: int,
+    num_org_vocab_padding: int,
+    added_vocab_start_index: int,
+    added_vocab_end_index: int,
+) -> torch.Tensor:
+    input_ = input_ids.long()
+    org_vocab_mask = (input_ >= org_vocab_start_index) & (input_ < org_vocab_end_index)
+    added_vocab_mask = (input_ >= added_vocab_start_index) & (
+        input_ < added_vocab_end_index
+    )
+    added_offset = (
+        added_vocab_start_index
+        - (org_vocab_end_index - org_vocab_start_index)
+        - num_org_vocab_padding
+    )
+    valid_offset = (org_vocab_start_index * org_vocab_mask) + (
+        added_offset * added_vocab_mask
+    )
+    vocab_mask = org_vocab_mask | added_vocab_mask
+    # Out-of-shard tokens map to row 0 here and are zeroed below.
+    local_ids = vocab_mask * (input_ - valid_offset)
+    out = F.embedding(local_ids, weight)
+    out = out * vocab_mask.unsqueeze(-1).to(out.dtype)
+    return out

@@ -236,6 +236,11 @@ class IluGlmMoeDsaIndexerCache(torch.nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # [B, H=1, N, C] -> [B, N, C]: the indexer kernels index a 3-D
+        # block-major cache (see ixf_ops.indexer_k_cache dim==3 assert).
+        self.kv_cache = kv_cache.squeeze(1)
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         return MLAAttentionSpec(
             block_size=self.cache_config.block_size,
@@ -655,6 +660,11 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # [B, H=1, N, C] -> [B, N, C]: the sparse MLA ixformer kernels
+        # (fused_glm_dsa_*_kv_insert / dsa_flash_mla_*) index a 3-D cache.
+        self.kv_cache = kv_cache.squeeze(1)
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return IluFlashMLASparseBackend

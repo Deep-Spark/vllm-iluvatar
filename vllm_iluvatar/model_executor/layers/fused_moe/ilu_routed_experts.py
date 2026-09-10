@@ -255,6 +255,20 @@ def weight_loader(
             FusedMoeWeightScaleSupported.GROUP.value,
             FusedMoeWeightScaleSupported.BLOCK.value,
         ]:
+            scale_refine = getattr(self.quant_method, "weight_scale_refine", None)
+            if (
+                quant_method == FusedMoeWeightScaleSupported.BLOCK.value
+                and scale_refine is not None
+            ):
+                # FP8 block scales are stored per (block_n, block_k) tile
+                # of the unsharded weight, while the TP-sharded parameters
+                # use a refined block grid (see Fp8MoEMethod). Upsample the
+                # scales to the refined grid (lossless: the refined block
+                # divides the checkpoint block) so per-rank slicing stays
+                # exact. Dim -2 is the weight's N dim, dim -1 is K.
+                loaded_weight = loaded_weight.repeat_interleave(
+                    scale_refine[0], dim=-2
+                ).repeat_interleave(scale_refine[1], dim=-1)
             self._load_model_weight_or_group_weight_scale(
                 shard_id=shard_id,
                 shard_dim=shard_dim,
@@ -802,44 +816,6 @@ class IluRoutedExperts(RoutedExperts):
         # based on the shard id. This will be whatever
         # dimension intermediate_size_per_partition is used.
         SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
-
-        # Case for BitsAndBytes
-        use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
-        if use_bitsandbytes_4bit:
-            shard_dim = 0
-
-            expert_data = param.data[expert_id]
-            if shard_id == "w2":
-                # BnB params are stored as flat packed tensors (e.g.
-                # (packed_size, 1)), not in the logical weight layout.
-                # Narrowing packed data for hidden-dim padding is not
-                # meaningful, so require an exact shape match.
-                if expert_data.shape != loaded_weight.shape:
-                    raise ValueError(
-                        "BitsAndBytes quantization with padded hidden_size "
-                        "(e.g., from DeepEP) is not supported. "
-                        f"Parameter shape {tuple(expert_data.shape)} != "
-                        f"checkpoint shape {tuple(loaded_weight.shape)}"
-                    )
-                expert_data.copy_(loaded_weight)
-            elif shard_id in ("w1", "w3"):
-                # BnB stores weights as flat packed tensors.  _load_w13 is
-                # still used to split the w1/w3 portions along shard_dim.
-                # _narrow_expert_data_for_padding will be a no-op since
-                # packed sizes should already match; if DeepEP padding
-                # causes a mismatch the copy_() will fail with a clear
-                # shape error.
-                full_load = True
-                self._load_w13(
-                    shard_id=shard_id,
-                    shard_dim=shard_dim,
-                    loaded_weight=loaded_weight,
-                    expert_data=expert_data,
-                    tp_rank=self.moe_config.tp_rank,
-                    load_full=full_load,
-                )
-            return True if return_success else None
-
         shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
         if is_transposed:
             shard_dim = int(not shard_dim)
@@ -1008,6 +984,20 @@ class IluRoutedExperts(RoutedExperts):
                 FusedMoeWeightScaleSupported.GROUP.value,
                 FusedMoeWeightScaleSupported.BLOCK.value,
             ]:
+                scale_refine = getattr(self.quant_method, "weight_scale_refine", None)
+                if (
+                    quant_method == FusedMoeWeightScaleSupported.BLOCK.value
+                    and scale_refine is not None
+                ):
+                    # FP8 block scales are stored per (block_n, block_k) tile
+                    # of the unsharded weight, while the TP-sharded parameters
+                    # use a refined block grid (see Fp8MoEMethod). Upsample the
+                    # scales to the refined grid (lossless: the refined block
+                    # divides the checkpoint block) so per-rank slicing stays
+                    # exact. Dim -2 is the weight's N dim, dim -1 is K.
+                    loaded_weight = loaded_weight.repeat_interleave(
+                        scale_refine[0], dim=-2
+                    ).repeat_interleave(scale_refine[1], dim=-1)
                 self._load_model_weight_or_group_weight_scale(
                     shard_id=shard_id,
                     shard_dim=shard_dim,

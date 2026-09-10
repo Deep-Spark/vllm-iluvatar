@@ -74,6 +74,7 @@ from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    WeightsMapper,
     is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
@@ -836,9 +837,14 @@ class IluGlmMoeDsaForCausalLM(nn.Module, SupportsPP):
         "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
     }
 
-    # MTP (layer 78) is skipped: applied to AutoWeightsLoader skip_substrs and
-    # the strict missing-param check below.
+    # MTP (layer 78) is dropped via ``hf_to_vllm_mapper`` (maps to None) and
+    # excluded from the strict missing-param check below. vLLM 0.29.0 removed
+    # AutoWeightsLoader.skip_substrs, so the drop is done through the mapper
+    # (matching the community deepseek_v4 pattern).
     _LOAD_SKIP_SUBSTRS: tuple[str, ...] = ("model.layers.78.",)
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_substr={"model.layers.78.": None},
+    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -885,8 +891,10 @@ class IluGlmMoeDsaForCausalLM(nn.Module, SupportsPP):
         return self.model.get_expert_mapping()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self, skip_substrs=list(self._LOAD_SKIP_SUBSTRS))
-        loaded = loader.load_weights(weights)
+        # vLLM 0.29.0 removed AutoWeightsLoader.skip_substrs; ``model.layers.78.*``
+        # (MTP) is dropped by ``hf_to_vllm_mapper`` (``"model.layers.78.": None``).
+        loader = AutoWeightsLoader(self)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
         # Strict reverse check: every nn.Parameter (except skipped MTP / PP
         # missing) must be filled from the checkpoint. vLLM's DefaultModelLoader

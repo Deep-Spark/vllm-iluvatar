@@ -24,7 +24,7 @@ from vllm.v1.attention.backends.mla.compressor_utils import (
     get_compressed_slot_mapping,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout, MLAAttentionSpec
 from vllm.v1.worker.cp_utils import get_kv_cache_shard_count
 
 
@@ -127,28 +127,6 @@ class IluDeepseekV32IndexerBackend(AttentionBackend):
     @staticmethod
     def get_builder_cls() -> type["IluDeepseekV32IndexerMetadataBuilder"]:
         return IluDeepseekV32IndexerMetadataBuilder
-
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        assert num_kv_heads == 1
-        return (num_blocks, block_size, head_size)
-
-    @staticmethod
-    def get_kv_cache_stride_order(
-        include_num_layers_dimension: bool = False,
-    ) -> tuple[int, ...]:
-        if include_num_layers_dimension:
-            # DeepseekV32Indexer kernels do not support cross-layer
-            # KV cache layout. Identity permutation keeps num_layers
-            # first, signaling incompatibility.
-            return (0, 1, 2, 3)
-        return (0, 1, 2)
 
 
 @dataclass
@@ -354,9 +332,7 @@ def kv_spans_from_batches_device(
     positions = token_arange_p1[:num_tokens]
 
     seq_lens_comp = (
-        seq_len_per_batch // compress_ratio
-        if compress_ratio > 1
-        else seq_len_per_batch
+        seq_len_per_batch // compress_ratio if compress_ratio > 1 else seq_len_per_batch
     )
     kv_starts_per_batch = torch.cumsum(seq_lens_comp, dim=0, dtype=torch.int32)
     kv_starts_per_batch -= seq_lens_comp
@@ -426,7 +402,7 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # for V4 (compress_ratio == 4 on the indexer cache).
         self.compress_ratio = 1
         if isinstance(self.kv_cache_spec, MLAAttentionSpec):
-            self.compress_ratio = self.kv_cache_spec.compress_ratio
+            self.compress_ratio = self.kv_cache_spec.tokens_per_state
         self.max_decode_context_len = get_max_decode_context_len(
             self.vllm_config, self.compress_ratio
         )
@@ -924,7 +900,7 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 common_attn_metadata.query_start_loc,
                 common_attn_metadata.seq_lens,
                 common_attn_metadata.block_table_tensor.clamp(min=0),
-                int(self.kv_cache_spec.storage_block_size),
+                self.kv_cache_spec.num_states,
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
             )
@@ -1092,6 +1068,12 @@ class IluDeepseekV4IndexerBackend(IluDeepseekV32IndexerBackend):
     @staticmethod
     def get_name() -> str:
         return "ILU_DEEPSEEK_V4_INDEXER"
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        # DeepSeek-V4 packs the indexer pages beside the MLA latent pages inside
+        # each block, so the layer dim must sit inside the block dim.
+        return (KVCacheLayout.BLHNC, KVCacheLayout.BLNHC)
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:

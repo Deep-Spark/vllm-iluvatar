@@ -1521,6 +1521,12 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         # arrive with the forward call.
         self._inv_rope_fused: bool | None = None
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # vLLM 0.29.0 KV-cache layout refactor: allocate_kv_cache binds a 4D
+        # [B, H=1, N, C] tensor; squeeze the singleton head dim -> 3D [B, N, C]
+        # as required by the ilu ixformer attention kernels (ndim 2 or 3 only).
+        self.kv_cache = kv_cache.squeeze(1)
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return IluDeepseekV4FlashMLASparseBackend
 
@@ -1534,7 +1540,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 num_kv_heads=1,
                 head_size=self.head_dim,
                 dtype=torch.uint8,
-                compress_ratio=self.compress_ratio,
+                tokens_per_state=self.compress_ratio,
                 cache_dtype_str="fp8_ds_mla",
                 model_version="deepseek_v4",
                 # Ilu fp8 attention kernels require 64B-aligned block bases.
@@ -1547,7 +1553,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=torch.bfloat16,
-            compress_ratio=self.compress_ratio,
+            tokens_per_state=self.compress_ratio,
             cache_dtype_str="bfloat16",
             model_version=None,
         )
@@ -2433,6 +2439,12 @@ class IluDeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # vLLM 0.29.0 KV-cache layout refactor: allocate_kv_cache binds a 4D
+        # [B, H=1, N, C] tensor; squeeze the singleton head dim -> 3D [B, N, C]
+        # as required by the ilu ixformer indexer kernels (ndim 2 or 3 only).
+        self.kv_cache = kv_cache.squeeze(1)
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # NOTE: Use ``cache_config.block_size`` (default 256) so the indexer
         # cache lives in the same ``KVCacheGroup`` as the main MLA cache,
@@ -2458,7 +2470,7 @@ class IluDeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
-            compress_ratio=self.compress_ratio,
+            tokens_per_state=self.compress_ratio,
         )
 
     def forward(self): ...

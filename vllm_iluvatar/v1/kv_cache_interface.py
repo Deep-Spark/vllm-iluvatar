@@ -156,7 +156,7 @@ def _mla_attention_real_page_size_bytes(self) -> int:
         if self.model_version == "deepseek_v4":
             # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
             # head_size stays semantic (512); bytes are determined here.
-            return self.storage_block_size * 584
+            return self.num_states * 584
         # V3.2 main MLA: 656-byte custom layout (kv_lora_rank=512 +
         # qk_rope_head_dim=64, head_size=576). See flashmla_sparse.py.
         return self.block_size * 656
@@ -165,10 +165,7 @@ def _mla_attention_real_page_size_bytes(self) -> int:
     else:
         head_dim = self.head_size
     return (
-        self.storage_block_size
-        * self.num_kv_heads
-        * head_dim
-        * _m.get_dtype_size(self.dtype)
+        self.num_states * self.num_kv_heads * head_dim * _m.get_dtype_size(self.dtype)
     )
 
 

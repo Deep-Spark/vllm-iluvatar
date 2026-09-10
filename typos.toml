@@ -18,3 +18,7 @@ ue = "ue"
 # ``mis-`` prefix (mis-unpacked / mis-sized / mis-aligned, meaning "wrongly")
 # is split by typos on the hyphen and the bare ``mis`` flagged as a typo.
 mis = "mis"
+# ``arange`` is the standard PyTorch API name (``torch.arange``); variables like
+# ``token_arange_p1`` / ``decode_token_arange_p1_buffer`` derive from it. Not a
+# typo of ``arrange``.
+arange = "arange"

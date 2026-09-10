@@ -31,20 +31,22 @@ def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
     # >>> ILU MODIFICATION >>>
     # Identify blocks with hash (LRU cache) and without it (will never match in APC)
     # <<< ILU MODIFICATION <<<
-    blocks_with_hash = []
-    blocks_without_hash = []
+    blocks_to_evict_last = []
+    blocks_to_evict_first = []
     for block in ordered_blocks:
         block.ref_cnt -= 1
         if block.ref_cnt == 0 and not block.is_null:
             # >>> ILU MODIFICATION >>>
             if block.block_hash is None:
                 # <<< ILU MODIFICATION <<<
-                blocks_without_hash.append(block)
+                blocks_to_evict_first.append(block)
             else:
-                blocks_with_hash.append(block)
+                # FIFO reuse of cached blocks for LRU eviction behavior.
+                blocks_to_evict_last.append(block)
 
     # >>> ILU MODIFICATION >>>
-    # Blocks without hash always get evicted first - prepend them last to the tail
+    # blocks_to_evict_first always get evicted first - prepend them last to the tail
     # <<< ILU MODIFICATION <<<
-    self.free_block_queue.prepend_n(blocks_without_hash)
-    self.free_block_queue.append_n(blocks_with_hash)
+    self.free_block_queue.prepend_n(blocks_to_evict_first)
+    # Blocks to reuse last are appended to the end of the free queue.
+    self.free_block_queue.append_n(blocks_to_evict_last)

@@ -179,6 +179,7 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
         topk_indices_buffer: torch.Tensor,
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
+        compress_ratio: int = 1,
     ):
         CustomOp.__init__(self)
         self.k_cache = k_cache
@@ -190,6 +191,7 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
         self.max_total_seq_len = max_total_seq_len
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
+        self.compress_ratio = compress_ratio
 
     def forward_native(
         self,

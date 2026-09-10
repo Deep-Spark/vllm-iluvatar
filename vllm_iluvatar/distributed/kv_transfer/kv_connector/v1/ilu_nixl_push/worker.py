@@ -35,7 +35,6 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionMetadata
-from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
@@ -369,7 +368,9 @@ class NixlConnectorWorker:
             raise RuntimeError("can not find an appropriate attention backend ")
 
         self.backend_name = self.attn_backend.get_name()
-        self.kv_cache_layout = get_kv_cache_layout()
+        self.kv_cache_layout = (
+            vllm_config.cache_config.get_resolved_kv_cache_layout().name
+        )
         self.host_buffer_kv_cache_layout = self.kv_cache_layout
         self._physical_blocks_per_logical_kv_block = 1
         self._sync_block_size_with_kernel()

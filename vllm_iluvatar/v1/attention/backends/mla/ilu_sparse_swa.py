@@ -156,6 +156,12 @@ class IluDeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
 
         self.block_size = 64
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # vLLM 0.29.0 KV-cache layout refactor: allocate_kv_cache binds a 4D
+        # [B, H=1, N, C] tensor; squeeze the singleton head dim -> 3D [B, N, C]
+        # as required by the ilu ixformer insert kernels (ndim 2 or 3 only).
+        self.kv_cache = kv_cache.squeeze(1)
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         cache_dtype = self.cache_config.cache_dtype
         is_fp8 = cache_dtype in ("fp8_ds_mla", "fp8")
@@ -526,16 +532,3 @@ class IluDeepseekSparseSWABackend(DeepseekSparseSWABackend):
     @staticmethod
     def get_builder_cls() -> type[DeepseekSparseSWAMetadataBuilder]:
         return IluDeepseekSparseSWAMetadataBuilder
-
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        assert num_kv_heads == 1
-        if cache_dtype_str == "fp8_ds_mla":
-            return (num_blocks, block_size, 584)
-        return (num_blocks, block_size, head_size)

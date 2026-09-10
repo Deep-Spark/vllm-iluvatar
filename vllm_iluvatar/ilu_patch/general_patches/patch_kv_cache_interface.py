@@ -38,6 +38,18 @@ def _apply() -> None:
     ):
         return
 
+    # Re-route AttentionSpec.page_size_bytes through real_page_size_bytes so
+    # the ILU int8 sizing overrides (set below per subclass) drive the
+    # allocation size. vLLM 0.28.0 otherwise resolves page_size_bytes via
+    # unpadded_page_size_bytes -> state_content_size_bytes (bf16-based) and
+    # bypasses real_page_size_bytes. Applied on the base class so it dispatches
+    # to whichever subclass real_page_size_bytes override is active.
+    from vllm.v1.kv_cache_interface import AttentionSpec
+
+    from vllm_iluvatar.v1.kv_cache_interface import _attention_page_size_bytes
+
+    AttentionSpec.page_size_bytes = property(_attention_page_size_bytes)
+
     # add property to spec, those properties will be used by:
     #  get_kv_cache_config_from_groups from vllm_iluvatar.v1.core.kv_cache_utils
     #  _reshape_kv_cache_tensors_with_scales from vllm_iluvatar.v1.worker.gpu_model_runner

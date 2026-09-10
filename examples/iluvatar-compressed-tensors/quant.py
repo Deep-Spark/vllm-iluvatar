@@ -381,10 +381,12 @@ class TensorStore:
         self._evict()
 
     def get(self, name: str) -> torch.Tensor:
-        try:
-            shard_name = self.weight_map[name]
-        except KeyError as error:
-            raise KeyError(f"companion tensor {name!r} is absent from index") from error
+        shard_name = self.weight_map.get(name)
+        if shard_name is None:
+            for tensors in self.loaded.values():
+                if name in tensors:
+                    return tensors[name]
+            raise KeyError(f"companion tensor {name!r} is absent from index")
         if shard_name not in self.loaded:
             self.loaded[shard_name] = load_file(
                 str(self.input_path / shard_name), device=self.device

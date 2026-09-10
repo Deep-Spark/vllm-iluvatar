@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "name": "step3p7_w4a8",
+  "load_device": "requested",
+  "model_config_patch": {
+    "compression_config": null
+  },
+  "default_action": "keep",
+  "rules": [
+    {
+      "id": "drop_consumed_scale",
+      "priority": 1000,
+      "match": {
+        "suffixes": [
+          ".weight_scale_inv",
+          ".weight_scale",
+          "_scale"
+        ]
+      },
+      "action": "drop"
+    },
+    {
+      "id": "keep_sensitive_tensor",
+      "priority": 950,
+      "match": {
+        "regex": [
+          "^lm_head\\.weight$",
+          "^model\\.embed_tokens\\.weight$",
+          "^model\\.norm\\.weight$",
+          "^model\\.layers\\.\\d+\\.(input_layernorm|post_attention_layernorm|final_layernorm)\\.weight$",
+          "^model\\.layers\\.\\d+\\.self_attn\\.(q_norm|k_norm|g_proj)\\.weight$",
+          "^model\\.layers\\.\\d+\\.moe\\.gate\\.weight$",
+          "^model\\.layers\\.\\d+\\.(eh_proj|enorm|hnorm)\\.weight$",
+          "^model\\.layers\\.\\d+\\.transformer\\.shared_head\\..*$",
+          "^vision_model\\..*$",
+          "^vit_large_projector\\..*$",
+          "router_bias"
+        ]
+      },
+      "action": "keep"
+    },
+    {
+      "id": "routed_fp8_to_w4a8",
+      "priority": 900,
+      "match": {
+        "regex": [
+          "^model\\.layers\\.\\d+\\.moe\\.(gate_proj|up_proj|down_proj)\\.weight$"
+        ],
+        "dtypes": ["float8_e4m3fn"],
+        "ndims": [3]
+      },
+      "action": "convert",
+      "config_group": "routed_experts",
+      "work_device": "cpu",
+      "scale": {
+        "from_suffix": ".weight",
+        "to_suffix": ".weight_scale_inv"
+      },
+      "dequant": {
+        "method": "fp8_block",
+        "options": {
+          "block_size": 128
+        }
+      },
+      "quant": {
+        "method": "pack_int4_moe",
+        "options": {
+          "group_size": -1,
+          "symmetric": true,
+          "gemm_format": "TN",
+          "pack_version": 2,
+          "scale_layout": "row",
+          "packed": false
+        }
+      },
+      "outputs": {
+        "weight_scale": ".weight_scale",
+        "i8_weight_scale": ".i8_weight_scale",
+        "i8_weight_zero": ".i8_weight_zero"
+      }
+    },
+    {
+      "id": "dense_float_to_w8a8",
+      "priority": 800,
+      "match": {
+        "regex": [
+          "^model\\.layers\\.\\d+\\.self_attn\\.(q_proj|k_proj|v_proj|o_proj)\\.weight$",
+          "^model\\.layers\\.\\d+\\.share_expert\\.(gate_proj|up_proj|down_proj)\\.weight$",
+          "^model\\.layers\\.\\d+\\.mlp\\.(gate_proj|up_proj|down_proj)\\.weight$"
+        ],
+        "dtypes": ["bfloat16", "float16", "float32"],
+        "ndims": [2]
+      },
+      "action": "convert",
+      "config_group": "dense_linears",
+      "work_device": "cpu",
+      "dequant": {
+        "method": "to_float32"
+      },
+      "quant": {
+        "method": "int8_per_channel",
+        "options": {
+          "group_size": -1,
+          "symmetric": true,
+          "gemm_format": "TN"
+        }
+      },
+      "iluvatar": {
+        "mixed_strategy": "CHANNEL",
+        "gemm_mode": "PERF"
+      },
+      "outputs": {
+        "weight_scale": ".weight_scale"
+      }
+    }
+  ]
+}

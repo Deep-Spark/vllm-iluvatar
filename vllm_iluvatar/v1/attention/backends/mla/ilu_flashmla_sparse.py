@@ -119,16 +119,6 @@ class IluFlashMLASparseBackend(AttentionBackend):
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return capability.major in [9, 10]
 
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,  # assumed to be 1 for MLA
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        return (num_blocks, block_size, head_size)
-
 
 @dataclass
 class IluFlashMLASparseMetadata(AttentionMetadata):
@@ -279,8 +269,8 @@ class IluFlashMLASparseMetadataBuilder(
             and len(getattr(hf_config, "compress_ratios", []) or []) > 0
         )
         self.compress_ratio = 1
-        if self.is_deepseek_v4 and hasattr(self.kv_cache_spec, "compress_ratio"):
-            self.compress_ratio = self.kv_cache_spec.compress_ratio
+        if self.is_deepseek_v4 and hasattr(self.kv_cache_spec, "tokens_per_state"):
+            self.compress_ratio = self.kv_cache_spec.tokens_per_state
 
         # Pre-allocate compressed slot mapping buffer for CUDA graph address
         # stability when this group needs compression (compress_ratio > 1).
@@ -434,7 +424,7 @@ class IluFlashMLASparseMetadataBuilder(
                 cm.query_start_loc,
                 cm.seq_lens,
                 cm.block_table_tensor.clamp(min=0),
-                int(self.kv_cache_spec.storage_block_size),
+                self.kv_cache_spec.num_states,
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
             )
@@ -862,15 +852,3 @@ class IluDeepseekV4FlashMLASparseBackend(IluFlashMLASparseBackend):
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [256]
-
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        if cache_dtype_str == "fp8_ds_mla":
-            return (num_blocks, block_size, 584)
-        return (num_blocks, block_size, head_size)

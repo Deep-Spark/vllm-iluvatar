@@ -27,7 +27,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
-from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.outputs import KVConnectorOutput
@@ -76,7 +75,10 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
 
         # For now there is no benefit to run cross layers when backend
         # does not support on HND
-        if get_kv_cache_layout() != "HND":
+        if (
+            self._vllm_config.cache_config.get_resolved_kv_cache_layout().name
+            != "LBHNC"
+        ):
             return False
 
         extra_config = self.kv_transfer_config.kv_connector_extra_config

@@ -406,9 +406,12 @@ class IluvatarGPUModelRunner(GPUModelRunner):
                     )
                     kernel_num_blocks = num_blocks * num_blocks_per_kv_block
 
-                    # For MLA with compression, storage_block_size != block_size
-                    if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
-                        shape_block_size = kv_cache_spec.storage_block_size
+                    # For MLA with compression, num_states != block_size
+                    # (num_states = block_size // tokens_per_state; was
+                    # ``storage_block_size`` before the 0.29.0 KV-cache layout
+                    # refactor).
+                    if kv_cache_spec.num_states != kv_cache_spec.block_size:
+                        shape_block_size = kv_cache_spec.num_states
                     else:
                         shape_block_size = kernel_block_size
 

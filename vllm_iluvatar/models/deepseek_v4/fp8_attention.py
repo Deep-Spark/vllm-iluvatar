@@ -118,13 +118,19 @@ class IluDeepseekV4Fp8IndexerCache(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # vLLM 0.29.0 KV-cache layout refactor: allocate_kv_cache binds a 4D
+        # [B, H=1, N, C] tensor; squeeze the singleton head dim -> 3D [B, N, C]
+        # as required by the ilu ixformer indexer kernels (ndim 2 or 3 only).
+        self.kv_cache = kv_cache.squeeze(1)
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
-            compress_ratio=self.compress_ratio,
+            tokens_per_state=self.compress_ratio,
         )
 
     def forward(self): ...
@@ -613,6 +619,12 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
         """Whether this instance stores fp8 KV in the ``fp8_ds_mla`` layout."""
         return self.use_fp8_ds_mla_layout
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # vLLM 0.29.0 KV-cache layout refactor: allocate_kv_cache binds a 4D
+        # [B, H=1, N, C] tensor; squeeze the singleton head dim -> 3D [B, N, C]
+        # as required by the ilu ixformer attention kernels (ndim 2 or 3 only).
+        self.kv_cache = kv_cache.squeeze(1)
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.backend_cls
 
@@ -634,7 +646,7 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=torch.uint8 if uses_fp8_ds_mla_layout else self.kv_cache_torch_dtype,
-            compress_ratio=self.compress_ratio,
+            tokens_per_state=self.compress_ratio,
             cache_dtype_str=self.kv_cache_dtype,
             alignment=64 if uses_fp8_ds_mla_layout else 512,
             model_version="deepseek_v4",

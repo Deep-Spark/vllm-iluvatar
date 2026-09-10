@@ -8,7 +8,6 @@ from types import SimpleNamespace
 import torch
 
 from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
-    IluDeepseekV32IndexerBackend,
     get_max_decode_context_len,
     get_max_prefill_buffer_size,
     kv_spans_from_batches,
@@ -174,20 +173,6 @@ def test_kv_spans_device_needs_no_cpu_copy_of_seq_lens():
 
     assert starts.numel() == 8
     assert ends.numel() == 8
-
-
-def test_deepseek_v32_indexer_backend_cache_layout():
-    assert IluDeepseekV32IndexerBackend.get_name() == "DEEPSEEK_V32_INDEXER"
-    assert IluDeepseekV32IndexerBackend.get_kv_cache_shape(
-        num_blocks=3,
-        block_size=64,
-        num_kv_heads=1,
-        head_size=576,
-    ) == (3, 64, 576)
-    assert IluDeepseekV32IndexerBackend.get_kv_cache_stride_order() == (0, 1, 2)
-    assert IluDeepseekV32IndexerBackend.get_kv_cache_stride_order(
-        include_num_layers_dimension=True,
-    ) == (0, 1, 2, 3)
 
 
 def test_get_max_prefill_buffer_size_scales_with_model_len():

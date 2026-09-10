@@ -130,15 +130,17 @@ _MODEL_PREFIX = "model."
 
 
 def _is_load_skipped(name: str) -> bool:
-    """Whether ``AutoWeightsLoader`` would skip this (mapped) name.
+    """Whether ``AutoWeightsLoader`` would drop this (mapped) name.
 
-    Mirrors ``AutoWeightsLoader._can_skip`` for the substrings this model passes:
-    our own ``mtp.`` plus the rotary leftovers the loader appends to every
-    ``skip_substrs`` list. Used by both Load_Verifier directions so the whitelist
-    is identical on the parameter and the checkpoint side.
+    vLLM 0.29.0 removed ``AutoWeightsLoader.ROTARY_EMBEDS_UNUSED_WEIGHTS``
+    (a list appended to ``skip_substrs``); rotary leftovers are now dropped
+    by ``AutoWeightsLoader.REMOVE_UNUSED_ROTARY_EMBEDS_MAPPER``, which the
+    loader composes with the model mapper internally. ``mtp.*`` is dropped by
+    the model mapper (``"mtp.": None``). Used by both Load_Verifier directions
+    so the whitelist is identical on the parameter and the checkpoint side.
     """
-    return any(substr in name for substr in _LOAD_SKIP_SUBSTRS) or any(
-        substr in name for substr in AutoWeightsLoader.ROTARY_EMBEDS_UNUSED_WEIGHTS
+    return any(substr in name for substr in _LOAD_SKIP_SUBSTRS) or not (
+        AutoWeightsLoader.REMOVE_UNUSED_ROTARY_EMBEDS_MAPPER.apply_list([name])
     )
 
 
@@ -186,6 +188,12 @@ def _make_fp8_weights_mapper() -> WeightsMapper:
             # and routed ``w2`` is untouched because the pattern is anchored
             # on ``.shared_experts.``.
             ".shared_experts.w2": ".shared_experts.down_proj",
+            # vLLM 0.29.0 dropped AutoWeightsLoader.skip_substrs; the MTP
+            # weights are loaded by the separate IluDeepSeekV4MTPModel draft
+            # model, so the base model drops them here via the mapper (maps
+            # to None). The orig_to_new_prefix rename ``mtp.`` -> ``model.mtp.``
+            # runs first, then this substr rule drops the renamed name.
+            "mtp.": None,
         },
     )
 
@@ -1110,10 +1118,14 @@ class IluDeepseekV4Fp8ForCausalLM(nn.Module, SupportsPP):
         Names are recorded *mapped* (via ``apply_list``, same
         ``_map_name_with_shard`` path as the stream ``apply``) so they line up
         with what ``IluDeepseekV4Fp8Model.load_weights`` records as consumed.
-        Names the loader will skip (``mtp.*`` + rotary leftovers) are not
-        recorded.
+        Names the loader will drop (``mtp.*`` via the model mapper +
+        rotary leftovers via ``REMOVE_UNUSED_ROTARY_EMBEDS_MAPPER``, which
+        the loader composes internally) are not recorded.
         """
-        mapper = self.hf_to_vllm_mapper
+        mapper = (
+            self.hf_to_vllm_mapper
+            | AutoWeightsLoader.REMOVE_UNUSED_ROTARY_EMBEDS_MAPPER
+        )
         for name, tensor in weights:
             mapped = mapper.apply_list([name])
             if mapped and not _is_load_skipped(mapped[0]):
@@ -1153,7 +1165,11 @@ class IluDeepseekV4Fp8ForCausalLM(nn.Module, SupportsPP):
         # accumulates and ``AutoWeightsLoader`` may enter its ``load_weights``
         # several times (see ``reset_consumed_ckpt_names``).
         self.model.reset_consumed_ckpt_names()
-        loader = AutoWeightsLoader(self, skip_substrs=list(_LOAD_SKIP_SUBSTRS))
+        # vLLM 0.29.0 removed AutoWeightsLoader.skip_substrs; ``mtp.*`` is
+        # dropped by ``hf_to_vllm_mapper`` (``"mtp.": None``) and loaded
+        # separately by IluDeepSeekV4MTPModel. Rotary leftovers are dropped
+        # internally by the loader (REMOVE_UNUSED_ROTARY_EMBEDS_MAPPER).
+        loader = AutoWeightsLoader(self)
         loaded = loader.load_weights(
             self._tap_weight_names(weights, seen), mapper=self.hf_to_vllm_mapper
         )

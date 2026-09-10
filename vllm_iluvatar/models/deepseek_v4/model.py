@@ -1307,6 +1307,12 @@ def _make_ilu_deepseek_v4_weights_mapper() -> WeightsMapper:
         orig_to_new_substr={
             ".attn.compressor.": ".attn.mla_attn.compressor.",
             ".shared_experts.w2": ".shared_experts.down_proj",
+            # vLLM 0.29.0 dropped AutoWeightsLoader.skip_substrs; the MTP
+            # weights are loaded by the separate IluDeepSeekV4MTPModel draft
+            # model, so the base model drops them here via the mapper (maps
+            # to None). The orig_to_new_prefix rename ``mtp.`` -> ``model.mtp.``
+            # runs first, then this substr rule drops the renamed name.
+            "mtp.": None,
         },
     )
 
@@ -1368,7 +1374,10 @@ class IluDeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     _LOAD_SKIP_SUBSTRS: tuple[str, ...] = ("mtp.",)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self, skip_substrs=list(self._LOAD_SKIP_SUBSTRS))
+        # vLLM 0.29.0 removed AutoWeightsLoader.skip_substrs; ``mtp.*`` weights
+        # are dropped by ``hf_to_vllm_mapper`` (``"mtp.": None`` in
+        # orig_to_new_substr) and loaded separately by IluDeepSeekV4MTPModel.
+        loader = AutoWeightsLoader(self)
         loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
         # Strict reverse check: every nn.Parameter must be filled from the

@@ -212,12 +212,20 @@ def _ilu_isend_tensor_dict_sync(
     metadata_group = self.cpu_group
 
     metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
-    self.send_object(metadata_list, dst=dst)
 
     tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]
     assert len(tensor_keys) == len(tensor_list)
 
+    # >>> ILU MODIFICATION >>>
+    # ivcore30 blocking path. Community 0.29.0 switched the metadata send to
+    # an async isend_object whose handle is self-retained in _pending_isends
+    # and reaped lazily. ivcore30 keeps the blocking send_object so metadata
+    # lands before the tensors, and returns no async handles (the tensor
+    # sends below are blocking too, so no self-retention is needed).
+    self.send_object(metadata_list, dst=dst)
     handles: list[Handle] = []
+    # <<< ILU MODIFICATION <<<
+
     for key, tensor in zip(tensor_keys, tensor_list):
         if tensor.numel() == 0:
             continue

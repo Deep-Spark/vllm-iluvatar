@@ -30,12 +30,10 @@ from vllm import _custom_ops as ops  # type: ignore[import]
 from vllm.config import (
     VllmConfig,
     get_current_vllm_config_or_none,
-    get_layers_from_vllm_config,
 )
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
-from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import cdiv
@@ -54,11 +52,9 @@ from vllm.v1.attention.backends.fa_utils import (
 )
 from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
-    get_kv_cache_layout,
     split_decodes_and_prefills,
 )
-from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
-from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
+from vllm.v1.attention.ops.dcp import cp_lse_ag_out_rs, dcp_a2a_lse_reduce
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_iluvatar.v1.attention.ilu_static_quant import (
@@ -195,23 +191,6 @@ class IluFlashAttentionBackend(AttentionBackend):
         return (2, num_blocks, num_kv_heads, block_size, head_size)
 
     @staticmethod
-    def get_kv_cache_stride_order(
-        include_num_layers_dimension: bool = False,
-    ) -> tuple[int, ...]:
-        cache_layout = get_kv_cache_layout()
-        if cache_layout == "NHD" and include_num_layers_dimension:
-            return (2, 0, 1, 3, 4, 5)
-        elif cache_layout == "NHD":
-            stride_order = (0, 1, 2, 3, 4)
-        elif cache_layout == "HND" and include_num_layers_dimension:
-            return (2, 4, 0, 1, 3, 5)
-        elif cache_layout == "HND":
-            stride_order = (0, 1, 2, 3, 4)
-        else:
-            raise ValueError(f"Unknown cache layout format {cache_layout}.")
-        return stride_order
-
-    @staticmethod
     def get_fp8_dtype_for_flashattn(kv_cache_dtype: str) -> torch.dtype:
         if kv_cache_dtype in ("fp8", "fp8_e4m3"):
             return torch.float8_e4m3fn
@@ -314,18 +293,6 @@ class IluFlashAttentionMetadata:
     causal: bool = True
 
 
-def _get_sliding_window_configs(
-    vllm_config: VllmConfig,
-) -> set[tuple[int, int] | None]:
-    """Get the set of all sliding window configs used in the model."""
-    sliding_window_configs: set[tuple[int, int] | None] = set()
-    layers = get_layers_from_vllm_config(vllm_config, Attention)
-    for layer in layers.values():
-        assert isinstance(layer.impl, IluFlashAttentionImpl)
-        sliding_window_configs.add(layer.impl.sliding_window)
-    return sliding_window_configs
-
-
 class IluFlashAttentionMetadataBuilder(
     AttentionMetadataBuilder[IluFlashAttentionMetadata]
 ):
@@ -365,7 +332,6 @@ class IluFlashAttentionMetadataBuilder(
         self.block_size = kv_cache_spec.block_size
 
         self.max_num_splits = 0
-        self.aot_schedule = False
 
         try:
             from vllm.distributed.parallel_state import get_dcp_group
@@ -417,8 +383,6 @@ class IluFlashAttentionMetadataBuilder(
                 dtype=torch.int32,
                 device=self.device,
             )
-
-        self.aot_sliding_window: tuple[int, int] | None = None
 
     def build(
         self,
@@ -922,7 +886,14 @@ class IluFlashAttentionImpl(AttentionImpl):
         if early_output is not None:
             return early_output
 
-        key_cache, value_cache = kv_cache.unbind(0)
+        # v0.29.0 KV-cache layout: per-layer view is [B, H, N, C] with K/V packed
+        # in the content dim C = head_size + head_size_v. ixformer's
+        # reshape_and_cache_flash expects HND [num_blocks, num_kv_heads,
+        # block_size, head_size] (it reads block_size from dim 2), so split the
+        # content dim directly WITHOUT transposing (community's transpose+split
+        # yields NHD, which only matches vLLM's own reshape_and_cache_flash op).
+        key_cache = kv_cache[..., : self.head_size]
+        value_cache = kv_cache[..., self.head_size :]
         if is_quantized_kv_cache(self.kv_cache_dtype):
             dtype = IluFlashAttentionBackend.get_fp8_dtype_for_flashattn(
                 self.kv_cache_dtype

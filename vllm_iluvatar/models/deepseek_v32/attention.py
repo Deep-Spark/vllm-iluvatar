@@ -77,6 +77,11 @@ class IluDeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
 
     def forward(self): ...
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # [B, H=1, N, C] -> [B, N, C]: the indexer kernels and
+        # kv_cache_as_quant_view index a 3-D block-major cache.
+        self.kv_cache = kv_cache.squeeze(1)
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return IluDeepseekV32IndexerBackend
 
@@ -251,6 +256,10 @@ class IluDeepseekV32SparseMLA(nn.Module, AttentionLayerBase):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # [B, H=1, N, C] -> [B, N, C]
+        self.kv_cache = kv_cache.squeeze(1)
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return IluFlashMLASparseBackend

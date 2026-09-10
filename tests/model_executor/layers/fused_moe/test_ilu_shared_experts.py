@@ -37,6 +37,7 @@ def test_community_shared_experts_may_return_true():
     mock_config.moe_parallel_config.all2all_backend = "deepep_low_latency"
     mock_config.moe_parallel_config.use_fi_nvl_two_sided_kernels = False
     obj._moe_config = mock_config
+    obj._layer = MagicMock(shard_sequence_parallel=False)
 
     assert obj._disable_shared_experts_overlap is True, (
         "Community SharedExperts should disable overlap with eplb + non-default backend"

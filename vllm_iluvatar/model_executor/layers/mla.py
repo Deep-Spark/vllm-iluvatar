@@ -69,8 +69,8 @@ class IluMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             quant_config,
             prefix,
             skip_topk,
-            non_causal_multi_token_decode=non_causal_multi_token_decode,
-            allow_short_prefill_indexer_scoring_skip=allow_short_prefill_indexer_scoring_skip,
+            non_causal_multi_token_decode,
+            allow_short_prefill_indexer_scoring_skip,
         )
         # [ILU override] plugin MLA backends apply rope/cache updates inside
         # MLAAttention.forward_full when positions are passed through forward().

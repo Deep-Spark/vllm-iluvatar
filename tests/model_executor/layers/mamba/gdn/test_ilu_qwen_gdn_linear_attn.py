@@ -114,7 +114,7 @@ def test_ilu_chunk_gated_delta_rule_registers_and_forces_plugin_native(monkeypat
         return "plugin-output"
 
     fake_chunk_module = ModuleType(
-        "vllm_iluvatar.third_party.flash_linear_attention.ops.chunk"
+        "vllm.third_party.flash_linear_attention.ops.chunk"
     )
     fake_chunk_module.chunk_gated_delta_rule = fake_chunk_gated_delta_rule
     monkeypatch.setitem(sys.modules, fake_chunk_module.__name__, fake_chunk_module)

@@ -147,6 +147,7 @@ def test_w4a8_decode_uses_decode_token_index_and_group_gemv(monkeypatch):
         w4a8_moe.IluCompressedTensorsW4A8Int8MoEMethod
     )
     method.group_size = -1
+    method.version = 2
     method.gemm1_info = _GemmInfo()
     method.gemm2_info = _GemmInfo()
     method._expand_and_quant = MagicMock(
@@ -170,6 +171,7 @@ def test_w4a8_decode_uses_decode_token_index_and_group_gemv(monkeypatch):
     fake_ixfops.moe_output_reduce_sum.return_value = expected
     monkeypatch.setattr(w4a8_moe, "ixfops", fake_ixfops)
     monkeypatch.setattr(w4a8_moe, "unpad_tensor", lambda tensor, *_args, **_kwargs: tensor)
+    method._try_fused_w13_swiglu_quant = MagicMock(return_value=None)
     layer = _non_ep_layer()
 
     result = method._apply_decode(

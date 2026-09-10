@@ -27,13 +27,16 @@ def _setup_modules(monkeypatch, *, flash_quant_type: str, mla_quant_type: str):
     sliding_original = object()
     mla_original = object()
 
-    class FullAttentionSpec:
+    class AttentionSpec:
+        pass
+
+    class FullAttentionSpec(AttentionSpec):
         real_page_size_bytes = full_original
 
-    class SlidingWindowSpec:
+    class SlidingWindowSpec(AttentionSpec):
         real_page_size_bytes = sliding_original
 
-    class MLAAttentionSpec:
+    class MLAAttentionSpec(AttentionSpec):
         real_page_size_bytes = mla_original
 
     @dataclass
@@ -42,6 +45,7 @@ def _setup_modules(monkeypatch, *, flash_quant_type: str, mla_quant_type: str):
 
     original_tensor_init = KVCacheTensor.__init__
     community = ModuleType("vllm.v1.kv_cache_interface")
+    community.AttentionSpec = AttentionSpec
     community.FullAttentionSpec = FullAttentionSpec
     community.SlidingWindowSpec = SlidingWindowSpec
     community.MLAAttentionSpec = MLAAttentionSpec
@@ -75,6 +79,7 @@ def _setup_modules(monkeypatch, *, flash_quant_type: str, mla_quant_type: str):
         return "mla-fixed"
 
     implementation = ModuleType("vllm_iluvatar.v1.kv_cache_interface")
+    implementation._attention_page_size_bytes = lambda self: self.real_page_size_bytes
     implementation._full_attention_real_page_size_bytes = full_real
     implementation._full_attention_scale_page_size_bytes = full_scale
     implementation._full_attention_fixed_size_bytes = full_fixed

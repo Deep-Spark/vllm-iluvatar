@@ -80,6 +80,7 @@ def _non_ep_layer():
 
 class _GemmInfo:
     format = 0
+    format_str = "TN"
 
     @staticmethod
     def get_n():

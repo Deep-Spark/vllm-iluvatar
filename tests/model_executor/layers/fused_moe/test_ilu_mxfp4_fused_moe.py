@@ -911,6 +911,57 @@ def test_ixformer_pipeline_wires_args_correctly(weights, hidden_states, monkeypa
     assert gather_call.call_args.args[1].dtype is torch.float32
 
 
+def test_ixmm_m3_uses_fused_packed_swiglu_quant(hidden_states, monkeypatch):
+    expert_count = 4
+    w13 = torch.zeros(
+        expert_count, _H // 2, 2 * _I, dtype=torch.uint8
+    )
+    w13_scale = torch.ones(
+        expert_count, 1, 2 * _I, dtype=torch.float32
+    )
+    w2 = torch.zeros(
+        expert_count, 256 // 2, _H, dtype=torch.uint8
+    )
+    w2_scale = torch.ones(expert_count, 1, _H, dtype=torch.float32)
+    topk_weights, topk_ids = _rand_routing(_TOKENS, 4, _TOPK, seed=29)
+    fake_ixfops, routing_out = _install_fake_ixfops(monkeypatch)
+    fake_ixfops.swigluoai_uninterleave_dynamic_scaled_fp8.return_value = (
+        torch.empty(_TOKENS * _TOPK, _I, dtype=torch.float8_e4m3fn),
+        torch.ones(_TOKENS * _TOPK, dtype=torch.float32),
+    )
+    fake_ixfops.moe_gather_output_reduce_sum.return_value = torch.zeros(
+        _TOKENS, _H, dtype=torch.bfloat16
+    )
+
+    _ilu_mxfp4_fused_experts_ixformer(
+        hidden_states,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        swiglu_limit=_SWIGLU_LIMIT,
+        expert_map=None,
+        output_scale=1.0,
+        extra_residual=None,
+        w13_bias=None,
+        w2_bias=None,
+        gemm_backend="ixmm",
+        gemm_mode=0,
+        swiglu_variant="swigluoai",
+        swiglu_alpha=1.702,
+        swiglu_beta=1.0,
+    )
+
+    fused = fake_ixfops.swigluoai_uninterleave_dynamic_scaled_fp8
+    fused.assert_called_once()
+    assert fused.call_args.args[1] is routing_out["v"][1]
+    assert fused.call_args.args[2] == float(_SWIGLU_LIMIT)
+    assert fused.call_args.kwargs["backend"] == "ixformer_native"
+    fake_ixfops.fp8_per_token_dynamic_scaled.assert_not_called()
+
+
 def test_ixmm_pipeline_pads_only_w2_k(monkeypatch):
     """w13 keeps its K while w2 and the SwiGLU activation pad 640 to 768."""
     expert_count = 4

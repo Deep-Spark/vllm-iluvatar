@@ -15,6 +15,7 @@ ixformer path, so the backend advertises BF16 only.
 
 from __future__ import annotations
 
+import os
 from typing import ClassVar
 
 import ixformer.inference.functions as ixf_ops
@@ -32,6 +33,7 @@ from vllm.models.minimax_m3.common.sparse_attention import (
     MiniMaxM3SparsePrefillMetadata,
 )
 from vllm.v1.attention.backend import AttentionLayer
+from vllm.v1.worker.workspace import current_workspace_manager
 
 # Re-exported, not just imported: the metadata and its builder are community's,
 # reused verbatim, which is what keeps this module a drop-in for
@@ -60,6 +62,15 @@ __all__ = [
 # all four derive from here so they cannot drift apart.
 SUPPORTED_KV_CACHE_DTYPES: tuple[CacheDType, ...] = ("bfloat16",)
 SUPPORTED_KV_CACHE_TORCH_DTYPES: tuple[torch.dtype, ...] = (torch.bfloat16,)
+_M3_SPARSE_PREFILL_BACKEND = os.getenv(
+    "VLLM_ILU_M3_SPARSE_PREFILL_BACKEND", "ixformer_perf"
+)
+if _M3_SPARSE_PREFILL_BACKEND not in {"ixformer_native", "ixformer_perf"}:
+    raise ValueError(
+        "VLLM_ILU_M3_SPARSE_PREFILL_BACKEND must be "
+        "'ixformer_native' or 'ixformer_perf', got "
+        f"{_M3_SPARSE_PREFILL_BACKEND!r}"
+    )
 
 
 def _dense_topk(topk_idx: torch.Tensor) -> torch.Tensor:
@@ -82,6 +93,40 @@ def _check_unquantized_kv(
         raise NotImplementedError("ixformer M3 sparse attention has no FP8 KV scales")
 
 
+def _minimax_m3_sparse_attn_ixformer(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_idx: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seq_lens: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    max_query_len: int,
+    num_kv_heads: int,
+    sm_scale: float,
+    output: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
+) -> None:
+    _check_unquantized_kv(kv_cache, k_scale, v_scale)
+    ixf_ops.minimax_m3_sparse_attn(
+        q,
+        kv_cache,
+        _dense_topk(topk_idx),
+        block_table,
+        cu_seqlens_q,
+        seq_lens,
+        prefix_lens,
+        max_query_len,
+        num_kv_heads,
+        sm_scale,
+        output,
+        workspace=workspace,
+        backend=_M3_SPARSE_PREFILL_BACKEND,
+    )
+
+
 def minimax_m3_sparse_attn(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -97,11 +142,10 @@ def minimax_m3_sparse_attn(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
 ) -> None:
-    _check_unquantized_kv(kv_cache, k_scale, v_scale)
-    ixf_ops.minimax_m3_sparse_attn(
+    _minimax_m3_sparse_attn_ixformer(
         q,
         kv_cache,
-        _dense_topk(topk_idx),
+        topk_idx,
         block_table,
         cu_seqlens_q,
         seq_lens,
@@ -110,6 +154,8 @@ def minimax_m3_sparse_attn(
         num_kv_heads,
         sm_scale,
         output,
+        k_scale,
+        v_scale,
     )
 
 
@@ -186,6 +232,17 @@ class MiniMaxM3SparseBackend(_CommunitySparseBackend):
 class MiniMaxM3SparseIxformerImpl(MiniMaxM3SparseImpl):
     """ixformer block-sparse attend over the indexer-selected blocks."""
 
+    def reserve_prefill_workspace(self, total_q: int) -> torch.Tensor | None:
+        if _M3_SPARSE_PREFILL_BACKEND != "ixformer_perf":
+            return None
+        workspace_bytes = ixf_ops.minimax_m3_sparse_attn_tcu_workspace_size(
+            total_q, self.num_kv_heads, self.topk_blocks
+        )
+        (workspace,) = current_workspace_manager().get_simultaneous(
+            ((workspace_bytes,), torch.uint8),
+        )
+        return workspace
+
     def forward(
         self,
         layer: AttentionLayer,
@@ -199,6 +256,9 @@ class MiniMaxM3SparseIxformerImpl(MiniMaxM3SparseImpl):
         community signature and unused: ix30 has no FP8-query attend."""
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
+            # Profiling reserves the maximum scratch once; every M3 layer then
+            # borrows the same workspace-manager slot during real prefill.
+            self.reserve_prefill_workspace(query.shape[0])
             return output  # profiling run; caches unbound
         main_md = attn_metadata[layer.layer_name]  # type: ignore[attr-defined]
         assert isinstance(main_md, MiniMaxM3SparseMetadata)
@@ -233,17 +293,33 @@ class MiniMaxM3SparseIxformerImpl(MiniMaxM3SparseImpl):
         if main_md.num_prefills > 0:
             p = main_md.prefill
             assert p is not None
-            minimax_m3_sparse_attn(
-                q[nd:],
-                kv_cache,
-                topk[:, nd:num_tokens, :],
-                p.block_table,
-                p.cu_seqlens_q,
-                p.seq_lens,
-                p.context_lens,
-                p.max_query_len,
-                self.num_kv_heads,
-                self.scale,
-                out[nd:],
-            )
+            if p.max_query_len == 1:
+                # Match the indexer's q=1 dispatch and reuse decode split-K.
+                minimax_m3_sparse_attn_decode(
+                    q[nd:],
+                    kv_cache,
+                    topk[:, nd:num_tokens, :],
+                    p.block_table,
+                    p.seq_lens,
+                    self.num_kv_heads,
+                    self.scale,
+                    out[nd:],
+                    1,
+                )
+            else:
+                workspace = self.reserve_prefill_workspace(q[nd:].shape[0])
+                _minimax_m3_sparse_attn_ixformer(
+                    q[nd:],
+                    kv_cache,
+                    topk[:, nd:num_tokens, :],
+                    p.block_table,
+                    p.cu_seqlens_q,
+                    p.seq_lens,
+                    p.context_lens,
+                    p.max_query_len,
+                    self.num_kv_heads,
+                    self.scale,
+                    out[nd:],
+                    workspace=workspace,
+                )
         return output

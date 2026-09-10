@@ -85,7 +85,10 @@ def test_local_forwards_dispatch_to_the_local_adapters():
         (
             sparse_attention,
             sparse_attention.MiniMaxM3SparseIxformerImpl,
-            ("minimax_m3_sparse_attn", "minimax_m3_sparse_attn_decode"),
+                (
+                    "_minimax_m3_sparse_attn_ixformer",
+                    "minimax_m3_sparse_attn_decode",
+                ),
         ),
     ):
         referenced = cls.forward.__code__.co_names
@@ -246,8 +249,9 @@ def test_sparse_attention_densifies_transposed_topk(
     assert not transposed.is_contiguous()
     seen = {}
 
-    def fake_ixformer(q, kv_cache, topk_idx, *args):
+    def fake_ixformer(q, kv_cache, topk_idx, *args, **kwargs):
         seen["topk"] = topk_idx
+        seen["backend"] = kwargs.get("backend")
 
     monkeypatch.setattr(sparse_attention.ixf_ops, ixformer_name, fake_ixformer)
     getattr(sparse_attention, adapter_name)(
@@ -256,6 +260,45 @@ def test_sparse_attention_densifies_transposed_topk(
 
     assert seen["topk"].is_contiguous()
     assert torch.equal(seen["topk"], transposed)
+    assert seen["backend"] == (
+        "ixformer_perf" if adapter_name == "minimax_m3_sparse_attn" else None
+    )
+
+
+def test_sparse_impl_reserves_workspace_from_shared_manager(monkeypatch):
+    impl = object.__new__(sparse_attention.MiniMaxM3SparseIxformerImpl)
+    impl.num_kv_heads = 2
+    impl.topk_blocks = 16
+    seen = {}
+    expected = torch.empty(123, dtype=torch.uint8)
+
+    class FakeWorkspaceManager:
+        def get_simultaneous(self, *specs):
+            seen["specs"] = specs
+            return (expected,)
+
+    def fake_size(total_q, num_kv_heads, topk):
+        seen["size_args"] = (total_q, num_kv_heads, topk)
+        return 123
+
+    monkeypatch.setattr(
+        sparse_attention, "_M3_SPARSE_PREFILL_BACKEND", "ixformer_perf"
+    )
+    monkeypatch.setattr(
+        sparse_attention.ixf_ops,
+        "minimax_m3_sparse_attn_tcu_workspace_size",
+        fake_size,
+    )
+    monkeypatch.setattr(
+        sparse_attention,
+        "current_workspace_manager",
+        lambda: FakeWorkspaceManager(),
+    )
+
+    got = impl.reserve_prefill_workspace(32768)
+    assert got is expected
+    assert seen["size_args"] == (32768, 2, 16)
+    assert seen["specs"] == (((123,), torch.uint8),)
 
 
 def test_indexer_impl_rejects_fp8_cache_and_non_max_score():

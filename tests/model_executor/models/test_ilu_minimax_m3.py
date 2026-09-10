@@ -9,6 +9,7 @@ import inspect
 from pathlib import Path
 
 import pytest
+import torch
 import vllm
 
 import vllm_iluvatar.ilu_register as ilu_register
@@ -132,6 +133,13 @@ def test_minimax_m3_runtime_has_no_hardware_upstream_imports():
             for name in imported
             for prefix in forbidden_modules
         ), source_file
+
+
+def test_minimax_m3_sparse_decode_is_not_eager_broken():
+    """Indexer + sparse attend must stay inside FULL_DECODE_ONLY capture."""
+    model = importlib.import_module(f"{PACKAGE}.model")
+    sparse_source = inspect.getsource(model.MiniMaxM3SparseAttention._run_attention)
+    assert "eager_break_during_capture" not in sparse_source
 
 
 def test_no_general_patch_touches_community_minimax_m3():

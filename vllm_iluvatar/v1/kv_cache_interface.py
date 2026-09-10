@@ -20,6 +20,23 @@ import torch
 import vllm.envs as envs
 
 
+def _attention_page_size_bytes(self) -> int:
+    """Route page_size_bytes through real_page_size_bytes.
+
+    vLLM 0.28.0 refactored AttentionSpec.page_size_bytes to resolve via
+    unpadded_page_size_bytes -> state_content_size_bytes (bf16-based), which
+    bypasses the ILU real_page_size_bytes override and leaves KVINT8/KINT8/
+    MLA-INT8 allocations sized at 2x (bf16). Re-route the chain through
+    real_page_size_bytes so ILU's int8 sizing drives the allocation. No-op
+    when real_page_size_bytes is not overridden (it aliases
+    unpadded_page_size_bytes).
+    """
+    if self.page_size_padded is not None:
+        assert self.page_size_padded >= self.real_page_size_bytes
+        return self.page_size_padded
+    return self.real_page_size_bytes
+
+
 # Iluvatar Full Attention scale part
 def _full_attention_real_page_size_bytes(self) -> int:
     import vllm.v1.kv_cache_interface as _m

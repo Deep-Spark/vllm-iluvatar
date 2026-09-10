@@ -73,9 +73,29 @@ def _block_dequant(
     block_size: int,
     decode_e8m0: bool,
 ) -> torch.Tensor:
+    if weight.dim() == 3:
+        if scale.dim() != 3 or scale.shape[0] != weight.shape[0]:
+            raise ValueError(
+                "3-D block dequant expects per-expert scale "
+                f"[E, *, *], got {weight.shape}/{scale.shape}"
+            )
+        return torch.stack(
+            [
+                _block_dequant(
+                    expert_weight,
+                    expert_scale,
+                    block_size=block_size,
+                    decode_e8m0=decode_e8m0,
+                )
+                for expert_weight, expert_scale in zip(
+                    weight.unbind(0), scale.unbind(0), strict=True
+                )
+            ],
+            dim=0,
+        )
     if weight.dim() != 2 or scale.dim() != 2:
         raise ValueError(
-            f"block dequant expects 2-D weight/scale, got {weight.shape}/{scale.shape}"
+            f"block dequant expects 2-D or 3-D weight/scale, got {weight.shape}/{scale.shape}"
         )
     rows, cols = weight.shape
     scale_rows, scale_cols = scale.shape

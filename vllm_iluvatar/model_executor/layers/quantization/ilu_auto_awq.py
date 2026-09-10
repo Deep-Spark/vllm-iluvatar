@@ -188,7 +188,7 @@ class IluAutoAWQConfig(AutoAWQConfig):
                 prefix,
                 self.modules_to_not_convert,
                 self.packed_modules_mapping,
-                skip_with_substr=True,
+                match_mode="substring",
             ):
                 return UnquantizedLinearMethod()
             # Check if Marlin is supported and not using batch invariant mode
@@ -222,7 +222,7 @@ class IluAutoAWQConfig(AutoAWQConfig):
             if is_layer_skipped(
                 prefix,
                 getattr(self, "modules_to_not_convert", []),
-                skip_with_substr=True,
+                match_mode="substring",
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
 

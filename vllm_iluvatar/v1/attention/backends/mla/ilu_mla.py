@@ -52,6 +52,10 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 
+from vllm.logger import init_logger
+
+logger = init_logger("vllm." + __name__)
+
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 
@@ -362,6 +366,15 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
             speculative_config is not None
             and speculative_config.num_speculative_tokens is not None
             and speculative_config.num_speculative_tokens > 0
+        )
+        logger.info_once(
+            "IluMLA quant dispatch: VLLM_ILU_MLA_ATTN_QUANT_TYPE=%r "
+            "-> use_int8_mla=%s kv_cache_dtype=%s use_spec_decode=%s",
+            envs.VLLM_ILU_MLA_ATTN_QUANT_TYPE,
+            self.use_int8_mla,
+            self.kv_cache_dtype,
+            self.use_spec_decode,
+            scope="local",
         )
 
     def reorg_kvcache(

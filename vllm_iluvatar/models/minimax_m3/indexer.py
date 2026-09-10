@@ -276,25 +276,48 @@ class MiniMaxM3IndexerIxformerImpl(MiniMaxM3IndexerImpl):
         if index_md.num_prefills > 0:
             p = index_md.prefill
             assert p is not None
-            score = minimax_m3_index_score(
-                iq[nd:],
-                kv,
-                p.block_table,
-                p.cu_seqlens_q,
-                p.seq_lens,
-                p.context_lens,
-                p.max_query_len,
-                p.max_seq_len,
-                self.num_kv_heads,
+            prefill_out = (
+                buf_htk[:, nd:, :] if buf_htk is not None else None
             )
-            prefill_topk = minimax_m3_index_topk(
-                score,
-                p.cu_seqlens_q,
-                p.context_lens,
-                p.max_query_len,
-                self.topk_blocks,
-                self.init_blocks,
-                self.local_blocks,
-                out=buf_htk[:, nd:, :] if buf_htk is not None else None,
-            )
+            if p.max_query_len == 1:
+                # A one-token chunk has the same causal boundary as decode.
+                # Skip the low-parallel score + top-k pair and reuse the
+                # parallel decode score path. Production 8k--64k prefills have
+                # q_len>=512 and never enter this branch.
+                prefill_topk = minimax_m3_index_decode(
+                    iq[nd:],
+                    kv,
+                    p.block_table,
+                    p.seq_lens,
+                    p.max_seq_len,
+                    self.topk_blocks,
+                    self.init_blocks,
+                    self.local_blocks,
+                    self.num_kv_heads,
+                    1,
+                    1,
+                    out=prefill_out,
+                )
+            else:
+                score = minimax_m3_index_score(
+                    iq[nd:],
+                    kv,
+                    p.block_table,
+                    p.cu_seqlens_q,
+                    p.seq_lens,
+                    p.context_lens,
+                    p.max_query_len,
+                    p.max_seq_len,
+                    self.num_kv_heads,
+                )
+                prefill_topk = minimax_m3_index_topk(
+                    score,
+                    p.cu_seqlens_q,
+                    p.context_lens,
+                    p.max_query_len,
+                    self.topk_blocks,
+                    self.init_blocks,
+                    self.local_blocks,
+                    out=prefill_out,
+                )
         return decode_topk, prefill_topk

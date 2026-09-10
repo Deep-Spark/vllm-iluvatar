@@ -18,7 +18,6 @@ import ixformer.inference.functions as ixf_ops
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
@@ -78,6 +77,7 @@ from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
@@ -268,11 +268,71 @@ class MiniMaxM3MLP(nn.Module):
             alpha=config.swiglu_alpha,
             beta=config.swiglu_beta,
         )
+        self._swiglu_limit = float(config.swiglu_limit)
+        self._swiglu_alpha = float(config.swiglu_alpha)
+        self._swiglu_beta = float(config.swiglu_beta)
+        # Shared experts do not reduce their row-parallel output here; the MoE
+        # runner folds that rank-local residual into the routed result before
+        # the single final collective. This makes it safe to bypass
+        # RowParallelLinear.forward when its MXFP8 kernel accepts prequantized
+        # activation.
+        self._fuse_shared_mxfp8_activation = (
+            ".shared_experts" in prefix and not reduce_results
+        )
+        self._dense_route_cache: dict[
+            tuple[int, torch.device], torch.Tensor
+        ] = {}
+
+    def _fused_shared_mxfp8_activation(
+        self, gate_up: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, object] | None:
+        if (
+            not self._fuse_shared_mxfp8_activation
+            or self._swiglu_alpha != 1.702
+            or self._swiglu_beta != 1.0
+            or self.down_proj.bias is not None
+            or self.down_proj.reduce_results
+        ):
+            return None
+        quant_method = getattr(self.down_proj, "quant_method", None)
+        kernel = getattr(quant_method, "kernel", None)
+        apply_prequantized = getattr(
+            kernel, "apply_weights_prequantized", None
+        )
+        fused_activation = getattr(
+            ixf_ops, "swigluoai_uninterleave_dynamic_scaled_fp8", None
+        )
+        if apply_prequantized is None or fused_activation is None:
+            return None
+
+        rows = int(gate_up.shape[0])
+        cache_key = (rows, gate_up.device)
+        dst_to_src = self._dense_route_cache.get(cache_key)
+        if dst_to_src is None:
+            # The fused EP activation only tests route >= 0. A reusable all-zero
+            # map marks every dense/shared-expert row valid without an arange
+            # kernel on every forward.
+            dst_to_src = torch.zeros(
+                rows, dtype=torch.int32, device=gate_up.device
+            )
+            self._dense_route_cache[cache_key] = dst_to_src
+        qx, scale_x = fused_activation(
+            gate_up, dst_to_src, self._swiglu_limit
+        )
+        return qx, scale_x, apply_prequantized
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        fused_activation = self._fused_shared_mxfp8_activation(gate_up)
+        if fused_activation is None:
+            x = self.act_fn(gate_up)
+        if fused_activation is None:
+            x, _ = self.down_proj(x)
+        else:
+            qx, scale_x, apply_prequantized = fused_activation
+            x = apply_prequantized(
+                self.down_proj, qx, scale_x, self.down_proj.bias
+            )
         return x
 
 
@@ -686,6 +746,9 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             or self.layer_name not in fwd_slot_mapping
         ):
             # Memory-profiling run: caches not yet bound, slot_mapping is empty.
+            # Reserve the maximum TCU densify scratch before vLLM locks its
+            # workspace manager; all M3 layers reuse this simultaneous slot.
+            self.impl.reserve_prefill_workspace(num_tokens)
             return qkv.new_zeros((num_tokens, self.hidden_size))
 
         main_slot_mapping = fwd_slot_mapping[self.layer_name]
@@ -724,16 +787,17 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         output, _ = self.o_proj(attn_output)
         return output
 
-    @eager_break_during_capture
     def _run_attention(
         self,
         query: torch.Tensor,
         index_query: torch.Tensor,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        # Single eager break around both: their split-K kernels read per-request
-        # metadata and can't be captured into a cudagraph. The indexer writes its
-        # top-k into the shared ``topk_indices_buffer``; the attend reads it back.
+        # Captured with the rest of the decode forward under FULL_DECODE_ONLY.
+        # Prefill stays eager (runtime mode NONE). The indexer writes top-k into
+        # the shared ``topk_indices_buffer``; the attend reads it back. Split-K
+        # scratch is the C++ grow-only buffer so capture does not allocate and
+        # free graph-pool memory inside this call.
         self.indexer(index_query)
         return self.impl.forward(self, query, self.kv_cache, output)
 
@@ -827,16 +891,18 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
             else:
-                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual
+                )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
 
+        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         hidden_states, residual = fused_allreduce_gemma_rms_norm(
             hidden_states, residual, self.post_attention_layernorm
         )
-        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         hidden_states = ffn(hidden_states)
         return hidden_states, residual
 

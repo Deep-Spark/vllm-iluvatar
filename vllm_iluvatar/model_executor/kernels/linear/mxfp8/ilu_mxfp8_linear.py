@@ -187,9 +187,53 @@ class IluMxfp8LinearKernel(Mxfp8LinearKernel):
         # ``fp8_per_token_dynamic_scaled`` only requires the last dim contiguous,
         # which ``reshape`` guarantees here.
         qx, scale_x = ixfops.fp8_per_token_dynamic_scaled(x_2d)
+        return self.apply_weights_prequantized(
+            layer, qx, scale_x, bias, output_shape=x.shape[:-1]
+        )
+
+    def apply_weights_prequantized(
+        self,
+        layer: torch.nn.Module,
+        qx: torch.Tensor,
+        scale_x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        *,
+        output_shape: tuple[int, ...] | torch.Size | None = None,
+    ) -> torch.Tensor:
+        """Apply an MXFP8 linear to an already per-token E4M3 activation.
+
+        This is used by fused activation+quant producers, avoiding a
+        BF16-materialize then re-quantize boundary before the next linear.
+        """
+        scale_w = layer.weight_scale
+        if scale_w.dim() != 1:
+            raise RuntimeError(
+                "IluMxfp8LinearKernel.apply_weights_prequantized expects a "
+                f"per-channel [N] weight scale, got shape {list(scale_w.shape)}."
+            )
+        if qx.dtype is not torch.float8_e4m3fn or qx.dim() != 2:
+            raise TypeError(
+                "prequantized activation must be contiguous 2-D "
+                f"float8_e4m3fn, got shape={list(qx.shape)} dtype={qx.dtype}"
+            )
+        if not qx.is_contiguous():
+            raise ValueError("prequantized activation must be contiguous")
+        if (
+            scale_x.dtype is not torch.float32
+            or scale_x.dim() != 1
+            or scale_x.numel() != qx.shape[0]
+        ):
+            raise TypeError(
+                "prequantized activation scale must be float32 [M], got "
+                f"shape={list(scale_x.shape)} dtype={scale_x.dtype}"
+            )
+
+        import ixformer.inference.functions as ixfops
 
         n = int(layer.weight.shape[0])
-        output = torch.empty((x_2d.shape[0], n), dtype=torch.bfloat16, device=x.device)
+        output = torch.empty(
+            (qx.shape[0], n), dtype=torch.bfloat16, device=qx.device
+        )
         bias_bf16 = None if bias is None else bias.to(torch.bfloat16)
 
         use_gemv = (
@@ -212,4 +256,6 @@ class IluMxfp8LinearKernel(Mxfp8LinearKernel):
                 qx, layer.weight, scale_x, scale_w, output, bias_bf16, backend="ixmm"
             )
 
-        return output.view(*x.shape[:-1], n)
+        if output_shape is None:
+            return output
+        return output.view(*output_shape, n)

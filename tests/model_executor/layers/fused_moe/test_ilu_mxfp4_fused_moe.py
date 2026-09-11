@@ -911,7 +911,10 @@ def test_ixformer_pipeline_wires_args_correctly(weights, hidden_states, monkeypa
     assert gather_call.call_args.args[1].dtype is torch.float32
 
 
-def test_ixmm_m3_uses_fused_packed_swiglu_quant(hidden_states, monkeypatch):
+@pytest.mark.parametrize("alpha,beta", [(1.702, 1.0), (0.75, -0.25)])
+def test_ixmm_uses_parameterized_fused_packed_swiglu_quant(
+    hidden_states, monkeypatch, alpha, beta
+):
     expert_count = 4
     w13 = torch.zeros(
         expert_count, _H // 2, 2 * _I, dtype=torch.uint8
@@ -950,14 +953,16 @@ def test_ixmm_m3_uses_fused_packed_swiglu_quant(hidden_states, monkeypatch):
         gemm_backend="ixmm",
         gemm_mode=0,
         swiglu_variant="swigluoai",
-        swiglu_alpha=1.702,
-        swiglu_beta=1.0,
+        swiglu_alpha=alpha,
+        swiglu_beta=beta,
     )
 
     fused = fake_ixfops.swigluoai_uninterleave_dynamic_scaled_fp8
     fused.assert_called_once()
     assert fused.call_args.args[1] is routing_out["v"][1]
     assert fused.call_args.args[2] == float(_SWIGLU_LIMIT)
+    assert fused.call_args.args[3] == alpha
+    assert fused.call_args.args[4] == beta
     assert fused.call_args.kwargs["backend"] == "ixformer_native"
     fake_ixfops.fp8_per_token_dynamic_scaled.assert_not_called()
 

@@ -285,10 +285,8 @@ _STEP3_SWIGLUSTEP_VARIANT = "step3_swiglustep"
 # the sigmoid, and the up branch is offset by ``beta`` --
 # ``gate.clamp(max=limit) * sigmoid(alpha * gate) * (up.clamp(±limit) + beta)``.
 # Note ixformer's ``swigluoai_and_mul`` is the *interleaved* gpt-oss split and
-# must not be used here. Newer ixformer CQ builds expose the correctly packed
-# ``swigluoai_uninterleave_dynamic_scaled_fp8`` fusion for MiniMax-M3's fixed
-# alpha=1.702 / beta=1.0 contract. Older builds and non-default parameters keep
-# the composed torch + ``fp8_per_token_dynamic_scaled`` fallback.
+# must not be used here. ``swigluoai_uninterleave_dynamic_scaled_fp8`` exposes
+# the packed alpha/beta semantics directly.
 _SWIGLUOAI_VARIANT = "swigluoai"
 _VALID_SWIGLU_VARIANTS = (
     _DSV4_CLAMP_VARIANT,
@@ -305,8 +303,6 @@ _VALID_SWIGLU_VARIANTS = (
 # values guard for ``None`` themselves (see ``IluModelOptMxFp8FusedMoE.apply``).
 _SWIGLUOAI_ALPHA = 1.0
 _SWIGLUOAI_BETA = 0.0
-_FUSED_M3_SWIGLUOAI_ALPHA = 1.702
-_FUSED_M3_SWIGLUOAI_BETA = 1.0
 
 
 def _swigluoai_uninterleave(
@@ -623,38 +619,18 @@ def _ilu_mxfp4_fused_experts_ixformer(
 
     # --- 4) SwiGLU + E4M3 -----------------------------------------------
     if swiglu_variant == _SWIGLUOAI_VARIANT:
+        # The activation variant defines the layout and formula. Its parameters
+        # are data, not a signal for selecting an implementation.
         alpha = _SWIGLUOAI_ALPHA if swiglu_alpha is None else float(swiglu_alpha)
         beta = _SWIGLUOAI_BETA if swiglu_beta is None else float(swiglu_beta)
-        fused_swiglu = getattr(
-            ixfops, "swigluoai_uninterleave_dynamic_scaled_fp8", None
+        a2_fp8, a2_scale = ixfops.swigluoai_uninterleave_dynamic_scaled_fp8(
+            gemm1_out,
+            dst_to_src,
+            float(swiglu_limit),
+            alpha,
+            beta,
+            backend=_IXFORMER_NATIVE_BACKEND,
         )
-        if (
-            gemm_backend == _IXMM_BACKEND
-            and fused_swiglu is not None
-            and alpha == _FUSED_M3_SWIGLUOAI_ALPHA
-            and beta == _FUSED_M3_SWIGLUOAI_BETA
-        ):
-            a2_fp8, a2_scale = fused_swiglu(
-                gemm1_out,
-                dst_to_src,
-                float(swiglu_limit),
-                backend=_IXFORMER_NATIVE_BACKEND,
-            )
-        else:
-            # MiniMax-M3 tags its experts ``SWIGLUOAI_UNINTERLEAVE``: packed
-            # halves, unlike the interleaved gpt-oss ``swigluoai_and_mul``.
-            act = _swigluoai_uninterleave(
-                gemm1_out,
-                float(swiglu_limit),
-                alpha=alpha,
-                beta=beta,
-            )
-            # Invalid routes may contain uninitialised GEMM1 rows. Avoid a NaN
-            # per-token amax before the final gather drops those rows.
-            act = torch.where(
-                (dst_to_src >= 0).unsqueeze(-1), act, act.new_zeros(())
-            )
-            a2_fp8, a2_scale = ixfops.fp8_per_token_dynamic_scaled(act)
     elif swiglu_variant == _STEP3_SWIGLUSTEP_VARIANT:
         # Step-3.5 swiglustep: clamp after silu; ``limit <= 0`` = plain SwiGLU.
         a2_fp8, a2_scale = ixfops.swiglustep_dynamic_scaled_fp8(

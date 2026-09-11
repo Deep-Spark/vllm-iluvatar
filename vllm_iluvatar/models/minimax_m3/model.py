@@ -288,8 +288,6 @@ class MiniMaxM3MLP(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, object] | None:
         if (
             not self._fuse_shared_mxfp8_activation
-            or self._swiglu_alpha != 1.702
-            or self._swiglu_beta != 1.0
             or self.down_proj.bias is not None
             or self.down_proj.reduce_results
         ):
@@ -317,7 +315,11 @@ class MiniMaxM3MLP(nn.Module):
             )
             self._dense_route_cache[cache_key] = dst_to_src
         qx, scale_x = fused_activation(
-            gate_up, dst_to_src, self._swiglu_limit
+            gate_up,
+            dst_to_src,
+            self._swiglu_limit,
+            self._swiglu_alpha,
+            self._swiglu_beta,
         )
         return qx, scale_x, apply_prequantized
 

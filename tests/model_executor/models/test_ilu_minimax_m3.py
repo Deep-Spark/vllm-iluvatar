@@ -187,6 +187,43 @@ def test_routed_experts_receive_the_config_swiglu_parameters():
     assert passed.get("activation") == "'swigluoai_uninterleave'"
 
 
+def test_dense_mlp_uses_community_act_then_linear():
+    """Shared/dense MLP must match DS-V4 / GLM / community MiniMax-M3:
+
+    ``gate_up_proj`` -> ``SiluAndMulWithClamp`` -> ``down_proj``. The fused EP
+    SwiGLU-OAI + ``dst_to_src`` path is only for routed experts.
+    """
+    package_dir = Path(__file__).parents[3] / "vllm_iluvatar" / "models" / "minimax_m3"
+    tree = ast.parse((package_dir / "model.py").read_text())
+
+    mlp_cls = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name == "MiniMaxM3MLP"
+    )
+    init_fn = next(
+        node
+        for node in mlp_cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    forward_fn = next(
+        node
+        for node in mlp_cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "forward"
+    )
+    assigned = {
+        ast.unparse(stmt.targets[0]): ast.unparse(stmt.value)
+        for stmt in init_fn.body
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+    }
+    assert assigned.get("self.act_fn", "").startswith("SiluAndMulWithClamp(")
+    source = ast.unparse(forward_fn)
+    assert "self.act_fn(gate_up)" in source
+    assert "self.down_proj(x)" in source
+    assert "enable_fuse_quant" not in ast.unparse(mlp_cls)
+    assert "swigluoai_uninterleave_dynamic_scaled_fp8" not in ast.unparse(mlp_cls)
+
+
 def test_community_config_still_supplies_m3_swiglu_defaults():
     """``swiglu_beta`` is absent from the checkpoint, so the config default is
     what M3 actually runs with. If community ever changes it, M3's routed and

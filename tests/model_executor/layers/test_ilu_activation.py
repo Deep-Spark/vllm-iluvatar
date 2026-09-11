@@ -114,6 +114,25 @@ def test_silu_and_mul_with_clamp_supports_non_default_alpha_beta():
     torch.testing.assert_close(out, expected)
 
 
+def test_silu_and_mul_with_clamp_forwards_alpha_beta_to_ixformer(monkeypatch):
+    """alpha/beta selection lives in ixformer, not in a plugin-side branch."""
+    from vllm_iluvatar import _custom_ops as ilu_ops
+
+    seen = {}
+
+    def _fake(input, output, limit, alpha, beta):
+        seen["kwargs"] = (limit, alpha, beta)
+        output.zero_()
+        return output
+
+    monkeypatch.setattr(ilu_ops.ixf_ops, "silu_and_mul_with_clamp", _fake)
+    ilu_ops.silu_and_mul_with_clamp(
+        torch.empty(1, 2), torch.zeros(1, 4), limit=7.0, alpha=1.702, beta=1.0
+    )
+
+    assert seen["kwargs"] == (7.0, 1.702, 1.0)
+
+
 def test_silu_and_mul_with_clamp_binds_plugin_custom_op():
     with (
         patch(

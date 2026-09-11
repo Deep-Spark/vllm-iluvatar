@@ -126,33 +126,6 @@ def test_apply_rejects_a_layer_that_skipped_the_requant(monkeypatch):
         kernel.apply_weights(layer, torch.zeros(1, _K, dtype=torch.bfloat16))
 
 
-def test_apply_prequantized_skips_activation_quant(monkeypatch):
-    kernel = _make_kernel(monkeypatch)
-    layer = _make_layer()
-    layer.register_parameter(
-        "weight_scale",
-        nn.Parameter(torch.ones(_N, dtype=torch.float32), requires_grad=False),
-    )
-    qx = torch.zeros(3, _K, dtype=torch.float8_e4m3fn)
-    scale_x = torch.ones(3, dtype=torch.float32)
-    seen = {}
-
-    import ixformer.inference.functions as ixfops
-
-    def _fake_mm(x, weight, x_scale, w_scale, output, bias, backend):
-        seen["args"] = (x, weight, x_scale, w_scale, bias, backend)
-        output.fill_(2)
-
-    monkeypatch.setattr(ixfops, "fp8_per_channel_mm", _fake_mm)
-    out = kernel.apply_weights_prequantized(layer, qx, scale_x)
-
-    assert out.shape == (3, _N)
-    assert torch.all(out == 2)
-    assert seen["args"][0] is qx
-    assert seen["args"][2] is scale_x
-    assert seen["args"][-1] == "ixmm"
-
-
 def test_patch_prepends_kernel_ahead_of_community_candidates(monkeypatch):
     import vllm.model_executor.kernels.linear as k
     from vllm.platforms import PlatformEnum

@@ -19,7 +19,10 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.attention import Attention
@@ -231,7 +234,12 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
 
 
 class MiniMaxM3MLP(nn.Module):
-    """Dense SwiGLU-OAI MLP (used by the leading dense layers)."""
+    """Dense SwiGLU-OAI MLP (leading dense layers and the shared expert).
+
+    Same layout as community ``MiniMaxM3MLP`` and Iluvatar DS-V4 / GLM shared
+    experts: ``gate_up_proj`` -> ``act_fn`` -> ``down_proj``. The activation
+    dispatches through ``ops.silu_and_mul_with_clamp`` into ixformer.
+    """
 
     def __init__(
         self,
@@ -262,79 +270,16 @@ class MiniMaxM3MLP(nn.Module):
                 f"Unsupported activation: {config.hidden_act}. "
                 "Only swigluoai is supported."
             )
-        # gate * sigmoid(alpha * gate) * (up + beta), with both halves clamped.
         self.act_fn = SiluAndMulWithClamp(
             swiglu_limit=config.swiglu_limit,
             alpha=config.swiglu_alpha,
             beta=config.swiglu_beta,
         )
-        self._swiglu_limit = float(config.swiglu_limit)
-        self._swiglu_alpha = float(config.swiglu_alpha)
-        self._swiglu_beta = float(config.swiglu_beta)
-        # Shared experts do not reduce their row-parallel output here; the MoE
-        # runner folds that rank-local residual into the routed result before
-        # the single final collective. This makes it safe to bypass
-        # RowParallelLinear.forward when its MXFP8 kernel accepts prequantized
-        # activation.
-        self._fuse_shared_mxfp8_activation = (
-            ".shared_experts" in prefix and not reduce_results
-        )
-        self._dense_route_cache: dict[
-            tuple[int, torch.device], torch.Tensor
-        ] = {}
-
-    def _fused_shared_mxfp8_activation(
-        self, gate_up: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, object] | None:
-        if (
-            not self._fuse_shared_mxfp8_activation
-            or self.down_proj.bias is not None
-            or self.down_proj.reduce_results
-        ):
-            return None
-        quant_method = getattr(self.down_proj, "quant_method", None)
-        kernel = getattr(quant_method, "kernel", None)
-        apply_prequantized = getattr(
-            kernel, "apply_weights_prequantized", None
-        )
-        fused_activation = getattr(
-            ixf_ops, "swigluoai_uninterleave_dynamic_scaled_fp8", None
-        )
-        if apply_prequantized is None or fused_activation is None:
-            return None
-
-        rows = int(gate_up.shape[0])
-        cache_key = (rows, gate_up.device)
-        dst_to_src = self._dense_route_cache.get(cache_key)
-        if dst_to_src is None:
-            # The fused EP activation only tests route >= 0. A reusable all-zero
-            # map marks every dense/shared-expert row valid without an arange
-            # kernel on every forward.
-            dst_to_src = torch.zeros(
-                rows, dtype=torch.int32, device=gate_up.device
-            )
-            self._dense_route_cache[cache_key] = dst_to_src
-        qx, scale_x = fused_activation(
-            gate_up,
-            dst_to_src,
-            self._swiglu_limit,
-            self._swiglu_alpha,
-            self._swiglu_beta,
-        )
-        return qx, scale_x, apply_prequantized
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
-        fused_activation = self._fused_shared_mxfp8_activation(gate_up)
-        if fused_activation is None:
-            x = self.act_fn(gate_up)
-        if fused_activation is None:
-            x, _ = self.down_proj(x)
-        else:
-            qx, scale_x, apply_prequantized = fused_activation
-            x = apply_prequantized(
-                self.down_proj, qx, scale_x, self.down_proj.bias
-            )
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
         return x
 
 

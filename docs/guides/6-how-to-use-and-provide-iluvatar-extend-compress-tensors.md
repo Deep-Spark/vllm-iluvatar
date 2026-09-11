@@ -220,12 +220,12 @@ Qwen3.8-27B 完整示例：
 python3 examples/iluvatar-compressed-tensors/quant.py \
   --input  /path/to/Qwen3.8-27B \
   --output /path/to/Qwen3.8-27B-W4A8 \
-  --configs examples/iluvatar-compressed-tensors/configs/qwen3_8.json \
-  --rules   examples/iluvatar-compressed-tensors/rules/qwen3_8.json \
+  --configs examples/iluvatar-compressed-tensors/configs/qwen3_8_dense_w4a8.json \
+  --rules   examples/iluvatar-compressed-tensors/rules/qwen3_8_dense_w4a8.json \
   --device cpu
 ```
 
-`rules/qwen3_8.json` 只量化 `self_attn.{q,k,v,o}_proj` 与 `mlp.{gate,up,down}_proj`；`linear_attn`（GDN）、`embed_tokens`、`lm_head`、norm、visual 保持 BF16。`configs/qwen3_8.json` 的 `iluvatar.weight_layout` 通过 `$rules` 与离线选项对齐为 `packed_nn`。
+`rules/qwen3_8_dense_w4a8.json` 只量化 `self_attn.{q,k,v,o}_proj` 与 `mlp.{gate,up,down}_proj`；`linear_attn`（GDN）、`embed_tokens`、`lm_head`、norm、visual 保持 BF16。`configs/qwen3_8_dense_w4a8.json` 的 `iluvatar.weight_layout` 通过 `$rules` 与离线选项对齐为 `packed_nn`。
 
 N、K 以及 TP / fused 分片边界必须是 32 的倍数。`create_weights` 用 `PackedvLLMParameter(packed_dim=1, packed_factor=2)` 承载 fused QKV / `gate_up` 的 shard 减半；不对齐会直接报错。packed 域切片与「先切再 pack」的等价性由
 `tests/model_executor/layers/quantization/compressed_tensors/test_ilu_compressed_tensors_w4a8_int.py` 中的 `test_packed_domain_*` 在真实形状上按 TP=1/2/8 逐字节验证。

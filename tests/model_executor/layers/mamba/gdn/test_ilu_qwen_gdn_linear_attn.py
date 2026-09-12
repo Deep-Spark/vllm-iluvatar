@@ -189,6 +189,118 @@ def test_rearrange_mixed_qkv_splits_qkv_projection(monkeypatch):
     assert torch.equal(value.reshape(3, 2), mixed_qkv[:, 8:])
 
 
+def test_packed_qkv_views_matches_rearrange(monkeypatch):
+    module, _, _ = _load_plugin_module(monkeypatch, gdn_backend=True)
+    op = object.__new__(module.IluQwenGatedDeltaNetAttention)
+    op.key_dim = 4
+    op.value_dim = 2
+    op.tp_size = 1
+    op.head_k_dim = 2
+    op.head_v_dim = 1
+    packed = torch.arange(30).reshape(3, 10).contiguous()
+    q0, k0, v0 = op.rearrange_mixed_qkv(packed)
+    q1, k1, v1 = op.packed_qkv_views(packed)
+    assert torch.equal(q0, q1)
+    assert torch.equal(k0, k1)
+    assert torch.equal(v0, v1)
+    assert q1.stride() == (10, 2, 1)
+    assert not q1.is_contiguous()
+
+
+def test_ixformer_core_uses_cuda_gating(monkeypatch):
+    import inspect
+
+    module, _, _ = _load_plugin_module(monkeypatch, gdn_backend=True)
+    src = inspect.getsource(module.IluQwenGatedDeltaNetAttention._forward_core_ixformer)
+    assert "fused_gdn_gating" not in src
+    assert "qwen_gdn_gating" in src
+    assert "_g_buf" in src and "_beta_buf" in src
+    assert "self._conv_w" in src
+    assert "weight.view" not in src
+    assert "torch.ones" not in src
+    assert "to(dtype=torch.uint8)" not in src
+    assert "to(dtype=torch.int32).contiguous()" not in src
+    assert "conv_cache.contiguous()" not in src
+    assert "conv_cache.copy_" not in src
+
+
+def test_ixformer_forward_cuda_isolates_other_kernels(monkeypatch):
+    import inspect
+
+    module, _, _ = _load_plugin_module(monkeypatch, gdn_backend=True)
+    src = inspect.getsource(module.IluQwenGatedDeltaNetAttention.forward_cuda)
+    assert 'self._qwen38_kernel() != "ixformer"' in src
+    assert "super().forward_cuda" in src
+    assert "b = b.contiguous()" not in src
+    assert "a = a.contiguous()" not in src
+    assert "_core_attn_out" in src
+
+
+def test_ixformer_output_projection_uses_cuda_rmsnorm(monkeypatch):
+    import inspect
+
+    module, _, _ = _load_plugin_module(monkeypatch, gdn_backend=True)
+    src = inspect.getsource(module.IluQwenGatedDeltaNetAttention._output_projection)
+    assert "qwen_gdn_rmsnorm_gated" in src
+    assert "self.norm.weight" in src
+    assert "reshape(-1" not in src
+    assert 'self._qwen38_kernel() != "ixformer"' in src
+    assert "super()._output_projection" in src
+
+
+def test_ixformer_has_init_reuses_buffers(monkeypatch):
+    module, _, _ = _load_plugin_module(monkeypatch, gdn_backend=True)
+    op = object.__new__(module.IluQwenGatedDeltaNetAttention)
+    op._has_init_u8 = torch.empty(8, dtype=torch.uint8)
+    op._has_init_i32 = torch.empty(8, dtype=torch.int32)
+    src = torch.tensor([1, 0, 1], dtype=torch.int32)
+    u8 = op._ixformer_has_init(src, 3, as_uint8=True)
+    assert u8 is not None and u8.dtype == torch.uint8
+    assert u8.data_ptr() == op._has_init_u8.data_ptr()
+    assert torch.equal(u8, src.to(torch.uint8))
+    i32 = op._ixformer_has_init(src, 3, as_uint8=False)
+    assert i32 is not None and i32.data_ptr() == src.data_ptr()
+    filled = op._ixformer_has_init(None, 4, as_uint8=False)
+    assert filled is not None
+    assert torch.equal(filled, torch.ones(4, dtype=torch.int32))
+    assert filled.data_ptr() == op._has_init_i32.data_ptr()
+    assert op._ixformer_has_init(None, 4, as_uint8=True) is None
+
+
+def test_ixformer_workspace_is_packed_and_shared(monkeypatch):
+    module, _, _ = _load_plugin_module(monkeypatch, gdn_backend=True)
+    module._shared_gdn_workspaces.clear()
+
+    def make_op():
+        op = object.__new__(module.IluQwenGatedDeltaNetAttention)
+        op._gdn_workspace = None
+        op._conv_out = None
+        op._g_buf = None
+        op._beta_buf = None
+        op._core_attn_out = None
+        op._conv_w = None
+        op._has_init_u8 = None
+        op._has_init_i32 = None
+        op._gdn_workspace_group = 123
+        op.num_v_heads = 12
+        op.tp_size = 4
+        op._gdn_b_max = 64
+        op._gdn_t_max = 8192
+        op.conv_dim = 24
+        op.head_v_dim = 8
+        op.conv1d = SimpleNamespace(weight=torch.empty(24, 1, 4))
+        return op
+
+    first = make_op()
+    second = make_op()
+    first._ensure_ixformer_buffers(torch.device("cpu"))
+    second._ensure_ixformer_buffers(torch.device("cpu"))
+    expected = ((8192 + 15) // 16 + 64) * 3 * 13856
+    assert first._gdn_workspace is not None
+    assert first._gdn_workspace.numel() == expected
+    assert second._gdn_workspace is first._gdn_workspace
+
+
 def _import_real_plugin_module():
     module_name = (
         "vllm_iluvatar.model_executor.layers.mamba.gdn.ilu_qwen_gdn_linear_attn"
@@ -319,6 +431,21 @@ def _build_split_and_plugin_chunk_metadata(module, query_lens, state_indices, de
     meta_plugin_chunk = dataclasses.replace(
         meta_split,
         has_initial_state=has_initial_state.to(torch.int32),
+        chunk_offsets=torch.tensor(
+            [0]
+            + list(
+                torch.tensor(
+                    [(length + 15) // 16 for length in query_lens],
+                    dtype=torch.int32,
+                )
+                .cumsum(0)
+                .tolist()
+            ),
+            dtype=torch.int32,
+            device=device,
+        ),
+        n_chunk_max=max((length + 15) // 16 for length in query_lens),
+        n_chunk_total=sum((length + 15) // 16 for length in query_lens),
     )
     return meta_split, meta_plugin_chunk
 
@@ -437,3 +564,29 @@ def test_forward_core_split_reference_matches_plugin_non_split(
         atol=3e-2,
         rtol=3e-2,
     )
+
+
+def test_qwen38_kernel_ixformer_only_on_qwen4_exp_ivcore30(monkeypatch):
+    """Qwen4Exp + ivcore30 uses ixformer; other models and ivcore11 stay FLA."""
+    from vllm_iluvatar.model_executor.layers.mamba.gdn.ilu_qwen_gdn_linear_attn import (
+        IluQwenGatedDeltaNetAttention,
+    )
+
+    dummy = SimpleNamespace(use_qwen38_ixformer=True)
+    bound = MethodType(IluQwenGatedDeltaNetAttention._qwen38_kernel, dummy)
+    monkeypatch.setattr(
+        "vllm_iluvatar.model_executor.layers.mamba.gdn.ilu_qwen_gdn_linear_attn.is_ivcore30",
+        lambda: True,
+    )
+    assert bound() == "ixformer"
+    monkeypatch.setattr(
+        "vllm_iluvatar.model_executor.layers.mamba.gdn.ilu_qwen_gdn_linear_attn.is_ivcore30",
+        lambda: False,
+    )
+    assert bound() == "plugin_fla"
+    dummy.use_qwen38_ixformer = False
+    monkeypatch.setattr(
+        "vllm_iluvatar.model_executor.layers.mamba.gdn.ilu_qwen_gdn_linear_attn.is_ivcore30",
+        lambda: True,
+    )
+    assert bound() == "plugin_fla"

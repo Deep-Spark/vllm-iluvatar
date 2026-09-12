@@ -14,7 +14,9 @@ How:
     ``QwenGatedDeltaNetAttention.register_oot`` narrows the attention delta to
     CoreX kernel preparation/dispatch.
 Scope:
-    Qwen3-Next GDN layers on the Iluvatar platform.
+    Shared Iluvatar GDN metadata/OOT for Qwen3-Next / Qwen3.5. The CoreX30
+    ixformer CUDA math is opt-in per layer via ``use_qwen38_ixformer`` and is
+    only set by the Qwen4Exp model package.
 """
 
 from __future__ import annotations
@@ -32,6 +34,9 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 )
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import _encode_layer_name
+
+from vllm_iluvatar.ilu_util.arch import is_ivcore30
 
 from vllm_iluvatar.model_executor.layers.mamba.ops.ilu_causal_conv1d import (
     causal_conv1d_fn,
@@ -43,6 +48,8 @@ from vllm_iluvatar.third_party.flash_linear_attention.ops.ilu_l2norm import (
 from vllm_iluvatar.v1.attention.backends.ilu_gdn_attn import (
     IluGDNAttentionMetadata,
 )
+
+_shared_gdn_workspaces: dict[tuple[int, str, int | None], torch.Tensor] = {}
 
 
 def _register_qwen_gdn_attention(cls):
@@ -121,9 +128,9 @@ def fused_gdn_gating(
     """
     batch, num_heads = a.shape
     token_stride = a.stride(0)
-    assert b.stride(0) == token_stride, (
-        "a and b must all contiguous or split from a same tensor"
-    )
+    assert (
+        b.stride(0) == token_stride
+    ), "a and b must all contiguous or split from a same tensor"
     grid = (batch, triton.cdiv(num_heads, 8))
 
     g = torch.empty(batch, num_heads, dtype=torch.float32, device=a.device)
@@ -193,6 +200,197 @@ def fused_gdn_gating_kernel(
 
 @_register_qwen_gdn_attention
 class IluQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
+    def __init__(
+        self,
+        config,
+        vllm_config,
+        prefix: str = "",
+        gqa_interleaved_layout=False,
+        reduce_results: bool = True,
+    ) -> None:
+        super().__init__(
+            config,
+            vllm_config,
+            prefix,
+            gqa_interleaved_layout,
+            reduce_results,
+        )
+        self._gdn_workspace: torch.Tensor | None = None
+        self._conv_out: torch.Tensor | None = None
+        self._g_buf: torch.Tensor | None = None
+        self._beta_buf: torch.Tensor | None = None
+        self._core_attn_out: torch.Tensor | None = None
+        self._conv_w: torch.Tensor | None = None
+        self._has_init_u8: torch.Tensor | None = None
+        self._has_init_i32: torch.Tensor | None = None
+        self._gdn_workspace_group = id(vllm_config)
+        # Cache sizes at construct time: CustomOp forward has no
+        # get_current_vllm_config() context.
+        sched = vllm_config.scheduler_config
+        self._gdn_b_max = int(sched.max_num_seqs)
+        self._gdn_t_max = int(sched.max_num_batched_tokens)
+        # Qwen3.8 ixformer math is installed by Qwen4ExpDecoderLayer only.
+        self.use_qwen38_ixformer = False
+
+    def _qwen38_kernel(self) -> str:
+        """Qwen4Exp on ivcore30 uses ixformer CUDA; everyone else keeps FLA."""
+        if getattr(self, "use_qwen38_ixformer", False) and is_ivcore30():
+            return "ixformer"
+        return "plugin_fla"
+
+    def _ensure_ixformer_buffers(
+        self, device: torch.device, dtype: torch.dtype | None = None
+    ) -> None:
+        if self._gdn_workspace is not None:
+            return
+        hv = self.num_v_heads // self.tp_size
+        n_chunk_capacity = (self._gdn_t_max + 15) // 16 + self._gdn_b_max
+        nbytes = n_chunk_capacity * hv * 13856
+        conv_c = self.conv_dim // self.tp_size
+        out_dtype = dtype if dtype is not None else torch.bfloat16
+        workspace_key = (
+            self._gdn_workspace_group,
+            device.type,
+            device.index,
+        )
+        shared = _shared_gdn_workspaces.get(workspace_key)
+        if shared is None or shared.numel() < nbytes:
+            shared = torch.empty(nbytes, dtype=torch.uint8, device=device)
+            _shared_gdn_workspaces[workspace_key] = shared
+        self._gdn_workspace = shared
+        self._conv_out = torch.empty(
+            self._gdn_t_max, conv_c, dtype=torch.bfloat16, device=device
+        )
+        self._g_buf = torch.empty(
+            self._gdn_t_max, hv, dtype=torch.float32, device=device
+        )
+        self._beta_buf = torch.empty(
+            self._gdn_t_max, hv, dtype=torch.bfloat16, device=device
+        )
+        self._core_attn_out = torch.empty(
+            self._gdn_t_max, hv, self.head_v_dim, dtype=out_dtype, device=device
+        )
+        conv_w = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+        self._conv_w = conv_w if conv_w.is_contiguous() else conv_w.contiguous()
+        self._has_init_u8 = torch.empty(
+            self._gdn_b_max, dtype=torch.uint8, device=device
+        )
+        self._has_init_i32 = torch.empty(
+            self._gdn_b_max, dtype=torch.int32, device=device
+        )
+
+    def _ixformer_has_init(
+        self,
+        has_init: torch.Tensor | None,
+        batch: int,
+        *,
+        as_uint8: bool,
+    ) -> torch.Tensor | None:
+        """Reuse preallocated [max_num_seqs] flags. None stays None."""
+        if has_init is None:
+            if not as_uint8:
+                assert self._has_init_i32 is not None
+                out = self._has_init_i32[:batch]
+                out.fill_(1)
+                return out
+            return None
+        src = has_init[:batch]
+        if as_uint8:
+            assert self._has_init_u8 is not None
+            if (
+                src.dtype == torch.uint8
+                and src.is_contiguous()
+                and src.numel() == batch
+            ):
+                return src
+            out = self._has_init_u8[:batch]
+            out.copy_(src)
+            return out
+        if src.dtype == torch.int32 and src.is_contiguous() and src.numel() == batch:
+            return src
+        assert self._has_init_i32 is not None
+        out = self._has_init_i32[:batch]
+        out.copy_(src)
+        return out
+
+    def forward_cuda(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """G5/G9 only on the ixformer core. Other kernels keep parent zeros+copy.
+
+        ``IluQwenGatedDeltaNetAttention`` is the OOT class for every
+        ``QwenGatedDeltaNetAttention`` once ``VLLM_ILU_GDN_ATTN_BACKEND=1``.
+        Qwen3-Next / Qwen3.5 and CoreX11 leave ``use_qwen38_ixformer`` unset
+        and take the parent FLA / cuinfer path:
+        - ``a/b.contiguous()``: community ``fused_gdn_gating`` assumes packed
+          stride; packed-decode Triton is stride-safe, but keep the parent
+          copies so we do not change a fallback we are not measuring.
+        - ``torch.zeros`` for ``core_attn_out``: FLA / warmup may not write
+          every row (vLLM PR 28182). ixformer writes the live ``T`` rows, so
+          we reuse a preallocated buffer and only zero on profile warmup.
+        """
+        if self._qwen38_kernel() != "ixformer":
+            return super().forward_cuda(hidden_states)
+
+        num_tokens = hidden_states.size(0)
+        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+        ba, _ = self.in_proj_ba(hidden_states)
+
+        if self.gqa_interleaved_layout:
+            query, key, value, z, b, a = self.fix_query_key_value_ordering(
+                mixed_qkvz, ba
+            )
+            query, key, value = map(
+                lambda x: rearrange(x, "l p d -> l (p d)"), (query, key, value)
+            )
+            mixed_qkv = torch.cat((query, key, value), dim=-1)
+        else:
+            qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+            z_size = self.value_dim // self.tp_size
+            mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
+            z = z.reshape(z.size(0), -1, self.head_v_dim)
+            b, a = self.split_ba(ba)
+
+        self._ensure_ixformer_buffers(hidden_states.device, hidden_states.dtype)
+        assert self._core_attn_out is not None
+        core_attn_out = self._core_attn_out[:num_tokens]
+        # Profile run: custom op returns without writing. Do not feed
+        # uninitialized rows into RMSNormGated.
+        if get_forward_context().attn_metadata is None:
+            core_attn_out.zero_()
+
+        torch.ops.vllm.qwen_gdn_attention_core(
+            mixed_qkv,
+            b,
+            a,
+            core_attn_out,
+            layer_name=_encode_layer_name(self.prefix),
+        )
+        return self._output_projection(core_attn_out, z)
+
+    def _output_projection(
+        self,
+        core_attn_out: torch.Tensor,
+        z: torch.Tensor,
+    ) -> torch.Tensor:
+        """RMSNormGated + out_proj.
+
+        Parent flattens strided ``z`` from ``mixed_qkvz.split`` and copies.
+        The ixformer kernel eats ``[T, Hv, 128]`` with token stride >= Hv*128.
+        """
+        if self._qwen38_kernel() != "ixformer":
+            return super()._output_projection(core_attn_out, z)
+        if z.dim() == 2:
+            z = z.view(z.size(0), -1, self.head_v_dim)
+        x = core_attn_out
+        if x.dim() == 2:
+            x = x.view(x.size(0), -1, self.head_v_dim)
+        ixf_c_ops.infer.qwen_gdn_rmsnorm_gated(
+            x, z, self.norm.weight, x, float(self.norm.eps)
+        )
+        output, _ = self.out_proj(x.flatten(-2))
+        return output
+
     def rearrange_mixed_qkv(self, mixed_qkv):
         if mixed_qkv is None:
             return None, None, None
@@ -210,6 +408,138 @@ class IluQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         value = rearrange(value, "l (h d) -> l h d", d=self.head_v_dim)
 
         return query, key, value
+
+    def packed_qkv_views(self, packed: torch.Tensor):
+        """G4: [T,H,D] views of packed conv_out [T, C=q|k|v], no copy."""
+        t, c = packed.size(0), packed.size(1)
+        d = self.head_k_dim
+        q_dim = self.key_dim // self.tp_size
+        k_dim = self.key_dim // self.tp_size
+        v_dim = self.value_dim // self.tp_size
+        hq = q_dim // d
+        hv = v_dim // self.head_v_dim
+        query = packed.as_strided((t, hq, d), (c, d, 1), storage_offset=0)
+        key = packed.as_strided((t, hq, d), (c, d, 1), storage_offset=q_dim)
+        value = packed.as_strided(
+            (t, hv, self.head_v_dim),
+            (c, self.head_v_dim, 1),
+            storage_offset=q_dim + k_dim,
+        )
+        return query, key, value
+
+    def _forward_core_ixformer(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        attn_metadata: IluGDNAttentionMetadata,
+    ) -> None:
+        if attn_metadata.spec_sequence_masks is not None:
+            raise NotImplementedError(
+                "Qwen3.8 GDN spec/MTP is not wired; disable speculative decode"
+            )
+
+        self._ensure_ixformer_buffers(mixed_qkv.device, mixed_qkv.dtype)
+        assert self._gdn_workspace is not None
+        assert self._conv_out is not None
+        assert self._conv_w is not None
+
+        # split() of in_proj_qkvz is a non-contiguous [T,C] view; conv reads
+        # x[t * x_stride + c] and does not need a packed copy.
+        if mixed_qkv.dim() != 2:
+            mixed_qkv = mixed_qkv.view(mixed_qkv.size(0), -1)
+
+        conv_cache = self.kv_cache[0]
+        # The ixformer kernel consumes SD [N, 3, C] directly, including a
+        # padded block stride from the mamba page. Never materialize the full
+        # cache here: that would copy every block on every layer and step.
+        if is_conv_state_dim_first():
+            raise RuntimeError(
+                "Qwen GDN ixformer kernel requires SD conv-state layout; "
+                "dim-first layout would require a full-cache copy"
+            )
+        conv_state = conv_cache
+        ssm_cache = self.kv_cache[1]
+        if ssm_cache.dtype != torch.float32:
+            raise RuntimeError(
+                "Qwen GDN ixformer kernel needs fp32 SSM cache "
+                f"(got {ssm_cache.dtype}). Pass --mamba-ssm-cache-dtype float32."
+            )
+        # Packed pages are strided on dim0; the CUDA op accepts that stride.
+        ssm_state = ssm_cache
+
+        cu = attn_metadata.non_spec_query_start_loc
+        idx = attn_metadata.non_spec_state_indices_tensor
+        assert cu is not None and idx is not None
+        # G7: builder already packed int32 contiguous (graph buffer if needed).
+
+        tokens = mixed_qkv.size(0)
+        conv_out = self._conv_out[:tokens]
+        has_init = attn_metadata.has_initial_state
+        has_init_u8 = None
+        if attn_metadata.num_prefills > 0 and has_init is not None:
+            has_init_u8 = self._ixformer_has_init(
+                has_init, int(has_init.numel()), as_uint8=True
+            )
+        ixf_c_ops.infer.qwen_causal_conv1d(
+            mixed_qkv,
+            self._conv_w,
+            conv_out,
+            conv_state,
+            cu,
+            idx,
+            has_init_u8,
+        )
+
+        query, key, value = self.packed_qkv_views(conv_out)
+        assert self._g_buf is not None and self._beta_buf is not None
+        g = self._g_buf[:tokens]
+        beta = self._beta_buf[:tokens]
+        ixf_c_ops.infer.qwen_gdn_gating(
+            self.A_log, a, b, self.dt_bias, g, beta, 1.0, 20.0
+        )
+        scale = self.head_k_dim**-0.5
+        # S3: prefill / mixed go through chunk. Pure decode stays recurrent.
+        if attn_metadata.num_prefills > 0:
+            batch = int(cu.numel()) - 1
+            has_init_i32 = self._ixformer_has_init(has_init, batch, as_uint8=False)
+            assert has_init_i32 is not None
+            chunk_offsets = attn_metadata.chunk_offsets
+            assert chunk_offsets is not None
+            n_max = max(1, int(attn_metadata.n_chunk_max))
+            ixf_c_ops.infer.qwen_gdn_chunk_fwd(
+                query,
+                key,
+                value,
+                core_attn_out[:tokens],
+                g,
+                beta,
+                ssm_state,
+                has_init_i32,
+                cu,
+                idx,
+                chunk_offsets,
+                self._gdn_workspace,
+                n_max,
+                int(attn_metadata.n_chunk_total),
+                scale,
+                True,
+            )
+        elif attn_metadata.num_decodes > 0:
+            ixf_c_ops.infer.qwen_gdn_recurrent_fwd(
+                query,
+                key,
+                value,
+                core_attn_out[:tokens],
+                g,
+                beta,
+                ssm_state,
+                cu,
+                idx,
+                scale,
+                True,
+            )
 
     def _forward_core(
         self,
@@ -238,12 +568,22 @@ class IluQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         assert isinstance(attn_metadata, IluGDNAttentionMetadata)
 
         if (
-            self.enable_packed_recurrent_decode
+            self._qwen38_kernel() != "ixformer"
+            and self.enable_packed_recurrent_decode
             and attn_metadata.spec_sequence_masks is None
             and attn_metadata.num_prefills == 0
             and attn_metadata.num_decodes > 0
         ):
             return self._forward_core_decode_non_spec(
+                mixed_qkv=mixed_qkv,
+                b=b,
+                a=a,
+                core_attn_out=core_attn_out,
+                attn_metadata=attn_metadata,
+            )
+
+        if self._qwen38_kernel() == "ixformer":
+            return self._forward_core_ixformer(
                 mixed_qkv=mixed_qkv,
                 b=b,
                 a=a,
@@ -257,8 +597,12 @@ class IluQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         spec_sequence_masks = attn_metadata.spec_sequence_masks
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx
-        spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
-        non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
+        spec_state_indices_tensor = (
+            attn_metadata.spec_state_indices_tensor
+        )  # noqa: E501
+        non_spec_state_indices_tensor = (
+            attn_metadata.non_spec_state_indices_tensor
+        )  # noqa: E501
         self_kv_cache = self.kv_cache
         # conv_state must be (..., dim, width-1) for the conv kernels.
         # DS layout stores it that way directly; SD layout needs a transpose.
@@ -372,9 +716,9 @@ class IluQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 key_spec.shape[-1] ** -0.5,
                 True,
                 num_accepted_tokens,
-                spec_token_indx
-                if attn_metadata.num_prefills > 0
-                else None,  # none for cuda graph, else use spec_token_indx to inplace update
+                (
+                    spec_token_indx if attn_metadata.num_prefills > 0 else None
+                ),  # none for cuda graph, else use spec_token_indx to inplace update
             )
 
         # 2.2: Process the remaining part

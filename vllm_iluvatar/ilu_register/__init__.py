@@ -65,6 +65,7 @@ _OOT_MODEL_PACKAGES = [
     "vllm_iluvatar.models.deepseek_v4",
     "vllm_iluvatar.models.glm_moe_dsa",
     "vllm_iluvatar.models.minimax_m3",
+    "vllm_iluvatar.models.qwen4_exp",
 ]
 
 __all__ = ["apply_oot_registrations"]

@@ -34,6 +34,44 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 
+def _n_chunk_max_from_cu(query_start_loc_cpu: torch.Tensor | None) -> int:
+    """Host-side ceil(max_seq_len / 16). No device D2H."""
+    if query_start_loc_cpu is None or query_start_loc_cpu.numel() < 2:
+        return 1
+    lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+    if lens.numel() == 0:
+        return 1
+    max_len = int(lens.max().item())
+    return max(1, (max_len + 15) // 16)
+
+
+def _pack_int32_1d(
+    src: torch.Tensor | None, buf: torch.Tensor | None
+) -> torch.Tensor | None:
+    """Once-per-step int32 packed 1D for ixformer ``check_tensor_int_contiguous``.
+
+    Eager: ``query_start_loc[:B+1]`` is already packed; ``block_table[:, 0]``
+    may have stride ``max_blocks``. Copy the latter into the builder's
+    persistent graph buffer (same storage FULL decode will capture). Do not
+    realloc per layer.
+
+    FULL graph: the pad block already wrote a contiguous ``[:capture_bs]``
+    view of that buffer. Leave it; shrinking to live ``B`` would break replay.
+    """
+    if src is None:
+        return None
+    if src.dim() != 1:
+        src = src.reshape(-1)
+    if src.dtype == torch.int32 and src.is_contiguous():
+        return src
+    n = int(src.numel())
+    if buf is not None and n <= buf.numel():
+        dst = buf[:n]
+        dst.copy_(src, non_blocking=True)
+        return dst
+    return src.to(dtype=torch.int32).contiguous()
+
+
 class IluGDNAttentionBackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
@@ -52,6 +90,8 @@ class IluGDNAttentionBackend(AttentionBackend):
 class IluGDNAttentionMetadata(GDNAttentionMetadata):
     non_spec_query_start_loc_cpu: torch.Tensor | None = None
     output_index: torch.Tensor | None = None  # shape: [total_tokens,]
+    n_chunk_max: int = 1
+    n_chunk_total: int = 1
 
 
 class IluGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
@@ -254,6 +294,7 @@ class IluGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         prefill_query_start_loc: torch.Tensor | None = None
         prefill_state_indices: torch.Tensor | None = None
         prefill_has_initial_state: torch.Tensor | None = None
+        n_chunk_total = 1
 
         if num_prefills > 0:
             has_initial_state = context_lens_tensor > 0
@@ -265,6 +306,24 @@ class IluGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                     non_spec_query_start_loc_cpu,
                     device=query_start_loc.device,
                 )
+            )
+            assert non_spec_query_start_loc_cpu is not None
+            query_lens_cpu = (
+                non_spec_query_start_loc_cpu[1:]
+                - non_spec_query_start_loc_cpu[:-1]
+            )
+            chunk_counts_cpu = torch.div(
+                query_lens_cpu + 15, 16, rounding_mode="floor"
+            ).to(torch.int32)
+            chunk_offsets_cpu = torch.zeros(
+                chunk_counts_cpu.numel() + 1, dtype=torch.int32
+            )
+            torch.cumsum(
+                chunk_counts_cpu, dim=0, out=chunk_offsets_cpu[1:]
+            )
+            n_chunk_total = max(1, int(chunk_offsets_cpu[-1].item()))
+            chunk_offsets = async_tensor_h2d(
+                chunk_offsets_cpu, device=query_start_loc.device
             )
             if spec_sequence_masks is None and num_decodes > 0:
                 prefill_has_initial_state = has_initial_state[num_decodes:]
@@ -352,6 +411,14 @@ class IluGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
             non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
 
+        # G7: pack after graph padding so capture views stay fixed-shape.
+        idx_buf = getattr(self, "non_spec_state_indices_tensor", None)
+        cu_buf = getattr(self, "non_spec_query_start_loc", None)
+        non_spec_state_indices_tensor = _pack_int32_1d(
+            non_spec_state_indices_tensor, idx_buf
+        )
+        non_spec_query_start_loc = _pack_int32_1d(non_spec_query_start_loc, cu_buf)
+
         attn_metadata = IluGDNAttentionMetadata(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
@@ -379,5 +446,7 @@ class IluGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             token_chunk_offset_ptr=token_chunk_offset_ptr,
             non_spec_query_start_loc_cpu=non_spec_query_start_loc_cpu,
             output_index=output_index,
+            n_chunk_max=_n_chunk_max_from_cu(non_spec_query_start_loc_cpu),
+            n_chunk_total=n_chunk_total,
         )
         return attn_metadata

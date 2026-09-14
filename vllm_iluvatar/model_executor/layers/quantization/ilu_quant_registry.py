@@ -99,5 +99,29 @@ class _IluvatarQuantRegistry:
             raise TypeError("Method name must be a string")
         return self.methods.get(method_name)
 
+    def create_runtime_method(
+        self, method_name: str, context: object
+    ) -> QuantizeMethodBase:
+        """Instantiate a method through the runtime-conversion contract."""
+        method_cls = self.get_method(method_name)
+        if method_cls is None:
+            raise KeyError(
+                f"Iluvatar quantization method {method_name!r} is not "
+                f"registered; registered methods: {sorted(self.methods)}"
+            )
+        factory = getattr(method_cls, "from_ilu_runtime_config", None)
+        if not callable(factory):
+            raise TypeError(
+                f"Iluvatar quantization method {method_name!r} does not "
+                "implement from_ilu_runtime_config(context)"
+            )
+        method = factory(context)
+        if not isinstance(method, method_cls):
+            raise TypeError(
+                f"{method_name}.from_ilu_runtime_config returned "
+                f"{type(method).__name__}, expected {method_cls.__name__}"
+            )
+        return method
+
 
 IluvatarQuantRegistry = _IluvatarQuantRegistry()

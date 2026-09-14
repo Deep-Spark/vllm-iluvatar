@@ -1,0 +1,13 @@
+# Qwen/Qwen3.8-Flash-Next runtime quant（file 模式）
+# 开源权重：https://modelscope.cn/models/Qwen/Qwen3.8-Flash-Next
+#
+# file 必须是所有 worker 可见的绝对路径。部署前：
+#   1. 把同目录 fp8-runtime.json 放到目标机器
+#   2. sha256sum fp8-runtime.json，把结果写成 sha256:<64 位小写 hex>
+#   3. 填写下面的 file 与 sha256
+# 修改 JSON 后必须重新计算 sha256。
+additional-config:
+  ilu_quant:
+    source: file
+    file: /path/to/vllm-iluvatar/examples/iluvatar-runtime-quant/Qwen/Qwen3.8-Flash-Next/fp8-runtime.json
+    sha256: sha256:c69b4d0cda9784d9fb95f821c1488e2877af232a00d5bf6fca88276f3713a0d3

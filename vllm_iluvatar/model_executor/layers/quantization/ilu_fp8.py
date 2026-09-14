@@ -111,6 +111,10 @@ from vllm_iluvatar.model_executor.layers.quantization.ilu_modelopt_nvfp4 import 
     _SWIGLUSTEP_CLAMP,
     _get_ilu_output_scale,
 )
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime_quant_config import (
+    dtype_name,
+    resolve_ilu_runtime_method,
+)
 
 # Process this many experts per dequant/requant temporary. Dequanting w13 across
 # all local experts at once would allocate several GB of fp32; mirror the
@@ -133,11 +137,103 @@ class IluFp8PerChannelOnlineLinearMethod(_Fp8OnlineLinearBase):
 
     uses_meta_device: bool = True
 
-    def __init__(self, quant_config: IluFp8Config) -> None:
+    def __init__(
+        self,
+        quant_config: IluFp8Config,
+        *,
+        runtime_context: Any | None = None,
+    ) -> None:
         super().__init__()
         self.quant_config = quant_config
         self.gemm_format = quant_config.gemm_format.upper()
         self._unquantized_method = UnquantizedLinearMethod()
+        self._runtime_context = runtime_context
+        if runtime_context is None:
+            self._source_dtypes = None
+            self._fallback_method = self._unquantized_method
+        else:
+            self._source_dtypes = runtime_context.group.weights.source.dtypes
+            self._fallback_method = runtime_context.original_method
+            if self._fallback_method is None:
+                raise ValueError(
+                    f"{runtime_context.prefix}: runtime FP8 fallback requires "
+                    "the original quantization method"
+                )
+
+    def _get_source_dtypes(self) -> tuple[str, ...] | None:
+        return getattr(self, "_source_dtypes", None)
+
+    def _get_fallback_method(self):
+        return getattr(self, "_fallback_method", self._unquantized_method)
+
+    def _get_runtime_context(self):
+        return getattr(self, "_runtime_context", None)
+
+    @classmethod
+    def from_ilu_runtime_config(
+        cls, context: Any
+    ) -> IluFp8PerChannelOnlineLinearMethod:
+        group = context.group
+        weights = group.weights
+        if not isinstance(context.layer, LinearBase):
+            raise TypeError(f"{group.group_id}: online FP8 only supports LinearBase")
+        if not isinstance(context.original_method, UnquantizedLinearMethod):
+            raise TypeError(
+                f"{group.group_id}: online FP8 fallback currently requires an "
+                "UnquantizedLinearMethod"
+            )
+        if group.require.original_disposition != "ignored":
+            raise ValueError(
+                f"{group.group_id}: online FP8 requires original_disposition=ignored"
+            )
+        if weights.loading.mode != "transform" or (
+            weights.loading.stage != "process_weights_after_loading"
+        ):
+            raise ValueError(
+                f"{group.group_id}: online FP8 requires "
+                "loading=transform@process_weights_after_loading"
+            )
+        if (
+            weights.source.format != "native"
+            or weights.target.format != "fp8"
+            or weights.target.dtype != "float8_e4m3fn"
+            or weights.target.strategy != "channel"
+        ):
+            raise ValueError(
+                f"{group.group_id}: unsupported online FP8 weight contract"
+            )
+        activation = group.input_activations
+        if (
+            activation is None
+            or activation.num_bits != 8
+            or activation.type != "float"
+            or activation.strategy != "token"
+            or not activation.dynamic
+            or group.output_activations is not None
+        ):
+            raise ValueError(
+                f"{group.group_id}: online FP8 requires dynamic per-token FP8 "
+                "input activations and null output_activations"
+            )
+        allowed_options = {"gemm_format", "shape_mismatch_policy"}
+        unknown_options = set(group.options) - allowed_options
+        if unknown_options:
+            raise ValueError(
+                f"{group.group_id}: unsupported options: {sorted(unknown_options)}"
+            )
+        shape_policy = group.options.get("shape_mismatch_policy", "fallback_original")
+        if shape_policy != "fallback_original":
+            raise ValueError(
+                f"{group.group_id}: shape_mismatch_policy must be fallback_original"
+            )
+        gemm_format = group.options.get("gemm_format", "TN")
+        if gemm_format != "TN":
+            raise ValueError(f"{group.group_id}: only gemm_format=TN is supported")
+
+        quant_config = copy.copy(context.base_quant_config)
+        quant_config.weight_block_size = None
+        quant_config.gemm_format = gemm_format
+        return cls(quant_config, runtime_context=context)
 
     def _shape_fallback_reason(self, n: int, k: int) -> str | None:
         reasons = []
@@ -179,6 +275,14 @@ class IluFp8PerChannelOnlineLinearMethod(_Fp8OnlineLinearBase):
             # count copy_ numel, then replays against a materialized parameter.
             if param.is_meta:
                 return weight_loader(param, loaded_weight, *args, **kwargs)
+            loaded_dtype = dtype_name(loaded_weight.dtype)
+            source_dtypes = self._get_source_dtypes()
+            if source_dtypes is not None and loaded_dtype not in source_dtypes:
+                raise ValueError(
+                    f"{getattr(layer, 'prefix', '<unknown>')}: runtime FP8 "
+                    f"expected checkpoint dtype in {source_dtypes}, got "
+                    f"{loaded_dtype}"
+                )
 
             staging_by_name = layer.__dict__.setdefault("_ilu_fp8_staging", {})
             staging = staging_by_name.get("weight")
@@ -202,6 +306,13 @@ class IluFp8PerChannelOnlineLinearMethod(_Fp8OnlineLinearBase):
         **extra_weight_attrs,
     ) -> None:
         output_size_per_partition = sum(output_partition_sizes)
+        param_dtype = dtype_name(params_dtype)
+        source_dtypes = self._get_source_dtypes()
+        if source_dtypes is not None and param_dtype not in source_dtypes:
+            raise ValueError(
+                f"{getattr(layer, 'prefix', '<unknown>')}: runtime FP8 expects "
+                f"parameter dtype in {source_dtypes}, got {param_dtype}"
+            )
         fallback_reason = self._shape_fallback_reason(
             output_size_per_partition, input_size_per_partition
         )
@@ -217,8 +328,20 @@ class IluFp8PerChannelOnlineLinearMethod(_Fp8OnlineLinearBase):
         layer._ilu_fp8_online_fallback_reason = fallback_reason
 
         if fallback_reason:
-            storage_dtype = params_dtype
-            effective_loader = weight_loader
+            # Keep the online layerwise loader's meta-device contract while
+            # delegating parameter construction and metadata to the original
+            # method.
+            with torch.device("meta"):
+                self._get_fallback_method().create_weights(
+                    layer,
+                    input_size_per_partition,
+                    output_partition_sizes,
+                    input_size,
+                    output_size,
+                    params_dtype,
+                    **extra_weight_attrs,
+                )
+            initialize_online_processing(layer)
             logger.warning(
                 "Online FP8 fallback to %s for %s: shape=[%d, %d], %s",
                 params_dtype,
@@ -227,23 +350,28 @@ class IluFp8PerChannelOnlineLinearMethod(_Fp8OnlineLinearBase):
                 input_size_per_partition,
                 fallback_reason,
             )
-        else:
-            storage_dtype = torch.float8_e4m3fn
-            effective_loader = self._make_online_weight_loader(layer, weight_loader)
+            runtime_context = self._get_runtime_context()
+            if runtime_context is not None:
+                runtime_context.record_shape_result(transformed=False)
+            return
 
         weight = ModelWeightParameter(
             data=torch.empty(
                 output_size_per_partition,
                 input_size_per_partition,
                 device="meta",
-                dtype=storage_dtype,
+                dtype=torch.float8_e4m3fn,
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=effective_loader,
+            weight_loader=self._make_online_weight_loader(layer, weight_loader),
         )
         layer.register_parameter("weight", weight)
         initialize_online_processing(layer)
+        if not fallback_reason:
+            runtime_context = self._get_runtime_context()
+            if runtime_context is not None:
+                runtime_context.record_shape_result(transformed=True)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
@@ -257,7 +385,7 @@ class IluFp8PerChannelOnlineLinearMethod(_Fp8OnlineLinearBase):
                     f"{getattr(layer, 'prefix', '<unknown>')}: BF16 fallback "
                     f"weight has unexpected dtype {layer.weight.dtype}"
                 )
-            self._unquantized_method.process_weights_after_loading(layer)
+            self._get_fallback_method().process_weights_after_loading(layer)
             layer._already_called_process_weights_after_loading = True
             return
 
@@ -331,8 +459,11 @@ class IluFp8PerChannelOnlineLinearMethod(_Fp8OnlineLinearBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         fallback_reason = getattr(layer, "_ilu_fp8_online_fallback_reason", None)
+        runtime_context = self._get_runtime_context()
+        if runtime_context is not None:
+            runtime_context.assert_validation_complete()
         if fallback_reason:
-            return self._unquantized_method.apply(layer, x, bias)
+            return self._get_fallback_method().apply(layer, x, bias)
         if layer.weight.dtype != torch.float8_e4m3fn or not hasattr(
             layer, "weight_scale"
         ):
@@ -913,16 +1044,12 @@ class IluFp8Config(Fp8Config):
             return True
         return any(prefix.startswith(f"{name}.") for name in self.ignored_layers)
 
-    # [ILU override] Fp8Config.get_quant_method — delta: online LinearBase
-    # layers use IluFp8PerTensorOnlineLinearMethod, serialized LinearBase layers
-    # use IluFp8LinearMethod, and block-wise routed experts use IluFp8MoEMethod.
-    # Skipped layers, attention and KV cache remain delegated to the community.
-    def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+    def _get_original_method_and_disposition(self, layer: torch.nn.Module, prefix: str):
         if isinstance(layer, LinearBase):
             if self._is_layer_skipped(prefix):
-                return UnquantizedLinearMethod()
+                return UnquantizedLinearMethod(), "ignored"
 
-            new_quant = copy.deepcopy(self)
+            new_quant = copy.copy(self)
             new_quant.weight_block_size = (
                 self.weight_block_size if self.none_moe_use_weight_block_size else None
             )
@@ -933,7 +1060,7 @@ class IluFp8Config(Fp8Config):
                 method = IluFp8LinearMethod(new_quant)
             else:
                 method = IluFp8PerChannelOnlineLinearMethod(new_quant)
-            return method
+            return method, "quantized"
 
         if (
             isinstance(layer, RoutedExperts)
@@ -942,5 +1069,21 @@ class IluFp8Config(Fp8Config):
             and self.store_dtype != "mxfp4"
             and not self._is_layer_skipped(prefix)
         ):
-            return IluFp8MoEMethod(self, layer)
-        return super().get_quant_method(layer, prefix)
+            return IluFp8MoEMethod(self, layer), "quantized"
+        return super().get_quant_method(layer, prefix), "quantized"
+
+    # [ILU override] Fp8Config.get_quant_method — delta: first preserve the
+    # checkpoint's original dispatch, then optionally overlay a strictly
+    # validated additional_config.ilu_quant method.
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        original_method, original_disposition = (
+            self._get_original_method_and_disposition(layer, prefix)
+        )
+        runtime_method = resolve_ilu_runtime_method(
+            base_quant_config=self,
+            original_method=original_method,
+            original_disposition=original_disposition,
+            layer=layer,
+            prefix=prefix,
+        )
+        return runtime_method if runtime_method is not None else original_method

@@ -33,3 +33,9 @@ def _resolve_version() -> str:
 
 
 __version__ = _resolve_version()
+
+
+try:
+    from ._git_id import __git_id__
+except ImportError:
+    __git_id__ = "unknown"

@@ -1,3 +1,6 @@
+# Generated at wheel build time
+vllm_iluvatar/_git_id.py
+
 # Byte-compiled / optimized / cache
 __pycache__/
 *.py[cod]

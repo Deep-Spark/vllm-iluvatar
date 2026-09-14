@@ -15,7 +15,7 @@ import os
 import sys
 from pathlib import Path
 
-from vllm_iluvatar.version import __version__
+from vllm_iluvatar.version import __git_id__, __version__
 
 # Env flag that gates the installed startup-patch .pth hook. The .pth is inert
 # unless this is "1"; ``register_platform`` sets it so spawned worker
@@ -24,6 +24,7 @@ STARTUP_PATCH_ENV = "VLLM_ILUVATAR_ENABLE_STARTUP_PATCH"
 
 __all__ = [
     "__version__",
+    "__git_id__",
     "register_platform",
     "register_general",
     "STARTUP_PATCH_ENV",

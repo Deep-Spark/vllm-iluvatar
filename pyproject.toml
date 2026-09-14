@@ -28,6 +28,7 @@ pythonpath = ["."]
 
 [tool.ruff.lint.per-file-ignores]
 "vllm_iluvatar/version.py" = ["F401"]
+"vllm_iluvatar/_git_id.py" = ["ALL"]
 
 [tool.ruff.lint]
 select = [

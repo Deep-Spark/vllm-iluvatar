@@ -62,6 +62,29 @@ def _load_version() -> str:
     return str(version)
 
 
+def write_git_id() -> None:
+    """Bake `[branch] <sha>` into vllm_iluvatar/_git_id.py for the installed wheel."""
+    git_id = "unknown"
+    if (ROOT_DIR / ".git").exists():
+        try:
+            git = ["git", "-c", f"safe.directory={ROOT_DIR}", "-C", str(ROOT_DIR)]
+            branch = subprocess.check_output(
+                git + ["rev-parse", "--abbrev-ref", "HEAD"],
+                text=True,
+            ).strip()
+            sha = subprocess.check_output(
+                git + ["rev-parse", "HEAD"],
+                text=True,
+            ).strip()
+            git_id = f"[{branch}] {sha}"
+        except (OSError, subprocess.CalledProcessError):
+            pass
+    (ROOT_DIR / "vllm_iluvatar" / "_git_id.py").write_text(
+        f'__git_id__ = "{git_id}"\n', encoding="utf-8"
+    )
+    logging.info("Wrote vllm_iluvatar/_git_id.py: %s", git_id)
+
+
 def get_requirements() -> list[str]:
     """Resolve runtime dependencies from ``requirements.txt``.
 
@@ -197,12 +220,16 @@ class CMakeBuildExt(build_ext):
         logging.info("Running CMake configure: %s", " ".join(configure_cmd))
         subprocess.run(configure_cmd, cwd=build_temp, env=cmake_env, check=True)
 
+        # ``_C_self_id`` (AddCommitInfo) stamps the git id into the built
+        # library; it is a separate target, so building only ``_C`` would ship
+        # an unidentifiable extension.
         build_cmd = [
             "cmake",
             "--build",
             ".",
             "--target",
             "_C",
+            "_C_self_id",
             "--parallel",
             str(num_jobs),
         ]
@@ -267,9 +294,11 @@ if editable_wheel is not None:
 EXT_MODULES = [CMakeExtension(name="vllm_iluvatar._C")]
 
 
+write_git_id()
 setup(
     version=_load_version(),
     install_requires=get_requirements(),
     ext_modules=EXT_MODULES,
     cmdclass=CMDCLASS,
+    package_data={"vllm_iluvatar": ["_git_id.py"]},
 )

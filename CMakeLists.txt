@@ -164,3 +164,6 @@ if(CMAKE_LIBRARY_OUTPUT_DIRECTORY)
   set_target_properties(_C PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
 endif()
+
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/AddCommitInfo.cmake)
+AddCommitInfo(_C)

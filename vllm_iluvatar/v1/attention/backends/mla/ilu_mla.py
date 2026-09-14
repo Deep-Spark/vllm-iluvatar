@@ -38,6 +38,8 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonMetadata,
     MLACommonMetadataBuilder,
     QueryLenSupport,
+    init_mla_context_partial,
+    reorg_kvcache,
 )
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SparseMLACommonImpl,
@@ -461,28 +463,29 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
         assert attn_metadata.prefill is not None
         prefill_metadata = attn_metadata.prefill
         assert prefill_metadata.prefill_backend is not None
-        assert prefill_metadata.chunked_context is not None
-        assert prefill_metadata.chunked_context.padded_local_chunk_seq_lens is not None
-        assert prefill_metadata.chunked_context.local_context_lens_allranks is not None
-        assert prefill_metadata.chunked_context.padded_local_cu_seq_lens is not None
-        assert prefill_metadata.chunked_context.cu_seq_lens_lst is not None
-        assert prefill_metadata.chunked_context.chunk_size is not None
+        chunked_context = prefill_metadata.chunked_context
+        assert chunked_context is not None
 
         output = None
-        iters = len(prefill_metadata.chunked_context.seq_tot)
-        workspace = prefill_metadata.chunked_context.workspace
+        output_lse = None
+        workspace = chunked_context.workspace
 
-        for i in range(iters):
-            toks = prefill_metadata.chunked_context.seq_tot[i]
+        for chunk in chunked_context.chunks:
+            assert chunk.padded_local_seq_lens is not None
+            assert chunk.local_context_lens_allranks is not None
+            assert chunk.padded_local_cu_seq_lens is not None
+            assert chunk.local_starts is not None
+
+            toks = chunk.num_local_context_tokens
+            padded_local_cu_seq_lens = chunk.padded_local_cu_seq_lens
+            block_table = prefill_metadata.block_table[chunk.request_slice]
             ops.cp_gather_cache(
                 src_cache=kv_c_and_k_pe_cache,
-                dst=workspace,
-                block_table=prefill_metadata.block_table,
-                cu_seq_lens=prefill_metadata.chunked_context.padded_local_cu_seq_lens[
-                    i
-                ],
-                batch_size=attn_metadata.num_prefills,
-                seq_starts=prefill_metadata.chunked_context.starts[i],
+                dst=workspace[:toks],
+                block_table=block_table,
+                cu_seq_lens=padded_local_cu_seq_lens,
+                batch_size=chunk.num_requests,
+                seq_starts=chunk.starts,
             )
             # workspace
             # |------- N tokens --------|--------- N*dcp_size tokens ----------|
@@ -496,6 +499,9 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
             ]
             assert toks * dcp_world_size <= cur_allgather_workspace.shape[0]
             cur_allgather_kvcache = cur_allgather_workspace[: toks * dcp_world_size]
+            # ILU: walk Corex-available dcp group allgather + copy, equivalent to
+            # community dcp_manager.kv_gather (dcp_manager._kv_gather's comm
+            # primitive may not be registered on Corex).
             cur_allgather_kvcache.copy_(
                 get_dcp_group().all_gather(local_gathered_kvcache, dim=0)
             )
@@ -507,17 +513,14 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
                 1
             ).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
 
-            kv_c_normed, k_pe = self.reorg_kvcache(
+            kv_c_normed, k_pe = reorg_kvcache(
                 allgatered_kv_c_normed,
                 allgatered_k_pe,
-                padded_local_chunk_seq_lens_lst=prefill_metadata.chunked_context.padded_local_chunk_seq_lens[
-                    i
-                ],
-                local_context_lens_allranks=prefill_metadata.chunked_context.local_context_lens_allranks,
-                sum_seq_len=prefill_metadata.chunked_context.cu_seq_lens_lst[i][-1],
-                max_seq_len=prefill_metadata.chunked_context.max_seq_lens[i],
-                chunk_size=prefill_metadata.chunked_context.chunk_size,
-                chunk_idx=i,
+                padded_local_chunk_seq_lens_lst=chunk.padded_local_seq_lens,
+                local_context_lens_allranks=chunk.local_context_lens_allranks,
+                local_starts=chunk.local_starts,
+                sum_seq_len=chunk.num_context_tokens,
+                max_seq_len=chunk.max_seq_len,
                 toks=toks,
             )
 
@@ -528,31 +531,50 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
             k = self._concat_k_nope_k_pe(k_nope, k_pe)
 
             attn_output, attn_softmax_lse = (
-                attn_metadata.prefill.prefill_backend.run_prefill_context_chunk(
-                    chunk_idx=i,
-                    q=q,
+                prefill_metadata.prefill_backend.run_prefill_context_chunk(
+                    chunk=chunk,
+                    q=q[chunk.token_slice],
                     k=k,
                     v=v,
                 )
             )
+
             if output is None:
-                output = attn_output
-                output_lse = attn_softmax_lse
-            else:
-                output, output_lse = ixf_merge_attn_states(
-                    prefix_output=output,
-                    prefix_lse=output_lse,
-                    suffix_output=attn_output,
-                    suffix_lse=attn_softmax_lse,
+                if (
+                    len(chunked_context.chunks) == 1
+                    and not chunked_context.empty_token_slices
+                ):
+                    return attn_output, attn_softmax_lse
+                output, output_lse = init_mla_context_partial(
+                    chunked_context,
+                    attn_output,
+                    attn_softmax_lse,
+                    num_tokens=q.shape[0],
+                )
+
+            # ILU accumulate: continuation chunk overlap merged via
+            # ixf_merge_attn_states, new region direct copy. Equivalent to
+            # community accumulate_mla_context_chunk, but merge goes through
+            # ixformer (Corex has _C.merge_attn_states unregistered).
+            token_start = chunk.token_slice.start
+            token_end = chunk.token_slice.stop
+            init_start = token_start
+            if chunk.is_continuation:
+                init_start = chunk.continuation_token_end
+                num_merged = init_start - token_start
+                merged_out, merged_lse = ixf_merge_attn_states(
+                    prefix_output=output[token_start:init_start],
+                    prefix_lse=output_lse[:, token_start:init_start],
+                    suffix_output=attn_output[:num_merged],
+                    suffix_lse=attn_softmax_lse[:, :num_merged],
                     return_lse=True,
                 )
-                ixf_merge_attn_states(
-                    prefix_output=output,
-                    prefix_lse=output_lse,
-                    suffix_output=attn_output,
-                    suffix_lse=attn_softmax_lse,
-                    return_lse=True,
-                )
+                output[token_start:init_start] = merged_out
+                output_lse[:, token_start:init_start] = merged_lse
+            if init_start < token_end:
+                written = init_start - token_start
+                output[init_start:token_end].copy_(attn_output[written:])
+                output_lse[:, init_start:token_end].copy_(attn_softmax_lse[:, written:])
 
         return output, output_lse
 
@@ -580,33 +602,35 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
         assert attn_metadata.prefill is not None
         prefill_metadata = attn_metadata.prefill
         assert prefill_metadata.chunked_context is not None
+        chunked_context = prefill_metadata.chunked_context
+        assert chunked_context is not None
 
         output = None
         output_lse = None
-        iters = len(prefill_metadata.chunked_context.seq_tot)
-        workspace = prefill_metadata.chunked_context.workspace
+        workspace = chunked_context.workspace
 
-        for i in range(iters):
-            toks = prefill_metadata.chunked_context.seq_tot[i]
+        for chunk in chunked_context.chunks:
+            toks = chunk.num_context_tokens
+            block_table = prefill_metadata.block_table[chunk.request_slice]
             if self.use_int8_mla:
                 ops.gather_cache_int8(
                     src_cache=kv_c_and_k_pe_cache,
                     src_cache_scale=kv_c_and_k_pe_cache_scale,
                     kv_lora_rank=self.kv_lora_rank,
                     dst=workspace,
-                    block_table=prefill_metadata.block_table,
-                    cu_seq_lens=(prefill_metadata.chunked_context.cu_seq_lens[i]),
-                    batch_size=attn_metadata.num_prefills,
-                    seq_starts=(prefill_metadata.chunked_context.starts[i]),
+                    block_table=block_table,
+                    cu_seq_lens=chunk.cu_seq_lens,
+                    batch_size=chunk.num_requests,
+                    seq_starts=chunk.starts,
                 )
             else:
                 ixf_ops.vllm_cp_gather_cache(
                     src_cache=kv_c_and_k_pe_cache,
                     dst=workspace,
-                    block_table=prefill_metadata.block_table,
-                    cu_seq_lens=(prefill_metadata.chunked_context.cu_seq_lens[i]),
-                    batch_size=attn_metadata.num_prefills,
-                    seq_starts=(prefill_metadata.chunked_context.starts[i]),
+                    block_table=block_table,
+                    cu_seq_lens=chunk.cu_seq_lens,
+                    batch_size=chunk.num_requests,
+                    seq_starts=chunk.starts,
                 )
 
             kv_c_normed = workspace[:toks][..., : self.kv_lora_rank]
@@ -623,24 +647,48 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
             attn_output, attn_softmax_lse = (
                 attn_metadata.prefill.prefill_backend.run_prefill_context_chunk(
-                    chunk_idx=i,
-                    q=q,
+                    chunk=chunk,
+                    q=q[chunk.token_slice],
                     k=k,
                     v=v,
                 )
             )
 
             if output is None:
-                output = attn_output
-                output_lse = attn_softmax_lse
-            else:
-                output, output_lse = ixf_merge_attn_states(
-                    prefix_output=output,
-                    prefix_lse=output_lse,
-                    suffix_output=attn_output,
-                    suffix_lse=attn_softmax_lse,
+                if (
+                    len(chunked_context.chunks) == 1
+                    and not chunked_context.empty_token_slices
+                ):
+                    return attn_output, attn_softmax_lse
+                output, output_lse = init_mla_context_partial(
+                    chunked_context,
+                    attn_output,
+                    attn_softmax_lse,
+                    num_tokens=q.shape[0],
+                )
+
+            # ILU accumulate：continuation chunk 的重叠区用 ixf_merge_attn_states
+            # 合并，新增区直接 copy。等价于社区 accumulate_mla_context_chunk，
+            # 但 merge 走 ixformer（Corex 上 _C.merge_attn_states 未注册）。
+            token_start = chunk.token_slice.start
+            token_end = chunk.token_slice.stop
+            init_start = token_start
+            if chunk.is_continuation:
+                init_start = chunk.continuation_token_end
+                num_merged = init_start - token_start
+                merged_out, merged_lse = ixf_merge_attn_states(
+                    prefix_output=output[token_start:init_start],
+                    prefix_lse=output_lse[:, token_start:init_start],
+                    suffix_output=attn_output[:num_merged],
+                    suffix_lse=attn_softmax_lse[:, :num_merged],
                     return_lse=True,
                 )
+                output[token_start:init_start] = merged_out
+                output_lse[:, token_start:init_start] = merged_lse
+            if init_start < token_end:
+                written = init_start - token_start
+                output[init_start:token_end].copy_(attn_output[written:])
+                output_lse[:, init_start:token_end].copy_(attn_softmax_lse[:, written:])
 
         return output, output_lse
 

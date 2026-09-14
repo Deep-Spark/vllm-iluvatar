@@ -13,6 +13,22 @@ import pytest
 vllm_envs = importlib.import_module("vllm.envs")
 
 
+def test_dsa_indexer_prepare_env_reader_defaults_on(monkeypatch):
+    name = "VLLM_ILU_GLM_DSA_INDEXER_PREPARE_FUSION"
+    envs = importlib.import_module("vllm_iluvatar.envs")
+    monkeypatch.setattr(
+        vllm_envs, "environment_variables", dict(vllm_envs.environment_variables)
+    )
+    monkeypatch.delenv(name, raising=False)
+    envs.apply()
+    reader = vllm_envs.environment_variables[name]
+    assert reader() is True
+    monkeypatch.setenv(name, "0")
+    assert reader() is False
+    monkeypatch.setenv(name, "1")
+    assert reader() is True
+
+
 def test_new_ilu_env_readers_are_registered(monkeypatch):
     envs = importlib.import_module("vllm_iluvatar.envs")
     monkeypatch.setattr(

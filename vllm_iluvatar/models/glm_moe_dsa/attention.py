@@ -279,6 +279,23 @@ class IluGlmMoeDsaIndexer(nn.Module):
         self.head_dim = config.index_head_dim
         self.rope_dim = config.qk_rope_head_dim
         self.q_lora_rank = q_lora_rank
+        self.use_prepare_fusion = envs.VLLM_ILU_GLM_DSA_INDEXER_PREPARE_FUSION
+        if self.use_prepare_fusion:
+            if self.head_dim != 128 or self.rope_dim != 64:
+                raise ValueError(
+                    "GLM indexer preparation fusion requires head_dim=128, rope_dim=64"
+                )
+            for name in (
+                "glm_dsa_indexer_q_rope_weights",
+                "glm_dsa_indexer_k_norm_rope_cache",
+            ):
+                if not callable(getattr(ixf_ops, name, None)) or not hasattr(
+                    torch.ops._ixformer_C, name
+                ):
+                    raise RuntimeError(
+                        f"VLLM_ILU_GLM_DSA_INDEXER_PREPARE_FUSION=1 requires "
+                        f"ixformer with {name} (Python and native op)"
+                    )
 
         # q projection for the indexer (W8A8 INT8, matches dense_linears
         # target ``indexer.wq_b``).
@@ -341,15 +358,56 @@ class IluGlmMoeDsaIndexer(nn.Module):
     ) -> torch.Tensor:
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
-        q_pe, q_nope = torch.split(
-            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-        )
 
         # Fused wk + weights_proj: one GEMM, then split.
         kw, _ = self.wk_weights_proj(hidden_states)
         k = kw[:, : self.head_dim]
         weights = kw[:, self.head_dim :]
 
+        if self.use_prepare_fusion:
+            attn_metadata = get_forward_context().attn_metadata
+            if isinstance(attn_metadata, dict):
+                metadata = attn_metadata.get(self.k_cache.prefix)
+                if metadata is not None and self.k_cache.kv_cache.numel() > 0:
+                    if rotary_emb.is_neox_style:
+                        raise ValueError(
+                            "GLM indexer preparation fusion requires interleaved RoPE"
+                        )
+                    # Match the original indexer cache insert's padded token
+                    # extent. Negative slots are skipped by the fused K op.
+                    slots = metadata.slot_mapping
+                    num_tokens = slots.shape[0]
+                    if num_tokens > k.shape[0]:
+                        raise ValueError("Indexer slot mapping exceeds K token count")
+                    cos_sin = rotary_emb._match_cos_sin_cache_dtype(q)
+                    weights = ixf_ops.glm_dsa_indexer_q_rope_weights(
+                        q,
+                        weights,
+                        positions,
+                        cos_sin,
+                        softmax_scale=self.softmax_scale,
+                        head_scale=self.n_head_scale,
+                    )
+                    ixf_ops.glm_dsa_indexer_k_norm_rope_cache(
+                        k[:num_tokens],
+                        self.k_norm.weight,
+                        self.k_norm.bias,
+                        positions[:num_tokens],
+                        cos_sin,
+                        self.k_cache.kv_cache,
+                        slots,
+                        eps=self.k_norm.eps,
+                    )
+                    # K remains raw: only the fused op's cache output is used
+                    # downstream. Never insert raw K over that prepared cache.
+                    return self.indexer_op(
+                        hidden_states, q, k, weights, skip_k_cache_insert=True
+                    )
+
+        # Also used by metadata-free dummy/profiling runs.
+        q_pe, q_nope = torch.split(
+            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+        )
         k = self.k_norm(k)
         k_pe, k_nope = torch.split(
             k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
@@ -543,7 +601,7 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         fusion_requested = envs.VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV
         # Prefer the native Torch schema over the Python facade: the facade can
         # exist from a Python-only ixformer update while `_ixformer_C` still
-        # lacks the ivcore30 kernel. Kernel contract is H in {8,16,32}.
+        # lacks the ivcore30 kernel. Kernel contract is H in {8,16,32,64}.
         fusion_op_available = False
         try:
             fusion_op_available = hasattr(
@@ -551,13 +609,15 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
             )
         except Exception:
             fusion_op_available = False
-        fusion_heads_supported = self.num_heads in (8, 16, 32)
-        self.use_rms_rope_fp8_kv_fusion = (
+        fusion_heads_supported = self.num_heads in (8, 16, 32, 64)
+        self._rms_rope_fp8_kv_fusion_available = (
             fusion_requested
             and self.use_fp8_attn
-            and self._fp8_kv_scale_frozen
             and fusion_op_available
             and fusion_heads_supported
+        )
+        self.use_rms_rope_fp8_kv_fusion = (
+            self._rms_rope_fp8_kv_fusion_available and self._fp8_kv_scale_frozen
         )
         if fusion_requested and not self.use_rms_rope_fp8_kv_fusion:
             global _RMS_ROPE_FP8_KV_SKIP_LOGGED
@@ -570,7 +630,9 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
                 if not fusion_op_available:
                     reasons.append("ixformer native op is unavailable")
                 if not fusion_heads_supported:
-                    reasons.append(f"local Q heads={self.num_heads} not in {{8,16,32}}")
+                    reasons.append(
+                        f"local Q heads={self.num_heads} not in {{8,16,32,64}}"
+                    )
                 logger.warning(
                     "GLM-5.2 RMSNorm+RoPE+FP8 KV fusion requested but not "
                     "armed (%s). Falling back to split path. Further layers "
@@ -694,6 +756,11 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         scale = amax / _GLM_DSA_FP8_E4M3_MAX
         self._k_scale.fill_(scale)
         self._fp8_kv_scale_frozen = True
+        # The first real eager insert calibrates on normalized KV. Subsequent
+        # calls can consume raw KV in the fused op, using that same frozen scale.
+        self.use_rms_rope_fp8_kv_fusion = getattr(
+            self, "_rms_rope_fp8_kv_fusion_available", False
+        )
         logger.info(
             "GLM DSA fp8 KV scale for %s frozen online = %.8g (amax/448)",
             self.prefix,

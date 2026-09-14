@@ -129,6 +129,7 @@ if TYPE_CHECKING:
     VLLM_ILU_GLM_DSA_FP8_ABSORB_UP: bool = True
     VLLM_ILU_GLM_DSA_TOPK_CONVERT_CACHE: bool = True
     VLLM_ILU_GLM_DSA_NATIVE_MQA_LOGITS: bool = False
+    VLLM_ILU_GLM_DSA_INDEXER_PREPARE_FUSION: bool = True
     VLLM_ILU_NIXL_WRITE_USE_HOST_BUFFER: bool = False
     VLLM_ILU_NIXL_HOST_DTYPE: str = "auto"
     VLLM_ILU_NIXL_PROXY_ADDR: str = ""
@@ -336,8 +337,17 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # TP8 Graph ITL A/B showed benefit; set 0 for the split GEMV path.
     # Fail-closed for unsupported shapes / runtime errors.
     "VLLM_ILU_FUSE_MOE_W13": _bool_reader("VLLM_ILU_FUSE_MOE_W13", "1"),
+    # GLM shared-expert SwiGLU + INT8 quant has no environment switch:
+    # silu_and_mul_quant is selected for a dynamic symmetric W8A8 down_proj;
+    # other quantization schemes keep separate activation and quantization.
+    #
     # Fuse kv_a RMSNorm + Q/K RoPE + FP8 KV pack/insert for GLM DSA.
-    # Default on; requires FP8 KV + frozen scale + ixformer op. Set 0 to disable.
+    # Default 1; set 0 for the split path. Requires local Q heads in
+    # {8, 16, 32, 64}, FP8 KV cache, a frozen KV scale, and ixformer's native
+    # fused_glm_dsa_rmsnorm_rope_fp8_kv_insert op. Unsupported cases fall back
+    # to the split path. Online scale calibration uses the split path first;
+    # fusion becomes eligible after the scale freezes. Read at model
+    # construction: restart the model process after changing this switch.
     "VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV": _bool_reader(
         "VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV", "1"
     ),
@@ -355,6 +365,20 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Cache request-local -> global top-k conversion across shared DSA layers.
     "VLLM_ILU_GLM_DSA_TOPK_CONVERT_CACHE": _bool_reader(
         "VLLM_ILU_GLM_DSA_TOPK_CONVERT_CACHE", "1"
+    ),
+    # GLM indexer preparation fusion. Default 1; set 0 for the split path:
+    # - glm_dsa_indexer_q_rope_weights: in-place RoPE on Q's first 64 dims
+    #   plus softmax_scale and head_scale multiplication of indexer weights.
+    # - glm_dsa_indexer_k_norm_rope_cache: K LayerNorm + first-64-dim RoPE
+    #   + cache insert, skipping the later standalone cache insert.
+    # Requires index_head_dim=128, qk_rope_head_dim=64 and interleaved RoPE.
+    # Supports prefill/decode/mixed batches and graph padding slots (-1 does
+    # not write cache); dummy/profiling calls without attention metadata use
+    # the split preparation path. Missing either Python or native ixformer
+    # API raises at initialization.
+    # Read at model construction: restart after changing this switch.
+    "VLLM_ILU_GLM_DSA_INDEXER_PREPARE_FUSION": _bool_reader(
+        "VLLM_ILU_GLM_DSA_INDEXER_PREPARE_FUSION", "1"
     ),
     # GLM DSA 640B fp8 packed KV scale. A non-empty float applies the SAME
     # scale to every layer (not per-layer). Prefer PATH for per-layer JSON

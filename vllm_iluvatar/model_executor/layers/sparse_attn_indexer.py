@@ -37,6 +37,7 @@ def ilu_sparse_attn_indexer(
     max_model_len: int,
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
+    skip_k_cache_insert: bool = False,
 ) -> torch.Tensor:
     # attn_metadata is unavailable during dummy/profiling runs.
     assert topk_indices_buffer is not None
@@ -66,9 +67,10 @@ def ilu_sparse_attn_indexer(
     # Grid follows slot_mapping's (CUDA-graph padded) length; truncate k if it
     # is longer. Padding rows carry slot_mapping == -1 and are skipped in the
     # kernel (see vllm_indexer_k_cache.cu ``if (slot_idx < 0) return;``).
-    num_tokens = slot_mapping.shape[0]
-    k = k[:num_tokens]
-    ops.indexer_k_cache(k, kv_cache, slot_mapping)
+    if not skip_k_cache_insert:
+        num_tokens = slot_mapping.shape[0]
+        k = k[:num_tokens]
+        ops.indexer_k_cache(k, kv_cache, slot_mapping)
 
     if has_prefill:
         prefill_metadata = attn_metadata.prefill
@@ -146,6 +148,7 @@ def ilu_sparse_attn_indexer_fake(
     max_model_len: int,
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
+    skip_k_cache_insert: bool = False,
 ) -> torch.Tensor:
     assert topk_indices_buffer is not None
     return topk_indices_buffer
@@ -154,7 +157,7 @@ def ilu_sparse_attn_indexer_fake(
 direct_register_custom_op(
     op_name="ilu_sparse_attn_indexer",
     op_func=ilu_sparse_attn_indexer,
-    mutates_args=["topk_indices_buffer"],
+    mutates_args=["kv_cache", "topk_indices_buffer"],
     fake_impl=ilu_sparse_attn_indexer_fake,
     dispatch_key=current_platform.dispatch_key,
 )
@@ -186,6 +189,7 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
         self.max_model_len = max_model_len
         self.max_total_seq_len = max_total_seq_len
         self.topk_indices_buffer = topk_indices_buffer
+        self.skip_k_cache_insert = skip_k_cache_insert
 
     def forward_native(
         self,
@@ -193,9 +197,12 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
         q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         k: torch.Tensor,
         weights: torch.Tensor,
+        skip_k_cache_insert: bool = False,
     ):
         if current_platform.is_cuda():
-            return self.forward_cuda(hidden_states, q_quant, k, weights)
+            return self.forward_cuda(
+                hidden_states, q_quant, k, weights, skip_k_cache_insert
+            )
         raise NotImplementedError(
             "SparseAttnIndexer native forward is only implemented for CUDA platforms."
         )
@@ -206,6 +213,7 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
         q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         k: torch.Tensor,
         weights: torch.Tensor,
+        skip_k_cache_insert: bool = False,
     ):
         return torch.ops.vllm.ilu_sparse_attn_indexer(
             hidden_states,
@@ -219,4 +227,5 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
             self.max_model_len,
             self.max_total_seq_len,
             self.topk_indices_buffer,
+            self.skip_k_cache_insert or skip_k_cache_insert,
         )

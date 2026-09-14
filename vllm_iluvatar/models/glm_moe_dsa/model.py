@@ -86,6 +86,9 @@ from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
     set_max_num_seqs_from_config,
 )
 from vllm_iluvatar.model_executor.layers.quantization import IluvatarQuantRegistry
+from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes import (
+    IluCompressedTensorsW8A8Int8,
+)
 from vllm_iluvatar.models.glm_moe_dsa.attention import (
     GlmDsaTopkConvertCache,
     IluGlmMoeDsaMLAAttention,
@@ -272,6 +275,7 @@ class IluGlmMoeDsaMLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         prefix: str = "",
+        fuse_act_quant: bool = False,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -294,10 +298,24 @@ class IluGlmMoeDsaMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported."
             )
         self.act_fn = SiluAndMul()
+        scheme = getattr(self.down_proj, "scheme", None)
+        self.fuse_act_quant = (
+            fuse_act_quant
+            and isinstance(scheme, IluCompressedTensorsW8A8Int8)
+            and not scheme.is_static_input_scheme
+            and scheme.input_symmetric
+        )
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if self.fuse_act_quant:
+            import ixformer.inference.functions as ixf_ops
+
+            x_q, x_s = ixf_ops.silu_and_mul_quant(gate_up)
+            # The W8A8 tuple bypasses down_proj's standalone input quantizer.
+            x = (x_q, x_s, gate_up.dtype)
+        else:
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
@@ -356,6 +374,7 @@ class IluGlmMoeDsaMoE(nn.Module, IluFusedMoEEP):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
+                fuse_act_quant=True,
             )
 
         self.experts = FusedMoEFactory(

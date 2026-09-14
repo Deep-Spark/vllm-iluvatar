@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+import ixformer.inference.functions as ixf_ops
 import pytest
 import torch
 
@@ -221,22 +223,45 @@ def test_maybe_init_fp8_kv_scale_skips_during_capture(monkeypatch):
     assert float(mla._k_scale.item()) == pytest.approx(1.0)
 
 
-def _resolve_rms_rope_fp8_kv_fusion(
-    *,
-    env_enabled: bool,
-    use_fp8_attn: bool,
-    scale_frozen: bool,
-    op_available: bool,
-    num_heads: int = 8,
-) -> bool:
-    """Mirror IluGlmMoeDsaSparseMLA init-time fusion arming rules."""
-    return bool(
-        env_enabled
-        and use_fp8_attn
-        and scale_frozen
-        and op_available
-        and num_heads in (8, 16, 32)
+def _make_sparse_mla(
+    monkeypatch, *, env_enabled=True, use_fp8_attn=True, scale_frozen=True,
+    op_available=None, num_heads=64,
+):
+    """Exercise the actual constructor, including TP1's 64 local heads."""
+    monkeypatch.setattr(attn_mod.envs, "VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV", env_enabled)
+    monkeypatch.setattr(
+        attn_mod.envs,
+        "VLLM_ILU_GLM_DSA_FP8_KV_SCALE",
+        "0.02" if scale_frozen else "",
     )
+    monkeypatch.setattr(attn_mod.envs, "VLLM_ILU_GLM_DSA_FP8_KV_SCALE_PATH", "")
+    monkeypatch.setattr(
+        attn_mod,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            compilation_config=SimpleNamespace(static_forward_context={})
+        ),
+    )
+    if op_available is not None:
+        native = SimpleNamespace()
+        if op_available:
+            native.fused_glm_dsa_rmsnorm_rope_fp8_kv_insert = object()
+        monkeypatch.setattr(torch.ops, "_ixformer_C", native)
+    mla = attn_mod.IluGlmMoeDsaSparseMLA(
+        num_heads=num_heads,
+        scale=1 / 16,
+        qk_nope_head_dim=192,
+        qk_rope_head_dim=64,
+        v_head_dim=256,
+        q_lora_rank=2048,
+        kv_lora_rank=512,
+        kv_b_proj=None,
+        rotary_emb=torch.nn.Identity(),
+        topk_indices_buffer=None,
+        cache_config=SimpleNamespace(cache_dtype="fp8" if use_fp8_attn else "bfloat16"),
+        prefix="model.layers.0.self_attn.attn",
+    )
+    return mla
 
 
 @pytest.mark.parametrize(
@@ -245,7 +270,8 @@ def _resolve_rms_rope_fp8_kv_fusion(
         (True, True, True, True, 8, True),
         (True, True, True, True, 16, True),
         (True, True, True, True, 32, True),
-        (True, True, True, True, 64, False),
+        (True, True, True, True, 64, True),
+        (True, True, True, True, 4, False),
         (True, True, False, True, 8, False),
         (True, False, True, True, 8, False),
         (False, True, True, True, 8, False),
@@ -253,16 +279,17 @@ def _resolve_rms_rope_fp8_kv_fusion(
     ],
 )
 def test_rms_rope_fp8_kv_fusion_arm_matrix(
-    env_enabled, use_fp8, frozen, op_ok, num_heads, expect
+    monkeypatch, env_enabled, use_fp8, frozen, op_ok, num_heads, expect
 ):
     assert (
-        _resolve_rms_rope_fp8_kv_fusion(
+        _make_sparse_mla(
+            monkeypatch=monkeypatch,
             env_enabled=env_enabled,
             use_fp8_attn=use_fp8,
             scale_frozen=frozen,
             op_available=op_ok,
             num_heads=num_heads,
-        )
+        ).use_rms_rope_fp8_kv_fusion
         is expect
     )
 
@@ -312,3 +339,90 @@ def test_wrapper_skips_external_kv_rmsnorm_when_fusion_armed():
     assert out is not None
     assert called["norm"] is False
     assert called["mla"] == (True, True, True)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_online_scale_enables_fusion_only_after_real_calibration(monkeypatch, enabled):
+    mla = _make_sparse_mla(monkeypatch, scale_frozen=False, env_enabled=enabled)
+    assert not mla.use_rms_rope_fp8_kv_fusion
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    mla._maybe_init_fp8_kv_scale(torch.ones(2, 512))
+    assert not mla._fp8_kv_scale_frozen
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    mla._maybe_init_fp8_kv_scale(torch.zeros(2, 512))
+    assert not mla._fp8_kv_scale_frozen
+    mla._maybe_init_fp8_kv_scale(torch.full((2, 512), 2.0))
+    assert mla._fp8_kv_scale_frozen
+    assert mla.use_rms_rope_fp8_kv_fusion == enabled
+    torch.testing.assert_close(mla._k_scale, torch.tensor([2 / 448]))
+
+
+@torch.inference_mode()
+def test_tp1_kv_fusion_forward_and_graph(monkeypatch, cuda_device):
+    mla = _make_sparse_mla(monkeypatch).to(cuda_device)
+    assert mla.use_rms_rope_fp8_kv_fusion
+    tokens = 8
+    gen = torch.Generator().manual_seed(47)
+    q_src = torch.randn(tokens, 64, 256, generator=gen).bfloat16().to(cuda_device)
+    # Preserve the strided views produced by fused_qkv_a_proj.
+    latent = torch.randn(tokens, 2624, generator=gen).bfloat16().to(cuda_device)
+    kv = latent[:, 2048:2560]
+    k_src = latent[:, 2560:]
+    weight = torch.randn(512, generator=gen).bfloat16().to(cuda_device)
+    angles = torch.randn(16, 32, generator=gen)
+    cos_sin = torch.cat((angles.cos(), angles.sin()), -1).bfloat16().to(cuda_device)
+    slots = torch.tensor([3, 0, -1, 7, 5, 9, 2, 12], device=cuda_device)
+    positions = torch.arange(tokens, device=cuda_device)
+    mla.kv_cache = torch.full((4, 4, 640), 123, dtype=torch.uint8, device=cuda_device)
+    mla.rotary_emb._match_cos_sin_cache_dtype = lambda q: cos_sin
+    mla.rotary_emb.forward = Mock(side_effect=AssertionError("split RoPE called"))
+    mla._k_up_proj = lambda q: torch.zeros(tokens, 64, 512, device=cuda_device)
+    mla._v_up_proj = lambda x: x[..., :256]
+    mla._sparse_mla_kernel_fp8 = lambda q, *a: q
+    metadata = SimpleNamespace(
+        num_actual_tokens=tokens, slot_mapping=slots, block_size=4
+    )
+    monkeypatch.setattr(
+        attn_mod,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={mla.prefix: metadata}),
+    )
+    q, k = q_src.clone(), k_src.clone()
+    q_ref, k_ref, cache_ref = q_src.clone(), k_src.clone(), mla.kv_cache.clone()
+    ixf_ops.fused_glm_dsa_rmsnorm_rope_fp8_kv_insert(
+        q_ref[..., 192:],
+        k_ref,
+        kv,
+        weight,
+        1e-6,
+        cache_ref,
+        slots,
+        positions,
+        cos_sin,
+        mla._k_scale,
+        4,
+        backend="torch",
+    )
+    # Any accidental split norm/cache call must fail, even when its numerical
+    # result would match the fused path.
+    monkeypatch.setattr(
+        ixf_ops, "rms_norm", Mock(side_effect=AssertionError("split norm"))
+    )
+    monkeypatch.setattr(
+        ixf_ops,
+        "glm_dsa_fp8_kv_insert",
+        Mock(side_effect=AssertionError("split cache insert")),
+    )
+    mla(q, kv, k, positions, weight, 1e-6)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = mla(q, kv, k, positions, weight, 1e-6)
+    for _ in range(2):
+        q.copy_(q_src)
+        k.copy_(k_src)
+        mla.kv_cache.fill_(123)
+        graph.replay()
+        torch.testing.assert_close(q, q_ref, atol=0.01, rtol=0.01)
+        torch.testing.assert_close(k, k_ref, atol=0.01, rtol=0.01)
+        assert torch.equal(mla.kv_cache, cache_ref)
+        assert output.shape == (tokens, 64 * 256)

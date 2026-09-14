@@ -90,9 +90,14 @@ def test_ilu_sparse_attn_indexer_fake_requires_output_buffer(monkeypatch):
         )
 
 
+@pytest.mark.parametrize(
+    "constructor_skip,call_skip", [(False, False), (True, False), (False, True)]
+)
 def test_ilu_sparse_attn_indexer_forward_cuda_calls_registered_op(
     monkeypatch,
     default_vllm_config,
+    constructor_skip,
+    call_skip,
 ):
     sparse_attn_indexer = _load_sparse_attn_indexer(monkeypatch)
     calls = []
@@ -116,6 +121,7 @@ def test_ilu_sparse_attn_indexer_forward_cuda_calls_registered_op(
         max_model_len=16,
         max_total_seq_len=32,
         topk_indices_buffer=topk_indices_buffer,
+        skip_k_cache_insert=constructor_skip,
     )
 
     hidden_states = torch.empty((2, 8))
@@ -124,7 +130,9 @@ def test_ilu_sparse_attn_indexer_forward_cuda_calls_registered_op(
     weights = torch.empty((2,))
 
     with patch.object(torch.ops.vllm, "ilu_sparse_attn_indexer", fake_op, create=True):
-        result = layer.forward_cuda(hidden_states, q, k, weights)
+        result = layer.forward_cuda(
+            hidden_states, q, k, weights, skip_k_cache_insert=call_skip
+        )
 
     assert result is output
     assert len(calls) == 1
@@ -137,3 +145,4 @@ def test_ilu_sparse_attn_indexer_forward_cuda_calls_registered_op(
     assert args[5] is weights
     assert args[6:10] == (4, 8, 16, 32)
     assert args[10] is topk_indices_buffer
+    assert args[11] is (constructor_skip or call_skip)

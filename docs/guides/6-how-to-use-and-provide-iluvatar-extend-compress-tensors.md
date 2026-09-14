@@ -198,7 +198,66 @@ W4A8 MoE 还要求权重量化粒度为 per-channel 或 per-group，激活为 pe
 
 与 MoE 量化类似，AWQ、GPTQ 等方案的使用方式与官方实现一致。
 
-### 4.2 Compressed-Tensors 量化
+### 4.2 `quant_method=fp8` checkpoint 的 BF16 Linear 在线量化
+
+有些官方 FP8 checkpoint 只把 routed experts 保存成 block-FP8，并通过
+`modules_to_not_convert`（旧配置也可能叫 `ignored_layers`）让普通 Linear
+继续保存 BF16。Iluvatar 可在逐层加载时将指定 BF16 Linear 做 per-output-channel
+FP8 在线量化，forward 使用动态 per-token 激活量化和 ixmm
+`fp8_per_channel_mm/gemv`。这条路径属于 `IluFp8Config`，**不是**
+Compressed-Tensors，不读取 `format: iluvatar-mixed`、`config_groups` 或
+`iluvatar.method`。
+
+不要直接修改原 checkpoint。使用派生目录生成器：
+
+```bash
+python3 examples/iluvatar-compressed-tensors/qwen38_flash_next_fp8_online.py \
+  --input /path/to/original-fp8-checkpoint \
+  --output /path/to/derived-online-fp8-checkpoint
+```
+
+Qwen3.8-Flash-Next preset 会保留 routed experts 的 `weight_block_size`，从 ignore
+列表移出候选 dense Linear，并设置
+`none_moe_is_checkpoint_fp8_serialized=false` 与
+`none_moe_use_weight_block_size=false`。生成器只重写派生目录的 `config.json`，
+其余文件均指回原 checkpoint。
+
+生成器不把模型配置键名写死。其他模型可以使用 `--preset none`，通过
+`--quant-config-path` 指定嵌套 quant 配置、`--ignore-key` 指定改名后的 ignore
+列表，重复传 `--remove-pattern` 选择候选层，并用
+`--set-quant KEY=JSON_VALUE` 设置该插件版本所需的开关。例如：
+
+```bash
+python3 examples/iluvatar-compressed-tensors/qwen38_flash_next_fp8_online.py \
+  --input /path/to/model \
+  --output /path/to/model-online \
+  --preset none \
+  --quant-config-path text_config.vendor_quantization \
+  --ignore-key do_not_quantize \
+  --remove-pattern 'self_attn\.(q_proj|k_proj|v_proj|o_proj)$' \
+  --set-quant none_moe_is_checkpoint_fp8_serialized=false \
+  --set-quant none_moe_use_weight_block_size=false
+```
+
+自定义 ignore 键会原样保留，同时生成器额外写出 `IluFp8Config` 可识别的
+`ignored_layers` 运行时副本，避免插件忽略 vendor 键后意外量化全部 Linear。
+`--quant-config-path` 必须指向该模型实际交给 vLLM 的 quant 配置对象；脚本能
+定位任意 JSON 路径，不代表 Transformers 会自动消费一个从未注册的新路径。
+
+候选层最终按 **当前 TP 的本 rank `[N,K]` 形状**决定。TN ixmm 要求
+`K % 64 == 0`，GEMV 快路径要求 `N % 32 == 0`；任一条件不满足时日志打印
+`Online FP8 fallback` warning，该层保持 checkpoint 原始 FP16/BF16 dtype 并走
+`UnquantizedLinearMethod`，不会发生无 scale 的 FP8 硬转。满足条件的层使用
+常驻 FP8 buffer；BF16 分片先按原 loader 完成本 rank/fused 装配，再一次性量化
+进该 buffer，避免改变 TP、QKV/merged shard 和 row-parallel scale 口径。
+
+接入新模型时至少验证：派生前后 routed experts 分发不变；fallback warning
+包含层名和 `[N,K]`；命中层为 `float8_e4m3fn` 且 scale 为 `[N]` float32；
+fallback 和 `lm_head` 保持原 dtype；greedy smoke 无 NaN；CUDA Graph capture
+前后权重地址不变；最后与同配置 BF16 dense 基线比较精度、TTFT、TPOT、加载
+时间、GPU 峰值和 worker `VmHWM`。
+
+### 4.3 Compressed-Tensors 量化
 
 Linear 使用与 MoE 相同的扩展机制：config group 中存在 `iluvatar` 时，若官方 scheme 识别为 W8A8 INT8 或 W4A8 INT，则换成 Iluvatar Linear 实现。量化为 W4A8/W8A8 的非 MoE Linear 还应在该 group 中设置 `format: int-quantized`。
 

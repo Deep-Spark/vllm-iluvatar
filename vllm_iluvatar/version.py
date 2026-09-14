@@ -39,3 +39,10 @@ try:
     from ._git_id import __git_id__
 except ImportError:
     __git_id__ = "unknown"
+
+
+def format_identity() -> str:
+    """Release version plus baked git id, for logs and collect-env."""
+    if __git_id__ and __git_id__ != "unknown":
+        return f"{__version__} {__git_id__}"
+    return str(__version__)

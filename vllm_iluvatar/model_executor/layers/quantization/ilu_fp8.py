@@ -57,6 +57,7 @@ narrows the overrides to serialized linear and block-wise routed-expert branches
 from __future__ import annotations
 
 import copy
+from functools import wraps
 from typing import Any
 
 import ixformer.inference.functions as ixfops
@@ -91,10 +92,15 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_scale_parameter,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+from vllm.model_executor.model_loader.reload.layerwise import (
+    initialize_online_processing,
+)
 from vllm.model_executor.parameter import (
     ChannelQuantScaleParameter,
+    ModelWeightParameter,
 )
 from vllm.model_executor.utils import replace_parameter
+from vllm.logger import init_logger
 
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
     _ixmm_backend_available,
@@ -113,6 +119,7 @@ _IXMM_EXPERT_CHUNK = 4
 _IXMM_GROUP_SIZE = 256
 _FP4_MAX_MAG = 6.0
 _IXMM_FP8_GEMV_MAX_M = 16
+logger = init_logger(__name__)
 
 
 @IluvatarQuantRegistry.register_method
@@ -130,6 +137,59 @@ class IluFp8PerChannelOnlineLinearMethod(_Fp8OnlineLinearBase):
         super().__init__()
         self.quant_config = quant_config
         self.gemm_format = quant_config.gemm_format.upper()
+        self._unquantized_method = UnquantizedLinearMethod()
+
+    def _shape_fallback_reason(self, n: int, k: int) -> str | None:
+        reasons = []
+        if k % 64:
+            reasons.append(f"K={k} is not divisible by 64")
+        if self.gemm_format == "TN" and n % 32:
+            reasons.append(f"N={n} is not divisible by 32 for GEMV")
+        return "; ".join(reasons) or None
+
+    @staticmethod
+    def _make_staging_parameter(
+        param: ModelWeightParameter,
+        dtype: torch.dtype,
+        weight_loader,
+    ) -> ModelWeightParameter:
+        staging = ModelWeightParameter(
+            data=torch.empty_like(param, dtype=dtype),
+            input_dim=param.input_dim,
+            output_dim=param.output_dim,
+            weight_loader=weight_loader,
+        )
+        # Preserve loader-specific metadata and the layer-local TP state
+        # (notably disable_tp/replicated parameters). The loader itself must
+        # remain the real checkpoint loader, not this method's wrapper.
+        attributes = param.__dict__.copy()
+        attributes["_weight_loader"] = weight_loader
+        staging.__dict__.update(attributes)
+        return staging
+
+    def _make_online_weight_loader(self, layer: torch.nn.Module, weight_loader):
+        @wraps(weight_loader, assigned=("__doc__", "__annotations__"))
+        def ilu_fp8_online_loader(
+            param: ModelWeightParameter,
+            loaded_weight: torch.Tensor,
+            *args,
+            **kwargs,
+        ):
+            # The public layerwise loader executes once against meta merely to
+            # count copy_ numel, then replays against a materialized parameter.
+            if param.is_meta:
+                return weight_loader(param, loaded_weight, *args, **kwargs)
+
+            staging_by_name = layer.__dict__.setdefault("_ilu_fp8_staging", {})
+            staging = staging_by_name.get("weight")
+            if staging is None:
+                staging = self._make_staging_parameter(
+                    param, layer.orig_dtype, weight_loader
+                )
+                staging_by_name["weight"] = staging
+            return weight_loader(staging, loaded_weight, *args, **kwargs)
+
+        return ilu_fp8_online_loader
 
     def create_weights(
         self,
@@ -141,40 +201,128 @@ class IluFp8PerChannelOnlineLinearMethod(_Fp8OnlineLinearBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        super().create_weights(
-            layer,
-            input_size_per_partition,
-            output_partition_sizes,
-            input_size,
-            output_size,
-            params_dtype,
-            **extra_weight_attrs,
+        output_size_per_partition = sum(output_partition_sizes)
+        fallback_reason = self._shape_fallback_reason(
+            output_size_per_partition, input_size_per_partition
         )
         weight_loader = extra_weight_attrs.get("weight_loader")
-        scale = create_fp8_scale_parameter(
-            ChannelQuantScaleParameter,
-            output_partition_sizes,
-            input_size_per_partition,
-            None,
-            weight_loader,
+        if weight_loader is None:
+            raise ValueError("online FP8 linear requires a weight_loader")
+
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        layer.orig_dtype = params_dtype
+        layer.weight_block_size = None
+        layer._ilu_fp8_online_fallback_reason = fallback_reason
+
+        if fallback_reason:
+            storage_dtype = params_dtype
+            effective_loader = weight_loader
+            logger.warning(
+                "Online FP8 fallback to %s for %s: shape=[%d, %d], %s",
+                params_dtype,
+                getattr(layer, "prefix", "<unknown>"),
+                output_size_per_partition,
+                input_size_per_partition,
+                fallback_reason,
+            )
+        else:
+            storage_dtype = torch.float8_e4m3fn
+            effective_loader = self._make_online_weight_loader(layer, weight_loader)
+
+        weight = ModelWeightParameter(
+            data=torch.empty(
+                output_size_per_partition,
+                input_size_per_partition,
+                device="meta",
+                dtype=storage_dtype,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=effective_loader,
         )
-        layer.register_parameter("weight_scale", scale)
+        layer.register_parameter("weight", weight)
+        initialize_online_processing(layer)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
 
         layer.input_scale = None
-        qweight, weight_scale = fp8_per_token_dynamic_scaled(layer.weight)
-        layer._can_use_gemm = (
-            qweight.shape[0] % 32 == 0
-            if self.gemm_format == "TN"
-            else qweight.shape[1] % 64 == 0
-        )
+        fallback_reason = getattr(layer, "_ilu_fp8_online_fallback_reason", None)
+        if fallback_reason:
+            if layer.weight.dtype != layer.orig_dtype:
+                raise RuntimeError(
+                    f"{getattr(layer, 'prefix', '<unknown>')}: BF16 fallback "
+                    f"weight has unexpected dtype {layer.weight.dtype}"
+                )
+            self._unquantized_method.process_weights_after_loading(layer)
+            layer._already_called_process_weights_after_loading = True
+            return
 
-        replace_parameter(layer, "weight", qweight)
-        replace_parameter(layer, "weight_scale", weight_scale)
+        staging_by_name = layer.__dict__.get("_ilu_fp8_staging")
+        staging = (
+            staging_by_name.get("weight") if isinstance(staging_by_name, dict) else None
+        )
+        if staging is None:
+            raise RuntimeError(
+                f"{getattr(layer, 'prefix', '<unknown>')}: online FP8 staging "
+                "weight is missing; the checkpoint loader may have bypassed "
+                "weight.weight_loader"
+            )
+        if not staging.is_cuda or staging.stride(-1) != 1:
+            raise RuntimeError(
+                f"{getattr(layer, 'prefix', '<unknown>')}: online FP8 staging "
+                f"must be CUDA and K-contiguous, got {staging.device=} "
+                f"{staging.stride()=}"
+            )
+
+        expected_scale_shape = (layer.output_size_per_partition,)
+        weight_scale = getattr(layer, "weight_scale", None)
+        if weight_scale is None:
+            weight_scale = torch.nn.Parameter(
+                torch.empty(
+                    expected_scale_shape,
+                    dtype=torch.float32,
+                    device=layer.weight.device,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("weight_scale", weight_scale)
+        elif (
+            tuple(weight_scale.shape) != expected_scale_shape
+            or weight_scale.dtype != torch.float32
+            or weight_scale.device != layer.weight.device
+        ):
+            raise RuntimeError(
+                f"{getattr(layer, 'prefix', '<unknown>')}: invalid reusable "
+                f"weight_scale shape/dtype/device: {tuple(weight_scale.shape)}, "
+                f"{weight_scale.dtype}, {weight_scale.device}"
+            )
+
+        weight_ptr = layer.weight.data_ptr()
+        fp8_per_token_dynamic_scaled(
+            staging,
+            fp8_output=layer.weight.data,
+            output_scales=layer.weight_scale.data,
+        )
+        if layer.weight.data_ptr() != weight_ptr:
+            raise RuntimeError("online FP8 quantization replaced the weight buffer")
+
+        staging_by_name.pop("weight")
+        if not staging_by_name:
+            layer.__dict__.pop("_ilu_fp8_staging", None)
+        layer._can_use_gemm = True
         layer._already_called_process_weights_after_loading = True
+        logger.info(
+            "Online FP8 ready for %s: dtype=%s shape=%s scale_shape=%s gemv=%s",
+            getattr(layer, "prefix", "<unknown>"),
+            layer.weight.dtype,
+            tuple(layer.weight.shape),
+            tuple(layer.weight_scale.shape),
+            self.gemm_format == "TN",
+        )
 
     def apply(
         self,
@@ -182,6 +330,17 @@ class IluFp8PerChannelOnlineLinearMethod(_Fp8OnlineLinearBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        fallback_reason = getattr(layer, "_ilu_fp8_online_fallback_reason", None)
+        if fallback_reason:
+            return self._unquantized_method.apply(layer, x, bias)
+        if layer.weight.dtype != torch.float8_e4m3fn or not hasattr(
+            layer, "weight_scale"
+        ):
+            raise RuntimeError(
+                f"{getattr(layer, 'prefix', '<unknown>')}: online FP8 forward "
+                "requires a float8_e4m3fn weight and per-channel weight_scale"
+            )
+
         x_2d = x.reshape(-1, x.shape[-1])
         qx, scale_x = fp8_per_token_dynamic_scaled(x_2d)
 
@@ -363,9 +522,9 @@ def preprocess_fp8_block_weight_for_ixmm(
     if allow_k_padding:
         padded_k = (k + _IXMM_GROUP_SIZE - 1) // _IXMM_GROUP_SIZE * _IXMM_GROUP_SIZE
     else:
-        assert k % _IXMM_GROUP_SIZE == 0, (
-            f"k={k} must be a multiple of {_IXMM_GROUP_SIZE}"
-        )
+        assert (
+            k % _IXMM_GROUP_SIZE == 0
+        ), f"k={k} must be a multiple of {_IXMM_GROUP_SIZE}"
         padded_k = k
 
     # 1-2. Block dequant: fp8 magnitude * per-block float32 scale. Expand the
@@ -557,12 +716,12 @@ class IluFp8MoEMethod(Fp8MoEMethod):
         ):
             w = getattr(layer, w_name)
             s = getattr(layer, s_in_name)
-            assert w.dtype is torch.float8_e4m3fn, (
-                f"{w_name} expected float8_e4m3fn, got {w.dtype}"
-            )
-            assert s.dtype is torch.float32, (
-                f"{s_in_name} expected float32, got {s.dtype}"
-            )
+            assert (
+                w.dtype is torch.float8_e4m3fn
+            ), f"{w_name} expected float8_e4m3fn, got {w.dtype}"
+            assert (
+                s.dtype is torch.float32
+            ), f"{s_in_name} expected float32, got {s.dtype}"
 
             weight_parts: list[torch.Tensor] = []
             scale_parts: list[torch.Tensor] = []

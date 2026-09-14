@@ -205,10 +205,25 @@ W4A8 MoE 还要求权重量化粒度为 per-channel 或 per-group，激活为 pe
 继续保存 BF16。Iluvatar 可在逐层加载时将指定 BF16 Linear 做 per-output-channel
 FP8 在线量化，forward 使用动态 per-token 激活量化和 ixmm
 `fp8_per_channel_mm/gemv`。这条路径属于 `IluFp8Config`，**不是**
-Compressed-Tensors，不读取 `format: iluvatar-mixed`、`config_groups` 或
-`iluvatar.method`。
+Compressed-Tensors，不读取 HF `quantization_config` 中的
+`format: iluvatar-mixed` 或 Compressed-Tensors group。
 
-不要直接修改原 checkpoint。使用派生目录生成器：
+有两种配置方式：
+
+1. 派生目录模式：只改隔离目录中的 `config.json`，safetensors 链回原目录；
+2. runtime group 模式：原模型目录一字不改，通过
+   `additional_config.ilu_quant.config_groups` 和 `iluvatar.method` 声明
+   source/target/loading 契约。
+
+第 2 种配置看起来与 Compressed-Tensors group 相似，但 schema、解析入口和
+method factory 均不同，详见
+[指南 7](7-how-to-use-iluvatar-runtime-quant-via-additional-config.md)。
+示例按开源权重 ID 放置，例如
+`examples/iluvatar-runtime-quant/Qwen/Qwen3.8-Flash-Next/`。不要把
+HF `quantization_config.config_groups` 与 `additional_config.ilu_quant` 混为
+一处。
+
+派生目录方式使用：
 
 ```bash
 python3 examples/iluvatar-compressed-tensors/qwen38_flash_next_fp8_online.py \

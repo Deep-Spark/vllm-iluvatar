@@ -73,24 +73,6 @@ class IluMiniMaxM3IndexerBackend(AttentionBackend):
     def is_sparse(cls) -> bool:
         return True
 
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        return (num_blocks, block_size, head_size)
-
-    @staticmethod
-    def get_kv_cache_stride_order(
-        include_num_layers_dimension: bool = False,
-    ) -> tuple[int, ...]:
-        if include_num_layers_dimension:
-            raise NotImplementedError
-        return (0, 1, 2)
-
 
 class IluMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
     """Side KV cache for the indexer's per-token index keys (key-only)."""
@@ -136,6 +118,10 @@ class IluMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
             head_size=self.head_dim,
             dtype=self.dtype,
         )
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # [B, H=1, N, C] -> [B, N, C]
+        self.kv_cache = kv_cache.squeeze(1)
 
     def forward(self) -> None: ...
 

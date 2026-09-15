@@ -341,14 +341,14 @@ def load_static_v_scales(
         ]
         scales[key] = part.contiguous().to(device)
 
-    back = False
     if layer_idx is not None:
         try:
             sample_idx = layer_idx
             sample = scales[sample_idx]
         except Exception:
-            back = True
-    if back:
+            sample_idx = next(iter(scales))
+            sample = scales[sample_idx]
+    else:
         sample_idx = next(iter(scales))
         sample = scales[sample_idx]
     logger.info(

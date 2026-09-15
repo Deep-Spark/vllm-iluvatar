@@ -27,10 +27,13 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.utils import (
-    get_kv_cache_layout,
     split_decodes_and_prefills,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec, is_quantized_kv_cache
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheLayout,
+    is_quantized_kv_cache,
+)
 
 # One sparse block == one KV page (matches ixformer / upstream MiniMax-M3).
 SPARSE_BLOCK_SIZE = 128
@@ -109,31 +112,9 @@ class IluMiniMaxM3SparseBackend(AttentionBackend):
     def is_sparse(cls) -> bool:
         return True
 
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        return (num_blocks, 2, block_size, num_kv_heads, head_size)
-
-    @staticmethod
-    def get_kv_cache_stride_order(
-        include_num_layers_dimension: bool = False,
-    ) -> tuple[int, ...]:
-        if include_num_layers_dimension:
-            raise NotImplementedError  # no cross-layer KV blocks in M3
-        # Native sparse kernels require NHD [B, 2, block, H, D] (size(2)==block).
-        # Identity stride order is correct for that layout; reject HND from the
-        # resolved layout (env override or connector default), not only the env.
-        if get_kv_cache_layout() == "HND":
-            raise ValueError(
-                "Iluvatar MiniMax-M3 sparse attention requires NHD KV cache "
-                "layout; HND is not supported"
-            )
-        return (0, 1, 2, 3, 4)
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...] | None:
+        return super().supported_kv_cache_layouts()
 
 
 @dataclass

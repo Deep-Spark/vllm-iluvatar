@@ -378,8 +378,11 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.calculate_kv_scales = False
         set_default_quant_scales(self, register_buffer=True)
         # Indexer side-cache dtype, mirroring --kv-cache-dtype for the main
-        # cache (--attention-config '{"indexer_kv_dtype": ...}').
-        self.indexer_kv_dtype = vllm_config.attention_config.indexer_kv_dtype
+        # cache (--attention-config '{"indexer_kv_dtype": ...}'). Resolve
+        # "auto" to the only dtype the ILU native index kernels support.
+        self.indexer_kv_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype(
+            "bf16"
+        )
         _require_unquantized_m3_caches(
             self.kv_cache_dtype,
             self.kv_cache_torch_dtype,

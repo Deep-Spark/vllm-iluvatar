@@ -11,7 +11,7 @@ IluWorker — subclass of the community Worker with following overrides:
 
 from __future__ import annotations
 
-import vllm.v1.worker.gpu_model_runner as _gpu_model_runner
+import vllm.v1.worker.gpu.model_runner as _gpu_model_runner
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu_worker import Worker
@@ -27,17 +27,17 @@ class IluWorker(Worker):
         # self.model_runner is the V2 GPUModelRunner; restoring the legacy class
         # here corrupts the instance and makes V2 initialization call V1 methods.
         orig_cls = self.model_runner.__class__
-        is_v1_runner = isinstance(self.model_runner, _gpu_model_runner.GPUModelRunner)
+        is_v2_runner = isinstance(self.model_runner, _gpu_model_runner.GPUModelRunner)
 
         quant_kv_cache_requested = (
             envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE != ""
             or envs.VLLM_ILU_MLA_ATTN_QUANT_TYPE != ""
         )
 
-        if quant_kv_cache_requested and not is_v1_runner:
+        if quant_kv_cache_requested and not is_v2_runner:
             raise NotImplementedError(
-                "Iluvatar quantized KV cache currently requires the V1 model "
-                "runner. Set VLLM_USE_V2_MODEL_RUNNER=0, or disable "
+                "Iluvatar quantized KV cache currently requires the V2 model "
+                "runner. Set VLLM_USE_V2_MODEL_RUNNER=1, or disable "
                 "VLLM_ILU_FLASH_ATTN_QUANT_TYPE/VLLM_ILU_MLA_ATTN_QUANT_TYPE."
             )
 
@@ -45,7 +45,7 @@ class IluWorker(Worker):
             logger.info(
                 "Enable quant kv cache, replace self.model_runner.__class__ to IluvatarGPUModelRunner temporarily"
             )
-            from vllm_iluvatar.v1.worker.gpu_model_runner import (
+            from vllm_iluvatar.v1.worker.gpu.model_runner import (
                 IluvatarGPUModelRunner,
             )
 

@@ -278,8 +278,11 @@ class IluMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             self.kv_cache_dtype, vllm_config.model_config
         )
         # Indexer side-cache dtype, mirroring --kv-cache-dtype for the main
-        # cache (--attention-config '{"indexer_kv_dtype": ...}').
-        self.indexer_kv_dtype = vllm_config.attention_config.indexer_kv_dtype
+        # cache (--attention-config '{"indexer_kv_dtype": ...}'). Resolve
+        # "auto" to the only dtype the ILU native index kernels support.
+        self.indexer_kv_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype(
+            "bf16"
+        )
 
         self.attn_backend = IluMiniMaxM3SparseBackend
         sparse_resolved = resolve_sparse_attention_cfg(config)
@@ -409,17 +412,21 @@ class IluMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         rotary_dim = self.rotary_emb.rotary_dim
         eps = self.q_norm.variance_epsilon
 
-        if self.kv_cache.dim() != 5:
+        # Main KV cache is the community 0.29.0 4-D
+        # [B, H, block, head_size+head_size_v] layout (K/V packed in the last
+        # dim). The ixformer native M3 fused_kv kernel lifts it to a zero-copy
+        # 5-D NHD view internally (see ixformer...fused_kv.as_nhd_view).
+        if self.kv_cache.dim() != 4:
             raise RuntimeError(
                 f"Unexpected main KV cache rank {self.kv_cache.dim()}, "
-                f"shape={tuple(self.kv_cache.shape)}"
+                f"shape={tuple(self.kv_cache.shape)} (expected 4-D "
+                "[B, H, block, head_size+head_size_v])"
             )
-        # Native sparse kernels require NHD [B, 2, block, H, D].
         if self.kv_cache.shape[2] != self.sparse_block_size:
             raise RuntimeError(
-                f"Main KV cache shape {tuple(self.kv_cache.shape)} is not NHD "
-                f"with block_size={self.sparse_block_size} "
-                f"(HND is not supported by Iluvatar MiniMax-M3 sparse kernels)"
+                f"Main KV cache shape {tuple(self.kv_cache.shape)} block dim "
+                f"{self.kv_cache.shape[2]} != sparse_block_size "
+                f"{self.sparse_block_size}"
             )
         page_size = int(self.kv_cache.shape[2])
 

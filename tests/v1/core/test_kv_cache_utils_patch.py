@@ -25,22 +25,26 @@ def _setup_modules(monkeypatch, *, flash_quant_type: str, mla_quant_type: str):
     def original_from_groups(*args, **kwargs):
         return args, kwargs
 
+    def original_pool_bytes_per_block(*args, **kwargs):
+        return args, kwargs
+
     def original_configs(*args, **kwargs):
         return args, kwargs
 
     community = ModuleType("vllm.v1.core.kv_cache_utils")
     community.get_kv_cache_config_from_groups = original_from_groups
+    community._pool_bytes_per_block = original_pool_bytes_per_block
     community.get_kv_cache_configs = original_configs
 
     def replacement_from_groups(*args, **kwargs):
         return args, kwargs
 
-    def replacement_configs(*args, **kwargs):
+    def replacement_pool_bytes_per_block(*args, **kwargs):
         return args, kwargs
 
     implementation = ModuleType("vllm_iluvatar.v1.core.kv_cache_utils")
     implementation.get_kv_cache_config_from_groups = replacement_from_groups
-    implementation.get_kv_cache_configs = replacement_configs
+    implementation._ilu_pool_bytes_per_block = replacement_pool_bytes_per_block
 
     monkeypatch.setattr(core, "kv_cache_utils", community, raising=False)
     monkeypatch.setitem(sys.modules, community.__name__, community)
@@ -49,9 +53,10 @@ def _setup_modules(monkeypatch, *, flash_quant_type: str, mla_quant_type: str):
     return SimpleNamespace(
         community=community,
         original_from_groups=original_from_groups,
+        original_pool_bytes_per_block=original_pool_bytes_per_block,
         original_configs=original_configs,
         replacement_from_groups=replacement_from_groups,
-        replacement_configs=replacement_configs,
+        replacement_pool_bytes_per_block=replacement_pool_bytes_per_block,
     )
 
 
@@ -64,6 +69,10 @@ def test_patch_is_noop_when_quantization_is_disabled(monkeypatch):
         modules.community.get_kv_cache_config_from_groups
         is modules.original_from_groups
     )
+    assert (
+        modules.community._pool_bytes_per_block is modules.original_pool_bytes_per_block
+    )
+    # get_kv_cache_configs is never overridden on 0.29.0.
     assert modules.community.get_kv_cache_configs is modules.original_configs
 
 
@@ -92,4 +101,9 @@ def test_patch_replaces_functions_when_quantization_is_enabled(
         modules.community.get_kv_cache_config_from_groups
         is modules.replacement_from_groups
     )
-    assert modules.community.get_kv_cache_configs is modules.replacement_configs
+    assert (
+        modules.community._pool_bytes_per_block
+        is modules.replacement_pool_bytes_per_block
+    )
+    # get_kv_cache_configs is never overridden on 0.29.0.
+    assert modules.community.get_kv_cache_configs is modules.original_configs

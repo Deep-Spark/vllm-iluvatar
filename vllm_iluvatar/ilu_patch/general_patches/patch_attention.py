@@ -51,3 +51,28 @@ def _apply() -> None:
     Attention.process_weights_after_loading = make_process_weights_after_loading(
         Attention.process_weights_after_loading
     )
+
+    # [ILU override] Attention.bind_kv_cache_scale - delta: store the per-layer
+    # [k_scale, v_scale] views (carved from the shared KV backing buffer by
+    # allocate_kv_cache_scale) the same way bind_kv_cache stores the KV view.
+    # ILU attention backends (ilu_flash_attn / mla_attention) read
+    # ``layer.kv_cache_scale`` at forward time. Mirrors the community
+    # ``bind_kv_cache`` layer hook so subclasses can unpack the raw scale
+    # allocation the way Mamba unpacks the raw KV allocation.
+    def _bind_kv_cache_scale(self, kv_scale_cache):
+        self.kv_cache_scale = kv_scale_cache
+
+    Attention.bind_kv_cache_scale = _bind_kv_cache_scale
+
+    # [ILU override] MLAAttention.bind_kv_cache_scale - delta: same store as
+    # Attention above. MLAAttention is a separate nn.Module (not Attention), so
+    # the Attention patch does not reach it; the ILU MLA forward reads
+    # ``self.kv_cache_scale`` (see model_executor/layers/attention/mla_attention.py
+    # forward_full) when use_int8_mla is set, and allocate_kv_cache_scale calls
+    # ``bind_kv_cache_scale`` on every layer that owns a KV scale, so MLAAttention
+    # must expose the same hook.
+    from vllm.model_executor.layers.attention.mla_attention import (  # type: ignore[reportMissingImports]
+        MLAAttention,
+    )
+
+    MLAAttention.bind_kv_cache_scale = _bind_kv_cache_scale

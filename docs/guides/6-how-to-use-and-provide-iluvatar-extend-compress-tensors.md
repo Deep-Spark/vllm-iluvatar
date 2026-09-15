@@ -217,7 +217,7 @@ Compressed-Tensors，不读取 HF `quantization_config` 中的
 
 第 2 种配置看起来与 Compressed-Tensors group 相似，但 schema、解析入口和
 method factory 均不同，详见
-[指南 7](7-how-to-use-iluvatar-runtime-quant-via-additional-config.md)。
+[指南 8](8-how-to-use-iluvatar-runtime-quant-via-additional-config.md)。
 示例按开源权重 ID 放置，例如
 `examples/iluvatar-runtime-quant/Qwen/Qwen3.8-Flash-Next/`。不要把
 HF `quantization_config.config_groups` 与 `additional_config.ilu_quant` 混为

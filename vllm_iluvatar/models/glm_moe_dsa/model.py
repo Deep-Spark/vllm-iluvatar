@@ -90,7 +90,7 @@ from vllm_iluvatar.models.glm_moe_dsa.attention import (
     IluGlmMoeDsaMLAAttention,
 )
 
-logger = init_logger("vllm." + __name__)
+logger = init_logger(__name__)
 
 _FUSE_NORM_QUANT_WARNED = False
 

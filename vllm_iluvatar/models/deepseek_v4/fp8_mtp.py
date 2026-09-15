@@ -47,10 +47,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.deepseek_mtp import SharedHead
-from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.deepseek_v2 import (
     get_spec_layer_idx_from_weight_name,
 )
+from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -58,7 +58,7 @@ from vllm.utils.math_utils import cdiv
 
 from .fp8_model import IluDeepseekV4Fp8DecoderLayer
 
-logger = init_logger("vllm." + __name__)
+logger = init_logger(__name__)
 
 # MoE expert scales land on Mxfp4MoEMethod's ``w{1,2,3}_weight_scale``; every
 # other FP8 linear scale is Fp8LinearMethod's ``weight_scale_inv``.  Same rule
@@ -409,9 +409,7 @@ class IluDeepseekV4Fp8MTP(nn.Module, SupportsPP):
                 if not self.load_own_embed_tokens:
                     continue
                 param = params_dict["model.embed_tokens.weight"]
-                weight_loader = getattr(
-                    param, "weight_loader", default_weight_loader
-                )
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded_params.add("model.embed_tokens.weight")
                 continue
@@ -444,9 +442,7 @@ class IluDeepseekV4Fp8MTP(nn.Module, SupportsPP):
                 name = name.removesuffix(".scale") + suffix
 
             if ".shared_experts.w2" in name:
-                name = name.replace(
-                    ".shared_experts.w2", ".shared_experts.down_proj"
-                )
+                name = name.replace(".shared_experts.w2", ".shared_experts.down_proj")
             if self.pad_shared_expert and ".shared_experts." in name:
                 loaded_weight = self._pad_shared_expert_weight(name, loaded_weight)
 
@@ -538,7 +534,8 @@ class IluDeepseekV4Fp8MTP(nn.Module, SupportsPP):
             _SHARE_EXCLUDED.add("embed_tokens")
         all_params = set(dict(self.named_parameters()).keys())
         unfilled = sorted(
-            name for name in all_params - loaded_params
+            name
+            for name in all_params - loaded_params
             if not any(excl in name for excl in _SHARE_EXCLUDED)
         )
         if unfilled:

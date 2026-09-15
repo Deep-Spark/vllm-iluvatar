@@ -24,7 +24,7 @@ from vllm.logger import init_logger
 
 from vllm_iluvatar.ilu_patch import general_patch as p
 
-logger = init_logger("vllm." + __name__)
+logger = init_logger(__name__)
 
 
 def register() -> None:

@@ -62,8 +62,7 @@ from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
     IluDeepseekV32IndexerMetadata,
 )
 
-logger = init_logger("vllm." + __name__)
-
+logger = init_logger(__name__)
 
 # 4-byte fp32 ue8m0 scale per token (quant_block_size == index_head_dim).
 _INDEXER_FP8_SCALE_BYTES = 4

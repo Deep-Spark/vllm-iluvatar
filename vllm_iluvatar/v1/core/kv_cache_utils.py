@@ -40,7 +40,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
-logger = init_logger("vllm." + __name__)
+logger = init_logger(__name__)
 
 origin_get_kv_cache_config_from_groups = kv_cache_utils.get_kv_cache_config_from_groups
 origin_get_kv_cache_config_packed = kv_cache_utils._get_kv_cache_config_packed
@@ -323,7 +323,9 @@ def _cross_layers_blocks_opt_in(vllm_config: VllmConfig) -> bool:
         if kv_transfer_config is not None
         else {}
     )
-    return str(extra_config.get("enable_cross_layers_blocks", "False")).lower() == "true"
+    return (
+        str(extra_config.get("enable_cross_layers_blocks", "False")).lower() == "true"
+    )
 
 
 def _use_dsv4_kv_cache_layout(

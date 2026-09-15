@@ -36,10 +36,11 @@ from __future__ import annotations
 
 import importlib
 import inspect
-import logging
 import pkgutil
 
-logger = logging.getLogger(__name__)
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 # Packages mirror the upstream tree so OOT overrides can be diffed against the
 # community source file-by-file. Two lists, one per registration mechanism.

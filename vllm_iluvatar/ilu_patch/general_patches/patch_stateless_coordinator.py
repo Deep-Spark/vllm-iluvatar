@@ -27,11 +27,11 @@ Remove   : when upstream stateless path instantiates the resolved
 
 from __future__ import annotations
 
-import logging
+from vllm.logger import init_logger
 
 from vllm_iluvatar.ilu_patch import general_patch as p
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 
 def register() -> None:

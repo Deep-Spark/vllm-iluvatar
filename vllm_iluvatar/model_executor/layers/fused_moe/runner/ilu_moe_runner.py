@@ -38,7 +38,7 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExpertsOrder,
 )
 
-logger = init_logger("vllm." + __name__)
+logger = init_logger(__name__)
 
 
 class IluMoERunner(MoERunner):
@@ -215,18 +215,14 @@ class IluMoERunner(MoERunner):
             SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
         )
 
-        return_shared_output = (
-            experts_order
-            in (
-                SharedExpertsOrder.MK_INTERNAL_OVERLAPPED,
-                SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
-            )
-            or (
-                experts_order == SharedExpertsOrder.NO_OVERLAP
-                and (
-                    self.moe_config.in_dtype == torch.float16
-                    or self.do_naive_dispatch_combine
-                )
+        return_shared_output = experts_order in (
+            SharedExpertsOrder.MK_INTERNAL_OVERLAPPED,
+            SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+        ) or (
+            experts_order == SharedExpertsOrder.NO_OVERLAP
+            and (
+                self.moe_config.in_dtype == torch.float16
+                or self.do_naive_dispatch_combine
             )
         )
 

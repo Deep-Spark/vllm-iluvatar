@@ -74,6 +74,7 @@ def _apply() -> None:
     from vllm.logger import init_logger
 
     logger = init_logger(__name__)
+
     orig_init = MessageQueue.__init__
 
     # [ILU override] MessageQueue.__init__ — delta: enlarge default max_chunks

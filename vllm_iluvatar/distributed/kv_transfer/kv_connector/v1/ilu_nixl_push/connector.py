@@ -46,12 +46,12 @@ from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_push.worker 
     NixlConnectorWorker,
 )
 
+logger = init_logger(__name__)
+
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
-
-logger = init_logger("vllm." + __name__)
 
 
 class NixlConnector(KVConnectorBase_V1, SupportsHMA):

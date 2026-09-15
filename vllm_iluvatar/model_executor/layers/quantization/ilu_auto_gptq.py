@@ -59,7 +59,7 @@ from vllm_iluvatar.model_executor.layers.fused_moe.ilu_decode_metadata import (
     _is_only_decode,
 )
 
-logger = init_logger("vllm." + __name__)
+logger = init_logger(__name__)
 
 
 def _get_ilu_output_scale(layer: RoutedExperts) -> float:
@@ -112,7 +112,7 @@ def _apply_decode_w4a16_gptq(
 
 
 # [B,K//8,N] ->[B,K,N]
-# less memmory
+# less memory
 def unpack_k_batch_opt(
     packed_w: torch.Tensor, num_bits: int = 4, chunk_size: int = 2
 ) -> torch.Tensor:
@@ -158,7 +158,7 @@ def unpack_k_batch_opt(
     return unpacked
 
 
-# more memmory
+# more memory
 def unpack_k_batch(packed_w: torch.Tensor, num_bits: int = 4) -> torch.Tensor:
     """
     Efficient vectorized unpacking for 3D tensor (batch version).
@@ -195,7 +195,7 @@ def unpack_k_batch(packed_w: torch.Tensor, num_bits: int = 4) -> torch.Tensor:
 
 
 # [B,K,N] ->[B,K,N//8]
-# less memmory
+# less memory
 def pack_n_batch_opt(
     x: torch.Tensor, pack_num: int = 8, order_map=None, chunk_size: int = 2
 ) -> torch.Tensor:
@@ -233,7 +233,7 @@ def pack_n_batch_opt(
     return packed
 
 
-## more memmory
+## more memory
 def pack_n_batch(x: torch.Tensor, pack_num: int = 8, order_map=None) -> torch.Tensor:
     """
     Efficient vectorized batch packing: [B, K, N] int4 -> [B, K, N//pack_num] int32.

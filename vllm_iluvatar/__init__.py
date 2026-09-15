@@ -31,6 +31,25 @@ __all__ = [
 ]
 
 
+def _restore_vllm_log_stream(stream) -> None:
+    """Point vllm's root-logger StreamHandler(s) at ``stream``.
+
+    The compat patch may run before vllm configures its logger; vllm's default
+    log stream is stdout. We temporarily route stdout to stderr while the patch
+    runs (see ``_load_import_compat_patch``), which makes vllm capture stderr as
+    its handler stream. After the patch we restore the handler to the real stdout
+    so normal (non-helper) processes keep vllm's default stream.
+    """
+    try:
+        import logging
+
+        for h in logging.getLogger("vllm").handlers:
+            if isinstance(h, logging.StreamHandler):
+                h.stream = stream
+    except Exception:
+        pass
+
+
 def _load_import_compat_patch() -> None:
     """Apply early corex/torch compat shims + import-hook registration (once).
 
@@ -40,21 +59,45 @@ def _load_import_compat_patch() -> None:
     workers and from ``register_platform`` in the main process — without
     importing the whole ``vllm_iluvatar.ilu_patch`` package eagerly.  Idempotent
     via ``sys.modules``.
+
+    stdout is redirected to stderr while the patch runs. The patch imports vllm,
+    which triggers platform-plugin activation logs; vllm's default log stream is
+    stdout, so in a helper subprocess that talks to its parent via stdout (e.g.
+    py-cpuinfo's ``cpuinfo.py --json`` spawned by ``cpuinfo.get_cpu_info()`` in
+    vllm's usage-reporting thread) those logs would corrupt the JSON pipe and
+    raise ``JSONDecodeError``. Routing them to stderr during the patch keeps the
+    pipe clean; vllm's handler stream is restored to the real stdout afterwards.
     """
     module_name = "vllm_iluvatar._early_import_compat"
     if module_name in sys.modules:
         return
 
-    patch_path = (
-        Path(__file__).resolve().parent / "ilu_patch" / "patch_import_compat.py"
-    )
-    spec = importlib.util.spec_from_file_location(module_name, patch_path)
-    if spec is None or spec.loader is None:
-        return
+    real_stdout = sys.stdout
+    sys.stdout = sys.stderr
+    try:
+        patch_path = (
+            Path(__file__).resolve().parent / "ilu_patch" / "patch_import_compat.py"
+        )
+        spec = importlib.util.spec_from_file_location(module_name, patch_path)
+        if spec is None or spec.loader is None:
+            return
 
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+    finally:
+        sys.stdout = real_stdout
+        _restore_vllm_log_stream(real_stdout)
+
+    # Wire the vllm_iluvatar.* logger tree to vLLM's handler/level so that ILU
+    # modules using bare ``logging.getLogger(__name__)`` still emit through vLLM's
+    # configured stream/formatter. Runs once per process after vllm.logger is up.
+    try:
+        from vllm_iluvatar.ilu_logger import configure_ilu_logging
+
+        configure_ilu_logging()
+    except Exception:
+        pass
 
 
 def register_platform() -> str:
@@ -99,6 +142,7 @@ def register_platform() -> str:
     register_platform_import_hooks()
 
     return "vllm_iluvatar.platforms.ilu_platform.IluPlatform"
+
 
 def register_general() -> None:
     """vllm.general_plugins entry point for Iluvatar hardware.

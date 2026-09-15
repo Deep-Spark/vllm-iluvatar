@@ -27,15 +27,16 @@ Convention: each general-plugins patch wiring module lives under
 from __future__ import annotations
 
 import hashlib
-import logging
 import os
 import sys
 import textwrap
 from collections.abc import Callable
 
+from vllm.logger import init_logger
+
 from vllm_iluvatar.ilu_util.signature import validate_patch_signatures
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 ENV_CHECK_SIGNATURE = "VLLM_ILU_PATCH_CHECK_SIGNATURE"
 ENV_CHECK_FINGERPRINT = "VLLM_ILU_PATCH_CHECK_FINGERPRINT"

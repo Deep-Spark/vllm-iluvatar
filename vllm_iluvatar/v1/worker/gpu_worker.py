@@ -16,7 +16,7 @@ from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu_worker import Worker
 
-logger = init_logger("vllm." + __name__)
+logger = init_logger(__name__)
 
 
 class IluWorker(Worker):

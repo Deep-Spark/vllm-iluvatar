@@ -35,10 +35,11 @@ from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 
+logger = init_logger(__name__)
+
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
-logger = init_logger("vllm." + __name__)
 
 # Target causal-LM arch -> ilu MTP draft arch.
 _ILU_MTP_ARCH_MAP = {

@@ -21,11 +21,11 @@ from vllm.logger import init_logger
 from .pull_scheduler import IluNixlPullConnectorScheduler
 from .pull_worker import IluNixlPullConnectorWorker
 
+logger = init_logger(__name__)
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig
-
-logger = init_logger("vllm." + __name__)
 
 
 class IluNixlBaseConnector(NixlBaseConnector):

@@ -20,7 +20,7 @@ from vllm.distributed import (
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 
-logger = init_logger("vllm." + __name__)
+logger = init_logger(__name__)
 
 _FP8_SCALE_NAMES = ("q", "k", "v")
 _fp8_scale_file_cache: dict[str, dict[str, torch.Tensor]] = {}

@@ -32,7 +32,7 @@ from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, MambaSpec
 from vllm.v1.worker.utils import AttentionGroup
 
-logger = init_logger("vllm." + __name__)
+logger = init_logger(__name__)
 
 AlignFn = Callable[
     [

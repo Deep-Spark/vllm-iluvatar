@@ -16,10 +16,11 @@ Remove   : when community backend selection is suitable for Iluvatar Gemma4.
 from __future__ import annotations
 
 import importlib
-import logging
 from collections.abc import Callable
 
-logger = logging.getLogger(__name__)
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def _has_heterogeneous_gemma4_head_dims(

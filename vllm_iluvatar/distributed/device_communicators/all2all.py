@@ -18,6 +18,8 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.utils.import_utils import has_deep_ep
 
+logger = init_logger(__name__)
+
 
 class AgRsAll2AllManager(All2AllManagerBase):
     """
@@ -122,7 +124,6 @@ class AgRsAll2AllManager(All2AllManagerBase):
 
 
 DISABLE_DEEPEP = envs.VLLM_ILU_DISABLE_DEEPEP
-logger = init_logger("vllm." + __name__)
 
 
 class DeepEPAll2AllManagerBase(All2AllManagerBase):
@@ -231,13 +232,13 @@ class DeepEPHTAll2AllManager(DeepEPAll2AllManagerBase):
 
         # num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens, num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens
         config_map = {
-            2:   (deep_ep.Buffer.num_sms, 16, 256, 6, 128),
-            4:   (deep_ep.Buffer.num_sms, 16, 256, 6, 128),
-            8:   (deep_ep.Buffer.num_sms, 6, 256, 6, 128),
-            16:  (deep_ep.Buffer.num_sms, 16, 288, 20, 128),
-            24:  (deep_ep.Buffer.num_sms, 8, 288, 32, 128),
-            32:  (deep_ep.Buffer.num_sms, 8, 288, 32, 128),
-            64:  (deep_ep.Buffer.num_sms, 20, 288, 28, 128),
+            2: (deep_ep.Buffer.num_sms, 16, 256, 6, 128),
+            4: (deep_ep.Buffer.num_sms, 16, 256, 6, 128),
+            8: (deep_ep.Buffer.num_sms, 6, 256, 6, 128),
+            16: (deep_ep.Buffer.num_sms, 16, 288, 20, 128),
+            24: (deep_ep.Buffer.num_sms, 8, 288, 32, 128),
+            32: (deep_ep.Buffer.num_sms, 8, 288, 32, 128),
+            64: (deep_ep.Buffer.num_sms, 20, 288, 28, 128),
             128: (deep_ep.Buffer.num_sms, 20, 560, 32, 128),
             144: (deep_ep.Buffer.num_sms, 32, 720, 12, 128),
             160: (deep_ep.Buffer.num_sms, 28, 720, 12, 128),
@@ -245,15 +246,41 @@ class DeepEPHTAll2AllManager(DeepEPAll2AllManagerBase):
         num_max_nvl_chunked_recv_tokens = config_map[num_ranks][2]
 
         nb = 0
-        nb += num_ranks * num_ranks * sizeof(int)                                                     # Size prefix matrix
-        nb += num_channels * num_ranks * sizeof(int)                                                  # Channel start offset
-        nb += num_channels * num_ranks * sizeof(int)                                                  # Channel end offset
-        nb += num_channels * num_ranks * sizeof(int) * 2                                              # Queue head and tail
-        nb += num_channels * num_ranks * num_max_nvl_chunked_recv_tokens * hidden * itemsize          # Data buffer
-        nb += num_channels * num_ranks * num_max_nvl_chunked_recv_tokens * sizeof(int)                # Source index buffer
-        nb += num_channels * num_ranks * num_max_nvl_chunked_recv_tokens * num_topk * sizeof(int64_t) # Top-k index buffer
-        nb += num_channels * num_ranks * num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float)   # Top-k weight buffer
-        nb += num_channels * num_ranks * num_max_nvl_chunked_recv_tokens * sizeof(float) * num_scales # FP8 scale buffer
+        nb += num_ranks * num_ranks * sizeof(int)  # Size prefix matrix
+        nb += num_channels * num_ranks * sizeof(int)  # Channel start offset
+        nb += num_channels * num_ranks * sizeof(int)  # Channel end offset
+        nb += num_channels * num_ranks * sizeof(int) * 2  # Queue head and tail
+        nb += (
+            num_channels
+            * num_ranks
+            * num_max_nvl_chunked_recv_tokens
+            * hidden
+            * itemsize
+        )  # Data buffer
+        nb += (
+            num_channels * num_ranks * num_max_nvl_chunked_recv_tokens * sizeof(int)
+        )  # Source index buffer
+        nb += (
+            num_channels
+            * num_ranks
+            * num_max_nvl_chunked_recv_tokens
+            * num_topk
+            * sizeof(int64_t)
+        )  # Top-k index buffer
+        nb += (
+            num_channels
+            * num_ranks
+            * num_max_nvl_chunked_recv_tokens
+            * num_topk
+            * sizeof(float)
+        )  # Top-k weight buffer
+        nb += (
+            num_channels
+            * num_ranks
+            * num_max_nvl_chunked_recv_tokens
+            * sizeof(float)
+            * num_scales
+        )  # FP8 scale buffer
         return nb
 
     def _make_all2all_kwargs(self) -> dict[Any, Any]:

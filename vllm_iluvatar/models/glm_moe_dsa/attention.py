@@ -69,11 +69,11 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
-from vllm_iluvatar.model_executor.layers.sparse_attn_indexer import (
-    IluSparseAttnIndexer,
-)
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes import (
     IluCompressedTensorsW8A8Int8,
+)
+from vllm_iluvatar.model_executor.layers.sparse_attn_indexer import (
+    IluSparseAttnIndexer,
 )
 from vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse import (
     IluFlashMLASparseBackend,
@@ -83,12 +83,13 @@ from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
     IluDeepseekV32IndexerBackend,
 )
 
+logger = init_logger(__name__)
+
 # GLM DSA fp8 packed latent: 512 e4m3 NoPE + 64 bf16 RoPE = 640 bytes.
 _GLM_DSA_FP8_ROW_BYTES = 640
 _GLM_DSA_FP8_Q_HEADS = 64
 _GLM_DSA_FP8_E4M3_MAX = 448.0
 
-logger = init_logger(__name__)
 
 DynamicInt8Input = tuple[torch.Tensor, torch.Tensor, torch.dtype]
 _RMS_ROPE_FP8_KV_ENGAGE_LOGGED = False
@@ -536,9 +537,7 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
                 if not fusion_op_available:
                     reasons.append("ixformer native op is unavailable")
                 if not fusion_heads_supported:
-                    reasons.append(
-                        f"local Q heads={self.num_heads} not in {{8,16,32}}"
-                    )
+                    reasons.append(f"local Q heads={self.num_heads} not in {{8,16,32}}")
                 logger.warning(
                     "GLM-5.2 RMSNorm+RoPE+FP8 KV fusion requested but not "
                     "armed (%s). Falling back to split path. Further layers "
@@ -554,7 +553,6 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
                     "(VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV=1)"
                 )
                 _RMS_ROPE_FP8_KV_ENGAGE_LOGGED = True
-
 
         self.kv_cache = torch.tensor([])
         self._vllm_config = get_current_vllm_config()

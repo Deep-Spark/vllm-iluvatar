@@ -112,7 +112,7 @@ from vllm_iluvatar.models.deepseek_v4.attention import (
     IluDeepseekV4MultiHeadLatentAttentionWrapper,
 )
 
-logger = init_logger("vllm." + __name__)
+logger = init_logger(__name__)
 
 
 @IluvatarQuantRegistry.register_method
@@ -250,9 +250,7 @@ _DS4_MHC_DYNAMIC_INT8 = (
     )
     == "1"
 )
-_DS4_ALLREDUCE_MHC_POST = (
-    os.environ.get("IXFORMER_DS4_ALLREDUCE_MHC_POST", "1") == "1"
-)
+_DS4_ALLREDUCE_MHC_POST = os.environ.get("IXFORMER_DS4_ALLREDUCE_MHC_POST", "1") == "1"
 
 
 def _hc_pre_norm_fusion_available() -> bool:

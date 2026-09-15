@@ -20,15 +20,20 @@ detect an upstream signature change anyway. If a signature ever diverges, the
 torch dispatcher raises at the first call site (and the e2e run fails), which is
 the real, non-silent backstop.
 
-No vllm imports; safe to call at interpreter-startup time.
+Only imports vllm.logger (light: vllm.envs + vllm.logging_utils, no heavy vllm
+init), safe to call at interpreter-startup time. The logger is created via the
+ilu_logger wrapper so it attaches to the ``vllm`` logger tree (inherits vLLM's
+handler/format/level) instead of an orphan ``vllm_iluvatar.*`` logger that would
+never emit INFO/DEBUG.
 """
 
 from __future__ import annotations
 
 import importlib
-import logging
 
-logger = logging.getLogger(__name__)
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 NATIVE_MODULE = "vllm_iluvatar._C"
 

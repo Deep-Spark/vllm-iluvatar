@@ -27,10 +27,11 @@ module should perform lazy imports, guards, and rebinding only.
 from __future__ import annotations
 
 import importlib
-import logging
 import pkgutil
 
-logger = logging.getLogger(__name__)
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 # Packages whose top-level modules are scanned for ``register()`` callables.
 # Centralising wiring here keeps upstream-mirrored implementation directories

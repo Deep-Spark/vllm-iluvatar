@@ -108,10 +108,11 @@ from vllm_iluvatar.models.deepseek_v4.fp8_attention import (
     IluDeepseekV4Fp8Attention,
 )
 
+logger = init_logger(__name__)
+
 # Use a logger inside the ``vllm.`` namespace so that vLLM's configured handler
 # picks up INFO-level messages (load statistics).  A ``vllm_iluvatar.…`` logger
 # would only hit ``logging.lastResort`` (WARNING), dropping the stats lines.
-logger = init_logger(f"vllm.{__name__}")
 
 # ``mtp.*`` is skipped end to end: at load time via AutoWeightsLoader, and in
 # both directions of the Load_Verifier (community ``nvidia/model.py:1468-1469``).
@@ -244,8 +245,7 @@ class IluDeepseekV4Fp8MLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. Only silu is supported "
-                "for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         # DS-V4 always ships ``swiglu_limit``, so there is no
         # plain-``SiluAndMul`` branch.  ``SiluAndMulWithClamp`` resolves to the
@@ -1095,9 +1095,7 @@ class IluDeepseekV4Fp8ForCausalLM(nn.Module, SupportsPP):
     ) -> torch.Tensor | IntermediateTensors:
         # Community: vllm/models/deepseek_v4/nvidia/model.py:1450-1462
         # (delegates straight to self.model).
-        return self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
-        )
+        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return getattr(self.model, "_mtp_hidden_buffer", None)
@@ -1244,11 +1242,9 @@ def register_model() -> None:
 
     ModelRegistry.register_model(
         "DeepseekV4ForCausalLM",
-        "vllm_iluvatar.models.deepseek_v4.fp8_model:"
-        "IluDeepseekV4Fp8ForCausalLM",
+        "vllm_iluvatar.models.deepseek_v4.fp8_model:IluDeepseekV4Fp8ForCausalLM",
     )
     ModelRegistry.register_model(
         "DeepSeekV4MTPModel",
-        "vllm_iluvatar.models.deepseek_v4.fp8_mtp:"
-        "IluDeepseekV4Fp8MTP",
+        "vllm_iluvatar.models.deepseek_v4.fp8_mtp:IluDeepseekV4Fp8MTP",
     )

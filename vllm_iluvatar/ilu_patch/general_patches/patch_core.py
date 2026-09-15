@@ -32,11 +32,9 @@ from vllm.logger import init_logger
 
 from vllm_iluvatar.ilu_patch import general_patch as p
 
+logger = init_logger(__name__)
 
-logger = init_logger("vllm." + __name__)
-
-
-SHOULD_THROTTLE_PREFILLS = '''\
+SHOULD_THROTTLE_PREFILLS = """\
 def _should_throttle_prefills(self) -> bool:
     # Throttle new prefills to cadence-aligned steps for DP balancing.
     # step_counter is identical across DP ranks. On a fresh wave the
@@ -45,7 +43,7 @@ def _should_throttle_prefills(self) -> bool:
         self.prefill_schedule_interval > 1
         and self.step_counter % self.prefill_schedule_interval != 0
     )
-'''
+"""
 
 PROCESS_ENGINE_STEP = '''\
 def _process_engine_step(self) -> bool:
@@ -68,7 +66,7 @@ def _process_engine_step(self) -> bool:
     return model_executed
 '''
 
-HANDLE_CLIENT_REQUEST = '''\
+HANDLE_CLIENT_REQUEST = """\
 def _handle_client_request(
     self, request_type: EngineCoreRequestType, request: Any
 ) -> None:
@@ -88,7 +86,7 @@ def _handle_client_request(
                 self.engines_running = True
     else:
         super()._handle_client_request(request_type, request)
-'''
+"""
 
 
 def register() -> None:
@@ -141,9 +139,7 @@ def _apply() -> None:
     should_throttle = impl._make_should_throttle_prefills(
         DPEngineCoreProc._should_throttle_prefills
     )
-    process_step = impl._make_process_engine_step(
-        DPEngineCoreProc._process_engine_step
-    )
+    process_step = impl._make_process_engine_step(DPEngineCoreProc._process_engine_step)
     handle_client_request = impl._make_handle_client_request(
         DPEngineCoreProc._handle_client_request
     )

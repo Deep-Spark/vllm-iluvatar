@@ -50,7 +50,7 @@ from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_uti
     unpad_tensor,
 )
 
-logger = init_logger("vllm." + __name__)
+logger = init_logger(__name__)
 
 _FUSE_W13_ENGAGED_LOGGED = False
 _FUSE_W13_SKIP_LOGGED = False
@@ -75,7 +75,9 @@ def _log_fuse_w13_skip(reason: str) -> None:
     _FUSE_W13_SKIP_LOGGED = True
 
 
-def _log_fuse_w13_engaged(num_experts: int, hidden: int, intermediate: int, rows: int) -> None:
+def _log_fuse_w13_engaged(
+    num_experts: int, hidden: int, intermediate: int, rows: int
+) -> None:
     global _FUSE_W13_ENGAGED_LOGGED
     if _FUSE_W13_ENGAGED_LOGGED:
         return
@@ -87,7 +89,6 @@ def _log_fuse_w13_engaged(num_experts: int, hidden: int, intermediate: int, rows
         rows,
     )
     _FUSE_W13_ENGAGED_LOGGED = True
-
 
 
 def int4_w4a8_moe_quant_config(
@@ -1056,9 +1057,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             _log_fuse_w13_skip("missing dense_expert_sizes")
             return None
         if self.version != 2 or self.group_size != -1:
-            _log_fuse_w13_skip(
-                f"version={self.version} group_size={self.group_size}"
-            )
+            _log_fuse_w13_skip(f"version={self.version} group_size={self.group_size}")
             return None
         if self.gemm1_info.format_str != "TN":
             _log_fuse_w13_skip(f"format={self.gemm1_info.format_str}")

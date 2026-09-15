@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
-import logging
+from vllm.logger import init_logger
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 _ILU_KV_CONNECTORS = (
     (

@@ -52,7 +52,7 @@ from vllm.utils.multi_stream_utils import AuxStreamType
 
 from .model import IluDeepseekV4DecoderLayer
 
-logger = init_logger("vllm." + __name__)
+logger = init_logger(__name__)
 
 _MTP_RE = re.compile(r"mtp\.(\d+)\.(.*)")
 

@@ -1,13 +1,15 @@
-from vllm.logger import init_logger
-logger = init_logger("vllm." + __name__)
-
 import torch
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils import replace_parameter
+
+logger = init_logger(__name__)
+
 
 def align_up(value: int, multiple: int) -> int:
     if multiple <= 0:
         raise ValueError(f"multiple must be positive, got {multiple}")
     return ((value + multiple - 1) // multiple) * multiple
+
 
 class GemmInfo:
     def __init__(
@@ -30,19 +32,19 @@ class GemmInfo:
 
     def get_k(self):
         return self.k
-    
+
     def get_pad_k(self):
         return self.pad_k
-    
+
     def get_n(self):
         return self.n
 
     def get_pad_n(self):
-        return self.pad_n    
+        return self.pad_n
 
     def get_weight_shape(self):
         raise NotImplementedError("Subclasses must implement get_weight_shape().")
-    
+
     def get_pad_weight_shape(self):
         raise NotImplementedError("Subclasses must implement get_pad_weight_shape().")
 
@@ -54,16 +56,16 @@ class W4A8GroupGemmInfo(GemmInfo):
         k: int,
         n: int,
     ):
-        '''
-            w4a8 
-            group gemm
-            TN: K % 128 == 0 && K >= 256。如果groupsize = -1，则K >= 128
-            NN: N % 128 == 0 && K % 64 == 0 && K >= 256
+        """
+        w4a8
+        group gemm
+        TN: K % 128 == 0 && K >= 256。如果groupsize = -1，则K >= 128
+        NN: N % 128 == 0 && K % 64 == 0 && K >= 256
 
-            group gemv
-            TN: K % 128 == 0 && N % 16 == 0 (TODO: any N to support)
-            NN: N % 128 == 0 && K % 64 == 0
-        '''
+        group gemv
+        TN: K % 128 == 0 && N % 16 == 0 (TODO: any N to support)
+        NN: N % 128 == 0 && K % 64 == 0
+        """
         super().__init__(format_str=format_str, k=k, n=n)
 
         if self.format_str == "TN":
@@ -75,7 +77,9 @@ class W4A8GroupGemmInfo(GemmInfo):
             self.pad_n = align_up(n, 128)
             self.pad_k = max(256, self.pad_k)
 
-        logger.info_once(f"[W4A8GroupGemmInfo] format: {format_str}, k: {k} -> {self.pad_k}, n: {n} -> {self.pad_n}")
+        logger.info_once(
+            f"[W4A8GroupGemmInfo] format: {format_str}, k: {k} -> {self.pad_k}, n: {n} -> {self.pad_n}"
+        )
 
     # pack到int8  内层维度需要 / 2
     def get_pad_weight_shape(self):
@@ -85,7 +89,7 @@ class W4A8GroupGemmInfo(GemmInfo):
         elif self.format_str == "NN":
             # k, n
             return (self.pad_k, self.pad_n // 2)
-    
+
     def get_weight_shape(self):
         if self.format_str == "TN":
             # n, k
@@ -94,6 +98,7 @@ class W4A8GroupGemmInfo(GemmInfo):
             # k, n
             return (self.k, self.n // 2)
 
+
 class W4A8GemmInfo(GemmInfo):
     def __init__(
         self,
@@ -101,26 +106,28 @@ class W4A8GemmInfo(GemmInfo):
         k: int,
         n: int,
     ):
-        '''
-            w4a8
-            gemm
-            TN: Unsupport
-            NN: N % 128 == 0 && K % 64 == 0 K >= 256
+        """
+        w4a8
+        gemm
+        TN: Unsupported
+        NN: N % 128 == 0 && K % 64 == 0 K >= 256
 
-            gemv
-            TN: Unsupport
-            NN: N % 128 == 0 && K % 16 == 0
-        '''
+        gemv
+        TN: Unsupported
+        NN: N % 128 == 0 && K % 16 == 0
+        """
         super().__init__(format_str=format_str, k=k, n=n)
 
         if self.format_str == "TN":
-            assert False, "W4A8 gemm with TN format is not supported"
+            raise AssertionError("W4A8 gemm with TN format is not supported")
         elif self.format_str == "NN":
             self.pad_k = align_up(k, 64)
             self.pad_k = max(256, self.pad_k)
             self.pad_n = align_up(n, 128)
 
-        logger.info_once(f"[W4A8GemmInfo] format: {format_str}, k: {k} -> {self.pad_k}, n: {n} -> {self.pad_n}")
+        logger.info_once(
+            f"[W4A8GemmInfo] format: {format_str}, k: {k} -> {self.pad_k}, n: {n} -> {self.pad_n}"
+        )
 
     # pack到int8  内层维度需要 / 2
     def get_pad_weight_shape(self):
@@ -130,7 +137,7 @@ class W4A8GemmInfo(GemmInfo):
         elif self.format_str == "NN":
             # k, n
             return (self.pad_k, self.pad_n // 2)
-    
+
     def get_weight_shape(self):
         if self.format_str == "TN":
             # n, k
@@ -147,16 +154,16 @@ class W8A8GemmInfo(GemmInfo):
         k: int,
         n: int,
     ):
-        '''
-            w8a8
-            gemm
-            TN: K % 64 == 0 && N % 2 == 0
-            NN: N % 64 == 0 && K % 64 == 0
+        """
+        w8a8
+        gemm
+        TN: K % 64 == 0 && N % 2 == 0
+        NN: N % 64 == 0 && K % 64 == 0
 
-            gemv
-            TN: K % 64 == 0
-            NN: N % 64 == 0 && K % 64 == 0 (opt config : input_K % 64 == 0 && weight_K % 16 == 0, K use weight_K)
-        '''
+        gemv
+        TN: K % 64 == 0
+        NN: N % 64 == 0 && K % 64 == 0 (opt config : input_K % 64 == 0 && weight_K % 16 == 0, K use weight_K)
+        """
         super().__init__(format_str=format_str, k=k, n=n)
 
         if self.format_str == "TN":
@@ -166,7 +173,9 @@ class W8A8GemmInfo(GemmInfo):
             self.pad_k = align_up(k, 64)
             self.pad_n = align_up(n, 64)
 
-        logger.info_once(f"[W8A8GemmInfo] format: {format_str}, k: {k} -> {self.pad_k}, n: {n} -> {self.pad_n}")
+        logger.info_once(
+            f"[W8A8GemmInfo] format: {format_str}, k: {k} -> {self.pad_k}, n: {n} -> {self.pad_n}"
+        )
 
     def get_pad_weight_shape(self):
         if self.format_str == "TN":
@@ -175,7 +184,7 @@ class W8A8GemmInfo(GemmInfo):
         elif self.format_str == "NN":
             # k, n
             return (self.pad_k, self.pad_n)
-    
+
     def get_weight_shape(self):
         if self.format_str == "TN":
             # n, k
@@ -199,7 +208,8 @@ def pad_tensor(input: torch.Tensor, pad_dim: int):
         return input
 
     padding = pad_dim - input.shape[-1]
-    return torch.nn.functional.pad(input, (0, padding), mode='constant', value=0)
+    return torch.nn.functional.pad(input, (0, padding), mode="constant", value=0)
+
 
 def unpad_tensor(input: torch.Tensor, real_dim: int, contiguous: bool = False):
     # tokens, hidden_size
@@ -207,7 +217,7 @@ def unpad_tensor(input: torch.Tensor, real_dim: int, contiguous: bool = False):
     assert real_dim <= input.shape[-1]
     if input.shape[-1] == real_dim:
         return input
-    
+
     if contiguous:
         return input[..., :real_dim].contiguous()
     else:
@@ -277,4 +287,3 @@ def replace_with_padded(
     if extra_attrs is not None:
         for k, v in extra_attrs.items():
             setattr(new_param, k, v)
-

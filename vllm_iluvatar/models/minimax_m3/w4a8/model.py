@@ -664,6 +664,9 @@ class IluMiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={"language_model.": ""},
+        # vLLM 0.29.0 removed AutoWeightsLoader.skip_substrs; drop ``mtp.*``
+        # here instead (the MTP module is not modeled yet).
+        orig_to_new_substr={"mtp.": None},
     )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -710,7 +713,7 @@ class IluMiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         return self.model.get_expert_mapping()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self, skip_substrs=list(_LOAD_SKIP_SUBSTRS))
+        loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
@@ -732,6 +735,9 @@ class IluMiniMaxM3SparseForConditionalGeneration(
         orig_to_new_substr={
             ".mlp.fc1.": ".fc1.",
             ".mlp.fc2.": ".fc2.",
+            # vLLM 0.29.0 removed AutoWeightsLoader.skip_substrs; drop ``mtp.*``
+            # here instead (the MTP module is not modeled yet).
+            "mtp.": None,
         },
     )
 
@@ -905,7 +911,7 @@ class IluMiniMaxM3SparseForConditionalGeneration(
         return self.language_model.get_expert_mapping()
 
     def load_weights(self, weights):
-        loader = AutoWeightsLoader(self, skip_substrs=list(_LOAD_SKIP_SUBSTRS))
+        loader = AutoWeightsLoader(self)
         loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         if _is_ilu_quant_config(self.quant_config):
             kv_dtype = getattr(self.language_model, "kv_cache_dtype", "auto")

@@ -194,31 +194,6 @@ class MiniMaxM3SparseBackend(_CommunitySparseBackend):
     def get_impl_cls() -> type[MiniMaxM3SparseIxformerImpl]:
         return MiniMaxM3SparseIxformerImpl
 
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        # ``"auto"`` means "follow the model dtype", which for MiniMax-M3 is
-        # BF16; anything else must name a dtype this backend actually runs.
-        if cache_dtype_str not in ("auto", *SUPPORTED_KV_CACHE_DTYPES):
-            raise NotImplementedError(
-                f"ixformer M3 sparse attention does not support {cache_dtype_str} "
-                f"KV; supported: {('auto', *SUPPORTED_KV_CACHE_DTYPES)}"
-            )
-        return (num_blocks, 2, block_size, num_kv_heads, head_size)
-
-    @staticmethod
-    def get_kv_cache_stride_order(
-        include_num_layers_dimension: bool = False,
-    ) -> tuple[int, ...]:
-        if include_num_layers_dimension:
-            raise NotImplementedError("MiniMax-M3 does not use cross-layer KV blocks")
-        return (0, 1, 2, 3, 4)
-
 
 class MiniMaxM3SparseIxformerImpl(MiniMaxM3SparseImpl):
     """ixformer block-sparse attend over the indexer-selected blocks."""

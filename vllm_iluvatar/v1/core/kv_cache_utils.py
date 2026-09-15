@@ -4,235 +4,181 @@
 ILU override implementations for attention quantization (Int8 KV cache
 scale) support.
 
-Target   : vllm.v1.core.kv_cache_utils.get_kv_cache_configs
-           vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
-Baseline : main_a67969c5a0
-Why      : Iluvatar attention quantization Int8 support — for allocating
+Target   : vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
+           vllm.v1.core.kv_cache_utils._pool_bytes_per_block
+Baseline : vllm 0.29.0 (b53bdfecb11d)
+Why      : Iluvatar attention quantization Int8 support -- for allocating
            KV cache scales and adjusting the num gpu blocks.
-How      : get_kv_cache_configs: full-method copy with one delta (shrink the
-           kv scale size proportionally when clamping num_blocks to the min
-           across workers).
-           get_kv_cache_config_from_groups: super method call with deltas
-           (size the K-scale buffer and recompute num_blocks against the
-           scale-aware memory budget).
+How      : B2 "shared backing buffer": the K-scale storage shares the SAME
+           int8 backing allocation as the KV cache. Scale is PER-LAYER --
+           each layer in a packed ``KVCacheTensor`` owns its K-scale page
+           (and static V-scale, if any), matching 0.29.0's ``layers`` packing
+           where every layer has its own KV page. (In 0.27.1 ``shared_by``
+           meant true byte-sharing, so one scale per tensor sufficed; 0.29.0
+           ``layers`` packs same-spec layers each-own-page, so scale must be
+           ``* len(layer_names)``.)
+
+           * Block-outermost layouts (BLHNC / BLNHC, the mixed-page-size and
+             P2P-transfer case): scale is CO-LOCATED inside every block, right
+             after that spec-region's KV pages -- block_stride =
+             kv_bytes_per_block + scale_per_block_total. Within a block the
+             layout is ``[KV region (L pages) | scale region (L scale pages)]``;
+             layer ``l``'s scale sits at ``scale_offset + l * scale_page``.
+             Transferring block b carries its KV and its scale together.
+             allocate_kv_cache_scale carves a strided float32
+             ``[num_blocks, scale_page/4]`` view per layer out of the per-block
+             padding.
+           * Layer-outermost layouts (LBNHC, uniform page sizes): scale is
+             appended as a contiguous tail after the KV region instead, and
+             block_stride stays KV-only. allocate_kv_cache_scale carves
+             contiguous float32 views per layer from the tail.
+
+           In both cases the fixed-size region (e.g. KVINT8 static V scale) is
+           appended once after the per-block / KV region, since it does not
+           scale with num_blocks; it is carved PER-LAYER too.
+
+           _pool_bytes_per_block is overridden to return
+           kv_bytes_per_block + scale_per_block_total so the community
+           shrink loop in get_kv_cache_configs re-plans each worker with a
+           scale-aware budget. This keeps the override pure
+           (num_blocks = available // _pool_bytes_per_block), so all ranks
+           still converge to the same num_blocks after the single re-plan.
+
+           get_kv_cache_configs is not overridden: its shrink loop re-plans
+           each worker by calling this override, so scale_size is recomputed
+           consistently.
 Scope    : only active when attention quantization is enabled
            (VLLM_ILU_FLASH_ATTN_QUANT_TYPE / VLLM_ILU_MLA_ATTN_QUANT_TYPE);
            see ilu_patch/general_patches/patch_kv_cache_utils.py.
 Remove   : When upstream supports int8 kv cache quantization.
-
-NOTE: the DeepSeek-V4 packed-layout override that previously rebound
-``_get_kv_cache_config_packed`` and ``_pool_bytes_per_block`` (installed by
-``ilu_patch/general_patches/patch_dsv4_kv_cache_layout.py``) has been
-removed; this module now imports ``_pool_bytes_per_block`` straight from the
-community and only keeps the attention-quantization deltas.
 """
 
-from typing import Any
+from collections import defaultdict
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.core import kv_cache_utils
+from vllm.v1.core.kv_cache_utils import (
+    compute_layout_strides,
+    may_override_num_blocks,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
+    KVCacheTensor,
     MLAAttentionSpec,
+    SlidingWindowMLASpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 
 logger = init_logger(__name__)
 
 origin_get_kv_cache_config_from_groups = kv_cache_utils.get_kv_cache_config_from_groups
+origin_get_kv_cache_bytes_per_block = kv_cache_utils._get_kv_cache_bytes_per_block
+origin_pool_bytes_per_block = kv_cache_utils._pool_bytes_per_block
 
-_SCALE_KV_SPEC_TYPES = (FullAttentionSpec, MLAAttentionSpec)
+_SCALE_KV_SPEC_TYPES = (
+    FullAttentionSpec,
+    SlidingWindowSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+)
 
 
-def _get_shared_scale_kv_spec(
-    shared_by: list[str],
-    kv_cache_specs: dict[str, KVCacheSpec],
-) -> Any | None:
-    """Return the scale-aware spec after validating a shared KV tensor.
+def _layers_by_spec(group: KVCacheGroupSpec) -> defaultdict[KVCacheSpec, list[str]]:
+    """Group a cache group's layer names by their concrete KVCacheSpec."""
+    group_spec = group.kv_cache_spec
+    layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
+    if isinstance(group_spec, UniformTypeKVCacheSpecs):
+        for layer_name, spec in group_spec.kv_cache_specs.items():
+            layers_by_spec[spec].append(layer_name)
+    elif group.layer_names:
+        layers_by_spec[group_spec].extend(group.layer_names)
+    return layers_by_spec
 
-    Scale-unaware specs such as Mamba may share the main allocation with an
-    attention spec, but only the attention layer owns and consumes the
-    separately allocated scale cache.
+
+def _scale_bytes_for_spec(spec: KVCacheSpec) -> int:
+    """Return scale_page_size_bytes for a spec, or 0 if it is not scale-aware."""
+    if not isinstance(spec, _SCALE_KV_SPEC_TYPES):
+        return 0
+    return getattr(spec, "scale_page_size_bytes", 0) or 0
+
+
+def _ilu_scale_per_block_total(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
+    """Total per-block scale bytes across all scale-bearing spec-regions.
+
+    Scale is PER-LAYER: each layer in a packed tensor owns its K-scale page,
+    so a spec-region's contribution is ``scale_page * len(layer_names)``.
     """
-    scale_specs: set[Any] = set()
-    scale_layers: list[str] = []
-    scale_unaware_layers: list[str] = []
-
-    for layer_name in shared_by:
-        layer_kv_spec = kv_cache_specs[layer_name]
-        spec_name = layer_kv_spec.__class__.__name__
-        if isinstance(layer_kv_spec, _SCALE_KV_SPEC_TYPES):
-            scale_specs.add(layer_kv_spec)
-            scale_layers.append(f"{layer_name} ({spec_name})")
-        else:
-            scale_unaware_layers.append(f"{layer_name} ({spec_name})")
-
-    if len(scale_specs) > 1:
-        raise ValueError(
-            "Scale-aware layers sharing one KV cache tensor must have the "
-            f"same KV spec, but got: {scale_layers}."
-        )
-
-    if not scale_specs:
-        logger.debug(
-            "KV cache tensor does not need a scale cache; shared_by=%s",
-            scale_unaware_layers,
-        )
-        return None
-
-    if scale_unaware_layers:
-        logger.debug(
-            "Allocating a scale cache only for scale-aware layers %s; "
-            "scale-unaware sharing layers are %s",
-            scale_layers,
-            scale_unaware_layers,
-        )
-    return next(iter(scale_specs))
+    total = 0
+    for group in kv_cache_groups:
+        for spec, layer_names in _layers_by_spec(group).items():
+            scale_page = _scale_bytes_for_spec(spec)
+            total += scale_page * len(layer_names)
+    return total
 
 
-def get_kv_cache_configs(
-    vllm_config: VllmConfig,
-    kv_cache_specs: list[dict[str, KVCacheSpec]],
-    available_memory: list[int],
-) -> list[KVCacheConfig]:
-    from functools import partial
-
-    from vllm.v1.core.kv_cache_utils import (
-        _auto_fit_max_model_len,
-        _check_enough_kv_cache_memory,
-        _estimate_max_model_len_from_groups,
-        _max_memory_usage_bytes_from_groups,
-        _pool_bytes_per_block,
-        _project_kv_cache_groups_to_worker,
-        get_kv_cache_capacity,
-        get_kv_cache_groups,
-    )
-    from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
-
-    # Merge the KV cache specs of all workers. Different PP stages may have
-    # different layer names, and different TP ranks of the same PP stage should
-    # have the same KV cache spec.
-    merged_kv_cache_specs: dict[str, KVCacheSpec] = {}
-    for kv_cache_spec_one_worker in kv_cache_specs:
-        for layer_name, layer_spec in kv_cache_spec_one_worker.items():
-            if layer_name not in merged_kv_cache_specs:
-                merged_kv_cache_specs[layer_name] = layer_spec
-            else:
-                assert merged_kv_cache_specs[layer_name] == layer_spec, (
-                    "The KV cache specs for the same layer are different "
-                    "across workers. This is not supported yet."
-                )
-
-    # Check if the KV cache specs are registered correctly.
-    # This is to prevent that some layers are initialized with unregistered specs.
-    KVCacheSpecRegistry.check_kv_cache_spec_registry(merged_kv_cache_specs)
-    # Get global KV cache groups. This also handles spec unification for
-    # hybrid models when disable_hybrid_kv_cache_manager is enabled.
-    # After this call, merged_kv_cache_specs may be modified in-place.
-    global_kv_cache_groups = get_kv_cache_groups(vllm_config, merged_kv_cache_specs)
-
-    # If original_max_model_len was -1, automatically
-    # determine the maximum model length that fits in available GPU memory.
-    # We use per-worker projected groups to account for PP sharding.
-    projected_groups_per_worker = [
-        _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)
-        for worker_spec in kv_cache_specs
-    ]
-
-    # If `num_gpu_blocks_override` is set, the cache size that will actually
-    # be allocated is decoupled from the profiled `available_memory`:
-    # `may_override_num_blocks` in `get_kv_cache_config_from_groups` clamps
-    # `num_blocks` to the override. Reflect that in `available_memory` here so
-    # auto-fit, the admission check, and the per-worker config builder all
-    # plan against the same effective capacity.
-    override = vllm_config.cache_config.num_gpu_blocks_override
-    if override is not None:
-        adjusted_memory: list[int] = []
-        for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
-            if not groups:
-                adjusted_memory.append(avail_mem)
+def _ilu_v_per_block_total(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
+    """Total per-block V bytes for KINT8 (flash) specs, where V is allocated
+    as a SEPARATE dense bf16 buffer per layer (not in the V2 backing buffer,
+    which holds K only). Each such layer contributes
+    ``num_heads * block_size * head_size_v * 2`` (bf16) per block, so a
+    spec-region contributes that times ``len(layer_names)``. This must be
+    included in the num_blocks divisor so num_blocks reflects the real
+    total memory (K in V2 + V separate + scale separate), otherwise num_blocks
+    is over-sized (K-only is small) and the per-layer V buffers OOM.
+    """
+    total = 0
+    for group in kv_cache_groups:
+        for spec, layer_names in _layers_by_spec(group).items():
+            if not (
+                isinstance(spec, (FullAttentionSpec, SlidingWindowSpec))
+                and envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE in ("KINT8", "KVINT8")
+            ):
                 continue
-            bytes_per_block = _pool_bytes_per_block(vllm_config, groups)
-            logger.info(
-                "Overriding num_gpu_blocks=%d with num_gpu_blocks_override=%d",
-                avail_mem // bytes_per_block,
-                override,
-            )
-            adjusted_memory.append(override * bytes_per_block)
-        available_memory = adjusted_memory
+            v_head = getattr(spec, "head_size_v", 0) or 0
+            total += spec.num_heads * spec.block_size * v_head * 2 * len(layer_names)
+    return total
 
-    if vllm_config.model_config.original_max_model_len == -1:
-        _auto_fit_max_model_len(
-            vllm_config, projected_groups_per_worker, available_memory
-        )
 
-    # Check if the available memory is enough per worker.
-    for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
-        if not groups:
-            continue
-        _check_enough_kv_cache_memory(
-            avail_mem,
-            partial(_max_memory_usage_bytes_from_groups, vllm_config, groups),
-            vllm_config.model_config.max_model_len,
-            partial(_estimate_max_model_len_from_groups, vllm_config, groups),
-        )
+def _ilu_v2_scale_per_block_total(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int:
+    """Per-block scale bytes that live in the V2 backing buffer.
 
-    kv_cache_configs: list[KVCacheConfig] = []
-    for projected_groups, kv_cache_spec_one_worker, available_memory_one_worker in zip(
-        projected_groups_per_worker, kv_cache_specs, available_memory
-    ):
-        assert sum(len(group.layer_names) for group in projected_groups) == len(
-            kv_cache_spec_one_worker
-        ), "Some layers are not assigned to any group."
-        kv_cache_configs.append(
-            get_kv_cache_config_from_groups(
-                vllm_config, projected_groups, available_memory_one_worker
-            )
-        )
+    KINT8 (flash) scale is allocated as a SEPARATE dense buffer per layer (see
+    allocate_kv_cache_scale), so it is excluded from the V2 buffer size /
+    scale_tail; only KVINT8 / MLA-INT8 scale (carved out of the shared buffer)
+    counts here.
+    """
+    total = 0
+    for group in kv_cache_groups:
+        for spec, layer_names in _layers_by_spec(group).items():
+            if isinstance(
+                spec, (FullAttentionSpec, SlidingWindowSpec)
+            ) and envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE in ("KINT8", "KVINT8"):
+                continue
+            scale_page = _scale_bytes_for_spec(spec)
+            total += scale_page * len(layer_names)
+    return total
 
-    # Change the num_blocks of each rank to the smallest among all ranks.
-    # We also need to shrink the tensor size proportionally to avoid
-    # allocating unused memory.
-    min_num_blocks = min(
-        kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+
+def _ilu_pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
+    """Scale-aware bytes-per-block used by the community shrink loop.
+
+    available_memory // _ilu_pool_bytes_per_block must equal the num_blocks
+    produced by get_kv_cache_config_from_groups so the single re-plan in
+    get_kv_cache_configs keeps every rank aligned.
+    """
+    return (
+        origin_get_kv_cache_bytes_per_block(kv_cache_groups)
+        + _ilu_v_per_block_total(kv_cache_groups)
+        + _ilu_scale_per_block_total(kv_cache_groups)
     )
-    for kv_cache_config in kv_cache_configs:
-        num_blocks_old = kv_cache_config.num_blocks
-        kv_cache_config.num_blocks = min_num_blocks
-
-        # Shrink tensor size proportionally
-        for tensor in kv_cache_config.kv_cache_tensors:
-            assert tensor.size % num_blocks_old == 0
-            tensor.size = tensor.size // num_blocks_old * min_num_blocks
-
-            # NOTE >>> iluvatar specific logic
-            if tensor.scale_size:
-                assert tensor.scale_size % num_blocks_old == 0
-                tensor.scale_size = tensor.scale_size // num_blocks_old * min_num_blocks
-            # <<< iluvatar specific logic
-
-        if len(kv_cache_config.kv_cache_groups) > 0:
-            max_model_len = vllm_config.model_config.max_model_len
-            # GPU KV cache size in tokens = max_concurrency * max_model_len:
-            # the total tokens of context the pool can hold at peak
-            # utilization. Sourcing this from the concurrency calculation
-            # handles hybrid layouts correctly.
-            num_tokens, max_concurrency = get_kv_cache_capacity(
-                vllm_config, kv_cache_config
-            )
-
-            logger.info_once("GPU KV cache size: %s tokens", f"{num_tokens:,}")
-            logger.info_once(
-                "Maximum concurrency for %s tokens per request: %.2fx",
-                f"{max_model_len:,}",
-                max_concurrency,
-            )
-
-    return kv_cache_configs
 
 
 def get_kv_cache_config_from_groups(
@@ -240,75 +186,132 @@ def get_kv_cache_config_from_groups(
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
 ) -> KVCacheConfig:
-    # first, use original function to get the config
-    config = origin_get_kv_cache_config_from_groups(
-        vllm_config, kv_cache_groups, available_memory
-    )
-    # graph capture mode
-    num_blocks = config.num_blocks
+    """ILU override: plan KV cache + K-scale sharing one backing buffer.
 
-    kv_cache_specs = {}
-    all_quant_layers: set[str] = set()
-    for kv_cache_group in kv_cache_groups:
-        if isinstance(kv_cache_group.kv_cache_spec, UniformTypeKVCacheSpecs):
-            kv_cache_specs.update(kv_cache_group.kv_cache_spec.kv_cache_specs)
-            all_quant_layers.update(kv_cache_group.kv_cache_spec.kv_cache_specs.keys())
-        else:
-            kv_cache_specs.update(
-                {
-                    layer_name: kv_cache_group.kv_cache_spec
-                    for layer_name in kv_cache_group.layer_names
-                }
-            )
-            all_quant_layers.update(kv_cache_group.layer_names)
+    Scale and fixed are PER-LAYER (each layer in a packed tensor owns its
+    K-scale page / static V-scale), so a spec-region's contribution is
+    ``scale_page * len(layer_names)`` per block.
 
-    # calculate the total size of the kv cache and the total size of the kv cache with scale
-    total_size = 0
-    total_size_with_scale = 0
-    scale_specs_by_tensor: list[Any | None] = []
-    for kv_cache_tensor in config.kv_cache_tensors:
-        total_size += kv_cache_tensor.size
-        total_size_with_scale += kv_cache_tensor.size
-        layer_kv_spec = _get_shared_scale_kv_spec(
-            kv_cache_tensor.shared_by, kv_cache_specs
+    Block-outermost: scale is co-located inside every block (after each
+    spec-region's KV pages), so block_stride includes the scale pages and
+    transferring a block carries its scale. Within a block the region is
+    ``[KV region (L pages) | scale region (L scale pages)]``; ``scale_offset``
+    is the byte offset of the scale region's start in block 0, and per-layer
+    offsets within it (``+ l * scale_page``) are resolved by
+    ``allocate_kv_cache_scale``. Layer-outermost: scale is appended as a
+    contiguous tail (block_stride stays KV-only). The fixed-size region is
+    always appended once after the per-block / KV region.
+    """
+    if len(kv_cache_groups) == 0:
+        return origin_get_kv_cache_config_from_groups(
+            vllm_config, kv_cache_groups, available_memory
         )
-        scale_specs_by_tensor.append(layer_kv_spec)
 
-        if layer_kv_spec is not None:
-            total_size_with_scale += (
-                layer_kv_spec.scale_page_size_bytes
-            ) * num_blocks + layer_kv_spec.fixed_size_bytes
+    layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+    assert layout.name in ("LBNHC", "LBHNC"), (
+        "Only LBNHC or LBHNC layout is supported for int8 quantization"
+    )
+    kv_bytes_per_block = origin_get_kv_cache_bytes_per_block(kv_cache_groups)
+    scale_per_block_total = _ilu_scale_per_block_total(kv_cache_groups)
+    v_per_block_total = _ilu_v_per_block_total(kv_cache_groups)
 
-    # shrink the num blocks
-    total_used_memory = total_size
-    assert total_used_memory <= available_memory or available_memory == 0
-    if available_memory != 0:
-        new_blocks = int(total_used_memory / total_size_with_scale * num_blocks)
-    else:
-        # on graph capturing, the num_blocks is the smallest block that forward needed, so, do not shrink it.
-        new_blocks = num_blocks
+    # K (V2 backing buffer) + V (separate, KINT8) + scale (shared/tail) per
+    # block, so num_blocks reflects the real total memory footprint.
+    bytes_per_block = kv_bytes_per_block + v_per_block_total + scale_per_block_total
+    num_blocks = available_memory // bytes_per_block
+    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+
+    # Scale (K-scale, and static V-scale for KVINT8) lives in a TAIL appended
+    # after the KV region -- NOT co-located inside every block. The ILU int8
+    # read kernels (vllm_paged_attention_mla_int8 / vllm_paged_attention_int8
+    # / cuInferPageAttentionV7) require kv_cache_scale.is_contiguous(); a
+    # co-located (block-outermost) scale would be a strided as_strided view
+    # whose block_stride is generally != 4*block_size, failing that check.
+    # Tail placement carves scale as a contiguous slice, which always passes.
+    # block_stride stays KV-only (page_size), matching community, so
+    # compute_layout_strides derives block_stride = page_size (per-layer) and
+    # layer_stride = num_blocks * page. KINT8/KVINT8 flash stores K alone in
+    # the V2 buffer (V + scale are separate dense buffers), so its block_stride
+    # is also K-only -- handled per-tensor below.
+    v2_scale_per_block_total = _ilu_v2_scale_per_block_total(kv_cache_groups)
+    scale_tail = v2_scale_per_block_total * num_blocks
+    size = kv_bytes_per_block * num_blocks + scale_tail
+
+    kv_cache_tensors: list[KVCacheTensor] = []
+    for group in kv_cache_groups:
+        byte_offset = 0
+        for spec, layer_names in _layers_by_spec(group).items():
+            num_layers = len(layer_names)
+            is_flash_int8 = isinstance(
+                spec, (FullAttentionSpec, SlidingWindowSpec)
+            ) and envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE in ("KINT8", "KVINT8")
+            # block_stride is always KV-only (None -> page_size): scale lives in
+            # the tail, not inside every block. KINT8/KVINT8 flash is also K-only.
+            blk_stride = None
+            layer_stride, block_stride, _, _, _ = compute_layout_strides(
+                spec,
+                num_blocks,
+                num_layers,
+                layout,
+                fixed_strides=(None, blk_stride, None, None, None),
+            )
+            offset = (
+                byte_offset
+                * max(layer_stride, spec.page_size_bytes)
+                // spec.page_size_bytes
+            )
+            scale_page = _scale_bytes_for_spec(spec)
+            # KINT8 (flash) stores K alone in the V2 buffer (dense,
+            # C = head_size); V is a separate dense bf16 buffer allocated
+            # per layer by allocate_kv_cache_scale. Flag the tensor so the
+            # allocator knows to allocate fresh V + K-scale instead of carving
+            # scale out of the shared backing buffer, and carry v_head_size for
+            # sizing the V buffer.
+            is_flash_int8 = isinstance(
+                spec, (FullAttentionSpec, SlidingWindowSpec)
+            ) and envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE in ("KINT8", "KVINT8")
+            tensor = KVCacheTensor(
+                size=size,
+                layers=list(layer_names),
+                layer_stride=layer_stride,
+                block_stride=block_stride,
+                offset=offset,
+            )
+            # ILU-added fields (injected by patch_kv_cache_interface.py).
+            # Scale and fixed are PER-LAYER: each layer in the packed tensor
+            # owns its K-scale page (and static V-scale, if any).
+            tensor.is_flash_int8 = is_flash_int8
+            tensor.v_head_size = spec.head_size_v if is_flash_int8 else 0
+            if is_flash_int8:
+                # K + scale are allocated as separate dense buffers per layer
+                # (see allocate_kv_cache_scale); they do NOT live in the V2
+                # backing buffer, so the V2 size / carve logic must ignore them.
+                tensor.scale_size = 0
+            else:
+                tensor.scale_size = scale_page * num_layers * num_blocks
+            # Scale lives in the tail (not co-located inside blocks); flash int8
+            # also has no in-buffer scale (V + scale are separate buffers). Mark
+            # scale_offset = -1 (no in-block carve) for all tensors; the per-tensor
+            # tail offset is resolved later by allocate_kv_cache_scale.
+            tensor.scale_offset = -1
+            byte_offset += num_layers * spec.page_size_bytes
+            kv_cache_tensors.append(tensor)
+
     logger.info(
-        "available_memory: %s, total_used_memory: %s, total_size_with_scale: %s, init_blocks: %s, new_blocks: %s",
-        available_memory,
-        total_used_memory,
-        total_size_with_scale,
+        "ilu kv+scale plan: layout=%s kv_bytes_per_block=%s "
+        "scale_per_block=%s num_blocks=%s size=%s",
+        layout.name,
+        kv_bytes_per_block,
+        scale_per_block_total,
         num_blocks,
-        new_blocks,
+        size,
     )
 
-    # adjust the size of the kv cache tensors and add kv scale and fixed size to kv_cache_tensors
-    # scale_size and fixed_size are only used on gpu model runner and will not influence the others.
-    for kv_cache_tensor, layer_kv_spec in zip(
-        config.kv_cache_tensors, scale_specs_by_tensor
-    ):
-        assert kv_cache_tensor.size % num_blocks == 0
-        kv_cache_tensor.size = kv_cache_tensor.size // num_blocks * new_blocks
-
-        if layer_kv_spec is not None:
-            kv_cache_tensor.scale_size = (
-                layer_kv_spec.scale_page_size_bytes * new_blocks
-            )
-            kv_cache_tensor.fixed_size = layer_kv_spec.fixed_size_bytes
-
-    config.num_blocks = new_blocks
-    return config
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=kv_cache_tensors,
+        kv_cache_groups=kv_cache_groups,
+        prefix_cache_retention_interval=(
+            vllm_config.cache_config.prefix_cache_retention_interval
+        ),
+    )

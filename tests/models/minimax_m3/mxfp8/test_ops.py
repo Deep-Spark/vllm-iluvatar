@@ -18,8 +18,6 @@ from vllm_iluvatar.models.minimax_m3.mxfp8.attention import (
 
 def test_local_model_uses_ixformer_ops_and_nhd_kv_layout():
     backend = sparse_attention.MiniMaxM3SparseBackend
-    assert backend.get_kv_cache_shape(3, 128, 2, 128) == (3, 2, 128, 2, 128)
-    assert backend.get_kv_cache_stride_order() == (0, 1, 2, 3, 4)
     assert backend.supported_kv_cache_dtypes == ["bfloat16"]
     assert inspect.getsource(MiniMAXGemmaRMSNorm.forward).count("gemma_rms_norm") == 1
 

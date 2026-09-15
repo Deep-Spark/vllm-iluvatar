@@ -56,6 +56,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.attention.ops.dcp import cp_lse_ag_out_rs, dcp_a2a_lse_reduce
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_iluvatar.v1.attention.ilu_static_quant import (
     FP8StaticQuantManager,
@@ -64,32 +65,6 @@ from vllm_iluvatar.v1.attention.ilu_static_quant import (
 )
 
 logger = init_logger(__name__)
-
-
-def _get_k_int8_cache_views(
-    kv_cache: torch.Tensor,
-    value_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return zero-copy KINT8 key and value views for either cache layout."""
-    assert kv_cache.ndim == 5 and kv_cache.shape[0] == 3
-    assert value_dtype in (torch.float16, torch.bfloat16)
-
-    i8_key_cache = kv_cache[0]
-    value_cache_bytes = kv_cache[1:]
-
-    # Hybrid Attention + Mamba uses blocks-first physical storage while
-    # retaining the backend's logical (planes, blocks, ...) shape. Move the
-    # block dimension first so each block's two BF16 value-byte planes can be
-    # merged without materializing a contiguous copy.
-    blocks_first = kv_cache.stride(0) < kv_cache.stride(1)
-    if blocks_first:
-        value_cache_bytes = value_cache_bytes.movedim(1, 0)
-
-    num_blocks, num_kv_heads, block_size, head_size = i8_key_cache.shape
-    value_cache = value_cache_bytes.view(value_dtype).view(
-        num_blocks, num_kv_heads, block_size, head_size
-    )
-    return i8_key_cache, value_cache
 
 
 def get_flash_attn_version(
@@ -136,6 +111,10 @@ class IluFlashAttentionBackend(AttentionBackend):
         "fp8_e4m3",
     ]
 
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...] | None:
+        return (KVCacheLayout.LBHNC,)
+
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         # The Iluvatar int8 paged FMHA kernel (cuinferFmhaFwdInt8QUnpadKVPageFuncV3)
@@ -175,20 +154,6 @@ class IluFlashAttentionBackend(AttentionBackend):
     @staticmethod
     def get_builder_cls() -> type["IluFlashAttentionMetadataBuilder"]:
         return IluFlashAttentionMetadataBuilder
-
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        if block_size % 16 != 0:
-            raise ValueError("Block size must be a multiple of 16.")
-        if envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE == "KINT8":
-            return (3, num_blocks, num_kv_heads, block_size, head_size)
-        return (2, num_blocks, num_kv_heads, block_size, head_size)
 
     @staticmethod
     def get_fp8_dtype_for_flashattn(kv_cache_dtype: str) -> torch.dtype:
@@ -1252,9 +1217,18 @@ class IluFlashAttentionImpl(AttentionImpl):
         prefill_output = output[num_decode_tokens:]
         decode_output = output[:num_decode_tokens]
 
-        i8_key_cache, i8_value_cache = kv_cache.unbind(0)
+        # KVINT8 (Option 2): K lives alone in the V2 backing buffer as a dense
+        # contiguous [B, H, N, head_size] int8 view (the kv_cache arg), matching
+        # the ILU int8 kernels' fixed-dense stride assumption. V is a separate
+        # dense int8 buffer per layer (kv_scale_cache[1]); K-scale is the
+        # per-token float32 buffer kv_scale_cache[0]; V-scale is the static
+        # per-head float32 buffer kv_scale_cache[2]. Nothing is split out of
+        # kv_cache anymore.
+        i8_key_cache = kv_cache
+        i8_value_cache = kv_scale_cache[1]
+        key_scale_cache = kv_scale_cache[0]
+        value_scale_cache = kv_scale_cache[2]
         num_blocks, num_kv_heads, block_size, head_size = i8_key_cache.shape
-        key_scale_cache, value_scale_cache = kv_scale_cache
         assert (
             key_scale_cache.shape
             == (
@@ -1404,7 +1378,14 @@ class IluFlashAttentionImpl(AttentionImpl):
         prefill_output = output[num_decode_tokens:]
         decode_output = output[:num_decode_tokens]
 
-        i8_key_cache, value_cache = _get_k_int8_cache_views(kv_cache, query.dtype)
+        # KINT8 (Option 2): K lives alone in the V2 backing buffer as a
+        # dense contiguous [B, H, N, head_size] int8 view (the kv_cache
+        # arg), matching the ILU KINT8 kernels' fixed-dense stride assumption.
+        # V is a separate dense bf16 buffer allocated per layer and stored on
+        # the layer as kv_cache_scale[1]; K-scale is kv_cache_scale[0]. Nothing
+        # is split out of kv_cache anymore.
+        i8_key_cache = kv_cache
+        value_cache = kv_scale_cache[1]
         key_scale_cache = kv_scale_cache[0]
 
         int8_query, query_scale = ixf_ops.scaled_int8_quant_for_attn(

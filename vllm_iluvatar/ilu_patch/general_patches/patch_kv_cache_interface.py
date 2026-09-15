@@ -1,16 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
-"""KV cache int8 quantization infrastructure (VLLM_ILU_FLASH_ATTN_QUANT_TYPE=KVINT8).
+"""KV cache int8 quantization infrastructure
+(VLLM_ILU_FLASH_ATTN_QUANT_TYPE=KVINT8/KINT8, VLLM_ILU_MLA_ATTN_QUANT_TYPE=INT8).
 
-Patches two community objects so that KVINT8 KV cache memory is sized correctly:
+Patches community objects so int8 KV cache memory is sized correctly, aligned
+with the vLLM 0.29.0 community mechanism:
 
-* ``AttentionSpec.page_size_bytes`` — returns the int8 planes-only main buffer
-  size (K scale is a separate standalone tensor, not part of page_size).
-* ``get_kv_cache_config_from_groups`` — recalculates num_blocks based on the
-  int8 page size and creates separate K-scale buffer entries.
+* ``AttentionSpec.state_content_size_bytes`` -- overridden (when any int8
+  quant is enabled) to return the int8 per-cell byte size. The community
+  formula ``unpadded_page_size_bytes = num_heads * num_states *
+  state_content_size_bytes`` (and its alias ``real_page_size_bytes``, plus
+  ``compute_logical_shape``'s C dim) then naturally yields int8 sizing for
+  every spec (FullAttention / SlidingWindow via flash int8, MLAAttentionSpec /
+  SlidingWindowMLASpec via MLA int8). MLA is single-sided (head_size_v == 0),
+  so (head_size + head_size_v) collapses to head_size. ``state_content_bytes``
+  (nvfp4 / fp8_ds_mla / ...) is honored via the fallback.
+* ``AttentionSpec.num_heads`` -- overridden to reject ``num_head_slots``
+  (incompatible with the ILU int8 layout).
+* ``get_kv_cache_config_from_groups`` -- replans ``num_blocks`` against a
+  scale-aware budget and co-locates/appends the per-tensor K-scale pages in
+  the SAME community backing allocation; attaches ``scale_size`` /
+  ``scale_offset`` to each ``KVCacheTensor``.
 
-Target   : vllm.v1.kv_cache_interface.AttentionSpec.page_size_bytes
+Target   : vllm.v1.kv_cache_interface.AttentionSpec.state_content_size_bytes
+           vllm.v1.kv_cache_interface.AttentionSpec.num_heads
            vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
-Scope    : only active when VLLM_ILU_FLASH_ATTN_QUANT_TYPE == "KVINT8"
+           vllm.v1.core.kv_cache_utils._pool_bytes_per_block
+Scope    : only active when VLLM_ILU_FLASH_ATTN_QUANT_TYPE != "" or
+           VLLM_ILU_MLA_ATTN_QUANT_TYPE != ""
 """
 
 from __future__ import annotations
@@ -25,7 +41,7 @@ def register() -> None:
     p.register_once(
         __name__,
         _apply,
-        detail="may add properties to AttentionSpec/MLAAttentionSpec/KVCacheTensor",
+        detail="may add properties to AttentionSpec/KVCacheTensor",
     )
 
 
@@ -38,64 +54,54 @@ def _apply() -> None:
     ):
         return
 
-    # Re-route AttentionSpec.page_size_bytes through real_page_size_bytes so
-    # the ILU int8 sizing overrides (set below per subclass) drive the
-    # allocation size. vLLM 0.28.0 otherwise resolves page_size_bytes via
-    # unpadded_page_size_bytes -> state_content_size_bytes (bf16-based) and
-    # bypasses real_page_size_bytes. Applied on the base class so it dispatches
-    # to whichever subclass real_page_size_bytes override is active.
     from vllm.v1.kv_cache_interface import AttentionSpec
 
-    from vllm_iluvatar.v1.kv_cache_interface import _attention_page_size_bytes
+    from vllm_iluvatar.v1.kv_cache_interface import (
+        attention_num_heads,
+        attention_state_content_size_bytes,
+    )
 
-    AttentionSpec.page_size_bytes = property(_attention_page_size_bytes)
+    # Override the community per-cell size so the community formula
+    # ``unpadded_page_size_bytes = num_heads * num_states *
+    # state_content_size_bytes`` (and the ``real_page_size_bytes`` alias, plus
+    # ``compute_logical_shape``'s C dim) all yield int8 sizing. Applied on the
+    # base class so every subclass inherits it; the function dispatches by
+    # env var and spec type (flash int8 vs MLA int8). int8 layout assumes one
+    # slot per KV head.
+    AttentionSpec.state_content_size_bytes = property(
+        attention_state_content_size_bytes
+    )
+    AttentionSpec.num_heads = property(attention_num_heads)
 
-    # add property to spec, those properties will be used by:
+    # scale_page_size_bytes describes the K-scale storage
+    # sharing the KV backing buffer. Used by:
     #  get_kv_cache_config_from_groups from vllm_iluvatar.v1.core.kv_cache_utils
-    #  _reshape_kv_cache_tensors_with_scales from vllm_iluvatar.v1.worker.gpu_model_runner
+    #  allocate_kv_cache_scale from vllm_iluvatar.v1.worker.gpu.model_runner
     if envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE != "":
         from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
         from vllm_iluvatar.v1.kv_cache_interface import (
-            _full_attention_fixed_size_bytes,
-            _full_attention_real_page_size_bytes,
             _full_attention_scale_page_size_bytes,
-            _sliding_window_fixed_size_bytes,
-            _sliding_window_real_page_size_bytes,
             _sliding_window_scale_page_size_bytes,
         )
 
-        FullAttentionSpec.real_page_size_bytes = property(
-            _full_attention_real_page_size_bytes
-        )
         FullAttentionSpec.scale_page_size_bytes = property(
             _full_attention_scale_page_size_bytes
-        )
-        FullAttentionSpec.fixed_size_bytes = property(_full_attention_fixed_size_bytes)
-        SlidingWindowSpec.real_page_size_bytes = property(
-            _sliding_window_real_page_size_bytes
         )
         SlidingWindowSpec.scale_page_size_bytes = property(
             _sliding_window_scale_page_size_bytes
         )
-        SlidingWindowSpec.fixed_size_bytes = property(_sliding_window_fixed_size_bytes)
 
     if envs.VLLM_ILU_MLA_ATTN_QUANT_TYPE != "":
         from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
         from vllm_iluvatar.v1.kv_cache_interface import (
-            _mla_attention_fixed_size_bytes,
-            _mla_attention_real_page_size_bytes,
             _mla_attention_scale_page_size_bytes,
         )
 
-        MLAAttentionSpec.real_page_size_bytes = property(
-            _mla_attention_real_page_size_bytes
-        )
         MLAAttentionSpec.scale_page_size_bytes = property(
             _mla_attention_scale_page_size_bytes
         )
-        MLAAttentionSpec.fixed_size_bytes = property(_mla_attention_fixed_size_bytes)
 
     from vllm.v1.kv_cache_interface import KVCacheTensor
 
@@ -108,20 +114,31 @@ def _apply() -> None:
         setattr(cls, name, field(default=default))
         dataclass(cls)
 
-    # add fixed_size and scale_size to KVCacheSpec, those properties will be used by:
+    # add scale_size and scale_offset to KVCacheTensor; those
+    # properties will be used by:
     #  get_kv_cache_config_from_groups from vllm_iluvatar.v1.core.kv_cache_utils
-    #  _reshape_kv_cache_tensors_with_scales from vllm_iluvatar.v1.worker.gpu_model_runner
-    _ensure_dataclass_field(KVCacheTensor, "fixed_size", int, 0)
+    #  allocate_kv_cache_scale from vllm_iluvatar.v1.worker.gpu.model_runner
+    # scale_offset >= 0  -> block-outermost: scale is co-located inside each
+    #                       block at this byte offset.
+    # scale_offset == -1 -> layer-outermost: scale lives in a contiguous tail
+    #                       (offset resolved by allocate_kv_cache_scale).
     _ensure_dataclass_field(KVCacheTensor, "scale_size", int, 0)
+    _ensure_dataclass_field(KVCacheTensor, "scale_offset", int, -1)
     old_init = KVCacheTensor.__init__
     if getattr(old_init, "_register", False):
         return
 
     @wraps(old_init)
-    def __init__(self, *args, fixed_size: int = 0, scale_size: int = 0, **kwargs):
+    def __init__(
+        self,
+        *args,
+        scale_size: int = 0,
+        scale_offset: int = -1,
+        **kwargs,
+    ):
         old_init(self, *args, **kwargs)
-        self.fixed_size = fixed_size
         self.scale_size = scale_size
+        self.scale_offset = scale_offset
 
     __init__._register = True
     KVCacheTensor.__init__ = __init__

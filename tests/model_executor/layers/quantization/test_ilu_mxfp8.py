@@ -32,10 +32,10 @@ import torch
 import torch.nn as nn
 from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8FusedMoE
 
-import vllm_iluvatar.model_executor.layers.quantization.ilu_modelopt_mxfp8 as ilu_mxfp8
-from vllm_iluvatar.model_executor.layers.quantization.ilu_modelopt_mxfp8 import (
-    IluModelOptMxFp8Config,
-    IluModelOptMxFp8FusedMoE,
+import vllm_iluvatar.model_executor.layers.quantization.ilu_mxfp8 as ilu_mxfp8
+from vllm_iluvatar.model_executor.layers.quantization.ilu_mxfp8 import (
+    IluMxFp8Config,
+    IluMxFp8FusedMoE,
     e8m0_to_fp32,
 )
 
@@ -68,7 +68,7 @@ def _make_layer():
 def _make_method():
     quant_config = MagicMock()
     quant_config.is_checkpoint_mxfp8_serialized = True
-    return IluModelOptMxFp8FusedMoE(quant_config=quant_config, moe_config=MagicMock())
+    return IluMxFp8FusedMoE(quant_config=quant_config, moe_config=MagicMock())
 
 
 def test_init_skips_community_backend_selection(monkeypatch):
@@ -370,30 +370,29 @@ def test_unaligned_k_trips_the_real_ixmm_preprocess_guard(monkeypatch):
         )
 
 
-@pytest.mark.parametrize("name", ["modelopt_mxfp8", "mxfp8"])
-def test_both_community_config_names_are_shadowed(name):
-    """MiniMax-M3 tags ``quant_method: "mxfp8"``; ModelOpt checkpoints resolve to
-    ``modelopt_mxfp8``. Community maps both to ``ModelOptMxFp8Config``, so
-    registering only one leaves the other on MARLIN."""
+def test_minimax_mxfp8_is_shadowed_not_nvidia_modelopt():
+    """MiniMax-M3 tags ``quant_method: "mxfp8"``. NVIDIA ``modelopt_mxfp8`` is
+    left on the community class."""
     from vllm.model_executor.layers.quantization import get_quantization_config
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
 
-    assert get_quantization_config(name) is IluModelOptMxFp8Config
+    assert get_quantization_config("mxfp8") is IluMxFp8Config
+    assert get_quantization_config("modelopt_mxfp8") is ModelOptMxFp8Config
 
 
 def test_config_only_swaps_the_moe_method():
-    assert IluModelOptMxFp8Config.FusedMoEMethodCls is IluModelOptMxFp8FusedMoE
+    assert IluMxFp8Config.FusedMoEMethodCls is IluMxFp8FusedMoE
     # Linear must stay on the community method: it is the caller of
     # ``init_mxfp8_linear_kernel()``, which is where IluMxfp8LinearKernel wins.
-    assert IluModelOptMxFp8Config.LinearMethodCls.__name__ == (
+    assert IluMxFp8Config.LinearMethodCls.__name__ == (
         "ModelOptMxFp8LinearMethod"
     )
-    # Shadowing the community name must not change how the config resolves.
-    quant_config = IluModelOptMxFp8Config(
+    quant_config = IluMxFp8Config(
         is_checkpoint_mxfp8_serialized=True,
         kv_cache_quant_algo=None,
         exclude_modules=[],
     )
-    assert quant_config.get_name() == "modelopt_mxfp8"
+    assert quant_config.get_name() == "mxfp8"
 
 
 def test_unknown_activation_is_rejected_rather_than_mis_run():

@@ -39,6 +39,11 @@ Shims (no-ops on stock CUDA torch):
      several FP8 quant op overloads at import time. Register missing schemas as
      real dispatcher ops so FX matchers can import even when CoreX does not ship
      these CUDA kernels.
+  7. MiniMax-M3 NVIDIA model entry points — importing
+     ``vllm.models.minimax_m3.common`` first executes the parent package, whose
+     CUDA branch imports the NVIDIA model and MTP implementations. Provide
+     import-only stand-ins for those entry points so Iluvatar code can import
+     the hardware-neutral ``common`` package directly.
 Then installs module *stand-in* shims (``_install_import_shims`` ->
 ``import_shims.install_all``): whole community modules that would otherwise be
 imported at *import time* and fail on corex are replaced in ``sys.modules`` with
@@ -445,6 +450,81 @@ def _patch_triton_gluon_symbols() -> None:
         experimental.gluon = gluon_module
 
 
+class _IluMiniMaxM3NvidiaPlaceholder:
+    """Import-only placeholder for unavailable MiniMax-M3 NVIDIA symbols."""
+
+    def __getattr__(self, _name: str):
+        return self
+
+    def __call__(self, *args, **kwargs):
+        del kwargs
+        if len(args) == 1 and callable(args[0]):
+            return args[0]
+        return self
+
+
+
+def _patch_minimax_m3_nvidia_entrypoints() -> None:
+    """Provide import-only MiniMax-M3 NV entry points when NV imports fail.
+
+    Python executes ``vllm.models.minimax_m3.__init__`` before importing a
+    child such as ``common.mm_preprocess``. On CUDA-like Iluvatar platforms
+    that initializer selects ``nvidia.model`` and ``nvidia.mtp``. Their real
+    implementations are not used by the OOT Iluvatar model and may fail while
+    importing NVIDIA-only dependencies, so expose only the names required by
+    the parent initializer.
+
+    Follow the same pattern as :func:`_patch_triton_gluon_symbols`: use the
+    upstream modules when they import successfully, otherwise install minimal
+    stand-ins in ``sys.modules``.
+    """
+
+    try:
+        from vllm.models.minimax_m3.nvidia import model as _nv_model  # noqa: F401
+        from vllm.models.minimax_m3.nvidia import mtp as _nv_mtp  # noqa: F401
+
+        return
+    except Exception:
+        # A failed parent-package import can leave partially initialized modules.
+        # Remove only the NV leaves we replace; the package itself is retried
+        # normally when ``vllm.models.minimax_m3.common`` is imported.
+        sys.modules.pop("vllm.models.minimax_m3.nvidia.model", None)
+        sys.modules.pop("vllm.models.minimax_m3.nvidia.mtp", None)
+        sys.modules.pop("vllm.models.minimax_m3", None)
+
+    model_module = sys.modules.setdefault(
+        "vllm.models.minimax_m3.nvidia.model",
+        types.ModuleType("vllm.models.minimax_m3.nvidia.model"),
+    )
+    mtp_module = sys.modules.setdefault(
+        "vllm.models.minimax_m3.nvidia.mtp",
+        types.ModuleType("vllm.models.minimax_m3.nvidia.mtp"),
+    )
+    for module in (model_module, mtp_module):
+        module.__file__ = "<vllm_iluvatar.minimax_m3_nvidia_entrypoint_shim>"
+
+    # Export the placeholder *class* (not an instance): community warmup does
+    # ``isinstance(module, MiniMaxM3SparseAttention)``; an instance would raise.
+    placeholder = _IluMiniMaxM3NvidiaPlaceholder
+    for name in (
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+        "MiniMaxM3SparseAttention",
+    ):
+        # Always (re)bind: a prior empty/partial shim in sys.modules must not
+        # leave required warmup symbols missing.
+        setattr(model_module, name, placeholder)
+    mtp_module.MiniMaxM3MTP = placeholder
+
+    def _model_getattr(_name: str):
+        if _name.startswith("__"):
+            raise AttributeError(_name)
+        return placeholder
+
+    model_module.__getattr__ = _model_getattr
+    mtp_module.__getattr__ = _model_getattr
+
+
 def _install_import_shims() -> None:
     # Inject module *stand-in* shims into sys.modules BEFORE any deep
     # ``import vllm``.  Unlike the attribute-level shims above, these replace a
@@ -494,6 +574,7 @@ def apply() -> None:
         _patch_triton_gdc_symbols()
         _stub_symmetric_memory()
         _disable_unsupported_symmetric_memory()
+        _patch_minimax_m3_nvidia_entrypoints()
         _install_import_shims()
         _register_import_hooks()
         _load_native_torch_ops()

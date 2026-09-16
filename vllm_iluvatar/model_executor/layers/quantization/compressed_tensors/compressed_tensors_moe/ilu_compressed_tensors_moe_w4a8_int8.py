@@ -170,6 +170,10 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             )
         self.static_input_scales = not self.input_quant.dynamic
 
+        # Grow-only buffer for swigluoai_uninterleave (MiniMax-M3); unused by
+        # DeepSeek-V4 silu/swiglu paths.
+        self._interleave_buf: torch.Tensor | None = None
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -1207,6 +1211,43 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         # kernel, while shared experts are still combined separately per rank.
         return None
 
+    def _halves_to_interleaved(self, x: torch.Tensor) -> torch.Tensor:
+        """Convert packed ``[gates; ups]`` to interleaved ``[g0,u0,g1,u1,...]``.
+
+        Uses a grow-only persistent buffer so FULL CUDA graph capture does not
+        allocate via ``torch.stack`` (MiniMax-M3 ``swigluoai_uninterleave``).
+        DeepSeek-V4 silu/swiglu paths never call this.
+        """
+        d = x.shape[-1] // 2
+        n = x.shape[0]
+        need_shape = (n, x.shape[-1])
+        buf = self._interleave_buf
+        if (
+            buf is None
+            or buf.device != x.device
+            or buf.dtype != x.dtype
+            or buf.shape[0] < n
+            or buf.shape[1] != x.shape[-1]
+        ):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "W4A8 MoE interleave buffer undersized during CUDA graph "
+                    "capture; pre-size outside capture "
+                    f"(need={need_shape}, have="
+                    f"{None if buf is None else tuple(buf.shape)})"
+                )
+            cap_n = max(n, 1 if buf is None else buf.shape[0] * 2)
+            self._interleave_buf = torch.empty(
+                cap_n, x.shape[-1], device=x.device, dtype=x.dtype
+            )
+            buf = self._interleave_buf
+        out = buf[:n]
+        gate = x[..., :d]
+        up = x[..., d:]
+        out[..., 0::2].copy_(gate)
+        out[..., 1::2].copy_(up)
+        return out
+
     # act + quant + pad
     def _activation_and_quant(
         self,
@@ -1263,7 +1304,9 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         #                         we use the fused clamp+swiglu+quant op,
         #                         otherwise the plain swiglu kernel.
         #   - "swiglustep"      : silu(gate) * (up + 1)
-        #   - "swigluoai"       : OpenAI/GPT-OSS variant with built-in clamp
+        #   - "swigluoai"       : OpenAI/GPT-OSS variant (interleaved) + clamp
+        #   - "swigluoai_uninterleave" : same OAI math on packed [gates; ups]
+        #                         (MiniMax-M3); layout is converted first.
         # Other ``MoEActivation`` values (gelu, relu2, *_no_mul) are NOT
         # implemented by the W4A8 kernel.
         if use_fused_swiglu_limit:
@@ -1272,6 +1315,11 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             )
         elif act_value == "swigluoai":
             kwargs["bias"] = None
+            output, scale = ixfops.activation_swigluoai_dynamic_scaled_int8(**kwargs)
+        elif act_value == "swigluoai_uninterleave":
+            # OAI fused kernel is interleaved-only; MiniMax packs halves.
+            kwargs["bias"] = None
+            kwargs["input"] = self._halves_to_interleaved(input)
             output, scale = ixfops.activation_swigluoai_dynamic_scaled_int8(**kwargs)
         elif act_value == "swiglustep":
             kwargs["bias"] = None
@@ -1285,7 +1333,8 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             raise ValueError(
                 f"IluCompressedTensorsW4A8Int8MoEMethod: unsupported MoE "
                 f"activation {act_value!r}. Supported activations: "
-                f"'silu', 'swiglu', 'swiglustep', 'swigluoai'."
+                f"'silu', 'swiglu', 'swiglustep', 'swigluoai', "
+                f"'swigluoai_uninterleave'."
             )
 
         return output, scale

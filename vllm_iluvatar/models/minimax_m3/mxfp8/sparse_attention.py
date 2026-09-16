@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Iluvatar MiniMax-M3 block-sparse attention: ixformer attend.
+"""Iluvatar MiniMax-M3 mxfp8 sparse attend.
 
 Metadata and its builder come from
 ``vllm.models.minimax_m3.common.sparse_attention`` unchanged. What is local
@@ -11,6 +11,9 @@ Two Iluvatar deltas drive the code below: ixformer wants a contiguous
 ``[H,Q,K]`` top-k (vLLM's shared buffer view is transposed), and it reads a
 K/V-split NHD cache instead of the community packed layout. FP8 KV has no
 ixformer path, so the backend advertises BF16 only.
+
+The compressed-tensors path uses token-major ``[Q,H,K]`` adapters in
+``compressed_tensors/sparse_attention.py``; do not merge those into this module.
 """
 
 from __future__ import annotations
@@ -58,7 +61,7 @@ __all__ = [
 # accept". ``MiniMaxM3SparseBackend.supported_kv_cache_dtypes`` is what vLLM's
 # cache-dtype resolution reads, ``get_kv_cache_shape`` gates the allocation,
 # ``_check_unquantized_kv`` gates the kernel call, and
-# ``models.minimax_m3.model`` reuses the same list for its init-time guard --
+# ``mxfp8.model`` reuses the same list for its init-time guard --
 # all four derive from here so they cannot drift apart.
 SUPPORTED_KV_CACHE_DTYPES: tuple[CacheDType, ...] = ("bfloat16",)
 SUPPORTED_KV_CACHE_TORCH_DTYPES: tuple[torch.dtype, ...] = (torch.bfloat16,)

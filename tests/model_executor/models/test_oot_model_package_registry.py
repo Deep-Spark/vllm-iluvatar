@@ -42,16 +42,31 @@ _MIGRATED_MODEL_PACKAGES = {
     ],
     "vllm_iluvatar.models.minimax_m3": [
         (
+            "IluMiniMaxM3SparseForCausalLM",
+            "vllm_iluvatar.models.minimax_m3.compressed_tensors.model:"
+            "IluMiniMaxM3SparseForCausalLM",
+        ),
+        (
+            "IluMiniMaxM3SparseForConditionalGeneration",
+            "vllm_iluvatar.models.minimax_m3.compressed_tensors.model:"
+            "IluMiniMaxM3SparseForConditionalGeneration",
+        ),
+        (
             "MiniMaxM3SparseForCausalLM",
-            "vllm_iluvatar.models.minimax_m3.model:MiniMaxM3SparseForCausalLM",
+            "vllm_iluvatar.models.minimax_m3.mxfp8.model:"
+            "MiniMaxM3SparseForCausalLM",
         ),
         (
             "MiniMaxM3SparseForConditionalGeneration",
-            "vllm_iluvatar.models.minimax_m3.model:"
+            "vllm_iluvatar.models.minimax_m3.mxfp8.model:"
             "MiniMaxM3SparseForConditionalGeneration",
         ),
     ],
 }
+
+
+def _register_hook_module(package_name: str) -> str:
+    return f"{package_name}.model"
 
 
 def test_migrated_model_packages_are_explicitly_discovered():
@@ -65,7 +80,7 @@ def test_migrated_model_packages_are_explicitly_discovered():
     ids=list(_MIGRATED_MODEL_PACKAGES),
 )
 def test_migrated_model_package_exposes_register_model_hook(package_name: str):
-    model_module = importlib.import_module(f"{package_name}.model")
+    model_module = importlib.import_module(_register_hook_module(package_name))
 
     assert callable(model_module.register_model)
 
@@ -90,7 +105,7 @@ def test_migrated_model_register_model_points_at_plugin_paths(
         lambda arch, path: calls.append((arch, path)),
     )
 
-    model_module = importlib.import_module(f"{package_name}.model")
+    model_module = importlib.import_module(_register_hook_module(package_name))
     model_module.register_model()
 
     for call, expected_call in zip(calls, expected_calls):

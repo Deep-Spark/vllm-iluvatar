@@ -300,7 +300,7 @@ _VALID_SWIGLU_VARIANTS = (
 # i.e. plain ``silu(gate) * up``, and are deliberately NOT MiniMax-M3's values:
 # otherwise a caller that forgets to thread alpha/beta silently gets M3's
 # activation applied to some other checkpoint. Callers that require the real
-# values guard for ``None`` themselves (see ``IluModelOptMxFp8FusedMoE.apply``).
+# values guard for ``None`` themselves (see ``IluMxFp8FusedMoE.apply``).
 _SWIGLUOAI_ALPHA = 1.0
 _SWIGLUOAI_BETA = 0.0
 

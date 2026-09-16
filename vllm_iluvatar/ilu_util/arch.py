@@ -32,3 +32,7 @@ def cuda_arch() -> str | None:
 
 def is_ivcore30() -> bool:
     return cuda_arch() == IVCORE30
+
+
+def is_ivcore11() -> bool:
+    return cuda_arch() == IVCORE11

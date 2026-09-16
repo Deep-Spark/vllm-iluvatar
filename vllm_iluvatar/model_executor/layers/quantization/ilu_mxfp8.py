@@ -5,8 +5,9 @@ Corresponds to: vllm/model_executor/layers/quantization/modelopt.py
                 vllm/model_executor/layers/fused_moe/oracle/mxfp8.py
 
 Target   : vllm.model_executor.layers.quantization.modelopt.ModelOptMxFp8Config
-           (registered under the name ``modelopt_mxfp8``) and its
+           under MiniMax ``quant_method="mxfp8"``, and its
            ``ModelOptMxFp8FusedMoE`` routed-expert branch.
+           NVIDIA ``modelopt_mxfp8`` checkpoints are not shadowed.
 Why      : ``ModelOptMxFp8FusedMoE.__init__`` calls ``select_mxfp8_moe_backend``,
            whose auto priority is FLASHINFER_TRTLLM -> DEEPGEMM -> MARLIN -> ...
            ``MarlinExperts`` only gates on "CUDA SM75+" and ``IluPlatform._enum``
@@ -15,7 +16,7 @@ Why      : ``ModelOptMxFp8FusedMoE.__init__`` calls ``select_mxfp8_moe_backend``
            ``prepare_mxfp8_moe_layer_for_marlin`` ->
            ``torch.ops._C.gptq_marlin_repack``, which the Iluvatar build does not
            define. Same failure class as NVFP4/block-FP8 landing on MARLIN.
-How      : ``@register_quantization_config("modelopt_mxfp8")`` on a subclass that
+How      : ``@register_quantization_config("mxfp8")`` on a subclass that
            only swaps ``FusedMoEMethodCls``; the inherited
            ``ModelOptQuantConfigBase.get_quant_method`` dispatches through that
            attribute, so no method body is copied. The MoE method skips the
@@ -184,7 +185,7 @@ def _publish_derived_weight(
     layer.register_buffer(name, tensor, persistent=False)
 
 
-class IluModelOptMxFp8FusedMoE(ModelOptMxFp8FusedMoE):
+class IluMxFp8FusedMoE(ModelOptMxFp8FusedMoE):
     """MXFP8 routed experts converted to ix30 FP4 and run by ixmm group GEMM."""
 
     # [ILU override] ModelOptMxFp8FusedMoE.__init__ — delta: skip the parent body
@@ -211,10 +212,10 @@ class IluModelOptMxFp8FusedMoE(ModelOptMxFp8FusedMoE):
         self.moe_kernel = None
 
         assert self.quant_config.is_checkpoint_mxfp8_serialized, (
-            "IluModelOptMxFp8FusedMoE only handles serialized MXFP8 checkpoints"
+            "IluMxFp8FusedMoE only handles serialized MXFP8 checkpoints"
         )
         assert not hasattr(self, "experts_cls"), (
-            "IluModelOptMxFp8FusedMoE must not define experts_cls; community "
+            "IluMxFp8FusedMoE must not define experts_cls; community "
             "is_monolithic() would dereference it"
         )
         assert self.is_monolithic is False
@@ -362,7 +363,7 @@ class IluModelOptMxFp8FusedMoE(ModelOptMxFp8FusedMoE):
 
         if not _ixmm_backend_available():
             raise RuntimeError(
-                "IluModelOptMxFp8FusedMoE requires the ixmm backend (ix30 "
+                "IluMxFp8FusedMoE requires the ixmm backend (ix30 "
                 "group_gemm_fp4 only accepts the preprocessed uint8 layout). "
                 "Install the ixmm wheel and rebuild ixformer with HAVE_IXMM on "
                 "ivcore30."
@@ -420,7 +421,7 @@ class IluModelOptMxFp8FusedMoE(ModelOptMxFp8FusedMoE):
         activation = getattr(activation, "value", activation)
         if activation not in _SUPPORTED_ACTIVATIONS:
             raise NotImplementedError(
-                "IluModelOptMxFp8FusedMoE supports "
+                "IluMxFp8FusedMoE supports "
                 f"{sorted(_SUPPORTED_ACTIVATIONS)} routed experts; got "
                 f"activation {activation!r}. Another variant needs a matching "
                 "activation-and-requant implementation."
@@ -442,7 +443,7 @@ class IluModelOptMxFp8FusedMoE(ModelOptMxFp8FusedMoE):
         ]
         if missing:
             raise ValueError(
-                f"IluModelOptMxFp8FusedMoE requires {missing} on the layer for "
+                f"IluMxFp8FusedMoE requires {missing} on the layer for "
                 f"{sorted(_SUPPORTED_ACTIVATIONS)} routed experts; the MoE "
                 "config did not supply them."
             )
@@ -469,8 +470,7 @@ class IluModelOptMxFp8FusedMoE(ModelOptMxFp8FusedMoE):
 
 
 @register_quantization_config("mxfp8")
-@register_quantization_config("modelopt_mxfp8")
-class IluModelOptMxFp8Config(ModelOptMxFp8Config):
+class IluMxFp8Config(ModelOptMxFp8Config):
     """MXFP8 config whose routed experts use the Iluvatar ix30 compute path.
 
     Only ``FusedMoEMethodCls`` differs from community: the inherited
@@ -479,19 +479,12 @@ class IluModelOptMxFp8Config(ModelOptMxFp8Config):
     ``IluMxfp8LinearKernel`` from the patched kernel list) and ``RoutedExperts``
     through ``FusedMoEMethodCls``.
 
-    Both community keys must be shadowed. ``get_quantization_config`` builds a
-    ``method_to_config`` map in which ``ModelOptMxFp8Config`` is reachable under
-    *two* names: ``"modelopt_mxfp8"`` (ModelOpt checkpoints, via
-    ``override_quantization_method``) and ``"mxfp8"`` (MiniMax-style checkpoints
-    that tag ``quant_method: "mxfp8"`` directly -- which is what MiniMax-M3 does).
-    Registering only the former leaves MiniMax-M3 on the community class and back
-    on MARLIN.
+    MiniMax checkpoints tag ``quant_method: "mxfp8"``. NVIDIA ModelOpt
+    checkpoints resolve to ``modelopt_mxfp8`` and stay on the community class.
     """
 
     def get_name(self) -> Any:
-        # Keep the community name so model-config resolution and
-        # ``override_quantization_method`` are unaffected by the shadowing.
-        return "modelopt_mxfp8"
+        return "mxfp8"
 
 
-IluModelOptMxFp8Config.FusedMoEMethodCls = IluModelOptMxFp8FusedMoE
+IluMxFp8Config.FusedMoEMethodCls = IluMxFp8FusedMoE

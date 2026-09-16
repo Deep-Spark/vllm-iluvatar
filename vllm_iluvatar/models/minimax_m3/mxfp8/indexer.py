@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Iluvatar MiniMax-M3 lightning indexer: ixformer score + top-k.
+"""Iluvatar MiniMax-M3 mxfp8 lightning indexer.
 
 Side cache, metadata, and metadata builders come from
 ``vllm.models.minimax_m3.common.indexer`` unchanged. What is local here is the
@@ -62,7 +62,7 @@ __all__ = [
 # Single source of truth for the indexer side cache, mirroring
 # ``sparse_attention.SUPPORTED_KV_CACHE_DTYPES``. ``SUPPORTED_INDEXER_KV_DTYPES``
 # is the ``--attention-config indexer_kv_dtype`` spelling checked by the impl and
-# by ``models.minimax_m3.model``; ``SUPPORTED_INDEXER_CACHE_DTYPES`` is the
+# by ``mxfp8.attention``; ``SUPPORTED_INDEXER_CACHE_DTYPES`` is the
 # ``CacheDType`` spelling vLLM's cache-dtype resolution reads off the backend.
 SUPPORTED_INDEXER_KV_DTYPES: tuple[IndexerKVDType, ...] = ("bf16",)
 SUPPORTED_INDEXER_CACHE_DTYPES: tuple[CacheDType, ...] = ("bfloat16",)

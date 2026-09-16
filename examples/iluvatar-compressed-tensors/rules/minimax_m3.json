@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "name": "minimax_m3",
+  "load_device": "cpu",
+  "model_config_patch": {
+    "text_config.quantization_config": null
+  },
+  "default_action": "keep",
+  "rules": [
+    {
+      "id": "keep_sensitive_tensor",
+      "priority": 950,
+      "match": {
+        "regex": [
+          "^language_model\\.lm_head\\.weight$",
+          "^language_model\\.model\\.embed_tokens\\.weight$",
+          "^language_model\\.model\\.norm\\.weight$",
+          "^language_model\\.model\\.layers\\.\\d+\\.(input_layernorm|post_attention_layernorm)\\.weight$",
+          "^language_model\\.model\\.layers\\.\\d+\\.self_attn\\.(q_norm|k_norm|index_q_norm|index_k_norm)\\.weight$",
+          "^language_model\\.model\\.layers\\.\\d+\\.block_sparse_moe\\.gate\\.weight$",
+          "^language_model\\.model\\.layers\\.\\d+\\.block_sparse_moe\\.e_score_correction_bias$"
+        ]
+      },
+      "action": "keep"
+    },
+    {
+      "id": "routed_float_to_w4a8",
+      "priority": 900,
+      "match": {
+        "regex": [
+          "^language_model\\.model\\.layers\\.\\d+\\.block_sparse_moe\\.experts\\.\\d+\\.w[123]\\.weight$"
+        ],
+        "dtypes": [
+          "bfloat16",
+          "float16",
+          "float32"
+        ]
+      },
+      "action": "convert",
+      "work_device": "cuda",
+      "dequant": {
+        "method": "to_float32"
+      },
+      "quant": {
+        "method": "int4_moe",
+        "options": {
+          "group_size": -1,
+          "symmetric": true,
+          "gemm_format": "TN",
+          "pack_version": 2,
+          "scale_layout": "row"
+        }
+      },
+      "outputs": {
+        "weight_scale": ".weight_scale",
+        "i8_weight_scale": ".i8_weight_scale",
+        "i8_weight_zero": ".i8_weight_zero"
+      }
+    },
+    {
+      "id": "dense_float_to_w8a8",
+      "priority": 800,
+      "match": {
+        "regex": [
+          "^language_model\\.model\\.layers\\.\\d+\\.self_attn\\.(q_proj|k_proj|v_proj|o_proj|index_q_proj|index_k_proj)\\.weight$",
+          "^language_model\\.model\\.layers\\.\\d+\\.mlp\\.(gate_proj|up_proj|down_proj)\\.weight$",
+          "^language_model\\.model\\.layers\\.\\d+\\.block_sparse_moe\\.shared_experts\\.(gate_proj|up_proj|down_proj)\\.weight$"
+        ],
+        "dtypes": [
+          "bfloat16",
+          "float16",
+          "float32"
+        ]
+      },
+      "action": "convert",
+      "work_device": "cuda",
+      "dequant": {
+        "method": "to_float32"
+      },
+      "quant": {
+        "method": "int8_per_channel",
+        "options": {
+          "group_size": -1,
+          "symmetric": true,
+          "gemm_format": "TN"
+        }
+      },
+      "iluvatar": {
+        "mixed_strategy": "CHANNEL",
+        "gemm_mode": "PERF"
+      },
+      "outputs": {
+        "weight_scale": ".weight_scale"
+      }
+    }
+  ]
+}

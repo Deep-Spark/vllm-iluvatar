@@ -8,8 +8,9 @@ import inspect
 import pytest
 import torch
 
-from vllm_iluvatar.models.minimax_m3 import indexer, sparse_attention
-from vllm_iluvatar.models.minimax_m3.model import (
+from vllm_iluvatar.models.minimax_m3.mxfp8 import indexer as indexer
+from vllm_iluvatar.models.minimax_m3.mxfp8 import sparse_attention as sparse_attention
+from vllm_iluvatar.models.minimax_m3.mxfp8.attention import (
     MiniMAXGemmaRMSNorm,
     fused_minimax_m3_qknorm_rope_kv_insert,
 )
@@ -36,7 +37,7 @@ def test_fused_insert_is_not_on_custom_ops():
     assert name not in ilu_ops._ILU_ADDED
     assert not hasattr(ilu_ops, name)
     assert fused_minimax_m3_qknorm_rope_kv_insert.__module__.endswith(
-        "models.minimax_m3.model"
+        "models.minimax_m3.mxfp8.attention"
     )
 
 

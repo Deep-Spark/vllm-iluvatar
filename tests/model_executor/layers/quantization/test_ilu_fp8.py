@@ -188,6 +188,89 @@ def test_method_init_skips_backend_selection(monkeypatch):
     assert not hasattr(method, "experts_cls")
 
 
+def _linear_method(mod, *, block: bool) -> object:
+    method = object.__new__(mod.IluFp8LinearMethod)
+    method.block_quant = block
+    method.gemm_format = "TN"
+    return method
+
+
+def test_block_linear_create_weights_keeps_scale_inv(monkeypatch):
+    """Official block-FP8 must not overlay a channel ``weight_scale``."""
+    mod = _load_ilu_fp8(monkeypatch)
+    method = _linear_method(mod, block=True)
+
+    def _super_create(self, layer, *args, **kwargs):
+        layer.register_parameter(
+            "weight",
+            torch.nn.Parameter(torch.empty(128, 128), requires_grad=False),
+        )
+        layer.register_parameter(
+            "weight_scale_inv",
+            torch.nn.Parameter(torch.empty(1, 1), requires_grad=False),
+        )
+
+    monkeypatch.setattr(mod.Fp8LinearMethod, "create_weights", _super_create)
+    layer = torch.nn.Module()
+    method.create_weights(layer, 128, [128], 128, 128, torch.bfloat16)
+
+    names = dict(layer.named_parameters())
+    assert "weight_scale_inv" in names
+    assert "weight_scale" not in names
+    assert not hasattr(layer, "_can_use_gemm")
+
+
+def test_block_linear_process_and_apply_delegate_to_parent(monkeypatch):
+    mod = _load_ilu_fp8(monkeypatch)
+    method = _linear_method(mod, block=True)
+    called = {}
+    monkeypatch.setattr(
+        mod.Fp8LinearMethod,
+        "process_weights_after_loading",
+        lambda self, layer: called.setdefault("proc", True),
+    )
+    monkeypatch.setattr(
+        mod.Fp8LinearMethod,
+        "apply",
+        lambda self, layer, x, bias=None: called.setdefault("apply", x),
+    )
+    layer = torch.nn.Module()
+    x = torch.ones(2, 4)
+
+    method.process_weights_after_loading(layer)
+    out = method.apply(layer, x)
+
+    assert called["proc"] is True
+    assert called["apply"] is x
+    assert out is x
+
+
+def test_per_tensor_linear_create_weights_still_overlays_channel_scale(monkeypatch):
+    mod = _load_ilu_fp8(monkeypatch)
+    method = _linear_method(mod, block=False)
+    dummy = torch.nn.Parameter(torch.ones(64, 1), requires_grad=False)
+    monkeypatch.setattr(mod, "create_fp8_scale_parameter", lambda *a, **k: dummy)
+
+    def _super_create(self, layer, *args, **kwargs):
+        layer.register_parameter(
+            "weight",
+            torch.nn.Parameter(torch.empty(64, 128), requires_grad=False),
+        )
+        layer.register_parameter(
+            "weight_scale",
+            torch.nn.Parameter(torch.ones(1), requires_grad=False),
+        )
+
+    monkeypatch.setattr(mod.Fp8LinearMethod, "create_weights", _super_create)
+    layer = torch.nn.Module()
+    method.create_weights(layer, 128, [64], 128, 64, torch.bfloat16)
+
+    names = dict(layer.named_parameters())
+    assert names["weight_scale"] is dummy
+    assert "weight_scale_inv" not in names
+    assert layer._can_use_gemm is True
+
+
 def test_preprocess_pads_k_to_ixmm_group_boundary(monkeypatch):
     mod = _load_ilu_fp8(monkeypatch)
 

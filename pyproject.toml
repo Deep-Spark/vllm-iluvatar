@@ -83,3 +83,5 @@ UE = "UE"
 indx = "indx"
 # ``arange`` (torch.arange / np.arange) is a valid API name, not ``arrange``.
 arange = "arange"
+# GDN fused beta/alpha projection: ``in_proj_ba``, ``split_ba``, local ``ba``.
+ba = "ba"

@@ -14,9 +14,9 @@ How:
     ``QwenGatedDeltaNetAttention.register_oot`` narrows the attention delta to
     CoreX kernel preparation/dispatch.
 Scope:
-    Shared Iluvatar GDN metadata/OOT for Qwen3-Next / Qwen3.5. The CoreX30
-    ixformer CUDA math is opt-in per layer via ``use_qwen38_ixformer`` and is
-    only set by the Qwen4Exp model package.
+    Shared Iluvatar GDN metadata/OOT for Qwen3-Next / Qwen3.5 / Qwen4Exp.
+    CoreX30 uses the ixformer CUDA kernels; other arches keep the plugin FLA
+    path.
 """
 
 from __future__ import annotations
@@ -37,7 +37,6 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import _encode_layer_name
 
 from vllm_iluvatar.ilu_util.arch import is_ivcore30
-
 from vllm_iluvatar.model_executor.layers.mamba.ops.ilu_causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -50,6 +49,31 @@ from vllm_iluvatar.v1.attention.backends.ilu_gdn_attn import (
 )
 
 _shared_gdn_workspaces: dict[tuple[int, str, int | None], torch.Tensor] = {}
+_GDN_GATE_ACT = {"sigmoid": 0, "silu": 1}
+_ixformer_gdn_activation_abi_ready = False
+
+
+def _run_ixformer_rmsnorm_gated(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    eps: float,
+    activation: int,
+) -> None:
+    """Call the activation-aware ABI and report stale ixformer clearly."""
+    global _ixformer_gdn_activation_abi_ready
+    if _ixformer_gdn_activation_abi_ready:
+        ixf_c_ops.infer.qwen_gdn_rmsnorm_gated(x, z, weight, out, eps, activation)
+        return
+    try:
+        ixf_c_ops.infer.qwen_gdn_rmsnorm_gated(x, z, weight, out, eps, activation)
+    except TypeError as exc:
+        raise RuntimeError(
+            "The installed ixformer is too old for activation-aware qwen38 "
+            "GDN kernels; rebuild and reinstall ixformer."
+        ) from exc
+    _ixformer_gdn_activation_abi_ready = True
 
 
 def _register_qwen_gdn_attention(cls):
@@ -128,9 +152,9 @@ def fused_gdn_gating(
     """
     batch, num_heads = a.shape
     token_stride = a.stride(0)
-    assert (
-        b.stride(0) == token_stride
-    ), "a and b must all contiguous or split from a same tensor"
+    assert b.stride(0) == token_stride, (
+        "a and b must all contiguous or split from a same tensor"
+    )
     grid = (batch, triton.cdiv(num_heads, 8))
 
     g = torch.empty(batch, num_heads, dtype=torch.float32, device=a.device)
@@ -215,6 +239,13 @@ class IluQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             gqa_interleaved_layout,
             reduce_results,
         )
+        output_gate_type = getattr(config, "output_gate_type", "silu")
+        if output_gate_type == "swish":
+            output_gate_type = "silu"
+        if output_gate_type not in ("silu", "sigmoid"):
+            raise ValueError(f"unsupported {output_gate_type=}")
+        self.output_gate_type = output_gate_type
+        self._gate_act_code = _GDN_GATE_ACT[output_gate_type]
         self._gdn_workspace: torch.Tensor | None = None
         self._conv_out: torch.Tensor | None = None
         self._g_buf: torch.Tensor | None = None
@@ -229,14 +260,39 @@ class IluQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         sched = vllm_config.scheduler_config
         self._gdn_b_max = int(sched.max_num_seqs)
         self._gdn_t_max = int(sched.max_num_batched_tokens)
-        # Qwen3.8 ixformer math is installed by Qwen4ExpDecoderLayer only.
-        self.use_qwen38_ixformer = False
+        if self._qwen38_kernel() == "ixformer":
+            self._check_ixformer_supported(vllm_config)
 
     def _qwen38_kernel(self) -> str:
-        """Qwen4Exp on ivcore30 uses ixformer CUDA; everyone else keeps FLA."""
-        if getattr(self, "use_qwen38_ixformer", False) and is_ivcore30():
-            return "ixformer"
-        return "plugin_fla"
+        """CoreX30 uses ixformer CUDA; other arches keep plugin FLA."""
+        return "ixformer" if is_ivcore30() else "plugin_fla"
+
+    def _check_ixformer_supported(self, vllm_config) -> None:
+        """Fail at model load when the CoreX30 kernel cannot support config."""
+        fallback = " Set VLLM_ILU_GDN_ATTN_BACKEND=0 to use the community path."
+        if self.head_k_dim != 128 or self.head_v_dim != 128:
+            raise ValueError(
+                "Iluvatar GDN ixformer kernels require head_k_dim == "
+                f"head_v_dim == 128, got {self.head_k_dim}/{self.head_v_dim}."
+                + fallback
+            )
+        if self.conv_kernel_size != 4:
+            raise ValueError(
+                "Iluvatar GDN ixformer kernels require conv_kernel_size == 4, "
+                f"got {self.conv_kernel_size}." + fallback
+            )
+        if self.num_v_heads % self.num_k_heads != 0:
+            raise ValueError(
+                "Iluvatar GDN ixformer kernels require num_v_heads % "
+                f"num_k_heads == 0, got {self.num_v_heads}/{self.num_k_heads}."
+                + fallback
+            )
+        if getattr(vllm_config, "speculative_config", None) is not None:
+            raise ValueError(
+                "Iluvatar GDN ixformer kernels do not support speculative "
+                "decode / MTP." + fallback + " Alternatively, disable "
+                "speculative decode."
+            )
 
     def _ensure_ixformer_buffers(
         self, device: torch.device, dtype: torch.dtype | None = None
@@ -320,8 +376,7 @@ class IluQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         ``IluQwenGatedDeltaNetAttention`` is the OOT class for every
         ``QwenGatedDeltaNetAttention`` once ``VLLM_ILU_GDN_ATTN_BACKEND=1``.
-        Qwen3-Next / Qwen3.5 and CoreX11 leave ``use_qwen38_ixformer`` unset
-        and take the parent FLA / cuinfer path:
+        CoreX11 takes the parent FLA / cuinfer path:
         - ``a/b.contiguous()``: community ``fused_gdn_gating`` assumes packed
           stride; packed-decode Triton is stride-safe, but keep the parent
           copies so we do not change a fallback we are not measuring.
@@ -385,8 +440,13 @@ class IluQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         x = core_attn_out
         if x.dim() == 2:
             x = x.view(x.size(0), -1, self.head_v_dim)
-        ixf_c_ops.infer.qwen_gdn_rmsnorm_gated(
-            x, z, self.norm.weight, x, float(self.norm.eps)
+        _run_ixformer_rmsnorm_gated(
+            x,
+            z,
+            self.norm.weight,
+            x,
+            float(self.norm.eps),
+            self._gate_act_code,
         )
         output, _ = self.out_proj(x.flatten(-2))
         return output
@@ -597,12 +657,8 @@ class IluQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         spec_sequence_masks = attn_metadata.spec_sequence_masks
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx
-        spec_state_indices_tensor = (
-            attn_metadata.spec_state_indices_tensor
-        )  # noqa: E501
-        non_spec_state_indices_tensor = (
-            attn_metadata.non_spec_state_indices_tensor
-        )  # noqa: E501
+        spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
+        non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
         self_kv_cache = self.kv_cache
         # conv_state must be (..., dim, width-1) for the conv kernels.
         # DS layout stores it that way directly; SD layout needs a transpose.

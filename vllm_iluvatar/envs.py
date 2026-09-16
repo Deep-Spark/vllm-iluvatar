@@ -99,6 +99,13 @@ def _hybrid_dp_sync_prefills_default() -> bool:
     )
 
 
+def _gdn_attn_backend_default() -> str:
+    """Enable the tuned ixformer GDN path by default on CoreX30."""
+    from vllm_iluvatar.ilu_util.arch import is_ivcore30
+
+    return "1" if is_ivcore30() else "0"
+
+
 if TYPE_CHECKING:
     # Canonical names (new code should use these).
     VLLM_ILU_MLA_CUSTOMIZE: bool = True
@@ -171,10 +178,14 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_VIT_ATTN_LAYER": lambda: _get(
         "VLLM_ILU_VIT_ATTN_LAYER", "VLLM_VIT_ATTN_LAYER", ""
     ).upper(),
-    # Gate the Iluvatar GDN attention backend. Community GDN remains the default
-    # unless the deployment explicitly opts into the plugin metadata/kernel path.
+    # Gate the Iluvatar GDN attention backend. CoreX30 defaults to ixformer;
+    # other arches keep the community path. Explicit env values always win.
     "VLLM_ILU_GDN_ATTN_BACKEND": lambda: (
-        _get("VLLM_ILU_GDN_ATTN_BACKEND", "VLLM_GDN_ATTN_BACKEND", "0").lower()
+        _get(
+            "VLLM_ILU_GDN_ATTN_BACKEND",
+            "VLLM_GDN_ATTN_BACKEND",
+            _gdn_attn_backend_default(),
+        ).lower()
         in _TRUE_VALS
     ),
     "VLLM_ILU_DS4_PREFILL_OPT": lambda: (

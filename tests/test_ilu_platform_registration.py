@@ -8,6 +8,8 @@ import os
 import sys
 from types import ModuleType, SimpleNamespace
 
+import pytest
+
 vllm_envs = importlib.import_module("vllm.envs")
 
 
@@ -34,7 +36,6 @@ def test_new_ilu_env_readers_are_registered(monkeypatch):
     assert "VLLM_ILU_USE_DEFAULT_FLA_NORM" not in registered
     assert "VLLM_USE_DEFAULT_FLA_NORM" not in registered
 
-    assert registered["VLLM_ILU_GDN_ATTN_BACKEND"]() is False
     monkeypatch.setenv("VLLM_GDN_ATTN_BACKEND", "true")
     assert registered["VLLM_ILU_GDN_ATTN_BACKEND"]() is True
     monkeypatch.setenv("VLLM_ILU_GDN_ATTN_BACKEND", "0")
@@ -57,6 +58,29 @@ def test_new_ilu_env_readers_are_registered(monkeypatch):
     monkeypatch.setenv("VLLM_ILU_FUSE_MOE_W13", "0")
     assert fuse_norm() is False
     assert fuse_w13() is False
+
+
+@pytest.mark.parametrize(
+    ("is_ivcore30", "expected"),
+    [(True, True), (False, False)],
+    ids=["ivcore30", "other-arch"],
+)
+def test_gdn_backend_default_follows_arch(monkeypatch, is_ivcore30, expected):
+    envs = importlib.import_module("vllm_iluvatar.envs")
+    arch = importlib.import_module("vllm_iluvatar.ilu_util.arch")
+    monkeypatch.setattr(
+        vllm_envs,
+        "environment_variables",
+        dict(vllm_envs.environment_variables),
+    )
+    monkeypatch.delenv("VLLM_ILU_GDN_ATTN_BACKEND", raising=False)
+    monkeypatch.delenv("VLLM_GDN_ATTN_BACKEND", raising=False)
+    monkeypatch.setattr(arch, "is_ivcore30", lambda: is_ivcore30)
+
+    envs.apply()
+
+    reader = vllm_envs.environment_variables["VLLM_ILU_GDN_ATTN_BACKEND"]
+    assert reader() is expected
 
 
 def test_register_attention_backends_gates_gdn_backend(monkeypatch):

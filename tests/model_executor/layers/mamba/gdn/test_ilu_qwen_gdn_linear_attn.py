@@ -241,8 +241,9 @@ def test_ixformer_output_projection_uses_cuda_rmsnorm(monkeypatch):
 
     module, _, _ = _load_plugin_module(monkeypatch, gdn_backend=True)
     src = inspect.getsource(module.IluQwenGatedDeltaNetAttention._output_projection)
-    assert "qwen_gdn_rmsnorm_gated" in src
+    assert "_run_ixformer_rmsnorm_gated" in src
     assert "self.norm.weight" in src
+    assert "self._gate_act_code" in src
     assert "reshape(-1" not in src
     assert 'self._qwen38_kernel() != "ixformer"' in src
     assert "super()._output_projection" in src
@@ -566,13 +567,12 @@ def test_forward_core_split_reference_matches_plugin_non_split(
     )
 
 
-def test_qwen38_kernel_ixformer_only_on_qwen4_exp_ivcore30(monkeypatch):
-    """Qwen4Exp + ivcore30 uses ixformer; other models and ivcore11 stay FLA."""
+def test_qwen38_kernel_follows_arch(monkeypatch):
     from vllm_iluvatar.model_executor.layers.mamba.gdn.ilu_qwen_gdn_linear_attn import (
         IluQwenGatedDeltaNetAttention,
     )
 
-    dummy = SimpleNamespace(use_qwen38_ixformer=True)
+    dummy = SimpleNamespace()
     bound = MethodType(IluQwenGatedDeltaNetAttention._qwen38_kernel, dummy)
     monkeypatch.setattr(
         "vllm_iluvatar.model_executor.layers.mamba.gdn.ilu_qwen_gdn_linear_attn.is_ivcore30",
@@ -584,9 +584,112 @@ def test_qwen38_kernel_ixformer_only_on_qwen4_exp_ivcore30(monkeypatch):
         lambda: False,
     )
     assert bound() == "plugin_fla"
-    dummy.use_qwen38_ixformer = False
-    monkeypatch.setattr(
-        "vllm_iluvatar.model_executor.layers.mamba.gdn.ilu_qwen_gdn_linear_attn.is_ivcore30",
-        lambda: True,
+
+
+def _make_attention(
+    monkeypatch,
+    *,
+    ivcore30=True,
+    output_gate_type=None,
+    speculative_config=None,
+    **geometry,
+):
+    module, _, _ = _load_plugin_module(monkeypatch, gdn_backend=True)
+    parent = module.IluQwenGatedDeltaNetAttention.__mro__[1]
+
+    def fake_parent_init(self, config, *args, **kwargs):
+        self.head_k_dim = config.head_k_dim
+        self.head_v_dim = config.head_v_dim
+        self.conv_kernel_size = config.conv_kernel_size
+        self.num_k_heads = config.num_k_heads
+        self.num_v_heads = config.num_v_heads
+
+    monkeypatch.setattr(parent, "__init__", fake_parent_init)
+    monkeypatch.setattr(module, "is_ivcore30", lambda: ivcore30)
+    config_values = {
+        "head_k_dim": 128,
+        "head_v_dim": 128,
+        "conv_kernel_size": 4,
+        "num_k_heads": 16,
+        "num_v_heads": 48,
+    }
+    config_values.update(geometry)
+    if output_gate_type is not None:
+        config_values["output_gate_type"] = output_gate_type
+    config = SimpleNamespace(**config_values)
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=8,
+            max_num_batched_tokens=128,
+        ),
+        speculative_config=speculative_config,
     )
-    assert bound() == "plugin_fla"
+    return module.IluQwenGatedDeltaNetAttention(config, vllm_config), module
+
+
+@pytest.mark.parametrize(
+    ("configured", "normalized", "code"),
+    [(None, "silu", 1), ("swish", "silu", 1), ("sigmoid", "sigmoid", 0)],
+)
+def test_output_gate_type_is_normalized(monkeypatch, configured, normalized, code):
+    op, _ = _make_attention(
+        monkeypatch,
+        ivcore30=False,
+        output_gate_type=configured,
+    )
+    assert op.output_gate_type == normalized
+    assert op._gate_act_code == code
+
+
+def test_output_gate_type_rejects_unsupported_value(monkeypatch):
+    with pytest.raises(ValueError, match="unsupported output_gate_type"):
+        _make_attention(
+            monkeypatch,
+            ivcore30=False,
+            output_gate_type="gelu",
+        )
+
+
+@pytest.mark.parametrize(
+    ("geometry", "message"),
+    [
+        ({"head_k_dim": 64}, "head_k_dim"),
+        ({"conv_kernel_size": 3}, "conv_kernel_size"),
+        ({"num_k_heads": 2, "num_v_heads": 3}, "num_v_heads"),
+    ],
+)
+def test_ixformer_geometry_fails_at_construction(monkeypatch, geometry, message):
+    with pytest.raises(ValueError, match=message) as exc_info:
+        _make_attention(monkeypatch, **geometry)
+    assert "VLLM_ILU_GDN_ATTN_BACKEND=0" in str(exc_info.value)
+
+
+def test_ixformer_speculative_decode_fails_at_construction(monkeypatch):
+    with pytest.raises(ValueError, match="speculative") as exc_info:
+        _make_attention(monkeypatch, speculative_config=object())
+    assert "VLLM_ILU_GDN_ATTN_BACKEND=0" in str(exc_info.value)
+
+
+def test_non_ivcore30_keeps_speculative_decode_fallback(monkeypatch):
+    op, _ = _make_attention(
+        monkeypatch,
+        ivcore30=False,
+        speculative_config=object(),
+    )
+    assert op._qwen38_kernel() == "plugin_fla"
+
+
+def test_stale_ixformer_activation_abi_has_clear_error(monkeypatch):
+    module, _, _ = _load_plugin_module(monkeypatch, gdn_backend=True)
+    module._ixformer_gdn_activation_abi_ready = False
+
+    def old_abi(*args):
+        raise TypeError("takes 5 positional arguments")
+
+    monkeypatch.setattr(
+        module.ixf_c_ops,
+        "infer",
+        SimpleNamespace(qwen_gdn_rmsnorm_gated=old_abi),
+    )
+    with pytest.raises(RuntimeError, match="rebuild and reinstall ixformer"):
+        module._run_ixformer_rmsnorm_gated(None, None, None, None, 1e-6, 1)

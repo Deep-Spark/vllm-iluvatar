@@ -7,10 +7,9 @@ from itertools import islice
 
 import torch
 from torch import nn
-
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.config.compilation import CUDAGraphMode, CompilationMode
+from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
@@ -68,6 +67,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
+
 from .attention import Qwen4ExpQSAAttention
 from .config import Qwen4ExpConfig, Qwen4ExpTextConfig
 from .hyperconnection import GatedResidual, HyperConnectionConfig
@@ -306,9 +306,6 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
             )
-            # CoreX30 ixformer GDN math is Qwen4Exp-only; other Qwen GDN
-            # models keep the shared plugin FLA / cuinfer path.
-            self.linear_attn.use_qwen38_ixformer = True
         elif layer_type == "full_attention":
             use_qsa = getattr(config, "indexer_n_heads", None) is not None
             if not use_qsa:
@@ -782,7 +779,7 @@ def _verify_prefix_caching_support(vllm_config: VllmConfig) -> None:
         # QSA declares supports_kv_connector() == False: the compressed-K side
         # cache is not part of what a connector transfers.
         raise NotImplementedError(
-            "Qwen4Exp does not support prefix caching together with a KV " "connector"
+            "Qwen4Exp does not support prefix caching together with a KV connector"
         )
     if getattr(cache_config, "prefix_match_unit", None) is not None:
         # Sub-block matches can resume without a matching PLE window snapshot

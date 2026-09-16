@@ -313,6 +313,7 @@ class IluDeepseekV32SparseMLA(nn.Module, AttentionLayerBase):
         indices: torch.Tensor,
         sm_scale: float,
         d_v: int = 512,
+        topk_length: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sparse attention prefill kernel
@@ -324,6 +325,7 @@ class IluDeepseekV32SparseMLA(nn.Module, AttentionLayerBase):
             Invalid indices should be set to -1 or numbers >= s_kv
         - sm_scale: float
         - d_v: The dimension of value vectors. Can only be 512
+        - topk_length: [s_q] int32, valid leading entries per row of indices
 
         Returns:
         - (output, max_logits, lse)
@@ -333,7 +335,7 @@ class IluDeepseekV32SparseMLA(nn.Module, AttentionLayerBase):
         - max_logits:  [s_q, h_q], float
         - lse: [s_q, h_q], float, 2-based log-sum-exp
         """
-        results = ops.sparse_prefill_fwd(q, kv, indices, sm_scale, d_v)
+        results = ops.sparse_prefill_fwd(q, kv, indices, sm_scale, d_v, topk_length)
         return results
 
     def _sparse_mla_kernel(
@@ -344,13 +346,15 @@ class IluDeepseekV32SparseMLA(nn.Module, AttentionLayerBase):
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
         topk_indices = self.topk_indices_buffer[:num_tokens]
-        # Per-request indices -> global paged slots.
-        topk_indices = triton_convert_req_index_to_global_index(
+        # Per-request indices -> global paged slots. The same pass counts the
+        # entries it left >= 0, which is exactly the topk_length below.
+        topk_indices, topk_length = triton_convert_req_index_to_global_index(
             attn_metadata.req_id_per_token,
             attn_metadata.block_table,
             topk_indices,
             BLOCK_SIZE=attn_metadata.block_size,
             NUM_TOPK_TOKENS=topk_indices.shape[1],
+            return_valid_counts=True,
         )
 
         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
@@ -358,7 +362,11 @@ class IluDeepseekV32SparseMLA(nn.Module, AttentionLayerBase):
         )
         topk_indices = topk_indices.view(num_tokens, 1, -1)
         return self.flash_mla_sparse_prefill(
-            q, kv_c_and_k_pe_cache, topk_indices, self.softmax_scale
+            q,
+            kv_c_and_k_pe_cache,
+            topk_indices,
+            self.softmax_scale,
+            topk_length=topk_length,
         )
 
     def forward(
@@ -511,6 +519,12 @@ class IluDeepseekV32Attention(nn.Module):
             rope_parameters=config.rope_parameters,
             is_neox_style=False,
         )
+        self.indexer_rope_emb = get_rope(
+            self.qk_rope_head_dim,
+            max_position=self.max_position_embeddings,
+            rope_parameters=config.rope_parameters,
+            is_neox_style=not getattr(config, "indexer_rope_interleave", False),
+        )
         if config.rope_parameters["rope_type"] == "deepseek_yarn":
             mscale_all_dim = config.rope_parameters.get("mscale_all_dim", False)
             scaling_factor = config.rope_parameters["factor"]
@@ -590,7 +604,7 @@ class IluDeepseekV32Attention(nn.Module):
         kv_c_normed = self.kv_a_layernorm(kv_a)
 
         if self.indexer is not None and not self.skip_topk:
-            self.indexer(hidden_states, q_c, positions, self.rotary_emb)
+            self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
 
         attn_out = self.mla_attn(q, kv_c_normed, k_pe, positions)
         return self.o_proj(attn_out)[0]

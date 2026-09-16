@@ -863,5 +863,15 @@ def sparse_prefill_fwd(
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
+    topk_length: torch.Tensor | None = None,
 ):
-    return ixf_ops.sparse_flash_attn(q, kv, indices, sm_scale, d_v)
+    # Valid indices from dsa_update_topk_indices are a prefix; cap softmax
+    # gather so padded -1 / OOB entries cannot pull cache slot 0. Callers that
+    # already ran triton_convert_req_index_to_global_index can pass its
+    # return_valid_counts output, which is the same count for free.
+    if topk_length is None:
+        idx = indices.reshape(indices.shape[0], -1)
+        topk_length = (idx >= 0).sum(dim=-1).to(torch.int32)
+    return ixf_ops.sparse_flash_attn(
+        q, kv, indices, sm_scale, d_v, topk_length=topk_length
+    )

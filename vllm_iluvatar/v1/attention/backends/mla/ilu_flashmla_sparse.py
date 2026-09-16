@@ -665,6 +665,7 @@ class IluFlashMLASparseImpl(SparseMLACommonImpl[IluFlashMLASparseMetadata]):
 
         return self._bf16_flash_mla_kernel(q, kv_c_and_k_pe_cache, topk_indices)
 
+    @staticmethod
     def flash_mla_sparse_prefill(
         q: torch.Tensor,
         kv: torch.Tensor,

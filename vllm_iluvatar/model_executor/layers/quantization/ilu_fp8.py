@@ -63,6 +63,7 @@ from typing import Any
 import ixformer.inference.functions as ixfops
 import torch
 from ixformer.inference.functions.fp8 import fp8_per_token_dynamic_scaled
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEActivationFormat,
     FusedMoEMethodBase,
@@ -100,7 +101,6 @@ from vllm.model_executor.parameter import (
     ModelWeightParameter,
 )
 from vllm.model_executor.utils import replace_parameter
-from vllm.logger import init_logger
 
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
     _ixmm_backend_available,
@@ -511,8 +511,9 @@ class IluFp8LinearMethod(Fp8LinearMethod):
     """Serialized FP8 linear method backed directly by GEMM/GEMV.
 
     Checkpoint weights remain in their native TN layout, ``[N, K]``. Block
-    quantization dispatches to DeepGEMM; non-block checkpoints are exposed
-    to per-channel epilogue.
+    quantization keeps the parent ``Fp8LinearMethod`` path (Iluvatar selects
+    ``IluFp8BlockScaledMMKernel``); non-block checkpoints overlay a
+    per-channel ``weight_scale`` epilogue.
     """
 
     def __init__(self, quant_config: IluFp8Config) -> None:
@@ -538,6 +539,11 @@ class IluFp8LinearMethod(Fp8LinearMethod):
             params_dtype,
             **extra_weight_attrs,
         )
+        if self.block_quant:
+            # Parent registered weight_scale_inv, not weight_scale. Overlaying
+            # a channel weight_scale via replace_parameter(None) plants a
+            # regular attribute and KeyErrors on register_parameter.
+            return
         weight_loader = extra_weight_attrs.get("weight_loader")
         scale = create_fp8_scale_parameter(
             ChannelQuantScaleParameter,
@@ -557,6 +563,8 @@ class IluFp8LinearMethod(Fp8LinearMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Keep weights unchanged and materialize per-channel scales."""
+        if self.block_quant:
+            return super().process_weights_after_loading(layer)
 
         scale = layer.weight_scale.to(torch.float32).reshape(-1)
         n = layer.output_size_per_partition
@@ -587,6 +595,8 @@ class IluFp8LinearMethod(Fp8LinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.block_quant:
+            return super().apply(layer, x, bias)
         x_2d = x.reshape(-1, x.shape[-1])
         qx, scale_x = fp8_per_token_dynamic_scaled(x_2d)
 
@@ -653,9 +663,9 @@ def preprocess_fp8_block_weight_for_ixmm(
     if allow_k_padding:
         padded_k = (k + _IXMM_GROUP_SIZE - 1) // _IXMM_GROUP_SIZE * _IXMM_GROUP_SIZE
     else:
-        assert (
-            k % _IXMM_GROUP_SIZE == 0
-        ), f"k={k} must be a multiple of {_IXMM_GROUP_SIZE}"
+        assert k % _IXMM_GROUP_SIZE == 0, (
+            f"k={k} must be a multiple of {_IXMM_GROUP_SIZE}"
+        )
         padded_k = k
 
     # 1-2. Block dequant: fp8 magnitude * per-block float32 scale. Expand the
@@ -847,12 +857,12 @@ class IluFp8MoEMethod(Fp8MoEMethod):
         ):
             w = getattr(layer, w_name)
             s = getattr(layer, s_in_name)
-            assert (
-                w.dtype is torch.float8_e4m3fn
-            ), f"{w_name} expected float8_e4m3fn, got {w.dtype}"
-            assert (
-                s.dtype is torch.float32
-            ), f"{s_in_name} expected float32, got {s.dtype}"
+            assert w.dtype is torch.float8_e4m3fn, (
+                f"{w_name} expected float8_e4m3fn, got {w.dtype}"
+            )
+            assert s.dtype is torch.float32, (
+                f"{s_in_name} expected float32, got {s.dtype}"
+            )
 
             weight_parts: list[torch.Tensor] = []
             scale_parts: list[torch.Tensor] = []

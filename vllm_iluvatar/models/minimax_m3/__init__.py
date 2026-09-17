@@ -3,6 +3,6 @@
 
 Quant implementations live in subdirectories named after ``quant_method``:
 
-* ``compressed_tensors/`` — ``quant_method: compressed-tensors`` (W4A8)
+* ``w4a8/`` — ``quant_method: compressed-tensors`` (W4A8)
 * ``mxfp8/`` — MiniMax ``quant_method: mxfp8``
 """

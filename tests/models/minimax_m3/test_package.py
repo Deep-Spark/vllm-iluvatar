@@ -10,12 +10,12 @@ from pathlib import Path
 import vllm_iluvatar.ilu_register as ilu_register
 
 PACKAGE = "vllm_iluvatar.models.minimax_m3"
-_REPO_ROOT = Path(__file__).resolve().parents[4]
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def test_minimax_m3_packages_are_explicitly_discovered():
     assert PACKAGE in ilu_register._OOT_MODEL_PACKAGES
-    assert f"{PACKAGE}.compressed_tensors" not in ilu_register._OOT_MODEL_PACKAGES
+    assert f"{PACKAGE}.w4a8" not in ilu_register._OOT_MODEL_PACKAGES
     assert f"{PACKAGE}.mxfp8" not in ilu_register._OOT_MODEL_PACKAGES
 
 
@@ -60,9 +60,7 @@ def test_minimax_m3_runtime_has_no_hardware_upstream_imports():
 def test_no_general_patch_touches_community_minimax_m3():
     """The local package wires the ixformer ops itself. A surviving patch would
     additionally rebind the community module functions process-wide."""
-    patch_dir = (
-        _REPO_ROOT / "vllm_iluvatar" / "ilu_patch" / "general_patches"
-    )
+    patch_dir = _REPO_ROOT / "vllm_iluvatar" / "ilu_patch" / "general_patches"
     assert not list(patch_dir.glob("*minimax_m3*.py"))
 
 

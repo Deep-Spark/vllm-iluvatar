@@ -3,9 +3,8 @@
 
 from __future__ import annotations
 
-import torch
-
 import ixformer.inference.functions as ixf
+import torch
 
 
 def _make_cos_sin(max_pos: int, rotary_dim: int) -> torch.Tensor:

@@ -43,18 +43,16 @@ _MIGRATED_MODEL_PACKAGES = {
     "vllm_iluvatar.models.minimax_m3": [
         (
             "IluMiniMaxM3SparseForCausalLM",
-            "vllm_iluvatar.models.minimax_m3.compressed_tensors.model:"
-            "IluMiniMaxM3SparseForCausalLM",
+            "vllm_iluvatar.models.minimax_m3.w4a8.model:IluMiniMaxM3SparseForCausalLM",
         ),
         (
             "IluMiniMaxM3SparseForConditionalGeneration",
-            "vllm_iluvatar.models.minimax_m3.compressed_tensors.model:"
+            "vllm_iluvatar.models.minimax_m3.w4a8.model:"
             "IluMiniMaxM3SparseForConditionalGeneration",
         ),
         (
             "MiniMaxM3SparseForCausalLM",
-            "vllm_iluvatar.models.minimax_m3.mxfp8.model:"
-            "MiniMaxM3SparseForCausalLM",
+            "vllm_iluvatar.models.minimax_m3.mxfp8.model:MiniMaxM3SparseForCausalLM",
         ),
         (
             "MiniMaxM3SparseForConditionalGeneration",

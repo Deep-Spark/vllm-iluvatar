@@ -6,9 +6,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
-from vllm_iluvatar.models.minimax_m3.compressed_tensors.sparse_attention import (
+
+from vllm_iluvatar.models.minimax_m3.w4a8.sparse_attention import (
     IluMiniMaxM3SparseBackend,
     resolve_sparse_attention_cfg,
 )
@@ -61,8 +61,7 @@ def test_hnd_layout_env_is_rejected(monkeypatch):
 
 def test_hnd_resolved_layout_is_rejected(monkeypatch):
     monkeypatch.setattr(
-        "vllm_iluvatar.models.minimax_m3.compressed_tensors.sparse_attention."
-        "get_kv_cache_layout",
+        "vllm_iluvatar.models.minimax_m3.w4a8.sparse_attention.get_kv_cache_layout",
         lambda: "HND",
     )
     with pytest.raises(ValueError, match="NHD"):

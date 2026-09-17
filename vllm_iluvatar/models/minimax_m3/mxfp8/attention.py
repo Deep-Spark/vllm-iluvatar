@@ -2,7 +2,7 @@
 """MiniMax-M3 mxfp8 attention layers (dense + block-sparse).
 
 Indexer / sparse backends live alongside this file. W4A8 token-major
-adapters are in ``minimax_m3.compressed_tensors``.
+adapters are in ``minimax_m3.w4a8``.
 """
 
 from __future__ import annotations
@@ -525,5 +525,3 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # free graph-pool memory inside this call.
         self.indexer(index_query)
         return self.impl.forward(self, query, self.kv_cache, output)
-
-

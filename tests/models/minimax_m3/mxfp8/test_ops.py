@@ -86,10 +86,10 @@ def test_local_forwards_dispatch_to_the_local_adapters():
         (
             sparse_attention,
             sparse_attention.MiniMaxM3SparseIxformerImpl,
-                (
-                    "_minimax_m3_sparse_attn_ixformer",
-                    "minimax_m3_sparse_attn_decode",
-                ),
+            (
+                "_minimax_m3_sparse_attn_ixformer",
+                "minimax_m3_sparse_attn_decode",
+            ),
         ),
     ):
         referenced = cls.forward.__code__.co_names

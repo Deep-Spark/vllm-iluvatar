@@ -13,7 +13,7 @@ K/V-split NHD cache instead of the community packed layout. FP8 KV has no
 ixformer path, so the backend advertises BF16 only.
 
 The compressed-tensors path uses token-major ``[Q,H,K]`` adapters in
-``compressed_tensors/sparse_attention.py``; do not merge those into this module.
+``w4a8/sparse_attention.py``; do not merge those into this module.
 """
 
 from __future__ import annotations
@@ -257,9 +257,10 @@ class MiniMaxM3SparseIxformerImpl(MiniMaxM3SparseImpl):
         main_md = attn_metadata[layer.layer_name]  # type: ignore[attr-defined]
         assert isinstance(main_md, MiniMaxM3SparseMetadata)
 
-        nd = main_md.num_decode_tokens
+        num_decode = main_md.num_decode_tokens
         num_tokens = main_md.num_actual_tokens
-        # Indexer top-k from the shared buffer: decode [:, :nd], prefill [:, nd:].
+        # Indexer top-k from the shared buffer: decode [:, :num_decode],
+        # prefill [:, num_decode:].
         topk_buffer = layer.topk_indices_buffer  # type: ignore[attr-defined]
         assert topk_buffer is not None
         topk = topk_buffer[:num_tokens].transpose(0, 1)
@@ -267,45 +268,46 @@ class MiniMaxM3SparseIxformerImpl(MiniMaxM3SparseImpl):
         q = query[:num_tokens].view(-1, self.num_heads, hd)
         out = output[:num_tokens].view(-1, self.num_heads, hd)
 
-        # Decode [:nd]: split-K over the selected blocks (request-major chunks).
+        # Decode [:num_decode]: split-K over the selected blocks
+        # (request-major chunks).
         if main_md.num_decodes > 0:
             d = main_md.decode
             assert d is not None
             minimax_m3_sparse_attn_decode(
-                q[:nd],
+                q[:num_decode],
                 kv_cache,
-                topk[:, :nd, :],
+                topk[:, :num_decode, :],
                 d.block_table,
                 d.seq_lens,
                 self.num_kv_heads,
                 self.scale,
-                out[:nd],
+                out[:num_decode],
                 d.decode_query_len,
             )
 
-        # Prefill [nd:]: cu_seqlens_q already rebased to 0.
+        # Prefill [num_decode:]: cu_seqlens_q already rebased to 0.
         if main_md.num_prefills > 0:
             p = main_md.prefill
             assert p is not None
             if p.max_query_len == 1:
                 # Match the indexer's q=1 dispatch and reuse decode split-K.
                 minimax_m3_sparse_attn_decode(
-                    q[nd:],
+                    q[num_decode:],
                     kv_cache,
-                    topk[:, nd:num_tokens, :],
+                    topk[:, num_decode:num_tokens, :],
                     p.block_table,
                     p.seq_lens,
                     self.num_kv_heads,
                     self.scale,
-                    out[nd:],
+                    out[num_decode:],
                     1,
                 )
             else:
-                workspace = self.reserve_prefill_workspace(q[nd:].shape[0])
+                workspace = self.reserve_prefill_workspace(q[num_decode:].shape[0])
                 _minimax_m3_sparse_attn_ixformer(
-                    q[nd:],
+                    q[num_decode:],
                     kv_cache,
-                    topk[:, nd:num_tokens, :],
+                    topk[:, num_decode:num_tokens, :],
                     p.block_table,
                     p.cu_seqlens_q,
                     p.seq_lens,
@@ -313,7 +315,7 @@ class MiniMaxM3SparseIxformerImpl(MiniMaxM3SparseImpl):
                     p.max_query_len,
                     self.num_kv_heads,
                     self.scale,
-                    out[nd:],
+                    out[num_decode:],
                     workspace=workspace,
                 )
         return output

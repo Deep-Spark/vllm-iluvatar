@@ -15,8 +15,8 @@
   "requirements": "./requirements.txt",
   "pins": {
     "ixformer": {
-      "branch": "chore/add-ixinfer-ixmm-submodules",
-      "commit": "da239de727b78c983df466214b61a4f482f50acb"
+      "branch": "master",
+      "commit": "17e11c9d728d49a4ab29195fddb6c9faec850aea"
     },
     "vllm": {
       "branch": "iluvatar_main",

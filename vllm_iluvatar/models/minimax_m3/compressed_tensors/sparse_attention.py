@@ -35,6 +35,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, is_quantized_kv_cache
 
 # One sparse block == one KV page (matches ixformer / upstream MiniMax-M3).
 SPARSE_BLOCK_SIZE = 128
+_SPARSE_PREFILL_BACKEND = "ixformer_perf"
 
 
 def resolve_sparse_attention_cfg(config) -> dict[str, int]:
@@ -417,5 +418,6 @@ class IluMiniMaxM3SparseImpl(AttentionImplBase[IluMiniMaxM3SparseMetadata]):
                 self.num_kv_heads,
                 self.scale,
                 out[nd:],
+                backend=_SPARSE_PREFILL_BACKEND,
             )
         return output

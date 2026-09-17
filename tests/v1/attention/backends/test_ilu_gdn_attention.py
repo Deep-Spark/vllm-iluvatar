@@ -89,6 +89,18 @@ def test_metadata_builder_creates_output_index_for_mixed_spec_decode(monkeypatch
     assert metadata.non_spec_state_indices_tensor.is_contiguous()
     assert metadata.non_spec_state_indices_tensor.dtype == torch.int32
     assert torch.equal(
+        metadata.spec_conv_state_indices,
+        torch.tensor([10, 30], dtype=torch.int32),
+    )
+    assert torch.equal(
+        metadata.spec_token_starts,
+        torch.tensor([0, 3], dtype=torch.int32),
+    )
+    assert torch.equal(
+        metadata.non_spec_token_starts,
+        torch.tensor([2], dtype=torch.int32),
+    )
+    assert torch.equal(
         metadata.chunk_offsets,
         torch.tensor([0, 1], dtype=torch.int32, device="cpu"),
     )
@@ -130,9 +142,7 @@ def test_pack_int32_1d_graph_padded_view_stays():
 
 
 def test_builder_packs_strided_block_table_column(monkeypatch):
-    table = torch.tensor(
-        [[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32
-    )
+    table = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32)
     assert not table[:, 0].is_contiguous()
     monkeypatch.setattr(
         ilu_gdn_attn,

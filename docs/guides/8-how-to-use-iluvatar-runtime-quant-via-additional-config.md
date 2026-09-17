@@ -6,14 +6,15 @@ SPDX-FileCopyrightText: Copyright (c) 2026 Iluvatar CoreX. All Rights Reserved.
 
 本文介绍如何在**不修改模型目录和 safetensors** 的前提下，通过
 `additional_config.ilu_quant` 在加载时把 checkpoint 权重转换成 Iluvatar
-运行时格式。当前已落地的首个 method 是 Qwen3.8-Flash-Next 的 BF16 dense
-Linear → per-channel FP8。
+运行时格式。当前已落地的首个 method 是 BF16 dense Linear → per-channel FP8，
+覆盖两类 checkpoint：部分量化的 Qwen3.8-Flash-Next-FP8，以及完全未量化的
+Qwen3.8-27B。
 
 | 项目 | 说明 |
 | --- | --- |
 | **适用对象** | 磁盘权重尚未完全量化、需要在加载时转换成 Iluvatar kernel 布局的模型 |
 | **改动范围** | `vllm-iluvatar` 插件仓库。配置放在 vLLM `additional-config`，不写回模型 `config.json` |
-| **参考实现** | `IluFp8PerChannelOnlineLinearMethod`；示例对齐 [Qwen/Qwen3.8-Flash-Next](https://modelscope.cn/models/Qwen/Qwen3.8-Flash-Next) |
+| **参考实现** | `IluFp8PerChannelOnlineLinearMethod`；示例对齐 [Qwen/Qwen3.8-Flash-Next](https://modelscope.cn/models/Qwen/Qwen3.8-Flash-Next) 与 [Qwen/Qwen3.8-27B](https://modelscope.cn/models/Qwen/Qwen3.8-27B) |
 
 使用路径：
 
@@ -24,6 +25,9 @@ Linear → per-channel FP8。
 3. **派生目录对照**。只改隔离副本的 `config.json`，safetensors 链回原目录。
    见 [指南 6](6-how-to-use-and-provide-iluvatar-extend-compress-tensors.md) §4.2。
 
+checkpoint 本身**没有** `quantization_config` 时，还要显式加
+`--quantization ilu_runtime`，见 [§3.1](#31-未量化-checkpoint-需要-quantization-ilu_runtime)。
+
 ---
 
 ## 目录
@@ -31,6 +35,7 @@ Linear → per-channel FP8。
 1. [背景：为什么需要运行时量化](#1-背景为什么需要运行时量化)
 2. [与指南 6 的边界](#2-与指南-6-的边界)
 3. [配置入口](#3-配置入口)
+   - [未量化 checkpoint 需要 quantization ilu_runtime](#31-未量化-checkpoint-需要-quantization-ilu_runtime)
 4. [配置模型](#4-配置模型)
    - [顶层字段](#41-顶层字段)
    - [config_groups](#42-config_groups)
@@ -39,8 +44,12 @@ Linear → per-channel FP8。
    - [加载契约](#61-加载契约)
    - [三种配置模式](#62-三种配置模式)
    - [启动命令](#63-启动命令)
-7. [故障定位](#7-故障定位)
-8. [附录](#8-附录)
+7. [Qwen3.8-27B 示例：完全未量化的 checkpoint](#7-qwen38-27b-示例)
+   - [加载契约](#71-加载契约)
+   - [启动命令](#72-启动命令)
+   - [实测计数与性能](#73-实测计数与性能)
+8. [故障定位](#8-故障定位)
+9. [附录](#9-附录)
 
 ---
 
@@ -136,6 +145,39 @@ vllm serve /path/to/model \
 直接传 object 和 YAML inline 的语义相同。`ilu_quant` 不接受“JSON 文件路径”
 字符串简写；引用文件必须使用显式的 `source: file` tagged union。
 
+### 3.1 未量化 checkpoint 需要 quantization ilu_runtime
+
+`ilu_quant` 由**基础量化配置**的 `get_quant_method` 解析。checkpoint 带
+`quantization_config` 时（如 Qwen3.8-Flash-Next-FP8 的 `fp8`），vLLM 会自动构造
+`IluFp8Config`，payload 自然被读到。
+
+完全未量化的 checkpoint（如 Qwen3.8-27B，BF16、无 `quantization_config`）没有这个
+挂载点：`ModelConfig.quantization` 是 `None`，vLLM 不会创建任何 quant config，
+`get_quant_method` 不会被调用，`ilu_quant` 会被**静默忽略**——服务照常 READY、
+全程 BF16、没有任何报错。
+
+这类模型必须显式选择插件提供的空基础配置：
+
+```bash
+vllm serve /path/to/Qwen3.8-27B \
+  --quantization ilu_runtime \
+  --config examples/iluvatar-runtime-quant/Qwen/Qwen3.8-27B/fp8-inline.yaml
+```
+
+`ilu_runtime`（`IluRuntimeQuantBaseConfig`）的语义：
+
+- 不读模型目录里的任何 json（`get_config_filenames()` 为空），checkpoint 只读；
+- 每个 `LinearBase` 的原始分发固定是 `UnquantizedLinearMethod` +
+  `original_disposition: ignored`，能改变它的只有命中的 ilu_quant group；
+- 非 Linear 层返回 `None`，embedding / attention 与不加任何量化配置时一致；
+- 没有 `ilu_quant`、或 `enabled: false` 时**直接报错**，不会退化成静默 BF16；
+- 只能显式指定，不参与任何 checkpoint 自动识别。
+
+不要用「给未量化 checkpoint 注入一份假的 `quantization_config`」来代替
+（例如 `--hf-overrides '{"quantization_config": {"quant_method": "fp8", ...}}'`）。
+那样 `ModelConfig.quantization` / `is_quantized` 会声称磁盘权重是 FP8，违反 §2 的
+「原 checkpoint 量化身份不可伪造」，而且一旦 overrides 写错就退回静默 BF16。
+
 ---
 
 ## 4. 配置模型
@@ -167,6 +209,10 @@ file 模式要求：
 `model_types` 和 `quant_methods` 都是非空、无重复字符串数组。当前模型必须
 同时命中，否则报错，防止把一份配置误用到其他 checkpoint。
 
+`quant_methods` 填的是**基础量化配置**的名字，不是要转换成的目标格式：
+checkpoint 自带 FP8 时是 `fp8`，完全未量化的 checkpoint 是 `ilu_runtime`
+（§3.1）。
+
 #### `ignore`
 
 `ignore` 是全局排除数组，优先于所有 group。元素采用 vLLM Compressed-Tensors
@@ -197,7 +243,8 @@ target 语义：
 
 `original_disposition` 取值：
 
-- `ignored`：原 quant config 明确将该层保持为非量化；
+- `ignored`：原 quant config 明确将该层保持为非量化（`ilu_runtime` 下所有
+  Linear 都属于这一类）；
 - `quantized`：原 quant config 原本会选择量化 method；
 - `any`：不限制，只应由能够验证 source 格式的方法使用。
 
@@ -383,7 +430,113 @@ vllm serve /data/nlp/Qwen/Qwen3.8-Flash-Next-FP8 \
 
 ---
 
-## 7. 故障定位
+## 7. Qwen3.8-27B 示例
+
+[Qwen/Qwen3.8-27B](https://modelscope.cn/models/Qwen/Qwen3.8-27B) 是 BF16 dense
+权重，`config.json` 里没有 `quantization_config`，`hf_text_config.model_type` 是
+`qwen3_5_text`。它与 §6 的差别：
+
+| | Qwen3.8-Flash-Next-FP8 | Qwen3.8-27B |
+| --- | --- | --- |
+| 基础 quant config | `fp8`（checkpoint 自带） | `ilu_runtime`（必须显式指定） |
+| 候选层来源 | `modules_to_not_convert` 里的 BF16 dense Linear | 整个语言塔 |
+| targets | QSA indexer、PLE、MoE shared_expert | dense `mlp.gate_up_proj` / `down_proj` |
+| 不量化 | routed experts、PLE n-gram、embedding、`lm_head` | ViT（`visual.*`）、embedding、`lm_head` |
+
+### 7.1 加载契约
+
+```yaml
+applies_to:
+  model_types: [qwen3_5_text]
+  quant_methods: [ilu_runtime]
+config_groups:
+  qwen38_27b_bf16_to_fp8:
+    priority: 100
+    targets:
+      - 're:.*\.self_attn\.qkv_proj$'
+      - 're:.*\.self_attn\.o_proj$'
+      - 're:.*\.linear_attn\.(?:in_proj_qkvz|in_proj_ba|out_proj)$'
+      - 're:.*\.mlp\.(?:gate_up_proj|down_proj)$'
+    require:
+      original_disposition: ignored
+      checkpoint_dtypes: [bfloat16]
+```
+
+`weights` / `input_activations` / `iluvatar` 与 §6.1 完全相同：native BF16 →
+per-channel `float8_e4m3fn`，`transform` @ `process_weights_after_loading`，
+动态 per-token FP8 激活，`gemm_format: TN`，`shape_mismatch_policy: fallback_original`。
+
+`original_disposition` 只能是 `ignored`：checkpoint 没有声明任何量化，
+`ilu_runtime` 给每个 Linear 的原始分发就是 `UnquantizedLinearMethod`。
+
+### 7.2 启动命令
+
+```bash
+export IXFORMER_KERNEL_BACKEND=linear:ixinfer   # ViT 仍是 BF16
+vllm serve /newdata/nlp/Qwen/Qwen3.8-27B \
+  --quantization ilu_runtime \
+  --config examples/iluvatar-runtime-quant/Qwen/Qwen3.8-27B/fp8-inline.yaml \
+  --tensor-parallel-size 1 \
+  --mamba-ssm-cache-dtype float32 \
+  --hf-overrides '{"language_model_only":true}'
+```
+
+file 模式把 `--config` 换成 `fp8-file.yaml`，并先按 §4.1 更新绝对路径和 SHA256。
+
+### 7.3 实测计数与性能
+
+CoreX `4.5.0.20260722` / ivcore30 / vLLM 0.27.1，`--enforce-eager`，
+`max_model_len=12288`，`max_num_seqs=32`：
+
+```text
+TP1   selected=304 transformed=304 fallback=0
+TP2   selected=304 transformed=256 fallback=48
+```
+
+304 = 48 个 GDN 层 × 3 + 16 个 full-attention 层 × 2 + 64 个 MLP × 2。TP2 的 48 个
+fallback 全部是 `linear_attn.in_proj_ba`：它的 `N = 2 * num_v_heads = 96`，TP2 切完
+只剩 48，不满足 GEMV 的 `N % 32 == 0`，整层退回 BF16。示例 YAML 因此默认不写
+`validation`——计数与 TP 绑定，固定 TP 部署时再取消注释。
+
+常驻权重从 BF16 的约 53.8 GiB 降到约 30 GiB（24.4 GiB FP8 + BF16 的
+embedding / `lm_head` / ViT）。加载峰值不是 BF16 全量：
+`initialize_online_processing` 按层统计 `load_numel`，某层参数收齐立刻量化并释放
+BF16 staging，额外峰值只有单层（最大 `gate_up_proj` 0.34 GiB）。
+
+单请求 TTFT / ITL（`output_len=256`，与官方 block-FP8 权重同机同配置对照）：
+
+| 配置 | TTFT 1k / 2k / 4k (ms) | ITL (ms) | decode (tok/s) |
+| --- | --- | ---: | ---: |
+| 27B BF16 + runtime quant，TP1 | 199 / 351 / 669 | 31.9 | 31.3 |
+| 27B-FP8 官方 block-FP8，TP1 | 201 / 355 / 672 | 32.6 | 30.6 |
+| 27B BF16 + runtime quant，TP2 | 179 / 327 / 628 | 34.5 | 29.0 |
+| 27B-FP8 官方 block-FP8，TP2 | 142 / 255 / 486 | 29.9 | 33.5 |
+
+TP1 两者持平（runtime quant 的 per-channel GEMM 略快于 block-FP8 的 requant 路径）。
+TP2 慢约 15%，来源是那 48 个退回 BF16 的 `in_proj_ba`：每 token 多约 4.6 ms，
+正好对应 48 次小 GEMM 的调度开销，而官方 block-FP8 权重里这些层仍是量化的。
+需要 TP2 性能对齐时，可行方向是让只违反 GEMV 约束（`N % 32`）的层保持 FP8 并走
+`fp8_per_channel_mm`，而不是整层回退。
+
+单 rank 权重显存与官方 block-FP8 几乎相同（TP1 28.5 GiB vs 28.52 GiB，
+TP2 均为 14.54 GiB），加载多花约 4 秒。同机纯 BF16 起服要 51.1 GiB，
+`max_num_seqs=32` 时 GDN state + KV 已经放不下单卡，只能降到 4。
+
+精度用 evalscope 1.11.1、`do_sample=false, temperature=0, top_p=1.0`，
+与官方 block-FP8 权重同机同配置对照（`errored=0`）：
+
+| 配置 | GSM8K (1319) | GPQA-Diamond (198) | GSM8K out tok/s | GPQA out tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| 27B BF16 + runtime quant，TP1 | 0.9682 | 0.6919 | 9.36 | 11.09 |
+| 27B-FP8 官方 block-FP8，TP1 | 0.9750 | 0.6515 | 9.29 | 10.83 |
+| 27B BF16 + runtime quant，TP2 | 0.9704 | 0.7121 | 10.35 | 13.95 |
+| 27B-FP8 官方 block-FP8，TP2 | 0.9750 | 0.6818 | 10.57 | 12.53 |
+
+GSM8K 低 0.5～0.7 个点（1319 题里 9 题，约 1.4σ），GPQA 反而高 3～4 个点（198 题
+的 1σ 就有 3.3 个点），两个方向都在噪声量级，没有系统性掉点。批量并发下的输出
+吞吐两者相当——单请求 TP2 的 15% 差距在 batch 里被摊掉了。
+
+## 8. 故障定位
 
 - `does not apply to model_type/quant_method`：配置用于了错误模型或基础量化类型。
 - `multiple ilu_quant groups`：多个命中 group 的最高 priority 相同。
@@ -397,25 +550,32 @@ vllm serve /data/nlp/Qwen/Qwen3.8-Flash-Next-FP8 \
   prefix，或模型实现的 fused module 名称已变化。
 - `ilu_quant.file must be absolute` / `SHA256 mismatch`：file 模式未改成绝对
   路径，或 JSON 改过但未更新 SHA256。
+- `quantization='ilu_runtime' requires additional_config.ilu_quant`：选了
+  `ilu_runtime` 却没给 payload。服务拒绝以静默 BF16 启动。
+- **服务正常起来但一条量化日志都没有**：checkpoint 没有 `quantization_config`
+  且忘了 `--quantization ilu_runtime`，`ilu_quant` 整块被跳过。见 §3.1。
 
 ---
 
-## 8. 附录
+## 9. 附录
 
-### 8.1 关键文件
+### 9.1 关键文件
 
 | 作用 | 文件 |
 | --- | --- |
 | runtime 配置解析与分发 | [`ilu_runtime_quant_config.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime_quant_config.py) |
+| 未量化 checkpoint 的基础 config | [`ilu_runtime_quant_base.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime_quant_base.py) |
 | method 注册表 | [`ilu_quant_registry.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_quant_registry.py) |
 | FP8 基础 config 与 online Linear method | [`ilu_fp8.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_fp8.py) |
 | Qwen3.8-Flash-Next 示例 | [`examples/iluvatar-runtime-quant/Qwen/Qwen3.8-Flash-Next/`](../../examples/iluvatar-runtime-quant/Qwen/Qwen3.8-Flash-Next/) |
+| Qwen3.8-27B 示例（未量化 checkpoint） | [`examples/iluvatar-runtime-quant/Qwen/Qwen3.8-27B/`](../../examples/iluvatar-runtime-quant/Qwen/Qwen3.8-27B/) |
 | 派生目录生成器（模式 A） | [`qwen38_flash_next_fp8_online.py`](../../examples/iluvatar-compressed-tensors/qwen38_flash_next_fp8_online.py) |
 
-### 8.2 步骤速览
+### 9.2 步骤速览
 
 1. **确认 checkpoint**：顶层 `quant_method` 仍是原值（如 `fp8`）；候选层在磁盘上
-   是 BF16，且被原 ignore 列表排除。
+   是 BF16，且被原 ignore 列表排除。完全没有 `quantization_config` 时，改用
+   `--quantization ilu_runtime`（§3.1）。
 2. **按模型 ID 放置示例**：`examples/iluvatar-runtime-quant/<org>/<model>/`，
    与 ModelScope / Hugging Face 命名对齐。
 3. **填写 `applies_to` 和 `targets`**：`targets` 用运行时 prefix；每个 target

@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "enabled": true,
+  "applies_to": {
+    "model_types": ["qwen3_5_text"],
+    "quant_methods": ["ilu_runtime"]
+  },
+  "ignore": [],
+  "config_groups": {
+    "qwen38_27b_bf16_to_fp8": {
+      "priority": 100,
+      "targets": [
+        "re:.*\\.self_attn\\.qkv_proj$",
+        "re:.*\\.self_attn\\.o_proj$",
+        "re:.*\\.linear_attn\\.(?:in_proj_qkvz|in_proj_ba|out_proj)$",
+        "re:.*\\.mlp\\.(?:gate_up_proj|down_proj)$"
+      ],
+      "require": {
+        "original_disposition": "ignored",
+        "checkpoint_dtypes": ["bfloat16"]
+      },
+      "weights": {
+        "source": {
+          "format": "native",
+          "dtypes": ["bfloat16"]
+        },
+        "target": {
+          "format": "fp8",
+          "dtype": "float8_e4m3fn",
+          "strategy": "channel"
+        },
+        "loading": {
+          "mode": "transform",
+          "stage": "process_weights_after_loading"
+        }
+      },
+      "input_activations": {
+        "num_bits": 8,
+        "type": "float",
+        "strategy": "token",
+        "dynamic": true
+      },
+      "output_activations": null,
+      "iluvatar": {
+        "method": "IluFp8PerChannelOnlineLinearMethod",
+        "gemm_format": "TN",
+        "shape_mismatch_policy": "fallback_original"
+      }
+    }
+  }
+}

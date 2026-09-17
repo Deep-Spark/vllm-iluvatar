@@ -487,6 +487,27 @@ def _rebuild_index(output_path: Path, source_index: Mapping[str, Any]) -> None:
         json.dump({"metadata": metadata, "weight_map": weight_map}, file, indent=2)
 
 
+def _load_checkpoint_index(input_dir: Path) -> tuple[dict[str, Any], bool]:
+    """Load checkpoint index from ``model.safetensors.index.json``, or from a lone ``model.safetensors``."""
+    index_path = input_dir / "model.safetensors.index.json"
+    if index_path.is_file():
+        with index_path.open("r", encoding="utf-8") as file:
+            source_index = json.load(file)
+        if not isinstance(source_index, dict):
+            raise ProfileError("model index must be an object")
+        return source_index, True
+
+    single_path = input_dir / "model.safetensors"
+    if not single_path.is_file():
+        raise FileNotFoundError(f"missing {index_path} and {single_path}")
+    shards = sorted(input_dir.glob("*.safetensors"))
+    if shards != [single_path]:
+        raise FileNotFoundError(f"missing {index_path}")
+    with safe_open(str(single_path), framework="pt") as file:
+        weight_map = {key: "model.safetensors" for key in file.keys()}
+    return {"metadata": {}, "weight_map": weight_map}, False
+
+
 def _write_model_config(
     input_path: Path,
     output_path: Path,
@@ -539,12 +560,10 @@ def convert(
         quant_config = _resolve_config(json.load(file), rules_doc)
     rule_set = RuleSet.load(rules, quant_config)
 
-    index_path = input_dir / "model.safetensors.index.json"
-    if not index_path.is_file():
-        raise FileNotFoundError(f"missing {index_path}")
-    with index_path.open("r", encoding="utf-8") as file:
-        source_index = json.load(file)
+    source_index, has_index = _load_checkpoint_index(input_dir)
     weight_map = source_index.get("weight_map", {})
+    if not isinstance(weight_map, dict):
+        raise ProfileError("model index weight_map must be an object")
 
     all_shards = sorted(input_dir.glob("*.safetensors"))
     shards = all_shards[slice(shard_start, shard_end)]
@@ -594,7 +613,8 @@ def convert(
     # Rebuild only after a complete conversion. Partial jobs can be merged and
     # finalized by rerunning with the complete output directory.
     if len(shards) == len(all_shards):
-        _rebuild_index(output_dir, source_index)
+        if has_index:
+            _rebuild_index(output_dir, source_index)
         _write_model_config(
             input_dir, output_dir, quant_config, rule_set.model_config_patch
         )
@@ -614,11 +634,7 @@ def match_only(
         quant_config = _resolve_config(json.load(file), rules_doc)
     rule_set = RuleSet.load(rules, quant_config)
 
-    index_path = input_dir / "model.safetensors.index.json"
-    if not index_path.is_file():
-        raise FileNotFoundError(f"missing {index_path}")
-    with index_path.open("r", encoding="utf-8") as file:
-        source_index = json.load(file)
+    source_index, _ = _load_checkpoint_index(input_dir)
     weight_map = source_index.get("weight_map", {})
     if not isinstance(weight_map, dict):
         raise ProfileError("model index weight_map must be an object")

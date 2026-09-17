@@ -11,7 +11,6 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
-
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.distributed.communication_op import tensor_model_parallel_all_reduce
@@ -54,16 +53,6 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.model_executor.models.vision import run_dp_sharded_mrope_vision_model
-from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.sequence import IntermediateTensors
-
-from vllm_iluvatar.models.minimax_m3.compressed_tensors.attention import (
-    IluMiniMaxM3Attention,
-    IluMiniMaxM3SparseAttention,
-)
-from vllm_iluvatar.models.minimax_m3.compressed_tensors.sparse_attention import (
-    resolve_sparse_attention_cfg,
-)
 
 # Community VL helpers. The early compatibility patch makes importing the
 # upstream common package safe without loading NVIDIA-only model entry points.
@@ -75,8 +64,18 @@ from vllm.models.minimax_m3.common.mm_preprocess import (
 from vllm.models.minimax_m3.common.vision_tower import (
     MiniMaxVLVisionModel,
 )
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.sequence import IntermediateTensors
+
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
     IluQuantConfig,
+)
+from vllm_iluvatar.models.minimax_m3.w4a8.attention import (
+    IluMiniMaxM3Attention,
+    IluMiniMaxM3SparseAttention,
+)
+from vllm_iluvatar.models.minimax_m3.w4a8.sparse_attention import (
+    resolve_sparse_attention_cfg,
 )
 
 logger = init_logger(__name__)
@@ -95,6 +94,7 @@ def _fused_allreduce_gemma_rms_norm(
     if get_tensor_model_parallel_world_size() > 1:
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
     return norm(hidden_states, residual)
+
 
 # Applied to AutoWeightsLoader skip list and quantized missing-param checks.
 _LOAD_SKIP_SUBSTRS: tuple[str, ...] = ("mtp.",)
@@ -154,6 +154,7 @@ def _log_m3_quant_load_stats(loaded: set[str]) -> None:
         n_shared,
         n_other,
     )
+
 
 def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
     """Layer ids whose attention runs the extra sparse "index" branch."""
@@ -389,9 +390,7 @@ class IluMiniMaxM3DecoderLayer(nn.Module):
 
         # config.use_gemma_norm is True for M3 -> Gemma-style RMSNorm
         # (OOT: IluGemmaRMSNorm).
-        self.input_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -460,9 +459,7 @@ class IluMiniMaxM3Model(nn.Module, EagleModelMixin):
             max_num_batched_tokens = int(
                 vllm_config.scheduler_config.max_num_batched_tokens
             )
-            capture_sizes = (
-                vllm_config.compilation_config.cudagraph_capture_sizes or []
-            )
+            capture_sizes = vllm_config.compilation_config.cudagraph_capture_sizes or []
             max_capture = max((int(s) for s in capture_sizes), default=0)
             # Token-major topk has no 4-align requirement.
             num_tokens = max(max_num_batched_tokens, max_capture)
@@ -713,10 +710,9 @@ class IluMiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         return self.model.get_expert_mapping()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(
-            self, skip_substrs=list(_LOAD_SKIP_SUBSTRS)
-        )
+        loader = AutoWeightsLoader(self, skip_substrs=list(_LOAD_SKIP_SUBSTRS))
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
 
 @MULTIMODAL_REGISTRY.register_processor(
     MiniMaxM3VLMultiModalProcessor,
@@ -909,16 +905,10 @@ class IluMiniMaxM3SparseForConditionalGeneration(
         return self.language_model.get_expert_mapping()
 
     def load_weights(self, weights):
-        loader = AutoWeightsLoader(
-            self, skip_substrs=list(_LOAD_SKIP_SUBSTRS)
-        )
+        loader = AutoWeightsLoader(self, skip_substrs=list(_LOAD_SKIP_SUBSTRS))
         loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         if _is_ilu_quant_config(self.quant_config):
-            kv_dtype = getattr(
-                self.language_model, "kv_cache_dtype", "auto"
-            )
-            _assert_m3_parameters_loaded(
-                self, loaded, kv_cache_dtype=kv_dtype
-            )
+            kv_dtype = getattr(self.language_model, "kv_cache_dtype", "auto")
+            _assert_m3_parameters_loaded(self, loaded, kv_cache_dtype=kv_dtype)
             _log_m3_quant_load_stats(loaded)
         return loaded

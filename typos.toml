@@ -1,0 +1,11 @@
+# Repo-level config for crate-ci/typos (pre-commit `typos` hook).
+#
+# Some identifiers we keep verbatim from upstream (HuggingFace
+# transformers, vLLM) contain sub-tokens that typos flags as misspellings.
+# Map them to themselves so typos accepts them as valid words instead of
+# forcing a rename of standard identifiers like ``grid_thw``.
+
+[default.extend-words]
+# ``grid_thw`` is the standard HuggingFace vision-model identifier for the
+# (temporal, height, width) grid; ``thw`` is not a typo.
+thw = "thw"

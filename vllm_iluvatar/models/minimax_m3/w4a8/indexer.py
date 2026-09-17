@@ -9,10 +9,9 @@ DeepSeek-V4 ``dsa_indexer_*`` call sites). mxfp8 uses
 from dataclasses import dataclass
 from typing import ClassVar
 
+import ixformer.inference.functions as ixfops
 import torch
 from torch import nn
-
-import ixformer.inference.functions as ixfops
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.attention import IndexerKVDType
 from vllm.config.cache import CacheDType
@@ -20,7 +19,6 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -130,8 +128,7 @@ class IluMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         block_size = vllm_config.cache_config.block_size
         if block_size != 128:
             raise ValueError(
-                f"MiniMax-M3 indexer cache requires block_size == 128, "
-                f"got {block_size}"
+                f"MiniMax-M3 indexer cache requires block_size == 128, got {block_size}"
             )
         return MLAAttentionSpec(
             block_size=block_size,
@@ -284,9 +281,7 @@ class IluMiniMaxM3IndexerMetadataBuilder(
             if not torch.all(
                 (query_lens_cpu == decode_query_len) | (query_lens_cpu == 0)
             ):
-                raise ValueError(
-                    "MiniMax-M3 decode requires a uniform query length"
-                )
+                raise ValueError("MiniMax-M3 decode requires a uniform query length")
             if num_decode_tokens != num_decodes * decode_query_len:
                 raise ValueError(
                     f"num_decode_tokens {num_decode_tokens} != "
@@ -409,7 +404,7 @@ class IluMiniMaxM3Indexer(nn.Module):
         index_md = attn_metadata[self.index_cache.prefix]
         assert isinstance(index_md, IluMiniMaxM3IndexerMetadata)
         num_tokens = index_md.num_actual_tokens
-        nd = index_md.num_decode_tokens
+        num_decode = index_md.num_decode_tokens
         iq = index_query[:num_tokens].view(
             -1, self.num_index_heads, self.index_head_dim
         )
@@ -420,10 +415,11 @@ class IluMiniMaxM3Indexer(nn.Module):
         if index_md.num_decodes > 0:
             d = index_md.decode
             assert d is not None
-            # Contiguous [nd, H, K] prefix of the shared token-major buffer.
-            decode_out = self._dense_topk_out(nd, token_offset=0)
+            # Contiguous [num_decode, H, K] prefix of the shared
+            # token-major buffer.
+            decode_out = self._dense_topk_out(num_decode, token_offset=0)
             decode_topk = ixfops.minimax_m3_index_decode(
-                iq[:nd],
+                iq[:num_decode],
                 kv,
                 d.block_table,
                 d.seq_lens,
@@ -441,7 +437,7 @@ class IluMiniMaxM3Indexer(nn.Module):
             assert p is not None
             np_ = index_md.num_prefill_tokens
             score = ixfops.minimax_m3_index_score(
-                iq[nd:],
+                iq[num_decode:],
                 kv,
                 p.block_table,
                 p.cu_seqlens_q,
@@ -452,7 +448,7 @@ class IluMiniMaxM3Indexer(nn.Module):
                 self.num_kv_heads,
             )
             # Limit out to actual prefill tokens.
-            prefill_out = self._dense_topk_out(np_, token_offset=nd)
+            prefill_out = self._dense_topk_out(np_, token_offset=num_decode)
             prefill_topk = ixfops.minimax_m3_index_topk(
                 score,
                 p.cu_seqlens_q,

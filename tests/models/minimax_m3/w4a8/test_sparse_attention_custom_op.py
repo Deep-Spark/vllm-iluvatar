@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import torch
 
-from vllm_iluvatar.models.minimax_m3.compressed_tensors import attention as m3_attn
-from vllm_iluvatar.models.minimax_m3.compressed_tensors import (
+from vllm_iluvatar.models.minimax_m3.w4a8 import attention as m3_attn
+from vllm_iluvatar.models.minimax_m3.w4a8 import (
     sparse_attention as m3_sparse,
 )
 
@@ -20,9 +20,7 @@ def test_fake_impl_is_noop():
     positions = torch.zeros(2, dtype=torch.long)
     out = torch.zeros(2, 8)
     assert (
-        m3_attn.ilu_minimax_m3_sparse_attention_fake(
-            qkv, positions, out, "layer.attn"
-        )
+        m3_attn.ilu_minimax_m3_sparse_attention_fake(qkv, positions, out, "layer.attn")
         is None
     )
     assert torch.equal(out, torch.zeros(2, 8))
@@ -68,9 +66,7 @@ def test_tcu_workspace_reservation_uses_ixformer_size_query(monkeypatch):
         queries.append((total_q, num_kv_heads, topk))
         return 12345
 
-    impl = m3_sparse.IluMiniMaxM3SparseImpl.__new__(
-        m3_sparse.IluMiniMaxM3SparseImpl
-    )
+    impl = m3_sparse.IluMiniMaxM3SparseImpl.__new__(m3_sparse.IluMiniMaxM3SparseImpl)
     impl.num_kv_heads = 2
     impl.topk_blocks = 32
     ref = real_empty(8, 16)

@@ -11,9 +11,8 @@ This module is the W4A8 token-major ``[Q,H,K]`` path.
 from dataclasses import dataclass
 from typing import ClassVar
 
-import torch
-
 import ixformer.inference.functions as ixfops
+import torch
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
@@ -355,11 +354,9 @@ class IluMiniMaxM3SparseImpl(AttentionImplBase[IluMiniMaxM3SparseMetadata]):
             return output  # profiling run; caches unbound
         main_md = attn_metadata[layer.layer_name]  # type: ignore[attr-defined]
         if not isinstance(main_md, IluMiniMaxM3SparseMetadata):
-            raise TypeError(
-                f"expected IluMiniMaxM3SparseMetadata, got {type(main_md)}"
-            )
+            raise TypeError(f"expected IluMiniMaxM3SparseMetadata, got {type(main_md)}")
 
-        nd = main_md.num_decode_tokens
+        num_decode = main_md.num_decode_tokens
         num_tokens = main_md.num_actual_tokens
         hd = self.head_size
         q = query[:num_tokens].view(-1, self.num_heads, hd)
@@ -368,9 +365,11 @@ class IluMiniMaxM3SparseImpl(AttentionImplBase[IluMiniMaxM3SparseMetadata]):
         indexer = layer.indexer  # type: ignore[attr-defined]
         topk_buf = indexer.topk_indices_buffer
         np_ = main_md.num_prefill_tokens
-        decode_topk = topk_buf[:nd] if main_md.num_decodes > 0 else None
+        decode_topk = topk_buf[:num_decode] if main_md.num_decodes > 0 else None
         prefill_topk = (
-            topk_buf[nd : nd + np_] if main_md.num_prefills > 0 else None
+            topk_buf[num_decode : num_decode + np_]
+            if main_md.num_prefills > 0
+            else None
         )
 
         if main_md.num_decodes > 0:
@@ -384,14 +383,14 @@ class IluMiniMaxM3SparseImpl(AttentionImplBase[IluMiniMaxM3SparseMetadata]):
                     "MiniMax-M3 sparse decode missing topk_indices_buffer slice"
                 )
             ixfops.minimax_m3_sparse_attn_decode(
-                q[:nd],
+                q[:num_decode],
                 kv_cache,
                 decode_topk,
                 d.block_table,
                 d.seq_lens,
                 self.num_kv_heads,
                 self.scale,
-                out[:nd],
+                out[:num_decode],
                 d.decode_query_len,
             )
 
@@ -407,7 +406,7 @@ class IluMiniMaxM3SparseImpl(AttentionImplBase[IluMiniMaxM3SparseMetadata]):
                     "MiniMax-M3 sparse prefill missing topk_indices_buffer slice"
                 )
             ixfops.minimax_m3_sparse_attn(
-                q[nd:],
+                q[num_decode:],
                 kv_cache,
                 prefill_topk,
                 p.block_table,
@@ -417,7 +416,7 @@ class IluMiniMaxM3SparseImpl(AttentionImplBase[IluMiniMaxM3SparseMetadata]):
                 p.max_query_len,
                 self.num_kv_heads,
                 self.scale,
-                out[nd:],
+                out[num_decode:],
                 backend=_SPARSE_PREFILL_BACKEND,
             )
         return output

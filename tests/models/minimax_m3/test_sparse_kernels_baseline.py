@@ -3,9 +3,8 @@
 
 from __future__ import annotations
 
-import torch
-
 import ixformer.inference.functions as ixf
+import torch
 from ixformer.inference.functions.minimax_m3.indexer import SPARSE_BLOCK_SIZE
 
 

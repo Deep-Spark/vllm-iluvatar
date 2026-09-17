@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""compressed-tensors MiniMax-M3 graph contracts."""
+"""W4A8 (compressed-tensors) MiniMax-M3 graph contracts."""
 
 from __future__ import annotations
 
@@ -7,11 +7,11 @@ import ast
 from pathlib import Path
 
 _MODEL_PY = (
-    Path(__file__).resolve().parents[5]
+    Path(__file__).resolve().parents[4]
     / "vllm_iluvatar"
     / "models"
     / "minimax_m3"
-    / "compressed_tensors"
+    / "w4a8"
     / "model.py"
 )
 

@@ -243,15 +243,15 @@ class MiniMaxM3IndexerIxformerImpl(MiniMaxM3IndexerImpl):
         index_md = attn_metadata[self.index_cache.prefix]
         assert isinstance(index_md, MiniMaxM3IndexerMetadata)
         num_tokens = index_md.num_actual_tokens
-        nd = index_md.num_decode_tokens
+        num_decode = index_md.num_decode_tokens
         iq = index_query[:num_tokens].view(
             -1, self.num_index_heads, self.index_head_dim
         )
         kv = self.index_cache.kv_cache
 
         # Both sides write into the single shared persistent topk_indices_buffer
-        # (decode at [:, :nd], prefill at [:, nd:]) and return views into it.
-        # None -> allocate fresh.
+        # (decode at [:, :num_decode], prefill at [:, num_decode:]) and return
+        # views into it. None -> allocate fresh.
         buf = self.topk_indices_buffer
         buf_htk = None if buf is None else buf.transpose(0, 1)
         decode_topk: torch.Tensor | None = None
@@ -260,7 +260,7 @@ class MiniMaxM3IndexerIxformerImpl(MiniMaxM3IndexerImpl):
             d = index_md.decode
             assert d is not None
             decode_topk = minimax_m3_index_decode(
-                iq[:nd],
+                iq[:num_decode],
                 kv,
                 d.block_table,
                 d.seq_lens,
@@ -276,16 +276,14 @@ class MiniMaxM3IndexerIxformerImpl(MiniMaxM3IndexerImpl):
         if index_md.num_prefills > 0:
             p = index_md.prefill
             assert p is not None
-            prefill_out = (
-                buf_htk[:, nd:, :] if buf_htk is not None else None
-            )
+            prefill_out = buf_htk[:, num_decode:, :] if buf_htk is not None else None
             if p.max_query_len == 1:
                 # A one-token chunk has the same causal boundary as decode.
                 # Skip the low-parallel score + top-k pair and reuse the
                 # parallel decode score path. Production 8k--64k prefills have
                 # q_len>=512 and never enter this branch.
                 prefill_topk = minimax_m3_index_decode(
-                    iq[nd:],
+                    iq[num_decode:],
                     kv,
                     p.block_table,
                     p.seq_lens,
@@ -300,7 +298,7 @@ class MiniMaxM3IndexerIxformerImpl(MiniMaxM3IndexerImpl):
                 )
             else:
                 score = minimax_m3_index_score(
-                    iq[nd:],
+                    iq[num_decode:],
                     kv,
                     p.block_table,
                     p.cu_seqlens_q,

@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from vllm_iluvatar.models.minimax_m3.compressed_tensors import indexer as m3_indexer
+from vllm_iluvatar.models.minimax_m3.w4a8 import indexer as m3_indexer
 
 
 def _device() -> torch.device:
@@ -54,8 +54,7 @@ def test_decode_and_prefill_share_storage():
     assert prefill.shape == (17, 4, 8)
     assert decode.is_contiguous() and prefill.is_contiguous()
     assert (
-        prefill.data_ptr()
-        == decode.data_ptr() + decode.numel() * decode.element_size()
+        prefill.data_ptr() == decode.data_ptr() + decode.numel() * decode.element_size()
     )
 
 

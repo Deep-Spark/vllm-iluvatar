@@ -13,7 +13,7 @@ import torch
 
 PACKAGE = "vllm_iluvatar.models.minimax_m3.mxfp8"
 _MODEL_PY = (
-    Path(__file__).resolve().parents[5]
+    Path(__file__).resolve().parents[4]
     / "vllm_iluvatar"
     / "models"
     / "minimax_m3"

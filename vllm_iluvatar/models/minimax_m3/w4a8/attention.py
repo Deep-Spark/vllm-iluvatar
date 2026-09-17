@@ -9,11 +9,10 @@ BF16 / mxfp8 attention lives in ``minimax_m3.mxfp8.attention``.
 
 from __future__ import annotations
 
+import ixformer.inference.functions as ixfops
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-
-import ixformer.inference.functions as ixfops
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
@@ -27,14 +26,6 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm_iluvatar.models.minimax_m3.compressed_tensors.indexer import (
-    IluMiniMaxM3Indexer,
-)
-from vllm_iluvatar.models.minimax_m3.compressed_tensors.sparse_attention import (
-    IluMiniMaxM3SparseBackend,
-    IluMiniMaxM3SparseImpl,
-    resolve_sparse_attention_cfg,
-)
 from vllm.utils.torch_utils import (
     direct_register_custom_op,
     kv_cache_dtype_str_to_dtype,
@@ -43,6 +34,15 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
     get_kv_quant_mode,
+)
+
+from vllm_iluvatar.models.minimax_m3.w4a8.indexer import (
+    IluMiniMaxM3Indexer,
+)
+from vllm_iluvatar.models.minimax_m3.w4a8.sparse_attention import (
+    IluMiniMaxM3SparseBackend,
+    IluMiniMaxM3SparseImpl,
+    resolve_sparse_attention_cfg,
 )
 
 
@@ -265,12 +265,8 @@ class IluMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             },
         )
 
-        self.index_q_norm = GemmaRMSNorm(
-            self.idx_head_dim, eps=config.rms_norm_eps
-        )
-        self.index_k_norm = GemmaRMSNorm(
-            self.idx_head_dim, eps=config.rms_norm_eps
-        )
+        self.index_q_norm = GemmaRMSNorm(self.idx_head_dim, eps=config.rms_norm_eps)
+        self.index_k_norm = GemmaRMSNorm(self.idx_head_dim, eps=config.rms_norm_eps)
 
         # Attention-backend wiring.
         vllm_config = get_current_vllm_config()

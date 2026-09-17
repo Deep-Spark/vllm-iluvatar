@@ -6,10 +6,11 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
 
 import torch
 from vllm.config import get_current_vllm_config_or_none
@@ -656,6 +657,18 @@ def _get_cached_config(
     )
     setattr(base_quant_config, _CACHE_ATTR, resolved)
     return resolved
+
+
+def get_ilu_runtime_quant_config(
+    base_quant_config: QuantizationConfig,
+) -> IluRuntimeQuantConfig | None:
+    """Parsed ``additional_config.ilu_quant`` for this base config, if any.
+
+    Base configs that exist *only* to host ilu_quant need to tell "no payload"
+    apart from "payload present but no group matched"; ``resolve_ilu_runtime_method``
+    returns ``None`` for both.
+    """
+    return _get_cached_config(base_quant_config)
 
 
 def resolve_ilu_runtime_method(

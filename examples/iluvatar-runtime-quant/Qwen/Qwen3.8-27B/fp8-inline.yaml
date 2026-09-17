@@ -1,0 +1,62 @@
+# Qwen/Qwen3.8-27B runtime quant（native BF16 checkpoint）
+# 开源权重：https://modelscope.cn/models/Qwen/Qwen3.8-27B
+#
+# 该 checkpoint 没有 quantization_config，必须同时传 --quantization ilu_runtime：
+#
+#   vllm serve /path/to/Qwen3.8-27B \
+#     --quantization ilu_runtime \
+#     --config examples/iluvatar-runtime-quant/Qwen/Qwen3.8-27B/fp8-inline.yaml
+#
+# 未列进 targets 的模块保持 BF16：ViT（visual.*）、embedding、lm_head。
+# ViT 留在 BF16 时普通 Linear 需要 IXFORMER_KERNEL_BACKEND=linear:ixinfer。
+additional-config:
+  ilu_quant:
+    source: inline
+    schema_version: 1
+    enabled: true
+    applies_to:
+      model_types: [qwen3_5_text]
+      quant_methods: [ilu_runtime]
+    ignore: []
+    config_groups:
+      qwen38_27b_bf16_to_fp8:
+        priority: 100
+        targets:
+          - 're:.*\.self_attn\.qkv_proj$'
+          - 're:.*\.self_attn\.o_proj$'
+          - 're:.*\.linear_attn\.(?:in_proj_qkvz|in_proj_ba|out_proj)$'
+          - 're:.*\.mlp\.(?:gate_up_proj|down_proj)$'
+        require:
+          original_disposition: ignored
+          checkpoint_dtypes: [bfloat16]
+        weights:
+          source:
+            format: native
+            dtypes: [bfloat16]
+          target:
+            format: fp8
+            dtype: float8_e4m3fn
+            strategy: channel
+          loading:
+            mode: transform
+            stage: process_weights_after_loading
+        input_activations:
+          num_bits: 8
+          type: float
+          strategy: token
+          dynamic: true
+        output_activations: null
+        iluvatar:
+          method: IluFp8PerChannelOnlineLinearMethod
+          gemm_format: TN
+          shape_mismatch_policy: fallback_original
+        # validation 与 TP 绑定，这里留空以便同一份配置在任意 TP 下可用。
+        # 固定 TP 部署时取消注释对应一组，把审计变成硬断言：
+        #   TP1     selected=304 transformed=304 fallback=0
+        #   TP2/TP4 selected=304 transformed=256 fallback=48
+        # 48 个 fallback 全是 linear_attn.in_proj_ba：N=96/TP 在 TP>1 时不满足
+        # GEMV 的 N % 32 == 0。
+        # validation:
+        #   expected_selected: 304
+        #   expected_transformed: 304
+        #   expected_fallback: 0

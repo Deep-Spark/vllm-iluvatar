@@ -234,12 +234,20 @@ def _make_iluvatar_platform():
             except Exception:
                 archs = []
             if (
-                "IluDeepseekV4ForCausalLM" in archs
+                any(
+                    a in archs
+                    for a in (
+                        "IluDeepseekV4ForCausalLM",
+                        "DeepseekV41ForCausalLM",
+                        "IluDeepseekV41ForCausalLM",
+                    )
+                )
                 and model_config.tokenizer_mode == "auto"
             ):
                 model_config.tokenizer_mode = "deepseek_v4"
                 logger.info(
-                    "ILU: set tokenizer_mode='deepseek_v4' for IluDeepseekV4ForCausalLM"
+                    "ILU: set tokenizer_mode='deepseek_v4' for %s",
+                    archs,
                 )
 
         @classmethod

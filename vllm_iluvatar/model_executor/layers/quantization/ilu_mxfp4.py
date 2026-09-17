@@ -121,6 +121,11 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
         # Skip Mxfp4MoEMethod.__init__, run its base directly.
         FusedMoEMethodBase.__init__(self, moe)
         self.weight_dtype = "mxfp4"
+        # Also required rather than convenient, for the same reason as ``mxfp4_backend`` below:
+        # community ``maybe_roundup_sizes`` (mxfp4.py:562) reads it during FusedMoE construction,
+        # and skipping ``Mxfp4MoEMethod.__init__`` skips where it is normally set (mxfp4.py:511).
+        # False is the correct value, not a stand-in: ``_use_k3_situ_aiter`` (mxfp4.py:484-491)
+        self.is_k3_situ_aiter = False
         # NONE is still required (not merely convenient): community
         # ``maybe_roundup_sizes`` (mxfp4.py:507), ``skip_forward_padding``
         # (:494) and ``has_unpadded_output`` (:499) all read this attribute, and

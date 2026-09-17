@@ -113,8 +113,7 @@ from vllm_iluvatar.models.deepseek_v4.fp8_attention import (
 # would only hit ``logging.lastResort`` (WARNING), dropping the stats lines.
 logger = init_logger(f"vllm.{__name__}")
 
-# ``mtp.*`` is skipped end to end: at load time via AutoWeightsLoader, and in
-# both directions of the Load_Verifier (community ``nvidia/model.py:1468-1469``).
+# Default for ``IluDeepseekV4Fp8ForCausalLM._LOAD_SKIP_SUBSTRS``; see that attribute.
 _LOAD_SKIP_SUBSTRS: tuple[str, ...] = ("mtp.",)
 
 # Cap reported names in load diagnostics.
@@ -128,15 +127,18 @@ _MAX_REPORTED_NAMES = 20
 _MODEL_PREFIX = "model."
 
 
-def _is_load_skipped(name: str) -> bool:
+def _is_load_skipped(name: str, skip_substrs: tuple[str, ...] = _LOAD_SKIP_SUBSTRS) -> bool:
     """Whether ``AutoWeightsLoader`` would skip this (mapped) name.
 
     Mirrors ``AutoWeightsLoader._can_skip`` for the substrings this model passes:
-    our own ``mtp.`` plus the rotary leftovers the loader appends to every
+    the caller's list plus the rotary leftovers the loader appends to every
     ``skip_substrs`` list. Used by both Load_Verifier directions so the whitelist
     is identical on the parameter and the checkpoint side.
+
+    ``skip_substrs`` is a parameter rather than the module constant so a subclass can widen the
+    list via ``_LOAD_SKIP_SUBSTRS`` and have both directions of the check follow.
     """
-    return any(substr in name for substr in _LOAD_SKIP_SUBSTRS) or any(
+    return any(substr in name for substr in skip_substrs) or any(
         substr in name for substr in AutoWeightsLoader.ROTARY_EMBEDS_UNUSED_WEIGHTS
     )
 
@@ -469,6 +471,8 @@ class IluDeepseekV4Fp8DecoderLayer(nn.Module):
     All six are fp32 plain tensors loaded by ``default_weight_loader``.
     """
 
+    attention_cls: type[nn.Module] = IluDeepseekV4Fp8Attention
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -480,7 +484,7 @@ class IluDeepseekV4Fp8DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
 
-        self.attn = IluDeepseekV4Fp8Attention(
+        self.attn = self.attention_cls(
             vllm_config,
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
@@ -626,6 +630,18 @@ class IluDeepseekV4Fp8Model(nn.Module):
     and without the MegaMoE / Eagle plumbing.
     """
 
+    # Subclass extension point, paired with ``IluDeepseekV4Fp8DecoderLayer.attention_cls``.
+    decoder_layer_cls: type[nn.Module] = IluDeepseekV4Fp8DecoderLayer
+
+    stacked_params_mapping: list[tuple[str, str, int]] = [
+        ("gate_up_proj", "w1", 0),
+        ("gate_up_proj", "w3", 1),
+        ("attn.fused_wqa_wkv", "attn.wq_a", 0),
+        ("attn.fused_wqa_wkv", "attn.wkv", 1),
+        ("compressor.fused_wkv_wgate", "compressor.wkv", 0),
+        ("compressor.fused_wkv_wgate", "compressor.wgate", 1),
+    ]
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
 
@@ -664,7 +680,7 @@ class IluDeepseekV4Fp8Model(nn.Module):
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: IluDeepseekV4Fp8DecoderLayer(
+            lambda prefix: self.decoder_layer_cls(
                 vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
@@ -879,8 +895,8 @@ class IluDeepseekV4Fp8Model(nn.Module):
 
         Four branches, in the order the community loop tries them:
 
-        1. **stacked fusion** -- three pairs of checkpoint tensors that share
-           one parameter: ``attn.wq_a`` / ``attn.wkv`` ->
+        1. **stacked fusion** -- pairs of checkpoint tensors that share one parameter, per
+           ``self.stacked_params_mapping``; by default ``attn.wq_a`` / ``attn.wkv`` ->
            ``attn.fused_wqa_wkv``, ``compressor.wkv`` / ``compressor.wgate`` ->
            ``compressor.fused_wkv_wgate``, and the shared expert's ``w1`` /
            ``w3`` -> ``gate_up_proj``.
@@ -897,15 +913,7 @@ class IluDeepseekV4Fp8Model(nn.Module):
         Every checkpoint name this loop *handles* is recorded in
         ``self.consumed_ckpt_names`` for the Load_Verifier.
         """
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("gate_up_proj", "w1", 0),
-            ("gate_up_proj", "w3", 1),
-            ("attn.fused_wqa_wkv", "attn.wq_a", 0),
-            ("attn.fused_wqa_wkv", "attn.wkv", 1),
-            ("compressor.fused_wkv_wgate", "compressor.wkv", 0),
-            ("compressor.fused_wkv_wgate", "compressor.wgate", 1),
-        ]
+        stacked_params_mapping = self.stacked_params_mapping
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         # Accumulate, never reset here -- this method may be entered more than
@@ -1056,6 +1064,8 @@ class IluDeepseekV4Fp8ForCausalLM(nn.Module, SupportsPP):
     model_cls = IluDeepseekV4Fp8Model
     hf_to_vllm_mapper = _make_fp8_weights_mapper()
 
+    _LOAD_SKIP_SUBSTRS: tuple[str, ...] = _LOAD_SKIP_SUBSTRS
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -1123,7 +1133,7 @@ class IluDeepseekV4Fp8ForCausalLM(nn.Module, SupportsPP):
         mapper = self.hf_to_vllm_mapper
         for name, tensor in weights:
             mapped = mapper.apply_list([name])
-            if mapped and not _is_load_skipped(mapped[0]):
+            if mapped and not _is_load_skipped(mapped[0], self._LOAD_SKIP_SUBSTRS):
                 seen[mapped[0]] = fp8_load_stats.dtype_name(tensor.dtype)
             yield name, tensor
 
@@ -1160,7 +1170,7 @@ class IluDeepseekV4Fp8ForCausalLM(nn.Module, SupportsPP):
         # accumulates and ``AutoWeightsLoader`` may enter its ``load_weights``
         # several times (see ``reset_consumed_ckpt_names``).
         self.model.reset_consumed_ckpt_names()
-        loader = AutoWeightsLoader(self, skip_substrs=list(_LOAD_SKIP_SUBSTRS))
+        loader = AutoWeightsLoader(self, skip_substrs=list(self._LOAD_SKIP_SUBSTRS))
         loaded = loader.load_weights(
             self._tap_weight_names(weights, seen), mapper=self.hf_to_vllm_mapper
         )
@@ -1207,7 +1217,8 @@ class IluDeepseekV4Fp8ForCausalLM(nn.Module, SupportsPP):
         expected = {
             name
             for name, _ in self.named_parameters()
-            if not _is_load_skipped(name) and not is_pp_missing_parameter(name, self)
+            if not _is_load_skipped(name, self._LOAD_SKIP_SUBSTRS)
+            and not is_pp_missing_parameter(name, self)
         }
         missing = sorted(expected - loaded)
         if missing:

@@ -283,9 +283,6 @@ def test_sparse_impl_reserves_workspace_from_shared_manager(monkeypatch):
         return 123
 
     monkeypatch.setattr(
-        sparse_attention, "_M3_SPARSE_PREFILL_BACKEND", "ixformer_perf"
-    )
-    monkeypatch.setattr(
         sparse_attention.ixf_ops,
         "minimax_m3_sparse_attn_tcu_workspace_size",
         fake_size,

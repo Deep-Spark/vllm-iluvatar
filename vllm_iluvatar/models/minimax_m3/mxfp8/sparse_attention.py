@@ -18,7 +18,6 @@ The compressed-tensors path uses token-major ``[Q,H,K]`` adapters in
 
 from __future__ import annotations
 
-import os
 from typing import ClassVar
 
 import ixformer.inference.functions as ixf_ops
@@ -65,15 +64,7 @@ __all__ = [
 # all four derive from here so they cannot drift apart.
 SUPPORTED_KV_CACHE_DTYPES: tuple[CacheDType, ...] = ("bfloat16",)
 SUPPORTED_KV_CACHE_TORCH_DTYPES: tuple[torch.dtype, ...] = (torch.bfloat16,)
-_M3_SPARSE_PREFILL_BACKEND = os.getenv(
-    "VLLM_ILU_M3_SPARSE_PREFILL_BACKEND", "ixformer_perf"
-)
-if _M3_SPARSE_PREFILL_BACKEND not in {"ixformer_native", "ixformer_perf"}:
-    raise ValueError(
-        "VLLM_ILU_M3_SPARSE_PREFILL_BACKEND must be "
-        "'ixformer_native' or 'ixformer_perf', got "
-        f"{_M3_SPARSE_PREFILL_BACKEND!r}"
-    )
+_M3_SPARSE_PREFILL_BACKEND = "ixformer_perf"
 
 
 def _dense_topk(topk_idx: torch.Tensor) -> torch.Tensor:

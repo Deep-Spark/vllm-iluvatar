@@ -224,6 +224,32 @@ def test_ixformer_core_uses_cuda_gating(monkeypatch):
     assert "conv_cache.copy_" not in src
 
 
+def test_mixed_spec_prefill_routes_to_ixformer(monkeypatch):
+    module, _, _ = _load_plugin_module(monkeypatch, gdn_backend=True)
+    op = object.__new__(module.IluQwenGatedDeltaNetAttention)
+    op.prefix = PREFIX
+    op.enable_packed_recurrent_decode = False
+    op._qwen38_kernel = lambda: "ixformer"
+    op._ixformer_spec_enabled = lambda: True
+    calls = []
+    op._forward_core_ixformer = lambda **kwargs: calls.append(kwargs)
+    metadata = module.IluGDNAttentionMetadata()
+    metadata.spec_sequence_masks = torch.tensor([True, False])
+    metadata.num_prefills = 1
+    metadata.num_decodes = 0
+    module.get_forward_context = lambda: SimpleNamespace(
+        attn_metadata={PREFIX: metadata}
+    )
+    mixed_qkv = torch.empty(2, 8)
+    gate = torch.empty(2, 1)
+    out = torch.empty(2, 1, 1)
+
+    op._forward_core(mixed_qkv, gate, gate, out)
+
+    assert len(calls) == 1
+    assert calls[0]["attn_metadata"] is metadata
+
+
 def test_ixformer_forward_cuda_isolates_other_kernels(monkeypatch):
     import inspect
 
@@ -664,10 +690,16 @@ def test_ixformer_geometry_fails_at_construction(monkeypatch, geometry, message)
     assert "VLLM_ILU_GDN_ATTN_BACKEND=0" in str(exc_info.value)
 
 
-def test_ixformer_speculative_decode_fails_at_construction(monkeypatch):
-    with pytest.raises(ValueError, match="speculative") as exc_info:
-        _make_attention(monkeypatch, speculative_config=object())
-    assert "VLLM_ILU_GDN_ATTN_BACKEND=0" in str(exc_info.value)
+def test_ixformer_speculative_decode_is_accepted_at_construction(monkeypatch):
+    op, _ = _make_attention(monkeypatch, speculative_config=object())
+    assert op._qwen38_kernel() == "ixformer"
+    assert op._ixformer_spec_enabled()
+
+
+def test_ixformer_spec_switch_can_disable_only_spec_path(monkeypatch):
+    op, _ = _make_attention(monkeypatch, speculative_config=object())
+    monkeypatch.setenv("VLLM_ILU_GDN_IXFORMER_SPEC", "0")
+    assert not op._ixformer_spec_enabled()
 
 
 def test_non_ivcore30_keeps_speculative_decode_fallback(monkeypatch):

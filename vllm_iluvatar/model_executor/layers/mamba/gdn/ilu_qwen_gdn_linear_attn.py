@@ -21,6 +21,7 @@ Scope:
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import ixformer._C as ixf_c_ops
@@ -287,12 +288,15 @@ class IluQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 f"num_k_heads == 0, got {self.num_v_heads}/{self.num_k_heads}."
                 + fallback
             )
-        if getattr(vllm_config, "speculative_config", None) is not None:
-            raise ValueError(
-                "Iluvatar GDN ixformer kernels do not support speculative "
-                "decode / MTP." + fallback + " Alternatively, disable "
-                "speculative decode."
-            )
+
+    @staticmethod
+    def _ixformer_spec_enabled() -> bool:
+        return os.getenv("VLLM_ILU_GDN_IXFORMER_SPEC", "1").lower() not in {
+            "0",
+            "false",
+            "off",
+            "no",
+        }
 
     def _ensure_ixformer_buffers(
         self, device: torch.device, dtype: torch.dtype | None = None
@@ -495,11 +499,6 @@ class IluQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         core_attn_out: torch.Tensor,
         attn_metadata: IluGDNAttentionMetadata,
     ) -> None:
-        if attn_metadata.spec_sequence_masks is not None:
-            raise NotImplementedError(
-                "Qwen3.8 GDN spec/MTP is not wired; disable speculative decode"
-            )
-
         self._ensure_ixformer_buffers(mixed_qkv.device, mixed_qkv.dtype)
         assert self._gdn_workspace is not None
         assert self._conv_out is not None
@@ -529,28 +528,53 @@ class IluQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # Packed pages are strided on dim0; the CUDA op accepts that stride.
         ssm_state = ssm_cache
 
-        cu = attn_metadata.non_spec_query_start_loc
-        idx = attn_metadata.non_spec_state_indices_tensor
-        assert cu is not None and idx is not None
-        # G7: builder already packed int32 contiguous (graph buffer if needed).
-
         tokens = mixed_qkv.size(0)
         conv_out = self._conv_out[:tokens]
         has_init = attn_metadata.has_initial_state
-        has_init_u8 = None
-        if attn_metadata.num_prefills > 0 and has_init is not None:
-            has_init_u8 = self._ixformer_has_init(
-                has_init, int(has_init.numel()), as_uint8=True
+        spec = attn_metadata.spec_sequence_masks is not None
+        has_non_spec = attn_metadata.num_prefills > 0 or attn_metadata.num_decodes > 0
+        if spec:
+            spec_cu = attn_metadata.spec_query_start_loc
+            spec_conv_idx = attn_metadata.spec_conv_state_indices
+            accepted = attn_metadata.num_accepted_tokens
+            assert spec_cu is not None
+            assert spec_conv_idx is not None
+            assert accepted is not None
+            try:
+                ixf_c_ops.infer.qwen_causal_conv1d_spec_update(
+                    mixed_qkv,
+                    self._conv_w,
+                    conv_out,
+                    conv_state,
+                    spec_cu,
+                    spec_conv_idx,
+                    accepted,
+                    attn_metadata.spec_token_starts,
+                )
+            except (AttributeError, TypeError) as exc:
+                raise RuntimeError(
+                    "The installed ixformer is too old for Qwen GDN MTP; "
+                    "rebuild and reinstall ixformer."
+                ) from exc
+        if has_non_spec:
+            cu = attn_metadata.non_spec_query_start_loc
+            idx = attn_metadata.non_spec_state_indices_tensor
+            assert cu is not None and idx is not None
+            has_init_u8 = None
+            if attn_metadata.num_prefills > 0 and has_init is not None:
+                has_init_u8 = self._ixformer_has_init(
+                    has_init, int(has_init.numel()), as_uint8=True
+                )
+            ixf_c_ops.infer.qwen_causal_conv1d(
+                mixed_qkv,
+                self._conv_w,
+                conv_out,
+                conv_state,
+                cu,
+                idx,
+                has_init_u8,
+                attn_metadata.non_spec_token_starts,
             )
-        ixf_c_ops.infer.qwen_causal_conv1d(
-            mixed_qkv,
-            self._conv_w,
-            conv_out,
-            conv_state,
-            cu,
-            idx,
-            has_init_u8,
-        )
 
         query, key, value = self.packed_qkv_views(conv_out)
         assert self._g_buf is not None and self._beta_buf is not None
@@ -560,7 +584,33 @@ class IluQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             self.A_log, a, b, self.dt_bias, g, beta, 1.0, 20.0
         )
         scale = self.head_k_dim**-0.5
-        # S3: prefill / mixed go through chunk. Pure decode stays recurrent.
+        if spec:
+            spec_cu = attn_metadata.spec_query_start_loc
+            spec_idx = attn_metadata.spec_state_indices_tensor
+            accepted = attn_metadata.num_accepted_tokens
+            assert spec_cu is not None and spec_idx is not None
+            assert accepted is not None
+            try:
+                ixf_c_ops.infer.qwen_gdn_recurrent_fwd(
+                    query,
+                    key,
+                    value,
+                    core_attn_out[:tokens],
+                    g,
+                    beta,
+                    ssm_state,
+                    spec_cu,
+                    spec_idx,
+                    scale,
+                    True,
+                    accepted,
+                    attn_metadata.spec_token_starts,
+                )
+            except TypeError as exc:
+                raise RuntimeError(
+                    "The installed ixformer is too old for Qwen GDN MTP; "
+                    "rebuild and reinstall ixformer."
+                ) from exc
         if attn_metadata.num_prefills > 0:
             batch = int(cu.numel()) - 1
             has_init_i32 = self._ixformer_has_init(has_init, batch, as_uint8=False)
@@ -585,6 +635,7 @@ class IluQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 int(attn_metadata.n_chunk_total),
                 scale,
                 True,
+                attn_metadata.non_spec_token_starts,
             )
         elif attn_metadata.num_decodes > 0:
             ixf_c_ops.infer.qwen_gdn_recurrent_fwd(
@@ -599,6 +650,8 @@ class IluQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 idx,
                 scale,
                 True,
+                None,
+                attn_metadata.non_spec_token_starts,
             )
 
     def _forward_core(
@@ -642,7 +695,13 @@ class IluQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 attn_metadata=attn_metadata,
             )
 
-        if self._qwen38_kernel() == "ixformer":
+        use_ixformer_spec = (
+            attn_metadata.spec_sequence_masks is not None
+            and self._ixformer_spec_enabled()
+        )
+        if self._qwen38_kernel() == "ixformer" and (
+            attn_metadata.spec_sequence_masks is None or use_ixformer_spec
+        ):
             return self._forward_core_ixformer(
                 mixed_qkv=mixed_qkv,
                 b=b,

@@ -90,6 +90,9 @@ class IluGDNAttentionBackend(AttentionBackend):
 class IluGDNAttentionMetadata(GDNAttentionMetadata):
     non_spec_query_start_loc_cpu: torch.Tensor | None = None
     output_index: torch.Tensor | None = None  # shape: [total_tokens,]
+    spec_conv_state_indices: torch.Tensor | None = None
+    spec_token_starts: torch.Tensor | None = None
+    non_spec_token_starts: torch.Tensor | None = None
     n_chunk_max: int = 1
     n_chunk_total: int = 1
 
@@ -107,6 +110,9 @@ class IluGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self.spec_conv_state_indices = torch.empty(
+            self.decode_cudagraph_max_bs, dtype=torch.int32, device=device
+        )
 
     def build(  # type: ignore[override]
         self,
@@ -309,8 +315,7 @@ class IluGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             )
             assert non_spec_query_start_loc_cpu is not None
             query_lens_cpu = (
-                non_spec_query_start_loc_cpu[1:]
-                - non_spec_query_start_loc_cpu[:-1]
+                non_spec_query_start_loc_cpu[1:] - non_spec_query_start_loc_cpu[:-1]
             )
             chunk_counts_cpu = torch.div(
                 query_lens_cpu + 15, 16, rounding_mode="floor"
@@ -318,9 +323,7 @@ class IluGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             chunk_offsets_cpu = torch.zeros(
                 chunk_counts_cpu.numel() + 1, dtype=torch.int32
             )
-            torch.cumsum(
-                chunk_counts_cpu, dim=0, out=chunk_offsets_cpu[1:]
-            )
+            torch.cumsum(chunk_counts_cpu, dim=0, out=chunk_offsets_cpu[1:])
             n_chunk_total = max(1, int(chunk_offsets_cpu[-1].item()))
             chunk_offsets = async_tensor_h2d(
                 chunk_offsets_cpu, device=query_start_loc.device
@@ -418,6 +421,26 @@ class IluGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             non_spec_state_indices_tensor, idx_buf
         )
         non_spec_query_start_loc = _pack_int32_1d(non_spec_query_start_loc, cu_buf)
+        spec_conv_state_indices = None
+        if spec_state_indices_tensor is not None:
+            spec_conv_state_indices = _pack_int32_1d(
+                spec_state_indices_tensor[:, 0],
+                getattr(self, "spec_conv_state_indices", None),
+            )
+        spec_token_starts = None
+        non_spec_token_starts = None
+        if spec_sequence_masks_cpu is not None and (
+            num_prefills > 0 or num_decodes > 0
+        ):
+            starts_cpu = query_start_loc_cpu[:-1]
+            spec_token_starts = async_tensor_h2d(
+                starts_cpu[spec_sequence_masks_cpu].to(torch.int32),
+                device=query_start_loc.device,
+            )
+            non_spec_token_starts = async_tensor_h2d(
+                starts_cpu[~spec_sequence_masks_cpu].to(torch.int32),
+                device=query_start_loc.device,
+            )
 
         attn_metadata = IluGDNAttentionMetadata(
             num_prefills=num_prefills,
@@ -446,6 +469,9 @@ class IluGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             token_chunk_offset_ptr=token_chunk_offset_ptr,
             non_spec_query_start_loc_cpu=non_spec_query_start_loc_cpu,
             output_index=output_index,
+            spec_conv_state_indices=spec_conv_state_indices,
+            spec_token_starts=spec_token_starts,
+            non_spec_token_starts=non_spec_token_starts,
             n_chunk_max=_n_chunk_max_from_cu(non_spec_query_start_loc_cpu),
             n_chunk_total=n_chunk_total,
         )

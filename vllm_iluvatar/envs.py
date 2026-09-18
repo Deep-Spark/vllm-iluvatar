@@ -160,6 +160,11 @@ if TYPE_CHECKING:
     # per-layer tables; empty -> online amax/448 on first eager insert.
     VLLM_ILU_GLM_DSA_FP8_KV_SCALE: str = ""
     VLLM_ILU_GLM_DSA_FP8_KV_SCALE_PATH: str = ""
+    # Cap num_cpus passed to ray.init() for fresh local cluster starts, so the
+    # raylet does not pre-start host-count workers and thrash the driver connect
+    # in containers without a cgroup CPU quota. See
+    # ilu_patch/general_patches/patch_ray_init_num_cpus.py.
+    VLLM_ILU_RAY_NUM_CPUS: int = 16
 
 # Canonical (VLLM_ILU_*) readers. Each lambda preserves the exact parsing the
 # fork used in vllm/envs.py, and reads VLLM_ILU_* first then the legacy VLLM_*.
@@ -402,6 +407,9 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Optional override for MessageQueue max_chunks (see patch_message_queue).
     # Empty / unset → auto: broadcast max(10, 2*n_reader+8), response max 48.
     "VLLM_ILU_MQ_MAX_CHUNKS": lambda: os.environ.get("VLLM_ILU_MQ_MAX_CHUNKS", ""),
+    # Cap num_cpus for ray.init() fresh local cluster starts (see
+    # patch_ray_init_num_cpus). 0/1 are clamped up to 1.
+    "VLLM_ILU_RAY_NUM_CPUS": _int_reader("VLLM_ILU_RAY_NUM_CPUS", 16, minimum=1),
 }
 
 

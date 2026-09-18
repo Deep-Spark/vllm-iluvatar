@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+
 import ixformer.inference.functions as ixfops
 import numpy as np
 import torch
@@ -20,6 +22,106 @@ logger = init_logger(f"vllm.{__name__}")
 
 
 _FP8_BLOCK = 32
+
+# 表本身是 F8_E4M3，它的块缩放是 F8_E8M0。其余几个只是为了以后换量化格式时不用回来改。
+_SAFETENSORS_DTYPES = {
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E5M2": torch.float8_e5m2,
+    "F8_E8M0": torch.float8_e8m0fnu,
+    "BF16": torch.bfloat16,
+    "F16": torch.float16,
+    "F32": torch.float32,
+    "U8": torch.uint8,
+    "I8": torch.int8,
+}
+
+
+def _safetensors_entry(path: str, name: str) -> tuple[int, list[int], torch.dtype]:
+    """``(该张量数据在文件中的绝对字节偏移, shape, dtype)``.
+
+    safetensors 的头是 8 字节小端长度 + 一段 JSON，JSON 里每个张量的 ``data_offsets``
+    是相对数据区起点的。自己解头是为了拿到绝对偏移好做 mmap —— ``safe_open`` 只肯给
+    张量，不肯给偏移。
+    """
+    import json
+
+    with open(path, "rb") as f:
+        header_len = int.from_bytes(f.read(8), "little")
+        header = json.loads(f.read(header_len))
+    meta = header[name]
+    dtype = _SAFETENSORS_DTYPES.get(meta["dtype"])
+    if dtype is None:
+        raise ValueError(f"{name}: 未支持的 safetensors dtype {meta['dtype']}")
+    return 8 + header_len + meta["data_offsets"][0], meta["shape"], dtype
+
+
+def _map_locked_rows(
+    path: str, name: str, start: int, end: int
+) -> tuple[torch.Tensor, object]:
+    """把 ``name`` 的行区间 ``[start, end)`` 以只读共享方式映射进来并锁住。
+
+    返回 ``(张量, mmap 对象)``；mmap 对象必须被调用方持有，否则映射会随垃圾回收消失。
+
+    为什么是这个组合，三点都是实测定下来的：
+      * ``MAP_SHARED`` + ``PROT_READ``：所有映射同一文件区间的进程共享同一份物理页。
+        表只按 TP 切，所以 DP 下同一段会被多个 rank 用到 —— 共享之后这些副本是白拿的
+        （实测第二个进程锁同一段 11.44 GiB，系统可用内存只动了 0.02 GiB）。
+      * ``mlock``：不锁的话页会被挤出去，每次 gather 都从磁盘换页，实测单次 9-240 ms，
+        直接砸在 prefill 关键路径上。锁上之后是 0.12-0.16 ms。
+      * 必须是只读映射。``safe_open`` 自己按 ``rw-p``（可写私有）映射文件，在那种映射
+        上 ``mlock`` 会提前触发 COW，smaps 记成 Private_Dirty —— 等于又复制一份，
+        共享一点没落着。
+    """
+    import ctypes
+    import mmap
+    import resource
+
+    abs_off, shape, dtype = _safetensors_entry(path, name)
+    itemsize = torch.empty((), dtype=dtype).element_size()
+    row_elems = 1
+    for d in shape[1:]:
+        row_elems *= d
+    row_bytes = row_elems * itemsize
+    nbytes = (end - start) * row_bytes
+    abs_off += start * row_bytes
+
+    # mmap 的 offset 必须页对齐，向下取整，差值交给 frombuffer 的 offset 抵掉。
+    granularity = mmap.ALLOCATIONGRANULARITY
+    map_off = abs_off - (abs_off % granularity)
+    skew = abs_off - map_off
+
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        region = mmap.mmap(fd, nbytes + skew, mmap.MAP_SHARED, mmap.PROT_READ,
+                           offset=map_off)
+    finally:
+        os.close(fd)
+
+    import warnings
+
+    with warnings.catch_warnings():
+        # 只读 buffer 会触发 "PyTorch 不支持不可写张量" 的告警。这里正是要不可写：
+        # 表只被 index_select 读，写它反而是 bug。
+        warnings.simplefilter("ignore")
+        flat = torch.frombuffer(region, dtype=dtype, count=nbytes // itemsize,
+                                offset=skew)
+    table = flat.view(end - start, *shape[1:])
+
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    try:
+        resource.setrlimit(resource.RLIMIT_MEMLOCK,
+                           (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+    except (OSError, ValueError):
+        pass  # 提不动就照原样试，锁不上会走下面的回退
+    addr = table.data_ptr()
+    page = os.sysconf("SC_PAGESIZE")
+    lo = addr - (addr % page)
+    if libc.mlock(ctypes.c_void_p(lo), ctypes.c_size_t(nbytes + (addr - lo))) != 0:
+        errno = ctypes.get_errno()
+        raise OSError(errno, f"mlock {nbytes / 2**30:.2f} GiB 失败: "
+                             f"{os.strerror(errno)}")
+    return table, region
 
 
 def _find_next_prime(start: int, seen: set[int]) -> int:
@@ -304,6 +406,8 @@ class EngramEmbedding(nn.Module):
         self.weight: torch.Tensor | None = None
         self.scale: torch.Tensor | None = None
         self._stage: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        # 映射对象要一直被持有：它一被回收，映射就没了，表底下的指针立刻失效。
+        self._regions: list[object] = []
 
     def _staging(self, n: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Pinned host buffers for ``n`` gathered rows. Grown, never shrunk."""
@@ -318,20 +422,26 @@ class EngramEmbedding(nn.Module):
         return buf[0][:n], buf[1][:n], buf[2][:n]
 
     def load_from_checkpoint(self, path: str, prefix: str) -> tuple[int, int]:
-        """Copy this rank's row slice out of the safetensors mmap into anonymous RAM.
+        """Map this rank's row slice read-only-shared and lock it resident.
 
-        The copy is not optional. A row slice is contiguous in the file, so
-        ``contiguous()`` on it is a no-op and leaves the table as a file mapping.
-        Mapped pages are reclaimable: the two engram tables are 183 GiB against
-        473 GiB of page cache shared with the rest of the weights, so lookup rows
-        get evicted and every gather faults them back in from disk. That showed up
-        as single ``index_select`` calls of 100-200 ms on the prefill critical path.
-        Anonymous pages can only leave via swap, which will not happen here.
+        The rows have to stay resident: a plain file mapping gets its lookup rows
+        evicted -- the two tables are 183 GiB against a page cache shared with the
+        rest of the weights -- and every gather then faults them back from disk, at
+        9-240 ms per ``index_select`` on the prefill critical path. ``mlock`` fixes
+        that at 0.12-0.16 ms.
+
+        They must also stay *shared*, which is why this maps the file itself instead
+        of copying. The table is sharded by TP only, so under data parallelism every
+        DP replica of a rank wants the same slice. A private copy per process put
+        TP2xDP4 at 756 GiB of host RAM and killed the server; sharing the mapping
+        brings that back to 189 GiB, because a second process locking the same
+        11.44 GiB region costs 0.02 GiB (measured).
+
+        ``safe_open`` cannot be used for this: it maps the file ``rw-p``, and
+        ``mlock`` on a writable private mapping breaks COW up front, which lands
+        right back on a private copy per process.
         """
         import json
-        import os
-
-        from safetensors import safe_open
 
         index_path = os.path.join(path, "model.safetensors.index.json")
         with open(index_path) as f:
@@ -341,11 +451,34 @@ class EngramEmbedding(nn.Module):
         for suffix in ("weight", "scale"):
             name = f"{prefix}.{suffix}"
             shard = os.path.join(path, weight_map[name])
+            table, region = self._load_rows(shard, name)
+            setattr(self, suffix, table)
+            self._regions.append(region)
+            out.append(table.numel() * table.element_size())
+        return out[0], out[1]
+
+    def _load_rows(self, shard: str, name: str) -> tuple[torch.Tensor, object]:
+        """Shared locked mapping, or an anonymous copy when locking is not allowed.
+
+        Locking needs ``CAP_IPC_LOCK`` or a raised ``RLIMIT_MEMLOCK``. Where that is
+        refused, an unlocked mapping is not an option -- it is the 9-240 ms gather --
+        so fall back to what this used to do and copy into anonymous memory, which
+        only swap can reclaim. That keeps single-instance TP working anywhere and
+        costs host RAM only under DP.
+        """
+        try:
+            return _map_locked_rows(shard, name, self.start_idx, self.end_idx)
+        except OSError as exc:
+            from safetensors import safe_open
+
+            logger.warning(
+                "engram %s: 共享映射锁不住内存（%s），回退到匿名副本。"
+                "单实例 TP 不受影响；DP 下每个副本各占一份表，注意主机内存。",
+                name, exc,
+            )
             with safe_open(shard, framework="pt", device="cpu") as f:
                 tensor = f.get_slice(name)[self.start_idx : self.end_idx]
-            setattr(self, suffix, tensor.clone())
-            out.append(tensor.numel() * tensor.element_size())
-        return out[0], out[1]
+            return tensor.clone(), None
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         """indices: [T, n_hash_cols] on device -> [T, n_hash_cols, dim] bf16 on device."""

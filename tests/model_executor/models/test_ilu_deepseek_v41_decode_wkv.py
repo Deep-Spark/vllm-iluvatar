@@ -131,8 +131,9 @@ def test_extra_decode_indices_match_group_slots():
         keep = valid & (torch.arange(local.size(-1)) < eff)
         slots = group_slots(md0, int(reqs[t]), local[t].clamp(min=0), ratio)
         expected = torch.where(keep, slots, slots.new_full((), -1))
-        torch.testing.assert_close(got_idx[t], expected)
-        assert int(got_len[t]) == int((expected >= 0).sum())
+        exp_idx, exp_len = pack_valid_slots(expected.unsqueeze(0))
+        torch.testing.assert_close(got_idx[t], exp_idx[0])
+        assert int(got_len[t]) == int(exp_len[0])
 
 
 def test_extra_positions_drop_stale_columns():
@@ -145,6 +146,21 @@ def test_extra_positions_drop_stale_columns():
     )
     assert lens.tolist() == [2]
     assert idx[0, 2:].tolist() == [-1, -1]
+
+
+def test_extra_builder_packs_mid_row_holes():
+    # Prefix reuse leaves 0s in the middle of the compress block_table. v3 walks
+    # the first topk_lens columns densely, so a hole inside that range loads -1.
+    ratio = 2
+    storage_bs = 8
+    block_table = torch.tensor([[2, 0, 3]], dtype=torch.int32)
+    reqs = torch.tensor([0], dtype=torch.int32)
+    local = torch.tensor([[0, 8, 16]], dtype=torch.int32)
+    idx, lens = build_extra_decode_indices(
+        block_table, storage_bs, reqs, local, torch.tensor([64]), compress_ratio=ratio
+    )
+    assert lens.tolist() == [2]
+    assert idx[0].tolist() == [16, 24, -1]
 
 
 def test_mask_null_page_slots_clears_block_zero_only():

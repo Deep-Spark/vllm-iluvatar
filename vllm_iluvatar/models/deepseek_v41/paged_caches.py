@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
+import ixformer.inference.functions as ixfops
 import torch
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -27,6 +29,31 @@ from vllm.v1.kv_cache_interface import (
 # read by the metadata builder as the C128 configuration.
 BLOCK_SIZE = 16
 
+# V41_CHECK_CACHE=1 runs each cache kernel's reference chain -- which is the
+# torch expression chain the kernel replaced -- alongside it and reports any
+# disagreement. The unit tests already compare the two, but only on shapes the
+# tests thought to build; this establishes the same equality on whatever the
+# model actually asks for, which is what licenses deleting the torch path.
+_CHECK_CACHE = os.environ.get("V41_CHECK_CACHE", "0").strip() == "1"
+_CHECK_STATS: dict[str, list[int]] = {}
+
+
+def _check_report(kind: str, ok: bool, elems: int, detail: str = "") -> None:
+    st = _CHECK_STATS.setdefault(kind, [0, 0, 0])
+    st[0] += 1
+    st[1] += elems
+    if not ok:
+        st[2] += 1
+        print(f"[CHECK_CACHE] {kind} 不一致: {detail}", flush=True)
+    total = sum(s[0] for s in _CHECK_STATS.values())
+    if total % 500 == 0:
+        rows = [
+            f"{k}: {v[0]} 次 / {v[1]} 元素 / 不一致 {v[2]}"
+            for k, v in sorted(_CHECK_STATS.items())
+        ]
+        print("[CHECK_CACHE] " + " || ".join(rows), flush=True)
+
+
 __all__ = [
     "BLOCK_SIZE",
     "V41AttentionMetadata",
@@ -36,85 +63,233 @@ __all__ = [
     "V41IndexKeyCache",
     "V41MetadataBuilder",
     "V41WindowKVCache",
-    "gather_rows",
-    "group_slots",
-    "slots_for_positions",
-    "window_slots",
+    "gather_group_rows",
+    "gather_window_rows",
+    "group_slots_from_slot_mapping",
     "write_cache",
 ]
-
-
-def slots_for_positions(
-    block_table_row: torch.Tensor,
-    positions: torch.Tensor,
-    storage_block_size: int,
-) -> torch.Tensor:
-    pos = positions.to(torch.int64)
-    n_blocks = block_table_row.size(0)
-    if n_blocks == 0 or pos.numel() == 0:
-        return pos.new_full(pos.shape, -1, dtype=torch.int32)
-    blk_idx = pos // storage_block_size
-    in_range = (blk_idx >= 0) & (blk_idx < n_blocks)
-    safe_idx = blk_idx.clamp(0, n_blocks - 1)
-    blocks = block_table_row.to(torch.int64).index_select(0, safe_idx)
-    slots = blocks * storage_block_size + pos % storage_block_size
-    # Block 0 is vLLM's null placeholder. Unused / SWA-evicted columns are 0,
-    # not -1; treating 0 as a real page writes the shared null block.
-    ok = in_range & (blocks > 0)
-    return torch.where(ok, slots, slots.new_full((), -1)).to(torch.int32)
 
 
 def write_cache(cache: torch.Tensor, rows: torch.Tensor, slots: torch.Tensor) -> None:
     """Scatter rows into paged cache. Invalid slots (``<0`` or OOB) are skipped.
 
-    Do not use boolean ``tensor[mask]`` here: that path is ``THPVariable_getitem``
-    → ``as_strided`` / ``ViewInfo::chain``, which segfaulted after decode WKV.
-
-    ``nonzero`` sidesteps that but has to ship its output size back to the host,
-    draining the pipeline once per call — 48 times per prefill forward, which
-    profiled as the whole of the GPU's idle time. So instead of selecting the
-    valid rows, invalid ones are aimed at row 0 and handed that row's own current
-    contents: whichever duplicate index wins writes it back unchanged. Row 0
-    belongs to vLLM's null block (``BlockPool`` pops it off the free queue and
-    never hands it out), so no valid slot can name it.
+    The kernel skips invalid rows outright. Torch could not: selecting a subset
+    needs the count on the host, and ``nonzero`` shipping it back drained the
+    pipeline once per call — 48 times per prefill forward, which profiled as the
+    whole of the GPU's idle time. (Boolean ``tensor[mask]`` was not an option
+    either: that path is ``THPVariable_getitem`` → ``as_strided`` /
+    ``ViewInfo::chain``, which segfaulted after decode WKV.) So the torch version
+    aimed invalid rows at row 0 and handed that row its own contents back,
+    which only held because row 0 belongs to vLLM's null block. Skipping drops
+    that assumption along with fourteen launches per call.
     """
     if slots.numel() == 0 or rows.numel() == 0:
         return
-    flat = cache.reshape(-1, rows.size(-1))
-    n_rows = int(flat.size(0))
-    if n_rows == 0:
+    flat_rows = rows.reshape(slots.numel(), -1)
+    flat_slots = slots.reshape(-1).to(torch.int32)
+
+    if _CHECK_CACHE:
+        # Cloning the cache to run the torch chain against is not an option here
+        # -- it is hundreds of megabytes and this is called 48 times a forward --
+        # so check the two properties that distinguish the kernel instead: every
+        # valid slot holds its row afterwards, and row 0 is untouched. Row 0 is
+        # the interesting one because the torch chain deliberately rewrote it on
+        # every invalid slot, and dropping that is the behaviour change. That no
+        # *other* row is clobbered is what the unit tests cover, on caches small
+        # enough to compare whole.
+        flat = cache.reshape(-1, flat_rows.size(-1))
+        n_rows = flat.size(0)
+        valid = (flat_slots >= 0) & (flat_slots < n_rows)
+        touched = torch.masked_select(flat_slots, valid).to(torch.int64)
+        row0_before = flat[0].clone() if not bool((touched == 0).any()) else None
+
+        ixfops.v41_write_cache(cache, flat_rows, flat_slots)
+
+        want_rows = flat_rows[torch.masked_select(
+            torch.arange(flat_slots.numel(), device=flat.device), valid
+        )]
+        ok = torch.equal(flat.index_select(0, touched), want_rows)
+        if row0_before is not None and not torch.equal(flat[0], row0_before):
+            ok = False
+        _check_report(
+            "write",
+            ok,
+            int(touched.numel()),
+            f"rows={tuple(flat_rows.shape)} 有效={int(touched.numel())} "
+            f"无效={int(flat_slots.numel() - touched.numel())}",
+        )
         return
-    idx = slots.reshape(-1).to(torch.int64)
-    src = rows.reshape(idx.size(0), -1)
-    valid = (idx >= 0) & (idx < n_rows)
-    safe_idx = torch.where(valid, idx, idx.new_zeros(()))
-    safe_src = torch.where(valid.unsqueeze(-1), src, flat[0].unsqueeze(0))
-    flat.index_copy_(0, safe_idx, safe_src)
+
+    ixfops.v41_write_cache(cache, flat_rows, flat_slots)
 
 
-def gather_rows(cache: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
-    flat = cache.reshape(-1, cache.size(-1))
-    n_rows = int(flat.size(0))
-    idx = slots.reshape(-1).to(torch.int64)
-    if n_rows == 0:
-        return flat.new_zeros(idx.size(0), flat.size(-1)).view(*slots.shape, -1)
-    valid = (idx >= 0) & (idx < n_rows)
-    gathered = flat.index_select(0, idx.clamp(0, n_rows - 1))
-    out = torch.where(valid.unsqueeze(1), gathered, gathered.new_zeros(()))
-    return out.view(*slots.shape, flat.size(-1)) if slots.ndim > 1 else out
+def group_slots_from_slot_mapping(
+    md: V41AttentionMetadata, ratio: int, num_groups: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compressed-domain slot and group start position for every group this
+    batch closes, derived from the framework's own per-token ``slot_mapping``.
+
+    vLLM already publishes, per cache layer, a slot for each token in the batch:
+
+        slot_mapping[t] = block_table[req, pos // bs] * bs + pos % bs
+
+    A compressed cache holds one row per ``ratio`` tokens, so its rows are
+    addressed in the group domain:
+
+        group_slot = block_table[req, g // (bs // ratio)] * (bs // ratio)
+                     + g % (bs // ratio)
+
+    The two pick the *same* physical block -- for a token at ``pos`` closing
+    group ``g = pos // ratio``, ``g // (bs // ratio) == pos // bs`` -- so the
+    physical block number can be recovered from the published slot as
+    ``slot_mapping[t] // bs``, and the offset within it as
+    ``(slot_mapping[t] % bs) // ratio``. That makes the group slot a closed form
+    of ``slot_mapping``: no block-table gather, no per-request loop, and no host
+    round trip to build group ids.
+
+    A group is closed by its last token, ``(pos + 1) % ratio == 0``. The set of
+    groups reached that way is exactly ``groups_completed``'s range: writing
+    ``start_pos = q * ratio + t`` with ``0 <= t < ratio``, that helper's lower
+    bound ``(start_pos + ratio) // ratio - 1`` is ``q``, and the smallest group
+    whose last token is at or after ``start_pos`` is
+    ``ceil((start_pos + 1) / ratio) - 1``, which is also ``q``.
+
+    ``num_groups`` is how many groups the caller expects, which it already knows
+    on the host from its own group spans. Taking it as an argument keeps this
+    function free of device-to-host syncs: boolean mask indexing would have to
+    count the selected tokens on the device and read that count back before it
+    could size the result, so instead every token computes a slot and a running
+    cumsum sends it to its compacted position, with non-boundary tokens dumped
+    into one scratch entry past the end.
+
+    Returns ``(slots, group_start_positions)``, both ordered by batch token
+    index, which is request-major and ascending within a request.
+    """
+    n = md.num_actual_tokens
+    sm = md.slot_mapping[:n].to(torch.int64)
+    pos = md.positions[:n].to(torch.int64)
+    closes = ((pos + 1) % ratio == 0) & (sm >= 0)
+
+    rows_per_block = md.block_size // ratio
+    all_slots = (sm // md.block_size) * rows_per_block + (sm % md.block_size) // ratio
+    all_pos = pos - (ratio - 1)
+
+    dest = torch.where(closes, closes.cumsum(0) - 1, torch.full_like(sm, num_groups))
+    out_slots = sm.new_zeros(num_groups + 1).scatter_(0, dest, all_slots)
+    out_pos = sm.new_zeros(num_groups + 1).scatter_(0, dest, all_pos)
+    return (
+        out_slots[:num_groups].to(torch.int32),
+        out_pos[:num_groups].to(torch.int32),
+    )
 
 
-def window_slots(
-    md: "V41AttentionMetadata", req: int, positions: torch.Tensor
+def compress_rope_qdq_insert(
+    cache: torch.Tensor,
+    x: torch.Tensor,
+    md: "V41AttentionMetadata",
+    ratio: int,
+    qdq_block: int,
+    qdq_fmt: str,
+    cos_sin: torch.Tensor,
+) -> None:
+    """Publish this batch's compressed rows: RoPE, qdq, and the cache write.
+
+    One kernel for what was four calls -- derive the slots, rotate, quantize,
+    scatter -- of which the slot derivation alone cost a cumsum and two scatters
+    over the whole batch. See ``ixformer``'s ``v41_compress_rope_qdq_insert``;
+    it works the same way ``group_slots_from_slot_mapping`` documents, just
+    without materialising the slots.
+
+    ``x`` is left untouched, where the chain rotated and quantized it in place.
+    No caller reads it afterwards.
+    """
+    n = md.num_actual_tokens
+    ixfops.v41_compress_rope_qdq_insert(
+        cache, x, md.slot_mapping[:n], md.positions[:n], cos_sin,
+        md.block_size, ratio, qdq_block, qdq_fmt,
+    )
+
+    if _CHECK_CACHE:
+        # Against the production chain rather than the torch reference: the unit
+        # tests already pin the kernel to the reference, so what is worth
+        # establishing here is that the chain the server was running and the
+        # kernel that replaced it agree on the shapes the model really produces.
+        # Imported here rather than at module scope because rope.py is a leaf and
+        # this is the only thing in the file that needs it.
+        from vllm_iluvatar.models.deepseek_v41.rope import apply_rope
+
+        slots, pos = group_slots_from_slot_mapping(md, ratio, x.shape[0])
+        shadow = x.clone()
+        apply_rope(shadow.unsqueeze(0), pos, cos_sin)
+        ixfops.ds4_act_qdq(shadow, qdq_block, qdq_fmt)
+        flat = cache.reshape(-1, x.size(-1))
+        valid = (slots >= 0) & (slots < flat.size(0))
+        idx = torch.masked_select(slots, valid).to(torch.int64)
+        want = shadow[valid]
+        got = flat.index_select(0, idx)
+        ok = bool(torch.equal(got, want))
+        _check_report(
+            "compress_rope_qdq_insert", ok, int(want.numel()),
+            f"rows={idx.numel()} width={x.size(-1)} fmt={qdq_fmt} ratio={ratio}",
+        )
+
+
+def gather_window_rows(
+    cache: torch.Tensor,
+    md: "V41AttentionMetadata",
+    req: int,
+    first_position: int,
+    count: int,
 ) -> torch.Tensor:
-    """Global slot ids for a window cache, whose rows are one per raw token."""
-    return slots_for_positions(md.block_table[req], positions, md.block_size)
+    """Rows of a window cache, whose rows are one per raw token, for the
+    positions ``first_position + [0, count)`` of one request.
+
+    Resolving the block table and gathering through it is one kernel: see
+    ``ixformer``'s ``v41_gather_by_positions``. Splitting it into an address
+    array and a gather, as this used to be, cost about twenty-eight aten
+    launches per call and an ``arange`` to feed it, once per cache per layer per
+    step, which is why the range is passed as two integers.
+    """
+    return _gather(cache, md.block_table[req], first_position, count, md.block_size)
 
 
-def group_slots(
-    md: "V41AttentionMetadata", req: int, groups: torch.Tensor, ratio: int
+def gather_group_rows(
+    cache: torch.Tensor,
+    md: "V41AttentionMetadata",
+    req: int,
+    first_group: int,
+    num_groups: int,
+    ratio: int,
 ) -> torch.Tensor:
-    return slots_for_positions(md.block_table[req], groups, md.block_size // ratio)
+    """Rows of a compressed cache, which holds one row per ``ratio`` tokens, for
+    the groups ``first_group + [0, num_groups)`` of one request."""
+    return _gather(
+        cache, md.block_table[req], first_group, num_groups, md.block_size // ratio
+    )
+
+
+def _gather(
+    cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    first: int,
+    count: int,
+    storage_block_size: int,
+) -> torch.Tensor:
+    got = ixfops.v41_gather_by_positions(
+        cache, block_table_row, first, count, storage_block_size
+    )
+    if _CHECK_CACHE:
+        want = ixfops.ref_v41_gather_by_positions(
+            cache, block_table_row, first, count, storage_block_size
+        )
+        _check_report(
+            "gather",
+            got.shape == want.shape and torch.equal(got, want),
+            got.numel(),
+            f"out={tuple(got.shape)} first={first} count={count} "
+            f"bs={storage_block_size} blocks={block_table_row.numel()}",
+        )
+    return got
 
 
 @dataclass
@@ -180,7 +355,11 @@ class V41MetadataBuilder(AttentionMetadataBuilder):
             query_start_loc=common_attn_metadata.query_start_loc,
             query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
             seq_lens=common_attn_metadata.seq_lens,
-            seq_lens_cpu=common_attn_metadata.seq_lens.cpu(),
+            # The property, not ``seq_lens.cpu()``: the runner has already filled
+            # the host copy from its own bookkeeping, so reading it costs nothing,
+            # while a fresh ``.cpu()`` is a blocking transfer that makes the CPU
+            # wait out every kernel queued so far -- once per cache group per step.
+            seq_lens_cpu=common_attn_metadata.seq_lens_cpu,
             num_reqs=common_attn_metadata.num_reqs,
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             max_query_len=common_attn_metadata.max_query_len,

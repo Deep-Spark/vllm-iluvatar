@@ -17,6 +17,17 @@ def decode_wkv_enabled() -> bool:
     return os.environ.get("V41_DECODE_WKV", "1").strip().lower() in _TRUE
 
 
+def prefill_as_decode_enabled() -> bool:
+    """Route prefill through this file too, instead of building a dense plane.
+
+    ``ds4_compute_swa_decode_indices_and_lens`` derives each token's position
+    from ``query_start_loc`` / ``seq_lens``, so it covers a multi-token query
+    unchanged; ``b = num_tokens, s_q = 1`` then makes ``topk_length``'s
+    per-batch semantics per-token.
+    """
+    return os.environ.get("V41_PREFILL_AS_DECODE", "0").strip().lower() in _TRUE
+
+
 def as_wkv_cache(cache: torch.Tensor) -> torch.Tensor:
     if cache.dim() == 4:
         if cache.size(-2) != 1:
@@ -36,10 +47,10 @@ def mask_null_page_slots(
 ) -> torch.Tensor:
     """Map slots that land in vLLM's null block (page 0) back to ``-1``.
 
-    The CUDA extra-index translation counts ``phys_block == 0`` as a hit, so the
-    slot it emits lands in ``[0, storage_block_size)``. Prefix reuse punches more
-    zeros into the compress ``block_table``, which is what makes those slots
-    appear in the first place.
+    Off the production path: both index builders now require ``phys_block > 0``
+    before emitting a slot, and a slot from a real block is always
+    ``>= storage_block_size``, so this can no longer match anything they
+    produce. Kept for the XID-24 repro, which replays raw kernel output.
     """
     if storage_block_size <= 0:
         return slots
@@ -86,16 +97,43 @@ def fill_walk_padding(slots: torch.Tensor, lens: torch.Tensor) -> torch.Tensor:
     return torch.where(slots >= 0, slots, filler.unsqueeze(-1))
 
 
+def cache_slot_limit(cache: torch.Tensor) -> int:
+    """Rows a paged cache exposes to v3's dense slot walk.
+
+    Cache is ``[num_blocks, page_block_size, 1, D]``. A slot ``>= num_blocks *
+    page_block_size`` (or negative) is an OOB load in ``cuInferDSV4Attention``
+    when ``need_gather_indices=false``.
+    """
+    return int(cache.size(0) * cache.size(1))
+
+
 def clamp_slots_to_cache(slots: torch.Tensor, cache: torch.Tensor) -> torch.Tensor:
     """Drop slots that ixinfer v3 would use as dense extra/SWA row ids.
 
-    Cache is ``[num_blocks, page_block_size, 1, D]``. A slot ``>= num_blocks *
-    page_block_size`` (or negative) is an OOB load in
-    ``cuInferDSV4Attention`` when ``need_gather_indices=false``.
+    Off the CUDA path: the index builders take ``slot_limit`` and apply this
+    while they emit, before they compact. Still used by the CPU fallback and by
+    the XID-24 repro, which replays raw kernel output.
     """
-    limit = int(cache.size(0) * cache.size(1))
+    limit = cache_slot_limit(cache)
     ok = (slots >= 0) & (slots < limit)
     return torch.where(ok, slots, slots.new_full((), -1))
+
+
+def finalize_rows_torch(
+    slots: torch.Tensor, lens: torch.Tensor, slot_limit: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Python mirror of what the CUDA builders now do in place.
+
+    Only the CPU fallback needs it: drop slots the cache cannot hold, compact
+    what is left, then repeat the last kept slot across the tail that v3's
+    unchecked tile load still reads.
+    """
+    del lens
+    if slot_limit > 0:
+        ok = (slots >= 0) & (slots < slot_limit)
+        slots = torch.where(ok, slots, slots.new_full((), -1))
+    slots, counts = pack_valid_slots(slots)
+    return fill_walk_padding(slots, counts), counts
 
 
 def build_swa_decode_indices(
@@ -148,7 +186,11 @@ def build_extra_decode_indices(
     """Map local compressed-group ids to global slots. Block 0 → ``-1``.
 
     ``storage_block_size`` is the compressed-domain page
-    (``cache_md.block_size // ratio``), matching ``group_slots``.
+    (``cache_md.block_size // ratio``), matching ``gather_group_rows``.
+
+    Packed like the CUDA builder: v3's dense walk reads the first
+    ``topk_lens`` columns, so a correct count with a mid-row hole still loads
+    slot ``-1``.
     """
     nd, topk = local_idxs.shape
     local = local_idxs.to(torch.int64)
@@ -177,7 +219,7 @@ def build_extra_decode_indices(
     slots = blocks * storage_block_size + blk_off
     ok = in_range & (blocks > 0)
     indices = torch.where(ok, slots, slots.new_full((), -1)).to(torch.int32)
-    return indices, ok.sum(-1, dtype=torch.int32)
+    return pack_valid_slots(indices)
 
 
 def _swa_indices_cuda(
@@ -186,9 +228,12 @@ def _swa_indices_cuda(
     window_size: int,
     device: torch.device,
     ixfops,
+    slot_limit: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    swa_indices = torch.full((nd, window_size), -1, dtype=torch.int32, device=device)
-    swa_lens = torch.zeros(nd, dtype=torch.int32, device=device)
+    # pad_walk_tail makes the kernel write every row in [0, nd), including
+    # padding tokens, so neither buffer needs a sentinel prefill.
+    swa_indices = torch.empty((nd, window_size), dtype=torch.int32, device=device)
+    swa_lens = torch.empty(nd, dtype=torch.int32, device=device)
     valid = md.slot_mapping[:nd] >= 0 if md.slot_mapping.numel() >= nd else torch.ones(
         nd, dtype=torch.bool, device=device
     )
@@ -203,10 +248,13 @@ def _swa_indices_cuda(
         block_table=md.block_table,
         block_size=md.block_size,
         num_decode_tokens=nd,
+        slot_limit=slot_limit,
+        pad_walk_tail=True,
     )
-    masked = mask_null_page_slots(swa_indices, md.block_size)
-    packed, counts = pack_valid_slots(masked)
-    return packed, counts
+    # The kernel drops page 0 and out-of-cache slots, compacts the row, writes
+    # the packed count and pads the walked tail, so the row is already in the
+    # shape v3 wants.
+    return swa_indices, swa_lens
 
 
 def _extra_indices_cuda(
@@ -217,9 +265,12 @@ def _extra_indices_cuda(
     token_to_req_indices: torch.Tensor,
     is_valid: torch.Tensor,
     ixfops,
+    slot_limit: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     storage_bs = cache_md.block_size // ratio
-    global_idxs, _extra_lens = ixfops.ds4_compute_global_topk_indices_and_lens(
+    # Same contract as the SWA builder: page 0 and out-of-cache slots dropped,
+    # row compacted, extra_lens holding the packed count, walked tail padded.
+    return ixfops.ds4_compute_global_topk_indices_and_lens(
         local_idxs.contiguous(),
         token_to_req_indices.contiguous(),
         cache_md.block_table.contiguous(),
@@ -227,11 +278,9 @@ def _extra_indices_cuda(
         is_valid,
         positions,
         ratio,
+        slot_limit,
+        True,
     )
-    # Kernel now skips phys_block==0; pack still densifies leftover -1.
-    masked = mask_null_page_slots(global_idxs, storage_bs)
-    packed, counts = pack_valid_slots(masked)
-    return packed, counts
 
 
 def decode_swa_indices(
@@ -239,6 +288,7 @@ def decode_swa_indices(
     positions: torch.Tensor,
     window_size: int,
     ixfops=None,
+    slot_limit: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     nd = int(positions.size(0))
     use_cuda = (
@@ -247,13 +297,18 @@ def decode_swa_indices(
         and hasattr(ixfops, "ds4_compute_swa_decode_indices_and_lens")
     )
     if use_cuda:
-        return _swa_indices_cuda(md, nd, window_size, positions.device, ixfops)
-    return build_swa_decode_indices(
-        md.block_table,
-        md.block_size,
-        md.token_to_req_indices,
-        positions,
-        window_size,
+        return _swa_indices_cuda(
+            md, nd, window_size, positions.device, ixfops, slot_limit
+        )
+    return finalize_rows_torch(
+        *build_swa_decode_indices(
+            md.block_table,
+            md.block_size,
+            md.token_to_req_indices,
+            positions,
+            window_size,
+        ),
+        slot_limit,
     )
 
 
@@ -265,6 +320,7 @@ def decode_extra_indices(
     token_to_req_indices: torch.Tensor,
     is_valid: torch.Tensor | None = None,
     ixfops=None,
+    slot_limit: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     nd = local_idxs.size(0)
     t2r = token_to_req_indices[:nd]
@@ -280,15 +336,18 @@ def decode_extra_indices(
             else torch.ones(nd, dtype=torch.bool, device=local_idxs.device)
         )
         return _extra_indices_cuda(
-            cache_md, local_idxs, positions, ratio, t2r, valid, ixfops
+            cache_md, local_idxs, positions, ratio, t2r, valid, ixfops, slot_limit
         )
-    return build_extra_decode_indices(
-        cache_md.block_table,
-        cache_md.block_size // ratio,
-        t2r,
-        local_idxs,
-        positions,
-        ratio,
+    return finalize_rows_torch(
+        *build_extra_decode_indices(
+            cache_md.block_table,
+            cache_md.block_size // ratio,
+            t2r,
+            local_idxs,
+            positions,
+            ratio,
+        ),
+        slot_limit,
     )
 
 
@@ -315,12 +374,17 @@ def decode_attn_wkv(
     import ixformer.inference.functions as ixfops
 
     window_cache = as_wkv_cache(window_cache)
+    # The builders take the cache size and hand back rows already in v3's
+    # shape; clamping, packing and walk-padding here cost three more passes
+    # over every row, per layer, for a result the kernel can produce as it
+    # emits.
     swa_idx, swa_len = decode_swa_indices(
-        window_md, positions, window_size, ixfops=ixfops
+        window_md,
+        positions,
+        window_size,
+        ixfops=ixfops,
+        slot_limit=cache_slot_limit(window_cache),
     )
-    swa_idx = clamp_slots_to_cache(swa_idx, window_cache)
-    swa_idx, swa_len = pack_valid_slots(swa_idx)
-    swa_idx = fill_walk_padding(swa_idx, swa_len)
 
     extra_cache = extra_idx = extra_len = None
     if (
@@ -330,6 +394,7 @@ def decode_attn_wkv(
         and group_idxs is not None
         and group_idxs.size(-1) > 0
     ):
+        extra_cache = as_wkv_cache(compress_cache)
         extra_idx, extra_len = decode_extra_indices(
             compress_md,
             group_idxs,
@@ -342,11 +407,8 @@ def decode_attn_wkv(
                 else None
             ),
             ixfops=ixfops,
+            slot_limit=cache_slot_limit(extra_cache),
         )
-        extra_cache = as_wkv_cache(compress_cache)
-        extra_idx = clamp_slots_to_cache(extra_idx, extra_cache)
-        extra_idx, extra_len = pack_valid_slots(extra_idx)
-        extra_idx = fill_walk_padding(extra_idx, extra_len)
         extra_idx = extra_idx.unsqueeze(1).contiguous()
 
     out = ixfops.ds4_flash_mla_with_kvcache(

@@ -1,11 +1,32 @@
 """V4.1 indexer weights. Scoring lives on ``V41PagedIndexer``."""
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import nn
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear
+
+_TRUE = ("1", "true", "yes", "on")
+
+
+def indexer_replicated_enabled() -> bool:
+    """Whether every rank computes all index heads instead of a 1/tp shard.
+
+    Sharding the index heads means each rank produces a partial per-head sum, so
+    the scores have to be summed across ranks -- and that all-reduce carries
+    ``[num_tokens, seq_len]`` fp32, which is 268 MiB at 8192 tokens on the
+    candidate source layer where compress_ratio is 1. Replicating instead makes
+    the score complete on every rank and the all-reduce disappears, at the price
+    of an 8x larger ``wq_b`` GEMM and 8x the scoring work per rank (V4's fp8
+    indexer replicates for exactly this reason).
+
+    Which side wins depends on the layer's compress_ratio, so this is a switch
+    rather than a rewrite until the profile says otherwise.
+    """
+    return os.environ.get("V41_INDEXER_REPLICATED", "0").strip().lower() in _TRUE
 
 
 def select_candidate_blocks(
@@ -70,18 +91,24 @@ class IluDeepseekV41Indexer(nn.Module):
         self.candidate_topk_blocks = config.candidate_topk_blocks
         self.candidate_block_size = config.candidate_block_size
         self.n_heads = config.index_n_heads
-        self.n_local_heads = config.index_n_heads // tp_size
+        self.heads_are_replicated = indexer_replicated_enabled()
+        self.n_local_heads = (
+            config.index_n_heads
+            if self.heads_are_replicated
+            else config.index_n_heads // tp_size
+        )
         self.index_head_dim = config.index_head_dim
         self.rope_head_dim = config.rope_head_dim
         self.index_topk = config.index_topk
         self.softmax_scale = self.index_head_dim**-0.5
         self.cos_sin: torch.Tensor | None = None
 
-        self.wq_b = ColumnParallelLinear(
+        q_proj_cls = ReplicatedLinear if self.heads_are_replicated else ColumnParallelLinear
+        self.wq_b = q_proj_cls(
             config.q_lora_rank, config.index_n_heads * config.index_head_dim,
             bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_b",
         )
-        self.weights_proj = ColumnParallelLinear(
+        self.weights_proj = q_proj_cls(
             config.hidden_size, config.index_n_heads, bias=False,
             params_dtype=torch.bfloat16, prefix=f"{prefix}.weights_proj",
         )

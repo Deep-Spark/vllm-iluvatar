@@ -9,6 +9,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -23,6 +24,7 @@ from vllm_iluvatar.models.deepseek_v41.compressor import IluDeepseekV41Compresso
 from vllm_iluvatar.models.deepseek_v41.decode_wkv import (
     decode_attn_wkv,
     decode_wkv_enabled,
+    prefill_as_decode_enabled,
 )
 from vllm_iluvatar.models.deepseek_v41.indexer import (
     IluDeepseekV41Indexer,
@@ -34,9 +36,9 @@ from vllm_iluvatar.models.deepseek_v41.paged_caches import (
     V41CompressKVCache,
     V41IndexKeyCache,
     V41WindowKVCache,
-    gather_rows,
-    group_slots,
-    window_slots,
+    compress_rope_qdq_insert,
+    gather_group_rows,
+    gather_window_rows,
     write_cache,
 )
 from vllm_iluvatar.models.deepseek_v41.rope import apply_rope, get_shared_cos_sin
@@ -50,7 +52,6 @@ _IXINFER_TOPK_MULTIPLE = 64
 
 
 _STEP_N = 0
-
 
 class PerSeqRuntime:
 
@@ -99,8 +100,7 @@ def index_scores(
     for (req, t0, t1, _seq_len), n_g in zip(spans, n_groups):
         if n_g == 0:
             continue
-        slots = group_slots(md, req, torch.arange(n_g, device=q.device), ratio)
-        k_req = gather_rows(k_cache, slots)
+        k_req = gather_group_rows(k_cache, md, req, 0, n_g, ratio)
         mid[t0:t1, :, :n_g] = torch.einsum("shd,td->sht", q[t0:t1], k_req)
     return mid
 
@@ -147,8 +147,7 @@ def prefill_attn(
     for req, t0, t1, seq_len in spans:
         n_g = seq_len // ratio if cflat is not None else 0
         if n_g:
-            slots = group_slots(md, req, torch.arange(n_g, device=q.device), ratio)
-            plane_parts.append(gather_rows(cflat, slots))
+            plane_parts.append(gather_group_rows(cflat, md, req, 0, n_g, ratio))
         grp_bases.append(base)
         base += n_g
         n_groups.append(n_g)
@@ -161,8 +160,9 @@ def prefill_attn(
             hist = start_pos - win_lo
             parts = []
             if hist:
-                win_pos = torch.arange(win_lo, start_pos, device=q.device)
-                parts.append(gather_rows(wflat, window_slots(window_md, req, win_pos)))
+                parts.append(
+                    gather_window_rows(wflat, window_md, req, win_lo, hist)
+                )
             parts.append(window_kv[t0:t1])
             plane_parts.append(parts[0] if len(parts) == 1 else torch.cat(parts, dim=0))
             win_origins.append(win_lo)
@@ -246,38 +246,10 @@ class V41PagedIndexer(IluDeepseekV41Indexer):
             self.key_cache.prefix
         ]
         k = self.k_norm(self.wk(latent)[0])
-        pos = (
-            torch.cat(
-                [
-                    (
-                        torch.tensor(list(g), dtype=torch.int32, device=k.device)
-                        * self.compress_ratio
-                    )
-                    for _req, g in groups
-                ]
-            )
-            if groups
-            else torch.zeros(0, dtype=torch.int32, device=k.device)
+        compress_rope_qdq_insert(
+            self.key_cache.kv_cache, k, md, self.compress_ratio,
+            FP4_BLOCK_SIZE, "fp4_pow2", self.cos_sin,
         )
-        apply_rope(k.unsqueeze(0), pos, self.cos_sin)
-        ixfops.ds4_act_qdq(k, FP4_BLOCK_SIZE, "fp4_pow2")
-
-        slots = (
-            torch.cat(
-                [
-                    group_slots(
-                        md,
-                        req,
-                        torch.arange(g.start, g.stop, device=k.device),
-                        self.compress_ratio,
-                    )
-                    for req, g in groups
-                ]
-            )
-            if groups
-            else pos
-        )
-        write_cache(self.key_cache.kv_cache, k, slots)
         shared.index_k = self.key_cache.kv_cache
         shared.index_k_md = md
 
@@ -306,16 +278,22 @@ class V41PagedIndexer(IluDeepseekV41Indexer):
         index_score = ixfops.ds4_index_score_reduce(
             mid.contiguous(), weights.contiguous(), visible
         )
-        cols = torch.arange(index_score.size(-1), device=index_score.device)
-        # ds4_index_score_reduce allocates its output, so nothing else aliases
-        # index_score and the mask can be applied in place. At the candidate
-        # source layer this tensor is [num_tokens, seq_len] fp32, so the copy
-        # that the out-of-place form makes is 268 MiB at 8192 tokens.
-        index_score.masked_fill_(
-            cols.unsqueeze(0) >= visible.unsqueeze(1), float("-inf")
-        )
-        if get_tensor_model_parallel_world_size() > 1:
-            torch.distributed.all_reduce(index_score)
+        # ds4_index_score_reduce already writes -inf for s >= visible_lens[t],
+        # so masking against ``visible`` again here only rescans the tensor --
+        # [num_tokens, seq_len] fp32, 268 MiB at 8192 tokens on the candidate
+        # source layer.
+        #
+        # Replicated index heads already give every rank the complete per-head
+        # sum, so there is nothing to combine.
+        #
+        # This has to name the tensor-parallel group: the bare
+        # ``torch.distributed.all_reduce`` this replaces used the default world
+        # group, which happens to equal the TP group only when
+        # pipeline_parallel_size == 1. Under PP the world group spans stages that
+        # never reach this layer, so the collective hung in ixccl's bootstrap
+        # waiting for ranks that would never join.
+        if not self.heads_are_replicated and get_tensor_model_parallel_world_size() > 1:
+            index_score = tensor_model_parallel_all_reduce(index_score)
 
         if self.is_candidate_source:
             shared.candidates = select_candidate_blocks(
@@ -468,35 +446,10 @@ class IluDeepseekV41Attention(nn.Module):
     def _write_compressed(
         self, latent: torch.Tensor, groups: list[tuple[int, range]], md: V41AttentionMetadata
     ) -> None:
-        pos = (
-            torch.cat(
-                [
-                    torch.tensor(list(g), dtype=torch.int32, device=latent.device)
-                    * self.compress_ratio
-                    for _req, g in groups
-                ]
-            )
-            if groups
-            else torch.zeros(0, dtype=torch.int32, device=latent.device)
+        compress_rope_qdq_insert(
+            self.compress_cache.kv_cache, latent, md, self.compress_ratio,
+            _COMPRESS_KV_FP4_BLOCK, "fp4_e4m3", self.cos_sin,
         )
-        apply_rope(latent.unsqueeze(0), pos, self.cos_sin)
-        ixfops.ds4_act_qdq(latent, _COMPRESS_KV_FP4_BLOCK, "fp4_e4m3")
-        slots = (
-            torch.cat(
-                [
-                    group_slots(
-                        md,
-                        req,
-                        torch.arange(g.start, g.stop, device=latent.device),
-                        self.compress_ratio,
-                    )
-                    for req, g in groups
-                ]
-            )
-            if groups
-            else pos
-        )
-        write_cache(self.compress_cache.kv_cache, latent, slots)
         self.shared.compress_kv = self.compress_cache.kv_cache
         self.shared.compress_kv_md = md
 
@@ -590,6 +543,24 @@ class IluDeepseekV41Attention(nn.Module):
         cache = self.shared.compress_kv if self.compress_ratio else None
         cache_md = self.shared.compress_kv_md if self.compress_ratio else None
         outs = []
+
+        if decode_wkv_enabled() and prefill_as_decode_enabled():
+            # ``kv`` was already written to the window cache above, so there is
+            # no plane to build and no decode / prefill split to make.
+            return decode_attn_wkv(
+                q.contiguous(),
+                self.window_cache.kv_cache,
+                md,
+                positions,
+                self.window_size,
+                self.attn_sink,
+                self.softmax_scale,
+                compress_ratio=self.compress_ratio,
+                compress_cache=cache,
+                compress_md=cache_md,
+                group_idxs=group_idxs,
+                group_lens=group_lens,
+            )
 
         if nd:
             dec_spans = spans[: md.num_decodes]

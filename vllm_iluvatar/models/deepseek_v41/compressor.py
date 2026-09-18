@@ -12,8 +12,7 @@ from vllm_iluvatar.models.deepseek_v41.paged_caches import (
     BLOCK_SIZE,
     V41AttentionMetadata,
     V41CompressorStateCache,
-    gather_rows,
-    slots_for_positions,
+    gather_window_rows,
 )
 
 
@@ -66,8 +65,13 @@ class IluDeepseekV41Compressor(nn.Module):
         kv_span = kv_all.index_select(0, src)
         score_span = score_all.index_select(0, src)
 
-        slots = slots_for_positions(md.block_table[req], positions, md.block_size)
-        rows = gather_rows(self.state_cache.kv_cache.view(-1, 2 * width), slots)
+        rows = gather_window_rows(
+            self.state_cache.kv_cache.view(-1, 2 * width),
+            md,
+            req,
+            groups.start * ratio,
+            positions.numel(),
+        )
 
         kv = torch.where(here, kv_span, rows[:, :width].to(kv_span.dtype))
         score = torch.where(here, score_span, rows[:, width:].to(score_span.dtype))

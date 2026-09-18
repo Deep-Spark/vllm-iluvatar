@@ -236,6 +236,49 @@ def test_noncausal_dspark_uses_python_indices_not_plugin():
         assert md.decode_swa_indices[q, 0, : md.decode_swa_lens[q]].tolist() == first
 
 
+def test_noncausal_dspark_ignores_queries_past_max_model_len():
+    block_size = 4
+    is_valid = torch.tensor([True, True, False, False, False, False])
+    indices, lens = build_dspark_noncausal_swa_indices(
+        seq_lens=torch.tensor([16], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 6], dtype=torch.int32),
+        block_table=torch.arange(4, dtype=torch.int32).unsqueeze(0),
+        is_valid_token=is_valid,
+        block_size=block_size,
+        window_size=4,
+        index_width=8,
+        num_decode_tokens=6,
+        device=torch.device("cpu"),
+    )
+
+    assert lens.tolist() == [6, 6, 0, 0, 0, 0]
+    assert indices[0, 0, :6].tolist() == [10, 11, 12, 13, 14, 15]
+    assert torch.equal(indices[0], indices[1])
+
+
+def test_noncausal_dspark_clamps_seq_len_to_block_table_capacity():
+    block_size = 4
+    # Model the ilu-only hotfix: an unpatched speculator still marks every
+    # query valid and reports a sequence length beyond block-table capacity.
+    is_valid = torch.ones(6, dtype=torch.bool)
+    indices, lens = build_dspark_noncausal_swa_indices(
+        seq_lens=torch.tensor([18], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 6], dtype=torch.int32),
+        block_table=torch.arange(4, dtype=torch.int32).unsqueeze(0),
+        is_valid_token=is_valid,
+        block_size=block_size,
+        window_size=4,
+        index_width=16,
+        num_decode_tokens=6,
+        device=torch.device("cpu"),
+    )
+
+    assert lens.tolist() == [10, 10, 10, 10, 10, 10]
+    assert indices[0, 0, :10].tolist() == list(range(6, 16))
+    for query_idx in range(1, 6):
+        assert torch.equal(indices[0], indices[query_idx])
+
+
 def test_noncausal_without_dspark_raises():
     builder = _make_builder(is_dspark=False, decode_threshold=8)
     cad = _make_cad(query_lens=[5], seq_lens=[15], causal=False)

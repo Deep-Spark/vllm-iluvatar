@@ -28,6 +28,7 @@ import torch
 import vllm.envs as envs
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
@@ -60,6 +61,8 @@ _LAYER_TYPE_C128A = "c128a"
 # deepseek_v41/sparse_mla.py.
 _LAYER_TYPE_C1A = "c1a"
 _LAYER_TYPE_C2A = "c2a"
+
+logger = init_logger("vllm." + __name__)
 
 
 def build_dspark_noncausal_swa_indices(
@@ -114,15 +117,34 @@ def build_dspark_noncausal_swa_indices(
         if start >= num_decode_tokens:
             break
         end = min(end, num_decode_tokens)
-        query_len = end - start
+        query_len = sum(is_valid_cpu[start:end])
         if query_len <= 0:
             continue
-        seq_len = seq_lens_cpu[req_idx]
+        block_table_row = block_table_cpu[req_idx]
+        # DSpark always prepares a full speculative block, so its draft
+        # sequence length can temporarily extend past the range represented by
+        # the block table near the model-length boundary. Treat that tail as
+        # padding instead of indexing beyond the row.
+        block_table_capacity = len(block_table_row) * block_size
+        raw_seq_len = seq_lens_cpu[req_idx]
+        if raw_seq_len > block_table_capacity:
+            logger.warning(
+                "Clamping DSpark SWA sequence length to block-table capacity: "
+                "req_idx=%d, seq_len=%d, capacity=%d, block_size=%d, "
+                "block_table_cols=%d, valid_query_len=%d",
+                req_idx,
+                raw_seq_len,
+                block_table_capacity,
+                block_size,
+                len(block_table_row),
+                query_len,
+            )
+        seq_len = min(raw_seq_len, block_table_capacity)
         prefix_len = seq_len - query_len
         start_pos = max(prefix_len - window_size, 0)
         positions = list(range(start_pos, seq_len))[:index_width]
         slots = [
-            block_table_cpu[req_idx][p // block_size] * block_size + p % block_size
+            block_table_row[p // block_size] * block_size + p % block_size
             for p in positions
         ]
         slot_t = torch.tensor(slots, dtype=torch.int32, device=device)

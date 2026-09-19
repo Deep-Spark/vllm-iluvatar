@@ -126,6 +126,7 @@ if TYPE_CHECKING:
     VLLM_ILU_FUSE_NORM_QUANT: bool = True
     VLLM_ILU_FUSE_MOE_W13: bool = True
     VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV: bool = True
+    VLLM_ILU_GLM_DSA_FP8_ABSORB_UP: bool = True
     VLLM_ILU_NIXL_WRITE_USE_HOST_BUFFER: bool = False
     VLLM_ILU_NIXL_HOST_DTYPE: str = "auto"
     VLLM_ILU_NIXL_PROXY_ADDR: str = ""
@@ -337,6 +338,13 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Default on; requires FP8 KV + frozen scale + ixformer op. Set 0 to disable.
     "VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV": _bool_reader(
         "VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV", "1"
+    ),
+    # GLM DSA official-FP8 checkpoint: run the absorbed k-up / v-up as fp8
+    # (fp8_grouped_per_token_quant + fp8_per_channel_einsum) instead of BF16
+    # grouped einsums off a dequantised kv_b_proj. Default on; set 0 for the
+    # BF16 A/B baseline. Ignored by the W4A8 (marlin) path.
+    "VLLM_ILU_GLM_DSA_FP8_ABSORB_UP": _bool_reader(
+        "VLLM_ILU_GLM_DSA_FP8_ABSORB_UP", "1"
     ),
     # GLM DSA 640B fp8 packed KV scale. A non-empty float applies the SAME
     # scale to every layer (not per-layer). Prefer PATH for per-layer JSON

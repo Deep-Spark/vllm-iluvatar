@@ -646,6 +646,13 @@ def preprocess_fp8_block_weight_for_ixmm(
     verbatim, which is what guarantees the output is byte-compatible with the
     MXFP4/NVFP4 ix30 tensors the compute path already accepts.
 
+    This is the bulk path: it runs once in ``process_weights_after_loading``,
+    with the whole FP8 layer resident. MoE also has a load-time path
+    (``ilu_fp8_to_fp4_moe.py``) that converts each checkpoint shard as it
+    lands, through ixformer's ``preprocess_fp8_block_weight_for_ixmm`` op.
+    Both produce the same bytes -- ``test_ilu_fp8_to_fp4_moe.py`` asserts it --
+    so the two can be compared directly when debugging.
+
     Args:
         weight:           ``[E, n, k]`` float8_e4m3fn (un-packed).
         weight_scale_inv: ``[E, ceil(n/bn), ceil(k/bk)]`` float32 block scale.

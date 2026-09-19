@@ -42,9 +42,16 @@ if TYPE_CHECKING:
 
 
 # Target causal-LM arch -> ilu MTP draft arch.
+#
+# ``GlmMoeDsaForCausalLM`` is the *community* arch name, declared by the official
+# ZhipuAI FP8 checkpoint (the W4A8 fork renames itself to ``Ilu...``). Community
+# routes it to the generic ``DeepSeekMTPModel``, which real DeepSeek checkpoints
+# share, so the FP8 GLM draft has to be re-pointed here rather than by
+# overriding that name in the registry.
 _ILU_MTP_ARCH_MAP = {
     "DeepseekV32ForCausalLM": "DeepseekV32MTPModel",
     "IluGlmMoeDsaForCausalLM": "IluGlmMoeDsaMTPModel",
+    "GlmMoeDsaForCausalLM": "IluGlmMoeDsaFp8MTPModel",
     "IluDeepseekV4ForCausalLM": "IluDeepSeekV4MTPModel",
 }
 

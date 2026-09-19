@@ -83,6 +83,7 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
     IluFusedMoEEP,
+    set_max_num_seqs_from_config,
 )
 from vllm_iluvatar.model_executor.layers.quantization import IluvatarQuantRegistry
 from vllm_iluvatar.models.glm_moe_dsa.attention import (
@@ -427,6 +428,16 @@ class IluGlmMoeDsaMoE(nn.Module, IluFusedMoEEP):
 
 
 class IluGlmMoeDsaDecoderLayer(nn.Module):
+    # Swapped by the FP8 variant (``fp8_model.py``) to avoid duplicating
+    # ``__init__``; W4A8 behaviour is unchanged.
+    mla_attention_cls: type[IluGlmMoeDsaMLAAttention] = IluGlmMoeDsaMLAAttention
+
+    # Emit the fused RMSNorm+INT8 triple ``(q, scales, dtype|normed)`` from
+    # ``forward``. Only INT8 consumers can unpack it, so the FP8 variant turns
+    # this off and every downstream layer takes its plain-tensor path -- the
+    # same path W4A8 already falls back to when the ixformer op is unavailable.
+    fuse_norm_quant: bool = True
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -444,7 +455,7 @@ class IluGlmMoeDsaDecoderLayer(nn.Module):
         layer_idx = int(prefix.split(sep=".")[-1])
         self.layer_idx = layer_idx
 
-        self.self_attn = IluGlmMoeDsaMLAAttention(
+        self.self_attn = self.mla_attention_cls(
             vllm_config=vllm_config,
             config=config,
             hidden_size=self.hidden_size,
@@ -514,12 +525,16 @@ class IluGlmMoeDsaDecoderLayer(nn.Module):
         # --- input layernorm (+ fused INT8 for attn W8A8) ---
         # Always return_normed so indexer can consume BF16 while W8A8 gemm
         # uses the int8 tuple (unpacked in attention.forward).
-        fused = _residual_rms_norm_with_quant(
-            hidden_states,
-            residual,
-            self.input_layernorm.weight,
-            self.input_layernorm.variance_epsilon,
-            return_normed=True,
+        fused = (
+            _residual_rms_norm_with_quant(
+                hidden_states,
+                residual,
+                self.input_layernorm.weight,
+                self.input_layernorm.variance_epsilon,
+                return_normed=True,
+            )
+            if self.fuse_norm_quant
+            else None
         )
 
         if fused is not None:
@@ -537,12 +552,16 @@ class IluGlmMoeDsaDecoderLayer(nn.Module):
 
         # --- post-attn layernorm (+ fused INT8 for dense/MoE) ---
         out_dtype = residual.dtype
-        fused = _residual_rms_norm_with_quant(
-            hidden_states,
-            residual,
-            self.post_attention_layernorm.weight,
-            self.post_attention_layernorm.variance_epsilon,
-            return_normed=self.is_moe_layer,
+        fused = (
+            _residual_rms_norm_with_quant(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+                return_normed=self.is_moe_layer,
+            )
+            if self.fuse_norm_quant
+            else None
         )
 
         if fused is not None:
@@ -563,6 +582,9 @@ class IluGlmMoeDsaDecoderLayer(nn.Module):
 
 class IluGlmMoeDsaModel(nn.Module):
     fall_back_to_pt_during_load = False
+
+    # Swapped by the FP8 variant (``fp8_model.py``).
+    decoder_layer_cls: type[IluGlmMoeDsaDecoderLayer] = IluGlmMoeDsaDecoderLayer
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -594,7 +616,7 @@ class IluGlmMoeDsaModel(nn.Module):
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: IluGlmMoeDsaDecoderLayer(
+            lambda prefix: self.decoder_layer_cls(
                 vllm_config=vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
@@ -787,6 +809,7 @@ class IluGlmMoeDsaForCausalLM(nn.Module, SupportsPP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
+        set_max_num_seqs_from_config(vllm_config)
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config

@@ -68,6 +68,10 @@ logger = init_logger(__name__)
 
 
 class IluGlmMoeDsaMultiTokenPredictorLayer(nn.Module):
+    # Overridden by the FP8 fork (:mod:`.fp8_mtp`) so the draft block reuses
+    # whichever decoder layer the target model is running.
+    decoder_layer_cls = IluGlmMoeDsaDecoderLayer
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -99,7 +103,7 @@ class IluGlmMoeDsaMultiTokenPredictorLayer(nn.Module):
         # The ilu self-contained decoder layer (MLA + DSA indexer + MoE). Passing
         # the layer prefix (ending in the numeric MTP layer index) keeps
         # ``int(prefix.split('.')[-1])`` == the MTP layer id (>= num_hidden_layers).
-        self.mtp_block = IluGlmMoeDsaDecoderLayer(
+        self.mtp_block = self.decoder_layer_cls(
             vllm_config=vllm_config,
             prefix=prefix,
             topk_indices_buffer=topk_indices_buffer,
@@ -137,6 +141,8 @@ class IluGlmMoeDsaMultiTokenPredictorLayer(nn.Module):
 
 
 class IluGlmMoeDsaMultiTokenPredictor(nn.Module):
+    predictor_layer_cls = IluGlmMoeDsaMultiTokenPredictorLayer
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -158,7 +164,7 @@ class IluGlmMoeDsaMultiTokenPredictor(nn.Module):
         # Map the exact layer index from weights.
         self.layers = torch.nn.ModuleDict(
             {
-                str(idx): IluGlmMoeDsaMultiTokenPredictorLayer(
+                str(idx): self.predictor_layer_cls(
                     vllm_config,
                     self.topk_indices_buffer,
                     f"{prefix}.layers.{idx}",
@@ -245,11 +251,13 @@ class IluGlmMoeDsaMultiTokenPredictor(nn.Module):
 class IluGlmMoeDsaMTP(nn.Module, SupportsPP):
     """Top-level ilu GLM-5.2 W4A8 MTP draft model (``IluGlmMoeDsaMTPModel``)."""
 
+    predictor_cls = IluGlmMoeDsaMultiTokenPredictor
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
-        self.model = IluGlmMoeDsaMultiTokenPredictor(
+        self.model = self.predictor_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
 

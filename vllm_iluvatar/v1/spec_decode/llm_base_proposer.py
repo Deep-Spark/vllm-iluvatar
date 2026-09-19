@@ -21,7 +21,12 @@ from collections.abc import Callable
 
 # Ilu MTP draft archs that follow the DeepSeek-family (logit, recycle) tuple
 # forward contract.
-_ILU_TUPLE_MTP_ARCHS = ("IluGlmMoeDsaMTPModel", "DeepseekV32MTPModel")
+_ILU_TUPLE_MTP_ARCHS = (
+    "IluGlmMoeDsaMTPModel",
+    # Subclasses IluGlmMoeDsaMTP, so same forward contract.
+    "IluGlmMoeDsaFp8MTPModel",
+    "DeepseekV32MTPModel",
+)
 
 
 def make_model_returns_tuple(orig: Callable[..., bool]) -> Callable[..., bool]:

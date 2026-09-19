@@ -903,7 +903,12 @@ class IluGlmMoeDsaMLAAttention(nn.Module):
     norms, the DSA indexer (:class:`IluGlmMoeDsaIndexer` driving the shared
     plugin ``SparseAttnIndexer``), the inner :class:`IluGlmMoeDsaSparseMLA`
     and ``o_proj``. No community wrapper / ``MLAAttention`` in the chain.
+
+    ``sparse_mla_cls`` lets the FP8 variant swap in its own inner attention
+    (see ``fp8_attention.py``) without duplicating this ``__init__``.
     """
+
+    sparse_mla_cls: type[IluGlmMoeDsaSparseMLA] = IluGlmMoeDsaSparseMLA
 
     def __init__(
         self,
@@ -1032,7 +1037,7 @@ class IluGlmMoeDsaMLAAttention(nn.Module):
         else:
             self.indexer = None
 
-        self.mla_attn = IluGlmMoeDsaSparseMLA(
+        self.mla_attn = self.sparse_mla_cls(
             num_heads=self.num_local_heads,
             scale=self.scaling,
             qk_nope_head_dim=self.qk_nope_head_dim,

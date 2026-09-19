@@ -48,8 +48,13 @@ checkpoint 本身**没有** `quantization_config` 时，还要显式加
    - [加载契约](#71-加载契约)
    - [启动命令](#72-启动命令)
    - [实测计数与性能](#73-实测计数与性能)
-8. [故障定位](#8-故障定位)
-9. [附录](#9-附录)
+8. [GLM-5.2 示例：MoE 的加载期 FP8 → FP4](#8-glm-52-示例moe-的加载期-fp8--fp4)
+   - [为什么需要 weight_load](#81-为什么需要-weight_load)
+   - [加载契约](#82-加载契约)
+   - [启动命令](#83-启动命令)
+   - [不支持的组合](#84-不支持的组合)
+9. [故障定位](#9-故障定位)
+10. [附录](#10-附录)
 
 ---
 
@@ -268,7 +273,8 @@ group / block 等方案可由 method 要求额外字段。
 `weights.loading.stage`：
 
 - `none`；
-- `process_weights_after_loading`。
+- `process_weights_after_loading`：所有权重加载完成后整层转换；
+- `weight_load`：**每个 checkpoint shard 落地即转换**。
 
 合法组合为：
 
@@ -276,11 +282,29 @@ group / block 等方案可由 method 要求额外字段。
 direct + none
 direct + process_weights_after_loading
 transform + process_weights_after_loading
+transform + weight_load
 ```
 
-`transform + none` 永远非法。当前只有
-`IluFp8PerChannelOnlineLinearMethod` 实现 runtime factory，且只支持第三种
-组合；schema 对 `direct` 的支持不代表已有 method 实现了它。
+`transform + none` 和 `direct + weight_load` 永远非法（前者没有转换时机，
+后者没有要转换的东西）。
+
+两个 `transform` stage 的区别只有峰值显存，最终权重逐字节相同：
+
+| | `process_weights_after_loading` | `weight_load` |
+| --- | --- | --- |
+| 转换时机 | 全部 shard 到齐后 | 每个 shard 到达时 |
+| 峰值额外显存 | 整层 source + 整层 target | 一个 expert 的 source（MoE） |
+| 实现难度 | 低，读现成的完整参数 | 高，要自己接管 `weight_loader` |
+| 何时需要 | 默认 | 整层 source 装不下（大 MoE 的 TP 部署） |
+
+已实现 runtime factory 的 method：
+
+| method | 组合 | 层类型 |
+| --- | --- | --- |
+| `IluFp8PerChannelOnlineLinearMethod` | `transform + process_weights_after_loading` | Linear |
+| `IluFp8ToFp4OnlineMoEMethod` | `transform + weight_load` | RoutedExperts |
+
+schema 对 `direct` 的支持不代表已有 method 实现了它。
 
 #### 激活
 
@@ -536,7 +560,98 @@ GSM8K 低 0.5～0.7 个点（1319 题里 9 题，约 1.4σ），GPQA 反而高 3
 的 1σ 就有 3.3 个点），两个方向都在噪声量级，没有系统性掉点。批量并发下的输出
 吞吐两者相当——单请求 TP2 的 15% 差距在 batch 里被摊掉了。
 
-## 8. 故障定位
+## 8. GLM-5.2 示例：MoE 的加载期 FP8 → FP4
+
+前两个示例都是 Linear 层的 `transform + process_weights_after_loading`。
+这一个不同：它改的是 **routed experts**，而且用的是
+`transform + weight_load`——**唯一因为显存放不下才必须用的 stage**。
+
+### 8.1 为什么需要 `weight_load`
+
+GLM-5.2 的 routed experts 是 block-FP8，今天走 `IluFp8MoEMethod`：
+FP8 权重一直常驻，等 `process_weights_after_loading` 再整层转成 ix30 FP4。
+FP4 只有 FP8 的约 1/4，所以**稳态完全放得下，放不下的是那一瞬间**——
+同一时刻 FP8 原件和 FP4 结果都在显存里。TP8 因此起不来，只能用 16 卡。
+
+`weight_load` 把转换提前到每个 shard 落地时：社区 loader 把 FP8 shard 写进一个
+单 expert 的 staging（几 MiB），转换器直接写进常驻的 FP4 参数，staging 立刻释放。
+峰值额外显存从"整层 FP8"降到"一个 expert 的 FP8"。
+
+产出的四个参数与旧路径**逐字节相同**，
+[`test_ilu_fp8_to_fp4_moe.py`](../../tests/model_executor/layers/quantization/test_ilu_fp8_to_fp4_moe.py)
+在 TP1 / TP2 两个 rank / EP 下都做了对拍，所以精度结论可以直接继承，
+不需要重跑一遍评测。
+
+### 8.2 加载契约
+
+```yaml
+weights:
+  source:
+    format: fp8-block
+    dtypes: [float8_e4m3fn]
+    block_shape: [128, 128]
+  target:
+    format: ix30-fp4
+    dtype: uint8
+    strategy: group
+    group_size: 256
+    scale_format: running_acc
+  loading:
+    mode: transform
+    stage: weight_load
+iluvatar:
+  method: IluFp8ToFp4OnlineMoEMethod
+  converter_backend: auto
+  max_pending_shards: 8
+```
+
+与前两个示例的三处关键差异：
+
+1. **`require.original_disposition` 是 `quantized` 而不是 `ignored`**。
+   checkpoint 本来就被 `IluFp8Config` 认成 block-FP8 MoE，这里是替换它选中的
+   method，不是给一个被 ignore 的层补量化。
+2. **`targets` 指向 MoE 容器本身**（`re:.*\.mlp\.experts$`），不是里面的
+   Linear。一个 target 覆盖 backbone 75 层 + MTP 1 层。
+3. **`block_shape` 写在 `source.extra` 里**。它必须与 checkpoint
+   `quantization_config.weight_block_size` 一致，不一致就报错——避免 checkpoint
+   换块大小后被静默按旧值换算。
+
+两个 method-specific option：
+
+| option | 取值 | 含义 |
+| --- | --- | --- |
+| `converter_backend` | `auto`（默认）/ `torch` / `ixformer_native` | 直接透传给 ixformer registry 的 `backend=`。`torch` 是纯 PyTorch 参考实现，慢但确定；做等价性对拍时两边必须用同一个 backend |
+| `max_pending_shards` | 正整数，默认 8 | 允许同时"只到了权重或只到了 scale"的 shard 数上限 |
+
+`max_pending_shards` 是显存护栏而不是性能旋钮：每个半配对的 shard 都钉着一个
+FP8 staging，堆积就等于回到了这条路径要避免的峰值。顺序 loader 下权重和 scale
+紧邻到达，峰值只有个位数；超限说明 checkpoint 的到达顺序和假设不同，
+报错会打印卡住的 `(group, local_expert, shard)`。
+
+### 8.3 启动命令
+
+checkpoint 自带 `quantization_config`，**不要**传 `--quantization`：
+
+```bash
+vllm serve /path/to/GLM-5.2-FP8 \
+  --config examples/iluvatar-runtime-quant/ZhipuAI/GLM-5.2/fp4-moe-inline.yaml \
+  --tensor-parallel-size 8 \
+  --trust-remote-code
+```
+
+去掉 `--config` 就回到今天的行为。两条路径在代码里并存、互不引用，
+`IluFp8MoEMethod` 的 compute 路径一行没改（新 method 继承它）。
+
+### 8.4 不支持的组合
+
+`create_weights` 里一律 fail-fast，不静默降级：带 bias 的 expert、
+padding 过的 hidden dim 或 intermediate size、融合成 3D 的 expert 张量、
+`is_transposed` 参数、BitsAndBytes、static input scale、EPLB、
+以及非顺序的 `load_format`。
+
+---
+
+## 9. 故障定位
 
 - `does not apply to model_type/quant_method`：配置用于了错误模型或基础量化类型。
 - `multiple ilu_quant groups`：多个命中 group 的最高 priority 相同。
@@ -555,11 +670,28 @@ GSM8K 低 0.5～0.7 个点（1319 题里 9 题，约 1.4σ），GPQA 反而高 3
 - **服务正常起来但一条量化日志都没有**：checkpoint 没有 `quantization_config`
   且忘了 `--quantization ilu_runtime`，`ilu_quant` 整块被跳过。见 §3.1。
 
+`weight_load` stage 专有（§8）：
+
+- `half-loaded expert shards exceed max_pending_shards`：权重和 scale 不是紧邻
+  到达，staging 正在堆积。报错里列出了卡住的 `(group, local_expert, shard)`；
+  先确认 `load_format` 是顺序 loader，再考虑调高上限——调高就等于接受更高的
+  加载峰值。
+- `expert shards were never converted to FP4`：某些 shard 只到了一半（通常是
+  checkpoint 缺 `*_weight_scale_inv`，或 `make_expert_params_mapping` 没生成
+  scale 条目）。此时参数里还是未初始化的字节，所以直接报错而不是放行。
+- `requires a sequential weight loader`：`load_format` 可能并发喂 shard，会和
+  staging 竞态。
+- `does not support ...`（bias / padded hidden dim / EPLB / 3-D expert tensor）：
+  见 §8.4，这些组合在 `create_weights` 就被拒绝。
+- **转换很慢**：`converter_backend` 落到了 `torch`。ixformer 的 registry 在形状
+  不满足 `n % 128 == 0 && k % 256 == 0` 时会自动回落 torch backend；用
+  `IXFORMER_LOG_LEVEL` 看 registry 的选择。
+
 ---
 
-## 9. 附录
+## 10. 附录
 
-### 9.1 关键文件
+### 10.1 关键文件
 
 | 作用 | 文件 |
 | --- | --- |
@@ -567,11 +699,15 @@ GSM8K 低 0.5～0.7 个点（1319 题里 9 题，约 1.4σ），GPQA 反而高 3
 | 未量化 checkpoint 的基础 config | [`ilu_runtime_quant_base.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime_quant_base.py) |
 | method 注册表 | [`ilu_quant_registry.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_quant_registry.py) |
 | FP8 基础 config 与 online Linear method | [`ilu_fp8.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_fp8.py) |
+| FP8 source layout 与 ix30 FP4 转换入口 | [`ilu_fp8_to_fp4.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_fp8_to_fp4.py) |
+| MoE 加载期 FP4 method | [`ilu_fp8_to_fp4_moe.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_fp8_to_fp4_moe.py) |
+| 转换算子（双 backend，在 ixformer） | `ixformer/inference/functions/fp4/gemm/fp8_block_preprocess.py` |
 | Qwen3.8-Flash-Next 示例 | [`examples/iluvatar-runtime-quant/Qwen/Qwen3.8-Flash-Next/`](../../examples/iluvatar-runtime-quant/Qwen/Qwen3.8-Flash-Next/) |
 | Qwen3.8-27B 示例（未量化 checkpoint） | [`examples/iluvatar-runtime-quant/Qwen/Qwen3.8-27B/`](../../examples/iluvatar-runtime-quant/Qwen/Qwen3.8-27B/) |
+| GLM-5.2 示例（MoE 加载期 FP4） | [`examples/iluvatar-runtime-quant/ZhipuAI/GLM-5.2/`](../../examples/iluvatar-runtime-quant/ZhipuAI/GLM-5.2/) |
 | 派生目录生成器（模式 A） | [`qwen38_flash_next_fp8_online.py`](../../examples/iluvatar-compressed-tensors/qwen38_flash_next_fp8_online.py) |
 
-### 9.2 步骤速览
+### 10.2 步骤速览
 
 1. **确认 checkpoint**：顶层 `quant_method` 仍是原值（如 `fp8`）；候选层在磁盘上
    是 BF16，且被原 ignore 列表排除。完全没有 `quantization_config` 时，改用

@@ -860,10 +860,16 @@ class IluGlmMoeDsaForCausalLM(nn.Module, SupportsPP):
         # only runs this when ``model_config.quantization is None``; we must do it ourselves so a
         # missing scale / name-mapping does not silently fall back to init.
         expected: set[str] = set()
-        for name, _ in self.named_parameters():
+        for name, param in self.named_parameters():
             if any(s in name for s in self._LOAD_SKIP_SUBSTRS):
                 continue
             if is_pp_missing_parameter(name, self):
+                continue
+            # Load-time quantisation derives some parameters from others rather
+            # than from a checkpoint tensor (e.g. the FP4 group scales, computed
+            # while a shard is converted). The quant method verifies those
+            # itself; the checkpoint has nothing to map onto them.
+            if getattr(param, "ilu_derived_at_load", False):
                 continue
             expected.add(name)
 

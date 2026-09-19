@@ -1,0 +1,77 @@
+# ZhipuAI/GLM-5.2-FP8 routed experts: block-FP8 -> ix30 FP4 during weight load
+#
+# 该 checkpoint 自带 quantization_config（fp8），所以**不要**传 --quantization：
+#
+#   vllm serve /newdata/nlp/ZhipuAI/GLM-5.2-FP8 \
+#     --config examples/iluvatar-runtime-quant/ZhipuAI/GLM-5.2/fp4-moe-inline.yaml \
+#     --tensor-parallel-size 8 --trust-remote-code
+#
+# 不给这份 --config 就是今天的行为（IluFp8MoEMethod：FP8 常驻到
+# process_weights_after_loading 再整层转 FP4）。两条路径在代码里并存。
+#
+# 作用范围只有 routed experts：attention / dense MLP / shared expert / MTP 的
+# 非 MoE 部分都不在 targets 里，走原本的 IluFp8LinearMethod。
+# targets 的正则同时命中 backbone 的 75 层和 MTP 的 1 层。
+additional-config:
+  ilu_quant:
+    source: inline
+    schema_version: 1
+    enabled: true
+    applies_to:
+      model_types: [glm_moe_dsa]
+      quant_methods: [fp8]
+    ignore: []
+    config_groups:
+      glm52_moe_fp8_to_ix30_fp4:
+        priority: 100
+        targets:
+          - 're:.*\.mlp\.experts$'
+        require:
+          # checkpoint 本来就被 IluFp8Config 识别成 block-FP8 MoE，
+          # 所以这里是 quantized 而不是 ignored。
+          original_disposition: quantized
+          checkpoint_dtypes: [float8_e4m3fn]
+        weights:
+          source:
+            format: fp8-block
+            dtypes: [float8_e4m3fn]
+            # 与 config.json 的 quantization_config.weight_block_size 一致；
+            # 写出来是为了让配置在 checkpoint 改块大小时报错而不是静默换算。
+            block_shape: [128, 128]
+          target:
+            format: ix30-fp4
+            dtype: uint8
+            strategy: group
+            group_size: 256
+            scale_format: running_acc
+          loading:
+            mode: transform
+            # weight_load：每个 shard 落地即转换，而不是等全部权重加载完。
+            # 峰值显存因此从"整层 FP8 + 整层 FP4"降到"一个 expert 的 FP8"。
+            stage: weight_load
+        input_activations:
+          num_bits: 8
+          type: float
+          strategy: token
+          dynamic: true
+        output_activations: null
+        iluvatar:
+          method: IluFp8ToFp4OnlineMoEMethod
+          # 直接透传给 ixformer registry 的 backend=：
+          #   auto            registry 选（ivcore30 上是 ixformer_native）
+          #   torch           纯 PyTorch 参考实现，慢但确定
+          #   ixformer_native CUDA kernel
+          # 等价性对拍时两边要用同一个 backend。
+          converter_backend: auto
+          # 只等到 weight 和 scale 配对就转换。超过这个数说明 checkpoint 不是
+          # 按"权重紧跟 scale"的顺序到达，staging 正在堆积——那正是这条路径要
+          # 避免的显存峰值，所以直接报错并打印卡住的 (group, expert, shard)。
+          max_pending_shards: 8
+        # validation 与 TP/EP 绑定（每张卡命中的层数一样，但 expert 数不同），
+        # 这里留空以便同一份配置在 TP8 与 16 卡 EP 下都能用。
+        # 固定部署后取消注释，把审计变成硬断言：
+        #   selected=76 transformed=76 fallback=0  （backbone 75 + MTP 1）
+        # validation:
+        #   expected_selected: 76
+        #   expected_transformed: 76
+        #   expected_fallback: 0

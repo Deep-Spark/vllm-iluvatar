@@ -435,10 +435,14 @@ def _parse_group(group_id: str, value: object) -> IluRuntimeQuantGroup:
     stage = _string(loading_data["stage"], f"{group_id}.weights.loading.stage")
     if mode not in {"direct", "transform"}:
         raise ValueError(f"{group_id}: invalid loading mode {mode!r}")
-    if stage not in {"none", "process_weights_after_loading"}:
+    if stage not in {"none", "process_weights_after_loading", "weight_load"}:
         raise ValueError(f"{group_id}: invalid loading stage {stage!r}")
     if mode == "transform" and stage == "none":
         raise ValueError(f"{group_id}: transform + none is not supported")
+    if mode == "direct" and stage == "weight_load":
+        # weight_load means "the method converts each shard as it lands", which
+        # only makes sense when source and target formats differ.
+        raise ValueError(f"{group_id}: direct + weight_load is not supported")
 
     ilu_data = _mapping(data["iluvatar"], f"{group_id}.iluvatar")
     if "method" not in ilu_data:

@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "enabled": true,
+  "applies_to": {
+    "model_types": ["glm_moe_dsa"],
+    "quant_methods": ["fp8"]
+  },
+  "ignore": [],
+  "config_groups": {
+    "glm52_moe_fp8_to_ix30_fp4": {
+      "priority": 100,
+      "targets": [
+        "re:.*\\.mlp\\.experts$"
+      ],
+      "require": {
+        "original_disposition": "quantized",
+        "checkpoint_dtypes": ["float8_e4m3fn"]
+      },
+      "weights": {
+        "source": {
+          "format": "fp8-block",
+          "dtypes": ["float8_e4m3fn"],
+          "block_shape": [128, 128]
+        },
+        "target": {
+          "format": "ix30-fp4",
+          "dtype": "uint8",
+          "strategy": "group",
+          "group_size": 256,
+          "scale_format": "running_acc"
+        },
+        "loading": {
+          "mode": "transform",
+          "stage": "weight_load"
+        }
+      },
+      "input_activations": {
+        "num_bits": 8,
+        "type": "float",
+        "strategy": "token",
+        "dynamic": true
+      },
+      "output_activations": null,
+      "iluvatar": {
+        "method": "IluFp8ToFp4OnlineMoEMethod",
+        "converter_backend": "auto",
+        "max_pending_shards": 8
+      }
+    }
+  }
+}

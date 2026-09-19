@@ -718,6 +718,42 @@ def preprocess_fp8_block_weight_for_ixmm(
     return ixmm_weight, ixmm_scale
 
 
+def _shrink_ll_max_tokens_to_decode(
+    prepare_finalize: FusedMoEPrepareAndFinalizeModular,
+) -> None:
+    """Size the batched expert layout for decode instead of prefill.
+
+    The community all2all factory builds DeepEP LL with
+    ``moe_config.max_num_tokens`` -- the prefill bound
+    (``max_num_batched_tokens``). When LL only carries decode (a
+    ``VLLM_ILU_DECODE_EP_BACKEND`` override on top of a non-LL configured
+    backend) the real bound is the uniform decode batch, which is also what the
+    NVSHMEM buffer in ``ilu_fused_moe_ep`` is built for. The batched layout
+    holds ``max_tokens_per_rank * num_dispatchers`` rows per expert, so keeping
+    the prefill bound costs GiBs of workspace and output per captured graph.
+    """
+    from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
+        _DS4_DECODE_EP_BACKEND,
+        _decode_ll_max_tokens_per_rank,
+    )
+
+    if _DS4_DECODE_EP_BACKEND != "deepep_low_latency":
+        return
+
+    current = getattr(prepare_finalize, "max_tokens_per_rank", None)
+    decode_max = _decode_ll_max_tokens_per_rank()
+    if current is None or decode_max >= current:
+        return
+
+    prepare_finalize.max_tokens_per_rank = decode_max
+    logger.info_once(
+        "Sized DeepEP LL batched experts for decode: max_tokens_per_rank "
+        "%d -> %d, matching the NVSHMEM dispatch buffer.",
+        current,
+        decode_max,
+    )
+
+
 @IluvatarQuantRegistry.register_method
 class IluFp8MoEMethod(Fp8MoEMethod):
     """Block-FP8 routed-expert method backed by ``ilu_mxfp4_fused_experts()``."""
@@ -824,6 +860,7 @@ class IluFp8MoEMethod(Fp8MoEMethod):
                 "IluMoEBatchedExpertsFp8 requires the batched activation format, "
                 f"got {prepare_finalize.activation_format}"
             )
+        _shrink_ll_max_tokens_to_decode(prepare_finalize)
         max_num_tokens = prepare_finalize.max_num_tokens_per_rank()
         if max_num_tokens is None:
             raise ValueError("batched FP8 experts require max_num_tokens")

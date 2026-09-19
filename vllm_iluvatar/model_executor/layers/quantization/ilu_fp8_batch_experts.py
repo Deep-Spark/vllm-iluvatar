@@ -18,6 +18,13 @@ from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compres
 class IluMoEBatchedExpertsFp8(BaseBatchExperts):
     """Run ix30 FP4 weights with FP8 activations in batched expert layout."""
 
+    # Shared by every MoE layer: expert chains run one layer at a time, so a
+    # single set of intermediates serves the whole model. Row counts come from
+    # the batched dispatch layout, which is fixed for the life of the engine,
+    # so the buffers are allocated once during warmup and never resized under
+    # a captured graph.
+    _scratch_cache: dict[str, torch.Tensor] = {}
+
     def __init__(
         self,
         moe_config: FusedMoEConfig,
@@ -38,6 +45,26 @@ class IluMoEBatchedExpertsFp8(BaseBatchExperts):
             max_num_tokens=max_num_tokens,
             num_dispatchers=num_dispatchers,
         )
+
+    def _scratch(
+        self,
+        name: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        buf = self._scratch_cache.get(name)
+        if (
+            buf is None
+            or buf.dtype != dtype
+            or buf.device != device
+            or buf.ndim != len(shape)
+            or buf.shape[1:] != shape[1:]
+            or buf.shape[0] < shape[0]
+        ):
+            buf = torch.empty(shape, dtype=dtype, device=device)
+            self._scratch_cache[name] = buf
+        return buf[: shape[0]]
 
     def apply(
         self,
@@ -70,9 +97,7 @@ class IluMoEBatchedExpertsFp8(BaseBatchExperts):
         if expert_tokens_meta is None:
             raise ValueError("expert_tokens_meta is required for batched FP8 MoE")
         if hidden_states.ndim not in (2, 3):
-            raise ValueError(
-                "IluMoEBatchedExpertsFp8 expects 2D or batched 3D input"
-            )
+            raise ValueError("IluMoEBatchedExpertsFp8 expects 2D or batched 3D input")
         num_experts = w1.shape[0]
         if hidden_states.ndim == 2:
             if hidden_states.shape[0] % num_experts != 0:
@@ -91,8 +116,14 @@ class IluMoEBatchedExpertsFp8(BaseBatchExperts):
 
         max_num_tokens_per_expert = hidden_states.shape[1]
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+        rows, hidden_size = hidden_states.shape
+        device = hidden_states.device
         if hidden_states.dtype in (torch.float16, torch.bfloat16):
-            hidden_states, a1q_scale = ixff.scaled_fp8_quant(hidden_states)
+            hidden_states, a1q_scale = ixff.dynamic_scaled_fp8_quant(
+                self._scratch("a1q", (rows, hidden_size), torch.float8_e4m3fn, device),
+                hidden_states,
+                self._scratch("a1q_scale", (rows, 1), torch.float32, device),
+            )
         elif hidden_states.dtype == torch.float8_e4m3fn:
             if a1q_scale is None:
                 raise ValueError("a1q_scale is required for FP8 dispatched inputs")
@@ -104,11 +135,15 @@ class IluMoEBatchedExpertsFp8(BaseBatchExperts):
         a1q_scale = a1q_scale.reshape(-1)
         output_2d = output.reshape(-1, output.shape[-1])
 
-        expert_num_tokens = expert_tokens_meta.expert_num_tokens.to(
-            device=hidden_states.device,
-            dtype=torch.int32,
-            non_blocking=True,
-        ).reshape(-1).contiguous()
+        expert_num_tokens = (
+            expert_tokens_meta.expert_num_tokens.to(
+                device=hidden_states.device,
+                dtype=torch.int32,
+                non_blocking=True,
+            )
+            .reshape(-1)
+            .contiguous()
+        )
         if expert_num_tokens.numel() != num_experts:
             raise ValueError(
                 f"expert_num_tokens must have {num_experts} values, "
@@ -117,14 +152,20 @@ class IluMoEBatchedExpertsFp8(BaseBatchExperts):
         group_layout = ixff.moe_make_padded_dense_tokens_per_experts_fp8(
             expert_num_tokens=expert_num_tokens,
             max_num_tokens_per_expert=max_num_tokens_per_expert,
+            group_layout=self._scratch(
+                "group_layout", (num_experts, 2), torch.int32, device
+            ),
         )
 
+        # ix30-packed w1 is [expert, k/2, 2 * intermediate].
+        inter_x2 = w1.shape[2]
         gemm1_output = ixff.group_gemm_fp4(
             a=hidden_states,
             scale_a=a1q_scale,
             weight=w1,
             scale_weight=self.w1_scale,
             group_layout=group_layout,
+            output=self._scratch("gemm1", (rows, inter_x2), torch.bfloat16, device),
             backend="ixmm",
         )
 
@@ -141,6 +182,10 @@ class IluMoEBatchedExpertsFp8(BaseBatchExperts):
             max_num_tokens_per_expert=max_num_tokens_per_expert,
             act_type=act_type,
             limit=self.swiglu_limit,
+            output=self._scratch(
+                "act", (rows, inter_x2 // 2), torch.float8_e4m3fn, device
+            ),
+            output_scales=self._scratch("act_scale", (rows,), torch.float32, device),
         )
 
         ixff.group_gemm_fp4(

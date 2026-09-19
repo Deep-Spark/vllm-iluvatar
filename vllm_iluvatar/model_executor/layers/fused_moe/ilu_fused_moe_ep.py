@@ -41,6 +41,7 @@ from vllm.distributed import (
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 from vllm_iluvatar.model_executor.layers.fused_moe.prepare_finalize.ilu_deepep_ll import (
     VLLM_ILU_DEEPEP_USE_SCATTER,
@@ -62,6 +63,13 @@ def set_max_num_seqs(max_num_seqs: int) -> None:
     _MAX_NUM_SEQS = max_num_seqs
 
 
+def set_max_num_seqs_from_config(vllm_config) -> None:
+    # Keep the cached fallback identical to the value _get_max_num_seqs()
+    # derives when the vllm_config context is still active, so DeepEP LL
+    # buffers are sized the same way during CUDA graph capture.
+    set_max_num_seqs(_decode_max_tokens_per_rank_from_config(vllm_config))
+
+
 def _decode_max_tokens_per_rank_from_config(vllm_config) -> int:
     # Uniform decode query length is (1 + num_speculative_tokens). With MTP
     # enabled, each seq can contribute multiple tokens per decode step.
@@ -73,6 +81,21 @@ def _decode_max_tokens_per_rank_from_config(vllm_config) -> int:
             getattr(speculative_config, "num_speculative_tokens", 0) or 0
         )
     return max_num_seqs * (1 + num_spec_tokens)
+
+
+def _decode_ll_max_tokens_per_rank() -> int:
+    """Token slots each rank can receive through the low-latency dispatch.
+
+    The LL path only carries decode steps (prefill goes through AG-RS / HT), so
+    the bound is the uniform decode batch rather than ``max_num_batched_tokens``.
+    After TP scatter / fused AG-AR each rank only holds a shard; ceil division
+    matches the uneven chunking in flatten().
+    """
+    max_tokens_per_rank = _get_max_num_seqs()
+    if VLLM_ILU_LL_FUSED_AG_AR or VLLM_ILU_DEEPEP_USE_SCATTER:
+        tp_size = get_tensor_model_parallel_world_size()
+        max_tokens_per_rank = (max_tokens_per_rank + tp_size - 1) // tp_size
+    return max_tokens_per_rank
 
 
 def _get_max_num_seqs() -> int:
@@ -207,12 +230,8 @@ class IluFusedMoEEP:
         if hasattr(handle, "buffer") and handle.buffer is None:
             from ixformer.distributed import nvsm_ep
 
-            max_tokens_per_rank = _get_max_num_seqs()
-            # After TP scatter / fused AG-AR, each rank only holds a shard.
-            # Use ceil division to match the uneven chunking in flatten().
+            max_tokens_per_rank = _decode_ll_max_tokens_per_rank()
             tp_size = get_tensor_model_parallel_world_size()
-            if VLLM_ILU_LL_FUSED_AG_AR or VLLM_ILU_DEEPEP_USE_SCATTER:
-                max_tokens_per_rank = (max_tokens_per_rank + tp_size - 1) // tp_size
 
             dispatch_quant_kwargs = self._nvsm_dispatch_quant_kwargs()
             handle.buffer = nvsm_ep.nvsm_init_ep_comm(
@@ -256,13 +275,18 @@ class IluFusedMoEEP:
                 local_expert_global_ids,
             ) = routing_tables
 
-        moe_config = runner.moe_config
         ll_manager, handle = self._get_forward_dp_ep_ll_all2all()
 
         use_fp8_dispatch = bool(self._nvsm_dispatch_quant_kwargs()["use_fp8"])
         prepare_finalize = DeepEPLLPrepareAndFinalize(
             handle,
-            max_tokens_per_rank=moe_config.max_num_tokens,
+            # Must match the NVSHMEM buffer built in
+            # ``_get_forward_dp_ep_ll_all2all``. ``moe_config.max_num_tokens``
+            # is the prefill bound (max_num_batched_tokens), and the batched
+            # expert layout is sized as max_tokens_per_rank * num_dispatchers
+            # per expert -- overstating it here costs GiBs of workspace and
+            # output per captured graph.
+            max_tokens_per_rank=_decode_ll_max_tokens_per_rank(),
             num_dispatchers=ll_manager.world_size,
             use_fp8_dispatch=use_fp8_dispatch,
             global_to_physical=global_to_physical,
@@ -629,6 +653,28 @@ class IluFusedMoEEP:
         ).view(org_shape)
         return final_hidden_states
 
+    # The LL batched layout is sized for the worst case (every route landing on
+    # one expert), so the routed-expert output is the same shape for every
+    # decode step and every layer. Allocating it per call puts one of these
+    # multi-GiB tensors into each captured graph's private pool; keeping one per
+    # (shape, dtype, ubatch) instead lets every layer and every graph share a
+    # single address. Layers run one at a time and finalize consumes the buffer
+    # before the next layer dispatches, so sharing is safe; the padding rows are
+    # garbage either way because ``apply`` only writes the active ranges.
+    _ll_expert_output_cache: dict[tuple, torch.Tensor] = {}
+
+    def _ll_expert_output_buffer(
+        self,
+        a1q: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        key = (dbo_current_ubatch_id(), tuple(a1q.shape), dtype, a1q.device)
+        buf = IluFusedMoEEP._ll_expert_output_cache.get(key)
+        if buf is None:
+            buf = torch.empty(a1q.shape, dtype=dtype, device=a1q.device)
+            IluFusedMoEEP._ll_expert_output_cache[key] = buf
+        return buf
+
     def _forward_dp_ep_flatten(
         self,
         hidden_states: torch.Tensor,
@@ -743,9 +789,9 @@ class IluFusedMoEEP:
         if hasattr(fused_experts, "local_num_experts"):
             fused_experts.local_num_experts = routed_experts.local_num_experts
 
-        fused_output = torch.empty_like(
+        fused_output = self._ll_expert_output_buffer(
             a1q,
-            dtype=fused_experts.workspace_dtype(hidden_states.dtype),
+            fused_experts.workspace_dtype(hidden_states.dtype),
         )
         fused_experts.apply(
             output=fused_output,

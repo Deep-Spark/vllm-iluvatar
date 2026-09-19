@@ -138,6 +138,8 @@
       )
   ```
 
+- **官方 FP8 权重（可选第二套）**：W4A8 转换权重走 `IluXXXForCausalLM`；官方 FP8 checkpoint 仍声明社区 arch 名时，另写薄子类覆盖（GLM-5.2：`fp8_model.py` / `fp8_attention.py` / `fp8_mtp.py`），用类属性钩子换 decoder / attention / MTP 层，避免复制整份模型图。社区 arch 名覆盖 vLLM 自带实现；MTP draft 若社区路由到与其它模型共享的 generic draft arch，则不要覆盖那个名字，改在 `_ILU_MTP_ARCH_MAP` 里重指向插件 draft。
+
 - **融合参数映射**：`packed_modules_mapping` 与 `load_weights` 中的 `stacked_params_mapping` 定义加载期融合——`gate_up_proj`（gate+up）、`fused_qkv_a_proj`（q_a + kv_a）、`wk_weights_proj`（indexer wk + weights_proj）；expert 权重走 `fused_moe_make_expert_params_mapping`。
 - **严格 reverse 校验**：量化模式下，vLLM 的 `DefaultModelLoader` 只在 `quantization is None` 时才检查"是否所有参数都被填充"。天数模型在 `--quantization compressed-tensors` 下须自行确定所有层都有正确的后端方法， 避免缺 scale / 命名不匹配时静默回退到随机初始化。
 - **MoE 要点**：sigmoid 打分 + `noaux_tc` 校正 bias（`e_score_correction_bias`）+ grouped top-k；`routed_scaling_factor` 在**输出侧**应用（`apply_routed_scale_to_output`，避免 router 侧重复缩放）。
@@ -242,6 +244,7 @@ MTP 还需两个 `ilu_patch.general_patches`（各暴露 `register()`，由 `app
 | 模型图 + 权重加载 + `register_model()` | [`vllm_iluvatar/models/glm_moe_dsa/model.py`](../../vllm_iluvatar/models/glm_moe_dsa/model.py) |
 | 自包含 attention 链 + plugin-local opaque op | [`vllm_iluvatar/models/glm_moe_dsa/attention.py`](../../vllm_iluvatar/models/glm_moe_dsa/attention.py) |
 | MTP draft 模型 | [`vllm_iluvatar/models/glm_moe_dsa/mtp.py`](../../vllm_iluvatar/models/glm_moe_dsa/mtp.py) |
+| 官方 FP8 权重（社区 arch 覆盖） | [`fp8_model.py`](../../vllm_iluvatar/models/glm_moe_dsa/fp8_model.py) · [`fp8_attention.py`](../../vllm_iluvatar/models/glm_moe_dsa/fp8_attention.py) · [`fp8_mtp.py`](../../vllm_iluvatar/models/glm_moe_dsa/fp8_mtp.py) |
 | 混合量化 config（W4A8/W8A8/W8A16 分发） | [`vllm_iluvatar/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py`](../../vllm_iluvatar/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py) |
 | MTP draft-arch 重定向实现 | [`vllm_iluvatar/config/speculative.py`](../../vllm_iluvatar/config/speculative.py) |
 | MTP tuple 返回契约实现 | [`vllm_iluvatar/v1/spec_decode/llm_base_proposer.py`](../../vllm_iluvatar/v1/spec_decode/llm_base_proposer.py) |

@@ -475,6 +475,9 @@ configs 不包含离线转换方法、checkpoint 名称匹配规则或模型配�
 - `int4_moe`：先生成 per-channel INT8，再通过 ixformer 重排为 MoE INT4，并按版本生成 scale、`i8_weight_scale` 和 `i8_weight_zero`。
   - `options`：`group_size`、`symmetric`、`gemm_format`、`pack_version`、`scale_layout` 和 `transport`；当 `scale_layout` 为 `row` 时，scale 会 reshape 为 `(1, *)`。
 - `pack_int4_moe`：处理三维专家权重，即所有专家位于同一个 tensor 中的情况；该方法会逐个专家调用 `int4_moe`。`options` 在 `int4_moe` 参数之外还包括：`packed`（gate_up 为 `true`，down 为 `false`）；`chunk_dim`（gate_up 的拆分维度）。
+- `pack_int8_moe`：处理三维 MoE expert 权重。先按 expert 做 `int8_per_channel`，scale 为 `(E, N, 1)`，再 `transpose(1, 2)` 成 `(E, K, N)`，对齐`moe_w8a8_group_gemv`（NN-only）。
+  - `options`：`gemm_format` 为 `NN`；`symmetric`；`group_size`；`round_through_bfloat16` 和 `transport` 与 `int8_per_channel` 相同。
+  - Qwen3.6 MoE W8A8 示例：`rules/qwen3_6_moe_w8a8.json` 与 `configs/qwen3_6_moe_w8a8.json`。routed experts 为 NN INT8，dense `self_attn.{q,k,v,o}_proj` 仍为 TN INT8。
 
 对于不同的量化方法，需要同步调整 configs 和 rules，以保证离线量化参数与运行时配置一致。除了手动同步，还可以在 configs 中通过 `$rules` 引用 rules 字段。这样，修改离线量化参数后，运行时配置会自动更新。例如：
 

@@ -545,6 +545,75 @@ class IluRoutedExperts(RoutedExperts):
                     f"{w4a8_format!r} for fused w2_scale loading."
                 )
         raise ValueError(f"Unsupported W4A8 fused w2 parameter {param_name!r}.")
+    
+       # Isolate W8A8 fused w13 / w13 scale physical-layout loading.
+    def _load_w8a8_fused_w13_shard(
+        self,
+        *,
+        fused_weight: torch.Tensor,
+        param_name: str,
+        expert_id: int,
+        unpadded_hidden: int,
+    ) -> torch.Tensor:
+        """Split W8A8 fused w13/w13-scale tensors by physical layout."""
+
+        w8a8_format = getattr(self.quant_method, "gemm_format", None)
+        if w8a8_format not in ("TN", "NN"):
+            raise ValueError(
+                f"Unsupported W8A8 MoE format {w8a8_format!r} for fused w13 loading."
+            )
+
+        if "weight_scale" in param_name:
+            # Per-channel over the fused gate|up N axis: [num_experts, 2 * inter, 1].
+            # The weight path keys off hidden_size and would fold a scale the
+            # wrong way, hence the separate path.
+            if fused_weight.shape[-1] != 1:
+                fused_weight = fused_weight.transpose(-1, -2)
+            return fused_weight.chunk(2, dim=-2)[expert_id]
+
+        # TN: [num_experts, 2 * inter, hidden]
+        # NN: [num_experts, hidden, 2 * inter]
+        if w8a8_format == "NN":
+            if fused_weight.shape[-2] != unpadded_hidden:
+                fused_weight = fused_weight.transpose(-1, -2)
+            chunk_dim = -1
+        else:
+            if fused_weight.shape[-1] != unpadded_hidden:
+                fused_weight = fused_weight.transpose(-1, -2)
+            chunk_dim = -2
+        return fused_weight.chunk(2, dim=chunk_dim)[expert_id]
+
+    # Isolate W8A8 fused w2 / w2 scale physical-layout loading.
+    def _load_w8a8_fused_w2_shard(
+        self,
+        *,
+        fused_weight: torch.Tensor,
+        param_name: str,
+        unpadded_hidden: int,
+    ) -> torch.Tensor:
+        """Reorient W8A8 fused w2/w2-scale tensors by physical layout."""
+
+        w8a8_format = getattr(self.quant_method, "gemm_format", None)
+        if w8a8_format not in ("TN", "NN"):
+            raise ValueError(
+                f"Unsupported W8A8 MoE format {w8a8_format!r} for fused w2 loading."
+            )
+
+        if "weight_scale" in param_name:
+            # Per-channel over hidden: [num_experts, hidden, 1].
+            if fused_weight.shape[-1] != 1:
+                fused_weight = fused_weight.transpose(-1, -2)
+            return fused_weight
+
+        # TN: [num_experts, hidden, inter]
+        # NN: [num_experts, inter, hidden]
+        if w8a8_format == "NN":
+            if fused_weight.shape[-1] != unpadded_hidden:
+                fused_weight = fused_weight.transpose(-1, -2)
+        else:
+            if fused_weight.shape[-2] != unpadded_hidden:
+                fused_weight = fused_weight.transpose(-1, -2)
+        return fused_weight
 
     # <<< ILU MODIFICATION <<<
 
@@ -587,6 +656,20 @@ class IluRoutedExperts(RoutedExperts):
                                 unpadded_hidden=unpadded_hidden,
                             )
                             # <<< ILU MODIFICATION <<<
+                        elif (
+                            quant_method_name
+                            == "IluCompressedTensorsW8A8Int8MoEMethod"
+                        ):
+                            # >>> ILU MODIFICATION >>>
+                            # W8A8 fused w13 tensors carry TN or NN layout;
+                            # split gate/up on N and keep scale on N.
+                            experts_shard = self._load_w8a8_fused_w13_shard(
+                                fused_weight=fused_weight,
+                                param_name=param_name,
+                                expert_id=expert_id,
+                                unpadded_hidden=unpadded_hidden,
+                            )
+                            # <<< ILU MODIFICATION <<<
                         else:
                             if fused_weight.shape[-1] != unpadded_hidden:
                                 # [..., hidden, intermediate] -> [..., intermediate, hidden]
@@ -598,6 +681,19 @@ class IluRoutedExperts(RoutedExperts):
                             # W4A8 fused w2 tensors may already be in ixformer
                             # kernel layout; delegate format-specific handling.
                             experts_shard = self._load_w4a8_fused_w2_shard(
+                                fused_weight=fused_weight,
+                                param_name=param_name,
+                                unpadded_hidden=unpadded_hidden,
+                            )
+                        
+                            # <<< ILU MODIFICATION <<<
+                        elif (
+                            quant_method_name
+                            == "IluCompressedTensorsW8A8Int8MoEMethod"
+                        ):
+                            # >>> ILU MODIFICATION >>>
+                            # W8A8 fused w2 tensors carry TN or NN layout.
+                            experts_shard = self._load_w8a8_fused_w2_shard(
                                 fused_weight=fused_weight,
                                 param_name=param_name,
                                 unpadded_hidden=unpadded_hidden,

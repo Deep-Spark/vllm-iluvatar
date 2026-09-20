@@ -5,17 +5,22 @@ Corresponds to: vllm/model_executor/models/gpt_oss.py
 Target   : vllm.model_executor.models.gpt_oss.GptOssForCausalLM
            (arch "GptOssForCausalLM")
 Baseline : main_6e448d0
-Why      : Iluvatar W4A8/W8A8 GPT-OSS checkpoints use padded routed-expert
-           tensors and plugin env-controlled layouts that community GPT-OSS
-           loaders do not understand.
+Why      : Iluvatar W4A8/W8A8 GPT-OSS checkpoints use NN/TN layouts and
+           plugin env-controlled gemm formats that the community GPT-OSS
+           loader does not understand. The community ``_load_weights_other``
+           unconditionally ``permute(0, 2, 1)`` on expert weights (assumes a
+           TN checkpoint -> NN param), which corrupts ILU NN-layout
+           checkpoints that are already stored as ``[E, k, n]``.
 How      : Register an OOT subclass, keep community construction unchanged, then
            swap the inner ``GptOssModel`` instance to a subclass that overrides
-           only ``_load_weights_other``. The padding-copy helper stays local to
-           this plugin instead of patching community ``weight_utils`` or
-           ``parameter.py``.
+           only ``_load_weights_other``. Permute is applied only when
+           ``gemm_format == "TN"``; NN skips it. Expert weight padding is now
+           deferred to the MoE quant method's ``process_weights_after_loading``,
+           so loading uses a plain ``default_weight_loader`` copy against the
+           unpadded params.
 Scope    : GPT-OSS non-MXFP4/non-Quark expert weight loading on Iluvatar.
-Remove   : when community GPT-OSS exposes a model-specific padded expert loader
-           hook or supports the Iluvatar layouts natively.
+Remove   : when community GPT-OSS exposes a layout-aware expert loader hook or
+           supports the Iluvatar layouts natively.
 
 Registration: ``register_model()`` below is invoked by
 ``vllm_iluvatar.ilu_register.apply_oot_registrations`` during register_general.
@@ -39,38 +44,6 @@ from vllm.model_executor.models.gpt_oss import (
 from vllm.model_executor.models.gpt_oss import GptOssModel as _GptOssModel
 from vllm.model_executor.models.utils import is_pp_missing_parameter
 from vllm.utils.math_utils import cdiv
-
-
-def padding_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-    """Copy overlapping 2D/3D slices for padded expert tensors."""
-    if param.shape == loaded_weight.shape:
-        param.data.copy_(loaded_weight)
-        return
-
-    if param.ndim != loaded_weight.ndim:
-        raise ValueError(
-            f"Cannot load weight with different ndim: param.ndim={param.ndim}, "
-            f"loaded.ndim={loaded_weight.ndim}, param.shape={tuple(param.shape)}, "
-            f"loaded.shape={tuple(loaded_weight.shape)}"
-        )
-    if param.ndim not in (2, 3):
-        raise ValueError(
-            f"padding_weight_loader only supports 2D/3D tensors, got {param.ndim}D. "
-            f"param.shape={tuple(param.shape)}, loaded.shape={tuple(loaded_weight.shape)}"
-        )
-    if param.shape[0] != loaded_weight.shape[0]:
-        raise AssertionError(
-            "Mismatch in number of experts: "
-            f"param={param.shape[0]}, loaded={loaded_weight.shape[0]}"
-        )
-
-    copy_d1 = min(param.shape[1], loaded_weight.shape[1])
-    if param.ndim == 2:
-        param.data[:, :copy_d1].copy_(loaded_weight[:, :copy_d1])
-        return
-
-    copy_d2 = min(param.shape[2], loaded_weight.shape[2])
-    param.data[:, :copy_d1, :copy_d2].copy_(loaded_weight[:, :copy_d1, :copy_d2])
 
 
 def _route_expert_name(name: str) -> str:
@@ -138,7 +111,7 @@ class GptOssModel(_GptOssModel):
                 weight = weight.permute(*permute_dims)
             if contiguous:
                 weight = weight.contiguous()
-            padding_weight_loader(param, weight)
+            default_weight_loader(param, weight)
             loaded_params.add(param_name)
 
         use_ep = self.parallel_config.enable_expert_parallel

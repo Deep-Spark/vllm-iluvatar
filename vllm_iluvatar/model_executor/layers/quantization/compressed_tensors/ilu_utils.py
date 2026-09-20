@@ -194,6 +194,47 @@ class W8A8GemmInfo(GemmInfo):
             return (self.k, self.n)
 
 
+class W8A8GroupGemmInfo(GemmInfo):
+    """GEMM metadata for the W8A8 MoE group-gemm / group-gemv kernels (NN only).
+
+    Mirrors W4A8GroupGemmInfo but for int8 weights (no int4 packing, so the
+    stored weight shape is not halved).  Only the NN layout is supported:
+    both moe_w8a8_group_gemm (cuinfer) and moe_w8a8_group_gemv accept NN, and
+    moe_w8a8_group_gemv enforces NN exclusively
+    (moe.cpp: `moe_w8a8_group_gemv only supported NN now!`).
+
+    NN alignment (cuinfer W8A8, see ixformer src/ixformer/infer/w8a8.cpp):
+      N % 64 == 0 && K % 64 == 0
+    """
+
+    def __init__(
+        self,
+        format_str: str,
+        k: int,
+        n: int,
+    ):
+        super().__init__(format_str=format_str, k=k, n=n)
+        assert self.format_str == "NN", (
+            f"W8A8GroupGemmInfo only supports NN, got {self.format_str}"
+        )
+
+        self.pad_k = align_up(k, 64)
+        self.pad_n = align_up(n, 64)
+
+        logger.info_once(
+            f"[W8A8GroupGemmInfo] format: {format_str}, "
+            f"k: {k} -> {self.pad_k}, n: {n} -> {self.pad_n}"
+        )
+
+    # int8 (no packing): the stored weight shape equals the logical shape.
+    # NN layout stores weight as [k, n].
+    def get_pad_weight_shape(self):
+        return (self.pad_k, self.pad_n)
+
+    def get_weight_shape(self):
+        return (self.k, self.n)
+
+
 def hidden_padding(real_k: int, pad_k: int) -> int:
     """Extra hidden elements needed to reach kernel-aligned pad_k."""
     assert pad_k >= real_k, f"pad_k ({pad_k}) must be >= real_k ({real_k})"

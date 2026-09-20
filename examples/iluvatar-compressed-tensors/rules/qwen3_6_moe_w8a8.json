@@ -1,0 +1,102 @@
+{
+    "schema_version": 1,
+    "name": "qwen3_6_moe_w8a8",
+    "load_device": "cpu",
+    "model_config_patch": {
+        "compression_config": null
+    },
+    "default_action": "keep",
+    "rules": [
+        {
+            "id": "keep_sensitive_tensor",
+            "priority": 1000,
+            "match": {
+                "regex": [
+                    "^lm_head\\.weight$",
+                    "^model\\.language_model\\.embed_tokens\\.weight$",
+                    "^model\\.language_model\\.norm\\.weight$",
+                    "^model\\.language_model\\.layers\\.\\d+\\.(input_layernorm|post_attention_layernorm)\\.weight$",
+                    "^model\\.language_model\\.layers\\.\\d+\\.self_attn\\.(q_norm|k_norm)\\.weight$",
+                    "^model\\.language_model\\.layers\\.\\d+\\.mlp\\.(gate|shared_expert_gate)\\.weight$",
+                    "^model\\.language_model\\.layers\\.\\d+\\.mlp\\.shared_expert\\..*$",
+                    "^model\\.language_model\\.layers\\.\\d+\\.linear_attn\\..*$",
+                    "^model\\.visual\\..*$",
+                    "^mtp\\.(fc|norm|pre_fc_norm_embedding|pre_fc_norm_hidden)\\.weight$",
+                    "^mtp\\.layers\\.\\d+\\.(input_layernorm|post_attention_layernorm)\\.weight$",
+                    "^mtp\\.layers\\.\\d+\\.self_attn\\.(q_norm|k_norm)\\.weight$",
+                    "^mtp\\.layers\\.\\d+\\.mlp\\.(gate|shared_expert_gate)\\.weight$",
+                    "^mtp\\.layers\\.\\d+\\.mlp\\.shared_expert\\..*$"
+                ]
+            },
+            "action": "keep"
+        },
+        {
+            "id": "routed_experts_to_w8a8",
+            "priority": 900,
+            "match": {
+                "regex": [
+                    "^(model\\.language_model|mtp)\\.layers\\.\\d+\\.mlp\\.experts\\.(gate_up_proj|down_proj)$"
+                ],
+                "dtypes": [
+                    "bfloat16"
+                ],
+                "ndims": [
+                    3
+                ]
+            },
+            "action": "convert",
+            "config_group": "routed_experts",
+            "work_device": true,
+            "dequant": {
+                "method": "to_float32"
+            },
+            "quant": {
+                "method": "pack_int8_moe",
+                "options": {
+                    "group_size": -1,
+                    "symmetric": true,
+                    "gemm_format": "NN"
+                }
+            },
+            "outputs": {
+                "weight_scale": "_scale"
+            }
+        },
+        {
+            "id": "dense_float_to_w8a8",
+            "priority": 800,
+            "match": {
+                "regex": [
+                    "^(model\\.language_model|mtp)\\.layers\\.\\d+\\.self_attn\\.(q_proj|k_proj|v_proj|o_proj)\\.weight$"
+                ],
+                "dtypes": [
+                    "bfloat16"
+                ],
+                "ndims": [
+                    2
+                ]
+            },
+            "action": "convert",
+            "config_group": "dense_linears",
+            "work_device": true,
+            "dequant": {
+                "method": "to_float32"
+            },
+            "quant": {
+                "method": "int8_per_channel",
+                "options": {
+                    "group_size": -1,
+                    "symmetric": true,
+                    "gemm_format": "TN"
+                }
+            },
+            "iluvatar": {
+                "mixed_strategy": "CHANNEL",
+                "gemm_mode": "PERF"
+            },
+            "outputs": {
+                "weight_scale": ".weight_scale"
+            }
+        }
+    ]
+}

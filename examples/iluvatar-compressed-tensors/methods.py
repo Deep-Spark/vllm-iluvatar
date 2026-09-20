@@ -374,8 +374,7 @@ def quant_int4_per_channel(
     group_size = int(options.get("group_size", -1))
     if group_size not in (-1,):
         raise ValueError(
-            "int4_per_channel only supports group_size=-1, "
-            f"got {group_size}"
+            f"int4_per_channel only supports group_size=-1, got {group_size}"
         )
     if not bool(options.get("symmetric", True)):
         raise ValueError("int4_per_channel only supports symmetric quantization")
@@ -517,4 +516,37 @@ def quant_pack_int4_moe(value: torch.Tensor, options: Mapping[str, Any]) -> Quan
         weight_scale=stack_optional("weight_scale"),
         i8_weight_scale=stack_optional("i8_weight_scale"),
         i8_weight_zero=stack_optional("i8_weight_zero"),
+    )
+
+
+@register_quant("pack_int8_moe")
+def quant_pack_int8_moe(value: torch.Tensor, options: Mapping[str, Any]) -> QuantResult:
+    """Per-expert symmetric INT8 for stacked MoE weights.
+
+    Each expert is quantized with ``int8_per_channel`` on the logical ``(N, K)``
+    layout. Scale is ``(E, N, 1)``. Weight is transposed to ``(E, K, N)`` for
+    ``moe_w8a8_group_gemv`` (NN-only).
+    """
+    if value.dim() != 3:
+        raise ValueError(
+            "pack_int8_moe expects stacked expert weights with shape "
+            f"(num_experts, dim0, dim1), got {value.shape}"
+        )
+    gemm_format = str(options.get("gemm_format", "NN")).upper()
+    if gemm_format != "NN":
+        raise ValueError(f"pack_int8_moe gemm_format must be NN, got {gemm_format!r}")
+    results = [
+        quant_int8_per_channel(expert_weight, options)
+        for expert_weight in value.unbind(dim=0)
+    ]
+    scales = [result.weight_scale for result in results]
+    if any(scale is None for scale in scales):
+        raise ValueError("pack_int8_moe requires a weight_scale from every expert")
+    weight = torch.stack([result.weight for result in results], dim=0)
+    weight = weight.transpose(1, 2).contiguous()
+    return QuantResult(
+        weight=weight,
+        weight_scale=torch.stack(
+            [scale for scale in scales if scale is not None], dim=0
+        ),
     )

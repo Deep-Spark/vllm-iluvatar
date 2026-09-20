@@ -31,23 +31,23 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kInt8StaticChannelSym,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.logger import init_logger
 
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_decode_metadata import (
     _ensure_cuda_graph_safe_dispatch,
     _is_only_decode,
 )
+from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_utils import (
+    W8A8GroupGemmInfo,
+    replace_with_padded,
+)
+
+logger = init_logger(__name__)
 
 
 
 def _get_ilu_output_scale(layer: RoutedExperts) -> float:
     return getattr(layer, "_ilu_output_scale", 1.0)
-
-
-def _pad_last_dim(input: torch.Tensor, target_dim: int) -> torch.Tensor:
-    if input.shape[-1] == target_dim:
-        return input
-    padding = target_dim - input.shape[-1]
-    return torch.nn.functional.pad(input, (0, padding), mode="constant", value=0)
 
 
 def _apply_decode_w8a8_int8_nn(
@@ -75,7 +75,10 @@ def _apply_decode_w8a8_int8_nn(
         smooth_scales=layer.w13_input_scale,
     )
 
-    act = _pad_last_dim(act, layer.w13_weight.shape[-2])
+    assert act.shape[-1] == layer.w13_weight.shape[-2], (
+        f"w8a8 moe gemv(NN) requires k % 64 == 0, "
+        f"got act k={act.shape[-1]} != weight k={layer.w13_weight.shape[-2]}"
+    )
     act = ixfops.moe_w8a8_group_gemv(
         input=act,
         weight=layer.w13_weight,
@@ -107,7 +110,10 @@ def _apply_decode_w8a8_int8_nn(
             act_type="swiglu",
         )
 
-    act = _pad_last_dim(act, layer.w2_weight.shape[-2])
+    assert act.shape[-1] == layer.w2_weight.shape[-2], (
+        f"w8a8 moe gemv(NN) requires k % 64 == 0, "
+        f"got act k={act.shape[-1]} != weight k={layer.w2_weight.shape[-2]}"
+    )
     act = ixfops.moe_w8a8_group_gemv(
         input=act,
         weight=layer.w2_weight,
@@ -150,10 +156,10 @@ class IluCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
             -1 if self.weight_quant.group_size is None else self.weight_quant.group_size
         )
         self.gemm_format = ilu_params.get("gemm_format", "")
-        assert self.gemm_format in ["TN", "NN"], (
-            f"W8A8 INT8 MoE only supports TN or NN format, but got {self.gemm_format}"
+        assert self.gemm_format == "NN", (
+            f"W8A8 INT8 MoE only supports NN format, but got {self.gemm_format}"
         )
-        self.padding_dim = -1 if self.gemm_format == "TN" else -2
+        self.padding_dim = -2  # NN layout: weight is [E, k, n], k on dim -2
 
         per_channel = (
             self.weight_quant.strategy == QuantizationStrategy.CHANNEL
@@ -192,79 +198,64 @@ class IluCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
         params_dtype = torch.int8
         w13_num_shards = 2 if self.moe.is_act_and_mul else 1
 
-        w13_remainder = hidden_size % 64
-        w2_remainder = intermediate_size_per_partition % 64
-        if w13_remainder != 0:
-            hidden_size_padded = hidden_size + (64 - w13_remainder)
-        else:
-            hidden_size_padded = hidden_size
-        if w2_remainder != 0:
-            intermediate_size_per_partition_padded = intermediate_size_per_partition + (
-                64 - w2_remainder
-            )
-        else:
-            intermediate_size_per_partition_padded = intermediate_size_per_partition
+        # [1] Build GEMM metadata from the raw (unpadded) sizes. Padding is
+        # deferred to process_weights_after_loading() so checkpoint loading is
+        # exact (mirrors the W4A8 path). k is the contraction dim, n the output.
+        self.gemm1_info = W8A8GroupGemmInfo(
+            self.gemm_format,
+            k=hidden_size,
+            n=w13_num_shards * intermediate_size_per_partition,
+        )
+        self.gemm2_info = W8A8GroupGemmInfo(
+            self.gemm_format,
+            k=intermediate_size_per_partition,
+            n=hidden_size,
+        )
+        w13_shape = (num_experts, *self.gemm1_info.get_weight_shape())
+        w2_shape = (num_experts, *self.gemm2_info.get_weight_shape())
+        logger.debug_once(
+            f"[W8A8GroupGemmInfo] create gemm13 shape:{w13_shape} "
+            f"gemm2 shape:{w2_shape}"
+        )
 
-        if self.gemm_format == "NN":
-            w13_shape = (
-                num_experts,
-                hidden_size_padded,
-                w13_num_shards * intermediate_size_per_partition_padded,
-            )
-            w2_shape = (
-                num_experts,
-                intermediate_size_per_partition_padded,
-                hidden_size_padded,
-            )
-        else:
-            w13_shape = (
-                num_experts,
-                w13_num_shards * intermediate_size_per_partition,
-                hidden_size_padded,
-            )
-            w2_shape = (
-                num_experts,
-                hidden_size,
-                intermediate_size_per_partition_padded,
-            )
-
-        # WEIGHTS
+        # [2] Register core expert weights (w13 / w2).
+        # ILU shard_dim override: the community weight_loader defaults the w13
+        # shard dim to 0 and w2 to 1, which assumes a TN-style [out, in] layout.
+        # w13 is ColumnParallel (shard inter/output) and w2 is RowParallel (shard
+        # inter/input). Under NN, w13 is [E, hidden, 2*inter] (inter on dim 1) and
+        # w2 is [E, inter, hidden] (inter on dim 0), so the community default would
+        # narrow the wrong dimension and produce a 2x size mismatch in
+        # _load_w13/_load_w2. Weight scales keep the default: their trailing ",1"
+        # axis leaves the sharded dim on dim 0, matching the community default.
         w13_weight = torch.nn.Parameter(
             torch.zeros(w13_shape, dtype=params_dtype), requires_grad=False
         )
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
+        w13_weight.shard_dim = 1
 
         w2_weight = torch.nn.Parameter(
             torch.zeros(w2_shape, dtype=params_dtype), requires_grad=False
         )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
+        w2_weight.shard_dim = 0
 
-        if self.gemm_format == "TN":
-            w13_bias_shape = (num_experts, 2 * intermediate_size_per_partition)
-            w2_bias_shape = (num_experts, hidden_size)
-        elif self.gemm_format == "NN":
-            w13_bias_shape = (num_experts, 2 * intermediate_size_per_partition_padded)
-            w2_bias_shape = (num_experts, hidden_size_padded)
-
+        # [3] Bias (if enabled). Stored unpadded on the output (n) axis; padded
+        # after loading.
         if self.has_bias:
             w13_bias = torch.nn.Parameter(
                 torch.zeros(
-                    w13_bias_shape,
+                    (num_experts, self.gemm1_info.get_n()),
                     dtype=torch.bfloat16,
                 ),
                 requires_grad=False,
             )
             layer.register_parameter("w13_bias", w13_bias)
             set_weight_attrs(w13_bias, extra_weight_attrs)
-        else:
-            layer.w13_bias = None
-
-        if self.has_bias:
             w2_bias = torch.nn.Parameter(
                 torch.zeros(
-                    w2_bias_shape,
+                    (num_experts, self.gemm2_info.get_n()),
                     dtype=torch.bfloat16,
                 ),
                 requires_grad=False,
@@ -272,32 +263,25 @@ class IluCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
             layer.register_parameter("w2_bias", w2_bias)
             set_weight_attrs(w2_bias, extra_weight_attrs)
         else:
+            layer.w13_bias = None
             layer.w2_bias = None
 
-        # WEIGHT_SCALES
+        # [4] Register weight scales (w13_weight_scale / w2_weight_scale).
+        # Per-channel on the output (n) axis: [num_experts, n, 1].
         assert self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-        if self.gemm_format == "NN":
-            w13_weight_scale_shape = (
-                num_experts,
-                w13_num_shards * intermediate_size_per_partition_padded,
-                1,
-            )
-            w2_weight_scale_shape = (num_experts, hidden_size_padded, 1)
-        else:
-            w13_weight_scale_shape = (
-                num_experts,
-                w13_num_shards * intermediate_size_per_partition,
-                1,
-            )
-            w2_weight_scale_shape = (num_experts, hidden_size, 1)
-
         w13_weight_scale = torch.nn.Parameter(
-            torch.ones(w13_weight_scale_shape, dtype=torch.float32),
+            torch.ones(
+                (num_experts, self.gemm1_info.get_n(), 1),
+                dtype=torch.float32,
+            ),
             requires_grad=False,
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         w2_weight_scale = torch.nn.Parameter(
-            torch.ones(w2_weight_scale_shape, dtype=torch.float32),
+            torch.ones(
+                (num_experts, self.gemm2_info.get_n(), 1),
+                dtype=torch.float32,
+            ),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
@@ -308,21 +292,21 @@ class IluCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
-        # INPUT_SCALES
+        # [5] Input scales (if static). Per-channel on the input (k) axis.
         if self.static_input_scales:
-            extra_weight_attrs.update(
-                {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
-            )
             w13_input_scale = torch.nn.Parameter(
-                torch.ones(num_experts, hidden_size, dtype=torch.float32),
+                torch.ones(
+                    (num_experts, self.gemm1_info.get_k()),
+                    dtype=torch.float32,
+                ),
                 requires_grad=False,
             )
             layer.register_parameter("w13_input_scale", w13_input_scale)
             set_weight_attrs(w13_input_scale, extra_weight_attrs)
-
             w2_input_scale = torch.nn.Parameter(
                 torch.ones(
-                    num_experts, intermediate_size_per_partition, dtype=torch.float32
+                    (num_experts, self.gemm2_info.get_k()),
+                    dtype=torch.float32,
                 ),
                 requires_grad=False,
             )
@@ -333,7 +317,82 @@ class IluCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
-        pass
+        def _log_prefix(branch: str, tensor_kind: str) -> str:
+            return f"[w8a8][process_weights_after_loading][{branch}][{tensor_kind}]"
+
+        # [1] Pad core expert weights to the kernel-aligned layout.
+        w13_target_shape = (
+            layer.w13_weight.shape[0],
+            *self.gemm1_info.get_pad_weight_shape(),
+        )
+        w2_target_shape = (
+            layer.w2_weight.shape[0],
+            *self.gemm2_info.get_pad_weight_shape(),
+        )
+        replace_with_padded(
+            layer,
+            "w13_weight",
+            w13_target_shape,
+            pad_value=0,
+            log_prefix=_log_prefix("w13", "weight"),
+        )
+        replace_with_padded(
+            layer,
+            "w2_weight",
+            w2_target_shape,
+            pad_value=0,
+            log_prefix=_log_prefix("w2", "weight"),
+        )
+
+        # [2] Pad main weight scales (per-channel on the n axis).
+        replace_with_padded(
+            layer,
+            "w13_weight_scale",
+            (layer.w13_weight_scale.shape[0], self.gemm1_info.get_pad_n(), 1),
+            pad_value=1,
+            log_prefix=_log_prefix("w13", "weight_scale"),
+        )
+        replace_with_padded(
+            layer,
+            "w2_weight_scale",
+            (layer.w2_weight_scale.shape[0], self.gemm2_info.get_pad_n(), 1),
+            pad_value=1,
+            log_prefix=_log_prefix("w2", "weight_scale"),
+        )
+
+        # [3] Pad bias (if enabled) on the n axis.
+        if self.has_bias:
+            replace_with_padded(
+                layer,
+                "w13_bias",
+                (layer.w13_bias.shape[0], self.gemm1_info.get_pad_n()),
+                pad_value=0,
+                log_prefix=_log_prefix("w13", "bias"),
+            )
+            replace_with_padded(
+                layer,
+                "w2_bias",
+                (layer.w2_bias.shape[0], self.gemm2_info.get_pad_n()),
+                pad_value=0,
+                log_prefix=_log_prefix("w2", "bias"),
+            )
+
+        # [4] Pad optional static input scales (per-channel on the k axis).
+        if self.static_input_scales:
+            replace_with_padded(
+                layer,
+                "w13_input_scale",
+                (layer.w13_input_scale.shape[0], self.gemm1_info.get_pad_k()),
+                pad_value=1,
+                log_prefix=_log_prefix("w13", "input_scale"),
+            )
+            replace_with_padded(
+                layer,
+                "w2_input_scale",
+                (layer.w2_input_scale.shape[0], self.gemm2_info.get_pad_k()),
+                pad_value=1,
+                log_prefix=_log_prefix("w2", "input_scale"),
+            )
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
         return make_int8_moe_quant_config(
@@ -404,7 +463,7 @@ class IluCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 num_experts=num_experts,
             )
 
-        if only_decode and self.gemm_format == "NN":
+        if only_decode:
             final_hidden_states = _apply_decode_w8a8_int8_nn(
                 layer=layer,
                 x=x,
@@ -431,11 +490,11 @@ class IluCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 smooth_scales=layer.w13_input_scale,
             )
 
-            if act.shape[-1] != layer.w13_weight.shape[self.padding_dim]:
-                padding = layer.w13_weight.shape[self.padding_dim] - act.shape[-1]
-                act = torch.nn.functional.pad(
-                    act, (0, padding), mode="constant", value=0
-                )
+            assert act.shape[-1] == layer.w13_weight.shape[self.padding_dim], (
+                f"w8a8 moe gemm requires k % 64 == 0, "
+                f"got act k={act.shape[-1]} != weight k="
+                f"{layer.w13_weight.shape[self.padding_dim]}"
+            )
 
             # w8a8 group gemm 1
             act = ixfops.moe_w8a8_group_gemm(
@@ -469,11 +528,11 @@ class IluCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
                     act_type="swiglu",
                 )
 
-            if act.shape[-1] != layer.w2_weight.shape[self.padding_dim]:
-                padding = layer.w2_weight.shape[self.padding_dim] - act.shape[-1]
-                act = torch.nn.functional.pad(
-                    act, (0, padding), mode="constant", value=0
-                )
+            assert act.shape[-1] == layer.w2_weight.shape[self.padding_dim], (
+                f"w8a8 moe gemm requires k % 64 == 0, "
+                f"got act k={act.shape[-1]} != weight k="
+                f"{layer.w2_weight.shape[self.padding_dim]}"
+            )
 
             # w8a8 group gemm 2 + reorder
             if use_ep:

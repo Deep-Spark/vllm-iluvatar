@@ -38,6 +38,11 @@ class IluCompressedTensorsW4A8Int8MoEMethod:
         self.gemm_format = gemm_format
 
 
+class IluCompressedTensorsW8A8Int8MoEMethod:
+    def __init__(self, gemm_format: str):
+        self.gemm_format = gemm_format
+
+
 def _uninitialized_routed_experts() -> IluRoutedExperts:
     obj = IluRoutedExperts.__new__(IluRoutedExperts)
     obj.__dict__["_parameters"] = {}
@@ -222,3 +227,36 @@ def test_load_weights_transposes_fused_w2_weight_scale_layout(
 
 def test_weight_loader_keeps_moe_loading_marker():
     assert IluRoutedExperts.weight_loader.supports_moe_loading is True
+
+
+def test_load_weights_w8a8_nn_chunks_fused_w13_on_last_dim():
+    routed = _uninitialized_routed_experts()
+    routed.moe_config.hidden_dim_unpadded = 2048
+    routed.__dict__["quant_method"] = IluCompressedTensorsW8A8Int8MoEMethod("NN")
+    routed.get_expert_mapping = lambda include_fused=True: [
+        ("experts.w13_weight", "experts.w13", 0, "w1"),
+        ("experts.w13_weight", "experts.w13", 1, "w3"),
+    ]
+    calls: list[tuple[str, torch.Size]] = []
+    routed.__dict__["experts.w13_weight"] = _recording_param(calls)
+
+    list(routed.load_weights([("experts.w13", torch.empty((4, 2048, 3072)))]))
+
+    assert calls
+    assert set(shape for _, shape in calls) == {torch.Size([2048, 1536])}
+
+
+def test_load_weights_w8a8_nn_keeps_fused_w2_as_inter_hidden():
+    routed = _uninitialized_routed_experts()
+    routed.moe_config.hidden_dim_unpadded = 2048
+    routed.__dict__["quant_method"] = IluCompressedTensorsW8A8Int8MoEMethod("NN")
+    routed.get_expert_mapping = lambda include_fused=True: [
+        ("experts.w2_weight", "experts.w2", 0, "w2"),
+    ]
+    calls: list[tuple[str, torch.Size]] = []
+    routed.__dict__["experts.w2_weight"] = _recording_param(calls)
+
+    list(routed.load_weights([("experts.w2", torch.empty((4, 1536, 2048)))]))
+
+    assert calls
+    assert set(shape for _, shape in calls) == {torch.Size([1536, 2048])}

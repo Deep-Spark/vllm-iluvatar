@@ -9,3 +9,6 @@
 # ``grid_thw`` is the standard HuggingFace vision-model identifier for the
 # (temporal, height, width) grid; ``thw`` is not a typo.
 thw = "thw"
+# ``UE8M0`` (Unsigned Exponent 8M0) is the FP8 block-scale format name used by
+# compressed-tensors; ``UE`` is not a typo of ``USE``/``DUE``.
+UE = "UE"

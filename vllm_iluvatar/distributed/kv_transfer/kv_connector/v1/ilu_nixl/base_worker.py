@@ -206,7 +206,7 @@ class IluNixlWorkerMixin:
             next_region_id += 1
             if (
                 self.transfer_topo is not None
-                and self.transfer_topo.virtually_split_kv_in_blocks
+                and self.transfer_topo.is_mamba
                 and not self._is_region_replicated(actual_region_id)
             ):
                 mapping[actual_region_id].append(next_region_id)
@@ -313,7 +313,7 @@ class IluNixlWorkerMixin:
             if region_id == next_region_id:
                 if (
                     self.transfer_topo is not None
-                    and self.transfer_topo.virtually_split_kv_in_blocks
+                    and self.transfer_topo.is_mamba
                     and not self._is_region_replicated(actual_region_id)
                 ):
                     return block_len // 2
@@ -321,7 +321,7 @@ class IluNixlWorkerMixin:
             next_region_id += 1
             if (
                 self.transfer_topo is not None
-                and self.transfer_topo.virtually_split_kv_in_blocks
+                and self.transfer_topo.is_mamba
                 and not self._is_region_replicated(actual_region_id)
             ):
                 if region_id == next_region_id:
@@ -405,6 +405,7 @@ class IluNixlWorkerMixin:
             ),
             num_blocks=self.num_blocks,
             block_lens=self.block_len_per_layer,
+            block_strides=self.block_stride_per_layer,
             kv_cache_layout=self.kv_cache_layout
             if not self.use_host_buffer
             else self.host_buffer_kv_cache_layout,
@@ -414,6 +415,8 @@ class IluNixlWorkerMixin:
             physical_blocks_per_logical_kv_block=(
                 self._physical_blocks_per_logical_kv_block
             ),
+            dcp_size=self.dcp_size,
+            pcp_size=self.pcp_size,
             pp_split=self.pp_split,
             pp_rank=self.pp_rank,
             tp_rank=self.tp_rank,
@@ -1226,6 +1229,7 @@ class IluNixlWorkerMixin:
         remote_request_id: str,
         local_xfer_side_handle: int,
         remote_xfer_side_handle: int,
+        expected_consumers: int = 1,
     ):
         if not self._is_heterogeneous_pp_engine(dst_engine_id):
             return super()._read_blocks(
@@ -1235,6 +1239,7 @@ class IluNixlWorkerMixin:
                 remote_request_id,
                 local_xfer_side_handle,
                 remote_xfer_side_handle,
+                expected_consumers=expected_consumers,
             )
 
         assert self.transfer_topo is not None

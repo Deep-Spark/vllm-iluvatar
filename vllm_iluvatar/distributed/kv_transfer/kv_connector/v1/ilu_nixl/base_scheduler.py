@@ -198,18 +198,20 @@ class IluNixlBaseConnectorScheduler(NixlBaseConnectorScheduler):
         # so ReqMeta carries remote PP topology to the worker.
         meta = IluNixlConnectorMetadata()
 
-        for req_id, (req, block_ids) in self._reqs_need_recv.items():
+        for req_id, (req, block_ids, cached) in self._reqs_need_recv.items():
             assert req.kv_transfer_params is not None
             meta.add_new_req_to_recv(
                 request_id=req_id,
                 local_block_ids=block_ids,
                 kv_transfer_params=req.kv_transfer_params,
+                local_num_computed_blocks=cached,
             )
 
         if self.use_host_buffer:
             self._build_save_meta(meta, scheduler_output)
 
         meta.reqs_to_send = self._reqs_need_send
+        meta.scheduler_clock = time.perf_counter()
         meta.reqs_in_batch = self._reqs_in_batch
         meta.reqs_not_processed = self._reqs_not_processed
 

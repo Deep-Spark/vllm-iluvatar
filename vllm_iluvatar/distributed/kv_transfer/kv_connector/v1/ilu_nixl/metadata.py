@@ -52,12 +52,19 @@ class IluNixlAgentMetadata(NixlAgentMetadata):
 class IluNixlConnectorMetadata(NixlConnectorMetadata):
     """NIXL metadata carrying remote PP topology."""
 
-    def _add_new_req(self, local_block_ids, kv_transfer_params) -> ReqMeta:
+    def _add_new_req(
+        self,
+        local_block_ids,
+        kv_transfer_params,
+        local_num_computed_blocks: tuple[int, ...] = (),
+    ) -> ReqMeta:
         return ReqMeta(
             local_block_ids=local_block_ids,
             local_physical_block_ids=local_block_ids,
             tp_size=kv_transfer_params.get("tp_size", 1),
+            dcp_size=kv_transfer_params.get("dcp_size", 1),
             remote_block_size=kv_transfer_params.get("remote_block_size"),
+            local_num_computed_blocks=local_num_computed_blocks,
             remote_pp_size=kv_transfer_params.get("pp_size", 1),
             remote_pp_split=kv_transfer_params.get("pp_split", ""),
         )

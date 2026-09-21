@@ -2662,7 +2662,7 @@ class IluDeepseekV4Indexer(nn.Module):
                 # ``size(1)`` matches the caller's ``max_context_len`` -- so
                 # callers can pass the raw (possibly odd) token-count
                 # metadata from ``seq_lens.max()`` as-is.
-                logits = ixfops.dsa_indexer_mqa_logits_with_blocks_bf16(
+                logits = ixfops.dsa_indexer_mqa_logits(
                     q[chunk.token_start : chunk.token_end],
                     chunk.cu_seqlens_q,
                     chunk.cu_seq_lens,
@@ -2672,6 +2672,7 @@ class IluDeepseekV4Indexer(nn.Module):
                     max_q_len=chunk.max_q_len,
                     max_kv_len=chunk.max_kv_len,
                     max_context_len=chunk.max_context_len,
+                    valid_lens=chunk.valid_lens,
                 )
                 ixfops.dsa_update_topk_indices(
                     logits,
@@ -2686,7 +2687,7 @@ class IluDeepseekV4Indexer(nn.Module):
             assert decode_md is not None
             # Ragged (non-uniform query length) decode batches -- e.g. K>=2 MTP
             # where requests carry a variable number of accepted/proposed spec
-            # tokens -- are supported natively. ``dsa_indexer_mqa_logits_with_blocks_bf16``
+            # tokens -- are supported natively. ``dsa_indexer_mqa_logits``
             # iterates requests via ``cu_seqlens_q`` (the same variable-q path
             # prefill uses) and ``cu_seqlen_ks/ke`` carry one causal span per
             # query token, so each decode token is an independent logits/topk
@@ -2701,7 +2702,7 @@ class IluDeepseekV4Indexer(nn.Module):
                 # cannot materialize a bf16 logits matrix with zero columns.
                 topk_buffer[:num_decode_tokens].fill_(-1)
                 return topk_buffer
-            logits = ixfops.dsa_indexer_mqa_logits_with_blocks_bf16(
+            logits = ixfops.dsa_indexer_mqa_logits(
                 q[:num_decode_tokens],
                 decode_md.cu_seqlens_q,
                 decode_md.cu_seqlens_kv,
@@ -2711,6 +2712,7 @@ class IluDeepseekV4Indexer(nn.Module):
                 max_q_len=decode_md.max_q_len,
                 max_kv_len=decode_md.max_kv_len,
                 max_context_len=decode_md.max_context_len,
+                valid_lens=decode_md.valid_lens,
             )
             ixfops.dsa_update_topk_indices(
                 logits,

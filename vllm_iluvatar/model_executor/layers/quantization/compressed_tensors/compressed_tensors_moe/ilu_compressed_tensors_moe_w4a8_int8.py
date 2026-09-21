@@ -7,6 +7,7 @@ describes 4-bit weights with 8-bit activations. Layout is taken from
 ``iluvatar.gemm_format`` and ``iluvatar.pack_version``.
 """
 
+import os
 from typing import Any
 
 import ixformer.inference.functions as ixfops  # type: ignore
@@ -33,6 +34,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
 )
+from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa E501
     CompressedTensorsMoEMethod,
 )
@@ -47,6 +49,9 @@ from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_uti
     pad_tensor,
     replace_with_padded,
     unpad_tensor,
+)
+from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.ilu_w4a8_layout import (  # noqa: E501
+    repack_w4a8_tn_to_nn,
 )
 
 logger = init_logger("vllm." + __name__)
@@ -147,6 +152,10 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
 
         self.weight_symmetric = self.weight_quant.symmetric
         self.gemm_format = ilu_params.get("gemm_format", "")
+        # Allocate in checkpoint layout; optionally switch the loaded runtime copy.
+        self.runtime_gemm_format = os.environ.get(
+            "VLLM_ILU_MOE_RUNTIME_LAYOUT", self.gemm_format
+        ).upper()
         self.version = ilu_params.get("pack_version", -1)
         assert self.version == 2, (
             "IluCompressedTensorsW4A8Int8MoEMethod only supports version 2"
@@ -154,6 +163,23 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         assert self.gemm_format in ["TN", "NN"], (
             "IluCompressedTensorsW4A8Int8MoEMethod only supports format TN or NN"
         )
+        if self.runtime_gemm_format not in ("TN", "NN"):
+            raise ValueError(
+                "VLLM_ILU_MOE_RUNTIME_LAYOUT must be TN or NN, got "
+                f"{self.runtime_gemm_format!r}"
+            )
+        if self.runtime_gemm_format != self.gemm_format and not (
+            self.gemm_format == "TN" and self.runtime_gemm_format == "NN"
+        ):
+            raise NotImplementedError(
+                "Only packed TN checkpoint to NN runtime conversion is supported"
+            )
+        if self.runtime_gemm_format != self.gemm_format and (
+            self.group_size != -1 or not self.weight_symmetric
+        ):
+            raise NotImplementedError(
+                "Runtime TN→NN conversion requires symmetric per-channel W4A8 v2"
+            )
         if not (
             (
                 self.weight_quant.strategy == QuantizationStrategy.CHANNEL
@@ -549,6 +575,9 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 log_prefix=_log_prefix("w2", "input_scale"),
             )
 
+        if self.runtime_gemm_format == "NN" and self.gemm_format == "TN":
+            self._repack_loaded_weights_to_nn(layer)
+
         if envs.VLLM_ILU_MOE_EP_LL_MOE_ALGO == "FUSED":
             if self.gemm_format != "TN" or self.version != 2 or self.group_size != -1:
                 raise NotImplementedError(
@@ -558,6 +587,66 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 layer.w13_weight,
                 layer.w2_weight,
             )
+
+    @torch.no_grad()
+    def _repack_loaded_weights_to_nn(self, layer: torch.nn.Module) -> None:
+        """Switch real TN checkpoint bytes to ixformer's packed NN layout."""
+        if envs.VLLM_ILU_MOE_EP_LL_MOE_ALGO == "FUSED":
+            raise NotImplementedError("FUSED MoE requires TN runtime layout")
+
+        nn1 = W4A8GroupGemmInfo(
+            "NN", k=self.gemm1_info.get_k(), n=self.gemm1_info.get_n()
+        )
+        nn2 = W4A8GroupGemmInfo(
+            "NN", k=self.gemm2_info.get_k(), n=self.gemm2_info.get_n()
+        )
+        for name, tn_info, nn_info, shard_dim in (
+            ("w13_weight", self.gemm1_info, nn1, 1),
+            ("w2_weight", self.gemm2_info, nn2, 0),
+        ):
+            # Keep the existing scales and workspace geometry unchanged.
+            if (
+                tn_info.get_pad_k() != nn_info.get_pad_k()
+                or tn_info.get_pad_n() != nn_info.get_pad_n()
+            ):
+                raise NotImplementedError(
+                    f"{name}: TN and NN padding differ; this experiment only "
+                    "supports the aligned DeepSeek-V4 W4A8 model"
+                )
+            param = getattr(layer, name)
+            if tuple(param.shape) != (
+                param.shape[0],
+                *tn_info.get_pad_weight_shape(),
+            ):
+                raise ValueError(f"Unexpected packed TN shape for {name}: {tuple(param.shape)}")
+            old_attrs = {key: value for key, value in vars(param).items() if not key.startswith("_")}
+            nn_weight = repack_w4a8_tn_to_nn(
+                param.data,
+                logical_n=tn_info.get_n(),
+                logical_k=tn_info.get_k(),
+                nn_n=nn_info.get_pad_n(),
+                nn_k=nn_info.get_pad_k(),
+            )
+            replace_parameter(
+                layer, name, torch.nn.Parameter(nn_weight, requires_grad=False)
+            )
+            converted = getattr(layer, name)
+            for key, value in old_attrs.items():
+                setattr(converted, key, value)
+            converted.shard_dim = shard_dim
+            if tuple(converted.shape) != (
+                param.shape[0],
+                *nn_info.get_pad_weight_shape(),
+            ):
+                raise AssertionError(f"Unexpected packed NN shape for {name}")
+
+        self.gemm1_info = nn1
+        self.gemm2_info = nn2
+        self.gemm_format = "NN"
+        logger.info_once(
+            "[W4A8 runtime layout] repacked TN checkpoint to NN for "
+            "G1 and G2; scales unchanged; kernel format=0"
+        )
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module

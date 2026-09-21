@@ -77,6 +77,13 @@ class IluMoEStandardExpertsW4A8(BaseStandardExperts):
         self.gemm1_info = gemm1_info
         self.gemm2_info = gemm2_info
 
+    def moe_problem_size(self, a1, w1, w2, topk_ids):
+        # BaseStandardExperts reads N from w1.shape[1], which is K for NN.
+        experts, tokens, _, hidden, topk = super().moe_problem_size(
+            a1, w1, w2, topk_ids
+        )
+        return experts, tokens, self.gemm1_info.get_pad_n(), hidden, topk
+
     def apply(
         self,
         output: torch.Tensor,

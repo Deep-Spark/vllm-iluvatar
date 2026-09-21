@@ -185,6 +185,9 @@ class IluGemmaRMSNorm(GemmaRMSNorm):
 
     # [ILU override] GemmaRMSNorm.forward_native — delta: route through the
     # Iluvatar fused_add_rms_norm with explicit float upcast / dtype restore.
+    # residual is upcast together with x: residual_rms_norm requires both to
+    # share a dtype, otherwise the kernel reads the fp16/bf16 residual buffer
+    # with an fp32 stride and corrupts the add.
     def forward_native(
         self,
         x: torch.Tensor,
@@ -192,12 +195,13 @@ class IluGemmaRMSNorm(GemmaRMSNorm):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         orig_dtype = x.dtype
         weight = self.weight.data.float() + 1.0
-        out, residual = fused_add_rms_norm(
-            x.float(), residual, weight, self.variance_epsilon
+        if residual is None:
+            out, _ = fused_add_rms_norm(x.float(), None, weight, self.variance_epsilon)
+            return out.to(orig_dtype)
+        out, residual_out = fused_add_rms_norm(
+            x.float(), residual.float(), weight, self.variance_epsilon
         )
-        return (
-            out.to(orig_dtype) if residual is None else (out.to(orig_dtype), residual)
-        )
+        return out.to(orig_dtype), residual_out.to(orig_dtype)
 
     # [ILU override] GemmaRMSNorm.forward_cuda — delta: 2D fast path via ixformer
     # gemma_rms_norm (+ optional dynamic-int8 fusion); extra trailing kwargs are

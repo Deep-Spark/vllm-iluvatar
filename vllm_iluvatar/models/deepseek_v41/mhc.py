@@ -73,22 +73,43 @@ def hc_pre_mixes(
     hc_eps: float,
     post_mult: float = 2.0,
     hc_fn_io: torch.Tensor | None = None,
+    sqrsum: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Installed _C.so still exports the pre-rename symbol. Prefer the new
-    # name; fall back so eval can run before ixformer is rebuilt.
-    _mhc_pre = getattr(ixfops, "ds4_v41_mhc_pre", None) or ixfops.ds4_mhc_pre_v41
-    post, comb, layer_input, pre_out = _mhc_pre(
-        x.contiguous(),
-        hc_fn if hc_fn_io is None else hc_fn_io,
-        hc_scale,
-        hc_base,
-        norm_eps,
-        hc_eps,
-        hc_eps,
-        post_mult,
-        sinkhorn_iters,
-        pre_mix_in,
-    )
+    """Project, split and collapse ``x``.
+
+    ``sqrsum`` is the sum of squares of ``x`` per token, from
+    :func:`hc_post_sqrsum`. Given it, the epilogue has no token-wide reduction
+    left to do and streams instead, which is ~2x on the kernel; without it the
+    op reduces the rms itself.
+    """
+    fn = hc_fn if hc_fn_io is None else hc_fn_io
+    if sqrsum is None:
+        post, comb, layer_input, pre_out = ixfops.ds4_v41_mhc_pre(
+            x.contiguous(),
+            fn,
+            hc_scale,
+            hc_base,
+            norm_eps,
+            hc_eps,
+            hc_eps,
+            post_mult,
+            sinkhorn_iters,
+            pre_mix_in,
+        )
+    else:
+        post, comb, layer_input, pre_out = ixfops.ds4_v41_mhc_pre_1pass(
+            x.contiguous(),
+            fn,
+            hc_scale,
+            hc_base,
+            sqrsum,
+            norm_eps,
+            hc_eps,
+            hc_eps,
+            post_mult,
+            sinkhorn_iters,
+            pre_mix_in,
+        )
     return post.squeeze(-1), comb, layer_input, pre_out
 
 
@@ -99,6 +120,27 @@ def hc_post(
     comb: torch.Tensor,
 ) -> torch.Tensor:
     return ixfops.ds4_mhc_post(
+        x.contiguous(),
+        residual.contiguous(),
+        post.contiguous(),
+        comb.contiguous(),
+    )
+
+
+def hc_post_sqrsum(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``hc_post`` that also returns the sum of squares of the residual it writes.
+
+    The next sub-block's ``pre`` needs exactly that to form its rms, and post
+    holds the values in registers anyway, so the second output is free. Pass it
+    to :func:`hc_pre_mixes` as ``sqrsum`` -- but only if nothing rewrites the
+    residual in between.
+    """
+    return ixfops.ds4_v41_mhc_post_sqrsum(
         x.contiguous(),
         residual.contiguous(),
         post.contiguous(),

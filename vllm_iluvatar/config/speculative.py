@@ -47,19 +47,25 @@ _ILU_MTP_ARCH_MAP = {
     "IluDeepseekV4ForCausalLM": "IluDeepSeekV4MTPModel",
 }
 
-# Community draft arch -> ilu draft arch, keyed by the architecture community
-# assigns in SpeculativeConfig.__post_init__. DSpark reuses the DeepSeek-V4
-# stack but is a separate draft arch from MTP, so it must never be routed
-# through _ILU_MTP_ARCH_MAP.
-_ILU_DSPARK_ARCH_MAP = {
-    "DSparkDraftModel": "IluDSparkDraftModel",
+# The draft arch community assigns in SpeculativeConfig.__post_init__ for every
+# DeepSeek-family DSpark. DSpark reuses the DeepSeek-V4 stack but is a separate
+# draft arch from MTP, so it must never be routed through _ILU_MTP_ARCH_MAP.
+_ILU_DSPARK_COMMUNITY_ARCHS = ("DSparkDraftModel",)
+
+# Target arch -> ilu DSpark draft arch. V4 and V4.1 share the DSpark scheme but
+# not the decoder layer (V4.1 defers its FFN hc_post and has no global MHC head),
+# so the draft class depends on which target is loaded.
+_ILU_DSPARK_DRAFT_BY_TARGET = {
+    "IluDeepseekV4ForCausalLM": "IluDSparkDraftModel",
+    "DeepseekV4ForCausalLM": "IluDSparkDraftModel",
+    "DeepseekV41ForCausalLM": "IluDSparkV41DraftModel",
 }
 
-# Target architectures whose DSpark draft should use the ilu implementation.
-_ILU_DSPARK_TARGET_ARCHS = (
-    "IluDeepseekV4ForCausalLM",
-    "DeepseekV4ForCausalLM",
-)
+# Targets that read ``dspark_target_layer_ids`` as the layers whose *input* feeds
+# the draft. Community's aux-layer resolution shifts those ids by one, which is
+# the V4 convention; naming them explicitly under the key it checks first
+# (``eagle_aux_hidden_state_layer_ids``) bypasses the shift.
+_ILU_DSPARK_UNSHIFTED_AUX_TARGETS = ("DeepseekV41ForCausalLM",)
 
 
 def make_post_init(orig: Callable[..., None]) -> Callable[..., None]:
@@ -80,13 +86,25 @@ def make_post_init(orig: Callable[..., None]) -> Callable[..., None]:
             if self.target_model_config is None
             else list(self.target_model_config.architectures)
         )
-        if any(arch in _ILU_DSPARK_TARGET_ARCHS for arch in target_archs):
+        draft_arch = next(
+            (
+                _ILU_DSPARK_DRAFT_BY_TARGET[arch]
+                for arch in target_archs
+                if arch in _ILU_DSPARK_DRAFT_BY_TARGET
+            ),
+            None,
+        )
+        if draft_arch is not None:
             hf_config = self.draft_model_config.hf_config
             current = list(getattr(hf_config, "architectures", None) or [])
-            remapped = [_ILU_DSPARK_ARCH_MAP.get(arch, arch) for arch in current]
+            remapped = [
+                draft_arch if arch in _ILU_DSPARK_COMMUNITY_ARCHS else arch
+                for arch in current
+            ]
             if remapped != current:
                 hf_config.architectures = remapped
                 self.update_arch_()
+
 
         # The draft ModelConfig logs "Resolved architecture" while the MTP
         # remap is still in effect, so that line names the wrong arch for
@@ -99,6 +117,37 @@ def make_post_init(orig: Callable[..., None]) -> Callable[..., None]:
     return __post_init__
 
 
+def _fixup_v41_dspark_config(hf_config: PretrainedConfig) -> None:
+    """Patch the two DSpark fields V4.1 reads differently from V4.
+
+    Both have to land here rather than in ``__post_init__``: community reads
+    ``n_predict`` while resolving ``num_speculative_tokens`` inside
+    ``__post_init__`` itself, so a later write is too late.
+
+    ``n_predict``
+        V4.1 drafts a block of ``dspark_block_size`` (5) tokens per step, not
+        ``num_nextn_predict_layers`` (3). Nothing sets ``n_predict`` for
+        ``model_type == "deepseek_v41"`` -- none of community's branches match it
+        -- so ``num_speculative_tokens`` would be left for the user to supply and
+        then rejected by the ``>= dspark_block_size`` check. V4.1 has no MTP
+        draft registered, so claiming this field for DSpark is unambiguous.
+
+    ``eagle_aux_hidden_state_layer_ids``
+        ``dspark_target_layer_ids`` names the layers whose *input* feeds the
+        draft, but community's aux resolution shifts DSpark ids by one (the V4
+        convention, where they name the layers to capture after). It checks
+        ``eagle_aux_hidden_state_layer_ids`` first and returns it unshifted, so
+        writing the ids there is what pins the capture points.
+    """
+    block_size = getattr(hf_config, "dspark_block_size", None)
+    if block_size is not None and getattr(hf_config, "n_predict", None) is None:
+        hf_config.update({"n_predict": block_size})
+
+    layer_ids = getattr(hf_config, "dspark_target_layer_ids", None)
+    if layer_ids and not getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None):
+        hf_config.update({"eagle_aux_hidden_state_layer_ids": list(layer_ids)})
+
+
 def make_hf_config_override(
     orig: Callable[[PretrainedConfig], PretrainedConfig],
 ) -> Callable[[PretrainedConfig], PretrainedConfig]:
@@ -106,15 +155,19 @@ def make_hf_config_override(
 
     Captures the target model's original architecture, delegates to the public
     routing, then swaps the resulting draft arch to the ilu MTP model when the
-    target is an ilu W4A8 fork. Non-ilu targets are returned unchanged. DSpark
-    is not handled here: community assigns that arch later, in
-    ``__post_init__`` (see ``make_post_init``).
+    target is an ilu W4A8 fork. Non-ilu targets are returned unchanged. DSpark's
+    *arch* is not handled here -- community assigns that later, in
+    ``__post_init__`` (see ``make_post_init``) -- but the V4.1 DSpark config
+    fields are, because ``__post_init__`` already depends on them.
     """
 
     @functools.wraps(orig)
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
         architectures = getattr(hf_config, "architectures", None) or []
         initial_architecture = architectures[0] if architectures else None
+
+        if initial_architecture in _ILU_DSPARK_UNSHIFTED_AUX_TARGETS:
+            _fixup_v41_dspark_config(hf_config)
 
         hf_config = orig(hf_config)
 

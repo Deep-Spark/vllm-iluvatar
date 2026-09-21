@@ -15,6 +15,7 @@ from vllm.model_executor.models.utils import (
     WeightsMapper,
     extract_layer_index,
 )
+from vllm.model_executor.models.interfaces import SupportsEagle3
 from vllm.sequence import IntermediateTensors
 
 from vllm_iluvatar.models.deepseek_v4.fp8_model import (
@@ -38,6 +39,18 @@ logger = init_logger(f"vllm.{__name__}")
 
 # Engram tables are loaded from mmap, not the vLLM weight iterator.
 _ENGRAM_SKIP = re.compile(r"(^|\.)engram\.")
+
+
+def default_aux_hidden_state_layers(hf_config) -> tuple[int, ...]:
+    """Aux capture layers for a V4.1 DSpark draft.
+
+    V4.1 reads ``dspark_target_layer_ids`` as the layers whose *input* feeds the
+    draft, so these ids pass through unshifted and the model captures before
+    them. V4 names the layers to capture *after* and shifts by one; both end up
+    calling ``hc_post`` at the same place, which is why the capture condition in
+    ``forward`` is shared.
+    """
+    return tuple(getattr(hf_config, "dspark_target_layer_ids", None) or ())
 
 
 def _make_v41_weights_mapper() -> WeightsMapper:
@@ -74,6 +87,7 @@ class IluDeepseekV41DecoderLayer(IluDeepseekV4Fp8DecoderLayer):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
         pre_mix_in: torch.Tensor,
+        sqrsum: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project, split, and collapse. Cache the bf16 copy of ``hc_fn``."""
         cached = self._hc_fn_io_cache.get(name)
@@ -92,6 +106,7 @@ class IluDeepseekV41DecoderLayer(IluDeepseekV4Fp8DecoderLayer):
             hc_eps=self.hc_eps,
             post_mult=self.hc_post_alpha,
             hc_fn_io=cached,
+            sqrsum=sqrsum,
         )
 
     def forward(
@@ -106,23 +121,31 @@ class IluDeepseekV41DecoderLayer(IluDeepseekV4Fp8DecoderLayer):
         engram_rows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """``(x, residual, post_mix, res_mix, ffn_pre)``; FFN post is delayed."""
+        # Each post hands the pre that follows it the sum of squares of the
+        # residual it just wrote, so the pre can stream instead of reducing it
+        # again. sqrsum stays None wherever that chain is broken: the first
+        # layer has no post, and engram rewrites the residual after one.
+        sqrsum = None
         if residual is None:
             residual = x
         else:
-            residual = mhc.hc_post(x, residual, post_mix, res_mix)
+            residual, sqrsum = mhc.hc_post_sqrsum(x, residual, post_mix, res_mix)
 
         if self.engram is not None and engram_rows is not None:
             residual = self.engram.apply(residual, engram_rows)
+            sqrsum = None
 
         attn_post, attn_comb, h, attn_pre = self._hc_pre_mixes(
-            residual, "attn", self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base, pre_mix
+            residual, "attn", self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
+            pre_mix, sqrsum
         )
         h = self.attn_norm(h)
         h = self.attn(positions, h, None)
-        residual = mhc.hc_post(h, residual, attn_post, attn_comb)
+        residual, attn_sqrsum = mhc.hc_post_sqrsum(h, residual, attn_post, attn_comb)
 
         ffn_post, ffn_comb, h, ffn_pre = self._hc_pre_mixes(
-            residual, "ffn", self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base, attn_pre
+            residual, "ffn", self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
+            attn_pre, attn_sqrsum
         )
         h = self.ffn_norm(h)
         h = self.ffn(h, input_ids)
@@ -134,10 +157,14 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
 
     decoder_layer_cls = IluDeepseekV41DecoderLayer
 
-    # Shared-expert gate_up only. Attention / compressor linears stay unfused.
+    # Shared-expert gate_up, plus attention's wq_a/wkv (both read the same normed
+    # hidden state, so they are one GEMM). The compressor linears stay unfused:
+    # V4.1's compressor has no ``wgate`` to pair ``wkv`` with.
     stacked_params_mapping = [
         ("gate_up_proj", "w1", 0),
         ("gate_up_proj", "w3", 1),
+        ("attn.fused_wqa_wkv", "attn.wq_a", 0),
+        ("attn.fused_wqa_wkv", "attn.wkv", 1),
     ]
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -146,6 +173,10 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
         # No global MHC head in the V4.1 checkpoint.
         del self.hc_head_fn, self.hc_head_base, self.hc_head_scale
         self._mtp_hidden_buffer = None
+
+        # Set by IluDeepseekV41ForCausalLM.set_aux_hidden_state_layers when a
+        # DSpark draft is active.
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
 
         config = self.config
         self.engram_layer_ids = list(getattr(config, "engram_layer_ids", ()) or ())
@@ -270,8 +301,18 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
-        """Embed -> local layers -> leftover FFN post -> collapse or PP send."""
+    ) -> (
+        torch.Tensor
+        | IntermediateTensors
+        | tuple[torch.Tensor, list[torch.Tensor]]
+    ):
+        """Embed -> local layers -> leftover FFN post -> collapse or PP send.
+
+        Returns ``(hidden_states, aux)`` instead of a bare tensor when a DSpark
+        draft asked for aux layers. Like V4, aux only survives if the capture
+        layers live on the last PP rank; the ilu speculative config pins draft
+        PP to 1, so that is the only configuration this is exercised in.
+        """
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -289,7 +330,10 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
 
         engram_rows = self._prepare_engram_rows(input_ids, positions)
         residual = post_mix = res_mix = None
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        aux_hidden_states: list[torch.Tensor] = []
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer), self.start_layer
+        ):
             hidden_states, residual, post_mix, res_mix, pre_mix = layer(
                 hidden_states,
                 positions,
@@ -300,6 +344,14 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
                 residual,
                 engram_rows.get(layer.layer_id),
             )
+            if (idx + 1) in self.aux_hidden_state_layers:
+                # ``hidden_states`` is this layer's delayed FFN output, not the
+                # hc stream, so folding it is what the next layer would do first.
+                # Mean-pool the hc_mult copies to the [T, H] the DSpark combiner
+                # wants -- a plain mean, not the learned ``pre_mix`` collapse.
+                aux_hidden_states.append(
+                    mhc.hc_post(hidden_states, residual, post_mix, res_mix).mean(dim=1)
+                )
 
         hidden_states = mhc.hc_post(hidden_states, residual, post_mix, res_mix)
         if not get_pp_group().is_last_rank:
@@ -307,7 +359,10 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
                 {"hidden_states": hidden_states, "pre_mix": pre_mix}
             )
         hidden_states = mhc.hc_pre(hidden_states, pre_mix)
-        return self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
+        return hidden_states
 
     def load_engram_weights(self) -> None:
         """Load the engram tensors that bypass the vLLM weight path."""
@@ -318,7 +373,7 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
             layer.engram.load_from_checkpoint(self.model_path)
 
 
-class IluDeepseekV41ForCausalLM(IluDeepseekV4Fp8ForCausalLM):
+class IluDeepseekV41ForCausalLM(IluDeepseekV4Fp8ForCausalLM, SupportsEagle3):
     """DeepSeek-V4.1-Flash on Iluvatar, raw FP8 checkpoint, text-only."""
 
     is_attention_free = False
@@ -337,6 +392,29 @@ class IluDeepseekV41ForCausalLM(IluDeepseekV4Fp8ForCausalLM):
         if getattr(self.model, "engram_layer_ids", None):
             self.model.load_engram_weights()
         return loaded
+
+    @property
+    def get_mtp_target_hidden_states(self):
+        """Absent on purpose: V4.1 has no MTP draft.
+
+        The parent hands the drafter its pre-hc_head residual buffer, which V4.1
+        never fills (``_mtp_hidden_buffer`` is None). The runner probes for this
+        hook with ``hasattr`` and then indexes whatever it gets back, so
+        inheriting it means a ``NoneType`` subscript; raising ``AttributeError``
+        is what makes ``hasattr`` answer False for an inherited name. DSpark does
+        not want the residual anyway -- it builds its own input from the aux
+        hidden states, and ignores ``last_hidden_states`` whenever aux is present.
+        """
+        raise AttributeError(
+            "IluDeepseekV41ForCausalLM has no MTP draft; DSpark reads the aux "
+            "hidden states instead of the pre-hc_head residual"
+        )
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = tuple(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return default_aux_hidden_state_layers(self.config)
 
 
 def register_model() -> None:

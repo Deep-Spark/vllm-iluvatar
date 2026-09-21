@@ -1,8 +1,6 @@
-"""Decode-side paged MLA: global slots + ``ds4_flash_mla_with_kvcache`` v3.
-"""
+"""Decode-side sparse MLA: global slots + ``ds4_flash_mla_with_kvcache`` v3."""
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -10,25 +8,8 @@ import torch
 if TYPE_CHECKING:
     from vllm_iluvatar.models.deepseek_v41.paged_caches import V41AttentionMetadata
 
-_TRUE = ("1", "true", "yes", "on")
 
-
-def decode_wkv_enabled() -> bool:
-    return os.environ.get("V41_DECODE_WKV", "1").strip().lower() in _TRUE
-
-
-def prefill_as_decode_enabled() -> bool:
-    """Route prefill through this file too, instead of building a dense plane.
-
-    ``ds4_compute_swa_decode_indices_and_lens`` derives each token's position
-    from ``query_start_loc`` / ``seq_lens``, so it covers a multi-token query
-    unchanged; ``b = num_tokens, s_q = 1`` then makes ``topk_length``'s
-    per-batch semantics per-token.
-    """
-    return os.environ.get("V41_PREFILL_AS_DECODE", "0").strip().lower() in _TRUE
-
-
-def as_wkv_cache(cache: torch.Tensor) -> torch.Tensor:
+def as_flashmla_cache(cache: torch.Tensor) -> torch.Tensor:
     if cache.dim() == 4:
         if cache.size(-2) != 1:
             raise ValueError(
@@ -136,28 +117,28 @@ def finalize_rows_torch(
     return fill_walk_padding(slots, counts), counts
 
 
-def build_swa_decode_indices(
+def _slots_from_windows(
     block_table: torch.Tensor,
     block_size: int,
-    token_to_req_indices: torch.Tensor,
-    positions: torch.Tensor,
-    window_size: int,
+    reqs: torch.Tensor,
+    lo: torch.Tensor,
+    n_win: torch.Tensor,
+    width: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Causal SWA global slots from ``positions``. Block 0 → ``-1``.
+    """Global slots for the per-token windows ``[lo, lo + n_win)``, ``width`` wide.
+
+    Shared by the causal and non-causal front-ends: they differ only in how the
+    window is placed, and everything after that -- the block-table gather, the
+    block-0 drop, the packing -- is the same walk.
     """
-    nd = int(positions.size(0))
-    device = positions.device
-    pos = positions.to(torch.int64)
-    n_win = (pos + 1).clamp(max=window_size)
-    lo = pos + 1 - n_win
-    offs = torch.arange(window_size, device=device, dtype=torch.int64)
+    nd = int(lo.size(0))
+    offs = torch.arange(width, device=lo.device, dtype=torch.int64)
     raw = lo.unsqueeze(1) + offs
     in_win = offs.unsqueeze(0) < n_win.unsqueeze(1)
 
-    reqs = token_to_req_indices[:nd].to(torch.int64)
     n_reqs, max_blocks = int(block_table.size(0)), int(block_table.size(1))
     if n_reqs == 0 or max_blocks == 0:
-        empty = pos.new_full((nd, window_size), -1, dtype=torch.int32)
+        empty = lo.new_full((nd, width), -1, dtype=torch.int32)
         return empty, n_win.to(torch.int32)
 
     blk_idx = torch.div(raw, block_size, rounding_mode="floor")
@@ -173,6 +154,67 @@ def build_swa_decode_indices(
     ok = in_range & (blocks > 0)
     indices = torch.where(ok, slots, slots.new_full((), -1)).to(torch.int32)
     return pack_valid_slots(indices)
+
+
+def build_swa_decode_indices(
+    block_table: torch.Tensor,
+    block_size: int,
+    token_to_req_indices: torch.Tensor,
+    positions: torch.Tensor,
+    window_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Causal SWA global slots from ``positions``. Block 0 → ``-1``.
+    """
+    nd = int(positions.size(0))
+    pos = positions.to(torch.int64)
+    n_win = (pos + 1).clamp(max=window_size)
+    return _slots_from_windows(
+        block_table,
+        block_size,
+        token_to_req_indices[:nd].to(torch.int64),
+        pos + 1 - n_win,
+        n_win,
+        window_size,
+    )
+
+
+def build_noncausal_swa_decode_indices(
+    block_table: torch.Tensor,
+    block_size: int,
+    token_to_req_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_decode_tokens: int,
+    window_size: int,
+    index_width: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Non-causal SWA global slots for a DSpark draft block. Block 0 → ``-1``.
+
+    DSpark drafts a whole block in one forward and lets its tokens attend to each
+    other, so a window is not cut at the querying token's own position: every
+    token of a request reads the same keys, the ``window_size`` of context before
+    the block plus the block itself. That is ``[max(prefix_len - window_size, 0),
+    seq_len)``, which needs rows ``window_size + n_predict`` wide.
+
+    Same arithmetic as community's ``_compute_dspark_noncausal_swa_indices_
+    kernel`` (vllm/v1/attention/backends/mla/sparse_swa.py:795-856, baseline
+    main_6e448d0), vectorised rather than looped: the V4 port of that kernel
+    reads four tensors back with ``.tolist()`` and rebuilds the rows per request
+    on the host, which is a device sync per SWA layer per step.
+
+    ``positions`` is not an argument because the window is a property of the
+    request, not of the token -- which is also why the draft never needs the
+    positions the speculator leaves unset.
+    """
+    nd = num_decode_tokens
+    reqs = token_to_req_indices[:nd].to(torch.int64)
+    qsl = query_start_loc.to(torch.int64)
+    query_lens = qsl[1:].index_select(0, reqs) - qsl[:-1].index_select(0, reqs)
+    seq = seq_lens.to(torch.int64).index_select(0, reqs)
+    lo = (seq - query_lens - window_size).clamp(min=0)
+    return _slots_from_windows(
+        block_table, block_size, reqs, lo, seq - lo, index_width
+    )
 
 
 def build_extra_decode_indices(
@@ -291,6 +333,23 @@ def decode_swa_indices(
     slot_limit: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     nd = int(positions.size(0))
+    if not md.causal:
+        # The ixformer builder walks a window ending at each token's own
+        # position, so there is no argument that makes it emit a block-anchored
+        # one; the draft takes the torch path until a kernel grows the mode.
+        return finalize_rows_torch(
+            *build_noncausal_swa_decode_indices(
+                md.block_table,
+                md.block_size,
+                md.token_to_req_indices,
+                md.query_start_loc,
+                md.seq_lens,
+                nd,
+                window_size,
+                md.noncausal_index_width,
+            ),
+            slot_limit,
+        )
     use_cuda = (
         positions.is_cuda
         and ixfops is not None
@@ -351,7 +410,7 @@ def decode_extra_indices(
     )
 
 
-def decode_attn_wkv(
+def decode_sparse_mla(
     q: torch.Tensor,
     window_cache: torch.Tensor,
     window_md: V41AttentionMetadata,
@@ -373,7 +432,7 @@ def decode_attn_wkv(
     del group_lens
     import ixformer.inference.functions as ixfops
 
-    window_cache = as_wkv_cache(window_cache)
+    window_cache = as_flashmla_cache(window_cache)
     # The builders take the cache size and hand back rows already in v3's
     # shape; clamping, packing and walk-padding here cost three more passes
     # over every row, per layer, for a result the kernel can produce as it
@@ -394,7 +453,7 @@ def decode_attn_wkv(
         and group_idxs is not None
         and group_idxs.size(-1) > 0
     ):
-        extra_cache = as_wkv_cache(compress_cache)
+        extra_cache = as_flashmla_cache(compress_cache)
         extra_idx, extra_len = decode_extra_indices(
             compress_md,
             group_idxs,
@@ -413,7 +472,7 @@ def decode_attn_wkv(
 
     out = ixfops.ds4_flash_mla_with_kvcache(
         q=q.unsqueeze(1).contiguous(),
-        k_cache=as_wkv_cache(window_cache),
+        k_cache=as_flashmla_cache(window_cache),
         indices=swa_idx.unsqueeze(1).contiguous(),
         topk_length=swa_len.contiguous(),
         sm_scale=scale,

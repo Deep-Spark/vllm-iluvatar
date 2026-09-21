@@ -199,13 +199,42 @@ def compute_hash_multipliers(
     return torch.stack(rows)
 
 
-def _first_window_layer():
+def _max_batched_tokens() -> int:
+    """Token ceiling for one forward, for sizing host staging up front.
+
+    Model construction runs inside ``set_current_vllm_config``, so the
+    scheduler config is the real one here (unlike ``_first_window_layer``,
+    which needs a registry that is only populated later). 0 if it is not.
+    """
     try:
         from vllm.config import get_current_vllm_config
 
-        ctx = get_current_vllm_config().compilation_config.static_forward_context
+        return int(get_current_vllm_config().scheduler_config.max_num_batched_tokens)
     except Exception:
-        return None
+        return 0
+
+
+def _first_window_layer():
+    # The forward context is the only registry that is populated here. Reading
+    # it off get_current_vllm_config() instead silently yields an empty dict:
+    # outside a set_current_vllm_config scope that call hands back a fresh
+    # default config, so every lookup missed and ensure_slots fell through to
+    # its blocking *.max() path on each call.
+    ctx = None
+    try:
+        from vllm.forward_context import get_forward_context
+
+        ctx = get_forward_context().no_compile_layers
+    except Exception:
+        ctx = None
+    if not isinstance(ctx, dict) or not ctx:
+        # No forward in flight (model init): the config still holds the registry.
+        try:
+            from vllm.config import get_current_vllm_config
+
+            ctx = get_current_vllm_config().compilation_config.static_forward_context
+        except Exception:
+            return None
     if not isinstance(ctx, dict):
         return None
     fallback = None
@@ -289,6 +318,8 @@ class EngramTokenHistory(nn.Module):
         )
         self.max_seq_len = max_seq_len
         self._slots: torch.Tensor | None = None
+        # Usable length of ``_slots``, which carries one extra trailing sink.
+        self._nslots = 0
 
     def _compress(self, ids: torch.Tensor) -> torch.Tensor:
         return self.token_map[ids.long().clamp(0, self.token_map.numel() - 1)]
@@ -325,23 +356,34 @@ class EngramTokenHistory(nn.Module):
             need = min(int(sm.index_select(0, sel).amax().item()) + 1, cap)
         if need <= 0:
             return None
-        if self._slots is None or self._slots.numel() < need:
-            grown = torch.zeros(need, dtype=torch.int64, device=self.token_map.device)
+        # One trailing slot past ``need`` is a write sink: ``update_slots`` aims
+        # the rows whose slot is out of range at it rather than selecting the
+        # valid ones, which needs ``nonzero`` -- a host round trip, and rejected
+        # outright while a graph captures. Nothing ever reads it.
+        if self._slots is None or self._slots.numel() < need + 1:
+            grown = torch.zeros(
+                need + 1, dtype=torch.int64, device=self.token_map.device
+            )
             if self._slots is not None:
-                grown[: self._slots.numel()] = self._slots
+                keep = min(self._nslots, need)
+                grown[:keep] = self._slots[:keep]
             self._slots = grown
+        self._nslots = need
         return self._slots
 
     def update_slots(self, input_ids: torch.Tensor, slot_mapping: torch.Tensor) -> None:
         """Write this chunk's compressed ids into window slots (official V1)."""
         assert self._slots is not None
         slots = slot_mapping[: input_ids.size(0)].to(torch.int64)
-        valid = (slots >= 0) & (slots < self._slots.numel())
-        sel = torch.nonzero(valid, as_tuple=False).reshape(-1)
-        if sel.numel():
-            dst = slots.index_select(0, sel)
-            src = self._compress(input_ids[: slots.size(0)].index_select(0, sel))
-            self._slots.index_copy_(0, dst, src)
+        # Write every row, sending the out-of-range ones to the sink
+        # ``ensure_slots`` reserves at the end. The mirror of the read path's
+        # clamp in ``lookback_paged``, and for the same reason.
+        sink = self._nslots
+        dst = torch.where(
+            (slots >= 0) & (slots < sink), slots, slots.new_full((), sink)
+        )
+        src = self._compress(input_ids[: slots.size(0)])
+        self._slots.index_copy_(0, dst, src)
 
     def lookback_paged(
         self,
@@ -378,13 +420,15 @@ class EngramTokenHistory(nn.Module):
             batch_idx = (token_idx - shift).clamp_min(0)
             batch_src = self._compress(ids[batch_idx])
             slots = _slots_at(md, req, look)
-            valid = (slots >= 0) & (slots < self._slots.numel())
-            cache_src = look.new_full(look.shape, self.DEAD)
-            sel = torch.nonzero(valid, as_tuple=False).reshape(-1)
-            if sel.numel():
-                cache_src.index_copy_(
-                    0, sel, self._slots.index_select(0, slots.index_select(0, sel))
-                )
+            nslots = self._nslots
+            valid = (slots >= 0) & (slots < nslots)
+            # Gather every row and mask afterwards. Selecting with nonzero would
+            # read the count back to the host, stalling on the whole queued
+            # stream once per shift. Clamping has to bound both ends: slots can
+            # also run past the cache, and an out-of-range index_select is a
+            # device assert rather than an exception.
+            gathered = self._slots.index_select(0, slots.clamp(0, max(nslots - 1, 0)))
+            cache_src = torch.where(valid, gathered, look.new_full((), self.DEAD))
             source = torch.where(in_batch, batch_src, cache_src)
             blocked = blocked | (pos < shift) | (source == self.DEAD)
             tokens.append(torch.where(blocked, pad_id, source))
@@ -409,14 +453,30 @@ class EngramEmbedding(nn.Module):
         # 映射对象要一直被持有：它一被回收，映射就没了，表底下的指针立刻失效。
         self._regions: list[object] = []
 
+    def reserve_staging(self, n: int) -> None:
+        """Pin the staging buffers at their ceiling, before any graph captures.
+
+        Growing them mid-capture calls ``cudaHostRegister`` again, which the
+        driver rejects (``ixErrorHostMemoryAlreadyRegistered`` at
+        ``capture_end``), so the second capture size fails once the first has
+        already sized the buffers.
+        """
+        if n > 0:
+            self._staging(n)
+
     def _staging(self, n: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Pinned host buffers for ``n`` gathered rows. Grown, never shrunk."""
         buf = self._stage
         if buf is None or buf[0].shape[0] < n:
+            # ``device`` is explicit because model construction runs under a
+            # CUDA default device, where an unqualified ``empty`` lands on the
+            # GPU and cannot be pinned at all.
             buf = (
-                torch.empty((n, self.dim), dtype=torch.uint8).pin_memory(),
-                torch.empty((n, self.dim // _FP8_BLOCK), dtype=torch.uint8).pin_memory(),
-                torch.empty((n,), dtype=torch.bool).pin_memory(),
+                torch.empty((n, self.dim), dtype=torch.uint8, device="cpu").pin_memory(),
+                torch.empty(
+                    (n, self.dim // _FP8_BLOCK), dtype=torch.uint8, device="cpu"
+                ).pin_memory(),
+                torch.empty((n,), dtype=torch.bool, device="cpu").pin_memory(),
             )
             self._stage = buf
         return buf[0][:n], buf[1][:n], buf[2][:n]
@@ -558,6 +618,7 @@ class IluEngram(nn.Module):
         self.embed = EngramEmbedding(
             config.engram_num_embeddings[layer_index], self.head_dim
         )
+        self.embed.reserve_staging(_max_batched_tokens() * self.n_hash_cols)
 
         flat = [p for per_ngram in primes for p in per_ngram]
         offsets = np.cumsum([0, *flat[:-1]])
@@ -577,6 +638,26 @@ class IluEngram(nn.Module):
         self.wkv_weight: torch.Tensor | None = None
         self.q_weight: torch.Tensor | None = None
         self.k_weight: torch.Tensor | None = None
+
+        # wkv emits hc_mult key streams plus one value stream, all hidden_size wide.
+        # The key streams only ever feed sums over hidden, so each rank can keep just
+        # its slice of them and let an all-reduce of two scalars per (token, stream)
+        # finish the job. value has to stay replicated: it is added straight into the
+        # full-width residual, and sharding it would cost an all-gather of the whole
+        # hidden state instead. That takes wkv from (hc_mult + 1) * hidden rows down to
+        # hc_mult * hidden / tp + hidden.
+        tp_size = get_tensor_model_parallel_world_size()
+        self.key_hidden = self.hidden_size // tp_size
+        self.key_offset = get_tensor_model_parallel_rank() * self.key_hidden
+        # The kernel reads the slice two elements at a time.
+        self._shard_keys = (
+            tp_size > 1
+            and self.hidden_size % tp_size == 0
+            and self.key_hidden % 2 == 0
+        )
+        if not self._shard_keys:
+            self.key_hidden = self.hidden_size
+            self.key_offset = 0
 
     def load_from_checkpoint(self, path: str) -> None:
         """Load the table slice, plus wkv (dequantized to bf16) and q/k weights."""
@@ -607,7 +688,16 @@ class IluEngram(nn.Module):
         device = self.primes.device
         wkv_q = read("wkv.weight")
         wkv_s = read("wkv.scale")
-        self.wkv_weight = _dequant_block_fp8(wkv_q, wkv_s).to(device, torch.bfloat16)
+        wkv = _dequant_block_fp8(wkv_q, wkv_s)
+        if self._shard_keys:
+            # Slice on the host so the device never holds the full-width weight.
+            keys = wkv[: self.hc_mult * self.hidden_size].unflatten(
+                0, (self.hc_mult, self.hidden_size)
+            )[:, self.key_offset : self.key_offset + self.key_hidden]
+            wkv = torch.cat(
+                [keys.flatten(0, 1), wkv[self.hc_mult * self.hidden_size :]]
+            )
+        self.wkv_weight = wkv.contiguous().to(device, torch.bfloat16)
         self.q_weight = read("q_weight").to(device)
         self.k_weight = read("k_weight").to(device)
 
@@ -641,9 +731,15 @@ class IluEngram(nn.Module):
         if self._qk_weight is None:
             self._qk_weight = (self.q_weight.float() * self.k_weight.float()).contiguous()
 
-        return ixfops.ds4_engram_gate(
-            hidden_states.contiguous(), kv, self._qk_weight, self.eps, self.clamp_value
-        )
+        x = hidden_states.contiguous()
+        if not self._shard_keys:
+            return ixfops.ds4_engram_gate(
+                x, kv, self._qk_weight, self.eps, self.clamp_value
+            )
+        # qk_weight stays full width; the kernel offsets into it by key_offset.
+        sums = ixfops.ds4_engram_gate_reduce(x, kv, self._qk_weight, self.key_offset)
+        sums = tensor_model_parallel_all_reduce(sums)
+        return ixfops.ds4_engram_gate_apply(x, kv, sums, self.eps, self.clamp_value)
 
 
 def _dequant_block_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:

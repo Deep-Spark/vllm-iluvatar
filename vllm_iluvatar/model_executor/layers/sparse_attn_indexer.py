@@ -69,7 +69,7 @@ def ilu_sparse_attn_indexer(
         for chunk in prefill_metadata.chunks:
             if chunk.max_context_len == 0:
                 continue
-            logits = ixfops.dsa_indexer_mqa_logits_with_blocks(
+            logits = ixfops.dsa_indexer_mqa_logits(
                 q[chunk.token_start : chunk.token_end],
                 chunk.cu_seqlens_q,
                 chunk.cu_seq_lens,
@@ -79,6 +79,7 @@ def ilu_sparse_attn_indexer(
                 max_q_len=chunk.max_q_len,
                 max_kv_len=chunk.max_kv_len,
                 max_context_len=chunk.max_context_len,
+                valid_lens=chunk.valid_lens,
             )
             ixfops.dsa_update_topk_indices(
                 logits,
@@ -102,7 +103,7 @@ def ilu_sparse_attn_indexer(
         # represented by cu_seqlens_q plus one causal [ks, ke) span per query
         # token. The same variable-query logits kernel used for prefill can
         # therefore handle requires_padding=True without an explicit pack step.
-        logits = ixfops.dsa_indexer_mqa_logits_with_blocks(
+        logits = ixfops.dsa_indexer_mqa_logits(
             q[:num_decode_tokens],
             decode_metadata.cu_seqlens_q,
             decode_metadata.cu_seqlens_kv,
@@ -112,6 +113,7 @@ def ilu_sparse_attn_indexer(
             max_q_len=decode_metadata.max_q_len,
             max_kv_len=decode_metadata.max_kv_len,
             max_context_len=decode_metadata.max_context_len,
+            valid_lens=decode_metadata.valid_lens,
         )
 
         ixfops.dsa_update_topk_indices(

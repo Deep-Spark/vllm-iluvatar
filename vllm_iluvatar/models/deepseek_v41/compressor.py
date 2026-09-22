@@ -7,13 +7,15 @@ for all four caches, so they are not duplicated per cache group here.
 """
 from __future__ import annotations
 
+import warnings
+
 import ixformer.inference.functions as ixfops
 import torch
 from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
@@ -24,6 +26,17 @@ from vllm_iluvatar.models.deepseek_v41.sparse_mla import (
     BLOCK_SIZE,
     V41AttentionMetadata,
     V41PagedCache,
+)
+
+
+# The wkv/wgate projection is bf16 in, fp32 out, which cublasLt has no kernel
+# for on this platform. ATen retries on cublas and gets the right answer -- and
+# faster than any of our fp32-out ops -- but it re-reports the miss on every
+# call, and the shapes in the text defeat Python's once-per-message dedup.
+# Filtered at import so the hot path carries no catch_warnings block, which
+# would split the compiled region in two.
+warnings.filterwarnings(
+    "ignore", message=".*bgemm_internal_cublaslt error.*", category=UserWarning
 )
 
 
@@ -196,14 +209,20 @@ class IluDeepseekV41Compressor(nn.Module):
             get_current_vllm_config().scheduler_config.max_num_batched_tokens
         )
         self.norm = RMSNorm(head_dim, config.rms_norm_eps)
+        # wkv and wgate read the same hidden state, so they are one GEMM. Its
+        # output is fp32 because ``ds4_v41_compress_prepare_out`` takes fp32
+        # states; going through bf16 first only threw away mantissa.
         # Checkpoint stores these bf16; declaring fp32 produced NaN on this platform.
-        self.wkv = ReplicatedLinear(
-            config.hidden_size, head_dim, bias=False, prefix=f"{prefix}.wkv"
+        self.fused_wkv_wgate = MergedColumnParallelLinear(
+            config.hidden_size,
+            [head_dim, head_dim] if compress_ratio > 1 else [head_dim],
+            bias=False,
+            return_bias=False,
+            quant_config=None,
+            disable_tp=True,
+            prefix=f"{prefix}.fused_wkv_wgate",
         )
         if compress_ratio > 1:
-            self.wgate = ReplicatedLinear(
-                config.hidden_size, head_dim, bias=False, prefix=f"{prefix}.wgate"
-            )
             self.state_cache = V41CompressorStateCache(
                 state_dim=2 * head_dim,
                 compress_ratio=compress_ratio,
@@ -212,6 +231,17 @@ class IluDeepseekV41Compressor(nn.Module):
             )
         else:
             self.state_cache = None
+
+    def _kv_score(self, x: torch.Tensor) -> torch.Tensor:
+        """The merged wkv/wgate projection, fp32.
+
+        cublasLt has no bf16 x bf16 -> fp32 kernel here, so ATen recovers on
+        cublas; that path is still faster than any fp32-out op we have, and the
+        warning it repeats is filtered where the layer is defined.
+        """
+        return torch.mm(
+            x, self.fused_wkv_wgate.weight.T, out_dtype=torch.float32
+        )
 
     def _forward_pooled(self, x: torch.Tensor) -> torch.Tensor | None:
         """One pre-RoPE latent row per token, in one launch.
@@ -241,9 +271,12 @@ class IluDeepseekV41Compressor(nn.Module):
         md: V41AttentionMetadata = get_forward_context().attn_metadata[
             self.state_cache.prefix
         ]
+        # kv and score are the two halves of the merged GEMM; the kernel takes a
+        # row stride, so the views go in without a copy.
+        kv_score = self._kv_score(x)
         ixfops.ds4_v41_compress_prepare_out(
-            self.wkv(x)[0].float(),
-            self.wgate(x)[0].float(),
+            kv_score[:, : self.head_dim],
+            kv_score[:, self.head_dim :],
             state,
             md.token_to_req_indices,
             md.positions,
@@ -260,5 +293,5 @@ class IluDeepseekV41Compressor(nn.Module):
         if self.compress_ratio == 1:
             # Each token is its own group, so pooling is the identity: no gate,
             # no state cache, and the rows are already one per token.
-            return self.norm(self.wkv(x)[0])
+            return self.norm(self._kv_score(x).to(x.dtype))
         return self._forward_pooled(x)

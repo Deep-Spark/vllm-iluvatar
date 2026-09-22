@@ -162,6 +162,8 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
         ("gate_up_proj", "w3", 1),
         ("attn.fused_wqa_wkv", "attn.wq_a", 0),
         ("attn.fused_wqa_wkv", "attn.wkv", 1),
+        ("compressor.fused_wkv_wgate", "compressor.wkv", 0),
+        ("compressor.fused_wkv_wgate", "compressor.wgate", 1),
     ]
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:

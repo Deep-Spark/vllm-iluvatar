@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import warnings
 
-import ixformer.inference.functions as ixfops
 import torch
 from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+from vllm_iluvatar.models.deepseek_v41.common.ops import fused_save_compress_norm
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
@@ -38,16 +38,6 @@ from vllm_iluvatar.models.deepseek_v41.sparse_mla import (
 warnings.filterwarnings(
     "ignore", message=".*bgemm_internal_cublaslt error.*", category=UserWarning
 )
-
-
-def latent_rows_are_tokens(ratio: int) -> bool:
-    """Whether the latent carries one row per token rather than per closed group.
-
-    The pooling layers emit one row per token because ``ds4_v41_compress_prepare_out``
-    does, which is what makes them capturable; a ``ratio == 1`` layer has no pooling
-    to fuse and keeps the packed per-group insert.
-    """
-    return ratio > 1
 
 
 _SCRATCH: dict[tuple[str, int, torch.dtype, torch.device], torch.Tensor] = {}
@@ -81,70 +71,6 @@ def token_scratch(
             f"got {rows}; it follows max_num_batched_tokens ({capacity})"
         )
     return buf[:rows]
-
-
-def compress_rope_qdq_insert_by_token(
-    cache: torch.Tensor,
-    x: torch.Tensor,
-    md: "V41AttentionMetadata",
-    ratio: int,
-    qdq_block: int,
-    qdq_fmt: str,
-    cos_sin: torch.Tensor,
-    norm_weight: torch.Tensor | None = None,
-    norm_eps: float = 1e-6,
-) -> None:
-    """``compress_rope_qdq_insert`` for rows indexed by token, not by group.
-    """
-    n = x.size(0)
-    ixfops.v41_rope_qdq_insert_by_token(
-        cache,
-        x,
-        md.positions[:n],
-        md.slot_mapping[:n],
-        md.block_table,
-        md.token_to_req_indices[:n],
-        cos_sin,
-        md.block_size,
-        ratio,
-        qdq_block,
-        qdq_fmt,
-        norm_weight,
-        norm_eps,
-    )
-
-
-def compress_rope_qdq_insert(
-    cache: torch.Tensor,
-    x: torch.Tensor,
-    md: "V41AttentionMetadata",
-    ratio: int,
-    qdq_block: int,
-    qdq_fmt: str,
-    cos_sin: torch.Tensor,
-) -> None:
-    """Publish this batch's compressed rows: RoPE, qdq, and the cache write.
-
-    One kernel for what was four calls -- derive the slots, rotate, quantize,
-    scatter -- of which the slot derivation alone cost a cumsum and two scatters
-    over the whole batch. See ``ixformer``'s ``v41_compress_rope_qdq_insert``.
-
-    The slots are a closed form of vLLM's own per-token ``slot_mapping``, which
-    is why no block-table gather is needed. A compressed cache holds one row per
-    ``ratio`` tokens, so it is addressed in the group domain, but for a token at
-    ``pos`` closing group ``g = pos // ratio`` the two pick the *same* physical
-    block -- ``g // (bs // ratio) == pos // bs``. So the block number is
-    ``slot_mapping[t] // bs`` and the offset within it ``(slot_mapping[t] % bs)
-    // ratio``, and a group is closed by its last token, ``(pos + 1) % ratio == 0``.
-
-    ``x`` is left untouched, where the chain rotated and quantized it in place.
-    No caller reads it afterwards.
-    """
-    n = md.num_actual_tokens
-    ixfops.v41_compress_rope_qdq_insert(
-        cache, x, md.slot_mapping[:n], md.positions[:n], cos_sin,
-        md.block_size, ratio, qdq_block, qdq_fmt,
-    )
 
 
 class V41CompressKVCache(V41PagedCache):
@@ -197,9 +123,13 @@ class V41CompressorStateCache(V41PagedCache):
 
 class IluDeepseekV41Compressor(nn.Module):
 
-    def __init__(self, config, compress_ratio: int, prefix: str) -> None:
+    def __init__(self, config, compress_ratio: int, prefix: str,
+                 k_cache_prefix: str) -> None:
         super().__init__()
         head_dim = config.head_dim
+        # A ratio-1 layer has no state ring of its own, so the token count for
+        # its rows comes from the cache it publishes into.
+        self.k_cache_prefix = k_cache_prefix
         self.compress_ratio = compress_ratio
         self.head_dim = head_dim
         self.rms_norm_eps = config.rms_norm_eps
@@ -252,7 +182,7 @@ class IluDeepseekV41Compressor(nn.Module):
         18 of the 40 layers pay a dozen launches per request for it.
         ``ds4_v41_compress_prepare_out`` does the state write, the pooling and the
         norm together, which is also why the rows come out per token rather than per
-        closed group -- see ``latent_rows_are_tokens``.
+        closed group.
         """
         state = self.state_cache.kv_cache
         if not state.numel():
@@ -271,27 +201,43 @@ class IluDeepseekV41Compressor(nn.Module):
         md: V41AttentionMetadata = get_forward_context().attn_metadata[
             self.state_cache.prefix
         ]
-        # kv and score are the two halves of the merged GEMM; the kernel takes a
-        # row stride, so the views go in without a copy.
-        kv_score = self._kv_score(x)
-        ixfops.ds4_v41_compress_prepare_out(
-            kv_score[:, : self.head_dim],
-            kv_score[:, self.head_dim :],
-            state,
-            md.token_to_req_indices,
+        fused_save_compress_norm(
+            self._kv_score(x),
             md.positions,
+            state,
             md.slot_mapping,
-            md.block_table,
+            md.query_start_loc,
+            md.token_to_req_indices,
             self.norm.weight,
-            latent,
-            self.compress_ratio,
             self.rms_norm_eps,
+            self.compress_ratio,
+            latent,
+            block_table=md.block_table,
         )
         return latent
 
     def forward(self, x: torch.Tensor) -> torch.Tensor | None:
         if self.compress_ratio == 1:
-            # Each token is its own group, so pooling is the identity: no gate,
-            # no state cache, and the rows are already one per token.
-            return self.norm(self._kv_score(x).to(x.dtype))
+            # Each token is its own group, so pooling is the identity: no gate
+            # and no state ring, and the rows are already one per token.
+            md: V41AttentionMetadata = get_forward_context().attn_metadata[
+                self.k_cache_prefix
+            ]
+            latent = token_scratch(
+                "latent", x.size(0), self.head_dim, x.dtype, x.device,
+                self.max_num_tokens,
+            )
+            fused_save_compress_norm(
+                self._kv_score(x),
+                md.positions,
+                None,
+                md.slot_mapping,
+                md.query_start_loc,
+                None,
+                self.norm.weight,
+                self.rms_norm_eps,
+                self.compress_ratio,
+                latent,
+            )
+            return latent
         return self._forward_pooled(x)

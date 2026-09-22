@@ -25,12 +25,13 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
+from vllm_iluvatar.models.deepseek_v41.common.ops import (
+    indexer_k_norm_rope_store,
+    rope_quant_insert,
+)
 from vllm_iluvatar.models.deepseek_v41.compressor import (
     IluDeepseekV41Compressor,
     V41CompressKVCache,
-    compress_rope_qdq_insert,
-    compress_rope_qdq_insert_by_token,
-    latent_rows_are_tokens,
 )
 from vllm_iluvatar.models.deepseek_v41.sparse_mla import (
     BLOCK_SIZE,
@@ -52,8 +53,6 @@ _MMA_INDEX_BUDGET = 192 << 20
 # dense scoring needs a host-side chunk plan and a few small H2D copies per call,
 # and decode is already CPU-bound here. See ``_mma_index_applies``.
 _MMA_INDEX_MIN_TOKENS = 512
-# Compressed KV uses groups of 16 with E4M3 scales; the indexer uses 32 with E8M0.
-_COMPRESS_KV_FP4_BLOCK = 16
 # ixinfer v3 on ivcore30 requires topk % 64 == 0.
 _IXINFER_TOPK_MULTIPLE = 64
 # ...and reaches its tiled MMA path only when the head count is exactly one of
@@ -418,23 +417,20 @@ class IluDeepseekV41Indexer(nn.Module):
         md: V41AttentionMetadata = get_forward_context().attn_metadata[
             self.key_cache_prefix
         ]
-        k = self.wk(latent)[0]
-        if latent_rows_are_tokens(self.compress_ratio):
-            # The norm folds into the insert here. Normalising in torch first
-            # meant normalising every token's row and then keeping only the ones
-            # that close a group.
-            compress_rope_qdq_insert_by_token(
-                self.key_cache.kv_cache, k, md, self.compress_ratio,
-                FP4_BLOCK_SIZE, "fp4_pow2", self.cos_sin,
-                norm_weight=self.k_norm.weight,
-                norm_eps=self.k_norm.variance_epsilon,
-            )
-        else:
-            # The packed-row insert has no norm to fold into.
-            compress_rope_qdq_insert(
-                self.key_cache.kv_cache, self.k_norm(k), md, self.compress_ratio,
-                FP4_BLOCK_SIZE, "fp4_pow2", self.cos_sin,
-            )
+        indexer_k_norm_rope_store(
+            self.wk(latent)[0],
+            md.positions,
+            self.cos_sin,
+            self.k_norm.weight,
+            self.k_norm.variance_epsilon,
+            self.key_cache.kv_cache,
+            md.slot_mapping,
+            self.compress_ratio,
+            True,
+            block_size=md.block_size,
+            block_table=md.block_table,
+            token_to_req_indices=md.token_to_req_indices,
+        )
 
     def score_and_select(
         self,
@@ -796,7 +792,8 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 )
             self._compress_cache_prefix = prefix
             self.compressor = IluDeepseekV41Compressor(
-                config, self.compress_ratio, prefix=f"{prefix}.compressor"
+                config, self.compress_ratio, prefix=f"{prefix}.compressor",
+                k_cache_prefix=self._compress_cache_prefix,
             )
         elif self.compress_ratio:
             self._compress_cache_prefix = self._source_prefix(
@@ -899,14 +896,16 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         return self.wo_b(z.flatten(2))[0]
 
     def _write_compressed(self, latent: torch.Tensor, md: V41AttentionMetadata) -> None:
-        insert = (
-            compress_rope_qdq_insert_by_token
-            if latent_rows_are_tokens(self.compress_ratio)
-            else compress_rope_qdq_insert
-        )
-        insert(
-            self.kv_cache, latent, md, self.compress_ratio,
-            _COMPRESS_KV_FP4_BLOCK, "fp4_e4m3", self.cos_sin,
+        rope_quant_insert(
+            latent,
+            md.positions,
+            self.cos_sin,
+            self.kv_cache,
+            md.slot_mapping,
+            self.compress_ratio,
+            block_size=md.block_size,
+            block_table=md.block_table,
+            token_to_req_indices=md.token_to_req_indices,
         )
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:

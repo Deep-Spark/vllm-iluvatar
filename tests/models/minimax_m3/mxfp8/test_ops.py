@@ -181,31 +181,31 @@ def test_quantized_kv_is_rejected_before_ixformer_dispatch():
         ),
     ],
 )
-def test_indexer_stages_into_transposed_padded_community_buffer(
+def test_indexer_stages_into_token_major_buffer(
     monkeypatch, adapter_name, ixformer_name, args
 ):
-    """vLLM passes a non-contiguous [H,Qmax,K] view of [Qmax,H,K].
+    """vLLM's persistent buffer is token-major [Qmax,H,K].
 
-    ixformer must receive ``out=None`` and the adapter must publish the exact
-    [H,Q,K] result into the active prefix without corrupting the padded suffix.
+    ixformer writes a contiguous [Q,H,K] prefix in place; the padded suffix
+    must stay untouched.
     """
     h, q, topk, qmax = 3, 2, 4, 6
-    expected = torch.arange(h * q * topk, dtype=torch.int32).view(h, q, topk)
+    expected = torch.arange(q * h * topk, dtype=torch.int32).view(q, h, topk)
     token_major = torch.full((qmax, h, topk), -7, dtype=torch.int32)
-    community_out = token_major.transpose(0, 1)
     seen = {}
 
     def fake_ixformer(*call_args):
         seen["out"] = call_args[-1]
-        return expected.clone()
+        call_args[-1].copy_(expected)
+        return call_args[-1]
 
     monkeypatch.setattr(indexer.ixf_ops, ixformer_name, fake_ixformer)
-    result = getattr(indexer, adapter_name)(*args, out=community_out)
+    result = getattr(indexer, adapter_name)(*args, out=token_major)
 
-    assert seen["out"] is None
-    assert tuple(result.shape) == (h, q, topk)
+    assert tuple(seen["out"].shape) == (q, h, topk)
+    assert seen["out"].data_ptr() == token_major[:q].data_ptr()
     assert torch.equal(result, expected)
-    assert torch.equal(token_major[:q].transpose(0, 1), expected)
+    assert torch.equal(token_major[:q], expected)
     assert torch.equal(
         token_major[q:], torch.full((qmax - q, h, topk), -7, dtype=torch.int32)
     )
@@ -242,12 +242,11 @@ def test_indexer_stages_into_transposed_padded_community_buffer(
         ),
     ],
 )
-def test_sparse_attention_densifies_transposed_topk(
+def test_sparse_attention_passes_token_major_topk(
     monkeypatch, adapter_name, ixformer_name, extra_args
 ):
     token_major = torch.arange(6 * 3 * 4, dtype=torch.int32).view(6, 3, 4)
-    transposed = token_major[:2].transpose(0, 1)
-    assert not transposed.is_contiguous()
+    topk = token_major[:2]
     seen = {}
 
     def fake_ixformer(q, kv_cache, topk_idx, *args, **kwargs):
@@ -256,11 +255,11 @@ def test_sparse_attention_densifies_transposed_topk(
 
     monkeypatch.setattr(sparse_attention.ixf_ops, ixformer_name, fake_ixformer)
     getattr(sparse_attention, adapter_name)(
-        torch.empty(1), torch.empty(1, dtype=torch.bfloat16), transposed, *extra_args
+        torch.empty(1), torch.empty(1, dtype=torch.bfloat16), topk, *extra_args
     )
 
     assert seen["topk"].is_contiguous()
-    assert torch.equal(seen["topk"], transposed)
+    assert torch.equal(seen["topk"], topk)
     assert seen["backend"] == (
         "ixformer_perf" if adapter_name == "minimax_m3_sparse_attn" else None
     )

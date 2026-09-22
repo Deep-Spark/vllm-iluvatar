@@ -4,7 +4,7 @@
 Sparse attn kernels via ``ixformer.inference.functions`` (same pattern as
 DeepSeek-V4 ``ds4_flash_mla_*`` / ``ds4_paged_sparse_attn_fwd`` call sites).
 
-BF16 / mxfp8 use ``mxfp8/sparse_attention.py`` (community ``[H,Q,K]`` top-k).
+BF16 / mxfp8 use ``mxfp8/sparse_attention.py`` (token-major ``[Q,H,K]`` top-k).
 This module is the W4A8 token-major ``[Q,H,K]`` path.
 """
 

@@ -7,9 +7,9 @@ kernel dispatch itself: :class:`MiniMaxM3IndexerImpl` (community) declares
 ``forward`` abstract precisely so each kernel family implements its own, so this
 module subclasses that base rather than the community Triton impl.
 
-The ixformer top-k kernels want an exact contiguous ``[H,Q,K]`` output while
-vLLM hands over a transposed, Q-padded view of its persistent buffer, so the
-adapters below let ixformer allocate and then publish into the active prefix.
+ixformer top-k is token-major ``[Q,H,K]``, the same layout as vLLM's persistent
+``topk_indices_buffer``. The adapters pass a contiguous ``[Q,H,K]`` prefix of
+that buffer through as ``out`` so native can write in place.
 The indexer cache is BF16-only: ixformer has no FP8 score path.
 """
 
@@ -72,31 +72,27 @@ SUPPORTED_INDEXER_TORCH_DTYPES: tuple[torch.dtype, ...] = (torch.bfloat16,)
 _SUPPORTED_SCORE_TYPES = ("max",)
 
 
-def _publish_topk(result: torch.Tensor, out: torch.Tensor | None) -> torch.Tensor:
-    """Publish an ixformer dense ``[H,Q,K]`` result into vLLM's output view.
-
-    vLLM owns one persistent token-major ``[Qmax,H,K]`` buffer and passes its
-    transposed ``[H,Qmax,K]`` view (or a suffix of that view) as ``out``.
-    ixformer requires an exact contiguous ``[H,Q,K]`` output, so we let it
-    allocate and copy into the active prefix of the persistent view.
-    """
+def _native_topk_out(
+    out: torch.Tensor | None, q: int, h: int, topk: int
+) -> torch.Tensor | None:
+    """Return the contiguous ``[Q,H,K]`` prefix native kernels can write."""
     if out is None:
-        return result
+        return None
     if out.ndim != 3:
         raise ValueError(f"MiniMax-M3 top-k out must be 3-D, got {out.ndim}")
-    expected_prefix = (result.shape[0], result.shape[1], result.shape[2])
-    if (
-        out.shape[0] != expected_prefix[0]
-        or out.shape[1] < expected_prefix[1]
-        or out.shape[2] != expected_prefix[2]
-    ):
+    expected = (q, h, topk)
+    if out.shape[0] < q or out.shape[1] != h or out.shape[2] != topk:
         raise ValueError(
-            "MiniMax-M3 top-k out must contain an [H,Q,K] prefix of "
-            f"{expected_prefix}, got {tuple(out.shape)}"
+            "MiniMax-M3 top-k out must contain a [Q,H,K] prefix of "
+            f"{expected}, got {tuple(out.shape)}"
         )
-    out_prefix = out[:, : result.shape[1], :]
-    out_prefix.copy_(result)
-    return out_prefix
+    prefix = out[:q]
+    if not prefix.is_contiguous():
+        raise ValueError(
+            "MiniMax-M3 top-k out prefix must be contiguous [Q,H,K], "
+            f"got shape {tuple(prefix.shape)} stride {tuple(prefix.stride())}"
+        )
+    return prefix
 
 
 def minimax_m3_index_score(
@@ -133,7 +129,8 @@ def minimax_m3_index_topk(
     local_blocks: int,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    result = ixf_ops.minimax_m3_index_topk(
+    native_out = _native_topk_out(out, score.shape[1], score.shape[0], topk)
+    return ixf_ops.minimax_m3_index_topk(
         score,
         cu_seqlens_q,
         prefix_lens,
@@ -141,9 +138,8 @@ def minimax_m3_index_topk(
         topk,
         init_blocks,
         local_blocks,
-        None,
+        native_out,
     )
-    return _publish_topk(result, out)
 
 
 def minimax_m3_index_decode(
@@ -163,7 +159,8 @@ def minimax_m3_index_decode(
 ) -> torch.Tensor:
     if score_out is not None:
         raise NotImplementedError("ixformer M3 index decode has no score_out path")
-    result = ixf_ops.minimax_m3_index_decode(
+    native_out = _native_topk_out(out, idx_q.shape[0], idx_q.shape[1], topk)
+    return ixf_ops.minimax_m3_index_decode(
         idx_q,
         index_kv_cache,
         block_table,
@@ -175,9 +172,8 @@ def minimax_m3_index_decode(
         num_kv_heads,
         decode_query_len,
         max_decode_query_len,
-        None,
+        native_out,
     )
-    return _publish_topk(result, out)
 
 
 class MiniMaxM3IndexerBackend(_CommunityIndexerBackend):
@@ -249,16 +245,15 @@ class MiniMaxM3IndexerIxformerImpl(MiniMaxM3IndexerImpl):
         )
         kv = self.index_cache.kv_cache
 
-        # Both sides write into the single shared persistent topk_indices_buffer
-        # (decode at [:, :num_decode], prefill at [:, num_decode:]) and return
-        # views into it. None -> allocate fresh.
+        # Both sides write into the shared token-major topk_indices_buffer
+        # (decode at [:num_decode], prefill packed immediately after).
         buf = self.topk_indices_buffer
-        buf_htk = None if buf is None else buf.transpose(0, 1)
         decode_topk: torch.Tensor | None = None
         prefill_topk: torch.Tensor | None = None
         if index_md.num_decodes > 0:
             d = index_md.decode
             assert d is not None
+            decode_out = None if buf is None else buf[:num_decode]
             decode_topk = minimax_m3_index_decode(
                 iq[:num_decode],
                 kv,
@@ -271,12 +266,15 @@ class MiniMaxM3IndexerIxformerImpl(MiniMaxM3IndexerImpl):
                 self.num_kv_heads,
                 d.decode_query_len,
                 d.max_decode_query_len,
-                out=buf_htk,
+                out=decode_out,
             )
         if index_md.num_prefills > 0:
             p = index_md.prefill
             assert p is not None
-            prefill_out = buf_htk[:, num_decode:, :] if buf_htk is not None else None
+            n_prefill = index_md.num_prefill_tokens
+            prefill_out = (
+                None if buf is None else buf[num_decode : num_decode + n_prefill]
+            )
             if p.max_query_len == 1:
                 # A one-token chunk has the same causal boundary as decode.
                 # Skip the low-parallel score + top-k pair and reuse the

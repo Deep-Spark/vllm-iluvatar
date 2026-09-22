@@ -64,7 +64,7 @@ from vllm.platforms import current_platform
 from vllm_iluvatar.models.deepseek_v41 import mhc
 from vllm_iluvatar.models.deepseek_v41.attention import FP8_BLOCK_SIZE
 from vllm_iluvatar.models.deepseek_v41.model import IluDeepseekV41DecoderLayer
-from vllm_iluvatar.models.deepseek_v41.paged_caches import write_cache
+from vllm_iluvatar.models.deepseek_v41.sparse_mla import write_cache
 from vllm_iluvatar.models.deepseek_v41.rope import apply_rope
 
 logger = init_logger("vllm." + __name__)

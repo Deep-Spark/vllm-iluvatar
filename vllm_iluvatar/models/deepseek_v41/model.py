@@ -43,18 +43,11 @@ _ENGRAM_SKIP = re.compile(r"(^|\.)engram\.")
 
 def default_aux_hidden_state_layers(hf_config) -> tuple[int, ...]:
     """Aux capture layers for a V4.1 DSpark draft.
-
-    V4.1 reads ``dspark_target_layer_ids`` as the layers whose *input* feeds the
-    draft, so these ids pass through unshifted and the model captures before
-    them. V4 names the layers to capture *after* and shifts by one; both end up
-    calling ``hc_post`` at the same place, which is why the capture condition in
-    ``forward`` is shared.
     """
     return tuple(getattr(hf_config, "dspark_target_layer_ids", None) or ())
 
 
 def _make_v41_weights_mapper() -> WeightsMapper:
-    """V4 mapper as-is; engram keys are filtered out before it (see ``load_weights``)."""
     return _make_fp8_weights_mapper()
 
 
@@ -88,13 +81,14 @@ class IluDeepseekV41DecoderLayer(IluDeepseekV4Fp8DecoderLayer):
         hc_base: torch.Tensor,
         pre_mix_in: torch.Tensor,
         sqrsum: torch.Tensor | None = None,
+        norm: torch.nn.Module | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Project, split, and collapse. Cache the bf16 copy of ``hc_fn``."""
         cached = self._hc_fn_io_cache.get(name)
         if cached is None or cached.dtype != x.dtype:
             cached = hc_fn.to(x.dtype).contiguous()
             self._hc_fn_io_cache[name] = cached
-        return mhc.hc_pre_mixes(
+        can_fold = norm is not None and sqrsum is not None
+        post, comb, h, pre = mhc.hc_pre_mixes(
             x,
             hc_fn,
             hc_scale,
@@ -107,7 +101,12 @@ class IluDeepseekV41DecoderLayer(IluDeepseekV4Fp8DecoderLayer):
             post_mult=self.hc_post_alpha,
             hc_fn_io=cached,
             sqrsum=sqrsum,
+            layer_norm_weight=norm.weight if can_fold else None,
+            layer_norm_eps=self.rms_norm_eps,
         )
+        if norm is not None and not can_fold:
+            h = norm(h)
+        return post, comb, h, pre
 
     def forward(
         self,
@@ -137,17 +136,15 @@ class IluDeepseekV41DecoderLayer(IluDeepseekV4Fp8DecoderLayer):
 
         attn_post, attn_comb, h, attn_pre = self._hc_pre_mixes(
             residual, "attn", self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
-            pre_mix, sqrsum
+            pre_mix, sqrsum, self.attn_norm
         )
-        h = self.attn_norm(h)
         h = self.attn(positions, h, None)
         residual, attn_sqrsum = mhc.hc_post_sqrsum(h, residual, attn_post, attn_comb)
 
         ffn_post, ffn_comb, h, ffn_pre = self._hc_pre_mixes(
             residual, "ffn", self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
-            attn_pre, attn_sqrsum
+            attn_pre, attn_sqrsum, self.ffn_norm
         )
-        h = self.ffn_norm(h)
         h = self.ffn(h, input_ids)
         return h, residual, ffn_post, ffn_comb, ffn_pre
 
@@ -174,6 +171,8 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
         del self.hc_head_fn, self.hc_head_base, self.hc_head_scale
         self._mtp_hidden_buffer = None
 
+        self._bind_index_buffers(vllm_config)
+
         # Set by IluDeepseekV41ForCausalLM.set_aux_hidden_state_layers when a
         # DSpark draft is active.
         self.aux_hidden_state_layers: tuple[int, ...] = ()
@@ -187,6 +186,46 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
         model_config = vllm_config.model_config
         self.model_path = model_config.model
         self._build_engram(config, model_config)
+
+    def _bind_index_buffers(self, vllm_config: VllmConfig) -> None:
+        """Preallocate the selection buffers the indexers share across layers.
+
+        The base class already owns the top-k indices buffer; these are the two
+        companions it has no notion of. ``topk_lens`` because V4.1's selection is
+        ragged and our kernels take the count explicitly, and the candidate list
+        because the indexer at ``candidate_source_layer_id`` publishes a block
+        mask that the ratio-1 indexers above it score against.
+
+        Allocating once is not only about the per-step cost: an indexer writing
+        into a buffer of a fixed address is what lets the selection cross layers
+        without any layer holding a reference to another layer's tensor.
+        """
+        config = self.config
+        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        device = self.topk_indices_buffer.device
+        self.topk_lens_buffer = torch.empty(
+            max_tokens, dtype=torch.int32, device=device
+        )
+        blocks = getattr(config, "candidate_topk_blocks", 0)
+        if getattr(config, "candidate_source_layer_id", -1) >= 0 and blocks > 0:
+            self.candidate_idxs_buffer = torch.empty(
+                max_tokens, blocks, dtype=torch.int32, device=device
+            )
+            self.candidate_lens_buffer = torch.empty(
+                max_tokens, dtype=torch.int32, device=device
+            )
+        else:
+            self.candidate_idxs_buffer = None
+            self.candidate_lens_buffer = None
+
+        for layer in self.layers:
+            attn = getattr(layer, "attn", None)
+            if attn is not None:
+                attn.bind_index_buffers(
+                    self.topk_lens_buffer,
+                    self.candidate_idxs_buffer,
+                    self.candidate_lens_buffer,
+                )
 
     def _build_engram(self, config, model_config) -> None:
         """Create the shared token history and one IluEngram per engram layer.

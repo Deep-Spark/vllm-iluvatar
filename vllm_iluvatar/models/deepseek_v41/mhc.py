@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import ixformer.inference.functions as ixfops
 import torch
-import torch.nn.functional as F
 
 
 def hc_split_sinkhorn(
@@ -38,27 +37,8 @@ def hc_split_sinkhorn(
     return pre, post, comb
 
 
-def hc_mixes(
-    x: torch.Tensor,
-    hc_fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    norm_eps: float,
-    hc_mult: int,
-    sinkhorn_iters: int,
-    hc_eps: float,
-    post_mult: float = 2.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    xf = x.flatten(1).float()
-    rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + norm_eps)
-    mixes = F.linear(xf, hc_fn) * rsqrt
-    return hc_split_sinkhorn(
-        mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, post_mult
-    )
-
-
 def hc_pre(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
-    return torch.sum(pre_mix.unsqueeze(-1) * x.float(), dim=1).to(x.dtype)
+    return ixfops.ds4_v41_hc_collapse(x.contiguous(), pre_mix.contiguous())
 
 
 def hc_pre_mixes(
@@ -74,6 +54,8 @@ def hc_pre_mixes(
     post_mult: float = 2.0,
     hc_fn_io: torch.Tensor | None = None,
     sqrsum: torch.Tensor | None = None,
+    layer_norm_weight: torch.Tensor | None = None,
+    layer_norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Project, split and collapse ``x``.
 
@@ -81,9 +63,18 @@ def hc_pre_mixes(
     :func:`hc_post_sqrsum`. Given it, the epilogue has no token-wide reduction
     left to do and streams instead, which is ~2x on the kernel; without it the
     op reduces the rms itself.
+
+    ``layer_norm_weight`` folds the layer's own RMSNorm into ``layer_input``, so
+    the caller does not run it separately over the row this just wrote. Only the
+    streaming path can do that, so callers must apply the norm themselves when
+    they pass no ``sqrsum``.
     """
     fn = hc_fn if hc_fn_io is None else hc_fn_io
     if sqrsum is None:
+        assert layer_norm_weight is None, (
+            "the norm can only fold into the streaming path; pass sqrsum or "
+            "apply the norm at the call site"
+        )
         post, comb, layer_input, pre_out = ixfops.ds4_v41_mhc_pre(
             x.contiguous(),
             fn,
@@ -109,6 +100,8 @@ def hc_pre_mixes(
             post_mult,
             sinkhorn_iters,
             pre_mix_in,
+            layer_norm_weight,
+            layer_norm_eps,
         )
     return post.squeeze(-1), comb, layer_input, pre_out
 

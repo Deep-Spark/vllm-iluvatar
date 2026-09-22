@@ -1,7 +1,7 @@
 """DeepSeek-V4.1-Flash attention: projections, caches, sparse MLA."""
 from __future__ import annotations
 
-import os
+import re
 
 import ixformer.inference.functions as ixfops
 import torch
@@ -24,35 +24,30 @@ from vllm.model_executor.models.utils import extract_layer_index
 
 from vllm_iluvatar.models.deepseek_v41.compressor import (
     IluDeepseekV41Compressor,
-    latent_rows_are_tokens,
-)
-from vllm_iluvatar.models.deepseek_v41.sparse_mla import decode_sparse_mla
-from vllm_iluvatar.models.deepseek_v41.paged_caches import (
-    BLOCK_SIZE,
-    V41AttentionMetadata,
     V41CompressKVCache,
-    V41IndexKeyCache,
-    V41WindowKVCache,
     compress_rope_qdq_insert,
     compress_rope_qdq_insert_by_token,
+    latent_rows_are_tokens,
+)
+from vllm_iluvatar.models.deepseek_v41.sparse_mla import (
+    BLOCK_SIZE,
+    V41AttentionMetadata,
+    V41WindowKVCache,
+    decode_sparse_mla,
     gather_group_rows,
     gather_window_rows,
-    write_cache,
 )
 from vllm_iluvatar.models.deepseek_v41.rope import apply_rope, get_shared_cos_sin
 
 FP8_BLOCK_SIZE = 32
 FP4_BLOCK_SIZE = 32
 
-# Score the index on the MMA units instead of the fused SIMT kernel. See
-# ``_mma_index_applies`` for when this is both possible and result-preserving.
-_MMA_INDEX = os.getenv("VLLM_ILU_V41_MMA_INDEXER", "1") == "1"
 # Peak bytes of dense score rows held at once; the token axis is split to fit.
-_MMA_INDEX_BUDGET = int(os.getenv("VLLM_ILU_V41_MMA_INDEX_BUDGET_MIB", "192")) << 20
-# Below this token count the fused kernel wins on the part that is not FLOPs:
+_MMA_INDEX_BUDGET = 192 << 20
+# Below this token count the fused SIMT kernel wins on the part that is not FLOPs:
 # dense scoring needs a host-side chunk plan and a few small H2D copies per call,
-# and decode is already CPU-bound here.
-_MMA_INDEX_MIN_TOKENS = int(os.getenv("VLLM_ILU_V41_MMA_INDEX_MIN_TOKENS", "512"))
+# and decode is already CPU-bound here. See ``_mma_index_applies``.
+_MMA_INDEX_MIN_TOKENS = 512
 # Compressed KV uses groups of 16 with E4M3 scales; the indexer uses 32 with E8M0.
 _COMPRESS_KV_FP4_BLOCK = 16
 # ixinfer v3 on ivcore30 requires topk % 64 == 0.
@@ -63,24 +58,20 @@ _IXINFER_TOPK_MULTIPLE = 64
 # h=16 against 29.5 at h=8 and 58.1 at h=48.
 _IXINFER_HEAD_TIERS = (16, 32, 64, 128, 256)
 
-_STEP_N = 0
 
-class PerSeqRuntime:
+def _source_layer_prefix(prefix: str, layer_id: int) -> str:
+    """Rewrite ``prefix`` so it names ``layer_id`` instead of its own layer.
 
-    def __init__(self) -> None:
-        self.compress_kv: torch.Tensor | None = None
-        self.index_k: torch.Tensor | None = None
-        self.topk_idxs: torch.Tensor | None = None
-        self.topk_lens: torch.Tensor | None = None
-        # The candidate source publishes its selection as a compact block-id list.
-        self.candidate_block_idxs: torch.Tensor | None = None
-        self.candidate_block_lens: torch.Tensor | None = None
-        # Borrowers cannot look metadata up: the key is the owning layer's prefix.
-        self.compress_kv_md: V41AttentionMetadata | None = None
-        self.index_k_md: V41AttentionMetadata | None = None
-
-
-paged_runtime = PerSeqRuntime()
+    Cross-layer state is never handed between layers. A borrower resolves the
+    module that owns what it needs out of ``static_forward_context``, keyed by
+    the source layer's prefix, which it can build from construction-time
+    knowledge alone. Nothing has to be published at forward time, so a layer
+    cannot read a value some earlier step left behind, and a source that is not
+    on this rank fails at load instead of silently going missing.
+    """
+    out, n = re.subn(r"\.layers\.\d+\.", f".layers.{layer_id}.", prefix)
+    assert n == 1, f"no layer index in prefix {prefix!r}"
+    return out
 
 
 def _seq_spans(md: V41AttentionMetadata) -> list[tuple[int, int, int, int]]:
@@ -215,7 +206,7 @@ def _mma_index_applies(
     """Can this batch be scored densely without changing what gets selected?
 
     Two conditions. The candidate machinery has to be vacuous: a restricted layer
-    selects among the blocks the source layer published, so when that list
+    selects among the blocks the source layer published, so when that listIluDeepseekV41IndexerBackend
     already spans every block a token can see, the restriction removes nothing --
     the source can skip publishing and the restricted layers can score the full
     range with identical results. ``candidate_topk_blocks * candidate_block_size``
@@ -235,13 +226,25 @@ def _mma_index_applies(
     check, plus a token floor -- below it the host-side plan costs more than the
     FLOPs it saves, and decode is CPU-bound here to begin with.
     """
-    if not _MMA_INDEX or md.num_decodes or not md.num_reqs:
+    if md.num_decodes or not md.num_reqs:
         return False
     if num_tokens < _MMA_INDEX_MIN_TOKENS:
         return False
     if torch.cuda.is_current_stream_capturing():
         return False
     return int(md.seq_lens_cpu[: md.num_reqs].max()) <= candidate_span
+
+
+def _short_context_bypass_applies(
+    md: V41AttentionMetadata, ratio: int, topk: int
+) -> bool:
+    """Whether the indexer cannot change the selection, so it can be skipped.
+    """
+    if ratio <= 0 or not md.num_reqs:
+        return False
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    return int(md.seq_lens_cpu[: md.num_reqs].max()) // ratio <= topk
 
 
 def _mma_index_chunks(
@@ -286,6 +289,10 @@ def _mma_index_chunks(
     return chunks
 
 
+class V41IndexKeyCache(V41CompressKVCache):
+    """Indexer keys: same page geometry as compressed KV, ``index_head_dim`` rows."""
+
+
 class IluDeepseekV41Indexer(nn.Module):
     """Index-query projections, the K cache for key owners, and the selection.
 
@@ -302,12 +309,26 @@ class IluDeepseekV41Indexer(nn.Module):
         compress_ratio: int,
         quant_config=None,
         prefix: str = "",
+        *,
+        owns_k: bool,
+        key_cache_prefix: str,
+        static_forward_context: dict,
     ) -> None:
         super().__init__()
         tp_size = get_tensor_model_parallel_world_size()
 
         self.layer_id = layer_id
-        self.owns_k = layer_id in config.kv_source_layer_ids
+        self.owns_k = owns_k
+        # Index keys come from a kv-source layer's compressor latent, so only
+        # those layers own a cache to write them to; the rest score against the
+        # nearest one, looked up here rather than published into shared state.
+        self.key_cache_prefix = key_cache_prefix
+        self._static_forward_context = static_forward_context
+        # Bound by the model once the shared selection buffers exist.
+        self.topk_idxs_buf: torch.Tensor | None = None
+        self.topk_lens_buf: torch.Tensor | None = None
+        self.candidate_idxs_buf: torch.Tensor | None = None
+        self.candidate_lens_buf: torch.Tensor | None = None
         self.compress_ratio = compress_ratio
         self.is_candidate_source = layer_id == config.candidate_source_layer_id
         self.uses_candidates = 0 <= config.candidate_source_layer_id < layer_id
@@ -340,6 +361,16 @@ class IluDeepseekV41Indexer(nn.Module):
             for i in config.index_source_layer_ids
             if i >= config.candidate_source_layer_id and config.compress_ratios[i]
         )
+        downstream = [
+            config.compress_ratios[i]
+            for i in config.index_source_layer_ids
+            if i >= config.candidate_source_layer_id and config.compress_ratios[i]
+        ]
+        self.bypass_ratio = (
+            min([compress_ratio] + downstream)
+            if self.is_candidate_source
+            else compress_ratio
+        )
 
         self.wq_b = ColumnParallelLinear(
             config.q_lora_rank, config.index_n_heads * config.index_head_dim,
@@ -360,52 +391,85 @@ class IluDeepseekV41Indexer(nn.Module):
                 dtype=torch.get_default_dtype(),
                 compress_ratio=compress_ratio,
                 block_size=BLOCK_SIZE,
-                prefix=f"{prefix}.index_k",
+                prefix=key_cache_prefix,
+            )
+            assert self.key_cache.prefix == key_cache_prefix
+        elif key_cache_prefix not in static_forward_context:
+            raise NotImplementedError(
+                f"layer {layer_id} scores against index keys owned by "
+                f"{key_cache_prefix!r}, which is not on this rank"
+            )
+
+    def _index_keys(self) -> tuple[torch.Tensor, V41AttentionMetadata]:
+        """The paged index-key cache this layer scores against, and its metadata."""
+        cache = self._static_forward_context[self.key_cache_prefix]
+        return cache.kv_cache, get_forward_context().attn_metadata[
+            self.key_cache_prefix
+        ]
+
+    def publish_keys(self, latent: torch.Tensor) -> None:
+        md: V41AttentionMetadata = get_forward_context().attn_metadata[
+            self.key_cache_prefix
+        ]
+        k = self.wk(latent)[0]
+        if latent_rows_are_tokens(self.compress_ratio):
+            # The norm folds into the insert here. Normalising in torch first
+            # meant normalising every token's row and then keeping only the ones
+            # that close a group.
+            compress_rope_qdq_insert_by_token(
+                self.key_cache.kv_cache, k, md, self.compress_ratio,
+                FP4_BLOCK_SIZE, "fp4_pow2", self.cos_sin,
+                norm_weight=self.k_norm.weight,
+                norm_eps=self.k_norm.variance_epsilon,
             )
         else:
-            self.key_cache = None
-
-    def publish_keys(self, latent: torch.Tensor, shared: PerSeqRuntime) -> None:
-        md: V41AttentionMetadata = get_forward_context().attn_metadata[
-            self.key_cache.prefix
-        ]
-        k = self.k_norm(self.wk(latent)[0])
-        insert = (
-            compress_rope_qdq_insert_by_token
-            if latent_rows_are_tokens(self.compress_ratio)
-            else compress_rope_qdq_insert
-        )
-        insert(
-            self.key_cache.kv_cache, k, md, self.compress_ratio,
-            FP4_BLOCK_SIZE, "fp4_pow2", self.cos_sin,
-        )
-        shared.index_k = self.key_cache.kv_cache
-        shared.index_k_md = md
+            # The packed-row insert has no norm to fold into.
+            compress_rope_qdq_insert(
+                self.key_cache.kv_cache, self.k_norm(k), md, self.compress_ratio,
+                FP4_BLOCK_SIZE, "fp4_pow2", self.cos_sin,
+            )
 
     def score_and_select(
         self,
         x: torch.Tensor,
         qr: torch.Tensor,
         positions: torch.Tensor,
-        shared: PerSeqRuntime,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert self.cos_sin is not None
-        assert shared.index_k is not None, "index keys were never published by a kv_source layer"
+        index_k, md = self._index_keys()
+
+        if _short_context_bypass_applies(md, self.bypass_ratio, self.index_topk):
+            n = positions.size(0)
+            idxs = self.topk_idxs_buf[:n]
+            lens = self.topk_lens_buf[:n]
+            ixfops.v41_fill_short_context_topk(
+                idxs, lens, positions, self.compress_ratio
+            )
+            return idxs, lens
 
         q = self.wq_b(qr)[0].unflatten(-1, (self.n_local_heads, self.index_head_dim))
-        apply_rope(q.unsqueeze(0), positions.to(torch.int32), self.cos_sin)
-        ixfops.ds4_act_qdq(q, FP4_BLOCK_SIZE, "fp4_pow2")
-        assert shared.index_k_md is not None, "index-key metadata was never published"
-        weights = self.weights_proj(x)[0] * (self.softmax_scale * self.n_heads**-0.5)
 
-        return self._select_paged(q, weights, positions, shared)
+        weights = self.weights_proj(x)[0]
+        ixfops.v41_indexer_q_rope_qdq(
+            q,
+            positions,
+            self.cos_sin,
+            FP4_BLOCK_SIZE,
+            "fp4_pow2",
+            weights,
+            weights,
+            self.softmax_scale * self.n_heads**-0.5,
+        )
+
+        return self._select_paged(q, weights, positions, index_k, md)
 
     def _select_paged(
         self,
         q: torch.Tensor,
         weights: torch.Tensor,
         positions: torch.Tensor,
-        shared: PerSeqRuntime,
+        index_k: torch.Tensor,
+        md: V41AttentionMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Score and select by walking the paged index cache.
 
@@ -427,8 +491,12 @@ class IluDeepseekV41Indexer(nn.Module):
         ``max_visible_groups`` must come from the CPU seq_lens: it is a launch
         hint only, and reading ``seq_lens.max()`` off the device would sync during
         CUDA graph capture.
+
+        The selection leaves in preallocated buffers the model owns, written in
+        place: they are what the layers between index sources read, and at 8192
+        tokens the top-k alone would otherwise be a 16 MiB allocation per source
+        layer per step.
         """
-        md = shared.index_k_md
         ratio = self.compress_ratio
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
@@ -445,13 +513,10 @@ class IluDeepseekV41Indexer(nn.Module):
                 md, num_tokens, self.candidate_topk_blocks * self.candidate_block_size
             )
         ):
-            return self._select_mma(q, weights, positions, md, shared.index_k, num_tokens)
+            return self._select_mma(q, weights, positions, md, index_k, num_tokens)
         if self.uses_candidates:
-            assert shared.candidate_block_idxs is not None, (
-                "candidate source never published a mask"
-            )
-            cand_in_idxs = shared.candidate_block_idxs
-            cand_in_lens = shared.candidate_block_lens
+            cand_in_idxs = self.candidate_idxs_buf[:num_tokens]
+            cand_in_lens = self.candidate_lens_buf[:num_tokens]
         else:
             cand_in_idxs = torch.empty((num_tokens, 0), dtype=torch.int32, device=dev)
             cand_in_lens = torch.zeros(num_tokens, dtype=torch.int32, device=dev)
@@ -469,7 +534,7 @@ class IluDeepseekV41Indexer(nn.Module):
         max_seq = int(md.seq_lens_cpu[: md.num_reqs].max().item()) if md.num_reqs else 0
         ixfops.ds4_v41_paged_index_select_out(
             q.contiguous(),
-            shared.index_k,
+            index_k,
             weights.contiguous(),
             md.token_to_req_indices,
             md.seq_lens,
@@ -499,12 +564,16 @@ class IluDeepseekV41Indexer(nn.Module):
             scores: torch.Tensor,
             lens: torch.Tensor,
             capacity: int,
+            dst_idxs: torch.Tensor,
+            dst_lens: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
+            out_idxs = dst_idxs[:num_tokens]
+            out_lens = dst_lens[:num_tokens]
             if tp_size == 1:
-                return idxs, lens
-            out_idxs = torch.empty((num_tokens, capacity), dtype=torch.int32, device=dev)
+                out_idxs.copy_(idxs)
+                out_lens.copy_(lens)
+                return out_idxs, out_lens
             out_scores = torch.empty((num_tokens, capacity), dtype=torch.float32, device=dev)
-            out_lens = torch.empty(num_tokens, dtype=torch.int32, device=dev)
             ixfops.ds4_v41_merge_topk_out(
                 tensor_model_parallel_all_gather(idxs, dim=1),
                 tensor_model_parallel_all_gather(scores, dim=1),
@@ -517,11 +586,14 @@ class IluDeepseekV41Indexer(nn.Module):
             return out_idxs, out_lens
 
         if self.is_candidate_source:
-            (
-                shared.candidate_block_idxs,
-                shared.candidate_block_lens,
-            ) = merge(cand_idxs, cand_scores, cand_lens, self.candidate_topk_blocks)
-        return merge(topk_idxs, topk_scores, topk_lens, self.index_topk)
+            merge(
+                cand_idxs, cand_scores, cand_lens, self.candidate_topk_blocks,
+                self.candidate_idxs_buf, self.candidate_lens_buf,
+            )
+        return merge(
+            topk_idxs, topk_scores, topk_lens, self.index_topk,
+            self.topk_idxs_buf, self.topk_lens_buf,
+        )
 
     def _select_mma(
         self,
@@ -577,7 +649,7 @@ class IluDeepseekV41Indexer(nn.Module):
         # clamp against seq_lens is redundant here.
         visible = (positions.to(torch.int32) + 1) // ratio
         topk = self.index_topk
-        idxs = torch.empty((num_tokens, topk), dtype=torch.int32, device=dev)
+        idxs = self.topk_idxs_buf[:num_tokens]
         zeros = torch.zeros(num_tokens, dtype=torch.int32, device=dev)
 
         rows = max(1, min(num_tokens, _MMA_INDEX_BUDGET // (width * 2)))
@@ -603,7 +675,7 @@ class IluDeepseekV41Indexer(nn.Module):
             ixfops.dsa_update_topk_indices(
                 scratch[:n], zeros[:n], visible[t0:t1], topk, idxs[t0:t1]
             )
-        return idxs, torch.clamp(visible, max=topk)
+        return idxs, torch.clamp(visible, max=topk, out=self.topk_lens_buf[:num_tokens])
 
 
 class IluDeepseekV41Attention(nn.Module):
@@ -619,7 +691,6 @@ class IluDeepseekV41Attention(nn.Module):
         prefix: str,
         topk_indices_buffer: torch.Tensor | None = None,
     ) -> None:
-        del topk_indices_buffer
         super().__init__()
         config = vllm_config.model_config.hf_config
         dtype = vllm_config.model_config.dtype
@@ -639,13 +710,18 @@ class IluDeepseekV41Attention(nn.Module):
         self.compress_ratio = config.compress_ratios[layer_id]
         self.softmax_scale = self.head_dim**-0.5
         self.max_seq_len = vllm_config.model_config.max_model_len
+        self.eps = config.rms_norm_eps
 
         is_backbone = layer_id < config.num_hidden_layers
         self.is_kv_source = is_backbone and layer_id in config.kv_source_layer_ids
         self.is_index_source = is_backbone and layer_id in config.index_source_layer_ids
         self.compressor = None
         self.indexer = None
-        self.shared = paged_runtime
+        # Top-k selections cross layers through buffers the model preallocates
+        # and every layer writes in place. The V4 layer plumbing already passes
+        # the indices one down; ``bind_index_buffers`` fills in its companions.
+        self.topk_idxs_buf = topk_indices_buffer
+        self.topk_lens_buf: torch.Tensor | None = None
 
         self.attn_sink = nn.Parameter(
             torch.empty(self.n_local_heads, dtype=torch.float32), requires_grad=False
@@ -662,12 +738,12 @@ class IluDeepseekV41Attention(nn.Module):
             quant_config=quant_config, prefix=f"{prefix}.fused_wqa_wkv",
             disable_tp=True,  # replicated, like the two linears it replaces
         )
-        self.q_norm = RMSNorm(self.q_lora_rank, config.rms_norm_eps)
+        self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank, self.n_heads * self.head_dim, bias=False,
             quant_config=quant_config, prefix=f"{prefix}.wq_b",
         )
-        self.kv_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
+        self.kv_norm = RMSNorm(self.head_dim, self.eps)
         self.wo_a = ColumnParallelLinear(
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * self.o_lora_rank,
@@ -693,22 +769,92 @@ class IluDeepseekV41Attention(nn.Module):
             head_size=self.head_dim, dtype=dtype, window_size=self.window_size,
             block_size=BLOCK_SIZE, prefix=f"{prefix}.window_kv",
         )
+        # ``compress_ratio > 0`` on a non-source layer means it reads a cache some
+        # earlier layer owns. Resolve whose here, while the layer list is still
+        # construction-time knowledge, and keep only the prefix: registering the
+        # same cache module under two layers would put it in the module tree twice.
+        sfc = vllm_config.compilation_config.static_forward_context
+        self._static_forward_context = sfc
+        self.compress_cache = None
+        self._compress_cache_prefix = ""
         if self.is_kv_source:
             self.compress_cache = V41CompressKVCache(
                 head_size=self.head_dim, dtype=dtype,
                 compress_ratio=self.compress_ratio,
                 block_size=BLOCK_SIZE, prefix=f"{prefix}.compress_kv",
             )
+            self._compress_cache_prefix = self.compress_cache.prefix
             self.compressor = IluDeepseekV41Compressor(
                 config, self.compress_ratio, prefix=f"{prefix}.compressor"
             )
-        else:
-            self.compress_cache = None
+        elif self.compress_ratio:
+            self._compress_cache_prefix = self._source_prefix(
+                prefix, config.kv_source_layer_ids, "compress_kv"
+            )
         if self.is_index_source:
+            # Index keys are written from a compressor latent, so their cache
+            # lives on the layers that are both a kv source and an index source.
+            key_owners = sorted(
+                set(config.kv_source_layer_ids) & set(config.index_source_layer_ids)
+            )
             self.indexer = IluDeepseekV41Indexer(
                 config, self.layer_id, self.compress_ratio,
                 quant_config=vllm_config.quant_config, prefix=f"{prefix}.indexer",
+                owns_k=layer_id in key_owners,
+                key_cache_prefix=self._source_prefix(
+                    prefix, key_owners, "indexer.index_k"
+                ),
+                static_forward_context=sfc,
             )
+
+    def _source_prefix(
+        self, prefix: str, source_layer_ids, suffix: str
+    ) -> str:
+        """Prefix of the nearest source layer at or below this one.
+
+        The caches are published forward, so the source is the largest source
+        index that does not exceed this layer's. It is always constructed before
+        this layer, which is what makes the lookup resolvable here.
+        """
+        sources = [i for i in sorted(source_layer_ids) if i <= self.layer_id]
+        assert sources, (
+            f"layer {self.layer_id} reads {suffix} but no source layer precedes it"
+        )
+        src = _source_layer_prefix(prefix, sources[-1]) + f".{suffix}"
+        # This layer being its own source means the cache is built a few lines
+        # below, so there is nothing to look up yet.
+        if sources[-1] != self.layer_id and src not in self._static_forward_context:
+            raise NotImplementedError(
+                f"layer {self.layer_id} reads {src!r}, which is not on this rank"
+            )
+        return src
+
+    def bind_index_buffers(
+        self,
+        topk_lens: torch.Tensor,
+        candidate_idxs: torch.Tensor | None,
+        candidate_lens: torch.Tensor | None,
+    ) -> None:
+        """Hand this layer the shared selection buffers the model preallocated.
+
+        Called once after construction, before any forward. The indices buffer
+        already arrived through the V4 layer plumbing; these are the companions
+        our kernels need, which take an explicit length instead of reading it off
+        a padded row.
+        """
+        self.topk_lens_buf = topk_lens
+        if self.indexer is not None:
+            self.indexer.topk_idxs_buf = self.topk_idxs_buf
+            self.indexer.topk_lens_buf = topk_lens
+            self.indexer.candidate_idxs_buf = candidate_idxs
+            self.indexer.candidate_lens_buf = candidate_lens
+
+    def _compressed_kv(self) -> tuple[torch.Tensor, V41AttentionMetadata]:
+        """The compressed KV cache this layer attends over, and its metadata."""
+        cache = self._static_forward_context[self._compress_cache_prefix]
+        return cache.kv_cache, get_forward_context().attn_metadata[
+            self._compress_cache_prefix
+        ]
 
     @property
     def cos_sin(self) -> torch.Tensor:
@@ -749,8 +895,6 @@ class IluDeepseekV41Attention(nn.Module):
             self.compress_cache.kv_cache, latent, md, self.compress_ratio,
             _COMPRESS_KV_FP4_BLOCK, "fp4_e4m3", self.cos_sin,
         )
-        self.shared.compress_kv = self.compress_cache.kv_cache
-        self.shared.compress_kv_md = md
 
     def forward(
         self,
@@ -775,13 +919,11 @@ class IluDeepseekV41Attention(nn.Module):
         qr_kv = self.fused_wqa_wkv(x)[0]
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
 
-        qr = self.q_norm(qr)
-        q = self.wq_b(qr)[0].unflatten(-1, (self.n_local_heads, self.head_dim))
-        apply_rope(q.unsqueeze(0), pos32, self.cos_sin)
+        qr, kv = ixfops.rms_norm_qk(
+            qr, kv, self.q_norm.weight, self.kv_norm.weight, self.eps
+        )
 
-        kv = self.kv_norm(kv)
-        apply_rope(kv.unsqueeze(0), pos32, self.cos_sin)
-        ixfops.ds4_act_qdq(kv, FP8_BLOCK_SIZE, "fp8_pow2")
+        q = self.wq_b(qr)[0].unflatten(-1, (self.n_local_heads, self.head_dim))
 
         if profiling:
             o = q.new_zeros(q.shape)
@@ -789,29 +931,38 @@ class IluDeepseekV41Attention(nn.Module):
                 o.view(1, num_tokens, self.n_local_groups, -1)
             ).view(num_tokens, -1)
 
-        write_cache(self.window_cache.kv_cache, kv, md.slot_mapping)
+        # One launch for what was four: RoPE on q, then RoPE, fp8 qdq and the
+        # window-cache insert on kv. The kv half never round-trips to memory
+        # between the three steps, which is the point.
+        ixfops.v41_qkv_rope_qdq_insert(
+            q,
+            self.window_cache.kv_cache,
+            kv,
+            md.slot_mapping,
+            pos32,
+            self.cos_sin,
+            FP8_BLOCK_SIZE,
+            "fp8_pow2",
+        )
 
         if self.compress_ratio:
             if self.is_kv_source:
                 latent = self.compressor(x)
                 if latent is not None:
                     if self.is_index_source:
-                        self.indexer.publish_keys(latent, self.shared)
+                        self.indexer.publish_keys(latent)
                     self._write_compressed(
                         latent,
-                        get_forward_context().attn_metadata[self.compress_cache.prefix],
+                        get_forward_context().attn_metadata[
+                            self._compress_cache_prefix
+                        ],
                     )
-                md_by = get_forward_context().attn_metadata
-                self.shared.compress_kv = self.compress_cache.kv_cache
-                self.shared.compress_kv_md = md_by[self.compress_cache.prefix]
-                if self.is_index_source and self.indexer.key_cache is not None:
-                    self.shared.index_k = self.indexer.key_cache.kv_cache
-                    self.shared.index_k_md = md_by[self.indexer.key_cache.prefix]
             if self.is_index_source:
-                self.shared.topk_idxs, self.shared.topk_lens = (
-                    self.indexer.score_and_select(x, qr, pos32, self.shared)
-                )
-            group_idxs, group_lens = self.shared.topk_idxs, self.shared.topk_lens
+                group_idxs, group_lens = self.indexer.score_and_select(x, qr, pos32)
+            else:
+                # Reuse the selection of the nearest index source above.
+                group_idxs = self.topk_idxs_buf[:num_tokens]
+                group_lens = self.topk_lens_buf[:num_tokens]
         else:
             group_idxs = group_lens = None
 
@@ -829,8 +980,7 @@ class IluDeepseekV41Attention(nn.Module):
             f"decode span boundary disagrees with num_decode_tokens: {nd} expected, "
             f"spans={[(r, t0, t1) for r, t0, t1, _ in spans]}, num_decodes={md.num_decodes}"
         )
-        cache = self.shared.compress_kv if self.compress_ratio else None
-        cache_md = self.shared.compress_kv_md if self.compress_ratio else None
+        cache, cache_md = self._compressed_kv() if self.compress_ratio else (None, None)
         outs = []
 
         if nd:

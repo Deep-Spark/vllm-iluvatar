@@ -16,7 +16,9 @@ community platform files stay byte-identical to upstream.
 
 from __future__ import annotations
 
+import importlib
 import logging
+import os
 import sys
 import types
 from typing import TYPE_CHECKING
@@ -28,9 +30,62 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _ATTN_BACKENDS_REGISTERED = False
+_ILU_BACKEND_MODULES_SMOKED = False
 _ILU_MLA_PREFILL_FLASH_ATTN_BACKEND = (
     "vllm_iluvatar.v1.attention.backends.mla.prefill.flash_attn.FlashAttnPrefillBackend"
 )
+
+# ILU override backend modules to smoke-import at registration time so that
+# import-time name drift (e.g. a community symbol rename consumed at module
+# scope, such as ``FA4_MLA_PREFILL_KERNEL`` -> ``_FA4_MLA_PREFILL_KERNEL``) is
+# surfaced at startup instead of deep inside model loading. Only the module is
+# imported — no backend class is instantiated — so this stays cheap and side
+# effect free relative to a normal model run, which would import these anyway.
+_ILU_BACKEND_MODULE_PATHS = (
+    "vllm_iluvatar.v1.attention.backends.mla.prefill.flash_attn",
+    "vllm_iluvatar.v1.attention.backends.ilu_flash_attn",
+    "vllm_iluvatar.v1.attention.backends.mla.ilu_mla",
+    "vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse",
+)
+# GDN is env-gated; only smoke-import when the gate is on (checked at call time).
+_ILU_GDN_BACKEND_MODULE_PATH = "vllm_iluvatar.v1.attention.backends.ilu_gdn_attn"
+
+
+def _smoke_import_ilu_backend_modules() -> None:
+    """Import every ILU override backend module to fail fast on import drift.
+
+    The fingerprint guard inside each backend class only runs when an instance
+    is created, so a renamed community symbol imported at module scope fails
+    much later (during model load) as an opaque ``ImportError``. Importing the
+    module here — right after registration, before any model loads — turns that
+    into an immediate, located startup error. Disable with
+    ``VLLM_ILU_BACKEND_IMPORT_GUARD=0`` for debugging.
+    """
+    global _ILU_BACKEND_MODULES_SMOKED
+    if _ILU_BACKEND_MODULES_SMOKED:
+        return
+    if os.environ.get("VLLM_ILU_BACKEND_IMPORT_GUARD", "1") != "1":
+        _ILU_BACKEND_MODULES_SMOKED = True
+        return
+
+    import vllm.envs as envs
+
+    paths = list(_ILU_BACKEND_MODULE_PATHS)
+    if envs.VLLM_ILU_GDN_ATTN_BACKEND:
+        paths.append(_ILU_GDN_BACKEND_MODULE_PATH)
+
+    _ILU_BACKEND_MODULES_SMOKED = True
+    for module_path in paths:
+        try:
+            importlib.import_module(module_path)
+        except Exception as exc:  # noqa: BLE001 - surface as a located guard error
+            raise RuntimeError(
+                f"ILU backend import guard: failed to import override module "
+                f"{module_path!r} at startup. This usually means a community "
+                f"symbol consumed at module scope was renamed/removed upstream; "
+                f"re-derive the ILU override against the current community "
+                f"source. Underlying error: {exc!r}"
+            ) from exc
 
 
 def register_attention_backends() -> None:
@@ -179,6 +234,9 @@ def _make_iluvatar_platform():
                 ["iluvatar", "native"],
                 rms_norm=["iluvatar", "vllm_c", "native"],
                 fused_add_rms_norm=["iluvatar", "native"],
+                # gelu_and_mul_sparse has no "iluvatar" impl; mirror the
+                # community CUDA default (triton + native fallback).
+                gelu_and_mul_sparse=["triton", "native"],
             )
 
         @classmethod
@@ -252,6 +310,7 @@ def _make_iluvatar_platform():
             from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
             register_attention_backends()
+            _smoke_import_ilu_backend_modules()
 
             if selected_backend is not None:
                 logger.info("Using %s backend (user-selected).", selected_backend)

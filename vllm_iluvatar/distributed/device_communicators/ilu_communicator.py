@@ -24,7 +24,6 @@ from vllm.distributed.device_communicators.cuda_communicator import (
 from vllm.distributed.utils import StatelessProcessGroup
 
 
-
 class IluCommunicator(CudaCommunicator):
     def __init__(
         self,
@@ -327,9 +326,13 @@ class IluCommunicator(CudaCommunicator):
             (max_size,) + rest, dtype=input_tensor.dtype, device=input_tensor.device
         )
         if comm.use_vllm_comm:
-            ixfd.reduce_scatter_tensor(out, padded, group=comm.ixfd_group, async_op=True)
+            ixfd.reduce_scatter_tensor(
+                out, padded, group=comm.ixfd_group, async_op=True
+            )
         else:
-            torch.distributed.reduce_scatter_tensor(out, padded, group=comm.device_group)
+            torch.distributed.reduce_scatter_tensor(
+                out, padded, group=comm.device_group
+            )
         out = out[: sizes[comm.rank_in_group]]
         return out.movedim(0, dim).contiguous()
 

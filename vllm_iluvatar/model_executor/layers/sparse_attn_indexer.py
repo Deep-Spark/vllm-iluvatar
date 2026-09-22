@@ -180,6 +180,9 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
         compress_ratio: int = 1,
+        candidate_blocks: torch.Tensor | None = None,
+        candidate_block_size: int = 0,
+        candidate_write: bool = False,
     ):
         CustomOp.__init__(self)
         self.k_cache = k_cache
@@ -192,6 +195,12 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.compress_ratio = compress_ratio
+        # v4.1 two-level selection attrs (kept for signature parity with the
+        # community SparseAttnIndexer; the ILU indexer op does its own
+        # candidate handling and does not consume these).
+        self.candidate_blocks = candidate_blocks
+        self.candidate_block_size = candidate_block_size
+        self.candidate_write = candidate_write
 
     def forward_native(
         self,

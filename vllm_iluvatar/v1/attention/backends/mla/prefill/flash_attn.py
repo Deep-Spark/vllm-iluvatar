@@ -21,7 +21,7 @@ import inspect
 import torch
 import vllm.envs as envs
 from vllm.v1.attention.backends.mla.prefill.flash_attn import (
-    FA4_MLA_PREFILL_KERNEL,
+    _FA4_MLA_PREFILL_KERNEL,
 )
 from vllm.v1.attention.backends.mla.prefill.flash_attn import (
     FlashAttnPrefillBackend as CommunityFlashAttnPrefillBackend,
@@ -64,7 +64,7 @@ _FLASH_ATTN_VARLEN_DIFF_HEADDIMS_BASELINE = """\
         if envs.VLLM_BATCH_INVARIANT:
             kwargs["num_splits"] = 1
 
-        attn_out = FA4_MLA_PREFILL_KERNEL(
+        attn_out = _FA4_MLA_PREFILL_KERNEL(
             q=q,
             k=k,
             v=maybe_padded_v,
@@ -142,7 +142,7 @@ class FlashAttnPrefillBackend(CommunityFlashAttnPrefillBackend):
         if envs.VLLM_BATCH_INVARIANT:
             kwargs["num_splits"] = 1
 
-        attn_out = FA4_MLA_PREFILL_KERNEL(
+        attn_out = _FA4_MLA_PREFILL_KERNEL(
             q=q,
             k=k,
             v=maybe_padded_v,

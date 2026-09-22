@@ -267,7 +267,7 @@ def test_mla_prefill_flash_attn_drops_output_scale_and_unpads_v(monkeypatch):
 
     monkeypatch.setattr(
         flash_attn,
-        "FA4_MLA_PREFILL_KERNEL",
+        "_FA4_MLA_PREFILL_KERNEL",
         fake_kernel,
     )
 

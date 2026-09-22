@@ -580,6 +580,46 @@ class IluDeepseekCompressor(DeepseekCompressor):
     metadata-driven and CUDA-graph friendly.
     """
 
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        compress_ratio: int,
+        hidden_size: int,
+        head_dim: int,
+        rotate: bool = False,
+        prefix: str = "",
+        k_cache_prefix: str = "",
+        use_fp4_cache: bool = False,
+    ) -> None:
+        # >>> ILU MODIFICATION >>>
+        # Upstream ``DeepseekCompressor.__init__`` runs a JIT warmup block when
+        # ``kernel_config.enable_jit_warmup`` is set (default True in v0.30.0).
+        # For ``head_dim == 512`` on a CUDA platform that block imports the
+        # NVIDIA CuTeDSL kernels (``sparse_attn_compress_cutedsl``), which
+        # require the ``cutlass`` package not available on Iluvatar. ILU's
+        # ``forward`` routes through ``ixfops`` kernels instead, so none of
+        # the upstream warmup kernels (CuTeDSL, the indexer Triton fallback,
+        # nor ``_SAVE_PARTIAL_STATES_KERNEL``) are used here. Temporarily
+        # disable ``enable_jit_warmup`` for the ``super().__init__`` call to
+        # skip the whole warmup block, then restore it.
+        kernel_config = vllm_config.kernel_config
+        _saved_warmup = kernel_config.enable_jit_warmup
+        kernel_config.enable_jit_warmup = False
+        try:
+            super().__init__(
+                vllm_config=vllm_config,
+                compress_ratio=compress_ratio,
+                hidden_size=hidden_size,
+                head_dim=head_dim,
+                rotate=rotate,
+                prefix=prefix,
+                k_cache_prefix=k_cache_prefix,
+                use_fp4_cache=use_fp4_cache,
+            )
+        finally:
+            kernel_config.enable_jit_warmup = _saved_warmup
+        # <<< ILU MODIFICATION <<<
+
     def k_cache_layer(self):
         """The attention layer this compressor writes its K cache into.
 

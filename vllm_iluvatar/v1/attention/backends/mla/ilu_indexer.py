@@ -25,7 +25,6 @@ from vllm.v1.attention.backends.mla.compressor_utils import (
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout, MLAAttentionSpec
-from vllm.v1.worker.cp_utils import get_kv_cache_shard_count
 
 
 @triton.jit
@@ -454,7 +453,8 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         )
         max_num_blocks_per_req = cdiv(
             self.vllm_config.model_config.max_model_len,
-            self.kv_cache_spec.block_size * get_kv_cache_shard_count(),
+            self.kv_cache_spec.block_size
+            * self.vllm_config.parallel_config.decode_context_parallel_size,
         )
         self.cu_seqlens_q_buffer = torch.empty(
             (scheduler_config.max_num_seqs + 1,),

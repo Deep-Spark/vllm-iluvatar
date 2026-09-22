@@ -451,6 +451,8 @@ def topk_hash_softplus_sqrt(
     input_tokens: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
     is_padding: torch.Tensor | None = None,
+    bias_vl: torch.Tensor | None = None,
+    image_sentinel_lo: int = 0,
 ) -> None:
     """PyTorch equivalent of ``torch.ops._moe_C.topk_softplus_sqrt``.
 
@@ -470,6 +472,15 @@ def topk_hash_softplus_sqrt(
          multiply by ``routed_scaling_factor`` (matches the kernel which
          applies the scale internally).
       4. ``token_expert_indices[t, j] = j`` (positional helper).
+
+    Vision-language bias (``bias_vl`` / ``image_sentinel_lo``): when enabled,
+    image sentinel tokens (five consecutive in-vocab ids starting at
+    ``image_sentinel_lo``) select experts with ``bias_vl`` instead of
+    ``e_score_correction_bias`` / the hash table. ixformer's kernel only
+    accepts a 1D ``e_score_correction_bias`` broadcast across tokens, so this
+    path falls back to a pure-torch sqrt-softplus topk that applies a
+    per-token bias. ``image_sentinel_lo == 0`` (or ``bias_vl is None``)
+    disables the feature and keeps the ixformer fast path.
     """
     # ixformer expects int32 index tensors. topk_indices/token_expert_indices
     # are output buffers, so use temporaries only when needed and copy back into
@@ -487,17 +498,49 @@ def topk_hash_softplus_sqrt(
     if hash_indices_table is not None and hash_indices_table.dtype != torch.int32:
         hash_indices_table = hash_indices_table.to(dtype=torch.int32)
 
-    ixf_ops.topk_hash_softplus_sqrt(
-        topk_weights=topk_weights,
-        topk_indices=topk_indices,
-        token_expert_indices=token_expert_indices,
-        gating_output=gating_output,
-        renormalize=renormalize,
-        routed_scaling_factor=routed_scaling_factor,
-        e_score_correction_bias=e_score_correction_bias,
-        input_tokens=input_tokens,
-        hash_indices_table=hash_indices_table,
-    )
+    if bias_vl is not None and image_sentinel_lo > 0:
+        # Vision-language bias: ixformer's kernel only takes a 1D
+        # e_score_correction_bias broadcast across tokens, so fall back to
+        # a pure-torch sqrt-softplus topk with a per-token bias. Image
+        # sentinel tokens (5 consecutive ids at image_sentinel_lo) use
+        # bias_vl; other tokens use e_score_correction_bias (or zeros).
+        assert input_tokens is not None, "bias_vl routing requires input_tokens"
+        top_k = topk_weights.shape[1]
+        scores = torch.sqrt(F.softplus(gating_output))
+        image_mask = (
+            (input_tokens >= image_sentinel_lo) & (input_tokens < image_sentinel_lo + 5)
+        ).unsqueeze(-1)
+        text_bias = (
+            e_score_correction_bias
+            if e_score_correction_bias is not None
+            else torch.zeros_like(bias_vl)
+        )
+        row_bias = torch.where(image_mask, bias_vl, text_bias)
+        scores_for_choice = scores + row_bias
+        chosen = torch.topk(scores_for_choice, k=top_k, dim=-1)[1]
+        topk_weights.copy_(scores.gather(1, chosen))
+        topk_indices.copy_(chosen.to(topk_indices.dtype))
+        token_expert_indices.copy_(
+            torch.arange(top_k, device=token_expert_indices.device).expand_as(
+                token_expert_indices
+            )
+        )
+        if renormalize:
+            topk_weights.div_(topk_weights.sum(dim=-1, keepdim=True))
+        if routed_scaling_factor != 1.0:
+            topk_weights.mul_(routed_scaling_factor)
+    else:
+        ixf_ops.topk_hash_softplus_sqrt(
+            topk_weights=topk_weights,
+            topk_indices=topk_indices,
+            token_expert_indices=token_expert_indices,
+            gating_output=gating_output,
+            renormalize=renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+            e_score_correction_bias=e_score_correction_bias,
+            input_tokens=input_tokens,
+            hash_indices_table=hash_indices_table,
+        )
     _mask_topk_padding(topk_weights, topk_indices, is_padding)
     if topk_indices is not orig_topk_indices:
         orig_topk_indices.copy_(topk_indices)

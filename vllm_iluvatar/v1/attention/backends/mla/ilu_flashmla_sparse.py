@@ -18,6 +18,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     get_mla_dims,
 )
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
+    SharedTopkIndicesBuffer,
     SparseMLACommonImpl,
     SparseMLACommonMetadataBuilder,
 )
@@ -477,7 +478,9 @@ class IluFlashMLASparseMetadataBuilder(
         return metadata
 
 
-class IluFlashMLASparseImpl(SparseMLACommonImpl[IluFlashMLASparseMetadata]):
+class IluFlashMLASparseImpl(
+    SparseMLACommonImpl[IluFlashMLASparseMetadata], SharedTopkIndicesBuffer
+):
     def __init__(
         self,
         num_heads: int,
@@ -512,13 +515,7 @@ class IluFlashMLASparseImpl(SparseMLACommonImpl[IluFlashMLASparseMetadata]):
         # passes, so forward_mqa has to re-read it rather than use the snapshot.
         self._indexer = indexer
         self.softmax_scale = scale
-        # The indexer carries the shared buffer for normal layers; skip-topk
-        # layers reuse the explicitly-passed buffer from the previous layer.
-        self.topk_indices_buffer: torch.Tensor | None = (
-            self._indexer.topk_indices_buffer
-            if self._indexer is not None
-            else topk_indices_buffer
-        )
+        self.init_topk_indices_buffer(indexer, topk_indices_buffer)
         # Prefill BF16 kernel requires 64 on Hopper, 128 on Blackwell
         self.prefill_padding = (
             128 if current_platform.is_device_capability_family(100) else 64

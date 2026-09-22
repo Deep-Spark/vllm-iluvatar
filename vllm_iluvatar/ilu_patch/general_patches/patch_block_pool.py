@@ -3,12 +3,14 @@
 
 Corresponds to: vllm/v1/core/block_pool.py
 Target   : BlockPool.free_blocks
-Baseline : main_a67969c5a0 (re-synced from main_a67969c5a0)
+Baseline : v0.30.0 (re-synced from community 0.30.0)
 Why      : Community commit a82f1b388fe changed the free-queue ordering for
-           blocks released while prefix caching is disabled.
+           blocks released while prefix caching is disabled; 0.30.0 added
+           multi-pool routing (block.pool) to free_blocks.
 How      : Fingerprint the current community ``BlockPool.free_blocks``
-           (post-a82f1b388fe), then rebind it to the pre-a82f1b388fe hash
-           split in ``vllm_iluvatar.v1.core.block_pool``.
+           (0.30.0, with other_pools routing), then rebind it to the
+           pre-a82f1b388fe hash split in ``vllm_iluvatar.v1.core.block_pool``,
+           preserving the 0.30.0 multi-pool routing.
 Scope    : KV-cache block release and reuse ordering.
 Remove   : When community vLLM reverts a82f1b388fe or provides an equivalent fix.
 Fingerprint: the live community ``BlockPool.free_blocks`` source is checked
@@ -34,7 +36,11 @@ def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
     # Identify blocks with hash (LRU cache) and without it (never match APC)
     blocks_to_evict_last = []
     blocks_to_evict_first = []
+    other_pools: dict[BlockPool, list[KVCacheBlock]] = {}
     for block in ordered_blocks:
+        if block.pool is not None and block.pool is not self:
+            other_pools.setdefault(block.pool, []).append(block)
+            continue
         block.ref_cnt -= 1
         if block.ref_cnt == 0 and not block.is_null:
             if block.block_hash is None or not self.enable_caching:
@@ -48,6 +54,8 @@ def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
     self.free_block_queue.prepend_n(blocks_to_evict_first)
     # Blocks to reuse last are appended to the end of the free queue.
     self.free_block_queue.append_n(blocks_to_evict_last)
+    for pool, blocks in other_pools.items():
+        pool.free_blocks(blocks)
 '''
 
 

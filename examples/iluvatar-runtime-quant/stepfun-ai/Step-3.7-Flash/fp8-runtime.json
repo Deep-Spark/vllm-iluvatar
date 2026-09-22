@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "enabled": true,
+  "applies_to": {
+    "model_types": [
+      "step3p5"
+    ],
+    "quant_methods": [
+      "fp8"
+    ]
+  },
+  "ignore": [
+    "lm_head",
+    "model.embed_tokens"
+  ],
+  "config_groups": {
+    "step37_backbone_bf16_to_fp8": {
+      "priority": 100,
+      "targets": [
+        "re:^(?!.*\\.mtp_block\\.).*\\.self_attn\\.(?:qkv_proj|o_proj|g_proj)$",
+        "re:^(?!.*\\.mtp_block\\.).*\\.mlp\\.(?:gate_up_proj|down_proj)$",
+        "re:^(?!.*\\.mtp_block\\.).*\\.share_expert\\.(?:gate_up_proj|down_proj)$"
+      ],
+      "require": {
+        "original_disposition": "ignored",
+        "checkpoint_dtypes": [
+          "bfloat16"
+        ]
+      },
+      "weights": {
+        "source": {
+          "format": "native",
+          "dtypes": [
+            "bfloat16"
+          ]
+        },
+        "target": {
+          "format": "fp8",
+          "dtype": "float8_e4m3fn",
+          "strategy": "channel"
+        },
+        "loading": {
+          "mode": "transform",
+          "stage": "process_weights_after_loading"
+        }
+      },
+      "input_activations": {
+        "num_bits": 8,
+        "type": "float",
+        "strategy": "token",
+        "dynamic": true
+      },
+      "output_activations": null,
+      "iluvatar": {
+        "method": "IluFp8PerChannelOnlineLinearMethod",
+        "gemm_format": "TN",
+        "shape_mismatch_policy": "fallback_original"
+      }
+    }
+  }
+}

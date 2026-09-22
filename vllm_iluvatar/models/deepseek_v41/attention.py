@@ -13,6 +13,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -21,6 +22,8 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 from vllm_iluvatar.models.deepseek_v41.compressor import (
     IluDeepseekV41Compressor,
@@ -32,6 +35,7 @@ from vllm_iluvatar.models.deepseek_v41.compressor import (
 from vllm_iluvatar.models.deepseek_v41.sparse_mla import (
     BLOCK_SIZE,
     V41AttentionMetadata,
+    V41CompressorBackend,
     V41WindowKVCache,
     decode_sparse_mla,
     gather_group_rows,
@@ -678,7 +682,7 @@ class IluDeepseekV41Indexer(nn.Module):
         return idxs, torch.clamp(visible, max=topk, out=self.topk_lens_buf[:num_tokens])
 
 
-class IluDeepseekV41Attention(nn.Module):
+class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
     """Q/KV/O projections, vLLM-owned caches, and the sparse MLA forward.
 
     ``compress_ratio > 0`` does not mean this layer compresses its own KV: only
@@ -775,21 +779,30 @@ class IluDeepseekV41Attention(nn.Module):
         # same cache module under two layers would put it in the module tree twice.
         sfc = vllm_config.compilation_config.static_forward_context
         self._static_forward_context = sfc
-        self.compress_cache = None
+        if prefix in sfc:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        sfc[prefix] = self
+
+        # A kv-source layer owns the compressed-KV cache itself: the spec and the
+        # handle live on the attention, so a borrower resolves the source layer
+        # rather than a cache module hanging off it.
+        self.kv_dtype = dtype
+        self.kv_cache = torch.tensor([])
         self._compress_cache_prefix = ""
         if self.is_kv_source:
-            self.compress_cache = V41CompressKVCache(
-                head_size=self.head_dim, dtype=dtype,
-                compress_ratio=self.compress_ratio,
-                block_size=BLOCK_SIZE, prefix=f"{prefix}.compress_kv",
-            )
-            self._compress_cache_prefix = self.compress_cache.prefix
+            if BLOCK_SIZE % self.compress_ratio:
+                raise ValueError(
+                    f"block_size {BLOCK_SIZE} must be a multiple of compress_ratio "
+                    f"{self.compress_ratio}, or a page would hold a fractional row "
+                    f"(layer {prefix})"
+                )
+            self._compress_cache_prefix = prefix
             self.compressor = IluDeepseekV41Compressor(
                 config, self.compress_ratio, prefix=f"{prefix}.compressor"
             )
         elif self.compress_ratio:
             self._compress_cache_prefix = self._source_prefix(
-                prefix, config.kv_source_layer_ids, "compress_kv"
+                prefix, config.kv_source_layer_ids, ""
             )
         if self.is_index_source:
             # Index keys are written from a compressor latent, so their cache
@@ -820,7 +833,9 @@ class IluDeepseekV41Attention(nn.Module):
         assert sources, (
             f"layer {self.layer_id} reads {suffix} but no source layer precedes it"
         )
-        src = _source_layer_prefix(prefix, sources[-1]) + f".{suffix}"
+        src = _source_layer_prefix(prefix, sources[-1])
+        if suffix:
+            src += f".{suffix}"
         # This layer being its own source means the cache is built a few lines
         # below, so there is nothing to look up yet.
         if sources[-1] != self.layer_id and src not in self._static_forward_context:
@@ -892,9 +907,26 @@ class IluDeepseekV41Attention(nn.Module):
             else compress_rope_qdq_insert
         )
         insert(
-            self.compress_cache.kv_cache, latent, md, self.compress_ratio,
+            self.kv_cache, latent, md, self.compress_ratio,
             _COMPRESS_KV_FP4_BLOCK, "fp4_e4m3", self.cos_sin,
         )
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        # Only kv-source layers own one: the rest read the source's through the
+        # forward context, and cr == 0 layers are pure sliding-window attention.
+        # The window cache stays a module of its own.
+        if not self.is_kv_source:
+            return None
+        return MLAAttentionSpec(
+            block_size=BLOCK_SIZE,
+            num_kv_heads=1,
+            head_size=self.head_dim,
+            dtype=self.kv_dtype,
+            compress_ratio=self.compress_ratio,
+        )
+
+    def get_attn_backend(self) -> type[AttentionBackend]:
+        return V41CompressorBackend
 
     def forward(
         self,

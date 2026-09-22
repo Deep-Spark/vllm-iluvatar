@@ -87,6 +87,7 @@ from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
 )
 from vllm_iluvatar.model_executor.layers.quantization import IluvatarQuantRegistry
 from vllm_iluvatar.models.glm_moe_dsa.attention import (
+    GlmDsaTopkConvertCache,
     IluGlmMoeDsaMLAAttention,
     glm_dsa_layer_skip_topk,
 )
@@ -443,6 +444,7 @@ class IluGlmMoeDsaDecoderLayer(nn.Module):
         vllm_config: VllmConfig,
         prefix: str,
         topk_indices_buffer: torch.Tensor | None = None,
+        topk_convert_cache: GlmDsaTopkConvertCache | None = None,
     ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -470,6 +472,7 @@ class IluGlmMoeDsaDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
             topk_indices_buffer=topk_indices_buffer,
+            topk_convert_cache=topk_convert_cache,
         )
 
         is_moe_layer = (
@@ -603,6 +606,11 @@ class IluGlmMoeDsaModel(nn.Module):
             dtype=torch.int32,
             device=self.device,
         )
+        self.topk_convert_cache = (
+            GlmDsaTopkConvertCache()
+            if envs.VLLM_ILU_GLM_DSA_TOPK_CONVERT_CACHE
+            else None
+        )
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -620,6 +628,7 @@ class IluGlmMoeDsaModel(nn.Module):
                 vllm_config=vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
+                topk_convert_cache=self.topk_convert_cache,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -678,6 +687,8 @@ class IluGlmMoeDsaModel(nn.Module):
             if self.recv_topk:
                 topk_indices = intermediate_tensors[_TOPK_INDICES_KEY]
                 self.topk_indices_buffer[: topk_indices.shape[0]].copy_(topk_indices)
+                if self.topk_convert_cache is not None:
+                    self.topk_convert_cache.invalidate()
 
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual)

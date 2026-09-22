@@ -128,6 +128,7 @@ if TYPE_CHECKING:
     VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV: bool = True
     VLLM_ILU_GLM_DSA_FP8_ABSORB_UP: bool = True
     VLLM_ILU_GLM_DSA_TOPK_CONVERT_CACHE: bool = True
+    VLLM_ILU_GLM_DSA_NATIVE_MQA_LOGITS: bool = False
     VLLM_ILU_NIXL_WRITE_USE_HOST_BUFFER: bool = False
     VLLM_ILU_NIXL_HOST_DTYPE: str = "auto"
     VLLM_ILU_NIXL_PROXY_ADDR: str = ""
@@ -346,6 +347,10 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # BF16 A/B baseline. Ignored by the W4A8 (marlin) path.
     "VLLM_ILU_GLM_DSA_FP8_ABSORB_UP": _bool_reader(
         "VLLM_ILU_GLM_DSA_FP8_ABSORB_UP", "1"
+    ),
+    # Indexer mqa-logits: 1 = ixformer_native narrow tile, 0 = ixinfer (16 slots).
+    "VLLM_ILU_GLM_DSA_NATIVE_MQA_LOGITS": _bool_reader(
+        "VLLM_ILU_GLM_DSA_NATIVE_MQA_LOGITS", "0"
     ),
     # Cache request-local -> global top-k conversion across shared DSA layers.
     "VLLM_ILU_GLM_DSA_TOPK_CONVERT_CACHE": _bool_reader(

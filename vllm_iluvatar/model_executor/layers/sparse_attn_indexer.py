@@ -7,6 +7,7 @@ from __future__ import annotations
 import ixformer.inference.functions as ixfops
 import torch
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
@@ -16,6 +17,12 @@ from vllm.utils.torch_utils import _encode_layer_name, direct_register_custom_op
 from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
     IluDeepseekV32IndexerMetadata,
 )
+
+
+def _mqa_logits(*args, **kwargs):
+    if envs.VLLM_ILU_GLM_DSA_NATIVE_MQA_LOGITS:
+        kwargs.setdefault("backend", "ixformer_native")
+    return ixfops.dsa_indexer_mqa_logits(*args, **kwargs)
 
 
 def ilu_sparse_attn_indexer(
@@ -69,7 +76,7 @@ def ilu_sparse_attn_indexer(
         for chunk in prefill_metadata.chunks:
             if chunk.max_context_len == 0:
                 continue
-            logits = ixfops.dsa_indexer_mqa_logits(
+            logits = _mqa_logits(
                 q[chunk.token_start : chunk.token_end],
                 chunk.cu_seqlens_q,
                 chunk.cu_seq_lens,
@@ -103,7 +110,7 @@ def ilu_sparse_attn_indexer(
         # represented by cu_seqlens_q plus one causal [ks, ke) span per query
         # token. The same variable-query logits kernel used for prefill can
         # therefore handle requires_padding=True without an explicit pack step.
-        logits = ixfops.dsa_indexer_mqa_logits(
+        logits = _mqa_logits(
             q[:num_decode_tokens],
             decode_metadata.cu_seqlens_q,
             decode_metadata.cu_seqlens_kv,

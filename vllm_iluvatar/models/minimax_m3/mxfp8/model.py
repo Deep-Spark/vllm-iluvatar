@@ -375,8 +375,8 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         # Reserved top-k indices buffer shared by all sparse-attention indexer
         # layers (mirrors DeepseekV4); kept at a stable address so the indexer's
         # top-k output survives cudagraph capture/replay. Token-major
-        # [total_q, num_index_heads, topk] so the indexer writes its native
-        # [token, head, topk] top-k; the attend transposes to [H, tokens, topk].
+        # [total_q, num_index_heads, topk] so indexer and sparse attend both use
+        # native token-major [token, head, topk].
         sparse_cfg = getattr(config, "sparse_attention_config", None)
         if sparse_cfg is not None:
             tp_size = get_tensor_model_parallel_world_size()

@@ -8,12 +8,9 @@ here is the kernel dispatch: :class:`MiniMaxM3SparseImpl` (community) declares
 module subclasses that base rather than the community Triton impl.
 
 Two Iluvatar deltas drive the code below: ixformer wants a contiguous
-``[H,Q,K]`` top-k (vLLM's shared buffer view is transposed), and it reads a
-K/V-split NHD cache instead of the community packed layout. FP8 KV has no
-ixformer path, so the backend advertises BF16 only.
-
-The compressed-tensors path uses token-major ``[Q,H,K]`` adapters in
-``w4a8/sparse_attention.py``; do not merge those into this module.
+token-major ``[Q,H,K]`` top-k (the same layout as the shared buffer), and it
+reads a K/V-split NHD cache instead of the community packed layout. FP8 KV has
+no ixformer path, so the backend advertises BF16 only.
 """
 
 from __future__ import annotations
@@ -68,7 +65,7 @@ _M3_SPARSE_PREFILL_BACKEND = "ixformer_perf"
 
 
 def _dense_topk(topk_idx: torch.Tensor) -> torch.Tensor:
-    """Return the dense ``[H,Q,K]`` layout assumed by ixformer kernels."""
+    """Return the dense token-major ``[Q,H,K]`` layout ixformer kernels want."""
     return topk_idx if topk_idx.is_contiguous() else topk_idx.contiguous()
 
 
@@ -259,11 +256,10 @@ class MiniMaxM3SparseIxformerImpl(MiniMaxM3SparseImpl):
 
         num_decode = main_md.num_decode_tokens
         num_tokens = main_md.num_actual_tokens
-        # Indexer top-k from the shared buffer: decode [:, :num_decode],
-        # prefill [:, num_decode:].
+        # Indexer top-k from the shared token-major buffer: decode [:num_decode],
+        # prefill packed immediately after.
         topk_buffer = layer.topk_indices_buffer  # type: ignore[attr-defined]
         assert topk_buffer is not None
-        topk = topk_buffer[:num_tokens].transpose(0, 1)
         hd = self.head_size
         q = query[:num_tokens].view(-1, self.num_heads, hd)
         out = output[:num_tokens].view(-1, self.num_heads, hd)
@@ -276,7 +272,7 @@ class MiniMaxM3SparseIxformerImpl(MiniMaxM3SparseImpl):
             minimax_m3_sparse_attn_decode(
                 q[:num_decode],
                 kv_cache,
-                topk[:, :num_decode, :],
+                topk_buffer[:num_decode],
                 d.block_table,
                 d.seq_lens,
                 self.num_kv_heads,
@@ -289,12 +285,13 @@ class MiniMaxM3SparseIxformerImpl(MiniMaxM3SparseImpl):
         if main_md.num_prefills > 0:
             p = main_md.prefill
             assert p is not None
+            prefill_topk = topk_buffer[num_decode:num_tokens]
             if p.max_query_len == 1:
                 # Match the indexer's q=1 dispatch and reuse decode split-K.
                 minimax_m3_sparse_attn_decode(
                     q[num_decode:],
                     kv_cache,
-                    topk[:, num_decode:num_tokens, :],
+                    prefill_topk,
                     p.block_table,
                     p.seq_lens,
                     self.num_kv_heads,
@@ -307,7 +304,7 @@ class MiniMaxM3SparseIxformerImpl(MiniMaxM3SparseImpl):
                 _minimax_m3_sparse_attn_ixformer(
                     q[num_decode:],
                     kv_cache,
-                    topk[:, num_decode:num_tokens, :],
+                    prefill_topk,
                     p.block_table,
                     p.cu_seqlens_q,
                     p.seq_lens,

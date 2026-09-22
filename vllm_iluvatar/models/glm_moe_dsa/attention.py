@@ -375,6 +375,37 @@ class IluGlmMoeDsaIndexer(nn.Module):
         )
 
 
+class GlmDsaTopkConvertCache:
+    """Reuse one request-local -> global top-k conversion across shared layers.
+
+    Invalidate after a ``full`` layer rewrites ``topk_indices_buffer``, or after
+    a PP stage copies a buffer from upstream (different KV cache).
+    """
+
+    def __init__(self) -> None:
+        self._generation = 0
+        self._cached_generation = -1
+        self._num_tokens = -1
+        self._value: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def invalidate(self) -> None:
+        self._generation += 1
+
+    def get(self, num_tokens: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if (
+            self._value is None
+            or self._cached_generation != self._generation
+            or self._num_tokens != num_tokens
+        ):
+            return None
+        return self._value
+
+    def put(self, num_tokens: int, value: tuple[torch.Tensor, torch.Tensor]) -> None:
+        self._cached_generation = self._generation
+        self._num_tokens = num_tokens
+        self._value = value
+
+
 class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
     """Sparse MLA inner attention for GLM-5.2 (ilu W4A8).
 
@@ -418,6 +449,7 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        topk_convert_cache: GlmDsaTopkConvertCache | None = None,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads  # local (TP-sharded) head count
@@ -436,6 +468,7 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         self.kv_b_proj = kv_b_proj
         self.rotary_emb = rotary_emb
         self.topk_indices_buffer = topk_indices_buffer
+        self.topk_convert_cache = topk_convert_cache
         self.prefix = prefix
 
         kv_cache_dtype = (
@@ -672,6 +705,12 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         num_tokens: int,
         attn_metadata: IluFlashMLASparseMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        cache = self.topk_convert_cache
+        if cache is not None:
+            hit = cache.get(num_tokens)
+            if hit is not None:
+                return hit
+
         topk_indices = self.topk_indices_buffer[:num_tokens]
         topk_indices, topk_length = triton_convert_req_index_to_global_index(
             attn_metadata.req_id_per_token,
@@ -681,7 +720,10 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
             NUM_TOPK_TOKENS=topk_indices.shape[1],
             return_valid_counts=True,
         )
-        return topk_indices.view(num_tokens, 1, -1), topk_length
+        result = (topk_indices.view(num_tokens, 1, -1), topk_length)
+        if cache is not None:
+            cache.put(num_tokens, result)
+        return result
 
     def _sparse_mla_kernel(
         self,
@@ -927,6 +969,7 @@ class IluGlmMoeDsaMLAAttention(nn.Module):
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
         reduce_results: bool = True,
+        topk_convert_cache: GlmDsaTopkConvertCache | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -1022,6 +1065,7 @@ class IluGlmMoeDsaMLAAttention(nn.Module):
         # (``shared``) layers reuse the previous full layer's topk buffer.
         layer_id = extract_layer_index(prefix)
         self.skip_topk = glm_dsa_layer_skip_topk(config, layer_id)
+        self.topk_convert_cache = topk_convert_cache
 
         if not self.skip_topk:
             self.indexer = IluGlmMoeDsaIndexer(
@@ -1051,6 +1095,7 @@ class IluGlmMoeDsaMLAAttention(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
+            topk_convert_cache=topk_convert_cache,
         )
 
     def forward(
@@ -1094,6 +1139,8 @@ class IluGlmMoeDsaMLAAttention(nn.Module):
 
         if self.indexer is not None and not self.skip_topk:
             self.indexer(hidden_bf16, q_projection_input, positions, self.rotary_emb)
+            if self.topk_convert_cache is not None:
+                self.topk_convert_cache.invalidate()
 
         if self.mla_attn.use_rms_rope_fp8_kv_fusion:
             attn_out = self.mla_attn(

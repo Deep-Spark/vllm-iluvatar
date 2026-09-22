@@ -1,0 +1,55 @@
+# stepfun-ai/Step-3.7-Flash runtime quant
+# 开源权重：https://modelscope.cn/models/stepfun-ai/Step-3.7-Flash
+# 本地 FP8 checkpoint 可能带 -FP8 后缀；--model 指向实际路径。
+#
+# 该 checkpoint 自带 quantization_config（fp8），不要传 --quantization。
+# 只转主干里被 ignore、磁盘仍是 BF16 的 Linear：self_attn、dense mlp、share_expert。
+# routed experts 已是 block-FP8，mtp_block / moe.gate / embedding / lm_head 不转。
+#
+#   vllm serve /path/to/Step-3.7-Flash-FP8 \
+#     --config examples/iluvatar-runtime-quant/stepfun-ai/Step-3.7-Flash/fp8-inline.yaml \
+#     --trust-remote-code
+additional-config:
+  ilu_quant:
+    source: inline
+    schema_version: 1
+    enabled: true
+    applies_to:
+      model_types: [step3p5]
+      quant_methods: [fp8]
+    ignore:
+      - lm_head
+      - model.embed_tokens
+    config_groups:
+      step37_backbone_bf16_to_fp8:
+        priority: 100
+        targets:
+          - 're:^(?!.*\.mtp_block\.).*\.self_attn\.(?:qkv_proj|o_proj|g_proj)$'
+          - 're:^(?!.*\.mtp_block\.).*\.mlp\.(?:gate_up_proj|down_proj)$'
+          - 're:^(?!.*\.mtp_block\.).*\.share_expert\.(?:gate_up_proj|down_proj)$'
+        require:
+          original_disposition: ignored
+          checkpoint_dtypes: [bfloat16]
+        weights:
+          source:
+            format: native
+            dtypes: [bfloat16]
+          target:
+            format: fp8
+            dtype: float8_e4m3fn
+            strategy: channel
+          loading:
+            mode: transform
+            stage: process_weights_after_loading
+        input_activations:
+          num_bits: 8
+          type: float
+          strategy: token
+          dynamic: true
+        output_activations: null
+        iluvatar:
+          method: IluFp8PerChannelOnlineLinearMethod
+          gemm_format: TN
+          shape_mismatch_policy: fallback_original
+        # TP2：selected=225 transformed=192 fallback=33。
+        # fallback 全是部分层的 g_proj（本 rank N=48）。

@@ -57,6 +57,11 @@ class IluNixlConnectorMetadata(NixlConnectorMetadata):
         local_block_ids,
         kv_transfer_params,
         local_num_computed_blocks: tuple[int, ...] = (),
+        # >>> ILU MODIFICATION >>>
+        # Forward community v0.30.0 `awaiting_kvs` to ReqMeta (inherited from
+        # NixlReqMeta). Ilu adds remote PP topology fields on top.
+        awaiting_kvs: bool = False,
+        # <<< ILU MODIFICATION <<<
     ) -> ReqMeta:
         return ReqMeta(
             local_block_ids=local_block_ids,
@@ -67,4 +72,5 @@ class IluNixlConnectorMetadata(NixlConnectorMetadata):
             local_num_computed_blocks=local_num_computed_blocks,
             remote_pp_size=kv_transfer_params.get("pp_size", 1),
             remote_pp_split=kv_transfer_params.get("pp_split", ""),
+            awaiting_kvs=awaiting_kvs,
         )

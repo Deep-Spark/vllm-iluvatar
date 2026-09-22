@@ -17,6 +17,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
 
 
@@ -33,7 +34,11 @@ def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
     # <<< ILU MODIFICATION <<<
     blocks_to_evict_last = []
     blocks_to_evict_first = []
+    other_pools: dict[BlockPool, list[KVCacheBlock]] = {}
     for block in ordered_blocks:
+        if block.pool is not None and block.pool is not self:
+            other_pools.setdefault(block.pool, []).append(block)
+            continue
         block.ref_cnt -= 1
         if block.ref_cnt == 0 and not block.is_null:
             # >>> ILU MODIFICATION >>>
@@ -50,3 +55,5 @@ def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
     self.free_block_queue.prepend_n(blocks_to_evict_first)
     # Blocks to reuse last are appended to the end of the free queue.
     self.free_block_queue.append_n(blocks_to_evict_last)
+    for pool, blocks in other_pools.items():
+        pool.free_blocks(blocks)

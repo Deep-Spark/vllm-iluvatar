@@ -7,7 +7,7 @@ Corresponds to: vllm/v1/worker/dp_utils.py
 Target   : vllm.v1.worker.dp_utils.coordinate_batch_across_dp
            vllm.forward_context.DPMetadata.make
            vllm.forward_context.set_forward_context
-Baseline : plugin/vllm 0.28.0 runtime source
+Baseline : v0.30.0 runtime source
 Why      : hybrid DeepSeek-V4 EP may switch decode to LL only when every DP
            rank is decode-only; otherwise collective paths can diverge.
 How      : coordinate_batch_across_dp is a full-function copy with optional
@@ -33,7 +33,7 @@ from vllm_iluvatar.ilu_patch import general_patch as p
 
 # Verbatim community-baseline source of
 # vllm.v1.worker.dp_utils.coordinate_batch_across_dp, used as the drift anchor.
-# Baseline: plugin/vllm 0.28.0 runtime source.
+# Baseline: v0.30.0 runtime source (adds should_skip_dp_coordination() early exit).
 COORDINATE_BATCH_ACROSS_DP = '''\
 def coordinate_batch_across_dp(
     num_tokens_unpadded: int,
@@ -85,6 +85,19 @@ def coordinate_batch_across_dp(
 
     if num_tokens_padded is None:
         num_tokens_padded = num_tokens_unpadded
+
+    if should_skip_dp_coordination():
+        should_ubatch = should_attempt_ubatching and not is_last_ubatch_empty(
+            num_tokens_unpadded,
+            num_tokens_padded,
+            parallel_config.num_ubatches,
+        )
+        num_tokens_after_padding = torch.full(
+            (parallel_config.data_parallel_size,),
+            num_tokens_padded,
+            dtype=torch.int32,
+        )
+        return should_ubatch, num_tokens_after_padding, cudagraph_mode
 
     (should_ubatch, num_tokens_after_padding, synced_cudagraph_mode) = (
         _synchronize_dp_ranks(

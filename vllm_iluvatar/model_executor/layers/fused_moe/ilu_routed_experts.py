@@ -6,8 +6,8 @@
 Iluvatar OOT replacement for routed expert weight loading.
 
 Target     : vllm.model_executor.layers.fused_moe.routed_experts.RoutedExperts
-Baseline   : main_a67969c5a0 ``RoutedExperts.weight_loader`` and
-             ``RoutedExperts.load_weights`` (re-synced from main_a67969c5a0)
+Baseline   : v0.30.0 ``RoutedExperts.weight_loader`` and
+             ``RoutedExperts.load_weights`` (re-synced from community 0.30.0)
 Why        : preserve the fork's MoE loading deltas without editing community
              vLLM source.
 How        : @PluggableLayer.register_oot subclass. Copied methods are pinned
@@ -79,7 +79,6 @@ def weight_loader(
     # against known CompressionFormat enum values that have this quality
     if quant_method_name in (
         "CompressedTensorsWNA16MoEMethod",
-        "CompressedTensorsWNA16RDNA3MoEMethod",
         "CompressedTensorsW4A16FlydslMoEMethod",
     ):
         if is_transposed:
@@ -158,17 +157,6 @@ def weight_loader(
             param=param,
             loaded_weight=loaded_weight,
             expert_id=global_expert_id if use_global_sf else expert_id,
-        )
-        return True if return_success else None
-
-    # Case g_idx
-    if "g_idx" in weight_name:
-        self._load_g_idx(
-            shard_dim=0,
-            shard_id=shard_id,
-            loaded_weight=loaded_weight,
-            expert_data=expert_data,
-            tp_rank=self.moe_config.tp_rank,
         )
         return True if return_success else None
 
@@ -275,7 +263,6 @@ def weight_loader(
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 tp_rank=self.moe_config.tp_rank,
-                load_full_w2=getattr(param, "load_full_w2", False),
             )
         elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
             self._load_per_tensor_weight_scale(
@@ -801,7 +788,6 @@ class IluRoutedExperts(RoutedExperts):
         # against known CompressionFormat enum values that have this quality
         if quant_method_name in (
             "CompressedTensorsWNA16MoEMethod",
-            "CompressedTensorsWNA16RDNA3MoEMethod",
             "CompressedTensorsW4A16FlydslMoEMethod",
         ):
             if is_transposed:
@@ -887,17 +873,6 @@ class IluRoutedExperts(RoutedExperts):
                 param=param,
                 loaded_weight=loaded_weight,
                 expert_id=global_expert_id if use_global_sf else expert_id,
-            )
-            return True if return_success else None
-
-        # Case g_idx
-        if "g_idx" in weight_name:
-            self._load_g_idx(
-                shard_dim=0,
-                shard_id=shard_id,
-                loaded_weight=loaded_weight,
-                expert_data=expert_data,
-                tp_rank=self.moe_config.tp_rank,
             )
             return True if return_success else None
 
@@ -1004,7 +979,6 @@ class IluRoutedExperts(RoutedExperts):
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
                     tp_rank=self.moe_config.tp_rank,
-                    load_full_w2=getattr(param, "load_full_w2", False),
                 )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
                 self._load_per_tensor_weight_scale(

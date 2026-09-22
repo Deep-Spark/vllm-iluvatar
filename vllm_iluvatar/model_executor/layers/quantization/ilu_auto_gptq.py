@@ -46,7 +46,6 @@ from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
     PackedColumnParameter,
     PackedvLLMParameter,
-    RowvLLMParameter,
 )
 from vllm.scalar_type import scalar_types
 
@@ -397,7 +396,6 @@ class IluAutoGPTQLinearMethod(LinearMethodBase):
             act_type=params_dtype if input_dtype is None else input_dtype,
             group_size=self.quant_config.group_size,
             zero_points=False,
-            has_g_idx=self.quant_config.desc_act,
         )
 
         kernel_type = choose_mp_linear_kernel(mp_linear_kernel_config)
@@ -414,7 +412,7 @@ class IluAutoGPTQLinearMethod(LinearMethodBase):
 
         # Determine sharding
         if marlin_repeat_scales_on_all_ranks(
-            self.quant_config.desc_act, self.quant_config.group_size, is_row_parallel
+            self.quant_config.group_size, is_row_parallel
         ):
             # By setting scale_dim == None, weight_loader will
             # repeat the scales on each GPU in TP>1 case.
@@ -437,16 +435,6 @@ class IluAutoGPTQLinearMethod(LinearMethodBase):
             output_dim=1,
             packed_dim=0,
             packed_factor=self.quant_config.pack_factor,
-            weight_loader=weight_loader,
-        )
-
-        # Activation order
-        g_idx = RowvLLMParameter(
-            data=torch.empty(
-                input_size_per_partition,
-                dtype=torch.int32,
-            ),
-            input_dim=0,
             weight_loader=weight_loader,
         )
 
@@ -489,7 +477,6 @@ class IluAutoGPTQLinearMethod(LinearMethodBase):
             )
 
         layer.register_parameter("qweight", qweight)
-        layer.register_parameter("g_idx", g_idx)
         layer.register_parameter("scales", scales)
         layer.register_parameter("qzeros", qzeros)
 
@@ -498,7 +485,6 @@ class IluAutoGPTQLinearMethod(LinearMethodBase):
             w_q_param_name="qweight",
             w_s_param_name="scales",
             w_zp_param_name="qzeros",
-            w_gidx_param_name="g_idx",
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -546,19 +532,9 @@ class IluAutoGPTQMoEMethod(FusedMoEMethodBase):
                 "W8A8-INT8 is not supported by marlin kernel."
             )
 
-        intermediate_size_full = extra_weight_attrs.pop("intermediate_size_full")
-
-        self.is_k_full = (not self.quant_config.desc_act) or (
-            intermediate_size_per_partition == intermediate_size_full
-        )
-
         if self.quant_config.group_size != -1:
             scales_size13 = hidden_size // self.quant_config.group_size
-            w2_scales_size = (
-                intermediate_size_full
-                if self.quant_config.desc_act
-                else intermediate_size_per_partition
-            )
+            w2_scales_size = intermediate_size_per_partition
             scales_size2 = w2_scales_size // self.quant_config.group_size
             strategy = FusedMoeWeightScaleSupported.GROUP.value
         else:
@@ -613,8 +589,6 @@ class IluAutoGPTQMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_scales", w2_scales)
         set_weight_attrs(w2_scales, extra_weight_attrs)
-        # don't shard the w2 scales when running act order
-        set_weight_attrs(w2_scales, {"load_full_w2": self.quant_config.desc_act})
         # up_proj scales
         w13_qzeros = torch.nn.Parameter(
             torch.empty(
@@ -639,48 +613,6 @@ class IluAutoGPTQMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_qzeros", w2_qzeros)
         set_weight_attrs(w2_qzeros, extra_weight_attrs)
-        # don't shard the w2 scales when running act order
-        set_weight_attrs(w2_qzeros, {"load_full_w2": self.quant_config.desc_act})
-        w13_g_idx = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                hidden_size,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_g_idx", w13_g_idx)
-        set_weight_attrs(w13_g_idx, extra_weight_attrs)
-        w2_g_idx = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                intermediate_size_per_partition,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_g_idx", w2_g_idx)
-        set_weight_attrs(w2_g_idx, extra_weight_attrs)
-        w13_g_idx_sort_indices = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                hidden_size,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_g_idx_sort_indices", w13_g_idx_sort_indices)
-        set_weight_attrs(w13_g_idx_sort_indices, extra_weight_attrs)
-        w2_g_idx_sort_indices = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                intermediate_size_per_partition,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_g_idx_sort_indices", w2_g_idx_sort_indices)
-        set_weight_attrs(w2_g_idx_sort_indices, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         is_a_8bit = self.input_dtype is not None and self.input_dtype.itemsize == 1

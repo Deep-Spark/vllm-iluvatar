@@ -7,7 +7,7 @@ Target   : vllm.v1.sample.rejection_sampler.rejection_sample
            vllm.v1.sample.rejection_sampler.generate_uniform_probs
            vllm.v1.sample.rejection_sampler.rejection_greedy_sample_kernel
            vllm.v1.sample.rejection_sampler.rejection_random_sample_kernel
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (re-synced from community 0.30.0)
 Why      : preserve Iluvatar/CoreX speculative-decoding fixes without editing
            community vLLM source.
 How      : rebind module-level functions after signature and source-signature
@@ -34,7 +34,7 @@ _OVERRIDES = [
 
 _BASELINE_SOURCE_SHAS = {
     "rejection_sample": (
-        "35d7236c81a06800520691e8eb79014b33653e05ce5e982901fdb68ea003a1ea"
+        "adadcc804bccf89cc3568b637d14b90480f903d0a5de417719200ad6a284c747"
     ),
     "generate_uniform_probs": (
         "f3e8fbcf4f6e8332bbe61141fad916087b61256f4dada65663d274b48e27524b"
@@ -71,7 +71,7 @@ def _check_source_sha(symbol_name: str, symbol: object) -> None:
         raise RuntimeError(
             "ILU patch: community "
             f"vllm.v1.sample.rejection_sampler.{symbol_name} source changed "
-            f"vs baseline main_a67969c5a0. Expected {expected_sha}, got "
+            f"vs baseline v0.30.0. Expected {expected_sha}, got "
             f"{current_sha}. Re-sync vllm_iluvatar/v1/sample/"
             "rejection_sampler.py and patch_rejection_sampler.py."
         )

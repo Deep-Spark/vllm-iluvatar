@@ -32,7 +32,6 @@ from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 
 
-
 def unpack_rows(packed_w: torch.Tensor, num_bits: int) -> torch.Tensor:
     """Unpack a row-packed ``[K // pack_factor, N]`` int32 tensor."""
 
@@ -61,9 +60,7 @@ def pack_cols(
 
     unit = 32 // pack_num
     rows, cols_pack = x.shape
-    assert cols_pack % pack_num == 0, (
-        "Number of columns must be a multiple of pack_num"
-    )
+    assert cols_pack % pack_num == 0, "Number of columns must be a multiple of pack_num"
     cols = cols_pack // pack_num
     x_reshape = x.view(rows, cols, pack_num)
     x_reorder = torch.gather(
@@ -129,11 +126,6 @@ class IluGPTQMarlinLinearKernel(MPLinearKernel):
             f"{c.weight_type}"
         )
 
-        if c.has_g_idx:
-            assert self.w_gidx_name is not None
-            perm = torch.argsort(getattr(layer, self.w_gidx_name)).to(torch.int)
-            self.act_perm = lambda x: x[:, perm]
-
         def transform_w_q(x):
             assert x.data.ndim == 2
             if x._packed_dim == 1:
@@ -142,16 +134,9 @@ class IluGPTQMarlinLinearKernel(MPLinearKernel):
                     c.weight_type,
                     packed_dim=1,
                 )
-                if c.has_g_idx:
-                    x_unpacked = x_unpacked[:, perm]
                 x_unpacked = x_unpacked.t().contiguous()
             elif x._packed_dim == 0:
                 x_unpacked = unpack_rows(x.data, c.weight_type.size_bits)
-                if c.has_g_idx:
-                    raise NotImplementedError(
-                        "GPTQMarlinLinearMethod with g_idx is not validated for "
-                        "IluGPTQMarlinLinearKernel."
-                    )
             else:
                 raise NotImplementedError(
                     f"transform_w_q packed_dim {x._packed_dim} is not implemented"
@@ -172,9 +157,7 @@ class IluGPTQMarlinLinearKernel(MPLinearKernel):
 
         def transform_w_zp(x):
             grouped_k = (
-                c.partition_weight_shape[0] // c.group_size
-                if c.group_size != -1
-                else 1
+                c.partition_weight_shape[0] // c.group_size if c.group_size != -1 else 1
             )
             x_unpacked = unpack_cols(
                 x.clone().t(),
@@ -217,13 +200,10 @@ class IluGPTQMarlinLinearKernel(MPLinearKernel):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         c = self.config
-        w_q, w_s, w_zp, _w_gidx = self._get_weight_params(layer)
+        w_q, w_s, w_zp = self._get_weight_params(layer)
         pack_factor = 32 // c.weight_type.size_bits
         out_shape = x.shape[:-1] + (c.partition_weight_shape[1],)
         x_2d = x.reshape(-1, x.shape[-1])
-
-        if c.has_g_idx:
-            x_2d = self.act_perm(x_2d)
 
         out = ops.custom_gptq_marlin_gemm(
             input=x_2d,

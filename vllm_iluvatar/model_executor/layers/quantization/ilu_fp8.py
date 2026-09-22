@@ -88,7 +88,7 @@ from vllm.model_executor.layers.quantization.fp8 import (
     Fp8LinearMethod,
     Fp8MoEMethod,
 )
-from vllm.model_executor.layers.quantization.online.fp8 import _Fp8OnlineLinearBase
+from vllm.model_executor.layers.quantization.online.fp8 import OnlineLinearBase
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_scale_parameter,
 )
@@ -127,7 +127,7 @@ logger = init_logger(__name__)
 
 
 @IluvatarQuantRegistry.register_method
-class IluFp8PerChannelOnlineLinearMethod(_Fp8OnlineLinearBase):
+class IluFp8PerChannelOnlineLinearMethod(OnlineLinearBase):
     """Load floating-point weights and quantize them for ixmm after loading.
 
     The public name follows vLLM's online per-channel method. ixmm's FP8 linear

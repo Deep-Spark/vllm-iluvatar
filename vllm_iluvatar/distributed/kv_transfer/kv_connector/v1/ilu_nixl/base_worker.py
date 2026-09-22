@@ -1219,6 +1219,12 @@ class IluNixlWorkerMixin:
                 remote_request_id=meta.remote.request_id,
                 local_xfer_side_handle=local_xfer_side_handle,
                 remote_xfer_side_handle=remote_xfer_side_handle,
+                # >>> ILU MODIFICATION >>>
+                # Forward community v0.30.0 `awaiting_kvs` so parked requests
+                # stay tracked. local_dram_handle defaults to None: the ILU
+                # HMA path does not stage to DRAM.
+                # <<< ILU MODIFICATION <<<
+                awaiting_kvs=getattr(meta, "awaiting_kvs", False),
             )
 
     def _read_blocks(
@@ -1230,6 +1236,8 @@ class IluNixlWorkerMixin:
         local_xfer_side_handle: int,
         remote_xfer_side_handle: int,
         expected_consumers: int = 1,
+        local_dram_handle: int | None = None,
+        awaiting_kvs: bool = False,
     ):
         if not self._is_heterogeneous_pp_engine(dst_engine_id):
             return super()._read_blocks(
@@ -1238,8 +1246,10 @@ class IluNixlWorkerMixin:
                 request_id,
                 remote_request_id,
                 local_xfer_side_handle,
+                local_dram_handle,
                 remote_xfer_side_handle,
                 expected_consumers=expected_consumers,
+                awaiting_kvs=awaiting_kvs,
             )
 
         assert self.transfer_topo is not None
@@ -1257,6 +1267,8 @@ class IluNixlWorkerMixin:
         if len(local_block_ids) == 0 or not any(local_block_ids):
             agent_name = self._remote_agents[dst_engine_id][remote_key]
             self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
+            if awaiting_kvs:
+                self._recving_transfers.setdefault(request_id, [])
             return
 
         local_block_ids, remote_block_ids = self._apply_prefix_caching(

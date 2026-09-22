@@ -12,7 +12,7 @@ CoreX also needs float32 uniform randoms because float64 CUDA tensors are not
 reliable on this backend, and deterministic draft sampling avoids the upstream
 NO_DRAFT_PROBS Triton recovered-token path that produces wrong tokens here.
 
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (re-synced from community 0.30.0)
 """
 
 from __future__ import annotations

@@ -1173,6 +1173,23 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
                 dtype=q_nope.dtype,
                 device=q_nope.device,
             )
+            # >>> ILU MODIFICATION >>>
+            # DCP warmup can shard a tiny dummy request across dcp_world_size
+            # ranks, leaving some ranks with all-zero seq_lens / max_context_len
+            # == 0. The ixformer vllm_paged_attention_mla(_int8) kernel divides by
+            # max_context_len internally and raises SIGFPE in that case. Short
+            # circuit: return zero attn_out and a neutral softmax_lse so the DCP
+            # collective (reduce_scatter on lse) still converges.
+            if max_decode_seq_len == 0:
+                attn_out = o
+                softmax_lse = torch.zeros(
+                    B,
+                    q.shape[1],
+                    dtype=torch.float32,
+                    device=o.device,
+                )
+                return attn_out, softmax_lse
+            # <<< ILU MODIFICATION <<<
             if self.use_int8_mla:
                 q_int8, q_scale = ops.quant_kv(q)
                 attn_out, softmax_lse = ixf_ops.vllm_paged_attention_mla_int8(

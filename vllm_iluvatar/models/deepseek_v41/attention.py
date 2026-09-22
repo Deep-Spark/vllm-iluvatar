@@ -319,8 +319,6 @@ class IluDeepseekV41Indexer(nn.Module):
         static_forward_context: dict,
     ) -> None:
         super().__init__()
-        tp_size = get_tensor_model_parallel_world_size()
-
         self.layer_id = layer_id
         self.owns_k = owns_k
         # Index keys come from a kv-source layer's compressor latent, so only
@@ -339,7 +337,6 @@ class IluDeepseekV41Indexer(nn.Module):
         self.candidate_topk_blocks = config.candidate_topk_blocks
         self.candidate_block_size = config.candidate_block_size
         self.n_heads = config.index_n_heads
-        self.n_local_heads = config.index_n_heads // tp_size
         self.index_head_dim = config.index_head_dim
         self.rope_head_dim = config.rope_head_dim
         self.index_topk = config.index_topk
@@ -376,12 +373,18 @@ class IluDeepseekV41Indexer(nn.Module):
             else compress_ratio
         )
 
-        self.wq_b = ColumnParallelLinear(
+        # Replicated, not sharded over heads: the scoring kernel shards candidate
+        # blocks over the TP group, so every rank needs every head anyway and a
+        # sharded projection would only gather them straight back -- 64 MiB of q
+        # per index-source layer at 8k tokens, against 7/8 of a
+        # [T, 1280] x [1280, 4096] GEMM to compute them everywhere.
+        self.wq_b = ReplicatedLinear(
             config.q_lora_rank, config.index_n_heads * config.index_head_dim,
             bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_b",
         )
-        self.weights_proj = ColumnParallelLinear(
+        self.weights_proj = ReplicatedLinear(
             config.hidden_size, config.index_n_heads, bias=False,
+            quant_config=None,
             params_dtype=torch.bfloat16, prefix=f"{prefix}.weights_proj",
         )
         if self.owns_k:
@@ -451,7 +454,7 @@ class IluDeepseekV41Indexer(nn.Module):
             )
             return idxs, lens
 
-        q = self.wq_b(qr)[0].unflatten(-1, (self.n_local_heads, self.index_head_dim))
+        q = self.wq_b(qr)[0].unflatten(-1, (self.n_heads, self.index_head_dim))
 
         weights = self.weights_proj(x)[0]
         ixfops.v41_indexer_q_rope_qdq(
@@ -485,9 +488,8 @@ class IluDeepseekV41Indexer(nn.Module):
 
         That also dictates how the work is split. A rank needs the *complete*
         per-head sum for any group it scores, and the ``[num_tokens, seq_len]``
-        score is exactly what must not exist to be all-reduced, so the heads are
-        all-gathered instead -- q is ``[num_tokens, n_local_heads, 128]`` and the
-        weights are one value per head, both negligible -- and the kernel shards
+        score is exactly what must not exist to be all-reduced, so q and the
+        weights are replicated -- see the projections -- and the kernel shards
         *candidate blocks* round-robin over the TP group. Each rank's local top-k
         contains every group of its own blocks that could reach the global top-k,
         so merging the compact results is exact rather than approximate.
@@ -504,10 +506,6 @@ class IluDeepseekV41Indexer(nn.Module):
         ratio = self.compress_ratio
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
-        if tp_size > 1:
-            q = tensor_model_parallel_all_gather(q, dim=1)
-            weights = tensor_model_parallel_all_gather(weights, dim=1)
-
         num_tokens = q.size(0)
         dev = q.device
         if (

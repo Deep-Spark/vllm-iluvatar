@@ -40,9 +40,8 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.models.utils import extract_layer_index
+from vllm.model_executor.layers.fused_moe import FusedMoEActivationFormat
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
-
 from vllm_iluvatar.model_executor.layers.fused_moe.prepare_finalize.ilu_deepep_ll import (
     VLLM_ILU_DEEPEP_USE_SCATTER,
     VLLM_ILU_LL_FUSED_AG_AR,
@@ -110,10 +109,23 @@ def _get_max_num_seqs() -> int:
     )
 
 
+def _check_shared_gate_up(
+    hidden: torch.Tensor,
+    packed: tuple[torch.Tensor, torch.Tensor, torch.dtype],
+) -> None:
+    q, scales, out_dtype = packed
+    assert hidden.dtype == torch.bfloat16
+    assert out_dtype == hidden.dtype
+    assert q.dtype == torch.int8 and q.shape == hidden.shape
+    assert scales.dtype == torch.float32
+    assert scales.numel() == hidden.numel() // hidden.shape[-1]
+
+
 class IluFusedMoEEP:
     _dp_ep_ll_all2all_manager = None
     _dp_ep_ll_all2all_handle = None
     _dp_ep_ll_all2all_handle_args = None
+    _dp_ep_ll_preinit_done = False
 
     def init_ep(self):
         if self._should_preinit_dp_ep_ll_handle():
@@ -121,9 +133,6 @@ class IluFusedMoEEP:
             # moe_quant_config is None during model construction because it needs
             # post-processed weight scales. Defer NVSM initialization until after
             # weight processing, but before CUDA graph capture; patch only once.
-            if getattr(runner, "_ilu_nvsm_init_patched", False):
-                return
-
             original_init = runner.maybe_init_modular_kernel
 
             def init_modular_kernel_and_nvsm(runner_self):
@@ -141,7 +150,7 @@ class IluFusedMoEEP:
                 init_modular_kernel_and_nvsm,
                 runner,
             )
-            runner._ilu_nvsm_init_patched = True
+            IluFusedMoEEP._dp_ep_ll_preinit_done = True
 
     def _should_use_forward_dp_ep(self) -> bool:
         moe_parallel_config = self.experts.moe_config.moe_parallel_config
@@ -172,7 +181,8 @@ class IluFusedMoEEP:
         )
 
     def _should_preinit_dp_ep_ll_handle(self) -> bool:
-        if extract_layer_index(self.prefix) != 0:
+        # Process-wide handle; first EP MoE layer wins (not always layer 0).
+        if IluFusedMoEEP._dp_ep_ll_preinit_done:
             return False
         configured_backend = self.experts.moe_config.moe_parallel_config.all2all_backend
         return (
@@ -244,6 +254,7 @@ class IluFusedMoEEP:
                 tp_size=tp_size,
                 **dispatch_quant_kwargs,
             )
+            handle.ilu_max_tokens_per_rank = max_tokens_per_rank
         return ll_manager, handle
 
     def _get_forward_dp_ep_ll_moe_kernel(self):
@@ -278,14 +289,14 @@ class IluFusedMoEEP:
         ll_manager, handle = self._get_forward_dp_ep_ll_all2all()
 
         use_fp8_dispatch = bool(self._nvsm_dispatch_quant_kwargs()["use_fp8"])
+        # Must match the NVSHMEM buffer built in
+        # ``_get_forward_dp_ep_ll_all2all``. ``moe_config.max_num_tokens``
+        # is the prefill bound (max_num_batched_tokens), and the batched
+        # expert layout is sized as max_tokens_per_rank * num_dispatchers
+        # per expert -- overstating it here costs GiBs of workspace and
+        # output per captured graph.
         prepare_finalize = DeepEPLLPrepareAndFinalize(
             handle,
-            # Must match the NVSHMEM buffer built in
-            # ``_get_forward_dp_ep_ll_all2all``. ``moe_config.max_num_tokens``
-            # is the prefill bound (max_num_batched_tokens), and the batched
-            # expert layout is sized as max_tokens_per_rank * num_dispatchers
-            # per expert -- overstating it here costs GiBs of workspace and
-            # output per captured graph.
             max_tokens_per_rank=_decode_ll_max_tokens_per_rank(),
             num_dispatchers=ll_manager.world_size,
             use_fp8_dispatch=use_fp8_dispatch,
@@ -346,14 +357,13 @@ class IluFusedMoEEP:
                 shared_gate_up_input=shared_gate_up_input,
             )
 
-        assert shared_gate_up_input is None
         if all2all_backend == "deepep_high_throughput":
-            assert shared_gate_up_input is None
             return self.forward_dp_ep_deep_ep(
                 hidden_states,
                 input_ids,
                 enable_fused_ag_ar=False,
                 moe_kernel=self.experts._quant_method.moe_kernel,
+                shared_gate_up_input=shared_gate_up_input,
             )
 
         if all2all_backend in (
@@ -362,8 +372,11 @@ class IluFusedMoEEP:
             "ag-rs",
             "ag_rs",
         ):
-            assert shared_gate_up_input is None
-            return self.forward_dp_ep_naive(hidden_states, input_ids)
+            return self.forward_dp_ep_naive(
+                hidden_states,
+                input_ids,
+                shared_gate_up_input=shared_gate_up_input,
+            )
         assert shared_gate_up_input is None
         return self.forward_dp_ep_modular(hidden_states, input_ids)
 
@@ -394,10 +407,6 @@ class IluFusedMoEEP:
         input_ids: torch.Tensor | None = None,
         enable_fused_ag_ar: bool = True,
         moe_kernel=None,
-        # Optional dynamic-INT8 view of the normalized BF16 shared-expert
-        # input. Only gate_up consumes this tuple; routing and dispatch keep
-        # using ``hidden_states`` so their numerical and communication
-        # contracts are unchanged.
         shared_gate_up_input: tuple[torch.Tensor, torch.Tensor, torch.dtype]
         | None = None,
     ) -> torch.Tensor:
@@ -496,6 +505,8 @@ class IluFusedMoEEP:
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        shared_gate_up_input: tuple[torch.Tensor, torch.Tensor, torch.dtype]
+        | None = None,
     ) -> torch.Tensor:
         org_shape = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, org_shape[-1])
@@ -534,6 +545,8 @@ class IluFusedMoEEP:
 
         if shared_experts is not None:
             assert shared_experts_input is not None
+            if shared_gate_up_input is not None:
+                _check_shared_gate_up(shared_experts_input, shared_gate_up_input)
             shared_experts.maybe_sync_shared_experts_stream(shared_experts_input)
         ctx = get_forward_context()
         sequence_parallel_ctx = (
@@ -602,8 +615,13 @@ class IluFusedMoEEP:
                 )
             if shared_experts is not None:
                 assert shared_experts_input is not None
+                shared_layer_input = (
+                    shared_experts_input
+                    if shared_gate_up_input is None
+                    else shared_gate_up_input
+                )
                 shared_experts(
-                    shared_experts_input,
+                    shared_layer_input,
                     shared_experts._determine_shared_experts_order(
                         shared_experts_input
                     ),
@@ -746,15 +764,7 @@ class IluFusedMoEEP:
 
         if shared_gate_up_input is not None:
             assert shared_experts_input is not None
-            quantized, scales, out_dtype = shared_gate_up_input
-            assert shared_experts_input.dtype == torch.bfloat16
-            assert out_dtype == shared_experts_input.dtype
-            assert quantized.dtype == torch.int8
-            assert quantized.shape == shared_experts_input.shape
-            assert scales.dtype == torch.float32
-            assert scales.numel() == (
-                shared_experts_input.numel() // shared_experts_input.shape[-1]
-            )
+            _check_shared_gate_up(shared_experts_input, shared_gate_up_input)
 
         shared_output = None
         if runner.shared_experts is not None:
@@ -819,6 +829,18 @@ class IluFusedMoEEP:
         if shared_output is not None and fused_output.dtype == torch.float16:
             shared_experts_scaling_factor = runner.shared_experts_scaling_factor
 
+        # The standard experts fold the runner's routed output scale into
+        # moe_output_reduce_sum, but the batched experts leave it to the caller:
+        # their topk weighting and reduction happen in the combine kernel below.
+        routed_experts_scaling_factor = 1.0
+        if (
+            prepare_finalize.activation_format
+            == FusedMoEActivationFormat.BatchedExperts
+        ):
+            routed_experts_scaling_factor = float(
+                getattr(fused_experts, "runner_scaling_factor", 1.0)
+            )
+
         # fused combine + all gather + all reduce
         if tp_size > 1 and use_fused_ag_ar:
             from ixformer.distributed import nvsm_ep
@@ -834,6 +856,7 @@ class IluFusedMoEEP:
                 tp_num_tokens_per_rank=tp_chunk_sizes,
                 shared_x=shared_output,
                 shared_experts_scaling_factor=shared_experts_scaling_factor,
+                router_experts_scaling_factor=routed_experts_scaling_factor,
             )
 
         # create all gather input tensor
@@ -907,6 +930,12 @@ class IluFusedMoEEP:
         # do all reduce + add
         if shared_output is not None and fused_output.dtype == torch.float16:
             shared_output *= runner.shared_experts_scaling_factor
+
+        # nvsm_low_latency_combine has no scaling argument, so the routed scale
+        # that the fused combine takes as router_experts_scaling_factor is
+        # applied here instead.
+        if routed_experts_scaling_factor != 1.0:
+            output.mul_(routed_experts_scaling_factor)
 
         fused_output = output
         if runner._fused_output_is_reduced:

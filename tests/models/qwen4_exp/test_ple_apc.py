@@ -9,7 +9,6 @@ from types import SimpleNamespace
 import torch
 import vllm
 from torch import nn
-
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
@@ -24,9 +23,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
 )
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
-from vllm_iluvatar.models.qwen4_exp.ple_utils import (
-    ple_conv_window_state_shape,
-)
+
 from vllm_iluvatar.models.qwen4_exp.model import (
     Qwen4ExpForCausalLM,
     _install_ple_window_states,
@@ -35,6 +32,9 @@ from vllm_iluvatar.models.qwen4_exp.model_state import (
     Qwen4ExpModelState,
 )
 from vllm_iluvatar.models.qwen4_exp.ple import Qwen4ExpPLELayer
+from vllm_iluvatar.models.qwen4_exp.ple_utils import (
+    ple_conv_window_state_shape,
+)
 
 BLOCK_SIZE = 1024
 PAGE_SIZE = 1_048_576
@@ -115,13 +115,21 @@ def test_mamba_copy_funcs_are_only_called_on_model_instances() -> None:
     call_lines = []
     for path in worker_root.rglob("*.py"):
         for line in path.read_text(encoding="utf-8").splitlines():
-            if "get_mamba_state_copy_func()" in line and not line.lstrip().startswith(
+            if "get_mamba_state_copy_funcs(" in line and not line.lstrip().startswith(
                 "def "
             ):
                 call_lines.append(line.strip())
 
-    assert len(call_lines) == 5
-    assert all("self.model.get_mamba_state_copy_func()" in line for line in call_lines)
+    # v0.30.0 routes through a cached ``_get_mamba_state_copy_funcs()`` wrapper;
+    # the only direct model-instance call sites are that wrapper's body (one in
+    # gpu_model_runner, one in the mamba_hybrid model state).
+    direct = [ln for ln in call_lines if "self.model.get_mamba_state_copy_funcs(" in ln]
+    assert len(direct) == 2
+    assert all(
+        "self.model.get_mamba_state_copy_funcs(" in ln
+        or "self._get_mamba_state_copy_funcs(" in ln
+        for ln in call_lines
+    )
 
 
 class _FakeGDN(QwenGatedDeltaNetAttention):

@@ -34,7 +34,7 @@ def test_community_free_blocks_fingerprint_matches() -> None:
 def test_caching_disabled_reuses_unhashed_block_first() -> None:
     queue = _Queue()
     pool = SimpleNamespace(enable_caching=False, free_block_queue=queue)
-    freed = SimpleNamespace(ref_cnt=1, is_null=False, block_hash=None)
+    freed = SimpleNamespace(ref_cnt=1, is_null=False, block_hash=None, pool=pool)
 
     block_pool.free_blocks(pool, [freed])
 
@@ -46,8 +46,8 @@ def test_caching_disabled_reuses_unhashed_block_first() -> None:
 def test_caching_enabled_preserves_hash_priority() -> None:
     queue = _Queue()
     pool = SimpleNamespace(enable_caching=True, free_block_queue=queue)
-    unhashed = SimpleNamespace(ref_cnt=1, is_null=False, block_hash=None)
-    hashed = SimpleNamespace(ref_cnt=1, is_null=False, block_hash=object())
+    unhashed = SimpleNamespace(ref_cnt=1, is_null=False, block_hash=None, pool=pool)
+    hashed = SimpleNamespace(ref_cnt=1, is_null=False, block_hash=object(), pool=pool)
 
     block_pool.free_blocks(pool, [unhashed, hashed])
 

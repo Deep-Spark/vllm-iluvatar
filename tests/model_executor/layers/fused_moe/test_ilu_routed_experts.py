@@ -18,7 +18,7 @@ from vllm_iluvatar.model_executor.layers.fused_moe.ilu_routed_experts import (
 )
 
 _MAIN_A67969C5A0_WEIGHT_LOADER_SHA = (
-    "6b466c1e39e4855d32e9645d4f776410084d9a27b3b2daf9b2ce61b0b261f182"
+    "f7cbf43595101b8c3402bead6609829706491ef32e88ba6cc4ee7f03d5711caf"
 )
 _MAIN_A67969C5A0_LOAD_WEIGHTS_SHA = (
     "e3039228fc2d38ad1213c5c1ee7988a03bebe4238fa98854b40d1a72b7c0f14b"

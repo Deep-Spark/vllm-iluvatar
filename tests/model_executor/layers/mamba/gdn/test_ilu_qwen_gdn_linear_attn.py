@@ -113,9 +113,7 @@ def test_ilu_chunk_gated_delta_rule_registers_and_forces_plugin_native(monkeypat
         calls.append(kwargs)
         return "plugin-output"
 
-    fake_chunk_module = ModuleType(
-        "vllm.third_party.flash_linear_attention.ops.chunk"
-    )
+    fake_chunk_module = ModuleType("vllm.third_party.flash_linear_attention.ops.chunk")
     fake_chunk_module.chunk_gated_delta_rule = fake_chunk_gated_delta_rule
     monkeypatch.setitem(sys.modules, fake_chunk_module.__name__, fake_chunk_module)
 
@@ -375,6 +373,10 @@ def _build_gdn_layer(
             name,
             MethodType(getattr(attention_cls, name), layer),
         )
+    # _qwen38_kernel is ILU-only; the community class does not define it, so
+    # bind it conditionally (the plugin _forward_core calls self._qwen38_kernel()).
+    if hasattr(attention_cls, "_qwen38_kernel"):
+        layer._qwen38_kernel = MethodType(attention_cls._qwen38_kernel, layer)
     return layer
 
 

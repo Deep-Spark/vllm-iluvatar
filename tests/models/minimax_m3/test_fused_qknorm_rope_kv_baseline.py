@@ -37,7 +37,9 @@ def test_sparse_qkv_layout_index_k_is_one_head():
     positions = torch.arange(t, dtype=torch.long)
     slots = torch.arange(t, dtype=torch.long)
 
-    kv_cache = torch.zeros(2, 2, block_size, nkv, d)
+    # ixformer's scatter_kv_nhd packs K/V in the last dim of a 4-D
+    # [pages, nkv, block_size, 2*d] cache (K = [..., :d], V = [..., d:]).
+    kv_cache = torch.zeros(2, nkv, block_size, 2 * d)
     index_cache = torch.zeros(2, block_size, d)
     q_out = torch.empty(t, nq * d)
     index_q_out = torch.empty(t, niq * d)
@@ -95,14 +97,14 @@ def test_sparse_qkv_layout_index_k_is_one_head():
     )
 
     for i in range(t):
-        assert kv_cache[0, 0, i].abs().sum() > 0
-        assert kv_cache[0, 1, i].abs().sum() > 0
+        assert kv_cache[0, :, i, :d].abs().sum() > 0
+        assert kv_cache[0, :, i, d:].abs().sum() > 0
         assert index_cache[0, i].abs().sum() > 0
 
     assert index_cache.shape[-1] == d
 
 
-def test_scatter_nhd_and_hnd():
+def test_scatter_nhd():
     torch.manual_seed(1)
     nq, nkv, d = 2, 2, 8
     t = 2
@@ -114,7 +116,13 @@ def test_scatter_nhd_and_hnd():
     positions = torch.arange(t, dtype=torch.long)
     slots = torch.tensor([1, 2], dtype=torch.long)
 
-    kv_nhd = torch.zeros(1, 2, block_size, nkv, d)
+    # >>> ILU MODIFICATION >>>
+    # ixformer's scatter_kv_nhd now packs K/V in the last dim of a 4-D
+    # [pages, nkv, block_size, 2*d] cache (K = [..., :d], V = [..., d:]).
+    # The legacy 5-D HND layout is no longer supported by ixformer, so the
+    # HND portion of this test has been dropped.
+    # <<< ILU MODIFICATION <<<
+    kv_nhd = torch.zeros(1, nkv, block_size, 2 * d)
     ixf.fused_minimax_m3_qknorm_rope_kv_insert(
         qkv.clone(),
         q_norm,
@@ -130,27 +138,10 @@ def test_scatter_nhd_and_hnd():
         block_size=block_size,
         backend="torch",
     )
-    assert kv_nhd[0, 0, 1].abs().sum() > 0
-    assert kv_nhd[0, 0, 2].abs().sum() > 0
-
-    kv_hnd = torch.zeros(1, 2, nkv, block_size, d)
-    ixf.fused_minimax_m3_qknorm_rope_kv_insert(
-        qkv.clone(),
-        q_norm,
-        k_norm,
-        cos_sin,
-        positions,
-        nq,
-        nkv,
-        4,
-        1e-6,
-        slot_mapping=slots,
-        kv_cache=kv_hnd,
-        block_size=block_size,
-        backend="torch",
-    )
-    assert kv_hnd[0, 0, :, 1].abs().sum() > 0
-    assert kv_hnd[0, 0, :, 2].abs().sum() > 0
+    assert kv_nhd[0, :, 1, :d].abs().sum() > 0
+    assert kv_nhd[0, :, 2, :d].abs().sum() > 0
+    assert kv_nhd[0, :, 1, d:].abs().sum() > 0
+    assert kv_nhd[0, :, 2, d:].abs().sum() > 0
 
 
 def test_negative_slots_skipped():
@@ -158,7 +149,10 @@ def test_negative_slots_skipped():
     t = 2
     block_size = 4
     qkv = torch.randn(t, (nq + 2 * nkv) * d)
-    kv = torch.zeros(1, 2, block_size, nkv, d)
+    # >>> ILU MODIFICATION >>>
+    # 4-D packed NHD layout: [pages, nkv, block_size, 2*d] (K=[...,:d], V=[...,d:]).
+    # <<< ILU MODIFICATION <<<
+    kv = torch.zeros(1, nkv, block_size, 2 * d)
     ixf.fused_minimax_m3_qknorm_rope_kv_insert(
         qkv,
         torch.zeros(d),
@@ -174,5 +168,5 @@ def test_negative_slots_skipped():
         block_size=block_size,
         backend="torch",
     )
-    assert kv[0, 0, 0].abs().sum() > 0
-    assert kv[0, 0, 1].abs().sum() == 0
+    assert kv[0, :, 0, :d].abs().sum() > 0
+    assert kv[0, :, 1, :d].abs().sum() == 0

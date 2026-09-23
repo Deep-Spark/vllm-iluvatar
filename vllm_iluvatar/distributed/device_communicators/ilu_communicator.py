@@ -358,6 +358,36 @@ class IluCommunicator(CudaCommunicator):
             torch.distributed.recv(tensor, self.ranks[src], self.device_group)
         return tensor
 
+    def batch_isend_irecv(self, p2p_ops: list) -> None:
+        # Elastic EP scale-up transfers weights to standby workers via p2p.
+        # The community CudaCommunicator path is pynccl-only and raises
+        # "No PyNCCL communicator found" on Iluvatar (pynccl disabled). Mirror
+        # the send/recv split: ixfd for normal groups, and the TCPStore-backed
+        # StatelessProcessGroup for stateless standby groups (same approach the
+        # plugin already uses for broadcast/broadcast_device_tensor).
+        if self.is_stateless_group:
+            assert self.tcp_store_group is not None
+            for op in p2p_ops:
+                peer = op.group_peer
+                if op.op is torch.distributed.isend:
+                    self.tcp_store_group.send(op.tensor, peer)
+                elif op.op is torch.distributed.irecv:
+                    self.tcp_store_group.recv(op.tensor, peer)
+                else:
+                    raise ValueError(f"Unsupported p2p op: {op.op}")
+            return
+        if self.use_vllm_comm and self.ixfd_group is not None:
+            for op in p2p_ops:
+                peer = op.group_peer
+                if op.op is torch.distributed.isend:
+                    ixfd.isend(op.tensor, self.ranks[peer], self.ixfd_group)
+                elif op.op is torch.distributed.irecv:
+                    ixfd.irecv(op.tensor, self.ranks[peer], self.ixfd_group)
+                else:
+                    raise ValueError(f"Unsupported p2p op: {op.op}")
+            return
+        raise ValueError("No ixfd communicator available for non-stateless group")
+
     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
         if self.world_size == 1:
             return tensor
@@ -423,6 +453,7 @@ _ILU_OVERRIDES_FROM_CUDA = [
     "send",
     "recv",
     "broadcast",
+    "batch_isend_irecv",
 ]
 _ILU_OVERRIDES_FROM_BASE = ["all_gather", "gather"]
 

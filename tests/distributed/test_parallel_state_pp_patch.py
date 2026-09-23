@@ -10,13 +10,11 @@ from __future__ import annotations
 import sys
 from collections import namedtuple
 from types import ModuleType
-from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
 from vllm_iluvatar.distributed import parallel_state as impl
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -78,6 +76,7 @@ class FakeGroupCoordinator:
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(autouse=True)
 def _patch_env(monkeypatch):
@@ -158,11 +157,13 @@ def _bind_globals(torch_mock):
     class _Handle:
         def is_completed(self):
             return True
+
         def wait(self):
             pass
 
     impl.Handle = _Handle
     import collections.abc
+
     impl.Callable = collections.abc.Callable
 
     yield
@@ -178,8 +179,8 @@ def _bind_globals(torch_mock):
 # Tests: isend_tensor_dict
 # ---------------------------------------------------------------------------
 
-class TestIsendTensorDict:
 
+class TestIsendTensorDict:
     def test_ivcore30_uses_blocking_send(self, _set_ivcore30, torch_mock):
         """On ivcore30, isend_tensor_dict must call torch.distributed.send."""
         gc = FakeGroupCoordinator(world_size=2, rank=0)
@@ -203,8 +204,9 @@ class TestIsendTensorDict:
 
         delegate_called = []
 
-        def orig_isend(self, tensor_dict, dst=None,
-                       all_gather_group=None, all_gather_tensors=None):
+        def orig_isend(
+            self, tensor_dict, dst=None, all_gather_group=None, all_gather_tensors=None
+        ):
             delegate_called.append(True)
             return ["fake_handle"]
 
@@ -233,8 +235,8 @@ class TestIsendTensorDict:
 # Tests: irecv_tensor_dict
 # ---------------------------------------------------------------------------
 
-class TestIrecvTensorDict:
 
+class TestIrecvTensorDict:
     def test_ivcore30_uses_blocking_recv(self, _set_ivcore30, torch_mock):
         """On ivcore30, irecv_tensor_dict must call torch.distributed.recv."""
         gc = FakeGroupCoordinator(world_size=2, rank=1)
@@ -257,8 +259,7 @@ class TestIrecvTensorDict:
 
         delegate_called = []
 
-        def orig_irecv(self, src=None,
-                       all_gather_group=None, all_gather_tensors=None):
+        def orig_irecv(self, src=None, all_gather_group=None, all_gather_tensors=None):
             delegate_called.append(True)
             return {"hidden": FakeTensor(4)}, ["fake_handle"], []
 
@@ -287,11 +288,12 @@ class TestIrecvTensorDict:
 # Tests: arch caching
 # ---------------------------------------------------------------------------
 
-class TestArchCaching:
 
+class TestArchCaching:
     def test_is_ivcore30_caches_result(self, monkeypatch):
         """ilu_util.arch.is_ivcore30 should cache after first call."""
         import vllm_iluvatar.ilu_util.arch as arch_mod
+
         monkeypatch.setattr(arch_mod, "_resolved", False)
         monkeypatch.setattr(arch_mod, "_cuda_arch", None)
 
@@ -312,6 +314,7 @@ class TestArchCaching:
     def test_ivcore11_returns_false(self, monkeypatch):
         """ivcore11 arch should make is_ivcore30 return False."""
         import vllm_iluvatar.ilu_util.arch as arch_mod
+
         monkeypatch.setattr(arch_mod, "_resolved", False)
         monkeypatch.setattr(arch_mod, "_cuda_arch", None)
 
@@ -330,6 +333,7 @@ class TestArchCaching:
 # Tests: upper-layer compatibility
 # ---------------------------------------------------------------------------
 
+
 class TestUpperLayerCompat:
     """Verify that ivcore30 sync mode is compatible with the community
     send_tensor_dict / recv_tensor_dict / gpu_worker patterns."""
@@ -340,9 +344,7 @@ class TestUpperLayerCompat:
         gc = FakeGroupCoordinator(world_size=2, rank=0)
         td = {"hidden": FakeTensor(4)}
 
-        wrapped_isend = impl._make_isend_tensor_dict(
-            lambda *a, **kw: [MagicMock()]
-        )
+        wrapped_isend = impl._make_isend_tensor_dict(lambda *a, **kw: [MagicMock()])
         gc.isend_tensor_dict = lambda *a, **kw: wrapped_isend(gc, *a, **kw)
 
         handles = gc.isend_tensor_dict(td)
@@ -357,9 +359,7 @@ class TestUpperLayerCompat:
         gc = FakeGroupCoordinator(world_size=2, rank=0)
         td = {"hidden": FakeTensor(4)}
 
-        wrapped_isend = impl._make_isend_tensor_dict(
-            lambda *a, **kw: [MagicMock()]
-        )
+        wrapped_isend = impl._make_isend_tensor_dict(lambda *a, **kw: [MagicMock()])
         pp_send_work = wrapped_isend(gc, td)
 
         assert not pp_send_work, (
@@ -388,9 +388,7 @@ class TestUpperLayerCompat:
         mock_ag_group.world_size = 2
         mock_ag_group.rank_in_group = 0
 
-        wrapped_irecv = impl._make_irecv_tensor_dict(
-            lambda *a, **kw: ({}, [], [])
-        )
+        wrapped_irecv = impl._make_irecv_tensor_dict(lambda *a, **kw: ({}, [], []))
         tensor_dict, handles, postprocess = wrapped_irecv(
             gc, all_gather_group=mock_ag_group
         )

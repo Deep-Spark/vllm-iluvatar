@@ -5,7 +5,6 @@
 from typing import Any, ClassVar, cast
 
 from transformers import PretrainedConfig
-
 from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5VisionConfig
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
 
@@ -268,6 +267,13 @@ def _register_configs() -> None:
       inserting the class objects is enough.
 
     Both are idempotent, so importing this module twice is harmless.
+
+    v0.30.0: upstream vLLM now ships its own ``vllm.models.qwen4_exp`` config
+    (``Qwen4ExpConfig``/``Qwen4ExpTextConfig``) and pre-registers both keys in
+    ``_CONFIG_REGISTRY``. The ILU plugin's model implementation consumes the
+    ILU config subclass, so the plugin must *override* (not merely ``setdefault``)
+    both registries to keep its config -- and the model that depends on it -- the
+    canonical one for ``model_type = "qwen4_exp"``.
     """
     from transformers import AutoConfig
 
@@ -275,17 +281,13 @@ def _register_configs() -> None:
     # checkpoint's nested vision_config block, so it is *not* registered by
     # model type -- Qwen4ExpConfig.sub_configs is what reaches it.
     for cls in (Qwen4ExpConfig, Qwen4ExpTextConfig):
-        try:
-            AutoConfig.register(cls.model_type, cls)
-        except ValueError:
-            # Already registered (duplicate import / re-entrant plugin init).
-            pass
+        AutoConfig.register(cls.model_type, cls, exist_ok=True)
 
     from vllm.transformers_utils import config as vllm_config_utils
 
     registry = vllm_config_utils._CONFIG_REGISTRY
-    registry.setdefault(Qwen4ExpConfig.model_type, Qwen4ExpConfig)
-    registry.setdefault(Qwen4ExpTextConfig.model_type, Qwen4ExpTextConfig)
+    registry[Qwen4ExpConfig.model_type] = Qwen4ExpConfig
+    registry[Qwen4ExpTextConfig.model_type] = Qwen4ExpTextConfig
 
 
 _register_configs()

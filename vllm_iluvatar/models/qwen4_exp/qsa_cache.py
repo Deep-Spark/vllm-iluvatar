@@ -16,10 +16,9 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
+import vllm.envs as envs
 from ixformer.inference.functions.qwen38 import qwen_qsa_build_metadata
 from torch import nn
-
-import vllm.envs as envs
 from vllm.config import CacheConfig, VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -37,6 +36,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
 )
+
 from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
     split_indexer_prefill_chunks,
 )
@@ -145,10 +145,14 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         if isinstance(kv_cache_spec, MLAAttentionSpec):
-            compress_ratio = kv_cache_spec.compress_ratio
-            assert isinstance(
-                compress_ratio, int
-            ), "QSA compression requires an integer compress_ratio"
+            # v0.30.0 dropped ``MLAAttentionSpec.compress_ratio``; the ratio is
+            # carried on ``tokens_per_state`` (one stored state per
+            # ``compress_ratio`` logical tokens), matching the rest of the ILU
+            # MLA path (ilu_indexer / ilu_flashmla_sparse / deepseek_v4).
+            compress_ratio = kv_cache_spec.tokens_per_state
+            assert isinstance(compress_ratio, int), (
+                "QSA compression requires an integer compress_ratio"
+            )
             self.compress_ratio = compress_ratio
             if compress_ratio > 1:
                 self.storage_block_size = kv_cache_spec.block_size // compress_ratio
@@ -661,7 +665,7 @@ class QSACompressedKeyCache(_QSAStateCache):
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=self.dtype,
-            compress_ratio=self.compress_ratio,
+            tokens_per_state=self.compress_ratio,
             page_size_padded=page_size_padded,
         )
 

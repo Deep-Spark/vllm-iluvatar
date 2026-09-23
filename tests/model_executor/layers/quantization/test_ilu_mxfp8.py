@@ -381,18 +381,27 @@ def test_minimax_mxfp8_is_shadowed_not_nvidia_modelopt():
 
 
 def test_config_only_swaps_the_moe_method():
-    assert IluMxFp8Config.FusedMoEMethodCls is IluMxFp8FusedMoE
-    # Linear must stay on the community method: it is the caller of
-    # ``init_mxfp8_linear_kernel()``, which is where IluMxfp8LinearKernel wins.
-    assert IluMxFp8Config.LinearMethodCls.__name__ == (
-        "ModelOptMxFp8LinearMethod"
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptLinearMethod,
+        build_linear_method,
     )
+
+    assert IluMxFp8Config.FusedMoEMethodCls is IluMxFp8FusedMoE
+    # v0.30.0 dropped ``LinearMethodCls``; Linear dispatch goes through the
+    # community ``build_linear_method`` -> generic ``ModelOptLinearMethod``
+    # (whose ``create_weights`` calls ``init_mxfp8_linear_kernel``). The ILU
+    # config must not override that path -- only MoE is swapped.
+    assert "LinearMethodCls" not in IluMxFp8Config.__dict__
     quant_config = IluMxFp8Config(
         is_checkpoint_mxfp8_serialized=True,
         kv_cache_quant_algo=None,
         exclude_modules=[],
     )
     assert quant_config.get_name() == "mxfp8"
+    assert isinstance(
+        build_linear_method(quant_config, quant_config.quant_method, "lm_head"),
+        ModelOptLinearMethod,
+    )
 
 
 def test_unknown_activation_is_rejected_rather_than_mis_run():

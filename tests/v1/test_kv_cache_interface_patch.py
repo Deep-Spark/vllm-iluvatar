@@ -61,20 +61,11 @@ def _setup_modules(monkeypatch, *, flash_quant_type: str, mla_quant_type: str):
     def full_scale(self):
         return "full-scale"
 
-    def full_fixed(self):
-        return "full-fixed"
-
     def sliding_scale(self):
         return "sliding-scale"
 
-    def sliding_fixed(self):
-        return "sliding-fixed"
-
     def mla_scale(self):
         return "mla-scale"
-
-    def mla_fixed(self):
-        return "mla-fixed"
 
     def state_content(self):
         return "state-content"
@@ -86,11 +77,8 @@ def _setup_modules(monkeypatch, *, flash_quant_type: str, mla_quant_type: str):
     implementation.attention_state_content_size_bytes = state_content
     implementation.attention_num_heads = num_heads_fn
     implementation._full_attention_scale_page_size_bytes = full_scale
-    implementation._full_attention_fixed_size_bytes = full_fixed
     implementation._sliding_window_scale_page_size_bytes = sliding_scale
-    implementation._sliding_window_fixed_size_bytes = sliding_fixed
     implementation._mla_attention_scale_page_size_bytes = mla_scale
-    implementation._mla_attention_fixed_size_bytes = mla_fixed
 
     monkeypatch.setattr(vllm_v1, "kv_cache_interface", community, raising=False)
     monkeypatch.setitem(sys.modules, community.__name__, community)
@@ -121,7 +109,6 @@ def test_patch_is_noop_when_quantization_is_disabled(monkeypatch):
     assert modules.base.num_heads is modules.num_heads_original
     for cls in (modules.full, modules.sliding, modules.mla):
         assert not hasattr(cls, "scale_page_size_bytes")
-        assert not hasattr(cls, "fixed_size_bytes")
     assert set(modules.tensor.__dataclass_fields__) == {"size"}
     assert modules.tensor.__init__ is modules.original_tensor_init
 
@@ -167,10 +154,8 @@ def test_patch_wires_properties(monkeypatch, flash_quant_type, mla_quant_type):
     for cls in (modules.full, modules.sliding):
         if flash_enabled:
             assert isinstance(cls.scale_page_size_bytes, property)
-            assert isinstance(cls.fixed_size_bytes, property)
         else:
             assert not hasattr(cls, "scale_page_size_bytes")
-            assert not hasattr(cls, "fixed_size_bytes")
 
     if mla_enabled:
         assert isinstance(modules.mla.scale_page_size_bytes, property)
@@ -178,16 +163,18 @@ def test_patch_wires_properties(monkeypatch, flash_quant_type, mla_quant_type):
             modules.mla.scale_page_size_bytes.fget
             is modules.implementation._mla_attention_scale_page_size_bytes
         )
-        assert isinstance(modules.mla.fixed_size_bytes, property)
+    elif flash_enabled:
+        # mla int8 disabled but flash int8 enabled: MLAAttentionSpec subclasses
+        # FullAttentionSpec in the community, so it inherits Full's
+        # scale_page_size_bytes property (fget is the full-attention scale fn).
+        assert isinstance(modules.mla.scale_page_size_bytes, property)
         assert (
-            modules.mla.fixed_size_bytes.fget
-            is modules.implementation._mla_attention_fixed_size_bytes
+            modules.mla.scale_page_size_bytes.fget
+            is modules.implementation._full_attention_scale_page_size_bytes
         )
     else:
         assert not hasattr(modules.mla, "scale_page_size_bytes")
-        assert not hasattr(modules.mla, "fixed_size_bytes")
 
-    assert {"fixed_size", "scale_size"} <= set(modules.tensor.__dataclass_fields__)
-    tensor = modules.tensor(size=128, fixed_size=16, scale_size=32)
-    assert tensor.fixed_size == 16
+    assert "scale_size" in set(modules.tensor.__dataclass_fields__)
+    tensor = modules.tensor(size=128, scale_size=32)
     assert tensor.scale_size == 32

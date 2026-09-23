@@ -7,8 +7,6 @@ import importlib
 import sys
 import types
 
-import pytest
-
 
 def _install_fake_ixformer(monkeypatch) -> None:
     ixformer = types.ModuleType("ixformer")

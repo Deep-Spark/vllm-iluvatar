@@ -5,11 +5,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from conftest import requires_cuda
 from torch import nn
 from torch.nn import functional as F
-
-from conftest import requires_cuda
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
 from vllm_iluvatar.models.qwen4_exp import ple as ple_layer_module
 from vllm_iluvatar.models.qwen4_exp.ple import (
     Qwen4ExpNGramEmbedding,
@@ -426,6 +426,10 @@ def test_resolve_conv_state_indexes_the_assigned_gdn_group() -> None:
 
 @requires_cuda
 def test_cuda_dilated_conv_accepts_a_padded_kv_page_stride() -> None:
+    from vllm_iluvatar.ilu_util.arch import is_ivcore30
+
+    if not is_ivcore30():
+        pytest.skip("qwen_ple_dilated_conv is only supported on ivcore30")
     channels, state_len, num_blocks, padding = 256, 9, 5, 128
     module = _make_conv_layer(channels, kernel=4, dilation=3).cuda().bfloat16()
     storage = torch.randn(

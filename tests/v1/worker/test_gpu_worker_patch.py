@@ -30,19 +30,26 @@ def _stub_gpu_worker(monkeypatch):
 
     gpu_worker_mod.Worker = _FakeWorker
 
-    gpu_model_runner_mod = ModuleType("vllm.v1.worker.gpu_model_runner")
+    # IluWorker imports ``vllm.v1.worker.gpu.model_runner`` (the v0.30.0 dotted
+    # path), whose real module pulls ``vllm.v1.watermarking`` at import time.
+    # Stub the dotted path -- plus the ``vllm.v1.worker.gpu`` package -- so the
+    # import resolves here and never touches the real model_runner.
+    gpu_package = make_package("vllm.v1.worker.gpu")
+    gpu_model_runner_mod = ModuleType("vllm.v1.worker.gpu.model_runner")
     gpu_model_runner_mod.GPUModelRunner = type("GPUModelRunner", (), {})
 
     vllm_mod.v1 = vllm_v1_mod
     vllm_v1_mod.worker = worker_package
     worker_package.gpu_worker = gpu_worker_mod
-    worker_package.gpu_model_runner = gpu_model_runner_mod
+    worker_package.gpu = gpu_package
+    gpu_package.model_runner = gpu_model_runner_mod
 
     modules = {
         "vllm": vllm_mod,
         "vllm.v1": vllm_v1_mod,
         "vllm.v1.worker": worker_package,
-        "vllm.v1.worker.gpu_model_runner": gpu_model_runner_mod,
+        "vllm.v1.worker.gpu": gpu_package,
+        "vllm.v1.worker.gpu.model_runner": gpu_model_runner_mod,
         "vllm.v1.worker.gpu_worker": gpu_worker_mod,
     }
     for name, module in modules.items():

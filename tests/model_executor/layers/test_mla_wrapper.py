@@ -12,7 +12,7 @@ import vllm_iluvatar.ilu_register as ilu_register
 from vllm_iluvatar.model_executor.layers.mla import IluMultiHeadLatentAttentionWrapper
 
 _MAIN_B35FF5F7739E_FLASH_ATTN_DIFF_HEAD_DIMS_SHA = (
-    "cb6ba62216aa9d3148bcc84f699e417fc71519f1b6824121dab417f5cf750a9b"
+    "c6171ba4b7e2b93fe1d67f0e180e98cccce52b53c80458f959f7638ced39c033"
 )
 
 
@@ -87,6 +87,7 @@ def test_ilu_mla_wrapper_sets_inner_rotary_emb(monkeypatch):
                 None,
                 None,
                 "",
+                False,
                 False,
                 False,
                 False,

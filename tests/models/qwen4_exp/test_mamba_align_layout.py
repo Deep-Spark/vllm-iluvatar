@@ -13,14 +13,14 @@ from __future__ import annotations
 
 import pytest
 import torch
-from ixformer.inference.functions.qwen38 import build_mamba_align_layout
-
 from conftest import requires_cuda
+from ixformer.inference.functions.qwen38 import build_mamba_align_layout
 from vllm.model_executor.layers.mamba.mamba_utils import (
     get_conv_copy_spec,
     get_temporal_copy_spec,
     is_conv_state_dim_first,
 )
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -29,6 +29,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.mamba_utils import MambaSpecDecodeGPUContext
+
 from vllm_iluvatar.models.qwen4_exp.model_state import collect_mamba_states
 
 pytestmark = requires_cuda
@@ -146,15 +147,19 @@ def test_layout_matches_vllm_metadata(page_padded):
 
     layout = build_mamba_align_layout(states, groups, is_conv, block_tables, dim_first)
 
+    # v0.30.0: ``create`` / ``initialize_from_forward_context`` take the copy
+    # funcs as a dict keyed by mamba_type (MambaStateCopyFuncsByType); the ILU
+    # ``collect_mamba_states`` above still takes the flat tuple.
+    copy_funcs_by_type = {MambaAttentionBackendEnum.MAMBA2: copy_funcs}
     ctx = MambaSpecDecodeGPUContext.create(
         max_num_reqs=MAX_REQS,
         kv_cache_config=kv_cache_config,
-        num_state_types=len(copy_funcs),
+        copy_funcs=copy_funcs_by_type,
         device=device,
         make_buffer=lambda n, dtype: CpuGpuBuffer(n, dtype=dtype, device=device),
     )
     ctx.initialize_from_forward_context(
-        kv_cache_config, forward_context, copy_funcs, block_tables
+        kv_cache_config, forward_context, copy_funcs_by_type, block_tables
     )
 
     assert layout.block_table_stride_req == ctx.block_table_stride_req

@@ -385,17 +385,9 @@ class IluGlmMoeDsaMoE(nn.Module, IluFusedMoEEP):
         self,
         hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        # Align with IluDeepseekV4MoE: route DP+EP through
-        # IluFusedMoEEP.forward_dp_ep (naive / ag-rs / DeepEP). Plain BF16 only;
-        # fused-norm-quant tuples stay on the non-EP path below.
-        if not isinstance(hidden_states, tuple) and self._should_use_forward_dp_ep():
-            org_shape = hidden_states.shape
-            final_hidden_states = self.forward_dp_ep(hidden_states)
-            return final_hidden_states.view(org_shape)
-
-        # Fused norm-quant may pass (int8, scales, bf16_normed). Gate/router
-        # need BF16; IluMoERunner.forward accepts the packed tuple for experts.
-        experts_in: torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        # Tuple is fused-norm-quant (int8, scales, bf16). Router/dispatch stay
+        # on BF16; shared gate_up can take the already-quantized view.
+        shared_gate_up_input = None
         if isinstance(hidden_states, tuple):
             if len(hidden_states) != 3:
                 raise ValueError(
@@ -405,15 +397,23 @@ class IluGlmMoeDsaMoE(nn.Module, IluFusedMoEEP):
                 )
             q, scales, normed = hidden_states
             org_shape = normed.shape
-            hidden_dim = org_shape[-1]
-            normed = normed.view(-1, hidden_dim)
+            router_in = normed.view(-1, org_shape[-1])
             q = q.view(-1, q.shape[-1]) if q.ndim >= 2 else q
             scales = scales.view(-1, scales.shape[-1]) if scales.ndim >= 2 else scales
-            experts_in = (q, scales, normed)
-            router_in = normed
+            shared_gate_up_input = (q, scales, normed.dtype)
         else:
             org_shape = hidden_states.shape
             router_in = hidden_states.view(-1, org_shape[-1])
+
+        if self._should_use_forward_dp_ep():
+            return self.forward_dp_ep(
+                router_in,
+                shared_gate_up_input=shared_gate_up_input,
+            ).view(org_shape)
+
+        if shared_gate_up_input is not None:
+            experts_in = (q, scales, router_in)
+        else:
             experts_in = router_in
 
         if self.experts.is_internal_router:

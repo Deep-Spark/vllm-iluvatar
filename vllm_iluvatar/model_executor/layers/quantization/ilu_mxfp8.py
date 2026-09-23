@@ -28,9 +28,12 @@ How      : ``@register_quantization_config("mxfp8")`` on a subclass that
            because on EP4 the MXFP8 grid and its ix30 FP4 image do not both fit
            in HBM. ``process_weights_after_loading`` streams that grid through
            the GPU a few experts at a time and publishes only the FP4 result.
-Scope    : MXFP8 routed experts on Iluvatar corex30 (MiniMax-M3 MXFP8:
-           ``quant_method="mxfp8"``, ``weight_block_size=[1, 32]``, UE8M0
-           scales). Dense MXFP8 linears are handled separately by
+Scope    : MXFP8 routed experts on Iluvatar corex30, ``weight_block_size=[1, 32]``
+           with UE8M0 scales -- MiniMax-M3 (``quant_method="mxfp8"``) through
+           ``IluMxFp8Config`` below, and Hy4-preview (ModelOpt tagging) through
+           ``ilu_modelopt_mxfp8.IluModelOptMxFp8Config``, which reuses
+           ``IluMxFp8FusedMoE`` unchanged.
+           Dense MXFP8 linears are handled separately by
            ``IluMxfp8LinearKernel`` (per-channel requant, no FP4 detour).
 Remove   : when community exposes a vendor MXFP8 MoE backend hook or ixmm gains
            a native [1,32] MXFP8 grouped GEMM that avoids load-time requant.
@@ -70,6 +73,7 @@ from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_
     _e8m0_to_fp32 as e8m0_to_fp32,
 )
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
+    _DSV4_CLAMP_VARIANT,
     _SWIGLUOAI_VARIANT,
     _ixmm_backend_available,
     ilu_mxfp4_fused_experts,
@@ -83,11 +87,23 @@ from vllm_iluvatar.model_executor.layers.quantization.ilu_modelopt_nvfp4 import 
     _get_ilu_output_scale,
 )
 
-# MiniMax-M3's routed experts are declared with community
-# ``swigluoai_uninterleave``; ``_SWIGLUOAI_VARIANT`` reproduces exactly that
-# math. Anything else must fail loudly rather than compute a different
-# activation, so the accepted set is explicit.
-_SUPPORTED_ACTIVATIONS = frozenset({"swigluoai_uninterleave"})
+# Community activation -> the ixformer SwiGLU variant that reproduces exactly
+# its math. Anything else must fail loudly rather than compute a different
+# activation, so the set is explicit and closed.
+#
+#   swigluoai_uninterleave (MiniMax-M3): packed gate/up halves, ``alpha`` inside
+#       the sigmoid, ``beta`` offset on the up branch. Needs all three of
+#       swiglu_limit / swiglu_alpha / swiglu_beta.
+#   silu + a clamp limit (HY V4): community ``silu_and_mul_with_clamp`` computes
+#       ``silu(clamp(gate, max=limit)) * clamp(up, +-limit)``, which is exactly
+#       ``_DSV4_CLAMP_VARIANT``. HY V4 expresses the clamp purely through
+#       ``swiglu_limit`` and leaves ``activation`` at the "silu" default, so the
+#       limit -- not the activation name -- is what distinguishes it from plain
+#       SwiGLU. alpha/beta must be absent: M3's 1.702 / 1.0 would silently
+#       compute a different activation.
+_SWIGLUOAI_ACTIVATION = "swigluoai_uninterleave"
+_CLAMPED_SILU_ACTIVATION = "silu"
+_SUPPORTED_ACTIVATIONS = frozenset({_SWIGLUOAI_ACTIVATION, _CLAMPED_SILU_ACTIVATION})
 
 
 def preprocess_fp8_moe_weight_for_ixmm(
@@ -402,9 +418,8 @@ class IluMxFp8FusedMoE(ModelOptMxFp8FusedMoE):
 
     # [ILU override] ModelOptMxFp8FusedMoE.apply — delta: wiring only. Community
     # delegates to ``self.moe_kernel.apply``; we call the plugin's ixmm compute
-    # with explicit tensors. MiniMax-M3 routes through community
-    # ``swigluoai_uninterleave``, so the pipeline uses its matching activation
-    # before dynamically quantizing GEMM2 input.
+    # with explicit tensors, selecting the ixformer SwiGLU variant that matches
+    # the layer's declared activation before dynamically quantizing GEMM2 input.
     # Routed experts carry no bias and the shared output arrives through
     # ``shared_experts_input`` (``extra_residual``), so ``shared_experts`` is
     # accepted for signature compatibility but unused.
@@ -431,25 +446,38 @@ class IluMxFp8FusedMoE(ModelOptMxFp8FusedMoE):
         # raises on a missing clamp limit and forwards ``gemm1_alpha`` /
         # ``gemm1_beta`` (both ``float | None``) without substituting anything.
         # Defaulting here is the dangerous option in both directions: M3's
-        # 1.702 / 1.0 / 7.0 would silently mis-run another checkpoint, and
+        # 1.702 / 1.0 / 7.0 would silently corrupt another checkpoint, and
         # ``SiluAndMulWithClamp``'s 1.0 / 0.0 would silently degrade M3 to
         # ``silu(gate) * up`` if the config wiring in ``MiniMaxM3MoE`` ever
-        # broke. ``_SUPPORTED_ACTIVATIONS`` is a single variant that needs all
-        # three, so demand all three.
-        missing = [
-            name
-            for name in ("swiglu_limit", "swiglu_alpha", "swiglu_beta")
-            if getattr(layer, name, None) is None
-        ]
+        # broke. Each variant demands exactly the parameters it consumes.
+        if activation == _SWIGLUOAI_ACTIVATION:
+            required = ("swiglu_limit", "swiglu_alpha", "swiglu_beta")
+            swiglu_variant = _SWIGLUOAI_VARIANT
+        else:
+            # Plain SwiGLU has no clamp and would need a different ixformer op,
+            # so the limit is what makes "silu" acceptable here at all.
+            required = ("swiglu_limit",)
+            swiglu_variant = _DSV4_CLAMP_VARIANT
+        missing = [name for name in required if getattr(layer, name, None) is None]
         if missing:
             raise ValueError(
                 f"IluMxFp8FusedMoE requires {missing} on the layer for "
-                f"{sorted(_SUPPORTED_ACTIVATIONS)} routed experts; the MoE "
-                "config did not supply them."
+                f"{activation!r} routed experts; the MoE config did not supply "
+                "them."
             )
         swiglu_limit = layer.swiglu_limit
         swiglu_alpha = layer.swiglu_alpha
         swiglu_beta = layer.swiglu_beta
+        if swiglu_variant == _DSV4_CLAMP_VARIANT and (
+            swiglu_alpha is not None or swiglu_beta is not None
+        ):
+            raise NotImplementedError(
+                "IluMxFp8FusedMoE maps clamped-silu routed experts onto "
+                "ixformer's DSv4 clamp SwiGLU, which has no alpha/beta; got "
+                f"swiglu_alpha={swiglu_alpha!r}, swiglu_beta={swiglu_beta!r}. A "
+                "checkpoint needing both the clamp and alpha/beta must declare "
+                f"{_SWIGLUOAI_ACTIVATION!r}."
+            )
         return ilu_mxfp4_fused_experts(
             hidden_states=x,
             w13_weight=layer.w13_weight,
@@ -465,7 +493,7 @@ class IluMxFp8FusedMoE(ModelOptMxFp8FusedMoE):
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             backend="ixmm",
-            swiglu_variant=_SWIGLUOAI_VARIANT,
+            swiglu_variant=swiglu_variant,
         )
 
 

@@ -26,6 +26,7 @@ _ILU_TUPLE_MTP_ARCHS = (
     # Subclasses IluGlmMoeDsaMTP, so same forward contract.
     "IluGlmMoeDsaFp8MTPModel",
     "DeepseekV32MTPModel",
+    "HYV4MTPModel",
 )
 
 

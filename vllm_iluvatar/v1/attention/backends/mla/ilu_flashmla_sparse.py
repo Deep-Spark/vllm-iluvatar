@@ -149,6 +149,18 @@ class IluFlashMLASparseMetadata(AttentionMetadata):
 
     block_table: torch.Tensor
     req_id_per_token: torch.Tensor
+    # The three fields below exist only for models that reach this backend
+    # through the community ``MLAAttention`` layer instead of a self-contained
+    # plugin attention module (V3.2 / V4 / GLM DSA all do the latter). That layer
+    # reads them unconditionally in ``forward`` / ``forward_impl``:
+    #   num_decode_tokens  -> PCP prefill-cache gather (needed even with PCP off)
+    #   prefill_max_seq_len, prefill -> the MQA/MHA split for sparse MLA
+    # ``prefill`` stays None on purpose: it makes the layer take the all-MQA
+    # route, which is the only one the ixformer sparse kernels implement (see
+    # ``forward_mqa`` -- it serves both prefill and decode).
+    num_decode_tokens: int = 0
+    prefill_max_seq_len: int = 0
+    prefill: None = None
     block_size: int = 64
     topk_tokens: int = 2048
     # DeepSeek-V4: compress_ratio carried per-group (4 / 128). Defaults to 1 so the
@@ -455,6 +467,10 @@ class IluFlashMLASparseMetadataBuilder(
             max_seq_len=cm.max_seq_len,
             num_decodes=num_decodes,
             num_prefills=num_prefills,
+            num_decode_tokens=num_decode_tokens,
+            # Batch max rather than the prefill-only max: a safe upper bound for
+            # the one comparison the community layer makes with it.
+            prefill_max_seq_len=cm.max_seq_len,
             num_actual_tokens=cm.num_actual_tokens,
             query_start_loc=cm.query_start_loc,
             query_start_loc_cpu=cm.query_start_loc_cpu,

@@ -34,6 +34,7 @@ _ILU_OVERRIDES: list[str] = [
     "apply_repetition_penalties",
     "awq_gemm",
     "concat_and_cache_mla",
+    "concat_mla_q",
     "cp_gather_cache",
     "cutlass_scaled_mm",
     "cutlass_scaled_mm_supports_block_fp8",
@@ -546,9 +547,28 @@ def concat_and_cache_mla(
     kv_cache_dtype: str,
     scale: torch.Tensor,
 ) -> None:
+    # The community op takes ``k_pe`` as [num_tokens, pe_dim] (its own
+    # ``MLACommonImpl.do_kv_cache_update`` squeezes the head dim off before
+    # calling), while ixformer requires the head dim to still be there. The
+    # plugin's own MLA models pass 3-D directly, so accept both.
+    if k_pe.dim() == 2:
+        k_pe = k_pe.unsqueeze(1)
     ixf_ops.vllm_concat_and_cache_mla(
         kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
     )
+
+
+def concat_mla_q(
+    ql_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    q_out: torch.Tensor,
+) -> None:
+    # Community routes this through ``torch.ops._C_cache_ops.concat_mla_q``,
+    # which Iluvatar does not build. The op is a plain copy into a preallocated
+    # [num_tokens, num_heads, nope_dim + rope_dim] buffer, so torch does it.
+    nope_dim = ql_nope.shape[-1]
+    q_out[..., :nope_dim].copy_(ql_nope)
+    q_out[..., nope_dim:].copy_(q_pe)
 
 
 def quant_kv(kv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

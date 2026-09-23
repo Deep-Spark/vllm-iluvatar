@@ -111,6 +111,17 @@ def test_remaps_deepseek_v4_after_community_routing():
     assert result.architectures == ["IluDeepSeekV4MTPModel"]
 
 
+def test_remaps_hy_v4_after_community_routing():
+    orig = _make_orig([], out_architectures=["DeepSeekMTPModel"])
+    wrapped = make_hf_config_override(orig)
+
+    cfg = _FakeHFConfig(["HYV4ForCausalLM"])
+    result = wrapped(cfg)
+
+    assert result.architectures == ["HYV4MTPModel"]
+    assert result.model_type == "deepseek_mtp"
+
+
 # --- factory: non-ilu passthrough ------------------------------------------
 
 
@@ -300,9 +311,7 @@ def test_patch_binds_wrapper_as_staticmethod():
     assert hasattr(SpeculativeConfig.__post_init__, "__wrapped__"), (
         "__post_init__ not wrapped by the ilu override"
     )
-    draft_pp = inspect.getattr_static(
-        SpeculativeConfig, "create_draft_parallel_config"
-    )
+    draft_pp = inspect.getattr_static(SpeculativeConfig, "create_draft_parallel_config")
     assert isinstance(draft_pp, staticmethod), (
         "create_draft_parallel_config must stay a staticmethod"
     )

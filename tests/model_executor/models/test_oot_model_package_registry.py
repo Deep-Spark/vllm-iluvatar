@@ -40,6 +40,16 @@ _MIGRATED_MODEL_PACKAGES = {
             "vllm_iluvatar.models.glm_moe_dsa.mtp:IluGlmMoeDsaMTP",
         ),
     ],
+    "vllm_iluvatar.models.hy_v4": [
+        (
+            "HYV4ForCausalLM",
+            "vllm_iluvatar.models.hy_v4.model:HYV4ForCausalLM",
+        ),
+        (
+            "HYV4MTPModel",
+            "vllm_iluvatar.models.hy_v4.mtp:HYV4MTP",
+        ),
+    ],
     "vllm_iluvatar.models.minimax_m3": [
         (
             "IluMiniMaxM3SparseForCausalLM",

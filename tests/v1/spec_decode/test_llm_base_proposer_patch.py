@@ -63,6 +63,16 @@ def test_returns_true_when_ilu_arch_among_multiple():
     assert wrapped(self_) is True
 
 
+def test_returns_true_for_hy_v4_mtp_without_delegating():
+    calls = []
+    wrapped = make_model_returns_tuple(_orig(calls, ret=False))
+
+    self_ = _fake_proposer("mtp", ["HYV4MTPModel"])
+
+    assert wrapped(self_) is True
+    assert calls == []
+
+
 # --- factory: delegation ----------------------------------------------------
 
 

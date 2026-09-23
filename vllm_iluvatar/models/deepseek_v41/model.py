@@ -32,6 +32,7 @@ from vllm_iluvatar.models.deepseek_v41.engram import (
     build_compressed_token_map,
     build_engram_primes,
     compute_hash_multipliers,
+    _window_metadata,
     lookback_tokens,
 )
 
@@ -321,19 +322,35 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
             or not getattr(self, "engram_layer_ids", None)
         ):
             return {}
-        tokens = lookback_tokens(
-            self.engram_history,
-            input_ids,
-            positions,
-            self.engram_max_ngram,
-            self.engram_pad_id,
+        md = _window_metadata()
+        use_kernel = (
+            md is not None
+            and md.slot_mapping is not None
+            and self.engram_history.ensure_slots(md) is not None
         )
+        tokens = None
+        if use_kernel:
+            n = min(input_ids.size(0), positions.size(0))
+            self.engram_history.write_slots_kernel(input_ids[:n], md.slot_mapping)
+        else:
+            tokens = lookback_tokens(
+                self.engram_history,
+                input_ids,
+                positions,
+                self.engram_max_ngram,
+                self.engram_pad_id,
+            )
         rows: dict[int, torch.Tensor] = {}
         for layer_id in self.engram_layer_ids:
             layer = self.layers[layer_id]
             if isinstance(layer, PPMissingLayer) or getattr(layer, "engram", None) is None:
                 continue
-            rows[layer_id] = layer.engram.embed_from_tokens(tokens)
+            if use_kernel:
+                rows[layer_id] = layer.engram.embed_from_metadata(
+                    self.engram_history, input_ids, positions, md
+                )
+            else:
+                rows[layer_id] = layer.engram.embed_from_tokens(tokens)
         return rows
 
     def forward(

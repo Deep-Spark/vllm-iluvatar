@@ -117,4 +117,52 @@ std::tuple<torch::Tensor, torch::Tensor> minimax_qk_rms_apply_meta(
     torch::Tensor& k_weight, int64_t q_size, int64_t kv_size,
     int64_t tp_world, double epsilon);
 
+// ---------------------------------------------------------------------------
+// DeepSeek-V4.1 Engram. Row-sharded table stays on the host; these ops replace
+// the per-shift index_select lookback and the D2H/index_select/H2D gather.
+// Gate and wkv stay on the existing ixformer kernels.
+// ---------------------------------------------------------------------------
+
+// Write this chunk's compressed token ids into the slot cache. Out-of-range
+// slots land on the sink at index ``nslots`` (cache must hold nslots + 1).
+void engram_write_hash_cache(torch::Tensor& input_ids, torch::Tensor& token_map,
+                             torch::Tensor& slot_mapping, torch::Tensor& cache,
+                             int64_t nslots);
+
+// Paged lookback + n-gram hash. Output int64 [T, (max_ngram-1) * n_heads].
+// ``paged`` selects the slot-cache path; otherwise ``cache`` is indexed by
+// position. Semantics match EngramTokenHistory.lookback_paged + hash_ids:
+// block id <= 0 is dead, and a dead source sticks for later shifts.
+torch::Tensor engram_ngram_hash(
+    torch::Tensor& input_ids, torch::Tensor& positions, torch::Tensor& token_map,
+    torch::Tensor& cache, torch::Tensor& block_table,
+    torch::Tensor& token_to_req, torch::Tensor& query_start_loc,
+    torch::Tensor& multipliers, torch::Tensor& primes, torch::Tensor& offsets,
+    int64_t pad_id, int64_t nslots, int64_t block_size, int64_t num_reqs,
+    bool paged);
+
+torch::Tensor engram_ngram_hash_meta(
+    torch::Tensor& input_ids, torch::Tensor& positions, torch::Tensor& token_map,
+    torch::Tensor& cache, torch::Tensor& block_table,
+    torch::Tensor& token_to_req, torch::Tensor& query_start_loc,
+    torch::Tensor& multipliers, torch::Tensor& primes, torch::Tensor& offsets,
+    int64_t pad_id, int64_t nslots, int64_t block_size, int64_t num_reqs,
+    bool paged);
+
+// Gather fp8 e4m3 rows, multiply by ue8m0 block scales, write bf16.
+// Ids outside [vocab_start, vocab_end) store zeros (row-shard all-reduce).
+// ``weight`` / ``scale`` are uint8 CUDA views, including UVA aliases of host
+// memory. Output is [T, n_hash_cols, dim].
+torch::Tensor engram_lookup_fp8(torch::Tensor& indices, torch::Tensor& weight,
+                                torch::Tensor& scale, int64_t vocab_start,
+                                int64_t vocab_end);
+
+torch::Tensor engram_lookup_fp8_meta(torch::Tensor& indices,
+                                     torch::Tensor& weight, torch::Tensor& scale,
+                                     int64_t vocab_start, int64_t vocab_end);
+
+// cudaHostRegister a page-aligned span of a CPU tensor and return a CUDA
+// alias. Does not copy. Used for the read-only engram mmap.
+torch::Tensor engram_register_host(torch::Tensor& cpu_tensor);
+
 }  // namespace vllm_iluvatar

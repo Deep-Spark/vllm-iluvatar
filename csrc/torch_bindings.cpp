@@ -80,6 +80,21 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
       "float epsilon) -> (Tensor, Tensor)");
   ops.def("weak_ref_tensor(Tensor input) -> Tensor");
   ops.def("get_cuda_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor");
+  // DeepSeek-V4.1 Engram: slot-cache write, fused lookback+ngram hash,
+  // fp8 row lookup, and a no-copy host registration for the mmap table.
+  ops.def(
+      "engram_write_hash_cache(Tensor input_ids, Tensor token_map, "
+      "Tensor slot_mapping, Tensor! cache, int nslots) -> ()");
+  ops.def(
+      "engram_ngram_hash(Tensor input_ids, Tensor positions, Tensor token_map, "
+      "Tensor cache, Tensor block_table, Tensor token_to_req, "
+      "Tensor query_start_loc, Tensor multipliers, Tensor primes, "
+      "Tensor offsets, int pad_id, int nslots, int block_size, int num_reqs, "
+      "bool paged) -> Tensor");
+  ops.def(
+      "engram_lookup_fp8(Tensor indices, Tensor weight, Tensor scale, "
+      "int vocab_start, int vocab_end) -> Tensor");
+  ops.def("engram_register_host(Tensor cpu_tensor) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL_EXPAND(_C, CUDA, ops) {
@@ -104,12 +119,16 @@ TORCH_LIBRARY_IMPL_EXPAND(_C, CUDA, ops) {
   ops.impl("minimax_qk_rms_apply", &vllm_iluvatar::minimax_qk_rms_apply);
   // Aliasing a CUDA tensor's storage; registered on the CUDA key like upstream.
   ops.impl("weak_ref_tensor", &vllm_iluvatar::weak_ref_tensor);
+  ops.impl("engram_write_hash_cache", &vllm_iluvatar::engram_write_hash_cache);
+  ops.impl("engram_ngram_hash", &vllm_iluvatar::engram_ngram_hash);
+  ops.impl("engram_lookup_fp8", &vllm_iluvatar::engram_lookup_fp8);
 }
 
 TORCH_LIBRARY_IMPL_EXPAND(_C, CPU, ops) {
   // Input is a CPU tensor; registered on the CPU key like upstream.
   ops.impl("get_cuda_view_from_cpu_tensor",
            &vllm_iluvatar::get_cuda_view_from_cpu_tensor);
+  ops.impl("engram_register_host", &vllm_iluvatar::engram_register_host);
 }
 
 TORCH_LIBRARY_IMPL_EXPAND(_C, Meta, ops) {
@@ -123,6 +142,8 @@ TORCH_LIBRARY_IMPL_EXPAND(_C, Meta, ops) {
   ops.impl("minimax_qk_var", &vllm_iluvatar::minimax_qk_var_meta);
   ops.impl("minimax_qk_rms_apply",
            &vllm_iluvatar::minimax_qk_rms_apply_meta);
+  ops.impl("engram_ngram_hash", &vllm_iluvatar::engram_ngram_hash_meta);
+  ops.impl("engram_lookup_fp8", &vllm_iluvatar::engram_lookup_fp8_meta);
 }
 
 REGISTER_EXTENSION(_C)

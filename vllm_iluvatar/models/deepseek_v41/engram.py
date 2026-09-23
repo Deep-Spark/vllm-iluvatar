@@ -384,6 +384,17 @@ class EngramTokenHistory(nn.Module):
         src = self._compress(input_ids[: slots.size(0)])
         self._slots.index_copy_(0, dst, src)
 
+    def write_slots_kernel(self, input_ids: torch.Tensor, slot_mapping: torch.Tensor) -> None:
+        assert self._slots is not None
+        n = input_ids.size(0)
+        torch.ops._C.engram_write_hash_cache(
+            input_ids[:n],
+            self.token_map,
+            slot_mapping[:n],
+            self._slots,
+            int(self._nslots),
+        )
+
     def lookback_paged(
         self,
         input_ids: torch.Tensor,
@@ -448,6 +459,9 @@ class EngramEmbedding(nn.Module):
         self.end_idx = min(self.start_idx + self.part_num_embeddings, num_embeddings)
         self.weight: torch.Tensor | None = None
         self.scale: torch.Tensor | None = None
+        self._dev_weight: torch.Tensor | None = None
+        self._dev_scale: torch.Tensor | None = None
+        self._uva_failed = False
         self._stage: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         # 映射对象要一直被持有：它一被回收，映射就没了，表底下的指针立刻失效。
         self._regions: list[object] = []
@@ -539,11 +553,32 @@ class EngramEmbedding(nn.Module):
                 tensor = f.get_slice(name)[self.start_idx : self.end_idx]
             return tensor.clone(), None
 
-    def forward(self, indices: torch.Tensor) -> torch.Tensor:
-        """indices: [T, n_hash_cols] on device -> [T, n_hash_cols, dim] bf16 on device."""
-        assert self.weight is not None and self.scale is not None, (
-            "engram table not loaded; call load_from_checkpoint first"
-        )
+    def ensure_device_view(self) -> bool:
+        """Register the mmap once so lookup reads it through UVA. No copy."""
+        if self._dev_weight is not None:
+            return True
+        if self._uva_failed or self.weight is None or self.scale is None:
+            return False
+        try:
+            weight = self.weight.view(torch.uint8)
+            scale = self.scale.view(torch.uint8)
+            if not weight.is_contiguous() or not scale.is_contiguous():
+                raise RuntimeError("engram table is not contiguous")
+            dev_weight = torch.ops._C.engram_register_host(weight)
+            dev_scale = torch.ops._C.engram_register_host(scale)
+        except Exception as exc:
+            logger.warning(
+                "engram 表 cudaHostRegister 失败，lookup 继续走 CPU gather：%s", exc
+            )
+            self._uva_failed = True
+            self._dev_weight = None
+            self._dev_scale = None
+            return False
+        self._dev_weight = dev_weight
+        self._dev_scale = dev_scale
+        return True
+
+    def _gather_cpu(self, indices: torch.Tensor) -> torch.Tensor:
         device = indices.device
         host_idx = indices.to("cpu")
         mask = (host_idx < self.start_idx) | (host_idx >= self.end_idx)
@@ -561,8 +596,27 @@ class EngramEmbedding(nn.Module):
         # Block dequantization: [..., dim] -> [..., dim // 32, 32] * [..., dim // 32, 1]
         values = values.float().unflatten(-1, (-1, _FP8_BLOCK)) * scales.float().unsqueeze(-1)
         values = values.flatten(-2).to(torch.bfloat16)
-        values = values.masked_fill_(mask.unsqueeze(-1), 0)
+        return values.masked_fill_(mask.unsqueeze(-1), 0)
 
+    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+        """indices: [T, n_hash_cols] on device -> [T, n_hash_cols, dim] bf16 on device."""
+        assert self.weight is not None and self.scale is not None, (
+            "engram table not loaded; call load_from_checkpoint first"
+        )
+        if indices.numel() == 0:
+            return torch.empty(
+                (*indices.shape, self.dim), dtype=torch.bfloat16, device=indices.device
+            )
+        if self.ensure_device_view():
+            values = torch.ops._C.engram_lookup_fp8(
+                indices,
+                self._dev_weight,
+                self._dev_scale,
+                int(self.start_idx),
+                int(self.end_idx),
+            )
+        else:
+            values = self._gather_cpu(indices)
         if get_tensor_model_parallel_world_size() > 1:
             values = tensor_model_parallel_all_reduce(values)
         return values
@@ -668,6 +722,11 @@ class IluEngram(nn.Module):
 
         prefix = f"layers.{self.layer_id}.engram"
         w_bytes, s_bytes = self.embed.load_from_checkpoint(path, f"{prefix}.embed")
+        if self.embed.ensure_device_view():
+            logger.info(
+                "engram layer %d: table registered for device lookup (rows [%d, %d))",
+                self.layer_id, self.embed.start_idx, self.embed.end_idx,
+            )
         logger.info(
             "engram layer %d: table rows [%d, %d) -> %.2f GiB weight + %.2f GiB scale on CPU",
             self.layer_id,
@@ -726,6 +785,50 @@ class IluEngram(nn.Module):
     def embed_from_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         return self.embed(self.hash_ids(tokens))
 
+    def hash_from_metadata(
+        self,
+        history: EngramTokenHistory,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        md,
+    ) -> torch.Tensor:
+        """Paged lookback and n-gram hash in one kernel. Slot cache already written."""
+        t = min(
+            input_ids.size(0),
+            positions.size(0),
+            md.token_to_req_indices.size(0),
+        )
+        if t == 0:
+            return torch.empty(
+                (0, self.n_hash_cols), dtype=torch.int64, device=input_ids.device
+            )
+        return torch.ops._C.engram_ngram_hash(
+            input_ids[:t],
+            positions[:t],
+            history.token_map,
+            history._slots,
+            md.block_table,
+            md.token_to_req_indices[:t],
+            md.query_start_loc,
+            self.multipliers,
+            self.primes,
+            self.offsets,
+            int(self.pad_id),
+            int(history._nslots),
+            int(md.block_size),
+            int(max(int(md.num_reqs), 1)),
+            True,
+        )
+
+    def embed_from_metadata(
+        self,
+        history: EngramTokenHistory,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        md,
+    ) -> torch.Tensor:
+        return self.embed(self.hash_from_metadata(history, input_ids, positions, md))
+
     def apply(self, hidden_states: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
         x, x_scale = ixfops.fp8_per_token_dynamic_scaled(rows.flatten(-2))
         kv = torch.empty(
@@ -745,8 +848,21 @@ class IluEngram(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        tokens = lookback_tokens(history, input_ids, positions, self.max_ngram_size, self.pad_id)
-        return self.apply(hidden_states, self.embed_from_tokens(tokens))
+        md = _window_metadata()
+        if (
+            md is not None
+            and md.slot_mapping is not None
+            and history.ensure_slots(md) is not None
+        ):
+            n = min(input_ids.size(0), positions.size(0))
+            history.write_slots_kernel(input_ids[:n], md.slot_mapping)
+            rows = self.embed_from_metadata(history, input_ids, positions, md)
+        else:
+            tokens = lookback_tokens(
+                history, input_ids, positions, self.max_ngram_size, self.pad_id
+            )
+            rows = self.embed_from_tokens(tokens)
+        return self.apply(hidden_states, rows)
 
     def _gate(self, hidden_states: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
         if self._qk_weight is None:

@@ -30,9 +30,9 @@ def indexer_k_norm_rope_store(
     compress_ratio: int,
     use_fp4_cache: bool,
     *,
-    block_size: int,
     block_table: torch.Tensor | None = None,
     token_to_req_indices: torch.Tensor | None = None,
+    block_size: int | None = None,
 ) -> None:
     """k_norm -> RoPE -> quant -> paged store for indexer keys.
 
@@ -48,19 +48,14 @@ def indexer_k_norm_rope_store(
         kv_slot_mapping: [num_tokens] slots in the indexer cache (-1 = skip).
         compress_ratio: group size; keys are emitted at group boundaries.
         use_fp4_cache: FP4 with power-of-two scales when True.
-        block_size: Page size in *tokens*; see ``rope_quant_insert``, which
-            takes it for the same reason.
         block_table: Pages of the indexer cache (ratio > 1).
         token_to_req_indices: Request indices for the token rows (ratio > 1).
+        block_size: Raw tokens per page. The cache's second dimension is the
+            compressed row count, ``block_size // compress_ratio``.
 
     """
-    assert k_cache.shape[1] * compress_ratio == block_size, (
-        f"{k_cache.shape[1]} rows per page x ratio {compress_ratio} is not the "
-        f"{block_size}-token page the slot arithmetic assumes"
-    )
-    # Request rows only: positions is cut to num_actual_tokens by the builder,
-    # while a captured batch's slot mapping still carries its padding.
-    num_tokens = positions.numel()
+    num_tokens = kv_slot_mapping.numel()
+    page_tokens = block_size if block_size is not None else int(k_cache.shape[1])
     assert k_pre.ndim == 2 and k_pre.shape[1] == 128
     assert k_pre.dtype == torch.bfloat16 and k_pre.stride(1) == 1
     assert num_tokens <= k_pre.shape[0] and num_tokens <= positions.numel()
@@ -78,10 +73,10 @@ def indexer_k_norm_rope_store(
         ixfops.v41_compress_rope_qdq_insert(
             k_cache,
             k,
-            kv_slot_mapping[:num_tokens],
+            kv_slot_mapping,
             positions[:num_tokens],
             cos_sin_cache,
-            block_size,
+            page_tokens,
             compress_ratio,
             MXFP4_BLOCK_SIZE,
             "fp4_pow2",
@@ -91,15 +86,17 @@ def indexer_k_norm_rope_store(
     # Folding the norm in matters here: normalising in torch first would
     # normalise every token's row and then keep only the ones closing a group.
     assert block_table is not None and token_to_req_indices is not None
+    if k_cache.dim() == 3:
+        assert k_cache.shape[1] * compress_ratio == page_tokens
     ixfops.v41_rope_qdq_insert_by_token(
         k_cache,
         k_pre[:num_tokens],
         positions[:num_tokens],
-        kv_slot_mapping[:num_tokens],
+        kv_slot_mapping,
         block_table,
         token_to_req_indices[:num_tokens],
         cos_sin_cache,
-        block_size,
+        page_tokens,
         compress_ratio,
         MXFP4_BLOCK_SIZE,
         "fp4_pow2",

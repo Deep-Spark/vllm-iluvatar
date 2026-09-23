@@ -20,9 +20,9 @@ Differences from the V4 ilu draft, all forced by V4.1's decoder layer:
   the remap ignores, so only the decoder blocks are stage-indexed;
 * the draft MoE is ``dspark_n_routed_experts`` (128) wide, not the backbone's
   384, so the layers are built against a config that carries the DSpark counts;
-* context KV insert follows V4.1's own attention (``kv_norm`` -> rope ->
-  ``ds4_act_qdq`` -> ``write_cache``) instead of V4's fused qnorm/rope op, and
-  reaches ``layer.attn`` directly because V4.1 has no ``mla_attn`` wrapper.
+* context KV insert is ``kv_norm`` then ``v41_qkv_rope_fp8_insert`` into the
+  window cache, and reaches ``layer.attn`` directly because V4.1 has no
+  ``mla_attn`` wrapper.
 
 Constructor prefixes use ``layers.{num_hidden_layers + i}`` so that
 ``extract_layer_index`` yields 40/41/42 and therefore ``compress_ratios[40+i]
@@ -62,10 +62,7 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.platforms import current_platform
 
 from vllm_iluvatar.models.deepseek_v41 import mhc
-from vllm_iluvatar.models.deepseek_v41.attention import FP8_BLOCK_SIZE
 from vllm_iluvatar.models.deepseek_v41.model import IluDeepseekV41DecoderLayer
-from vllm_iluvatar.models.deepseek_v41.sparse_mla import write_cache
-from vllm_iluvatar.models.deepseek_v41.rope import apply_rope
 
 logger = init_logger("vllm." + __name__)
 
@@ -248,9 +245,14 @@ class IluDSparkDeepseekV41Model(nn.Module):
             qr_kv = attn.fused_wqa_wkv(main_x)[0]
             _, kv = qr_kv.split([attn.q_lora_rank, attn.head_dim], dim=-1)
             kv = attn.kv_norm(kv)
-            apply_rope(kv.unsqueeze(0), pos32, attn.cos_sin)
-            ixfops.ds4_act_qdq(kv, FP8_BLOCK_SIZE, "fp8_pow2")
-            write_cache(attn.window_cache.kv_cache, kv, slot_mapping)
+            ixfops.v41_qkv_rope_fp8_insert(
+                kv.new_empty((kv.size(0), 0, kv.size(1))),
+                attn.swa_cache_layer.kv_cache,
+                kv,
+                slot_mapping,
+                pos32,
+                attn.cos_sin,
+            )
 
     def forward(
         self,
@@ -347,7 +349,7 @@ class IluDSparkDeepseekV41ForCausalLM(nn.Module):
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
-        return [layer.attn.window_cache.prefix for layer in self.model.layers]
+        return [layer.attn.swa_cache_layer.prefix for layer in self.model.layers]
 
     def _remap_dspark_name(self, name: str) -> str | None:
         return remap_dspark_name(name, self.config.num_hidden_layers)

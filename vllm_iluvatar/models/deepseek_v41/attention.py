@@ -1,18 +1,21 @@
 """DeepSeek-V4.1-Flash attention: projections, caches, sparse MLA."""
+
 from __future__ import annotations
 
 import re
+import warnings
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import ixformer.inference.functions as ixfops
 import torch
 from torch import nn
-from vllm.config import VllmConfig
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
 )
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -21,279 +24,151 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.v1.attention.backend import AttentionBackend
-from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
+from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
+from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
+from vllm.v1.kv_cache_interface import (
+    KVCacheSpec,
+    MLAAttentionSpec,
+    get_kv_quant_mode,
+)
 
+from vllm_iluvatar.model_executor.layers.sparse_attn_indexer import (
+    IluSparseAttnIndexer,
+)
 from vllm_iluvatar.models.deepseek_v41.common.ops import (
     indexer_k_norm_rope_store,
-    rope_quant_insert,
 )
 from vllm_iluvatar.models.deepseek_v41.compressor import (
-    IluDeepseekV41Compressor,
-    V41CompressKVCache,
+    IluDeepseekCompressor,
 )
+from vllm_iluvatar.models.deepseek_v41.rope import apply_rope
 from vllm_iluvatar.models.deepseek_v41.sparse_mla import (
-    BLOCK_SIZE,
-    V41AttentionMetadata,
-    V41CompressorBackend,
-    V41WindowKVCache,
-    decode_sparse_mla,
-    gather_group_rows,
-    gather_window_rows,
+    IluDeepseekSparseSWAFlashMLABackend,
+    IluDeepseekV4FlashMLABackend,
+    IluDeepseekV4FlashMLAMetadata,
 )
-from vllm_iluvatar.models.deepseek_v41.rope import apply_rope, get_shared_cos_sin
+from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
+    IluDeepseekV41IndexerBackend,
+    get_max_prefill_buffer_size,
+)
+from vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa import IluDeepseekV4SWACache
 
-FP8_BLOCK_SIZE = 32
+if TYPE_CHECKING:
+    from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+
+logger = init_logger(__name__)
+
+
+warnings.filterwarnings(
+    "ignore", message=".*bgemm_internal_cublaslt error.*", category=UserWarning
+)
+
 FP4_BLOCK_SIZE = 32
-
-# Peak bytes of dense score rows held at once; the token axis is split to fit.
-_MMA_INDEX_BUDGET = 192 << 20
-# Below this token count the fused SIMT kernel wins on the part that is not FLOPs:
-# dense scoring needs a host-side chunk plan and a few small H2D copies per call,
-# and decode is already CPU-bound here. See ``_mma_index_applies``.
-_MMA_INDEX_MIN_TOKENS = 512
-# ixinfer v3 on ivcore30 requires topk % 64 == 0.
-_IXINFER_TOPK_MULTIPLE = 64
-# ...and reaches its tiled MMA path only when the head count is exactly one of
-# its five template tiers. Any other count -- including multiples of 16 such as
-# 48 -- falls back to a scalar dot product. Measured at 8192 tokens: 12.2 ms at
-# h=16 against 29.5 at h=8 and 58.1 at h=48.
-_IXINFER_HEAD_TIERS = (16, 32, 64, 128, 256)
+_INDEX_TILE = 256
+_PACKED_MLA_HEADS = (1, 8, 16, 32, 64, 128)
 
 
-def _source_layer_prefix(prefix: str, layer_id: int) -> str:
-    """Rewrite ``prefix`` so it names ``layer_id`` instead of its own layer.
+def _tiled_index_rows(idx: torch.Tensor) -> torch.Tensor:
+    """Index rows whose stride(0) is a positive multiple of 256.
 
-    Cross-layer state is never handed between layers. A borrower resolves the
-    module that owns what it needs out of ``static_forward_context``, keyed by
-    the source layer's prefix, which it can build from construction-time
-    knowledge alone. Nothing has to be published at forward time, so a layer
-    cannot read a value some earlier step left behind, and a source that is not
-    on this rank fails at load instead of silently going missing.
+    ``ds4_sparse_mla_fp8_decode`` reads index tiles of that width. A window of
+    128 is narrower, so the row is copied into a wider allocation and the
+    returned view keeps the padded stride.
     """
-    out, n = re.subn(r"\.layers\.\d+\.", f".layers.{layer_id}.", prefix)
-    assert n == 1, f"no layer index in prefix {prefix!r}"
-    return out
-
-
-def _seq_spans(md: V41AttentionMetadata) -> list[tuple[int, int, int, int]]:
-    qsl = md.query_start_loc_cpu.tolist()
-    slens = md.seq_lens_cpu.tolist()
-    spans = []
-    for i in range(md.num_reqs):
-        start, end = qsl[i], qsl[i + 1]
-        if end > start:
-            spans.append((i, start, end, slens[i]))
-    return spans
-
-
-def prefill_attn(
-    q: torch.Tensor,
-    window_kv: torch.Tensor,
-    compress_cache: torch.Tensor | None,
-    md: V41AttentionMetadata | None,
-    spans: list[tuple[int, int, int, int]],
-    ratio: int,
-    group_idxs: torch.Tensor | None,
-    group_lens: torch.Tensor | None,
-    positions: torch.Tensor,
-    window_size: int,
-    attn_sink: torch.Tensor,
-    scale: float,
-    window_cache: torch.Tensor | None = None,
-    window_md: V41AttentionMetadata | None = None,
-) -> torch.Tensor:
-    dev = q.device
-    n_win_max = min(window_size, max((sl for *_, sl in spans), default=0))
-    plane_parts: list[torch.Tensor] = []
-    base = 0
-    win_bases: list[int] = []
-    grp_bases: list[int] = []
-    n_groups: list[int] = []
-
-    cflat = None if compress_cache is None else compress_cache
-    wflat = None if window_cache is None else window_cache
-    win_origins: list[int] = []
-    for req, t0, t1, seq_len in spans:
-        n_g = seq_len // ratio if cflat is not None else 0
-        if n_g:
-            plane_parts.append(gather_group_rows(cflat, md, req, 0, n_g, ratio))
-        grp_bases.append(base)
-        base += n_g
-        n_groups.append(n_g)
-
-        start_pos = seq_len - (t1 - t0)
-        # First prefill uses the current activation as the window plane.
-        # Gathering through block_table is not equivalent (slot/block mismatch).
-        if wflat is not None and window_md is not None and start_pos > 0:
-            win_lo = max(0, start_pos + 1 - window_size)
-            hist = start_pos - win_lo
-            parts = []
-            if hist:
-                parts.append(
-                    gather_window_rows(wflat, window_md, req, win_lo, hist)
-                )
-            parts.append(window_kv[t0:t1])
-            plane_parts.append(parts[0] if len(parts) == 1 else torch.cat(parts, dim=0))
-            win_origins.append(win_lo)
-            win_bases.append(base)
-            base += hist + (t1 - t0)
-        else:
-            plane_parts.append(window_kv[t0:t1])
-            win_origins.append(start_pos)
-            win_bases.append(base)
-            base += t1 - t0
-
-    plane = torch.cat(plane_parts, dim=0) if plane_parts else window_kv[:0]
-
-    topk_w = 0 if group_idxs is None else group_idxs.size(-1)
-    width = n_win_max + topk_w
-    pad = -width % _IXINFER_TOPK_MULTIPLE
-    idxs = torch.full((q.size(0), width + pad), -1, dtype=torch.int32, device=dev)
-    lens = torch.zeros(q.size(0), dtype=torch.int32, device=dev)
-
-    for (_req, t0, t1, _seq_len), wb, gb, n_g, wlo in zip(
-        spans, win_bases, grp_bases, n_groups, win_origins
+    if idx.dim() == 3:
+        idx = idx.reshape(idx.shape[0], -1)
+    width = idx.shape[-1]
+    if (
+        width % _INDEX_TILE == 0
+        and idx.stride(1) == 1
+        and idx.stride(0) > 0
+        and idx.stride(0) % _INDEX_TILE == 0
     ):
-        has_groups = bool(n_g) and group_idxs is not None
-        ixfops.ds4_build_v41_index_plane(
-            idxs,
-            lens,
-            positions,
-            group_idxs if has_groups else None,
-            group_lens if has_groups else None,
-            t0,
-            t1 - t0,
-            wb,
-            gb,
-            wlo,
-            window_size,
+        return idx
+    if width % _INDEX_TILE == 0:
+        return idx.contiguous()
+    padded = width + (-width % _INDEX_TILE)
+    wide = idx.new_empty((idx.shape[0], padded))
+    wide[:, :width].copy_(idx)
+    return wide[:, :width]
+
+
+def _replace_layer_index(prefix: str, layer_id: int) -> str:
+    """Swap the layer index inside a ``...layers.<idx>...`` prefix."""
+    new_prefix, n = re.subn(r"\.layers\.\d+\.", f".layers.{layer_id}.", prefix)
+    assert n == 1, f"Cannot locate layer index in prefix {prefix}"
+    return new_prefix
+
+
+def _indexer_k_cache_head_dim(index_head_dim: int, kv_dtype: str) -> int:
+    MXFP4_BLOCK_SIZE = 32
+    """Per-token byte width of the paged indexer K cache row."""
+    if kv_dtype == "mxfp4":
+        # MXFP4 stores two values per byte plus one UE8M0 byte per 32 values.
+        # head_dim bytes = 64 packed values + 4 UE8M0 scales = 68.
+        return index_head_dim // 2 + index_head_dim // MXFP4_BLOCK_SIZE
+    # NOTE(yifan): FP8 indexer cache uses the same layout as V3.2:
+    # head_dim bytes = 128 fp8 + 4 fp32 scale = 132.
+    return (
+        index_head_dim + index_head_dim // 128 * 4
+        if kv_dtype == "fp8"
+        else index_head_dim
+    )
+
+
+class IluDeepseekV41IndexerCache(torch.nn.Module, AttentionLayerBase):
+    """The paged index-key cache an ``owns_k`` layer publishes into."""
+
+    def __init__(
+        self,
+        head_dim: int,
+        dtype: torch.dtype,
+        prefix: str,
+        cache_config: CacheConfig,
+        compress_ratio: int = 1,
+    ):
+        super().__init__()
+        self.kv_cache = torch.tensor([])
+        self.head_dim = head_dim
+        self.prefix = prefix
+        self.cache_config = cache_config
+        self.dtype = dtype
+        self.compress_ratio = compress_ratio
+        self.block_size = cache_config.block_size
+        if self.block_size % compress_ratio:
+            raise ValueError(
+                f"block_size {self.block_size} must be a multiple of compress_ratio "
+                f"{compress_ratio}, or a page would hold a fractional row "
+                f"(layer {prefix})"
+            )
+        compilation_config = get_current_vllm_config().compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # [B, H=1, N, C] -> [B, N, C]
+        self.kv_cache = kv_cache.squeeze(1)
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        del vllm_config
+        return MLAAttentionSpec(
+            block_size=self.block_size,
+            num_kv_heads=1,
+            head_size=self.head_dim,
+            dtype=self.dtype,
+            # The indexer page shares a physical block with the main KV cache,
+            # so it carries the same padding.
+            alignment=512,
+            compress_ratio=self.compress_ratio,
         )
 
-    # Pad up to the nearest tier so the kernel takes its MMA path. Off-tier head
-    # counts hit a scalar fallback that is 2.4x slower *in absolute time* than
-    # the padded call despite doing half the work. Heads are independent, so the
-    # padded lanes are computed and dropped; they cost nothing in accuracy either
-    # -- the MMA path lands closer to an fp32 reference (2.6e-3 relative) than
-    # the scalar path it replaces (5.2e-3). TP8 gives 64/8 = 8 heads and lands on
-    # the slow side; TP4 gives 16 and pays nothing here.
-    heads = q.size(1)
-    tier = next((t for t in _IXINFER_HEAD_TIERS if t >= heads), heads)
-    pad_h = tier - heads
-    if pad_h:
-        q_in = q.new_zeros((q.size(0), heads + pad_h, q.size(2)))
-        q_in[:, :heads] = q
-        sink_in = attn_sink.new_zeros(heads + pad_h)
-        sink_in[:heads] = attn_sink
-    else:
-        q_in, sink_in = q, attn_sink
+    def forward(self): ...
 
-    o = ixfops.ds4_flash_mla_sparse_fwd(
-        q_in,
-        plane.unsqueeze(1),
-        idxs.unsqueeze(1).contiguous(),
-        scale,
-        d_v=q.size(-1),
-        attn_sink=sink_in,
-        topk_length=lens,
-    )
-    # Dropping the padded lanes leaves a strided view, and the RoPE that consumes
-    # this output requires contiguous memory.
-    return o[:, :heads].contiguous() if pad_h else o
-
-
-def _mma_index_applies(
-    md: V41AttentionMetadata, num_tokens: int, candidate_span: int
-) -> bool:
-    """Can this batch be scored densely without changing what gets selected?
-
-    Two conditions. The candidate machinery has to be vacuous: a restricted layer
-    selects among the blocks the source layer published, so when that listIluDeepseekV41IndexerBackend
-    already spans every block a token can see, the restriction removes nothing --
-    the source can skip publishing and the restricted layers can score the full
-    range with identical results. ``candidate_topk_blocks * candidate_block_size``
-    is that span. It is measured in the compressed domain of the *source* layer,
-    and the answer has to hold for every index layer at once (it is what tells
-    the source whether to publish), so the comparison is against the token-domain
-    sequence length -- the form that is conservative for every ratio.
-
-    And the batch has to be one this path can be captured around. Dense scoring
-    plans its chunks on the host and uploads the per-chunk seqlens, so a graph
-    would freeze one batch's lengths and silently replay them for every later
-    one -- the fused kernel derives its chunk count from run-time lengths on the
-    device precisely so it can replay at any length. ``num_decodes`` does not
-    catch this: V4.1's builder keeps ``reorder_batch_threshold`` at 1 without
-    ``supports_spec_as_decode``, so a DSpark verify step arrives here counted as
-    a prefill, and it is exactly what gets captured. Hence the explicit capture
-    check, plus a token floor -- below it the host-side plan costs more than the
-    FLOPs it saves, and decode is CPU-bound here to begin with.
-    """
-    if md.num_decodes or not md.num_reqs:
-        return False
-    if num_tokens < _MMA_INDEX_MIN_TOKENS:
-        return False
-    if torch.cuda.is_current_stream_capturing():
-        return False
-    return int(md.seq_lens_cpu[: md.num_reqs].max()) <= candidate_span
-
-
-def _short_context_bypass_applies(
-    md: V41AttentionMetadata, ratio: int, topk: int
-) -> bool:
-    """Whether the indexer cannot change the selection, so it can be skipped.
-    """
-    if ratio <= 0 or not md.num_reqs:
-        return False
-    if torch.cuda.is_current_stream_capturing():
-        return False
-    return int(md.seq_lens_cpu[: md.num_reqs].max()) // ratio <= topk
-
-
-def _mma_index_chunks(
-    query_start_loc_cpu: torch.Tensor,
-    seq_lens_cpu: torch.Tensor,
-    num_reqs: int,
-    rows: int,
-) -> list[tuple[int, int, list[int], list[int], list[int]]]:
-    """Split the token axis into pieces that fit the dense-score budget.
-
-    Any contiguous sub-span of a request is a valid batch entry for the scoring
-    kernel: the only thing its causal mask reads is ``kv_len - q_len``, so giving
-    it the position just past the sub-span's last token as ``kv_len`` reproduces
-    that span's absolute positions exactly. That makes a request splittable at
-    any token, which is what lets one budget serve any context length.
-
-    Returns ``(token_start, token_end, cu_seqlens_q, cu_seqlens_kv, req_ids)``
-    per chunk. ``req_ids`` is one entry per span rather than per request, because
-    a request split across chunks contributes a span -- and a block-table row --
-    to each of them.
-    """
-    chunks: list[tuple[int, int, list[int], list[int], list[int]]] = []
-    cu_q, cu_kv, reqs = [0], [0], []
-    start = 0
-    for r in range(num_reqs):
-        lo, hi = int(query_start_loc_cpu[r]), int(query_start_loc_cpu[r + 1])
-        # Absolute position of this request's first query token.
-        base = int(seq_lens_cpu[r]) - (hi - lo)
-        cursor = lo
-        while cursor < hi:
-            if cu_q[-1] == rows:
-                chunks.append((start, start + cu_q[-1], cu_q, cu_kv, reqs))
-                start += cu_q[-1]
-                cu_q, cu_kv, reqs = [0], [0], []
-            take = min(rows - cu_q[-1], hi - cursor)
-            cu_q.append(cu_q[-1] + take)
-            cu_kv.append(cu_kv[-1] + base + (cursor - lo) + take)
-            reqs.append(r)
-            cursor += take
-    if cu_q[-1]:
-        chunks.append((start, start + cu_q[-1], cu_q, cu_kv, reqs))
-    return chunks
-
-
-class V41IndexKeyCache(V41CompressKVCache):
-    """Indexer keys: same page geometry as compressed KV, ``index_head_dim`` rows."""
+    def get_attn_backend(self) -> type[AttentionBackend]:
+        return IluDeepseekV41IndexerBackend
 
 
 class IluDeepseekV41Indexer(nn.Module):
@@ -307,373 +182,193 @@ class IluDeepseekV41Indexer(nn.Module):
 
     def __init__(
         self,
-        config,
-        layer_id: int,
+        vllm_config: VllmConfig,
+        config: Any,
+        hidden_size: int,
+        q_lora_rank: int,
+        quant_config: QuantizationConfig | None,
+        cache_config: CacheConfig | None,
+        topk_indices_buffer: torch.Tensor | None,
         compress_ratio: int,
-        quant_config=None,
-        prefix: str = "",
+        prefix: str,
         *,
         owns_k: bool,
-        key_cache_prefix: str,
-        static_forward_context: dict,
+        k_cache: IluDeepseekV41IndexerCache,
+        main_head_dim: int,
+        candidate_block_buffer: torch.Tensor | None = None,
+        candidate_block_size: int = 0,
+        candidate_write: bool = False,
     ) -> None:
         super().__init__()
-        self.layer_id = layer_id
-        self.owns_k = owns_k
-        # Index keys come from a kv-source layer's compressor latent, so only
-        # those layers own a cache to write them to; the rest score against the
-        # nearest one, looked up here rather than published into shared state.
-        self.key_cache_prefix = key_cache_prefix
-        self._static_forward_context = static_forward_context
-        # Bound by the model once the shared selection buffers exist.
-        self.topk_idxs_buf: torch.Tensor | None = None
-        self.topk_lens_buf: torch.Tensor | None = None
-        self.candidate_idxs_buf: torch.Tensor | None = None
-        self.candidate_lens_buf: torch.Tensor | None = None
+        self.vllm_config = vllm_config
+        self.config = config
+        self.quant_config = quant_config
+        self.topk_tokens = config.index_topk
+        self.n_head = config.index_n_heads  
+        self.head_dim = config.index_head_dim  
+        self.rope_dim = config.qk_rope_head_dim  
+        self.q_lora_rank = q_lora_rank  
         self.compress_ratio = compress_ratio
-        self.is_candidate_source = layer_id == config.candidate_source_layer_id
-        self.uses_candidates = 0 <= config.candidate_source_layer_id < layer_id
-        self.candidate_topk_blocks = config.candidate_topk_blocks
-        self.candidate_block_size = config.candidate_block_size
-        self.n_heads = config.index_n_heads
-        self.index_head_dim = config.index_head_dim
-        self.rope_head_dim = config.rope_head_dim
-        self.index_topk = config.index_topk
-        self.softmax_scale = self.index_head_dim**-0.5
-        self.cos_sin: torch.Tensor | None = None
-
-        # Dense scoring needs a page the mqa_logits paged loader accepts, which is
-        # a multiple of 16 rows. A compressed layer's page holds
-        # ``BLOCK_SIZE / compress_ratio`` rows, so ratio 2 gives 8 and only the
-        # ratio-1 layers qualify -- which are also the expensive ones, since they
-        # see twice the groups.
-        def page_ok(ratio: int) -> bool:
-            page = BLOCK_SIZE // ratio if ratio else 0
-            return page >= 16 and page % 16 == 0
-
-        self.mma_page_ok = page_ok(compress_ratio)
-        # Taking this path means the candidate list is never published, which is
-        # only safe when every layer that would consume it also takes the path.
-        # Otherwise a restricted layer falls back to the fused kernel and finds no
-        # mask to read.
-        self.mma_chain_ok = all(
-            page_ok(config.compress_ratios[i])
-            for i in config.index_source_layer_ids
-            if i >= config.candidate_source_layer_id and config.compress_ratios[i]
-        )
-        downstream = [
-            config.compress_ratios[i]
-            for i in config.index_source_layer_ids
-            if i >= config.candidate_source_layer_id and config.compress_ratios[i]
-        ]
-        self.bypass_ratio = (
-            min([compress_ratio] + downstream)
-            if self.is_candidate_source
-            else compress_ratio
+        self.owns_k = owns_k
+        self.k_row_buffer: torch.Tensor | None = None
+        self.use_fp4_kv = False
+        logger.info_once(
+            "Using %s indexer cache for Lightning Indexer.",
+            "MXFP4" if self.use_fp4_kv else "FP8" if False else "Bfloat16",
         )
 
-        # Replicated, not sharded over heads: the scoring kernel shards candidate
-        # blocks over the TP group, so every rank needs every head anyway and a
-        # sharded projection would only gather them straight back -- 64 MiB of q
-        # per index-source layer at 8k tokens, against 7/8 of a
-        # [T, 1280] x [1280, 4096] GEMM to compute them everywhere.
+        # no tensor parallel, just replicated
         self.wq_b = ReplicatedLinear(
-            config.q_lora_rank, config.index_n_heads * config.index_head_dim,
-            bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_b",
+            self.q_lora_rank,
+            self.head_dim * self.n_head,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.wq_b",
         )
         self.weights_proj = ReplicatedLinear(
-            config.hidden_size, config.index_n_heads, bias=False,
+            hidden_size,
+            self.n_head,
+            bias=False,
             quant_config=None,
-            params_dtype=torch.bfloat16, prefix=f"{prefix}.weights_proj",
+            prefix=f"{prefix}.weights_proj",
         )
-        if self.owns_k:
+        self.softmax_scale = self.head_dim**-0.5
+
+        self.scale_fmt = "ue8m0"
+        self.quant_block_size = 128
+        self.topk_indices_buffer = topk_indices_buffer
+
+        self.max_model_len = (
+            vllm_config.model_config.max_model_len // self.compress_ratio
+        )
+        self.prefix = prefix
+
+        self.max_total_seq_len = (
+            get_max_prefill_buffer_size(vllm_config) // self.compress_ratio
+        )
+
+        assert cache_config is not None, "Deepseek V4 indexer requires cache_config"
+        if owns_k:
+            # wk maps the main compressor's (pre-RoPE) latent to index keys.
+            # The checkpoint stores it in bf16 with no quantization scales.
             self.wk = ReplicatedLinear(
-                config.head_dim, config.index_head_dim, bias=False,
-                params_dtype=torch.bfloat16, prefix=f"{prefix}.wk",
+                main_head_dim,
+                self.head_dim,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.wk",
             )
-            self.k_norm = RMSNorm(config.index_head_dim, config.rms_norm_eps)
-            self.key_cache = V41IndexKeyCache(
-                head_size=config.index_head_dim,
-                dtype=torch.get_default_dtype(),
-                compress_ratio=compress_ratio,
-                block_size=BLOCK_SIZE,
-                prefix=key_cache_prefix,
-            )
-            assert self.key_cache.prefix == key_cache_prefix
-        elif key_cache_prefix not in static_forward_context:
-            raise NotImplementedError(
-                f"layer {layer_id} scores against index keys owned by "
-                f"{key_cache_prefix!r}, which is not on this rank"
-            )
+            self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
+        self.k_cache = k_cache
 
-    def _index_keys(self) -> tuple[torch.Tensor, V41AttentionMetadata]:
-        """The paged index-key cache this layer scores against, and its metadata."""
-        cache = self._static_forward_context[self.key_cache_prefix]
-        return cache.kv_cache, get_forward_context().attn_metadata[
-            self.key_cache_prefix
-        ]
+        # Scoring and selection live behind the platform's subclass of official's
+        # SparseAttnIndexer, same as v3.2 and glm_moe_dsa.
+        self.indexer_op = IluSparseAttnIndexer(
+            self.k_cache,
+            self.quant_block_size,
+            self.scale_fmt,
+            self.topk_tokens,
+            self.head_dim,
+            self.max_model_len,
+            self.max_total_seq_len,
+            self.topk_indices_buffer,
+            skip_k_cache_insert=True,
+            use_fp4_cache=self.use_fp4_kv,
+            compress_ratio=compress_ratio,
+            candidate_blocks=candidate_block_buffer,
+            candidate_block_size=candidate_block_size,
+            candidate_write=candidate_write,
+        )
 
-    def publish_keys(self, latent: torch.Tensor) -> None:
-        md: V41AttentionMetadata = get_forward_context().attn_metadata[
-            self.key_cache_prefix
-        ]
+    def _produce_k(
+        self, latent: torch.Tensor | None, positions: torch.Tensor, rotary_emb
+    ) -> None:
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict) or latent is None:
+            # Profile run: the indexer K cache is not bound yet and the
+            # compressor skipped its latent output.
+            return
+        assert self.owns_k
+        indexer_metadata = cast(Any, attn_metadata[self.k_cache.prefix])
+        # ReplicatedLinear returns (output, bias); bias is None. Rows at
+        # non-boundary tokens hold garbage latent and are skipped by the
+        # store kernel.
+        k_pre, _ = self.wk(latent)
         indexer_k_norm_rope_store(
-            self.wk(latent)[0],
-            md.positions,
-            self.cos_sin,
+            k_pre,
+            positions,
+            rotary_emb.cos_sin_cache,
             self.k_norm.weight,
             self.k_norm.variance_epsilon,
-            self.key_cache.kv_cache,
-            md.slot_mapping,
+            self.k_cache.kv_cache,
+            indexer_metadata.slot_mapping,
             self.compress_ratio,
             True,
-            block_size=md.block_size,
-            block_table=md.block_table,
-            token_to_req_indices=md.token_to_req_indices,
+            block_table=indexer_metadata.block_table,
+            token_to_req_indices=indexer_metadata.token_to_req_indices,
+            block_size=self.k_cache.block_size,
         )
 
-    def score_and_select(
+    def forward(
         self,
-        x: torch.Tensor,
         qr: torch.Tensor,
+        latent: torch.Tensor | None,
+        indexer_weights: torch.Tensor,
         positions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rotary_emb,
+        qr_scale: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """Publish this layer's index keys, then prepare the index query.
+
+        Returns the quantized query, its scale (none in this layout) and the
+        per-head weights, or three Nones when the short-context bypass filled
+        the top-k outright and there is nothing to score.
+        """
         assert self.cos_sin is not None
-        index_k, md = self._index_keys()
+        attn_metadata = get_forward_context().attn_metadata
+        if isinstance(attn_metadata, dict):
+            indexer_metadata = cast(Any, attn_metadata[self.k_cache.prefix])
+            if (
+                indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                if self.owns_k:
+                    self._produce_k(latent, positions, rotary_emb)
+                assert self.topk_indices_buffer is not None
+                topk_lens = getattr(self, "topk_lens_buffer", None)
+                assert topk_lens is not None
+                num_tokens = (
+                    indexer_metadata.num_decode_tokens
+                    + indexer_metadata.num_prefill_tokens
+                )
+                if num_tokens > 0:
+                    ixfops.v41_fill_short_context_topk(
+                        self.topk_indices_buffer[:num_tokens],
+                        topk_lens[:num_tokens],
+                        positions,
+                        self.compress_ratio,
+                    )
+                return None, None, None
 
-        if _short_context_bypass_applies(md, self.bypass_ratio, self.index_topk):
-            n = positions.size(0)
-            idxs = self.topk_idxs_buf[:n]
-            lens = self.topk_lens_buf[:n]
-            ixfops.v41_fill_short_context_topk(
-                idxs, lens, positions, self.compress_ratio
-            )
-            return idxs, lens
+        if self.owns_k:
+            # K write must land before indexer_op reads the cache
+            # (skip_k_cache_insert=True).
+            self._produce_k(latent, positions, rotary_emb)
 
-        q = self.wq_b(qr)[0].unflatten(-1, (self.n_heads, self.index_head_dim))
-
-        weights = self.weights_proj(x)[0]
+        # ReplicatedLinear returns (output, bias).
+        q = self.wq_b(qr)[0].view(-1, self.n_head, self.head_dim)
+        # In-place: q is rotated and requantized, weights are rescaled.
         ixfops.v41_indexer_q_rope_qdq(
             q,
             positions,
             self.cos_sin,
             FP4_BLOCK_SIZE,
             "fp4_pow2",
-            weights,
-            weights,
-            self.softmax_scale * self.n_heads**-0.5,
+            indexer_weights,
+            indexer_weights,
+            self.softmax_scale * self.n_head**-0.5,
         )
-
-        return self._select_paged(q, weights, positions, index_k, md)
-
-    def _select_paged(
-        self,
-        q: torch.Tensor,
-        weights: torch.Tensor,
-        positions: torch.Tensor,
-        index_k: torch.Tensor,
-        md: V41AttentionMetadata,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Score and select by walking the paged index cache.
-
-        Nothing sequence-wide may be materialised here. A dense
-        ``[num_tokens, n_heads, max_groups]`` score is seq_len**2 on a
-        compress_ratio=1 layer and wants 17 GiB at 32k tokens; the kernel carries a
-        running top-k per token instead, so the widest allocation is
-        ``[num_tokens, index_topk]``.
-
-        That also dictates how the work is split. A rank needs the *complete*
-        per-head sum for any group it scores, and the ``[num_tokens, seq_len]``
-        score is exactly what must not exist to be all-reduced, so q and the
-        weights are replicated -- see the projections -- and the kernel shards
-        *candidate blocks* round-robin over the TP group. Each rank's local top-k
-        contains every group of its own blocks that could reach the global top-k,
-        so merging the compact results is exact rather than approximate.
-
-        ``max_visible_groups`` must come from the CPU seq_lens: it is a launch
-        hint only, and reading ``seq_lens.max()`` off the device would sync during
-        CUDA graph capture.
-
-        The selection leaves in preallocated buffers the model owns, written in
-        place: they are what the layers between index sources read, and at 8192
-        tokens the top-k alone would otherwise be a 16 MiB allocation per source
-        layer per step.
-        """
-        ratio = self.compress_ratio
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
-        num_tokens = q.size(0)
-        dev = q.device
-        if (
-            self.mma_page_ok
-            and self.mma_chain_ok
-            and _mma_index_applies(
-                md, num_tokens, self.candidate_topk_blocks * self.candidate_block_size
-            )
-        ):
-            return self._select_mma(q, weights, positions, md, index_k, num_tokens)
-        if self.uses_candidates:
-            cand_in_idxs = self.candidate_idxs_buf[:num_tokens]
-            cand_in_lens = self.candidate_lens_buf[:num_tokens]
-        else:
-            cand_in_idxs = torch.empty((num_tokens, 0), dtype=torch.int32, device=dev)
-            cand_in_lens = torch.zeros(num_tokens, dtype=torch.int32, device=dev)
-
-        # Only the candidate source emits blocks; everyone else still has to pass
-        # a buffer, so give it the minimum width the binding accepts.
-        cand_capacity = self.candidate_topk_blocks if self.is_candidate_source else 1
-        topk_idxs = torch.empty((num_tokens, self.index_topk), dtype=torch.int32, device=dev)
-        topk_scores = torch.empty((num_tokens, self.index_topk), dtype=torch.float32, device=dev)
-        topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=dev)
-        cand_idxs = torch.empty((num_tokens, cand_capacity), dtype=torch.int32, device=dev)
-        cand_scores = torch.empty((num_tokens, cand_capacity), dtype=torch.float32, device=dev)
-        cand_lens = torch.empty(num_tokens, dtype=torch.int32, device=dev)
-
-        max_seq = int(md.seq_lens_cpu[: md.num_reqs].max().item()) if md.num_reqs else 0
-        ixfops.ds4_v41_paged_index_select_out(
-            q.contiguous(),
-            index_k,
-            weights.contiguous(),
-            md.token_to_req_indices,
-            md.seq_lens,
-            md.block_table,
-            positions.to(torch.int64),
-            cand_in_idxs,
-            cand_in_lens,
-            topk_idxs,
-            topk_scores,
-            topk_lens,
-            cand_idxs,
-            cand_scores,
-            cand_lens,
-            ratio,
-            self.index_topk,
-            cand_capacity,
-            self.candidate_block_size,
-            int(self.uses_candidates),
-            self.is_candidate_source,
-            tp_rank,
-            tp_size,
-            max_seq // ratio,
-        )
-
-        def merge(
-            idxs: torch.Tensor,
-            scores: torch.Tensor,
-            lens: torch.Tensor,
-            capacity: int,
-            dst_idxs: torch.Tensor,
-            dst_lens: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            out_idxs = dst_idxs[:num_tokens]
-            out_lens = dst_lens[:num_tokens]
-            if tp_size == 1:
-                out_idxs.copy_(idxs)
-                out_lens.copy_(lens)
-                return out_idxs, out_lens
-            out_scores = torch.empty((num_tokens, capacity), dtype=torch.float32, device=dev)
-            ixfops.ds4_v41_merge_topk_out(
-                tensor_model_parallel_all_gather(idxs, dim=1),
-                tensor_model_parallel_all_gather(scores, dim=1),
-                tensor_model_parallel_all_gather(lens.unsqueeze(1), dim=1),
-                out_idxs,
-                out_scores,
-                out_lens,
-                capacity,
-            )
-            return out_idxs, out_lens
-
-        if self.is_candidate_source:
-            merge(
-                cand_idxs, cand_scores, cand_lens, self.candidate_topk_blocks,
-                self.candidate_idxs_buf, self.candidate_lens_buf,
-            )
-        return merge(
-            topk_idxs, topk_scores, topk_lens, self.index_topk,
-            self.topk_idxs_buf, self.topk_lens_buf,
-        )
-
-    def _select_mma(
-        self,
-        q: torch.Tensor,
-        weights: torch.Tensor,
-        positions: torch.Tensor,
-        md: V41AttentionMetadata,
-        index_k: torch.Tensor,
-        num_tokens: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Score on the MMA units against a dense row, then radix top-k.
-
-        The fused kernel scores at 1.5 TFLOPS against this device's 11.2 TFLOPS
-        fp32 FMA ceiling, and the shape is the reason: it holds q in shared
-        memory and broadcasts it, so every FMA needs a companion shared-memory
-        read and half the issue slots go to loads. ``mqa_logits`` computes the
-        same ReLU-weighted head sum out of a tensor-core GEMM at 133 TFLOPS.
-
-        What the fused kernel buys with that rate is a footprint -- it keeps a
-        running top-k per token and never materialises a score row, which at 128k
-        would be seq_len**2. Here the row exists but the token axis is split to a
-        byte budget, so the peak allocation is a constant rather than a function
-        of context.
-
-        Scoring every group on every rank also retires the cross-rank merge. The
-        ranks already all-gather q, so each one holds all 32 heads and can select
-        independently; ``ds4_v41_merge_topk_out`` (2.6 ms a call at 8k tokens) and
-        its three all-gathers disappear with it.
-        """
-        dev = q.device
-        ratio = self.compress_ratio
-        block = md.block_size
-        seq_cpu, qsl_cpu = md.seq_lens_cpu, md.query_start_loc_cpu
-        max_seq = int(seq_cpu[: md.num_reqs].max())
-
-        # The stock causal mask is `col <= i + (kv_len - q_len)`: slope 1 in the
-        # token domain. A compressed layer needs slope 1/ratio, which no pair of
-        # seqlen arrays can express, so the mask is left a superset and the exact
-        # bound is applied by `visible` in the selection below. The widened mask
-        # reaches pages the compressed block table does not list, so pad it with
-        # one it does -- those columns score against the wrong key and are cut
-        # before anything reads them.
-        pages = (max_seq + block - 1) // block
-        bt = md.block_table
-        if bt.size(1) < pages:
-            bt = torch.cat(
-                [bt, bt[:, :1].expand(bt.size(0), pages - bt.size(1))], dim=1
-            ).contiguous()
-        width = pages * block
-
-        # Compressed-domain count of groups this token may see. A prefill token's
-        # position is always inside its own sequence, so the fused kernel's second
-        # clamp against seq_lens is redundant here.
-        visible = (positions.to(torch.int32) + 1) // ratio
-        topk = self.index_topk
-        idxs = self.topk_idxs_buf[:num_tokens]
-        zeros = torch.zeros(num_tokens, dtype=torch.int32, device=dev)
-
-        rows = max(1, min(num_tokens, _MMA_INDEX_BUDGET // (width * 2)))
-        chunks = _mma_index_chunks(qsl_cpu, seq_cpu, md.num_reqs, rows)
-        scratch = torch.empty((rows, width), dtype=torch.bfloat16, device=dev)
-        for t0, t1, cu_q, cu_kv, reqs in chunks:
-            n = t1 - t0
-            # One block-table row per span, not per request: the scoring kernel
-            # indexes it by its own batch index.
-            rows_bt = bt[torch.tensor(reqs, dtype=torch.int32, device=dev)]
-            ixfops.dsa_indexer_mqa_logits_with_blocks_bf16(
-                q[t0:t1].contiguous(),
-                torch.tensor(cu_q, dtype=torch.int32, device=dev),
-                torch.tensor(cu_kv, dtype=torch.int32, device=dev),
-                index_k,
-                rows_bt,
-                weights[t0:t1].contiguous(),
-                scratch[:n],
-                max(cu_q[i + 1] - cu_q[i] for i in range(len(cu_q) - 1)),
-                max(cu_kv[i + 1] - cu_kv[i] for i in range(len(cu_kv) - 1)),
-                width,
-            )
-            ixfops.dsa_update_topk_indices(
-                scratch[:n], zeros[:n], visible[t0:t1], topk, idxs[t0:t1]
-            )
-        return idxs, torch.clamp(visible, max=topk, out=self.topk_lens_buf[:num_tokens])
+        return q, None, indexer_weights
 
 
 class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
@@ -683,161 +378,348 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
     ``kv_source_layer_ids`` do; the rest read that cache.
     """
 
+    backend_cls: ClassVar[type[AttentionBackend]] = IluDeepseekV4FlashMLABackend
+    swa_backend_cls: ClassVar[type[AttentionBackend]] = (
+        IluDeepseekSparseSWAFlashMLABackend
+    )
+
     def __init__(
         self,
         vllm_config: VllmConfig,
         prefix: str,
         topk_indices_buffer: torch.Tensor | None = None,
+        aux_stream_list: list[torch.cuda.Stream] | None = None,
+        candidate_block_buffer: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
         dtype = vllm_config.model_config.dtype
+
+        config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
+        cache_config = vllm_config.cache_config
         tp_size = get_tensor_model_parallel_world_size()
         layer_id = extract_layer_index(prefix)
-
         self.layer_id = layer_id
+
+        self.prefix = prefix  # Alias for compatibility with compressor
+        self.hidden_size = config.hidden_size
         self.n_heads = config.num_attention_heads
-        self.n_local_heads = config.num_attention_heads // tp_size
+        assert self.n_heads % tp_size == 0
+        self.n_local_heads = self.n_heads // tp_size
         self.q_lora_rank = config.q_lora_rank
         self.o_lora_rank = config.o_lora_rank
         self.head_dim = config.head_dim
-        self.rope_head_dim = config.rope_head_dim
+        self.rope_head_dim = config.qk_rope_head_dim
+        self.nope_head_dim = self.head_dim - self.rope_head_dim
         self.n_groups = config.o_groups
         self.n_local_groups = self.n_groups // tp_size
-        self.window_size = config.window_size
-        self.compress_ratio = config.compress_ratios[layer_id]
-        self.softmax_scale = self.head_dim**-0.5
-        self.max_seq_len = vllm_config.model_config.max_model_len
-        self.eps = config.rms_norm_eps
+        self.window_size = config.sliding_window
+        # ---- v4.1 sparse-attention topology ----
+        # compress_ratios has one entry per layer (MTP layers included):
+        # 0 = pure sliding window, 1 = full-length compressed cache,
+        # 2 = ratio-2 compressed. Compressors and compressed-KV caches live
+        # only on ``kv_source_layer_ids``; indexers only on
+        # ``index_source_layer_ids``. Consumers reuse the most recently
+        # published source below them.
+        compress_ratios = getattr(config, "compress_ratios", None)
+        if compress_ratios is not None and layer_id < len(compress_ratios):
+            self.compress_ratio = int(compress_ratios[layer_id])
+        else:
+            # MTP layers past the configured list are pure sliding-window.
+            self.compress_ratio = 0
+        if self.compress_ratio not in (0, 1, 2):
+            raise ValueError(
+                f"DeepSeek V4.1 layer {layer_id} has compress_ratio="
+                f"{self.compress_ratio}; only 0 (sliding window), 1 and 2 are "
+                "supported."
+            )
+        self.kv_source_layers = tuple(
+            getattr(config, "kv_source_layer_ids", None) or ()
+        )
+        self.index_source_layers = tuple(
+            getattr(config, "index_source_layer_ids", None) or ()
+        )
+        self.candidate_source_layer = getattr(config, "candidate_source_layer_id", -1)
+        self.candidate_topk_blocks = getattr(config, "candidate_topk_blocks", 0)
+        self.candidate_block_size = getattr(config, "candidate_block_size", 0)
 
         is_backbone = layer_id < config.num_hidden_layers
-        self.is_kv_source = is_backbone and layer_id in config.kv_source_layer_ids
-        self.is_index_source = is_backbone and layer_id in config.index_source_layer_ids
-        self.compressor = None
-        self.indexer = None
-        # Top-k selections cross layers through buffers the model preallocates
-        # and every layer writes in place. The V4 layer plumbing already passes
-        # the indices one down; ``bind_index_buffers`` fills in its companions.
-        self.topk_idxs_buf = topk_indices_buffer
-        self.topk_lens_buf: torch.Tensor | None = None
+        self.is_kv_source = is_backbone and layer_id in self.kv_source_layers
+        self.is_index_source = is_backbone and layer_id in self.index_source_layers
+        if self.compress_ratio > 0:
+            if not self.kv_source_layers or not self.index_source_layers:
+                raise ValueError(
+                    "DeepSeek V4.1 requires kv_source_layer_ids / "
+                    "index_source_layer_ids in the config for compressed "
+                    f"layers (layer {layer_id} has "
+                    f"compress_ratio={self.compress_ratio})."
+                )
+            self.kv_source_layer_id = max(
+                s for s in self.kv_source_layers if s <= layer_id
+            )
+            self.index_source_layer_id = max(
+                s for s in self.index_source_layers if s <= layer_id
+            )
+        else:
+            self.kv_source_layer_id = None
+            self.index_source_layer_id = None
+        self.eps = config.rms_norm_eps
+        self.scale = self.head_dim**-0.5
 
+        # Sink padded to the same head count, initialized to -inf (no sink
+        # effect). Weight loading fills the first n_local_heads slots.
         self.attn_sink = nn.Parameter(
-            torch.empty(self.n_local_heads, dtype=torch.float32), requires_grad=False
+            torch.full((self.n_local_heads,), -float("inf"), dtype=torch.float32),
+            requires_grad=False,
         )
-        self.attn_sink.weight_loader = self._load_attn_sink
 
-        quant_config = vllm_config.quant_config
-        # ``wq_a`` and ``wkv`` both read the layer's normed hidden state, so as two
-        # linears they walk the same activation twice -- and under fp8 they also
-        # quantize it twice. Merged (V4's ``fused_wqa_wkv``) that becomes one pass
-        # and, at decode, one launch instead of two on each side.
         self.fused_wqa_wkv = MergedColumnParallelLinear(
-            config.hidden_size, [self.q_lora_rank, self.head_dim], bias=False,
-            quant_config=quant_config, prefix=f"{prefix}.fused_wqa_wkv",
-            disable_tp=True,  # replicated, like the two linears it replaces
+            self.hidden_size,
+            [self.q_lora_rank, self.head_dim],
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.fused_wqa_wkv",
+            disable_tp=True,  # fused ReplicatedLinear
         )
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
         self.wq_b = ColumnParallelLinear(
-            self.q_lora_rank, self.n_heads * self.head_dim, bias=False,
-            quant_config=quant_config, prefix=f"{prefix}.wq_b",
+            self.q_lora_rank,
+            self.n_heads * self.head_dim,
+            bias=False,
+            quant_config=quant_config,
+            return_bias=False,
+            prefix=f"{prefix}.wq_b",
         )
+
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
         self.wo_a = ColumnParallelLinear(
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * self.o_lora_rank,
-            bias=False, quant_config=quant_config, prefix=f"{prefix}.wo_a",
+            bias=False,
+            quant_config=quant_config,
+            return_bias=False,
+            prefix=f"{prefix}.wo_a",
+        )
+        self._o_proj_block_size = (
+            32 if getattr(self.wo_a, "weight_block_size", None) == [1, 32] else 128
         )
         self.wo_b = RowParallelLinear(
-            self.n_groups * self.o_lora_rank, config.hidden_size, bias=False,
-            quant_config=quant_config, prefix=f"{prefix}.wo_b",
+            self.n_groups * self.o_lora_rank,
+            self.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            return_bias=False,
+            prefix=f"{prefix}.wo_b",
         )
+        # Initialize rotary embedding before the indexer/compressor consume it.
+        self.rotary_emb = build_deepseek_v4_rope(
+            config,
+            head_dim=self.head_dim,
+            rope_head_dim=self.rope_head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            compress_ratio=self.compress_ratio,
+        )
+        self.indexer_rotary_emb = self.rotary_emb
+        self.topk_indices_buffer = topk_indices_buffer
+        self.candidate_block_buffer = candidate_block_buffer
 
-        if self.compress_ratio:
-            original_seq_len = config.original_seq_len
-            rope_theta = config.compress_rope_theta
-        else:
-            original_seq_len, rope_theta = 0, config.rope_theta
-        self._freqs_key = (
-            self.rope_head_dim, self.max_seq_len, original_seq_len, rope_theta,
-            config.rope_factor, config.beta_fast, config.beta_slow,
-        )
-        self._cos_sin: torch.Tensor | None = None
-
-        self.window_cache = V41WindowKVCache(
-            head_size=self.head_dim, dtype=dtype, window_size=self.window_size,
-            block_size=BLOCK_SIZE, prefix=f"{prefix}.window_kv",
-        )
-        # ``compress_ratio > 0`` on a non-source layer means it reads a cache some
-        # earlier layer owns. Resolve whose here, while the layer list is still
-        # construction-time knowledge, and keep only the prefix: registering the
-        # same cache module under two layers would put it in the module tree twice.
-        sfc = vllm_config.compilation_config.static_forward_context
-        self._static_forward_context = sfc
-        if prefix in sfc:
+        # Register with compilation context for metadata lookup. Done before
+        # indexer/compressor creation so consumers can resolve their source
+        # layers through it.
+        compilation_config = vllm_config.compilation_config
+        if prefix and prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
-        sfc[prefix] = self
-
-        # A kv-source layer owns the compressed-KV cache itself: the spec and the
-        # handle live on the attention, so a borrower resolves the source layer
-        # rather than a cache module hanging off it.
-        self.kv_dtype = dtype
+        if prefix:
+            compilation_config.static_forward_context[prefix] = self
         self.kv_cache = torch.tensor([])
-        self._compress_cache_prefix = ""
-        if self.is_kv_source:
-            if BLOCK_SIZE % self.compress_ratio:
-                raise ValueError(
-                    f"block_size {BLOCK_SIZE} must be a multiple of compress_ratio "
-                    f"{self.compress_ratio}, or a page would hold a fractional row "
-                    f"(layer {prefix})"
-                )
-            self._compress_cache_prefix = prefix
-            self.compressor = IluDeepseekV41Compressor(
-                config, self.compress_ratio, prefix=f"{prefix}.compressor",
-                k_cache_prefix=self._compress_cache_prefix,
-            )
-        elif self.compress_ratio:
-            self._compress_cache_prefix = self._source_prefix(
-                prefix, config.kv_source_layer_ids, ""
-            )
+        self._static_forward_context = compilation_config.static_forward_context
+
+        self.indexer = None
         if self.is_index_source:
-            # Index keys are written from a compressor latent, so their cache
-            # lives on the layers that are both a kv source and an index source.
-            key_owners = sorted(
-                set(config.kv_source_layer_ids) & set(config.index_source_layer_ids)
-            )
+            index_k_cache: IluDeepseekV41IndexerCache | None
+            # Index K cache: owned only by kv-source layers (their indexer has
+            # wk/k_norm); non-owning index sources share the K cache of the
+            # latest kv source below them (its indexer produces the keys).
+            if self.is_kv_source:
+                index_k_cache = IluDeepseekV41IndexerCache(
+                    head_dim=_indexer_k_cache_head_dim(config.index_head_dim, False),
+                    dtype=torch.bfloat16,
+                    prefix=f"{prefix}.indexer.k_cache",
+                    cache_config=cache_config,
+                    compress_ratio=self.compress_ratio,
+                )
+            else:
+                assert self.kv_source_layer_id is not None
+                k_cache_prefix = (
+                    f"{_replace_layer_index(prefix, self.kv_source_layer_id)}"
+                    ".indexer.k_cache"
+                )
+                index_k_cache = self._static_forward_context.get(k_cache_prefix)
+                if index_k_cache is None:
+                    raise NotImplementedError(
+                        f"Indexer K cache source {k_cache_prefix} not found on "
+                        "this rank; PP splits inside a v4.1 kv-sharing group "
+                        "are not supported."
+                    )
+            is_candidate_source = layer_id == self.candidate_source_layer
+            uses_candidates = 0 <= self.candidate_source_layer < layer_id
             self.indexer = IluDeepseekV41Indexer(
-                config, self.layer_id, self.compress_ratio,
-                quant_config=vllm_config.quant_config, prefix=f"{prefix}.indexer",
-                owns_k=layer_id in key_owners,
-                key_cache_prefix=self._source_prefix(
-                    prefix, key_owners, "indexer.index_k"
+                vllm_config,
+                config=config,
+                hidden_size=self.hidden_size,
+                q_lora_rank=self.q_lora_rank,
+                quant_config=quant_config,
+                cache_config=cache_config,
+                topk_indices_buffer=topk_indices_buffer,
+                compress_ratio=self.compress_ratio,
+                prefix=f"{prefix}.indexer",
+                owns_k=self.is_kv_source,
+                k_cache=index_k_cache,
+                main_head_dim=self.head_dim,
+                candidate_block_buffer=(
+                    candidate_block_buffer
+                    if (is_candidate_source or uses_candidates)
+                    else None
                 ),
-                static_forward_context=sfc,
+                candidate_block_size=self.candidate_block_size,
+                candidate_write=is_candidate_source,
             )
 
-    def _source_prefix(
-        self, prefix: str, source_layer_ids, suffix: str
-    ) -> str:
-        """Prefix of the nearest source layer at or below this one.
-
-        The caches are published forward, so the source is the largest source
-        index that does not exceed this layer's. It is always constructed before
-        this layer, which is what makes the lookup resolvable here.
-        """
-        sources = [i for i in sorted(source_layer_ids) if i <= self.layer_id]
-        assert sources, (
-            f"layer {self.layer_id} reads {suffix} but no source layer precedes it"
+        assert cache_config is not None, "DeepseekV4 attention requires cache_config"
+        # ---- Attention / KV-cache setup ----
+        self.max_num_batched_tokens = (
+            vllm_config.scheduler_config.max_num_batched_tokens
         )
-        src = _source_layer_prefix(prefix, sources[-1])
-        if suffix:
-            src += f".{suffix}"
-        # This layer being its own source means the cache is built a few lines
-        # below, so there is nothing to look up yet.
-        if sources[-1] != self.layer_id and src not in self._static_forward_context:
-            raise NotImplementedError(
-                f"layer {self.layer_id} reads {src!r}, which is not on this rank"
+        self.max_model_len = vllm_config.model_config.max_model_len
+
+        # Resolve the kv-cache dtype from this backend's block format. The same
+        # resolution drives the SWA cache tensor dtype below.
+        self.kv_cache_dtype, self.kv_cache_torch_dtype = "fp8", torch.uint8
+        self.kv_mxfp8 = False
+        self.swa_bytes_per_token = 528 if self.kv_mxfp8 else 584
+        # nvfp4_ds_mla keeps the MXFP8 sliding-window record and stores the
+        # compressed cache as NVFP4 (256 B of e2m1 pairs + 32 e4m3 scales).
+        self.compressed_bytes_per_token = (
+            288 if self.kv_cache_dtype == "nvfp4_ds_mla" else self.swa_bytes_per_token
+        )
+        # One alignment for every page in the block: the block stride is their
+        # sum, and 512 satisfies both TMA strides in play (512 for the V4.1
+        # fp8 record, 256 for NVFP4).
+        self.kv_page_alignment = 512 if self.kv_mxfp8 else 576
+        if self.kv_cache_dtype == "nvfp4_ds_mla" and not self.kv_mxfp8:
+            raise ValueError(
+                "nvfp4_ds_mla needs the V4.1 KV records, which FlashMLA "
+                "decodes only on SM100."
             )
-        return src
+
+        swa_bounded_replay = getattr(cache_config, "swa_bounded_replay", False)
+        if swa_bounded_replay and not vllm_config.use_v2_model_runner:
+            logger.warning_once(
+                "SWA bounded replay needs model runner V2 (only it skips the "
+                "paged-KV writes of replayed tokens); the sliding-window cache "
+                "takes part in prefix caching instead."
+            )
+            swa_bounded_replay = False
+        if (
+            swa_bounded_replay
+            and vllm_config.parallel_config.prefill_context_parallel_size > 1
+        ):
+            logger.warning_once(
+                "SWA bounded replay is off under prefill context parallelism "
+                "(the replayed tokens' slot padding knows the rank-local batch "
+                "only); the sliding-window cache takes part in prefix caching "
+                "instead."
+            )
+            swa_bounded_replay = False
+        self.swa_cache_layer = IluDeepseekV4SWACache(
+            head_dim=self.head_dim,
+            window_size=self.window_size,
+            dtype=self.kv_cache_torch_dtype,
+            prefix=f"{prefix}.swa_cache",
+            cache_config=cache_config,
+            backend_cls=self.swa_backend_cls,
+            block_size=cache_config.block_size,
+            packed_bytes_per_token=self.swa_bytes_per_token,
+            packed_page_alignment=self.kv_page_alignment,
+            bounded_replay=swa_bounded_replay,
+        )
+
+        # The attention layer itself was already registered with the
+        # compilation context above (before indexer/compressor creation).
+
+        # Compressors live only on kv-source layers; consumers read the
+        # source's compressed cache through the forward context.
+        self.compressor = None
+        if self.is_kv_source:
+            self.compressor = IluDeepseekCompressor(
+                vllm_config=vllm_config,
+                compress_ratio=self.compress_ratio,
+                hidden_size=self.hidden_size,
+                head_dim=self.head_dim,
+                rotate=True,
+                prefix=f"{prefix}.compressor",
+                k_cache_prefix=self.prefix,
+            )
+        # Prefix of the attention layer owning this layer's compressed KV
+        # cache (self for kv sources).
+        if self.compress_ratio > 0:
+            assert self.kv_source_layer_id is not None
+            self.compressed_cache_prefix: str | None = _replace_layer_index(
+                prefix, self.kv_source_layer_id
+            )
+            if (
+                not self.is_kv_source
+                and self.compressed_cache_prefix not in self._static_forward_context
+            ):
+                raise NotImplementedError(
+                    f"Compressed-KV source {self.compressed_cache_prefix} not "
+                    "found on this rank; PP splits inside a v4.1 kv-sharing "
+                    "group are not supported."
+                )
+        else:
+            self.compressed_cache_prefix = None
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        # Only kv-source layers own a compressed-KV cache: consumers read the
+        # source's through the forward context and cr==0 layers are pure SWA.
+        # The window cache is registered separately as IluDeepseekV4SWACache.
+        if not self.is_kv_source:
+            return None
+        return MLAAttentionSpec(
+            block_size=vllm_config.cache_config.block_size,
+            num_kv_heads=1,
+            head_size=self.head_dim,
+            dtype=torch.uint8,
+            compress_ratio=self.compress_ratio,
+            cache_dtype_str="fp8_ds_mla",
+            model_version="deepseek_v4",
+            alignment=64,
+            kv_quant_mode=get_kv_quant_mode("fp8_ds_mla"),
+        )
+
+    def get_attn_backend(self) -> type[AttentionBackend]:
+        return self.backend_cls
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        self.kv_cache = kv_cache.squeeze(1)
+
+    def _compressed_kv_cache(self) -> torch.Tensor:
+        """The compressed-KV cache tensor of this layer's kv source."""
+        if self.is_kv_source:
+            return self.kv_cache
+        assert self.compressed_cache_prefix is not None
+        source = self._static_forward_context[self.compressed_cache_prefix]
+        return source.kv_cache
+
+    @property
+    def cos_sin(self) -> torch.Tensor:
+        return self.rotary_emb.cos_sin_cache
+
+    def _load_attn_sink(self, param: nn.Parameter, loaded: torch.Tensor) -> None:
+        rank = get_tensor_model_parallel_rank()
+        shard = loaded.narrow(0, rank * self.n_local_heads, self.n_local_heads)
+        param.data.copy_(shard.to(param.dtype))
 
     def bind_index_buffers(
         self,
@@ -845,85 +727,26 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         candidate_idxs: torch.Tensor | None,
         candidate_lens: torch.Tensor | None,
     ) -> None:
-        """Hand this layer the shared selection buffers the model preallocated.
-
-        Called once after construction, before any forward. The indices buffer
-        already arrived through the V4 layer plumbing; these are the companions
-        our kernels need, which take an explicit length instead of reading it off
-        a padded row.
-        """
-        self.topk_lens_buf = topk_lens
-        if self.indexer is not None:
-            self.indexer.topk_idxs_buf = self.topk_idxs_buf
-            self.indexer.topk_lens_buf = topk_lens
-            self.indexer.candidate_idxs_buf = candidate_idxs
-            self.indexer.candidate_lens_buf = candidate_lens
-
-    def _compressed_kv(self) -> tuple[torch.Tensor, V41AttentionMetadata]:
-        """The compressed KV cache this layer attends over, and its metadata."""
-        cache = self._static_forward_context[self._compress_cache_prefix]
-        return cache.kv_cache, get_forward_context().attn_metadata[
-            self._compress_cache_prefix
-        ]
-
-    @property
-    def cos_sin(self) -> torch.Tensor:
-        if self._cos_sin is None:
-            self._cos_sin = get_shared_cos_sin(self._freqs_key, self.attn_sink.device)
-        return self._cos_sin
-
-    def _load_attn_sink(self, param: nn.Parameter, loaded: torch.Tensor) -> None:
-        rank = get_tensor_model_parallel_rank()
-        shard = loaded.narrow(0, rank * self.n_local_heads, self.n_local_heads)
-        param.data.copy_(shard.to(param.dtype))
+        """Take the selection buffers allocated after the layer list exists."""
+        self.topk_lens_buffer = topk_lens
+        self.candidate_idxs_buffer = candidate_idxs
+        self.candidate_lens_buffer = candidate_lens
+        indexer = self.indexer
+        uses_candidates = self.layer_id == self.candidate_source_layer or (
+            0 <= self.candidate_source_layer < self.layer_id
+        )
+        if indexer is not None:
+            indexer.topk_lens_buffer = topk_lens
+            if uses_candidates and candidate_idxs is not None:
+                indexer.indexer_op.candidate_blocks = candidate_idxs
 
     def _o_proj(self, o: torch.Tensor) -> torch.Tensor:
-        """Grouped output projection: ``wo_a`` is block-diagonal over groups.
-
-        V4 runs this as ``ds4_inv_rope_fp8_quant`` + ``fp8_per_channel_einsum`` over an
-        fp8 ``wo_a``, which fits V4.1's geometry exactly (G=1, D=1024, R=4096 at TP8) and
-        was measured here: decode moved 47.6 -> 46.3..47.6 ms, i.e. inside run-to-run
-        noise, because the einsum only saves 4 MiB of weight traffic per layer. GSM8K over
-        two runs came out 96.59% / 96.97% against 97.27% bf16 -- 0.9 sigma, so not proven,
-        but consistently on the low side. The likely cause is that
-        ``ds4_inv_rope_fp8_quant`` emits one scale per (group, token), i.e. 4096 values
-        spanning 8 heads share a scale, where the other dense layers quantize RMSNorm
-        output that is uniformly scaled by construction. No measurable speedup is not worth
-        that, so this stays bf16.
-        """
-        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        z = torch.einsum("bsgd,grd->bsgr", o.to(wo_a.dtype), wo_a)
-        return self.wo_b(z.flatten(2))[0]
-
-    def _write_compressed(self, latent: torch.Tensor, md: V41AttentionMetadata) -> None:
-        rope_quant_insert(
-            latent,
-            md.positions,
-            self.cos_sin,
-            self.kv_cache,
-            md.slot_mapping,
-            self.compress_ratio,
-            block_size=md.block_size,
-            block_table=md.block_table,
-            token_to_req_indices=md.token_to_req_indices,
-        )
-
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
-        # Only kv-source layers own one: the rest read the source's through the
-        # forward context, and cr == 0 layers are pure sliding-window attention.
-        # The window cache stays a module of its own.
-        if not self.is_kv_source:
-            return None
-        return MLAAttentionSpec(
-            block_size=BLOCK_SIZE,
-            num_kv_heads=1,
-            head_size=self.head_dim,
-            dtype=self.kv_dtype,
-            compress_ratio=self.compress_ratio,
-        )
-
-    def get_attn_backend(self) -> type[AttentionBackend]:
-        return V41CompressorBackend
+        """Grouped output projection. One group per rank uses the fp8 linear."""
+        if self.n_local_groups != 1:
+            wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+            z = torch.einsum("bsgd,grd->bsgr", o.to(wo_a.dtype), wo_a)
+            return self.wo_b(z.flatten(2))
+        return self.wo_b(self.wo_a(o.flatten(0, -2)))
 
     def forward(
         self,
@@ -932,125 +755,387 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del llama_4_scaling
-        md_by_layer = get_forward_context().attn_metadata
-        profiling = not isinstance(md_by_layer, dict)
-        md: V41AttentionMetadata | None = (
-            None if profiling else md_by_layer[self.window_cache.prefix]
+        qr_kv, kv_score, indexer_weights = self._run_parallel_input_projections(
+            hidden_states
         )
-        spans = [] if md is None else _seq_spans(md)
-        x = hidden_states
-        num_tokens = x.size(0)
-        pos32 = positions[:num_tokens].to(torch.int32)
+        qr, kv = self._split_qkv_and_norm(qr_kv)
+        attn_out = torch.empty(
+            (hidden_states.shape[0], self.n_local_heads, self.head_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        self._prepare_and_attn(
+            hidden_states, qr, kv, kv_score, indexer_weights, positions, attn_out
+        )
+        num_tokens = hidden_states.shape[0]
+        apply_rope(attn_out.unsqueeze(0), positions, self.cos_sin, inverse=True)
+        return self._o_proj(
+            attn_out.view(1, num_tokens, self.n_local_groups, -1)
+        ).view(num_tokens, -1)
 
-        if self.indexer is not None and self.indexer.cos_sin is None:
-            self.indexer.cos_sin = self.cos_sin
+    def _run_parallel_input_projections(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """The layer's input GEMMs over the same hidden state.
 
-        qr_kv = self.fused_wqa_wkv(x)[0]
+        The v4.1 indexer derives K from the kv-source compressor's latent, so
+        unlike v4.0 there is no indexer K GEMM over hidden_states here.
+
+        Official fans these out over aux streams, putting the heaviest
+        (``fused_wqa_wkv``) on the default one. They run in sequence here: this
+        platform has no aux-stream path wired, and the prefill trace already
+        sits at 88-91% GPU occupancy, so there is little to overlap into.
+        """
+        kv_score = None
+        indexer_weights = None
+
+        if self.compressor is not None:
+            # Local ref so the closure keeps a non-None type.
+            compressor = self.compressor
+            kv_score = torch.mm(
+                hidden_states,
+                compressor.fused_wkv_wgate.weight.T,
+                out_dtype=torch.float32,
+            )
+
+        if self.indexer is not None:
+            # ReplicatedLinear returns (output, bias); bias is None.
+            indexer_weights, _ = self.indexer.weights_proj(hidden_states)
+
+        qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+        return qr_kv, kv_score, indexer_weights
+
+    def _split_qkv_and_norm(
+        self, qr_kv: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split the fused q-lora / kv projection and RMSNorm both halves."""
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
-
-        qr, kv = ixfops.rms_norm_qk(
+        return ixfops.rms_norm_qk(
             qr, kv, self.q_norm.weight, self.kv_norm.weight, self.eps
         )
 
-        q = self.wq_b(qr)[0].unflatten(-1, (self.n_local_heads, self.head_dim))
+    def _wq_b_proj(self, qr: torch.Tensor) -> torch.Tensor:
+        return self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
 
-        if profiling:
-            o = q.new_zeros(q.shape)
-            return self._o_proj(
-                o.view(1, num_tokens, self.n_local_groups, -1)
-            ).view(num_tokens, -1)
-
-        # One launch for what was four: RoPE on q, then RoPE, fp8 qdq and the
-        # window-cache insert on kv. The kv half never round-trips to memory
-        # between the three steps, which is the point.
-        ixfops.v41_qkv_rope_qdq_insert(
-            q,
-            self.window_cache.kv_cache,
-            kv,
-            md.slot_mapping,
-            pos32,
-            self.cos_sin,
-            FP8_BLOCK_SIZE,
-            "fp8_pow2",
-        )
-
-        if self.compress_ratio:
-            if self.is_kv_source:
-                latent = self.compressor(x)
-                if latent is not None:
-                    if self.is_index_source:
-                        self.indexer.publish_keys(latent)
-                    self._write_compressed(
-                        latent,
-                        get_forward_context().attn_metadata[
-                            self._compress_cache_prefix
-                        ],
-                    )
-            if self.is_index_source:
-                group_idxs, group_lens = self.indexer.score_and_select(x, qr, pos32)
-            else:
-                # Reuse the selection of the nearest index source above.
-                group_idxs = self.topk_idxs_buf[:num_tokens]
-                group_lens = self.topk_lens_buf[:num_tokens]
-        else:
-            group_idxs = group_lens = None
-
-        o = self._attend(q, kv, md, spans, group_idxs, group_lens, pos32)
-        apply_rope(o.unsqueeze(0), pos32, self.cos_sin, inverse=True)
-        return self._o_proj(
-            o.view(1, num_tokens, self.n_local_groups, -1)
-        ).view(num_tokens, -1)
-
-    def _attend(
-        self, q, window_kv, md: V41AttentionMetadata, spans, group_idxs, group_lens, positions
+    def _fused_qnorm_rope_kv_insert(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        attn_metadata: (
+            dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None
+        ),
     ) -> torch.Tensor:
-        nd = md.num_decode_tokens
-        assert sum(t1 - t0 for _r, t0, t1, _sl in spans[: md.num_decodes]) == nd, (
-            f"decode span boundary disagrees with num_decode_tokens: {nd} expected, "
-            f"spans={[(r, t0, t1) for r, t0, t1, _ in spans]}, num_decodes={md.num_decodes}"
+        """RoPE q in place and publish kv as a packed fp8 window record."""
+        if not isinstance(attn_metadata, dict):
+            return q
+
+        swa_metadata = cast(
+            "DeepseekSparseSWAMetadata | None",
+            attn_metadata.get(self.swa_cache_layer.prefix),
         )
-        cache, cache_md = self._compressed_kv() if self.compress_ratio else (None, None)
-        outs = []
+        assert swa_metadata is not None
+        ixfops.v41_qkv_rope_fp8_insert(
+            q,
+            self.swa_cache_layer.kv_cache,
+            kv,
+            swa_metadata.slot_mapping,
+            positions,
+            self.cos_sin,
+        )
+        return q
 
-        if nd:
-            outs.append(
-                decode_sparse_mla(
-                    q[:nd].contiguous(),
-                    self.window_cache.kv_cache,
-                    md,
-                    positions[:nd],
-                    self.window_size,
-                    self.attn_sink,
-                    self.softmax_scale,
-                    compress_ratio=self.compress_ratio,
-                    compress_cache=cache,
-                    compress_md=cache_md,
-                    group_idxs=None if group_idxs is None else group_idxs[:nd],
-                    group_lens=None if group_lens is None else group_lens[:nd],
-                )
+    def _prepare_and_attn(
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        kv: torch.Tensor,
+        kv_score: torch.Tensor | None,
+        indexer_weights: torch.Tensor | None,
+        positions: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        """Attention input preparation followed by the sparse indexer and MLA.
+
+        Q preparation and the KV insert precede compression; once the latent is
+        ready the main-cache insert and the indexer K insert both run off it,
+        and both finish before sparse attention reads either cache.
+        """
+        attn_metadata = get_forward_context().attn_metadata
+        indexer = self.indexer
+        compressor = self.compressor
+
+        index_q: torch.Tensor | None = None
+        index_weights_out: torch.Tensor | None = None
+        latent: torch.Tensor | None = None
+
+        if compressor is not None:
+            latent = compressor(kv_score, positions)
+            compressor.insert_cache(latent, positions, self.rotary_emb)
+
+        q = self._wq_b_proj(qr)
+        self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+
+        index_q, index_weights_out = None, None
+
+        if indexer is not None:
+            if getattr(indexer, "cos_sin", None) is None:
+                indexer.cos_sin = self.cos_sin
+            index_q, _, index_weights_out = indexer(
+                qr,
+                latent,
+                indexer_weights,
+                positions,
+                self.indexer_rotary_emb,
             )
 
-        if md.num_prefills:
-            pre_spans = [
-                (r, t0 - nd, t1 - nd, sl) for r, t0, t1, sl in spans[md.num_decodes :]
-            ]
-            outs.append(
-                prefill_attn(
-                    q[nd:].contiguous(),
-                    window_kv[nd:],
-                    cache,
-                    cache_md,
-                    pre_spans,
-                    self.compress_ratio or 1,
-                    None if group_idxs is None else group_idxs[nd:],
-                    None if group_lens is None else group_lens[nd:],
-                    positions[nd:],
-                    self.window_size,
-                    self.attn_sink,
-                    self.softmax_scale,
-                    window_cache=self.window_cache.kv_cache,
-                    window_md=md,
-                )
+        self._sparse_indexer_and_attn(
+            hidden_states,
+            index_q,
+            index_weights_out,
+            q,
+            kv,
+            positions,
+            out,
+        )
+
+    def forward_mqa(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+
+        if attn_metadata is None:
+            output.zero_()
+            return
+
+        assert isinstance(attn_metadata, dict)
+        flashmla_metadata = cast(
+            IluDeepseekV4FlashMLAMetadata | None,
+            attn_metadata.get(self.compressed_cache_prefix)
+            if self.compressed_cache_prefix is not None
+            else None,
+        )
+        swa_metadata = cast(
+            "DeepseekSparseSWAMetadata | None",
+            attn_metadata.get(self.swa_cache_layer.prefix),
+        )
+        assert swa_metadata is not None
+        swa_only = self.compress_ratio == 0
+        self_kv_cache = None if swa_only else self._compressed_kv_cache()
+        swa_kv_cache = self.swa_cache_layer.kv_cache
+
+        num_decodes = swa_metadata.num_decodes
+        num_prefills = swa_metadata.num_prefills
+        num_decode_tokens = swa_metadata.num_decode_tokens
+
+        if num_prefills > 0:
+            prefill_q = q[num_decode_tokens:]
+            prefill_out = output[num_decode_tokens:]
+
+            self._forward_prefill(
+                q=prefill_q,
+                positions=positions[num_decode_tokens:],
+                compressed_k_cache=self_kv_cache,
+                swa_k_cache=swa_kv_cache,
+                output=prefill_out,
+                attn_metadata=flashmla_metadata if not swa_only else None,
+                swa_metadata=swa_metadata,
+            )
+        if num_decodes > 0:
+            decode_out = output[:num_decode_tokens]
+            self._forward_decode(
+                q=q[:num_decode_tokens],
+                kv_cache=self_kv_cache,
+                positions=positions[:num_decode_tokens],
+                swa_metadata=swa_metadata,
+                attn_metadata=flashmla_metadata if not swa_only else None,
+                swa_only=swa_only,
+                output=decode_out,
             )
 
-        return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
+    def _sparse_indexer_and_attn(
+        self,
+        hidden_states: torch.Tensor,
+        index_q: torch.Tensor | None,
+        index_weights: torch.Tensor | None,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        if self.indexer is not None and index_q is not None:
+            assert index_weights is not None
+            self.indexer.indexer_op(
+                hidden_states,
+                index_q,
+                None,
+                index_weights,
+            )
+
+        self.forward_mqa(q, kv, positions, out)
+
+    def _window_indices(
+        self,
+        swa_metadata: DeepseekSparseSWAMetadata,
+        begin: int,
+        end: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """SWA slots for batch tokens ``[begin, end)``.
+
+        The builder only fills decode rows. Prefill tokens sit later in the
+        same batch, so this recomputes ``[0, end)`` and returns the slice.
+        """
+        width = self.window_size
+        buf = getattr(self, "_prefill_swa_idx", None)
+        lens = getattr(self, "_prefill_swa_lens", None)
+        if buf is None or buf.shape[0] < end:
+            n = max(end, self.max_num_batched_tokens)
+            device = swa_metadata.block_table.device
+            buf = torch.empty(n, 1, width, dtype=torch.int32, device=device)
+            lens = torch.empty(n, dtype=torch.int32, device=device)
+            self._prefill_swa_idx = buf
+            self._prefill_swa_lens = lens
+        assert swa_metadata.token_to_req_indices is not None
+        assert swa_metadata.is_valid_token is not None
+        ixfops.ds4_compute_swa_decode_indices_and_lens(
+            swa_indices=buf,
+            swa_lens=lens,
+            window_size=width,
+            query_start_loc=swa_metadata.query_start_loc,
+            seq_lens=swa_metadata.seq_lens,
+            token_to_req_indices=swa_metadata.token_to_req_indices,
+            is_valid_token=swa_metadata.is_valid_token,
+            block_table=swa_metadata.block_table,
+            block_size=swa_metadata.block_size,
+            num_decode_tokens=end,
+        )
+        return buf[begin:end], lens[begin:end]
+
+    def _sparse_fp8_mla(
+        self,
+        q: torch.Tensor,
+        swa_indices: torch.Tensor,
+        swa_lens: torch.Tensor,
+        extra_cache: torch.Tensor | None,
+        extra_indices: torch.Tensor | None,
+        extra_lens: torch.Tensor | None,
+        output: torch.Tensor,
+    ) -> None:
+        heads = q.shape[1]
+        if heads not in _PACKED_MLA_HEADS:
+            raise ValueError(
+                f"ds4_sparse_mla_fp8_decode needs h_q in {_PACKED_MLA_HEADS}, got {heads}"
+            )
+        q_packed, q_scales = ixfops.ds4_dynamic_quant_mla_q_packed_fp8(q)
+        ixfops.ds4_sparse_mla_fp8_decode(
+            q_packed,
+            q_scales,
+            self.swa_cache_layer.kv_cache,
+            _tiled_index_rows(swa_indices),
+            self.scale,
+            swa_lens,
+            self.attn_sink,
+            extra_cache,
+            None if extra_indices is None else _tiled_index_rows(extra_indices),
+            extra_lens,
+            output,
+        )
+
+    def _forward_decode(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor | None,
+        positions: torch.Tensor,
+        swa_metadata: DeepseekSparseSWAMetadata,
+        attn_metadata: IluDeepseekV4FlashMLAMetadata | None,
+        swa_only: bool,
+        output: torch.Tensor,
+    ) -> None:
+        num_decodes = swa_metadata.num_decodes
+        num_decode_tokens = swa_metadata.num_decode_tokens
+        extra_cache = None
+        extra_indices = None
+        extra_lens = None
+        if not swa_only:
+            assert attn_metadata is not None
+            assert swa_metadata.is_valid_token is not None
+            assert self.topk_indices_buffer is not None
+            block_size = attn_metadata.block_size // self.compress_ratio
+            is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
+            token_to_req = swa_metadata.token_to_req_indices
+            assert token_to_req is not None
+            extra_indices, extra_lens = ixfops.ds4_compute_global_topk_indices_and_lens(
+                self.topk_indices_buffer[:num_decode_tokens],
+                token_to_req[:num_decode_tokens],
+                attn_metadata.block_table[:num_decodes],
+                block_size,
+                is_valid,
+                positions,
+                self.compress_ratio,
+            )
+            extra_cache = kv_cache
+        assert swa_metadata.decode_swa_indices is not None
+        assert swa_metadata.decode_swa_lens is not None
+        self._sparse_fp8_mla(
+            q,
+            swa_metadata.decode_swa_indices,
+            swa_metadata.decode_swa_lens,
+            extra_cache,
+            extra_indices,
+            extra_lens,
+            output,
+        )
+
+    def _forward_prefill(
+        self,
+        q: torch.Tensor,
+        positions: torch.Tensor,
+        compressed_k_cache: torch.Tensor | None,
+        swa_k_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: IluDeepseekV4FlashMLAMetadata | None,
+        swa_metadata: DeepseekSparseSWAMetadata,
+    ) -> None:
+        del swa_k_cache
+        swa_only = self.compress_ratio == 0
+        if not swa_only and self.compress_ratio not in (1, 2):
+            raise ValueError(
+                f"Unsupported compress_ratio={self.compress_ratio}; expected 0, 1, or 2."
+            )
+
+        n0 = swa_metadata.num_decode_tokens
+        n1 = n0 + swa_metadata.num_prefill_tokens
+        swa_indices, swa_lens = self._window_indices(swa_metadata, n0, n1)
+        extra_cache = None
+        extra_indices = None
+        extra_lens = None
+        if not swa_only:
+            assert attn_metadata is not None
+            assert compressed_k_cache is not None
+            assert swa_metadata.is_valid_token is not None
+            assert swa_metadata.token_to_req_indices is not None
+            assert self.topk_indices_buffer is not None
+            extra_indices, extra_lens = ixfops.ds4_compute_global_topk_indices_and_lens(
+                self.topk_indices_buffer[n0:n1],
+                swa_metadata.token_to_req_indices[n0:n1],
+                attn_metadata.block_table,
+                attn_metadata.block_size // self.compress_ratio,
+                swa_metadata.is_valid_token[n0:n1],
+                positions,
+                self.compress_ratio,
+            )
+            extra_cache = compressed_k_cache
+        self._sparse_fp8_mla(
+            q,
+            swa_indices,
+            swa_lens,
+            extra_cache,
+            extra_indices,
+            extra_lens,
+            output,
+        )

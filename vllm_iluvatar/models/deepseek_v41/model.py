@@ -155,8 +155,8 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
     decoder_layer_cls = IluDeepseekV41DecoderLayer
 
     # Shared-expert gate_up, plus attention's wq_a/wkv (both read the same normed
-    # hidden state, so they are one GEMM). The compressor linears stay unfused:
-    # V4.1's compressor has no ``wgate`` to pair ``wkv`` with.
+    # hidden state, so they are one GEMM), plus the compressor's wkv/wgate, which
+    # both read the layer's hidden state.
     stacked_params_mapping = [
         ("gate_up_proj", "w1", 0),
         ("gate_up_proj", "w3", 1),

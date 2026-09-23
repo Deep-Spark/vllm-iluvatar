@@ -282,8 +282,15 @@ class IluDeepseekV41FP8Config(IluDeepseekV4FP8Config):
                 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
                 return UnquantizedLinearMethod()
-            # 这里wo_a量化为fp8的话，实测 GSM8K精度会下降 1个点，暂时保留 bf16
-            if FP8_ALL_DENSE and not prefix.endswith(".wo_a"):
+            # wo_a is block-diagonal over o_groups. One group per rank (TP >= 8 on
+            # this model) is an ordinary GEMM and stays fp8; fewer ranks leave
+            # several groups per rank, and that contraction reads a bf16 weight.
+            from vllm.distributed import get_tensor_model_parallel_world_size
+
+            grouped_wo_a = prefix.endswith(".wo_a") and (
+                get_tensor_model_parallel_world_size() < 8
+            )
+            if FP8_ALL_DENSE and not grouped_wo_a:
                 return IluDeepseekV41FP8LinearMethod(self)
             return IluDeepseekV41Bf16DequantLinearMethod(self)
         # RoutedExperts -> V4's MXFP4 branch; everything else -> community.

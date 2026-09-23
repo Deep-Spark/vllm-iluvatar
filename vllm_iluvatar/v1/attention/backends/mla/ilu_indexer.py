@@ -221,6 +221,9 @@ class IluDeepseekV32IndexerMetadata:
 
     decode: IluDeepSeekV32IndexerDecodeMetadata | None = None
     prefill: IluDeepseekV32IndexerPrefillMetadata | None = None
+    # Token-domain page table for the compressed index-key insert.
+    block_table: torch.Tensor | None = None
+    token_to_req_indices: torch.Tensor | None = None
 
 
 # TODO (zyongye) optimize this, this is now vibe coded
@@ -374,6 +377,11 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 dtype=torch.int64,
                 device=self.device,
             )
+        self.req_id_per_token_buffer = torch.empty(
+            (scheduler_config.max_num_batched_tokens,),
+            dtype=torch.int32,
+            device=self.device,
+        )
 
         self.offsets_buffer = torch.arange(
             next_n, device=self.device, dtype=torch.int32
@@ -959,6 +967,9 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 common_attn_metadata, num_decodes, decode_lens, num_decode_tokens
             )
 
+        token_to_req_indices = common_attn_metadata.token_to_req_indices(
+            self.req_id_per_token_buffer
+        )
         attn_metadata = IluDeepseekV32IndexerMetadata(
             seq_lens=common_attn_metadata.seq_lens,
             num_reqs=common_attn_metadata.num_reqs,
@@ -968,6 +979,8 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             query_start_loc=common_attn_metadata.query_start_loc,
             slot_mapping=slot_mapping,
             head_dim=128,
+            block_table=common_attn_metadata.block_table_tensor,
+            token_to_req_indices=token_to_req_indices,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
@@ -1034,3 +1047,13 @@ class IluDeepseekV4IndexerBackend(IluDeepseekV32IndexerBackend):
         # ref fallback（pure-PyTorch ref_dsa_indexer_mqa_logits_with_blocks），
         # 功能等价但性能更低，后续可在 ixformer 层做 native 256 支持。
         return [256]
+
+
+class IluDeepseekV41IndexerBackend(IluDeepseekV4IndexerBackend):
+    @staticmethod
+    def get_name() -> str:
+        return "ILU_DEEPSEEK_V4_INDEXER"
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        return [64, 128]

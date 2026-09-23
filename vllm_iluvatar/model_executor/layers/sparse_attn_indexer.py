@@ -30,6 +30,7 @@ def ilu_sparse_attn_indexer(
     max_model_len: int,
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
+    skip_k_cache_insert: bool = False,
 ) -> torch.Tensor:
     # attn_metadata is unavailable during dummy/profiling runs.
     assert topk_indices_buffer is not None
@@ -60,8 +61,12 @@ def ilu_sparse_attn_indexer(
     # is longer. Padding rows carry slot_mapping == -1 and are skipped in the
     # kernel (see vllm_indexer_k_cache.cu ``if (slot_idx < 0) return;``).
     num_tokens = slot_mapping.shape[0]
-    k = k[:num_tokens]
-    ops.indexer_k_cache(k, kv_cache, slot_mapping)
+    if k is not None:
+        k = k[:num_tokens]
+        if not skip_k_cache_insert:
+            ops.indexer_k_cache(k, kv_cache, slot_mapping)
+    elif not skip_k_cache_insert:
+        raise RuntimeError("indexer k is required when skip_k_cache_insert is false")
 
     if has_prefill:
         prefill_metadata = attn_metadata.prefill
@@ -137,6 +142,7 @@ def ilu_sparse_attn_indexer_fake(
     max_model_len: int,
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
+    skip_k_cache_insert: bool = False,
 ) -> torch.Tensor:
     assert topk_indices_buffer is not None
     return topk_indices_buffer
@@ -167,6 +173,10 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
         topk_indices_buffer: torch.Tensor,
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
+        compress_ratio: int = 1,
+        candidate_blocks: torch.Tensor | None = None,
+        candidate_block_size: int = 0,
+        candidate_write: bool = False,
     ):
         CustomOp.__init__(self)
         self.k_cache = k_cache
@@ -177,6 +187,14 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
         self.max_model_len = max_model_len
         self.max_total_seq_len = max_total_seq_len
         self.topk_indices_buffer = topk_indices_buffer
+        self.skip_k_cache_insert = skip_k_cache_insert
+        self.use_fp4_cache = use_fp4_cache
+
+        self.compress_ratio = compress_ratio
+        self.candidate_blocks = candidate_blocks
+        self.candidate_block_size = candidate_block_size
+        self.candidate_write = candidate_write
+        self.dense_mha_metadata_layer_name = ""
 
     def forward_native(
         self,
@@ -210,4 +228,5 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
             self.max_model_len,
             self.max_total_seq_len,
             self.topk_indices_buffer,
+            self.skip_k_cache_insert,
         )

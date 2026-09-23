@@ -131,7 +131,8 @@ class IluDeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
     """SWA cache layer for DeepSeek-V4 in ilu vllm.
 
     Supports bf16 (contiguous head_dim) and fp8_ds_mla (584-byte packed)
-    layouts, selected via ``cache_config.cache_dtype``.
+    layouts. uint8, or a cache dtype of fp8 / fp8_ds_mla, selects the packed
+    record.
     """
 
     def __init__(
@@ -141,24 +142,43 @@ class IluDeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         dtype: torch.dtype,
         prefix: str,
         cache_config: CacheConfig,
+        backend_cls: type[AttentionBackend] | None = None,
+        block_size: int = 64,
+        packed_bytes_per_token: int = 584,
+        packed_page_alignment: int = 576,
+        bounded_replay: bool = False,
     ) -> None:
         super().__init__()
+        self.backend_cls = backend_cls or IluDeepseekSparseSWABackend
+        # DeepseekV4.1 SWA bounded replay.
+        self.bounded_replay = bounded_replay
         self.kv_cache = torch.tensor([])
         self.head_dim = head_dim
         self.window_size = window_size
         self.prefix = prefix
         self.cache_config = cache_config
         self.dtype = dtype
+        self.packed_bytes_per_token = packed_bytes_per_token
+        self.packed_page_alignment = packed_page_alignment
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
-        self.block_size = 64
+        # Any multiple of 32; the sparse decode kernels take the page size at
+        # runtime.
+        self.block_size = block_size
+        # uint8: fp8_ds_mla UE8M0 paged layout. bfloat16 / float8_e4m3fn:
+        # contiguous full-cache layout.
+        assert self.dtype in (torch.uint8, torch.bfloat16, torch.float8_e4m3fn)
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # [B, H=1, N, C] -> [B, N, C]
+        self.kv_cache = kv_cache.squeeze(1)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         cache_dtype = self.cache_config.cache_dtype
-        is_fp8 = cache_dtype in ("fp8_ds_mla", "fp8")
+        is_fp8 = cache_dtype in ("fp8_ds_mla", "fp8") or self.dtype == torch.uint8
 
         if is_fp8:
             return SlidingWindowMLASpec(
@@ -180,7 +200,7 @@ class IluDeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
                 # default makes the runner fall back to ``head_size`` (512) and the
                 # view fails with a 584-vs-512 page-size mismatch.
                 alignment=64,
-                kv_quant_mode=get_kv_quant_mode(cache_dtype),
+                kv_quant_mode=get_kv_quant_mode("fp8_ds_mla"),
             )
         return SlidingWindowMLASpec(
             block_size=self.block_size,
@@ -196,7 +216,45 @@ class IluDeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
     def forward(self): ...
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        return IluDeepseekSparseSWABackend
+        return self.backend_cls
+
+
+class IluDeepseekSparseSWABackend(DeepseekSparseSWABackend):
+    """SWA backend supporting bf16 and fp8_ds_mla cache."""
+
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "bfloat16",
+        "fp8_ds_mla",
+        "fp8",
+    ]
+
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        # DSpark draft blocks attend bidirectionally within the query window;
+        # the builder encodes that via non-causal SWA indices.
+        return True
+
+    @staticmethod
+    def get_name() -> str:
+        return "ILU_DEEPSEEK_SPARSE_SWA"
+
+    @staticmethod
+    def get_builder_cls() -> type[DeepseekSparseSWAMetadataBuilder]:
+        return IluDeepseekSparseSWAMetadataBuilder
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        assert num_kv_heads == 1
+        if cache_dtype_str == "fp8_ds_mla":
+            return (num_blocks, block_size, 584)
+        return (num_blocks, block_size, head_size)
 
 
 class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
@@ -501,41 +559,3 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
         metadata.prefill_swa_lens = self.decode_swa_lens[
             num_decode_tokens:num_swa_tokens
         ]
-
-
-class IluDeepseekSparseSWABackend(DeepseekSparseSWABackend):
-    """SWA backend supporting bf16 and fp8_ds_mla cache."""
-
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
-        "auto",
-        "bfloat16",
-        "fp8_ds_mla",
-        "fp8",
-    ]
-
-    @classmethod
-    def supports_non_causal(cls) -> bool:
-        # DSpark draft blocks attend bidirectionally within the query window;
-        # the builder encodes that via non-causal SWA indices.
-        return True
-
-    @staticmethod
-    def get_name() -> str:
-        return "ILU_DEEPSEEK_SPARSE_SWA"
-
-    @staticmethod
-    def get_builder_cls() -> type[DeepseekSparseSWAMetadataBuilder]:
-        return IluDeepseekSparseSWAMetadataBuilder
-
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        assert num_kv_heads == 1
-        if cache_dtype_str == "fp8_ds_mla":
-            return (num_blocks, block_size, 584)
-        return (num_blocks, block_size, head_size)

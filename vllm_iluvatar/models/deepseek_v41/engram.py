@@ -9,7 +9,6 @@ import os
 import ixformer.inference.functions as ixfops
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch import nn
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -636,6 +635,7 @@ class IluEngram(nn.Module):
             "multipliers", multipliers.to(device), persistent=False
         )
         self.wkv_weight: torch.Tensor | None = None
+        self.wkv_scale: torch.Tensor | None = None
         self.q_weight: torch.Tensor | None = None
         self.k_weight: torch.Tensor | None = None
 
@@ -660,7 +660,7 @@ class IluEngram(nn.Module):
             self.key_offset = 0
 
     def load_from_checkpoint(self, path: str) -> None:
-        """Load the table slice, plus wkv (dequantized to bf16) and q/k weights."""
+        """Load the table slice, plus fp8 wkv and q/k weights."""
         import json
         import os
 
@@ -688,16 +688,28 @@ class IluEngram(nn.Module):
         device = self.primes.device
         wkv_q = read("wkv.weight")
         wkv_s = read("wkv.scale")
-        wkv = _dequant_block_fp8(wkv_q, wkv_s)
         if self._shard_keys:
             # Slice on the host so the device never holds the full-width weight.
-            keys = wkv[: self.hc_mult * self.hidden_size].unflatten(
-                0, (self.hc_mult, self.hidden_size)
-            )[:, self.key_offset : self.key_offset + self.key_hidden]
-            wkv = torch.cat(
-                [keys.flatten(0, 1), wkv[self.hc_mult * self.hidden_size :]]
-            )
-        self.wkv_weight = wkv.contiguous().to(device, torch.bfloat16)
+            n = self.hc_mult * self.hidden_size
+            keys_q = wkv_q[:n].unflatten(0, (self.hc_mult, self.hidden_size))[
+                :, self.key_offset : self.key_offset + self.key_hidden
+            ]
+            n_s = n // _FP8_BLOCK
+            keys_s = wkv_s[:n_s].unflatten(
+                0, (self.hc_mult, self.hidden_size // _FP8_BLOCK)
+            )[
+                :,
+                self.key_offset // _FP8_BLOCK : (self.key_offset + self.key_hidden)
+                // _FP8_BLOCK,
+            ]
+            wkv_q = torch.cat([keys_q.flatten(0, 1), wkv_q[n:]])
+            wkv_s = torch.cat([keys_s.flatten(0, 1), wkv_s[n_s:]])
+        self.wkv_weight, self.wkv_scale = ixfops.fp8_weight_block_to_channel_requant(
+            wkv_q.contiguous().to(device),
+            wkv_s.contiguous().to(device),
+            _FP8_BLOCK,
+            _FP8_BLOCK,
+        )
         self.q_weight = read("q_weight").to(device)
         self.k_weight = read("k_weight").to(device)
 
@@ -715,7 +727,16 @@ class IluEngram(nn.Module):
         return self.embed(self.hash_ids(tokens))
 
     def apply(self, hidden_states: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
-        return self._gate(hidden_states, F.linear(rows.flatten(-2), self.wkv_weight))
+        x, x_scale = ixfops.fp8_per_token_dynamic_scaled(rows.flatten(-2))
+        kv = torch.empty(
+            (x.shape[0], self.wkv_weight.shape[0]),
+            dtype=torch.bfloat16,
+            device=x.device,
+        )
+        ixfops.fp8_per_channel_mm(
+            x, self.wkv_weight, x_scale, self.wkv_scale, kv, None, backend="ixmm"
+        )
+        return self._gate(hidden_states, kv)
 
     def forward(
         self,
@@ -740,11 +761,3 @@ class IluEngram(nn.Module):
         sums = ixfops.ds4_engram_gate_reduce(x, kv, self._qk_weight, self.key_offset)
         sums = tensor_model_parallel_all_reduce(sums)
         return ixfops.ds4_engram_gate_apply(x, kv, sums, self.eps, self.clamp_value)
-
-
-def _dequant_block_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    out_features, in_features = weight.shape
-    w = weight.float()
-    s = scale.float()
-    s = s.repeat_interleave(_FP8_BLOCK, dim=0).repeat_interleave(_FP8_BLOCK, dim=1)
-    return w * s[:out_features, :in_features]

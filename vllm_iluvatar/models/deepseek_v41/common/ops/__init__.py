@@ -9,7 +9,6 @@ this layer and marked ``TODO(ops)``.
 """
 
 from vllm_iluvatar.models.deepseek_v41.common.ops.fused_compress_quant_cache import (
-    COMPRESS_KV_QDQ_BLOCK,
     fused_save_compress_norm,
     rope_quant_insert,
 )
@@ -19,7 +18,6 @@ from vllm_iluvatar.models.deepseek_v41.common.ops.indexer_k_store import (
 )
 
 __all__ = [
-    "COMPRESS_KV_QDQ_BLOCK",
     "MXFP4_BLOCK_SIZE",
     "fused_save_compress_norm",
     "indexer_k_norm_rope_store",

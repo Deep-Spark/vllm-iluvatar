@@ -188,9 +188,36 @@ Iluvatar 支持多种 MoE 权重布局，需要通过离线量化生成与目标
 | 字段 | 适用类型 | 必填 | 值 | 说明 |
 | --- | --- | --- | --- | --- |
 | `gemm_format` | W4A8 / W8A8 | 是 | `TN` / `NN` | 权重布局，必须与离线量化一致 |
-| `pack_version` | W4A8 | 是 | `1` / `2` | 打包版本；当前 W4A8 MoE 实现使用 `2` |
+| `pack_version` | W4A8 | ivcore30 NN 可省略 | `1` / `2` | checkpoint 兼容标记；ivcore30 NN 接受省略或 `1`，原类要求 `2` |
 
-W4A8 MoE 还要求权重量化粒度为 per-channel 或 per-group，激活为 per-token。当前实现使用 `pack_version=2`。
+W4A8 MoE 要求权重为 per-channel 或 per-group，激活为 per-token。ivcore30
+另提供专用 NN method，要求对称 per-channel 权重；原类保留 v2 契约。
+
+### 3.3 ivcore30 W4A8 NN 专用类
+
+静态 `gemm_format=NN` 在 ivcore30 上选择
+`IluW4A8NNMoEMethod`。FP8→NN 在线量化类继承它、只重写加载过程。
+新类固定采用 ixmm NN 权重和完整 per-channel scale，不保存 `version` 字段。
+加载入口兼容旧 checkpoint 的 `pack_version=1`；省略该字段表示同一格式。
+显式指定 `pack_version=2` 或其他值会报不兼容，不会改走旧 kernel，
+也不会自动修改权重和 scale。
+prefill、mixed、decode 都调用 ixformer 的 `moe_w4a8_group_gemm_ixmm`。
+不需要 decode 环境变量或后端选项；在线量化配置见指南 8 §8.6。
+
+EP/非 EP 共用一条流程：packed routing → 普通 INT8 量化/展开 →
+W13 GEMM → 激活量化 → W2 GEMM → mapped reduce。
+输入量化使用 `scaled_int8_quant`，INT8 激活和 FP32 scale 分开保存，
+再由 `moe_expand_input_ep` 按 expert 行映射展开。
+路由生成 GPU `group_layout` 和 `packed_to_expert_row`，两次 GEMM 都保持
+expert-major 输出，`moe_output_reduce_sum_ep` 根据逆映射读取并归约。
+HT 和 LL 分别选择独立的 `IluMoEStandardExpertsW4A8NN` 和
+`IluMoEBatchedExpertsW4A8NN`；LL 保持固定容量 expert 布局，由 combine 归约。
+
+接口支持 BF16/FP16 输出、ixmm NN per-channel 权重，
+且无 bias、使用动态 INT8 激活。加载后不额外缩放权重。
+TP16 的 down_proj 本地 K=128 补零至 256；不提供 TN→NN 的加载期转换。
+TN/v2 和 ivcore11 的 NN/v2 仍选择原 `IluCompressedTensorsW4A8Int8MoEMethod`。
+ivcore11 NN/v1 当前仍受原类的 v2 约束，不会落入 ivcore30 ixmm 路径。
 
 ## 4. Linear 量化
 

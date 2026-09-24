@@ -228,6 +228,8 @@ class IluMoEStandardExpertsW4A8(BaseStandardExperts):
         sorted_token_ids,
         output_format=None,
         activation: MoEActivation = None,
+        check_valid: bool = False,
+        expand_tokens_gpu: torch.Tensor | None = None,
     ):
         # unpad
         input = unpad_tensor(input, self.gemm1_info.get_n(), contiguous=True)
@@ -247,6 +249,8 @@ class IluMoEStandardExpertsW4A8(BaseStandardExperts):
         )
         if output_format is not None:
             kwargs["output_format"] = output_format
+        if check_valid:
+            kwargs["check_valid"] = True
         kwargs["output_padding"] = hidden_padding(
             self.gemm1_info.get_n() // 2, self.gemm2_info.pad_k
         )
@@ -261,10 +265,14 @@ class IluMoEStandardExpertsW4A8(BaseStandardExperts):
         elif act_value == "swiglustep":
             kwargs["bias"] = None
             kwargs["act_type"] = "swiglustep"
+            if expand_tokens_gpu is not None:
+                kwargs["expand_tokens_gpu"] = expand_tokens_gpu
             output, scale = ixff.activation_dynamic_scaled_int8(**kwargs)
         elif act_value in ("silu", "swiglu"):
             kwargs["bias"] = None
             kwargs["act_type"] = "swiglu"
+            if expand_tokens_gpu is not None:
+                kwargs["expand_tokens_gpu"] = expand_tokens_gpu
             output, scale = ixff.activation_dynamic_scaled_int8(**kwargs)
         else:
             raise ValueError(

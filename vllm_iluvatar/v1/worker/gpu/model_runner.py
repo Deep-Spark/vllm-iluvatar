@@ -359,7 +359,7 @@ def init_kv_cache(
 
 
 class IluvatarGPUModelRunner(GPUModelRunner):
-    # [ILU override] _update_hybrid_attention_mamba_layout
+    # [ILU override] initialize_kv_cache
     # Delta: correct the upstream two-plane stride for ILU's three-plane KINT8
     # cache after delegating the common hybrid-layout handling to vLLM.
     def initialize_kv_cache(

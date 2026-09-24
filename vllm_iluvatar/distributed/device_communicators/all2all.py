@@ -2,7 +2,8 @@
 """
 Iluvatar-specific All2All manager implementations.
 
-NaiveAll2AllManager: broadcast-based naive all2all for testing and debugging.
+Provides ``AgRsAll2AllManager`` (allgather+reducescatter) and the DeepEP
+high-throughput / low-latency managers used by the EP all2all path.
 """
 
 from typing import Any
@@ -225,10 +226,6 @@ class DeepEPHTAll2AllManager(DeepEPAll2AllManagerBase):
         itemsize = 2
         num_topk = 8
         num_scales = hidden // 128
-
-        # inconsistent impl for config and deep_ep.cpp
-        # config = deep_ep.Buffer.get_dispatch_config(num_ranks)
-        # return config.get_nvl_buffer_size_hint(hidden * 2, num_ranks), config.get_rdma_buffer_size_hint(hidden * 2, num_ranks)
 
         # num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens, num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens
         config_map = {

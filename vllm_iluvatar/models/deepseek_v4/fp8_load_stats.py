@@ -40,7 +40,6 @@ parameter counts (stacked fusion and expert merging are many-to-one).
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
 
 #: Category order.
 CATEGORY_ORDER: tuple[str, ...] = (
@@ -89,9 +88,7 @@ _PLAIN_DTYPE_NAMES = {
 
 
 def normalise_pattern(name: str) -> str:
-    """Collapse a tensor name to its pattern by replacing every digit run with ``*``.
-
-    """
+    """Collapse a tensor name to its pattern by replacing every digit run with ``*``."""
     return re.sub(r"\d+", "*", name)
 
 
@@ -210,14 +207,12 @@ class LoadStats:
         """Classify one consumed checkpoint tensor and count it."""
         category = classify_tensor(name, dtype)
         self._counts[category] += 1
-        if category == "unknown":
-            if len(self._unknown_names) < self.max_reported_unknown:
-                self._unknown_names.append(name)
+        if (
+            category == "unknown"
+            and len(self._unknown_names) < self.max_reported_unknown
+        ):
+            self._unknown_names.append(name)
         return category
-
-    def record_all(self, items: Iterable[tuple[str, object]]) -> None:
-        for name, dtype in items:
-            self.record(name, dtype)
 
     @property
     def counts(self) -> dict[str, int]:

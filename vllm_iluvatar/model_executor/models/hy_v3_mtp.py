@@ -1,26 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Iluvatar OOT Qwen3-MoE model override.
 
-Corresponds to:
-    vllm/model_executor/models/hy_v3_mtp.py
+Corresponds to: vllm/model_executor/models/hy_v3_mtp.py
 
-Target:
-    vllm.model_executor.models.hy_v3_mtp.HYV3MTP
-    (arch "HYV3MTPModel").
-Baseline:
-    main_a67969c5a0.
-Why:
-    The MoE router optionally runs bf16 to match the
-    ixformer grouped-topk kernel (see
-    ``hy_v3_moe_bf16_router_overrides``).
-How:
-    ModelRegistry.register_model points the arch at the subclass below;
-    the subclass inherits the community model unchanged and, after
-    ``super().__init__()``, process hy_v3_moe_bf16_router_overrides.
-Scope:
-    HunYuan-V3-MTP on the Iluvatar platform.
-Remove:
-    when backend grouped_tokp support float32 inputs.
+Target   : vllm.model_executor.models.hy_v3_mtp.HYV3MTP (arch "HYV3MTPModel")
+Baseline : v0.30.0 (ced6857afa)
+Why      : The MoE router optionally runs bf16 to match the
+           ixformer grouped-topk kernel (see
+           ``hy_v3_moe_bf16_router_overrides``).
+How      : ModelRegistry.register_model points the arch at the subclass below;
+           the subclass inherits the community model unchanged and, after
+           ``super().__init__()``, process hy_v3_moe_bf16_router_overrides.
+Scope    : HunYuan-V3-MTP on the Iluvatar platform.
+Remove   : when backend grouped_tokp support float32 inputs.
 """
 
 from __future__ import annotations

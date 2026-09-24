@@ -2,21 +2,17 @@
 # pyright: reportMissingImports=false
 """Iluvatar OOT GDN overrides.
 
-Corresponds to:
-    vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+Corresponds to: vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
 
-Why:
-    Iluvatar routes GDN chunk/prefill/decode work through ixformer/CoreX kernels
-    and needs plugin-owned GDN metadata for speculative decode output ordering.
-How:
-    Official OOT hooks keep community source untouched:
-    ``ChunkGatedDeltaRule.register_oot`` owns the chunk op and
-    ``QwenGatedDeltaNetAttention.register_oot`` narrows the attention delta to
-    CoreX kernel preparation/dispatch.
-Scope:
-    Shared Iluvatar GDN metadata/OOT for Qwen3-Next / Qwen3.5 / Qwen4Exp.
-    CoreX30 uses the ixformer CUDA kernels; other arches keep the plugin FLA
-    path.
+Why      : Iluvatar routes GDN chunk/prefill/decode work through ixformer/CoreX kernels
+           and needs plugin-owned GDN metadata for speculative decode output ordering.
+How      : Official OOT hooks keep community source untouched:
+           ``ChunkGatedDeltaRule.register_oot`` owns the chunk op and
+           ``QwenGatedDeltaNetAttention.register_oot`` narrows the attention delta to
+           CoreX kernel preparation/dispatch.
+Scope    : Shared Iluvatar GDN metadata/OOT for Qwen3-Next / Qwen3.5. The CoreX30
+           ixformer CUDA math is opt-in per layer via ``use_qwen38_ixformer`` and is
+           only set by the Qwen4Exp model package.
 """
 
 from __future__ import annotations

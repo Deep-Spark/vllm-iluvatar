@@ -280,9 +280,6 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             num_experts,
             use_fp8=self.use_fp8_dispatch,
             use_int8=self.use_int8_dispatch,
-            # round_scale needs to be set to dispatch in ue8m0
-            # round_scale=self.use_ue8m0_dispatch,
-            # use_ue8m0=self.use_ue8m0_dispatch,
             async_finish=False,
             return_recv_hook=True,
         )

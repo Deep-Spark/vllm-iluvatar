@@ -5,7 +5,7 @@ Corresponds to: vllm/models/deepseek_v4/quant_config.py
 
 Target   : vllm.models.deepseek_v4.quant_config.DeepseekV4FP8Config
            (registered under the name ``deepseek_v4_fp8``)
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (ced6857afa)
 Why      : the community config routes MXFP4 routed experts to
            ``Mxfp4MoEMethod``, whose every backend is NVIDIA/ROCm-only. Iluvatar
            needs the same checkpoint parsing with an Iluvatar MoE method.

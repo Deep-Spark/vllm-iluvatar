@@ -50,18 +50,6 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
 
 
-# For FP8 sparse attention we have two implementations:
-# 1. Mixed batch mode: use the FP8 decode kernel for both prefill and decode this is
-#    done by treating all tokens as single batch.
-# 2. Separate prefill and decode mode: use the BF16 prefill kernel for prefill
-#    (upconverting the FP8 cache to BF16 then calling the prefill kernel) and using
-#    the FP8 decode kernel for decode.
-# Currently we use #1 when the number of heads per rank is low (i.e. TP) since the BF16
-# prefill kernel requires padding the number of heads to 128 while the decode does not
-# so when the per ranke head count is below MIN_HEADS_FOR_BF16_PREFILL we use the mixed
-# batch mode (#2).
-MIN_HEADS_FOR_BF16_PREFILL = 32
-
 """
 NOTE: FlashMLA Sparse uses an fp8 cache with the following format
 
@@ -175,16 +163,6 @@ class IluFlashMLASparseMetadata(AttentionMetadata):
     # builder buffers for CUDA-graph capture/replay.
     c128a_global_topk_indices: torch.Tensor | None = None  # [num_actual, W] int32
     c128a_topk_lens: torch.Tensor | None = None  # [num_actual] int32
-
-
-def get_prefill_workspace_size(max_model_len: int):
-    # NOTE(Lucas): 5 is a magic number for controlling the prefill buffer size.
-    # May be tuned later.
-    # Memory usage: 5 * max_model_len * 576 * 2 bytes
-    #   Example: DeepSeek-V3.2 with max_model_len=163840 ->
-    #            5 * 163840 * 576 * 2 = ~900 MB
-    # This fits nicely below the typical MoE workspace size of >2GB so this is "free"
-    return max_model_len * 5
 
 
 _C128A_TOPK_ALIGNMENT = 128
@@ -509,7 +487,6 @@ class IluFlashMLASparseImpl(
         self.qk_head_dim = mla_args["qk_head_dim"]
         self.v_head_dim = mla_args["v_head_dim"]
         self.kv_b_proj = mla_args["kv_b_proj"]
-        self.kv_lora_rank: int = mla_args["kv_lora_rank"]
         # Keep the indexer, not just the buffer the base class snapshots from it:
         # under MTP+PP the indexer swaps its buffer between the target and draft
         # passes, so forward_mqa has to re-read it rather than use the snapshot.

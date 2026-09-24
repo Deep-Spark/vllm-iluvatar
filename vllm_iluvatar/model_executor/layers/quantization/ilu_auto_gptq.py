@@ -110,53 +110,6 @@ def _apply_decode_w4a16_gptq(
     )
 
 
-# [B,K//8,N] ->[B,K,N]
-# less memory
-def unpack_k_batch_opt(
-    packed_w: torch.Tensor, num_bits: int = 4, chunk_size: int = 2
-) -> torch.Tensor:
-    """
-    Memory-efficient unpacking for 3D tensor.
-    Converts [B, K // pack_factor, N] int32 tensor → [B, K, N] int8 tensor,
-    without broadcasting huge intermediate tensors (avoids OOM).
-
-    Args:
-        packed_w: torch.int32 tensor of shape [B, K // pack_factor, N].
-        num_bits: Number of bits per packed element (e.g., 4 or 2).
-        chunk_size: How many bit groups to unpack at once (tradeoff between speed and memory).
-
-    Returns:
-        unpacked: torch.int8 tensor of shape [B, K, N].
-    """
-    B, k_packed, N = packed_w.shape
-    pack_factor = 32 // num_bits
-    K = k_packed * pack_factor
-    mask = (1 << num_bits) - 1
-
-    # Allocate output tensor once
-    unpacked = torch.empty((B, K, N), dtype=torch.int8, device=packed_w.device)
-
-    # Process bit chunks iteratively to save memory
-    for i in range(0, pack_factor, chunk_size):
-        # Precompute shifts for this chunk
-        shift_vals = num_bits * torch.arange(
-            i, min(i + chunk_size, pack_factor), device=packed_w.device
-        )
-        # [chunk_size, 1, 1, 1]
-        shifts = shift_vals.view(-1, 1, 1, 1)
-        # Compute small chunk only
-        chunk = ((packed_w.unsqueeze(0) >> shifts) & mask).to(torch.int8)
-
-        # chunk: [chunk_size, B, k_packed, N]
-        # write into output
-        for j in range(chunk.shape[0]):
-            unpacked[:, (i + j) :: pack_factor, :] = chunk[j]
-
-        del chunk  # release memory early
-
-    return unpacked
-
-
 # more memory
 def unpack_k_batch(packed_w: torch.Tensor, num_bits: int = 4) -> torch.Tensor:
     """
@@ -193,46 +146,7 @@ def unpack_k_batch(packed_w: torch.Tensor, num_bits: int = 4) -> torch.Tensor:
     return unpacked
 
 
-# [B,K,N] ->[B,K,N//8]
-# less memory
-def pack_n_batch_opt(
-    x: torch.Tensor, pack_num: int = 8, order_map=None, chunk_size: int = 2
-) -> torch.Tensor:
-    """
-    Memory-efficient batch packing with correct bit order.
-    [B, K, N] int4 -> [B, K, N//pack_num] int32.
-    """
-    B, K, N = x.shape
-    assert N % pack_num == 0, "N must be divisible by pack_num"
-    cols = N // pack_num
-    unit = 32 // pack_num
-
-    if order_map is None:
-        order_map = list(range(pack_num))
-    order_map = torch.tensor(order_map, device=x.device)
-
-    shifts = unit * torch.arange(
-        pack_num, device=x.device
-    )  # always 0..unit*(pack_num-1)
-    packed = torch.zeros((B, K, cols), dtype=torch.int32, device=x.device)
-    x_reshape = x.view(B, K, cols, pack_num) & 0xF
-
-    # process in chunks for memory efficiency
-    for start in range(0, pack_num, chunk_size):
-        end = min(start + chunk_size, pack_num)
-        idx_chunk = order_map[start:end]
-        shift_chunk = shifts[start:end]
-
-        vals = torch.gather(
-            x_reshape, 3, idx_chunk.view(1, 1, 1, -1).expand(B, K, cols, -1)
-        ).to(torch.int32)
-        for j in range(vals.shape[-1]):
-            packed.add_(vals[..., j] << shift_chunk[j])
-
-    return packed
-
-
-## more memory
+# more memory
 def pack_n_batch(x: torch.Tensor, pack_num: int = 8, order_map=None) -> torch.Tensor:
     """
     Efficient vectorized batch packing: [B, K, N] int4 -> [B, K, N//pack_num] int32.

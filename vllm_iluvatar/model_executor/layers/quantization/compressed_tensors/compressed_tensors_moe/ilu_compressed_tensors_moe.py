@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Iluvatar compressed-tensors MoE method-selection wrapper.
 
-Corresponds to:
-    vllm/model_executor/layers/quantization/compressed_tensors/
-    compressed_tensors_moe/compressed_tensors_moe.py
+Corresponds to: vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe.py
 
 Target   : CompressedTensorsMoEMethod.get_moe_method
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (ced6857afa)
 Why      : select Iluvatar W4A8/W8A8 MoE methods from Compressed-Tensors
            weight/activation args plus the per-group ``iluvatar`` block.
 How      : ``patch_compressed_tensors_moe`` installs this staticmethod wrapper;

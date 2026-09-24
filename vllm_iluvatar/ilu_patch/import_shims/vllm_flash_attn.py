@@ -4,27 +4,27 @@
 Module stand-in injected as ``sys.modules["vllm.vllm_flash_attn"]`` at startup
 (see ``vllm_iluvatar.ilu_patch.import_shims.install_all``).
 
-Target  : sys.modules["vllm.vllm_flash_attn"]
-Baseline: main_a67969c5a0
-Why     : IluPlatform is cuda-like (``is_cuda()`` is True), so community
-          ``vllm.v1.attention.backends.fa_utils`` takes its ``is_cuda()`` branch
-          and runs a module-level
-          ``from vllm.vllm_flash_attn import
-          compile_flash_attn_varlen_func_from_specs, flash_attn_varlen_func,
-          get_scheduler_metadata``. On corex that package ``__init__`` raises
-          ``ImportError`` (no ``_vllm_fa2_C`` / ``_vllm_fa3_C``). This is an
-          import-time binding, so a general patch (``register_general``) is too
-          late; we stand in an ixformer-backed module BEFORE any deep
-          ``import vllm``.
-How     : expose ixformer ``flash_attn_varlen_func``, a compile-only no-op
-          stub (ixformer has no FA4 CuTeDSL precompile entry), and a
-          ``get_scheduler_metadata`` stub (returns None). ``reshape_and_cache_flash``
-          comes from ``vllm._custom_ops`` (covered by the custom-ops import hook),
-          so it is not provided here.
-Scope   : Iluvatar (cuda-like) runs that import community fa_utils.
-Remove  : when the plugin ships its own attention backend that no longer relies
-          on the community fa_utils cuda branch (converge to a self-owned FA
-          stack).
+Target   : sys.modules["vllm.vllm_flash_attn"]
+Baseline : v0.30.0 (ced6857afa)
+Why      : IluPlatform is cuda-like (``is_cuda()`` is True), so community
+           ``vllm.v1.attention.backends.fa_utils`` takes its ``is_cuda()`` branch
+           and runs a module-level
+           ``from vllm.vllm_flash_attn import
+           compile_flash_attn_varlen_func_from_specs, flash_attn_varlen_func,
+           get_scheduler_metadata``. On corex that package ``__init__`` raises
+           ``ImportError`` (no ``_vllm_fa2_C`` / ``_vllm_fa3_C``). This is an
+           import-time binding, so a general patch (``register_general``) is too
+           late; we stand in an ixformer-backed module BEFORE any deep
+           ``import vllm``.
+How      : expose ixformer ``flash_attn_varlen_func``, a compile-only no-op
+           stub (ixformer has no FA4 CuTeDSL precompile entry), and a
+           ``get_scheduler_metadata`` stub (returns None). ``reshape_and_cache_flash``
+           comes from ``vllm._custom_ops`` (covered by the custom-ops import hook),
+           so it is not provided here.
+Scope    : Iluvatar (cuda-like) runs that import community fa_utils.
+Remove   : when the plugin ships its own attention backend that no longer relies
+           on the community fa_utils cuda branch (converge to a self-owned FA
+           stack).
 """
 
 from __future__ import annotations

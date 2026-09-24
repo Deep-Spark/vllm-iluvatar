@@ -1,29 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """Iluvatar OOT Qwen3-MoE model override.
 
-Corresponds to:
-    vllm/model_executor/models/qwen3_moe.py
+Corresponds to: vllm/model_executor/models/qwen3_moe.py
 
-Target:
-    vllm.model_executor.models.qwen3_moe.Qwen3MoeForCausalLM
-    (arch "Qwen3MoeForCausalLM").
-Baseline:
-    main_a67969c5a0.
-Why:
-    The fork replaces the two separate q_norm/k_norm passes in
-    ``Qwen3MoeAttention.forward`` with one fused q/k RMSNorm, and keeps the MoE
-    router gate unquantized by constructing it with ``quant_config=None``.
-How:
-    Use the official ``ModelRegistry.register_model`` hook. The subclass keeps
-    community model construction unchanged, then swaps each layer's
-    ``self_attn.__class__`` to a fused attention subclass and attaches the
-    plugin-owned ``RMSNormQK`` op. Sparse MoE router gates are rebuilt before
-    weight loading with the same prefix and dimensions but no quantization.
-Scope:
-    Qwen3-MoE models on Iluvatar.
-Remove:
-    When community Qwen3-MoE attention fuses q/k norm natively and router gate
-    quantization is safe for Iluvatar.
+Target   : vllm.model_executor.models.qwen3_moe.Qwen3MoeForCausalLM (arch
+           "Qwen3MoeForCausalLM")
+Baseline : v0.30.0 (ced6857afa)
+Why      : The fork replaces the two separate q_norm/k_norm passes in
+           ``Qwen3MoeAttention.forward`` with one fused q/k RMSNorm, and keeps the MoE
+           router gate unquantized by constructing it with ``quant_config=None``.
+How      : Use the official ``ModelRegistry.register_model`` hook. The subclass keeps
+           community model construction unchanged, then swaps each layer's
+           ``self_attn.__class__`` to a fused attention subclass and attaches the
+           plugin-owned ``RMSNormQK`` op. Sparse MoE router gates are rebuilt before
+           weight loading with the same prefix and dimensions but no quantization.
+Scope    : Qwen3-MoE models on Iluvatar.
+Remove   : When community Qwen3-MoE attention fuses q/k norm natively and router gate
+           quantization is safe for Iluvatar.
 """
 
 from __future__ import annotations

@@ -3,7 +3,7 @@
 (VLLM_ILU_FLASH_ATTN_QUANT_TYPE=KVINT8/KINT8, VLLM_ILU_MLA_ATTN_QUANT_TYPE=INT8).
 
 Patches community objects so int8 KV cache memory is sized correctly, aligned
-with the vLLM 0.29.0 community mechanism (B2 "shared backing buffer"):
+with the vLLM 0.30.0 community mechanism (B2 "shared backing buffer"):
 
 * ``AttentionSpec.state_content_size_bytes`` -- overridden (when any int8
   quant is enabled) to return the int8 per-cell byte size; see
@@ -19,7 +19,7 @@ with the vLLM 0.29.0 community mechanism (B2 "shared backing buffer"):
   so all ranks still converge to the same ``num_blocks`` after the single
   re-plan.
 
-Note: ``get_kv_cache_configs`` is not overridden on 0.29.0. Its shrink loop
+Note: ``get_kv_cache_configs`` is not overridden on 0.30.0. Its shrink loop
 re-plans each worker by calling this override, so ``scale_size`` is recomputed
 consistently during re-plan -- the old ILU manual proportional scale shrink is
 obsolete and would leave strides/offsets inconsistent with the shrunken
@@ -27,6 +27,7 @@ allocation.
 
 Target   : vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
            vllm.v1.core.kv_cache_utils._pool_bytes_per_block
+Baseline : v0.30.0 (ced6857afa)
 Scope    : only active when VLLM_ILU_FLASH_ATTN_QUANT_TYPE != "" or
            VLLM_ILU_MLA_ATTN_QUANT_TYPE != ""
 """

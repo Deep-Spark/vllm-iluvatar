@@ -1,27 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Iluvatar OOT Qwen2.5-VL vision encoder overrides.
 
-Corresponds to:
-    vllm/model_executor/models/qwen2_5_vl.py
+Corresponds to: vllm/model_executor/models/qwen2_5_vl.py
 
-Target:
-    ``Qwen2_5_VLForConditionalGeneration``.
-Baseline:
-    main_a67969c5a0.
-Why:
-    The fork fused QKV split, rotary, and head-dim padding for Qwen2.5-VL ViT
-    attention, and accepted CUDA-graph ``max_seqlen`` metadata that may arrive as
-    tensors on Iluvatar/CoreX runs.
-How:
-    Use the official ``ModelRegistry.register_model`` hook. The subclass keeps
-    community model construction unchanged, then swaps only the vision attention
-    and block classes in-place so loaded weights and module ownership remain
-    untouched.
-Scope:
-    Qwen2.5-VL vision encoder on Iluvatar.
-Remove:
-    When community Qwen2.5-VL uses the fused ViT QKV preprocessing path and
-    tensor ``max_seqlen`` metadata is handled upstream.
+Target   : ``Qwen2_5_VLForConditionalGeneration``
+Baseline : v0.30.0 (ced6857afa)
+Why      : The fork fused QKV split, rotary, and head-dim padding for Qwen2.5-VL ViT
+           attention, and accepted CUDA-graph ``max_seqlen`` metadata that may arrive as
+           tensors on Iluvatar/CoreX runs.
+How      : Use the official ``ModelRegistry.register_model`` hook. The subclass keeps
+           community model construction unchanged, then swaps only the vision attention
+           and block classes in-place so loaded weights and module ownership remain
+           untouched.
+Scope    : Qwen2.5-VL vision encoder on Iluvatar.
+Remove   : When community Qwen2.5-VL uses the fused ViT QKV preprocessing path and
+           tensor ``max_seqlen`` metadata is handled upstream.
 """
 
 from __future__ import annotations

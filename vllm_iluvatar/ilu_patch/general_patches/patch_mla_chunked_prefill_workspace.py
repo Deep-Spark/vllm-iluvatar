@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Cap MLA chunked-prefill workspace size via env.
 
-Corresponds to:
-    vllm/model_executor/layers/attention/mla_attention.py
-        MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size
-    vllm/model_executor/layers/attention/sparse_mla_attention.py
+Corresponds to: vllm/model_executor/layers/attention/mla_attention.py
+           MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size
+           vllm/model_executor/layers/attention/sparse_mla_attention.py
         SparseMLACommonMetadataBuilder.determine_chunked_prefill_workspace_size
 
 Target   : community MLA / sparse-MLA metadata builders.
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (ced6857afa)
 Why      : Iluvatar deployments sometimes need a smaller workspace cap than
            the community 64k formula (e.g. W8A8 kv_b_proj peak memory).
 How      : replace both builders'

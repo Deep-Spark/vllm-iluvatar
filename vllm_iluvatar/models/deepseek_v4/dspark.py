@@ -97,7 +97,7 @@ class IluDSparkDeepseekV4Model(nn.Module):
     """Iluvatar DeepSeek-V4 backbone used by the DSpark draft."""
 
     # Ported from vllm/models/deepseek_v4/nvidia/dspark.py:57-198 at
-    # main_a67969c5a0, with the Iluvatar substitutions documented above.
+    # v0.30.0 (ced6857afa), with the Iluvatar substitutions documented above.
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None
@@ -280,7 +280,7 @@ class IluDSparkDeepseekV4ForCausalLM(nn.Module):
     draft_id_to_target_id = None
 
     # Ported from vllm/models/deepseek_v4/nvidia/dspark.py:268-344 at
-    # main_a67969c5a0, with the Iluvatar backbone and loader below.
+    # v0.30.0 (ced6857afa), with the Iluvatar backbone and loader below.
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None
@@ -339,9 +339,6 @@ class IluDSparkDeepseekV4ForCausalLM(nn.Module):
         return [
             layer.attn.mla_attn.swa_cache_layer.prefix for layer in self.model.layers
         ]
-
-    def _remap_dspark_name(self, name: str) -> str | None:
-        return remap_dspark_name(name, self.config.num_hidden_layers)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load the ``mtp.{0,1,2}.*`` weights embedded in the target checkpoint."""

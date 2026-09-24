@@ -1,34 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 """Iluvatar OOT Qwen3-MoE model override.
 
-Corresponds to:
-    vllm/model_executor/models/hy_v3.py
+Corresponds to: vllm/model_executor/models/hy_v3.py
 
-Target:
-    vllm.model_executor.models.hy_v3.HYV3ForCausalLM
-    (arch "HYV3ForCausalLM").
-Baseline:
-    main_a67969c5a0.
-Why:
-    the only Iluvatar delta vs community is fusing the two separate
-    q_norm/k_norm passes into one fused q/k RMSNorm (ixformer
-    rms_norm_qk).  The MoE router optionally runs bf16 to match the
-    ixformer grouped-topk kernel (see
-    ``hy_v3_moe_bf16_router_overrides``).
-How:
-    ModelRegistry.register_model points the arch at the subclass below;
-    the subclass inherits the community model unchanged and, after
-    ``super().__init__()``, swaps each layer's ``self_attn.__class__`` to
-    a fused attention subclass (weights preserved) and attaches a
-    ``qk_norm`` op.  IluPlatform does not use the HPC_ATTN backend, so the
-    community HpcRopeNorm fast path is never built (``rope_support`` is
-    False); the fused fallback forward is the only active path.  vLLM has
-    no finer-grained (per-method) model hook, so whole-class
-    re-registration is the only official extension point.
-Scope:
-    HunYuan-V3 causal-LM on the Iluvatar platform.
-Remove:
-    when community HYV3 attention fuses q/k norm natively.
+Target   : vllm.model_executor.models.hy_v3.HYV3ForCausalLM (arch
+           "HYV3ForCausalLM")
+Baseline : v0.30.0 (ced6857afa)
+Why      : the only Iluvatar delta vs community is fusing the two separate
+           q_norm/k_norm passes into one fused q/k RMSNorm (ixformer
+           rms_norm_qk).  The MoE router optionally runs bf16 to match the
+           ixformer grouped-topk kernel (see
+           ``hy_v3_moe_bf16_router_overrides``).
+How      : ModelRegistry.register_model points the arch at the subclass below;
+           the subclass inherits the community model unchanged and, after
+           ``super().__init__()``, swaps each layer's ``self_attn.__class__`` to
+           a fused attention subclass (weights preserved) and attaches a
+           ``qk_norm`` op.  IluPlatform does not use the HPC_ATTN backend, so the
+           community HpcRopeNorm fast path is never built (``rope_support`` is
+           False); the fused fallback forward is the only active path.  vLLM has
+           no finer-grained (per-method) model hook, so whole-class
+           re-registration is the only official extension point.
+Scope    : HunYuan-V3 causal-LM on the Iluvatar platform.
+Remove   : when community HYV3 attention fuses q/k norm natively.
 """
 
 from __future__ import annotations

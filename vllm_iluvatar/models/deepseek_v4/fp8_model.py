@@ -132,7 +132,7 @@ _MODEL_PREFIX = "model."
 def _is_load_skipped(name: str) -> bool:
     """Whether ``AutoWeightsLoader`` would drop this (mapped) name.
 
-    vLLM 0.29.0 removed ``AutoWeightsLoader.ROTARY_EMBEDS_UNUSED_WEIGHTS``
+    vLLM v0.30.0 (ced6857afa) removed ``AutoWeightsLoader.ROTARY_EMBEDS_UNUSED_WEIGHTS``
     (a list appended to ``skip_substrs``); rotary leftovers are now dropped
     by ``AutoWeightsLoader.REMOVE_UNUSED_ROTARY_EMBEDS_MAPPER``, which the
     loader composes with the model mapper internally. ``mtp.*`` is dropped by
@@ -188,7 +188,7 @@ def _make_fp8_weights_mapper() -> WeightsMapper:
             # and routed ``w2`` is untouched because the pattern is anchored
             # on ``.shared_experts.``.
             ".shared_experts.w2": ".shared_experts.down_proj",
-            # vLLM 0.29.0 dropped AutoWeightsLoader.skip_substrs; the MTP
+            # vLLM v0.30.0 (ced6857afa) dropped AutoWeightsLoader.skip_substrs; the MTP
             # weights are loaded by the separate IluDeepSeekV4MTPModel draft
             # model, so the base model drops them here via the mapper (maps
             # to None). The orig_to_new_prefix rename ``mtp.`` -> ``model.mtp.``
@@ -439,7 +439,7 @@ class IluDeepseekV4Fp8MoE(nn.Module):
         EP/TP all-reduce.  ``routed_scaling_factor`` is likewise handled by the
         router (multiplied into ``topk_weights``).
 
-        Adapted to vLLM 0.28.0: the runner always holds the gate (it was
+        Adapted to vLLM v0.30.0 (ced6857afa): the runner always holds the gate (it was
         constructed via ``FusedMoEFactory(gate=self.gate, ...)``), so
         ``router_logits`` is a placeholder (``hidden_states``) and the real
         gate GEMM runs inside the runner (see ``MoERunner._forward_impl``).
@@ -877,8 +877,8 @@ class IluDeepseekV4Fp8Model(nn.Module):
         """Main loading loop, transcribed from community ``nvidia/model.py:1150-1257``.
 
         Names arriving here have already been rewritten by
-        ``hf_to_vllm_mapper`` and ``mtp.*`` has already been dropped by
-        ``AutoWeightsLoader(skip_substrs=["mtp."])``.
+        ``hf_to_vllm_mapper`` and ``mtp.*`` has already been dropped by the
+        model ``WeightsMapper`` (``"mtp.": None``).
 
         Four branches, in the order the community loop tries them:
 
@@ -1135,9 +1135,9 @@ class IluDeepseekV4Fp8ForCausalLM(nn.Module, SupportsPP):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load the checkpoint, then run the Load_Verifier.
 
-        ``skip_substrs=["mtp."]`` matches community ``nvidia/model.py:1468-1469``;
-        the loading rules themselves live in
-        ``IluDeepseekV4Fp8Model.load_weights``.
+        ``mtp.*`` is dropped by the model ``WeightsMapper`` (``"mtp.": None``),
+        matching the community ``nvidia/model.py`` load rules; the loading
+        rules themselves live in ``IluDeepseekV4Fp8Model.load_weights``.
 
         Three closing steps, in this order -- statistics first so the numbers are
         on record even when a check below fails, and the raise last so the
@@ -1165,7 +1165,7 @@ class IluDeepseekV4Fp8ForCausalLM(nn.Module, SupportsPP):
         # accumulates and ``AutoWeightsLoader`` may enter its ``load_weights``
         # several times (see ``reset_consumed_ckpt_names``).
         self.model.reset_consumed_ckpt_names()
-        # vLLM 0.29.0 removed AutoWeightsLoader.skip_substrs; ``mtp.*`` is
+        # vLLM v0.30.0 (ced6857afa) removed AutoWeightsLoader.skip_substrs; ``mtp.*`` is
         # dropped by ``hf_to_vllm_mapper`` (``"mtp.": None``) and loaded
         # separately by IluDeepSeekV4MTPModel. Rotary leftovers are dropped
         # internally by the loader (REMOVE_UNUSED_ROTARY_EMBEDS_MAPPER).

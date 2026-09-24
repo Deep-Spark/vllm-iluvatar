@@ -5,7 +5,7 @@ Corresponds to: vllm/model_executor/layers/minimax_rms_norm/rms_norm_tp.py
 
 Target   : vllm.model_executor.layers.minimax_rms_norm.rms_norm_tp
            .MiniMaxText01RMSNormTP.forward_qkv
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (ced6857afa)
 Why      : the community ``forward_qkv`` sends the TP>1 case through
            ``torch.ops.vllm.minimax_qk_norm_fusion``, whose three tiers all fail
            or are risky on Iluvatar corex: the Lamport fused op

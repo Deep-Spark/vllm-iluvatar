@@ -6,7 +6,7 @@ ILU override implementation for Attention quantization support.
 Target   : AttentionSpec.state_content_size_bytes (int8 per-cell for all specs)
            AttentionSpec.num_heads (disallow num_head_slots for int8)
            KVCacheTensor (scale_size fields)
-Baseline : vllm 0.29.0 (b53bdfecb11d)
+Baseline : vllm 0.30.0 (ced6857afa)
 Why      : Iluvatar attention quantization Int8 support.
 How      : state_content_size_bytes drives int8 per-cell sizing through the
            community formula ``unpadded_page_size_bytes = num_heads *

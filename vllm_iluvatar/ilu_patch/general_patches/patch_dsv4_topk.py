@@ -11,7 +11,7 @@ The override implementation lives in
 module only performs register-time wiring.
 
 Target   : vllm.model_executor.layers.fused_moe.router.dsv4_topk.can_use_dsv4_topk
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (ced6857afa)
 Why      : with ``sqrtsoftplus`` routing, ``fused_topk_bias``
            (``fused_topk_bias_router.py:190-203``) hands the 40 bias layers of
            DeepSeek-V4 to the Triton kernel ``dsv4_topk`` -- all eight gating

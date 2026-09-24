@@ -342,7 +342,6 @@ class NixlConnectorWorker:
         self.dp_world_size = vllm_config.parallel_config.data_parallel_size
         self.global_rank = self.pp_rank * self.tp_world_size + self.tp_rank
         self.enable_permute_local_kv = False
-        # self.device_id_calculated = (self.pp_rank * self.tp_world_size + self.tp_rank) if self.use_host_buffer else 0
         self.device_id: int = 0
         self.max_num_batched_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
@@ -1634,17 +1633,6 @@ class NixlConnectorWorker:
 
         self.host_xfer_buffers = new_kv_caches
         return new_kv_caches, kv_cache_scales
-
-    def register_cross_layers_kv_caches(self, kv_cache: torch.Tensor) -> None:
-        """Register a cross-layers KV cache tensor with NIXL.
-
-        `use_uniform_kv_cache()` guarantees a single KV cache group whose
-        layers all share the same `AttentionSpec`, so any layer name from
-        `_layer_specs` yields the correct per-layer spec for `page_size_bytes`.
-        """
-        first_layer = next(iter(self._layer_specs))
-        # Forwarding a real layer name rather than a synthetic key
-        self.register_kv_caches({first_layer: kv_cache})
 
     def register_kv_caches(
         self,

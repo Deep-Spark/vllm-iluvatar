@@ -9,7 +9,7 @@ binding) lives in
 ``register_general``.
 
 Target   : vllm.models.deepseek_v4.compressor.CompressorStateCache.get_kv_cache_spec
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (ced6857afa)
 Why      : The community ``get_kv_cache_spec`` uses an ``alignment`` kwarg
            tied to the fp8_ds_mla paged layout; the Iluvatar bf16 path needs a
            different block_size derivation and no alignment constraint.

@@ -10,7 +10,7 @@ during ``register_general``.
 
 Target   : vllm.distributed.parallel_state.GroupCoordinator.{broadcast,
            broadcast_tensor_dict, isend_tensor_dict, irecv_tensor_dict}
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (ced6857afa)
 Why      : 1) route broadcast / GPU-tensor broadcast through the device
               communicator so Iluvatar (ixformer) collectives are used instead
               of torch.distributed defaults.
@@ -217,7 +217,7 @@ def _ilu_isend_tensor_dict_sync(
     assert len(tensor_keys) == len(tensor_list)
 
     # >>> ILU MODIFICATION >>>
-    # ivcore30 blocking path. Community 0.29.0 switched the metadata send to
+    # ivcore30 blocking path. Community v0.30.0 (ced6857afa) sends metadata via
     # an async isend_object whose handle is self-retained in _pending_isends
     # and reaped lazily. ivcore30 keeps the blocking send_object so metadata
     # lands before the tensors, and returns no async handles (the tensor

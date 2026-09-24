@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Iluvatar Flash Attention backend metadata.
 Corresponds to: vllm/v1/attention/backends/flash_attn.py
-Baseline: main_a67969c5a0
+Baseline: v0.30.0 (ced6857afa)
 Why: Iluvatar optimized flash attention kernels.
 How: Reuse the official ``FLASH_ATTN`` enum member via platform backend
      registration.
@@ -851,7 +851,7 @@ class IluFlashAttentionImpl(AttentionImpl):
         if early_output is not None:
             return early_output
 
-        # v0.29.0 KV-cache layout: per-layer view is [B, H, N, C] with K/V packed
+        # v0.30.0 (ced6857afa) KV-cache layout: per-layer view is [B, H, N, C] with K/V packed
         # in the content dim C = head_size + head_size_v. ixformer's
         # reshape_and_cache_flash expects HND [num_blocks, num_kv_heads,
         # block_size, head_size] (it reads block_size from dim 2), so split the

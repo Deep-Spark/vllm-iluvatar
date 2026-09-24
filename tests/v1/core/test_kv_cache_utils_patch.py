@@ -72,7 +72,7 @@ def test_patch_is_noop_when_quantization_is_disabled(monkeypatch):
     assert (
         modules.community._pool_bytes_per_block is modules.original_pool_bytes_per_block
     )
-    # get_kv_cache_configs is never overridden on 0.29.0.
+    # get_kv_cache_configs is never overridden on v0.30.0 (ced6857afa).
     assert modules.community.get_kv_cache_configs is modules.original_configs
 
 
@@ -105,5 +105,5 @@ def test_patch_replaces_functions_when_quantization_is_enabled(
         modules.community._pool_bytes_per_block
         is modules.replacement_pool_bytes_per_block
     )
-    # get_kv_cache_configs is never overridden on 0.29.0.
+    # get_kv_cache_configs is never overridden on v0.30.0 (ced6857afa).
     assert modules.community.get_kv_cache_configs is modules.original_configs

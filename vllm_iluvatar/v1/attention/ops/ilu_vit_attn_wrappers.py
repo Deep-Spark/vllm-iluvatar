@@ -1,21 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Iluvatar ViT attention preprocessing helpers.
 
-Corresponds to:
-    vllm/v1/attention/ops/vit_attn_wrappers.py
+Corresponds to: vllm/v1/attention/ops/vit_attn_wrappers.py
 
-Baseline:
-    main_a67969c5a0.
-Why:
-    Iluvatar's Qwen2.5-VL OOT model fuses packed QKV split, rotary, and
-    head-dim padding before calling the community MM encoder attention op.
-How:
-    Keep the helper in the plugin and call it from the OOT Qwen2.5-VL model
-    instead of adding Iluvatar-only APIs to the community ViT attention wrappers.
-Scope:
-    Qwen2.5-VL vision attention on Iluvatar.
-Remove:
-    When community vLLM exposes an equivalent fused ViT QKV preprocessing helper.
+Baseline : v0.30.0 (ced6857afa)
+Why      : Iluvatar's Qwen2.5-VL OOT model fuses packed QKV split, rotary, and
+           head-dim padding before calling the community MM encoder attention op.
+How      : Keep the helper in the plugin and call it from the OOT Qwen2.5-VL model
+           instead of adding Iluvatar-only APIs to the community ViT attention wrappers.
+Scope    : Qwen2.5-VL vision attention on Iluvatar.
+Remove   : When community vLLM exposes an equivalent fused ViT QKV preprocessing helper.
 """
 
 from __future__ import annotations

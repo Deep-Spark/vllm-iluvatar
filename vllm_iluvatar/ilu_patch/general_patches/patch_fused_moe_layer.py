@@ -10,10 +10,9 @@ ILU general-plugins patch, auto-discovered from the centralized
 
 This patch is a pure module-global rebind with no method-body copy.
 
-Target   : vllm.model_executor.layers.fused_moe.layer.MoERunner
-           vllm.model_executor.layers.fused_moe.runner.moe_runner.MoERunner
+Target   : vllm.model_executor.layers.fused_moe.runner.moe_runner.MoERunner
            vllm.model_executor.layers.fused_moe.runner.shared_experts.SharedExperts
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (ced6857afa)
 Why      : MoERunner is not a CustomOp (no register_oot); Iluvatar needs
            elastic-EP, input_ids dispatch, FP16 scaling, fused norm-quant tuple
            support, and the fork's RoutedExperts scaling placement. SharedExperts

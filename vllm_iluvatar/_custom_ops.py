@@ -65,8 +65,6 @@ _ILU_ADDED: list[str] = [
     "quant_kv",
     "ref_mqa_logits",
     "ref_paged_mqa_logits",
-    "rejection_greedy_sample_torch",
-    "rejection_random_sample_torch",
     "rms_norm_qk",
     "router_gemm_bf16_fp32",
     "silu_and_mul",
@@ -201,11 +199,6 @@ def apply_repetition_penalties(
         output_mask: A boolean tensor indicating which tokens appear in the output.
         repetition_penalties: The repetition penalties of shape (num_seqs, ).
     """
-    # if logits.is_cuda and logits.is_contiguous():
-    #     apply_repetition_penalties_cuda(
-    #         logits, prompt_mask, output_mask, repetition_penalties
-    #     )
-    # else:
     apply_repetition_penalties_torch(
         logits, prompt_mask, output_mask, repetition_penalties
     )
@@ -942,14 +935,14 @@ def sparse_prefill_fwd(
 
 
 # Fused vocab-parallel embedding lookup (pure-torch ILU fallback).
-# Community 0.29.0 added a fused ``torch.ops._C.vocab_parallel_embedding`` kernel
-# (commit e2c8eeac40, "[kernel] Fused embedding kernel") used by
+# Community v0.30.0 (ced6857afa) ships a fused ``torch.ops._C.vocab_parallel_embedding`` kernel
+# (added at commit e2c8eeac40, "[kernel] Fused embedding kernel") used by
 # VocabParallelEmbedding.forward when ``use_fused_embedding`` is True (TP>1 +
 # cuda + unquantized). The Iluvatar plugin _C does not register that op, so
 # replicate the kernel's semantics — range mask, id shift, gather, out-of-shard
 # zeroing — in pure torch. This mirrors the community
-# ``get_masked_input_and_mask`` + ``embedding`` + masked_fill path that 0.28.0
-# used; an all-reduce over TP ranks still yields the full embedding.
+# ``get_masked_input_and_mask`` + ``embedding`` + masked_fill path used
+# before that fused kernel; an all-reduce over TP ranks still yields the full embedding.
 def vocab_parallel_embedding(
     input_ids: torch.Tensor,
     weight: torch.Tensor,

@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Iluvatar compressed-tensors linear method-selection wrapper.
 
-Corresponds to:
-    vllm/model_executor/layers/quantization/compressed_tensors/
-    compressed_tensors.py
+Corresponds to: vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py
 
 Target   : Replace CompressedTensorsConfig with IluQuantConfig
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (ced6857afa)
 Why      : Official CompressedTensors standards cannot cover
            distribution specific quantization implementations.
 How      : IluQuantConfig extends the CompressedTensorsConfig and

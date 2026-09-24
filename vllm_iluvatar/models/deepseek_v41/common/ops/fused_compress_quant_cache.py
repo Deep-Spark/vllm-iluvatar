@@ -115,7 +115,7 @@ def rope_quant_insert(
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     compress_ratio: int,
-    fp8_scale: torch.Tensor | None = None,
+    row_out: torch.Tensor | None = None,
 ) -> None:
     """Apply GPT-J RoPE and publish a latent into the compressed KV cache.
 
@@ -125,9 +125,14 @@ def rope_quant_insert(
     reference does, so no block table is involved.
 
     ``kv_cache``'s dtype selects the record: ``uint8`` with a 584-byte row is
-    the packed fp8_ds_mla one, ``bfloat16`` and ``float8_e4m3fn`` the plain
-    [448 NoPE | 64 RoPE] rows, the latter divided by the per-tensor
-    ``fp8_scale``.
+    the packed fp8_ds_mla one, ``bfloat16`` the plain [448 NoPE | 64 RoPE] row.
+    Official also offers a per-tensor-fp8 plain row and takes an ``fp8_scale``
+    for it; nothing on this platform reads that record, so neither the record
+    nor the argument is carried here.
+
+    ``row_out``, when a pipeline cut leaves this layer's consumers on a later
+    rank, receives the same record in token order so it can cross the boundary
+    and be replayed there.
     """
     if slot_mapping.numel() == 0:
         return
@@ -138,5 +143,25 @@ def rope_quant_insert(
         kv_cache,
         slot_mapping,
         compress_ratio,
-        fp8_scale,
+        row_out,
+    )
+
+
+def move_rows_to_paged_cache(
+    rows: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    compress_ratio: int,
+) -> None:
+    """Replay records received from an earlier pipeline rank into a local cache.
+
+    ``rows`` is the dense ``[num_tokens, record_width]`` mirror the producing
+    rank filled through ``row_out``; ``slot_mapping`` is this rank's. Nothing
+    is recomputed, so the replica holds the producer's bytes exactly.
+    """
+    if slot_mapping.numel() == 0:
+        return
+    torch.ops._C.v41_move_rows_to_paged_cache(
+        rows, kv_cache, slot_mapping, positions, compress_ratio
     )

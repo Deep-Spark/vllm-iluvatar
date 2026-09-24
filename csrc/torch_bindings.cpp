@@ -88,12 +88,17 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
       "v41_rope_insert("
       "Tensor latent, Tensor positions, Tensor cos_sin_cache, "
       "Tensor! kv_cache, Tensor slot_mapping, int compress_ratio, "
-      "Tensor? fp8_scale=None) -> ()");
+      "Tensor(a!)? row_out=None) -> ()");
   ops.def(
       "v41_indexer_k_norm_rope_store("
       "Tensor k_pre, Tensor positions, Tensor cos_sin_cache, "
       "Tensor rms_norm_weight, float rms_norm_eps, Tensor! k_cache, "
-      "Tensor kv_slot_mapping, int compress_ratio, bool store_fp8) -> ()");
+      "Tensor kv_slot_mapping, int compress_ratio, bool store_fp8, "
+      "Tensor(a!)? row_out=None) -> ()");
+  ops.def(
+      "v41_move_rows_to_paged_cache("
+      "Tensor rows, Tensor! kv_cache, Tensor slot_mapping, "
+      "Tensor positions, int compress_ratio) -> ()");
   ops.def(
       "v41_indexer_q_rope("
       "Tensor! q, Tensor positions, Tensor cos_sin_cache, Tensor weights_in, "
@@ -145,6 +150,8 @@ TORCH_LIBRARY_IMPL_EXPAND(_C, CUDA, ops) {
   ops.impl("v41_rope_insert", &vllm_iluvatar::v41_rope_insert);
   ops.impl("v41_indexer_k_norm_rope_store",
            &vllm_iluvatar::v41_indexer_k_norm_rope_store);
+  ops.impl("v41_move_rows_to_paged_cache",
+           &vllm_iluvatar::v41_move_rows_to_paged_cache);
   ops.impl("v41_indexer_q_rope", &vllm_iluvatar::v41_indexer_q_rope);
   ops.impl("v41_indexer_q_rope_fp8",
            &vllm_iluvatar::v41_indexer_q_rope_fp8);

@@ -159,7 +159,7 @@ def test_rope_insert_bf16(compress_ratio: int):
     )
 
     torch.ops._C.v41_rope_insert(
-        latent, positions, cos_sin, cache, slots, compress_ratio, None
+        latent, positions, cos_sin, cache, slots, compress_ratio
     )
 
     rope_pos = (positions // compress_ratio) * compress_ratio
@@ -213,7 +213,7 @@ def test_rope_insert_packed_matches_ixformer(compress_ratio: int):
     theirs = torch.zeros_like(ours)
 
     torch.ops._C.v41_rope_insert(
-        latent, positions, cos_sin, ours, slots, compress_ratio, None
+        latent, positions, cos_sin, ours, slots, compress_ratio
     )
     ixfops.v41_rope_fp8_insert_by_token(
         theirs,
@@ -247,7 +247,7 @@ def test_rope_insert_packed_record(compress_ratio: int):
         dtype=torch.uint8,
     )
     torch.ops._C.v41_rope_insert(
-        latent, positions, cos_sin, cache, slots, compress_ratio, None
+        latent, positions, cos_sin, cache, slots, compress_ratio
     )
 
     rope_pos = (positions // compress_ratio) * compress_ratio
@@ -290,33 +290,79 @@ def test_rope_insert_packed_record(compress_ratio: int):
         )
 
 
-def test_rope_insert_plain_fp8():
-    torch.manual_seed(4)
+# The four records this platform stores, and nothing else. Anything outside
+# the table has no reader here, so the ops reject it rather than writing bytes
+# that would later be decoded as something they are not.
+_MAIN_RECORDS = [(PACKED_ROW_BYTES, torch.uint8), (LATENT_DIM, torch.bfloat16)]
+_INDEX_RECORDS = [(INDEX_HEAD_DIM + 4, torch.uint8), (INDEX_HEAD_DIM, torch.bfloat16)]
+
+
+@pytest.mark.parametrize("width,dtype", _MAIN_RECORDS)
+def test_the_main_record_geometries_round_trip(width: int, dtype: torch.dtype):
+    """fp8 is 584 uint8 and bf16 is 512 bf16, on both the write and the move."""
+    torch.manual_seed(13)
     num_tokens, rows_per_page, compress_ratio = 32, 8, 1
     positions, slots, _, _, num_pages = _paged_layout(
-        num_tokens, rows_per_page, compress_ratio, seed=4
+        num_tokens, rows_per_page, compress_ratio, seed=13
     )
     cos_sin = _make_cos_sin(128)
     latent = torch.randn(num_tokens, LATENT_DIM, device=DEVICE, dtype=torch.bfloat16)
-    scale = torch.tensor([0.5], device=DEVICE, dtype=torch.float32)
-    cache = torch.zeros(
-        num_pages,
-        rows_per_page,
-        LATENT_DIM,
-        device=DEVICE,
-        dtype=torch.float8_e4m3fn,
-    )
+    cache = torch.zeros(num_pages, rows_per_page, width, device=DEVICE, dtype=dtype)
+    rows = torch.zeros(num_tokens, width, device=DEVICE, dtype=dtype)
     torch.ops._C.v41_rope_insert(
-        latent, positions, cos_sin, cache, slots, compress_ratio, scale
+        latent, positions, cos_sin, cache, slots, compress_ratio, rows
     )
+    # Guard against a vacuous round trip: an op that wrote nothing at all
+    # would replay nothing and still compare equal.
+    assert bool((cache.view(torch.uint8) != 0).any())
+    replayed = torch.zeros_like(cache)
+    torch.ops._C.v41_move_rows_to_paged_cache(
+        rows, replayed, slots, positions, compress_ratio
+    )
+    assert torch.equal(replayed, cache)
 
-    rotated = _bf16_round(_rope_rows(latent.float(), positions, cos_sin))
-    expected = (rotated / scale).clamp(-FP8_MAX, FP8_MAX)
-    ok = _publishes(positions, slots, compress_ratio)
-    for t in torch.nonzero(ok).flatten().tolist():
-        slot = int(slots[t])
-        got = cache[slot // rows_per_page, slot % rows_per_page].float()
-        torch.testing.assert_close(got, expected[t], rtol=7e-2, atol=1e-3)
+
+def test_the_main_store_rejects_a_record_it_has_no_reader_for():
+    """Per-tensor fp8 rows are official's third option and unread here."""
+    positions = torch.zeros(4, device=DEVICE, dtype=torch.int64)
+    slots = torch.arange(4, device=DEVICE, dtype=torch.int64)
+    cos_sin = _make_cos_sin(8)
+    latent = torch.randn(4, LATENT_DIM, device=DEVICE, dtype=torch.bfloat16)
+    cache = torch.zeros(1, 4, LATENT_DIM, device=DEVICE, dtype=torch.float8_e4m3fn)
+    with pytest.raises(RuntimeError, match="packed uint8 record or a plain bf16"):
+        torch.ops._C.v41_rope_insert(latent, positions, cos_sin, cache, slots, 1)
+
+
+@pytest.mark.parametrize("width,dtype", _INDEX_RECORDS)
+def test_the_index_record_geometries_round_trip(width: int, dtype: torch.dtype):
+    """fp8 is 132 uint8 and bf16 is 128 bf16, on both the write and the move."""
+    torch.manual_seed(14)
+    num_tokens, rows_per_page, eps, compress_ratio = 32, 8, 1e-6, 1
+    positions, slots, _, _, num_pages = _paged_layout(
+        num_tokens, rows_per_page, compress_ratio, seed=14
+    )
+    cos_sin = _make_cos_sin(128)
+    k_pre = torch.randn(num_tokens, INDEX_HEAD_DIM, device=DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(INDEX_HEAD_DIM, device=DEVICE, dtype=torch.bfloat16)
+    cache = torch.zeros(num_pages, rows_per_page, width, device=DEVICE, dtype=dtype)
+    rows = torch.zeros(num_tokens, width, device=DEVICE, dtype=dtype)
+    torch.ops._C.v41_indexer_k_norm_rope_store(
+        k_pre,
+        positions,
+        cos_sin,
+        weight,
+        eps,
+        cache,
+        slots,
+        compress_ratio,
+        dtype is torch.uint8,
+        rows,
+    )
+    replayed = torch.zeros_like(cache)
+    torch.ops._C.v41_move_rows_to_paged_cache(
+        rows, replayed, slots, positions, compress_ratio
+    )
+    assert torch.equal(replayed, cache)
 
 
 # ---------------------------------------------------------------------------
@@ -507,12 +553,261 @@ def test_indexer_q_rope_fp8():
     )
 
 
+# ---------------------------------------------------------------------------
+# Pipeline transfer: the dense mirror, and replaying it into another cache
+# ---------------------------------------------------------------------------
+
+
+def _packed_record_from_page(
+    cache: torch.Tensor,
+    slot: int,
+    rows_per_page: int,
+    value_bytes: int,
+    scale_bytes: int,
+) -> torch.Tensor:
+    """The contiguous [values | scales] record a segregated page holds."""
+    page, row = slot // rows_per_page, slot % rows_per_page
+    flat = cache.reshape(cache.size(0), -1)
+    values = flat[page, row * value_bytes : (row + 1) * value_bytes]
+    sbase = rows_per_page * value_bytes + row * scale_bytes
+    return torch.cat([values, flat[page, sbase : sbase + scale_bytes]])
+
+
+@pytest.mark.parametrize("compress_ratio", [1, 2])
+def test_rope_insert_row_out_mirrors_the_page(compress_ratio: int):
+    """What crosses the pipeline must be what the page holds, byte for byte.
+
+    The receiving rank replays these bytes instead of recomputing, so any
+    divergence here would put a different record on each side of the cut.
+    """
+    torch.manual_seed(9)
+    num_tokens, rows_per_page = 48, 8
+    positions, slots, _, _, num_pages = _paged_layout(
+        num_tokens, rows_per_page, compress_ratio, seed=9
+    )
+    cos_sin = _make_cos_sin(128)
+    latent = torch.randn(num_tokens, LATENT_DIM, device=DEVICE, dtype=torch.bfloat16)
+    cache = torch.zeros(
+        num_pages,
+        rows_per_page,
+        PACKED_ROW_BYTES,
+        device=DEVICE,
+        dtype=torch.uint8,
+    )
+    rows = torch.zeros(num_tokens, PACKED_ROW_BYTES, device=DEVICE, dtype=torch.uint8)
+
+    torch.ops._C.v41_rope_insert(
+        latent, positions, cos_sin, cache, slots, compress_ratio, rows
+    )
+
+    ok = _publishes(positions, slots, compress_ratio)
+    assert bool(ok.any())
+    for t in torch.nonzero(ok).flatten().tolist():
+        expected = _packed_record_from_page(
+            cache,
+            int(slots[t]),
+            rows_per_page,
+            PACKED_DATA_BYTES,
+            PACKED_SCALE_BYTES,
+        )
+        assert torch.equal(rows[t], expected)
+    # A token that published nothing leaves its mirror row alone; the receiver
+    # reapplies the same test, so the staleness is never read.
+    for t in torch.nonzero(~ok).flatten().tolist():
+        assert torch.all(rows[t] == 0)
+
+
+@pytest.mark.parametrize("store_fp8", [False, True])
+def test_indexer_k_store_row_out_mirrors_the_page(store_fp8: bool):
+    torch.manual_seed(10)
+    num_tokens, rows_per_page, eps, compress_ratio = 48, 8, 1e-6, 2
+    positions, slots, _, _, num_pages = _paged_layout(
+        num_tokens, rows_per_page, compress_ratio, seed=10
+    )
+    cos_sin = _make_cos_sin(128)
+    k_pre = torch.randn(num_tokens, INDEX_HEAD_DIM, device=DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(INDEX_HEAD_DIM, device=DEVICE, dtype=torch.bfloat16)
+
+    row_bytes = INDEX_HEAD_DIM + 4 if store_fp8 else INDEX_HEAD_DIM
+    dtype = torch.uint8 if store_fp8 else torch.bfloat16
+    cache = torch.zeros(num_pages, rows_per_page, row_bytes, device=DEVICE, dtype=dtype)
+    rows = torch.zeros(num_tokens, row_bytes, device=DEVICE, dtype=dtype)
+
+    torch.ops._C.v41_indexer_k_norm_rope_store(
+        k_pre,
+        positions,
+        cos_sin,
+        weight,
+        eps,
+        cache,
+        slots,
+        compress_ratio,
+        store_fp8,
+        rows,
+    )
+
+    ok = _publishes(positions, slots, compress_ratio)
+    assert bool(ok.any())
+    for t in torch.nonzero(ok).flatten().tolist():
+        slot = int(slots[t])
+        if store_fp8:
+            expected = _packed_record_from_page(
+                cache, slot, rows_per_page, INDEX_HEAD_DIM, 4
+            )
+        else:
+            expected = cache[slot // rows_per_page, slot % rows_per_page]
+        assert torch.equal(rows[t], expected)
+
+
+@pytest.mark.parametrize("compress_ratio", [1, 2])
+@pytest.mark.parametrize("packed", [True, False])
+def test_move_rows_replays_into_a_different_slot_mapping(
+    compress_ratio: int, packed: bool
+):
+    """The receiving rank's cache must end up holding the sender's records.
+
+    The two ranks page the same tokens differently, which is the whole reason
+    the transfer is dense rows and a local slot mapping rather than a cache
+    copy. Here the receiver's block table is shifted, so the slots genuinely
+    differ and a kernel that ignored them would fail.
+    """
+    torch.manual_seed(11)
+    num_tokens, rows_per_page = 48, 8
+    positions, send_slots, _, _, num_pages = _paged_layout(
+        num_tokens, rows_per_page, compress_ratio, seed=11
+    )
+    # The receiver's pages for the same tokens, one page further along.
+    recv_slots = torch.where(send_slots < 0, send_slots, send_slots + rows_per_page)
+    recv_pages = num_pages + 1
+
+    width = PACKED_ROW_BYTES if packed else LATENT_DIM
+    dtype = torch.uint8 if packed else torch.bfloat16
+    cos_sin = _make_cos_sin(128)
+    latent = torch.randn(num_tokens, LATENT_DIM, device=DEVICE, dtype=torch.bfloat16)
+    sender_cache = torch.zeros(
+        num_pages, rows_per_page, width, device=DEVICE, dtype=dtype
+    )
+    rows = torch.zeros(num_tokens, width, device=DEVICE, dtype=dtype)
+    torch.ops._C.v41_rope_insert(
+        latent,
+        positions,
+        cos_sin,
+        sender_cache,
+        send_slots,
+        compress_ratio,
+        rows,
+    )
+
+    recv_cache = torch.zeros(
+        recv_pages, rows_per_page, width, device=DEVICE, dtype=dtype
+    )
+    torch.ops._C.v41_move_rows_to_paged_cache(
+        rows, recv_cache, recv_slots, positions, compress_ratio
+    )
+
+    ok = _publishes(positions, send_slots, compress_ratio)
+    assert bool(ok.any())
+    for t in torch.nonzero(ok).flatten().tolist():
+        send_slot, recv_slot = int(send_slots[t]), int(recv_slots[t])
+        if packed:
+            sent = _packed_record_from_page(
+                sender_cache,
+                send_slot,
+                rows_per_page,
+                PACKED_DATA_BYTES,
+                PACKED_SCALE_BYTES,
+            )
+            got = _packed_record_from_page(
+                recv_cache,
+                recv_slot,
+                rows_per_page,
+                PACKED_DATA_BYTES,
+                PACKED_SCALE_BYTES,
+            )
+        else:
+            sent = sender_cache[send_slot // rows_per_page, send_slot % rows_per_page]
+            got = recv_cache[recv_slot // rows_per_page, recv_slot % rows_per_page]
+        assert torch.equal(got, sent)
+
+    # Slots the sender skipped stay untouched on the receiver, even though the
+    # mirror row for those tokens holds whatever was there before. A packed
+    # page is segregated, so "untouched" is about the record, not about the
+    # 584-byte window a plain tensor index would give.
+    written = {int(recv_slots[t]) for t in torch.nonzero(ok).flatten().tolist()}
+    for slot in range(recv_pages * rows_per_page):
+        if slot in written:
+            continue
+        if packed:
+            record = _packed_record_from_page(
+                recv_cache,
+                slot,
+                rows_per_page,
+                PACKED_DATA_BYTES,
+                PACKED_SCALE_BYTES,
+            )
+        else:
+            record = recv_cache[slot // rows_per_page, slot % rows_per_page]
+        assert torch.all(record == 0)
+
+
+def test_move_rows_replays_the_indexer_record():
+    """The indexer key takes the same route, at its own record width."""
+    torch.manual_seed(12)
+    num_tokens, rows_per_page, eps, compress_ratio = 32, 8, 1e-6, 1
+    positions, send_slots, _, _, num_pages = _paged_layout(
+        num_tokens, rows_per_page, compress_ratio, seed=12
+    )
+    recv_slots = torch.where(send_slots < 0, send_slots, send_slots + rows_per_page)
+    cos_sin = _make_cos_sin(128)
+    k_pre = torch.randn(num_tokens, INDEX_HEAD_DIM, device=DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(INDEX_HEAD_DIM, device=DEVICE, dtype=torch.bfloat16)
+
+    sender_cache = torch.zeros(
+        num_pages,
+        rows_per_page,
+        INDEX_HEAD_DIM,
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    )
+    rows = torch.zeros(num_tokens, INDEX_HEAD_DIM, device=DEVICE, dtype=torch.bfloat16)
+    torch.ops._C.v41_indexer_k_norm_rope_store(
+        k_pre,
+        positions,
+        cos_sin,
+        weight,
+        eps,
+        sender_cache,
+        send_slots,
+        compress_ratio,
+        False,
+        rows,
+    )
+    recv_cache = torch.zeros(
+        num_pages + 1,
+        rows_per_page,
+        INDEX_HEAD_DIM,
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    )
+    torch.ops._C.v41_move_rows_to_paged_cache(
+        rows, recv_cache, recv_slots, positions, compress_ratio
+    )
+
+    ok = _publishes(positions, send_slots, compress_ratio)
+    for t in torch.nonzero(ok).flatten().tolist():
+        send_slot, recv_slot = int(send_slots[t]), int(recv_slots[t])
+        assert torch.equal(
+            recv_cache[recv_slot // rows_per_page, recv_slot % rows_per_page],
+            sender_cache[send_slot // rows_per_page, send_slot % rows_per_page],
+        )
+
+
 def test_empty_batches_are_noops():
     cos_sin = _make_cos_sin(8)
     empty_i64 = torch.empty(0, device=DEVICE, dtype=torch.int64)
     latent = torch.empty(0, LATENT_DIM, device=DEVICE, dtype=torch.bfloat16)
     cache = torch.zeros(1, 4, LATENT_DIM, device=DEVICE, dtype=torch.bfloat16)
-    torch.ops._C.v41_rope_insert(latent, empty_i64, cos_sin, cache, empty_i64, 1, None)
+    torch.ops._C.v41_rope_insert(latent, empty_i64, cos_sin, cache, empty_i64, 1)
     assert torch.all(cache == 0)
 
     kv_score = torch.empty(0, LATENT_DIM, device=DEVICE)

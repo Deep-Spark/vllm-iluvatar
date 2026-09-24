@@ -111,7 +111,8 @@ __global__ void v41_rope_insert_packed_kernel(
     const float* __restrict__ cos_sin_cache, int64_t cos_sin_stride,
     uint8_t* __restrict__ cache, int64_t page_stride, int rows_per_page,
     int64_t num_pages, const void* __restrict__ slot_mapping,
-    bool slots_are_int64, int compress_ratio) {
+    bool slots_are_int64, int compress_ratio,
+    uint8_t* __restrict__ row_out) {
   const int64_t token = blockIdx.x;
   int64_t page, row, rope_pos;
   if (!resolve_slot(positions, positions_are_int64, slot_mapping,
@@ -140,6 +141,11 @@ __global__ void v41_rope_insert_packed_kernel(
   (void)amax;
 
   uint8_t* const data = cache + page * page_stride + row * kFp8TokenDataBytes;
+  // The pipeline replica, when this rank has to hand the record to the next
+  // one. Same bytes, addressed by token instead of by slot, so the record is
+  // written once and read twice rather than recomputed downstream.
+  uint8_t* const mirror =
+      row_out == nullptr ? nullptr : row_out + token * kFp8RecordBytes;
 
   if (rotates) {
     // The record keeps the RoPE tail in BF16, so the rotation is stored as it
@@ -147,8 +153,11 @@ __global__ void v41_rope_insert_packed_kernel(
     __nv_bfloat162 out;
     out.x = __float2bfloat16_rn(even);
     out.y = __float2bfloat16_rn(odd);
-    *reinterpret_cast<__nv_bfloat162*>(data + kFp8NopeBytes +
-                                       (d0 - kRopeStart) * 2) = out;
+    const int rope_byte = kFp8NopeBytes + (d0 - kRopeStart) * 2;
+    *reinterpret_cast<__nv_bfloat162*>(data + rope_byte) = out;
+    if (mirror != nullptr) {
+      *reinterpret_cast<__nv_bfloat162*>(mirror + rope_byte) = out;
+    }
     return;
   }
 
@@ -159,6 +168,9 @@ __global__ void v41_rope_insert_packed_kernel(
   bytes.x = e4m3_bits(even * inv_scale);
   bytes.y = e4m3_bits(odd * inv_scale);
   *reinterpret_cast<uchar2*>(data + d0) = bytes;
+  if (mirror != nullptr) {
+    *reinterpret_cast<uchar2*>(mirror + d0) = bytes;
+  }
 
   if (d0 % kFp8QuantGroup == 0) {
     uint8_t* const scales = cache + page * page_stride +
@@ -169,21 +181,25 @@ __global__ void v41_rope_insert_packed_kernel(
     // The eighth byte exists to make the region a multiple of eight; the
     // readers skip it, but a page of uninitialised memory should not carry it.
     if (d0 == 0) scales[kFp8NumScales] = 0;
+    if (mirror != nullptr) {
+      mirror[kFp8TokenDataBytes + d0 / kFp8QuantGroup] = scale_bits;
+      if (d0 == 0) mirror[kFp8TokenDataBytes + kFp8NumScales] = 0;
+    }
   }
 #endif
 }
 
-// Plain [448 NoPE | 64 RoPE] row, bf16 or e4m3 against a per-tensor scale.
-// This is the reference's ``_rope_plain_insert_kernel``.
-template <bool STORE_FP8>
+// Plain [448 NoPE | 64 RoPE] bf16 row, the reference's
+// ``_rope_plain_insert_kernel`` without its per-tensor-fp8 variant: this
+// platform's two main-KV records are the packed 584-byte one and this.
 __global__ void v41_rope_insert_plain_kernel(
     const __nv_bfloat16* __restrict__ latent, int64_t latent_stride,
     const void* __restrict__ positions, bool positions_are_int64,
     const float* __restrict__ cos_sin_cache, int64_t cos_sin_stride,
-    void* __restrict__ cache, int64_t page_stride, int64_t row_stride,
+    __nv_bfloat16* __restrict__ cache, int64_t page_stride, int64_t row_stride,
     int rows_per_page, int64_t num_pages,
     const void* __restrict__ slot_mapping, bool slots_are_int64,
-    int compress_ratio, const float* __restrict__ fp8_scale) {
+    int compress_ratio, __nv_bfloat16* __restrict__ row_out) {
   const int64_t token = blockIdx.x;
   int64_t page, row, rope_pos;
   if (!resolve_slot(positions, positions_are_int64, slot_mapping,
@@ -204,26 +220,13 @@ __global__ void v41_rope_insert_plain_kernel(
                  (d0 - kRopeStart) / 2, kRopeDim);
   }
 
-  const int64_t offset = page * page_stride + row * row_stride + d0;
-  if constexpr (STORE_FP8) {
-#ifdef ILUVATAR_HAS_FP8_FP4
-    // The reference rounds to bf16 first (its row is a bf16 tensor), then
-    // scales; matching that keeps the two writers bit-identical.
-    const float inv_scale = 1.0f / *fp8_scale;
-    uint8_t* dst = static_cast<uint8_t*>(cache) + offset;
-    uchar2 bytes;
-    bytes.x = e4m3_bits(
-        fminf(fmaxf(bf16_round(even) * inv_scale, -kE4m3Max), kE4m3Max));
-    bytes.y = e4m3_bits(
-        fminf(fmaxf(bf16_round(odd) * inv_scale, -kE4m3Max), kE4m3Max));
-    *reinterpret_cast<uchar2*>(dst) = bytes;
-#endif
-  } else {
-    __nv_bfloat162 out;
-    out.x = __float2bfloat16_rn(even);
-    out.y = __float2bfloat16_rn(odd);
-    *reinterpret_cast<__nv_bfloat162*>(static_cast<__nv_bfloat16*>(cache) +
-                                       offset) = out;
+  __nv_bfloat162 out;
+  out.x = __float2bfloat16_rn(even);
+  out.y = __float2bfloat16_rn(odd);
+  *reinterpret_cast<__nv_bfloat162*>(
+      cache + page * page_stride + row * row_stride + d0) = out;
+  if (row_out != nullptr) {
+    *reinterpret_cast<__nv_bfloat162*>(row_out + token * kLatentDim + d0) = out;
   }
 }
 
@@ -281,7 +284,7 @@ void v41_compress_norm_cr1(torch::Tensor& kv_score,
 void v41_rope_insert(torch::Tensor& latent, torch::Tensor& positions,
                      torch::Tensor& cos_sin_cache, torch::Tensor& kv_cache,
                      torch::Tensor& slot_mapping, int64_t compress_ratio,
-                     const std::optional<torch::Tensor>& fp8_scale) {
+                     const std::optional<torch::Tensor>& row_out) {
   TORCH_CHECK(compress_ratio == 1 || compress_ratio == 2,
               "compress_ratio must be 1 or 2, got ", compress_ratio);
   TORCH_CHECK(latent.is_cuda() && latent.dim() == 2 &&
@@ -313,6 +316,23 @@ void v41_rope_insert(torch::Tensor& latent, torch::Tensor& positions,
   const bool positions_are_int64 = positions.scalar_type() == at::kLong;
   const bool slots_are_int64 = slot_mapping.scalar_type() == at::kLong;
 
+  // ``row_out`` mirrors the record in token order for the next pipeline rank.
+  // Its width is the record's, not the cache's page geometry.
+  void* row_ptr = nullptr;
+  if (row_out.has_value()) {
+    const torch::Tensor& rows = *row_out;
+    TORCH_CHECK(rows.is_cuda() && rows.dim() == 2 && rows.is_contiguous(),
+                "row_out must be a 2D contiguous CUDA tensor");
+    TORCH_CHECK(rows.size(0) >= num_tokens,
+                "row_out is shorter than the token count");
+    TORCH_CHECK(rows.scalar_type() == kv_cache.scalar_type(),
+                "row_out must share the cache dtype");
+    TORCH_CHECK(rows.size(1) == kv_cache.size(2),
+                "row_out rows are ", rows.size(1), " wide but the cache "
+                "record is ", kv_cache.size(2));
+    row_ptr = rows.data_ptr();
+  }
+
   const at::cuda::OptionalCUDAGuard device_guard(device_of(latent));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const unsigned grid = static_cast<unsigned>(num_tokens);
@@ -336,38 +356,24 @@ void v41_rope_insert(torch::Tensor& latent, torch::Tensor& positions,
         positions_are_int64, cos_sin_ptr, cos_sin_cache.stride(0),
         reinterpret_cast<uint8_t*>(kv_cache.data_ptr()), kv_cache.stride(0),
         rows_per_page, num_pages, slot_mapping.data_ptr(), slots_are_int64,
-        static_cast<int>(compress_ratio));
+        static_cast<int>(compress_ratio),
+        reinterpret_cast<uint8_t*>(row_ptr));
     return;
   }
 
+  TORCH_CHECK(kv_cache.scalar_type() == at::kBFloat16,
+              "the compressed KV cache is either the packed uint8 record or a "
+              "plain bf16 row; got ", kv_cache.scalar_type());
   TORCH_CHECK(kv_cache.size(2) == kLatentDim && kv_cache.stride(2) == 1,
               "a plain compressed cache row is 512 wide and contiguous");
-  const bool store_fp8 = kv_cache.scalar_type() == at::kFloat8_e4m3fn;
-  TORCH_CHECK(store_fp8 || kv_cache.scalar_type() == at::kBFloat16,
-              "kv_cache must be uint8 (packed), bfloat16 or float8_e4m3fn");
-
-  if (store_fp8) {
-#ifndef ILUVATAR_HAS_FP8_FP4
-    TORCH_CHECK(false, "the fp8 compressed cache needs an ivcore30 build");
-#endif
-    TORCH_CHECK(fp8_scale.has_value() && fp8_scale->numel() == 1 &&
-                    fp8_scale->scalar_type() == at::kFloat &&
-                    fp8_scale->is_cuda(),
-                "an fp8 cache needs a single fp32 CUDA fp8_scale");
-    v41_rope_insert_plain_kernel<true><<<grid, kLatentThreads, 0, stream>>>(
-        latent_ptr, latent.stride(0), positions.data_ptr(),
-        positions_are_int64, cos_sin_ptr, cos_sin_cache.stride(0),
-        kv_cache.data_ptr(), kv_cache.stride(0), kv_cache.stride(1),
-        rows_per_page, num_pages, slot_mapping.data_ptr(), slots_are_int64,
-        static_cast<int>(compress_ratio), fp8_scale->data_ptr<float>());
-  } else {
-    v41_rope_insert_plain_kernel<false><<<grid, kLatentThreads, 0, stream>>>(
-        latent_ptr, latent.stride(0), positions.data_ptr(),
-        positions_are_int64, cos_sin_ptr, cos_sin_cache.stride(0),
-        kv_cache.data_ptr(), kv_cache.stride(0), kv_cache.stride(1),
-        rows_per_page, num_pages, slot_mapping.data_ptr(), slots_are_int64,
-        static_cast<int>(compress_ratio), nullptr);
-  }
+  v41_rope_insert_plain_kernel<<<grid, kLatentThreads, 0, stream>>>(
+      latent_ptr, latent.stride(0), positions.data_ptr(), positions_are_int64,
+      cos_sin_ptr, cos_sin_cache.stride(0),
+      reinterpret_cast<__nv_bfloat16*>(kv_cache.data_ptr()),
+      kv_cache.stride(0), kv_cache.stride(1), rows_per_page, num_pages,
+      slot_mapping.data_ptr(), slots_are_int64,
+      static_cast<int>(compress_ratio),
+      reinterpret_cast<__nv_bfloat16*>(row_ptr));
 }
 
 }  // namespace vllm_iluvatar

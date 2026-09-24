@@ -35,6 +35,7 @@ def indexer_k_norm_rope_store(
     kv_slot_mapping: torch.Tensor,
     compress_ratio: int,
     store_fp8: bool,
+    row_out: torch.Tensor | None = None,
 ) -> None:
     """k_norm -> RoPE -> store for indexer keys.
 
@@ -54,6 +55,9 @@ def indexer_k_norm_rope_store(
         kv_slot_mapping: [num_tokens] slots in the indexer cache (-1 = skip).
         compress_ratio: group size; keys are emitted at group boundaries.
         store_fp8: per-token E4M3 with one FP32 scale when True, else BF16.
+        row_out: When a pipeline cut leaves this layer's consumers on a later
+            rank, receives the same record in token order so it can cross the
+            boundary and be replayed there.
 
     """
     assert k_pre.ndim == 2 and k_pre.shape[1] == 128
@@ -74,4 +78,5 @@ def indexer_k_norm_rope_store(
         kv_slot_mapping,
         compress_ratio,
         store_fp8,
+        row_out,
     )

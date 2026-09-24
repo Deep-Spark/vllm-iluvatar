@@ -4,18 +4,26 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from functools import partial
 from itertools import islice
 
 import torch
+from torch import nn
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
+from vllm.model_executor.models.interfaces import SupportsEagle3
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
     WeightsMapper,
     extract_layer_index,
 )
-from vllm.model_executor.models.interfaces import SupportsEagle3
+from vllm.model_executor.offloader import get_offloader
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from vllm_iluvatar.models.deepseek_v4.fp8_model import (
@@ -36,6 +44,7 @@ from vllm_iluvatar.models.deepseek_v41.engram import (
     compute_hash_multipliers,
     engram_dp_group,
 )
+from vllm_iluvatar.models.deepseek_v41.pp_plan import build_rank_plan, local_kv_source
 
 logger = init_logger(f"vllm.{__name__}")
 
@@ -44,8 +53,7 @@ _ENGRAM_SKIP = re.compile(r"(^|\.)engram\.")
 
 
 def default_aux_hidden_state_layers(hf_config) -> tuple[int, ...]:
-    """Aux capture layers for a V4.1 DSpark draft.
-    """
+    """Aux capture layers for a V4.1 DSpark draft."""
     return tuple(getattr(hf_config, "dspark_target_layer_ids", None) or ())
 
 
@@ -67,7 +75,21 @@ class IluDeepseekV41DecoderLayer(IluDeepseekV4Fp8DecoderLayer):
         vllm_config: VllmConfig,
         prefix: str,
         topk_indices_buffer: torch.Tensor | None = None,
+        *,
+        is_kv_forwarder: bool = False,
+        is_kv_sender: bool = False,
+        kv_source_override: int | None = None,
     ) -> None:
+        # The V4 layer constructs the attention itself and knows nothing about
+        # pipeline roles, so bind them onto the callable it uses. An instance
+        # attribute shadows the class one, and this runs before the base
+        # constructor reaches that call.
+        self.attention_cls = partial(
+            IluDeepseekV41Attention,
+            is_kv_forwarder=is_kv_forwarder,
+            is_kv_sender=is_kv_sender,
+            kv_source_override=kv_source_override,
+        )
         super().__init__(vllm_config, prefix, topk_indices_buffer)
         self.layer_id = extract_layer_index(prefix)
         # Set by IluDeepseekV41Model for the engram layers only.
@@ -136,22 +158,42 @@ class IluDeepseekV41DecoderLayer(IluDeepseekV4Fp8DecoderLayer):
             sqrsum = None
 
         attn_post, attn_comb, h, attn_pre = self._hc_pre_mixes(
-            residual, "attn", self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
-            pre_mix, sqrsum, self.attn_norm
+            residual,
+            "attn",
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            pre_mix,
+            sqrsum,
+            self.attn_norm,
         )
         h = self.attn(positions, h, None)
         residual, attn_sqrsum = mhc.hc_post_sqrsum(h, residual, attn_post, attn_comb)
 
         ffn_post, ffn_comb, h, ffn_pre = self._hc_pre_mixes(
-            residual, "ffn", self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
-            attn_pre, attn_sqrsum, self.ffn_norm
+            residual,
+            "ffn",
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            attn_pre,
+            attn_sqrsum,
+            self.ffn_norm,
         )
         h = self.ffn(h, input_ids)
         return h, residual, ffn_post, ffn_comb, ffn_pre
 
 
 class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
-    """V4 model plus V4.1 attention, the engram layers, and the token history they share."""
+    """V4.1 backbone: V4.1 attention, the engram layers, and the pipeline cut.
+
+    The constructor is V4.1's own rather than the V4 parent's, because the
+    layer list is where the pipeline plan has to be applied: which layer
+    replicates a stranded KV group, which one mirrors its records for the next
+    rank, and which cache every consumer should read. Weight loading is still
+    the parent's -- the FP8 checkpoint layout is identical and there is nothing
+    to gain from a second copy of it.
+    """
 
     decoder_layer_cls = IluDeepseekV41DecoderLayer
 
@@ -168,44 +210,186 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
     ]
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
-        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        nn.Module.__init__(self)
 
-        # No global MHC head in the V4.1 checkpoint.
-        del self.hc_head_fn, self.hc_head_base, self.hc_head_scale
+        config = vllm_config.model_config.hf_config
+        self.config = config
+        self.quant_config = vllm_config.quant_config
+        self.parallel_config = vllm_config.parallel_config
+        self.vocab_size = config.vocab_size
+        self.hc_eps = config.hc_eps
+        self.hc_mult = config.hc_mult
+        self.hc_dim = self.hc_mult * config.hidden_size
+        self.rms_norm_eps = config.rms_norm_eps
+        self.device = current_platform.device_type
+        # V4.1 has no global MHC head and no MTP draft, so neither the
+        # ``hc_head_*`` parameters nor the residual buffer the V4 parent
+        # allocates for one exist here.
         self._mtp_hidden_buffer = None
-
-        self._bind_index_buffers(vllm_config)
-
+        # Filled by the inherited load_weights, read by the load verifier.
+        self.consumed_ckpt_names: set[str] = set()
         # Set by IluDeepseekV41ForCausalLM.set_aux_hidden_state_layers when a
         # DSpark draft is active.
         self.aux_hidden_state_layers: tuple[int, ...] = ()
 
-        config = self.config
+        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        self.topk_indices_buffer = torch.empty(
+            max_tokens, config.index_topk, dtype=torch.int32, device=self.device
+        )
+
+        pp = get_pp_group()
+        if pp.is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.embed_tokens",
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+
+        self._build_layers(vllm_config, prefix, pp)
+        self._build_transfer_buffers(max_tokens)
+
+        if pp.is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
+
+        self._bind_index_buffers(max_tokens)
+
         self.engram_layer_ids = list(getattr(config, "engram_layer_ids", ()) or ())
         self.engram_layout: EngramLayout | None = None
         self.engram_hash: NgramHashState | None = None
         if not self.engram_layer_ids:
             return
-
         model_config = vllm_config.model_config
         self.model_path = model_config.model
         self._build_engram(config, model_config)
 
-    def _bind_index_buffers(self, vllm_config: VllmConfig) -> None:
+    # ---- construction -----------------------------------------------------
+
+    def _build_layers(self, vllm_config: VllmConfig, prefix: str, pp) -> None:
+        """The local layers, each told what the pipeline cut made of it."""
+        config = self.config
+        kv_sources = tuple(getattr(config, "kv_source_layer_ids", None) or ())
+        index_sources = tuple(getattr(config, "index_source_layer_ids", None) or ())
+        compress_ratios = tuple(
+            int(r) for r in (getattr(config, "compress_ratios", None) or ())
+        )
+        plan = build_rank_plan(
+            config.num_hidden_layers,
+            kv_sources,
+            index_sources,
+            compress_ratios,
+            pp.rank_in_group,
+            pp.world_size,
+        )
+        self.pp_plan = plan
+        self.start_layer, self.end_layer = plan.start_layer, plan.end_layer
+
+        # Only the last KV source on this rank has to mirror its records: an
+        # earlier one's would be overwritten before the rank finishes anyway.
+        local_sources = [
+            s for s in kv_sources if plan.start_layer <= s < plan.end_layer
+        ]
+        self.kv_sender_layer = max(local_sources) if local_sources else None
+        # With no local source to refill it, the outgoing buffer is whatever
+        # arrived, so a group spanning three or more ranks needs this rank to
+        # pass it along.
+        self.relays_kv = plan.forwarder is not None and self.kv_sender_layer is None
+
+        def build(layer_id: int) -> nn.Module:
+            real_source = None
+            if (
+                layer_id < len(compress_ratios)
+                and compress_ratios[layer_id] > 0
+                and kv_sources
+            ):
+                eligible = [s for s in kv_sources if s <= layer_id]
+                real_source = max(eligible) if eligible else None
+            return self.decoder_layer_cls(
+                vllm_config,
+                prefix=f"{prefix}.layers.{layer_id}",
+                topk_indices_buffer=self.topk_indices_buffer,
+                is_kv_forwarder=layer_id == plan.forwarder,
+                is_kv_sender=layer_id == self.kv_sender_layer,
+                kv_source_override=local_kv_source(layer_id, real_source, plan),
+            )
+
+        self.layers = nn.ModuleList(
+            [PPMissingLayer() for _ in range(plan.start_layer)]
+            + get_offloader().wrap_modules(
+                build(layer_id) for layer_id in range(plan.start_layer, plan.end_layer)
+            )
+            + [
+                PPMissingLayer()
+                for _ in range(plan.end_layer, config.num_hidden_layers)
+            ]
+        )
+
+        if plan.transfers_kv:
+            logger.info(
+                "DeepSeek V4.1 pipeline rank %s/%s owns layers [%s, %s); "
+                "kv forwarder=%s (replicating source %s), kv sender=%s, "
+                "relays=%s, carries topk=%s",
+                pp.rank_in_group,
+                pp.world_size,
+                plan.start_layer,
+                plan.end_layer,
+                plan.forwarder,
+                plan.forwarded_kv_source,
+                self.kv_sender_layer,
+                self.relays_kv,
+                plan.transfers_topk,
+            )
+
+    def _build_transfer_buffers(self, max_tokens: int) -> None:
+        """Dense per-token record buffers, when the cut makes the pipeline carry KV.
+
+        Every rank allocates them, not just the ones that send: the pipeline's
+        intermediate tensors have to carry the same keys everywhere.
+        """
+        self.main_kv_rows: torch.Tensor | None = None
+        self.indexer_kv_rows: torch.Tensor | None = None
+        if not self.pp_plan.transfers_kv:
+            return
+
+        sample = self.layers[self.start_layer].attn
+        self.main_kv_rows = torch.empty(
+            max_tokens,
+            sample.main_transfer_width,
+            dtype=sample.main_transfer_dtype,
+            device=self.device,
+        )
+        self.indexer_kv_rows = torch.empty(
+            max_tokens,
+            sample.indexer_transfer_width,
+            dtype=sample.indexer_transfer_dtype,
+            device=self.device,
+        )
+        if self.kv_sender_layer is not None:
+            sender = self.layers[self.kv_sender_layer].attn
+            sender.main_kv_rows = self.main_kv_rows
+            assert sender.indexer is not None, (
+                f"layer {self.kv_sender_layer} is a kv source and must own an "
+                "indexer to mirror its index keys"
+            )
+            sender.indexer.k_row_buffer = self.indexer_kv_rows
+
+    def _bind_index_buffers(self, max_tokens: int) -> None:
         """Preallocate the selection buffers the indexers share across layers.
 
-        The base class already owns the top-k indices buffer; these are the two
-        companions it has no notion of. ``topk_lens`` because V4.1's selection is
-        ragged and our kernels take the count explicitly, and the candidate list
-        because the indexer at ``candidate_source_layer_id`` publishes a block
-        mask that the ratio-1 indexers above it score against.
+        ``topk_lens`` because V4.1's selection is ragged and our kernels take
+        the count explicitly, and the candidate list because the indexer at
+        ``candidate_source_layer_id`` publishes a block mask that the ratio-1
+        indexers above it score against.
 
         Allocating once is not only about the per-step cost: an indexer writing
         into a buffer of a fixed address is what lets the selection cross layers
         without any layer holding a reference to another layer's tensor.
         """
         config = self.config
-        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         device = self.topk_indices_buffer.device
         self.topk_lens_buffer = torch.empty(
             max_tokens, dtype=torch.int32, device=device
@@ -240,7 +424,8 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
         rehash all 189 GiB of tables.
         """
         local_ids = [
-            lid for lid in self.engram_layer_ids
+            lid
+            for lid in self.engram_layer_ids
             if not isinstance(self.layers[lid], PPMissingLayer)
         ]
         if not local_ids:
@@ -288,27 +473,72 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
                 self.device,
             )
 
+    # ---- pipeline ---------------------------------------------------------
+
     def make_empty_intermediate_tensors(
         self,
         batch_size: int,
         dtype: torch.dtype,
         device: torch.device,
     ) -> IntermediateTensors:
-        """PP carries posted multi-stream hidden states plus the leftover ``pre_mix``."""
-        return IntermediateTensors(
-            {
-                "hidden_states": torch.zeros(
-                    (batch_size, self.hc_mult, self.config.hidden_size),
-                    dtype=dtype,
-                    device=device,
-                ),
-                "pre_mix": torch.zeros(
-                    (batch_size, self.hc_mult),
-                    dtype=torch.float32,
-                    device=device,
-                ),
-            }
+        """The posted multi-stream hidden states, the leftover ``pre_mix``, and
+        the KV records a split group has to carry."""
+        tensors = {
+            "hidden_states": torch.zeros(
+                (batch_size, self.hc_mult, self.config.hidden_size),
+                dtype=dtype,
+                device=device,
+            ),
+            "pre_mix": torch.zeros(
+                (batch_size, self.hc_mult),
+                dtype=torch.float32,
+                device=device,
+            ),
+        }
+        if self.pp_plan.transfers_kv:
+            assert self.main_kv_rows is not None
+            assert self.indexer_kv_rows is not None
+            tensors["main_kv"] = torch.zeros(
+                (batch_size, self.main_kv_rows.shape[1]),
+                dtype=self.main_kv_rows.dtype,
+                device=device,
+            )
+            tensors["indexer_kv"] = torch.zeros(
+                (batch_size, self.indexer_kv_rows.shape[1]),
+                dtype=self.indexer_kv_rows.dtype,
+                device=device,
+            )
+        if self.pp_plan.transfers_topk:
+            tensors["topk"] = torch.zeros(
+                (batch_size, self.config.index_topk),
+                dtype=torch.int32,
+                device=device,
+            )
+        return IntermediateTensors(tensors)
+
+    def _accept_remote_kv(
+        self,
+        intermediate_tensors: IntermediateTensors,
+        positions: torch.Tensor,
+    ) -> None:
+        """Hand a stranded group's records to this rank's forwarder."""
+        forwarder = self.pp_plan.forwarder
+        if forwarder is None:
+            return
+        main_rows = intermediate_tensors["main_kv"]
+        indexer_rows = intermediate_tensors["indexer_kv"]
+        topk_rows = intermediate_tensors.tensors.get("topk")
+        self.layers[forwarder].attn.accept_remote_kv(
+            main_rows, indexer_rows, topk_rows, positions
         )
+        if self.relays_kv:
+            # No local source will refill the outgoing buffer, so the group
+            # continues past this rank only if we pass on what we received.
+            assert self.main_kv_rows is not None
+            assert self.indexer_kv_rows is not None
+            num_tokens = main_rows.shape[0]
+            self.main_kv_rows[:num_tokens].copy_(main_rows)
+            self.indexer_kv_rows[:num_tokens].copy_(indexer_rows)
 
     def _engram_layers(self):
         for layer in islice(self.layers, self.start_layer, self.end_layer):
@@ -366,11 +596,7 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> (
-        torch.Tensor
-        | IntermediateTensors
-        | tuple[torch.Tensor, list[torch.Tensor]]
-    ):
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         """Embed -> local layers -> leftover FFN post -> collapse or PP send.
 
         Returns ``(hidden_states, aux)`` instead of a bare tensor when a DSpark
@@ -392,6 +618,9 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             pre_mix = intermediate_tensors["pre_mix"]
+            # Before any layer runs: the stranded group's caches have to hold
+            # this step's rows by the time the first consumer reads them.
+            self._accept_remote_kv(intermediate_tensors, positions)
 
         self._prepare_engram(input_ids, positions)
         residual = post_mix = res_mix = None
@@ -419,9 +648,19 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
 
         hidden_states = mhc.hc_post(hidden_states, residual, post_mix, res_mix)
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "pre_mix": pre_mix}
-            )
+            tensors = {"hidden_states": hidden_states, "pre_mix": pre_mix}
+            num_tokens = positions.shape[0]
+            if self.pp_plan.transfers_kv:
+                assert self.main_kv_rows is not None
+                assert self.indexer_kv_rows is not None
+                tensors["main_kv"] = self.main_kv_rows[:num_tokens]
+                tensors["indexer_kv"] = self.indexer_kv_rows[:num_tokens]
+            if self.pp_plan.transfers_topk:
+                # No designated sender: every index source rewrites this
+                # buffer, so at the end of the rank it already holds the
+                # latest selection -- this rank's, or the one it took over.
+                tensors["topk"] = self.topk_indices_buffer[:num_tokens]
+            return IntermediateTensors(tensors)
         hidden_states = mhc.hc_pre(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)
         if aux_hidden_states:
@@ -432,7 +671,10 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
         """Load the engram tensors that bypass the vLLM weight path."""
         for layer_id in self.engram_layer_ids:
             layer = self.layers[layer_id]
-            if isinstance(layer, PPMissingLayer) or getattr(layer, "engram", None) is None:
+            if (
+                isinstance(layer, PPMissingLayer)
+                or getattr(layer, "engram", None) is None
+            ):
                 continue
             layer.engram.load_from_checkpoint(self.model_path)
 
@@ -451,7 +693,7 @@ class IluDeepseekV41ForCausalLM(IluDeepseekV4Fp8ForCausalLM, SupportsEagle3):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Drop ``engram.*`` from the iterator; tables load from mmap afterwards."""
         loaded = super().load_weights(
-            (item for item in weights if not _ENGRAM_SKIP.search(item[0]))
+            item for item in weights if not _ENGRAM_SKIP.search(item[0])
         )
         if getattr(self.model, "engram_layer_ids", None):
             self.model.load_engram_weights()

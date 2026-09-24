@@ -11,6 +11,7 @@ signature is confined to this layer and explained in the module that carries it.
 
 from vllm_iluvatar.models.deepseek_v41.common.ops.fused_compress_quant_cache import (
     fused_save_compress_norm,
+    move_rows_to_paged_cache,
     rope_quant_insert,
 )
 from vllm_iluvatar.models.deepseek_v41.common.ops.indexer_k_store import (
@@ -20,5 +21,6 @@ from vllm_iluvatar.models.deepseek_v41.common.ops.indexer_k_store import (
 __all__ = [
     "fused_save_compress_norm",
     "indexer_k_norm_rope_store",
+    "move_rows_to_paged_cache",
     "rope_quant_insert",
 ]

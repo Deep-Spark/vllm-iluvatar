@@ -189,14 +189,19 @@ void v41_compress_norm_cr1(torch::Tensor& kv_score,
                            torch::Tensor& rms_norm_weight, double rms_norm_eps,
                            torch::Tensor& latent_out);
 
-// GPT-J RoPE on a compressor latent, then publish it into the compressed KV
-// cache. The cache dtype picks the record: uint8 [., ., 584] is the packed
-// fp8_ds_mla row, bfloat16 / float8_e4m3fn are the plain [448 NoPE | 64 RoPE]
-// rows, the latter divided by the per-tensor ``fp8_scale``.
+// ``row_out``, on both store ops below, additionally mirrors the record in
+// token order into a dense ``[num_tokens, record_width]`` buffer. That buffer
+// is what crosses a pipeline boundary when a KV group is split across ranks,
+// so the receiving rank replays bytes rather than recomputing them.
+
+// GPT-J RoPE on a compressor latent, then publish it. ``kv_cache``'s dtype
+// picks the record: uint8 [., ., 584] is the packed fp8_ds_mla row, bfloat16
+// [., ., 512] the plain one. The reference's per-tensor-fp8 row has no reader
+// on this platform and is not offered.
 void v41_rope_insert(torch::Tensor& latent, torch::Tensor& positions,
                      torch::Tensor& cos_sin_cache, torch::Tensor& kv_cache,
                      torch::Tensor& slot_mapping, int64_t compress_ratio,
-                     const std::optional<torch::Tensor>& fp8_scale);
+                     const std::optional<torch::Tensor>& row_out);
 
 // k_norm -> RoPE -> paged store for indexer keys. ``store_fp8`` picks the
 // record: bf16 [., ., 128], or uint8 [., ., 132] holding a page of 128 E4M3
@@ -207,7 +212,17 @@ void v41_indexer_k_norm_rope_store(torch::Tensor& k_pre,
                                    torch::Tensor& rms_norm_weight,
                                    double rms_norm_eps, torch::Tensor& k_cache,
                                    torch::Tensor& kv_slot_mapping,
-                                   int64_t compress_ratio, bool store_fp8);
+                                   int64_t compress_ratio, bool store_fp8,
+                                   const std::optional<torch::Tensor>& row_out);
+
+// Place dense ``[num_tokens, record_width]`` rows received from an earlier
+// pipeline rank into this rank's paged cache, under this rank's slot mapping.
+// The same "valid slot and group boundary" test the sender applied is reapplied
+// here, so rows the sender skipped are never read.
+void v41_move_rows_to_paged_cache(torch::Tensor& rows, torch::Tensor& kv_cache,
+                                  torch::Tensor& slot_mapping,
+                                  torch::Tensor& positions,
+                                  int64_t compress_ratio);
 
 // RoPE the index query in place and rescale the per-head weights.
 // ``weights_out`` may alias ``weights_in``.

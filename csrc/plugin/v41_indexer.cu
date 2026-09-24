@@ -61,7 +61,7 @@ __global__ void v41_indexer_k_norm_rope_store_kernel(
     void* __restrict__ k_cache, int64_t page_stride, int64_t row_stride,
     int rows_per_page, int64_t num_pages,
     const void* __restrict__ kv_slot_mapping, bool slots_are_int64,
-    int compress_ratio) {
+    int compress_ratio, void* __restrict__ row_out) {
   const int64_t token = blockIdx.x;
   const int64_t slot = load_index(kv_slot_mapping, slots_are_int64, token);
   const int64_t pos = load_index(positions, positions_are_int64, token);
@@ -110,6 +110,12 @@ __global__ void v41_indexer_k_norm_rope_store_kernel(
     *reinterpret_cast<__nv_bfloat162*>(
         static_cast<__nv_bfloat16*>(k_cache) + page * page_stride +
         row * row_stride + d0) = out;
+    // The pipeline replica, when this rank has to hand the key to the next.
+    if (row_out != nullptr) {
+      *reinterpret_cast<__nv_bfloat162*>(
+          static_cast<__nv_bfloat16*>(row_out) + token * kIndexHeadDim + d0) =
+          out;
+    }
     return;
   }
 
@@ -128,11 +134,23 @@ __global__ void v41_indexer_k_norm_rope_store_kernel(
       fminf(fmaxf(odd * inv_scale, -kE4m3Max), kE4m3Max));
   *reinterpret_cast<uchar2*>(page_base + row * kIndexHeadDim + d0) = bytes;
 
+  uint8_t* const mirror =
+      row_out == nullptr
+          ? nullptr
+          : static_cast<uint8_t*>(row_out) +
+                token * (kIndexHeadDim + kIndexFp8ScaleBytes);
+  if (mirror != nullptr) {
+    *reinterpret_cast<uchar2*>(mirror + d0) = bytes;
+  }
+
   if (d0 == 0) {
-    float* const scales = reinterpret_cast<float*>(
+    const float scale = exp2f(exponent);
+    *reinterpret_cast<float*>(
         page_base + static_cast<int64_t>(rows_per_page) * kIndexHeadDim +
-        row * kIndexFp8ScaleBytes);
-    *scales = exp2f(exponent);
+        row * kIndexFp8ScaleBytes) = scale;
+    if (mirror != nullptr) {
+      *reinterpret_cast<float*>(mirror + kIndexHeadDim) = scale;
+    }
   }
 #endif
 }
@@ -270,7 +288,8 @@ void v41_indexer_k_norm_rope_store(torch::Tensor& k_pre,
                                    torch::Tensor& rms_norm_weight,
                                    double rms_norm_eps, torch::Tensor& k_cache,
                                    torch::Tensor& kv_slot_mapping,
-                                   int64_t compress_ratio, bool store_fp8) {
+                                   int64_t compress_ratio, bool store_fp8,
+                                   const std::optional<torch::Tensor>& row_out) {
   TORCH_CHECK(compress_ratio == 1 || compress_ratio == 2,
               "compress_ratio must be 1 or 2, got ", compress_ratio);
   TORCH_CHECK(k_pre.is_cuda() && k_pre.dim() == 2 &&
@@ -325,6 +344,22 @@ void v41_indexer_k_norm_rope_store(torch::Tensor& k_pre,
   const bool positions_are_int64 = positions.scalar_type() == at::kLong;
   const bool slots_are_int64 = kv_slot_mapping.scalar_type() == at::kLong;
 
+  // ``row_out`` mirrors the key in token order for the next pipeline rank.
+  void* row_ptr = nullptr;
+  if (row_out.has_value()) {
+    const torch::Tensor& rows = *row_out;
+    TORCH_CHECK(rows.is_cuda() && rows.dim() == 2 && rows.is_contiguous(),
+                "row_out must be a 2D contiguous CUDA tensor");
+    TORCH_CHECK(rows.size(0) >= num_tokens,
+                "row_out is shorter than the token count");
+    TORCH_CHECK(rows.scalar_type() == k_cache.scalar_type(),
+                "row_out must share the indexer cache dtype");
+    TORCH_CHECK(rows.size(1) == k_cache.size(2),
+                "row_out rows are ", rows.size(1), " wide but the indexer "
+                "record is ", k_cache.size(2));
+    row_ptr = rows.data_ptr();
+  }
+
 #define VLLM_ILU_LAUNCH_K_STORE(FP8)                                        \
   v41_indexer_k_norm_rope_store_kernel<FP8>                                 \
       <<<grid, kIndexThreads, 0, stream>>>(                                 \
@@ -334,7 +369,7 @@ void v41_indexer_k_norm_rope_store(torch::Tensor& k_pre,
           cos_sin_cache.stride(0), k_cache.data_ptr(), k_cache.stride(0),   \
           k_cache.stride(1), static_cast<int>(k_cache.size(1)),             \
           k_cache.size(0), kv_slot_mapping.data_ptr(), slots_are_int64,     \
-          static_cast<int>(compress_ratio))
+          static_cast<int>(compress_ratio), row_ptr)
 
   if (store_fp8) {
     VLLM_ILU_LAUNCH_K_STORE(true);

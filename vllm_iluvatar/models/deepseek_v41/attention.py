@@ -39,6 +39,7 @@ from vllm_iluvatar.model_executor.layers.sparse_attn_indexer import (
 )
 from vllm_iluvatar.models.deepseek_v41.common.ops import (
     indexer_k_norm_rope_store,
+    move_rows_to_paged_cache,
 )
 from vllm_iluvatar.models.deepseek_v41.compressor import (
     IluDeepseekCompressor,
@@ -94,6 +95,50 @@ def _tiled_index_rows(idx: torch.Tensor) -> torch.Tensor:
     return wide[:, :width]
 
 
+def _resolve_dsv4_kv_cache_dtype(
+    use_fp8_ds_mla_layout: bool,
+    kv_cache_dtype: str,
+    cache_config: CacheConfig | None,
+    packed_kv_cache_dtype: str = "fp8_ds_mla",
+) -> tuple[str, torch.dtype]:
+    """Map ``(layout, --kv-cache-dtype)`` to ``(cache_dtype_str, torch_dtype)``.
+
+    Both layouts are paged; they differ in the per-token block format. The
+    packed formats are ``uint8``-backed: ``fp8_ds_mla`` is UE8M0 block-scaled
+    fp8 throughout, ``nvfp4_ds_mla`` keeps that sliding-window record and
+    stores the compressed cache as NVFP4. An unspecific ``--kv-cache-dtype``
+    (``auto`` / ``fp8``) resolves to ``packed_kv_cache_dtype``, the record this
+    layer's kernel prefers, and the canonical string is written back onto
+    ``cache_config`` so the page-size specs pick the right per-token slot.
+    Plain-row backends store each token's KV row in its element dtype: bf16 or
+    per-tensor FP8 E4M3.
+    """
+    if use_fp8_ds_mla_layout:
+        if kv_cache_dtype in ("auto", "fp8"):
+            kv_cache_dtype = packed_kv_cache_dtype
+        elif not kv_cache_dtype.endswith("_ds_mla"):
+            raise ValueError(
+                "DeepseekV4 packed KV layouts only support fp8 kv-cache, got "
+                f"{kv_cache_dtype}. Please set `--kv-cache-dtype fp8` or "
+                "select a backend that supports bfloat16 KV cache."
+            )
+        if cache_config is not None and cache_config.cache_dtype != kv_cache_dtype:
+            cache_config.cache_dtype = kv_cache_dtype
+        logger.info_once("Using DeepSeek's %s KV cache format.", kv_cache_dtype)
+        return kv_cache_dtype, torch.uint8
+    if kv_cache_dtype.endswith("_ds_mla"):
+        raise ValueError(
+            f"{kv_cache_dtype} is a packed FlashMLA DeepSeek V4.1 KV cache "
+            "format; the selected backend stores plain KV rows."
+        )
+
+    # Plain bf16 / per-tensor fp8 KV row (FlashInfer).
+    if kv_cache_dtype.startswith("fp8"):
+        return kv_cache_dtype, torch.float8_e4m3fn
+    # auto / bfloat16 -> plain bf16 KV row.
+    return kv_cache_dtype, torch.bfloat16
+
+
 def _replace_layer_index(prefix: str, layer_id: int) -> str:
     """Swap the layer index inside a ``...layers.<idx>...`` prefix."""
     new_prefix, n = re.subn(r"\.layers\.\d+\.", f".layers.{layer_id}.", prefix)
@@ -101,15 +146,36 @@ def _replace_layer_index(prefix: str, layer_id: int) -> str:
     return new_prefix
 
 
+# Record the indexer K cache holds, and with it the query's.
+#
+# Deliberately a constant rather than ``--kv-cache-dtype``: the two are
+# independent choices, and reading the cache config here used to be a hazard.
+# ``_resolve_dsv4_kv_cache_dtype`` *rewrites* ``cache_config.cache_dtype`` as a
+# side effect, and it runs later in ``__init__`` than the indexer cache is
+# built, so whichever layer a rank happened to construct first decided the
+# indexer layout for that rank. On a cut where a rank starts on a kv source
+# (pp=4 rank 2 starts at layer 20, pp=5 rank 1 at layer 8) that rank ended up
+# with a bf16 cache while its peers had fp8, and the pipeline replica then
+# failed on a dtype mismatch.
+#
+# Moving to "fp8" is not this constant alone: the scoring call in
+# ``sparse_attn_indexer.py`` has to become
+# ``dsa_indexer_mqa_logits_with_blocks_fp8`` (ivcore30-only, and it wants a
+# page whose row count is a multiple of 64) and the query goes through
+# ``v41_indexer_q_rope_fp8``, whose folded weights come back fp32. The kernels
+# for that path exist and are tested; only the wiring is missing.
+_INDEXER_KV_DTYPE = "bf16"
+
+
 def _indexer_k_cache_row(index_head_dim: int, kv_dtype: str) -> tuple[int, torch.dtype]:
     """Width and element type of one paged indexer K cache row.
 
-    FP8 uses the V3.2 layout the paged scoring kernel reads: a page of
+    FP8 is the V3.2 layout the paged scoring kernel reads: a page of
     ``index_head_dim`` E4M3 bytes per row followed by a page of one FP32 scale
     per row, so the row is ``index_head_dim + 4`` bytes. BF16 rows are the
-    values alone. Official's third option, MXFP4, has no reader here.
+    values alone.
     """
-    if kv_dtype.startswith("fp8"):
+    if kv_dtype == "fp8":
         return index_head_dim + 4, torch.uint8
     if kv_dtype == "bf16":
         return index_head_dim, torch.bfloat16
@@ -211,8 +277,7 @@ class IluDeepseekV41Indexer(nn.Module):
         self.compress_ratio = compress_ratio
         self.owns_k = owns_k
         self.k_row_buffer: torch.Tensor | None = None
-        # TODO: for now, always use bf16 indexer cache
-        self.store_fp8_kv = False
+        self.store_fp8_kv = _INDEXER_KV_DTYPE == "fp8"
         logger.info_once(
             "Using %s indexer cache for Lightning Indexer.",
             "FP8" if self.store_fp8_kv else "BF16",
@@ -314,6 +379,7 @@ class IluDeepseekV41Indexer(nn.Module):
             indexer_metadata.slot_mapping,
             self.compress_ratio,
             self.store_fp8_kv,
+            row_out=self.k_row_buffer,
         )
 
     def forward(
@@ -405,10 +471,11 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
         candidate_block_buffer: torch.Tensor | None = None,
+        is_kv_forwarder: bool = False,
+        is_kv_sender: bool = False,
+        kv_source_override: int | None = None,
     ) -> None:
         super().__init__()
-        config = vllm_config.model_config.hf_config
-
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         cache_config = vllm_config.cache_config
@@ -461,6 +528,16 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         is_backbone = layer_id < config.num_hidden_layers
         self.is_kv_source = is_backbone and layer_id in self.kv_source_layers
         self.is_index_source = is_backbone and layer_id in self.index_source_layers
+        # Pipeline roles, assigned by the model from the rank's cut plan. A
+        # sender's group reaches consumers on a later rank, so it mirrors its
+        # records into dense buffers the model ships across. A forwarder is the
+        # first stranded layer on that later rank: it owns a replica cache and
+        # replays what arrives into it. Neither role builds a compressor or an
+        # indexer it would not otherwise have.
+        self.is_kv_forwarder = is_kv_forwarder
+        self.is_kv_sender = is_kv_sender
+        # Bound by the model once the layer list exists.
+        self.main_kv_rows: torch.Tensor | None = None
         if self.compress_ratio > 0:
             if not self.kv_source_layers or not self.index_source_layers:
                 raise ValueError(
@@ -469,8 +546,13 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                     f"layers (layer {layer_id} has "
                     f"compress_ratio={self.compress_ratio})."
                 )
-            self.kv_source_layer_id = max(
-                s for s in self.kv_source_layers if s <= layer_id
+            # ``kv_source_override`` points at this rank's forwarder when the
+            # real source sits on an earlier one; everything downstream
+            # addresses the cache owner by this id alone.
+            self.kv_source_layer_id = (
+                kv_source_override
+                if kv_source_override is not None
+                else max(s for s in self.kv_source_layers if s <= layer_id)
             )
             self.index_source_layer_id = max(
                 s for s in self.index_source_layers if s <= layer_id
@@ -557,7 +639,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             # latest kv source below them (its indexer produces the keys).
             if self.is_kv_source:
                 row_bytes, row_dtype = _indexer_k_cache_row(
-                    config.index_head_dim, "auto"
+                    config.index_head_dim, _INDEXER_KV_DTYPE
                 )
                 index_k_cache = IluDeepseekV41IndexerCache(
                     head_dim=row_bytes,
@@ -574,10 +656,12 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 )
                 index_k_cache = self._static_forward_context.get(k_cache_prefix)
                 if index_k_cache is None:
-                    raise NotImplementedError(
+                    raise RuntimeError(
                         f"Indexer K cache source {k_cache_prefix} not found on "
-                        "this rank; PP splits inside a v4.1 kv-sharing group "
-                        "are not supported."
+                        f"this rank for layer {layer_id}. A pipeline cut inside "
+                        "a kv-sharing group is meant to be covered by a "
+                        "forwarder replica; the cut plan and the layer's "
+                        "kv_source_override disagree."
                     )
             is_candidate_source = layer_id == self.candidate_source_layer
             uses_candidates = 0 <= self.candidate_source_layer < layer_id
@@ -603,6 +687,28 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 candidate_write=is_candidate_source,
             )
 
+        # A forwarder replicates a group that started on an earlier rank. It
+        # runs no compressor and no indexer, but it owns both caches the group
+        # would have published locally: the compressed KV one through
+        # ``get_kv_cache_spec`` below, and this index-key one, which the
+        # consumers above it resolve through ``kv_source_layer_id``.
+        self.forwarder_indexer_cache: IluDeepseekV41IndexerCache | None = None
+        if self.is_kv_forwarder:
+            assert cache_config is not None
+            assert not self.is_kv_source, (
+                f"layer {layer_id} is its own kv source and cannot also forward one"
+            )
+            row_bytes, row_dtype = _indexer_k_cache_row(
+                config.index_head_dim, _INDEXER_KV_DTYPE
+            )
+            self.forwarder_indexer_cache = IluDeepseekV41IndexerCache(
+                head_dim=row_bytes,
+                dtype=row_dtype,
+                prefix=f"{prefix}.indexer.k_cache",
+                cache_config=cache_config,
+                compress_ratio=self.compress_ratio,
+            )
+
         assert cache_config is not None, "DeepseekV4 attention requires cache_config"
         # ---- Attention / KV-cache setup ----
         self.max_num_batched_tokens = (
@@ -611,24 +717,44 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         self.max_model_len = vllm_config.model_config.max_model_len
 
         # Resolve the kv-cache dtype from this backend's block format. The same
-        # resolution drives the SWA cache tensor dtype below.
-        self.kv_cache_dtype, self.kv_cache_torch_dtype = "fp8", torch.uint8
-        self.kv_mxfp8 = False
-        self.swa_bytes_per_token = 528 if self.kv_mxfp8 else 584
-        # nvfp4_ds_mla keeps the MXFP8 sliding-window record and stores the
-        # compressed cache as NVFP4 (256 B of e2m1 pairs + 32 e4m3 scales).
-        self.compressed_bytes_per_token = (
-            288 if self.kv_cache_dtype == "nvfp4_ds_mla" else self.swa_bytes_per_token
+        # resolution drives the SWA cache tensor dtype below. ``auto`` means the
+        # packed record here: it is what the backend advertises and what the
+        # decode kernel reads, so it must not fall through to the plain-row
+        # branch the way a plain ``startswith("fp8")`` test would let it.
+        packed_layout = cache_config.cache_dtype in (
+            "auto",
+            "fp8",
+        ) or cache_config.cache_dtype.endswith("_ds_mla")
+        self.kv_cache_dtype, self.kv_cache_torch_dtype = _resolve_dsv4_kv_cache_dtype(
+            packed_layout,
+            cache_config.cache_dtype,
+            cache_config,
+            "fp8_ds_mla",
         )
-        # One alignment for every page in the block: the block stride is their
-        # sum, and 512 satisfies both TMA strides in play (512 for the V4.1
-        # fp8 record, 256 for NVFP4).
-        self.kv_page_alignment = 512 if self.kv_mxfp8 else 576
-        if self.kv_cache_dtype == "nvfp4_ds_mla" and not self.kv_mxfp8:
-            raise ValueError(
-                "nvfp4_ds_mla needs the V4.1 KV records, which FlashMLA "
-                "decodes only on SM100."
+        if self.kv_cache_torch_dtype is not torch.uint8:
+            # The plain-row store kernel exists and is tested, but nothing
+            # downstream reads such a cache: the sliding-window write goes
+            # through ``v41_qkv_rope_fp8_insert`` and the attention through
+            # ``ds4_sparse_mla_fp8_decode``, both of which take the packed
+            # 584-byte record only. Refusing here beats producing garbage.
+            raise NotImplementedError(
+                f"DeepSeek V4.1 on this platform stores the main KV as the "
+                f"packed fp8_ds_mla record; --kv-cache-dtype "
+                f"{cache_config.cache_dtype} would need a bf16 sliding-window "
+                "insert and a bf16 sparse-MLA decode, neither of which exists "
+                "yet. Use --kv-cache-dtype fp8 (or auto)."
             )
+        self.swa_bytes_per_token = 584
+        # Width and dtype of one record on the wire, for the dense buffers the
+        # model allocates when a pipeline cut strands this layer's consumers.
+        # These are the record's own shape, not the cache's page geometry.
+        self.main_transfer_width = self.swa_bytes_per_token
+        self.main_transfer_dtype = self.kv_cache_torch_dtype
+        (
+            self.indexer_transfer_width,
+            self.indexer_transfer_dtype,
+        ) = _indexer_k_cache_row(config.index_head_dim, _INDEXER_KV_DTYPE)
+        self.kv_page_alignment = 576
 
         swa_bounded_replay = getattr(cache_config, "swa_bounded_replay", False)
         if swa_bounded_replay and not vllm_config.use_v2_model_runner:
@@ -701,18 +827,22 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         # Only kv-source layers own a compressed-KV cache: consumers read the
         # source's through the forward context and cr==0 layers are pure SWA.
         # The window cache is registered separately as IluDeepseekV4SWACache.
-        if not self.is_kv_source:
+        # A forwarder owns one too -- it is the local replica of a source that
+        # a pipeline cut left on an earlier rank.
+        if not self.is_kv_source and not self.is_kv_forwarder:
             return None
+        # Tied to the resolved record rather than restated, so the spec and the
+        # tensor the store kernel writes cannot drift apart.
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
-            dtype=torch.uint8,
+            dtype=self.kv_cache_torch_dtype,
             compress_ratio=self.compress_ratio,
-            cache_dtype_str="fp8_ds_mla",
+            cache_dtype_str=self.kv_cache_dtype,
             model_version="deepseek_v4",
             alignment=64,
-            kv_quant_mode=get_kv_quant_mode("fp8_ds_mla"),
+            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
         )
 
     def get_attn_backend(self) -> type[AttentionBackend]:
@@ -722,12 +852,65 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         self.kv_cache = kv_cache.squeeze(1)
 
     def _compressed_kv_cache(self) -> torch.Tensor:
-        """The compressed-KV cache tensor of this layer's kv source."""
-        if self.is_kv_source:
+        """The compressed-KV cache this layer reads.
+
+        Its own for a kv source, and equally for a forwarder: the forwarder's
+        cache *is* the local copy of the source it stands in for.
+        """
+        if self.is_kv_source or self.is_kv_forwarder:
             return self.kv_cache
         assert self.compressed_cache_prefix is not None
         source = self._static_forward_context[self.compressed_cache_prefix]
         return source.kv_cache
+
+    def accept_remote_kv(
+        self,
+        main_rows: torch.Tensor,
+        indexer_rows: torch.Tensor,
+        topk_rows: torch.Tensor | None,
+        positions: torch.Tensor,
+    ) -> None:
+        """Replay a previous rank's records into this forwarder's caches.
+
+        The producing rank already wrote these records into its own paged
+        caches and kept a dense copy in token order. Here they go into the
+        local pages under this rank's slot mapping, so the replica grows into
+        a full copy of the source's cache one step at a time.
+
+        Returns without writing during a profile run, when no metadata is
+        bound and the caches are still empty.
+        """
+        assert self.is_kv_forwarder
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict) or not self.kv_cache.numel():
+            return
+
+        main_metadata = cast(Any, attn_metadata[self.prefix])
+        move_rows_to_paged_cache(
+            main_rows,
+            self.kv_cache,
+            main_metadata.slot_mapping,
+            positions,
+            self.compress_ratio,
+        )
+
+        indexer_cache = self.forwarder_indexer_cache
+        assert indexer_cache is not None
+        if indexer_cache.kv_cache.numel():
+            indexer_metadata = cast(Any, attn_metadata[indexer_cache.prefix])
+            move_rows_to_paged_cache(
+                indexer_rows,
+                indexer_cache.kv_cache,
+                indexer_metadata.slot_mapping,
+                positions,
+                self.compress_ratio,
+            )
+
+        # The selection is a plain per-rank buffer, so taking it over is a
+        # copy rather than a paged write.
+        if topk_rows is not None and self.topk_indices_buffer is not None:
+            num_tokens = topk_rows.shape[0]
+            self.topk_indices_buffer[:num_tokens].copy_(topk_rows)
 
     @property
     def cos_sin(self) -> torch.Tensor:
@@ -888,7 +1071,12 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
 
         if compressor is not None:
             latent = compressor(kv_score, positions)
-            compressor.insert_cache(latent, positions, self.rotary_emb)
+            compressor.insert_cache(
+                latent,
+                positions,
+                self.rotary_emb,
+                row_out=self.main_kv_rows if self.is_kv_sender else None,
+            )
 
         q = self._wq_b_proj(qr)
         self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)

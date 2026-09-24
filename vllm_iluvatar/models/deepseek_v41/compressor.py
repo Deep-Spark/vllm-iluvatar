@@ -261,8 +261,14 @@ class IluDeepseekCompressor(nn.Module):
         latent: torch.Tensor | None,
         positions: torch.Tensor,
         rotary_emb,
+        row_out: torch.Tensor | None = None,
     ) -> None:
-        """Publish compressed main-cache rows after the latent becomes ready."""
+        """Publish compressed main-cache rows after the latent becomes ready.
+
+        ``row_out`` additionally receives the same records in token order,
+        for the next pipeline rank when a cut strands this group's consumers.
+        The paged write is unchanged.
+        """
         if latent is None:
             return
         attn_metadata = get_forward_context().attn_metadata
@@ -292,4 +298,5 @@ class IluDeepseekCompressor(nn.Module):
             kv_cache,
             k_cache_metadata.slot_mapping,
             self.compress_ratio,
+            row_out=row_out,
         )

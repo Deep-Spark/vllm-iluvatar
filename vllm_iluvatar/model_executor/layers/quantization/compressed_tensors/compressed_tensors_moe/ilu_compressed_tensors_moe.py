@@ -153,6 +153,21 @@ class IluCompressedTensorsMoEMethod:
             and input_quant is not None
             and input_quant.num_bits == 8
         ):
+            from vllm_iluvatar.ilu_util.arch import is_ivcore30
+
+            if (
+                is_ivcore30()
+                and ilu_params.get("gemm_format") == "NN"
+            ):
+                from vllm_iluvatar.model_executor.layers.quantization.ilu_w4a8_nn import (
+                    IluW4A8NNMoEMethod,
+                )
+
+                logger.info_once("Using ivcore30 W4A8 NN MoE method")
+                return IluW4A8NNMoEMethod(
+                    weight_quant, input_quant, layer.moe_config, ilu_params=ilu_params
+                )
+
             from .ilu_compressed_tensors_moe_w4a8_int8 import (
                 IluCompressedTensorsW4A8Int8MoEMethod,
             )

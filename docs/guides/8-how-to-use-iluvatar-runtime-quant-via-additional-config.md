@@ -53,6 +53,7 @@ checkpoint 本身**没有** `quantization_config` 时，还要显式加
    - [加载契约](#82-加载契约)
    - [启动命令](#83-启动命令)
    - [不支持的组合](#84-不支持的组合)
+   - [静态 W4A8 NN checkpoint：直接加载](#85-静态-w4a8-nn-checkpoint直接加载)
 9. [故障定位](#9-故障定位)
 10. [附录](#10-附录)
 
@@ -98,11 +99,9 @@ checkpoint 权重
    `from_ilu_runtime_config(context)`。
 6. **forward 无配置查找**：分发时解析并缓存，forward 只执行选定 method。
 
-当前 schema 可以描述 `direct` / `transform` 等加载方式，以及未来的 MoE、
-Attention、INT8、FP4。真正已实现 runtime factory 的只有
-`IluFp8PerChannelOnlineLinearMethod`（native BF16 → per-channel
-`float8_e4m3fn`，`transform` @ `process_weights_after_loading`）。选择尚未
-实现 factory 的注册 method 会明确报错。
+当前已实现 Linear BF16 → per-channel FP8、MoE block-FP8 → ix30 FP4，
+以及 MoE block-FP8 → W4A8 NN 加载时量化。具体 method 和加载时机见 §4.2；
+选择尚未实现 factory 的注册 method 会明确报错。
 
 ---
 
@@ -303,6 +302,7 @@ transform + weight_load
 | --- | --- | --- |
 | `IluFp8PerChannelOnlineLinearMethod` | `transform + process_weights_after_loading` | Linear |
 | `IluFp8ToFp4OnlineMoEMethod` | `transform + weight_load` | RoutedExperts |
+| `IluFp8ToW4A8NNMoEMethod` | `transform + weight_load`（FP8 → ixmm W4A8 NN） | RoutedExperts |
 
 schema 对 `direct` 的支持不代表已有 method 实现了它。
 
@@ -650,6 +650,70 @@ padding 过的 hidden dim 或 intermediate size、融合成 3D 的 expert 张量
 以及非顺序的 `load_format`。
 
 ---
+
+### 8.5 静态 W4A8 NN checkpoint：直接加载
+
+在 ivcore30 上，checkpoint 的 compressed-tensors 配置指定
+`iluvatar.gemm_format: NN` 后直接加载 ixmm NN 权重，
+不需要 `additional_config.ilu_quant` 转换配置。
+`iluvatar.pack_version` 可省略；旧 checkpoint 的值 `1` 仍兼容。
+该字段只在加载入口校验，quant method 和 HT/LL experts 内部不保存版本字段。
+显式值 `2` 或其他值会报格式不兼容，需要先转换权重和 scale。
+要求无 bias、对称 per-channel INT4、动态 per-token INT8 激活。
+
+ivcore30 使用独立的 `IluW4A8NNMoEMethod`，普通 prefill/mixed/decode
+共用一条执行路径；HT/LL 选择各自的 NN experts 类。
+W13 和 W2 都调用 `ixformer.moe_w4a8_group_gemm_ixmm`，支持 BF16/FP16 输出。
+GPU 路由生成 expert ranges 和逆映射，普通/HT 输出在 reduce 阶段按映射归约，
+LL 输出由通信 combine 归约。构造时检查 ivcore30 和 ixmm 后端可用性。
+NN 权重及 scale 不经过 TN 重排，也不会在加载后额外乘 18。
+
+TN/v2 和 ivcore11 NN/v2 继续使用原 W4A8 类。ivcore11 NN/v1 的支持本次
+不扩展，仍由原类按 v2 契约拒绝。
+
+本类不提供 TN → NN 的 runtime transform。
+FP8 checkpoint 加载时转换使用下节的专用子类。
+
+NN method 固定选择 graph-safe 算子，不提供 `decode_backend` 或
+`enable_cuda_graph` 配置项；实际捕获/重放仍由 vLLM 自身配置控制。
+AG INT8 通信及 router fusion 仍由各自的开关控制，准入条件是 ivcore30 NN method。
+
+### 8.6 官方 FP8 checkpoint：加载时直接量化为 W4A8 NN
+
+在仓库外的部署配置中，通过 `additional_config.ilu_quant`
+选择 `IluFp8ToW4A8NNMoEMethod`。checkpoint 的 `quant_method` 保持 `fp8`，
+不需要生成 TN/v2 权重，也不修改模型目录。将配置的 `additional_config`
+合并到已有服务配置，或通过 `vllm serve --config` 传入。
+
+契约为 `fp8-block`（128×128、E4M3、乘法 FP32 block scale）→
+`int4-packed-nn`（per-channel、ixmm NN），`transform@weight_load`。
+target 的 `pack_version` 也可省略，旧值 `1` 仅作为兼容标记。
+仅匹配 routed experts；attention、dense 和 shared experts 保持原 FP8 路径。
+激活为动态 per-token INT8；`IluFp8ToW4A8NNMoEMethod` 继承
+`IluW4A8NNMoEMethod` 的全部执行入口，仅覆盖 FP8 checkpoint 的创建和加载转换。
+`iluvatar` 只需指定 `method: IluFp8ToW4A8NNMoEMethod`，可选
+`max_pending_shards`（默认 8）；不再指定 decode 后端或 graph 开关。
+
+量化与离线 per-channel 算法一致：先反量化 FP8，令
+`s8 = max(abs(W), dim=K) / 127`，再计算
+`q8 = clamp(round(W/s8), -127, 127)`、
+`q4 = clamp(round(q8/18), -8, 7)`，NN 保存的通道 scale 为 `18*s8`。
+全零通道单独处理为零权重和有限 scale，避免除零。
+
+上述在线算法保留 FP32 中间值。若已有离线 checkpoint 在反量化、scale
+计算或归一化时使用 BF16，中间舍入会使其权重和 scale 与在线结果不逐位相等；
+不能把这种数值差异当作 NN 布局转换错误。
+
+**TP 必须保留完整 K 维的统计范围。** gate/up 沿输出通道切分，可先切后量化；
+down_proj 沿 K 切分，加载器暂存单个 expert 的完整 FP8 权重与 block scale，
+计算完整通道的 scale 后，只量化和打包本 rank 的 K 分片。两级 scale 都不能
+根据本地 K 重新估计。因此相同 checkpoint 的 down_proj scale 不随 TP 改变，
+不需要加载时跨 rank all-reduce。暂存受 `max_pending_shards` 限制，转换后释放。
+
+GLM-5.2 纯 TP8 的 down_proj 本地 K=256；TP16 本地 K=128，目标权重和激活
+补零到 NN graph GEMM 要求的 K=256，有效 INT4 数值及通道 scale 不变。
+目前仅支持顺序 checkpoint loader、无 bias 的 gate/up experts、128 对齐的
+FP8 分片；不支持 EPLB、预先切好 K 的 checkpoint 或源 hidden/intermediate padding。
 
 ## 9. 故障定位
 

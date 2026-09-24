@@ -1256,6 +1256,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         sorted_token_ids,
         output_format=None,
         check_valid=False,
+        expand_tokens_gpu=None,
     ):
         # unpad
         input = unpad_tensor(input, self.gemm1_info.get_n(), contiguous=True)
@@ -1324,10 +1325,14 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         elif act_value == "swiglustep":
             kwargs["bias"] = None
             kwargs["act_type"] = "swiglustep"
+            if expand_tokens_gpu is not None:
+                kwargs["expand_tokens_gpu"] = expand_tokens_gpu
             output, scale = ixfops.activation_dynamic_scaled_int8(**kwargs)
         elif act_value in ("silu", "swiglu"):
             kwargs["bias"] = None
             kwargs["act_type"] = "swiglu"
+            if expand_tokens_gpu is not None:
+                kwargs["expand_tokens_gpu"] = expand_tokens_gpu
             output, scale = ixfops.activation_dynamic_scaled_int8(**kwargs)
         else:
             raise ValueError(

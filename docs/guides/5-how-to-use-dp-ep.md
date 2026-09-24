@@ -278,6 +278,19 @@ A/B 定位。
 - 对应提交：
   `6752b169`。
 
+#### `VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP`
+
+- 默认值：`0`；设置为 `1` 后重启模型进程。
+- 作用：GLM-5.2 的 LL 路径在 dispatch 提交前，将 shared MLP 提交到辅助
+  CUDA stream，与主流上的 dispatch 并行；dispatch receiver 返回后汇合，
+  再执行 routed experts。shared MLP 不再延后到 combine/AG 阶段。
+- 与 `VLLM_ILU_LL_FUSED_AG_AR` 兼容：fused combine/AG/AR 直接接收已完成的
+  shared 输出，不再拆出独立的 shared TP all-reduce 和加法。
+- 生效条件：LL 路径、有 shared expert、输入 token 数大于 0；TP=1 也可
+  与 EP dispatch 重叠。该开关与全局 `VLLM_DISABLE_SHARED_EXPERTS_STREAM` 独立。
+
+该开关仅改变执行调度。实际收益需在目标并发与 CUDA Graph 模式下对照验证。
+
 ### 3.2 DP 请求分配与 Prefill 同步
 
 #### `VLLM_ILU_DP_ROUND_ROBIN_LB`

@@ -41,6 +41,7 @@ from vllm.distributed import (
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoEActivationFormat
+from vllm.utils.torch_utils import aux_stream, current_stream
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 from vllm_iluvatar.model_executor.layers.fused_moe.prepare_finalize.ilu_deepep_ll import (
     VLLM_ILU_DEEPEP_USE_SCATTER,
@@ -744,6 +745,40 @@ class IluFusedMoEEP:
             topk_weights = topk_weights[shard_start:shard_end]
             topk_ids = topk_ids[shard_start:shard_end]
 
+        if shared_gate_up_input is not None:
+            assert shared_experts_input is not None
+            _check_shared_gate_up(shared_experts_input, shared_gate_up_input)
+
+        shared_output = None
+        shared_stream = None
+        if runner.shared_experts is not None:
+            assert shared_experts_input is not None
+            shared_layer_input = (
+                shared_experts_input
+                if shared_gate_up_input is None
+                else shared_gate_up_input
+            )
+            if (
+                getattr(self, "_ll_shared_dispatch_overlap_enabled", False)
+                and orig_num_tokens > 0
+            ):
+                # Fork BEFORE prepare_async: NVSM dispatch itself is queued on
+                # the main stream. Forking afterward would serialize shared
+                # compute behind dispatch, including during CUDA Graph replay.
+                shared_stream = aux_stream()
+                assert shared_stream is not None
+                shared_stream.wait_stream(current_stream())
+                shared_inputs = (
+                    shared_layer_input
+                    if isinstance(shared_layer_input, tuple)
+                    else (shared_layer_input,)
+                )
+                for tensor in shared_inputs:
+                    if isinstance(tensor, torch.Tensor):
+                        tensor.record_stream(shared_stream)
+                with torch.cuda.stream(shared_stream):
+                    shared_output = runner.shared_experts._layer(shared_layer_input)
+
         # dispatch
         assert prepare_finalize.supports_async()
         prepare_ret = prepare_finalize.prepare_async(
@@ -762,24 +797,8 @@ class IluFusedMoEEP:
         if prepare_hook is not None:
             prepare_hook()
 
-        if shared_gate_up_input is not None:
-            assert shared_experts_input is not None
-            _check_shared_gate_up(shared_experts_input, shared_gate_up_input)
-
-        shared_output = None
-        if runner.shared_experts is not None:
-            assert shared_experts_input is not None
-            # This is the accepted dispatch-window schedule: dispatch is
-            # launched first, shared experts run before the receiver waits for
-            # dispatch completion, and routed experts run afterward. Backends
-            # with independent communication progress can overlap that window.
-            # Do not move shared experts to their auxiliary stream here: the
-            # extra CUDA Graph fork/join was substantially slower per layer.
-            shared_layer_input = (
-                shared_experts_input
-                if shared_gate_up_input is None
-                else shared_gate_up_input
-            )
+        if runner.shared_experts is not None and shared_stream is None:
+            # Preserve the serial dispatch-window schedule when disabled.
             shared_output = runner.shared_experts._layer(shared_layer_input)
 
         (
@@ -789,6 +808,13 @@ class IluFusedMoEEP:
             expert_topk_ids,
             expert_topk_weights,
         ) = prepare_receiver()
+
+        # Join before routed GEMMs: shared compute overlaps only dispatch,
+        # and the original fused combine/AG/AR can consume shared_output.
+        if shared_stream is not None:
+            current_stream().wait_stream(shared_stream)
+            assert shared_output is not None
+            shared_output.record_stream(current_stream())
 
         # moe forward
         if expert_topk_ids is not None:

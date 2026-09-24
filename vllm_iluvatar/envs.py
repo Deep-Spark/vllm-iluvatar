@@ -129,6 +129,7 @@ if TYPE_CHECKING:
     VLLM_ILU_GLM_DSA_FP8_ABSORB_UP: bool = True
     VLLM_ILU_GLM_DSA_TOPK_CONVERT_CACHE: bool = True
     VLLM_ILU_GLM_DSA_NATIVE_MQA_LOGITS: bool = False
+    VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP: bool = False
     VLLM_ILU_GLM_DSA_INDEXER_PREPARE_FUSION: bool = True
     VLLM_ILU_NIXL_WRITE_USE_HOST_BUFFER: bool = False
     VLLM_ILU_NIXL_HOST_DTYPE: str = "auto"
@@ -365,6 +366,10 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Cache request-local -> global top-k conversion across shared DSA layers.
     "VLLM_ILU_GLM_DSA_TOPK_CONVERT_CACHE": _bool_reader(
         "VLLM_ILU_GLM_DSA_TOPK_CONVERT_CACHE", "1"
+    ),
+    # GLM-5.2 LL: shared MLP on an auxiliary stream overlaps dispatch.
+    "VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP": _bool_reader(
+        "VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP", "0"
     ),
     # GLM indexer preparation fusion. Default 1; set 0 for the split path:
     # - glm_dsa_indexer_q_rope_weights: in-place RoPE on Q's first 64 dims

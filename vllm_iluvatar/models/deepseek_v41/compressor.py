@@ -7,7 +7,7 @@ from typing import Any, ClassVar, cast
 
 import torch
 from torch import nn
-from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -21,10 +21,9 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.kv_cache_interface import (
-    KVCacheSpec,
-    SlidingWindowMLASpec,
-)
+from vllm.v1.kv_cache_interface import KVCacheSpec
+
+from vllm_iluvatar.v1.core.compressor_state import IluCompressorStateSpec
 
 from vllm_iluvatar.models.deepseek_v41.common.ops.fused_compress_quant_cache import (
     fused_save_compress_norm,
@@ -64,7 +63,7 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        assert isinstance(self.kv_cache_spec, SlidingWindowMLASpec)
+        assert isinstance(self.kv_cache_spec, IluCompressorStateSpec)
         self.capacity = self.kv_cache_spec.block_size
         max_num_batched_tokens = (
             self.vllm_config.scheduler_config.max_num_batched_tokens
@@ -97,14 +96,11 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
 class IluCompressorStateCache(torch.nn.Module, AttentionLayerBase):
     """Per-request ring of the open group's [kv, score] rows (ratio > 1)."""
 
-    def __init__(
-        self, state_dim: int, dtype: torch.dtype, prefix: str, cache_config: CacheConfig
-    ):
+    def __init__(self, state_dim: int, dtype: torch.dtype, prefix: str):
         super().__init__()
         self.state_dim = state_dim
         self.dtype = dtype
         self.prefix = prefix
-        self.cache_config = cache_config
         self.kv_cache = torch.tensor([])
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -112,10 +108,13 @@ class IluCompressorStateCache(torch.nn.Module, AttentionLayerBase):
         compilation_config.static_forward_context[prefix] = self
 
         assert self.dtype == torch.float32
-        # The ring shares physical blocks with the other three caches, so its
-        # capacity is the negotiated page size rather than the draft count
-        # official derives it from.
-        self.block_size = cache_config.block_size
+        # Official V4.1 ring: capacity covers the open group plus the
+        # speculative lookahead, and is at least 8. The kernel wraps
+        # ``pos % block_size`` inside the single block this spec reserves.
+        spec_cfg = get_current_vllm_config().speculative_config
+        n_spec = 0 if spec_cfg is None else spec_cfg.num_speculative_tokens
+        rows_per_step = n_spec + 2
+        self.block_size = max(8, 1 << (rows_per_step - 1).bit_length())
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         # [B, H=1, N, C] -> [B, N, C]
@@ -123,7 +122,7 @@ class IluCompressorStateCache(torch.nn.Module, AttentionLayerBase):
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         del vllm_config
-        return SlidingWindowMLASpec(
+        return IluCompressorStateSpec(
             block_size=self.block_size,
             num_kv_heads=1,
             head_size=self.state_dim,
@@ -196,7 +195,6 @@ class IluDeepseekCompressor(nn.Module):
                 state_dim=2 * self.head_dim,  # kv_state + score_state
                 dtype=torch.float32,
                 prefix=f"{prefix}.state_cache",
-                cache_config=vllm_config.cache_config,
             )
             if compress_ratio > 1
             else None

@@ -88,7 +88,7 @@ def hc_pre_mixes(
             pre_mix_in,
         )
     else:
-        post, comb, layer_input, pre_out = ixfops.ds4_v41_mhc_pre_1pass(
+        post, comb, layer_input, pre_out = ixfops.ds4_v41_mhc_pre_sqrsum(
             x.contiguous(),
             fn,
             hc_scale,
@@ -133,7 +133,7 @@ def hc_post_sqrsum(
     to :func:`hc_pre_mixes` as ``sqrsum`` -- but only if nothing rewrites the
     residual in between.
     """
-    return ixfops.ds4_v41_mhc_post_sqrsum(
+    return ixfops.ds4_v41_mhc_post(
         x.contiguous(),
         residual.contiguous(),
         post.contiguous(),

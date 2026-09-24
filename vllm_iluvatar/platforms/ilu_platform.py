@@ -152,6 +152,22 @@ def _make_iluvatar_platform():
             return True
 
         @classmethod
+        def register_custom_kv_cache_specs(cls, vllm_config) -> None:
+            del vllm_config
+            from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+
+            from vllm_iluvatar.v1.core.compressor_state import (
+                CompressorStateManager,
+                IluCompressorStateSpec,
+            )
+
+            KVCacheSpecRegistry.register(
+                IluCompressorStateSpec,
+                CompressorStateManager,
+                uniform_type_base_spec=IluCompressorStateSpec,
+            )
+
+        @classmethod
         def import_kernels(cls) -> None:
             # fork interface.py: Platform.import_kernels -> pass.
             pass

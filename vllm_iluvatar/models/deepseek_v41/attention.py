@@ -557,7 +557,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             # latest kv source below them (its indexer produces the keys).
             if self.is_kv_source:
                 row_bytes, row_dtype = _indexer_k_cache_row(
-                    config.index_head_dim, "auto"
+                    config.index_head_dim, "bf16"
                 )
                 index_k_cache = IluDeepseekV41IndexerCache(
                     head_dim=row_bytes,

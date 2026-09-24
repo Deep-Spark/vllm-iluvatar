@@ -27,13 +27,14 @@ from vllm_iluvatar.models.deepseek_v4.fp8_model import (
 from vllm_iluvatar.models.deepseek_v41 import mhc
 from vllm_iluvatar.models.deepseek_v41.attention import IluDeepseekV41Attention
 from vllm_iluvatar.models.deepseek_v41.engram import (
-    EngramTokenHistory,
     IluEngram,
-    build_compressed_token_map,
-    build_engram_primes,
-    compute_hash_multipliers,
+    EngramLayout,
+    NgramHashState,
+    _num_reqs,
     _window_metadata,
-    lookback_tokens,
+    build_compressed_token_map,
+    compute_hash_multipliers,
+    engram_dp_group,
 )
 
 logger = init_logger(f"vllm.{__name__}")
@@ -118,7 +119,6 @@ class IluDeepseekV41DecoderLayer(IluDeepseekV4Fp8DecoderLayer):
         post_mix: torch.Tensor | None = None,
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
-        engram_rows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """``(x, residual, post_mix, res_mix, ffn_pre)``; FFN post is delayed."""
         # Each post hands the pre that follows it the sum of squares of the
@@ -131,8 +131,8 @@ class IluDeepseekV41DecoderLayer(IluDeepseekV4Fp8DecoderLayer):
         else:
             residual, sqrsum = mhc.hc_post_sqrsum(x, residual, post_mix, res_mix)
 
-        if self.engram is not None and engram_rows is not None:
-            residual = self.engram.apply(residual, engram_rows)
+        if self.engram is not None and self.engram._rows is not None:
+            residual = self.engram(residual, self.engram._hash_ids)
             sqrsum = None
 
         attn_post, attn_comb, h, attn_pre = self._hc_pre_mixes(
@@ -182,7 +182,8 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
 
         config = self.config
         self.engram_layer_ids = list(getattr(config, "engram_layer_ids", ()) or ())
-        self.engram_history: EngramTokenHistory | None = None
+        self.engram_layout: EngramLayout | None = None
+        self.engram_hash: NgramHashState | None = None
         if not self.engram_layer_ids:
             return
 
@@ -260,31 +261,30 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
                 "number, so the tables would be rehashed incorrectly"
             )
 
-        primes = build_engram_primes(
-            self.engram_layer_ids,
-            config.engram_max_ngram_size,
-            config.engram_n_heads,
-            config.engram_vocab_size,
-        )
+        layout = EngramLayout.from_config(config)
+        assert layout is not None
+        self.engram_layout = layout
         multipliers = compute_hash_multipliers(
             self.engram_layer_ids, config.engram_max_ngram_size, compressed_vocab
         )
-        pad_id = token_map[config.engram_pad_token_id]
-        self.engram_history = EngramTokenHistory(
-            token_map, model_config.max_model_len, self.device
+        swa = self.layers[local_ids[0]].attn.swa_cache_layer
+        self.engram_hash = NgramHashState(
+            layout,
+            swa,
+            token_map,
+            multipliers,
+            token_map[config.engram_pad_token_id],
+            self.device,
         )
-        self.engram_max_ngram = config.engram_max_ngram_size
-        self.engram_pad_id = pad_id
-        for i, layer_id in enumerate(self.engram_layer_ids):
+        for layer_id in self.engram_layer_ids:
             if layer_id not in local_ids:
                 continue
-            layer = self.layers[layer_id]
-            layer.engram = IluEngram(
+            self.layers[layer_id].engram = IluEngram(
                 config,
                 layer_id,
-                primes[i],
-                multipliers[i],
-                pad_id,
+                layout.primes[layout.layer_ids.index(layer_id)],
+                multipliers[layout.layer_ids.index(layer_id)],
+                token_map[config.engram_pad_token_id],
                 self.device,
             )
 
@@ -310,48 +310,55 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
             }
         )
 
-    def _prepare_engram_rows(
-        self,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor,
-    ) -> dict[int, torch.Tensor]:
-        """Lookback once; each local engram layer hashes its own primes."""
-        if (
-            input_ids is None
-            or not getattr(self, "engram_history", None)
-            or not getattr(self, "engram_layer_ids", None)
-        ):
-            return {}
-        md = _window_metadata()
-        use_kernel = (
-            md is not None
-            and md.slot_mapping is not None
-            and self.engram_history.ensure_slots(md) is not None
+    def _engram_layers(self):
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            engram = getattr(layer, "engram", None)
+            if engram is not None:
+                yield engram
+
+    def _prepare_engram(self, input_ids: torch.Tensor | None, positions: torch.Tensor) -> None:
+        """Hash once, then each engram layer gathers its rows before the decoder loop.
+
+        DP>1 lookups are collectives. A replica that skips the real hash still
+        submits dead ids so the other replicas' rows, which live on this rank's
+        shard, are still read.
+        """
+        ready = (
+            input_ids is not None
+            and self.engram_hash is not None
+            and self.engram_hash.ensure_cache()
         )
-        tokens = None
-        if use_kernel:
+        md = _window_metadata() if ready else None
+        if ready and md is not None and md.slot_mapping is not None:
             n = min(input_ids.size(0), positions.size(0))
-            self.engram_history.write_slots_kernel(input_ids[:n], md.slot_mapping)
-        else:
-            tokens = lookback_tokens(
-                self.engram_history,
-                input_ids,
-                positions,
-                self.engram_max_ngram,
-                self.engram_pad_id,
+            hashes = self.engram_hash(
+                input_ids[:n],
+                positions[:n],
+                md.query_start_loc,
+                input_ids.new_zeros(n, dtype=torch.bool),
+                input_ids.new_full((max(_num_reqs(md), 1), self.engram_hash.lookback_depth), -1),
+                input_ids.new_zeros((max(_num_reqs(md), 1), self.engram_hash.lookback_depth), dtype=torch.bool),
+                md.slot_mapping,
+                md.block_table,
+                md.token_to_req_indices,
+                _num_reqs(md),
             )
-        rows: dict[int, torch.Tensor] = {}
-        for layer_id in self.engram_layer_ids:
-            layer = self.layers[layer_id]
-            if isinstance(layer, PPMissingLayer) or getattr(layer, "engram", None) is None:
-                continue
-            if use_kernel:
-                rows[layer_id] = layer.engram.embed_from_metadata(
-                    self.engram_history, input_ids, positions, md
-                )
-            else:
-                rows[layer_id] = layer.engram.embed_from_tokens(tokens)
-        return rows
+            for engram in self._engram_layers():
+                engram.prepare_embeddings(hashes[:, engram.layer_hash_index])
+            return
+        if engram_dp_group() is None or self.engram_layout is None:
+            return
+        t = 0 if input_ids is None else input_ids.size(0)
+        device = self.device if input_ids is None else input_ids.device
+        dummy = torch.full(
+            (t, self.engram_layout.n_hash_cols),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
+        for engram in self._engram_layers():
+            engram.prepare_embeddings(dummy)
+            engram._rows = None
 
     def forward(
         self,
@@ -386,7 +393,7 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
             hidden_states = intermediate_tensors["hidden_states"]
             pre_mix = intermediate_tensors["pre_mix"]
 
-        engram_rows = self._prepare_engram_rows(input_ids, positions)
+        self._prepare_engram(input_ids, positions)
         residual = post_mix = res_mix = None
         aux_hidden_states: list[torch.Tensor] = []
         for idx, layer in enumerate(
@@ -400,7 +407,6 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
                 post_mix,
                 res_mix,
                 residual,
-                engram_rows.get(layer.layer_id),
             )
             if (idx + 1) in self.aux_hidden_state_layers:
                 # ``hidden_states`` is this layer's delayed FFN output, not the

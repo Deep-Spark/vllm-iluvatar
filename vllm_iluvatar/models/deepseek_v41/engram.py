@@ -11,16 +11,42 @@ import numpy as np
 import torch
 from torch import nn
 from vllm.distributed import (
+    get_dp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 
 logger = init_logger(f"vllm.{__name__}")
 
 
 _FP8_BLOCK = 32
+# Out-of-range hash ids (and DP padding) look up as zeros.
+_DEAD_HASH = -1
+
+
+def engram_dp_group():
+    """DP replicas that must split one Engram table. ``None`` when DP size is 1."""
+    try:
+        group = get_dp_group()
+    except AssertionError:
+        return None
+    if group is None or group.world_size <= 1:
+        return None
+    return group
+
+
+def engram_dp_token_slot(group) -> int:
+    """Common token count so every DP rank enters the Engram collective."""
+    meta = get_forward_context().dp_metadata
+    if meta is None:
+        raise RuntimeError("Engram DP lookup needs dp_metadata.num_tokens_across_dp_cpu")
+    counts = meta.num_tokens_across_dp_cpu
+    start = 0
+    stop = group.world_size
+    return int(counts[start:stop].max())
 
 # 表本身是 F8_E4M3，它的块缩放是 F8_E8M0。其余几个只是为了以后换量化格式时不用回来改。
 _SAFETENSORS_DTYPES = {
@@ -239,9 +265,9 @@ def _first_window_layer():
     fallback = None
     for key, layer in ctx.items():
         name = str(key)
-        if "window_kv" not in name:
+        if not _is_window_key(name):
             continue
-        if ".0." in name or name.endswith("layers.0.self_attn.window_kv"):
+        if ".layers.0." in name:
             return layer
         if fallback is None:
             fallback = layer
@@ -262,25 +288,58 @@ def _window_metadata():
         if not hasattr(md, "block_table") or not hasattr(md, "slot_mapping"):
             continue
         name = str(key)
-        if "window_kv" not in name:
+        if not _is_window_key(name):
             continue
-        if ".0." in name or name.endswith("layers.0.self_attn.window_kv"):
+        if ".layers.0." in name:
             return md
         if fallback is None:
             fallback = md
     return fallback
 
 
+def _is_window_key(name: str) -> bool:
+    return "swa_cache" in name or "window_kv" in name
+
+
+def _num_reqs(md) -> int:
+    n = getattr(md, "num_reqs", None)
+    if n is None:
+        n = int(getattr(md, "num_decodes", 0)) + int(getattr(md, "num_prefills", 0))
+    return max(int(n), 1)
+
+
 def _window_nslots() -> int | None:
+    """How many slots the window cache can address, from host-side shapes.
+
+    A slot is ``block_id * block_size + offset``. That is bounded by the
+    cache's page count, which lives on the module after ``bind_kv_cache``.
+    Falling back to ``slot_mapping.max()`` syncs the device every prefill.
+    """
     layer = _first_window_layer()
     if layer is None:
         return None
     kv = getattr(layer, "kv_cache", None)
     if isinstance(kv, (list, tuple)):
         kv = kv[0] if kv else None
-    if kv is None or not hasattr(kv, "numel") or kv.numel() == 0:
+    block_size = int(getattr(layer, "block_size", 0) or 0)
+    if kv is not None and hasattr(kv, "numel") and kv.numel() > 0 and block_size > 0:
+        return int(kv.shape[0]) * block_size
+    return None
+
+
+def _pool_nslots(block_size: int) -> int | None:
+    """Page-pool bound when the window cache tensor is not bound yet."""
+    if block_size <= 0:
         return None
-    return int(kv.shape[0]) * int(getattr(layer, "block_size", 0) or 0)
+    try:
+        from vllm.config import get_current_vllm_config
+
+        nblk = int(get_current_vllm_config().cache_config.num_gpu_blocks or 0)
+    except Exception:
+        return None
+    if nblk <= 0:
+        return None
+    return nblk * block_size
 
 
 def _slots_at(md, req: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -341,19 +400,14 @@ class EngramTokenHistory(nn.Module):
         return torch.stack(tokens, dim=-1)
 
     def ensure_slots(self, md) -> torch.Tensor | None:
-        """Size the slot cache from the bound window KV, not from ``*.max()``."""
         need = _window_nslots()
         if need is None:
-            sm = md.slot_mapping
-            bt = md.block_table
-            if sm is None or sm.numel() == 0 or bt.numel() == 0:
+            sm = getattr(md, "slot_mapping", None)
+            bt = getattr(md, "block_table", None)
+            if sm is None or bt is None or sm.numel() == 0 or bt.numel() == 0:
                 return None
-            cap = min(bt.numel() * max(int(md.block_size), 1), 1 << 20)
-            sel = torch.nonzero(sm >= 0, as_tuple=False).reshape(-1)
-            if sel.numel() == 0:
-                return None
-            need = min(int(sm.index_select(0, sel).amax().item()) + 1, cap)
-        if need <= 0:
+            need = _pool_nslots(max(int(getattr(md, "block_size", 0) or 0), 1))
+        if not need:
             return None
         # One trailing slot past ``need`` is a write sink: ``update_slots`` aims
         # the rows whose slot is out of range at it rather than selecting the
@@ -454,9 +508,22 @@ class EngramEmbedding(nn.Module):
         self.dim = dim
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
-        self.part_num_embeddings = (num_embeddings + tp_size - 1) // tp_size
-        self.start_idx = tp_rank * self.part_num_embeddings
+        # DP=1 keeps the TP-only row split. DP>1 shards the same table across
+        # TP x DP so each replica owns a disjoint row range; the lookup then
+        # all-reduces. TP-major rank matches the official head-shard order.
+        self._dp_group = engram_dp_group()
+        dp_size = self._dp_group.world_size if self._dp_group is not None else 1
+        dp_rank = self._dp_group.rank_in_group if self._dp_group is not None else 0
+        num_shards = tp_size * dp_size
+        shard_rank = tp_rank * dp_size + dp_rank
+        self.part_num_embeddings = (num_embeddings + num_shards - 1) // num_shards
+        self.start_idx = shard_rank * self.part_num_embeddings
         self.end_idx = min(self.start_idx + self.part_num_embeddings, num_embeddings)
+        if self._dp_group is not None:
+            logger.info(
+                "engram table sharded across TP %d x DP %d, this rank rows [%d, %d)",
+                tp_size, dp_size, self.start_idx, self.end_idx,
+            )
         self.weight: torch.Tensor | None = None
         self.scale: torch.Tensor | None = None
         self._dev_weight: torch.Tensor | None = None
@@ -502,14 +569,6 @@ class EngramEmbedding(nn.Module):
         rest of the weights -- and every gather then faults them back from disk, at
         9-240 ms per ``index_select`` on the prefill critical path. ``mlock`` fixes
         that at 0.12-0.16 ms.
-
-        They must also stay *shared*, which is why this maps the file itself instead
-        of copying. The table is sharded by TP only, so under data parallelism every
-        DP replica of a rank wants the same slice. A private copy per process put
-        TP2xDP4 at 756 GiB of host RAM and killed the server; sharing the mapping
-        brings that back to 189 GiB, because a second process locking the same
-        11.44 GiB region costs 0.02 GiB (measured).
-
         ``safe_open`` cannot be used for this: it maps the file ``rw-p``, and
         ``mlock`` on a writable private mapping breaks COW up front, which lands
         right back on a private copy per process.
@@ -598,28 +657,48 @@ class EngramEmbedding(nn.Module):
         values = values.flatten(-2).to(torch.bfloat16)
         return values.masked_fill_(mask.unsqueeze(-1), 0)
 
-    def forward(self, indices: torch.Tensor) -> torch.Tensor:
-        """indices: [T, n_hash_cols] on device -> [T, n_hash_cols, dim] bf16 on device."""
-        assert self.weight is not None and self.scale is not None, (
-            "engram table not loaded; call load_from_checkpoint first"
-        )
+    def _lookup(self, indices: torch.Tensor) -> torch.Tensor:
         if indices.numel() == 0:
             return torch.empty(
                 (*indices.shape, self.dim), dtype=torch.bfloat16, device=indices.device
             )
         if self.ensure_device_view():
-            values = torch.ops._C.engram_lookup_fp8(
+            return torch.ops._C.engram_lookup_fp8(
                 indices,
                 self._dev_weight,
                 self._dev_scale,
                 int(self.start_idx),
                 int(self.end_idx),
             )
-        else:
-            values = self._gather_cpu(indices)
+        return self._gather_cpu(indices)
+
+    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+        assert self.weight is not None and self.scale is not None, (
+            "engram table not loaded; call load_from_checkpoint first"
+        )
+        group = self._dp_group
+        n_local = indices.shape[0]
+        if group is None:
+            values = self._lookup(indices)
+            if get_tensor_model_parallel_world_size() > 1:
+                values = tensor_model_parallel_all_reduce(values)
+            return values
+
+        slot = engram_dp_token_slot(group)
+        if n_local > slot:
+            raise ValueError(
+                f"Engram token count {n_local} exceeds the DP token slot {slot}"
+            )
+        if n_local < slot:
+            pad = indices.new_full((slot - n_local, indices.shape[1]), _DEAD_HASH)
+            indices = torch.cat((indices, pad))
+        gathered = group.all_gather(indices, dim=0)
+        values = self._lookup(gathered)
         if get_tensor_model_parallel_world_size() > 1:
             values = tensor_model_parallel_all_reduce(values)
-        return values
+        values = group.all_reduce(values)
+        start = group.rank_in_group * slot
+        return values[start : start + n_local]
 
 
 def lookback_tokens(
@@ -668,6 +747,8 @@ class IluEngram(nn.Module):
         self.n_hash_cols = (self.max_ngram_size - 1) * self.n_heads
 
         layer_index = list(config.engram_layer_ids).index(layer_id)
+        self.layer_hash_index = layer_index
+        self._rows: torch.Tensor | None = None
         self.embed = EngramEmbedding(
             config.engram_num_embeddings[layer_index], self.head_dim
         )
@@ -816,7 +897,7 @@ class IluEngram(nn.Module):
             int(self.pad_id),
             int(history._nslots),
             int(md.block_size),
-            int(max(int(md.num_reqs), 1)),
+            _num_reqs(md),
             True,
         )
 
@@ -828,6 +909,11 @@ class IluEngram(nn.Module):
         md,
     ) -> torch.Tensor:
         return self.embed(self.hash_from_metadata(history, input_ids, positions, md))
+
+    def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
+        """Look up this layer's rows before the decoder loop, as official does."""
+        self._hash_ids = hash_ids
+        self._rows = self.embed(hash_ids)
 
     def apply(self, hidden_states: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
         x, x_scale = ixfops.fp8_per_token_dynamic_scaled(rows.flatten(-2))
@@ -842,6 +928,18 @@ class IluEngram(nn.Module):
         return self._gate(hidden_states, kv)
 
     def forward(
+        self,
+        hidden_states: torch.Tensor,
+        hash_ids: torch.Tensor,
+        token_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        rows = self._rows if self._rows is not None else self.embed(hash_ids)
+        self._rows = None
+        if token_mask is not None:
+            rows = rows.masked_fill(~token_mask.view(-1, 1, 1), 0)
+        return self.apply(hidden_states, rows)
+
+    def forward_from_history(
         self,
         hidden_states: torch.Tensor,
         history: EngramTokenHistory,
@@ -877,3 +975,122 @@ class IluEngram(nn.Module):
         sums = ixfops.ds4_engram_gate_reduce(x, kv, self._qk_weight, self.key_offset)
         sums = tensor_model_parallel_all_reduce(sums)
         return ixfops.ds4_engram_gate_apply(x, kv, sums, self.eps, self.clamp_value)
+
+
+class EngramLayout:
+    """Bucket layout of the n-gram hash tables. Same fields as upstream."""
+
+    def __init__(self, config) -> None:
+        self.layer_ids = tuple(config.engram_layer_ids)
+        self.num_embeddings = tuple(config.engram_num_embeddings)
+        self.max_ngram_size = config.engram_max_ngram_size
+        self.n_heads = config.engram_n_heads
+        self.head_dim = config.engram_head_dim
+        self.compressed_vocab_size = config.engram_compressed_vocab_size
+        self.pad_token_id = config.engram_pad_token_id
+        self.primes = tuple(
+            build_engram_primes(
+                list(self.layer_ids),
+                self.max_ngram_size,
+                self.n_heads,
+                config.engram_vocab_size,
+            )
+        )
+        self.n_hash_cols = (self.max_ngram_size - 1) * self.n_heads
+
+    @classmethod
+    def from_config(cls, config) -> "EngramLayout | None":
+        if not getattr(config, "engram_layer_ids", None):
+            return None
+        return cls(config)
+
+
+class NgramHashState(nn.Module):
+    """One hash for the batch, shared by every engram layer.
+
+    ``ensure_cache`` sizes the slot store from the bound SWA KV cache.
+    There is no device reduction and no host sync.
+    """
+
+    def __init__(self, layout: EngramLayout, swa_cache_module, token_map, multipliers, pad_id, device) -> None:
+        super().__init__()
+        self.layout = layout
+        self.swa_cache_module = swa_cache_module
+        self.block_size = int(swa_cache_module.block_size)
+        self.lookback_depth = layout.max_ngram_size - 1
+        self.pad_id = int(pad_id)
+        self._cache: torch.Tensor | None = None
+        self._nslots = 0
+        self.register_buffer(
+            "token_map",
+            torch.tensor(token_map, dtype=torch.int64, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "multipliers", multipliers.to(device=device, dtype=torch.int64), persistent=False
+        )
+        prime_rows = []
+        offset_rows = []
+        for primes in layout.primes:
+            flat = [p for group in primes for p in group]
+            prime_rows.append(torch.tensor(primes, dtype=torch.int64))
+            offset_rows.append(torch.tensor(np.cumsum([0, *flat[:-1]]), dtype=torch.int64))
+        self.register_buffer("primes", torch.stack(prime_rows).to(device), persistent=False)
+        self.register_buffer("offsets", torch.stack(offset_rows).to(device), persistent=False)
+
+    def ensure_cache(self) -> bool:
+        kv = self.swa_cache_module.kv_cache
+        if isinstance(kv, (list, tuple)):
+            kv = kv[0] if kv else None
+        if kv is None or kv.numel() == 0:
+            self._cache = None
+            self._nslots = 0
+            return False
+        nslots = int(kv.shape[0]) * self.block_size
+        if self._cache is None or self._cache.numel() < nslots + 1:
+            self._cache = torch.zeros(nslots + 1, dtype=torch.int64, device=kv.device)
+        self._nslots = nslots
+        return True
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        dead_mask: torch.Tensor,
+        lookback_token_ids: torch.Tensor,
+        lookback_dead_mask: torch.Tensor,
+        slot_mapping: torch.Tensor | None,
+        block_table: torch.Tensor | None,
+        token_to_req: torch.Tensor,
+        num_reqs: int,
+    ) -> torch.Tensor:
+        del dead_mask, lookback_token_ids, lookback_dead_mask
+        assert self._cache is not None and slot_mapping is not None
+        assert block_table is not None
+        n = min(input_ids.size(0), positions.size(0), token_to_req.size(0))
+        torch.ops._C.engram_write_hash_cache(
+            input_ids[:n], self.token_map, slot_mapping[:n], self._cache, int(self._nslots)
+        )
+        cols = []
+        for i in range(self.multipliers.shape[0]):
+            cols.append(
+                torch.ops._C.engram_ngram_hash(
+                    input_ids[:n],
+                    positions[:n],
+                    self.token_map,
+                    self._cache,
+                    block_table,
+                    token_to_req[:n],
+                    query_start_loc,
+                    self.multipliers[i],
+                    self.primes[i],
+                    self.offsets[i],
+                    self.pad_id,
+                    int(self._nslots),
+                    self.block_size,
+                    int(num_reqs),
+                    True,
+                )
+            )
+        return torch.stack(cols, dim=1)

@@ -8,11 +8,15 @@ import pytest
 import torch
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor import parameter as parameter_module
+from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
 from vllm_iluvatar.model_executor.layers.quantization import ilu_fp8
+from vllm_iluvatar.model_executor.layers.quantization.ilu_fp16_to_fp4_moe import (
+    IluFp16ToFp4OnlineMoEMethod,
+)
 from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8 import (
     IluFp8PerChannelOnlineLinearMethod,
 )
@@ -81,10 +85,10 @@ def _payload(*, enabled: bool = True) -> dict:
     }
 
 
-def _vllm_config(payload: dict | None) -> VllmConfig:
+def _vllm_config(payload: dict | None, *, model_type: str = MODEL_TYPE) -> VllmConfig:
     config = VllmConfig()
     config.model_config = SimpleNamespace(
-        hf_text_config=SimpleNamespace(model_type=MODEL_TYPE),
+        hf_text_config=SimpleNamespace(model_type=model_type),
         dtype=torch.bfloat16,
     )
     config.additional_config = {} if payload is None else {"ilu_quant": payload}
@@ -151,3 +155,50 @@ def test_payload_declaring_another_quant_method_is_rejected():
         pytest.raises(ValueError, match="does not apply to quant_method"),
     ):
         config.get_quant_method(_linear(TARGET_PREFIX), TARGET_PREFIX)
+
+
+def _minimax_payload() -> dict:
+    import json
+    from pathlib import Path
+
+    example = (
+        Path(__file__).resolve().parents[4]
+        / "examples"
+        / "iluvatar-runtime-quant"
+        / "MiniMaxAI"
+        / "MiniMax-M3"
+        / "fp8-fp4-runtime.json"
+    )
+    return {"source": "inline", **json.loads(example.read_text())}
+
+
+def _experts(prefix: str) -> RoutedExperts:
+    layer = object.__new__(RoutedExperts)
+    torch.nn.Module.__init__(layer)
+    layer.prefix = prefix
+    layer.moe_config = SimpleNamespace()
+    return layer
+
+
+def test_minimax_payload_dispatches_linear_fp8_and_moe_fp4():
+    payload = _minimax_payload()
+    config = IluRuntimeQuantBaseConfig()
+    linear_prefix = "language_model.model.layers.0.self_attn.qkv_proj"
+    moe_prefix = "language_model.model.layers.3.block_sparse_moe.experts"
+    other_linear = "language_model.model.layers.3.block_sparse_moe.gate"
+    with set_current_vllm_config(_vllm_config(payload, model_type="minimax_m3_text")):
+        linear = config.get_quant_method(_linear(linear_prefix), linear_prefix)
+        moe = config.get_quant_method(_experts(moe_prefix), moe_prefix)
+        moe_nested = config.get_quant_method(
+            _experts(moe_prefix + ".routed_experts"),
+            moe_prefix + ".routed_experts",
+        )
+        unmatched_linear = config.get_quant_method(_linear(other_linear), other_linear)
+        skipped_experts = config.get_quant_method(
+            _experts("visual.blocks.0.mlp.experts"), "visual.blocks.0.mlp.experts"
+        )
+    assert isinstance(linear, IluFp8PerChannelOnlineLinearMethod)
+    assert isinstance(moe, IluFp16ToFp4OnlineMoEMethod)
+    assert isinstance(moe_nested, IluFp16ToFp4OnlineMoEMethod)
+    assert isinstance(unmatched_linear, UnquantizedLinearMethod)
+    assert skipped_experts is None

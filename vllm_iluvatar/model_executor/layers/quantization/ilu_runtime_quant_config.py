@@ -301,8 +301,17 @@ class IluRuntimeQuantConfig:
             target for target, count in audit.target_hits.items() if count == 0
         ]
         if missing_targets:
-            raise RuntimeError(
-                f"{group_id}: targets matched no layers: {missing_targets}"
+            # A pipeline stage only builds its own layers, so a target can be
+            # legitimately unmatched: MiniMax's dense MLP lives on PP0 and PP1
+            # never sees it. Only a single-stage run can demand full coverage.
+            if _pipeline_parallel_size() == 1:
+                raise RuntimeError(
+                    f"{group_id}: targets matched no layers: {missing_targets}"
+                )
+            logger.info(
+                "%s: PP rank has no local layers for targets %s",
+                group_id,
+                missing_targets,
             )
         if log_summary and not audit.summary_logged:
             audit.summary_logged = True
@@ -330,6 +339,21 @@ class IluRuntimeQuantConfig:
         for group in self.config_groups:
             self.assert_validation_complete(group.group_id)
         self._all_validated[0] = True
+
+
+def _pipeline_parallel_size() -> int:
+    """PP world size on this worker, or 1 when there is no PP group yet.
+
+    Read from the process group rather than ``get_current_vllm_config()``:
+    validation also runs during the profile forward, where the config context
+    is not set but the group is already initialized.
+    """
+    try:
+        from vllm.distributed.parallel_state import get_pp_group
+
+        return int(get_pp_group().world_size)
+    except Exception:
+        return 1
 
 
 def _parse_endpoint(value: object, where: str, *, source: bool) -> IluWeightEndpoint:

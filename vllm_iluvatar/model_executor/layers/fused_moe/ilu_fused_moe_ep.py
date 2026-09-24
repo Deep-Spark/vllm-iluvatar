@@ -129,29 +129,50 @@ class IluFusedMoEEP:
     _dp_ep_ll_preinit_done = False
 
     def init_ep(self):
-        if self._should_preinit_dp_ep_ll_handle():
-            runner = self.experts
-            # moe_quant_config is None during model construction because it needs
-            # post-processed weight scales. Defer NVSM initialization until after
-            # weight processing, but before CUDA graph capture; patch only once.
-            original_init = runner.maybe_init_modular_kernel
+        if not self._should_preinit_dp_ep_ll_handle():
+            return
+        runner = self.experts
+        # Seed the module-global max-num-seqs consumed by ``_get_max_num_seqs``
+        # (called later from ``_get_forward_dp_ep_ll_all2all``). deepseek_v4 —
+        # unlike step3p5 / minimax_m2 — does not call ``set_max_num_seqs`` in its
+        # own ``__init__``, and the NVSM init wrapper below runs on the first
+        # forward (``profile_run`` under ``determine_available_memory``), where
+        # ``set_current_vllm_config`` is no longer active so
+        # ``get_current_vllm_config_or_none()`` returns None. Model construction
+        # runs inside ``set_current_vllm_config``, so capture the value here and
+        # stash it in the module global for the later forward.
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is not None and _MAX_NUM_SEQS is None:
+            set_max_num_seqs(_decode_max_tokens_per_rank_from_config(vllm_config))
 
-            def init_modular_kernel_and_nvsm(runner_self):
-                original_init()
-                runner_self.routed_experts._ensure_moe_quant_config_init()
-                self._get_forward_dp_ep_ll_all2all()
-                logger.info_once(
-                    "Initialized Hybrid EP low-latency decode backend "
-                    "(configured_backend=%s, decode_override=%s).",
-                    runner_self.moe_config.moe_parallel_config.all2all_backend,
-                    _DS4_DECODE_EP_BACKEND,
-                )
+        # moe_quant_config is None during model construction because it needs
+        # post-processed weight scales. The runner lazily initializes it on
+        # the first forward — ``_forward_impl`` calls
+        # ``routed_experts._ensure_moe_quant_config_init`` (ced6857afa,
+        # replacing the old ``runner.maybe_init_modular_kernel`` removed by
+        # the MoE modular-kernel refactor) — which runs after weight
+        # processing and before CUDA graph capture. Wrap that hook to also
+        # bring up the DeepEP low-latency all2all handle + NVSM dispatch
+        # state at the same point; patch only once.
+        routed_experts = runner.routed_experts
 
-            runner.maybe_init_modular_kernel = MethodType(
-                init_modular_kernel_and_nvsm,
-                runner,
+        original_init = routed_experts._ensure_moe_quant_config_init
+
+        def ensure_moe_quant_config_and_nvsm(re_self):
+            original_init()
+            self._get_forward_dp_ep_ll_all2all()
+            logger.info_once(
+                "Initialized Hybrid EP low-latency decode backend "
+                "(configured_backend=%s, decode_override=%s).",
+                runner.moe_config.moe_parallel_config.all2all_backend,
+                _DS4_DECODE_EP_BACKEND,
             )
-            IluFusedMoEEP._dp_ep_ll_preinit_done = True
+
+        routed_experts._ensure_moe_quant_config_init = MethodType(
+            ensure_moe_quant_config_and_nvsm,
+            routed_experts,
+        )
+        IluFusedMoEEP._dp_ep_ll_preinit_done = True
 
     def _should_use_forward_dp_ep(self) -> bool:
         moe_parallel_config = self.experts.moe_config.moe_parallel_config
@@ -545,7 +566,13 @@ class IluFusedMoEEP:
             assert shared_experts_input is not None
             if shared_gate_up_input is not None:
                 _check_shared_gate_up(shared_experts_input, shared_gate_up_input)
-            shared_experts.maybe_sync_shared_experts_stream(shared_experts_input)
+        # vLLM v0.30.0 (ced6857afa) removed ``SharedExperts.maybe_sync_shared_experts_stream``
+        # (the pre-dispatch aux-stream sync) and replaced it with ``maybe_forward_async`` +
+        # ``wait``. This naive DP+EP path does NOT use pre-dispatch async shared experts:
+        # shared experts run synchronously AFTER the routed experts below (see the
+        # ``shared_experts(...)`` call after ``forward_modular``/``apply_fused_moe``), so
+        # there is nothing to sync here. Drop the stale call (same rationale as
+        # ``IluMoERunner._forward_impl``).
         ctx = get_forward_context()
         sequence_parallel_ctx = (
             ctx.dp_metadata.sp_local_sizes(moe_config.sp_size)

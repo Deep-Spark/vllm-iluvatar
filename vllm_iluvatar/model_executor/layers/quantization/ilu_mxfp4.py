@@ -280,8 +280,10 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
 
     # [ILU override] FusedMoEMethodBase.maybe_make_prepare_finalize — delta:
     # None. Community would build a prepare/finalize pair once
-    # ``use_all2all_kernels`` is true (EP together with DP / PCP / SP), and
-    # ``MoERunner.maybe_init_modular_kernel`` would then wrap us into a
+    # ``use_all2all_kernels`` is true (EP together with DP / PCP / SP); the
+    # runner's lazy ``routed_experts._ensure_moe_quant_config_init``
+    # (ced6857afa, replacing the ``maybe_init_modular_kernel`` removed by the
+    # MoE modular-kernel refactor) then materializes a
     # ``FusedMoEModularMethod`` whose ``apply`` expects a real kernel. Iluvatar
     # dispatch/combine is the naive EP-group path instead
     # (``IluMoERunner.do_naive_dispatch_combine``), so we opt out explicitly

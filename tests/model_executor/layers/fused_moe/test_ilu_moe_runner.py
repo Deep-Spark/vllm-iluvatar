@@ -129,10 +129,13 @@ class TestFP16ScalingFactor:
 
         vllm_config = MagicMock()
         vllm_config.parallel_config.enable_elastic_ep = False
-        with patch.object(MoERunner, "__init__", fake_super_init), patch(
-            "vllm_iluvatar.model_executor.layers.fused_moe.runner"
-            ".ilu_moe_runner.get_current_vllm_config",
-            return_value=vllm_config,
+        with (
+            patch.object(MoERunner, "__init__", fake_super_init),
+            patch(
+                "vllm_iluvatar.model_executor.layers.fused_moe.runner"
+                ".ilu_moe_runner.get_current_vllm_config",
+                return_value=vllm_config,
+            ),
         ):
             runner = IluMoERunner(routed_scaling_factor=4.0)
 
@@ -155,10 +158,13 @@ class TestFP16ScalingFactor:
 
         vllm_config = MagicMock()
         vllm_config.parallel_config.enable_elastic_ep = False
-        with patch.object(MoERunner, "__init__", fake_super_init), patch(
-            "vllm_iluvatar.model_executor.layers.fused_moe.runner"
-            ".ilu_moe_runner.get_current_vllm_config",
-            return_value=vllm_config,
+        with (
+            patch.object(MoERunner, "__init__", fake_super_init),
+            patch(
+                "vllm_iluvatar.model_executor.layers.fused_moe.runner"
+                ".ilu_moe_runner.get_current_vllm_config",
+                return_value=vllm_config,
+            ),
         ):
             runner = IluMoERunner(routed_scaling_factor=4.0)
 
@@ -397,7 +403,6 @@ class TestForwardImpl:
             ]
         )
 
-        runner._maybe_sync_shared_experts_stream = MagicMock()
         runner._maybe_dispatch = MagicMock(
             side_effect=lambda hidden, logits, input_ids: (
                 hidden,

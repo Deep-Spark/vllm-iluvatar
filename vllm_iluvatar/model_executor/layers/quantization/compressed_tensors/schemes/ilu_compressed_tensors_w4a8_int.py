@@ -29,13 +29,11 @@ from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_uti
     unpad_tensor,
 )
 
-
 __all__ = ["IluCompressedTensorsW4A8Int"]
 
 W4A8_SUPPORTED_TYPES_MAP = {
     4: scalar_types.int4,
 }
-W4A8_SUPPORTED_BITS = list(W4A8_SUPPORTED_TYPES_MAP.keys())
 
 # Dense W4A8 checkpoints store kernel-packed NN ``[K, N/2]``.
 # ``w4a8_gemm_quant_repack_int4`` transposes to ``[K, N]``, permutes 32x32 tiles

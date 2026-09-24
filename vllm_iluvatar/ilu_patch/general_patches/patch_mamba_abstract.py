@@ -3,7 +3,7 @@
 
 Corresponds to: vllm/model_executor/layers/mamba/abstract.py
 Target   : vllm.model_executor.layers.mamba.abstract.MambaBase
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (ced6857afa)
 Why      : ILU ``bind_kv_cache_scale`` (free function in
            vllm_iluvatar.v1.worker.gpu.model_runner) mirrors the community
            ``bind_kv_cache`` free function and calls

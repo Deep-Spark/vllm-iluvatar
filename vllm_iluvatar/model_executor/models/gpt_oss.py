@@ -4,13 +4,10 @@
 Corresponds to: vllm/model_executor/models/gpt_oss.py
 Target   : vllm.model_executor.models.gpt_oss.GptOssForCausalLM
            (arch "GptOssForCausalLM")
-Baseline : main_6e448d0
-Why      : Iluvatar W4A8/W8A8 GPT-OSS checkpoints use NN/TN layouts and
-           plugin env-controlled gemm formats that the community GPT-OSS
-           loader does not understand. The community ``_load_weights_other``
-           unconditionally ``permute(0, 2, 1)`` on expert weights (assumes a
-           TN checkpoint -> NN param), which corrupts ILU NN-layout
-           checkpoints that are already stored as ``[E, k, n]``.
+Baseline : v0.30.0 (ced6857afa)
+Why      : Iluvatar W4A8/W8A8 GPT-OSS checkpoints use padded routed-expert
+           tensors and plugin env-controlled layouts that community GPT-OSS
+           loaders do not understand.
 How      : Register an OOT subclass, keep community construction unchanged, then
            swap the inner ``GptOssModel`` instance to a subclass that overrides
            only ``_load_weights_other``. Permute is applied only when

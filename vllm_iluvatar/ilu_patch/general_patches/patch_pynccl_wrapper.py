@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Wiring for Iluvatar PyNCCL optional symmetric-memory symbols.
 
-Corresponds to:
-    vllm/distributed/device_communicators/pynccl_wrapper.py
+Corresponds to: vllm/distributed/device_communicators/pynccl_wrapper.py
 
 ILU general-plugins patch, auto-discovered from the centralized
 ``ilu_patch.general_patches`` package during ``register_general``.
@@ -14,7 +13,7 @@ so they are removed from ``NCCLLibrary.exported_functions`` before
 
 Target   : vllm.distributed.device_communicators.pynccl_wrapper.
            NCCLLibrary.exported_functions
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (ced6857afa)
 Why      : ``ncclCommWindowRegister`` / ``ncclCommWindowDeregister`` are only
            needed for NCCL symmetric memory and may be absent in vendor NCCL
            builds. Missing them should not disable the ordinary PyNCCL API.

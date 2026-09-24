@@ -216,7 +216,7 @@ MTP 还需两个 `ilu_patch.general_patches`（各暴露 `register()`，由 `app
 
 启动约束（以通用形式给出，具体拓扑按部署环境调整）：
 
-- **PP>1 时 draft 须单 stage**：MTP draft 只有一层、未做流水线切分，须在投机配置里设 `draft_pipeline_parallel_size: 1`（TP 仍与 target 一致），否则 draft PP 会继承 target PP，在 config 校验阶段报 draft 模型不支持 PP。
+- **PP>1 时 draft 自动单 stage**：MTP draft 只有一层、未做流水线切分；社区 `SpeculativeConfig.create_draft_parallel_config` 已把 draft 的 `pipeline_parallel_size` 硬编码为 1（TP 仍与 target 一致），无需在投机配置里显式设置 draft PP。
 - **PP 每个 stage 的首层须为 `full` indexer 层**：`shared` 层复用本 rank 上一个 `full` 层写的 top-k buffer，buffer 不跨 rank 传。因此须按 `full` 层位置对齐 PP 边界（可用层划分环境变量控制），否则某 rank 首层落在 `shared` 会读到脏值、输出错误。
 - 权重几乎全在 MoE 层，PP 负载均衡应按 **MoE 层数**而非总层数分配；带 MTP 的最后一个 stage 宜少放一层目标 MoE，为 MTP 与 KV cache 腾空间。
 
@@ -256,6 +256,6 @@ MTP 还需两个 `ilu_patch.general_patches`（各暴露 `register()`，由 `app
 2. **模型适配**：按 `model.py` 模板搭 `IluXXXForCausalLM`，实现融合参数映射与严格 reverse 校验，`register_model()` 注册 causal-LM + MTP，并把包加入 `_OOT_MODEL_PACKAGES`。
 3. **attention 抽离**：三层自包含 attention，数据依赖控制流用 `direct_register_custom_op` 封成 plugin-local opaque op（独立算子名、padding 行保护）。
 4. **MoE / 量化**：复用 `compressed-tensors`（`IluQuantConfig`），`kv_b_proj` 走 `IluGlmKVBProjW8A16Method` 拆 `W_UK/W_UV`，grouped-BMM method 的 `apply` 抛 `NotImplementedError`。
-5. **三种模式**：先 eager 打基线；再用 `--compilation-config` 开 `FULL_DECODE_ONLY` cuda-graph；最后加 `mtp.py` + 两个 general patch 开 MTP（注意 `draft_pipeline_parallel_size: 1` 与 PP 首层须为 full 层）。
+5. **三种模式**：先 eager 打基线；再用 `--compilation-config` 开 `FULL_DECODE_ONLY` cuda-graph；最后加 `mtp.py` + 两个 general patch 开 MTP（注意 PP 首层须为 full 层）。
 
 本文的所有代码引用均来自 GLM-5.2（`IluGlmMoeDsa`）这一落地实现，可作为对照。

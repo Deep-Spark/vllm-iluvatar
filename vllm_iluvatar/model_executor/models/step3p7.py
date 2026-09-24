@@ -1,29 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """Iluvatar OOT Step3.7 VL model override.
 
-Corresponds to:
-    vllm/model_executor/models/step3p7.py
+Corresponds to: vllm/model_executor/models/step3p7.py
 
-Target:
-    vllm.model_executor.models.step3p7.Step3p7ForConditionalGeneration
-    (arch "Step3p7ForConditionalGeneration").
-Baseline:
-    main_6e448d0.
-Why:
-    Step-3.7 nests ``Step3p7TextConfig`` (model_type step3p5) without
-    ``tie_word_embeddings``. Community ``Step3p5Model`` reads that field when
-    building PP embeddings. The language tower is constructed with
-    ``hf_config=text_config``, so the nested object must carry the default.
-How:
-    ``ModelRegistry.register_model`` points the community arch at this subclass.
-    Before community construction, fill ``tie_word_embeddings=False`` on the
-    nested text config when the attribute is missing. The language model still
-    resolves to the existing Step3.5 OOT class. vLLM has no per-method model
-    hook, so whole-class re-registration is the only official extension point.
-Scope:
-    Step-3.7 Flash serving on Iluvatar.
-Remove:
-    When upstream ``Step3p7TextConfig`` defines ``tie_word_embeddings``.
+Target   : vllm.model_executor.models.step3p7.Step3p7ForConditionalGeneration
+           (arch "Step3p7ForConditionalGeneration")
+Baseline : v0.30.0 (ced6857afa)
+Why      : Step-3.7 nests ``Step3p7TextConfig`` (model_type step3p5) without
+           ``tie_word_embeddings``. Community ``Step3p5Model`` reads that field when
+           building PP embeddings. The language tower is constructed with
+           ``hf_config=text_config``, so the nested object must carry the default.
+How      : ``ModelRegistry.register_model`` points the community arch at this subclass.
+           Before community construction, fill ``tie_word_embeddings=False`` on the
+           nested text config when the attribute is missing. The language model still
+           resolves to the existing Step3.5 OOT class. vLLM has no per-method model
+           hook, so whole-class re-registration is the only official extension point.
+Scope    : Step-3.7 Flash serving on Iluvatar.
+Remove   : When upstream ``Step3p7TextConfig`` defines ``tie_word_embeddings``.
 """
 
 from __future__ import annotations
@@ -58,6 +51,5 @@ def register_model() -> None:
 
     ModelRegistry.register_model(
         "Step3p7ForConditionalGeneration",
-        "vllm_iluvatar.model_executor.models.step3p7:"
-        "Step3p7ForConditionalGeneration",
+        "vllm_iluvatar.model_executor.models.step3p7:Step3p7ForConditionalGeneration",
     )

@@ -387,7 +387,7 @@ class IluFusedMoEEP:
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         org_shape = hidden_states.shape
-        # Adapted to vLLM 0.28.0: the runner always holds the gate (it was
+        # Adapted to vLLM v0.30.0 (ced6857afa): the runner always holds the gate (it was
         # constructed via ``FusedMoEFactory(gate=gate, ...)``), so it computes
         # ``router_logits`` internally. ``router_logits=hidden_states`` is the
         # community ``_forward_fused_moe`` placeholder convention; the
@@ -647,7 +647,6 @@ class IluFusedMoEEP:
             assert shard_rank < len(sizes)
             shard_start = 0 if shard_rank == 0 else sum(sizes[:shard_rank])
             shard_end = shard_start + sizes[shard_rank]
-            # final_hidden_states = final_hidden_states.clone()
             final_hidden_states[shard_start:shard_end] += shared_output
         ep_comm = get_ep_group().device_communicator
         assert ep_comm is not None and ep_comm.ixfd_group is not None

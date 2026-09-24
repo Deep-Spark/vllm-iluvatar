@@ -3,7 +3,7 @@
 
 Corresponds to: vllm/model_executor/models/minimax_m2.py
 Target   : arch ``MiniMaxM2ForCausalLM``
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (ced6857afa)
 Why      : Iluvatar keeps the router weight in BF16 while returning FP32
            logits, and routes DP/EP MoE execution through ``IluFusedMoEEP``.
 How      : Promote community MoE and gate modules in place after construction,

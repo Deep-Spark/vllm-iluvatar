@@ -3,7 +3,7 @@
 
 Corresponds to: vllm/model_executor/models/step3p5.py
 Target   : arch ``Step3p5ForCausalLM``
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (ced6857afa)
 Why      : Iluvatar W8A8 uses fused dynamic-INT8 norm outputs, fused Q/K
            RMSNorm and head-wise gating kernels, and must transport the residual
            stream across pipeline-parallel ranks. DP/EP MoE must use the same
@@ -150,7 +150,7 @@ class IluFusedMoEBlock(_FusedMoEBlock, IluFusedMoEEP):
         if self._should_use_forward_dp_ep() and isinstance(hidden_states, torch.Tensor):
             final_hidden_states = self.forward_dp_ep(hidden_states)
         else:
-            # Adapted to vLLM 0.28.0: the runner always holds the gate (it was
+            # Adapted to vLLM v0.30.0 (ced6857afa): the runner always holds the gate (it was
             # constructed via ``FusedMoEFactory(gate=gate, ...)``), so it
             # computes ``router_logits`` internally. ``router_logits=
             # hidden_states`` is the community ``_forward_fused_moe``

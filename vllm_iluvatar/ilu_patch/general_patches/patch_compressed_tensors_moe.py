@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Wiring for compressed-tensors MoE method selection on Iluvatar.
 
-Corresponds to:
-    vllm/model_executor/layers/quantization/compressed_tensors/
-    compressed_tensors_moe/compressed_tensors_moe.py
+Corresponds to: vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe.py
 
 ILU general-plugins patch, auto-discovered from the centralized
 ``ilu_patch.general_patches`` package during ``register_general``.
@@ -15,7 +13,7 @@ the wrapper and preserves the live community method as fallback.
 
 Target   : vllm.model_executor.layers.quantization.compressed_tensors.
            compressed_tensors_moe.compressed_tensors_moe.CompressedTensorsMoEMethod
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (ced6857afa)
 Why      : community vLLM has no vendor hook for selecting Iluvatar W4A8/W8A8
            MoE methods from compressed-tensors configs.
 How      : install an Iluvatar wrapper for get_moe_method(); unsupported cases

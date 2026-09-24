@@ -439,7 +439,7 @@ class IluGlmMoeDsaMoE(nn.Module, IluFusedMoEEP):
         else:
             experts_in = router_in
 
-        # Adapted to vLLM 0.28.0: the runner always holds the gate (it was
+        # Adapted to vLLM v0.30.0 (ced6857afa): the runner always holds the gate (it was
         # constructed via ``FusedMoEFactory(gate=self.gate, ...)``), so it
         # computes ``router_logits`` internally. ``router_logits=router_in``
         # is the community ``_forward_fused_moe`` placeholder convention (the
@@ -838,7 +838,7 @@ class IluGlmMoeDsaForCausalLM(nn.Module, SupportsPP):
     }
 
     # MTP (layer 78) is dropped via ``hf_to_vllm_mapper`` (maps to None) and
-    # excluded from the strict missing-param check below. vLLM 0.29.0 removed
+    # excluded from the strict missing-param check below. vLLM v0.30.0 (ced6857afa) removed
     # AutoWeightsLoader.skip_substrs, so the drop is done through the mapper
     # (matching the community deepseek_v4 pattern).
     _LOAD_SKIP_SUBSTRS: tuple[str, ...] = ("model.layers.78.",)
@@ -891,7 +891,7 @@ class IluGlmMoeDsaForCausalLM(nn.Module, SupportsPP):
         return self.model.get_expert_mapping()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # vLLM 0.29.0 removed AutoWeightsLoader.skip_substrs; ``model.layers.78.*``
+        # vLLM v0.30.0 (ced6857afa) removed AutoWeightsLoader.skip_substrs; ``model.layers.78.*``
         # (MTP) is dropped by ``hf_to_vllm_mapper`` (``"model.layers.78.": None``).
         loader = AutoWeightsLoader(self)
         loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

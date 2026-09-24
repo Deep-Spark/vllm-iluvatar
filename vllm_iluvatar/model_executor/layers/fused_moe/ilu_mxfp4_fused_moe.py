@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Iluvatar MXFP4 fused-MoE routed-expert execution.
 
-Corresponds to:
-    vllm/model_executor/layers/quantization/mxfp4.py (the routed-expert compute
-    the community ``Mxfp4MoeBackend`` kernels own)
+Corresponds to: vllm/model_executor/layers/quantization/mxfp4.py (the routed-expert compute
+           the community ``Mxfp4MoeBackend`` kernels own)
 
 Target   : routed MXFP4 expert execution for Iluvatar
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (ced6857afa)
 Why      : none of the community MXFP4 MoE backends (TRTLLM / DeepGEMM / Marlin /
            FlashInfer / AITER) has an Iluvatar implementation, so the plugin owns
            the compute. Keeping it in a standalone function -- rather than inside

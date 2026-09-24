@@ -10,7 +10,7 @@ This patch is a pure wrapper with no override implementation of its own, so no
 upstream-mirrored implementation sibling is needed.
 
 Target   : the ``ray.init`` call used by vllm.v1.engine.utils.CoreEngineActorManager
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (ced6857afa)
 Why      : containers without a cgroup CPU quota expose the host CPU count
           (e.g. 255) to ray; ``ray.init()`` defaults ``num_cpus`` to that, so the
           raylet pre-starts 255 python workers (``--num_prestart_python_workers

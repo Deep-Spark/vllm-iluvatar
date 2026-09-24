@@ -7,7 +7,7 @@ ILU general-plugins patch, auto-discovered from the centralized
 ``ilu_patch.general_patches`` package during ``register_general``.
 
 Target   : vllm.v1.worker.gpu.spec_decode.rejection_sampler.MAX_CHUNK_BYTES
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (ced6857afa)
 Why      : community sizes chunks only from the FP32 logits buffer. On Iluvatar
            the top-k/top-p path falls back to PyTorch sorting, which also
            materializes sorted values and int64 indices.

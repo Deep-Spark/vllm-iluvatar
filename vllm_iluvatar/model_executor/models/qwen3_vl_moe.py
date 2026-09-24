@@ -1,31 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 """Iluvatar OOT Qwen3-VL-MoE model override.
 
-Corresponds to:
-    vllm/model_executor/models/qwen3_vl_moe.py
+Corresponds to: vllm/model_executor/models/qwen3_vl_moe.py
 
-Target:
-    vllm.model_executor.models.qwen3_vl_moe.Qwen3VLMoeForConditionalGeneration
-    (arch "Qwen3VLMoeForConditionalGeneration").
-Baseline:
-    main_a67969c5a0.
-Why:
-    Some Qwen3-VL-MoE text configs do not carry ``architectures``. The normal
-    Iluvatar vLLM baseline constructs the embedded language model with
-    ``architectures=["Qwen3MoeForCausalLM"]``. The embedded Qwen3-MoE language
-    model needs the Iluvatar fused q/k norm and unquantized router-gate
-    adaptations, while expert loading stays on the AutoWeightsLoader /
-    RoutedExperts path.
-How:
-    Use ``ModelRegistry.register_model`` for the VL-MoE architecture. Before
-    community construction, fill the nested text config architecture if missing;
-    after construction, install the same Qwen3-MoE language-model adaptations
-    used by the standalone Qwen3-MoE plugin.
-Scope:
-    Qwen3-VL-MoE models on Iluvatar.
-Remove:
-    When community preserves nested text config architectures and Qwen3-MoE
-    attention/router behavior is device-safe upstream.
+Target   : vllm.model_executor.models.qwen3_vl_moe.Qwen3VLMoeForConditionalGeneration
+           (arch "Qwen3VLMoeForConditionalGeneration")
+Baseline : v0.30.0 (ced6857afa)
+Why      : Some Qwen3-VL-MoE text configs do not carry ``architectures``. The normal
+           Iluvatar vLLM baseline constructs the embedded language model with
+           ``architectures=["Qwen3MoeForCausalLM"]``. The embedded Qwen3-MoE language
+           model needs the Iluvatar fused q/k norm and unquantized router-gate
+           adaptations, while expert loading stays on the AutoWeightsLoader /
+           RoutedExperts path.
+How      : Use ``ModelRegistry.register_model`` for the VL-MoE architecture. Before
+           community construction, fill the nested text config architecture if missing;
+           after construction, install the same Qwen3-MoE language-model adaptations
+           used by the standalone Qwen3-MoE plugin.
+Scope    : Qwen3-VL-MoE models on Iluvatar.
+Remove   : When community preserves nested text config architectures and Qwen3-MoE
+           attention/router behavior is device-safe upstream.
 """
 
 from __future__ import annotations

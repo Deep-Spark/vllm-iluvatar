@@ -12,11 +12,12 @@ shares the community KV backing buffer) is released alongside the KV cache:
   fingerprint to maintain): the iterable is materialised, the original is
   called, then a second pass detaches ``kv_cache_scale``.
 
-The runner-level ``self.kv_scale_caches`` list does not exist in V2 yet (the
-ILU scale wiring into the real V2 path is pending); its clear will be added
-in that wiring patch once ``self.kv_scale_caches`` is created, not here.
+The runner-level ``self.kv_scale_caches`` list is created and cleared in
+``GPUModelRunner`` (see ``vllm_iluvatar/v1/worker/gpu/model_runner.py``); this
+patch only owns the layer-level ``kv_cache_scale`` detach.
 
 Target   : vllm.v1.worker.utils.clear_layer_kv_caches
+Baseline : v0.30.0 (ced6857afa)
 Scope    : only active when VLLM_ILU_FLASH_ATTN_QUANT_TYPE != "" or
            VLLM_ILU_MLA_ATTN_QUANT_TYPE != ""
 Remove   : when upstream supports int8 kv cache quantization.

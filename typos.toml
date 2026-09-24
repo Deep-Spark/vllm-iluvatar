@@ -22,3 +22,7 @@ mis = "mis"
 # ``token_arange_p1`` / ``decode_token_arange_p1_buffer`` derive from it. Not a
 # typo of ``arrange``.
 arange = "arange"
+# ``ba`` is the GDN (gated delta net) b/a decomposition tensor: ``in_proj_ba``
+# projects to it and ``split_ba`` splits it into the ``b`` and ``a`` gates. Not
+# a typo of ``by`` / ``be``.
+ba = "ba"

@@ -22,7 +22,6 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     get_temporal_copy_spec,
 )
-from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -74,16 +73,6 @@ from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .indexer import QSAPoolCarry
 from .ple import Qwen4ExpPLELayer
 from .ple_utils import ple_conv_window_state_shape
-
-
-def without_modelopt_fp4(
-    quant_config: QuantizationConfig | None,
-) -> QuantizationConfig | None:
-    """Return ``None`` for weights excluded from Qwen4Exp ModelOpt-FP4."""
-
-    if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
-        return None
-    return quant_config
 
 
 class _Qwen4ExpGDNStateMixin:

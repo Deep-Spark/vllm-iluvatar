@@ -576,12 +576,6 @@ class QSAStateBackend(AttentionBackend):
     def supported_kv_cache_layouts(cls) -> tuple[str, ...]:
         return ("NHD", "HND")
 
-    @classmethod
-    def indexes_kv_by_block_stride(cls) -> bool:
-        # get_kv_cache_shape puts num_blocks outermost, so a page padded up to
-        # the main KV page stays readable as a strided view over the block dim.
-        return True
-
 
 class _QSAStateCache(nn.Module, AttentionLayerBase):
     supports_dcp = False

@@ -4,7 +4,7 @@
 Corresponds to: vllm/model_executor/layers/quantization/mxfp4.py
 
 Target   : vllm.model_executor.layers.quantization.mxfp4.Mxfp4MoEMethod
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (ced6857afa)
 Why      : community ``Mxfp4MoEMethod`` picks a backend through
            ``select_deepseek_v4_mxfp4_moe_backend``, and off ROCm that function
            can only return NVIDIA-specific backends (TRTLLM / DeepGEMM / Marlin /

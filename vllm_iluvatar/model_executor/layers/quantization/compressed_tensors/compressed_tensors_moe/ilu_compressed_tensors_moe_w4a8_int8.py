@@ -194,8 +194,6 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         self.group_size = (
             weight_quant.group_size if (weight_quant.group_size is not None) else -1
         )
-        # if weight_quant.num_bits != 4:
-        #     raise ValueError("This method only supports 4-bit weights (num_bits=4).")
 
         self.weight_symmetric = self.weight_quant.symmetric
         self.gemm_format = ilu_params.get("gemm_format", "")

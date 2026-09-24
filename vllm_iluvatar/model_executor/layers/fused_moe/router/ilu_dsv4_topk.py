@@ -4,7 +4,7 @@
 Corresponds to: vllm/model_executor/layers/fused_moe/router/dsv4_topk.py
 
 Target   : vllm.model_executor.layers.fused_moe.router.dsv4_topk.can_use_dsv4_topk
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (ced6857afa)
 Why      : ``fused_topk_bias`` diverts ``sqrtsoftplus`` routing into the Triton
            kernel ``dsv4_topk`` whenever ``can_use_dsv4_topk`` says yes.  On
            Iluvatar all eight conditions hold for DeepSeek-V4's 40 bias layers,

@@ -8,7 +8,6 @@ import torch
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineId,
-    get_current_attn_backend,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     CopyBlocksOp,
@@ -26,9 +25,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 )
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
-from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
+from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_push.metadata import (
@@ -54,39 +52,6 @@ if TYPE_CHECKING:
 
 
 class NixlConnector(KVConnectorBase_V1, SupportsHMA):
-    @property
-    def prefer_cross_layer_blocks(self) -> bool:
-        if any(
-            [
-                isinstance(group.kv_cache_spec, MambaSpec)
-                for group in self._kv_cache_config.kv_cache_groups
-            ]
-        ):
-            # Hybrid SSM models do not yet support cross-layer layout
-            return False
-
-        backend = get_current_attn_backend(self._vllm_config)
-        if backend.get_name() not in (
-            "FLASH_ATTN",
-            "FLASHINFER",
-            "TRITON_ATTN",
-        ):
-            return False
-
-        # For now there is no benefit to run cross layers when backend
-        # does not support on HND
-        if (
-            self._vllm_config.cache_config.get_resolved_kv_cache_layout().name
-            != "LBHNC"
-        ):
-            return False
-
-        extra_config = self.kv_transfer_config.kv_connector_extra_config
-        return (
-            str(extra_config.get("enable_cross_layers_blocks", "False")).lower()
-            == "true"
-        )
-
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -217,12 +182,6 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
     ):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches, kv_cache_scales)
-
-    def register_cross_layers_kv_cache(
-        self, kv_cache: torch.Tensor, attn_backend: type[AttentionBackend]
-    ):
-        assert self.connector_worker is not None
-        self.connector_worker.register_cross_layers_kv_caches(kv_cache)
 
     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
         pass

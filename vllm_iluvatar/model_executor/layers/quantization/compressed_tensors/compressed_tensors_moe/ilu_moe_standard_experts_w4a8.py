@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Iluvatar standard-layout W4A8 MoE expert implementation.
 
-Corresponds to:
-    vllm/model_executor/layers/quantization/compressed_tensors/
-    compressed_tensors_moe/*
+Corresponds to: vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/*
 Target   : W4A8 standard-layout expert kernel for Iluvatar MoE.
-Baseline : plugin/vllm 0.28.0 runtime source
+Baseline : v0.30.0 (ced6857afa) plugin runtime source
 Why      : Iluvatar W4A8 MoE uses ixformer kernels with fork-specific format
            and metadata handling.
 How      : subclass ``BaseStandardExperts`` and route W4A8 compute through
@@ -192,7 +190,6 @@ class IluMoEStandardExpertsW4A8(BaseStandardExperts):
             scaling_factor=self.runner_scaling_factor,
             mask=reduce_mask,
             output=output,
-            # extra_residual=shared_experts_input,
         )
 
         return out

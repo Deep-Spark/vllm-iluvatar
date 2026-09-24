@@ -194,7 +194,7 @@ class IluNixlBaseConnectorScheduler(NixlBaseConnectorScheduler):
     def build_connector_meta(self, scheduler_output):
         # Keep this method in sync with vLLM
         # vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler
-        # at community commit 9b71db2c9e (v0.30.0). Ilu delta: use
+        # at community commit ced6857afa (v0.30.0). Ilu delta: use
         # IluNixlConnectorMetadata so ReqMeta carries remote PP topology
         # to the worker.
         meta = IluNixlConnectorMetadata()

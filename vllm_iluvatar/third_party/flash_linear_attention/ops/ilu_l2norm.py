@@ -4,8 +4,6 @@ import os
 import torch
 from vllm.triton_utils import tl, triton
 
-BT_LIST = [8, 16, 32, 64, 128]
-
 USE_DEFAULT_FLA_NORM = int(os.getenv("USE_DEFAULT_FLA_NORM", "0"))
 
 
@@ -86,7 +84,6 @@ def l2norm_fwd_inplace(
     assert x.stride(-1) == 1 and x1.stride(-1) == 1
     assert x.stride() == x1.stride()
     token_stride = x.stride(0)
-    # rstd = torch.empty((T,), dtype=torch.float32, device=x.device)
     # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // x.element_size()
     BD = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
@@ -95,7 +92,6 @@ def l2norm_fwd_inplace(
 
     if not USE_DEFAULT_FLA_NORM and H % 4 == 0:
         MBLOCK = 4
-        # M, N = x.shape
         l2norm_fwd_kernel2[(B, H // 4)](
             x,
             x1,

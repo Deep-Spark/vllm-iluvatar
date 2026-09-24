@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Iluvatar W16A16 unquantized fused-MoE method wrappers.
 
-Corresponds to:
-    vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py
+Corresponds to: vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py
 
 Target   : vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method.
            UnquantizedFusedMoEMethod
-Baseline : main_a67969c5a0 + fork ILUVATAR_W16A16 delta
+Baseline : v0.30.0 (ced6857afa) + fork ILUVATAR_W16A16 delta
 Why      : preserve the fork-only ILUVATAR_W16A16 ``ilu_apply`` dispatch without
            editing community vLLM source.
 How      : ``@UnquantizedFusedMoEMethod.register_oot()`` installs an official

@@ -4,7 +4,7 @@
 Migrated from upstream ``vllm/model_executor/layers/fused_moe/iluvatar_runner/
 ilu_elastic_ep.py`` + ``vllm/distributed/eplb/ilu_rebalance.py``.
 
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (ced6857afa)
 
 Contains:
   ilu_eplb_map_and_record       pure-torch EPLB mapping (replaces Triton kernel)

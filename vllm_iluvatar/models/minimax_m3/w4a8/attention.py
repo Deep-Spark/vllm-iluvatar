@@ -412,7 +412,7 @@ class IluMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         rotary_dim = self.rotary_emb.rotary_dim
         eps = self.q_norm.variance_epsilon
 
-        # Main KV cache is the community 0.29.0 4-D
+        # Main KV cache is the community v0.30.0 (ced6857afa) 4-D
         # [B, H, block, head_size+head_size_v] layout (K/V packed in the last
         # dim). The ixformer native M3 fused_kv kernel lifts it to a zero-copy
         # 5-D NHD view internally (see ixformer...fused_kv.as_nhd_view).

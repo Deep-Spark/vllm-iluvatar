@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Iluvatar ``SpeculativeConfig`` draft-arch routing and draft-PP overrides.
+"""Iluvatar ``SpeculativeConfig`` draft-arch routing overrides.
 
 Corresponds to: vllm/config/speculative.py ::
-``SpeculativeConfig.hf_config_override`` / ``SpeculativeConfig.__post_init__`` /
-``SpeculativeConfig.create_draft_parallel_config``
+``SpeculativeConfig.hf_config_override`` / ``SpeculativeConfig.__post_init__``
 
 On Iluvatar the W4A8 forks of the speculative draft models ship dedicated,
 self-contained draft archs (``IluGlmMoeDsaMTPModel`` / ``IluDeepSeekV4MTPModel`` /
@@ -20,18 +19,18 @@ assigns the arch, so the community path stays untouched for non-ilu models:
   ``hf_config_override`` has run, so that remap has to happen there instead.
 
 ``create_draft_parallel_config`` keeps the draft on a single PP stage: ilu MTP
-drafts are one layer and do not implement ``SupportsPP``.
+drafts are one layer and do not implement ``SupportsPP``. Community
+(``ced6857afa``) already hardcodes ``pipeline_parallel_size=1`` in that
+function, so no ilu override is needed for it.
 
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (ced6857afa)
 """
 
 from __future__ import annotations
 
-import copy
 import functools
-import inspect
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 
@@ -139,56 +138,3 @@ def make_hf_config_override(
         return hf_config
 
     return hf_config_override
-
-
-def make_create_draft_parallel_config(orig: Callable[..., Any]) -> Callable[..., Any]:
-    """Force draft PP=1 when the target uses PP>1.
-
-    Newer vLLM takes an explicit draft PP (already resolved to the target PP
-    when unset). Older builds copy target PP. Either way the ilu MTP draft
-    cannot be pipeline-split, so override to a single stage.
-    """
-    takes_draft_pp = (
-        "speculative_draft_pipeline_parallel_size" in inspect.signature(orig).parameters
-    )
-
-    @functools.wraps(orig)
-    def create_draft_parallel_config(
-        target_parallel_config: Any,
-        speculative_draft_tensor_parallel_size: int,
-        *_args: Any,
-    ) -> Any:
-        target_pp = target_parallel_config.pipeline_parallel_size
-        draft_pp = 1 if target_pp > 1 else target_pp
-        if takes_draft_pp:
-            return orig(
-                target_parallel_config,
-                speculative_draft_tensor_parallel_size,
-                draft_pp,
-            )
-        # Old signature copies PP from the target. Do not dataclasses.replace
-        # the returned config: pydantic Field(init=False) members (world_size)
-        # leak back as init kwargs.
-        if target_pp != draft_pp:
-            target_parallel_config = copy.copy(target_parallel_config)
-            target_parallel_config.pipeline_parallel_size = draft_pp
-        return orig(target_parallel_config, speculative_draft_tensor_parallel_size)
-
-    return create_draft_parallel_config
-
-
-def make_create_speculative_config(orig: Callable[..., Any]) -> Callable[..., Any]:
-    """Drop ``draft_pipeline_parallel_size`` on older SpeculativeConfig.
-
-    Extra keys are forbidden; the draft PP override above does not read this
-    field, so stripping it is always safe.
-    """
-
-    @functools.wraps(orig)
-    def create_speculative_config(self: Any, *args: Any, **kwargs: Any) -> Any:
-        cfg = getattr(self, "speculative_config", None)
-        if isinstance(cfg, dict):
-            cfg.pop("draft_pipeline_parallel_size", None)
-        return orig(self, *args, **kwargs)
-
-    return create_speculative_config

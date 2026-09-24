@@ -5,7 +5,7 @@ Corresponds to: vllm/model_executor/models/glm4_moe.py
 
 Target   : vllm.model_executor.models.glm4_moe.Glm4MoeForCausalLM
            (arch "Glm4MoeForCausalLM")
-Baseline : main_a67969c5a0
+Baseline : v0.30.0 (ced6857afa)
 Why      : the fork runs the GLM4-MoE router gate in bf16 for Iluvatar grouped
            top-k kernels and makes q/k/v contiguous after qkv split before the
            attention backend consumes them.

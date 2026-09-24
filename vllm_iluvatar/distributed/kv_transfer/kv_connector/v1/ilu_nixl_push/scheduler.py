@@ -766,9 +766,6 @@ class NixlConnectorScheduler:
         if not params:
             return False, None
 
-        # NOTE(gyf): pass
-        # self._stop_heartbeat(request.request_id)
-
         # D side
         if params.get("do_remote_prefill"):
             # If do_remote_prefill is still True when the request is finished,

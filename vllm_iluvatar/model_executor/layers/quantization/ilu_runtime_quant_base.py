@@ -12,10 +12,12 @@ Why      : ``additional_config.ilu_quant`` is resolved from a *base* quant
            requires fail-fast, so those models need a base config of their own.
 How      : ``@register_quantization_config("ilu_runtime")``. The checkpoint
            declares nothing, so every ``LinearBase`` starts out ``ignored`` with
-           an ``UnquantizedLinearMethod``; the only thing that can overlay a
-           runtime method is a matching ilu_quant group. Non-Linear layers
-           return ``None`` and keep community behaviour.
-Scope    : native checkpoints quantized at load time, e.g. ``Qwen/Qwen3.8-27B``.
+           an ``UnquantizedLinearMethod`` and every ``RoutedExperts`` starts
+           out ``ignored`` with ``UnquantizedFusedMoEMethod``; the only thing
+           that can overlay a runtime method is a matching ilu_quant group.
+           Other layers return ``None`` and keep community behaviour.
+Scope    : native checkpoints quantized at load time, e.g. ``Qwen/Qwen3.8-27B``
+           (Linear) and ``MiniMaxAI/MiniMax-M3`` (Linear + routed experts).
 Remove   : if vLLM grows a first-class "no checkpoint quantization, but still
            give me a QuantizationConfig" hook.
 
@@ -36,6 +38,10 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import RoutedExperts
+from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+    UnquantizedFusedMoEMethod,
+)
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import (
@@ -105,21 +111,50 @@ class IluRuntimeQuantBaseConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> QuantizeMethodBase | None:
-        if not isinstance(layer, LinearBase):
-            # Embeddings, attention and everything else keep the behaviour they
-            # would have had without any quantization config.
-            return None
+        if isinstance(layer, LinearBase):
+            self._require_payload()
+            original_method: QuantizeMethodBase = UnquantizedLinearMethod()
+            runtime_method = resolve_ilu_runtime_method(
+                base_quant_config=self,
+                original_method=original_method,
+                original_disposition="ignored",
+                layer=layer,
+                prefix=prefix,
+            )
+            return runtime_method if runtime_method is not None else original_method
 
-        self._require_payload()
-        original_method = UnquantizedLinearMethod()
-        runtime_method = resolve_ilu_runtime_method(
-            base_quant_config=self,
-            original_method=original_method,
-            original_disposition="ignored",
-            layer=layer,
-            prefix=prefix,
-        )
-        return runtime_method if runtime_method is not None else original_method
+        if isinstance(layer, RoutedExperts):
+            self._require_payload()
+            # Do not construct UnquantizedFusedMoEMethod here: its __init__
+            # selects a compute backend. RoutedExperts already does that when
+            # get_quant_method returns None. The factory only needs isinstance.
+            original_method = object.__new__(UnquantizedFusedMoEMethod)
+            runtime_method = resolve_ilu_runtime_method(
+                base_quant_config=self,
+                original_method=original_method,
+                original_disposition="ignored",
+                layer=layer,
+                prefix=prefix,
+            )
+            if runtime_method is None:
+                logger.warning(
+                    "ILU runtime quant: no group matched RoutedExperts "
+                    "prefix=%s class=%s; UnquantizedFusedMoEMethod will keep "
+                    "native BF16 expert weights",
+                    prefix,
+                    type(layer).__name__,
+                )
+            else:
+                logger.info_once(
+                    "ILU runtime quant: RoutedExperts -> %s (example prefix=%s)",
+                    type(runtime_method).__name__,
+                    prefix,
+                )
+            return runtime_method
+
+        # Embeddings, attention and everything else keep the behaviour they
+        # would have had without any quantization config.
+        return None
 
     def _require_payload(self) -> None:
         """Refuse to run as a silent no-op (checked once, then cached)."""

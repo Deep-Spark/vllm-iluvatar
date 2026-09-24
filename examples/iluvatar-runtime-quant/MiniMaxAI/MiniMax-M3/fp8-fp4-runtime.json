@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "enabled": true,
+  "applies_to": {
+    "model_types": ["minimax_m3_text"],
+    "quant_methods": ["ilu_runtime"]
+  },
+  "ignore": [],
+  "config_groups": {
+    "minimax_m3_bf16_linear_to_fp8": {
+      "priority": 100,
+      "targets": [
+        "re:.*\\.self_attn\\.(?:qkv_proj|o_proj)$",
+        "re:.*\\.mlp\\.(?:gate_up_proj|down_proj)$",
+        "re:.*\\.block_sparse_moe\\.shared_experts\\.(?:gate_up_proj|down_proj)$"
+      ],
+      "require": {
+        "original_disposition": "ignored",
+        "checkpoint_dtypes": ["bfloat16"]
+      },
+      "weights": {
+        "source": {
+          "format": "native",
+          "dtypes": ["bfloat16"]
+        },
+        "target": {
+          "format": "fp8",
+          "dtype": "float8_e4m3fn",
+          "strategy": "channel"
+        },
+        "loading": {
+          "mode": "transform",
+          "stage": "process_weights_after_loading"
+        }
+      },
+      "input_activations": {
+        "num_bits": 8,
+        "type": "float",
+        "strategy": "token",
+        "dynamic": true
+      },
+      "output_activations": null,
+      "iluvatar": {
+        "method": "IluFp8PerChannelOnlineLinearMethod",
+        "gemm_format": "TN",
+        "shape_mismatch_policy": "fallback_original"
+      }
+    },
+    "minimax_m3_bf16_moe_to_ix30_fp4": {
+      "priority": 90,
+      "targets": [
+        "re:.*block_sparse_moe\\.experts(?:\\.routed_experts)?$"
+      ],
+      "require": {
+        "original_disposition": "ignored",
+        "checkpoint_dtypes": ["bfloat16"]
+      },
+      "weights": {
+        "source": {
+          "format": "native",
+          "dtypes": ["bfloat16"]
+        },
+        "target": {
+          "format": "ix30-fp4",
+          "dtype": "uint8",
+          "strategy": "group",
+          "group_size": 256,
+          "scale_format": "running_acc"
+        },
+        "loading": {
+          "mode": "transform",
+          "stage": "weight_load"
+        }
+      },
+      "input_activations": {
+        "num_bits": 8,
+        "type": "float",
+        "strategy": "token",
+        "dynamic": true
+      },
+      "output_activations": null,
+      "iluvatar": {
+        "method": "IluFp16ToFp4OnlineMoEMethod",
+        "converter_backend": "auto",
+        "max_pending_shards": 8,
+        "fp8_block_shape": [128, 128]
+      }
+    }
+  }
+}

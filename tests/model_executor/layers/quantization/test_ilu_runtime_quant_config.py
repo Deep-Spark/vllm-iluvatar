@@ -250,6 +250,17 @@ def test_priority_tie_and_target_coverage_are_rejected():
         config.select_group(_linear(), PREFIX, {})
 
 
+def test_pp_stage_may_miss_targets_owned_by_another_stage(monkeypatch):
+    import vllm_iluvatar.model_executor.layers.quantization.ilu_runtime_quant_config as mod
+
+    payload = _payload(targets=[PREFIX, "re:.*\\.mlp\\.(?:gate_up_proj|down_proj)$"])
+    config = _parse(payload)
+    group = config.select_group(_linear(), PREFIX, {})
+    assert group is not None
+    monkeypatch.setattr(mod, "_pipeline_parallel_size", lambda: 2)
+    config.record_shape_result(group.group_id, transformed=True)
+
+
 def test_fp8_dispatch_overlays_ignored_linear_and_records_transform():
     config = _vllm_config(_payload())
     fp8_config = _fp8_config()

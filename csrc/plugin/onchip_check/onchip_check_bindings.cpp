@@ -185,6 +185,22 @@ PyObject *py_kmsg_ready(PyObject *, PyObject *) {
   return PyBool_FromLong(onchip_check_kmsg_ready());
 }
 
+PyObject *py_report_xid(PyObject *, PyObject *args, PyObject *kwargs) {
+  unsigned physical_gpu = 0;
+  unsigned xid = 0;
+  const char *message = nullptr;
+  static const char *keywords[] = {"physical_gpu", "xid", "message", nullptr};
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "IIs",
+                                   const_cast<char **>(keywords), &physical_gpu,
+                                   &xid, &message))
+    return nullptr;
+  int rc = 0;
+  Py_BEGIN_ALLOW_THREADS
+  rc = onchip_check_report_xid(physical_gpu, xid, message);
+  Py_END_ALLOW_THREADS
+  return PyBool_FromLong(rc == 0);
+}
+
 PyObject *py_free(PyObject *, PyObject *) {
   onchip_check_free();
   Py_RETURN_NONE;
@@ -199,6 +215,9 @@ PyMethodDef methods[] = {
     {"config", py_config, METH_NOARGS, "Return the active checker config."},
     {"kmsg_ready", py_kmsg_ready, METH_NOARGS,
      "Return whether the driver XID reporting device is available."},
+    {"report_xid", reinterpret_cast<PyCFunction>(py_report_xid),
+     METH_VARARGS | METH_KEYWORDS,
+     "Report an XID for an explicit physical GPU through /dev/itrctl."},
     {"free", py_free, METH_NOARGS, "Release checker resources."},
     {nullptr, nullptr, 0, nullptr},
 };

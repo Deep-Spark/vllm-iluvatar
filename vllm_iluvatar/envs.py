@@ -158,6 +158,12 @@ if TYPE_CHECKING:
     VLLM_ILU_ONCHIP_CHECK_STARTUP_RETRIES: int = 2
     VLLM_ILU_ONCHIP_CHECK_RETRY_DELAY_MS: float = 100.0
     VLLM_ILU_ONCHIP_CHECK_INCOMPLETE_LOG_INTERVAL: int = 100
+    VLLM_ILU_HBM_ECC_CHECK: bool = False
+    VLLM_ILU_HBM_ECC_POLL_INTERVAL_MS: float = 1000.0
+    VLLM_ILU_HBM_ECC_HEARTBEAT_TIMEOUT_MS: float = 5000.0
+    VLLM_ILU_HBM_ECC_MAX_QUERY_FAILURES: int = 3
+    VLLM_ILU_HBM_ECC_KMSG: bool = False
+    VLLM_ILU_HBM_ECC_KILL_PROCESS_GROUP: bool = False
 
 # Canonical (VLLM_ILU_*) readers. Each lambda preserves the exact parsing the
 # fork used in vllm/envs.py, and reads VLLM_ILU_* first then the legacy VLLM_*.
@@ -402,6 +408,23 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_ONCHIP_CHECK_INCOMPLETE_LOG_INTERVAL": lambda: max(
         1,
         int(os.environ.get("VLLM_ILU_ONCHIP_CHECK_INCOMPLETE_LOG_INTERVAL", "100")),
+    ),
+    "VLLM_ILU_HBM_ECC_CHECK": _bool_reader("VLLM_ILU_HBM_ECC_CHECK", "0"),
+    "VLLM_ILU_HBM_ECC_POLL_INTERVAL_MS": lambda: max(
+        1.0,
+        float(os.environ.get("VLLM_ILU_HBM_ECC_POLL_INTERVAL_MS", "1000")),
+    ),
+    "VLLM_ILU_HBM_ECC_HEARTBEAT_TIMEOUT_MS": lambda: max(
+        1.0,
+        float(os.environ.get("VLLM_ILU_HBM_ECC_HEARTBEAT_TIMEOUT_MS", "5000")),
+    ),
+    "VLLM_ILU_HBM_ECC_MAX_QUERY_FAILURES": lambda: max(
+        1,
+        int(os.environ.get("VLLM_ILU_HBM_ECC_MAX_QUERY_FAILURES", "3")),
+    ),
+    "VLLM_ILU_HBM_ECC_KMSG": _bool_reader("VLLM_ILU_HBM_ECC_KMSG", "0"),
+    "VLLM_ILU_HBM_ECC_KILL_PROCESS_GROUP": _bool_reader(
+        "VLLM_ILU_HBM_ECC_KILL_PROCESS_GROUP", "0"
     ),
 }
 

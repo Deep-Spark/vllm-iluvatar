@@ -183,6 +183,38 @@ stream on every checked batch (about 180 microseconds on BI-V150 under an idle
 GPU). A BI-V150 exposes its two dies as two GPU devices, so each associated
 Worker maintains and runs its own checker.
 
+### HBM ECC monitoring
+
+The HBM ECC monitor reads the CoreX ixML volatile corrected (SBE) and
+uncorrected (DBE) counters without launching CUDA kernels:
+
+```bash
+export VLLM_ILU_HBM_ECC_CHECK=1
+```
+
+Each GPU Worker polls its physical GPU in a background thread. New SBE counts
+are logged and serving continues. An existing DBE at startup rejects the
+Worker; a new DBE at runtime raises a worker health error. Counter rollback,
+repeated query failures, and a stalled polling thread emit critical monitoring
+alerts but do not stop serving. Only a confirmed DBE triggers fail-stop.
+
+Optional settings:
+
+- `VLLM_ILU_HBM_ECC_POLL_INTERVAL_MS` — polling interval, default `1000`.
+- `VLLM_ILU_HBM_ECC_HEARTBEAT_TIMEOUT_MS` — maximum query/heartbeat delay,
+  default `5000`; it must exceed the polling interval.
+- `VLLM_ILU_HBM_ECC_MAX_QUERY_FAILURES` — consecutive failures before the
+  monitor emits an unavailable alert, default `3`.
+- `VLLM_ILU_HBM_ECC_KMSG` — mirror fatal monitor events through
+  `/dev/itrctl` using the physical GPU ID.
+- `VLLM_ILU_HBM_ECC_KILL_PROCESS_GROUP` — terminate the service process group
+  after a runtime fatal event. Enable this only when the launcher gives each
+  vLLM instance a dedicated process group, for example with `setsid`.
+
+The monitor uses a separate watchdog that never calls ixML. If an ixML query
+stalls, the watchdog reports the monitoring outage without blocking the
+inference thread or stopping serving.
+
 ## Documentation
 
 - [Plugin Design](docs/design/iluvatar_plugin_design.md) — Detailed implementation notes

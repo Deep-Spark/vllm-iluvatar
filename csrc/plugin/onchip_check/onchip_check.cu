@@ -154,6 +154,7 @@ void onchip_check_set_kmsg(int enable);
 // the control device is absent, so a caller that must not lose a fault report
 // checks this once at startup rather than discovering it when a card goes bad.
 int onchip_check_kmsg_ready(void);
+int onchip_check_report_xid(unsigned cardid, unsigned xid, const char *message);
 void onchip_check_free(void);
 const char *onchip_check_last_error(void);
 const char *onchip_level_name(int level);
@@ -701,19 +702,26 @@ struct OnchipXidOccurArgs {
 #define ONCHIP_XID_OCCUR_IOCTL \
   _IOW(0x81, ITRCTL_XID_OCCUR, struct OnchipXidOccurArgs)
 
+extern "C" int onchip_check_report_xid(unsigned cardid, unsigned xid,
+                                       const char *message) {
+  int fd = open("/dev/itrctl", O_RDWR | O_CLOEXEC);
+  if (fd < 0)
+    return -1;
+  OnchipXidOccurArgs args = {};
+  args.cardid = (uint32_t)cardid;
+  args.xid = (uint32_t)xid;
+  snprintf(args.msg, sizeof args.msg, "%s", message ? message : "");
+  args.msg[UMDXID_MSG_LEN - 1] = '\0';
+  const int rc = ioctl(fd, ONCHIP_XID_OCCUR_IOCTL, &args);
+  close(fd);
+  return rc;
+}
+
 // Raise XID_CP_HUNG through /dev/itrctl. The driver prepends BDF/UUID/XID, so
 // msg only carries the onchip detail. msg must stay NUL-terminated within
 // UMDXID_MSG_LEN (KMD rejects a non-zero final byte). Never fatal.
 static void xid_report(const char *msg) {
-  int fd = open("/dev/itrctl", O_RDWR | O_CLOEXEC);
-  if (fd < 0) return;
-  OnchipXidOccurArgs args = {};
-  args.cardid = (uint32_t)g.dev;
-  args.xid = XID_CP_HUNG;
-  snprintf(args.msg, sizeof args.msg, "%s", msg);
-  args.msg[UMDXID_MSG_LEN - 1] = '\0';
-  (void)ioctl(fd, ONCHIP_XID_OCCUR_IOCTL, &args);
-  close(fd);
+  (void)onchip_check_report_xid((unsigned)g.dev, XID_CP_HUNG, msg);
 }
 
 // Each level is announced once per init session. A caller that checks around

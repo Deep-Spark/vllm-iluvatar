@@ -182,9 +182,31 @@ class _FakeChecker:
         self.calls.append("free")
 
 
+class _FakeEccMonitor:
+    def __init__(self):
+        self.calls = []
+
+    def start(
+        self,
+        *,
+        rank=None,
+        local_rank=None,
+        logical_device=None,
+        physical_gpu=None,
+    ):
+        self.calls.append(("start", rank, local_rank, logical_device, physical_gpu))
+
+    def check(self):
+        self.calls.append("check")
+
+    def free(self):
+        self.calls.append("free")
+
+
 def test_compile_starts_checker_before_parent():
     worker = _make_worker(object())
     checker = _FakeChecker()
+    monitor = _FakeEccMonitor()
     started_before_parent = []
 
     def start(
@@ -197,6 +219,7 @@ def test_compile_starts_checker_before_parent():
 
     checker.start = start
     worker._onchip_checker = checker
+    worker._hbm_ecc_monitor = monitor
     worker.device = "cuda:3"
     worker.rank = 7
     worker.local_rank = 3
@@ -207,13 +230,16 @@ def test_compile_starts_checker_before_parent():
     assert started_before_parent == [True]
     assert worker.base_calls == ["compile"]
     assert checker.calls == [("start", "cuda:3", 7, 3, 3, 27)]
+    assert monitor.calls == [("start", 7, 3, 3, 27)]
 
 
 @pytest.mark.parametrize("num_tokens", [0, 4])
 def test_execute_checks_only_nonempty_batch(num_tokens):
     worker = _make_worker(object())
     checker = _FakeChecker()
+    monitor = _FakeEccMonitor()
     worker._onchip_checker = checker
+    worker._hbm_ecc_monitor = monitor
     scheduler_output = type(
         "SchedulerOutput", (), {"total_num_scheduled_tokens": num_tokens}
     )()
@@ -222,6 +248,7 @@ def test_execute_checks_only_nonempty_batch(num_tokens):
 
     assert result == "model-output"
     assert checker.calls == (["before_batch"] if num_tokens else [])
+    assert monitor.calls == ["check"]
     assert worker.base_calls == [("execute", scheduler_output)]
 
 
@@ -233,9 +260,27 @@ def test_checker_failure_prevents_model_execution():
             raise RuntimeError("fault")
 
     worker._onchip_checker = FailingChecker()
+    worker._hbm_ecc_monitor = _FakeEccMonitor()
     scheduler_output = type("SchedulerOutput", (), {"total_num_scheduled_tokens": 1})()
 
     with pytest.raises(RuntimeError, match="fault"):
+        worker.execute_model(scheduler_output)
+
+    assert worker.base_calls == []
+
+
+def test_hbm_ecc_failure_prevents_model_execution():
+    worker = _make_worker(object())
+
+    class FailingMonitor(_FakeEccMonitor):
+        def check(self):
+            raise RuntimeError("hbm ecc fault")
+
+    worker._hbm_ecc_monitor = FailingMonitor()
+    worker._onchip_checker = _FakeChecker()
+    scheduler_output = type("SchedulerOutput", (), {"total_num_scheduled_tokens": 1})()
+
+    with pytest.raises(RuntimeError, match="hbm ecc fault"):
         worker.execute_model(scheduler_output)
 
     assert worker.base_calls == []
@@ -245,12 +290,15 @@ def test_shutdown_checks_and_frees():
     model_runner = type("ModelRunner", (), {})()
     worker = _make_worker(model_runner)
     checker = _FakeChecker()
+    monitor = _FakeEccMonitor()
     worker._onchip_checker = checker
+    worker._hbm_ecc_monitor = monitor
     worker._try_replace_model_runner_class = lambda: model_runner.__class__
 
     worker.shutdown()
 
     assert checker.calls == ["check_shutdown", "free"]
+    assert monitor.calls == ["check", "free"]
     assert worker.base_calls == ["shutdown"]
 
 
@@ -264,12 +312,15 @@ def test_shutdown_check_failure_does_not_block_cleanup():
             raise RuntimeError("inconclusive")
 
     checker = FailingChecker()
+    monitor = _FakeEccMonitor()
     worker._onchip_checker = checker
+    worker._hbm_ecc_monitor = monitor
     worker._try_replace_model_runner_class = lambda: model_runner.__class__
 
     worker.shutdown()
 
     assert checker.calls == ["check_shutdown", "free"]
+    assert monitor.calls == ["check", "free"]
     assert worker.base_calls == ["shutdown"]
 
 
@@ -277,7 +328,9 @@ def test_parent_shutdown_failure_still_frees_checker():
     model_runner = type("ModelRunner", (), {})()
     worker = _make_worker(model_runner)
     checker = _FakeChecker()
+    monitor = _FakeEccMonitor()
     worker._onchip_checker = checker
+    worker._hbm_ecc_monitor = monitor
     worker._try_replace_model_runner_class = lambda: model_runner.__class__
     worker.base_shutdown_error = RuntimeError("parent shutdown failed")
 
@@ -285,4 +338,5 @@ def test_parent_shutdown_failure_still_frees_checker():
         worker.shutdown()
 
     assert checker.calls == ["check_shutdown", "free"]
+    assert monitor.calls == ["check", "free"]
     assert worker.base_calls == ["shutdown"]

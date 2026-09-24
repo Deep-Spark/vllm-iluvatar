@@ -6,7 +6,7 @@ IluWorker — subclass of the community Worker with following overrides:
 1. ``determine_available_memory`` for attention quantisation support.
 2. ``initialize_from_config`` for attention quantisation support.
 3. ``compile_or_warm_up_model`` / ``execute_model`` / ``shutdown`` for the
-   optional on-chip storage integrity checker.
+   optional on-chip storage integrity checker and HBM ECC monitor.
 4. ``shutdown`` for attention quantisation support.
 5. ``execute_dummy_batch`` for Iluvatar DP idle-rank optimisation.
 """
@@ -78,18 +78,41 @@ class IluWorker(Worker):
             self._onchip_checker = checker
         return checker
 
+    def _get_hbm_ecc_monitor(self):
+        monitor = getattr(self, "_hbm_ecc_monitor", None)
+        if monitor is None:
+            from vllm_iluvatar.ilu_util.hbm_ecc_monitor import HbmEccMonitor
+
+            monitor = HbmEccMonitor()
+            self._hbm_ecc_monitor = monitor
+        return monitor
+
     def compile_or_warm_up_model(self):
         physical_gpu = current_platform.device_id_to_physical_device_id(self.local_rank)
-        self._get_onchip_checker().start(
-            self.device,
-            rank=self.rank,
-            local_rank=self.local_rank,
-            logical_device=self.local_rank,
-            physical_gpu=physical_gpu,
-        )
-        return super().compile_or_warm_up_model()
+        checker = self._get_onchip_checker()
+        monitor = self._get_hbm_ecc_monitor()
+        try:
+            checker.start(
+                self.device,
+                rank=self.rank,
+                local_rank=self.local_rank,
+                logical_device=self.local_rank,
+                physical_gpu=physical_gpu,
+            )
+            monitor.start(
+                rank=self.rank,
+                local_rank=self.local_rank,
+                logical_device=self.local_rank,
+                physical_gpu=physical_gpu,
+            )
+            return super().compile_or_warm_up_model()
+        except Exception:
+            monitor.free()
+            checker.free()
+            raise
 
     def execute_model(self, scheduler_output):
+        self._get_hbm_ecc_monitor().check()
         if scheduler_output.total_num_scheduled_tokens > 0:
             self._get_onchip_checker().before_batch()
         return super().execute_model(scheduler_output)
@@ -97,7 +120,13 @@ class IluWorker(Worker):
     def shutdown(self) -> None:
         orig_cls = self._try_replace_model_runner_class()
         checker = getattr(self, "_onchip_checker", None)
+        monitor = getattr(self, "_hbm_ecc_monitor", None)
         try:
+            if monitor is not None:
+                try:
+                    monitor.check()
+                except Exception:
+                    logger.exception("HBM ECC monitor shutdown check failed")
             if checker is not None:
                 try:
                     checker.check_shutdown()
@@ -110,6 +139,11 @@ class IluWorker(Worker):
                     checker.free()
                 except Exception:
                     logger.exception("Failed to free worker health checker")
+            if monitor is not None:
+                try:
+                    monitor.free()
+                except Exception:
+                    logger.exception("Failed to free HBM ECC monitor")
             self.model_runner.__class__ = orig_cls
 
     def execute_dummy_batch(self) -> None:

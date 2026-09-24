@@ -58,6 +58,7 @@ int onchip_check_run(OnchipResult *result, unsigned seed,
                      cudaStream_t stream);
 void onchip_check_set_kmsg(int enable);
 int onchip_check_kmsg_ready(void);
+int onchip_check_report_xid(unsigned cardid, unsigned xid, const char *message);
 void onchip_check_free(void);
 const char *onchip_check_last_error(void);
 const char *onchip_level_name(int level);

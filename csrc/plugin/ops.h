@@ -5,6 +5,7 @@
 
 #include <torch/all.h>
 
+#include <optional>
 #include <tuple>
 
 namespace vllm_iluvatar {
@@ -164,5 +165,66 @@ torch::Tensor engram_lookup_fp8_meta(torch::Tensor& indices,
 // cudaHostRegister a page-aligned span of a CPU tensor and return a CUDA
 // alias. Does not copy. Used for the read-only engram mmap.
 torch::Tensor engram_register_host(torch::Tensor& cpu_tensor);
+
+// ---------------------------------------------------------------------------
+// DeepSeek-V4.1 compressor / indexer ops.
+//
+// Shared contract:
+//   slots   : compressed-domain global row indices, as
+//             ``get_compressed_slot_mapping`` emits them (negative = skip). The
+//             page and the row inside it come out of the slot alone, so none of
+//             these take a block table.
+//   ratio   : 1 or 2. A row is published only by the last token of its group,
+//             ``(position + 1) % compress_ratio == 0``, and is rotated against
+//             the group's first raw position.
+//   cos_sin : fp32 [max_pos, >= rope_dim], cos half then sin half (GPT-J).
+//   quant   : true quantization, never quantize-dequantize. The FP8 paths need
+//             an ivcore30 build and raise otherwise.
+// ---------------------------------------------------------------------------
+
+// Ratio-1 compressor latent: per-token RMSNorm of a 512-wide fp32 row into a
+// bf16 ``latent_out`` row. Rows whose slot is negative are left untouched.
+void v41_compress_norm_cr1(torch::Tensor& kv_score,
+                           torch::Tensor& slot_mapping,
+                           torch::Tensor& rms_norm_weight, double rms_norm_eps,
+                           torch::Tensor& latent_out);
+
+// GPT-J RoPE on a compressor latent, then publish it into the compressed KV
+// cache. The cache dtype picks the record: uint8 [., ., 584] is the packed
+// fp8_ds_mla row, bfloat16 / float8_e4m3fn are the plain [448 NoPE | 64 RoPE]
+// rows, the latter divided by the per-tensor ``fp8_scale``.
+void v41_rope_insert(torch::Tensor& latent, torch::Tensor& positions,
+                     torch::Tensor& cos_sin_cache, torch::Tensor& kv_cache,
+                     torch::Tensor& slot_mapping, int64_t compress_ratio,
+                     const std::optional<torch::Tensor>& fp8_scale);
+
+// k_norm -> RoPE -> paged store for indexer keys. ``store_fp8`` picks the
+// record: bf16 [., ., 128], or uint8 [., ., 132] holding a page of 128 E4M3
+// bytes per row followed by a page of one fp32 scale per row.
+void v41_indexer_k_norm_rope_store(torch::Tensor& k_pre,
+                                   torch::Tensor& positions,
+                                   torch::Tensor& cos_sin_cache,
+                                   torch::Tensor& rms_norm_weight,
+                                   double rms_norm_eps, torch::Tensor& k_cache,
+                                   torch::Tensor& kv_slot_mapping,
+                                   int64_t compress_ratio, bool store_fp8);
+
+// RoPE the index query in place and rescale the per-head weights.
+// ``weights_out`` may alias ``weights_in``.
+void v41_indexer_q_rope(torch::Tensor& q, torch::Tensor& positions,
+                        torch::Tensor& cos_sin_cache,
+                        torch::Tensor& weights_in, torch::Tensor& weights_out,
+                        double weights_scale);
+
+// RoPE the index query and quantize it to E4M3 against one power-of-two scale
+// per (token, head). That scale is folded into the returned fp32 weights, since
+// the FP8 scoring kernel takes no companion scale tensor.
+std::tuple<torch::Tensor, torch::Tensor> v41_indexer_q_rope_fp8(
+    torch::Tensor& q, torch::Tensor& positions, torch::Tensor& cos_sin_cache,
+    torch::Tensor& weights_in, double weights_scale);
+
+std::tuple<torch::Tensor, torch::Tensor> v41_indexer_q_rope_fp8_meta(
+    torch::Tensor& q, torch::Tensor& positions, torch::Tensor& cos_sin_cache,
+    torch::Tensor& weights_in, double weights_scale);
 
 }  // namespace vllm_iluvatar

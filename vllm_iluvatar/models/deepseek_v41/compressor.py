@@ -277,6 +277,16 @@ class IluDeepseekCompressor(nn.Module):
 
         cos_sin_cache = getattr(rotary_emb, "cos_sin_cache", rotary_emb)
 
+        # The slot mapping is compressed-domain, so the cache's second dimension
+        # has to be the compressed row count the builder sized those slots
+        # against; otherwise the kernel's slot split lands on the wrong row.
+        assert kv_cache.shape[1] * self.compress_ratio == (
+            k_cache_metadata.block_size
+        ), (
+            f"compressed cache holds {kv_cache.shape[1]} rows per page, but "
+            f"the slots were built for {k_cache_metadata.block_size} tokens "
+            f"at compress_ratio {self.compress_ratio}"
+        )
         rope_quant_insert(
             latent,
             positions,
@@ -284,7 +294,4 @@ class IluDeepseekCompressor(nn.Module):
             kv_cache,
             k_cache_metadata.slot_mapping,
             self.compress_ratio,
-            block_table=k_cache_metadata.block_table,
-            token_to_req_indices=k_cache_metadata.req_id_per_token,
-            block_size=k_cache_metadata.block_size,
         )

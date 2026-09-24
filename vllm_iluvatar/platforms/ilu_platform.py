@@ -80,6 +80,17 @@ def register_attention_backends() -> None:
         "vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse."
         "IluDeepseekV4FlashMLASparseBackend",
     )
+    # V4.1 runs attention inside the model rather than through a selected
+    # backend, so its ``get_name()`` is only an identifier today. The enum
+    # member arrived after the vLLM this plugin builds against, so register it
+    # where it exists: anything that does select by enum then resolves to ours
+    # instead of upstream's, and older trees keep working.
+    _dsv41 = getattr(AttentionBackendEnum, "FLASHMLA_SPARSE_DSV41", None)
+    if _dsv41 is not None:
+        register_backend(
+            _dsv41,
+            "vllm_iluvatar.models.deepseek_v41.sparse_mla.IluDeepseekV4FlashMLABackend",
+        )
     # Reuse the official GDN_ATTN enum member; do not introduce an ILU_* enum.
     if envs.VLLM_ILU_GDN_ATTN_BACKEND:
         register_backend(

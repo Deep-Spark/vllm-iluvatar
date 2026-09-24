@@ -1,20 +1,25 @@
 """Compressor state/pool/norm and compressed-cache insert.
 
 Mirrors ``vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py``:
-same function names, same positional arguments, same contract, so the callers
-read exactly like the official ones. Official drives both entry points with
-Triton, which does not run on this platform, so each body dispatches to the
-ixformer kernel covering the same work.
+same function names, same arguments, same contract, so the callers read exactly
+like the official ones. Official drives both entry points with Triton, which
+does not run on this platform, so each body dispatches to the kernel covering
+the same work.
 
-Three arguments are ours and keyword-only: ``block_table``,
-``token_to_req_indices`` and the token-domain ``block_size``. Official derives
-the state ring slot in a separate Triton kernel in the metadata builder and
-finds a chunk's predecessor row with a dedicated per-request program; our
-kernels absorb both, so they need the block table instead of a pre-encoded slot.
+``fused_save_compress_norm`` keeps two of our arguments keyword-only for the
+ratio-2 path, ``block_table`` and ``token_to_req_indices``: official derives the
+state ring slot in a separate Triton kernel in the metadata builder and finds a
+chunk's predecessor row with a dedicated per-request program, while the ixformer
+pooling kernel absorbs both and needs the block table instead of a pre-encoded
+slot. ``rope_quant_insert`` takes official's arguments exactly -- the plugin
+kernel derives page and row from the compressed slot, the way the reference
+does.
 
-The cache record is the packed fp8_ds_mla row: 448 E4M3 NoPE bytes, 64 BF16
-RoPE values and 7 UE8M0 scales.
+The cache record is whatever ``kv_cache``'s dtype says: the packed fp8_ds_mla
+row (448 E4M3 NoPE bytes, 64 BF16 RoPE values, 7 UE8M0 scales), or a plain
+[448 NoPE | 64 RoPE] bf16 / e4m3 row.
 """
+
 from __future__ import annotations
 
 import ixformer.inference.functions as ixfops
@@ -48,7 +53,8 @@ def fused_save_compress_norm(
         kv_score: FP32 [tokens, 512] for CR1, [tokens, 1024] for CR2.
         positions: Absolute positions of the packed request tokens.
         state_cache: Ring FP32 [blocks, capacity, 1024] KV/score states (CR2).
-        slot_mapping: Ring slots (CR2) or main-cache slots (CR1).
+        slot_mapping: Ring slots (CR2) or main-cache slots (CR1). Negative
+            marks a token that publishes nothing.
         query_start_loc: Unused here; our kernel takes request boundaries from
             ``token_to_req_indices`` and the block table.
         token_to_req_indices: Request indices for the packed token rows.
@@ -72,13 +78,15 @@ def fused_save_compress_norm(
         return
 
     if compress_ratio == 1:
-        # No group to pool and no state to carry, so the latent is just the
-        # normalized row. TODO(ops): ds4_v41_compress_prepare_out needs a state
-        # cache, which a ratio-1 layer never allocates, so this stays at torch
-        # level until the kernel takes a null state.
-        row = kv_score[:num_tokens]
-        rms = torch.rsqrt(row.pow(2).mean(-1, keepdim=True) + rms_norm_eps)
-        latent_out[:num_tokens] = (row * rms).to(latent_out.dtype) * rms_norm_weight
+        # Ratio 1 pools nothing and carries no state, so the latent is just the
+        # normalized row.
+        torch.ops._C.v41_compress_norm_cr1(
+            kv_score,
+            slot_mapping,
+            rms_norm_weight,
+            rms_norm_eps,
+            latent_out,
+        )
         return
 
     assert state_cache is not None and token_to_req_indices is not None
@@ -107,33 +115,28 @@ def rope_quant_insert(
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     compress_ratio: int,
-    *,
     fp8_scale: torch.Tensor | None = None,
-    block_table: torch.Tensor | None = None,
-    token_to_req_indices: torch.Tensor | None = None,
-    block_size: int | None = None,
 ) -> None:
-    """Apply GPT-J RoPE and publish a latent as a packed fp8 compressed row.
+    """Apply GPT-J RoPE and publish a latent into the compressed KV cache.
 
-    ``block_size`` is the token page size. The cache's second dimension is the
-    compressed row count, which is ``block_size // compress_ratio``.
+    ``slot_mapping`` is already compressed-domain: the metadata builder runs
+    ``get_compressed_slot_mapping``, whose slot is the global compressed row
+    index ``page * rows_per_page + row``. The kernel splits it the way the
+    reference does, so no block table is involved.
+
+    ``kv_cache``'s dtype selects the record: ``uint8`` with a 584-byte row is
+    the packed fp8_ds_mla one, ``bfloat16`` and ``float8_e4m3fn`` the plain
+    [448 NoPE | 64 RoPE] rows, the latter divided by the per-tensor
+    ``fp8_scale``.
     """
-    assert fp8_scale is None
-    assert block_table is not None and token_to_req_indices is not None
-    assert block_size is not None
-    num_tokens = positions.numel()
-    if num_tokens == 0:
+    if slot_mapping.numel() == 0:
         return
-    if kv_cache.dim() == 3:
-        assert kv_cache.shape[1] * compress_ratio == block_size
-    ixfops.v41_rope_fp8_insert_by_token(
-        kv_cache,
-        latent[:num_tokens],
-        positions[:num_tokens],
-        slot_mapping[:num_tokens],
-        block_table,
-        token_to_req_indices[:num_tokens],
+    torch.ops._C.v41_rope_insert(
+        latent,
+        positions,
         cos_sin_cache,
-        block_size,
+        kv_cache,
+        slot_mapping,
         compress_ratio,
+        fp8_scale,
     )

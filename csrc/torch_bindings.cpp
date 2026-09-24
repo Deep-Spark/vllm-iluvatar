@@ -78,6 +78,30 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
       "minimax_qk_rms_apply(Tensor qkv, Tensor qk_var, Tensor q_weight, "
       "Tensor k_weight, int q_size, int kv_size, int tp_world, "
       "float epsilon) -> (Tensor, Tensor)");
+  // DeepSeek-V4.1 compressor / indexer ops (plugin-internal). Slots are
+  // compressed-domain row indices, so none of these take a block table.
+  ops.def(
+      "v41_compress_norm_cr1("
+      "Tensor kv_score, Tensor slot_mapping, Tensor rms_norm_weight, "
+      "float rms_norm_eps, Tensor! latent_out) -> ()");
+  ops.def(
+      "v41_rope_insert("
+      "Tensor latent, Tensor positions, Tensor cos_sin_cache, "
+      "Tensor! kv_cache, Tensor slot_mapping, int compress_ratio, "
+      "Tensor? fp8_scale=None) -> ()");
+  ops.def(
+      "v41_indexer_k_norm_rope_store("
+      "Tensor k_pre, Tensor positions, Tensor cos_sin_cache, "
+      "Tensor rms_norm_weight, float rms_norm_eps, Tensor! k_cache, "
+      "Tensor kv_slot_mapping, int compress_ratio, bool store_fp8) -> ()");
+  ops.def(
+      "v41_indexer_q_rope("
+      "Tensor! q, Tensor positions, Tensor cos_sin_cache, Tensor weights_in, "
+      "Tensor! weights_out, float weights_scale) -> ()");
+  ops.def(
+      "v41_indexer_q_rope_fp8("
+      "Tensor q, Tensor positions, Tensor cos_sin_cache, Tensor weights_in, "
+      "float weights_scale) -> (Tensor, Tensor)");
   ops.def("weak_ref_tensor(Tensor input) -> Tensor");
   ops.def("get_cuda_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor");
   // DeepSeek-V4.1 Engram: slot-cache write, fused lookback+ngram hash,
@@ -117,6 +141,13 @@ TORCH_LIBRARY_IMPL_EXPAND(_C, CUDA, ops) {
            &vllm_iluvatar::reshape_and_cache_mix);
   ops.impl("minimax_qk_var", &vllm_iluvatar::minimax_qk_var);
   ops.impl("minimax_qk_rms_apply", &vllm_iluvatar::minimax_qk_rms_apply);
+  ops.impl("v41_compress_norm_cr1", &vllm_iluvatar::v41_compress_norm_cr1);
+  ops.impl("v41_rope_insert", &vllm_iluvatar::v41_rope_insert);
+  ops.impl("v41_indexer_k_norm_rope_store",
+           &vllm_iluvatar::v41_indexer_k_norm_rope_store);
+  ops.impl("v41_indexer_q_rope", &vllm_iluvatar::v41_indexer_q_rope);
+  ops.impl("v41_indexer_q_rope_fp8",
+           &vllm_iluvatar::v41_indexer_q_rope_fp8);
   // Aliasing a CUDA tensor's storage; registered on the CUDA key like upstream.
   ops.impl("weak_ref_tensor", &vllm_iluvatar::weak_ref_tensor);
   ops.impl("engram_write_hash_cache", &vllm_iluvatar::engram_write_hash_cache);
@@ -144,6 +175,8 @@ TORCH_LIBRARY_IMPL_EXPAND(_C, Meta, ops) {
            &vllm_iluvatar::minimax_qk_rms_apply_meta);
   ops.impl("engram_ngram_hash", &vllm_iluvatar::engram_ngram_hash_meta);
   ops.impl("engram_lookup_fp8", &vllm_iluvatar::engram_lookup_fp8_meta);
+  ops.impl("v41_indexer_q_rope_fp8",
+           &vllm_iluvatar::v41_indexer_q_rope_fp8_meta);
 }
 
 REGISTER_EXTENSION(_C)

@@ -106,6 +106,45 @@ def test_register_attention_backends_gates_gdn_backend(monkeypatch):
     )
 
 
+def test_register_attention_backends_takes_dsv41_when_the_enum_has_it(monkeypatch):
+    """FLASHMLA_SPARSE_DSV41 postdates the vLLM this plugin builds against.
+
+    The test above covers the older enum, where the member is absent and the
+    registration is skipped. Here it exists, and ours must claim it rather than
+    leaving ``IluDeepseekV4FlashMLABackend.get_name()`` pointing at upstream's.
+    """
+    platform = importlib.import_module("vllm_iluvatar.platforms.ilu_platform")
+    monkeypatch.setattr(platform, "_ATTN_BACKENDS_REGISTERED", False)
+
+    flashmla_sparse_dsv41 = SimpleNamespace(name="FLASHMLA_SPARSE_DSV41")
+    calls = []
+
+    registry = ModuleType("vllm.v1.attention.backends.registry")
+    registry.AttentionBackendEnum = SimpleNamespace(
+        FLASH_ATTN=SimpleNamespace(name="FLASH_ATTN"),
+        FLASHMLA=SimpleNamespace(name="FLASHMLA"),
+        FLASHMLA_SPARSE=SimpleNamespace(name="FLASHMLA_SPARSE"),
+        FLASHMLA_SPARSE_DSV4=SimpleNamespace(name="FLASHMLA_SPARSE_DSV4"),
+        FLASHMLA_SPARSE_DSV41=flashmla_sparse_dsv41,
+    )
+    registry.MambaAttentionBackendEnum = SimpleNamespace(
+        GDN_ATTN=SimpleNamespace(name="GDN_ATTN")
+    )
+    registry.register_backend = lambda member, path, is_mamba=False: calls.append(
+        (member, path, is_mamba)
+    )
+    monkeypatch.setitem(sys.modules, registry.__name__, registry)
+    monkeypatch.setattr(vllm_envs, "VLLM_ILU_GDN_ATTN_BACKEND", False, raising=False)
+
+    platform.register_attention_backends()
+
+    assert (
+        flashmla_sparse_dsv41,
+        "vllm_iluvatar.models.deepseek_v41.sparse_mla.IluDeepseekV4FlashMLABackend",
+        False,
+    ) in calls
+
+
 def test_register_platform_applies_envs_before_attention_backends(monkeypatch):
     plugin = importlib.import_module("vllm_iluvatar")
     calls = []

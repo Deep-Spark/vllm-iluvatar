@@ -65,7 +65,6 @@ warnings.filterwarnings(
     "ignore", message=".*bgemm_internal_cublaslt error.*", category=UserWarning
 )
 
-FP4_BLOCK_SIZE = 32
 _INDEX_TILE = 256
 _PACKED_MLA_HEADS = (1, 8, 16, 32, 64, 128)
 
@@ -102,19 +101,20 @@ def _replace_layer_index(prefix: str, layer_id: int) -> str:
     return new_prefix
 
 
-def _indexer_k_cache_head_dim(index_head_dim: int, kv_dtype: str) -> int:
-    MXFP4_BLOCK_SIZE = 32
-    """Per-token byte width of the paged indexer K cache row."""
-    if kv_dtype == "mxfp4":
-        # MXFP4 stores two values per byte plus one UE8M0 byte per 32 values.
-        # head_dim bytes = 64 packed values + 4 UE8M0 scales = 68.
-        return index_head_dim // 2 + index_head_dim // MXFP4_BLOCK_SIZE
-    # NOTE(yifan): FP8 indexer cache uses the same layout as V3.2:
-    # head_dim bytes = 128 fp8 + 4 fp32 scale = 132.
-    return (
-        index_head_dim + index_head_dim // 128 * 4
-        if kv_dtype == "fp8"
-        else index_head_dim
+def _indexer_k_cache_row(index_head_dim: int, kv_dtype: str) -> tuple[int, torch.dtype]:
+    """Width and element type of one paged indexer K cache row.
+
+    FP8 uses the V3.2 layout the paged scoring kernel reads: a page of
+    ``index_head_dim`` E4M3 bytes per row followed by a page of one FP32 scale
+    per row, so the row is ``index_head_dim + 4`` bytes. BF16 rows are the
+    values alone. Official's third option, MXFP4, has no reader here.
+    """
+    if kv_dtype.startswith("fp8"):
+        return index_head_dim + 4, torch.uint8
+    if kv_dtype == "bf16":
+        return index_head_dim, torch.bfloat16
+    raise ValueError(
+        f"unsupported indexer cache dtype {kv_dtype!r}; expected 'bf16' or 'fp8'"
     )
 
 
@@ -204,17 +204,18 @@ class IluDeepseekV41Indexer(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.topk_tokens = config.index_topk
-        self.n_head = config.index_n_heads  
-        self.head_dim = config.index_head_dim  
-        self.rope_dim = config.qk_rope_head_dim  
-        self.q_lora_rank = q_lora_rank  
+        self.n_head = config.index_n_heads
+        self.head_dim = config.index_head_dim
+        self.rope_dim = config.qk_rope_head_dim
+        self.q_lora_rank = q_lora_rank
         self.compress_ratio = compress_ratio
         self.owns_k = owns_k
         self.k_row_buffer: torch.Tensor | None = None
-        self.use_fp4_kv = False
+        # TODO: for now, always use bf16 indexer cache
+        self.store_fp8_kv = False
         logger.info_once(
             "Using %s indexer cache for Lightning Indexer.",
-            "MXFP4" if self.use_fp4_kv else "FP8" if False else "Bfloat16",
+            "FP8" if self.store_fp8_kv else "BF16",
         )
 
         # no tensor parallel, just replicated
@@ -273,7 +274,7 @@ class IluDeepseekV41Indexer(nn.Module):
             self.max_total_seq_len,
             self.topk_indices_buffer,
             skip_k_cache_insert=True,
-            use_fp4_cache=self.use_fp4_kv,
+            use_fp4_cache=False,
             compress_ratio=compress_ratio,
             candidate_blocks=candidate_block_buffer,
             candidate_block_size=candidate_block_size,
@@ -290,6 +291,15 @@ class IluDeepseekV41Indexer(nn.Module):
             return
         assert self.owns_k
         indexer_metadata = cast(Any, attn_metadata[self.k_cache.prefix])
+        k_cache = self.k_cache.kv_cache
+        # The slot mapping is compressed-domain, so the cache's second
+        # dimension has to be the compressed row count the builder sized those
+        # slots against, or the kernel's slot split lands on the wrong row.
+        assert k_cache.shape[1] * self.compress_ratio == self.k_cache.block_size, (
+            f"indexer cache holds {k_cache.shape[1]} rows per page, but the "
+            f"slots were built for {self.k_cache.block_size} tokens at "
+            f"compress_ratio {self.compress_ratio}"
+        )
         # ReplicatedLinear returns (output, bias); bias is None. Rows at
         # non-boundary tokens hold garbage latent and are skipped by the
         # store kernel.
@@ -300,13 +310,10 @@ class IluDeepseekV41Indexer(nn.Module):
             rotary_emb.cos_sin_cache,
             self.k_norm.weight,
             self.k_norm.variance_epsilon,
-            self.k_cache.kv_cache,
+            k_cache,
             indexer_metadata.slot_mapping,
             self.compress_ratio,
-            True,
-            block_table=indexer_metadata.block_table,
-            token_to_req_indices=indexer_metadata.token_to_req_indices,
-            block_size=self.k_cache.block_size,
+            self.store_fp8_kv,
         )
 
     def forward(
@@ -320,11 +327,10 @@ class IluDeepseekV41Indexer(nn.Module):
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         """Publish this layer's index keys, then prepare the index query.
 
-        Returns the quantized query, its scale (none in this layout) and the
+        Returns the prepared query, its scale (none in this layout) and the
         per-head weights, or three Nones when the short-context bypass filled
         the top-k outright and there is nothing to score.
         """
-        assert self.cos_sin is not None
         attn_metadata = get_forward_context().attn_metadata
         if isinstance(attn_metadata, dict):
             indexer_metadata = cast(Any, attn_metadata[self.k_cache.prefix])
@@ -357,13 +363,22 @@ class IluDeepseekV41Indexer(nn.Module):
 
         # ReplicatedLinear returns (output, bias).
         q = self.wq_b(qr)[0].view(-1, self.n_head, self.head_dim)
-        # In-place: q is rotated and requantized, weights are rescaled.
-        ixfops.v41_indexer_q_rope_qdq(
+        if self.store_fp8_kv:
+            # The per-(token, head) q_scale comes back folded into the weights,
+            # which the FP8 scoring kernel wants as fp32.
+            q_fp8, folded_weights = torch.ops._C.v41_indexer_q_rope_fp8(
+                q,
+                positions,
+                rotary_emb.cos_sin_cache,
+                indexer_weights,
+                self.softmax_scale * self.n_head**-0.5,
+            )
+            return q_fp8, None, folded_weights
+        # In-place: q is rotated, weights are rescaled.
+        torch.ops._C.v41_indexer_q_rope(
             q,
             positions,
-            self.cos_sin,
-            FP4_BLOCK_SIZE,
-            "fp4_pow2",
+            rotary_emb.cos_sin_cache,
             indexer_weights,
             indexer_weights,
             self.softmax_scale * self.n_head**-0.5,
@@ -393,7 +408,6 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
     ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
-        dtype = vllm_config.model_config.dtype
 
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
@@ -542,9 +556,12 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             # wk/k_norm); non-owning index sources share the K cache of the
             # latest kv source below them (its indexer produces the keys).
             if self.is_kv_source:
+                row_bytes, row_dtype = _indexer_k_cache_row(
+                    config.index_head_dim, "auto"
+                )
                 index_k_cache = IluDeepseekV41IndexerCache(
-                    head_dim=_indexer_k_cache_head_dim(config.index_head_dim, False),
-                    dtype=torch.bfloat16,
+                    head_dim=row_bytes,
+                    dtype=row_dtype,
                     prefix=f"{prefix}.indexer.k_cache",
                     cache_config=cache_config,
                     compress_ratio=self.compress_ratio,
@@ -769,9 +786,9 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         )
         num_tokens = hidden_states.shape[0]
         apply_rope(attn_out.unsqueeze(0), positions, self.cos_sin, inverse=True)
-        return self._o_proj(
-            attn_out.view(1, num_tokens, self.n_local_groups, -1)
-        ).view(num_tokens, -1)
+        return self._o_proj(attn_out.view(1, num_tokens, self.n_local_groups, -1)).view(
+            num_tokens, -1
+        )
 
     def _run_parallel_input_projections(
         self, hidden_states: torch.Tensor
@@ -879,8 +896,6 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         index_q, index_weights_out = None, None
 
         if indexer is not None:
-            if getattr(indexer, "cos_sin", None) is None:
-                indexer.cos_sin = self.cos_sin
             index_q, _, index_weights_out = indexer(
                 qr,
                 latent,

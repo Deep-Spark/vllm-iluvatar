@@ -339,6 +339,9 @@ class IluGlmMoeDsaMoE(nn.Module, IluFusedMoEEP):
     ) -> None:
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
+        self._ll_shared_dispatch_overlap_enabled = (
+            envs.VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP
+        )
         self.prefix = prefix
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.n_routed_experts: int = config.n_routed_experts

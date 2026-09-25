@@ -224,8 +224,13 @@ def test_maybe_init_fp8_kv_scale_skips_during_capture(monkeypatch):
 
 
 def _make_sparse_mla(
-    monkeypatch, *, env_enabled=True, use_fp8_attn=True, scale_frozen=True,
-    op_available=None, num_heads=64,
+    monkeypatch,
+    *,
+    env_enabled=True,
+    use_fp8_attn=True,
+    scale_frozen=True,
+    op_available=None,
+    num_heads=64,
 ):
     """Exercise the actual constructor, including TP1's 64 local heads."""
     monkeypatch.setattr(attn_mod.envs, "VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV", env_enabled)

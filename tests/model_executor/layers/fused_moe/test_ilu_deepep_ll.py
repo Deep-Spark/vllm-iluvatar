@@ -11,11 +11,11 @@ from vllm.model_executor.layers.fused_moe.config import (
     mxfp4_w4a8_moe_quant_config,
 )
 
-from vllm_iluvatar.model_executor.layers.fused_moe.prepare_finalize import (
-    ilu_deepep_ll,
-)
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
     IluFusedMoEEP,
+)
+from vllm_iluvatar.model_executor.layers.fused_moe.prepare_finalize import (
+    ilu_deepep_ll,
 )
 
 
@@ -121,9 +121,7 @@ def test_glm_ll_shared_expert_overlaps_dispatch_when_enabled(
 
     events = []
     x = torch.zeros((num_tokens, 8), dtype=dtype)
-    shared_input = (
-        (x.to(torch.int8), torch.ones(num_tokens), dtype) if packed else x
-    )
+    shared_input = (x.to(torch.int8), torch.ones(num_tokens), dtype) if packed else x
     main_stream = SimpleNamespace(
         wait_stream=lambda other: events.append("main_wait_shared")
     )
@@ -256,6 +254,7 @@ def test_glm_ll_shared_expert_overlaps_dispatch_when_enabled(
 @pytest.mark.parametrize("enabled", [False, True])
 def test_glm_ll_dispatch_overlap_preserves_fused_shared_reduction(monkeypatch, enabled):
     from ixformer.distributed import nvsm_ep
+
     from vllm_iluvatar.model_executor.layers.fused_moe import ilu_fused_moe_ep as ep
 
     events = []
@@ -289,7 +288,9 @@ def test_glm_ll_dispatch_overlap_preserves_fused_shared_reduction(monkeypatch, e
     )
 
     def fused_combine(**kwargs):
-        events.append("fused_routed_only" if kwargs["shared_x"] is None else "fused_all")
+        events.append(
+            "fused_routed_only" if kwargs["shared_x"] is None else "fused_all"
+        )
         routed = torch.full_like(x, 2)
         if kwargs["shared_x"] is not None:
             routed += kwargs["shared_x"] * 2
@@ -331,7 +332,11 @@ def test_glm_ll_dispatch_overlap_preserves_fused_shared_reduction(monkeypatch, e
         activation_format=FusedMoEActivationFormat.BatchedExperts,
         supports_async=lambda: True,
         prepare_async=lambda local, *args, **kwargs: lambda: (
-            local, None, None, None, None
+            local,
+            None,
+            None,
+            None,
+            None,
         ),
         buffer=object(),
     )
@@ -421,7 +426,11 @@ def test_glm_ll_shared_dispatch_overlap_cuda_graph_replay(monkeypatch, use_fused
         activation_format=FusedMoEActivationFormat.BatchedExperts,
         supports_async=lambda: True,
         prepare_async=lambda local, *args, **kwargs: lambda: (
-            local, None, None, None, None
+            local,
+            None,
+            None,
+            None,
+            None,
         ),
         finalize_async=lambda output, *args: lambda: output.fill_(2),
         buffer=object(),

@@ -130,7 +130,7 @@ class HYV4Config(PreTrainedConfig):
     layer_types: list[str] | None = None
     index_topk: int = 2048
     index_head_dim: int = 128
-    index_n_heads: int = 16
+    index_n_heads: int = 32
     indexer_types: list[str] | None = None
     enable_lm_head_fp32: bool = True
     enable_ihc: bool = True

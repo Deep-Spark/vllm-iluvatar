@@ -19,6 +19,8 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import get_pp_missing_layer_names
 
@@ -30,6 +32,66 @@ from vllm_iluvatar.models.glm_moe_dsa.mtp import (
 
 from .model import HYV4DecoderLayer, _normalize_hyv4_config
 from .weight_utils import try_load_quantized_indexer_wk
+
+logger = init_logger(__name__)
+
+# Attribute holding the unquantized-module prefix list, per config class:
+# ``exclude_modules`` on ModelOpt* configs, ``ignored_layers`` elsewhere.
+_QUANT_EXCLUSION_ATTRS = ("exclude_modules", "ignored_layers")
+
+
+def _remap_mtp_quant_exclusions(
+    quant_config: QuantizationConfig | None,
+    mtp_start_layer_idx: int,
+    num_mtp_layers: int,
+) -> QuantizationConfig | None:
+    """Translate checkpoint-named MTP quant exclusions to draft prefixes.
+
+    The checkpoint names the MTP modules ``model.mtp_layers.0.*`` while the
+    draft builds them under ``model.layers.<num_hidden_layers + i>.*``.
+    ``is_layer_skipped`` compares prefixes literally, so an excluded MTP module
+    otherwise gets a quant method while its checkpoint weight is plain BF16
+    with no companion scale: the scale then keeps its uninitialized value and
+    the layer silently produces garbage.
+    """
+    if quant_config is None:
+        return None
+
+    exclusion_attr: str | None = None
+    patterns: list[str] | None = None
+    for attr in _QUANT_EXCLUSION_ATTRS:
+        value = getattr(quant_config, attr, None)
+        if value:
+            exclusion_attr = attr
+            patterns = list(value)
+            break
+    if not patterns or exclusion_attr is None:
+        return quant_config
+
+    extra: list[str] = []
+    for offset in range(num_mtp_layers):
+        source_prefix = f"model.mtp_layers.{offset}."
+        draft_prefix = f"model.layers.{mtp_start_layer_idx + offset}."
+        for pattern in patterns:
+            stripped = pattern.rstrip("*")
+            if not stripped.startswith(source_prefix):
+                continue
+            trailing_stars = pattern[len(stripped) :]
+            extra.append(draft_prefix + stripped[len(source_prefix) :] + trailing_stars)
+    if not extra:
+        return quant_config
+
+    # The target model shares this object; copy before widening the list.
+    quant_config = copy.copy(quant_config)
+    setattr(quant_config, exclusion_attr, patterns + extra)
+    logger.info(
+        "HY4 MTP: mapped %d checkpoint-named quant exclusions (%s) onto draft "
+        "module prefixes: %s",
+        len(extra),
+        exclusion_attr,
+        ", ".join(extra),
+    )
+    return quant_config
 
 
 class HYV4MTPDecoderLayer(HYV4DecoderLayer):
@@ -74,6 +136,18 @@ class HYV4MTP(IluGlmMoeDsaMTP):
     """Top-level HY4 MTP draft model."""
 
     predictor_cls = HYV4MultiTokenPredictor
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        target_config = vllm_config.model_config.hf_config
+        remapped = _remap_mtp_quant_exclusions(
+            vllm_config.quant_config,
+            target_config.num_hidden_layers,
+            max(getattr(target_config, "num_nextn_predict_layers", 1), 1),
+        )
+        if remapped is not vllm_config.quant_config:
+            vllm_config = copy.copy(vllm_config)
+            vllm_config.quant_config = remapped
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
 
     def _translate_mtp_weight_name(self, name: str) -> str:
         prefix = "model.mtp_layers."
@@ -158,8 +232,11 @@ class HYV4MTP(IluGlmMoeDsaMTP):
 
                 if ".self_attn.learnable_sink_param" in rewritten:
                     param = params_dict[rewritten]
+                    narrow_weight = loaded_weight[head_start:head_end]
                     with torch.no_grad():
-                        param.copy_(loaded_weight[head_start:head_end].to(param.dtype))
+                        param[: narrow_weight.shape[0]].copy_(
+                            narrow_weight.to(param.dtype)
+                        )
                     loaded_extra.add(rewritten)
                     continue
 
@@ -214,4 +291,24 @@ class HYV4MTP(IluGlmMoeDsaMTP):
                 f"incomplete HY4 MTP indexer wk weight/scale pairs: {missing}"
             )
         loaded.update(loaded_extra)
+
+        # ``weight_scale`` is allocated with ``torch.empty``. A module that got
+        # a quant method by mistake -- because its checkpoint-named exclusion
+        # did not match the draft prefix -- therefore runs on whatever the
+        # allocator returned and quietly degrades the draft instead of failing.
+        # ``shared_head.head`` is exempt: the checkpoint ships no per-MTP head,
+        # and the proposer replaces the whole module with the target's lm_head
+        # (``_maybe_share_lm_head``) before the first draft forward.
+        unscaled = sorted(
+            name
+            for name in params_dict
+            if name.endswith("weight_scale")
+            and name not in loaded
+            and ".shared_head.head." not in name
+        )
+        if unscaled:
+            raise ValueError(
+                "HY4 MTP quantization scale(s) received no checkpoint value: "
+                + ", ".join(unscaled)
+            )
         return loaded

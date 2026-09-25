@@ -159,6 +159,8 @@ if TYPE_CHECKING:
     # per-layer tables; empty -> online amax/448 on first eager insert.
     VLLM_ILU_GLM_DSA_FP8_KV_SCALE: str = ""
     VLLM_ILU_GLM_DSA_FP8_KV_SCALE_PATH: str = ""
+    VLLM_ILU_HYV4_DSA_FP8_KV_SCALE: str = ""
+    VLLM_ILU_HYV4_DSA_FP8_KV_SCALE_PATH: str = ""
 
 # Canonical (VLLM_ILU_*) readers. Each lambda preserves the exact parsing the
 # fork used in vllm/envs.py, and reads VLLM_ILU_* first then the legacy VLLM_*.
@@ -393,6 +395,12 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ILU_GLM_DSA_FP8_KV_SCALE_PATH": lambda: os.environ.get(
         "VLLM_ILU_GLM_DSA_FP8_KV_SCALE_PATH", ""
+    ),
+    "VLLM_ILU_HYV4_DSA_FP8_KV_SCALE": lambda: os.environ.get(
+        "VLLM_ILU_HYV4_DSA_FP8_KV_SCALE", ""
+    ),
+    "VLLM_ILU_HYV4_DSA_FP8_KV_SCALE_PATH": lambda: os.environ.get(
+        "VLLM_ILU_HYV4_DSA_FP8_KV_SCALE_PATH", ""
     ),
     # Optional override for MessageQueue max_chunks (see patch_message_queue).
     # Empty / unset → auto: broadcast max(10, 2*n_reader+8), response max 48.

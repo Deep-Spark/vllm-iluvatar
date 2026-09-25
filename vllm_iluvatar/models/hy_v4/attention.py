@@ -26,10 +26,15 @@ below.
 
 from __future__ import annotations
 
+import copy
+import json
+import math
+from functools import lru_cache
 from typing import cast
 
 import regex as re
 import torch
+import vllm.envs as envs
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
 from vllm.compilation.breakable_cudagraph import (
@@ -53,6 +58,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.selector import get_attn_backend
+from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 from vllm_iluvatar.model_executor.layers.sparse_attn_indexer import (
     IluSparseAttnIndexer,
@@ -65,6 +71,128 @@ logger = init_logger(__name__)
 
 _SPARSE_LAYER_TYPES = ("sparse_attention", "sparse", "deepseek_sparse_attention")
 _WEIGHT_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+_HYV4_DSA_FP8_ROW_BYTES = 640
+_HYV4_DSA_FP8_E4M3_MAX = 448.0
+_HYV4_DSA_FP8_CACHE_DTYPES = ("fp8", "fp8_e4m3")
+
+
+@lru_cache(maxsize=4)
+def _load_hyv4_fp8_kv_scale_table(path: str) -> dict[str, float]:
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"VLLM_ILU_HYV4_DSA_FP8_KV_SCALE_PATH={path!r}: expected a JSON "
+            f"object of layer -> {{'kv': float}}, got {type(raw).__name__}"
+        )
+    out: dict[str, float] = {}
+    for key, val in raw.items():
+        if isinstance(val, dict) and "kv" in val:
+            out[key] = float(val["kv"])
+        elif isinstance(val, (int, float)):
+            out[key] = float(val)
+        else:
+            raise ValueError(
+                f"VLLM_ILU_HYV4_DSA_FP8_KV_SCALE_PATH={path!r}: entry "
+                f"{key!r} must be {{'kv': float}} or a float, got {val!r}"
+            )
+    logger.info("Loaded %d HYV4 DSA fp8 KV scales from %s", len(out), path)
+    return out
+
+
+def _resolve_hyv4_fp8_kv_scale(prefix: str) -> tuple[float | None, str]:
+    scale_env = envs.VLLM_ILU_HYV4_DSA_FP8_KV_SCALE
+    if scale_env.strip():
+        return float(scale_env), "VLLM_ILU_HYV4_DSA_FP8_KV_SCALE"
+
+    path = envs.VLLM_ILU_HYV4_DSA_FP8_KV_SCALE_PATH
+    if path.strip():
+        table = _load_hyv4_fp8_kv_scale_table(path.strip())
+        candidates = [
+            prefix,
+            prefix.removeprefix("model."),
+            f"model.{prefix}" if not prefix.startswith("model.") else prefix,
+        ]
+        for candidate in candidates:
+            if candidate in table:
+                return table[candidate], f"{path}:{candidate}"
+        logger.warning(
+            "VLLM_ILU_HYV4_DSA_FP8_KV_SCALE_PATH=%r has no entry for %r "
+            "(tried %s); falling back to online amax/448 calibration",
+            path,
+            prefix,
+            candidates,
+        )
+        return None, "online_amax_missing_json_key"
+    return None, "online_amax"
+
+
+def _hyv4_fp8_q_heads(num_heads: int) -> int:
+    if num_heads > 64:
+        raise ValueError(
+            f"HYV4 fp8 sparse MLA requires <=64 local heads, got {num_heads}"
+        )
+    return 64 if num_heads > 32 else max(16, (num_heads + 15) // 16 * 16)
+
+
+class HYV4MLAAttentionLayer(MLAAttention):
+    """Community MLA layer with HYV4's physical 640-byte fp8 cache spec."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        cache_config = kwargs.get("cache_config")
+        requested_dtype = (
+            cache_config.cache_dtype if cache_config is not None else "auto"
+        )
+        self.use_hyv4_fp8_attn = requested_dtype in _HYV4_DSA_FP8_CACHE_DTYPES
+        prefix = kwargs.get("prefix", "")
+        init_scale = 1.0
+        scale_frozen = False
+        if self.use_hyv4_fp8_attn:
+            resolved, source = _resolve_hyv4_fp8_kv_scale(prefix)
+            if resolved is not None:
+                if not math.isfinite(resolved) or resolved <= 0:
+                    raise ValueError(
+                        f"HYV4 fp8 KV scale must be finite and >0, got {resolved}"
+                    )
+                init_scale = resolved
+                scale_frozen = True
+                logger.info(
+                    "HYV4 DSA fp8 KV scale for %s = %.8g (%s)",
+                    prefix,
+                    init_scale,
+                    source,
+                )
+            kwargs["hyv4_use_fp8_attn"] = True
+            kwargs["hyv4_fp8_kv_scale_frozen"] = scale_frozen
+            kwargs["hyv4_fp8_prefix"] = prefix
+            # MLAAttention canonicalizes every quantized FLASHMLA_SPARSE cache
+            # to DeepSeek's 656-byte ``fp8_ds_mla`` format and mutates the
+            # shared CacheConfig in place. HYV4 uses a different 640-byte GLM
+            # layout implemented by HYV4FlashMLASparseImpl, so give the
+            # community layer a private, non-quantized facade config. The
+            # override below still publishes the real uint8/640-byte spec.
+            # Keeping ``self.kv_cache_dtype == "auto"`` also prevents the
+            # community forward path from viewing our packed uint8 cache as a
+            # plain float8 tensor.
+            facade_cache_config = copy.copy(cache_config)
+            facade_cache_config.cache_dtype = "auto"
+            kwargs["cache_config"] = facade_cache_config
+        super().__init__(*args, **kwargs)
+        if self.use_hyv4_fp8_attn:
+            self._k_scale.fill_(init_scale)
+            self._non_persistent_buffers_set.add("_k_scale")
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        if self.use_hyv4_fp8_attn:
+            return MLAAttentionSpec(
+                block_size=vllm_config.cache_config.block_size,
+                num_kv_heads=1,
+                head_size=_HYV4_DSA_FP8_ROW_BYTES,
+                dtype=torch.uint8,
+                cache_dtype_str="fp8",
+                non_causal_multi_token_decode=self.non_causal_multi_token_decode,
+            )
+        return super().get_kv_cache_spec(vllm_config)
 
 
 def compute_skip_topk_layers(config: PretrainedConfig) -> set[int]:
@@ -345,6 +473,12 @@ class HYV4MLAAttention(nn.Module):
         # Do not silently degrade sparse layers into dense attention. Probe the
         # sparse MLA backend directly and fail fast with the real error.
         kv_cache_dtype = cache_config.cache_dtype if cache_config else "auto"
+        self.use_hyv4_fp8_attn = kv_cache_dtype in _HYV4_DSA_FP8_CACHE_DTYPES
+        self._fp8_q_heads = (
+            _hyv4_fp8_q_heads(self.num_local_heads)
+            if self.use_hyv4_fp8_attn
+            else self.num_local_heads
+        )
         if self.is_sparse:
             try:
                 get_attn_backend(
@@ -493,8 +627,9 @@ class HYV4MLAAttention(nn.Module):
             sink_backend = self._resolve_sink_backend(kv_cache_dtype)
             enable_sink = sink_backend is not None
             self.learnable_sink_param = nn.Parameter(
-                torch.empty(
-                    self.num_local_heads,
+                torch.full(
+                    (self._fp8_q_heads,),
+                    float("-inf"),
                     # The kernels require fp32 sinks; the disabled path keeps
                     # the checkpoint dtype since the value is never consumed.
                     dtype=torch.float32 if enable_sink else torch.bfloat16,
@@ -511,7 +646,7 @@ class HYV4MLAAttention(nn.Module):
             # layer derived from it (see ``topk_index_cache``).
             extra_impl_args["topk_index_cache"] = topk_index_cache
             extra_impl_args["reuses_topk_indices"] = self.skip_topk
-        self.mla_attn = MLAAttention(
+        self.mla_attn = HYV4MLAAttentionLayer(
             num_heads=self.num_local_heads,
             scale=self.scaling,
             qk_nope_head_dim=self.qk_nope_head_dim,

@@ -16,7 +16,7 @@
   "pins": {
     "ixformer": {
       "branch": "master",
-      "commit": "17e11c9d728d49a4ab29195fddb6c9faec850aea"
+      "commit": "475fae4e3d8cd5e40c677c1a2ee950a9726f655a"
     },
     "vllm": {
       "branch": "iluvatar_main",

@@ -71,6 +71,22 @@ def _ihc_ops() -> object | None:
     return ixf_ops
 
 
+def _bf16_projection(module: nn.Module, weight: torch.Tensor) -> torch.Tensor:
+    """Cache a bf16 copy of an iHC projection weight.
+
+    The fused ops run the projection as a bf16 GEMM, so an fp32 weight would be
+    cast on every call. The weight is static, so cast it once and hold on to it
+    (ds4 does the same with ``fn``).
+    """
+    if weight.dtype != torch.float32:
+        return weight
+    cached = getattr(module, "_ihc_w_bf16", None)
+    if cached is None or cached.shape != weight.shape:
+        cached = weight.to(torch.bfloat16).contiguous()
+        module._ihc_w_bf16 = cached
+    return cached
+
+
 class HYV4HCPreLayer(nn.Module):
     """iHC pre-processing layer.
 
@@ -141,7 +157,7 @@ class HYV4HCPreLayer(nn.Module):
         if ops is not None and x.is_cuda and x.dim() == 3:
             return ops.fuse_ihc_pre(
                 x,
-                self.hc_fn.weight,
+                _bf16_projection(self, self.hc_fn.weight),
                 self.hc_scale,
                 self.hc_base,
                 norm_eps=self.layernorm_epsilon,
@@ -285,7 +301,7 @@ class HYV4HCHeadLayer(nn.Module):
         if ops is not None and x.is_cuda and x.dim() == 3:
             return ops.fuse_ihc_head(
                 x,
-                self.hc_head_fn.weight,
+                _bf16_projection(self, self.hc_head_fn.weight),
                 self.hc_head_scale,
                 self.hc_head_base,
                 norm_eps=self.config.rms_norm_eps,

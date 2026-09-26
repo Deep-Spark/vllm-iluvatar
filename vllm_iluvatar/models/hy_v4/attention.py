@@ -11,12 +11,15 @@ per-head learnable sink (bound through `.flashmla_sparse`) and the gated-MLA
 output gate.
 
 The indexer instead takes the plugin ``IluSparseAttnIndexer`` /
-``IluDeepseekV32IndexerCache`` (as V3.2 and GLM DSA do). ixformer keeps the
-indexer K cache in BF16 and quantizes nothing, so the community fp8 indexer
-contract -- a per-128-block-quantized q with its scale folded into ``weights``,
-and a uint8 cache carrying fp32 block scales -- does not apply here. It also
-cannot: ``per_token_group_quant_fp8`` needs ``torch.ops._C.
+``IluDeepseekV32IndexerCache`` (as V3.2 and GLM DSA do), keeping K in BF16 and
+quantizing nothing. The *community* fp8 indexer contract does not apply here
+and cannot: ``per_token_group_quant_fp8`` needs ``torch.ops._C.
 per_token_group_fp8_quant``, which Iluvatar does not build.
+
+ixformer has its own fp8 indexer lane though, and hy4 can use it --
+``VLLM_ILU_HY4_FP8_INDEXER=1`` switches to the grouped fp8 K cache and the
+ds4 kernels (see ``fp8_indexer.py``), which does its own quantization and
+never touches the community op.
 
 Delta vs upstream: the HPC fused output gate (``hpc_gated_mla_gemm``) is
 dropped. It needs the hpc ``.so`` plus sm100/sm103 and is off by default
@@ -29,6 +32,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
 from functools import lru_cache
 from typing import cast
 
@@ -64,6 +68,10 @@ from vllm_iluvatar.model_executor.layers.sparse_attn_indexer import (
     IluSparseAttnIndexer,
 )
 from vllm_iluvatar.models.deepseek_v32.attention import IluDeepseekV32IndexerCache
+from vllm_iluvatar.models.hy_v4.fp8_indexer import (
+    HYV4Fp8IndexerCache,
+    hy4_fp8_indexer_forward,
+)
 
 from .topk_index_cache import HYV4TopkIndexCache
 
@@ -322,17 +330,23 @@ class Indexer(nn.Module):
         self.quant_block_size = 128
         self.topk_indices_buffer = topk_indices_buffer
 
-        # BF16 indexer K cache, matching the other Iluvatar DSA models: the
-        # ixformer indexer keeps K in the checkpoint dtype rather than the
-        # community fp8 + per-128-block-scale packing, which is also why no q
-        # quantization happens below.
         assert cache_config is not None, "HYV4 indexer requires cache_config"
-        self.k_cache = IluDeepseekV32IndexerCache(
-            head_dim=self.head_dim,
-            dtype=torch.bfloat16,
-            prefix=f"{prefix}.k_cache",
-            cache_config=cache_config,
-        )
+        self.use_fp8 = os.environ.get("VLLM_ILU_HY4_FP8_INDEXER", "0") == "1"
+        if self.use_fp8:
+            # Grouped fp8 K cache + the ds4 fp8 kernel lane; see fp8_indexer.py.
+            self.k_cache = HYV4Fp8IndexerCache(
+                head_dim=self.head_dim,
+                prefix=f"{prefix}.k_cache",
+                cache_config=cache_config,
+            )
+        else:
+            # BF16 indexer K cache, matching the other Iluvatar DSA models.
+            self.k_cache = IluDeepseekV32IndexerCache(
+                head_dim=self.head_dim,
+                dtype=torch.bfloat16,
+                prefix=f"{prefix}.k_cache",
+                cache_config=cache_config,
+            )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.prefix = prefix
 
@@ -357,6 +371,10 @@ class Indexer(nn.Module):
         positions: torch.Tensor,
         rotary_emb: nn.Module,
     ) -> torch.Tensor:
+        if self.use_fp8:
+            return hy4_fp8_indexer_forward(
+                self, hidden_states, qr, positions, rotary_emb
+            )
         hidden_states, q, k, weights = self.prepare_inputs(
             hidden_states, qr, positions, rotary_emb
         )

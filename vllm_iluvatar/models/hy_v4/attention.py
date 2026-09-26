@@ -10,16 +10,12 @@ lands on ixformer kernels with no model-side work. The HY V4 deltas are the
 per-head learnable sink (bound through `.flashmla_sparse`) and the gated-MLA
 output gate.
 
-The indexer instead takes the plugin ``IluSparseAttnIndexer`` /
-``IluDeepseekV32IndexerCache`` (as V3.2 and GLM DSA do), keeping K in BF16 and
-quantizing nothing. The *community* fp8 indexer contract does not apply here
-and cannot: ``per_token_group_quant_fp8`` needs ``torch.ops._C.
-per_token_group_fp8_quant``, which Iluvatar does not build.
-
-ixformer has its own fp8 indexer lane though, and hy4 can use it --
-``VLLM_ILU_HY4_FP8_INDEXER=1`` switches to the grouped fp8 K cache and the
-ds4 kernels (see ``fp8_indexer.py``), which does its own quantization and
-never touches the community op.
+The indexer follows ``--kv-cache-dtype``, the same switch as the main MLA
+cache. ``fp8`` / ``fp8_e4m3`` selects the grouped fp8 K cache and the ds4
+kernels (see ``fp8_indexer.py``). Any other dtype keeps the BF16 indexer
+cache used by V3.2 and GLM DSA. The community fp8 indexer op is not used:
+``per_token_group_quant_fp8`` needs ``torch.ops._C.per_token_group_fp8_quant``,
+which Iluvatar does not build, and the ixformer lane quantizes on its own.
 
 Delta vs upstream: the HPC fused output gate (``hpc_gated_mla_gemm``) is
 dropped. It needs the hpc ``.so`` plus sm100/sm103 and is off by default
@@ -38,7 +34,6 @@ from typing import cast
 
 import regex as re
 import torch
-import vllm.envs as envs
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
 from vllm.compilation.breakable_cudagraph import (
@@ -109,11 +104,11 @@ def _load_hyv4_fp8_kv_scale_table(path: str) -> dict[str, float]:
 
 
 def _resolve_hyv4_fp8_kv_scale(prefix: str) -> tuple[float | None, str]:
-    scale_env = envs.VLLM_ILU_HYV4_DSA_FP8_KV_SCALE
+    scale_env = os.environ.get("VLLM_ILU_HYV4_DSA_FP8_KV_SCALE", "")
     if scale_env.strip():
         return float(scale_env), "VLLM_ILU_HYV4_DSA_FP8_KV_SCALE"
 
-    path = envs.VLLM_ILU_HYV4_DSA_FP8_KV_SCALE_PATH
+    path = os.environ.get("VLLM_ILU_HYV4_DSA_FP8_KV_SCALE_PATH", "")
     if path.strip():
         table = _load_hyv4_fp8_kv_scale_table(path.strip())
         candidates = [
@@ -331,7 +326,11 @@ class Indexer(nn.Module):
         self.topk_indices_buffer = topk_indices_buffer
 
         assert cache_config is not None, "HYV4 indexer requires cache_config"
-        self.use_fp8 = os.environ.get("VLLM_ILU_HY4_FP8_INDEXER", "0") == "1"
+        # Same switch as the main MLA cache. The community layer later swaps in
+        # a private cache_dtype="auto" facade; this indexer is built earlier,
+        # from the original CacheConfig, so it still sees --kv-cache-dtype.
+        kv_cache_dtype = cache_config.cache_dtype or "auto"
+        self.use_fp8 = kv_cache_dtype in _HYV4_DSA_FP8_CACHE_DTYPES
         if self.use_fp8:
             # Grouped fp8 K cache + the ds4 fp8 kernel lane; see fp8_indexer.py.
             self.k_cache = HYV4Fp8IndexerCache(

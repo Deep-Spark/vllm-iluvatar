@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -255,8 +256,11 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                     )
                 self.buffer = self.buffer.buffer
 
+            split_dispatch = os.environ.get("IXFORMER_NVSM_DISPATCH_VARIANT") == "batch_split"
+            dispatch_fn = (nvsm_ep.nvsm_low_latency_dispatch_begin if split_dispatch
+                           else nvsm_ep.nvsm_low_latency_dispatch)
             recv_x, num_tokens_per_local_experts_gpu, recv_scales, *_ = (
-                nvsm_ep.nvsm_low_latency_dispatch(
+                dispatch_fn(
                     self.buffer, a1, topk_ids.int(), topk_weights
                 )
             )
@@ -265,10 +269,15 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 expert_num_tokens=num_tokens_per_local_experts_gpu,
                 expert_num_tokens_cpu=None,
             )
-            return (
-                lambda: 1,
-                lambda: (recv_x, recv_scales, expert_tokens_meta, None, None),
-            )
+            def receive():
+                if split_dispatch:
+                    nvsm_ep.nvsm_low_latency_dispatch_finish(self.buffer, recv_x, recv_scales)
+                return recv_x, recv_scales, expert_tokens_meta, None, None
+
+            if split_dispatch and not getattr(self, "_split_dispatch_reported", False):
+                print("NVSM_SPLIT_RECEIVER_ACTIVE", flush=True)
+                self._split_dispatch_reported = True
+            return (lambda: 1, receive)
 
         # Dispatch
         dispatch_topk_ids = self._map_global_to_physical_ids(topk_ids)

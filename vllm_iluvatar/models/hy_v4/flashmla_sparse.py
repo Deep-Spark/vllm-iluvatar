@@ -204,6 +204,8 @@ class HYV4FlashMLASparseImpl(IluFlashMLASparseImpl):
             )
         if kv_cache.numel() == 0:
             return
+        if getattr(self, "_skip_fp8_kv_insert", False):
+            return
         import ixformer.inference.functions as ixf_ops
 
         self._maybe_init_fp8_kv_scale(kv_c_normed, k_scale)

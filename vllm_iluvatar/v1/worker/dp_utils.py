@@ -29,6 +29,7 @@ import torch.distributed as dist
 from vllm.config import ParallelConfig
 from vllm.distributed.parallel_state import get_dp_group
 from vllm.logger import init_logger
+from vllm.v1.worker.dp_utils import should_skip_dp_coordination
 from vllm.v1.worker.ubatch_utils import (
     check_ubatch_thresholds,
     is_last_ubatch_empty,
@@ -176,6 +177,31 @@ def coordinate_batch_across_dp(
     assert num_tokens_padded >= num_tokens_unpadded
     assert num_tokens_pre_cudagraph_padding >= num_tokens_unpadded
     # <<< ILU MODIFICATION <<<
+
+    # Callers inside a ``skip_dp_coordination()`` scope must not hit a
+    # collective; mirror the community early-exit before ``_run_ar``.
+    if should_skip_dp_coordination():
+        should_ubatch = should_attempt_ubatching and not is_last_ubatch_empty(
+            num_tokens_unpadded,
+            num_tokens_padded,
+            parallel_config.num_ubatches,
+        )
+        num_tokens_after_padding = torch.full(
+            (parallel_config.data_parallel_size,),
+            num_tokens_padded,
+            dtype=torch.int32,
+        )
+        # >>> ILU MODIFICATION — publish the unsynchronized decode-only bit.
+        _ILU_LAST_ALL_RANKS_DECODE_ONLY = all_ranks_decode_only
+        if return_all_ranks_decode_only:
+            return (
+                should_ubatch,
+                num_tokens_after_padding,
+                cudagraph_mode,
+                all_ranks_decode_only,
+            )
+        # <<< ILU MODIFICATION <<<
+        return should_ubatch, num_tokens_after_padding, cudagraph_mode
 
     tensor = _run_ar(
         should_ubatch=should_attempt_ubatching,

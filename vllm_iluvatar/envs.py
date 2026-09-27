@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     VLLM_ILU_DS4_PREFILL_OPT: bool = False
     VLLM_ILU_DS4_PREFILL_AS_DECODE: bool = False
     VLLM_ILU_DS4_C4A_FUSED_INDEXCOMPRESS: bool = False
+    VLLM_ILU_DS4_CANDIDATE_FILTER: bool = True
     VLLM_ILU_DS4_MQA_QUANT_TYPE: str = ""
     VLLM_ILU_FUSE_NORM_QUANT: bool = True
     VLLM_ILU_FUSE_MOE_W13: bool = True
@@ -189,6 +190,15 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
         _get(
             "VLLM_ILU_DS4_PREFILL_AS_DECODE", "VLLM_DS4_PREFILL_AS_DECODE", "0"
         ).lower()
+        in ("1", "true")
+    ),
+    # DeepSeek-V4.1 two-level indexing: the layer at
+    # ``candidate_source_layer_id`` publishes a block shortlist and the index
+    # sources above it mask their logits to it before taking their top-k. On by
+    # default because it is what the model was trained to do; set to 0 to score
+    # the whole context instead, which is the only way to A/B the filter.
+    "VLLM_ILU_DS4_CANDIDATE_FILTER": lambda: (
+        _get("VLLM_ILU_DS4_CANDIDATE_FILTER", "VLLM_DS4_CANDIDATE_FILTER", "1").lower()
         in ("1", "true")
     ),
     # Collapse a C4A layer's indexer compressor + weights_proj + main

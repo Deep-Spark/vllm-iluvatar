@@ -49,7 +49,6 @@ _OOT_OP_PACKAGES = [
     "vllm_iluvatar.model_executor.layers",
     "vllm_iluvatar.model_executor.layers.fused_moe",
     "vllm_iluvatar.model_executor.layers.fused_moe.router",
-    "vllm_iluvatar.model_executor.layers.mamba.gdn",
     "vllm_iluvatar.model_executor.layers.rotary_embedding",
     # Quantization configs register via @register_quantization_config at import.
     "vllm_iluvatar.model_executor.layers.quantization",
@@ -58,13 +57,12 @@ _OOT_OP_PACKAGES = [
 # Model packages register via a module-level ``register_model()`` hook.
 # Sub-packages are not auto-discovered (``_iter_package_modules`` skips them),
 # so multi-file model packages must be listed explicitly.
+#
+# This build targets DeepSeek-V4.1 only. ``deepseek_v4`` stays on the list
+# because V4.1 reuses its attention and fp8 helpers, but its own architectures
+# are no longer registered.
 _OOT_MODEL_PACKAGES = [
-    "vllm_iluvatar.model_executor.models",
-    "vllm_iluvatar.models.deepseek_v32",
-    "vllm_iluvatar.models.deepseek_v4",
     "vllm_iluvatar.models.deepseek_v41",
-    "vllm_iluvatar.models.glm_moe_dsa",
-    "vllm_iluvatar.models.minimax_m3",
 ]
 
 __all__ = ["apply_oot_registrations"]

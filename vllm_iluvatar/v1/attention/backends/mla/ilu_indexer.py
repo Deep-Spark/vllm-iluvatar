@@ -25,7 +25,6 @@ from vllm.v1.attention.backends.mla.compressor_utils import (
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
-from vllm.v1.worker.cp_utils import get_kv_cache_shard_count
 
 
 @triton.jit
@@ -224,6 +223,11 @@ class IluDeepseekV32IndexerMetadata:
     # Token-domain page table for the compressed index-key insert.
     block_table: torch.Tensor | None = None
     token_to_req_indices: torch.Tensor | None = None
+    # Rows per page that ``slot_mapping`` was built against. Not simply
+    # ``block_size // compress_ratio``: the KV cache coordinator scales a
+    # group's manager block size up to equalize page sizes across groups, so
+    # this is the group spec's ``num_states``, not the layer's block size.
+    num_states: int | None = None
 
 
 # TODO (zyongye) optimize this, this is now vibe coded
@@ -361,10 +365,15 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.num_sms = sm_count
 
         # KV compression. Default 1 for V3.2 (no compression); read from spec
-        # for V4 (compress_ratio == 4 on the indexer cache).
+        # for V4 (compress_ratio == 4 on the indexer cache). 0.30.1 renamed the
+        # spec field from ``compress_ratio`` to the generic
+        # ``tokens_per_state``; the semantics are unchanged.
         self.compress_ratio = 1
         if isinstance(self.kv_cache_spec, MLAAttentionSpec):
-            self.compress_ratio = self.kv_cache_spec.compress_ratio
+            # Fractional tokens_per_state is whisper block pooling and never
+            # reaches MLA.
+            assert isinstance(self.kv_cache_spec.tokens_per_state, int)
+            self.compress_ratio = self.kv_cache_spec.tokens_per_state
         self.max_decode_context_len = get_max_decode_context_len(
             self.vllm_config, self.compress_ratio
         )
@@ -411,9 +420,12 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
+        # ``cp_utils.get_kv_cache_shard_count`` was removed upstream; the
+        # community indexer now reads the DCP size off the parallel config.
         max_num_blocks_per_req = cdiv(
             self.vllm_config.model_config.max_model_len,
-            self.kv_cache_spec.block_size * get_kv_cache_shard_count(),
+            self.kv_cache_spec.block_size
+            * self.vllm_config.parallel_config.decode_context_parallel_size,
         )
         self.cu_seqlens_q_buffer = torch.empty(
             (scheduler_config.max_num_seqs + 1,),
@@ -621,7 +633,11 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # dsa_update_topk_indices) and the K-cache itself live in the
         # compressed domain.
         compress_ratio = self.compress_ratio
-        seq_lens_decode_uncomp = common_attn_metadata.seq_lens_cpu[:num_decodes]
+        # 0.30.1 dropped the cached ``seq_lens_cpu`` property to stop callers
+        # from taking an implicit H<>D sync by accident. ``kv_spans_from_batches``
+        # reads these lengths on the host, so the sync is unavoidable here; this
+        # is the same copy the property used to make.
+        seq_lens_decode_uncomp = common_attn_metadata.seq_lens[:num_decodes].cpu()
         if compress_ratio > 1:
             seq_lens_decode = seq_lens_decode_uncomp // compress_ratio
         else:
@@ -858,12 +874,17 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # ``self.compressed_slot_mapping_buffer``.
         if self.compress_ratio > 1:
             padded_num_tokens = common_attn_metadata.slot_mapping.shape[0]
+            # 0.30.1 added the uncompressed ``slot_mapping`` argument so PAD
+            # tokens (SWA bounded replay) stay PAD after compression, and
+            # moved the compressed page size from the ``storage_block_size``
+            # property to ``num_states``.
             get_compressed_slot_mapping(
                 common_attn_metadata.num_actual_tokens,
+                common_attn_metadata.slot_mapping,
                 common_attn_metadata.query_start_loc,
                 common_attn_metadata.seq_lens,
                 common_attn_metadata.block_table_tensor.clamp(min=0),
-                int(self.kv_cache_spec.storage_block_size),
+                int(self.kv_cache_spec.num_states),
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
             )
@@ -981,6 +1002,7 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             head_dim=128,
             block_table=common_attn_metadata.block_table_tensor,
             token_to_req_indices=token_to_req_indices,
+            num_states=int(self.kv_cache_spec.num_states),
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,

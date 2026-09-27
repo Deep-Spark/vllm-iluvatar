@@ -349,19 +349,13 @@ class IluFusedMoEEP:
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         org_shape = hidden_states.shape
-        if self.experts.is_internal_router:
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=hidden_states,
-                input_ids=input_ids,
-            )
-        else:
-            router_logits, _ = self.gate(hidden_states)
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-            )
+        # The runner owns the gate upstream, so ``router_logits`` is a
+        # placeholder; the ``is_internal_router`` branch went away with it.
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            router_logits=hidden_states,
+            input_ids=input_ids,
+        )
         return final_hidden_states.view(org_shape)
 
     def forward_dp_ep_deep_ep(

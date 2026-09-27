@@ -152,22 +152,6 @@ def _make_iluvatar_platform():
             return True
 
         @classmethod
-        def register_custom_kv_cache_specs(cls, vllm_config) -> None:
-            del vllm_config
-            from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
-
-            from vllm_iluvatar.v1.core.compressor_state import (
-                CompressorStateManager,
-                IluCompressorStateSpec,
-            )
-
-            KVCacheSpecRegistry.register(
-                IluCompressorStateSpec,
-                CompressorStateManager,
-                uniform_type_base_spec=IluCompressorStateSpec,
-            )
-
-        @classmethod
         def import_kernels(cls) -> None:
             # fork interface.py: Platform.import_kernels -> pass.
             pass
@@ -202,10 +186,16 @@ def _make_iluvatar_platform():
             # because community vllm_c.fused_add_rms_norm calls
             # torch.ops._C.fused_add_rms_norm, which the plugin _C does not
             # register.
+            #
+            # The default must NOT name "iluvatar": it applies to every IR op,
+            # including ones upstream adds later, and a priority entry without
+            # a registered implementation trips an assertion at worker startup.
+            # Only ops with an impl in vllm_iluvatar.kernels.ilu_ops list it.
             return IrOpPriorityConfig.with_default(
-                ["iluvatar", "native"],
+                ["native"],
                 rms_norm=["iluvatar", "vllm_c", "native"],
                 fused_add_rms_norm=["iluvatar", "native"],
+                gelu_and_mul_sparse=["triton", "native"],
             )
 
         @classmethod

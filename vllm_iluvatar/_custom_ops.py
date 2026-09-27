@@ -45,6 +45,7 @@ _ILU_OVERRIDES: list[str] = [
     "topk_hash_softplus_sqrt",
     "topk_sigmoid",
     "topk_softmax",
+    "vocab_parallel_embedding",
 ]
 
 _ILU_ADDED: list[str] = [
@@ -440,6 +441,48 @@ def topk_sigmoid(
     _mask_topk_padding(topk_weights, topk_ids, is_padding)
 
 
+def vocab_parallel_embedding(
+    input_ids: torch.Tensor,
+    weight: torch.Tensor,
+    org_vocab_start_index: int,
+    org_vocab_end_index: int,
+    num_org_vocab_padding: int,
+    added_vocab_start_index: int,
+    added_vocab_end_index: int,
+) -> torch.Tensor:
+    """PyTorch equivalent of ``torch.ops._C.vocab_parallel_embedding``.
+
+    The community kernel fuses the range mask, id shift, gather and output
+    masking of the TP > 1 embedding path. Iluvatar has no such kernel and the
+    plugin ``_C`` does not register the op, so reproduce it with the same
+    pointwise sequence the community used before the kernel existed (still its
+    ``get_masked_input_and_mask`` fallback path).
+
+    Out-of-shard tokens produce zero rows, so an all-reduce over the ranks
+    yields the full embedding.
+    """
+    org_vocab_mask = (input_ids >= org_vocab_start_index) & (
+        input_ids < org_vocab_end_index
+    )
+    added_vocab_mask = (input_ids >= added_vocab_start_index) & (
+        input_ids < added_vocab_end_index
+    )
+    added_offset = (
+        added_vocab_start_index
+        - (org_vocab_end_index - org_vocab_start_index)
+        - num_org_vocab_padding
+    )
+    valid_offset = (org_vocab_start_index * org_vocab_mask) + (
+        added_offset * added_vocab_mask
+    )
+    vocab_mask = org_vocab_mask | added_vocab_mask
+    masked_input = vocab_mask * (input_ids - valid_offset)
+
+    out = F.embedding(masked_input.long(), weight)
+    out.masked_fill_(~vocab_mask.unsqueeze(-1), 0)
+    return out
+
+
 def topk_hash_softplus_sqrt(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -451,6 +494,8 @@ def topk_hash_softplus_sqrt(
     input_tokens: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
     is_padding: torch.Tensor | None = None,
+    bias_vl: torch.Tensor | None = None,
+    image_sentinel_lo: int = 0,
 ) -> None:
     """PyTorch equivalent of ``torch.ops._moe_C.topk_softplus_sqrt``.
 
@@ -470,7 +515,18 @@ def topk_hash_softplus_sqrt(
          multiply by ``routed_scaling_factor`` (matches the kernel which
          applies the scale internally).
       4. ``token_expert_indices[t, j] = j`` (positional helper).
+
+    ``bias_vl`` / ``image_sentinel_lo`` route the five image-sentinel tokens
+    through a separate bias. The ixformer kernel has no such input, so the
+    feature is rejected rather than silently ignored; this build is text-only.
     """
+    if bias_vl is not None and image_sentinel_lo > 0:
+        raise NotImplementedError(
+            "Iluvatar topk_hash_softplus_sqrt has no image-sentinel routing "
+            "(bias_vl / image_sentinel_lo); the ixformer kernel takes no such "
+            "input. This build serves text only."
+        )
+
     # ixformer expects int32 index tensors. topk_indices/token_expert_indices
     # are output buffers, so use temporaries only when needed and copy back into
     # the original buffers after the kernel writes them.

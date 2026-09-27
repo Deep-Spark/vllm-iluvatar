@@ -411,9 +411,13 @@ class IluvatarGPUModelRunner(GPUModelRunner):
                     )
                     kernel_num_blocks = num_blocks * num_blocks_per_kv_block
 
-                    # For MLA with compression, storage_block_size != block_size
-                    if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
-                        shape_block_size = kv_cache_spec.storage_block_size
+                    # For MLA with compression a block holds fewer states than
+                    # tokens. 0.30.1 renamed the computed page size from the
+                    # storage_block_size property to num_states, and made
+                    # storage_block_size an optional override defaulting to
+                    # None -- comparing against that name would always differ.
+                    if kv_cache_spec.num_states != kv_cache_spec.block_size:
+                        shape_block_size = kv_cache_spec.num_states
                     else:
                         shape_block_size = kernel_block_size
 

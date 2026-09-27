@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ixformer.inference.functions as ixfops
 import torch
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import CustomOp
@@ -13,9 +14,63 @@ from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import _encode_layer_name, direct_register_custom_op
 
+from vllm_iluvatar.model_executor.kernels.attention.dsa.ilu_candidate_blocks import (
+    apply_candidate_mask,
+    select_candidate_blocks,
+)
 from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
     IluDeepseekV32IndexerMetadata,
 )
+
+
+def _two_level_filter(
+    logits: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    candidate_blocks: torch.Tensor | None,
+    candidate_block_size: int,
+    candidate_write: bool,
+    token_start: int,
+    token_end: int,
+) -> None:
+    return # temp disable candidate filter
+    """V4.1's coarse pass over the logits, in place, before the top-k.
+
+    The layer at ``candidate_source_layer_id`` writes the shortlist; every
+    index source above it masks against the shortlist that layer left behind.
+    ``candidate_blocks`` is ``None`` on models without a candidate source and
+    on the layers below it, which is what makes this a no-op there.
+    """
+    if candidate_blocks is None or not envs.VLLM_ILU_DS4_CANDIDATE_FILTER:
+        return
+    assert candidate_block_size > 0, (
+        "a candidate source needs candidate_block_size; the model passed "
+        f"{candidate_block_size}"
+    )
+    # ``cu_seqlen_ks`` is an offset into the concatenated KV space, not into
+    # the logits: ``dsa_indexer_mqa_logits_with_blocks`` emits a row whose
+    # column 0 is that request's first key, and ``dsa_update_topk_indices``
+    # reads the span as ``ke - ks`` for exactly that reason. So the columns
+    # start at zero and only the length carries over.
+    row_ke = cu_seqlen_ke - cu_seqlen_ks
+    rows = candidate_blocks[token_start:token_end]
+    if candidate_write:
+        select_candidate_blocks(
+            logits,
+            None,
+            row_ke,
+            rows.shape[1],
+            candidate_block_size,
+            rows,
+        )
+    else:
+        apply_candidate_mask(
+            logits,
+            None,
+            row_ke,
+            rows,
+            candidate_block_size,
+        )
 
 
 def ilu_sparse_attn_indexer(
@@ -31,6 +86,9 @@ def ilu_sparse_attn_indexer(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool = False,
+    candidate_blocks: torch.Tensor | None = None,
+    candidate_block_size: int = 0,
+    candidate_write: bool = False,
 ) -> torch.Tensor:
     # attn_metadata is unavailable during dummy/profiling runs.
     assert topk_indices_buffer is not None
@@ -85,6 +143,16 @@ def ilu_sparse_attn_indexer(
                 max_kv_len=chunk.max_kv_len,
                 max_context_len=chunk.max_context_len,
             )
+            _two_level_filter(
+                logits,
+                chunk.cu_seqlen_ks,
+                chunk.cu_seqlen_ke,
+                candidate_blocks,
+                candidate_block_size,
+                candidate_write,
+                chunk.token_start,
+                chunk.token_end,
+            )
             ixfops.dsa_update_topk_indices(
                 logits,
                 chunk.cu_seqlen_ks,
@@ -119,6 +187,16 @@ def ilu_sparse_attn_indexer(
             max_context_len=decode_metadata.max_context_len,
         )
 
+        _two_level_filter(
+            logits,
+            decode_metadata.cu_seqlen_ks,
+            decode_metadata.cu_seqlen_ke,
+            candidate_blocks,
+            candidate_block_size,
+            candidate_write,
+            0,
+            num_decode_tokens,
+        )
         ixfops.dsa_update_topk_indices(
             logits,
             decode_metadata.cu_seqlen_ks,
@@ -143,6 +221,9 @@ def ilu_sparse_attn_indexer_fake(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool = False,
+    candidate_blocks: torch.Tensor | None = None,
+    candidate_block_size: int = 0,
+    candidate_write: bool = False,
 ) -> torch.Tensor:
     assert topk_indices_buffer is not None
     return topk_indices_buffer
@@ -151,7 +232,9 @@ def ilu_sparse_attn_indexer_fake(
 direct_register_custom_op(
     op_name="ilu_sparse_attn_indexer",
     op_func=ilu_sparse_attn_indexer,
-    mutates_args=["topk_indices_buffer"],
+    # The candidate source writes its shortlist into ``candidate_blocks``; the
+    # layers above it only read, but the schema is shared.
+    mutates_args=["topk_indices_buffer", "candidate_blocks"],
     fake_impl=ilu_sparse_attn_indexer_fake,
     dispatch_key=current_platform.dispatch_key,
 )
@@ -229,4 +312,7 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
             self.max_total_seq_len,
             self.topk_indices_buffer,
             self.skip_k_cache_insert,
+            self.candidate_blocks,
+            self.candidate_block_size,
+            self.candidate_write,
         )

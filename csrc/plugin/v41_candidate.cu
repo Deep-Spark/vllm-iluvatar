@@ -1,0 +1,333 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// DeepSeek-V4.1 two-level indexer, block half:
+//   v41_candidate_block_scores -- per-candidate-block max of the index logits
+//   v41_apply_candidate_mask   -- -inf everything outside the candidate blocks
+//
+// V4.1 scores its index logits twice. The layer at ``candidate_source_layer_id``
+// publishes a coarse shortlist -- the best ``candidate_topk_blocks`` blocks of
+// ``candidate_block_size`` columns each -- and the index sources above it keep
+// only those blocks before taking their own top-k. Official spells both halves
+// in Triton (``vllm/model_executor/kernels/attention/dsa/candidate_blocks.py``),
+// which does not run on corex, so they are reproduced here; the arithmetic
+// below is a transcription of those kernels, down to the two special cases:
+//
+//   * the block holding a row's newest column always scores ``+inf``, so the
+//     shortlist cannot drop the most recent context;
+//   * a candidate whose first column lands past the logits width is folded into
+//     a single "edge" flag that keeps the last column instead.
+//
+// Columns are *packed*: a row's context starts at ``row_ks`` and ends at
+// ``row_ke``, and block ``b`` covers ``[start + b*block_size, ...)``. Rows share
+// bounds in groups of ``row_repeat`` (decode batches that flatten several query
+// rows per request); V4.1 passes per-token bounds, so ``row_repeat`` is 1.
+
+#include <torch/all.h>
+
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+#include <cstdint>
+
+#include "ops.h"
+#include "utils.cuh"
+
+namespace vllm_iluvatar {
+namespace {
+
+constexpr int kThreads = 256;
+
+inline int64_t cdiv_i64(int64_t a, int64_t b) { return (a + b - 1) / b; }
+
+// The index logits come out of whichever ixformer scoring kernel ran: bf16 on
+// this platform, fp32 from the reference path. Both have to be maskable in
+// place, so the two kernels below are generic over the element type and do
+// their arithmetic in fp32.
+template <typename scalar_t>
+__device__ __forceinline__ float to_float(scalar_t v);
+template <>
+__device__ __forceinline__ float to_float<float>(float v) {
+  return v;
+}
+template <>
+__device__ __forceinline__ float to_float<__nv_bfloat16>(__nv_bfloat16 v) {
+  return __bfloat162float(v);
+}
+template <>
+__device__ __forceinline__ float to_float<__half>(__half v) {
+  return __half2float(v);
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t from_float(float v);
+template <>
+__device__ __forceinline__ float from_float<float>(float v) {
+  return v;
+}
+template <>
+__device__ __forceinline__ __nv_bfloat16 from_float<__nv_bfloat16>(float v) {
+  return __float2bfloat16_rn(v);
+}
+template <>
+__device__ __forceinline__ __half from_float<__half>(float v) {
+  return __float2half_rn(v);
+}
+
+#define VLLM_ILU_DISPATCH_LOGITS(TYPE, ...)                            \
+  switch (TYPE) {                                                      \
+    case at::kFloat: {                                                 \
+      using scalar_t = float;                                          \
+      __VA_ARGS__;                                                     \
+      break;                                                           \
+    }                                                                  \
+    case at::kBFloat16: {                                              \
+      using scalar_t = __nv_bfloat16;                                  \
+      __VA_ARGS__;                                                     \
+      break;                                                           \
+    }                                                                  \
+    case at::kHalf: {                                                  \
+      using scalar_t = __half;                                         \
+      __VA_ARGS__;                                                     \
+      break;                                                           \
+    }                                                                  \
+    default:                                                           \
+      TORCH_CHECK(false, "logits must be fp32, bf16 or fp16, got ",    \
+                  TYPE);                                               \
+  }
+
+// Triton's ``tl.maximum(..., propagate_nan=ALL)``. A NaN anywhere in a block
+// has to survive the reduction, or a warmup row of NaNs would score as a
+// perfectly ordinary block and be shortlisted.
+__device__ __forceinline__ float nan_max(float a, float b) {
+  if (isnan(a) || isnan(b)) {
+    return CUDART_NAN_F;
+  }
+  return fmaxf(a, b);
+}
+
+__device__ __forceinline__ int load_bound(const int32_t* p, int64_t stride,
+                                          int64_t row, int row_repeat) {
+  return static_cast<int>(p[(row / row_repeat) * stride]);
+}
+
+template <typename scalar_t>
+__global__ void v41_candidate_block_scores_kernel(
+    const scalar_t* __restrict__ logits, int64_t stride_row,
+    int64_t stride_col, const int32_t* __restrict__ starts,
+    int64_t start_stride, const int32_t* __restrict__ ends, int64_t end_stride,
+    scalar_t* __restrict__ scores, int width, int nblocks, int block_size,
+    int row_repeat) {
+  const int64_t row = blockIdx.x;
+  const int block = blockIdx.y * blockDim.x + threadIdx.x;
+  if (block >= nblocks) {
+    return;
+  }
+
+  const int start =
+      starts == nullptr ? 0 : load_bound(starts, start_stride, row, row_repeat);
+  const int end = load_bound(ends, end_stride, row, row_repeat);
+
+  float acc = -INFINITY;
+  const int64_t base = static_cast<int64_t>(start) +
+                       static_cast<int64_t>(block) * block_size;
+  for (int j = 0; j < block_size; ++j) {
+    const int64_t col = base + j;
+    if (col < end && col < width) {
+      acc = nan_max(acc,
+                    to_float(logits[row * stride_row + col * stride_col]));
+    }
+  }
+
+  // Pin the row's newest block: whatever it scored, it is always shortlisted.
+  if (end > start && block == (end - start - 1) / block_size) {
+    acc = INFINITY;
+  }
+  scores[row * static_cast<int64_t>(nblocks) + block] = from_float<scalar_t>(acc);
+}
+
+// One block per row. Zeroes the row's flags, then marks the shortlisted
+// blocks; slot ``nblocks`` is the edge flag described in the header.
+__global__ void v41_candidate_flags_kernel(
+    const int32_t* __restrict__ candidates, int64_t cand_stride_row,
+    int64_t cand_stride_col, const int32_t* __restrict__ starts,
+    int64_t start_stride, uint8_t* __restrict__ flags, int width, int nblocks,
+    int block_size, int num_candidates, int row_repeat) {
+  const int64_t row = blockIdx.x;
+  uint8_t* const row_flags = flags + row * static_cast<int64_t>(nblocks + 1);
+  for (int i = threadIdx.x; i <= nblocks; i += blockDim.x) {
+    row_flags[i] = 0;
+  }
+  __syncthreads();
+
+  const int start =
+      starts == nullptr ? 0 : load_bound(starts, start_stride, row, row_repeat);
+  for (int c = threadIdx.x; c < num_candidates; c += blockDim.x) {
+    int64_t block = candidates[row * cand_stride_row + c * cand_stride_col];
+    if (start + block * block_size >= width) {
+      block = nblocks;
+    }
+    if (block >= 0) {
+      row_flags[block] = 1;
+    }
+  }
+}
+
+template <typename scalar_t>
+__global__ void v41_mask_candidates_kernel(
+    scalar_t* __restrict__ logits, int64_t stride_row, int64_t stride_col,
+    const int32_t* __restrict__ starts, int64_t start_stride,
+    const int32_t* __restrict__ ends, int64_t end_stride,
+    const uint8_t* __restrict__ flags, int width, int nblocks, int block_size,
+    int row_repeat) {
+  const int64_t row = blockIdx.x;
+  const int64_t col =
+      static_cast<int64_t>(blockIdx.y) * blockDim.x + threadIdx.x;
+  if (col >= width) {
+    return;
+  }
+
+  const int start =
+      starts == nullptr ? 0 : load_bound(starts, start_stride, row, row_repeat);
+  const int end = load_bound(ends, end_stride, row, row_repeat);
+  const uint8_t* const row_flags =
+      flags + row * static_cast<int64_t>(nblocks + 1);
+
+  const bool valid = col >= start && col < end;
+  bool keep = false;
+  if (valid) {
+    keep = row_flags[(col - start) / block_size] != 0;
+  }
+  keep = keep || (col == width - 1 && row_flags[nblocks] != 0);
+
+  if (!(valid && keep)) {
+    logits[row * stride_row + col * stride_col] =
+        from_float<scalar_t>(-INFINITY);
+  }
+}
+
+void check_logits(const torch::Tensor& logits) {
+  TORCH_CHECK(logits.is_cuda() && logits.dim() == 2,
+              "logits must be a 2D CUDA tensor [rows, width]");
+}
+
+void check_bound(const torch::Tensor& t, const char* name) {
+  TORCH_CHECK(t.is_cuda() && t.dim() == 1 && t.scalar_type() == at::kInt, name,
+              " must be a 1D int32 CUDA tensor");
+}
+
+void check_row_groups(int64_t rows, int64_t bound_rows, int64_t row_repeat,
+                      const char* name) {
+  TORCH_CHECK(row_repeat >= 1, "row_repeat must be positive, got ", row_repeat);
+  TORCH_CHECK((rows + row_repeat - 1) / row_repeat <= bound_rows, name,
+              " holds ", bound_rows, " bounds but ", rows,
+              " rows in groups of ", row_repeat, " need ",
+              (rows + row_repeat - 1) / row_repeat);
+}
+
+}  // namespace
+
+torch::Tensor v41_candidate_block_scores(
+    torch::Tensor& logits, const std::optional<torch::Tensor>& row_ks,
+    torch::Tensor& row_ke, int64_t block_size, int64_t row_repeat) {
+  check_logits(logits);
+  check_bound(row_ke, "row_ke");
+  TORCH_CHECK(block_size > 0, "block_size must be positive, got ", block_size);
+
+  const int64_t rows = logits.size(0);
+  const int64_t width = logits.size(1);
+  const int64_t nblocks = cdiv_i64(width, block_size);
+  auto scores = logits.new_empty({rows, nblocks});
+  if (rows == 0 || width == 0) {
+    return scores;
+  }
+  check_row_groups(rows, row_ke.numel(), row_repeat, "row_ke");
+
+  const int32_t* starts_ptr = nullptr;
+  int64_t start_stride = 0;
+  if (row_ks.has_value()) {
+    const torch::Tensor& ks = *row_ks;
+    check_bound(ks, "row_ks");
+    check_row_groups(rows, ks.numel(), row_repeat, "row_ks");
+    starts_ptr = ks.data_ptr<int32_t>();
+    start_stride = ks.stride(0);
+  }
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(logits));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const dim3 grid(static_cast<unsigned>(rows),
+                  static_cast<unsigned>(cdiv_i64(nblocks, kThreads)));
+  VLLM_ILU_DISPATCH_LOGITS(
+      logits.scalar_type(),
+      v41_candidate_block_scores_kernel<scalar_t><<<grid, kThreads, 0, stream>>>(
+          reinterpret_cast<const scalar_t*>(logits.data_ptr()),
+          logits.stride(0), logits.stride(1), starts_ptr, start_stride,
+          row_ke.data_ptr<int32_t>(), row_ke.stride(0),
+          reinterpret_cast<scalar_t*>(scores.data_ptr()),
+          static_cast<int>(width), static_cast<int>(nblocks),
+          static_cast<int>(block_size), static_cast<int>(row_repeat)));
+  return scores;
+}
+
+void v41_apply_candidate_mask(torch::Tensor& logits,
+                              const std::optional<torch::Tensor>& row_ks,
+                              torch::Tensor& row_ke,
+                              torch::Tensor& candidate_blocks,
+                              int64_t block_size, int64_t row_repeat) {
+  check_logits(logits);
+  check_bound(row_ke, "row_ke");
+  TORCH_CHECK(block_size > 0, "block_size must be positive, got ", block_size);
+  TORCH_CHECK(candidate_blocks.is_cuda() && candidate_blocks.dim() == 2 &&
+                  candidate_blocks.scalar_type() == at::kInt,
+              "candidate_blocks must be a 2D int32 CUDA tensor [rows, k]");
+
+  const int64_t rows = logits.size(0);
+  const int64_t width = logits.size(1);
+  if (rows == 0 || width == 0) {
+    return;
+  }
+  TORCH_CHECK(candidate_blocks.size(0) >= rows, "candidate_blocks holds ",
+              candidate_blocks.size(0), " rows but the logits have ", rows);
+  check_row_groups(rows, row_ke.numel(), row_repeat, "row_ke");
+
+  const int32_t* starts_ptr = nullptr;
+  int64_t start_stride = 0;
+  if (row_ks.has_value()) {
+    const torch::Tensor& ks = *row_ks;
+    check_bound(ks, "row_ks");
+    check_row_groups(rows, ks.numel(), row_repeat, "row_ks");
+    starts_ptr = ks.data_ptr<int32_t>();
+    start_stride = ks.stride(0);
+  }
+
+  const int64_t nblocks = cdiv_i64(width, block_size);
+  auto flags = at::empty({rows, nblocks + 1},
+                         logits.options().dtype(at::kByte));
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(logits));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  v41_candidate_flags_kernel<<<static_cast<unsigned>(rows), kThreads, 0,
+                               stream>>>(
+      candidate_blocks.data_ptr<int32_t>(), candidate_blocks.stride(0),
+      candidate_blocks.stride(1), starts_ptr, start_stride,
+      flags.data_ptr<uint8_t>(), static_cast<int>(width),
+      static_cast<int>(nblocks), static_cast<int>(block_size),
+      static_cast<int>(candidate_blocks.size(1)),
+      static_cast<int>(row_repeat));
+
+  const dim3 grid(static_cast<unsigned>(rows),
+                  static_cast<unsigned>(cdiv_i64(width, kThreads)));
+  VLLM_ILU_DISPATCH_LOGITS(
+      logits.scalar_type(),
+      v41_mask_candidates_kernel<scalar_t><<<grid, kThreads, 0, stream>>>(
+          reinterpret_cast<scalar_t*>(logits.data_ptr()), logits.stride(0),
+          logits.stride(1), starts_ptr, start_stride,
+          row_ke.data_ptr<int32_t>(), row_ke.stride(0),
+          flags.data_ptr<uint8_t>(), static_cast<int>(width),
+          static_cast<int>(nblocks), static_cast<int>(block_size),
+          static_cast<int>(row_repeat)));
+}
+
+}  // namespace vllm_iluvatar

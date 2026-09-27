@@ -127,19 +127,30 @@ _MAX_REPORTED_NAMES = 20
 _MODEL_PREFIX = "model."
 
 
-def _is_load_skipped(name: str, skip_substrs: tuple[str, ...] = _LOAD_SKIP_SUBSTRS) -> bool:
-    """Whether ``AutoWeightsLoader`` would skip this (mapped) name.
+# Rotary leftovers some checkpoints still ship. ``AutoWeightsLoader`` used to
+# append these to every ``skip_substrs`` list; it no longer does (and no longer
+# takes the argument), so the list lives here and this model filters its own
+# checkpoint stream.
+_ROTARY_UNUSED_SUBSTRS: tuple[str, ...] = (
+    "rotary_pos_emb.inv_freq",
+    "rotary_emb.inv_freq",
+    "rotary_emb.cos_cached",
+    "rotary_emb.sin_cached",
+)
 
-    Mirrors ``AutoWeightsLoader._can_skip`` for the substrings this model passes:
-    the caller's list plus the rotary leftovers the loader appends to every
-    ``skip_substrs`` list. Used by both Load_Verifier directions so the whitelist
-    is identical on the parameter and the checkpoint side.
+
+def _is_load_skipped(name: str, skip_substrs: tuple[str, ...] = _LOAD_SKIP_SUBSTRS) -> bool:
+    """Whether this (mapped) checkpoint name should be skipped.
+
+    Used by both Load_Verifier directions so the whitelist is identical on the
+    parameter and the checkpoint side, and by the weight-stream filter feeding
+    ``AutoWeightsLoader``.
 
     ``skip_substrs`` is a parameter rather than the module constant so a subclass can widen the
     list via ``_LOAD_SKIP_SUBSTRS`` and have both directions of the check follow.
     """
     return any(substr in name for substr in skip_substrs) or any(
-        substr in name for substr in AutoWeightsLoader.ROTARY_EMBEDS_UNUSED_WEIGHTS
+        substr in name for substr in _ROTARY_UNUSED_SUBSTRS
     )
 
 
@@ -334,7 +345,9 @@ class IluDeepseekV4Fp8MoE(nn.Module):
         self.gate.tid2eid = None
 
         self.layer_id = extract_layer_index(prefix)
-        is_hash_moe = self.layer_id < config.num_hash_layers
+        # V4.1 has no hash-routed layers and its config omits the field, so
+        # absence means "none" rather than a config error.
+        is_hash_moe = self.layer_id < getattr(config, "num_hash_layers", 0)
         # int32 on the FusedMoE path (community picks int64 only for MegaMoE).
         # The checkpoint tensor is I64, so the loader converts on copy.
         self.hash_indices_dtype = torch.int32
@@ -433,9 +446,10 @@ class IluDeepseekV4Fp8MoE(nn.Module):
         EP/TP all-reduce.  ``routed_scaling_factor`` is likewise handled by the
         router (multiplied into ``topk_weights``).
 
-        ``is_internal_router`` is true because ``FusedMoE`` was constructed with
-        ``gate=self.gate``, so ``router_logits`` is a placeholder and the real
-        gate GEMM runs inside the runner.
+        The runner owns the gate (``FusedMoE`` is constructed with
+        ``gate=self.gate``), so ``router_logits`` is a placeholder and the real
+        gate GEMM runs inside it. Upstream dropped the ``is_internal_router``
+        branch once the gate always lived there, so there is only this path.
         """
         if self.gate.tid2eid is not None:
             if input_ids is None:
@@ -443,19 +457,11 @@ class IluDeepseekV4Fp8MoE(nn.Module):
             input_ids = input_ids.to(dtype=self.hash_indices_dtype)
 
         org_shape = hidden_states.shape
-        if self.experts.is_internal_router:
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=hidden_states,
-                input_ids=input_ids,
-            )
-        else:
-            router_logits, _ = self.gate(hidden_states)
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-            )
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            router_logits=hidden_states,
+            input_ids=input_ids,
+        )
         return final_hidden_states.view(org_shape)
 
 
@@ -1170,9 +1176,17 @@ class IluDeepseekV4Fp8ForCausalLM(nn.Module, SupportsPP):
         # accumulates and ``AutoWeightsLoader`` may enter its ``load_weights``
         # several times (see ``reset_consumed_ckpt_names``).
         self.model.reset_consumed_ckpt_names()
-        loader = AutoWeightsLoader(self, skip_substrs=list(self._LOAD_SKIP_SUBSTRS))
+        # ``AutoWeightsLoader`` no longer takes ``skip_substrs``; filter the
+        # checkpoint stream instead, which keeps the skip list in one place
+        # (``_is_load_skipped``) and matches what the verifier below expects.
+        loader = AutoWeightsLoader(self)
         loaded = loader.load_weights(
-            self._tap_weight_names(weights, seen), mapper=self.hf_to_vllm_mapper
+            (
+                (name, weight)
+                for name, weight in self._tap_weight_names(weights, seen)
+                if not _is_load_skipped(name, self._LOAD_SKIP_SUBSTRS)
+            ),
+            mapper=self.hf_to_vllm_mapper,
         )
 
         # ``IluDeepseekV4Fp8Model.load_weights`` sees names with the ``model.``

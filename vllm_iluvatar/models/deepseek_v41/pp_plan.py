@@ -64,6 +64,12 @@ class RankKvPlan:
     # decision to carry them is global even though the need is local.
     transfers_kv: bool
     transfers_topk: bool
+    # The two-level candidate shortlist is published by a single layer and read
+    # by the index sources above it. A cut between them strands the readers the
+    # same way a cut inside a kv group strands its consumers, except there is
+    # nothing to replicate: the shortlist is a plain per-rank buffer, so it
+    # rides the pipeline and every rank copies it in on arrival.
+    transfers_candidates: bool = False
 
 
 def _group_source(layer_id: int, sources: tuple[int, ...]) -> int | None:
@@ -108,6 +114,21 @@ def _rank_needs(
     return layer_id, kv_source, needs_topk
 
 
+def _rank_reads_remote_candidates(
+    start: int,
+    end: int,
+    index_sources: tuple[int, ...],
+    candidate_source: int,
+) -> bool:
+    """Whether this rank scores against a shortlist published elsewhere."""
+    if candidate_source < 0 or start <= candidate_source < end:
+        return False
+    return any(
+        start <= source < end and source > candidate_source
+        for source in index_sources
+    )
+
+
 def build_rank_plan(
     num_layers: int,
     kv_sources: tuple[int, ...],
@@ -115,6 +136,7 @@ def build_rank_plan(
     compress_ratios: tuple[int, ...],
     rank: int,
     world: int,
+    candidate_source: int = -1,
 ) -> RankKvPlan:
     """Plan this rank's share of the cut, and whether the pipeline carries KV.
 
@@ -127,6 +149,7 @@ def build_rank_plan(
 
     transfers_kv = False
     transfers_topk = False
+    transfers_candidates = False
     for other in range(1, world):
         other_start, other_end = get_pp_indices(num_layers, other, world)
         forwarder, _, needs_topk = _rank_needs(
@@ -135,6 +158,9 @@ def build_rank_plan(
         if forwarder is not None:
             transfers_kv = True
             transfers_topk = transfers_topk or needs_topk
+        transfers_candidates = transfers_candidates or _rank_reads_remote_candidates(
+            other_start, other_end, index_sources, candidate_source
+        )
 
     forwarder, kv_source, needs_topk = (
         _rank_needs(start, end, kv_sources, index_sources, compress_ratios)
@@ -149,6 +175,7 @@ def build_rank_plan(
         forwarder_needs_topk=needs_topk,
         transfers_kv=transfers_kv,
         transfers_topk=transfers_topk,
+        transfers_candidates=transfers_candidates,
     )
 
 

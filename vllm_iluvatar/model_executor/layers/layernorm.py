@@ -34,7 +34,7 @@ import ixformer.inference.functions as ixf_ops
 import torch
 from vllm import envs, ir
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.batch_invariant import rms_norm_batch_invariant
+from vllm.model_executor.determinism.batch_invariant import rms_norm_batch_invariant
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 
 

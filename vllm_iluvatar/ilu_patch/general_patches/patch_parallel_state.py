@@ -130,13 +130,23 @@ BROADCAST_TENSOR_DICT = '''    def broadcast_tensor_dict(
 # Verbatim community-baseline source of GroupCoordinator.isend_tensor_dict
 # (4-space method indent, trailing newline), used as the drift anchor.
 # Baseline: main_6e448d0
-ISEND_TENSOR_DICT = """    def isend_tensor_dict(
+ISEND_TENSOR_DICT = '''    def isend_tensor_dict(
         self,
         tensor_dict: dict[str, torch.Tensor | Any],
         dst: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
     ) -> list[Handle]:
+        """Send the input tensor dictionary asynchronously.
+
+        The returned handles are additionally self-retained in
+        ``self._pending_isends`` (together with the sent source tensors) and
+        reaped lazily on subsequent calls, so fire-and-forget callers that
+        drop the handles cannot free or overwrite the send buffers while the
+        sends are still in flight. Callers that do keep the handles may
+        ``wait()`` them as before; the retention entry is dropped on reap
+        either way.
+        """
         if self.world_size <= 1:
             return []
 
@@ -162,12 +172,16 @@ ISEND_TENSOR_DICT = """    def isend_tensor_dict(
         metadata_group = self.cpu_group
 
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
-        self.send_object(metadata_list, dst=dst)
 
         tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]
         assert len(tensor_keys) == len(tensor_list)
 
-        handles: list[Handle] = []
+        # Reap completed sends before posting new ones, bounding the
+        # self-retention FIFO.
+        self._reap_completed_isends()
+        handles: list[Handle] = [self.isend_object(metadata_list, dst=dst)]
+
+        sent_tensors: list[torch.Tensor] = []
         for key, tensor in zip(tensor_keys, tensor_list):
             if tensor.numel() == 0:
                 continue
@@ -184,9 +198,22 @@ ISEND_TENSOR_DICT = """    def isend_tensor_dict(
             if tensor.is_cuda:
                 tensor.record_stream(torch.cuda.current_stream(tensor.device))
             handles.append(handle)
+            sent_tensors.append(tensor)
+
+        # Self-retain for fire-and-forget callers: keep the handles and
+        # the source tensors alive until the sends complete (reaped
+        # lazily by ``_reap_completed_isends``). Without this, dropping
+        # the returned handles would GC the ``_RetainedHandle``'s
+        # serialized metadata buffers mid-send, and non-CUDA devices
+        # have no ``record_stream`` equivalent protecting the tensor
+        # sources.
+        pending = getattr(self, "_pending_isends", None)
+        if pending is None:
+            self._pending_isends = pending = deque()
+        pending.append((handles, sent_tensors))
 
         return handles
-"""
+'''
 
 # Verbatim community-baseline source of GroupCoordinator.irecv_tensor_dict
 # (4-space method indent, trailing newline), used as the drift anchor.

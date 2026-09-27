@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import os
 import re
 import warnings
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import ixformer.inference.functions as ixfops
 import torch
+import vllm.envs as envs
 from torch import nn
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -33,6 +36,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     get_kv_quant_mode,
 )
+from vllm.v1.worker.workspace import current_workspace_manager
 
 from vllm_iluvatar.model_executor.layers.sparse_attn_indexer import (
     IluSparseAttnIndexer,
@@ -59,7 +63,118 @@ from vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa import IluDeepseekV4
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
-logger = init_logger(__name__)
+logger = init_logger(f"vllm.{__name__}")
+
+# One ratio-1 layer per process reports. The check is the write slot against the
+# block table the attention kernel will read: a mismatch means insert and
+# attention name different pages for the same token.
+_slot_audit_prefix: str | None = None
+_slot_audit_ok = 0
+
+
+def _audit_prefill_slots(layer, swa_metadata, attn_metadata) -> None:
+    """Compare insert slots with the block tables ``_forward_prefill_opt`` reads."""
+    global _slot_audit_prefix, _slot_audit_ok
+    if os.environ.get("VLLM_ILU_DS4_SLOT_CHECK", "0") == "0":
+        return
+    if layer.compress_ratio != 1 or swa_metadata.prefill_swa_block_table is None:
+        return
+    if _slot_audit_prefix is None:
+        _slot_audit_prefix = layer.prefix
+    if layer.prefix != _slot_audit_prefix:
+        return
+
+    nd = swa_metadata.num_decodes
+    npre = swa_metadata.num_prefills
+    bs = int(swa_metadata.block_size)
+    qsl = swa_metadata.query_start_loc[nd : nd + npre + 1].cpu().tolist()
+    seq = swa_metadata.seq_lens[nd : nd + npre].cpu().tolist()
+    replay = swa_metadata.replay_start[nd : nd + npre].cpu().tolist()
+    n_tok = qsl[-1] - qsl[0]
+    slots = swa_metadata.slot_mapping[qsl[0] : qsl[0] + n_tok].cpu().tolist()
+    write_bt = swa_metadata.block_table[nd : nd + npre].cpu()
+    read_bt = swa_metadata.prefill_swa_block_table.cpu()
+
+    bad: list[str] = []
+    checked = 0
+    cursor = 0
+    # Two requests naming one page: each one's slot matches its own table, and
+    # attention still reads the other request's KV.
+    owners: dict[int, int] = {}
+    for r in range(npre):
+        qlen = qsl[r + 1] - qsl[r]
+        slen = int(seq[r])
+        rep = int(replay[r])
+        nblocks = (max(slen, 1) + bs - 1) // bs
+        for col in range(min(nblocks, write_bt.shape[1])):
+            bid = int(write_bt[r, col])
+            if bid <= 0:
+                continue
+            prev = owners.get(bid)
+            if prev is not None and prev != r and len(bad) < 6:
+                bad.append(f"alias blk={bid} reqs={prev},{r}")
+            else:
+                owners[bid] = r
+        for i in range(qlen):
+            pos = slen - qlen + i
+            slot = int(slots[cursor])
+            cursor += 1
+            if slot < 0 or pos < 0:
+                continue
+            checked += 1
+            got = slot // bs
+            col = pos // bs
+            exp = int(write_bt[r, col]) if col < write_bt.shape[1] else -2
+            rcol = (pos - rep) // bs
+            exp_r = int(read_bt[r, rcol]) if 0 <= rcol < read_bt.shape[1] else -2
+            if got != exp or got != exp_r:
+                if len(bad) < 6:
+                    bad.append(
+                        f"swa r={r} pos={pos} slot={slot} blk={got} "
+                        f"table={exp} read={exp_r} replay={rep}"
+                    )
+
+    if attn_metadata is not None:
+        ratio = int(layer.compress_ratio)
+        cbs = int(attn_metadata.block_size) // ratio
+        cslots = attn_metadata.slot_mapping[qsl[0] : qsl[0] + n_tok].cpu().tolist()
+        cbt = attn_metadata.block_table[nd : nd + npre].cpu()
+        cursor = 0
+        for r in range(npre):
+            qlen = qsl[r + 1] - qsl[r]
+            slen = int(seq[r])
+            for i in range(qlen):
+                pos = slen - qlen + i
+                cslot = int(cslots[cursor])
+                cursor += 1
+                if cslot < 0 or pos < 0 or (pos + 1) % ratio != 0:
+                    continue
+                checked += 1
+                cpos = pos // ratio
+                got = cslot // cbs
+                col = cpos // cbs
+                exp = int(cbt[r, col]) if col < cbt.shape[1] else -2
+                if got != exp and len(bad) < 8:
+                    bad.append(
+                        f"cmp r={r} pos={pos} slot={cslot} blk={got} table={exp}"
+                    )
+
+    if bad:
+        logger.warning(
+            "slot/table mismatch %s checked=%s %s",
+            layer.prefix,
+            checked,
+            " | ".join(bad),
+        )
+    else:
+        _slot_audit_ok += 1
+        if _slot_audit_ok <= 3 or _slot_audit_ok % 500 == 0:
+            logger.warning(
+                "slot/table ok %s checked=%s reports=%s",
+                layer.prefix,
+                checked,
+                _slot_audit_ok,
+            )
 
 
 warnings.filterwarnings(
@@ -68,6 +183,10 @@ warnings.filterwarnings(
 
 _INDEX_TILE = 256
 _PACKED_MLA_HEADS = (1, 8, 16, 32, 64, 128)
+
+# Requests per workspace-gathered prefill chunk. Each one costs a row of
+# ``M * head_dim`` bf16, so this bounds the workspace rather than the batch.
+PREFILL_CHUNK_SIZE = 4
 
 
 def _tiled_index_rows(idx: torch.Tensor) -> torch.Tensor:
@@ -93,6 +212,16 @@ def _tiled_index_rows(idx: torch.Tensor) -> torch.Tensor:
     wide = idx.new_empty((idx.shape[0], padded))
     wide[:, :width].copy_(idx)
     return wide[:, :width]
+
+
+def _batched_index_rows(idx: torch.Tensor) -> torch.Tensor:
+    """Index rows as ``[tokens, s_q, width]``.
+
+    ``ds4_flash_mla_with_kvcache`` batches over tokens, so it wants the query
+    axis spelled out. The SWA builder already emits that shape; the global
+    top-k op returns one row per token.
+    """
+    return idx if idx.dim() == 3 else idx.unsqueeze(1)
 
 
 def _resolve_dsv4_kv_cache_dtype(
@@ -166,6 +295,42 @@ def _replace_layer_index(prefix: str, layer_id: int) -> str:
 # for that path exist and are tested; only the wiring is missing.
 _INDEXER_KV_DTYPE = "bf16"
 
+_DBG_TOPK = os.environ.get("VLLM_V41_DEBUG_TOPK", "0") == "1"
+_dbg_topk_seen: dict[str, int] = {}
+
+
+def _dbg_topk(
+    prefix: str,
+    index_q: torch.Tensor,
+    index_weights: torch.Tensor,
+    topk_buffer: torch.Tensor,
+) -> None:
+    """Signature of one index source's inputs and its selection.
+
+    Comparable across TP / PP layouts: keyed by layer prefix, and the last row
+    is the token whose answer we look at.
+    """
+    seen = _dbg_topk_seen.get(prefix, 0)
+    if seen >= 2:
+        return
+    _dbg_topk_seen[prefix] = seen + 1
+    n = index_q.shape[0]
+    sel = topk_buffer[:n].to(torch.int64)
+    valid = sel >= 0
+    last = sel[-1][valid[-1]]
+    logger.info(
+        "[DBG-TOPK] %s #%s n=%s q=%.5f w=%.5f sel_sum=%s valid=%s last_n=%s last16=%s",
+        prefix,
+        seen,
+        n,
+        float(index_q.float().abs().sum()),
+        float(index_weights.float().abs().sum()),
+        int(sel[valid].sum()),
+        int(valid.sum()),
+        int(last.numel()),
+        sorted(last[:16].tolist()),
+    )
+
 
 def _indexer_k_cache_row(index_head_dim: int, kv_dtype: str) -> tuple[int, torch.dtype]:
     """Width and element type of one paged indexer K cache row.
@@ -202,17 +367,19 @@ class IluDeepseekV41IndexerCache(torch.nn.Module, AttentionLayerBase):
         self.cache_config = cache_config
         self.dtype = dtype
         self.compress_ratio = compress_ratio
-        self.block_size = cache_config.block_size
-        if self.block_size % compress_ratio:
-            raise ValueError(
-                f"block_size {self.block_size} must be a multiple of compress_ratio "
-                f"{compress_ratio}, or a page would hold a fractional row "
-                f"(layer {prefix})"
-            )
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+
+    @property
+    def block_size(self) -> int:
+        # Read live: ``update_block_size_for_backend`` picks the backend's
+        # preferred page only once the layers exist, so it lands after this
+        # module is built. A value captured in ``__init__`` would stay at the
+        # 16-token default while the main KV spec reports the negotiated 64,
+        # and the two MLA specs would no longer group together.
+        return self.cache_config.block_size
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         # [B, H=1, N, C] -> [B, N, C]
@@ -220,6 +387,12 @@ class IluDeepseekV41IndexerCache(torch.nn.Module, AttentionLayerBase):
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         del vllm_config
+        if self.block_size % self.compress_ratio:
+            raise ValueError(
+                f"block_size {self.block_size} must be a multiple of "
+                f"compress_ratio {self.compress_ratio}, or a page would hold a "
+                f"fractional row (layer {self.prefix})"
+            )
         return MLAAttentionSpec(
             block_size=self.block_size,
             num_kv_heads=1,
@@ -228,7 +401,7 @@ class IluDeepseekV41IndexerCache(torch.nn.Module, AttentionLayerBase):
             # The indexer page shares a physical block with the main KV cache,
             # so it carries the same padding.
             alignment=512,
-            compress_ratio=self.compress_ratio,
+            tokens_per_state=self.compress_ratio,
         )
 
     def forward(self): ...
@@ -360,10 +533,16 @@ class IluDeepseekV41Indexer(nn.Module):
         # The slot mapping is compressed-domain, so the cache's second
         # dimension has to be the compressed row count the builder sized those
         # slots against, or the kernel's slot split lands on the wrong row.
-        assert k_cache.shape[1] * self.compress_ratio == self.k_cache.block_size, (
+        # Compare against the builder's own row count rather than deriving it
+        # from cache_config.block_size: the KV cache coordinator scales a
+        # group's manager block size up to equalize page sizes across groups,
+        # so the page can be wider than this layer's configured block.
+        assert k_cache.shape[1] == indexer_metadata.num_states, (
             f"indexer cache holds {k_cache.shape[1]} rows per page, but the "
-            f"slots were built for {self.k_cache.block_size} tokens at "
-            f"compress_ratio {self.compress_ratio}"
+            f"slots were built for {indexer_metadata.num_states} "
+            f"(cache shape {tuple(k_cache.shape)}, "
+            f"compress_ratio {self.compress_ratio}, "
+            f"prefix {self.k_cache.prefix})"
         )
         # ReplicatedLinear returns (output, bias); bias is None. Rows at
         # non-boundary tokens hold garbage latent and are skipped by the
@@ -414,7 +593,7 @@ class IluDeepseekV41Indexer(nn.Module):
                     + indexer_metadata.num_prefill_tokens
                 )
                 if num_tokens > 0:
-                    ixfops.v41_fill_short_context_topk(
+                    torch.ops._C.v41_fill_short_context_topk(
                         self.topk_indices_buffer[:num_tokens],
                         topk_lens[:num_tokens],
                         positions,
@@ -600,6 +779,19 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         self._o_proj_block_size = (
             32 if getattr(self.wo_a, "weight_block_size", None) == [1, 32] else 128
         )
+        # ``wo_a`` is contracted per output group, not as one flat linear, and
+        # the checkpoint stores it flat as
+        # ``[n_local_groups * o_lora_rank, heads_per_group * head_dim]``. These
+        # four numbers are the only part of that split a quant method cannot
+        # recover on its own (``output_partition_sizes`` carries the product
+        # alone), so hand them over for ``process_weights_after_loading``.
+        # Always set: a method that does not regroup simply ignores it.
+        self.wo_a.bmm_geom = SimpleNamespace(
+            n_local_groups=self.n_local_groups,
+            o_lora_rank=self.o_lora_rank,
+            heads_per_group=self.n_local_heads // self.n_local_groups,
+            head_dim=self.head_dim,
+        )
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
@@ -630,6 +822,33 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             compilation_config.static_forward_context[prefix] = self
         self.kv_cache = torch.tensor([])
         self._static_forward_context = compilation_config.static_forward_context
+
+        # A forwarder replicates a group that started on an earlier rank. It
+        # runs no compressor, but it owns both caches the group would have
+        # published locally: the compressed KV one through
+        # ``get_kv_cache_spec`` below, and this index-key one, which the
+        # consumers above it resolve through ``kv_source_layer_id``.
+        #
+        # Built before the indexer because the forwarder layer can be an index
+        # source itself -- a cut landing on 24 / 28 / 32 / 36, which is what an
+        # even pp=5 or pp=10 split does. Such a layer resolves its own prefix
+        # below, so the cache has to exist by then.
+        self.forwarder_indexer_cache: IluDeepseekV41IndexerCache | None = None
+        if self.is_kv_forwarder:
+            assert cache_config is not None
+            assert not self.is_kv_source, (
+                f"layer {layer_id} is its own kv source and cannot also forward one"
+            )
+            row_bytes, row_dtype = _indexer_k_cache_row(
+                config.index_head_dim, _INDEXER_KV_DTYPE
+            )
+            self.forwarder_indexer_cache = IluDeepseekV41IndexerCache(
+                head_dim=row_bytes,
+                dtype=row_dtype,
+                prefix=f"{prefix}.indexer.k_cache",
+                cache_config=cache_config,
+                compress_ratio=self.compress_ratio,
+            )
 
         self.indexer = None
         if self.is_index_source:
@@ -687,28 +906,6 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 candidate_write=is_candidate_source,
             )
 
-        # A forwarder replicates a group that started on an earlier rank. It
-        # runs no compressor and no indexer, but it owns both caches the group
-        # would have published locally: the compressed KV one through
-        # ``get_kv_cache_spec`` below, and this index-key one, which the
-        # consumers above it resolve through ``kv_source_layer_id``.
-        self.forwarder_indexer_cache: IluDeepseekV41IndexerCache | None = None
-        if self.is_kv_forwarder:
-            assert cache_config is not None
-            assert not self.is_kv_source, (
-                f"layer {layer_id} is its own kv source and cannot also forward one"
-            )
-            row_bytes, row_dtype = _indexer_k_cache_row(
-                config.index_head_dim, _INDEXER_KV_DTYPE
-            )
-            self.forwarder_indexer_cache = IluDeepseekV41IndexerCache(
-                head_dim=row_bytes,
-                dtype=row_dtype,
-                prefix=f"{prefix}.indexer.k_cache",
-                cache_config=cache_config,
-                compress_ratio=self.compress_ratio,
-            )
-
         assert cache_config is not None, "DeepseekV4 attention requires cache_config"
         # ---- Attention / KV-cache setup ----
         self.max_num_batched_tokens = (
@@ -731,24 +928,30 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             cache_config,
             "fp8_ds_mla",
         )
-        if self.kv_cache_torch_dtype is not torch.uint8:
-            # The plain-row store kernel exists and is tested, but nothing
-            # downstream reads such a cache: the sliding-window write goes
-            # through ``v41_qkv_rope_fp8_insert`` and the attention through
-            # ``ds4_sparse_mla_fp8_decode``, both of which take the packed
-            # 584-byte record only. Refusing here beats producing garbage.
-            raise NotImplementedError(
-                f"DeepSeek V4.1 on this platform stores the main KV as the "
-                f"packed fp8_ds_mla record; --kv-cache-dtype "
-                f"{cache_config.cache_dtype} would need a bf16 sliding-window "
-                "insert and a bf16 sparse-MLA decode, neither of which exists "
-                "yet. Use --kv-cache-dtype fp8 (or auto)."
-            )
-        self.swa_bytes_per_token = 584
         # Width and dtype of one record on the wire, for the dense buffers the
         # model allocates when a pipeline cut strands this layer's consumers.
         # These are the record's own shape, not the cache's page geometry.
-        self.main_transfer_width = self.swa_bytes_per_token
+        if self.kv_cache_torch_dtype is torch.uint8:
+            # Packed fp8_ds_mla: 448 E4M3 NoPE bytes, 64 BF16 RoPE values and
+            # 8 bytes of UE8M0 scales.
+            self.swa_bytes_per_token = 584
+            self.main_transfer_width = 584
+        elif self.kv_cache_torch_dtype is torch.bfloat16:
+            # Plain [448 NoPE | 64 RoPE] bf16 row, which is also the record
+            # width because the two coincide when nothing is packed.
+            self.swa_bytes_per_token = self.head_dim * 2
+            self.main_transfer_width = self.head_dim
+        else:
+            # The plain per-tensor-fp8 store kernel exists and is tested, but
+            # no reader on this platform takes that record: the window write
+            # and the sparse MLA both come in a packed-fp8 and a bf16 flavour
+            # and nothing else. Refusing here beats producing garbage.
+            raise NotImplementedError(
+                f"DeepSeek V4.1 stores the main KV as the packed fp8_ds_mla "
+                f"record or as a plain bf16 row; --kv-cache-dtype "
+                f"{cache_config.cache_dtype} is neither. Use fp8 (or auto) "
+                "for the packed record, bfloat16 for the plain one."
+            )
         self.main_transfer_dtype = self.kv_cache_torch_dtype
         (
             self.indexer_transfer_width,
@@ -782,7 +985,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             prefix=f"{prefix}.swa_cache",
             cache_config=cache_config,
             backend_cls=self.swa_backend_cls,
-            block_size=cache_config.block_size,
+            block_size=None,
             packed_bytes_per_token=self.swa_bytes_per_token,
             packed_page_alignment=self.kv_page_alignment,
             bounded_replay=swa_bounded_replay,
@@ -833,12 +1036,25 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             return None
         # Tied to the resolved record rather than restated, so the spec and the
         # tensor the store kernel writes cannot drift apart.
+        if self.kv_cache_dtype != "fp8_ds_mla":
+            # A plain row needs none of the packed record's bookkeeping: the
+            # page size follows from head_size and the element type, and there
+            # is no 64B-aligned block base to respect.
+            return MLAAttentionSpec(
+                block_size=vllm_config.cache_config.block_size,
+                num_kv_heads=1,
+                head_size=self.head_dim,
+                dtype=self.kv_cache_torch_dtype,
+                tokens_per_state=self.compress_ratio,
+                cache_dtype_str=self.kv_cache_dtype,
+                model_version=None,
+            )
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.kv_cache_torch_dtype,
-            compress_ratio=self.compress_ratio,
+            tokens_per_state=self.compress_ratio,
             cache_dtype_str=self.kv_cache_dtype,
             model_version="deepseek_v4",
             alignment=64,
@@ -941,12 +1157,37 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 indexer.indexer_op.candidate_blocks = candidate_idxs
 
     def _o_proj(self, o: torch.Tensor) -> torch.Tensor:
-        """Grouped output projection. One group per rank uses the fp8 linear."""
-        if self.n_local_groups != 1:
-            wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-            z = torch.einsum("bsgd,grd->bsgr", o.to(wo_a.dtype), wo_a)
-            return self.wo_b(z.flatten(2))
-        return self.wo_b(self.wo_a(o.flatten(0, -2)))
+        """Grouped output projection over ``[tokens, n_local_heads, head_dim]``.
+
+        The heads of one output group are contracted together, so what reaches
+        ``wo_a`` is ``[tokens, n_local_groups, heads_per_group * head_dim]``.
+
+        Which contraction runs depends on what the quant method left behind.
+        The Iluvatar-quantized checkpoint routes this layer to
+        ``IluV4W8A16BMMLinearMethod``, which repacks the INT8 weight into a
+        Marlin layout and *deletes* ``weight`` / ``weight_scale``; the einsum
+        below would have nothing to read, and ``marlin_w8a16`` applies the
+        per-(group, channel) scale itself against a bf16 activation. An
+        unquantized ``wo_a`` keeps its weight and takes the einsum.
+        """
+        if hasattr(self.wo_a, "W_repacked"):
+            z = ixfops.marlin_w8a16(
+                o.view(o.shape[0], self.n_local_groups, -1),
+                self.wo_a.W_repacked,
+                self.wo_a.W_scale_repacked,
+                group_size=-1,
+                format=self.wo_a.W_format,
+                batch_first=False,
+            )
+            return self.wo_b(z.flatten(1))
+        if self.n_local_groups == 1:
+            # One group is an ordinary linear; let it run its own apply.
+            return self.wo_b(self.wo_a(o.flatten(0, -2)))
+        w_view = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        z = torch.einsum(
+            "bgd,grd->bgr", o.view(o.shape[0], self.n_local_groups, -1), w_view
+        )
+        return self.wo_b(z.flatten(1))
 
     def forward(
         self,
@@ -967,11 +1208,8 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         self._prepare_and_attn(
             hidden_states, qr, kv, kv_score, indexer_weights, positions, attn_out
         )
-        num_tokens = hidden_states.shape[0]
         apply_rope(attn_out.unsqueeze(0), positions, self.cos_sin, inverse=True)
-        return self._o_proj(attn_out.view(1, num_tokens, self.n_local_groups, -1)).view(
-            num_tokens, -1
-        )
+        return self._o_proj(attn_out)
 
     def _run_parallel_input_projections(
         self, hidden_states: torch.Tensor
@@ -1026,7 +1264,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None
         ),
     ) -> torch.Tensor:
-        """RoPE q in place and publish kv as a packed fp8 window record."""
+        """RoPE q in place and publish kv as this layer's window record."""
         if not isinstance(attn_metadata, dict):
             return q
 
@@ -1035,7 +1273,12 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             attn_metadata.get(self.swa_cache_layer.prefix),
         )
         assert swa_metadata is not None
-        ixfops.v41_qkv_rope_fp8_insert(
+        insert = (
+            ixfops.v41_qkv_rope_fp8_insert
+            if self.kv_cache_dtype == "fp8_ds_mla"
+            else torch.ops._C.v41_qkv_rope_insert
+        )
+        insert(
             q,
             self.swa_cache_layer.kv_cache,
             kv,
@@ -1140,15 +1383,42 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             prefill_q = q[num_decode_tokens:]
             prefill_out = output[num_decode_tokens:]
 
-            self._forward_prefill(
-                q=prefill_q,
-                positions=positions[num_decode_tokens:],
-                compressed_k_cache=self_kv_cache,
-                swa_k_cache=swa_kv_cache,
-                output=prefill_out,
-                attn_metadata=flashmla_metadata if not swa_only else None,
-                swa_metadata=swa_metadata,
-            )
+            # Three prefill paths, same math, very different shapes. The
+            # default gathers the compressed pool and the window into one bf16
+            # workspace and runs a single sparse-MLA kernel over a combined
+            # index list. ``_opt`` skips the workspace and merges two paged
+            # attentions by LSE. ``_as_decode`` reuses the per-token decode
+            # kernel, which treats every query token as its own batch element
+            # -- fine for correctness, but the query side is large in prefill.
+            if envs.VLLM_ILU_DS4_PREFILL_AS_DECODE:
+                self._forward_prefill_as_decode(
+                    q=prefill_q,
+                    positions=positions[num_decode_tokens:],
+                    compressed_k_cache=self_kv_cache,
+                    output=prefill_out,
+                    attn_metadata=flashmla_metadata if not swa_only else None,
+                    swa_metadata=swa_metadata,
+                )
+            elif swa_metadata.prefill_swa_block_table is not None:
+                # Built only under VLLM_ILU_DS4_PREFILL_OPT, and not for a
+                # step that replays from mid-page (see the builder).
+                self._forward_prefill_opt(
+                    q=prefill_q,
+                    swa_k_cache=swa_kv_cache,
+                    output=prefill_out,
+                    swa_metadata=swa_metadata,
+                    compressed_k_cache=self_kv_cache,
+                    attn_metadata=flashmla_metadata if not swa_only else None,
+                )
+            else:
+                self._forward_prefill(
+                    q=prefill_q,
+                    compressed_k_cache=self_kv_cache,
+                    swa_k_cache=swa_kv_cache,
+                    output=prefill_out,
+                    attn_metadata=flashmla_metadata if not swa_only else None,
+                    swa_metadata=swa_metadata,
+                )
         if num_decodes > 0:
             decode_out = output[:num_decode_tokens]
             self._forward_decode(
@@ -1179,6 +1449,10 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 None,
                 index_weights,
             )
+            if _DBG_TOPK and self.topk_indices_buffer is not None:
+                _dbg_topk(
+                    self.prefix, index_q, index_weights, self.topk_indices_buffer
+                )
 
         self.forward_mqa(q, kv, positions, out)
 
@@ -1205,19 +1479,64 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             self._prefill_swa_lens = lens
         assert swa_metadata.token_to_req_indices is not None
         assert swa_metadata.is_valid_token is not None
-        ixfops.ds4_compute_swa_decode_indices_and_lens(
-            swa_indices=buf,
-            swa_lens=lens,
-            window_size=width,
-            query_start_loc=swa_metadata.query_start_loc,
-            seq_lens=swa_metadata.seq_lens,
-            token_to_req_indices=swa_metadata.token_to_req_indices,
-            is_valid_token=swa_metadata.is_valid_token,
-            block_table=swa_metadata.block_table,
-            block_size=swa_metadata.block_size,
-            num_decode_tokens=end,
+        assert swa_metadata.query_start_loc is not None
+        assert swa_metadata.seq_lens is not None
+        assert swa_metadata.replay_start is not None
+        torch.ops._C.v41_swa_indices_and_lens(
+            buf,
+            lens,
+            swa_metadata.query_start_loc,
+            swa_metadata.seq_lens,
+            swa_metadata.token_to_req_indices,
+            swa_metadata.is_valid_token,
+            swa_metadata.block_table,
+            swa_metadata.replay_start,
+            width,
+            swa_metadata.block_size,
+            end,
         )
         return buf[begin:end], lens[begin:end]
+
+    def _sparse_mla(
+        self,
+        q: torch.Tensor,
+        swa_indices: torch.Tensor,
+        swa_lens: torch.Tensor,
+        extra_cache: torch.Tensor | None,
+        extra_indices: torch.Tensor | None,
+        extra_lens: torch.Tensor | None,
+        output: torch.Tensor,
+    ) -> None:
+        """Sparse MLA over the window and, for compressed layers, the top-k.
+
+        Both kernels below are per-token -- every query token is its own batch
+        element with ``s_q = 1`` -- so prefill goes through them too, with the
+        window indices :meth:`_window_indices` recomputes for its token range.
+        They differ in the record they read: the packed fp8_ds_mla row wants a
+        packed and per-(token, head) quantized query, while the plain bf16 row
+        takes the query as it is and the caches with an explicit single-KV-head
+        axis.
+        """
+        if self.kv_cache_dtype == "fp8_ds_mla":
+            self._sparse_fp8_mla(
+                q, swa_indices, swa_lens, extra_cache, extra_indices,
+                extra_lens, output,
+            )
+            return
+        ixfops.ds4_flash_mla_with_kvcache(
+            q=q.unsqueeze(1),
+            k_cache=self.swa_cache_layer.kv_cache.unsqueeze(-2),
+            indices=_batched_index_rows(swa_indices),
+            topk_length=swa_lens,
+            sm_scale=self.scale,
+            attn_sink=self.attn_sink,
+            extra_k_cache=None if extra_cache is None else extra_cache.unsqueeze(-2),
+            extra_indices=(
+                None if extra_indices is None else _batched_index_rows(extra_indices)
+            ),
+            extra_topk_length=extra_lens,
+            output=output.unsqueeze(1),
+        )
 
     def _sparse_fp8_mla(
         self,
@@ -1284,7 +1603,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             extra_cache = kv_cache
         assert swa_metadata.decode_swa_indices is not None
         assert swa_metadata.decode_swa_lens is not None
-        self._sparse_fp8_mla(
+        self._sparse_mla(
             q,
             swa_metadata.decode_swa_indices,
             swa_metadata.decode_swa_lens,
@@ -1294,17 +1613,25 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             output,
         )
 
-    def _forward_prefill(
+    def _forward_prefill_as_decode(
         self,
         q: torch.Tensor,
         positions: torch.Tensor,
         compressed_k_cache: torch.Tensor | None,
-        swa_k_cache: torch.Tensor,
         output: torch.Tensor,
         attn_metadata: IluDeepseekV4FlashMLAMetadata | None,
         swa_metadata: DeepseekSparseSWAMetadata,
     ) -> None:
-        del swa_k_cache
+        """Prefill through the per-token decode kernel.
+
+        Well-defined because the window and the compressed top-k are sourced
+        purely by position, so a prefill token asks for exactly what it would
+        ask for as a decode token. The query side is the catch: every token
+        becomes its own batch element with ``s_q = 1``, which throws away the
+        shared-K reuse a real prefill kernel gets across a request's tokens.
+        Kept behind ``VLLM_ILU_DS4_PREFILL_AS_DECODE`` as the reference the
+        other two paths are checked against.
+        """
         swa_only = self.compress_ratio == 0
         if not swa_only and self.compress_ratio not in (1, 2):
             raise ValueError(
@@ -1333,7 +1660,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 self.compress_ratio,
             )
             extra_cache = compressed_k_cache
-        self._sparse_fp8_mla(
+        self._sparse_mla(
             q,
             swa_indices,
             swa_lens,
@@ -1341,4 +1668,291 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             extra_indices,
             extra_lens,
             output,
+        )
+
+    def _gather_k_cache(
+        self,
+        out: torch.Tensor,
+        k_cache: torch.Tensor,
+        seq_lens: torch.Tensor,
+        gather_lens: torch.Tensor | None,
+        block_table: torch.Tensor,
+        block_size: int,
+        offset: int,
+    ) -> None:
+        """Gather a paged K cache into the bf16 workspace.
+
+        The packed fp8_ds_mla record has to be dequantized on the way out; a
+        plain bf16 row is copied as it is.
+        """
+        gather = (
+            ixfops.ds4_gather_fp8_k_cache
+            if self.kv_cache_dtype == "fp8_ds_mla"
+            else ixfops.ds4_gather_k_cache
+        )
+        gather(
+            out=out,
+            k_cache=k_cache,
+            seq_lens=seq_lens,
+            gather_lens=gather_lens,
+            block_table=block_table,
+            block_size=block_size,
+            offset=offset,
+        )
+
+    def _forward_prefill(
+        self,
+        q: torch.Tensor,
+        compressed_k_cache: torch.Tensor | None,
+        swa_k_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: IluDeepseekV4FlashMLAMetadata | None,
+        swa_metadata: DeepseekSparseSWAMetadata,
+    ) -> None:
+        """Prefill via a gathered workspace and one sparse-MLA kernel.
+
+        Port of V4's ``_forward_prefill`` to the V4.1 ratios (0 / 1 / 2). Per
+        chunk of ``PREFILL_CHUNK_SIZE`` requests, a row of the workspace holds
+        the compressed pool in ``[0, N)`` and the sliding window at ``[N, ...)``;
+        :func:`ds4_combine_topk_swa_indices` then rewrites the indexer's
+        per-request compressed row ids and the window into that row's
+        coordinates and concatenates them, so one
+        :func:`ds4_flash_mla_sparse_fwd` covers both.
+
+        ``N`` is the whole compressed pool, not ``top_k``: the indices the
+        indexer produces range over the request's compressed rows, and the
+        workspace has to be addressable at all of them. At ratio 1 that makes
+        the row ``max_model_len`` wide, which is the price this path pays for
+        not touching the paged caches during attention --
+        :meth:`_forward_prefill_opt` is the variant that skips the workspace.
+
+        ``attn_metadata`` is ``None`` on a sliding-window-only layer; the loop
+        then gathers the window alone and hands the combiner
+        ``compress_ratio=1, top_k=0, N=0`` so the layout collapses to pure SWA.
+        """
+        swa_only = attn_metadata is None
+        if not swa_only and self.compress_ratio not in (1, 2):
+            raise ValueError(
+                f"Unsupported compress_ratio={self.compress_ratio}; expected 0, 1, or 2."
+            )
+
+        num_prefills = swa_metadata.num_prefills
+        num_prefill_tokens = swa_metadata.num_prefill_tokens
+        num_decodes = swa_metadata.num_decodes
+        num_decode_tokens = swa_metadata.num_decode_tokens
+
+        seq_lens = swa_metadata.prefill_seq_lens
+        gather_lens = swa_metadata.prefill_gather_lens
+        assert seq_lens is not None
+        assert gather_lens is not None
+
+        query_start_loc_cpu = swa_metadata.query_start_loc_cpu
+        query_start_loc = swa_metadata.query_start_loc
+        assert query_start_loc_cpu is not None
+        assert query_start_loc is not None
+        prefill_token_base = query_start_loc_cpu[num_decodes]
+
+        assert self.topk_indices_buffer is not None
+        topk_indices = self.topk_indices_buffer[num_decode_tokens:]
+        if swa_only:
+            # Unused when ``top_k == 0``, but the combiner still shape-checks a
+            # 2D int32 buffer. Slice on dim 0 only so it stays contiguous.
+            top_k = 0
+            N = 0
+        else:
+            topk_indices = topk_indices[:num_prefill_tokens]
+            top_k = topk_indices.shape[-1]
+            N = (self.max_model_len + self.compress_ratio - 1) // self.compress_ratio
+
+        # Workspace row stride: compressed pool, then the window, then room for
+        # the in-batch query rows the sparse kernel reads.
+        M = N + self.window_size + self.max_num_batched_tokens
+        num_chunks = (num_prefills + PREFILL_CHUNK_SIZE - 1) // PREFILL_CHUNK_SIZE
+
+        (kv,) = current_workspace_manager().get_simultaneous(
+            ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+        )
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * PREFILL_CHUNK_SIZE
+            chunk_end = min(chunk_start + PREFILL_CHUNK_SIZE, num_prefills)
+            chunk_size = chunk_end - chunk_start
+
+            if not swa_only:
+                assert attn_metadata is not None
+                assert compressed_k_cache is not None
+                block_table = attn_metadata.block_table[num_decodes:]
+                self._gather_k_cache(
+                    kv[:chunk_size],
+                    compressed_k_cache,
+                    seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
+                    gather_lens=None,
+                    block_table=block_table[chunk_start:chunk_end],
+                    block_size=attn_metadata.block_size // self.compress_ratio,
+                    offset=0,
+                )
+
+            swa_block_table = swa_metadata.block_table[num_decodes:]
+            self._gather_k_cache(
+                kv[:chunk_size],
+                swa_k_cache,
+                seq_lens=seq_lens[chunk_start:chunk_end],
+                gather_lens=gather_lens[chunk_start:chunk_end],
+                block_table=swa_block_table[chunk_start:chunk_end],
+                block_size=swa_metadata.block_size,
+                offset=N,
+            )
+
+            query_start = (
+                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
+            )
+            query_end = (
+                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
+            )
+
+            combined_indices, combined_lens = ixfops.ds4_combine_topk_swa_indices(
+                topk_indices[query_start:query_end],
+                query_start_loc[
+                    num_decodes + chunk_start : num_decodes + chunk_end + 1
+                ],
+                seq_lens[chunk_start:chunk_end],
+                gather_lens[chunk_start:chunk_end],
+                self.window_size,
+                self.compress_ratio if not swa_only else 1,
+                top_k,
+                M,
+                N,
+            )
+
+            ixfops.ds4_flash_mla_sparse_fwd(
+                q=q[query_start:query_end],
+                kv=kv.view(-1, 1, q.shape[-1]),
+                indices=combined_indices.unsqueeze(1),
+                sm_scale=self.scale,
+                attn_sink=self.attn_sink,
+                topk_length=combined_lens,
+                output=output[query_start:query_end],
+            )
+
+    def _forward_prefill_opt(
+        self,
+        q: torch.Tensor,
+        swa_k_cache: torch.Tensor,
+        output: torch.Tensor,
+        swa_metadata: DeepseekSparseSWAMetadata,
+        compressed_k_cache: torch.Tensor | None = None,
+        attn_metadata: IluDeepseekV4FlashMLAMetadata | None = None,
+    ) -> None:
+        """Prefill straight off the paged caches, no workspace.
+
+        A sliding-window-only layer is one windowed attention. A compressed
+        layer (ratio 1 or 2) is two attentions over disjoint key sets --
+        window and compressed top-k -- merged by log-sum-exp, which is exactly
+        a single softmax over their union.
+        """
+        if self.compress_ratio == 0:
+            self._prefill_swa_only(q, swa_k_cache, output, swa_metadata)
+            return
+        if self.compress_ratio not in (1, 2):
+            raise ValueError(
+                f"Unsupported compress_ratio={self.compress_ratio} in "
+                "_forward_prefill_opt; expected 0, 1, or 2."
+            )
+        assert compressed_k_cache is not None
+        assert attn_metadata is not None
+        self._prefill_compressed(
+            q,
+            swa_k_cache,
+            output,
+            swa_metadata,
+            compressed_k_cache,
+            attn_metadata,
+        )
+
+    def _prefill_swa_only(
+        self,
+        q: torch.Tensor,
+        swa_k_cache: torch.Tensor,
+        output: torch.Tensor,
+        swa_metadata: DeepseekSparseSWAMetadata,
+    ) -> None:
+        """Sliding-window attention with the sink, written into ``output``."""
+        ixfops.ds4_swa_attn_fwd(
+            q=q,
+            kv_cache=swa_k_cache,
+            block_table=swa_metadata.prefill_swa_block_table,
+            cu_seqlens_q=swa_metadata.prefill_cu_seqlens_q,
+            cu_seqlens_k=swa_metadata.prefill_cu_seqlens_k,
+            max_seqlen_q=swa_metadata.prefill_max_seqlen_q,
+            max_seqlen_k=swa_metadata.prefill_max_seqlen_k,
+            window_size=self.window_size,
+            sm_scale=self.scale,
+            attn_sink=self.attn_sink,
+            output=output,
+        )
+
+    def _prefill_compressed(
+        self,
+        q: torch.Tensor,
+        swa_k_cache: torch.Tensor,
+        output: torch.Tensor,
+        swa_metadata: DeepseekSparseSWAMetadata,
+        compressed_k_cache: torch.Tensor,
+        attn_metadata: IluDeepseekV4FlashMLAMetadata,
+    ) -> None:
+        """Paged sparse-compressed + window attention, merged by LSE."""
+        num_decodes = swa_metadata.num_decodes
+        num_decode_tokens = swa_metadata.num_decode_tokens
+        num_prefill_tokens = swa_metadata.num_prefill_tokens
+        cu_seqlens_q = swa_metadata.prefill_cu_seqlens_q
+        cu_seqlens_k = swa_metadata.prefill_cu_seqlens_k
+        prefill_seq_lens = swa_metadata.prefill_seq_lens
+        assert cu_seqlens_q is not None
+        assert cu_seqlens_k is not None
+        assert prefill_seq_lens is not None
+        _audit_prefill_slots(self, swa_metadata, attn_metadata)
+
+        # The sink belongs to the union, so it enters once, at the merge; this
+        # half must not fold it into its own denominator.
+        o_swa, lse_swa = ixfops.ds4_swa_attn_fwd(
+            q=q,
+            kv_cache=swa_k_cache,
+            block_table=swa_metadata.prefill_swa_block_table,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=swa_metadata.prefill_max_seqlen_q,
+            max_seqlen_k=swa_metadata.prefill_max_seqlen_k,
+            window_size=self.window_size,
+            sm_scale=self.scale,
+            attn_sink=None,
+        )
+
+        assert self.topk_indices_buffer is not None
+        topk_indices = self.topk_indices_buffer[
+            num_decode_tokens : num_decode_tokens + num_prefill_tokens
+        ]
+
+        # The kernel resolves the indexer's per-request compressed row ids
+        # against the block table itself and derives each token's causal
+        # top-k length from cu_seqlens_q / seq_lens / compress_ratio, so no
+        # global-index pass is needed here.
+        o_cmp, lse_cmp = ixfops.ds4_paged_sparse_attn_fwd(
+            q=q,
+            kv_cache=compressed_k_cache,
+            block_table=attn_metadata.block_table[num_decodes:],
+            topk_indices=topk_indices,
+            cu_seqlens_q=cu_seqlens_q,
+            seq_lens=prefill_seq_lens,
+            compress_ratio=self.compress_ratio,
+            block_size=attn_metadata.block_size // self.compress_ratio,
+            sm_scale=self.scale,
+            return_lse=True,
+        )
+
+        ixfops.ds4_merge_attn_outputs(
+            output,
+            o_cmp,
+            lse_cmp,
+            o_swa,
+            lse_swa,
+            attn_sink=self.attn_sink,
         )

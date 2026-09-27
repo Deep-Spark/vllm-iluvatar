@@ -6,6 +6,15 @@ from __future__ import annotations
 import ixformer.inference.functions as ixfops
 import torch
 
+# The two streaming variants were renamed between ixformer releases; the
+# arguments never changed. Resolve once so the plugin runs against either.
+_mhc_pre_sqrsum = getattr(
+    ixfops, "ds4_v41_mhc_pre_sqrsum", None
+) or ixfops.ds4_v41_mhc_pre_1pass
+_mhc_post_sqrsum = getattr(
+    ixfops, "ds4_v41_mhc_post", None
+) or ixfops.ds4_v41_mhc_post_sqrsum
+
 
 def hc_split_sinkhorn(
     mixes: torch.Tensor,
@@ -88,7 +97,7 @@ def hc_pre_mixes(
             pre_mix_in,
         )
     else:
-        post, comb, layer_input, pre_out = ixfops.ds4_v41_mhc_pre_sqrsum(
+        post, comb, layer_input, pre_out = _mhc_pre_sqrsum(
             x.contiguous(),
             fn,
             hc_scale,
@@ -133,7 +142,7 @@ def hc_post_sqrsum(
     to :func:`hc_pre_mixes` as ``sqrsum`` -- but only if nothing rewrites the
     residual in between.
     """
-    return ixfops.ds4_v41_mhc_post(
+    return _mhc_post_sqrsum(
         x.contiguous(),
         residual.contiguous(),
         post.contiguous(),

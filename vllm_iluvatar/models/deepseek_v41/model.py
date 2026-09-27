@@ -45,6 +45,7 @@ from vllm_iluvatar.models.deepseek_v41.engram import (
     engram_dp_group,
 )
 from vllm_iluvatar.models.deepseek_v41.pp_plan import build_rank_plan, local_kv_source
+from vllm_iluvatar.models.deepseek_v41.weight_dump import start_weight_dump_server
 
 logger = init_logger(f"vllm.{__name__}")
 
@@ -261,11 +262,15 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
         self.engram_layer_ids = list(getattr(config, "engram_layer_ids", ()) or ())
         self.engram_layout: EngramLayout | None = None
         self.engram_hash: NgramHashState | None = None
-        if not self.engram_layer_ids:
-            return
-        model_config = vllm_config.model_config
-        self.model_path = model_config.model
-        self._build_engram(config, model_config)
+        if self.engram_layer_ids:
+            model_config = vllm_config.model_config
+            self.model_path = model_config.model
+            self._build_engram(config, model_config)
+        # Flipped at the end of load_weights. The listener is up before that,
+        # and it refuses a snapshot until this is set.
+        self._weights_ready = False
+        # One port per worker. Snapshots are taken from outside, twice.
+        start_weight_dump_server(self)
 
     # ---- construction -----------------------------------------------------
 
@@ -284,6 +289,14 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
             compress_ratios,
             pp.rank_in_group,
             pp.world_size,
+            # -1 unless a shortlist is actually allocated, so the plan and
+            # ``_bind_index_buffers`` cannot disagree about whether there is
+            # anything to carry.
+            candidate_source=(
+                int(getattr(config, "candidate_source_layer_id", -1))
+                if int(getattr(config, "candidate_topk_blocks", 0)) > 0
+                else -1
+            ),
         )
         self.pp_plan = plan
         self.start_layer, self.end_layer = plan.start_layer, plan.end_layer
@@ -514,6 +527,13 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
                 dtype=torch.int32,
                 device=device,
             )
+        if self.pp_plan.transfers_candidates:
+            assert self.candidate_idxs_buffer is not None
+            tensors["candidates"] = torch.zeros(
+                (batch_size, self.candidate_idxs_buffer.shape[1]),
+                dtype=torch.int32,
+                device=device,
+            )
         return IntermediateTensors(tensors)
 
     def _accept_remote_kv(
@@ -539,6 +559,22 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
             num_tokens = main_rows.shape[0]
             self.main_kv_rows[:num_tokens].copy_(main_rows)
             self.indexer_kv_rows[:num_tokens].copy_(indexer_rows)
+
+    def _accept_remote_candidates(
+        self, intermediate_tensors: IntermediateTensors
+    ) -> None:
+        """Take over the shortlist published on an earlier rank.
+
+        Unconditional on every rank that carries it, forwarder or not: a rank
+        with no index source of its own still has to hand the shortlist to the
+        next one, and copying into the local buffer is what makes the send at
+        the end of :meth:`forward` pick it up.
+        """
+        rows = intermediate_tensors.tensors.get("candidates")
+        if rows is None or self.candidate_idxs_buffer is None:
+            return
+        num_tokens = rows.shape[0]
+        self.candidate_idxs_buffer[:num_tokens].copy_(rows)
 
     def _engram_layers(self):
         for layer in islice(self.layers, self.start_layer, self.end_layer):
@@ -621,6 +657,7 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
             # Before any layer runs: the stranded group's caches have to hold
             # this step's rows by the time the first consumer reads them.
             self._accept_remote_kv(intermediate_tensors, positions)
+            self._accept_remote_candidates(intermediate_tensors)
 
         self._prepare_engram(input_ids, positions)
         residual = post_mix = res_mix = None
@@ -660,6 +697,12 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
                 # buffer, so at the end of the rank it already holds the
                 # latest selection -- this rank's, or the one it took over.
                 tensors["topk"] = self.topk_indices_buffer[:num_tokens]
+            if self.pp_plan.transfers_candidates:
+                # Same story as the top-k: whichever rank last wrote the
+                # shortlist left it in this buffer, so the send needs no
+                # designated sender.
+                assert self.candidate_idxs_buffer is not None
+                tensors["candidates"] = self.candidate_idxs_buffer[:num_tokens]
             return IntermediateTensors(tensors)
         hidden_states = mhc.hc_pre(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)
@@ -697,6 +740,7 @@ class IluDeepseekV41ForCausalLM(IluDeepseekV4Fp8ForCausalLM, SupportsEagle3):
         )
         if getattr(self.model, "engram_layer_ids", None):
             self.model.load_engram_weights()
+        self.model._weights_ready = True
         return loaded
 
     @property
@@ -716,6 +760,37 @@ class IluDeepseekV41ForCausalLM(IluDeepseekV4Fp8ForCausalLM, SupportsEagle3):
             "hidden states instead of the pre-hc_head residual"
         )
 
+    @staticmethod
+    def get_model_state_cls():
+        """Community V4.1 state, for SWA bounded replay.
+
+        ``CacheConfig.swa_bounded_replay`` keeps the sliding-window KV out of
+        prefix caching and rebuilds it after a prefix hit by recomputing the
+        hit's last window. The scheduler tells each request where that replay
+        starts; this state is what carries it into the batch -- it pads the
+        replayed tokens' slots in the prefix-cacheable groups so their cached KV
+        is left alone, and hands the starts to the sliding-window metadata
+        builder (``IluDeepseekSparseSWAMetadataBuilder`` subclasses the
+        community one, which is what the state dispatches on).
+        """
+        from vllm.models.deepseek_v41.nvidia.model_state import (
+            DeepseekV41ModelState,
+        )
+
+        return DeepseekV41ModelState
+
+    @property
+    def token_lookback_depth(self) -> int:
+        """Zero: this model needs no runner-gathered lookback window.
+
+        Community V4.1 has the runner gather the ids preceding each chunk start
+        for the engram n-gram hash. Here ``IluEngram`` keeps its own paged slot
+        cache of token ids and reads the window from that (see
+        ``engram.lookback_paged``), so there is nothing for the runner to
+        gather. Only the state's bounded-replay half is wanted.
+        """
+        return 0
+
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model.aux_hidden_state_layers = tuple(layers)
 
@@ -726,7 +801,15 @@ class IluDeepseekV41ForCausalLM(IluDeepseekV4Fp8ForCausalLM, SupportsEagle3):
 def register_model() -> None:
     from vllm import ModelRegistry
 
-    ModelRegistry.register_model(
-        "DeepseekV41ForCausalLM",
-        "vllm_iluvatar.models.deepseek_v41.model:IluDeepseekV41ForCausalLM",
-    )
+    # Two names, one class. ``DeepseekV41ForCausalLM`` is what the released
+    # raw-FP8 checkpoint declares; the Iluvatar-quantized conversions declare
+    # ``IluDeepseekV41ForCausalLM``, following the V4 convention where the
+    # ``Ilu`` prefix marks a checkpoint quantized for this platform. The two
+    # differ only in ``quantization_config`` -- compressed-tensors
+    # ``iluvatar-mixed`` versus raw FP8 -- which already selects the quant
+    # method per layer, and in module names they agree.
+    for arch in ("DeepseekV41ForCausalLM", "IluDeepseekV41ForCausalLM"):
+        ModelRegistry.register_model(
+            arch,
+            "vllm_iluvatar.models.deepseek_v41.model:IluDeepseekV41ForCausalLM",
+        )

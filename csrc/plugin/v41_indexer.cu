@@ -5,6 +5,8 @@
 //   v41_indexer_q_rope            -- RoPE + weight rescale, BF16 query in place
 //   v41_indexer_q_rope_fp8        -- RoPE + true E4M3 quant, q_scale folded into
 //                                    the weights
+//   v41_fill_short_context_topk   -- the identity selection, when the whole
+//                                    compressed context fits in topk
 //
 // The K side mirrors ``off/vllm/vllm/models/deepseek_v41/common/ops/
 // indexer_k_store.py`` and the Q side ``off/vllm/vllm/models/deepseek_v4/
@@ -254,6 +256,36 @@ __global__ void v41_indexer_q_rope_fp8_kernel(
 }
 #endif  // ILUVATAR_HAS_FP8_FP4
 
+// ---------------------------------------------------------------------------
+// A4: the short-context bypass
+// ---------------------------------------------------------------------------
+
+// When a layer's whole compressed context fits in ``topk``, the selection is
+// forced: every group is picked whatever it scores, so the q projection, RoPE,
+// quantization and paged scoring can all be skipped and the top-k written
+// outright. Mirrors the reference's ``_fill_short_context_topk_indices``, with
+// the companion ``topk_lens`` this platform's sparse kernels take.
+//
+// One block per token, striding over the row: V4.1's topk is 512.
+__global__ void v41_fill_short_context_topk_kernel(
+    int32_t* __restrict__ topk_idxs, int64_t idxs_stride,
+    int32_t* __restrict__ topk_lens, const void* __restrict__ positions,
+    bool positions_are_int64, int topk, int compress_ratio) {
+  const int64_t token = blockIdx.x;
+  const int64_t pos = load_index(positions, positions_are_int64, token);
+  // A token sees this many groups under causality. A negative position is
+  // graph-capture padding and yields an empty row.
+  const int64_t groups = pos < 0 ? 0 : (pos + 1) / compress_ratio;
+
+  for (int j = threadIdx.x; j < topk; j += blockDim.x) {
+    topk_idxs[token * idxs_stride + j] = j < groups ? j : -1;
+  }
+  if (threadIdx.x == 0) {
+    topk_lens[token] =
+        static_cast<int32_t>(groups < topk ? groups : topk);
+  }
+}
+
 void check_index_tensor(const torch::Tensor& t, const char* name) {
   TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
   TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
@@ -471,6 +503,42 @@ std::tuple<torch::Tensor, torch::Tensor> v41_indexer_q_rope_fp8_meta(
   return {torch::empty(q.sizes(), q.options().dtype(torch::kFloat8_e4m3fn)),
           torch::empty(weights_in.sizes(),
                        weights_in.options().dtype(torch::kFloat32))};
+}
+
+void v41_fill_short_context_topk(torch::Tensor& topk_idxs,
+                                 torch::Tensor& topk_lens,
+                                 torch::Tensor& positions,
+                                 int64_t compress_ratio) {
+  TORCH_CHECK(compress_ratio == 1 || compress_ratio == 2,
+              "compress_ratio must be 1 or 2, got ", compress_ratio);
+  TORCH_CHECK(topk_idxs.is_cuda() && topk_idxs.dim() == 2 &&
+                  topk_idxs.scalar_type() == at::kInt &&
+                  topk_idxs.stride(1) == 1,
+              "topk_idxs must be a 2D int32 CUDA tensor [T, topk] with a "
+              "contiguous last dim");
+  TORCH_CHECK(topk_lens.is_cuda() && topk_lens.dim() == 1 &&
+                  topk_lens.is_contiguous() &&
+                  topk_lens.scalar_type() == at::kInt,
+              "topk_lens must be a contiguous 1D int32 CUDA tensor");
+  check_index_tensor(positions, "positions");
+
+  const int64_t num_tokens = topk_idxs.size(0);
+  TORCH_CHECK(topk_lens.numel() >= num_tokens &&
+                  positions.numel() >= num_tokens,
+              "topk_lens / positions are shorter than topk_idxs' token count");
+  if (num_tokens == 0) {
+    return;
+  }
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(topk_idxs));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  constexpr unsigned kFillThreads = 256;
+  v41_fill_short_context_topk_kernel<<<static_cast<unsigned>(num_tokens),
+                                      kFillThreads, 0, stream>>>(
+      topk_idxs.data_ptr<int32_t>(), topk_idxs.stride(0),
+      topk_lens.data_ptr<int32_t>(), positions.data_ptr(),
+      positions.scalar_type() == at::kLong,
+      static_cast<int>(topk_idxs.size(1)), static_cast<int>(compress_ratio));
 }
 
 }  // namespace vllm_iluvatar

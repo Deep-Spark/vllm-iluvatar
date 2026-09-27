@@ -85,10 +85,20 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
       "Tensor kv_score, Tensor slot_mapping, Tensor rms_norm_weight, "
       "float rms_norm_eps, Tensor! latent_out) -> ()");
   ops.def(
+      "v41_compress_pool_norm("
+      "Tensor kv_score, Tensor positions, Tensor! state_cache, "
+      "Tensor slot_mapping, Tensor query_start_loc, "
+      "Tensor token_to_req_indices, Tensor rms_norm_weight, "
+      "float rms_norm_eps, Tensor! latent_out) -> ()");
+  ops.def(
       "v41_rope_insert("
       "Tensor latent, Tensor positions, Tensor cos_sin_cache, "
       "Tensor! kv_cache, Tensor slot_mapping, int compress_ratio, "
       "Tensor(a!)? row_out=None) -> ()");
+  ops.def(
+      "v41_qkv_rope_insert("
+      "Tensor! q, Tensor! kv_cache, Tensor! kv, Tensor slot_mapping, "
+      "Tensor positions, Tensor cos_sin_cache) -> ()");
   ops.def(
       "v41_indexer_k_norm_rope_store("
       "Tensor k_pre, Tensor positions, Tensor cos_sin_cache, "
@@ -100,6 +110,14 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
       "Tensor rows, Tensor! kv_cache, Tensor slot_mapping, "
       "Tensor positions, int compress_ratio) -> ()");
   ops.def(
+      "v41_candidate_block_scores("
+      "Tensor logits, Tensor? row_ks, Tensor row_ke, int block_size, "
+      "int row_repeat) -> Tensor");
+  ops.def(
+      "v41_apply_candidate_mask("
+      "Tensor! logits, Tensor? row_ks, Tensor row_ke, "
+      "Tensor candidate_blocks, int block_size, int row_repeat) -> ()");
+  ops.def(
       "v41_indexer_q_rope("
       "Tensor! q, Tensor positions, Tensor cos_sin_cache, Tensor weights_in, "
       "Tensor! weights_out, float weights_scale) -> ()");
@@ -107,6 +125,21 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
       "v41_indexer_q_rope_fp8("
       "Tensor q, Tensor positions, Tensor cos_sin_cache, Tensor weights_in, "
       "float weights_scale) -> (Tensor, Tensor)");
+  ops.def(
+      "v41_fill_short_context_topk("
+      "Tensor! topk_idxs, Tensor! topk_lens, Tensor positions, "
+      "int compress_ratio) -> ()");
+  ops.def(
+      "v41_swa_indices_and_lens("
+      "Tensor! swa_indices, Tensor! swa_lens, Tensor query_start_loc, "
+      "Tensor seq_lens, Tensor token_to_req_indices, Tensor is_valid_token, "
+      "Tensor block_table, Tensor replay_start, int window_size, "
+      "int block_size, int num_tokens) -> ()");
+  ops.def(
+      "v41_swa_prefill_gather_lens("
+      "Tensor! prefill_gather_lens, Tensor seq_lens, Tensor query_start_loc, "
+      "Tensor replay_start, int num_prefills, int num_decodes, "
+      "int window_size) -> ()");
   ops.def("weak_ref_tensor(Tensor input) -> Tensor");
   ops.def("get_cuda_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor");
   // DeepSeek-V4.1 Engram: slot-cache write, fused lookback+ngram hash,
@@ -147,14 +180,26 @@ TORCH_LIBRARY_IMPL_EXPAND(_C, CUDA, ops) {
   ops.impl("minimax_qk_var", &vllm_iluvatar::minimax_qk_var);
   ops.impl("minimax_qk_rms_apply", &vllm_iluvatar::minimax_qk_rms_apply);
   ops.impl("v41_compress_norm_cr1", &vllm_iluvatar::v41_compress_norm_cr1);
+  ops.impl("v41_compress_pool_norm", &vllm_iluvatar::v41_compress_pool_norm);
   ops.impl("v41_rope_insert", &vllm_iluvatar::v41_rope_insert);
+  ops.impl("v41_qkv_rope_insert", &vllm_iluvatar::v41_qkv_rope_insert);
   ops.impl("v41_indexer_k_norm_rope_store",
            &vllm_iluvatar::v41_indexer_k_norm_rope_store);
   ops.impl("v41_move_rows_to_paged_cache",
            &vllm_iluvatar::v41_move_rows_to_paged_cache);
+  ops.impl("v41_candidate_block_scores",
+           &vllm_iluvatar::v41_candidate_block_scores);
+  ops.impl("v41_apply_candidate_mask",
+           &vllm_iluvatar::v41_apply_candidate_mask);
   ops.impl("v41_indexer_q_rope", &vllm_iluvatar::v41_indexer_q_rope);
   ops.impl("v41_indexer_q_rope_fp8",
            &vllm_iluvatar::v41_indexer_q_rope_fp8);
+  ops.impl("v41_fill_short_context_topk",
+           &vllm_iluvatar::v41_fill_short_context_topk);
+  ops.impl("v41_swa_indices_and_lens",
+           &vllm_iluvatar::v41_swa_indices_and_lens);
+  ops.impl("v41_swa_prefill_gather_lens",
+           &vllm_iluvatar::v41_swa_prefill_gather_lens);
   // Aliasing a CUDA tensor's storage; registered on the CUDA key like upstream.
   ops.impl("weak_ref_tensor", &vllm_iluvatar::weak_ref_tensor);
   ops.impl("engram_write_hash_cache", &vllm_iluvatar::engram_write_hash_cache);

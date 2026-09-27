@@ -189,6 +189,21 @@ void v41_compress_norm_cr1(torch::Tensor& kv_score,
                            torch::Tensor& rms_norm_weight, double rms_norm_eps,
                            torch::Tensor& latent_out);
 
+// Ratio-2 compressor latent: pool each closed group of two into one row, then
+// the same RMSNorm. ``state_cache`` is the per-request ring of the open group's
+// [kv | score] rows, addressed by ``slot_mapping``'s
+// ``block * rows_per_page + position % rows_per_page``. A group that a chunk's
+// first token closes takes its predecessor from the ring; every other group is
+// pooled from ``kv_score`` directly, so one ring block per request is enough.
+// The chunk's last ``rows_per_page`` rows are saved for the next chunk.
+void v41_compress_pool_norm(torch::Tensor& kv_score, torch::Tensor& positions,
+                            torch::Tensor& state_cache,
+                            torch::Tensor& slot_mapping,
+                            torch::Tensor& query_start_loc,
+                            torch::Tensor& token_to_req_indices,
+                            torch::Tensor& rms_norm_weight,
+                            double rms_norm_eps, torch::Tensor& latent_out);
+
 // ``row_out``, on both store ops below, additionally mirrors the record in
 // token order into a dense ``[num_tokens, record_width]`` buffer. That buffer
 // is what crosses a pipeline boundary when a KV group is split across ranks,
@@ -202,6 +217,17 @@ void v41_rope_insert(torch::Tensor& latent, torch::Tensor& positions,
                      torch::Tensor& cos_sin_cache, torch::Tensor& kv_cache,
                      torch::Tensor& slot_mapping, int64_t compress_ratio,
                      const std::optional<torch::Tensor>& row_out);
+
+// GPT-J RoPE on the query and on the latent KV row, then publish that row into
+// the plain bf16 sliding-window cache. ``slot_mapping`` is the framework's own
+// per-token window slot, not a compressed-domain one, so this op is the
+// exception to the ratio contract above: every token publishes. An empty head
+// axis on ``q`` rotates nothing and only publishes, which is how the DSpark
+// proposer writes context KV.
+void v41_qkv_rope_insert(torch::Tensor& q, torch::Tensor& kv_cache,
+                         torch::Tensor& kv, torch::Tensor& slot_mapping,
+                         torch::Tensor& positions,
+                         torch::Tensor& cos_sin_cache);
 
 // k_norm -> RoPE -> paged store for indexer keys. ``store_fp8`` picks the
 // record: bf16 [., ., 128], or uint8 [., ., 132] holding a page of 128 E4M3
@@ -224,6 +250,28 @@ void v41_move_rows_to_paged_cache(torch::Tensor& rows, torch::Tensor& kv_cache,
                                   torch::Tensor& positions,
                                   int64_t compress_ratio);
 
+// ---------------------------------------------------------------------------
+// DeepSeek-V4.1 two-level indexer. Columns are packed between ``row_ks`` and
+// ``row_ke``, block ``b`` spans ``[row_ks + b * block_size, ...)``, and rows
+// share bounds in groups of ``row_repeat``.
+// ---------------------------------------------------------------------------
+
+// Per-block max of the index logits, ``[rows, ceil(width / block_size)]`` fp32.
+// The block holding a row's newest column scores ``+inf`` so the shortlist
+// always keeps the most recent context.
+torch::Tensor v41_candidate_block_scores(
+    torch::Tensor& logits, const std::optional<torch::Tensor>& row_ks,
+    torch::Tensor& row_ke, int64_t block_size, int64_t row_repeat);
+
+// Set every logit outside the causal bounds or outside a shortlisted block to
+// ``-inf``, in place. A candidate whose first column lands past the logits
+// width keeps the last column instead.
+void v41_apply_candidate_mask(torch::Tensor& logits,
+                              const std::optional<torch::Tensor>& row_ks,
+                              torch::Tensor& row_ke,
+                              torch::Tensor& candidate_blocks,
+                              int64_t block_size, int64_t row_repeat);
+
 // RoPE the index query in place and rescale the per-head weights.
 // ``weights_out`` may alias ``weights_in``.
 void v41_indexer_q_rope(torch::Tensor& q, torch::Tensor& positions,
@@ -241,5 +289,46 @@ std::tuple<torch::Tensor, torch::Tensor> v41_indexer_q_rope_fp8(
 std::tuple<torch::Tensor, torch::Tensor> v41_indexer_q_rope_fp8_meta(
     torch::Tensor& q, torch::Tensor& positions, torch::Tensor& cos_sin_cache,
     torch::Tensor& weights_in, double weights_scale);
+
+// The identity selection, for when a layer's whole compressed context fits in
+// ``topk`` and scoring cannot change the outcome: ``topk_idxs[t, j]`` is the
+// group index ``j`` while the token can see it and ``-1`` past that, and
+// ``topk_lens[t]`` is how many that is. A token sees
+// ``(positions[t] + 1) / compress_ratio`` groups; a negative position is
+// graph-capture padding and yields an empty row.
+void v41_fill_short_context_topk(torch::Tensor& topk_idxs,
+                                 torch::Tensor& topk_lens,
+                                 torch::Tensor& positions,
+                                 int64_t compress_ratio);
+
+// Paged key slots of each token's sliding window, for tokens
+// ``[0, num_tokens)`` of a decode-first batch. ``swa_lens[t]`` is how many
+// slots the row holds: slots whose page is the null block are dropped and the
+// kept ones compacted to the front, and a padding token (``is_valid_token``
+// false) gets length 0 with its row left as staged.
+//
+// ``replay_start`` ([num_reqs], SWA bounded replay) is the position from which
+// each request holds window KV; no slot below it is emitted. Pass zeros when
+// nothing replays.
+void v41_swa_indices_and_lens(torch::Tensor& swa_indices,
+                              torch::Tensor& swa_lens,
+                              torch::Tensor& query_start_loc,
+                              torch::Tensor& seq_lens,
+                              torch::Tensor& token_to_req_indices,
+                              torch::Tensor& is_valid_token,
+                              torch::Tensor& block_table,
+                              torch::Tensor& replay_start, int64_t window_size,
+                              int64_t block_size, int64_t num_tokens);
+
+// Context rows a prefill request gathers for its window:
+// ``query_len + min(max(prefix_len - replay_start, 0), window_size - 1)``,
+// written to ``prefill_gather_lens[:num_prefills]``. The batch is decode-first,
+// so the prefill requests start at ``num_decodes``.
+void v41_swa_prefill_gather_lens(torch::Tensor& prefill_gather_lens,
+                                 torch::Tensor& seq_lens,
+                                 torch::Tensor& query_start_loc,
+                                 torch::Tensor& replay_start,
+                                 int64_t num_prefills, int64_t num_decodes,
+                                 int64_t window_size);
 
 }  // namespace vllm_iluvatar

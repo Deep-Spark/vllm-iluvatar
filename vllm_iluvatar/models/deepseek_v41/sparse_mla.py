@@ -52,24 +52,22 @@ def deepseek_v41_layer_type(compress_ratio: int) -> str:
 def _spec_compress_ratio(kv_cache_spec: AttentionSpec) -> int:
     """Read the compressed-cache ratio from this tree's MLA spec.
 
-    Official names this ``tokens_per_state``; the installed vLLM still carries
-    ``compress_ratio`` on ``MLAAttentionSpec``.
+    Named ``compress_ratio`` up to 0.27.1, ``tokens_per_state`` from 0.30.1.
     """
-    ratio = getattr(kv_cache_spec, "compress_ratio", None)
-    if ratio is None:
-        ratio = getattr(kv_cache_spec, "tokens_per_state", 1)
-    return int(ratio)
+    return int(getattr(kv_cache_spec, "tokens_per_state", 1))
 
 
 def _spec_compressed_block_size(
     kv_cache_spec: AttentionSpec, compress_ratio: int
 ) -> int:
-    """Compressed-domain page size (official ``num_states``)."""
+    """Compressed-domain page size (official ``num_states``).
+
+    Up to 0.27.1 this was the ``storage_block_size`` property. In 0.30.1 that
+    name became an optional override field defaulting to None, and the
+    computed value moved to ``num_states``.
+    """
     if hasattr(kv_cache_spec, "num_states"):
         return int(kv_cache_spec.num_states)
-    storage = getattr(kv_cache_spec, "storage_block_size", None)
-    if storage:
-        return int(storage)
     return int(kv_cache_spec.block_size // compress_ratio)
 
 
@@ -180,18 +178,13 @@ class IluDeepseekV4SparseMLAMetadataBuilder(
 
         slot_mapping = cm.slot_mapping
         if self.compress_ratio > 1:
-            compressed_block_size = _spec_compressed_block_size(
-                self.kv_cache_spec, self.compress_ratio
-            )
-            # Official passes slot_mapping so SWA-bounded-replay PAD tokens
-            # stay PAD after compression. This tree's helper has not grown
-            # that argument yet; the rest of the call matches official.
             slot_mapping = get_compressed_slot_mapping(
                 cm.num_actual_tokens,
+                cm.slot_mapping,
                 cm.query_start_loc,
                 cm.seq_lens,
                 cm.block_table_tensor.clamp_(min=0),
-                compressed_block_size,
+                _spec_compressed_block_size(self.kv_cache_spec, self.compress_ratio),
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
             )
@@ -227,6 +220,7 @@ class IluDeepseekV4SparseMLABackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
+        "bfloat16",
         "fp8_ds_mla",
         "fp8",  # alias for fp8_ds_mla
     ]

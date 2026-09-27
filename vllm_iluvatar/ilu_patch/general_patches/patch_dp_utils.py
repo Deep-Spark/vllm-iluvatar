@@ -43,8 +43,7 @@ def coordinate_batch_across_dp(
     uniform_decode: bool | None = None,
     cudagraph_mode: int = 0,
 ) -> tuple[bool, torch.Tensor | None, int]:
-    """
-    Coordinates amongst all DP ranks to determine if and how the full batch
+    """Coordinates amongst all DP ranks to determine if and how the full batch
     should be split into microbatches.
 
     Args:
@@ -85,6 +84,19 @@ def coordinate_batch_across_dp(
 
     if num_tokens_padded is None:
         num_tokens_padded = num_tokens_unpadded
+
+    if should_skip_dp_coordination():
+        should_ubatch = should_attempt_ubatching and not is_last_ubatch_empty(
+            num_tokens_unpadded,
+            num_tokens_padded,
+            parallel_config.num_ubatches,
+        )
+        num_tokens_after_padding = torch.full(
+            (parallel_config.data_parallel_size,),
+            num_tokens_padded,
+            dtype=torch.int32,
+        )
+        return should_ubatch, num_tokens_after_padding, cudagraph_mode
 
     (should_ubatch, num_tokens_after_padding, synced_cudagraph_mode) = (
         _synchronize_dp_ranks(

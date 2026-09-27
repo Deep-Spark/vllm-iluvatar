@@ -6,14 +6,16 @@ like the official ones. Official drives both entry points with Triton, which
 does not run on this platform, so each body dispatches to the kernel covering
 the same work.
 
-``fused_save_compress_norm`` keeps two of our arguments keyword-only for the
-ratio-2 path, ``block_table`` and ``token_to_req_indices``: official derives the
-state ring slot in a separate Triton kernel in the metadata builder and finds a
-chunk's predecessor row with a dedicated per-request program, while the ixformer
-pooling kernel absorbs both and needs the block table instead of a pre-encoded
-slot. ``rope_quant_insert`` takes official's arguments exactly -- the plugin
-kernel derives page and row from the compressed slot, the way the reference
-does.
+The ratio-2 pooling is a plugin kernel rather than ixformer's
+``ds4_v41_compress_prepare_out``. That one gathers a group's rows from the state
+cache by absolute position, ``block_table[position / capacity]``, so it wants a
+state cache paged over the whole context -- which is what the 0.27.1
+``IluCompressorStateSpec`` handed it. V4.1's ``CircularBufferSpec`` reserves one
+block per request instead, and every group past the first ``capacity`` positions
+then indexes off the end of the block-table row. ``v41_compress_pool_norm``
+follows official's division of labour, where only a chunk's first token reads
+the ring and every other group is pooled from the batch, which is what makes one
+block per request enough.
 
 The cache record is whatever ``kv_cache``'s dtype says: the packed fp8_ds_mla
 row (448 E4M3 NoPE bytes, 64 BF16 RoPE values, 7 UE8M0 scales), or a plain
@@ -22,7 +24,6 @@ row (448 E4M3 NoPE bytes, 64 BF16 RoPE values, 7 UE8M0 scales), or a plain
 
 from __future__ import annotations
 
-import ixformer.inference.functions as ixfops
 import torch
 
 
@@ -37,17 +38,19 @@ def fused_save_compress_norm(
     rms_norm_eps: float,
     compress_ratio: int,
     latent_out: torch.Tensor,
-    *,
-    block_table: torch.Tensor | None = None,
 ) -> None:
     """Pool each closed group into a normalized BF16 latent; save FP32 states.
 
     The latent feeds the main-cache insert and the indexer K path, which the
     attention layer schedules on separate streams.
 
-    Ratio 2 keeps one ring block per request holding the open group's rows. A
-    group that a chunk's first token closes with its predecessor needs that
-    predecessor's ring row, which is why the block table comes in.
+    Ratio 2 keeps one ring block per request holding the open group's rows:
+    position ``p`` lives in row ``p % capacity`` and ``slot_mapping`` encodes
+    ``block * capacity + p % capacity``. A request's program handles the group
+    that the chunk's first token closes with its predecessor's ring row, then
+    stores the chunk's last ``capacity`` rows; every group that ends inside the
+    batch is pooled from ``kv_score`` and never touches the ring. Ratio 1 has
+    no ring, and ``slot_mapping`` then only marks valid tokens.
 
     Args:
         kv_score: FP32 [tokens, 512] for CR1, [tokens, 1024] for CR2.
@@ -55,17 +58,14 @@ def fused_save_compress_norm(
         state_cache: Ring FP32 [blocks, capacity, 1024] KV/score states (CR2).
         slot_mapping: Ring slots (CR2) or main-cache slots (CR1). Negative
             marks a token that publishes nothing.
-        query_start_loc: Unused here; our kernel takes request boundaries from
-            ``token_to_req_indices`` and the block table.
+        query_start_loc: [num_reqs + 1] token offsets of each request's chunk.
         token_to_req_indices: Request indices for the packed token rows.
         rms_norm_weight: BF16 [512] normalization weight.
         rms_norm_eps: RMSNorm epsilon.
         compress_ratio: Group size, either 1 or 2.
         latent_out: BF16 [tokens, 512], written only at valid group boundaries.
-        block_table: [num_reqs, max_blocks] pages backing the state ring.
 
     """
-    del query_start_loc
     assert compress_ratio in (1, 2)
     assert kv_score.dtype == torch.float32
     assert kv_score.shape[1] == 512 * compress_ratio and kv_score.stride(1) == 1
@@ -90,21 +90,17 @@ def fused_save_compress_norm(
         return
 
     assert state_cache is not None and token_to_req_indices is not None
-    assert block_table is not None
-    # kv and score are the two halves of the merged wkv/wgate GEMM. The kernel
-    # takes a row stride, so these views go in without a copy.
-    ixfops.ds4_v41_compress_prepare_out(
-        kv_score[:num_tokens, :512],
-        kv_score[:num_tokens, 512:],
+    assert query_start_loc is not None
+    torch.ops._C.v41_compress_pool_norm(
+        kv_score,
+        positions,
         state_cache,
-        token_to_req_indices[:num_tokens],
-        positions[:num_tokens],
         slot_mapping,
-        block_table,
+        query_start_loc,
+        token_to_req_indices,
         rms_norm_weight,
-        latent_out[:num_tokens],
-        compress_ratio,
         rms_norm_eps,
+        latent_out,
     )
 
 

@@ -2,8 +2,7 @@
 """Iluvatar MoERunner — inherits community MoERunner, overrides only the
 delta methods required for corex / Iluvatar hardware.
 
-Baseline : community ``runner/moe_runner.py`` @ main_6e448d0
-Delta    : ~250 lines vs. the original 1010-line full-class copy
+Baseline : community ``runner/moe_runner.py`` @ v0.30.1rc0
 
 Override summary (each marked with ``# [ILU override]`` in-line):
 
@@ -16,19 +15,28 @@ Override summary (each marked with ``# [ILU override]`` in-line):
   _maybe_dispatch                   input_ids + _kernel_handles_own_dispatch
   _maybe_combine                    _kernel_handles_own_dispatch guard
   _maybe_apply_routed_scale_to_output  FP16 shared_experts_scaling_factor
-  do_naive_dispatch_combine         drop supports_internal_mk check
+  do_naive_dispatch_combine         drop supports_internal_mk / SP checks
+  _is_unquantized_fused_moe_method  new helper (W16A16 detection)
   _kernel_handles_own_dispatch      new property (monolithic W16A16 guard)
+
+0.30.1 shared-experts rework absorbed here: ``SharedExperts`` no longer has
+``maybe_sync_shared_experts_stream`` / ``_run_in_aux_stream``.  The aux-stream
+launch now happens in ``maybe_forward_async`` (called from ``_forward_impl``),
+which returns whether it enqueued anything; that bool is threaded into
+``_apply_quant_method``, which joins with ``wait()`` instead of re-invoking the
+module under ``SharedExpertsOrder.MULTI_STREAM_OVERLAPPED``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import cast
 
 import torch
-import torch.nn.functional as F
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_ep_group, get_pcp_group
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
     MoERunner,
     _moe_forward_shared,
@@ -37,6 +45,7 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExpertsOrder,
 )
+from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
 
 logger = init_logger("vllm." + __name__)
 
@@ -81,19 +90,27 @@ class IluMoERunner(MoERunner):
     # [ILU override] forward — delta: support tuple hidden_states from fused
     # norm-quant path (quantized_output, output_scales, fp_output). Does NOT
     # override apply_routed_input_transform — uses the community version and
-    # discards the second return value in the tuple case.
+    # discards the second return value in the tuple case. Everything after
+    # ``_forward_entry`` mirrors community forward().
     def forward(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if not isinstance(hidden_states, tuple):
-            return super().forward(hidden_states, router_logits, input_ids)
+            return super().forward(
+                hidden_states, router_logits, input_ids, shared_experts_input
+            )
 
         assert len(hidden_states) == 3, (
             "Expected hidden_states tuple of "
             "(quantized_output, output_scales, fp_output)"
+        )
+        assert shared_experts_input is None, (
+            "Fused norm-quant hidden_states carries its own shared-experts "
+            "input; a pre-applied routed input transform is not supported."
         )
         shared_experts_input = (
             *hidden_states[:2],
@@ -120,11 +137,23 @@ class IluMoERunner(MoERunner):
         )
 
         shared_output, fused_output = _unpack(result)
+        fused_output = cast(torch.Tensor, fused_output)
 
         if og_pre is not None:
             fused_output = fused_output[..., :og_pre]
 
-        shared_output = self._maybe_reduce_shared_expert_output(shared_output)
+        # fused_output_is_reduced = self._fused_output_is_reduced
+
+        # fused_output, fused_output_is_reduced = (
+        #     self._maybe_reduce_routed_output_before_transform(
+        #         fused_output,
+        #         fused_output_is_reduced,
+        #     )
+        # )
+
+        shared_output = self._maybe_reduce_shared_expert_output(
+            shared_output
+        )
 
         shared_output, fused_output = self._maybe_apply_routed_scale_to_output(
             shared_output, fused_output
@@ -137,12 +166,11 @@ class IluMoERunner(MoERunner):
         else:
             result = fused_output
 
-        result = self._maybe_reduce_final_output(result, og_post)
+        result = self._maybe_reduce_final_output(
+            result, og_post
+        )
         return self._maybe_add_zero_expert_output(result)
 
-    # [ILU override] _apply_quant_method — delta: fused shared output
-    # optimisation; unquantized W16A16 stays unfused so runner-side routed
-    # scaling applies only to the routed output, not the shared residual.
     def _is_unquantized_fused_moe_method(self) -> bool:
         from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
             UnquantizedFusedMoEMethod,
@@ -150,13 +178,21 @@ class IluMoERunner(MoERunner):
 
         return isinstance(self._quant_method, UnquantizedFusedMoEMethod)
 
+    # [ILU override] _apply_quant_method — delta: fused shared output
+    # optimisation. When the shared branch runs inline (NO_OVERLAP) and the
+    # kernel can take a residual, its output is handed to the routed kernel as
+    # ``shared_experts_input`` and added there, so nothing is returned to the
+    # runner. Unquantized W16A16 and FP16 stay unfused so the runner-side
+    # routed scaling applies only to the routed output, not the shared
+    # residual.
     def _apply_quant_method(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        shared_experts_overlapping: bool = False,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | UnfinalizedMoEOutput]:
         experts_order = SharedExpertsOrder.NONE
         if self._shared_experts is not None:
             experts_order = self._shared_experts._determine_shared_experts_order(
@@ -190,6 +226,8 @@ class IluMoERunner(MoERunner):
                 input_ids=input_ids,
             )
 
+            # Pops ``_shared_experts.output``, so the tail of this method must
+            # not read it again in the fused case.
             fused_shared_output = (
                 self._shared_experts.output if can_fused_shared_output else None
             )
@@ -210,10 +248,9 @@ class IluMoERunner(MoERunner):
                 ),
             )
 
-        self._maybe_apply_shared_experts(
-            shared_experts_input,
-            SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
-        )
+        if shared_experts_overlapping:
+            assert self._shared_experts is not None
+            self._shared_experts.wait()
 
         return_shared_output = (
             experts_order
@@ -249,14 +286,25 @@ class IluMoERunner(MoERunner):
         router_logits: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> (
+        torch.Tensor
+        | UnfinalizedMoEOutput
+        | tuple[torch.Tensor, torch.Tensor | UnfinalizedMoEOutput]
+    ):
         self.routed_experts._ensure_moe_quant_config_init()
-        self._maybe_sync_shared_experts_stream(shared_experts_input)
+
+        shared_experts_overlapping = False
+        if self._shared_experts is not None:
+            shared_experts_overlapping = self._shared_experts.maybe_forward_async(
+                shared_experts_input
+            )
 
         if self.gate is not None:
             if self._fse_fuse_gate:
                 self._maybe_fuse_gate_weights()
-                router_logits = F.linear(hidden_states, self._combined_gate_weight)
+                router_logits = dispatch_unquantized_gemm()(
+                    self, hidden_states, self._combined_gate_weight, None
+                )
             else:
                 router_logits, _ = self.gate(hidden_states)
 
@@ -272,6 +320,7 @@ class IluMoERunner(MoERunner):
                 router_logits=router_logits,
                 shared_experts_input=shared_experts_input,
                 input_ids=input_ids,
+                shared_experts_overlapping=shared_experts_overlapping,
             )
 
             return self._maybe_combine(
@@ -305,7 +354,10 @@ class IluMoERunner(MoERunner):
                 assert len(result) == 2
                 hidden_states, router_logits = result
 
-        if self.moe_config.pcp_size > 1:
+        if (
+            self.moe_config.pcp_size > 1
+            and not self.moe_config.moe_parallel_config.use_all2all_kernels
+        ):
             hidden_states = get_pcp_group().all_gather(hidden_states, dim=0)
             router_logits = get_pcp_group().all_gather(router_logits, dim=0)
             if input_ids is not None:
@@ -313,19 +365,41 @@ class IluMoERunner(MoERunner):
 
         return hidden_states, router_logits, input_ids
 
-    # [ILU override] _maybe_combine — delta: guard with
-    # _kernel_handles_own_dispatch.
+    # [ILU override] _maybe_combine — delta: guard the EP combine with
+    # _kernel_handles_own_dispatch, and key the paired return off
+    # ``shared_output`` rather than ``self.shared_experts``. The latter is
+    # required by the fused shared output path: the shared branch exists but
+    # its result was folded into the routed kernel, so _apply_quant_method
+    # returns None and community's ``assert shared_output is not None`` would
+    # fire.
     def _maybe_combine(
         self,
         shared_output: torch.Tensor | None,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor | tuple[torch.Tensor | None, torch.Tensor]:
+        hidden_states: torch.Tensor | UnfinalizedMoEOutput,
+    ) -> (
+        torch.Tensor
+        | UnfinalizedMoEOutput
+        | tuple[torch.Tensor | None, torch.Tensor | UnfinalizedMoEOutput]
+    ):
         if self.do_naive_dispatch_combine and not self._kernel_handles_own_dispatch:
+            if isinstance(hidden_states, UnfinalizedMoEOutput):
+                raise RuntimeError(
+                    "Naive expert-parallel combine cannot consume a deferred "
+                    "MoE output."
+                )
             hidden_states = get_ep_group().combine(
-                hidden_states, self.moe_config.is_sequence_parallel
+                hidden_states,
+                self.moe_config.is_sequence_parallel,
             )
 
-        if self.moe_config.pcp_size > 1:
+        if (
+            self.moe_config.pcp_size > 1
+            and not self.moe_config.moe_parallel_config.use_all2all_kernels
+        ):
+            if isinstance(hidden_states, UnfinalizedMoEOutput):
+                raise RuntimeError(
+                    "PCP reduce-scatter cannot consume a deferred MoE output."
+                )
             hidden_states = get_pcp_group().reduce_scatter(hidden_states, dim=0)
 
         if shared_output is not None:
@@ -335,7 +409,9 @@ class IluMoERunner(MoERunner):
 
     # [ILU override] _maybe_apply_routed_scale_to_output — delta: FP16 uses
     # shared_experts_scaling_factor instead of dividing fused_output (avoids
-    # FP16 overflow).
+    # FP16 overflow); every other dtype has the routed scale folded into
+    # topk_weights by the router, except the unquantized W16A16 kernel which
+    # scales after reduction via ``_ilu_output_scale``.
     def _maybe_apply_routed_scale_to_output(
         self,
         shared_output: torch.Tensor | None,
@@ -349,8 +425,9 @@ class IluMoERunner(MoERunner):
         return shared_output, fused_output
 
     # [ILU override] do_naive_dispatch_combine — delta: drop the
-    # supports_internal_mk check; Iluvatar kernels do not yet implement
-    # internal MK dispatch.
+    # supports_internal_mk check (Iluvatar kernels do not implement internal
+    # MK dispatch) and the is_sequence_parallel term (SP is not supported on
+    # corex, and the Iluvatar kernels own the SP scatter themselves).
     @property
     def do_naive_dispatch_combine(self) -> bool:
         return self.moe_config.dp_size > 1

@@ -1500,7 +1500,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 num_kv_heads=1,
                 head_size=self.head_dim,
                 dtype=torch.uint8,
-                compress_ratio=self.compress_ratio,
+                tokens_per_state=self.compress_ratio,
                 cache_dtype_str="fp8_ds_mla",
                 model_version="deepseek_v4",
                 # Ilu fp8 attention kernels require 64B-aligned block bases.
@@ -1513,7 +1513,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=torch.bfloat16,
-            compress_ratio=self.compress_ratio,
+            tokens_per_state=self.compress_ratio,
             cache_dtype_str="bfloat16",
             model_version=None,
         )
@@ -2427,7 +2427,7 @@ class IluDeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
-            compress_ratio=self.compress_ratio,
+            tokens_per_state=self.compress_ratio,
         )
 
     def forward(self): ...

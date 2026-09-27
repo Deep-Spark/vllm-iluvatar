@@ -21,9 +21,8 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.kv_cache_interface import KVCacheSpec
-
-from vllm_iluvatar.v1.core.compressor_state import IluCompressorStateSpec
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheSpec
 
 from vllm_iluvatar.models.deepseek_v41.common.ops.fused_compress_quant_cache import (
     fused_save_compress_norm,
@@ -34,7 +33,7 @@ from vllm_iluvatar.models.deepseek_v41.common.ops.fused_compress_quant_cache imp
 class IluCompressorBackend(CompressorBackend):
     @staticmethod
     def get_name() -> str:
-        return "CompressorBackend"
+        return "IluCompressorBackend"
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
@@ -45,25 +44,28 @@ class IluCompressorBackend(CompressorBackend):
         return [512, 1024]
 
     @staticmethod
-    def get_builder_cls() -> type[CompressorMetadataBuilder]:
-        return CompressorMetadataBuilder
+    def get_builder_cls() -> type[IluCompressorMetadataBuilder]:
+        return IluCompressorMetadataBuilder
 
 
 @dataclass
-class CompressorMetadata:
-    slot_mapping: torch.Tensor  # [num_tokens] state-ring slot of every token
+class IluCompressorMetadata:
+    # [num_tokens] ring slot of every token: block * capacity + pos % capacity.
+    slot_mapping: torch.Tensor
     query_start_loc: torch.Tensor  # [num_reqs + 1]
     token_to_req_indices: torch.Tensor  # [num_tokens]
-    block_table: torch.Tensor  # [num_reqs, max_blocks] pages of the ring
-    positions: torch.Tensor  # [num_tokens]
+    capacity: int  # ring rows per page, the slots above were encoded against
 
 
-class CompressorMetadataBuilder(AttentionMetadataBuilder):
+class IluCompressorMetadataBuilder(AttentionMetadataBuilder):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        assert isinstance(self.kv_cache_spec, IluCompressorStateSpec)
+        assert isinstance(self.kv_cache_spec, CircularBufferSpec)
+        # The coordinator scales a group's block size up to equalize page sizes
+        # across groups, so this is wider than the layer asked for (8 -> 16 on
+        # this model) and is the capacity the bound tensor actually carries.
         self.capacity = self.kv_cache_spec.block_size
         max_num_batched_tokens = (
             self.vllm_config.scheduler_config.max_num_batched_tokens
@@ -71,25 +73,40 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         self.token_to_req_indices = torch.zeros(
             max_num_batched_tokens, dtype=torch.int32, device=self.device
         )
+        self.slot_mapping_buffer = torch.empty(
+            max_num_batched_tokens, dtype=torch.int64, device=self.device
+        )
 
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
-    ) -> CompressorMetadata:
+    ) -> IluCompressorMetadata:
         num_tokens = common_attn_metadata.slot_mapping.numel()
         positions = common_attn_metadata.positions
         assert positions is not None
         token_to_req_indices = common_attn_metadata.token_to_req_indices(
             self.token_to_req_indices
         )
-        return CompressorMetadata(
-            slot_mapping=common_attn_metadata.slot_mapping,
+        # ``CircularBufferSpec.uses_slot_mapping`` is False, so the worker fills
+        # this group's row of ``slot_mapping`` with PAD for every token and
+        # leaves the addressing to us. Forwarding that row would make the
+        # compressor kernel skip every token and save no state at all.
+        num_actual = common_attn_metadata.num_actual_tokens
+        slot_mapping = self.slot_mapping_buffer[:num_tokens]
+        # The ring is a single block per request, held for the request's life.
+        ring_block = common_attn_metadata.block_table_tensor[:, 0].to(torch.int64)
+        req = token_to_req_indices[:num_actual].long()
+        slot_mapping[:num_actual] = (
+            ring_block[req] * self.capacity + positions[:num_actual] % self.capacity
+        )
+        slot_mapping[num_actual:] = PAD_SLOT_ID
+        return IluCompressorMetadata(
+            slot_mapping=slot_mapping,
             query_start_loc=common_attn_metadata.query_start_loc,
-            token_to_req_indices=token_to_req_indices,
-            block_table=common_attn_metadata.block_table_tensor,
-            positions=positions[:num_tokens],
+            token_to_req_indices=token_to_req_indices[:num_tokens],
+            capacity=self.capacity,
         )
 
 
@@ -122,14 +139,12 @@ class IluCompressorStateCache(torch.nn.Module, AttentionLayerBase):
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         del vllm_config
-        return IluCompressorStateSpec(
+        return CircularBufferSpec(
             block_size=self.block_size,
             num_kv_heads=1,
             head_size=self.state_dim,
+            head_size_v=0,
             dtype=self.dtype,
-            sliding_window=2,
-            alignment=512,
-            compress_ratio=1,
         )
 
     def forward(self): ...
@@ -221,7 +236,6 @@ class IluDeepseekCompressor(nn.Module):
         if not isinstance(attn_metadata, dict):
             return None
 
-        block_table = None
         if self.state_cache is None:
             state_cache = query_start_loc = token_to_req_indices = None
             slot_mapping = cast(Any, attn_metadata[self.k_cache_prefix]).slot_mapping
@@ -230,10 +244,15 @@ class IluDeepseekCompressor(nn.Module):
                 CompressorMetadata, attn_metadata[self.state_cache.prefix]
             )
             state_cache = self.state_cache.kv_cache
+            # The kernel splits a ring slot by the page's own row count, so a
+            # slot encoded against a different capacity lands on another page.
+            assert state_cache.shape[1] == state_metadata.capacity, (
+                f"ring page holds {state_cache.shape[1]} rows but the slots "
+                f"were built for {state_metadata.capacity}"
+            )
             slot_mapping = state_metadata.slot_mapping
             query_start_loc = state_metadata.query_start_loc
             token_to_req_indices = state_metadata.token_to_req_indices
-            block_table = state_metadata.block_table
 
         latent = torch.empty(
             kv_score.shape[0],
@@ -252,7 +271,6 @@ class IluDeepseekCompressor(nn.Module):
             self.rms_norm_eps,
             self.compress_ratio,
             latent,
-            block_table=block_table,
         )
         return latent
 

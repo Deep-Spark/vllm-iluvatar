@@ -265,9 +265,15 @@ class IluFlashMLASparseMetadataBuilder(
             hasattr(hf_config, "compress_ratios")
             and len(getattr(hf_config, "compress_ratios", []) or []) > 0
         )
+        # 0.30.1 renamed the MLA spec's ``compress_ratio`` field to the generic
+        # ``tokens_per_state``. Probing the old name here does not raise, it
+        # just silently leaves the ratio at 1, so keep the attribute name in
+        # sync with the spec.
         self.compress_ratio = 1
-        if self.is_deepseek_v4 and hasattr(self.kv_cache_spec, "compress_ratio"):
-            self.compress_ratio = self.kv_cache_spec.compress_ratio
+        if self.is_deepseek_v4:
+            self.compress_ratio = int(
+                getattr(self.kv_cache_spec, "tokens_per_state", 1)
+            )
 
         # Pre-allocate compressed slot mapping buffer for CUDA graph address
         # stability when this group needs compression (compress_ratio > 1).
@@ -416,12 +422,14 @@ class IluFlashMLASparseMetadataBuilder(
         # ``DeepseekCompressor._fused_kernel`` writes to the right cache slot.
         slot_mapping = cm.slot_mapping
         if self.compress_ratio > 1:
+            # See ilu_indexer.py for the 0.30.1 signature change.
             slot_mapping = get_compressed_slot_mapping(
                 cm.num_actual_tokens,
+                cm.slot_mapping,
                 cm.query_start_loc,
                 cm.seq_lens,
                 cm.block_table_tensor.clamp(min=0),
-                int(self.kv_cache_spec.storage_block_size),
+                int(self.kv_cache_spec.num_states),
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
             )

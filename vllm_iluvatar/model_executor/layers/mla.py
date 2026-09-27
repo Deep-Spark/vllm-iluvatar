@@ -54,6 +54,7 @@ class IluMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         skip_topk: bool = False,
         non_causal_multi_token_decode: bool = False,
         allow_short_prefill_indexer_scoring_skip: bool = False,
+        fuse_qkv_rmsnorm: bool = False,
     ) -> None:
         super().__init__(
             hidden_size,
@@ -71,6 +72,7 @@ class IluMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             skip_topk,
             non_causal_multi_token_decode=non_causal_multi_token_decode,
             allow_short_prefill_indexer_scoring_skip=allow_short_prefill_indexer_scoring_skip,
+            fuse_qkv_rmsnorm=fuse_qkv_rmsnorm,
         )
         # [ILU override] plugin MLA backends apply rope/cache updates inside
         # MLAAttention.forward_full when positions are passed through forward().

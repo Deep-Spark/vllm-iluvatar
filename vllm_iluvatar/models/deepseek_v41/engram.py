@@ -795,7 +795,17 @@ class IluEngram(nn.Module):
             self.key_offset = 0
 
     def load_from_checkpoint(self, path: str) -> None:
-        """Load the table slice, plus fp8 wkv and q/k weights."""
+        """Load the table slice, plus the wkv and q/k weights.
+
+        ``wkv`` comes in one of two records and the checkpoint decides which:
+        block-scaled FP8 (a companion ``wkv.scale``) or plain BF16. The
+        Iluvatar-quantized V4.1 checkpoints leave engram out of the quantized
+        set entirely -- ``re:.*\\.engram\\..*`` sits in the config's ``ignore``
+        list -- so there the weight arrives BF16 with no scale at all, and
+        :meth:`apply` must not reach for an FP8 kernel. Keyed off the file
+        rather than off a runtime flag: the record is a property of the
+        checkpoint, and a flag could disagree with it.
+        """
         import json
         import os
 
@@ -827,29 +837,36 @@ class IluEngram(nn.Module):
 
         device = self.primes.device
         wkv_q = read("wkv.weight")
-        wkv_s = read("wkv.scale")
+        wkv_s = read("wkv.scale") if f"{prefix}.wkv.scale" in weight_map else None
         if self._shard_keys:
             # Slice on the host so the device never holds the full-width weight.
             n = self.hc_mult * self.hidden_size
             keys_q = wkv_q[:n].unflatten(0, (self.hc_mult, self.hidden_size))[
                 :, self.key_offset : self.key_offset + self.key_hidden
             ]
-            n_s = n // _FP8_BLOCK
-            keys_s = wkv_s[:n_s].unflatten(
-                0, (self.hc_mult, self.hidden_size // _FP8_BLOCK)
-            )[
-                :,
-                self.key_offset // _FP8_BLOCK : (self.key_offset + self.key_hidden)
-                // _FP8_BLOCK,
-            ]
             wkv_q = torch.cat([keys_q.flatten(0, 1), wkv_q[n:]])
-            wkv_s = torch.cat([keys_s.flatten(0, 1), wkv_s[n_s:]])
-        self.wkv_weight, self.wkv_scale = ixfops.fp8_weight_block_to_channel_requant(
-            wkv_q.contiguous().to(device),
-            wkv_s.contiguous().to(device),
-            _FP8_BLOCK,
-            _FP8_BLOCK,
-        )
+            if wkv_s is not None:
+                n_s = n // _FP8_BLOCK
+                keys_s = wkv_s[:n_s].unflatten(
+                    0, (self.hc_mult, self.hidden_size // _FP8_BLOCK)
+                )[
+                    :,
+                    self.key_offset // _FP8_BLOCK : (self.key_offset + self.key_hidden)
+                    // _FP8_BLOCK,
+                ]
+                wkv_s = torch.cat([keys_s.flatten(0, 1), wkv_s[n_s:]])
+        if wkv_s is None:
+            self.wkv_weight = wkv_q.contiguous().to(device)
+            self.wkv_scale = None
+        else:
+            self.wkv_weight, self.wkv_scale = (
+                ixfops.fp8_weight_block_to_channel_requant(
+                    wkv_q.contiguous().to(device),
+                    wkv_s.contiguous().to(device),
+                    _FP8_BLOCK,
+                    _FP8_BLOCK,
+                )
+            )
         self.q_weight = read("q_weight").to(device)
         self.k_weight = read("k_weight").to(device)
 
@@ -916,6 +933,14 @@ class IluEngram(nn.Module):
         self._rows = self.embed(hash_ids)
 
     def apply(self, hidden_states: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+        # The table lookup already hands back BF16 rows, so an unquantized wkv
+        # needs no quantization step at all -- one plain GEMM and nothing FP8
+        # anywhere on the path. See ``load_from_checkpoint`` for which record
+        # is in play.
+        if self.wkv_scale is None:
+            kv = torch.matmul(rows.flatten(-2), self.wkv_weight.t())
+            return self._gate(hidden_states, kv)
+
         x, x_scale = ixfops.fp8_per_token_dynamic_scaled(rows.flatten(-2))
         kv = torch.empty(
             (x.shape[0], self.wkv_weight.shape[0]),

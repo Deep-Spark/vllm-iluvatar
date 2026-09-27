@@ -43,6 +43,7 @@ from vllm.compilation.breakable_cudagraph import (
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
@@ -77,6 +78,7 @@ _WEIGHT_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 _HYV4_DSA_FP8_ROW_BYTES = 640
 _HYV4_DSA_FP8_E4M3_MAX = 448.0
 _HYV4_DSA_FP8_CACHE_DTYPES = ("fp8", "fp8_e4m3")
+_MLA_KV_FUSE_LOGGED = False
 
 
 @lru_cache(maxsize=4)
@@ -138,6 +140,42 @@ def _hyv4_fp8_q_heads(num_heads: int) -> int:
     return 64 if num_heads > 32 else max(16, (num_heads + 15) // 16 * 16)
 
 
+# Token count up to which the fused single-kernel up-projection wins. Measured
+# per layer on ivcore30 (TP2, G=32): the fused kernel runs 19.4 us at T=16
+# against 25.6 for quant+einsum, and loses at T=32 (32.4 vs 27.9) where the
+# einsum's larger tiles take over. Production maps concurrency to T as
+# ``T = seqs_per_rank * 4`` (DP8 + MTP3), so this covers 32-way concurrency.
+_FUSED_MAX_TOKENS = 16
+_FP8_E4M3_MAX = 448.0
+
+
+def _ixf_functions():
+    """Imported lazily, like the rest of this module's ixformer use."""
+    import ixformer.inference.functions as ixf_ops
+
+    return ixf_ops
+
+
+def _quant_per_out_channel(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``[G, D, R]`` BF16 -> e4m3 bytes plus a read-safe fp32 scale ``[G, D]``.
+
+    The scale sits on the output axis D, which is what the up-projection ops
+    dequantise with; the einsum reads it in 128-wide chunks, hence read-safe.
+    """
+    groups, dim = w.shape[0], w.shape[1]
+    wf = w.float()
+    scale = (wf.abs().amax(dim=-1) / _FP8_E4M3_MAX).clamp_min(1e-12)
+    q = (
+        (wf / scale.unsqueeze(-1))
+        .clamp_(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+        .contiguous()
+    )
+    padded = _ixf_functions().alloc_readsafe_scale(groups, dim, device=w.device)
+    padded.copy_(scale)
+    return q, padded
+
+
 class HYV4MLAAttentionLayer(MLAAttention):
     """Community MLA layer with HYV4's physical 640-byte fp8 cache spec."""
 
@@ -184,6 +222,75 @@ class HYV4MLAAttentionLayer(MLAAttention):
         if self.use_hyv4_fp8_attn:
             self._k_scale.fill_(init_scale)
             self._non_persistent_buffers_set.add("_k_scale")
+        self.fuse_v_up = os.environ.get(
+            "VLLM_ILU_HYV4_FUSE_KV_UP", "1"
+        ) != "0" and hasattr(_ixf_functions(), "hy4_kv_up_gate")
+        # Folding the gate is separable from running v-up in FP8, which keeps
+        # the two halves of this change independently switchable.
+        self.fuse_gate = (
+            self.fuse_v_up
+            and os.environ.get("VLLM_ILU_HYV4_FUSE_KV_UP_GATE", "1") != "0"
+        )
+        self.W_UV_FP8: torch.Tensor | None = None
+        self.W_UV_FP8_S: torch.Tensor | None = None
+        # Gate logits for the current token batch, handed over by the attention
+        # module so ``_v_up_proj`` can fold ``sigmoid * mul`` into its store,
+        # and the number of leading rows that fold actually covered.
+        self.gate_logits: torch.Tensor | None = None
+        self.gated_rows = 0
+
+    # [ILU override] MLAAttention.process_weights_after_loading — delta: keep an
+    # FP8 copy of the absorbed v-up weight, laid out for the gated up-proj ops.
+    # ``W_UK_T`` is left alone: the k-up bmm is inlined in the community
+    # ``forward_impl`` with no hook to replace it (see 2.1-实现记录.md §7).
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        super().process_weights_after_loading(act_dtype)
+        if not self.fuse_v_up:
+            return
+        # Community layout is ``W_UV[N, L, V]``; both ops want ``[G, D, R]``
+        # with the scale on the output axis D, i.e. D=V, R=L.
+        self.W_UV_FP8, self.W_UV_FP8_S = _quant_per_out_channel(
+            self.W_UV.transpose(1, 2)
+        )
+        self.W_UV = None  # ~0.5 GB/rank; the FP8 copy is the only consumer now
+
+    # [ILU override] MLAAttention._v_up_proj — delta: FP8 instead of a BF16 bmm,
+    # plus HY4's elementwise output gate folded into the store so the layer no
+    # longer pays a ``sigmoid_`` and a ``mul_`` over [T, heads * v_head_dim].
+    def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor) -> None:
+        if not self.fuse_v_up:
+            super()._v_up_proj(x, out)
+            return
+        ixf_ops = _ixf_functions()
+        x = x.view(-1, self.num_heads, self.kv_lora_rank)
+        out_3d = out.view(-1, self.num_heads, self.v_head_dim)
+        gate = self.gate_logits
+        if self.fuse_gate:
+            # The module stopped applying the gate itself, so a missing or
+            # too-short hand-over must not silently drop it.
+            if gate is None:
+                raise RuntimeError(
+                    f"{self.layer_name}: gate folding is on but the attention "
+                    "module handed over no gate logits before attention ran."
+                )
+            if gate.shape[0] < x.shape[0]:
+                raise RuntimeError(
+                    f"{self.layer_name}: gate logits cover {gate.shape[0]} "
+                    f"tokens, attention produced {x.shape[0]}."
+                )
+        if gate is not None:
+            # In a mixed batch this runs on the leading MQA rows only; the dense
+            # MHA prefill rows bypass ``_v_up_proj`` entirely, so the module
+            # gates whatever ``gated_rows`` leaves over.
+            gate = gate[: x.shape[0]].view(x.shape[0], self.num_heads, self.v_head_dim)
+            self.gated_rows = x.shape[0]
+        if x.shape[0] <= _FUSED_MAX_TOKENS:
+            ixf_ops.hy4_kv_up_gate(x, self.W_UV_FP8, self.W_UV_FP8_S, gate, out=out_3d)
+            return
+        a, a_s = ixf_ops.fp8_grouped_per_token_quant(x, x.shape[1])
+        ixf_ops.hy4_fp8_einsum_gate(
+            a, self.W_UV_FP8, a_s, self.W_UV_FP8_S, gate, out=out_3d
+        )
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         if self.use_hyv4_fp8_attn:
@@ -858,6 +965,94 @@ class HYV4MLAAttention(nn.Module):
             "as the dense MLA prefill backends cannot apply sinks."
         )
 
+    def _prepare_mla_qkv(
+        self,
+        q: torch.Tensor,
+        kv_c: torch.Tensor,
+        k_pe: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply RoPE, and on the fp8 path fuse RMSNorm + RoPE + KV insert.
+
+        ``q`` and ``k_pe`` are updated in place. Returns the latent that
+        ``mla_attn`` should see: raw ``kv_c`` when the fused insert already
+        wrote the cache, otherwise the RMSNorm output.
+        """
+        impl = self.mla_attn.impl
+        fused = self._try_fuse_mla_kv(q, kv_c, k_pe, positions)
+        impl._skip_fp8_kv_insert = fused
+        if fused:
+            return kv_c
+        kv_c_normed = self.kv_a_layernorm(kv_c)
+        q_pe = q[..., self.qk_nope_head_dim :]
+        q_out, k_out = self.rotary_emb(positions, q_pe, k_pe)
+        if q_out is not q_pe:
+            q_pe.copy_(q_out.reshape(q_pe.shape))
+            k_pe.copy_(k_out.reshape(k_pe.shape))
+        return kv_c_normed
+
+    def _try_fuse_mla_kv(
+        self,
+        q: torch.Tensor,
+        kv_c: torch.Tensor,
+        k_pe: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> bool:
+        global _MLA_KV_FUSE_LOGGED
+        if os.environ.get("VLLM_ILU_HYV4_FUSE_MLA_KV", "1") == "0":
+            return False
+        impl = getattr(self.mla_attn, "impl", None)
+        if impl is None or not getattr(impl, "use_fp8_attn", False):
+            return False
+        if not getattr(impl, "_fp8_kv_scale_frozen", False):
+            return False
+        if q.shape[-2] not in (8, 16, 32, 64):
+            return False
+        if self.kv_a_layernorm.weight.dtype != kv_c.dtype:
+            return False
+        kv_cache = self.mla_attn.kv_cache
+        if kv_cache.numel() == 0:
+            return False
+        try:
+            import ixformer.inference.functions as ixf_ops
+        except Exception:
+            return False
+        if not hasattr(ixf_ops, "fused_glm_dsa_rmsnorm_rope_fp8_kv_insert"):
+            return False
+        ctx = get_forward_context()
+        slot_mapping = getattr(ctx, "slot_mapping", None)
+        if not isinstance(slot_mapping, dict):
+            return False
+        slots = slot_mapping.get(self.mla_attn.layer_name)
+        if slots is None:
+            return False
+        n = q.shape[0]
+        slots = slots.reshape(-1)
+        pos = positions.reshape(-1)
+        if slots.numel() < n or pos.numel() < n or kv_c.shape[0] < n:
+            return False
+        q_pe = q[..., self.qk_nope_head_dim :]
+        ixf_ops.fused_glm_dsa_rmsnorm_rope_fp8_kv_insert(
+            q_pe,
+            k_pe,
+            kv_c[:n],
+            self.kv_a_layernorm.weight,
+            float(self.kv_a_layernorm.variance_epsilon),
+            kv_cache,
+            slots[:n].contiguous(),
+            pos[:n].contiguous(),
+            self.rotary_emb._match_cos_sin_cache_dtype(q_pe),
+            self.mla_attn._k_scale,
+            int(kv_cache.shape[1]),
+        )
+        if not _MLA_KV_FUSE_LOGGED:
+            logger.info(
+                "HYV4 MLA RMSNorm+RoPE+fp8 KV insert fusion armed "
+                "(VLLM_ILU_HYV4_FUSE_MLA_KV=1)"
+            )
+            _MLA_KV_FUSE_LOGGED = True
+        return True
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -883,14 +1078,11 @@ class HYV4MLAAttention(nn.Module):
             kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
 
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv_c_normed = self.kv_a_layernorm(kv_c)
 
         q = q.view(-1, self.num_local_heads, self.qk_head_dim)
         # Add a head dim of 1 to k_pe.
         k_pe = k_pe.unsqueeze(1)
-        q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
-            positions, q[..., self.qk_nope_head_dim :], k_pe
-        )
+        kv_c_normed = self._prepare_mla_qkv(q, kv_c, k_pe, positions)
 
         if llama_4_scaling is not None:
             q *= llama_4_scaling
@@ -899,6 +1091,21 @@ class HYV4MLAAttention(nn.Module):
             hidden_states.shape[0],
             self.num_local_heads * self.v_head_dim,
         )
+        # HY4's elementwise gate is folded into the absorbed v-up store, so the
+        # gate GEMM has to run *before* attention and hand its logits over. The
+        # headwise variant reshapes the output and is left on the eager path.
+        fused_gate = (
+            self.gated_mla
+            and self.linear_gate is not None
+            and self.config.gating_type != "headwise"
+            and getattr(self.mla_attn, "fuse_gate", False)
+        )
+        gate_score = None
+        if fused_gate:
+            gate_score = self.linear_gate(hidden_states)[0]
+            self.mla_attn.gate_logits = gate_score
+            self.mla_attn.gated_rows = 0
+
         if is_breakable_cudagraph_enabled():
             # Breakable CUDA graphs replay the eager segment without a Python
             # return value, so it needs a caller-owned stable output buffer.
@@ -922,7 +1129,15 @@ class HYV4MLAAttention(nn.Module):
                 output_shape=output_shape,
             )
 
-        if self.gated_mla and self.linear_gate is not None:
+        if fused_gate:
+            gated = self.mla_attn.gated_rows
+            self.mla_attn.gate_logits = None
+            if gated < attn_out.shape[0]:
+                # Mixed batch: the dense-MHA prefill rows never reached the
+                # gated v-up, so gate the tail here.
+                assert gate_score is not None
+                attn_out[gated:].mul_(gate_score[gated:].sigmoid())
+        elif self.gated_mla and self.linear_gate is not None:
             gate_score = self.linear_gate(hidden_states)[0]
             if self.config.gating_type == "headwise":
                 gate_score = gate_score.unsqueeze(-1)

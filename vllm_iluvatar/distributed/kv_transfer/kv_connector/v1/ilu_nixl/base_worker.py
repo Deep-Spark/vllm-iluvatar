@@ -749,11 +749,9 @@ class IluNixlWorkerMixin:
             selected_local_region_ids, selected_remote_region_ids
         ):
             replicated = self._is_region_replicated(local_region_id)
-            local_block_len = self.get_backend_aware_kv_block_len(
-                layer_idx=local_region_id,
-                first_split=True,
-                mamba_view=False,
-            )
+            # Use the stride registered for this transfer region.  The IluNixl
+            # worker mixin does not implement get_backend_aware_kv_block_len.
+            local_block_len = self.block_len_per_layer[local_region_id]
             remote_kv_block_len = local_block_len // block_size_ratio
             if block_size_ratio > 1:
                 local_block_len = remote_kv_block_len

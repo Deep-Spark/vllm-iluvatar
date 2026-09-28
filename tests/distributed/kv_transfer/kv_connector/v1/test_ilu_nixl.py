@@ -173,6 +173,26 @@ def test_infer_pp_split_respects_env(monkeypatch):
     assert infer_pp_split(vllm_config) == "21,22"
 
 
+def test_remote_transfer_regions_uses_registered_block_lengths():
+    worker = object.__new__(IluNixlWorkerMixin)
+    worker._is_hma_required = False
+    worker.transfer_topo = SimpleNamespace(block_size_ratio=lambda _: 2)
+    worker._group_spec_types = [FullAttentionSpec]
+    worker.tp_mappings = {
+        "remote": SimpleNamespace(
+            source_ranks_per_group=[[0, 1]],
+            rank_offset_factor=1,
+        )
+    }
+    worker.block_len_per_layer = [2048]
+    worker._is_region_replicated = lambda _: False
+    remote_meta = SimpleNamespace(block_size=128)
+
+    assert worker._remote_transfer_regions("remote", remote_meta, [0], [3]) == [
+        (3, 512, 1024)
+    ]
+
+
 def test_cache_identity_and_region_range_selection():
     assert (
         IluNixlWorkerMixin._cache_kind_from_layer_name("model.layers.16.attn.swa_cache")

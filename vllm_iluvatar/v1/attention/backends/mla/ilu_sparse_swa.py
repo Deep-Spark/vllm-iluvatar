@@ -309,10 +309,10 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
         fast_build: bool = False,
         replay_start: torch.Tensor | None = None,
     ) -> DeepseekSparseSWAMetadata:
-        assert replay_start is not None, "no graph for now, replay_start must be provided"
         """``replay_start`` ([num_reqs], SWA bounded replay): the position from
         which each request holds window KV. The model state passes it for every
-        batch of a replaying group; graph captures pass nothing.
+        batch of a replaying group; graph captures and the DSpark drafter pass
+        nothing, and those batches replay nothing.
         """
         seq_lens = common_attn_metadata.seq_lens
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound

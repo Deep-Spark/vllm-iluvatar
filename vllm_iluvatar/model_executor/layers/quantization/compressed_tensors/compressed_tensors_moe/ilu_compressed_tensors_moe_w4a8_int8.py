@@ -1248,6 +1248,12 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         )
         if output_format is not None:
             kwargs["output_format"] = output_format
+        # Group-gemv (format 1) requires the int8 width to be a multiple of 64.
+        # Pad inside the kernel up to gemm2's padded K so the zero tail matches
+        # the padded w2 and the later pad_tensor is a no-op.
+        if output_format == 1:
+            valid_hidden = input.shape[-1] // 2
+            kwargs["output_padding"] = max(0, self.gemm2_info.pad_k - valid_hidden)
         kwargs["check_valid"] = check_valid
 
         # Explicit dispatch with whitelist — unknown activations must raise

@@ -61,6 +61,7 @@ import sys
 import types
 
 _applied = False
+_applying = False
 _torch_c_schema_libraries: list[object] = []
 
 _TORCH_C_COMPILE_SCHEMA_OPS = {
@@ -483,24 +484,38 @@ def _load_native_torch_ops() -> None:
 
 
 def apply() -> None:
-    """Apply all early compat shims.  Idempotent and defensive."""
-    global _applied
-    if _applied:
+    """Apply all early compat shims.  Idempotent and defensive.
+
+    The installed ``.pth`` runs while site.py is still adding system
+    site-packages, so ``import torch`` can fail on that first call. Do not
+    latch success in that case: ``register_platform`` / ``register_general``
+    call back after ``torch`` is importable and must be able to finish
+    loading ``torch.ops._C`` (including ``rotary_embedding``).
+    """
+    global _applied, _applying
+    if _applied or _applying:
         return
-    _applied = True
+    _applying = True
     try:
-        _patch_torch()
-        _patch_triton_gluon_symbols()
-        _patch_triton_gdc_symbols()
-        _stub_symmetric_memory()
-        _disable_unsupported_symmetric_memory()
+        # Stand-ins must land before any other shim imports community vLLM.
+        # fa_utils imports vllm.vllm_flash_attn at module scope on the cuda branch.
         _install_import_shims()
-        _register_import_hooks()
-        _load_native_torch_ops()
-        _define_missing_torch_c_compile_schema_ops()
-    except Exception:
-        # Compat shims must never break interpreter / vLLM startup.
-        pass
+        try:
+            _patch_torch()
+            _patch_triton_gluon_symbols()
+            _patch_triton_gdc_symbols()
+            _stub_symmetric_memory()
+            _disable_unsupported_symmetric_memory()
+            _register_import_hooks()
+            _load_native_torch_ops()
+            _define_missing_torch_c_compile_schema_ops()
+        except Exception:
+            # Compat shims must never break interpreter / vLLM startup.
+            # Leave ``_applied`` false so a later call can retry.
+            return
+        _applied = True
+    finally:
+        _applying = False
 
 
 # Apply on import. This module is loaded exactly once via

@@ -79,6 +79,55 @@ def test_torch_config_key_is_not_overwritten():
     assert module._config["alignment_asserts"] is sentinel
 
 
+def test_apply_retries_after_torch_is_missing(monkeypatch):
+    """A .pth-time ``import torch`` failure must not latch the shim as done."""
+    import torch
+    from torch._ops import OpOverload
+
+    real_patch_torch = patch_import_compat._patch_torch
+    calls = {"n": 0}
+
+    def flaky_patch_torch():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ModuleNotFoundError("No module named 'torch'")
+        return real_patch_torch()
+
+    monkeypatch.setattr(patch_import_compat, "_patch_torch", flaky_patch_torch)
+    monkeypatch.setattr(patch_import_compat, "_applied", False)
+
+    patch_import_compat.apply()
+    assert patch_import_compat._applied is False
+    assert calls["n"] == 1
+
+    patch_import_compat.apply()
+    assert patch_import_compat._applied is True
+    assert calls["n"] == 2
+    assert isinstance(torch.ops._C.rotary_embedding.default, OpOverload)
+
+
+def test_loader_retries_incomplete_apply(monkeypatch):
+    import sys
+
+    import vllm_iluvatar
+
+    vllm_iluvatar._load_import_compat_patch()
+    module = sys.modules["vllm_iluvatar._early_import_compat"]
+    called: list[int] = []
+
+    def mark_applied():
+        called.append(1)
+        module._applied = True
+
+    monkeypatch.setattr(module, "_applied", False)
+    monkeypatch.setattr(module, "apply", mark_applied)
+
+    vllm_iluvatar._load_import_compat_patch()
+
+    assert called == [1]
+    assert module._applied is True
+
+
 def test_missing_torch_c_compile_schema_ops_are_dispatcher_overloads():
     import torch
     from torch._ops import OpOverload

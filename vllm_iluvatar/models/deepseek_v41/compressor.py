@@ -241,7 +241,7 @@ class IluDeepseekCompressor(nn.Module):
             slot_mapping = cast(Any, attn_metadata[self.k_cache_prefix]).slot_mapping
         else:
             state_metadata = cast(
-                CompressorMetadata, attn_metadata[self.state_cache.prefix]
+                IluCompressorMetadata, attn_metadata[self.state_cache.prefix]
             )
             state_cache = self.state_cache.kv_cache
             # The kernel splits a ring slot by the page's own row count, so a

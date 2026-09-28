@@ -50,7 +50,6 @@ def _should_throttle_prefills(self) -> bool:
 PROCESS_ENGINE_STEP = '''\
 def _process_engine_step(self) -> bool:
     """Called only when there are unfinished local requests."""
-
     # Step the engine core.
     outputs, model_executed = self.step_fn()
     # Put EngineCoreOutputs into the output queue.

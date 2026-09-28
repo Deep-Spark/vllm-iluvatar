@@ -37,11 +37,18 @@ def _load_import_compat_patch() -> None:
     of a normal ``import vllm_iluvatar.ilu_patch.patch_import_compat``) so this
     can run at interpreter-startup time — from the installed .pth in spawned
     workers and from ``register_platform`` in the main process — without
-    importing the whole ``vllm_iluvatar.ilu_patch`` package eagerly.  Idempotent
-    via ``sys.modules``.
+    importing the whole ``vllm_iluvatar.ilu_patch`` package eagerly.
+
+    Idempotent once ``apply()`` has succeeded. A ``.pth``-time attempt can
+    fail before ``torch`` is importable; that leaves the module in
+    ``sys.modules`` with ``_applied`` still false, and this function must
+    call ``apply()`` again instead of returning.
     """
     module_name = "vllm_iluvatar._early_import_compat"
     if module_name in sys.modules:
+        module = sys.modules[module_name]
+        if not getattr(module, "_applied", False):
+            module.apply()
         return
 
     patch_path = (
@@ -127,6 +134,13 @@ def register_general() -> None:
         import ixformer  # noqa: F401
     except ImportError:
         return
+
+    # Model-arch inspection spawns `python -m vllm.model_executor.models.registry`,
+    # which only calls load_general_plugins() and never register_platform().
+    # Apply early shims here directly; do not set STARTUP_PATCH_ENV — that flag
+    # is only for enabling the installed .pth in EngineCore/worker children, and
+    # is already set by register_platform in the parent when those are spawned.
+    _load_import_compat_patch()
 
     from vllm_iluvatar.ilu_patch import apply_general_patches
     from vllm_iluvatar.ilu_register import apply_oot_registrations

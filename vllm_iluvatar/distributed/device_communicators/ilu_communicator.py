@@ -24,7 +24,6 @@ from vllm.distributed.device_communicators.cuda_communicator import (
 from vllm.distributed.utils import StatelessProcessGroup
 
 
-
 class IluCommunicator(CudaCommunicator):
     def __init__(
         self,
@@ -108,6 +107,10 @@ class IluCommunicator(CudaCommunicator):
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         if dim < 0:
             dim += input_.dim()
+        # ixformer CHECK_TENSOR requires cuda + contiguous; Engram DP passes
+        # ``hashes[:, layer_hash_index]`` which is a non-contiguous column view.
+        # Match community CudaCommunicator / PyNccl (input_.contiguous()).
+        input_ = input_.contiguous()
         input_size = input_.size()
         output_size = (input_size[0] * self.world_size,) + input_size[1:]
         output_tensor = torch.empty(
@@ -148,6 +151,7 @@ class IluCommunicator(CudaCommunicator):
         else:
             gather_list = None
 
+        input_ = input_.contiguous()
         if self.use_vllm_comm:
             ixfd.gather(
                 input_,
@@ -327,9 +331,13 @@ class IluCommunicator(CudaCommunicator):
             (max_size,) + rest, dtype=input_tensor.dtype, device=input_tensor.device
         )
         if comm.use_vllm_comm:
-            ixfd.reduce_scatter_tensor(out, padded, group=comm.ixfd_group, async_op=True)
+            ixfd.reduce_scatter_tensor(
+                out, padded, group=comm.ixfd_group, async_op=True
+            )
         else:
-            torch.distributed.reduce_scatter_tensor(out, padded, group=comm.device_group)
+            torch.distributed.reduce_scatter_tensor(
+                out, padded, group=comm.device_group
+            )
         out = out[: sizes[comm.rank_in_group]]
         return out.movedim(0, dim).contiguous()
 

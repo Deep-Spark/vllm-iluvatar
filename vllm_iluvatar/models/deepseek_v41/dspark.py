@@ -339,6 +339,14 @@ class IluDSparkDeepseekV41ForCausalLM(nn.Module, SupportsPP):
     draft_id_to_target_id = None
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        # Same Hybrid-EP budget as the target; draft MoE may init its own NVSM
+        # communicator (different topk / expert count) during CUDA graph capture.
+        from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
+            _decode_max_tokens_per_rank_from_config,
+            set_max_num_seqs,
+        )
+
+        set_max_num_seqs(_decode_max_tokens_per_rank_from_config(vllm_config))
         super().__init__()
         assert vllm_config.speculative_config is not None
         self.draft_model_config = vllm_config.speculative_config.draft_model_config

@@ -1073,6 +1073,14 @@ class IluDeepseekV4Fp8ForCausalLM(nn.Module, SupportsPP):
     _LOAD_SKIP_SUBSTRS: tuple[str, ...] = _LOAD_SKIP_SUBSTRS
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        # NVSM Hybrid-EP buffer sizing; CUDA graph capture may clear the
+        # thread-local VllmConfig, so stash the decode token budget here.
+        from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
+            _decode_max_tokens_per_rank_from_config,
+            set_max_num_seqs,
+        )
+
+        set_max_num_seqs(_decode_max_tokens_per_rank_from_config(vllm_config))
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.config = config

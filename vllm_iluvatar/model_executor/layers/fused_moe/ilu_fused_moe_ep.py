@@ -56,6 +56,13 @@ _MAX_NUM_SEQS: int | None = None
 
 
 def set_max_num_seqs(max_num_seqs: int) -> None:
+    """Cache the Hybrid-EP decode token budget for when VllmConfig is absent.
+
+    Callers that care about speculative decode should pass
+    ``_decode_max_tokens_per_rank_from_config(vllm_config)`` (already includes
+    ``max_num_seqs * (1 + num_speculative_tokens)``), not the bare scheduler
+    ``max_num_seqs``. CUDA graph capture may clear the thread-local config.
+    """
     global _MAX_NUM_SEQS
     if max_num_seqs <= 0:
         raise ValueError("max_num_seqs must be positive")
@@ -87,10 +94,27 @@ def _get_max_num_seqs() -> int:
     )
 
 
+def _nvsm_ll_max_tokens_per_rank() -> int:
+    """Token capacity compiled into the Hybrid NVSM LL communicator.
+
+    Matches the buffer sized in ``nvsm_init_ep_comm``. Must stay in sync with
+    ``DeepEPLLPrepareAndFinalize.max_tokens_per_rank`` — using
+    ``moe_config.max_num_tokens`` (often max_num_batched_tokens) here made the
+    modular-kernel metadata disagree with the JIT EPConfig and garbled
+    DSpark multi-token decode.
+    """
+    max_tokens_per_rank = _get_max_num_seqs()
+    tp_size = get_tensor_model_parallel_world_size()
+    if tp_size > 1 and (VLLM_ILU_LL_FUSED_AG_AR or VLLM_ILU_DEEPEP_USE_SCATTER):
+        max_tokens_per_rank = (max_tokens_per_rank + tp_size - 1) // tp_size
+    return max_tokens_per_rank
+
+
 class IluFusedMoEEP:
+    # Shared DeepEP LL manager; NVSM communicators are keyed by MoE shape so
+    # target (e.g. 384/topk6) and DSpark draft (128/topk3) do not collide.
     _dp_ep_ll_all2all_manager = None
-    _dp_ep_ll_all2all_handle = None
-    _dp_ep_ll_all2all_handle_args = None
+    _dp_ep_ll_handles: dict = {}
 
     def init_ep(self):
         if self._should_preinit_dp_ep_ll_handle():
@@ -169,6 +193,24 @@ class IluFusedMoEEP:
             "use_fp8": False,
         }
 
+    def _dp_ep_ll_handle_key(
+        self,
+        all_to_all_args: dict,
+        max_tokens_per_rank: int,
+        topk: int,
+        dispatch_quant_kwargs: dict[str, object],
+    ) -> tuple:
+        quant_items = tuple(sorted(dispatch_quant_kwargs.items(), key=lambda kv: kv[0]))
+        return (
+            all_to_all_args["num_global_experts"],
+            topk,
+            all_to_all_args["token_hidden_size"],
+            all_to_all_args["num_ep_ranks"],
+            all_to_all_args["max_num_tokens_per_dp_rank"],
+            max_tokens_per_rank,
+            quant_items,
+        )
+
     def _get_forward_dp_ep_ll_all2all(self):
         from vllm_iluvatar.distributed.device_communicators.all2all import (
             DeepEPLLAll2AllManager,
@@ -176,45 +218,43 @@ class IluFusedMoEEP:
 
         ep_comm = get_ep_group().device_communicator
         assert ep_comm is not None
-        ll_manager = IluFusedMoEEP._dp_ep_ll_all2all_manager
-        handle = IluFusedMoEEP._dp_ep_ll_all2all_handle
-        if ll_manager is not None and handle is not None:
-            return ll_manager, handle
 
-        if ll_manager is None:
-            ll_manager = DeepEPLLAll2AllManager(
+        if IluFusedMoEEP._dp_ep_ll_all2all_manager is None:
+            IluFusedMoEEP._dp_ep_ll_all2all_manager = DeepEPLLAll2AllManager(
                 ep_comm.cpu_group,
                 getattr(ep_comm, "tcp_store_group", None),
             )
-            IluFusedMoEEP._dp_ep_ll_all2all_manager = ll_manager
+        ll_manager = IluFusedMoEEP._dp_ep_ll_all2all_manager
 
         moe_config = self.experts.moe_config
+        max_tokens_per_rank = _nvsm_ll_max_tokens_per_rank()
+        # Size the BufferWrapper cache key by the NVSM token budget, not
+        # moe_config.max_num_tokens (prefill-scale), so handle.buffer matches
+        # the compiled EPConfig.
         all_to_all_args = dict(
-            max_num_tokens_per_dp_rank=moe_config.max_num_tokens,
+            max_num_tokens_per_dp_rank=max_tokens_per_rank,
             token_hidden_size=moe_config.hidden_dim,
             num_ep_ranks=ll_manager.world_size,
             num_global_experts=moe_config.num_experts,
             num_local_experts=moe_config.num_experts // ll_manager.world_size,
         )
-        if (
-            handle is None
-            or IluFusedMoEEP._dp_ep_ll_all2all_handle_args != all_to_all_args
-        ):
+
+        dispatch_quant_kwargs = self._nvsm_dispatch_quant_kwargs()
+        cache_key = self._dp_ep_ll_handle_key(
+            all_to_all_args,
+            max_tokens_per_rank,
+            moe_config.experts_per_token,
+            dispatch_quant_kwargs,
+        )
+        handle = IluFusedMoEEP._dp_ep_ll_handles.get(cache_key)
+        if handle is None:
             handle = ll_manager.get_handle(all_to_all_args)
-            IluFusedMoEEP._dp_ep_ll_all2all_handle = handle
-            IluFusedMoEEP._dp_ep_ll_all2all_handle_args = all_to_all_args
+            IluFusedMoEEP._dp_ep_ll_handles[cache_key] = handle
 
         if hasattr(handle, "buffer") and handle.buffer is None:
             from ixformer.distributed import nvsm_ep
 
-            max_tokens_per_rank = _get_max_num_seqs()
-            # After TP scatter / fused AG-AR, each rank only holds a shard.
-            # Use ceil division to match the uneven chunking in flatten().
             tp_size = get_tensor_model_parallel_world_size()
-            if VLLM_ILU_LL_FUSED_AG_AR or VLLM_ILU_DEEPEP_USE_SCATTER:
-                max_tokens_per_rank = (max_tokens_per_rank + tp_size - 1) // tp_size
-
-            dispatch_quant_kwargs = self._nvsm_dispatch_quant_kwargs()
             handle.buffer = nvsm_ep.nvsm_init_ep_comm(
                 max_num_tokens=max_tokens_per_rank,
                 hidden_size=moe_config.hidden_dim,
@@ -256,13 +296,13 @@ class IluFusedMoEEP:
                 local_expert_global_ids,
             ) = routing_tables
 
-        moe_config = runner.moe_config
         ll_manager, handle = self._get_forward_dp_ep_ll_all2all()
+        max_tokens_per_rank = _nvsm_ll_max_tokens_per_rank()
 
         use_fp8_dispatch = bool(self._nvsm_dispatch_quant_kwargs()["use_fp8"])
         prepare_finalize = DeepEPLLPrepareAndFinalize(
             handle,
-            max_tokens_per_rank=moe_config.max_num_tokens,
+            max_tokens_per_rank=max_tokens_per_rank,
             num_dispatchers=ll_manager.world_size,
             use_fp8_dispatch=use_fp8_dispatch,
             global_to_physical=global_to_physical,

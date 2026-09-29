@@ -335,9 +335,20 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
 
         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
         is_valid_token.copy_(slot_mapping >= 0)
+        num_rows = seq_lens.shape[0]
         if replay_start is None:
             # Graph captures build without it; their dummy batches replay nothing.
-            replay_start = self.no_replay_start[: seq_lens.shape[0]]
+            replay_start = self.no_replay_start[:num_rows]
+        elif replay_start.shape[0] < num_rows:
+            # The model state used to publish one row per real request. A FULL
+            # graph or DP pad makes seq_lens longer, and v41_swa_* rejects the
+            # short tensor. Padding rows replay nothing.
+            buf = self.no_replay_start[:num_rows]
+            buf.zero_()
+            buf[: replay_start.shape[0]].copy_(replay_start)
+            replay_start = buf
+        elif replay_start.shape[0] > num_rows:
+            replay_start = replay_start[:num_rows]
 
         decode_swa_indices = self.decode_swa_indices
         if num_decode_tokens > 0:

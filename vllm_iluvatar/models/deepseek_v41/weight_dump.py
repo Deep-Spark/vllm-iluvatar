@@ -1,12 +1,12 @@
 """Per-rank weight snapshot, so an out-of-bounds kernel can be caught after the fact.
 
-``IluDeepseekV41Model`` starts one of these in every worker. Each TP/PP rank
+``IluDeepseekV41Model`` starts one of these in every worker. Each DP/TP/PP rank
 binds its own port and serves a single endpoint:
 
     POST /v1/chat/save_weights   {"tag": "<name>"}
     GET  /v1/chat/save_weights
 
-A tag is written once, to ``/data/nlp/dsv41_weight_dump/<tag>/pp<P>_tp<T>/``.
+A tag is written once, to ``/data/nlp/dsv41_weight_dump/<tag>/dp<D>_pp<P>_tp<T>/``.
 A second call with the same tag is refused, so a rank can only be snapshotted
 twice by using two tags. Engram parameters are skipped (they live on CPU, and
 are not what an attention kernel could scribble on); so is anything else that
@@ -29,21 +29,24 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from vllm.distributed import get_pp_group, get_tp_group
+from vllm.distributed import get_dp_group, get_pp_group, get_tp_group
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# 19000 + pp * STRIDE + tp. STRIDE stays above any tp world we run.
+# 19000 + dp * DP_STRIDE + pp * PP_STRIDE + tp.
+# PP_STRIDE stays above any tp world we run; DP_STRIDE covers pp*PP_STRIDE
+# for pp up to 16 so DP ranks do not collide on the same host.
 _PORT_BASE = 19000
-_PORT_STRIDE = 16
+_PP_STRIDE = 16
+_DP_STRIDE = 256
 _DUMP_ROOT = Path("/data/nlp/dsv41_weight_dump")
 _TAG_OK = re.compile(r"[A-Za-z0-9_-]{1,32}")
 _ENGRAM = re.compile(r"(^|\.)engram\.")
 
 
-def port_for(pp_rank: int, tp_rank: int) -> int:
-    return _PORT_BASE + pp_rank * _PORT_STRIDE + tp_rank
+def port_for(dp_rank: int, pp_rank: int, tp_rank: int) -> int:
+    return _PORT_BASE + dp_rank * _DP_STRIDE + pp_rank * _PP_STRIDE + tp_rank
 
 
 def _sha256(cpu: torch.Tensor) -> str:
@@ -61,14 +64,16 @@ def _sha256(cpu: torch.Tensor) -> str:
     return hasher.hexdigest()
 
 
-def dump_weights(model: nn.Module, tag: str, pp_rank: int, tp_rank: int) -> dict:
+def dump_weights(
+    model: nn.Module, tag: str, dp_rank: int, pp_rank: int, tp_rank: int
+) -> dict:
     # The listener starts at the end of ``__init__``, which is before
     # ``load_weights``. Snapshotting then would record uninitialised storage.
     if not getattr(model, "_weights_ready", False):
         raise RuntimeError("weights are not loaded yet")
     if not _TAG_OK.fullmatch(tag):
         raise ValueError(f"tag must match {_TAG_OK.pattern}")
-    dest = _DUMP_ROOT / tag / f"pp{pp_rank}_tp{tp_rank}"
+    dest = _DUMP_ROOT / tag / f"dp{dp_rank}_pp{pp_rank}_tp{tp_rank}"
     if dest.exists():
         raise FileExistsError(f"{dest} already exists; a tag is written once")
 
@@ -115,6 +120,7 @@ def dump_weights(model: nn.Module, tag: str, pp_rank: int, tp_rank: int) -> dict
 
     summary = {
         "tag": tag,
+        "dp": dp_rank,
         "pp": pp_rank,
         "tp": tp_rank,
         "num_tensors": len(manifest),
@@ -126,8 +132,9 @@ def dump_weights(model: nn.Module, tag: str, pp_rank: int, tp_rank: int) -> dict
     # Written last: its presence is what a client waits on.
     (dest / "DONE").write_text(json.dumps(summary))
     logger.info(
-        "weight dump %s pp=%s tp=%s tensors=%s bytes=%.2fGiB skipped=%s",
+        "weight dump %s dp=%s pp=%s tp=%s tensors=%s bytes=%.2fGiB skipped=%s",
         tag,
+        dp_rank,
         pp_rank,
         tp_rank,
         len(manifest),
@@ -139,9 +146,10 @@ def dump_weights(model: nn.Module, tag: str, pp_rank: int, tp_rank: int) -> dict
 
 def start_weight_dump_server(model: nn.Module) -> None:
     """Bind this worker's port. A failure to bind is logged, not fatal."""
+    dp_rank = get_dp_group().rank_in_group
     pp_rank = get_pp_group().rank_in_group
     tp_rank = get_tp_group().rank_in_group
-    port = port_for(pp_rank, tp_rank)
+    port = port_for(dp_rank, pp_rank, tp_rank)
     lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
@@ -151,6 +159,7 @@ def start_weight_dump_server(model: nn.Module) -> None:
                 return
             self._send(
                 {
+                    "dp": dp_rank,
                     "pp": pp_rank,
                     "tp": tp_rank,
                     "port": port,
@@ -168,7 +177,7 @@ def start_weight_dump_server(model: nn.Module) -> None:
                 body = json.loads(self.rfile.read(n) or b"{}")
                 tag = str(body["tag"])
                 with lock:
-                    summary = dump_weights(model, tag, pp_rank, tp_rank)
+                    summary = dump_weights(model, tag, dp_rank, pp_rank, tp_rank)
             except FileExistsError as exc:
                 self._send({"error": str(exc)}, status=409)
                 return
@@ -197,10 +206,14 @@ def start_weight_dump_server(model: nn.Module) -> None:
     httpd.daemon_threads = True
     thread = threading.Thread(
         target=httpd.serve_forever,
-        name=f"weight-dump-pp{pp_rank}-tp{tp_rank}",
+        name=f"weight-dump-dp{dp_rank}-pp{pp_rank}-tp{tp_rank}",
         daemon=True,
     )
     thread.start()
     logger.info(
-        "weight dump listening on :%s (pp=%s tp=%s)", port, pp_rank, tp_rank
+        "weight dump listening on :%s (dp=%s pp=%s tp=%s)",
+        port,
+        dp_rank,
+        pp_rank,
+        tp_rank,
     )

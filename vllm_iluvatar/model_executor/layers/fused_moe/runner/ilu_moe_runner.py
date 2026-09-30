@@ -18,6 +18,7 @@ Override summary (each marked with ``# [ILU override]`` in-line):
   do_naive_dispatch_combine         drop supports_internal_mk / SP checks
   _is_unquantized_fused_moe_method  new helper (W16A16 detection)
   _kernel_handles_own_dispatch      new property (monolithic W16A16 guard)
+  _ilu_fused_ep_combine + helpers   new: 5 collectives per layer -> 2
 
 0.30.1 shared-experts rework absorbed here: ``SharedExperts`` no longer has
 ``maybe_sync_shared_experts_stream`` / ``_run_in_aux_stream``.  The aux-stream
@@ -33,14 +34,19 @@ from collections.abc import Callable
 from typing import cast
 
 import torch
+from vllm import envs
 from vllm.config import get_current_vllm_config
-from vllm.distributed import get_ep_group, get_pcp_group
+from vllm.distributed import get_dp_group, get_ep_group, get_pcp_group
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
     MoERunner,
     _moe_forward_shared,
     _unpack,
+)
+from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
+    ZeroExpertRouter,
 )
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExpertsOrder,
@@ -63,7 +69,12 @@ class IluMoERunner(MoERunner):
         super().__init__(*args, routed_scaling_factor=routed_scaling_factor, **kwargs)
         logger.info_once("Use Iluvatar MoERunner.")
 
-        if get_current_vllm_config().parallel_config.enable_elastic_ep:
+        # Read here rather than in forward: the thread-local VllmConfig is not
+        # guaranteed to be set during CUDA graph capture.
+        self._ilu_elastic_ep = bool(
+            get_current_vllm_config().parallel_config.enable_elastic_ep
+        )
+        if self._ilu_elastic_ep:
             from vllm_iluvatar.model_executor.layers.fused_moe.runner.ilu_elastic_ep import (  # noqa: E501
                 install_ilu_elastic_ep_patches,
             )
@@ -100,6 +111,10 @@ class IluMoERunner(MoERunner):
         shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if not isinstance(hidden_states, tuple):
+            if self._ilu_fused_ep_combine:
+                return self._forward_fused_ep_combine(
+                    hidden_states, router_logits, input_ids, shared_experts_input
+                )
             return super().forward(
                 hidden_states, router_logits, input_ids, shared_experts_input
             )
@@ -293,6 +308,11 @@ class IluMoERunner(MoERunner):
     ):
         self.routed_experts._ensure_moe_quant_config_init()
 
+        if self._ilu_fused_ep_combine:
+            return self._forward_impl_fused_ep_combine(
+                hidden_states, router_logits, shared_experts_input, input_ids
+            )
+
         shared_experts_overlapping = False
         if self._shared_experts is not None:
             shared_experts_overlapping = self._shared_experts.maybe_forward_async(
@@ -443,3 +463,269 @@ class IluMoERunner(MoERunner):
         )
 
         return ilu_kernel_handles_own_dispatch(self._quant_method)
+
+    # ------------------------------------------------------------------
+    # [ILU addition] fused EP combine — collective launch reduction
+    # ------------------------------------------------------------------
+    # On the AG/RS naive DP+EP path the community schedule costs five
+    # collective launches per MoE layer:
+    #
+    #   _maybe_dispatch   all_gatherv([hidden, router_logits, input_ids])
+    #                     -> ilu_communicator issues one all_gather_into_tensor
+    #                        per list entry, i.e. 3 launches
+    #   _maybe_combine    reduce_scatterv over the DP group            -> 1
+    #   _maybe_reduce_final_output  all_reduce over the TP group       -> 1
+    #
+    # At batch 1 each one moves a few KB, so the layer pays five launch
+    # latencies (times 40 layers, inside the decode CUDA graph) to move
+    # almost nothing. Three of the five are removable:
+    #
+    #   * router_logits is a per-token GEMM of hidden_states. Running the
+    #     gate *after* the gather reproduces exactly the same logits on
+    #     every rank without putting them on the wire.
+    #   * input_ids is read only by hash routing (``_hash_indices_table``).
+    #   * RS(DP) + AR(TP) == AR(EP) once the shared-expert partial is folded
+    #     into this rank's own shard: with EP, tp_size is flattened into
+    #     ep_size = dp_size * tp_size and every expert lives on exactly one
+    #     EP rank, so summing the routed partials over the EP group is the
+    #     complete routed sum; and the only ranks holding a nonzero shared
+    #     term for row ``t`` are the TP peers of the DP rank that owns ``t``,
+    #     which are all inside the same EP group.
+    #
+    # This is the reduction ``IluFusedMoEEP.forward_dp_ep_naive`` already
+    # performs. It is unreachable for DeepSeek-V4.1, whose FFN drives the
+    # runner directly instead of going through ``IluFusedMoEEP.forward_dp_ep``.
+    # Note the accumulation order changes (one bf16 reduction tree instead of
+    # RS-then-AR), so this is not bit-identical to the community path.
+    #
+    # Kill switch: ``VLLM_ILU_FUSE_EP_COMBINE=0``.
+    @property
+    def _ilu_fused_ep_combine(self) -> bool:
+        cached = self.__dict__.get("_ilu_fused_ep_combine_cached")
+        if cached is None:
+            cached = self._ilu_compute_fused_ep_combine()
+            self.__dict__["_ilu_fused_ep_combine_cached"] = cached
+        return cached
+
+    def _ilu_compute_fused_ep_combine(self) -> bool:
+        """Config-only eligibility check, evaluated once on first forward.
+
+        Deferred past ``__init__`` because ``_fused_output_is_reduced``
+        depends on the modular kernel, which is only attached in
+        ``process_weights_after_loading``. Everything read here is static
+        afterwards, with the two exceptions (elastic EP, EPLB) rejected up
+        front, so the result is safe to cache.
+        """
+        if not envs.VLLM_ILU_FUSE_EP_COMBINE:
+            return False
+
+        moe = self.moe_config
+        reasons: list[str] = []
+        # Both can swap the quant method / expert map at runtime, which would
+        # invalidate the cached decision below.
+        if self._ilu_elastic_ep:
+            reasons.append("elastic_ep")
+        if moe.moe_parallel_config.enable_eplb:
+            reasons.append("eplb")
+        # Must be the naive AG/RS DP+EP schedule this fast path replaces.
+        if not self.do_naive_dispatch_combine:
+            reasons.append("not_naive_dispatch_combine")
+        if self._kernel_handles_own_dispatch:
+            reasons.append("kernel_owns_dispatch")
+        if self._fused_output_is_reduced:
+            reasons.append("fused_output_already_reduced")
+        if moe.ep_size <= 1:
+            reasons.append(f"ep_size={moe.ep_size}")
+        # SP redistributes tokens itself; PCP adds a second gather domain.
+        if moe.is_sequence_parallel:
+            reasons.append("sequence_parallel")
+        if moe.pcp_size != 1:
+            reasons.append(f"pcp_size={moe.pcp_size}")
+        # The gate must be local, otherwise router_logits has to be gathered.
+        if self.gate is None:
+            reasons.append("no_gate")
+        # These all need work between the routed output and the reduction,
+        # which the single fused all-reduce has no place for.
+        if moe.in_dtype == torch.float16:
+            reasons.append("fp16_shared_scaling")
+        if self._is_unquantized_fused_moe_method():
+            reasons.append("unquantized_output_scale")
+        if self.routed_output_transform is not None:
+            reasons.append("routed_output_transform")
+        if moe.skip_final_all_reduce:
+            reasons.append("skip_final_all_reduce")
+        if isinstance(self.router, ZeroExpertRouter):
+            reasons.append("zero_expert_router")
+        if self.is_monolithic:
+            reasons.append("monolithic_quant_method")
+
+        enabled = not reasons
+        logger.debug(
+            "ILU fused EP combine: %s%s",
+            "enabled" if enabled else "disabled",
+            "" if enabled else " (" + ", ".join(reasons) + ")",
+        )
+        return enabled
+
+    def _ilu_dp_chunk_sizes(self) -> list[int]:
+        """Per-DP-rank token counts, readable outside the SP context.
+
+        ``DPMetadata.local_sizes`` is only filled inside
+        ``_sequence_parallel_context``, and the slice in
+        ``_forward_fused_ep_combine`` runs after that context has exited.
+        With sequence parallelism rejected by the eligibility check,
+        ``sp_size == 1`` and ``_compute_sp_num_tokens`` is the identity, so
+        ``num_tokens_across_dp_cpu`` is the chunk list the community
+        all-gather uses.
+        """
+        assert self.moe_config.sp_size == 1
+        dp_metadata = get_forward_context().dp_metadata
+        assert dp_metadata is not None
+        return dp_metadata.num_tokens_across_dp_cpu.tolist()
+
+    @property
+    def _ilu_router_reads_input_ids(self) -> bool:
+        """Whether ``input_ids`` still has to be put on the wire.
+
+        Across every community router, ``input_ids`` is read in exactly two
+        cases: hash routing (``_hash_indices_table``, DeepSeek-V4 hash layers)
+        and the vision sentinel bias (``bias_vl`` in FusedTopKBiasRouter).
+        DeepSeek-V4.1 has neither, so its dispatch drops to a single tensor.
+        The monolithic path, which also forwards ``input_ids``, is excluded by
+        ``_ilu_compute_fused_ep_combine``.
+        """
+        return (
+            getattr(self.router, "_hash_indices_table", None) is not None
+            or getattr(self.router, "bias_vl", None) is not None
+        )
+
+    def _forward_impl_fused_ep_combine(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+        input_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        """``_forward_impl`` with a 1-tensor dispatch and no combine.
+
+        Returns the routed output still spanning *all* DP rows and still
+        unreduced; ``_forward_fused_ep_combine`` finishes it with one EP
+        all-reduce. The incoming ``router_logits`` (computed by the caller on
+        this rank's rows only) is discarded and recomputed after the gather.
+        """
+        shared_experts_overlapping = False
+        if self._shared_experts is not None:
+            shared_experts_overlapping = self._shared_experts.maybe_forward_async(
+                shared_experts_input
+            )
+
+        dp_group = get_dp_group()
+        sizes = self._ilu_dp_chunk_sizes()
+        assert sizes[dp_group.rank_in_group] == hidden_states.shape[0], (
+            f"{sizes[dp_group.rank_in_group]} != {hidden_states.shape[0]}"
+        )
+
+        with self._sequence_parallel_context():
+            if input_ids is not None and self._ilu_router_reads_input_ids:
+                hidden_states, input_ids = dp_group.all_gatherv(
+                    [hidden_states, input_ids], dim=0, sizes=sizes
+                )
+            else:
+                hidden_states = dp_group.all_gatherv(
+                    hidden_states, dim=0, sizes=sizes
+                )
+                input_ids = None
+
+            assert self.gate is not None
+            if self._fse_fuse_gate:
+                self._maybe_fuse_gate_weights()
+                router_logits = dispatch_unquantized_gemm()(
+                    self, hidden_states, self._combined_gate_weight, None
+                )
+            else:
+                router_logits, _ = self.gate(hidden_states)
+
+            shared_output, fused_output = self._apply_quant_method(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                shared_experts_input=shared_experts_input,
+                input_ids=input_ids,
+                shared_experts_overlapping=shared_experts_overlapping,
+            )
+
+        assert not isinstance(fused_output, UnfinalizedMoEOutput), (
+            "fused EP combine requires a materialized routed output"
+        )
+        return shared_output, fused_output
+
+    def _forward_fused_ep_combine(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """``MoERunner.forward`` tail with RS(DP) + AR(TP) folded into AR(EP).
+
+        ``_ilu_compute_fused_ep_combine`` has already ruled out every step the
+        community tail would do between the two outputs and the reduction
+        (fp16 shared scaling, unquantized output scale, routed output
+        transform, zero experts, pre-reduced fused output), so the only work
+        left here is the shared add and the reduction itself.
+        """
+        if shared_experts_input is None:
+            hidden_states, shared_experts_input = self.apply_routed_input_transform(
+                hidden_states
+            )
+
+        hidden_states, og_hidden_dim_pre_xform, og_hidden_dim_post_xform = (
+            self._maybe_pad_hidden_states(
+                shared_experts_input,
+                hidden_states,
+            )
+        )
+
+        result = self._forward_entry(
+            hidden_states,
+            router_logits,
+            shared_experts_input,
+            input_ids,
+            self._encode_layer_name(),
+            self.moe_config.hidden_dim_unpadded
+            if self._quant_method.has_unpadded_output
+            else 0,
+        )
+
+        shared_output, fused_output = _unpack(result)
+        fused_output = cast(torch.Tensor, fused_output)
+
+        if og_hidden_dim_pre_xform is not None:
+            fused_output = fused_output[..., :og_hidden_dim_pre_xform]
+        # The trim above can leave a strided view, which the collective below
+        # cannot consume; no-op when nothing was actually trimmed.
+        fused_output = fused_output.contiguous()
+
+        # fused_output still covers every DP rank's rows, in the gather order
+        # all_gatherv used, so this rank owns [start, end).
+        sizes = self._ilu_dp_chunk_sizes()
+        dp_rank = get_dp_group().rank_in_group
+        start = sum(sizes[:dp_rank])
+        end = start + sizes[dp_rank]
+        assert fused_output.shape[0] == sum(sizes), (
+            f"{fused_output.shape[0]} != {sum(sizes)}"
+        )
+
+        # Fold this rank's TP-partial shared output into its own rows so the
+        # single all-reduce below sums it together with the routed partials.
+        if shared_output is not None:
+            fused_output[start:end] += shared_output
+
+        # One reduction over DP x TP replaces reduce_scatter(DP) +
+        # all_reduce(TP). IluCommunicator.all_reduce is a single in-place
+        # ixfd.all_reduce.
+        fused_output = get_ep_group().all_reduce(fused_output)
+        result = fused_output[start:end]
+
+        if og_hidden_dim_post_xform is not None:
+            result = result[..., :og_hidden_dim_post_xform]
+        return result

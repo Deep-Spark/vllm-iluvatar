@@ -140,6 +140,7 @@ if TYPE_CHECKING:
     VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS: int = 8
     VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS: float = 0.0
     VLLM_ILU_MOE_EP_LL_MOE_ALGO: str = "GEMV"
+    VLLM_ILU_FUSE_EP_COMBINE: bool = True
     VLLM_ILU_ENABLE_PP_MTP: bool = False
     VLLM_ILU_ENABLE_V2_PP_MTP: bool = False
     VLLM_ILU_MXFP4_MOE_BACKEND: str = "ixmm"
@@ -298,6 +299,12 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_MOE_EP_LL_MOE_ALGO": lambda: os.environ.get(
         "VLLM_ILU_MOE_EP_LL_MOE_ALGO", "GEMV"
     ).upper(),
+    # AG/RS DP+EP only. Collapses the MoE runner's five collectives per layer
+    # (3x dispatch all-gather + DP reduce-scatter + TP all-reduce) into two:
+    # one all-gather of hidden_states, and one EP all-reduce that subsumes the
+    # reduce-scatter, the TP reduction, and the shared-expert add. Set to 0 to
+    # go back to the community schedule. See IluMoERunner._ilu_fused_ep_combine.
+    "VLLM_ILU_FUSE_EP_COMBINE": _bool_reader("VLLM_ILU_FUSE_EP_COMBINE", "1"),
     # Opt-in gate for the PP + MTP / speculative-decode compatibility
     # patch (ilu_patch/general_patches/patch_pp_mtp.py). Default off so the
     # plugin leaves community vLLM untouched unless explicitly enabled.

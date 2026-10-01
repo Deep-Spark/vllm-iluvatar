@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Engram: n-gram hash memory written into the residual stream (DeepSeek-V4.1).
-"""
+"""Engram: n-gram hash memory written into the residual stream (DeepSeek-V4.1)."""
 
 from __future__ import annotations
 
+import contextlib
 import os
 
 import ixformer.inference.functions as ixfops
@@ -42,11 +42,14 @@ def engram_dp_token_slot(group) -> int:
     """Common token count so every DP rank enters the Engram collective."""
     meta = get_forward_context().dp_metadata
     if meta is None:
-        raise RuntimeError("Engram DP lookup needs dp_metadata.num_tokens_across_dp_cpu")
+        raise RuntimeError(
+            "Engram DP lookup needs dp_metadata.num_tokens_across_dp_cpu"
+        )
     counts = meta.num_tokens_across_dp_cpu
     start = 0
     stop = group.world_size
     return int(counts[start:stop].max())
+
 
 # 表本身是 F8_E4M3，它的块缩放是 F8_E8M0。其余几个只是为了以后换量化格式时不用回来改。
 _SAFETENSORS_DTYPES = {
@@ -117,8 +120,9 @@ def _map_locked_rows(
 
     fd = os.open(path, os.O_RDONLY)
     try:
-        region = mmap.mmap(fd, nbytes + skew, mmap.MAP_SHARED, mmap.PROT_READ,
-                           offset=map_off)
+        region = mmap.mmap(
+            fd, nbytes + skew, mmap.MAP_SHARED, mmap.PROT_READ, offset=map_off
+        )
     finally:
         os.close(fd)
 
@@ -128,24 +132,26 @@ def _map_locked_rows(
         # 只读 buffer 会触发 "PyTorch 不支持不可写张量" 的告警。这里正是要不可写：
         # 表只被 index_select 读，写它反而是 bug。
         warnings.simplefilter("ignore")
-        flat = torch.frombuffer(region, dtype=dtype, count=nbytes // itemsize,
-                                offset=skew)
+        flat = torch.frombuffer(
+            region, dtype=dtype, count=nbytes // itemsize, offset=skew
+        )
     table = flat.view(end - start, *shape[1:])
 
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
     libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-    try:
-        resource.setrlimit(resource.RLIMIT_MEMLOCK,
-                           (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
-    except (OSError, ValueError):
-        pass  # 提不动就照原样试，锁不上会走下面的回退
+    # 提不动就照原样试，锁不上会走下面的回退
+    with contextlib.suppress(OSError, ValueError):
+        resource.setrlimit(
+            resource.RLIMIT_MEMLOCK, (resource.RLIM_INFINITY, resource.RLIM_INFINITY)
+        )
     addr = table.data_ptr()
     page = os.sysconf("SC_PAGESIZE")
     lo = addr - (addr % page)
     if libc.mlock(ctypes.c_void_p(lo), ctypes.c_size_t(nbytes + (addr - lo))) != 0:
         errno = ctypes.get_errno()
-        raise OSError(errno, f"mlock {nbytes / 2**30:.2f} GiB 失败: "
-                             f"{os.strerror(errno)}")
+        raise OSError(
+            errno, f"mlock {nbytes / 2**30:.2f} GiB 失败: {os.strerror(errno)}"
+        )
     return table, region
 
 
@@ -359,7 +365,6 @@ def _slots_at(md, req: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
 
 
 class EngramTokenHistory(nn.Module):
-
     DEAD = -1
 
     def __init__(self, token_map: list[int], max_seq_len: int, device) -> None:
@@ -438,7 +443,9 @@ class EngramTokenHistory(nn.Module):
         src = self._compress(input_ids[: slots.size(0)])
         self._slots.index_copy_(0, dst, src)
 
-    def write_slots_kernel(self, input_ids: torch.Tensor, slot_mapping: torch.Tensor) -> None:
+    def write_slots_kernel(
+        self, input_ids: torch.Tensor, slot_mapping: torch.Tensor
+    ) -> None:
         assert self._slots is not None
         n = input_ids.size(0)
         torch.ops._C.engram_write_hash_cache(
@@ -470,8 +477,10 @@ class EngramTokenHistory(nn.Module):
         pos = positions[:t].to(torch.int64)
         nreq = max(int(md.num_reqs), 1)
         qsl = md.query_start_loc
-        req = md.token_to_req_indices[:t].to(torch.int64).clamp(
-            0, min(nreq, qsl.numel()) - 1
+        req = (
+            md.token_to_req_indices[:t]
+            .to(torch.int64)
+            .clamp(0, min(nreq, qsl.numel()) - 1)
         )
         t0 = qsl[req].to(torch.int64).clamp(0, t - 1)
         chunk_start = pos[t0]
@@ -522,7 +531,10 @@ class EngramEmbedding(nn.Module):
         if self._dp_group is not None:
             logger.info(
                 "engram table sharded across TP %d x DP %d, this rank rows [%d, %d)",
-                tp_size, dp_size, self.start_idx, self.end_idx,
+                tp_size,
+                dp_size,
+                self.start_idx,
+                self.end_idx,
             )
         self.weight: torch.Tensor | None = None
         self.scale: torch.Tensor | None = None
@@ -552,7 +564,9 @@ class EngramEmbedding(nn.Module):
             # CUDA default device, where an unqualified ``empty`` lands on the
             # GPU and cannot be pinned at all.
             buf = (
-                torch.empty((n, self.dim), dtype=torch.uint8, device="cpu").pin_memory(),
+                torch.empty(
+                    (n, self.dim), dtype=torch.uint8, device="cpu"
+                ).pin_memory(),
                 torch.empty(
                     (n, self.dim // _FP8_BLOCK), dtype=torch.uint8, device="cpu"
                 ).pin_memory(),
@@ -606,7 +620,8 @@ class EngramEmbedding(nn.Module):
             logger.warning(
                 "engram %s: 共享映射锁不住内存（%s），回退到匿名副本。"
                 "单实例 TP 不受影响；DP 下每个副本各占一份表，注意主机内存。",
-                name, exc,
+                name,
+                exc,
             )
             with safe_open(shard, framework="pt", device="cpu") as f:
                 tensor = f.get_slice(name)[self.start_idx : self.end_idx]
@@ -653,7 +668,9 @@ class EngramEmbedding(nn.Module):
         mask = m_buf.to(device).unflatten(0, indices.shape)
 
         # Block dequantization: [..., dim] -> [..., dim // 32, 32] * [..., dim // 32, 1]
-        values = values.float().unflatten(-1, (-1, _FP8_BLOCK)) * scales.float().unsqueeze(-1)
+        values = values.float().unflatten(
+            -1, (-1, _FP8_BLOCK)
+        ) * scales.float().unsqueeze(-1)
         values = values.flatten(-2).to(torch.bfloat16)
         return values.masked_fill_(mask.unsqueeze(-1), 0)
 
@@ -713,7 +730,11 @@ def lookback_tokens(
     ids = input_ids[:n]
     pos = positions[:n]
     md = _window_metadata()
-    if md is not None and md.slot_mapping is not None and history.ensure_slots(md) is not None:
+    if (
+        md is not None
+        and md.slot_mapping is not None
+        and history.ensure_slots(md) is not None
+    ):
         history.update_slots(ids, md.slot_mapping)
         out = history.lookback_paged(ids, pos, md, max_ngram_size, pad_id)
         return out
@@ -766,9 +787,7 @@ class IluEngram(nn.Module):
             torch.tensor(offsets, dtype=torch.int64, device=device),
             persistent=False,
         )
-        self.register_buffer(
-            "multipliers", multipliers.to(device), persistent=False
-        )
+        self.register_buffer("multipliers", multipliers.to(device), persistent=False)
         self.wkv_weight: torch.Tensor | None = None
         self.wkv_scale: torch.Tensor | None = None
         self.q_weight: torch.Tensor | None = None
@@ -786,9 +805,7 @@ class IluEngram(nn.Module):
         self.key_offset = get_tensor_model_parallel_rank() * self.key_hidden
         # The kernel reads the slice two elements at a time.
         self._shard_keys = (
-            tp_size > 1
-            and self.hidden_size % tp_size == 0
-            and self.key_hidden % 2 == 0
+            tp_size > 1 and self.hidden_size % tp_size == 0 and self.key_hidden % 2 == 0
         )
         if not self._shard_keys:
             self.key_hidden = self.hidden_size
@@ -816,7 +833,9 @@ class IluEngram(nn.Module):
         if self.embed.ensure_device_view():
             logger.info(
                 "engram layer %d: table registered for device lookup (rows [%d, %d))",
-                self.layer_id, self.embed.start_idx, self.embed.end_idx,
+                self.layer_id,
+                self.embed.start_idx,
+                self.embed.end_idx,
             )
         logger.info(
             "engram layer %d: table rows [%d, %d) -> %.2f GiB weight + %.2f GiB scale on CPU",
@@ -989,7 +1008,9 @@ class IluEngram(nn.Module):
 
     def _gate(self, hidden_states: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
         if self._qk_weight is None:
-            self._qk_weight = (self.q_weight.float() * self.k_weight.float()).contiguous()
+            self._qk_weight = (
+                self.q_weight.float() * self.k_weight.float()
+            ).contiguous()
 
         x = hidden_states.contiguous()
         if not self._shard_keys:
@@ -1024,7 +1045,7 @@ class EngramLayout:
         self.n_hash_cols = (self.max_ngram_size - 1) * self.n_heads
 
     @classmethod
-    def from_config(cls, config) -> "EngramLayout | None":
+    def from_config(cls, config) -> EngramLayout | None:
         if not getattr(config, "engram_layer_ids", None):
             return None
         return cls(config)
@@ -1037,7 +1058,15 @@ class NgramHashState(nn.Module):
     There is no device reduction and no host sync.
     """
 
-    def __init__(self, layout: EngramLayout, swa_cache_module, token_map, multipliers, pad_id, device) -> None:
+    def __init__(
+        self,
+        layout: EngramLayout,
+        swa_cache_module,
+        token_map,
+        multipliers,
+        pad_id,
+        device,
+    ) -> None:
         super().__init__()
         self.layout = layout
         self.swa_cache_module = swa_cache_module
@@ -1052,16 +1081,24 @@ class NgramHashState(nn.Module):
             persistent=False,
         )
         self.register_buffer(
-            "multipliers", multipliers.to(device=device, dtype=torch.int64), persistent=False
+            "multipliers",
+            multipliers.to(device=device, dtype=torch.int64),
+            persistent=False,
         )
         prime_rows = []
         offset_rows = []
         for primes in layout.primes:
             flat = [p for group in primes for p in group]
             prime_rows.append(torch.tensor(primes, dtype=torch.int64))
-            offset_rows.append(torch.tensor(np.cumsum([0, *flat[:-1]]), dtype=torch.int64))
-        self.register_buffer("primes", torch.stack(prime_rows).to(device), persistent=False)
-        self.register_buffer("offsets", torch.stack(offset_rows).to(device), persistent=False)
+            offset_rows.append(
+                torch.tensor(np.cumsum([0, *flat[:-1]]), dtype=torch.int64)
+            )
+        self.register_buffer(
+            "primes", torch.stack(prime_rows).to(device), persistent=False
+        )
+        self.register_buffer(
+            "offsets", torch.stack(offset_rows).to(device), persistent=False
+        )
 
     def ensure_cache(self) -> bool:
         kv = self.swa_cache_module.kv_cache
@@ -1095,7 +1132,11 @@ class NgramHashState(nn.Module):
         assert block_table is not None
         n = min(input_ids.size(0), positions.size(0), token_to_req.size(0))
         torch.ops._C.engram_write_hash_cache(
-            input_ids[:n], self.token_map, slot_mapping[:n], self._cache, int(self._nslots)
+            input_ids[:n],
+            self.token_map,
+            slot_mapping[:n],
+            self._cache,
+            int(self._nslots),
         )
         cols = []
         for i in range(self.multipliers.shape[0]):

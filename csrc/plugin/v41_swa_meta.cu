@@ -5,20 +5,21 @@
 //   v41_swa_prefill_gather_lens   -- per-request context rows a prefill gathers
 //
 // These replace ``ixfops.ds4_compute_swa_decode_indices_and_lens`` and
-// ``ixfops.ds4_compute_swa_prefill_gather_lens``. The ixformer ops predate SWA
-// bounded replay (``CacheConfig.swa_bounded_replay``) and take no per-request
-// lower bound, which the replay needs: after a prefix hit the scheduler rewinds
-// the request to ``replay_start`` and only the window from there on has been
-// written, so anything below it must stay out of both the index rows and the
-// gather length. See ``_compute_swa_indices_and_lens_kernel`` and
-// ``ComputePrefillMetadataKernel`` in
-// ``off/vllm/vllm/v1/attention/backends/mla/sparse_swa.py``.
+// ``ixfops.ds4_compute_swa_prefill_gather_lens``, whose contract predates SWA
+// bounded replay (``CacheConfig.swa_bounded_replay``): they take no per-request
+// lower bound, and after a prefix hit the scheduler rewinds a request to
+// ``replay_start`` so only the window from there on has been written.
 //
-// Apart from that lower bound the index op keeps ixformer's contract rather
-// than the Triton one: slots whose page is the null block are dropped and the
-// kept ones compacted to the front, so ``swa_lens`` counts what the row really
-// holds. With the bound in place the two agree -- a retired page can no longer
-// fall inside the window -- but the drop stays as the cheap backstop it was.
+// Both ops follow the community Triton kernels in
+// ``vllm/vllm/v1/attention/backends/mla/sparse_swa.py``:
+// ``_compute_swa_indices_and_lens_kernel`` and
+// ``ComputePrefillMetadataKernel``. In particular the index op keeps the
+// Triton contract rather than ixformer's: output row ``pid`` describes
+// absolute token ``pid + token_offset``, ``swa_lens`` is the window span
+// (``end_pos - start_pos``) rather than a compacted count, a null page stays
+// in the row as ``page * block_size + offset``, an invalid token clears its
+// whole index row to -1, and ``has_image`` widens the window with the
+// per-token left/right in-image visibility.
 
 #include <torch/all.h>
 
@@ -28,7 +29,6 @@
 #include <cstdint>
 
 #include "ops.h"
-#include "utils.cuh"
 
 namespace vllm_iluvatar {
 namespace {
@@ -38,77 +38,76 @@ constexpr int kGatherLenThreads = 128;
 
 __global__ void v41_swa_indices_and_lens_kernel(
     int32_t* __restrict__ swa_indices, int64_t indices_stride,
-    int32_t* __restrict__ swa_lens,
+    int32_t* __restrict__ swa_lens, int window_size, int index_width,
+    const int32_t* __restrict__ left_visible,
+    const int32_t* __restrict__ right_visible,
     const int32_t* __restrict__ query_start_loc,
     const int32_t* __restrict__ seq_lens,
     const int32_t* __restrict__ token_to_req_indices,
     const bool* __restrict__ is_valid_token,
     const int32_t* __restrict__ block_table, int64_t block_table_stride,
-    const int32_t* __restrict__ replay_start, int window_size,
-    int block_size) {
-  extern __shared__ int32_t slots[];  // window_size entries
-  const int token = blockIdx.x;
+    int block_size, const int32_t* __restrict__ replay_start, int token_offset,
+    int has_image) {
+  const int pid = blockIdx.x;
+  const int token_idx = pid + token_offset;
+  int32_t* row = swa_indices + static_cast<int64_t>(pid) * indices_stride;
 
-  if (!is_valid_token[token]) {
-    // Graph-capture or batch padding. Report an empty window and leave the
-    // row as the caller staged it.
+  if (!is_valid_token[token_idx]) {
+    // Graph-capture or batch padding. Clear the row so a padded token cannot
+    // gather through stale indices.
     if (threadIdx.x == 0) {
-      swa_lens[token] = 0;
+      swa_lens[pid] = 0;
+    }
+    for (int off = threadIdx.x; off < index_width; off += blockDim.x) {
+      row[off] = -1;
     }
     return;
   }
 
-  const int req = token_to_req_indices[token];
+  const int req = token_to_req_indices[token_idx];
   const int query_start = query_start_loc[req];
   const int query_len = query_start_loc[req + 1] - query_start;
-  const int pos = seq_lens[req] - query_len + token - query_start;
+  const int seq_len = seq_lens[req];
+  const int pos = seq_len - query_len + token_idx - query_start;
 
-  int start_pos = pos - window_size + 1;
+  // In-image bidirectional visibility widens the window: it starts up to
+  // max(left - (window_size - 1), 0) positions earlier and extends ``right``
+  // positions past the query token.
+  int left = 0;
+  int right = 0;
+  if (has_image) {
+    left = left_visible[token_idx];
+    right = right_visible[token_idx];
+  }
+  int left_add = left - (window_size - 1);
+  if (left_add < 0) {
+    left_add = 0;
+  }
+  int start_pos = pos - (window_size - 1) - left_add;
   if (start_pos < 0) {
     start_pos = 0;
   }
-  // SWA bounded replay: the request holds no window KV below this position.
+  // SWA bounded replay: no window KV exists below the request's replay start.
   const int lower_bound = replay_start[req];
   if (start_pos < lower_bound) {
     start_pos = lower_bound;
   }
-  const int span = pos + 1 - start_pos;
-
-  for (int off = threadIdx.x; off < window_size; off += blockDim.x) {
-    int32_t slot = -1;
-    if (off < span) {
-      const int p = start_pos + off;
-      const int page = block_table[req * block_table_stride + p / block_size];
-      // Page 0 is the null block: a position whose page was retired below the
-      // window contributes nothing.
-      if (page > 0) {
-        slot = page * block_size + p % block_size;
-      }
-    }
-    slots[off] = slot;
-  }
-  __syncthreads();
-
-  // Compact in place -- the write index never overtakes the read index -- so
-  // the store back to the row below stays coalesced.
+  const int end_pos = pos + right + 1;
+  const int swa_len = end_pos - start_pos;
   if (threadIdx.x == 0) {
-    int kept = 0;
-    for (int off = 0; off < window_size; ++off) {
-      const int32_t slot = slots[off];
-      if (slot >= 0) {
-        slots[kept++] = slot;
-      }
-    }
-    for (int off = kept; off < window_size; ++off) {
-      slots[off] = -1;
-    }
-    swa_lens[token] = kept;
+    swa_lens[pid] = swa_len;
   }
-  __syncthreads();
 
-  int32_t* row = swa_indices + token * indices_stride;
-  for (int off = threadIdx.x; off < window_size; off += blockDim.x) {
-    row[off] = slots[off];
+  const int32_t* pages =
+      block_table + static_cast<int64_t>(req) * block_table_stride;
+  for (int off = threadIdx.x; off < index_width; off += blockDim.x) {
+    int32_t slot = -1;
+    if (off < swa_len) {
+      const int p = start_pos + off;
+      const int page = pages[p / block_size];
+      slot = page * block_size + p % block_size;
+    }
+    row[off] = slot;
   }
 }
 
@@ -144,14 +143,17 @@ void check_int32_1d(const torch::Tensor& t, const char* name) {
 }  // namespace
 
 void v41_swa_indices_and_lens(torch::Tensor& swa_indices,
-                              torch::Tensor& swa_lens,
+                              torch::Tensor& swa_lens, int64_t window_size,
+                              int64_t index_width,
+                              torch::Tensor& left_visible,
+                              torch::Tensor& right_visible,
                               torch::Tensor& query_start_loc,
                               torch::Tensor& seq_lens,
                               torch::Tensor& token_to_req_indices,
                               torch::Tensor& is_valid_token,
-                              torch::Tensor& block_table,
-                              torch::Tensor& replay_start, int64_t window_size,
-                              int64_t block_size, int64_t num_tokens) {
+                              torch::Tensor& block_table, int64_t block_size,
+                              torch::Tensor& replay_start, int64_t num_tokens,
+                              int64_t token_offset, bool has_image) {
   if (num_tokens == 0) {
     return;
   }
@@ -172,17 +174,25 @@ void v41_swa_indices_and_lens(torch::Tensor& swa_indices,
                   block_table.scalar_type() == at::kInt &&
                   block_table.stride(1) == 1,
               "block_table must be a 2D int32 CUDA tensor with contiguous rows");
-  TORCH_CHECK(window_size > 0 && block_size > 0,
-              "window_size and block_size must be positive");
-
-  const int64_t index_width = swa_indices.numel() / swa_indices.size(0);
-  TORCH_CHECK(index_width >= window_size, "swa_indices rows are ", index_width,
-              " wide, narrower than the ", window_size, " token window");
+  TORCH_CHECK(window_size > 0 && index_width > 0 && block_size > 0,
+              "window_size, index_width and block_size must be positive");
+  TORCH_CHECK(token_offset >= 0, "token_offset must be non-negative");
+  TORCH_CHECK(swa_indices.size(-1) >= index_width, "swa_indices last dim is ",
+              swa_indices.size(-1), ", narrower than index_width ",
+              index_width);
+  const int64_t abs_end = num_tokens + token_offset;
   TORCH_CHECK(swa_indices.size(0) >= num_tokens &&
                   swa_lens.numel() >= num_tokens &&
-                  is_valid_token.numel() >= num_tokens,
-              "swa_indices / swa_lens / is_valid_token are shorter than "
-              "num_tokens");
+                  is_valid_token.numel() >= abs_end &&
+                  token_to_req_indices.numel() >= abs_end,
+              "index rows or token maps are shorter than the token range");
+  if (has_image) {
+    check_int32_1d(left_visible, "left_visible");
+    check_int32_1d(right_visible, "right_visible");
+    TORCH_CHECK(left_visible.numel() >= abs_end &&
+                    right_visible.numel() >= abs_end,
+                "left_visible / right_visible are shorter than the token range");
+  }
   // ``seq_lens`` is the batch's request count; the other request-indexed
   // tensors must cover it. Which request a token belongs to only the device
   // knows, so this is as far as the bounds can be checked here.
@@ -195,15 +205,19 @@ void v41_swa_indices_and_lens(torch::Tensor& swa_indices,
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(swa_indices));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  const size_t smem = static_cast<size_t>(window_size) * sizeof(int32_t);
   v41_swa_indices_and_lens_kernel<<<static_cast<unsigned>(num_tokens),
-                                    kSwaIndexThreads, smem, stream>>>(
-      swa_indices.data_ptr<int32_t>(), index_width,
-      swa_lens.data_ptr<int32_t>(), query_start_loc.data_ptr<int32_t>(),
-      seq_lens.data_ptr<int32_t>(), token_to_req_indices.data_ptr<int32_t>(),
+                                    kSwaIndexThreads, 0, stream>>>(
+      swa_indices.data_ptr<int32_t>(), swa_indices.stride(0),
+      swa_lens.data_ptr<int32_t>(), static_cast<int>(window_size),
+      static_cast<int>(index_width),
+      has_image ? left_visible.data_ptr<int32_t>() : nullptr,
+      has_image ? right_visible.data_ptr<int32_t>() : nullptr,
+      query_start_loc.data_ptr<int32_t>(), seq_lens.data_ptr<int32_t>(),
+      token_to_req_indices.data_ptr<int32_t>(),
       is_valid_token.data_ptr<bool>(), block_table.data_ptr<int32_t>(),
-      block_table.stride(0), replay_start.data_ptr<int32_t>(),
-      static_cast<int>(window_size), static_cast<int>(block_size));
+      block_table.stride(0), static_cast<int>(block_size),
+      replay_start.data_ptr<int32_t>(), static_cast<int>(token_offset),
+      has_image ? 1 : 0);
 }
 
 void v41_swa_prefill_gather_lens(torch::Tensor& prefill_gather_lens,

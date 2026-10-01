@@ -113,6 +113,11 @@ void check_index_tensor(const torch::Tensor& t, const char* name) {
               name, " must be int32 or int64");
 }
 
+void check_slot_tensor(const torch::Tensor& t, const char* name) {
+  check_index_tensor(t, name);
+  TORCH_CHECK(t.scalar_type() == at::kLong, name, " must be int64");
+}
+
 }  // namespace
 
 void v41_qkv_rope_insert(torch::Tensor& q, torch::Tensor& kv_cache,
@@ -143,7 +148,7 @@ void v41_qkv_rope_insert(torch::Tensor& q, torch::Tensor& kv_cache,
   TORCH_CHECK(cos_sin_cache.size(1) >= kRopeDim,
               "cos_sin_cache must be at least ", kRopeDim, " wide");
   check_index_tensor(positions, "positions");
-  check_index_tensor(slot_mapping, "slot_mapping");
+  check_slot_tensor(slot_mapping, "slot_mapping");
 
   const int64_t num_tokens = slot_mapping.numel();
   TORCH_CHECK(num_tokens <= kv.size(0) && num_tokens <= positions.numel(),

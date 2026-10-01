@@ -374,18 +374,26 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # reaches MLA.
             assert isinstance(self.kv_cache_spec.tokens_per_state, int)
             self.compress_ratio = self.kv_cache_spec.tokens_per_state
-        self.max_decode_context_len = get_max_decode_context_len(
-            self.vllm_config, self.compress_ratio
-        )
-
-        # Pre-allocate compressed slot_mapping buffer for CUDA graph address
-        # stability when this group needs compression (V4 indexer cache).
+        # Pre-allocate buffers for CUDA graph compatibility when
         if self.compress_ratio > 1:
-            self.compressed_slot_mapping_buffer = torch.empty(
+            # compress_ratio > 1 (DeepseekV4)
+            # Compressed slot mapping output buffer
+            self.compressed_slot_mapping_buffer = torch.zeros(
                 (scheduler_config.max_num_batched_tokens,),
                 dtype=torch.int64,
                 device=self.device,
             )
+            # Buffer for compressed seq_lens in decode path
+            self.expanded_seq_lens_buffer = torch.zeros(
+                (scheduler_config.max_num_batched_tokens,),
+                dtype=torch.int32,
+                device=self.device,
+            )
+
+        self.max_decode_context_len = get_max_decode_context_len(
+            self.vllm_config, self.compress_ratio
+        )
+
         self.req_id_per_token_buffer = torch.empty(
             (scheduler_config.max_num_batched_tokens,),
             dtype=torch.int32,
@@ -638,10 +646,6 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # reads these lengths on the host, so the sync is unavoidable here; this
         # is the same copy the property used to make.
         seq_lens_decode_uncomp = common_attn_metadata.seq_lens[:num_decodes].cpu()
-        if compress_ratio > 1:
-            seq_lens_decode = seq_lens_decode_uncomp // compress_ratio
-        else:
-            seq_lens_decode = seq_lens_decode_uncomp
         # These host scalars are fixed at CUDA graph capture time. Actual
         # per-request lengths remain device-driven through cu_seqlens_kv.
         max_context_len = self.max_decode_context_len
@@ -864,36 +868,11 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     ) -> IluDeepseekV32IndexerMetadata:
         num_reqs = common_attn_metadata.num_reqs
         num_tokens = common_attn_metadata.num_actual_tokens
-
-        # When the indexer cache is compressed (V4 ``compress_ratio > 1``)
-        # ``common_attn_metadata.slot_mapping`` is the **uncompressed** slot
-        # mapping prepared by the model runner. Override it with a compressed
-        # version so the ``DeepseekCompressor`` (and any downstream consumer)
-        # writes/reads at compressed-domain offsets matching the K-cache
-        # layout.  CUDA-graph stability is preserved by reusing
-        # ``self.compressed_slot_mapping_buffer``.
-        if self.compress_ratio > 1:
-            padded_num_tokens = common_attn_metadata.slot_mapping.shape[0]
-            # 0.30.1 added the uncompressed ``slot_mapping`` argument so PAD
-            # tokens (SWA bounded replay) stay PAD after compression, and
-            # moved the compressed page size from the ``storage_block_size``
-            # property to ``num_states``.
-            get_compressed_slot_mapping(
-                common_attn_metadata.num_actual_tokens,
-                common_attn_metadata.slot_mapping,
-                common_attn_metadata.query_start_loc,
-                common_attn_metadata.seq_lens,
-                common_attn_metadata.block_table_tensor.clamp(min=0),
-                int(self.kv_cache_spec.num_states),
-                self.compress_ratio,
-                out=self.compressed_slot_mapping_buffer,
-            )
-            # Expose the full CUDA-graph padded length (padding rows stay -1).
-            slot_mapping = self.compressed_slot_mapping_buffer[:padded_num_tokens]
-        else:
-            slot_mapping = common_attn_metadata.slot_mapping
-
+        query_start_loc = common_attn_metadata.query_start_loc
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        seq_lens = common_attn_metadata.seq_lens
+        slot_mapping = common_attn_metadata.slot_mapping
+        block_table = common_attn_metadata.block_table_tensor
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
                 common_attn_metadata,
@@ -904,6 +883,44 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         assert num_decodes + num_prefills == num_reqs
         assert num_decode_tokens + num_prefill_tokens == num_tokens
+
+        # When the indexer cache is compressed (V4 ``compress_ratio > 1``)
+        # ``common_attn_metadata.slot_mapping`` is the **uncompressed** slot
+        # mapping prepared by the model runner. Override it with a compressed
+        # version so the ``DeepseekCompressor`` (and any downstream consumer)
+        # writes/reads at compressed-domain offsets matching the K-cache
+        # layout.  CUDA-graph stability is preserved by reusing
+        # ``self.compressed_slot_mapping_buffer``.
+        slot_mapping = common_attn_metadata.slot_mapping
+        indexer_block_table = block_table
+        if self.compress_ratio > 1:
+            kernel_block_size = self.kernel_block_size
+            if (
+                kernel_block_size is not None
+                and self.kv_cache_spec.block_size != kernel_block_size
+                and self.kv_cache_spec.block_size % kernel_block_size == 0
+            ):
+                factor = self.kv_cache_spec.block_size // kernel_block_size
+                indexer_block_table = (block_table[:, ::factor] // factor).contiguous()
+            local_slot_mapping = slot_mapping
+            # padded_num_tokens = common_attn_metadata.slot_mapping.shape[0]
+            # # 0.30.1 added the uncompressed ``slot_mapping`` argument so PAD
+            # # tokens (SWA bounded replay) stay PAD after compression, and
+            # # moved the compressed page size from the ``storage_block_size``
+            # # property to ``num_states``.
+            compressed_slot_mapping = get_compressed_slot_mapping(
+                num_tokens,
+                local_slot_mapping,
+                query_start_loc,
+                seq_lens,
+                indexer_block_table,
+                self.kv_cache_spec.num_states,
+                self.compress_ratio,
+                out=self.compressed_slot_mapping_buffer,
+            )
+            slot_mapping = compressed_slot_mapping
+        else:
+            slot_mapping = common_attn_metadata.slot_mapping
 
         prefill_metadata = None
         if num_prefills > 0:
@@ -1074,8 +1091,8 @@ class IluDeepseekV4IndexerBackend(IluDeepseekV32IndexerBackend):
 class IluDeepseekV41IndexerBackend(IluDeepseekV4IndexerBackend):
     @staticmethod
     def get_name() -> str:
-        return "ILU_DEEPSEEK_V4_INDEXER"
+        return "ILU_DEEPSEEK_V41_INDEXER"
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [64, 128]
+        return [64]

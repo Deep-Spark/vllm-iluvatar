@@ -33,10 +33,12 @@ from vllm_iluvatar.models.deepseek_v4.fp8_model import (
     _make_fp8_weights_mapper,
 )
 from vllm_iluvatar.models.deepseek_v41 import mhc
-from vllm_iluvatar.models.deepseek_v41.attention import IluDeepseekV41Attention
+from vllm_iluvatar.models.deepseek_v41.attention import (
+    IluDeepseekV41Attention,
+)
 from vllm_iluvatar.models.deepseek_v41.engram import (
-    IluEngram,
     EngramLayout,
+    IluEngram,
     NgramHashState,
     _num_reqs,
     _window_metadata,
@@ -45,7 +47,6 @@ from vllm_iluvatar.models.deepseek_v41.engram import (
     engram_dp_group,
 )
 from vllm_iluvatar.models.deepseek_v41.pp_plan import build_rank_plan, local_kv_source
-from vllm_iluvatar.models.deepseek_v41.weight_dump import start_weight_dump_server
 
 logger = init_logger(f"vllm.{__name__}")
 
@@ -276,8 +277,6 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         # Flipped at the end of load_weights. The listener is up before that,
         # and it refuses a snapshot until this is set.
         self._weights_ready = False
-        # One port per worker. Snapshots are taken from outside, twice.
-        start_weight_dump_server(self)
 
     # ---- construction -----------------------------------------------------
 
@@ -589,7 +588,9 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
             if engram is not None:
                 yield engram
 
-    def _prepare_engram(self, input_ids: torch.Tensor | None, positions: torch.Tensor) -> None:
+    def _prepare_engram(
+        self, input_ids: torch.Tensor | None, positions: torch.Tensor
+    ) -> None:
         """Hash once, then each engram layer gathers its rows before the decoder loop.
 
         DP>1 lookups are collectives. A replica that skips the real hash still
@@ -609,8 +610,13 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 positions[:n],
                 md.query_start_loc,
                 input_ids.new_zeros(n, dtype=torch.bool),
-                input_ids.new_full((max(_num_reqs(md), 1), self.engram_hash.lookback_depth), -1),
-                input_ids.new_zeros((max(_num_reqs(md), 1), self.engram_hash.lookback_depth), dtype=torch.bool),
+                input_ids.new_full(
+                    (max(_num_reqs(md), 1), self.engram_hash.lookback_depth), -1
+                ),
+                input_ids.new_zeros(
+                    (max(_num_reqs(md), 1), self.engram_hash.lookback_depth),
+                    dtype=torch.bool,
+                ),
                 md.slot_mapping,
                 md.block_table,
                 md.token_to_req_indices,
@@ -711,7 +717,6 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 # designated sender.
                 assert self.candidate_idxs_buffer is not None
                 tensors["candidates"] = self.candidate_idxs_buffer[:num_tokens]
-            tensors.update(self.pack_local_aux_hidden_states(aux_hidden_states))
             return IntermediateTensors(tensors)
         hidden_states = mhc.hc_pre(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)

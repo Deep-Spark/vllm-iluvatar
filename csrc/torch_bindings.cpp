@@ -131,10 +131,17 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
       "int compress_ratio) -> ()");
   ops.def(
       "v41_swa_indices_and_lens("
-      "Tensor! swa_indices, Tensor! swa_lens, Tensor query_start_loc, "
+      "Tensor! swa_indices, Tensor! swa_lens, int window_size, int index_width, "
+      "Tensor left_visible, Tensor right_visible, Tensor query_start_loc, "
       "Tensor seq_lens, Tensor token_to_req_indices, Tensor is_valid_token, "
-      "Tensor block_table, Tensor replay_start, int window_size, "
-      "int block_size, int num_tokens) -> ()");
+      "Tensor block_table, int block_size, Tensor replay_start, "
+      "int num_tokens, int token_offset, bool has_image) -> ()");
+  ops.def(
+      "v41_global_topk_indices_and_lens("
+      "Tensor topk_indices, Tensor token_to_req_indices, Tensor block_table, "
+      "int block_size, Tensor is_valid_token, Tensor? positions, "
+      "int compress_ratio, int slot_limit, bool pad_walk_tail) "
+      "-> (Tensor, Tensor)");
   ops.def(
       "v41_swa_prefill_gather_lens("
       "Tensor! prefill_gather_lens, Tensor seq_lens, Tensor query_start_loc, "
@@ -200,6 +207,8 @@ TORCH_LIBRARY_IMPL_EXPAND(_C, CUDA, ops) {
            &vllm_iluvatar::v41_swa_indices_and_lens);
   ops.impl("v41_swa_prefill_gather_lens",
            &vllm_iluvatar::v41_swa_prefill_gather_lens);
+  ops.impl("v41_global_topk_indices_and_lens",
+           &vllm_iluvatar::v41_global_topk_indices_and_lens);
   // Aliasing a CUDA tensor's storage; registered on the CUDA key like upstream.
   ops.impl("weak_ref_tensor", &vllm_iluvatar::weak_ref_tensor);
   ops.impl("engram_write_hash_cache", &vllm_iluvatar::engram_write_hash_cache);

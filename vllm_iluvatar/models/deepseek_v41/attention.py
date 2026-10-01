@@ -17,6 +17,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -38,6 +39,9 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
+from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.skip_layers import (
+    add_skip_layers,
+)
 from vllm_iluvatar.model_executor.layers.sparse_attn_indexer import (
     IluSparseAttnIndexer,
 )
@@ -64,117 +68,6 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 logger = init_logger(f"vllm.{__name__}")
-
-# One ratio-1 layer per process reports. The check is the write slot against the
-# block table the attention kernel will read: a mismatch means insert and
-# attention name different pages for the same token.
-_slot_audit_prefix: str | None = None
-_slot_audit_ok = 0
-
-
-def _audit_prefill_slots(layer, swa_metadata, attn_metadata) -> None:
-    """Compare insert slots with the block tables ``_forward_prefill_opt`` reads."""
-    global _slot_audit_prefix, _slot_audit_ok
-    if os.environ.get("VLLM_ILU_DS4_SLOT_CHECK", "0") == "0":
-        return
-    if layer.compress_ratio != 1 or swa_metadata.prefill_swa_block_table is None:
-        return
-    if _slot_audit_prefix is None:
-        _slot_audit_prefix = layer.prefix
-    if layer.prefix != _slot_audit_prefix:
-        return
-
-    nd = swa_metadata.num_decodes
-    npre = swa_metadata.num_prefills
-    bs = int(swa_metadata.block_size)
-    qsl = swa_metadata.query_start_loc[nd : nd + npre + 1].cpu().tolist()
-    seq = swa_metadata.seq_lens[nd : nd + npre].cpu().tolist()
-    replay = swa_metadata.replay_start[nd : nd + npre].cpu().tolist()
-    n_tok = qsl[-1] - qsl[0]
-    slots = swa_metadata.slot_mapping[qsl[0] : qsl[0] + n_tok].cpu().tolist()
-    write_bt = swa_metadata.block_table[nd : nd + npre].cpu()
-    read_bt = swa_metadata.prefill_swa_block_table.cpu()
-
-    bad: list[str] = []
-    checked = 0
-    cursor = 0
-    # Two requests naming one page: each one's slot matches its own table, and
-    # attention still reads the other request's KV.
-    owners: dict[int, int] = {}
-    for r in range(npre):
-        qlen = qsl[r + 1] - qsl[r]
-        slen = int(seq[r])
-        rep = int(replay[r])
-        nblocks = (max(slen, 1) + bs - 1) // bs
-        for col in range(min(nblocks, write_bt.shape[1])):
-            bid = int(write_bt[r, col])
-            if bid <= 0:
-                continue
-            prev = owners.get(bid)
-            if prev is not None and prev != r and len(bad) < 6:
-                bad.append(f"alias blk={bid} reqs={prev},{r}")
-            else:
-                owners[bid] = r
-        for i in range(qlen):
-            pos = slen - qlen + i
-            slot = int(slots[cursor])
-            cursor += 1
-            if slot < 0 or pos < 0:
-                continue
-            checked += 1
-            got = slot // bs
-            col = pos // bs
-            exp = int(write_bt[r, col]) if col < write_bt.shape[1] else -2
-            rcol = (pos - rep) // bs
-            exp_r = int(read_bt[r, rcol]) if 0 <= rcol < read_bt.shape[1] else -2
-            if got != exp or got != exp_r:
-                if len(bad) < 6:
-                    bad.append(
-                        f"swa r={r} pos={pos} slot={slot} blk={got} "
-                        f"table={exp} read={exp_r} replay={rep}"
-                    )
-
-    if attn_metadata is not None:
-        ratio = int(layer.compress_ratio)
-        cbs = int(attn_metadata.block_size) // ratio
-        cslots = attn_metadata.slot_mapping[qsl[0] : qsl[0] + n_tok].cpu().tolist()
-        cbt = attn_metadata.block_table[nd : nd + npre].cpu()
-        cursor = 0
-        for r in range(npre):
-            qlen = qsl[r + 1] - qsl[r]
-            slen = int(seq[r])
-            for i in range(qlen):
-                pos = slen - qlen + i
-                cslot = int(cslots[cursor])
-                cursor += 1
-                if cslot < 0 or pos < 0 or (pos + 1) % ratio != 0:
-                    continue
-                checked += 1
-                cpos = pos // ratio
-                got = cslot // cbs
-                col = cpos // cbs
-                exp = int(cbt[r, col]) if col < cbt.shape[1] else -2
-                if got != exp and len(bad) < 8:
-                    bad.append(
-                        f"cmp r={r} pos={pos} slot={cslot} blk={got} table={exp}"
-                    )
-
-    if bad:
-        logger.warning(
-            "slot/table mismatch %s checked=%s %s",
-            layer.prefix,
-            checked,
-            " | ".join(bad),
-        )
-    else:
-        _slot_audit_ok += 1
-        if _slot_audit_ok <= 3 or _slot_audit_ok % 500 == 0:
-            logger.warning(
-                "slot/table ok %s checked=%s reports=%s",
-                layer.prefix,
-                checked,
-                _slot_audit_ok,
-            )
 
 
 warnings.filterwarnings(
@@ -849,6 +742,20 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 cache_config=cache_config,
                 compress_ratio=self.compress_ratio,
             )
+            # PD sends the source's own caches; a replica only relays inside
+            # this instance. On a decode instance nothing would fill the
+            # replica's prefix, and its consumers would read garbage.
+            kv_transfer_config = vllm_config.kv_transfer_config
+            if (
+                kv_transfer_config is not None
+                and kv_transfer_config.kv_role == "kv_consumer"
+            ):
+                raise NotImplementedError(
+                    f"layer {layer_id} is a kv forwarder on a PD decode "
+                    "instance; its replica would miss the transferred prefix. "
+                    "Pick a decode PP split that does not cut a kv-sharing group."
+                )
+            add_skip_layers(prefix, self.forwarder_indexer_cache.prefix)
 
         self.indexer = None
         if self.is_index_source:
@@ -1007,6 +914,14 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 prefix=f"{prefix}.compressor",
                 k_cache_prefix=self.prefix,
             )
+        # A PD hit is rewound by the last window and replayed on D, which
+        # rebuilds the window and the compressor's open-group ring (window >=
+        # compress ratio). Without the replay D recomputes only the last
+        # token, so both have to be transferred.
+        if swa_bounded_replay:
+            add_skip_layers(self.swa_cache_layer.prefix)
+            if self.compressor is not None and self.compressor.state_cache is not None:
+                add_skip_layers(self.compressor.state_cache.prefix)
         # Prefix of the attention layer owning this layer's compressed KV
         # cache (self for kv sources).
         if self.compress_ratio > 0:
@@ -1272,7 +1187,6 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             "DeepseekSparseSWAMetadata | None",
             attn_metadata.get(self.swa_cache_layer.prefix),
         )
-        assert swa_metadata is not None
         insert = (
             ixfops.v41_qkv_rope_fp8_insert
             if self.kv_cache_dtype == "fp8_ds_mla"
@@ -1335,6 +1249,14 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 self.indexer_rotary_emb,
             )
 
+        # Every cache of this layer is written by now. The push connector
+        # counts one call per decoder layer of the PP stage, so layers with
+        # nothing to send must call it as well.
+        if isinstance(attn_metadata, dict) and has_kv_transfer_group():
+            get_kv_transfer_group().save_kv_layer(
+                "layer_name", "kv_cache", "attn_metadata"
+            )
+
         self._sparse_indexer_and_attn(
             hidden_states,
             index_q,
@@ -1382,26 +1304,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         if num_prefills > 0:
             prefill_q = q[num_decode_tokens:]
             prefill_out = output[num_decode_tokens:]
-
-            # Three prefill paths, same math, very different shapes. The
-            # default gathers the compressed pool and the window into one bf16
-            # workspace and runs a single sparse-MLA kernel over a combined
-            # index list. ``_opt`` skips the workspace and merges two paged
-            # attentions by LSE. ``_as_decode`` reuses the per-token decode
-            # kernel, which treats every query token as its own batch element
-            # -- fine for correctness, but the query side is large in prefill.
-            if envs.VLLM_ILU_DS4_PREFILL_AS_DECODE:
-                self._forward_prefill_as_decode(
-                    q=prefill_q,
-                    positions=positions[num_decode_tokens:],
-                    compressed_k_cache=self_kv_cache,
-                    output=prefill_out,
-                    attn_metadata=flashmla_metadata if not swa_only else None,
-                    swa_metadata=swa_metadata,
-                )
-            elif swa_metadata.prefill_swa_block_table is not None:
-                # Built only under VLLM_ILU_DS4_PREFILL_OPT, and not for a
-                # step that replays from mid-page (see the builder).
+            if envs.VLLM_ILU_DS4_PREFILL_OPT:
                 self._forward_prefill_opt(
                     q=prefill_q,
                     swa_k_cache=swa_kv_cache,
@@ -1410,7 +1313,17 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                     compressed_k_cache=self_kv_cache,
                     attn_metadata=flashmla_metadata if not swa_only else None,
                 )
+            elif envs.VLLM_ILU_DS4_PREFILL_AS_DECODE:
+                self._forward_prefill_as_decode(
+                    q=prefill_q,
+                    positions=positions[num_decode_tokens:],
+                    compressed_k_cache=self_kv_cache,
+                    output=prefill_out,
+                    attn_metadata=flashmla_metadata if not swa_only else None,
+                    swa_metadata=swa_metadata,
+                )
             else:
+                raise AssertionError("do not use this for prefill")
                 self._forward_prefill(
                     q=prefill_q,
                     compressed_k_cache=self_kv_cache,
@@ -1419,16 +1332,16 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                     attn_metadata=flashmla_metadata if not swa_only else None,
                     swa_metadata=swa_metadata,
                 )
+
         if num_decodes > 0:
             decode_out = output[:num_decode_tokens]
             self._forward_decode(
                 q=q[:num_decode_tokens],
-                kv_cache=self_kv_cache,
                 positions=positions[:num_decode_tokens],
-                swa_metadata=swa_metadata,
-                attn_metadata=flashmla_metadata if not swa_only else None,
-                swa_only=swa_only,
+                compressed_k_cache=self_kv_cache,
                 output=decode_out,
+                attn_metadata=flashmla_metadata if not swa_only else None,
+                swa_metadata=swa_metadata,
             )
 
     def _sparse_indexer_and_attn(
@@ -1450,52 +1363,54 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 index_weights,
             )
             if _DBG_TOPK and self.topk_indices_buffer is not None:
-                _dbg_topk(
-                    self.prefix, index_q, index_weights, self.topk_indices_buffer
-                )
+                _dbg_topk(self.prefix, index_q, index_weights, self.topk_indices_buffer)
 
         self.forward_mqa(q, kv, positions, out)
 
-    def _window_indices(
+    def _sparse_mla(
         self,
-        swa_metadata: DeepseekSparseSWAMetadata,
-        begin: int,
-        end: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """SWA slots for batch tokens ``[begin, end)``.
+        q: torch.Tensor,
+        swa_indices: torch.Tensor,
+        swa_lens: torch.Tensor,
+        extra_cache: torch.Tensor | None,
+        extra_indices: torch.Tensor | None,
+        extra_lens: torch.Tensor | None,
+        output: torch.Tensor,
+    ) -> None:
+        """Sparse MLA over the window and, for compressed layers, the top-k.
 
-        The builder only fills decode rows. Prefill tokens sit later in the
-        same batch, so this recomputes ``[0, end)`` and returns the slice.
+        Both kernels below are per-token -- every query token is its own batch
+        element with ``s_q = 1`` -- so prefill goes through them too, with the
+        window indices the builder wrote for its token range. They differ in
+        the record they read: the packed fp8_ds_mla row wants a packed and
+        per-(token, head) quantized query, while the plain bf16 row takes the
+        query as it is and the caches with an explicit single-KV-head axis.
         """
-        width = self.window_size
-        buf = getattr(self, "_prefill_swa_idx", None)
-        lens = getattr(self, "_prefill_swa_lens", None)
-        if buf is None or buf.shape[0] < end:
-            n = max(end, self.max_num_batched_tokens)
-            device = swa_metadata.block_table.device
-            buf = torch.empty(n, 1, width, dtype=torch.int32, device=device)
-            lens = torch.empty(n, dtype=torch.int32, device=device)
-            self._prefill_swa_idx = buf
-            self._prefill_swa_lens = lens
-        assert swa_metadata.token_to_req_indices is not None
-        assert swa_metadata.is_valid_token is not None
-        assert swa_metadata.query_start_loc is not None
-        assert swa_metadata.seq_lens is not None
-        assert swa_metadata.replay_start is not None
-        torch.ops._C.v41_swa_indices_and_lens(
-            buf,
-            lens,
-            swa_metadata.query_start_loc,
-            swa_metadata.seq_lens,
-            swa_metadata.token_to_req_indices,
-            swa_metadata.is_valid_token,
-            swa_metadata.block_table,
-            swa_metadata.replay_start,
-            width,
-            swa_metadata.block_size,
-            end,
+        if self.kv_cache_dtype == "fp8_ds_mla":
+            self._sparse_fp8_mla(
+                q,
+                swa_indices,
+                swa_lens,
+                extra_cache,
+                extra_indices,
+                extra_lens,
+                output,
+            )
+            return
+        ixfops.ds4_flash_mla_with_kvcache(
+            q=q.unsqueeze(1),
+            k_cache=self.swa_cache_layer.kv_cache.unsqueeze(-2),
+            indices=_batched_index_rows(swa_indices),
+            topk_length=swa_lens,
+            sm_scale=self.scale,
+            attn_sink=self.attn_sink,
+            extra_k_cache=None if extra_cache is None else extra_cache.unsqueeze(-2),
+            extra_indices=(
+                None if extra_indices is None else _batched_index_rows(extra_indices)
+            ),
+            extra_topk_length=extra_lens,
+            output=output.unsqueeze(1),
         )
-        return buf[begin:end], lens[begin:end]
 
     def _sparse_mla(
         self,
@@ -1519,8 +1434,13 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         """
         if self.kv_cache_dtype == "fp8_ds_mla":
             self._sparse_fp8_mla(
-                q, swa_indices, swa_lens, extra_cache, extra_indices,
-                extra_lens, output,
+                q,
+                swa_indices,
+                swa_lens,
+                extra_cache,
+                extra_indices,
+                extra_lens,
+                output,
             )
             return
         ixfops.ds4_flash_mla_with_kvcache(
@@ -1571,42 +1491,49 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
     def _forward_decode(
         self,
         q: torch.Tensor,
-        kv_cache: torch.Tensor | None,
         positions: torch.Tensor,
+        compressed_k_cache: torch.Tensor | None,
+        output: torch.Tensor,
         swa_metadata: DeepseekSparseSWAMetadata,
         attn_metadata: IluDeepseekV4FlashMLAMetadata | None,
-        swa_only: bool,
-        output: torch.Tensor,
     ) -> None:
-        num_decodes = swa_metadata.num_decodes
+        swa_only = self.compress_ratio == 0
+        if not swa_only and self.compress_ratio not in (1, 2):
+            raise ValueError(
+                f"Unsupported compress_ratio={self.compress_ratio}; expected 0, 1, or 2."
+            )
         num_decode_tokens = swa_metadata.num_decode_tokens
+        swa_indices = swa_metadata.decode_swa_indices
+        swa_lens = swa_metadata.decode_swa_lens
+        assert swa_indices is not None and swa_lens is not None
         extra_cache = None
         extra_indices = None
         extra_lens = None
         if not swa_only:
             assert attn_metadata is not None
+            assert compressed_k_cache is not None
             assert swa_metadata.is_valid_token is not None
+            assert swa_metadata.token_to_req_indices is not None
             assert self.topk_indices_buffer is not None
-            block_size = attn_metadata.block_size // self.compress_ratio
-            is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
-            token_to_req = swa_metadata.token_to_req_indices
-            assert token_to_req is not None
-            extra_indices, extra_lens = ixfops.ds4_compute_global_topk_indices_and_lens(
+            # ``block_table`` is indexed by the absolute request id that
+            # ``token_to_req_indices`` carries, so it is never sliced by token
+            # range -- only the per-token tensors are.
+            extra_indices, extra_lens = torch.ops._C.v41_global_topk_indices_and_lens(
                 self.topk_indices_buffer[:num_decode_tokens],
-                token_to_req[:num_decode_tokens],
-                attn_metadata.block_table[:num_decodes],
-                block_size,
-                is_valid,
+                swa_metadata.token_to_req_indices[:num_decode_tokens],
+                attn_metadata.block_table,
+                attn_metadata.block_size // self.compress_ratio,
+                swa_metadata.is_valid_token[:num_decode_tokens],
                 positions,
                 self.compress_ratio,
+                0,
+                False,
             )
-            extra_cache = kv_cache
-        assert swa_metadata.decode_swa_indices is not None
-        assert swa_metadata.decode_swa_lens is not None
+            extra_cache = compressed_k_cache
         self._sparse_mla(
             q,
-            swa_metadata.decode_swa_indices,
-            swa_metadata.decode_swa_lens,
+            swa_indices,
+            swa_lens,
             extra_cache,
             extra_indices,
             extra_lens,
@@ -1619,8 +1546,8 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         positions: torch.Tensor,
         compressed_k_cache: torch.Tensor | None,
         output: torch.Tensor,
-        attn_metadata: IluDeepseekV4FlashMLAMetadata | None,
         swa_metadata: DeepseekSparseSWAMetadata,
+        attn_metadata: IluDeepseekV4FlashMLAMetadata | None,
     ) -> None:
         """Prefill through the per-token decode kernel.
 
@@ -1640,7 +1567,12 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
 
         n0 = swa_metadata.num_decode_tokens
         n1 = n0 + swa_metadata.num_prefill_tokens
-        swa_indices, swa_lens = self._window_indices(swa_metadata, n0, n1)
+        # The builder already wrote these rows for the prefill token range,
+        # reading is_valid / token_to_req at absolute positions and clamping
+        # the window to each request's replay_start.
+        swa_indices = swa_metadata.prefill_swa_indices
+        swa_lens = swa_metadata.prefill_swa_lens
+        assert swa_indices is not None and swa_lens is not None
         extra_cache = None
         extra_indices = None
         extra_lens = None
@@ -1650,7 +1582,10 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             assert swa_metadata.is_valid_token is not None
             assert swa_metadata.token_to_req_indices is not None
             assert self.topk_indices_buffer is not None
-            extra_indices, extra_lens = ixfops.ds4_compute_global_topk_indices_and_lens(
+            # ``block_table`` is indexed by the absolute request id that
+            # ``token_to_req_indices`` carries, so it is never sliced by token
+            # range -- only the per-token tensors are.
+            extra_indices, extra_lens = torch.ops._C.v41_global_topk_indices_and_lens(
                 self.topk_indices_buffer[n0:n1],
                 swa_metadata.token_to_req_indices[n0:n1],
                 attn_metadata.block_table,
@@ -1658,6 +1593,8 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 swa_metadata.is_valid_token[n0:n1],
                 positions,
                 self.compress_ratio,
+                0,
+                False,
             )
             extra_cache = compressed_k_cache
         self._sparse_mla(
@@ -1906,13 +1843,6 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         cu_seqlens_q = swa_metadata.prefill_cu_seqlens_q
         cu_seqlens_k = swa_metadata.prefill_cu_seqlens_k
         prefill_seq_lens = swa_metadata.prefill_seq_lens
-        assert cu_seqlens_q is not None
-        assert cu_seqlens_k is not None
-        assert prefill_seq_lens is not None
-        _audit_prefill_slots(self, swa_metadata, attn_metadata)
-
-        # The sink belongs to the union, so it enters once, at the merge; this
-        # half must not fold it into its own denominator.
         o_swa, lse_swa = ixfops.ds4_swa_attn_fwd(
             q=q,
             kv_cache=swa_k_cache,

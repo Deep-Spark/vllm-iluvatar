@@ -33,7 +33,6 @@ def _two_level_filter(
     token_start: int,
     token_end: int,
 ) -> None:
-    return # temp disable candidate filter
     """V4.1's coarse pass over the logits, in place, before the top-k.
 
     The layer at ``candidate_source_layer_id`` writes the shortlist; every

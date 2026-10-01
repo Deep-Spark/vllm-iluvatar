@@ -391,6 +391,11 @@ void check_index_tensor(const torch::Tensor& t, const char* name) {
               name, " must be int32 or int64");
 }
 
+void check_slot_tensor(const torch::Tensor& t, const char* name) {
+  check_index_tensor(t, name);
+  TORCH_CHECK(t.scalar_type() == at::kLong, name, " must be int64");
+}
+
 }  // namespace
 
 void v41_compress_norm_cr1(torch::Tensor& kv_score,
@@ -413,7 +418,7 @@ void v41_compress_norm_cr1(torch::Tensor& kv_score,
                   rms_norm_weight.numel() == kLatentDim &&
                   rms_norm_weight.scalar_type() == at::kBFloat16,
               "rms_norm_weight must be a contiguous bf16 [512] CUDA tensor");
-  check_index_tensor(slot_mapping, "slot_mapping");
+  check_slot_tensor(slot_mapping, "slot_mapping");
 
   const int64_t num_tokens = slot_mapping.numel();
   TORCH_CHECK(num_tokens <= kv_score.size(0) &&
@@ -470,7 +475,7 @@ void v41_compress_pool_norm(torch::Tensor& kv_score, torch::Tensor& positions,
   TORCH_CHECK(state_cache.stride(0) % 2 == 0 && state_cache.stride(1) % 2 == 0,
               "state_cache pages and rows must be 8-byte aligned");
   check_index_tensor(positions, "positions");
-  check_index_tensor(slot_mapping, "slot_mapping");
+  check_slot_tensor(slot_mapping, "slot_mapping");
   check_index_tensor(query_start_loc, "query_start_loc");
   check_index_tensor(token_to_req_indices, "token_to_req_indices");
 
@@ -529,7 +534,7 @@ void v41_rope_insert(torch::Tensor& latent, torch::Tensor& positions,
   TORCH_CHECK(kv_cache.is_cuda() && kv_cache.dim() == 3,
               "kv_cache must be a 3D CUDA tensor [pages, rows, width]");
   check_index_tensor(positions, "positions");
-  check_index_tensor(slot_mapping, "slot_mapping");
+  check_slot_tensor(slot_mapping, "slot_mapping");
 
   const int64_t num_tokens = slot_mapping.numel();
   TORCH_CHECK(num_tokens <= latent.size(0) && num_tokens <= positions.numel(),

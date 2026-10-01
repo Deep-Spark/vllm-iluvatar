@@ -301,24 +301,43 @@ void v41_fill_short_context_topk(torch::Tensor& topk_idxs,
                                  torch::Tensor& positions,
                                  int64_t compress_ratio);
 
-// Paged key slots of each token's sliding window, for tokens
-// ``[0, num_tokens)`` of a decode-first batch. ``swa_lens[t]`` is how many
-// slots the row holds: slots whose page is the null block are dropped and the
-// kept ones compacted to the front, and a padding token (``is_valid_token``
-// false) gets length 0 with its row left as staged.
+// Paged key slots of each token's sliding window, matching
+// ``_compute_swa_indices_and_lens_kernel``. Output row ``pid`` is absolute
+// token ``pid + token_offset``. ``swa_lens[pid]`` is the window span
+// (``end_pos - start_pos``), including null pages. A padding token gets
+// length 0 and its index row filled with -1.
 //
-// ``replay_start`` ([num_reqs], SWA bounded replay) is the position from which
-// each request holds window KV; no slot below it is emitted. Pass zeros when
-// nothing replays.
+// ``replay_start`` ([num_reqs]) is the position from which each request holds
+// window KV. ``has_image`` loads ``left_visible`` / ``right_visible`` at the
+// absolute token and widens the window; otherwise those tensors are unused.
 void v41_swa_indices_and_lens(torch::Tensor& swa_indices,
-                              torch::Tensor& swa_lens,
+                              torch::Tensor& swa_lens, int64_t window_size,
+                              int64_t index_width, torch::Tensor& left_visible,
+                              torch::Tensor& right_visible,
                               torch::Tensor& query_start_loc,
                               torch::Tensor& seq_lens,
                               torch::Tensor& token_to_req_indices,
                               torch::Tensor& is_valid_token,
-                              torch::Tensor& block_table,
-                              torch::Tensor& replay_start, int64_t window_size,
-                              int64_t block_size, int64_t num_tokens);
+                              torch::Tensor& block_table, int64_t block_size,
+                              torch::Tensor& replay_start, int64_t num_tokens,
+                              int64_t token_offset, bool has_image);
+
+// Local compressed top-k slots resolved against the block table into paged
+// global slots, the plugin's copy of ixformer's
+// ``ds4_compute_global_topk_indices_and_lens``. Kept slots compact to the
+// front of each row, the tail is -1, and ``topk_lens`` counts the kept ones.
+// Page 0 is the null block and is dropped. An invalid token gets length 0
+// and its ``token_to_req_indices`` entry is never read.
+//
+// ``positions`` (optional) caps the scan at ``(pos + 1) / compress_ratio``
+// columns. ``slot_limit`` drops slots at or above it (0 disables).
+// ``pad_walk_tail`` fills the tail with the last kept slot instead of -1.
+std::tuple<torch::Tensor, torch::Tensor> v41_global_topk_indices_and_lens(
+    torch::Tensor& topk_indices, torch::Tensor& token_to_req_indices,
+    torch::Tensor& block_table, int64_t block_size,
+    torch::Tensor& is_valid_token,
+    const std::optional<torch::Tensor>& positions, int64_t compress_ratio,
+    int64_t slot_limit, bool pad_walk_tail);
 
 // Context rows a prefill request gathers for its window:
 // ``query_len + min(max(prefix_len - replay_start, 0), window_size - 1)``,

@@ -141,13 +141,16 @@ void v41_move_rows_to_paged_cache(torch::Tensor& rows,
   TORCH_CHECK(rows.size(1) == kv_cache.size(2),
               "rows are ", rows.size(1), " wide but the cache record is ",
               kv_cache.size(2));
-  for (const auto& index : {slot_mapping, positions}) {
-    TORCH_CHECK(index.is_cuda() && index.is_contiguous(),
-                "slot_mapping and positions must be contiguous CUDA tensors");
-    TORCH_CHECK(
-        index.scalar_type() == at::kLong || index.scalar_type() == at::kInt,
-        "slot_mapping and positions must be int32 or int64");
-  }
+  TORCH_CHECK(slot_mapping.is_cuda() && slot_mapping.is_contiguous(),
+              "slot_mapping must be a contiguous CUDA tensor");
+  TORCH_CHECK(slot_mapping.scalar_type() == at::kLong,
+              "slot_mapping must be int64");
+  TORCH_CHECK(positions.is_cuda() && positions.is_contiguous(),
+              "positions must be a contiguous CUDA tensor");
+  TORCH_CHECK(
+      positions.scalar_type() == at::kLong ||
+          positions.scalar_type() == at::kInt,
+      "positions must be int32 or int64");
 
   const int64_t num_tokens = slot_mapping.numel();
   TORCH_CHECK(num_tokens <= rows.size(0) && num_tokens <= positions.numel(),

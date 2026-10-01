@@ -293,6 +293,11 @@ void check_index_tensor(const torch::Tensor& t, const char* name) {
               name, " must be int32 or int64");
 }
 
+void check_slot_tensor(const torch::Tensor& t, const char* name) {
+  check_index_tensor(t, name);
+  TORCH_CHECK(t.scalar_type() == at::kLong, name, " must be int64");
+}
+
 void check_cos_sin(const torch::Tensor& cos_sin_cache) {
   TORCH_CHECK(cos_sin_cache.is_cuda() && cos_sin_cache.dim() == 2 &&
                   cos_sin_cache.scalar_type() == at::kFloat &&
@@ -337,7 +342,7 @@ void v41_indexer_k_norm_rope_store(torch::Tensor& k_pre,
               "k_cache must be a 3D CUDA tensor [pages, rows, width]");
   check_cos_sin(cos_sin_cache);
   check_index_tensor(positions, "positions");
-  check_index_tensor(kv_slot_mapping, "kv_slot_mapping");
+  check_slot_tensor(kv_slot_mapping, "kv_slot_mapping");
 
   const int64_t num_tokens = kv_slot_mapping.numel();
   TORCH_CHECK(num_tokens <= k_pre.size(0) && num_tokens <= positions.numel(),

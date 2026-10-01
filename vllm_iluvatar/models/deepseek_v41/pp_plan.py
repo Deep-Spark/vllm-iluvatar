@@ -124,8 +124,7 @@ def _rank_reads_remote_candidates(
     if candidate_source < 0 or start <= candidate_source < end:
         return False
     return any(
-        start <= source < end and source > candidate_source
-        for source in index_sources
+        start <= source < end and source > candidate_source for source in index_sources
     )
 
 

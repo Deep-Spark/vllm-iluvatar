@@ -412,6 +412,7 @@ class IluFlashMLASparseMetadataBuilder(
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> IluFlashMLASparseMetadata:
+        raise AssertionError("v41 not used this ,delete it later")
         cm = common_attn_metadata
         num_tokens = cm.num_actual_tokens
         req_id_per_token = self._stage_req_id_per_token(

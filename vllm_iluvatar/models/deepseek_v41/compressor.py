@@ -13,11 +13,11 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.models.deepseek_v4.compressor import CompressorBackend
+from vllm.models.deepseek_v41.compressor import CompressorMetadataBuilder
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
-    AttentionMetadataBuilder,
     CommonAttentionMetadata,
     MultipleOf,
 )
@@ -57,25 +57,11 @@ class IluCompressorMetadata:
     capacity: int  # ring rows per page, the slots above were encoded against
 
 
-class IluCompressorMetadataBuilder(AttentionMetadataBuilder):
+class IluCompressorMetadataBuilder(CompressorMetadataBuilder):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        assert isinstance(self.kv_cache_spec, CircularBufferSpec)
-        # The coordinator scales a group's block size up to equalize page sizes
-        # across groups, so this is wider than the layer asked for (8 -> 16 on
-        # this model) and is the capacity the bound tensor actually carries.
-        self.capacity = self.kv_cache_spec.block_size
-        max_num_batched_tokens = (
-            self.vllm_config.scheduler_config.max_num_batched_tokens
-        )
-        self.token_to_req_indices = torch.zeros(
-            max_num_batched_tokens, dtype=torch.int32, device=self.device
-        )
-        self.slot_mapping_buffer = torch.empty(
-            max_num_batched_tokens, dtype=torch.int64, device=self.device
-        )
 
     def build(
         self,
@@ -105,7 +91,7 @@ class IluCompressorMetadataBuilder(AttentionMetadataBuilder):
         return IluCompressorMetadata(
             slot_mapping=slot_mapping,
             query_start_loc=common_attn_metadata.query_start_loc,
-            token_to_req_indices=token_to_req_indices[:num_tokens],
+            token_to_req_indices=token_to_req_indices,
             capacity=self.capacity,
         )
 
@@ -297,8 +283,6 @@ class IluDeepseekCompressor(nn.Module):
         if not kv_cache.numel():
             return
 
-        cos_sin_cache = getattr(rotary_emb, "cos_sin_cache", rotary_emb)
-
         # The slot mapping is compressed-domain, so the cache's second dimension
         # has to be the compressed row count the builder sized those slots
         # against; otherwise the kernel's slot split lands on the wrong row.
@@ -312,7 +296,7 @@ class IluDeepseekCompressor(nn.Module):
         rope_quant_insert(
             latent,
             positions,
-            cos_sin_cache,
+            rotary_emb.cos_sin_cache,
             kv_cache,
             k_cache_metadata.slot_mapping,
             self.compress_ratio,

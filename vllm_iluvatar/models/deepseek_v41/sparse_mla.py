@@ -17,6 +17,11 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
+from vllm.v1.attention.backends.mla.sparse_swa import (
+    _LAYER_TYPE_C1A,
+    _LAYER_TYPE_C2A,
+    _LAYER_TYPE_SWAONLY,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa import (
@@ -27,11 +32,8 @@ from vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa import (
 # v4.1 per-layer compress ratios: 0 = pure sliding window, 1 = full-length
 # compressed cache, 2 = ratio-2 compressed cache. Ratio-1 and ratio-2 layers
 # both attend over indexer topk indices into a shared compressed cache but
-# differ in compressed page block size (block_size // ratio).
-_LAYER_TYPE_SWAONLY = "swaonly"
-_LAYER_TYPE_C1A = "c1a"
-_LAYER_TYPE_C2A = "c2a"
-
+# differ in compressed page block size (block_size // ratio), so each needs its
+# own FlashMLA tile-scheduler plan.
 _V41_LAYER_TYPES: dict[int, str] = {
     0: _LAYER_TYPE_SWAONLY,
     1: _LAYER_TYPE_C1A,
@@ -80,35 +82,68 @@ class IluDeepseekV41SparseSWAMetadataBuilder(IluDeepseekSparseSWAMetadataBuilder
     """
 
     def __init__(self, *args, **kwargs):
-        from vllm.config import get_current_vllm_config
-
-        hf_config = get_current_vllm_config().model_config.hf_config
-        saved = getattr(hf_config, "compress_ratios", None)
-        if saved is not None:
-            hf_config.compress_ratios = [0]
-        try:
-            super().__init__(*args, **kwargs)
-        finally:
-            if saved is not None:
-                hf_config.compress_ratios = saved
-        compress_ratios = saved or [0]
+        super().__init__(*args, **kwargs)
+        compress_ratios = getattr(
+            self.vllm_config.model_config.hf_config, "compress_ratios", None
+        ) or [0]
         self._layer_types = {
             deepseek_v41_layer_type(int(ratio)) for ratio in compress_ratios
         }
 
 
-class IluDeepseekSparseSWAFlashMLAMetadataBuilder(
-    IluDeepseekV41SparseSWAMetadataBuilder
-):
-    """SWA metadata for the FlashMLA decode path, which allows varlen decode."""
+class IluDeepseekV4SparseMLABackend(AttentionBackend):
+    """DeepSeek-V4.1 sparse-MLA backend base.
 
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+    Subclasses ``AttentionBackend`` directly (not the V3.2
+    ``FlashMLASparseBackend``): DeepSeek-V4.1 runs its own attention layer
+    (``IluDeepseekV41Attention``), so it does not reuse the V3.2 builder or
+    impl, and only needs to declare its own metadata builder, KV-cache
+    layout, and the sparse-MLA capability flags.
+    """
 
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "bfloat16",
+        "fp8_ds_mla",
+        "fp8",  # alias for fp8_ds_mla
+    ]
 
-class IluDeepseekSparseSWAFlashMLABackend(IluDeepseekSparseSWABackend):
     @staticmethod
-    def get_builder_cls() -> type[IluDeepseekSparseSWAFlashMLAMetadataBuilder]:
-        return IluDeepseekSparseSWAFlashMLAMetadataBuilder
+    def get_supported_kernel_block_sizes() -> list[int]:
+        return [64]
+
+    @staticmethod
+    def get_builder_cls() -> type[IluDeepseekV4SparseMLAMetadataBuilder]:
+        return IluDeepseekV4SparseMLAMetadataBuilder
+
+    @staticmethod
+    def get_impl_cls() -> type[Any]:
+        raise NotImplementedError(
+            "IluDeepseekV4SparseMLABackend has no separate impl class; "
+            "DeepSeek-V4.1 attention runs through IluDeepseekV41Attention."
+        )
+
+    @classmethod
+    def get_supported_head_sizes(cls) -> list[int]:
+        # DeepSeek V4 layout: 448 NoPE + 64 RoPE = 512.
+        return [512]
+
+    @classmethod
+    def is_mla(cls) -> bool:
+        return True
+
+    @classmethod
+    def is_sparse(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_sink(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
+        return True
 
 
 @dataclass
@@ -184,7 +219,7 @@ class IluDeepseekV4SparseMLAMetadataBuilder(
                 cm.query_start_loc,
                 cm.seq_lens,
                 cm.block_table_tensor.clamp_(min=0),
-                _spec_compressed_block_size(self.kv_cache_spec, self.compress_ratio),
+                int(self.kv_cache_spec.num_states),
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
             )
@@ -207,79 +242,25 @@ class IluDeepseekV4FlashMLAMetadataBuilder(IluDeepseekV4SparseMLAMetadataBuilder
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
 
-class IluDeepseekV4SparseMLABackend(AttentionBackend):
-    """DeepSeek-V4.1 sparse-MLA backend base.
-
-    Subclasses ``AttentionBackend`` directly (not the V3.2
-    ``FlashMLASparseBackend``): DeepSeek-V4.1 runs its own attention layer
-    (``IluDeepseekV41Attention``), so it does not reuse the V3.2 builder or
-    impl, and only needs to declare its own metadata builder, KV-cache
-    layout, and the sparse-MLA capability flags.
-    """
-
-    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
-        "auto",
-        "bfloat16",
-        "fp8_ds_mla",
-        "fp8",  # alias for fp8_ds_mla
-    ]
-
-    @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int]:
-        return [64, 128]
-
-    @staticmethod
-    def get_builder_cls() -> type[IluDeepseekV4SparseMLAMetadataBuilder]:
-        return IluDeepseekV4SparseMLAMetadataBuilder
-
-    @staticmethod
-    def get_impl_cls() -> type[Any]:
-        raise NotImplementedError(
-            "IluDeepseekV4SparseMLABackend has no separate impl class; "
-            "DeepSeek-V4.1 attention runs through IluDeepseekV41Attention."
-        )
-
-    @classmethod
-    def get_supported_head_sizes(cls) -> list[int]:
-        # DeepSeek V4 layout: 448 NoPE + 64 RoPE = 512.
-        return [512]
-
-    @classmethod
-    def is_mla(cls) -> bool:
-        return True
-
-    @classmethod
-    def is_sparse(cls) -> bool:
-        return True
-
-    @classmethod
-    def supports_sink(cls) -> bool:
-        return True
-
-    @classmethod
-    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return True
-
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        assert num_kv_heads == 1
-        if cache_dtype_str == "fp8_ds_mla":
-            return (num_blocks, block_size, 584)
-        return (num_blocks, block_size, head_size)
-
-
 class IluDeepseekV4FlashMLABackend(IluDeepseekV4SparseMLABackend):
     @staticmethod
     def get_name() -> str:
-        return "FLASHMLA_SPARSE_DSV41"
+        return "ILU_FLASHMLA_SPARSE_DSV41"
 
     @staticmethod
     def get_builder_cls() -> type[IluDeepseekV4FlashMLAMetadataBuilder]:
         return IluDeepseekV4FlashMLAMetadataBuilder
+
+
+class IluDeepseekSparseSWAFlashMLAMetadataBuilder(
+    IluDeepseekV41SparseSWAMetadataBuilder
+):
+    """SWA metadata for the FlashMLA decode path, which allows varlen decode."""
+
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+
+
+class IluDeepseekSparseSWAFlashMLABackend(IluDeepseekSparseSWABackend):
+    @staticmethod
+    def get_builder_cls() -> type[IluDeepseekSparseSWAFlashMLAMetadataBuilder]:
+        return IluDeepseekSparseSWAFlashMLAMetadataBuilder

@@ -2693,8 +2693,7 @@ def _ilu__dummy_run(
                 # from the zeroed dummy block tables instead of retaining state
                 # indices from the previous real batch.
                 for_cudagraph_capture=(
-                    is_graph_capturing
-                    or cudagraph_runtime_mode == CUDAGraphMode.FULL
+                    is_graph_capturing or cudagraph_runtime_mode == CUDAGraphMode.FULL
                 ),
                 slot_mappings=slot_mappings_by_group,
                 use_spec_decode=self.speculative_config is not None,

@@ -830,6 +830,7 @@ SCHEDULE_BASELINE = r"""def schedule(self, throttle_prefills: bool = False) -> S
 
 
 def _ilu_schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+    raise AssertionError
     self.current_step += 1
     # NOTE(woosuk) on the scheduling algorithm:
     # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -1105,10 +1106,7 @@ def _ilu_schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
                 step_skipped_waiting.prepend_request(request)
                 continue
 
-            if (
-                request.num_stale_output_tokens > 0
-                and not request.drop_stale_output
-            ):
+            if request.num_stale_output_tokens > 0 and not request.drop_stale_output:
                 # Deliverable stale output still in flight: resuming now
                 # could resample a position that output later delivers.
                 # It drains within the pipeline depth.

@@ -1642,9 +1642,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     swa_metadata=swa_metadata,
                 )
 
-            if cos_sin_cache is not None and not (
-                prefill_as_decode and fuse_inv_rope
-            ):
+            if cos_sin_cache is not None and not (prefill_as_decode and fuse_inv_rope):
                 ixfops.ds4_inv_rope(
                     prefill_out,
                     positions[num_decode_tokens:],
@@ -1703,8 +1701,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 cos_sin_cache=cos_sin_cache,
             )
         logger.info_once(
-            "ilu DeepSeek-V4: inverse RoPE fused into "
-            "ds4_flash_mla_with_kvcache: %s.",
+            "ilu DeepSeek-V4: inverse RoPE fused into ds4_flash_mla_with_kvcache: %s.",
             "enabled" if supported else "unsupported on this configuration",
         )
         self._inv_rope_fused = supported
@@ -2836,9 +2833,7 @@ class IluDeepseekV4Indexer(nn.Module):
         # ``_topk_tail`` slices both with the same token counts. Only the first
         # ``num_actual`` rows are written; the DP-padding tail is never read,
         # exactly as for ``q``.
-        weights = torch.empty(
-            (num_tokens, self.n_head), dtype=q.dtype, device=q.device
-        )
+        weights = torch.empty((num_tokens, self.n_head), dtype=q.dtype, device=q.device)
         ixfops.ds4_c4a_indexcompress(
             cmp_a=self._cmp_a,
             cmp_x=hidden_states[:num_actual],

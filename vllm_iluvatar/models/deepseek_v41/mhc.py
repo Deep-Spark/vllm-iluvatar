@@ -8,12 +8,12 @@ import torch
 
 # The two streaming variants were renamed between ixformer releases; the
 # arguments never changed. Resolve once so the plugin runs against either.
-_mhc_pre_sqrsum = getattr(
-    ixfops, "ds4_v41_mhc_pre_sqrsum", None
-) or ixfops.ds4_v41_mhc_pre_1pass
-_mhc_post_sqrsum = getattr(
-    ixfops, "ds4_v41_mhc_post", None
-) or ixfops.ds4_v41_mhc_post_sqrsum
+_mhc_pre_sqrsum = (
+    getattr(ixfops, "ds4_v41_mhc_pre_sqrsum", None) or ixfops.ds4_v41_mhc_pre_1pass
+)
+_mhc_post_sqrsum = (
+    getattr(ixfops, "ds4_v41_mhc_post", None) or ixfops.ds4_v41_mhc_post_sqrsum
+)
 
 
 def hc_split_sinkhorn(

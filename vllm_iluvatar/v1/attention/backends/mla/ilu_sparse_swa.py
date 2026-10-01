@@ -12,11 +12,12 @@ Supports both bf16 and fp8_ds_mla KV cache formats:
   Per-token layout: 448B FP8 NoPE + 64*2B bf16 RoPE + 8B UE8M0 scale.
   Page size = ``64 * 584 = 37376`` bytes.
 
-The metadata builder is subclassed as ``IluDeepseekSparseSWAMetadataBuilder``
-to support ``VLLM_ILU_DS4_PREFILL_AS_DECODE``: when enabled, the SWA kernel
-range is extended from decode-only to decode+prefill tokens so that each
-prefill query token gets its own per-token SWA window indices/lens (reusing
-the decode kernel ``ds4_flash_mla_with_kvcache`` for prefill).
+The metadata builder is subclassed as ``IluDeepseekSparseSWAMetadataBuilder``,
+which builds decode and prefill SWA rows in two separate passes of the plugin
+kernel: decode rows into ``decode_swa_indices``, prefill rows into
+``prefill_swa_indices`` at ``token_offset = num_decode_tokens``. Both are
+per-token, so under ``VLLM_ILU_DS4_PREFILL_AS_DECODE`` prefill runs through
+the same per-token sparse MLA op decode uses.
 """
 
 from __future__ import annotations
@@ -39,8 +40,6 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.flashmla import (
     FlashMLASchedMeta,
-    _is_flashmla_available,
-    get_mla_metadata,
 )
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
@@ -48,9 +47,19 @@ from vllm.v1.kv_cache_interface import (
     get_kv_quant_mode,
 )
 
+# DeepseekV4 decode layer types, keyed by compress_ratio. Each type has a distinct
+# (topk, extra_topk, extra_page_block_size) config, so they cannot share a
+# FlashMLA tile-scheduler plan. Within a type, all ~60 DeepseekV4 layers share one
+# plan per step because b / s_q / h_q / page_block_sizes / topks are identical.
 _LAYER_TYPE_SWAONLY = "swaonly"
 _LAYER_TYPE_C4A = "c4a"
 _LAYER_TYPE_C128A = "c128a"
+# v4.1 ratio-1 / ratio-2 indexer layers: same indexer-path shape as C4A, but
+# their compressed page block is block_size // ratio, so each gets its own plan.
+# v4.1 builders classify layer types themselves (ratio 0 is SWA-only there); see
+# deepseek_v41/sparse_mla.py.
+_LAYER_TYPE_C1A = "c1a"
+_LAYER_TYPE_C2A = "c2a"
 
 
 def build_dspark_noncausal_swa_indices(
@@ -273,13 +282,13 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
     for decode/prefill SWA metadata. Ilu Triton currently fails on that decode
     kernel path, so this override keeps the community data layout but computes
     the affected metadata with the ``v41_swa_*`` plugin ops (see
-    ``csrc/plugin/v41_swa_meta.cu``), which take the same SWA bounded-replay
-    lower bound the community kernels do.
+    ``csrc/plugin/v41_swa_meta.cu``), which follow the community
+    Triton kernels including ``token_offset`` and the uncompacted window span.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        spec_config = get_current_vllm_config().speculative_config
+        spec_config = self.vllm_config.speculative_config
         self.is_dspark = spec_config is not None and spec_config.use_dspark()
         # The kernel pads the q-head count, so the index width must be a
         # multiple of 128 (matches community sparse_swa.py).
@@ -309,10 +318,12 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
         fast_build: bool = False,
         replay_start: torch.Tensor | None = None,
     ) -> DeepseekSparseSWAMetadata:
+        assert replay_start is not None, (
+            "no graph for now, replay_start must be provided"
+        )
         """``replay_start`` ([num_reqs], SWA bounded replay): the position from
         which each request holds window KV. The model state passes it for every
-        batch of a replaying group; graph captures and the DSpark drafter pass
-        nothing, and those batches replay nothing.
+        batch of a replaying group; graph captures pass nothing.
         """
         seq_lens = common_attn_metadata.seq_lens
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
@@ -321,11 +332,10 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
         block_table = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
 
+        # Split into decode and prefill portions using configurable threshold
         (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
             split_decodes_and_prefills(
-                common_attn_metadata,
-                decode_threshold=self.decode_threshold,
-                treat_short_extends_as_decodes=True,
+                common_attn_metadata, decode_threshold=self.decode_threshold
             )
         )
 
@@ -334,30 +344,35 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
         )
 
         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
-        is_valid_token.copy_(slot_mapping >= 0)
-        num_rows = seq_lens.shape[0]
+        torch.ge(slot_mapping, 0, out=is_valid_token)
         if replay_start is None:
             # Graph captures build without it; their dummy batches replay nothing.
-            replay_start = self.no_replay_start[:num_rows]
-        elif replay_start.shape[0] < num_rows:
-            # The model state used to publish one row per real request. A FULL
-            # graph or DP pad makes seq_lens longer, and v41_swa_* rejects the
-            # short tensor. Padding rows replay nothing.
-            buf = self.no_replay_start[:num_rows]
-            buf.zero_()
-            buf[: replay_start.shape[0]].copy_(replay_start)
-            replay_start = buf
-        elif replay_start.shape[0] > num_rows:
-            replay_start = replay_start[:num_rows]
+            replay_start = self.no_replay_start
 
+        non_causal = not common_attn_metadata.causal
+        decode_swa_width = (
+            self.noncausal_index_width if non_causal else self.window_size
+        )
         decode_swa_indices = self.decode_swa_indices
         if num_decode_tokens > 0:
             self.decode_swa_lens[num_decode_tokens:] = 0
-            if not common_attn_metadata.causal:
+            if non_causal:
                 assert self.is_dspark, (
                     "Non-causal DeepseekV4 SWA is only supported for the DSpark "
                     "speculation mode, but causal=False was set without DSpark."
                 )
+                # decode_swa_indices = noncausal_indices
+                if self.decode_swa_indices_noncausal is None:
+                    self.decode_swa_indices_noncausal = torch.zeros(
+                        self._max_tokens,
+                        1,
+                        self.noncausal_index_width,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                decode_swa_indices = self.decode_swa_indices_noncausal
+                # No replay_start: decode rows sit above the hit, so a
+                # request's replayed window never reaches them.
                 noncausal_indices, noncausal_lens = build_dspark_noncausal_swa_indices(
                     seq_lens=seq_lens,
                     query_start_loc=query_start_loc,
@@ -371,30 +386,82 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
                     out_indices=self._decode_swa_indices_noncausal,
                     out_lens=self.decode_swa_lens,
                 )
-                decode_swa_indices = noncausal_indices
             else:
                 torch.ops._C.v41_swa_indices_and_lens(
-                    self.decode_swa_indices,
+                    decode_swa_indices,
+                    self.decode_swa_lens,
+                    self.window_size,
+                    decode_swa_indices.shape[-1],
+                    self.decode_swa_lens,
                     self.decode_swa_lens,
                     query_start_loc,
                     seq_lens,
                     token_to_req_indices,
                     is_valid_token,
                     block_table,
-                    replay_start,
-                    self.window_size,
                     self.block_size,
-                    num_decode_tokens,
+                    replay_start,
+                    num_tokens=num_decode_tokens,
+                    token_offset=0,
+                    has_image=False,
                 )
 
-        deepseek_v4_fields = self._build_ilu_deepseek_v4_metadata(
+        # Vision variant: per-token in-image visibility for prefill tokens.
+        # Decode tokens are always past the image spans (spans are prefilled
+        # atomically), so the decode path above never needs them.
+        prefill_left_visible: torch.Tensor | None = None
+        prefill_right_visible: torch.Tensor | None = None
+        mm_ranges = common_attn_metadata.mm_req_doc_ranges
+        if (
+            self.max_image_tokens > 0
+            and num_prefill_tokens > 0
+            and mm_ranges
+            and any(mm_ranges.values())
+        ):
+            raise AssertionError("image visibility not supported for now")
+            prefill_left_visible, prefill_right_visible = self._build_image_visibility(
+                common_attn_metadata.num_reqs,
+                mm_ranges,
+                num_decode_tokens,
+                num_prefill_tokens,
+                seq_lens,
+                query_start_loc,
+                token_to_req_indices,
+            )
+
+        # Prefill SWA indices live in paged coordinates. `token_offset` lets
+        # the kernel read is_valid_token / token_to_req_indices at absolute
+        # prefill positions while writing output starting at index 0.
+        if num_prefill_tokens > 0:
+            has_image = prefill_left_visible is not None
+            prefill_swa_indices = self.prefill_swa_indices[:num_prefill_tokens]
+            prefill_swa_lens = self.prefill_swa_lens[:num_prefill_tokens]
+            torch.ops._C.v41_swa_indices_and_lens(
+                prefill_swa_indices,
+                prefill_swa_lens,
+                self.window_size,
+                self.prefill_index_width,
+                prefill_left_visible if has_image else prefill_swa_lens,
+                prefill_right_visible if has_image else prefill_swa_lens,
+                query_start_loc,
+                seq_lens,
+                token_to_req_indices,
+                is_valid_token,
+                block_table,
+                self.block_size,
+                replay_start,
+                num_tokens=num_prefill_tokens,
+                token_offset=num_decode_tokens,
+                has_image=has_image,
+            )
+
+        deepseek_v4_fields = self._build_deepseek_v4_metadata(
             num_decodes,
             num_prefills,
             seq_lens,
             seq_lens_cpu,
             query_start_loc,
             query_start_loc_cpu,
-            block_table,
             replay_start,
         )
 
@@ -410,6 +477,7 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
             token_to_req_indices=token_to_req_indices,
             decode_swa_indices=decode_swa_indices[:num_decode_tokens],
             decode_swa_lens=self.decode_swa_lens[:num_decode_tokens],
+            decode_swa_width=decode_swa_width,
             prefill_swa_indices=(
                 self.prefill_swa_indices[:num_prefill_tokens]
                 if num_prefill_tokens > 0
@@ -420,30 +488,39 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
                 if num_prefill_tokens > 0
                 else None
             ),
+            prefill_left_visible=prefill_left_visible,
+            prefill_right_visible=prefill_right_visible,
             replay_start=replay_start,
             block_size=self.block_size,
             num_decodes=num_decodes,
             num_prefills=num_prefills,
             num_decode_tokens=num_decode_tokens,
             num_prefill_tokens=num_prefill_tokens,
+            # Upper bound on decode-split rows for the kernel's max_q_len
+            # hint. common max_query_len bounds every row (scheduled max under
+            # adaptive verification), clamped to what the split can admit so a
+            # mixed batch's prefill max does not inflate decode scheduling.
+            max_decode_query_len=min(
+                common_attn_metadata.max_query_len, self.decode_threshold
+            ),
             tile_sched_swaonly=tile_sched[_LAYER_TYPE_SWAONLY],
             tile_sched_c4a=tile_sched[_LAYER_TYPE_C4A],
             tile_sched_c128a=tile_sched[_LAYER_TYPE_C128A],
+            tile_sched_c1a=tile_sched[_LAYER_TYPE_C1A],
+            tile_sched_c2a=tile_sched[_LAYER_TYPE_C2A],
             **deepseek_v4_fields,  # type: ignore[arg-type]
         )
-        self._populate_prefill_opt_fields(
-            metadata,
-            num_decodes,
-            num_prefills,
-            seq_lens,
-            query_start_loc,
-            query_start_loc_cpu,
-            block_table,
-            replay_start,
-        )
-
-        if envs.VLLM_ILU_DS4_PREFILL_AS_DECODE:
-            self._populate_prefill_swa_as_decode(metadata)
+        if envs.VLLM_ILU_DS4_PREFILL_OPT:
+            self._populate_prefill_opt_fields(
+                metadata,
+                num_decodes,
+                num_prefills,
+                seq_lens,
+                query_start_loc,
+                query_start_loc_cpu,
+                block_table,
+                replay_start,
+            )
 
         # DFlash/DSpark proposers assert ``attn_metadata.causal is False`` when
         # drafting a non-causal block. Community ``DeepseekSparseSWAMetadata``
@@ -459,6 +536,8 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
             _LAYER_TYPE_SWAONLY: None,
             _LAYER_TYPE_C4A: None,
             _LAYER_TYPE_C128A: None,
+            _LAYER_TYPE_C1A: None,
+            _LAYER_TYPE_C2A: None,
         }
         if (
             num_decode_tokens == 0
@@ -467,15 +546,9 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
             or current_platform.is_device_capability_family(120)
         ):
             return out
-        # FlashMLA C++ is unavailable on Iluvatar; ilu attention bypasses
-        # tile_scheduler_metadata and uses ixformer decode kernels instead.
-        if not _is_flashmla_available()[0]:
-            return out
-        for layer_type in self._layer_types:
-            out[layer_type] = get_mla_metadata()[0]
         return out
 
-    def _build_ilu_deepseek_v4_metadata(
+    def _build_deepseek_v4_metadata(
         self,
         num_decodes: int,
         num_prefills: int,
@@ -483,39 +556,44 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
         seq_lens_cpu: torch.Tensor | None,
         query_start_loc: torch.Tensor,
         query_start_loc_cpu: torch.Tensor,
-        block_table: torch.Tensor,
         replay_start: torch.Tensor,
     ) -> dict[str, torch.Tensor | None | int]:
-        del block_table
         result: dict[str, torch.Tensor | int | None] = {}
 
-        if num_prefills == 0:
-            return result
+        # --- Prefill query metadata ---
+        if num_prefills > 0:
+            assert seq_lens_cpu is not None
+            # Plain slices, and the compressed prefill kernel on the opt path
+            # reads ``prefill_seq_lens``, so these are unconditional.
+            result["prefill_seq_lens"] = seq_lens[num_decodes:]
+            result["prefill_seq_lens_cpu"] = seq_lens_cpu[num_decodes:]
 
-        assert seq_lens_cpu is not None
-        pfx_gather_lens = torch.empty(
-            num_prefills, dtype=torch.int32, device=seq_lens.device
-        )
-        torch.ops._C.v41_swa_prefill_gather_lens(
-            pfx_gather_lens,
-            seq_lens,
-            query_start_loc,
-            replay_start,
-            num_prefills,
-            num_decodes,
-            self.window_size,
-        )
+        # The rest only feeds the workspace-gather prefill path, so neither
+        # opt path pays for the gather-lens kernel or the CPU query lens.
+        if num_prefills > 0 and not (
+            envs.VLLM_ILU_DS4_PREFILL_OPT or envs.VLLM_ILU_DS4_PREFILL_AS_DECODE
+        ):
+            pfx_gather_lens = torch.empty(
+                num_prefills, dtype=torch.int32, device=seq_lens.device
+            )
+            torch.ops._C.v41_swa_prefill_gather_lens(
+                pfx_gather_lens,
+                seq_lens,
+                query_start_loc,
+                replay_start,
+                num_prefills,
+                num_decodes,
+                self.window_size,
+            )
 
-        result["prefill_seq_lens"] = seq_lens[num_decodes:]
-        result["prefill_seq_lens_cpu"] = seq_lens_cpu[num_decodes:]
-        result["prefill_gather_lens"] = pfx_gather_lens
-        result["prefill_query_lens_cpu"] = (
-            query_start_loc_cpu[num_decodes + 1 : num_decodes + num_prefills + 1]
-            - query_start_loc_cpu[num_decodes : num_decodes + num_prefills]
-        ).to(dtype=torch.int32)
-        result["prefill_window_size"] = self.window_size
-        result["prefill_max_model_len"] = self.max_model_len
-        result["prefill_max_num_batched_tokens"] = self.max_num_batched_tokens
+            result["prefill_gather_lens"] = pfx_gather_lens
+            result["prefill_query_lens_cpu"] = (
+                query_start_loc_cpu[num_decodes + 1 : num_decodes + num_prefills + 1]
+                - query_start_loc_cpu[num_decodes : num_decodes + num_prefills]
+            ).to(dtype=torch.int32)
+            result["prefill_window_size"] = self.window_size
+            result["prefill_max_model_len"] = self.max_model_len
+            result["prefill_max_num_batched_tokens"] = self.max_num_batched_tokens
 
         return result
 
@@ -586,44 +664,3 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
         prefill_seq_lens_cpu = seq_lens[pfx_sl:pfx_el].cpu() - pfx_replay_cpu
         metadata.prefill_max_seqlen_k = int(prefill_seq_lens_cpu.max().item())
         metadata.prefill_swa_block_table = swa_block_table
-
-    def _populate_prefill_swa_as_decode(
-        self, metadata: DeepseekSparseSWAMetadata
-    ) -> None:
-        num_prefill_tokens = metadata.num_prefill_tokens
-        if num_prefill_tokens == 0:
-            return
-
-        num_decode_tokens = metadata.num_decode_tokens
-        num_swa_tokens = num_decode_tokens + num_prefill_tokens
-
-        # Extend SWA computation to cover the prefill token range.
-        # v41_swa_indices_and_lens is purely position-based, so extending the
-        # processed range yields correct causal SWA windows for prefill tokens
-        # too. The decode portion (0:num_decode_tokens) is recomputed with
-        # identical results; the prefill portion
-        # (num_decode_tokens:num_swa_tokens) is newly populated.
-        assert metadata.seq_lens is not None
-        assert metadata.query_start_loc is not None
-        assert metadata.replay_start is not None
-        self.decode_swa_lens[num_swa_tokens:] = 0
-        torch.ops._C.v41_swa_indices_and_lens(
-            self.decode_swa_indices,
-            self.decode_swa_lens,
-            metadata.query_start_loc,
-            metadata.seq_lens,
-            self.token_to_req_indices,
-            self.is_valid_token,
-            metadata.block_table,
-            metadata.replay_start,
-            self.window_size,
-            self.block_size,
-            num_swa_tokens,
-        )
-
-        metadata.prefill_swa_indices = self.decode_swa_indices[
-            num_decode_tokens:num_swa_tokens
-        ]
-        metadata.prefill_swa_lens = self.decode_swa_lens[
-            num_decode_tokens:num_swa_tokens
-        ]

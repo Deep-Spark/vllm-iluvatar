@@ -40,13 +40,13 @@ from vllm.distributed import get_dp_group, get_ep_group, get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
+from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
+    ZeroExpertRouter,
+)
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
     MoERunner,
     _moe_forward_shared,
     _unpack,
-)
-from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
-    ZeroExpertRouter,
 )
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExpertsOrder,
@@ -166,9 +166,7 @@ class IluMoERunner(MoERunner):
         #     )
         # )
 
-        shared_output = self._maybe_reduce_shared_expert_output(
-            shared_output
-        )
+        shared_output = self._maybe_reduce_shared_expert_output(shared_output)
 
         shared_output, fused_output = self._maybe_apply_routed_scale_to_output(
             shared_output, fused_output
@@ -181,9 +179,7 @@ class IluMoERunner(MoERunner):
         else:
             result = fused_output
 
-        result = self._maybe_reduce_final_output(
-            result, og_post
-        )
+        result = self._maybe_reduce_final_output(result, og_post)
         return self._maybe_add_zero_expert_output(result)
 
     def _is_unquantized_fused_moe_method(self) -> bool:
@@ -267,18 +263,14 @@ class IluMoERunner(MoERunner):
             assert self._shared_experts is not None
             self._shared_experts.wait()
 
-        return_shared_output = (
-            experts_order
-            in (
-                SharedExpertsOrder.MK_INTERNAL_OVERLAPPED,
-                SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
-            )
-            or (
-                experts_order == SharedExpertsOrder.NO_OVERLAP
-                and (
-                    self.moe_config.in_dtype == torch.float16
-                    or self.do_naive_dispatch_combine
-                )
+        return_shared_output = experts_order in (
+            SharedExpertsOrder.MK_INTERNAL_OVERLAPPED,
+            SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+        ) or (
+            experts_order == SharedExpertsOrder.NO_OVERLAP
+            and (
+                self.moe_config.in_dtype == torch.float16
+                or self.do_naive_dispatch_combine
             )
         )
 
@@ -631,9 +623,7 @@ class IluMoERunner(MoERunner):
                     [hidden_states, input_ids], dim=0, sizes=sizes
                 )
             else:
-                hidden_states = dp_group.all_gatherv(
-                    hidden_states, dim=0, sizes=sizes
-                )
+                hidden_states = dp_group.all_gatherv(hidden_states, dim=0, sizes=sizes)
                 input_ids = None
 
             assert self.gate is not None

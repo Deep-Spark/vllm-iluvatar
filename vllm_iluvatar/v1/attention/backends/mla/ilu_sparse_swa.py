@@ -313,6 +313,27 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
             if self.is_dspark
             else None
         )
+        # FULL cudagraph replay can pad the request dimension beyond the real
+        # batch. The community model state supplies replay_start for real
+        # requests only, so keep a persistent buffer for the synthetic rows.
+        self._padded_replay_start = torch.zeros_like(self.no_replay_start)
+
+    def _pad_replay_start(
+        self,
+        replay_start: torch.Tensor | None,
+        num_reqs: int,
+    ) -> torch.Tensor:
+        """Match replay_start to the request dimension used by attention metadata."""
+        if replay_start is None:
+            return self.no_replay_start[:num_reqs]
+        num_actual_reqs = replay_start.numel()
+        if num_actual_reqs >= num_reqs:
+            return replay_start[:num_reqs]
+
+        padded = self._padded_replay_start[:num_reqs]
+        padded[num_actual_reqs:].zero_()
+        padded[:num_actual_reqs].copy_(replay_start)
+        return padded
 
     def build(
         self,
@@ -345,20 +366,7 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
 
         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
         torch.ge(slot_mapping, 0, out=is_valid_token)
-        num_rows = seq_lens.shape[0]
-        if replay_start is None:
-            # Graph captures build without it; their dummy batches replay nothing.
-            replay_start = self.no_replay_start[:num_rows]
-        elif replay_start.shape[0] < num_rows:
-            # The model state used to publish one row per real request. A FULL
-            # graph or DP pad makes seq_lens longer, and v41_swa_* rejects the
-            # short tensor. Padding rows replay nothing.
-            buf = self.no_replay_start[:num_rows]
-            buf.zero_()
-            buf[: replay_start.shape[0]].copy_(replay_start)
-            replay_start = buf
-        elif replay_start.shape[0] > num_rows:
-            replay_start = replay_start[:num_rows]
+        replay_start = self._pad_replay_start(replay_start, seq_lens.numel())
 
         non_causal = not common_attn_metadata.causal
         decode_swa_width = (

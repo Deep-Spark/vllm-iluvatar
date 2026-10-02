@@ -10,6 +10,176 @@
 
 namespace vllm_iluvatar {
 
+// Native replacements for the Triton kernels exercised by the V2 GPU runner
+// and DSpark. Python kernel-like launchers preserve the community call sites.
+void triton_prepare_dflash_inputs(
+    torch::Tensor& out_input_ids, torch::Tensor& out_query_positions,
+    torch::Tensor& out_query_start_loc, torch::Tensor& out_seq_lens,
+    torch::Tensor& out_query_slot_mapping,
+    torch::Tensor& out_context_positions,
+    torch::Tensor& out_context_slot_mapping,
+    torch::Tensor& out_sample_indices, torch::Tensor& out_sample_pos,
+    torch::Tensor& out_sample_idx_mapping, torch::Tensor& out_temperature,
+    torch::Tensor& out_seeds, torch::Tensor& target_positions,
+    torch::Tensor& target_query_start_loc, torch::Tensor& idx_mapping,
+    torch::Tensor& last_sampled, torch::Tensor& next_prefill_tokens,
+    torch::Tensor& num_sampled, torch::Tensor& num_rejected,
+    torch::Tensor& temperature, torch::Tensor& seeds,
+    torch::Tensor& block_table, int64_t block_table_stride,
+    int64_t parallel_drafting_token_id, int64_t block_size,
+    int64_t num_query_per_req, int64_t num_speculative_steps,
+    int64_t max_num_reqs, int64_t max_num_tokens, int64_t max_model_len,
+    int64_t cp_rank, bool sample_from_anchor, int64_t pad_slot_id,
+    int64_t cp_size, int64_t cp_interleave);
+
+void triton_zero_kv_blocks(torch::Tensor& seg_addrs,
+                           torch::Tensor& seg_block_strides,
+                           torch::Tensor& seg_page_sizes,
+                           torch::Tensor& block_ids);
+
+void triton_prepare_uniform_decode(
+    torch::Tensor& seq_lens, torch::Tensor& decode_seq_lens,
+    torch::Tensor& block_table, int64_t block_table_stride,
+    torch::Tensor& expanded_block_table, int64_t expanded_stride,
+    torch::Tensor& decode_lens, int64_t max_decode_len, int64_t num_tokens);
+
+void triton_token_request_mapping(torch::Tensor& query_start_loc,
+                                  torch::Tensor& output, int64_t num_reqs,
+                                  int64_t num_mapped, int64_t num_tokens);
+
+void triton_gather_block_tables(
+    torch::Tensor& batch_to_req, torch::Tensor& src_ptrs,
+    torch::Tensor& dst_ptrs, torch::Tensor& strides,
+    torch::Tensor& num_blocks, int64_t num_blocks_stride, int64_t num_reqs,
+    int64_t num_reqs_padded);
+
+void triton_compute_slot_mappings(
+    int64_t max_num_tokens, torch::Tensor& idx_mapping,
+    torch::Tensor& query_start_loc, torch::Tensor& positions,
+    torch::Tensor& block_table_ptrs, torch::Tensor& block_table_strides,
+    torch::Tensor& block_sizes, torch::Tensor& kernel_block_sizes,
+    torch::Tensor& mapping_enabled, torch::Tensor& slot_mappings,
+    int64_t slot_mappings_stride, int64_t cp_rank, int64_t cp_size,
+    int64_t cp_interleave, int64_t pad_id);
+
+void triton_apply_write(
+    torch::Tensor& output, int64_t output_stride,
+    torch::Tensor& write_indices, torch::Tensor& write_starts,
+    torch::Tensor& contents, torch::Tensor& cu_lens,
+    const std::optional<torch::Tensor>& group_ids,
+    const std::optional<torch::Tensor>& output_strides, bool multi_group);
+
+void triton_prepare_prefill_inputs(
+    torch::Tensor& input_ids, torch::Tensor& next_prefill_tokens,
+    int64_t next_prefill_stride, int64_t num_lookahead,
+    torch::Tensor& idx_mapping, torch::Tensor& query_start_loc,
+    torch::Tensor& all_token_ids, int64_t all_token_ids_stride,
+    torch::Tensor& prefill_lens, torch::Tensor& num_computed_tokens);
+
+void triton_prepare_pos_seq_lens(
+    torch::Tensor& positions, torch::Tensor& seq_lens,
+    torch::Tensor& idx_mapping, torch::Tensor& query_start_loc,
+    torch::Tensor& num_computed_tokens, int64_t max_num_reqs);
+
+void triton_combine_sampled_and_draft_tokens(
+    torch::Tensor& input_ids, torch::Tensor& idx_mapping,
+    torch::Tensor& last_sampled, torch::Tensor& query_start_loc,
+    torch::Tensor& seq_lens, torch::Tensor& prefill_lens,
+    torch::Tensor& draft_tokens, int64_t draft_stride,
+    torch::Tensor& cu_num_logits, torch::Tensor& logits_indices,
+    int64_t num_new_sampled_tokens);
+
+void triton_get_num_sampled_and_rejected(
+    torch::Tensor& num_sampled, torch::Tensor& num_rejected,
+    torch::Tensor& seq_lens, torch::Tensor& cu_num_logits,
+    torch::Tensor& idx_mapping, torch::Tensor& prefill_lens);
+
+void triton_post_update(
+    torch::Tensor& idx_mapping, torch::Tensor& num_computed_tokens,
+    torch::Tensor& last_sampled,
+    const std::optional<torch::Tensor>& output_bin_counts,
+    int64_t output_bin_stride, torch::Tensor& sampled_tokens,
+    int64_t sampled_stride, torch::Tensor& num_sampled,
+    torch::Tensor& num_rejected,
+    const std::optional<torch::Tensor>& query_start_loc,
+    torch::Tensor& all_token_ids, int64_t all_token_ids_stride,
+    torch::Tensor& total_len);
+
+void triton_expand_idx_mapping(torch::Tensor& idx_mapping,
+                               torch::Tensor& expanded_idx_mapping,
+                               torch::Tensor& expanded_local_pos,
+                               torch::Tensor& cu_num_logits);
+
+void triton_gumbel_sample(
+    torch::Tensor& local_argmax, int64_t local_argmax_stride,
+    torch::Tensor& local_max, int64_t local_max_stride,
+    const std::optional<torch::Tensor>& logits_cache,
+    int64_t logits_cache_stride_0, int64_t logits_cache_stride_1,
+    const std::optional<torch::Tensor>& logits_cache_col,
+    torch::Tensor& logits, int64_t logits_stride,
+    torch::Tensor& expanded_idx_mapping, torch::Tensor& seeds,
+    torch::Tensor& positions, torch::Tensor& temperatures, int64_t vocab_size,
+    int64_t block_size, bool is_drafting, bool apply_temperature,
+    bool use_fp64, bool per_token_col);
+
+void triton_compute_local_logits_stats(
+    torch::Tensor& target_local_argmax, int64_t target_argmax_stride,
+    torch::Tensor& target_local_max, int64_t target_max_stride,
+    torch::Tensor& target_local_sumexp, int64_t target_sumexp_stride,
+    torch::Tensor& draft_local_max, int64_t draft_max_stride,
+    torch::Tensor& draft_local_sumexp, int64_t draft_sumexp_stride,
+    torch::Tensor& target_logits, int64_t target_logits_stride,
+    const std::optional<torch::Tensor>& draft_logits, int64_t draft_stride_0,
+    int64_t draft_stride_1, torch::Tensor& expanded_idx_mapping,
+    torch::Tensor& expanded_local_pos, torch::Tensor& temperatures,
+    int64_t vocab_size, int64_t num_speculative_steps,
+    int64_t vocab_block_size, bool has_draft_logits);
+
+void triton_rejection(
+    torch::Tensor& sampled, int64_t sampled_stride,
+    torch::Tensor& rejected_steps, torch::Tensor& target_rejected_lse,
+    torch::Tensor& draft_rejected_lse, torch::Tensor& target_logits,
+    int64_t target_logits_stride, torch::Tensor& target_local_argmax,
+    int64_t target_argmax_stride, torch::Tensor& target_local_max,
+    int64_t target_max_stride, torch::Tensor& target_local_sumexp,
+    int64_t target_sumexp_stride, torch::Tensor& draft_sampled,
+    const std::optional<torch::Tensor>& draft_logits, int64_t draft_stride_0,
+    int64_t draft_stride_1, torch::Tensor& draft_local_max,
+    int64_t draft_max_stride, torch::Tensor& draft_local_sumexp,
+    int64_t draft_sumexp_stride, torch::Tensor& cu_num_logits,
+    torch::Tensor& idx_mapping, torch::Tensor& temperatures,
+    torch::Tensor& seeds, torch::Tensor& positions,
+    const std::optional<torch::Tensor>& synthetic_rates,
+    int64_t vocab_num_blocks, bool has_draft_logits, bool synthetic_mode,
+    bool use_block_verification);
+
+void triton_resample(
+    torch::Tensor& local_argmax, int64_t argmax_stride,
+    torch::Tensor& local_max, int64_t max_stride,
+    torch::Tensor& target_logits, int64_t target_logits_stride,
+    torch::Tensor& target_rejected_lse,
+    const std::optional<torch::Tensor>& draft_logits, int64_t draft_stride_0,
+    int64_t draft_stride_1, torch::Tensor& draft_rejected_lse,
+    torch::Tensor& rejected_step, torch::Tensor& cu_num_logits,
+    torch::Tensor& expanded_idx_mapping, torch::Tensor& draft_sampled,
+    torch::Tensor& temperatures, torch::Tensor& seeds,
+    torch::Tensor& positions,
+    const std::optional<torch::Tensor>& cumulative_log_p, int64_t vocab_size,
+    int64_t block_size, bool has_draft_logits, bool use_fp64,
+    bool use_block_verification);
+
+void triton_insert_resampled(
+    torch::Tensor& sampled, int64_t sampled_stride,
+    torch::Tensor& num_sampled, torch::Tensor& local_argmax,
+    int64_t argmax_stride, torch::Tensor& local_max, int64_t max_stride,
+    int64_t resample_num_blocks, torch::Tensor& cu_num_logits,
+    torch::Tensor& expanded_idx_mapping, torch::Tensor& temperatures,
+    bool use_fp64);
+
+std::tuple<torch::Tensor, torch::Tensor> greedy_rejection_sample(
+    torch::Tensor& target_logits, torch::Tensor& draft_sampled,
+    torch::Tensor& cu_num_logits, int64_t max_speculative_steps);
+
 // apply_rotary_emb(Tensor x, Tensor cos, Tensor sin, bool interleaved) -> Tensor
 // Plugin-internal op (community torch.ops._C has NO such op): backs the
 // ApplyRotaryEmb OOT override with a real CUDA kernel (flash-attn style:

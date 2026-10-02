@@ -147,6 +147,142 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
       "Tensor! prefill_gather_lens, Tensor seq_lens, Tensor query_start_loc, "
       "Tensor replay_start, int num_prefills, int num_decodes, "
       "int window_size) -> ()");
+  ops.def(
+      "triton_prepare_dflash_inputs("
+      "Tensor! out_input_ids, Tensor! out_query_positions, "
+      "Tensor! out_query_start_loc, Tensor! out_seq_lens, "
+      "Tensor! out_query_slot_mapping, Tensor! out_context_positions, "
+      "Tensor! out_context_slot_mapping, Tensor! out_sample_indices, "
+      "Tensor! out_sample_pos, Tensor! out_sample_idx_mapping, "
+      "Tensor! out_temperature, Tensor! out_seeds, Tensor target_positions, "
+      "Tensor target_query_start_loc, Tensor idx_mapping, Tensor last_sampled, "
+      "Tensor next_prefill_tokens, Tensor num_sampled, Tensor num_rejected, "
+      "Tensor temperature, Tensor seeds, Tensor block_table, "
+      "int block_table_stride, int parallel_drafting_token_id, int block_size, "
+      "int num_query_per_req, int num_speculative_steps, int max_num_reqs, "
+      "int max_num_tokens, int max_model_len, int cp_rank, "
+      "bool sample_from_anchor, int pad_slot_id, int cp_size, "
+      "int cp_interleave) -> ()");
+  ops.def(
+      "triton_zero_kv_blocks(Tensor seg_addrs, Tensor seg_block_strides, "
+      "Tensor seg_page_sizes, Tensor block_ids) -> ()");
+  ops.def(
+      "triton_prepare_uniform_decode("
+      "Tensor seq_lens, Tensor! decode_seq_lens, Tensor block_table, "
+      "int block_table_stride, Tensor! expanded_block_table, "
+      "int expanded_stride, Tensor! decode_lens, int max_decode_len, "
+      "int num_tokens) -> ()");
+  ops.def(
+      "triton_token_request_mapping(Tensor query_start_loc, Tensor! output, "
+      "int num_reqs, int num_mapped, int num_tokens) -> ()");
+  ops.def(
+      "triton_gather_block_tables("
+      "Tensor batch_to_req, Tensor src_ptrs, Tensor dst_ptrs, Tensor strides, "
+      "Tensor num_blocks, int num_blocks_stride, int num_reqs, "
+      "int num_reqs_padded) -> ()");
+  ops.def(
+      "triton_compute_slot_mappings("
+      "int max_num_tokens, Tensor idx_mapping, Tensor query_start_loc, "
+      "Tensor positions, Tensor block_table_ptrs, Tensor block_table_strides, "
+      "Tensor block_sizes, Tensor kernel_block_sizes, Tensor mapping_enabled, "
+      "Tensor! slot_mappings, int slot_mappings_stride, int cp_rank, "
+      "int cp_size, int cp_interleave, int pad_id) -> ()");
+  ops.def(
+      "triton_apply_write("
+      "Tensor(a!) output, int output_stride, Tensor write_indices, "
+      "Tensor write_starts, Tensor contents, Tensor cu_lens, "
+      "Tensor? group_ids, Tensor? output_strides, bool multi_group) -> ()");
+  ops.def(
+      "triton_prepare_prefill_inputs("
+      "Tensor! input_ids, Tensor! next_prefill_tokens, "
+      "int next_prefill_stride, int num_lookahead, Tensor idx_mapping, "
+      "Tensor query_start_loc, Tensor all_token_ids, int all_token_ids_stride, "
+      "Tensor prefill_lens, Tensor num_computed_tokens) -> ()");
+  ops.def(
+      "triton_prepare_pos_seq_lens("
+      "Tensor! positions, Tensor! seq_lens, Tensor idx_mapping, "
+      "Tensor query_start_loc, Tensor num_computed_tokens, "
+      "int max_num_reqs) -> ()");
+  ops.def(
+      "triton_combine_sampled_and_draft_tokens("
+      "Tensor! input_ids, Tensor idx_mapping, Tensor last_sampled, "
+      "Tensor query_start_loc, Tensor seq_lens, Tensor prefill_lens, "
+      "Tensor draft_tokens, int draft_stride, Tensor cu_num_logits, "
+      "Tensor! logits_indices, int num_new_sampled_tokens) -> ()");
+  ops.def(
+      "triton_get_num_sampled_and_rejected("
+      "Tensor! num_sampled, Tensor! num_rejected, Tensor seq_lens, "
+      "Tensor cu_num_logits, Tensor idx_mapping, Tensor prefill_lens) -> ()");
+  ops.def(
+      "triton_post_update("
+      "Tensor idx_mapping, Tensor! num_computed_tokens, Tensor! last_sampled, "
+      "Tensor? output_bin_counts, int output_bin_stride, "
+      "Tensor sampled_tokens, int sampled_stride, Tensor num_sampled, "
+      "Tensor num_rejected, Tensor? query_start_loc, Tensor! all_token_ids, "
+      "int all_token_ids_stride, Tensor! total_len) -> ()");
+  ops.def(
+      "triton_expand_idx_mapping("
+      "Tensor idx_mapping, Tensor! expanded_idx_mapping, "
+      "Tensor! expanded_local_pos, Tensor cu_num_logits) -> ()");
+  ops.def(
+      "triton_gumbel_sample("
+      "Tensor! local_argmax, int local_argmax_stride, Tensor! local_max, "
+      "int local_max_stride, Tensor? logits_cache, "
+      "int logits_cache_stride_0, int logits_cache_stride_1, "
+      "Tensor? logits_cache_col, Tensor logits, int logits_stride, "
+      "Tensor expanded_idx_mapping, Tensor seeds, Tensor positions, "
+      "Tensor temperatures, int vocab_size, int block_size, "
+      "bool is_drafting, bool apply_temperature, bool use_fp64, "
+      "bool per_token_col) -> ()");
+  ops.def(
+      "triton_compute_local_logits_stats("
+      "Tensor! target_local_argmax, int target_argmax_stride, "
+      "Tensor! target_local_max, int target_max_stride, "
+      "Tensor! target_local_sumexp, int target_sumexp_stride, "
+      "Tensor! draft_local_max, int draft_max_stride, "
+      "Tensor! draft_local_sumexp, int draft_sumexp_stride, "
+      "Tensor target_logits, int target_logits_stride, Tensor? draft_logits, "
+      "int draft_stride_0, int draft_stride_1, Tensor expanded_idx_mapping, "
+      "Tensor expanded_local_pos, Tensor temperatures, int vocab_size, "
+      "int num_speculative_steps, int vocab_block_size, "
+      "bool has_draft_logits) -> ()");
+  ops.def(
+      "triton_rejection("
+      "Tensor! sampled, int sampled_stride, Tensor! rejected_steps, "
+      "Tensor! target_rejected_lse, Tensor! draft_rejected_lse, "
+      "Tensor target_logits, int target_logits_stride, "
+      "Tensor target_local_argmax, int target_argmax_stride, "
+      "Tensor target_local_max, int target_max_stride, "
+      "Tensor target_local_sumexp, int target_sumexp_stride, "
+      "Tensor draft_sampled, Tensor? draft_logits, int draft_stride_0, "
+      "int draft_stride_1, Tensor draft_local_max, int draft_max_stride, "
+      "Tensor draft_local_sumexp, int draft_sumexp_stride, "
+      "Tensor cu_num_logits, Tensor idx_mapping, Tensor temperatures, "
+      "Tensor seeds, Tensor positions, Tensor? synthetic_rates, "
+      "int vocab_num_blocks, bool has_draft_logits, bool synthetic_mode, "
+      "bool use_block_verification) -> ()");
+  ops.def(
+      "triton_resample("
+      "Tensor! local_argmax, int argmax_stride, Tensor! local_max, "
+      "int max_stride, Tensor target_logits, int target_logits_stride, "
+      "Tensor target_rejected_lse, Tensor? draft_logits, int draft_stride_0, "
+      "int draft_stride_1, Tensor draft_rejected_lse, Tensor rejected_step, "
+      "Tensor cu_num_logits, Tensor expanded_idx_mapping, "
+      "Tensor draft_sampled, Tensor temperatures, Tensor seeds, "
+      "Tensor positions, Tensor? cumulative_log_p, int vocab_size, "
+      "int block_size, bool has_draft_logits, bool use_fp64, "
+      "bool use_block_verification) -> ()");
+  ops.def(
+      "triton_insert_resampled("
+      "Tensor! sampled, int sampled_stride, Tensor! num_sampled, "
+      "Tensor local_argmax, int argmax_stride, Tensor local_max, "
+      "int max_stride, int resample_num_blocks, Tensor cu_num_logits, "
+      "Tensor expanded_idx_mapping, Tensor temperatures, "
+      "bool use_fp64) -> ()");
+  ops.def(
+      "greedy_rejection_sample("
+      "Tensor target_logits, Tensor draft_sampled, Tensor cu_num_logits, "
+      "int max_speculative_steps) -> (Tensor, Tensor)");
   ops.def("weak_ref_tensor(Tensor input) -> Tensor");
   ops.def("get_cuda_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor");
   // DeepSeek-V4.1 Engram: slot-cache write, fused lookback+ngram hash,
@@ -209,6 +345,39 @@ TORCH_LIBRARY_IMPL_EXPAND(_C, CUDA, ops) {
            &vllm_iluvatar::v41_swa_prefill_gather_lens);
   ops.impl("v41_global_topk_indices_and_lens",
            &vllm_iluvatar::v41_global_topk_indices_and_lens);
+  ops.impl("triton_prepare_dflash_inputs",
+           &vllm_iluvatar::triton_prepare_dflash_inputs);
+  ops.impl("triton_zero_kv_blocks",
+           &vllm_iluvatar::triton_zero_kv_blocks);
+  ops.impl("triton_prepare_uniform_decode",
+           &vllm_iluvatar::triton_prepare_uniform_decode);
+  ops.impl("triton_token_request_mapping",
+           &vllm_iluvatar::triton_token_request_mapping);
+  ops.impl("triton_gather_block_tables",
+           &vllm_iluvatar::triton_gather_block_tables);
+  ops.impl("triton_compute_slot_mappings",
+           &vllm_iluvatar::triton_compute_slot_mappings);
+  ops.impl("triton_apply_write", &vllm_iluvatar::triton_apply_write);
+  ops.impl("triton_prepare_prefill_inputs",
+           &vllm_iluvatar::triton_prepare_prefill_inputs);
+  ops.impl("triton_prepare_pos_seq_lens",
+           &vllm_iluvatar::triton_prepare_pos_seq_lens);
+  ops.impl("triton_combine_sampled_and_draft_tokens",
+           &vllm_iluvatar::triton_combine_sampled_and_draft_tokens);
+  ops.impl("triton_get_num_sampled_and_rejected",
+           &vllm_iluvatar::triton_get_num_sampled_and_rejected);
+  ops.impl("triton_post_update", &vllm_iluvatar::triton_post_update);
+  ops.impl("triton_expand_idx_mapping",
+           &vllm_iluvatar::triton_expand_idx_mapping);
+  ops.impl("triton_gumbel_sample", &vllm_iluvatar::triton_gumbel_sample);
+  ops.impl("triton_compute_local_logits_stats",
+           &vllm_iluvatar::triton_compute_local_logits_stats);
+  ops.impl("triton_rejection", &vllm_iluvatar::triton_rejection);
+  ops.impl("triton_resample", &vllm_iluvatar::triton_resample);
+  ops.impl("triton_insert_resampled",
+           &vllm_iluvatar::triton_insert_resampled);
+  ops.impl("greedy_rejection_sample",
+           &vllm_iluvatar::greedy_rejection_sample);
   // Aliasing a CUDA tensor's storage; registered on the CUDA key like upstream.
   ops.impl("weak_ref_tensor", &vllm_iluvatar::weak_ref_tensor);
   ops.impl("engram_write_hash_cache", &vllm_iluvatar::engram_write_hash_cache);

@@ -1145,10 +1145,10 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         if self.compressor is not None:
             # Local ref so the closure keeps a non-None type.
             compressor = self.compressor
-            kv_score = torch.mm(
+            kv_score = ixfops.gemm_bf16_bf16_fp32(
                 hidden_states,
-                compressor.fused_wkv_wgate.weight.T,
-                out_dtype=torch.float32,
+                compressor.fused_wkv_wgate.weight,
+                format="TN",
             )
 
         if self.indexer is not None:

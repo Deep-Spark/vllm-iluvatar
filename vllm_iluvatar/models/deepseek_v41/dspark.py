@@ -450,7 +450,7 @@ class IluDSparkDeepseekV41ForCausalLM(nn.Module, SupportsPP):
             and markov_embed.is_cuda
         ):
             flat = markov_embed.reshape(-1, markov_embed.shape[-1])
-            logits = torch.mm(flat, weight.t(), out_dtype=head_dtype)
+            logits = ixfops.gemm_bf16_bf16_fp32(flat, weight, format="TN")
             logits = logits.reshape(*markov_embed.shape[:-1], -1)
         else:
             logits = F.linear(

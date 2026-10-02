@@ -39,6 +39,12 @@ _PATCH_PACKAGES = [
     "vllm_iluvatar.ilu_patch.general_patches",
 ]
 
+# These compatibility shims must run before auto-discovery imports another
+# patch whose community target transitively imports decorated Triton kernels.
+_EARLY_GENERAL_PATCHES = [
+    "vllm_iluvatar.ilu_patch.general_patches.patch_triton_jit_compat",
+]
+
 _applied = False
 
 
@@ -52,6 +58,12 @@ def apply_general_patches() -> None:
     if _applied:
         return
     _applied = True
+
+    for module_name in _EARLY_GENERAL_PATCHES:
+        module = importlib.import_module(module_name)
+        register = getattr(module, "register", None)
+        if callable(register):
+            register()
 
     for pkg_name in _PATCH_PACKAGES:
         try:

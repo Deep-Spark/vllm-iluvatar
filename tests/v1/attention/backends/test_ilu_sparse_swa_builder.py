@@ -94,6 +94,7 @@ def _make_builder(
     )
     builder.max_model_len = 1024
     builder.max_num_batched_tokens = max_tokens
+    builder._max_tokens = max_tokens
     builder.token_to_req_indices = torch.zeros(max_tokens, dtype=torch.int32)
     builder.decode_swa_indices = torch.zeros(
         max_tokens, 1, window_size, dtype=torch.int32
@@ -105,6 +106,7 @@ def _make_builder(
     builder.prefill_swa_lens = torch.zeros(max_tokens, dtype=torch.int32)
     builder.is_valid_token = torch.zeros(max_tokens, dtype=torch.bool)
     builder.no_replay_start = torch.zeros(max_tokens, dtype=torch.int32)
+    builder._padded_replay_start = torch.zeros_like(builder.no_replay_start)
     builder.decode_swa_indices_noncausal = (
         torch.empty(
             max_tokens, 1, builder.noncausal_index_width, dtype=torch.int32
@@ -125,6 +127,20 @@ def _make_builder(
     )
     builder._populate_prefill_opt_fields = MagicMock()
     return builder
+
+
+def test_replay_start_is_zero_padded_to_cudagraph_request_count():
+    builder = _make_builder(is_dspark=True)
+    replay_start = torch.tensor([16, 0, 0], dtype=torch.int32)
+    builder._padded_replay_start[3] = 123
+
+    padded = builder._pad_replay_start(replay_start, num_reqs=4)
+
+    assert padded.tolist() == [16, 0, 0, 0]
+    assert padded.data_ptr() == builder._padded_replay_start.data_ptr()
+    assert builder._pad_replay_start(replay_start, num_reqs=3).data_ptr() == (
+        replay_start.data_ptr()
+    )
 
 
 def test_causal_decode_calls_plugin_and_sets_metadata_causal_true():

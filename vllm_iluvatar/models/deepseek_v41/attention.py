@@ -30,7 +30,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
+from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,

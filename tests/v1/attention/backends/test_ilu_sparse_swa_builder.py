@@ -104,46 +104,65 @@ def _make_builder(
     )
     builder.prefill_swa_lens = torch.zeros(max_tokens, dtype=torch.int32)
     builder.is_valid_token = torch.zeros(max_tokens, dtype=torch.bool)
-    builder._decode_swa_indices_noncausal = None
-    builder._build_ilu_deepseek_v4_metadata = MagicMock(return_value={})
+    builder.no_replay_start = torch.zeros(max_tokens, dtype=torch.int32)
+    builder.decode_swa_indices_noncausal = (
+        torch.empty(
+            max_tokens, 1, builder.noncausal_index_width, dtype=torch.int32
+        )
+        if is_dspark
+        else None
+    )
+    builder.max_image_tokens = 0
+    builder._build_deepseek_v4_metadata = MagicMock(return_value={})
     builder.build_tile_scheduler = MagicMock(
-        return_value={"swaonly": None, "c4a": None, "c128a": None}
+        return_value={
+            "swaonly": None,
+            "c4a": None,
+            "c128a": None,
+            "c1a": None,
+            "c2a": None,
+        }
     )
     builder._populate_prefill_opt_fields = MagicMock()
     return builder
 
 
-def test_causal_decode_calls_ixformer_and_sets_metadata_causal_true():
+def test_causal_decode_calls_plugin_and_sets_metadata_causal_true():
     builder = _make_builder(is_dspark=True, num_spec=5)
     cad = _make_cad(query_lens=[1], seq_lens=[12], causal=True, is_prefilling=[False])
 
-    def _fake_ixformer(**kwargs):
-        n = kwargs["num_decode_tokens"]
-        kwargs["swa_indices"][:n].fill_(42)
-        kwargs["swa_lens"][:n] = 7
+    def _fake_plugin(*args, **kwargs):
+        n = kwargs["num_tokens"]
+        args[0][:n].fill_(42)
+        args[1][:n] = 7
 
     with (
         patch(
-            "vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa.ixfops."
-            "ds4_compute_swa_decode_indices_and_lens",
-            side_effect=_fake_ixformer,
-        ) as mock_ix,
+            "torch.ops._C.v41_swa_indices_and_lens",
+            side_effect=_fake_plugin,
+            create=True,
+        ) as mock_op,
         patch(
             "vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa.envs."
             "VLLM_ILU_DS4_PREFILL_AS_DECODE",
             False,
         ),
+        patch(
+            "vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa.envs."
+            "VLLM_ILU_DS4_PREFILL_OPT",
+            False,
+        ),
     ):
         md = builder.build(0, cad)
 
-    mock_ix.assert_called_once()
+    mock_op.assert_called_once()
     assert md.causal is True
     assert md.num_decode_tokens == 1
     assert md.decode_swa_lens.tolist() == [7]
     assert int(md.decode_swa_indices[0, 0, 0]) == 42
 
 
-def test_noncausal_dspark_uses_python_indices_not_ixformer():
+def test_noncausal_dspark_uses_python_indices_not_plugin():
     window_size, num_spec, block_size = 8, 5, 4
     builder = _make_builder(
         is_dspark=True,
@@ -162,18 +181,23 @@ def test_noncausal_dspark_uses_python_indices_not_ixformer():
 
     with (
         patch(
-            "vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa.ixfops."
-            "ds4_compute_swa_decode_indices_and_lens"
-        ) as mock_ix,
+            "torch.ops._C.v41_swa_indices_and_lens",
+            create=True,
+        ) as mock_op,
         patch(
             "vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa.envs."
             "VLLM_ILU_DS4_PREFILL_AS_DECODE",
             False,
         ),
+        patch(
+            "vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa.envs."
+            "VLLM_ILU_DS4_PREFILL_OPT",
+            False,
+        ),
     ):
         md = builder.build(0, cad)
 
-    mock_ix.assert_not_called()
+    mock_op.assert_not_called()
     assert md.causal is False
     assert md.num_decode_tokens == num_spec
 

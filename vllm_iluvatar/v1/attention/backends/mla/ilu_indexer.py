@@ -891,7 +891,6 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # writes/reads at compressed-domain offsets matching the K-cache
         # layout.  CUDA-graph stability is preserved by reusing
         # ``self.compressed_slot_mapping_buffer``.
-        slot_mapping = common_attn_metadata.slot_mapping
         indexer_block_table = block_table
         if self.compress_ratio > 1:
             kernel_block_size = self.kernel_block_size
@@ -902,15 +901,9 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             ):
                 factor = self.kv_cache_spec.block_size // kernel_block_size
                 indexer_block_table = (block_table[:, ::factor] // factor).contiguous()
-            local_slot_mapping = slot_mapping
-            # padded_num_tokens = common_attn_metadata.slot_mapping.shape[0]
-            # # 0.30.1 added the uncompressed ``slot_mapping`` argument so PAD
-            # # tokens (SWA bounded replay) stay PAD after compression, and
-            # # moved the compressed page size from the ``storage_block_size``
-            # # property to ``num_states``.
-            compressed_slot_mapping = get_compressed_slot_mapping(
+            slot_mapping = get_compressed_slot_mapping(
                 num_tokens,
-                local_slot_mapping,
+                slot_mapping,
                 query_start_loc,
                 seq_lens,
                 indexer_block_table,
@@ -918,9 +911,6 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
             )
-            slot_mapping = compressed_slot_mapping
-        else:
-            slot_mapping = common_attn_metadata.slot_mapping
 
         prefill_metadata = None
         if num_prefills > 0:

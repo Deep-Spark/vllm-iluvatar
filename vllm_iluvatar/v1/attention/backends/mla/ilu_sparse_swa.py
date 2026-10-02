@@ -297,7 +297,10 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
             if self.is_dspark
             else 0
         )
-        self._decode_swa_indices_noncausal = (
+        # Same buffer the community builder writes from the Triton kernel.
+        # Allocate here so the Torch helper and the metadata path cannot
+        # silently pick different storage (see 441c2f60 accept-rate drop).
+        self.decode_swa_indices_noncausal = (
             torch.empty(
                 (
                     self.max_num_batched_tokens,
@@ -342,9 +345,20 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
 
         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
         torch.ge(slot_mapping, 0, out=is_valid_token)
+        num_rows = seq_lens.shape[0]
         if replay_start is None:
             # Graph captures build without it; their dummy batches replay nothing.
-            replay_start = self.no_replay_start
+            replay_start = self.no_replay_start[:num_rows]
+        elif replay_start.shape[0] < num_rows:
+            # The model state used to publish one row per real request. A FULL
+            # graph or DP pad makes seq_lens longer, and v41_swa_* rejects the
+            # short tensor. Padding rows replay nothing.
+            buf = self.no_replay_start[:num_rows]
+            buf.zero_()
+            buf[: replay_start.shape[0]].copy_(replay_start)
+            replay_start = buf
+        elif replay_start.shape[0] > num_rows:
+            replay_start = replay_start[:num_rows]
 
         non_causal = not common_attn_metadata.causal
         decode_swa_width = (
@@ -358,19 +372,10 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
                     "Non-causal DeepseekV4 SWA is only supported for the DSpark "
                     "speculation mode, but causal=False was set without DSpark."
                 )
-                # decode_swa_indices = noncausal_indices
-                if self.decode_swa_indices_noncausal is None:
-                    self.decode_swa_indices_noncausal = torch.zeros(
-                        self._max_tokens,
-                        1,
-                        self.noncausal_index_width,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
                 decode_swa_indices = self.decode_swa_indices_noncausal
                 # No replay_start: decode rows sit above the hit, so a
                 # request's replayed window never reaches them.
-                noncausal_indices, noncausal_lens = build_dspark_noncausal_swa_indices(
+                build_dspark_noncausal_swa_indices(
                     seq_lens=seq_lens,
                     query_start_loc=query_start_loc,
                     block_table=block_table,
@@ -380,7 +385,7 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
                     index_width=self.noncausal_index_width,
                     num_decode_tokens=num_decode_tokens,
                     device=self.device,
-                    out_indices=self._decode_swa_indices_noncausal,
+                    out_indices=decode_swa_indices,
                     out_lens=self.decode_swa_lens,
                 )
             else:

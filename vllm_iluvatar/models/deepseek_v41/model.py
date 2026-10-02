@@ -717,6 +717,7 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 # designated sender.
                 assert self.candidate_idxs_buffer is not None
                 tensors["candidates"] = self.candidate_idxs_buffer[:num_tokens]
+            tensors.update(self.pack_local_aux_hidden_states(aux_hidden_states))
             return IntermediateTensors(tensors)
         hidden_states = mhc.hc_pre(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)

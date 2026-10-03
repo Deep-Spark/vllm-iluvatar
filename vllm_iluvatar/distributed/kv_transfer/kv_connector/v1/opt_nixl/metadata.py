@@ -201,8 +201,6 @@ def compute_nixl_compatibility_hash(vllm_config: VllmConfig) -> str:
 @dataclass
 class PeerMeta:
     addr: str
-    block_ratio: int
-    block_size: list[int]
     pp_size: int = 1
     tp_size: int = 1
     pp_split: list[int] = None

@@ -11,7 +11,6 @@ from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 import msgspec
-import numpy as np
 import uvloop
 import zmq
 from vllm import envs
@@ -51,6 +50,7 @@ from .metadata import (
 )
 from .utils import (
     NodeError,
+    dp_scoped_addr,
     zmq_comm2proxy,
     zmq_ctx,
 )
@@ -67,11 +67,35 @@ _FORCE_PER_RANK_SEND = os.getenv("VLLM_ILU_NIXL_FORCE_PER_RANK_SEND", "0").lower
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-    from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
     from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
 
 logger = init_logger("vllm." + __name__)
+
+
+def transfer_slice(spec: "KVCacheSpec") -> slice | None:
+    """The part of a group's block list P has to hand over, or None for all.
+
+    Three groups are clipped:
+
+    * sliding window: the KV cache manager allocates the whole sequence and
+      frees the blocks that drop out of the window before the
+      ``request_finished_all_groups`` hook, so only the last n survive.
+    * SSM/Mamba: one block holds the whole state, so the first one is enough.
+    * outside prefix caching (DeepSeek-V4.1 SWA under bounded replay, HiSparse
+      replicas): D rebuilds the group locally, so nothing has to travel.
+
+    An empty slice keeps the group's seat in the block-id tuple -- P and D
+    index that tuple by KV cache group id -- it does not drop the group.
+    """
+    if not spec.prefix_cacheable:
+        return slice(0, 0)
+    if isinstance(spec, SlidingWindowSpec):
+        return slice(-(cdiv(spec.sliding_window, spec.block_size) + 1), None)
+    if isinstance(spec, MambaSpec):
+        return slice(0, 1)
+    return None
 
 
 class NixlConnectorScheduler:
@@ -89,9 +113,12 @@ class NixlConnectorScheduler:
         self.engine_id: EngineId = engine_id
         self.kv_cache_config = kv_cache_config
         self.side_channel_host = envs.VLLM_NIXL_SIDE_CHANNEL_HOST
-        self.side_channel_port = (
-            envs.VLLM_NIXL_SIDE_CHANNEL_PORT
-            + vllm_config.parallel_config.data_parallel_index
+        dp_index = vllm_config.parallel_config.data_parallel_index
+        self.side_channel_port = envs.VLLM_NIXL_SIDE_CHANNEL_PORT + dp_index
+        # Each DP rank binds its own scheduler->worker publisher.
+        self.scheduler_addr = dp_scoped_addr(_SCHEDULER_ADDR, dp_index)
+        self.scheduler_addr = dp_scoped_addr(
+            _SCHEDULER_ADDR, vllm_config.parallel_config.data_parallel_index
         )
         assert vllm_config.kv_transfer_config is not None
         if current_platform.device_type == "cpu":
@@ -142,31 +169,24 @@ class NixlConnectorScheduler:
                 "For model with mamba but not only with mamba, do not support disable_hybrid_kv_cache_manager is True"
             )
 
-        # Gather Sliding Window sizes for each kv cache group (if any) in number of
-        # blocks per KV cache group. This is used to clip the local attention window.
-        self.blocks_per_sw = []
+        # Per KV cache group, the slice of a request's block list that P has
+        # to transfer.  ``None`` means the whole list; see ``transfer_slice``.
+        self.transfer_slices: list[slice | None] = [None] * self.kv_group_nums
         if self._apply_block_id_preprocess:
-            for g in kv_cache_config.kv_cache_groups:
-                if isinstance(g.kv_cache_spec, SlidingWindowSpec):
-                    transfer_block_nums = (
-                        cdiv(g.kv_cache_spec.sliding_window, g.kv_cache_spec.block_size)
-                        + 1
-                    )
-                    self.blocks_per_sw.append(
-                        (-transfer_block_nums, transfer_block_nums)
-                    )
-                elif isinstance(g.kv_cache_spec, MambaSpec):
-                    # for none or all
-                    self.blocks_per_sw.append((0, 1))
-                else:
-                    self.blocks_per_sw.append((0, 0))
-
-        self.remap_to_kernel_size = []
-        for g in kv_cache_config.kv_cache_groups:
-            if isinstance(g.kv_cache_spec, MambaSpec):
-                self.remap_to_kernel_size.append(0)
-            else:
-                self.remap_to_kernel_size.append(1)
+            self.transfer_slices = [
+                transfer_slice(g.kv_cache_spec) for g in kv_cache_config.kv_cache_groups
+            ]
+        logger.info(
+            "NIXL block clipping: %s of %d KV groups transfer nothing, %s are "
+            "clipped to a window",
+            [i for i, clip in enumerate(self.transfer_slices) if clip == slice(0, 0)],
+            self.kv_group_nums,
+            [
+                i
+                for i, clip in enumerate(self.transfer_slices)
+                if clip is not None and clip != slice(0, 0)
+            ],
+        )
 
         is_bidirectional_kv_xfer_enabled = (
             vllm_config.kv_transfer_config.get_from_extra_config(
@@ -224,7 +244,6 @@ class NixlConnectorScheduler:
         self._scheduler_loop_t: threading.Thread | None = None
         self._encoded_xfer_handshake_metadata: dict[int, Any] = {}
         self._stop_event = threading.Event()
-        self.physical_blocks_per_logical_kv_block: int = 1
         # a socket connect to remote prefill node, use this socket to send local block ids to remote[D use]
         self.peer_node_metas: dict[str, PeerMeta] = {}
         # the block infos will be send to remote[D use]
@@ -271,85 +290,52 @@ class NixlConnectorScheduler:
         return
 
     def get_sw_clipped_blocks(self, block_ids: BlockIds) -> BlockIds:
+        """Clip every group's block list down to what P actually has to send.
+
+        See ``transfer_slice`` for the three clipped cases.  Groups that D
+        rebuilds locally come back empty; any other group stays non-empty,
+        which is what downstream reads as "this group is covered".
         """
-        Clip the number of blocks to the sliding window size for each kv cache group
-        that employs SWA.
-        This is necessary because the KV Cache manager initially allocates blocks for
-        the entire sequence length, and successively cleans up blocks that are outside
-        the window prior to the `request_finished_all_groups` hook.
-        """
-        if len(block_ids) == 0 or not self._apply_block_id_preprocess:
-            # No blocks to clip eg Full prefix cache hit or not a hybrid model.
+        if len(block_ids) == 0:
+            # No blocks to clip, eg a full prefix cache hit.
             return block_ids
         # NOTE (NickLucche) This logic is currently handled at the connector level
         # because offloading connectors might want to receive the whole sequence even
         # for SWA groups. We will abstract this logic once the interface is more stable
-        assert len(block_ids) == len(self.blocks_per_sw), (
+        assert len(block_ids) == len(self.transfer_slices), (
             "Number of KV cache groups must match"
         )
-        # For non-SWA groups, blocks_per_sw is (0,0) so we return all block_ids unchanged
-        # for SWA groups, return [-start:][:len], where start == len
-        # for Mamba groups, return [0:][:1], the official impl is ok, but we only need transfer the first block.
         return tuple(
-            [
-                blocks[self.blocks_per_sw[i][0] :][: self.blocks_per_sw[i][1]]
-                if self.blocks_per_sw[i][1] > 0
-                else blocks
-                for i, blocks in enumerate(block_ids)
-            ]
+            blocks if (clip := self.transfer_slices[i]) is None else blocks[clip]
+            for i, blocks in enumerate(block_ids)
         )
 
-    def _remote_block_starts(self, blocks: "KVCacheBlocks", ratio: int) -> list[int]:
+    def _remote_block_starts(self, blocks: "KVCacheBlocks") -> list[int]:
         """Per group, index in the prompt's block list of the first block D asks for.
 
-        D may load fewer tokens than the prompt (prefix hit at the head, and
-        the scheduler aligns external tokens down to its block size under SWA
-        bounded replay), so P cannot align on the tail of its own list.  -1
-        marks groups whose lists are clipped (SWA, Mamba): P tail/head-aligns
-        those as before.
+        D's list is neither a prefix nor a suffix of P's: the head is a prefix
+        hit, and under SWA bounded replay the scheduler aligns the external
+        token count down to a block multiple and replays the tail itself.  So
+        P cannot align on either end of its own list and needs the offset.
+        -1 marks the groups whose lists are clipped (sliding window, Mamba) or
+        empty; those keep the old tail/head alignment.
         """
         starts: list[int] = []
         for i, group in enumerate(blocks.blocks):
-            if self._apply_block_id_preprocess and self.blocks_per_sw[i][1] > 0:
+            if self.transfer_slices[i] is not None:
                 starts.append(-1)
                 continue
-            start = next(
-                (
-                    j
-                    for j, block in enumerate(group)
-                    if block.block_hash is None and not block.is_null
-                ),
-                len(group),
+            starts.append(
+                next(
+                    (
+                        j
+                        for j, block in enumerate(group)
+                        if block.block_hash is None and not block.is_null
+                    ),
+                    len(group),
+                )
             )
-            if ratio != 1 and self.remap_to_kernel_size[i] > 0:
-                start *= ratio
-            starts.append(start)
         return starts
-
-    def remap_to_kernel_blocks(
-        self, block_ids: BlockIds, token_lens: int, ratio: int, block_sizes: list[int]
-    ) -> list[list[int]]:
-        """
-        Re-map the logical block ids to physical block ids for kernel use when physical_blocks_per_logical_kv_block > 1.
-        for mamba, return.
-        for others:
-                eg: block_size 64, ratio 4, token_lens 65, block_ids original [1, 2], return [4, 5, 6, 7, 8] for cdiv(65, 64//4) = 5.
-        """
-        if ratio == 1:
-            return block_ids
-
-        kernel_block_offsets = np.arange(ratio)
-        return [
-            (
-                np.array(blocks, dtype=np.int32).reshape(-1, 1) * ratio
-                + kernel_block_offsets
-            )
-            .reshape(-1)[: cdiv(token_lens, block_sizes[i])]
-            .tolist()
-            if self.remap_to_kernel_size[i] > 0
-            else list(blocks)
-            for i, blocks in enumerate(block_ids)
-        ]
 
     def set_xfer_handshake_metadata(
         self, metadata: dict[int, KVConnectorHandshakeMetadata]
@@ -363,7 +349,6 @@ class NixlConnectorScheduler:
         encoded_data: dict[int, bytes] = {}
         decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
         physical_block_size = self.block_size
-        block_size = None
         for global_rank, rank_metadata in metadata.items():
             if not isinstance(rank_metadata, NixlHandshakePayload):
                 raise ValueError(
@@ -373,52 +358,27 @@ class NixlConnectorScheduler:
             nixl_meta: NixlAgentMetadata = decoder.decode(
                 rank_metadata.agent_metadata_bytes
             )
-            if (
-                self.physical_blocks_per_logical_kv_block
-                != nixl_meta.physical_blocks_per_logical_kv_block
-            ):
-                self.physical_blocks_per_logical_kv_block = (
-                    nixl_meta.physical_blocks_per_logical_kv_block
+            # Our workers register scheduler blocks, so a kernel block lives
+            # inside a registered block and block ids travel unmodified.
+            if nixl_meta.physical_blocks_per_logical_kv_block != 1:
+                raise ValueError(
+                    f"rank {global_rank} reports "
+                    f"{nixl_meta.physical_blocks_per_logical_kv_block} physical "
+                    "blocks per logical KV block; NIXL registers scheduler "
+                    "blocks and only supports 1"
                 )
-            else:
-                assert (
-                    self.physical_blocks_per_logical_kv_block
-                    == nixl_meta.physical_blocks_per_logical_kv_block
+            if nixl_meta.physical_block_size != physical_block_size:
+                raise ValueError(
+                    f"rank {global_rank} block size "
+                    f"{nixl_meta.physical_block_size} != {physical_block_size}; "
+                    "all ranks of an engine must agree"
                 )
-
-            if physical_block_size != nixl_meta.physical_block_size:
-                physical_block_size = nixl_meta.physical_block_size
-            else:
-                assert physical_block_size == nixl_meta.physical_block_size
             encoded_data[global_rank] = rank_metadata.agent_metadata_bytes
             logger.info(
                 "global rank %d: encoded NixlHandshakePayload size: %s bytes",
                 global_rank,
                 str(len(encoded_data[global_rank])),
             )
-            if not self._has_multi_size or self._has_mamba:
-                if block_size is None:
-                    block_size = (
-                        self.block_size // self.physical_blocks_per_logical_kv_block
-                    )
-                else:
-                    assert (
-                        block_size
-                        == self.block_size // self.physical_blocks_per_logical_kv_block
-                    )
-
-        self.block_size = block_size or self.block_size
-        if self._has_multi_size and not self._has_mamba:
-            assert self.physical_blocks_per_logical_kv_block == 1, (
-                "physical block size != logical block size is not supported when kv spec has multi block size"
-            )
-
-        for index, remap in enumerate(self.remap_to_kernel_size):
-            if remap:
-                self.group_block_sizes[index] = (
-                    self.group_block_sizes[index]
-                    // self.physical_blocks_per_logical_kv_block
-                )
 
         logger.info("the block size for each group are: %s", self.group_block_sizes)
         self.node_info["physical_block_size"] = physical_block_size
@@ -572,8 +532,6 @@ class NixlConnectorScheduler:
                 f"{remote_physical_block_size} != local block size "
                 f"{self.block_size}; P and D must use the same block size"
             )
-        remote_ratio = 1
-        remote_block_sizes = list(self.group_block_sizes)
 
         remote_addr = peer_infos["side_channel_addr"]
         assert remote_addr != f"{self.side_channel_host}:{self.side_channel_port}"
@@ -594,8 +552,6 @@ class NixlConnectorScheduler:
         )
         peer_meta = PeerMeta(
             addr=remote_addr,
-            block_ratio=remote_ratio,
-            block_size=remote_block_sizes,
             pp_size=peer_infos["pp_size"],
             tp_size=peer_infos["tp_size"],
             pp_split=peer_infos["pp_split"],
@@ -631,7 +587,7 @@ class NixlConnectorScheduler:
                     raise ValueError(
                         f"request {request.request_id} is missing remote_engine_id"
                     )
-                peer_meta = self._get_or_connect_peer(remote_engine_id)
+                self._get_or_connect_peer(remote_engine_id)
                 block_ids_send_to_remote = [[] for _ in range(self.kv_group_nums)]
                 block_starts = [-1] * self.kv_group_nums
                 intent = TransferIntent.NO_TRANSFER
@@ -647,22 +603,16 @@ class NixlConnectorScheduler:
                     block_ids_send_to_remote = self.get_sw_clipped_blocks(
                         unhashed_local_block_ids
                     )
-                    block_ids_send_to_remote = self.remap_to_kernel_blocks(
-                        block_ids_send_to_remote,
-                        num_external_tokens,
-                        peer_meta.block_ratio,
-                        peer_meta.block_size,
-                    )
-                    block_starts = self._remote_block_starts(
-                        blocks, peer_meta.block_ratio
-                    )
+                    block_starts = self._remote_block_starts(blocks)
                     self._reqs_to_recv[request.request_id] = (
                         request,
                         block_ids_send_to_remote,
                     )
-                    assert all(
+                    # Replay groups are deliberately empty; a request with no
+                    # destination at all would leave P nothing to write.
+                    assert any(
                         len(block_id) for block_id in block_ids_send_to_remote
-                    ), "partial empty KV groups are not supported yet"
+                    ), "D allocated external tokens but no KV group has blocks"
                 else:
                     self._reqs_not_send_to_worker.add(request.request_id)
 
@@ -734,19 +684,12 @@ class NixlConnectorScheduler:
 
         send_dst = meta.reqs_to_send if not layer_wise else meta.reqs_to_send_layerwise
         block_ids = self.get_sw_clipped_blocks(self._reqs_blocks[request_id])
-        # if block size > kernel block size, re-map the block ids.
-        # But local block size may bigger than remote block size, need processed on worker side.
-        block_ids = self.remap_to_kernel_blocks(
-            # self._reqs_blocks[request_id],
-            block_ids,
-            prefill_tokens,
-            self.physical_blocks_per_logical_kv_block,
-            self.group_block_sizes,
-        )
 
         logger.debug("block ids send to local worker is: %s", block_ids)
-        assert all(len(block_id) for block_id in block_ids), (
-            "some group do not need send kv, not support for now, fixing..."
+        # Replay groups are deliberately empty; a request with no source at all
+        # would mean P holds no KV for it.
+        assert any(len(block_id) for block_id in block_ids), (
+            "no KV group has blocks to send"
         )
         # P only need local block and remote_engine_id
         send_dst[request_id] = ReqMeta(
@@ -754,7 +697,7 @@ class NixlConnectorScheduler:
             None,
             remote_engine_id,
             False,
-            prefill_tokens,  # use for worker re-calculate block nums if local_block_size != remote_block_size
+            prefill_tokens,
         )
         self._pending_worker_sends.add(request_id)
         # for write, start time record after schedule
@@ -814,9 +757,31 @@ class NixlConnectorScheduler:
         return meta
 
     def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
-        """Release scheduler-side ownership after worker WRITE completion."""
-        for req_id in connector_output.finished_sending or ():
-            self._pending_worker_sends.discard(req_id)
+        """Release scheduler-side ownership after worker WRITE completion.
+
+        Also drops completions for sends this engine is not waiting on.  The
+        worker reports one no matter how a send ends, including a lease that
+        expires long after the request left the scheduler, and the scheduler
+        then does ``assert req_id in self.requests`` and kills the engine.  A
+        send is in ``_pending_worker_sends`` from the moment it is handed to the
+        worker, so anything outside that set is a completion whose blocks are
+        already freed and must not be reported again.
+        """
+        finished = connector_output.finished_sending
+        if not finished:
+            return
+        stale = finished - self._pending_worker_sends
+        if stale:
+            # A leak would show up here as a request that is never freed, so
+            # this is loud rather than silent.
+            logger.warning(
+                "Ignoring send completion for %d request(s) this engine no "
+                "longer owns: %s",
+                len(stale),
+                sorted(stale),
+            )
+            finished -= stale
+        self._pending_worker_sends -= finished
 
     def has_pending_push_work(self) -> bool:
         """Keep the engine loop alive while push work can still make progress."""
@@ -989,7 +954,7 @@ class NixlConnectorScheduler:
     ):
         """Background thread for pub info to workers."""
         # a socket publish infos to workers, tcp://ip:port
-        scheduler_addr = _SCHEDULER_ADDR
+        scheduler_addr = self.scheduler_addr
         path = make_zmq_path("tcp", self.local_addr)
         with (
             make_zmq_socket(

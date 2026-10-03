@@ -48,9 +48,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
 )
-from vllm.v1.worker.utils import select_common_block_size
 
-from ..skip_layers import get_skip_layers
+from ..skip_layers import get_skip_layers, producer_last_layer
 from .handshake_validation import (
     validate_block_id_groups,
     validate_compatibility_hash,
@@ -103,6 +102,7 @@ from .utils import (
     NotifyPayload,
     TransferStatusChecker,
     TransferWrapper,
+    dp_scoped_addr,
     find_number_on_layer_name,
     make_zmq_socket,
     zmq_comm2proxy,
@@ -380,6 +380,10 @@ class NixlConnectorWorker:
         self.pp_rank = 0 if self.pp_world_size == 1 else get_pp_group().rank_in_group
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.dp_world_size = vllm_config.parallel_config.data_parallel_size
+        # Must match the port this rank's own scheduler binds.
+        self.scheduler_addr = dp_scoped_addr(
+            _SCHEDULER_ADDR, vllm_config.parallel_config.data_parallel_index
+        )
         self.global_rank = self.pp_rank * self.tp_world_size + self.tp_rank
         self.enable_permute_local_kv = False
         self.use_quant_to_fp8 = False
@@ -431,6 +435,13 @@ class NixlConnectorWorker:
         self.pp_layer_start, self.pp_layer_end = get_pp_indices(
             self.num_hidden_layers, self.pp_rank, self.pp_world_size
         )
+        # A PD prefiller stops at the last kv source (producer_last_layer), so
+        # only that many layers run their save hook. Leaving the stage bounds
+        # at the full depth would make un_send_layer_nums never reach 0 and
+        # pp_layer_end_closed name a layer that never fires.
+        if (last_layer := producer_last_layer(vllm_config)) is not None:
+            self.pp_layer_start = min(self.pp_layer_start, last_layer + 1)
+            self.pp_layer_end = min(self.pp_layer_end, last_layer + 1)
         self.pp_layer_end_closed = self.pp_layer_end - 1
         self.pp_split = [
             get_pp_indices(self.num_hidden_layers, i, self.pp_world_size)[0]
@@ -499,11 +510,17 @@ class NixlConnectorWorker:
         self._invalid_block_ids: set[int] = set()
         self._recv_notification_status: dict[ReqId, TransferStatusChecker] = {}
         self.use_async_scheduling = vllm_config.scheduler_config.async_scheduling
-        # Async scheduling may deliver a completion notification before the
-        # next model-runner metadata batch installs ReqMeta on this worker.
+        # The scheduler sends block_ids to the producer while scheduling, but
+        # this worker only learns of the request with the next model-runner
+        # metadata batch.  A producer that writes fast (e.g. a prefix-cache
+        # hit) can notify inside that gap, with or without async scheduling,
+        # and a dropped notification leaves the request waiting until its
+        # lease expires.  Buffered entries that no request ever claims are
+        # discarded after the same lease.
         self._early_recv_notifications: dict[ReqId, list[BufferedRecvNotification]] = (
             defaultdict(list)
         )
+        self._early_recv_deadlines: dict[ReqId, float] = {}
 
         # Step-scoped producer metadata is main-thread-owned.
         self._step_layerwise_sends: dict[ReqId, ReqMeta] = {}
@@ -537,16 +554,10 @@ class NixlConnectorWorker:
         # rank can hold groups with different ratios (V4.1: 1/2/4/8).  NIXL
         # therefore registers scheduler blocks and reads the per-view ratio at
         # registration time; block_size and num_blocks stay logical.
-        kernel_block_size = select_common_block_size(
-            self.block_size,
-            self.attn_backends,
-        )
         self._logical_num_blocks = self.num_blocks
         logger.info(
-            "NIXL KV block geometry: block_size=%s, common_kernel_block_size=%s, "
-            "num_blocks=%s, attn_backends=%s",
+            "NIXL KV block geometry: block_size=%s, num_blocks=%s, attn_backends=%s",
             self.block_size,
-            kernel_block_size,
             self.num_blocks,
             [backend.get_name() for backend in self.attn_backends],
         )
@@ -1661,6 +1672,7 @@ class NixlConnectorWorker:
             session.pending_recv.add(req_id)
             if aborted:
                 self._aborted_recv_requests.add(req_id)
+            self._early_recv_deadlines.pop(req_id, None)
             for notification in self._early_recv_notifications.pop(req_id, []):
                 self._apply_recv_notification(req_id, *notification)
 
@@ -2128,8 +2140,11 @@ class NixlConnectorWorker:
         allow_buffer: bool = False,
     ) -> None:
         if req_id not in self._recv_requests:
-            if allow_buffer and self.use_async_scheduling and self._accepting_work:
+            if allow_buffer and self._accepting_work:
                 self._early_recv_notifications[req_id].append((status, payload))
+                self._early_recv_deadlines.setdefault(
+                    req_id, time.perf_counter() + self._kv_lease_duration
+                )
             else:
                 logger.warning(
                     "Dropping late or unknown NIXL notification for request %s",
@@ -2269,6 +2284,16 @@ class NixlConnectorWorker:
         for req_id, expires in list(self._recv_deadlines.items()):
             if now >= expires:
                 self._fail_recv(req_id, "receive lease expired")
+
+        for req_id, expires in list(self._early_recv_deadlines.items()):
+            if now >= expires:
+                del self._early_recv_deadlines[req_id]
+                self._early_recv_notifications.pop(req_id, None)
+                logger.warning(
+                    "Discarding NIXL notification for request %s that no "
+                    "receive ever claimed",
+                    req_id,
+                )
 
         for req_id, state in list(self._send_requests.items()):
             if state.deadline is None or now < state.deadline:
@@ -2659,7 +2684,7 @@ class NixlConnectorWorker:
             traceback.print_exc()
 
     async def _scheduler_listener(self) -> None:
-        scheduler_addr = _SCHEDULER_ADDR
+        scheduler_addr = self.scheduler_addr
         with make_zmq_socket(
             path=scheduler_addr, ctx=self.ctx, socket_type=zmq.XSUB, linger=0
         ) as recv_from_scheduler:

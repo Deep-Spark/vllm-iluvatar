@@ -127,6 +127,7 @@ if TYPE_CHECKING:
     VLLM_ILU_NIXL_FORCE_PER_RANK_SEND: bool = False
     VLLM_ILU_NIXL_SERVER_ADDR: str = ""
     VLLM_ILU_NIXL_DS32_QUANT_AFTER_TRANSFER: bool = False
+    VLLM_ILU_PP_SKIP_FINISHING_RELAY: bool = True
     VLLM_ILU_LINEAR_BACKEND: str = ""
     VLLM_ILU_DP_LB_EXACT_INFLIGHT: bool = False
     VLLM_ILU_DEEPEP_USE_INT8: int = 0
@@ -256,6 +257,11 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ILU_NIXL_DS32_QUANT_AFTER_TRANSFER": _bool_reader(
         "VLLM_ILU_NIXL_DS32_QUANT_AFTER_TRANSFER", "0"
+    ),
+    # PP>1: do not relay the sampled token of a request that finishes with it
+    # (max_tokens reached, e.g. every PD prefill) to the earlier stages.
+    "VLLM_ILU_PP_SKIP_FINISHING_RELAY": _bool_reader(
+        "VLLM_ILU_PP_SKIP_FINISHING_RELAY", "1"
     ),
     "VLLM_ILU_LINEAR_BACKEND": lambda: (
         os.environ.get("VLLM_ILU_LINEAR_BACKEND", "").strip().lower().replace("-", "_")

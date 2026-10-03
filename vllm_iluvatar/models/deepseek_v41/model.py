@@ -26,6 +26,9 @@ from vllm.model_executor.offloader import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.skip_layers import (
+    producer_last_layer,
+)
 from vllm_iluvatar.models.deepseek_v4.fp8_model import (
     IluDeepseekV4Fp8DecoderLayer,
     IluDeepseekV4Fp8ForCausalLM,
@@ -303,6 +306,7 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 if int(getattr(config, "candidate_topk_blocks", 0)) > 0
                 else -1
             ),
+            last_layer=producer_last_layer(vllm_config),
         )
         self.pp_plan = plan
         self.start_layer, self.end_layer = plan.start_layer, plan.end_layer
@@ -347,6 +351,21 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
             ]
         )
 
+        last_layer = producer_last_layer(vllm_config)
+        if last_layer is not None:
+            logger.info(
+                "DeepSeek V4.1 PD prefiller stops after layer %s (last kv "
+                "source); rank %s/%s runs [%s, %s), layers %s-%s are "
+                "PPMissingLayer and their weights are never loaded",
+                last_layer,
+                pp.rank_in_group,
+                pp.world_size,
+                plan.start_layer,
+                plan.end_layer,
+                last_layer + 1,
+                config.num_hidden_layers - 1,
+            )
+
         if plan.transfers_kv:
             logger.info(
                 "DeepSeek V4.1 pipeline rank %s/%s owns layers [%s, %s); "
@@ -372,6 +391,11 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         self.main_kv_rows: torch.Tensor | None = None
         self.indexer_kv_rows: torch.Tensor | None = None
         if not self.pp_plan.transfers_kv:
+            return
+        if self.start_layer == self.end_layer:
+            # Truncated prefiller: this rank sits entirely past the last kv
+            # source and has no layer to size the buffers from. It also has
+            # nothing to send, so leaving them None is correct.
             return
 
         sample = self.layers[self.start_layer].attn

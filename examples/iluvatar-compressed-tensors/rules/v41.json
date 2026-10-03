@@ -1,0 +1,189 @@
+{
+    "schema_version": 1,
+    "name": "deepseek_v41_ct",
+    "model_config_patch": {
+        "expert_dtype": "w4a8",
+        "architectures": [
+            "IluDeepseekV41ForCausalLM"
+        ]
+    },
+    "default_action": "keep",
+    "rules": [
+        {
+            "id": "keep_engram_embed_fp8",
+            "priority": 1100,
+            "match": {
+                "regex": [
+                    "\\.engram\\.embed\\.(weight|scale)$"
+                ]
+            },
+            "action": "keep"
+        },
+        {
+            "id": "drop_consumed_scale",
+            "priority": 1000,
+            "match": {
+                "suffixes": [
+                    ".scale"
+                ]
+            },
+            "action": "drop"
+        },
+        {
+            "id": "routed_mxfp4_to_w4a8",
+            "priority": 900,
+            "match": {
+                "regex": [
+                    "\\.experts\\.\\d+\\.w[123]\\.weight$"
+                ],
+                "dtypes": [
+                    "int8",
+                    "uint8"
+                ]
+            },
+            "action": "convert",
+            "scale": {
+                "from_suffix": ".weight",
+                "to_suffix": ".scale"
+            },
+            "dequant": {
+                "method": "mxfp4_block32"
+            },
+            "quant": {
+                "method": "int4_moe",
+                "options": {
+                    "group_size": -1,
+                    "symmetric": true,
+                    "gemm_format": "NN",
+                    "pack_version": 2,
+                    "scale_layout": "row"
+                }
+            },
+            "outputs": {
+                "weight_scale": ".weight_scale",
+                "i8_weight_scale": ".i8_weight_scale",
+                "i8_weight_zero": ".i8_weight_zero"
+            },
+            "work_device": "cuda"
+        },
+        {
+            "id": "shared_fp8_to_w8a8",
+            "priority": 800,
+            "match": {
+                "regex": [
+                    "\\.shared_experts\\.w[123]\\.weight$"
+                ],
+                "dtypes": [
+                    "float8_e4m3fn"
+                ]
+            },
+            "action": "convert",
+            "scale": {
+                "from_suffix": ".weight",
+                "to_suffix": ".scale"
+            },
+            "dequant": {
+                "method": "fp8_block_e8m0",
+                "options": {
+                    "block_size": 32
+                }
+            },
+            "quant": {
+                "method": "int8_per_channel",
+                "options": {
+                    "group_size": -1,
+                    "symmetric": true,
+                    "gemm_format": "TN"
+                }
+            },
+            "iluvatar": {
+                "mixed_strategy": "CHANNEL",
+                "gemm_mode": "PERF"
+            },
+            "outputs": {
+                "weight_scale": ".weight_scale"
+            },
+            "work_device": "cuda"
+        },
+        {
+            "id": "dense_fp8_to_w8a8",
+            "priority": 700,
+            "match": {
+                "regex": [
+                    "\\.attn\\.(wq_a|wkv|wq_b|wo_b)\\.weight$",
+                    "\\.attn\\.indexer\\.wq_b\\.weight$",
+                    "\\.(e_proj|h_proj)\\.weight$",
+                    "\\.main_proj\\.weight$",
+                    "\\.attn\\.wo_a\\.weight$"
+                ],
+                "dtypes": [
+                    "float8_e4m3fn"
+                ]
+            },
+            "action": "convert",
+            "scale": {
+                "from_suffix": ".weight",
+                "to_suffix": ".scale"
+            },
+            "dequant": {
+                "method": "fp8_block_e8m0",
+                "options": {
+                    "block_size": 32
+                }
+            },
+            "quant": {
+                "method": "int8_per_channel",
+                "options": {
+                    "group_size": -1,
+                    "symmetric": true,
+                    "gemm_format": "TN",
+                    "round_through_bfloat16": true
+                }
+            },
+            "iluvatar": {
+                "mixed_strategy": "CHANNEL",
+                "gemm_mode": "PERF",
+                "method": "IluV4W8A16BMMLinearMethod",
+                "bmm_w8a16_gemm_format": "k16n16"
+            },
+            "outputs": {
+                "weight_scale": ".weight_scale"
+            },
+            "work_device": "cuda"
+        },
+        {
+            "id": "remaining_fp8_to_bfloat16",
+            "priority": 100,
+            "match": {
+                "dtypes": [
+                    "float8_e4m3fn"
+                ],
+                "suffixes": [
+                    ".weight"
+                ],
+                "exclude_regex": [
+                    "\\.engram\\.embed\\.weight$"
+                ]
+            },
+            "action": "convert",
+            "scale": {
+                "from_suffix": ".weight",
+                "to_suffix": ".scale"
+            },
+            "dequant": {
+                "method": "fp8_block_e8m0",
+                "options": {
+                    "block_size": 32
+                }
+            },
+            "quant": {
+                "method": "cast",
+                "options": {
+                    "dtype": "bfloat16"
+                }
+            },
+            "outputs": {},
+            "work_device": "cuda"
+        }
+    ]
+}

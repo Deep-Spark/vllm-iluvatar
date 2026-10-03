@@ -53,6 +53,25 @@ def zmq_ctx(socket_type: Any, addr: str) -> Iterator[zmq.Socket]:
             ctx.destroy(linger=0)
 
 
+def dp_scoped_addr(addr: str, dp_index: int) -> str:
+    """Shift a ``tcp://host:port`` address by the data-parallel index.
+
+    Every DP rank runs its own scheduler and its own workers, and the two talk
+    over a port the scheduler binds, so each rank needs a port of its own --
+    the same reason ``VLLM_NIXL_SIDE_CHANNEL_PORT`` is offset by the DP index.
+    Both ends must derive the port the same way, so they share this helper
+    rather than each doing the arithmetic.
+    """
+    if not dp_index:
+        return addr
+    scheme, _, host_port = addr.rpartition("://")
+    host, sep, port = host_port.rpartition(":")
+    if not sep or not port.isdigit():
+        raise ValueError(f"Cannot apply a DP offset to address {addr!r}")
+    shifted = f"{host}:{int(port) + dp_index}"
+    return f"{scheme}://{shifted}" if scheme else shifted
+
+
 def get_representative_spec_type(spec: KVCacheSpec) -> type[KVCacheSpec]:
     if isinstance(spec, UniformTypeKVCacheSpecs):
         # All inner specs are the same type; pick any.

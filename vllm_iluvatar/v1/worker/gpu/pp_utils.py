@@ -19,6 +19,24 @@ Scope    : V2 pipeline-parallel MTP/speculative decoding on Iluvatar.
 Enable   : opt-in via ``VLLM_ILU_ENABLE_V2_PP_MTP=1``.
 Remove   : when upstream carries equivalent V2 PP + MTP sampled/draft-token
            broadcast compatibility.
+
+``compute_need_sampled_mask`` / ``make_prepare_inputs_max_seq_len`` are wired
+separately by ``ilu_patch.general_patches.patch_pp_finishing_relay``:
+
+Target   : vllm.v1.worker.gpu.pp_utils.compute_need_sampled_mask
+Baseline : v0.30.1
+Why      : v0.27.1 left requests that finish at this step out of the
+           sampled-token relay; v0.30.1 relays every sampling row.  A PD
+           prefiller's requests all finish on their first token, so each of
+           them now leaves a broadcast receive pending on PP 0..PP n-2 until the
+           last stage samples.
+How      : copy of the community function plus the v0.27.1 finishing
+           exclusion, fed by ``max_seq_len`` (prompt_len + max_tokens) that
+           ``prepare_inputs`` attaches to the batch.  Every PP rank derives it
+           from the same scheduler output, so the collectives stay matched.
+Scope    : PP>1 without speculative decoding (whose optimistic computed
+           count could exclude a row that does not finish);
+           VLLM_ILU_PP_SKIP_FINISHING_RELAY=0 restores the community mask.
 """
 
 from __future__ import annotations
@@ -27,8 +45,47 @@ from collections.abc import Callable
 from functools import wraps
 from typing import Any
 
+import numpy as np
 import torch
 from vllm.v1.worker.gpu.input_batch import InputBatch
+
+MAX_SEQ_LEN_ATTR = "ilu_max_seq_len_np"
+
+
+def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
+    """Return a bool array of shape `[input_batch.num_reqs]` marking requests
+    that produce a sampled token this step, and therefore must have that token
+    (and the draft block proposed from it) propagated to the earlier PP stages.
+    Returns None if no request in the batch produces a sample."""
+    old_computed = input_batch.num_computed_tokens_np
+    prefill_len = input_batch.prefill_len_np
+    # Exclude non-final prefill chunks (they don't produce a sample).
+    produces_sample = old_computed + input_batch.num_scheduled_tokens >= prefill_len
+    # >>> ILU MODIFICATION >>>
+    # Exclude requests that we know are finished.
+    max_seq_len = getattr(input_batch, MAX_SEQ_LEN_ATTR, None)
+    if max_seq_len is not None:
+        not_finishing = np.maximum(old_computed, prefill_len) + 1 < max_seq_len
+        produces_sample = produces_sample & not_finishing
+    # <<< ILU MODIFICATION <<<
+    return produces_sample if produces_sample.any() else None
+
+
+def make_prepare_inputs_max_seq_len(
+    original: Callable[..., InputBatch],
+) -> Callable[..., InputBatch]:
+    @wraps(original)
+    def prepare_inputs(self, *args: Any, **kwargs: Any) -> InputBatch:
+        input_batch = original(self, *args, **kwargs)
+        if self.pp_handler is not None and not self.num_speculative_steps:
+            setattr(
+                input_batch,
+                MAX_SEQ_LEN_ATTR,
+                self.req_states.max_seq_len[input_batch.idx_mapping_np],
+            )
+        return input_batch
+
+    return prepare_inputs
 
 
 def make_pphandler_init(original_init: Callable[..., None]) -> Callable[..., None]:

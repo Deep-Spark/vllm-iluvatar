@@ -136,13 +136,26 @@ def build_rank_plan(
     rank: int,
     world: int,
     candidate_source: int = -1,
+    last_layer: int | None = None,
 ) -> RankKvPlan:
     """Plan this rank's share of the cut, and whether the pipeline carries KV.
 
     Every rank walks every other rank's bounds, so the global ``transfers_*``
     flags come out identical without any communication.
+
+    ``last_layer`` truncates the model after that layer (a PD prefiller stops
+    at the last KV source). The cut itself still comes from ``get_pp_indices``
+    over the full depth, so ``VLLM_PP_LAYER_PARTITION`` keeps validating
+    against the checkpoint; only the per-rank bounds are clipped, which can
+    leave a trailing rank empty.
     """
-    start, end = get_pp_indices(num_layers, rank, world)
+    depth = num_layers if last_layer is None else min(num_layers, last_layer + 1)
+
+    def bounds(of_rank: int) -> tuple[int, int]:
+        start, end = get_pp_indices(num_layers, of_rank, world)
+        return min(start, depth), min(end, depth)
+
+    start, end = bounds(rank)
     if world == 1:
         return RankKvPlan(start, end, None, None, False, False, False)
 
@@ -150,7 +163,7 @@ def build_rank_plan(
     transfers_topk = False
     transfers_candidates = False
     for other in range(1, world):
-        other_start, other_end = get_pp_indices(num_layers, other, world)
+        other_start, other_end = bounds(other)
         forwarder, _, needs_topk = _rank_needs(
             other_start, other_end, kv_sources, index_sources, compress_ratios
         )

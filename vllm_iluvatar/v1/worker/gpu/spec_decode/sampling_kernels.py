@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from functools import wraps
 from typing import Any
 
 import torch
@@ -87,6 +89,46 @@ def _insert_resampled(_grid: Any, *args: Any, **kwargs: Any) -> None:
         *args,
         args[5].dtype == torch.float64,
     )
+
+
+def rejection_sample_with_aligned_draft(
+    original: Callable[..., Any],
+) -> Callable[..., Any]:
+    """Cast draft logits to the target dtype before native rejection kernels.
+
+    DSpark keeps draft logits in the model dtype (bf16) while the target
+    logits that reach rejection sampling are fp32. The native stats, rejection,
+    and resample kernels dispatch on the target dtype and then take
+    ``draft.data_ptr`` of that same type, which raises
+    "expected Float but found BFloat16". The cast has to happen before
+    ``rejection_sample`` records draft strides: ``to()`` may repack the tensor.
+    bf16 to fp32 is exact.
+    """
+
+    @wraps(original)
+    def rejection_sample(*args: Any, **kwargs: Any) -> Any:
+        target_logits = args[0] if args else kwargs["target_logits"]
+        if "draft_logits" in kwargs:
+            kwargs["draft_logits"] = _match_draft_dtype(
+                target_logits, kwargs["draft_logits"]
+            )
+        elif len(args) >= 2:
+            args = (
+                args[0],
+                _match_draft_dtype(target_logits, args[1]),
+                *args[2:],
+            )
+        return original(*args, **kwargs)
+
+    return rejection_sample
+
+
+def _match_draft_dtype(
+    target_logits: torch.Tensor, draft_logits: torch.Tensor | None
+) -> torch.Tensor | None:
+    if draft_logits is not None and draft_logits.dtype != target_logits.dtype:
+        return draft_logits.to(dtype=target_logits.dtype)
+    return draft_logits
 
 
 gumbel_sample_kernel = KernelLauncher(_gumbel_sample)

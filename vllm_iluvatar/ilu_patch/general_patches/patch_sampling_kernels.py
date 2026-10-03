@@ -44,6 +44,13 @@ def _apply() -> None:
     for module, name, replacement in replacements:
         p.rebind_module_func(module, name, replacement)
 
+    p.rebind_module_func(
+        rejection,
+        "rejection_sample",
+        sampling_kernels.rejection_sample_with_aligned_draft(
+            rejection.rejection_sample
+        ),
+    )
     rejection_sampler.RejectionSampler._verify = make_verify_with_greedy_cuda(
         rejection_sampler.RejectionSampler._verify
     )

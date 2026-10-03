@@ -59,9 +59,9 @@ class RankKvPlan:
     # The forwarder also has to take the top-k selection over, because this
     # rank's first compressed layer has no local index source above it.
     forwarder_needs_topk: bool
-    # Set on every rank when *any* rank needs a transfer: the pipeline's
-    # intermediate tensors have to carry the same keys everywhere, so the
-    # decision to carry them is global even though the need is local.
+    # Set on every rank when *any* rank needs a transfer. Only decides whether
+    # the dense replica buffers are allocated at all; which keys actually ride
+    # a given hop is the ``sends_*`` / ``recvs_*`` pair below.
     transfers_kv: bool
     transfers_topk: bool
     # The two-level candidate shortlist is published by a single layer and read
@@ -70,6 +70,24 @@ class RankKvPlan:
     # nothing to replicate: the shortlist is a plain per-rank buffer, so it
     # rides the pipeline and every rank copies it in on arrival.
     transfers_candidates: bool = False
+    # Per-hop key set. ``recvs_*`` is what rank-1 puts on the wire for us and
+    # therefore what ``make_empty_intermediate_tensors`` has to allocate;
+    # ``sends_*`` is what we have to put on the wire for rank+1, and equals the
+    # next rank's ``recvs_*`` by construction.
+    #
+    # These exist because the payload is large and most of it is dead weight on
+    # most hops. Per token a hop carries 40960 B of hc hidden states, 8192 B of
+    # candidates and 2048 B of top-k; sending candidates on every hop rather
+    # than only between the publisher and its last reader is ~10% of the total
+    # bytes on a PP16 cut. Narrowing is safe because the receiver allocates
+    # from the *sender's* metadata (`GroupCoordinator.irecv_tensor_dict`), so
+    # the key set is free to differ per hop.
+    recvs_kv: bool = False
+    recvs_topk: bool = False
+    recvs_candidates: bool = False
+    sends_kv: bool = False
+    sends_topk: bool = False
+    sends_candidates: bool = False
 
 
 def _group_source(layer_id: int, sources: tuple[int, ...]) -> int | None:
@@ -138,10 +156,12 @@ def build_rank_plan(
     candidate_source: int = -1,
     last_layer: int | None = None,
 ) -> RankKvPlan:
-    """Plan this rank's share of the cut, and whether the pipeline carries KV.
+    """Plan this rank's share of the cut, and what each hop has to carry.
 
     Every rank walks every other rank's bounds, so the global ``transfers_*``
-    flags come out identical without any communication.
+    flags and the per-hop key sets come out consistent without any
+    communication: rank r's ``sends_*`` is computed from rank r+1's needs and
+    is by construction equal to rank r+1's ``recvs_*``.
 
     ``last_layer`` truncates the model after that layer (a PD prefiller stops
     at the last KV source). The cut itself still comes from ``get_pp_indices``
@@ -151,34 +171,44 @@ def build_rank_plan(
     """
     depth = num_layers if last_layer is None else min(num_layers, last_layer + 1)
 
-    def bounds(of_rank: int) -> tuple[int, int]:
+    def clip(of_rank: int) -> tuple[int, int]:
         start, end = get_pp_indices(num_layers, of_rank, world)
         return min(start, depth), min(end, depth)
 
-    start, end = bounds(rank)
+    rank_bounds = [clip(r) for r in range(world)]
+    start, end = rank_bounds[rank]
     if world == 1:
         return RankKvPlan(start, end, None, None, False, False, False)
 
-    transfers_kv = False
-    transfers_topk = False
-    transfers_candidates = False
-    for other in range(1, world):
-        other_start, other_end = bounds(other)
-        forwarder, _, needs_topk = _rank_needs(
-            other_start, other_end, kv_sources, index_sources, compress_ratios
-        )
-        if forwarder is not None:
-            transfers_kv = True
-            transfers_topk = transfers_topk or needs_topk
-        transfers_candidates = transfers_candidates or _rank_reads_remote_candidates(
-            other_start, other_end, index_sources, candidate_source
-        )
+    # Rank 0 starts every group it reads, so it is never stranded.
+    needs = [(None, None, False)] + [
+        _rank_needs(s, e, kv_sources, index_sources, compress_ratios)
+        for s, e in rank_bounds[1:]
+    ]
+    reads_candidates = [
+        _rank_reads_remote_candidates(s, e, index_sources, candidate_source)
+        for s, e in rank_bounds
+    ]
 
-    forwarder, kv_source, needs_topk = (
-        _rank_needs(start, end, kv_sources, index_sources, compress_ratios)
-        if rank > 0
-        else (None, None, False)
+    transfers_kv = any(n[0] is not None for n in needs)
+    transfers_topk = any(n[2] for n in needs)
+    transfers_candidates = any(reads_candidates[1:])
+
+    # The shortlist only has to travel from the rank that publishes it to the
+    # last rank that scores against it; before the publisher the local buffer
+    # holds nothing anyone may read.
+    candidate_rank = next(
+        (r for r, (s, e) in enumerate(rank_bounds) if s <= candidate_source < e),
+        None,
     )
+
+    def recvs_candidates(r: int) -> bool:
+        if candidate_rank is None or r <= candidate_rank:
+            return False
+        return any(reads_candidates[r:])
+
+    forwarder, kv_source, needs_topk = needs[rank]
+    nxt = rank + 1
     return RankKvPlan(
         start_layer=start,
         end_layer=end,
@@ -188,6 +218,12 @@ def build_rank_plan(
         transfers_kv=transfers_kv,
         transfers_topk=transfers_topk,
         transfers_candidates=transfers_candidates,
+        recvs_kv=forwarder is not None,
+        recvs_topk=needs_topk,
+        recvs_candidates=recvs_candidates(rank),
+        sends_kv=nxt < world and needs[nxt][0] is not None,
+        sends_topk=nxt < world and needs[nxt][2],
+        sends_candidates=nxt < world and recvs_candidates(nxt),
     )
 
 

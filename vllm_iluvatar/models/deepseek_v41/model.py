@@ -525,7 +525,12 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         device: torch.device,
     ) -> IntermediateTensors:
         """The posted multi-stream hidden states, the leftover ``pre_mix``, and
-        the KV records a split group has to carry."""
+        the KV records a split group has to carry.
+
+        These are the buffers the V2 runner copies the arriving tensors into,
+        so the key set is this rank's ``recvs_*`` -- what the previous rank
+        actually puts on the wire -- not the global ``transfers_*``.
+        """
         tensors = {
             "hidden_states": torch.zeros(
                 (batch_size, self.hc_mult, self.config.hidden_size),
@@ -538,7 +543,7 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 device=device,
             ),
         }
-        if self.pp_plan.transfers_kv:
+        if self.pp_plan.recvs_kv:
             assert self.main_kv_rows is not None
             assert self.indexer_kv_rows is not None
             tensors["main_kv"] = torch.zeros(
@@ -551,13 +556,13 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 dtype=self.indexer_kv_rows.dtype,
                 device=device,
             )
-        if self.pp_plan.transfers_topk:
+        if self.pp_plan.recvs_topk:
             tensors["topk"] = torch.zeros(
                 (batch_size, self.config.index_topk),
                 dtype=torch.int32,
                 device=device,
             )
-        if self.pp_plan.transfers_candidates:
+        if self.pp_plan.recvs_candidates:
             assert self.candidate_idxs_buffer is not None
             tensors["candidates"] = torch.zeros(
                 (batch_size, self.candidate_idxs_buffer.shape[1]),
@@ -725,17 +730,17 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         if not get_pp_group().is_last_rank:
             tensors = {"hidden_states": hidden_states, "pre_mix": pre_mix}
             num_tokens = positions.shape[0]
-            if self.pp_plan.transfers_kv:
+            if self.pp_plan.sends_kv:
                 assert self.main_kv_rows is not None
                 assert self.indexer_kv_rows is not None
                 tensors["main_kv"] = self.main_kv_rows[:num_tokens]
                 tensors["indexer_kv"] = self.indexer_kv_rows[:num_tokens]
-            if self.pp_plan.transfers_topk:
+            if self.pp_plan.sends_topk:
                 # No designated sender: every index source rewrites this
                 # buffer, so at the end of the rank it already holds the
                 # latest selection -- this rank's, or the one it took over.
                 tensors["topk"] = self.topk_indices_buffer[:num_tokens]
-            if self.pp_plan.transfers_candidates:
+            if self.pp_plan.sends_candidates:
                 # Same story as the top-k: whichever rank last wrote the
                 # shortlist left it in this buffer, so the send needs no
                 # designated sender.

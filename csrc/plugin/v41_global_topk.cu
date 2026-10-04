@@ -105,20 +105,56 @@ __global__ void v41_global_topk_indices_and_lens_kernel(
 
   // Compaction is order-preserving, so the write index never overtakes the
   // read index and the pass can run in place in shared memory.
+  //
+  // It used to run entirely on thread 0: a serial walk over all ``topk``
+  // entries while the other 127 threads idled, which at index_topk=512 was
+  // essentially the whole kernel (68 us per call, 2.4 ms/step). A block-wide
+  // stable scan does the same compaction in ceil(topk / blockDim.x) tiles.
+  __shared__ int32_t scan_buf[kGlobalTopkThreads];
+  __shared__ int32_t kept_total;
   if (threadIdx.x == 0) {
-    int kept = 0;
-    for (int k = 0; k < topk; ++k) {
-      const int32_t slot = staged[k];
-      if (slot >= 0) {
-        staged[kept++] = slot;
-      }
+    kept_total = 0;
+  }
+  __syncthreads();
+
+  for (int base = 0; base < topk; base += kGlobalTopkThreads) {
+    const int k = base + static_cast<int>(threadIdx.x);
+    // Load before any store: the compacted position never exceeds the read
+    // position, but a lower-indexed thread must not land on a slot this
+    // thread has yet to read.
+    const int32_t val = (k < topk) ? staged[k] : -1;
+    const int32_t pred = (val >= 0) ? 1 : 0;
+    __syncthreads();
+
+    scan_buf[threadIdx.x] = pred;
+    __syncthreads();
+    for (int off = 1; off < kGlobalTopkThreads; off <<= 1) {
+      const int32_t add =
+          (threadIdx.x >= static_cast<unsigned>(off)) ? scan_buf[threadIdx.x - off] : 0;
+      __syncthreads();
+      scan_buf[threadIdx.x] += add;
+      __syncthreads();
     }
-    const int32_t fill =
-        pad_walk_tail ? (kept > 0 ? staged[kept - 1] : 0) : -1;
-    for (int k = kept; k < topk; ++k) {
-      staged[k] = fill;
+    const int32_t incl = scan_buf[threadIdx.x];
+    if (pred) {
+      staged[kept_total + incl - 1] = val;
     }
+    __syncthreads();
+    if (threadIdx.x == kGlobalTopkThreads - 1) {
+      kept_total += incl;
+    }
+    __syncthreads();
+  }
+
+  const int32_t kept = kept_total;
+  const int32_t fill = pad_walk_tail ? (kept > 0 ? staged[kept - 1] : 0) : -1;
+  __syncthreads();
+  if (threadIdx.x == 0) {
     topk_lens[token] = kept;
+  }
+  for (int k = kept + static_cast<int>(threadIdx.x); k < topk;
+       k += kGlobalTopkThreads) {
+    staged[k] = fill;
   }
   __syncthreads();
 

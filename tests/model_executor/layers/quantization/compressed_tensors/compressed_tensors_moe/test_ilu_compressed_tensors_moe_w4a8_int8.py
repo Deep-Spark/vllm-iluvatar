@@ -6,6 +6,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
@@ -143,6 +144,7 @@ def test_w4a8_non_ep_uses_regular_token_index_and_group_gemm(monkeypatch):
 
 
 def test_w4a8_decode_uses_decode_token_index_and_group_gemv(monkeypatch):
+    monkeypatch.setenv("VLLM_ILU_FUSE_MOE_W13", "0")
     method = w4a8_moe.IluCompressedTensorsW4A8Int8MoEMethod.__new__(
         w4a8_moe.IluCompressedTensorsW4A8Int8MoEMethod
     )
@@ -187,3 +189,54 @@ def test_w4a8_decode_uses_decode_token_index_and_group_gemv(monkeypatch):
     fake_ixfops.moe_w4a8_group_gemm.assert_not_called()
     fake_ixfops.moe_compute_token_index.assert_not_called()
     fake_ixfops.moe_compute_token_index_ep.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "use_ep,local_prefills,global_decode,expected_decode",
+    [
+        (True, 0, False, False),  # Local decode, remote prefill after EP gather.
+        (True, 1, False, False),
+        (True, 0, True, True),   # All DP ranks decode, including speculative decode.
+        (True, 0, None, True),   # TP/EP without DP uses local semantics.
+        (True, 1, None, False),
+        (False, 0, False, True), # Non-EP input is local despite remote prefill.
+        (False, 1, True, False),
+    ],
+)
+def test_apply_dispatch_uses_gathered_batch_semantics(
+    monkeypatch, use_ep, local_prefills, global_decode, expected_decode
+):
+    method = w4a8_moe.IluCompressedTensorsW4A8Int8MoEMethod.__new__(
+        w4a8_moe.IluCompressedTensorsW4A8Int8MoEMethod
+    )
+    expected = object()
+    method._apply_ep = MagicMock(return_value=expected)
+    method._apply_decode = MagicMock(return_value=expected)
+    method._apply_general = MagicMock(return_value=expected)
+    method._valid_extra_residual = MagicMock(return_value=None)
+    metadata = SimpleNamespace(num_prefills=local_prefills, num_decodes=4)
+    dp = None if global_decode is None else SimpleNamespace(
+        all_ranks_decode_only=global_decode
+    )
+    monkeypatch.setattr(w4a8_moe, "get_forward_context", lambda: SimpleNamespace(
+        attn_metadata={"attention": metadata}, dp_metadata=dp
+    ))
+    guard = MagicMock()
+    monkeypatch.setattr(w4a8_moe, "_ensure_cuda_graph_safe_dispatch", guard)
+    layer = SimpleNamespace(expert_map=torch.tensor([0]) if use_ep else None)
+    result = method.apply(
+        layer, torch.ones((4, 5)), torch.ones((4, 1)),
+        torch.zeros((4, 1), dtype=torch.int32), None, None,
+    )
+    assert result is expected
+    guard.assert_called_once_with(expected_decode, {"attention": metadata})
+    if use_ep:
+        assert method._apply_ep.call_args.kwargs["run_decode"] is expected_decode
+        method._apply_decode.assert_not_called()
+        method._apply_general.assert_not_called()
+    elif expected_decode:
+        method._apply_decode.assert_called_once()
+        method._apply_general.assert_not_called()
+    else:
+        method._apply_general.assert_called_once()
+        method._apply_decode.assert_not_called()

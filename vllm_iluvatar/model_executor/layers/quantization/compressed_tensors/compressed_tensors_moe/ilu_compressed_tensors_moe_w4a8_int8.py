@@ -590,6 +590,12 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         attn_metadata = forward_context.attn_metadata
         use_ep = layer.expert_map is not None
         only_decode = _is_only_decode(attn_metadata)
+        if use_ep and forward_context.dp_metadata is not None:
+            # EP receives tokens from every DP rank. Local attention metadata
+            # cannot classify this gathered batch when some ranks still prefill.
+            only_decode = bool(
+                forward_context.dp_metadata.all_ranks_decode_only
+            )
         _ensure_cuda_graph_safe_dispatch(only_decode, attn_metadata)
 
         if use_ep:

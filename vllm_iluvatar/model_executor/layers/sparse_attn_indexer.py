@@ -141,6 +141,8 @@ def ilu_sparse_attn_indexer(
                 max_q_len=chunk.max_q_len,
                 max_kv_len=chunk.max_kv_len,
                 max_context_len=chunk.max_context_len,
+                cu_seqlen_ks=chunk.cu_seqlen_ks,
+                cu_seqlen_ke=chunk.cu_seqlen_ke,
             )
             _two_level_filter(
                 logits,
@@ -184,6 +186,8 @@ def ilu_sparse_attn_indexer(
             max_q_len=decode_metadata.max_q_len,
             max_kv_len=decode_metadata.max_kv_len,
             max_context_len=decode_metadata.max_context_len,
+            cu_seqlen_ks=decode_metadata.cu_seqlen_ks,
+            cu_seqlen_ke=decode_metadata.cu_seqlen_ke,
         )
 
         _two_level_filter(

@@ -99,7 +99,8 @@ __global__ void engram_ngram_hash_kernel(
     int64_t vocab, int64_t num_tokens, int64_t bt_rows, int64_t bt_cols,
     int64_t qsl_n, int64_t cache_n, bool paged,
     const int32_t* __restrict__ lookback, int64_t lookback_stride,
-    int64_t lookback_rows, int64_t lookback_depth) {
+    int64_t lookback_rows, int64_t lookback_depth,
+    bool lookback_is_prompt_only) {
   const int64_t token = static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x;
   if (token >= num_tokens) {
     return;
@@ -146,35 +147,41 @@ __global__ void engram_ngram_hash_kernel(
           id = vocab - 1;
         }
         source = token_map[id];
-      } else if (look >= 0 && lookback != nullptr) {
-        // SWA pages before bounded replay may have been reclaimed. The
-        // runner's original-token history is independent of KV residency.
-        const int64_t offset = chunk_start - look - 1;
-        if (req < lookback_rows && offset < lookback_depth) {
-          const int32_t id = lookback[req * lookback_stride + offset];
-          if (id >= 0 && id < vocab) {
-            source = token_map[id];
+      } else if (look >= 0) {
+        bool read_cache = lookback == nullptr;
+        if (lookback != nullptr) {
+          const int64_t offset = chunk_start - look - 1;
+          if (req < lookback_rows && offset < lookback_depth) {
+            const int32_t id = lookback[req * lookback_stride + offset];
+            if (id >= 0 && id < vocab) {
+              source = token_map[id];
+            }
+            // V1 only supplies prompt history: -1 for generated positions
+            // means consult the paged token cache. In V2 the window is
+            // complete, so -1 remains missing history even if a page exists.
+            read_cache = lookback_is_prompt_only && id == kDeadId;
           }
         }
-      } else if (look >= 0 && bt_rows > 0 && bt_cols > 0 && block_size > 0) {
-        const int64_t blk = look / block_size;
-        const bool in_range = blk < bt_cols;
-        int64_t row = req;
-        if (row >= bt_rows) {
-          row = bt_rows - 1;
-        }
-        int64_t col = blk;
-        if (col < 0) {
-          col = 0;
-        } else if (col >= bt_cols) {
-          col = bt_cols - 1;
-        }
-        const int32_t block =
-            block_table[row * bt_stride0 + col * bt_stride1];
-        const int64_t slot =
-            static_cast<int64_t>(block) * block_size + (look % block_size);
-        if (in_range && block > 0 && slot >= 0 && slot < nslots) {
-          source = cache[slot];
+        if (read_cache && bt_rows > 0 && bt_cols > 0 && block_size > 0) {
+          const int64_t blk = look / block_size;
+          const bool in_range = blk < bt_cols;
+          int64_t row = req;
+          if (row >= bt_rows) {
+            row = bt_rows - 1;
+          }
+          int64_t col = blk;
+          if (col < 0) {
+            col = 0;
+          } else if (col >= bt_cols) {
+            col = bt_cols - 1;
+          }
+          const int32_t block =
+              block_table[row * bt_stride0 + col * bt_stride1];
+          const int64_t slot =
+              static_cast<int64_t>(block) * block_size + (look % block_size);
+          if (in_range && block > 0 && slot >= 0 && slot < nslots) {
+            source = cache[slot];
+          }
         }
       }
     } else if (look >= 0 && look < cache_n) {
@@ -275,7 +282,8 @@ torch::Tensor engram_ngram_hash(
     torch::Tensor& token_to_req, torch::Tensor& query_start_loc,
     torch::Tensor& multipliers, torch::Tensor& primes, torch::Tensor& offsets,
     int64_t pad_id, int64_t nslots, int64_t block_size, int64_t num_reqs,
-    bool paged, const std::optional<torch::Tensor>& lookback_token_ids) {
+    bool paged, const std::optional<torch::Tensor>& lookback_token_ids,
+    bool lookback_is_prompt_only) {
   TORCH_CHECK(multipliers.is_cuda() && multipliers.is_contiguous(),
               "multipliers must be a contiguous CUDA tensor");
   TORCH_CHECK(primes.is_cuda() && primes.is_contiguous(),
@@ -381,7 +389,8 @@ torch::Tensor engram_ngram_hash(
       lookback_token_ids.has_value() ? lookback_token_ids->data_ptr<int32_t>() : nullptr,
       lookback_token_ids.has_value() ? lookback_token_ids->stride(0) : 0,
       lookback_token_ids.has_value() ? lookback_token_ids->size(0) : 0,
-      lookback_token_ids.has_value() ? lookback_token_ids->size(1) : 0);
+      lookback_token_ids.has_value() ? lookback_token_ids->size(1) : 0,
+      lookback_is_prompt_only);
   AT_CUDA_CHECK(cudaGetLastError());
   return out;
 }
@@ -392,7 +401,8 @@ torch::Tensor engram_ngram_hash_meta(
     torch::Tensor& token_to_req, torch::Tensor& query_start_loc,
     torch::Tensor& multipliers, torch::Tensor& primes, torch::Tensor& offsets,
     int64_t pad_id, int64_t nslots, int64_t block_size, int64_t num_reqs,
-    bool paged, const std::optional<torch::Tensor>& lookback_token_ids) {
+    bool paged, const std::optional<torch::Tensor>& lookback_token_ids,
+    bool lookback_is_prompt_only) {
   (void)positions;
   (void)token_map;
   (void)cache;
@@ -405,6 +415,7 @@ torch::Tensor engram_ngram_hash_meta(
   (void)num_reqs;
   (void)paged;
   (void)lookback_token_ids;
+  (void)lookback_is_prompt_only;
   const int64_t num_tokens = input_ids.numel() == 0 ? 0 : input_ids.size(0);
   const int64_t n_heads = primes.dim() == 2 ? primes.size(1) : 0;
   const int64_t groups = multipliers.numel() > 0 ? multipliers.numel() - 1 : 0;

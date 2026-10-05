@@ -276,7 +276,10 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         if self.engram_layer_ids:
             model_config = vllm_config.model_config
             self.model_path = model_config.model
-            self._build_engram(config, model_config)
+            self._build_engram(
+                config, model_config,
+                lookback_is_prompt_only=not vllm_config.use_v2_model_runner,
+            )
         # Flipped at the end of load_weights. The listener is up before that,
         # and it refuses a snapshot until this is set.
         self._weights_ready = False
@@ -474,7 +477,9 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                     self.candidate_lens_buffer,
                 )
 
-    def _build_engram(self, config, model_config) -> None:
+    def _build_engram(
+        self, config, model_config, *, lookback_is_prompt_only: bool,
+    ) -> None:
         """Create the shared token history and one IluEngram per engram layer.
 
         The compressed token map is derived from the tokenizer (about 5 s for
@@ -519,6 +524,7 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
             multipliers,
             token_map[config.engram_pad_token_id],
             self.device,
+            lookback_is_prompt_only=lookback_is_prompt_only,
         )
         for layer_id in self.engram_layer_ids:
             if layer_id not in local_ids:

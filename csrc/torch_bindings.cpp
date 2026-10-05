@@ -295,7 +295,8 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
       "Tensor cache, Tensor block_table, Tensor token_to_req, "
       "Tensor query_start_loc, Tensor multipliers, Tensor primes, "
       "Tensor offsets, int pad_id, int nslots, int block_size, int num_reqs, "
-      "bool paged, Tensor? lookback_token_ids=None) -> Tensor");
+      "bool paged, Tensor? lookback_token_ids=None, "
+      "bool lookback_is_prompt_only=False) -> Tensor");
   ops.def(
       "engram_lookup_fp8(Tensor indices, Tensor weight, Tensor scale, "
       "int vocab_start, int vocab_end) -> Tensor");

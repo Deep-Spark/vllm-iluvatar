@@ -1066,12 +1066,15 @@ class NgramHashState(nn.Module):
         multipliers,
         pad_id,
         device,
+        *,
+        lookback_is_prompt_only: bool = False,
     ) -> None:
         super().__init__()
         self.layout = layout
         self.swa_cache_module = swa_cache_module
         self.block_size = int(swa_cache_module.block_size)
         self.lookback_depth = layout.max_ngram_size - 1
+        self.lookback_is_prompt_only = lookback_is_prompt_only
         self.pad_id = int(pad_id)
         self._cache: torch.Tensor | None = None
         self._nslots = 0
@@ -1162,6 +1165,7 @@ class NgramHashState(nn.Module):
                     int(num_reqs),
                     True,
                     lookback_token_ids,
+                    self.lookback_is_prompt_only,
                 )
             )
         return torch.stack(cols, dim=1)

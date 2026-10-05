@@ -635,7 +635,8 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 yield engram
 
     def _prepare_engram(
-        self, input_ids: torch.Tensor | None, positions: torch.Tensor
+        self, input_ids: torch.Tensor | None, positions: torch.Tensor,
+        lookback_token_ids: torch.Tensor | None = None,
     ) -> None:
         """Hash once, then each engram layer gathers its rows before the decoder loop.
 
@@ -650,15 +651,15 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         )
         md = _window_metadata() if ready else None
         if ready and md is not None and md.slot_mapping is not None:
+            if lookback_token_ids is None:
+                raise ValueError("Engram requires runner-provided lookback_token_ids")
             n = min(input_ids.size(0), positions.size(0))
             hashes = self.engram_hash(
                 input_ids[:n],
                 positions[:n],
                 md.query_start_loc,
                 input_ids.new_zeros(n, dtype=torch.bool),
-                input_ids.new_full(
-                    (max(_num_reqs(md), 1), self.engram_hash.lookback_depth), -1
-                ),
+                lookback_token_ids,
                 input_ids.new_zeros(
                     (max(_num_reqs(md), 1), self.engram_hash.lookback_depth),
                     dtype=torch.bool,
@@ -691,6 +692,7 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
+        lookback_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         """Embed -> local layers -> leftover FFN post -> collapse or PP send.
 
@@ -719,7 +721,7 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
             self._accept_remote_kv(intermediate_tensors, positions)
             self._accept_remote_candidates(intermediate_tensors)
 
-        self._prepare_engram(input_ids, positions)
+        self._prepare_engram(input_ids, positions, lookback_token_ids)
         residual = post_mix = res_mix = None
         aux_hidden_states: list[torch.Tensor] = []
         for idx, layer in enumerate(
@@ -846,15 +848,21 @@ class IluDeepseekV41ForCausalLM(IluDeepseekV4Fp8ForCausalLM, SupportsEagle3):
 
     @property
     def token_lookback_depth(self) -> int:
-        """Zero: this model needs no runner-gathered lookback window.
+        """Original-token history remains valid after SWA pages are reclaimed."""
+        if not getattr(self.config, "engram_layer_ids", None):
+            return 0
+        return int(self.config.engram_max_ngram_size) - 1
 
-        Community V4.1 has the runner gather the ids preceding each chunk start
-        for the engram n-gram hash. Here ``IluEngram`` keeps its own paged slot
-        cache of token ids and reads the window from that (see
-        ``engram.lookback_paged``), so there is nothing for the runner to
-        gather. Only the state's bounded-replay half is wanted.
-        """
-        return 0
+    def forward(
+        self, input_ids: torch.Tensor, positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        lookback_token_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        return self.model(
+            input_ids, positions, intermediate_tensors, inputs_embeds,
+            lookback_token_ids=lookback_token_ids,
+        )
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         # Sorts the ids and fills the PP slot cache the runner's

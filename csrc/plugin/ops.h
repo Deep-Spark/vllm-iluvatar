@@ -310,7 +310,7 @@ torch::Tensor engram_ngram_hash(
     torch::Tensor& token_to_req, torch::Tensor& query_start_loc,
     torch::Tensor& multipliers, torch::Tensor& primes, torch::Tensor& offsets,
     int64_t pad_id, int64_t nslots, int64_t block_size, int64_t num_reqs,
-    bool paged);
+    bool paged, const std::optional<torch::Tensor>& lookback_token_ids);
 
 torch::Tensor engram_ngram_hash_meta(
     torch::Tensor& input_ids, torch::Tensor& positions, torch::Tensor& token_map,
@@ -318,7 +318,7 @@ torch::Tensor engram_ngram_hash_meta(
     torch::Tensor& token_to_req, torch::Tensor& query_start_loc,
     torch::Tensor& multipliers, torch::Tensor& primes, torch::Tensor& offsets,
     int64_t pad_id, int64_t nslots, int64_t block_size, int64_t num_reqs,
-    bool paged);
+    bool paged, const std::optional<torch::Tensor>& lookback_token_ids);
 
 // Gather fp8 e4m3 rows, multiply by ue8m0 block scales, write bf16.
 // Ids outside [vocab_start, vocab_end) store zeros (row-shard all-reduce).

@@ -1108,6 +1108,10 @@ class NgramHashState(nn.Module):
             self._cache = None
             self._nslots = 0
             return False
+        # The KV coordinator can enlarge a group's pages to equalize page
+        # sizes. Use the bound cache geometry, matching its slot mapping and
+        # block table, rather than the layer's original KVCacheSpec.
+        self.block_size = int(kv.shape[1])
         nslots = int(kv.shape[0]) * self.block_size
         if self._cache is None or self._cache.numel() < nslots + 1:
             self._cache = torch.zeros(nslots + 1, dtype=torch.int64, device=kv.device)
@@ -1127,7 +1131,7 @@ class NgramHashState(nn.Module):
         token_to_req: torch.Tensor,
         num_reqs: int,
     ) -> torch.Tensor:
-        del dead_mask, lookback_token_ids, lookback_dead_mask
+        del dead_mask, lookback_dead_mask
         assert self._cache is not None and slot_mapping is not None
         assert block_table is not None
         n = min(input_ids.size(0), positions.size(0), token_to_req.size(0))
@@ -1157,6 +1161,7 @@ class NgramHashState(nn.Module):
                     self.block_size,
                     int(num_reqs),
                     True,
+                    lookback_token_ids,
                 )
             )
         return torch.stack(cols, dim=1)

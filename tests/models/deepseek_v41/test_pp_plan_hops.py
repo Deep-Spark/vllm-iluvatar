@@ -78,8 +78,6 @@ def test_narrowing_actually_drops_hops_on_pp16() -> None:
     ranks = plans(16)
     assert sum(p.sends_candidates for p in ranks) == 5
     assert sum(p.sends_kv for p in ranks) == 11
-    # Global flags stay on so the replica buffers are still allocated.
-    assert all(p.transfers_kv and p.transfers_candidates for p in ranks)
 
 
 def test_single_rank_carries_nothing() -> None:

@@ -33,6 +33,26 @@ from vllm.model_executor.layers.fused_moe.routed_experts import (
 
 from vllm_iluvatar.ilu_patch import general_patch as p
 
+# vLLM loads weights under max_split_size_mb=20 (gpu_worker.load_model), so a
+# cached 20 MiB segment is never handed to a smaller request. Copying a CPU
+# shard into a strided expert slice (w1/w3 halves of w13) stages through a
+# ~6 MiB device buffer, and every one of them opens a fresh 20 MiB segment.
+# torch would free those on its own OOM, but a Corex H2D copy needs free device
+# memory outside the allocator and fails with "invalid argument" first: on
+# TP2/PP8 three MoE layers per rank leave ~20 GiB of such segments behind.
+_LOAD_STAGING_SLACK = 1 << 30
+
+
+def _release_load_staging(device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    if (
+        torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+        > _LOAD_STAGING_SLACK
+    ):
+        torch.cuda.empty_cache()
+
+
 _ROUTED_EXPERTS_WEIGHT_LOADER_BASELINE = """\
     def weight_loader(
         self,
@@ -949,6 +969,9 @@ class IluRoutedExperts(RoutedExperts):
                 expert_data=expert_data,
                 tp_rank=self.moe_config.tp_rank,
             )
+            # >>> ILU MODIFICATION >>>
+            _release_load_staging(expert_data.device)
+            # <<< ILU MODIFICATION <<<
             return True if return_success else None
 
         return False if return_success else None

@@ -79,13 +79,40 @@ def test_the_forwarder_is_the_first_stranded_layer(world: int):
 
 
 @pytest.mark.parametrize("world", [1, 2, 3, 4, 5, 6, 7, 8])
-def test_the_carry_flags_agree_on_every_rank(world: int):
-    """Each rank derives them alone, and the pipeline breaks if they differ:
-    the intermediate tensors must have the same keys on both sides."""
+def test_each_hop_agrees_on_what_it_carries(world: int):
+    """Each rank derives its hops alone, and the pipeline breaks if the two
+    sides of one hop disagree: a key the sender omits would reach the receiver
+    holding the previous step's rows, and one it adds has nowhere to land."""
     plans = _plans(world)
-    assert len({p.transfers_kv for p in plans}) == 1
-    assert len({p.transfers_topk for p in plans}) == 1
-    assert plans[0].transfers_kv == any(p.forwarder is not None for p in plans)
+    for sender, receiver in zip(plans, plans[1:]):
+        assert sender.sends_kv == receiver.recvs_kv
+        assert sender.sends_topk == receiver.recvs_topk
+        assert sender.sends_candidates == receiver.recvs_candidates
+    # Nothing leaves the last rank and nothing arrives at the first.
+    assert not (plans[-1].sends_kv or plans[-1].sends_topk)
+    assert not (plans[0].recvs_kv or plans[0].recvs_topk)
+
+
+@pytest.mark.parametrize("world", [2, 3, 4, 5, 6, 7, 8])
+def test_a_rank_only_sends_records_it_can_produce(world: int):
+    """The outgoing buffer is filled by a local source or by the relay, so
+    sending without either would ship whatever the buffer happened to hold."""
+    for plan in _plans(world):
+        if not plan.sends_kv:
+            continue
+        owns_source = any(
+            plan.start_layer <= s < plan.end_layer for s in V41_KV_SOURCES
+        )
+        assert owns_source or plan.recvs_kv
+    # Same for the selection: it is whatever the rank's last index source
+    # wrote, or what it took over.
+    for plan in _plans(world):
+        if not plan.sends_topk:
+            continue
+        owns_source = any(
+            plan.start_layer <= s < plan.end_layer for s in V41_INDEX_SOURCES
+        )
+        assert owns_source or plan.recvs_topk
 
 
 @pytest.mark.parametrize("world", [1, 2, 3, 4, 5, 6, 7, 8])
@@ -105,7 +132,8 @@ def test_single_rank_carries_nothing():
         V41_LAYERS, V41_KV_SOURCES, V41_INDEX_SOURCES, V41_RATIOS, 0, 1
     )
     assert plan.forwarder is None
-    assert not plan.transfers_kv and not plan.transfers_topk
+    assert not (plan.recvs_kv or plan.recvs_topk or plan.recvs_candidates)
+    assert not (plan.sends_kv or plan.sends_topk or plan.sends_candidates)
     assert (plan.start_layer, plan.end_layer) == (0, V41_LAYERS)
 
 
@@ -130,7 +158,12 @@ def test_topk_can_be_stranded_while_the_kv_group_is_not():
     assert plans[3].forwarder == 30
     assert plans[3].forwarded_kv_source == 20
     assert plans[3].forwarder_needs_topk
-    assert plans[0].transfers_topk
+    assert plans[3].recvs_kv and plans[3].recvs_topk
+    assert plans[2].sends_kv and plans[2].sends_topk
+    # Rank 2 starts on a source of both kinds, so the hop into it carries
+    # neither even though the hop out of it carries both.
+    assert not (plans[2].recvs_kv or plans[2].recvs_topk)
+    assert not (plans[1].sends_kv or plans[1].sends_topk)
 
 
 def test_a_group_spanning_three_ranks_puts_a_forwarder_on_each():
@@ -143,8 +176,10 @@ def test_a_group_spanning_three_ranks_puts_a_forwarder_on_each():
     assert plans[0].forwarder is None
     assert plans[1].forwarder == 4 and plans[1].forwarded_kv_source == 0
     assert plans[2].forwarder == 8 and plans[2].forwarded_kv_source == 0
-    # Rank 1 owns no source, so nothing on it would refill the outgoing buffer.
+    # Rank 1 owns no source, so nothing on it would refill the outgoing buffer:
+    # it has to send what it received, which is what makes it a relay.
     assert not any(4 <= s < 8 for s in kv)
+    assert plans[1].recvs_kv and plans[1].sends_kv
 
 
 def test_leading_sliding_window_layers_do_not_strand_a_group():
@@ -160,6 +195,42 @@ def test_leading_sliding_window_layers_do_not_strand_a_group():
     assert plans[2].forwarder == 4 and plans[2].forwarded_kv_source == 2
 
 
+@pytest.mark.parametrize("partition", ["10,10,10,10", "5,5,5,5,5,5,5,5", "20,2,2,16"])
+def test_truncation_rejects_a_rank_left_with_no_layer(partition, monkeypatch):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", partition)
+    world = len(partition.split(","))
+    for rank in range(world):
+        with pytest.raises(ValueError, match="no layer"):
+            build_rank_plan(
+                V41_LAYERS,
+                V41_KV_SOURCES,
+                V41_INDEX_SOURCES,
+                V41_RATIOS,
+                rank,
+                world,
+                last_layer=20,
+            )
+
+
+@pytest.mark.parametrize("partition", ["5,5,5,25", "3,3,3,3,2,3,2,21", "20,20"])
+def test_truncation_accepts_a_cut_where_every_rank_keeps_a_layer(
+    partition, monkeypatch
+):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", partition)
+    world = len(partition.split(","))
+    for rank in range(world):
+        plan = build_rank_plan(
+            V41_LAYERS,
+            V41_KV_SOURCES,
+            V41_INDEX_SOURCES,
+            V41_RATIOS,
+            rank,
+            world,
+            last_layer=20,
+        )
+        assert plan.start_layer < plan.end_layer <= 21
+
+
 def test_local_kv_source_rejects_a_plan_that_forgot_a_forwarder():
     plan = build_rank_plan(
         V41_LAYERS, V41_KV_SOURCES, V41_INDEX_SOURCES, V41_RATIOS, 0, 1
@@ -172,8 +243,7 @@ def test_local_kv_source_rejects_a_plan_that_forgot_a_forwarder():
         forwarder=None,
         forwarded_kv_source=None,
         forwarder_needs_topk=False,
-        transfers_kv=True,
-        transfers_topk=False,
+        recvs_kv=True,
     )
     with pytest.raises(AssertionError):
         local_kv_source(12, 8, broken)

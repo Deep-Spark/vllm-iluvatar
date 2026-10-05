@@ -846,6 +846,10 @@ class NixlConnectorScheduler:
                 params["do_remote_prefill"] = False
                 return False, None
 
+            # Dropped on every finish, not only on abort: a fully locally cached
+            # request that finishes normally would otherwise stay here forever.
+            fully_local = request.request_id in self._reqs_not_send_to_worker
+            self._reqs_not_send_to_worker.discard(request.request_id)
             if (
                 request.status
                 not in (
@@ -856,9 +860,8 @@ class NixlConnectorScheduler:
             ):
                 assert not params.get("do_remote_prefill")
                 # for D, there are 2 cases.
-                if request.request_id in self._reqs_not_send_to_worker:
+                if fully_local:
                     # this req is full cache by local, when aborted, return False
-                    self._reqs_not_send_to_worker.pop(request.request_id)
                     return False, {}
                 else:
                     # wait kv cache write done from P

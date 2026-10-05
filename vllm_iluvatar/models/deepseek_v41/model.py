@@ -311,16 +311,20 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         self.pp_plan = plan
         self.start_layer, self.end_layer = plan.start_layer, plan.end_layer
 
-        # Only the last KV source on this rank has to mirror its records: an
-        # earlier one's would be overwritten before the rank finishes anyway.
+        # Only the last KV source on this rank has to mirror its records, and
+        # only when the next rank is actually stranded: an earlier source's
+        # mirror would be overwritten before the rank finishes anyway, and a
+        # mirror nobody receives is pure cost.
         local_sources = [
             s for s in kv_sources if plan.start_layer <= s < plan.end_layer
         ]
-        self.kv_sender_layer = max(local_sources) if local_sources else None
+        self.kv_sender_layer = (
+            max(local_sources) if local_sources and plan.sends_kv else None
+        )
         # With no local source to refill it, the outgoing buffer is whatever
         # arrived, so a group spanning three or more ranks needs this rank to
         # pass it along.
-        self.relays_kv = plan.forwarder is not None and self.kv_sender_layer is None
+        self.relays_kv = plan.sends_kv and self.kv_sender_layer is None
 
         def build(layer_id: int) -> nn.Module:
             real_source = None
@@ -366,11 +370,12 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 config.num_hidden_layers - 1,
             )
 
-        if plan.transfers_kv:
+        if plan.recvs_kv or plan.sends_kv or plan.recvs_candidates:
             logger.info(
                 "DeepSeek V4.1 pipeline rank %s/%s owns layers [%s, %s); "
                 "kv forwarder=%s (replicating source %s), kv sender=%s, "
-                "relays=%s, carries topk=%s",
+                "relays=%s; receives kv=%s topk=%s candidates=%s; "
+                "sends kv=%s topk=%s candidates=%s",
                 pp.rank_in_group,
                 pp.world_size,
                 plan.start_layer,
@@ -379,37 +384,48 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 plan.forwarded_kv_source,
                 self.kv_sender_layer,
                 self.relays_kv,
-                plan.transfers_topk,
+                plan.recvs_kv,
+                plan.recvs_topk,
+                plan.recvs_candidates,
+                plan.sends_kv,
+                plan.sends_topk,
+                plan.sends_candidates,
             )
 
     def _build_transfer_buffers(self, max_tokens: int) -> None:
-        """Dense per-token record buffers, when the cut makes the pipeline carry KV.
+        """Dense per-token record buffers for the hop out of this rank.
 
-        Every rank allocates them, not just the ones that send: the pipeline's
-        intermediate tensors have to carry the same keys everywhere.
+        Only a rank that sends records allocates them: the local kv source
+        mirrors into them, or -- for a group spanning three or more ranks --
+        the forwarder relays into them what it received. The receiving side
+        needs no buffer of its own, because the receive allocates from the
+        sender's metadata; it does need the record geometry, which is why that
+        is read off a layer whether or not anything is allocated here.
         """
         self.main_kv_rows: torch.Tensor | None = None
         self.indexer_kv_rows: torch.Tensor | None = None
-        if not self.pp_plan.transfers_kv:
-            return
-        if self.start_layer == self.end_layer:
-            # Truncated prefiller: this rank sits entirely past the last kv
-            # source and has no layer to size the buffers from. It also has
-            # nothing to send, so leaving them None is correct.
-            return
-
+        self.main_kv_record: tuple[int, torch.dtype] | None = None
+        self.indexer_kv_record: tuple[int, torch.dtype] | None = None
         sample = self.layers[self.start_layer].attn
+        self.main_kv_record = (sample.main_transfer_width, sample.main_transfer_dtype)
+        self.indexer_kv_record = (
+            sample.indexer_transfer_width,
+            sample.indexer_transfer_dtype,
+        )
+        if not self.pp_plan.sends_kv:
+            return
+        assert self.kv_sender_layer is not None or self.pp_plan.recvs_kv, (
+            f"rank bounds [{self.start_layer}, {self.end_layer}) have to send "
+            "kv records but own no source and receive none to relay"
+        )
+
+        main_width, main_dtype = self.main_kv_record
+        indexer_width, indexer_dtype = self.indexer_kv_record
         self.main_kv_rows = torch.empty(
-            max_tokens,
-            sample.main_transfer_width,
-            dtype=sample.main_transfer_dtype,
-            device=self.device,
+            max_tokens, main_width, dtype=main_dtype, device=self.device
         )
         self.indexer_kv_rows = torch.empty(
-            max_tokens,
-            sample.indexer_transfer_width,
-            dtype=sample.indexer_transfer_dtype,
-            device=self.device,
+            max_tokens, indexer_width, dtype=indexer_dtype, device=self.device
         )
         if self.kv_sender_layer is not None:
             sender = self.layers[self.kv_sender_layer].attn
@@ -525,11 +541,12 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         device: torch.device,
     ) -> IntermediateTensors:
         """The posted multi-stream hidden states, the leftover ``pre_mix``, and
-        the KV records a split group has to carry.
+        whatever the hop into this rank carries.
 
-        These are the buffers the V2 runner copies the arriving tensors into,
-        so the key set is this rank's ``recvs_*`` -- what the previous rank
-        actually puts on the wire -- not the global ``transfers_*``.
+        This is exactly ``recvs_*``, no wider: the runner copies the keys it
+        received into these buffers and then hands the model *these* keys, so a
+        key declared here that rank-1 never sends would reach the layers
+        holding the previous step's rows rather than raising.
         """
         tensors = {
             "hidden_states": torch.zeros(
@@ -544,17 +561,15 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
             ),
         }
         if self.pp_plan.recvs_kv:
-            assert self.main_kv_rows is not None
-            assert self.indexer_kv_rows is not None
+            assert self.main_kv_record is not None
+            assert self.indexer_kv_record is not None
+            main_width, main_dtype = self.main_kv_record
+            indexer_width, indexer_dtype = self.indexer_kv_record
             tensors["main_kv"] = torch.zeros(
-                (batch_size, self.main_kv_rows.shape[1]),
-                dtype=self.main_kv_rows.dtype,
-                device=device,
+                (batch_size, main_width), dtype=main_dtype, device=device
             )
             tensors["indexer_kv"] = torch.zeros(
-                (batch_size, self.indexer_kv_rows.shape[1]),
-                dtype=self.indexer_kv_rows.dtype,
-                device=device,
+                (batch_size, indexer_width), dtype=indexer_dtype, device=device
             )
         if self.pp_plan.recvs_topk:
             tensors["topk"] = torch.zeros(
@@ -577,12 +592,13 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         positions: torch.Tensor,
     ) -> None:
         """Hand a stranded group's records to this rank's forwarder."""
-        forwarder = self.pp_plan.forwarder
-        if forwarder is None:
+        if not self.pp_plan.recvs_kv:
             return
+        forwarder = self.pp_plan.forwarder
+        assert forwarder is not None
         main_rows = intermediate_tensors["main_kv"]
         indexer_rows = intermediate_tensors["indexer_kv"]
-        topk_rows = intermediate_tensors.tensors.get("topk")
+        topk_rows = intermediate_tensors["topk"] if self.pp_plan.recvs_topk else None
         self.layers[forwarder].attn.accept_remote_kv(
             main_rows, indexer_rows, topk_rows, positions
         )
@@ -600,14 +616,15 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
     ) -> None:
         """Take over the shortlist published on an earlier rank.
 
-        Unconditional on every rank that carries it, forwarder or not: a rank
-        with no index source of its own still has to hand the shortlist to the
-        next one, and copying into the local buffer is what makes the send at
-        the end of :meth:`forward` pick it up.
+        Done by every rank the shortlist reaches, forwarder or not and reader
+        or not: a rank with no index source of its own still has to hand it to
+        the next one, and copying into the local buffer is what makes the send
+        at the end of :meth:`forward` pick it up.
         """
-        rows = intermediate_tensors.tensors.get("candidates")
-        if rows is None or self.candidate_idxs_buffer is None:
+        if not self.pp_plan.recvs_candidates:
             return
+        assert self.candidate_idxs_buffer is not None
+        rows = intermediate_tensors["candidates"]
         num_tokens = rows.shape[0]
         self.candidate_idxs_buffer[:num_tokens].copy_(rows)
 

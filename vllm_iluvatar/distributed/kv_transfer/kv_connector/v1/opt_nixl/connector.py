@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import VllmConfig
-from vllm.config.kv_transfer import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import EngineId
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -96,22 +95,15 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
     """
 
     @classmethod
-    def requires_piecewise_for_cudagraph(
-        cls, kv_transfer_config: KVTransferConfig
-    ) -> bool:
-        # Push readiness is published from save_kv_layer(), including the
-        # per-rank path that records the final layer's CUDA event.  That Python
-        # hook has to run between layers, so a producer cannot be captured as
-        # one full graph.
-        #
-        # A pure consumer never pushes: save_kv_layer_cuda() and
-        # save_kv_layer_host() both return immediately on is_consumer and
-        # wait_for_layer_load() is a no-op, so nothing has to run between
-        # layers and full decode graphs are safe there.
-        #
-        # The test is "can this role push", not "is it a consumer": kv_both
-        # satisfies both is_kv_producer and is_kv_consumer, and it does push.
-        return kv_transfer_config.is_kv_producer
+    def requires_piecewise_for_cudagraph(cls, extra_config: Any) -> bool:
+        # The argument is ignored: this vLLM passes kv_connector_extra_config,
+        # newer ones pass the whole KVTransferConfig, and neither changes the
+        # answer here.  A pure consumer never pushes (save_kv_layer_cuda() and
+        # save_kv_layer_host() return immediately on is_consumer, and
+        # wait_for_layer_load() is a no-op), so full decode graphs are safe on
+        # D.  A producer pushes from save_kv_layer() between layers and cannot
+        # be captured as one full graph, so P has to run with --enforce-eager.
+        return False
 
     def __init__(
         self,

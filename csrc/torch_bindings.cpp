@@ -227,7 +227,7 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
   ops.def(
       "triton_gumbel_sample("
       "Tensor! local_argmax, int local_argmax_stride, Tensor! local_max, "
-      "int local_max_stride, Tensor? logits_cache, "
+      "int local_max_stride, Tensor(a!)? logits_cache, "
       "int logits_cache_stride_0, int logits_cache_stride_1, "
       "Tensor? logits_cache_col, Tensor logits, int logits_stride, "
       "Tensor expanded_idx_mapping, Tensor seeds, Tensor positions, "

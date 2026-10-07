@@ -23,6 +23,24 @@ from vllm.distributed.device_communicators.cuda_communicator import (
 )
 from vllm.distributed.utils import StatelessProcessGroup
 
+# Inside a captured CUDA graph, an all_gather whose per-rank message is not a
+# multiple of 256 bytes returns wrong data on this platform once NCCL picks the
+# SIMPLE protocol (above roughly 62 KiB per rank, or at any size with
+# NCCL_PROTO=Simple). It is not an ixformer bug: torch.distributed's own NCCL
+# all_gather corrupts identically, eager is always correct, and all_reduce is
+# unaffected at every size tried. Padding the message to this alignment avoids
+# it. See performance/pd_opt/scripts/repro_allgather_graph.py and
+# performance/B2_DSPARK_DRAFT_CUDAGRAPH.md.
+_ALL_GATHER_ALIGN_BYTES = 256
+
+
+def _needs_all_gather_padding(input_: torch.Tensor) -> bool:
+    # Only for sizes the collective gets wrong; everything else keeps the
+    # allocation-free path. Applied outside graph capture too, where it is
+    # merely unnecessary, because the caller cannot tell: the same module is
+    # replayed from a graph and run eagerly.
+    return (input_.numel() * input_.element_size()) % _ALL_GATHER_ALIGN_BYTES != 0
+
 
 class IluCommunicator(CudaCommunicator):
     def __init__(
@@ -113,20 +131,14 @@ class IluCommunicator(CudaCommunicator):
         input_ = input_.contiguous()
         input_size = input_.size()
         output_size = (input_size[0] * self.world_size,) + input_size[1:]
-        output_tensor = torch.empty(
-            output_size, dtype=input_.dtype, device=input_.device
-        )
-        if self.use_vllm_comm:
-            ixfd.all_gather_into_tensor(
-                output_tensor,
-                input_,
-                group=self.ixfd_group,
-                async_op=True,
-            )
+
+        if _needs_all_gather_padding(input_):
+            output_tensor = self._all_gather_padded(input_).reshape(output_size)
         else:
-            torch.distributed.all_gather_into_tensor(
-                output_tensor, input_, group=self.device_group
+            output_tensor = torch.empty(
+                output_size, dtype=input_.dtype, device=input_.device
             )
+            self._all_gather_into(output_tensor, input_)
         output_tensor = output_tensor.reshape((self.world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
         output_tensor = output_tensor.reshape(
@@ -135,6 +147,34 @@ class IluCommunicator(CudaCommunicator):
             + input_size[dim + 1 :]
         )
         return output_tensor
+
+    def _all_gather_into(self, output: torch.Tensor, input_: torch.Tensor) -> None:
+        if self.use_vllm_comm:
+            ixfd.all_gather_into_tensor(
+                output, input_, group=self.ixfd_group, async_op=True
+            )
+        else:
+            torch.distributed.all_gather_into_tensor(
+                output, input_, group=self.device_group
+            )
+
+    def _all_gather_padded(self, input_: torch.Tensor) -> torch.Tensor:
+        """all_gather a message rounded up to ``_ALL_GATHER_ALIGN_BYTES``.
+
+        See ``_needs_all_gather_padding``. Returns the gathered data with the
+        padding removed, flattened; the caller reshapes it.
+        """
+        flat = input_.reshape(-1)
+        numel = flat.numel()
+        step = _ALL_GATHER_ALIGN_BYTES // flat.element_size()
+        padded = -(-numel // step) * step
+        send = torch.zeros(padded, dtype=flat.dtype, device=flat.device)
+        send[:numel] = flat
+        recv = torch.empty(
+            padded * self.world_size, dtype=flat.dtype, device=flat.device
+        )
+        self._all_gather_into(recv, send)
+        return recv.reshape(self.world_size, padded)[:, :numel].reshape(-1)
 
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1

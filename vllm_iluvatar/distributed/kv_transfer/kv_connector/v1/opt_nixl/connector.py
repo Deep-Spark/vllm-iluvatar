@@ -97,12 +97,17 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
     @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: Any) -> bool:
         # The argument is ignored: this vLLM passes kv_connector_extra_config,
-        # newer ones pass the whole KVTransferConfig, and neither changes the
-        # answer here.  A pure consumer never pushes (save_kv_layer_cuda() and
-        # save_kv_layer_host() return immediately on is_consumer, and
-        # wait_for_layer_load() is a no-op), so full decode graphs are safe on
-        # D.  A producer pushes from save_kv_layer() between layers and cannot
-        # be captured as one full graph, so P has to run with --enforce-eager.
+        # newer ones pass the whole KVTransferConfig, and neither carries the
+        # role. The right answer depends on the role, so the hook never asks
+        # for PIECEWISE. __init__, which sees the role and the resolved mode,
+        # refuses a producer (or kv_both) captured as a full CUDA graph.
+        #
+        # A producer publishes push readiness from save_kv_layer(): per-layer
+        # Python that a full CUDA graph replay skips, so the push for that step
+        # would never be issued. A pure consumer never pushes:
+        # save_kv_layer_cuda() and save_kv_layer_host() both return immediately
+        # on is_consumer and wait_for_layer_load() is a no-op, so full decode
+        # graphs are safe there.
         return False
 
     def __init__(
@@ -117,6 +122,20 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
         assert vllm_config.kv_transfer_config.engine_id is not None
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
         self.kv_transfer_config = vllm_config.kv_transfer_config
+        cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
+        if (
+            # The test is "can this role push", not "is it a consumer":
+            # kv_both satisfies is_kv_consumer too, and it does push.
+            self.kv_transfer_config.is_kv_producer
+            and cudagraph_mode.has_full_cudagraphs()
+        ):
+            raise ValueError(
+                "OptNixlConnector as kv_producer or kv_both publishes push "
+                "readiness from save_kv_layer(), which a full CUDA graph replay "
+                "skips, so the KV push would never be issued. Run it with "
+                "--enforce-eager or a PIECEWISE / NONE cudagraph_mode "
+                f"(resolved cudagraph_mode: {cudagraph_mode.name})."
+            )
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler: NixlConnectorScheduler | None = (
                 NixlConnectorScheduler(vllm_config, kv_cache_config, self.engine_id)

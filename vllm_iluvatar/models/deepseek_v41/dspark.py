@@ -61,7 +61,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsPP
-from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
+from vllm.model_executor.models.qwen3_dspark import (
+    DSparkConfidenceHead,
+    DSparkMarkovHead,
+)
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.platforms import current_platform
 
@@ -74,7 +77,13 @@ _MTP_RE = re.compile(r"mtp\.(\d+)\.(.*)")
 
 # Owned by the model, not by a decoder block. Which ``mtp.{i}`` they ship under
 # is not meaningful (0 for main_*, 2 for the rest), so the stage is dropped.
-_HEAD_PREFIXES = ("norm.", "markov_head.", "main_proj.", "main_norm.")
+_HEAD_PREFIXES = (
+    "norm.",
+    "markov_head.",
+    "main_proj.",
+    "main_norm.",
+    "confidence_head.",
+)
 
 # ``DSparkMarkovHead`` names its two tensors after their role in the low-rank
 # product, the checkpoint after their shape.
@@ -105,14 +114,20 @@ def _local_vocab_weight(
 
 
 def remap_dspark_name(
-    name: str, num_hidden_layers: int, load_own_embed: bool = False
+    name: str,
+    num_hidden_layers: int,
+    load_own_embed: bool = False,
+    load_confidence_head: bool = False,
 ) -> str | None:
     """Map a checkpoint ``mtp.{i}.*`` name to this model's parameter path.
 
     Returns ``None`` for weights this model does not own: anything outside
-    ``mtp.*``, the vision-language gate bias (V4.1 runs text-only), and the
-    confidence head, which is only read under adaptive verification and is not
-    wired up yet.
+    ``mtp.*`` and the vision-language gate bias (V4.1 runs text-only).
+
+    The confidence head is only read under adaptive verification, and the model
+    only builds the module in that case, so pass ``load_confidence_head=True``
+    to claim ``mtp.2.confidence_head.*``. Claiming it unconditionally would hand
+    the loader a weight with no parameter to put it in.
 
     Under pipeline parallelism the target's ``embed_tokens`` is a
     ``PPMissingLayer`` on the drafting rank, so the draft cannot alias it and
@@ -134,7 +149,9 @@ def remap_dspark_name(
     stage = int(m.group(1))
     rest = m.group(2)
 
-    if rest.startswith("confidence_head.") or rest.endswith(".bias_vl"):
+    if rest.endswith(".bias_vl"):
+        return None
+    if rest.startswith("confidence_head.") and not load_confidence_head:
         return None
 
     for old, new in _MARKOV_RENAME.items():
@@ -240,6 +257,25 @@ class IluDSparkDeepseekV41Model(nn.Module):
             config.dspark_markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
         )
+
+        # Per-position acceptance probability, consumed only by adaptive
+        # verification to size each request's draft budget. The speculator
+        # tests this attribute for None, so it has to exist either way.
+        #
+        # V4.1 ships a single `mtp.2.confidence_head.proj.weight` of shape
+        # [1, 5376] = [1, hidden_size + dspark_markov_rank], i.e. the head
+        # scores the concatenation of the per-(req, step) head hidden state and
+        # that step's Markov embedding, and there is no bias tensor. Qwen3
+        # DSpark builds the same head with bias=True, which would leave an
+        # unloaded parameter here.
+        self.confidence_head: DSparkConfidenceHead | None = None
+        if vllm_config.speculative_config.enable_adaptive_verification:
+            self.confidence_head = DSparkConfidenceHead(
+                config.hidden_size + config.dspark_markov_rank,
+                prefix=maybe_prefix(prefix, "confidence_head"),
+                bias=False,
+                with_markov=True,
+            )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -422,6 +458,17 @@ class IluDSparkDeepseekV41ForCausalLM(nn.Module, SupportsPP):
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids
 
+    def compute_confidence(
+        self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
+    ) -> torch.Tensor:
+        """Per-position acceptance probability for each drafted token.
+
+        Both arguments are ordered (req, step) and flattened, so the head sees
+        one row per drafted token.
+        """
+        assert self.model.confidence_head is not None
+        return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
+
     def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.embed(token_ids)
 
@@ -476,6 +523,7 @@ class IluDSparkDeepseekV41ForCausalLM(nn.Module, SupportsPP):
             name,
             self.config.num_hidden_layers,
             load_own_embed=self.load_own_embed_tokens,
+            load_confidence_head=self.model.confidence_head is not None,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

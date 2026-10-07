@@ -260,10 +260,16 @@ __global__ void gumbel_sample_kernel(
     cache_col = per_token_col ? logits_cache_col[token_row] : logits_cache_col[0];
   }
 
-  MaxPair<acc_t> best{-std::numeric_limits<acc_t>::infinity(),
-                      std::numeric_limits<int64_t>::max()};
   const int begin = vocab_block * block_size;
   const int end = min(begin + block_size, vocab_size);
+  // Seed the index with this block's first token, never INT64_MAX. choose_max
+  // never selects a NaN, so an all-NaN block would otherwise leave the
+  // sentinel in place and emit an out-of-range token id. Triton computes
+  // `block_idx * BLOCK_SIZE + idx` with idx=0 in that case, which is what this
+  // matches. The id is read straight back by markov_embed and by the target's
+  // embedding, and an out-of-range lookup does not fault here: it silently
+  // reads out-of-bounds memory.
+  MaxPair<acc_t> best{-std::numeric_limits<acc_t>::infinity(), begin};
   for (int token = begin + threadIdx.x; token < end; token += blockDim.x) {
     const scalar_t raw = logits[static_cast<int64_t>(token_row) * logits_stride +
                                 token];
@@ -559,8 +565,11 @@ __global__ void resample_kernel(
   const bool valid_rejected = rejected_token >= 0;
   const int vocab_begin = vocab_block * block_size;
   const int vocab_end = min(vocab_begin + block_size, vocab_size);
-  MaxPair<acc_t> best{-std::numeric_limits<acc_t>::infinity(),
-                      std::numeric_limits<int64_t>::max()};
+  // See gumbel_sample_kernel: seed with the block's first token so an all-NaN
+  // residual cannot leave the INT64_MAX sentinel in place. insert_resampled
+  // writes this id straight into the output, so a sentinel here would emit an
+  // out-of-range token to the user.
+  MaxPair<acc_t> best{-std::numeric_limits<acc_t>::infinity(), vocab_begin};
   for (int token = vocab_begin + threadIdx.x; token < vocab_end;
        token += blockDim.x) {
     const float target =

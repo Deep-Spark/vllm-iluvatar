@@ -40,7 +40,6 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.models.utils import extract_layer_index
 
 from vllm_iluvatar.model_executor.layers.fused_moe.prepare_finalize.ilu_deepep_ll import (
     VLLM_ILU_DEEPEP_USE_SCATTER,
@@ -125,22 +124,22 @@ class IluFusedMoEEP:
             if getattr(runner, "_ilu_nvsm_init_patched", False):
                 return
 
-            original_init = runner.maybe_init_modular_kernel
+            quant_method = runner._quant_method
+            original_process = quant_method.process_weights_after_loading
 
-            def init_modular_kernel_and_nvsm(runner_self):
-                original_init()
-                runner_self.routed_experts._ensure_moe_quant_config_init()
+            def process_weights_and_nvsm(method_self, layer):
+                original_process(layer)
+                runner.routed_experts._ensure_moe_quant_config_init()
                 self._get_forward_dp_ep_ll_all2all()
                 logger.info_once(
                     "Initialized Hybrid EP low-latency decode backend "
                     "(configured_backend=%s, decode_override=%s).",
-                    runner_self.moe_config.moe_parallel_config.all2all_backend,
+                    runner.moe_config.moe_parallel_config.all2all_backend,
                     _DS4_DECODE_EP_BACKEND,
                 )
 
-            runner.maybe_init_modular_kernel = MethodType(
-                init_modular_kernel_and_nvsm,
-                runner,
+            quant_method.process_weights_after_loading = MethodType(
+                process_weights_and_nvsm, quant_method,
             )
             runner._ilu_nvsm_init_patched = True
 
@@ -161,6 +160,7 @@ class IluFusedMoEEP:
             )
             and (
                 all2all_backend in ("deepep_low_latency", "deepep_high_throughput")
+                or _DS4_DECODE_EP_BACKEND == "deepep_low_latency"
                 or not self.experts._quant_method.supports_internal_mk
             )
             and not self.experts._quant_method.is_monolithic
@@ -173,8 +173,6 @@ class IluFusedMoEEP:
         )
 
     def _should_preinit_dp_ep_ll_handle(self) -> bool:
-        if extract_layer_index(self.prefix) != 0:
-            return False
         configured_backend = self.experts.moe_config.moe_parallel_config.all2all_backend
         return (
             _DS4_DECODE_EP_BACKEND == "deepep_low_latency"

@@ -71,6 +71,9 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
+from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
+    IluFusedMoEEP, _DS4_DECODE_EP_BACKEND,
+)
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
@@ -278,7 +281,7 @@ class IluDeepseekV4Fp8MLP(nn.Module):
         return out
 
 
-class IluDeepseekV4Fp8MoE(nn.Module):
+class IluDeepseekV4Fp8MoE(nn.Module, IluFusedMoEEP):
     """DS-V4-Flash FFN: routing gate + shared expert MLP + routed MXFP4 experts.
 
     Community counterpart: ``DeepseekV4MoE.__init__`` /
@@ -319,6 +322,7 @@ class IluDeepseekV4Fp8MoE(nn.Module):
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
 
+        self.prefix = prefix
         self.tp_size = get_tensor_model_parallel_world_size()
 
         self.hidden_size = config.hidden_size
@@ -434,6 +438,13 @@ class IluDeepseekV4Fp8MoE(nn.Module):
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=eplb_config.num_redundant_experts,
         )
+        # The 0.30 runner owns the normal path; explicitly opt decode into LL.
+        self._ilu_decode_ll = (
+            _DS4_DECODE_EP_BACKEND == "deepep_low_latency"
+            and self._should_use_forward_dp_ep()
+        )
+        if self._ilu_decode_ll:
+            self.init_ep()
 
     def forward(
         self,
@@ -450,12 +461,16 @@ class IluDeepseekV4Fp8MoE(nn.Module):
         The runner owns the gate (``FusedMoE`` is constructed with
         ``gate=self.gate``), so ``router_logits`` is a placeholder and the real
         gate GEMM runs inside it. Upstream dropped the ``is_internal_router``
-        branch once the gate always lived there, so there is only this path.
+        branch once the gate always lived there. An explicit LL decode
+        override uses the existing EP helper; prefill stays on this runner.
         """
         if self.gate.tid2eid is not None:
             if input_ids is None:
                 raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
             input_ids = input_ids.to(dtype=self.hash_indices_dtype)
+
+        if self._ilu_decode_ll and self._is_all_ranks_decode_only():
+            return self.forward_dp_ep_deep_ep(hidden_states, input_ids)
 
         org_shape = hidden_states.shape
         final_hidden_states = self.experts(

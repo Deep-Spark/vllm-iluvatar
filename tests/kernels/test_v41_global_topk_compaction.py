@@ -1,11 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Reference test for ``v41_global_topk_indices_and_lens``' compaction.
 
-The companion ``test_v41_global_topk.py`` builds its inputs through
-``get_compressed_slot_mapping``, whose signature has since moved on, so it no
-longer reaches the kernel. This one states the documented semantics directly
-in torch and drives the kernel over the shapes that matter, including
-``index_topk = 512`` and widths that are not a multiple of the block.
+An independent reference checks slot translation and stable compaction,
+including index_topk=512 and widths not divisible by the block size.
 
 The compaction is the part under test: it has to be stable (slots stay in
 top-k order) and it has to agree on ``topk_lens``.
@@ -15,7 +12,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-import vllm_iluvatar  # noqa: F401  (registers torch.ops._C)
+pytest.importorskip("vllm_iluvatar._C")
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 
 DEVICE = "cuda"
 

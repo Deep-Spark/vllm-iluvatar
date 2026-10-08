@@ -15,6 +15,29 @@ from __future__ import annotations
 import pytest
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--run-legacy-drift",
+        action="store_true",
+        default=False,
+        help="Include optional legacy numerical compatibility diagnostics.",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--run-legacy-drift"):
+        return
+    selected = []
+    deselected = []
+    for item in items:
+        if item.get_closest_marker("legacy_drift") is not None:
+            deselected.append(item)
+        else:
+            selected.append(item)
+    items[:] = selected
+    config.hook.pytest_deselected(items=deselected)
+
+
 def _cuda_available() -> bool:
     try:
         import torch

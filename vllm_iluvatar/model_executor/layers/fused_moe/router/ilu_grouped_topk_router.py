@@ -35,6 +35,34 @@ def grouped_topk(
     from ixformer.inference.functions import (  # type: ignore[import]
         moe_grouped_topk as _ixf_grouped_topk,
     )
+    from vllm import envs
+
+    from vllm_iluvatar.ilu_util.arch import is_ivcore30
+
+    if (
+        envs.VLLM_ILU_GLM_MOE_PREPARE_FUSION
+        and is_ivcore30()
+        and gating_output.is_cuda
+        and gating_output.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and gating_output.ndim == 2
+        and gating_output.is_contiguous()
+        and gating_output.shape[-1] == 256
+        and topk == 8
+        and num_expert_group == 1
+        and topk_group == 1
+        and scoring_func == "sigmoid"
+        and renormalize
+        and e_score_correction_bias is not None
+        and e_score_correction_bias.is_contiguous()
+        and e_score_correction_bias.dtype in (gating_output.dtype, torch.float32)
+    ):
+        from ixformer.inference.functions import moe_sigmoid_topk
+
+        return moe_sigmoid_topk(
+            gating_output,
+            e_score_correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
+        )
 
     # [ILU override] grouped_topk - delta: route selection through ixformer.
     if (

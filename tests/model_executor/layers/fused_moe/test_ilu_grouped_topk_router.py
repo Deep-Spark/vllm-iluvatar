@@ -7,6 +7,7 @@ import sys
 from types import ModuleType
 from unittest.mock import patch
 
+import pytest
 import torch
 import vllm.model_executor.layers.fused_moe.router.grouped_topk_router as community
 
@@ -75,3 +76,35 @@ def test_grouped_topk_patch_rebinds_module_function_and_new_custom_op():
             topk_group=1,
         )
     assert grouped_topk_op.native_impl is ilu_grouped_topk_router.grouped_topk
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("tokens", [1, 129])
+def test_fused_sigmoid_routing_native(monkeypatch, dtype, tokens):
+    from vllm import envs as opt
+
+    monkeypatch.setattr(opt, "VLLM_ILU_GLM_MOE_PREPARE_FUSION", True)
+    logits = torch.randn(tokens, 256, device="cuda", dtype=dtype)
+    bias = torch.randn(256, device="cuda", dtype=torch.float32) * 0.01
+    weights, ids = ilu_grouped_topk_router.grouped_topk(
+        torch.empty(tokens, 1, device="cuda"),
+        logits,
+        8,
+        True,
+        1,
+        1,
+        "sigmoid",
+        2.5,
+        bias,
+    )
+    scores = logits.cpu().float().sigmoid()
+    selection = scores + bias.cpu().to(dtype).float()
+    expected_ids = selection.argsort(dim=-1, descending=True, stable=True)[:, :8]
+    selected = scores.gather(1, expected_ids)
+    torch.testing.assert_close(ids.cpu().long(), expected_ids)
+    torch.testing.assert_close(
+        weights.cpu(),
+        selected / selected.sum(-1, keepdim=True) * 2.5,
+        rtol=2e-5,
+        atol=2e-6,
+    )

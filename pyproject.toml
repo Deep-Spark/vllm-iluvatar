@@ -23,8 +23,13 @@ include = ["vllm_iluvatar*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # Ensure the repo root is importable so test modules can resolve the installed
-# plugin package and local helpers regardless of invocation cwd.
-pythonpath = ["."]
+# plugin package and local helpers regardless of invocation cwd. ``tests`` is
+# also needed so the bare ``from conftest import ...`` pattern used by several
+# kernel/layer/model test modules resolves to tests/conftest.py.
+pythonpath = [".", "tests"]
+markers = [
+    "legacy_drift: optional old/new numerical compatibility diagnostic",
+]
 
 [tool.ruff.lint.per-file-ignores]
 "vllm_iluvatar/version.py" = ["F401"]

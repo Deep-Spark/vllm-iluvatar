@@ -99,6 +99,17 @@ def _hybrid_dp_sync_prefills_default() -> bool:
     )
 
 
+def _glm_sampling_mode() -> str:
+    """Read the GLM sampling mode through the registered environment reader."""
+    value = os.environ.get("VLLM_ILU_GLM_SAMPLING_MODE", "off").strip().lower()
+    choices = ("off", "sorted", "radix")
+    if value not in choices:
+        raise ValueError(
+            f"VLLM_ILU_GLM_SAMPLING_MODE must be one of {choices}, got {value!r}"
+        )
+    return value
+
+
 def _gdn_attn_backend_default() -> str:
     """Enable the tuned ixformer GDN path by default on CoreX30."""
     from vllm_iluvatar.ilu_util.arch import is_ivcore30
@@ -127,6 +138,7 @@ if TYPE_CHECKING:
     VLLM_ILU_DS4_MQA_QUANT_TYPE: str = ""
     VLLM_ILU_FUSE_NORM_QUANT: bool = True
     VLLM_ILU_FUSE_MOE_W13: bool = True
+    VLLM_ILU_GLM_SAMPLING_MODE: str = "off"
     VLLM_ILU_GLM_MOE_PREPARE_FUSION: bool = False
     VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV: bool = True
     VLLM_ILU_GLM_DSA_FP8_ABSORB_UP: bool = True
@@ -377,6 +389,7 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP": _bool_reader(
         "VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP", "0"
     ),
+    "VLLM_ILU_GLM_SAMPLING_MODE": _glm_sampling_mode,
     # Opt-in local routing and INT8 quant+expand; restart workers to change.
     "VLLM_ILU_GLM_MOE_PREPARE_FUSION": _bool_reader(
         "VLLM_ILU_GLM_MOE_PREPARE_FUSION", "0"

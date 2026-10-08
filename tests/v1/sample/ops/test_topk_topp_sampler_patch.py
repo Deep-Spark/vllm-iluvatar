@@ -40,6 +40,13 @@ def _install_fake_vllm(monkeypatch, *, is_cpu: bool) -> ModuleType:
     def apply_top_k_top_p(logits, k, p):
         return "community"
 
+    community.TopKTopPSampler = type(
+        "TopKTopPSampler",
+        (),
+        {
+            "forward_native": lambda self, logits, generators, k, p: "native",
+        },
+    )
     community.HAS_TRITON = True
     community.apply_top_k_top_p = apply_top_k_top_p
     community.apply_top_k_top_p_triton = lambda *args, **kwargs: "triton"
@@ -134,3 +141,4 @@ def test_patch_apply_rebinds_community_function(monkeypatch):
     patch_topk_topp_sampler._apply()
 
     assert community.apply_top_k_top_p is impl.apply_top_k_top_p
+    assert community.TopKTopPSampler.forward_native is impl.forward_native

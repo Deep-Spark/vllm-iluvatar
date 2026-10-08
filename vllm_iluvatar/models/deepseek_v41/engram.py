@@ -957,7 +957,14 @@ class IluEngram(nn.Module):
         # anywhere on the path. See ``load_from_checkpoint`` for which record
         # is in play.
         if self.wkv_scale is None:
-            kv = torch.matmul(rows.flatten(-2), self.wkv_weight.t())
+            x = rows.flatten(-2)
+            if (os.getenv("VLLM_ILU_ENGRAM_LINEAR", "0") == "1"
+                    and 0 < x.shape[0] <= 32
+                    and x.dtype == torch.bfloat16
+                    and self.wkv_weight.dtype == torch.bfloat16):
+                kv = ixfops.linear(x, self.wkv_weight, backend="ixinfer")
+            else:
+                kv = torch.matmul(x, self.wkv_weight.t())
             return self._gate(hidden_states, kv)
 
         x, x_scale = ixfops.fp8_per_token_dynamic_scaled(rows.flatten(-2))

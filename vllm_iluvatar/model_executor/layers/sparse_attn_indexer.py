@@ -13,7 +13,7 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.platforms import current_platform
-from vllm.utils.torch_utils import _encode_layer_name, direct_register_custom_op
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
     IluDeepseekV32IndexerMetadata,
@@ -235,7 +235,7 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
     ):
         return torch.ops.vllm.ilu_sparse_attn_indexer(
             hidden_states,
-            _encode_layer_name(self.k_cache.prefix),
+            self.k_cache.prefix,
             self.k_cache.kv_cache,
             q_quant,
             k,

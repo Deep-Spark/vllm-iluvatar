@@ -251,6 +251,7 @@ def test_forward_fp8_calibration_filters_invalid_slots(monkeypatch, pcp_size, sl
     mla.kv_cache = torch.zeros(1, 64, 640, dtype=torch.uint8)
     mla.rotary_emb = lambda positions, q, k: (q, k)
     mla._k_up_proj = lambda q: q
+    mla._decode_prepare_enabled = False
     mla._v_up_proj = lambda x: x
     mla._sparse_mla_kernel_fp8 = lambda q, *args: torch.zeros(len(q), 1, 512)
     metadata = SimpleNamespace(
@@ -540,3 +541,20 @@ def test_pcp_never_arms_local_kv_fusion(monkeypatch, frozen):
     mla._maybe_init_fp8_kv_scale(torch.full((2, 512), 2.0), torch.tensor([0, 1]))
     assert mla._fp8_kv_scale_frozen
     assert not mla.use_rms_rope_fp8_kv_fusion
+
+
+@pytest.mark.parametrize("heads", [8, 16, 32, 48, 64])
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("use_fp8", [False, True])
+def test_decode_prepare_head_support(monkeypatch, heads, enabled, use_fp8):
+    from vllm import envs as opt
+    from vllm_iluvatar.ilu_util import arch
+
+    monkeypatch.setattr(opt, "VLLM_ILU_GLM_DSA_PREPARE_FUSION", enabled)
+    monkeypatch.setattr(arch, "is_ivcore30", lambda: True)
+    mla = _make_sparse_mla(
+        monkeypatch, num_heads=heads, use_fp8_attn=use_fp8, env_enabled=False
+    )
+    assert mla._decode_prepare_enabled == (
+        enabled and use_fp8 and heads in (16, 32, 64)
+    )

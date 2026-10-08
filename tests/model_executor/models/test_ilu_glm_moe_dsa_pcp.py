@@ -78,13 +78,16 @@ def test_pcp_mla_cache_matches_unpartitioned_tokens(
         layer.v_head_dim = width
         layer.kv_cache_dtype = "bfloat16"
         layer.use_fp8_attn = use_fp8
+        layer._decode_prepare_enabled = False
         layer._fp8_kv_scale_frozen = False
         layer.use_rms_rope_fp8_kv_fusion = True
         layer._k_scale = torch.ones(1)
         layer.kv_cache = torch.full((1, 8, width + rope), -99.0)
         layer.rotary_emb = lambda positions, q, k: (q, k)
         layer._k_up_proj = lambda q: q.new_zeros((len(q), 1, width))
-        layer._v_up_proj = lambda x: x
+        layer._v_up_proj = lambda x, outputs=None: (
+            x if outputs is None else outputs.copy_(x)
+        )
         layer._maybe_init_fp8_kv_scale = lambda kv, slots: None
         layer._sparse_mla_kernel = lambda q, *args: q.new_zeros((len(q), 1, width))
         layer._sparse_mla_kernel_fp8 = lambda q, *args: q.new_zeros((len(q), 1, width))
@@ -196,4 +199,3 @@ def test_indexer_gathers_padding_and_skips_empty_queries(monkeypatch, empty):
     torch.testing.assert_close(cache[6:8], remote)
     torch.testing.assert_close(cache[4:6], local)
     assert result.shape == (2, 4)
-

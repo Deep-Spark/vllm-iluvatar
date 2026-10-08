@@ -256,6 +256,7 @@ def _worker(rank, rendezvous, native_comm):
             layer.qk_rope_head_dim = 64
             layer.softmax_scale = 1 / 16
             layer.use_fp8_attn = True
+            layer._decode_prepare_enabled = False
             layer.use_rms_rope_fp8_kv_fusion = False
             layer._fp8_kv_scale_frozen = True
             layer._k_scale = scale
@@ -266,7 +267,9 @@ def _worker(rank, rendezvous, native_comm):
             layer.topk_convert_cache = None
             layer.rotary_emb = lambda positions, q, k: (q, k)
             layer._k_up_proj = lambda q: q
-            layer._v_up_proj = lambda x: x
+            layer._v_up_proj = lambda x, outputs=None: (
+                x if outputs is None else outputs.copy_(x)
+            )
             ixf.glm_dsa_fp8_kv_insert(
                 latent[:9].to(device),
                 rope[:9].to(device),
@@ -480,4 +483,3 @@ def test_glm_dsa_pcp_two_gpus(tmp_path, native_comm):
         nprocs=2,
         join=True,
     )
-

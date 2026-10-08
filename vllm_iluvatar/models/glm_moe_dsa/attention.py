@@ -51,10 +51,6 @@ from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
-from vllm.v1.attention.ops.pcp import (
-    maybe_gather_indexer_k,
-    maybe_gather_mla_latent_cache_inputs,
-)
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -70,6 +66,10 @@ from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
+)
+from vllm.v1.attention.ops.pcp import (
+    maybe_gather_indexer_k,
+    maybe_gather_mla_latent_cache_inputs,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
@@ -659,6 +659,18 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
                     self._fp8_q_heads,
                 )
         self.kv_cache_dtype = kv_cache_dtype
+        from vllm import envs
+
+        from vllm_iluvatar.ilu_util.arch import is_ivcore30
+
+        self._decode_prepare_enabled = (
+            envs.VLLM_ILU_GLM_DSA_PREPARE_FUSION
+            and is_ivcore30()
+            and self.use_fp8_attn
+            and self.num_heads in (16, 32, 64)
+            and self.kv_lora_rank == 512
+            and self.qk_rope_head_dim == 64
+        )
 
         self.register_buffer(
             "_k_scale",
@@ -773,7 +785,7 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
             batch_first=False,
         )  # (B, N, L)
 
-    def _v_up_proj(self, x: torch.Tensor) -> torch.Tensor:
+    def _v_up_proj(self, x: torch.Tensor, outputs=None) -> torch.Tensor:
         # Absorbed v-up as a grouped W8A16 marlin GEMM (R1 _v_up_proj_w8a8).
         # x: (B, N, L); kv_b_proj.W_UV: per-head (K=kv_lora, N=v) marlin.
         return ixf_ops.marlin_w8a16(
@@ -783,6 +795,7 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
             group_size=-1,
             format="k16n16",
             batch_first=False,
+            outputs=outputs,
         )  # (B, N, V)
 
     @staticmethod
@@ -913,22 +926,26 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         q_pe: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: IluFlashMLASparseMetadata,
+        prepared_q: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Packed 640B sparse MLA via ``dsa_flash_mla_with_fp8_kvcache``."""
         num_tokens = q_nope.shape[0]
         q_heads = self._fp8_q_heads
         topk_indices, topk_length = self._global_topk(num_tokens, attn_metadata)
 
-        q_packed = q_nope.new_empty(
-            (num_tokens, q_heads, _GLM_DSA_FP8_ROW_BYTES),
-            dtype=torch.uint8,
-        )
-        q_scale = torch.empty(
-            (num_tokens, q_heads),
-            dtype=torch.float32,
-            device=q_nope.device,
-        )
-        ixf_ops.glm_dsa_fp8_q_pack(q_nope, q_pe, q_packed, q_scale)
+        if prepared_q is not None:
+            q_packed, q_scale = prepared_q
+        else:
+            q_packed = q_nope.new_empty(
+                (num_tokens, q_heads, _GLM_DSA_FP8_ROW_BYTES),
+                dtype=torch.uint8,
+            )
+            q_scale = torch.empty(
+                (num_tokens, q_heads),
+                dtype=torch.float32,
+                device=q_nope.device,
+            )
+            ixf_ops.glm_dsa_fp8_q_pack(q_nope, q_pe, q_packed, q_scale)
 
         out = ixf_ops.dsa_flash_mla_with_fp8_kvcache(
             q_packed.view(num_tokens, 1, q_heads, _GLM_DSA_FP8_ROW_BYTES),
@@ -982,6 +999,8 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
             return q.new_zeros((num_tokens, self.num_heads * self.v_head_dim))
 
         num_actual_toks = attn_metadata.num_actual_tokens
+        if num_actual_toks == 0 and attn_metadata.pcp_world_size <= 1:
+            return q.new_zeros((num_tokens, self.num_heads * self.v_head_dim))
         kv_cache = self.kv_cache
         use_pcp = attn_metadata.pcp_world_size > 1
 
@@ -991,8 +1010,22 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         k_pe = k_pe[:num_actual_toks]
         positions = positions[:num_actual_toks]
 
+        from vllm_iluvatar.ilu_util.arch import is_ivcore30
+
+        use_decode_prepare = (
+            self._decode_prepare_enabled
+            and is_ivcore30()
+            and not use_pcp
+            and kv_rms_weight is not None
+            and q.dtype == torch.bfloat16
+            and 0 < num_actual_toks <= 65535
+            and attn_metadata.block_size == 64
+            and kv_cache.numel() > 0
+            and (self._fp8_kv_scale_frozen or torch.cuda.is_current_stream_capturing())
+        )
+        prepared_q = None
         use_rms_rope_fp8_kv_fusion = (
-            self.use_rms_rope_fp8_kv_fusion
+            (self.use_rms_rope_fp8_kv_fusion or use_decode_prepare)
             and not use_pcp
             and kv_rms_weight is not None
             and kv_cache.numel() > 0
@@ -1058,7 +1091,25 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
                     )
                 )
             if self.use_fp8_attn and not use_packed_pcp:
-                if use_rms_rope_fp8_kv_fusion:
+                if use_decode_prepare:
+                    # BF16 absorbed einsum can return head-major storage.
+                    # Keep compatible token-major (including padded) Q as-is.
+                    if q_nope.stride(0) < self.num_heads * q_nope.stride(1):
+                        q_nope = q_nope.contiguous()
+                    prepared_q = ixf_ops.glm_dsa_prepare(
+                        q_nope,
+                        q_pe,
+                        k_pe.squeeze(1),
+                        kv_c,
+                        kv_rms_weight,
+                        kv_cache,
+                        slot_mapping,
+                        positions,
+                        self.rotary_emb._match_cos_sin_cache_dtype(q_pe),
+                        self._k_scale,
+                        eps=kv_rms_eps,
+                    )
+                elif use_rms_rope_fp8_kv_fusion:
                     ixf_ops.fused_glm_dsa_rmsnorm_rope_fp8_kv_insert(
                         q_pe,
                         k_pe,
@@ -1097,14 +1148,18 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
 
         if self.use_fp8_attn:
             attn_out = self._sparse_mla_kernel_fp8(
-                q_nope, q_pe, kv_cache, attn_metadata
+                q_nope, q_pe, kv_cache, attn_metadata, prepared_q
             )
         else:
             q = torch.cat([q_nope, q_pe], dim=-1)
             attn_out = self._sparse_mla_kernel(q, kv_cache, attn_metadata)
 
+        if num_actual_toks == num_tokens:
+            return self._v_up_proj(attn_out).reshape(
+                num_tokens, self.num_heads * self.v_head_dim
+            )
         output = q_nope.new_empty((num_tokens, self.num_heads, self.v_head_dim))
-        output[:num_actual_toks] = self._v_up_proj(attn_out)
+        self._v_up_proj(attn_out, outputs=output[:num_actual_toks])
         if use_pcp and num_actual_toks < num_tokens:
             output[num_actual_toks:].zero_()
         return output.view(num_tokens, self.num_heads * self.v_head_dim)
@@ -1351,7 +1406,10 @@ class IluGlmMoeDsaMLAAttention(nn.Module):
             if self.topk_convert_cache is not None:
                 self.topk_convert_cache.invalidate()
 
-        if self.mla_attn.use_rms_rope_fp8_kv_fusion:
+        if (
+            self.mla_attn.use_rms_rope_fp8_kv_fusion
+            or self.mla_attn._decode_prepare_enabled
+        ):
             attn_out = self.mla_attn(
                 q,
                 kv_a,

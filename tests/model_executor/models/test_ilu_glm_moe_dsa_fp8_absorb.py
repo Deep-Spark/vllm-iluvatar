@@ -305,3 +305,34 @@ def test_fp8_up_proj_is_cuda_graph_capturable():
     replayed = out.clone()
     assert torch.equal(replayed, mla._k_up_proj(q_nope))
     assert eager.shape == out.shape
+
+
+@cuda_only
+@pytest.mark.parametrize("fp8_absorb", [False, True])
+@torch.inference_mode()
+def test_v_up_outputs_view_and_graph(fp8_absorb):
+    """New outputs contract in the real FP8 subclass, including padded view."""
+    mla = _make_mla(_make_kv_b_proj(device="cuda"), fp8_absorb=fp8_absorb)
+    if fp8_absorb:
+        mla._build_fp8_absorb()
+    else:
+        mla._build_bf16_absorb()
+    x = torch.randn(7, _HEADS, _LORA, device="cuda", dtype=torch.bfloat16)
+    storage = torch.full((8, _HEADS, _V), 123, device="cuda", dtype=x.dtype)
+    output = storage[:7]
+    for _ in range(3):
+        mla._v_up_proj(x, outputs=output)
+    result = mla._v_up_proj(x, outputs=output)
+    assert result is output and result.data_ptr() == storage.data_ptr()
+    torch.testing.assert_close(result, mla._v_up_proj(x), atol=0, rtol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = mla._v_up_proj(x, outputs=output)
+    for _ in range(2):
+        x.normal_()
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert captured is output
+        torch.testing.assert_close(output, mla._v_up_proj(x), atol=0, rtol=0)
+        assert torch.all(storage[7] == 123)

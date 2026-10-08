@@ -256,12 +256,17 @@ class IluGlmMoeDsaFp8SparseMLA(IluGlmMoeDsaSparseMLA):
         a, a_s = ixf_ops.fp8_grouped_per_token_quant(q_nope, q_nope.shape[1])
         return ixf_ops.fp8_per_channel_einsum(a, self.W_UK, a_s, self.W_UK_S)
 
-    def _v_up_proj(self, x: torch.Tensor) -> torch.Tensor:
-        # (T, H, lora) -> (T, H, v)
+    def _v_up_proj(self, x: torch.Tensor, outputs=None) -> torch.Tensor:
+        # FP8/einsum backends do not expose the Marlin direct-output contract.
         if self.W_UV_S is None:
-            return torch.einsum("thl,hvl->thv", x, self.W_UV)
-        a, a_s = ixf_ops.fp8_grouped_per_token_quant(x, x.shape[1])
-        return ixf_ops.fp8_per_channel_einsum(a, self.W_UV, a_s, self.W_UV_S)
+            result = torch.einsum("thl,hvl->thv", x, self.W_UV)
+        else:
+            a, a_s = ixf_ops.fp8_grouped_per_token_quant(x, x.shape[1])
+            result = ixf_ops.fp8_per_channel_einsum(a, self.W_UV, a_s, self.W_UV_S)
+        if outputs is not None:
+            outputs.copy_(result)
+            return outputs
+        return result
 
 
 class IluGlmMoeDsaFp8MLAAttention(IluGlmMoeDsaMLAAttention):

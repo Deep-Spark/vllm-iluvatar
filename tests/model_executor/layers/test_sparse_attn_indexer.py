@@ -12,7 +12,7 @@ import pytest
 import torch
 from vllm.model_executor.custom_op import op_registry_oot
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
-from vllm.utils.torch_utils import _encode_layer_name
+from vllm.utils import torch_utils
 
 import vllm_iluvatar.ilu_register as ilu_register
 
@@ -93,12 +93,15 @@ def test_ilu_sparse_attn_indexer_fake_requires_output_buffer(monkeypatch):
 @pytest.mark.parametrize(
     "constructor_skip,call_skip", [(False, False), (True, False), (False, True)]
 )
+@pytest.mark.parametrize("encode_layer_names", [False, True])
 def test_ilu_sparse_attn_indexer_forward_cuda_calls_registered_op(
     monkeypatch,
     default_vllm_config,
     constructor_skip,
     call_skip,
+    encode_layer_names,
 ):
+    monkeypatch.setattr(torch_utils, "_USE_LAYERNAME", encode_layer_names)
     sparse_attn_indexer = _load_sparse_attn_indexer(monkeypatch)
     calls = []
     output = torch.empty((2, 4), dtype=torch.int32)
@@ -138,7 +141,8 @@ def test_ilu_sparse_attn_indexer_forward_cuda_calls_registered_op(
     assert len(calls) == 1
     args = calls[0]
     assert args[0] is hidden_states
-    assert args[1] == _encode_layer_name(k_cache.prefix)
+    assert isinstance(args[1], str)
+    assert args[1] == k_cache.prefix
     assert args[2] is k_cache.kv_cache
     assert args[3] is q
     assert args[4] is k

@@ -253,22 +253,40 @@ class IluMoEStandardExpertsW4A8NN(_NNExpertsInit, IluMoEStandardExpertsW4A8):
                 packed_to_expert_row=packed_to_expert_row,
             )
         )
-        quantized, input_scale = ixff.scaled_int8_quant(hidden_states)
         act = torch.empty(
             (rows, self.gemm1_info.pad_k), device=hidden_states.device, dtype=torch.int8
         )
         act_scale = torch.empty(
             (rows,), device=hidden_states.device, dtype=torch.float32
         )
-        ixff.moe_expand_input_ep(
-            hidden_states=quantized,
-            src_to_expert_row=src_to_dst,
-            expand_tokens=rows,
-            topk=topk_ids.shape[-1],
-            output=act,
-            output_scale=act_scale,
-            input_scale=input_scale,
-        )
+        from vllm import envs
+
+        from vllm_iluvatar.ilu_util.arch import is_ivcore30
+
+        if (
+            envs.VLLM_ILU_GLM_MOE_PREPARE_FUSION
+            and is_ivcore30()
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.ndim == 2
+            and hidden_states.is_cuda
+            and hidden_states.is_contiguous()
+            and 0 < hidden_states.shape[1] <= 8192
+            and hidden_states.shape[1] == self.gemm1_info.pad_k
+        ):
+            ixff.moe_expand_input_ep_dynamic_scaled_int8(
+                hidden_states, src_to_dst, act, act_scale, topk=topk_ids.shape[-1]
+            )
+        else:
+            quantized, input_scale = ixff.scaled_int8_quant(hidden_states)
+            ixff.moe_expand_input_ep(
+                hidden_states=quantized,
+                src_to_expert_row=src_to_dst,
+                expand_tokens=rows,
+                topk=topk_ids.shape[-1],
+                output=act,
+                output_scale=act_scale,
+                input_scale=input_scale,
+            )
         hidden = ixff.moe_w4a8_group_gemm_ixmm(
             a=act,
             weight=w1,

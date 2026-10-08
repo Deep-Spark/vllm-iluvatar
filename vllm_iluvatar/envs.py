@@ -127,6 +127,7 @@ if TYPE_CHECKING:
     VLLM_ILU_DS4_MQA_QUANT_TYPE: str = ""
     VLLM_ILU_FUSE_NORM_QUANT: bool = True
     VLLM_ILU_FUSE_MOE_W13: bool = True
+    VLLM_ILU_GLM_MOE_PREPARE_FUSION: bool = False
     VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV: bool = True
     VLLM_ILU_GLM_DSA_FP8_ABSORB_UP: bool = True
     VLLM_ILU_GLM_DSA_TOPK_CONVERT_CACHE: bool = True
@@ -375,6 +376,10 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # GLM-5.2 LL: shared MLP on an auxiliary stream overlaps dispatch.
     "VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP": _bool_reader(
         "VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP", "0"
+    ),
+    # Opt-in local routing and INT8 quant+expand; restart workers to change.
+    "VLLM_ILU_GLM_MOE_PREPARE_FUSION": _bool_reader(
+        "VLLM_ILU_GLM_MOE_PREPARE_FUSION", "0"
     ),
     # GLM indexer preparation fusion. Default 1; set 0 for the split path:
     # - glm_dsa_indexer_q_rope_weights: in-place RoPE on Q's first 64 dims

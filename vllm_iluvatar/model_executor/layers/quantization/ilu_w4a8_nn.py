@@ -161,8 +161,33 @@ class IluW4A8NNMoEMethod(IluCompressedTensorsW4A8Int8MoEMethod):
         runtime_context = getattr(self, "_runtime_context", None)
         if runtime_context is not None:
             runtime_context.assert_validation_complete()
-        residual = self._valid_extra_residual(x, shared_experts_input)
+        residual = self._valid_extra_residual(
+            x[0] if isinstance(x, tuple) else x, shared_experts_input
+        )
         return self._apply_group_gemm(layer, x, topk_weights, topk_ids, residual)
+
+    def _unpack_input(self, x):
+        if not isinstance(x, tuple):
+            return x, None, x.dtype
+        q, scale, dtype = x
+        if (
+            q.dtype != torch.int8
+            or q.ndim != 2
+            or q.shape[1] != self.gemm1_info.pad_k
+            or dtype not in (torch.bfloat16, torch.float16)
+        ):
+            raise ValueError(
+                "prequantized MoE input must be INT8 [tokens, padded K] with BF16/FP16 compute dtype"
+            )
+        if (
+            scale.dtype != torch.float32
+            or scale.device != q.device
+            or scale.numel() != q.shape[0]
+        ):
+            raise ValueError(
+                "prequantized MoE scales must be one FP32 value per token on the input device"
+            )
+        return q, scale.reshape(-1, 1), dtype
 
     def select_gemm_impl(self, prepare_finalize, layer):
         from .ilu_w4a8_nn_experts import (
@@ -202,7 +227,7 @@ class IluW4A8NNMoEMethod(IluCompressedTensorsW4A8Int8MoEMethod):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         """NN prefill/decode for EP and non-EP inputs."""
-        dtype = x.dtype
+        x, input_scale, dtype = self._unpack_input(x)
         start = (
             layer.moe_config.ep_rank * layer.local_num_experts
             if layer.expert_map is not None
@@ -235,20 +260,42 @@ class IluW4A8NNMoEMethod(IluCompressedTensorsW4A8Int8MoEMethod):
         )
         if layer.w13_input_scale is not None:
             raise NotImplementedError("NN group GEMM requires dynamic INT8 input")
-        quantized, input_scale = ixfops.scaled_int8_quant(x)
+        from vllm import envs
+
+        from vllm_iluvatar.ilu_util.arch import is_ivcore30
+
+        fuse_quant = (
+            envs.VLLM_ILU_GLM_MOE_PREPARE_FUSION
+            and is_ivcore30()
+            and input_scale is None
+            and x.dtype == torch.bfloat16
+            and x.ndim == 2
+            and x.is_cuda
+            and x.is_contiguous()
+            and 0 < x.shape[1] <= 8192
+            and x.shape[1] == self.gemm1_info.pad_k
+        )
+        quantized = x
+        if not fuse_quant and input_scale is None:
+            quantized, input_scale = ixfops.scaled_int8_quant(x)
         act = torch.empty(
             (rows, self.gemm1_info.pad_k), dtype=torch.int8, device=x.device
         )
         a_scale = torch.empty((rows,), dtype=torch.float32, device=x.device)
-        ixfops.moe_expand_input_ep(
-            hidden_states=quantized,
-            src_to_expert_row=src_to_dst,
-            expand_tokens=rows,
-            topk=layer.top_k,
-            output=act,
-            output_scale=a_scale,
-            input_scale=input_scale,
-        )
+        if fuse_quant:
+            ixfops.moe_expand_input_ep_dynamic_scaled_int8(
+                x, src_to_dst, act, a_scale, topk=layer.top_k
+            )
+        else:
+            ixfops.moe_expand_input_ep(
+                hidden_states=quantized,
+                src_to_expert_row=src_to_dst,
+                expand_tokens=rows,
+                topk=layer.top_k,
+                output=act,
+                output_scale=a_scale,
+                input_scale=input_scale,
+            )
         act = self._group_gemm(
             self.gemm1_info,
             act,

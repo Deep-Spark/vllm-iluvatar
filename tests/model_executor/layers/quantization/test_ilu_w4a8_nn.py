@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 import ixformer.inference.functions as ixf_ops
 import pytest
+from tests.moe_test_utils import make_nn_graph_method as _make_nn_graph_method
 import torch
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import RoutedExperts
@@ -26,55 +27,6 @@ from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compres
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.ilu_compressed_tensors_moe import (
     IluCompressedTensorsMoEMethod,
 )
-from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_utils import (
-    W4A8GroupGemmInfo,
-)
-
-
-def _make_nn_graph_method(experts=4, hidden=256, intermediate=256):
-    rng = torch.Generator().manual_seed(71)
-    cls = w4a8_moe.IluW4A8NNMoEMethod
-    method = cls.__new__(cls)
-    method.group_size = -1
-    method.gemm_format = "NN"
-    method.gemm1_info = W4A8GroupGemmInfo("NN", hidden, 2 * intermediate)
-    method.gemm2_info = W4A8GroupGemmInfo("NN", intermediate, hidden)
-    layer = torch.nn.Module()
-    raw = []
-    scales = []
-    for prefix, n, k in (
-        ("w13", 2 * intermediate, hidden),
-        ("w2", hidden, intermediate),
-    ):
-        w = torch.randint(-7, 8, (experts, n, k), generator=rng, dtype=torch.int8)
-        scale = torch.rand(experts, 1, n, generator=rng) * 0.002
-        # Construct an NN checkpoint directly, independent of plugin packing.
-        # Force every output channel's q8 amax=126, hence the NN scale is 18.
-        w[..., 0] = 7
-        q8 = (w.to(torch.int16) * 18).clamp(-127, 127).to(torch.int8).cuda()
-        packed, extra, _ = ixf_ops.quant_repack_int4(q8, -1, 1, "NN", False)
-        torch.testing.assert_close(extra, torch.full_like(extra, 18))
-        layer.register_parameter(
-            prefix + "_weight", torch.nn.Parameter(packed, requires_grad=False)
-        )
-        layer.register_parameter(
-            prefix + "_weight_scale",
-            torch.nn.Parameter((scale * 18).cuda(), requires_grad=False),
-        )
-        raw.append(w)
-        scales.append(scale)
-        for suffix in ("i8_weight_scale", "i8_weight_zero", "input_scale", "bias"):
-            setattr(layer, prefix + "_" + suffix, None)
-    layer.moe_config = SimpleNamespace(ep_rank=1)
-    layer.local_num_experts = experts
-    layer.global_num_experts = experts * 2
-    layer.top_k = 2
-    layer.expert_map = torch.arange(experts, device="cuda")
-    layer.activation = SimpleNamespace(value="silu")
-    layer._ilu_output_scale = 0.375
-    return method, layer, raw, scales
-
-
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_static_nn_ixformer_against_cpu(dtype):
@@ -267,14 +219,39 @@ def test_nn_prefill_uses_ixformer_ixmm(ep, num_tokens, monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_nn_standard_experts_prefill_matches_monolithic(monkeypatch):
+@pytest.mark.parametrize(
+    "fused,hidden,topk,tokens",
+    [
+        (False, 256, 2, 33),
+        (True, 256, 3, 33),
+        (True, 3584, 6, 129),
+        (True, 4096, 8, 17),
+    ],
+)
+def test_nn_standard_experts_prefill_matches_monolithic(
+    monkeypatch, fused, hidden, topk, tokens
+):
     from vllm.model_executor.layers.fused_moe import MoEActivation
 
     from vllm_iluvatar.model_executor.layers.quantization import (
         ilu_w4a8_nn_experts as std_w4a8,
     )
 
-    method, layer, _, _ = _make_nn_graph_method()
+    from vllm import envs as opt
+
+    monkeypatch.setattr(opt, "VLLM_ILU_GLM_MOE_PREPARE_FUSION", fused)
+    method, layer, _, _ = _make_nn_graph_method(hidden=hidden)
+    layer.top_k = topk
+    native_quant = ixf_ops.moe_expand_input_ep_dynamic_scaled_int8
+    quant_calls = []
+
+    def checked_quant(*args, **kwargs):
+        quant_calls.append(kwargs["topk"])
+        return native_quant(*args, **kwargs)
+
+    monkeypatch.setattr(
+        ixf_ops, "moe_expand_input_ep_dynamic_scaled_int8", checked_quant
+    )
     experts = std_w4a8.IluMoEStandardExpertsW4A8NN.__new__(
         std_w4a8.IluMoEStandardExpertsW4A8NN
     )
@@ -291,10 +268,10 @@ def test_nn_standard_experts_prefill_matches_monolithic(monkeypatch):
         std_w4a8, "get_ep_group", lambda: SimpleNamespace(rank_in_group=1)
     )
     rng = torch.Generator().manual_seed(41)
-    x = torch.randn(33, 256, generator=rng).to("cuda", torch.bfloat16)
-    ids = torch.randint(8, (33, 2), generator=rng, dtype=torch.int64).cuda()
-    weights = torch.rand(33, 2, generator=rng).cuda()
-    output = torch.empty((33, 256), device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(tokens, hidden, generator=rng).to("cuda", torch.bfloat16)
+    ids = torch.randint(8, (tokens, topk), generator=rng, dtype=torch.int64).cuda()
+    weights = torch.rand(tokens, topk, generator=rng).cuda()
+    output = torch.empty((tokens, hidden), device="cuda", dtype=torch.bfloat16)
     actual = experts.apply(
         output,
         x,
@@ -331,6 +308,8 @@ def test_nn_standard_experts_prefill_matches_monolithic(monkeypatch):
         None,
     )
     torch.testing.assert_close(output, torch.zeros_like(output))
+
+    assert quant_calls == ([topk, topk, topk] if fused else [])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -726,3 +705,35 @@ def test_ll_nn_fixed_capacity_and_graph(
         for e, count in enumerate(active):
             assert torch.isfinite(output[e, :count]).all()
             assert torch.isnan(output[e, count:]).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("fused", [False, True])
+def test_nn_prequantized_input_matches_float_without_requantizing(
+    monkeypatch, dtype, fused
+):
+    from vllm import envs as opt
+
+    monkeypatch.setattr(opt, "VLLM_ILU_GLM_MOE_PREPARE_FUSION", False)
+    method, layer, _, _ = _make_nn_graph_method()
+    x = torch.randn(5, 256, device="cuda", dtype=dtype) * 0.1
+    ids = torch.tensor(
+        [[0, 4], [3, 5], [6, 7], [1, 2], [4, 7]], device="cuda", dtype=torch.int32
+    )
+    weights = torch.full((5, 2), 0.5, device="cuda")
+    expected = method.apply(layer, x, weights, ids, None, None)
+    q, scale = ixf_ops.scaled_int8_quant(x)
+
+    def unexpected_quant(*args, **kwargs):
+        raise AssertionError("prequantized input must not be quantized again")
+
+    monkeypatch.setattr(opt, "VLLM_ILU_GLM_MOE_PREPARE_FUSION", fused)
+    monkeypatch.setattr(ixf_ops, "scaled_int8_quant", unexpected_quant)
+    monkeypatch.setattr(
+        ixf_ops, "moe_expand_input_ep_dynamic_scaled_int8", unexpected_quant
+    )
+    actual = method.apply(layer, (q, scale, dtype), weights, ids, None, None)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="one FP32 value per token"):
+        method.apply(layer, (q, scale[:1], dtype), weights, ids, None, None)

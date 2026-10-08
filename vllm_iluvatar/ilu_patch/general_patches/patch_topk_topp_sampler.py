@@ -3,10 +3,11 @@
 
 Corresponds to: vllm/v1/sample/ops/topk_topp_sampler.py
 
-Target   : vllm.v1.sample.ops.topk_topp_sampler.apply_top_k_top_p
+Target   : apply_top_k_top_p and TopKTopPSampler.forward_native
 Baseline : v0.31.0 (db9527a468)
 Why      : Iluvatar should avoid the upstream Triton top-k/top-p sampler path
-           on GPU while keeping upstream CPU behavior intact.
+           on GPU while keeping upstream CPU behavior intact. The mode switch optionally
+           fuses top-p/sampling through native ixformer kernels.
 How      : rebind the module-level function so already-imported references are
            updated as well.
 Scope    : Iluvatar GPU sampling; CPU behavior is preserved.
@@ -35,5 +36,7 @@ def _apply() -> None:
     import vllm_iluvatar.v1.sample.ops.topk_topp_sampler as impl
 
     p.check_signatures(_m, impl, _OVERRIDES, strict=True)
+    p.check_signatures(_m.TopKTopPSampler, impl, ["forward_native"], strict=True)
+    _m.TopKTopPSampler.forward_native = impl.forward_native
     for name in _OVERRIDES:
         p.rebind_module_func(_m, name, getattr(impl, name))

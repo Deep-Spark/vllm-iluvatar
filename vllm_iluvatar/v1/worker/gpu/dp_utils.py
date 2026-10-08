@@ -13,6 +13,8 @@ How      : wrap the community sync and all-reduce ``uniform_decode`` on the
            same CPU group, then ``set_last_all_ranks_decode_only``. CUDA graph
            capture does not go through that sync, so ``capture`` publishes the
            bit for each descriptor (``uniform_token_count == decode_query_len``).
+Experiment: VLLM_ILU_MERGE_DP_SYNC=1 appends the vote to the six-row
+           0.30 agreement in merged_dp_sync; default keeps the original path.
 Scope    : V2 DP+EP MoE forward and CUDA graph capture.
 Remove   : when community DP sync writes this bit into forward metadata.
 """
@@ -22,6 +24,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from functools import wraps
 from typing import Any
+
+import os
 
 import torch
 import torch.distributed as dist
@@ -85,8 +89,12 @@ def sync_cudagraph_and_dp_padding(
     """Community V2 DP sync, plus the all-ranks decode-only bit."""
     if _ORIGINAL_SYNC is None:
         raise RuntimeError("sync_cudagraph_and_dp_padding patch is not installed")
-    _publish_all_ranks_decode_only(uniform_decode, dp_size, dp_rank)
-    return _ORIGINAL_SYNC(
+    if os.environ.get("VLLM_ILU_MERGE_DP_SYNC", "0") == "1":
+        from .merged_dp_sync import sync_cudagraph_and_dp_padding as sync
+    else:
+        _publish_all_ranks_decode_only(uniform_decode, dp_size, dp_rank)
+        sync = _ORIGINAL_SYNC
+    result = sync(
         cudagraph_manager,
         desired_batch_desc,
         num_tokens,
@@ -100,6 +108,8 @@ def sync_cudagraph_and_dp_padding(
         allow_ubatching=allow_ubatching,
         uniform_decode=uniform_decode,
     )
+
+    return result
 
 
 def make_capture(original: Callable[..., None]) -> Callable[..., None]:

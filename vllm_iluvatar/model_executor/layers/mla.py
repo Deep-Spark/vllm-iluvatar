@@ -5,7 +5,7 @@
 Corresponds to: vllm/model_executor/layers/mla.py
 
 Target   : vllm.model_executor.layers.mla.MultiHeadLatentAttentionWrapper
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : Iluvatar MLA backends apply rope and cache updates inside
            ``MLAAttention`` using ``positions`` and the layer ``rotary_emb``.
 How      : @MultiHeadLatentAttentionWrapper.register_oot subclass. Community

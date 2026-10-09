@@ -6,8 +6,8 @@
 Iluvatar OOT replacement for routed expert weight loading.
 
 Target     : vllm.model_executor.layers.fused_moe.routed_experts.RoutedExperts
-Baseline   : v0.30.0 ``RoutedExperts.weight_loader`` and
-             ``RoutedExperts.load_weights`` (re-synced from community 0.30.0)
+Baseline   : v0.31.0 (db9527a468) ``RoutedExperts.weight_loader`` and
+             ``RoutedExperts.load_weights``
 Why        : preserve the fork's MoE loading deltas without editing community
              vLLM source.
 How        : @PluggableLayer.register_oot subclass. Copied methods are pinned
@@ -28,6 +28,7 @@ import torch
 from vllm.model_executor.layers.fused_moe.routed_experts import (
     FusedMoeWeightScaleSupported,
     RoutedExperts,
+    _index_expert_mapping,
     logger,
 )
 
@@ -70,21 +71,22 @@ def weight_loader(
     # Hereafter, `expert_id` is local physical id
 
     # is_transposed: if the dim to shard the weight
-    # should be flipped. Required by GPTQ, compressed-tensors
+    # should be flipped. Required by GPTQ/AWQ (K-first format).
     # should be whatever dimension intermediate_size_per_partition is
     is_transposed = getattr(param, "is_transposed", False)
 
     # compressed-tensors checkpoints with packed weights are stored flipped
     # TODO (mgoin): check self.quant_method.quant_config.quant_format
     # against known CompressionFormat enum values that have this quality
-    if quant_method_name in (
-        "CompressedTensorsWNA16MoEMethod",
-        "CompressedTensorsW4A16FlydslMoEMethod",
+    if (
+        quant_method_name
+        in (
+            "CompressedTensorsWNA16MoEMethod",
+            "CompressedTensorsW4A16FlydslMoEMethod",
+        )
+        and is_transposed
     ):
-        if is_transposed:
-            loaded_weight = loaded_weight.t().contiguous()
-        else:
-            loaded_weight = loaded_weight
+        loaded_weight = loaded_weight.t().contiguous()
 
     if shard_id not in ("w1", "w2", "w3"):
         raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")
@@ -263,6 +265,7 @@ def weight_loader(
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 tp_rank=self.moe_config.tp_rank,
+                is_scale=True,
             )
         elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
             self._load_per_tensor_weight_scale(
@@ -305,14 +308,22 @@ def load_weights(
     self, weights: Iterable[tuple[str, torch.Tensor]]
 ) -> Iterable[str]:
     expert_mapping = self.get_expert_mapping(include_fused=True)
+    mapping_by_expert = _index_expert_mapping(expert_mapping)
+
     for expert_name, loaded_weight in weights:
         qual_name = f"{self.layer_name}.{expert_name}"
-        # Fused expert weights can be identified by their 3D tensors
         is_fused = loaded_weight.dim() == 3
+        # Fused tensors and ambiguous names keep the full mapping.
+        candidates = expert_mapping
+        if not is_fused and qual_name.count("experts.") == 1:
+            expert_key = qual_name.partition("experts.")[2].partition(".")[0]
+            candidates = mapping_by_expert.get(expert_key, expert_mapping)
+
         matched = False
-        for param_name, weight_name, expert_id, shard_id in expert_mapping:
+        for param_name, weight_name, expert_id, shard_id in candidates:
             if weight_name not in qual_name:
                 if matched and is_fused:
+                    # Fused tensors use the first contiguous run of matches.
                     break
                 continue
             matched = True
@@ -534,8 +545,8 @@ class IluRoutedExperts(RoutedExperts):
                     f"{w4a8_format!r} for fused w2_scale loading."
                 )
         raise ValueError(f"Unsupported W4A8 fused w2 parameter {param_name!r}.")
-    
-       # Isolate W8A8 fused w13 / w13 scale physical-layout loading.
+
+    # Isolate W8A8 fused w13 / w13 scale physical-layout loading.
     def _load_w8a8_fused_w13_shard(
         self,
         *,
@@ -610,90 +621,112 @@ class IluRoutedExperts(RoutedExperts):
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[str]:
         expert_mapping = self.get_expert_mapping(include_fused=True)
+        mapping_by_expert = _index_expert_mapping(expert_mapping)
+        # >>> ILU MODIFICATION >>>
         unpadded_hidden = (
             self.moe_config.hidden_dim_unpadded or self.moe_config.hidden_dim
         )
         quant_method_name = self.quant_method.__class__.__name__
+        # <<< ILU MODIFICATION <<<
+
         for expert_name, loaded_weight in weights:
             qual_name = f"{self.layer_name}.{expert_name}"
-            # Fused expert weights can be identified by their 3D tensors
             is_fused = loaded_weight.dim() == 3
+            # Fused tensors and ambiguous names keep the full mapping.
+            candidates = expert_mapping
+            if not is_fused and qual_name.count("experts.") == 1:
+                expert_key = qual_name.partition("experts.")[2].partition(".")[0]
+                candidates = mapping_by_expert.get(expert_key, expert_mapping)
+
             matched = False
-            for param_name, weight_name, expert_id, shard_id in expert_mapping:
+            for param_name, weight_name, expert_id, shard_id in candidates:
                 if weight_name not in qual_name:
                     if matched and is_fused:
+                        # Fused tensors use the first contiguous run of matches.
                         break
                     continue
                 matched = True
+                is_per_expert_fused_w13 = (
+                    not is_fused
+                    and shard_id in {"w1", "w3"}
+                    and any(
+                        f".{fused_name}." in qual_name
+                        for fused_name in ("gate_up_proj", "w13")
+                    )
+                )
                 weight_name = qual_name.replace(weight_name, param_name)
                 param_name = weight_name.removeprefix(f"{self.layer_name}.")
-                param = getattr(self, param_name)
+                param = getattr(self, param_name, None)
+                if param is None:
+                    if param_name.endswith(("w13_bias", "w2_bias")):
+                        continue
+                    raise AttributeError(
+                        f"Layer {self.layer_name} has no parameter {param_name!r} "
+                        f"for checkpoint weight {qual_name!r}"
+                    )
                 if is_fused:
-                    # w1 and w3 share one fused tensor; use a local copy so the
-                    # transpose below doesn't mutate loaded_weight across
-                    # iterations (else w3 is transposed twice and wrongly chunked)
-                    fused_weight = loaded_weight
-                    if shard_id in {"w1", "w3"}:
-                        if quant_method_name == "IluCompressedTensorsW4A8Int8MoEMethod":
-                            # >>> ILU MODIFICATION >>>
-                            # W4A8 fused w13 tensors may already be in ixformer
-                            # kernel layout; delegate format-specific splitting.
+                    quant_method = getattr(param, "quant_method", None)
+                    # Block scales share the weight's two-dimensional layout.
+                    # Other quantization metadata can use independent layouts.
+                    uses_weight_layout = (
+                        "scale" not in weight_name
+                        or quant_method == FusedMoeWeightScaleSupported.BLOCK.value
+                    )
+                    # >>> ILU MODIFICATION >>>
+                    if quant_method_name == "IluCompressedTensorsW4A8Int8MoEMethod":
+                        # W4A8 fused tensors may already be in ixformer kernel
+                        # layout; delegate format-specific splitting (bypass
+                        # _orient_fused_weight, which would double-orient).
+                        if shard_id in {"w1", "w3"}:
                             experts_shard = self._load_w4a8_fused_w13_shard(
-                                fused_weight=fused_weight,
+                                fused_weight=loaded_weight,
                                 param_name=param_name,
                                 expert_id=expert_id,
                                 unpadded_hidden=unpadded_hidden,
                             )
-                            # <<< ILU MODIFICATION <<<
-                        elif (
-                            quant_method_name
-                            == "IluCompressedTensorsW8A8Int8MoEMethod"
-                        ):
-                            # >>> ILU MODIFICATION >>>
-                            # W8A8 fused w13 tensors carry TN or NN layout;
-                            # split gate/up on N and keep scale on N.
-                            experts_shard = self._load_w8a8_fused_w13_shard(
-                                fused_weight=fused_weight,
-                                param_name=param_name,
-                                expert_id=expert_id,
-                                unpadded_hidden=unpadded_hidden,
-                            )
-                            # <<< ILU MODIFICATION <<<
                         else:
-                            if fused_weight.shape[-1] != unpadded_hidden:
-                                # [..., hidden, intermediate] -> [..., intermediate, hidden]
-                                fused_weight = fused_weight.transpose(-1, -2)
-                            experts_shard = fused_weight.chunk(2, dim=1)[expert_id]
-                    else:
-                        if quant_method_name == "IluCompressedTensorsW4A8Int8MoEMethod":
-                            # >>> ILU MODIFICATION >>>
-                            # W4A8 fused w2 tensors may already be in ixformer
-                            # kernel layout; delegate format-specific handling.
                             experts_shard = self._load_w4a8_fused_w2_shard(
-                                fused_weight=fused_weight,
+                                fused_weight=loaded_weight,
                                 param_name=param_name,
                                 unpadded_hidden=unpadded_hidden,
                             )
-                        
-                            # <<< ILU MODIFICATION <<<
-                        elif (
-                            quant_method_name
-                            == "IluCompressedTensorsW8A8Int8MoEMethod"
-                        ):
-                            # >>> ILU MODIFICATION >>>
-                            # W8A8 fused w2 tensors carry TN or NN layout.
-                            experts_shard = self._load_w8a8_fused_w2_shard(
-                                fused_weight=fused_weight,
+                    elif quant_method_name == "IluCompressedTensorsW8A8Int8MoEMethod":
+                        # W8A8 fused tensors carry TN or NN layout; delegate
+                        # format-specific splitting.
+                        if shard_id in {"w1", "w3"}:
+                            experts_shard = self._load_w8a8_fused_w13_shard(
+                                fused_weight=loaded_weight,
                                 param_name=param_name,
+                                expert_id=expert_id,
                                 unpadded_hidden=unpadded_hidden,
                             )
-                            # <<< ILU MODIFICATION <<<
                         else:
-                            if fused_weight.shape[-2] != unpadded_hidden:
-                                # [..., intermediate, hidden] -> [..., hidden, intermediate]
-                                fused_weight = fused_weight.transpose(-1, -2)
+                            experts_shard = self._load_w8a8_fused_w2_shard(
+                                fused_weight=loaded_weight,
+                                param_name=param_name,
+                                unpadded_hidden=unpadded_hidden,
+                            )
+                    else:
+                        # <<< ILU MODIFICATION <<<
+                        # w1 and w3 share one fused tensor; use a local copy so the
+                        # transpose below doesn't mutate loaded_weight across
+                        # iterations (else w3 is transposed twice and wrongly chunked)
+                        fused_weight = self._orient_fused_weight(
+                            loaded_weight,
+                            self.is_fused_checkpoint_transposed and uses_weight_layout,
+                        )
+                        if shard_id in {"w1", "w3"}:
+                            # Repurpose expert_id for deconcatenating w1 and w3
+                            experts_shard = fused_weight.chunk(2, dim=1)[expert_id]
+                        else:
                             experts_shard = fused_weight
                     start = 0
+                elif is_per_expert_fused_w13:
+                    shard_index = 0 if shard_id == "w1" else 1
+                    experts_shard = loaded_weight.chunk(2, dim=0)[
+                        shard_index
+                    ].unsqueeze(0)
+                    start = expert_id
                 else:
                     # loaded_weight is a single expert weight, so we add a dummy expert
                     # dimension to unify the loading logic with the fused case
@@ -779,21 +812,22 @@ class IluRoutedExperts(RoutedExperts):
         # Hereafter, `expert_id` is local physical id
 
         # is_transposed: if the dim to shard the weight
-        # should be flipped. Required by GPTQ, compressed-tensors
+        # should be flipped. Required by GPTQ/AWQ (K-first format).
         # should be whatever dimension intermediate_size_per_partition is
         is_transposed = getattr(param, "is_transposed", False)
 
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
-        if quant_method_name in (
-            "CompressedTensorsWNA16MoEMethod",
-            "CompressedTensorsW4A16FlydslMoEMethod",
+        if (
+            quant_method_name
+            in (
+                "CompressedTensorsWNA16MoEMethod",
+                "CompressedTensorsW4A16FlydslMoEMethod",
+            )
+            and is_transposed
         ):
-            if is_transposed:
-                loaded_weight = loaded_weight.t().contiguous()
-            else:
-                loaded_weight = loaded_weight
+            loaded_weight = loaded_weight.t().contiguous()
 
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")
@@ -979,6 +1013,7 @@ class IluRoutedExperts(RoutedExperts):
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
                     tp_rank=self.moe_config.tp_rank,
+                    is_scale=True,
                 )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
                 self._load_per_tensor_weight_scale(

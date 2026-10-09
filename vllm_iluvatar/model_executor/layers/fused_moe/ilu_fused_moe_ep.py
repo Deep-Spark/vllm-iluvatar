@@ -43,6 +43,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoEActivationFormat
 from vllm.utils.torch_utils import aux_stream, current_stream
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
 from vllm_iluvatar.model_executor.layers.fused_moe.prepare_finalize.ilu_deepep_ll import (
     VLLM_ILU_DEEPEP_USE_SCATTER,
     VLLM_ILU_LL_FUSED_AG_AR,
@@ -148,9 +149,9 @@ class IluFusedMoEEP:
         # moe_quant_config is None during model construction because it needs
         # post-processed weight scales. The runner lazily initializes it on
         # the first forward — ``_forward_impl`` calls
-        # ``routed_experts._ensure_moe_quant_config_init`` (ced6857afa,
-        # replacing the old ``runner.maybe_init_modular_kernel`` removed by
-        # the MoE modular-kernel refactor) — which runs after weight
+        # ``routed_experts._ensure_moe_quant_config_init`` (introduced by the
+        # MoE modular-kernel refactor, replacing the removed
+        # ``runner.maybe_init_modular_kernel``) — which runs after weight
         # processing and before CUDA graph capture. Wrap that hook to also
         # bring up the DeepEP low-latency all2all handle + NVSM dispatch
         # state at the same point; patch only once.
@@ -408,7 +409,7 @@ class IluFusedMoEEP:
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         org_shape = hidden_states.shape
-        # Adapted to vLLM v0.30.0 (ced6857afa): the runner always holds the gate (it was
+        # Adapted to vLLM v0.31.0 (db9527a468): the runner always holds the gate (it was
         # constructed via ``FusedMoEFactory(gate=gate, ...)``), so it computes
         # ``router_logits`` internally. ``router_logits=hidden_states`` is the
         # community ``_forward_fused_moe`` placeholder convention; the
@@ -566,7 +567,7 @@ class IluFusedMoEEP:
             assert shared_experts_input is not None
             if shared_gate_up_input is not None:
                 _check_shared_gate_up(shared_experts_input, shared_gate_up_input)
-        # vLLM v0.30.0 (ced6857afa) removed ``SharedExperts.maybe_sync_shared_experts_stream``
+        # vLLM v0.31.0 (db9527a468) removed ``SharedExperts.maybe_sync_shared_experts_stream``
         # (the pre-dispatch aux-stream sync) and replaced it with ``maybe_forward_async`` +
         # ``wait``. This naive DP+EP path does NOT use pre-dispatch async shared experts:
         # shared experts run synchronously AFTER the routed experts below (see the

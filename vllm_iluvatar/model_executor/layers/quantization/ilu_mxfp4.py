@@ -4,7 +4,7 @@
 Corresponds to: vllm/model_executor/layers/quantization/mxfp4.py
 
 Target   : vllm.model_executor.layers.quantization.mxfp4.Mxfp4MoEMethod
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : community ``Mxfp4MoEMethod`` picks a backend through
            ``select_deepseek_v4_mxfp4_moe_backend``, and off ROCm that function
            can only return NVIDIA-specific backends (TRTLLM / DeepGEMM / Marlin /
@@ -282,8 +282,8 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
     # None. Community would build a prepare/finalize pair once
     # ``use_all2all_kernels`` is true (EP together with DP / PCP / SP); the
     # runner's lazy ``routed_experts._ensure_moe_quant_config_init``
-    # (ced6857afa, replacing the ``maybe_init_modular_kernel`` removed by the
-    # MoE modular-kernel refactor) then materializes a
+    # (introduced by the MoE modular-kernel refactor, replacing the removed
+    # ``maybe_init_modular_kernel``) then materializes a
     # ``FusedMoEModularMethod`` whose ``apply`` expects a real kernel. Iluvatar
     # dispatch/combine is the naive EP-group path instead
     # (``IluMoERunner.do_naive_dispatch_combine``), so we opt out explicitly

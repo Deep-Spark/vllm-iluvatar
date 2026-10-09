@@ -11,7 +11,7 @@ own, so no upstream-mirrored implementation sibling is needed.
 
 Target   : vllm.distributed.stateless_coordinator (module-global
            ``CudaCommunicator`` symbol used by StatelessGroupCoordinator.__init__)
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : the stateless / elastic-EP path hardcodes CudaCommunicator and asserts
            ``device_comm_cls == CudaCommunicator``, rejecting OOT communicators.
            IluPlatform returns IluCommunicator, so the assert would fail.

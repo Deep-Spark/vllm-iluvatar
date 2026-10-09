@@ -111,8 +111,7 @@ def _is_only_decode(attn_metadata) -> bool:
     if not counts:
         return False
     return all(
-        num_prefills == 0 and num_decodes > 0
-        for num_prefills, num_decodes in counts
+        num_prefills == 0 and num_decodes > 0 for num_prefills, num_decodes in counts
     )
 
 

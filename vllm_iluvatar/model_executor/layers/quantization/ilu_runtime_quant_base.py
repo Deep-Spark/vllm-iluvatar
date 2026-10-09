@@ -2,7 +2,7 @@
 """Runtime-quant entry point for checkpoints that carry no quantization config.
 
 Target   : new Iluvatar-only quantization config, registered as ``ilu_runtime``
-Baseline : vllm 0.27.1
+Baseline : v0.31.0 (db9527a468)
 Why      : ``additional_config.ilu_quant`` is resolved from a *base* quant
            config's ``get_quant_method`` (``ilu_fp8.py:1088``). A native
            BF16/FP16 checkpoint has no ``quantization_config``, so

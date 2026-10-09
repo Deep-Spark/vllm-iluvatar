@@ -4,7 +4,7 @@
 Corresponds to: vllm/model_executor/layers/conv.py
 
 Target   : vllm.model_executor.layers.conv.Conv3dLayer
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : the fork forced the Conv3D CUDA path to use the linear/matmul
            implementation on Iluvatar.
 How      : @Conv3dLayer.register_oot subclass overriding only ``forward_cuda``.

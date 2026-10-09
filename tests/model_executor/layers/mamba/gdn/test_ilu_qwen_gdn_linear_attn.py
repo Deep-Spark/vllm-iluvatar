@@ -19,8 +19,12 @@ import vllm_iluvatar.ilu_register as ilu_register
 PREFIX = "model.layers.0.linear_attn"
 NUM_K_HEADS = 2
 NUM_V_HEADS = 2
-HEAD_K_DIM = 16
-HEAD_V_DIM = 16
+# ixinfer's chunked GDN kernel requires d_qk = d_v = 128 (see
+# ixinfer.h @par Chunked implementation) and 64-byte Q/K/V pointer alignment
+# (bf16 head_dim 16 -> 32-byte rows, unaligned). Use the real-model head_dim
+# 128 so the live-kernel test path actually exercises a supported config.
+HEAD_K_DIM = 128
+HEAD_V_DIM = 128
 KEY_DIM = NUM_K_HEADS * HEAD_K_DIM
 VALUE_DIM = NUM_V_HEADS * HEAD_V_DIM
 CONV_DIM = 2 * KEY_DIM + VALUE_DIM

@@ -12,7 +12,7 @@ register-time wiring: signature guard, binding the live community method as the
 fallback, and installing the wrapper onto ``PunicaWrapperGPU``.
 
 Target   : vllm.lora.punica_wrapper.punica_gpu.PunicaWrapperGPU.add_lora_linear
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 How      : add_lora_linear -> wrapper delegating to the community method when
                               ixformer fusion is disabled or unsupported.
 Fingerprint: add_lora_linear community source is hashed at register-time
@@ -32,7 +32,7 @@ import vllm_iluvatar.ilu_patch.general_patch as p
 # PunicaWrapperGPU.add_lora_linear (4-space method indent, trailing newline),
 # used as the drift anchor by the fingerprint guard.
 #
-# Baseline: v0.30.0 (ced6857afa)
+# Baseline: v0.31.0 (db9527a468)
 ADD_LORA_LINEAR = '''    def add_lora_linear(
         self,
         y: torch.Tensor,
@@ -43,10 +43,9 @@ ADD_LORA_LINEAR = '''    def add_lora_linear(
         output_slices: tuple[int, ...],
         *,
         buffer: torch.Tensor | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
-        """
-        Applicable to linear-related lora.
+        """Applicable to linear-related lora.
 
         Semantics:
             for i in range(len(lora_a_stacked)):
@@ -56,6 +55,7 @@ ADD_LORA_LINEAR = '''    def add_lora_linear(
                     @ lora_b_stacked[indices[i], layer_idx, :, :]
                     * scale
                     ).squeeze(0)
+
         Args:
             y (torch.Tensor): Output tensor. Will be changed in-place.
             x (torch.Tensor): Input tensor
@@ -64,8 +64,10 @@ ADD_LORA_LINEAR = '''    def add_lora_linear(
             scale (float): Scaling factor.
             output_slices (tuple[int, ...]): Every slice's size.
             buffer (Optional[torch.Tensor]): Defaults to None.
-        """
+            **kwargs: Accepts `add_inputs` (bool, defaults to True); any other
+                keys are ignored.
 
+        """
         assert len(lora_a_stacked) == len(lora_b_stacked) == len(output_slices)
 
         assert buffer is None, (

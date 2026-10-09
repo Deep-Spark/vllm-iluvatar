@@ -6,7 +6,7 @@ Corresponds to: vllm/model_executor/layers/quantization/modelopt.py
 Target   : vllm.model_executor.layers.quantization.modelopt.ModelOptNvFp4Config
            (registered under the name ``modelopt_fp4``) and its
            ``ModelOptNvFp4FusedMoE`` routed-expert method.
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : community ``ModelOptNvFp4FusedMoE.__init__`` calls
            ``select_nvfp4_moe_backend`` which, off NVIDIA/ROCm, only returns
            NVIDIA-specific backends and lands Step-3.7 on MARLIN ->

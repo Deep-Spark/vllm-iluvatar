@@ -1,1 +1,6 @@
 MD013: false
+# Keep a Changelog reuses Added/Changed/Removed/Fixed per version section;
+# allow same heading under different parent (##) sections, still flag dupes
+# within one section.
+MD024:
+  siblings_only: true

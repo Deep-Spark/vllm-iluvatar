@@ -104,4 +104,3 @@ def test_w16_helper_rejects_quantized_config():
             activation="silu",
             quant_config=quant_config,
         )
-

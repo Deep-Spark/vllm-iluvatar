@@ -10,8 +10,8 @@ from types import ModuleType, SimpleNamespace
 from vllm_iluvatar.ilu_patch import general_patch as p
 from vllm_iluvatar.ilu_patch.general_patches import patch_spec_decode_utils
 
-_MAIN_CED6857AFA_EAGLE_NEXT_TOKEN_PADDED_KERNEL_SHA = (
-    "930294908083bb508b264eb1823404268160ef8b2f8b0a812fe2126b32ae8d8c"
+_MAIN_DB9527A468_EAGLE_NEXT_TOKEN_PADDED_KERNEL_SHA = (
+    "1d4273a7a2bdfbbfba262af663bd11b25a5a98a54983bbf705b486b451aaa8a2"
 )
 
 
@@ -93,7 +93,7 @@ def test_eagle_kernel_fingerprint_baseline_matches_declared_main_source():
         p.source_sha(
             patch_spec_decode_utils._EAGLE_PREPARE_NEXT_TOKEN_PADDED_KERNEL_BASELINE
         )
-        == _MAIN_CED6857AFA_EAGLE_NEXT_TOKEN_PADDED_KERNEL_SHA
+        == _MAIN_DB9527A468_EAGLE_NEXT_TOKEN_PADDED_KERNEL_SHA
     )
 
 

@@ -5,7 +5,7 @@ Corresponds to: vllm/model_executor/layers/quantization/mxfp4.py (the routed-exp
            the community ``Mxfp4MoeBackend`` kernels own)
 
 Target   : routed MXFP4 expert execution for Iluvatar
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : none of the community MXFP4 MoE backends (TRTLLM / DeepGEMM / Marlin /
            FlashInfer / AITER) has an Iluvatar implementation, so the plugin owns
            the compute. Keeping it in a standalone function -- rather than inside

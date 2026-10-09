@@ -4,7 +4,7 @@
 Corresponds to: vllm/model_executor/models/qwen2_5_vl.py
 
 Target   : ``Qwen2_5_VLForConditionalGeneration``
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : The fork fused QKV split, rotary, and head-dim padding for Qwen2.5-VL ViT
            attention, and accepted CUDA-graph ``max_seqlen`` metadata that may arrive as
            tensors on Iluvatar/CoreX runs.

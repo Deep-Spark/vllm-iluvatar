@@ -22,7 +22,9 @@ from unittest.mock import MagicMock, patch
 import torch
 from vllm.model_executor.custom_op import op_registry_oot
 from vllm.model_executor.layers.conv import Conv3dLayer  # noqa: F401
-from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb  # noqa: F401
+from vllm.model_executor.layers.rotary_embedding.common import (
+    ApplyRotaryEmb,  # noqa: F401
+)
 
 import vllm_iluvatar._custom_ops as ilu_ops
 from vllm_iluvatar.model_executor.layers.conv import IluConv3dLayer

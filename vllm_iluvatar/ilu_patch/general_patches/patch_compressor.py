@@ -7,7 +7,7 @@ ILU general-plugins patch, auto-discovered from the centralized
 ``ilu_patch.general_patches`` package during ``register_general``.
 
 Target   : vllm.models.deepseek_v4.compressor.CompressorStateCache.get_kv_cache_spec
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : The community ``get_kv_cache_spec`` uses an ``alignment`` kwarg
            tied to the fp8_ds_mla paged layout; the Iluvatar bf16 path needs a
            different block_size derivation and no alignment constraint.
@@ -31,7 +31,7 @@ from vllm_iluvatar.ilu_patch import general_patch as p
 # CompressorStateCache.get_kv_cache_spec (4-space method indent),
 # used as the drift anchor by the fingerprint guard.
 #
-# Baseline: v0.30.0 (ced6857afa)
+# Baseline: v0.31.0 (db9527a468)
 GET_KV_CACHE_SPEC = """\
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # fp8_ds_mla is the UE8M0 paged layout and needs 576B alignment. Plain
@@ -41,6 +41,7 @@ GET_KV_CACHE_SPEC = """\
         return SlidingWindowMLASpec(  # only has one vector instead of K + V
             block_size=self.block_size,
             num_kv_heads=1,
+            max_tp_shards=1,
             head_size=self.state_dim,
             dtype=self.dtype,
             sliding_window=self.sliding_window,

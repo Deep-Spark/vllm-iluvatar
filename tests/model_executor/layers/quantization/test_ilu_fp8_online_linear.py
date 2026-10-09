@@ -7,8 +7,8 @@ import logging
 
 import pytest
 import torch
-from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor import parameter as parameter_module
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.parameter import ModelWeightParameter
 
 from vllm_iluvatar.model_executor.layers.quantization import ilu_fp8

@@ -11,7 +11,7 @@ module only performs register-time wiring.
 
 Target   : vllm.config.speculative.SpeculativeConfig.hf_config_override
            vllm.config.speculative.SpeculativeConfig.__post_init__
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : re-point the draft architecture to the ilu W4A8 self-contained draft
            models (DeepseekV32MTPModel / IluGlmMoeDsaMTPModel /
            DeepSeekV4MTPModel for MTP, IluDSparkDraftModel for DSpark) for the

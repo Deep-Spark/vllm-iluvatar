@@ -664,7 +664,7 @@ class IluMiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={"language_model.": ""},
-        # vLLM v0.30.0 (ced6857afa) removed AutoWeightsLoader.skip_substrs; drop ``mtp.*``
+        # vLLM v0.31.0 (db9527a468) removed AutoWeightsLoader.skip_substrs; drop ``mtp.*``
         # here instead (the MTP module is not modeled yet).
         orig_to_new_substr={"mtp.": None},
     )
@@ -735,7 +735,7 @@ class IluMiniMaxM3SparseForConditionalGeneration(
         orig_to_new_substr={
             ".mlp.fc1.": ".fc1.",
             ".mlp.fc2.": ".fc2.",
-            # vLLM v0.30.0 (ced6857afa) removed AutoWeightsLoader.skip_substrs; drop ``mtp.*``
+            # vLLM v0.31.0 (db9527a468) removed AutoWeightsLoader.skip_substrs; drop ``mtp.*``
             # here instead (the MTP module is not modeled yet).
             "mtp.": None,
         },

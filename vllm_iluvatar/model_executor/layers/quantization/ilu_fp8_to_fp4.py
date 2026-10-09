@@ -6,7 +6,7 @@ Corresponds to: no community module (Iluvatar-only conversion step).
 Target   : the ``weights.source`` contract of an ``additional_config.ilu_quant``
            group whose ``loading`` is ``transform`` @ ``weight_load``
            (see ``ilu_runtime_quant_config.py``).
-Baseline : main_9c12a81ac
+Baseline : v0.31.0 (db9527a468)
 Why      : ``IluFp8ToFp4OnlineMoEMethod`` converts one checkpoint shard at a
            time and must not hard-code "the source is DeepSeek block-FP8". The
            same ix30 target is reachable from per-channel and per-tensor FP8

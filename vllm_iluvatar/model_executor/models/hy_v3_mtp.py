@@ -4,7 +4,7 @@
 Corresponds to: vllm/model_executor/models/hy_v3_mtp.py
 
 Target   : vllm.model_executor.models.hy_v3_mtp.HYV3MTP (arch "HYV3MTPModel")
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : The MoE router optionally runs bf16 to match the
            ixformer grouped-topk kernel (see
            ``hy_v3_moe_bf16_router_overrides``).

@@ -12,7 +12,7 @@ This patch is a pure module-global rebind with no method-body copy.
 
 Target   : vllm.model_executor.layers.fused_moe.runner.moe_runner.MoERunner
            vllm.model_executor.layers.fused_moe.runner.shared_experts.SharedExperts
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : MoERunner is not a CustomOp (no register_oot); Iluvatar needs
            elastic-EP, input_ids dispatch, FP16 scaling, fused norm-quant tuple
            support, and the fork's RoutedExperts scaling placement. SharedExperts

@@ -4,7 +4,7 @@
 Corresponds to: vllm/v1/sample/ops/topk_topp_sampler.py
 
 Target   : vllm.v1.sample.ops.topk_topp_sampler.apply_top_k_top_p
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : Iluvatar should avoid the upstream Triton top-k/top-p sampler path
            on GPU while keeping upstream CPU behavior intact.
 How      : rebind the module-level function so already-imported references are

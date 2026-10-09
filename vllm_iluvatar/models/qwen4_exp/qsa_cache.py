@@ -145,10 +145,10 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         if isinstance(kv_cache_spec, MLAAttentionSpec):
-            # v0.30.0 dropped ``MLAAttentionSpec.compress_ratio``; the ratio is
-            # carried on ``tokens_per_state`` (one stored state per
-            # ``compress_ratio`` logical tokens), matching the rest of the ILU
-            # MLA path (ilu_indexer / ilu_flashmla_sparse / deepseek_v4).
+            # v0.31.0: ``MLAAttentionSpec.compress_ratio`` is dropped;
+            # the ratio is carried on ``tokens_per_state`` (one stored
+            # state per ``compress_ratio`` logical tokens), matching the rest of
+            # the ILU MLA path (ilu_indexer / ilu_flashmla_sparse / deepseek_v4).
             compress_ratio = kv_cache_spec.tokens_per_state
             assert isinstance(compress_ratio, int), (
                 "QSA compression requires an integer compress_ratio"

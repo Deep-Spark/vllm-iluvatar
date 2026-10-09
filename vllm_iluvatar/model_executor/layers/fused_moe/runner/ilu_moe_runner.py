@@ -2,7 +2,7 @@
 """Iluvatar MoERunner — inherits community MoERunner, overrides only the
 delta methods required for corex / Iluvatar hardware.
 
-Baseline : community ``runner/moe_runner.py`` @ v0.30.0 (ced6857afa)
+Baseline : community ``runner/moe_runner.py`` @ v0.31.0 (db9527a468)
 Delta    : ~250 lines vs. the original 1010-line full-class copy
 
 Override summary (each marked with ``# [ILU override]`` in-line):
@@ -247,7 +247,7 @@ class IluMoERunner(MoERunner):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         self.routed_experts._ensure_moe_quant_config_init()
-        # vLLM v0.30.0 (ced6857afa) removed ``_maybe_sync_shared_experts_stream`` (the
+        # vLLM v0.31.0 (db9527a468) removed ``_maybe_sync_shared_experts_stream`` (the
         # pre-dispatch aux-stream sync) and replaced it with
         # ``SharedExperts.maybe_forward_async`` + ``wait``. ILU does NOT use
         # pre-dispatch async shared experts — ``_apply_quant_method`` below

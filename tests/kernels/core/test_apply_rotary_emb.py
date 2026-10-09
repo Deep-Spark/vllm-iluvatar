@@ -113,10 +113,14 @@ def test_apply_rotary_emb_op(
     if rot_dim == 0:
         pytest.skip("degenerate rot_dim")
 
-    shape = (batch, seqlen, num_heads, head_dim) if batched else (
-        seqlen,
-        num_heads,
-        head_dim,
+    shape = (
+        (batch, seqlen, num_heads, head_dim)
+        if batched
+        else (
+            seqlen,
+            num_heads,
+            head_dim,
+        )
     )
     x = torch.randn(shape, dtype=dtype, device=device)
     cos, sin = _make_cos_sin(seqlen, rot_dim, dtype, device)

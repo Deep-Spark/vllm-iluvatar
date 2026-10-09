@@ -30,8 +30,9 @@ def _stub_gpu_worker(monkeypatch):
 
     gpu_worker_mod.Worker = _FakeWorker
 
-    # IluWorker imports ``vllm.v1.worker.gpu.model_runner`` (the v0.30.0 dotted
-    # path), whose real module pulls ``vllm.v1.watermarking`` at import time.
+    # IluWorker imports ``vllm.v1.worker.gpu.model_runner`` (the dotted
+    # path used since v0.30.0), whose real module pulls ``vllm.v1.watermarking``
+    # at import time.
     # Stub the dotted path -- plus the ``vllm.v1.worker.gpu`` package -- so the
     # import resolves here and never touches the real model_runner.
     gpu_package = make_package("vllm.v1.worker.gpu")

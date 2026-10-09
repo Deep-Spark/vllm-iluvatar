@@ -935,7 +935,7 @@ def sparse_prefill_fwd(
 
 
 # Fused vocab-parallel embedding lookup (pure-torch ILU fallback).
-# Community v0.30.0 (ced6857afa) ships a fused ``torch.ops._C.vocab_parallel_embedding`` kernel
+# Community v0.31.0 (db9527a468) ships a fused ``torch.ops._C.vocab_parallel_embedding`` kernel
 # (added at commit e2c8eeac40, "[kernel] Fused embedding kernel") used by
 # VocabParallelEmbedding.forward when ``use_fused_embedding`` is True (TP>1 +
 # cuda + unquantized). The Iluvatar plugin _C does not register that op, so

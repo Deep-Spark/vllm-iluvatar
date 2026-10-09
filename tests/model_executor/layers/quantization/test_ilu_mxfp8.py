@@ -387,8 +387,9 @@ def test_config_only_swaps_the_moe_method():
     )
 
     assert IluMxFp8Config.FusedMoEMethodCls is IluMxFp8FusedMoE
-    # v0.30.0 dropped ``LinearMethodCls``; Linear dispatch goes through the
-    # community ``build_linear_method`` -> generic ``ModelOptLinearMethod``
+    # v0.31.0: ``LinearMethodCls`` is dropped; Linear dispatch
+    # goes through the community ``build_linear_method`` -> generic
+    # ``ModelOptLinearMethod``
     # (whose ``create_weights`` calls ``init_mxfp8_linear_kernel``). The ILU
     # config must not override that path -- only MoE is swapped.
     assert "LinearMethodCls" not in IluMxFp8Config.__dict__

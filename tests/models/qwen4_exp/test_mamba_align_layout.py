@@ -147,7 +147,7 @@ def test_layout_matches_vllm_metadata(page_padded):
 
     layout = build_mamba_align_layout(states, groups, is_conv, block_tables, dim_first)
 
-    # v0.30.0: ``create`` / ``initialize_from_forward_context`` take the copy
+    # v0.31.0: ``create`` / ``initialize_from_forward_context`` take the copy
     # funcs as a dict keyed by mamba_type (MambaStateCopyFuncsByType); the ILU
     # ``collect_mamba_states`` above still takes the flat tuple.
     copy_funcs_by_type = {MambaAttentionBackendEnum.MAMBA2: copy_funcs}

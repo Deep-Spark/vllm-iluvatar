@@ -46,9 +46,7 @@ def _engine(
         waiting=list(waiting),
         skipped_waiting=[],
         running=list(running),
-        has_unfinished_requests=lambda: bool(
-            scheduler.waiting or scheduler.running
-        ),
+        has_unfinished_requests=lambda: bool(scheduler.waiting or scheduler.running),
     )
     engine = SimpleNamespace(
         scheduler=scheduler,

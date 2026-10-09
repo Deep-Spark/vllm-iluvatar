@@ -4,7 +4,7 @@
 Corresponds to: vllm/v1/worker/gpu_model_runner.py
 
 Target   : GPUModelRunner.__init__
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : Community only creates the event under async scheduling. PP
            keeps pp_size in-flight batches, so non-blocking H2D of the
            shared pinned input buffers can race the next step (worse

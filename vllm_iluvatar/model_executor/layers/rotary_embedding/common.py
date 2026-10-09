@@ -4,7 +4,7 @@
 Corresponds to: vllm/model_executor/layers/rotary_embedding/common.py
 
 Target   : vllm.model_executor.layers.rotary_embedding.common.ApplyRotaryEmb
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : the community ``forward_cuda`` imports
            ``from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb``
            (a flash-attn kernel absent on Iluvatar/corex). Rather than fake that

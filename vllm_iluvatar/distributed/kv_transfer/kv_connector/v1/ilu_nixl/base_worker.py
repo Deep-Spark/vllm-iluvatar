@@ -1220,7 +1220,7 @@ class IluNixlWorkerMixin:
                 local_xfer_side_handle=local_xfer_side_handle,
                 remote_xfer_side_handle=remote_xfer_side_handle,
                 # >>> ILU MODIFICATION >>>
-                # Forward community v0.30.0 `awaiting_kvs` so parked requests
+                # Forward community v0.31.0 ``awaiting_kvs`` so parked requests
                 # stay tracked. local_dram_handle defaults to None: the ILU
                 # HMA path does not stage to DRAM.
                 # <<< ILU MODIFICATION <<<

@@ -9,7 +9,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import nn
-
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -25,6 +24,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
+
 from .config import Qwen4ExpTextConfig
 from .ple_utils import copy_ple_embedding_shard_
 

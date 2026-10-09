@@ -30,10 +30,10 @@ from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_
     IluFp8BlockScaledMMKernel,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_kernel(
     gn: int,
@@ -70,6 +70,7 @@ def _ref_block_mm(
     intentionally written differently from the kernel's vectorized broadcast so
     it validates the group-indexing direction rather than duplicating it.
     """
+
     def _e8m0(scale: torch.Tensor) -> torch.Tensor:
         exp_bits = scale.view(torch.uint8).to(torch.int32)
         return (exp_bits << 23).view(torch.float32)
@@ -113,6 +114,7 @@ def _cuda_list():
 # ---------------------------------------------------------------------------
 # Registration / arch gate
 # ---------------------------------------------------------------------------
+
 
 def test_apply_inserts_at_head_and_idempotent(monkeypatch):
     import vllm_iluvatar.ilu_util.arch as arch_mod
@@ -187,6 +189,7 @@ def test_register_applies_once(monkeypatch):
 # is_supported arch gate
 # ---------------------------------------------------------------------------
 
+
 def test_is_supported_true_on_ivcore30(monkeypatch):
     monkeypatch.setattr(mod, "_is_ivcore30_fn", lambda: True)
     ok, reason = IluFp8BlockScaledMMKernel.is_supported(90)
@@ -205,12 +208,13 @@ def test_is_supported_false_off_ivcore30(monkeypatch):
 # torch dequant correctness
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize(
     "M,N,K,gn,gk",
     [
-        (4, 256, 256, 128, 128),   # clean 128x128 blocks, multiple tiles
-        (3, 128, 128, 128, 128),   # single block
-        (5, 130, 200, 128, 128),   # non-divisible N and K (tail blocks)
+        (4, 256, 256, 128, 128),  # clean 128x128 blocks, multiple tiles
+        (3, 128, 128, 128, 128),  # single block
+        (5, 130, 200, 128, 128),  # non-divisible N and K (tail blocks)
     ],
 )
 def test_dequant_matches_reference(M, N, K, gn, gk):

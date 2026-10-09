@@ -14,9 +14,7 @@ def _install_fake_pynccl_wrapper(monkeypatch):
     vllm = ModuleType("vllm")
     distributed = ModuleType("vllm.distributed")
     device_communicators = ModuleType("vllm.distributed.device_communicators")
-    pynccl_wrapper = ModuleType(
-        "vllm.distributed.device_communicators.pynccl_wrapper"
-    )
+    pynccl_wrapper = ModuleType("vllm.distributed.device_communicators.pynccl_wrapper")
 
     class NCCLLibrary:
         exported_functions = [

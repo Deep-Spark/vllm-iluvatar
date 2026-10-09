@@ -437,7 +437,6 @@ class IluvatarGPUModelRunner(GPUModelRunner):
                 self.speculator, "enable_adaptive_verification", False
             ),
             attn_groups=self.attn_groups,
-            attn_cg_support=attn_cg_support,
             req_states=self.req_states,
             query_start_loc=self.input_buffers.query_start_loc,
             num_bonus_tokens=self.model_state.num_new_sampled_tokens_per_step,

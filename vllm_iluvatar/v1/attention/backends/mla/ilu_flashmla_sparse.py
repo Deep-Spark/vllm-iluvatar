@@ -400,6 +400,7 @@ class IluFlashMLASparseMetadataBuilder(
         if self.compress_ratio > 1:
             slot_mapping = get_compressed_slot_mapping(
                 cm.num_actual_tokens,
+                cm.slot_mapping,
                 cm.query_start_loc,
                 cm.seq_lens,
                 cm.block_table_tensor.clamp(min=0),

@@ -528,7 +528,7 @@ class IluDeepseekV4MoE(nn.Module, IluFusedMoEEP):
             return final_hidden_states.view(org_shape)
 
         assert shared_gate_up_input is None
-        # Adapted to vLLM v0.30.0 (ced6857afa): the runner always holds the gate (it was
+        # Adapted to vLLM v0.31.0 (db9527a468): the runner always holds the gate (it was
         # passed via ``FusedMoEFactory(gate=self.gate, ...)``), so it computes
         # ``router_logits`` internally. ``router_logits=hidden_states`` is the
         # community ``_forward_fused_moe`` placeholder convention; the runner
@@ -1307,7 +1307,7 @@ def _make_ilu_deepseek_v4_weights_mapper() -> WeightsMapper:
         orig_to_new_substr={
             ".attn.compressor.": ".attn.mla_attn.compressor.",
             ".shared_experts.w2": ".shared_experts.down_proj",
-            # vLLM v0.30.0 (ced6857afa) dropped AutoWeightsLoader.skip_substrs; the MTP
+            # vLLM v0.31.0 (db9527a468) dropped AutoWeightsLoader.skip_substrs; the MTP
             # weights are loaded by the separate IluDeepSeekV4MTPModel draft
             # model, so the base model drops them here via the mapper (maps
             # to None). The orig_to_new_prefix rename ``mtp.`` -> ``model.mtp.``
@@ -1374,7 +1374,7 @@ class IluDeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     _LOAD_SKIP_SUBSTRS: tuple[str, ...] = ("mtp.",)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # vLLM v0.30.0 (ced6857afa) removed AutoWeightsLoader.skip_substrs; ``mtp.*`` weights
+        # vLLM v0.31.0 (db9527a468) removed AutoWeightsLoader.skip_substrs; ``mtp.*`` weights
         # are dropped by ``hf_to_vllm_mapper`` (``"mtp.": None`` in
         # orig_to_new_substr) and loaded separately by IluDeepSeekV4MTPModel.
         loader = AutoWeightsLoader(self)

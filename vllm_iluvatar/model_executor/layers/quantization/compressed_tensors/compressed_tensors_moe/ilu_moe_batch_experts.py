@@ -4,7 +4,7 @@
 Corresponds to: vllm/model_executor/layers/fused_moe/modular_kernel.py
            vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/*
 Target   : batched expert kernels selected by Iluvatar compressed-tensors MoE.
-Baseline : v0.30.0 (ced6857afa) plugin runtime source
+Baseline : v0.31.0 (db9527a468) plugin runtime source
 Why      : Iluvatar W4A8/W16A16 DP+EP kernels consume batched expert layouts and
            may own activation quantization internally.
 How      : plugin-only modular-kernel expert classes selected by

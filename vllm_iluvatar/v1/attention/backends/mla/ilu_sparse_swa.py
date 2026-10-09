@@ -76,7 +76,7 @@ def build_dspark_noncausal_swa_indices(
 
     Reproduces ``_compute_dspark_noncausal_swa_indices_kernel``
     (vllm/v1/attention/backends/mla/sparse_swa.py:816-856, baseline
-    v0.30.0 (ced6857afa)) in Torch. Correctness first; an ixformer kernel can
+    v0.31.0 (db9527a468)) in Torch. Correctness first; an ixformer kernel can
     replace it once the numerics are pinned down.
     """
     if out_indices is None:
@@ -157,7 +157,7 @@ class IluDeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         self.block_size = 64
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
-        # vLLM v0.30.0 (ced6857afa) KV-cache layout: allocate_kv_cache binds a 4D
+        # vLLM v0.31.0 (db9527a468) KV-cache layout: allocate_kv_cache binds a 4D
         # [B, H=1, N, C] tensor; squeeze the singleton head dim -> 3D [B, N, C]
         # as required by the ilu ixformer insert kernels (ndim 2 or 3 only).
         self.kv_cache = kv_cache.squeeze(1)

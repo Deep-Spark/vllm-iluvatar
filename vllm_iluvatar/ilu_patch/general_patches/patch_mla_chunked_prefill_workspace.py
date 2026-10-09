@@ -7,7 +7,7 @@ Corresponds to: vllm/model_executor/layers/attention/mla_attention.py
         SparseMLACommonMetadataBuilder.determine_chunked_prefill_workspace_size
 
 Target   : community MLA / sparse-MLA metadata builders.
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : Iluvatar deployments sometimes need a smaller workspace cap than
            the community 64k formula (e.g. W8A8 kv_b_proj peak memory).
 How      : replace both builders'

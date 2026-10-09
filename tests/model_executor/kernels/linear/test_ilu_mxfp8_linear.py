@@ -42,7 +42,11 @@ def _make_kernel(monkeypatch):
         Mxfp8LinearLayerConfig,
     )
 
-    return IluMxfp8LinearKernel(Mxfp8LinearLayerConfig())
+    # Community 0.31.0 made ``weight_shape`` a required field. The ILU kernel
+    # reads the real shape from the layer tensor in process_weights_after_loading
+    # (per-layer K % 64 / scale-shape checks live there), so the config value is
+    # only needed to satisfy construction here.
+    return IluMxfp8LinearKernel(Mxfp8LinearLayerConfig(weight_shape=(_N, _K)))
 
 
 def test_arch_gate(monkeypatch):
@@ -79,9 +83,7 @@ def test_requant_uses_mxfp8_grid_and_zero_copy_scale_view(monkeypatch, scale_dty
     # patching ``sys.modules`` would not be seen. Patch the real function.
     import ixformer.inference.functions as ixfops
 
-    monkeypatch.setattr(
-        ixfops, "fp8_weight_block_to_channel_requant", _fake_requant
-    )
+    monkeypatch.setattr(ixfops, "fp8_weight_block_to_channel_requant", _fake_requant)
 
     kernel.process_weights_after_loading(layer)
 
@@ -149,7 +151,8 @@ def test_patch_prepends_kernel_ahead_of_community_candidates(monkeypatch):
         # Idempotent: apply_general_patches may run more than once.
         patch._apply()
         assert (
-            k._POSSIBLE_MXFP8_KERNELS[PlatformEnum.CUDA].count(IluMxfp8LinearKernel) == 1
+            k._POSSIBLE_MXFP8_KERNELS[PlatformEnum.CUDA].count(IluMxfp8LinearKernel)
+            == 1
         )
     finally:
         k._POSSIBLE_MXFP8_KERNELS[PlatformEnum.CUDA][:] = original

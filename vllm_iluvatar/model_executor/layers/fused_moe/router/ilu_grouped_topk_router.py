@@ -4,7 +4,7 @@
 Corresponds to: vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py
 
 Target   : vllm.model_executor.layers.fused_moe.router.grouped_topk_router.grouped_topk
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : Iluvatar uses ixformer's grouped-topk kernel instead of community
            CUDA/Torch grouped-topk paths. ixformer requires the noaux_tc
            correction bias dtype to match the router logits dtype.

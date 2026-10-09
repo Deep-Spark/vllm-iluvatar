@@ -13,7 +13,7 @@ module only performs register-time wiring.
 Target   : vllm.v1.worker.gpu.spec_decode.autoregressive.speculator.
            AutoRegressiveSpeculator.__init__ / capture / _multi_step_decode
            (+ new _generate_draft_graph_part / _generate_draft_tail methods)
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : ixfd TP all_gather (inside sample_draft/compute_logits) is not
            CUDA-graph-safe; capturing it into the draft decode graph corrupts
            the shared ixfd communicator and produces garbage output. all_reduce
@@ -86,7 +86,5 @@ def _apply() -> None:
     # [ILU override] _multi_step_decode - delta: each FULL replay is followed
     # by the eager tail _generate_draft_tail (all_gather + argmax + update).
     AutoRegressiveSpeculator._multi_step_decode = wrapped_msd
-    AutoRegressiveSpeculator._generate_draft_graph_part = (
-        _generate_draft_graph_part
-    )
+    AutoRegressiveSpeculator._generate_draft_graph_part = _generate_draft_graph_part
     AutoRegressiveSpeculator._generate_draft_tail = _generate_draft_tail

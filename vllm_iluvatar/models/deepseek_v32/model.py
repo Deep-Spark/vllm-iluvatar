@@ -6,7 +6,7 @@ Corresponds to: vllm/models/deepseek_v32/nvidia/model.py and the DeepSeek V3.2
 DSA-specific portions previously embedded in
 vllm/model_executor/models/deepseek_v2.py.
 
-Baseline : v0.30.0 (ced6857afa) + paired Iluvatar DSA fork
+Baseline : v0.31.0 (db9527a468) + paired Iluvatar DSA fork
 Why      : keep DeepSeek V3.2 DSA model logic in the plugin package while the
            community DeepSeek V2 model can be restored to upstream boundaries.
 How      : ModelRegistry.register_model points the public DeepSeek V3.2 arch at

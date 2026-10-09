@@ -11,7 +11,7 @@ from vllm.model_executor.layers.mla import MultiHeadLatentAttentionWrapper
 import vllm_iluvatar.ilu_register as ilu_register
 from vllm_iluvatar.model_executor.layers.mla import IluMultiHeadLatentAttentionWrapper
 
-_MAIN_CED6857AFA_FLASH_ATTN_DIFF_HEAD_DIMS_SHA = (
+_MAIN_DB9527A468_FLASH_ATTN_DIFF_HEAD_DIMS_SHA = (
     "c6171ba4b7e2b93fe1d67f0e180e98cccce52b53c80458f959f7638ced39c033"
 )
 
@@ -250,7 +250,7 @@ def test_mla_prefill_flash_attn_fingerprint_baseline_hash():
 
     assert (
         p.source_sha(flash_attn._FLASH_ATTN_VARLEN_DIFF_HEADDIMS_BASELINE)
-        == _MAIN_CED6857AFA_FLASH_ATTN_DIFF_HEAD_DIMS_SHA
+        == _MAIN_DB9527A468_FLASH_ATTN_DIFF_HEAD_DIMS_SHA
     )
 
 

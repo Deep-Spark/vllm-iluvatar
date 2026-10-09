@@ -122,6 +122,8 @@ if TYPE_CHECKING:
     VLLM_ILU_DS4_PREFILL_OPT: bool = False
     VLLM_ILU_DS4_PREFILL_AS_DECODE: bool = False
     VLLM_ILU_DS4_C4A_FUSED_INDEXCOMPRESS: bool = False
+    VLLM_ILU_WO_A_QUANT: str = "marlin"
+    VLLM_ILU_WO_A_MSD_MIN_TOKENS: int = 256
     VLLM_ILU_DS4_MQA_QUANT_TYPE: str = ""
     VLLM_ILU_FUSE_NORM_QUANT: bool = True
     VLLM_ILU_FUSE_MOE_W13: bool = True
@@ -196,6 +198,14 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_DS4_PREFILL_OPT": lambda: (
         _get("VLLM_ILU_DS4_PREFILL_OPT", "VLLM_DS4_PREFILL_OPT", "0").lower()
         in ("1", "true")
+    ),
+    # attn.wo_a grouped BMM backend: marlin | msd | w8a8. Read directly from
+    # os.environ in models/deepseek_v4/attention.py (module-level constant).
+    "VLLM_ILU_WO_A_QUANT": lambda: os.environ.get("VLLM_ILU_WO_A_QUANT", "marlin")
+    .strip()
+    .lower(),
+    "VLLM_ILU_WO_A_MSD_MIN_TOKENS": _int_reader(
+        "VLLM_ILU_WO_A_MSD_MIN_TOKENS", 256, minimum=0
     ),
     # Route DeepSeek-V4 prefill through the per-token *decode* sparse MLA
     # kernel (ds4_flash_mla_with_kvcache) instead of the workspace-gather

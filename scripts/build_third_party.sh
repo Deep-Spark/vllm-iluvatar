@@ -15,7 +15,7 @@
 #   COREX_ARCH / CUDA_ARCH   目标架构,默认 ivcore11
 #   COREX_HOME               corex 工具链路径,默认 /usr/local/corex
 #   SW_HOME                  传递给 ixformer 构建脚本
-#   MAX_JOBS                 并行任务数,默认 nproc
+#   MAX_JOBS                 并行任务数,默认 nproc,再按容器内存上限收敛
 #   SKIP_IXFORMER=1          跳过 ixformer(含其依赖)
 #   SKIP_VLLM=1              跳过 vllm
 set -euo pipefail
@@ -26,6 +26,20 @@ VLLM="${ROOT}/third_party/vllm"
 CUDA_ARCH="${CUDA_ARCH:-${COREX_ARCH:-ivcore11}}"
 COREX_HOME="${COREX_HOME:-/usr/local/corex}"
 MAX_JOBS="${MAX_JOBS:-$(nproc)}"
+
+# 单个 ivcore CUDA 编译单元峰值约 5GiB,IXCI 构建容器是 128 核 / 32GiB,
+# 不按内存上限收敛并行度会在 ninja 起满 job 后被 OOMKill。
+mem_max="$(cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null | head -1 || true)"
+if [[ "${mem_max}" =~ ^[0-9]+$ ]] && (( mem_max < 1 << 62 )); then
+  mem_jobs=$(( mem_max / (5 * 1024 ** 3) ))
+  if (( mem_jobs < 1 )); then
+    mem_jobs=1
+  fi
+  if (( MAX_JOBS > mem_jobs )); then
+    MAX_JOBS="${mem_jobs}"
+  fi
+fi
+echo "==> MAX_JOBS=${MAX_JOBS}"
 
 init_submodules() {
   echo "==> checkout submodule SHAs"

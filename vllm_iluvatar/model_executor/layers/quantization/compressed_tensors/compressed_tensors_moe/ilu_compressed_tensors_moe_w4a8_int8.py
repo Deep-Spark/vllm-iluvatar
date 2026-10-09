@@ -63,6 +63,56 @@ def _get_ilu_output_scale(layer: RoutedExperts) -> float:
     return getattr(layer, "_ilu_output_scale", 1.0)
 
 
+def _unpack_int4(packed: torch.Tensor) -> torch.Tensor:
+    """``(..., L // 2)`` packed INT4 -> ``(..., L)`` sign-extended values.
+
+    Inverse of the nibble packing in ixformer's ``quant_repack_int4``: the last
+    dim is walked in groups of 32 values / 16 bytes, where byte ``j`` holds
+    value ``j`` in the low nibble and value ``j + 16`` in the high nibble.
+    """
+    *lead, half = packed.shape
+    if half % 16:
+        raise ValueError(f"packed last dim {half} must be a multiple of 16")
+    v = packed.reshape(*lead, half // 16, 16).to(torch.int16)
+    low = (v & 0x0F) - ((v & 0x08) << 1)
+    high = v >> 4
+    return torch.cat([low, high], dim=-1).reshape(*lead, half * 2).to(torch.int8)
+
+
+def _pack_int4(values: torch.Tensor) -> torch.Tensor:
+    """``(..., L)`` INT4 values -> ``(..., L // 2)`` packed. Inverse of
+    :func:`_unpack_int4`."""
+    *lead, length = values.shape
+    if length % 32:
+        raise ValueError(f"value last dim {length} must be a multiple of 32")
+    v = values.reshape(*lead, length // 32, 32).to(torch.int16)
+    low, high = v[..., :16], v[..., 16:]
+    packed = ((high & 0x0F) << 4) | (low & 0x0F)
+    packed = torch.where(packed > 127, packed - 256, packed)
+    return packed.reshape(*lead, length // 2).to(torch.int8)
+
+
+def _relayout_int4_tn_to_nn(w_tn: torch.Tensor) -> torch.Tensor:
+    """``(E, n, k // 2)`` TN-packed INT4 -> ``(E, k, n // 2)`` NN-packed.
+
+    Mirrors the ``format[0] == "N"`` branch of ixformer's
+    ``quant_repack_int4``: TN stores the raw ``(n, k)`` values, NN transposes to
+    ``(k, n)`` and applies a 32x32 block swizzle before packing along ``n``.
+    Converted one expert at a time to bound the INT16 scratch.
+    """
+    num_experts, n, half_k = w_tn.shape
+    k = half_k * 2
+    if k % 32 or n % 32:
+        raise ValueError(f"TN->NN relayout needs k={k}, n={n} multiples of 32")
+    out = w_tn.new_empty((num_experts, k, n // 2))
+    for e in range(num_experts):
+        vals = _unpack_int4(w_tn[e]).transpose(0, 1).contiguous()
+        vals = vals.reshape(k // 32, 2, 16, n // 32, 2, 16)
+        vals = vals.permute(0, 4, 2, 3, 1, 5).contiguous().reshape(k, n)
+        out[e] = _pack_int4(vals)
+    return out
+
+
 def _fuse_moe_w13_enabled() -> bool:
     return bool(getattr(envs, "VLLM_ILU_FUSE_MOE_W13", False))
 
@@ -150,8 +200,8 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         self.weight_symmetric = self.weight_quant.symmetric
         self.gemm_format = ilu_params.get("gemm_format", "")
         self.version = ilu_params.get("pack_version", -1)
-        assert self.version == 2, (
-            "IluCompressedTensorsW4A8Int8MoEMethod only supports version 2"
+        assert self.version in (1, 2), (
+            "IluCompressedTensorsW4A8Int8MoEMethod only supports pack_version 1 or 2"
         )
         assert self.gemm_format in ["TN", "NN"], (
             "IluCompressedTensorsW4A8Int8MoEMethod only supports format TN or NN"
@@ -173,6 +223,19 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         # Grow-only buffer for swigluoai_uninterleave (MiniMax-M3); unused by
         # DeepSeek-V4 silu/swiglu paths.
         self._interleave_buf: torch.Tensor | None = None
+
+        # Decode kernel follows the on-disk layout: NN/v1 uses
+        # moe_w4a8_group_gemm(enable_cuda_graph=True); TN/v2 stays on
+        # moe_w4a8_group_gemv. Switch formats with a converted checkpoint, not
+        # a runtime relayout. create_weights keeps the on-disk shapes so
+        # loading is unaffected.
+        self.decode_group_gemm = (
+            self.gemm_format == "NN"
+            and self.version == 1
+            and self.group_size == -1
+            and not self.has_bias
+            and self.weight_symmetric
+        )
 
     def create_weights(
         self,
@@ -711,6 +774,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         num_tokens = topk_ids.shape[0]
         num_experts = layer.global_num_experts
         hidden_size = x.shape[1]
+        decode_gemm = run_decode and getattr(self, "decode_group_gemm", False)
 
         if run_decode:
             (
@@ -764,11 +828,29 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             expand_tokens=expand_tokens,
             sorted_token_ids=sorted_token_ids,
             src_to_dst=src_to_dst,
-            output_format=1 if run_decode else 0,
+            output_format=1 if (run_decode and not decode_gemm) else 0,
             check_valid=run_decode,
         )
 
-        if run_decode:
+        if decode_gemm:
+            act = self._decode_group_gemm(
+                gemm_info=self.gemm1_info,
+                act=act,
+                a_scale=a_scale,
+                weight=layer.w13_weight,
+                w_scales=layer.w13_weight_scale,
+                expert_sizes_gpu=expert_sizes_gpu,
+                rows=expand_tokens,
+                dtype=dtype,
+            )
+            act, a_scale = self._activation_and_quant(
+                layer=layer,
+                input=act,
+                sorted_token_ids=sorted_token_ids,
+                output_format=0,
+                check_valid=True,
+            )
+        elif run_decode:
             fused = self._try_fused_w13_swiglu_quant(
                 layer=layer,
                 act=act,
@@ -830,7 +912,20 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             device=x.device,
             dtype=x.dtype,
         )
-        if run_decode:
+        if decode_gemm:
+            self._decode_group_gemm(
+                gemm_info=self.gemm2_info,
+                act=act,
+                a_scale=a_scale,
+                weight=layer.w2_weight,
+                w_scales=layer.w2_weight_scale,
+                expert_sizes_gpu=expert_sizes_gpu,
+                rows=out.shape[0],
+                dtype=dtype,
+                dst_to_src=sorted_token_ids,
+                output=out,
+            )
+        elif run_decode:
             ixfops.moe_w4a8_group_gemv(
                 input=act,
                 weight=layer.w2_weight,
@@ -899,63 +994,95 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             return_dense_expert_sizes=True,
         )
 
+        decode_gemm = getattr(self, "decode_group_gemm", False)
         act, a_scale = self._expand_and_quant(
             layer=layer,
             input=x,
             expand_tokens=expand_tokens,
             sorted_token_ids=sorted_token_ids,
             src_to_dst=src_to_dst,
-            output_format=1,
+            output_format=0 if decode_gemm else 1,
         )
 
-        fused = self._try_fused_w13_swiglu_quant(
-            layer=layer,
-            act=act,
-            a_scale=a_scale,
-            dense_expert_sizes_gpu=dense_expert_sizes_gpu,
-            aggregate_rows=expand_tokens,
-            sorted_token_ids=sorted_token_ids,
-        )
-        if fused is None:
-            act = ixfops.moe_w4a8_group_gemv(
-                input=act,
+        if decode_gemm:
+            act = self._decode_group_gemm(
+                gemm_info=self.gemm1_info,
+                act=act,
+                a_scale=a_scale,
                 weight=layer.w13_weight,
-                i_scales=a_scale,
                 w_scales=layer.w13_weight_scale,
-                output_dtype=dtype,
-                tokens_per_experts=expert_sizes_gpu,
-                w_i8scales=layer.w13_i8_weight_scale,
-                w_i8zeros=layer.w13_i8_weight_zero,
-                dst_to_src=None,
-                bias=layer.w13_bias,
-                format=self.gemm1_info.format,
-                group_size=self.group_size,
-                dense_tokens_per_experts=dense_expert_sizes_gpu,
+                expert_sizes_gpu=expert_sizes_gpu,
+                rows=expand_tokens,
+                dtype=dtype,
             )
             act, a_scale = self._activation_and_quant(
                 layer=layer,
                 input=act,
                 sorted_token_ids=sorted_token_ids,
-                output_format=1,
+                output_format=0,
             )
         else:
-            act, a_scale = fused
+            fused = self._try_fused_w13_swiglu_quant(
+                layer=layer,
+                act=act,
+                a_scale=a_scale,
+                dense_expert_sizes_gpu=dense_expert_sizes_gpu,
+                aggregate_rows=expand_tokens,
+                sorted_token_ids=sorted_token_ids,
+            )
+            if fused is None:
+                act = ixfops.moe_w4a8_group_gemv(
+                    input=act,
+                    weight=layer.w13_weight,
+                    i_scales=a_scale,
+                    w_scales=layer.w13_weight_scale,
+                    output_dtype=dtype,
+                    tokens_per_experts=expert_sizes_gpu,
+                    w_i8scales=layer.w13_i8_weight_scale,
+                    w_i8zeros=layer.w13_i8_weight_zero,
+                    dst_to_src=None,
+                    bias=layer.w13_bias,
+                    format=self.gemm1_info.format,
+                    group_size=self.group_size,
+                    dense_tokens_per_experts=dense_expert_sizes_gpu,
+                )
+                act, a_scale = self._activation_and_quant(
+                    layer=layer,
+                    input=act,
+                    sorted_token_ids=sorted_token_ids,
+                    output_format=1,
+                )
+            else:
+                act, a_scale = fused
 
-        act = ixfops.moe_w4a8_group_gemv(
-            input=act,
-            weight=layer.w2_weight,
-            i_scales=a_scale,
-            w_scales=layer.w2_weight_scale,
-            output_dtype=dtype,
-            tokens_per_experts=expert_sizes_gpu,
-            w_i8scales=layer.w2_i8_weight_scale,
-            w_i8zeros=layer.w2_i8_weight_zero,
-            dst_to_src=sorted_token_ids,
-            bias=layer.w2_bias,
-            format=self.gemm2_info.format,
-            group_size=self.group_size,
-            dense_tokens_per_experts=dense_expert_sizes_gpu,
-        )
+        if decode_gemm:
+            act = self._decode_group_gemm(
+                gemm_info=self.gemm2_info,
+                act=act,
+                a_scale=a_scale,
+                weight=layer.w2_weight,
+                w_scales=layer.w2_weight_scale,
+                expert_sizes_gpu=expert_sizes_gpu,
+                rows=expand_tokens,
+                dtype=dtype,
+                dst_to_src=sorted_token_ids,
+            )
+        else:
+            act = ixfops.moe_w4a8_group_gemv(
+                input=act,
+                weight=layer.w2_weight,
+                i_scales=a_scale,
+                w_scales=layer.w2_weight_scale,
+                output_dtype=dtype,
+                tokens_per_experts=expert_sizes_gpu,
+                w_i8scales=layer.w2_i8_weight_scale,
+                w_i8zeros=layer.w2_i8_weight_zero,
+                dst_to_src=sorted_token_ids,
+                bias=layer.w2_bias,
+                format=self.gemm2_info.format,
+                group_size=self.group_size,
+                dense_tokens_per_experts=dense_expert_sizes_gpu,
+            )
         act = unpad_tensor(act, self.gemm2_info.get_n(), contiguous=False)
 
         return ixfops.moe_output_reduce_sum(
@@ -1045,6 +1172,48 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         return result
 
     # expand + quant + pad
+    def _decode_group_gemm(
+        self,
+        gemm_info: W4A8GroupGemmInfo,
+        act: torch.Tensor,
+        a_scale: torch.Tensor,
+        weight: torch.Tensor,
+        w_scales: torch.Tensor,
+        expert_sizes_gpu: torch.Tensor,
+        rows: int,
+        dtype: torch.dtype,
+        dst_to_src: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Decode W4A8 GEMM via the CUDA-graph group GEMM.
+
+        Stands in for ``moe_w4a8_group_gemv``: the graph kernel reads the
+        per-expert token counts from device memory, so the whole decode step
+        stays capturable with no host-side shape decision. Requires a native
+        NN/v1 checkpoint, and a pre-allocated output (``enable_cuda_graph``
+        derives its row count from ``output.shape[0]``, i.e. the worst-case
+        ``num_tokens * topk``).
+        """
+        if output is None:
+            output = torch.empty(
+                (rows, gemm_info.get_pad_n()), device=act.device, dtype=dtype
+            )
+        ixfops.moe_w4a8_group_gemm(
+            input=act,
+            weight=weight,
+            i_scales=a_scale.reshape(-1).contiguous(),
+            w_scales=w_scales,
+            output_dtype=dtype,
+            tokens_per_experts=expert_sizes_gpu,
+            dst_to_src=dst_to_src,
+            format=gemm_info.format,
+            version=self.version,
+            group_size=self.group_size,
+            output=output,
+            enable_cuda_graph=True,
+        )
+        return output
+
     def _try_fused_w13_swiglu_quant(
         self,
         layer: RoutedExperts,

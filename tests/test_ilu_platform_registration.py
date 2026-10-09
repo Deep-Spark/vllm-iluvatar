@@ -57,6 +57,7 @@ def test_new_ilu_env_readers_are_registered(monkeypatch):
     monkeypatch.setenv("VLLM_ILU_GDN_ATTN_BACKEND", "0")
     assert registered["VLLM_ILU_GDN_ATTN_BACKEND"]() is False
 
+    assert "VLLM_ILU_MOE_W4A8_DECODE_GEMM" not in registered
     assert "VLLM_GLM52_RMS_ROPE_FP8_KV" not in registered
     assert "VLLM_FUSE_NORM_QUANT" not in registered
     assert "VLLM_FUSE_MOE_W13" not in registered

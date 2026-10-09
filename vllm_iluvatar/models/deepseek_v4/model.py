@@ -107,6 +107,7 @@ from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes
     IluCompressedTensorsW8A8Int8,
 )
 from vllm_iluvatar.models.deepseek_v4.attention import (
+    _WO_A_QUANT,
     IluDeepseekV4Indexer,
     IluDeepseekV4MLAModules,
     IluDeepseekV4MultiHeadLatentAttentionWrapper,
@@ -196,6 +197,10 @@ class IluV4W8A16BMMLinearMethod(LinearMethodBase):
             .contiguous()
         )
         s_grouped = weight_scale.view(n_local_groups, o_lora_rank, 1).contiguous()
+
+        if _WO_A_QUANT in ("msd", "w8a8"):
+            layer.W = weight.view(n_local_groups, o_lora_rank, k_per_group).contiguous()
+            layer.W_scale = weight_scale.view(n_local_groups, o_lora_rank).contiguous()
 
         layer.W_repacked = ixf_ops.marlin_w8_weight_repack(
             weights=w_grouped,

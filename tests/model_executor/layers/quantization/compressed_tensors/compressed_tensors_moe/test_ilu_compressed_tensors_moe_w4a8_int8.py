@@ -6,11 +6,29 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 import torch
+from compressed_tensors.quantization import QuantizationStrategy
 
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
     ilu_compressed_tensors_moe_w4a8_int8 as w4a8_moe,
 )
+
+
+def _make_w4a8_method(gemm_format: str, pack_version: int):
+    return w4a8_moe.IluCompressedTensorsW4A8Int8MoEMethod(
+        weight_quant=SimpleNamespace(
+            group_size=None,
+            strategy=QuantizationStrategy.CHANNEL,
+            symmetric=True,
+        ),
+        input_quant=SimpleNamespace(
+            strategy=QuantizationStrategy.TOKEN,
+            dynamic=True,
+        ),
+        moe=SimpleNamespace(has_bias=False),
+        ilu_params={"gemm_format": gemm_format, "pack_version": pack_version},
+    )
 
 
 def _layer_without_ep_rank():
@@ -123,7 +141,9 @@ def test_w4a8_non_ep_uses_regular_token_index_and_group_gemm(monkeypatch):
     ]
     fake_ixfops.moe_output_reduce_sum.return_value = expected
     monkeypatch.setattr(w4a8_moe, "ixfops", fake_ixfops)
-    monkeypatch.setattr(w4a8_moe, "unpad_tensor", lambda tensor, *_args, **_kwargs: tensor)
+    monkeypatch.setattr(
+        w4a8_moe, "unpad_tensor", lambda tensor, *_args, **_kwargs: tensor
+    )
     layer = _non_ep_layer()
 
     result = method._apply_general(
@@ -170,8 +190,11 @@ def test_w4a8_decode_uses_decode_token_index_and_group_gemv(monkeypatch):
     ]
     fake_ixfops.moe_output_reduce_sum.return_value = expected
     monkeypatch.setattr(w4a8_moe, "ixfops", fake_ixfops)
-    monkeypatch.setattr(w4a8_moe, "unpad_tensor", lambda tensor, *_args, **_kwargs: tensor)
+    monkeypatch.setattr(
+        w4a8_moe, "unpad_tensor", lambda tensor, *_args, **_kwargs: tensor
+    )
     method._try_fused_w13_swiglu_quant = MagicMock(return_value=None)
+    method.decode_group_gemm = False
     layer = _non_ep_layer()
 
     result = method._apply_decode(
@@ -366,3 +389,154 @@ def test_standard_experts_expand_and_act_fuse_k_padding(monkeypatch):
     assert tuple(expand_out.shape) == (16, 256)
     assert act_kw["output_padding"] == 64
     assert tuple(act_out.shape) == (4, 256)
+
+
+def test_w4a8_decode_group_gemm_uses_graph_gemm(monkeypatch):
+    method = w4a8_moe.IluCompressedTensorsW4A8Int8MoEMethod.__new__(
+        w4a8_moe.IluCompressedTensorsW4A8Int8MoEMethod
+    )
+    method.group_size = -1
+    method.version = 1
+    method.decode_group_gemm = True
+    method.gemm1_info = _GemmInfo()
+    method.gemm2_info = _GemmInfo()
+    method._expand_and_quant = MagicMock(
+        return_value=(torch.ones((3, 5), dtype=torch.int8), torch.ones(3))
+    )
+    method._activation_and_quant = MagicMock(
+        return_value=(torch.ones((3, 5), dtype=torch.int8), torch.ones(3))
+    )
+    expected = torch.full((3, 5), 13.0)
+    fake_ixfops = MagicMock()
+    fake_ixfops.moe_compute_token_index_for_decode.return_value = (
+        torch.arange(3),
+        torch.arange(3),
+        torch.ones(1, dtype=torch.int32),
+        torch.ones(1, dtype=torch.int32),
+    )
+    fake_ixfops.moe_output_reduce_sum.return_value = expected
+    monkeypatch.setattr(w4a8_moe, "ixfops", fake_ixfops)
+    monkeypatch.setattr(
+        w4a8_moe, "unpad_tensor", lambda tensor, *_args, **_kwargs: tensor
+    )
+    layer = _non_ep_layer()
+
+    result = method._apply_decode(
+        layer=layer,
+        x=torch.ones((3, 5), dtype=torch.float32),
+        topk_weights=torch.ones((3, 1), dtype=torch.float32),
+        topk_ids=torch.zeros((3, 1), dtype=torch.int32),
+        shared_experts_input=None,
+    )
+
+    assert result is expected
+    assert fake_ixfops.moe_w4a8_group_gemm.call_count == 2
+    fake_ixfops.moe_w4a8_group_gemv.assert_not_called()
+    for call in fake_ixfops.moe_w4a8_group_gemm.call_args_list:
+        assert call.kwargs["enable_cuda_graph"] is True
+        assert call.kwargs["version"] == 1
+    method._expand_and_quant.assert_called_once()
+    assert method._expand_and_quant.call_args.kwargs["output_format"] == 0
+    method._activation_and_quant.assert_called_once()
+    assert method._activation_and_quant.call_args.kwargs["output_format"] == 0
+
+
+def test_native_nn_v1_enables_decode_group_gemm():
+    method = _make_w4a8_method("NN", 1)
+    assert method.version == 1
+    assert method.gemm_format == "NN"
+    assert method.decode_group_gemm is True
+
+
+def test_tn_v2_stays_on_decode_group_gemv():
+    method = _make_w4a8_method("TN", 2)
+    assert method.decode_group_gemm is False
+
+
+def test_nn_v2_and_tn_v1_do_not_enable_decode_group_gemm():
+    nn_v2 = _make_w4a8_method("NN", 2)
+    tn_v1 = _make_w4a8_method("TN", 1)
+    assert nn_v2.decode_group_gemm is False
+    assert tn_v1.decode_group_gemm is False
+
+
+def test_unsupported_pack_version_still_rejected():
+    with pytest.raises(AssertionError, match="pack_version 1 or 2"):
+        _make_w4a8_method("NN", 3)
+
+
+def test_pack_unpack_int4_roundtrip():
+    torch.manual_seed(0)
+    values = torch.randint(-8, 8, (3, 64), dtype=torch.int8)
+    packed = w4a8_moe._pack_int4(values)
+    assert packed.shape[-1] == values.shape[-1] // 2
+    torch.testing.assert_close(w4a8_moe._unpack_int4(packed), values)
+
+
+def test_relayout_int4_tn_to_nn_recovers_values():
+    torch.manual_seed(0)
+    num_experts, n, k = 2, 64, 64
+    values = torch.randint(-8, 8, (num_experts, n, k), dtype=torch.int8)
+    w_tn = torch.stack([w4a8_moe._pack_int4(values[e]) for e in range(num_experts)])
+    w_nn = w4a8_moe._relayout_int4_tn_to_nn(w_tn)
+    assert w_nn.shape == (num_experts, k, n // 2)
+
+    recovered = []
+    for e in range(num_experts):
+        swizzled = w4a8_moe._unpack_int4(w_nn[e])
+        swizzled = swizzled.reshape(k // 32, 2, 16, n // 32, 2, 16)
+        raw = swizzled.permute(0, 4, 2, 3, 1, 5).contiguous().reshape(k, n)
+        recovered.append(raw.transpose(0, 1).contiguous())
+    torch.testing.assert_close(torch.stack(recovered), values)
+
+
+@pytest.mark.parametrize("decode_gemm", [False, True])
+def test_ep_decode_quantizes_activation_once_with_matching_layout(
+    monkeypatch, decode_gemm
+):
+    method = w4a8_moe.IluCompressedTensorsW4A8Int8MoEMethod.__new__(
+        w4a8_moe.IluCompressedTensorsW4A8Int8MoEMethod
+    )
+    method.group_size = -1
+    method.version = 1 if decode_gemm else 2
+    method.decode_group_gemm = decode_gemm
+    method._try_fused_w13_swiglu_quant = MagicMock(return_value=None)
+    method.gemm1_info = _GemmInfo()
+    method.gemm2_info = _GemmInfo()
+    method._expand_and_quant = MagicMock(
+        return_value=(torch.ones((3, 5), dtype=torch.int8), torch.ones(3))
+    )
+    method._activation_and_quant = MagicMock(
+        return_value=(torch.ones((3, 5), dtype=torch.int8), torch.ones(3))
+    )
+    ops = MagicMock()
+    ops.moe_compute_token_index_ep.return_value = (
+        torch.arange(3),
+        torch.arange(3),
+        torch.ones(4, dtype=torch.int32),
+        torch.ones(4, dtype=torch.int32),
+        3,
+        torch.ones(4, dtype=torch.int32),
+    )
+    ops.moe_w4a8_group_gemv.return_value = torch.ones((3, 5))
+    monkeypatch.setattr(w4a8_moe, "ixfops", ops)
+    monkeypatch.setattr(w4a8_moe, "unpad_tensor", lambda tensor, *_a, **_kw: tensor)
+    layer = _non_ep_layer()
+    layer.moe_config.ep_rank = 0
+    method._apply_ep(
+        layer=layer,
+        x=torch.ones((3, 5)),
+        topk_weights=torch.ones((3, 1)),
+        topk_ids=torch.zeros((3, 1), dtype=torch.int32),
+        shared_experts_input=None,
+        run_decode=True,
+    )
+    method._activation_and_quant.assert_called_once()
+    assert method._activation_and_quant.call_args.kwargs["output_format"] == (
+        0 if decode_gemm else 1
+    )
+    assert method._expand_and_quant.call_args.kwargs["output_format"] == (
+        0 if decode_gemm else 1
+    )
+    assert ops.moe_w4a8_group_gemm.call_count == (2 if decode_gemm else 0)
+    assert ops.moe_w4a8_group_gemv.call_count == (0 if decode_gemm else 2)

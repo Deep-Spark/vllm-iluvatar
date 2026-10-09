@@ -17,7 +17,6 @@ from ixformer.inference.functions.qwen38 import (
 )
 from ixformer.inference.functions.qwen38.qsa_common import align_logits_cols
 from torch import nn
-
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm

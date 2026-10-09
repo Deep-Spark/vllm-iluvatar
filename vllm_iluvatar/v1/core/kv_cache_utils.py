@@ -6,13 +6,13 @@ scale) support.
 
 Target   : vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
            vllm.v1.core.kv_cache_utils._pool_bytes_per_block
-Baseline : vllm 0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : Iluvatar attention quantization Int8 support -- for allocating
            KV cache scales and adjusting the num gpu blocks.
 How      : B2 "shared backing buffer": the K-scale storage shares the SAME
            int8 backing allocation as the KV cache. Scale is PER-LAYER --
            each layer in a packed ``KVCacheTensor`` owns its K-scale page
-           (and static V-scale, if any), matching v0.30.0 (ced6857afa)'s ``layers`` packing
+           (and static V-scale, if any), matching v0.31.0 (db9527a468)'s ``layers`` packing
            where every layer has its own KV page. (Earlier ``shared_by``
            meant true byte-sharing, so one scale per tensor sufficed; the
            ``layers`` packing packs same-spec layers each-own-page, so scale must be

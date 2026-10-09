@@ -20,10 +20,10 @@ assigns the arch, so the community path stays untouched for non-ilu models:
 
 ``create_draft_parallel_config`` keeps the draft on a single PP stage: ilu MTP
 drafts are one layer and do not implement ``SupportsPP``. Community
-(``ced6857afa``) already hardcodes ``pipeline_parallel_size=1`` in that
+(v0.31.0) already hardcodes ``pipeline_parallel_size=1`` in that
 function, so no ilu override is needed for it.
 
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 """
 
 from __future__ import annotations

@@ -3,7 +3,6 @@
 
 import torch
 import torch.nn.functional as F
-
 from vllm.model_executor.layers.layernorm import RMSNormGated
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,

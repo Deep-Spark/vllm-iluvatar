@@ -12,7 +12,7 @@ register-time wiring.
 
 Target   : vllm.v1.spec_decode.llm_base_proposer.SpecDecodeBaseProposer.
            model_returns_tuple
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : the ilu GLM-5.2 MTP draft (IluGlmMoeDsaMTPModel) is a DeepSeek-V3.2
            standard MTP whose forward returns (logit_hidden, recycle_hidden);
            the community method only recognises DeepSeekMTPModel, so the tuple

@@ -3,7 +3,7 @@
 
 Corresponds to: vllm/v1/attention/backend.py
 Target   : vllm.v1.attention.backend.CommonAttentionMetadata.token_to_req_indices
-Baseline : current community source (post commit 13e221f8308)
+Baseline : v0.31.0 (db9527a468) (post commit 13e221f8308)
 Why      : Community commit 13e221f8308 ("[Perf] Fuse DSV4.1 input metadata
            preparation with Triton") replaced the ``torch.repeat_interleave``
            per-token→request mapping with a Triton binary-search kernel

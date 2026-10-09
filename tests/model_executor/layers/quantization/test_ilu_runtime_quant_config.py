@@ -13,12 +13,14 @@ from vllm.model_executor import parameter as parameter_module
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.parameter import ModelWeightParameter
 
-from vllm_iluvatar.model_executor.layers.quantization import IluvatarQuantRegistry
+from vllm_iluvatar.model_executor.layers.quantization import (
+    IluvatarQuantRegistry,
+    ilu_fp8,
+)
 from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8 import (
     IluFp8Config,
     IluFp8PerChannelOnlineLinearMethod,
 )
-from vllm_iluvatar.model_executor.layers.quantization import ilu_fp8
 from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime_quant_config import (
     parse_ilu_runtime_quant_config,
 )
@@ -357,9 +359,11 @@ def test_global_ignore_and_unmatched_target_preserve_original_method():
 def test_fp8_factory_rejects_unknown_options():
     payload = _payload()
     payload["config_groups"]["online_fp8"]["iluvatar"]["typo"] = True
-    with set_current_vllm_config(_vllm_config(payload)):
-        with pytest.raises(ValueError, match="unsupported options"):
-            _fp8_config().get_quant_method(_linear(), PREFIX)
+    with (
+        set_current_vllm_config(_vllm_config(payload)),
+        pytest.raises(ValueError, match="unsupported options"),
+    ):
+        _fp8_config().get_quant_method(_linear(), PREFIX)
 
 
 def test_registry_rejects_methods_without_runtime_factory():

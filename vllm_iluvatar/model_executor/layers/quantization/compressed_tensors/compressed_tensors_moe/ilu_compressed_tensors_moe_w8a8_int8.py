@@ -10,6 +10,7 @@ from compressed_tensors.quantization import (
     QuantizationStrategy,
 )
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoeWeightScaleSupported,
     RoutedExperts,
@@ -31,7 +32,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kInt8StaticChannelSym,
 )
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.logger import init_logger
 
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_decode_metadata import (
     _ensure_cuda_graph_safe_dispatch,
@@ -43,7 +43,6 @@ from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_uti
 )
 
 logger = init_logger(__name__)
-
 
 
 def _get_ilu_output_scale(layer: RoutedExperts) -> float:

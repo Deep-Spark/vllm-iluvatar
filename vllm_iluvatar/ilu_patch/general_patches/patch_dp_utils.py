@@ -7,7 +7,7 @@ Corresponds to: vllm/v1/worker/dp_utils.py
 Target   : vllm.v1.worker.dp_utils.coordinate_batch_across_dp
            vllm.forward_context.DPMetadata.make
            vllm.forward_context.set_forward_context
-Baseline : v0.30.0 runtime source
+Baseline : v0.31.0 (db9527a468) runtime source
 Why      : hybrid DeepSeek-V4 EP may switch decode to LL only when every DP
            rank is decode-only; otherwise collective paths can diverge.
 How      : coordinate_batch_across_dp is a full-function copy with optional
@@ -33,7 +33,7 @@ from vllm_iluvatar.ilu_patch import general_patch as p
 
 # Verbatim community-baseline source of
 # vllm.v1.worker.dp_utils.coordinate_batch_across_dp, used as the drift anchor.
-# Baseline: v0.30.0 runtime source (adds should_skip_dp_coordination() early exit).
+# Baseline: v0.31.0 runtime source (adds should_skip_dp_coordination() early exit).
 COORDINATE_BATCH_ACROSS_DP = '''\
 def coordinate_batch_across_dp(
     num_tokens_unpadded: int,
@@ -43,8 +43,7 @@ def coordinate_batch_across_dp(
     uniform_decode: bool | None = None,
     cudagraph_mode: int = 0,
 ) -> tuple[bool, torch.Tensor | None, int]:
-    """
-    Coordinates amongst all DP ranks to determine if and how the full batch
+    """Coordinates amongst all DP ranks to determine if and how the full batch
     should be split into microbatches.
 
     Args:

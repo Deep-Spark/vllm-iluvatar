@@ -5,7 +5,7 @@ Corresponds to: vllm/model_executor/models/qwen3_moe.py
 
 Target   : vllm.model_executor.models.qwen3_moe.Qwen3MoeForCausalLM (arch
            "Qwen3MoeForCausalLM")
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : The fork replaces the two separate q_norm/k_norm passes in
            ``Qwen3MoeAttention.forward`` with one fused q/k RMSNorm, and keeps the MoE
            router gate unquantized by constructing it with ``quant_config=None``.

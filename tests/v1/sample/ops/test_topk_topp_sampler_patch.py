@@ -13,11 +13,9 @@ import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
-
 _IMPL_NAME = "vllm_iluvatar.v1.sample.ops.topk_topp_sampler"
 _IMPL_PATH = (
-    Path(__file__).parents[4]
-    / "vllm_iluvatar/v1/sample/ops/topk_topp_sampler.py"
+    Path(__file__).parents[4] / "vllm_iluvatar/v1/sample/ops/topk_topp_sampler.py"
 )
 
 
@@ -53,9 +51,7 @@ def _install_fake_vllm(monkeypatch, *, is_cpu: bool) -> ModuleType:
     monkeypatch.setitem(sys.modules, "vllm.v1", v1)
     monkeypatch.setitem(sys.modules, "vllm.v1.sample", sample)
     monkeypatch.setitem(sys.modules, "vllm.v1.sample.ops", ops)
-    monkeypatch.setitem(
-        sys.modules, "vllm.v1.sample.ops.topk_topp_sampler", community
-    )
+    monkeypatch.setitem(sys.modules, "vllm.v1.sample.ops.topk_topp_sampler", community)
 
     vllm.platforms = platforms
     vllm.v1 = v1
@@ -95,9 +91,7 @@ def test_ilu_override_gpu_uses_pytorch_fallback(monkeypatch):
         calls.append(("pytorch", args, kwargs))
         return "pytorch"
 
-    monkeypatch.setattr(
-        impl, "current_platform", SimpleNamespace(is_cpu=lambda: False)
-    )
+    monkeypatch.setattr(impl, "current_platform", SimpleNamespace(is_cpu=lambda: False))
     monkeypatch.setattr(impl._community, "HAS_TRITON", True)
     monkeypatch.setattr(impl._community, "apply_top_k_top_p_triton", triton)
     monkeypatch.setattr(impl._community, "apply_top_k_top_p_pytorch", pytorch)
@@ -121,9 +115,7 @@ def test_ilu_override_preserves_cpu_triton_path(monkeypatch):
         calls.append(("pytorch", args, kwargs))
         return "pytorch"
 
-    monkeypatch.setattr(
-        impl, "current_platform", SimpleNamespace(is_cpu=lambda: True)
-    )
+    monkeypatch.setattr(impl, "current_platform", SimpleNamespace(is_cpu=lambda: True))
     monkeypatch.setattr(impl._community, "HAS_TRITON", True)
     monkeypatch.setattr(impl._community, "apply_top_k_top_p_triton", triton)
     monkeypatch.setattr(impl._community, "apply_top_k_top_p_pytorch", pytorch)

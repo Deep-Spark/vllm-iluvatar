@@ -8,6 +8,7 @@ dispatch across the plugin should go through this module instead of importing
 The ``ixformer`` import is kept inside the function body so that importing
 this module at auto-discovery time never pulls in ixformer eagerly.
 """
+
 from __future__ import annotations
 
 IVCORE30 = "ivcore30"
@@ -24,6 +25,7 @@ def cuda_arch() -> str | None:
         _resolved = True
         try:
             from ixformer import cuda
+
             _cuda_arch = cuda.cuda_arch
         except ImportError:
             _cuda_arch = None

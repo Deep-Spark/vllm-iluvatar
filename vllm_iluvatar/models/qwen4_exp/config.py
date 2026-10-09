@@ -268,11 +268,12 @@ def _register_configs() -> None:
 
     Both are idempotent, so importing this module twice is harmless.
 
-    v0.30.0: upstream vLLM now ships its own ``vllm.models.qwen4_exp`` config
-    (``Qwen4ExpConfig``/``Qwen4ExpTextConfig``) and pre-registers both keys in
-    ``_CONFIG_REGISTRY``. The ILU plugin's model implementation consumes the
-    ILU config subclass, so the plugin must *override* (not merely ``setdefault``)
-    both registries to keep its config -- and the model that depends on it -- the
+    v0.31.0: upstream vLLM ships its own ``vllm.models.qwen4_exp`` config
+    (``Qwen4ExpConfig``/``Qwen4ExpTextConfig``) and
+    pre-registers both keys in ``_CONFIG_REGISTRY``. The ILU plugin's model
+    implementation consumes the ILU config subclass, so the plugin must
+    *override* (not merely ``setdefault``) both registries to keep its config
+    -- and the model that depends on it -- the
     canonical one for ``model_type = "qwen4_exp"``.
     """
     from transformers import AutoConfig

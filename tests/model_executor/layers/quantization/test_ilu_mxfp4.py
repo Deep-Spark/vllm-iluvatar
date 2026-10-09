@@ -151,9 +151,7 @@ def test_process_weights_preprocesses_ixmm_layout(monkeypatch):
         expert, out_dim, packed_k = weight.shape
         return (
             torch.zeros(expert, packed_k, out_dim, dtype=torch.uint8),
-            torch.ones(
-                expert, (packed_k * 2) // 256, out_dim, dtype=torch.float32
-            ),
+            torch.ones(expert, (packed_k * 2) // 256, out_dim, dtype=torch.float32),
         )
 
     fake_ixfops.preprocess_weight_for_ixmm.side_effect = _preprocess

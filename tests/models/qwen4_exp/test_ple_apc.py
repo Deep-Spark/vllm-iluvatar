@@ -120,7 +120,7 @@ def test_mamba_copy_funcs_are_only_called_on_model_instances() -> None:
             ):
                 call_lines.append(line.strip())
 
-    # v0.30.0 routes through a cached ``_get_mamba_state_copy_funcs()`` wrapper;
+    # v0.31.0 routes through a cached ``_get_mamba_state_copy_funcs()`` wrapper;
     # the only direct model-instance call sites are that wrapper's body (one in
     # gpu_model_runner, one in the mamba_hybrid model state).
     direct = [ln for ln in call_lines if "self.model.get_mamba_state_copy_funcs(" in ln]

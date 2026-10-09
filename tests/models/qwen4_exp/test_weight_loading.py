@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
-
 from vllm.model_executor.models.qwen3_vl import Qwen3_VisionTransformer
+
 from vllm_iluvatar.models.qwen4_exp.model import (
     Qwen4ExpForConditionalGeneration,
     Qwen4ExpModel,
@@ -141,62 +141,11 @@ def test_only_qsa_main_cache_scales_move_to_the_merged_owner(
     assert _remap_qsa_cache_scale_name(checkpoint_name, frozenset({0})) == model_name
 
 
-@pytest.mark.parametrize(
-    ("checkpoint_name", "model_name"),
-    [
-        ("mtp.fc_embedding.weight", "model.fc_embedding.weight"),
-        (
-            "model.mtp.layers.0.self_attn.q_proj.weight",
-            "model.layers.0.self_attn.q_proj.weight",
-        ),
-        (
-            "model.language_model.mtp.pre_fc_norm_hidden.weight",
-            "model.pre_fc_norm_hidden.weight",
-        ),
-        ("model.shared_head.head.weight", "lm_head.weight"),
-        (
-            "language_model.model.shared_head.head.weight",
-            "lm_head.weight",
-        ),
-        (
-            "model.language_model.model.embed_tokens.weight",
-            "model.embed_tokens.weight",
-        ),
-        (
-            "model.language_model.embed_tokens.weight",
-            "model.embed_tokens.weight",
-        ),
-        (
-            "language_model.embed_tokens.weight",
-            "model.embed_tokens.weight",
-        ),
-        (
-            "model.language_model.shared_head.head.weight",
-            "lm_head.weight",
-        ),
-        (
-            "model.language_model.model.lm_head.weight",
-            "lm_head.weight",
-        ),
-        (
-            "model.language_model.mtp.layers.0.mlp.experts.gate_up_proj",
-            "model.layers.0.mlp.experts.gate_up_proj",
-        ),
-        ("model.language_model.layers.0.mlp.down_proj.weight", None),
-    ],
-)
-@pytest.mark.skip(reason="Qwen4Exp MTP weight remapping is gated off")
-def test_qwen4_exp_mtp_weight_name_mapping(
-    checkpoint_name: str,
-    model_name: str | None,
-) -> None:
-    assert _remap_mtp_weight_name(checkpoint_name) == model_name
-
-
 def test_ple_backbone_only_skips_ple_weight_names() -> None:
     from types import SimpleNamespace
 
     from vllm.model_executor.models.utils import WeightsMapper
+
     from vllm_iluvatar.models.qwen4_exp.model import _ple_skip_substrs
 
     assert _ple_skip_substrs(SimpleNamespace(ple_layer_ids=[2])) == ()

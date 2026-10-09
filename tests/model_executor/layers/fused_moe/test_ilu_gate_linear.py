@@ -49,18 +49,20 @@ def _fake_community_gate_init(self, *args, **kwargs) -> None:
 
 
 def test_gate_linear_keeps_community_dispatch_flags_after_init():
-    with patch(
-        "vllm.model_executor.layers.fused_moe.router.gate_linear.current_platform",
-        _CudaLikePlatform(),
+    with (
+        patch(
+            "vllm.model_executor.layers.fused_moe.router.gate_linear.current_platform",
+            _CudaLikePlatform(),
+        ),
+        patch.object(GateLinear, "__init__", _fake_community_gate_init),
     ):
-        with patch.object(GateLinear, "__init__", _fake_community_gate_init):
-            gate = GateLinear(
-                input_size=3072,
-                output_size=256,
-                bias=False,
-                out_dtype=torch.float32,
-                params_dtype=torch.float32,
-            )
+        gate = GateLinear(
+            input_size=3072,
+            output_size=256,
+            bias=False,
+            out_dtype=torch.float32,
+            params_dtype=torch.float32,
+        )
 
     assert isinstance(gate, IluGateLinear)
     assert gate.allow_specialized_router_gemm is True
@@ -70,17 +72,19 @@ def test_gate_linear_keeps_community_dispatch_flags_after_init():
 
 
 def test_gate_linear_set_out_dtype_keeps_community_flag_behavior():
-    with patch(
-        "vllm.model_executor.layers.fused_moe.router.gate_linear.current_platform",
-        _CudaLikePlatform(),
+    with (
+        patch(
+            "vllm.model_executor.layers.fused_moe.router.gate_linear.current_platform",
+            _CudaLikePlatform(),
+        ),
+        patch.object(GateLinear, "__init__", _fake_community_gate_init),
     ):
-        with patch.object(GateLinear, "__init__", _fake_community_gate_init):
-            gate = GateLinear(
-                input_size=3072,
-                output_size=256,
-                bias=False,
-                params_dtype=torch.bfloat16,
-            )
+        gate = GateLinear(
+            input_size=3072,
+            output_size=256,
+            bias=False,
+            params_dtype=torch.bfloat16,
+        )
 
     gate.set_out_dtype(torch.float32)
 
@@ -107,13 +111,15 @@ def test_gate_linear_fallback_calls_replicated_linear_directly():
         calls.append((self, input_))
         return "fallback-output", "fallback-bias"
 
-    with patch.object(
-        GateLinear,
-        "forward",
-        side_effect=AssertionError("GateLinear.forward should not be re-entered"),
+    with (
+        patch.object(
+            GateLinear,
+            "forward",
+            side_effect=AssertionError("GateLinear.forward should not be re-entered"),
+        ),
+        patch.object(ReplicatedLinear, "forward", fake_replicated_forward),
     ):
-        with patch.object(ReplicatedLinear, "forward", fake_replicated_forward):
-            assert gate.forward(x) == ("fallback-output", "fallback-bias")
+        assert gate.forward(x) == ("fallback-output", "fallback-bias")
 
     assert calls == [(gate, x)]
 

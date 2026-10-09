@@ -27,10 +27,10 @@ def test_format_identity_includes_version():
 
 
 def test_wrap_collect_env_appends_plugin_identity():
-    mod = SimpleNamespace(get_vllm_version=lambda: "0.27.1 [main] abc")
+    mod = SimpleNamespace(get_vllm_version=lambda: "0.31.0 [main] abc")
     _wrap_collect_env(mod)
     out = mod.get_vllm_version()
-    assert out.startswith("0.27.1")
+    assert out.startswith("0.31.0")
     assert "vllm_iluvatar" in out
     assert format_identity() in out
     assert mod.get_vllm_version().count("vllm_iluvatar") == 1
@@ -48,6 +48,6 @@ def test_wrap_log_version_and_model_logs_plugin_line():
 
     mod = SimpleNamespace(log_version_and_model=orig)
     _wrap_log_version_and_model(mod)
-    mod.log_version_and_model(_Lgr(), "0.27.1", "llama")
-    assert recorded[0].startswith("vLLM server version 0.27.1")
+    mod.log_version_and_model(_Lgr(), "0.31.0", "llama")
+    assert recorded[0].startswith("vLLM server version 0.31.0")
     assert recorded[1] == f"vllm_iluvatar {format_identity()}"

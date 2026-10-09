@@ -97,7 +97,7 @@ class IluDSparkDeepseekV4Model(nn.Module):
     """Iluvatar DeepSeek-V4 backbone used by the DSpark draft."""
 
     # Ported from vllm/models/deepseek_v4/nvidia/dspark.py:57-198 at
-    # v0.30.0 (ced6857afa), with the Iluvatar substitutions documented above.
+    # v0.31.0 (db9527a468), with the Iluvatar substitutions documented above.
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None
@@ -280,7 +280,7 @@ class IluDSparkDeepseekV4ForCausalLM(nn.Module):
     draft_id_to_target_id = None
 
     # Ported from vllm/models/deepseek_v4/nvidia/dspark.py:268-344 at
-    # v0.30.0 (ced6857afa), with the Iluvatar backbone and loader below.
+    # v0.31.0 (db9527a468), with the Iluvatar backbone and loader below.
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None

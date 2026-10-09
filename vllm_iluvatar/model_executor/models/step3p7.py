@@ -5,7 +5,7 @@ Corresponds to: vllm/model_executor/models/step3p7.py
 
 Target   : vllm.model_executor.models.step3p7.Step3p7ForConditionalGeneration
            (arch "Step3p7ForConditionalGeneration")
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : Step-3.7 nests ``Step3p7TextConfig`` (model_type step3p5) without
            ``tie_word_embeddings``. Community ``Step3p5Model`` reads that field when
            building PP embeddings. The language tower is constructed with

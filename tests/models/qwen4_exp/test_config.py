@@ -6,10 +6,10 @@ from unittest.mock import patch
 
 import pytest
 import torch
-
-from vllm.config.compilation import CUDAGraphMode, CompilationMode
+from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.config.speculative import SpeculativeConfig
 from vllm.transformers_utils.config import get_config
+
 from vllm_iluvatar.models.qwen4_exp.config import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
@@ -229,6 +229,7 @@ def test_qwen4_exp_registers_v2_model_state() -> None:
 
 def test_qwen4_exp_uses_local_moe_metadata() -> None:
     from vllm.model_executor.models.qwen3_next import QwenNextMixtureOfExperts
+
     from vllm_iluvatar.models.qwen4_exp.model import (
         Qwen4ExpDecoderLayer,
         Qwen4ExpMixtureOfExperts,

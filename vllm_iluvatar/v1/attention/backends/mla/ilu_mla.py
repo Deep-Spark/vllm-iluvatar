@@ -114,10 +114,12 @@ class IluMLACommonMetadataBuilder(MLACommonMetadataBuilder):
         query_start_loc_cpu: torch.Tensor,
         query_start_loc_device: torch.Tensor,
         num_decode_tokens: int,
+        max_query_len: int,
         dcp_tot_seq_lens_device: torch.Tensor | None,
     ) -> IluMLACommonDecodeMetadata:
         del max_seq_len
         del query_start_loc_device
+        del max_query_len
 
         num_decodes = block_table_tensor.shape[0]
         decode_block_table = block_table_tensor

@@ -4,7 +4,7 @@
 Corresponds to: vllm/v1/engine/core.py
 Target   : DPEngineCoreProc.{
            _should_throttle_prefills,_process_engine_step,_handle_client_request}
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : Align replacement prefills across DP ranks before EP execution and
            avoid entering a dummy batch during the short replacement round trip.
            The patch is installed only when VLLM_ILU_DP_ENABLE_SYNC_PREFILLS
@@ -48,7 +48,6 @@ def _should_throttle_prefills(self) -> bool:
 PROCESS_ENGINE_STEP = '''\
 def _process_engine_step(self) -> bool:
     """Called only when there are unfinished local requests."""
-
     # Step the engine core.
     outputs, model_executed = self.step_fn()
     # Put EngineCoreOutputs into the output queue.

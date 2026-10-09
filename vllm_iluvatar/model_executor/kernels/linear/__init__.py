@@ -12,7 +12,6 @@ from vllm.model_executor.kernels.linear import (
 from vllm.model_executor.kernels.linear import (
     choose_mp_linear_kernel as _community_choose_mp_linear_kernel,
 )
-from vllm.platforms import current_platform
 
 from vllm_iluvatar.model_executor.kernels.linear.mixed_precision.ilu_gptq_marlin import (
     IluGPTQMarlinLinearKernel,

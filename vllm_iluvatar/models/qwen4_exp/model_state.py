@@ -27,7 +27,6 @@ from ixformer.inference.functions.qwen38 import (
     qwen_mamba_align_postcopy,
     qwen_mamba_align_precopy,
 )
-
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
@@ -137,9 +136,9 @@ class Qwen4ExpModelState(MambaHybridModelState):
         if not indexers:
             return None
         head_dims = {int(indexer.index_head_dim) for indexer in indexers}
-        assert (
-            len(head_dims) == 1
-        ), f"Qwen4Exp QSA layers must share one indexer head dim, got {head_dims}"
+        assert len(head_dims) == 1, (
+            f"Qwen4Exp QSA layers must share one indexer head dim, got {head_dims}"
+        )
         carry = QSAPoolCarry(
             acc=torch.zeros(
                 (len(indexers), self.max_num_reqs, head_dims.pop()),

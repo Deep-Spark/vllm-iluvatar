@@ -8,7 +8,7 @@ and signature checks live in
 ``register_general``.
 
 Target   : vllm.v1.worker.dp_utils.coordinate_batch_across_dp
-Baseline : v0.30.0 runtime source
+Baseline : v0.31.0 (db9527a468) runtime source
 Why      : DeepSeek-V4 hybrid DP+EP must know whether every DP rank is in
            decode-only mode before switching decode to the LL collective path.
            The same coordination also disables CUDA graph replay when any DP
@@ -178,7 +178,7 @@ def coordinate_batch_across_dp(
     assert num_tokens_pre_cudagraph_padding >= num_tokens_unpadded
     # <<< ILU MODIFICATION <<<
 
-    # >>> ILU MODIFICATION — mirror the community 0.30.0 skip_dp_coordination
+    # >>> ILU MODIFICATION — mirror the community 0.31.0 skip_dp_coordination
     # early exit. No all-reduce runs here, so all_ranks_decode_only stays as
     # the local uniform_decode value; publish it and honor the opt-in 4-value
     # return contract the same way as the DP-size-1 early exit above.

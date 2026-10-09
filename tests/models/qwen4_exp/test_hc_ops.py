@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
-
 from conftest import requires_cuda
+
 from vllm_iluvatar.models.qwen4_exp.hc import (
     grouped_gemma_rmsnorm,
     hc_combine,

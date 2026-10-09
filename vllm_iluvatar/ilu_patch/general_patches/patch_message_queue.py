@@ -7,7 +7,7 @@ Corresponds to: vllm/distributed/device_communicators/shm_broadcast.py
 ILU general-plugins patch, auto-discovered during ``register_general``.
 
 Target   : MessageQueue.__init__ default max_chunks
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : Community default max_chunks=10. With PP, EngineCore fills
            batch_queue to pp_size and enqueues execute_model + sample_tokens
            per batch (2 RPCs). For tp1pp16 that is ~32 in-flight broadcast

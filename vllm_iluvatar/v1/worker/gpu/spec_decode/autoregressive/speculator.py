@@ -20,7 +20,7 @@ copy into persistent buffers) and an eager tail (``_generate_draft_tail``:
 in ``__init__`` (regular pool, before any graph pool), so their addresses are
 stable across capture and replay; no graph-pool tensor is held past capture.
 
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 """
 
 from __future__ import annotations
@@ -30,7 +30,6 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
-
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     update_draft_inputs,

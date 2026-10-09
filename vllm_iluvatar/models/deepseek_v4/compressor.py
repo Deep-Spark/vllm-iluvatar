@@ -9,7 +9,7 @@ binding) lives in
 ``register_general``.
 
 Target   : vllm.models.deepseek_v4.compressor.CompressorStateCache.get_kv_cache_spec
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : The community ``get_kv_cache_spec`` uses an ``alignment`` kwarg
            tied to the fp8_ds_mla paged layout; the Iluvatar bf16 path needs a
            different block_size derivation and no alignment constraint.
@@ -30,11 +30,14 @@ SlidingWindowMLASpec = None
 # different block_size derivation (fp8: 16384-byte bucket alignment;
 # bf16: 2x default) and drops the ``alignment`` kwarg entirely.
 def _ilu_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-    is_fp8 = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
-    block_size = 16384 // (self.state_dim * 4) if is_fp8 else self.block_size * 2
+    uses_fp8_ds_mla_layout = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+    block_size = (
+        16384 // (self.state_dim * 4) if uses_fp8_ds_mla_layout else self.block_size * 2
+    )
     return SlidingWindowMLASpec(
         block_size=block_size,
         num_kv_heads=1,
+        max_tp_shards=1,
         head_size=self.state_dim,
         dtype=self.dtype,
         sliding_window=self.sliding_window,

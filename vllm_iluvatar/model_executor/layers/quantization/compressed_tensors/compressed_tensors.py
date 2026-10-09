@@ -4,7 +4,7 @@
 Corresponds to: vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py
 
 Target   : Replace CompressedTensorsConfig with IluQuantConfig
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : Official CompressedTensors standards cannot cover
            distribution specific quantization implementations.
 How      : IluQuantConfig extends the CompressedTensorsConfig and

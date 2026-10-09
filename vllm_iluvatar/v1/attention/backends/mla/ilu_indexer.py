@@ -897,6 +897,7 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             padded_num_tokens = common_attn_metadata.slot_mapping.shape[0]
             get_compressed_slot_mapping(
                 common_attn_metadata.num_actual_tokens,
+                common_attn_metadata.slot_mapping,
                 common_attn_metadata.query_start_loc,
                 common_attn_metadata.seq_lens,
                 common_attn_metadata.block_table_tensor.clamp(min=0),

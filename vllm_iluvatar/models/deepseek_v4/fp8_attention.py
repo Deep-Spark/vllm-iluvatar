@@ -119,7 +119,7 @@ class IluDeepseekV4Fp8IndexerCache(nn.Module, AttentionLayerBase):
         compilation_config.static_forward_context[prefix] = self
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
-        # vLLM v0.30.0 (ced6857afa) KV-cache layout: allocate_kv_cache binds a 4D
+        # vLLM v0.31.0 (db9527a468) KV-cache layout: allocate_kv_cache binds a 4D
         # [B, H=1, N, C] tensor; squeeze the singleton head dim -> 3D [B, N, C]
         # as required by the ilu ixformer indexer kernels (ndim 2 or 3 only).
         self.kv_cache = kv_cache.squeeze(1)
@@ -620,7 +620,7 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
         return self.use_fp8_ds_mla_layout
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
-        # vLLM v0.30.0 (ced6857afa) KV-cache layout: allocate_kv_cache binds a 4D
+        # vLLM v0.31.0 (db9527a468) KV-cache layout: allocate_kv_cache binds a 4D
         # [B, H=1, N, C] tensor; squeeze the singleton head dim -> 3D [B, N, C]
         # as required by the ilu ixformer attention kernels (ndim 2 or 3 only).
         self.kv_cache = kv_cache.squeeze(1)

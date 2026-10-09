@@ -3,7 +3,7 @@
 
 Corresponds to: vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/*
 Target   : W4A8 batched expert kernel for Iluvatar MoE.
-Baseline : v0.30.0 (ced6857afa) plugin runtime source
+Baseline : v0.31.0 (db9527a468) plugin runtime source
 Why      : Iluvatar DP+EP MoE uses ixformer grouped kernels and fork metadata
            for W4A8 expert dispatch.
 How      : subclass ``BaseBatchExperts`` and route W4A8 compute through ixformer

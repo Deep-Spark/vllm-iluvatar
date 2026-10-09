@@ -14,7 +14,6 @@ from ixformer.inference.functions.qwen38 import (
     qwen_qsa_sparse_paged_fmha_prefill,
 )
 from torch import nn
-
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -43,7 +42,6 @@ from vllm.v1.attention.backend import (
     AttentionType,
     MultipleOf,
 )
-from vllm.v1.attention.backends.fa_utils import is_flash_attn_varlen_func_available
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
     FlashAttentionImpl,

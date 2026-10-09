@@ -3,7 +3,7 @@
 
 Corresponds to: vllm/model_executor/warmup/jit_warmup_triton_helper.py
 Target   : vllm.model_executor.warmup.jit_warmup_triton_helper._triton_key_deriver
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : The CoreX (Iluvatar) Triton build extends
            ``triton.runtime.jit.compute_cache_key`` with an extra required
            ``backend`` positional argument

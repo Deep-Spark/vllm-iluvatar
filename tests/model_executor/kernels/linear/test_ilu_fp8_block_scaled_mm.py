@@ -42,6 +42,7 @@ from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_kernel(gn: int, gk: int, out_dtype: torch.dtype) -> IluFp8BlockScaledMMKernel:
     k = IluFp8BlockScaledMMKernel.__new__(IluFp8BlockScaledMMKernel)
     k.weight_group_shape = (gn, gk)
@@ -59,6 +60,7 @@ def _make_layer(weight: torch.Tensor, block_scale: torch.Tensor) -> torch.nn.Mod
 # ---------------------------------------------------------------------------
 # process_weights_after_loading: block -> per-channel requant (op call contract)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("scale_dtype", [torch.float32, torch.float8_e8m0fnu])
 def test_process_weights_after_loading_calls_requant_op(monkeypatch, scale_dtype):
@@ -92,9 +94,7 @@ def test_process_weights_after_loading_calls_requant_op(monkeypatch, scale_dtype
         out_scale = torch.arange(w.shape[0], dtype=torch.float32, device=w.device)
         return fp8_output, out_scale
 
-    monkeypatch.setattr(
-        ixfops, "fp8_weight_block_to_channel_requant", fake_requant
-    )
+    monkeypatch.setattr(ixfops, "fp8_weight_block_to_channel_requant", fake_requant)
 
     layer = _make_layer(weight, block_scale)
     orig_weight = layer.weight
@@ -136,9 +136,7 @@ def test_process_weights_after_loading_skips_bmm_layer(monkeypatch):
     def boom(*args, **kwargs):
         raise AssertionError("requant op must not be called for is_bmm layers")
 
-    monkeypatch.setattr(
-        ixfops, "fp8_weight_block_to_channel_requant", boom
-    )
+    monkeypatch.setattr(ixfops, "fp8_weight_block_to_channel_requant", boom)
 
     N, K, gn, gk = 256, 256, 128, 128
     nb, kb = (N + gn - 1) // gn, (K + gk - 1) // gk
@@ -196,9 +194,7 @@ def test_process_weights_after_loading_bmm_layer_builds_grouped_views(
         out_scale = torch.arange(w.shape[0], dtype=torch.float32, device=w.device)
         return fp8_output, out_scale
 
-    monkeypatch.setattr(
-        ixfops, "fp8_weight_block_to_channel_requant", fake_requant
-    )
+    monkeypatch.setattr(ixfops, "fp8_weight_block_to_channel_requant", fake_requant)
 
     layer = _make_layer(weight, block_scale)
     layer.is_bmm = True
@@ -241,7 +237,9 @@ def test_process_weights_after_loading_k_not_multiple_of_64_raises(monkeypatch):
     )
     N, K, gn, gk = 128, 100, 128, 128  # K=100 is not a multiple of 64
     weight = torch.zeros(N, K, dtype=torch.float8_e4m3fn)
-    block_scale = torch.ones((N + gn - 1) // gn, (K + gk - 1) // gk, dtype=torch.float32)
+    block_scale = torch.ones(
+        (N + gn - 1) // gn, (K + gk - 1) // gk, dtype=torch.float32
+    )
     layer = _make_layer(weight, block_scale)
     kernel = _make_kernel(gn, gk, torch.bfloat16)
 
@@ -252,6 +250,7 @@ def test_process_weights_after_loading_k_not_multiple_of_64_raises(monkeypatch):
 # ---------------------------------------------------------------------------
 # apply_block_scaled_mm: ixformer per-channel path (mocked)
 # ---------------------------------------------------------------------------
+
 
 def test_apply_block_scaled_mm_per_channel_path(monkeypatch):
     import ixformer.inference.functions as ixfops
@@ -270,9 +269,7 @@ def test_apply_block_scaled_mm_per_channel_path(monkeypatch):
         m, n = A.shape[0], B.shape[0]
         return torch.full((m, n), 2.0, dtype=torch.bfloat16, device=A.device)
 
-    monkeypatch.setattr(
-        ixfops, "fp8_per_token_dynamic_scaled", fake_quant
-    )
+    monkeypatch.setattr(ixfops, "fp8_per_token_dynamic_scaled", fake_quant)
     monkeypatch.setattr(ixfops, "fp8_per_channel_mm", fake_mm)
 
     M, N, K = 4, 8, 128
@@ -300,6 +297,7 @@ def test_apply_block_scaled_mm_per_channel_path(monkeypatch):
 # ---------------------------------------------------------------------------
 # is_supported arch gate (on-device)
 # ---------------------------------------------------------------------------
+
 
 @requires_cuda
 def test_is_supported_true_on_device(cuda_device, monkeypatch):

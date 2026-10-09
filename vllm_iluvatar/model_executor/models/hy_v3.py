@@ -5,7 +5,7 @@ Corresponds to: vllm/model_executor/models/hy_v3.py
 
 Target   : vllm.model_executor.models.hy_v3.HYV3ForCausalLM (arch
            "HYV3ForCausalLM")
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : the only Iluvatar delta vs community is fusing the two separate
            q_norm/k_norm passes into one fused q/k RMSNorm (ixformer
            rms_norm_qk).  The MoE router optionally runs bf16 to match the

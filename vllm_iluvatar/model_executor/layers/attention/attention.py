@@ -2,7 +2,7 @@
 """CoreX compatibility wrappers for :mod:`vllm` attention layers.
 
 Corresponds to: vllm/model_executor/layers/attention/attention.py
-Baseline     : v0.30.0 (ced6857afa)
+Baseline     : v0.31.0 (db9527a468)
 """
 
 from __future__ import annotations

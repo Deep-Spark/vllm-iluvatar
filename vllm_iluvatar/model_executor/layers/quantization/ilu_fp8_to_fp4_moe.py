@@ -6,7 +6,7 @@ Corresponds to: ``vllm/model_executor/layers/quantization/fp8.py::Fp8MoEMethod``
 
 Target   : ``additional_config.ilu_quant`` groups whose weights contract is
            ``fp8-block -> ix30-fp4`` @ ``transform`` + ``weight_load``.
-Baseline : main_9c12a81ac
+Baseline : v0.31.0 (db9527a468)
 Why      : ``IluFp8MoEMethod`` keeps the full FP8 routed-expert weights
            resident until ``process_weights_after_loading``, then converts
            them to ix30 FP4 in one pass. For GLM-5.2 that means every rank

@@ -26,3 +26,6 @@ arange = "arange"
 # projects to it and ``split_ba`` splits it into the ``b`` and ``a`` gates. Not
 # a typo of ``by`` / ``be``.
 ba = "ba"
+# ``MOEW`` is the ILU MoE W16A16 expert-class acronym (e.g. ``IluMOEW16A16``);
+# not a typo of ``MEOW`` / ``MORE`` / ``MOW``.
+moew = "moew"

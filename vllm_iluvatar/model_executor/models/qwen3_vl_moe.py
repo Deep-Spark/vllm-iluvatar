@@ -5,7 +5,7 @@ Corresponds to: vllm/model_executor/models/qwen3_vl_moe.py
 
 Target   : vllm.model_executor.models.qwen3_vl_moe.Qwen3VLMoeForConditionalGeneration
            (arch "Qwen3VLMoeForConditionalGeneration")
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : Some Qwen3-VL-MoE text configs do not carry ``architectures``. The normal
            Iluvatar vLLM baseline constructs the embedded language model with
            ``architectures=["Qwen3MoeForCausalLM"]``. The embedded Qwen3-MoE language

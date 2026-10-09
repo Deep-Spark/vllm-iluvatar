@@ -17,7 +17,7 @@ The runner-level ``self.kv_scale_caches`` list is created and cleared in
 patch only owns the layer-level ``kv_cache_scale`` detach.
 
 Target   : vllm.v1.worker.utils.clear_layer_kv_caches
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Scope    : only active when VLLM_ILU_FLASH_ATTN_QUANT_TYPE != "" or
            VLLM_ILU_MLA_ATTN_QUANT_TYPE != ""
 Remove   : when upstream supports int8 kv cache quantization.

@@ -87,13 +87,13 @@ class IluMxfp8LinearKernel(Mxfp8LinearKernel):
 
     @classmethod
     def can_implement(cls, c: Mxfp8LinearLayerConfig) -> tuple[bool, str | None]:
-        # ``Mxfp8LinearLayerConfig`` carries no fields: every MXFP8 layer is
-        # e4m3 weights with uint8 E8M0 scales at block 32, so there is nothing
-        # here to reject on. The per-layer shape constraints are only knowable
-        # in ``process_weights_after_loading``, and raising there aborts the
-        # load rather than falling through to the next candidate -- hence the
-        # ``_DISABLE_HINT`` on those messages. Move the gate up here if
-        # ``Mxfp8LinearLayerConfig`` ever grows shape fields.
+        # Community 0.31.0 grew ``Mxfp8LinearLayerConfig.weight_shape``, but the
+        # ILU kernel still reads the real shape from the layer tensor in
+        # ``process_weights_after_loading`` (per-layer K % 64 / scale-shape
+        # checks live there, and raising there aborts the load rather than
+        # falling through to the next candidate -- hence ``_DISABLE_HINT`` on
+        # those messages). Nothing to reject on here: every MXFP8 layer is e4m3
+        # weights with uint8 E8M0 scales at block 32.
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -189,9 +189,7 @@ class IluMxfp8LinearKernel(Mxfp8LinearKernel):
         qx, scale_x = ixfops.fp8_per_token_dynamic_scaled(x_2d)
 
         n = int(layer.weight.shape[0])
-        output = torch.empty(
-            (qx.shape[0], n), dtype=torch.bfloat16, device=qx.device
-        )
+        output = torch.empty((qx.shape[0], n), dtype=torch.bfloat16, device=qx.device)
         bias_bf16 = None if bias is None else bias.to(torch.bfloat16)
 
         use_gemv = (

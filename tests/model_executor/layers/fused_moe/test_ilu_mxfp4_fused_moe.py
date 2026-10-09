@@ -916,15 +916,9 @@ def test_ixmm_uses_parameterized_fused_packed_swiglu_quant(
     hidden_states, monkeypatch, alpha, beta
 ):
     expert_count = 4
-    w13 = torch.zeros(
-        expert_count, _H // 2, 2 * _I, dtype=torch.uint8
-    )
-    w13_scale = torch.ones(
-        expert_count, 1, 2 * _I, dtype=torch.float32
-    )
-    w2 = torch.zeros(
-        expert_count, 256 // 2, _H, dtype=torch.uint8
-    )
+    w13 = torch.zeros(expert_count, _H // 2, 2 * _I, dtype=torch.uint8)
+    w13_scale = torch.ones(expert_count, 1, 2 * _I, dtype=torch.float32)
+    w2 = torch.zeros(expert_count, 256 // 2, _H, dtype=torch.uint8)
     w2_scale = torch.ones(expert_count, 1, _H, dtype=torch.float32)
     topk_weights, topk_ids = _rand_routing(_TOKENS, 4, _TOPK, seed=29)
     fake_ixfops, routing_out = _install_fake_ixfops(monkeypatch)

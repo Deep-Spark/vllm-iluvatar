@@ -6,7 +6,7 @@ Iluvatar OOT Qwen3 (dense) model: fuses the per-head q/k RMSNorm into a single
 
 Target   : vllm.model_executor.models.qwen3.Qwen3ForCausalLM (arch
            "Qwen3ForCausalLM")
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : the fork replaces the two separate q_norm/k_norm passes with one
            fused q/k RMSNorm (ixformer rms_norm_qk).
 How      : ModelRegistry.register_model points the arch at the subclass below;

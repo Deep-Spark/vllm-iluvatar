@@ -3,7 +3,7 @@
 
 Corresponds to: vllm/v1/attention/backend.py
 Target   : CommonAttentionMetadata.token_to_req_indices
-Baseline : v0.30.0 (ced6857afa); override predates commit 13e221f8308
+Baseline : v0.31.0 (db9527a468); override predates commit 13e221f8308
 Why      : Community commit 13e221f8308 replaced the ``torch.repeat_interleave``
            per-token→request mapping with a Triton binary-search kernel
            (``_token_request_mapping_kernel``). That kernel is a pure device

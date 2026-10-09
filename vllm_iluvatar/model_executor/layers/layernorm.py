@@ -6,7 +6,7 @@ plugin-owned ``RMSNormQK`` op used by the fused Qwen3 attention.
 
 Target   : vllm.model_executor.layers.layernorm.{RMSNorm, GemmaRMSNorm}
            (+ new RMSNormQK, plugin-owned)
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : route RMSNorm residual / GemmaRMSNorm through ixformer-backed kernels
            (the fork's delta to community layernorm.py), and provide a fused
            q/k RMSNorm op for Qwen3 attention.

@@ -3,14 +3,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from functools import wraps
-from typing import Callable, Dict, List, Optional
 
 
 def _device_control_env_vars(
-    assigned_physical_gpu_ids: Optional[List[int]],
+    assigned_physical_gpu_ids: list[int] | None,
     current_platform,
-) -> Dict[str, str]:
+) -> dict[str, str]:
     if assigned_physical_gpu_ids is None:
         return {}
     device_control_env_var = getattr(current_platform, "device_control_env_var", "")
@@ -28,11 +28,13 @@ def wrap_initialize_worker(original_initialize_worker: Callable) -> Callable:
     def initialize_worker(
         self,
         local_rank: int,
-        env_vars: Dict[str, str],
-        driver_env_vars: Optional[Dict[str, str]] = None,
-        assigned_physical_gpu_ids: Optional[List[int]] = None,
+        env_vars: dict[str, str],
+        driver_env_vars: dict[str, str] | None = None,
+        assigned_physical_gpu_ids: list[int] | None = None,
     ):
-        from vllm.platforms import current_platform  # pyright: ignore[reportMissingImports]
+        from vllm.platforms import (
+            current_platform,  # pyright: ignore[reportMissingImports]
+        )
 
         worker_env_vars = dict(env_vars)
         worker_env_vars.update(

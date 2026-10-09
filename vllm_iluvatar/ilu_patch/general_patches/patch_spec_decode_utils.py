@@ -7,7 +7,7 @@ ILU general-plugins patch, auto-discovered from the centralized
 ``ilu_patch.general_patches`` package during ``register_general``.
 
 Target   : vllm.v1.spec_decode.utils.eagle_prepare_next_token_padded_kernel
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : Iluvatar Triton can infer ``tl.sum(bool_mask)`` as ``int1``, causing
            a phi-node dtype mismatch with the discarded-request branch.
 How      : rebind the module-level Triton kernel and propagate to from-import
@@ -31,7 +31,7 @@ _OVERRIDES = ["eagle_prepare_next_token_padded_kernel"]
 # vllm.v1.spec_decode.utils.eagle_prepare_next_token_padded_kernel,
 # used as the drift anchor by the fingerprint guard.
 #
-# Baseline: v0.30.0 (ced6857afa)
+# Baseline: v0.31.0 (db9527a468)
 _EAGLE_PREPARE_NEXT_TOKEN_PADDED_KERNEL_BASELINE = """\
 @triton.jit
 def eagle_prepare_next_token_padded_kernel(
@@ -46,8 +46,7 @@ def eagle_prepare_next_token_padded_kernel(
     stride_sampled_token_ids,  # tl.int32 (stride for dim 0)
     BLOCK_SIZE_TOKENS: tl.constexpr,  # Power-of-2 >= num_sampled_tokens_per_req
 ):
-    \"\"\"
-    Fused kernel for Eagle prepare_next_token_ids_padded. This kernel computes the
+    \"\"\"Fused kernel for Eagle prepare_next_token_ids_padded. This kernel computes the
     number of valid (1 + accepted) tokens for each request, and the corresponding
     "next" token id to sample from during speculative decoding. This is the
     "last accepted token" from the sampled tokens, or the backup token if no

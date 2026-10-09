@@ -41,6 +41,7 @@ def test_plugin_class_subclasses_community():
     from vllm.model_executor.models.step3p7 import (
         Step3p7ForConditionalGeneration as _Community,
     )
+
     from vllm_iluvatar.model_executor.models.step3p7 import (
         Step3p7ForConditionalGeneration,
     )

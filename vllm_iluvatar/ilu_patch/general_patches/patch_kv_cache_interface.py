@@ -3,7 +3,7 @@
 (VLLM_ILU_FLASH_ATTN_QUANT_TYPE=KVINT8/KINT8, VLLM_ILU_MLA_ATTN_QUANT_TYPE=INT8).
 
 Patches community objects so int8 KV cache memory is sized correctly, aligned
-with the vLLM 0.30.0 community mechanism:
+with the vLLM 0.31.0 community mechanism:
 
 * ``AttentionSpec.state_content_size_bytes`` -- overridden (when any int8
   quant is enabled) to return the int8 per-cell byte size. The community
@@ -25,7 +25,7 @@ Target   : vllm.v1.kv_cache_interface.AttentionSpec.state_content_size_bytes
            vllm.v1.kv_cache_interface.AttentionSpec.num_heads
            vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
            vllm.v1.core.kv_cache_utils._pool_bytes_per_block
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Scope    : only active when VLLM_ILU_FLASH_ATTN_QUANT_TYPE != "" or
            VLLM_ILU_MLA_ATTN_QUANT_TYPE != ""
 """

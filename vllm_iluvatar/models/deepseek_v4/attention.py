@@ -267,7 +267,7 @@ class IluDeepseekCompressor(DeepseekCompressor):
     ) -> None:
         # >>> ILU MODIFICATION >>>
         # Upstream ``DeepseekCompressor.__init__`` runs a JIT warmup block when
-        # ``kernel_config.enable_jit_warmup`` is set (default True in v0.30.0).
+        # ``kernel_config.enable_jit_warmup`` is set (default True in v0.31.0).
         # For ``head_dim == 512`` on a CUDA platform that block imports the
         # NVIDIA CuTeDSL kernels (``sparse_attn_compress_cutedsl``), which
         # require the ``cutlass`` package not available on Iluvatar. ILU's
@@ -1232,7 +1232,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self._inv_rope_fused: bool | None = None
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
-        # vLLM v0.30.0 (ced6857afa) KV-cache layout: allocate_kv_cache binds a 4D
+        # vLLM v0.31.0 (db9527a468) KV-cache layout: allocate_kv_cache binds a 4D
         # [B, H=1, N, C] tensor; squeeze the singleton head dim -> 3D [B, N, C]
         # as required by the ilu ixformer attention kernels (ndim 2 or 3 only).
         self.kv_cache = kv_cache.squeeze(1)
@@ -2150,7 +2150,7 @@ class IluDeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         compilation_config.static_forward_context[prefix] = self
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
-        # vLLM v0.30.0 (ced6857afa) KV-cache layout: allocate_kv_cache binds a 4D
+        # vLLM v0.31.0 (db9527a468) KV-cache layout: allocate_kv_cache binds a 4D
         # [B, H=1, N, C] tensor; squeeze the singleton head dim -> 3D [B, N, C]
         # as required by the ilu ixformer indexer kernels (ndim 2 or 3 only).
         self.kv_cache = kv_cache.squeeze(1)

@@ -11,7 +11,7 @@ upstream-mirrored implementation sibling is needed.
 
 Target   : vllm.collect_env.get_vllm_version,
            vllm.entrypoints.serve.utils.api_utils.log_version_and_model
-Baseline : v0.30.0 (ced6857afa)
+Baseline : v0.31.0 (db9527a468)
 Why      : community printers only know vLLM's own version; do not patch vLLM.
 How      : wrap those module-level functions with ``rebind_module_func`` and log
            ``vllm_iluvatar {version} {git_id}``. Delegation wrappers; no

@@ -4,7 +4,7 @@
 Corresponds to: vllm/model_executor/layers/fused_moe/modular_kernel.py
            vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/*
 Target   : standard activation-format expert kernels selected by Iluvatar MoE.
-Baseline : v0.30.0 (ced6857afa) plugin runtime source
+Baseline : v0.31.0 (db9527a468) plugin runtime source
 Why      : Iluvatar W4A8 kernels need a standard expert layout that performs
            activation quantization internally.
 How      : plugin-only modular-kernel expert base selected by

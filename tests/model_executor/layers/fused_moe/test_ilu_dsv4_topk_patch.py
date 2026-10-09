@@ -259,14 +259,11 @@ def test_wrapper_keeps_the_community_identity_metadata():
         *[
             object()
             for p in community.parameters.values()
-            if p.kind
-            in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
             and p.default is p.empty
         ]
     )
-    assert any(
-        p.kind is p.VAR_POSITIONAL for p in raw.parameters.values()
-    ), (
+    assert any(p.kind is p.VAR_POSITIONAL for p in raw.parameters.values()), (
         "the wrapper reads none of its arguments, so it should take "
         "*args/**kwargs and survive upstream adding a parameter"
     )

@@ -35,10 +35,10 @@ def _load_ilu_auto_gptq(monkeypatch):
 def test_ilu_auto_gptq_registers_gptq_entry_names(monkeypatch):
     mod = _load_ilu_auto_gptq(monkeypatch)
 
-    from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
     from vllm.model_executor.layers.quantization import (
         _CUSTOMIZED_METHOD_TO_QUANT_CONFIG,
     )
+    from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
 
     assert issubclass(mod.IluAutoGPTQConfig, AutoGPTQConfig)
     assert _CUSTOMIZED_METHOD_TO_QUANT_CONFIG["gptq"] is mod.IluAutoGPTQConfig

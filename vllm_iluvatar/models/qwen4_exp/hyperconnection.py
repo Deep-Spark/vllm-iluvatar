@@ -24,7 +24,6 @@ Typical usage inside a transformer decoder layer::
 
 import torch
 from torch import nn
-
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,

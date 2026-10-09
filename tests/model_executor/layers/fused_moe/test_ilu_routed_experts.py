@@ -17,11 +17,11 @@ from vllm_iluvatar.model_executor.layers.fused_moe.ilu_routed_experts import (
     IluRoutedExperts,
 )
 
-_MAIN_CED6857AFA_WEIGHT_LOADER_SHA = (
-    "f7cbf43595101b8c3402bead6609829706491ef32e88ba6cc4ee7f03d5711caf"
+_MAIN_DB9527A468_WEIGHT_LOADER_SHA = (
+    "382566c5d258c199d66e490058fabc41b193281140858a3e688abc22fec8bd6f"
 )
-_MAIN_CED6857AFA_LOAD_WEIGHTS_SHA = (
-    "e3039228fc2d38ad1213c5c1ee7988a03bebe4238fa98854b40d1a72b7c0f14b"
+_MAIN_DB9527A468_LOAD_WEIGHTS_SHA = (
+    "a7de59bf6938a44fcf6ae50c9072d97546200cd3b045c07551ee6af3f657d28f"
 )
 
 
@@ -55,6 +55,7 @@ def _uninitialized_routed_experts() -> IluRoutedExperts:
     obj.__dict__["quant_method"] = OtherMoEMethod()
     obj.__dict__["opt_level"] = 0
     obj.__dict__["layer_name"] = "layer"
+    obj.__dict__["is_fused_checkpoint_transposed"] = False
     obj.__dict__["_map_global_expert_id_to_local_expert_id"] = lambda _: 0
     obj.__dict__["_load_model_weight_or_group_weight_scale"] = MagicMock()
     return obj
@@ -64,12 +65,12 @@ def test_routed_experts_oot_registration_uses_upstream_class_name():
     assert op_registry_oot["RoutedExperts"] is IluRoutedExperts
 
 
-def test_weight_loader_fingerprint_baseline_matches_declared_main_ced6857afa_source():
+def test_weight_loader_fingerprint_baseline_matches_declared_main_db9527a468_source():
     assert p.source_sha(_ROUTED_EXPERTS_WEIGHT_LOADER_BASELINE) == (
-        _MAIN_CED6857AFA_WEIGHT_LOADER_SHA
+        _MAIN_DB9527A468_WEIGHT_LOADER_SHA
     )
     assert p.source_sha(_ROUTED_EXPERTS_LOAD_WEIGHTS_BASELINE) == (
-        _MAIN_CED6857AFA_LOAD_WEIGHTS_SHA
+        _MAIN_DB9527A468_LOAD_WEIGHTS_SHA
     )
 
 
@@ -183,7 +184,12 @@ def test_load_weights_keeps_fused_w13_weight_scale_when_dim_differs():
 
     scale_shapes = [shape for name, shape in calls if name == "w13_weight_scale"]
     assert scale_shapes
-    assert set(scale_shapes) == {torch.Size([1, 4096])}
+    # Community 0.31.0 replaced the ILU shape heuristic with flag-based
+    # _orient_fused_weight: with is_fused_checkpoint_transposed=False the fused
+    # w13 weight_scale [128, 4096, 2] is not transposed, so chunk(2, dim=1)
+    # splits the 4096 span into the per-shard [2048, 2] scale (gate/up split on
+    # dim 1, not the span).
+    assert set(scale_shapes) == {torch.Size([2048, 2])}
 
 
 @pytest.mark.parametrize(

@@ -2,9 +2,11 @@
 """DSA integration preserves mutation/cache/packed-Q contracts across replay."""
 
 from types import SimpleNamespace
+
+import ixformer.inference.functions as F
 import pytest
 import torch
-import ixformer.inference.functions as F
+
 from vllm_iluvatar.models.glm_moe_dsa import attention as mod
 
 

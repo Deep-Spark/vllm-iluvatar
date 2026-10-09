@@ -8,11 +8,12 @@ algorithm correctness does not approve compatibility or model quality.
 Run the optional compatibility diagnostic with --run-legacy-drift -m legacy_drift.
 """
 
+import ixformer.inference.functions as F
 import pytest
 import torch
-import ixformer.inference.functions as F
-from tests.moe_test_utils import make_nn_graph_method
 from vllm import envs as opt
+
+from tests.model_executor.layers.quantization.moe_test_utils import make_nn_graph_method
 from vllm_iluvatar.ilu_util import arch
 
 
@@ -107,7 +108,7 @@ def assess_outputs(outputs, references, assessment, record_property, label):
                 reference,
                 atol=0.03,
                 rtol=0.03,
-                msg=lambda msg: f"{label} enabled={enabled}: {msg}",
+                msg=lambda msg, enabled=enabled: f"{label} enabled={enabled}: {msg}",
             )
         # Consistency envelope includes algorithm drift, not a new
         # compatibility tolerance or a replacement for legacy_drift.
@@ -197,6 +198,7 @@ def test_full_nn_prepare_off_on(
 
 def standard_experts(method, layer, monkeypatch):
     from types import SimpleNamespace
+
     from vllm_iluvatar.model_executor.layers.quantization import (
         ilu_w4a8_nn_experts as std,
     )
@@ -210,7 +212,7 @@ def standard_experts(method, layer, monkeypatch):
     experts.quant_config = SimpleNamespace(
         w1_scale=layer.w13_weight_scale, w2_scale=layer.w2_weight_scale
     )
-    monkeypatch.setattr(std, "get_ep_group", lambda: SimpleNamespace(rank_in_group=1))
+    monkeypatch.setattr(std, "get_ep_group", lambda: SimpleNamespace(rank=1))
     return experts
 
 

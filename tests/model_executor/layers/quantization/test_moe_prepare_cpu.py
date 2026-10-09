@@ -5,17 +5,18 @@ No Torch/vLLM/ixformer imports or device access. Native numerical and graph
 contracts are tested separately on the paired CQ runtime.
 """
 
-import ast
 import __future__
+
+import ast
 import math
 import os
-from pathlib import Path
 import sys
-from types import ModuleType, SimpleNamespace
 import unittest
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[4]
 NN = "vllm_iluvatar/model_executor/layers/quantization/ilu_w4a8_nn.py"
 STD = "vllm_iluvatar/model_executor/layers/quantization/ilu_w4a8_nn_experts.py"
 ROUTER = (
@@ -327,7 +328,7 @@ class MoECPU(unittest.TestCase):
                     ns = {
                         "torch": TORCH,
                         "ixff": ops,
-                        "get_ep_group": lambda: SimpleNamespace(rank_in_group=1),
+                        "get_ep_group": lambda: SimpleNamespace(rank=1),
                         "unpad_tensor": lambda x, *a, **k: x,
                     }
                     fn = load(STD, "_apply_nn", ns, "IluMoEStandardExpertsW4A8NN")

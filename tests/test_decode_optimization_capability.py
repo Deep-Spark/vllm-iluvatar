@@ -5,12 +5,13 @@ No Torch/vLLM/ixformer imports, device discovery or GPU allocations. These tests
 prove selection and error propagation, not native numerical correctness.
 """
 
-import ast
 import __future__
-from pathlib import Path
+
+import ast
 import sys
-from types import ModuleType, SimpleNamespace
 import unittest
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -248,7 +249,7 @@ class PreparationSelectionTest(unittest.TestCase):
                 "self": a,
                 "use_pcp": reason == "pcp",
                 "q": q,
-                "is_ivcore30": lambda: reason != "unknown_binary",
+                "is_ivcore30": lambda reason=reason: reason != "unknown_binary",
                 "kv_rms_weight": None if reason == "weight" else object(),
                 "num_actual_toks": (
                     0 if reason == "zero" else 65536 if reason == "too_many" else 17
@@ -257,7 +258,7 @@ class PreparationSelectionTest(unittest.TestCase):
                     block_size=32 if reason == "block" else 64
                 ),
                 "kv_cache": SimpleNamespace(
-                    numel=lambda: 0 if reason == "cache" else 128
+                    numel=lambda reason=reason: 0 if reason == "cache" else 128
                 ),
                 "torch": SimpleNamespace(
                     bfloat16="bf16",
@@ -272,26 +273,11 @@ class PreparationSelectionTest(unittest.TestCase):
     def test_pcp_guard_mutation_is_detected(self):
         """Other conditions pass; removing only PCP exclusion hits the sentinel.
 
-        This is a CPU predicate mutation proof, not full native forward. Also
-        inspect the real distributed invocation to prevent weight=None from
-        silently weakening the GPU sentinel again.
+        This is a CPU predicate mutation proof, not a PCP forward test:
+        the v0.31 branch does not contain the GLM PCP implementation.
         """
         import copy
 
-        worker = ast.parse((ROOT / "tests/distributed/test_glm_dsa_pcp.py").read_text())
-        call = next(
-            n
-            for n in ast.walk(worker)
-            if isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Attribute)
-            and n.func.attr == "forward"
-            and isinstance(n.func.value, ast.Name)
-            and n.func.value.id == "layer"
-        )
-        kwargs = {k.arg: k.value for k in call.keywords}
-        self.assertIsInstance(kwargs["kv_rms_weight"], ast.Name)
-        self.assertEqual(kwargs["kv_rms_weight"].id, "rms_weight")
-        self.assertEqual(kwargs["kv_rms_eps"].id, "rms_eps")
         path = "vllm_iluvatar/models/glm_moe_dsa/attention.py"
         tree = ast.parse((ROOT / path).read_text())
         node = next(
@@ -327,18 +313,6 @@ class PreparationSelectionTest(unittest.TestCase):
             ),
         }
         self.assertFalse(eval(compile(ast.Expression(node), path, "eval"), ns))
-        packed = next(
-            n.value
-            for n in ast.walk(tree)
-            if isinstance(n, ast.Assign)
-            and any(
-                isinstance(t, ast.Name) and t.id == "use_packed_pcp" for t in n.targets
-            )
-        )
-        # Replicated decode takes the non-packed insertion branch; another
-        # PCP route must not accidentally bypass the forbidden sentinel.
-        self.assertFalse(eval(compile(ast.Expression(packed), path, "eval"), ns))
-
         class RemovePcpGuard(ast.NodeTransformer):
             def visit_UnaryOp(self, n):
                 if (

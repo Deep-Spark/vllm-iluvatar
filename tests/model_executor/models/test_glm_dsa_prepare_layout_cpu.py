@@ -4,18 +4,19 @@
 Proves layout/configuration integration and copy scope, not GPU numerics.
 """
 
-import ast
 import __future__
+
+import ast
 import os
-from pathlib import Path
 import sys
-from types import MethodType, ModuleType, SimpleNamespace
 import unittest
+from pathlib import Path
+from types import MethodType, ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 BASE = "vllm_iluvatar/models/glm_moe_dsa/attention.py"
 FP8 = "vllm_iluvatar/models/glm_moe_dsa/fp8_attention.py"
 ABSORB = "VLLM_ILU_GLM_DSA_FP8_ABSORB_UP"

@@ -2,8 +2,10 @@
 """Shared native NN MoE fixture; unchanged from the main quantization tests."""
 
 from types import SimpleNamespace
-import torch
+
 import ixformer.inference.functions as ixf_ops
+import torch
+
 from vllm_iluvatar.model_executor.layers.quantization import ilu_w4a8_nn as w4a8_moe
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_utils import (
     W4A8GroupGemmInfo,

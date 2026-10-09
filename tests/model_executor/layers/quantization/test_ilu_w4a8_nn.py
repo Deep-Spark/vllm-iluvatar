@@ -9,7 +9,6 @@ from unittest.mock import MagicMock
 
 import ixformer.inference.functions as ixf_ops
 import pytest
-from tests.moe_test_utils import make_nn_graph_method as _make_nn_graph_method
 import torch
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import RoutedExperts
@@ -17,6 +16,9 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
     CompressedTensorsMoEMethod,
 )
 
+from tests.model_executor.layers.quantization.moe_test_utils import (
+    make_nn_graph_method as _make_nn_graph_method,
+)
 from vllm_iluvatar.model_executor.layers.quantization import ilu_w4a8_nn as w4a8_moe
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
     IluQuantConfig,
@@ -27,6 +29,8 @@ from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compres
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.ilu_compressed_tensors_moe import (
     IluCompressedTensorsMoEMethod,
 )
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_static_nn_ixformer_against_cpu(dtype):
@@ -231,13 +235,12 @@ def test_nn_prefill_uses_ixformer_ixmm(ep, num_tokens, monkeypatch):
 def test_nn_standard_experts_prefill_matches_monolithic(
     monkeypatch, fused, hidden, topk, tokens
 ):
+    from vllm import envs as opt
     from vllm.model_executor.layers.fused_moe import MoEActivation
 
     from vllm_iluvatar.model_executor.layers.quantization import (
         ilu_w4a8_nn_experts as std_w4a8,
     )
-
-    from vllm import envs as opt
 
     monkeypatch.setattr(opt, "VLLM_ILU_GLM_MOE_PREPARE_FUSION", fused)
     method, layer, _, _ = _make_nn_graph_method(hidden=hidden)
@@ -414,9 +417,9 @@ def test_arch_and_layout_select_quant_class(monkeypatch, arch, format, version):
         return ["ixmm"]
 
     monkeypatch.setattr(w4a8_moe.registry, "available_backends", backend_probe)
-    if arch == "ivcore11" and version != 2:
-        # ee989a is deliberately deferred: keep the original v2 contract.
-        with pytest.raises(AssertionError, match="only supports version 2"):
+    if arch == "ivcore11" and version is None:
+        # v0.31 supports explicit v1/v2 legacy checkpoints.
+        with pytest.raises(AssertionError, match="only supports pack_version 1 or 2"):
             _select_static_nn(source=source)
         return
     if new_path and version == 2:
@@ -432,7 +435,8 @@ def test_arch_and_layout_select_quant_class(monkeypatch, arch, format, version):
         else legacy_w4a8.IluCompressedTensorsW4A8Int8MoEMethod
     )
     assert type(method) is expected
-    assert not hasattr(method, "decode_group_gemm")
+    if new_path:
+        assert not hasattr(method, "decode_group_gemm")
     if new_path:
         assert not hasattr(method, "version")
 
@@ -472,7 +476,13 @@ def test_modular_factory_selects_dedicated_nn_experts(monkeypatch, algorithm, ba
     )
 
     method, layer, _, _ = _make_nn_graph_method()
-    method.moe = SimpleNamespace()
+    method.moe = SimpleNamespace(
+        swiglu_limit=None,
+        swiglu_alpha=None,
+        swiglu_beta=None,
+        activation_situ_beta=None,
+        activation_situ_linear_beta=None,
+    )
     method.moe_quant_config = method.get_fused_moe_quant_config(layer)
     monkeypatch.setattr(ilu_moe_batch_experts, "MOE_ALGO", algorithm)
     prepare = SimpleNamespace(

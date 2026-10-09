@@ -3,13 +3,13 @@
 
 import builtins
 import os
-from pathlib import Path
 import sys
-from types import ModuleType
 import unittest
+from pathlib import Path
+from types import ModuleType
 from unittest.mock import patch
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 MOE = "VLLM_ILU_GLM_MOE_PREPARE_FUSION"
 DSA = "VLLM_ILU_GLM_DSA_PREPARE_FUSION"
 SAMPLING = "VLLM_ILU_GLM_SAMPLING_MODE"
@@ -84,9 +84,12 @@ class ConfigurationCPU(unittest.TestCase):
                     os.environ[SAMPLING] = value
                 self.assertEqual(reader(), expected)
         for value in ("", "true", "1", "other"):
-            with self.subTest(value=value), patch.dict(os.environ, {SAMPLING: value}):
-                with self.assertRaisesRegex(ValueError, "must be one of"):
-                    reader()
+            with (
+                self.subTest(value=value),
+                patch.dict(os.environ, {SAMPLING: value}),
+                self.assertRaisesRegex(ValueError, "must be one of"),
+            ):
+                reader()
 
     def test_arch_unknown_and_loaded_binary_cache(self):
         for value in (None, "unknown", "ivcore11", "ivcore40", "ivcore30"):
@@ -121,14 +124,16 @@ class ConfigurationCPU(unittest.TestCase):
                 with self.subTest(error=type(error).__name__, query=query):
                     module = source_module("vllm_iluvatar/ilu_util/arch.py")
 
-                    def unavailable(name, *args, **kwargs):
+                    def unavailable(name, *args, _error=error, **kwargs):
                         if name == "ixformer":
-                            raise error
+                            raise _error
                         return original(name, *args, **kwargs)
 
-                    with patch("builtins.__import__", unavailable):
-                        with self.assertRaises(type(error)) as caught:
-                            getattr(module, query)()
+                    with (
+                        patch("builtins.__import__", unavailable),
+                        self.assertRaises(type(error)) as caught,
+                    ):
+                        getattr(module, query)()
                     self.assertIs(caught.exception, error)
 
     def test_arch_read_error_propagates(self):
@@ -139,14 +144,16 @@ class ConfigurationCPU(unittest.TestCase):
 
                     class UnreadableCuda:
                         @property
-                        def cuda_arch(self):
-                            raise error
+                        def cuda_arch(self, _error=error):
+                            raise _error
 
                     ixformer = ModuleType("ixformer")
                     ixformer.cuda = UnreadableCuda()
-                    with patch.dict(sys.modules, {"ixformer": ixformer}):
-                        with self.assertRaises(type(error)) as caught:
-                            getattr(module, query)()
+                    with (
+                        patch.dict(sys.modules, {"ixformer": ixformer}),
+                        self.assertRaises(type(error)) as caught,
+                    ):
+                        getattr(module, query)()
                     self.assertIs(caught.exception, error)
 
 

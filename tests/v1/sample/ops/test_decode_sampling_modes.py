@@ -2,11 +2,13 @@
 """Model sampling integration: generator advancement, outputs and fallbacks."""
 
 from types import SimpleNamespace
+
 import pytest
 import torch
-from vllm.v1.sample.ops import topk_topp_sampler as upstream
-from vllm_iluvatar.v1.sample.ops import topk_topp_sampler as impl
 from vllm import envs as opt
+from vllm.v1.sample.ops import topk_topp_sampler as upstream
+
+from vllm_iluvatar.v1.sample.ops import topk_topp_sampler as impl
 
 
 @pytest.mark.parametrize("mode", ["sorted", "radix"])
@@ -53,7 +55,9 @@ def test_sampling_generators(monkeypatch, mode, seeded):
     "reason", ["off", "cpu", "fp64", "processed", "topk", "no_p", "stride"]
 )
 def test_fallback_preserves_upstream_contract(monkeypatch, reason):
-    monkeypatch.setattr(opt, "VLLM_ILU_GLM_SAMPLING_MODE", "off" if reason == "off" else "sorted")
+    monkeypatch.setattr(
+        opt, "VLLM_ILU_GLM_SAMPLING_MODE", "off" if reason == "off" else "sorted"
+    )
     x = torch.zeros(2, 32, device="cpu" if reason == "cpu" else "cuda")
     if reason == "stride":
         x = x[:, ::2]
@@ -75,6 +79,8 @@ def test_fallback_preserves_upstream_contract(monkeypatch, reason):
 
 @pytest.mark.parametrize("mode", ["sorted", "radix"])
 def test_broadcast_top_p_uses_upstream(monkeypatch, mode):
+    # Mirror register_general: the fallback uses the plugin PyTorch mask.
+    monkeypatch.setattr(upstream, "apply_top_k_top_p", impl.apply_top_k_top_p)
     monkeypatch.setattr(opt, "VLLM_ILU_GLM_SAMPLING_MODE", mode)
     logits = torch.randn(3, 257, device="cuda")
     p = torch.tensor([0.9], device="cuda")

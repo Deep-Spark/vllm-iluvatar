@@ -548,6 +548,7 @@ def test_pcp_never_arms_local_kv_fusion(monkeypatch, frozen):
 @pytest.mark.parametrize("use_fp8", [False, True])
 def test_decode_prepare_head_support(monkeypatch, heads, enabled, use_fp8):
     from vllm import envs as opt
+
     from vllm_iluvatar.ilu_util import arch
 
     monkeypatch.setattr(opt, "VLLM_ILU_GLM_DSA_PREPARE_FUSION", enabled)

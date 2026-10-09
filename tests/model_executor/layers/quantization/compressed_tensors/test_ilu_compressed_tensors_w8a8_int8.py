@@ -198,3 +198,22 @@ def test_IluCompressedTensorsW8A8Int8(
         f"min_diff: {min(diff_list):.4f} "
         f"avg_diff: {sum(diff_list) / len(diff_list):.4f}"
     )
+
+
+def test_ivcore11_flash_wq_b_wo_b_perf_table_is_tn():
+    scheme = IluCompressedTensorsW8A8Int8(
+        strategy=QuantizationStrategy.CHANNEL,
+        is_static_input_scheme=False,
+        input_symmetric=True,
+        ilu_params={
+            "mixed_strategy": "CHANNEL",
+            "gemm_format": "TN",
+            "gemm_mode": "PERF",
+        },
+    )
+    scheme.arch = "ivcore11"
+    assert scheme._choose_format(32768, 1024) == "TN"
+    assert scheme._choose_format(4096, 8192) == "TN"
+    # indexer / shared stay on the 64-aligned NN fallback
+    assert scheme._choose_format(8192, 1024) == "NN"
+    assert scheme._choose_format(4096, 4096) == "NN"

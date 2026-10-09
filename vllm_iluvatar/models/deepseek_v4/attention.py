@@ -110,6 +110,17 @@ _QK_NORM_QUANT_Q_K = (1024, 1536)
 # its GPU-time win grows with the batch (measured 5.4us at T=1 rising to 8.1us
 # at T=16 on both widths).  Cap at the largest decode batch per rank.
 _QK_NORM_QUANT_MAX_TOKENS = 16
+# attn.wo_a grouped BMM backend, selected by VLLM_ILU_WO_A_QUANT:
+#   marlin (default) : bf16 activation, INT8 weight in Marlin layout
+#   msd              : W8A16 int8-TCU above _WO_A_MSD_MIN_TOKENS, marlin below
+#   w8a8             : INT8 weight + dynamic per-(token, group) activation quant
+_WO_A_QUANT = os.environ.get("VLLM_ILU_WO_A_QUANT", "marlin").strip().lower()
+if _WO_A_QUANT not in ("marlin", "msd", "w8a8"):
+    logger.warning(
+        "VLLM_ILU_WO_A_QUANT=%s is invalid; falling back to marlin", _WO_A_QUANT
+    )
+    _WO_A_QUANT = "marlin"
+_WO_A_MSD_MIN_TOKENS = int(os.environ.get("VLLM_ILU_WO_A_MSD_MIN_TOKENS", "256"))
 
 
 def _can_fuse_qr_norm_quant(
@@ -1087,11 +1098,34 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         o_view = o.view(
             num_tokens, self.n_local_groups, heads_per_group * self.head_dim
         )
-        if hasattr(self.wo_a, "W_repacked"):
-            # v2 W8A16 marlin path (set by IluV4W8A16BMMLinearMethod):
-            # input stays bf16; weight is INT8 in Marlin layout +
-            # per-(group,N) channel scale. The 3D batched signature mirrors
-            # R1's _k_up_proj_w8a8 (vllm_iluvatar/v1/attention/backends/mla/ilu_mla.py).
+
+        has_w8 = hasattr(self.wo_a, "W") and hasattr(self.wo_a, "W_scale")
+        if has_w8 and _WO_A_QUANT == "w8a8":
+            o_i8, o_scales = ixfops.scaled_int8_quant(
+                o_view.view(num_tokens * self.n_local_groups, -1)
+            )
+            z = o.new_empty((num_tokens, self.n_local_groups, self.o_lora_rank))
+            ixfops.w8a8_bmm(
+                o_i8.view(num_tokens, self.n_local_groups, -1).transpose(0, 1),
+                self.wo_a.W,
+                o_scales.view(num_tokens, self.n_local_groups).t().contiguous(),
+                self.wo_a.W_scale,
+                output=z.transpose(0, 1),
+                batched_scales=True,
+            )
+        elif has_w8 and _WO_A_QUANT == "msd" and num_tokens > _WO_A_MSD_MIN_TOKENS:
+            high, low, activation_scales = ixfops.msd_dynamic_quant(
+                o_view, transpose_scale=True
+            )
+            z = ixfops.w8a16_msd(
+                high,
+                low,
+                self.wo_a.W,
+                activation_scales,
+                self.wo_a.W_scale,
+                output_dtype=o_view.dtype,
+            )
+        elif hasattr(self.wo_a, "W_repacked"):
             z = ixfops.marlin_w8a16(
                 o_view,
                 self.wo_a.W_repacked,

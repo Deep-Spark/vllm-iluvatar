@@ -11,7 +11,7 @@ from typing import Any
 import ixformer.inference.functions as ixf_ops
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
-from ixformer.inference.functions.w8a8 import w8a8_gemm
+from ixformer.inference.functions.w8a8 import w8a8_gemm, w8a8_gemv
 from ixformer.inference.functions.w8a8_shapes import w8a8_perf_gemv_supported
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
@@ -232,7 +232,18 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
                     "func": [(0, _w8a8_ixformer_perf), (17, w8a8_gemm)],
                 },
             },
-            "ivcore11": {},
+            "ivcore11": {
+                # deepseekv4 flash attn.wq_b / attn.wo_b (TP1).
+                # Prefill on BI-V150: TN beats the 64-aligned NN fallback.
+                (32768, 1024): {
+                    "format": "TN",
+                    "func": [(0, w8a8_gemv), (9, w8a8_gemm)],
+                },
+                (4096, 8192): {
+                    "format": "TN",
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                },
+            },
         }
 
     def _get_layer_params(

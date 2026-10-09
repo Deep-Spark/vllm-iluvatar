@@ -67,13 +67,13 @@ def select_candidate_blocks(
             row_repeat,
         )
         top = scores.topk(k, dim=-1)
-        # A block that scored ``-inf`` holds no live column, so it is padding
-        # rather than a candidate. NaN can show up during warmup and is left
-        # alone, which is what keeps this in step with community's tie
-        # behaviour.
-        keep = top.values != -float("inf")
-        out[r0:r1, :k] = torch.where(keep, top.indices.to(torch.int32), -1)
-    out[:rows, k:] = -1
+        # One kernel writes the slice's whole ``out`` row: an index in the
+        # first ``k`` columns (``-1`` where the slot scored ``-inf``, a block
+        # with no live column, which is padding not a candidate; NaN is left as
+        # a kept index, the reference's tie behaviour) and ``-1`` in the tail.
+        # This replaces a select, an int32 cast, a row copy and a separate
+        # ``out[:, k:]`` fill with a single launch per slice.
+        torch.ops._C.v41_write_candidate_topk(out[r0:r1], top.values, top.indices, k)
 
 
 def apply_candidate_mask(

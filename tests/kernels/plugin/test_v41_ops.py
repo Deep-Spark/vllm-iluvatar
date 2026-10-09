@@ -25,6 +25,7 @@ LATENT_DIM = 512
 INDEX_HEAD_DIM = 128
 ROPE_DIM = 64
 FP8_MAX = 448.0
+INT8_MAX = 127.0
 # The packed fp8_ds_mla record: 448 e4m3 + 64 bf16 rope + 7 ue8m0 + 1 pad.
 PACKED_DATA_BYTES = 576
 PACKED_NOPE_BYTES = 448
@@ -294,7 +295,14 @@ def test_rope_insert_packed_record(compress_ratio: int):
 # the table has no reader here, so the ops reject it rather than writing bytes
 # that would later be decoded as something they are not.
 _MAIN_RECORDS = [(PACKED_ROW_BYTES, torch.uint8), (LATENT_DIM, torch.bfloat16)]
-_INDEX_RECORDS = [(INDEX_HEAD_DIM + 4, torch.uint8), (INDEX_HEAD_DIM, torch.bfloat16)]
+_INDEX_RECORDS = ["fp8", "int8", "bf16"]
+
+
+def _indexer_record_row(record: str) -> tuple[int, torch.dtype]:
+    """Row width and dtype of an index-key record. fp8 and int8 share both."""
+    if record == "bf16":
+        return INDEX_HEAD_DIM, torch.bfloat16
+    return INDEX_HEAD_DIM + 4, torch.uint8
 
 
 @pytest.mark.parametrize("width,dtype", _MAIN_RECORDS)
@@ -333,9 +341,9 @@ def test_the_main_store_rejects_a_record_it_has_no_reader_for():
         torch.ops._C.v41_rope_insert(latent, positions, cos_sin, cache, slots, 1)
 
 
-@pytest.mark.parametrize("width,dtype", _INDEX_RECORDS)
-def test_the_index_record_geometries_round_trip(width: int, dtype: torch.dtype):
-    """fp8 is 132 uint8 and bf16 is 128 bf16, on both the write and the move."""
+@pytest.mark.parametrize("record", _INDEX_RECORDS)
+def test_the_index_record_geometries_round_trip(record: str):
+    """fp8/int8 are 132 uint8 and bf16 is 128 bf16, on the write and the move."""
     torch.manual_seed(14)
     num_tokens, rows_per_page, eps, compress_ratio = 32, 8, 1e-6, 1
     positions, slots, _, _, num_pages = _paged_layout(
@@ -344,6 +352,7 @@ def test_the_index_record_geometries_round_trip(width: int, dtype: torch.dtype):
     cos_sin = _make_cos_sin(128)
     k_pre = torch.randn(num_tokens, INDEX_HEAD_DIM, device=DEVICE, dtype=torch.bfloat16)
     weight = torch.randn(INDEX_HEAD_DIM, device=DEVICE, dtype=torch.bfloat16)
+    width, dtype = _indexer_record_row(record)
     cache = torch.zeros(num_pages, rows_per_page, width, device=DEVICE, dtype=dtype)
     rows = torch.zeros(num_tokens, width, device=DEVICE, dtype=dtype)
     torch.ops._C.v41_indexer_k_norm_rope_store(
@@ -355,7 +364,7 @@ def test_the_index_record_geometries_round_trip(width: int, dtype: torch.dtype):
         cache,
         slots,
         compress_ratio,
-        dtype is torch.uint8,
+        record,
         rows,
     )
     replayed = torch.zeros_like(cache)
@@ -377,13 +386,21 @@ def _ref_indexer_k(
     weight: torch.Tensor,
     eps: float,
     compress_ratio: int,
+    round_bf16: bool = True,
 ) -> torch.Tensor:
-    """k_norm then RoPE, with the reference's two bf16 round-trips."""
+    """k_norm then RoPE.
+
+    The bf16 and fp8 references round back through bf16 after the norm and
+    again after the rotation. ixformer's int8 reference does neither: it
+    carries fp32 from the norm straight into the quantizer, so that record
+    passes ``round_bf16=False``.
+    """
+    maybe_round = _bf16_round if round_bf16 else (lambda x: x)
     k = k_pre.float()
     variance = k.pow(2).mean(-1, keepdim=True)
-    k = _bf16_round(k * torch.rsqrt(variance + eps) * weight.float())
+    k = maybe_round(k * torch.rsqrt(variance + eps) * weight.float())
     rope_pos = (positions // compress_ratio) * compress_ratio
-    return _bf16_round(_rope_rows(k, rope_pos, cos_sin))
+    return maybe_round(_rope_rows(k, rope_pos, cos_sin))
 
 
 @pytest.mark.parametrize("compress_ratio", [1, 2])
@@ -413,7 +430,7 @@ def test_indexer_k_store_bf16(compress_ratio: int):
         cache,
         slots,
         compress_ratio,
-        False,
+        "bf16",
     )
 
     expected = _ref_indexer_k(k_pre, positions, cos_sin, weight, eps, compress_ratio)
@@ -448,7 +465,7 @@ def test_indexer_k_store_fp8(compress_ratio: int):
         cache,
         slots,
         compress_ratio,
-        True,
+        "fp8",
     )
 
     expected = _ref_indexer_k(k_pre, positions, cos_sin, weight, eps, compress_ratio)
@@ -475,6 +492,68 @@ def test_indexer_k_store_fp8(compress_ratio: int):
             * got_scale[0]
         )
         torch.testing.assert_close(values, expected[t], rtol=7e-2, atol=1e-3)
+
+
+@pytest.mark.parametrize("compress_ratio", [1, 2])
+def test_indexer_k_store_int8(compress_ratio: int):
+    """The scheme-A key record: 128 int8 bytes and one ``amax / 127`` scale.
+
+    Same 132-byte page as fp8, so only the quantizer is under test here. The
+    bytes are compared as integers against the reference's own rounding, which
+    pins the scale and the round-nearest together; a tolerance on the
+    dequantized value would pass even if the scale were off by a step.
+    """
+    torch.manual_seed(6)
+    num_tokens, rows_per_page, eps = 64, 8, 1e-6
+    positions, slots, _, _, num_pages = _paged_layout(
+        num_tokens, rows_per_page, compress_ratio, seed=6
+    )
+    cos_sin = _make_cos_sin(128)
+    k_pre = torch.randn(num_tokens, INDEX_HEAD_DIM, device=DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(INDEX_HEAD_DIM, device=DEVICE, dtype=torch.bfloat16)
+    cache = torch.zeros(
+        num_pages, rows_per_page, INDEX_HEAD_DIM + 4, device=DEVICE, dtype=torch.uint8
+    )
+
+    torch.ops._C.v41_indexer_k_norm_rope_store(
+        k_pre,
+        positions,
+        cos_sin,
+        weight,
+        eps,
+        cache,
+        slots,
+        compress_ratio,
+        "int8",
+    )
+
+    expected = _ref_indexer_k(
+        k_pre, positions, cos_sin, weight, eps, compress_ratio, round_bf16=False
+    )
+    absmax = expected.abs().amax(-1).clamp(min=1e-10)
+    exp_scale = absmax / INT8_MAX
+    exp_bytes = (
+        (expected * (INT8_MAX / absmax).unsqueeze(-1))
+        .round()
+        .clamp(-INT8_MAX, INT8_MAX)
+    )
+
+    flat = cache.reshape(num_pages, -1)
+    ok = _publishes(positions, slots, compress_ratio)
+    assert bool(ok.any())
+    for t in torch.nonzero(ok).flatten().tolist():
+        slot = int(slots[t])
+        page, row = slot // rows_per_page, slot % rows_per_page
+        base = rows_per_page * INDEX_HEAD_DIM + row * 4
+        got_scale = flat[page, base : base + 4].view(torch.float32)
+        torch.testing.assert_close(got_scale[0], exp_scale[t], rtol=1e-6, atol=0)
+
+        values = (
+            flat[page, row * INDEX_HEAD_DIM : (row + 1) * INDEX_HEAD_DIM]
+            .view(torch.int8)
+            .float()
+        )
+        assert (values - exp_bytes[t]).abs().max() <= 1
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +632,107 @@ def test_indexer_q_rope_fp8():
     )
 
 
+def test_indexer_q_rope_int8():
+    """ixformer's scheme A: one ``amax / 127`` per row, folded into the weights.
+
+    The quantized bytes are compared as integers with a one-step slack rather
+    than through a tolerance on the dequantized value. A step here is
+    ``amax / 127`` wide, so a tolerance loose enough to absorb the rotation's
+    last-bit disagreement would also absorb a wrong byte; "off by at most one
+    level, and only where the product sits near a rounding boundary" is the
+    actual claim.
+    """
+    torch.manual_seed(9)
+    num_tokens, num_heads = 33, 8
+    scale = 0.037
+    positions = (torch.arange(num_tokens, dtype=torch.int64) % 97).to(DEVICE)
+    cos_sin = _make_cos_sin(128)
+    q = torch.randn(
+        num_tokens,
+        num_heads,
+        INDEX_HEAD_DIM,
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    )
+    weights = torch.randn(num_tokens, num_heads, device=DEVICE, dtype=torch.bfloat16)
+
+    q_int8, weights_out = torch.ops._C.v41_indexer_q_rope_int8(
+        q, positions, cos_sin, weights, scale
+    )
+    assert q_int8.dtype == torch.int8
+    assert weights_out.dtype == torch.float32
+
+    rows = q.float().reshape(-1, INDEX_HEAD_DIM)
+    rope_pos = positions.repeat_interleave(num_heads)
+    # No bf16 round-trip after the rotation: unlike the fp8 path, the reference
+    # carries fp32 from the rotation straight into the quantizer.
+    rotated = _rope_rows(rows, rope_pos, cos_sin)
+    amax = rotated.abs().amax(-1, keepdim=True).clamp(min=1e-10)
+    q_scale = amax / INT8_MAX
+
+    expected = (rotated * (INT8_MAX / amax)).round().clamp(-INT8_MAX, INT8_MAX)
+    got = q_int8.float().reshape(-1, INDEX_HEAD_DIM)
+    assert (got - expected).abs().max() <= 1
+
+    torch.testing.assert_close(
+        weights_out,
+        weights.float() * q_scale.reshape(num_tokens, num_heads) * scale,
+        rtol=1e-4,
+        atol=1e-8,
+    )
+
+
+def test_indexer_q_rope_int8_saturates_without_overflowing():
+    """A row whose amax lands on the clamp must reach 127, never wrap to -128.
+
+    The kernel rounds into an int and clamps afterwards, so this is the case
+    that would have shown a clamp applied in the wrong order.
+    """
+    cos_sin = _make_cos_sin(8)
+    positions = torch.zeros(1, dtype=torch.int64, device=DEVICE)
+    q = torch.full((1, 1, INDEX_HEAD_DIM), 2.0, device=DEVICE, dtype=torch.bfloat16)
+    q[0, 0, 0] = -2.0
+    weights = torch.ones(1, 1, device=DEVICE, dtype=torch.bfloat16)
+
+    q_int8, _ = torch.ops._C.v41_indexer_q_rope_int8(
+        q, positions, cos_sin, weights, 1.0
+    )
+
+    # Position 0 rotates by the identity, so every lane holds +-amax exactly.
+    assert int(q_int8[0, 0, 0]) == -127
+    assert q_int8[0, 0, 1:].min().item() == 127
+
+
+def test_indexer_q_rope_int8_zero_row_does_not_divide_by_zero():
+    """An all-zero query row: the eps floor has to keep the scale finite."""
+    cos_sin = _make_cos_sin(8)
+    positions = torch.zeros(2, dtype=torch.int64, device=DEVICE)
+    q = torch.zeros(2, 4, INDEX_HEAD_DIM, device=DEVICE, dtype=torch.bfloat16)
+    weights = torch.ones(2, 4, device=DEVICE, dtype=torch.bfloat16)
+
+    q_int8, weights_out = torch.ops._C.v41_indexer_q_rope_int8(
+        q, positions, cos_sin, weights, 1.0
+    )
+
+    assert int(q_int8.abs().max()) == 0
+    assert torch.isfinite(weights_out).all()
+
+
+def test_indexer_q_rope_int8_empty_batch():
+    cos_sin = _make_cos_sin(8)
+    q = torch.empty(0, 4, INDEX_HEAD_DIM, device=DEVICE, dtype=torch.bfloat16)
+    weights = torch.empty(0, 4, device=DEVICE, dtype=torch.bfloat16)
+    positions = torch.empty(0, dtype=torch.int64, device=DEVICE)
+
+    q_int8, weights_out = torch.ops._C.v41_indexer_q_rope_int8(
+        q, positions, cos_sin, weights, 1.0
+    )
+
+    assert q_int8.shape == (0, 4, INDEX_HEAD_DIM)
+    assert q_int8.dtype == torch.int8
+    assert weights_out.shape == (0, 4)
+
+
 # ---------------------------------------------------------------------------
 # Pipeline transfer: the dense mirror, and replaying it into another cache
 # ---------------------------------------------------------------------------
@@ -617,8 +797,8 @@ def test_rope_insert_row_out_mirrors_the_page(compress_ratio: int):
         assert torch.all(rows[t] == 0)
 
 
-@pytest.mark.parametrize("store_fp8", [False, True])
-def test_indexer_k_store_row_out_mirrors_the_page(store_fp8: bool):
+@pytest.mark.parametrize("record", ["bf16", "fp8", "int8"])
+def test_indexer_k_store_row_out_mirrors_the_page(record: str):
     torch.manual_seed(10)
     num_tokens, rows_per_page, eps, compress_ratio = 48, 8, 1e-6, 2
     positions, slots, _, _, num_pages = _paged_layout(
@@ -628,8 +808,7 @@ def test_indexer_k_store_row_out_mirrors_the_page(store_fp8: bool):
     k_pre = torch.randn(num_tokens, INDEX_HEAD_DIM, device=DEVICE, dtype=torch.bfloat16)
     weight = torch.randn(INDEX_HEAD_DIM, device=DEVICE, dtype=torch.bfloat16)
 
-    row_bytes = INDEX_HEAD_DIM + 4 if store_fp8 else INDEX_HEAD_DIM
-    dtype = torch.uint8 if store_fp8 else torch.bfloat16
+    row_bytes, dtype = _indexer_record_row(record)
     cache = torch.zeros(num_pages, rows_per_page, row_bytes, device=DEVICE, dtype=dtype)
     rows = torch.zeros(num_tokens, row_bytes, device=DEVICE, dtype=dtype)
 
@@ -642,7 +821,7 @@ def test_indexer_k_store_row_out_mirrors_the_page(store_fp8: bool):
         cache,
         slots,
         compress_ratio,
-        store_fp8,
+        record,
         rows,
     )
 
@@ -650,12 +829,12 @@ def test_indexer_k_store_row_out_mirrors_the_page(store_fp8: bool):
     assert bool(ok.any())
     for t in torch.nonzero(ok).flatten().tolist():
         slot = int(slots[t])
-        if store_fp8:
+        if record == "bf16":
+            expected = cache[slot // rows_per_page, slot % rows_per_page]
+        else:
             expected = _packed_record_from_page(
                 cache, slot, rows_per_page, INDEX_HEAD_DIM, 4
             )
-        else:
-            expected = cache[slot // rows_per_page, slot % rows_per_page]
         assert torch.equal(rows[t], expected)
 
 
@@ -779,7 +958,7 @@ def test_move_rows_replays_the_indexer_record():
         sender_cache,
         send_slots,
         compress_ratio,
-        False,
+        "bf16",
         rows,
     )
     recv_cache = torch.zeros(

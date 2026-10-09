@@ -27,6 +27,17 @@ from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 
 
+def indexer_kv_dtype() -> str:
+    """Record the lightning indexer keeps its index keys in: ``bf16`` or ``int8``.
+
+    One answer per process, from ``VLLM_ILU_DS4_INDEXER_KV_DTYPE``. The
+    metadata builder, the model's indexer and the scoring op all have to agree
+    on it, and they are built at different points of startup, so none of them
+    may derive it from anything a later step can still change.
+    """
+    return envs.VLLM_ILU_DS4_INDEXER_KV_DTYPE
+
+
 @triton.jit
 def _prepare_uniform_decode_kernel(
     seq_lens_ptr,
@@ -1086,3 +1097,30 @@ class IluDeepseekV41IndexerBackend(IluDeepseekV4IndexerBackend):
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [64]
+
+
+class IluDeepseekV41IndexerRatio2Backend(IluDeepseekV41IndexerBackend):
+    """The same backend for a layer whose index keys are 2:1 compressed.
+
+    INT8 mqa-logits kernel only accepts a page of 64 or 256 index states.
+    A kernel block is counted in tokens, so a 2:1 layer needs twice as
+    many of them to hold the same 64 states as an uncompressed one.
+    """
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        return [128]
+
+
+def indexer_backend_cls(compress_ratio: int) -> type[AttentionBackend]:
+    """Pick the backend that pages a layer's index keys 64 states at a time.
+
+    Only INT8 needs this: its kernel takes a fixed page of states, while the
+    BF16 one accepts anything from 16 to 256 and is left on the 64-token block
+    it has always used. Each indexer layer sits alone in its KV cache group
+    (measured), so the two sizes never have to agree with each other or with
+    the main MLA.
+    """
+    if indexer_kv_dtype() == "int8" and compress_ratio == 2:
+        return IluDeepseekV41IndexerRatio2Backend
+    return IluDeepseekV41IndexerBackend

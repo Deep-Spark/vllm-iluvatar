@@ -207,6 +207,38 @@ __global__ void v41_mask_candidates_kernel(
   }
 }
 
+// Fold ``torch.topk``'s two outputs into the shortlist row ``out`` expects.
+// ``out`` is wider than ``k`` (it holds ``topk_blocks`` columns); the first
+// ``k`` take an index, unless that slot scored ``-inf`` -- a block with no
+// live column, which is padding, not a candidate -- and the tail is ``-1``.
+//
+// A NaN is left as a kept index: ``values != -inf`` is true for it, which is
+// the tie behaviour the reference keeps. The whole point of the kernel is that
+// the select, the int32 cast, the row copy and the tail fill the python used
+// to spell as four torch ops over the slice become one launch that writes
+// ``out`` once.
+template <typename scalar_t>
+__global__ void v41_write_candidate_topk_kernel(
+    const scalar_t* __restrict__ values, int64_t val_stride_row,
+    int64_t val_stride_col, const int64_t* __restrict__ indices,
+    int64_t idx_stride_row, int64_t idx_stride_col, int32_t* __restrict__ out,
+    int64_t out_stride_row, int64_t out_stride_col, int k, int out_width) {
+  const int64_t row = blockIdx.x;
+  for (int col = blockIdx.y * blockDim.x + threadIdx.x; col < out_width;
+       col += static_cast<int>(gridDim.y) * blockDim.x) {
+    int32_t v = -1;
+    if (col < k) {
+      const float score =
+          to_float(values[row * val_stride_row + col * val_stride_col]);
+      if (score != -INFINITY) {
+        v = static_cast<int32_t>(
+            indices[row * idx_stride_row + col * idx_stride_col]);
+      }
+    }
+    out[row * out_stride_row + col * out_stride_col] = v;
+  }
+}
+
 void check_logits(const torch::Tensor& logits) {
   TORCH_CHECK(logits.is_cuda() && logits.dim() == 2,
               "logits must be a 2D CUDA tensor [rows, width]");
@@ -268,6 +300,43 @@ torch::Tensor v41_candidate_block_scores(
           static_cast<int>(width), static_cast<int>(nblocks),
           static_cast<int>(block_size), static_cast<int>(row_repeat)));
   return scores;
+}
+
+void v41_write_candidate_topk(torch::Tensor& out, torch::Tensor& values,
+                              torch::Tensor& indices, int64_t k) {
+  TORCH_CHECK(out.is_cuda() && out.dim() == 2 &&
+                  out.scalar_type() == at::kInt,
+              "out must be a 2D int32 CUDA tensor [rows, topk_blocks]");
+  TORCH_CHECK(values.is_cuda() && values.dim() == 2,
+              "values must be a 2D CUDA tensor [rows, k]");
+  TORCH_CHECK(indices.is_cuda() && indices.dim() == 2 &&
+                  indices.scalar_type() == at::kLong,
+              "indices must be a 2D int64 CUDA tensor [rows, k]");
+
+  const int64_t rows = out.size(0);
+  const int64_t out_width = out.size(1);
+  TORCH_CHECK(k >= 0 && k <= out_width, "k must be in [0, out_width], got ", k,
+              " with out_width ", out_width);
+  TORCH_CHECK(values.size(0) >= rows && indices.size(0) >= rows,
+              "values / indices have fewer rows than out");
+  TORCH_CHECK(values.size(1) >= k && indices.size(1) >= k,
+              "values / indices are narrower than k");
+  if (rows == 0 || out_width == 0) {
+    return;
+  }
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const dim3 grid(static_cast<unsigned>(rows),
+                  static_cast<unsigned>(cdiv_i64(out_width, kThreads)));
+  VLLM_ILU_DISPATCH_LOGITS(
+      values.scalar_type(),
+      v41_write_candidate_topk_kernel<scalar_t><<<grid, kThreads, 0, stream>>>(
+          reinterpret_cast<const scalar_t*>(values.data_ptr()),
+          values.stride(0), values.stride(1), indices.data_ptr<int64_t>(),
+          indices.stride(0), indices.stride(1), out.data_ptr<int32_t>(),
+          out.stride(0), out.stride(1), static_cast<int>(k),
+          static_cast<int>(out_width)));
 }
 
 void v41_apply_candidate_mask(torch::Tensor& logits,

@@ -43,6 +43,38 @@ __device__ __forceinline__ int64_t load_index(const void* p, bool is_int64,
                   : static_cast<int64_t>(static_cast<const int32_t*>(p)[i]);
 }
 
+// log2 of ``value`` when it is a positive power of two, else -1. Host side:
+// kernels take the result as a parameter rather than deriving it per thread.
+inline int exact_log2(int64_t value) {
+  if (value <= 0 || (value & (value - 1)) != 0) {
+    return -1;
+  }
+  int shift = 0;
+  while ((int64_t{1} << shift) != value) {
+    ++shift;
+  }
+  return shift;
+}
+
+// Split a non-negative paged index into its page and its row inside that
+// page. ``shift`` is ``exact_log2(rows_per_page)``.
+//
+// The divide is worth avoiding even when it runs once per thread: this device
+// has no 64-bit integer divider, so ``slot / rows_per_page`` expands to a
+// software sequence long enough to show up as integer-pipeline pressure in a
+// kernel that otherwise only moves bytes.
+__device__ __forceinline__ void split_slot(int64_t slot, int rows_per_page,
+                                           int shift, int64_t& page,
+                                           int64_t& row) {
+  if (shift >= 0) {
+    page = slot >> shift;
+    row = slot & (rows_per_page - 1);
+  } else {
+    page = slot / rows_per_page;
+    row = slot % rows_per_page;
+  }
+}
+
 // Forward GPT-J RoPE on one adjacent pair. ``sin_v`` is the **negated** sine,
 // which is how ds4_rope spells its forward case and therefore how every V4.1
 // kernel on this platform spells it.

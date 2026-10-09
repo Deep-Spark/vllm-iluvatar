@@ -27,6 +27,7 @@ def _two_level_filter(
     logits: torch.Tensor,
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
+    valid_lens: torch.Tensor,
     candidate_blocks: torch.Tensor | None,
     candidate_block_size: int,
     candidate_write: bool,
@@ -51,13 +52,13 @@ def _two_level_filter(
     # column 0 is that request's first key, and ``dsa_update_topk_indices``
     # reads the span as ``ke - ks`` for exactly that reason. So the columns
     # start at zero and only the length carries over.
-    row_ke = cu_seqlen_ke - cu_seqlen_ks
+    # ``valid_lens`` is cu_seqlen_ke - cu_seqlen_ks
     rows = candidate_blocks[token_start:token_end]
     if candidate_write:
         select_candidate_blocks(
             logits,
             None,
-            row_ke,
+            valid_lens,
             rows.shape[1],
             candidate_block_size,
             rows,
@@ -66,10 +67,61 @@ def _two_level_filter(
         apply_candidate_mask(
             logits,
             None,
-            row_ke,
+            valid_lens,
             rows,
             candidate_block_size,
         )
+
+
+def _mqa_logits(
+    q: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    max_q_len: int,
+    max_kv_len: int,
+    max_context_len: int,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    valid_lens: torch.Tensor,
+) -> torch.Tensor:
+    """One chunk's paged MQA logits, per the record the query carries.
+
+    An INT8 query means an INT8 K cache, which only the ixinfer kernel reads.
+    It derives each row's visibility from ``valid_lens`` where the span kernel
+    takes the ``[ks, ke)`` pair; the two carry the same information, since the
+    length is all either one uses (see ``_two_level_filter``).
+    """
+    if q.dtype is torch.int8:
+        return ixfops.dsa_indexer_mqa_logits(
+            q,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            kv_cache,
+            block_table,
+            weights,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            max_context_len=max_context_len,
+            valid_lens=valid_lens,
+            backend="ixinfer",
+        )
+    return ixfops.dsa_indexer_mqa_logits_with_blocks(
+        q,
+        cu_seqlens_q,
+        cu_seqlens_kv,
+        kv_cache,
+        block_table,
+        weights,
+        max_q_len=max_q_len,
+        max_kv_len=max_kv_len,
+        max_context_len=max_context_len,
+        cu_seqlen_ks=cu_seqlen_ks,
+        cu_seqlen_ke=cu_seqlen_ke,
+    )
 
 
 def ilu_sparse_attn_indexer(
@@ -131,7 +183,7 @@ def ilu_sparse_attn_indexer(
         for chunk in prefill_metadata.chunks:
             if chunk.max_context_len == 0:
                 continue
-            logits = ixfops.dsa_indexer_mqa_logits_with_blocks(
+            logits = _mqa_logits(
                 q[chunk.token_start : chunk.token_end],
                 chunk.cu_seqlens_q,
                 chunk.cu_seq_lens,
@@ -143,11 +195,13 @@ def ilu_sparse_attn_indexer(
                 max_context_len=chunk.max_context_len,
                 cu_seqlen_ks=chunk.cu_seqlen_ks,
                 cu_seqlen_ke=chunk.cu_seqlen_ke,
+                valid_lens=chunk.valid_lens,
             )
             _two_level_filter(
                 logits,
                 chunk.cu_seqlen_ks,
                 chunk.cu_seqlen_ke,
+                chunk.valid_lens,
                 candidate_blocks,
                 candidate_block_size,
                 candidate_write,
@@ -176,7 +230,7 @@ def ilu_sparse_attn_indexer(
         # represented by cu_seqlens_q plus one causal [ks, ke) span per query
         # token. The same variable-query logits kernel used for prefill can
         # therefore handle requires_padding=True without an explicit pack step.
-        logits = ixfops.dsa_indexer_mqa_logits_with_blocks(
+        logits = _mqa_logits(
             q[:num_decode_tokens],
             decode_metadata.cu_seqlens_q,
             decode_metadata.cu_seqlens_kv,
@@ -188,12 +242,14 @@ def ilu_sparse_attn_indexer(
             max_context_len=decode_metadata.max_context_len,
             cu_seqlen_ks=decode_metadata.cu_seqlen_ks,
             cu_seqlen_ke=decode_metadata.cu_seqlen_ke,
+            valid_lens=decode_metadata.valid_lens,
         )
 
         _two_level_filter(
             logits,
             decode_metadata.cu_seqlen_ks,
             decode_metadata.cu_seqlen_ke,
+            decode_metadata.valid_lens,
             candidate_blocks,
             candidate_block_size,
             candidate_write,

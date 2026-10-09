@@ -131,7 +131,7 @@ __global__ void v41_compress_pool_norm_kernel(
     const float* __restrict__ kv_score, int64_t raw_stride,
     const void* __restrict__ positions, bool positions_are_int64,
     float* __restrict__ state, int64_t page_stride, int64_t row_stride,
-    int rows_per_page, int64_t num_pages,
+    int rows_per_page, int page_shift, int64_t num_pages,
     const void* __restrict__ slot_mapping, bool slots_are_int64,
     const void* __restrict__ query_start_loc, bool starts_are_int64,
     const void* __restrict__ token_to_req, bool reqs_are_int64,
@@ -153,7 +153,8 @@ __global__ void v41_compress_pool_norm_kernel(
     if (first_slot < 0) {
       return;
     }
-    const int64_t page = first_slot / rows_per_page;
+    int64_t page, unused_row;
+    split_slot(first_slot, rows_per_page, page_shift, page, unused_row);
     if (page >= num_pages) {
       return;
     }
@@ -164,8 +165,11 @@ __global__ void v41_compress_pool_norm_kernel(
     if ((pos + 1) % kPoolRatio == 0) {
       // A group of two closes on an odd position, so the predecessor row is
       // there and ``pos - 1`` never goes negative.
-      const float* prev_row = state + page * page_stride +
-                              ((pos - 1) % rows_per_page) * row_stride;
+      int64_t unused_page, prev_ring_row;
+      split_slot(pos - 1, rows_per_page, page_shift, unused_page,
+                 prev_ring_row);
+      const float* prev_row =
+          state + page * page_stride + prev_ring_row * row_stride;
       float even, odd;
       pool_rows(prev_row, kv_score + start * raw_stride, d0, even, odd);
       // Every lane has read the ring before the tail store below writes it.
@@ -183,12 +187,12 @@ __global__ void v41_compress_pool_norm_kernel(
       if (slot < 0) {
         continue;
       }
-      const int64_t tail_page = slot / rows_per_page;
+      int64_t tail_page, tail_row;
+      split_slot(slot, rows_per_page, page_shift, tail_page, tail_row);
       if (tail_page >= num_pages) {
         continue;
       }
-      float* dst = state + tail_page * page_stride +
-                   (slot % rows_per_page) * row_stride;
+      float* dst = state + tail_page * page_stride + tail_row * row_stride;
       const float* src = kv_score + token * raw_stride;
       *reinterpret_cast<float2*>(dst + d0) =
           *reinterpret_cast<const float2*>(src + d0);
@@ -232,21 +236,25 @@ __global__ void v41_compress_pool_norm_kernel(
 // lose a partner.
 __device__ __forceinline__ bool resolve_slot(
     const void* positions, bool positions_are_int64, const void* slot_mapping,
-    bool slots_are_int64, int64_t token, int compress_ratio, int rows_per_page,
-    int64_t num_pages, int64_t& page, int64_t& row, int64_t& rope_pos) {
+    bool slots_are_int64, int64_t token, int compress_ratio,
+    int compress_shift, int rows_per_page, int page_shift, int64_t num_pages,
+    int64_t& page, int64_t& row, int64_t& rope_pos) {
   const int64_t pos = load_index(positions, positions_are_int64, token);
   const int64_t slot = load_index(slot_mapping, slots_are_int64, token);
-  if (slot < 0 || (pos + 1) % compress_ratio != 0) {
+  const bool closes = compress_shift >= 0
+                          ? ((pos + 1) & (compress_ratio - 1)) == 0
+                          : (pos + 1) % compress_ratio == 0;
+  if (slot < 0 || !closes) {
     return false;
   }
-  page = slot / rows_per_page;
+  split_slot(slot, rows_per_page, page_shift, page, row);
   if (page >= num_pages) {
     return false;
   }
-  row = slot % rows_per_page;
   // A compressed row stands for a whole group; it is rotated against the
   // group's first raw position.
-  rope_pos = (pos / compress_ratio) * compress_ratio;
+  rope_pos = compress_shift >= 0 ? (pos & ~(int64_t{compress_ratio} - 1))
+                                 : (pos / compress_ratio) * compress_ratio;
   return true;
 }
 
@@ -264,14 +272,15 @@ __global__ void v41_rope_insert_packed_kernel(
     const void* __restrict__ positions, bool positions_are_int64,
     const float* __restrict__ cos_sin_cache, int64_t cos_sin_stride,
     uint8_t* __restrict__ cache, int64_t page_stride, int rows_per_page,
-    int64_t num_pages, const void* __restrict__ slot_mapping,
-    bool slots_are_int64, int compress_ratio,
+    int page_shift, int64_t num_pages, const void* __restrict__ slot_mapping,
+    bool slots_are_int64, int compress_ratio, int compress_shift,
     uint8_t* __restrict__ row_out) {
   const int64_t token = blockIdx.x;
   int64_t page, row, rope_pos;
   if (!resolve_slot(positions, positions_are_int64, slot_mapping,
-                    slots_are_int64, token, compress_ratio, rows_per_page,
-                    num_pages, page, row, rope_pos)) {
+                    slots_are_int64, token, compress_ratio, compress_shift,
+                    rows_per_page, page_shift, num_pages, page, row,
+                    rope_pos)) {
     return;
   }
 
@@ -351,14 +360,16 @@ __global__ void v41_rope_insert_plain_kernel(
     const void* __restrict__ positions, bool positions_are_int64,
     const float* __restrict__ cos_sin_cache, int64_t cos_sin_stride,
     __nv_bfloat16* __restrict__ cache, int64_t page_stride, int64_t row_stride,
-    int rows_per_page, int64_t num_pages,
+    int rows_per_page, int page_shift, int64_t num_pages,
     const void* __restrict__ slot_mapping, bool slots_are_int64,
-    int compress_ratio, __nv_bfloat16* __restrict__ row_out) {
+    int compress_ratio, int compress_shift,
+    __nv_bfloat16* __restrict__ row_out) {
   const int64_t token = blockIdx.x;
   int64_t page, row, rope_pos;
   if (!resolve_slot(positions, positions_are_int64, slot_mapping,
-                    slots_are_int64, token, compress_ratio, rows_per_page,
-                    num_pages, page, row, rope_pos)) {
+                    slots_are_int64, token, compress_ratio, compress_shift,
+                    rows_per_page, page_shift, num_pages, page, row,
+                    rope_pos)) {
     return;
   }
 
@@ -501,7 +512,8 @@ void v41_compress_pool_norm(torch::Tensor& kv_score, torch::Tensor& positions,
       kv_score.data_ptr<float>(), kv_score.stride(0), positions.data_ptr(),
       positions.scalar_type() == at::kLong, state_cache.data_ptr<float>(),
       state_cache.stride(0), state_cache.stride(1),
-      static_cast<int>(state_cache.size(1)), state_cache.size(0),
+      static_cast<int>(state_cache.size(1)),
+      exact_log2(state_cache.size(1)), state_cache.size(0),
       slot_mapping.data_ptr(), slot_mapping.scalar_type() == at::kLong,
       query_start_loc.data_ptr(),
       query_start_loc.scalar_type() == at::kLong,
@@ -587,8 +599,9 @@ void v41_rope_insert(torch::Tensor& latent, torch::Tensor& positions,
         latent_ptr, latent.stride(0), positions.data_ptr(),
         positions_are_int64, cos_sin_ptr, cos_sin_cache.stride(0),
         reinterpret_cast<uint8_t*>(kv_cache.data_ptr()), kv_cache.stride(0),
-        rows_per_page, num_pages, slot_mapping.data_ptr(), slots_are_int64,
-        static_cast<int>(compress_ratio),
+        rows_per_page, exact_log2(rows_per_page), num_pages,
+        slot_mapping.data_ptr(), slots_are_int64,
+        static_cast<int>(compress_ratio), exact_log2(compress_ratio),
         reinterpret_cast<uint8_t*>(row_ptr));
     return;
   }
@@ -602,9 +615,10 @@ void v41_rope_insert(torch::Tensor& latent, torch::Tensor& positions,
       latent_ptr, latent.stride(0), positions.data_ptr(), positions_are_int64,
       cos_sin_ptr, cos_sin_cache.stride(0),
       reinterpret_cast<__nv_bfloat16*>(kv_cache.data_ptr()),
-      kv_cache.stride(0), kv_cache.stride(1), rows_per_page, num_pages,
-      slot_mapping.data_ptr(), slots_are_int64,
-      static_cast<int>(compress_ratio),
+      kv_cache.stride(0), kv_cache.stride(1), rows_per_page,
+      exact_log2(rows_per_page), num_pages, slot_mapping.data_ptr(),
+      slots_are_int64, static_cast<int>(compress_ratio),
+      exact_log2(compress_ratio),
       reinterpret_cast<__nv_bfloat16*>(row_ptr));
 }
 

@@ -20,6 +20,7 @@ import pytest
 import torch
 
 ixfops = pytest.importorskip("ixformer.inference.functions")
+import vllm_iluvatar._C  # noqa: F401, E402  (registers torch.ops._C)
 from vllm.v1.attention.backends.mla.compressor_utils import (  # noqa: E402
     get_compressed_slot_mapping,
 )
@@ -29,6 +30,60 @@ DEVICE = "cuda"
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs a CUDA device"
 )
+
+
+def _ixformer_impl(
+    topk_indices,
+    token_to_req,
+    block_table,
+    block_size,
+    is_valid,
+    positions=None,
+    compress_ratio=0,
+    slot_limit=0,
+    pad_walk_tail=False,
+):
+    return ixfops.ds4_compute_global_topk_indices_and_lens(
+        topk_indices,
+        token_to_req,
+        block_table,
+        block_size,
+        is_valid,
+        positions,
+        compress_ratio,
+        slot_limit,
+        pad_walk_tail,
+    )
+
+
+def _plugin_impl(
+    topk_indices,
+    token_to_req,
+    block_table,
+    block_size,
+    is_valid,
+    positions=None,
+    compress_ratio=0,
+    slot_limit=0,
+    pad_walk_tail=False,
+):
+    return torch.ops._C.v41_global_topk_indices_and_lens(
+        topk_indices,
+        token_to_req,
+        block_table,
+        block_size,
+        is_valid,
+        positions,
+        compress_ratio,
+        slot_limit,
+        pad_walk_tail,
+    )
+
+
+# ``attention.py`` calls the plugin op; ixformer's is the kernel it was ported
+# from. Every semantic check below runs against both, so the port cannot drift.
+IMPLS = {"ixformer": _ixformer_impl, "plugin": _plugin_impl}
+impl_param = pytest.mark.parametrize("impl", IMPLS.values(), ids=IMPLS.keys())
 
 
 def _build_batch(seq_lens: list[int], rows_per_page: int, compress_ratio: int):
@@ -65,9 +120,12 @@ def _build_batch(seq_lens: list[int], rows_per_page: int, compress_ratio: int):
     query_start_loc[1:] = torch.cumsum(lens, 0)
     num_tokens = int(query_start_loc[-1])
 
-    # A full prefill: seq_len == query_len, so every request starts at 0.
+    # A full prefill: seq_len == query_len, so every request starts at 0, and
+    # no token is a replay, so none of their own slots is the PAD sentinel.
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=DEVICE)
     slots = get_compressed_slot_mapping(
         num_tokens,
+        slot_mapping,
         query_start_loc,
         lens,
         block_table,
@@ -85,8 +143,9 @@ def _build_batch(seq_lens: list[int], rows_per_page: int, compress_ratio: int):
     return positions, token_to_req, block_table, written, num_tokens
 
 
+@impl_param
 @pytest.mark.parametrize("compress_ratio", [1, 2])
-def test_global_topk_lands_on_the_rows_the_compressor_wrote(compress_ratio: int):
+def test_global_topk_lands_on_the_rows_the_compressor_wrote(impl, compress_ratio: int):
     """Identity selection must resolve to every group the token can see.
 
     Feeding ``[0, 1, 2, ...]`` is what the short-context bypass
@@ -106,7 +165,7 @@ def test_global_topk_lands_on_the_rows_the_compressor_wrote(compress_ratio: int)
     )
     is_valid = torch.ones(num_tokens, dtype=torch.bool, device=DEVICE)
 
-    global_indices, lens = ixfops.ds4_compute_global_topk_indices_and_lens(
+    global_indices, lens = impl(
         topk_indices,
         token_to_req,
         block_table,
@@ -134,8 +193,9 @@ def test_global_topk_lands_on_the_rows_the_compressor_wrote(compress_ratio: int)
         assert torch.all(global_indices[t, len(expected) :] == -1)
 
 
+@impl_param
 @pytest.mark.parametrize("compress_ratio", [1, 2])
-def test_global_topk_honours_selection_and_padding(compress_ratio: int):
+def test_global_topk_honours_selection_and_padding(impl, compress_ratio: int):
     """A sparse, out-of-order selection, plus CUDA-graph padding rows."""
     seq_lens = [12, 7]
     rows_per_page, topk = 4, 8
@@ -153,7 +213,7 @@ def test_global_topk_honours_selection_and_padding(compress_ratio: int):
     is_valid = torch.ones(num_tokens, dtype=torch.bool, device=DEVICE)
     is_valid[::5] = False
 
-    global_indices, lens = ixfops.ds4_compute_global_topk_indices_and_lens(
+    global_indices, lens = impl(
         topk_indices,
         token_to_req,
         block_table,
@@ -185,8 +245,9 @@ def test_global_topk_honours_selection_and_padding(compress_ratio: int):
         assert torch.all(global_indices[t, len(expected) :] == -1)
 
 
+@impl_param
 @pytest.mark.parametrize("compress_ratio", [1, 2])
-def test_global_topk_ignores_columns_past_the_causal_length(compress_ratio: int):
+def test_global_topk_ignores_columns_past_the_causal_length(impl, compress_ratio: int):
     """Stale columns of a long-lived buffer must not leak into the selection.
 
     ``topk_indices_buffer`` is reused across steps, so a row whose causal
@@ -203,7 +264,7 @@ def test_global_topk_ignores_columns_past_the_causal_length(compress_ratio: int)
     topk_indices = torch.zeros(num_tokens, topk, dtype=torch.int32, device=DEVICE)
     is_valid = torch.ones(num_tokens, dtype=torch.bool, device=DEVICE)
 
-    _, lens = ixfops.ds4_compute_global_topk_indices_and_lens(
+    _, lens = impl(
         topk_indices,
         token_to_req,
         block_table,
@@ -216,3 +277,56 @@ def test_global_topk_ignores_columns_past_the_causal_length(compress_ratio: int)
         min((int(positions[t]) + 1) // compress_ratio, topk) for t in range(num_tokens)
     ]
     assert lens.tolist() == expected
+
+
+# ``topk`` picks the plugin's block width (<=128, <=256, else 512 with a loop
+# for anything wider), so the matrix straddles each of those boundaries.
+@pytest.mark.parametrize("topk", [8, 128, 129, 256, 512, 1024])
+@pytest.mark.parametrize("pad_walk_tail", [False, True])
+@pytest.mark.parametrize("slot_limit", [0, 64])
+def test_plugin_matches_ixformer(topk: int, pad_walk_tail: bool, slot_limit: int):
+    """The port must be bit-identical to the kernel it was ported from.
+
+    The plugin op is the one ``_forward_decode`` calls, and it was rewritten
+    for speed against ixformer's block-scan shape. Nothing about that rewrite
+    may change an output, including the tail the reader over-reads under
+    ``pad_walk_tail`` and the rows dropped by ``slot_limit``.
+    """
+    num_tokens, num_reqs, rows_per_page, compress_ratio = 37, 5, 64, 2
+    generator = torch.Generator(device="cpu").manual_seed(topk)
+
+    block_table = torch.randint(
+        0, 24, (num_reqs, 9), generator=generator, dtype=torch.int32
+    ).to(DEVICE)
+    token_to_req = (torch.arange(num_tokens, dtype=torch.int32) % num_reqs).to(DEVICE)
+    positions = torch.randint(
+        0, 4096, (num_tokens,), generator=generator, dtype=torch.int64
+    ).to(DEVICE)
+    # -1 is the producer's sentinel; the high end overruns the block table so
+    # the out-of-range guard is exercised too.
+    topk_indices = torch.randint(
+        -1,
+        9 * rows_per_page + 32,
+        (num_tokens, topk),
+        generator=generator,
+        dtype=torch.int32,
+    ).to(DEVICE)
+    is_valid = torch.ones(num_tokens, dtype=torch.bool, device=DEVICE)
+    is_valid[::7] = False
+
+    args = (
+        topk_indices,
+        token_to_req,
+        block_table,
+        rows_per_page,
+        is_valid,
+        positions,
+        compress_ratio,
+        slot_limit,
+        pad_walk_tail,
+    )
+    ixf_indices, ixf_lens = _ixformer_impl(*args)
+    plugin_indices, plugin_lens = _plugin_impl(*args)
+
+    assert plugin_lens.tolist() == ixf_lens.tolist()
+    assert plugin_indices.tolist() == ixf_indices.tolist()

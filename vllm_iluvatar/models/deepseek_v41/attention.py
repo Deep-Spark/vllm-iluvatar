@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 import warnings
 from types import SimpleNamespace
@@ -59,8 +58,9 @@ from vllm_iluvatar.models.deepseek_v41.sparse_mla import (
     IluDeepseekV4FlashMLAMetadata,
 )
 from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
-    IluDeepseekV41IndexerBackend,
     get_max_prefill_buffer_size,
+    indexer_backend_cls,
+    indexer_kv_dtype,
 )
 from vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa import IluDeepseekV4SWACache
 
@@ -168,61 +168,34 @@ def _replace_layer_index(prefix: str, layer_id: int) -> str:
     return new_prefix
 
 
-# Record the indexer K cache holds, and with it the query's.
+# NO description
+_INDEXER_KV_DTYPE = indexer_kv_dtype()
+
+
+# One FP32 scale per row trails the values in a quantized index-key record.
+_INDEX_SCALE_BYTES = 4
+
+# Row width a quantized index-key page is *allocated* at, as opposed to the 132
+# bytes a record occupies.
 #
-# Deliberately a constant rather than ``--kv-cache-dtype``: the two are
-# independent choices, and reading the cache config here used to be a hazard.
-# ``_resolve_dsv4_kv_cache_dtype`` *rewrites* ``cache_config.cache_dtype`` as a
-# side effect, and it runs later in ``__init__`` than the indexer cache is
-# built, so whichever layer a rank happened to construct first decided the
-# indexer layout for that rank. On a cut where a rank starts on a kv source
-# (pp=4 rank 2 starts at layer 20, pp=5 rank 1 at layer 8) that rank ended up
-# with a bf16 cache while its peers had fp8, and the pipeline replica then
-# failed on a dtype mismatch.
+# ``unify_kv_cache_spec_page_size`` equalizes a cache group by scaling every
+# smaller spec's block_size by an integer ratio, so the index page has to
+# divide the group's largest page exactly. Here that largest page is the
+# sliding-window cache's 65536 bytes, not the main KV page -- a measured run
+# reports swa 65536, main 32768, compressor 32768 -- and 65536 is a pure power
+# of two. So the index page has to be one too, and since the page is
+# ``states * row`` with a power-of-two state count, the row has to be a power
+# of two. 132 is not, which is what the packed layout kept failing on; 256 is
+# the smallest one that still holds the record.
 #
-# Moving to "fp8" is not this constant alone: the scoring call in
-# ``sparse_attn_indexer.py`` has to become
-# ``dsa_indexer_mqa_logits_with_blocks_fp8`` (ivcore30-only, and it wants a
-# page whose row count is a multiple of 64) and the query goes through
-# ``v41_indexer_q_rope_fp8``, whose folded weights come back fp32. The kernels
-# for that path exist and are tested; only the wiring is missing.
-_INDEXER_KV_DTYPE = "bf16"
-
-_DBG_TOPK = os.environ.get("VLLM_V41_DEBUG_TOPK", "0") == "1"
-_dbg_topk_seen: dict[str, int] = {}
-
-
-def _dbg_topk(
-    prefix: str,
-    index_q: torch.Tensor,
-    index_weights: torch.Tensor,
-    topk_buffer: torch.Tensor,
-) -> None:
-    """Signature of one index source's inputs and its selection.
-
-    Comparable across TP / PP layouts: keyed by layer prefix, and the last row
-    is the token whose answer we look at.
-    """
-    seen = _dbg_topk_seen.get(prefix, 0)
-    if seen >= 2:
-        return
-    _dbg_topk_seen[prefix] = seen + 1
-    n = index_q.shape[0]
-    sel = topk_buffer[:n].to(torch.int64)
-    valid = sel >= 0
-    last = sel[-1][valid[-1]]
-    logger.info(
-        "[DBG-TOPK] %s #%s n=%s q=%.5f w=%.5f sel_sum=%s valid=%s last_n=%s last16=%s",
-        prefix,
-        seen,
-        n,
-        float(index_q.float().abs().sum()),
-        float(index_weights.float().abs().sum()),
-        int(sel[valid].sum()),
-        int(valid.sum()),
-        int(last.numel()),
-        sorted(last[:16].tolist()),
-    )
+# That makes a quantized page cost exactly what a bf16 page costs (128 values
+# x 2 bytes), so INT8 buys scoring bandwidth here, not cache capacity. The
+# record itself stays 132 bytes: ``bind_kv_cache`` hands the kernels a view
+# whose page pitch is the allocated 256 but whose row pitch is the record's
+# 132, so every page ends in bytes that nothing addresses. Both our store
+# kernel and ixformer's readers take the page pitch from ``stride(0)`` and
+# document support for exactly this layout.
+_INDEX_PAGE_ROW_BYTES = 256
 
 
 def _indexer_k_cache_row(index_head_dim: int, kv_dtype: str) -> tuple[int, torch.dtype]:
@@ -230,15 +203,17 @@ def _indexer_k_cache_row(index_head_dim: int, kv_dtype: str) -> tuple[int, torch
 
     FP8 is the V3.2 layout the paged scoring kernel reads: a page of
     ``index_head_dim`` E4M3 bytes per row followed by a page of one FP32 scale
-    per row, so the row is ``index_head_dim + 4`` bytes. BF16 rows are the
-    values alone.
+    per row, so the row is ``index_head_dim + 4`` bytes. INT8 is the same
+    geometry with the values reinterpreted, which is what ixformer's INT8
+    paged mqa-logits kernel reads. BF16 rows are the values alone.
     """
-    if kv_dtype == "fp8":
-        return index_head_dim + 4, torch.uint8
+    if kv_dtype in ("fp8", "int8"):
+        return index_head_dim + _INDEX_SCALE_BYTES, torch.uint8
     if kv_dtype == "bf16":
         return index_head_dim, torch.bfloat16
     raise ValueError(
-        f"unsupported indexer cache dtype {kv_dtype!r}; expected 'bf16' or 'fp8'"
+        f"unsupported indexer cache dtype {kv_dtype!r}; expected 'bf16', "
+        "'fp8' or 'int8'"
     )
 
 
@@ -276,7 +251,19 @@ class IluDeepseekV41IndexerCache(torch.nn.Module, AttentionLayerBase):
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         # [B, H=1, N, C] -> [B, N, C]
-        self.kv_cache = kv_cache.squeeze(1)
+        cache = kv_cache.squeeze(1)
+        if cache.size(-1) != self.head_dim:
+            # A quantized page is allocated wider than its record (see
+            # ``_INDEX_PAGE_ROW_BYTES``). Narrow it back to the record while
+            # keeping the allocated page pitch, which is what tells the kernels
+            # where the next page starts. The result is deliberately not
+            # contiguous, so ``view`` would refuse it and ``reshape`` would
+            # copy; ``as_strided`` is the only way to state this layout.
+            cache = cache.as_strided(
+                (cache.size(0), cache.size(1), self.head_dim),
+                (cache.stride(0), self.head_dim, 1),
+            )
+        self.kv_cache = cache
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         del vllm_config
@@ -286,13 +273,27 @@ class IluDeepseekV41IndexerCache(torch.nn.Module, AttentionLayerBase):
                 f"compress_ratio {self.compress_ratio}, or a page would hold a "
                 f"fractional row (layer {self.prefix})"
             )
+        if self.dtype is torch.uint8:
+            # No ``alignment``: a padded page would break both halves of what
+            # the page-size unification needs -- the rescaled page would no
+            # longer match the main one, and ``compute_layer_kv_cache_shape``
+            # refuses to split a padded page into kernel blocks at all. The
+            # 144-byte row is chosen so that no padding is needed.
+            return MLAAttentionSpec(
+                block_size=self.block_size,
+                num_kv_heads=1,
+                head_size=_INDEX_PAGE_ROW_BYTES,
+                dtype=self.dtype,
+                tokens_per_state=self.compress_ratio,
+            )
         return MLAAttentionSpec(
             block_size=self.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
-            # The indexer page shares a physical block with the main KV cache,
-            # so it carries the same padding.
+            # A no-op for the bf16 record -- a page of 256-byte rows is always
+            # a multiple of 512 -- but kept so the page keeps the main KV
+            # cache's alignment if that record ever changes width.
             alignment=512,
             tokens_per_state=self.compress_ratio,
         )
@@ -300,7 +301,7 @@ class IluDeepseekV41IndexerCache(torch.nn.Module, AttentionLayerBase):
     def forward(self): ...
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        return IluDeepseekV41IndexerBackend
+        return indexer_backend_cls(self.compress_ratio)
 
 
 class IluDeepseekV41Indexer(nn.Module):
@@ -344,9 +345,10 @@ class IluDeepseekV41Indexer(nn.Module):
         self.owns_k = owns_k
         self.k_row_buffer: torch.Tensor | None = None
         self.store_fp8_kv = _INDEXER_KV_DTYPE == "fp8"
+        self.store_int8_kv = _INDEXER_KV_DTYPE == "int8"
         logger.info_once(
             "Using %s indexer cache for Lightning Indexer.",
-            "FP8" if self.store_fp8_kv else "BF16",
+            _INDEXER_KV_DTYPE.upper(),
         )
 
         # no tensor parallel, just replicated
@@ -450,7 +452,7 @@ class IluDeepseekV41Indexer(nn.Module):
             k_cache,
             indexer_metadata.slot_mapping,
             self.compress_ratio,
-            self.store_fp8_kv,
+            _INDEXER_KV_DTYPE,
             row_out=self.k_row_buffer,
         )
 
@@ -512,6 +514,20 @@ class IluDeepseekV41Indexer(nn.Module):
                 self.softmax_scale * self.n_head**-0.5,
             )
             return q_fp8, None, folded_weights
+        if self.store_int8_kv:
+            # Same contract as the FP8 branch:
+            # the INT8 scoring kernel reads the folded fp32 weights and takes
+            # no companion scale tensor. One combined scale goes in -- the old
+            # W4A8 tree passed softmax_scale and the head scale separately and
+            # multiplied them inside the kernel.
+            q_int8, folded_weights = torch.ops._C.v41_indexer_q_rope_int8(
+                q,
+                positions,
+                rotary_emb.cos_sin_cache,
+                indexer_weights,
+                self.softmax_scale * self.n_head**-0.5,
+            )
+            return q_int8, None, folded_weights
         # In-place: q is rotated, weights are rescaled.
         torch.ops._C.v41_indexer_q_rope(
             q,
@@ -1362,8 +1378,6 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 None,
                 index_weights,
             )
-            if _DBG_TOPK and self.topk_indices_buffer is not None:
-                _dbg_topk(self.prefix, index_q, index_weights, self.topk_indices_buffer)
 
         self.forward_mqa(q, kv, positions, out)
 

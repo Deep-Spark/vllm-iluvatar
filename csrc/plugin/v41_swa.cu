@@ -38,72 +38,119 @@ using namespace v41;
 constexpr int kRowDim = 512;
 constexpr int kRopeDim = 64;
 constexpr int kRopeStart = kRowDim - kRopeDim;
-// One thread per GPT-J pair, so a whole row is four 64-lane warps and the
-// rotation band alone is half of one.
-constexpr int kRowThreads = kRowDim / kRopePacked;
-constexpr int kRopeThreads = kRopeDim / kRopePacked;
 
-// One block per (token, head). Only the trailing band moves, so the block
-// covers the band rather than the row.
-__global__ void v41_q_rope_kernel(__nv_bfloat16* __restrict__ q,
-                                  int64_t token_stride, int64_t head_stride,
-                                  const void* __restrict__ positions,
-                                  bool positions_are_int64,
-                                  const float* __restrict__ cos_sin_cache,
-                                  int64_t cos_sin_stride) {
-  const int64_t token = blockIdx.x;
-  const int64_t head = blockIdx.y;
-  const int pair = threadIdx.x;
+// Both kernels move bf16 in 16-byte units -- the widest access this data type
+// has -- so a thread owns four adjacent GPT-J pairs rather than one. That is
+// a quarter of the memory instructions of a pair-per-thread kernel, and these
+// kernels are small enough that their cost is instruction count and launch
+// shape rather than bandwidth.
+constexpr int kPairsPerThread = 4;
+constexpr int kElemsPerThread = kPairsPerThread * kRopePacked;  // 8 bf16 = 16 B
+// A whole 512-wide row is then one 64-lane warp.
+constexpr int kRowThreads = kRowDim / kElemsPerThread;
+// The 64-wide rotation band is eight lanes.
+constexpr int kRopeLanes = kRopeDim / kElemsPerThread;
+// Query rows are rotation band only, so a block batches whole heads to reach
+// a full warp; 32 heads is 256 threads.
+constexpr int kQRopeHeadsPerBlock = 32;
+constexpr int kQRopeThreads = kQRopeHeadsPerBlock * kRopeLanes;
 
-  const int64_t pos = load_index(positions, positions_are_int64, token);
-  __nv_bfloat16* const row = q + token * token_stride + head * head_stride;
-  __nv_bfloat162 v =
-      *reinterpret_cast<__nv_bfloat162*>(row + kRopeStart + pair * kRopePacked);
-  float even = __bfloat162float(v.x);
-  float odd = __bfloat162float(v.y);
-  rope_pair_at(even, odd, cos_sin_cache + pos * cos_sin_stride, pair, kRopeDim);
-  v.x = __float2bfloat16_rn(even);
-  v.y = __float2bfloat16_rn(odd);
-  *reinterpret_cast<__nv_bfloat162*>(row + kRopeStart + pair * kRopePacked) = v;
+// Rotate the four pairs packed into one 16-byte unit. ``first_pair`` is the
+// index of the unit's first pair inside the band.
+__device__ __forceinline__ void rope_quad(uint4& packed,
+                                          const float* __restrict__ cs_row,
+                                          int first_pair) {
+  __nv_bfloat162* const v = reinterpret_cast<__nv_bfloat162*>(&packed);
+#pragma unroll
+  for (int i = 0; i < kPairsPerThread; ++i) {
+    float even = __bfloat162float(v[i].x);
+    float odd = __bfloat162float(v[i].y);
+    rope_pair_at(even, odd, cs_row, first_pair + i, kRopeDim);
+    v[i].x = __float2bfloat16_rn(even);
+    v[i].y = __float2bfloat16_rn(odd);
+  }
 }
 
-// One block per token over the full 512-wide latent row: the trailing band is
-// rotated in place and the whole row is published.
-__global__ void v41_kv_rope_insert_kernel(
-    __nv_bfloat16* __restrict__ kv, int64_t kv_stride,
-    const void* __restrict__ positions, bool positions_are_int64,
-    const void* __restrict__ slot_mapping, bool slots_are_int64,
-    const float* __restrict__ cos_sin_cache, int64_t cos_sin_stride,
-    __nv_bfloat16* __restrict__ cache, int64_t page_stride, int64_t row_stride,
-    int rows_per_page, int64_t num_pages) {
-  const int64_t token = blockIdx.x;
-  const int d0 = threadIdx.x * kRopePacked;
-
-  __nv_bfloat16* const src = kv + token * kv_stride;
-  __nv_bfloat162 v = *reinterpret_cast<__nv_bfloat162*>(src + d0);
+// Rotate and publish the token's latent KV row. One warp covers all 512
+// channels at 16 bytes a lane.
+//
+// ``page_shift`` is the log2 of ``rows_per_page``, or -1 when it is not a
+// power of two. Splitting the slot with a shift rather than a 64-bit divide
+// is what takes this off the integer pipeline: the divide is emulated in
+// software and ran once per thread.
+__device__ __forceinline__ void kv_rope_insert_row(
+    __nv_bfloat16* __restrict__ kv, int64_t kv_stride, int64_t token,
+    const float* __restrict__ cs_row, const void* __restrict__ slot_mapping,
+    bool slots_are_int64, __nv_bfloat16* __restrict__ cache,
+    int64_t page_stride, int64_t row_stride, int rows_per_page, int page_shift,
+    int64_t num_pages, int lane) {
+  const int d0 = lane * kElemsPerThread;
+  __nv_bfloat16* const src = kv + token * kv_stride + d0;
+  uint4 packed = *reinterpret_cast<uint4*>(src);
 
   if (d0 >= kRopeStart) {
-    const int64_t pos = load_index(positions, positions_are_int64, token);
-    float even = __bfloat162float(v.x);
-    float odd = __bfloat162float(v.y);
-    rope_pair_at(even, odd, cos_sin_cache + pos * cos_sin_stride,
-                 (d0 - kRopeStart) / 2, kRopeDim);
-    v.x = __float2bfloat16_rn(even);
-    v.y = __float2bfloat16_rn(odd);
-    *reinterpret_cast<__nv_bfloat162*>(src + d0) = v;
+    rope_quad(packed, cs_row, (d0 - kRopeStart) / kRopePacked);
+    *reinterpret_cast<uint4*>(src) = packed;
   }
 
   const int64_t slot = load_index(slot_mapping, slots_are_int64, token);
   if (slot < 0) {
     return;
   }
-  const int64_t page = slot / rows_per_page;
+  int64_t page, row;
+  split_slot(slot, rows_per_page, page_shift, page, row);
   if (page >= num_pages) {
     return;
   }
-  const int64_t row = slot % rows_per_page;
-  *reinterpret_cast<__nv_bfloat162*>(cache + page * page_stride +
-                                     row * row_stride + d0) = v;
+  *reinterpret_cast<uint4*>(cache + page * page_stride + row * row_stride +
+                            d0) = packed;
+}
+
+// The query and the latent row share a token, a position and a cos/sin row,
+// and nothing either writes is read by the other, so they are one launch.
+// That matters more than what either does: at these shapes a launch costs
+// about as much as the work, and this op used to pay for two.
+//
+// ``blockIdx.y == 0`` is the latent row -- one warp of the block, the rest
+// exit -- and the remaining y cover ``kQRopeHeadsPerBlock`` query bands each.
+// Only the trailing band of a query head moves, so a block covers bands
+// rather than rows: one band per block came to a 32-thread block, which
+// leaves half of every 64-lane warp idle.
+__global__ void v41_qkv_rope_insert_kernel(
+    __nv_bfloat16* __restrict__ q, int64_t q_token_stride,
+    int64_t q_head_stride, int num_heads, __nv_bfloat16* __restrict__ kv,
+    int64_t kv_stride, const void* __restrict__ positions,
+    bool positions_are_int64, const void* __restrict__ slot_mapping,
+    bool slots_are_int64, const float* __restrict__ cos_sin_cache,
+    int64_t cos_sin_stride, __nv_bfloat16* __restrict__ cache,
+    int64_t page_stride, int64_t row_stride, int rows_per_page, int page_shift,
+    int64_t num_pages) {
+  const int64_t token = blockIdx.x;
+  const int64_t pos = load_index(positions, positions_are_int64, token);
+  const float* const cs_row = cos_sin_cache + pos * cos_sin_stride;
+
+  if (blockIdx.y == 0) {
+    if (threadIdx.x < kRowThreads) {
+      kv_rope_insert_row(kv, kv_stride, token, cs_row, slot_mapping,
+                         slots_are_int64, cache, page_stride, row_stride,
+                         rows_per_page, page_shift, num_pages,
+                         static_cast<int>(threadIdx.x));
+    }
+    return;
+  }
+
+  const int64_t head =
+      (blockIdx.y - 1) * kQRopeHeadsPerBlock + threadIdx.x / kRopeLanes;
+  if (head >= num_heads) {
+    return;
+  }
+  const int lane = threadIdx.x % kRopeLanes;
+  __nv_bfloat16* const unit = q + token * q_token_stride +
+                              head * q_head_stride + kRopeStart +
+                              lane * kElemsPerThread;
+  uint4 packed = *reinterpret_cast<uint4*>(unit);
+  rope_quad(packed, cs_row, lane * kPairsPerThread);
+  *reinterpret_cast<uint4*>(unit) = packed;
 }
 
 void check_index_tensor(const torch::Tensor& t, const char* name) {
@@ -116,6 +163,15 @@ void check_index_tensor(const torch::Tensor& t, const char* name) {
 void check_slot_tensor(const torch::Tensor& t, const char* name) {
   check_index_tensor(t, name);
   TORCH_CHECK(t.scalar_type() == at::kLong, name, " must be int64");
+}
+
+// The 16-byte accesses need every row this kernel addresses to start on a
+// 16-byte boundary. A torch allocation is aligned well past that, so this is
+// really a check on the strides.
+void check_wide_stride(int64_t stride, const char* name) {
+  TORCH_CHECK(stride % kElemsPerThread == 0, name,
+              " must be a multiple of ", kElemsPerThread,
+              " elements for 16-byte access, got ", stride);
 }
 
 }  // namespace
@@ -169,22 +225,28 @@ void v41_qkv_rope_insert(torch::Tensor& q, torch::Tensor& kv_cache,
   if (num_heads > 0) {
     TORCH_CHECK(num_tokens <= q.size(0),
                 "slot_mapping is longer than q");
-    v41_q_rope_kernel<<<dim3(static_cast<unsigned>(num_tokens),
-                             static_cast<unsigned>(num_heads)),
-                        kRopeThreads, 0, stream>>>(
-        reinterpret_cast<__nv_bfloat16*>(q.data_ptr()), q.stride(0),
-        q.stride(1), positions.data_ptr(), positions_are_int64, cos_sin_ptr,
-        cos_sin_cache.stride(0));
+    check_wide_stride(q.stride(0), "q.stride(0)");
+    check_wide_stride(q.stride(1), "q.stride(1)");
   }
+  check_wide_stride(kv.stride(0), "kv.stride(0)");
+  check_wide_stride(kv_cache.stride(0), "kv_cache.stride(0)");
+  check_wide_stride(kv_cache.stride(1), "kv_cache.stride(1)");
 
-  v41_kv_rope_insert_kernel<<<static_cast<unsigned>(num_tokens), kRowThreads, 0,
-                              stream>>>(
+  // y == 0 is the latent row; the rest are query head bands.
+  const unsigned head_blocks = static_cast<unsigned>(
+      (num_heads + kQRopeHeadsPerBlock - 1) / kQRopeHeadsPerBlock);
+  v41_qkv_rope_insert_kernel<<<
+      dim3(static_cast<unsigned>(num_tokens), head_blocks + 1), kQRopeThreads,
+      0, stream>>>(
+      reinterpret_cast<__nv_bfloat16*>(q.data_ptr()), q.stride(0), q.stride(1),
+      static_cast<int>(num_heads),
       reinterpret_cast<__nv_bfloat16*>(kv.data_ptr()), kv.stride(0),
       positions.data_ptr(), positions_are_int64, slot_mapping.data_ptr(),
       slots_are_int64, cos_sin_ptr, cos_sin_cache.stride(0),
       reinterpret_cast<__nv_bfloat16*>(kv_cache.data_ptr()),
       kv_cache.stride(0), kv_cache.stride(1),
-      static_cast<int>(kv_cache.size(1)), kv_cache.size(0));
+      static_cast<int>(kv_cache.size(1)), exact_log2(kv_cache.size(1)),
+      kv_cache.size(0));
 }
 
 }  // namespace vllm_iluvatar

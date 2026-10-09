@@ -401,16 +401,19 @@ void v41_qkv_rope_insert(torch::Tensor& q, torch::Tensor& kv_cache,
                          torch::Tensor& positions,
                          torch::Tensor& cos_sin_cache);
 
-// k_norm -> RoPE -> paged store for indexer keys. ``store_fp8`` picks the
-// record: bf16 [., ., 128], or uint8 [., ., 132] holding a page of 128 E4M3
-// bytes per row followed by a page of one fp32 scale per row.
+// k_norm -> RoPE -> paged store for indexer keys. ``record`` picks the layout:
+// "bf16" is [., ., 128]; "fp8" and "int8" share a uint8 [., ., 132] page
+// holding 128 value bytes per row followed by one fp32 scale per row, and
+// differ only in the quantizer (E4M3 on a power-of-two scale vs amax/127).
+// Only "fp8" needs FP8 hardware.
 void v41_indexer_k_norm_rope_store(torch::Tensor& k_pre,
                                    torch::Tensor& positions,
                                    torch::Tensor& cos_sin_cache,
                                    torch::Tensor& rms_norm_weight,
                                    double rms_norm_eps, torch::Tensor& k_cache,
                                    torch::Tensor& kv_slot_mapping,
-                                   int64_t compress_ratio, bool store_fp8,
+                                   int64_t compress_ratio,
+                                   const std::string& record,
                                    const std::optional<torch::Tensor>& row_out);
 
 // Place dense ``[num_tokens, record_width]`` rows received from an earlier
@@ -434,6 +437,13 @@ void v41_move_rows_to_paged_cache(torch::Tensor& rows, torch::Tensor& kv_cache,
 torch::Tensor v41_candidate_block_scores(
     torch::Tensor& logits, const std::optional<torch::Tensor>& row_ks,
     torch::Tensor& row_ke, int64_t block_size, int64_t row_repeat);
+
+// Fold ``torch.topk``'s (values, indices) into the shortlist ``out`` row: the
+// first ``k`` columns take an index (``-1`` where the slot scored ``-inf``),
+// the tail is ``-1``. Replaces the select / cast / copy / tail-fill the caller
+// otherwise spells as separate torch ops.
+void v41_write_candidate_topk(torch::Tensor& out, torch::Tensor& values,
+                              torch::Tensor& indices, int64_t k);
 
 // Set every logit outside the causal bounds or outside a shortlisted block to
 // ``-inf``, in place. A candidate whose first column lands past the logits
@@ -459,6 +469,17 @@ std::tuple<torch::Tensor, torch::Tensor> v41_indexer_q_rope_fp8(
     torch::Tensor& weights_in, double weights_scale);
 
 std::tuple<torch::Tensor, torch::Tensor> v41_indexer_q_rope_fp8_meta(
+    torch::Tensor& q, torch::Tensor& positions, torch::Tensor& cos_sin_cache,
+    torch::Tensor& weights_in, double weights_scale);
+
+// RoPE the index query and quantize it to INT8 against one ``amax / 127`` scale
+// per (token, head), folded into the returned fp32 weights for the same reason
+// as the FP8 op above. Needs no FP8 hardware.
+std::tuple<torch::Tensor, torch::Tensor> v41_indexer_q_rope_int8(
+    torch::Tensor& q, torch::Tensor& positions, torch::Tensor& cos_sin_cache,
+    torch::Tensor& weights_in, double weights_scale);
+
+std::tuple<torch::Tensor, torch::Tensor> v41_indexer_q_rope_int8_meta(
     torch::Tensor& q, torch::Tensor& positions, torch::Tensor& cos_sin_cache,
     torch::Tensor& weights_in, double weights_scale);
 

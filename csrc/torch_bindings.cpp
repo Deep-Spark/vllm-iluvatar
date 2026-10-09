@@ -103,7 +103,7 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
       "v41_indexer_k_norm_rope_store("
       "Tensor k_pre, Tensor positions, Tensor cos_sin_cache, "
       "Tensor rms_norm_weight, float rms_norm_eps, Tensor! k_cache, "
-      "Tensor kv_slot_mapping, int compress_ratio, bool store_fp8, "
+      "Tensor kv_slot_mapping, int compress_ratio, str record, "
       "Tensor(a!)? row_out=None) -> ()");
   ops.def(
       "v41_move_rows_to_paged_cache("
@@ -114,6 +114,9 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
       "Tensor logits, Tensor? row_ks, Tensor row_ke, int block_size, "
       "int row_repeat) -> Tensor");
   ops.def(
+      "v41_write_candidate_topk("
+      "Tensor! out, Tensor values, Tensor indices, int k) -> ()");
+  ops.def(
       "v41_apply_candidate_mask("
       "Tensor! logits, Tensor? row_ks, Tensor row_ke, "
       "Tensor candidate_blocks, int block_size, int row_repeat) -> ()");
@@ -123,6 +126,10 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
       "Tensor! weights_out, float weights_scale) -> ()");
   ops.def(
       "v41_indexer_q_rope_fp8("
+      "Tensor q, Tensor positions, Tensor cos_sin_cache, Tensor weights_in, "
+      "float weights_scale) -> (Tensor, Tensor)");
+  ops.def(
+      "v41_indexer_q_rope_int8("
       "Tensor q, Tensor positions, Tensor cos_sin_cache, Tensor weights_in, "
       "float weights_scale) -> (Tensor, Tensor)");
   ops.def(
@@ -333,11 +340,15 @@ TORCH_LIBRARY_IMPL_EXPAND(_C, CUDA, ops) {
            &vllm_iluvatar::v41_move_rows_to_paged_cache);
   ops.impl("v41_candidate_block_scores",
            &vllm_iluvatar::v41_candidate_block_scores);
+  ops.impl("v41_write_candidate_topk",
+           &vllm_iluvatar::v41_write_candidate_topk);
   ops.impl("v41_apply_candidate_mask",
            &vllm_iluvatar::v41_apply_candidate_mask);
   ops.impl("v41_indexer_q_rope", &vllm_iluvatar::v41_indexer_q_rope);
   ops.impl("v41_indexer_q_rope_fp8",
            &vllm_iluvatar::v41_indexer_q_rope_fp8);
+  ops.impl("v41_indexer_q_rope_int8",
+           &vllm_iluvatar::v41_indexer_q_rope_int8);
   ops.impl("v41_fill_short_context_topk",
            &vllm_iluvatar::v41_fill_short_context_topk);
   ops.impl("v41_swa_indices_and_lens",
@@ -408,6 +419,8 @@ TORCH_LIBRARY_IMPL_EXPAND(_C, Meta, ops) {
   ops.impl("engram_lookup_fp8", &vllm_iluvatar::engram_lookup_fp8_meta);
   ops.impl("v41_indexer_q_rope_fp8",
            &vllm_iluvatar::v41_indexer_q_rope_fp8_meta);
+  ops.impl("v41_indexer_q_rope_int8",
+           &vllm_iluvatar::v41_indexer_q_rope_int8_meta);
 }
 
 REGISTER_EXTENSION(_C)

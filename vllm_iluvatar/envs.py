@@ -113,10 +113,11 @@ if TYPE_CHECKING:
     VLLM_ILU_VIT_ATTN_LAYER: str = ""
     VLLM_ILU_GDN_ATTN_BACKEND: bool = False
     VLLM_ILU_DS4_PREFILL_OPT: bool = False
-    VLLM_ILU_DS4_PREFILL_AS_DECODE: bool = False
+    VLLM_ILU_DS4_PREFILL_AS_DECODE: bool = True
     VLLM_ILU_DS4_C4A_FUSED_INDEXCOMPRESS: bool = False
     VLLM_ILU_DS4_CANDIDATE_FILTER: bool = True
     VLLM_ILU_DS4_MQA_QUANT_TYPE: str = ""
+    VLLM_ILU_DS4_INDEXER_KV_DTYPE: str = "bf16"
     VLLM_ILU_FUSE_NORM_QUANT: bool = True
     VLLM_ILU_FUSE_MOE_W13: bool = True
     VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV: bool = True
@@ -186,11 +187,12 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
     ),
     # Route DeepSeek-V4 prefill through the per-token *decode* sparse MLA
     # kernel (ds4_flash_mla_with_kvcache) instead of the workspace-gather
-    # prefill kernel. bf16 KV cache only. See
+    # prefill kernel. bf16 KV cache only. Default on: it is the path the other
+    # two are checked against. See
     # IluDeepseekV4MLAAttention._forward_prefill_as_decode.
     "VLLM_ILU_DS4_PREFILL_AS_DECODE": lambda: (
         _get(
-            "VLLM_ILU_DS4_PREFILL_AS_DECODE", "VLLM_DS4_PREFILL_AS_DECODE", "0"
+            "VLLM_ILU_DS4_PREFILL_AS_DECODE", "VLLM_DS4_PREFILL_AS_DECODE", "1"
         ).lower()
         in ("1", "true")
     ),
@@ -338,6 +340,18 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_DS4_MQA_QUANT_TYPE": lambda: os.environ.get(
         "VLLM_ILU_DS4_MQA_QUANT_TYPE", ""
     ).upper(),
+    # Record the DeepSeek-V4.1 lightning indexer keeps its index keys in, which
+    # also decides the query's record and the scoring kernel that reads the
+    # pair. "bf16" (default) is plain 128-wide BF16 rows scored by the span
+    # kernel; "int8" is ixformer's scheme-A record -- 128 INT8 bytes plus one
+    # FP32 scale per row -- scored by the ixinfer INT8 paged mqa-logits kernel,
+    # which masks from ``valid_lens`` rather than a ``[ks, ke)`` pair. Read
+    # once per process: every layer of a rank must agree, and a rank whose
+    # indexer layout differed from its pipeline peers used to fail on a dtype
+    # mismatch mid-forward.
+    "VLLM_ILU_DS4_INDEXER_KV_DTYPE": lambda: (
+        os.environ.get("VLLM_ILU_DS4_INDEXER_KV_DTYPE", "bf16").strip().lower()
+    ),
     # IluGlm residual/RMSNorm+INT8 fusion. Default on (TP8 Graph ITL benefit);
     # set 0 to force the split RMSNorm path. Fail-closed at the call site.
     "VLLM_ILU_FUSE_NORM_QUANT": _bool_reader("VLLM_ILU_FUSE_NORM_QUANT", "1"),

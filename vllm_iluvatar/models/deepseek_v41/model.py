@@ -277,7 +277,8 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
             model_config = vllm_config.model_config
             self.model_path = model_config.model
             self._build_engram(
-                config, model_config,
+                config,
+                model_config,
                 lookback_is_prompt_only=not vllm_config.use_v2_model_runner,
             )
         # Flipped at the end of load_weights. The listener is up before that,
@@ -478,7 +479,11 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 )
 
     def _build_engram(
-        self, config, model_config, *, lookback_is_prompt_only: bool,
+        self,
+        config,
+        model_config,
+        *,
+        lookback_is_prompt_only: bool,
     ) -> None:
         """Create the shared token history and one IluEngram per engram layer.
 
@@ -641,7 +646,9 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 yield engram
 
     def _prepare_engram(
-        self, input_ids: torch.Tensor | None, positions: torch.Tensor,
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
         lookback_token_ids: torch.Tensor | None = None,
     ) -> None:
         """Hash once, then each engram layer gathers its rows before the decoder loop.
@@ -772,6 +779,7 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 assert self.candidate_idxs_buffer is not None
                 tensors["candidates"] = self.candidate_idxs_buffer[:num_tokens]
             tensors.update(self.pack_local_aux_hidden_states(aux_hidden_states))
+
             return IntermediateTensors(tensors)
         hidden_states = mhc.hc_pre(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)
@@ -860,13 +868,18 @@ class IluDeepseekV41ForCausalLM(IluDeepseekV4Fp8ForCausalLM, SupportsEagle3):
         return int(self.config.engram_max_ngram_size) - 1
 
     def forward(
-        self, input_ids: torch.Tensor, positions: torch.Tensor,
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         return self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds,
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
             lookback_token_ids=lookback_token_ids,
         )
 

@@ -17,11 +17,11 @@
   "pins": {
     "ixformer": {
       "branch": "master",
-      "commit": "475fae4e3d8cd5e40c677c1a2ee950a9726f655a"
+      "commit": "63ad530151c62e553bc0404ce2fd64fc41ec4d44"
     },
     "vllm": {
-      "branch": "iluvatar_main",
-      "commit": "9b71db2c9e9f24ce7682e5de270686bf429c114e"
+      "branch": "feat/v0.31.0",
+      "commit": "341bf7d4d1244424c94296ce4fc5626ad14b827a"
     }
   }
 }

@@ -62,20 +62,7 @@ class IluGateLinear(GateLinear):
         ):
             import ixformer.inference.functions as ixfops
 
-            # Same math and the same fp32 accumulator, with the k loop split
-            # across CTAs: the decode gate (N=384, K=5120) is bound by that
-            # loop, not by the grid. 44.1 us -> 16.5 at M=24, and it is the
-            # more accurate of the two (2.7e-07 against an fp32 reference vs
-            # 1.3e-06, because the stock op drops to a bf16-accumulating GEMV
-            # under IXFORMER_W16A16_GEMV_MAX_BATCH). Shapes the split cannot
-            # divide fall back to the stock op inside C++, bitwise equal, and
-            # IXFORMER_DS4_GATE_GEMM_SPLITK=1 disables the split outright.
-            # getattr keeps this working against an ixformer without the op.
-            gate_gemm = getattr(ixfops, "ds4_router_gate_gemm", None)
-            if gate_gemm is not None:
-                output = gate_gemm(x, self.weight)
-            else:
-                output = ixfops.gemm_bf16_bf16_fp32(x, self.weight, format="TN")
+            output = ixfops.gemm_bf16_bf16_fp32(x, self.weight, format="TN")
             return self._return(output)
 
         return super().forward(x)

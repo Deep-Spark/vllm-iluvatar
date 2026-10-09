@@ -131,10 +131,11 @@ class DeepEPAll2AllManagerBase(All2AllManagerBase):
     """
 
     def __init__(self, cpu_group, tcp_store_group=None):
-        assert has_deep_ep(), (
-            "DeepEP kernels not found. Please follow https://github.com/vllm-project/vllm/blob/main/tools/ep_kernels/README.md"
-            " to install DeepEP kernels."
-        )  # noqa
+        if not DISABLE_DEEPEP:
+            assert has_deep_ep(), (
+                "DeepEP kernels not found. Please follow https://github.com/vllm-project/vllm/blob/main/tools/ep_kernels/README.md"
+                " to install DeepEP kernels."
+            )  # noqa
         super().__init__(cpu_group, tcp_store_group)
         self.handle_cache = Cache()
 
@@ -357,17 +358,21 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
         num_global_experts: Number of experts in the model.
         num_local_experts: Number of experts in an EP rank.
         """
-        import deep_ep  # type: ignore[import-not-found]
-
         # Defaults for internode and intranode are taken from DeepEP tests.
         num_nvl_bytes = envs.VLLM_DEEPEP_BUFFER_SIZE_MB * 1024 * 1024
         num_qps_per_rank = num_local_experts
-        num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(
-            num_max_dispatch_tokens_per_rank=max_num_tokens_per_dp_rank,
-            hidden=token_hidden_size,
-            num_ranks=num_ep_ranks,
-            num_experts=num_global_experts,
-        )
+        if DISABLE_DEEPEP:
+            # NVSM initializes the real communication buffer later.
+            num_rdma_bytes = 0
+        else:
+            import deep_ep  # type: ignore[import-not-found]
+
+            num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(
+                num_max_dispatch_tokens_per_rank=max_num_tokens_per_dp_rank,
+                hidden=token_hidden_size,
+                num_ranks=num_ep_ranks,
+                num_experts=num_global_experts,
+            )
 
         assert num_rdma_bytes is not None
         # TODO: remove platform-specific logic
@@ -389,12 +394,14 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
         The kwargs for DeepEPLLAll2AllManager is dictated by
         _make_all2all_kwargs.
         """
-        import deep_ep  # type: ignore[import-not-found]
-
         buffer_kwargs = self._make_all2all_kwargs(**kwargs)
         logger.debug("DeepEP all2all args %s", buffer_kwargs)
+        if DISABLE_DEEPEP:
+            return self.handle_cache.get_or_create(buffer_kwargs, BufferWrapper)
+        import deep_ep  # type: ignore[import-not-found]
+
         handle: deep_ep.Buffer = self.handle_cache.get_or_create(
-            buffer_kwargs, deep_ep.Buffer if not DISABLE_DEEPEP else BufferWrapper
+            buffer_kwargs, deep_ep.Buffer
         )
         return handle
 

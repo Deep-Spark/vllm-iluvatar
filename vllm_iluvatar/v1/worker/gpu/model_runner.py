@@ -23,6 +23,7 @@ from __future__ import annotations
 from collections import defaultdict
 from contextlib import AbstractContextManager, nullcontext
 from copy import deepcopy
+from functools import wraps
 from typing import Any
 
 import torch
@@ -615,3 +616,25 @@ class IluvatarGPUModelRunner(GPUModelRunner):
         super().shutdown()
         if hasattr(self, "kv_scale_caches"):
             self.kv_scale_caches.clear()
+
+
+def make_pcp_pp_sample_tokens(original_sample_tokens):
+    """Use request rows, rather than PCP segment rows, for PP state handoff."""
+
+    @wraps(original_sample_tokens)
+    def sample_tokens(self, grammar_output):
+        state = self.execute_model_state
+        manager = self.pcp_manager
+        if state is not None and manager is not None and not self.is_last_pp_rank:
+            # Forward and PP p2p have already consumed the local, padded token
+            # slice. The non-last PP branch only receives sampled tokens and
+            # advances request state; both must use the same global batch as
+            # the last PP stage's sampler. Local DualChunkSwap rows can repeat
+            # a request index or omit a request entirely on an empty rank.
+            # No hidden-state gather is needed on this stage.
+            global_batch = manager._global_batch
+            assert global_batch is not None
+            self.execute_model_state = state._replace(input_batch=global_batch)
+        return original_sample_tokens(self, grammar_output)
+
+    return sample_tokens

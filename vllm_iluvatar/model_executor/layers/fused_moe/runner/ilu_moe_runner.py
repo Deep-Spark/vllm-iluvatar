@@ -167,6 +167,8 @@ class IluMoERunner(MoERunner):
             experts_order == SharedExpertsOrder.NO_OVERLAP
             and self.moe_config.in_dtype != torch.float16
             and not self.do_naive_dispatch_combine
+            # Routed tokens are gathered across PCP; shared experts stay local.
+            and self.moe_config.pcp_size == 1
         )
         use_mk_internal_shared_experts = (
             experts_order == SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
@@ -223,6 +225,7 @@ class IluMoERunner(MoERunner):
             and (
                 self.moe_config.in_dtype == torch.float16
                 or self.do_naive_dispatch_combine
+                or self.moe_config.pcp_size > 1
             )
         )
 
@@ -279,6 +282,13 @@ class IluMoERunner(MoERunner):
                 shared_output,
                 hidden_states,
             )
+            
+    @property
+    def _needs_pcp_dispatch_combine(self) -> bool:
+        return self.moe_config.pcp_size > 1 and (
+            not self.moe_config.moe_parallel_config.use_all2all_kernels
+            or not self._kernel_handles_own_dispatch
+        )
 
     # [ILU override] _maybe_dispatch — delta: propagate input_ids through
     # DP/EP dispatch + PCP all_gather, guard with _kernel_handles_own_dispatch.
@@ -306,7 +316,9 @@ class IluMoERunner(MoERunner):
                 assert len(result) == 2
                 hidden_states, router_logits = result
 
-        if self.moe_config.pcp_size > 1:
+        if self._needs_pcp_dispatch_combine:
+            # EP alone does not install a dispatch kernel. Native W4A8 still
+            # needs all PCP tokens on every expert shard before local GEMMs.
             hidden_states = get_pcp_group().all_gather(hidden_states, dim=0)
             router_logits = get_pcp_group().all_gather(router_logits, dim=0)
             if input_ids is not None:
@@ -326,7 +338,7 @@ class IluMoERunner(MoERunner):
                 hidden_states, self.moe_config.is_sequence_parallel
             )
 
-        if self.moe_config.pcp_size > 1:
+        if self._needs_pcp_dispatch_combine:
             hidden_states = get_pcp_group().reduce_scatter(hidden_states, dim=0)
 
         if shared_output is not None:

@@ -9,7 +9,7 @@ import types
 from vllm_iluvatar.ilu_patch import general_patch as p
 
 # v0.31.0 IluDeepseekV32IndexerMetadataBuilder.build.
-_BUILD_SOURCE_SHA = "b0cb28a43984d927657cad9ddde40e27a265f22fa72640adb72eca6be6ca38d1"
+_BUILD_SOURCE_SHA = "b9c654a4dab35b75a2d0b1acea56122e64f6665c6fbbe988249eb794e9f67d63"
 
 
 def register() -> None:

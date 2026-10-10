@@ -287,7 +287,9 @@ def test_nn_standard_experts_prefill_matches_monolithic(monkeypatch):
         w1_scale=layer.w13_weight_scale,
         w2_scale=layer.w2_weight_scale,
     )
-    monkeypatch.setattr(std_w4a8, "get_ep_group", lambda: SimpleNamespace(rank=1))
+    monkeypatch.setattr(
+        std_w4a8, "get_ep_group", lambda: SimpleNamespace(rank_in_group=1)
+    )
     rng = torch.Generator().manual_seed(41)
     x = torch.randn(33, 256, generator=rng).to("cuda", torch.bfloat16)
     ids = torch.randint(8, (33, 2), generator=rng, dtype=torch.int64).cuda()

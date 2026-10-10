@@ -54,7 +54,7 @@ def reference_ops(monkeypatch):
     )
 
 
-def make_indexer(monkeypatch, *, tokens=8, enabled=True, device="cpu"):
+def make_indexer(monkeypatch, *, tokens=8, enabled=True, device="cpu", pcp_size=1):
     monkeypatch.setattr(attn.envs, "VLLM_ILU_GLM_DSA_INDEXER_PREPARE_FUSION", enabled)
     generator = torch.Generator().manual_seed(81)
     q = torch.randn(tokens, 32 * 128, generator=generator).bfloat16()
@@ -79,6 +79,7 @@ def make_indexer(monkeypatch, *, tokens=8, enabled=True, device="cpu"):
     vc = SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=64),
         compilation_config=SimpleNamespace(static_forward_context={}),
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp_size),
     )
     monkeypatch.setattr(attn, "get_current_vllm_config", lambda: vc)
     layer = attn.IluGlmMoeDsaIndexer(
@@ -300,3 +301,23 @@ def test_meta_registered_fused_path(monkeypatch, default_vllm_config):
         )
     assert out.device.type == "meta"
     assert out.shape == (8, 4)
+
+
+@torch.inference_mode()
+def test_pcp_uses_split_preparation_without_local_fusion_ops(
+    monkeypatch, default_vllm_config
+):
+    monkeypatch.setattr(torch.ops, "_ixformer_C", SimpleNamespace())
+    layer = make_indexer(monkeypatch, pcp_size=2)
+    assert not layer.use_prepare_fusion
+    q = torch.zeros(8, 32, 128, dtype=torch.bfloat16)
+    layer.indexer_op._forward_method = Mock(return_value=q)
+    hidden = torch.zeros(8, 6144, dtype=torch.bfloat16)
+    layer(hidden, hidden, torch.arange(8), Rotary("cpu"))
+    args, kwargs = layer.indexer_op._forward_method.call_args
+    assert not kwargs.get("skip_k_cache_insert", False)
+    # K must have passed through normalization/RoPE before PCP gathers it.
+    raw_k = layer.wk_weights_proj.value[:, :128]
+    expected_k = layer.k_norm(raw_k)
+    rotate(expected_k, torch.arange(8), Rotary("cpu").trig)
+    torch.testing.assert_close(args[2], expected_k)

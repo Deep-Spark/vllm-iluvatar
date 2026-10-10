@@ -194,28 +194,6 @@ def test_get_max_decode_context_len_uses_cache_domain_upper_bound():
     assert get_max_decode_context_len(vllm_config, compress_ratio=4) == 1025
 
 
-def test_storage_block_size_wrapper_is_scoped_to_compressed_build():
-    seen = []
-
-    def original(self, common_prefix_len, common_attn_metadata, fast_build=False):
-        seen.append(self.kv_cache_spec.block_size)
-        return common_prefix_len, common_attn_metadata, fast_build
-
-    wrapped = make_storage_block_size_build(original)
-    builder = SimpleNamespace(
-        compress_ratio=4,
-        kv_cache_spec=SimpleNamespace(block_size=256, storage_block_size=64),
-    )
-
-    assert wrapped(builder, 3, "meta", True) == (3, "meta", True)
-    assert seen == [64]
-    assert builder.kv_cache_spec.block_size == 256
-
-    builder.compress_ratio = 1
-    wrapped(builder, 0, None)
-    assert seen == [64, 256]
-
-
 def test_pcp_dual_chunk_causal_spans_and_query_subchunks():
     """Runner represents each PCP segment as a request ending at its own position."""
     from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
@@ -240,6 +218,36 @@ def test_pcp_dual_chunk_causal_spans_and_query_subchunks():
     )
     assert sub.valid_lens.tolist() == [15]
     assert (sub.token_start, sub.token_end) == (2, 3)
+
+
+def test_pcp_single_token_prefill_is_not_a_replicated_decode(monkeypatch):
+    from vllm_iluvatar.v1.attention.backends.mla import ilu_indexer as mod
+
+    builder = object.__new__(mod.IluDeepseekV32IndexerMetadataBuilder)
+    builder.pcp_world_size = 2
+    builder.compress_ratio = 1
+    builder.use_flattening = False
+    builder.max_prefill_buffer_size = 100
+    builder.device = torch.device("cpu")
+    monkeypatch.setattr(mod.envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 1)
+    cm = SimpleNamespace(
+        num_reqs=1,
+        num_actual_tokens=1,
+        max_query_len=1,
+        max_seq_len=9,
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([9], dtype=torch.int32),
+        seq_lens=torch.tensor([9], dtype=torch.int32),
+        slot_mapping=torch.tensor([8, 9]),
+        block_table_tensor=torch.tensor([[0]]),
+        is_prefilling=torch.tensor([True]),
+    )
+    meta = builder.build(0, cm)
+    assert meta.num_decode_tokens == 0
+    assert meta.num_prefill_tokens == 1
+    assert meta.prefill.chunks[0].valid_lens.tolist() == [9]
+    assert meta.pcp_world_size == 2
 
 
 @pytest.mark.parametrize("seq_lens", [[0], [0, 0], [7, 0]])

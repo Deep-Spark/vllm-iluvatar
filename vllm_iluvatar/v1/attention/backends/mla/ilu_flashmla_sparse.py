@@ -66,6 +66,12 @@ structured as:
 
 
 class IluFlashMLASparseBackend(AttentionBackend):
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        # SparseMLACommonImpl advertises PCP, but the plugin V4 cache path
+        # does not implement its gather contract. GLM overrides this below.
+        return False
+
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
@@ -163,6 +169,7 @@ class IluFlashMLASparseMetadata(AttentionMetadata):
     # builder buffers for CUDA-graph capture/replay.
     c128a_global_topk_indices: torch.Tensor | None = None  # [num_actual, W] int32
     c128a_topk_lens: torch.Tensor | None = None  # [num_actual] int32
+    pcp_world_size: int = 1
 
 
 _C128A_TOPK_ALIGNMENT = 128
@@ -185,6 +192,7 @@ class IluFlashMLASparseMetadataBuilder(
         self.kv_cache_spec = kv_cache_spec
         self.model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
+        self.pcp_world_size = parallel_config.prefill_context_parallel_size
         self.device = device
 
         # Treat requests with query length <= 1 as decodes to match the
@@ -419,6 +427,7 @@ class IluFlashMLASparseMetadataBuilder(
         ) = split_decodes_and_prefills(
             cm,
             decode_threshold=self.reorder_batch_threshold or 1,
+            treat_short_extends_as_decodes=self.pcp_world_size == 1,
         )
 
         c128a_fields: dict[str, torch.Tensor | None] = {}
@@ -451,6 +460,7 @@ class IluFlashMLASparseMetadataBuilder(
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,
             compress_ratio=self.compress_ratio,
+            pcp_world_size=self.pcp_world_size,
             **c128a_fields,
         )
 

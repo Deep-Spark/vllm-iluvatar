@@ -104,9 +104,10 @@ def split_indexer_prefill_chunks(
             chunk_m, chunk_n = query_lens_cpu[end].item(), seq_lens_cpu[end].item()
             end += 1
 
+        # DualChunkSwap can leave a PCP rank with only empty segments. There
+        # are no local logits to compute; do not construct a zero-step range.
         if chunk_m == 0:
             continue
-
         req_slice = slice(start + request_offset, end + request_offset)
         max_q = max(1, max_logits_elems // chunk_n) if chunk_n > 0 else chunk_m
         for q_off in range(0, chunk_m, max_q):
@@ -117,6 +118,10 @@ def split_indexer_prefill_chunks(
 
 
 class IluDeepseekV32IndexerBackend(AttentionBackend):
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
+
     @staticmethod
     def get_name() -> str:
         return "DEEPSEEK_V32_INDEXER"
@@ -204,6 +209,7 @@ class IluDeepseekV32IndexerMetadata:
 
     decode: IluDeepSeekV32IndexerDecodeMetadata | None = None
     prefill: IluDeepseekV32IndexerPrefillMetadata | None = None
+    pcp_world_size: int = 1
 
 
 # TODO (zyongye) optimize this, this is now vibe coded
@@ -388,6 +394,9 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.pcp_world_size = (
+            self.vllm_config.parallel_config.prefill_context_parallel_size
+        )
         scheduler_config = self.vllm_config.scheduler_config
         # NOTE(Chen):an estimated max size of flattened_kv. Need to double check.
         self.max_prefill_buffer_size = get_max_prefill_buffer_size(self.vllm_config)
@@ -408,6 +417,10 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.compress_ratio = 1
         if isinstance(self.kv_cache_spec, MLAAttentionSpec):
             self.compress_ratio = self.kv_cache_spec.tokens_per_state
+        if self.pcp_world_size > 1 and self.compress_ratio != 1:
+            raise NotImplementedError(
+                "Iluvatar PCP requires an uncompressed indexer cache"
+            )
         self.max_decode_context_len = get_max_decode_context_len(
             self.vllm_config, self.compress_ratio
         )
@@ -922,6 +935,7 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 common_attn_metadata,
                 decode_threshold=self.reorder_batch_threshold,
                 require_uniform=not self.use_flattening,
+                treat_short_extends_as_decodes=self.pcp_world_size == 1,
             )
         )
 
@@ -1026,6 +1040,7 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             num_prefill_tokens=num_prefill_tokens,
             prefill=prefill_metadata,
             decode=decode_metadata,
+            pcp_world_size=self.pcp_world_size,
         )
 
         return attn_metadata
@@ -1072,6 +1087,10 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
 
 class IluDeepseekV4IndexerBackend(IluDeepseekV32IndexerBackend):
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return False
+
     @staticmethod
     def get_name() -> str:
         return "ILU_DEEPSEEK_V4_INDEXER"

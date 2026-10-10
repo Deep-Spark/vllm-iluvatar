@@ -10,6 +10,7 @@ from vllm import _custom_ops as ops
 from vllm import envs
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import CustomOp
+from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import _encode_layer_name, direct_register_custom_op
@@ -69,14 +70,20 @@ def ilu_sparse_attn_indexer(
     # kernel (see vllm_indexer_k_cache.cu ``if (slot_idx < 0) return;``).
     if not skip_k_cache_insert:
         num_tokens = slot_mapping.shape[0]
+        use_pcp = attn_metadata.pcp_world_size > 1
+        if use_pcp:
+            num_tokens //= attn_metadata.pcp_world_size
         k = k[:num_tokens]
+        k, slot_mapping = maybe_gather_indexer_k(
+            k, slot_mapping, num_decode_tokens, use_pcp
+        )
         ops.indexer_k_cache(k, kv_cache, slot_mapping)
 
     if has_prefill:
         prefill_metadata = attn_metadata.prefill
         assert prefill_metadata is not None
         for chunk in prefill_metadata.chunks:
-            if chunk.max_context_len == 0:
+            if chunk.max_context_len == 0 or chunk.token_start == chunk.token_end:
                 continue
             logits = _mqa_logits(
                 q[chunk.token_start : chunk.token_end],

@@ -231,7 +231,8 @@ class IluMoEStandardExpertsW4A8NN(_NNExpertsInit, IluMoEStandardExpertsW4A8):
             raise NotImplementedError("NN prefill requires dynamic per-channel W4A8")
         if hidden_states.dtype not in (torch.bfloat16, torch.float16):
             raise ValueError("NN prefill requires BF16 or FP16 activations")
-        start = get_ep_group().rank * self.local_num_experts
+        # Each PP stage owns a separate EP group; global rank includes PP.
+        start = get_ep_group().rank_in_group * self.local_num_experts
         end = min(start + self.local_num_experts, global_num_experts)
         rows = topk_ids.numel()
         group_layout = torch.empty(

@@ -20,20 +20,27 @@ Remove   : when upstream exposes a configurable block-size strategy.
 
 from __future__ import annotations
 
+from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.fp8_layout import (
+    use_fp8_ds_mla_wire_staging,
+)
+
 # Community types bound by patch_compressor._apply().
 VllmConfig = None
 KVCacheSpec = None
 SlidingWindowMLASpec = None
 
 
-# [ILU override] get_kv_cache_spec — delta: Iluvatar bf16 path uses a
-# different block_size derivation (fp8: 16384-byte bucket alignment;
-# bf16: 2x default) and drops the ``alignment`` kwarg entirely.
+# [ILU override] get_kv_cache_spec — delta: Iluvatar normally uses a different
+# block_size derivation (fp8: 16384-byte bucket alignment; bf16: 2x default).
+# FP8 wire staging requires D-compatible native 4/8 state granularity.
 def _ilu_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-    uses_fp8_ds_mla_layout = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
-    block_size = (
-        16384 // (self.state_dim * 4) if uses_fp8_ds_mla_layout else self.block_size * 2
-    )
+    is_fp8 = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+    if use_fp8_ds_mla_wire_staging(vllm_config):
+        block_size = self.block_size
+    elif is_fp8:
+        block_size = 16384 // (self.state_dim * 4)
+    else:
+        block_size = self.block_size * 2
     return SlidingWindowMLASpec(
         block_size=block_size,
         num_kv_heads=1,

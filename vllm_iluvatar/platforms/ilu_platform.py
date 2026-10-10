@@ -296,7 +296,8 @@ def _make_iluvatar_platform():
             # for the upstream "DeepseekV4ForCausalLM" arch. The Iluvatar W4A8
             # arch is OOT-registered under "IluDeepseekV4ForCausalLM", so set its
             # tokenizer_mode here (runs in VllmConfig.__post_init__, before the
-            # tokenizer is built).
+            # tokenizer is built). V4.1's upstream name is "DeepseekV41ForCausalLM"
+            # (mode deepseek_v41); the W4A8 arch is "IluDeepseekV41ForCausalLM".
             model_config = getattr(vllm_config, "model_config", None)
             if model_config is None:
                 return
@@ -311,14 +312,19 @@ def _make_iluvatar_platform():
                 archs = model_config.architectures or []
             except Exception:
                 archs = []
-            if (
-                "IluDeepseekV4ForCausalLM" in archs
-                and model_config.tokenizer_mode == "auto"
-            ):
-                model_config.tokenizer_mode = "deepseek_v4"
-                logger.info(
-                    "ILU: set tokenizer_mode='deepseek_v4' for IluDeepseekV4ForCausalLM"
-                )
+            if model_config.tokenizer_mode == "auto":
+                if "IluDeepseekV41ForCausalLM" in archs:
+                    model_config.tokenizer_mode = "deepseek_v41"
+                    logger.info(
+                        "ILU: set tokenizer_mode='deepseek_v41' for "
+                        "IluDeepseekV41ForCausalLM"
+                    )
+                elif "IluDeepseekV4ForCausalLM" in archs:
+                    model_config.tokenizer_mode = "deepseek_v4"
+                    logger.info(
+                        "ILU: set tokenizer_mode='deepseek_v4' for "
+                        "IluDeepseekV4ForCausalLM"
+                    )
 
         @classmethod
         def get_attn_backend_cls(

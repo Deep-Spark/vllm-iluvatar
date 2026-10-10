@@ -55,6 +55,12 @@ class IluNixlBaseConnector(NixlBaseConnector):
         )
         self.set_xfer_handshake_metadata(global_rank_metadata)
 
+    def wait_for_save(self):
+        assert self.connector_worker is not None
+        if self.connector_worker.fp8_wire_staging_enabled:
+            self.connector_worker.export_fp8_wire_staging(self._connector_metadata)
+        return super().wait_for_save()
+
 
 class IluNixlPullConnector(IluNixlBaseConnector):
     """Pull-based Ilu NIXL connector."""

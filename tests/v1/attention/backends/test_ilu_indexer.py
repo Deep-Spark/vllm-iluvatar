@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
@@ -12,6 +13,7 @@ from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
     get_max_prefill_buffer_size,
     kv_spans_from_batches,
     kv_spans_from_batches_device,
+    make_storage_block_size_build,
     split_indexer_prefill_chunks,
 )
 
@@ -190,3 +192,64 @@ def test_get_max_decode_context_len_uses_cache_domain_upper_bound():
 
     assert get_max_decode_context_len(vllm_config, compress_ratio=1) == 4097
     assert get_max_decode_context_len(vllm_config, compress_ratio=4) == 1025
+
+
+def test_storage_block_size_wrapper_is_scoped_to_compressed_build():
+    seen = []
+
+    def original(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        seen.append(self.kv_cache_spec.block_size)
+        return common_prefix_len, common_attn_metadata, fast_build
+
+    wrapped = make_storage_block_size_build(original)
+    builder = SimpleNamespace(
+        compress_ratio=4,
+        kv_cache_spec=SimpleNamespace(block_size=256, storage_block_size=64),
+    )
+
+    assert wrapped(builder, 3, "meta", True) == (3, "meta", True)
+    assert seen == [64]
+    assert builder.kv_cache_spec.block_size == 256
+
+    builder.compress_ratio = 1
+    wrapped(builder, 0, None)
+    assert seen == [64, 256]
+
+
+def test_pcp_dual_chunk_causal_spans_and_query_subchunks():
+    """Runner represents each PCP segment as a request ending at its own position."""
+    from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
+        IluDeepseekV32IndexerMetadataBuilder,
+    )
+
+    builder = object.__new__(IluDeepseekV32IndexerMetadataBuilder)
+    builder.device = torch.device("cpu")
+    builder.compress_ratio = 1
+    builder.max_prefill_buffer_size = 100
+    # One request with cached prefix 8, local segments [8,9] and [14,15].
+    starts = torch.tensor([0, 2, 4], dtype=torch.int32)
+    ends = torch.tensor([10, 16], dtype=torch.int32)
+    blocks = torch.tensor([[3], [3]], dtype=torch.int32)
+    chunk = builder.build_one_prefill_chunk(
+        slice(0, 2), slice(0, 4), starts, ends, blocks
+    )
+    assert chunk.valid_lens.tolist() == [9, 10, 15, 16]
+    assert chunk.cu_seqlens_q.tolist() == [0, 2, 4]
+    sub = builder.build_one_prefill_chunk(
+        slice(1, 2), slice(0, 1), starts, ends, blocks
+    )
+    assert sub.valid_lens.tolist() == [15]
+    assert (sub.token_start, sub.token_end) == (2, 3)
+
+
+@pytest.mark.parametrize("seq_lens", [[0], [0, 0], [7, 0]])
+def test_split_prefill_chunks_no_local_queries(seq_lens):
+    assert (
+        split_indexer_prefill_chunks(
+            torch.tensor(seq_lens),
+            torch.zeros(len(seq_lens), dtype=torch.int32),
+            workspace_size=32,
+            max_logits_bytes=64,
+        )
+        == []
+    )

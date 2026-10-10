@@ -10,7 +10,7 @@ added when the full environment is available.
 from __future__ import annotations
 
 from contextlib import nullcontext
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 import torch
@@ -429,3 +429,61 @@ class TestForwardImpl:
             expected_router_logits,
         )
         torch.testing.assert_close(result, torch.full((2, 3), 7.0))
+
+
+def test_pcp_shared_output_stays_local_until_routed_reduce_scatter():
+    runner = _make_stub_runner()
+    runner.moe_config.pcp_size = 2
+    runner.moe_config.is_sequence_parallel = False
+    runner._shared_experts._determine_shared_experts_order.return_value = (
+        SharedExpertsOrder.NO_OVERLAP
+    )
+    runner.routed_experts.quant_method.is_monolithic = False
+    runner.router = MagicMock()
+    runner.router.select_experts.return_value = (torch.ones(6, 1), torch.zeros(6, 1))
+    shared = torch.randn(3, 128)
+    routed = torch.randn(6, 128)
+    runner._shared_experts.output = shared
+    runner.routed_experts.forward_modular.return_value = routed
+    runner._maybe_apply_shared_experts = MagicMock()
+    out_shared, out_routed = runner._apply_quant_method(
+        routed, torch.zeros(6, 1), torch.zeros(3, 128)
+    )
+    assert out_shared is shared
+    assert out_routed is routed
+    assert (
+        runner.routed_experts.forward_modular.call_args.kwargs["shared_experts_input"]
+        is None
+    )
+
+
+@pytest.mark.parametrize("all2all", [False, True])
+@pytest.mark.parametrize("kernel_dispatch", [False, True])
+def test_pcp_moe_collectives_are_owned_by_one_dispatch_path(all2all, kernel_dispatch):
+    runner = _make_stub_runner(has_shared_experts=False)
+    runner.moe_config.pcp_size = 2
+    runner.moe_config.is_sequence_parallel = False
+    runner.moe_config.moe_parallel_config.use_all2all_kernels = all2all
+    group = MagicMock()
+    group.all_gather.side_effect = lambda x, dim: torch.cat((x, x), dim=dim)
+    group.reduce_scatter.side_effect = lambda x, dim: x.chunk(2, dim=dim)[0] * 2
+    x, logits, ids = torch.ones(3, 4), torch.ones(3, 2), torch.arange(3)
+    runner_dispatch = not all2all or not kernel_dispatch
+    with (
+        patch(
+            "vllm_iluvatar.model_executor.layers.fused_moe.runner.ilu_moe_runner.get_pcp_group",
+            return_value=group,
+        ),
+        patch.object(
+            IluMoERunner,
+            "_kernel_handles_own_dispatch",
+            new_callable=PropertyMock,
+            return_value=kernel_dispatch,
+        ),
+    ):
+        routed, scores, tokens = runner._maybe_dispatch(x, logits, ids)
+        output = runner._maybe_combine(None, routed)
+    assert group.all_gather.call_count == (3 if runner_dispatch else 0)
+    assert group.reduce_scatter.call_count == (1 if runner_dispatch else 0)
+    assert scores.shape[0] == tokens.shape[0] == (6 if runner_dispatch else 3)
+    torch.testing.assert_close(output, x * 2 if runner_dispatch else x)

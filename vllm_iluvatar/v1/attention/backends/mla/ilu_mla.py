@@ -364,6 +364,23 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
         if self.kv_cache_dtype.startswith("fp8"):
             raise NotImplementedError("FP8 ILU MLA not yet supported")
         self.use_int8_mla = envs.VLLM_ILU_MLA_ATTN_QUANT_TYPE == "INT8"
+        # DCP + INT8 MLA is only half-implemented: the decode kernel
+        # (vllm_paged_attention_mla_int8) supports the int8 KV cache + scale,
+        # but the DCP prefill context path (_context_parallel_compute_prefill_
+        # context -> ops.cp_gather_cache -> ixformer vllm_cp_gather_cache)
+        # only accepts fp16/bf16 src_cache and asserts on int8. Prefill is
+        # mandatory (every request's first step is a prefill), so without it
+        # decode is unreachable -- reject the whole combination at backend
+        # init rather than crashing obscurely inside the gather kernel during
+        # the profiling run.
+        _dcp_world_size = get_dcp_group().world_size
+        if _dcp_world_size > 1 and self.use_int8_mla:
+            raise NotImplementedError(
+                "DCP + INT8 MLA is not yet supported: the prefill KV gather "
+                "kernel vllm_cp_gather_cache only accepts fp16/bf16 KV cache. "
+                "Either disable DCP (--decode-context-parallel-size 1) or "
+                "disable INT8 MLA (unset VLLM_ILU_MLA_ATTN_QUANT_TYPE)."
+            )
         speculative_config = get_current_vllm_config().speculative_config
         self.use_spec_decode = (
             speculative_config is not None
@@ -1192,31 +1209,26 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
                 )
                 return attn_out, softmax_lse
             # <<< ILU MODIFICATION <<<
-            if self.use_int8_mla:
-                q_int8, q_scale = ops.quant_kv(q)
-                attn_out, softmax_lse = ixf_ops.vllm_paged_attention_mla_int8(
-                    o,
-                    q_int8,
-                    q_scale,
-                    kv_c_and_k_pe_cache,
-                    kv_c_and_k_pe_cache_scale,
-                    self.scale,
-                    decode_meta.block_table,
-                    decode_meta.seq_lens,
-                    max_decode_seq_len,
-                    return_softmax_lse=True,
-                )
-            else:
-                attn_out, softmax_lse = ixf_ops.vllm_paged_attention_mla(
-                    output=o,
-                    query=q,
-                    kv_cache=kv_c_and_k_pe_cache,
-                    scale=self.scale,
-                    block_tables=decode_meta.block_table,
-                    context_lens=decode_meta.seq_lens,
-                    max_context_len=max_decode_seq_len,
-                    return_softmax_lse=True,
-                )
+            # DCP + INT8 MLA is rejected at __init__ (vllm_cp_gather_cache, the
+            # prefill KV gather, only accepts fp16/bf16). This assert guards
+            # the DCP decode path: the int8 branch below is correct but
+            # unreachable until the prefill gather supports int8 KV cache.
+            # Re-enable by removing the __init__ guard + this assert together.
+            assert not self.use_int8_mla, (
+                "DCP + INT8 MLA decode path is unreachable: the combination "
+                "is rejected at __init__ because vllm_cp_gather_cache (prefill "
+                "KV gather) only accepts fp16/bf16 KV cache."
+            )
+            attn_out, softmax_lse = ixf_ops.vllm_paged_attention_mla(
+                output=o,
+                query=q,
+                kv_cache=kv_c_and_k_pe_cache,
+                scale=self.scale,
+                block_tables=decode_meta.block_table,
+                context_lens=decode_meta.seq_lens,
+                max_context_len=max_decode_seq_len,
+                return_softmax_lse=True,
+            )
             return attn_out, softmax_lse
 
         o = torch.empty(

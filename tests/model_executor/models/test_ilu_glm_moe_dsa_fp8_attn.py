@@ -223,6 +223,99 @@ def test_maybe_init_fp8_kv_scale_skips_during_capture(monkeypatch):
     assert float(mla._k_scale.item()) == pytest.approx(1.0)
 
 
+@pytest.mark.parametrize("slots, expected", [([-1, -1], None), ([-1, 7], 0.2)])
+def test_fp8_scale_ignores_dummy_and_padding_slots(monkeypatch, slots, expected):
+    mla = _sparse_mla_stub(
+        num_heads=8, use_fp8=True, prefix="model.layers.0.self_attn.attn"
+    )
+    mla._fp8_kv_scale_frozen = False
+    mla._k_scale = torch.ones(1, dtype=torch.float32)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    # Nonzero dummy projections must not freeze the scale; an invalid row
+    # with a much larger magnitude must not dominate real-token calibration.
+    kv_c = torch.tensor([[4480.0] * 512, [89.6] * 512])
+    mla._maybe_init_fp8_kv_scale(kv_c, torch.tensor(slots))
+    assert mla._fp8_kv_scale_frozen is (expected is not None)
+    assert mla._k_scale.item() == pytest.approx(1.0 if expected is None else expected)
+
+
+@pytest.mark.parametrize("pcp_size", [1, 2])
+@pytest.mark.parametrize("slots", [[-1, -1], [-1, 7]])
+def test_forward_fp8_calibration_filters_invalid_slots(monkeypatch, pcp_size, slots):
+    mla = _sparse_mla_stub(num_heads=1, use_fp8=True, prefix="attn")
+    mla.qk_nope_head_dim = mla.kv_lora_rank = mla.v_head_dim = 512
+    mla.qk_rope_head_dim = 64
+    mla.use_rms_rope_fp8_kv_fusion = False
+    mla._fp8_kv_scale_frozen = False
+    mla._k_scale = torch.ones(1)
+    mla.kv_cache = torch.zeros(1, 64, 640, dtype=torch.uint8)
+    mla.rotary_emb = lambda positions, q, k: (q, k)
+    mla._k_up_proj = lambda q: q
+    mla._v_up_proj = lambda x: x
+    mla._sparse_mla_kernel_fp8 = lambda q, *args: torch.zeros(len(q), 1, 512)
+    metadata = SimpleNamespace(
+        num_actual_tokens=2,
+        pcp_world_size=pcp_size,
+        num_decode_tokens=2,
+        slot_mapping=torch.tensor(slots * pcp_size),
+        block_size=64,
+    )
+    monkeypatch.setattr(
+        attn_mod,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"attn": metadata}),
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(attn_mod.ixf_ops, "glm_dsa_fp8_kv_insert", Mock())
+    mla.forward(
+        torch.zeros(2, 1, 576),
+        torch.tensor([[4480.0] * 512, [89.6] * 512]),
+        torch.zeros(2, 64),
+        torch.arange(2),
+    )
+    expected = 0.2 if slots[1] >= 0 else 1.0
+    assert mla._k_scale.item() == pytest.approx(expected)
+    assert mla._fp8_kv_scale_frozen is (slots[1] >= 0)
+
+
+@pytest.mark.parametrize("fail_warmup", [False, True])
+@pytest.mark.parametrize("pcp_size", [1, 2])
+def test_worker_warmup_calibration_scope(monkeypatch, fail_warmup, pcp_size):
+    from vllm.v1.worker.gpu_worker import Worker
+
+    from vllm_iluvatar.v1.worker.gpu_worker import IluWorker
+
+    mla = _sparse_mla_stub(
+        num_heads=8, use_fp8=True, prefix="model.layers.0.self_attn.attn"
+    )
+    mla._fp8_kv_scale_frozen = False
+    mla._k_scale = torch.ones(1, dtype=torch.float32)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    kv = torch.full((2, 512), 89.6)
+    slots = torch.tensor([0, 1])  # V2 warmup can use valid slots.
+
+    def warmup(self):
+        mla._maybe_init_fp8_kv_scale(kv, slots)
+        assert mla._fp8_kv_scale_frozen is (pcp_size == 1)
+        assert mla._k_scale.item() == pytest.approx(0.2 if pcp_size == 1 else 1.0)
+        if fail_warmup:
+            raise RuntimeError("warmup failed")
+        return "ready"
+
+    monkeypatch.setattr(Worker, "compile_or_warm_up_model", warmup)
+    worker = object.__new__(IluWorker)
+    worker.parallel_config = SimpleNamespace(prefill_context_parallel_size=pcp_size)
+    worker.model_runner = SimpleNamespace(model=SimpleNamespace(modules=lambda: [mla]))
+    if fail_warmup:
+        with pytest.raises(RuntimeError, match="warmup failed"):
+            worker.compile_or_warm_up_model()
+    else:
+        assert worker.compile_or_warm_up_model() == "ready"
+    mla._maybe_init_fp8_kv_scale(kv, slots)
+    assert mla._fp8_kv_scale_frozen
+    assert mla._k_scale.item() == pytest.approx(0.2)
+
+
 def _make_sparse_mla(
     monkeypatch,
     *,
@@ -231,6 +324,7 @@ def _make_sparse_mla(
     scale_frozen=True,
     op_available=None,
     num_heads=64,
+    pcp_size=1,
 ):
     """Exercise the actual constructor, including TP1's 64 local heads."""
     monkeypatch.setattr(attn_mod.envs, "VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV", env_enabled)
@@ -244,7 +338,10 @@ def _make_sparse_mla(
         attn_mod,
         "get_current_vllm_config",
         lambda: SimpleNamespace(
-            compilation_config=SimpleNamespace(static_forward_context={})
+            compilation_config=SimpleNamespace(static_forward_context={}),
+            parallel_config=SimpleNamespace(
+                prefill_context_parallel_size=pcp_size, decode_context_parallel_size=1
+            ),
         ),
     )
     if op_available is not None:
@@ -385,7 +482,7 @@ def test_tp1_kv_fusion_forward_and_graph(monkeypatch, cuda_device):
     mla._v_up_proj = lambda x: x[..., :256]
     mla._sparse_mla_kernel_fp8 = lambda q, *a: q
     metadata = SimpleNamespace(
-        num_actual_tokens=tokens, slot_mapping=slots, block_size=4
+        num_actual_tokens=tokens, slot_mapping=slots, block_size=4, pcp_world_size=1
     )
     monkeypatch.setattr(
         attn_mod,
@@ -431,3 +528,15 @@ def test_tp1_kv_fusion_forward_and_graph(monkeypatch, cuda_device):
         torch.testing.assert_close(k, k_ref, atol=0.01, rtol=0.01)
         assert torch.equal(mla.kv_cache, cache_ref)
         assert output.shape == (tokens, 64 * 256)
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_pcp_never_arms_local_kv_fusion(monkeypatch, frozen):
+    mla = _make_sparse_mla(
+        monkeypatch, pcp_size=2, scale_frozen=frozen, op_available=True
+    )
+    assert not mla.use_rms_rope_fp8_kv_fusion
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    mla._maybe_init_fp8_kv_scale(torch.full((2, 512), 2.0), torch.tensor([0, 1]))
+    assert mla._fp8_kv_scale_frozen
+    assert not mla.use_rms_rope_fp8_kv_fusion

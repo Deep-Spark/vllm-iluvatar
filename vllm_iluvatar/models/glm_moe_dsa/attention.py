@@ -51,6 +51,10 @@ from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.v1.attention.ops.pcp import (
+    maybe_gather_indexer_k,
+    maybe_gather_mla_latent_cache_inputs,
+)
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -96,6 +100,52 @@ _RMS_ROPE_FP8_KV_ENGAGE_LOGGED = False
 _RMS_ROPE_FP8_KV_SKIP_LOGGED = False
 _Q_A_NORM_QUANT_FAILED = False
 
+def _gather_and_cache_packed_fp8_kv(
+    kv_c: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    scale: torch.Tensor,
+    pcp_world_size: int,
+    num_decode_tokens: int,
+) -> None:
+    """Pack locally with a shared, frozen scale; gather 640 bytes per token.
+
+    The runner supplies rank-major padded slots. Pack only actual local rows;
+    padded rows still participate in the collective but never enter the cache.
+    Replicated decode rows are retained once by the upstream PCP helper.
+    """
+    local_tokens = slot_mapping.numel() // pcp_world_size
+    packed = torch.empty(
+        (local_tokens, 1, _GLM_DSA_FP8_ROW_BYTES),
+        dtype=torch.uint8,
+        device=kv_c.device,
+    )
+    if kv_c.shape[0] < local_tokens:
+        packed[kv_c.shape[0] :].zero_()
+    if kv_c.shape[0]:
+        ixf_ops.glm_dsa_fp8_kv_insert(
+            kv_c,
+            k_pe,
+            packed,
+            torch.arange(kv_c.shape[0], device=kv_c.device),
+            scale,
+            1,
+        )
+    # This public helper handles any single tensor, including packed byte rows.
+    packed, slots = maybe_gather_indexer_k(
+        packed[:, 0], slot_mapping, num_decode_tokens, True
+    )
+    # The uint8 specialization is a vectorized byte copy, with negative-slot
+    # masking. No dequantization or second FP8 conversion takes place here.
+    ixf_ops.vllm_concat_and_cache_mla(
+        packed[:, :512],
+        packed[:, 512:].unsqueeze(1),
+        kv_cache,
+        slots,
+        "auto",
+        scale,
+    )
 
 def _can_fuse_q_a_norm_quant(
     attn: "IluGlmMoeDsaMLAAttention",
@@ -211,6 +261,13 @@ def _yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
+class IluGlmMoeDsaPCPBackend(IluFlashMLASparseBackend):
+    """PCP support for the GLM cache path, independent of the V4 backend."""
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
+
 class IluGlmMoeDsaIndexerCache(torch.nn.Module, AttentionLayerBase):
     """BF16 lightning-indexer K cache for GLM-5.2 (ilu W4A8).
 
@@ -284,7 +341,12 @@ class IluGlmMoeDsaIndexer(nn.Module):
         self.head_dim = config.index_head_dim
         self.rope_dim = config.qk_rope_head_dim
         self.q_lora_rank = q_lora_rank
-        self.use_prepare_fusion = envs.VLLM_ILU_GLM_DSA_INDEXER_PREPARE_FUSION
+        # The fused K op inserts only local rows; PCP must gather normalized,
+        # rotated K before inserting the replicated cache.
+        self.use_prepare_fusion = (
+            envs.VLLM_ILU_GLM_DSA_INDEXER_PREPARE_FUSION
+            and vllm_config.parallel_config.prefill_context_parallel_size == 1
+        )
         if self.use_prepare_fusion:
             if self.head_dim != 128 or self.rope_dim != 64:
                 raise ValueError(
@@ -496,6 +558,7 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
     ``_v_up_proj_w8a8`` (``vllm/v1/attention/backends/mla/ilu_mla.py``). There
     is no BF16 absorb fallback (the converted checkpoint is always INT8).
     """
+    _fp8_kv_scale_calibration_enabled: bool = True
 
     def __init__(
         self,
@@ -602,7 +665,8 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
             torch.full((1,), init_scale, dtype=torch.float32),
             persistent=False,
         )
-
+        self._vllm_config = get_current_vllm_config()
+        use_pcp = self._vllm_config.parallel_config.prefill_context_parallel_size > 1
         fusion_requested = envs.VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV
         # Prefer the native Torch schema over the Python facade: the facade can
         # exist from a Python-only ixformer update while `_ixformer_C` still
@@ -620,6 +684,7 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
             and self.use_fp8_attn
             and fusion_op_available
             and fusion_heads_supported
+            and not use_pcp
         )
         self.use_rms_rope_fp8_kv_fusion = (
             self._rms_rope_fp8_kv_fusion_available and self._fp8_kv_scale_frozen
@@ -628,6 +693,8 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
             global _RMS_ROPE_FP8_KV_SKIP_LOGGED
             if not _RMS_ROPE_FP8_KV_SKIP_LOGGED:
                 reasons = []
+                if use_pcp:
+                    reasons.append("PCP requires gathering normalized/rotated KV")
                 if not self.use_fp8_attn:
                     reasons.append("KV cache is not fp8")
                 if not self._fp8_kv_scale_frozen:
@@ -655,7 +722,11 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
                 _RMS_ROPE_FP8_KV_ENGAGE_LOGGED = True
 
         self.kv_cache = torch.tensor([])
-        self._vllm_config = get_current_vllm_config()
+        if (
+            self._vllm_config.parallel_config.prefill_context_parallel_size > 1
+            and self._vllm_config.parallel_config.decode_context_parallel_size > 1
+        ):
+            raise NotImplementedError("GLM DSA PCP currently requires DCP=1")
         compilation_config = self._vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -667,7 +738,7 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         self.kv_cache = kv_cache.squeeze(1)
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        return IluFlashMLASparseBackend
+        return IluGlmMoeDsaPCPBackend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         if self.use_fp8_attn:
@@ -744,7 +815,9 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         results = ops.sparse_prefill_fwd(q, kv, indices, sm_scale, d_v)
         return results
 
-    def _maybe_init_fp8_kv_scale(self, kv_c: torch.Tensor) -> None:
+    def _maybe_init_fp8_kv_scale(
+        self, kv_c: torch.Tensor, slot_mapping: torch.Tensor | None = None
+    ) -> None:
         """Freeze kv_scale from the first eager insert that has a real amax.
 
         Online calibration is a bring-up fallback. Prefer
@@ -754,13 +827,22 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         non-positive amax: PP stages > 0 see an all-zero recv buffer during
         the profiling dummy run; freezing ``clamp(0)/448`` saturates later
         real tokens. Prefill stays eager under ``FULL_DECODE_ONLY``, so the
-        first real insert still calibrates.
+        first real insert still calibrates. Ignore padding and V2 warmup rows
+        with slot_mapping == -1: their projections can be nonzero even though
+        no KV is inserted.
         """
-        if self._fp8_kv_scale_frozen or kv_c.numel() == 0:
+        if (
+            not self._fp8_kv_scale_calibration_enabled
+            or self._fp8_kv_scale_frozen
+            or kv_c.numel() == 0
+        ):
             return
         if torch.cuda.is_current_stream_capturing():
             return
-        amax = float(kv_c.detach().float().abs().amax())
+        abs_kv = kv_c.detach().float().abs()
+        if slot_mapping is not None:
+            abs_kv = abs_kv.masked_fill(slot_mapping.reshape(-1, 1) < 0, 0.0)
+        amax = float(abs_kv.amax())
         if not math.isfinite(amax) or amax <= 0.0:
             return
         scale = amax / _GLM_DSA_FP8_E4M3_MAX
@@ -901,6 +983,7 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
 
         num_actual_toks = attn_metadata.num_actual_tokens
         kv_cache = self.kv_cache
+        use_pcp = attn_metadata.pcp_world_size > 1
 
         k_pe = k_pe.unsqueeze(1)
         q = q[:num_actual_toks]
@@ -910,27 +993,71 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
 
         use_rms_rope_fp8_kv_fusion = (
             self.use_rms_rope_fp8_kv_fusion
+            and not use_pcp
             and kv_rms_weight is not None
             and kv_cache.numel() > 0
         )
         if kv_rms_weight is not None and kv_rms_eps is None:
             raise ValueError("kv_rms_eps is required with kv_rms_weight")
-        if kv_rms_weight is not None and not use_rms_rope_fp8_kv_fusion:
+        if (
+            kv_rms_weight is not None
+            and not use_rms_rope_fp8_kv_fusion
+            and num_actual_toks > 0
+        ):
             kv_c_normed = ixf_ops.rms_norm(kv_c, kv_rms_weight, kv_rms_eps)
         else:
             kv_c_normed = kv_c
 
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        if not use_rms_rope_fp8_kv_fusion:
+        if not use_rms_rope_fp8_kv_fusion and num_actual_toks > 0:
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         # Absorbed k-up: (B, N, P) -> (B, N, kv_lora_rank).
-        q_nope = self._k_up_proj(q_nope)
-        q_nope = q_nope.view(-1, self.num_heads, self.kv_lora_rank)
+        if num_actual_toks > 0:
+            q_nope = self._k_up_proj(q_nope)
+            q_nope = q_nope.view(-1, self.num_heads, self.kv_lora_rank)
 
         if kv_cache.numel() > 0:
             slot_mapping = attn_metadata.slot_mapping.flatten()[:num_actual_toks]
-            if self.use_fp8_attn:
+            cache_kv_c, cache_k_pe = kv_c_normed, k_pe
+            use_packed_pcp = (
+                use_pcp
+                and self.use_fp8_attn
+                and self._fp8_kv_scale_frozen
+                and attn_metadata.num_decode_tokens
+                < attn_metadata.slot_mapping.numel() // attn_metadata.pcp_world_size
+            )
+            if use_packed_pcp:
+                _gather_and_cache_packed_fp8_kv(
+                    kv_c_normed,
+                    k_pe,
+                    kv_cache,
+                    attn_metadata.slot_mapping.flatten(),
+                    self._k_scale,
+                    attn_metadata.pcp_world_size,
+                    attn_metadata.num_decode_tokens,
+                )
+            elif use_pcp:
+                # Collective sizes and rank-major slot strides use the runner's
+                # padded length, including ranks with no local prefill tokens.
+                slot_mapping = attn_metadata.slot_mapping.flatten()
+                local_tokens = slot_mapping.numel() // attn_metadata.pcp_world_size
+                padding = local_tokens - num_actual_toks
+                if padding:
+                    cache_kv_c = torch.nn.functional.pad(cache_kv_c, (0, 0, 0, padding))
+                    cache_k_pe = torch.nn.functional.pad(
+                        cache_k_pe, (0, 0, 0, 0, 0, padding)
+                    )
+                cache_kv_c, cache_k_pe, slot_mapping = (
+                    maybe_gather_mla_latent_cache_inputs(
+                        cache_kv_c,
+                        cache_k_pe,
+                        slot_mapping,
+                        attn_metadata.num_decode_tokens,
+                        True,
+                    )
+                )
+            if self.use_fp8_attn and not use_packed_pcp:
                 if use_rms_rope_fp8_kv_fusion:
                     ixf_ops.fused_glm_dsa_rmsnorm_rope_fp8_kv_insert(
                         q_pe,
@@ -946,24 +1073,27 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
                         attn_metadata.block_size,
                     )
                 else:
-                    self._maybe_init_fp8_kv_scale(kv_c_normed)
+                    self._maybe_init_fp8_kv_scale(cache_kv_c, slot_mapping)
                     ixf_ops.glm_dsa_fp8_kv_insert(
-                        kv_c_normed,
-                        k_pe,
+                        cache_kv_c,
+                        cache_k_pe,
                         kv_cache,
                         slot_mapping,
                         self._k_scale,
                         attn_metadata.block_size,
                     )
-            else:
+            elif not self.use_fp8_attn:
                 ops.concat_and_cache_mla(
-                    kv_c_normed,
-                    k_pe,
+                    cache_kv_c,
+                    cache_k_pe,
                     kv_cache,
                     slot_mapping,
                     kv_cache_dtype=self.kv_cache_dtype,
                     scale=self._k_scale,
                 )
+                
+        if num_actual_toks == 0:
+            return q.new_zeros((num_tokens, self.num_heads * self.v_head_dim))
 
         if self.use_fp8_attn:
             attn_out = self._sparse_mla_kernel_fp8(
@@ -975,6 +1105,8 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
 
         output = q_nope.new_empty((num_tokens, self.num_heads, self.v_head_dim))
         output[:num_actual_toks] = self._v_up_proj(attn_out)
+        if use_pcp and num_actual_toks < num_tokens:
+            output[num_actual_toks:].zero_()
         return output.view(num_tokens, self.num_heads * self.v_head_dim)
 
 

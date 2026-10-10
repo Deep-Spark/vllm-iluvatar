@@ -41,6 +41,10 @@ from vllm.distributed import (
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 
+from vllm_iluvatar.model_executor.layers.fused_moe.ilu_moe_padding import (
+    _gathered_router_padding,
+)
+
 from vllm_iluvatar.model_executor.layers.fused_moe.prepare_finalize.ilu_deepep_ll import (
     VLLM_ILU_DEEPEP_USE_SCATTER,
     VLLM_ILU_LL_FUSED_AG_AR,
@@ -581,12 +585,13 @@ class IluFusedMoEEP:
                 router_logits, _ = runner.gate(hidden_states)
             else:
                 router_logits, _ = self.gate(hidden_states)
-            topk_weights, topk_ids = runner.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                topk_indices_dtype=quant_method.topk_indices_dtype,
-                input_ids=router_input_ids,
-            )
+            with _gathered_router_padding(ctx, dist_group, sizes):
+                topk_weights, topk_ids = runner.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    topk_indices_dtype=quant_method.topk_indices_dtype,
+                    input_ids=router_input_ids,
+                )
             shared_output = None
             apply_fused_moe = (
                 getattr(quant_method, "apply_fused_moe", None)

@@ -53,6 +53,10 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
 )
 from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
 
+from vllm_iluvatar.model_executor.layers.fused_moe.ilu_moe_padding import (
+    _gathered_router_padding,
+)
+
 logger = init_logger("vllm." + __name__)
 
 
@@ -635,13 +639,14 @@ class IluMoERunner(MoERunner):
             else:
                 router_logits, _ = self.gate(hidden_states)
 
-            shared_output, fused_output = self._apply_quant_method(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                shared_experts_input=shared_experts_input,
-                input_ids=input_ids,
-                shared_experts_overlapping=shared_experts_overlapping,
-            )
+            with _gathered_router_padding(get_forward_context(), dp_group, sizes):
+                shared_output, fused_output = self._apply_quant_method(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    shared_experts_input=shared_experts_input,
+                    input_ids=input_ids,
+                    shared_experts_overlapping=shared_experts_overlapping,
+                )
 
         assert not isinstance(fused_output, UnfinalizedMoEOutput), (
             "fused EP combine requires a materialized routed output"

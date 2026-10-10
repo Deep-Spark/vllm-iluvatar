@@ -10,6 +10,7 @@ added when the full environment is available.
 from __future__ import annotations
 
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -64,6 +65,7 @@ def _make_stub_runner(
     moe_config.hidden_dim_unpadded = 128
 
     obj.moe_config = moe_config
+    obj._ilu_fused_ep_combine_cached = False
     obj.routed_scaling_factor = routed_scaling_factor
     obj.shared_experts_scaling_factor = 1.0
 
@@ -88,6 +90,47 @@ class UnquantizedFusedMoEMethod(CommunityUnquantizedFusedMoEMethod):
 # ---------------------------------------------------------------------------
 # CPU-only tests
 # ---------------------------------------------------------------------------
+
+
+def test_fused_ep_prefill_routes_with_global_padding(monkeypatch):
+    from vllm_iluvatar import _custom_ops
+    from vllm_iluvatar.model_executor.layers.fused_moe.runner import ilu_moe_runner
+
+    runner = _make_stub_runner(has_shared_experts=False)
+    runner._fse_fuse_gate = False
+    runner.gate = lambda value: (value, None)
+    local_mask = torch.tensor([False, True])
+    ctx = SimpleNamespace(is_padding=local_mask)
+    mask_gathers = []
+
+    def gather(value, **kwargs):
+        if value.dtype == torch.int8:
+            mask_gathers.append(value.clone())
+            return torch.cat([value, torch.tensor([0, 1, 0], dtype=torch.int8)])
+        return torch.cat([value, torch.ones(3, 2)])
+
+    group = SimpleNamespace(rank_in_group=0, all_gatherv=gather)
+    monkeypatch.setattr(ilu_moe_runner, "get_dp_group", lambda: group)
+    monkeypatch.setattr(ilu_moe_runner, "get_forward_context", lambda: ctx)
+    monkeypatch.setattr(ilu_moe_runner.envs, "VLLM_MOE_SKIP_PADDING", True)
+    monkeypatch.setattr(runner, "_ilu_dp_chunk_sizes", lambda: [2, 3])
+    monkeypatch.setattr(runner, "_sequence_parallel_context", nullcontext)
+
+    def apply(hidden_states, **kwargs):
+        weights = torch.ones(5, 1)
+        ids = torch.zeros(5, 1, dtype=torch.int32)
+        _custom_ops._mask_topk_padding(weights, ids, ctx.is_padding)
+        assert ids[:, 0].tolist() == [0, -1, 0, -1, 0]
+        return None, hidden_states
+
+    monkeypatch.setattr(runner, "_apply_quant_method", apply)
+    for _ in range(2):
+        _, output = runner._forward_impl_fused_ep_combine(
+            torch.ones(2, 2), torch.ones(2, 2), None, None,
+        )
+        assert output.shape == (5, 2)
+        assert ctx.is_padding is local_mask
+    assert len(mask_gathers) == 1
 
 
 class TestInheritance:

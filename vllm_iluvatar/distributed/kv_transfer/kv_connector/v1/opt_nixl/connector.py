@@ -177,6 +177,13 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
     # Scheduler Side Methods
     ############################################################
 
+    @property
+    def prefix_replay_alignment(self) -> int | None:
+        """Optional token alignment for complete remote-prefix replay."""
+        if self.connector_scheduler is None:
+            return None
+        return self.connector_scheduler.prefix_replay_alignment
+
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:

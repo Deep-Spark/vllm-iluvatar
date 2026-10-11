@@ -29,8 +29,11 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import make_zmq_path, make_zmq_socket
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
     MambaSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -203,6 +206,33 @@ class NixlConnectorScheduler:
             "kv_consumer",
         ], f"Unsupported kv role: {vllm_config.kv_transfer_config.kv_role}"
         self.is_consumer = vllm_config.kv_transfer_config.kv_role == "kv_consumer"
+        # Partial prompt blocks are private receive destinations; the even hit
+        # keeps CR2 replay aligned and its first SWA block live.
+        replay_specs = [s for s in self._all_specs if s.prefix_replay_tokens]
+        self.prefix_replay_alignment = (
+            2
+            if os.getenv("VLLM_ILU_V41_REMOTE_REPLAY_ALIGN2", "0") == "1"
+            and self.is_consumer
+            and vllm_config.model_config.hf_config.model_type == "deepseek_v41"
+            and not self._has_mamba
+            and replay_specs
+            and all(
+                isinstance(s, SlidingWindowMLASpec)
+                and s.prefix_replay_tokens == 128
+                and s.block_size == 64
+                for s in replay_specs
+            )
+            and all(
+                isinstance(
+                    s,
+                    (SlidingWindowMLASpec, MLAAttentionSpec, CircularBufferSpec),
+                )
+                and getattr(s, "tokens_per_state", 1) in (1, 2)
+                for s in self._all_specs
+            )
+            else None
+        )
+        logger.info("Remote-prefix replay alignment: %s", self.prefix_replay_alignment)
         pp_split: list[int] = []
         pp_world_size = vllm_config.parallel_config.pipeline_parallel_size
         num_hidden_layers = (

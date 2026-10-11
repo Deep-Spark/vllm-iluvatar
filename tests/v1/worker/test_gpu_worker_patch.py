@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from types import ModuleType
 
@@ -48,7 +49,11 @@ def _stub_gpu_worker(monkeypatch):
     worker_package.gpu = gpu_package
     gpu_package.model_runner = gpu_model_runner_mod
 
+    logger_mod = ModuleType("vllm.logger")
+    logger_mod.init_logger = logging.getLogger
+
     modules = {
+        "vllm.logger": logger_mod,
         "vllm": vllm_mod,
         "vllm.v1": vllm_v1_mod,
         "vllm.v1.worker": worker_package,
@@ -203,8 +208,12 @@ def test_pcp_profile_does_not_change_other_runner_modes(v2, pcp, spec):
         assert "_dummy_run" not in vars(runner)
 
 
-def test_non_pcp_warmup_does_not_inspect_glm_layers(monkeypatch):
+def test_non_glm_warmup_delegates_to_upstream(monkeypatch):
     from types import SimpleNamespace
+
+    attention = ModuleType("vllm_iluvatar.models.glm_moe_dsa.attention")
+    attention.IluGlmMoeDsaSparseMLA = type("GlmLayer", (), {})
+    monkeypatch.setitem(sys.modules, attention.__name__, attention)
 
     base = sys.modules["vllm.v1.worker.gpu_worker"].Worker
     monkeypatch.setattr(
@@ -213,14 +222,15 @@ def test_non_pcp_warmup_does_not_inspect_glm_layers(monkeypatch):
 
     class Model:
         def modules(self):
-            raise AssertionError("non-PCP warmup must not inspect model layers")
+            return [object()]
 
     worker = _make_worker(SimpleNamespace(model=Model()))
     worker.parallel_config = SimpleNamespace(prefill_context_parallel_size=1)
     assert worker.compile_or_warm_up_model() == "base"
 
 
-def test_pcp_warmup_temporarily_disables_glm_calibration(monkeypatch):
+@pytest.mark.parametrize("pcp_size", [1, 16])
+def test_warmup_temporarily_disables_glm_calibration(monkeypatch, pcp_size):
     from types import SimpleNamespace
 
     class GlmLayer:
@@ -233,7 +243,7 @@ def test_pcp_warmup_temporarily_disables_glm_calibration(monkeypatch):
     layer = GlmLayer()
     model = SimpleNamespace(modules=lambda: [layer])
     worker = _make_worker(SimpleNamespace(model=model))
-    worker.parallel_config = SimpleNamespace(prefill_context_parallel_size=16)
+    worker.parallel_config = SimpleNamespace(prefill_context_parallel_size=pcp_size)
     base = sys.modules["vllm.v1.worker.gpu_worker"].Worker
 
     def base_warmup(self):

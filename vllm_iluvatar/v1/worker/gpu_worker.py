@@ -6,8 +6,8 @@ IluWorker — subclass of the community Worker with following overrides:
 1. ``determine_available_memory`` for attention quantisation support.
 2. ``initialize_from_config`` for attention quantisation support.
 3. ``shutdown`` for attention quantisation support.
-4. ``execute_dummy_batch`` for Iluvatar DP idle-rank optimisation.
-5. ``compile_or_warm_up_model`` to exclude synthetic GLM KV calibration.
+4. ``compile_or_warm_up_model`` to exclude simulated requests from KV calibration.
+5. ``execute_dummy_batch`` for Iluvatar DP idle-rank optimisation.
 """
 
 from __future__ import annotations
@@ -127,14 +127,10 @@ class IluWorker(Worker):
             self.model_runner.__class__ = orig_cls
 
     def compile_or_warm_up_model(self):
-        if self.parallel_config.prefill_context_parallel_size <= 1:
-            return super().compile_or_warm_up_model()
-
         from vllm_iluvatar.models.glm_moe_dsa.attention import IluGlmMoeDsaSparseMLA
 
-        # V2 warmup includes simulated requests with valid KV slots. Keep those
-        # projections out of online calibration; the first real request must
-        # select the scale. Restore flags even when startup fails.
+        # v0.31 warmup can simulate requests with valid KV slots even at PCP=1.
+        # Only real requests may freeze the online scale; restore on failure too.
         calibration_states = [
             (layer, layer._fp8_kv_scale_calibration_enabled)
             for layer in self.model_runner.model.modules()

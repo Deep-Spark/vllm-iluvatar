@@ -297,8 +297,8 @@ def test_worker_warmup_calibration_scope(monkeypatch, fail_warmup, pcp_size):
 
     def warmup(self):
         mla._maybe_init_fp8_kv_scale(kv, slots)
-        assert mla._fp8_kv_scale_frozen is (pcp_size == 1)
-        assert mla._k_scale.item() == pytest.approx(0.2 if pcp_size == 1 else 1.0)
+        assert not mla._fp8_kv_scale_frozen
+        assert mla._k_scale.item() == pytest.approx(1.0)
         if fail_warmup:
             raise RuntimeError("warmup failed")
         return "ready"
@@ -559,3 +559,55 @@ def test_decode_prepare_head_support(monkeypatch, heads, enabled, use_fp8):
     assert mla._decode_prepare_enabled == (
         enabled and use_fp8 and heads in (16, 32, 64)
     )
+
+
+@pytest.mark.parametrize("all_padding", [False, True])
+def test_online_scale_ignores_nonzero_warmup_and_padding(monkeypatch, all_padding):
+    mla = _make_sparse_mla(monkeypatch, scale_frozen=False)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    kv = torch.stack([torch.full((512,), 100.0), torch.full((512,), 2.0)])
+    slots = torch.tensor([-1, -1 if all_padding else 0])
+    mla._maybe_init_fp8_kv_scale(kv, slots)
+    if all_padding:
+        assert not mla._fp8_kv_scale_frozen
+        # A later real request still performs calibration.
+        mla._maybe_init_fp8_kv_scale(kv[1:], torch.tensor([0]))
+    assert mla._fp8_kv_scale_frozen
+    torch.testing.assert_close(mla._k_scale, torch.tensor([2 / 448]))
+
+
+@pytest.mark.parametrize("fail_warmup", [False, True])
+@pytest.mark.parametrize("initially_enabled", [False, True])
+def test_worker_warmup_preserves_calibration_state(
+    monkeypatch, fail_warmup, initially_enabled
+):
+    from vllm.v1.worker.gpu_worker import Worker
+
+    from vllm_iluvatar.v1.worker.gpu_worker import IluWorker
+
+    mla = _make_sparse_mla(monkeypatch, scale_frozen=False)
+    mla._fp8_kv_scale_calibration_enabled = initially_enabled
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    kv = torch.full((2, 512), 2.0)
+    slots = torch.tensor([0, 1])
+
+    def warmup(self):
+        mla._maybe_init_fp8_kv_scale(kv, slots)
+        assert not mla._fp8_kv_scale_frozen
+        if fail_warmup:
+            raise RuntimeError("warmup failed")
+        return "ready"
+
+    monkeypatch.setattr(Worker, "compile_or_warm_up_model", warmup)
+    worker = object.__new__(IluWorker)
+    worker.model_runner = SimpleNamespace(model=SimpleNamespace(modules=lambda: [mla]))
+    if fail_warmup:
+        with pytest.raises(RuntimeError, match="warmup failed"):
+            worker.compile_or_warm_up_model()
+    else:
+        assert worker.compile_or_warm_up_model() == "ready"
+    assert mla._fp8_kv_scale_calibration_enabled is initially_enabled
+    mla._maybe_init_fp8_kv_scale(kv, slots)
+    assert mla._fp8_kv_scale_frozen is initially_enabled
+    if initially_enabled:
+        assert mla._k_scale.item() == pytest.approx(2.0 / 448.0)

@@ -139,6 +139,7 @@ if TYPE_CHECKING:
     VLLM_ILU_DP_ROUND_ROBIN_LB: bool = False
     VLLM_ILU_DP_ROUND_ROBIN_LB_FILE: str = ""
     VLLM_ILU_DP_ENABLE_SYNC_PREFILLS: bool = False
+    VLLM_ILU_DP_SYNC_READY_REPLAY: bool = False
     VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS: int = 8
     VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS: float = 0.0
     VLLM_ILU_MOE_EP_LL_MOE_ALGO: str = "GEMV"
@@ -285,6 +286,10 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_DP_ENABLE_SYNC_PREFILLS": _bool_reader(
         "VLLM_ILU_DP_ENABLE_SYNC_PREFILLS",
         "1" if _hybrid_dp_sync_prefills_default() else "0",
+    ),
+    "VLLM_ILU_DP_SYNC_READY_REPLAY": _bool_reader(
+        "VLLM_ILU_DP_SYNC_READY_REPLAY",
+        "0",
     ),
     "VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS": lambda: max(
         0,

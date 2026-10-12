@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import torch.distributed as dist
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.core import DPEngineCoreProc
+from vllm.v1.request import RequestStatus
 
 from vllm_iluvatar.ilu_patch import general_patch
 from vllm_iluvatar.ilu_patch.general_patches import patch_core
@@ -91,6 +92,37 @@ def test_local_prefill_state_includes_running_chunks_but_not_blocked_waiting():
     assert core._local_prefill_state(scheduler) == (False, False)
 
 
+def test_local_prefill_state_includes_ready_remote_replay():
+    request = SimpleNamespace(
+        request_id="replay",
+        status=RequestStatus.WAITING_FOR_REMOTE_KVS,
+        replay_start=0,
+    )
+    scheduler = SimpleNamespace(
+        waiting=[],
+        skipped_waiting=[request],
+        running=[],
+        finished_recving_kv_req_ids={"replay"},
+    )
+    assert core._local_prefill_state(scheduler, sync_ready_replay=True) == (
+        True,
+        False,
+    )
+
+    scheduler.finished_recving_kv_req_ids.clear()
+    assert core._local_prefill_state(scheduler, sync_ready_replay=True) == (
+        False,
+        False,
+    )
+
+    request.status = RequestStatus.WAITING
+    request.replay_start = 13_372
+    assert core._local_prefill_state(scheduler, sync_ready_replay=True) == (
+        True,
+        False,
+    )
+
+
 def test_prefill_sync_state_is_initialized_once_from_env(monkeypatch):
     import vllm.envs as envs
 
@@ -99,6 +131,7 @@ def test_prefill_sync_state_is_initialized_once_from_env(monkeypatch):
     seen_tensors = []
 
     monkeypatch.setattr(envs, "VLLM_ILU_DP_ENABLE_SYNC_PREFILLS", True)
+    monkeypatch.setattr(envs, "VLLM_ILU_DP_SYNC_READY_REPLAY", True)
     monkeypatch.setattr(
         envs,
         "VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS",
@@ -124,6 +157,7 @@ def test_prefill_sync_state_is_initialized_once_from_env(monkeypatch):
     prefill_sync_state = engine._ilu_dp_prefill_sync_state
     assert prefill_sync_state.max_defer_steps == 3
     assert prefill_sync_state.max_replacement_wait_s == 0.007
+    assert prefill_sync_state.sync_ready_replay is True
     assert prefill_sync_state.sync_group is cloned_group
     assert seen_tensors[0] is seen_tensors[1]
 

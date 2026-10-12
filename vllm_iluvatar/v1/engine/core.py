@@ -12,6 +12,8 @@ Why      : Closed-loop traffic can deliver replacement prefills to DP ranks at
            work, adding a second prefill-sized step to TTFT.
            - VLLM_ILU_DP_ENABLE_SYNC_PREFILLS enables rank-synchronized
            prefills.
+           - VLLM_ILU_DP_SYNC_READY_REPLAY includes completed remote-KV SWA
+             replays in the pre-scheduling readiness vote.
            - VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS bounds how many model steps a
            partial prefill may wait before fail-open.
            - VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS bounds the post-completion wait
@@ -45,6 +47,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
+from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
     import torch
@@ -57,6 +60,7 @@ class DPPrefillSyncState:
     max_replacement_wait_s: float
     max_defer_steps: int
     sync_group: dist.ProcessGroup | None
+    sync_ready_replay: bool = False
     coalesce_steps: int = 2
     partial_steps: int = 0
     force_throttle: bool = False
@@ -101,8 +105,31 @@ def _clone_dp_process_group(
     )
 
 
-def _local_prefill_state(scheduler) -> tuple[bool, bool]:
-    prefill_ready = bool(scheduler.waiting) or any(
+def _local_prefill_state(
+    scheduler,
+    sync_ready_replay: bool = False,
+) -> tuple[bool, bool]:
+    # A completed async P/D receive remains in ``skipped_waiting`` until
+    # Scheduler.schedule() promotes it. Count it before scheduling so the DP
+    # gate can coalesce 128-token SWA replays across ranks. After promotion, a
+    # throttled replay stays in that queue as WAITING with replay_start set.
+    replay_ready = False
+    if sync_ready_replay:
+        finished_recvs = getattr(scheduler, "finished_recving_kv_req_ids", ())
+        replay_ready = any(
+            (
+                getattr(request, "status", None)
+                == RequestStatus.WAITING_FOR_REMOTE_KVS
+                and getattr(request, "request_id", None) in finished_recvs
+            )
+            or (
+                getattr(request, "status", None)
+                in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+                and getattr(request, "replay_start", 0) > 0
+            )
+            for request in scheduler.skipped_waiting
+        )
+    prefill_ready = bool(scheduler.waiting) or replay_ready or any(
         request.is_prefill_chunk for request in scheduler.running
     )
     running_decode = any(
@@ -165,6 +192,7 @@ def _make_process_engine_step(orig):
                 ),
                 max_defer_steps=envs.VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS,
                 sync_group=_clone_dp_process_group(self.dp_group, self.dp_store),
+                sync_ready_replay=envs.VLLM_ILU_DP_SYNC_READY_REPLAY,
             )
         prefill_sync_state = self._ilu_dp_prefill_sync_state
         waiting = False
@@ -175,7 +203,10 @@ def _make_process_engine_step(orig):
         if sync_active:
             import torch
 
-            waiting, running_decode = _local_prefill_state(self.scheduler)
+            waiting, running_decode = _local_prefill_state(
+                self.scheduler,
+                prefill_sync_state.sync_ready_replay,
+            )
             state = prefill_sync_state.sync_tensor
             assert state is not None
             state[0] = int(waiting)

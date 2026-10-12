@@ -30,6 +30,7 @@ Behavioural deltas vs the upstream V4 attention layer:
 5. The ``deepseek_v4_attention`` / ``deepseek_v4_fp8_einsum`` custom ops are
    not re-registered: the wrapper's ``forward`` raises before they would be
    invoked. The upstream ones remain registered for the original V4 path.
+6. After KV write, ``save_kv_layer`` runs when the connector has metadata.
 """
 
 from __future__ import annotations
@@ -1030,7 +1031,10 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # 5) Until this, all kv cache are wrote, do kv transfer if needed
         if has_kv_transfer_group():
             connector = get_kv_transfer_group()
-            connector.save_kv_layer("layer_name", "kv_cache", "attn_metadata")
+            if connector.has_connector_metadata():
+                connector.save_kv_layer(
+                    self.layer_name, self.mla_attn.kv_cache, attn_metadata
+                )
 
         # 6) Run the sparse MLA forward into the pre-allocated ``out`` buffer
         #    (shape ``(T, n_local_heads, head_dim)``). No head-count padding:

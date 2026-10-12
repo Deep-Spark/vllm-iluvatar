@@ -65,6 +65,18 @@ def nvsm_dispatch_quant_kwargs(
             fp8_format=current_platform.fp8_dtype(),
             fp8_group_size=None,
         )
+
+    # Dispatch quantization does not select the Combine wire format. Expose
+    # the FP8 Combine implemented by the fused AG/AR kernel as an opt-in.
+    combine_fp8 = os.environ.get("IXFORMER_NVSM_COMBINE_FP8", "0")
+    if combine_fp8 not in ("0", "1"):
+        raise ValueError("IXFORMER_NVSM_COMBINE_FP8 must be 0 or 1")
+    if combine_fp8 == "1":
+        kwargs["use_combine_fp8"] = True
+        kwargs.setdefault("fp8_format", current_platform.fp8_dtype())
+        if kwargs.get("fp8_group_size") is None:
+            # Fused Combine AG/AR does not support per-token FP8.
+            kwargs["fp8_group_size"] = 128
     return kwargs
 
 

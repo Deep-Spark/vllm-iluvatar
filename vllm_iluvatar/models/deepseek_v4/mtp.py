@@ -46,6 +46,7 @@ from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import (
     get_spec_layer_idx_from_weight_name,
 )
+from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -250,7 +251,16 @@ class IluDeepSeekV4MultiTokenPredictor(nn.Module):
 
 
 @support_torch_compile
-class IluDeepSeekV4MTP(nn.Module):
+class IluDeepSeekV4MTP(nn.Module, SupportsPP):
+    """W4A8 MTP draft model.
+
+    ``SupportsPP`` only gates ``ModelConfig.verify_with_parallel_config``: vLLM
+    places the *whole* drafter on the last PP rank
+    (``gpu_model_runner``: ``if self.speculative_config and
+    get_pp_group().is_last_rank``), so this model is never split across stages
+    and never exchanges PP intermediate tensors.
+    """
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config

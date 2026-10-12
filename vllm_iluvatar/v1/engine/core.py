@@ -3,7 +3,8 @@
 
 ILU wrappers for DP prefill synchronization and replacement-request handling.
 
-Target   : vllm.v1.engine.core.DPEngineCoreProc.{
+Target   : vllm.v1.engine.core.EngineCore.get_kv_cache_group_metadata;
+           vllm.v1.engine.core.DPEngineCoreProc.{
            _should_throttle_prefills,_process_engine_step,_handle_client_request}
 Baseline : v0.31.0 (db9527a468)
 Why      : Closed-loop traffic can deliver replacement prefills to DP ranks at
@@ -16,6 +17,9 @@ Why      : Closed-loop traffic can deliver replacement prefills to DP ranks at
            partial prefill may wait before fail-open.
            - VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS bounds the post-completion wait
            for a replacement request before the rank enters a dummy batch.
+           HMA models also need schema version, model identity, layout, and
+           schema hash; community metadata is only group_idx / kind /
+           block_size / sliding_window.
 How      : Before scheduling, all DP EngineCore ranks synchronize two CPU
            counters (prefill-ready and decode-busy) over a cloned c10d group,
            isolated from vLLM's DP lifecycle collectives. New and chunked
@@ -26,9 +30,13 @@ How      : Before scheduling, all DP EngineCore ranks synchronize two CPU
            methods with two deltas: a pre-scheduling prefill-sync decision and a
            post-execution replacement wait. All other behavior delegates to the
            captured community implementation.
+           ``get_kv_cache_group_metadata`` is likewise a wrapper: HMA models
+           emit the dynamo_nixl schema rows; every other model delegates to
+           the community implementation.
 Scope    : Hybrid low-latency decode with plugin global round-robin enabled.
 Remove   : When upstream offers rank-synchronized prefill scheduling and a
-           bounded post-completion input-queue wait.
+           bounded post-completion input-queue wait, and when upstream
+           EngineCore metadata already carries the HMA schema.
 """
 
 from __future__ import annotations
@@ -207,3 +215,22 @@ def _make_process_engine_step(orig):
         return executed
 
     return _process_engine_step
+
+
+def _make_get_kv_cache_group_metadata(orig):
+    # [ILU override] Wrapper, not a full-method copy. Delta: HMA models publish
+    # the dynamo_nixl schema rows; every other model keeps community metadata.
+    def get_kv_cache_group_metadata(self) -> list[dict]:
+        from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.dynamo_nixl.schema import (
+            build_engine_group_metadata,
+            is_hma_model_config,
+        )
+
+        if not is_hma_model_config(self.vllm_config):
+            return orig(self)
+        kv_cache_config = getattr(self.scheduler, "kv_cache_config", None)
+        if kv_cache_config is None:
+            return []
+        return build_engine_group_metadata(self.vllm_config, kv_cache_config)
+
+    return get_kv_cache_group_metadata

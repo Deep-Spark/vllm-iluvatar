@@ -728,7 +728,8 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
         # 5) All KV caches are now written -- push to a KV connector if present.
         if has_kv_transfer_group():
             connector = get_kv_transfer_group()
-            connector.save_kv_layer("layer_name", "kv_cache", "attn_metadata")
+            if connector.has_connector_metadata():
+                connector.save_kv_layer(self.prefix, self.kv_cache, attn_metadata)
 
         # 6) Sparse MLA forward into the pre-allocated ``out`` (T, H, head_dim).
         self.forward_mqa(q, kv, positions, out)

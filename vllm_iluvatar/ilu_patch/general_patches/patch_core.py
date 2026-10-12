@@ -2,7 +2,8 @@
 """Wiring for Iluvatar DP EngineCore scheduling wrappers.
 
 Corresponds to: vllm/v1/engine/core.py
-Target   : DPEngineCoreProc.{
+Target   : EngineCore.get_kv_cache_group_metadata;
+           DPEngineCoreProc.{
            _should_throttle_prefills,_process_engine_step,_handle_client_request}
 Baseline : v0.31.0 (db9527a468)
 Why      : Align replacement prefills across DP ranks before EP execution and
@@ -10,13 +11,19 @@ Why      : Align replacement prefills across DP ranks before EP execution and
            The patch is installed only when VLLM_ILU_DP_ENABLE_SYNC_PREFILLS
            is enabled and VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS is positive.
            VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS bounds the fail-open delay.
+           KVBM HMA handshake also needs schema version, model identity,
+           layout, and schema hash.
 How      : Delegation wrappers installed on DPEngineCoreProc only.
            All three community method bodies are fingerprinted before wrapping
            so upstream scheduling changes fail fast and require a wrapper review.
            Installation requires both VLLM_ILU_DP_ENABLE_SYNC_PREFILLS and a
            positive VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS; either off is a no-op.
+           EngineCore.get_kv_cache_group_metadata is wrapped unconditionally:
+           HMA models use the dynamo_nixl schema builder; every other model
+           keeps the community implementation.
 Scope    : Env-gated Iluvatar hybrid DP+EP serving.
-Remove   : When upstream provides equivalent synchronized prefill scheduling.
+Remove   : When upstream provides equivalent synchronized prefill scheduling,
+           and when upstream EngineCore metadata already carries the HMA schema.
 Fingerprint: DPEngineCoreProc._should_throttle_prefills, _process_engine_step,
            and _handle_client_request community sources are hashed at
            register-time against the snapshots below; gated by
@@ -92,15 +99,29 @@ def register() -> None:
     p.register_once(
         __name__,
         _apply,
-        detail="DPEngineCoreProc prefill sync and replacement wait wrappers",
+        detail="DPEngineCoreProc prefill sync and replacement wait wrappers; EngineCore HMA KV-group metadata",
     )
 
 
 def _apply() -> None:
     import vllm.envs as envs
-    from vllm.v1.engine.core import DPEngineCoreProc
+    from vllm.v1.engine.core import DPEngineCoreProc, EngineCore
 
     import vllm_iluvatar.v1.engine.core as impl
+
+    get_kv_cache_group_metadata = impl._make_get_kv_cache_group_metadata(
+        EngineCore.get_kv_cache_group_metadata
+    )
+    p.check_signatures(
+        EngineCore,
+        types.SimpleNamespace(get_kv_cache_group_metadata=get_kv_cache_group_metadata),
+        ["get_kv_cache_group_metadata"],
+        strict=True,
+    )
+    # [ILU override] Publish HMA schema rows for DSV4/GLM.
+    EngineCore.get_kv_cache_group_metadata = (  # type: ignore[method-assign]
+        get_kv_cache_group_metadata
+    )
 
     sync_prefills = bool(envs.VLLM_ILU_DP_ENABLE_SYNC_PREFILLS)
     replacement_wait_ms = float(envs.VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS)

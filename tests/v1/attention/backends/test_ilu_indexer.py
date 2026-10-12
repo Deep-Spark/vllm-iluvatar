@@ -13,7 +13,6 @@ from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
     get_max_prefill_buffer_size,
     kv_spans_from_batches,
     kv_spans_from_batches_device,
-    make_storage_block_size_build,
     split_indexer_prefill_chunks,
 )
 

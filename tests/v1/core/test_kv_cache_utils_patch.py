@@ -15,6 +15,8 @@ def _setup_modules(monkeypatch, *, flash_quant_type: str, mla_quant_type: str):
     import vllm.envs as envs
     from vllm.v1 import core
 
+    from vllm_iluvatar.v1 import core as ilu_core
+
     monkeypatch.setattr(
         envs, "VLLM_ILU_FLASH_ATTN_QUANT_TYPE", flash_quant_type, raising=False
     )
@@ -22,31 +24,50 @@ def _setup_modules(monkeypatch, *, flash_quant_type: str, mla_quant_type: str):
         envs, "VLLM_ILU_MLA_ATTN_QUANT_TYPE", mla_quant_type, raising=False
     )
 
-    def original_from_groups(*args, **kwargs):
-        return args, kwargs
+    def original_from_groups(vllm_config, kv_cache_groups, available_memory):
+        return vllm_config, kv_cache_groups, available_memory
 
-    def original_pool_bytes_per_block(*args, **kwargs):
-        return args, kwargs
+    def original_configs(vllm_config, kv_cache_specs, available_memory):
+        return vllm_config, kv_cache_specs, available_memory
 
-    def original_configs(*args, **kwargs):
-        return args, kwargs
+    def original_scheduler(kv_cache_configs):
+        return kv_cache_configs
+
+    def original_pool_bytes_per_block(kv_cache_groups):
+        return kv_cache_groups
 
     community = ModuleType("vllm.v1.core.kv_cache_utils")
     community.get_kv_cache_config_from_groups = original_from_groups
     community._pool_bytes_per_block = original_pool_bytes_per_block
     community.get_kv_cache_configs = original_configs
+    community.generate_scheduler_kv_cache_config = original_scheduler
 
-    def replacement_from_groups(*args, **kwargs):
-        return args, kwargs
+    def replacement_from_groups(vllm_config, kv_cache_groups, available_memory):
+        return vllm_config, kv_cache_groups, available_memory
 
-    def replacement_pool_bytes_per_block(*args, **kwargs):
-        return args, kwargs
+    def replacement_pool_bytes_per_block(kv_cache_groups):
+        return kv_cache_groups
+
+    def wrap(base):
+        def wrapped(*args, **kwargs):
+            return base(*args, **kwargs)
+
+        wrapped.base = base
+        return wrapped
+
+    def per_layer_scheduler(kv_cache_configs):
+        return kv_cache_configs
 
     implementation = ModuleType("vllm_iluvatar.v1.core.kv_cache_utils")
     implementation.get_kv_cache_config_from_groups = replacement_from_groups
     implementation._ilu_pool_bytes_per_block = replacement_pool_bytes_per_block
+    implementation.generate_scheduler_kv_cache_config = per_layer_scheduler
+    implementation.make_get_kv_cache_config_from_groups = wrap
+    implementation.make_get_kv_cache_configs = wrap
+    implementation.make_generate_scheduler_kv_cache_config = wrap
 
     monkeypatch.setattr(core, "kv_cache_utils", community, raising=False)
+    monkeypatch.setattr(ilu_core, "kv_cache_utils", implementation, raising=False)
     monkeypatch.setitem(sys.modules, community.__name__, community)
     monkeypatch.setitem(sys.modules, implementation.__name__, implementation)
 
@@ -55,25 +76,30 @@ def _setup_modules(monkeypatch, *, flash_quant_type: str, mla_quant_type: str):
         original_from_groups=original_from_groups,
         original_pool_bytes_per_block=original_pool_bytes_per_block,
         original_configs=original_configs,
+        original_scheduler=original_scheduler,
+        per_layer_scheduler=per_layer_scheduler,
         replacement_from_groups=replacement_from_groups,
         replacement_pool_bytes_per_block=replacement_pool_bytes_per_block,
     )
 
 
-def test_patch_is_noop_when_quantization_is_disabled(monkeypatch):
+def test_patch_wraps_community_planners_when_quantization_is_disabled(monkeypatch):
     modules = _setup_modules(monkeypatch, flash_quant_type="", mla_quant_type="")
 
     patch_kv_cache_utils._apply()
 
     assert (
-        modules.community.get_kv_cache_config_from_groups
+        modules.community.get_kv_cache_config_from_groups.base
         is modules.original_from_groups
     )
     assert (
         modules.community._pool_bytes_per_block is modules.original_pool_bytes_per_block
     )
-    # get_kv_cache_configs is never overridden on v0.31.0 (db9527a468).
-    assert modules.community.get_kv_cache_configs is modules.original_configs
+    assert modules.community.get_kv_cache_configs.base is modules.original_configs
+    assert (
+        modules.community.generate_scheduler_kv_cache_config.base
+        is modules.per_layer_scheduler
+    )
 
 
 @pytest.mark.parametrize(
@@ -98,12 +124,15 @@ def test_patch_replaces_functions_when_quantization_is_enabled(
     patch_kv_cache_utils._apply()
 
     assert (
-        modules.community.get_kv_cache_config_from_groups
+        modules.community.get_kv_cache_config_from_groups.base
         is modules.replacement_from_groups
     )
     assert (
         modules.community._pool_bytes_per_block
         is modules.replacement_pool_bytes_per_block
     )
-    # get_kv_cache_configs is never overridden on v0.31.0 (db9527a468).
-    assert modules.community.get_kv_cache_configs is modules.original_configs
+    assert modules.community.get_kv_cache_configs.base is modules.original_configs
+    assert (
+        modules.community.generate_scheduler_kv_cache_config.base
+        is modules.per_layer_scheduler
+    )

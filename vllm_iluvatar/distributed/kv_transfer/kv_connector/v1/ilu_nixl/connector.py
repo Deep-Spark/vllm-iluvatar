@@ -8,20 +8,14 @@ implementation while reusing its transfer logic.
 
 from typing import TYPE_CHECKING
 
-from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-    KVConnectorHandshakeMetadata,
-    KVConnectorRole,
-)
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
     NixlBaseConnector,
 )
 from vllm.forward_context import ForwardContext
-from vllm.logger import init_logger
 
 from .pull_scheduler import IluNixlPullConnectorScheduler
 from .pull_worker import IluNixlPullConnectorWorker
-
-logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -29,31 +23,11 @@ if TYPE_CHECKING:
 
 
 class IluNixlBaseConnector(NixlBaseConnector):
-    def set_xfer_handshake_metadata(
-        self, metadata: dict[int, KVConnectorHandshakeMetadata]
-    ) -> None:
-        assert self.connector_scheduler is not None
-        logger.info(
-            "IluNixlConnector setting global-rank handshake metadata for ranks=%s",
-            sorted(metadata.keys()),
-        )
-        self.connector_scheduler.set_xfer_handshake_metadata(metadata)
-
-    def set_xfer_handshake_metadata_pp_aware(
-        self, metadata: dict[tuple[int, int], KVConnectorHandshakeMetadata]
-    ) -> None:
-        tp_size = self._vllm_config.parallel_config.tensor_parallel_size
-        global_rank_metadata = {
-            pp_rank * tp_size + tp_rank: rank_metadata
-            for (pp_rank, tp_rank), rank_metadata in metadata.items()
-        }
-        logger.info(
-            "IluNixlConnector converted PP-aware handshake metadata keys=%s "
-            "to global ranks=%s",
-            sorted(metadata.keys()),
-            sorted(global_rank_metadata.keys()),
-        )
-        self.set_xfer_handshake_metadata(global_rank_metadata)
+    def wait_for_save(self):
+        assert self.connector_worker is not None
+        if self.connector_worker.fp8_wire_staging_enabled:
+            self.connector_worker.export_fp8_wire_staging(self._connector_metadata)
+        return super().wait_for_save()
 
 
 class IluNixlPullConnector(IluNixlBaseConnector):

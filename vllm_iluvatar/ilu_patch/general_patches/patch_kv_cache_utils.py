@@ -1,65 +1,94 @@
 # SPDX-License-Identifier: Apache-2.0
-"""KV cache int8 quantization infrastructure
-(VLLM_ILU_FLASH_ATTN_QUANT_TYPE=KVINT8/KINT8, VLLM_ILU_MLA_ATTN_QUANT_TYPE=INT8).
+"""Wiring for Ilu quantized and FP8 wire-cache planning.
 
-Patches community objects so int8 KV cache memory is sized correctly, aligned
-with the vLLM 0.31.0 community mechanism (B2 "shared backing buffer"):
+Corresponds to: vllm/v1/core/kv_cache_utils.py
 
-* ``AttentionSpec.state_content_size_bytes`` -- overridden (when any int8
-  quant is enabled) to return the int8 per-cell byte size; see
-  patch_kv_cache_interface.py.
-* ``get_kv_cache_config_from_groups`` -- replans ``num_blocks`` against a
-  scale-aware budget and appends the per-tensor K-scale pages as a contiguous
-  tail inside the SAME community backing allocation; attaches ``scale_size``
-  to each ``KVCacheTensor``.
-* ``_pool_bytes_per_block`` -- overridden to return
-  ``kv_bytes_per_block + scale_per_block_total`` so the community shrink loop in
-  ``get_kv_cache_configs`` re-plans each worker with a scale-aware budget. This
-  keeps the override *pure* (``num_blocks = available // _pool_bytes_per_block``),
-  so all ranks still converge to the same ``num_blocks`` after the single
-  re-plan.
-
-Note: ``get_kv_cache_configs`` is not overridden on 0.31.0. Its shrink loop
-re-plans each worker by calling this override, so ``scale_size`` is recomputed
-consistently during re-plan -- the old ILU manual proportional scale shrink is
-obsolete and would leave strides/offsets inconsistent with the shrunken
-allocation.
-
-Target   : vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
-           vllm.v1.core.kv_cache_utils._pool_bytes_per_block
-Baseline : v0.31.0 (db9527a468)
-Scope    : only active when VLLM_ILU_FLASH_ATTN_QUANT_TYPE != "" or
-           VLLM_ILU_MLA_ATTN_QUANT_TYPE != ""
+Target   : _pool_bytes_per_block, get_kv_cache_config_from_groups,
+           get_kv_cache_configs, generate_scheduler_kv_cache_config
+Why      : preserve the v0.31 Ilu INT8 shared-buffer planner while reserving
+           and describing a producer-only packed FP8 transfer cache.
+Scope    : quantized planning is gated by the attention quantization
+           environment; FP8 wire planning is gated to enabled IluNixl
+           producer connectors.
 """
 
 from __future__ import annotations
 
+import inspect
+from collections.abc import Callable
+
 from vllm_iluvatar.ilu_patch import general_patch as p
+
+_EXPECTED_PARAMETERS = {
+    "get_kv_cache_config_from_groups": (
+        "vllm_config",
+        "kv_cache_groups",
+        "available_memory",
+    ),
+    "get_kv_cache_configs": (
+        "vllm_config",
+        "kv_cache_specs",
+        "available_memory",
+    ),
+    "generate_scheduler_kv_cache_config": ("kv_cache_configs",),
+}
 
 
 def register() -> None:
     p.register_once(
         __name__,
         _apply,
-        detail="may override get_kv_cache_config_from_groups and _pool_bytes_per_block",
+        detail="Ilu quantized cache and FP8 wire-cache planning",
     )
+
+
+def _check_parameters(name: str, function: Callable[..., object]) -> None:
+    actual = tuple(inspect.signature(function).parameters)
+    expected = _EXPECTED_PARAMETERS[name]
+    if actual != expected:
+        raise RuntimeError(
+            f"ILU patch: vllm.v1.core.kv_cache_utils.{name} signature "
+            f"changed from {expected} to {actual}; re-sync the FP8 planning "
+            "wrapper before using this vLLM version"
+        )
 
 
 def _apply() -> None:
     import vllm.envs as envs
+    import vllm.v1.core.kv_cache_utils as community
 
-    if (
-        envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE == ""
-        and envs.VLLM_ILU_MLA_ATTN_QUANT_TYPE == ""
-    ):
-        return
+    import vllm_iluvatar.v1.core.kv_cache_utils as impl
 
-    from vllm.v1.core import kv_cache_utils as _m
+    originals = {name: getattr(community, name) for name in _EXPECTED_PARAMETERS}
+    for name, function in originals.items():
+        _check_parameters(name, function)
 
-    from vllm_iluvatar.v1.core.kv_cache_utils import (
-        _ilu_pool_bytes_per_block,
-        get_kv_cache_config_from_groups,
+    quantized_cache = (
+        envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE != ""
+        or envs.VLLM_ILU_MLA_ATTN_QUANT_TYPE != ""
+    )
+    base_from_groups = (
+        impl.get_kv_cache_config_from_groups
+        if quantized_cache
+        else originals["get_kv_cache_config_from_groups"]
     )
 
-    _m.get_kv_cache_config_from_groups = get_kv_cache_config_from_groups
-    _m._pool_bytes_per_block = _ilu_pool_bytes_per_block
+    replacements = {
+        "get_kv_cache_config_from_groups": (
+            impl.make_get_kv_cache_config_from_groups(base_from_groups)
+        ),
+        "get_kv_cache_configs": impl.make_get_kv_cache_configs(
+            originals["get_kv_cache_configs"]
+        ),
+        "generate_scheduler_kv_cache_config": (
+            impl.make_generate_scheduler_kv_cache_config(
+                impl.generate_scheduler_kv_cache_config
+            )
+        ),
+    }
+    for name, replacement in replacements.items():
+        p.rebind_module_func(community, name, replacement)
+    if quantized_cache:
+        p.rebind_module_func(
+            community, "_pool_bytes_per_block", impl._ilu_pool_bytes_per_block
+        )

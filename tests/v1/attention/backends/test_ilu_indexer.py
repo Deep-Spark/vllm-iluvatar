@@ -13,6 +13,7 @@ from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
     get_max_prefill_buffer_size,
     kv_spans_from_batches,
     kv_spans_from_batches_device,
+    make_storage_block_size_build,
     split_indexer_prefill_chunks,
 )
 
@@ -191,6 +192,28 @@ def test_get_max_decode_context_len_uses_cache_domain_upper_bound():
 
     assert get_max_decode_context_len(vllm_config, compress_ratio=1) == 4097
     assert get_max_decode_context_len(vllm_config, compress_ratio=4) == 1025
+
+
+def test_storage_block_size_wrapper_is_scoped_to_compressed_build():
+    seen = []
+
+    def original(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        seen.append(self.kv_cache_spec.block_size)
+        return common_prefix_len, common_attn_metadata, fast_build
+
+    wrapped = make_storage_block_size_build(original)
+    builder = SimpleNamespace(
+        compress_ratio=4,
+        kv_cache_spec=SimpleNamespace(block_size=256, storage_block_size=64),
+    )
+
+    assert wrapped(builder, 3, "meta", True) == (3, "meta", True)
+    assert seen == [64]
+    assert builder.kv_cache_spec.block_size == 256
+
+    builder.compress_ratio = 1
+    wrapped(builder, 0, None)
+    assert seen == [64, 256]
 
 
 def test_pcp_dual_chunk_causal_spans_and_query_subchunks():

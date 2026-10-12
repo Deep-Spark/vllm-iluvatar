@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import wraps
+from typing import Any
 
 import torch
 import vllm.envs as envs
@@ -1108,3 +1111,50 @@ class IluDeepseekV4IndexerBackend(IluDeepseekV32IndexerBackend):
         # ref fallback（pure-PyTorch ref_dsa_indexer_mqa_logits_with_blocks），
         # 功能等价但性能更低，后续可在 ixformer 层做 native 256 支持。
         return [256]
+
+
+class _StorageBlockSizeSpec:
+    """Read-only proxy exposing physical indexer block size to build()."""
+
+    def __init__(self, spec: Any) -> None:
+        self._spec = spec
+
+    @property
+    def block_size(self) -> int:
+        return int(self._spec.storage_block_size)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._spec, name)
+
+
+def make_storage_block_size_build(orig: Callable[..., Any]) -> Callable[..., Any]:
+    """Use the physical compressed page size while building index metadata."""
+
+    @wraps(orig)
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata,
+        fast_build: bool = False,
+    ):
+        if self.compress_ratio <= 1:
+            return orig(
+                self,
+                common_prefix_len,
+                common_attn_metadata,
+                fast_build,
+            )
+
+        original_spec = self.kv_cache_spec
+        self.kv_cache_spec = _StorageBlockSizeSpec(original_spec)
+        try:
+            return orig(
+                self,
+                common_prefix_len,
+                common_attn_metadata,
+                fast_build,
+            )
+        finally:
+            self.kv_cache_spec = original_spec
+
+    return build

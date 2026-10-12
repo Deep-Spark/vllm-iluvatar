@@ -2,7 +2,7 @@
 """Corresponds to: vllm/v1/core/kv_cache_utils.py
 
 ILU override implementations for attention quantization (Int8 KV cache
-scale) support.
+scale), FP8 wire staging, and scheduler-side HMA metadata preservation.
 
 Target   : vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
            vllm.v1.core.kv_cache_utils._pool_bytes_per_block
@@ -44,16 +44,28 @@ How      : B2 "shared backing buffer": the K-scale storage shares the SAME
            (num_blocks = available // _pool_bytes_per_block), so all ranks
            still converge to the same num_blocks after the single re-plan.
 
-           get_kv_cache_configs is not overridden: its shrink loop re-plans
-           each worker by calling this override, so scale_size is recomputed
-           consistently.
+           get_kv_cache_configs keeps the community planner and shrink loop;
+           an outer FP8 wrapper only supplies registration-order metadata and
+           resizes the worker-only wire plan after community re-planning.
 Scope    : only active when attention quantization is enabled
            (VLLM_ILU_FLASH_ATTN_QUANT_TYPE / VLLM_ILU_MLA_ATTN_QUANT_TYPE);
            see ilu_patch/general_patches/patch_kv_cache_utils.py.
 Remove   : When upstream supports int8 kv cache quantization.
+
+FP8 wire planning is enabled only for configured IluNixl producers. The
+scheduler keeps the community's concrete group spec so a block manager can
+be built. Per-layer page size and compression ratio are stored beside that
+spec; workers keep the original group spec for the transfer layout.
 """
 
+from __future__ import annotations
+
 from collections import defaultdict
+from collections.abc import Callable, Sequence
+from contextvars import ContextVar
+from copy import deepcopy
+from dataclasses import dataclass
+from functools import wraps
 
 from vllm import envs
 from vllm.config import VllmConfig
@@ -75,11 +87,23 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.fp8_layout import (
+    FP8_WIRE_SCRATCH_BUFFER_COUNT,
+    build_fp8_ds_mla_wire_config,
+    get_fp8_ds_mla_wire_groups,
+    get_fp8_wire_scratch_blocks,
+    packed_bytes_per_block,
+    use_fp8_ds_mla_wire_staging,
+)
+
 logger = init_logger(__name__)
 
 origin_get_kv_cache_config_from_groups = kv_cache_utils.get_kv_cache_config_from_groups
 origin_get_kv_cache_bytes_per_block = kv_cache_utils._get_kv_cache_bytes_per_block
 origin_pool_bytes_per_block = kv_cache_utils._pool_bytes_per_block
+origin_generate_scheduler_kv_cache_config = (
+    kv_cache_utils.generate_scheduler_kv_cache_config
+)
 
 _SCALE_KV_SPEC_TYPES = (
     FullAttentionSpec,
@@ -315,3 +339,220 @@ def get_kv_cache_config_from_groups(
             vllm_config.cache_config.prefix_cache_retention_interval
         ),
     )
+
+
+@dataclass
+class _OrderedWorkerSpecs:
+    specs: Sequence[dict[str, KVCacheSpec]]
+
+    def resolve(
+        self, kv_cache_groups: list[KVCacheGroupSpec]
+    ) -> dict[str, KVCacheSpec]:
+        """Resolve a worker spec without consuming it.
+
+        vLLM 0.31 may re-plan a worker after finding the global minimum block
+        count, so the same projected groups can be planned more than once.
+        """
+        layer_names = {
+            layer_name
+            for group in kv_cache_groups
+            for layer_name in group.layer_names
+        }
+        matches = [spec for spec in self.specs if set(spec) == layer_names]
+        if not matches:
+            raise RuntimeError(
+                "FP8 wire planning could not match projected KV groups to a "
+                "registration-ordered worker spec"
+            )
+        return matches[0]
+
+
+_ordered_worker_specs: ContextVar[_OrderedWorkerSpecs | None] = ContextVar(
+    "ilu_fp8_ordered_worker_specs", default=None
+)
+
+
+def make_get_kv_cache_config_from_groups(
+    original: Callable[..., KVCacheConfig],
+) -> Callable[..., KVCacheConfig]:
+    """Wrap one-worker planning with FP8 wire-memory reservation."""
+
+    @wraps(original)
+    def get_kv_cache_config_from_groups(
+        vllm_config: VllmConfig,
+        kv_cache_groups: list[KVCacheGroupSpec],
+        available_memory: int,
+        kv_cache_spec: dict[str, KVCacheSpec] | None = None,
+    ) -> KVCacheConfig:
+        if not use_fp8_ds_mla_wire_staging(vllm_config):
+            return original(vllm_config, kv_cache_groups, available_memory)
+
+        planning_context = _ordered_worker_specs.get()
+        context_spec = (
+            planning_context.resolve(kv_cache_groups)
+            if planning_context is not None
+            else None
+        )
+        if kv_cache_spec is None:
+            kv_cache_spec = context_spec
+
+        # available_memory==0 is the minimal profiling-cache path. It must not
+        # require registration-order metadata or reserve a second allocation.
+        plan_wire_staging = bool(kv_cache_groups) and available_memory > 0
+        wire_groups: list[KVCacheGroupSpec] | None = None
+        if plan_wire_staging:
+            if kv_cache_spec is None:
+                raise ValueError(
+                    "FP8 DS MLA wire staging requires the registration-ordered "
+                    "KV cache spec; deriving the layer order from the compute "
+                    "groups instead silently mislays every SWA page on the "
+                    "decode side"
+                )
+            wire_groups = get_fp8_ds_mla_wire_groups(
+                vllm_config, kv_cache_groups, kv_cache_spec
+            )
+            wire_bytes_per_block = packed_bytes_per_block(wire_groups)
+            original_available_memory = available_memory
+            scratch_blocks = get_fp8_wire_scratch_blocks(vllm_config)
+            scratch_bytes = (
+                FP8_WIRE_SCRATCH_BUFFER_COUNT * scratch_blocks * wire_bytes_per_block
+            )
+            if scratch_bytes > available_memory:
+                raise ValueError(
+                    "FP8 wire GPU scratch does not fit available KV memory: "
+                    f"required={scratch_bytes}, available={available_memory}, "
+                    f"scratch_buffers={FP8_WIRE_SCRATCH_BUFFER_COUNT}, "
+                    f"scratch_blocks={scratch_blocks}"
+                )
+            available_memory -= scratch_bytes
+            logger.info(
+                "Reserving GPU KV memory for pinned-host FP8 wire staging scratch: "
+                "scratch_buffers=%d, scratch_blocks=%d, "
+                "wire_bytes_per_block=%d, "
+                "scratch_bytes=%d, compute_budget=%d/%d bytes",
+                FP8_WIRE_SCRATCH_BUFFER_COUNT,
+                scratch_blocks,
+                wire_bytes_per_block,
+                scratch_bytes,
+                available_memory,
+                original_available_memory,
+            )
+            if vllm_config.cache_config.num_gpu_blocks_override is not None:
+                logger.warning(
+                    "num_gpu_blocks_override bypasses FP8 wire-staging "
+                    "capacity planning; ensure the compute and scratch "
+                    "allocations both fit"
+                )
+        else:
+            logger.debug(
+                "Skipping FP8 DS MLA wire-staging planning for the minimal "
+                "profiling KV cache"
+            )
+
+        kv_cache_config = original(vllm_config, kv_cache_groups, available_memory)
+        wire_config = (
+            build_fp8_ds_mla_wire_config(
+                kv_cache_groups,
+                wire_groups,
+                kv_cache_config.num_blocks,
+            )
+            if wire_groups is not None
+            else None
+        )
+        # Baseline KVCacheConfig intentionally remains unchanged; worker-only
+        # planning state is attached dynamically for the Ilu connector.
+        kv_cache_config.wire_kv_cache_config = wire_config
+        return kv_cache_config
+
+    return get_kv_cache_config_from_groups
+
+
+def _resize_wire_config(compute_config: KVCacheConfig) -> None:
+    wire_config = getattr(compute_config, "wire_kv_cache_config", None)
+    if wire_config is None:
+        return
+
+    old_num_blocks = wire_config.num_blocks
+    new_num_blocks = compute_config.num_blocks
+    if old_num_blocks == new_num_blocks:
+        return
+    if old_num_blocks <= 0:
+        raise ValueError("Cannot resize an FP8 wire cache planned with no blocks")
+
+    wire_config.num_blocks = new_num_blocks
+    for tensor in wire_config.kv_cache_tensors:
+        assert tensor.size % old_num_blocks == 0
+        tensor.size = tensor.size // old_num_blocks * new_num_blocks
+
+
+def make_get_kv_cache_configs(
+    original: Callable[..., list[KVCacheConfig]],
+) -> Callable[..., list[KVCacheConfig]]:
+    """Supply ordered worker specs and mirror global block-count shrinking."""
+
+    @wraps(original)
+    def get_kv_cache_configs(
+        vllm_config: VllmConfig,
+        kv_cache_specs: list[dict[str, KVCacheSpec]],
+        available_memory: list[int],
+    ) -> list[KVCacheConfig]:
+        if not use_fp8_ds_mla_wire_staging(vllm_config):
+            return original(vllm_config, kv_cache_specs, available_memory)
+
+        planning_context = _OrderedWorkerSpecs(kv_cache_specs)
+        token = _ordered_worker_specs.set(planning_context)
+        try:
+            configs = original(vllm_config, kv_cache_specs, available_memory)
+        finally:
+            _ordered_worker_specs.reset(token)
+
+        for config in configs:
+            _resize_wire_config(config)
+        return configs
+
+    return get_kv_cache_configs
+
+
+def make_generate_scheduler_kv_cache_config(
+    original: Callable[..., KVCacheConfig],
+) -> Callable[..., KVCacheConfig]:
+    """Remove worker-only wire allocation state from scheduler config."""
+
+    @wraps(original)
+    def generate_scheduler_kv_cache_config(
+        kv_cache_configs: list[KVCacheConfig],
+    ) -> KVCacheConfig:
+        cfg = original(kv_cache_configs)
+        if any(
+            hasattr(worker_config, "wire_kv_cache_config")
+            for worker_config in kv_cache_configs
+        ):
+            cfg.wire_kv_cache_config = None
+        return cfg
+
+    return generate_scheduler_kv_cache_config
+
+
+def generate_scheduler_kv_cache_config(
+    kv_cache_configs: list[KVCacheConfig],
+) -> KVCacheConfig:
+    """Keep a concrete scheduler spec and the per-layer physical specs.
+
+    The community planner replaces ``UniformTypeKVCacheSpecs`` with one
+    layer's spec so ``KVCacheManager`` can select a block manager. Putting
+    the wrapper back prevents that lookup. The block manager only needs the
+    shared block size and attention window; page size and compression ratio
+    differ per layer and stay on ``layer_kv_cache_specs``. Worker configs are
+    not rewritten here, so transfer descriptors still see every layer.
+    """
+    cfg = origin_generate_scheduler_kv_cache_config(kv_cache_configs)
+    for src, dst in zip(kv_cache_configs[0].kv_cache_groups, cfg.kv_cache_groups):
+        spec = src.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            dst.layer_kv_cache_specs = deepcopy(spec.kv_cache_specs)
+    if any(
+        hasattr(worker_config, "wire_kv_cache_config")
+        for worker_config in kv_cache_configs
+    ):
+        cfg.wire_kv_cache_config = None
+    return cfg

@@ -260,6 +260,7 @@ class IluMoEBatchedExpertsW4A8(BaseBatchExperts):
             input=output_1,
             expert_num_tokens=expert_num_tokens_gpu,
             max_num_tokens_per_expert=max_num_tokens_per_expert,
+            limit=self.swiglu_limit,
         )
 
         ixff.moe_w4a8_group_gemv(

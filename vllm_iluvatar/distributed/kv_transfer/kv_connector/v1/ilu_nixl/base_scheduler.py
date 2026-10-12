@@ -22,38 +22,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
 from vllm.logger import init_logger
 from vllm.utils.network_utils import make_zmq_path
 
-from .fp8_layout import use_fp8_ds_mla_wire_staging
-from .metadata import (
-    HeartbeatInfo,
-    IluNixlConnectorMetadata,
-    format_kv_group_page_log,
-)
+from .metadata import HeartbeatInfo, IluNixlConnectorMetadata
 
 logger = init_logger(__name__)
 
 
 class IluNixlBaseConnectorScheduler(NixlBaseConnectorScheduler):
     """Base scheduler that propagates PP topology through connector metadata."""
-
-    def __init__(self, *args, **kwargs):
-        vllm_config = args[0] if args else kwargs["vllm_config"]
-        super().__init__(*args, **kwargs)
-        transfer_config = getattr(vllm_config, "kv_transfer_config", None)
-        self.fp8_wire_staging_enabled = bool(
-            transfer_config is not None
-            and getattr(transfer_config, "kv_connector", None) is not None
-            and use_fp8_ds_mla_wire_staging(vllm_config)
-        )
-        self._fp8_staging_block_ids: dict[str, list[list[int]]] = {}
-        self._fp8_exported_block_ids: dict[str, Any] = {}
-        if self.fp8_wire_staging_enabled:
-            logger.info(
-                "[PD-P] scheduler KV groups: %s",
-                format_kv_group_page_log(
-                    self.kv_cache_config.kv_cache_groups,
-                    blocks_per_sw=self.blocks_per_sw,
-                ),
-            )
 
     def set_xfer_handshake_metadata(
         self,
@@ -182,8 +157,6 @@ class IluNixlBaseConnectorScheduler(NixlBaseConnectorScheduler):
         # at community commit 63e161f29. Ilu delta: carry pp_size/pp_split in
         # heartbeat metadata for heterogeneous PP handshakes.
         params = request.kv_transfer_params
-        if params is not None and params.get("do_remote_decode"):
-            self._truncate_request_for_prefill(request)
         if params is None or not params.get("do_remote_prefill"):
             return
 
@@ -192,7 +165,6 @@ class IluNixlBaseConnectorScheduler(NixlBaseConnectorScheduler):
         host = params.get("remote_host")
         port = params.get("remote_port")
         tp_size = params.get("tp_size")
-        dcp_size = params.get("dcp_size", 1)
         pp_size = params.get("pp_size", 1)
         pp_split = params.get("pp_split", "")
         if (
@@ -210,7 +182,6 @@ class IluNixlBaseConnectorScheduler(NixlBaseConnectorScheduler):
                 host=host,
                 port=port,
                 tp_size=tp_size,
-                dcp_size=dcp_size,
                 pp_size=pp_size,
                 pp_split=pp_split,
             )
@@ -219,108 +190,6 @@ class IluNixlBaseConnectorScheduler(NixlBaseConnectorScheduler):
             remote_engine_id,
             remote_request_id,
         )
-
-    def _build_save_meta(self, meta, scheduler_output) -> None:
-        if not self.fp8_wire_staging_enabled:
-            return super()._build_save_meta(meta, scheduler_output)
-
-        # Import from the community scheduler module so this stays pinned to
-        # the installed SchedulerOutput traversal.
-        from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
-            yield_req_data,
-        )
-
-        for req_id, new_block_id_groups, _ in yield_req_data(scheduler_output):
-            req = self._reqs_need_save.get(req_id)
-            if req is None:
-                continue
-
-            assert scheduler_output.num_scheduled_tokens is not None
-            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            is_partial = (
-                req.num_computed_tokens + num_scheduled_tokens
-            ) < req.num_prompt_tokens
-
-            accumulated = self._fp8_staging_block_ids.setdefault(
-                req_id,
-                [[] for _ in self.kv_cache_config.kv_cache_groups],
-            )
-            if new_block_id_groups is not None:
-                if len(accumulated) != len(new_block_id_groups):
-                    raise RuntimeError(
-                        "FP8 wire staging block group count changed while "
-                        f"accumulating request {req_id}: "
-                        f"{len(accumulated)} != {len(new_block_id_groups)}"
-                    )
-                for current, new_ids in zip(accumulated, new_block_id_groups):
-                    # SWA can reuse a numeric block ID. Move it to the live end
-                    # so final clipping keeps the current window.
-                    for block_id in new_ids:
-                        if block_id in current:
-                            current.remove(block_id)
-                        current.append(block_id)
-
-            if is_partial:
-                logger.debug(
-                    "[PD-P] save accumulate req=%s partial "
-                    "computed=%s scheduled=%s prompt=%s pages=%s",
-                    req_id,
-                    req.num_computed_tokens,
-                    num_scheduled_tokens,
-                    req.num_prompt_tokens,
-                    ",".join(str(len(group)) for group in accumulated),
-                )
-                continue
-
-            clipped = self.get_exchange_clipped_blocks(
-                tuple(list(group) for group in accumulated)
-            )
-            # vLLM 0.31 exchanges only transfer groups, while the staging
-            # transcoder is indexed by the complete compute-group list.
-            exported = [[] for _ in self.kv_cache_config.kv_cache_groups]
-            transfer_group_ids = getattr(
-                self.kv_cache_config,
-                "transfer_group_ids",
-                tuple(range(len(clipped))),
-            )
-            for group_id, group_blocks in zip(
-                transfer_group_ids, clipped
-            ):
-                exported[group_id] = list(group_blocks)
-            exported_block_ids = tuple(exported)
-            self._fp8_exported_block_ids[req_id] = exported_block_ids
-            num_tokens = min(
-                req.num_computed_tokens + num_scheduled_tokens,
-                req.num_prompt_tokens,
-            )
-            logger.info(
-                "[PD-P] save clip req=%s prompt=%s computed=%s "
-                "scheduled=%s export_tokens=%s before=[%s] after=[%s]",
-                req_id,
-                req.num_prompt_tokens,
-                req.num_computed_tokens,
-                num_scheduled_tokens,
-                num_tokens,
-                ",".join(str(len(group)) for group in accumulated),
-                ",".join(str(len(group)) for group in exported_block_ids),
-            )
-            logger.info(
-                "[PD-P] save groups req=%s %s",
-                req_id,
-                format_kv_group_page_log(
-                    self.kv_cache_config.kv_cache_groups,
-                    exported_block_ids,
-                ),
-            )
-            assert req.kv_transfer_params is not None
-            meta.add_new_req_to_save(
-                request_id=req_id,
-                local_block_ids=exported_block_ids,
-                kv_transfer_params=req.kv_transfer_params,
-                num_tokens=num_tokens,
-            )
-            self._reqs_need_save.pop(req_id)
-            self._fp8_staging_block_ids.pop(req_id, None)
 
     def build_connector_meta(self, scheduler_output):
         # Keep this method in sync with vLLM
@@ -345,7 +214,7 @@ class IluNixlBaseConnectorScheduler(NixlBaseConnectorScheduler):
                 awaiting_kvs=awaiting_kvs,
             )
 
-        if self.use_host_buffer or self.fp8_wire_staging_enabled:
+        if self.use_host_buffer:
             self._build_save_meta(meta, scheduler_output)
 
         meta.reqs_to_send = self._reqs_need_send

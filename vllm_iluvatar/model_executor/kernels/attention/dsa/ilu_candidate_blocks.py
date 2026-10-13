@@ -13,7 +13,8 @@ Why      : community spells both in Triton, which does not run on corex, and
 How      : same two entry points, same argument order and contract; the two
            reductions move to ``torch.ops._C.v41_candidate_block_scores`` /
            ``v41_apply_candidate_mask`` (``csrc/plugin/v41_candidate.cu``) and
-           the top-k stays in torch, exactly where community leaves it.
+           decode top-k scans the GPU row bounds with the native radix kernel;
+           other shapes retain the bounded Torch implementation.
 Scope    : DeepSeek-V4.1 indexers with a candidate source.
 Remove   : when community grows a vendor hook for these two.
 """
@@ -21,6 +22,7 @@ Remove   : when community grows a vendor hook for these two.
 from __future__ import annotations
 
 import torch
+import ixformer.inference.functions as ixfops
 
 # Rows per ``topk`` call in ``select_candidate_blocks``. Above 128 rows corex
 # torch's topk takes scratch memory outside the caching allocator -- tens of
@@ -54,6 +56,32 @@ def select_candidate_blocks(
 
     nblocks = -(-width // block_size)
     k = min(topk_blocks, nblocks)
+    if (
+        rows in (6, 12)
+        and logits.dtype == torch.bfloat16
+        and row_ks is None
+        and row_repeat == 1
+        and block_size == 8
+        and topk_blocks == 2048
+        and nblocks >= topk_blocks
+        and width % 16 == 0
+        and out.is_contiguous()
+    ):
+        scores = torch.ops._C.v41_candidate_block_scores(
+            logits, None, row_ke, block_size, row_repeat
+        )
+        ends = torch.div(
+            row_ke.clamp(min=0, max=width) + block_size - 1,
+            block_size,
+            rounding_mode="floor",
+        )
+        starts = torch.zeros_like(ends)
+        ixfops.dsa_update_topk_indices(scores, starts, ends, topk_blocks, out)
+        # The score producer initializes all columns. The radix pads with -1;
+        # an in-span block with no finite column is padding as well.
+        selected = scores.gather(1, out.clamp(min=0).long())
+        out.masked_fill_((out < 0) | (selected == -float("inf")), -1)
+        return
     # Slice on group boundaries so each slice's bounds start at a group.
     step = max(1, _TOPK_ROWS // row_repeat) * row_repeat
     for r0 in range(0, rows, step):

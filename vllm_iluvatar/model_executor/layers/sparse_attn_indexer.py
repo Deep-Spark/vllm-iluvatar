@@ -16,6 +16,7 @@ from vllm.utils.torch_utils import _encode_layer_name, direct_register_custom_op
 
 from vllm_iluvatar.model_executor.kernels.attention.dsa.ilu_candidate_blocks import (
     apply_candidate_mask,
+    apply_initialized_decode_candidate_mask,
     select_candidate_blocks,
 )
 from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
@@ -33,6 +34,8 @@ def _two_level_filter(
     candidate_write: bool,
     token_start: int,
     token_end: int,
+    *,
+    initialized_decode: bool = False,
 ) -> None:
     """V4.1's coarse pass over the logits, in place, before the top-k.
 
@@ -63,6 +66,8 @@ def _two_level_filter(
             candidate_block_size,
             rows,
         )
+    elif initialized_decode and candidate_block_size == 8:
+        apply_initialized_decode_candidate_mask(logits, valid_lens, rows)
     else:
         apply_candidate_mask(
             logits,
@@ -255,6 +260,7 @@ def ilu_sparse_attn_indexer(
             candidate_write,
             0,
             num_decode_tokens,
+            initialized_decode=q.dtype == torch.int8,
         )
         ixfops.dsa_update_topk_indices(
             logits,

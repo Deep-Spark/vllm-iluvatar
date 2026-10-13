@@ -207,6 +207,55 @@ __global__ void v41_mask_candidates_kernel(
   }
 }
 
+// The INT8 decode scorer already initializes the complete exterior to -inf.
+// Keep the private flag and mask work bounded by the current GPU row length.
+__global__ void v41_initialized_decode_flags_kernel(
+    const int32_t* candidates, const int32_t* ends, uint8_t* flags,
+    int width, int num_candidates, int64_t end_stride,
+    int64_t candidate_row_stride, int64_t candidate_col_stride) {
+  const int row = blockIdx.x;
+  const int nblocks = (width + 7) / 8;
+  const int length = max(0, min(ends[row * end_stride], width));
+  const int live_blocks = (length + 7) / 8;
+  uint8_t* row_flags = flags + static_cast<int64_t>(row) * (nblocks + 1);
+  for (int i = threadIdx.x; i < live_blocks; i += blockDim.x) row_flags[i] = 0;
+  if (threadIdx.x == 0) row_flags[nblocks] = 0;
+  __syncthreads();
+  for (int c = threadIdx.x; c < num_candidates; c += blockDim.x) {
+    const int64_t block = candidates[static_cast<int64_t>(row) *
+        candidate_row_stride + static_cast<int64_t>(c) * candidate_col_stride];
+    if (block < 0) continue;
+    if (block * 8 >= width) row_flags[nblocks] = 1;
+    else if (block < live_blocks) row_flags[block] = 1;
+  }
+}
+
+__global__ void v41_initialized_decode_mask_kernel(
+    int16_t* logits, const int32_t* ends, const uint8_t* flags,
+    int width, int64_t logits_row_stride, int64_t end_stride) {
+  const int row = blockIdx.x;
+  const int length = max(0, min(ends[row * end_stride], width));
+  const int nblocks = (width + 7) / 8;
+  const uint8_t* row_flags = flags + static_cast<int64_t>(row) * (nblocks + 1);
+  int16_t* row_logits = logits + static_cast<int64_t>(row) * logits_row_stride;
+#if __IVCORE_ARCH__
+  const auto desc = __build_desc(row_logits);
+#endif
+  for (int col = blockIdx.y * blockDim.x + threadIdx.x;
+       col < length; col += gridDim.y * blockDim.x) {
+    const bool keep = row_flags[col / 8] != 0 ||
+        (col == width - 1 && row_flags[nblocks] != 0);
+    if (!keep) {
+#if __IVCORE_ARCH__
+      // Preserve coherence through the native score/selection pipeline.
+      __ivcorex_ml_mem_store_i16(static_cast<int16_t>(0xff80), desc, col * 2, 0, 0);
+#else
+      row_logits[col] = static_cast<int16_t>(0xff80);
+#endif
+    }
+  }
+}
+
 // Fold ``torch.topk``'s two outputs into the shortlist row ``out`` expects.
 // ``out`` is wider than ``k`` (it holds ``topk_blocks`` columns); the first
 // ``k`` take an index, unless that slot scored ``-inf`` -- a block with no
@@ -397,6 +446,43 @@ void v41_apply_candidate_mask(torch::Tensor& logits,
           flags.data_ptr<uint8_t>(), static_cast<int>(width),
           static_cast<int>(nblocks), static_cast<int>(block_size),
           static_cast<int>(row_repeat)));
+}
+
+void v41_apply_initialized_decode_mask(torch::Tensor& logits,
+                                       torch::Tensor& row_ke,
+                                       torch::Tensor& candidate_blocks) {
+  check_logits(logits);
+  check_bound(row_ke, "row_ke");
+  const int64_t rows = logits.size(0);
+  const int64_t width = logits.size(1);
+  TORCH_CHECK(logits.scalar_type() == at::kBFloat16 && logits.stride(1) == 1,
+              "initialized decode logits must be bf16 with contiguous columns");
+  TORCH_CHECK(rows == 0 || rows == 6 || rows == 12,
+              "initialized decode mask requires 6 or 12 query rows");
+  TORCH_CHECK(candidate_blocks.is_cuda() && candidate_blocks.dim() == 2 &&
+                  candidate_blocks.scalar_type() == at::kInt &&
+                  candidate_blocks.size(0) >= rows,
+              "candidate_blocks must hold all query rows as CUDA int32");
+  TORCH_CHECK(row_ke.device() == logits.device() &&
+                  candidate_blocks.device() == logits.device(),
+              "initialized decode mask tensors must be on the same device");
+  check_row_groups(rows, row_ke.numel(), 1, "row_ke");
+  if (rows == 0 || width == 0) return;
+  const int64_t nblocks = cdiv_i64(width, 8);
+  auto flags = at::empty({rows, nblocks + 1}, logits.options().dtype(at::kByte));
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(logits));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  v41_initialized_decode_flags_kernel<<<static_cast<unsigned>(rows), kThreads,
+                                        0, stream>>>(
+      candidate_blocks.data_ptr<int32_t>(), row_ke.data_ptr<int32_t>(),
+      flags.data_ptr<uint8_t>(), static_cast<int>(width),
+      static_cast<int>(candidate_blocks.size(1)), row_ke.stride(0),
+      candidate_blocks.stride(0), candidate_blocks.stride(1));
+  v41_initialized_decode_mask_kernel<<<dim3(static_cast<unsigned>(rows), 32),
+                                       kThreads, 0, stream>>>(
+      reinterpret_cast<int16_t*>(logits.data_ptr()), row_ke.data_ptr<int32_t>(),
+      flags.data_ptr<uint8_t>(), static_cast<int>(width), logits.stride(0),
+      row_ke.stride(0));
 }
 
 }  // namespace vllm_iluvatar

@@ -454,6 +454,12 @@ void v41_apply_candidate_mask(torch::Tensor& logits,
                               torch::Tensor& candidate_blocks,
                               int64_t block_size, int64_t row_repeat);
 
+// Private block8 decode path. The scorer must have initialized the exterior
+// to -inf; only GPU-visible columns are masked, through the ML store path.
+void v41_apply_initialized_decode_mask(torch::Tensor& logits,
+                                       torch::Tensor& row_ke,
+                                       torch::Tensor& candidate_blocks);
+
 // RoPE the index query in place and rescale the per-head weights.
 // ``weights_out`` may alias ``weights_in``.
 void v41_indexer_q_rope(torch::Tensor& q, torch::Tensor& positions,

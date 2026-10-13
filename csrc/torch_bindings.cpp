@@ -121,6 +121,9 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
       "Tensor! logits, Tensor? row_ks, Tensor row_ke, "
       "Tensor candidate_blocks, int block_size, int row_repeat) -> ()");
   ops.def(
+      "v41_apply_initialized_decode_mask("
+      "Tensor! logits, Tensor row_ke, Tensor candidate_blocks) -> ()");
+  ops.def(
       "v41_indexer_q_rope("
       "Tensor! q, Tensor positions, Tensor cos_sin_cache, Tensor weights_in, "
       "Tensor! weights_out, float weights_scale) -> ()");
@@ -356,6 +359,8 @@ TORCH_LIBRARY_IMPL_EXPAND(_C, CUDA, ops) {
            &vllm_iluvatar::v41_write_candidate_topk);
   ops.impl("v41_apply_candidate_mask",
            &vllm_iluvatar::v41_apply_candidate_mask);
+  ops.impl("v41_apply_initialized_decode_mask",
+           &vllm_iluvatar::v41_apply_initialized_decode_mask);
   ops.impl("v41_indexer_q_rope", &vllm_iluvatar::v41_indexer_q_rope);
   ops.impl("v41_indexer_q_rope_fp8",
            &vllm_iluvatar::v41_indexer_q_rope_fp8);

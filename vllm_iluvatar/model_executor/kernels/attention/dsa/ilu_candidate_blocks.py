@@ -119,3 +119,19 @@ def apply_candidate_mask(
     torch.ops._C.v41_apply_candidate_mask(
         logits, row_ks, row_ke, candidate_blocks, block_size, row_repeat
     )
+
+
+def apply_initialized_decode_candidate_mask(
+    logits: torch.Tensor,
+    row_ke: torch.Tensor,
+    candidate_blocks: torch.Tensor,
+) -> None:
+    """Mask block8 decode logits whose exterior the scorer already initialized."""
+    if (logits.dtype == torch.bfloat16 and logits.shape[0] in (6, 12)
+            and logits.stride(1) == 1):
+        if logits.shape[1]:
+            torch.ops._C.v41_apply_initialized_decode_mask(
+                logits, row_ke, candidate_blocks
+            )
+        return
+    apply_candidate_mask(logits, None, row_ke, candidate_blocks, 8)

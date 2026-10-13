@@ -57,7 +57,12 @@ def register() -> None:
 
 
 def _patched_schedule_source(source: str) -> str:
-    """Widen idle ``num_new_tokens == 0`` checks to ``<= 0``."""
+    """Widen idle checks and apply even remote-prefix replay alignment."""
+    from vllm_iluvatar.ilu_patch.general_patches.patch_prefix_replay_alignment import (
+        patch_schedule_source,
+    )
+
+    source = patch_schedule_source(source)
     if _IDLE_CHECK not in source:
         raise RuntimeError(
             "Scheduler.schedule no longer contains "
@@ -113,6 +118,12 @@ def _patch_update_draft_token_ids(Scheduler: Any) -> None:
 def _apply() -> None:
     from vllm.v1.core.sched import scheduler as sched_mod
     from vllm.v1.core.sched.scheduler import Scheduler
+
+    from vllm_iluvatar.ilu_patch.general_patches.patch_prefix_replay_alignment import (
+        align_prefix_replay_ext_tokens,
+    )
+
+    sched_mod._ilu_align_prefix_replay_ext_tokens = align_prefix_replay_ext_tokens
 
     if getattr(Scheduler.schedule, "_ilu_pp_spec_schedule_patched", False):
         _patch_update_draft_token_ids(Scheduler)

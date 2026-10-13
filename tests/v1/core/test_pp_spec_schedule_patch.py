@@ -100,4 +100,8 @@ def test_schedule_patch_installs_on_community_scheduler():
     assert "if num_new_tokens <= 0:" in source
     assert "if num_new_tokens == 0:" not in source
     assert "num_new_tokens += self.num_sampled_tokens_per_step" not in source
-    assert getattr(Scheduler.update_draft_token_ids, "_ilu_pp_spec_draft_patched", False)
+    assert "_ilu_align_prefix_replay_ext_tokens" in source
+    assert "ext_tokens -= ext_tokens % self.block_size" not in source
+    assert getattr(
+        Scheduler.update_draft_token_ids, "_ilu_pp_spec_draft_patched", False
+    )

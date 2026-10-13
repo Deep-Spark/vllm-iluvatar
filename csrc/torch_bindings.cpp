@@ -163,6 +163,11 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
       "Tensor block_table, Tensor is_valid_token, int block_size, int window_size, "
       "int index_width, int num_tokens) -> ()");
   ops.def(
+      "v41_indexer_decode_spans("
+      "Tensor seq_lens, Tensor cu_query, Tensor(a!) ks, Tensor(b!) ke, "
+      "int num_requests, int num_real_tokens, int num_padded_tokens, "
+      "int compress_ratio) -> ()");
+  ops.def(
       "triton_prepare_dflash_inputs("
       "Tensor! out_input_ids, Tensor! out_query_positions, "
       "Tensor! out_query_start_loc, Tensor! out_seq_lens, "
@@ -374,6 +379,8 @@ TORCH_LIBRARY_IMPL_EXPAND(_C, CUDA, ops) {
            &vllm_iluvatar::v41_swa_prefill_gather_lens);
   ops.impl("v41_dspark_noncausal_swa_indices_and_lens",
            &vllm_iluvatar::v41_dspark_noncausal_swa_indices_and_lens);
+  ops.impl("v41_indexer_decode_spans",
+           &vllm_iluvatar::v41_indexer_decode_spans);
   ops.impl("v41_global_topk_indices_and_lens",
            &vllm_iluvatar::v41_global_topk_indices_and_lens);
   ops.impl("triton_prepare_dflash_inputs",

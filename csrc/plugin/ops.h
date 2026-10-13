@@ -557,4 +557,11 @@ void v41_dspark_noncausal_swa_indices_and_lens(
     torch::Tensor& is_valid_token, int64_t block_size, int64_t window_size,
     int64_t index_width, int64_t num_tokens);
 
+// Causal decode spans in the indexer's compressed domain. Outputs retain
+// their graph-captured addresses; query and sequence inputs stay on device.
+void v41_indexer_decode_spans(
+    torch::Tensor& seq_lens, torch::Tensor& cu_query,
+    torch::Tensor& ks, torch::Tensor& ke, int64_t num_requests,
+    int64_t num_real_tokens, int64_t num_padded_tokens, int64_t compress_ratio);
+
 }  // namespace vllm_iluvatar

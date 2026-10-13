@@ -652,11 +652,6 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # dsa_update_topk_indices) and the K-cache itself live in the
         # compressed domain.
         compress_ratio = self.compress_ratio
-        # 0.30.1 dropped the cached ``seq_lens_cpu`` property to stop callers
-        # from taking an implicit H<>D sync by accident. ``kv_spans_from_batches``
-        # reads these lengths on the host, so the sync is unavoidable here; this
-        # is the same copy the property used to make.
-        seq_lens_decode_uncomp = common_attn_metadata.seq_lens[:num_decodes].cpu()
         # These host scalars are fixed at CUDA graph capture time. Actual
         # per-request lengths remain device-driven through cu_seqlens_kv.
         max_context_len = self.max_decode_context_len
@@ -683,13 +678,6 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # causal ``[ks, ke)`` span per query token in the compressed domain.
         # For MTP this is exactly the per-token causal structure: token j of
         # request b attends to ``L_b - next_n + j + 1`` KV positions.
-        cu_seqlen_ks_tmp, cu_seqlen_ke_tmp = kv_spans_from_batches(
-            decode_qsl_cpu,
-            seq_lens_decode_uncomp,
-            self.device,
-            compress_ratio=compress_ratio,
-        )
-
         # Copy into persistent buffers for CUDA graph address stability. There
         # is one ks/ke entry per **real** decode query token; the topk kernel
         # only reads ``ke - ks`` (the per-token causal length), so the absolute
@@ -699,11 +687,44 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # (uninitialised) padded logits rows. Slicing to the padded length
         # keeps ``cu_seqlen_ks.shape[0] == logits.shape[0]`` (the consumer
         # builds logits from ``q[:num_decode_tokens]``).
-        assert cu_seqlen_ks_tmp.shape[0] == num_real_decode_tokens
-        self.cu_seqlen_ks_buffer[:num_real_decode_tokens] = cu_seqlen_ks_tmp
-        self.cu_seqlen_ke_buffer[:num_real_decode_tokens] = cu_seqlen_ke_tmp
-        self.cu_seqlen_ks_buffer[num_real_decode_tokens:num_decode_tokens] = 0
-        self.cu_seqlen_ke_buffer[num_real_decode_tokens:num_decode_tokens] = 0
+        use_cuda_spans = (
+            indexer_kv_dtype() == "int8"
+            and compress_ratio in (1, 2)
+            and num_decodes in (1, 2)
+            and num_decode_tokens in (6, 12)
+            and max_q_len in (0, 6)
+            and not requires_padding
+            and common_attn_metadata.seq_lens.is_cuda
+            and common_attn_metadata.seq_lens.dtype == torch.int32
+            and common_attn_metadata.seq_lens.is_contiguous()
+        )
+        if use_cuda_spans:
+            # Use actual device lengths: the CPU mirror is only an upper
+            # bound with asynchronous scheduling. Existing current-stream
+            # input preparation precedes these writes and graph consumers.
+            torch.ops._C.v41_indexer_decode_spans(
+                common_attn_metadata.seq_lens[:num_decodes],
+                cu_seqlens_q,
+                self.cu_seqlen_ks_buffer[:num_decode_tokens],
+                self.cu_seqlen_ke_buffer[:num_decode_tokens],
+                num_decodes,
+                num_real_decode_tokens,
+                num_decode_tokens,
+                compress_ratio,
+            )
+        else:
+            seq_lens_decode_uncomp = common_attn_metadata.seq_lens[:num_decodes].cpu()
+            cu_seqlen_ks_tmp, cu_seqlen_ke_tmp = kv_spans_from_batches(
+                decode_qsl_cpu,
+                seq_lens_decode_uncomp,
+                self.device,
+                compress_ratio=compress_ratio,
+            )
+            assert cu_seqlen_ks_tmp.shape[0] == num_real_decode_tokens
+            self.cu_seqlen_ks_buffer[:num_real_decode_tokens] = cu_seqlen_ks_tmp
+            self.cu_seqlen_ke_buffer[:num_real_decode_tokens] = cu_seqlen_ke_tmp
+            self.cu_seqlen_ks_buffer[num_real_decode_tokens:num_decode_tokens] = 0
+            self.cu_seqlen_ke_buffer[num_real_decode_tokens:num_decode_tokens] = 0
         cu_seqlen_ks = self.cu_seqlen_ks_buffer[:num_decode_tokens]
         cu_seqlen_ke = self.cu_seqlen_ke_buffer[:num_decode_tokens]
         torch.sub(

@@ -85,74 +85,28 @@ def build_dspark_noncausal_swa_indices(
     tokens that follow it. Slots beyond a token's length are ``-1``, and
     padding tokens get length 0.
 
-    Reproduces ``_compute_dspark_noncausal_swa_indices_kernel``
-    (vllm/v1/attention/backends/mla/sparse_swa.py:816-856, baseline
-    main_6e448d0) in Torch. Correctness first; an ixformer kernel can
-    replace it once the numerics are pinned down.
+    The CUDA kernel reads GPU metadata and only the window's page IDs. It
+    initializes every output slot, including padding and reused buffers.
     """
     if out_indices is None:
-        indices = torch.full(
-            (num_decode_tokens, 1, index_width), -1, dtype=torch.int32, device=device
+        indices = torch.empty(
+            (num_decode_tokens, 1, index_width), dtype=torch.int32, device=device
         )
     else:
         assert out_indices.shape[0] >= num_decode_tokens
         assert out_indices.shape[1:] == (1, index_width)
         indices = out_indices[:num_decode_tokens]
-        indices.fill_(-1)
 
     if out_lens is None:
-        lens = torch.zeros(num_decode_tokens, dtype=torch.int32, device=device)
+        lens = torch.empty(num_decode_tokens, dtype=torch.int32, device=device)
     else:
         assert out_lens.shape[0] >= num_decode_tokens
         lens = out_lens[:num_decode_tokens]
-        lens.zero_()
 
-    seq_lens_cpu = seq_lens.tolist()
-    qsl_cpu = query_start_loc.tolist()
-    block_table_cpu = block_table.tolist()
-    is_valid_cpu = is_valid_token.tolist()
-
-    for req_idx in range(len(qsl_cpu) - 1):
-        start, end = qsl_cpu[req_idx], qsl_cpu[req_idx + 1]
-        if start >= num_decode_tokens:
-            break
-        end = min(end, num_decode_tokens)
-        query_len = sum(is_valid_cpu[start:end])
-        if query_len <= 0:
-            continue
-        block_table_row = block_table_cpu[req_idx]
-        # DSpark always prepares a full speculative block, so its draft
-        # sequence length can temporarily extend past the range represented by
-        # the block table near the model-length boundary. Treat that tail as
-        # padding instead of indexing beyond the row.
-        block_table_capacity = len(block_table_row) * block_size
-        raw_seq_len = seq_lens_cpu[req_idx]
-        if raw_seq_len > block_table_capacity:
-            logger.warning(
-                "Clamping DSpark SWA sequence length to block-table capacity: "
-                "req_idx=%d, seq_len=%d, capacity=%d, block_size=%d, "
-                "block_table_cols=%d, valid_query_len=%d",
-                req_idx,
-                raw_seq_len,
-                block_table_capacity,
-                block_size,
-                len(block_table_row),
-                query_len,
-            )
-        seq_len = min(raw_seq_len, block_table_capacity)
-        prefix_len = seq_len - query_len
-        start_pos = max(prefix_len - window_size, 0)
-        positions = list(range(start_pos, seq_len))[:index_width]
-        slots = [
-            block_table_row[p // block_size] * block_size + p % block_size
-            for p in positions
-        ]
-        slot_t = torch.tensor(slots, dtype=torch.int32, device=device)
-        for token_idx in range(start, end):
-            if not is_valid_cpu[token_idx]:
-                continue
-            indices[token_idx, 0, : slot_t.numel()] = slot_t
-            lens[token_idx] = slot_t.numel()
+    torch.ops._C.v41_dspark_noncausal_swa_indices_and_lens(
+        indices, lens, seq_lens, query_start_loc, block_table, is_valid_token,
+        block_size, window_size, index_width, num_decode_tokens,
+    )
 
     return indices, lens
 

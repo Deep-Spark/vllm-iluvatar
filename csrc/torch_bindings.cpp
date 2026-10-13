@@ -155,6 +155,11 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
       "Tensor replay_start, int num_prefills, int num_decodes, "
       "int window_size) -> ()");
   ops.def(
+      "v41_dspark_noncausal_swa_indices_and_lens("
+      "Tensor! indices, Tensor! lens, Tensor seq_lens, Tensor query_start_loc, "
+      "Tensor block_table, Tensor is_valid_token, int block_size, int window_size, "
+      "int index_width, int num_tokens) -> ()");
+  ops.def(
       "triton_prepare_dflash_inputs("
       "Tensor! out_input_ids, Tensor! out_query_positions, "
       "Tensor! out_query_start_loc, Tensor! out_seq_lens, "
@@ -362,6 +367,8 @@ TORCH_LIBRARY_IMPL_EXPAND(_C, CUDA, ops) {
            &vllm_iluvatar::v41_swa_indices_and_lens);
   ops.impl("v41_swa_prefill_gather_lens",
            &vllm_iluvatar::v41_swa_prefill_gather_lens);
+  ops.impl("v41_dspark_noncausal_swa_indices_and_lens",
+           &vllm_iluvatar::v41_dspark_noncausal_swa_indices_and_lens);
   ops.impl("v41_global_topk_indices_and_lens",
            &vllm_iluvatar::v41_global_topk_indices_and_lens);
   ops.impl("triton_prepare_dflash_inputs",

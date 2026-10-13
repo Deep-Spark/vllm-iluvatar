@@ -543,4 +543,12 @@ void v41_swa_prefill_gather_lens(torch::Tensor& prefill_gather_lens,
                                  int64_t num_prefills, int64_t num_decodes,
                                  int64_t window_size);
 
+// DSpark's noncausal draft window uses actual valid query count and includes
+// all block keys. Writes every output/PAD row without transferring page tables.
+void v41_dspark_noncausal_swa_indices_and_lens(
+    torch::Tensor& indices, torch::Tensor& lens, torch::Tensor& seq_lens,
+    torch::Tensor& query_start_loc, torch::Tensor& block_table,
+    torch::Tensor& is_valid_token, int64_t block_size, int64_t window_size,
+    int64_t index_width, int64_t num_tokens);
+
 }  // namespace vllm_iluvatar

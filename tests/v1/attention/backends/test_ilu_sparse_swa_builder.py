@@ -178,7 +178,7 @@ def test_causal_decode_calls_plugin_and_sets_metadata_causal_true():
     assert int(md.decode_swa_indices[0, 0, 0]) == 42
 
 
-def test_noncausal_dspark_uses_python_indices_not_plugin():
+def test_noncausal_dspark_calls_noncausal_plugin():
     window_size, num_spec, block_size = 8, 5, 4
     builder = _make_builder(
         is_dspark=True,
@@ -195,7 +195,18 @@ def test_noncausal_dspark_uses_python_indices_not_plugin():
         is_prefilling=[True],
     )
 
+    def _fake_noncausal(indices, lens, seq, qsl, table, valid, bs, ws, width, n):
+        assert bs == block_size and ws == window_size and n == num_spec
+        indices.fill_(-1)
+        indices[:, 0, :13] = torch.arange(2, 15, dtype=torch.int32)
+        lens.fill_(13)
+
     with (
+        patch(
+            "torch.ops._C.v41_dspark_noncausal_swa_indices_and_lens",
+            side_effect=_fake_noncausal,
+            create=True,
+        ) as noncausal_op,
         patch(
             "torch.ops._C.v41_swa_indices_and_lens",
             create=True,
@@ -214,20 +225,13 @@ def test_noncausal_dspark_uses_python_indices_not_plugin():
         md = builder.build(0, cad)
 
     mock_op.assert_not_called()
+    noncausal_op.assert_called_once()
     assert md.causal is False
     assert md.num_decode_tokens == num_spec
 
-    expected_indices, expected_lens = build_dspark_noncausal_swa_indices(
-        seq_lens=cad.seq_lens,
-        query_start_loc=cad.query_start_loc,
-        block_table=cad.block_table_tensor,
-        is_valid_token=cad.slot_mapping >= 0,
-        block_size=block_size,
-        window_size=window_size,
-        index_width=builder.noncausal_index_width,
-        num_decode_tokens=num_spec,
-        device=torch.device("cpu"),
-    )
+    expected_indices = torch.full_like(md.decode_swa_indices, -1)
+    expected_indices[:, 0, :13] = torch.arange(2, 15, dtype=torch.int32)
+    expected_lens = torch.full_like(md.decode_swa_lens, 13)
     assert torch.equal(md.decode_swa_indices, expected_indices)
     assert torch.equal(md.decode_swa_lens, expected_lens)
     # All queries in the block share the same non-causal key set.
@@ -236,19 +240,21 @@ def test_noncausal_dspark_uses_python_indices_not_plugin():
         assert md.decode_swa_indices[q, 0, : md.decode_swa_lens[q]].tolist() == first
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 def test_noncausal_dspark_ignores_queries_past_max_model_len():
+    import vllm_iluvatar._C  # noqa: F401
     block_size = 4
-    is_valid = torch.tensor([True, True, False, False, False, False])
+    is_valid = torch.tensor([True, True, False, False, False, False], device="cuda")
     indices, lens = build_dspark_noncausal_swa_indices(
-        seq_lens=torch.tensor([16], dtype=torch.int32),
-        query_start_loc=torch.tensor([0, 6], dtype=torch.int32),
-        block_table=torch.arange(4, dtype=torch.int32).unsqueeze(0),
+        seq_lens=torch.tensor([16], dtype=torch.int32, device="cuda"),
+        query_start_loc=torch.tensor([0, 6], dtype=torch.int32, device="cuda"),
+        block_table=torch.arange(4, dtype=torch.int32, device="cuda").unsqueeze(0),
         is_valid_token=is_valid,
         block_size=block_size,
         window_size=4,
         index_width=8,
         num_decode_tokens=6,
-        device=torch.device("cpu"),
+        device=torch.device("cuda"),
     )
 
     assert lens.tolist() == [6, 6, 0, 0, 0, 0]
@@ -256,21 +262,23 @@ def test_noncausal_dspark_ignores_queries_past_max_model_len():
     assert torch.equal(indices[0], indices[1])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 def test_noncausal_dspark_clamps_seq_len_to_block_table_capacity():
+    import vllm_iluvatar._C  # noqa: F401
     block_size = 4
     # Model the ilu-only hotfix: an unpatched speculator still marks every
     # query valid and reports a sequence length beyond block-table capacity.
-    is_valid = torch.ones(6, dtype=torch.bool)
+    is_valid = torch.ones(6, dtype=torch.bool, device="cuda")
     indices, lens = build_dspark_noncausal_swa_indices(
-        seq_lens=torch.tensor([18], dtype=torch.int32),
-        query_start_loc=torch.tensor([0, 6], dtype=torch.int32),
-        block_table=torch.arange(4, dtype=torch.int32).unsqueeze(0),
+        seq_lens=torch.tensor([18], dtype=torch.int32, device="cuda"),
+        query_start_loc=torch.tensor([0, 6], dtype=torch.int32, device="cuda"),
+        block_table=torch.arange(4, dtype=torch.int32, device="cuda").unsqueeze(0),
         is_valid_token=is_valid,
         block_size=block_size,
         window_size=4,
         index_width=16,
         num_decode_tokens=6,
-        device=torch.device("cpu"),
+        device=torch.device("cuda"),
     )
 
     assert lens.tolist() == [10, 10, 10, 10, 10, 10]

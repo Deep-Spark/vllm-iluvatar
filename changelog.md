@@ -14,10 +14,11 @@
 
 ### Added
 
-- `version.json` 新增 `pins`,用于在 Docker 构建时固定 ixformer 与 vllm 的 commit。
-- 新增 `third_party/ixformer` 与 `third_party/vllm` 两个 submodule,由本仓库统一管理其版本。
-- 新增 `scripts/build_third_party.sh`,按 submodule 锁定的 commit 编译并安装 ixformer 与 vllm(仅用于开发,不参与打包)。
 - 新增《如何搭建 vllm-iluvatar 开发环境》开发文档。
+
+### Removed
+
+- 移除 `third_party/ixformer`、`third_party/vllm` 两个 submodule、`.gitmodules` 及仅用于驱动 submodule 构建的 `scripts/build_third_party.sh`;ixformer / vllm 的锁定 commit 改由根目录 `Dockerfile` 的构建参数(`IXFORMER_COMMIT` / `VLLM_COMMIT`)管理。
 
 ### Changed
 

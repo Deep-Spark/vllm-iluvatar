@@ -2,7 +2,6 @@
 import hashlib
 import json
 import os
-from pathlib import Path
 import time
 import numpy as np
 from .source_state import local_paths

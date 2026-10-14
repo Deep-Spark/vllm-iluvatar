@@ -40,7 +40,7 @@ install_runtime_deps() {
     return
   fi
 
-  echo "INFO: Installing runtime deps (numpy, --no-deps quartet, requirements.txt)"
+  echo "INFO: Installing runtime deps from requirements.txt"
   "${PYTHON_PATH}" -m pip install --upgrade pip
 
   # ``--only-binary=:all:`` forbids sdist fallback so pip fails loudly (with a
@@ -54,20 +54,16 @@ install_runtime_deps() {
     BINARY_ONLY_FLAG=(--only-binary=:all:)
   fi
 
-  # numpy must be pinned to a NumPy 1.x release to match CoreX torch's C ABI.
-  # ``.ixci/build.json`` also pins it before the build step; this line is the
-  # fallback for hosts that run install_vllm_iluvatar.sh standalone. Idempotent
-  # (skips if numpy 1.26.x is already installed).
-  "${PYTHON_PATH}" -m pip install "${PIP_INSTALL_FLAGS[@]}" "${BINARY_ONLY_FLAG[@]}" 'numpy~=1.26.0'
-
-  # T
-  # gets its own explicit pip line here.
-  "${PYTHON_PATH}" -m pip install "${PIP_INSTALL_FLAGS[@]}" "${BINARY_ONLY_FLAG[@]}" --no-deps 'opencv-python-headless==4.11.0.86'
-  "${PYTHON_PATH}" -m pip install "${PIP_INSTALL_FLAGS[@]}" "${BINARY_ONLY_FLAG[@]}" --no-deps 'compressed-tensors==0.15.0.1'
-  "${PYTHON_PATH}" -m pip install "${PIP_INSTALL_FLAGS[@]}" "${BINARY_ONLY_FLAG[@]}" --no-deps 'mistral_common==1.11.5'
-  "${PYTHON_PATH}" -m pip install "${PIP_INSTALL_FLAGS[@]}" "${BINARY_ONLY_FLAG[@]}" --no-deps 'xgrammar>=0.2.1,<1.0.0'
-  "${PYTHON_PATH}" -m pip install "${PIP_INSTALL_FLAGS[@]}" "${BINARY_ONLY_FLAG[@]}" --no-deps 'llguidance>=1.7.0,<1.8.0'
-
+  # requirements.txt is the single source of truth for runtime deps. It already
+  # carries every iluvatar delta that used to be hardcoded here as a separate
+  # ``--no-deps`` line:
+  #   * numpy < 2            (CoreX torch is built against the NumPy 1.x C ABI)
+  #   * opencv-python-headless == 4.11.0.86   (upstream >= 4.13 wants numpy >= 2)
+  #   * compressed-tensors == 0.15.0.1        (upstream moved to 0.17.0)
+  #   * mistral_common == 1.11.5              (dropped the [image] extra)
+  #   * xgrammar / llguidance pins
+  # pip resolves the whole file together, so those pins no longer need their own
+  # pre-install lines; duplicating them here only risked drift from the file.
   "${PYTHON_PATH}" -m pip install "${PIP_INSTALL_FLAGS[@]}" "${BINARY_ONLY_FLAG[@]}" -r "${ROOT_DIR}/requirements.txt"
 }
 

@@ -412,6 +412,17 @@ class IluDeepseekV41Indexer(nn.Module):
             candidate_blocks=candidate_block_buffer,
             candidate_block_size=candidate_block_size,
             candidate_write=candidate_write,
+            owned_decode_state=(
+                self.store_int8_kv and self.n_head == 32 and self.head_dim == 128
+                and compress_ratio in (1, 2) and topk_indices_buffer is not None
+                and topk_indices_buffer.is_cuda
+                and vllm_config.kv_transfer_config is not None
+                and vllm_config.kv_transfer_config.kv_role == "kv_consumer"
+                and 1 <= vllm_config.scheduler_config.max_num_seqs <= 2
+                and vllm_config.speculative_config is not None
+                and vllm_config.speculative_config.method == "dspark"
+                and vllm_config.speculative_config.num_speculative_tokens == 5
+            ),
         )
 
     def _produce_k(

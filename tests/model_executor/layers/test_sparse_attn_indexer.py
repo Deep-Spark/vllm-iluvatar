@@ -137,3 +137,123 @@ def test_ilu_sparse_attn_indexer_forward_cuda_calls_registered_op(
     assert args[5] is weights
     assert args[6:10] == (4, 8, 16, 32)
     assert args[10] is topk_indices_buffer
+    assert args[-2:] == (None, None)
+
+
+def _owned_test_layer(sparse_attn_indexer, *, enabled):
+    return sparse_attn_indexer.IluSparseAttnIndexer(
+        k_cache=SimpleNamespace(prefix="layer.0.indexer", kv_cache=object()),
+        quant_block_size=128,
+        scale_fmt="ue8m0",
+        topk_tokens=4,
+        head_dim=128,
+        max_model_len=33,
+        max_total_seq_len=66,
+        topk_indices_buffer=torch.empty((12, 4), dtype=torch.int32),
+        owned_decode_state=enabled,
+    )
+
+
+def _owned_test_metadata(tokens, *, prefill=False, padded=False):
+    from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
+        IluDeepSeekV32IndexerDecodeMetadata,
+        IluDeepseekV32IndexerMetadata,
+    )
+
+    batch = max(1, tokens // 6)
+    lens = torch.ones(tokens, dtype=torch.int32)
+    prefix = torch.arange(batch + 1, dtype=torch.int32) * (tokens // batch)
+    decode = IluDeepSeekV32IndexerDecodeMetadata(
+        block_table=torch.zeros((batch, 1), dtype=torch.int32),
+        seq_lens=lens,
+        decode_lens=torch.full((batch,), tokens // batch, dtype=torch.int32),
+        requires_padding=padded,
+        cu_seqlen_ks=torch.zeros_like(lens),
+        cu_seqlen_ke=lens,
+        valid_lens=lens,
+        cu_seqlens_kv=torch.arange(batch + 1, dtype=torch.int32),
+        cu_seqlens_q=prefix,
+        max_context_len=33,
+        max_q_len=tokens // batch,
+        max_kv_len=1,
+    )
+    return IluDeepseekV32IndexerMetadata(
+        seq_lens=torch.ones(batch, dtype=torch.int32),
+        num_reqs=batch,
+        max_query_len=tokens // batch,
+        max_seq_len=1,
+        num_actual_tokens=tokens,
+        query_start_loc=prefix,
+        slot_mapping=torch.zeros(tokens, dtype=torch.int32),
+        head_dim=128,
+        num_decodes=batch,
+        num_decode_tokens=tokens,
+        num_prefills=int(prefill),
+        num_prefill_tokens=int(prefill),
+        decode=decode,
+    )
+
+
+def test_disabled_owner_never_reads_forward_context(monkeypatch, default_vllm_config):
+    sparse = _load_sparse_attn_indexer(monkeypatch)
+    layer = _owned_test_layer(sparse, enabled=False)
+    calls = []
+
+    def unexpected_context():
+        raise AssertionError("disabled owner must delegate without metadata lookup")
+
+    monkeypatch.setattr(sparse, "get_forward_context", unexpected_context)
+    with patch.object(torch.ops.vllm, "ilu_sparse_attn_indexer",
+                      lambda *args: calls.append(args) or args[10], create=True):
+        output = layer.forward_cuda(torch.empty(6, 8), torch.empty(6, 32, 128),
+                                    torch.empty(6, 128), torch.empty(6, 32))
+    assert output is layer.topk_indices_buffer
+    assert len(calls) == 1 and calls[0][-2:] == (None, None)
+
+
+@pytest.mark.parametrize("kind", ["full6", "full12", "prefill", "padded",
+                                 "unsupported", "none", "missing", "list"])
+def test_owned_buffer_selection_in_forward_context(monkeypatch, default_vllm_config, kind):
+    from vllm.forward_context import set_forward_context
+
+    sparse = _load_sparse_attn_indexer(monkeypatch)
+    layer = _owned_test_layer(sparse, enabled=True)
+    tokens = 12 if kind == "full12" else 8 if kind == "unsupported" else 6
+    md = _owned_test_metadata(tokens, prefill=kind == "prefill", padded=kind == "padded")
+    metadata = {layer.k_cache.prefix: md}
+    if kind == "none":
+        metadata = None
+    elif kind == "missing":
+        metadata = {}
+    elif kind == "list":
+        metadata = [metadata]
+    calls = []
+    with patch.object(torch.ops.vllm, "ilu_sparse_attn_indexer",
+                      lambda *args: calls.append(args) or args[10], create=True):
+        with set_forward_context(metadata, default_vllm_config):
+            output = layer.forward_cuda(torch.empty(tokens, 8), torch.empty(tokens, 32, 128),
+                                        torch.empty(tokens, 128), torch.empty(tokens, 32))
+    assert output is layer.topk_indices_buffer and len(calls) == 1
+    if kind in ("full6", "full12"):
+        logits, extent = calls[0][-2:]
+        assert logits is getattr(layer, f"_owned_decode_logits_{tokens}")
+        assert extent is getattr(layer, f"_owned_decode_extent_{tokens}")
+        assert logits.shape == (tokens, 33) and logits.stride(0) == 64
+        assert logits.dtype == torch.bfloat16 and extent.dtype == torch.int32
+        assert torch.all(extent == -1)
+        assert layer._owned_decode_logits_6.untyped_storage().data_ptr() != (
+            layer._owned_decode_logits_12.untyped_storage().data_ptr())
+        assert not any("owned_decode" in name for name in layer.state_dict())
+    else:
+        assert calls[0][-2:] == (None, None)
+
+
+def test_active_owner_requires_forward_context(monkeypatch, default_vllm_config):
+    from vllm.forward_context import override_forward_context
+
+    sparse = _load_sparse_attn_indexer(monkeypatch)
+    layer = _owned_test_layer(sparse, enabled=True)
+    with override_forward_context(None):
+        with pytest.raises(AssertionError, match="Forward context is not set"):
+            layer.forward_cuda(torch.empty(6, 8), torch.empty(6, 32, 128),
+                               torch.empty(6, 128), torch.empty(6, 32))

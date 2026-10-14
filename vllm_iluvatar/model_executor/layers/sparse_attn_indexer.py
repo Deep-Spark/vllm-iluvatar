@@ -92,6 +92,8 @@ def _mqa_logits(
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
     valid_lens: torch.Tensor,
+    owned_logits: torch.Tensor | None = None,
+    previous_extent: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """One chunk's paged MQA logits, per the record the query carries.
 
@@ -101,6 +103,14 @@ def _mqa_logits(
     length is all either one uses (see ``_two_level_filter``).
     """
     if q.dtype is torch.int8:
+        if owned_logits is not None and previous_extent is not None:
+            from ixformer.inference.functions.deepseek.indexer import (
+                dsa_indexer_mqa_logits_ixinfer_owned,
+            )
+            return dsa_indexer_mqa_logits_ixinfer_owned(
+                q, cu_seqlens_q, cu_seqlens_kv, kv_cache, block_table, weights,
+                owned_logits, previous_extent, max_q_len=max_q_len,
+                max_kv_len=max_kv_len, valid_lens=valid_lens)
         return ixfops.dsa_indexer_mqa_logits(
             q,
             cu_seqlens_q,
@@ -145,6 +155,8 @@ def ilu_sparse_attn_indexer(
     candidate_blocks: torch.Tensor | None = None,
     candidate_block_size: int = 0,
     candidate_write: bool = False,
+    owned_logits: torch.Tensor | None = None,
+    previous_extent: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # attn_metadata is unavailable during dummy/profiling runs.
     assert topk_indices_buffer is not None
@@ -231,6 +243,20 @@ def ilu_sparse_attn_indexer(
             topk_indices_buffer[:num_decode_tokens].fill_(-1)
             return topk_indices_buffer
 
+        use_owned = (
+            not has_prefill and not decode_metadata.requires_padding
+            and q.dtype == torch.int8 and q.shape[1:] == (32, 128)
+            and num_decode_tokens in (6, 12)
+            and decode_metadata.max_q_len == 6
+            and decode_metadata.cu_seqlens_q.numel() == num_decode_tokens // 6 + 1
+            and owned_logits is not None and previous_extent is not None
+            and owned_logits.shape == (num_decode_tokens, decode_metadata.max_context_len)
+            and owned_logits.dtype == torch.bfloat16
+            and previous_extent.shape == (num_decode_tokens,)
+            and previous_extent.dtype == torch.int32
+            and owned_logits.device == previous_extent.device == q.device
+        )
+
         # Ragged MTP decode batches (for example query lengths [4, 1]) are
         # represented by cu_seqlens_q plus one causal [ks, ke) span per query
         # token. The same variable-query logits kernel used for prefill can
@@ -248,6 +274,8 @@ def ilu_sparse_attn_indexer(
             cu_seqlen_ks=decode_metadata.cu_seqlen_ks,
             cu_seqlen_ke=decode_metadata.cu_seqlen_ke,
             valid_lens=decode_metadata.valid_lens,
+            owned_logits=owned_logits if use_owned else None,
+            previous_extent=previous_extent if use_owned else None,
         )
 
         _two_level_filter(
@@ -289,6 +317,8 @@ def ilu_sparse_attn_indexer_fake(
     candidate_blocks: torch.Tensor | None = None,
     candidate_block_size: int = 0,
     candidate_write: bool = False,
+    owned_logits: torch.Tensor | None = None,
+    previous_extent: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert topk_indices_buffer is not None
     return topk_indices_buffer
@@ -299,7 +329,7 @@ direct_register_custom_op(
     op_func=ilu_sparse_attn_indexer,
     # The candidate source writes its shortlist into ``candidate_blocks``; the
     # layers above it only read, but the schema is shared.
-    mutates_args=["topk_indices_buffer", "candidate_blocks"],
+    mutates_args=["topk_indices_buffer", "candidate_blocks", "owned_logits", "previous_extent"],
     fake_impl=ilu_sparse_attn_indexer_fake,
     dispatch_key=current_platform.dispatch_key,
 )
@@ -325,6 +355,7 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
         candidate_blocks: torch.Tensor | None = None,
         candidate_block_size: int = 0,
         candidate_write: bool = False,
+        owned_decode_state: bool = False,
     ):
         CustomOp.__init__(self)
         self.k_cache = k_cache
@@ -343,6 +374,17 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
         self.candidate_block_size = candidate_block_size
         self.candidate_write = candidate_write
         self.dense_mha_metadata_layer_name = ""
+        # Width is already compressed; owners are outside graph-pool scratch.
+        for tokens in (6, 12):
+            logits = extent = None
+            if owned_decode_state:
+                device = topk_indices_buffer.device
+                stride = (max_model_len + 31) // 32 * 32
+                logits = torch.empty((tokens, stride), dtype=torch.bfloat16,
+                                     device=device)[:, :max_model_len]
+                extent = torch.full((tokens,), -1, dtype=torch.int32, device=device)
+            self.register_buffer(f"_owned_decode_logits_{tokens}", logits, persistent=False)
+            self.register_buffer(f"_owned_decode_extent_{tokens}", extent, persistent=False)
 
     def forward_native(
         self,
@@ -364,6 +406,20 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
         k: torch.Tensor,
         weights: torch.Tensor,
     ):
+        owned_logits = previous_extent = None
+        if (
+            self._owned_decode_logits_6 is not None
+            or self._owned_decode_logits_12 is not None
+        ):
+            metadata = get_forward_context().attn_metadata
+            if isinstance(metadata, dict):
+                md = metadata.get(self.k_cache.prefix)
+                if (isinstance(md, IluDeepseekV32IndexerMetadata)
+                        and md.num_prefills == 0 and md.decode is not None
+                        and not md.decode.requires_padding
+                        and md.num_decode_tokens in (6, 12)):
+                    owned_logits = getattr(self, f"_owned_decode_logits_{md.num_decode_tokens}")
+                    previous_extent = getattr(self, f"_owned_decode_extent_{md.num_decode_tokens}")
         return torch.ops.vllm.ilu_sparse_attn_indexer(
             hidden_states,
             _encode_layer_name(self.k_cache.prefix),
@@ -380,4 +436,6 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
             self.candidate_blocks,
             self.candidate_block_size,
             self.candidate_write,
+            owned_logits,
+            previous_extent,
         )

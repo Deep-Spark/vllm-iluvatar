@@ -457,8 +457,8 @@ void v41_apply_initialized_decode_mask(torch::Tensor& logits,
   const int64_t width = logits.size(1);
   TORCH_CHECK(logits.scalar_type() == at::kBFloat16 && logits.stride(1) == 1,
               "initialized decode logits must be bf16 with contiguous columns");
-  TORCH_CHECK(rows == 0 || rows == 6 || rows == 12,
-              "initialized decode mask requires 6 or 12 query rows");
+  TORCH_CHECK(rows == 0 || rows == 6 || rows == 12 || rows == 18 || rows == 24,
+              "initialized decode mask requires 6, 12, 18 or 24 query rows");
   TORCH_CHECK(candidate_blocks.is_cuda() && candidate_blocks.dim() == 2 &&
                   candidate_blocks.scalar_type() == at::kInt &&
                   candidate_blocks.size(0) >= rows,

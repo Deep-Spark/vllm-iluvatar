@@ -68,8 +68,8 @@ void v41_indexer_decode_spans(
   check_int32_vector(ke, "ke");
   TORCH_CHECK(seq_lens.device() == ks.device() && cu_query.device() == ks.device() &&
                   ke.device() == ks.device(), "decode span tensors must share a device");
-  TORCH_CHECK(num_requests >= 1 && num_requests <= 2 &&
-                  num_padded_tokens >= 1 && num_padded_tokens <= 12 &&
+  TORCH_CHECK(num_requests >= 1 && num_requests <= 4 &&
+                  num_padded_tokens >= 1 && num_padded_tokens <= 24 &&
                   num_real_tokens >= 0 && num_real_tokens <= num_padded_tokens &&
                   (compress_ratio == 1 || compress_ratio == 2),
               "unsupported small decode span dimensions");

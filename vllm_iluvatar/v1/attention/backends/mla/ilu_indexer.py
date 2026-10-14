@@ -690,8 +690,8 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         use_cuda_spans = (
             indexer_kv_dtype() == "int8"
             and compress_ratio in (1, 2)
-            and num_decodes in (1, 2)
-            and num_decode_tokens in (6, 12)
+            and 1 <= num_decodes <= 4
+            and num_decode_tokens in (6, 12, 18, 24)
             and max_q_len in (0, 6)
             and not requires_padding
             and common_attn_metadata.seq_lens.is_cuda

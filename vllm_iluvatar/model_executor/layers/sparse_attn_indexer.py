@@ -246,7 +246,7 @@ def ilu_sparse_attn_indexer(
         use_owned = (
             not has_prefill and not decode_metadata.requires_padding
             and q.dtype == torch.int8 and q.shape[1:] == (32, 128)
-            and num_decode_tokens in (6, 12)
+            and num_decode_tokens in (6, 12, 18, 24)
             and decode_metadata.max_q_len == 6
             and decode_metadata.cu_seqlens_q.numel() == num_decode_tokens // 6 + 1
             and owned_logits is not None and previous_extent is not None
@@ -356,6 +356,7 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
         candidate_block_size: int = 0,
         candidate_write: bool = False,
         owned_decode_state: bool = False,
+        max_num_decode_seqs: int = 2,
     ):
         CustomOp.__init__(self)
         self.k_cache = k_cache
@@ -375,14 +376,18 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
         self.candidate_write = candidate_write
         self.dense_mha_metadata_layer_name = ""
         # Width is already compressed; owners are outside graph-pool scratch.
-        for tokens in (6, 12):
-            logits = extent = None
-            if owned_decode_state:
-                device = topk_indices_buffer.device
-                stride = (max_model_len + 31) // 32 * 32
-                logits = torch.empty((tokens, stride), dtype=torch.bfloat16,
-                                     device=device)[:, :max_model_len]
-                extent = torch.full((tokens,), -1, dtype=torch.int32, device=device)
+        # Reserve only shapes allowed by the scheduler. Larger configurations
+        # keep the public logits path without allocating owned decode state.
+        self._owned_decode_tokens = (
+            tuple(6 * batch for batch in range(1, max_num_decode_seqs + 1))
+            if owned_decode_state and 1 <= max_num_decode_seqs <= 4 else ()
+        )
+        for tokens in self._owned_decode_tokens:
+            device = topk_indices_buffer.device
+            stride = (max_model_len + 31) // 32 * 32
+            logits = torch.empty((tokens, stride), dtype=torch.bfloat16,
+                                 device=device)[:, :max_model_len]
+            extent = torch.full((tokens,), -1, dtype=torch.int32, device=device)
             self.register_buffer(f"_owned_decode_logits_{tokens}", logits, persistent=False)
             self.register_buffer(f"_owned_decode_extent_{tokens}", extent, persistent=False)
 
@@ -407,17 +412,14 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
         weights: torch.Tensor,
     ):
         owned_logits = previous_extent = None
-        if (
-            self._owned_decode_logits_6 is not None
-            or self._owned_decode_logits_12 is not None
-        ):
+        if self._owned_decode_tokens:
             metadata = get_forward_context().attn_metadata
             if isinstance(metadata, dict):
                 md = metadata.get(self.k_cache.prefix)
                 if (isinstance(md, IluDeepseekV32IndexerMetadata)
                         and md.num_prefills == 0 and md.decode is not None
                         and not md.decode.requires_padding
-                        and md.num_decode_tokens in (6, 12)):
+                        and md.num_decode_tokens in self._owned_decode_tokens):
                     owned_logits = getattr(self, f"_owned_decode_logits_{md.num_decode_tokens}")
                     previous_extent = getattr(self, f"_owned_decode_extent_{md.num_decode_tokens}")
         return torch.ops.vllm.ilu_sparse_attn_indexer(

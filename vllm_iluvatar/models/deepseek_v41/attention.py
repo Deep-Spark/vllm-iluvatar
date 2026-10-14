@@ -418,11 +418,12 @@ class IluDeepseekV41Indexer(nn.Module):
                 and topk_indices_buffer.is_cuda
                 and vllm_config.kv_transfer_config is not None
                 and vllm_config.kv_transfer_config.kv_role == "kv_consumer"
-                and 1 <= vllm_config.scheduler_config.max_num_seqs <= 2
+                and 1 <= vllm_config.scheduler_config.max_num_seqs <= 4
                 and vllm_config.speculative_config is not None
                 and vllm_config.speculative_config.method == "dspark"
                 and vllm_config.speculative_config.num_speculative_tokens == 5
             ),
+            max_num_decode_seqs=vllm_config.scheduler_config.max_num_seqs,
         )
 
     def _produce_k(

@@ -57,7 +57,7 @@ def select_candidate_blocks(
     nblocks = -(-width // block_size)
     k = min(topk_blocks, nblocks)
     if (
-        rows in (6, 12)
+        rows in (6, 12, 18, 24)
         and logits.dtype == torch.bfloat16
         and row_ks is None
         and row_repeat == 1
@@ -127,7 +127,7 @@ def apply_initialized_decode_candidate_mask(
     candidate_blocks: torch.Tensor,
 ) -> None:
     """Mask block8 decode logits whose exterior the scorer already initialized."""
-    if (logits.dtype == torch.bfloat16 and logits.shape[0] in (6, 12)
+    if (logits.dtype == torch.bfloat16 and logits.shape[0] in (6, 12, 18, 24)
             and logits.stride(1) == 1):
         if logits.shape[1]:
             torch.ops._C.v41_apply_initialized_decode_mask(

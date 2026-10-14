@@ -140,7 +140,7 @@ def test_ilu_sparse_attn_indexer_forward_cuda_calls_registered_op(
     assert args[-2:] == (None, None)
 
 
-def _owned_test_layer(sparse_attn_indexer, *, enabled):
+def _owned_test_layer(sparse_attn_indexer, *, enabled, max_seqs=2):
     return sparse_attn_indexer.IluSparseAttnIndexer(
         k_cache=SimpleNamespace(prefix="layer.0.indexer", kv_cache=object()),
         quant_block_size=128,
@@ -149,8 +149,9 @@ def _owned_test_layer(sparse_attn_indexer, *, enabled):
         head_dim=128,
         max_model_len=33,
         max_total_seq_len=66,
-        topk_indices_buffer=torch.empty((12, 4), dtype=torch.int32),
+        topk_indices_buffer=torch.empty((max(1, max_seqs) * 6, 4), dtype=torch.int32),
         owned_decode_state=enabled,
+        max_num_decode_seqs=max_seqs,
     )
 
 
@@ -211,14 +212,14 @@ def test_disabled_owner_never_reads_forward_context(monkeypatch, default_vllm_co
     assert len(calls) == 1 and calls[0][-2:] == (None, None)
 
 
-@pytest.mark.parametrize("kind", ["full6", "full12", "prefill", "padded",
+@pytest.mark.parametrize("kind", ["full6", "full12", "full18", "full24", "prefill", "padded",
                                  "unsupported", "none", "missing", "list"])
 def test_owned_buffer_selection_in_forward_context(monkeypatch, default_vllm_config, kind):
     from vllm.forward_context import set_forward_context
 
     sparse = _load_sparse_attn_indexer(monkeypatch)
-    layer = _owned_test_layer(sparse, enabled=True)
-    tokens = 12 if kind == "full12" else 8 if kind == "unsupported" else 6
+    layer = _owned_test_layer(sparse, enabled=True, max_seqs=4)
+    tokens = int(kind[4:]) if kind.startswith("full") else 8 if kind == "unsupported" else 6
     md = _owned_test_metadata(tokens, prefill=kind == "prefill", padded=kind == "padded")
     metadata = {layer.k_cache.prefix: md}
     if kind == "none":
@@ -234,7 +235,7 @@ def test_owned_buffer_selection_in_forward_context(monkeypatch, default_vllm_con
             output = layer.forward_cuda(torch.empty(tokens, 8), torch.empty(tokens, 32, 128),
                                         torch.empty(tokens, 128), torch.empty(tokens, 32))
     assert output is layer.topk_indices_buffer and len(calls) == 1
-    if kind in ("full6", "full12"):
+    if kind.startswith("full"):
         logits, extent = calls[0][-2:]
         assert logits is getattr(layer, f"_owned_decode_logits_{tokens}")
         assert extent is getattr(layer, f"_owned_decode_extent_{tokens}")
@@ -246,6 +247,46 @@ def test_owned_buffer_selection_in_forward_context(monkeypatch, default_vllm_con
         assert not any("owned_decode" in name for name in layer.state_dict())
     else:
         assert calls[0][-2:] == (None, None)
+
+
+@pytest.mark.parametrize("max_seqs", [0, 1, 2, 3, 4, 5, 8])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_owned_allocation_matches_configured_sequence_limit(
+    monkeypatch, default_vllm_config, max_seqs, enabled
+):
+    sparse = _load_sparse_attn_indexer(monkeypatch)
+    layer = _owned_test_layer(sparse, enabled=enabled, max_seqs=max_seqs)
+    expected = tuple(range(6, max_seqs * 6 + 1, 6)) if enabled and 1 <= max_seqs <= 4 else ()
+    assert layer._owned_decode_tokens == expected
+    buffers = dict(layer.named_buffers())
+    assert set(buffers) == {f"_owned_decode_{kind}_{tokens}" for kind in ("logits", "extent")
+                            for tokens in expected}
+    assert sum(t.numel() * t.element_size() for t in buffers.values()) == (
+        sum(expected) * (33 * 2 + 4))
+    ranges = sorted((t.untyped_storage().data_ptr(),
+                     t.untyped_storage().data_ptr() + t.untyped_storage().nbytes())
+                    for t in buffers.values())
+    assert all(a[1] <= b[0] for a, b in zip(ranges, ranges[1:]))
+    assert not layer.state_dict()
+
+
+@pytest.mark.parametrize("max_seqs", [1, 2, 3, 5])
+def test_unallocated_decode_shape_delegates_original_path(
+    monkeypatch, default_vllm_config, max_seqs
+):
+    from vllm.forward_context import set_forward_context
+
+    sparse = _load_sparse_attn_indexer(monkeypatch)
+    layer = _owned_test_layer(sparse, enabled=True, max_seqs=max_seqs)
+    tokens = 6 * (max_seqs + 1) if max_seqs < 4 else 6
+    metadata = {layer.k_cache.prefix: _owned_test_metadata(tokens)}
+    calls = []
+    with patch.object(torch.ops.vllm, "ilu_sparse_attn_indexer",
+                      lambda *args: calls.append(args) or args[10], create=True):
+        with set_forward_context(metadata, default_vllm_config):
+            layer.forward_cuda(torch.empty(tokens, 8), torch.empty(tokens, 32, 128),
+                               torch.empty(tokens, 128), torch.empty(tokens, 32))
+    assert len(calls) == 1 and calls[0][-2:] == (None, None)
 
 
 def test_active_owner_requires_forward_context(monkeypatch, default_vllm_config):

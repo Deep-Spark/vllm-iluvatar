@@ -20,6 +20,8 @@ Remove   : when the Iluvatar sampler no longer needs the PyTorch sort fallback,
 
 from __future__ import annotations
 
+import importlib
+
 from vllm.logger import init_logger
 
 from vllm_iluvatar.ilu_patch import general_patch as p
@@ -37,9 +39,11 @@ def register() -> None:
 
 
 def _apply() -> None:
-    import vllm.v1.worker.gpu.spec_decode.rejection_sampler as rejection_sampler
     from vllm import envs
 
+    rejection_sampler = importlib.import_module(
+        "vllm.v1.worker.gpu.spec_decode.rejection_sampler"
+    )
     max_chunk_bytes = envs.VLLM_ILU_REJECTION_SAMPLER_MAX_CHUNK_BYTES
     rejection_sampler.MAX_CHUNK_BYTES = max_chunk_bytes
     logger.debug(

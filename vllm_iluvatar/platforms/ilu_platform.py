@@ -278,6 +278,20 @@ def _make_iluvatar_platform():
                     flush=True,
                 )
 
+            # JIT warmup derives its cache key through ``triton.knobs``, which
+            # the CoreX Triton build does not expose. Warmup is a startup-time
+            # optimisation only, so drop it rather than half-mirror the helper.
+            kernel_config = getattr(vllm_config, "kernel_config", None)
+            if kernel_config is not None and kernel_config.enable_jit_warmup:
+                try:
+                    from triton import knobs as _triton_knobs  # noqa: F401
+                except ImportError:
+                    kernel_config.enable_jit_warmup = False
+                    logger.info(
+                        "ILU: disabled enable_jit_warmup; this Triton build "
+                        "has no `knobs` API."
+                    )
+
             # Community ModelConfig only auto-selects the deepseek_v4 tokenizer
             # for the upstream "DeepseekV4ForCausalLM" arch. The Iluvatar W4A8
             # arch is OOT-registered under "IluDeepseekV4ForCausalLM", so set its
@@ -286,6 +300,12 @@ def _make_iluvatar_platform():
             model_config = getattr(vllm_config, "model_config", None)
             if model_config is None:
                 return
+
+            from vllm_iluvatar.models.deepseek_v41.engram_storage import (
+                validate_engram_config,
+            )
+
+            validate_engram_config(vllm_config)
 
             try:
                 archs = model_config.architectures or []

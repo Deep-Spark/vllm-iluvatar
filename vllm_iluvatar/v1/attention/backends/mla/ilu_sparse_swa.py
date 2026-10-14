@@ -141,20 +141,37 @@ class IluDeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         dtype: torch.dtype,
         prefix: str,
         cache_config: CacheConfig,
+        backend_cls: type[AttentionBackend] | None = None,
+        block_size: int | None = 64,
+        packed_bytes_per_token: int = 584,
+        packed_page_alignment: int = 576,
+        bounded_replay: bool = False,
     ) -> None:
         super().__init__()
+        self.backend_cls = backend_cls or IluDeepseekSparseSWABackend
+        self.bounded_replay = bounded_replay
         self.kv_cache = torch.tensor([])
         self.head_dim = head_dim
         self.window_size = window_size
         self.prefix = prefix
         self.cache_config = cache_config
         self.dtype = dtype
+        self.packed_bytes_per_token = packed_bytes_per_token
+        self.packed_page_alignment = packed_page_alignment
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
-        self.block_size = 64
+        self._block_size = block_size
+
+    @property
+    def block_size(self) -> int:
+        return (
+            self.cache_config.block_size
+            if self._block_size is None
+            else self._block_size
+        )
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         # vLLM v0.31.0 (db9527a468) KV-cache layout: allocate_kv_cache binds a 4D
@@ -168,29 +185,34 @@ class IluDeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
 
         if is_fp8:
             return SlidingWindowMLASpec(
+                bounded_replay=self.bounded_replay,
                 block_size=self.block_size,
                 num_kv_heads=1,
+                max_tp_shards=1,
                 head_size=self.head_dim,
                 head_size_v=0,
                 dtype=torch.uint8,
                 sliding_window=self.window_size,
                 cache_dtype_str="fp8_ds_mla",
                 model_version="deepseek_v4",
+                # 448B NoPE + 128B RoPE + 8B fp8 scale per token; ``head_size``
+                # stays semantic (512). v0.30.0 (ced6857afa) takes C from
+                # ``state_content_bytes`` instead of deriving it from
+                # ``cache_dtype_str``, so without this the per-layer view is
+                # 512 wide and ``ds4_sparse_mla_fp8_decode`` rejects it with
+                # "k_cache.size(2) must be 584, got 512".
+                state_content_bytes=self.packed_bytes_per_token,
                 # Ilu fp8 attention kernels require 64B-aligned block bases.
-                # NOTE: the ilu SWA page is the contiguous 584B/token layout with
-                # no per-page padding (37376B == 64*584, already 64-aligned), so
-                # the KV-cache reshape falls into the plain ``.view()`` branch.
-                # ``kv_quant_mode`` MUST be set so ``initialize_kv_cache_tensors``
-                # passes ``cache_dtype_str="fp8_ds_mla"`` to ``get_kv_cache_shape``
-                # (which then returns the 584-wide shape). Leaving it at the NONE
-                # default makes the runner fall back to ``head_size`` (512) and the
-                # view fails with a 584-vs-512 page-size mismatch.
+                # The ilu SWA page is the contiguous 584B/token layout with no
+                # per-page padding (37376B == 64*584, already 64-aligned).
                 alignment=64,
                 kv_quant_mode=get_kv_quant_mode(cache_dtype),
             )
         return SlidingWindowMLASpec(
+            bounded_replay=self.bounded_replay,
             block_size=self.block_size,
             num_kv_heads=1,
+            max_tp_shards=1,
             head_size=self.head_dim,
             head_size_v=0,
             dtype=self.dtype,
@@ -202,7 +224,7 @@ class IluDeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
     def forward(self): ...
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        return IluDeepseekSparseSWABackend
+        return self.backend_cls
 
 
 class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
@@ -213,6 +235,16 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
     kernel path, so this override keeps the community data layout but delegates
     the affected metadata computation to ixformer.
     """
+
+    # Model subclasses select their formal API without changing the shared
+    # metadata layout or the operators used by other DeepSeek models.
+    @staticmethod
+    def _compute_swa_decode_indices_and_lens(*args, **kwargs):
+        return ixfops.ds4_compute_swa_decode_indices_and_lens(*args, **kwargs)
+
+    @staticmethod
+    def _compute_swa_prefill_gather_lens(*args, **kwargs):
+        return ixfops.ds4_compute_swa_prefill_gather_lens(*args, **kwargs)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -225,6 +257,7 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
             if self.is_dspark
             else 0
         )
+        self._replay_start_buffer = torch.zeros_like(self.no_replay_start)
         self._decode_swa_indices_noncausal = (
             torch.empty(
                 (
@@ -244,6 +277,7 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
+        replay_start: torch.Tensor | None = None,
     ) -> DeepseekSparseSWAMetadata:
         seq_lens = common_attn_metadata.seq_lens
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
@@ -266,6 +300,12 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
 
         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
         is_valid_token.copy_(slot_mapping >= 0)
+        if replay_start is None:
+            replay_start = self.no_replay_start
+        elif replay_start.shape[0] < seq_lens.shape[0]:
+            self._replay_start_buffer.zero_()
+            self._replay_start_buffer[: replay_start.shape[0]].copy_(replay_start)
+            replay_start = self._replay_start_buffer
 
         decode_swa_indices = self.decode_swa_indices
         if num_decode_tokens > 0:
@@ -290,7 +330,7 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
                 )
                 decode_swa_indices = noncausal_indices
             else:
-                ixfops.ds4_compute_swa_decode_indices_and_lens(
+                self._compute_swa_decode_indices_and_lens(
                     swa_indices=self.decode_swa_indices,
                     swa_lens=self.decode_swa_lens,
                     window_size=self.window_size,
@@ -301,6 +341,7 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
                     block_table=block_table,
                     block_size=self.block_size,
                     num_decode_tokens=num_decode_tokens,
+                    replay_start=replay_start,
                 )
 
         deepseek_v4_fields = self._build_ilu_deepseek_v4_metadata(
@@ -311,6 +352,7 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
             query_start_loc,
             query_start_loc_cpu,
             block_table,
+            replay_start,
         )
 
         tile_sched = self.build_tile_scheduler(num_decode_tokens)
@@ -335,6 +377,7 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
                 if num_prefill_tokens > 0
                 else None
             ),
+            replay_start=replay_start,
             block_size=self.block_size,
             num_decodes=num_decodes,
             num_prefills=num_prefills,
@@ -397,6 +440,7 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
         query_start_loc: torch.Tensor,
         query_start_loc_cpu: torch.Tensor,
         block_table: torch.Tensor,
+        replay_start: torch.Tensor,
     ) -> dict[str, torch.Tensor | None | int]:
         del block_table
         result: dict[str, torch.Tensor | int | None] = {}
@@ -408,13 +452,14 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
         pfx_gather_lens = torch.empty(
             num_prefills, dtype=torch.int32, device=seq_lens.device
         )
-        ixfops.ds4_compute_swa_prefill_gather_lens(
+        self._compute_swa_prefill_gather_lens(
             prefill_gather_lens=pfx_gather_lens,
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
             num_prefills=num_prefills,
             num_decodes=num_decodes,
             window_size=self.window_size,
+            replay_start=replay_start,
         )
 
         result["prefill_seq_lens"] = seq_lens[num_decodes:]
@@ -456,20 +501,34 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
             query_start_loc[pfx_sl : pfx_el + 1] - query_start_loc[pfx_sl]
         ).to(torch.int32)
 
-        pfx_seq_lens = seq_lens[pfx_sl:pfx_el].to(torch.int32)
+        assert metadata.prefill_gather_lens is not None
+        pfx_gather_lens = metadata.prefill_gather_lens.to(torch.int32)
         cu_seqlens_k = torch.zeros(
             num_prefills + 1, dtype=torch.int32, device=seq_lens.device
         )
-        cu_seqlens_k[1:] = pfx_seq_lens.cumsum(0)
+        cu_seqlens_k[1:] = pfx_gather_lens.cumsum(0)
         metadata.prefill_cu_seqlens_k = cu_seqlens_k
 
         qsl_cpu = query_start_loc_cpu[pfx_sl : pfx_el + 1]
         q_lens_cpu = qsl_cpu[1:] - qsl_cpu[:-1]
         metadata.prefill_max_seqlen_q = int(q_lens_cpu.max().item())
 
-        prefill_seq_lens_cpu = seq_lens[pfx_sl:pfx_el].cpu()
-        metadata.prefill_max_seqlen_k = int(prefill_seq_lens_cpu.max().item())
-        metadata.prefill_swa_block_table = block_table[num_decodes:]
+        metadata.prefill_max_seqlen_k = int(pfx_gather_lens.max().item())
+        replay_blocks = (
+            metadata.replay_start[pfx_sl:pfx_el].to(torch.int64) // self.block_size
+        )
+        max_blocks = (
+            metadata.prefill_max_seqlen_k + self.block_size - 1
+        ) // self.block_size
+        block_cols = (
+            replay_blocks[:, None]
+            + torch.arange(max_blocks, device=block_table.device, dtype=torch.int64)[
+                None, :
+            ]
+        )
+        metadata.prefill_swa_block_table = torch.gather(
+            block_table[pfx_sl:pfx_el], 1, block_cols
+        )
 
     def _populate_prefill_swa_as_decode(
         self, metadata: DeepseekSparseSWAMetadata
@@ -488,17 +547,24 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
         # is recomputed with identical results; the prefill portion
         # (num_decode_tokens:num_swa_tokens) is newly populated.
         self.decode_swa_lens[num_swa_tokens:] = 0
-        ixfops.ds4_compute_swa_decode_indices_and_lens(
+        # The per-step request ids live on the metadata. The builder's own
+        # buffer stays at its initial zeros once CommonAttentionMetadata
+        # starts returning a cached mapping, and feeding that buffer makes
+        # every prefill token read request 0.
+        assert metadata.token_to_req_indices is not None
+        assert metadata.is_valid_token is not None
+        self._compute_swa_decode_indices_and_lens(
             swa_indices=self.decode_swa_indices,
             swa_lens=self.decode_swa_lens,
             window_size=self.window_size,
             query_start_loc=metadata.query_start_loc,
             seq_lens=metadata.seq_lens,
-            token_to_req_indices=self.token_to_req_indices,
-            is_valid_token=self.is_valid_token,
+            token_to_req_indices=metadata.token_to_req_indices,
+            is_valid_token=metadata.is_valid_token,
             block_table=metadata.block_table,
             block_size=self.block_size,
             num_decode_tokens=num_swa_tokens,
+            replay_start=metadata.replay_start,
         )
 
         metadata.prefill_swa_indices = self.decode_swa_indices[
@@ -510,12 +576,13 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
 
 
 class IluDeepseekSparseSWABackend(DeepseekSparseSWABackend):
-    """SWA backend supporting bf16 and fp8_ds_mla cache."""
+    """SWA backend supporting BF16, packed FP8 and per-tensor E4M3 cache."""
 
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "bfloat16",
         "fp8_ds_mla",
+        "fp8_e4m3",
         "fp8",
     ]
 

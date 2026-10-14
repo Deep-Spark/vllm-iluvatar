@@ -27,8 +27,11 @@ from functools import wraps
 from typing import Any
 
 import torch
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.aux_output_connector.worker import get_aux_output_connector
+from vllm.v1.hisparse.binding import init_hisparse_kv_cache
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -46,21 +49,27 @@ from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.attn_utils import (
+    FastPrefillHelper,
     get_shared_kv_cache_layers,
     init_attn_backend,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
+from vllm.v1.worker.gpu.cudagraph_utils import (
+    ModelCudaGraphManager,
+    has_compiled_submodule,
+)
 from vllm.v1.worker.gpu.kv_connector import NO_OP_KV_CONNECTOR, get_kv_connector
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     maybe_create_adaptive_verification_manager,
+    resolve_adaptive_cudagraph_mode,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import get_max_chunk_logits
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.ubatch_utils import maybe_build_ubatch_runner
 from vllm.v1.worker.utils import (
     allocate_kv_cache,
-    bind_kv_cache,
+    bind_kv_cache_to_layers,
     copy_kv_cache_blocks_inplace,
 )
 
@@ -300,7 +309,6 @@ def bind_kv_cache_scale(
 
 
 def init_kv_cache(
-    runner_kv_caches: list[torch.Tensor | list[torch.Tensor]],
     runner_kv_scale_caches: list[torch.Tensor | list[torch.Tensor]],
     forward_context: dict[str, Any],
     kv_cache_config: KVCacheConfig,
@@ -308,28 +316,28 @@ def init_kv_cache(
     kernel_block_sizes: list[int],
     vllm_config: VllmConfig,
     kv_cache_allocation_context: AbstractContextManager | None = None,
+    *,
+    block_tables: BlockTables | None = None,
 ) -> dict[str, Any]:
-    """ILU counterpart of ``vllm.v1.worker.gpu.attn_utils.init_kv_cache``.
-
-    Mirrors the community free function (allocate + cross-layer share + bind
-    into ``runner_kv_caches``) and additionally carves per-layer K-scale views
-    out of the shared int8 backing buffer (already sized to include scale
-    space by the ILU ``get_kv_cache_config_from_groups`` override) and binds
-    them into ``runner_kv_scale_caches`` and onto the attention layers via
-    ``bind_kv_cache_scale``.
-
-    Called directly by ``IluvatarGPUModelRunner.initialize_kv_cache`` (the V2
-    override), which passes ``self.kv_caches`` and ``self.kv_scale_caches``
-    the same way community ``initialize_kv_cache`` passes ``self.kv_caches``.
-    """
     allocation_context = kv_cache_allocation_context or nullcontext()
     with allocation_context:
-        kv_caches = allocate_kv_cache(
-            kv_cache_config,
-            device,
-            vllm_config.cache_config.get_resolved_kv_cache_layout(),
-            kernel_block_sizes,
-        )
+        if vllm_config.attention_config.hisparse_config is not None:
+            assert block_tables is not None
+            kv_caches = init_hisparse_kv_cache(
+                kv_cache_config,
+                device,
+                kernel_block_sizes,
+                vllm_config,
+                forward_context,
+                block_tables,
+            )
+        else:
+            kv_caches = allocate_kv_cache(
+                kv_cache_config,
+                device,
+                vllm_config.cache_config.get_resolved_kv_cache_layout(),
+                kernel_block_sizes,
+            )
         kv_scale_caches = allocate_kv_cache_scale(
             kv_caches,
             kv_cache_config,
@@ -339,7 +347,6 @@ def init_kv_cache(
             vllm_config=vllm_config,
         )
 
-    # Cross-layer KV cache sharing (mirror community bind_kv_cache).
     for layer_name, target in get_shared_kv_cache_layers(vllm_config).items():
         kv_caches[layer_name] = kv_caches[target]
         if target in kv_scale_caches:
@@ -351,8 +358,15 @@ def init_kv_cache(
         in ("longcat_flash", "longcat_flash_ngram")
         else 1
     )
-
-    bind_kv_cache(kv_caches, forward_context, runner_kv_caches, num_attn_module)
+    bindable_caches = {
+        name: cache for name, cache in kv_caches.items() if name in forward_context
+    }
+    bind_kv_cache_to_layers(
+        bindable_caches,
+        forward_context,
+        num_attn_module,
+        kv_cache_groups=kv_cache_config.kv_cache_groups,
+    )
     bind_kv_cache_scale(
         kv_scale_caches, forward_context, runner_kv_scale_caches, num_attn_module
     )
@@ -369,13 +383,6 @@ class IluvatarGPUModelRunner(GPUModelRunner):
         is_profiling: bool = False,
         kv_cache_allocation_context: AbstractContextManager | None = None,
     ) -> None:
-        # [ILU override] Full rewrite of community
-        # GPUModelRunner.initialize_kv_cache (model_runner.py 533-682) to
-        # additionally allocate and bind the KINT8 K-scale cache. The ONLY delta
-        # vs upstream is the init_kv_cache call: the ILU init_kv_cache takes a
-        # parallel runner_kv_scale_caches list (like runner_kv_caches) and fills
-        # it alongside the KV caches. Keep this body in sync with upstream;
-        # re-derive when the upstream 533-682 region changes.
         # GPUWorker finalizes the PD interleave before KV cache initialization.
         self.cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
         kv_cache_config = deepcopy(kv_cache_config)
@@ -394,13 +401,15 @@ class IluvatarGPUModelRunner(GPUModelRunner):
         block_sizes = []
         max_num_blocks_per_group = []
         slot_mapping_enabled = []
+        dcp_sharded = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
             layer_spec = (
                 spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
             )
-            slot_mapping_enabled.append(not isinstance(layer_spec, CircularBufferSpec))
+            slot_mapping_enabled.append(layer_spec.uses_slot_mapping)
+            dcp_sharded.append(spec.dcp_sharded)
             # Let each cache type account for CP. Attention KV is DCP-sharded,
             # while Mamba/GDN recurrent state is replicated across DCP ranks.
             max_num_blocks = spec.max_num_blocks_per_req(
@@ -408,12 +417,11 @@ class IluvatarGPUModelRunner(GPUModelRunner):
             )
             # Preserve each cache type's alignment requirements after applying
             # its topology-aware block-table width.
-            if isinstance(layer_spec, (MambaSpec, CircularBufferSpec)):
-                max_num_blocks = get_block_table_width(
-                    max_num_blocks, spec.block_size, token_alignment=None
-                )
-            else:
-                max_num_blocks = get_block_table_width(max_num_blocks, spec.block_size)
+            max_num_blocks = get_block_table_width(
+                max_num_blocks,
+                spec.block_size,
+                token_alignment=spec.block_table_token_alignment,
+            )
             max_num_blocks_per_group.append(max_num_blocks)
 
         target_attn_layer_names = None
@@ -424,11 +432,21 @@ class IluvatarGPUModelRunner(GPUModelRunner):
                 for group in self.kv_cache_config.kv_cache_groups
                 for layer_name in group.layer_names
             } - self.speculator.draft_attn_layer_names
-        self.attn_groups, attn_cg_support, self.kernel_block_sizes = init_attn_backend(
-            self.kv_cache_config,
-            self.vllm_config,
-            self.device,
-        )
+        draft_attn_layer_names = None
+        if isinstance(self.speculator, DraftModelSpeculator):
+            draft_attn_layer_names = self.speculator.draft_attn_layer_names
+        # Metadata builders select attention kernels that need JIT warmup.
+        with self.jit_warmup_registry.activate():
+            (
+                self.attn_groups,
+                attn_cg_support,
+                self.kernel_block_sizes,
+            ) = init_attn_backend(
+                self.kv_cache_config,
+                self.vllm_config,
+                self.device,
+                draft_layer_names=draft_attn_layer_names,
+            )
         additional_attn_cg_support = self.model_state.get_additional_cg_support()
         attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
         # The speculator clears the flag at load time when the checkpoint has
@@ -455,6 +473,7 @@ class IluvatarGPUModelRunner(GPUModelRunner):
             device=self.device,
             kernel_block_sizes=self.kernel_block_sizes,
             slot_mapping_enabled=slot_mapping_enabled,
+            dcp_sharded=dcp_sharded,
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
@@ -466,11 +485,29 @@ class IluvatarGPUModelRunner(GPUModelRunner):
             self.block_tables,
             cls=self.pcp_manager_cls,
         )
+        self.ubatch_runner = maybe_build_ubatch_runner(
+            self.vllm_config,
+            self.device,
+            self.model_state,
+            self.attn_groups,
+            self.kv_cache_config,
+            self.max_num_reqs,
+        )
+        if self.speculator is not None:
+            self.speculator.pcp_manager = self.pcp_manager
         initialize_mamba_ssu_backend(
-            self.vllm_config.mamba_config, self.kv_cache_config
+            self.vllm_config.mamba_config,
+            self.kv_cache_config,
+            use_replayssm=self.cache_config.use_replayssm,
+        )
+        piecewise_capture_available = bool(
+            envs.VLLM_USE_BREAKABLE_CUDAGRAPH or has_compiled_submodule(self.model)
         )
         if self.adaptive_verification is not None:
-            self.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+            self.compilation_config.cudagraph_mode = resolve_adaptive_cudagraph_mode(
+                self.compilation_config.cudagraph_mode,
+                piecewise_capture_available=piecewise_capture_available,
+            )
         cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
             attn_cg_support.min_cg_support,
             attn_cg_support.min_cg_attn_backend,
@@ -480,6 +517,7 @@ class IluvatarGPUModelRunner(GPUModelRunner):
             kv_cache_config=self.kv_cache_config,
             max_num_reqs=self.max_num_reqs,
             is_profiling=is_profiling,
+            piecewise_capture_available=piecewise_capture_available,
         )
         self.cudagraph_manager = ModelCudaGraphManager(
             self.vllm_config,
@@ -488,8 +526,13 @@ class IluvatarGPUModelRunner(GPUModelRunner):
             decode_query_len=self.decode_query_len,
             lora_capture_cases=self.lora_capture_cases,
             varlen_decode=self.adaptive_verification is not None,
+            ubatch_runner=self.ubatch_runner,
         )
-        check_attention_cp_compatibility(self.vllm_config)
+        if self.cache_config.kv_sharing_fast_prefill and self.pcp_manager is None:
+            self.fast_prefill = FastPrefillHelper(
+                self.cudagraph_manager, self.max_num_tokens
+            )
+        check_attention_cp_compatibility(self.vllm_config, target_attn_layer_names)
         if isinstance(self.speculator, DraftModelSpeculator):
             # HACK(woosuk)
             self.speculator.set_attn(
@@ -504,52 +547,44 @@ class IluvatarGPUModelRunner(GPUModelRunner):
             # to its own attention support.
             self.speculator.init_cudagraph_manager(cudagraph_mode)
 
-        self.kv_caches: list[torch.Tensor] = []
-        # NOTE >>> iluvatar specific logic
-        # Parallel runner-level scale list, filled by the ILU init_kv_cache
-        # the same way self.kv_caches is filled by the community one.
+        # Capture warmup providers that depend on allocated KV-cache strides.
         self.kv_scale_caches: list[torch.Tensor | list[torch.Tensor]] = []
-        kv_caches_dict = init_kv_cache(
-            self.kv_caches,
-            self.kv_scale_caches,
-            self.compilation_config.static_forward_context,
-            self.kv_cache_config,
-            self.device,
-            self.kernel_block_sizes,
-            self.vllm_config,
-            kv_cache_allocation_context=kv_cache_allocation_context,
-        )
-        # <<< iluvatar specific logic
+        with self.jit_warmup_registry.activate():
+            kv_caches_dict = init_kv_cache(
+                self.kv_scale_caches,
+                self.compilation_config.static_forward_context,
+                self.kv_cache_config,
+                self.device,
+                self.kernel_block_sizes,
+                self.vllm_config,
+                kv_cache_allocation_context=kv_cache_allocation_context,
+                block_tables=self.block_tables,
+            )
+        self.kv_caches = [
+            cache for cache in kv_caches_dict.values() if cache.device == self.device
+        ]
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
             self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
-        # [ILU guard] ILU KV-cache int8 quantization (flash KINT8/KVINT8 and
-        # MLA-INT8) is not yet wired through the kv_connector (pipeline-parallel
-        # KV transfer) path. Flash int8 keeps V and the per-token/static scales in
-        # SEPARATE per-layer buffers (self.kv_scale_caches, allocated by
-        # allocate_kv_cache_scale) outside the shared V2 backing buffer the
-        # connector moves, so a real connector would transfer K only and leave
-        # V/scale stale on the receiver. MLA-INT8 stores its per-token scales
-        # (kc_scale + kpe_scale) in the V2 buffer tail, but the receiver-side
-        # carve/offset for that tail is not verified, so it is also blocked until
-        # wired. Refuse rather than silently corrupt the migrated cache.
-        import vllm.envs as _envs
+            # AuxOutput connector requires resolved kv_cache_config.
+            if self.vllm_config.aux_output_config.enabled:
+                self.aux_output_connector = get_aux_output_connector(
+                    self.model, self.vllm_config, kv_cache_config
+                )
 
-        _ilu_int8_quant = (
-            _envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE in ("KINT8", "KVINT8")
-            or _envs.VLLM_ILU_MLA_ATTN_QUANT_TYPE == "INT8"
+        ilu_int8_quant = (
+            envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE in ("KINT8", "KVINT8")
+            or envs.VLLM_ILU_MLA_ATTN_QUANT_TYPE == "INT8"
         )
-        if _ilu_int8_quant and self.kv_connector is not NO_OP_KV_CONNECTOR:
+        if ilu_int8_quant and self.kv_connector is not NO_OP_KV_CONNECTOR:
             raise NotImplementedError(
-                "ILU int8 KV-cache quantization (flash KINT8/KVINT8 or "
-                "MLA-INT8) is not yet supported with a kv_connector "
-                "(pipeline-parallel KV transfer): the per-token/static "
-                "scales are not moved/carved by the connector. Disable the "
-                "connector or unset VLLM_ILU_FLASH_ATTN_QUANT_TYPE / "
-                "VLLM_ILU_MLA_ATTN_QUANT_TYPE."
+                "ILU int8 KV-cache quantization is not supported with a "
+                "kv_connector because scale buffers are not transferred"
             )
+
+
 
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
         # [ILU override] delegate to community update_requests (which does the

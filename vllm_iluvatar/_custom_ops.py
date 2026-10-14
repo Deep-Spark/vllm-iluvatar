@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import math
 
-import ixformer.inference.functions as ixf_ops  # type: ignore[import]
+import ixformer.functions as ixf_ops  # type: ignore[import]
 import torch
 import torch.nn.functional as F
 from ixformer.core import config

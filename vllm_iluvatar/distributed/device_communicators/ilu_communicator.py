@@ -24,6 +24,15 @@ from vllm.distributed.device_communicators.cuda_communicator import (
 from vllm.distributed.utils import StatelessProcessGroup
 
 
+def _as_gather_bytes(t: torch.Tensor) -> tuple[torch.Tensor, torch.dtype | None]:
+    """Reinterpret an fp8 payload as raw bytes for a movement-only collective.
+    """
+    dtype = t.dtype
+    if dtype.is_floating_point and dtype.itemsize == 1:
+        return t.contiguous().view(torch.uint8), dtype
+    return t, None
+
+
 class IluCommunicator(CudaCommunicator):
     def __init__(
         self,
@@ -107,6 +116,7 @@ class IluCommunicator(CudaCommunicator):
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         if dim < 0:
             dim += input_.dim()
+        input_, restore_dtype = _as_gather_bytes(input_)
         input_size = input_.size()
         output_size = (input_size[0] * self.world_size,) + input_size[1:]
         output_tensor = torch.empty(
@@ -130,6 +140,8 @@ class IluCommunicator(CudaCommunicator):
             + (self.world_size * input_size[dim],)
             + input_size[dim + 1 :]
         )
+        if restore_dtype is not None:
+            output_tensor = output_tensor.view(restore_dtype)
         return output_tensor
 
     def gather(
@@ -187,7 +199,7 @@ class IluCommunicator(CudaCommunicator):
         if sizes is None:
 
             def _all_gather_dev(inp: torch.Tensor) -> torch.Tensor:
-                inp_c = inp.contiguous()
+                inp_c, restore_dtype = _as_gather_bytes(inp.contiguous())
                 input_size = inp_c.size()
                 output_size = (input_size[0] * world_size,) + tuple(input_size[1:])
                 output_tensor = torch.empty(
@@ -201,6 +213,8 @@ class IluCommunicator(CudaCommunicator):
                     torch.distributed.all_gather_into_tensor(
                         output_tensor, inp_c, group=comm.device_group
                     )
+                if restore_dtype is not None:
+                    output_tensor = output_tensor.view(restore_dtype)
                 return output_tensor
 
             if isinstance(input_, torch.Tensor):
@@ -214,7 +228,7 @@ class IluCommunicator(CudaCommunicator):
         max_size = max(sizes)
 
         def _all_gatherv_dev(inp: torch.Tensor) -> torch.Tensor:
-            inp_c = inp.contiguous()
+            inp_c, restore_dtype = _as_gather_bytes(inp.contiguous())
             s_self = sizes[comm.rank_in_group]
             assert inp_c.shape[0] == s_self, f"{inp_c.shape[0]} != {s_self}"
             rest = tuple(inp_c.shape[1:])
@@ -238,7 +252,10 @@ class IluCommunicator(CudaCommunicator):
                 )
             gathered = gathered.view((world_size, max_size) + rest)
             parts = [gathered[r, : sizes[r]] for r in range(world_size)]
-            return torch.cat(parts, dim=0)
+            result = torch.cat(parts, dim=0)
+            if restore_dtype is not None:
+                result = result.view(restore_dtype)
+            return result
 
         if isinstance(input_, torch.Tensor):
             return _all_gatherv_dev(input_)

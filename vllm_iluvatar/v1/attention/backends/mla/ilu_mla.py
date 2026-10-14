@@ -118,6 +118,7 @@ class IluMLACommonMetadataBuilder(MLACommonMetadataBuilder):
         dcp_tot_seq_lens_device: torch.Tensor | None,
     ) -> IluMLACommonDecodeMetadata:
         del max_seq_len
+        del max_query_len
         del query_start_loc_device
         del max_query_len
 

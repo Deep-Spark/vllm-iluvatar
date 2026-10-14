@@ -78,8 +78,17 @@ class IluDeepseekV4Fp8FlashMLASparseMetadataBuilder(IluFlashMLASparseMetadataBui
         self,
         cm: CommonAttentionMetadata,
         req_id_per_token: torch.Tensor,
+        num_decodes: int,
+        num_decode_tokens: int,
+        num_prefill_tokens: int,
     ) -> dict[str, torch.Tensor | None]:
-        result = super()._build_c128a_metadata(cm, req_id_per_token)
+        result = super()._build_c128a_metadata(
+            cm,
+            req_id_per_token,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            num_prefill_tokens=num_prefill_tokens,
+        )
         if not result:
             return result
 
@@ -87,8 +96,6 @@ class IluDeepseekV4Fp8FlashMLASparseMetadataBuilder(IluFlashMLASparseMetadataBui
         decode_lens = result.get("c128a_decode_topk_lens")
         prefill_local = result.get("c128a_prefill_topk_indices")
 
-        num_decode_tokens = decode_idx.shape[0] if decode_idx is not None else 0
-        num_prefill_tokens = prefill_local.shape[0] if prefill_local is not None else 0
         num_total = num_decode_tokens + num_prefill_tokens
         if num_total == 0:
             return result

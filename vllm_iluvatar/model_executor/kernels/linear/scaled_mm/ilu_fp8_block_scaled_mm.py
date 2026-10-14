@@ -66,6 +66,42 @@ from vllm_iluvatar.ilu_util.arch import is_ivcore30
 _is_ivcore30_fn = is_ivcore30
 
 
+# One-forward pre-quantized activation handoff. The DeepSeek-V4.1 MHC pre-norm
+# kernel (``dsv41_mhc_pre_with_sqrsum_fp8``) can fold the per-token fp8 quant of
+# the normed hidden state it just wrote into its own epilogue, bit-identical to
+# ``fp8_per_token_dynamic_scaled`` run here. When the model registers that
+# ``(a_fp8, a_scale)`` pair for a hidden-state buffer, ``apply_block_scaled_mm``
+# reuses it instead of re-running the per-token quant, so the activation quant
+# that otherwise precedes ``fused_wqa_wkv`` costs one fewer launch and rides the
+# norm kernel's bandwidth. Keyed by storage ``data_ptr`` (which survives the
+# ``apply_weights`` ``x.view(-1, K)``); validated by shape + dtype and read
+# without popping so one hidden state can feed several fp8 GEMMs.
+_PREQUANT: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def register_activation_prequant(
+    a: torch.Tensor, a_fp8: torch.Tensor, a_scale: torch.Tensor
+) -> None:
+    """Hand ``apply_block_scaled_mm`` a ready per-token quant for ``a``."""
+    _PREQUANT[a.data_ptr()] = (a_fp8, a_scale)
+
+
+def clear_activation_prequant() -> None:
+    """Drop all registered pre-quants (call once the consumers have run)."""
+    _PREQUANT.clear()
+
+
+def _lookup_activation_prequant(
+    A: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    hit = _PREQUANT.get(A.data_ptr())
+    if hit is not None:
+        a_fp8, a_scale = hit
+        if a_fp8.shape == A.shape and a_scale.numel() == A.shape[0]:
+            return (a_fp8, a_scale)
+    return None
+
+
 def _e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
     """Torch-equivalent decode of an E8M0 (exponent-only) scale to fp32.
 
@@ -231,7 +267,13 @@ class IluFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         # ``fp8_per_token_dynamic_scaled`` only requires the last dim contiguous
         # (``stride(-1) == 1``), which the base ``apply_weights`` guarantees via
         # ``x.view(-1, x.shape[-1])`` — no explicit ``.contiguous()`` needed.
-        a_fp8, a_scale = ixfops.fp8_per_token_dynamic_scaled(A)
+        # A V4.1 pre-norm kernel may already have produced this exact quant for
+        # ``A`` (bit-identical, same hidden-state storage); reuse it when present.
+        prequant = _lookup_activation_prequant(A)
+        if prequant is not None:
+            a_fp8, a_scale = prequant
+        else:
+            a_fp8, a_scale = ixfops.fp8_per_token_dynamic_scaled(A)
         out = ixfops.fp8_per_channel_mm(a_fp8, B, a_scale, Bs)
         return out.to(self.config.out_dtype)
 

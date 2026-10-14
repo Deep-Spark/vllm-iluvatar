@@ -651,6 +651,10 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
             alignment=64 if uses_fp8_ds_mla_layout else 512,
             model_version="deepseek_v4",
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+            # 448B NoPE + 128B RoPE + 8B fp8 scale per token; ``head_size``
+            # stays semantic (512). v0.30.0 (ced6857afa) takes C from this
+            # field rather than from ``cache_dtype_str``.
+            state_content_bytes=584 if uses_fp8_ds_mla_layout else None,
         )
 
     def forward(

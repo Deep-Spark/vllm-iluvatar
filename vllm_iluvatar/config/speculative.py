@@ -63,11 +63,13 @@ _ILU_DSPARK_ARCH_MAP = {
     "DSparkDraftModel": "IluDSparkDraftModel",
 }
 
-# Target architectures whose DSpark draft should use the ilu implementation.
-_ILU_DSPARK_TARGET_ARCHS = (
-    "IluDeepseekV4ForCausalLM",
-    "DeepseekV4ForCausalLM",
-)
+# Target architectures whose DSpark draft should be remapped to the W4A8 ilu
+# implementation (``IluDSparkDraftModel``). The FP8 target
+# (``DeepseekV4ForCausalLM``) is intentionally excluded: it keeps the community
+# ``DSparkDraftModel`` arch, which ``fp8_model.register_model`` re-points at the
+# FP8 draft (``IluDSparkDeepseekV4Fp8ForCausalLM``) -- mirroring how the FP8 MTP
+# reuses the community ``DeepSeekV4MTPModel`` name instead of ``_ILU_MTP_ARCH_MAP``.
+_ILU_DSPARK_TARGET_ARCHS = ("IluDeepseekV4ForCausalLM",)
 
 
 def make_post_init(orig: Callable[..., None]) -> Callable[..., None]:

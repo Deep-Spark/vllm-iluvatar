@@ -89,7 +89,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import SupportsPP
+from vllm.model_executor.models.interfaces import SupportsEagle3, SupportsPP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -142,6 +142,17 @@ def _is_load_skipped(name: str) -> bool:
     return any(substr in name for substr in _LOAD_SKIP_SUBSTRS) or not (
         AutoWeightsLoader.REMOVE_UNUSED_ROTARY_EMBEDS_MAPPER.apply_list([name])
     )
+
+
+def default_aux_hidden_state_layers(hf_config) -> tuple[int, ...]:
+    """Aux capture layers for a DSpark draft (FP8 fork).
+
+    ``dspark_target_layer_ids`` names the *source* decoder layers; capture
+    happens after that layer runs, so the runner-facing ids are shifted by one
+    (same convention as community eagle3 / DFlash and the W4A8 ``model.py``).
+    """
+    layer_ids = getattr(hf_config, "dspark_target_layer_ids", None) or ()
+    return tuple(i + 1 for i in layer_ids)
 
 
 def _make_fp8_weights_mapper() -> WeightsMapper:
@@ -708,6 +719,12 @@ class IluDeepseekV4Fp8Model(nn.Module):
         else:
             self._mtp_hidden_buffer = None
 
+        # Populated by ``IluDeepseekV4Fp8ForCausalLM.set_aux_hidden_state_layers``
+        # when a DSpark draft is active. Empty => forward keeps its single-tensor
+        # return, so MTP and non-speculative paths are unaffected. Mirrors the
+        # W4A8 ``model.py`` aux-hidden plumbing.
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
+
         # Filled by ``load_weights``, read by the Load_Verifier on
         # ``IluDeepseekV4Fp8ForCausalLM``: the checkpoint-side names
         # (post-mapper, pre-fusion) that the main loop handled.  Accumulated
@@ -786,8 +803,15 @@ class IluDeepseekV4Fp8Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        aux_hidden_states: list[torch.Tensor] = []
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer), self.start_layer
+        ):
             hidden_states = layer(hidden_states, positions, input_ids)
+            if (idx + 1) in self.aux_hidden_state_layers:
+                # hc streams are already folded by the ilu layer; mean-pool the
+                # hc_mult copies to the [T, H] the DSpark combiner expects.
+                aux_hidden_states.append(hidden_states.mean(dim=1))
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
@@ -799,6 +823,8 @@ class IluDeepseekV4Fp8Model(nn.Module):
 
         hidden_states = self.hc_head(hidden_states)
         hidden_states = self.norm(hidden_states)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
@@ -1049,7 +1075,7 @@ class IluDeepseekV4Fp8Model(nn.Module):
         return loaded_params
 
 
-class IluDeepseekV4Fp8ForCausalLM(nn.Module, SupportsPP):
+class IluDeepseekV4Fp8ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     """Top-level causal-LM for the raw-FP8 DeepSeek-V4-Flash checkpoint.
 
     Registered under the community arch name ``DeepseekV4ForCausalLM``
@@ -1083,6 +1109,14 @@ class IluDeepseekV4Fp8ForCausalLM(nn.Module, SupportsPP):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        # Wired by the runner (``set_eagle3_aux_hidden_state_layers``) when a
+        # DSpark draft is active; enables the aux-hidden capture in the model.
+        self.model.aux_hidden_state_layers = tuple(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return default_aux_hidden_state_layers(self.config)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         # Community: vllm/models/deepseek_v4/nvidia/model.py:1443-1448
@@ -1258,4 +1292,13 @@ def register_model() -> None:
     ModelRegistry.register_model(
         "DeepSeekV4MTPModel",
         "vllm_iluvatar.models.deepseek_v4.fp8_mtp:IluDeepseekV4Fp8MTP",
+    )
+    # DSpark block drafter for the FP8 checkpoint. Community assigns the draft
+    # arch ``DSparkDraftModel`` in ``SpeculativeConfig.__post_init__``; keeping
+    # that community name (instead of remapping to the W4A8 ``IluDSparkDraftModel``
+    # in ``config/speculative.py``) routes the FP8 target to the FP8 draft, the
+    # same way ``DeepSeekV4MTPModel`` routes MTP.
+    ModelRegistry.register_model(
+        "DSparkDraftModel",
+        "vllm_iluvatar.models.deepseek_v4.fp8_dspark:IluDSparkDeepseekV4Fp8ForCausalLM",
     )

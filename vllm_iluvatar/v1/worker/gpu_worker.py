@@ -4,7 +4,8 @@
 IluWorker — subclass of the community Worker with following overrides:
 
 1. ``determine_available_memory`` for attention quantisation support.
-2. ``initialize_from_config`` for attention quantisation support.
+2. ``initialize_from_config`` for attention quantisation support, plus the
+   resolved-KV-layout report and its 32-bit layer-span guard.
 3. ``shutdown`` for attention quantisation support.
 4. ``compile_or_warm_up_model`` to exclude simulated requests from KV calibration.
 5. ``execute_dummy_batch`` for Iluvatar DP idle-rank optimisation.
@@ -18,6 +19,8 @@ import vllm.v1.worker.gpu.model_runner as _gpu_model_runner
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu_worker import Worker
+
+from vllm_iluvatar.v1.worker.kv_layout_report import report_kv_cache_layout
 
 logger = init_logger(__name__)
 
@@ -113,6 +116,8 @@ class IluWorker(Worker):
             self.model_runner.__class__ = orig_cls
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+        if self.rank == 0:
+            report_kv_cache_layout(self.vllm_config, kv_cache_config)
         orig_cls = self._try_replace_model_runner_class()
         try:
             super().initialize_from_config(kv_cache_config)

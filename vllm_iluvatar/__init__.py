@@ -176,6 +176,12 @@ def register_general() -> None:
     except ImportError:
         return
 
+    # Model-registry inspection subprocesses load general plugins without first
+    # resolving the platform plugin, so install env readers here as well.
+    from vllm_iluvatar.envs import apply as _apply_ilu_envs
+
+    _apply_ilu_envs()
+
     from vllm_iluvatar.distributed.kv_transfer import (
         apply_kv_transfer_registrations,
     )

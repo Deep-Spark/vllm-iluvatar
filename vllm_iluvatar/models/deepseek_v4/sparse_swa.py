@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING
 
 import ixformer.inference.functions as ixfops
 import torch
+from vllm.config import get_current_vllm_config
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadataBuilder
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
@@ -25,6 +27,7 @@ from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa import (
     IluDeepseekSparseSWABackend,
     IluDeepseekV4SWACache,
+    build_dspark_noncausal_swa_indices,
 )
 
 if TYPE_CHECKING:
@@ -69,6 +72,11 @@ class IluFp8SWAMetadata:
     num_decode_tokens: int = 0
     num_prefill_tokens: int = 0
 
+    # False for a DSpark draft block (all queries attend bidirectionally within
+    # the block). Mirrors the ``causal`` field the W4A8 builder exposes so a
+    # DSpark/DFlash proposer can verify the builder honored the request.
+    causal: bool = True
+
 
 class IluDeepseekV4Fp8SWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
     """fp8-only SWA metadata builder for the unified (single-call) MQA path.
@@ -97,22 +105,40 @@ class IluDeepseekV4Fp8SWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
         else:
             self._packed_swa_indices = None
 
+        # DSpark draft blocks are drafted non-causally: every query in the block
+        # shares one key set (trailing window context + all block keys). The
+        # causal ixformer kernel cannot express that, so those windows are built
+        # in Torch (``build_dspark_noncausal_swa_indices``) into a dedicated
+        # buffer whose backing row is 256-aligned (the fp8 decode kernel checks
+        # ``indices.stride(0) % 256 == 0``, same constraint as the causal path).
+        spec_config = get_current_vllm_config().speculative_config
+        self.is_dspark = spec_config is not None and spec_config.use_dspark()
+        self.noncausal_index_width = (
+            cdiv(self.window_size + self.num_speculative_tokens, _FP8_SWA_INDEX_ALIGN)
+            * _FP8_SWA_INDEX_ALIGN
+            if self.is_dspark
+            else 0
+        )
+        self._decode_swa_indices_noncausal = (
+            torch.full(
+                (self.decode_swa_indices.shape[0], 1, self.noncausal_index_width),
+                -1,
+                dtype=torch.int32,
+                device=self.decode_swa_indices.device,
+            )
+            if self.is_dspark
+            else None
+        )
+
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
+        replay_start: torch.Tensor | None = None,
     ) -> IluFp8SWAMetadata:
-        # The community builder branches on ``causal`` and switches to a
-        # non-causal kernel with wider index buffers for DSpark. This builder
-        # only implements the causal window, so reject the other mode instead
-        # of silently computing the wrong windows.
-        if not getattr(common_attn_metadata, "causal", True):
-            raise NotImplementedError(
-                "IluDeepseekV4Fp8SWAMetadataBuilder only supports causal "
-                "attention; the non-causal (DSpark) path is not implemented "
-                "for the raw-FP8 DeepSeek-V4 model."
-            )
+        del replay_start
+        causal = getattr(common_attn_metadata, "causal", True)
 
         seq_lens = common_attn_metadata.seq_lens
         query_start_loc = common_attn_metadata.query_start_loc
@@ -137,38 +163,66 @@ class IluDeepseekV4Fp8SWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
         is_valid_token.copy_(slot_mapping >= 0)
 
         if num_swa_tokens > 0:
-            # ``ds4_compute_swa_decode_indices_and_lens`` is purely
-            # position-based, so a single pass over the full range yields the
-            # correct causal SWA windows for both decode and prefill tokens.
             # CUDA-graph padding safety: zero ``decode_swa_lens`` past the real
             # token count so padded rows the captured op still visits carry
             # ``topk_length == 0`` (attend nothing); their stale index contents
             # are never read.
             self.decode_swa_lens[num_swa_tokens:] = 0
-            ixfops.ds4_compute_swa_decode_indices_and_lens(
-                swa_indices=self.decode_swa_indices,
-                swa_lens=self.decode_swa_lens,
-                window_size=self.window_size,
-                query_start_loc=query_start_loc,
-                seq_lens=seq_lens,
-                token_to_req_indices=token_to_req_indices,
-                is_valid_token=is_valid_token,
-                block_table=block_table,
-                block_size=self.block_size,
-                num_decode_tokens=num_swa_tokens,
-            )
-            if self._packed_swa_indices is not None:
-                self._packed_swa_indices[:num_swa_tokens, :, : self.window_size].copy_(
-                    self.decode_swa_indices[:num_swa_tokens]
+            if not causal:
+                # DSpark draft block: every query shares one non-causal key set
+                # (trailing window context + all block keys). Built in Torch;
+                # ``ds4_compute_swa_decode_indices_and_lens`` is causal-only.
+                assert self.is_dspark, (
+                    "Non-causal DeepseekV4 fp8 SWA is only supported for the "
+                    "DSpark speculation mode, but causal=False was set without "
+                    "DSpark."
                 )
+                build_dspark_noncausal_swa_indices(
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
+                    block_table=block_table,
+                    is_valid_token=is_valid_token,
+                    block_size=self.block_size,
+                    window_size=self.window_size,
+                    index_width=self.noncausal_index_width,
+                    num_decode_tokens=num_swa_tokens,
+                    device=self.device,
+                    out_indices=self._decode_swa_indices_noncausal,
+                    out_lens=self.decode_swa_lens,
+                )
+            else:
+                # ``ds4_compute_swa_decode_indices_and_lens`` is purely
+                # position-based, so a single pass over the full range yields the
+                # correct causal SWA windows for both decode and prefill tokens.
+                ixfops.ds4_compute_swa_decode_indices_and_lens(
+                    swa_indices=self.decode_swa_indices,
+                    swa_lens=self.decode_swa_lens,
+                    window_size=self.window_size,
+                    query_start_loc=query_start_loc,
+                    seq_lens=seq_lens,
+                    token_to_req_indices=token_to_req_indices,
+                    is_valid_token=is_valid_token,
+                    block_table=block_table,
+                    block_size=self.block_size,
+                    num_decode_tokens=num_swa_tokens,
+                )
+                if self._packed_swa_indices is not None:
+                    self._packed_swa_indices[
+                        :num_swa_tokens, :, : self.window_size
+                    ].copy_(self.decode_swa_indices[:num_swa_tokens])
 
-        # Narrow to window_size: squeezed 2D view is (T, window_size) with
-        # stride(0) 256-aligned.
-        all_swa_indices = (
-            self._packed_swa_indices[:num_swa_tokens, :, : self.window_size]
-            if self._packed_swa_indices is not None
-            else self.decode_swa_indices[:num_swa_tokens]
-        )
+        # Non-causal DSpark exposes the wider Torch-built buffer; the causal path
+        # narrows to window_size. Either way stride(0) is 256-aligned.
+        if not causal and self.is_dspark:
+            all_swa_indices = self._decode_swa_indices_noncausal[
+                :num_swa_tokens, :, : self.noncausal_index_width
+            ]
+        elif self._packed_swa_indices is not None:
+            all_swa_indices = self._packed_swa_indices[
+                :num_swa_tokens, :, : self.window_size
+            ]
+        else:
+            all_swa_indices = self.decode_swa_indices[:num_swa_tokens]
 
         return IluFp8SWAMetadata(
             all_swa_indices=all_swa_indices,
@@ -180,6 +234,7 @@ class IluDeepseekV4Fp8SWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
             num_actual_tokens=num_swa_tokens,
             num_decode_tokens=num_decode_tokens,
             num_prefill_tokens=num_prefill_tokens,
+            causal=causal,
         )
 
 

@@ -210,6 +210,9 @@ class IluDeepseekV32IndexerMetadata:
     decode: IluDeepSeekV32IndexerDecodeMetadata | None = None
     prefill: IluDeepseekV32IndexerPrefillMetadata | None = None
     pcp_world_size: int = 1
+    block_table: torch.Tensor | None = None
+    token_to_req_indices: torch.Tensor | None = None
+    num_states: int | None = None
 
 
 # TODO (zyongye) optimize this, this is now vibe coded
@@ -433,6 +436,11 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 dtype=torch.int64,
                 device=self.device,
             )
+        self.v41_req_id_per_token_buffer = torch.empty(
+            (scheduler_config.max_num_batched_tokens,),
+            dtype=torch.int32,
+            device=self.device,
+        )
 
         self.offsets_buffer = torch.arange(
             next_n, device=self.device, dtype=torch.int32
@@ -1034,6 +1042,11 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             query_start_loc=common_attn_metadata.query_start_loc,
             slot_mapping=slot_mapping,
             head_dim=128,
+            block_table=common_attn_metadata.block_table_tensor,
+            token_to_req_indices=common_attn_metadata.token_to_req_indices(
+                self.v41_req_id_per_token_buffer
+            ),
+            num_states=int(self.kv_cache_spec.num_states),
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
@@ -1158,3 +1171,38 @@ def make_storage_block_size_build(orig: Callable[..., Any]) -> Callable[..., Any
             self.kv_cache_spec = original_spec
 
     return build
+
+
+class IluDeepseekV41IndexerBackend(IluDeepseekV4IndexerBackend):
+    """V4.1 indexer backend with independent BF16/FP8 cache selection."""
+
+    @staticmethod
+    def get_builder_cls():
+        return IluDeepseekV41IndexerMetadataBuilder
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        import os
+        if os.environ.get("VLLM_ILU_V41_INDEXER_KV_DTYPE", "fp8") == "fp8":
+            return [128]
+        return [64, 128]
+
+
+class IluDeepseekV41IndexerMetadataBuilder(IluDeepseekV32IndexerMetadataBuilder):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Initialize every capture-visible scratch buffer, including padded
+        # request/token rows. This is V4.1-only; shared V4/GLM stay unchanged.
+        for name in (
+            "v41_req_id_per_token_buffer",
+            "cu_seqlens_q_buffer",
+            "cu_seqlens_kv_buffer",
+            "cu_seqlen_ks_buffer",
+            "cu_seqlen_ke_buffer",
+            "valid_lens_buffer",
+            "decode_compressed_seq_lens_buffer",
+            "scheduler_metadata_buffer",
+        ):
+            getattr(self, name).zero_()
+        if self.compress_ratio > 1:
+            self.compressed_slot_mapping_buffer.fill_(-1)

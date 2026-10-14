@@ -6,10 +6,9 @@ Corresponds to: vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
 
 Why: two things the Iluvatar Triton build does differently.
 
-* ``tl_rand32`` (``tl.rand``) returns a ``[1]``-shaped tensor instead of a 0-d
-  scalar. That shape propagates through ``accepted`` into the loop-carried
-  ``verifying`` / ``accepted_length``, and this build rejects the resulting
-  inconsistent loop-carry type.
+* ``tl_rand32`` (``tl.rand``) is already a 0-d scalar when the offset is a
+  scalar. Wrapping it in ``tl.sum`` hits ``dtype`` has no ``numel`` inside
+  the reduction. Leave ``u`` as returned.
 * It does not fold ``constexpr and runtime`` conjunctions. ``USE_BLOCK_VERIFICATION``
   is a ``tl.constexpr``; under the default ``rejection_sample_method='standard'``
   (what DSpark / MTP use here) it is ``False`` and the block-verification
@@ -23,9 +22,9 @@ v0.30.0 already splits the in-loop block-verification arm into a standalone
 ``elif USE_BLOCK_VERIFICATION:``, so only the tail fixup still needs re-nesting
 (0.27.1 needed both).
 
-How: this module mirrors ``_rejection_kernel`` verbatim except for those two
-spots -- ``u`` is reduced back to a scalar with ``tl.sum``, and the tail guard
+How: this module mirrors ``_rejection_kernel`` verbatim except the tail guard
 becomes ``if USE_BLOCK_VERIFICATION:`` with the runtime tests nested inside.
+``u`` is left as the scalar ``tl_rand32`` returns.
 Numerics are identical. All ``@triton.jit`` helpers are imported from the
 community module so Triton resolves them from this function's globals.
 
@@ -140,13 +139,6 @@ def _rejection_kernel(
         if verifying:
             pos = tl.load(pos_ptr + logit_idx)
             u = tl_rand32(seed, pos, includes_zero=False)
-            # ILU: tl_rand32 (tl.rand) returns a [1]-shaped tensor on the
-            # Iluvatar Triton build instead of a 0-d scalar; that shape
-            # propagates through `accepted` into the loop-carried `verifying`
-            # and `accepted_length`, which this build rejects as an
-            # inconsistent loop-carry type. Reduce the single element back to
-            # a scalar (value-preserving) so the loop-carried types stay 0-d.
-            u = tl.sum(u)
             if is_greedy:
                 # Greedy sampling. Accept IFF draft matches target argmax.
                 # NOTE: Target argmax is stored directly so that resampling

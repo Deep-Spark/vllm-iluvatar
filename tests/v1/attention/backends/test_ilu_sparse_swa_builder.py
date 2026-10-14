@@ -15,6 +15,9 @@ from vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa import (
     IluDeepseekSparseSWAMetadataBuilder,
     build_dspark_noncausal_swa_indices,
 )
+from vllm_iluvatar.models.deepseek_v41.sparse_mla import (
+    IluDeepseekV41SparseSWAMetadataBuilder,
+)
 
 
 def _make_cad(
@@ -104,6 +107,8 @@ def _make_builder(
     )
     builder.prefill_swa_lens = torch.zeros(max_tokens, dtype=torch.int32)
     builder.is_valid_token = torch.zeros(max_tokens, dtype=torch.bool)
+    builder.no_replay_start = torch.zeros(max_tokens + 1, dtype=torch.int32)
+    builder._replay_start_buffer = torch.zeros(max_tokens + 1, dtype=torch.int32)
     builder._decode_swa_indices_noncausal = None
     builder._build_ilu_deepseek_v4_metadata = MagicMock(return_value={})
     builder.build_tile_scheduler = MagicMock(
@@ -209,3 +214,105 @@ def test_noncausal_without_dspark_raises():
         pytest.raises(AssertionError, match="only supported for the DSpark"),
     ):
         builder.build(0, cad)
+
+
+def test_decode_forwards_replay_start_to_ixformer_and_metadata():
+    builder = _make_builder(is_dspark=False)
+    cad = _make_cad(query_lens=[1], seq_lens=[12], causal=True)
+    replay_start = torch.tensor([8], dtype=torch.int32)
+
+    with (
+        patch(
+            "vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa.ixfops."
+            "ds4_compute_swa_decode_indices_and_lens"
+        ) as mock_ix,
+        patch(
+            "vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa.envs."
+            "VLLM_ILU_DS4_PREFILL_AS_DECODE",
+            False,
+        ),
+    ):
+        metadata = builder.build(0, cad, replay_start=replay_start)
+
+    assert mock_ix.call_args.kwargs["replay_start"] is replay_start
+    assert metadata.replay_start is replay_start
+
+
+def test_decode_pads_replay_start_for_graph_padded_seq_lens():
+    builder = _make_builder(is_dspark=False)
+    cad = _make_cad(query_lens=[1], seq_lens=[12], causal=True)
+    cad.seq_lens = torch.tensor([12, 0], dtype=torch.int32)
+    cad.seq_lens_cpu_upper_bound = cad.seq_lens.clone()
+    cad.block_table_tensor = torch.cat(
+        [cad.block_table_tensor, torch.zeros_like(cad.block_table_tensor)], dim=0
+    )
+    replay_start = torch.tensor([8], dtype=torch.int32)
+
+    with (
+        patch(
+            "vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa.ixfops."
+            "ds4_compute_swa_decode_indices_and_lens"
+        ) as mock_ix,
+        patch(
+            "vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa.envs."
+            "VLLM_ILU_DS4_PREFILL_AS_DECODE",
+            False,
+        ),
+    ):
+        metadata = builder.build(0, cad, replay_start=replay_start)
+
+    padded = mock_ix.call_args.kwargs["replay_start"]
+    assert padded.shape == builder.no_replay_start.shape
+    assert padded[:2].tolist() == [8, 0]
+    assert metadata.replay_start is padded
+
+def test_prefill_forwards_replay_start_to_gather_kernel():
+    from types import MethodType
+
+    builder = _make_builder(is_dspark=False)
+    builder._build_ilu_deepseek_v4_metadata = MethodType(
+        IluDeepseekSparseSWAMetadataBuilder._build_ilu_deepseek_v4_metadata,
+        builder,
+    )
+    cad = _make_cad(query_lens=[4], seq_lens=[12], causal=True)
+    replay_start = torch.tensor([8], dtype=torch.int32)
+
+    def _fake_gather(**kwargs):
+        kwargs["prefill_gather_lens"].fill_(4)
+
+    with (
+        patch(
+            "vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa.ixfops."
+            "ds4_compute_swa_prefill_gather_lens",
+            side_effect=_fake_gather,
+        ) as mock_gather,
+        patch(
+            "vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa.envs."
+            "VLLM_ILU_DS4_PREFILL_AS_DECODE",
+            False,
+        ),
+    ):
+        metadata = builder.build(0, cad, replay_start=replay_start)
+
+    assert mock_gather.call_args.kwargs["replay_start"] is replay_start
+    assert metadata.replay_start is replay_start
+    assert metadata.prefill_gather_lens.tolist() == [4]
+
+
+def test_v41_wrapper_forwards_replay_start_to_shared_builder():
+    builder = object.__new__(IluDeepseekV41SparseSWAMetadataBuilder)
+    builder.block_size = 4
+    builder._valid_slots = torch.empty(64, dtype=torch.int64)
+    cad = _make_cad(query_lens=[1], seq_lens=[12], causal=True)
+    replay_start = torch.tensor([8], dtype=torch.int32)
+    metadata = SimpleNamespace(causal=True)
+
+    with patch.object(
+        IluDeepseekSparseSWAMetadataBuilder,
+        "build",
+        return_value=metadata,
+    ) as mock_build:
+        result = builder.build(0, cad, replay_start=replay_start)
+
+    assert result is metadata
+    assert mock_build.call_args.kwargs["replay_start"] is replay_start

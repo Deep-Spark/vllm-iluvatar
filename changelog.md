@@ -17,6 +17,10 @@
 - 新增多阶段 `Dockerfile` 与 `scripts/build_image.sh`:从源码构建整链路(ixinfer/ixformer/vllm 按 pin 克隆编译 + 本仓库插件),产出 CoreX 运行时镜像,并按仓库地址 + 打包日期打 tag。
 - 新增《如何搭建 vllm-iluvatar 开发环境》开发文档。
 - 新增 `LICENSE`(Apache-2.0)与项目 logo;`pyproject.toml` 声明 `license` 字段。
+- 新增 DeepSeek-V4 Flash FP8 的 DSpark draft model，以及 KV cache 跨距校验。
+- 新增 DeepSeek-V4 Flash 社区 block-outermost KV 布局 CPU 回归测试。
+- 将 DeepSeek-V4 / V4.1 插件适配到 vLLM 0.31，并打通 sparse SWA
+  bounded replay（`replay_start`）。
 
 ### Removed
 
@@ -30,6 +34,20 @@
   `non_causal_multi_token_decode` 与
   `allow_short_prefill_indexer_scoring_skip`，满足 OOT 前缀签名检查。
 - `IluCommunicator` 接受并转发 `use_all2all`，对齐 0.27 `GroupCoordinator`。
+- DeepSeek-V4 Flash FP8 KV spec 显式提供 `state_content_bytes=584`，适配
+  vLLM 0.30 的 `AttentionSpec` 页宽计算，并保留社区 KV cache 分组、准入和
+  block-outermost 分配。
+- `version.json` 版本与依赖窗口改为 0.31；ixformer / vllm 锁定 commit 改由
+  `Dockerfile` 的 `IXFORMER_COMMIT` / `VLLM_COMMIT` 管理。ixformer pin 跟随
+  `master@573eda3f`（已包含 V4.1 `739abab2`）。
+
+### Fixed
+
+- 兼容 CoreX Triton 3.2 缺少的 `triton.knobs`、`tl.mul`、Gluon 和
+  `core._aggregate` 等接口，并镜像修复 penalties/rejection kernel 不支持的
+  Triton 语法。
+- DeepSeek-V4 Flash FP8 sparse MLA 使用 ixformer a64 gather，修复单层 KV
+  cache 跨距超过 4 GiB 时的 32 位 per-lane 地址截断。
 
 ## [0.26.0] - 2026-08-27
 

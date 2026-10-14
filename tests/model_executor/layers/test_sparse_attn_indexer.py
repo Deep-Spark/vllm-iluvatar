@@ -66,6 +66,7 @@ def test_ilu_sparse_attn_indexer_fake_returns_mutated_buffer(monkeypatch):
         max_model_len=16,
         total_seq_lens=16,
         topk_indices_buffer=buffer,
+        skip_k_cache_insert=False,
     )
 
     assert result is buffer
@@ -87,6 +88,7 @@ def test_ilu_sparse_attn_indexer_fake_requires_output_buffer(monkeypatch):
             max_model_len=16,
             total_seq_lens=16,
             topk_indices_buffer=None,
+            skip_k_cache_insert=False,
         )
 
 

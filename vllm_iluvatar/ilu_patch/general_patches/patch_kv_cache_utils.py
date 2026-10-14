@@ -80,9 +80,11 @@ def _apply() -> None:
         "get_kv_cache_configs": impl.make_get_kv_cache_configs(
             originals["get_kv_cache_configs"]
         ),
+        # Clear worker-only FP8 wire state. Keep the community scheduler
+        # planner; per-layer HMA specs stay on the worker config.
         "generate_scheduler_kv_cache_config": (
             impl.make_generate_scheduler_kv_cache_config(
-                impl.generate_scheduler_kv_cache_config
+                originals["generate_scheduler_kv_cache_config"]
             )
         ),
     }

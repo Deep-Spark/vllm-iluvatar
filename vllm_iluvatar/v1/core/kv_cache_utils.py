@@ -2,7 +2,7 @@
 """Corresponds to: vllm/v1/core/kv_cache_utils.py
 
 ILU override implementations for attention quantization (Int8 KV cache
-scale), FP8 wire staging, and scheduler-side HMA metadata preservation.
+scale) and FP8 wire staging.
 
 Target   : vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
            vllm.v1.core.kv_cache_utils._pool_bytes_per_block
@@ -53,9 +53,8 @@ Scope    : only active when attention quantization is enabled
 Remove   : When upstream supports int8 kv cache quantization.
 
 FP8 wire planning is enabled only for configured IluNixl producers. The
-scheduler keeps the community's concrete group spec so a block manager can
-be built. Per-layer page size and compression ratio are stored beside that
-spec; workers keep the original group spec for the transfer layout.
+scheduler planner stays the community function. Its wrapper only drops a
+worker-only wire plan copied onto the scheduler config.
 """
 
 from __future__ import annotations
@@ -63,7 +62,6 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from contextvars import ContextVar
-from copy import deepcopy
 from dataclasses import dataclass
 from functools import wraps
 
@@ -101,9 +99,6 @@ logger = init_logger(__name__)
 origin_get_kv_cache_config_from_groups = kv_cache_utils.get_kv_cache_config_from_groups
 origin_get_kv_cache_bytes_per_block = kv_cache_utils._get_kv_cache_bytes_per_block
 origin_pool_bytes_per_block = kv_cache_utils._pool_bytes_per_block
-origin_generate_scheduler_kv_cache_config = (
-    kv_cache_utils.generate_scheduler_kv_cache_config
-)
 
 _SCALE_KV_SPEC_TYPES = (
     FullAttentionSpec,
@@ -531,28 +526,3 @@ def make_generate_scheduler_kv_cache_config(
         return cfg
 
     return generate_scheduler_kv_cache_config
-
-
-def generate_scheduler_kv_cache_config(
-    kv_cache_configs: list[KVCacheConfig],
-) -> KVCacheConfig:
-    """Keep a concrete scheduler spec and the per-layer physical specs.
-
-    The community planner replaces ``UniformTypeKVCacheSpecs`` with one
-    layer's spec so ``KVCacheManager`` can select a block manager. Putting
-    the wrapper back prevents that lookup. The block manager only needs the
-    shared block size and attention window; page size and compression ratio
-    differ per layer and stay on ``layer_kv_cache_specs``. Worker configs are
-    not rewritten here, so transfer descriptors still see every layer.
-    """
-    cfg = origin_generate_scheduler_kv_cache_config(kv_cache_configs)
-    for src, dst in zip(kv_cache_configs[0].kv_cache_groups, cfg.kv_cache_groups):
-        spec = src.kv_cache_spec
-        if isinstance(spec, UniformTypeKVCacheSpecs):
-            dst.layer_kv_cache_specs = deepcopy(spec.kv_cache_specs)
-    if any(
-        hasattr(worker_config, "wire_kv_cache_config")
-        for worker_config in kv_cache_configs
-    ):
-        cfg.wire_kv_cache_config = None
-    return cfg

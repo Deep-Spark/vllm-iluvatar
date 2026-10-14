@@ -107,7 +107,9 @@ def test_upstream_pp_guards_are_masked_by_phase(
     )
     vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(pipeline_parallel_size=pp_size),
-        kv_transfer_config=SimpleNamespace(kv_role=role),
+        kv_transfer_config=SimpleNamespace(
+            kv_role=role, kv_connector="NixlConnector"
+        ),
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
     )
 
@@ -240,6 +242,8 @@ def test_registers_qwen_kv_first_components_as_separate_regions():
     worker._registered_descs = []
     worker.kv_caches_base_addr = {"engine": {0: []}}
     worker.dst_num_blocks = {}
+    worker.region_mem_types = []
+    worker.dst_region_mem_types = {}
     worker.src_xfer_handles_by_block_size = {}
     worker.register_local_xfer_handler = lambda _: (
         7,

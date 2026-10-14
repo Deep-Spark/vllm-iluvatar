@@ -63,49 +63,6 @@ def _single_uniform_group():
     return specs, [KVCacheGroupSpec(list(specs), uniform)]
 
 
-def test_scheduler_config_keeps_concrete_spec_and_layer_map():
-    ratio4 = MLAAttentionSpec(
-        block_size=256,
-        num_kv_heads=1,
-        head_size=512,
-        dtype=torch.bfloat16,
-        tokens_per_state=4,
-        cache_dtype_str="bfloat16",
-        alignment=512,
-    )
-    ratio128 = MLAAttentionSpec(
-        block_size=256,
-        num_kv_heads=1,
-        head_size=512,
-        dtype=torch.bfloat16,
-        tokens_per_state=128,
-        cache_dtype_str="bfloat16",
-        alignment=512,
-    )
-    specs = {"layers.0.main": ratio4, "layers.1.main": ratio128}
-    uniform = UniformTypeKVCacheSpecs(block_size=256, kv_cache_specs=specs)
-    worker_config = KVCacheConfig(
-        num_blocks=4,
-        kv_cache_tensors=[],
-        kv_cache_groups=[KVCacheGroupSpec(list(specs), uniform)],
-    )
-
-    scheduler_config = ilu_planning.generate_scheduler_kv_cache_config(
-        [worker_config]
-    )
-
-    group = scheduler_config.kv_cache_groups[0]
-    assert isinstance(group.kv_cache_spec, MLAAttentionSpec)
-    assert group.kv_cache_spec.tokens_per_state == 4
-    assert {
-        name: spec.tokens_per_state
-        for name, spec in group.layer_kv_cache_specs.items()
-    } == {"layers.0.main": 4, "layers.1.main": 128}
-    assert isinstance(
-        worker_config.kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
-    )
-
-
 def test_planning_activation_reserves_memory_and_scheduler_strips_wire_config():
     config = _config()
     specs, groups = _single_uniform_group()

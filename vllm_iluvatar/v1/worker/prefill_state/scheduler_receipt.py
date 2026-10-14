@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import time
 import numpy as np
-WIRE=Path(os.environ['P21_WIRE']);RUN_UUID=os.environ['P21_RUN_UUID']
+from .source_state import local_paths
 def save(path,value):
     tmp=path.with_suffix('.tmp');tmp.write_text(json.dumps(value)+'\n');tmp.replace(path)
 def selected(group):
@@ -21,10 +21,12 @@ def install():
     old_build=NixlConnectorScheduler.build_connector_meta
     def initialized(self,*args,**kwargs):
         value=old_init(self,*args,**kwargs)
+        self._p21_wire, self._p21_nonce = local_paths(self.engine_id)
+        self._p21_remote_endpoints={}
         self._p21_requests={};self._p21_selected=[g for g,group in enumerate(self.kv_cache_config.kv_cache_groups) if selected(group)]
         if self.is_consumer:
-            save(WIRE/f'engine_installed_{self.vllm_config.parallel_config.data_parallel_index}.json',
-                 dict(pid=os.getpid(),run_uuid=RUN_UUID,engine_id=self.engine_id,groups=self._p21_selected,
+            save(self._p21_wire/f'engine_installed_{self.vllm_config.parallel_config.data_parallel_index}.json',
+                 dict(pid=os.getpid(),run_uuid=self._p21_nonce,engine_id=self.engine_id,groups=self._p21_selected,
                       successful_receive_scope=True,original_cache_publication_unchanged=True))
         return value
     def update(self,request):
@@ -55,26 +57,35 @@ def install():
                 remote_engine_id=request.kv_transfer_params.get('remote_engine_id'))
             request._p21_ready_receipt=None
             self._p21_requests[request.request_id]=request
-        return old_alloc(self,request,blocks,num_external_tokens)
+        value=old_alloc(self,request,blocks,num_external_tokens)
+        if self.is_consumer and num_external_tokens>0:
+            remote_id=request.kv_transfer_params.get('remote_engine_id')
+            peer=self.peer_node_metas.get(remote_id)
+            if peer is not None:
+                self._p21_remote_endpoints[request.request_id]=dict(engine_id=remote_id,addr=peer.addr)
+        return value
     def build(self,output):
         metadata=old_build(self,output);receipts={}
         for rid in tuple(self._p21_requests):
             request=self._p21_requests[rid]
             if rid in output.finished_req_ids or rid in output.preempted_req_ids:
-                request._p21_ready_receipt=None;self._p21_requests.pop(rid,None);continue
+                request._p21_ready_receipt=None;self._p21_requests.pop(rid,None)
+                self._p21_remote_endpoints.pop(rid,None);continue
             ready=getattr(request,'_p21_ready_receipt',None)
             if ready is None or rid not in output.num_scheduled_tokens:continue
             if request.num_computed_tokens!=ready['N']-128:continue
             scheduler=request._p21_scheduler
             current=scheduler.kv_cache_manager.get_blocks(rid).get_block_ids(group_ids=self._p21_selected)
             record=request._p21_alloc_receipt
-            receipts[rid]=dict(request_id=rid,run_uuid=RUN_UUID,engine_id=self.engine_id,**ready,
+            receipts[rid]=dict(request_id=rid,run_uuid=self._p21_nonce,engine_id=self.engine_id,**ready,
                 external=record['external'],local=record['local'],groups={g:list(ids) for g,ids in zip(self._p21_selected,current)},
                 received_positions=record['received_positions'],remote_engine_id=record['remote_engine_id'],
                 group_specs={g:dict(block_size=self.kv_cache_config.kv_cache_groups[g].kv_cache_spec.block_size,
                                    layer_names=list(self.kv_cache_config.kv_cache_groups[g].layer_names),
                                    dtype=str(self.kv_cache_config.kv_cache_groups[g].kv_cache_spec.dtype)) for g in self._p21_selected})
         metadata.source_full_ready_receipts=receipts
+        metadata.source_state_endpoints={rid:self._p21_remote_endpoints[rid]
+            for rid in metadata.reqs_to_recv if rid in self._p21_remote_endpoints}
         return metadata
     NixlConnectorScheduler.__init__=initialized
     NixlConnectorScheduler.update_state_after_alloc=allocated

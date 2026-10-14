@@ -11,11 +11,7 @@ import types
 import numpy as np
 import torch
 from vllm_iluvatar.v1.worker.gpu_worker import IluWorker
-
-WIRE = Path(os.environ['P21_WIRE'])
-RESULT = Path(os.environ['P21_SHADOW_DIR'])
-RUN_UUID = os.environ['P21_RUN_UUID']
-CAP = 16
+from .source_state import StatePublisher, local_paths, request_dir
 
 
 def save(path, value):
@@ -32,6 +28,12 @@ class HostSourceWorker(IluWorker):
         self._src_pp = get_pp_group().rank_in_group
         self._src_tp = get_tp_group().rank_in_group
         self._src_rank = self._src_pp * 2 + self._src_tp
+        self._src_engine = self.vllm_config.kv_transfer_config.engine_id
+        self._src_wire, self._src_nonce = local_paths(self._src_engine)
+        self._src_result = self._src_wire / 'source'
+        self._src_cap = self.vllm_config.scheduler_config.max_num_seqs
+        self._src_stop = threading.Event()
+        self._src_thread = None
         models = [m for m in self.model_runner.get_model().modules()
                   if isinstance(m, module.IluDeepseekV41Model)]
         assert len(models) == 1
@@ -67,7 +69,8 @@ class HostSourceWorker(IluWorker):
                 pool = self._src_free.popleft() if eligible and self._src_free else None
                 state = dict(id=req_id, idx=idx, generation=gen, N=prompt_len,
                              H=prompt_len, S=prompt_len-128, token_sha256=key,
-                             initial_computed=int(num_computed_tokens), run_uuid=RUN_UUID,
+                             initial_computed=int(num_computed_tokens), run_uuid=self._src_nonce,
+                             engine_id=self._src_engine,
                              blocks=[[] for _ in range(runner.block_tables.num_kv_cache_groups)],
                              pool=pool, coverage=[False]*128, spans=[], events=[], records=[],
                              phase='ACTIVE', abort=False, fresh=False,
@@ -76,7 +79,7 @@ class HostSourceWorker(IluWorker):
                 self._src_counts['admitted'] += 1
                 if eligible and pool is None:
                     self._src_counts['capacity'] += 1
-            directory = RESULT/req_id
+            directory = request_dir(self._src_result, req_id)
             directory.mkdir(exist_ok=True)
             save(directory/f'observed_{self._src_rank}.json', self._scalar(state))
             return result
@@ -128,7 +131,7 @@ class HostSourceWorker(IluWorker):
 
     def _scalar(self, state):
         return {k: state[k] for k in ('id', 'idx', 'generation', 'N', 'H', 'S',
-                'token_sha256', 'initial_computed', 'run_uuid', 'add_mono_ns')}
+                'token_sha256', 'initial_computed', 'run_uuid', 'engine_id', 'add_mono_ns')}
 
     def compile_or_warm_up_model(self, *args, **kwargs):
         value = super().compile_or_warm_up_model(*args, **kwargs)
@@ -169,7 +172,7 @@ class HostSourceWorker(IluWorker):
         assert sum(s['kind']=='ring' for s in self._src_specs) == (0 if self._src_pp==3 else 1)
         before = torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
         host_bytes = 0
-        for _ in range(CAP):
+        for _ in range(self._src_cap):
             pool = {}
             for s in self._src_specs:
                 if s['kind']=='SWA':
@@ -186,11 +189,16 @@ class HostSourceWorker(IluWorker):
             self._src_free.append(pool)
         assert before == (torch.cuda.memory_allocated(), torch.cuda.memory_reserved()), 'source GPU owner changed'
         self._src_ready = True
-        save(RESULT/f'installed_{self._src_rank}.json', dict(rank=self._src_rank, pp=self._src_pp,
-            tp=self._src_tp, active_cap=CAP, pinned_host_bytes=host_bytes, new_GPU_owner_bytes=0,
+        save(self._src_result/f'installed_{self._src_rank}.json', dict(rank=self._src_rank, pp=self._src_pp,
+            tp=self._src_tp, active_cap=self._src_cap, pinned_host_bytes=host_bytes, new_GPU_owner_bytes=0,
             max_model_len=self.vllm_config.model_config.max_model_len,
             specs=[{k:v for k,v in s.items() if k!='cache'} for s in self._src_specs]))
-        threading.Thread(target=self._export_loop, daemon=True, name='P21-host-export').start()
+        self._src_publisher = (StatePublisher(self._src_wire, self._src_engine, self._src_nonce,
+            float(os.environ.get('P21_SHARD_TIMEOUT_S', '3600')),
+            float(os.environ.get('P21_PACKET_TTL_S', '60')))
+            if (self._src_pp, self._src_tp) == (3, 0) else None)
+        self._src_thread = threading.Thread(target=self._export_loop, daemon=True, name='P21-host-export')
+        self._src_thread.start()
         return value
 
     def capture(self, model, hc, pre_mix, positions):
@@ -258,7 +266,7 @@ class HostSourceWorker(IluWorker):
     def _export_loop(self):
         torch.cuda.set_device(self.device)
         report_time = 0
-        while True:
+        while not self._src_stop.is_set():
             with self._src_lock:
                 state = self._src_export[0] if self._src_export else None
             if state is not None and all(event.query() for event in state['events']):
@@ -267,7 +275,7 @@ class HostSourceWorker(IluWorker):
                     meta.update(rank=self._src_rank, pp=self._src_pp, tp=self._src_tp,
                                 fresh=state['fresh'], spans=state['spans'], abort=state['abort'],
                                 export_mono_ns=time.monotonic_ns(), records=[])
-                    directory = RESULT/state['id']
+                    directory = request_dir(self._src_result, state['id'])
                     directory.mkdir(exist_ok=True)
                     if state['fresh']:
                         # CPU-only serialization after all writer-stream D2H events.
@@ -301,7 +309,7 @@ class HostSourceWorker(IluWorker):
                         self._src_counts['partial'] += 1
                     save(directory/f'auto_{self._src_rank}.json',meta)
                 except Exception as error:
-                    save(RESULT/f'error_{self._src_rank}.json',dict(error=repr(error),request_id=state['id']))
+                    save(self._src_result/f'error_{self._src_rank}.json',dict(error=repr(error),request_id=state['id']))
                 finally:
                     with self._src_lock:
                         assert self._src_export.popleft() is state
@@ -311,6 +319,16 @@ class HostSourceWorker(IluWorker):
                         state['events']=[]
                         state['blocks']=[]
             if time.monotonic()-report_time>=1:
-                save(RESULT/f'counters_{self._src_rank}.json',self._src_counts)
+                save(self._src_result/f'counters_{self._src_rank}.json',self._src_counts)
                 report_time = time.monotonic()
-            time.sleep(.002)
+            if self._src_publisher is not None:
+                self._src_publisher.poll()
+            self._src_stop.wait(.002)
+
+    def shutdown(self):
+        self._src_ready = False
+        if hasattr(self, '_src_stop'):
+            self._src_stop.set()
+        if getattr(self, '_src_thread', None) is not None:
+            self._src_thread.join()
+        super().shutdown()

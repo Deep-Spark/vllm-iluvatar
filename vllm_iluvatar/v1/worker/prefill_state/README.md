@@ -1,40 +1,44 @@
-# DeepSeek V4.1 producer-prefix state reuse
+# E25: service-owned complete producer prefix states
 
-This optional worker path transfers the current producer's complete prefix-21
-hidden state, last 128 SWA rows, compressor rings and source-20 selectors to the
-consumer. The consumer validates original NIXL completion, the full current
-scheduler allocation and absolute positions of compact remote receive pages.
-It keeps the original compressed main/index caches and their publication rules.
-A common vote across all EP ranks selects state reuse or the original model.
+E25 reuses the current producer's complete layer0–20 state and executes D's
+layer21–39 suffix for a new request's tail128 replay. Ordinary KV transfer,
+cache publication and receive ownership remain in OptNixl.
 
-The initial supported configuration is one host, producer TP2/PP4 with a
-21-layer partial model, consumer TP2/DP8/EP16, DSpark K5, and two in-flight
-requests per DP. Even prompts with a fully captured current last128 window are
-eligible. Partial or missing source capture, local-only cache hits, invalid
-receive provenance, changed request generations and unsupported mixed shapes
-fall back to the original consumer. No new prefix CUDA Graph is included here.
+Start both P and D with `python -m vllm_iluvatar.v1.worker.prefill_state.engine_entry
+serve ...`. P uses `HostSourceWorker`; D uses `LiveDWorker`. The original
+OptNixl-capable vllm-router routes HTTP requests unchanged. No Python proxy or
+standalone state process is used. Keep request-ID randomization disabled on
+both services. Each service bootstrap generates its own lifetime nonce.
 
-Use producer worker class
-`vllm_iluvatar.v1.worker.prefill_state.host_source_worker.HostSourceWorker`,
-consumer worker class
-`vllm_iluvatar.v1.worker.prefill_state.live_d_worker.LiveDWorker`, and launch the
-consumer through `python -m
-vllm_iluvatar.v1.worker.prefill_state.engine_entry serve ...` so scheduler
-receipts are installed in spawned engines. Launch the original proxy policy
-through `python -m vllm_iluvatar.v1.worker.prefill_state.source_proxy ...`.
+P's existing PP3/TP0 host export thread aggregates all eight local producer
+shards. Its scheduler serves versioned metadata and CPU payloads over the
+existing registered OptNixl side-channel endpoint. D obtains that endpoint
+from its current remote-engine metadata, validates the payload and holds only
+pinned host memory. After the common EP vote, it copies fields on the current
+stream directly into existing SWA/ring/HC/topk/candidate destinations. Hosts
+remain alive until the copy event completes, including request cancellation.
 
-All three services must share a fresh `P21_RUN_UUID`, an existing `P21_WIRE`
-directory on local tmpfs, `P21_SHADOW_DIR` for producer packets, and
-`D21_SHADOW_DIR` for consumer diagnostic receipts. The proxy also accepts
-`DSV41_WORKSPACE` to locate the existing `run_script/proxy.py`. These paths are
-runtime owners, not persistent caches, and must not be reused across service
-lifetimes. Producer contexts are bounded at16 pinned-host slots; each consumer
-owns at most two9.5MB packets. Producer GPU buffers and extra communicators
-are not allocated. Keep normal target/draft graphs, model length256000, and at
-least1024MiB of consumer headroom at the full peak.
+P and D may run on separate hosts. No P/D shared filesystem, shared `/dev/shm`,
+shared nonce, new network port or router extension is required. Each P node's
+eight TP/PP ranks use that P host's local CPU state directory.
+`P21_LOCAL_STATE_ROOT` optionally changes the local storage root (default
+`/dev/shm/vllm_p21`, temporary-directory fallback). `P21_SHARD_TIMEOUT_S` and
+`P21_PACKET_TTL_S` bound incomplete and published packet retention. The P/D
+side-channel addresses must be mutually reachable.
 
-Original128/C16 performance:23.241/23.363ms TPOT; returned canonical control:
-23.969/24.198ms. Original GPQA10 and a separately routed original question
-passed. The feature is explicitly selected and does not change the default
-worker or proxy. All original transfer, cancellation and allocator ownership
-rules remain in effect.
+The prefix token budget comes from configured max-num-seqs and speculative
+query length. The common vote selects the maximum actual decode count, rounded
+to TP alignment. A dedicated small workspace is allocated before KV memory
+profiling: HC BF16, pre_mix FP32, positions int64, IDs int32 and padding mask
+share one aligned byte owner. K5/seq4 costs983736 logical bytes (~0.938MiB);
+allocator reserve is measured separately. No DSpark buffer is reused and no
+additional graph pool is captured. Target/draft graph configurations remain
+independent. Original runner table/slot views are used without duplicate owners.
+
+Empty DPs skip prefix attention/Engram/cache writes and still join the same
+masked MoE collectives. E25 has no configured seq<=2/<=4 activation gate; actual
+decode must fit the configured workspace and existing LL communicator capacity.
+Adaptive verification's different row layout currently takes ordinary forward.
+Missing/partial source, mismatched engine/request/prompt/nonce/generation, stale
+allocation/pages, insufficient memory or a peer veto also take ordinary forward
+on all EP ranks before any state import.

@@ -1397,7 +1397,36 @@ class NixlConnectorScheduler:
                 try:
                     await complete_ownership_events()
                     identity, _, data = await recv_from.recv_multipart()
-                    op_type, payload = msgspec.msgpack.decode(data)
+                    message = msgspec.msgpack.decode(data)
+                    # E25 uses this existing P/D endpoint. State messages are
+                    # handled locally and never published as worker commands.
+                    from vllm_iluvatar.v1.worker.prefill_state.source_state import (
+                        GET_STATE,
+                        serve_state,
+                    )
+
+                    if (
+                        isinstance(message, (tuple, list))
+                        and message
+                        and message[0] == GET_STATE
+                    ):
+                        state_reply, state_payload = serve_state(
+                            getattr(self, "_p21_wire", None)
+                            if not self.is_consumer
+                            else None,
+                            self.engine_id,
+                            message,
+                        )
+                        await recv_from.send_multipart(
+                            (
+                                identity,
+                                b"",
+                                msgspec.msgpack.encode(state_reply),
+                                state_payload,
+                            )
+                        )
+                        continue
+                    op_type, payload = message
 
                     if op_type == TEARDOWN_COMPLETE_MSG:
                         (

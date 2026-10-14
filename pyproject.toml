@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "vllm_iluvatar"
 description = "Iluvatar CoreX plugin package for vLLM (out-of-tree platform plugin)"
 requires-python = ">=3.10"
+license = {file = "LICENSE"}
 # torch / ixformer are provided by the corex environment, not installed via pip.
 # Runtime deps are resolved dynamically in setup.py from requirements.txt.
 dynamic = ["version", "dependencies"]

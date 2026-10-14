@@ -217,7 +217,7 @@ evalscope eval \
 #### 5.2.1 启动 vLLM 服务
 
 ```bash
-export VLLM_ILU_FLASH_ATTN_V_SCALE_PATH="/data/Qwen3.6-35B-A3B/v_scales.pt"
+export VLLM_ILU_FLASH_ATTN_V_SCALE_PATH="/path/to/model/v_scales.pt"
 
 vllm serve Qwen/Qwen3.6-35B-A3B \
     -tp 4 \
@@ -256,7 +256,7 @@ evalscope eval \
 #### 5.2.3 重启 vLLM 服务
 
 ```bash
-export VLLM_ILU_FLASH_ATTN_V_SCALE_PATH="/data/Qwen3.6-35B-A3B/v_scales.pt"
+export VLLM_ILU_FLASH_ATTN_V_SCALE_PATH="/path/to/model/v_scales.pt"
 export VLLM_ILU_FLASH_ATTN_QUANT_TYPE="KVINT8"
 
 vllm serve Qwen/Qwen3.6-35B-A3B \

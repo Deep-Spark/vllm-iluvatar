@@ -435,7 +435,7 @@ GEMV 快路径还要求 `N % 32 == 0`。不满足时该层从 create / load / po
 模式 B（推荐）：
 
 ```bash
-vllm serve /data/nlp/Qwen/Qwen3.8-Flash-Next-FP8 \
+vllm serve /path/to/model/Qwen3.8-Flash-Next-FP8 \
   --config examples/iluvatar-runtime-quant/Qwen/Qwen3.8-Flash-Next/fp8-inline.yaml \
   --tensor-parallel-size 4
 ```
@@ -444,7 +444,7 @@ vllm serve /data/nlp/Qwen/Qwen3.8-Flash-Next-FP8 \
 
 ```bash
 sha256sum examples/iluvatar-runtime-quant/Qwen/Qwen3.8-Flash-Next/fp8-runtime.json
-vllm serve /data/nlp/Qwen/Qwen3.8-Flash-Next-FP8 \
+vllm serve /path/to/model/Qwen3.8-Flash-Next-FP8 \
   --config examples/iluvatar-runtime-quant/Qwen/Qwen3.8-Flash-Next/fp8-file.yaml \
   --tensor-parallel-size 4
 ```

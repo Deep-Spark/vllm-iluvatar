@@ -1,181 +1,111 @@
 # vLLM Iluvatar Plugin
 
-[![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
-[![vLLM Plugin](https://img.shields.io/badge/vLLM-plugin-green)](https://github.com/vllm-project/vllm)
+![vLLM × Iluvatar CoreX](docs/assets/logos/vllm-iluvatar.png)
 
-`vllm_iluvatar` is an out-of-tree [vLLM](https://github.com/vllm-project/vllm)
-plugin for the Iluvatar CoreX platform. It adds platform integration,
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
+[![vLLM](https://img.shields.io/badge/vLLM-0.31.0-green)](https://github.com/vllm-project/vllm)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue)](LICENSE)
+
+vLLM Iluvatar is a hardware plugin that enables [vLLM](https://github.com/vllm-project/vllm)
+inference and serving on Iluvatar CoreX GPUs. It adds platform integration,
 `ixformer`-backed communication and IR operators, selected `torch.ops._C`
 compatibility bindings, model and quantization support, runtime patches, and
-NIXL KV-transfer connectors—without modifying the upstream vLLM source tree.
+NIXL KV-transfer connectors — without modifying the upstream vLLM source tree.
+The plugin is loaded automatically by vLLM after installation.
 
-## Architecture Overview
+## Requirements
 
-vLLM loads the plugin through two entry points:
+- Linux with an Iluvatar CoreX GPU and a matching driver and SDK.
+- Python 3.10 or newer, CMake, and Ninja.
+- A compatible CoreX software environment:
 
-- `vllm.platform_plugins`: `register_platform()` activates `IluPlatform`,
-  early compatibility shims, runtime configuration registration, attention backend
-  registration, and worker startup hooks.
-- `vllm.general_plugins`: `register_general()` applies late runtime patches and
-  registers out-of-tree `CustomOp` implementations, models, quantization
-  methods, and KV-transfer connectors.
+| Component | Version |
+| --- | --- |
+| vLLM | `>=0.31.0,<0.32.0` |
+| CoreX runtime and driver | `>=5.0.0` |
+| CoreX PyTorch | `>=2.10.0` |
+| ixformer | `>=0.7.0` |
 
-The package includes:
+Install the matching CoreX PyTorch, Triton, ixformer, and vLLM packages before
+building this plugin. CoreX-specific packages are supplied separately and are
+not included as Git submodules or installed from public PyPI by this project.
 
-- `IluPlatform`, a CUDA-compatible CoreX platform adapter.
-- `IluCommunicator`, backed by `ixformer.distributed` collectives.
-- `vllm_iluvatar._C`, a native extension providing vLLM-compatible `_C`
-  operators such as `rms_norm`, `weak_ref_tensor`, and
-  `get_cuda_view_from_cpu_tensor`.
-- `vllm_iluvatar.kernels`, an Iluvatar IR operator provider for vLLM V1.
-- Runtime import hooks and compatibility shims required during worker startup.
-- Out-of-tree model and quantization support for Qwen3 and DeepSeek-V4.
-- `IluNixlConnector`, `IluNixlPullConnector`, and `IluNixlPushConnector` for
-  disaggregated prefill/decode deployments.
+## Installation
 
-For implementation details, see the [plugin design](docs/design/iluvatar_plugin_design.md).
+From the repository root, select your GPU architecture and build the wheel:
+
+```bash
+# Use the architecture of your GPU, for example ivcore11 or ivcore30.
+export COREX_ARCH=ivcore11
+bash build_vllm_iluvatar.sh
+VLLM_ILUVATAR_INSTALL_RUNTIME_DEPS=1 bash install_vllm_iluvatar.sh
+```
+
+`_C.so` contains CUDA kernels, so it must be compiled for the ivcore
+architecture of the machine it will run on. When `COREX_ARCH` is not set,
+`setup.py` falls back to `ivcore11`; a wrong-arch extension loads without error
+but returns wrong values (degenerate text, no crash), so set it explicitly.
+
+Verify the native extension and platform registration:
+
+```bash
+python3 -c "import torch; import vllm_iluvatar._C; from vllm.platforms import current_platform; print(current_platform)"
+```
+
+The output should identify the Iluvatar platform. For editable installation,
+see the [development guide](docs/guides/7-how-to-set-up-the-dev-environment.md).
 
 ## Quick Start
 
-### Prerequisites
-
-- An Iluvatar CoreX GPU environment with `corex`, `torch`, and `ixformer`.
-- Python 3.10 or newer.
-- A vLLM version compatible with this plugin branch.
-- CMake and Ninja for building the native extension.
-
-The CoreX environment must provide `torch` and `ixformer`; this package does
-not install them.
-
-### Install vLLM
-
-Install the upstream vLLM version that matches this plugin branch and your
-runtime environment:
+Start an OpenAI-compatible server with a model supported by your CoreX environment:
 
 ```bash
-pip3 install vllm --no-deps
+vllm serve /path/to/model --port 8000
 ```
 
-### Install vllm_iluvatar
-
-For development, use an editable installation:
+Send a request:
 
 ```bash
-bash install_vllm_iluvatar_editable.sh
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"/path/to/model","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
-For a wheel-based installation:
-
-```bash
-bash build_vllm_iluvatar.sh
-bash install_vllm_iluvatar.sh
-```
-
-#### Target architecture
-
-`_C.so` contains CUDA kernels (RoPE, KV-cache ops), so it must be compiled for
-the ivcore architecture of the machine it will run on. `setup.py` resolves the
-target in this order (same as ixformer / ixmm):
-
-```text
-CUDA_ARCH -> COREX_ARCH -> CMAKE_CUDA_ARCHITECTURES
-  -> TORCH_CUDA_ARCH_LIST -> torch.corex_arch -> "ivcore11"
-```
-
-The final fallback makes a build silently target `ivcore11` whenever `torch` is
-not importable in the build environment. A wrong-arch `_C.so` does not fail to
-load: the kernels run and return wrong values, which surfaces much later as a
-model that generates degenerate text with no crash and no NaN. Pass the
-architecture explicitly:
-
-```bash
-COREX_ARCH=ivcore30 bash install_vllm_iluvatar_editable.sh
-```
-
-### Verify
-
-```bash
-python3 -c "from vllm.platforms import current_platform; print(current_platform)"
-```
-
-The output or startup logs should confirm that the Iluvatar platform plugin is
-active.
-
-Also confirm the extension was built for this machine. The build directory name
-carries the architecture, so compare it against the hardware:
-
-```bash
-python3 -c "import torch; print('hardware:', torch.corex_arch)"
-ls -d build/Release-*        # e.g. Release-py312-ivcore30
-```
-
-A mismatch means `_C.so` must be rebuilt with `COREX_ARCH` set; remove the stale
-`build/Release-*` directory first so the old objects are not reused.
+For NIXL KV transfer, use vLLM's `--kv-transfer-config` option to select
+`IluNixlConnector`, `IluNixlPullConnector`, or `IluNixlPushConnector`,
+depending on the deployment topology.
 
 ## Build a runtime image (Docker)
 
 The repository ships a multi-stage `Dockerfile` that builds the whole stack from
 source: it clones and compiles ixinfer, ixformer, and vLLM at the commits pinned
-in `version.json`, builds this plugin from the checked-out source, and produces a
-runnable CoreX runtime image (SDK + torch / triton + source-built `libcuinfer` +
-the three wheels).
+in the Dockerfile build args, builds this plugin from the checked-out source, and
+produces a runnable CoreX runtime image (SDK + torch / triton + source-built
+`libcuinfer` + the three wheels).
 
 ```bash
-# Needs ssh-agent access to the internal bitbucket for the pinned clones.
+# Needs SSH access to the source repositories for the pinned clones.
 bash scripts/build_image.sh
 ```
 
-The image is tagged for the Harbor registry with a build-date suffix, e.g.:
-
-```text
-[redacted:private-ip]:80/aac-llmfp/vllm-iluvatar:0.31.0-corex5.0.1-py3.12-ubuntu24.04-<YYYYMMDD>
-```
-
-The `<registry>/<project>/` prefix (`[redacted:private-ip]:80/aac-llmfp/`) is required to
-`docker push` to Harbor. Override via the `REGISTRY` / `PROJECT` / `BASE_TAG` /
-`BUILD_DATE` environment variables.
-
-The CoreX driver is deliberately **not** baked into the image; install it inside
-the (privileged) container before serving — see the comments at the top of the
-`Dockerfile`.
-
-## Usage
-
-After installing the plugin, launch models with the standard `vllm serve`
-command. Model-specific launch scripts can define arguments in a `SERVE_ARGS`
-array and pass them through together with the serving port:
-
-```bash
-vllm serve /path/to/model "${SERVE_ARGS[@]}" --port 8000
-```
-
-Example launch configurations:
-
-```bash
-# Qwen3-14B dense
-vllm serve /path/to/qwen3_model \
-  --tensor-parallel-size 2 \
-  --trust-remote-code \
-  --gpu-memory-utilization 0.90 \
-  --max-num-batched-tokens 2048 \
-  --no-async-scheduling
-
-# DeepSeek-V4-Flash W4A8 (TN layout)
-
-vllm serve /path/to/deepseek_v4_model \
-  --tensor-parallel-size 4 \
-  --pipeline-parallel-size 2 \
-  --trust-remote-code \
-  --max-model-len 8192 \
-  --gpu-memory-utilization 0.90 \
-  --no-enable-prefix-caching \
-  --max-num-batched-tokens 2048
-```
-
-For NIXL KV transfer, use vLLM's `--kv-transfer-config` option to select
-`IluNixlConnector`, `IluNixlPullConnector`, or `IluNixlPushConnector`, depending
-on the deployment topology.
+The image is tagged for a container registry with a CPU-arch and build-date
+suffix (`<base-tag>-<arch>-<YYYYMMDD>`, arch defaulting to `uname -m`); override
+the target via the `REGISTRY` / `PROJECT` / `BASE_TAG` / `ARCH` / `BUILD_DATE`
+environment variables. The CoreX driver is deliberately **not** baked into the
+image; install it inside the (privileged) container before serving — see the
+comments at the top of the `Dockerfile`.
 
 ## Documentation
 
-- [Plugin Design](docs/design/iluvatar_plugin_design.md) — Detailed implementation notes
+- [Plugin design](docs/design/iluvatar_plugin_design.md)
+- [Development setup](docs/guides/7-how-to-set-up-the-dev-environment.md)
+- [Model integration](docs/guides/2-how-to-quickly-adapt-a-community-model.md)
+- [Quantization](docs/guides/8-how-to-use-iluvatar-runtime-quant-via-additional-config.md)
+- [Distributed inference](docs/guides/5-how-to-use-dp-ep.md)
+- [Changelog](changelog.md)
+
+For general serving options and API usage, see the [vLLM documentation](https://docs.vllm.ai/).
+
+## License
+
+This project is licensed under the [Apache License 2.0](LICENSE).

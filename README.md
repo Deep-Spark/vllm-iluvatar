@@ -112,6 +112,33 @@ ls -d build/Release-*        # e.g. Release-py312-ivcore30
 A mismatch means `_C.so` must be rebuilt with `COREX_ARCH` set; remove the stale
 `build/Release-*` directory first so the old objects are not reused.
 
+## Build a runtime image (Docker)
+
+The repository ships a multi-stage `Dockerfile` that builds the whole stack from
+source: it clones and compiles ixinfer, ixformer, and vLLM at the commits pinned
+in `version.json`, builds this plugin from the checked-out source, and produces a
+runnable CoreX runtime image (SDK + torch / triton + source-built `libcuinfer` +
+the three wheels).
+
+```bash
+# Needs ssh-agent access to the internal bitbucket for the pinned clones.
+bash scripts/build_image.sh
+```
+
+The image is tagged for the Harbor registry with a build-date suffix, e.g.:
+
+```text
+[redacted:private-ip]:80/aac-llmfp/vllm-iluvatar:0.31.0-corex5.0.1-py3.12-ubuntu24.04-<YYYYMMDD>
+```
+
+The `<registry>/<project>/` prefix (`[redacted:private-ip]:80/aac-llmfp/`) is required to
+`docker push` to Harbor. Override via the `REGISTRY` / `PROJECT` / `BASE_TAG` /
+`BUILD_DATE` environment variables.
+
+The CoreX driver is deliberately **not** baked into the image; install it inside
+the (privileged) container before serving — see the comments at the top of the
+`Dockerfile`.
+
 ## Usage
 
 After installing the plugin, launch models with the standard `vllm serve`

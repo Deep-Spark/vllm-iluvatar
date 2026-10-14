@@ -14,6 +14,7 @@
 
 ### Added
 
+- 新增多阶段 `Dockerfile` 与 `scripts/build_image.sh`:从源码构建整链路(ixinfer/ixformer/vllm 按 pin 克隆编译 + 本仓库插件),产出 CoreX 运行时镜像,并按 Harbor 仓库地址 + 打包日期打 tag。
 - 新增《如何搭建 vllm-iluvatar 开发环境》开发文档。
 
 ### Removed

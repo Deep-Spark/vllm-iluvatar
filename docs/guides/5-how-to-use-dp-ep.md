@@ -29,7 +29,7 @@ Parallel（EP），重点说明 DeepSeek-V4 的 Hybrid EP 配置、环境变量�
 7. [常见问题](#7-常见问题)
    - [TTFT 变成约两倍](#71-ttft-变成约两倍)
    - [LL buffer OOM](#72-ll-buffer-oom)
-8. [相关提交](#8-相关提交)
+8. [变更记录](#8-变更记录)
 9. [附录](#9-附录)
    - [关键文件](#91-关键文件)
    - [配置步骤速览](#92-配置步骤速览)
@@ -226,8 +226,6 @@ vllm serve /path/to/model \
 - 作用：当且仅当 `all_ranks_decode_only=true` 时，将 Decode 的 EP backend
   覆盖为 LL；Prefill 仍使用 `--all2all_backend`。
 - 合法覆盖值：当前仅支持 `deepep_low_latency`。
-- 对应提交：
-  `6752b169`。
 
 设置该变量后，LL manager 和通信 handle 会由 `init_ep()` 在 CUDA Graph
 capture 前预初始化，避免在 stream capture 期间执行 barrier。LL MoE
@@ -239,8 +237,6 @@ kernel 由 profile/warmup 或首次对应 forward 路径完成初始化。
 - 参考脚本：`1`。
 - 作用：设为 `1` 时，LL manager 不创建原生 `deep_ep.Buffer`，而是使用
   `BufferWrapper`，通信 buffer 由 ixformer NVSM EP 路径初始化。
-- 对应提交：
-  `6752b169`。
 
 该变量名称表示是否禁用原生 DeepEP buffer，不表示关闭 Hybrid LL 语义。
 参考脚本使用 `VLLM_ILU_DISABLE_DEEPEP=1` 和
@@ -252,8 +248,6 @@ Iluvatar/ixformer 的 LL 通信实现。
 - 默认值：`0`。
 - 参考脚本：`1`。
 - 作用：控制 LL dispatch buffer 是否使用 INT8，以降低通信量。
-- 对应提交：
-  `6752b169`。
 
 该开关需要与模型量化实现、dispatch scale 和当前 ixformer kernel 组合一起
 验证精度，不能只根据 HTTP 请求成功判断正确性。
@@ -263,8 +257,6 @@ Iluvatar/ixformer 的 LL 通信实现。
 - 默认值：`1`。
 - 作用：在 TP > 1 时，先按 TP rank scatter token，再执行 EP dispatch，
   避免每个 TP rank 重复发送相同 token。
-- 对应提交：
-  `6752b169`。
 
 该变量同时作用于 HT 和 LL。关闭后会增加 dispatch 通信量，通常只用于
 A/B 定位。
@@ -275,8 +267,6 @@ A/B 定位。
 - 生效条件：`VLLM_ILU_DISABLE_DEEPEP=1`。
 - 作用：在 LL 路径融合 TP All Gather/All Reduce 相关处理，减少独立通信和
   中间数据搬运。
-- 对应提交：
-  `6752b169`。
 
 #### `VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP`
 
@@ -299,10 +289,6 @@ A/B 定位。
 - 推荐值：Hybrid EP 场景设为 `1`。
 - 作用：使用跨 API server 进程共享的 round-robin 计数器，将请求稳定地
   分发到各 DP engine，减少 coordinator 负载统计滞后造成的 rank 失衡。
-- 对应提交：
-  `6752b169`。
-- 测试与边界补充：
-  `3f2a6e81`。
 
 Round-robin 不能单独保证所有 DP rank 永远同时进入 Prefill，但能显著提高
 请求 wave 对齐概率，是下面 Prefill 同步策略的推荐前置配置。
@@ -318,8 +304,6 @@ PID，默认文件也不会共享；此时若需要跨 server 的全局 round-ro
 - 作用：指定跨 API server 进程共享的 round-robin 状态文件。
 - 未设置时：使用
   `/tmp/vllm-dp-rr-<parent-pid>-<num-engines>.state`。
-- 对应提交：
-  `6752b169`。
 
 只有需要让多个独立服务进程共享同一 DP 分配序列时才应显式设置。不同服务
 实例不要误用同一个文件。
@@ -333,8 +317,6 @@ PID，默认文件也不会共享；此时若需要跨 server 的全局 round-ro
   状态；当只有部分 rank ready 时，有界推迟该 Prefill wave。
 - 安装条件：还须 `VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS > 0`，否则
   EngineCore wrapper 不会安装，本开关单独开启无效。
-- 对应提交：
-  `76d338dd`。
 - collective 顺序修复：
   `924613a5`。
 
@@ -348,8 +330,6 @@ PID，默认文件也不会共享；此时若需要跨 server 的全局 round-ro
 - 负值处理：限制为 `0`。
 - 作用：部分 DP rank 有 Prefill、其它 rank 仍 Decode 时，允许等待的最大
   模型 step 数；超过上限后 fail-open，避免 Prefill 饥饿。
-- 对应提交：
-  `76d338dd`。
 
 当部分 rank ready 但没有 rank Decode 时，实现最多只短暂聚合两个 step，
 同时仍受该上限约束。
@@ -360,8 +340,6 @@ PID，默认文件也不会共享；此时若需要跨 server 的全局 round-ro
 - 负值处理：限制为 `0`。
 - 作用：某个 rank 执行完模型并清空本地 scheduler 后，短暂等待后台线程把
   replacement request 放入输入队列，避免过早进入 dummy batch。
-- 对应提交：
-  `76d338dd`。
 
 该等待解决短请求完成后的输入投递竞态；长输出下的 DP phase drift 仍需由
 `VLLM_ILU_DP_ENABLE_SYNC_PREFILLS` 解决。不要用较大的固定 sleep 代替跨
@@ -570,9 +548,9 @@ kernel 做大范围 profiling。
 3. TP scatter/fused AG-AR 开启时容量是否按 TP size 缩放；
 4. KV Cache 之后是否仍为 MoE workspace 留有足够显存。
 
-## 8. 相关提交
+## 8. 变更记录
 
-相关提交：
+变更记录：
 
 1. `6752b169`：
    初始支持 DP + EP、Hybrid EP backend 和 round-robin LB。

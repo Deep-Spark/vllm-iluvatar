@@ -14,8 +14,9 @@
 
 ### Added
 
-- 新增多阶段 `Dockerfile` 与 `scripts/build_image.sh`:从源码构建整链路(ixinfer/ixformer/vllm 按 pin 克隆编译 + 本仓库插件),产出 CoreX 运行时镜像,并按 Harbor 仓库地址 + 打包日期打 tag。
+- 新增多阶段 `Dockerfile` 与 `scripts/build_image.sh`:从源码构建整链路(ixinfer/ixformer/vllm 按 pin 克隆编译 + 本仓库插件),产出 CoreX 运行时镜像,并按仓库地址 + 打包日期打 tag。
 - 新增《如何搭建 vllm-iluvatar 开发环境》开发文档。
+- 新增 `LICENSE`(Apache-2.0)与项目 logo;`pyproject.toml` 声明 `license` 字段。
 
 ### Removed
 
@@ -23,6 +24,7 @@
 
 ### Changed
 
+- 面向开源:README 精简为公开版(logo/badge/License 小节);清理 guide 文档中的内部引用(私有数据路径改为 `/path/to/model`、移除内部 bitbucket commit 链接)。
 - GLM / DeepSeek-V4 MoE 构造改为社区 `FusedMoEFactory`（0.27 去掉 `FusedMoE` 导出）。
 - `IluMultiHeadLatentAttentionWrapper.__init__` 增加
   `non_causal_multi_token_decode` 与

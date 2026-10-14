@@ -13,15 +13,5 @@
     "ixcc": ">=22.1.0",
     "ixsdk": ">=22.1.0"
   },
-  "requirements": "./requirements.txt",
-  "pins": {
-    "ixformer": {
-      "branch": "master",
-      "commit": "63ad530151c62e553bc0404ce2fd64fc41ec4d44"
-    },
-    "vllm": {
-      "branch": "feat/v0.31.0",
-      "commit": "341bf7d4d1244424c94296ce4fc5626ad14b827a"
-    }
-  }
+  "requirements": "./requirements.txt"
 }

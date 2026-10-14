@@ -156,6 +156,23 @@ def byte_compatible_kv_layouts(
     )
 
 
+_TERMINAL_XFER_ERROR_MARKERS = (
+    "NIXL_ERR_REMOTE_DISCONNECT",
+    "NIXL_ERR_NOT_FOUND",
+    "NIXL_ERR_CANCELED",
+    "NIXLREMOTEDISCONNECTERROR",
+    "NIXLNOTFOUNDERROR",
+    "NIXLCANCELLEDERROR",
+)
+
+
+def _is_terminal_xfer_query_error(error: BaseException) -> bool:
+    """Whether a NIXL status exception means the transfer cannot progress."""
+
+    text = f"{type(error).__name__}: {error}".upper()
+    return any(marker in text for marker in _TERMINAL_XFER_ERROR_MARKERS)
+
+
 class NixlConnectorWorker:
     """Implementation of Worker side methods"""
 
@@ -1600,23 +1617,29 @@ class NixlConnectorWorker:
         if not batch.is_empty:
             self._completion_outbox.put(batch)
 
-    def _release_xfer_handle(self, handle: Any) -> None:
+    def _release_xfer_handle(self, handle: Any) -> bool:
         try:
             self.nixl_wrapper.release_xfer_handle(handle)
+            return True
         except Exception as e:
             self._log_failure("release_xfer_handle_failed", None, error=e)
+            return False
 
-    def _release_dlist_handle(self, handle: Any) -> None:
+    def _release_dlist_handle(self, handle: Any) -> bool:
         try:
             self.nixl_wrapper.release_dlist_handle(handle)
+            return True
         except Exception as e:
             self._log_failure("release_dlist_handle_failed", None, error=e)
+            return False
 
-    def _remove_remote_agent(self, agent_name: str) -> None:
+    def _remove_remote_agent(self, agent_name: str) -> bool:
         try:
             self.nixl_wrapper.remove_remote_agent(agent_name)
+            return True
         except Exception as e:
             self._log_failure("remove_remote_agent_failed", None, error=e)
+            return False
 
     def _deregister_memory(self, desc: Any) -> None:
         try:
@@ -2251,15 +2274,23 @@ class NixlConnectorWorker:
                     req_id, status, payload, allow_buffer=True
                 )
 
-    def _finish_send(self, req_id: ReqId, failure: str | None = None) -> None:
-        self._send_failures.pop(req_id, None)
-        wrapper = self._send_transfers.pop(req_id, None)
+    def _finish_send(self, req_id: ReqId, failure: str | None = None) -> bool:
+        if failure:
+            self._send_failures[req_id] = failure
+        wrapper = self._send_transfers.get(req_id)
         engine_id = None
         if wrapper is not None:
+            release_failed = False
             for handle, _, _, remote_engine_id in wrapper.transfer_list:
                 engine_id = remote_engine_id
-                if handle is not None:
-                    self._release_xfer_handle(handle)
+                if handle is not None and not self._release_xfer_handle(handle):
+                    release_failed = True
+            if release_failed:
+                self._send_failures.setdefault(
+                    req_id, "unable to release terminal NIXL transfer handle"
+                )
+                return False
+            self._send_transfers.pop(req_id, None)
         state = self._send_requests.pop(req_id, None)
         if state is not None and state.metadata is not None:
             engine_id = state.metadata.engine_id
@@ -2269,9 +2300,11 @@ class NixlConnectorWorker:
                 session.pending_send.discard(req_id)
                 session.inflight_send.discard(req_id)
         batch = CompletionBatch(done_sending={req_id})
+        failure = self._send_failures.pop(req_id, None)
         if failure:
             batch.failures[req_id] = failure
         self._put_completion(batch)
+        return True
 
     def _poll_send_transfers(self, include_unready: bool = False) -> None:
         for req_id, wrapper in list(self._send_transfers.items()):
@@ -2285,16 +2318,33 @@ class NixlConnectorWorker:
                 try:
                     xfer_state = self.nixl_wrapper.check_xfer_state(handle)
                 except Exception as e:
-                    in_progress = True
-                    if req_id not in self._send_failures:
-                        self._send_failures[req_id] = (
-                            f"unable to query NIXL transfer state: {e}"
-                        )
-                        logger.error(
-                            "Unable to query NIXL transfer state for request %s; "
-                            "retaining handle",
-                            req_id,
-                        )
+                    if _is_terminal_xfer_query_error(e):
+                        item[1] = True
+                        if req_id not in self._send_failures:
+                            self._send_failures[req_id] = (
+                                "terminal NIXL transfer state: "
+                                f"{type(e).__name__}: {e}"
+                            )
+                            self.xfer_stats.record_failed_transfer()
+                            logger.error(
+                                "NIXL transfer for request %s reached terminal "
+                                "disconnect state %s; releasing handle",
+                                req_id,
+                                self._send_failures[req_id],
+                            )
+                    else:
+                        in_progress = True
+                        if req_id not in self._send_failures:
+                            self._send_failures[req_id] = (
+                                "unable to query NIXL transfer state: "
+                                f"{type(e).__name__}: {e}"
+                            )
+                            logger.error(
+                                "Unable to query NIXL transfer state for request %s; "
+                                "retaining handle: %s",
+                                req_id,
+                                self._send_failures[req_id],
+                            )
                     continue
                 if xfer_state == "DONE":
                     try:
@@ -2320,7 +2370,7 @@ class NixlConnectorWorker:
                         xfer_state,
                     )
             if not in_progress:
-                self._finish_send(req_id, self._send_failures.pop(req_id, None))
+                self._finish_send(req_id, self._send_failures.get(req_id))
 
     def _expire_requests(self, now: float) -> None:
         for req_id, expires in list(self._recv_deadlines.items()):
@@ -2365,10 +2415,19 @@ class NixlConnectorWorker:
                 if not session.stuck_reported:
                     session.stuck_reported = True
                     logger.error(
-                        "Remote engine %s generation %s remains in PROC after "
-                        "disconnect drain timeout; retaining NIXL resources",
+                        "Remote engine %s generation %s still has active transfer "
+                        "handles after disconnect drain timeout; retaining NIXL "
+                        "resources (last failure=%s)",
                         session.engine_id,
                         session.generation,
+                        next(
+                            (
+                                failure
+                                for req_id, failure in self._send_failures.items()
+                                if req_id in session.inflight_send
+                            ),
+                            "none",
+                        ),
                     )
             self._cleanup_session_if_drained(session)
 
@@ -2551,10 +2610,41 @@ class NixlConnectorWorker:
         # Remove mappings first so no later queued work can discover a dlist.
         self._remote_agents_per_layer.pop(engine_id, None)
         self._remote_agents_per_rank.pop(engine_id, None)
-        for handle in self.dst_xfer_side_handles.pop(engine_id, []):
-            self._release_dlist_handle(handle)
-        for agent_name in self._remote_agents.pop(engine_id, []):
-            self._remove_remote_agent(agent_name)
+        failed_dlists = [
+            handle
+            for handle in self.dst_xfer_side_handles.get(engine_id, [])
+            if not self._release_dlist_handle(handle)
+        ]
+        if failed_dlists:
+            self.dst_xfer_side_handles[engine_id] = failed_dlists
+            session.state = RemoteSessionState.STUCK
+            logger.error(
+                "Remote engine %s generation %s cleanup is STUCK: %d remote "
+                "dlist handle(s) could not be released",
+                engine_id,
+                session.generation,
+                len(failed_dlists),
+            )
+            return
+        self.dst_xfer_side_handles.pop(engine_id, None)
+
+        failed_agents = [
+            agent_name
+            for agent_name in self._remote_agents.get(engine_id, [])
+            if not self._remove_remote_agent(agent_name)
+        ]
+        if failed_agents:
+            self._remote_agents[engine_id] = failed_agents
+            session.state = RemoteSessionState.STUCK
+            logger.error(
+                "Remote engine %s generation %s cleanup is STUCK: %d remote "
+                "agent(s) could not be removed",
+                engine_id,
+                session.generation,
+                len(failed_agents),
+            )
+            return
+        self._remote_agents.pop(engine_id, None)
         self._tp_size.pop(engine_id, None)
         self._pp_size.pop(engine_id, None)
         self._block_size.pop(engine_id, None)

@@ -1,0 +1,40 @@
+# Keep the build context lean. NOTE: .git is intentionally NOT ignored — the
+# plugin wheel stamps its git id from it during the build (falls back to
+# "unknown" when absent, so this is cosmetic but nice to have).
+
+# Build / packaging artifacts
+build/
+build_pip/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+*.whl
+*.so
+
+# Generated at wheel build time
+vllm_iluvatar/_git_id.py
+*_startup_patch.pth
+
+# Caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Logs
+*.log
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

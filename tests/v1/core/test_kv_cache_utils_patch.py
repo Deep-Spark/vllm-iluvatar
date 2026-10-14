@@ -55,13 +55,9 @@ def _setup_modules(monkeypatch, *, flash_quant_type: str, mla_quant_type: str):
         wrapped.base = base
         return wrapped
 
-    def per_layer_scheduler(kv_cache_configs):
-        return kv_cache_configs
-
     implementation = ModuleType("vllm_iluvatar.v1.core.kv_cache_utils")
     implementation.get_kv_cache_config_from_groups = replacement_from_groups
     implementation._ilu_pool_bytes_per_block = replacement_pool_bytes_per_block
-    implementation.generate_scheduler_kv_cache_config = per_layer_scheduler
     implementation.make_get_kv_cache_config_from_groups = wrap
     implementation.make_get_kv_cache_configs = wrap
     implementation.make_generate_scheduler_kv_cache_config = wrap
@@ -77,7 +73,6 @@ def _setup_modules(monkeypatch, *, flash_quant_type: str, mla_quant_type: str):
         original_pool_bytes_per_block=original_pool_bytes_per_block,
         original_configs=original_configs,
         original_scheduler=original_scheduler,
-        per_layer_scheduler=per_layer_scheduler,
         replacement_from_groups=replacement_from_groups,
         replacement_pool_bytes_per_block=replacement_pool_bytes_per_block,
     )
@@ -98,7 +93,7 @@ def test_patch_wraps_community_planners_when_quantization_is_disabled(monkeypatc
     assert modules.community.get_kv_cache_configs.base is modules.original_configs
     assert (
         modules.community.generate_scheduler_kv_cache_config.base
-        is modules.per_layer_scheduler
+        is modules.original_scheduler
     )
 
 
@@ -134,5 +129,5 @@ def test_patch_replaces_functions_when_quantization_is_enabled(
     assert modules.community.get_kv_cache_configs.base is modules.original_configs
     assert (
         modules.community.generate_scheduler_kv_cache_config.base
-        is modules.per_layer_scheduler
+        is modules.original_scheduler
     )

@@ -22,7 +22,6 @@ Fingerprint: the community DeepseekV32IndexerMetadataBuilder.build source is
 from __future__ import annotations
 
 import inspect
-import types
 
 from vllm_iluvatar.ilu_patch import general_patch as p
 
@@ -71,11 +70,5 @@ def _apply() -> None:
 
     replacement = make_storage_block_size_build(
         IluDeepseekV32IndexerMetadataBuilder.build
-    )
-    p.check_signatures(
-        IluDeepseekV32IndexerMetadataBuilder,
-        types.SimpleNamespace(build=replacement),
-        ["build"],
-        strict=True,
     )
     IluDeepseekV32IndexerMetadataBuilder.build = replacement

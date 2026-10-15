@@ -450,24 +450,27 @@ class IluDeepseekV41Indexer(nn.Module):
                 dtype=torch.float32,
                 device="cuda",
             )
-            if not hasattr(k_cache, "logits_buffer"):
-                decode_rows = max(
-                    vllm_config.compilation_config.max_cudagraph_capture_size or 0,
-                    vllm_config.scheduler_config.max_num_seqs
-                    * (
-                        1
-                        + (
-                            vllm_config.speculative_config.num_speculative_tokens
-                            if vllm_config.speculative_config
-                            else 0
-                        )
-                    ),
-                )
-                k_cache.logits_buffer = torch.empty(
-                    (decode_rows, (self.max_model_len + 31) // 32 * 32),
-                    dtype=torch.bfloat16,
-                    device="cuda",
-                )
+        # Decode CUDA graphs cannot allocate logits per step. Size to the
+        # max compressed context so the same storage covers every capture
+        # size. BF16 used to skip this and empty() inside the graph.
+        if not hasattr(k_cache, "logits_buffer"):
+            decode_rows = max(
+                vllm_config.compilation_config.max_cudagraph_capture_size or 0,
+                vllm_config.scheduler_config.max_num_seqs
+                * (
+                    1
+                    + (
+                        vllm_config.speculative_config.num_speculative_tokens
+                        if vllm_config.speculative_config
+                        else 0
+                    )
+                ),
+            )
+            k_cache.logits_buffer = torch.empty(
+                (decode_rows, (self.max_model_len + 31) // 32 * 32),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
 
         # Scoring and selection live behind the platform's subclass of official's
         # SparseAttnIndexer, same as v3.2 and glm_moe_dsa.

@@ -24,6 +24,7 @@ def _install_fake_ixformer(monkeypatch):
     inference.__path__ = []
     functions = ModuleType("ixformer.inference.functions")
     functions.dsa_indexer_mqa_logits = object()
+    functions.dsa_indexer_mqa_logits_with_blocks_fp8 = object()
     functions.dsa_update_topk_indices = object()
     monkeypatch.setitem(sys.modules, "ixformer", ixformer)
     monkeypatch.setitem(sys.modules, "ixformer.inference", inference)
@@ -152,3 +153,63 @@ def test_ilu_sparse_attn_indexer_forward_cuda_calls_registered_op(
     assert args[6:10] == (4, 8, 16, 32)
     assert args[10] is topk_indices_buffer
     assert args[11] is (constructor_skip or call_skip)
+
+
+def _capture_mqa_logits(monkeypatch):
+    sparse = _load_sparse_attn_indexer(monkeypatch)
+    monkeypatch.setattr(sparse.envs, "VLLM_ILU_GLM_DSA_NATIVE_MQA_LOGITS", False)
+    captured = {}
+
+    def fake_logits(*args, **kwargs):
+        captured["kwargs"] = dict(kwargs)
+        return torch.empty(0)
+
+    monkeypatch.setattr(sparse.ixfops, "dsa_indexer_mqa_logits", fake_logits)
+    monkeypatch.setattr(
+        sparse.ixfops, "dsa_indexer_mqa_logits_with_blocks_fp8", fake_logits
+    )
+    return sparse, captured
+
+
+def test_mqa_logits_v41_bf16_defaults_to_native(monkeypatch):
+    sparse, captured = _capture_mqa_logits(monkeypatch)
+    monkeypatch.setenv("VLLM_ILU_V41_INDEXER_KV_DTYPE", "bf16")
+    q = torch.zeros((1, 16, 128), dtype=torch.bfloat16)
+    kv = torch.zeros((1, 64, 128), dtype=torch.bfloat16)
+    sparse._mqa_logits(
+        q, None, None, kv, None, None, valid_lens=torch.zeros(1, dtype=torch.int32)
+    )
+    assert captured["kwargs"]["backend"] == "ixformer_native"
+
+
+def test_mqa_logits_v41_bf16_backend_override(monkeypatch):
+    sparse, captured = _capture_mqa_logits(monkeypatch)
+    monkeypatch.setenv("VLLM_ILU_V41_INDEXER_KV_DTYPE", "bf16")
+    monkeypatch.setenv("VLLM_ILU_V41_BF16_INDEXER_BACKEND", "ixinfer")
+    q = torch.zeros((1, 16, 128), dtype=torch.bfloat16)
+    kv = torch.zeros((1, 64, 128), dtype=torch.bfloat16)
+    sparse._mqa_logits(
+        q, None, None, kv, None, None, valid_lens=torch.zeros(1, dtype=torch.int32)
+    )
+    assert captured["kwargs"]["backend"] == "ixinfer"
+
+
+def test_mqa_logits_plain_bf16_does_not_force_backend(monkeypatch):
+    sparse, captured = _capture_mqa_logits(monkeypatch)
+    monkeypatch.delenv("VLLM_ILU_V41_INDEXER_KV_DTYPE", raising=False)
+    q = torch.zeros((1, 16, 128), dtype=torch.bfloat16)
+    kv = torch.zeros((1, 64, 128), dtype=torch.bfloat16)
+    sparse._mqa_logits(
+        q, None, None, kv, None, None, valid_lens=torch.zeros(1, dtype=torch.int32)
+    )
+    assert "backend" not in captured["kwargs"]
+
+
+def test_mqa_logits_int8_stays_on_ixinfer(monkeypatch):
+    sparse, captured = _capture_mqa_logits(monkeypatch)
+    q = torch.zeros((1, 16, 128), dtype=torch.int8)
+    kv = torch.zeros((1, 64, 132), dtype=torch.uint8)
+    sparse._mqa_logits(
+        q, None, None, kv, None, None, valid_lens=torch.zeros(1, dtype=torch.int32)
+    )
+    assert captured["kwargs"]["backend"] == "ixinfer"

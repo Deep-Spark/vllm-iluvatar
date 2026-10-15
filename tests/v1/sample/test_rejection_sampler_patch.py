@@ -10,12 +10,6 @@ from types import ModuleType, SimpleNamespace
 
 from vllm_iluvatar.ilu_patch.general_patches import patch_rejection_sampler
 
-_MAIN_DB9527A468_REJECTION_GREEDY_SAMPLE_KERNEL_SHA = (
-    "9cd5a8f8fe5a065937797b59a1fede6aadb711391d3288a09fc7ffa65cfc5551"
-)
-_MAIN_DB9527A468_REJECTION_RANDOM_SAMPLE_KERNEL_SHA = (
-    "63a939862a8810443cdd667248e16b8aba6c33e0f921812b5b6a34cc597d2bad"
-)
 _MAIN_DB9527A468_REJECTION_SAMPLE_SHA = (
     "adadcc804bccf89cc3568b637d14b90480f903d0a5de417719200ad6a284c747"
 )
@@ -161,31 +155,25 @@ def test_rejection_sampler_fingerprint_baselines_match_declared_main_source():
     assert patch_rejection_sampler._BASELINE_SOURCE_SHAS == {
         "rejection_sample": _MAIN_DB9527A468_REJECTION_SAMPLE_SHA,
         "generate_uniform_probs": _MAIN_DB9527A468_GENERATE_UNIFORM_PROBS_SHA,
-        "rejection_greedy_sample_kernel": (
-            _MAIN_DB9527A468_REJECTION_GREEDY_SAMPLE_KERNEL_SHA
-        ),
-        "rejection_random_sample_kernel": (
-            _MAIN_DB9527A468_REJECTION_RANDOM_SAMPLE_KERNEL_SHA
-        ),
     }
 
 
-def test_rejection_sampler_impl_marks_ilu_predicate_delta(monkeypatch):
+def test_rejection_sampler_impl_keeps_only_float32_uniform_delta(monkeypatch):
     _install_fake_vllm(monkeypatch)
     impl = _load_impl(monkeypatch)
 
-    greedy_source = inspect.getsource(impl.rejection_greedy_sample_kernel)
-    random_source = inspect.getsource(impl.rejection_random_sample_kernel)
     rejection_source = inspect.getsource(impl.rejection_sample)
     uniform_source = inspect.getsource(impl.generate_uniform_probs)
 
-    assert "# >>> ILU MODIFICATION >>>" in greedy_source
-    assert "# >>> ILU MODIFICATION >>>" in random_source
+    assert not hasattr(impl, "rejection_greedy_sample_kernel")
+    assert not hasattr(impl, "rejection_random_sample_kernel")
+    assert not hasattr(impl, "sample_recovered_tokens_kernel")
     assert "# >>> ILU MODIFICATION >>>" in rejection_source
     assert "# >>> ILU MODIFICATION >>>" in uniform_source
-    assert "tl.load(is_greedy_ptr + req_idx).to(tl.int32) != 0" in greedy_source
-    assert "tl.load(is_greedy_ptr + req_idx).to(tl.int32) != 0" in random_source
-    assert "rejection_sample_deterministic_draft_torch" in rejection_source
+    assert "_community.rejection_greedy_sample_kernel[" in rejection_source
+    assert "_community.rejection_random_sample_kernel[" in rejection_source
+    assert "_community.sample_recovered_tokens(" in rejection_source
+    assert "NO_DRAFT_PROBS=True" in rejection_source
     assert "dtype=torch.float32" in uniform_source
 
 
@@ -236,7 +224,7 @@ def test_rejection_sample_delegates_to_community_when_draft_probs_exist(monkeypa
     ]
 
 
-def test_rejection_sample_draft_probs_none_uses_deterministic_fallback(monkeypatch):
+def test_rejection_sample_draft_probs_none_uses_triton_kernels(monkeypatch):
     _install_fake_vllm(monkeypatch)
     impl = _load_impl(monkeypatch)
 
@@ -256,8 +244,20 @@ def test_rejection_sample_draft_probs_none_uses_deterministic_fallback(monkeypat
         def softmax(self, dim, dtype):
             return FakeTensor(ndim=2, shape=self.shape, device=self.device)
 
+    class GridKernel:
+        def __init__(self):
+            self.calls = []
+
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                self.calls.append((grid, args, kwargs))
+
+            return launch
+
     output_token_ids = object()
-    fallback_calls = []
+    recovered = object()
+    random_kernel = GridKernel()
+    recovered_calls = []
 
     monkeypatch.setattr(
         impl.torch,
@@ -270,10 +270,16 @@ def test_rejection_sample_draft_probs_none_uses_deterministic_fallback(monkeypat
         "generate_uniform_probs",
         lambda *args, **kwargs: "uniform-probs",
     )
+
+    def sample_recovered_tokens(*args, **kwargs):
+        recovered_calls.append(args)
+        return recovered
+
     monkeypatch.setattr(
-        impl,
-        "rejection_sample_deterministic_draft_torch",
-        lambda *args, **kwargs: fallback_calls.append(args),
+        impl._community, "sample_recovered_tokens", sample_recovered_tokens
+    )
+    monkeypatch.setattr(
+        impl._community, "rejection_random_sample_kernel", random_kernel
     )
 
     sampling_metadata = SimpleNamespace(
@@ -282,21 +288,34 @@ def test_rejection_sample_draft_probs_none_uses_deterministic_fallback(monkeypat
         temperature="temperature",
         generators={},
     )
+    draft_token_ids = FakeTensor(ndim=1, shape=(1,))
+    cu_num_draft_tokens = FakeTensor(ndim=1, shape=(1,))
+    target_logits = FakeTargetLogits(ndim=2, shape=(1, 4), device="corex")
+    bonus_token_ids = FakeTensor(ndim=2, shape=(1, 1))
 
     result = impl.rejection_sample(
-        FakeTensor(ndim=1, shape=(1,)),
+        draft_token_ids,
         [1],
         2,
-        FakeTensor(ndim=1, shape=(1,)),
+        cu_num_draft_tokens,
         None,
-        FakeTargetLogits(ndim=2, shape=(1, 4), device="corex"),
-        FakeTensor(ndim=2, shape=(1, 1)),
+        target_logits,
+        bonus_token_ids,
         sampling_metadata,
     )
 
     assert result is output_token_ids
-    assert len(fallback_calls) == 1
-    assert fallback_calls[0][0] is output_token_ids
+    assert len(recovered_calls) == 1
+    assert recovered_calls[0][0] == 2
+    assert recovered_calls[0][2] is cu_num_draft_tokens
+    assert len(random_kernel.calls) == 1
+    grid, args, kwargs = random_kernel.calls[0]
+    assert grid == (1,)
+    assert args[0] is output_token_ids
+    assert args[6] is recovered
+    assert args[7] == "uniform-probs"
+    assert kwargs["NO_DRAFT_PROBS"] is True
+    assert kwargs["SYNTHETIC_MODE"] is False
 
 
 def test_patch_apply_rebinds_rejection_sampler_overrides(monkeypatch):
@@ -325,17 +344,9 @@ def test_patch_apply_rebinds_rejection_sampler_overrides(monkeypatch):
     assert impl._community_rejection_sample is old_sample
     assert community.rejection_sample is impl.rejection_sample
     assert community.generate_uniform_probs is impl.generate_uniform_probs
-    assert community.rejection_greedy_sample_kernel is (
-        impl.rejection_greedy_sample_kernel
-    )
-    assert community.rejection_random_sample_kernel is (
-        impl.rejection_random_sample_kernel
-    )
+    assert community.rejection_greedy_sample_kernel is old_greedy
+    assert community.rejection_random_sample_kernel is old_random
     assert consumer.rejection_sample is impl.rejection_sample
     assert consumer.generate_uniform_probs is impl.generate_uniform_probs
-    assert (
-        consumer.rejection_greedy_sample_kernel is impl.rejection_greedy_sample_kernel
-    )
-    assert (
-        consumer.rejection_random_sample_kernel is impl.rejection_random_sample_kernel
-    )
+    assert consumer.rejection_greedy_sample_kernel is old_greedy
+    assert consumer.rejection_random_sample_kernel is old_random

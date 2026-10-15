@@ -5,13 +5,12 @@ Corresponds to: vllm/v1/sample/rejection_sampler.py
 
 Target   : vllm.v1.sample.rejection_sampler.rejection_sample
            vllm.v1.sample.rejection_sampler.generate_uniform_probs
-           vllm.v1.sample.rejection_sampler.rejection_greedy_sample_kernel
-           vllm.v1.sample.rejection_sampler.rejection_random_sample_kernel
 Baseline : v0.31.0 (db9527a468)
-Why      : preserve Iluvatar/CoreX speculative-decoding fixes without editing
-           community vLLM source.
-How      : rebind module-level functions after signature and source-signature
-           checks.
+Why      : float64 CUDA uniforms read back as zeros on CoreX and force every
+           draft token to be accepted. The greedy, random, and recovered-token
+           kernels stay on upstream.
+How      : rebind rejection_sample and generate_uniform_probs after signature
+           and source-signature checks.
 Scope    : speculative-decoding rejection sampling on Iluvatar.
 Remove   : when upstream exposes sampler hooks for these backend-specific
            behaviours or Iluvatar Triton/float64 gaps are resolved.
@@ -28,24 +27,7 @@ from vllm_iluvatar.ilu_patch import general_patch as p
 _OVERRIDES = [
     "rejection_sample",
     "generate_uniform_probs",
-    "rejection_greedy_sample_kernel",
-    "rejection_random_sample_kernel",
 ]
-
-_BASELINE_SOURCE_SHAS = {
-    "rejection_sample": (
-        "adadcc804bccf89cc3568b637d14b90480f903d0a5de417719200ad6a284c747"
-    ),
-    "generate_uniform_probs": (
-        "016fdca2217c3f2b2ce40b75d94cac8c49fbea92202180cb57a3f481654fd83f"
-    ),
-    "rejection_greedy_sample_kernel": (
-        "9cd5a8f8fe5a065937797b59a1fede6aadb711391d3288a09fc7ffa65cfc5551"
-    ),
-    "rejection_random_sample_kernel": (
-        "63a939862a8810443cdd667248e16b8aba6c33e0f921812b5b6a34cc597d2bad"
-    ),
-}
 
 
 def register() -> None:
@@ -60,6 +42,16 @@ def register() -> None:
 def _source_for_fingerprint(symbol: object) -> str:
     """Return Python source for a function or a Triton JITFunction wrapper."""
     return inspect.getsource(getattr(symbol, "fn", symbol))
+
+
+_BASELINE_SOURCE_SHAS = {
+    "rejection_sample": (
+        "adadcc804bccf89cc3568b637d14b90480f903d0a5de417719200ad6a284c747"
+    ),
+    "generate_uniform_probs": (
+        "016fdca2217c3f2b2ce40b75d94cac8c49fbea92202180cb57a3f481654fd83f"
+    ),
+}
 
 
 def _check_source_sha(symbol_name: str, symbol: object) -> None:
@@ -88,6 +80,6 @@ def _apply() -> None:
     impl._community_rejection_sample = _m.rejection_sample
     p.check_signatures(_m, impl, _OVERRIDES, strict=True)
     for name in _OVERRIDES:
-        # [ILU override] rejection sampler - delta: CoreX uniform dtype,
-        # deterministic-draft fallback, and explicit Triton predicates.
+        # [ILU override] rejection sampler - delta: float32 uniforms.
+        # Greedy, random, and recovered-token kernels stay on upstream.
         p.rebind_module_func(_m, name, getattr(impl, name))

@@ -18,7 +18,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
-from vllm.model_executor.models.interfaces import SupportsEagle3
+from vllm.model_executor.models.interfaces import EagleModelMixin, SupportsEagle3
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
     WeightsMapper,
@@ -325,8 +325,14 @@ class IluDeepseekV41DecoderLayer(nn.Module):
         return h, residual, ffn_post, ffn_comb, ffn_pre
 
 
-class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
+class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
     """V4.1 backbone: V4.1 attention, the engram layers, and the pipeline cut.
+
+    ``supports_aux_hidden_states_over_pp`` is the contract the V2 runner checks
+    before a DSpark draft. Capture stays ``idx + 1`` (the id V4.1 stores), which
+    is what ``EagleModelMixin._cache_aux_pp_layout`` counts with ``bisect_right``.
+    Aux captured on an earlier PP rank is packed into the intermediate tensors
+    and concatenated on the last rank, where the drafter runs.
 
     The constructor is V4.1's own rather than the V4 parent's, because the
     layer list is where the pipeline plan has to be applied: which layer
@@ -337,6 +343,7 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
     """
 
     decoder_layer_cls = IluDeepseekV41DecoderLayer
+    supports_aux_hidden_states_over_pp = True
 
     # Shared-expert gate_up, plus attention's wq_a/wkv (both read the same normed
     # hidden state, so they are one GEMM), plus the compressor's wkv/wgate, which
@@ -808,9 +815,10 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
         """Embed -> local layers -> leftover FFN post -> collapse or PP send.
 
         Returns ``(hidden_states, aux)`` instead of a bare tensor when a DSpark
-        draft asked for aux layers. Like V4, aux only survives if the capture
-        layers live on the last PP rank; the ilu speculative config pins draft
-        PP to 1, so that is the only configuration this is exercised in.
+        draft asked for aux layers. Aux captured on an earlier PP rank is packed
+        into the intermediate tensors and concatenated on the last rank, which
+        is where the drafter runs. PP=1 leaves the packed keys empty and returns
+        only this rank's captures.
         """
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -872,9 +880,14 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model):
                 # designated sender.
                 assert self.candidate_idxs_buffer is not None
                 tensors["candidates"] = self.candidate_idxs_buffer[:num_tokens]
+            tensors.update(self.pack_local_aux_hidden_states(aux_hidden_states))
             return IntermediateTensors(tensors)
         hidden_states = mhc.hc_pre(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)
+        aux_hidden_states = (
+            self.collect_remote_aux_hidden_states(intermediate_tensors)
+            + aux_hidden_states
+        )
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -968,7 +981,9 @@ class IluDeepseekV41ForCausalLM(IluDeepseekV4Fp8ForCausalLM, SupportsEagle3):
         return state.lookback_depth if state is not None else 0
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
-        self.model.aux_hidden_state_layers = tuple(layers)
+        # Sorts the ids and fills the PP slot cache the runner's
+        # ``reserve_aux_intermediate_tensor_slots`` reads.
+        self.model._set_aux_hidden_state_layers(layers)
 
     def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
         return default_aux_hidden_state_layers(self.config)

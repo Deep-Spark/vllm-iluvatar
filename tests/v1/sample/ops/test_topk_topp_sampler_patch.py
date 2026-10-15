@@ -85,60 +85,15 @@ def _load_impl(monkeypatch, *, is_cpu: bool = False) -> ModuleType:
     return impl
 
 
-def test_ilu_override_gpu_uses_pytorch_fallback(monkeypatch):
-    impl = _load_impl(monkeypatch, is_cpu=False)
+def test_patch_apply_rebinds_forward_native_only(monkeypatch):
+    from vllm_iluvatar.ilu_patch.general_patches import patch_topk_topp_sampler
 
-    calls = []
-
-    def triton(*args, **kwargs):
-        calls.append(("triton", args, kwargs))
-        return "triton"
-
-    def pytorch(*args, **kwargs):
-        calls.append(("pytorch", args, kwargs))
-        return "pytorch"
-
-    monkeypatch.setattr(impl, "current_platform", SimpleNamespace(is_cpu=lambda: False))
-    monkeypatch.setattr(impl._community, "HAS_TRITON", True)
-    monkeypatch.setattr(impl._community, "apply_top_k_top_p_triton", triton)
-    monkeypatch.setattr(impl._community, "apply_top_k_top_p_pytorch", pytorch)
-
-    logits = SimpleNamespace(shape=(8, 1024))
-
-    assert impl.apply_top_k_top_p(logits, "k", "p") == "pytorch"
-    assert calls == [("pytorch", (logits, "k", "p"), {})]
-
-
-def test_ilu_override_preserves_cpu_triton_path(monkeypatch):
-    impl = _load_impl(monkeypatch, is_cpu=True)
-
-    calls = []
-
-    def triton(*args, **kwargs):
-        calls.append(("triton", args, kwargs))
-        return "triton"
-
-    def pytorch(*args, **kwargs):
-        calls.append(("pytorch", args, kwargs))
-        return "pytorch"
-
-    monkeypatch.setattr(impl, "current_platform", SimpleNamespace(is_cpu=lambda: True))
-    monkeypatch.setattr(impl._community, "HAS_TRITON", True)
-    monkeypatch.setattr(impl._community, "apply_top_k_top_p_triton", triton)
-    monkeypatch.setattr(impl._community, "apply_top_k_top_p_pytorch", pytorch)
-
-    logits = SimpleNamespace(shape=(8, 1024))
-
-    assert impl.apply_top_k_top_p(logits, "k", "p") == "triton"
-    assert calls == [("triton", (logits, "k", "p"), {})]
-
-
-def test_patch_apply_rebinds_community_function(monkeypatch):
     impl = _load_impl(monkeypatch, is_cpu=False)
     community = sys.modules["vllm.v1.sample.ops.topk_topp_sampler"]
-    from vllm_iluvatar.ilu_patch.general_patches import patch_topk_topp_sampler
+    upstream_apply = community.apply_top_k_top_p
 
     patch_topk_topp_sampler._apply()
 
-    assert community.apply_top_k_top_p is impl.apply_top_k_top_p
+    assert community.apply_top_k_top_p is upstream_apply
+    assert not hasattr(impl, "apply_top_k_top_p")
     assert community.TopKTopPSampler.forward_native is impl.forward_native

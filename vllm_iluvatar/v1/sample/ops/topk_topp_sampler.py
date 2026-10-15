@@ -1,37 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Iluvatar top-k/top-p sampler override.
+"""Iluvatar GLM sampling override.
 
 Why:
-    The upstream Triton top-k/top-p fast path is unstable on the current
-    Iluvatar sampling stack for larger batches. Keep the CPU behavior unchanged
-    but force the default CUDA path to use the PyTorch implementation.
-    VLLM_ILU_GLM_SAMPLING_MODE optionally selects native CQ sorted/radix sampling;
-    unsupported contracts retain the original sampler.
+    VLLM_ILU_GLM_SAMPLING_MODE optionally selects native CQ sorted/radix
+    sampling on ivcore30. apply_top_k_top_p stays on upstream, so the
+    community dispatch (Triton at eight rows or more, the PyTorch sort
+    below that) is unchanged. Unsupported contracts retain the original
+    sampler.
 Remove:
-    When the Triton sampler path is validated on Iluvatar for the affected
-    workloads.
+    When upstream provides this GLM sampling path.
 """
 
 from __future__ import annotations
 
 import torch
-from vllm.platforms import current_platform
+
 from vllm.v1.sample.ops import topk_topp_sampler as _community
-
-
-# [ILU override] apply_top_k_top_p - delta: disable the Triton GPU fast path.
-def apply_top_k_top_p(
-    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
-) -> torch.Tensor:
-    if p is None and k is None:
-        return logits
-
-    if current_platform.is_cpu():
-        if _community.HAS_TRITON:
-            return _community.apply_top_k_top_p_triton(logits, k, p)
-        return _community.apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
-
-    return _community.apply_top_k_top_p_pytorch(logits, k, p)
 
 
 # Keep the original method for unsupported contracts and the disabled mode.

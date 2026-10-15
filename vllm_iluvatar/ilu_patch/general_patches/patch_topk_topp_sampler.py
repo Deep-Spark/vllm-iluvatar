@@ -1,32 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Wiring for top-k/top-p sampler ILU override.
+"""Wiring for the GLM sampling override.
 
 Corresponds to: vllm/v1/sample/ops/topk_topp_sampler.py
 
-Target   : apply_top_k_top_p and TopKTopPSampler.forward_native
+Target   : TopKTopPSampler.forward_native
 Baseline : v0.31.0 (db9527a468)
-Why      : Iluvatar should avoid the upstream Triton top-k/top-p sampler path
-           on GPU while keeping upstream CPU behavior intact. The mode switch optionally
-           fuses top-p/sampling through native ixformer kernels.
-How      : rebind the module-level function so already-imported references are
-           updated as well.
-Scope    : Iluvatar GPU sampling; CPU behavior is preserved.
-Remove   : when upstream Triton sampler is stable on Iluvatar.
+Why      : VLLM_ILU_GLM_SAMPLING_MODE selects native CQ sorted/radix sampling.
+           apply_top_k_top_p is left on upstream.
+How      : rebind TopKTopPSampler.forward_native only. The fallback calls the
+           original method, which uses upstream apply_top_k_top_p.
+Scope    : ivcore30 GLM sampling when the contract matches.
+Remove   : when upstream provides this GLM sampling path.
 """
 
 from __future__ import annotations
 
 from vllm_iluvatar.ilu_patch import general_patch as p
 
-_OVERRIDES = ["apply_top_k_top_p"]
-
 
 def register() -> None:
-    """Register the top-k/top-p sampler override."""
+    """Register the GLM sampling override."""
     p.register_once(
         __name__,
         _apply,
-        detail="top-k/top-p sampler PyTorch fallback on Iluvatar GPU",
+        detail="GLM CQ sampling on TopKTopPSampler.forward_native",
     )
 
 
@@ -35,8 +32,5 @@ def _apply() -> None:
 
     import vllm_iluvatar.v1.sample.ops.topk_topp_sampler as impl
 
-    p.check_signatures(_m, impl, _OVERRIDES, strict=True)
     p.check_signatures(_m.TopKTopPSampler, impl, ["forward_native"], strict=True)
     _m.TopKTopPSampler.forward_native = impl.forward_native
-    for name in _OVERRIDES:
-        p.rebind_module_func(_m, name, getattr(impl, name))

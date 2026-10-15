@@ -79,8 +79,6 @@ def test_fallback_preserves_upstream_contract(monkeypatch, reason):
 
 @pytest.mark.parametrize("mode", ["sorted", "radix"])
 def test_broadcast_top_p_uses_upstream(monkeypatch, mode):
-    # Mirror register_general: the fallback uses the plugin PyTorch mask.
-    monkeypatch.setattr(upstream, "apply_top_k_top_p", impl.apply_top_k_top_p)
     monkeypatch.setattr(opt, "VLLM_ILU_GLM_SAMPLING_MODE", mode)
     logits = torch.randn(3, 257, device="cuda")
     p = torch.tensor([0.9], device="cuda")

@@ -203,7 +203,7 @@ def _insert_context_kv(
     positions: torch.Tensor,
     slot_mapping: torch.Tensor,
 ) -> None:
-    """Insert precomputed context KV into one FP8 draft layer's SWA cache."""
+    """Insert precomputed context KV into one draft layer's SWA cache."""
     swa_kv_cache = attn.swa_cache_layer.kv_cache
     dummy_q = attn._attn_out[: kv.shape[0]]
     dummy_q.zero_()
@@ -229,9 +229,14 @@ def _insert_context_kv(
             backend="ixformer_native",
         )
         return
-    raise ValueError(
-        "V4.1 DSpark requires fp8_ds_mla or fp8_e4m3 KV cache; "
-        f"got {attn.kv_cache_dtype}"
+    # Plain bf16 window cache, same op the target attention uses.
+    ixfops.dsv41_qkv_rope_insert(
+        dummy_q,
+        swa_kv_cache,
+        kv,
+        slot_mapping,
+        positions,
+        attn.cos_sin,
     )
 
 

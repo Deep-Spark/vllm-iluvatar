@@ -1934,6 +1934,7 @@ class IluNixlWorkerMixin:
                     try:
                         self._remote_agents[eid] = f.result()
                         self._engine_last_active[eid] = time.perf_counter()
+                        self._track_remote_engine_replacement(eid, host, port)
                     except Exception as e:
                         self._log_failure(
                             failure_type="handshake_setup_failed",

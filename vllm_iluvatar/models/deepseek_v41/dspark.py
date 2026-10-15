@@ -11,12 +11,14 @@ from typing import cast
 import ixformer.inference.functions as ixfshared
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from ixformer.inference.functions import deepseekv41 as ixfops  # type: ignore[import]
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -36,7 +38,29 @@ from . import mhc
 from .model import IluDeepseekV41DecoderLayer
 
 
-def remap_dspark_name(name: str) -> str | None:
+def _local_vocab_weight(
+    weight: torch.Tensor, vocab_start: int, local_vocab_size: int
+) -> torch.Tensor:
+    """Return this TP rank's rows from a local or replicated vocab weight."""
+    if weight.shape[0] == local_vocab_size:
+        return weight
+    vocab_end = vocab_start + local_vocab_size
+    if vocab_start < 0 or vocab_end > weight.shape[0]:
+        raise ValueError(
+            "Cannot select local vocabulary rows "
+            f"[{vocab_start}:{vocab_end}] from weight shape {tuple(weight.shape)}."
+        )
+    return weight.narrow(0, vocab_start, local_vocab_size)
+
+
+def remap_dspark_name(name: str, load_own_embed: bool = False) -> str | None:
+    """Map a checkpoint name onto this draft.
+
+    Under pipeline parallelism the drafting rank has no target embedding, so
+    ``load_own_embed=True`` claims the checkpoint's top-level ``embed.weight``.
+    """
+    if load_own_embed and name == "embed.weight":
+        return "model.embed_tokens.weight"
     match = re.fullmatch(r"mtp\.([0-2])\.(.+)", name)
     if match is None:
         return None
@@ -253,6 +277,12 @@ class IluDSparkV41DraftModel(nn.Module):
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
         self.quant_config = vllm_config.quant_config
+        # The drafter is built with pipeline_parallel_size=1, but it only runs
+        # on the last PP rank. That rank's target embedding is a PPMissingLayer,
+        # so the draft has to keep the checkpoint embedding instead of aliasing.
+        self.load_own_embed_tokens = get_pp_group().world_size > 1
+        if self.load_own_embed_tokens:
+            self.has_own_embed_tokens = True
         # Block-FP8 shared experts round the intermediate axis up to a whole
         # number of TP shards, same as fp8_model / fp8_mtp.
         self.pad_shared_expert = (
@@ -299,6 +329,30 @@ class IluDSparkV41DraftModel(nn.Module):
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.compute_logits(hidden_states)
 
+    def _compute_local_logits(
+        self, lm_head: ParallelLMHead, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        logits = self.logits_processor._apply_head(lm_head, hidden_states, None)
+        if self.logits_processor.soft_cap is not None:
+            soft_cap = self.logits_processor.soft_cap
+            logits = torch.tanh(logits / soft_cap) * soft_cap
+        if self.logits_processor.scale != 1.0:
+            logits = logits * self.logits_processor.scale
+        return logits
+
+    def compute_draft_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.model.norm(hidden_states)
+        return self._compute_local_logits(self.lm_head, hidden_states)
+
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.logits_processor.get_top_tokens(
+            self.lm_head, self.model.norm(hidden_states)
+        )
+
+    def get_draft_vocab_shard(self) -> tuple[int, int]:
+        indices = self.lm_head.shard_indices
+        return indices.org_vocab_start_index, indices.num_org_vocab_padding
+
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids
 
@@ -308,8 +362,48 @@ class IluDSparkV41DraftModel(nn.Module):
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
 
+    def markov_bias_local(self, markov_embed: torch.Tensor) -> torch.Tensor:
+        markov_w2 = self.model.markov_head.markov_w2
+        indices = self.lm_head.shard_indices
+        local_vocab_size = self.lm_head.num_embeddings_per_partition
+
+        if markov_w2.weight.shape[0] == local_vocab_size:
+            return self._compute_local_logits(markov_w2, markov_embed)
+
+        weight = _local_vocab_weight(
+            markov_w2.weight,
+            indices.org_vocab_start_index,
+            local_vocab_size,
+        )
+        head_dtype = self.logits_processor.head_dtype
+        if head_dtype is None or head_dtype == markov_embed.dtype:
+            logits = F.linear(markov_embed, weight)
+        elif (
+            head_dtype == torch.float32
+            and (current_platform.is_cuda() or current_platform.is_rocm())
+            and markov_embed.is_cuda
+        ):
+            flat = markov_embed.reshape(-1, markov_embed.shape[-1])
+            logits = ixfshared.gemm_bf16_bf16_fp32(flat, weight, format="TN")
+            logits = logits.reshape(*markov_embed.shape[:-1], -1)
+        else:
+            logits = F.linear(
+                markov_embed.to(head_dtype),
+                weight.to(head_dtype),
+            )
+        if self.logits_processor.soft_cap is not None:
+            soft_cap = self.logits_processor.soft_cap
+            logits = torch.tanh(logits / soft_cap) * soft_cap
+        if self.logits_processor.scale != 1.0:
+            logits = logits * self.logits_processor.scale
+        return logits
+
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.attn.swa_cache_layer.prefix for layer in self.model.layers]
+
+    def get_draft_attn_causal(self) -> list[bool]:
+        """DSpark query block is non-causal SWA on every draft layer."""
+        return [False] * len(self.model.layers)
 
     def _pad_shared_expert_weight(
         self, name: str, loaded_weight: torch.Tensor
@@ -360,7 +454,9 @@ class IluDSparkV41DraftModel(nn.Module):
         )
 
         for name, loaded_weight in weights:
-            mapped = remap_dspark_name(name)
+            mapped = remap_dspark_name(
+                name, load_own_embed=self.load_own_embed_tokens
+            )
             if mapped is None:
                 continue
             name = mapped
@@ -434,10 +530,18 @@ class IluDSparkV41DraftModel(nn.Module):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
+        # embed_tokens / lm_head are normally aliased from the target. Under PP
+        # the draft owns its embedding, and a silently unloaded one produces
+        # garbage drafts, so it must be covered by this check.
+        aliased_prefixes = (
+            ("lm_head",)
+            if self.load_own_embed_tokens
+            else ("model.embed_tokens", "lm_head")
+        )
         expected = {
             name
             for name, _ in self.named_parameters()
-            if not name.startswith(("model.embed_tokens", "lm_head"))
+            if not name.startswith(aliased_prefixes)
         }
         missing = expected - loaded_params
         if missing:

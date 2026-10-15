@@ -56,6 +56,29 @@ logger = init_logger(f"vllm.{__name__}")
 # Engram tables are loaded from mmap, not the vLLM weight iterator.
 _ENGRAM_SKIP = re.compile(r"(^|\.)engram\.")
 
+# ``kDeadId`` in csrc/plugin/engram_ops.cu, ``DEAD_ID`` in community
+# ``deepseek_v41/common/engram.py``: the token-cache value that stops an
+# n-gram. Only reachable through ``token_map``, which is int64.
+_ENGRAM_DEAD_ID = -1
+
+
+def _image_dead_token_id(hf_config) -> int | None:
+    """The token id whose positions are dead for n-gram hashing, if any.
+
+    Vision checkpoints fill every image-span position with ``image_token_id``
+    (community ``deepseek_v41/common/mm_preprocess.py``), and those positions
+    must not enter an n-gram. Text-only checkpoints have no such id.
+    """
+    if not getattr(hf_config, "vision_n_layers", 0):
+        return None
+    image_token_id = getattr(hf_config, "image_token_id", None)
+    if image_token_id is None:
+        raise ValueError(
+            "config declares a vision tower but no image_token_id; engram "
+            "hashing needs it to recognize image-span positions"
+        )
+    return int(image_token_id)
+
 
 def default_aux_hidden_state_layers(hf_config) -> tuple[int, ...]:
     """Aux capture layers for a V4.1 DSpark draft."""
@@ -159,7 +182,9 @@ class IluDeepseekV41DecoderLayer(IluDeepseekV4Fp8DecoderLayer):
             residual, sqrsum = mhc.hc_post_sqrsum(x, residual, post_mix, res_mix)
 
         if self.engram is not None and self.engram._rows is not None:
-            residual = self.engram(residual, self.engram._hash_ids)
+            residual = self.engram(
+                residual, self.engram._hash_ids, self.engram._token_mask
+            )
             sqrsum = None
 
         attn_post, attn_comb, h, attn_pre = self._hc_pre_mixes(
@@ -273,6 +298,7 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         self.engram_layer_ids = list(getattr(config, "engram_layer_ids", ()) or ())
         self.engram_layout: EngramLayout | None = None
         self.engram_hash: NgramHashState | None = None
+        self.image_dead_token_id = _image_dead_token_id(config)
         if self.engram_layer_ids:
             model_config = vllm_config.model_config
             self.model_path = model_config.model
@@ -514,6 +540,14 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 f"declares {expected}; every hash multiplier derives from this "
                 "number, so the tables would be rehashed incorrectly"
             )
+        # Image-span positions take no part in an n-gram. Mapping the image
+        # token to the hash kernels' dead id is what implements that: the
+        # kernels stop at a dead source and fill the rest of the n-gram with
+        # the pad id, and the cache write stores the dead id, so a position
+        # read back from a page behaves the same. Done after the vocab check,
+        # which counts the map built from the tokenizer.
+        if self.image_dead_token_id is not None:
+            token_map[self.image_dead_token_id] = _ENGRAM_DEAD_ID
 
         layout = EngramLayout.from_config(config)
         assert layout is not None
@@ -682,8 +716,17 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 md.token_to_req_indices,
                 _num_reqs(md),
             )
+            # An image-span position still produces a hash -- the n-gram is
+            # blocked, so it is the all-pad one -- and that row would otherwise
+            # be added to its residual. Community zeroes it with the same mask
+            # (True = keep).
+            keep = (
+                None
+                if self.image_dead_token_id is None
+                else input_ids[:n] != self.image_dead_token_id
+            )
             for engram in self._engram_layers():
-                engram.prepare_embeddings(hashes[:, engram.layer_hash_index])
+                engram.prepare_embeddings(hashes[:, engram.layer_hash_index], keep)
             return
         if engram_dp_group() is None or self.engram_layout is None:
             return
@@ -811,8 +854,10 @@ class IluDeepseekV41ForCausalLM(IluDeepseekV4Fp8ForCausalLM, SupportsEagle3):
     model_cls = IluDeepseekV41Model
     hf_to_vllm_mapper = _make_v41_weights_mapper()
 
-    # Text-only: skip DSpark draft, vision tower, and image-token gate bias.
-    _LOAD_SKIP_SUBSTRS = ("mtp.", "vision.", "aligner.", "image_", ".bias_vl")
+    # ``_LOAD_SKIP_SUBSTRS`` stays at the parent's ``("mtp.",)``: the tower
+    # (``vision.`` / ``aligner.`` / ``image_*``) never reaches this class --
+    # ``vl_model.IluDeepseekV41VLForCausalLM`` keeps those weights for itself --
+    # and ``.ffn.gate.bias_vl`` is a real parameter on vision checkpoints.
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Drop ``engram.*`` from the iterator; tables load from mmap afterwards."""
@@ -841,9 +886,16 @@ class IluDeepseekV41ForCausalLM(IluDeepseekV4Fp8ForCausalLM, SupportsEagle3):
             "hidden states instead of the pre-hc_head residual"
         )
 
+    # The runner hands ``input_ids`` to the model even when it also builds
+    # ``inputs_embeds``: both the MoE image routing and the engram hashing read
+    # raw ids. (The VL wrapper declares the same, which is what makes the
+    # runner keep them on the first rank; ``IluDeepseekV41ModelState`` is what
+    # gets them to the later PP ranks.)
+    requires_raw_input_tokens = True
+
     @staticmethod
     def get_model_state_cls():
-        """Community V4.1 state, for SWA bounded replay.
+        """Iluvatar V4.1 state, for SWA bounded replay and PP raw token ids.
 
         ``CacheConfig.swa_bounded_replay`` keeps the sliding-window KV out of
         prefix caching and rebuilds it after a prefix hit by recomputing the
@@ -853,12 +905,15 @@ class IluDeepseekV41ForCausalLM(IluDeepseekV4Fp8ForCausalLM, SupportsEagle3):
         is left alone, and hands the starts to the sliding-window metadata
         builder (``IluDeepseekSparseSWAMetadataBuilder`` subclasses the
         community one, which is what the state dispatches on).
+
+        The Iluvatar subclass additionally hands the raw token ids to the PP
+        ranks past the first; see its module docstring.
         """
-        from vllm.models.deepseek_v41.nvidia.model_state import (
-            DeepseekV41ModelState,
+        from vllm_iluvatar.models.deepseek_v41.model_state import (
+            IluDeepseekV41ModelState,
         )
 
-        return DeepseekV41ModelState
+        return IluDeepseekV41ModelState
 
     @property
     def token_lookback_depth(self) -> int:
@@ -869,14 +924,17 @@ class IluDeepseekV41ForCausalLM(IluDeepseekV4Fp8ForCausalLM, SupportsEagle3):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
+        raw_input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        # ``input_ids`` is None on every PP rank past the first; the ids still
+        # arrive as ``raw_input_ids`` (see ``IluDeepseekV41ModelState``).
         return self.model(
-            input_ids,
+            input_ids if input_ids is not None else raw_input_ids,
             positions,
             intermediate_tensors,
             inputs_embeds,
@@ -892,18 +950,10 @@ class IluDeepseekV41ForCausalLM(IluDeepseekV4Fp8ForCausalLM, SupportsEagle3):
         return default_aux_hidden_state_layers(self.config)
 
 
-def register_model() -> None:
-    from vllm import ModelRegistry
-
-    # Two names, one class. ``DeepseekV41ForCausalLM`` is what the released
-    # raw-FP8 checkpoint declares; the Iluvatar-quantized conversions declare
-    # ``IluDeepseekV41ForCausalLM``, following the V4 convention where the
-    # ``Ilu`` prefix marks a checkpoint quantized for this platform. The two
-    # differ only in ``quantization_config`` -- compressed-tensors
-    # ``iluvatar-mixed`` versus raw FP8 -- which already selects the quant
-    # method per layer, and in module names they agree.
-    for arch in ("DeepseekV41ForCausalLM", "IluDeepseekV41ForCausalLM"):
-        ModelRegistry.register_model(
-            arch,
-            "vllm_iluvatar.models.deepseek_v41.model:IluDeepseekV41ForCausalLM",
-        )
+# No ``register_model`` hook here. Both released arch names --
+# ``DeepseekV41ForCausalLM`` (raw-FP8 release) and ``IluDeepseekV41ForCausalLM``
+# (Iluvatar-quantized conversions; they differ only in ``quantization_config``,
+# which already selects the quant method per layer) -- are registered by
+# ``vl_model.py``, which wraps this class as its ``language_model``. A
+# text-only checkpoint reaches this class through that wrapper with the tower
+# stubbed out.

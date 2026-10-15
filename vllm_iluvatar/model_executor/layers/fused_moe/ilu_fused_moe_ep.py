@@ -44,7 +44,6 @@ from vllm.logger import init_logger
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_moe_padding import (
     _gathered_router_padding,
 )
-
 from vllm_iluvatar.model_executor.layers.fused_moe.prepare_finalize.ilu_deepep_ll import (
     VLLM_ILU_DEEPEP_USE_SCATTER,
     VLLM_ILU_LL_FUSED_AG_AR,
@@ -143,7 +142,8 @@ class IluFusedMoEEP:
                 )
 
             quant_method.process_weights_after_loading = MethodType(
-                process_weights_and_nvsm, quant_method,
+                process_weights_and_nvsm,
+                quant_method,
             )
             runner._ilu_nvsm_init_patched = True
 
@@ -471,11 +471,7 @@ class IluFusedMoEEP:
         )
 
         with sequence_parallel_ctx:
-            router_input_ids = (
-                input_ids
-                if getattr(runner.router, "_hash_indices_table", None) is not None
-                else None
-            )
+            router_input_ids = input_ids if runner._ilu_router_reads_input_ids else None
             topk_indices_dtype = moe_kernel.prepare_finalize.topk_indices_dtype()
             topk_weights, topk_ids = runner.router.select_experts(
                 hidden_states=hidden_states,
@@ -564,11 +560,7 @@ class IluFusedMoEEP:
             )
             assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]
 
-            router_input_ids = (
-                input_ids
-                if getattr(runner.router, "_hash_indices_table", None) is not None
-                else None
-            )
+            router_input_ids = input_ids if runner._ilu_router_reads_input_ids else None
             tensors_to_gather = [hidden_states]
             if router_input_ids is not None:
                 tensors_to_gather.append(router_input_ids)

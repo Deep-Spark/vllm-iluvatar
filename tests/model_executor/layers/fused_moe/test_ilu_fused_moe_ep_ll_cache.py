@@ -54,13 +54,16 @@ def test_prefill_routes_use_gathered_padding_and_restore_local_mask(monkeypatch)
     ep.experts = SimpleNamespace(
         moe_config=SimpleNamespace(pcp_size=1, sp_size=1, is_sequence_parallel=False),
         _quant_method=SimpleNamespace(
-            skip_forward_padding=True, topk_indices_dtype=torch.int32,
+            skip_forward_padding=True,
+            topk_indices_dtype=torch.int32,
         ),
         shared_experts=None,
         routed_experts=SimpleNamespace(_ensure_moe_quant_config_init=lambda: None),
         apply_routed_input_transform=lambda value: (value, None),
         gate=lambda value: (value, None),
         router=SimpleNamespace(select_experts=select_experts),
+        # Text-only routing: the ids stay off the wire.
+        _ilu_router_reads_input_ids=False,
     )
     for _ in range(2):
         with pytest.raises(RoutingChecked):

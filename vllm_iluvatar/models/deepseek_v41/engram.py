@@ -770,6 +770,7 @@ class IluEngram(nn.Module):
         layer_index = list(config.engram_layer_ids).index(layer_id)
         self.layer_hash_index = layer_index
         self._rows: torch.Tensor | None = None
+        self._token_mask: torch.Tensor | None = None
         self.embed = EngramEmbedding(
             config.engram_num_embeddings[layer_index], self.head_dim
         )
@@ -946,9 +947,16 @@ class IluEngram(nn.Module):
     ) -> torch.Tensor:
         return self.embed(self.hash_from_metadata(history, input_ids, positions, md))
 
-    def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
-        """Look up this layer's rows before the decoder loop, as official does."""
+    def prepare_embeddings(
+        self, hash_ids: torch.Tensor, token_mask: torch.Tensor | None = None
+    ) -> None:
+        """Look up this layer's rows before the decoder loop, as official does.
+
+        ``token_mask`` (True = keep) rides along to the decoder layer, which
+        hands it back to :meth:`forward`; image-span rows are zeroed there.
+        """
         self._hash_ids = hash_ids
+        self._token_mask = token_mask
         self._rows = self.embed(hash_ids)
 
     def apply(self, hidden_states: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
@@ -958,10 +966,12 @@ class IluEngram(nn.Module):
         # is in play.
         if self.wkv_scale is None:
             x = rows.flatten(-2)
-            if (os.getenv("VLLM_ILU_ENGRAM_LINEAR", "0") == "1"
-                    and 0 < x.shape[0] <= 32
-                    and x.dtype == torch.bfloat16
-                    and self.wkv_weight.dtype == torch.bfloat16):
+            if (
+                os.getenv("VLLM_ILU_ENGRAM_LINEAR", "0") == "1"
+                and 0 < x.shape[0] <= 32
+                and x.dtype == torch.bfloat16
+                and self.wkv_weight.dtype == torch.bfloat16
+            ):
                 kv = ixfops.linear(x, self.wkv_weight, backend="ixinfer")
             else:
                 kv = torch.matmul(x, self.wkv_weight.t())
@@ -987,6 +997,11 @@ class IluEngram(nn.Module):
         rows = self._rows if self._rows is not None else self.embed(hash_ids)
         self._rows = None
         if token_mask is not None:
+            # Community zeroes the gate inside its post-wkv kernel; the
+            # ixformer gate takes no mask, so zero the table rows instead.
+            # ``wkv`` has no bias, so those rows give kv == 0, and the gate
+            # adds ``gate * value`` with ``value == 0`` -- the position passes
+            # through untouched, same as community.
             rows = rows.masked_fill(~token_mask.view(-1, 1, 1), 0)
         return self.apply(hidden_states, rows)
 
@@ -1141,6 +1156,14 @@ class NgramHashState(nn.Module):
         token_to_req: torch.Tensor,
         num_reqs: int,
     ) -> torch.Tensor:
+        # The dead masks are community's way of telling the hash kernels which
+        # positions take no part in an n-gram (the image spans). Here that is
+        # routed through ``token_map`` instead: the image token maps to the
+        # kernels' dead id, so ``engram_write_hash_cache`` stores it in the
+        # token cache and ``engram_ngram_hash`` blocks every n-gram reaching
+        # one, whether the position comes from this batch, the lookback window
+        # or a page written by an earlier step. The masks are therefore
+        # redundant, and the signature keeps them only to match community's.
         del dead_mask, lookback_dead_mask
         assert self._cache is not None and slot_mapping is not None
         assert block_table is not None

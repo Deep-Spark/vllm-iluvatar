@@ -149,8 +149,6 @@ def remap_dspark_name(
     stage = int(m.group(1))
     rest = m.group(2)
 
-    if rest.endswith(".bias_vl"):
-        return None
     if rest.startswith("confidence_head.") and not load_confidence_head:
         return None
 

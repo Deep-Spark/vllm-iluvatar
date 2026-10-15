@@ -71,9 +71,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
-from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
-    IluFusedMoEEP, _DS4_DECODE_EP_BACKEND,
-)
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
@@ -106,6 +103,10 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 
+from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
+    _DS4_DECODE_EP_BACKEND,
+    IluFusedMoEEP,
+)
 from vllm_iluvatar.models.deepseek_v4 import fp8_load_stats
 from vllm_iluvatar.models.deepseek_v4.fp8_attention import (
     IluDeepseekV4Fp8Attention,
@@ -343,11 +344,27 @@ class IluDeepseekV4Fp8MoE(nn.Module, IluFusedMoEEP):
             out_dtype=torch.float32,
             prefix=f"{prefix}.gate",
         )
-        # Both attributes always exist; exactly one of them is a Parameter. The
-        # None-initialisation matters because FusedMoE / the forward read them
-        # unconditionally.
+        # All three attributes always exist; the forward and FusedMoE read them
+        # unconditionally. ``tid2eid`` and ``e_score_correction_bias`` are
+        # mutually exclusive; ``bias_vl`` rides along on vision checkpoints.
         self.gate.e_score_correction_bias = None
         self.gate.tid2eid = None
+        self.gate.bias_vl = None
+        # Image tokens borrow five consecutive reserved in-vocab ids starting
+        # at the config's ``image_token_id``; 0 disables the vision routing
+        # path (community nvidia/model.py:861-865). Also 0 when this
+        # deployment cannot receive an image at all -- the same condition that
+        # stubs the tower out -- so those runs keep the kernel router. A
+        # config without ``multimodal_config`` (the DSpark draft's) counts as
+        # "unknown", i.e. enabled.
+        self.has_bias_vl = bool(getattr(config, "vision_n_layers", 0))
+        mm_config = vllm_config.model_config.multimodal_config
+        no_images = (
+            mm_config is not None and mm_config.get_limit_per_prompt("image") == 0
+        )
+        self.image_sentinel_lo = (
+            int(config.image_token_id) if self.has_bias_vl and not no_images else 0
+        )
 
         self.layer_id = extract_layer_index(prefix)
         # V4.1 has no hash-routed layers and its config omits the field, so
@@ -371,6 +388,15 @@ class IluDeepseekV4Fp8MoE(nn.Module, IluFusedMoEEP):
             )
         elif getattr(config, "topk_method", None) == "noaux_tc":
             self.gate.e_score_correction_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
+        if self.has_bias_vl:
+            # Vision checkpoints ship one of these per MoE layer. Created even
+            # when the deployment serves text only, so the checkpoint is still
+            # fully consumed; ``image_sentinel_lo == 0`` is what keeps it out
+            # of the routing path then.
+            self.gate.bias_vl = nn.Parameter(
                 torch.empty(config.n_routed_experts, dtype=torch.float32),
                 requires_grad=False,
             )
@@ -433,6 +459,8 @@ class IluDeepseekV4Fp8MoE(nn.Module, IluFusedMoEEP):
             routed_scaling_factor=self.routed_scaling_factor,
             e_score_correction_bias=self.gate.e_score_correction_bias,
             hash_indices_table=self.gate.tid2eid,
+            bias_vl=self.gate.bias_vl if self.image_sentinel_lo else None,
+            image_sentinel_lo=self.image_sentinel_lo,
             swiglu_limit=self.swiglu_limit,
             router_logits_dtype=torch.float32,
             enable_eplb=parallel_config.enable_eplb,
@@ -468,6 +496,8 @@ class IluDeepseekV4Fp8MoE(nn.Module, IluFusedMoEEP):
             if input_ids is None:
                 raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
             input_ids = input_ids.to(dtype=self.hash_indices_dtype)
+        elif self.image_sentinel_lo and input_ids is None:
+            raise ValueError("DeepSeek V4 image-token MoE routing requires input_ids.")
 
         if self._ilu_decode_ll and self._is_all_ranks_decode_only():
             return self.forward_dp_ep_deep_ep(hidden_states, input_ids)

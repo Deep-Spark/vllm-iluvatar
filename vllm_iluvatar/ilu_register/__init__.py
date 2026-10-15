@@ -47,6 +47,10 @@ logger = logging.getLogger(__name__)
 # Op packages register via import-time decorators (no hook).
 _OOT_OP_PACKAGES = [
     "vllm_iluvatar.model_executor.layers",
+    # Holds the MMEncoderAttention override (the ViT attention of the
+    # DeepSeek-V4.1 vision tower); its siblings there are plain helper modules
+    # that import-time registration ignores.
+    "vllm_iluvatar.model_executor.layers.attention",
     "vllm_iluvatar.model_executor.layers.fused_moe",
     "vllm_iluvatar.model_executor.layers.fused_moe.router",
     "vllm_iluvatar.model_executor.layers.rotary_embedding",

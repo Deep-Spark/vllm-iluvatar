@@ -48,7 +48,12 @@ def test_prepare_engram_receives_original_history(monkeypatch):
     hasher.ensure_cache.return_value = True
     hasher.lookback_depth = 3
     engram = SimpleNamespace(layer_hash_index=0, prepare_embeddings=MagicMock())
-    instance = SimpleNamespace(engram_hash=hasher, _engram_layers=lambda: [engram])
+    instance = SimpleNamespace(
+        engram_hash=hasher,
+        _engram_layers=lambda: [engram],
+        # Text-only checkpoint: no image span to mask out.
+        image_dead_token_id=None,
+    )
     history = torch.tensor([[11, 13, 17]], dtype=torch.int32)
     model.IluDeepseekV41Model._prepare_engram(
         instance, torch.tensor([19, 23]), torch.tensor([3, 4]), history
@@ -68,4 +73,6 @@ def test_model_requests_the_engram_lookback_depth(layers, expected):
     instance = SimpleNamespace(
         config=SimpleNamespace(engram_layer_ids=layers, engram_max_ngram_size=4)
     )
-    assert model.IluDeepseekV41ForCausalLM.token_lookback_depth.fget(instance) == expected
+    assert (
+        model.IluDeepseekV41ForCausalLM.token_lookback_depth.fget(instance) == expected
+    )

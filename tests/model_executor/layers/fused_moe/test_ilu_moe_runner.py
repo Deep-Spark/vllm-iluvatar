@@ -126,11 +126,38 @@ def test_fused_ep_prefill_routes_with_global_padding(monkeypatch):
     monkeypatch.setattr(runner, "_apply_quant_method", apply)
     for _ in range(2):
         _, output = runner._forward_impl_fused_ep_combine(
-            torch.ones(2, 2), torch.ones(2, 2), None, None,
+            torch.ones(2, 2),
+            torch.ones(2, 2),
+            None,
+            None,
         )
         assert output.shape == (5, 2)
         assert ctx.is_padding is local_mask
     assert len(mask_gathers) == 1
+
+
+@pytest.mark.parametrize(
+    "router_attrs,expected",
+    [
+        pytest.param({}, False, id="text-only"),
+        pytest.param(
+            {"_hash_indices_table": torch.zeros(4, dtype=torch.int32)},
+            True,
+            id="hash",
+        ),
+        pytest.param({"bias_vl": torch.zeros(8)}, True, id="bias_vl"),
+    ],
+)
+def test_router_reads_input_ids_covers_hash_and_bias_vl(router_attrs, expected):
+    """The DP/EP paths keep input_ids off the wire unless the router reads them.
+
+    ``bias_vl`` is the second reader: a vision checkpoint routes image rows by
+    it, so a predicate that only looked for the hash table left those routers
+    without ids.
+    """
+    runner = _make_stub_runner()
+    runner.router = SimpleNamespace(**router_attrs)
+    assert runner._ilu_router_reads_input_ids is expected
 
 
 class TestInheritance:
@@ -172,10 +199,13 @@ class TestFP16ScalingFactor:
 
         vllm_config = MagicMock()
         vllm_config.parallel_config.enable_elastic_ep = False
-        with patch.object(MoERunner, "__init__", fake_super_init), patch(
-            "vllm_iluvatar.model_executor.layers.fused_moe.runner"
-            ".ilu_moe_runner.get_current_vllm_config",
-            return_value=vllm_config,
+        with (
+            patch.object(MoERunner, "__init__", fake_super_init),
+            patch(
+                "vllm_iluvatar.model_executor.layers.fused_moe.runner"
+                ".ilu_moe_runner.get_current_vllm_config",
+                return_value=vllm_config,
+            ),
         ):
             runner = IluMoERunner(routed_scaling_factor=4.0)
 
@@ -198,10 +228,13 @@ class TestFP16ScalingFactor:
 
         vllm_config = MagicMock()
         vllm_config.parallel_config.enable_elastic_ep = False
-        with patch.object(MoERunner, "__init__", fake_super_init), patch(
-            "vllm_iluvatar.model_executor.layers.fused_moe.runner"
-            ".ilu_moe_runner.get_current_vllm_config",
-            return_value=vllm_config,
+        with (
+            patch.object(MoERunner, "__init__", fake_super_init),
+            patch(
+                "vllm_iluvatar.model_executor.layers.fused_moe.runner"
+                ".ilu_moe_runner.get_current_vllm_config",
+                return_value=vllm_config,
+            ),
         ):
             runner = IluMoERunner(routed_scaling_factor=4.0)
 

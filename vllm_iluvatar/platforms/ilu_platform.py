@@ -31,6 +31,13 @@ _ATTN_BACKENDS_REGISTERED = False
 _ILU_MLA_PREFILL_FLASH_ATTN_BACKEND = (
     "vllm_iluvatar.v1.attention.backends.mla.prefill.flash_attn.FlashAttnPrefillBackend"
 )
+# Arch names DeepSeek-V4.1 checkpoints declare; all of them are OOT-registered
+# (see models/deepseek_v41/vl_model.py).
+_DSV41_ARCHS = (
+    "DeepseekV41ForCausalLM",
+    "IluDeepseekV41ForCausalLM",
+    "IluDeepseekV41VLForCausalLM",
+)
 
 
 def register_attention_backends() -> None:
@@ -251,19 +258,31 @@ def _make_iluvatar_platform():
             except Exception:
                 archs = []
             if (
-                any(
-                    a in archs
-                    for a in (
-                        "IluDeepseekV4ForCausalLM",
-                        "DeepseekV41ForCausalLM",
-                        "IluDeepseekV41ForCausalLM",
-                    )
-                )
+                any(a in archs for a in ("IluDeepseekV4ForCausalLM", *_DSV41_ARCHS))
                 and model_config.tokenizer_mode == "auto"
             ):
                 model_config.tokenizer_mode = "deepseek_v4"
                 logger.info(
                     "ILU: set tokenizer_mode='deepseek_v4' for %s",
+                    archs,
+                )
+
+            # Every V4.1 arch name resolves to the vision wrapper (see
+            # models/deepseek_v41/vl_model.py), so a text-only checkpoint
+            # arrives here declared multimodal. Say so explicitly: this zeroes
+            # every per-modality limit, which is what stubs the tower out
+            # (``_mark_tower_model``) instead of allocating an unfilled ViT and
+            # reserving an encoder budget no request can use.
+            mm_config = getattr(model_config, "multimodal_config", None)
+            if (
+                mm_config is not None
+                and not mm_config.language_model_only
+                and any(a in archs for a in _DSV41_ARCHS)
+                and not getattr(model_config.hf_config, "vision_n_layers", 0)
+            ):
+                mm_config.language_model_only = True
+                logger.info(
+                    "ILU: %s has no vision tower; set language_model_only=True",
                     archs,
                 )
 

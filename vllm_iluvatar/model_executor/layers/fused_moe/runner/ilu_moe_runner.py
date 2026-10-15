@@ -479,7 +479,8 @@ class IluMoERunner(MoERunner):
     #   * router_logits is a per-token GEMM of hidden_states. Running the
     #     gate *after* the gather reproduces exactly the same logits on
     #     every rank without putting them on the wire.
-    #   * input_ids is read only by hash routing (``_hash_indices_table``).
+    #   * input_ids is read only by hash routing and the vision sentinel bias
+    #     (see ``_ilu_router_reads_input_ids``).
     #   * RS(DP) + AR(TP) == AR(EP) once the shared-expert partial is folded
     #     into this rank's own shard: with EP, tp_size is flattened into
     #     ep_size = dp_size * tp_size and every expert lives on exactly one
@@ -586,7 +587,8 @@ class IluMoERunner(MoERunner):
         Across every community router, ``input_ids`` is read in exactly two
         cases: hash routing (``_hash_indices_table``, DeepSeek-V4 hash layers)
         and the vision sentinel bias (``bias_vl`` in FusedTopKBiasRouter).
-        DeepSeek-V4.1 has neither, so its dispatch drops to a single tensor.
+        Text-only DeepSeek-V4.1 has neither, so its dispatch drops to a single
+        tensor; the VL checkpoint brings ``bias_vl`` back.
         The monolithic path, which also forwards ``input_ids``, is excluded by
         ``_ilu_compute_fused_ep_combine``.
         """

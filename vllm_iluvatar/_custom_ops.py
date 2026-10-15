@@ -516,17 +516,12 @@ def topk_hash_softplus_sqrt(
          applies the scale internally).
       4. ``token_expert_indices[t, j] = j`` (positional helper).
 
-    ``bias_vl`` / ``image_sentinel_lo`` route the five image-sentinel tokens
-    through a separate bias. The ixformer kernel has no such input, so the
-    feature is rejected rather than silently ignored; this build is text-only.
+    ``bias_vl`` / ``image_sentinel_lo`` make the rows holding an image sentinel
+    id select their experts with ``bias_vl`` instead of
+    ``e_score_correction_bias``; the kernel does that selection per row. It
+    rejects the combination with ``hash_indices_table``, which DeepSeek-V4.1
+    never needs (it has no hash-routed MoE layer).
     """
-    if bias_vl is not None and image_sentinel_lo > 0:
-        raise NotImplementedError(
-            "Iluvatar topk_hash_softplus_sqrt has no image-sentinel routing "
-            "(bias_vl / image_sentinel_lo); the ixformer kernel takes no such "
-            "input. This build serves text only."
-        )
-
     # ixformer expects int32 index tensors. topk_indices/token_expert_indices
     # are output buffers, so use temporaries only when needed and copy back into
     # the original buffers after the kernel writes them.
@@ -553,6 +548,10 @@ def topk_hash_softplus_sqrt(
         e_score_correction_bias=e_score_correction_bias,
         input_tokens=input_tokens,
         hash_indices_table=hash_indices_table,
+        # A sentinel of 0 disables image routing, and the kernel refuses the
+        # pair, so drop whichever half is inert.
+        bias_vl=bias_vl if image_sentinel_lo > 0 else None,
+        image_sentinel_lo=image_sentinel_lo if bias_vl is not None else 0,
     )
     _mask_topk_padding(topk_weights, topk_indices, is_padding)
     if topk_indices is not orig_topk_indices:

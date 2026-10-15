@@ -109,7 +109,10 @@ def _make_builder(
     builder.is_valid_token = torch.zeros(max_tokens, dtype=torch.bool)
     builder.no_replay_start = torch.zeros(max_tokens + 1, dtype=torch.int32)
     builder._replay_start_buffer = torch.zeros(max_tokens + 1, dtype=torch.int32)
-    builder._decode_swa_indices_noncausal = None
+    width = builder.noncausal_index_width if is_dspark else 1
+    builder.decode_swa_indices_noncausal = torch.empty(
+        max_tokens, 1, width, dtype=torch.int32
+    )
     builder._build_ilu_deepseek_v4_metadata = MagicMock(return_value={})
     builder.build_tile_scheduler = MagicMock(
         return_value={"swaonly": None, "c4a": None, "c128a": None}
@@ -194,6 +197,9 @@ def test_noncausal_dspark_uses_python_indices_not_ixformer():
         device=torch.device("cpu"),
     )
     assert torch.equal(md.decode_swa_indices, expected_indices)
+    assert md.decode_swa_indices.data_ptr() == (
+        builder.decode_swa_indices_noncausal.data_ptr()
+    )
     assert torch.equal(md.decode_swa_lens, expected_lens)
     # All queries in the block share the same non-causal key set.
     first = md.decode_swa_indices[0, 0, : md.decode_swa_lens[0]].tolist()

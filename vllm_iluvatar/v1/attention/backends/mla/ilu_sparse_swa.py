@@ -258,7 +258,10 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
             else 0
         )
         self._replay_start_buffer = torch.zeros_like(self.no_replay_start)
-        self._decode_swa_indices_noncausal = (
+        # Wider than ``decode_swa_indices``. Metadata must point at this
+        # buffer: the non-causal helper writes it in place, and the SWA kernel
+        # reads whatever ``metadata.decode_swa_indices`` references.
+        self.decode_swa_indices_noncausal = (
             torch.empty(
                 (
                     self.max_num_batched_tokens,
@@ -315,7 +318,8 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
                     "Non-causal DeepseekV4 SWA is only supported for the DSpark "
                     "speculation mode, but causal=False was set without DSpark."
                 )
-                noncausal_indices, noncausal_lens = build_dspark_noncausal_swa_indices(
+                decode_swa_indices = self.decode_swa_indices_noncausal
+                build_dspark_noncausal_swa_indices(
                     seq_lens=seq_lens,
                     query_start_loc=query_start_loc,
                     block_table=block_table,
@@ -325,10 +329,9 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
                     index_width=self.noncausal_index_width,
                     num_decode_tokens=num_decode_tokens,
                     device=self.device,
-                    out_indices=self._decode_swa_indices_noncausal,
+                    out_indices=decode_swa_indices,
                     out_lens=self.decode_swa_lens,
                 )
-                decode_swa_indices = noncausal_indices
             else:
                 self._compute_swa_decode_indices_and_lens(
                     swa_indices=self.decode_swa_indices,

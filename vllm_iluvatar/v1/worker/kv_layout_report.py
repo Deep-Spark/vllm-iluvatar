@@ -12,7 +12,9 @@ gather kernels that still compute a per-lane ``voff`` with
 ``__ivcorex_ml_mem_load_i32`` wrap silently once it exceeds 4 GiB -- see
 ``kernels/踩坑记录/大kv-cache越界问题.md`` in llm-adapt-notes. The packed FP8 decode path moved to ``__ivcorex_ml_mem_a64_load_i32`` in
 ixformer e3d1c525. The plain per-tensor E4M3 path uses native 64-bit pointer
-arithmetic and has dedicated >4 GiB gather/attention tests. BF16 / W4A8 / int8
+arithmetic and has dedicated >4 GiB gather/attention tests. BF16 DSA gather on
+ixinfer ``dev_dsa_4g`` keeps the block displacement in a 64-bit pointer and
+leaves only the intra-row step in the 32-bit SME/SMEX offset. W4A8 / int8
 DeepSeek-V4 kernels remain unsafe, so for those we refuse to start rather than
 return wrong tokens.
 """
@@ -31,9 +33,10 @@ logger = init_logger(__name__)
 
 _SPAN_32BIT_LIMIT = 2**32 - 1
 
-# Both FP8 layouts have >4 GiB coverage: packed uses the ixformer e3d1c525
-# a64 load fix; plain E4M3 uses int64_t page-stride pointer arithmetic.
-_A64_SAFE_CACHE_DTYPES = frozenset({"fp8_ds_mla", "fp8_e4m3"})
+# FP8 layouts have >4 GiB coverage: packed uses the ixformer e3d1c525 a64 load
+# fix; plain E4M3 uses int64_t page-stride pointer arithmetic. BF16 DSA gather
+# does the same via a 64-bit base pointer (ixinfer dev_dsa_4g, 214b77a4b).
+_A64_SAFE_CACHE_DTYPES = frozenset({"fp8_ds_mla", "fp8_e4m3", "bfloat16"})
 
 
 def _layer_specs(kv_cache_config: KVCacheConfig) -> dict[str, KVCacheSpec]:
@@ -109,8 +112,8 @@ def report_kv_cache_layout(
     raise RuntimeError(
         f"DeepSeek-V4 KV cache layer span is {max_span} B, over the "
         f"{_SPAN_32BIT_LIMIT} B that the {cache_dtype} gather kernels can "
-        f"address (their per-lane voffset is 32-bit; the packed FP8 and plain "
-        f"E4M3 paths are the a64-safe exceptions). Results would be silently wrong. "
+        f"address (their per-lane voffset is 32-bit; the packed FP8, plain "
+        f"E4M3, and bfloat16 paths are the a64-safe exceptions). Results would be silently wrong. "
         f"Shrink the pool to at most {max_pool_bytes} B "
         f"({max_pool_bytes / 2**30:.2f} GiB, {max_blocks} blocks of "
         f"{bytes_per_block} B) with --kv-cache-memory, or lower "

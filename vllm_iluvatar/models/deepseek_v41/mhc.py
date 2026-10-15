@@ -8,6 +8,8 @@ import os
 import torch
 from ixformer.inference.functions import deepseekv41 as ixfops
 
+from vllm_iluvatar.ilu_util.arch import is_ivcore30
+
 _fuse_reductions = os.getenv("VLLM_ILU_V41_MHC_FUSE_REDUCTIONS", "1") != "0"
 # Fold the fused_wqa_wkv per-token fp8 activation quant into the pre-norm kernel.
 _fuse_fp8_norm = os.getenv("VLLM_ILU_V41_FUSE_FP8_NORM", "1") != "0"
@@ -25,7 +27,12 @@ def _want_fused_fp8(
     be folded (``layer_norm_weight``), and the op must take the T>16 dense-sqrsum
     branch (the small-batch fused kernel has no fp8 variant, so decode stays on
     the plain op and quantizes in the GEMM as before).
+
+    The quant's only consumer is ``apply_block_scaled_mm``, which is ivcore30
+    only, so elsewhere the plain op runs and nothing asks for the fp8 epilogue.
     """
+    if not is_ivcore30():
+        return False
     if not (_fuse_fp8_norm and want_fp8 and layer_norm_weight is not None):
         return False
     if _fuse_reductions and num_tokens <= 16:

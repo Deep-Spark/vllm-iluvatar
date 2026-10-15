@@ -27,13 +27,25 @@ from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
 
 
 def _mqa_logits(*args, **kwargs):
+    """Paged MQA logits for one chunk.
+
+    Callers pass the same ``[cu_seqlen_ks, cu_seqlen_ke)`` span that top-k
+    consumes. The logits kernels on this ixformer take that visibility as
+    ``valid_lens`` (``ke - ks``): column 0 of a row is the request's first
+    visible key, and the length is the only bound either side uses. A uint8
+    cache with a bf16/fp8 query is the FP8 record.
+    """
     kv_cache = args[3] if len(args) > 3 else kwargs["kv_cache"]
+    ks = kwargs.pop("cu_seqlen_ks", None)
+    ke = kwargs.pop("cu_seqlen_ke", None)
+    if kwargs.get("valid_lens") is None and ks is not None and ke is not None:
+        kwargs["valid_lens"] = ke - ks
     if kv_cache.dtype == torch.uint8:
         # ixinfer supports only 64/256-row pages. Ratio1's 128 rows use native.
-        kwargs.setdefault("backend", os.environ.get(
-            "VLLM_ILU_V41_FP8_INDEXER_BACKEND",
-            "ixformer_native",
-        ))
+        kwargs.setdefault(
+            "backend",
+            os.environ.get("VLLM_ILU_V41_FP8_INDEXER_BACKEND", "ixformer_native"),
+        )
         return ixfops.dsa_indexer_mqa_logits_with_blocks_fp8(*args, **kwargs)
     if envs.VLLM_ILU_GLM_DSA_NATIVE_MQA_LOGITS:
         kwargs.setdefault("backend", "ixformer_native")
@@ -41,11 +53,11 @@ def _mqa_logits(*args, **kwargs):
 
 
 def _mqa_logits_for_candidates(candidate_blocks, *args, **kwargs):
-    kv_cache = args[3] if len(args) > 3 else kwargs["kv_cache"]
-    if candidate_blocks is None or kv_cache.dtype == torch.uint8:
-        return _mqa_logits(*args, **kwargs)
-    kwargs.pop("valid_lens", None)
-    return ixfops.dsa_indexer_mqa_logits_with_blocks(*args, **kwargs)
+    del candidate_blocks
+    # Visibility has to reach the producer. The legacy with_blocks entry on
+    # this ixformer ignores ``valid_lens`` and does not take the span pair, so
+    # every record goes through ``_mqa_logits``.
+    return _mqa_logits(*args, **kwargs)
 
 
 def _two_level_filter(

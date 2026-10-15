@@ -12,8 +12,10 @@ Why      : community spells both in Triton, which does not run on corex, and
            candidate source published.
 How      : same two entry points, same argument order and contract; the two
            reductions move to ``ixfops.dsv41_candidate_block_scores`` /
-           ``dsv41_apply_candidate_mask`` (ixformer deepseekv41/candidate) and
-           the top-k stays in torch, exactly where community leaves it.
+           ``dsv41_apply_candidate_mask`` (ixformer deepseekv41/candidate).
+           ``torch.topk`` stays in torch; writing the shortlist uses
+           ``dsv41_write_candidate_topk``, the same kernel the plugin
+           ``v41_write_candidate_topk`` used.
 Scope    : DeepSeek-V4.1 indexers with a candidate source.
 Remove   : when community grows a vendor hook for these two.
 """
@@ -109,16 +111,13 @@ def select_candidate_blocks(
                     sub = max(1, sub // 2)
                     continue
                 raise
-            # A block that scored ``-inf`` holds no live column, so it is
-            # padding rather than a candidate. NaN can show up during warmup
-            # and is left alone, which keeps this in step with community's tie
-            # behaviour.
-            keep = top.values != -float("inf")
-            out[r0 + s : r0 + e, :k] = torch.where(
-                keep, top.indices.to(torch.int32), -1
+            # One launch writes the kept indices and the ``-1`` tail. A block
+            # that scored ``-inf`` is padding; a NaN is kept, matching
+            # community.
+            ixfops.dsv41_write_candidate_topk(
+                out[r0 + s : r0 + e], top.values, top.indices, k
             )
             s = e
-    out[:rows, k:] = -1
 
 
 def apply_candidate_mask(

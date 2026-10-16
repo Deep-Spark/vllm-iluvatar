@@ -168,7 +168,10 @@ def test_sparse_pt_plugin_dispatch_replays_dynamic_q_scale(heads):
             )
 
 
-@pytest.mark.parametrize("dtype, expected", [(None, 128), ("fp8", 128), ("bf16", 64)])
+@pytest.mark.parametrize(
+    "dtype, expected",
+    [(None, 128), ("fp8", 128), ("bf16", 64), ("int8", 64)],
+)
 def test_main_backend_negotiates_physical_page_for_indexer(
     monkeypatch, dtype, expected
 ):
@@ -188,8 +191,24 @@ def test_main_backend_negotiates_physical_page_for_indexer(
     assert (
         physical_page in IluDeepseekV41IndexerBackend.get_supported_kernel_block_sizes()
     )
-    if dtype != "bf16":
+    if dtype in (None, "fp8"):
         assert (physical_page // 2) % 64 == 0
+
+
+def test_int8_indexer_splits_ratio_pages(monkeypatch):
+    from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
+        IluDeepseekV41IndexerBackend,
+        IluDeepseekV41IndexerRatio2Backend,
+        indexer_backend_cls,
+    )
+
+    monkeypatch.setenv("VLLM_ILU_V41_INDEXER_KV_DTYPE", "int8")
+    assert indexer_backend_cls(1) is IluDeepseekV41IndexerBackend
+    assert indexer_backend_cls(2) is IluDeepseekV41IndexerRatio2Backend
+    assert IluDeepseekV41IndexerBackend.get_supported_kernel_block_sizes() == [64]
+    assert IluDeepseekV41IndexerRatio2Backend.get_supported_kernel_block_sizes() == [
+        128
+    ]
 
 
 @pytest.mark.parametrize("n", [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64])
@@ -389,10 +408,10 @@ def test_fp8_indexer_key_store_matches_bf16_quantization_and_pp_mirror(ratio, bs
     fp8 = torch.zeros(pages, bs, 132, device="cuda", dtype=torch.uint8)
     mirror = torch.zeros(n, 132, device="cuda", dtype=torch.uint8)
     formal_ops.dsv41_indexer_k_norm_rope_store(
-        k, pos, cs, weight, 1e-20, bf16, slots, ratio, False, None
+        k, pos, cs, weight, 1e-20, bf16, slots, ratio, "bf16", None
     )
     formal_ops.dsv41_indexer_k_norm_rope_store(
-        k, pos, cs, weight, 1e-20, fp8, slots, ratio, True, mirror
+        k, pos, cs, weight, 1e-20, fp8, slots, ratio, "fp8", mirror
     )
     valid = (slots >= 0) & ((pos + 1) % ratio == 0)
     live_slots = slots[valid]

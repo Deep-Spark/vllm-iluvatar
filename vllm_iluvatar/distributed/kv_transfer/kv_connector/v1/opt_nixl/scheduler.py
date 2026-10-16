@@ -150,6 +150,14 @@ class NixlConnectorScheduler:
             self.kv_group_infos.append(specs.__class__.__name__)
 
         self._has_multi_size = len(set(self.group_block_sizes)) > 1
+        # The page the workers negotiated and registered with NIXL. Specs are
+        # cut from that page, so the widest group is it. ``cache_config
+        # .block_size`` is not: the engine core lowers it to the smallest
+        # prefix-cacheable group (V4.1 INT8 gives the ratio-1 indexer its own
+        # 64-token page), and that rewrite happens in this process only.
+        self.registered_block_size = max(
+            self.group_block_sizes, default=self.block_size
+        )
         self._has_mamba = any(isinstance(spec, MambaSpec) for spec in self._all_specs)
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
         self._force_rank_wise_sends = (
@@ -342,7 +350,7 @@ class NixlConnectorScheduler:
         """
         encoded_data: dict[int, bytes] = {}
         decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
-        physical_block_size = self.block_size
+        physical_block_size = self.registered_block_size
         for global_rank, rank_metadata in metadata.items():
             if not isinstance(rank_metadata, NixlHandshakePayload):
                 raise ValueError(

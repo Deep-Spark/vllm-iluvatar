@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -21,6 +20,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import indexer_kv_dtype
 from vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa import (
     IluDeepseekSparseSWABackend,
     IluDeepseekSparseSWAMetadataBuilder,
@@ -289,8 +289,11 @@ class IluDeepseekV4SparseMLABackend(AttentionBackend):
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
         # Platform negotiation consults the main MLA backend before the indexer.
-        # Ratio2 FP8 index rows require a physical page of 128 tokens.
-        if os.environ.get("VLLM_ILU_V41_INDEXER_KV_DTYPE", "fp8") == "fp8":
+        # Ratio-2 FP8 index rows require a physical page of 128 tokens. INT8
+        # stays at the non-FP8 size: a ratio-1 page of 128 states is illegal
+        # for the INT8 mqa-logits kernel, and the ratio-2 indexer backend
+        # advertises 128 on its own.
+        if indexer_kv_dtype() == "fp8":
             return 128
         return super().get_preferred_block_size(default_block_size)
 

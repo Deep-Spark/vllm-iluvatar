@@ -60,8 +60,9 @@ from vllm_iluvatar.models.deepseek_v41.sparse_mla import (
     IluDeepseekV4FlashMLAMetadata,
 )
 from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
-    IluDeepseekV41IndexerBackend,
     get_max_prefill_buffer_size,
+    indexer_backend_cls,
+    indexer_kv_dtype,
 )
 from vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa import IluDeepseekV4SWACache
 
@@ -216,9 +217,14 @@ def _replace_layer_index(prefix: str, layer_id: int) -> str:
 # failed on a dtype mismatch.
 #
 # Resolve before constructing any indexer cache, independently of main MLA.
-_INDEXER_KV_DTYPE = os.environ.get("VLLM_ILU_V41_INDEXER_KV_DTYPE", "fp8")
-if _INDEXER_KV_DTYPE not in ("bf16", "fp8"):
-    raise ValueError("VLLM_ILU_V41_INDEXER_KV_DTYPE must be bf16 or fp8")
+# ``VLLM_ILU_V41_INDEXER_KV_DTYPE``; unset stays fp8.
+_INDEXER_KV_DTYPE = indexer_kv_dtype()
+
+# Quantized index pages are allocated at a power-of-two row so page unification
+# can divide the sliding-window page (65536 bytes). The record itself stays
+# 132 bytes; ``bind_kv_cache`` narrows the view and keeps the allocated pitch
+# in ``stride(0)``. FP8 stays on the contiguous 132-byte spec.
+_INDEX_PAGE_ROW_BYTES = 256
 
 _DBG_TOPK = os.environ.get("VLLM_V41_DEBUG_TOPK", "0") == "1"
 _dbg_topk_seen: dict[str, int] = {}
@@ -262,15 +268,16 @@ def _indexer_k_cache_row(index_head_dim: int, kv_dtype: str) -> tuple[int, torch
 
     FP8 is the V3.2 layout the paged scoring kernel reads: a page of
     ``index_head_dim`` E4M3 bytes per row followed by a page of one FP32 scale
-    per row, so the row is ``index_head_dim + 4`` bytes. BF16 rows are the
-    values alone.
+    per row, so the row is ``index_head_dim + 4`` bytes. INT8 is the same
+    geometry with the values reinterpreted. BF16 rows are the values alone.
     """
-    if kv_dtype == "fp8":
+    if kv_dtype in ("fp8", "int8"):
         return index_head_dim + 4, torch.uint8
     if kv_dtype == "bf16":
         return index_head_dim, torch.bfloat16
     raise ValueError(
-        f"unsupported indexer cache dtype {kv_dtype!r}; expected 'bf16' or 'fp8'"
+        f"unsupported indexer cache dtype {kv_dtype!r}; expected 'bf16', "
+        "'fp8' or 'int8'"
     )
 
 
@@ -291,6 +298,7 @@ class IluDeepseekV41IndexerCache(torch.nn.Module, AttentionLayerBase):
         self.prefix = prefix
         self.cache_config = cache_config
         self.dtype = dtype
+        self.record = _INDEXER_KV_DTYPE
         self.compress_ratio = compress_ratio
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -308,34 +316,67 @@ class IluDeepseekV41IndexerCache(torch.nn.Module, AttentionLayerBase):
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         # [B, H=1, N, C] -> [B, N, C]
-        self.kv_cache = kv_cache.squeeze(1)
-        self.kv_cache[0].zero_()
+        cache = kv_cache.squeeze(1)
+        cache[0].zero_()
+        if cache.size(-1) != self.head_dim:
+            # INT8 pages are allocated at ``_INDEX_PAGE_ROW_BYTES`` and narrowed
+            # here. Page pitch stays in stride(0); the row is the 132-byte record.
+            cache = cache.as_strided(
+                (cache.size(0), cache.size(1), self.head_dim),
+                (cache.stride(0), self.head_dim, 1),
+            )
+        self.kv_cache = cache
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         del vllm_config
-        if self.block_size % self.compress_ratio:
+        # INT8 ratio-1 cannot share the 128-token manager page. States per page
+        # are ``block_size / compress_ratio``, and ixinfer only accepts 64 or
+        # 256. Ratio-2 at 128 tokens is 64 states; ratio-1 at 128 tokens is
+        # 128 states. v0.31 packs MLA specs with the same ``block_size`` into
+        # one KV group and then requires one kernel block for every backend in
+        # it, so the two ratios have to be different block sizes to land in
+        # different groups. 64 tokens is one legal page and needs no split.
+        block_size = self.block_size
+        if self.record == "int8" and self.compress_ratio == 1:
+            block_size = 64
+        if block_size % self.compress_ratio:
             raise ValueError(
-                f"block_size {self.block_size} must be a multiple of "
+                f"block_size {block_size} must be a multiple of "
                 f"compress_ratio {self.compress_ratio}, or a page would hold a "
                 f"fractional row (layer {self.prefix})"
             )
-        rows_per_page = self.block_size // self.compress_ratio
-        if self.dtype == torch.uint8 and rows_per_page % 64:
+        rows_per_page = block_size // self.compress_ratio
+        if self.record == "fp8" and rows_per_page % 64:
             raise ValueError(
                 f"FP8 indexer requires rows_per_page % 64 == 0, got "
                 f"{rows_per_page} at {self.prefix}; use --block-size 128"
             )
+        # INT8 is allocated wider than the record so the page byte count is a
+        # power of two. FP8 keeps the contiguous 132-byte row.
+        head_size = (
+            _INDEX_PAGE_ROW_BYTES if self.record == "int8" else self.head_dim
+        )
         logger.info_once(
-            "Indexer cache %s: dtype=%s row_width=%d rows_per_page=%d",
+            "Indexer cache %s: record=%s dtype=%s row_width=%d "
+            "rows_per_page=%d",
             self.prefix,
+            self.record,
             self.dtype,
-            self.head_dim,
+            head_size,
             rows_per_page,
         )
+        if self.record == "int8":
+            return MLAAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=head_size,
+                dtype=self.dtype,
+                tokens_per_state=self.compress_ratio,
+            )
         return MLAAttentionSpec(
-            block_size=self.block_size,
+            block_size=block_size,
             num_kv_heads=1,
-            head_size=self.head_dim,
+            head_size=head_size,
             dtype=self.dtype,
             # The indexer page shares a physical block with the main KV cache,
             # so it carries the same padding.
@@ -346,7 +387,7 @@ class IluDeepseekV41IndexerCache(torch.nn.Module, AttentionLayerBase):
     def forward(self): ...
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        return IluDeepseekV41IndexerBackend
+        return indexer_backend_cls(self.compress_ratio)
 
 
 class IluDeepseekV41Indexer(nn.Module):
@@ -389,10 +430,10 @@ class IluDeepseekV41Indexer(nn.Module):
         self.compress_ratio = compress_ratio
         self.owns_k = owns_k
         self.k_row_buffer: torch.Tensor | None = None
-        self.store_fp8_kv = _INDEXER_KV_DTYPE == "fp8"
+        self.record = _INDEXER_KV_DTYPE
         logger.info_once(
             "Using %s indexer cache for Lightning Indexer.",
-            "FP8" if self.store_fp8_kv else "BF16",
+            self.record.upper(),
         )
 
         # no tensor parallel, just replicated
@@ -438,18 +479,25 @@ class IluDeepseekV41Indexer(nn.Module):
             )
             self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         self.k_cache = k_cache
-        if self.store_fp8_kv:
+        if self.record in ("fp8", "int8"):
             max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-            self.q_fp8_buffer = torch.empty(
-                (max_tokens, self.n_head, self.head_dim),
-                dtype=torch.float8_e4m3fn,
-                device="cuda",
-            )
             self.weights_fp32_buffer = torch.empty(
                 (max_tokens, self.n_head),
                 dtype=torch.float32,
                 device="cuda",
             )
+            if self.record == "fp8":
+                self.q_fp8_buffer = torch.empty(
+                    (max_tokens, self.n_head, self.head_dim),
+                    dtype=torch.float8_e4m3fn,
+                    device="cuda",
+                )
+            else:
+                self.q_int8_buffer = torch.empty(
+                    (max_tokens, self.n_head, self.head_dim),
+                    dtype=torch.int8,
+                    device="cuda",
+                )
         # Decode CUDA graphs cannot allocate logits per step. Size to the
         # max compressed context so the same storage covers every capture
         # size. BF16 used to skip this and empty() inside the graph.
@@ -529,7 +577,7 @@ class IluDeepseekV41Indexer(nn.Module):
             k_cache,
             indexer_metadata.slot_mapping,
             self.compress_ratio,
-            self.store_fp8_kv,
+            self.record,
             row_out=self.k_row_buffer,
         )
 
@@ -580,7 +628,7 @@ class IluDeepseekV41Indexer(nn.Module):
 
         # ReplicatedLinear returns (output, bias).
         q = self.wq_b(qr)[0].view(-1, self.n_head, self.head_dim)
-        if self.store_fp8_kv:
+        if self.record == "fp8":
             # The per-(token, head) q_scale comes back folded into the weights,
             # which the FP8 scoring kernel wants as fp32.
             q_fp8 = self.q_fp8_buffer[: q.shape[0]]
@@ -595,6 +643,23 @@ class IluDeepseekV41Indexer(nn.Module):
                 folded_weights,
             )
             return q_fp8, None, folded_weights
+        if self.record == "int8":
+            # Same contract as FP8: the INT8 scoring kernel reads folded fp32
+            # weights and takes no companion scale tensor.
+            q_int8 = self.q_int8_buffer[: q.shape[0]]
+            folded_weights = self.weights_fp32_buffer[: q.shape[0]]
+            ixfshared.ds4_fused_indexer_q_rope_int8_quant(
+                q,
+                positions,
+                rotary_emb.cos_sin_cache,
+                indexer_weights,
+                self.softmax_scale,
+                self.n_head**-0.5,
+                self.rope_dim,
+                q_int8_out=q_int8,
+                weights_out=folded_weights,
+            )
+            return q_int8, None, folded_weights
         # In-place: q is rotated, weights are rescaled.
         ixfops.dsv41_indexer_q_rope(
             q,

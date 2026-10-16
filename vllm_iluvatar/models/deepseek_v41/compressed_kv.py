@@ -502,7 +502,9 @@ class CompressedKVState:
         for name in layout.placements:
             if getattr(forward_context[name], "compressed_kv_format", None) != fmt:
                 raise ValueError(f"{name}: worker/layer compressed format mismatch")
-        self._forward_context = forward_context
+        # The upstream runner clears its registry before worker State release.
+        # Retain the original layer bindings without copying their tensors.
+        self._forward_context = dict(forward_context)
         self.scale_storage = None
         self.workspace = None
         self.scales = {}
@@ -584,3 +586,4 @@ class CompressedKVState:
         self.scales.clear()
         self.scale_storage = None
         self.workspace = None
+        self._forward_context.clear()

@@ -58,6 +58,82 @@ def cache_config(fmt, count=3, block_outer=False):
 
 
 @pytest.mark.parametrize("fmt", [I8G64, I4G32])
+def test_real_parent_shutdown_clears_context_before_state_unbinds(fmt, monkeypatch):
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    from vllm_iluvatar.v1.worker.gpu_worker import IluWorker
+
+    cfg, names = cache_config(fmt)
+    context = {name: SimpleNamespace(compressed_kv_format=fmt) for name in names}
+    layers = list(context.values())
+    state = CompressedKVState(
+        plan_scale_layout(cfg, fmt), fmt, "cpu", context, workspace_bytes=4096
+    )
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(num_gpu_blocks=3),
+        compilation_config=SimpleNamespace(static_forward_context=context),
+    )
+    runner.aux_output_connector = None
+    worker = IluWorker.__new__(IluWorker)
+    worker.model_runner = runner
+    worker.profiler = None
+    worker.elastic_ep_executor = SimpleNamespace(shutdown=lambda: None)
+    worker._compressed_kv_state = state
+    worker._try_replace_model_runner_class = lambda: runner.__class__
+    # Only accelerator operations/allocator inspection are isolated. The real
+    # Worker and V2 runner shutdowns call real free_before_shutdown, which clears
+    # static_forward_context before the plugin releases its paired State.
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        __import__(
+            IluWorker.__module__, fromlist=["current_platform"]
+        ).current_platform,
+        "is_cuda_alike",
+        lambda: False,
+    )
+    worker.shutdown()
+    assert context == {} and runner.vllm_config.cache_config.num_gpu_blocks is None
+    assert worker._compressed_kv_state is None
+    assert not state.scales and state.workspace is state.scale_storage is None
+    assert not state._forward_context
+    assert all(layer.kv_cache_scales is None for layer in layers)
+    assert all(layer.compressed_kv_workspace is None for layer in layers)
+    state.release()
+
+
+@pytest.mark.parametrize("fmt", [I8G64, I4G32])
+def test_partial_state_construction_keeps_bindings_when_external_context_clears(
+    fmt, monkeypatch
+):
+    cfg, names = cache_config(fmt)
+    context = {name: SimpleNamespace(compressed_kv_format=fmt) for name in names}
+    layers = list(context.values())
+    original = torch.as_strided
+    calls = []
+    error = RuntimeError("original scale binding failure")
+
+    def fail_second_view(*args, **kwargs):
+        calls.append(True)
+        if len(calls) == 2:
+            context.clear()
+            raise error
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "as_strided", fail_second_view)
+    state = CompressedKVState.__new__(CompressedKVState)
+    with pytest.raises(RuntimeError) as raised:
+        state.__init__(
+            plan_scale_layout(cfg, fmt), fmt, "cpu", context, workspace_bytes=4096
+        )
+    assert raised.value is error
+    assert not state.scales and state.workspace is state.scale_storage is None
+    assert not state._forward_context
+    assert getattr(layers[0], "kv_cache_scales", None) is None
+
+
+@pytest.mark.parametrize("fmt", [I8G64, I4G32])
 @pytest.mark.parametrize("workspace_bytes", [WORKSPACE_BYTES, PREFILL_WORKSPACE_BYTES])
 def test_budget_reserves_sidecars_and_one_workspace(fmt, workspace_bytes):
     page_cost = PAYLOAD_PAGE_BYTES + fmt.scale_page_bytes(512)

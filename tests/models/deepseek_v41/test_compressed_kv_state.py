@@ -58,6 +58,85 @@ def cache_config(fmt, count=3, block_outer=False):
 
 
 @pytest.mark.parametrize("fmt", [I8G64, I4G32])
+@pytest.mark.parametrize("pages", [2, 4])
+def test_promoted_manager_pages_match_payload_kernel_views(fmt, pages):
+    """The real allocator may promote pages while retaining codec block width."""
+    from vllm.config import CacheConfig
+    from vllm.v1.kv_cache_interface import (
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheTensor,
+        MLAAttentionSpec,
+        group_kernel_blocks,
+    )
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    rows = fmt.rows_per_page(512)
+    spec = MLAAttentionSpec(
+        block_size=rows * 2 * pages,
+        storage_block_size=rows * 2,
+        tokens_per_state=2,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        state_content_bytes=fmt.payload_bytes(512),
+        cache_dtype_str=fmt.name,
+    )
+    cfg = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_groups=[KVCacheGroupSpec(["main"], spec)],
+        kv_cache_tensors=[KVCacheTensor(
+            size=2 * spec.page_size_bytes,
+            layers=["main"],
+            offset=0,
+            layer_stride=2 * spec.page_size_bytes,
+            block_stride=spec.page_size_bytes,
+        )],
+    )
+    context = {"main": SimpleNamespace(compressed_kv_format=fmt)}
+    state = CompressedKVState(
+        plan_scale_layout(cfg, fmt), fmt, "cpu", context, workspace_bytes=4096
+    )
+    cache = CacheConfig(block_size=64, cache_dtype="bfloat16")
+    cache.kv_cache_layout = "LBNHC"
+    try:
+        payload = allocate_kv_cache(
+            cfg, torch.device("cpu"), cache.get_resolved_kv_cache_layout()
+        )["main"]
+        scales = state.scales["main"]
+        assert payload.shape[:3] == (2 * pages, 1, rows)
+        assert scales.shape == (2 * pages, rows, fmt.scale_groups(512))
+        from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.opt_nixl.memory_registration import (
+            MemoryRegistrationPlanner,
+        )
+
+        planner = MemoryRegistrationPlanner(cfg)
+        registration = planner.describe(
+            layer_name="main", tensor=payload.squeeze(1), spec=spec, num_blocks=2
+        )
+        scale_registration = planner.describe_scale_plane(
+            layer_name="main", scales=scales, payload=registration,
+            scale_page_bytes=fmt.scale_page_bytes(512),
+        )
+        assert registration.kernel_blocks == scale_registration.kernel_blocks == pages
+        assert scale_registration.payload_segments == (
+            (0, pages * fmt.scale_page_bytes(512)),
+        )
+        assert scale_registration.num_blocks == 2
+        physical = group_kernel_blocks(scales, cfg.num_blocks)
+        assert physical.shape[:2] == (2, pages)
+        for block in range(2 * pages):
+            scales[block].fill_(block + 1)
+        assert physical[1, -1, 0, 0].item() == 2 * pages
+        zeroer = SimpleNamespace(_meta=None)
+        state.bind_zeroer(zeroer)
+        assert zeroer._meta[1].tolist() == [physical.stride(0) // 2]
+        assert zeroer._meta[2].tolist() == [physical[0].numel() // 2]
+    finally:
+        state.release()
+
+
+@pytest.mark.parametrize("fmt", [I8G64, I4G32])
 def test_real_parent_shutdown_clears_context_before_state_unbinds(fmt, monkeypatch):
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 

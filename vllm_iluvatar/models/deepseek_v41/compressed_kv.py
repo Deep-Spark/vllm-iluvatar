@@ -221,6 +221,7 @@ class ScalePlacement:
     block_stride_elements: int
     rows: int
     groups: int
+    blocks_per_page: int = 1
 
 
 @dataclass(frozen=True)
@@ -252,28 +253,51 @@ def plan_scale_layout(config, fmt, head_dim: int = 512) -> ScaleLayout:
             spec = specs[name]
             if not is_quantized_main_spec(spec):
                 continue
+            blocks_per_page = spec.page_size_bytes // PAYLOAD_PAGE_BYTES
+            storage_block = getattr(spec, "storage_block_size", None)
+            kernel_rows = (
+                spec.get_num_kernel_states(storage_block)
+                if storage_block is not None
+                else spec.num_states
+            )
             if (
                 spec.cache_dtype_str != fmt.name
                 or spec.dtype is not torch.uint8
                 or spec.state_content_size_bytes != fmt.payload_bytes(head_dim)
-                or spec.page_size_bytes != PAYLOAD_PAGE_BYTES
-                or spec.num_states != rows
+                or blocks_per_page < 1
+                or spec.page_size_bytes % PAYLOAD_PAGE_BYTES
+                or spec.num_states != rows * blocks_per_page
+                or kernel_rows != rows
             ):
-                raise ValueError(f"{name}: incompatible compressed KV page geometry")
+                raise ValueError(
+                    f"{name}: incompatible compressed KV page geometry: {spec}"
+                )
             offset = tensor.offset + index * tensor.layer_stride
             if offset % PAYLOAD_PAGE_BYTES or tensor.block_stride % PAYLOAD_PAGE_BYTES:
                 raise ValueError(
                     f"{name}: compressed payload placement is not page aligned"
                 )
+            # Match create_kv_cache_views: splitting a manager page into
+            # codec pages requires dense pages without inter-layer gaps.
+            if blocks_per_page > 1 and tensor.block_stride != spec.page_size_bytes:
+                raise ValueError(
+                    f"{name}: compressed manager pages must be dense "
+                    "for kernel block splitting"
+                )
             placement = ScalePlacement(
                 offset // PAYLOAD_PAGE_BYTES * scale_page_elements,
-                tensor.block_stride // PAYLOAD_PAGE_BYTES * scale_page_elements,
+                tensor.block_stride
+                // blocks_per_page
+                // PAYLOAD_PAGE_BYTES
+                * scale_page_elements,
                 rows,
                 groups,
+                blocks_per_page,
             )
             last = (
                 placement.offset_elements
-                + (config.num_blocks - 1) * placement.block_stride_elements
+                + (config.num_blocks * blocks_per_page - 1)
+                * placement.block_stride_elements
                 + scale_page_elements
             )
             if last * 2 > scale_bytes:
@@ -518,11 +542,19 @@ class CompressedKVState:
             )
             aliases = {}
             for name, placement in layout.placements.items():
-                key = (placement.offset_elements, placement.block_stride_elements)
+                key = (
+                    placement.offset_elements,
+                    placement.block_stride_elements,
+                    placement.blocks_per_page,
+                )
                 if key not in aliases:
                     aliases[key] = torch.as_strided(
                         self.scale_storage,
-                        (layout.num_blocks, placement.rows, placement.groups),
+                        (
+                            layout.num_blocks * placement.blocks_per_page,
+                            placement.rows,
+                            placement.groups,
+                        ),
                         (placement.block_stride_elements, placement.groups, 1),
                         placement.offset_elements,
                     )
@@ -538,6 +570,8 @@ class CompressedKVState:
 
     def bind_zeroer(self, zeroer) -> None:
         """Extend the V2 zeroer using metadata inside the reserved workspace."""
+        from vllm.v1.kv_cache_interface import group_kernel_blocks
+
         addresses, strides, sizes = [], [], []
         if zeroer._meta is not None:
             old_addresses, old_strides, old_sizes, *_ = zeroer._meta
@@ -550,9 +584,10 @@ class CompressedKVState:
             if address in seen:
                 continue
             seen.add(address)
+            physical = group_kernel_blocks(scale, self.layout.num_blocks)
             addresses.append(address)
-            strides.append(scale.stride(0) * 2 // 4)
-            sizes.append(scale.shape[1] * scale.shape[2] * 2 // 4)
+            strides.append(physical.stride(0) * 2 // 4)
+            sizes.append(physical[0].numel() * 2 // 4)
         count = len(addresses)
         metadata = self.workspace.reserve_metadata(count * 24)
         addr_view = metadata[: count * 8].view(torch.uint64)

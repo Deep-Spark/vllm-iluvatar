@@ -399,7 +399,8 @@ class MemoryRegistrationPlanner:
             raise ValueError(
                 f"{layer_name}: scale plane must be FP16[pages,rows,groups]"
             )
-        if scales.shape[0] != payload.num_blocks or payload.kernel_blocks != 1:
+        kernel_blocks = payload.kernel_blocks
+        if kernel_blocks <= 0 or scales.shape[0] != payload.num_blocks * kernel_blocks:
             raise ValueError(
                 f"{layer_name}: scale/payload physical block ranges differ"
             )
@@ -412,10 +413,10 @@ class MemoryRegistrationPlanner:
             raise ValueError(f"{layer_name}: scale page size does not match its format")
         storage = scales.untyped_storage()
         offset = scales.data_ptr() - storage.data_ptr()
-        stride = scales.stride(0) * scales.element_size()
+        stride = scales.stride(0) * scales.element_size() * kernel_blocks
         ((payload_offset, payload_length),) = payload.payload_segments
         if (
-            payload_length != PAYLOAD_PAGE_BYTES
+            payload_length != PAYLOAD_PAGE_BYTES * kernel_blocks
             or payload_offset % PAYLOAD_PAGE_BYTES
             or payload.block_stride % PAYLOAD_PAGE_BYTES
             or offset != payload_offset // PAYLOAD_PAGE_BYTES * scale_page_bytes
@@ -430,9 +431,9 @@ class MemoryRegistrationPlanner:
             registration_base=storage.data_ptr(),
             registration_nbytes=storage.nbytes(),
             block_stride=stride,
-            payload_segments=((offset, scale_page_bytes),),
+            payload_segments=((offset, scale_page_bytes * kernel_blocks),),
             num_blocks=payload.num_blocks,
-            kernel_blocks=1,
+            kernel_blocks=kernel_blocks,
             device_id=max(scales.get_device(), 0),
         )
         result.validate(layer_name)
@@ -442,7 +443,7 @@ class MemoryRegistrationPlanner:
             block_stride=stride,
             num_blocks=payload.num_blocks,
             payload_segments=result.payload_segments,
-            kernel_blocks=1,
+            kernel_blocks=kernel_blocks,
         )
         return result
 

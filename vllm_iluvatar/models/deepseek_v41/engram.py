@@ -599,7 +599,7 @@ class IluEngram(nn.Module):
                 and x.dtype == torch.bfloat16
                 and self.wkv_weight.dtype == torch.bfloat16
             ):
-                kv = ixfshared.linear(x, self.wkv_weight, backend="ixformer_perf")
+                kv = ixfshared.linear(x, self.wkv_weight, backend="ixinfer")
             else:
                 kv = torch.matmul(x, self.wkv_weight.t())
             return self._gate(hidden_states, kv)

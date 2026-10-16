@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import wraps
@@ -28,6 +29,21 @@ from vllm.v1.attention.backends.mla.compressor_utils import (
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout, MLAAttentionSpec
+
+
+def indexer_kv_dtype() -> str:
+    """Record the lightning indexer keeps its index keys in.
+
+    ``VLLM_ILU_V41_INDEXER_KV_DTYPE``; unset means ``fp8``. Read live so a test
+    can point the process at another record before the model is built.
+    """
+    dtype = os.environ.get("VLLM_ILU_V41_INDEXER_KV_DTYPE", "fp8").strip().lower()
+    if dtype not in ("bf16", "fp8", "int8"):
+        raise ValueError(
+            "VLLM_ILU_V41_INDEXER_KV_DTYPE must be bf16, fp8, or int8, "
+            f"got {dtype!r}"
+        )
+    return dtype
 
 
 @triton.jit
@@ -1174,7 +1190,7 @@ def make_storage_block_size_build(orig: Callable[..., Any]) -> Callable[..., Any
 
 
 class IluDeepseekV41IndexerBackend(IluDeepseekV4IndexerBackend):
-    """V4.1 indexer backend with independent BF16/FP8 cache selection."""
+    """V4.1 indexer backend with independent BF16/FP8/INT8 cache selection."""
 
     @staticmethod
     def get_builder_cls():
@@ -1182,10 +1198,42 @@ class IluDeepseekV41IndexerBackend(IluDeepseekV4IndexerBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        import os
-        if os.environ.get("VLLM_ILU_V41_INDEXER_KV_DTYPE", "fp8") == "fp8":
+        # ixinfer INT8 accepts a page of 64 or 256 index states. A kernel block
+        # is counted in tokens, so an uncompressed INT8 layer stays at 64.
+        # ``get_kv_cache_spec`` gives that layer its own 64-token page: v0.31
+        # puts every MLA spec that shares ``block_size`` into one KV group, and
+        # ``select_common_block_size`` then demands one kernel block for the
+        # ratio-1 and ratio-2 indexers together, which no single size can be.
+        dtype = indexer_kv_dtype()
+        if dtype == "fp8":
             return [128]
+        if dtype == "int8":
+            return [64]
         return [64, 128]
+
+
+class IluDeepseekV41IndexerRatio2Backend(IluDeepseekV41IndexerBackend):
+    """Index keys compressed 2:1.
+
+    INT8 mqa-logits only accepts 64 or 256 index states per page. A kernel
+    block is counted in tokens, so a 2:1 layer needs 128 tokens to hold the
+    same 64 states as an uncompressed one.
+    """
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        return [128]
+
+
+def indexer_backend_cls(compress_ratio: int) -> type[AttentionBackend]:
+    """Page INT8 ratio-2 index keys at 128 tokens (64 states).
+
+    FP8 and BF16 stay on ``IluDeepseekV41IndexerBackend``. The ratio-1 INT8
+    spec uses a 64-token block so it is not packed into the 128-token group.
+    """
+    if indexer_kv_dtype() == "int8" and compress_ratio == 2:
+        return IluDeepseekV41IndexerRatio2Backend
+    return IluDeepseekV41IndexerBackend
 
 
 class IluDeepseekV41IndexerMetadataBuilder(IluDeepseekV32IndexerMetadataBuilder):

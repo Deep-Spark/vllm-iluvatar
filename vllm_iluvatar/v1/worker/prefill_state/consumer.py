@@ -10,7 +10,7 @@ import time
 import numpy as np
 import torch
 
-from .cache_rows import indexer_row_views, restore_indexer_row
+from .cache_rows import indexer_row_views, restore_indexer_row, main_boundary_sources
 from .configuration import PrefixGeometry, session_paths
 from .decode_prefix import PrefixBuffers
 from .runtime import PrefixRuntime
@@ -203,6 +203,10 @@ class ConsumerPrefixState(PrefixRuntime):
                     and layer in self.geometry.ring_layers
                     else None
                 )
+                if layer == self.geometry.prefix_depth - 1 and name.endswith(".attn"):
+                    self._p21_cache_sources.extend(main_boundary_sources(
+                        static[name], name, g, self.geometry))
+                    continue
                 if kind is None and layer == self.geometry.prefix_depth - 1:
                     kind = (
                         "main_tail"
@@ -223,7 +227,8 @@ class ConsumerPrefixState(PrefixRuntime):
                     )
         assert (
             len(self._p21_cache_sources)
-            == self.geometry.prefix_depth + len(self.geometry.ring_layers) + 2
+            == self.geometry.prefix_depth + len(self.geometry.ring_layers)
+            + len(self.geometry.main_tail_fields()) + 1
         )
         self._p21_ring_rows = {
             s["layer"]: s["cache"].shape[1]
@@ -694,9 +699,12 @@ class ConsumerPrefixState(PrefixRuntime):
                                 == field["byte_count"]
                             )
                         elif valid:
+                            field = next(f for f in packet["metadata"]["fields"]
+                                         if f["kind"] == source["kind"])
                             eligible &= (
-                                cache.dtype == torch.bfloat16
-                                and cache.shape[-1] == self.geometry.head_dim
+                                str(cache.dtype) in DTYPES
+                                and DTYPES[str(cache.dtype)][0] == DTYPES[field["dtype"]][0]
+                                and tuple(field["shape"]) == (1, cache.shape[-1])
                             )
         free, _ = torch.cuda.mem_get_info()
         eligible &= free / 2**20 >= (1100 if self._p21_eager_warmed else 1900)
@@ -768,6 +776,7 @@ class ConsumerPrefixState(PrefixRuntime):
                     "FP32": torch.float32,
                     "I32": torch.int32,
                     "U8": torch.uint8,
+                    "FP16": torch.float16,
                 }[DTYPES[field["dtype"]][0]]
                 off = field["offset_bytes"]
                 end = off + field["byte_count"]
@@ -775,7 +784,7 @@ class ConsumerPrefixState(PrefixRuntime):
 
             for source in self._p21_cache_sources:
                 if (
-                    source["kind"] in ("main_tail", "indexer_tail")
+                    source["kind"] in ("main_tail", "main_tail_scale", "indexer_tail")
                     and state["N"] % 2 == 0
                 ):
                     continue
@@ -807,7 +816,7 @@ class ConsumerPrefixState(PrefixRuntime):
                 else:
                     logical, row = divmod(state["N"] - 1, cache.shape[1])
                     block = int(blocks[logical])
-                    if source["kind"] == "main_tail":
+                    if source["kind"] in ("main_tail", "main_tail_scale"):
                         cache[block, row].copy_(data[0], non_blocking=True)
                     else:
                         restore_indexer_row(cache, block, row, data)

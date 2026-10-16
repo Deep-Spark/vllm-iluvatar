@@ -9,7 +9,7 @@ from collections import deque
 import numpy as np
 import torch
 
-from .cache_rows import copy_indexer_row_to_host
+from .cache_rows import copy_indexer_row_to_host, main_boundary_sources
 from .configuration import PrefixGeometry, ProducerTopology, session_paths
 from .runtime import PrefixRuntime
 from .source_state import replay_layout, request_dir
@@ -191,7 +191,11 @@ class ProducerPrefixState(PrefixRuntime):
                 elif layer_id == self.geometry.prefix_depth - 1 and (
                     name.endswith(".attn") or name.endswith(".attn.indexer.k_cache")
                 ):
-                    kind = "main_tail" if name.endswith(".attn") else "indexer_tail"
+                    if name.endswith(".attn"):
+                        self._src_specs.extend(main_boundary_sources(
+                            static[name], name, g, self.geometry))
+                        continue
+                    kind = "indexer_tail"
                     self._src_specs.append(
                         dict(
                             name=name,
@@ -219,12 +223,8 @@ class ProducerPrefixState(PrefixRuntime):
                     shape, dtype = (129, self.geometry.head_dim), torch.bfloat16
                 elif s["kind"] == "ring":
                     shape, dtype = tuple(s["cache"].shape[1:]), torch.float32
-                elif s["kind"] == "main_tail":
-                    assert (
-                        s["cache"].dtype == torch.bfloat16
-                        and s["cache"].shape[-1] == self.geometry.head_dim
-                    )
-                    shape, dtype = (1, self.geometry.head_dim), torch.bfloat16
+                elif s["kind"] in ("main_tail", "main_tail_scale"):
+                    shape, dtype = (1, s["cache"].shape[-1]), s["cache"].dtype
                 else:
                     assert s["kind"] == "indexer_tail"
                     width = self.geometry.indexer_width
@@ -345,7 +345,7 @@ class ProducerPrefixState(PrefixRuntime):
             host = state["pool"][spec["name"]]
             blocks = state["blocks"][spec["group"]]
             segments = []
-            if spec["kind"] in ("main_tail", "indexer_tail"):
+            if spec["kind"] in ("main_tail", "main_tail_scale", "indexer_tail"):
                 if state["N"] == state["H"]:
                     continue
                 start, stop = state["H"], state["N"]
@@ -354,7 +354,7 @@ class ProducerPrefixState(PrefixRuntime):
                     logical < len(blocks) and 0 < int(blocks[logical]) < cache.shape[0]
                 )
                 block = int(blocks[logical])
-                if spec["kind"] == "main_tail":
+                if spec["kind"] in ("main_tail", "main_tail_scale"):
                     host[0].copy_(cache[block, row], non_blocking=True)
                 else:
                     copy_indexer_row_to_host(host, cache, block, row)

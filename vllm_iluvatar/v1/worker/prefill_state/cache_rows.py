@@ -42,3 +42,26 @@ def restore_indexer_row(cache: torch.Tensor, block: int, row: int,
     for part in parts:
         part.copy_(host[offset:offset + part.numel()], non_blocking=True)
         offset += part.numel()
+
+
+
+def main_boundary_sources(layer, name: str, group: int, geometry) -> list[dict]:
+    """Describe paired live page views, including padded page strides.
+
+    Payload and scale planes use the same physical block and row. This creates
+    metadata only and allocates no device workspace.
+    """
+    dtypes = {"BF16": torch.bfloat16, "U8": torch.uint8, "FP16": torch.float16}
+    payload = layer.kv_cache
+    sources = []
+    for kind, (shape, dtype) in geometry.main_tail_fields().items():
+        cache = payload if kind == "main_tail" else getattr(layer, "kv_cache_scales", None)
+        if (not isinstance(cache, torch.Tensor) or cache.ndim != 3
+                or cache.shape[:2] != payload.shape[:2] or cache.shape[-1] != shape[-1]
+                or cache.dtype != dtypes[dtype] or cache.device != payload.device
+                or cache.stride(-1) != 1):
+            raise ValueError("Unsupported E25 paired main boundary-row layout")
+        sources.append(dict(name=name if kind == "main_tail" else name + ".kv_cache_scales",
+                            kind=kind, layer=geometry.prefix_depth - 1, group=group,
+                            cache=cache, R=int(cache.shape[1]), ratio=1))
+    return sources

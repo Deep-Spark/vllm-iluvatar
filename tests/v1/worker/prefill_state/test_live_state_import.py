@@ -12,10 +12,15 @@ import pytest
 import torch
 
 from vllm_iluvatar.v1.worker.prefill_state.live_d_worker import LiveDWorker
-from vllm_iluvatar.v1.worker.prefill_state.source_state import validate_fields
+from vllm_iluvatar.v1.worker.prefill_state.source_state import (
+    validate_fields, replay_layout, main_tail_layout,
+)
+from vllm_iluvatar.v1.worker.prefill_state.cache_rows import main_boundary_sources, indexer_row_views
+from vllm_iluvatar.v1.worker.prefill_state.host_source_worker import HostSourceWorker
 
 
-def import_fixture(device="cpu", *, n=4098, generation=1):
+def import_fixture(device="cpu", *, n=4098, generation=1, main_format="none"):
+    hit, start, rows = replay_layout(n)
     fields, parts, expected = [], [], {}
 
     def add(name, kind, shape, dtype, layer=None):
@@ -37,18 +42,23 @@ def import_fixture(device="cpu", *, n=4098, generation=1):
         expected[name] = value
 
     for layer in range(21):
-        add(f"swa{layer}", "SWA", (128, 512), torch.bfloat16, layer)
+        add(f"swa{layer}", "SWA", (rows, 512), torch.bfloat16, layer)
     for layer in (2, 8, 14):
         add(f"ring{layer}", "ring", (16, 1024), torch.float32, layer)
-    add("HC", "boundary21", (128, 4, 5120), torch.bfloat16)
-    add("pre_mix", "boundary21", (128, 4), torch.float32)
-    add("topk20", "boundary21", (128, 512), torch.int32)
-    add("candidates20", "boundary21", (128, 2048), torch.int32)
+    add("HC", "boundary21", (rows, 4, 5120), torch.bfloat16)
+    add("pre_mix", "boundary21", (rows, 4), torch.float32)
+    add("topk20", "boundary21", (rows, 512), torch.int32)
+    add("candidates20", "boundary21", (rows, 2048), torch.int32)
+    dtypes = {"BF16": torch.bfloat16, "U8": torch.uint8, "FP16": torch.float16}
+    if n % 2:
+        for kind, (shape, dtype) in main_tail_layout(main_format).items():
+            add(kind, kind, shape, dtypes[dtype], 20)
+        add("indexer_tail", "indexer_tail", (132,), torch.uint8, 20)
     host = torch.cat(parts)
-    validate_fields(fields, host.numel())
+    validate_fields(fields, host.numel(), n, main_format)
     if device == "cuda":
         host = host.pin_memory()
-    packet = dict(metadata=dict(fields=fields), host=host)
+    packet = dict(metadata=dict(fields=fields, H=hit, S=start), host=host)
     worker = LiveDWorker.__new__(LiveDWorker)
     worker._p21_lock = threading.Lock()
     worker._p21_host_inflight = []
@@ -57,7 +67,7 @@ def import_fixture(device="cpu", *, n=4098, generation=1):
     blocks = []
     for layer in range(21):
         table = [0] * ((n + 63) // 64)
-        lo, hi = (n - 128) // 64, (n - 1) // 64
+        lo, hi = start // 64, (n - 1) // 64
         table[lo : hi + 1] = [4, 1, 3][: hi - lo + 1]
         blocks.append(table)
         worker._p21_cache_sources.append(
@@ -80,33 +90,60 @@ def import_fixture(device="cpu", *, n=4098, generation=1):
                 cache=torch.full((4, 16, 1024), -9, dtype=torch.float32, device=device),
             )
         )
+    # Both paired main views use identical nonidentity page tables; the indexer
+    # has independent64-row SoA pages, unlike main I8R128/I4R256 pages.
+    layout = main_tail_layout(main_format)
+    page_rows = {"none": 64, "i8g64": 128, "i4g32": 256}[main_format]
+    main_group = len(blocks)
+    blocks.append([3] * ((n + page_rows - 1) // page_rows))
+    for kind, (shape, dtype) in layout.items():
+        width=shape[-1]
+        owner=torch.full((5,page_rows*width+64),9,dtype=dtypes[dtype],device=device)
+        cache=owner.as_strided((5,page_rows,width),(page_rows*width+64,width,1))
+        worker._p21_cache_sources.append(dict(
+            name=kind, group=main_group, layer=20, kind=kind, cache=cache,
+            padding=owner[:,page_rows*width:]))
+    blocks.append([2] * ((n + 63) // 64))
+    worker._p21_cache_sources.append(dict(
+        name="indexer_tail",group=len(blocks)-1,layer=20,kind="indexer_tail",
+        cache=torch.full((5,64,132),9,dtype=torch.uint8,device=device)))
     worker._p21_target = SimpleNamespace(
         topk_indices_buffer=torch.full(
-            (134, 512), -9, dtype=torch.int32, device=device
+            (rows + 6, 512), -9, dtype=torch.int32, device=device
         ),
         candidate_idxs_buffer=torch.full(
-            (134, 2048), -9, dtype=torch.int32, device=device
+            (rows + 6, 2048), -9, dtype=torch.int32, device=device
         ),
     )
-    hidden = torch.full((134, 4, 5120), -9, dtype=torch.bfloat16, device=device)
-    pre = torch.full((134, 4), -9, dtype=torch.float32, device=device)
-    state = dict(id="request", N=n, blocks=blocks, generation=generation)
+    hidden = torch.full((rows + 6, 4, 5120), -9, dtype=torch.bfloat16, device=device)
+    pre = torch.full((rows + 6, 4), -9, dtype=torch.float32, device=device)
+    state = dict(id="request", N=n, H=hit, S=start, blocks=blocks, generation=generation)
     return worker, state, packet, expected, hidden, pre
 
 
 def check_import(worker, state, expected, hidden, pre):
     for source in worker._p21_cache_sources:
         cache = source["cache"].cpu()
-        want = torch.full_like(cache, -9)
+        want = torch.full_like(cache, -9 if source["kind"] in ("SWA","ring") else 9)
         table = state["blocks"][source["group"]]
-        data = expected[source["name"]]
+        data = expected.get(source["name"])
         if source["kind"] == "SWA":
-            for offset in range(128):
-                logical, row = divmod(state["N"] - 128 + offset, 64)
+            for offset in range(state["N"] - state["S"]):
+                logical, row = divmod(state["S"] + offset, 64)
                 want[table[logical], row] = data[offset]
-        else:
+        elif source["kind"] == "ring":
             want[table[0]] = data
+        elif state["N"] % 2:
+            logical, row = divmod(state["N"]-1, cache.shape[1])
+            if source["kind"] == "indexer_tail":
+                offset=0
+                for part in indexer_row_views(want, table[logical], row):
+                    part.copy_(data[offset:offset+part.numel()]);offset+=part.numel()
+            else:
+                want[table[logical],row]=data[0]
         assert torch.equal(cache, want)  # Includes every untouched guard row.
+        if "padding" in source:
+            assert torch.all(source["padding"].cpu()==9)
     for actual, name in (
         (hidden, "HC"),
         (pre, "pre_mix"),
@@ -186,3 +223,38 @@ def test_cuda_import_waits_for_receive_and_preserves_current_pages():
     worker._p21_host_inflight[0]["event"].synchronize()
     check_import(worker, state, expected, hidden, pre)
     assert torch.cuda.mem_get_info()[0] >= (1 << 30)
+
+
+@pytest.mark.parametrize("main_format", ["none", "i8g64", "i4g32"])
+@pytest.mark.parametrize("n", [128,129,255,256,257,4099,1048575,1048576])
+def test_p_export_d_import_preserve_boundary_payload_scale_and_neighbors(monkeypatch, main_format, n):
+    worker,state,packet,expected,hidden,pre=import_fixture(n=n,main_format=main_format)
+    mock_copy_stream(monkeypatch,worker)
+    rows=n-state['S']
+    worker._p21_import_states([(1,state,packet,dict(event=object()))],[0,6,6+rows],hidden,pre)
+    check_import(worker,state,expected,hidden,pre)
+    # Feed the exact destination views back through the real P exporter. This
+    # checks page addressing/SoA and packed main rows, with no mock copy kernel.
+    producer=HostSourceWorker.__new__(HostSourceWorker)
+    producer._src_specs=[dict(s,R=s['cache'].shape[1],ratio=1) for s in worker._p21_cache_sources]
+    pool={}
+    for source in producer._src_specs:
+        kind=source['kind'];cache=source['cache']
+        shape=((129,512) if kind=='SWA' else (16,1024) if kind=='ring'
+               else (132,) if kind=='indexer_tail' else (1,cache.shape[-1]))
+        dtype=torch.uint8 if kind=='indexer_tail' else cache.dtype
+        pool[source['name']]=torch.empty(shape,dtype=dtype)
+    records=producer._copy_caches(dict(state,pool=pool))
+    for rec in records:
+        value=pool[rec['name']]
+        if rec['kind']=='SWA':value=value[:rows]
+        assert torch.equal(value,expected[rec['name']])
+    main=next(s['cache'] for s in producer._src_specs if s['kind']=='main_tail')
+    scale=next((s['cache'] for s in producer._src_specs if s['kind']=='main_tail_scale'),None)
+    layer=SimpleNamespace(kv_cache=main,kv_cache_scales=scale)
+    specs=main_boundary_sources(layer,'model.layers.20.attn',24,main_format)
+    assert len(specs)==1+(main_format!='none')
+    if scale is not None:
+        layer.kv_cache_scales=scale[:,:-1]
+        with pytest.raises(ValueError,match='paired main'):
+            main_boundary_sources(layer,'model.layers.20.attn',24,main_format)

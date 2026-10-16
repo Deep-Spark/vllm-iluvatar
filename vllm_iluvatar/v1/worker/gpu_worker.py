@@ -131,17 +131,21 @@ class IluWorker(Worker):
         fmt = main_kv_format()
         if fmt is not None:
             self._initialize_compressed_kv(kv_cache_config, fmt)
+            self._initialize_prefix_cache()
             return
         orig_cls = self._try_replace_model_runner_class()
         try:
             super().initialize_from_config(kv_cache_config)
-            if getattr(self, "prefix_state", None) is not None:
-                from vllm.distributed.kv_transfer import get_kv_transfer_group
-
-                self.prefix_state.initialize_cache()
-                get_kv_transfer_group().attach_prefix_state(self.prefix_state)
+            self._initialize_prefix_cache()
         finally:
             self.model_runner.__class__ = orig_cls
+
+    def _initialize_prefix_cache(self) -> None:
+        if getattr(self, "prefix_state", None) is not None:
+            from vllm.distributed.kv_transfer import get_kv_transfer_group
+
+            self.prefix_state.initialize_cache()
+            get_kv_transfer_group().attach_prefix_state(self.prefix_state)
 
     def _validate_compressed_kv_runner(self) -> None:
         import vllm.envs as envs

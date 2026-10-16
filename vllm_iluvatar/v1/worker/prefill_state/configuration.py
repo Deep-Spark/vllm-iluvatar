@@ -279,6 +279,7 @@ class PrefixGeometry:
     candidates: int = 2048
     ring_layers: tuple[int, ...] = (2, 8, 14)
     indexer_width: int = 132
+    main_kv_format: str = "none"
 
     def __post_init__(self):
         if any(
@@ -302,6 +303,22 @@ class PrefixGeometry:
             for layer in self.ring_layers
         ):
             raise ValueError("Invalid compressor source layer")
+        self.main_tail_fields()
+
+    def main_tail_fields(self) -> dict:
+        """Boundary payload and optional scales, without requantization."""
+        if self.main_kv_format == "none":
+            return {"main_tail": ((1, self.head_dim), "BF16")}
+        formats = {"i8g64": (8, 64), "i4g32": (4, 32)}
+        if self.main_kv_format not in formats:
+            raise ValueError("Unsupported prefix-state main KV format")
+        bits, group = formats[self.main_kv_format]
+        if self.head_dim % group:
+            raise ValueError("Main KV head dimension must contain complete groups")
+        return {
+            "main_tail": ((1, self.head_dim * bits // 8), "U8"),
+            "main_tail_scale": ((1, self.head_dim // group), "FP16"),
+        }
 
     def to_dict(self) -> dict:
         return {**asdict(self), "ring_layers": list(self.ring_layers)}
@@ -327,6 +344,7 @@ class PrefixGeometry:
             hf.candidate_topk_blocks,
             tuple(i for i in hf.kv_source_layer_ids if hf.compress_ratios[i] > 1),
             width,
+            os.getenv("VLLM_ILU_DS41_COMPRESSED_KV_FORMAT", "none"),
         )
 
     def fields(self, n: int, ring_rows: dict[int, int] | None = None) -> dict:
@@ -358,11 +376,13 @@ class PrefixGeometry:
         if n % 2:
             result.update(
                 {
-                    ("main_tail", self.prefix_depth - 1): ((1, self.head_dim), "BF16"),
                     ("indexer_tail", self.prefix_depth - 1): (
                         (self.indexer_width,),
                         "U8",
                     ),
                 }
             )
+        if n % 2:
+            result.update({(kind, self.prefix_depth - 1): layout
+                           for kind, layout in self.main_tail_fields().items()})
         return result

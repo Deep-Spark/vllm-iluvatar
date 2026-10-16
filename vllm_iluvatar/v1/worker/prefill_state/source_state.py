@@ -18,7 +18,23 @@ GET_STATE = b"p21_state_v1"
 PACKET_BYTES = 9_504_768
 DTYPES = {"torch.bfloat16": ("BF16", 2), "torch.float32": ("FP32", 4),
           "torch.int32": ("I32", 4), "BF16": ("BF16", 2),
-          "FP32": ("FP32", 4), "I32": ("I32", 4)}
+          "FP32": ("FP32", 4), "I32": ("I32", 4),
+          "torch.uint8": ("U8", 1), "U8": ("U8", 1)}
+
+
+def replay_layout(n: int) -> tuple[int, int, int]:
+    """Even received prefix H, replay start S, and complete query128/129."""
+    if type(n) is not int or n < 128:
+        raise ValueError("Prefix-state prompt length must be an integer >=128")
+    hit = n - n % 2
+    return hit, hit - 128, 128 + n % 2
+
+
+def packet_bytes(n: int, indexer_bytes: int = 132) -> int:
+    _, _, rows = replay_layout(n)
+    if indexer_bytes not in (132, 256):
+        raise ValueError("Unsupported indexer boundary-row byte count")
+    return PACKET_BYTES + (rows - 128) * (72_720 + 1_024 + indexer_bytes)
 
 
 def save(path: Path, value: dict) -> None:
@@ -46,15 +62,26 @@ def local_paths(engine_id: str) -> tuple[Path, str]:
     return wire, nonce
 
 
-def validate_fields(fields: list[dict], size: int) -> None:
+def validate_fields(fields: list[dict], size: int, n: int = 128) -> None:
     """Reject overlapping, incomplete or incorrectly typed destination records."""
-    if size != PACKET_BYTES or not isinstance(fields, list):
+    _, _, rows = replay_layout(n)
+    if not isinstance(fields, list):
         raise ValueError("Expected a complete prefix-21 packet")
-    wanted = {( "SWA", i): ((128, 512), "BF16") for i in range(21)}
+    wanted = {( "SWA", i): ((rows, 512), "BF16") for i in range(21)}
     wanted.update({("ring", i): ((16, 1024), "FP32") for i in (2, 8, 14)})
     wanted.update({("boundary21", name): (shape, dtype) for name, shape, dtype in (
-        ("HC", (128, 4, 5120), "BF16"), ("pre_mix", (128, 4), "FP32"),
-        ("topk20", (128, 512), "I32"), ("candidates20", (128, 2048), "I32"))})
+        ("HC", (rows, 4, 5120), "BF16"), ("pre_mix", (rows, 4), "FP32"),
+        ("topk20", (rows, 512), "I32"), ("candidates20", (rows, 2048), "I32"))})
+    indexer_bytes = 132
+    if rows == 129:
+        index = [f for f in fields if f.get('kind') == 'indexer_tail']
+        if len(index) != 1 or tuple(index[0].get('shape', ())) not in ((132,), (256,)):
+            raise ValueError("Missing or invalid uncached indexer boundary row")
+        indexer_bytes = index[0]['shape'][0]
+        wanted.update({('main_tail', 20): ((1, 512), 'BF16'),
+                       ('indexer_tail', 20): ((indexer_bytes,), 'U8')})
+    if size != packet_bytes(n, indexer_bytes):
+        raise ValueError("Prefix-state packet byte count mismatch")
     seen, names, offset = set(), set(), 0
     for field in sorted(fields, key=lambda f: f["offset_bytes"]):
         if (not isinstance(field['name'], str) or not field['name']
@@ -84,9 +111,10 @@ def join_packets(wire: Path, source: Path, engine_id: str, nonce: str,
     if len(rows) != 8 or {r["rank"] for r in rows} != set(range(8)):
         raise ValueError("Expected all eight producer ranks")
     n, digest = rows[0]["N"], rows[0]["token_sha256"]
+    hit, start, _ = replay_layout(n)
     if not all(r["engine_id"] == engine_id and r["run_uuid"] == nonce
-               and r["id"] == request_id and r["N"] == r["H"] == n
-               and r["S"] == n - 128 and n >= 128 and n % 2 == 0
+               and r["id"] == request_id and r["N"] == n and r["H"] == hit
+               and r["S"] == start
                and r["token_sha256"] == digest
                and r["rank"] == r["pp"] * 2 + r["tp"]
                and 0 <= r["pp"] < 4 and r["tp"] in (0, 1)
@@ -110,13 +138,13 @@ def join_packets(wire: Path, source: Path, engine_id: str, nonce: str,
             parts.append(raw)
             offset += len(raw)
         raw = b"".join(parts)
-        validate_fields(fields, len(raw))
+        validate_fields(fields, len(raw), n)
         temporary = target / f"packet_tp{tp}.bin.tmp"
         temporary.write_bytes(raw)
         temporary.replace(target / f"packet_tp{tp}.bin")
         save(target / f"packet_tp{tp}.json", dict(
-            version=1, engine_id=engine_id, request_id=request_id, run_uuid=nonce,
-            epoch=epoch, tp=tp, N=n, H=n, S=n-128, token_sha256=digest,
+            version=2, engine_id=engine_id, request_id=request_id, run_uuid=nonce,
+            epoch=epoch, tp=tp, N=n, H=hit, S=start, token_sha256=digest,
             byte_count=len(raw), sha256=hashlib.sha256(raw).hexdigest(), fields=fields,
             source_complete=True, source_generation=stages[-1]["generation"],
             published_mono_ns=time.monotonic_ns()))
@@ -207,7 +235,7 @@ class StatePublisher:
 
 def serve_state(wire: Path | None, engine_id: str, message: tuple) -> tuple[dict, bytes]:
     """Serve a versioned pull on the already registered P side-channel socket."""
-    reply = dict(version=1, status="BAD_REQUEST", engine_id=engine_id)
+    reply = dict(version=2, status="BAD_REQUEST", engine_id=engine_id)
     if not isinstance(message, (tuple, list)) or len(message) != 6:
         return reply, b""
     _, remote_id, rid, tp, n, digest = message
@@ -217,7 +245,7 @@ def serve_state(wire: Path | None, engine_id: str, message: tuple) -> tuple[dict
         return {**reply, "status": "UNSUPPORTED"}, b""
     if (not isinstance(rid, str) or not 0 < len(rid) <= 512
             or type(tp) is not int or tp not in (0, 1) or type(n) is not int
-            or n < 128 or n % 2 or not isinstance(digest, str) or len(digest) != 64):
+            or n < 128 or not isinstance(digest, str) or len(digest) != 64):
         return reply, b""
     directory = request_dir(wire, rid)
     if request_dir(wire / 'source', rid).exists():
@@ -234,8 +262,9 @@ def serve_state(wire: Path | None, engine_id: str, message: tuple) -> tuple[dict
                 and source["fresh"] and meta["source_complete"]):
             return {**reply, "status": "IDENTITY_MISMATCH"}, b""
         raw = (directory / f"packet_tp{tp}.bin").read_bytes()
-        if len(raw) != PACKET_BYTES:
+        if len(raw) != meta['byte_count']:
             return {**reply, "status": "INVALID_PAYLOAD"}, b""
+        validate_fields(meta['fields'], len(raw), n)
         return {**reply, "status": "READY", "metadata": meta, "source": source}, raw
     except FileNotFoundError:
         status = "UNAVAILABLE" if (directory / "unavailable.json").exists() else "PENDING"
@@ -254,24 +283,25 @@ def fetch_state(socket, engine_id: str, request_id: str, tp: int,
         raise ValueError("Expected prefix-state metadata and CPU payload frames")
     reply = msgspec.msgpack.decode(frames[0])
     raw = frames[1]
-    if reply.get("version") != 1 or reply.get("engine_id") != engine_id:
+    if reply.get("version") != 2 or reply.get("engine_id") != engine_id:
         raise ValueError("Prefix-state endpoint identity mismatch")
     if reply.get("status") != "READY":
         if raw:
             raise ValueError("Unexpected payload for unavailable state")
         return reply, raw
     meta, source = reply["metadata"], reply["source"]
+    hit, start, _ = replay_layout(n)
     if not (meta["request_id"] == source["request_id"] == request_id
             and meta["engine_id"] == source["engine_id"] == engine_id
             and meta["run_uuid"] == source["run_uuid"] and meta["run_uuid"]
-            and meta["N"] == meta["H"] == source["N"] == n
-            and meta["S"] == n - 128 and meta["tp"] == tp
+            and meta['version'] == 2 and meta["N"] == source["N"] == n
+            and meta['H'] == hit and meta["S"] == start and meta["tp"] == tp
             and meta["token_sha256"] == source["token_sha256"] == digest
             and meta["epoch"] == source["epoch"] and meta["epoch"] > 0
             and meta["source_generation"] > 0
             and meta["source_complete"] and source["fresh"]
-            and len(raw) == meta["byte_count"] == PACKET_BYTES
+            and len(raw) == meta["byte_count"]
             and hashlib.sha256(raw).hexdigest() == meta["sha256"]):
         raise ValueError("Prefix-state payload identity or checksum mismatch")
-    validate_fields(meta["fields"], len(raw))
+    validate_fields(meta["fields"], len(raw), n)
     return reply, raw

@@ -4,7 +4,7 @@ import json
 import os
 import time
 import numpy as np
-from .source_state import local_paths
+from .source_state import local_paths, replay_layout
 def save(path,value):
     tmp=path.with_suffix('.tmp');tmp.write_text(json.dumps(value)+'\n');tmp.replace(path)
 def selected(group):
@@ -38,10 +38,12 @@ def install():
         value=old_mark(self,request,num_hit_tokens)
         scope=getattr(self,'_p21_success_scope',None)
         N=request.num_prompt_tokens
-        if scope is not None and scope[0] is request and scope[1] and N>=128 and N%2==0 and num_hit_tokens==N and value==128:
+        H, S, rows = replay_layout(N) if N >= 128 else (N, 0, 0)
+        if scope is not None and scope[0] is request and scope[1] and N>=128 and num_hit_tokens==H and value==128:
             record=getattr(request,'_p21_alloc_receipt',None)
             if record and record['external']>0:
-                request._p21_ready_receipt=dict(N=N,fullkv_valid_before_replay=N,original_receive_success=True,
+                request._p21_ready_receipt=dict(N=N,H=H,S=S,query_rows=rows,
+                    fullkv_valid_before_replay=H,original_receive_success=True,
                     alloc_serial=record['serial'],token_sha256=hashlib.sha256(np.asarray(request.prompt_token_ids,dtype=np.int32).tobytes()).hexdigest(),
                     mark_mono_ns=time.monotonic_ns())
                 request._p21_scheduler=self
@@ -72,7 +74,7 @@ def install():
                 self._p21_remote_endpoints.pop(rid,None);continue
             ready=getattr(request,'_p21_ready_receipt',None)
             if ready is None or rid not in output.num_scheduled_tokens:continue
-            if request.num_computed_tokens!=ready['N']-128:continue
+            if request.num_computed_tokens!=ready['S']:continue
             scheduler=request._p21_scheduler
             current=scheduler.kv_cache_manager.get_blocks(rid).get_block_ids(group_ids=self._p21_selected)
             record=request._p21_alloc_receipt

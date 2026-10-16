@@ -11,7 +11,8 @@ import types
 import numpy as np
 import torch
 from vllm_iluvatar.v1.worker.gpu_worker import IluWorker
-from .source_state import StatePublisher, local_paths, request_dir
+from .source_state import StatePublisher, local_paths, request_dir, replay_layout
+from .cache_rows import copy_indexer_row_to_host
 
 
 def save(path, value):
@@ -64,15 +65,16 @@ class HostSourceWorker(IluWorker):
             # Exact CPU input identity; no device->host read or JIT hashing.
             key = hashlib.sha256(np.asarray(all_token_ids[:prompt_len],
                                            dtype=np.int32).tobytes()).hexdigest()
-            eligible = prompt_len == len(all_token_ids) and prompt_len >= 128 and prompt_len % 2 == 0
+            eligible = prompt_len == len(all_token_ids) and prompt_len >= 128
+            hit, start, rows = replay_layout(prompt_len) if eligible else (prompt_len, 0, 0)
             with self._src_lock:
                 pool = self._src_free.popleft() if eligible and self._src_free else None
                 state = dict(id=req_id, idx=idx, generation=gen, N=prompt_len,
-                             H=prompt_len, S=prompt_len-128, token_sha256=key,
+                             H=hit, S=start, token_sha256=key,
                              initial_computed=int(num_computed_tokens), run_uuid=self._src_nonce,
                              engine_id=self._src_engine,
                              blocks=[[] for _ in range(runner.block_tables.num_kv_cache_groups)],
-                             pool=pool, coverage=[False]*128, spans=[], events=[], records=[],
+                             pool=pool, coverage=[False]*rows, spans=[], events=[], records=[],
                              phase='ACTIVE', abort=False, fresh=False,
                              add_mono_ns=time.monotonic_ns())
                 self._src_active[req_id] = state
@@ -168,6 +170,10 @@ class HostSourceWorker(IluWorker):
                     self._src_specs.append(dict(name=name, kind=kind, layer=layer_id,
                                                 group=g, cache=cache, R=int(cache.shape[1]),
                                                 ratio=1 if layer_id==20 else 2))
+                elif layer_id == 20 and (name.endswith('.attn') or name.endswith('.attn.indexer.k_cache')):
+                    kind = 'main_tail' if name.endswith('.attn') else 'indexer_tail'
+                    self._src_specs.append(dict(name=name, kind=kind, layer=20,
+                                                group=g, cache=cache, R=int(cache.shape[1]), ratio=1))
         assert sum(s['kind']=='SWA' for s in self._src_specs) == self._src_model.end_layer-self._src_model.start_layer
         assert sum(s['kind']=='ring' for s in self._src_specs) == (0 if self._src_pp==3 else 1)
         before = torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
@@ -176,15 +182,22 @@ class HostSourceWorker(IluWorker):
             pool = {}
             for s in self._src_specs:
                 if s['kind']=='SWA':
-                    shape, dtype = (128, 512), torch.bfloat16
+                    shape, dtype = (129, 512), torch.bfloat16
                 elif s['kind']=='ring':
                     shape, dtype = (16, 1024), torch.float32
+                elif s['kind']=='main_tail':
+                    assert s['cache'].dtype == torch.bfloat16 and s['cache'].shape[-1] == 512
+                    shape, dtype = (1, 512), torch.bfloat16
+                else:
+                    assert s['kind']=='indexer_tail'
+                    width = 132 if s['cache'].dtype == torch.uint8 else 256
+                    shape, dtype = (width,), torch.uint8
                 pool[s['name']] = torch.empty(shape, dtype=dtype, pin_memory=True)
             if self._src_pp==3:
-                pool.update(HC=torch.empty((128,4,5120), dtype=torch.bfloat16, pin_memory=True),
-                            pre_mix=torch.empty((128,4), dtype=torch.float32, pin_memory=True),
-                            topk20=torch.empty((128,512), dtype=torch.int32, pin_memory=True),
-                            candidates20=torch.empty((128,2048), dtype=torch.int32, pin_memory=True))
+                pool.update(HC=torch.empty((129,4,5120), dtype=torch.bfloat16, pin_memory=True),
+                            pre_mix=torch.empty((129,4), dtype=torch.float32, pin_memory=True),
+                            topk20=torch.empty((129,512), dtype=torch.int32, pin_memory=True),
+                            candidates20=torch.empty((129,2048), dtype=torch.int32, pin_memory=True))
             host_bytes += sum(t.numel()*t.element_size() for t in pool.values())
             self._src_free.append(pool)
         assert before == (torch.cuda.memory_allocated(), torch.cuda.memory_reserved()), 'source GPU owner changed'
@@ -244,7 +257,20 @@ class HostSourceWorker(IluWorker):
         for spec in self._src_specs:
             cache=spec['cache'];host=state['pool'][spec['name']]
             blocks=state['blocks'][spec['group']];segments=[]
-            if spec['kind']=='ring':
+            if spec['kind'] in ('main_tail', 'indexer_tail'):
+                if state['N'] == state['H']:
+                    continue
+                start, stop = state['H'], state['N']
+                logical, row = divmod(start, spec['R'])
+                assert logical < len(blocks) and 0 < int(blocks[logical]) < cache.shape[0]
+                block = int(blocks[logical])
+                if spec['kind'] == 'main_tail':
+                    host[0].copy_(cache[block, row], non_blocking=True)
+                else:
+                    copy_indexer_row_to_host(host, cache, block, row)
+                segments.append(dict(logical_rows=[start,stop], physical_block=block,
+                                     physical_rows=[row,row+1]))
+            elif spec['kind']=='ring':
                 assert len(blocks)==1 and 0<int(blocks[0])<cache.shape[0]
                 host.copy_(cache[int(blocks[0])],non_blocking=True)
                 start,stop=state['N']-16,state['N']
@@ -259,7 +285,8 @@ class HostSourceWorker(IluWorker):
                                          physical_rows=[lo,lo+count]))
                     p+=count
             records.append(dict(name=spec['name'],kind=spec['kind'],layer=spec['layer'],
-                group=spec['group'],dtype=str(host.dtype),shape=list(host.shape),
+                group=spec['group'],dtype=str(host.dtype),
+                shape=([state['N']-state['S'],512] if spec['kind']=='SWA' else list(host.shape)),
                 absolute_interval=[start,stop],segments=segments))
         return records
 
@@ -284,10 +311,12 @@ class HostSourceWorker(IluWorker):
                         records = list(state['records'])
                         if self._src_pp==3:
                             records += [dict(name=k, kind='boundary21', dtype=str(state['pool'][k].dtype),
-                                             shape=list(state['pool'][k].shape))
+                                             shape=[state['N']-state['S'],*state['pool'][k].shape[1:]])
                                         for k in ('HC','pre_mix','topk20','candidates20')]
                         for record in records:
                             host = state['pool'][record['name']]
+                            if tuple(host.shape) != tuple(record['shape']):
+                                host = host[:record['shape'][0]]
                             raw = host.contiguous().view(torch.uint8).numpy().tobytes()
                             if host.dtype==torch.bfloat16:
                                 # CPU bit-level finite check avoids a large

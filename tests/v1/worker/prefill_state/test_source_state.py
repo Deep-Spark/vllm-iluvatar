@@ -13,6 +13,9 @@ import zmq
 
 from vllm_iluvatar.v1.worker.prefill_state import source_state as pub
 from vllm_iluvatar.v1.worker.prefill_state.decode_prefix import PrefixBuffers
+from vllm_iluvatar.v1.worker.prefill_state.cache_rows import (
+    copy_indexer_row_to_host, restore_indexer_row,
+)
 
 
 class PacketTest(unittest.TestCase):
@@ -28,23 +31,29 @@ class PacketTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def shards(self, rid='chatcmpl-request', n=262144):
+    def shards(self, rid='chatcmpl-request', n=262144, indexer_bytes=132):
         directory=pub.request_dir(self.source,rid);directory.mkdir()
+        hit,start,q=pub.replay_layout(n)
         rows=[]
         for rank in range(8):
             pp,tp=divmod(rank,2)
             records=[]
             for layer in range(pp*5,pp*5+(5 if pp<3 else 6)):
                 records.append(dict(name=f'layers.{layer}.swa',kind='SWA',layer=layer,
-                                    shape=[128,512],dtype='torch.bfloat16'))
+                                    shape=[q,512],dtype='torch.bfloat16'))
             if pp<3:
                 records.append(dict(name=f'layers.{(2,8,14)[pp]}.ring',kind='ring',
                                     layer=(2,8,14)[pp],shape=[16,1024],dtype='torch.float32'))
             else:
                 for name,shape,dtype in (
-                    ('HC',[128,4,5120],'torch.bfloat16'),('pre_mix',[128,4],'torch.float32'),
-                    ('topk20',[128,512],'torch.int32'),('candidates20',[128,2048],'torch.int32')):
+                    ('HC',[q,4,5120],'torch.bfloat16'),('pre_mix',[q,4],'torch.float32'),
+                    ('topk20',[q,512],'torch.int32'),('candidates20',[q,2048],'torch.int32')):
                     records.append(dict(name=name,kind='boundary21',shape=shape,dtype=dtype))
+                if q==129:
+                    records.extend([
+                        dict(name='main20',kind='main_tail',layer=20,shape=[1,512],dtype='torch.bfloat16'),
+                        dict(name='indexer20',kind='indexer_tail',layer=20,shape=[indexer_bytes],dtype='torch.uint8'),
+                    ])
             offset=0
             for record in records:
                 size=pub.DTYPES[record['dtype']][1]
@@ -52,18 +61,42 @@ class PacketTest(unittest.TestCase):
                 record.update(offset_bytes=offset,byte_count=size);offset+=size
             raw=bytes([rank+1])*offset
             (directory/f'rank{rank}.bin').write_bytes(raw)
-            row=dict(id=rid,engine_id=self.engine,run_uuid=self.nonce,N=n,H=n,S=n-128,
+            row=dict(id=rid,engine_id=self.engine,run_uuid=self.nonce,N=n,H=hit,S=start,
                      token_sha256=self.digest,rank=rank,pp=pp,tp=tp,fresh=True,abort=False,
                      generation=rank+1,byte_count=len(raw),sha256=hashlib.sha256(raw).hexdigest(),
-                     records=records,spans=[dict(computed=n-128,query=128)])
+                     records=records,spans=[dict(computed=start,query=q)])
             pub.save(directory/f'auto_{rank}.json',row);rows.append(row)
         return rows
 
     def publisher(self,**kw):
         return pub.StatePublisher(self.wire,self.engine,self.nonce,**kw)
 
-    def request(self,rid='chatcmpl-request',tp=0):
-        return (pub.GET_STATE,self.engine,rid,tp,262144,self.digest)
+    def request(self,rid='chatcmpl-request',tp=0,n=262144):
+        return (pub.GET_STATE,self.engine,rid,tp,n,self.digest)
+
+    def test_odd_prompt_carries129_rows_and_uncached_cr1_boundary(self):
+        for n in (32769,76393,131071):
+            for width in (132,256):
+                with self.subTest(n=n,indexer_bytes=width):
+                    rid=f'odd-{n}-{width}'
+                    self.shards(rid,n,indexer_bytes=width);self.publisher().poll(10)
+                    reply,raw=pub.serve_state(self.wire,self.engine,self.request(rid,n=n))
+                    self.assertEqual(reply['status'],'READY')
+                    self.assertEqual(len(raw),pub.packet_bytes(n,width))
+                    meta=reply['metadata'];self.assertEqual((meta['H'],meta['S']),(n-1,n-129))
+                    pub.validate_fields(meta['fields'],len(raw),n)
+                    self.assertTrue(any(f['kind']=='main_tail' for f in meta['fields']))
+                    for kind in ('main_tail','indexer_tail'):
+                        fields=[f for f in meta['fields'] if f['kind']!=kind]
+                        with self.assertRaises(ValueError):pub.validate_fields(fields,len(raw),n)
+
+    def test_replay_geometry_rejects_stale_odd_prefix_boundary(self):
+        rows=self.shards('bad-odd-H',76393)
+        rows[0]['H']=76393
+        with self.assertRaisesRegex(ValueError,'capture mismatch'):
+            pub.join_packets(self.wire,self.source,self.engine,self.nonce,'bad-odd-H',1,rows)
+        for n in (0,127,True,128.0):
+            with self.assertRaises(ValueError):pub.replay_layout(n)
 
     def test_atomic_two_tp_completion_and_exact_wire_fields(self):
         rows=self.shards();rid=rows[0]['id'];directory=pub.request_dir(self.source,rid)
@@ -133,7 +166,7 @@ class PacketTest(unittest.TestCase):
         self.assertEqual(pub.serve_state(self.wire,self.engine,self.request(rid=rid))[0]['status'],'READY')
 
     def test_transport_without_shared_consumer_filesystem(self):
-        self.shards();self.publisher().poll(10)
+        self.shards();self.shards('odd',76393);self.publisher().poll(10)
         # Real TCP frames with a separate empty D root; only P opens packet files.
         consumer_root=Path(self.temp.name)/'consumer';consumer_root.mkdir()
         context=zmq.Context();server=context.socket(zmq.ROUTER);server.linger=0
@@ -141,7 +174,7 @@ class PacketTest(unittest.TestCase):
         errors=[]
         def serve():
             try:
-                for _ in range(4):
+                for _ in range(6):
                     identity,empty,data=server.recv_multipart();self.assertEqual(empty,b'')
                     reply,raw=pub.serve_state(self.wire,self.engine,msgspec.msgpack.decode(data))
                     server.send_multipart((identity,b'',msgspec.msgpack.encode(reply),raw))
@@ -153,6 +186,10 @@ class PacketTest(unittest.TestCase):
             for tp in (0,1):
                 reply,raw=pub.fetch_state(client,self.engine,'chatcmpl-request',tp,262144,self.digest)
                 self.assertEqual(reply['status'],'READY');self.assertEqual(len(raw),pub.PACKET_BYTES)
+                reply,raw=pub.fetch_state(client,self.engine,'odd',tp,76393,self.digest)
+                self.assertEqual(reply['status'],'READY')
+                self.assertEqual((reply['metadata']['H'],reply['metadata']['S']),(76392,76264))
+                self.assertEqual(len(raw),pub.packet_bytes(76393))
             with self.assertRaisesRegex(ValueError,'endpoint identity'):
                 pub.fetch_state(client,'wrong-engine','chatcmpl-request',0,262144,self.digest)
             reply,_=pub.fetch_state(client,self.engine,'chatcmpl-request',0,262144,'0'*64)
@@ -183,6 +220,41 @@ class PacketTest(unittest.TestCase):
         self.assertEqual(new['status'],'READY')
         self.assertGreater(new['metadata']['epoch'],old['metadata']['epoch'])
         self.assertGreater(new['metadata']['source_generation'],old['metadata']['source_generation'])
+
+
+class BoundaryRowTest(unittest.TestCase):
+    def test_quantized_page_key_and_scale_are_separate_with_page_padding(self):
+        rows=64
+        # Same132-byte nominal view and256-byte allocated page pitch as INT8.
+        source=torch.full((3,rows*256),0xA7,dtype=torch.uint8)
+        destination=torch.full_like(source,0x5D)
+        src=source.as_strided((3,rows,132),(rows*256,132,1))
+        dst=destination.as_strided((3,rows,132),(rows*256,132,1))
+        for row in (0,1,rows-1):
+            with self.subTest(row=row):
+                source[1,row*128:(row+1)*128]=torch.arange(128,dtype=torch.uint8)
+                source[1,rows*128+row*4:rows*128+(row+1)*4]=torch.tensor([1,2,3,4],dtype=torch.uint8)
+                before=destination.clone()
+                packet=torch.empty(132,dtype=torch.uint8)
+                copy_indexer_row_to_host(packet,src,1,row)
+                self.assertEqual(packet[:128].tolist(),list(range(128)))
+                self.assertEqual(packet[128:].tolist(),[1,2,3,4])
+                restore_indexer_row(dst,1,row,packet)
+                expected=before.clone()
+                expected[1,row*128:(row+1)*128]=packet[:128]
+                expected[1,rows*128+row*4:rows*128+(row+1)*4]=packet[128:]
+                self.assertTrue(torch.equal(destination,expected))
+
+    def test_bf16_boundary_row_at_new_page_preserves_all_other_rows(self):
+        source=torch.arange(3*64*128,dtype=torch.float32).to(torch.bfloat16).reshape(3,64,128)
+        destination=torch.zeros_like(source)
+        packet=torch.empty(256,dtype=torch.uint8)
+        copy_indexer_row_to_host(packet,source,2,0)
+        restore_indexer_row(destination,2,0,packet)
+        self.assertTrue(torch.equal(destination[2,0],source[2,0]))
+        self.assertEqual(torch.count_nonzero(destination[:2]).item(),0)
+        self.assertEqual(torch.count_nonzero(destination[2,1:]).item(),0)
+        with self.assertRaises(ValueError):restore_indexer_row(destination,2,0,packet[:132])
 
 
 class WorkspaceTest(unittest.TestCase):

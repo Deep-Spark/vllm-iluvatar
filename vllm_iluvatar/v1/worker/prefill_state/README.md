@@ -1,7 +1,7 @@
 # E25: service-owned complete producer prefix states
 
 E25 reuses the current producer's complete layer0–20 state and executes D's
-layer21–39 suffix for a new request's tail128 replay. Ordinary KV transfer,
+layer21–39 suffix for a new request's tail128/129 replay. Ordinary KV transfer,
 cache publication and receive ownership remain in OptNixl.
 
 Start both P and D with `python -m vllm_iluvatar.v1.worker.prefill_state.engine_entry
@@ -17,6 +17,19 @@ from its current remote-engine metadata, validates the payload and holds only
 pinned host memory. After the common EP vote, it copies fields on the current
 stream directly into existing SWA/ring/HC/topk/candidate destinations. Hosts
 remain alive until the copy event completes, including request cancellation.
+
+With the connector's two-token receive alignment, a prompt of length N has
+received prefix H=N-(N%2), replay start S=H-128 and query length N-S. Even
+prompts replay128 rows; odd prompts replay129, including one uncached token.
+Wire version2 captures all rows in [S,N). For129 it also carries the last
+layer20 CR1 main-KV row and indexer key/scale row. D restores those into the
+current live KV slots before suffix execution; the receipt still records H
+as the originally received prefix. Quantized indexer keys and FP32 scales
+occupy separate page regions and are copied separately, preserving page
+padding. CR2 layers2/8/14 keep the unfinished group in their exported ring.
+This adds1156 payload bytes for the missing INT8-indexer/main-KV row and
+72720 bytes for the additional boundary/SWA row per TP packet. Only P's CPU
+pool grows to129 rows. D's device workspace and graph pools do not grow.
 
 P and D may run on separate hosts. No P/D shared filesystem, shared `/dev/shm`,
 shared nonce, new network port or router extension is required. Each P node's

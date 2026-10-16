@@ -9,8 +9,9 @@ import time
 import numpy as np
 import torch
 from vllm_iluvatar.v1.worker.gpu_worker import IluWorker
-from .source_state import DTYPES, fetch_state, local_paths
+from .source_state import DTYPES, fetch_state, local_paths, replay_layout
 from .decode_prefix import PrefixBuffers
+from .cache_rows import indexer_row_views, restore_indexer_row
 
 def save(path,value):
     tmp=path.with_suffix('.tmp');tmp.write_text(json.dumps(value)+'\n');tmp.replace(path)
@@ -48,6 +49,7 @@ class LiveDWorker(IluWorker):
         self._p21_eager_warmed=False
         self._p21_raw_tables=self._p21_raw_slots=None
         self._p21_counters={'NONE':0,'GO':0,'fallback':0,'skipped_tail_rows':0,
+                            'tail128_requests':0,'tail129_requests':0,
                             'ready_packets':0,'source_unavailable':0}
         models=[m for m in self.model_runner.get_model().modules() if isinstance(m,module.IluDeepseekV41Model)]
         assert len(models)==1
@@ -176,9 +178,12 @@ class LiveDWorker(IluWorker):
                 if not isinstance(cache,torch.Tensor) or not cache.numel() or '.layers.' not in name:continue
                 layer=int(name.split('.layers.')[1].split('.')[0])
                 kind='SWA' if name.endswith('.attn.swa_cache') else 'ring' if name.endswith('.attn.compressor.state_cache') else None
+                if kind is None and layer == 20:
+                    kind = ('main_tail' if name.endswith('.attn') else
+                            'indexer_tail' if name.endswith('.attn.indexer.k_cache') else None)
                 if kind and layer<=20:self._p21_cache_sources.append({'name':name,'group':g,
                                                         'layer':layer,'kind':kind,'cache':cache})
-        assert len(self._p21_cache_sources)==24
+        assert len(self._p21_cache_sources)==26
         self._p21_ready=True
         save(self._p21_result/f'installed_{self._p21_rank}.json',{'rank':self._p21_rank,'dp':self._p21_dp,
              'tp':self._p21_tp,'actual_aux':list(self._p21_target.aux_hidden_state_layers),
@@ -209,7 +214,7 @@ class LiveDWorker(IluWorker):
                               'endpoint':self._p21_recv_metadata.get(rid,{}).get('source_endpoint')}
                              for rid,s in self._p21_states.items()
                              if rid not in self._p21_packets and rid not in self._p21_unavailable
-                             and not s.get('imported') and s['N']>=128 and s['N']%2==0]
+                             and not s.get('imported') and s['N']>=128]
                 for state in pending:
                     if self._p21_stop.is_set():break
                     endpoint=state['endpoint'];rid=state['id']
@@ -311,6 +316,7 @@ class LiveDWorker(IluWorker):
                 packet=self._p21_packets.get(rid);recv=self._p21_recv.get(rid)
                 full_ready=self._p21_full_ready.get(rid)
                 N=int(batch.prefill_len_np[i]);c=int(batch.num_computed_tokens_np[i])
+                H, S, rows = replay_layout(N) if N >= 128 else (N, 0, 0)
                 good=state is not None and packet is not None and recv is not None and full_ready is not None
                 detail={'id':rid,'N':N,'c':c,'q':int(q[i+1]-q[i]),'state':state is not None,
                         'packet':packet is not None,'recv':recv is not None,'full_ready':full_ready is not None,
@@ -319,22 +325,22 @@ class LiveDWorker(IluWorker):
                 if good:
                     meta=packet['metadata'];receipt=recv['metadata']
                     detail['initial_conditions']={
-                        'even_N':N%2==0,
-                        'source_lengths':N==state['N']==meta['N']==meta['H'],
-                        'tail_computed':c==N-128,
-                        'tail_query':int(q[i+1]-q[i])==128,
+                        'source_lengths':N==state['N']==meta['N'] and meta['H']==H and meta['S']==S,
+                        'tail_computed':c==S,
+                        'tail_query':int(q[i+1]-q[i])==rows,
                         'request_slot':state['idx']==int(batch.idx_mapping_np[i])==packet['idx'],
                         'generation':state['generation']==packet['generation']==self._p21_generation[state['idx']],
                         'CPU_state_ready':packet['local_nonce']==self._p21_nonce,
                         'original_receive_metadata':receipt is not None}
-                    good=(N%2==0 and N==state['N']==meta['N']==meta['H'] and
-                          c==N-128 and int(q[i+1]-q[i])==128 and
+                    good=(N>=128 and N==state['N']==meta['N'] and meta['H']==H and meta['S']==S and
+                          c==S and int(q[i+1]-q[i])==rows and
                           state['idx']==int(batch.idx_mapping_np[i])==packet['idx'] and
                           state['generation']==packet['generation']==self._p21_generation[state['idx']] and
                           packet['local_nonce']==self._p21_nonce and receipt is not None and
                           recv['post_layout_original_completion'] and
                           full_ready['request_id']==rid and full_ready['run_uuid']==self._p21_nonce and
-                          full_ready['N']==full_ready['fullkv_valid_before_replay']==N and
+                          full_ready['N']==N and full_ready['H']==full_ready['fullkv_valid_before_replay']==H and
+                          full_ready['S']==S and full_ready['query_rows']==rows and
                           full_ready['original_receive_success'] and full_ready['external']>0 and
                           full_ready['alloc_serial']>0 and
                           full_ready['token_sha256']==meta['token_sha256']==state['token_sha256'] and
@@ -381,10 +387,20 @@ class LiveDWorker(IluWorker):
                 for source in self._p21_cache_sources:
                     blocks=state['blocks'][source['group']];cache=source['cache']
                     if source['kind']=='SWA':
-                        lo=(state['N']-128)//64;hi=(state['N']-1)//64
+                        lo=packet['metadata']['S']//64;hi=(state['N']-1)//64
                         eligible &= len(blocks)>hi and all(0<int(blocks[j])<cache.shape[0]
                                      for j in range(lo,min(hi+1,len(blocks))))
-                    else:eligible &= len(blocks)==1 and 0<int(blocks[0])<cache.shape[0]
+                    elif source['kind']=='ring':
+                        eligible &= len(blocks)==1 and 0<int(blocks[0])<cache.shape[0]
+                    elif state['N'] % 2:
+                        logical,row=divmod(state['N']-1,cache.shape[1])
+                        valid=len(blocks)>logical and 0<int(blocks[logical])<cache.shape[0]
+                        eligible &= valid
+                        if valid and source['kind']=='indexer_tail':
+                            field=next(f for f in packet['metadata']['fields'] if f['kind']=='indexer_tail')
+                            eligible &= sum(v.numel() for v in indexer_row_views(cache,int(blocks[logical]),row))==field['byte_count']
+                        elif valid:
+                            eligible &= cache.dtype==torch.bfloat16 and cache.shape[-1]==512
         free,_=torch.cuda.mem_get_info()
         eligible &= free/2**20 >= (1100 if self._p21_eager_warmed else 1900)
         decision=torch.tensor([int(eligible),decode,len(tails),capacity,ndecode],dtype=torch.int64)
@@ -415,23 +431,32 @@ class LiveDWorker(IluWorker):
             torch.cuda.current_stream().wait_event(recv['event'])
             fields={f['name']:f for f in packet['metadata']['fields']}
             def view(field):
-                dtype={'BF16':torch.bfloat16,'FP32':torch.float32,'I32':torch.int32}[DTYPES[field['dtype']][0]]
+                dtype={'BF16':torch.bfloat16,'FP32':torch.float32,'I32':torch.int32,'U8':torch.uint8}[DTYPES[field['dtype']][0]]
                 off=field['offset_bytes'];end=off+field['byte_count']
                 return packet['host'][off:end].view(dtype).reshape(field['shape'])
             for source in self._p21_cache_sources:
+                if source['kind'] in ('main_tail','indexer_tail') and state['N']%2==0:
+                    continue
                 field=next(f for f in fields.values() if f.get('kind')==source['kind']
                            and f.get('layer')==source['layer'])
                 data=view(field);cache=source['cache'];blocks=state['blocks'][source['group']]
                 if source['kind']=='SWA':
-                    p=state['N']-128;off=0
+                    p=packet['metadata']['S'];off=0
                     while p<state['N']:
                         logical,lo=divmod(p,64);count=min(state['N']-p,64-lo)
                         block=int(blocks[logical]);assert 0<block<cache.shape[0]
                         cache[block,lo:lo+count].copy_(data[off:off+count],non_blocking=True)
                         p+=count;off+=count
-                else:
+                elif source['kind']=='ring':
                     assert len(blocks)==1 and 0<int(blocks[0])<cache.shape[0]
                     cache[int(blocks[0])].copy_(data,non_blocking=True)
+                else:
+                    logical,row=divmod(state['N']-1,cache.shape[1])
+                    block=int(blocks[logical])
+                    if source['kind']=='main_tail':
+                        cache[block,row].copy_(data[0],non_blocking=True)
+                    else:
+                        restore_indexer_row(cache,block,row,data)
             region=slice(int(q[i]),int(q[i+1]))
             h[region].copy_(view(fields['HC']),non_blocking=True)
             pre[region].copy_(view(fields['pre_mix']),non_blocking=True)
@@ -542,9 +567,12 @@ class LiveDWorker(IluWorker):
         h=model.norm(mhc.hc_pre(h,pre))
         self._p21_counters['GO']+=1
         self._p21_eager_warmed |= any(int(v[1]) for v in votes)
-        self._p21_counters['skipped_tail_rows']+=128*len(tails)
+        replay_rows=[state['N']-packet['metadata']['S'] for _,state,packet,_ in tails]
+        self._p21_counters['skipped_tail_rows']+=sum(replay_rows)
+        for rows in replay_rows:self._p21_counters[f'tail{rows}_requests']+=1
         save(self._p21_result/f'go_{self._p21_rank}.json',{'rank':self._p21_rank,
              'request_ids':[state['id'] for _,state,_,_ in tails],
+             'request_replay_rows':replay_rows,
              'decode_rows':decode,'global_votes':[v.tolist() for v in votes],
              'prefix_tokens':prefix_tokens,'max_num_seqs':self._p21_max_reqs,
              'counters':self._p21_counters,'GPU_packet_bytes':0,'new_graphs':0,

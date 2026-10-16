@@ -141,7 +141,8 @@ def test_sparse_reader_reaches_the_selected_native_facade(fmt, prefill, monkeypa
 
 
 @pytest.mark.parametrize("fmt", [I8G64, I4G32])
-def test_fused_producer_retains_latent_and_writes_paired_records_once(fmt, monkeypatch):
+@pytest.mark.parametrize("capacity", [3, 8])
+def test_fused_producer_retains_latent_and_writes_paired_records_once(fmt, capacity, monkeypatch):
     layer = attention(fmt, ratio=1)
     compressor = IluDeepseekCompressor.__new__(IluDeepseekCompressor)
     torch.nn.Module.__init__(compressor)
@@ -173,8 +174,8 @@ def test_fused_producer_retains_latent_and_writes_paired_records_once(fmt, monke
     facade.compress_norm_rope_quant_store = produce
     monkeypatch.setitem(sys.modules, name, facade)
     rotary = SimpleNamespace(cos_sin_cache=torch.empty(8, 64))
-    records = torch.empty(3, fmt.payload_bytes(512), dtype=torch.uint8)
-    scale_records = torch.empty(3, fmt.scale_groups(512), dtype=torch.float16)
+    records = torch.zeros(capacity, fmt.payload_bytes(512), dtype=torch.uint8)
+    scale_records = torch.zeros(capacity, fmt.scale_groups(512), dtype=torch.float16)
     latent = compressor(
         torch.zeros(3, 512),
         torch.arange(3),
@@ -189,7 +190,9 @@ def test_fused_producer_retains_latent_and_writes_paired_records_once(fmt, monke
     assert args[10] is layer.kv_cache and args[11] is layer.kv_cache_scales
     assert args[12] is slots and kwargs["format"] is fmt
     assert latent.dtype is torch.bfloat16 and (latent == 5).all()
-    assert (records == 0x3B).all() and (scale_records == 2).all()
+    assert kwargs["row_out"].shape[0] == kwargs["scale_out"].shape[0] == 3
+    assert (records[:3] == 0x3B).all() and (scale_records[:3] == 2).all()
+    assert (records[3:] == 0).all() and (scale_records[3:] == 0).all()
 
 
 @pytest.mark.parametrize("fmt", [I8G64, I4G32])

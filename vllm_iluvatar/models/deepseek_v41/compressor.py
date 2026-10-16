@@ -280,8 +280,12 @@ class IluDeepseekCompressor(nn.Module):
                 metadata.slot_mapping,
                 self.compress_ratio,
                 format=fmt,
-                row_out=row_out,
-                scale_out=scale_out,
+                # PP carriers retain max-batch capacity; the producer writes
+                # exactly this invocation's token rows, including graph pad.
+                row_out=None if row_out is None else row_out[:kv_score.shape[0]],
+                scale_out=(
+                    None if scale_out is None else scale_out[:kv_score.shape[0]]
+                ),
             )
             workspace = getattr(cache_layer, "compressed_kv_workspace", None)
             if workspace is not None:

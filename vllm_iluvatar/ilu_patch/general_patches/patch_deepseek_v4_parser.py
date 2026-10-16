@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Preserve DeepSeek-V4 DSML markup for legacy requests without tools."""
+"""Preserve DeepSeek-V4/V4.1 DSML markup for legacy requests without tools."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ def register() -> None:
     p.register_once(
         __name__,
         _apply,
-        detail="preserve DeepSeek-V4 DSML content when tools are omitted",
+        detail="preserve DeepSeek-V4/V4.1 DSML content when tools are omitted",
     )
 
 
@@ -71,23 +71,27 @@ def _wrap_extract_tool_calls_streaming(original: Callable) -> Callable:
 
 
 def _apply() -> None:
+    # V4.1 adapters come from a separate ``make_adapters`` call, so they do not
+    # inherit the V4 wrappers even though both share the DSML grammar.
     from vllm.parser.engine.registered_adapters import (
         DeepSeekV4ParserToolAdapter,
+        DeepSeekV41ParserToolAdapter,
     )
 
-    if getattr(DeepSeekV4ParserToolAdapter, _PATCH_MARKER, False):
-        return
+    for adapter_cls in (DeepSeekV4ParserToolAdapter, DeepSeekV41ParserToolAdapter):
+        if getattr(adapter_cls, _PATCH_MARKER, False):
+            continue
 
-    DeepSeekV4ParserToolAdapter.adjust_request = _wrap_adjust_request(
-        DeepSeekV4ParserToolAdapter.adjust_request
-    )
-    DeepSeekV4ParserToolAdapter.extract_tool_calls = _wrap_extract_tool_calls(
-        DeepSeekV4ParserToolAdapter.extract_tool_calls
-    )
-    DeepSeekV4ParserToolAdapter.extract_tool_calls_streaming = (
-        _wrap_extract_tool_calls_streaming(
-            DeepSeekV4ParserToolAdapter.extract_tool_calls_streaming
+        adapter_cls.adjust_request = _wrap_adjust_request(
+            adapter_cls.adjust_request
         )
-    )
-    setattr(DeepSeekV4ParserToolAdapter, _PATCH_MARKER, True)
+        adapter_cls.extract_tool_calls = _wrap_extract_tool_calls(
+            adapter_cls.extract_tool_calls
+        )
+        adapter_cls.extract_tool_calls_streaming = (
+            _wrap_extract_tool_calls_streaming(
+                adapter_cls.extract_tool_calls_streaming
+            )
+        )
+        setattr(adapter_cls, _PATCH_MARKER, True)
 

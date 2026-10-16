@@ -32,21 +32,14 @@ def _mqa_logits(*args, **kwargs):
     Callers pass the same ``[cu_seqlen_ks, cu_seqlen_ke)`` span that top-k
     consumes. The logits kernels on this ixformer take that visibility as
     ``valid_lens`` (``ke - ks``): column 0 of a row is the request's first
-    visible key, and the length is the only bound either side uses. INT8
-    queries go to ``dsa_indexer_mqa_logits`` with ``backend="ixinfer"``; a
-    uint8 cache with a bf16/fp8 query is the FP8 record; V4.1 BF16 cache
-    uses ``ixformer_native`` (override with
-    ``VLLM_ILU_V41_BF16_INDEXER_BACKEND``).
+    visible key, and the length is the only bound either side uses. A uint8
+    cache with a bf16/fp8 query is the FP8 record.
     """
-    q = args[0]
     kv_cache = args[3] if len(args) > 3 else kwargs["kv_cache"]
     ks = kwargs.pop("cu_seqlen_ks", None)
     ke = kwargs.pop("cu_seqlen_ke", None)
     if kwargs.get("valid_lens") is None and ks is not None and ke is not None:
         kwargs["valid_lens"] = ke - ks
-    if q.dtype is torch.int8:
-        kwargs["backend"] = "ixinfer"
-        return ixfops.dsa_indexer_mqa_logits(*args, **kwargs)
     if kv_cache.dtype == torch.uint8:
         # ixinfer supports only 64/256-row pages. Ratio1's 128 rows use native.
         kwargs.setdefault(
@@ -56,13 +49,6 @@ def _mqa_logits(*args, **kwargs):
         return ixfops.dsa_indexer_mqa_logits_with_blocks_fp8(*args, **kwargs)
     if envs.VLLM_ILU_GLM_DSA_NATIVE_MQA_LOGITS:
         kwargs.setdefault("backend", "ixformer_native")
-    elif os.environ.get("VLLM_ILU_V41_INDEXER_KV_DTYPE", "").strip().lower() == "bf16":
-        # Registry default is ixinfer (INT8 CQ). BF16 on ivcore11 needs the
-        # native C4A kernel that honors valid_lens and the 64/128 page sizes.
-        kwargs.setdefault(
-            "backend",
-            os.environ.get("VLLM_ILU_V41_BF16_INDEXER_BACKEND", "ixformer_native"),
-        )
     return ixfops.dsa_indexer_mqa_logits(*args, **kwargs)
 
 
@@ -305,17 +291,14 @@ def ilu_sparse_attn_indexer(
         # token. The same variable-query logits kernel used for prefill can
         # therefore handle requires_padding=True without an explicit pack step.
         decode_logits = None
-        cache_layer = get_forward_context().no_compile_layers.get(k_cache_prefix)
-        logits_buffer = (
-            getattr(cache_layer, "logits_buffer", None)
-            if cache_layer is not None
-            else None
-        )
+        if kv_cache.dtype == torch.uint8:
+            cache_layer = get_forward_context().no_compile_layers[k_cache_prefix]
+            logits_buffer = getattr(cache_layer, "logits_buffer", None)
+        else:
+            logits_buffer = None
         if logits_buffer is not None:
             if num_decode_tokens > logits_buffer.shape[0]:
-                raise ValueError(
-                    "indexer decode exceeds preallocated logits rows"
-                )
+                raise ValueError("FP8 indexer decode exceeds preallocated logits rows")
             decode_logits = logits_buffer[:num_decode_tokens, :decode_metadata.max_context_len]
         _indexer_logits_and_topk(
             candidate_blocks=candidate_blocks,

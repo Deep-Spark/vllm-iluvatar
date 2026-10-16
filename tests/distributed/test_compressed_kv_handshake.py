@@ -57,6 +57,31 @@ def payload(format_name, *, inner_format=None, remote_hash="compatible"):
     )
 
 
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_scheduler_global_prefix_width_is_not_a_hybrid_group_width(hybrid):
+    from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.opt_nixl.scheduler import (
+        NixlConnectorScheduler,
+    )
+
+    # EngineCore updates its prefix-cache width after spawning workers. The
+    # hybrid connector transfers scheduler blocks using per-layer descriptors.
+    scheduler = SimpleNamespace(
+        block_size=128, _has_multi_size=hybrid,
+        group_block_sizes=[64, 128, 256], node_info={},
+        _scheduler_loop_t=object(),
+    )
+    if hybrid:
+        NixlConnectorScheduler.set_xfer_handshake_metadata(
+            scheduler, {0: payload("i8g64")}
+        )
+        assert scheduler.node_info["physical_block_size"] == 128
+    else:
+        with pytest.raises(ValueError, match="all ranks of an engine must agree"):
+            NixlConnectorScheduler.set_xfer_handshake_metadata(
+                scheduler, {0: payload("i8g64")}
+            )
+
+
 def fetch(local_format, encoded, monkeypatch, *, enforce=False):
     monkeypatch.setenv("VLLM_ILU_DS41_COMPRESSED_KV_FORMAT", local_format)
     worker = NixlConnectorWorker.__new__(NixlConnectorWorker)

@@ -548,7 +548,13 @@ class NixlConnectorScheduler:
                     "blocks per logical KV block; NIXL registers scheduler "
                     "blocks and only supports 1"
                 )
-            if nixl_meta.physical_block_size != physical_block_size:
+            # Hybrid groups carry their own token widths and kernel splits.
+            # EngineCore may change its global prefix-cache width after workers
+            # were spawned; that scalar is not the geometry of every group.
+            if (
+                not self._has_multi_size
+                and nixl_meta.physical_block_size != physical_block_size
+            ):
                 raise ValueError(
                     f"rank {global_rank} block size "
                     f"{nixl_meta.physical_block_size} != {physical_block_size}; "

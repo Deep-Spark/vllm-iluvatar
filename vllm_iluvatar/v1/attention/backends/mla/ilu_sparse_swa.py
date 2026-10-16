@@ -106,7 +106,7 @@ def build_dspark_noncausal_swa_indices(
         if start >= num_decode_tokens:
             break
         end = min(end, num_decode_tokens)
-        query_len = end - start
+        query_len = sum(is_valid_cpu[start:end])
         if query_len <= 0:
             continue
         seq_len = seq_lens_cpu[req_idx]

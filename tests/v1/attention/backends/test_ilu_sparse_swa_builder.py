@@ -207,6 +207,26 @@ def test_noncausal_dspark_uses_python_indices_not_ixformer():
         assert md.decode_swa_indices[q, 0, : md.decode_swa_lens[q]].tolist() == first
 
 
+def test_noncausal_dspark_ignores_queries_past_max_model_len():
+    block_size = 4
+    is_valid = torch.tensor([True, True, False, False, False, False])
+    indices, lens = build_dspark_noncausal_swa_indices(
+        seq_lens=torch.tensor([16], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 6], dtype=torch.int32),
+        block_table=torch.arange(4, dtype=torch.int32).unsqueeze(0),
+        is_valid_token=is_valid,
+        block_size=block_size,
+        window_size=4,
+        index_width=8,
+        num_decode_tokens=6,
+        device=torch.device("cpu"),
+    )
+
+    assert lens.tolist() == [6, 6, 0, 0, 0, 0]
+    assert indices[0, 0, :6].tolist() == [10, 11, 12, 13, 14, 15]
+    assert torch.equal(indices[0], indices[1])
+
+
 def test_noncausal_without_dspark_raises():
     builder = _make_builder(is_dspark=False, decode_threshold=8)
     cad = _make_cad(query_lens=[5], seq_lens=[15], causal=False)
@@ -311,7 +331,7 @@ def test_v41_wrapper_forwards_replay_start_to_shared_builder():
     builder._valid_slots = torch.empty(64, dtype=torch.int64)
     cad = _make_cad(query_lens=[1], seq_lens=[12], causal=True)
     replay_start = torch.tensor([8], dtype=torch.int32)
-    metadata = SimpleNamespace(causal=True)
+    metadata = SimpleNamespace(causal=True, num_prefill_tokens=0)
 
     with patch.object(
         IluDeepseekSparseSWAMetadataBuilder,

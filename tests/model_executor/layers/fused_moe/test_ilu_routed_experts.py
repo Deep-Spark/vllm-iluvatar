@@ -12,9 +12,11 @@ from vllm.model_executor.custom_op import op_registry_oot
 
 from vllm_iluvatar.ilu_patch import general_patch as p
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_routed_experts import (
+    _LOAD_STAGING_SLACK,
     _ROUTED_EXPERTS_LOAD_WEIGHTS_BASELINE,
     _ROUTED_EXPERTS_WEIGHT_LOADER_BASELINE,
     IluRoutedExperts,
+    _release_load_staging,
 )
 
 _MAIN_DB9527A468_WEIGHT_LOADER_SHA = (
@@ -266,3 +268,26 @@ def test_load_weights_w8a8_nn_keeps_fused_w2_as_inter_hidden():
 
     assert calls
     assert set(shape for _, shape in calls) == {torch.Size([1536, 2048])}
+
+
+def test_release_load_staging_empties_when_reserved_slack_exceeds_1gib(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        torch.cuda, "memory_reserved", lambda device: 2 * _LOAD_STAGING_SLACK
+    )
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append(True))
+    _release_load_staging(torch.device("cuda"))
+    assert calls == [True]
+
+
+def test_release_load_staging_keeps_cache_under_slack_and_on_cpu(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        torch.cuda, "memory_reserved", lambda device: _LOAD_STAGING_SLACK
+    )
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append(True))
+    _release_load_staging(torch.device("cuda"))
+    _release_load_staging(torch.device("cpu"))
+    assert calls == []

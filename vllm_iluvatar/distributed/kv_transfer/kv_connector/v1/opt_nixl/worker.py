@@ -57,6 +57,7 @@ from .handshake_validation import (
     validate_block_id_groups,
     validate_compatibility_hash,
     validate_descriptor_geometry,
+    validate_main_kv_format,
     validate_parallel_topology,
 )
 from .host_kv_stub import (
@@ -280,7 +281,7 @@ class NixlConnectorWorker:
         )
         # all local registered data
         self._registered_descs: list[Any] = []
-        self.xfer_handshake_metadata: NixlAgentMetadata | None = None
+        self.xfer_handshake_metadata: NixlHandshakePayload | None = None
         # infos about registered kv cache
         self.layer_ptr_mapping = defaultdict(list[int])
         self.layer_desc_mapping = defaultdict(list[tuple[int, int]])
@@ -775,7 +776,8 @@ class NixlConnectorWorker:
         return [(offset + start, size) for start, size in split] + [(offset, whole)]
 
     def _register_kv_views(
-        self, kv_caches: dict[str, torch.Tensor]
+        self, kv_caches: dict[str, torch.Tensor],
+        kv_cache_scales: dict[str, torch.Tensor] | None = None,
     ) -> tuple[list, list]:
         """Register every KV view with NIXL.
 
@@ -799,6 +801,15 @@ class NixlConnectorWorker:
         registered_allocation_sizes: dict[int, int] = {}
         plain_storage_nbytes: int | None = None
         self._reset_registration_mappings()
+        from ixformer.inference.functions.deepseek.quantized_kv_format import (
+            resolve_quant_format,
+        )
+
+        from vllm_iluvatar.models.deepseek_v41.compressed_kv import (
+            is_quantized_main_spec,
+        )
+
+        forward_context = self.vllm_config.compilation_config.static_forward_context
         skip_layers = get_skip_layers()
         unknown_skip_layers = skip_layers - kv_caches.keys()
         if unknown_skip_layers:
@@ -855,6 +866,25 @@ class NixlConnectorWorker:
                     seen_base_addresses_check=seen_base_addresses_check,
                     registered_allocation_sizes=registered_allocation_sizes,
                 )
+                if is_quantized_main_spec(layer_spec):
+                    fmt = resolve_quant_format(layer_spec.cache_dtype_str)
+                    scales = (kv_cache_scales or {}).get(layer_name)
+                    if scales is None:
+                        scales = getattr(forward_context[layer_name], "kv_cache_scales", None)
+                    if not isinstance(scales, torch.Tensor):
+                        raise ValueError(f"{layer_name}: compressed KV registration requires its scale plane")
+                    scale_registration = self._memory_registration_planner.describe_scale_plane(
+                        layer_name=layer_name, scales=scales, payload=registration,
+                        scale_page_bytes=fmt.scale_page_bytes(layer_spec.head_size),
+                    )
+                    self._record_registered_kv_region(
+                        layer_name=layer_name, cache=scales, layer_spec=layer_spec,
+                        registration=scale_registration,
+                        segments=list(scale_registration.payload_segments),
+                        caches_data=caches_data, seen_base_addresses=seen_base_addresses,
+                        seen_base_addresses_check=seen_base_addresses_check,
+                        registered_allocation_sizes=registered_allocation_sizes,
+                    )
 
         return caches_data, seen_base_addresses
 
@@ -892,9 +922,14 @@ class NixlConnectorWorker:
     def register_kv_caches(
         self,
         kv_caches: dict[str, torch.Tensor],
-        kv_cache_scales: dict[str, tuple[torch.Tensor]] | None = None,
+        kv_cache_scales: dict[str, torch.Tensor] | None = None,
     ) -> None:
         """Register the KV Cache data in nixl."""
+        from vllm_iluvatar.models.deepseek_v41.compressed_kv import main_kv_format
+
+        main_format = main_kv_format()
+        if main_format is not None and host_kv_enabled():
+            raise NotImplementedError("Compressed main KV requires paired direct-VRAM registration")
         self.gpu_kv_cache = kv_caches
         kv_caches = may_override_kv_cache(kv_caches)
         self.cpu_kv_cache = kv_caches
@@ -933,7 +968,7 @@ class NixlConnectorWorker:
         )
         self.compat_hash = compute_nixl_compatibility_hash(self.vllm_config)
 
-        caches_data, seen_base_addresses = self._register_kv_views(kv_caches)
+        caches_data, seen_base_addresses = self._register_kv_views(kv_caches, kv_cache_scales)
         if caches_data:
             self._register_nixl_memory(caches_data, seen_base_addresses)
         else:
@@ -997,6 +1032,7 @@ class NixlConnectorWorker:
             global_rank=self.global_rank,
             tp_rank=self.tp_rank,
             pp_rank=self.pp_rank,
+            main_kv_format=main_format.name if main_format is not None else "none",
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -1004,6 +1040,7 @@ class NixlConnectorWorker:
         self.xfer_handshake_metadata = NixlHandshakePayload(
             compatibility_hash=self.compat_hash,
             agent_metadata_bytes=encoder.encode(agent_metadata),
+            main_kv_format=agent_metadata.main_kv_format,
         )
 
     ############################################################
@@ -1168,15 +1205,30 @@ class NixlConnectorWorker:
                 f"an incompatibility between connector version. Error: {e}"
             ) from e
 
+        from vllm_iluvatar.models.deepseek_v41.compressed_kv import main_kv_format
+
+        main_format = main_kv_format()
+        local_format = main_format.name if main_format is not None else "none"
+        requires_compat = validate_main_kv_format(
+            local_format,
+            handshake_payload.main_kv_format,
+            remote_engine_id=engine_id,
+        )
         validate_compatibility_hash(
             self.compat_hash,
             handshake_payload.compatibility_hash,
             remote_engine_id=engine_id,
-            enforce=self.enforce_handshake_compat,
+            enforce=self.enforce_handshake_compat or requires_compat,
         )
         metadata: NixlAgentMetadata = decoder.decode(
             handshake_payload.agent_metadata_bytes
         )
+        if metadata.main_kv_format != handshake_payload.main_kv_format:
+            raise RuntimeError(
+                f"Remote NIXL main KV format tag disagrees with agent metadata "
+                f"for engine {engine_id}: envelope={handshake_payload.main_kv_format}, "
+                f"agent={metadata.main_kv_format}"
+            )
         if metadata.engine_id != engine_id:
             raise RuntimeError(
                 f"Remote NIXL agent engine ID mismatch. "

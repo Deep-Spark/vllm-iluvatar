@@ -72,8 +72,10 @@ DISCONNECT_MSG = msgspec.msgpack.encode(("disconnect", "test-id"))[
 #  14: reconnect teardown tokens and worker-complete acknowledgements
 #  15: request-generation ownership fencing for producer WRITE destinations
 #  16: delimiter-safe request generations for native completion notifications
+#  17: explicit main KV format tags in envelope and agent metadata;
+#      compressed peers require matching tags and compatibility hashes
 #
-NIXL_CONNECTOR_VERSION: int = 16
+NIXL_CONNECTOR_VERSION: int = 17
 
 
 class TransferIntent(str, Enum):
@@ -128,6 +130,8 @@ class NixlAgentMetadata:
     global_rank: int
     pp_rank: int  # for check use
     tp_rank: int
+    # Engine-wide setting, including ranks with no registered main KV views.
+    main_kv_format: str = "none"
 
 
 @dataclass
@@ -136,9 +140,9 @@ class NixlHandshakePayload(KVConnectorHandshakeMetadata):
     Wrapper for NIXL handshake sent over the wire.
 
     Enables two-phase decoding for graceful compatibility checking:
-    1. Decode NixlHandshakePayload to get compatibility_hash
-    2. Compute local hash and compare
-    3. Only if hashes match, decode agent_metadata_bytes
+    1. Decode NixlHandshakePayload to get the format and compatibility_hash
+    2. Require matching format and hash if either peer uses quantized main KV
+    3. Decode agent_metadata_bytes and require its format tag to agree
 
     This prevents decoder errors when NixlAgentMetadata schema is
     incompatible, allowing graceful failure with clear error message.
@@ -146,6 +150,8 @@ class NixlHandshakePayload(KVConnectorHandshakeMetadata):
 
     compatibility_hash: str
     agent_metadata_bytes: bytes  # NixlAgentMetadata encoded
+    # Defaults preserve decoding of old, unquantized handshakes.
+    main_kv_format: str = "none"
 
 
 def compute_nixl_compatibility_hash(vllm_config: VllmConfig) -> str:
@@ -194,6 +200,9 @@ def compute_nixl_compatibility_hash(vllm_config: VllmConfig) -> str:
         "cache_dtype": str(cache_config.cache_dtype),
         "is_hma_enabled": is_hma_enabled,
     }
+    from vllm_iluvatar.models.deepseek_v41.compressed_kv import format_factors
+
+    factors.update(format_factors())
 
     compat_hash = hash_factors(factors)
     logger.info(

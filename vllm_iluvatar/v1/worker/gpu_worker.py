@@ -68,6 +68,57 @@ class IluWorker(Worker):
         return orig_cls
 
     def determine_available_memory(self) -> int:
+        from vllm_iluvatar.models.deepseek_v41.compressed_kv import (
+            CacheBudget,
+            main_kv_format,
+            prefill_producer_for_config,
+            retained_mapper_bytes_for_config,
+            workspace_bytes_for_config,
+        )
+
+        fmt = main_kv_format()
+        if fmt is not None:
+            self._validate_compressed_kv_runner()
+            workspace_bytes = workspace_bytes_for_config(self.vllm_config)
+            prefill_producer = prefill_producer_for_config(self.vllm_config)
+            retained_mapper_bytes = retained_mapper_bytes_for_config(self.vllm_config)
+            if retained_mapper_bytes >= workspace_bytes:
+                raise ValueError(
+                    "Compressed mapper credit leaves no usable workspace arena"
+                )
+            from vllm_iluvatar.v1.worker.gpu.compressed_kv_profiling import (
+                compressed_kv_profiling,
+            )
+
+            with compressed_kv_profiling(
+                self.model_runner,
+                fmt,
+                workspace_bytes=workspace_bytes - retained_mapper_bytes,
+                prefill_producer=prefill_producer,
+            ):
+                available = super().determine_available_memory()
+            budget = CacheBudget.create(
+                available,
+                fmt,
+                workspace_bytes=workspace_bytes,
+                retained_mapper_bytes=retained_mapper_bytes,
+                prefill_producer=prefill_producer,
+            )
+            self._compressed_kv_budget = budget
+            # The scheduler receives payload bytes only. Sidecars and the
+            # single fixed workspace are reserved before its block allocator.
+            logger.info(
+                "Compressed KV budget: format=%s total=%d payload=%d "
+                "scale_page=%d workspace=%d retained_mapper=%d arena=%d",
+                fmt.name,
+                available,
+                budget.payload_bytes,
+                budget.scale_page_bytes,
+                budget.workspace_bytes,
+                budget.retained_mapper_bytes,
+                budget.arena_bytes,
+            )
+            return budget.payload_bytes
         orig_cls = self._try_replace_model_runner_class()
         try:
             return super().determine_available_memory()
@@ -75,6 +126,12 @@ class IluWorker(Worker):
             self.model_runner.__class__ = orig_cls
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+        from vllm_iluvatar.models.deepseek_v41.compressed_kv import main_kv_format
+
+        fmt = main_kv_format()
+        if fmt is not None:
+            self._initialize_compressed_kv(kv_cache_config, fmt)
+            return
         orig_cls = self._try_replace_model_runner_class()
         try:
             super().initialize_from_config(kv_cache_config)
@@ -85,6 +142,81 @@ class IluWorker(Worker):
                 get_kv_transfer_group().attach_prefix_state(self.prefix_state)
         finally:
             self.model_runner.__class__ = orig_cls
+
+    def _validate_compressed_kv_runner(self) -> None:
+        import vllm.envs as envs
+
+        if not self.vllm_config.use_v2_model_runner:
+            raise NotImplementedError(
+                "DS41 compressed main KV requires model runner V2"
+            )
+        model_config = getattr(self.vllm_config, "model_config", None)
+        if model_config is not None:
+            hf_config = getattr(
+                model_config, "hf_text_config", getattr(model_config, "hf_config", None)
+            )
+            if getattr(hf_config, "model_type", None) != "deepseek_v41":
+                raise ValueError("DS41 compressed main KV only supports DeepSeek V4.1")
+        if self.cache_config.cache_dtype != "bfloat16":
+            raise ValueError(
+                "DS41 compressed main KV requires --kv-cache-dtype bfloat16 for SWA"
+            )
+        if envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE or envs.VLLM_ILU_MLA_ATTN_QUANT_TYPE:
+            raise ValueError(
+                "DS41 compressed main KV cannot use legacy V1 quantization settings"
+            )
+        if self.vllm_config.attention_config.hisparse_config is not None:
+            raise NotImplementedError(
+                "DS41 compressed main KV does not use the HiSparse allocator"
+            )
+
+    def _initialize_compressed_kv(self, kv_cache_config, fmt) -> None:
+        from vllm_iluvatar.models.deepseek_v41.compressed_kv import (
+            CompressedKVState,
+            plan_scale_layout,
+        )
+
+        self._validate_compressed_kv_runner()
+        budget = getattr(self, "_compressed_kv_budget", None)
+        if budget is None:
+            raise RuntimeError(
+                "Compressed KV must be budgeted before cache initialization"
+            )
+        if getattr(self, "_compressed_kv_state", None) is not None:
+            raise RuntimeError("Compressed KV cache is already initialized")
+        if getattr(self, "_compressed_kv_init_attempted", False):
+            raise RuntimeError(
+                "Compressed KV initialization failed; restart the worker before retrying"
+            )
+        layout = plan_scale_layout(kv_cache_config, fmt)
+        budget.validate(layout.payload_bytes, layout.scale_bytes)
+        context = self.vllm_config.compilation_config.static_forward_context
+        self._compressed_kv_init_attempted = True
+        with self._maybe_get_memory_pool_context(tag="kv_cache"):
+            state = CompressedKVState(
+                layout,
+                fmt,
+                self.device,
+                context,
+                workspace_bytes=budget.arena_bytes,
+                prefill_producer=budget.prefill_producer,
+            )
+        self._compressed_kv_state = state
+        try:
+            # Bind scale views before the V2 runner registers the cache with
+            # its connector. NIXL observes both planes in one layer transfer.
+            super().initialize_from_config(kv_cache_config)
+            # V2 uses this tensor list for physical block copies. No synthetic
+            # layer names or separate block IDs enter its metadata path.
+            self.model_runner.kv_caches.extend(state.scales.values())
+            if state.scales:
+                if getattr(self.model_runner, "kv_block_zeroer", None) is None:
+                    self.model_runner._init_kv_zero_meta()
+                state.bind_zeroer(self.model_runner.kv_block_zeroer)
+        except Exception:
+            state.release()
+            self._compressed_kv_state = None
+            raise
 
     def _get_onchip_checker(self):
         checker = getattr(self, "_onchip_checker", None)
@@ -139,6 +271,11 @@ class IluWorker(Worker):
         if context is not None:
             context.observe_scheduler_output(scheduler_output)
         try:
+            state = getattr(self, "_compressed_kv_state", None)
+            if state is not None:
+                # Lease the shared arena for eager work and graph replay alike.
+                with state.workspace.acquire():
+                    return super().execute_model(scheduler_output)
             return super().execute_model(scheduler_output)
         finally:
             if context is not None:
@@ -163,6 +300,10 @@ class IluWorker(Worker):
                     logger.exception("Worker health shutdown check failed")
             super().shutdown()
         finally:
+            state = getattr(self, "_compressed_kv_state", None)
+            if state is not None:
+                state.release()
+                self._compressed_kv_state = None
             if checker is not None:
                 try:
                     checker.free()

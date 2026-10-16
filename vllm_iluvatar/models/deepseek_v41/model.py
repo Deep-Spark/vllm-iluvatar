@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from contextlib import nullcontext
 from functools import partial
 from itertools import islice
 
@@ -456,10 +457,12 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         is read off a layer whether or not anything is allocated here.
         """
         self.main_kv_rows: torch.Tensor | None = None
+        self.main_kv_scale_rows: torch.Tensor | None = None
         self.indexer_kv_rows: torch.Tensor | None = None
         self.main_kv_record: tuple[int, torch.dtype] | None = None
         self.indexer_kv_record: tuple[int, torch.dtype] | None = None
         sample = self.layers[self.start_layer].attn
+        self.main_kv_scale_width = sample.main_scale_transfer_width
         self.main_kv_record = (sample.main_transfer_width, sample.main_transfer_dtype)
         self.indexer_kv_record = (
             sample.indexer_transfer_width,
@@ -477,12 +480,20 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         self.main_kv_rows = torch.empty(
             max_tokens, main_width, dtype=main_dtype, device=self.device
         )
+        if self.main_kv_scale_width:
+            self.main_kv_scale_rows = torch.empty(
+                max_tokens,
+                self.main_kv_scale_width,
+                dtype=torch.float16,
+                device=self.device,
+            )
         self.indexer_kv_rows = torch.empty(
             max_tokens, indexer_width, dtype=indexer_dtype, device=self.device
         )
         if self.kv_sender_layer is not None:
             sender = self.layers[self.kv_sender_layer].attn
             sender.main_kv_rows = self.main_kv_rows
+            sender.main_kv_scale_rows = self.main_kv_scale_rows
             assert sender.indexer is not None, (
                 f"layer {self.kv_sender_layer} is a kv source and must own an "
                 "indexer to mirror its index keys"
@@ -636,6 +647,12 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
             tensors["main_kv"] = torch.zeros(
                 (batch_size, main_width), dtype=main_dtype, device=device
             )
+            if self.main_kv_scale_width:
+                tensors["main_kv_scales"] = torch.zeros(
+                    (batch_size, self.main_kv_scale_width),
+                    dtype=torch.float16,
+                    device=device,
+                )
             tensors["indexer_kv"] = torch.zeros(
                 (batch_size, indexer_width), dtype=indexer_dtype, device=device
             )
@@ -668,7 +685,15 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         indexer_rows = intermediate_tensors["indexer_kv"]
         topk_rows = intermediate_tensors["topk"] if self.pp_plan.recvs_topk else None
         self.layers[forwarder].attn.accept_remote_kv(
-            main_rows, indexer_rows, topk_rows, positions
+            main_rows,
+            indexer_rows,
+            topk_rows,
+            positions,
+            main_scale_rows=(
+                intermediate_tensors["main_kv_scales"]
+                if self.main_kv_scale_width
+                else None
+            ),
         )
         if self.relays_kv:
             # No local source will refill the outgoing buffer, so the group
@@ -677,6 +702,11 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
             assert self.indexer_kv_rows is not None
             num_tokens = main_rows.shape[0]
             self.main_kv_rows[:num_tokens].copy_(main_rows)
+            if self.main_kv_scale_width:
+                assert self.main_kv_scale_rows is not None
+                self.main_kv_scale_rows[:num_tokens].copy_(
+                    intermediate_tensors["main_kv_scales"]
+                )
             self.indexer_kv_rows[:num_tokens].copy_(indexer_rows)
 
     def _accept_remote_candidates(
@@ -768,6 +798,17 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
     producer_prefix_state = None
     consumer_prefix_state = None
 
+    def _compressed_kv_workspace(self):
+        if self.start_layer >= self.end_layer:
+            return None
+        attn = getattr(self.layers[self.start_layer], "attn", None)
+        return getattr(attn, "compressed_kv_workspace", None)
+
+    def compressed_kv_forward_scope(self):
+        """Scope the complete local forward, including producer-prefix replay."""
+        workspace = self._compressed_kv_workspace()
+        return nullcontext() if workspace is None else workspace.forward_scope()
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -776,23 +817,17 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-        context = self.consumer_prefix_state
-        if context is not None:
-            return context.forward(
-                self._forward_full,
-                input_ids,
-                positions,
-                intermediate_tensors,
-                inputs_embeds,
-                lookback_token_ids,
+        with self.compressed_kv_forward_scope():
+            context = self.consumer_prefix_state
+            if context is not None:
+                return context.forward(
+                    self._forward_full, input_ids, positions, intermediate_tensors,
+                    inputs_embeds, lookback_token_ids,
+                )
+            return self._forward_full(
+                input_ids, positions, intermediate_tensors,
+                inputs_embeds, lookback_token_ids,
             )
-        return self._forward_full(
-            input_ids,
-            positions,
-            intermediate_tensors,
-            inputs_embeds,
-            lookback_token_ids,
-        )
 
     def _forward_full(
         self,
@@ -863,6 +898,9 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 assert self.main_kv_rows is not None
                 assert self.indexer_kv_rows is not None
                 tensors["main_kv"] = self.main_kv_rows[:num_tokens]
+                if self.main_kv_scale_width:
+                    assert self.main_kv_scale_rows is not None
+                    tensors["main_kv_scales"] = self.main_kv_scale_rows[:num_tokens]
                 tensors["indexer_kv"] = self.indexer_kv_rows[:num_tokens]
             if self.pp_plan.sends_topk:
                 # No designated sender: every index source rewrites this

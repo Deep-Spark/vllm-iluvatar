@@ -5,7 +5,11 @@ Every KV view is registered the same way, whatever its layout:
 * registration span: the whole backing storage, registered once per storage;
 * block stride: bytes between scheduler block ``b`` and ``b + 1``;
 * payload: the bytes of one scheduler block that are actually transferred,
-  at ``view offset`` inside the block.
+  at the first block's ``view offset`` relative to the allocation base.
+
+Layer-outer views may start beyond one block stride. The offset plus every
+block stride and segment length must remain within the registered allocation;
+the segment must also remain inside its own block at that offset.
 
 All three are read off the view itself and cross-checked against what vLLM
 declared: ``KVCacheConfig`` for a layer placed in a shared per-block slab
@@ -36,7 +40,7 @@ logger = init_logger("vllm." + __name__)
 
 @dataclass(frozen=True)
 class PackedLayerInfo:
-    """Placement of a layer inside a packed per-block slab."""
+    """First-block placement of a layer within a shared allocation."""
 
     offset: int
     block_stride: int
@@ -89,7 +93,7 @@ class TensorRegistration:
                 raise ValueError(
                     f"{layer_name}: invalid payload segment ({offset}, {length})"
                 )
-            if offset + length > self.block_stride:
+            if offset % self.block_stride + length > self.block_stride:
                 raise ValueError(
                     f"{layer_name}: payload segment ({offset}, {length}) exceeds "
                     f"block stride {self.block_stride}"
@@ -115,14 +119,15 @@ class MemoryRegistrationPlanner:
 
     def __init__(self, kv_cache_config: KVCacheConfig) -> None:
         self._packing_by_layer: dict[str, PackedLayerInfo] = {}
+        self._allocation_sizes_by_layer: dict[str, int] = {}
         for tensor_config in kv_cache_config.kv_cache_tensors:
             if tensor_config.block_stride <= 0:
                 continue
             if tensor_config.offset < 0:
                 raise ValueError("packed KV tensor offset must be non-negative")
-            if tensor_config.offset >= tensor_config.block_stride:
+            if tensor_config.offset >= tensor_config.size:
                 raise ValueError(
-                    "packed KV tensor offset must be smaller than block_stride"
+                    "packed KV tensor offset must be smaller than allocation size"
                 )
             # 0.30 renamed KVCacheTensor.shared_by to .layers and added a
             # third geometry field, .layer_stride. Each layer view starts at
@@ -135,11 +140,16 @@ class MemoryRegistrationPlanner:
                     block_stride=tensor_config.block_stride,
                 )
                 previous = self._packing_by_layer.setdefault(layer_name, placement)
+                previous_size = self._allocation_sizes_by_layer.setdefault(
+                    layer_name, tensor_config.size
+                )
                 if previous != placement:
                     raise ValueError(
                         f"{layer_name}: conflicting packed KV placements: "
                         f"{previous} vs {placement}"
                     )
+                if previous_size != tensor_config.size:
+                    raise ValueError(f"{layer_name}: conflicting KV allocation sizes")
 
     @property
     def has_packed_layers(self) -> bool:
@@ -286,11 +296,14 @@ class MemoryRegistrationPlanner:
                 f"itemsize={tensor.element_size()}, num_blocks={num_blocks})"
             )
 
+        for offset, length in payload_segments:
+            if offset % block_stride + length > block_stride:
+                raise ValueError(f"{layer_name}: payload crosses a block boundary")
         payload_end = max(offset + length for offset, length in payload_segments)
-        if payload_end > block_stride:
+        descriptor_end = (num_blocks - 1) * block_stride + payload_end
+        if descriptor_end > tensor.untyped_storage().nbytes():
             raise ValueError(
-                f"{layer_name}: payload end {payload_end} exceeds block stride "
-                f"{block_stride}"
+                f"{layer_name}: descriptor span exceeds the backing allocation"
             )
 
         span = num_blocks * block_stride
@@ -327,18 +340,20 @@ class MemoryRegistrationPlanner:
         if packing is None:
             block_stride = spec.page_size_bytes
             declared = f"spec page size {block_stride}"
+            expected_nbytes = num_blocks * block_stride
         else:
             block_stride = packing.block_stride
             declared = f"KVCacheConfig block_stride {block_stride}"
+            expected_nbytes = self._allocation_sizes_by_layer[layer_name]
             if view_offset != packing.offset:
                 raise ValueError(
                     f"{layer_name}: KVCacheConfig offset {packing.offset} does "
                     f"not match tensor view offset {view_offset}"
                 )
-        if storage_nbytes != num_blocks * block_stride:
+        if storage_nbytes != expected_nbytes:
             raise ValueError(
                 f"{layer_name}: storage size {storage_nbytes} is not "
-                f"num_blocks {num_blocks} x {declared} "
+                f"declared allocation size {expected_nbytes} ({declared}) "
                 f"(shape={tuple(tensor.shape)}, stride={tuple(tensor.stride())})"
             )
 
@@ -366,6 +381,68 @@ class MemoryRegistrationPlanner:
             num_blocks=num_blocks,
             payload_segments=result.payload_segments,
             kernel_blocks=kernel_blocks,
+        )
+        return result
+
+    @staticmethod
+    def describe_scale_plane(
+        *,
+        layer_name: str,
+        scales: torch.Tensor,
+        payload: TensorRegistration,
+        scale_page_bytes: int,
+    ) -> TensorRegistration:
+        """Register paired FP16 scales over the same scheduler block range."""
+        from vllm_iluvatar.models.deepseek_v41.compressed_kv import PAYLOAD_PAGE_BYTES
+
+        if scales.dtype is not torch.float16 or scales.ndim != 3:
+            raise ValueError(
+                f"{layer_name}: scale plane must be FP16[pages,rows,groups]"
+            )
+        if scales.shape[0] != payload.num_blocks or payload.kernel_blocks != 1:
+            raise ValueError(
+                f"{layer_name}: scale/payload physical block ranges differ"
+            )
+        if (
+            MemoryRegistrationPlanner.kernel_row_bytes(
+                layer_name=layer_name, tensor=scales
+            )
+            != scale_page_bytes
+        ):
+            raise ValueError(f"{layer_name}: scale page size does not match its format")
+        storage = scales.untyped_storage()
+        offset = scales.data_ptr() - storage.data_ptr()
+        stride = scales.stride(0) * scales.element_size()
+        ((payload_offset, payload_length),) = payload.payload_segments
+        if (
+            payload_length != PAYLOAD_PAGE_BYTES
+            or payload_offset % PAYLOAD_PAGE_BYTES
+            or payload.block_stride % PAYLOAD_PAGE_BYTES
+            or offset != payload_offset // PAYLOAD_PAGE_BYTES * scale_page_bytes
+            or stride != payload.block_stride // PAYLOAD_PAGE_BYTES * scale_page_bytes
+            or storage.nbytes()
+            != payload.registration_nbytes // PAYLOAD_PAGE_BYTES * scale_page_bytes
+        ):
+            raise ValueError(
+                f"{layer_name}: scale plane does not mirror payload ownership/layout"
+            )
+        result = TensorRegistration(
+            registration_base=storage.data_ptr(),
+            registration_nbytes=storage.nbytes(),
+            block_stride=stride,
+            payload_segments=((offset, scale_page_bytes),),
+            num_blocks=payload.num_blocks,
+            kernel_blocks=1,
+            device_id=max(scales.get_device(), 0),
+        )
+        result.validate(layer_name)
+        MemoryRegistrationPlanner.validate_block_geometry(
+            layer_name=layer_name,
+            tensor=scales,
+            block_stride=stride,
+            num_blocks=payload.num_blocks,
+            payload_segments=result.payload_segments,
+            kernel_blocks=1,
         )
         return result
 

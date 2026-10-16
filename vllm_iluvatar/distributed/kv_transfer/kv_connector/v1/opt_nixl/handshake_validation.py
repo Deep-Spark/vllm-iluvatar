@@ -8,6 +8,27 @@ from typing import TypeVar
 T = TypeVar("T")
 
 
+def validate_main_kv_format(
+    local_format: str,
+    remote_format: str,
+    *,
+    remote_engine_id: str,
+) -> bool:
+    """Check explicit format identity and return whether hash checks are mandatory."""
+
+    supported = ("none", "i8g64", "i4g32")
+    for side, value in (("local", local_format), ("remote", remote_format)):
+        if value not in supported:
+            raise RuntimeError(f"Unsupported {side} NIXL main KV format: {value!r}")
+    quantized = local_format != "none" or remote_format != "none"
+    if quantized and local_format != remote_format:
+        raise RuntimeError(
+            f"NIXL main KV format mismatch for remote engine {remote_engine_id}: "
+            f"local={local_format}, remote={remote_format}"
+        )
+    return quantized
+
+
 def require_positive(name: str, value: int) -> None:
     if value <= 0:
         raise ValueError(f"{name} must be positive, got {value}")
@@ -111,7 +132,7 @@ def validate_descriptor_geometry(
                         f"{side} descriptor[{index}] has invalid segment "
                         f"({offset}, {length})"
                     )
-                if offset + length > block_stride:
+                if offset % block_stride + length > block_stride:
                     raise ValueError(
                         f"{side} descriptor[{index}] segment ({offset}, {length}) "
                         f"exceeds block stride {block_stride}"

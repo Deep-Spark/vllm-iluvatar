@@ -118,6 +118,7 @@ if TYPE_CHECKING:
     VLLM_ILU_DS4_CANDIDATE_FILTER: bool = True
     VLLM_ILU_DS4_MQA_QUANT_TYPE: str = ""
     VLLM_ILU_DS4_INDEXER_KV_DTYPE: str = "bf16"
+    VLLM_ILU_DS41_COMPRESSED_KV_FORMAT: str = "none"
     VLLM_ILU_FUSE_NORM_QUANT: bool = True
     VLLM_ILU_FUSE_MOE_W13: bool = True
     VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV: bool = True
@@ -235,6 +236,9 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
 
 
 _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
+    "VLLM_ILU_DS41_COMPRESSED_KV_FORMAT": lambda: os.environ.get(
+        "VLLM_ILU_DS41_COMPRESSED_KV_FORMAT", "none"
+    ),
     "VLLM_ILU_FLASH_ATTN_QUANT_TYPE": lambda: os.environ.get(
         "VLLM_ILU_FLASH_ATTN_QUANT_TYPE", ""
     ).upper(),

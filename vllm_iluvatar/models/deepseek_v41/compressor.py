@@ -213,6 +213,10 @@ class IluDeepseekCompressor(nn.Module):
         kv_score: torch.Tensor,
         # [num_tokens]
         positions: torch.Tensor,
+        *,
+        rotary_emb=None,
+        row_out: torch.Tensor | None = None,
+        scale_out: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         """Save states and return the BF16 latent for cache insertion and indexing.
 
@@ -246,6 +250,43 @@ class IluDeepseekCompressor(nn.Module):
             dtype=torch.bfloat16,
             device=kv_score.device,
         )
+        cache_layer = self._static_forward_context[self.k_cache_prefix]
+        fmt = getattr(cache_layer, "compressed_kv_format", None)
+        if fmt is not None:
+            from ixformer.inference.functions.deepseek.quantized_kv_cache import (
+                compress_norm_rope_quant_store,
+            )
+
+            metadata = cast(Any, attn_metadata[self.k_cache_prefix])
+            if rotary_emb is None or metadata.compressed_kv_format != fmt:
+                raise ValueError(
+                    "Compressed KV producer requires matching format and RoPE metadata"
+                )
+            if cache_layer.kv_cache_scales is None:
+                raise RuntimeError("Compressed KV scale plane is not initialized")
+            compress_norm_rope_quant_store(
+                kv_score,
+                positions,
+                state_cache,
+                slot_mapping,
+                query_start_loc,
+                token_to_req_indices,
+                self.norm.weight,
+                self.rms_norm_eps,
+                latent,
+                rotary_emb.cos_sin_cache,
+                cache_layer.kv_cache,
+                cache_layer.kv_cache_scales,
+                metadata.slot_mapping,
+                self.compress_ratio,
+                format=fmt,
+                row_out=row_out,
+                scale_out=scale_out,
+            )
+            workspace = getattr(cache_layer, "compressed_kv_workspace", None)
+            if workspace is not None:
+                workspace.main_cache_written()
+            return latent
         fused_save_compress_norm(
             kv_score,
             positions,
@@ -279,6 +320,10 @@ class IluDeepseekCompressor(nn.Module):
         assert isinstance(attn_metadata, dict)
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         k_cache_layer = self._static_forward_context[self.k_cache_prefix]
+        if getattr(k_cache_layer, "compressed_kv_format", None) is not None:
+            # The fused producer already published both planes while retaining
+            # the pre-RoPE BF16 latent used by the current INT8 indexer.
+            return
         kv_cache = k_cache_layer.kv_cache
         if not kv_cache.numel():
             return

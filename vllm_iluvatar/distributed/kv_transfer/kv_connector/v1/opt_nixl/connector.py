@@ -263,7 +263,7 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
     def register_kv_caches(
         self,
         kv_caches: dict[str, torch.Tensor],
-        kv_cache_scales: dict[str, tuple[torch.Tensor, ...]] | None = None,
+        kv_cache_scales: dict[str, torch.Tensor] | None = None,
     ):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches, kv_cache_scales)

@@ -7,6 +7,8 @@ one thread while the engine main thread consumes immutable result batches.
 
 from __future__ import annotations
 
+import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Literal
@@ -25,6 +27,87 @@ class RemoteSessionState(Enum):
     CLOSED = auto()
 
 
+class RequestOwnershipState(str, Enum):
+    """Cross-process ownership of one D-side destination generation."""
+
+    PREPARED = "prepared"
+    ACCEPTED = "accepted"
+    WRITING = "writing"
+    TERMINAL = "terminal"
+    CANCELED = "canceled"
+
+    @property
+    def is_safe_to_release(self) -> bool:
+        return self in (
+            RequestOwnershipState.TERMINAL,
+            RequestOwnershipState.CANCELED,
+        )
+
+
+@dataclass(frozen=True)
+class RequestOwnershipTombstone:
+    state: RequestOwnershipState
+    created_at: float
+
+
+class RequestTombstoneStore:
+    """Bounded replay fence for terminal request generations.
+
+    Expiry is intentionally much longer than the control-message retry window.
+    If the bound is reached before any tombstone is old enough to prune, fail
+    closed instead of forgetting a generation that could still be replayed.
+    """
+
+    def __init__(self, ttl: float, limit: int):
+        if ttl <= 0 or limit <= 0:
+            raise ValueError("request tombstone ttl and limit must be positive")
+        self.ttl = ttl
+        self.limit = limit
+        self._items: OrderedDict[
+            tuple[ReqId, str], RequestOwnershipTombstone
+        ] = OrderedDict()
+
+    def _prune(self, now: float) -> None:
+        while self._items:
+            key, tombstone = next(iter(self._items.items()))
+            if now - tombstone.created_at < self.ttl:
+                break
+            del self._items[key]
+
+    def get(
+        self, req_id: ReqId, generation: str, now: float | None = None
+    ) -> RequestOwnershipState | None:
+        now = time.monotonic() if now is None else now
+        self._prune(now)
+        tombstone = self._items.get((req_id, generation))
+        return None if tombstone is None else tombstone.state
+
+    def record(
+        self,
+        req_id: ReqId,
+        generation: str,
+        state: RequestOwnershipState,
+        now: float | None = None,
+    ) -> RequestOwnershipState:
+        if not state.is_safe_to_release:
+            raise ValueError(f"non-terminal tombstone state: {state.value}")
+        now = time.monotonic() if now is None else now
+        self._prune(now)
+        key = (req_id, generation)
+        if existing := self._items.get(key):
+            return existing.state
+        if len(self._items) >= self.limit:
+            raise RuntimeError(
+                "request ownership tombstone capacity exhausted; refusing "
+                "to forget a possibly replayable generation"
+            )
+        self._items[key] = RequestOwnershipTombstone(state, now)
+        return state
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
 @dataclass
 class RemoteEngineSession:
     """Uvloop-owned lifecycle of one remote engine generation."""
@@ -33,12 +116,14 @@ class RemoteEngineSession:
     generation: int
     role: WorkerRole
     state: RemoteSessionState = RemoteSessionState.CONNECTING
+    teardown_id: int | None = None
     disconnected_at: float | None = None
     drain_deadline: float | None = None
     pending_send: set[ReqId] = field(default_factory=set)
     inflight_send: set[ReqId] = field(default_factory=set)
     pending_recv: set[ReqId] = field(default_factory=set)
     stuck_reported: bool = False
+    reported_teardown_id: int | None = None
 
     def activate(self) -> None:
         if self.state not in (
@@ -127,6 +212,10 @@ class SendRequestState:
     remote_block_ids: Any | None = None
     remote_block_starts: list[int] | None = None
     started: bool = False
+    generation: str = ""
+    ownership_state: RequestOwnershipState = RequestOwnershipState.PREPARED
+    cancel_requested: bool = False
+    command_fingerprint: bytes | None = None
 
     def install_metadata(self, metadata: Any, deadline: float | None) -> None:
         """Merge scheduler metadata without dropping earlier join inputs."""
@@ -145,6 +234,12 @@ class SendRequestState:
             and self.transfer_intent is not None
             and self.has_remote_blocks
             and self.has_local_kv
+            and self.ownership_state
+            in (
+                RequestOwnershipState.ACCEPTED,
+                RequestOwnershipState.WRITING,
+            )
+            and not self.cancel_requested
         )
 
     @property

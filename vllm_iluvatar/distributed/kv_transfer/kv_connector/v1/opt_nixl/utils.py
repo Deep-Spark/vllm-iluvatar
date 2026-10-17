@@ -33,7 +33,6 @@ _NIXL_SUPPORTED_DEVICE.update(current_platform.get_nixl_supported_devices())
 TransferHandle = int
 Transfer = list[tuple[TransferHandle, bool, float]]  # (xfer_handle, done, start_time)
 
-
 # TODO: merge with vllm.utils.network_utils.zmq_socket_ctx
 @contextlib.contextmanager
 def zmq_ctx(socket_type: Any, addr: str) -> Iterator[zmq.Socket]:
@@ -80,30 +79,34 @@ def get_representative_spec_type(spec: KVCacheSpec) -> type[KVCacheSpec]:
     return type(spec)
 
 
-class NodeError(Exception):
-    """a enum class"""
+class NodeError(RuntimeError):
+    """Request-scoped OptNixl control-plane failure."""
 
 
 def zmq_comm2proxy(socket: zmq.Socket, send_msg: bytes, need_recv: bool, logger: Any):
+    """Exchange one strict request/reply sequence with the metadata proxy."""
     try:
         socket.send(send_msg)
-        msg = socket.recv()
-        if msg == b"error: node not found":
-            raise NodeError()
-        if msg != b"success":
-            logger.error(
-                "Proxy failed to handle message: %s, please check the "
-                "message format or proxy status",
-                msg,
-            )
+        status = socket.recv()
+        if status == b"error: node not found":
+            raise NodeError("proxy reported node not found")
+        if not isinstance(status, bytes) or status != b"success":
+            raise NodeError(f"proxy rejected request: {status!r}")
+        has_body = bool(socket.getsockopt(zmq.RCVMORE))
         if need_recv:
-            msg = socket.recv()
-            return msg
-    except zmq.ZMQError as e:
-        logger.error(
-            "Failed to communicate with proxy: %s, please check the proxy status",
-            e,
-        )
+            if not has_body:
+                raise NodeError("proxy success reply is missing its metadata body frame")
+            body = socket.recv()
+            if not isinstance(body, bytes):
+                raise NodeError(f"proxy returned a non-bytes body: {type(body).__name__}")
+            if socket.getsockopt(zmq.RCVMORE):
+                raise NodeError("proxy returned unexpected extra reply frames")
+            return body
+        if has_body:
+            raise NodeError("proxy returned an unexpected body frame")
+        return None
+    except zmq.ZMQError as error:
+        raise NodeError("metadata proxy request timed out or disconnected") from error
 
 
 class NotifyPayload(NamedTuple):
@@ -279,6 +282,37 @@ class TransferStatusChecker:
         return bool(
             np.all(self.declared >= 0)
             and np.array_equal(self.received_per_cell, self.declared)
+        )
+
+    def progress_summary(self) -> str:
+        """Return a compact failure-only diagnostic for a stalled request."""
+
+        undeclared = [
+            (int(tp + self.tp_start), int(pp + self.pp_start))
+            for tp, pp in np.argwhere(self.declared < 0)
+        ]
+        incomplete = [
+            (
+                int(tp + self.tp_start),
+                int(pp + self.pp_start),
+                int(self.received_per_cell[tp, pp]),
+                int(self.declared[tp, pp]),
+            )
+            for tp, pp in np.argwhere(
+                (self.declared >= 0)
+                & (self.received_per_cell != self.declared)
+            )
+        ]
+        received_layers = {
+            int(tp + self.tp_start): [
+                int(layer + self.pp_layer_start)
+                for layer in np.flatnonzero(self.received[tp])
+            ]
+            for tp in range(self.received.shape[0])
+        }
+        return (
+            f"undeclared_sources={undeclared}, "
+            f"incomplete_sources={incomplete}, received_layers={received_layers}"
         )
 
 

@@ -22,6 +22,13 @@ ReqId = str
 PUT_NODE_META_MSG = b"put_node_meta_msg"
 GET_NODE_META_MSG = b"get_node_meta_msg"
 GET_META_MSG = b"get_meta_msg"
+TEARDOWN_COMPLETE_MSG = "teardown_complete"
+TEARDOWN_RESULT_OK = b"teardown_complete"
+TEARDOWN_RESULT_FAILED = b"teardown_failed"
+OWNERSHIP_CANCEL_MSG = "ownership_cancel"
+OWNERSHIP_RESULT_ACCEPTED = "accepted"
+OWNERSHIP_RESULT_CANCELED = "canceled"
+OWNERSHIP_RESULT_TERMINAL = "terminal"
 DISCONNECT_MSG = msgspec.msgpack.encode(("disconnect", "test-id"))[
     : msgspec.msgpack.encode(("disconnect", "test-id")).index(b"d") + len("disconnect")
 ]
@@ -62,8 +69,11 @@ DISCONNECT_MSG = msgspec.msgpack.encode(("disconnect", "test-id"))[
 #  13: attention backends are checked per paired layer (layer_backend_mapping)
 #      instead of hashing the rank-local backend set, which differs between
 #      PP stages
+#  14: reconnect teardown tokens and worker-complete acknowledgements
+#  15: request-generation ownership fencing for producer WRITE destinations
+#  16: delimiter-safe request generations for native completion notifications
 #
-NIXL_CONNECTOR_VERSION: int = 13
+NIXL_CONNECTOR_VERSION: int = 16
 
 
 class TransferIntent(str, Enum):
@@ -227,6 +237,9 @@ class ReqMeta:
     engine_id: str = None
     need_permute_after_recv: bool = False
     prompt_token_len: int = -1
+    # Stable across the P and D legs, normally the Router transfer_id.
+    # It fences reused request IDs and stale control/notification messages.
+    generation: str = ""
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):
@@ -237,16 +250,21 @@ class NixlConnectorMetadata(KVConnectorMetadata):
 
         self.reqs_to_abort: set[ReqId] = set()
         self.reqs_to_send_time_record: dict[ReqId, float] = {}
+        # D-side release proofs returned by P after every native WRITE is
+        # terminal, or after P tombstones a request before any WRITE starts.
+        self.reqs_to_release: dict[ReqId, tuple[str, str]] = {}
 
     def _add_new_req(
         self,
         request_id: ReqId,
         local_block_ids: list[list[int]],
         engine_id: str | None = None,
+        generation: str = "",
     ) -> ReqMeta:
         _req = ReqMeta(
             local_block_ids=local_block_ids,
             engine_id=engine_id,
+            generation=generation,
         )
         self.reqs_to_recv[request_id] = _req
         return _req

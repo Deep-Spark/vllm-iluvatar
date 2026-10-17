@@ -3,7 +3,9 @@
 """Scheduler-side logic for the NIXL connector."""
 
 import asyncio
+import hashlib
 import os
+import queue
 import threading
 import time
 import traceback
@@ -39,8 +41,11 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from .metadata import (
-    DISCONNECT_MSG,
     GET_NODE_META_MSG,
+    OWNERSHIP_CANCEL_MSG,
+    OWNERSHIP_RESULT_ACCEPTED,
+    OWNERSHIP_RESULT_CANCELED,
+    OWNERSHIP_RESULT_TERMINAL,
     PUT_NODE_META_MSG,
     NixlAgentMetadata,
     NixlConnectorMetadata,
@@ -49,8 +54,12 @@ from .metadata import (
     PeerMeta,
     ReqId,
     ReqMeta,
+    TEARDOWN_COMPLETE_MSG,
+    TEARDOWN_RESULT_FAILED,
+    TEARDOWN_RESULT_OK,
     TransferIntent,
 )
+from .lifecycle import RequestOwnershipState, RequestTombstoneStore
 from .utils import (
     NodeError,
     dp_scoped_addr,
@@ -254,6 +263,14 @@ class NixlConnectorScheduler:
                 "kv_lease_duration", 480
             )
         )
+        self._teardown_timeout = float(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                # A 256K in-flight transfer can delay a worker's connector
+                # control loop for more than two minutes.
+                "reconnect_teardown_timeout",
+                300.0,
+            )
+        )
         self.local_addr = f"{self.side_channel_host}:{self.side_channel_port}"
         self.node_info = {
             "server_addr": _SERVER_ADDR,  # vllm openai server ip:port
@@ -264,6 +281,7 @@ class NixlConnectorScheduler:
             "pp_split": pp_split,
             "dp_rank": vllm_config.parallel_config.data_parallel_rank,
             "kv_role": vllm_config.kv_transfer_config.kv_role,
+            "teardown_protocol_version": 1,
             "kv_group_infos": self.kv_group_infos,  # the p/d kv group must be the same
         }
 
@@ -272,19 +290,18 @@ class NixlConnectorScheduler:
         self.ctx = zmq.asyncio.Context()
         self._async_loop = uvloop.new_event_loop()
         self._scheduler_loop_t: threading.Thread | None = None
+        self._shutdown_async_event: asyncio.Event | None = None
         self._encoded_xfer_handshake_metadata: dict[int, Any] = {}
         self._stop_event = threading.Event()
         # a socket connect to remote prefill node, use this socket to send local block ids to remote[D use]
         self.peer_node_metas: dict[str, PeerMeta] = {}
         # the block infos will be send to remote[D use]
         # for now, "Any" could be: 1:(req_id, list[int]) for block_ids, 2: NodeMeta for connect
-        self.send_to_peer_infos: asyncio.Queue[tuple[str, tuple[str, Any]]] = (
-            asyncio.Queue()
-        )
+        self.send_to_peer_infos: asyncio.Queue[tuple[Any, ...]] = asyncio.Queue()
 
         # recv/send used
         self._reqs_to_recv: dict[ReqId, tuple[Request, list[list[int]]]] = {}
-        self._reqs_to_send: dict[ReqId, tuple[int, bool, str]] = {}
+        self._reqs_to_send: dict[ReqId, tuple[int, bool, str, str]] = {}
         # Reqs to send and their expiration time
         self._reqs_to_send_time_record: dict[ReqId, float] = {}
         # The block info of local requests
@@ -293,10 +310,42 @@ class NixlConnectorScheduler:
         # remote prefill or aborted.
         self._reqs_not_processed_recv: set[ReqId] = set()
         self._reqs_not_send_to_worker: set[ReqId] = set()
+        # A P can disappear after the router selected it but before D asks the
+        # proxy for its metadata. Report that request as a failed async receive
+        # on the next connector output instead of killing the EngineCore.
+        self._scheduler_failed_recvs: set[ReqId] = set()
         # Requests whose blocks are owned by the connector until workers
         # report finished_sending.  This keeps a producer-only engine stepping
         # even after its local prefill request has left the scheduler.
         self._pending_worker_sends: set[ReqId] = set()
+        # Live D-side requests waiting for remote KV. This is ownership state,
+        # not a lease renewal: a stuck transfer must still expire and fail.
+        self._live_recv_reqs: set[ReqId] = set()
+        # Request-generation ownership is scheduler-owned. A timeout requests
+        # cancellation; it never releases D destination blocks by itself.
+        self._ownership_generations: dict[ReqId, str] = {}
+        self._ownership_remote_engines: dict[ReqId, str] = {}
+        self._ownership_states: dict[ReqId, RequestOwnershipState] = {}
+        self._ownership_deadlines: dict[ReqId, float] = {}
+        self._ownership_cancel_pending: set[ReqId] = set()
+        self._ownership_safe_releases: queue.SimpleQueue[
+            tuple[ReqId, str, str]
+        ] = queue.SimpleQueue()
+        # P-side worker completion is delivered from the scheduler main thread
+        # to the side-channel actor, which may be holding a CANCEL waiter.
+        self._ownership_terminal_events: asyncio.Queue[
+            tuple[ReqId, str, str]
+        ] = asyncio.Queue()
+        self._ownership_tombstone_ttl = float(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "ownership_tombstone_ttl", 86400.0
+            )
+        )
+        self._ownership_tombstone_limit = int(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "ownership_tombstone_limit", 262144
+            )
+        )
 
         # Default per-layer unless cross or the env forces per-rank.
         self.prefer_layer_wise = not (
@@ -305,19 +354,122 @@ class NixlConnectorScheduler:
 
     def shutdown(self):
         self._stop_event.set()
-        if self._scheduler_loop_t is not None:
-            self._scheduler_loop_t.join()
+        shutdown_event = self._shutdown_async_event
+        if shutdown_event is not None:
+            with suppress(RuntimeError):
+                self._async_loop.call_soon_threadsafe(shutdown_event.set)
+        scheduler_thread = self._scheduler_loop_t
+        if scheduler_thread is not None:
+            scheduler_thread.join(timeout=5.0)
+            if scheduler_thread.is_alive():
+                logger.error(
+                    "NIXL scheduler background thread did not exit within 5 seconds"
+                )
+                return
             self._scheduler_loop_t = None
 
     def on_new_request(self, request: "Request") -> None:
-        """Track a request that may need heartbeats."""
-        # NOTE(gyf): write not used heartbeat for now, it doesn't seem useful
-        return
+        """Track live D-side requests that are waiting for remote KV."""
+        params = request.kv_transfer_params
+        if self.is_consumer and params and params.get("do_remote_prefill"):
+            self._live_recv_reqs.add(request.request_id)
+            generation = self._request_generation(request.request_id, params)
+            self._ownership_generations[request.request_id] = generation
+            remote_engine_id = params.get("remote_engine_id")
+            if remote_engine_id:
+                self._ownership_remote_engines[request.request_id] = str(
+                    remote_engine_id
+                )
+            self._ownership_states[request.request_id] = (
+                RequestOwnershipState.PREPARED
+            )
 
-    def _stop_heartbeat(self, req_id: ReqId) -> None:
-        """Remove *req_id* from heartbeat tracking (if tracked)."""
-        # NOTE(gyf): write not used heartbeat for now, it doesn't seem useful
-        return
+    def _stop_recv_tracking(self, req_id: ReqId) -> None:
+        """Stop tracking a completed or cancelled local receive."""
+        self._live_recv_reqs.discard(req_id)
+        self._ownership_deadlines.pop(req_id, None)
+        self._ownership_cancel_pending.discard(req_id)
+        self._ownership_generations.pop(req_id, None)
+        self._ownership_remote_engines.pop(req_id, None)
+        self._ownership_states.pop(req_id, None)
+
+    @staticmethod
+    def _request_generation(req_id: ReqId, params: dict[str, Any]) -> str:
+        if generation := params.get("_opt_nixl_generation"):
+            return str(generation)
+        identity = str(
+            params.get("transfer_id")
+            or params.get("remote_request_id")
+            or req_id
+        )
+        # Router request IDs contain host:port pairs. Keep the generation
+        # delimiter-safe for the native notification wire while preserving
+        # the request ID's UUID-level uniqueness on both P and D.
+        generation = hashlib.sha256(identity.encode()).hexdigest()
+        params["_opt_nixl_generation"] = generation
+        return generation
+
+    def _queue_peer_command(
+        self, remote_engine_id: str, command: tuple[str, Any]
+    ) -> None:
+        """Enqueue one side-channel command from the scheduler main thread."""
+
+        self._async_loop.call_soon_threadsafe(
+            self.send_to_peer_infos.put_nowait,
+            (remote_engine_id, command, 0),
+        )
+
+    def _request_ownership_cancel(self, req_id: ReqId, reason: str) -> None:
+        """Ask P for a proof that no WRITE can still target this generation."""
+
+        if req_id in self._ownership_cancel_pending:
+            return
+        generation = self._ownership_generations.get(req_id)
+        remote_engine_id = self._ownership_remote_engines.get(req_id)
+        if not generation or not remote_engine_id:
+            logger.error(
+                "Cannot cancel KV ownership for %s: generation=%r remote=%r",
+                req_id,
+                generation,
+                remote_engine_id,
+            )
+            return
+        self._ownership_cancel_pending.add(req_id)
+        self._queue_peer_command(
+            remote_engine_id,
+            (
+                OWNERSHIP_CANCEL_MSG,
+                (req_id, generation, self.engine_id, reason),
+            ),
+        )
+
+    def _expire_recv_ownership(self, now: float) -> None:
+        for req_id, expires in list(self._ownership_deadlines.items()):
+            if now < expires or req_id not in self._live_recv_reqs:
+                continue
+            logger.warning(
+                "NIXL receive lease expired for request %s; requesting "
+                "producer terminal proof before releasing destination blocks",
+                req_id,
+            )
+            self._request_ownership_cancel(req_id, "receive lease expired")
+
+    def _drain_safe_releases(self, meta: NixlConnectorMetadata) -> None:
+        while True:
+            try:
+                req_id, generation, reason = self._ownership_safe_releases.get_nowait()
+            except queue.Empty:
+                break
+            if self._ownership_generations.get(req_id) != generation:
+                logger.debug(
+                    "Ignoring stale ownership proof for %s generation %s",
+                    req_id,
+                    generation,
+                )
+                continue
+            self._ownership_states[req_id] = RequestOwnershipState.TERMINAL
+            self._ownership_deadlines.pop(req_id, None)
+            meta.reqs_to_release[req_id] = (generation, reason)
 
     def get_sw_clipped_blocks(self, block_ids: BlockIds) -> BlockIds:
         """Clip every group's block list down to what P actually has to send.
@@ -523,16 +675,78 @@ class NixlConnectorScheduler:
                 # Remote prefill: get all prompt blocks from remote.
                 token_ids = request.prompt_token_ids or []
                 layerwise = not (_FORCE_PER_RANK_SEND or self._force_rank_wise_sends)
+                generation = self._request_generation(
+                    request.request_id, params
+                )
+                self._ownership_generations[request.request_id] = generation
                 self._reqs_to_send[request.request_id] = (
                     len(token_ids),
                     layerwise,
                     params.get("remote_engine_id"),
+                    generation,
                 )
                 # The producer computes KV locally. The async-load flag is only
                 # for consumers waiting on remote KV and would make vLLM assert
                 # that the producer has external cached tokens.
                 return 0, False
             return 0, False
+
+    def _decode_peer_infos(
+        self, remote_engine_id: str, encoded_peer_infos: bytes
+    ) -> dict[str, Any]:
+        """Decode and validate metadata without leaking protocol errors."""
+        try:
+            peer_infos = msgspec.msgpack.decode(encoded_peer_infos)
+            if not isinstance(peer_infos, dict):
+                raise TypeError("peer metadata is not a mapping")
+
+            required = (
+                "physical_block_size",
+                "side_channel_addr",
+                "pp_size",
+                "tp_size",
+                "pp_split",
+            )
+            missing = [key for key in required if key not in peer_infos]
+            if missing:
+                raise KeyError(f"missing fields: {', '.join(missing)}")
+
+            for key in ("physical_block_size", "pp_size", "tp_size"):
+                value = peer_infos[key]
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    raise TypeError(f"{key} must be a positive integer")
+
+            dp_rank = peer_infos.get("dp_rank", 0)
+            if isinstance(dp_rank, bool) or not isinstance(dp_rank, int) or dp_rank < 0:
+                raise TypeError("dp_rank must be a non-negative integer")
+
+            pp_split = peer_infos["pp_split"]
+            if not isinstance(pp_split, list) or not all(
+                isinstance(value, int) and not isinstance(value, bool)
+                for value in pp_split
+            ):
+                raise TypeError("pp_split must be a list of integers")
+
+            remote_addr = peer_infos["side_channel_addr"]
+            if not isinstance(remote_addr, str) or not remote_addr:
+                raise TypeError("side_channel_addr must be a non-empty string")
+            host, sep, port = remote_addr.rpartition(":")
+            if not sep or not host or not port.isdigit() or not 0 < int(port) < 65536:
+                raise ValueError("side_channel_addr must be host:port")
+            if remote_addr == f"{self.side_channel_host}:{self.side_channel_port}":
+                raise ValueError("remote side channel resolves to the local scheduler")
+
+            remote_block_size = peer_infos["physical_block_size"]
+            if not self._has_multi_size and remote_block_size != self.block_size:
+                raise ValueError(
+                    f"block size {remote_block_size} != local block size "
+                    f"{self.block_size}"
+                )
+        except (msgspec.DecodeError, KeyError, TypeError, ValueError) as error:
+            raise NodeError(
+                f"invalid metadata for remote engine {remote_engine_id}: {error}"
+            ) from error
+        return peer_infos
 
     def _get_or_connect_peer(self, remote_engine_id: str) -> PeerMeta:
         """Resolve one remote engine and enqueue CONNECT before block commands."""
@@ -541,36 +755,36 @@ class NixlConnectorScheduler:
             return peer_meta
 
         with zmq_ctx(zmq.REQ, _PROXY_ADDR) as sock:
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.setsockopt(zmq.SNDTIMEO, 5000)
             sock.setsockopt(zmq.RCVTIMEO, 5000)
-            peer_infos: dict[str, Any] = msgspec.msgpack.decode(
-                zmq_comm2proxy(
-                    sock,
-                    msgspec.msgpack.encode((GET_NODE_META_MSG, remote_engine_id)),
-                    need_recv=True,
-                    logger=logger,
-                )
+            encoded_peer_infos = zmq_comm2proxy(
+                sock,
+                msgspec.msgpack.encode((GET_NODE_META_MSG, remote_engine_id)),
+                need_recv=True,
+                logger=logger,
             )
-
-        # Both workers register scheduler blocks (kernel blocks live inside a
-        # registered block), so destination ids travel unmodified and the two
-        # engines must agree on the block size.  Multi-size groups are checked
-        # per pointer by the worker handshake (layer_block_tokens_mapping).
-        remote_physical_block_size = peer_infos["physical_block_size"]
-        if not self._has_multi_size and remote_physical_block_size != self.block_size:
-            raise ValueError(
-                f"remote engine {remote_engine_id} block size "
-                f"{remote_physical_block_size} != local block size "
-                f"{self.block_size}; P and D must use the same block size"
-            )
+        peer_infos = self._decode_peer_infos(remote_engine_id, encoded_peer_infos)
 
         remote_addr = peer_infos["side_channel_addr"]
-        assert remote_addr != f"{self.side_channel_host}:{self.side_channel_port}"
-        peer_socket = make_zmq_socket(
-            path=make_zmq_path("tcp", remote_addr),
-            ctx=self.ctx,
-            socket_type=zmq.REQ,
-            bind=False,
-        )
+        peer_socket = None
+        try:
+            peer_socket = make_zmq_socket(
+                path=make_zmq_path("tcp", remote_addr),
+                ctx=self.ctx,
+                socket_type=zmq.REQ,
+                bind=False,
+            )
+            peer_socket.setsockopt(zmq.LINGER, 0)
+            peer_socket.setsockopt(zmq.SNDTIMEO, 3000)
+            peer_socket.setsockopt(zmq.RCVTIMEO, 3000)
+        except (RuntimeError, ValueError, zmq.ZMQError) as error:
+            if peer_socket is not None:
+                peer_socket.close(linger=0)
+            raise NodeError(
+                f"failed to create side channel for remote engine {remote_engine_id}"
+            ) from error
+
         node_meta = NodeMeta(
             pp_size=self.node_info["pp_size"],
             tp_size=self.node_info["tp_size"],
@@ -589,10 +803,17 @@ class NixlConnectorScheduler:
             socket=peer_socket,
         )
         self.peer_node_metas[remote_engine_id] = peer_meta
-        self._async_loop.call_soon_threadsafe(
-            self.send_to_peer_infos.put_nowait,
-            (remote_engine_id, ("connect", node_meta)),
-        )
+        try:
+            self._async_loop.call_soon_threadsafe(
+                self.send_to_peer_infos.put_nowait,
+                (remote_engine_id, ("connect", node_meta)),
+            )
+        except RuntimeError as error:
+            self.peer_node_metas.pop(remote_engine_id, None)
+            peer_socket.close(linger=0)
+            raise NodeError(
+                f"failed to enqueue side-channel connect for {remote_engine_id}"
+            ) from error
         return peer_meta
 
     def update_state_after_alloc(
@@ -613,11 +834,32 @@ class NixlConnectorScheduler:
         if self.is_consumer:
             if params.get("do_remote_prefill"):
                 remote_engine_id = params.get("remote_engine_id")
-                if not remote_engine_id:
-                    raise ValueError(
-                        f"request {request.request_id} is missing remote_engine_id"
+                generation = self._request_generation(
+                    request.request_id, params
+                )
+                try:
+                    if not remote_engine_id:
+                        raise NodeError("request is missing remote_engine_id")
+                    self._get_or_connect_peer(remote_engine_id)
+                except NodeError as error:
+                    logger.warning(
+                        "Remote prefill setup failed for request %s (engine=%s): %s; "
+                        "failing only this KV receive",
+                        request.request_id,
+                        remote_engine_id,
+                        error,
                     )
-                self._get_or_connect_peer(remote_engine_id)
+                    params["do_remote_prefill"] = False
+                    self._reqs_not_send_to_worker.add(request.request_id)
+                    self._scheduler_failed_recvs.add(request.request_id)
+                    return
+                self._ownership_generations[request.request_id] = generation
+                self._ownership_remote_engines[request.request_id] = str(
+                    remote_engine_id
+                )
+                self._ownership_states[request.request_id] = (
+                    RequestOwnershipState.PREPARED
+                )
                 block_ids_send_to_remote = [[] for _ in range(self.kv_group_nums)]
                 block_starts = [-1] * self.kv_group_nums
                 intent = TransferIntent.NO_TRANSFER
@@ -638,6 +880,9 @@ class NixlConnectorScheduler:
                         request,
                         block_ids_send_to_remote,
                     )
+                    self._ownership_deadlines[request.request_id] = (
+                        time.perf_counter() + self._kv_lease_duration
+                    )
                     # Replay groups are deliberately empty; a request with no
                     # destination at all would leave P nothing to write.
                     assert any(
@@ -652,19 +897,17 @@ class NixlConnectorScheduler:
                     intent.value,
                     block_ids_send_to_remote,
                 )
-                self._async_loop.call_soon_threadsafe(
-                    self.send_to_peer_infos.put_nowait,
+                self._queue_peer_command(
+                    str(remote_engine_id),
                     (
-                        remote_engine_id,
+                        "block_ids",
                         (
-                            "block_ids",
-                            (
-                                request.request_id,
-                                intent.value,
-                                block_ids_send_to_remote,
-                                self.engine_id,
-                                block_starts,
-                            ),
+                            request.request_id,
+                            generation,
+                            intent.value,
+                            block_ids_send_to_remote,
+                            self.engine_id,
+                            block_starts,
                         ),
                     ),
                 )
@@ -707,7 +950,12 @@ class NixlConnectorScheduler:
                     new_block_id if new_block_id is not None else []
                 )
 
-        prefill_tokens, layer_wise, remote_engine_id = self._reqs_to_send[request_id]
+        (
+            prefill_tokens,
+            layer_wise,
+            remote_engine_id,
+            generation,
+        ) = self._reqs_to_send[request_id]
 
         if num_computed_tokens + num_scheduled_tokens < prefill_tokens:
             return
@@ -728,6 +976,7 @@ class NixlConnectorScheduler:
             remote_engine_id,
             False,
             prefill_tokens,
+            generation,
         )
         self._pending_worker_sends.add(request_id)
         # for write, start time record after schedule
@@ -745,6 +994,7 @@ class NixlConnectorScheduler:
 
         # D side
         if self.is_consumer:
+            self._expire_recv_ownership(time.perf_counter())
             # Loop through _reqs_to_recv and convert to ReqMeta.
             for req_id, (req, block_ids) in self._reqs_to_recv.items():
                 assert req.kv_transfer_params is not None
@@ -752,11 +1002,13 @@ class NixlConnectorScheduler:
                     request_id=req_id,
                     local_block_ids=block_ids,
                     engine_id=req.kv_transfer_params.get("remote_engine_id"),
+                    generation=self._ownership_generations.get(req_id, ""),
                 )
             # Clear need recv
             self._reqs_to_recv.clear()
             meta.reqs_to_abort = self._reqs_not_processed_recv
             self._reqs_not_processed_recv = set()
+            self._drain_safe_releases(meta)
         # P side
         else:
             # try add waiting to running requests first
@@ -797,9 +1049,51 @@ class NixlConnectorScheduler:
         worker, so anything outside that set is a completion whose blocks are
         already freed and must not be reported again.
         """
+        # Scheduler-originated failures are valid only while this scheduler
+        # still owns the receive. A cancel may remove the request before the
+        # next connector output; never surface such a stale completion.
+        failed = self._scheduler_failed_recvs & self._live_recv_reqs
+        stale_failed = self._scheduler_failed_recvs - failed
+        if stale_failed:
+            logger.debug(
+                "Dropping stale scheduler receive failures: %s",
+                sorted(stale_failed),
+            )
+        self._scheduler_failed_recvs.clear()
+        if failed:
+            if connector_output.finished_recving is None:
+                connector_output.finished_recving = failed.copy()
+            else:
+                connector_output.finished_recving.update(failed)
+            if connector_output.failed_recving is None:
+                connector_output.failed_recving = failed
+            else:
+                connector_output.failed_recving.update(failed)
+
+        for req_id in connector_output.finished_recving or ():
+            self._stop_recv_tracking(req_id)
+        for req_id in connector_output.failed_recving or ():
+            self._stop_recv_tracking(req_id)
+
         finished = connector_output.finished_sending
         if not finished:
             return
+        # Multiproc connector output reports a request only after every local
+        # TP/PP worker reached a native terminal state. Publish that proof
+        # before filtering scheduler-stale completions.
+        for req_id in set(finished):
+            generation = self._ownership_generations.get(req_id)
+            if generation:
+                self._ownership_states[req_id] = RequestOwnershipState.TERMINAL
+                with suppress(RuntimeError):
+                    self._async_loop.call_soon_threadsafe(
+                        self._ownership_terminal_events.put_nowait,
+                        (
+                            req_id,
+                            generation,
+                            OWNERSHIP_RESULT_TERMINAL,
+                        ),
+                    )
         stale = finished - self._pending_worker_sends
         if stale:
             # A leak would show up here as a request that is never freed, so
@@ -820,6 +1114,8 @@ class NixlConnectorScheduler:
             or self._reqs_blocks
             or self._reqs_to_send_time_record
             or self._pending_worker_sends
+            or self._live_recv_reqs
+            or self._ownership_cancel_pending
         )
 
     def request_finished_all_groups(
@@ -842,6 +1138,7 @@ class NixlConnectorScheduler:
             params,
         )
         if not params:
+            self._stop_recv_tracking(request.request_id)
             return False, None
 
         # D side
@@ -856,24 +1153,22 @@ class NixlConnectorScheduler:
                 try:
                     self._get_or_connect_peer(remote_engine_id)
                 except NodeError:
+                    self._stop_recv_tracking(request.request_id)
                     return False, {}
-                empty_block_ids = [[] for _ in range(self.kv_group_nums)]
-                self._async_loop.call_soon_threadsafe(
-                    self.send_to_peer_infos.put_nowait,
-                    (
-                        remote_engine_id,
-                        (
-                            "block_ids",
-                            (
-                                request.request_id,
-                                TransferIntent.CANCEL.value,
-                                empty_block_ids,
-                                self.engine_id,
-                            ),
-                        ),
-                    ),
+                generation = self._request_generation(
+                    request.request_id, params
+                )
+                self._ownership_generations[request.request_id] = generation
+                self._ownership_remote_engines[request.request_id] = str(
+                    remote_engine_id
+                )
+                self._request_ownership_cancel(
+                    request.request_id, "request aborted before allocation"
                 )
                 params["do_remote_prefill"] = False
+                # No destination block was disclosed, so local release is
+                # already safe; the best-effort cancel only frees P sooner.
+                self._stop_recv_tracking(request.request_id)
                 return False, None
 
             # Dropped on every finish, not only on abort: a fully locally cached
@@ -892,12 +1187,17 @@ class NixlConnectorScheduler:
                 # for D, there are 2 cases.
                 if fully_local:
                     # this req is full cache by local, when aborted, return False
+                    self._stop_recv_tracking(request.request_id)
                     return False, {}
                 else:
-                    # wait kv cache write done from P
+                    # Keep D blocks until P proves every native WRITE terminal.
+                    self._request_ownership_cancel(
+                        request.request_id, "consumer request aborted"
+                    )
                     self._reqs_not_processed_recv.add(request.request_id)
                     return True, {}
 
+            self._stop_recv_tracking(request.request_id)
             return False, None
         # P side
         else:
@@ -926,16 +1226,21 @@ class NixlConnectorScheduler:
 
     def scheduler_loop(self, metadata: dict[int, KVConnectorHandshakeMetadata]):
         asyncio.set_event_loop(self._async_loop)
+        shutdown_event = asyncio.Event()
+        self._shutdown_async_event = shutdown_event
+        if self._stop_event.is_set():
+            shutdown_event.set()
 
         async def tasks():
             background_tasks = {
                 asyncio.create_task(self._proxy_connector(metadata)),
                 asyncio.create_task(self._worker_data_forward()),
                 asyncio.create_task(self._run_send_infos()),
+                asyncio.create_task(shutdown_event.wait()),
             }
             done, pending = await asyncio.wait(
                 background_tasks,
-                return_when=asyncio.FIRST_EXCEPTION,
+                return_when=asyncio.FIRST_COMPLETED,
             )
             try:
                 for task in done:
@@ -951,6 +1256,8 @@ class NixlConnectorScheduler:
         except Exception:
             logger.fatal("An exception occurred in the scheduler background thread")
             traceback.print_exc()
+        finally:
+            self._shutdown_async_event = None
 
     async def _proxy_connector(self, metadata: dict[int, KVConnectorHandshakeMetadata]):
         """
@@ -985,7 +1292,7 @@ class NixlConnectorScheduler:
     async def _worker_data_forward(
         self,
     ):
-        """Background thread for pub info to workers."""
+        """Forward peer control messages and return a real teardown ACK."""
         # a socket publish infos to workers, tcp://ip:port
         scheduler_addr = self.scheduler_addr
         path = make_zmq_path("tcp", self.local_addr)
@@ -1010,36 +1317,340 @@ class NixlConnectorScheduler:
                         "NIXL handshake listener failed to connect to connector"
                     )
             await publish_to_connector.send(b"READY")
-            recv_from.setsockopt(zmq.RCVTIMEO, 1000)
+            recv_from.setsockopt(zmq.RCVTIMEO, 100)
+            expected_workers = self.node_info["tp_size"] * self.node_info["pp_size"]
+            pending: dict[int, dict[str, Any]] = {}
+            completed: dict[int, tuple[str, bytes]] = {}
+            ownership_waiters: dict[tuple[ReqId, str], set[bytes]] = {}
+            ownership_tombstones = RequestTombstoneStore(
+                self._ownership_tombstone_ttl,
+                self._ownership_tombstone_limit,
+            )
+
+            async def reply(identity: bytes, payload: bytes) -> None:
+                await recv_from.send_multipart((identity, b"", payload))
+
+            def remember_completed(
+                teardown_id: int, engine_id: str, result: bytes
+            ) -> None:
+                completed[teardown_id] = (engine_id, result)
+                if len(completed) > 4096:
+                    completed.pop(next(iter(completed)))
+
+            async def expire_teardowns() -> None:
+                now = time.monotonic()
+                for teardown_id, state in list(pending.items()):
+                    if now < state["deadline"]:
+                        continue
+                    logger.error(
+                        "NIXL teardown %s timed out for %s: %d/%d worker ACKs",
+                        teardown_id,
+                        state["engine_id"],
+                        len(state["acks"]),
+                        expected_workers,
+                    )
+                    for waiter in state["waiters"]:
+                        await reply(waiter, TEARDOWN_RESULT_FAILED)
+                    remember_completed(
+                        teardown_id,
+                        state["engine_id"],
+                        TEARDOWN_RESULT_FAILED,
+                    )
+                    del pending[teardown_id]
+
+            async def complete_ownership_events() -> None:
+                while True:
+                    try:
+                        req_id, generation, result = (
+                            self._ownership_terminal_events.get_nowait()
+                        )
+                    except asyncio.QueueEmpty:
+                        break
+                    state = (
+                        RequestOwnershipState.CANCELED
+                        if result == OWNERSHIP_RESULT_CANCELED
+                        else RequestOwnershipState.TERMINAL
+                    )
+                    try:
+                        ownership_tombstones.record(req_id, generation, state)
+                    except RuntimeError as error:
+                        # Fail closed: D receives no proof and keeps its blocks.
+                        logger.critical(
+                            "Unable to retain ownership tombstone for %s/%s: %s",
+                            req_id,
+                            generation,
+                            error,
+                        )
+                        continue
+                    encoded = msgspec.msgpack.encode((state.value, generation))
+                    for waiter in ownership_waiters.pop(
+                        (req_id, generation), set()
+                    ):
+                        with suppress(zmq.ZMQError):
+                            await reply(waiter, encoded)
+                    if self._ownership_generations.get(req_id) == generation:
+                        self._ownership_generations.pop(req_id, None)
+                        self._ownership_remote_engines.pop(req_id, None)
+                        self._ownership_states.pop(req_id, None)
 
             while True:
                 try:
+                    await complete_ownership_events()
                     identity, _, data = await recv_from.recv_multipart()
-                    # do not want to decoding the data when get a msg from proxy,
-                    # because scheduler only need "disconnect" msg, a little trick here.
-                    if (
-                        len(data) >= len(DISCONNECT_MSG)
-                        and data[: len(DISCONNECT_MSG)] == DISCONNECT_MSG
-                    ):
-                        _, remote_engine_id = msgspec.msgpack.decode(data)
+                    op_type, payload = msgspec.msgpack.decode(data)
+
+                    if op_type == TEARDOWN_COMPLETE_MSG:
+                        (
+                            remote_engine_id,
+                            generation,
+                            teardown_id,
+                            rank,
+                            status,
+                        ) = payload
+                        # Worker REQ sockets only need delivery acknowledgement.
+                        await reply(identity, b"")
+                        state = pending.get(int(teardown_id))
+                        if (
+                            state is None
+                            or state["engine_id"] != remote_engine_id
+                            or not 0 <= int(rank) < expected_workers
+                        ):
+                            continue
+                        state["acks"][int(rank)] = str(status)
+                        logger.info(
+                            "NIXL teardown ACK id=%s engine=%s generation=%s "
+                            "rank=%s status=%s (%d/%d)",
+                            teardown_id,
+                            remote_engine_id,
+                            generation,
+                            rank,
+                            status,
+                            len(state["acks"]),
+                            expected_workers,
+                        )
+                        if len(state["acks"]) >= expected_workers:
+                            result = (
+                                TEARDOWN_RESULT_OK
+                                if all(
+                                    item == "closed"
+                                    for item in state["acks"].values()
+                                )
+                                else TEARDOWN_RESULT_FAILED
+                            )
+                            for waiter in state["waiters"]:
+                                await reply(waiter, result)
+                            remember_completed(
+                                int(teardown_id), remote_engine_id, result
+                            )
+                            del pending[int(teardown_id)]
+                        continue
+
+                    if op_type == "block_ids":
+                        if len(payload) < 5:
+                            raise ValueError("block_ids ownership generation missing")
+                        req_id = str(payload[0])
+                        generation = str(payload[1])
+                        remote_engine_id = str(payload[4])
+                        if terminal := ownership_tombstones.get(
+                            req_id, generation
+                        ):
+                            await reply(
+                                identity,
+                                msgspec.msgpack.encode(
+                                    (terminal.value, generation)
+                                ),
+                            )
+                            continue
+                        current = self._ownership_generations.get(req_id)
+                        if current is not None and current != generation:
+                            # This scheduler never accepted the stale generation;
+                            # reject it without disturbing the active one.
+                            ownership_tombstones.record(
+                                req_id,
+                                generation,
+                                RequestOwnershipState.CANCELED,
+                            )
+                            await reply(
+                                identity,
+                                msgspec.msgpack.encode(
+                                    (
+                                        OWNERSHIP_RESULT_CANCELED,
+                                        generation,
+                                    )
+                                ),
+                            )
+                            continue
+                        self._ownership_generations[req_id] = generation
+                        self._ownership_remote_engines[req_id] = remote_engine_id
+                        self._ownership_states[req_id] = (
+                            RequestOwnershipState.ACCEPTED
+                        )
+                        # XPUB preserves per-subscriber order. Reply only after
+                        # PREPARED is queued to every connected local worker.
+                        await publish_to_connector.send(data)
+                        await reply(
+                            identity,
+                            msgspec.msgpack.encode(
+                                (
+                                    OWNERSHIP_RESULT_ACCEPTED,
+                                    generation,
+                                )
+                            ),
+                        )
+                        continue
+
+                    if op_type == OWNERSHIP_CANCEL_MSG:
+                        req_id, generation, remote_engine_id, _reason = payload
+                        req_id = str(req_id)
+                        generation = str(generation)
+                        remote_engine_id = str(remote_engine_id)
+                        if terminal := ownership_tombstones.get(
+                            req_id, generation
+                        ):
+                            await reply(
+                                identity,
+                                msgspec.msgpack.encode(
+                                    (terminal.value, generation)
+                                ),
+                            )
+                            continue
+                        current = self._ownership_generations.get(req_id)
+                        if current is not None and current != generation:
+                            ownership_tombstones.record(
+                                req_id,
+                                generation,
+                                RequestOwnershipState.CANCELED,
+                            )
+                            await reply(
+                                identity,
+                                msgspec.msgpack.encode(
+                                    (
+                                        OWNERSHIP_RESULT_CANCELED,
+                                        generation,
+                                    )
+                                ),
+                            )
+                            continue
+                        self._ownership_generations[req_id] = generation
+                        self._ownership_remote_engines[req_id] = remote_engine_id
+                        ownership_waiters.setdefault(
+                            (req_id, generation), set()
+                        ).add(identity)
+                        # Do not reply until Multiproc reports all TP/PP workers
+                        # terminal. Duplicate CANCEL is safe and helps a worker
+                        # that missed an earlier publication.
+                        await publish_to_connector.send(data)
+                        continue
+
+                    if op_type == "disconnect":
+                        if isinstance(payload, (list, tuple)):
+                            remote_engine_id = str(payload[0])
+                            teardown_id = int(payload[1])
+                        else:
+                            remote_engine_id = str(payload)
+                            teardown_id = 0
                         self.send_to_peer_infos.put_nowait((remote_engine_id, None))
-                    await recv_from.send_multipart((identity, b"", b""))
+                        if teardown_id in completed:
+                            completed_engine, result = completed[teardown_id]
+                            await reply(
+                                identity,
+                                result
+                                if completed_engine == remote_engine_id
+                                else TEARDOWN_RESULT_FAILED,
+                            )
+                            continue
+                        if teardown_id in pending:
+                            if (
+                                pending[teardown_id]["engine_id"]
+                                != remote_engine_id
+                            ):
+                                await reply(
+                                    identity, TEARDOWN_RESULT_FAILED
+                                )
+                            else:
+                                pending[teardown_id]["waiters"].append(
+                                    identity
+                                )
+                            continue
+                        pending[teardown_id] = {
+                            "engine_id": remote_engine_id,
+                            "waiters": [identity],
+                            "acks": {},
+                            "deadline": time.monotonic()
+                            + self._teardown_timeout,
+                        }
+                        # Do not reply yet. The Router sees success only after
+                        # every local TP/PP worker closed the native endpoint.
+                        await publish_to_connector.send(data)
+                        logger.info(
+                            "NIXL scheduler started teardown for %s; "
+                            "id=%s waiting for %d workers",
+                            remote_engine_id,
+                            teardown_id,
+                            expected_workers,
+                        )
+                        continue
+
+                    await reply(identity, b"")
                     await publish_to_connector.send(data)
                     logger.info(
                         "NIXL scheduler forwarded %d bytes to workers (op=%s)",
                         len(data),
-                        msgspec.msgpack.decode(data)[0],
+                        op_type,
                     )
                 except zmq.Again:
                     if self._stop_event.is_set():
                         break
-                    continue
+                    await complete_ownership_events()
+                    await expire_teardowns()
                 except Exception as e:
                     logger.warning("NIXL scheduler forward failed: %r", e)
+                await expire_teardowns()
 
     async def _run_send_infos(self):
+        async def retry_later(
+            remote_engine_id: str,
+            send_infos: tuple[str, Any],
+            attempt: int,
+        ) -> None:
+            op_type, payload = send_infos
+            if op_type not in ("block_ids", OWNERSHIP_CANCEL_MSG):
+                return
+            req_id, generation = str(payload[0]), str(payload[1])
+            if self._ownership_generations.get(req_id) != generation:
+                return
+            if (
+                op_type == "block_ids"
+                and req_id in self._ownership_cancel_pending
+            ):
+                return
+            if (
+                op_type == OWNERSHIP_CANCEL_MSG
+                and req_id not in self._ownership_cancel_pending
+            ):
+                return
+            await asyncio.sleep(min(0.2 * (2 ** min(attempt, 4)), 3.0))
+            await self.send_to_peer_infos.put(
+                (remote_engine_id, send_infos, attempt + 1)
+            )
+
+        def reset_peer_socket(peer_meta: PeerMeta) -> None:
+            with suppress(BaseException):
+                peer_meta.socket.close(linger=0)
+            peer_meta.socket = make_zmq_socket(
+                path=make_zmq_path("tcp", peer_meta.addr),
+                ctx=self.ctx,
+                socket_type=zmq.REQ,
+                bind=False,
+            )
+            peer_meta.socket.setsockopt(zmq.LINGER, 0)
+            peer_meta.socket.setsockopt(zmq.SNDTIMEO, 3000)
+            peer_meta.socket.setsockopt(zmq.RCVTIMEO, 3000)
+
         while not self._stop_event.is_set():
-            remote_engine_id, send_infos = await self.send_to_peer_infos.get()
+            item = await self.send_to_peer_infos.get()
+            remote_engine_id, send_infos = item[:2]
+            attempt = int(item[2]) if len(item) > 2 else 0
             if send_infos is None:
                 # A producer never opens a peer socket to its decoders, so the
                 # disconnect of one may have nothing to close.
@@ -1056,9 +1667,61 @@ class NixlConnectorScheduler:
                 remote_engine_id,
                 "dropped, peer gone" if peer_meta is None else peer_meta.addr,
             )
-            if peer_meta is not None:
+            if peer_meta is None:
+                asyncio.create_task(
+                    retry_later(remote_engine_id, send_infos, attempt)
+                )
+                continue
+            try:
                 await peer_meta.socket.send(msgspec.msgpack.encode(send_infos))
+                response = await peer_meta.socket.recv()
+                op_type, payload = send_infos
+                if op_type in ("block_ids", OWNERSHIP_CANCEL_MSG):
+                    req_id, generation = str(payload[0]), str(payload[1])
+                    result, reply_generation = msgspec.msgpack.decode(response)
+                    if str(reply_generation) != generation:
+                        raise ValueError(
+                            "ownership ACK generation mismatch: "
+                            f"{reply_generation!r} != {generation!r}"
+                        )
+                    if result == OWNERSHIP_RESULT_ACCEPTED:
+                        self._ownership_states[req_id] = (
+                            RequestOwnershipState.ACCEPTED
+                        )
+                    elif result in (
+                        OWNERSHIP_RESULT_CANCELED,
+                        OWNERSHIP_RESULT_TERMINAL,
+                    ):
+                        self._ownership_cancel_pending.discard(req_id)
+                        self._ownership_states[req_id] = (
+                            RequestOwnershipState.TERMINAL
+                        )
+                        self._ownership_safe_releases.put(
+                            (
+                                req_id,
+                                generation,
+                                f"producer ownership {result}",
+                            )
+                        )
+                    else:
+                        raise ValueError(
+                            f"unexpected ownership ACK result {result!r}"
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                # A missing ACK is an uncertain commit: the peer may already
+                # have forwarded block_ids to its workers. Keep ownership and
+                # retry the idempotent generation-scoped command.
                 with suppress(BaseException):
-                    # remote may closed when before get disconnect msg, recv msg form a closed remote socket will
-                    # get a error
-                    await peer_meta.socket.recv()
+                    reset_peer_socket(peer_meta)
+                logger.warning(
+                    "NIXL scheduler peer request failed for %s "
+                    "(attempt=%d): %r",
+                    remote_engine_id,
+                    attempt + 1,
+                    error,
+                )
+                asyncio.create_task(
+                    retry_later(remote_engine_id, send_infos, attempt)
+                )

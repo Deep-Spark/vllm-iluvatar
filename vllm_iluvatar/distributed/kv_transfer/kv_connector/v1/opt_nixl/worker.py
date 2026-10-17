@@ -20,6 +20,7 @@ import uvloop
 import zmq
 from nixl._api import nixl_agent as NixlWrapper
 from nixl._api import nixl_agent_config, nixl_prepped_dlist_handle
+from vllm import envs
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineId,
@@ -38,6 +39,7 @@ from vllm.distributed.utils import get_pp_indices
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
+from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -64,6 +66,8 @@ from .host_kv_stub import (
 from .lifecycle import (
     CompletionBatch,
     LayerReadyBatch,
+    RequestOwnershipState,
+    RequestTombstoneStore,
     RemoteEngineSession,
     RemoteSessionState,
     SendRequestState,
@@ -84,12 +88,14 @@ from .memory_registration import (
 )
 from .metadata import (
     GET_META_MSG,
+    OWNERSHIP_CANCEL_MSG,
     NixlAgentMetadata,
     NixlConnectorMetadata,
     NixlHandshakePayload,
     NodeMeta,
     ReqId,
     ReqMeta,
+    TEARDOWN_COMPLETE_MSG,
     TransferIntent,
     TransferNotificationStatus,
     compute_nixl_compatibility_hash,
@@ -156,21 +162,15 @@ def byte_compatible_kv_layouts(
     )
 
 
-_TERMINAL_XFER_ERROR_MARKERS = (
-    "NIXL_ERR_REMOTE_DISCONNECT",
-    "NIXL_ERR_NOT_FOUND",
-    "NIXL_ERR_CANCELED",
-    "NIXLREMOTEDISCONNECTERROR",
-    "NIXLNOTFOUNDERROR",
-    "NIXLCANCELLEDERROR",
-)
-
-
 def _is_terminal_xfer_query_error(error: BaseException) -> bool:
     """Whether a NIXL status exception means the transfer cannot progress."""
 
-    text = f"{type(error).__name__}: {error}".upper()
-    return any(marker in text for marker in _TERMINAL_XFER_ERROR_MARKERS)
+    # check_xfer_state returns only IN_PROG/SUCCESS; every negative NIXL
+    # status is raised as a typed nixl*Error and is permanent for that handle.
+    error_name = type(error).__name__.upper()
+    if error_name.startswith("NIXL") and error_name.endswith("ERROR"):
+        return True
+    return "NIXL_ERR_" in str(error).upper()
 
 
 class NixlConnectorWorker:
@@ -430,6 +430,13 @@ class NixlConnectorWorker:
         self.scheduler_addr = dp_scoped_addr(
             _SCHEDULER_ADDR, vllm_config.parallel_config.data_parallel_index
         )
+        side_channel_port = (
+            envs.VLLM_NIXL_SIDE_CHANNEL_PORT
+            + vllm_config.parallel_config.data_parallel_index
+        )
+        self.side_channel_addr = (
+            f"{envs.VLLM_NIXL_SIDE_CHANNEL_HOST}:{side_channel_port}"
+        )
         self.global_rank = self.pp_rank * self.tp_world_size + self.tp_rank
         self.enable_permute_local_kv = False
         self.use_quant_to_fp8 = False
@@ -512,12 +519,12 @@ class NixlConnectorWorker:
         self._session_role = "consumer" if role == "kv_consumer" else "producer"
         self.consumer_disconnect_grace = float(
             vllm_config.kv_transfer_config.get_from_extra_config(
-                "consumer_disconnect_grace", 30.0
+                "consumer_disconnect_grace", 0.0
             )
         )
         self.producer_disconnect_drain_timeout = float(
             vllm_config.kv_transfer_config.get_from_extra_config(
-                "producer_disconnect_drain_timeout", 300.0
+                "producer_disconnect_drain_timeout", 45.0
             )
         )
         self._connector_metadata = None
@@ -534,6 +541,11 @@ class NixlConnectorWorker:
         self._engine_generations: dict[EngineId, int] = {}
         self._loop_tasks: set[asyncio.Task[Any]] = set()
         self._loop_exit_event = asyncio.Event()
+        self._teardown_outbox: asyncio.Queue[
+            tuple[str, int, int, int, str]
+        ] = (
+            asyncio.Queue()
+        )
         self._accepting_work = True
         self._shutdown_started_on_loop = False
         self._shutdown_lock = threading.Lock()
@@ -551,7 +563,7 @@ class NixlConnectorWorker:
         )
         # Receive state is owned exclusively by the uvloop actor.
         self._recv_requests: dict[ReqId, ReqMeta] = {}
-        self._recv_deadlines: dict[ReqId, float] = {}
+        self._recv_generations: dict[ReqId, str] = {}
         self._aborted_recv_requests: set[ReqId] = set()
         self._invalid_block_ids: set[int] = set()
         self._recv_notification_status: dict[ReqId, TransferStatusChecker] = {}
@@ -563,10 +575,26 @@ class NixlConnectorWorker:
         # and a dropped notification leaves the request waiting until its
         # lease expires.  Buffered entries that no request ever claims are
         # discarded after the same lease.
-        self._early_recv_notifications: dict[ReqId, list[BufferedRecvNotification]] = (
-            defaultdict(list)
+        self._early_recv_notifications: dict[
+            tuple[ReqId, str], list[BufferedRecvNotification]
+        ] = defaultdict(list)
+        self._early_recv_deadlines: dict[tuple[ReqId, str], float] = {}
+        tombstone_ttl = float(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "ownership_tombstone_ttl", 86400.0
+            )
         )
-        self._early_recv_deadlines: dict[ReqId, float] = {}
+        tombstone_limit = int(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "ownership_tombstone_limit", 262144
+            )
+        )
+        self._recv_tombstones = RequestTombstoneStore(
+            tombstone_ttl, tombstone_limit
+        )
+        self._send_tombstones = RequestTombstoneStore(
+            tombstone_ttl, tombstone_limit
+        )
 
         # Step-scoped producer metadata is main-thread-owned.
         self._step_layerwise_sends: dict[ReqId, ReqMeta] = {}
@@ -1610,6 +1638,7 @@ class NixlConnectorWorker:
             dict(metadata.reqs_to_send_layerwise),
             set(metadata.reqs_to_abort),
             dict(metadata.reqs_to_send_time_record),
+            dict(metadata.reqs_to_release),
         )
 
     def _put_completion(self, batch: CompletionBatch) -> None:
@@ -1659,8 +1688,9 @@ class NixlConnectorWorker:
                     for block_ids in meta.local_block_ids[:1]:
                         batch.invalid_block_ids.update(block_ids)
             else:
-                batch.done_sending.add(req_id)
-                self._send_requests.pop(req_id, None)
+                self._finish_send(req_id, reason)
+                logger.error(reason)
+                return False
             self._put_completion(batch)
             logger.error(reason)
             return False
@@ -1699,8 +1729,9 @@ class NixlConnectorWorker:
                 for block_ids in meta.local_block_ids[:1]:
                     batch.invalid_block_ids.update(block_ids)
         else:
-            batch.done_sending.add(req_id)
-            self._send_requests.pop(req_id, None)
+            self._finish_send(req_id, reason)
+            logger.warning("Rejecting request %s: %s", req_id, reason)
+            return False
         self._put_completion(batch)
         logger.warning("Rejecting request %s: %s", req_id, reason)
         return False
@@ -1712,6 +1743,7 @@ class NixlConnectorWorker:
         reqs_to_send_layerwise: dict[ReqId, ReqMeta],
         reqs_to_abort: set[ReqId],
         send_expirations: dict[ReqId, float],
+        safe_releases: dict[ReqId, tuple[str, str]],
     ) -> None:
         """Apply model-runner metadata on the uvloop owner thread."""
         if not self._accepting_work:
@@ -1726,32 +1758,110 @@ class NixlConnectorWorker:
                 )
             return
 
-        now = time.perf_counter()
         for req_id, meta in reqs_to_recv.items():
+            if self._recv_tombstones.get(req_id, meta.generation) is not None:
+                continue
             aborted = req_id in reqs_to_abort
             if not self._session_accepts_request(req_id, meta, aborted=aborted):
                 continue
             self._recv_requests[req_id] = meta
-            self._recv_deadlines[req_id] = now + self._kv_lease_duration
+            self._recv_generations[req_id] = meta.generation
             session = self.remote_sessions[meta.engine_id]
             session.pending_recv.add(req_id)
             if aborted:
                 self._aborted_recv_requests.add(req_id)
-            self._early_recv_deadlines.pop(req_id, None)
-            for notification in self._early_recv_notifications.pop(req_id, []):
-                self._apply_recv_notification(req_id, *notification)
+            early_key = (req_id, meta.generation)
+            self._early_recv_deadlines.pop(early_key, None)
+            for notification in self._early_recv_notifications.pop(
+                early_key, []
+            ):
+                self._apply_recv_notification(
+                    req_id, meta.generation, *notification
+                )
 
         all_sends = {**reqs_to_send, **reqs_to_send_layerwise}
         for req_id, meta in all_sends.items():
-            state = self._send_requests.setdefault(
-                req_id, SendRequestState(req_id=req_id)
+            state = self._send_state_for_generation(
+                req_id, meta.generation
             )
+            if state is None:
+                continue
             state.install_metadata(meta, send_expirations.get(req_id))
             if not self._session_accepts_request(req_id, meta):
                 continue
             state.session = self.remote_sessions[meta.engine_id]
             state.session.pending_send.add(req_id)
             self._maybe_start_or_continue_send(state)
+
+        for req_id, (generation, reason) in safe_releases.items():
+            if self._recv_generations.get(req_id) != generation:
+                continue
+            self._fail_recv(req_id, reason)
+
+    def _send_state_for_generation(
+        self, req_id: ReqId, generation: str
+    ) -> SendRequestState | None:
+        """Return generation-matched producer state or reject fail-closed."""
+
+        if not generation:
+            logger.error("Rejecting request %s without ownership generation", req_id)
+            self._put_completion(
+                CompletionBatch(
+                    done_sending={req_id},
+                    failures={req_id: "missing ownership generation"},
+                )
+            )
+            return None
+        if self._send_tombstones.get(req_id, generation) is not None:
+            # Duplicate or reordered PREPARED/CANCEL after terminal. Re-emit
+            # completion so a peer retry can recover a lost proof.
+            self._put_completion(CompletionBatch(done_sending={req_id}))
+            return None
+        state = self._send_requests.get(req_id)
+        if state is None:
+            state = SendRequestState(req_id=req_id, generation=generation)
+            self._send_requests[req_id] = state
+            return state
+        if state.generation and state.generation != generation:
+            self._send_tombstones.record(
+                req_id, generation, RequestOwnershipState.CANCELED
+            )
+            self._put_completion(
+                CompletionBatch(
+                    done_sending={req_id},
+                    failures={
+                        req_id: (
+                            "stale ownership generation "
+                            f"{generation}; active={state.generation}"
+                        )
+                    },
+                )
+            )
+            return None
+        state.generation = generation
+        return state
+
+    def _cancel_send_request(
+        self, req_id: ReqId, generation: str, reason: str
+    ) -> None:
+        """Stop new WRITEs and publish completion only after native terminal."""
+
+        state = self._send_state_for_generation(req_id, generation)
+        if state is None:
+            return
+        state.cancel_requested = True
+        state.ready_layers.clear()
+        if not state.started:
+            state.ownership_state = RequestOwnershipState.CANCELED
+            self._finish_send(req_id, reason)
+            return
+        state.ownership_state = RequestOwnershipState.WRITING
+        wrapper = self._send_transfers.get(req_id)
+        if wrapper is None:
+            self._finish_send(req_id, reason)
+            return
+        wrapper.ready_for_check = True
+        self._poll_send_transfers(include_unready=True)
 
     def _maybe_start_or_continue_send(self, state: SendRequestState) -> None:
         """Join metadata, ACTIVE handshake, remote blocks and local readiness."""
@@ -1761,6 +1871,11 @@ class NixlConnectorWorker:
         req_id = state.req_id
         meta = state.metadata
         session = state.session
+        if state.cancel_requested:
+            state.ready_layers.clear()
+            if not state.started:
+                self._finish_send(req_id, "ownership canceled before WRITE")
+            return
         if not self._accepting_work or not state.is_ready():
             logger.info(
                 "NIXL send %s waiting: accepting=%s metadata=%s session=%s "
@@ -1778,6 +1893,7 @@ class NixlConnectorWorker:
         try:
             if not state.started:
                 state.started = True
+                state.ownership_state = RequestOwnershipState.WRITING
                 assert session is not None
                 session.pending_send.discard(req_id)
                 session.inflight_send.add(req_id)
@@ -1790,6 +1906,7 @@ class NixlConnectorWorker:
                     state.remote_block_ids,
                     meta.engine_id,
                     req_id,
+                    state.generation,
                     layer_index,
                     TransferIntent(state.transfer_intent),
                     state.remote_block_starts,
@@ -1808,10 +1925,13 @@ class NixlConnectorWorker:
     @staticmethod
     def _build_notification(
         request_id: str,
+        generation: str,
         notify_msg: str,
         status: TransferNotificationStatus,
     ) -> bytes:
-        return f"{request_id}:{notify_msg}:{status.value}".encode()
+        return (
+            f"{request_id}:{generation}:{notify_msg}:{status.value}".encode()
+        )
 
     def _cell_descriptor_ids(
         self,
@@ -1851,6 +1971,7 @@ class NixlConnectorWorker:
         remote_block_ids: list[np.ndarray],
         dst_engine_id: str,
         request_id: str,
+        generation: str,
         layer_index: int,
         transfer_intent: TransferIntent,
         remote_block_starts: list[int] | None = None,
@@ -1909,7 +2030,10 @@ class NixlConnectorWorker:
             if cell is None:
                 continue
             success_notif = self._build_notification(
-                request_id, cell.notify_msg, TransferNotificationStatus.SUCCESS
+                request_id,
+                generation,
+                cell.notify_msg,
+                TransferNotificationStatus.SUCCESS,
             )
             ids = (
                 None
@@ -1955,6 +2079,7 @@ class NixlConnectorWorker:
                         cell.remote_agent_name,
                         self._build_notification(
                             request_id,
+                            generation,
                             cell.notify_msg,
                             TransferNotificationStatus.FAILED,
                         ),
@@ -2143,9 +2268,11 @@ class NixlConnectorWorker:
                 )
                 manager.reset()
                 for req_id, meta in batch.requests.items():
-                    state = self._send_requests.setdefault(
-                        req_id, SendRequestState(req_id=req_id)
+                    state = self._send_state_for_generation(
+                        req_id, meta.generation
                     )
+                    if state is None:
+                        continue
                     state.ready_layers.append((-1, meta))
                     self._maybe_start_or_continue_send(state)
 
@@ -2153,11 +2280,25 @@ class NixlConnectorWorker:
     # Get results for sending and recving
     ############################################################
     def _complete_recv(self, req_id: ReqId) -> None:
-        meta = self._recv_requests.pop(req_id, None)
+        meta = self._recv_requests.get(req_id)
         if meta is None:
             logger.warning("Dropping completion for unknown receive %s", req_id)
             return
-        self._recv_deadlines.pop(req_id, None)
+        generation = self._recv_generations.get(req_id, meta.generation)
+        try:
+            self._recv_tombstones.record(
+                req_id, generation, RequestOwnershipState.TERMINAL
+            )
+        except RuntimeError as error:
+            logger.critical(
+                "Unable to retain receive tombstone for %s/%s: %s",
+                req_id,
+                generation,
+                error,
+            )
+            return
+        self._recv_requests.pop(req_id, None)
+        self._recv_generations.pop(req_id, None)
         self._aborted_recv_requests.discard(req_id)
         self._recv_notification_status.pop(req_id, None)
         session = self.remote_sessions.get(meta.engine_id)
@@ -2171,10 +2312,24 @@ class NixlConnectorWorker:
         )
 
     def _fail_recv(self, req_id: ReqId, reason: str) -> None:
-        meta = self._recv_requests.pop(req_id, None)
+        meta = self._recv_requests.get(req_id)
         if meta is None:
             return
-        self._recv_deadlines.pop(req_id, None)
+        generation = self._recv_generations.get(req_id, meta.generation)
+        try:
+            self._recv_tombstones.record(
+                req_id, generation, RequestOwnershipState.TERMINAL
+            )
+        except RuntimeError as error:
+            logger.critical(
+                "Unable to retain receive tombstone for %s/%s: %s",
+                req_id,
+                generation,
+                error,
+            )
+            return
+        self._recv_requests.pop(req_id, None)
+        self._recv_generations.pop(req_id, None)
         self._recv_notification_status.pop(req_id, None)
         aborted = req_id in self._aborted_recv_requests
         self._aborted_recv_requests.discard(req_id)
@@ -2199,16 +2354,20 @@ class NixlConnectorWorker:
     def _apply_recv_notification(
         self,
         req_id: ReqId,
+        generation: str,
         status: TransferNotificationStatus,
         payload: NotifyPayload,
         *,
         allow_buffer: bool = False,
     ) -> None:
+        if self._recv_tombstones.get(req_id, generation) is not None:
+            return
         if req_id not in self._recv_requests:
             if allow_buffer and self._accepting_work:
-                self._early_recv_notifications[req_id].append((status, payload))
+                early_key = (req_id, generation)
+                self._early_recv_notifications[early_key].append((status, payload))
                 self._early_recv_deadlines.setdefault(
-                    req_id, time.perf_counter() + self._kv_lease_duration
+                    early_key, time.perf_counter() + self._kv_lease_duration
                 )
             else:
                 logger.warning(
@@ -2216,9 +2375,23 @@ class NixlConnectorWorker:
                     req_id,
                 )
             return
+        if self._recv_generations.get(req_id) != generation:
+            logger.warning(
+                "Dropping stale NIXL notification for request %s generation %s",
+                req_id,
+                generation,
+            )
+            return
 
         if status == TransferNotificationStatus.FAILED:
-            self._fail_recv(req_id, "remote NIXL transfer failed")
+            # Setup failure does not prove a partially-created native WRITE is
+            # terminal. Scheduler lease expiry drives generation-scoped CANCEL.
+            logger.warning(
+                "Remote reported NIXL transfer failure for %s/%s; retaining "
+                "destination blocks pending producer terminal proof",
+                req_id,
+                generation,
+            )
             return
 
         transfer_helper = self._recv_notification_status.get(req_id)
@@ -2257,11 +2430,12 @@ class NixlConnectorWorker:
                 try:
                     (
                         req_id,
+                        generation,
                         pp_text,
                         layer_text,
                         tp_text,
                         status_text,
-                    ) = notif.decode("utf-8").rsplit(":", 4)
+                    ) = notif.decode("utf-8").rsplit(":", 5)
                     status = TransferNotificationStatus(status_text)
                     payload = NotifyPayload.decode(pp_text, layer_text, tp_text)
                 except Exception as e:
@@ -2271,19 +2445,32 @@ class NixlConnectorWorker:
                     continue
 
                 self._apply_recv_notification(
-                    req_id, status, payload, allow_buffer=True
+                    req_id,
+                    generation,
+                    status,
+                    payload,
+                    allow_buffer=True,
                 )
 
     def _finish_send(self, req_id: ReqId, failure: str | None = None) -> bool:
         if failure:
             self._send_failures[req_id] = failure
+        state = self._send_requests.get(req_id)
         wrapper = self._send_transfers.get(req_id)
         engine_id = None
         if wrapper is not None:
             release_failed = False
-            for handle, _, _, remote_engine_id in wrapper.transfer_list:
+            for item in wrapper.transfer_list:
+                handle, _done, _, remote_engine_id = item
                 engine_id = remote_engine_id
-                if handle is not None and not self._release_xfer_handle(handle):
+                if handle is None:
+                    continue
+                if self._release_xfer_handle(handle):
+                    # Do not poll or release this native handle a second time
+                    # if another handle in the same transfer fails cleanup.
+                    item[0] = None
+                    item[1] = True
+                else:
                     release_failed = True
             if release_failed:
                 self._send_failures.setdefault(
@@ -2291,6 +2478,28 @@ class NixlConnectorWorker:
                 )
                 return False
             self._send_transfers.pop(req_id, None)
+        if state is not None and state.generation:
+            terminal_state = (
+                RequestOwnershipState.TERMINAL
+                if state.started
+                else RequestOwnershipState.CANCELED
+            )
+            try:
+                self._send_tombstones.record(
+                    req_id, state.generation, terminal_state
+                )
+            except RuntimeError as error:
+                # Forgetting this generation would permit a late PREPARED to
+                # start a new WRITE. Stop accepting work and withhold proof.
+                self._accepting_work = False
+                state.cancel_requested = True
+                logger.critical(
+                    "Unable to retain ownership tombstone for %s/%s: %s",
+                    req_id,
+                    state.generation,
+                    error,
+                )
+                return False
         state = self._send_requests.pop(req_id, None)
         if state is not None and state.metadata is not None:
             engine_id = state.metadata.engine_id
@@ -2373,24 +2582,34 @@ class NixlConnectorWorker:
                 self._finish_send(req_id, self._send_failures.get(req_id))
 
     def _expire_requests(self, now: float) -> None:
-        for req_id, expires in list(self._recv_deadlines.items()):
+        for early_key, expires in list(self._early_recv_deadlines.items()):
             if now >= expires:
-                self._fail_recv(req_id, "receive lease expired")
-
-        for req_id, expires in list(self._early_recv_deadlines.items()):
-            if now >= expires:
-                del self._early_recv_deadlines[req_id]
-                self._early_recv_notifications.pop(req_id, None)
+                del self._early_recv_deadlines[early_key]
+                self._early_recv_notifications.pop(early_key, None)
                 logger.warning(
-                    "Discarding NIXL notification for request %s that no "
+                    "Discarding NIXL notification for request %s/%s that no "
                     "receive ever claimed",
-                    req_id,
+                    *early_key,
                 )
 
         for req_id, state in list(self._send_requests.items()):
             if state.deadline is None or now < state.deadline:
                 continue
             if not state.started:
+                if state.generation:
+                    # A queued D request can legitimately wait longer than the
+                    # legacy producer lease before disclosing destination
+                    # blocks. Keep source ownership until D sends CANCEL, the
+                    # remote session disconnects, or WRITE reaches terminal.
+                    state.deadline = None
+                    logger.warning(
+                        "Producer lease expired for request %s generation %s "
+                        "before WRITE; retaining ownership "
+                        "until consumer cancel or disconnect",
+                        req_id,
+                        state.generation,
+                    )
+                    continue
                 self.xfer_stats.record_kv_expired_req()
                 self._finish_send(req_id, "send lease expired before transfer")
 
@@ -2402,8 +2621,18 @@ class NixlConnectorWorker:
                 and session.drain_deadline is not None
                 and now >= session.drain_deadline
             ):
-                for req_id in list(session.pending_recv):
-                    self._fail_recv(req_id, "remote engine disconnected")
+                if session.pending_recv and not session.stuck_reported:
+                    session.stuck_reported = True
+                    logger.warning(
+                        "Remote producer %s disconnected with %d destination "
+                        "ownership(s); fencing native peer before release",
+                        session.engine_id,
+                        len(session.pending_recv),
+                    )
+                self._cleanup_session_if_drained(
+                    session, fence_pending_recv=True
+                )
+                continue
             elif (
                 session.role == "producer"
                 and session.state == RemoteSessionState.DRAINING
@@ -2603,8 +2832,94 @@ class NixlConnectorWorker:
                 )
             self._shutdown_complete = True
 
-    def _cleanup_session_if_drained(self, session: RemoteEngineSession) -> None:
-        if not session.can_release:
+    def _report_teardown(
+        self, session: RemoteEngineSession, status: str
+    ) -> None:
+        """Report one terminal teardown result per local worker and generation."""
+        if session.teardown_id is None:
+            return
+        if session.reported_teardown_id == session.teardown_id:
+            return
+        session.reported_teardown_id = session.teardown_id
+        self._teardown_outbox.put_nowait(
+            (
+                session.engine_id,
+                session.generation,
+                session.teardown_id,
+                self.global_rank,
+                status,
+            )
+        )
+
+    async def _run_teardown_reports(self) -> None:
+        """Deliver worker teardown completion to this rank's scheduler."""
+        path = make_zmq_path("tcp", self.side_channel_addr)
+        while True:
+            engine_id, generation, teardown_id, global_rank, status = (
+                await self._teardown_outbox.get()
+            )
+            payload = msgspec.msgpack.encode(
+                (
+                    TEARDOWN_COMPLETE_MSG,
+                    (
+                        engine_id,
+                        generation,
+                        teardown_id,
+                        global_rank,
+                        status,
+                    ),
+                )
+            )
+            delivered = False
+            for attempt in range(5):
+                try:
+                    with make_zmq_socket(
+                        path=path,
+                        ctx=self.ctx,
+                        socket_type=zmq.REQ,
+                        bind=False,
+                        linger=0,
+                    ) as socket:
+                        socket.setsockopt(zmq.SNDTIMEO, 3000)
+                        socket.setsockopt(zmq.RCVTIMEO, 3000)
+                        await socket.send(payload)
+                        await socket.recv()
+                    delivered = True
+                    break
+                except Exception as error:
+                    logger.warning(
+                        "NIXL teardown report retry %d/5 failed for %s "
+                        "generation %s: %s",
+                        attempt + 1,
+                        engine_id,
+                        generation,
+                        error,
+                    )
+                    await asyncio.sleep(0.2 * (attempt + 1))
+            if not delivered:
+                # Router remains fenced when an ACK is lost; never fake safety.
+                logger.error(
+                    "Unable to report teardown for %s generation %s rank %s",
+                    engine_id,
+                    generation,
+                    global_rank,
+                )
+
+    def _cleanup_session_if_drained(
+        self,
+        session: RemoteEngineSession,
+        *,
+        fence_pending_recv: bool = False,
+    ) -> None:
+        can_fence_recv = (
+            fence_pending_recv
+            and session.role == "consumer"
+            and session.state
+            in (RemoteSessionState.DRAINING, RemoteSessionState.STUCK)
+            and not session.pending_send
+            and not session.inflight_send
+        )
+        if not session.can_release and not can_fence_recv:
             return
         engine_id = session.engine_id
         # Remove mappings first so no later queued work can discover a dlist.
@@ -2648,12 +2963,31 @@ class NixlConnectorWorker:
         self._tp_size.pop(engine_id, None)
         self._pp_size.pop(engine_id, None)
         self._block_size.pop(engine_id, None)
+        if can_fence_recv:
+            # Native peer teardown is the proof that the failed producer can no
+            # longer issue a late WRITE. Only now may D release failed receives.
+            for req_id in list(session.pending_recv):
+                self._fail_recv(
+                    req_id,
+                    "remote producer disconnected after native teardown",
+                )
+            if session.request_count:
+                session.state = RemoteSessionState.STUCK
+                logger.error(
+                    "Remote producer %s generation %s native teardown "
+                    "completed but %d ownership(s) could not be released",
+                    engine_id,
+                    session.generation,
+                    session.request_count,
+                )
+                return
         session.state = RemoteSessionState.CLOSED
         logger.info(
             "Closed remote engine %s generation %s",
             engine_id,
             session.generation,
         )
+        self._report_teardown(session, "closed")
 
     def _new_connect_session(self, engine_id: EngineId) -> RemoteEngineSession | None:
         current = self.remote_sessions.get(engine_id)
@@ -2678,7 +3012,9 @@ class NixlConnectorWorker:
         self.remote_sessions[engine_id] = session
         return session
 
-    def _mark_engine_disconnected(self, engine_id: EngineId) -> None:
+    def _mark_engine_disconnected(
+        self, engine_id: EngineId, teardown_id: int | None = None
+    ) -> None:
         now = time.perf_counter()
         session = self.remote_sessions.get(engine_id)
         if session is None:
@@ -2690,6 +3026,11 @@ class NixlConnectorWorker:
                 role=self._session_role,
             )
             self.remote_sessions[engine_id] = session
+        if teardown_id is not None:
+            session.teardown_id = teardown_id
+            if session.state == RemoteSessionState.CLOSED:
+                self._report_teardown(session, "closed")
+                return
         timeout = (
             self.consumer_disconnect_grace
             if self.is_consumer
@@ -2704,8 +3045,8 @@ class NixlConnectorWorker:
                     and state.metadata is not None
                     and state.metadata.engine_id == engine_id
                 ):
-                    # No more layers are admitted after disconnect; all handles
-                    # already started for this request are now drainable.
+                    # Poll already-started writes until UCX reports terminal;
+                    # never free an in-progress native request.
                     wrapper.ready_for_check = True
             pending = [
                 req_id
@@ -2800,6 +3141,7 @@ class NixlConnectorWorker:
                 self._scheduler_listener(),
                 self._run_progress(),
                 self._run_write_kv_cache(),
+                self._run_teardown_reports(),
             ]
             if host_kv_enabled():
                 coroutines.append(self._run_d2h())
@@ -2838,17 +3180,25 @@ class NixlConnectorWorker:
                 try:
                     op_type, remote_infos = msgspec.msgpack.decode(msg)
                     if op_type == "block_ids":
-                        req_id, intent_text, block_ids, remote_engine_id = remote_infos[
-                            :4
-                        ]
+                        (
+                            req_id,
+                            generation,
+                            intent_text,
+                            block_ids,
+                            remote_engine_id,
+                        ) = remote_infos[:5]
+                        req_id = str(req_id)
+                        generation = str(generation)
                         block_starts: list[int] | None = (
-                            list(remote_infos[4]) if len(remote_infos) > 4 else None
+                            list(remote_infos[5]) if len(remote_infos) > 5 else None
                         )
                         intent = TransferIntent(intent_text)
                         logger.info(
-                            "NIXL recv block_ids req=%s intent=%s groups=%s "
+                            "NIXL recv block_ids req=%s generation=%s "
+                            "intent=%s groups=%s "
                             "starts=%s from=%s session=%s",
                             req_id,
+                            generation,
                             intent.value,
                             [len(x) for x in block_ids],
                             block_starts,
@@ -2862,21 +3212,68 @@ class NixlConnectorWorker:
                             np.array(block_id, dtype=np.int32)[None, :]
                             for block_id in block_ids
                         ]
-                        state = self._send_requests.setdefault(
-                            req_id, SendRequestState(req_id=req_id)
+                        state = self._send_state_for_generation(
+                            req_id, generation
                         )
+                        if state is None:
+                            continue
+                        fingerprint = msgspec.msgpack.encode(
+                            (
+                                intent.value,
+                                block_ids,
+                                remote_engine_id,
+                                block_starts,
+                            )
+                        )
+                        if (
+                            state.command_fingerprint is not None
+                            and state.command_fingerprint != fingerprint
+                        ):
+                            self._cancel_send_request(
+                                req_id,
+                                generation,
+                                "conflicting duplicate PREPARED command",
+                            )
+                            continue
+                        state.command_fingerprint = fingerprint
                         state.transfer_intent = intent.value
                         state.remote_block_ids = remote_block_ids
                         state.remote_block_starts = block_starts
                         state.session = self.remote_sessions.get(remote_engine_id)
+                        if (
+                            state.ownership_state
+                            == RequestOwnershipState.PREPARED
+                        ):
+                            state.ownership_state = (
+                                RequestOwnershipState.ACCEPTED
+                            )
                         if state.deadline is None:
                             state.deadline = (
                                 time.perf_counter() + self._kv_lease_duration
                             )
-                        self._maybe_start_or_continue_send(state)
+                        if intent == TransferIntent.CANCEL:
+                            self._cancel_send_request(
+                                req_id,
+                                generation,
+                                "consumer canceled before allocation",
+                            )
+                        else:
+                            self._maybe_start_or_continue_send(state)
+                    elif op_type == OWNERSHIP_CANCEL_MSG:
+                        req_id, generation, _remote_engine_id, reason = remote_infos
+                        self._cancel_send_request(
+                            str(req_id), str(generation), str(reason)
+                        )
                     elif op_type == "disconnect":
-                        remote_engine_id = remote_infos
-                        self._mark_engine_disconnected(remote_engine_id)
+                        if isinstance(remote_infos, (list, tuple)):
+                            remote_engine_id = remote_infos[0]
+                            teardown_id = int(remote_infos[1])
+                        else:
+                            remote_engine_id = remote_infos
+                            teardown_id = None
+                        self._mark_engine_disconnected(
+                            remote_engine_id, teardown_id
+                        )
                     elif op_type == "connect":
                         node_meta = NodeMeta(**remote_infos)
                         if not self._accepting_work:
@@ -2944,8 +3341,10 @@ class NixlConnectorWorker:
                 await asyncio.sleep(0.0005)
 
             for req_id, meta in batch.requests.items():
-                state = self._send_requests.setdefault(
-                    req_id, SendRequestState(req_id=req_id)
+                state = self._send_state_for_generation(
+                    req_id, meta.generation
                 )
+                if state is None:
+                    continue
                 state.ready_layers.append((batch.layer_index, meta))
                 self._maybe_start_or_continue_send(state)

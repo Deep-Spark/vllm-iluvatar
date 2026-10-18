@@ -151,5 +151,10 @@ def register_general() -> None:
     from vllm_iluvatar.ilu_register import apply_oot_registrations
 
     apply_general_patches()
+    from vllm_iluvatar.ilu_patch.general_patches.patch_pp_cpu_offloading import (
+        attest_required_bindings,
+    )
+
+    attest_required_bindings()
     apply_oot_registrations()
     apply_kv_transfer_registrations()

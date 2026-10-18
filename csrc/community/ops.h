@@ -25,6 +25,15 @@ torch::Tensor weak_ref_tensor(torch::Tensor& tensor);
 // Maps a (pinned) CPU tensor into the CUDA address space and returns a view.
 torch::Tensor get_cuda_view_from_cpu_tensor(torch::Tensor& cpu_tensor);
 
+// swap_blocks_batch(Tensor src_ptrs, Tensor dst_ptrs, Tensor sizes,
+//                   bool is_src_access_order_any=False) -> ()
+// Descriptor tensors are on CPU; their values address pinned host or device
+// memory copied asynchronously on the current CUDA stream.
+void swap_blocks_batch(const torch::Tensor& src_ptrs,
+                       const torch::Tensor& dst_ptrs,
+                       const torch::Tensor& sizes,
+                       bool is_src_access_order_any);
+
 // rotary_embedding(Tensor positions, Tensor! query, Tensor!? key,
 //                  int head_size, Tensor cos_sin_cache, bool is_neox,
 //                  int rope_dim_offset=0, bool inverse=False) -> ()

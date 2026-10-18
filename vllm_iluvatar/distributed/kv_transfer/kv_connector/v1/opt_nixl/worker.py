@@ -127,6 +127,35 @@ BufferedRecvNotification = tuple[TransferNotificationStatus, NotifyPayload]
 logger = init_logger("vllm." + __name__)
 
 
+def byte_compatible_kv_layouts(
+    local_layout: str,
+    remote_layout: str,
+    registered_specs: list[KVCacheSpec],
+) -> bool:
+    """Return whether registered blocks have identical bytes in two layouts.
+
+    The listed mixed layout pairs are equivalent only for singleton-head MLA:
+    descriptor offsets and strides account for outer layer/block packing, and
+    the in-block head dimension has length one.
+    """
+    if local_layout == remote_layout:
+        return True
+    layout_pair = {local_layout, remote_layout}
+    if layout_pair not in (
+        {"LBNHC", "BLHNC"},
+        {"LBNHC", "LBHNC"},
+        {"LBHNC", "BLHNC"},
+    ):
+        return False
+    # A PP stage with no registered NIXL tensors transfers no layout-sensitive
+    # bytes, so the certified layout mismatch is vacuously safe there.
+    return all(
+        isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+        and spec.num_kv_heads == 1
+        for spec in registered_specs
+    )
+
+
 class NixlConnectorWorker:
     """Implementation of Worker side methods"""
 
@@ -1148,13 +1177,26 @@ class NixlConnectorWorker:
                 f"{metadata.physical_blocks_per_logical_kv_block}); this "
                 "connector exchanges scheduler block ids only"
             )
-        # Blocks are copied byte for byte, so a different in-block layout
-        # would not fail the transfer, it would silently scramble the KV.
-        if self.kv_cache_layout != metadata.kv_cache_layout:
+        registered_specs = [
+            self._layer_specs[layer_name] for layer_name in self.layer_ptr_mapping
+        ]
+        if not byte_compatible_kv_layouts(
+            self.kv_cache_layout,
+            metadata.kv_cache_layout,
+            registered_specs,
+        ):
             raise RuntimeError(
-                "P/D KV cache layouts must match: "
+                "P/D KV cache layouts must be byte-compatible: "
                 f"local={self.kv_cache_layout}, "
                 f"remote={metadata.kv_cache_layout}"
+            )
+        if self.kv_cache_layout != metadata.kv_cache_layout:
+            logger.info_once(
+                "Allowing byte-compatible P/D KV cache layouts: "
+                "local=%s, remote=%s, registered_specs=%d",
+                self.kv_cache_layout,
+                metadata.kv_cache_layout,
+                len(registered_specs),
             )
         self._remember_remote_engine(metadata, remote_tp_size, remote_pp_size)
 

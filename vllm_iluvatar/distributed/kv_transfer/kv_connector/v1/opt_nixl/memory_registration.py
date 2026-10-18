@@ -124,13 +124,16 @@ class MemoryRegistrationPlanner:
                 raise ValueError(
                     "packed KV tensor offset must be smaller than block_stride"
                 )
-            placement = PackedLayerInfo(
-                offset=tensor_config.offset,
-                block_stride=tensor_config.block_stride,
-            )
             # 0.30 renamed KVCacheTensor.shared_by to .layers and added a
-            # third geometry field, .layer_stride.
-            for layer_name in tensor_config.layers:
+            # third geometry field, .layer_stride. Each layer view starts at
+            # its own position in the packed scheduler-block slab.
+            for layer_index, layer_name in enumerate(tensor_config.layers):
+                placement = PackedLayerInfo(
+                    offset=(
+                        tensor_config.offset + layer_index * tensor_config.layer_stride
+                    ),
+                    block_stride=tensor_config.block_stride,
+                )
                 previous = self._packing_by_layer.setdefault(layer_name, placement)
                 if previous != placement:
                     raise ValueError(

@@ -190,7 +190,88 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
                     "func": [(0, w8a8_gemv), (9, w8a8_gemm)],
                 },
             },
-            "ivcore11": {},
+            "ivcore11": {
+                # Select GEMV/GEMM here; iXinfer selects the GEMM tile.
+                # Shared gate/up: TP4 / TP2 / TP1.
+                (1152, 5120): {
+                    "format": "NN",
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                },
+                (2304, 5120): {
+                    "format": "NN",
+                    "func": [(0, w8a8_gemm)],
+                },
+                (4608, 5120): {
+                    "format": "NN",
+                    "func": [(0, w8a8_gemm)],
+                },
+                # Shared down: TP4 / TP2 / TP1.
+                (5120, 576): {
+                    "format": "NN",
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                },
+                (5120, 1152): {
+                    "format": "NN",
+                    "func": [(0, w8a8_gemm)],
+                },
+                (5120, 2304): {
+                    "format": "NN",
+                    "func": [(0, w8a8_gemm)],
+                },
+                # Replicated Q-A/KV and indexer Q-B.
+                (1792, 5120): {
+                    "format": "NN",
+                    "func": [(0, w8a8_gemm)],
+                },
+                (4096, 1280): {
+                    "format": "NN",
+                    "func": [(0, w8a8_gemm)],
+                },
+                # Attention O-B: TP4 / TP2 / TP1.
+                (5120, 2048): {
+                    "format": "NN",
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                },
+                (5120, 4096): {
+                    "format": "NN",
+                    "func": [(0, w8a8_gemm)],
+                },
+                (5120, 8192): {
+                    "format": "NN",
+                    "func": [(0, w8a8_gemm)],
+                },
+                # Attention Q-B: TP2 / TP1.
+                (16384, 1280): {
+                    "format": "NN",
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                },
+                (32768, 1280): {
+                    "format": "NN",
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                },
+                # Replicated DSpark main projection.
+                (5120, 15360): {
+                    "format": "NN",
+                    "func": [(0, w8a8_gemm)],
+                },
+                # GLM5Next shared experts and dense MLP.
+                (4096, 4096): {
+                    "format": "NN",
+                    "func": [(0, w8a8_gemv), (2, w8a8_gemm)],
+                },
+                (4096, 2048): {
+                    "format": "NN",
+                    "func": [(0, w8a8_gemv), (2, w8a8_gemm)],
+                },
+                (24576, 4096): {
+                    "format": "NN",
+                    "func": [(0, w8a8_gemv), (17, w8a8_gemm)],
+                },
+                (4096, 12288): {
+                    "format": "NN",
+                    "func": [(0, w8a8_gemm)],
+                },
+            },
         }
 
     def _get_layer_params(

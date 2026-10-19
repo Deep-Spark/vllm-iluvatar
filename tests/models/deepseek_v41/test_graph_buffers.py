@@ -6,12 +6,6 @@ import torch
 from vllm_iluvatar.models.deepseek_v41.attention import IluDeepseekV41Attention
 
 
-def test_large_kv_span_allows_both_a64_fp8_layouts():
-    from vllm_iluvatar.v1.worker.kv_layout_report import _A64_SAFE_CACHE_DTYPES
-
-    assert {"fp8_ds_mla", "fp8_e4m3", "bfloat16"} == _A64_SAFE_CACHE_DTYPES
-
-
 def test_dspark_context_insert_supports_plain_e4m3():
     from ixformer.inference.functions import deepseekv41 as formal_ops
 

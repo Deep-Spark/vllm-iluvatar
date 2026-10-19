@@ -707,7 +707,8 @@ class ConsumerPrefixState(PrefixRuntime):
                                 and tuple(field["shape"]) == (1, cache.shape[-1])
                             )
         free, _ = torch.cuda.mem_get_info()
-        eligible &= free / 2**20 >= (1100 if self._p21_eager_warmed else 1900)
+        required_free_mib = 1024 if self._p21_eager_warmed else 1900
+        eligible &= free / 2**20 >= required_free_mib
         decision = torch.tensor(
             [int(eligible), decode, len(tails), capacity, ndecode], dtype=torch.int64
         )
@@ -736,6 +737,8 @@ class ConsumerPrefixState(PrefixRuntime):
                     "votes": [v.tolist() for v in votes],
                     "prefix_tokens": prefix_tokens,
                     "free_MiB": free / 2**20,
+                    "eager_warmed": self._p21_eager_warmed,
+                    "required_free_MiB": required_free_mib,
                     "ctx_metadata_type": type(ctx.attn_metadata).__name__,
                 },
             )
@@ -745,13 +748,19 @@ class ConsumerPrefixState(PrefixRuntime):
                     self._p21_reasons.get("peer_veto", 0) + 1
                 )
             self._p21_counters["fallback"] += 1
-            return original(
+            result = original(
                 input_ids,
                 positions,
                 intermediate_tensors,
                 inputs_embeds,
                 lookback_token_ids,
             )
+            # Every EP rank executes the same eager collective, including
+            # locally idle DPs. A successful fallback has warmed its scratch
+            # allocations even when this rank has no live request. Do not
+            # mark an all-dummy step or an exceptional forward as warm.
+            self._p21_eager_warmed |= any(int(v[1]) or int(v[2]) for v in votes)
+            return result
         h = (
             inputs_embeds
             if inputs_embeds is not None

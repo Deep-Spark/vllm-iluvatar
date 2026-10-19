@@ -1,9 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Wire Iluvatar vocab-sharded DSpark sampling.
-
-Draft ``enforce_eager`` is applied by ``patch_draft_cudagraph``, which wraps
-``DFlashSpeculator.init_cudagraph_manager``. DSpark inherits that method.
-"""
+"""Wire Iluvatar vocab-sharded DSpark sampling."""
 
 from __future__ import annotations
 

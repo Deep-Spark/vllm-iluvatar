@@ -5,9 +5,6 @@ The community DSpark speculator remains the owner of input preparation,
 backbone execution and request state. This module replaces the sequential
 draft-head stage so Iluvatar's local-head APIs can avoid redundant full-vocab
 communication when the draft implements ``compute_draft_logits_local``.
-
-Draft CUDA graphs already honor ``speculative_config.enforce_eager`` via
-``ilu_patch.general_patches.patch_draft_cudagraph``.
 """
 
 from __future__ import annotations

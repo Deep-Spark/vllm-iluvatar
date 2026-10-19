@@ -85,6 +85,15 @@ restoring them preserves page padding. Compressor rings retain the open CR2
 group. The internal boundary field names remain `HC`, `pre_mix`, `topk20` and
 `candidates20`.
 
+Compressed main KV uses the same native lifecycle. `PrefixGeometry` carries
+`main_kv_format` (`none`, `i8g64`, or `i4g32`) on every packet, including even
+prompts. Odd boundary rows carry the existing packed payload and FP16 group
+scales as a pair, with identical block/row indices and no requantization. D
+binds both cache planes before initializing prefix reuse. The worker leases the
+bounded compressed workspace around execution; the complete model forward,
+including prefix reuse and the remaining suffix, shares one forward scope.
+SWA remains BF16 and indexer storage retains its independent layout.
+
 Before the common EP decision, D checks engine/session/request/prompt/slot
 generation, successful original receive, replay shape, current full KV pages,
 compact receive-to-logical-page mapping, cache geometry and available memory.

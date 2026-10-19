@@ -468,7 +468,7 @@ def test_model_and_imported_suffix_scopes_reset_reuse_under_one_outer_lease():
         calls.append((pool._leased, pool._forward_depth, pool.restore.step_epoch))
         return args[0]
 
-    model._forward = body
+    model._forward_full = body
     with pool.acquire():
         assert model(torch.empty(0), torch.empty(0), None).numel() == 0
         # Mirrors the explicit E25 scope after prefix reconstruction.
@@ -485,7 +485,7 @@ def test_none_model_does_not_enter_a_compressed_scope():
     model.start_layer, model.end_layer = 0, 1
     model.layers = [SimpleNamespace(attn=SimpleNamespace(compressed_kv_workspace=None))]
     expected = object()
-    model._forward = lambda *args: expected
+    model._forward_full = lambda *args: expected
     assert model(None, None, None) is expected
 
 

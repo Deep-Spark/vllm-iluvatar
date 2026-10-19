@@ -44,10 +44,12 @@ class PacketTest(unittest.TestCase):
         n=262144,
         indexer_bytes=132,
         topology=TEST_TOPOLOGY,
+        main_format="none",
     ):
         directory = pub.request_dir(self.source, rid)
         directory.mkdir()
         hit, start, q = pub.replay_layout(n)
+        geometry = PrefixGeometry(indexer_width=indexer_bytes, main_kv_format=main_format)
         rows = []
         for rank in range(topology.world_size):
             pp, tp = divmod(rank, topology.tp_size)
@@ -86,13 +88,9 @@ class PacketTest(unittest.TestCase):
                 if q == 129:
                     records.extend(
                         [
-                            dict(
-                                name="main20",
-                                kind="main_tail",
-                                layer=20,
-                                shape=[1, 512],
-                                dtype="torch.bfloat16",
-                            ),
+                            *[dict(name="main20." + kind, kind=kind, layer=20,
+                                   shape=list(shape), dtype=dtype)
+                              for kind,(shape,dtype) in geometry.main_tail_fields().items()],
                             dict(
                                 name="indexer20",
                                 kind="indexer_tail",
@@ -113,7 +111,7 @@ class PacketTest(unittest.TestCase):
             (directory / f"rank{rank}.bin").write_bytes(raw)
             row = dict(
                 topology=topology.to_dict(),
-                geometry=PrefixGeometry(indexer_width=indexer_bytes).to_dict(),
+                geometry=geometry.to_dict(),
                 admission=1,
                 id=rid,
                 engine_id=self.engine,

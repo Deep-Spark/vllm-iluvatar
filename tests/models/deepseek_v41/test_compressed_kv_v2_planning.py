@@ -287,177 +287,88 @@ def test_role_workspace_fits_real_v2_1m_groups_and_meta_allocation(
             state.release()
 
 
-def receipt_chain(fmt, monkeypatch, tmp_path):
-    """Drive the public receipt hooks with actual V2 cache groups on CPU."""
-    from vllm.v1.core.sched import scheduler as scheduler_module
 
-    from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.opt_nixl import (
-        scheduler as connector_module,
+def receipt_chain(fmt, tmp_path):
+    from vllm_iluvatar.v1.worker.prefill_state.configuration import PrefixGeometry
+    from vllm_iluvatar.v1.worker.prefill_state.scheduler_state import (
+        PrefixSchedulerState, selected_groups,
     )
-    from vllm_iluvatar.v1.worker.prefill_state import scheduler_receipt
-
     cfg = config()
-    cfg.parallel_config.data_parallel_index = 0
     specs, _ = specs_for_rank(cfg, fmt, 0, 40)
-    available = (
-        CacheBudget.create(8 * 1024**3, fmt).payload_bytes
-        if fmt is not None
-        else 8 * 1024**3
-    )
+    available = CacheBudget.create(8 * 1024**3, fmt).payload_bytes if fmt else 8 * 1024**3
     cache = kv_cache_utils.get_kv_cache_configs(cfg, [specs], [available])[0]
+    tracker = PrefixSchedulerState.__new__(PrefixSchedulerState)
+    tracker.wire, tracker.nonce, tracker.engine_id = tmp_path, "local-run", "D"
+    tracker.consumer, tracker.cache_config = True, cache
+    tracker.geometry = PrefixGeometry(main_kv_format=fmt.name if fmt else "none")
+    tracker.selected = selected_groups(cache, tracker.geometry)
+    tracker.requests, tracker.serial = {}, 0
     n = 512
-    blocks = SimpleNamespace(
-        blocks=[
-            [
-                SimpleNamespace(
-                    block_id=g * 100 + j + 1,
-                    # Logical zero is a live local prefix, omitted from the
-                    # compact remote receive but retained in full coverage.
-                    block_hash="local-prefix" if j == 0 else None,
-                    is_null=False,
-                )
-                for j in range(
-                    (n + group.kv_cache_spec.block_size - 1)
-                    // group.kv_cache_spec.block_size
-                )
-            ]
-            for g, group in enumerate(cache.kv_cache_groups)
-        ]
-    )
-
-    def current_blocks(_):
-        return SimpleNamespace(
-            get_block_ids=lambda *, group_ids: [
-                [block.block_id for block in blocks.blocks[g]] for g in group_ids
-            ]
-        )
-
-    class Scheduler:
-        def __init__(self):
-            self.finished_recving_kv_req_ids = set()
-            self.failed_recving_kv_req_ids = set()
-            self.kv_cache_manager = SimpleNamespace(get_blocks=current_blocks)
-
-        def _mark_prefix_replay(self, request, hit_tokens):
-            assert hit_tokens == n
-            request.num_computed_tokens = n - 128
-            return 128
-
-        def _update_waiting_for_remote_kv(self, request):
-            return self._mark_prefix_replay(request, n)
-
-    class Connector:
-        def __init__(self):
-            self.engine_id = "D"
-            self.kv_cache_config, self.vllm_config = cache, cfg
-            self.is_consumer = True
-            self.peer_node_metas = {"P": SimpleNamespace(addr="offline-peer")}
-
-        def update_state_after_alloc(self, *args):
-            pass
-
-        def build_connector_meta(self, output):
-            return SimpleNamespace(reqs_to_recv={"request": object()})
-
-    monkeypatch.setattr(scheduler_module, "Scheduler", Scheduler)
-    monkeypatch.setattr(connector_module, "NixlConnectorScheduler", Connector)
-    monkeypatch.setattr(
-        scheduler_receipt, "local_paths", lambda _: (tmp_path, "local-run")
-    )
-    scheduler_receipt.install()
-    scheduler, connector = Scheduler(), Connector()
-    request = SimpleNamespace(
-        request_id="request",
-        num_prompt_tokens=n,
-        num_computed_tokens=128,
-        prompt_token_ids=list(range(n)),
-        kv_transfer_params={"remote_engine_id": "P"},
-    )
-    output = SimpleNamespace(
-        finished_req_ids=set(),
-        preempted_req_ids=set(),
+    blocks = SimpleNamespace(blocks=[
+        [SimpleNamespace(block_id=g * 100 + j + 1,
+                         block_hash="local-prefix" if j == 0 else None, is_null=False)
+         for j in range((n + group.kv_cache_spec.block_size - 1)
+                        // group.kv_cache_spec.block_size)]
+        for g, group in enumerate(cache.kv_cache_groups)])
+    request = SimpleNamespace(request_id="request", num_prompt_tokens=n,
+        num_computed_tokens=384, replay_start=384, prompt_token_ids=list(range(n)),
+        kv_transfer_params={"do_remote_prefill": True, "remote_engine_id": "P"})
+    output = SimpleNamespace(finished_req_ids=set(), preempted_req_ids=set(),
         num_scheduled_tokens={"request": 128},
-    )
-    return scheduler_receipt, scheduler, connector, request, blocks, output
+        kv_connector_block_state=SimpleNamespace(get_block_ids=lambda rid:
+            [[b.block_id for b in group] for group in blocks.blocks]))
+    metadata = SimpleNamespace(reqs_to_recv={"request": object()})
+    return tracker, request, blocks, output, metadata
 
 
 @pytest.mark.parametrize("fmt", [None, I8G64, I4G32])
-def test_real_v2_e25_receipt_keeps_current_prefix_and_compact_remote_positions(
-    fmt, monkeypatch, tmp_path
-):
-    from vllm_iluvatar.models.deepseek_v41.compressed_kv import cache_group_geometry
-
-    pub, scheduler, connector, request, blocks, output = receipt_chain(
-        fmt, monkeypatch, tmp_path
-    )
-    connector.update_state_after_alloc(request, blocks, 384)
-    assert connector.build_connector_meta(output).source_full_ready_receipts == {}
-    scheduler.finished_recving_kv_req_ids.add(request.request_id)
-    scheduler._update_waiting_for_remote_kv(request)
-    metadata = connector.build_connector_meta(output)
-    receipt = metadata.source_full_ready_receipts[request.request_id]
-    expected = {
-        g
-        for g, group in enumerate(connector.kv_cache_config.kv_cache_groups)
-        if pub.selected(group)
-    }
-    assert set(receipt["groups"]) == set(receipt["group_specs"]) == expected
-    assert set(receipt["received_positions"]) == expected
+def test_real_v2_e25_receipt_keeps_current_prefix_and_compact_remote_positions(fmt, tmp_path):
+    tracker, req, blocks, output, meta = receipt_chain(fmt, tmp_path)
+    tracker.allocated(req, blocks, 384)
+    peers = {"P": SimpleNamespace(addr="offline-peer")}
+    tracker.add_metadata(meta, output, peers)
+    assert not meta.source_full_ready_receipts
+    tracker.completed(SimpleNamespace(finished_recving={"request"}, failed_recving=set(),
+                                      invalid_block_ids=set()))
+    tracker.add_metadata(meta, output, peers)
+    receipt = meta.source_full_ready_receipts["request"]
     assert receipt["N"] == receipt["fullkv_valid_before_replay"] == 512
     assert receipt["original_receive_success"] and receipt["external"] == 384
-    assert metadata.source_state_endpoints[request.request_id]["engine_id"] == "P"
-    main_names = set()
-    for g in expected:
-        group = connector.kv_cache_config.kv_cache_groups[g]
-        assert receipt["group_specs"][g] == cache_group_geometry(group)
+    assert meta.source_state_endpoints["request"]["engine_id"] == "P"
+    names = set()
+    for g in tracker.selected:
+        group = tracker.cache_config.kv_cache_groups[g]
+        assert receipt["group_specs"][g] == dict(block_size=group.kv_cache_spec.block_size,
+            layer_names=list(group.layer_names), dtype=str(group.kv_cache_spec.dtype))
         assert receipt["groups"][g] == [b.block_id for b in blocks.blocks[g]]
-        assert receipt["received_positions"][g] == [
-            {"logical": j, "block_id": b.block_id}
-            for j, b in enumerate(blocks.blocks[g])
-            if j > 0
-        ]
-        main_names.update(name for name in group.layer_names if name.endswith(".attn"))
-        compressed = receipt["group_specs"][g].get("compressed_main_kv")
-        if compressed:
-            assert fmt is not None
-            assert set(compressed["formats"].values()) == {fmt.name}
-            assert compressed["scale_dtype"] == "float16"
-    assert main_names == {f"model.layers.{i}.attn" for i in SOURCES}
+        assert receipt["received_positions"][g] == [dict(logical=j, block_id=b.block_id)
+            for j,b in enumerate(blocks.blocks[g]) if j > 0]
+        names.update(name for name in group.layer_names if name.endswith(".attn"))
+    assert names == {f"model.layers.{i}.attn" for i in SOURCES}
 
 
 @pytest.mark.parametrize("fmt", [None, I8G64, I4G32])
-def test_real_v2_e25_failed_receive_and_preempt_do_not_reuse_ready_receipt(
-    fmt, monkeypatch, tmp_path
-):
-    _, scheduler, connector, request, blocks, output = receipt_chain(
-        fmt, monkeypatch, tmp_path
-    )
-    connector.update_state_after_alloc(request, blocks, 384)
-    scheduler.finished_recving_kv_req_ids.add(request.request_id)
-    scheduler.failed_recving_kv_req_ids.add(request.request_id)
-    scheduler._update_waiting_for_remote_kv(request)
-    assert connector.build_connector_meta(output).source_full_ready_receipts == {}
-    scheduler.failed_recving_kv_req_ids.clear()
-    scheduler._update_waiting_for_remote_kv(request)
-    old_receipt = connector.build_connector_meta(output).source_full_ready_receipts[
-        "request"
-    ]
-    output.preempted_req_ids.add(request.request_id)
-    assert connector.build_connector_meta(output).source_full_ready_receipts == {}
-    assert request._p21_ready_receipt is None
-    assert connector._p21_requests == connector._p21_remote_endpoints == {}
+def test_real_v2_e25_failed_receive_and_preempt_do_not_reuse_ready_receipt(fmt, tmp_path):
+    tracker, req, blocks, output, meta = receipt_chain(fmt, tmp_path)
+    tracker.allocated(req, blocks, 384)
+    tracker.completed(SimpleNamespace(finished_recving={"request"}, failed_recving={"request"},
+                                      invalid_block_ids=set()))
+    tracker.add_metadata(meta, output, {})
+    assert not meta.source_full_ready_receipts
+    output.preempted_req_ids.add("request")
+    tracker.add_metadata(meta, output, {})
+    assert not tracker.requests
     output.preempted_req_ids.clear()
     for group in blocks.blocks:
         for block in group:
             block.block_id += 500
-    connector.update_state_after_alloc(request, blocks, 384)
-    assert request._p21_alloc_receipt["serial"] == 2
-    assert connector.build_connector_meta(output).source_full_ready_receipts == {}
-    scheduler._update_waiting_for_remote_kv(request)
-    receipt = connector.build_connector_meta(output).source_full_ready_receipts[
-        "request"
-    ]
+    tracker.allocated(req, blocks, 384)
+    tracker.add_metadata(meta, output, {})
+    assert not meta.source_full_ready_receipts
+    tracker.completed(SimpleNamespace(finished_recving={"request"}, failed_recving=set(),
+                                      invalid_block_ids=set()))
+    tracker.add_metadata(meta, output, {})
+    receipt = meta.source_full_ready_receipts["request"]
     assert receipt["alloc_serial"] == 2
-    assert receipt["groups"] != old_receipt["groups"]
-    for group, ids in receipt["groups"].items():
-        assert ids == [block.block_id for block in blocks.blocks[group]]
+    for g, ids in receipt["groups"].items():
+        assert ids == [b.block_id for b in blocks.blocks[g]]

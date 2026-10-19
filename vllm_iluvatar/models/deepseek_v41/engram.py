@@ -519,7 +519,8 @@ class EngramEmbedding(nn.Module):
         tp_rank = get_tensor_model_parallel_rank()
         # DP=1 keeps the TP-only row split. DP>1 shards the same table across
         # TP x DP so each replica owns a disjoint row range; the lookup then
-        # all-reduces. TP-major rank matches the official head-shard order.
+        # reduces each token's rows to its owner. TP-major rank matches the
+        # official head-shard order.
         self._dp_group = engram_dp_group()
         dp_size = self._dp_group.world_size if self._dp_group is not None else 1
         dp_rank = self._dp_group.rank_in_group if self._dp_group is not None else 0
@@ -713,9 +714,10 @@ class EngramEmbedding(nn.Module):
         values = self._lookup(gathered)
         if get_tensor_model_parallel_world_size() > 1:
             values = tensor_model_parallel_all_reduce(values)
-        values = group.all_reduce(values)
-        start = group.rank_in_group * slot
-        return values[start : start + n_local]
+        # Only this DP rank's token rows are consumed. Reduce directly to
+        # their owner instead of materializing every rank's reduced rows.
+        values = group.reduce_scatter(values, dim=0)
+        return values[:n_local]
 
 
 def lookback_tokens(

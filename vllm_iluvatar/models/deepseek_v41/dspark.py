@@ -38,6 +38,7 @@ from __future__ import annotations
 import copy
 import re
 from collections.abc import Callable, Iterable
+from contextlib import nullcontext
 from typing import cast
 
 import ixformer.inference.functions as ixfops  # type: ignore[import]
@@ -111,6 +112,25 @@ def _local_vocab_weight(
             f"[{vocab_start}:{vocab_end}] from weight shape {tuple(weight.shape)}."
         )
     return weight.narrow(0, vocab_start, local_vocab_size)
+
+
+def _make_vocab_layer(
+    factory: Callable[..., nn.Module],
+    vocab_size: int,
+    hidden_size: int,
+    *,
+    prefix: str,
+    owns_weight: bool,
+) -> nn.Module:
+    """Keep sharing metadata without allocating a throwaway vocabulary weight.
+
+    The DSpark loader aliases target-owned embeddings and output heads after
+    draft weight loading. A meta placeholder retains their sharding metadata
+    while avoiding a full temporary device copy during draft construction.
+    Draft-owned embeddings, including the last stage under PP, stay allocated.
+    """
+    with nullcontext() if owns_weight else torch.device("meta"):
+        return factory(vocab_size, hidden_size, prefix=prefix)
 
 
 def remap_dspark_name(
@@ -198,7 +218,9 @@ def _draft_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
 class IluDSparkDeepseekV41Model(nn.Module):
     """Iluvatar DeepSeek-V4.1 backbone used by the DSpark draft."""
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+    def __init__(
+        self, *, vllm_config: VllmConfig, prefix: str = "", owns_embedding: bool = True
+    ) -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None
         config = vllm_config.speculative_config.draft_model_config.hf_config
@@ -214,10 +236,12 @@ class IluDSparkDeepseekV41Model(nn.Module):
             or 3
         )
 
-        self.embed_tokens = VocabParallelEmbedding(
+        self.embed_tokens = _make_vocab_layer(
+            VocabParallelEmbedding,
             config.vocab_size,
             config.hidden_size,
             prefix=maybe_prefix(prefix, "embed_tokens"),
+            owns_weight=owns_embedding,
         )
         self.main_proj = ReplicatedLinear(
             config.hidden_size * len(self.target_layer_ids),
@@ -390,12 +414,15 @@ class IluDSparkDeepseekV41ForCausalLM(nn.Module, SupportsPP):
         # load_dspark_model override) and this model owns its embedding instead.
         self.load_own_embed_tokens = get_pp_group().world_size > 1
         self.model = IluDSparkDeepseekV41Model(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"),
+            owns_embedding=self.load_own_embed_tokens or self.has_own_embed_tokens,
         )
-        self.lm_head = ParallelLMHead(
+        self.lm_head = _make_vocab_layer(
+            ParallelLMHead,
             self.config.vocab_size,
             self.config.hidden_size,
             prefix=maybe_prefix(prefix, "lm_head"),
+            owns_weight=self.has_own_lm_head,
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
 

@@ -60,6 +60,15 @@ def nvsm_dispatch_quant_kwargs(
         "use_int8": use_int8,
         "use_fp8": use_fp8,
     }
+    # Standard MoE top-k selects distinct experts for each token, including
+    # physical IDs after EPLB mapping. This optional NVSM contract reduces
+    # each expert's receive capacity to world_size * max_input_tokens; the
+    # library's default retains support for callers with duplicate routes.
+    unique_topk = os.environ.get("IXFORMER_NVSM_UNIQUE_TOPK", "0")
+    if unique_topk not in ("0", "1"):
+        raise ValueError("IXFORMER_NVSM_UNIQUE_TOPK must be 0 or 1")
+    if unique_topk == "1":
+        kwargs["unique_topk"] = True
     if use_fp8:
         kwargs.update(
             fp8_format=current_platform.fp8_dtype(),

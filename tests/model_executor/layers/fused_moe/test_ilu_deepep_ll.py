@@ -102,3 +102,17 @@ def test_nvsm_dispatch_quant_kwargs_cover_quant_dtype_families(monkeypatch):
         else:
             assert "fp8_format" not in kwargs
             assert "fp8_group_size" not in kwargs
+
+
+def test_unique_topk_receive_capacity_is_explicit(monkeypatch):
+    import pytest
+
+    config = SimpleNamespace(quant_dtype=torch.int8, weight_quant_dtype=None)
+    monkeypatch.delenv("IXFORMER_NVSM_COMBINE_FP8", raising=False)
+    monkeypatch.delenv("IXFORMER_NVSM_UNIQUE_TOPK", raising=False)
+    assert "unique_topk" not in ilu_deepep_ll.nvsm_dispatch_quant_kwargs(config)
+    monkeypatch.setenv("IXFORMER_NVSM_UNIQUE_TOPK", "1")
+    assert ilu_deepep_ll.nvsm_dispatch_quant_kwargs(config)["unique_topk"] is True
+    monkeypatch.setenv("IXFORMER_NVSM_UNIQUE_TOPK", "2")
+    with pytest.raises(ValueError, match="IXFORMER_NVSM_UNIQUE_TOPK"):
+        ilu_deepep_ll.nvsm_dispatch_quant_kwargs(config)

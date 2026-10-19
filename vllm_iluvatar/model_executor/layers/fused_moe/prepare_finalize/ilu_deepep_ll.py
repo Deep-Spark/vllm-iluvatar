@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import envs
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
@@ -69,6 +69,13 @@ def nvsm_dispatch_quant_kwargs(
         raise ValueError("IXFORMER_NVSM_UNIQUE_TOPK must be 0 or 1")
     if unique_topk == "1":
         kwargs["unique_topk"] = True
+    reuse_ipc = os.environ.get("IXFORMER_NVSM_REUSE_EP_COMM", "0")
+    if reuse_ipc not in ("0", "1"):
+        raise ValueError("IXFORMER_NVSM_REUSE_EP_COMM must be 0 or 1")
+    if reuse_ipc == "1":
+        # The EP device communicator is initialized before MoE weight loading.
+        # Reuse only its IPC setup transport, never NVSM data or signal buffers.
+        kwargs["ipc_group"] = get_ep_group().device_group
     if use_fp8:
         kwargs.update(
             fp8_format=current_platform.fp8_dtype(),

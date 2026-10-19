@@ -116,3 +116,18 @@ def test_unique_topk_receive_capacity_is_explicit(monkeypatch):
     monkeypatch.setenv("IXFORMER_NVSM_UNIQUE_TOPK", "2")
     with pytest.raises(ValueError, match="IXFORMER_NVSM_UNIQUE_TOPK"):
         ilu_deepep_ll.nvsm_dispatch_quant_kwargs(config)
+
+
+def test_nvsm_reuses_initialized_ep_transport_only_when_requested(monkeypatch):
+    import pytest
+
+    config = SimpleNamespace(quant_dtype=torch.int8, weight_quant_dtype=None)
+    group = object()
+    monkeypatch.setattr(ilu_deepep_ll, "get_ep_group", lambda: SimpleNamespace(device_group=group))
+    monkeypatch.delenv("IXFORMER_NVSM_REUSE_EP_COMM", raising=False)
+    assert "ipc_group" not in ilu_deepep_ll.nvsm_dispatch_quant_kwargs(config)
+    monkeypatch.setenv("IXFORMER_NVSM_REUSE_EP_COMM", "1")
+    assert ilu_deepep_ll.nvsm_dispatch_quant_kwargs(config)["ipc_group"] is group
+    monkeypatch.setenv("IXFORMER_NVSM_REUSE_EP_COMM", "invalid")
+    with pytest.raises(ValueError, match="IXFORMER_NVSM_REUSE_EP_COMM"):
+        ilu_deepep_ll.nvsm_dispatch_quant_kwargs(config)

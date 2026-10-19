@@ -24,7 +24,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
 )
-from vllm.distributed.utils import get_pp_indices
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
@@ -39,6 +38,12 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
+
+from vllm_iluvatar.v1.worker.prefill_state.configuration import (
+    config_pipeline_bounds,
+    enabled,
+)
+from vllm_iluvatar.v1.worker.prefill_state.scheduler_state import PrefixSchedulerState
 
 from .metadata import (
     GET_NODE_META_MSG,
@@ -220,9 +225,14 @@ class NixlConnectorScheduler:
         replay_specs = [s for s in self._all_specs if s.prefix_replay_tokens]
         self.prefix_replay_alignment = (
             2
-            if os.getenv("VLLM_ILU_V41_REMOTE_REPLAY_ALIGN2", "0") == "1"
+            if (
+                enabled(vllm_config)
+                or os.getenv("VLLM_ILU_V41_REMOTE_REPLAY_ALIGN2", "0") == "1"
+            )
             and self.is_consumer
-            and vllm_config.model_config.hf_config.model_type == "deepseek_v41"
+            and vllm_config.model_config.hf_config.model_type in (
+                "deepseek_v41", "deepseek_v41_text"
+            )
             and not self._has_mamba
             and replay_specs
             and all(
@@ -242,22 +252,7 @@ class NixlConnectorScheduler:
             else None
         )
         logger.info("Remote-prefix replay alignment: %s", self.prefix_replay_alignment)
-        pp_split: list[int] = []
-        pp_world_size = vllm_config.parallel_config.pipeline_parallel_size
-        num_hidden_layers = (
-            vllm_config.model_config.hf_text_config.num_hidden_layers
-            if vllm_config.model_config.hf_text_config is not None
-            else vllm_config.model_config.hf_config.num_hidden_layers
-        )
-        for i in range(pp_world_size):
-            pp_split.append(
-                get_pp_indices(
-                    num_hidden_layers,
-                    i,
-                    pp_world_size,
-                )[0]
-            )
-        self.pp_split = pp_split
+        self.pp_split = [start for start, _ in config_pipeline_bounds(vllm_config)]
         self._kv_lease_duration: int = (
             vllm_config.kv_transfer_config.get_from_extra_config(
                 "kv_lease_duration", 480
@@ -278,7 +273,7 @@ class NixlConnectorScheduler:
             "pp_size": vllm_config.parallel_config.pipeline_parallel_size,
             "tp_size": vllm_config.parallel_config.tensor_parallel_size,
             "engine_id": self.engine_id,
-            "pp_split": pp_split,
+            "pp_split": self.pp_split,
             "dp_rank": vllm_config.parallel_config.data_parallel_rank,
             "kv_role": vllm_config.kv_transfer_config.kv_role,
             "teardown_protocol_version": 1,
@@ -352,7 +347,11 @@ class NixlConnectorScheduler:
             _FORCE_PER_RANK_SEND or self._force_rank_wise_sends
         )
 
+        self.prefix_state = PrefixSchedulerState.create(vllm_config, kv_cache_config)
+
     def shutdown(self):
+        if self.prefix_state is not None:
+            self.prefix_state.shutdown()
         self._stop_event.set()
         shutdown_event = self._shutdown_async_event
         if shutdown_event is not None:
@@ -819,6 +818,8 @@ class NixlConnectorScheduler:
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
+        if self.prefix_state is not None:
+            self.prefix_state.allocated(request, blocks, num_external_tokens)
         params = request.kv_transfer_params
         logger.info(
             "NIXLConnector update_state_after_alloc: "
@@ -1036,6 +1037,8 @@ class NixlConnectorScheduler:
             meta.reqs_to_send_time_record = self._reqs_to_send_time_record
             self._reqs_to_send_time_record = {}
 
+        if self.prefix_state is not None:
+            self.prefix_state.add_metadata(meta, scheduler_output, self.peer_node_metas)
         return meta
 
     def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
@@ -1075,6 +1078,8 @@ class NixlConnectorScheduler:
         for req_id in connector_output.failed_recving or ():
             self._stop_recv_tracking(req_id)
 
+        if self.prefix_state is not None:
+            self.prefix_state.completed(connector_output)
         finished = connector_output.finished_sending
         if not finished:
             return
@@ -1411,8 +1416,8 @@ class NixlConnectorScheduler:
                         and message[0] == GET_STATE
                     ):
                         state_reply, state_payload = serve_state(
-                            getattr(self, "_p21_wire", None)
-                            if not self.is_consumer
+                            self.prefix_state.wire
+                            if self.prefix_state is not None and not self.is_consumer
                             else None,
                             self.engine_id,
                             message,

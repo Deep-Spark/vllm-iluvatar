@@ -120,6 +120,7 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
 
         assert vllm_config.kv_transfer_config is not None
         assert vllm_config.kv_transfer_config.engine_id is not None
+        self.prefix_state = None
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
         self.kv_transfer_config = vllm_config.kv_transfer_config
         cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
@@ -267,6 +268,11 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches, kv_cache_scales)
 
+    def attach_prefix_state(self, context) -> None:
+        """Attach the standard worker's optional model-state context."""
+        assert self.connector_worker is not None
+        self.prefix_state = context
+
     def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
         """Set the connector metadata from the scheduler.
 
@@ -280,6 +286,8 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         super().bind_connector_metadata(connector_metadata)
         self.connector_worker.bind_connector_metadata(connector_metadata)
+        if self.prefix_state is not None:
+            self.prefix_state.bind_metadata(connector_metadata)
 
     def clear_connector_metadata(self) -> None:
         super().clear_connector_metadata()
@@ -297,7 +305,10 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
         a failed load would look successful to the scheduler.
         """
         assert self.connector_worker is not None
-        return self.connector_worker.get_transfer_results()
+        result = self.connector_worker.get_transfer_results()
+        if self.prefix_state is not None:
+            self.prefix_state.receive_results(result)
+        return result
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""

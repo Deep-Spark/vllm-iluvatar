@@ -18,9 +18,10 @@ and the consumers on that rank read the forwarder instead of the real source.
 Three things here go beyond the shape that only had to serve a four-way cut of
 layers 0-20:
 
-* **Any pipeline size.** Bounds come from ``get_pp_indices``, the same helper
-  ``make_layers`` uses, so the plan cannot disagree with the layer list and
-  ``VLLM_PP_LAYER_PARTITION`` keeps working.
+* **Any pipeline size.** Full-depth models use ``get_pp_indices``. Truncated
+  producers share one prefix-aware partition with the connector; configuration
+  publishes that partition to the upstream helper before workers are spawned.
+  ``VLLM_PP_LAYER_PARTITION`` remains authoritative.
 
 * **Groups spanning three or more ranks.** A middle rank has no local source to
   fill its outgoing buffer, so its forwarder relays: it copies what it received
@@ -46,6 +47,7 @@ layers 0-20:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 from vllm.distributed.utils import get_pp_indices
@@ -165,16 +167,24 @@ def build_rank_plan(
     rank+1 derives for itself.
 
     ``last_layer`` truncates the model after that layer (a PD prefiller stops
-    at the last KV source). The cut itself still comes from ``get_pp_indices``
-    over the full depth, so ``VLLM_PP_LAYER_PARTITION`` keeps validating
-    against the checkpoint; only the per-rank bounds are clipped. A cut that
+    at the last KV source). Its shared prefix-aware cut still validates
+    ``VLLM_PP_LAYER_PARTITION`` against the checkpoint's full depth; only
+    the executed per-rank bounds are clipped. A cut that
     clips a rank down to no layer at all is rejected: such a rank has no KV
     cache, and vLLM cannot size a KV pool for it.
     """
     depth = num_layers if last_layer is None else min(num_layers, last_layer + 1)
+    if last_layer is not None:
+        from vllm_iluvatar.v1.worker.prefill_state.configuration import pipeline_bounds
+
+        cuts = pipeline_bounds(
+            num_layers, world, last_layer, os.getenv("VLLM_PP_LAYER_PARTITION")
+        )
+    else:
+        cuts = tuple(get_pp_indices(num_layers, r, world) for r in range(world))
 
     def bounds(of_rank: int) -> tuple[int, int]:
-        start, end = get_pp_indices(num_layers, of_rank, world)
+        start, end = cuts[of_rank]
         return min(start, depth), min(end, depth)
 
     rank_bounds = [bounds(r) for r in range(world)]

@@ -23,6 +23,18 @@ logger = init_logger("vllm." + __name__)
 
 
 class IluWorker(Worker):
+    def load_model(self, *args, **kwargs):
+        result = super().load_model(*args, **kwargs)
+        configure = (
+            getattr(self.model_runner.model_state, "configure_prefix_reuse", None)
+            if self.vllm_config.use_v2_model_runner
+            else None
+        )
+        self.prefix_state = (
+            configure(self.model_runner) if configure is not None else None
+        )
+        return result
+
     def _try_replace_model_runner_class(self) -> type[object]:
         import vllm.envs as envs
 
@@ -66,6 +78,11 @@ class IluWorker(Worker):
         orig_cls = self._try_replace_model_runner_class()
         try:
             super().initialize_from_config(kv_cache_config)
+            if getattr(self, "prefix_state", None) is not None:
+                from vllm.distributed.kv_transfer import get_kv_transfer_group
+
+                self.prefix_state.initialize_cache()
+                get_kv_transfer_group().attach_prefix_state(self.prefix_state)
         finally:
             self.model_runner.__class__ = orig_cls
 
@@ -105,7 +122,10 @@ class IluWorker(Worker):
                 logical_device=self.local_rank,
                 physical_gpu=physical_gpu,
             )
-            return super().compile_or_warm_up_model()
+            result = super().compile_or_warm_up_model()
+            if getattr(self, "prefix_state", None) is not None:
+                self.prefix_state.start()
+            return result
         except Exception:
             monitor.free()
             checker.free()
@@ -115,9 +135,18 @@ class IluWorker(Worker):
         self._get_hbm_ecc_monitor().check()
         if scheduler_output.total_num_scheduled_tokens > 0:
             self._get_onchip_checker().before_batch()
-        return super().execute_model(scheduler_output)
+        context = getattr(self, "prefix_state", None)
+        if context is not None:
+            context.observe_scheduler_output(scheduler_output)
+        try:
+            return super().execute_model(scheduler_output)
+        finally:
+            if context is not None:
+                context.end_step()
 
     def shutdown(self) -> None:
+        if getattr(self, "prefix_state", None) is not None:
+            self.prefix_state.shutdown()
         orig_cls = self._try_replace_model_runner_class()
         checker = getattr(self, "_onchip_checker", None)
         monitor = getattr(self, "_hbm_ecc_monitor", None)
@@ -148,6 +177,10 @@ class IluWorker(Worker):
 
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
-        self.model_runner._dummy_run(
-            num_tokens, uniform_decode=True, profile_seq_lens=1
-        )
+        try:
+            self.model_runner._dummy_run(
+                num_tokens, uniform_decode=True, profile_seq_lens=1
+            )
+        finally:
+            if getattr(self, "prefix_state", None) is not None:
+                self.prefix_state.end_step()

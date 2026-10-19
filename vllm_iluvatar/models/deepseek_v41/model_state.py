@@ -40,13 +40,67 @@ RAW_INPUT_IDS_KWARG = "raw_input_ids"
 
 
 class IluDeepseekV41ModelState(DeepseekV41ModelState):
-    """Community V4.1 state plus the raw token ids as a second kwarg."""
+    """V4.1 raw-token forwarding and optional producer-prefix lifecycle."""
+
+    prefix_state = None
+
+    def configure_prefix_reuse(self, runner):
+        from vllm_iluvatar.v1.worker.prefill_state.configuration import enabled
+
+        if not enabled(runner.vllm_config):
+            return None
+        from .model import IluDeepseekV41Model
+
+        models = [
+            m
+            for m in runner.get_model().modules()
+            if isinstance(m, IluDeepseekV41Model)
+        ]
+        if len(models) != 1:
+            return None
+        if runner.vllm_config.kv_transfer_config.kv_role == "kv_producer":
+            from vllm_iluvatar.v1.worker.prefill_state.producer import (
+                ProducerPrefixState,
+            )
+
+            context = ProducerPrefixState(runner, models[0])
+            models[0].producer_prefix_state = context
+        else:
+            from vllm_iluvatar.v1.worker.prefill_state.consumer import (
+                ConsumerPrefixState,
+            )
+
+            context = ConsumerPrefixState(runner, models[0])
+            models[0].consumer_prefix_state = context
+        self.prefix_state = context
+        return context
+
+    def add_request(self, req_index, new_req_data):
+        super().add_request(req_index, new_req_data)
+        if self.prefix_state is not None:
+            self.prefix_state.add_request(req_index, new_req_data)
+
+    def remove_request(self, req_id):
+        if self.prefix_state is not None:
+            self.prefix_state.remove_request(req_id)
+        super().remove_request(req_id)
+
+    def prepare_attn(
+        self, input_batch, cudagraph_mode, block_tables, slot_mappings, *args, **kwargs
+    ):
+        if self.prefix_state is not None:
+            self.prefix_state.prepare_attn(input_batch, block_tables, slot_mappings)
+        return super().prepare_attn(
+            input_batch, cudagraph_mode, block_tables, slot_mappings, *args, **kwargs
+        )
 
     _dummy_input_ids: torch.Tensor | None = None
 
     def prepare_inputs(
         self, input_batch: InputBatch, req_states: RequestState
     ) -> dict[str, torch.Tensor | None]:
+        if self.prefix_state is not None:
+            self.prefix_state.prepare_inputs(input_batch)
         model_inputs = super().prepare_inputs(input_batch, req_states)
         model_inputs[RAW_INPUT_IDS_KWARG] = input_batch.input_ids
         return model_inputs

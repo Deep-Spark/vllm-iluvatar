@@ -35,7 +35,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import
     derive_mamba_conv_split,
 )
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
-from vllm.distributed.utils import get_pp_indices
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
@@ -50,6 +49,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
 )
+
+from vllm_iluvatar.v1.worker.prefill_state.configuration import config_pipeline_bounds
 
 from ..skip_layers import get_skip_layers, producer_last_layer
 from .handshake_validation import (
@@ -485,9 +486,8 @@ class NixlConnectorWorker:
             if vllm_config.model_config.hf_text_config is not None
             else vllm_config.model_config.hf_config.num_hidden_layers
         )
-        self.pp_layer_start, self.pp_layer_end = get_pp_indices(
-            self.num_hidden_layers, self.pp_rank, self.pp_world_size
-        )
+        pp_bounds = config_pipeline_bounds(vllm_config)
+        self.pp_layer_start, self.pp_layer_end = pp_bounds[self.pp_rank]
         # A PD prefiller stops at the last kv source (producer_last_layer), so
         # only that many layers run their save hook. Leaving the stage bounds
         # at the full depth would make un_send_layer_nums never reach 0 and
@@ -496,10 +496,7 @@ class NixlConnectorWorker:
             self.pp_layer_start = min(self.pp_layer_start, last_layer + 1)
             self.pp_layer_end = min(self.pp_layer_end, last_layer + 1)
         self.pp_layer_end_closed = self.pp_layer_end - 1
-        self.pp_split = [
-            get_pp_indices(self.num_hidden_layers, i, self.pp_world_size)[0]
-            for i in range(self.pp_world_size)
-        ]
+        self.pp_split = [start for start, _ in pp_bounds]
         self.num_layers = self.pp_layer_end - self.pp_layer_start
         self.num_layers_end_index = self.num_layers - 1
         self.total_num_kv_heads = self.model_config.get_total_num_kv_heads()

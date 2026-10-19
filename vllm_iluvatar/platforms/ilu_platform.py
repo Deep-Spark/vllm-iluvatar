@@ -225,6 +225,11 @@ def _make_iluvatar_platform():
         @classmethod
         def check_and_update_config(cls, vllm_config) -> None:
             super().check_and_update_config(vllm_config)
+            from vllm_iluvatar.v1.worker.prefill_state.configuration import (
+                initialize_config,
+            )
+
+            initialize_config(vllm_config)
 
             pc = getattr(vllm_config, "parallel_config", None)
             import sys

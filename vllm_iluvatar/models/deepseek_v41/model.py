@@ -11,6 +11,7 @@ import torch
 from torch import nn
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -181,10 +182,23 @@ class IluDeepseekV41DecoderLayer(IluDeepseekV4Fp8DecoderLayer):
         else:
             residual, sqrsum = mhc.hc_post_sqrsum(x, residual, post_mix, res_mix)
 
+        valid_prefix = get_forward_context().additional_kwargs.get(
+            "prefix_decode_tokens"
+        )
         if self.engram is not None and self.engram._rows is not None:
-            residual = self.engram(
-                residual, self.engram._hash_ids, self.engram._token_mask
-            )
+            if valid_prefix is None:
+                residual = self.engram(
+                    residual, self.engram._hash_ids, self.engram._token_mask
+                )
+            elif valid_prefix:
+                mask = self.engram._token_mask
+                residual[:valid_prefix].copy_(
+                    self.engram(
+                        residual[:valid_prefix],
+                        self.engram._hash_ids[:valid_prefix],
+                        mask[:valid_prefix] if mask is not None else None,
+                    )
+                )
             sqrsum = None
 
         attn_post, attn_comb, h, attn_pre = self._hc_pre_mixes(
@@ -197,7 +211,16 @@ class IluDeepseekV41DecoderLayer(IluDeepseekV4Fp8DecoderLayer):
             sqrsum,
             self.attn_norm,
         )
-        h = self.attn(positions, h, None)
+        if valid_prefix is None:
+            h = self.attn(positions, h, None)
+        else:
+            # Padded ranks still participate in MoE collectives, but never issue
+            # attention/cache writes for rows that have no local request.
+            if valid_prefix:
+                h[:valid_prefix].copy_(
+                    self.attn(positions[:valid_prefix], h[:valid_prefix], None)
+                )
+            h[valid_prefix:].zero_()
         residual, attn_sqrsum = mhc.hc_post_sqrsum(h, residual, attn_post, attn_comb)
 
         ffn_post, ffn_comb, h, ffn_pre = self._hc_pre_mixes(
@@ -742,7 +765,36 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
             engram.prepare_embeddings(dummy)
             engram._rows = None
 
+    producer_prefix_state = None
+    consumer_prefix_state = None
+
     def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None = None,
+        lookback_token_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        context = self.consumer_prefix_state
+        if context is not None:
+            return context.forward(
+                self._forward_full,
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                lookback_token_ids,
+            )
+        return self._forward_full(
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            lookback_token_ids,
+        )
+
+    def _forward_full(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
@@ -802,6 +854,8 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 )
 
         hidden_states = mhc.hc_post(hidden_states, residual, post_mix, res_mix)
+        if self.producer_prefix_state is not None:
+            self.producer_prefix_state.capture(self, hidden_states, pre_mix, positions)
         if not get_pp_group().is_last_rank:
             tensors = {"hidden_states": hidden_states, "pre_mix": pre_mix}
             num_tokens = positions.shape[0]

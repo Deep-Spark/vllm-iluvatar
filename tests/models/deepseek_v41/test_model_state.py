@@ -65,3 +65,41 @@ def test_prepare_dummy_inputs_reuses_one_buffer(monkeypatch):
     second = state.prepare_dummy_inputs(num_reqs=1, num_tokens=4)[RAW_INPUT_IDS_KWARG]
 
     assert first.data_ptr() == second.data_ptr()
+
+
+def test_native_request_and_attention_callbacks_keep_parent_behavior(monkeypatch):
+    from types import SimpleNamespace
+
+    events = []
+    state = _state()
+    state.prefix_state = SimpleNamespace(
+        add_request=lambda idx, req: events.append(("prefix_add", idx, req)),
+        remove_request=lambda rid: events.append(("prefix_remove", rid)),
+        prepare_attn=lambda batch, tables, slots: events.append(
+            ("prefix_attn", batch, tables, slots)
+        ),
+    )
+    monkeypatch.setattr(
+        DeepseekV41ModelState,
+        "add_request",
+        lambda self, idx, req: events.append(("base_add", idx, req)),
+    )
+    monkeypatch.setattr(
+        DeepseekV41ModelState,
+        "remove_request",
+        lambda self, rid: events.append(("base_remove", rid)),
+    )
+    monkeypatch.setattr(
+        DeepseekV41ModelState, "prepare_attn", lambda self, *a, **kw: "base_metadata"
+    )
+    req = object()
+    state.add_request(3, req)
+    state.remove_request("r")
+    assert events == [
+        ("base_add", 3, req),
+        ("prefix_add", 3, req),
+        ("prefix_remove", "r"),
+        ("base_remove", "r"),
+    ]
+    assert state.prepare_attn("batch", "mode", "tables", "slots") == "base_metadata"
+    assert events[-1] == ("prefix_attn", "batch", "tables", "slots")

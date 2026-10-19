@@ -340,3 +340,34 @@ def test_parent_shutdown_failure_still_frees_checker():
     assert checker.calls == ["check_shutdown", "free"]
     assert monitor.calls == ["check", "free"]
     assert worker.base_calls == ["shutdown"]
+
+
+def test_native_prefix_context_observes_batch_and_releases_after_execution():
+    from types import SimpleNamespace
+
+    events = []
+    worker = _make_worker(object())
+    worker._onchip_checker = _FakeChecker()
+    worker._hbm_ecc_monitor = _FakeEccMonitor()
+    output = SimpleNamespace(total_num_scheduled_tokens=1)
+    worker.prefix_state = SimpleNamespace(
+        observe_scheduler_output=lambda out: events.append(("observe", out)),
+        end_step=lambda: events.append("end"),
+    )
+    assert worker.execute_model(output) == "model-output"
+    assert events == [("observe", output), "end"]
+
+
+def test_native_prefix_context_does_not_survive_a_failed_dummy_step():
+    from types import SimpleNamespace
+
+    events = []
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("dummy failed")
+
+    worker = _make_worker(SimpleNamespace(_dummy_run=fail))
+    worker.prefix_state = SimpleNamespace(end_step=lambda: events.append("end"))
+    with pytest.raises(RuntimeError, match="dummy failed"):
+        worker.execute_dummy_batch()
+    assert events == ["end"]

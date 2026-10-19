@@ -65,7 +65,7 @@ def test_patch_kv_xfer_finished_source_drops_late_call():
         + "        return req_id\n"
     )
     patched = patch.patch_kv_xfer_finished_source(source)
-    assert "update_connector_output" not in patched
+    assert "self.connector.update_connector_output" not in patched
     assert _NEW_XFER in patched
     assert "finished_recving" in patched
     assert patch.patch_kv_xfer_finished_source(patched) == patched

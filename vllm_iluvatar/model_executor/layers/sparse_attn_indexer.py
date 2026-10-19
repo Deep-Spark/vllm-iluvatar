@@ -35,11 +35,17 @@ def _mqa_logits(*args, **kwargs):
     visible key, and the length is the only bound either side uses. A uint8
     cache with a bf16/fp8 query is the FP8 record.
     """
+    q = args[0] if args else kwargs["q"]
     kv_cache = args[3] if len(args) > 3 else kwargs["kv_cache"]
     ks = kwargs.pop("cu_seqlen_ks", None)
     ke = kwargs.pop("cu_seqlen_ke", None)
     if kwargs.get("valid_lens") is None and ks is not None and ke is not None:
         kwargs["valid_lens"] = ke - ks
+    # INT8 stores K in the same uint8 pages as FP8. Check the query first:
+    # ixinfer is the only kernel that reads an int8 query.
+    if q.dtype is torch.int8:
+        kwargs["backend"] = "ixinfer"
+        return ixfops.dsa_indexer_mqa_logits(*args, **kwargs)
     if kv_cache.dtype == torch.uint8:
         # ixinfer supports only 64/256-row pages. Ratio1's 128 rows use native.
         kwargs.setdefault(

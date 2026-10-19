@@ -37,6 +37,42 @@ def _load_sparse_attn_indexer(monkeypatch):
     )
 
 
+def test_int8_query_scores_with_ixinfer(monkeypatch):
+    sparse_attn_indexer = _load_sparse_attn_indexer(monkeypatch)
+    calls = []
+
+    def ixinfer(*args, **kwargs):
+        calls.append((args, kwargs))
+        return torch.empty(1)
+
+    def fp8(*args, **kwargs):
+        raise AssertionError("int8 query must not use the fp8 logits kernel")
+
+    monkeypatch.setattr(
+        sparse_attn_indexer.ixfops, "dsa_indexer_mqa_logits", ixinfer
+    )
+    sparse_attn_indexer.ixfops.dsa_indexer_mqa_logits_with_blocks_fp8 = fp8
+
+    q = torch.empty((2, 64, 128), dtype=torch.int8)
+    kv_cache = torch.empty((1, 64, 132), dtype=torch.uint8)
+    ks = torch.tensor([0, 0], dtype=torch.int32)
+    ke = torch.tensor([4, 8], dtype=torch.int32)
+    sparse_attn_indexer._mqa_logits(
+        q,
+        torch.empty(3, dtype=torch.int32),
+        torch.empty(3, dtype=torch.int32),
+        kv_cache,
+        torch.empty((1, 1), dtype=torch.int32),
+        torch.empty((2, 64), dtype=torch.float32),
+        cu_seqlen_ks=ks,
+        cu_seqlen_ke=ke,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1]["backend"] == "ixinfer"
+    assert torch.equal(calls[0][1]["valid_lens"], ke - ks)
+
+
 def test_sparse_attn_indexer_package_is_auto_discovered():
     assert "vllm_iluvatar.model_executor.layers" in ilu_register._OOT_OP_PACKAGES
 

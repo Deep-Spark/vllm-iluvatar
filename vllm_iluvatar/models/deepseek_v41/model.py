@@ -306,6 +306,9 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 quant_config=self.quant_config,
                 prefix=f"{prefix}.embed_tokens",
             )
+            self.embed_tokens = get_offloader().wrap_modules(
+                iter([self.embed_tokens]), prefix=f"{prefix}.embed_tokens"
+            )[0]
         else:
             self.embed_tokens = PPMissingLayer()
 

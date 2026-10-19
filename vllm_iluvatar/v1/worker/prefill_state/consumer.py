@@ -131,7 +131,10 @@ class ConsumerPrefixState(PrefixRuntime):
             self._p21_unavailable.discard(rid)
 
     def prepare_inputs(self, batch):
-        self._p21_batch = batch
+        # Runner-level profiling/warmup bypasses the worker's end_step hook.
+        # Do not retain its temporary batch across cache planning/capture.
+        if self._p21_ready:
+            self._p21_batch = batch
 
     def prepare_attn(self, batch, tables, slots):
         if self._p21_ready and not self._p21_builder_scope:

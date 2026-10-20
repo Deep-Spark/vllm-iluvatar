@@ -1,4 +1,4 @@
-"""Actual capture-only packed map reuse with no selected BF16 rows."""
+"""Decode map reuse and opt-in selected rows across changing owned graphs."""
 
 import os
 from types import SimpleNamespace
@@ -31,8 +31,9 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("fmt", [I8G64, I4G32])
 @pytest.mark.parametrize("ratio", [1, 2])
 @pytest.mark.parametrize("forwarder", [False, True])
+@pytest.mark.parametrize("restore_decode", [False, True])
 def test_decode_capture_reuses_map_with_changed_inputs_pages_and_aliases(
-    fmt, ratio, forwarder, monkeypatch, record_property
+    fmt, ratio, forwarder, restore_decode, monkeypatch, record_property
 ):
     assert torch.cuda.device_count() == 1
     assert torch.cuda.mem_get_info()[0] - (WORKSPACE_BYTES + 64 * 1024**2) >= 1024**3
@@ -92,6 +93,7 @@ def test_decode_capture_reuses_map_with_changed_inputs_pages_and_aliases(
         layer = IluDeepseekV41Attention.__new__(IluDeepseekV41Attention)
         torch.nn.Module.__init__(layer)
         layer.compressed_kv_format, layer.compress_ratio = fmt, ratio
+        layer.compressed_decode_restore = restore_decode
         layer.is_kv_source, layer.is_kv_forwarder = False, forwarder and index == 0
         if layer.is_kv_forwarder:
             layer.kv_cache, layer.kv_cache_scales = (
@@ -116,10 +118,10 @@ def test_decode_capture_reuses_map_with_changed_inputs_pages_and_aliases(
             num_prefills=0,
             num_decode_tokens=5,
             num_prefill_tokens=0,
-            is_valid_token=valid,
+            is_valid_token=valid.clone() if restore_decode else valid,
             token_to_req_indices=reqs,
             decode_swa_indices=swa_indices,
-            decode_swa_lens=swa_lens,
+            decode_swa_lens=swa_lens.clone() if restore_decode else swa_lens,
         )
         layers.append(layer)
         queries.append(torch.randn(5, 32, 512, dtype=torch.bfloat16, device="cuda"))
@@ -139,16 +141,37 @@ def test_decode_capture_reuses_map_with_changed_inputs_pages_and_aliases(
         )
 
     monkeypatch.setattr(torch.ops._C, "v41_global_topk_indices_and_lens", mapped)
+    prepares = []
     for name in (
         "quantized_sparse_mla_scratch_bytes",
         "make_quantized_sparse_mla_restore_plan",
         "prepare_quantized_sparse_mla_restore_plan",
     ):
-        monkeypatch.setattr(facade, name, forbidden)
+        if restore_decode:
+            if name == "prepare_quantized_sparse_mla_restore_plan":
+                original_prepare = getattr(facade, name)
+
+                def prepared(*args, **kwargs):
+                    prepares.append(args[4])
+                    return original_prepare(*args, **kwargs)
+
+                monkeypatch.setattr(facade, name, prepared)
+        else:
+            monkeypatch.setattr(facade, name, forbidden)
 
     def publish():
         quantize_paged_kv(semantic, slots, cache, scales, format=fmt)
         pool.main_cache_written()
+        for index, layer in enumerate(layers):
+            local = metadata[layer.swa_cache_layer.prefix]
+            if restore_decode:
+                local.is_valid_token.copy_(valid)
+                # Distinct buffers model the real builders. The first
+                # consumer masks a row that a later one must still consume.
+                if index == 0:
+                    local.is_valid_token[0] = False
+                local.decode_swa_lens.copy_(swa_lens)
+                local.decode_swa_lens.masked_fill_(~local.is_valid_token, 0)
 
     def chain():
         with override_forward_context(ctx), pool.forward_scope():
@@ -172,7 +195,7 @@ def test_decode_capture_reuses_map_with_changed_inputs_pages_and_aliases(
                 layer.swa_cache_layer.kv_cache[0, :2],
                 decoded,
                 logical,
-                valid,
+                metadata[layer.swa_cache_layer.prefix].is_valid_token,
                 positions,
                 ratio,
                 rows,
@@ -205,7 +228,7 @@ def test_decode_capture_reuses_map_with_changed_inputs_pages_and_aliases(
     publish()
     chain()
     torch.cuda.synchronize()
-    assert len(mappings) == 3 and not pool.capturing
+    assert len(mappings) == (1 if restore_decode else 3) and not pool.capturing
     check()
     capture_stream = torch.cuda.Stream()
     capture_stream.wait_stream(torch.cuda.current_stream())
@@ -251,6 +274,7 @@ def test_decode_capture_reuses_map_with_changed_inputs_pages_and_aliases(
             torch.testing.assert_close(output, expected, rtol=0, atol=0)
         check()
     assert len(mappings) == count_before
+    assert len(prepares) == (len(mappings) if restore_decode else 0)
     assert torch.all(metadata_guard == 0xA5).item()
     for page in (0, 1, 2, 4, 6):
         assert torch.all(raw[page * 65536 : (page + 1) * 65536] == 0xA5).item()

@@ -758,6 +758,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         self.kv_cache = torch.tensor([])
         self._static_forward_context = compilation_config.static_forward_context
         self.compressed_kv_format = main_kv_format()
+        self.compressed_decode_restore = envs.VLLM_ILU_DS41_DECODE_KV_RESTORE
         self.kv_cache_scales = None
         self.compressed_kv_workspace = None
         self.main_kv_scale_rows = None
@@ -1441,7 +1442,10 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 or (
                     num_decodes > 0
                     and self.compressed_kv_workspace is not None
-                    and self.compressed_kv_workspace.capturing
+                    and (
+                        self.compressed_kv_workspace.capturing
+                        or getattr(self, "compressed_decode_restore", False)
+                    )
                 )
             )
         ):
@@ -1556,15 +1560,21 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         The old and new query slices share the same map and retained rows.
         New steps/captures always record preparation; only later consumers
         in the current forward may reuse the active family. Pure decode uses
-        mapping reuse during capture, with no restored rows or restore plan.
+        mapping reuse during capture; its optional selected-row path restores
+        the full decode selection inside the same bounded worker lease.
         Producer-only partial prefill may replace the linear plan with a
-        bounded compact plan; decode and mixed batches keep their old route.
+        bounded compact plan; mixed batches retain suffix-only restoration.
         """
         assert self.topk_indices_buffer is not None
         assert swa_metadata.is_valid_token is not None
         assert swa_metadata.token_to_req_indices is not None
         n0 = swa_metadata.num_decode_tokens
         n1 = n0 + swa_metadata.num_prefill_tokens
+        restore_decode = swa_metadata.num_prefills == 0 and getattr(
+            self, "compressed_decode_restore", False
+        )
+        restore_start = 0 if restore_decode else n0
+        restore_tokens = n1 - restore_start
         topk = self.topk_indices_buffer[:n1]
         reqs = swa_metadata.token_to_req_indices[:n1]
         valid = swa_metadata.is_valid_token[:n1]
@@ -1588,7 +1598,11 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             mapping_layout=(
                 TensorViewKey.of(topk),
                 TensorViewKey.of(reqs),
-                TensorViewKey.of(valid),
+                # Physical selection is independent of a layer's query mask.
+                # Each decode consumer still masks its own main lengths below.
+                "per-consumer-decode-validity"
+                if restore_decode
+                else TensorViewKey.of(valid),
                 TensorViewKey.of(positions),
                 TensorViewKey.of(attn_metadata.block_table),
                 attn_metadata.block_size,
@@ -1598,14 +1612,19 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 TensorLayoutKey.of(swa_cache),
                 tuple(TensorLayoutKey.of(indices) for _, indices in reader_ranges),
             ),
-            restore_start=n0,
-            restore_tokens=n1 - n0,
+            restore_start=restore_start,
+            restore_tokens=restore_tokens,
         )
         tracker = self.compressed_kv_workspace.restore
         selection = tracker.lookup(key)
         if selection is not None:
             return selection
         ticket = tracker.begin_prepare(key)
+        if restore_decode:
+            # A later consumer can have a valid query where the first does
+            # not. Prepare its physical rows too, while guarding every request
+            # index before the native mapper reads the block table.
+            valid = (reqs >= 0) & (reqs < attn_metadata.block_table.shape[0])
         indices, lengths = torch.ops._C.v41_global_topk_indices_and_lens(
             topk,
             reqs,
@@ -1617,7 +1636,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             0,
             False,
         )
-        if swa_metadata.num_prefills == 0:
+        if swa_metadata.num_prefills == 0 and not restore_decode:
             selection = CompressedFamilySelection(indices, lengths, None, 0)
             tracker.publish(ticket, selection)
             return selection
@@ -1648,8 +1667,8 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 _batched_index_rows(indices),
                 q.shape[-1],
                 scratch_bytes=scratch_bytes,
-                restore_start=n0,
-                restore_tokens=n1 - n0,
+                restore_start=restore_start,
+                restore_tokens=restore_tokens,
                 owner=self.compressed_cache_prefix,
                 index_source_layer_id=self.index_source_layer_id,
                 compressed_capacity=cache.shape[0] * cache.shape[1],
@@ -1913,6 +1932,16 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             indices, lengths, plan = selection.for_queries(
                 slice(0, swa_metadata.num_decode_tokens)
             )
+            if (
+                getattr(self, "compressed_decode_restore", False)
+                and swa_metadata.num_prefills == 0
+            ):
+                assert swa_metadata.is_valid_token is not None
+                lengths = torch.where(
+                    swa_metadata.is_valid_token[: swa_metadata.num_decode_tokens],
+                    lengths,
+                    0,
+                )
             if (
                 plan is not None
                 and selection.plan.restore_start >= swa_metadata.num_decode_tokens

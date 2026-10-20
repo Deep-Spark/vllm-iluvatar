@@ -3,7 +3,10 @@
 import pytest
 import torch
 
+from vllm_iluvatar.ilu_util.arch import is_ivcore30
 
+
+@pytest.mark.skipif(not is_ivcore30(), reason="only supported on ivcore30")
 def test_sparse_fp8_cache_past_4gib_matches_small_cache():
     from ixformer.inference.functions import deepseekv41 as formal_ops
     from ixformer.inference.functions.deepseek import fp8_cache as shared_ops

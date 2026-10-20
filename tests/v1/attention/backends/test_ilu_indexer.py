@@ -251,6 +251,10 @@ def test_pcp_single_token_prefill_is_not_a_replicated_decode(monkeypatch):
     builder.use_flattening = False
     builder.max_prefill_buffer_size = 100
     builder.device = torch.device("cpu")
+    # build() feeds this buffer to CommonAttentionMetadata.token_to_req_indices
+    # (allocated unconditionally in __init__ since the V4.1 landing).
+    builder.v41_req_id_per_token_buffer = torch.empty(16, dtype=torch.int32)
+    builder.kv_cache_spec = SimpleNamespace(num_states=64)
     monkeypatch.setattr(mod.envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 1)
     cm = SimpleNamespace(
         num_reqs=1,
@@ -265,6 +269,13 @@ def test_pcp_single_token_prefill_is_not_a_replicated_decode(monkeypatch):
         block_table_tensor=torch.tensor([[0]]),
         is_prefilling=torch.tensor([True]),
     )
+
+    def token_to_req_indices(buffer):
+        # Stand-in for CommonAttentionMetadata.token_to_req_indices: one real
+        # token from request 0 -> req id 0.
+        return torch.zeros(cm.num_actual_tokens, dtype=torch.int32)
+
+    cm.token_to_req_indices = token_to_req_indices
     meta = builder.build(0, cm)
     assert meta.num_decode_tokens == 0
     assert meta.num_prefill_tokens == 1

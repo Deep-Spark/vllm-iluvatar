@@ -2,13 +2,18 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from ixformer.inference.functions import deepseekv41 as formal_ops
 
+from vllm_iluvatar.ilu_util.arch import is_ivcore30
 from vllm_iluvatar.models.deepseek_v41.attention import IluDeepseekV41Attention
+
+requires_ivcore30 = pytest.mark.skipif(
+    not is_ivcore30(),
+    reason="only supported on ivcore30",
+)
 
 
 def test_dspark_context_insert_supports_plain_e4m3():
-    from ixformer.inference.functions import deepseekv41 as formal_ops
-
     from vllm_iluvatar.models.deepseek_v41.dspark import _insert_context_kv
 
     gen = torch.Generator(device="cuda").manual_seed(2026)
@@ -54,6 +59,9 @@ def test_compressed_plain_insert_and_pipeline_copy_replay(ratio, dtype):
         move_rows_to_paged_cache,
         rope_quant_insert,
     )
+
+    if dtype is torch.float8_e4m3fn and not is_ivcore30():
+        pytest.skip("plain E4M3 compressed insert is only supported on ivcore30")
 
     latent = torch.full((6, 512), 2, dtype=torch.bfloat16, device="cuda")
     latent[:, 0] = 1024
@@ -101,6 +109,7 @@ def test_compressed_plain_insert_and_pipeline_copy_replay(ratio, dtype):
         assert torch.equal(cache.view(torch.uint8), replica.view(torch.uint8))
 
 
+@requires_ivcore30
 @pytest.mark.parametrize("heads", [4, 8, 16, 32, 64])
 def test_sparse_pt_plugin_dispatch_replays_dynamic_q_scale(heads):
     """The plugin combines two PT caches and recomputes device scale on replay."""
@@ -341,7 +350,7 @@ def test_swa_capture_dummy_never_writes_null_page(monkeypatch):
     builder._valid_slots = torch.full((64,), -1, dtype=torch.int64, device="cuda")
     builder.block_size = 64
     raw = torch.tensor([0, 63, 64, -1], dtype=torch.int64, device="cuda")
-    cm = SimpleNamespace(slot_mapping=raw, causal=True)
+    cm = SimpleNamespace(slot_mapping=raw, causal=True, num_prefill_tokens=0)
     monkeypatch.setattr(
         IluDeepseekSparseSWAMetadataBuilder,
         "build",
@@ -352,6 +361,7 @@ def test_swa_capture_dummy_never_writes_null_page(monkeypatch):
     assert raw.tolist() == [0, 63, 64, -1]
 
 
+@requires_ivcore30
 @pytest.mark.parametrize("n", [1, 6, 64, 384, 2048])
 def test_fp8_indexer_query_out_replays_current_positions_without_overwrite(n):
     import vllm_iluvatar._C  # noqa: F401
@@ -387,6 +397,7 @@ def test_fp8_indexer_query_out_replays_current_positions_without_overwrite(n):
     assert torch.all(w_storage[[0, -1]] == 123)
 
 
+@requires_ivcore30
 @pytest.mark.parametrize("ratio,bs", [(1, 128), (2, 64)])
 def test_fp8_indexer_key_store_matches_bf16_quantization_and_pp_mirror(ratio, bs):
     n = 513

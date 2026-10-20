@@ -25,7 +25,7 @@ from ixformer.contrib.vllm_flash_attn import (
     flash_attn_with_kvcache,
     merge_attn_states,
 )
-from ixformer.inference.functions import flash_attn_varlen_fp8_func
+from ixformer.inference.functions import flash_attn_unpad_with_kvcache_fp8
 from vllm import _custom_ops as ops  # type: ignore[import]
 from vllm.config import (
     VllmConfig,
@@ -1145,43 +1145,45 @@ class IluFlashAttentionImpl(AttentionImpl):
         )
         if attn_metadata.num_prefills > 0 and attn_metadata.prefill is not None:
             prefill_q = fp8_query[num_decode_tokens:num_actual_tokens]
-            flash_attn_varlen_fp8_func(
+            flash_attn_unpad_with_kvcache_fp8(
                 q=prefill_q,
-                k=key_cache,
-                v=value_cache,
+                key_cache=key_cache,
+                value_cache=value_cache,
                 q_scale=query_scale,
                 k_scale=key_scale,
                 v_scale=value_scale,
+                block_table=attn_metadata.prefill.block_table,
                 cu_seqlens_q=attn_metadata.prefill.query_start_loc,
                 cu_seqlens_k=attn_metadata.prefill.key_start_loc,
                 max_seqlen_q=attn_metadata.prefill.max_query_len,
                 max_seqlen_k=attn_metadata.max_seq_len,
-                softmax_scale=self.scale,
-                causal=attn_metadata.causal,
-                window_size=sliding_window_size,
-                block_table=attn_metadata.prefill.block_table,
+                is_causal=attn_metadata.causal,
+                atten_scale=self.scale,
                 out=output[num_decode_tokens : num_decode_tokens + prefill_q.shape[0]],
+                window_left=sliding_window_size[0],
+                window_right=sliding_window_size[1],
                 output_dtype=query.dtype,
             )
 
         if attn_metadata.num_decodes > 0 and attn_metadata.decode is not None:
             decode_q = fp8_query[:num_decode_tokens]
-            flash_attn_varlen_fp8_func(
+            flash_attn_unpad_with_kvcache_fp8(
                 q=decode_q,
-                k=key_cache,
-                v=value_cache,
+                key_cache=key_cache,
+                value_cache=value_cache,
                 q_scale=query_scale,
                 k_scale=key_scale,
                 v_scale=value_scale,
+                block_table=attn_metadata.decode.block_table,
                 cu_seqlens_q=attn_metadata.decode.cu_seqlens_q,
                 cu_seqlens_k=attn_metadata.decode.cu_seqlens_k,
                 max_seqlen_q=attn_metadata.decode.max_query_len,
                 max_seqlen_k=attn_metadata.decode.max_decode_seq_len,
-                softmax_scale=self.scale,
-                causal=True,
-                window_size=sliding_window_size,
-                block_table=attn_metadata.decode.block_table,
+                is_causal=True,
+                atten_scale=self.scale,
                 out=output[:num_decode_tokens],
+                window_left=sliding_window_size[0],
+                window_right=sliding_window_size[1],
                 output_dtype=query.dtype,
             )
         return output
@@ -1343,7 +1345,7 @@ class IluFlashAttentionImpl(AttentionImpl):
                         save_key_scale=key_scale[:num_decode_tokens],
                     )
                 )
-            ixf_ops.vllm_paged_attention_int8(**para_dict)
+            ixf_ops.paged_attention_int8(**para_dict)
         return output
 
     def _forward_k_int8(
@@ -1472,7 +1474,7 @@ class IluFlashAttentionImpl(AttentionImpl):
                         save_key_scale=key_scale[:num_decode_tokens],
                     )
                 )
-            ixf_ops.vllm_paged_attention_mix(**para_dict)
+            ixf_ops.paged_attention_mix(**para_dict)
         return output
 
     def do_kv_cache_update(

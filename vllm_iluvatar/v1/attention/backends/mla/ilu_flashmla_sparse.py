@@ -335,7 +335,7 @@ class IluFlashMLASparseMetadataBuilder(
             positions_int32 = positions_int32.to(torch.int32)
 
         global_decode, decode_lens, prefill_local = (
-            ixfops.ds4_build_c128a_topk_metadata(
+            ixfops.build_c128a_topk_metadata(
                 positions_int32,
                 self.compress_ratio,
                 num_decode_tokens,

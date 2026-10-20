@@ -11,8 +11,10 @@ from typing import Any
 import ixformer.inference.functions as ixf_ops
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
-from ixformer.inference.functions.w8a8 import w8a8_gemm, w8a8_gemv
-from ixformer.inference.functions.w8a8_shapes import w8a8_perf_gemv_supported
+from ixformer.inference.functions import w8a8_gemm, w8a8_gemv
+from ixformer.inference.functions.ops.gemm.int8.w8a8_shapes import (
+    w8a8_perf_gemv_supported,
+)
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_scheme import (  # noqa: E501

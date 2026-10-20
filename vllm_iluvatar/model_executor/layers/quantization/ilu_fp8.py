@@ -62,7 +62,7 @@ from typing import Any
 
 import ixformer.inference.functions as ixfops
 import torch
-from ixformer.inference.functions.fp8 import fp8_per_token_dynamic_scaled
+from ixformer.inference.functions import fp8_per_token_dynamic_scaled
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEActivationFormat,
@@ -664,7 +664,7 @@ def preprocess_fp8_block_weight_for_ixmm(
     """
     # Lazy import keeps this module importable without ixformer (CPU-only unit
     # tests), matching the NVFP4/MXFP4 methods' lazy-import discipline.
-    from ixformer.inference.functions.fp4.gemm import gemm as ixmm_gemm
+    from ixformer.inference.functions.ops.gemm.fp4.gemm import gemm as ixmm_gemm
 
     expert, n_dim, k = weight.shape
     if allow_k_padding:

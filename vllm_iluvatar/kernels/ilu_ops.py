@@ -67,4 +67,4 @@ def fused_add_rms_norm(
         weight = torch.ones(x.shape[-1], device=x.device, dtype=x.dtype)
     assert variance_size is None
     # ixformer returns (normed_output, new_residual).
-    return ixf_ops.residual_rms_norm(x, weight, epsilon, 1.0, x_residual)
+    return ixf_ops.fused_add_rms_norm(x, weight, epsilon, 1.0, x_residual)

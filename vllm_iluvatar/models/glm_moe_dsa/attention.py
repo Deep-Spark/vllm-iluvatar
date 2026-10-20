@@ -138,7 +138,7 @@ def _gather_and_cache_packed_fp8_kv(
     )
     # The uint8 specialization is a vectorized byte copy, with negative-slot
     # masking. No dequantization or second FP8 conversion takes place here.
-    ixf_ops.vllm_concat_and_cache_mla(
+    ixf_ops.concat_and_cache_mla(
         packed[:, :512],
         packed[:, 512:].unsqueeze(1),
         kv_cache,
@@ -911,7 +911,7 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         )
         # Sparse MLA returns latent V (kv_lora_rank=512); v_up_proj maps to
         # v_head_dim afterwards. Do not pass self.v_head_dim (256 on GLM-5.2).
-        return ixf_ops.dsa_flash_mla_sparse_fwd(
+        return ixf_ops.dsa_flash_mla_sparse_fwd_diff_kv(
             q,
             kv_c_and_k_pe_cache,
             topk_indices,
@@ -947,7 +947,7 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
             )
             ixf_ops.glm_dsa_fp8_q_pack(q_nope, q_pe, q_packed, q_scale)
 
-        out = ixf_ops.dsa_flash_mla_with_fp8_kvcache(
+        out = ixf_ops.dsa_flash_mla_sparse_with_fp8_kvcache_diff_kv(
             q_packed.view(num_tokens, 1, q_heads, _GLM_DSA_FP8_ROW_BYTES),
             kv_cache.unsqueeze(2),
             topk_indices,

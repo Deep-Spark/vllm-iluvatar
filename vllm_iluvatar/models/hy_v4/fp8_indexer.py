@@ -104,7 +104,7 @@ def hy4_fp8_indexer_forward(
     # softmax_scale, head_scale and the per-row q_scale into ``weights``, so
     # ``weights_in`` is the raw projection slice, *not* the pre-scaled
     # ``weights`` the bf16 path builds.
-    q_fp8, weights = ixfops.ds4_fused_indexer_q_rope_fp8_quant(
+    q_fp8, weights = ixfops.fused_indexer_q_rope_quant(
         q,
         positions,
         cos_sin,
@@ -162,7 +162,7 @@ def hy4_fp8_indexer_forward(
         for chunk in md.prefill.chunks:
             if chunk.max_context_len == 0:
                 continue
-            logits = ixfops.dsa_indexer_mqa_logits_with_blocks_fp8(
+            logits = ixfops.dsa_indexer_mqa_logits_with_kvcache_fp8(
                 q_fp8[chunk.token_start : chunk.token_end],
                 chunk.cu_seqlens_q,
                 chunk.cu_seq_lens,
@@ -193,7 +193,7 @@ def hy4_fp8_indexer_forward(
             topk_indices_buffer[:num_decode_tokens].fill_(-1)
             return topk_indices_buffer
 
-        logits = ixfops.dsa_indexer_mqa_logits_with_blocks_fp8(
+        logits = ixfops.dsa_indexer_mqa_logits_with_kvcache_fp8(
             q_fp8[:num_decode_tokens],
             md.decode.cu_seqlens_q,
             md.decode.cu_seqlens_kv,

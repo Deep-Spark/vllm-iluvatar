@@ -8,14 +8,16 @@ from dataclasses import dataclass
 from typing import cast
 
 import torch
-from ixformer.inference.functions.qwen38 import (
+from ixformer.inference.functions.models.qwen3_next import (
     qwen_qsa_indexer_mqa_logits,
     qwen_qsa_indexer_q_norm_rope,
     qwen_qsa_indexer_topk_expand,
     qwen_qsa_kpool_compress_store,
     qwen_qsa_kpool_tail_update,
 )
-from ixformer.inference.functions.qwen38.qsa_common import align_logits_cols
+from ixformer.inference.functions.models.qwen3_next.qsa.float.qsa_common import (
+    align_logits_cols,
+)
 from torch import nn
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context

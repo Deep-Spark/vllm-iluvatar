@@ -644,7 +644,7 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
                     seq_starts=chunk.starts,
                 )
             else:
-                ixf_ops.vllm_cp_gather_cache(
+                ixf_ops.cp_gather_cache(
                     src_cache=kv_c_and_k_pe_cache,
                     dst=workspace,
                     block_table=block_table,
@@ -1220,7 +1220,7 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
                 "is rejected at __init__ because vllm_cp_gather_cache (prefill "
                 "KV gather) only accepts fp16/bf16 KV cache."
             )
-            attn_out, softmax_lse = ixf_ops.vllm_paged_attention_mla(
+            attn_out, softmax_lse = ixf_ops.flash_mla_with_kvcache(
                 output=o,
                 query=q,
                 kv_cache=kv_c_and_k_pe_cache,
@@ -1243,7 +1243,7 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
         if self.use_int8_mla:
             q = torch.cat([q_nope, q_pe], dim=-1)
             q_int8, q_scale = ops.quant_kv(q)
-            ixf_ops.vllm_paged_attention_mla_int8(
+            ixf_ops.flash_mla_with_kvcache_int8(
                 o,
                 q_int8,
                 q_scale,
@@ -1258,7 +1258,7 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
         else:
             if k_c_normed is None:
                 q = torch.cat([q_nope, q_pe.contiguous()], dim=-1)
-                ixf_ops.vllm_paged_attention_mla(
+                ixf_ops.flash_mla_with_kvcache(
                     output=o,
                     query=q,
                     kv_cache=kv_c_and_k_pe_cache,
@@ -1269,7 +1269,7 @@ class IluMLAImpl(MLACommonImpl[MLACommonMetadata]):
                     use_cuda_graph=getattr(decode_meta, "use_cuda_graph", False),
                 )
             else:
-                ixf_ops.vllm_paged_attention_mla_fused(
+                ixf_ops.flash_mla_with_kvcache_fused(
                     output=o,
                     q_nope=q_nope.contiguous(),
                     q_pe=q_pe.contiguous(),

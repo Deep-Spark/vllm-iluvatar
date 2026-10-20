@@ -17,7 +17,7 @@ from typing import ClassVar
 
 import torch
 import vllm.envs as envs
-from ixformer.inference.functions.qwen38 import qwen_qsa_build_metadata
+from ixformer.inference.functions.models.qwen3_next import qwen_qsa_build_metadata
 from torch import nn
 from vllm.config import CacheConfig, VllmConfig
 from vllm.config.cache import CacheDType

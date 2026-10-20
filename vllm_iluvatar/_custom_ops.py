@@ -152,7 +152,7 @@ def rms_norm(
 def fused_add_rms_norm(
     input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, epsilon: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return ixf_ops.residual_rms_norm(input, weight, epsilon, 1.0, residual)
+    return ixf_ops.fused_add_rms_norm(input, weight, epsilon, 1.0, residual)
 
 
 def rms_norm_qk(
@@ -590,7 +590,7 @@ def concat_and_cache_mla(
     # plugin's own MLA models pass 3-D directly, so accept both.
     if k_pe.dim() == 2:
         k_pe = k_pe.unsqueeze(1)
-    ixf_ops.vllm_concat_and_cache_mla(
+    ixf_ops.concat_and_cache_mla(
         kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
     )
 
@@ -628,7 +628,7 @@ def concat_and_cache_mla_int8(
     kv_cache_dtype: str,
     scale: torch.Tensor,
 ) -> None:
-    ixf_ops.vllm_concat_and_cache_mla_int8(
+    ixf_ops.concat_and_cache_mla_int8(
         kv_c_int8,
         kv_c_scale,
         k_pe_int8,
@@ -651,7 +651,7 @@ def gather_cache_int8(
     batch_size: int,
     seq_starts: torch.Tensor | None = None,
 ) -> None:
-    ixf_ops.vllm_gather_cache_int8(
+    ixf_ops.gather_cache_int8(
         src_cache,
         src_cache_scale,
         kv_lora_rank,
@@ -671,7 +671,7 @@ def cp_gather_cache(
     batch_size: int,
     seq_starts: torch.Tensor | None = None,
 ) -> None:
-    ixf_ops.vllm_cp_gather_cache(
+    ixf_ops.cp_gather_cache(
         src_cache, dst, block_table, cu_seq_lens, batch_size, seq_starts
     )
 
@@ -701,7 +701,7 @@ def dsa_convert_req_index_to_global_index(
             block_idx = block_table[req, tok // block_size]
             output[token_id, indice_id] = block_idx * block_size + tok % block_size
     """
-    return ixf_ops.dsa_convert_req_index_to_global_index(
+    return ixf_ops.triton_convert_req_index_to_global_index(
         req_id, block_table, token_indices, block_size, output
     )
 

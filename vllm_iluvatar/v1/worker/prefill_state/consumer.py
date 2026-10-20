@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 import threading
 import time
 
@@ -26,6 +27,10 @@ def save(path, value):
 class ConsumerPrefixState(PrefixRuntime):
     def __init__(self, runner, model):
         super().__init__(runner, model)
+        compact_engram = os.environ.get("VLLM_ILU_E25_COMPACT_ENGRAM", "0")
+        if compact_engram not in ("0", "1"):
+            raise ValueError("VLLM_ILU_E25_COMPACT_ENGRAM must be 0 or 1")
+        self._p21_compact_engram = compact_engram == "1"
         self.geometry = PrefixGeometry.from_config(self.vllm_config)
         from vllm.distributed import get_dp_group, get_ep_group, get_tp_group
 
@@ -253,6 +258,7 @@ class ConsumerPrefixState(PrefixRuntime):
                 "GPU_packet_bytes": 0,
                 "max_num_seqs": self._p21_max_reqs,
                 "max_model_len": self.vllm_config.model_config.max_model_len,
+                "compact_engram": self._p21_compact_engram,
             },
         )
 
@@ -769,7 +775,24 @@ class ConsumerPrefixState(PrefixRuntime):
         h = h.unsqueeze(-2).repeat(1, model.hc_mult, 1)
         pre = h.new_zeros((h.shape[0], model.hc_mult), dtype=torch.float32)
         pre[:, 0] = 1
-        model._prepare_engram(input_ids, positions, lookback_token_ids)
+        if self._p21_compact_engram:
+            from vllm_iluvatar.models.deepseek_v41.engram import prepare_prefix_engram
+
+            used = prepare_prefix_engram(
+                model,
+                input_ids,
+                positions,
+                lookback_token_ids,
+                decode,
+                prefix_tokens,
+                self.geometry.prefix_depth,
+            )
+            if used:
+                self._p21_counters["compact_engram_steps"] = (
+                    self._p21_counters.get("compact_engram_steps", 0) + 1
+                )
+        else:
+            model._prepare_engram(input_ids, positions, lookback_token_ids)
         # Import only current, still-live destination pages. All CPU views are generation checked.
         for i, state, packet, recv in tails:
             # Retain before the first async copy, including partial-copy errors.

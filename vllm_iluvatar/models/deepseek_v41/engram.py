@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import os
+from dataclasses import dataclass
 
 import ixformer.inference.functions as ixfops
 import numpy as np
@@ -16,7 +18,12 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import (
+    DPMetadata,
+    get_forward_context,
+    is_forward_context_available,
+    override_forward_context,
+)
 from vllm.logger import init_logger
 
 logger = init_logger(f"vllm.{__name__}")
@@ -25,6 +32,67 @@ logger = init_logger(f"vllm.{__name__}")
 _FP8_BLOCK = 32
 # Out-of-range hash ids (and DP padding) look up as zeros.
 _DEAD_HASH = -1
+
+_PREFIX_LOOKUP_PLAN = "_ilu_prefix_engram_lookup"
+
+
+@dataclass(frozen=True)
+class PrefixEngramLookup:
+    """Local rows and the already coordinated DP slot for a reused prefix."""
+
+    local_tokens: int
+    token_slot: int
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.local_tokens <= self.token_slot:
+            raise ValueError("Prefix Engram rows must fit the coordinated slot")
+
+
+def prepare_prefix_engram(
+    model,
+    input_ids: torch.Tensor | None,
+    positions: torch.Tensor,
+    lookback_token_ids: torch.Tensor | None,
+    local_tokens: int,
+    token_slot: int,
+    prefix_depth: int,
+) -> bool:
+    """Keep full history updates while looking up only consumed prefix rows.
+
+    Imported producer states replace the prefix for new-request rows. Their
+    tokens must still enter the hash history, but their table rows are unused
+    when every Engram layer is inside that prefix. Unsupported models retain
+    their ordinary preparation contract.
+    """
+    prefix = [
+        layer.engram
+        for layer in model.layers[:prefix_depth]
+        if getattr(layer, "engram", None) is not None
+    ]
+    suffix_has_engram = any(
+        getattr(layer, "engram", None) is not None
+        for layer in model.layers[prefix_depth : model.end_layer]
+    )
+    supported = (
+        input_ids is not None
+        and prefix
+        and not suffix_has_engram
+        and all(getattr(layer, "supports_prefix_lookup", False) for layer in prefix)
+    )
+    if not supported:
+        model._prepare_engram(input_ids, positions, lookback_token_ids)
+        return False
+    plan = PrefixEngramLookup(local_tokens, token_slot)
+    if local_tokens > min(input_ids.shape[0], positions.shape[0]):
+        raise ValueError("Prefix Engram rows exceed the input extent")
+    context = copy.copy(get_forward_context())
+    context.additional_kwargs = dict(context.additional_kwargs)
+    context.additional_kwargs[_PREFIX_LOOKUP_PLAN] = plan
+    with override_forward_context(context):
+        # This original method hashes/writes the complete mixed input before
+        # prepare_embeddings applies the row subset and lookup-only DP scope.
+        model._prepare_engram(input_ids, positions, lookback_token_ids)
+    return True
 
 
 def engram_dp_group():
@@ -747,6 +815,8 @@ def lookback_tokens(
 class IluEngram(nn.Module):
     """One engram layer: hash -> table lookup -> wkv -> gated add."""
 
+    supports_prefix_lookup = True
+
     def __init__(
         self,
         config,
@@ -957,9 +1027,37 @@ class IluEngram(nn.Module):
         ``token_mask`` (True = keep) rides along to the decoder layer, which
         hands it back to :meth:`forward`; image-span rows are zeroed there.
         """
+        context = get_forward_context() if is_forward_context_available() else None
+        plan = (
+            context.additional_kwargs.get(_PREFIX_LOOKUP_PLAN)
+            if context is not None
+            else None
+        )
+        if plan is not None:
+            if not isinstance(plan, PrefixEngramLookup):
+                raise TypeError("Invalid prefix Engram lookup plan")
+            if plan.local_tokens > hash_ids.shape[0]:
+                raise ValueError("Prefix Engram rows exceed the hash extent")
+            hash_ids = hash_ids[: plan.local_tokens]
+            if token_mask is not None:
+                token_mask = token_mask[: plan.local_tokens]
         self._hash_ids = hash_ids
         self._token_mask = token_mask
-        self._rows = self.embed(hash_ids)
+        if plan is not None and plan.token_slot == 0:
+            self._rows = None
+            return
+        group = self.embed._dp_group if plan is not None else None
+        if group is None:
+            self._rows = self.embed(hash_ids)
+            return
+        lookup_context = copy.copy(context)
+        lookup_context.dp_metadata = DPMetadata(
+            torch.full(
+                (group.world_size,), plan.token_slot, dtype=torch.int32, device="cpu"
+            )
+        )
+        with override_forward_context(lookup_context):
+            self._rows = self.embed(hash_ids)
 
     def apply(self, hidden_states: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
         # The table lookup already hands back BF16 rows, so an unquantized wkv

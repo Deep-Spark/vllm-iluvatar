@@ -205,6 +205,7 @@ class ProducerPrefixState(PrefixRuntime):
                             cache=cache,
                             R=int(cache.shape[1]),
                             ratio=1,
+                            scales=getattr(static[name], "kv_cache_scales", None),
                         )
                     )
         assert (
@@ -268,7 +269,7 @@ class ProducerPrefixState(PrefixRuntime):
                 new_GPU_owner_bytes=0,
                 max_model_len=self.vllm_config.model_config.max_model_len,
                 specs=[
-                    {k: v for k, v in s.items() if k != "cache"}
+                    {k: v for k, v in s.items() if k not in ("cache", "scales")}
                     for s in self._src_specs
                 ],
             ),
@@ -357,7 +358,8 @@ class ProducerPrefixState(PrefixRuntime):
                 if spec["kind"] in ("main_tail", "main_tail_scale"):
                     host[0].copy_(cache[block, row], non_blocking=True)
                 else:
-                    copy_indexer_row_to_host(host, cache, block, row)
+                    copy_indexer_row_to_host(host, cache, block, row,
+                                             spec.get("scales"))
                 segments.append(
                     dict(
                         logical_rows=[start, stop],

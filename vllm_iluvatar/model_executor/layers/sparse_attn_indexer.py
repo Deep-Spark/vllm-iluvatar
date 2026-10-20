@@ -94,6 +94,7 @@ def _mqa_logits(
     valid_lens: torch.Tensor,
     owned_logits: torch.Tensor | None = None,
     previous_extent: torch.Tensor | None = None,
+    kv_scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """One chunk's paged MQA logits, per the record the query carries.
 
@@ -103,6 +104,14 @@ def _mqa_logits(
     length is all either one uses (see ``_two_level_filter``).
     """
     if q.dtype is torch.int8:
+        if kv_scales is not None:
+            return ixfops.dsa_indexer_mqa_logits_split(
+                q, cu_seqlens_q, cu_seqlens_kv, kv_cache, kv_scales,
+                block_table, weights, max_q_len=max_q_len,
+                max_kv_len=max_kv_len, max_context_len=max_context_len,
+                valid_lens=valid_lens, logits=owned_logits,
+                previous_extent=previous_extent,
+            )
         if owned_logits is not None and previous_extent is not None:
             from ixformer.inference.functions.deepseek.indexer import (
                 dsa_indexer_mqa_logits_ixinfer_owned,
@@ -176,6 +185,13 @@ def ilu_sparse_attn_indexer(
             topk_indices_buffer,
         )
 
+    cache_layer = get_forward_context().no_compile_layers.get(k_cache_prefix)
+    kv_scales = (
+        cache_layer.kv_cache_scales
+        if getattr(cache_layer, "split_indexer", False) else None
+    )
+    if getattr(cache_layer, "split_indexer", False) and kv_scales is None:
+        raise RuntimeError("Split indexer payload is missing its scale plane")
     attn_metadata = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata, IluDeepseekV32IndexerMetadata)
     slot_mapping = attn_metadata.slot_mapping
@@ -213,6 +229,7 @@ def ilu_sparse_attn_indexer(
                 cu_seqlen_ks=chunk.cu_seqlen_ks,
                 cu_seqlen_ke=chunk.cu_seqlen_ke,
                 valid_lens=chunk.valid_lens,
+                kv_scales=kv_scales,
             )
             _two_level_filter(
                 logits,
@@ -276,6 +293,7 @@ def ilu_sparse_attn_indexer(
             valid_lens=decode_metadata.valid_lens,
             owned_logits=owned_logits if use_owned else None,
             previous_extent=previous_extent if use_owned else None,
+            kv_scales=kv_scales,
         )
 
         _two_level_filter(

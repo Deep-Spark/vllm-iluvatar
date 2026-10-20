@@ -422,8 +422,8 @@ def test_zeroer_binding_failure_releases_arena_and_layer_views(
     original = CompressedKVState.bind_zeroer
     references = []
 
-    def bind_then_fail(state, zeroer):
-        original(state, zeroer)
+    def bind_then_fail(state, zeroer, extra_planes=()):
+        original(state, zeroer, extra_planes)
         references.extend(
             (weakref.ref(state.workspace.storage), weakref.ref(state.scale_storage))
         )

@@ -54,12 +54,14 @@ def compressed_kv_profiling(
         if getattr(original_initialize, "_ilu_compressed_kv_profiling", False):
             raise RuntimeError("Compressed KV profiling is already active")
         state = None
+        index_state = None
+        owners = []
 
         @wraps(original_initialize)
         def initialize(config, is_profiling=False, kv_cache_allocation_context=None):
-            nonlocal state
+            nonlocal state, index_state
             if is_profiling:
-                if state is not None:
+                if owners:
                     raise RuntimeError("Profiling KV cache was initialized twice")
                 if any(
                     getattr(layer, "compressed_kv_workspace", None) is not None
@@ -69,23 +71,42 @@ def compressed_kv_profiling(
                     raise RuntimeError(
                         "Profiling cannot replace a live compressed KV cache"
                     )
-                state = CompressedKVState(
-                    plan_scale_layout(config, fmt),
-                    fmt,
-                    runner.device,
-                    context,
-                    workspace_bytes=workspace_bytes,
-                    prefill_producer=prefill_producer,
+                from vllm_iluvatar.models.deepseek_v41.indexer_kv import (
+                    IndexerScaleState,
+                    plan_indexer_scales,
                 )
+
+                index_layout = plan_indexer_scales(config)
+                if index_layout.placements:
+                    index_state = IndexerScaleState(index_layout, runner.device, context)
+                    owners.append(index_state)
+                if fmt is not None:
+                    state = CompressedKVState(
+                        plan_scale_layout(config, fmt),
+                        fmt,
+                        runner.device,
+                        context,
+                        workspace_bytes=workspace_bytes,
+                        prefill_producer=prefill_producer,
+                    )
+                    owners.append(state)
             result = original_initialize(
                 config,
                 is_profiling=is_profiling,
                 kv_cache_allocation_context=kv_cache_allocation_context,
             )
             if is_profiling:
-                runner.kv_caches.extend(state.scales.values())
+                if state is not None:
+                    runner.kv_caches.extend(state.scales.values())
+                extra_planes = tuple(index_state.scales.values()) if index_state else ()
+                runner.kv_caches.extend(extra_planes)
                 runner._init_kv_zero_meta()
-                state.bind_zeroer(runner.kv_block_zeroer)
+                if state is not None:
+                    state.bind_zeroer(runner.kv_block_zeroer, extra_planes)
+                elif index_state is not None:
+                    from vllm_iluvatar.models.deepseek_v41.indexer_kv import extend_kv_zeroer
+
+                    extend_kv_zeroer(runner.kv_block_zeroer, config.num_blocks, extra_planes)
             return result
 
         initialize._ilu_compressed_kv_profiling = True
@@ -100,7 +121,7 @@ def compressed_kv_profiling(
                 return original_profile()
             except BaseException as error:
                 failure = error
-                if state is not None:
+                if owners:
                     # Initialization can fail before the upstream profiler
                     # enters the try/finally that normally clears its cache.
                     try:
@@ -113,17 +134,18 @@ def compressed_kv_profiling(
                         logger.exception("Failed to tear down profiling KV cache")
                 raise
             finally:
-                if state is not None:
+                if owners:
                     import torch
 
-                    device = state.workspace.storage.device
+                    device = runner.device
                     try:
                         try:
                             if device.type == "cuda":
                                 torch.cuda.synchronize(device)
                         finally:
                             runner.kv_block_zeroer = None
-                            state.release()
+                            for owner in reversed(owners):
+                                owner.release()
                             gc.collect()
                             if device.type == "cuda":
                                 # Upstream empty_cache ran while we still held

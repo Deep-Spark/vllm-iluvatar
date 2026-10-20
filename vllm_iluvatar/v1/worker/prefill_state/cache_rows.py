@@ -3,7 +3,8 @@
 import torch
 
 
-def indexer_row_views(cache: torch.Tensor, block: int, row: int) -> tuple[torch.Tensor, ...]:
+def indexer_row_views(cache: torch.Tensor, block: int, row: int,
+                      scales: torch.Tensor | None = None) -> tuple[torch.Tensor, ...]:
     """Return actual key and scale byte ranges, without a device allocation.
 
     Quantized indexer pages contain all128-byte keys followed by all4-byte
@@ -12,6 +13,12 @@ def indexer_row_views(cache: torch.Tensor, block: int, row: int) -> tuple[torch.
     """
     if not 0 <= row < cache.shape[1] or not 0 <= block < cache.shape[0]:
         raise ValueError("Indexer row extends beyond its current page")
+    if scales is not None:
+        if (cache.dtype != torch.uint8 or cache.shape[-1] != 128
+                or scales.dtype != torch.float32 or scales.shape != cache.shape[:2]
+                or scales.device != cache.device or scales.stride(1) != 1):
+            raise ValueError("Unsupported E25 split indexer boundary-row layout")
+        return cache[block, row], scales[block, row:row + 1].view(torch.uint8)
     if cache.dtype == torch.uint8 and cache.shape[-1] == 132:
         rows = cache.shape[1]
         page = cache[block].as_strided((rows * 132,), (1,))
@@ -23,8 +30,9 @@ def indexer_row_views(cache: torch.Tensor, block: int, row: int) -> tuple[torch.
 
 
 def copy_indexer_row_to_host(host: torch.Tensor, cache: torch.Tensor,
-                             block: int, row: int) -> None:
-    parts = indexer_row_views(cache, block, row)
+                             block: int, row: int,
+                             scales: torch.Tensor | None = None) -> None:
+    parts = indexer_row_views(cache, block, row, scales)
     if host.dtype != torch.uint8 or host.numel() != sum(p.numel() for p in parts):
         raise ValueError("Indexer boundary payload size mismatch")
     offset = 0
@@ -34,8 +42,9 @@ def copy_indexer_row_to_host(host: torch.Tensor, cache: torch.Tensor,
 
 
 def restore_indexer_row(cache: torch.Tensor, block: int, row: int,
-                        host: torch.Tensor) -> None:
-    parts = indexer_row_views(cache, block, row)
+                        host: torch.Tensor,
+                        scales: torch.Tensor | None = None) -> None:
+    parts = indexer_row_views(cache, block, row, scales)
     if host.dtype != torch.uint8 or host.numel() != sum(p.numel() for p in parts):
         raise ValueError("Indexer boundary payload size mismatch")
     offset = 0

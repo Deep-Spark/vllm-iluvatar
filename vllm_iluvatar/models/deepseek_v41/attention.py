@@ -62,6 +62,10 @@ from vllm_iluvatar.models.deepseek_v41.compressed_kv_restore import (
 from vllm_iluvatar.models.deepseek_v41.compressor import (
     IluDeepseekCompressor,
 )
+from vllm_iluvatar.models.deepseek_v41.indexer_kv import (
+    SPLIT_INDEXER_FORMAT,
+    indexer_kv_layout,
+)
 from vllm_iluvatar.models.deepseek_v41.rope import apply_rope
 from vllm_iluvatar.models.deepseek_v41.sparse_mla import (
     IluDeepseekSparseSWAFlashMLABackend,
@@ -186,26 +190,9 @@ _INDEXER_KV_DTYPE = indexer_kv_dtype()
 # One FP32 scale per row trails the values in a quantized index-key record.
 _INDEX_SCALE_BYTES = 4
 
-# Row width a quantized index-key page is *allocated* at, as opposed to the 132
-# bytes a record occupies.
-#
-# ``unify_kv_cache_spec_page_size`` equalizes a cache group by scaling every
-# smaller spec's block_size by an integer ratio, so the index page has to
-# divide the group's largest page exactly. Here that largest page is the
-# sliding-window cache's 65536 bytes, not the main KV page -- a measured run
-# reports swa 65536, main 32768, compressor 32768 -- and 65536 is a pure power
-# of two. So the index page has to be one too, and since the page is
-# ``states * row`` with a power-of-two state count, the row has to be a power
-# of two. 132 is not, which is what the packed layout kept failing on; 256 is
-# the smallest one that still holds the record.
-#
-# That makes a quantized page cost exactly what a bf16 page costs (128 values
-# x 2 bytes), so INT8 buys scoring bandwidth here, not cache capacity. The
-# record itself stays 132 bytes: ``bind_kv_cache`` hands the kernels a view
-# whose page pitch is the allocated 256 but whose row pitch is the record's
-# 132, so every page ends in bytes that nothing addresses. Both our store
-# kernel and ixformer's readers take the page pitch from ``stride(0)`` and
-# document support for exactly this layout.
+# Legacy packed pages reserve a power-of-two row width to satisfy common-page
+# unification. Split INT8 pages instead allocate128-byte values here and budget
+# FP32 scales through indexer_kv, preserving the132-byte PP record on the wire.
 _INDEX_PAGE_ROW_BYTES = 256
 
 
@@ -231,6 +218,8 @@ def _indexer_k_cache_row(index_head_dim: int, kv_dtype: str) -> tuple[int, torch
 class IluDeepseekV41IndexerCache(torch.nn.Module, AttentionLayerBase):
     """The paged index-key cache an ``owns_k`` layer publishes into."""
 
+    split_indexer = False
+
     def __init__(
         self,
         head_dim: int,
@@ -246,6 +235,8 @@ class IluDeepseekV41IndexerCache(torch.nn.Module, AttentionLayerBase):
         self.cache_config = cache_config
         self.dtype = dtype
         self.compress_ratio = compress_ratio
+        self.split_indexer = indexer_kv_layout() == "split"
+        self.kv_cache_scales = None
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -263,6 +254,15 @@ class IluDeepseekV41IndexerCache(torch.nn.Module, AttentionLayerBase):
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         # [B, H=1, N, C] -> [B, N, C]
         cache = kv_cache.squeeze(1)
+        if self.split_indexer:
+            if cache.shape[-1] != 128:
+                raise ValueError("Split indexer payload must contain128 INT8 values")
+            owner = getattr(self, "_indexer_scale_owner", None)
+            if owner is None:
+                raise RuntimeError("Split indexer scales must be bound before its payload")
+            owner.bind(self.prefix, cache)
+            self.kv_cache = cache
+            return
         if cache.size(-1) != self.head_dim:
             # A quantized page is allocated wider than its record (see
             # ``_INDEX_PAGE_ROW_BYTES``). Narrow it back to the record while
@@ -285,17 +285,15 @@ class IluDeepseekV41IndexerCache(torch.nn.Module, AttentionLayerBase):
                 f"fractional row (layer {self.prefix})"
             )
         if self.dtype is torch.uint8:
-            # No ``alignment``: a padded page would break both halves of what
-            # the page-size unification needs -- the rescaled page would no
-            # longer match the main one, and ``compute_layer_kv_cache_shape``
-            # refuses to split a padded page into kernel blocks at all. The
-            # 144-byte row is chosen so that no padding is needed.
+            # Both layouts have power-of-two payload pages. An arbitrary
+            # padded132-byte page cannot be split into backend kernel blocks.
             return MLAAttentionSpec(
                 block_size=self.block_size,
                 num_kv_heads=1,
-                head_size=_INDEX_PAGE_ROW_BYTES,
+                head_size=128 if self.split_indexer else _INDEX_PAGE_ROW_BYTES,
                 dtype=self.dtype,
                 tokens_per_state=self.compress_ratio,
+                cache_dtype_str=SPLIT_INDEXER_FORMAT if self.split_indexer else None,
             )
         return MLAAttentionSpec(
             block_size=self.block_size,
@@ -480,6 +478,7 @@ class IluDeepseekV41Indexer(nn.Module):
             self.compress_ratio,
             _INDEXER_KV_DTYPE,
             row_out=self.k_row_buffer,
+            scales=self.k_cache.kv_cache_scales,
         )
 
     def forward(
@@ -1156,13 +1155,17 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         assert indexer_cache is not None
         if indexer_cache.kv_cache.numel():
             indexer_metadata = cast(Any, attn_metadata[indexer_cache.prefix])
-            move_rows_to_paged_cache(
-                indexer_rows,
-                indexer_cache.kv_cache,
-                indexer_metadata.slot_mapping,
-                positions,
-                self.compress_ratio,
-            )
+            if indexer_cache.split_indexer:
+                ixfops.indexer_int8_insert_split(
+                    indexer_rows, indexer_cache.kv_cache,
+                    indexer_cache.kv_cache_scales, indexer_metadata.slot_mapping,
+                    positions, self.compress_ratio,
+                )
+            else:
+                move_rows_to_paged_cache(
+                    indexer_rows, indexer_cache.kv_cache,
+                    indexer_metadata.slot_mapping, positions, self.compress_ratio,
+                )
 
         # The selection is a plain per-rank buffer, so taking it over is a
         # copy rather than a paged write.

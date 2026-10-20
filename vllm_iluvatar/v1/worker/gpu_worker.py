@@ -133,22 +133,79 @@ class IluWorker(Worker):
             return budget.payload_bytes
         orig_cls = self._try_replace_model_runner_class()
         try:
-            return super().determine_available_memory()
+            from contextlib import nullcontext
+
+            from vllm_iluvatar.models.deepseek_v41.indexer_kv import indexer_kv_layout
+
+            profiling = nullcontext()
+            if indexer_kv_layout() == "split":
+                if not self.vllm_config.use_v2_model_runner:
+                    raise ValueError("Split indexer KV requires model runner V2")
+                from vllm_iluvatar.v1.worker.gpu.compressed_kv_profiling import (
+                    compressed_kv_profiling,
+                )
+
+                profiling = compressed_kv_profiling(
+                    self.model_runner, None, workspace_bytes=0,
+                    prefill_producer=prefill_producer_for_config(self.vllm_config),
+                )
+            with profiling:
+                available = super().determine_available_memory()
+            self._indexer_kv_available_memory = available
+            return available
         finally:
             self.model_runner.__class__ = orig_cls
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         from vllm_iluvatar.models.deepseek_v41.compressed_kv import main_kv_format
+        from vllm_iluvatar.models.deepseek_v41.indexer_kv import (
+            IndexerScaleState,
+            extend_kv_zeroer,
+            plan_indexer_scales,
+        )
 
+        index_layout = plan_indexer_scales(kv_cache_config)
+        index_state = None
+        if index_layout.placements:
+            if not self.vllm_config.use_v2_model_runner:
+                raise ValueError("Split indexer KV requires model runner V2")
+            if getattr(self, "_indexer_kv_state", None) is not None:
+                raise RuntimeError("Split indexer KV cache is already initialized")
+            with self._maybe_get_memory_pool_context(tag="kv_cache"):
+                index_state = IndexerScaleState(
+                    index_layout, self.device,
+                    self.vllm_config.compilation_config.static_forward_context,
+                )
+            self._indexer_kv_state = index_state
+            logger.info("Split INT8 indexer scales: bytes=%d owners=%d blocks=%d",
+                        index_layout.nbytes, len(index_layout.placements),
+                        index_layout.num_blocks)
         fmt = main_kv_format()
-        if fmt is not None:
-            self._initialize_compressed_kv(kv_cache_config, fmt)
-            self._initialize_prefix_cache()
-            return
         orig_cls = self._try_replace_model_runner_class()
         try:
-            super().initialize_from_config(kv_cache_config)
+            if fmt is not None:
+                self._initialize_compressed_kv(kv_cache_config, fmt)
+            else:
+                if index_state is not None:
+                    payload = {t.size for t in kv_cache_config.kv_cache_tensors}
+                    if (len(payload) != 1 or payload.pop() + index_layout.nbytes
+                            > self._indexer_kv_available_memory):
+                        raise ValueError("Split indexer exceeds its profiled budget")
+                super().initialize_from_config(kv_cache_config)
+                if index_state is not None:
+                    self.model_runner.kv_caches.extend(index_state.scales.values())
+                    if self.model_runner.kv_block_zeroer is None:
+                        self.model_runner._init_kv_zero_meta()
+                    extend_kv_zeroer(
+                        self.model_runner.kv_block_zeroer, index_layout.num_blocks,
+                        index_state.scales.values(),
+                    )
             self._initialize_prefix_cache()
+        except BaseException:
+            if index_state is not None:
+                index_state.release()
+                self._indexer_kv_state = None
+            raise
         finally:
             self.model_runner.__class__ = orig_cls
 
@@ -205,7 +262,9 @@ class IluWorker(Worker):
                 "Compressed KV initialization failed; restart the worker before retrying"
             )
         layout = plan_scale_layout(kv_cache_config, fmt)
-        budget.validate(layout.payload_bytes, layout.scale_bytes)
+        index_state = getattr(self, "_indexer_kv_state", None)
+        index_bytes = index_state.layout.nbytes if index_state is not None else 0
+        budget.validate(layout.payload_bytes, layout.scale_bytes + index_bytes)
         context = self.vllm_config.compilation_config.static_forward_context
         self._compressed_kv_init_attempted = True
         with self._maybe_get_memory_pool_context(tag="kv_cache"):
@@ -225,10 +284,12 @@ class IluWorker(Worker):
             # V2 uses this tensor list for physical block copies. No synthetic
             # layer names or separate block IDs enter its metadata path.
             self.model_runner.kv_caches.extend(state.scales.values())
-            if state.scales:
+            extra_planes = tuple(index_state.scales.values()) if index_state else ()
+            self.model_runner.kv_caches.extend(extra_planes)
+            if state.scales or extra_planes:
                 if getattr(self.model_runner, "kv_block_zeroer", None) is None:
                     self.model_runner._init_kv_zero_meta()
-                state.bind_zeroer(self.model_runner.kv_block_zeroer)
+                state.bind_zeroer(self.model_runner.kv_block_zeroer, extra_planes)
         except Exception:
             state.release()
             self._compressed_kv_state = None
@@ -303,6 +364,7 @@ class IluWorker(Worker):
         orig_cls = self._try_replace_model_runner_class()
         checker = getattr(self, "_onchip_checker", None)
         monitor = getattr(self, "_hbm_ecc_monitor", None)
+        parent_shutdown_complete = False
         try:
             if monitor is not None:
                 try:
@@ -315,17 +377,24 @@ class IluWorker(Worker):
                 except Exception:
                     logger.exception("Worker health shutdown check failed")
             super().shutdown()
+            parent_shutdown_complete = True
         finally:
+            # Any parent error may precede transport drain, including a failure
+            # submitting it to the loop. Keep the live worker's owners for retry.
             state = getattr(self, "_compressed_kv_state", None)
-            if state is not None:
+            if state is not None and parent_shutdown_complete:
                 state.release()
                 self._compressed_kv_state = None
-            if checker is not None:
+            index_state = getattr(self, "_indexer_kv_state", None)
+            if index_state is not None and parent_shutdown_complete:
+                index_state.release()
+                self._indexer_kv_state = None
+            if checker is not None and parent_shutdown_complete:
                 try:
                     checker.free()
                 except Exception:
                     logger.exception("Failed to free worker health checker")
-            if monitor is not None:
+            if monitor is not None and parent_shutdown_complete:
                 try:
                     monitor.free()
                 except Exception:

@@ -94,10 +94,14 @@ def main_kv_format():
 
 
 def format_factors() -> dict[str, Any]:
+    from vllm_iluvatar.models.deepseek_v41.indexer_kv import indexer_format_factors
+
+    factors = indexer_format_factors()
     fmt = main_kv_format()
     if fmt is None:
-        return {}
+        return factors
     return {
+        **factors,
         "compressed_kv_encoding": ENCODING_VERSION,
         "compressed_kv_format": fmt.name,
         "compressed_kv_group_size": fmt.group_size,
@@ -568,46 +572,13 @@ class CompressedKVState:
             self.release()
             raise
 
-    def bind_zeroer(self, zeroer) -> None:
+    def bind_zeroer(self, zeroer, extra_planes=()) -> None:
         """Extend the V2 zeroer using metadata inside the reserved workspace."""
-        from vllm.v1.kv_cache_interface import group_kernel_blocks
+        from vllm_iluvatar.models.deepseek_v41.indexer_kv import extend_kv_zeroer
 
-        addresses, strides, sizes = [], [], []
-        if zeroer._meta is not None:
-            old_addresses, old_strides, old_sizes, *_ = zeroer._meta
-            addresses.extend(old_addresses.cpu().tolist())
-            strides.extend(old_strides.cpu().tolist())
-            sizes.extend(old_sizes.cpu().tolist())
-        seen = set(addresses)
-        for scale in self.scales.values():
-            address = scale.data_ptr()
-            if address in seen:
-                continue
-            seen.add(address)
-            physical = group_kernel_blocks(scale, self.layout.num_blocks)
-            addresses.append(address)
-            strides.append(physical.stride(0) * 2 // 4)
-            sizes.append(physical[0].numel() * 2 // 4)
-        count = len(addresses)
-        metadata = self.workspace.reserve_metadata(count * 24)
-        addr_view = metadata[: count * 8].view(torch.uint64)
-        stride_view = metadata[count * 8 : count * 16].view(torch.int64)
-        size_view = metadata[count * 16 :].view(torch.int64)
-        for view, values in (
-            (addr_view, addresses),
-            (stride_view, strides),
-            (size_view, sizes),
-        ):
-            view.copy_(torch.tensor(values, dtype=view.dtype, device="cpu"))
-        max_page = max(sizes)
-        block_size = min(1 << (max_page - 1).bit_length(), 1024)
-        zeroer._meta = (
-            addr_view,
-            stride_view,
-            size_view,
-            (max_page + block_size - 1) // block_size,
-            block_size,
-            count,
+        extend_kv_zeroer(
+            zeroer, self.layout.num_blocks,
+            (*self.scales.values(), *extra_planes), self.workspace,
         )
 
     def release(self) -> None:

@@ -228,6 +228,7 @@ class ConsumerPrefixState(PrefixRuntime):
                             "layer": layer,
                             "kind": kind,
                             "cache": cache,
+                            "scales": getattr(static[name], "kv_cache_scales", None),
                         }
                     )
         assert (
@@ -699,7 +700,8 @@ class ConsumerPrefixState(PrefixRuntime):
                                 sum(
                                     v.numel()
                                     for v in indexer_row_views(
-                                        cache, int(blocks[logical]), row
+                                        cache, int(blocks[logical]), row,
+                                        source.get("scales"),
                                     )
                                 )
                                 == field["byte_count"]
@@ -851,7 +853,8 @@ class ConsumerPrefixState(PrefixRuntime):
                     if source["kind"] in ("main_tail", "main_tail_scale"):
                         cache[block, row].copy_(data[0], non_blocking=True)
                     else:
-                        restore_indexer_row(cache, block, row, data)
+                        restore_indexer_row(cache, block, row, data,
+                                            source.get("scales"))
             region = slice(int(q[i]), int(q[i + 1]))
             h[region].copy_(view(fields["HC"]), non_blocking=True)
             pre[region].copy_(view(fields["pre_mix"]), non_blocking=True)

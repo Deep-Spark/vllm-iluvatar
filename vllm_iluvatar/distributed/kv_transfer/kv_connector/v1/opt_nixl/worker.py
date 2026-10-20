@@ -808,6 +808,7 @@ class NixlConnectorWorker:
         from vllm_iluvatar.models.deepseek_v41.compressed_kv import (
             is_quantized_main_spec,
         )
+        from vllm_iluvatar.models.deepseek_v41.indexer_kv import is_split_indexer_spec
 
         forward_context = self.vllm_config.compilation_config.static_forward_context
         skip_layers = get_skip_layers()
@@ -866,17 +867,28 @@ class NixlConnectorWorker:
                     seen_base_addresses_check=seen_base_addresses_check,
                     registered_allocation_sizes=registered_allocation_sizes,
                 )
-                if is_quantized_main_spec(layer_spec):
-                    fmt = resolve_quant_format(layer_spec.cache_dtype_str)
+                if is_quantized_main_spec(layer_spec) or is_split_indexer_spec(layer_spec):
                     scales = (kv_cache_scales or {}).get(layer_name)
                     if scales is None:
                         scales = getattr(forward_context[layer_name], "kv_cache_scales", None)
                     if not isinstance(scales, torch.Tensor):
-                        raise ValueError(f"{layer_name}: compressed KV registration requires its scale plane")
-                    scale_registration = self._memory_registration_planner.describe_scale_plane(
-                        layer_name=layer_name, scales=scales, payload=registration,
-                        scale_page_bytes=fmt.scale_page_bytes(layer_spec.head_size),
-                    )
+                        raise ValueError(
+                            f"{layer_name}: compressed KV registration requires its scale plane"
+                        )
+                    if is_split_indexer_spec(layer_spec):
+                        scale_registration = (
+                            self._memory_registration_planner.describe_indexer_scale_plane(
+                                layer_name=layer_name, scales=scales, payload=registration,
+                            )
+                        )
+                    else:
+                        fmt = resolve_quant_format(layer_spec.cache_dtype_str)
+                        scale_registration = self._memory_registration_planner.describe_scale_plane(
+                            layer_name=layer_name,
+                            scales=scales,
+                            payload=registration,
+                            scale_page_bytes=fmt.scale_page_bytes(layer_spec.head_size),
+                        )
                     self._record_registered_kv_region(
                         layer_name=layer_name, cache=scales, layer_spec=layer_spec,
                         registration=scale_registration,

@@ -251,7 +251,7 @@ class HYV4FlashMLASparseImpl(IluFlashMLASparseImpl):
             device=q_nope.device,
         )
         ixf_ops.glm_dsa_fp8_q_pack(q_nope, q_pe, q_packed, q_scale)
-        out = ixf_ops.dsa_flash_mla_with_fp8_kvcache(
+        out = ixf_ops.dsa_flash_mla_sparse_with_fp8_kvcache_diff_kv(
             q_packed.view(num_tokens, 1, self._fp8_q_heads, _HYV4_DSA_FP8_ROW_BYTES),
             kv_cache.unsqueeze(2),
             topk_indices.view(num_tokens, 1, -1),
@@ -286,7 +286,7 @@ class HYV4FlashMLASparseImpl(IluFlashMLASparseImpl):
         if topk_length is None:
             idx = topk_indices.reshape(num_tokens, -1)
             topk_length = (idx >= 0).sum(dim=-1).to(torch.int32)
-        output = ixf_ops.dsa_flash_mla_sparse_fwd(
+        output = ixf_ops.dsa_flash_mla_sparse_fwd_diff_kv(
             q,
             kv_c_and_k_pe_cache,
             topk_indices,

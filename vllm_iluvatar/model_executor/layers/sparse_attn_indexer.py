@@ -45,17 +45,17 @@ def _mqa_logits(*args, **kwargs):
     # ixinfer is the only kernel that reads an int8 query.
     if q.dtype is torch.int8:
         kwargs["backend"] = "ixinfer"
-        return ixfops.dsa_indexer_mqa_logits(*args, **kwargs)
+        return ixfops.dsa_indexer_mqa_logits_with_kvcache(*args, **kwargs)
     if kv_cache.dtype == torch.uint8:
         # ixinfer supports only 64/256-row pages. Ratio1's 128 rows use native.
         kwargs.setdefault(
             "backend",
             os.environ.get("VLLM_ILU_V41_FP8_INDEXER_BACKEND", "ixformer_native"),
         )
-        return ixfops.dsa_indexer_mqa_logits_with_blocks_fp8(*args, **kwargs)
+        return ixfops.dsa_indexer_mqa_logits_with_kvcache_fp8(*args, **kwargs)
     if envs.VLLM_ILU_GLM_DSA_NATIVE_MQA_LOGITS:
         kwargs.setdefault("backend", "ixformer_native")
-    return ixfops.dsa_indexer_mqa_logits(*args, **kwargs)
+    return ixfops.dsa_indexer_mqa_logits_with_kvcache(*args, **kwargs)
 
 
 def _mqa_logits_for_candidates(candidate_blocks, *args, **kwargs):

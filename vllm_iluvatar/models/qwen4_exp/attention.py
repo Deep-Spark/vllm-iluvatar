@@ -7,11 +7,15 @@ from __future__ import annotations
 from typing import ClassVar, cast
 
 import torch
-from ixformer.inference.functions.qwen38 import (
+from ixformer.inference.functions.models.qwen3_next import (
     qwen_qsa_kv_store,
     qwen_qsa_qk_norm_rope_gate,
-    qwen_qsa_sparse_paged_fmha_decode,
-    qwen_qsa_sparse_paged_fmha_prefill,
+)
+from ixformer.inference.functions.models.qwen3_next import (
+    qwen_qsa_sparse_paged_fmha as qwen_qsa_sparse_paged_fmha_decode,
+)
+from ixformer.inference.functions.models.qwen3_next import (
+    qwen_qsa_sparse_paged_fmha as qwen_qsa_sparse_paged_fmha_prefill,
 )
 from torch import nn
 from vllm.config import VllmConfig

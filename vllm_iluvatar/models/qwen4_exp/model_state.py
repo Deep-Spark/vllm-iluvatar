@@ -21,7 +21,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from ixformer.inference.functions.qwen38 import (
+from ixformer.inference.functions.models.qwen3_next import (
     build_mamba_align_layout,
     qwen_mamba_align_advance,
     qwen_mamba_align_postcopy,

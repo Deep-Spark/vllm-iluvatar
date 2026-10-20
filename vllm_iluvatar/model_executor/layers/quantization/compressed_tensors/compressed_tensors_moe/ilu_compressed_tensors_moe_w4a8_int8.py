@@ -16,7 +16,7 @@ from compressed_tensors.quantization import (
     QuantizationArgs,
     QuantizationStrategy,
 )
-from ixformer.inference.functions.fused_moe import (
+from ixformer.inference.functions.ops.moe.float.fused_moe import (
     _prepack_fused_moe_w4a8_tn_weights_,
 )
 from vllm.forward_context import get_forward_context

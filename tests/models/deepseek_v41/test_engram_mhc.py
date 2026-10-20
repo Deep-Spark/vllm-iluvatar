@@ -58,7 +58,7 @@ def test_engram_apply_sqrsum_restarts_streaming_pre(layer_id, monkeypatch):
 
     def pre(x, *args, **kwargs):
         calls.append((x.clone(), kwargs["sqrsum"], kwargs["layer_norm_weight"]))
-        return None, None, x.mean(1), torch.ones(2, 4)
+        return None, None, x.mean(1), torch.ones(2, 4), None, None
 
     monkeypatch.setattr(mhc, "hc_post_sqrsum", post)
     monkeypatch.setattr(mhc, "hc_pre_mixes", pre)

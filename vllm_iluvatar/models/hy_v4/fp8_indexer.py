@@ -76,6 +76,9 @@ class HYV4Fp8IndexerCache(torch.nn.Module, AttentionLayerBase):
 
     def forward(self): ...
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        self.kv_cache = kv_cache.squeeze(1)
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return IluDeepseekV32IndexerBackend
 

@@ -547,7 +547,8 @@ class NixlConnectorWorker:
             asyncio.Queue()
         )
         self._accepting_work = True
-        self._shutdown_started_on_loop = False
+        self._shutdown_task: asyncio.Task[None] | None = None
+        self._shutdown_future = None
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
         self._send_failures: dict[ReqId, str] = {}

@@ -33,6 +33,18 @@ class IluWorker(Worker):
         self.prefix_state = (
             configure(self.model_runner) if configure is not None else None
         )
+        import vllm.envs as envs
+
+        if envs.VLLM_ILU_DP_VOCAB_GROUP_SIZE:
+            if not self.vllm_config.use_v2_model_runner:
+                raise ValueError("DP vocabulary projection requires model runner V2")
+            from vllm_iluvatar.distributed.dp_vocab_projection import (
+                install_dp_vocab_projection,
+            )
+
+            install_dp_vocab_projection(
+                self.model_runner, envs.VLLM_ILU_DP_VOCAB_GROUP_SIZE
+            )
         return result
 
     def _try_replace_model_runner_class(self) -> type[object]:

@@ -114,6 +114,7 @@ if TYPE_CHECKING:
     VLLM_ILU_GDN_ATTN_BACKEND: bool = False
     VLLM_ILU_CUDAGRAPH_ASYNC_REPLAY: bool = False
     VLLM_ILU_COMPACT_RAGGED_GATHER: bool = False
+    VLLM_ILU_DP_VOCAB_GROUP_SIZE: int = 0
     VLLM_ILU_E25_COMPACT_ENGRAM: bool = False
     VLLM_ILU_DS41_DECODE_KV_RESTORE: bool = False
     VLLM_ILU_DS4_PREFILL_OPT: bool = False
@@ -240,6 +241,9 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
 
 
 _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
+    "VLLM_ILU_DP_VOCAB_GROUP_SIZE": _int_reader(
+        "VLLM_ILU_DP_VOCAB_GROUP_SIZE", 0, minimum=0
+    ),
     "VLLM_ILU_DS41_DECODE_KV_RESTORE": _bool_reader(
         "VLLM_ILU_DS41_DECODE_KV_RESTORE", "0"
     ),

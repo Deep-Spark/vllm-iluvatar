@@ -2980,6 +2980,7 @@ class NixlConnectorWorker:
                     generation,
                     global_rank,
                 )
+            self._teardown_outbox.task_done()
 
     def _cleanup_session_if_drained(
         self,
@@ -3206,6 +3207,12 @@ class NixlConnectorWorker:
         ]
         if self._registered_descs:
             raise NixlDrainIncomplete("Native memory deregistration is incomplete")
+        reports = getattr(self, "_teardown_outbox", None)
+        if reports is not None:
+            try:
+                await asyncio.wait_for(reports.join(), timeout=5.0)
+            except TimeoutError as error:
+                raise NixlDrainIncomplete("Teardown reports are still pending") from error
         getattr(self, "_registered_cache_owners", {}).clear()
 
     ############################################################

@@ -78,14 +78,38 @@ def test_failed_deregistration_keeps_the_exact_owner_for_a_successful_retry():
 def test_failed_native_descriptor_release_does_not_forget_registration():
     value, owner = worker()
     value.src_xfer_side_handles["source"] = object()
-    value.nixl_wrapper.release_dlist_handle = lambda _: (_ for _ in ()).throw(
-        RuntimeError("busy")
-    )
+
+    def fail_release(_handle):
+        raise RuntimeError("busy")
+
+    value.nixl_wrapper.release_dlist_handle = fail_release
     with pytest.raises(NixlDrainIncomplete, match="descriptors"):
         asyncio.run(value._drain_and_cleanup_on_loop())
     assert "source" in value.src_xfer_side_handles
     assert value._registered_descs and owner() is not None
     value.nixl_wrapper.release_dlist_handle = lambda _: None
     asyncio.run(value._drain_and_cleanup_on_loop())
+    gc.collect()
+    assert owner() is None
+
+
+def test_shutdown_delivers_queued_teardown_reports_before_releasing_owners():
+    value, owner = worker()
+
+    async def run():
+        value._teardown_outbox = asyncio.Queue()
+        value._teardown_outbox.put_nowait("terminal proof")
+
+        async def report():
+            await asyncio.sleep(0.01)
+            assert owner() is not None
+            assert await value._teardown_outbox.get() == "terminal proof"
+            value._teardown_outbox.task_done()
+
+        reporter = asyncio.create_task(report())
+        await value._drain_and_cleanup_on_loop()
+        await reporter
+
+    asyncio.run(run())
     gc.collect()
     assert owner() is None

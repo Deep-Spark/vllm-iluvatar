@@ -1,6 +1,7 @@
 """CPU-only topology, replay receipts and standard lifecycle regression tests."""
 
 import os
+import queue
 import threading
 from copy import deepcopy
 from types import SimpleNamespace as NS
@@ -345,6 +346,15 @@ def test_native_connector_scheduler_delivers_receipts_without_scheduler_patches(
     scheduler._reqs_to_recv = {}
     scheduler._reqs_not_processed_recv = set()
     scheduler._reqs_not_send_to_worker = set()
+    scheduler._live_recv_reqs = {req.request_id}
+    scheduler._scheduler_failed_recvs = set()
+    scheduler._ownership_generations = {}
+    scheduler._ownership_remote_engines = {}
+    scheduler._ownership_states = {}
+    scheduler._ownership_deadlines = {}
+    scheduler._ownership_cancel_pending = set()
+    scheduler._ownership_safe_releases = queue.SimpleQueue()
+    scheduler._kv_lease_duration = 45
     scheduler.peer_node_metas = {"P": NS(addr="10.0.0.2:5600")}
     scheduler._get_or_connect_peer = lambda rid: scheduler.peer_node_metas[rid]
     scheduler.get_sw_clipped_blocks = lambda blocks: blocks

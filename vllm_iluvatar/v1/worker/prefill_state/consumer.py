@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from .cache_rows import indexer_row_views, restore_indexer_row, main_boundary_sources
-from .configuration import PrefixGeometry, session_paths
+from .configuration import PrefixGeometry, prefix_transfer_config, session_paths
 from .decode_prefix import PrefixBuffers
 from .runtime import PrefixRuntime
 from .source_state import DTYPES, fetch_state, replay_layout
@@ -38,7 +38,7 @@ class ConsumerPrefixState(PrefixRuntime):
         self._p21_rank = ep.rank_in_group
         self._p21_dp = get_dp_group().rank_in_group
         self._p21_tp = get_tp_group().rank_in_group
-        self._p21_engine = self.vllm_config.kv_transfer_config.engine_id
+        self._p21_engine = prefix_transfer_config(self.vllm_config).engine_id
         self._p21_wire, self._p21_nonce = session_paths(self.vllm_config)
         self._p21_result = self._p21_wire / "decode"
         self._p21_lock = threading.Lock()

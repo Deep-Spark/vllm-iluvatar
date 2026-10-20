@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from .cache_rows import copy_indexer_row_to_host, main_boundary_sources
-from .configuration import PrefixGeometry, ProducerTopology, session_paths
+from .configuration import PrefixGeometry, ProducerTopology, prefix_transfer_config, session_paths
 from .runtime import PrefixRuntime
 from .source_state import replay_layout, request_dir
 
@@ -31,7 +31,7 @@ class ProducerPrefixState(PrefixRuntime):
         self.topology = ProducerTopology.from_config(self.vllm_config)
         self.geometry = PrefixGeometry.from_config(self.vllm_config)
         self._src_rank = self.topology.rank(self._src_pp, self._src_tp)
-        self._src_engine = self.vllm_config.kv_transfer_config.engine_id
+        self._src_engine = prefix_transfer_config(self.vllm_config).engine_id
         self._src_wire, self._src_nonce = session_paths(self.vllm_config)
         self._src_result = self._src_wire / "source"
         self._src_cap = self.vllm_config.scheduler_config.max_num_seqs

@@ -118,6 +118,9 @@ def transfer_slice(spec: "KVCacheSpec") -> slice | None:
 class NixlConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
+    # Shutdown and the endpoint loop may run before optional state is ready.
+    prefix_state: PrefixSchedulerState | None = None
+
     def __init__(
         self,
         vllm_config: "VllmConfig",

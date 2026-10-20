@@ -15,6 +15,61 @@ from pathlib import Path
 from typing import Any
 
 SESSION_KEY = "_ilu_prefix_state_session"
+_NIXL_CONNECTORS = ("OptNixlConnector", "IluNixlPushConnector")
+
+
+@dataclass(frozen=True)
+class _ChildTransfer:
+    """A view of one MultiConnector child, retaining its mutable extra config."""
+
+    kv_connector: str
+    kv_role: str
+    engine_id: str
+    kv_connector_extra_config: dict
+
+    def get_from_extra_config(self, key, default=None):
+        return self.kv_connector_extra_config.get(key, default)
+
+
+def prefix_transfer_config(config: Any) -> Any:
+    """Resolve the unique NIXL endpoint without changing sibling connectors.
+
+    The returned child shares its extra-config dictionary with the serialized
+    engine configuration. Initializing a session therefore reaches the native
+    MultiConnector child as well as the outer model worker.
+    """
+    transfer = getattr(config, "kv_transfer_config", None)
+    if transfer is None:
+        return None
+    if transfer.kv_connector in _NIXL_CONNECTORS:
+        return transfer
+    if transfer.kv_connector != "MultiConnector":
+        return None
+    matches = []
+
+    def visit(children, inherited_engine):
+        for child in children:
+            name = child.get("kv_connector")
+            engine = child.get("engine_id", inherited_engine)
+            if name in _NIXL_CONNECTORS:
+                matches.append(
+                    _ChildTransfer(
+                        name,
+                        child["kv_role"],
+                        engine,
+                        child.setdefault("kv_connector_extra_config", {}),
+                    )
+                )
+            elif name == "MultiConnector":
+                visit(
+                    child.get("kv_connector_extra_config", {}).get("connectors", ()),
+                    engine,
+                )
+
+    visit(transfer.kv_connector_extra_config.get("connectors", ()), transfer.engine_id)
+    if len(matches) > 1:
+        raise ValueError("Prefix-state reuse requires a unique NIXL connector")
+    return matches[0] if matches else None
 
 
 def text_config(config: Any) -> Any:
@@ -26,11 +81,8 @@ def text_config(config: Any) -> Any:
 
 
 def enabled(config: Any) -> bool:
-    transfer = getattr(config, "kv_transfer_config", None)
-    if transfer is None or transfer.kv_connector not in (
-        "OptNixlConnector",
-        "IluNixlPushConnector",
-    ):
+    transfer = prefix_transfer_config(config)
+    if transfer is None:
         return False
     selected = transfer.get_from_extra_config("enable_prefix_state_reuse", True)
     if type(selected) is not bool:
@@ -95,13 +147,16 @@ def initialize_config(config: Any) -> None:
             # and the connector, including when state reuse is disabled.
             os.environ["VLLM_PP_LAYER_PARTITION"] = ",".join(map(str, parts))
     if enabled(config):
+        transfer = prefix_transfer_config(config)
         transfer.kv_connector_extra_config.setdefault(SESSION_KEY, str(uuid.uuid4()))
 
 
 def session_paths(config: Any) -> tuple[Path, str]:
     import hashlib
 
-    transfer = config.kv_transfer_config
+    transfer = prefix_transfer_config(config)
+    if transfer is None:
+        raise RuntimeError("Prefix-state reuse has no NIXL endpoint")
     nonce = transfer.kv_connector_extra_config.get(SESSION_KEY)
     if not nonce:
         raise RuntimeError(
@@ -383,6 +438,10 @@ class PrefixGeometry:
                 }
             )
         if n % 2:
-            result.update({(kind, self.prefix_depth - 1): layout
-                           for kind, layout in self.main_tail_fields().items()})
+            result.update(
+                {
+                    (kind, self.prefix_depth - 1): layout
+                    for kind, layout in self.main_tail_fields().items()
+                }
+            )
         return result

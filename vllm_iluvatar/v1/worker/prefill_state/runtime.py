@@ -3,6 +3,24 @@
 from __future__ import annotations
 
 
+def attach_prefix_state(connector, state):
+    """Attach to the unique native NIXL child, including inside MultiConnector."""
+    endpoints = []
+
+    def visit(current):
+        children = getattr(current, "sub_connectors", None)
+        if children is not None:
+            for child in children:
+                visit(child)
+        elif callable(getattr(current, "attach_prefix_state", None)):
+            endpoints.append(current)
+
+    visit(connector)
+    if len(endpoints) != 1:
+        raise RuntimeError("Prefix state requires exactly one native NIXL endpoint")
+    endpoints[0].attach_prefix_state(state)
+
+
 class PrefixRuntime:
     def __init__(self, runner, model):
         self.model_runner = runner

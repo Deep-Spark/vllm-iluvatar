@@ -212,9 +212,10 @@ class IluWorker(Worker):
     def _initialize_prefix_cache(self) -> None:
         if getattr(self, "prefix_state", None) is not None:
             from vllm.distributed.kv_transfer import get_kv_transfer_group
+            from vllm_iluvatar.v1.worker.prefill_state.runtime import attach_prefix_state
 
             self.prefix_state.initialize_cache()
-            get_kv_transfer_group().attach_prefix_state(self.prefix_state)
+            attach_prefix_state(get_kv_transfer_group(), self.prefix_state)
 
     def _validate_compressed_kv_runner(self) -> None:
         import vllm.envs as envs

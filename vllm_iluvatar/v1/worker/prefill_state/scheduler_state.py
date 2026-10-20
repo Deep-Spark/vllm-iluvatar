@@ -12,7 +12,9 @@ import time
 
 import numpy as np
 
-from .configuration import PrefixGeometry, ProducerTopology, enabled, session_paths
+from .configuration import (
+    PrefixGeometry, ProducerTopology, enabled, prefix_transfer_config, session_paths,
+)
 from .source_state import StatePublisher, replay_layout, save
 
 
@@ -33,8 +35,8 @@ def selected_groups(cache_config, geometry):
 class PrefixSchedulerState:
     def __init__(self, config, cache_config):
         self.wire, self.nonce = session_paths(config)
-        self.engine_id = config.kv_transfer_config.engine_id
-        self.consumer = config.kv_transfer_config.kv_role == "kv_consumer"
+        self.engine_id = prefix_transfer_config(config).engine_id
+        self.consumer = prefix_transfer_config(config).kv_role == "kv_consumer"
         self.cache_config = cache_config
         self.geometry = PrefixGeometry.from_config(config)
         self.selected = selected_groups(cache_config, self.geometry)

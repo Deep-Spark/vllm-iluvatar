@@ -112,6 +112,8 @@ if TYPE_CHECKING:
     VLLM_ILU_VIT_ATTN_OPT_LEVEL: int = 0
     VLLM_ILU_VIT_ATTN_LAYER: str = ""
     VLLM_ILU_GDN_ATTN_BACKEND: bool = False
+    VLLM_ILU_CUDAGRAPH_ASYNC_REPLAY: bool = False
+    VLLM_ILU_COMPACT_RAGGED_GATHER: bool = False
     VLLM_ILU_DS4_PREFILL_OPT: bool = False
     VLLM_ILU_DS4_PREFILL_AS_DECODE: bool = True
     VLLM_ILU_DS4_C4A_FUSED_INDEXCOMPRESS: bool = False
@@ -236,6 +238,12 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
 
 
 _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
+    "VLLM_ILU_CUDAGRAPH_ASYNC_REPLAY": _bool_reader(
+        "VLLM_ILU_CUDAGRAPH_ASYNC_REPLAY", "0"
+    ),
+    "VLLM_ILU_COMPACT_RAGGED_GATHER": _bool_reader(
+        "VLLM_ILU_COMPACT_RAGGED_GATHER", "0"
+    ),
     "VLLM_ILU_DS41_COMPRESSED_KV_FORMAT": lambda: os.environ.get(
         "VLLM_ILU_DS41_COMPRESSED_KV_FORMAT", "none"
     ),

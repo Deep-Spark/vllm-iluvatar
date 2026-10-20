@@ -60,3 +60,19 @@ def test_replay_policy(
         assert torch.cuda.CUDAGraph is (new if expected == "on" else old)
         patch_async_cuda_graph._apply()
     assert torch.cuda.graphs.CUDAGraph is torch.cuda.CUDAGraph
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["VLLM_ILU_CUDAGRAPH_ASYNC_REPLAY", "VLLM_ILU_COMPACT_RAGGED_GATHER"],
+)
+def test_optimization_flags_are_registered_with_opt_in_defaults(monkeypatch, name):
+    from vllm_iluvatar import envs
+
+    reader = envs._ILU_CANONICAL_ONLY_ENV_VARS[name]
+    monkeypatch.delenv(name, raising=False)
+    assert reader() is False
+    monkeypatch.setenv(name, "1")
+    assert reader() is True
+    monkeypatch.setenv(name, "0")
+    assert reader() is False

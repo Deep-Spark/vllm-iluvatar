@@ -123,6 +123,7 @@ if TYPE_CHECKING:
     VLLM_ILU_DS4_CANDIDATE_FILTER: bool = True
     VLLM_ILU_DS4_MQA_QUANT_TYPE: str = ""
     VLLM_ILU_DS4_INDEXER_KV_DTYPE: str = "bf16"
+    VLLM_ILU_DS41_INDEXER_KV_LAYOUT: str = "legacy"
     VLLM_ILU_DS41_COMPRESSED_KV_FORMAT: str = "none"
     VLLM_ILU_FUSE_NORM_QUANT: bool = True
     VLLM_ILU_FUSE_MOE_W13: bool = True
@@ -258,6 +259,9 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ILU_DS41_COMPRESSED_KV_FORMAT": lambda: os.environ.get(
         "VLLM_ILU_DS41_COMPRESSED_KV_FORMAT", "none"
+    ),
+    "VLLM_ILU_DS41_INDEXER_KV_LAYOUT": lambda: os.environ.get(
+        "VLLM_ILU_DS41_INDEXER_KV_LAYOUT", "legacy"
     ),
     "VLLM_ILU_FLASH_ATTN_QUANT_TYPE": lambda: os.environ.get(
         "VLLM_ILU_FLASH_ATTN_QUANT_TYPE", ""
@@ -485,6 +489,9 @@ _ILU_GUARD_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_PATCH_VERBOSE": _bool_reader("VLLM_ILU_PATCH_VERBOSE", "0"),
     "VLLM_ILUVATAR_ENABLE_STARTUP_PATCH": _bool_reader(
         "VLLM_ILUVATAR_ENABLE_STARTUP_PATCH", "0"
+    ),
+    "VLLM_ILU_PP_CPU_OFFLOAD_REQUIRED": _bool_reader(
+        "VLLM_ILU_PP_CPU_OFFLOAD_REQUIRED", "0"
     ),
 }
 

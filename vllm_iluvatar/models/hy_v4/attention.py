@@ -73,7 +73,12 @@ from .topk_index_cache import HYV4TopkIndexCache
 
 logger = init_logger(__name__)
 
-_SPARSE_LAYER_TYPES = ("sparse_attention", "sparse", "deepseek_sparse_attention")
+_SPARSE_LAYER_TYPES = (
+    "sparse_attention",
+    "sparse",
+    "deepseek_sparse_attention",
+    "indexed_attention",
+)
 _WEIGHT_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 _HYV4_DSA_FP8_ROW_BYTES = 640
 _HYV4_DSA_FP8_E4M3_MAX = 448.0

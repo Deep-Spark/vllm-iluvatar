@@ -15,6 +15,7 @@ from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.opt_nixl.layer_mappin
 from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.opt_nixl.memory_registration import (
     MemoryRegistrationPlanner,
 )
+from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.opt_nixl.lifecycle import RequestTombstoneStore
 from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.opt_nixl.metadata import (
     TransferNotificationStatus,
 )
@@ -206,9 +207,11 @@ def test_peer_missing_scale_pointer_is_rejected_before_transfer():
 def receiver():
     worker = NixlConnectorWorker.__new__(NixlConnectorWorker)
     worker._recv_requests = {
-        "request": SimpleNamespace(engine_id="peer", local_block_ids=[[1, 2], [3]])
+        "request": SimpleNamespace(engine_id="peer", generation="generation", local_block_ids=[[1, 2], [3]])
     }
-    worker._recv_deadlines = {"request": 1}
+    worker._recv_generations = {"request": "generation"}
+    worker._recv_tombstones = RequestTombstoneStore(86400, 128)
+    worker._accepting_work = True
     worker._recv_notification_status = {}
     worker._aborted_recv_requests = set()
     worker.remote_sessions = {"peer": SimpleNamespace(pending_recv={"request"})}
@@ -236,43 +239,46 @@ def notification(layer):
 def test_partial_and_duplicate_notifications_never_publish_ready():
     worker, completions = receiver()
     worker._apply_recv_notification(
-        "request", TransferNotificationStatus.SUCCESS, notification(0)
+        "request", "generation", TransferNotificationStatus.SUCCESS, notification(0)
     )
     worker._apply_recv_notification(
-        "request", TransferNotificationStatus.SUCCESS, notification(0)
+        "request", "generation", TransferNotificationStatus.SUCCESS, notification(0)
     )
     assert completions == [] and "request" in worker._recv_requests
     worker._apply_recv_notification(
-        "request", TransferNotificationStatus.SUCCESS, notification(1)
+        "request", "generation", TransferNotificationStatus.SUCCESS, notification(1)
     )
     assert len(completions) == 1 and completions[0].failures == {}
     assert set(completions[0].recv_metadata) == {"request"}
     assert (
         worker._recv_requests
         == worker._recv_notification_status
-        == worker._recv_deadlines
+        == worker._recv_generations
         == {}
     )
     assert worker.remote_sessions["peer"].pending_recv == set()
 
 
-def test_failed_pair_never_becomes_a_success_receipt_after_late_notification():
+def test_failed_pair_is_retained_until_generation_is_fenced():
     worker, completions = receiver()
     worker._apply_recv_notification(
-        "request", TransferNotificationStatus.SUCCESS, notification(0)
+        "request", "generation", TransferNotificationStatus.SUCCESS, notification(0)
     )
     worker._apply_recv_notification(
-        "request", TransferNotificationStatus.FAILED, notification(1)
+        "request", "generation", TransferNotificationStatus.FAILED, notification(1)
     )
+    assert completions == [] and "request" in worker._recv_requests
+    # SDK forwards terminal producer proof in the generation-safe release map.
+    worker._apply_start_load({}, {}, {}, set(), {}, {"request": ("generation", "producer fenced")})
     worker._apply_recv_notification(
-        "request", TransferNotificationStatus.SUCCESS, notification(1)
+        "request", "generation", TransferNotificationStatus.SUCCESS, notification(1)
     )
     assert len(completions) == 1 and "request" in completions[0].failures
     assert completions[0].recv_metadata == {}
     assert (
         worker._recv_requests
         == worker._recv_notification_status
-        == worker._recv_deadlines
+        == worker._recv_generations
         == {}
     )
     assert worker.remote_sessions["peer"].pending_recv == set()

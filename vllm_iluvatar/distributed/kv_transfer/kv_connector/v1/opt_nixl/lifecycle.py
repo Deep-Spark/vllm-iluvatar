@@ -19,6 +19,10 @@ ReqId = str
 WorkerRole = Literal["producer", "consumer"]
 
 
+class NixlDrainIncomplete(RuntimeError):
+    """Native ownership remains live; retain buffers and allow shutdown retry."""
+
+
 class RemoteSessionState(Enum):
     CONNECTING = auto()
     ACTIVE = auto()

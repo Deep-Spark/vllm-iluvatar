@@ -68,6 +68,7 @@ from .host_kv_stub import (
 from .lifecycle import (
     CompletionBatch,
     LayerReadyBatch,
+    NixlDrainIncomplete,
     RequestOwnershipState,
     RequestTombstoneStore,
     RemoteEngineSession,
@@ -281,6 +282,7 @@ class NixlConnectorWorker:
         )
         # all local registered data
         self._registered_descs: list[Any] = []
+        self._registered_cache_owners: dict[int, torch.Tensor] = {}
         self.xfer_handshake_metadata: NixlHandshakePayload | None = None
         # infos about registered kv cache
         self.layer_ptr_mapping = defaultdict(list[int])
@@ -701,6 +703,11 @@ class NixlConnectorWorker:
     ) -> None:
         base_addr = registration.registration_base
         registration_nbytes = registration.registration_nbytes
+        # Native descriptors contain addresses, so they cannot retain either
+        # the payload or a private scale allocation by themselves.
+        if not hasattr(self, "_registered_cache_owners"):
+            self._registered_cache_owners = {}
+        self._registered_cache_owners[base_addr] = cache
         if base_addr in seen_base_addresses_check:
             # if exist, record the index for remote to get the correct data_ptr.
             current_index = seen_base_addresses_check[base_addr]
@@ -1731,11 +1738,13 @@ class NixlConnectorWorker:
             self._log_failure("remove_remote_agent_failed", None, error=e)
             return False
 
-    def _deregister_memory(self, desc: Any) -> None:
+    def _deregister_memory(self, desc: Any) -> bool:
         try:
             self.nixl_wrapper.deregister_memory(desc)
+            return True
         except Exception as e:
             self._log_failure("deregister_memory_failed", None, error=e)
+            return False
 
     def _session_accepts_request(
         self, req_id: ReqId, meta: ReqMeta, aborted: bool = False
@@ -2874,23 +2883,29 @@ class NixlConnectorWorker:
             loop = getattr(self, "_async_loop", None)
             worker_thread = getattr(self, "worker_thread", None)
             if loop is None or worker_thread is None or not worker_thread.is_alive():
+                if any(
+                    getattr(self, name, None)
+                    for name in ("_send_transfers", "_recv_requests", "_registered_descs")
+                ):
+                    raise NixlDrainIncomplete("Owner loop stopped with live registrations")
                 self._shutdown_complete = True
                 return
             if threading.current_thread() is worker_thread:
                 loop.create_task(self._shutdown_on_loop())
                 return
-            future = asyncio.run_coroutine_threadsafe(self._shutdown_on_loop(), loop)
+            future = getattr(self, "_shutdown_future", None)
+            if future is None or future.done():
+                future = asyncio.run_coroutine_threadsafe(self._shutdown_on_loop(), loop)
+                self._shutdown_future = future
             drain_bound = min(self.producer_disconnect_drain_timeout, 5.0)
             try:
                 future.result(timeout=max(1.0, drain_bound + 5.0))
             except Exception as e:
-                logger.error("NIXL uvloop shutdown did not complete cleanly: %s", e)
-                self.stop_event.set()
+                # A timeout does not cancel the live owner-loop drain.
+                raise NixlDrainIncomplete("NIXL shutdown is not quiescent") from e
             worker_thread.join(timeout=5.0)
             if worker_thread.is_alive():
-                logger.error(
-                    "NIXL uvloop thread did not exit; process teardown will reclaim it"
-                )
+                raise NixlDrainIncomplete("NIXL owner loop has not exited")
             self._shutdown_complete = True
 
     def _report_teardown(
@@ -3121,74 +3136,77 @@ class NixlConnectorWorker:
         self._cleanup_session_if_drained(session)
 
     async def _shutdown_on_loop(self) -> None:
-        if self._shutdown_started_on_loop:
-            return
-        self._shutdown_started_on_loop = True
-        try:
-            await self._drain_and_cleanup_on_loop()
-        except Exception as e:
-            self._log_failure("shutdown_cleanup_failed", None, error=e)
-        finally:
-            self.stop_event.set()
-            current = asyncio.current_task()
-            tasks = [task for task in self._loop_tasks if task is not current]
-            for task in tasks:
-                task.cancel()
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            self._loop_exit_event.set()
+        task = getattr(self, "_shutdown_task", None)
+        if task is None or task.done():
+            task = asyncio.create_task(self._drain_and_cleanup_on_loop())
+            self._shutdown_task = task
+        # Preserve the one live drain if the synchronous caller times out.
+        await asyncio.shield(task)
+        self.stop_event.set()
+        current = asyncio.current_task()
+        tasks = [item for item in self._loop_tasks if item is not current]
+        for item in tasks:
+            item.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._loop_exit_event.set()
 
     async def _drain_and_cleanup_on_loop(self) -> None:
         self._accepting_work = False
         for engine_id in list(self.remote_sessions):
             self._mark_engine_disconnected(engine_id)
+        for req_id in list(self._send_requests):
+            if req_id not in self._send_transfers:
+                self._finish_send(req_id, "worker shutdown before transfer")
 
         deadline = time.perf_counter() + min(
             self.producer_disconnect_drain_timeout, 5.0
         )
-        while self._send_transfers and time.perf_counter() < deadline:
+        while True:
             self._poll_send_transfers(include_unready=True)
+            # SDK generation-scoped teardown fences remote WRITEs before it
+            # releases a failed receive. Never bypass that proof on shutdown.
+            self._progress_sessions(time.perf_counter())
+            if not self._send_transfers and not self._recv_requests:
+                break
+            if time.perf_counter() >= deadline:
+                raise NixlDrainIncomplete("Native transfers still own registered pages")
             await asyncio.sleep(0.005)
 
-        for req_id in list(self._recv_requests):
-            self._fail_recv(req_id, "worker shutdown")
-        for req_id in list(self._send_requests):
-            if req_id not in self._send_transfers:
-                self._finish_send(req_id, "worker shutdown before transfer")
-        self._poll_send_transfers(include_unready=True)
-        self._progress_sessions(time.perf_counter())
+        for session in self.remote_sessions.values():
+            if session.state not in (
+                RemoteSessionState.CLOSED,
+                RemoteSessionState.DRAINING,
+                RemoteSessionState.STUCK,
+            ):
+                session.start_draining(time.perf_counter(), 0.0)
+            self._cleanup_session_if_drained(session)
 
-        has_proc = bool(self._send_transfers)
-        if has_proc:
-            logger.error(
-                "Shutdown retains %s request(s) with PROC NIXL handles; "
-                "dlist and registered memory release is deferred to process exit",
-                len(self._send_transfers),
-            )
-        else:
-            for session in self.remote_sessions.values():
-                if session.state not in (
-                    RemoteSessionState.CLOSED,
-                    RemoteSessionState.DRAINING,
-                    RemoteSessionState.STUCK,
-                ):
-                    session.start_draining(time.perf_counter(), 0.0)
-                self._cleanup_session_if_drained(session)
-            # Local source dlists may be shared across engine generations.
-            for handle in self.src_xfer_side_handles.values():
-                self._release_dlist_handle(handle)
-            self.src_xfer_side_handles.clear()
-            for handles in self.dst_xfer_side_handles.values():
-                for handle in handles:
-                    self._release_dlist_handle(handle)
-            self.dst_xfer_side_handles.clear()
-            for agents in self._remote_agents.values():
-                for agent_name in agents:
-                    self._remove_remote_agent(agent_name)
-            self._remote_agents.clear()
-            for desc in self._registered_descs:
-                self._deregister_memory(desc)
-            self._registered_descs.clear()
+        # Keep every failed native release in its registry so a retry does not
+        # forget ownership. Cache tensors outlive all registration descriptors.
+        for key, handle in list(self.src_xfer_side_handles.items()):
+            if self._release_dlist_handle(handle):
+                del self.src_xfer_side_handles[key]
+        for key, handles in list(self.dst_xfer_side_handles.items()):
+            remaining = [handle for handle in handles if not self._release_dlist_handle(handle)]
+            if remaining:
+                self.dst_xfer_side_handles[key] = remaining
+            else:
+                del self.dst_xfer_side_handles[key]
+        for key, agents in list(self._remote_agents.items()):
+            remaining = [agent for agent in agents if not self._remove_remote_agent(agent)]
+            if remaining:
+                self._remote_agents[key] = remaining
+            else:
+                del self._remote_agents[key]
+        if self.src_xfer_side_handles or self.dst_xfer_side_handles or self._remote_agents:
+            raise NixlDrainIncomplete("Native descriptors or peers remain registered")
+        self._registered_descs = [
+            desc for desc in self._registered_descs if not self._deregister_memory(desc)
+        ]
+        if self._registered_descs:
+            raise NixlDrainIncomplete("Native memory deregistration is incomplete")
+        getattr(self, "_registered_cache_owners", {}).clear()
 
     ############################################################
     # async loop for recv info from scheduler, run kv cache sending...

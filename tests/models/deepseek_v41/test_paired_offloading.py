@@ -1,5 +1,6 @@
 """Exercise shared planning and real strided payload/scale offload views."""
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -30,7 +31,7 @@ from vllm_iluvatar.models.deepseek_v41.offloading import (
 )
 
 
-def paired_cache(fmt, block_outer):
+def paired_cache(fmt, block_outer, device="cpu"):
     count, page = 3, 65536
     main = MLAAttentionSpec(
         block_size=fmt.rows_per_page(512) * 2,
@@ -77,7 +78,7 @@ def paired_cache(fmt, block_outer):
         ]
     ]
     config = KVCacheConfig(count, tensors, groups)
-    raw = torch.randint(0, 256, (count * page * 3,), dtype=torch.uint8)
+    raw = torch.randint(0, 256, (count * page * 3,), dtype=torch.uint8, device=device)
     context = {
         name: SimpleNamespace(
             compressed_kv_format=fmt if name.startswith("main") else None,
@@ -86,8 +87,8 @@ def paired_cache(fmt, block_outer):
         for name in ("main", "main_alias", "index", "swa")
     }
     states = (
-        CompressedKVState(plan_scale_layout(config, fmt), fmt, "cpu", context),
-        IndexerScaleState(plan_indexer_scales(config), "cpu", context),
+        CompressedKVState(plan_scale_layout(config, fmt), fmt, device, context),
+        IndexerScaleState(plan_indexer_scales(config), device, context),
     )
     caches = {}
     for names, offset in [(t.layers, t.offset) for t in tensors]:
@@ -144,5 +145,53 @@ def test_reject_scale_view_bound_to_the_wrong_manager_offset():
         with pytest.raises((AssertionError, ValueError), match="planned|page|^$"):
             canonical_paired_pages(config, caches, context)
     finally:
+        for state in reversed(states):
+            state.release()
+
+
+@pytest.mark.skipif(
+    os.getenv("KV_PAIRED_CPU_OFFLOAD_GPU_TESTS") != "1",
+    reason="Explicitly enable isolated GPU CPU-offload validation",
+)
+@pytest.mark.parametrize("fmt", [I4G32, I8G64])
+@pytest.mark.parametrize("block_outer", [False, True])
+def test_native_cpu_worker_restores_payload_and_scales_as_one_group(fmt, block_outer):
+    import vllm_iluvatar._C  # noqa: F401
+    from vllm.v1.kv_offload.base import GPULoadStoreSpec
+    from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+    from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+
+    config, caches, context, states = paired_cache(fmt, block_outer, "cuda")
+    worker = None
+    try:
+        canonical = canonical_paired_pages(config, caches, context)
+        for tensor in canonical.tensors:
+            tensor.tensor[1].random_(-128, 127)
+        expected = [tensor.tensor[1].clone() for tensor in canonical.tensors]
+        untouched = [tensor.tensor[0].clone() for tensor in canonical.tensors]
+        worker = CPUOffloadingWorker(canonical, blocks_per_chunk=1, num_cpu_chunks=2)
+        groups = len(canonical.group_data_refs)
+        src = GPULoadStoreSpec([1] * groups, [1] * groups, [1] * groups)
+        cpu = CPULoadStoreSpec([0] * groups)
+        assert worker.submit_store(101, src, cpu)
+        worker.wait({101})
+        stored = worker.get_finished()
+        assert len(stored) == 1 and stored[0].success
+        assert stored[0].transfer_size == plan_offload_layout(config).bytes_per_block
+        for tensor in canonical.tensors:
+            tensor.tensor[2].zero_()
+        dst = GPULoadStoreSpec([2] * groups, [1] * groups, [1] * groups)
+        assert worker.submit_load(102, cpu, dst)
+        worker.wait({102})
+        loaded = worker.get_finished()
+        assert len(loaded) == 1 and loaded[0].success
+        assert loaded[0].transfer_size == stored[0].transfer_size
+        torch.cuda.synchronize()
+        for tensor, restored, canary in zip(canonical.tensors, expected, untouched):
+            assert torch.equal(tensor.tensor[2], restored)
+            assert torch.equal(tensor.tensor[0], canary)
+    finally:
+        if worker is not None:
+            worker.shutdown()
         for state in reversed(states):
             state.release()

@@ -39,12 +39,12 @@ def test_split_key_publication_matches_original_production_quantizer(
     split_mirror = legacy_mirror.clone()
     torch.ops._C.v41_indexer_k_norm_rope_store(
         keys,
-        positions,
+        positions.to(torch.int64),
         cos_sin,
         weight,
         1e-6,
         packed,
-        slots,
+        slots.to(torch.int64),
         ratio,
         "int8",
         legacy_mirror,

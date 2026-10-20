@@ -20,6 +20,7 @@ _ORIGINAL_GET_CONFIGS = None
 _ORIGINAL_BUILD_CONFIG = None
 _ORIGINAL_SPEC_INIT = None
 _ORIGINAL_CREATE_WORKER = None
+_ORIGINAL_REGISTER_KV = None
 _REQUIRED_ENV = "VLLM_ILU_PP_CPU_OFFLOAD_REQUIRED"
 _REVIEWED_PARTITIONS = {
     (4, 2, 8): (5, 5, 5, 25),
@@ -68,6 +69,9 @@ def attest_required_bindings() -> None:
 
     from vllm.distributed.kv_transfer.kv_connector.v1 import offloading_connector
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading import config
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
+        OffloadingConnectorWorker,
+    )
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
         OffloadingConnector,
     )
@@ -83,6 +87,8 @@ def attest_required_bindings() -> None:
         "spec_init": CPUOffloadingSpec.__init__ is _ilu_cpu_offloading_spec_init,
         "spec_worker": CPUOffloadingSpec.create_worker
         is _ilu_create_cpu_offloading_worker,
+        "paired_registration": OffloadingConnectorWorker.register_kv_caches
+        is _ilu_register_kv_caches,
         "handshake": (
             OffloadingConnector.set_xfer_handshake_metadata_pp_aware
             is _ilu_offloading_set_xfer_handshake_metadata_pp_aware
@@ -119,6 +125,13 @@ def attest_required_bindings() -> None:
 
 
 def _worker_bytes_per_block(config) -> int:
+    from vllm_iluvatar.models.deepseek_v41.offloading import (
+        has_paired_pages,
+        plan_offload_layout,
+    )
+
+    if has_paired_pages(config):
+        return plan_offload_layout(config).bytes_per_block
     if config.num_blocks <= 0 or not config.kv_cache_tensors:
         raise ValueError("PP CPU offload requires an allocated GPU KV cache.")
     total_sizes = {tensor.size for tensor in config.kv_cache_tensors}
@@ -134,6 +147,19 @@ def _worker_bytes_per_block(config) -> int:
             f"num_blocks={config.num_blocks}."
         )
     return total_size // config.num_blocks
+
+
+def _ilu_register_kv_caches(self, kv_caches):
+    from vllm_iluvatar.models.deepseek_v41.offloading import (
+        canonical_paired_pages,
+        has_paired_pages,
+    )
+
+    if not has_paired_pages(self.kv_cache_config):
+        assert _ORIGINAL_REGISTER_KV is not None
+        return _ORIGINAL_REGISTER_KV(self, kv_caches)
+    context = self.vllm_config.compilation_config.static_forward_context
+    self._init_worker(canonical_paired_pages(self.kv_cache_config, kv_caches, context))
 
 
 def _validate_target_geometry(vllm_config, geometry: tuple[int, ...]) -> None:
@@ -369,11 +395,15 @@ def _bind_offloading_handshake_noop() -> None:
 def _apply() -> None:
     from vllm.distributed.kv_transfer.kv_connector.v1 import offloading_connector
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading import config
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
+        OffloadingConnectorWorker,
+    )
     from vllm.v1.core import kv_cache_utils
     from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 
     global _ORIGINAL_GET_CONFIGS, _ORIGINAL_BUILD_CONFIG
     global _ORIGINAL_SPEC_INIT, _ORIGINAL_CREATE_WORKER
+    global _ORIGINAL_REGISTER_KV
 
     current_get_configs = kv_cache_utils.get_kv_cache_configs
     if current_get_configs is not _ilu_get_kv_cache_configs:
@@ -407,5 +437,10 @@ def _apply() -> None:
     if current_create is not _ilu_create_cpu_offloading_worker:
         _ORIGINAL_CREATE_WORKER = current_create
     CPUOffloadingSpec.create_worker = _ilu_create_cpu_offloading_worker
+
+    current_register = OffloadingConnectorWorker.register_kv_caches
+    if current_register is not _ilu_register_kv_caches:
+        _ORIGINAL_REGISTER_KV = current_register
+    OffloadingConnectorWorker.register_kv_caches = _ilu_register_kv_caches
 
     _bind_offloading_handshake_noop()

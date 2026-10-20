@@ -99,6 +99,15 @@ def _stub_gpu_worker(monkeypatch):
     monkeypatch.delitem(
         sys.modules, "vllm_iluvatar.v1.worker.gpu_worker", raising=False
     )
+    # This fixture isolates the worker lifecycle from physical cache planning;
+    # paired allocator geometry is covered by the real cache configuration tests.
+    from vllm_iluvatar.models.deepseek_v41 import indexer_kv
+
+    monkeypatch.setattr(
+        indexer_kv,
+        "plan_indexer_scales",
+        lambda _config: indexer_kv.IndexerScaleLayout(0, 0, {}),
+    )
 
     yield gpu_worker_mod
 
@@ -231,7 +240,9 @@ def test_new_format_profiles_total_budget_without_replacing_v2_class(
 
     page_count = payload // 65536
     layout = SimpleNamespace(
-        payload_bytes=payload, scale_bytes=page_count * budget.scale_page_bytes
+        payload_bytes=payload,
+        scale_bytes=page_count * budget.scale_page_bytes,
+        num_blocks=page_count,
     )
     monkeypatch.setattr(compressed_kv, "plan_scale_layout", lambda *args: layout)
     monkeypatch.setattr(compressed_kv, "CompressedKVState", State)
@@ -546,7 +557,7 @@ def test_shutdown_check_failure_does_not_block_cleanup():
     assert worker.base_calls == ["shutdown"]
 
 
-def test_parent_shutdown_failure_still_frees_checker():
+def test_parent_shutdown_failure_retains_owners_until_retry():
     model_runner = type("ModelRunner", (), {})()
     worker = _make_worker(model_runner)
     checker = _FakeChecker()
@@ -559,9 +570,14 @@ def test_parent_shutdown_failure_still_frees_checker():
     with pytest.raises(RuntimeError, match="parent shutdown failed"):
         worker.shutdown()
 
-    assert checker.calls == ["check_shutdown", "free"]
-    assert monitor.calls == ["check", "free"]
+    assert checker.calls == ["check_shutdown"]
+    assert monitor.calls == ["check"]
     assert worker.base_calls == ["shutdown"]
+    worker.base_shutdown_error = None
+    worker.shutdown()
+    assert checker.calls == ["check_shutdown", "check_shutdown", "free"]
+    assert monitor.calls == ["check", "check", "free"]
+    assert worker.base_calls == ["shutdown", "shutdown"]
 
 
 def test_native_prefix_context_observes_batch_and_releases_after_execution():

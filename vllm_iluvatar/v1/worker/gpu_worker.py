@@ -266,6 +266,14 @@ class IluWorker(Worker):
         index_state = getattr(self, "_indexer_kv_state", None)
         index_bytes = index_state.layout.nbytes if index_state is not None else 0
         budget.validate(layout.payload_bytes, layout.scale_bytes + index_bytes)
+        logger.info(
+            "Compressed KV allocation: payload=%d main_scales=%d "
+            "index_scales=%d blocks=%d",
+            layout.payload_bytes,
+            layout.scale_bytes,
+            index_bytes,
+            layout.num_blocks,
+        )
         context = self.vllm_config.compilation_config.static_forward_context
         self._compressed_kv_init_attempted = True
         with self._maybe_get_memory_pool_context(tag="kv_cache"):

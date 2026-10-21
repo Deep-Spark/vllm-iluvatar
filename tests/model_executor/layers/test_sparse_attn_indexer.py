@@ -49,9 +49,9 @@ def test_int8_query_scores_with_ixinfer(monkeypatch):
         raise AssertionError("int8 query must not use the fp8 logits kernel")
 
     monkeypatch.setattr(
-        sparse_attn_indexer.ixfops, "dsa_indexer_mqa_logits", ixinfer
+        sparse_attn_indexer.ixfops, "dsa_indexer_mqa_logits_with_kvcache", ixinfer
     )
-    sparse_attn_indexer.ixfops.dsa_indexer_mqa_logits_with_blocks_fp8 = fp8
+    sparse_attn_indexer.ixfops.dsa_indexer_mqa_logits_with_kvcache_fp8 = fp8
 
     q = torch.empty((2, 64, 128), dtype=torch.int8)
     kv_cache = torch.empty((1, 64, 132), dtype=torch.uint8)

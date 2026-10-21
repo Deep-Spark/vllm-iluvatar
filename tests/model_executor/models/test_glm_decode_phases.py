@@ -7,7 +7,15 @@ import ixformer.inference.functions as F
 import pytest
 import torch
 
+from vllm_iluvatar.ilu_util import arch
 from vllm_iluvatar.models.glm_moe_dsa import attention as mod
+
+# 这组用例走真实 packed sparse MLA / Marlin，仅支持 ivcore30（CQ 机器）。
+# 在 ivcore11 机器上跳过，避免全量回归时以硬断言形式红掉。
+pytestmark = pytest.mark.skipif(
+    not arch.is_ivcore30(),
+    reason="requires ivcore30 (CQ); glm DSA real-backend suite",
+)
 
 
 def make_attention(enabled, trig, tokens, vup_weights, heads=32):
@@ -195,7 +203,7 @@ def test_real_sparse_backend_prepare_ab_and_graph(
         return native_sparse(*args, **kwargs)
 
     monkeypatch.setattr(F, "glm_dsa_prepare", checked_prepare)
-    monkeypatch.setattr(F, "dsa_flash_mla_with_fp8_kvcache", checked_sparse)
+    monkeypatch.setattr(F, "dsa_flash_mla_sparse_with_fp8_kvcache_diff_kv", checked_sparse)
     q = torch.randn(capacity, heads, 256, generator=rng).bfloat16().cuda()
     kv = torch.randn(capacity, 576, generator=rng).bfloat16().cuda()
     q_f, kv_f = q.clone(), kv.clone()

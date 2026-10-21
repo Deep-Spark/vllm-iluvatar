@@ -176,7 +176,7 @@ def _fuse_q_a_norm_quant(
         return None
     global _Q_A_NORM_QUANT_FAILED
     try:
-        q_int8, _, _, scales = ixf_ops.residual_rms_norm_with_quant(
+        q_int8, _, _, scales = ixf_ops.residual_rmsnorm_with_quant(
             q_c,
             attn.q_a_layernorm.weight,
             eps=attn.q_a_layernorm.variance_epsilon,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 
 import torch
-from ixformer.inference.functions import deepseekv41 as ixfops
+from ixformer.inference.functions.models import deepseek_v41 as ixfops
 
 _FREQS_CIS_CACHE: dict[tuple, torch.Tensor] = {}
 _COS_SIN_CACHE: dict[tuple, torch.Tensor] = {}

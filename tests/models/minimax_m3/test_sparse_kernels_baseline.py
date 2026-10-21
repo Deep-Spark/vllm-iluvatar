@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import ixformer.inference.functions as ixf
 import torch
-from ixformer.inference.functions.minimax_m3.indexer import SPARSE_BLOCK_SIZE
+from ixformer.inference.functions.models.minimax_m3.indexer.float.indexer import SPARSE_BLOCK_SIZE
 
 
 def test_index_score_topk_and_sparse_attn_shapes():
@@ -49,13 +49,9 @@ def test_index_score_topk_and_sparse_attn_shapes():
 
     n_q = 4
     q = torch.randn(q_len, n_q, head_dim)
-    # >>> ILU MODIFICATION >>>
-    # ixformer's torch backend (_load_kv) consumes the 4-D packed NHD
-    # [pages, Hkv, block, 2*D] layout (K=[...,:D], V=[...,D:]); the legacy
-    # 5-D [pages, 2, block, Hkv, D] layout is only valid for the native C++
-    # backends which remap strides internally.
-    # <<< ILU MODIFICATION <<<
-    kv = torch.randn(2, n_heads, blk, 2 * head_dim)
+    # ixformer 3817cf75: torch 后端 _load_kv 恢复标准 5-D 分页布局
+    # [pages, 2, block, Hkv, D]（v0.30.0 的 4-D packed 布局不再支持）。
+    kv = torch.randn(2, 2, blk, n_heads, head_dim)
     out = torch.zeros_like(q)
     ixf.minimax_m3_sparse_attn(
         q,
@@ -101,11 +97,8 @@ def test_decode_path():
     assert topk.shape == (1, n_heads, 2)
 
     q = torch.randn(1, 4, head_dim)
-    # >>> ILU MODIFICATION >>>
-    # 4-D packed NHD [pages, Hkv, block, 2*D] (K=[...,:D], V=[...,D:]) for the
-    # torch backend; the 5-D layout is native-only.
-    # <<< ILU MODIFICATION <<<
-    kv = torch.randn(2, n_heads, blk, 2 * head_dim)
+    # ixformer 3817cf75: 恢复标准 5-D 分页布局 [pages, 2, block, Hkv, D]。
+    kv = torch.randn(2, 2, blk, n_heads, head_dim)
     out = torch.zeros_like(q)
     ixf.minimax_m3_sparse_attn_decode(
         q,

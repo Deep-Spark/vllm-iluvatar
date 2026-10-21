@@ -135,7 +135,7 @@ def _install_fake_ixformer(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     def fake_quant_q(x):
         return x, torch.ones((), dtype=torch.float32, device=x.device)
 
-    def fake_ixinfer_flash_attn_unpad_int8_vf16(
+    def fake_flash_attn_unpad_int8_vf16(
         q,
         k,
         v,
@@ -152,9 +152,9 @@ def _install_fake_ixformer(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
 
     vllm_flash_attn.flash_attn_varlen_func = fake_flash_attn_varlen_func
     sageattention.sageattn_allint8 = fake_sageattn_allint8
-    sageattention.ixinfer_flash_attn_unpad_int8_vf16 = (
-        fake_ixinfer_flash_attn_unpad_int8_vf16
-    )
+    # ixformer 3817cf75: ixinfer_flash_attn_unpad_int8_vf16 改名
+    # flash_attn_unpad_int8_vf16（mm_encoder_attention.py 同步）。
+    sageattention.flash_attn_unpad_int8_vf16 = fake_flash_attn_unpad_int8_vf16
     sageattention_core.quant_q = fake_quant_q
 
     monkeypatch.setitem(sys.modules, "ixformer", ixformer)

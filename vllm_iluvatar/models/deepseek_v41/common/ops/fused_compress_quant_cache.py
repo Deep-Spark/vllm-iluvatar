@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import torch
 
-from ixformer.inference.functions import deepseekv41 as ixfops
+from ixformer.inference.functions.models import deepseek_v41 as ixfops
 
 
 def fused_save_compress_norm(
@@ -82,7 +82,7 @@ def fused_save_compress_norm(
     if compress_ratio == 1:
         # Ratio 1 pools nothing and carries no state, so the latent is just the
         # normalized row.
-        ixfops.dsv41_compress_norm_cr1(
+        ixfops.v41_compress_norm_cr1(
             kv_score,
             slot_mapping,
             rms_norm_weight,
@@ -93,7 +93,7 @@ def fused_save_compress_norm(
 
     assert state_cache is not None and token_to_req_indices is not None
     assert query_start_loc is not None
-    ixfops.dsv41_compress_pool_norm(
+    ixfops.v41_compress_pool_norm(
         kv_score,
         positions,
         state_cache,
@@ -133,7 +133,7 @@ def rope_quant_insert(
     """
     if slot_mapping.numel() == 0:
         return
-    ixfops.dsv41_rope_insert(
+    ixfops.v41_rope_insert(
         latent,
         positions,
         cos_sin_cache,
@@ -159,6 +159,6 @@ def move_rows_to_paged_cache(
     """
     if slot_mapping.numel() == 0:
         return
-    ixfops.dsv41_move_rows_to_paged_cache(
+    ixfops.v41_move_rows_to_paged_cache(
         rows, kv_cache, slot_mapping, positions, compress_ratio
     )

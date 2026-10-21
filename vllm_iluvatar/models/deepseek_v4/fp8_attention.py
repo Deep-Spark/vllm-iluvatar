@@ -188,7 +188,7 @@ class IluDeepseekV4Fp8IndexerCompressor(IluDeepseekCompressor):
 
         state_cache = self.state_cache.kv_cache
 
-        ixfops.ds4_compressor_save_partial_states(
+        ixfops.save_partial_states(
             kv=kv,
             score=score,
             ape=self.ape,
@@ -313,7 +313,7 @@ class IluDeepseekV4Fp8Indexer(nn.Module):
         weights_in, _ = self.weights_proj(hidden_states)
         # Fused forward-RoPE + per-(token,head) ue8m0 fp8 quant (q_scale folded
         # into weights).
-        q_fp8, weights = ixfops.ds4_fused_indexer_q_rope_fp8_quant(
+        q_fp8, weights = ixfops.fused_indexer_q_rope_quant(
             q,
             positions,
             rotary_emb.cos_sin_cache,
@@ -371,7 +371,7 @@ class IluDeepseekV4Fp8Indexer(nn.Module):
                     if topk_buffer_is_read:
                         topk_buffer[chunk.token_start : chunk.token_end].fill_(-1)
                     continue
-                logits = ixfops.dsa_indexer_mqa_logits_with_blocks_fp8(
+                logits = ixfops.dsa_indexer_mqa_logits_with_kvcache_fp8(
                     q_fp8[chunk.token_start : chunk.token_end],
                     chunk.cu_seqlens_q,
                     chunk.cu_seq_lens,
@@ -398,7 +398,7 @@ class IluDeepseekV4Fp8Indexer(nn.Module):
             if decode_md.max_context_len == 0:
                 topk_buffer[:num_decode_tokens].fill_(-1)
                 return topk_buffer
-            logits = ixfops.dsa_indexer_mqa_logits_with_blocks_fp8(
+            logits = ixfops.dsa_indexer_mqa_logits_with_kvcache_fp8(
                 q_fp8[:num_decode_tokens],
                 decode_md.cu_seqlens_q,
                 decode_md.cu_seqlens_kv,
@@ -867,7 +867,7 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
         if self.compress_ratio == 4:
             assert self.topk_indices_buffer is not None
             block_size = attn_metadata.block_size // self.compress_ratio
-            global_indices, topk_lens = ixfops.ds4_compute_global_topk_indices_and_lens(
+            global_indices, topk_lens = ixfops.compute_global_topk_indices_and_lens(
                 self.topk_indices_buffer[:num_actual],
                 token_to_req,
                 attn_metadata.block_table,
@@ -912,7 +912,7 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
         with the load-time per-channel fp8 weight into ``z`` [T, G, D] bf16.
         """
         self._require_bmm_weights()
-        a, as_scale = ixfops.ds4_inv_rope_fp8_quant(
+        a, as_scale = ixfops.fused_inv_rope_fp8_quant(
             o,
             positions,
             self.rotary_emb.cos_sin_cache,
@@ -952,7 +952,7 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
         swa_kv_cache = self.swa_cache_layer.kv_cache
         # 3D uint8 cache passed directly: the fp8 insert kernel uses stride(0)
         # and must not flatten padded (non-contiguous) blocks.
-        ixfops.ds4_fused_qnorm_rope_fp8_kv_insert(
+        ixfops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
             q,
             kv,
             swa_kv_cache,

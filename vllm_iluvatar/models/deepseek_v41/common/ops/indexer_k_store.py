@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import torch
 
-from ixformer.inference.functions import deepseekv41 as ixfops
+from ixformer.inference.functions.models import deepseek_v41 as ixfops
 
 _RECORDS = ("bf16", "fp8", "int8")
 
@@ -77,7 +77,7 @@ def indexer_k_norm_rope_store(
     if num_tokens == 0:
         return
 
-    ixfops.dsv41_indexer_k_norm_rope_store(
+    ixfops.v41_indexer_k_norm_rope_store(
         k_pre,
         positions,
         cos_sin_cache,

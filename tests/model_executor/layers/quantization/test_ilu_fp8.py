@@ -285,12 +285,16 @@ def test_preprocess_pads_k_to_ixmm_group_boundary(monkeypatch):
         _pack_nibbles_ix30=lambda x: x[:, ::2, :],
         preprocess_group_scale_for_running_acc=lambda x: x,
     )
-    fp4_module = types.ModuleType("ixformer.inference.functions.fp4")
-    gemm_module = types.ModuleType("ixformer.inference.functions.fp4.gemm")
+    # ixformer 3817cf75: fp4 gemm 从 functions.fp4.gemm 移到
+    # functions.ops.gemm.fp4.gemm（ilu_fp8.py 按新路径懒加载）。
+    fp4_module = types.ModuleType("ixformer.inference.functions.ops.gemm.fp4")
+    gemm_module = types.ModuleType("ixformer.inference.functions.ops.gemm.fp4.gemm")
     gemm_module.gemm = fake_gemm
-    monkeypatch.setitem(sys.modules, "ixformer.inference.functions.fp4", fp4_module)
     monkeypatch.setitem(
-        sys.modules, "ixformer.inference.functions.fp4.gemm", gemm_module
+        sys.modules, "ixformer.inference.functions.ops.gemm.fp4", fp4_module
+    )
+    monkeypatch.setitem(
+        sys.modules, "ixformer.inference.functions.ops.gemm.fp4.gemm", gemm_module
     )
 
     weight = torch.ones((1, 2, 640), dtype=torch.float32)

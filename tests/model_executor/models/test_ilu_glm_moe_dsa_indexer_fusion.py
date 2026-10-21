@@ -212,7 +212,7 @@ def _compare_paths(monkeypatch, mode, short_slots, device, graph):
         records.append((q.clone(), weights.clone(), cache.clone()))
         return torch.zeros(q.shape[0], 16, device=device)
 
-    monkeypatch.setattr(sparse.ixfops, "dsa_indexer_mqa_logits", logits)
+    monkeypatch.setattr(sparse.ixfops, "dsa_indexer_mqa_logits_with_kvcache", logits)
     monkeypatch.setattr(
         sparse.ixfops,
         "dsa_update_topk_indices",

@@ -10,7 +10,11 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import ixformer.inference.functions as ixfshared
 import torch
-from ixformer.inference.functions import deepseekv41 as ixfops
+from ixformer.inference.functions.models import deepseek_v41 as ixfops
+from ixformer.inference.functions import (
+    flash_mla_sparse_fwd,
+    flash_mla_sparse_with_kvcache,
+)
 from torch import nn
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -630,7 +634,7 @@ class IluDeepseekV41Indexer(nn.Module):
             # which the FP8 scoring kernel wants as fp32.
             q_fp8 = self.q_fp8_buffer[: q.shape[0]]
             folded_weights = self.weights_fp32_buffer[: q.shape[0]]
-            ixfops.dsv41_indexer_q_rope_fp8_out(
+            ixfops.v41_indexer_q_rope_fp8_out(
                 q,
                 positions,
                 rotary_emb.cos_sin_cache,
@@ -658,7 +662,7 @@ class IluDeepseekV41Indexer(nn.Module):
             )
             return q_int8, None, folded_weights
         # In-place: q is rotated, weights are rescaled.
-        ixfops.dsv41_indexer_q_rope(
+        ixfops.v41_indexer_q_rope(
             q,
             positions,
             rotary_emb.cos_sin_cache,
@@ -1389,7 +1393,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         insert = (
             ixfops.dsv41_qkv_rope_packed_fp8_insert
             if self.kv_cache_dtype == "fp8_ds_mla"
-            else ixfops.dsv41_qkv_rope_insert
+            else ixfops.v41_qkv_rope_insert
         )
         insert(
             q,
@@ -1690,7 +1694,10 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 output,
             )
             return
-        ixfops.dsv41_mla_with_kvcache(
+        # ixformer 3817cf75: dsv41_mla_with_kvcache 与 ds4 的 decode 稀疏 MLA
+        # 统一为 ops 层的 flash_mla_sparse_with_kvcache（签名逐参一致）。
+        # 原 ixformer_native 后端已并入 ixformer_perf（同为手写 CUDA 路径）。
+        flash_mla_sparse_with_kvcache(
             q=q.unsqueeze(1),
             k_cache=self.swa_cache_layer.kv_cache.unsqueeze(-2),
             indices=_batched_index_rows(swa_indices),
@@ -1704,9 +1711,9 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             extra_topk_length=extra_lens,
             output=output.unsqueeze(1),
             # The ixinfer backend rejects the mixed prefill/decode warmup used
-            # by the BF16 service. The native backend supports this contract
-            # and is covered against the torch reference.
-            backend="ixformer_native",
+            # by the BF16 service. The perf (hand-written CUDA) backend supports
+            # this contract and is covered against the torch reference.
+            backend="ixformer_perf",
         )
 
     def _tile_window(self, indices):
@@ -2075,7 +2082,10 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 ],
             )
 
-            ixfops.dsv41_sparse_mla_prefill(
+            # ixformer 3817cf75: dsv41_sparse_mla_prefill → ops 层
+            # flash_mla_sparse_fwd（kwargs 全兼容；return_lse 移为纯 kwarg，
+            # 本处未用）。
+            flash_mla_sparse_fwd(
                 q=q[query_start:query_end],
                 kv=kv.view(-1, 1, q.shape[-1]),
                 indices=combined_indices.unsqueeze(1),

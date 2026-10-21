@@ -9,7 +9,7 @@ import os
 import ixformer.inference.functions as ixfshared
 import numpy as np
 import torch
-from ixformer.inference.functions import deepseekv41 as ixfops
+from ixformer.inference.functions.models import deepseek_v41 as ixfops
 from torch import nn
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import get_current_vllm_config

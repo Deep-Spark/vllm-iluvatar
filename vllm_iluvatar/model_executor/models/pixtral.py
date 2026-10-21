@@ -58,7 +58,7 @@ class Attention(_Attention):
 
         q = q.reshape(batch * patches, self.n_heads, self.head_dim)
         k = k.reshape(batch * patches, self.n_heads, self.head_dim)
-        out = ixf.ixinfer_flash_attn_unpad(
+        out = ixf.flash_attn_unpad(
             q,
             k,
             v,

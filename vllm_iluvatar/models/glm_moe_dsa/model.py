@@ -128,7 +128,7 @@ def _residual_rms_norm_with_quant(
     try:
         import ixformer.inference.functions as ixf_ops
 
-        return ixf_ops.residual_rms_norm_with_quant(
+        return ixf_ops.residual_rmsnorm_with_quant(
             hidden_states,
             weight,
             residual=residual,

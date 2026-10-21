@@ -339,7 +339,7 @@ class _HcPreNormFusion:
 #
 # `IluDeepseekV4MLP` is byte-identical to upstream. The model-output multi-head
 # fusion (originally `hc_head` eager PyTorch) is replaced by the fused
-# ixformer kernel `ixfops.ds4_hc_head` at the call site.
+# ixformer kernel `ixfops.hc_head` at the call site.
 
 
 class IluDeepseekV4MLP(nn.Module):
@@ -831,7 +831,7 @@ class IluDeepseekV4DecoderLayer(nn.Module):
         elif _DS4_MHC_PRE_VERSION == "v2":
             mhc_pre = ixfops.ds4_mhc_pre_v2
         else:
-            mhc_pre = ixfops.ds4_mhc_pre
+            mhc_pre = ixfops.mhc_pre
         post_mix, comb_mix, layer_input = mhc_pre(
             residual=x,
             fn=hc_fn,
@@ -909,7 +909,7 @@ class IluDeepseekV4DecoderLayer(nn.Module):
                 out,
                 group=get_tp_group().device_group,
             )
-        return ixfops.ds4_mhc_post(x, residual, post, comb)
+        return ixfops.mhc_post(x, residual, post, comb)
 
     def forward(
         self,
@@ -1166,7 +1166,7 @@ class IluDeepseekV4Model(nn.Module):
         num_tokens = hidden_states.shape[0]
         self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
-        hidden_states = ixfops.ds4_hc_head(
+        hidden_states = ixfops.hc_head(
             hidden_states,
             self.hc_head_fn,
             self.hc_head_scale,

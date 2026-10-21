@@ -10,12 +10,7 @@ import torch
 from ixformer.inference.functions.models.qwen3_next import (
     qwen_qsa_kv_store,
     qwen_qsa_qk_norm_rope_gate,
-)
-from ixformer.inference.functions.models.qwen3_next import (
-    qwen_qsa_sparse_paged_fmha as qwen_qsa_sparse_paged_fmha_decode,
-)
-from ixformer.inference.functions.models.qwen3_next import (
-    qwen_qsa_sparse_paged_fmha as qwen_qsa_sparse_paged_fmha_prefill,
+    qwen_qsa_sparse_paged_fmha,
 )
 from torch import nn
 from vllm.config import VllmConfig
@@ -199,13 +194,10 @@ class Qwen4ExpQSAIxformerImpl(FlashAttentionImpl):
             raise NotImplementedError("Qwen4Exp QSA requires BF16 Q/K/V")
 
         # One token per request means decode-shaped work: neighbouring queries
-        # belong to different requests and cannot share a K/V gather.
-        sparse_fmha = (
-            qwen_qsa_sparse_paged_fmha_decode
-            if num_tokens == num_reqs
-            else qwen_qsa_sparse_paged_fmha_prefill
-        )
-        sparse_fmha(
+        # belong to different requests and cannot share a K/V gather. The
+        # unified kernel reads prefill-vs-decode off ``token_to_req`` itself
+        # (the two registry entries were one op wearing two names).
+        qwen_qsa_sparse_paged_fmha(
             query[:num_tokens],
             key_cache,
             value_cache,

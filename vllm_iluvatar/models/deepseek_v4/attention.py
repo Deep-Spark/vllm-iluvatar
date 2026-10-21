@@ -41,6 +41,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import ixformer.inference.functions as ixfops
+from ixformer.inference.functions.models import deepseek_v4 as d4ops
 import torch
 import torch.nn as nn
 import vllm.envs as envs
@@ -234,9 +235,9 @@ class IluDeepseekCompressor(DeepseekCompressor):
     ``ixfops`` equivalents:
 
     - ``_save_partial_states_kernel`` →
-      ``ixfops.ds4_compressor_save_partial_states``
+      ``ixfops.save_partial_states``
     - ``_fused_kv_compress_norm_rope_insert_*`` →
-      ``ixfops.ds4_compressor_pool_norm_rope_insert``
+      ``ixfops.compress_norm_rope_store``
 
     The rationale is twofold:
 
@@ -390,7 +391,7 @@ class IluDeepseekCompressor(DeepseekCompressor):
         kv_cache = mla_layer.kv_cache
         kv_cache_dtype = getattr(mla_layer, "kv_cache_dtype", "bfloat16")
         if kv_cache_dtype == "fp8_ds_mla":
-            ixfops.ds4_compressor_save_partial_states(
+            ixfops.save_partial_states(
                 kv=kv,
                 score=score,
                 ape=self.ape,
@@ -437,7 +438,7 @@ class IluDeepseekCompressor(DeepseekCompressor):
                 rms_norm_eps=self.rms_norm_eps,
             )
         else:
-            ixfops.ds4_compressor_save_partial_states(
+            ixfops.save_partial_states(
                 kv=kv,
                 score=score,
                 ape=self.ape,
@@ -447,7 +448,7 @@ class IluDeepseekCompressor(DeepseekCompressor):
                 block_size=block_size,
                 compress_ratio=self.compress_ratio,
             )
-            ixfops.ds4_compressor_pool_norm_rope_insert(
+            ixfops.compress_norm_rope_store(
                 state_cache=state_cache,
                 token_to_req_indices=token_to_req_indices,
                 positions=positions,
@@ -1130,7 +1131,7 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         if self.mla_attn.kv_cache_dtype == "fp8_ds_mla":
             # Pass the 3D uint8 cache directly; the CUDA insert kernel uses
             # stride(0) and must not flatten padded (non-contiguous) blocks.
-            ixfops.ds4_fused_qnorm_rope_fp8_kv_insert(
+            ixfops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                 q,
                 kv,
                 swa_kv_cache,
@@ -1141,7 +1142,7 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 swa_metadata.block_size,
             )
         else:
-            ixfops.ds4_fused_qnorm_rope_kv_insert(
+            ixfops.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
                 q,
                 kv,
                 swa_kv_cache,
@@ -1450,7 +1451,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         if self.kv_cache_dtype == "fp8_ds_mla":
             supported = False
         else:
-            supported = ixfops.ds4_flash_mla_with_kvcache_supports_inv_rope(
+            supported = ixfops.flash_mla_sparse_with_kvcache_supports_inv_rope(
                 positions=positions,
                 cos_sin_cache=cos_sin_cache,
             )
@@ -1484,7 +1485,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         - ``compress_ratio == 4`` (C4A): the indexer wrote per-token *local*
           (per-request) compressed-domain indices into
           ``self.topk_indices_buffer``. We map them to global compressed
-          paged slots via ``ixfops.ds4_compute_global_topk_indices_and_lens``
+          paged slots via ``ixfops.compute_global_topk_indices_and_lens``
           (the ixformer CUDA op that replaces the upstream Triton
           ``compute_global_topk_indices_and_lens``), using
           ``block_size = attn_metadata.block_size // compress_ratio``
@@ -1521,7 +1522,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 # C4A: per-layer local topk indices written by the indexer.
                 assert self.topk_indices_buffer is not None
                 global_indices, topk_lens = (
-                    ixfops.ds4_compute_global_topk_indices_and_lens(
+                    ixfops.compute_global_topk_indices_and_lens(
                         self.topk_indices_buffer[:num_decode_tokens],
                         swa_metadata.token_to_req_indices[:num_decode_tokens],
                         attn_metadata.block_table[:num_decodes],
@@ -1557,7 +1558,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 "epilogue; _inv_rope_fusable must reject fp8_ds_mla layers"
             )
             swa_cache = self.swa_cache_layer.kv_cache
-            ixfops.ds4_flash_mla_with_fp8_kvcache(
+            ixfops.flash_mla_sparse_with_fp8_kvcache(
                 q=q,
                 k_cache=swa_cache,
                 indices=swa_indices,
@@ -1575,7 +1576,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             if kv_cache is not None:
                 kv_cache = kv_cache.unsqueeze(-2)
 
-            ixfops.ds4_flash_mla_with_kvcache(
+            ixfops.flash_mla_sparse_with_kvcache(
                 q=q,
                 k_cache=swa_cache,
                 indices=swa_indices,
@@ -1608,7 +1609,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         Otherwise, calls the standard ``ds4_gather_k_cache`` for bf16 cache.
         """
         if self.kv_cache_dtype == "fp8_ds_mla":
-            ixfops.ds4_gather_fp8_k_cache(
+            ixfops.dequantize_and_gather_k_cache(
                 out=out,
                 k_cache=k_cache,
                 seq_lens=seq_lens,
@@ -1618,7 +1619,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 offset=offset,
             )
         else:
-            ixfops.ds4_gather_k_cache(
+            d4ops.ds4_gather_k_cache(
                 out=out,
                 k_cache=k_cache,
                 seq_lens=seq_lens,
@@ -1660,7 +1661,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         - C4A (``compress_ratio == 4``): the indexer wrote per-prefill-token
           *local* compressed indices into ``self.topk_indices_buffer``; we map
           them to global paged slots with
-          ``ixfops.ds4_compute_global_topk_indices_and_lens`` -- the same op the
+          ``ixfops.compute_global_topk_indices_and_lens`` -- the same op the
           decode path uses.
         - C128A (``compress_ratio == 128``): the FlashMLA sparse builder
           pre-computed per-prefill-token *local* compressed indices in
@@ -1724,7 +1725,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     f"Unsupported compress_ratio={self.compress_ratio}; "
                     "expected 1, 4, or 128."
                 )
-            global_indices, topk_lens = ixfops.ds4_compute_global_topk_indices_and_lens(
+            global_indices, topk_lens = ixfops.compute_global_topk_indices_and_lens(
                 local_topk,
                 token_to_req,
                 attn_metadata.block_table,
@@ -1744,7 +1745,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         if kv_cache is not None:
             kv_cache = kv_cache.unsqueeze(-2)
 
-        ixfops.ds4_flash_mla_with_kvcache(
+        ixfops.flash_mla_sparse_with_kvcache(
             q=q,
             k_cache=swa_cache,
             indices=swa_indices,
@@ -1901,7 +1902,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
 
-            combined_indices, combined_lens = ixfops.ds4_combine_topk_swa_indices(
+            combined_indices, combined_lens = ixfops.combine_topk_swa_indices(
                 topk_indices[query_start:query_end],
                 query_start_loc[
                     num_decodes + chunk_start : num_decodes + chunk_end + 1
@@ -1919,7 +1920,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             # 4) Sparse MLA prefill: read from the workspace KV view and
             #    write into the per-token output slice.
             # ------------------------------------------------------------
-            ixfops.ds4_flash_mla_sparse_fwd(
+            ixfops.flash_mla_sparse_fwd(
                 q=q[query_start:query_end],
                 kv=kv.view(-1, 1, q.shape[-1]),
                 indices=combined_indices.unsqueeze(1),
@@ -1986,7 +1987,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_metadata: DeepseekSparseSWAMetadata,
     ) -> None:
         """SWA-only sliding-window attention (with attn_sink) into ``output``."""
-        ixfops.ds4_swa_attn_fwd(
+        ixfops.swa_attn_fwd(
             q=q,
             kv_cache=swa_k_cache,
             block_table=swa_metadata.prefill_swa_block_table,
@@ -2024,7 +2025,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         assert prefill_seq_lens is not None
 
         # SWA part (no attn_sink -- will be applied in merge)
-        o_swa, lse_swa = ixfops.ds4_swa_attn_fwd(
+        o_swa, lse_swa = ixfops.swa_attn_fwd(
             q=q,
             kv_cache=swa_k_cache,
             block_table=swa_metadata.prefill_swa_block_table,
@@ -2046,7 +2047,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             num_decode_tokens : num_decode_tokens + num_prefill_tokens
         ]
 
-        o_c4, lse_c4 = ixfops.ds4_paged_sparse_attn_fwd(
+        o_c4, lse_c4 = ixfops.paged_sparse_attn_fwd(
             q=q,
             kv_cache=compressed_k_cache,
             block_table=c_block_table,
@@ -2060,7 +2061,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         )
 
         # Merge compressed + SWA via fused kernel
-        ixfops.ds4_merge_attn_outputs(
+        ixfops.merge_attn_outputs(
             output,
             o_c4,
             lse_c4,
@@ -2089,7 +2090,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         assert cu_seqlens_k is not None
 
         # SWA part (no attn_sink -- will be applied in merge)
-        o_swa, lse_swa = ixfops.ds4_swa_attn_fwd(
+        o_swa, lse_swa = ixfops.swa_attn_fwd(
             q=q,
             kv_cache=swa_k_cache,
             block_table=swa_metadata.prefill_swa_block_table,
@@ -2104,7 +2105,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         # Dense compressed attention
         c_block_table = attn_metadata.block_table[num_decodes:]
-        o_compressed, lse_compressed = ixfops.ds4_dense_compressed_attn_fwd(
+        o_compressed, lse_compressed = ixfops.dense_compressed_attn_fwd(
             q=q,
             kv_cache=compressed_k_cache,
             block_table=c_block_table,
@@ -2115,7 +2116,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         )
 
         # Merge compressed + SWA via fused kernel
-        ixfops.ds4_merge_attn_outputs(
+        ixfops.merge_attn_outputs(
             output,
             o_compressed,
             lse_compressed,
@@ -2422,7 +2423,7 @@ class IluDeepseekV4Indexer(nn.Module):
                 # ``size(1)`` matches the caller's ``max_context_len`` -- so
                 # callers can pass the raw (possibly odd) token-count
                 # metadata from ``seq_lens.max()`` as-is.
-                logits = ixfops.dsa_indexer_mqa_logits(
+                logits = ixfops.dsa_indexer_mqa_logits_with_kvcache(
                     q[chunk.token_start : chunk.token_end],
                     chunk.cu_seqlens_q,
                     chunk.cu_seq_lens,
@@ -2462,7 +2463,7 @@ class IluDeepseekV4Indexer(nn.Module):
                 # cannot materialize a bf16 logits matrix with zero columns.
                 topk_buffer[:num_decode_tokens].fill_(-1)
                 return topk_buffer
-            logits = ixfops.dsa_indexer_mqa_logits(
+            logits = ixfops.dsa_indexer_mqa_logits_with_kvcache(
                 q[:num_decode_tokens],
                 decode_md.cu_seqlens_q,
                 decode_md.cu_seqlens_kv,

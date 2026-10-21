@@ -12,7 +12,7 @@ import ixformer.inference.functions as ixfshared
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from ixformer.inference.functions import deepseekv41 as ixfops  # type: ignore[import]
+from ixformer.inference.functions.models import deepseek_v41 as ixfops  # type: ignore[import]
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -254,7 +254,7 @@ def _insert_context_kv(
         )
         return
     # Plain bf16 window cache, same op the target attention uses.
-    ixfops.dsv41_qkv_rope_insert(
+    ixfops.v41_qkv_rope_insert(
         dummy_q,
         swa_kv_cache,
         kv,

@@ -10,7 +10,7 @@ Differences from the nvidia draft:
 * the backbone layer is :class:`IluDeepseekV4DecoderLayer`, whose ``forward``
   returns a single tensor (hc_post is applied inline), so the nvidia 4-tuple
   unpack and explicit ``mhc_post_tilelang`` call are dropped;
-* ``hc_head`` uses ``ixfops.ds4_hc_head`` instead of the tilelang kernel;
+* ``hc_head`` uses ``ixfops.hc_head`` instead of the tilelang kernel;
 * the offline converter already writes ``.weight_scale``, so the nvidia
   ``.scale`` rewrite is removed; ilu renames (``shared_experts.w2`` ->
   ``down_proj``, ``ffn.gate.bias`` -> ``e_score_correction_bias``) are applied
@@ -220,7 +220,7 @@ class IluDSparkDeepseekV4Model(nn.Module):
         hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         for layer in self.layers:
             hidden_states = layer(hidden_states, positions, input_ids)
-        return ixfops.ds4_hc_head(
+        return ixfops.hc_head(
             hidden_states,
             self.hc_head_fn,
             self.hc_head_scale,
@@ -249,7 +249,7 @@ def _insert_context_kv(
         device=kv.device,
     )
     if attn.mla_attn.kv_cache_dtype == "fp8_ds_mla":
-        ixfops.ds4_fused_qnorm_rope_fp8_kv_insert(
+        ixfops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
             dummy_q,
             kv,
             swa_kv_cache,
@@ -260,7 +260,7 @@ def _insert_context_kv(
             block_size,
         )
     else:
-        ixfops.ds4_fused_qnorm_rope_kv_insert(
+        ixfops.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
             dummy_q,
             kv,
             swa_kv_cache.view(swa_kv_cache.shape[0], -1),

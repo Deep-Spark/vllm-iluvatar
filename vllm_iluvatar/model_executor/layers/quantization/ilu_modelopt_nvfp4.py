@@ -112,7 +112,7 @@ def preprocess_nvfp4_weight_for_ixmm(
     """
     # Lazy import keeps this module importable without ixformer (CPU-only unit
     # tests), matching the MXFP4 method's lazy-import discipline.
-    from ixformer.inference.functions.fp4.gemm import gemm as ixmm_gemm
+    from ixformer.inference.functions.ops.gemm.fp4.gemm import gemm as ixmm_gemm
 
     expert, n_dim, packed_k = weight.shape
     k = packed_k * 2

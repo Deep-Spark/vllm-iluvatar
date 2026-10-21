@@ -41,6 +41,10 @@ def method(path, cls, name, namespace):
 
 class PrepareLayoutCPU(unittest.TestCase):
     def run_forward(self, tokens, fp8_absorb, prepare_enabled):
+        # The forward path below must not touch CUDA; assert on the delta
+        # rather than the absolute state so this CPU-only check stays valid
+        # even when earlier tests in the same process already initialized CUDA.
+        cuda_was_initialized = torch.cuda.is_initialized()
         heads, nope, lora, value = 32, 192, 512, 256
         events = []
         projected = []
@@ -189,7 +193,7 @@ class PrepareLayoutCPU(unittest.TestCase):
         self.assertEqual("prepare" in events, prepare_enabled)
         self.assertEqual("norm" in events, not prepare_enabled)
         self.assertEqual("rope" in events, not prepare_enabled)
-        self.assertFalse(torch.cuda.is_initialized())
+        self.assertEqual(torch.cuda.is_initialized(), cuda_was_initialized)
 
     def test_bf16_absorb_prepare_configuration_matrix(self):
         for tokens in (1, 4):

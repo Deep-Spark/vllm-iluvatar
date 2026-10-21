@@ -195,3 +195,38 @@ def test_native_cpu_worker_restores_payload_and_scales_as_one_group(fmt, block_o
             worker.shutdown()
         for state in reversed(states):
             state.release()
+
+
+@pytest.mark.skipif(
+    os.getenv("KV_PAIRED_CPU_OFFLOAD_GPU_TESTS") != "1",
+    reason="Explicitly enable isolated GPU paired block-copy validation",
+)
+@pytest.mark.parametrize("fmt", [I4G32, I8G64])
+@pytest.mark.parametrize("block_outer", [False, True])
+def test_native_copy_on_write_keeps_all_paired_pages_and_canaries(fmt, block_outer):
+    from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+    from vllm.v1.worker.utils import copy_kv_cache_blocks_inplace
+
+    config, caches, context, states = paired_cache(fmt, block_outer, "cuda")
+    try:
+        canonical = canonical_paired_pages(config, caches, context)
+        for entry in canonical.tensors:
+            entry.tensor[1].random_(0, 127)
+        saved = [entry.tensor[1].clone() for entry in canonical.tensors]
+        canaries = [entry.tensor[0].clone() for entry in canonical.tensors]
+        # Match IluWorker's physical-copy list: payload bindings plus both
+        # sideplanes. Alias names are intentional; no separate block IDs.
+        copies = list(caches.values())
+        for state in states:
+            copies.extend(state.scales.values())
+        copy_kv_cache_blocks_inplace(
+            copies, config.num_blocks, [KVCacheBlockCopy(1, 2)]
+        )
+        torch.cuda.synchronize()
+        for entry, expected, guard in zip(canonical.tensors, saved, canaries):
+            assert torch.equal(entry.tensor[2], expected)
+            assert torch.equal(entry.tensor[1], expected)
+            assert torch.equal(entry.tensor[0], guard)
+    finally:
+        for state in reversed(states):
+            state.release()

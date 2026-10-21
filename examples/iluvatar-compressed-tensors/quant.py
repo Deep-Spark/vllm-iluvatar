@@ -29,8 +29,10 @@ from tqdm import tqdm
 
 if __package__:
     from .methods import DEQUANT_METHODS, QUANT_METHODS
+    from .recipes import available_recipes, legacy_profile_path, recipe_paths
 else:  # Allow ``python examples/iluvatar-compressed-tensors/quant.py``.
     from methods import DEQUANT_METHODS, QUANT_METHODS
+    from recipes import available_recipes, legacy_profile_path, recipe_paths
 
 _SAFETENSORS_DTYPE_BYTES = {
     "BOOL": 1,
@@ -696,8 +698,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True)
     parser.add_argument("--output")
-    parser.add_argument("--configs", required=True)
-    parser.add_argument("--rules", required=True)
+    parser.add_argument(
+        "--recipe",
+        choices=available_recipes(),
+        help="built-in vendor/name selecting a matching configs/rules pair",
+    )
+    parser.add_argument("--configs", help="explicit configs JSON (requires --rules)")
+    parser.add_argument("--rules", help="explicit rules JSON (requires --configs)")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--shard-start", type=int)
     parser.add_argument("--shard-end", type=int)
@@ -716,6 +723,18 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
+    if args.recipe:
+        if args.configs is not None or args.rules is not None:
+            parser.error("--recipe cannot be combined with --configs or --rules")
+        args.configs, args.rules = map(str, recipe_paths(args.recipe))
+    else:
+        if args.configs is None or args.rules is None:
+            parser.error("use --recipe or provide both --configs and --rules")
+        try:
+            args.configs = str(legacy_profile_path(args.configs, "configs"))
+            args.rules = str(legacy_profile_path(args.rules, "rules"))
+        except ValueError as error:
+            parser.error(str(error))
     if args.match_only:
         if not args.match_report:
             parser.error("--match-only requires --match-report")

@@ -262,7 +262,24 @@ class MiniMaxM3DecoderLayer(nn.Module):
 
         is_sparse_attention_layer = layer_id in _sparse_attention_layer_ids(config)
 
-        if is_sparse_attention_layer:
+        use_fp8_attention = cache_config is not None and cache_config.cache_dtype in (
+            "fp8",
+            "fp8_e4m3",
+        )
+        if use_fp8_attention:
+            from vllm_iluvatar.models.minimax_m3.mxfp8.fp8_attention import (
+                MiniMaxM3FP8Attention,
+            )
+
+            self.self_attn = MiniMaxM3FP8Attention(
+                config=config,
+                layer_id=layer_id,
+                quant_config=quant_config,
+                prefix=f"{prefix}.self_attn",
+                cache_config=cache_config,
+                sparse=is_sparse_attention_layer,
+            )
+        elif is_sparse_attention_layer:
             self.self_attn = MiniMaxM3SparseAttention(
                 config=config,
                 layer_id=layer_id,
@@ -376,7 +393,10 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         # [total_q, num_index_heads, topk] so indexer and sparse attend both use
         # native token-major [token, head, topk].
         sparse_cfg = getattr(config, "sparse_attention_config", None)
-        if sparse_cfg is not None:
+        if sparse_cfg is not None and vllm_config.cache_config.cache_dtype not in (
+            "fp8",
+            "fp8_e4m3",
+        ):
             tp_size = get_tensor_model_parallel_world_size()
             num_index_heads = max(1, sparse_cfg["sparse_num_index_heads"] // tp_size)
             # Pad tokens to a multiple of 4 so the buffer head stride stays
@@ -502,6 +522,34 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             # MTP is not enabled on this Iluvatar path; skip those tensors.
             if "mtp." in name:
                 continue
+
+            if name.endswith((".k_scale", ".v_scale", ".kv_scale")):
+                import re
+
+                owner_name = re.sub(
+                    r"(?:\.(?:attn|[kv]_proj|qkv_proj))?\.(?:[kv]|kv)_scale$", "", name
+                )
+                owner = dict(self.named_modules()).get(owner_name)
+                if (
+                    owner is not None
+                    and owner.__class__.__name__ == "MiniMaxM3FP8Attention"
+                ):
+                    scale_value = loaded_weight.float()
+                    if (
+                        scale_value.numel() != 1
+                        or not torch.isfinite(scale_value).all()
+                        or not (scale_value > 0).all()
+                    ):
+                        raise ValueError(f"Invalid fixed FP8 KV scale: {name}")
+                    targets = (
+                        ("_k_scale", "_v_scale")
+                        if name.endswith(".kv_scale")
+                        else ("_k_scale" if name.endswith(".k_scale") else "_v_scale",)
+                    )
+                    for target in targets:
+                        getattr(owner, target).copy_(scale_value.reshape(1))
+                    loaded_params.add(name)
+                    continue
 
             # The checkpoint stores block scales as ``weight_scale_inv``; the
             # ModelOpt MXFP8 layers expose them as ``weight_scale``.

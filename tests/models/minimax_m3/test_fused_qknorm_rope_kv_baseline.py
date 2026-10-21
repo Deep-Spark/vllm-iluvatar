@@ -37,8 +37,9 @@ def test_sparse_qkv_layout_index_k_is_one_head():
     positions = torch.arange(t, dtype=torch.long)
     slots = torch.arange(t, dtype=torch.long)
 
-    # ixformer 3817cf75: 主 KV cache 恢复标准 5-D 布局 [pages, 2, block, H, D]。
-    kv_cache = torch.zeros(2, 2, block_size, nkv, d)
+    # ixformer e51605a0: 主 KV cache 为 4-D packed 布局 [pages, Hkv, block, 2*D]
+    # （K/V 打包在最后一维，K = [.., :D]，V = [.., D:]）。
+    kv_cache = torch.zeros(2, nkv, block_size, 2 * d)
     index_cache = torch.zeros(2, block_size, d)
     q_out = torch.empty(t, nq * d)
     index_q_out = torch.empty(t, niq * d)
@@ -96,8 +97,8 @@ def test_sparse_qkv_layout_index_k_is_one_head():
     )
 
     for i in range(t):
-        assert kv_cache[0, 0, i, :, :].abs().sum() > 0  # K
-        assert kv_cache[0, 1, i, :, :].abs().sum() > 0  # V
+        assert kv_cache[0, 0, i, :d].abs().sum() > 0  # K
+        assert kv_cache[0, 0, i, d:].abs().sum() > 0  # V
         assert index_cache[0, i].abs().sum() > 0
 
     assert index_cache.shape[-1] == d
@@ -115,9 +116,8 @@ def test_scatter_nhd():
     positions = torch.arange(t, dtype=torch.long)
     slots = torch.tensor([1, 2], dtype=torch.long)
 
-    # ixformer 3817cf75: 主 KV cache 恢复标准 5-D NHD 布局
-    # [pages, 2, block, H, D]（HND 亦支持，由 block_size 维位置推断）。
-    kv_nhd = torch.zeros(1, 2, block_size, nkv, d)
+    # ixformer e51605a0: 主 KV cache 为 4-D packed 布局 [pages, Hkv, block, 2*D]。
+    kv_packed = torch.zeros(1, nkv, block_size, 2 * d)
     ixf.fused_minimax_m3_qknorm_rope_kv_insert(
         qkv.clone(),
         q_norm,
@@ -129,14 +129,14 @@ def test_scatter_nhd():
         4,
         1e-6,
         slot_mapping=slots,
-        kv_cache=kv_nhd,
+        kv_cache=kv_packed,
         block_size=block_size,
         backend="torch",
     )
-    assert kv_nhd[0, 0, 1, :, :].abs().sum() > 0  # K
-    assert kv_nhd[0, 0, 2, :, :].abs().sum() > 0  # K
-    assert kv_nhd[0, 1, 1, :, :].abs().sum() > 0  # V
-    assert kv_nhd[0, 1, 2, :, :].abs().sum() > 0  # V
+    assert kv_packed[0, 0, 1, :d].abs().sum() > 0  # K
+    assert kv_packed[0, 0, 2, :d].abs().sum() > 0  # K
+    assert kv_packed[0, 1, 1, d:].abs().sum() > 0  # V
+    assert kv_packed[0, 1, 2, d:].abs().sum() > 0  # V
 
 
 def test_negative_slots_skipped():

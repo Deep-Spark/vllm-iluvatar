@@ -146,7 +146,9 @@ class IluWorker(Worker):
                 )
 
                 profiling = compressed_kv_profiling(
-                    self.model_runner, None, workspace_bytes=0,
+                    self.model_runner,
+                    None,
+                    workspace_bytes=0,
                     prefill_producer=prefill_producer_for_config(self.vllm_config),
                 )
             with profiling:
@@ -173,13 +175,17 @@ class IluWorker(Worker):
                 raise RuntimeError("Split indexer KV cache is already initialized")
             with self._maybe_get_memory_pool_context(tag="kv_cache"):
                 index_state = IndexerScaleState(
-                    index_layout, self.device,
+                    index_layout,
+                    self.device,
                     self.vllm_config.compilation_config.static_forward_context,
                 )
             self._indexer_kv_state = index_state
-            logger.info("Split INT8 indexer scales: bytes=%d owners=%d blocks=%d",
-                        index_layout.nbytes, len(index_layout.placements),
-                        index_layout.num_blocks)
+            logger.info(
+                "Split INT8 indexer scales: bytes=%d owners=%d blocks=%d",
+                index_layout.nbytes,
+                len(index_layout.placements),
+                index_layout.num_blocks,
+            )
         fmt = main_kv_format()
         orig_cls = self._try_replace_model_runner_class()
         try:
@@ -188,8 +194,11 @@ class IluWorker(Worker):
             else:
                 if index_state is not None:
                     payload = {t.size for t in kv_cache_config.kv_cache_tensors}
-                    if (len(payload) != 1 or payload.pop() + index_layout.nbytes
-                            > self._indexer_kv_available_memory):
+                    if (
+                        len(payload) != 1
+                        or payload.pop() + index_layout.nbytes
+                        > self._indexer_kv_available_memory
+                    ):
                         raise ValueError("Split indexer exceeds its profiled budget")
                 super().initialize_from_config(kv_cache_config)
                 if index_state is not None:
@@ -197,7 +206,8 @@ class IluWorker(Worker):
                     if self.model_runner.kv_block_zeroer is None:
                         self.model_runner._init_kv_zero_meta()
                     extend_kv_zeroer(
-                        self.model_runner.kv_block_zeroer, index_layout.num_blocks,
+                        self.model_runner.kv_block_zeroer,
+                        index_layout.num_blocks,
                         index_state.scales.values(),
                     )
             self._initialize_prefix_cache()
@@ -212,7 +222,10 @@ class IluWorker(Worker):
     def _initialize_prefix_cache(self) -> None:
         if getattr(self, "prefix_state", None) is not None:
             from vllm.distributed.kv_transfer import get_kv_transfer_group
-            from vllm_iluvatar.v1.worker.prefill_state.runtime import attach_prefix_state
+
+            from vllm_iluvatar.v1.worker.prefill_state.runtime import (
+                attach_prefix_state,
+            )
 
             self.prefix_state.initialize_cache()
             attach_prefix_state(get_kv_transfer_group(), self.prefix_state)
@@ -341,6 +354,9 @@ class IluWorker(Worker):
                 physical_gpu=physical_gpu,
             )
             result = super().compile_or_warm_up_model()
+            controller = getattr(self.model_runner, "_ilu_dp_vocab_projection", None)
+            if controller is not None:
+                controller.enable_dynamic_capacity()
             if getattr(self, "prefix_state", None) is not None:
                 self.prefix_state.start()
             return result
@@ -348,6 +364,20 @@ class IluWorker(Worker):
             monitor.free()
             checker.free()
             raise
+
+    def sample_tokens(self, grammar_output):
+        controller = getattr(self.model_runner, "_ilu_dp_vocab_projection", None)
+        if (
+            controller is None
+            or not controller.dynamic_capacity
+            or self.model_runner.execute_model_state is None
+        ):
+            return super().sample_tokens(grammar_output)
+        # Read the shared CPU agreement before the runner clears its execute
+        # state. Do not retain that state and its activation owners here.
+        dp_sync = self.model_runner.execute_model_state.dp_sync
+        with controller.pair(dp_sync):
+            return super().sample_tokens(grammar_output)
 
     def execute_model(self, scheduler_output):
         self._get_hbm_ecc_monitor().check()

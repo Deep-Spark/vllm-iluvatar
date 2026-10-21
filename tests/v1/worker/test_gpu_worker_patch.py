@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 import sys
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -46,6 +46,10 @@ def _stub_gpu_worker(monkeypatch):
         def execute_model(self, scheduler_output):
             self.base_calls.append(("execute", scheduler_output))
             return "model-output"
+
+        def sample_tokens(self, grammar_output):
+            self.base_calls.append(("sample", grammar_output))
+            return self.model_runner.sample_tokens(grammar_output)
 
         def shutdown(self) -> None:
             self.base_calls.append("shutdown")
@@ -464,6 +468,71 @@ def test_compile_starts_checker_before_parent():
     assert worker.base_calls == ["compile"]
     assert checker.calls == [("start", "cuda:3", 7, 3, 3, 27)]
     assert monitor.calls == [("start", 7, 3, 3, 27)]
+
+
+def test_dynamic_vocabulary_capacity_is_enabled_after_parent_warmup():
+    events = []
+    runner = SimpleNamespace()
+    worker = _make_worker(runner)
+
+    def enable():
+        assert worker.base_calls == ["compile"]
+        events.append("dynamic-enabled")
+
+    runner._ilu_dp_vocab_projection = SimpleNamespace(enable_dynamic_capacity=enable)
+    worker._onchip_checker = _FakeChecker()
+    worker._hbm_ecc_monitor = _FakeEccMonitor()
+    worker.device, worker.rank, worker.local_rank = "cuda:0", 0, 0
+    assert worker.compile_or_warm_up_model() == "compilation-times"
+    assert events == ["dynamic-enabled"]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("has_state", [False, True])
+def test_sample_rpc_scopes_shared_sync_before_runner_clears_state(enabled, has_state):
+    events = []
+    sync, grammar = object(), object()
+
+    class Controller:
+        dynamic_capacity = enabled
+
+        @contextmanager
+        def pair(self, agreement):
+            assert agreement is sync
+            events.append("pair-enter")
+            try:
+                yield
+            finally:
+                events.append("pair-exit")
+
+    runner = SimpleNamespace(
+        _ilu_dp_vocab_projection=Controller(),
+        execute_model_state=SimpleNamespace(dp_sync=sync) if has_state else None,
+    )
+
+    def sample(grammar_output):
+        assert grammar_output is grammar
+        runner.execute_model_state = None
+        events.append("base-sample")
+        return "sample-output"
+
+    runner.sample_tokens = sample
+    worker = _make_worker(runner)
+    assert worker.sample_tokens(grammar) == "sample-output"
+    assert events == (
+        ["pair-enter", "base-sample", "pair-exit"]
+        if enabled and has_state
+        else ["base-sample"]
+    )
+    assert worker.base_calls == [("sample", grammar)]
+
+
+def test_sample_rpc_without_projection_preserves_base_behavior():
+    runner = SimpleNamespace(sample_tokens=lambda grammar: grammar)
+    worker = _make_worker(runner)
+    grammar = object()
+    assert worker.sample_tokens(grammar) is grammar
+    assert worker.base_calls == [("sample", grammar)]
 
 
 @pytest.mark.parametrize("num_tokens", [0, 4])

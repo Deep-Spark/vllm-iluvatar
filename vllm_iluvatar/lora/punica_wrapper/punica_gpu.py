@@ -76,7 +76,7 @@ def add_lora_linear(
         if len(lora_a_stacked) == 1 and ixf_ops.lora_gemv_optim_condition(
             num_token, m, k, n
         ):
-            ixf_ops.add_lora_linear(
+            ixf_ops.add_lora_gemv_fusion(
                 y,
                 x,
                 lora_a_stacked,

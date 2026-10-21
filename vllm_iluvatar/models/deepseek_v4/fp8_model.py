@@ -582,7 +582,7 @@ class IluDeepseekV4Fp8DecoderLayer(nn.Module):
         ``[token, in_stream, out_stream]``; transposing it silently changes the
         result, so it is passed through untouched.
         """
-        return ixfops.ds4_mhc_post(x, residual, post, comb)
+        return ixfops.mhc_post(x, residual, post, comb)
 
     def forward(
         self,
@@ -764,7 +764,7 @@ class IluDeepseekV4Fp8Model(nn.Module):
         ``hc_head_fn`` stays fp32 -- unlike the per-layer ``hc_*_fn`` it is
         validated as float32 by the kernel, so it must not be cast.
         """
-        return ixfops.ds4_hc_head(
+        return ixfops.hc_head(
             hidden_states,
             self.hc_head_fn,
             self.hc_head_scale,

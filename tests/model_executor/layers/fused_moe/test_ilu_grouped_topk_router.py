@@ -78,7 +78,28 @@ def test_grouped_topk_patch_rebinds_module_function_and_new_custom_op():
     assert grouped_topk_op.native_impl is ilu_grouped_topk_router.grouped_topk
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def _requires_ivcore30_fusion() -> str | None:
+    from vllm_iluvatar.ilu_util.arch import is_ivcore30
+
+    return None if is_ivcore30() else "fused sigmoid routing requires ivcore30"
+
+
+_FUSION_REASON = _requires_ivcore30_fusion() or ""
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.bfloat16),
+        pytest.param(torch.float16),
+        pytest.param(
+            torch.float32,
+            marks=pytest.mark.skipif(
+                _FUSION_REASON != "", reason=_FUSION_REASON
+            ),
+        ),
+    ],
+)
 @pytest.mark.parametrize("tokens", [1, 129])
 def test_fused_sigmoid_routing_native(monkeypatch, dtype, tokens):
     from vllm import envs as opt

@@ -328,7 +328,7 @@ class MoECPU(unittest.TestCase):
                     ns = {
                         "torch": TORCH,
                         "ixff": ops,
-                        "get_ep_group": lambda: SimpleNamespace(rank=1),
+                        "get_ep_group": lambda: SimpleNamespace(rank=1, rank_in_group=0),
                         "unpad_tensor": lambda x, *a, **k: x,
                     }
                     fn = load(STD, "_apply_nn", ns, "IluMoEStandardExpertsW4A8NN")

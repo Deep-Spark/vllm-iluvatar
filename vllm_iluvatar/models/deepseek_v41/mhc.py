@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 
 import torch
-from ixformer.inference.functions import deepseekv41 as ixfops
+from ixformer.inference.functions.models import deepseek_v41 as ixfops
 
 from vllm_iluvatar.ilu_util.arch import is_ivcore30
 

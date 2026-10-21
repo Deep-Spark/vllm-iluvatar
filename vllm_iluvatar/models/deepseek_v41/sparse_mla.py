@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import torch
-from ixformer.inference.functions import deepseekv41 as ixfops
+from ixformer.inference.functions.models import deepseek_v41 as ixfops
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.platforms.interface import DeviceCapability

@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
-from ixformer.inference.functions.w4a8 import (
+from ixformer.inference.functions.ops.gemm.int4.w4a8 import (
     ref_w4a8,
     w4a8_gemm_quant_repack_int4,
 )

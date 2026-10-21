@@ -9,7 +9,7 @@ fork's pieces instead of the upstream FP8/FP4 ones:
 * ``mtp_block`` is an :class:`IluDeepseekV4DecoderLayer` whose ``forward``
   returns a *single* tensor (the ilu layer applies ``hc_post`` inline), so the
   nvidia 4-tuple unpack + explicit ``mtp_block.hc_post(...)`` is dropped.
-* ``hc_head`` is computed with ``ixfops.ds4_hc_head`` (the ilu kernel) rather
+* ``hc_head`` is computed with ``ixfops.hc_head`` (the ilu kernel) rather
   than the nvidia ``HCHeadOp``.
 * MoE experts use the plain :class:`FusedMoE` mapping -- there is no MegaMoE
   path, ``use_mega_moe`` flag, or ``finalize_mega_moe_weights`` step.
@@ -236,7 +236,7 @@ class IluDeepSeekV4MultiTokenPredictor(nn.Module):
         hidden_states = hidden_states.view(
             -1, mtp_layer.hc_mult, mtp_layer.config.hidden_size
         )
-        hidden_states = ixfops.ds4_hc_head(
+        hidden_states = ixfops.hc_head(
             hidden_states,
             mtp_layer.hc_head_fn,
             mtp_layer.hc_head_scale,

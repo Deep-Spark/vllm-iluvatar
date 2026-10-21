@@ -414,8 +414,7 @@ class IluMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 
         # Main KV cache is the community v0.31.0 (db9527a468) 4-D
         # [B, H, block, head_size+head_size_v] layout (K/V packed in the last
-        # dim). The ixformer native M3 fused_kv kernel lifts it to a zero-copy
-        # 5-D NHD view internally (see ixformer...fused_kv.as_nhd_view).
+        # dim).
         if self.kv_cache.dim() != 4:
             raise RuntimeError(
                 f"Unexpected main KV cache rank {self.kv_cache.dim()}, "

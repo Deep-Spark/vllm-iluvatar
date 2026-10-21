@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 import torch
 from conftest import requires_cuda
-from ixformer.inference.functions.qwen38 import build_mamba_align_layout
+from ixformer.inference.functions.models.qwen3_next import build_mamba_align_layout
 from vllm.model_executor.layers.mamba.mamba_utils import (
     get_conv_copy_spec,
     get_temporal_copy_spec,

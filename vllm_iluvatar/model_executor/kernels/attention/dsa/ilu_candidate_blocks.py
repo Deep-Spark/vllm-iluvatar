@@ -11,7 +11,7 @@ Why      : community spells both in Triton, which does not run on corex, and
            top-k over the whole context instead of over the shortlist the
            candidate source published.
 How      : same two entry points, same argument order and contract; the two
-           reductions move to ``ixfops.dsv41_candidate_block_scores`` /
+           reductions move to ``ixfops.v41_candidate_block_scores`` /
            ``dsv41_apply_candidate_mask`` (ixformer deepseekv41/candidate).
            ``torch.topk`` stays in torch; writing the shortlist uses
            ``dsv41_write_candidate_topk``, the same kernel the plugin
@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import torch
 
-from ixformer.inference.functions import deepseekv41 as ixfops
+from ixformer.inference.functions.models import deepseek_v41 as ixfops
 
 # Rows per ``topk`` call in ``select_candidate_blocks``. Above 128 rows corex
 # torch's topk takes scratch memory outside the caching allocator -- tens of
@@ -85,7 +85,7 @@ def select_candidate_blocks(
     for r0 in range(0, rows, step):
         r1 = min(rows, r0 + step)
         g0, g1 = r0 // row_repeat, -(-r1 // row_repeat)
-        scores = ixfops.dsv41_candidate_block_scores(
+        scores = ixfops.v41_candidate_block_scores(
             logits[r0:r1],
             None if row_ks is None else row_ks[g0:g1],
             row_ke[g0:g1],
@@ -114,7 +114,7 @@ def select_candidate_blocks(
             # One launch writes the kept indices and the ``-1`` tail. A block
             # that scored ``-inf`` is padding; a NaN is kept, matching
             # community.
-            ixfops.dsv41_write_candidate_topk(
+            ixfops.v41_write_candidate_topk(
                 out[r0 + s : r0 + e], top.values, top.indices, k
             )
             s = e
@@ -132,6 +132,6 @@ def apply_candidate_mask(
     rows, width = logits.shape
     if not rows or not width:
         return
-    ixfops.dsv41_apply_candidate_mask(
+    ixfops.v41_apply_candidate_mask(
         logits, row_ks, row_ke, candidate_blocks, block_size, row_repeat
     )

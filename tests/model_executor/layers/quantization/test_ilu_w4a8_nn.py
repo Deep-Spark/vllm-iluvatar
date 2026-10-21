@@ -31,8 +31,25 @@ from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compres
 )
 
 
+def _ivcore30_nn_available() -> bool:
+    try:
+        w4a8_moe.require_ivcore30_nn()
+    except RuntimeError:
+        return False
+    return True
+
+
+# Real NN-method construction and execution require ivcore30 with the ixmm
+# backend; skip per-test so the arch-agnostic selection/validation tests below
+# still run on other architectures.
+_requires_ivcore30_nn = pytest.mark.skipif(
+    not _ivcore30_nn_available(), reason="requires ivcore30 with ixmm backend"
+)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@_requires_ivcore30_nn
 def test_static_nn_ixformer_against_cpu(dtype):
     method, layer, raw, scales = _make_nn_graph_method()
     rng = torch.Generator().manual_seed(8)
@@ -74,6 +91,7 @@ def test_static_nn_ixformer_against_cpu(dtype):
 @pytest.mark.parametrize("mode", ["ep", "non_ep"])
 @pytest.mark.parametrize("topk", [1, 2])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@_requires_ivcore30_nn
 def test_decode_pipeline_replay(dtype, mode, topk, monkeypatch):
     method, layer, _, _ = _make_nn_graph_method()
     layer.top_k = topk
@@ -143,6 +161,7 @@ def test_decode_pipeline_replay(dtype, mode, topk, monkeypatch):
 @pytest.mark.parametrize("ep", [False, True])
 @pytest.mark.parametrize("num_tokens", [17, 1033])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@_requires_ivcore30_nn
 def test_nn_prefill_uses_ixformer_ixmm(ep, num_tokens, monkeypatch):
     method, layer, raw, scales = _make_nn_graph_method()
     if not ep:
@@ -223,6 +242,7 @@ def test_nn_prefill_uses_ixformer_ixmm(ep, num_tokens, monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@_requires_ivcore30_nn
 @pytest.mark.parametrize(
     "fused,hidden,topk,tokens",
     [
@@ -316,6 +336,7 @@ def test_nn_standard_experts_prefill_matches_monolithic(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@_requires_ivcore30_nn
 def test_glm_shape_decode():
     method, layer, _, _ = _make_nn_graph_method(
         experts=16, hidden=6144, intermediate=2048
@@ -467,6 +488,7 @@ def test_nn_class_rejects_missing_ixmm(monkeypatch):
 @pytest.mark.parametrize("algorithm", ["GEMV", "GEMM", "FUSED"])
 @pytest.mark.parametrize("batched", [False, True])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@_requires_ivcore30_nn
 def test_modular_factory_selects_dedicated_nn_experts(monkeypatch, algorithm, batched):
     from vllm.model_executor.layers.fused_moe import FusedMoEActivationFormat
 
@@ -508,6 +530,7 @@ def test_modular_factory_selects_dedicated_nn_experts(monkeypatch, algorithm, ba
 
 @pytest.mark.parametrize("prefix", [_STATIC_NN_PREFIX, "model.layers.78.mlp.experts"])
 @pytest.mark.usefixtures("_static_nn_dispatch")
+@_requires_ivcore30_nn
 def test_static_nn_selects_dedicated_method(prefix):
     source = _static_nn_checkpoint_config()
     before = copy.deepcopy(source)
@@ -520,6 +543,7 @@ def test_static_nn_selects_dedicated_method(prefix):
 
 @pytest.mark.usefixtures("_static_nn_dispatch")
 @pytest.mark.parametrize("algorithm", ["GEMV", "GEMM", "FUSED"])
+@_requires_ivcore30_nn
 def test_static_nn_post_load_preserves_weights_and_scales(monkeypatch, algorithm):
     monkeypatch.setattr(legacy_w4a8.envs, "VLLM_ILU_MOE_EP_LL_MOE_ALGO", algorithm)
     method = _select_static_nn()
@@ -546,6 +570,7 @@ def test_static_nn_post_load_preserves_weights_and_scales(monkeypatch, algorithm
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.usefixtures("_static_nn_dispatch")
+@_requires_ivcore30_nn
 def test_static_nn_uses_ixmm_under_graph_capture(monkeypatch):
     method = _select_static_nn()
     layer = torch.nn.Module()
@@ -605,6 +630,7 @@ def test_nn_fused_prefill_keeps_regular_nn_path(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@_requires_ivcore30_nn
 @pytest.mark.parametrize("intermediate", [128, 256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("limit", [None, 7.0])
@@ -718,6 +744,7 @@ def test_ll_nn_fixed_capacity_and_graph(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@_requires_ivcore30_nn
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("fused", [False, True])
 def test_nn_prequantized_input_matches_float_without_requantizing(

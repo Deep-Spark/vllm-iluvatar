@@ -87,7 +87,7 @@ def test_aux_forward_mean_pools_and_uses_shifted_layer_ids():
             return_value=pp,
         ),
         patch(
-            "vllm_iluvatar.models.deepseek_v4.model.ixfops.ds4_hc_head",
+            "vllm_iluvatar.models.deepseek_v4.model.ixfops.hc_head",
             side_effect=_fake_hc_head,
         ),
     ):
@@ -129,7 +129,7 @@ def test_aux_forward_without_capture_returns_single_tensor():
             return_value=pp,
         ),
         patch(
-            "vllm_iluvatar.models.deepseek_v4.model.ixfops.ds4_hc_head",
+            "vllm_iluvatar.models.deepseek_v4.model.ixfops.hc_head",
             side_effect=lambda hs, *a, **k: hs.mean(dim=1),
         ),
     ):

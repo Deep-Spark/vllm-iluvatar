@@ -17,9 +17,17 @@ from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8 import (
     IluFp8Config,
     IluFp8MoEMethod,
 )
+from vllm_iluvatar.ilu_util import arch
 from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8_to_w4a8_moe import (
     IluFp8ToW4A8NNMoEMethod,
     quantize_fp8_to_w4a8_nn,
+)
+
+# IluW4A8NNMoEMethod 自带 require_ivcore30_nn() 硬校验；只有真正构造
+# NN method 的用例需要 ivcore30（CQ），其余用例在 ivcore11 上照常跑。
+_requires_ivcore30 = pytest.mark.skipif(
+    not arch.is_ivcore30(),
+    reason="requires ivcore30 (CQ); W4A8 NN MoE method",
 )
 
 
@@ -115,6 +123,7 @@ def select(tp=1, rank=0, config_mutation=None):
     return layer, method
 
 
+@_requires_ivcore30
 def test_dispatch():
     _, method = select()
     assert isinstance(method, IluFp8ToW4A8NNMoEMethod)
@@ -125,6 +134,7 @@ def test_dispatch():
     assert not isinstance(original, IluFp8ToW4A8NNMoEMethod)
 
 
+@_requires_ivcore30
 def test_runtime_target_can_omit_pack_version():
     def mutate(config):
         del config["config_groups"]["glm52_fp8_w4a8_nn"]["weights"]["target"][
@@ -289,6 +299,7 @@ def feed(layer, tensor, shard, expert, scale=False):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 @pytest.mark.parametrize("tp,rank", [(1, 0), (2, 0), (2, 1), (4, 3), (8, 7), (16, 15)])
 @pytest.mark.parametrize("scale_first", [False, True])
+@_requires_ivcore30
 def test_streaming_tp_ep_and_graph(tp, rank, scale_first, monkeypatch):
     import ixformer.inference.functions as ops
 
@@ -397,6 +408,7 @@ def test_streaming_tp_ep_and_graph(tp, rank, scale_first, monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@_requires_ivcore30
 def test_invalid_dtype_and_pending():
     layer, method = select()
     with torch.device("cuda"):
@@ -417,6 +429,7 @@ def test_invalid_dtype_and_pending():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 @pytest.mark.parametrize("tp,rank", [(1, 0), (2, 1), (4, 3)])
 @pytest.mark.parametrize("pack_version", [None, 1])
+@_requires_ivcore30
 def test_static_nn_load_matches_online(tp, rank, pack_version, monkeypatch):
     import ixformer.inference.functions as ops
 

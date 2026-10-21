@@ -9,7 +9,7 @@ implementations belong in tests, not in this runtime adapter.
 from __future__ import annotations
 
 import torch
-from ixformer.inference.functions.models.qwen3_next.hc import float as hc_ops
+from ixformer.inference.functions.models.qwen3_next.hc.float import hc as hc_ops
 
 
 def _require_cuda(x: torch.Tensor) -> None:

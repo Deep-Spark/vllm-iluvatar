@@ -17,7 +17,7 @@ import torch
 import vllm_iluvatar._C  # noqa: F401
 from compressed_tensors.quantization import QuantizationStrategy
 from conftest import COMPILED_CUDA_ARCH
-from ixformer.inference.functions.w8a8 import ref_w8a8
+from ixformer.inference.functions.ops.gemm.int8.w8a8 import ref_w8a8
 from torch.nn.parameter import Parameter
 from vllm import _custom_ops as ops
 

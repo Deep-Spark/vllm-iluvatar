@@ -1335,8 +1335,6 @@ class IluFlashAttentionImpl(AttentionImpl):
                 window_right=self.sliding_window[1],
                 use_cuda_graph=attn_metadata.decode.use_graph if decode_only else False,
                 max_context_len=attn_metadata.decode.max_decode_seq_len,
-                cu_query_lens=attn_metadata.decode.query_start_loc,
-                max_query_len=attn_metadata.decode.max_query_len,
                 value_cache=i8_value_cache,
                 value_scale_cache=value_scale_cache,
             )
@@ -1348,7 +1346,17 @@ class IluFlashAttentionImpl(AttentionImpl):
                         save_key_scale=key_scale[:num_decode_tokens],
                     )
                 )
-            ixf_ops.paged_attention_int8(**para_dict)
+            # MTP / speculative decode (max_query_len > 1) must go to the
+            # dedicated mtp op; paged_attention_int8 has no max_query_len /
+            # cu_query_lens params, so they are only passed to the mtp one.
+            if attn_metadata.decode.max_query_len > 1:
+                ixf_ops.paged_attention_mtp_int8(
+                    **para_dict,
+                    max_query_len=attn_metadata.decode.max_query_len,
+                    cu_query_lens=attn_metadata.decode.query_start_loc,
+                )
+            else:
+                ixf_ops.paged_attention_int8(**para_dict)
         return output
 
     def _forward_k_int8(
@@ -1465,8 +1473,6 @@ class IluFlashAttentionImpl(AttentionImpl):
                 window_right=self.sliding_window[1],
                 use_cuda_graph=attn_metadata.decode.use_graph if decode_only else False,
                 max_context_len=attn_metadata.decode.max_decode_seq_len,
-                cu_query_lens=attn_metadata.decode.query_start_loc,
-                max_query_len=attn_metadata.decode.max_query_len,
                 value_cache=value_cache,
             )
             if decode_only:
@@ -1477,7 +1483,17 @@ class IluFlashAttentionImpl(AttentionImpl):
                         save_key_scale=key_scale[:num_decode_tokens],
                     )
                 )
-            ixf_ops.paged_attention_mix(**para_dict)
+            # MTP / speculative decode (max_query_len > 1) must go to the
+            # dedicated mtp op; paged_attention_mix has no max_query_len /
+            # cu_query_lens params, so they are only passed to the mtp one.
+            if attn_metadata.decode.max_query_len > 1:
+                ixf_ops.paged_attention_mtp_mix(
+                    **para_dict,
+                    max_query_len=attn_metadata.decode.max_query_len,
+                    cu_query_lens=attn_metadata.decode.query_start_loc,
+                )
+            else:
+                ixf_ops.paged_attention_mix(**para_dict)
         return output
 
     def do_kv_cache_update(

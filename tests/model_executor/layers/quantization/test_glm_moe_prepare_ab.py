@@ -16,6 +16,13 @@ from vllm import envs as opt
 from tests.model_executor.layers.quantization.moe_test_utils import make_nn_graph_method
 from vllm_iluvatar.ilu_util import arch
 
+# 本文件 4 个测试全部在函数体首行断言 is_ivcore30()（NN prepare 融合仅
+# 在 ivcore30/CQ 机器可用），没有架构无关用例，故模块级整体跳过。
+pytestmark = pytest.mark.skipif(
+    not arch.is_ivcore30(),
+    reason="requires ivcore30 (CQ); GLM MoE NN prepare fusion suite",
+)
+
 
 def dense_reference(q, scale, raw, scales, ids, weights, layer):
     q, scale = q.float().cpu(), scale.reshape(-1, 1).cpu()

@@ -221,13 +221,13 @@ class IluMMEncoderAttention(MMEncoderAttention):
         kv_len: int,
     ) -> torch.Tensor:
         from ixformer.contrib.sageattention import (
-            ixinfer_flash_attn_unpad_int8_vf16,
+            flash_attn_unpad_int8_vf16,
         )
         from ixformer.contrib.sageattention.core import quant_q
 
         i8_q, q_scale = quant_q(query_4d)
         i8_k, k_scale = quant_q(key_4d)
-        out, _ = ixinfer_flash_attn_unpad_int8_vf16(
+        out, _ = flash_attn_unpad_int8_vf16(
             i8_q,
             i8_k,
             value_4d,

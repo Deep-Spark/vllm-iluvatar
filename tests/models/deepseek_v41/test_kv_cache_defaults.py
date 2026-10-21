@@ -101,8 +101,8 @@ def test_bf16_attention_uses_supported_native_backend(monkeypatch):
 
     calls = []
     monkeypatch.setattr(
-        attention_mod.ixfops,
-        "dsv41_mla_with_kvcache",
+        attention_mod,
+        "flash_mla_sparse_with_kvcache",
         lambda **kwargs: calls.append(kwargs),
     )
     attn = object.__new__(attention_mod.IluDeepseekV41Attention)
@@ -118,4 +118,6 @@ def test_bf16_attention_uses_supported_native_backend(monkeypatch):
     lengths = torch.ones(1, dtype=torch.int32)
     attn._sparse_mla(q, indices, lengths, None, None, None, torch.empty_like(q))
     assert len(calls) == 1
-    assert calls[0]["backend"] == "ixformer_native"
+    # ixformer 3817cf75: dsv41_mla_with_kvcache 的 ixformer_native 后端
+    # 并入 flash_mla_sparse_with_kvcache 的 ixformer_perf 后端。
+    assert calls[0]["backend"] == "ixformer_perf"

@@ -9,7 +9,7 @@ against the FP8 fork (``fp8_model`` / ``fp8_attention``) rather than the W4A8
   returns a single ``(T, hc_mult, H)`` tensor (``hc_post`` applied inline), so
   the nvidia 4-tuple unpack + explicit post is dropped -- same contract as
   W4A8 ``mtp.py``.
-* ``hc_head`` uses ``ixfops.ds4_hc_head``.
+* ``hc_head`` uses ``ixfops.hc_head``.
 * No aux streams (FP8 attention does not take ``aux_stream_dict``).
 * Raw-FP8 scale rewrite (``.scale`` -> ``weight_scale`` / ``weight_scale_inv``)
   and E8M0 ``view(uint8)`` for routed-expert scales match ``fp8_model`` /
@@ -230,7 +230,7 @@ class IluDeepseekV4Fp8MultiTokenPredictor(nn.Module):
         hidden_states = hidden_states.view(
             -1, mtp_layer.hc_mult, mtp_layer.config.hidden_size
         )
-        hidden_states = ixfops.ds4_hc_head(
+        hidden_states = ixfops.hc_head(
             hidden_states,
             mtp_layer.hc_head_fn,
             mtp_layer.hc_head_scale,

@@ -8,8 +8,16 @@ import torch
 from vllm import envs as opt
 from vllm.v1.sample.ops import topk_topp_sampler as upstream
 
+from vllm_iluvatar.ilu_util import arch
 from vllm_iluvatar.v1.sample.ops import topk_topp_sampler as impl
 
+# GLM CQ 采样 patch 的 Scope 是 ivcore30（见 patch_topk_topp_sampler.py）；
+# ivcore11 机器上 forward_native 恒回退上游，且上游新版不再接受广播 p，
+# 这组用例只能在 CQ 机器上验证。
+pytestmark = pytest.mark.skipif(
+    not arch.is_ivcore30(),
+    reason="requires ivcore30 (CQ); GLM sampling override scope",
+)
 
 @pytest.mark.parametrize("mode", ["sorted", "radix"])
 @pytest.mark.parametrize("seeded", ["none", "mixed", "all"])

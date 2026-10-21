@@ -418,7 +418,7 @@ def _worker(rank, rendezvous, native_comm):
                     expected_idx = torch.arange(128, dtype=torch.int32).repeat(n, 1)
                     lengths_ref = torch.tensor(ids, dtype=torch.int32) + 1
                     expected_idx[expected_idx >= lengths_ref[:, None]] = -1
-                    reference = ixf.dsa_flash_mla_with_fp8_kvcache(
+                    reference = ixf.dsa_flash_mla_sparse_with_fp8_kvcache_diff_kv(
                         packed_q[:, None],
                         packed_kv.unsqueeze(2),
                         expected_idx[:, None],
@@ -444,7 +444,7 @@ def _worker(rank, rendezvous, native_comm):
                     )
                     native_q.copy_(all_q[ids])
                     native_scale.copy_(all_scale[ids])
-                    unpartitioned = ixf.dsa_flash_mla_with_fp8_kvcache(
+                    unpartitioned = ixf.dsa_flash_mla_sparse_with_fp8_kvcache_diff_kv(
                         native_q[:, None],
                         packed_kv.unsqueeze(2).to(device),
                         layer.topk_indices_buffer[:n, None],

@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 
 import ixformer.inference.functions as ixfops
+from ixformer.inference.functions.models.deepseek_v41.indexer.fp8.dsv41_indexer_mqa_topk_fp8 import dsv41_indexer_mqa_topk_fp8
 import torch
 from vllm import _custom_ops as ops
 from vllm import envs
@@ -136,7 +137,7 @@ def _indexer_logits_and_topk(
         and kv_cache.dtype == torch.uint8
         and os.environ.get("VLLM_ILU_V41_INDEXER_KV_DTYPE") == "fp8"
     ):
-        ixfops.dsv41_indexer_mqa_topk_fp8(
+        dsv41_indexer_mqa_topk_fp8(
             q,
             cu_seqlens_q,
             cu_seqlens_kv,

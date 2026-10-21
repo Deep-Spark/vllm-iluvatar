@@ -125,7 +125,7 @@ class IluDeepseekV4Fp8FlashMLASparseMetadataBuilder(IluFlashMLASparseMetadataBui
 
         if num_prefill_tokens > 0:
             assert prefill_local is not None
-            pf_idx, pf_lens = ixfops.ds4_compute_global_topk_indices_and_lens(
+            pf_idx, pf_lens = ixfops.compute_global_topk_indices_and_lens(
                 prefill_local[:num_prefill_tokens],
                 req_id_per_token[num_decode_tokens:num_total],
                 cm.block_table_tensor,

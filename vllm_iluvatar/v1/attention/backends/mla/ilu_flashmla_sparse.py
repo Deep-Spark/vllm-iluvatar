@@ -552,7 +552,7 @@ class IluFlashMLASparseImpl(
         - Rotary embedding is applied inside (not in the wrapper)
         - KV cache write is done inside (not in forward())
         - Prefill uses ixf_ops.mla_rope for fused rope
-        - Decode uses ixf_ops.vllm_paged_attention_mla_fused
+        - Decode uses ixf_ops.flash_mla_with_kvcache_fused
         """
         if attn_metadata is None:
             _ = torch.empty(

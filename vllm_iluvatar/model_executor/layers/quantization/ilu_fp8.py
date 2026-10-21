@@ -797,6 +797,8 @@ class IluFp8MoEMethod(Fp8MoEMethod):
         # Block quant stores per-block scales under ``*_weight_scale_inv``; the
         # inherited ``create_weights`` reads this name.
         self.weight_scale_name = "weight_scale_inv"
+        self.weight_scale_refine = None
+        self.moe_block_shape = self.weight_block_size
         # No community backend is selected: the ix30 path is our own compute.
         self.fp8_backend = None
         self.moe_kernel = None

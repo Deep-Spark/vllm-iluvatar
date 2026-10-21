@@ -577,7 +577,7 @@ configs 不包含离线转换方法、checkpoint 名称匹配规则或模型配�
 
 #### 6.8.1 rules
 
-完整内容见 `examples/iluvatar-compressed-tensors/rules/deepseek/deepseek_v4.json`。
+完整内容见 `examples/iluvatar-compressed-tensors/rules/deepseek/deepseek_v4_w4a8.json`。
 
 该文件定义以下处理方式：
 
@@ -592,7 +592,7 @@ configs 不包含离线转换方法、checkpoint 名称匹配规则或模型配�
 
 #### 6.8.2 configs
 
-完整内容见 `examples/iluvatar-compressed-tensors/configs/deepseek/deepseek_v4.json`。
+完整内容见 `examples/iluvatar-compressed-tensors/configs/deepseek/deepseek_v4_w4a8.json`。
 
 该文件指定以下运行时量化方式：
 
@@ -607,8 +607,8 @@ configs 不包含离线转换方法、checkpoint 名称匹配规则或模型配�
 ```bash
 python3 examples/iluvatar-compressed-tensors/quant.py \
   --input /path/to/DeepSeek-V4-flash-0731 \
-  --configs examples/iluvatar-compressed-tensors/configs/deepseek/deepseek_v4.json \
-  --rules examples/iluvatar-compressed-tensors/rules/deepseek/deepseek_v4.json \
+  --configs examples/iluvatar-compressed-tensors/configs/deepseek/deepseek_v4_w4a8.json \
+  --rules examples/iluvatar-compressed-tensors/rules/deepseek/deepseek_v4_w4a8.json \
   --match-only \
   --match-report examples/iluvatar-compressed-tensors/deepseek_v4_match.json
 ```
@@ -621,8 +621,8 @@ python3 examples/iluvatar-compressed-tensors/quant.py \
 python3 examples/iluvatar-compressed-tensors/quant.py \
   --input /path/to/DeepSeek-V4-flash-0731 \
   --output /path/to/DeepSeek-V4-flash-0731-quant \
-  --configs examples/iluvatar-compressed-tensors/configs/deepseek/deepseek_v4.json \
-  --rules examples/iluvatar-compressed-tensors/rules/deepseek/deepseek_v4.json
+  --configs examples/iluvatar-compressed-tensors/configs/deepseek/deepseek_v4_w4a8.json \
+  --rules examples/iluvatar-compressed-tensors/rules/deepseek/deepseek_v4_w4a8.json
 ```
 
 #### 6.8.5 运行
@@ -646,10 +646,10 @@ vllm serve /path/to/DeepSeek-V4-flash-0731-quant \
 | `methods.py` | 注册可复用的反量化和量化算法 | 模型专用 tensor 名称匹配 |
 | `quant.py` | 解析配置和规则、遍历 shard、转换权重、重建索引并写入模型配置 | 模型专用量化算法 |
 
-configs 与 rules 应使用相同的文件名 stem，例如 `configs/deepseek/deepseek_v4.json` 对应 `rules/deepseek/deepseek_v4.json`。
+configs 与 rules 应使用相同的文件名 stem，例如 `configs/deepseek/deepseek_v4_w4a8.json` 对应 `rules/deepseek/deepseek_v4_w4a8.json`。
 
-内置配方按厂商/生态分组，也可以直接使用 `--recipe deepseek/deepseek_v4`，
-自动选择 `configs/deepseek/deepseek_v4.json` 与 `rules/deepseek/deepseek_v4.json`。
+内置配方按厂商/生态分组，也可以直接使用 `--recipe deepseek/deepseek_v4_w4a8`，
+自动选择 `configs/deepseek/deepseek_v4_w4a8.json` 与 `rules/deepseek/deepseek_v4_w4a8.json`。
 `--recipe` 不与显式路径参数混用；`--configs` / `--rules` 成对传入的旧用法和
 自定义 JSON 仍可使用。CLI 会将已迁移且不存在的旧内置平铺路径映射到唯一的厂商路径。
 可选配方见 `quant.py --help`，完整用法见

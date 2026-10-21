@@ -29,10 +29,20 @@ from tqdm import tqdm
 
 if __package__:
     from .methods import DEQUANT_METHODS, QUANT_METHODS
-    from .recipes import available_recipes, legacy_profile_path, recipe_paths
+    from .recipes import (
+        available_recipes,
+        canonical_recipe_name,
+        legacy_profile_path,
+        recipe_paths,
+    )
 else:  # Allow ``python examples/iluvatar-compressed-tensors/quant.py``.
     from methods import DEQUANT_METHODS, QUANT_METHODS
-    from recipes import available_recipes, legacy_profile_path, recipe_paths
+    from recipes import (
+        available_recipes,
+        canonical_recipe_name,
+        legacy_profile_path,
+        recipe_paths,
+    )
 
 _SAFETENSORS_DTYPE_BYTES = {
     "BOOL": 1,
@@ -700,6 +710,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output")
     parser.add_argument(
         "--recipe",
+        type=canonical_recipe_name,
         choices=available_recipes(),
         help="built-in vendor/name selecting a matching configs/rules pair",
     )

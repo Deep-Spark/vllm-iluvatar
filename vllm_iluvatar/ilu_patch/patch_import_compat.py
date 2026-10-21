@@ -14,28 +14,21 @@ before any deep ``import vllm`` touches them.  They are applied via two paths:
      fires for vLLM worker processes (never for unrelated ``python`` calls).
 
 Shims (no-ops on stock CUDA torch):
-  1. torch.accelerator — corex torch has a partial/missing module; map the
-     subset vLLM uses onto torch.cuda equivalents.
-  2. symmetric-memory guard — corex torch ships an INCOMPLETE
-     ``torch.distributed._symmetric_memory`` (importable, but missing
-     ``empty``).  Community ``device_communicators/symm_mem.py`` only guards
-     ``ImportError`` (not the missing attribute), so it flips
-     ``symm_mem_available=True`` and later crashes at ``torch_symm_mem.empty``
-     during GroupCoordinator init.  We pre-inject a stub and force-disable
-     symmetric-memory allreduce via ``VLLM_ALLREDUCE_USE_SYMM_MEM=0``.
-  3. torch.fx._graph_pickler — the CoreX Torch build used here ships
-     GraphPickler but not Options. Community ``vllm.compilation.caching``
-     imports both at module scope, so patch the missing Options symbol before
-     vLLM imports it.
-  4. torch._inductor.config / torch._functorch.config — some CoreX Torch builds
-     lack config keys that upstream vLLM patches or serializes during compile
-     setup/cache-key creation, so add compatible no-op defaults before vLLM
-     builds the config.
-  5. torch.ops._C compile-only quant schemas — compilation fusion modules bind
+  1. ``_patch_torch`` — empty reserved hook. Torch 2.13.0+corex already ships
+     ``torch.accelerator``, GraphPickler.Options, inductor ``alignment_asserts``,
+     and functorch autograd-cache keys; re-fill this hook if a CoreX drop
+     regresses.
+  2. ``_ensure_symm_mem_ops_registered`` — CoreX can leave ``torch.ops.symm_mem``
+     half-loaded (e.g. ``one_shot_all_reduce`` present, ``_low_contention_*``
+     missing). Early-import ``torch.distributed._symmetric_memory`` so Inductor
+     ``register_symm_mem_lowerings`` does not AttributeError.
+  3. symmetric-memory guard — if the real module is still missing ``empty``,
+     pre-inject a stub and force-disable via ``VLLM_ALLREDUCE_USE_SYMM_MEM=0``.
+  4. torch.ops._C compile-only quant schemas — compilation fusion modules bind
      several FP8 quant op overloads at import time. Register missing schemas as
      real dispatcher ops so FX matchers can import even when CoreX does not ship
      these CUDA kernels.
-  6. MiniMax-M3 NVIDIA model entry points — importing
+  5. MiniMax-M3 NVIDIA model entry points — importing
      ``vllm.models.minimax_m3.common`` first executes the parent package, whose
      CUDA branch imports the NVIDIA model and MTP implementations. Provide
      import-only stand-ins for those entry points so Iluvatar code can import
@@ -143,125 +136,15 @@ def _has_torch_c_op(torch_ops_c: object, name: str) -> bool:
 
 
 def _patch_torch() -> None:
-    import torch
+    """Reserved Torch attribute shims (empty on Torch 2.13.0+corex).
 
-    if getattr(torch._C, "_accelerator_setAllocatorSettings", None) is None:
-        torch._C._accelerator_setAllocatorSettings = lambda *args, **kwargs: None
-
-    if not hasattr(torch, "float4_e2m1fn_x2"):
-        torch.float4_e2m1fn_x2 = "float4_e2m1fn_x2"
-
-    _patch_torch_fx_graph_pickler()
-    _patch_torch_inductor_config()
-    _patch_torch_functorch_config()
-
-    if not hasattr(torch, "accelerator"):
-        torch.accelerator = types.ModuleType("torch.accelerator")
-    target_module = torch.accelerator
-    patch_map = {
-        "empty_cache": torch.cuda.empty_cache,
-        "device_count": torch.cuda.device_count,
-        "set_device_index": torch.cuda.set_device,
-        "current_device_index": torch.cuda.current_device,
-        "get_memory_info": torch.cuda.mem_get_info,
-        "memory_stats": torch.cuda.memory_stats,
-        "memory_reserved": torch.cuda.memory_reserved,
-        "max_memory_allocated": torch.cuda.max_memory_allocated,
-        "reset_peak_memory_stats": torch.cuda.reset_peak_memory_stats,
-        "synchronize": torch.cuda.synchronize,
-        "device_index": torch.cuda.device,
-    }
-    for name, func in patch_map.items():
-        if not hasattr(target_module, name):
-            setattr(target_module, name, func)
-
-
-def _ensure_graph_pickler_options(module: types.ModuleType) -> None:
-    if hasattr(module, "Options"):
-        return
-
-    class Options:
-        def __init__(self, ops_filter=None):
-            self.ops_filter = ops_filter
-
-    module.Options = Options
-    existing_all = getattr(module, "__all__", None)
-    if isinstance(existing_all, list) and "Options" not in existing_all:
-        existing_all.append("Options")
-
-
-def _patch_torch_fx_graph_pickler() -> None:
-    try:
-        import torch.fx._graph_pickler as graph_pickler
-    except Exception:
-        return
-    _ensure_graph_pickler_options(graph_pickler)
-
-
-def _ensure_torch_config_key(
-    config_module: types.ModuleType,
-    key: str,
-    default: object,
-    value_type: type,
-) -> bool:
-    config = getattr(config_module, "_config", None)
-    if not isinstance(config, dict) or key in config:
-        return False
-
-    try:
-        from torch.utils._config_module import Config
-    except Exception:
-        return False
-
-    for entry in config.values():
-        entry_type = type(entry)
-        try:
-            config[key] = entry_type(Config(default, value_type=value_type))
-            return True
-        except Exception:
-            continue
-    return False
-
-
-def _patch_torch_inductor_config() -> None:
-    """Add CoreX-missing Inductor config keys consumed by upstream vLLM.
-
-    Community ``CompilationConfig`` may pass ``alignment_asserts`` to
-    ``torch._inductor.config.patch``. Some CoreX Torch builds lack that key, so
-    patching would raise before a late general patch can help. Keep this as an
-    early, defensive Torch-runtime compatibility shim.
+    Verified present on this CoreX build: ``torch.accelerator`` APIs used by
+    vLLM, ``torch._C._accelerator_setAllocatorSettings``,
+    ``torch.float4_e2m1fn_x2``, GraphPickler.Options, inductor
+    ``alignment_asserts``, and functorch autograd-cache keys. Re-fill here if
+    a future CoreX drop regresses.
     """
-    try:
-        import torch._inductor.config as inductor_config
-    except Exception:
-        return
-
-    _ensure_torch_config_key(
-        inductor_config,
-        "alignment_asserts",
-        False,
-        bool,
-    )
-
-
-def _patch_torch_functorch_config() -> None:
-    """Add CoreX-missing Functorch config keys consumed by upstream vLLM.
-
-    Community ``compiler_interface`` patches and serializes functorch config
-    keys while computing compile config and cache keys. Some CoreX Torch builds
-    lack those keys, so add defaults early instead of overriding vLLM's compiler
-    helpers with a late general patch.
-    """
-    try:
-        import torch._functorch.config as functorch_config
-    except Exception:
-        return
-
-    for key in (
-        "bundled_autograd_cache",
-        "autograd_cache_normalize_inputs",
-    ):
-        _ensure_torch_config_key(functorch_config, key, False, bool)
+    return
 
 
 def _define_missing_torch_c_compile_schema_ops() -> list[str]:
@@ -305,6 +188,25 @@ def _define_missing_torch_c_compile_schema_ops() -> list[str]:
     return registered
 
 
+def _ensure_symm_mem_ops_registered() -> None:
+    """Finish CoreX half-loaded ``torch.ops.symm_mem`` registration.
+
+    CoreX can expose ``symm_mem.one_shot_all_reduce`` while still missing
+    ``_low_contention_all_gather`` / ``_low_contention_reduce_scatter``.
+    Community ``register_symm_mem_lowerings`` only probes ``one_shot_all_reduce``
+    before decorating the rest, so ``import vllm`` → ``env_override`` →
+    ``import torch._inductor.lowering`` raises AttributeError.
+
+    Importing the real ``torch.distributed._symmetric_memory`` registers the
+    full op set. Must run before ``_stub_symmetric_memory`` (which uses
+    ``sys.modules.setdefault`` and would otherwise hide the real module).
+    """
+    try:
+        import torch.distributed._symmetric_memory  # noqa: F401
+    except Exception:
+        return
+
+
 def _stub_symmetric_memory() -> None:
     """Pre-inject a stub for ``torch.distributed._symmetric_memory``.
 
@@ -315,6 +217,9 @@ def _stub_symmetric_memory() -> None:
     ``sys.modules`` early, the import succeeds harmlessly and
     ``_disable_unsupported_symmetric_memory`` (below) ensures the actual usage
     is gated off via ``VLLM_ALLREDUCE_USE_SYMM_MEM=0``.
+
+    Call after ``_ensure_symm_mem_ops_registered`` so a successful real import
+    is not overwritten (``setdefault`` keeps the already-loaded module).
     """
 
     key = "torch.distributed._symmetric_memory"
@@ -451,6 +356,8 @@ def apply() -> None:
     _applied = True
     try:
         _patch_torch()
+        # Real symm_mem import before stub so half-loaded ops get completed.
+        _ensure_symm_mem_ops_registered()
         _stub_symmetric_memory()
         _disable_unsupported_symmetric_memory()
         _patch_minimax_m3_nvidia_entrypoints()

@@ -2,10 +2,9 @@
 """Startup-phase *module stand-in* shims for Iluvatar.
 
 Unlike the small attribute-level compat shims inlined in
-``patch_import_compat.py`` (``torch.accelerator`` mapping, ``_symmetric_memory``
-stub, ...), each module here provides a COMPLETE stand-in for a community module
-that would otherwise be imported at *import time* and fail / pull NV-specific
-code on corex.
+``patch_import_compat.py`` (``_symmetric_memory`` stub, ...), each module here
+provides a COMPLETE stand-in for a community module that would otherwise be
+imported at *import time* and fail / pull NV-specific code on corex.
 
 Each ``*.py`` module in this package:
 

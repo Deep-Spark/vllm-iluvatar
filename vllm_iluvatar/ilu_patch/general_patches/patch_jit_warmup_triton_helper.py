@@ -4,32 +4,33 @@
 Corresponds to: vllm/model_executor/warmup/jit_warmup_triton_helper.py
 Target   : vllm.model_executor.warmup.jit_warmup_triton_helper._triton_key_deriver
 Baseline : v0.31.0 (db9527a468)
-Why      : The CoreX (Iluvatar) Triton build extends
-           ``triton.runtime.jit.compute_cache_key`` with an extra required
-           ``backend`` positional argument
-           (``compute_cache_key(kernel_key_cache, specialization, options, backend)``).
-           The community JIT-warmup helper was written against stock Triton,
-           whose ``compute_cache_key`` takes only
-           ``(kernel_key_cache, specialization, options)``, so its ``derive_jit``
-           closure raises
+Why      : CoreX Triton commit ``8e6f69a0c9d18fee94d1726b5ed6c3f3c594a63e``
+           (``[SWFW-3370] Keep CQ fp32 dots off the TCU``) changed
+           ``triton.runtime.jit.compute_cache_key`` from the stock 3-arg form
+           ``(kernel_key_cache, specialization, options)`` to a 4-arg form that
+           requires ``backend``
+           (``compute_cache_key(kernel_key_cache, specialization, options, backend)``)
+           so specialization can be keyed via ``backend.cache_key_specialization``.
+           Community vLLM's JIT-warmup ``_triton_key_deriver`` still calls the
+           stock 3-arg API, so ``derive_jit`` raises
            ``TypeError: compute_cache_key() missing 1 required positional
-           argument: 'backend'`` the first time any Triton JIT kernel is warmed
-           up.  This surfaces as
-           ``RuntimeError: Worker failed with error 'compute_cache_key() missing
-           1 required positional argument: 'backend''`` from
-           ``compile_or_warm_up_model`` during KV-cache init, e.g. DeepSeek-V2-Lite
-           under Elastic EP / DPMoE (DP+EP) which exercises the standard
-           fused-MoE / sampling Triton kernels.
+           argument: 'backend'`` on the first Triton JIT warmup. That surfaces
+           as ``RuntimeError: Worker failed with error 'compute_cache_key()
+           missing 1 required positional argument: 'backend''`` from
+           ``compile_or_warm_up_model`` during KV-cache init (e.g. DeepSeek /
+           fused-MoE / sampling kernels under DP+EP).
 How      : Fingerprint the live community ``_triton_key_deriver`` source against
-           the baseline snapshot below, then rebind the function to the
-           override in ``vllm_iluvatar.model_executor.warmup.jit_warmup_triton_helper``,
+           the baseline snapshot below, then rebind to the override in
+           ``vllm_iluvatar.model_executor.warmup.jit_warmup_triton_helper``,
            which captures ``backend`` from ``kernel.device_caches[device]`` and
-           forwards it.  The override inspects the live ``compute_cache_key``
+           forwards it. The override inspects the live ``compute_cache_key``
            signature and falls back to the stock 3-arg call when ``backend`` is
            not required, so it works against both CoreX and stock Triton.
 Scope    : every V1 Triton JIT kernel warmup on Iluvatar.
-Remove   : when community's JIT-warmup helper forwards ``backend`` to
-           ``compute_cache_key`` (or CoreX Triton drops the ``backend`` arg).
+Remove   : when CoreX Triton restores a community-compatible
+           ``compute_cache_key`` API (e.g. ``backend`` optional / 3-arg callable).
+           **Currently waiting on that Triton fix**; do not drop this patch
+           until the installed CoreX Triton signature is compatible again.
 Fingerprint: the live community ``_triton_key_deriver`` source is checked against
            ``_TRITON_KEY_DERIVER`` before rebinding; gated by
            VLLM_ILU_PATCH_CHECK_FINGERPRINT.
@@ -161,5 +162,6 @@ def _apply() -> None:
     )
 
     # [ILU override] _triton_key_deriver — delta: forward ``backend`` to
-    # ``compute_cache_key`` for the CoreX Triton build (extra trailing arg).
+    # ``compute_cache_key`` after CoreX Triton 8e6f69a0 made it required.
+    # Waiting on Triton to restore a community-compatible signature.
     p.rebind_module_func(_m, "_triton_key_deriver", impl._triton_key_deriver)

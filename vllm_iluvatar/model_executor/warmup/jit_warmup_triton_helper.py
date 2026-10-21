@@ -4,27 +4,22 @@
 Corresponds to: vllm/model_executor/warmup/jit_warmup_triton_helper.py
 Target   : _triton_key_deriver
 Baseline : v0.31.0 (db9527a468)
-Why      : The CoreX (Iluvatar) Triton build extends
-           ``triton.runtime.jit.compute_cache_key`` with an extra required
-           ``backend`` positional argument
-           (``compute_cache_key(kernel_key_cache, specialization, options, backend)``).
-           The community JIT-warmup helper was written against stock Triton,
-           whose ``compute_cache_key`` takes only
-           ``(kernel_key_cache, specialization, options)``, so its ``derive_jit``
-           closure raises ``TypeError: compute_cache_key() missing 1 required
-           positional argument: 'backend'`` the first time any Triton JIT kernel
-           is warmed up. This surfaces as ``RuntimeError: Worker failed with
-           error 'compute_cache_key() missing 1 required positional argument:
-           'backend''`` from ``compile_or_warm_up_model`` during KV-cache init,
-           e.g. DeepSeek-V2-Lite under Elastic EP / DPMoE, which exercises the
-           standard fused-MoE / sampling Triton kernels.
+Why      : CoreX Triton commit ``8e6f69a0c9d18fee94d1726b5ed6c3f3c594a63e``
+           (``[SWFW-3370] Keep CQ fp32 dots off the TCU``) made
+           ``triton.runtime.jit.compute_cache_key`` require a trailing
+           ``backend`` argument and key specialization through
+           ``backend.cache_key_specialization``. Stock / community callers
+           (including vLLM JIT warmup) still use the 3-arg form, which raises
+           ``TypeError: compute_cache_key() missing 1 required positional
+           argument: 'backend'`` on first Triton JIT warmup.
 How      : Capture ``backend`` from ``kernel.device_caches[device]`` and forward
            it to ``compute_cache_key``. Inspect the live ``compute_cache_key``
            signature once and fall back to the stock 3-arg call when ``backend``
            is not required, so the override works on both CoreX and stock Triton.
 Scope    : every V1 Triton JIT kernel warmup on Iluvatar.
-Remove   : when community's JIT-warmup helper forwards ``backend`` to
-           ``compute_cache_key`` (or CoreX Triton drops the ``backend`` arg).
+Remove   : when CoreX Triton restores a community-compatible
+           ``compute_cache_key`` API (``backend`` optional / 3-arg callable).
+           **Currently waiting on that Triton fix.**
 """
 
 from __future__ import annotations
@@ -49,8 +44,9 @@ def _triton_key_deriver(
     compute_cache_key = triton.runtime.jit.compute_cache_key
 
     # >>> ILU MODIFICATION >>>
-    # CoreX Triton adds a required trailing ``backend`` arg to compute_cache_key;
-    # stock Triton does not. Decide once which call form to use.
+    # CoreX Triton 8e6f69a0 made ``backend`` required on compute_cache_key;
+    # stock Triton does not. Decide once which call form to use. Waiting on
+    # Triton to restore a community-compatible (optional / 3-arg) API.
     try:
         _needs_backend = "backend" in inspect.signature(compute_cache_key).parameters
     except (ValueError, TypeError):
@@ -120,7 +116,7 @@ def _triton_key_deriver(
             _, inspection_hash = inspection_hook()
             specialization.append(f'("custom_pipeline", {inspection_hash})')
         # >>> ILU MODIFICATION >>>
-        # Forward ``backend`` to compute_cache_key for CoreX Triton.
+        # Forward ``backend`` for CoreX Triton 8e6f69a0+ (required arg).
         if _needs_backend:
             cache_key = cast(
                 Hashable,

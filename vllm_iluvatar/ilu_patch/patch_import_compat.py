@@ -35,21 +35,15 @@ Shims (no-ops on stock CUDA torch):
      several FP8 quant op overloads at import time. Register missing schemas as
      real dispatcher ops so FX matchers can import even when CoreX does not ship
      these CUDA kernels.
-  6. Triton Gluon symbols — CoreX ships Triton 3.2.0, which has no
-     ``triton.experimental`` package and no ``triton.language.core._aggregate``.
-     Community ``vllm.triton_utils`` imports both unconditionally whenever
-     ``HAS_TRITON`` is true, so ``import vllm.config`` fails outright. Every
-     real Gluon user in vLLM 0.30 is ROCm-only (``rocm_aiter_*``,
-     ``models/*/amd/``, ``inkling`` gfx950), so permissive stand-ins are enough.
-  7. ``triton.language`` gaps — Triton hashes a kernel by walking its whole
-     AST, so names in constexpr-dead branches still have to resolve. CoreX
-     Triton 3.2.0 lacks ``tl.mul`` (used by the Philox sampler),
-     ``tl.make_tensor_descriptor`` (TMA) and ``tl.reduce_or`` (gpt-oss MoE).
-  8. MiniMax-M3 NVIDIA model entry points — importing
+  6. MiniMax-M3 NVIDIA model entry points — importing
      ``vllm.models.minimax_m3.common`` first executes the parent package, whose
      CUDA branch imports the NVIDIA model and MTP implementations. Provide
      import-only stand-ins for those entry points so Iluvatar code can import
      the hardware-neutral ``common`` package directly.
+
+Dropped on Triton 3.6.0+corex (native APIs present): Gluon
+(``triton.experimental.gluon`` / ``language.core._aggregate``) and
+``tl.mul`` / ``make_tensor_descriptor`` / ``reduce_or`` stand-ins.
 Then installs module *stand-in* shims (``_install_import_shims`` ->
 ``import_shims.install_all``): whole community modules that would otherwise be
 imported at *import time* and fail on corex are replaced in ``sys.modules`` with
@@ -338,135 +332,6 @@ def _disable_unsupported_symmetric_memory() -> None:
         os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
 
 
-class _TritonGluonPlaceholder:
-    """Permissive stand-in for a Gluon symbol Triton 3.2.0 does not ship.
-
-    Mirrors ``vllm.triton_utils.importing.TritonLanguagePlaceholder``: attribute
-    access keeps returning placeholders, and a call with a single callable is
-    treated as a bare decorator so ``@gluon.jit``-style module-level code
-    imports cleanly.
-    """
-
-    def __init__(self, name: str = "triton.experimental.gluon"):
-        self._name = name
-
-    def __getattr__(self, name: str):
-        if name.startswith("__"):
-            raise AttributeError(name)
-        return _TritonGluonPlaceholder(f"{self._name}.{name}")
-
-    def __call__(self, *args, **kwargs):
-        if len(args) == 1 and not kwargs and callable(args[0]):
-            return args[0]
-        return self
-
-    def __getitem__(self, _key):
-        return self
-
-    def __repr__(self) -> str:
-        return f"<ilu triton gluon placeholder {self._name}>"
-
-
-def _patch_triton_gluon_symbols() -> None:
-    """Make ``vllm.triton_utils``'s unconditional Gluon imports resolvable.
-
-    ``triton_utils/__init__.py`` imports ``triton.experimental.gluon``,
-    ``triton.experimental.gluon.language`` and
-    ``triton.language.core._aggregate`` whenever ``HAS_TRITON`` is true, which
-    it is on CoreX. Triton 3.2.0 has none of them, so install stand-ins in
-    ``sys.modules`` (and as attributes, for ``import triton.experimental``).
-    """
-
-    try:
-        import triton
-    except Exception:
-        return
-
-    try:
-        from triton.language import core as triton_language_core
-    except Exception:
-        triton_language_core = None
-    if triton_language_core is not None and not hasattr(
-        triton_language_core, "_aggregate"
-    ):
-        triton_language_core._aggregate = lambda cls: cls
-
-    try:
-        import triton.experimental.gluon.language  # noqa: F401
-
-        return
-    except Exception:
-        pass
-
-    for key, parent, attr in (
-        ("triton.experimental", triton, "experimental"),
-        ("triton.experimental.gluon", None, "gluon"),
-        ("triton.experimental.gluon.language", None, "language"),
-    ):
-        module = sys.modules.setdefault(key, types.ModuleType(key))
-        module.__file__ = "<vllm_iluvatar.triton_gluon_shim>"
-        if not hasattr(module, "__getattr__"):
-            module.__getattr__ = _TritonGluonPlaceholder(key).__getattr__
-        if parent is not None:
-            setattr(parent, attr, module)
-
-    sys.modules["triton.experimental"].gluon = sys.modules[
-        "triton.experimental.gluon"
-    ]
-    sys.modules["triton.experimental.gluon"].language = sys.modules[
-        "triton.experimental.gluon.language"
-    ]
-
-
-def _patch_triton_language_gaps() -> None:
-    """Backfill ``tl`` symbols that postdate the CoreX Triton build.
-
-    Triton builds a kernel's cache key by walking the whole AST of its source
-    (``JITFunction.cache_key`` -> ``DependenciesFinder``), so every ``tl.foo``
-    has to resolve even inside a branch a ``tl.constexpr`` would have deleted.
-    Missing names therefore abort at launch, not at codegen, with
-    ``AttributeError: module 'triton.language' has no attribute '...'``.
-
-    ``mul`` gets a real implementation because the Philox path that uses it
-    (``v1/worker/gpu/sample/watermark.py``) can run. The other two are reached
-    only from branches this platform never takes -- TMA descriptors and the
-    gpt-oss MoE kernels -- so they get stand-ins that raise if ever called,
-    rather than a guess at their semantics.
-    """
-    try:
-        import triton
-        import triton.language as tl
-    except Exception:
-        return
-
-    if not hasattr(tl, "mul"):
-
-        @triton.jit
-        def _ilu_tl_mul(a, b, sanitize_overflow: tl.constexpr = True):
-            # Triton 3.2.0 has no overflow sanitisation to turn off, so plain
-            # ``*`` already is the ``sanitize_overflow=False`` behaviour.
-            return a * b
-
-        tl.mul = _ilu_tl_mul
-
-    for name in ("make_tensor_descriptor", "reduce_or"):
-        if not hasattr(tl, name):
-            setattr(tl, name, _make_missing_triton_symbol(name))
-
-
-def _make_missing_triton_symbol(name: str):
-    def _missing(*args, **kwargs):
-        raise NotImplementedError(
-            f"triton.language.{name} is not available in this CoreX Triton "
-            "build. vllm_iluvatar installs this stand-in so Triton's AST walk "
-            "can resolve the name in dead branches; reaching it at runtime "
-            "means an unsupported kernel path was selected."
-        )
-
-    _missing.__name__ = name
-    return _missing
-
-
 def _install_import_shims() -> None:
     # Inject module *stand-in* shims into sys.modules BEFORE any deep
     # ``import vllm``.  Unlike the attribute-level shims above, these replace a
@@ -527,9 +392,9 @@ def _patch_minimax_m3_nvidia_entrypoints() -> None:
     importing NVIDIA-only dependencies, so expose only the names required by
     the parent initializer.
 
-    Follow the same pattern as :func:`_patch_triton_gluon_symbols`: use the
-    upstream modules when they import successfully, otherwise install minimal
-    stand-ins in ``sys.modules``.
+    Follow the same pattern as other early shims in this file: use the upstream
+    modules when they import successfully, otherwise install minimal stand-ins
+    in ``sys.modules``.
     """
 
     try:
@@ -588,8 +453,6 @@ def apply() -> None:
         _patch_torch()
         _stub_symmetric_memory()
         _disable_unsupported_symmetric_memory()
-        _patch_triton_gluon_symbols()
-        _patch_triton_language_gaps()
         _patch_minimax_m3_nvidia_entrypoints()
         _install_import_shims()
         _register_import_hooks()

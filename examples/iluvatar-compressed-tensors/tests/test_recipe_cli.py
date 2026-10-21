@@ -73,6 +73,7 @@ class RecipeCliTests(unittest.TestCase):
         self.assertFalse(list((TOOL / "rules").glob("*.json")))
         self.assertEqual(len(recipes.available_recipes()), len(configs))
         for name in recipes.available_recipes():
+            self.assertRegex(name.split("/")[1], r"^[a-z0-9_]+_(?:w4a8|w8a8|fp8)$")
             with self.subTest(recipe=name):
                 config, rule = recipes.recipe_paths(name)
                 quant.RuleSet.load(rule, json.loads(config.read_text()))
@@ -183,6 +184,108 @@ class RecipeCliTests(unittest.TestCase):
                     )
                     reports.append(json.loads(report.read_text())["stats"])
             self.assertEqual(reports[0], reports[1])
+
+    def test_historical_names_resolve_in_cli_and_both_path_layouts(self):
+        self.assertTrue(recipes.LEGACY_RECIPES)
+        canonical = set(recipes.available_recipes())
+        for old, new in recipes.LEGACY_RECIPES.items():
+            with self.subTest(old=old, new=new):
+                self.assertIn(new, canonical)
+                self.assertNotIn(old, canonical)
+                self.assertEqual(recipes.recipe_paths(old), recipes.recipe_paths(new))
+                args = quant._build_parser().parse_args(
+                    ["--input", "unused", "--recipe", old]
+                )
+                self.assertEqual(args.recipe, new)
+                for kind in ("configs", "rules"):
+                    expected = TOOL / kind / (new + ".json")
+                    for relative in (
+                        Path(old + ".json"),
+                        Path(old).with_suffix(".json").name,
+                    ):
+                        self.assertEqual(
+                            recipes.legacy_profile_path(
+                                str(TOOL / kind / relative), kind
+                            ),
+                            expected,
+                        )
+                        with working_directory(TOOL):
+                            self.assertEqual(
+                                recipes.legacy_profile_path(
+                                    str(Path(kind) / relative), kind
+                                ),
+                                expected,
+                            )
+
+    def test_renamed_recipe_runs_match_and_conversion_through_old_names(self):
+        new = "stepfun/step3_7_flash_fp8_w8a8"
+        old = "stepfun/step3p7_flash_w8a8"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, _ = self.make_checkpoint(root)
+            config, rule = recipes.recipe_paths(new)
+            options = [
+                ["--recipe", new],
+                ["--recipe", old],
+                ["--configs", config, "--rules", rule],
+                [
+                    "--configs",
+                    TOOL / "configs" / (old + ".json"),
+                    "--rules",
+                    TOOL / "rules" / (old + ".json"),
+                ],
+                [
+                    "--configs",
+                    TOOL / "configs/step3p7_flash_w8a8.json",
+                    "--rules",
+                    TOOL / "rules/step3p7_flash_w8a8.json",
+                ],
+            ]
+            results, reports = [], []
+            with working_directory(root):
+                for index, option in enumerate(options):
+                    output = root / f"output-{index}"
+                    self.call_cli(
+                        [
+                            "--input",
+                            source,
+                            "--output",
+                            output,
+                            "--device",
+                            "cpu",
+                            *option,
+                        ]
+                    )
+                    results.append({p.name: p.read_bytes() for p in output.iterdir()})
+                    report = root / f"report-{index}.json"
+                    self.call_cli(
+                        [
+                            "--input",
+                            source,
+                            "--match-only",
+                            "--match-report",
+                            report,
+                            *option,
+                        ]
+                    )
+                    reports.append(json.loads(report.read_text()))
+            self.assertTrue(all(result == results[0] for result in results))
+            self.assertTrue(all(report == reports[0] for report in reports))
+            weights = load_file(str(root / "output-0/model-00001-of-00001.safetensors"))
+            self.assertEqual(
+                weights["model.layers.0.self_attn.q_proj.weight"].dtype, torch.int8
+            )
+
+    def test_existing_historical_file_wins_over_renaming(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = root / "rules/deepseek/deepseek_v4.json"
+            new = root / "rules/deepseek/deepseek_v4_w4a8.json"
+            old.parent.mkdir(parents=True)
+            old.write_text("custom original")
+            new.write_text("canonical")
+            with patch.object(recipes, "TOOL_DIR", root):
+                self.assertEqual(recipes.legacy_profile_path(str(old), "rules"), old)
 
     def test_invalid_options_fail_before_reading_checkpoint(self):
         cases = [

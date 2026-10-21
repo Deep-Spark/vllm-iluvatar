@@ -321,12 +321,12 @@ Qwen3.8-27B 完整示例：
 python3 examples/iluvatar-compressed-tensors/quant.py \
   --input  /path/to/Qwen3.8-27B \
   --output /path/to/Qwen3.8-27B-W4A8 \
-  --configs examples/iluvatar-compressed-tensors/configs/qwen3_8_dense_w4a8.json \
-  --rules   examples/iluvatar-compressed-tensors/rules/qwen3_8_dense_w4a8.json \
+  --configs examples/iluvatar-compressed-tensors/configs/qwen/qwen3_8_dense_w4a8.json \
+  --rules   examples/iluvatar-compressed-tensors/rules/qwen/qwen3_8_dense_w4a8.json \
   --device cpu
 ```
 
-`rules/qwen3_8_dense_w4a8.json` 只量化 `self_attn.{q,k,v,o}_proj` 与 `mlp.{gate,up,down}_proj`；`linear_attn`（GDN）、`embed_tokens`、`lm_head`、norm、visual 保持 BF16。`configs/qwen3_8_dense_w4a8.json` 的 `iluvatar.weight_layout` 通过 `$rules` 与离线选项对齐为 `packed_nn`。
+`rules/qwen/qwen3_8_dense_w4a8.json` 只量化 `self_attn.{q,k,v,o}_proj` 与 `mlp.{gate,up,down}_proj`；`linear_attn`（GDN）、`embed_tokens`、`lm_head`、norm、visual 保持 BF16。`configs/qwen/qwen3_8_dense_w4a8.json` 的 `iluvatar.weight_layout` 通过 `$rules` 与离线选项对齐为 `packed_nn`。
 
 N、K 以及 TP / fused 分片边界必须是 32 的倍数。`create_weights` 用 `PackedvLLMParameter(packed_dim=1, packed_factor=2)` 承载 fused QKV / `gate_up` 的 shard 减半；不对齐会直接报错。packed 域切片与「先切再 pack」的等价性由
 `tests/model_executor/layers/quantization/compressed_tensors/test_ilu_compressed_tensors_w4a8_int.py` 中的 `test_packed_domain_*` 在真实形状上按 TP=1/2/8 逐字节验证。
@@ -358,7 +358,7 @@ N、K 以及 TP / fused 分片边界必须是 32 的倍数。`create_weights` �
 
 ### 6.1 configs：运行时量化配置
 
-`examples/iluvatar-compressed-tensors/configs/*.json` 会直接写入模型 `config.json` 的 `quantization_config`，主要描述：
+`examples/iluvatar-compressed-tensors/configs/<vendor>/*.json` 会直接写入模型 `config.json` 的 `quantization_config`，主要描述：
 
 - Compressed-Tensors 的 `config_groups`、`targets` 和权重/激活量化字段；
 - 每个 group 的 `iluvatar` 扩展字段（`gemm_format`、`pack_version`、`method` 等）。
@@ -462,7 +462,7 @@ configs 不包含离线转换方法、checkpoint 名称匹配规则或模型配�
 
 ### 6.2 rules：离线转换规则
 
-`examples/iluvatar-compressed-tensors/rules/*.json` 按 checkpoint tensor 名称选择离线转换 pipeline。每条规则主要包含：
+`examples/iluvatar-compressed-tensors/rules/<vendor>/*.json` 按 checkpoint tensor 名称选择离线转换 pipeline。每条规则主要包含：
 
 - `priority`：当一个权重同时匹配多条规则时，优先使用数值较大的规则；
 - `action`：`drop` 表示丢弃且不写入转换后的权重，`keep` 表示原样保存，`convert` 表示按规则转换后保存；
@@ -504,7 +504,7 @@ configs 不包含离线转换方法、checkpoint 名称匹配规则或模型配�
 - `pack_int4_moe`：处理三维专家权重，即所有专家位于同一个 tensor 中的情况；该方法会逐个专家调用 `int4_moe`。`options` 在 `int4_moe` 参数之外还包括：`packed`（gate_up 为 `true`，down 为 `false`）；`chunk_dim`（gate_up 的拆分维度）。
 - `pack_int8_moe`：处理三维 MoE expert 权重。先按 expert 做 `int8_per_channel`，scale 为 `(E, N, 1)`，再 `transpose(1, 2)` 成 `(E, K, N)`，对齐`moe_w8a8_group_gemv`（NN-only）。
   - `options`：`gemm_format` 为 `NN`；`symmetric`；`group_size`；`round_through_bfloat16` 和 `transport` 与 `int8_per_channel` 相同。
-  - Qwen3.6 MoE W8A8 示例：`rules/qwen3_6_moe_w8a8.json` 与 `configs/qwen3_6_moe_w8a8.json`。routed experts 为 NN INT8，dense `self_attn.{q,k,v,o}_proj` 仍为 TN INT8。
+  - Qwen3.6 MoE W8A8 示例：`rules/qwen/qwen3_6_moe_w8a8.json` 与 `configs/qwen/qwen3_6_moe_w8a8.json`。routed experts 为 NN INT8，dense `self_attn.{q,k,v,o}_proj` 仍为 TN INT8。
 
 对于不同的量化方法，需要同步调整 configs 和 rules，以保证离线量化参数与运行时配置一致。除了手动同步，还可以在 configs 中通过 `$rules` 引用 rules 字段。这样，修改离线量化参数后，运行时配置会自动更新。例如：
 
@@ -577,7 +577,7 @@ configs 不包含离线转换方法、checkpoint 名称匹配规则或模型配�
 
 #### 6.8.1 rules
 
-完整内容见 `examples/iluvatar-compressed-tensors/rules/deepseek_v4.json`。
+完整内容见 `examples/iluvatar-compressed-tensors/rules/deepseek/deepseek_v4.json`。
 
 该文件定义以下处理方式：
 
@@ -592,7 +592,7 @@ configs 不包含离线转换方法、checkpoint 名称匹配规则或模型配�
 
 #### 6.8.2 configs
 
-完整内容见 `examples/iluvatar-compressed-tensors/configs/deepseek_v4.json`。
+完整内容见 `examples/iluvatar-compressed-tensors/configs/deepseek/deepseek_v4.json`。
 
 该文件指定以下运行时量化方式：
 
@@ -607,8 +607,8 @@ configs 不包含离线转换方法、checkpoint 名称匹配规则或模型配�
 ```bash
 python3 examples/iluvatar-compressed-tensors/quant.py \
   --input /path/to/DeepSeek-V4-flash-0731 \
-  --configs examples/iluvatar-compressed-tensors/configs/deepseek_v4.json \
-  --rules examples/iluvatar-compressed-tensors/rules/deepseek_v4.json \
+  --configs examples/iluvatar-compressed-tensors/configs/deepseek/deepseek_v4.json \
+  --rules examples/iluvatar-compressed-tensors/rules/deepseek/deepseek_v4.json \
   --match-only \
   --match-report examples/iluvatar-compressed-tensors/deepseek_v4_match.json
 ```
@@ -621,8 +621,8 @@ python3 examples/iluvatar-compressed-tensors/quant.py \
 python3 examples/iluvatar-compressed-tensors/quant.py \
   --input /path/to/DeepSeek-V4-flash-0731 \
   --output /path/to/DeepSeek-V4-flash-0731-quant \
-  --configs examples/iluvatar-compressed-tensors/configs/deepseek_v4.json \
-  --rules examples/iluvatar-compressed-tensors/rules/deepseek_v4.json
+  --configs examples/iluvatar-compressed-tensors/configs/deepseek/deepseek_v4.json \
+  --rules examples/iluvatar-compressed-tensors/rules/deepseek/deepseek_v4.json
 ```
 
 #### 6.8.5 运行
@@ -641,12 +641,19 @@ vllm serve /path/to/DeepSeek-V4-flash-0731-quant \
 
 | 文件 | 主要职责 | 不应包含 |
 | --- | --- | --- |
-| `configs/<model>.json` | 描述运行时量化组、目标模块、权重/激活精度及 Iluvatar 扩展字段 | checkpoint tensor 匹配规则、离线反量化方法 |
-| `rules/<model>.json` | 按 checkpoint tensor 名称选择 `keep`、`drop` 或 `convert`，并定义离线转换参数 | 运行时实现类的选择逻辑 |
+| `configs/<vendor>/<model>.json` | 描述运行时量化组、目标模块、权重/激活精度及 Iluvatar 扩展字段 | checkpoint tensor 匹配规则、离线反量化方法 |
+| `rules/<vendor>/<model>.json` | 按 checkpoint tensor 名称选择 `keep`、`drop` 或 `convert`，并定义离线转换参数 | 运行时实现类的选择逻辑 |
 | `methods.py` | 注册可复用的反量化和量化算法 | 模型专用 tensor 名称匹配 |
 | `quant.py` | 解析配置和规则、遍历 shard、转换权重、重建索引并写入模型配置 | 模型专用量化算法 |
 
-configs 与 rules 应使用相同的文件名 stem，例如 `configs/deepseek_v4.json` 对应 `rules/deepseek_v4.json`。
+configs 与 rules 应使用相同的文件名 stem，例如 `configs/deepseek/deepseek_v4.json` 对应 `rules/deepseek/deepseek_v4.json`。
+
+内置配方按厂商/生态分组，也可以直接使用 `--recipe deepseek/deepseek_v4`，
+自动选择 `configs/deepseek/deepseek_v4.json` 与 `rules/deepseek/deepseek_v4.json`。
+`--recipe` 不与显式路径参数混用；`--configs` / `--rules` 成对传入的旧用法和
+自定义 JSON 仍可使用。CLI 会将已迁移且不存在的旧内置平铺路径映射到唯一的厂商路径。
+可选配方见 `quant.py --help`，完整用法见
+[量化入口说明](../../examples/iluvatar-compressed-tensors/README.md)。
 
 rules 文件还包含以下顶层字段：
 

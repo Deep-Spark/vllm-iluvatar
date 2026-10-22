@@ -115,6 +115,8 @@ from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime_quant_config i
     dtype_name,
     resolve_ilu_runtime_method,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8Dynamic128Sym
+from vllm.model_executor.layers.fused_moe.oracle.fp8 import resolve_fp8_moe_weight_block_shape
 
 # Process this many experts per dequant/requant temporary. Dequanting w13 across
 # all local experts at once would allocate several GB of fp32; mirror the
@@ -797,8 +799,23 @@ class IluFp8MoEMethod(Fp8MoEMethod):
         # Block quant stores per-block scales under ``*_weight_scale_inv``; the
         # inherited ``create_weights`` reads this name.
         self.weight_scale_name = "weight_scale_inv"
-        self.weight_scale_refine = None
+        
+        self.weight_scale_refine: tuple[int, int] | None = None
         self.moe_block_shape = self.weight_block_size
+
+        # Set weight key and activation key for kernel compatibility
+        assert self.weight_block_size is not None
+        # Adapt the checkpoint block shape to TP sharding before
+        # building the weight key.
+        self.moe_block_shape, self.weight_scale_refine = (
+            resolve_fp8_moe_weight_block_shape(
+                self.moe,
+                self.weight_block_size,
+                kFp8Dynamic128Sym,
+                self.quant_config.is_checkpoint_fp8_serialized,
+            )
+        )
+        
         # No community backend is selected: the ix30 path is our own compute.
         self.fp8_backend = None
         self.moe_kernel = None
@@ -895,7 +912,17 @@ class IluFp8MoEMethod(Fp8MoEMethod):
                 "wheel and rebuild ixformer with HAVE_IXMM on ivcore30."
             )
 
-        block = (self.weight_block_size[0], self.weight_block_size[1])
+        # Use the runtime (TP-refined) block shape, NOT the checkpoint one.
+        # When TP slicing leaves ``intermediate_size_per_partition`` indivisible
+        # by the checkpoint block, ``resolve_fp8_moe_weight_block_shape``
+        # (mirrored in ``__init__``) refines the grid (e.g. 128 -> 32) and the
+        # inherited ``create_weights`` + loader upsample ``weight_scale_inv``
+        # onto that finer grid. Dequant stays mathematically identical (every
+        # fine sub-block inherits its parent scale), but the element-wise scale
+        # expansion below must use the grid the parameter actually carries --
+        # passing the checkpoint block here would repeat-and-truncate into
+        # silently wrong scales.
+        block = (self.moe_block_shape[0], self.moe_block_shape[1])
 
         for w_name, s_in_name, s_out_name in (
             ("w13_weight", "w13_weight_scale_inv", "w13_weight_scale"),

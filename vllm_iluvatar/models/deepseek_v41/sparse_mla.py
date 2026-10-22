@@ -283,7 +283,9 @@ class IluDeepseekV4SparseMLABackend(AttentionBackend):
     ]
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int]:
+    def get_supported_kernel_block_sizes(
+        kv_cache_spec: "KVCacheSpec | None" = None,
+    ) -> list[int]:
         return [64, 128]
 
     @classmethod

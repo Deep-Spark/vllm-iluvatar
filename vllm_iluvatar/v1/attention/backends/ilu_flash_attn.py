@@ -116,7 +116,9 @@ class IluFlashAttentionBackend(AttentionBackend):
         return (KVCacheLayout.LBHNC,)
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(
+        kv_cache_spec: "KVCacheSpec | None" = None,
+    ) -> list[int | MultipleOf]:
         # The Iluvatar int8 paged FMHA kernel (cuinferFmhaFwdInt8QUnpadKVPageFuncV3)
         # only accepts power-of-2 page sizes. The previous range(16, 257, 16)
         # exposed non-power-of-2 sizes (48/96/192/...) which, on hybrid models

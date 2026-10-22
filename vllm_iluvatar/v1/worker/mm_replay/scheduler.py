@@ -6,6 +6,7 @@ import hashlib
 import os
 import shutil
 import threading
+from contextlib import suppress
 
 from vllm.logger import init_logger
 
@@ -78,6 +79,7 @@ class ReplayScheduler:
         from .lifecycle import claim_session
 
         claim_session(self.root)
+        self._maintenance_period = min(1.0, lease / 3)
         self._stop = threading.Event()
         self._maintenance_thread = None
         self.archive = None
@@ -110,9 +112,21 @@ class ReplayScheduler:
             self._maintenance_thread.start()
 
     def _maintain(self):
-        while not self._stop.wait(1):
-            # Expire leases even while no requests arrive. Cached image data is
-            # intentionally retained within the fixed host LRU budget.
+        while not self._stop.wait(self._maintenance_period):
+            # P can spend longer than a transfer lease in an interleaved long
+            # prefill before D has received its request and can send heartbeats.
+            # Keep only current admitted P work alive; completion hands lease
+            # ownership to D, and terminal release never recreates an archive.
+            for rid in self.admitted.copy():
+                record = self.records.get(rid)
+                if record is not None:
+                    # A terminal release/new generation can race this copied
+                    # record. Renewal must never resurrect or own that source.
+                    with suppress(ValueError, FileNotFoundError):
+                        self.archive.renew(
+                            rid, record["generation"], record["input_digest"]
+                        )
+            # Cached image data remains within the fixed host LRU budget.
             atomic_json(self.root / "source_cache.json", self.archive.stats())
 
     @classmethod

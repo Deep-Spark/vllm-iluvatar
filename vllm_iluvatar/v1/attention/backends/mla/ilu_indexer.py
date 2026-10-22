@@ -143,7 +143,9 @@ class IluDeepseekV32IndexerBackend(AttentionBackend):
         return "DEEPSEEK_V32_INDEXER"
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(
+        kv_cache_spec: "KVCacheSpec | None" = None,
+    ) -> list[int | MultipleOf]:
         return [1 if current_platform.is_rocm() else 64]
 
     @classmethod
@@ -1131,7 +1133,9 @@ class IluDeepseekV4IndexerBackend(IluDeepseekV32IndexerBackend):
         return (KVCacheLayout.BLHNC, KVCacheLayout.BLNHC)
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(
+        kv_cache_spec: "KVCacheSpec | None" = None,
+    ) -> list[int | MultipleOf]:
         # V4 indexer KV-cache block_size。与主 MLA / SWA 一致，
         # 走 NV upstream 的 KV cache 分配路径（indexer 与 main MLA 共用一个
         # KVCacheGroup，kernel_block_size 必须相同）。
@@ -1197,7 +1201,9 @@ class IluDeepseekV41IndexerBackend(IluDeepseekV4IndexerBackend):
         return IluDeepseekV41IndexerMetadataBuilder
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(
+        kv_cache_spec: "KVCacheSpec | None" = None,
+    ) -> list[int | MultipleOf]:
         # ixinfer INT8 accepts a page of 64 or 256 index states. A kernel block
         # is counted in tokens, so an uncompressed INT8 layer stays at 64.
         # ``get_kv_cache_spec`` gives that layer its own 64-token page: v0.31
@@ -1221,7 +1227,9 @@ class IluDeepseekV41IndexerRatio2Backend(IluDeepseekV41IndexerBackend):
     """
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(
+        kv_cache_spec: "KVCacheSpec | None" = None,
+    ) -> list[int | MultipleOf]:
         return [128]
 
 

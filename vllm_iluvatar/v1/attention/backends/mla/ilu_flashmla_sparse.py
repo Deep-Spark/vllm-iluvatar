@@ -81,7 +81,9 @@ class IluFlashMLASparseBackend(AttentionBackend):
     ]
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(
+        kv_cache_spec: "KVCacheSpec | None" = None,
+    ) -> list[int | MultipleOf]:
         return [64]
 
     @staticmethod
@@ -835,5 +837,7 @@ class IluDeepseekV4FlashMLASparseBackend(IluFlashMLASparseBackend):
         return "FLASHMLA_SPARSE_DSV4"
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(
+        kv_cache_spec: "KVCacheSpec | None" = None,
+    ) -> list[int | MultipleOf]:
         return [256]

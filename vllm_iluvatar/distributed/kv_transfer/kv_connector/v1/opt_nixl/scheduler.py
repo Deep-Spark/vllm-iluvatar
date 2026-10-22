@@ -351,8 +351,15 @@ class NixlConnectorScheduler:
         )
 
         self.prefix_state = PrefixSchedulerState.create(vllm_config, kv_cache_config)
+        from vllm_iluvatar.v1.worker.mm_replay.scheduler import ReplayScheduler
+
+        self.mm_replay = ReplayScheduler.create(vllm_config, engine_id)
+        if self.mm_replay is not None:
+            self.node_info["mm_replay"] = self.mm_replay.capabilities()
 
     def shutdown(self):
+        if getattr(self, "mm_replay", None) is not None:
+            self.mm_replay.shutdown()
         if self.prefix_state is not None:
             self.prefix_state.shutdown()
         self._stop_event.set()
@@ -372,6 +379,8 @@ class NixlConnectorScheduler:
 
     def on_new_request(self, request: "Request") -> None:
         """Track live D-side requests that are waiting for remote KV."""
+        if self.mm_replay is not None:
+            self.mm_replay.on_new_request(request)
         params = request.kv_transfer_params
         if self.is_consumer and params and params.get("do_remote_prefill"):
             self._live_recv_reqs.add(request.request_id)
@@ -1143,6 +1152,9 @@ class NixlConnectorScheduler:
         """
         from vllm.v1.request import RequestStatus
 
+        if self.mm_replay is not None:
+            self.mm_replay.finished(request)
+
         params = request.kv_transfer_params
         logger.debug(
             "NIXLConnector request_finished(%s), request_status=%s, "
@@ -1412,6 +1424,47 @@ class NixlConnectorScheduler:
                     await complete_ownership_events()
                     identity, _, data = await recv_from.recv_multipart()
                     message = msgspec.msgpack.decode(data)
+                    from vllm_iluvatar.v1.worker.mm_replay.archive import (
+                        MM_OP,
+                        VERSION as MM_VERSION,
+                        is_capability_request,
+                    )
+
+                    if is_capability_request(message):
+                        supported = (
+                            self.mm_replay is not None and not self.is_consumer
+                            and message[1] == self.engine_id
+                        )
+                        reply_data = dict(
+                            version=3, engine_id=self.engine_id,
+                            status="MM_CAPABILITIES" if supported else "UNSUPPORTED",
+                        )
+                        if supported:
+                            reply_data["mm_replay"] = self.mm_replay.capabilities()
+                        await recv_from.send_multipart((
+                            identity, b"", msgspec.msgpack.encode(reply_data), b""
+                        ))
+                        continue
+
+                    if (
+                        isinstance(message, (tuple, list))
+                        and message
+                        and message[0] == MM_OP
+                    ):
+                        archive = (
+                            self.mm_replay.archive
+                            if self.mm_replay is not None else None
+                        )
+                        mm_reply, mm_payload = (
+                            archive.handle(message) if archive is not None else (
+                                dict(version=MM_VERSION, engine_id=self.engine_id,
+                                     status="UNSUPPORTED"), b""
+                            )
+                        )
+                        await recv_from.send_multipart((
+                            identity, b"", msgspec.msgpack.encode(mm_reply), mm_payload
+                        ))
+                        continue
                     # E25 uses this existing P/D endpoint. State messages are
                     # handled locally and never published as worker commands.
                     from vllm_iluvatar.v1.worker.prefill_state.source_state import (

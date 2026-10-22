@@ -57,7 +57,6 @@ from vllm.models.deepseek_v41.common.mm_preprocess import (
     IMAGE_PLACEHOLDER,
     IMAGE_START,
     DeepseekV4VLDummyInputsBuilder,
-    DeepseekV4VLMultiModalProcessor,
     DeepseekV4VLProcessingInfo,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -66,6 +65,8 @@ from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from vllm_iluvatar.models.deepseek_v4.fp8_model import _make_fp8_weights_mapper
 from vllm_iluvatar.models.deepseek_v41.model import IluDeepseekV41ForCausalLM
+from vllm_iluvatar.v1.worker.mm_replay.configuration import consumer_only
+from vllm_iluvatar.v1.worker.mm_replay.processor import CertifiedImageProcessor
 
 logger = init_logger(f"vllm.{__name__}")
 
@@ -129,7 +130,7 @@ def _make_v41_vl_weights_mapper() -> WeightsMapper:
 
 
 @MULTIMODAL_REGISTRY.register_processor(
-    DeepseekV4VLMultiModalProcessor,
+    CertifiedImageProcessor,
     info=DeepseekV4VLProcessingInfo,
     dummy_inputs=DeepseekV4VLDummyInputsBuilder,
 )
@@ -159,6 +160,7 @@ class IluDeepseekV41VLForCausalLM(
         model_config = vllm_config.model_config
         config = model_config.hf_config
         self.config = config
+        self._remote_mm_encoder = consumer_only(vllm_config)
         self.multimodal_config = model_config.multimodal_config
         assert self.multimodal_config is not None
 
@@ -215,7 +217,9 @@ class IluDeepseekV41VLForCausalLM(
         already_stubbed = (
             mm_config is not None and mm_config.get_limit_per_prompt("image") == 0
         )
-        if already_stubbed or get_pp_group().is_first_rank:
+        if already_stubbed or (
+            get_pp_group().is_first_rank and not self._remote_mm_encoder
+        ):
             yield
             return
         with no_init_weights(self, lambda mod: StageMissingLayer("vision_tower", mod)):
@@ -302,6 +306,10 @@ class IluDeepseekV41VLForCausalLM(
         return tuple(embeds)
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        if self._remote_mm_encoder:
+            raise RuntimeError(
+                "The PD decoder has no vision encoder; schedule producer embeddings"
+            )
         image_input = self._parse_and_validate_image_input(**kwargs)
         if image_input is None:
             return []
@@ -392,6 +400,10 @@ class IluDeepseekV41VLForCausalLM(
             for name, weight in self.hf_to_vllm_mapper.apply(weights):
                 if name.startswith(_LM_PREFIX):
                     yield name[len(_LM_PREFIX) :], weight
+                elif self._remote_mm_encoder and name.startswith(
+                    ("vision.", "aligner.", "image_start", "image_end", "image_newline")
+                ):
+                    continue
                 else:
                     tower.append((name, weight))
 

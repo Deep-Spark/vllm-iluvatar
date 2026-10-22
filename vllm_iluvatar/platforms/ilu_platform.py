@@ -230,6 +230,11 @@ def _make_iluvatar_platform():
             )
 
             initialize_config(vllm_config)
+            from vllm_iluvatar.v1.worker.mm_replay.configuration import (
+                initialize_config as initialize_mm_replay,
+            )
+
+            initialize_mm_replay(vllm_config)
 
             pc = getattr(vllm_config, "parallel_config", None)
             import sys

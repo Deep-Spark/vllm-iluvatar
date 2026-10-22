@@ -33,6 +33,12 @@ class IluWorker(Worker):
         self.prefix_state = (
             configure(self.model_runner) if configure is not None else None
         )
+        if self.vllm_config.use_v2_model_runner:
+            configure_mm = getattr(
+                self.model_runner.model_state, "configure_mm_replay", None
+            )
+            if configure_mm is not None:
+                configure_mm()
         import vllm.envs as envs
 
         if envs.VLLM_ILU_DP_VOCAB_GROUP_SIZE:

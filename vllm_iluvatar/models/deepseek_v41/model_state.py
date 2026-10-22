@@ -43,6 +43,12 @@ class IluDeepseekV41ModelState(DeepseekV41ModelState):
     """V4.1 raw-token forwarding and optional producer-prefix lifecycle."""
 
     prefix_state = None
+    mm_replay = None
+
+    def configure_mm_replay(self):
+        from vllm_iluvatar.v1.worker.mm_replay.worker import configure
+
+        self.mm_replay = configure(self)
 
     def configure_prefix_reuse(self, runner):
         from vllm_iluvatar.v1.worker.prefill_state.configuration import enabled
@@ -77,13 +83,29 @@ class IluDeepseekV41ModelState(DeepseekV41ModelState):
 
     def add_request(self, req_index, new_req_data):
         super().add_request(req_index, new_req_data)
+        if self.mm_replay is not None:
+            self.mm_replay.add_request(new_req_data)
         if self.prefix_state is not None:
             self.prefix_state.add_request(req_index, new_req_data)
 
     def remove_request(self, req_id):
+        if self.mm_replay is not None:
+            self.mm_replay.remove_request(req_id)
         if self.prefix_state is not None:
             self.prefix_state.remove_request(req_id)
         super().remove_request(req_id)
+
+    def prepare_inputs_embeds(self, scheduled_encoder_inputs, input_batch, req_states):
+        if self.mm_replay is not None:
+            if self.mm_replay.consumer:
+                result = self.mm_replay.prepare(input_batch)
+                if result is not None:
+                    return result
+            else:
+                self.mm_replay.prepare(scheduled_encoder_inputs)
+        return super().prepare_inputs_embeds(
+            scheduled_encoder_inputs, input_batch, req_states
+        )
 
     def prepare_attn(
         self, input_batch, cudagraph_mode, block_tables, slot_mappings, *args, **kwargs

@@ -11,7 +11,7 @@ import time
 import numpy as np
 import torch
 
-from .cache_rows import indexer_row_views, restore_indexer_row, main_boundary_sources
+from .cache_rows import indexer_row_views, main_boundary_sources, restore_indexer_row
 from .configuration import PrefixGeometry, prefix_transfer_config, session_paths
 from .decode_prefix import PrefixBuffers
 from .runtime import PrefixRuntime
@@ -118,11 +118,17 @@ class ConsumerPrefixState(PrefixRuntime):
                 idx=idx,
                 generation=gen,
                 N=request.prompt_len,
-                eligible=self.request_eligible(request),
+                eligible=self.request_eligible(request, allow_mm=self._mm_prefix_reuse),
                 token_sha256=hashlib.sha256(
                     np.asarray(tokens[: request.prompt_len], dtype=np.int32).tobytes()
                 ).hexdigest(),
                 blocks=self.initial_blocks(request),
+            )
+            state = self._p21_states[rid]
+            state["mm_input_digest"] = (
+                self.mm_input_identity(request, state["token_sha256"])
+                if state["eligible"]
+                else None
             )
 
     def remove_request(self, rid):
@@ -209,8 +215,9 @@ class ConsumerPrefixState(PrefixRuntime):
                     else None
                 )
                 if layer == self.geometry.prefix_depth - 1 and name.endswith(".attn"):
-                    self._p21_cache_sources.extend(main_boundary_sources(
-                        static[name], name, g, self.geometry))
+                    self._p21_cache_sources.extend(
+                        main_boundary_sources(static[name], name, g, self.geometry)
+                    )
                     continue
                 if kind is None and layer == self.geometry.prefix_depth - 1:
                     kind = (
@@ -233,8 +240,10 @@ class ConsumerPrefixState(PrefixRuntime):
                     )
         assert (
             len(self._p21_cache_sources)
-            == self.geometry.prefix_depth + len(self.geometry.ring_layers)
-            + len(self.geometry.main_tail_fields()) + 1
+            == self.geometry.prefix_depth
+            + len(self.geometry.ring_layers)
+            + len(self.geometry.main_tail_fields())
+            + 1
         )
         self._p21_ring_rows = {
             s["layer"]: s["cache"].shape[1]
@@ -300,6 +309,7 @@ class ConsumerPrefixState(PrefixRuntime):
                             "generation": s["generation"],
                             "N": s["N"],
                             "token_sha256": s["token_sha256"],
+                            "mm_input_digest": s.get("mm_input_digest"),
                             "endpoint": self._p21_recv_metadata.get(rid, {}).get(
                                 "source_endpoint"
                             ),
@@ -334,6 +344,7 @@ class ConsumerPrefixState(PrefixRuntime):
                             self._p21_tp,
                             state["N"],
                             state["token_sha256"],
+                            mm_input_digest=state.get("mm_input_digest"),
                             geometry=self.geometry,
                             ring_rows=self._p21_ring_rows,
                         )
@@ -547,6 +558,7 @@ class ConsumerPrefixState(PrefixRuntime):
                         and N == state["N"] == meta["N"]
                         and meta["H"] == H
                         and meta["S"] == S
+                        and meta.get("mm_input_digest") == state.get("mm_input_digest")
                         and c == S
                         and int(q[i + 1] - q[i]) == rows
                         and state["idx"]
@@ -700,18 +712,24 @@ class ConsumerPrefixState(PrefixRuntime):
                                 sum(
                                     v.numel()
                                     for v in indexer_row_views(
-                                        cache, int(blocks[logical]), row,
+                                        cache,
+                                        int(blocks[logical]),
+                                        row,
                                         source.get("scales"),
                                     )
                                 )
                                 == field["byte_count"]
                             )
                         elif valid:
-                            field = next(f for f in packet["metadata"]["fields"]
-                                         if f["kind"] == source["kind"])
+                            field = next(
+                                f
+                                for f in packet["metadata"]["fields"]
+                                if f["kind"] == source["kind"]
+                            )
                             eligible &= (
                                 str(cache.dtype) in DTYPES
-                                and DTYPES[str(cache.dtype)][0] == DTYPES[field["dtype"]][0]
+                                and DTYPES[str(cache.dtype)][0]
+                                == DTYPES[field["dtype"]][0]
                                 and tuple(field["shape"]) == (1, cache.shape[-1])
                             )
         free, _ = torch.cuda.mem_get_info()
@@ -853,8 +871,9 @@ class ConsumerPrefixState(PrefixRuntime):
                     if source["kind"] in ("main_tail", "main_tail_scale"):
                         cache[block, row].copy_(data[0], non_blocking=True)
                     else:
-                        restore_indexer_row(cache, block, row, data,
-                                            source.get("scales"))
+                        restore_indexer_row(
+                            cache, block, row, data, source.get("scales")
+                        )
             region = slice(int(q[i]), int(q[i + 1]))
             h[region].copy_(view(fields["HC"]), non_blocking=True)
             pre[region].copy_(view(fields["pre_mix"]), non_blocking=True)

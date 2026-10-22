@@ -117,3 +117,22 @@ receipts, request reuse, boundary key/scale layout, workspace sizes and explicit
 padded-prefix execution. Integration tests use the standard worker/model-state
 and connector callbacks. Deployment validation must also check the actual
 TP/PP cut, cache geometry, replay hits, memory reserve and end-to-end accuracy.
+
+## Multimodal prefix identity
+
+Text requests retain protocol v3 and their original token digest. Native PD
+image reuse is opt-in through `enable_mm_prefix_state_reuse`, and also requires
+`mm_encoder_on_prefill_only` on the P/D connector configurations. The image
+processor certifies actual processed CPU tensors before replicated cache lookup.
+The proof includes model identity, tensor layouts/content, ordered absolute
+image positions and complete prompt token identity. Client image UUIDs alone
+cannot certify reuse; prompt embeddings and adapters remain ineligible.
+
+For images the existing six-field `GET_STATE` operation carries a v4 typed
+identity in its final field. Producer shards, publication marker and consumer
+pending snapshot retain that same proof. All original generation, geometry,
+KV receipt, full source coverage and all-DP GO checks still apply. A missing or
+incompatible proof falls back to the independently correct native remote image
+embedding path. No new router handler, standalone service or shared P/D path
+is needed. See the `mm_replay` package and the launcher `MM-PD-REPLAY.md` for
+encoder ownership, bounded staging and terminal cleanup details.

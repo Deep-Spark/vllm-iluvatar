@@ -7,7 +7,7 @@ import msgspec
 import pytest
 import zmq
 
-from vllm_iluvatar.v1.worker.mm_replay.archive import SourceArchive
+from vllm_iluvatar.v1.worker.mm_replay.archive import SourceArchive, storage_key
 from vllm_iluvatar.v1.worker.mm_replay.receiver import RangeReceiver, read_window
 
 
@@ -204,3 +204,108 @@ def test_native_registry_multipart_and_legacy_safe_capability_query(
         proxy.close(0)
         producer.close(0)
         context.term()
+
+
+def test_one_million_context_rewind_and_terminal_ack(tmp_path, endpoint):
+    archive, raw, feature, peer, messages = endpoint
+    start = 1048576 - 200
+    image = dict(feature, start=start)
+    assert archive.admit("long", "long-gen", "b" * 64, 1048576, [image])
+    archive.publish("long", "long-gen", "image", raw)
+    receiver = RangeReceiver(
+        tmp_path / "private-D",
+        lambda _: peer,
+        hidden_size=8,
+        max_window_rows=129,
+        max_num_seqs=3,
+        page_rows=8,
+    )
+    features = [{k: image[k] for k in ("key", "start", "rows")}]
+    try:
+        receiver.register(
+            dict(
+                request_id="long",
+                generation="long-gen",
+                input_digest="b" * 64,
+                prompt_len=1048576,
+                features=features,
+                engine_id="P",
+            )
+        )
+        for lo, hi in (
+            (start + 8, start + 20),
+            (start, start + 12),
+            (start + 4, start + 15),
+        ):
+            deadline = time.monotonic() + 3
+            while not receiver.ensure("long", lo, hi):
+                assert not receiver.failures()
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            _, payload = read_window(
+                receiver.root, "long", "long-gen", "b" * 64, lo, hi, 8, features
+            )
+            assert payload == raw[(lo - start) * 16 : (hi - start) * 16]
+        pages = list((receiver.root / storage_key("long")).glob("*.bin"))
+        assert sum(p.stat().st_size for p in pages) == len(raw)
+        receiver.finish("long")
+        # A queued worker may still consume its already scheduled replay.
+        time.sleep(0.1)
+        _, payload = read_window(
+            receiver.root, "long", "long-gen", "b" * 64, start, start + 20, 8, features
+        )
+        assert payload == raw
+        directory = receiver.root / storage_key("long")
+        (directory / "worker_done").touch()
+        receiver.wakeup.set()
+        deadline = time.monotonic() + 3
+        while directory.exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+    finally:
+        receiver.shutdown()
+
+
+def test_timed_out_range_reconnects_without_accepting_stale_frames(tmp_path, endpoint):
+    archive, raw, feature, peer, messages = endpoint
+    original = archive.handle
+    delayed = [False]
+
+    def handle(message):
+        if message[2] == "GET" and not delayed[0]:
+            delayed[0] = True
+            time.sleep(0.4)  # exceed the receiver's250ms RPC timeout
+        return original(message)
+
+    archive.handle = handle
+    archive.publish("request", "gen", "image", raw)
+    receiver = RangeReceiver(
+        tmp_path / "D-reconnect",
+        lambda _: peer,
+        hidden_size=8,
+        max_window_rows=129,
+        max_num_seqs=3,
+    )
+    try:
+        receiver.register(
+            dict(
+                request_id="request",
+                generation="gen",
+                input_digest="a" * 64,
+                prompt_len=129,
+                features=[{k: feature[k] for k in ("key", "start", "rows")}],
+                engine_id="P",
+            )
+        )
+        deadline = time.monotonic() + 4
+        while not receiver.ensure("request", 0, 129):
+            assert time.monotonic() < deadline
+            assert not receiver.failures()
+            time.sleep(0.01)
+        _, payload = read_window(
+            receiver.root, "request", "gen", "a" * 64, 0, 129, 8, [feature]
+        )
+        assert payload == raw
+        assert sum(m[2] == "GET" for m in messages) > 3
+    finally:
+        receiver.shutdown()

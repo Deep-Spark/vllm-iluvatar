@@ -15,6 +15,7 @@ from pathlib import Path
 from .configuration import PrefixGeometry, ProducerTopology
 
 PROTOCOL_VERSION = 3
+MM_PROTOCOL_VERSION = 4
 GET_STATE = b"p21_state_v1"
 DTYPES = {
     "torch.bfloat16": ("BF16", 2),
@@ -136,6 +137,13 @@ def join_packets(
     if geometry.prefix_depth != topology.prefix_depth:
         raise ValueError("Producer topology and geometry disagree")
     n, digest = rows[0]["N"], rows[0]["token_sha256"]
+    mm_digest = rows[0].get("mm_input_digest")
+    extension = {} if mm_digest is None else {"mm_input_digest": mm_digest}
+    version = PROTOCOL_VERSION if mm_digest is None else MM_PROTOCOL_VERSION
+    if mm_digest is not None and (
+        not isinstance(mm_digest, str) or len(mm_digest) != 64
+    ):
+        raise ValueError("Invalid multimodal input identity")
     hit, start, _ = replay_layout(n)
     if not all(
         r["engine_id"] == engine_id
@@ -145,6 +153,7 @@ def join_packets(
         and r["H"] == hit
         and r["S"] == start
         and r["token_sha256"] == digest
+        and r.get("mm_input_digest") == mm_digest
         and r["rank"] == r["pp"] * topology.tp_size + r["tp"]
         and 0 <= r["pp"] < topology.pp_size
         and 0 <= r["tp"] < topology.tp_size
@@ -163,8 +172,13 @@ def join_packets(
         observed = json.loads(
             (shard_directory / f"observed_{row['rank']}.json").read_text()
         )
-        if observed["admission"] != row["admission"]:
-            raise ValueError("Producer admission changed during publication")
+        if (
+            observed["admission"] != row["admission"]
+            or observed.get("mm_input_digest") != mm_digest
+        ):
+            raise ValueError(
+                "Producer admission or image identity changed during publication"
+            )
     target = request_dir(wire, request_id)
     target.mkdir(exist_ok=True)
     for tp in range(topology.tp_size):
@@ -203,7 +217,8 @@ def join_packets(
         save(
             target / f"packet_tp{tp}.json",
             dict(
-                version=PROTOCOL_VERSION,
+                version=version,
+                **extension,
                 topology=topology.to_dict(),
                 geometry=geometry.to_dict(),
                 ring_rows=ring_rows,
@@ -237,6 +252,7 @@ def join_packets(
             admission=rows[0]["admission"],
             N=n,
             token_sha256=digest,
+            **extension,
             fresh=True,
             ready_mono_ns=time.monotonic_ns(),
         ),
@@ -382,6 +398,16 @@ def serve_state(
     if not isinstance(message, (tuple, list)) or len(message) != 6:
         return reply, b""
     _, remote_id, rid, tp, n, digest = message
+    mm_digest = None
+    if isinstance(digest, dict):
+        if digest.get("version") != MM_PROTOCOL_VERSION:
+            return reply, b""
+        mm_digest = digest.get("mm_input_digest")
+        digest = digest.get("token_sha256")
+        reply["version"] = MM_PROTOCOL_VERSION
+        if not isinstance(mm_digest, str) or len(mm_digest) != 64:
+            return reply, b""
+    version = PROTOCOL_VERSION if mm_digest is None else MM_PROTOCOL_VERSION
     if remote_id != engine_id:
         return {**reply, "status": "WRONG_ENGINE"}, b""
     if wire is None:
@@ -418,6 +444,10 @@ def serve_state(
             and meta["admission"] == source["admission"]
             and meta["topology"] == source["topology"]
             and meta["token_sha256"] == source["token_sha256"] == digest
+            and meta["version"] == version
+            and meta.get("mm_input_digest")
+            == source.get("mm_input_digest")
+            == mm_digest
             and source["fresh"]
             and meta["source_complete"]
         ):
@@ -452,19 +482,26 @@ def fetch_state(
     *,
     geometry=None,
     ring_rows=None,
+    mm_input_digest=None,
 ) -> tuple[dict, bytes]:
     """The D receiver owns this socket; inference/Graph code never uses it."""
     import msgspec
 
+    version = PROTOCOL_VERSION if mm_input_digest is None else MM_PROTOCOL_VERSION
+    identity = (
+        digest
+        if mm_input_digest is None
+        else dict(version=version, token_sha256=digest, mm_input_digest=mm_input_digest)
+    )
     socket.send(
-        msgspec.msgpack.encode((GET_STATE, engine_id, request_id, tp, n, digest))
+        msgspec.msgpack.encode((GET_STATE, engine_id, request_id, tp, n, identity))
     )
     frames = socket.recv_multipart()
     if len(frames) != 2:
         raise ValueError("Expected prefix-state metadata and CPU payload frames")
     reply = msgspec.msgpack.decode(frames[0])
     raw = frames[1]
-    if reply.get("version") != PROTOCOL_VERSION or reply.get("engine_id") != engine_id:
+    if reply.get("version") != version or reply.get("engine_id") != engine_id:
         raise ValueError("Prefix-state endpoint identity mismatch")
     if reply.get("status") != "READY":
         if raw:
@@ -478,12 +515,15 @@ def fetch_state(
         and meta["engine_id"] == source["engine_id"] == engine_id
         and meta["run_uuid"] == source["run_uuid"]
         and meta["run_uuid"]
-        and meta["version"] == PROTOCOL_VERSION
+        and meta["version"] == version
         and meta["N"] == source["N"] == n
         and meta["H"] == hit
         and meta["S"] == start
         and meta["tp"] == tp % topology.tp_size
         and meta["token_sha256"] == source["token_sha256"] == digest
+        and meta.get("mm_input_digest")
+        == source.get("mm_input_digest")
+        == mm_input_digest
         and meta["epoch"] == source["epoch"]
         and meta["epoch"] > 0
         and meta["admission"] == source["admission"]

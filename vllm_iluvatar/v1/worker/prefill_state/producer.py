@@ -10,7 +10,12 @@ import numpy as np
 import torch
 
 from .cache_rows import copy_indexer_row_to_host, main_boundary_sources
-from .configuration import PrefixGeometry, ProducerTopology, prefix_transfer_config, session_paths
+from .configuration import (
+    PrefixGeometry,
+    ProducerTopology,
+    prefix_transfer_config,
+    session_paths,
+)
 from .runtime import PrefixRuntime
 from .source_state import replay_layout, request_dir
 
@@ -67,7 +72,7 @@ class ProducerPrefixState(PrefixRuntime):
         key = hashlib.sha256(
             np.asarray(tokens[:prompt_len], dtype=np.int32).tobytes()
         ).hexdigest()
-        eligible = self.request_eligible(request)
+        eligible = self.request_eligible(request, allow_mm=self._mm_prefix_reuse)
         hit, start, rows = replay_layout(prompt_len) if eligible else (prompt_len, 0, 0)
         with self._src_lock:
             pool = self._src_free.popleft() if eligible and self._src_free else None
@@ -80,6 +85,9 @@ class ProducerPrefixState(PrefixRuntime):
                 H=hit,
                 S=start,
                 token_sha256=key,
+                mm_input_digest=self.mm_input_identity(request, key)
+                if eligible
+                else None,
                 initial_computed=int(request.num_computed_tokens),
                 run_uuid=self._src_nonce,
                 engine_id=self._src_engine,
@@ -130,7 +138,7 @@ class ProducerPrefixState(PrefixRuntime):
         self._src_batch = None
 
     def _scalar(self, state):
-        return {
+        result = {
             k: state[k]
             for k in (
                 "id",
@@ -147,6 +155,9 @@ class ProducerPrefixState(PrefixRuntime):
                 "add_mono_ns",
             )
         }
+        if state.get("mm_input_digest") is not None:
+            result["mm_input_digest"] = state["mm_input_digest"]
+        return result
 
     def initialize_cache(self):
         runner = self.model_runner
@@ -192,8 +203,9 @@ class ProducerPrefixState(PrefixRuntime):
                     name.endswith(".attn") or name.endswith(".attn.indexer.k_cache")
                 ):
                     if name.endswith(".attn"):
-                        self._src_specs.extend(main_boundary_sources(
-                            static[name], name, g, self.geometry))
+                        self._src_specs.extend(
+                            main_boundary_sources(static[name], name, g, self.geometry)
+                        )
                         continue
                     kind = "indexer_tail"
                     self._src_specs.append(
@@ -358,8 +370,9 @@ class ProducerPrefixState(PrefixRuntime):
                 if spec["kind"] in ("main_tail", "main_tail_scale"):
                     host[0].copy_(cache[block, row], non_blocking=True)
                 else:
-                    copy_indexer_row_to_host(host, cache, block, row,
-                                             spec.get("scales"))
+                    copy_indexer_row_to_host(
+                        host, cache, block, row, spec.get("scales")
+                    )
                 segments.append(
                     dict(
                         logical_rows=[start, stop],

@@ -789,15 +789,16 @@ def _install_fake_ixfops(monkeypatch):
     fake_ixfops = MagicMock()
     _routing_out = {}
 
-    def _routing(topk_ids, start, end, expert_map=None):
+    def _routing(*args, **kwargs):
+        topk_ids = args[0] if args else kwargs["topk_ids"]
         M = topk_ids.numel()
         src_to_dst = torch.arange(M, dtype=torch.int32)
-        dst_to_src = torch.arange(M, dtype=torch.int32)
-        group_layout = (
-            torch.tensor([[0, M]], dtype=torch.int32)
-            .expand(end - start, 2)
-            .contiguous()
-        )
+        dst_to_src = kwargs.get("dst_to_src")
+        if dst_to_src is None:
+            dst_to_src = torch.arange(M, dtype=torch.int32)
+        else:
+            dst_to_src.copy_(torch.arange(M, dtype=torch.int32))
+        group_layout = kwargs["group_layout"]
         result = (src_to_dst, dst_to_src, group_layout)
         _routing_out["v"] = result
         return result
@@ -872,14 +873,15 @@ def test_ixformer_pipeline_wires_args_correctly(weights, hidden_states, monkeypa
 
     src_to_dst, dst_to_src, group_layout = routing_out["v"]
 
-    # 1) routing: topk_ids forwarded untouched, start=0, end=E_local, and the
-    # expert_map remap delegated to the op.
     routing_call = fake_ixfops.moe_compute_token_index_ep_group_layout
     routing_call.assert_called_once()
-    r_args = routing_call.call_args.args
-    assert r_args[0] is topk_ids
-    assert r_args[1] == 0 and r_args[2] == w13_n.shape[0]
-    assert routing_call.call_args.kwargs["expert_map"] is None
+    r_args, r_kwargs = routing_call.call_args
+    assert r_args[0].dtype == torch.int32
+    assert r_args[1] == 0
+    assert r_args[2] == w13_n.shape[0]
+    assert r_kwargs["expert_map"] is None
+    assert r_kwargs["group_layout"] is group_layout
+    assert tuple(r_kwargs["group_layout"].shape) == (w13_n.shape[0], 3)
 
     # 2) expand: dst_to_src + top_k forwarded.
     expand_call = fake_ixfops.moe_expand_input_dynamic_scaled_fp8
@@ -1079,7 +1081,9 @@ def test_ixformer_pipeline_forwards_expert_map_without_remapping(
 
     routing_call = fake_ixfops.moe_compute_token_index_ep_group_layout
     routing_call.assert_called_once()
-    assert routing_call.call_args.args[0] is topk_ids
-    assert routing_call.call_args.args[1] == 0
-    assert routing_call.call_args.args[2] == expert_count
-    assert routing_call.call_args.kwargs["expert_map"] is expert_map
+    r_args, r_kwargs = routing_call.call_args
+    assert r_args[0] is topk_ids
+    assert r_args[1] == 0
+    assert r_args[2] == expert_count
+    assert r_kwargs["expert_map"] is expert_map
+    assert tuple(r_kwargs["group_layout"].shape) == (expert_count, 3)

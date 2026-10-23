@@ -27,7 +27,7 @@ Two implementations, one dispatcher
 * ``_ilu_mxfp4_fused_experts_ixformer`` -- the production path. Six device
   kernels, no bf16 weight materialisation::
 
-      moe_compute_token_index_ep_group_layout
+      moe_compute_token_index_ep_group_layout ([E, 3] F4F8 group_layout)
         -> moe_expand_input_dynamic_scaled_fp8
         -> group_gemm_fp4(w13) -> swiglu_limit_dynamic_scaled_fp8
         -> group_gemm_fp4(w2)  -> moe_gather_output_reduce_sum(extra_residual=...)
@@ -155,7 +155,8 @@ def _to_local_expert_ids(
 
     Only the torch path uses this. The ixformer path forwards ``expert_map`` to
     ``moe_compute_token_index_ep_group_layout``, which applies the same formula
-    inside the routing kernel.
+    inside the routing kernel. Pass a preallocated ``[E_local, 3]``
+    ``group_layout`` so F4F8 grouped GEMM gets load-descending expert order.
     """
     ids = topk_ids.long()
     if expert_map is None:
@@ -581,16 +582,21 @@ def _ilu_mxfp4_fused_experts_ixformer(
         "fallen back to the torch path"
     )
 
-    # --- 1) Routing: the op owns the global -> local remap ----------------
-    #     ``expert_map`` is forwarded as-is: ``None`` for pure TP / single card
-    #     (ids are already local), otherwise the community
-    #     ``[global_num_experts]`` int32 map with ``-1`` for remote experts.
-    #     Remote and out-of-range routes come back as ``-1`` in ``src_to_dst``
-    #     and are skipped by the final gather, so no host-side early-out is
-    #     needed even when this rank owns none of the routed experts.
+    # --- 1) Routing: expert_map + F4F8 [E, 3] group_layout ----------------
+    #     Maps stay expert-major with -1 padding on unused slots. Layout is
+    #     [start, end, local_expert_id] sorted by descending token count so
+    #     ix30 F4F8 grouped GEMM schedules heavy experts first. Token storage
+    #     is not reordered.
+    group_layout = torch.empty(
+        (E_local, 3), dtype=torch.int32, device=hidden_states.device
+    )
     src_to_dst, dst_to_src, group_layout = (
         ixfops.moe_compute_token_index_ep_group_layout(
-            topk_ids, 0, E_local, expert_map=expert_map
+            topk_ids,
+            0,
+            E_local,
+            expert_map=expert_map,
+            group_layout=group_layout,
         )
     )
 

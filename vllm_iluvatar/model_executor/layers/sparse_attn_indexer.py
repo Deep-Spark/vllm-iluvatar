@@ -61,9 +61,8 @@ def _mqa_logits(*args, **kwargs):
 
 def _mqa_logits_for_candidates(candidate_blocks, *args, **kwargs):
     del candidate_blocks
-    # Visibility has to reach the producer. The legacy with_blocks entry on
-    # this ixformer ignores ``valid_lens`` and does not take the span pair, so
-    # every record goes through ``_mqa_logits``.
+    # Visibility has to reach the producer (``valid_lens`` / ks-ke). Keep a
+    # single dispatch so fp8 vs int8 vs bf16 does not fork here.
     return _mqa_logits(*args, **kwargs)
 
 

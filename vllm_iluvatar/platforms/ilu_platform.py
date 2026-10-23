@@ -34,6 +34,11 @@ _ILU_BACKEND_MODULES_SMOKED = False
 _ILU_MLA_PREFILL_FLASH_ATTN_BACKEND = (
     "vllm_iluvatar.v1.attention.backends.mla.prefill.flash_attn.FlashAttnPrefillBackend"
 )
+_DSV41_ARCHS = (
+    "DeepseekV41ForCausalLM",
+    "IluDeepseekV41ForCausalLM",
+    "IluDeepseekV41VLForCausalLM",
+)
 
 # ILU override backend modules to smoke-import at registration time so that
 # import-time name drift (e.g. a community symbol rename consumed at module
@@ -315,11 +320,17 @@ def _make_iluvatar_platform():
             except Exception:
                 archs = []
             if model_config.tokenizer_mode == "auto":
-                if "IluDeepseekV41ForCausalLM" in archs:
+                if any(
+                    a in archs
+                    for a in (
+                        "IluDeepseekV41ForCausalLM",
+                        "IluDeepseekV41VLForCausalLM",
+                    )
+                ):
                     model_config.tokenizer_mode = "deepseek_v41"
                     logger.info(
-                        "ILU: set tokenizer_mode='deepseek_v41' for "
-                        "IluDeepseekV41ForCausalLM"
+                        "ILU: set tokenizer_mode='deepseek_v41' for %s",
+                        archs,
                     )
                 elif "IluDeepseekV4ForCausalLM" in archs:
                     model_config.tokenizer_mode = "deepseek_v4"
@@ -327,6 +338,18 @@ def _make_iluvatar_platform():
                         "ILU: set tokenizer_mode='deepseek_v4' for "
                         "IluDeepseekV4ForCausalLM"
                     )
+            mm_config = getattr(model_config, "multimodal_config", None)
+            if (
+                mm_config is not None
+                and not mm_config.language_model_only
+                and any(a in archs for a in _DSV41_ARCHS)
+                and not getattr(model_config.hf_config, "vision_n_layers", 0)
+            ):
+                mm_config.language_model_only = True
+                logger.info(
+                    "ILU: %s has no vision tower; set language_model_only=True",
+                    archs,
+                )
 
         @classmethod
         def get_attn_backend_cls(

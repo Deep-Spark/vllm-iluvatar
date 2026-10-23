@@ -14,8 +14,8 @@ plain BF16 rows or the V3.2 grouped 132-byte page -- so the parameter is
 * ``"fp8"``:  uint8 [num_blocks, block_size, 132] grouped pages holding 128
   E4M3 bytes per row followed by one FP32 scale per row.
 * ``"int8"``: the same grouped 132-byte page with scheme-A INT8 values
-  (amax/127) instead of E4M3, which is what ``dsa_indexer_mqa_logits`` with
-  ``backend="ixinfer"`` reads.
+  (amax/127) instead of E4M3, which is what
+  ``dsa_indexer_mqa_logits_with_kvcache`` with ``backend="ixinfer"`` reads.
 
 Neither path quantize-dequantizes. What lands in the cache is what the scoring
 kernel reads.

@@ -5,7 +5,7 @@
 The BF16 indexer in ``attention.py`` keeps K in the checkpoint dtype and feeds
 the cuinfer bf16 mqa-logits kernel. This variant runs the same three steps on
 the fp8 lane that DeepSeek V4 uses -- ``ds4_fused_indexer_q_rope_fp8_quant``,
-a grouped fp8 K insert, and ``dsa_indexer_mqa_logits_with_blocks_fp8`` --
+a grouped fp8 K insert, and ``dsa_indexer_mqa_logits_with_kvcache_fp8`` --
 which measures 2.2~2.6x faster on hy4's prefill shapes and up to 9x on decode,
 and halves the indexer K cache (132 B/token vs 256 B).
 

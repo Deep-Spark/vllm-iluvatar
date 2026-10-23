@@ -491,7 +491,17 @@ def topk_hash_softplus_sqrt(
     if hash_indices_table is not None and hash_indices_table.dtype != torch.int32:
         hash_indices_table = hash_indices_table.to(dtype=torch.int32)
 
+    has_image_tokens = False
     if bias_vl is not None and image_sentinel_lo > 0:
+        try:
+            from vllm.forward_context import get_forward_context
+
+            has_image_tokens = bool(
+                getattr(get_forward_context(), "ilu_v41_has_image_tokens", False)
+            )
+        except Exception:
+            has_image_tokens = False
+    if has_image_tokens:
         # Vision-language bias: ixformer's kernel only takes a 1D
         # e_score_correction_bias broadcast across tokens, so fall back to
         # a pure-torch sqrt-softplus topk with a per-token bias. Image

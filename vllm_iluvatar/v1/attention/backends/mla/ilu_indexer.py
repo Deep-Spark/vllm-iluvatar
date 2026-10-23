@@ -215,8 +215,8 @@ class IluDeepseekV32IndexerPrefillChunkMetadata:
     token_end: int
     num_reqs: int
     max_context_len: int
-    max_q_len: int  # Maximum query length for dsa_indexer_mqa_logits_with_blocks
-    max_kv_len: int  # Maximum key-value length for dsa_indexer_mqa_logits_with_blocks
+    max_q_len: int  # Maximum query length for dsa_indexer_mqa_logits_with_kvcache
+    max_kv_len: int  # Maximum key-value length for dsa_indexer_mqa_logits_with_kvcache
     skip_kv_gather: bool = False
 
 
@@ -372,7 +372,7 @@ def kv_spans_from_batches(
                          Example: [5, 9, 4].
       compress_ratio: cache compression ratio. ``cu_seqlen_ks/ke`` are
                      emitted in compressed-domain so the indexer kernels
-                     (dsa_indexer_mqa_logits_with_blocks /
+                     (dsa_indexer_mqa_logits_with_kvcache /
                      dsa_update_topk_indices) see a logits matrix of width
                      == compressed kv len. ``compress_ratio == 1`` keeps the
                      legacy V3.2 token-domain semantics.
@@ -405,7 +405,7 @@ def kv_spans_from_batches(
             torch.empty(0, dtype=torch.int32, device=device),
         )
 
-    # Compressed seq_len per batch — what dsa_indexer_mqa_logits_with_blocks
+    # Compressed seq_len per batch — what dsa_indexer_mqa_logits_with_kvcache
     # sees in cu_seqlens_kv / kv_cache.shape[1] domain.
     L_comp = L_uncomp // compress_ratio if compress_ratio > 1 else L_uncomp
 
@@ -700,7 +700,7 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # ``seq_lens_cpu`` is in **uncompressed** token domain. For V4
         # (compress_ratio > 1) the indexer kernels operate over the
         # compressed K cache, so the per-chunk metadata fed to
-        # ``dsa_indexer_mqa_logits_with_blocks`` /
+        # ``dsa_indexer_mqa_logits_with_kvcache`` /
         # ``dsa_update_topk_indices`` needs to be compressed.
         compress_ratio = self.compress_ratio
         if compress_ratio > 1:
@@ -794,7 +794,7 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # tokens. We mirror ``build_one_prefill_chunk``: build per-query-token
         # ``cu_seqlen_ks/ke`` via ``kv_spans_from_batches_device`` and a per-request
         # ``cu_seqlens_q`` so the (shared with prefill) kernel
-        # ``dsa_indexer_mqa_logits_with_blocks`` handles >1 query per request.
+        # ``dsa_indexer_mqa_logits_with_kvcache`` handles >1 query per request.
         #
         # ``decode_qsl_cpu`` is the per-request query start loc relative to the
         # first decode token (decodes are at the front of the batch). For plain
@@ -901,7 +901,7 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # Fill compressed seq_lens buffer in-place for address stability.
         # ``decode_metadata.seq_lens`` is consumed by topk-update / paged-mqa
         # kernels for the per-token causal masks. Those kernels
-        # (dsa_indexer_mqa_logits_with_blocks / dsa_update_topk_indices) and the
+        # (dsa_indexer_mqa_logits_with_kvcache / dsa_update_topk_indices) and the
         # K-cache itself live in the **compressed** domain when the indexer
         # cache uses compression (V4: compress_ratio == 4), while vLLM tracks
         # the token domain.
@@ -1251,7 +1251,7 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # Under FULL_DECODE_ONLY CUDA graph the decode ``max_context_len`` /
         # ``max_kv_len`` are Python scalars baked into the graph at capture:
         # they size the indexer logits width and the KV loop bound for
-        # ``dsa_indexer_mqa_logits_with_blocks`` and DO NOT update on replay.
+        # ``dsa_indexer_mqa_logits_with_kvcache`` and DO NOT update on replay.
         # ``build_decode_metadata`` derives them from ``seq_lens.max()``, so the
         # captured value tracks whatever dummy seq_len ``_dummy_run`` used. With
         # the community ``seq_lens = max_query_len`` (tiny), the baked bound
@@ -1308,9 +1308,9 @@ class IluDeepseekV4IndexerBackend(IluDeepseekV32IndexerBackend):
         # V4 indexer KV-cache block_size。与主 MLA / SWA 一致，
         # 走 NV upstream 的 KV cache 分配路径（indexer 与 main MLA 共用一个
         # KVCacheGroup，kernel_block_size 必须相同）。
-        # ixformer dsa_indexer_mqa_logits_with_blocks 原生 CUDA kernel 只支持
+        # ixformer dsa_indexer_mqa_logits_with_kvcache 原生 CUDA kernel 只支持
         # block_size in {16, 32, 64}；block_size=256 会触发 wrapper 内的
-        # ref fallback（pure-PyTorch ref_dsa_indexer_mqa_logits_with_blocks），
+        # ref fallback（pure-PyTorch ref_dsa_indexer_mqa_logits_with_kvcache），
         # 功能等价但性能更低，后续可在 ixformer 层做 native 256 支持。
         return [256]
 

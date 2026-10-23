@@ -112,6 +112,7 @@ class ReplayScheduler:
             self._maintenance_thread.start()
 
     def _maintain(self):
+        unavailable_reported = False
         while not self._stop.wait(self._maintenance_period):
             # P can spend longer than a transfer lease in an interleaved long
             # prefill before D has received its request and can send heartbeats.
@@ -127,7 +128,20 @@ class ReplayScheduler:
                             rid, record["generation"], record["input_digest"]
                         )
             # Cached image data remains within the fixed host LRU budget.
-            atomic_json(self.root / "source_cache.json", self.archive.stats())
+            try:
+                atomic_json(self.root / "source_cache.json", self.archive.stats())
+                unavailable_reported = False
+            except OSError as error:
+                # Diagnostic I/O must not terminate the lease keeper. Missing
+                # archive data still fails closed in admission/range handling;
+                # do not recreate an empty archive or claim replay succeeded.
+                if not unavailable_reported:
+                    logger.warning(
+                        "Producer image cache statistics unavailable at %s: %s",
+                        self.root,
+                        error,
+                    )
+                unavailable_reported = True
 
     @classmethod
     def create(cls, config, engine_id):
@@ -308,9 +322,17 @@ class ReplayScheduler:
             session=self.session,
             requests=len(self.records),
         )
-        if self.archive is not None:
-            value["cache"] = self.archive.stats()
-        atomic_json(self.root / "counters.json", value)
+        try:
+            if self.archive is not None:
+                value["cache"] = self.archive.stats()
+            atomic_json(self.root / "counters.json", value)
+        except OSError as error:
+            # Called by terminal request cleanup as well as admission. Failure
+            # to write counters must not escalate a request-local image error
+            # into an EngineCore failure and tear down DP/EP collectives.
+            logger.warning(
+                "Image replay statistics unavailable at %s: %s", self.root, error
+            )
 
     def shutdown(self):
         self._stop.set()

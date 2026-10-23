@@ -149,7 +149,10 @@ class RangeReceiver:
                 self.retiring[rid] = state
                 self.release_queue.append(state)
                 directory = self.root / storage_key(rid)
-                (directory / "finished").touch()
+                # A request can already be failing because local pages were
+                # lost. Keep its release/terminal path usable in that case.
+                with suppress(FileNotFoundError):
+                    (directory / "finished").touch()
         self.wakeup.set()
 
     def _publish(self, state, start, end, reply, raw):

@@ -32,7 +32,6 @@ from vllm.logger import init_logger
 
 from vllm_iluvatar.ilu_patch import general_patch as p
 
-
 logger = init_logger("vllm." + __name__)
 
 
@@ -141,7 +140,8 @@ def _apply() -> None:
         DPEngineCoreProc._should_throttle_prefills
     )
     process_step = impl._make_process_engine_step(
-        DPEngineCoreProc._process_engine_step
+        DPEngineCoreProc._process_engine_step,
+        community_should_throttle=DPEngineCoreProc._should_throttle_prefills,
     )
     handle_client_request = impl._make_handle_client_request(
         DPEngineCoreProc._handle_client_request
@@ -170,7 +170,8 @@ def _apply() -> None:
     DPEngineCoreProc._handle_client_request = handle_client_request  # type: ignore[method-assign]
     logger.info(
         "Enabled ILU synchronized DP prefills: max_defer_steps=%d, "
-        "max_replacement_wait_ms=%g.",
+        "max_replacement_wait_ms=%g, rearm_after_admission=%s.",
         envs.VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS,
         replacement_wait_ms,
+        envs.VLLM_ILU_DP_PREFILL_REARM,
     )

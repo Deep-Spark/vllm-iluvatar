@@ -396,7 +396,6 @@ class IluMiniMaxM3SparseImpl(AttentionImplBase[IluMiniMaxM3SparseMetadata]):
                 p.cu_seqlens_q,
                 p.seq_lens,
                 p.context_lens,
-                p.max_query_len,
                 self.num_kv_heads,
                 self.scale,
                 out[num_decode:],

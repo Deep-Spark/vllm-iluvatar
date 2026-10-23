@@ -23,9 +23,13 @@ DequantMethod = Callable[
     [torch.Tensor, torch.Tensor | None, Mapping[str, Any]], torch.Tensor
 ]
 QuantMethod = Callable[[torch.Tensor, Mapping[str, Any]], QuantResult]
+# Takes the raw weight and its scale, and runs dequant and quant itself.
+# Used when the two stages must be interleaved, e.g. one expert at a time.
+DequantQuantMethod = Callable[..., QuantResult]
 
 DEQUANT_METHODS: dict[str, DequantMethod] = {}
 QUANT_METHODS: dict[str, QuantMethod] = {}
+DEQUANT_QUANT_METHODS: dict[str, DequantQuantMethod] = {}
 
 
 def register_dequant(name: str):
@@ -43,6 +47,16 @@ def register_quant(name: str):
         if name in QUANT_METHODS:
             raise ValueError(f"quant method {name!r} is already registered")
         QUANT_METHODS[name] = method
+        return method
+
+    return decorator
+
+
+def register_dequant_quant(name: str):
+    def decorator(method: DequantQuantMethod) -> DequantQuantMethod:
+        if name in DEQUANT_QUANT_METHODS:
+            raise ValueError(f"dequant-quant method {name!r} is already registered")
+        DEQUANT_QUANT_METHODS[name] = method
         return method
 
     return decorator
@@ -66,6 +80,51 @@ def _decode_e8m0(scale: torch.Tensor) -> torch.Tensor:
     return scale.float()
 
 
+def _block_dequant_1d(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    block_size: int,
+    decode_e8m0: bool,
+) -> torch.Tensor:
+    """Dequantize 1-D block scales: one scale per ``block_size`` elements
+    along the last dim (``scale [..., K/block_size]``), as used by e8m0
+    MXFP8 checkpoints (e.g. HY4 ``[N, K/32]``)."""
+    if weight.dim() == 3 and scale.dim() == 3:
+        # Fused MoE packs: [num_experts, out, in] with per-row block scales.
+        return torch.stack(
+            [
+                _block_dequant_1d(
+                    expert_weight,
+                    expert_scale,
+                    block_size=block_size,
+                    decode_e8m0=decode_e8m0,
+                )
+                for expert_weight, expert_scale in zip(
+                    weight.unbind(0), scale.unbind(0), strict=True
+                )
+            ],
+            dim=0,
+        )
+    if weight.dim() != 2 or scale.dim() != 2:
+        raise ValueError(
+            "1-D block dequant expects 2-D or 3-D weight/scale, "
+            f"got {weight.shape}/{scale.shape}"
+        )
+    if scale.shape[:-1] != weight.shape[:-1]:
+        raise ValueError(
+            "1-D block dequant leading dims mismatch: "
+            f"weight={weight.shape}, scale={scale.shape}"
+        )
+    if weight.shape[-1] != scale.shape[-1] * block_size:
+        raise ValueError(
+            "1-D block dequant last-dim mismatch: weight="
+            f"{weight.shape}, scale={scale.shape}, block_size={block_size}"
+        )
+    scale_fp32 = _decode_e8m0(scale) if decode_e8m0 else scale.float()
+    return weight.float() * scale_fp32.repeat_interleave(block_size, dim=-1)
+
+
 def _block_dequant(
     weight: torch.Tensor,
     scale: torch.Tensor,
@@ -73,12 +132,8 @@ def _block_dequant(
     block_size: int,
     decode_e8m0: bool,
 ) -> torch.Tensor:
-    if weight.dim() == 3:
-        if scale.dim() != 3 or scale.shape[0] != weight.shape[0]:
-            raise ValueError(
-                "3-D block dequant expects per-expert scale "
-                f"[E, *, *], got {weight.shape}/{scale.shape}"
-            )
+    if weight.dim() == 3 and scale.dim() == 3:
+        # Fused MoE packs: [num_experts, out, in] with matching block scales.
         return torch.stack(
             [
                 _block_dequant(
@@ -95,10 +150,22 @@ def _block_dequant(
         )
     if weight.dim() != 2 or scale.dim() != 2:
         raise ValueError(
-            f"block dequant expects 2-D or 3-D weight/scale, got {weight.shape}/{scale.shape}"
+            "block dequant expects 2-D or 3-D weight/scale, "
+            f"got {weight.shape}/{scale.shape}"
         )
     rows, cols = weight.shape
     scale_rows, scale_cols = scale.shape
+    # One scale per ``block_size x block_size`` tile. Without this check a 1-D
+    # ``[N, K/block]`` scale still pads and reshapes cleanly, but every row
+    # silently picks up row ``r // block_size``'s scale.
+    want_rows = -(-rows // block_size)
+    want_cols = -(-cols // block_size)
+    if (scale_rows, scale_cols) != (want_rows, want_cols):
+        raise ValueError(
+            "2-D block dequant expects a scale of "
+            f"({want_rows}, {want_cols}) for weight {tuple(weight.shape)} "
+            f"with block_size={block_size}, got {tuple(scale.shape)}"
+        )
     padded = torch.zeros(
         scale_rows * block_size,
         scale_cols * block_size,
@@ -156,10 +223,22 @@ def dequant_fp8_block_e8m0(
     scale: torch.Tensor | None,
     options: Mapping[str, Any],
 ) -> torch.Tensor:
-    return _block_dequant(
+    scale = _require_scale(scale, "fp8_block_e8m0", weight)
+    block_size = int(options.get("block_size", 128))
+    # e8m0 scales come in two layouts: one scale per ``block_size`` elements
+    # along the last dim only (HY4, ``[N, K/32]``), or 2-D tiles over both dims
+    # (DeepSeek-V4, ``[N/128, K/128]``). Picking the wrong one silently applies
+    # a neighbouring row's exponent, so dispatch on the scale shape.
+    dequant = (
+        _block_dequant_1d
+        if scale.shape[:-1] == weight.shape[:-1]
+        and weight.shape[-1] == scale.shape[-1] * block_size
+        else _block_dequant
+    )
+    return dequant(
         weight,
-        _require_scale(scale, "fp8_block_e8m0", weight),
-        block_size=int(options.get("block_size", 128)),
+        scale,
+        block_size=block_size,
         decode_e8m0=True,
     )
 
@@ -447,6 +526,134 @@ def quant_int4_moe(value: torch.Tensor, options: Mapping[str, Any]) -> QuantResu
     )
 
 
+def _to_host_quant_result(result: QuantResult) -> QuantResult:
+    return QuantResult(
+        weight=result.weight.cpu(),
+        weight_scale=(
+            None if result.weight_scale is None else result.weight_scale.cpu()
+        ),
+        i8_weight_scale=(
+            None if result.i8_weight_scale is None else result.i8_weight_scale.cpu()
+        ),
+        i8_weight_zero=(
+            None if result.i8_weight_zero is None else result.i8_weight_zero.cpu()
+        ),
+    )
+
+
+def _merge_optional_quant_field(
+    chunk_results: list[QuantResult], field: str, dim: int
+) -> torch.Tensor | None:
+    tensors = [getattr(result, field) for result in chunk_results]
+    if all(tensor is None for tensor in tensors):
+        return None
+    if any(tensor is None for tensor in tensors):
+        raise ValueError(
+            f"pack_int4_moe produced inconsistent {field} results across chunks"
+        )
+    return torch.cat([tensor for tensor in tensors if tensor is not None], dim=dim)
+
+
+def _quant_one_expert_int4_moe(
+    expert_weight: torch.Tensor, options: Mapping[str, Any]
+) -> QuantResult:
+    """Quantize one expert (optionally split fused gate/up) on its input device."""
+    packed = bool(options.get("packed", False))
+    chunk_dim = int(options.get("chunk_dim", -2))
+    gemm_format = str(options.get("gemm_format", "TN").upper())
+    if not packed:
+        return quant_int4_moe(expert_weight, options)
+    if expert_weight.shape[chunk_dim] % 2:
+        raise ValueError(
+            "pack_int4_moe requires an even last dimension when "
+            f"packed=true, got {expert_weight.shape}"
+        )
+    chunk_results = [
+        quant_int4_moe(chunk, options)
+        for chunk in expert_weight.chunk(2, dim=chunk_dim)
+    ]
+    scale_dim = (
+        -2
+        if int(options.get("pack_version", 2)) != 1
+        and options.get("scale_layout") == "row"
+        else -1
+    )
+    weight_dim = -2 if gemm_format[0] == "T" else -1
+    return QuantResult(
+        weight=torch.cat([result.weight for result in chunk_results], dim=weight_dim),
+        weight_scale=_merge_optional_quant_field(
+            chunk_results, "weight_scale", scale_dim
+        ),
+        i8_weight_scale=_merge_optional_quant_field(
+            chunk_results, "i8_weight_scale", -2
+        ),
+        i8_weight_zero=_merge_optional_quant_field(
+            chunk_results, "i8_weight_zero", -2
+        ),
+    )
+
+
+@register_dequant_quant("stream_pack_int4_moe")
+def pack_int4_moe_stream_dequant(
+    weight: torch.Tensor,
+    scale: torch.Tensor | None,
+    *,
+    dequant_method: str,
+    dequant_options: Mapping[str, Any],
+    quant_options: Mapping[str, Any],
+    work_device: str,
+) -> QuantResult:
+    """Dequant + int4-pack fused MoE experts one-by-one on ``work_device``.
+
+    Avoids materializing the full ``[num_experts, ...]`` FP32 tensor on host or
+    device. Each expert is moved to GPU, dequantized, packed, then copied back.
+    """
+    if weight.dim() != 3:
+        raise ValueError(
+            "stream_pack_int4_moe expects stacked expert weights with shape "
+            f"(num_experts, dim0, dim1), got {weight.shape}"
+        )
+    if dequant_method not in DEQUANT_METHODS:
+        raise ValueError(f"unknown dequant method {dequant_method!r}")
+    if scale is not None and scale.shape[0] != weight.shape[0]:
+        raise ValueError(
+            "expert scale batch mismatch: "
+            f"weight={weight.shape}, scale={scale.shape}"
+        )
+
+    device = torch.device(work_device)
+    dequant = DEQUANT_METHODS[dequant_method]
+    results: list[QuantResult] = []
+    scale_experts = scale.unbind(0) if scale is not None else [None] * weight.shape[0]
+    for expert_weight, expert_scale in zip(
+        weight.unbind(0), scale_experts, strict=True
+    ):
+        weight_dev = expert_weight.to(device)
+        scale_dev = None if expert_scale is None else expert_scale.to(device)
+        value = dequant(weight_dev, scale_dev, dequant_options)
+        results.append(
+            _to_host_quant_result(_quant_one_expert_int4_moe(value, quant_options))
+        )
+        del weight_dev, scale_dev, value
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    def stack_optional(field: str) -> torch.Tensor | None:
+        tensors = [getattr(result, field) for result in results]
+        if all(tensor is None for tensor in tensors):
+            return None
+        if any(tensor is None for tensor in tensors):
+            raise ValueError(f"pack_int4_moe produced inconsistent {field} results")
+        return torch.stack([tensor for tensor in tensors if tensor is not None], dim=0)
+
+    return QuantResult(
+        weight=torch.stack([result.weight for result in results], dim=0),
+        weight_scale=stack_optional("weight_scale"),
+        i8_weight_scale=stack_optional("i8_weight_scale"),
+        i8_weight_zero=stack_optional("i8_weight_zero"),
+    )
+
+
 @register_quant("pack_int4_moe")
 def quant_pack_int4_moe(value: torch.Tensor, options: Mapping[str, Any]) -> QuantResult:
     if value.dim() != 3:
@@ -455,53 +662,12 @@ def quant_pack_int4_moe(value: torch.Tensor, options: Mapping[str, Any]) -> Quan
             f"(num_experts, dim0, dim1), got {value.shape}"
         )
 
-    packed = bool(options.get("packed", False))
-    chunk_dim = int(options.get("chunk_dim", -2))
-    gemm_format = str(options.get("gemm_format", "TN").upper())
-
-    def merge_optional(
-        chunk_results: list[QuantResult], field: str, dim: int
-    ) -> torch.Tensor | None:
-        tensors = [getattr(result, field) for result in chunk_results]
-        if all(tensor is None for tensor in tensors):
-            return None
-        if any(tensor is None for tensor in tensors):
-            raise ValueError(
-                f"pack_int4_moe produced inconsistent {field} results across chunks"
-            )
-        return torch.cat([tensor for tensor in tensors if tensor is not None], dim=dim)
-
+    host_results = value.device.type != "cuda"
     results: list[QuantResult] = []
     for expert_weight in value.unbind(dim=0):
-        if not packed:
-            results.append(quant_int4_moe(expert_weight, options))
-            continue
-        if expert_weight.shape[chunk_dim] % 2:
-            raise ValueError(
-                "pack_int4_moe requires an even last dimension when "
-                f"packed=true, got {expert_weight.shape}"
-            )
-        chunk_results = [
-            quant_int4_moe(chunk, options)
-            for chunk in expert_weight.chunk(2, dim=chunk_dim)
-        ]
-        scale_dim = (
-            -2
-            if int(options.get("pack_version", 2)) != 1
-            and options.get("scale_layout") == "row"
-            else -1
-        )
-        weight_dim = -2 if gemm_format[0] == "T" else -1
-        results.append(
-            QuantResult(
-                weight=torch.cat(
-                    [result.weight for result in chunk_results], dim=weight_dim
-                ),
-                weight_scale=merge_optional(chunk_results, "weight_scale", scale_dim),
-                i8_weight_scale=merge_optional(chunk_results, "i8_weight_scale", -2),
-                i8_weight_zero=merge_optional(chunk_results, "i8_weight_zero", -2),
-            )
-        )
+        results.append(_quant_one_expert_int4_moe(expert_weight, options))
+        if host_results and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def stack_optional(field: str) -> torch.Tensor | None:
         tensors = [getattr(result, field) for result in results]

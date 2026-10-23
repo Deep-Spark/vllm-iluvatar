@@ -1,0 +1,100 @@
+{
+  "_comment": "No FP8 weights. Routed experts are W4A8 INT, dense linears are W8A8 INT, kv_b_proj and indexer.wk are BF16. wk loads into wk_weights_proj shard 0 through the non-FP8 path in HYV4Model.load_weights.",
+  "quant_method": "compressed-tensors",
+  "format": "iluvatar-mixed",
+  "config_groups": {
+    "routed_experts": {
+      "targets": [
+        "re:.*\\.experts"
+      ],
+      "weights": {
+        "num_bits": 4,
+        "type": "int",
+        "symmetric": {
+          "$rules": "rules.routed_experts_gate_up_to_w4a8.quant.options.symmetric"
+        },
+        "strategy": "channel",
+        "group_size": {
+          "$rules": "rules.routed_experts_gate_up_to_w4a8.quant.options.group_size",
+          "none_as": -1
+        },
+        "dynamic": false
+      },
+      "input_activations": {
+        "num_bits": 8,
+        "type": "int",
+        "symmetric": true,
+        "strategy": "token",
+        "group_size": null,
+        "dynamic": true
+      },
+      "output_activations": null,
+      "iluvatar": {
+        "gemm_format": {
+          "$rules": "rules.routed_experts_gate_up_to_w4a8.quant.options.gemm_format"
+        },
+        "pack_version": {
+          "$rules": "rules.routed_experts_gate_up_to_w4a8.quant.options.pack_version"
+        }
+      }
+    },
+    "dense_linears": {
+      "format": "int-quantized",
+      "targets": [
+        "re:.*\\.self_attn\\.(fused_qkv_a_proj|q_b_proj|o_proj)$",
+        "re:.*\\.self_attn\\.indexer\\.wq_b$",
+        "re:.*\\.mlp\\.(gate_up_proj|down_proj)$",
+        "re:.*\\.shared_experts\\.(gate_up_proj|down_proj)$"
+      ],
+      "weights": {
+        "num_bits": 8,
+        "type": "int",
+        "symmetric": {
+          "$rules": "rules.dense_fp8_to_w8a8.quant.options.symmetric"
+        },
+        "strategy": "channel",
+        "group_size": {
+          "$rules": "rules.dense_fp8_to_w8a8.quant.options.group_size",
+          "none_as": -1
+        },
+        "dynamic": false
+      },
+      "input_activations": {
+        "num_bits": 8,
+        "type": "int",
+        "symmetric": true,
+        "strategy": "token",
+        "group_size": null,
+        "dynamic": true
+      },
+      "output_activations": null,
+      "iluvatar": {
+        "gemm_format": {
+          "$rules": "rules.dense_fp8_to_w8a8.quant.options.gemm_format"
+        },
+        "mixed_strategy": {
+          "$rules": "rules.dense_fp8_to_w8a8.iluvatar.mixed_strategy"
+        },
+        "gemm_mode": {
+          "$rules": "rules.dense_fp8_to_w8a8.iluvatar.gemm_mode"
+        }
+      }
+    }
+  },
+  "ignore": [
+    "embed",
+    "lm_head",
+    "norm",
+    "re:.*\\.input_layernorm$",
+    "re:.*\\.post_attention_layernorm$",
+    "re:.*\\.self_attn\\.(q_a_layernorm|kv_a_layernorm)$",
+    "re:.*\\.self_attn\\.kv_b_proj$",
+    "re:.*\\.self_attn\\.indexer\\.(wk_weights_proj|k_norm)$",
+    "re:.*\\.self_attn\\.(linear_gate|learnable_sink_param)$",
+    "re:.*\\.mlp\\.gate$",
+    "re:.*e_score_correction_bias$",
+    "re:.*\\.eh_proj$",
+    "re:.*\\.(enorm|hnorm|final_layernorm)$",
+    "re:.*hc_.*"
+  ]
+}

@@ -263,8 +263,8 @@ class HYV4FlashMLASparseImpl(IluFlashMLASparseImpl):
         ).squeeze(1)
         return out[:, : self.num_heads, :].contiguous()
 
-    # [ILU override] IluFlashMLASparseImpl._bf16_flash_mla_kernel — use the
-    # paged DSV4 facade, which pads HY4 TP8's H=8 to H=16 and forwards sinks.
+    # [ILU override] Use the same 576/512 SparseFlash facade as feat_hy4_dev
+    # for both prefill and decode, preserving local heads and the sink.
     def _bf16_flash_mla_kernel(
         self,
         q: torch.Tensor,
@@ -272,12 +272,11 @@ class HYV4FlashMLASparseImpl(IluFlashMLASparseImpl):
         topk_indices: torch.Tensor,
         topk_length: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.attn_sink is None:
-            return super()._bf16_flash_mla_kernel(q, kv_c_and_k_pe_cache, topk_indices)
-
         import ixformer.inference.functions as ixf_ops
 
         num_tokens = q.shape[0]
+        if num_tokens == 0:
+            return q.new_empty((0, q.shape[1], 512))
         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
             -1, 1, kv_c_and_k_pe_cache.shape[-1]
         )
@@ -286,14 +285,15 @@ class HYV4FlashMLASparseImpl(IluFlashMLASparseImpl):
         if topk_length is None:
             idx = topk_indices.reshape(num_tokens, -1)
             topk_length = (idx >= 0).sum(dim=-1).to(torch.int32)
-        output = ixf_ops.dsa_flash_mla_sparse_fwd_diff_kv(
+        output = ixf_ops.sparse_flash_attn(
             q,
             kv_c_and_k_pe_cache,
             topk_indices,
             self.softmax_scale,
-            d_v=512,
+            v_head_dim=512,
             topk_length=topk_length,
             attn_sink=self.attn_sink,
+            backend="ixinfer",
         )
         return output
 

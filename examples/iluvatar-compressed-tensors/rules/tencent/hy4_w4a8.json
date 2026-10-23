@@ -1,0 +1,235 @@
+{
+  "schema_version": 1,
+  "name": "hy4_w4a8",
+  "load_device": "cpu",
+  "model_config_patch": {
+    "compression_config": null
+  },
+  "default_action": "keep",
+  "rules": [
+    {
+      "id": "drop_consumed_scale",
+      "priority": 1000,
+      "match": {
+        "suffixes": [
+          ".weight_scale",
+          "gate_up_proj_scale",
+          "down_proj_scale"
+        ]
+      },
+      "action": "drop"
+    },
+    {
+      "id": "keep_sensitive_tensor",
+      "priority": 950,
+      "description": "Keep source dtype for embeddings, norms, router, iHC, indexer weights_proj/k_norm, and MTP eh_proj. indexer.wk is MXFP8 in the source and is dequantized to BF16 by remaining_fp8_to_bfloat16 so the checkpoint has no FP8 weights. eh_proj stays BF16.",
+      "match": {
+        "regex": [
+          "^lm_head\\.weight$",
+          "^model\\.embed_tokens\\.weight$",
+          "^model\\.norm\\.weight$",
+          "^model\\.hc_head\\..*$",
+          "^model\\.(layers|mtp_layers)\\.\\d+\\.(input_layernorm|post_attention_layernorm|final_layernorm)\\.weight$",
+          "^model\\.(layers|mtp_layers)\\.\\d+\\.self_attn\\.(q_a_layernorm|kv_a_layernorm)\\.weight$",
+          "^model\\.(layers|mtp_layers)\\.\\d+\\.self_attn\\.indexer\\.(weights_proj|k_norm)\\..*$",
+          "^model\\.(layers|mtp_layers)\\.\\d+\\.self_attn\\.(linear_gate|learnable_sink_param)\\..*$",
+          "^model\\.(layers|mtp_layers)\\.\\d+\\.self_attn\\.learnable_sink_param$",
+          "^model\\.(layers|mtp_layers)\\.\\d+\\.mlp\\.gate\\..*$",
+          "^model\\.(layers|mtp_layers)\\.\\d+\\.eh_proj\\.weight$",
+          "^model\\.(layers|mtp_layers)\\.\\d+\\.(enorm|hnorm)\\.weight$",
+          "^model\\.(layers|mtp_layers)\\.\\d+\\.hc_.*$"
+        ]
+      },
+      "action": "keep"
+    },
+    {
+      "id": "routed_experts_gate_up_to_w4a8",
+      "priority": 900,
+      "match": {
+        "regex": [
+          "^model\\.(layers|mtp_layers)\\.\\d+\\.mlp\\.experts\\.gate_up_proj$"
+        ],
+        "dtypes": [
+          "float8_e4m3fn"
+        ],
+        "ndims": [
+          3
+        ]
+      },
+      "action": "convert",
+      "work_device": "cuda",
+      "scale": {
+        "from_suffix": "",
+        "to_suffix": "_scale"
+      },
+      "dequant": {
+        "method": "fp8_block_e8m0",
+        "options": {
+          "block_size": 32
+        }
+      },
+      "quant": {
+        "method": "stream_pack_int4_moe",
+        "options": {
+          "group_size": -1,
+          "symmetric": true,
+          "gemm_format": "TN",
+          "pack_version": 2,
+          "scale_layout": "row",
+          "packed": true,
+          "chunk_dim": -2
+        }
+      },
+      "outputs": {
+        "weight_scale": "_scale",
+        "i8_weight_scale": "_i8_weight_scale",
+        "i8_weight_zero": "_i8_weight_zero"
+      }
+    },
+    {
+      "id": "routed_experts_down_to_w4a8",
+      "priority": 899,
+      "match": {
+        "regex": [
+          "^model\\.(layers|mtp_layers)\\.\\d+\\.mlp\\.experts\\.down_proj$"
+        ],
+        "dtypes": [
+          "float8_e4m3fn"
+        ],
+        "ndims": [
+          3
+        ]
+      },
+      "action": "convert",
+      "work_device": "cuda",
+      "scale": {
+        "from_suffix": "",
+        "to_suffix": "_scale"
+      },
+      "dequant": {
+        "method": "fp8_block_e8m0",
+        "options": {
+          "block_size": 32
+        }
+      },
+      "quant": {
+        "method": "stream_pack_int4_moe",
+        "options": {
+          "group_size": -1,
+          "symmetric": true,
+          "gemm_format": "TN",
+          "pack_version": 2,
+          "scale_layout": "row",
+          "packed": false
+        }
+      },
+      "outputs": {
+        "weight_scale": "_scale",
+        "i8_weight_scale": "_i8_weight_scale",
+        "i8_weight_zero": "_i8_weight_zero"
+      }
+    },
+    {
+      "id": "dense_fp8_to_w8a8",
+      "priority": 800,
+      "match": {
+        "regex": [
+          "^model\\.(layers|mtp_layers)\\.\\d+\\.self_attn\\.(q_a_proj|q_b_proj|kv_a_proj_with_mqa|o_proj)\\.weight$",
+          "^model\\.(layers|mtp_layers)\\.\\d+\\.self_attn\\.indexer\\.wq_b\\.weight$",
+          "^model\\.(layers|mtp_layers)\\.\\d+\\.mlp\\.(gate_proj|up_proj|down_proj)\\.weight$",
+          "^model\\.(layers|mtp_layers)\\.\\d+\\.mlp\\.shared_experts\\.(gate_proj|up_proj|down_proj)\\.weight$"
+        ],
+        "dtypes": [
+          "float8_e4m3fn"
+        ]
+      },
+      "action": "convert",
+      "work_device": "cuda",
+      "scale": {
+        "from_suffix": ".weight",
+        "to_suffix": ".weight_scale"
+      },
+      "dequant": {
+        "method": "fp8_block_e8m0",
+        "options": {
+          "block_size": 32
+        }
+      },
+      "quant": {
+        "method": "int8_per_channel",
+        "options": {
+          "group_size": -1,
+          "symmetric": true,
+          "gemm_format": "TN"
+        }
+      },
+      "iluvatar": {
+        "mixed_strategy": "CHANNEL",
+        "gemm_mode": "PERF"
+      },
+      "outputs": {
+        "weight_scale": ".weight_scale"
+      }
+    },
+    {
+      "id": "kv_b_fp8_to_bf16",
+      "priority": 790,
+      "match": {
+        "regex": [
+          "^model\\.(layers|mtp_layers)\\.\\d+\\.self_attn\\.kv_b_proj\\.weight$"
+        ],
+        "dtypes": [
+          "float8_e4m3fn"
+        ]
+      },
+      "action": "convert",
+      "scale": {
+        "from_suffix": ".weight",
+        "to_suffix": ".weight_scale"
+      },
+      "dequant": {
+        "method": "fp8_block_e8m0",
+        "options": {
+          "block_size": 32
+        }
+      },
+      "quant": {
+        "method": "cast",
+        "options": {
+          "dtype": "bfloat16"
+        }
+      },
+      "outputs": {}
+    },
+    {
+      "id": "remaining_fp8_to_bfloat16",
+      "priority": 100,
+      "match": {
+        "dtypes": [
+          "float8_e4m3fn"
+        ],
+        "suffixes": [
+          ".weight"
+        ]
+      },
+      "action": "convert",
+      "scale": {
+        "from_suffix": ".weight",
+        "to_suffix": ".weight_scale"
+      },
+      "dequant": {
+        "method": "fp8_block_e8m0",
+        "options": {
+          "block_size": 32
+        }
+      },
+      "quant": {
+        "method": "cast",
+        "options": {
+          "dtype": "bfloat16"
+        }
+      },
+      "outputs": {}
+    }
+  ]
+}

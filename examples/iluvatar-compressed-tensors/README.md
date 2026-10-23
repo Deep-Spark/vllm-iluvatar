@@ -14,7 +14,7 @@
 | `moonshot/` | Kimi K2.5 |
 | `qwen/` | Qwen2、Qwen3 及现有变体 |
 | `stepfun/` | Step 3.5、3.7 |
-| `tencent/` | HY3 |
+| `tencent/` | HY3、HY4 |
 | `zhipu/` | GLM 5.2 |
 
 例如，`deepseek/deepseek_v4_w4a8` 对应

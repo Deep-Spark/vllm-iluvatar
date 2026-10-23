@@ -1123,7 +1123,8 @@ class IluFlashAttentionImpl(AttentionImpl):
         fp8_query = torch.empty(query.shape, dtype=fp8_dtype, device=query.device)
         torch.ops._C.static_scaled_fp8_quant(fp8_query, query, query_scale)
 
-        key_cache, value_cache = kv_cache.unbind(0)
+        key_cache = kv_cache[..., : self.head_size]
+        value_cache = kv_cache[..., self.head_size :]
         key_cache = key_cache.view(fp8_dtype)
         value_cache = value_cache.view(fp8_dtype)
         if (

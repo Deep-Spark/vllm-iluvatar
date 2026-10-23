@@ -129,6 +129,7 @@ class IluDSparkV41Model(nn.Module):
         draft_config = deepcopy(config)
         draft_config.n_routed_experts = config.dspark_n_routed_experts
         draft_config.num_experts_per_tok = config.dspark_num_experts_per_tok
+        draft_config.vision_n_layers = 0
         current_vllm_config = copy(vllm_config)
         current_vllm_config.model_config = copy(vllm_config.model_config)
         current_vllm_config.model_config.hf_config = draft_config

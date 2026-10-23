@@ -344,7 +344,7 @@ class IluDeepseekV4Fp8Indexer(nn.Module):
         #
         # The reset is a stopgap. ixformer a9d172e2 (branch yd_opt_fusion, not
         # yet on the ixformer mainline this plugin builds against) gives
-        # ``ds4_compute_global_topk_indices_and_lens`` optional ``positions`` /
+        # ``compute_global_topk_indices_and_lens`` optional ``positions`` /
         # ``compress_ratio`` args and bounds each row by
         # ``min((positions[t] + 1) / compress_ratio, topk)``. That makes a
         # never-written row unrepresentable at the point of use instead of
@@ -363,7 +363,7 @@ class IluDeepseekV4Fp8Indexer(nn.Module):
                     # every seq_len <= 3), so the kernels below are skipped.
                     # The buffer is torch.empty and only ever rewritten in
                     # place, so leaving these rows alone keeps the previous
-                    # step's slots; ``ds4_compute_global_topk_indices_and_lens``
+                    # step's slots; ``compute_global_topk_indices_and_lens``
                     # would then index this step's block_table with them. The
                     # is_valid gate does not cover it -- these are real tokens
                     # with real slots, unlike the all-padding warmup chunks.
@@ -906,7 +906,7 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Fused inverse-RoPE + fp8 grouped ``wo_a`` + row-parallel ``wo_b``.
 
-        ``ds4_inv_rope_fp8_quant`` fuses the inverse RoPE of ``o`` with a
+        ``fused_inv_rope_fp8_quant`` fuses the inverse RoPE of ``o`` with a
         per-(group, token) fp8 dynamic quant (activation ``a`` [G, T, R] fp8 +
         scale ``as_scale`` [G, T] fp32); ``fp8_per_channel_einsum`` contracts it
         with the load-time per-channel fp8 weight into ``z`` [T, G, D] bf16.
@@ -934,7 +934,7 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
     ) -> None:
         """Fused per-head q RMSNorm + q/kv RoPE + fp8 KV paged insert (SWA).
 
-        ``ds4_fused_qnorm_rope_fp8_kv_insert`` writes the 584B packed SWA cache:
+        ``fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert`` writes the 584B packed SWA cache:
         q gets weightless per-head RMSNorm + GPT-J RoPE, kv NoPE -> fp8 E4M3 +
         UE8M0 scale and RoPE -> bf16. Tokens with ``slot_mapping[t] < 0`` are
         skipped. ``q`` and the SWA cache are mutated in place.

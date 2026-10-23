@@ -206,7 +206,7 @@ def _positions_int32(
 ) -> torch.Tensor:
     """``positions`` as int32, converted at most once per forward pass.
 
-    ``ds4_flash_mla_with_kvcache``'s fused inverse RoPE indexes the cos/sin
+    ``flash_mla_sparse_with_kvcache``'s fused inverse RoPE indexes the cos/sin
     table with an ``int``, while vLLM's runner keeps positions in int64. Every
     DS4 layer in a step shares one SWA metadata object, so the cast is cached
     there and the remaining ~60 layers reuse it instead of each launching
@@ -249,7 +249,7 @@ class IluDeepseekCompressor(DeepseekCompressor):
        ilu fork stores raw bf16 paged ``[num_blocks, kv_block_size, head_dim]``
        and so collapses the three NV-side variants
        (``sparse_attn`` / ``indexer_attn`` / ``indexer_mxfp4_attn``) into a
-       single ``ds4_compressor_pool_norm_rope_insert`` call.
+       single ``compress_norm_rope_store`` call.
 
     The op also takes care of the early-return semantics (PAD ``slot_mapping``,
     non-window-end positions, PAD ``kv_slot_mapping``) so the call site stays
@@ -321,7 +321,7 @@ class IluDeepseekCompressor(DeepseekCompressor):
         )
         # ``.split`` along the last dim yields non-contiguous views
         # (stride=(2W, 1), score with storage_offset=W). The ixformer op
-        # ``ds4_compressor_save_partial_states`` accepts any row-contiguous
+        # ``save_partial_states`` accepts any row-contiguous
         # layout (stride(-1) == 1) so we hand the views straight through
         # without an extra .contiguous() copy.
         kv, score = kv_score.split(
@@ -364,7 +364,7 @@ class IluDeepseekCompressor(DeepseekCompressor):
         # that means ``x``/``positions`` are DP-padded while ``slot_mapping`` /
         # ``token_to_req_indices`` stay at the unpadded ``num_actual`` length,
         # so ``kv.size(0) != slot_mapping.size(0)`` and the strict ixformer op
-        # ``ds4_compressor_save_partial_states`` aborts with
+        # ``save_partial_states`` aborts with
         # "slot_mapping shape must be [num_tokens]".
         #
         # The padding rows are no-op tokens, so slice ``kv``/``score``/
@@ -765,8 +765,8 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         2. Allocate ``o`` of shape ``(T, n_local_heads, head_dim)``;
            the sparse MLA op writes the attention result into this
            buffer in place via the custom op. (No head-count padding:
-           ixformer's ``ds4_flash_mla_sparse_fwd`` /
-           ``ds4_flash_mla_with_kvcache`` accept arbitrary ``h_q``.)
+           ixformer's ``flash_mla_sparse_fwd`` /
+           ``flash_mla_sparse_with_kvcache`` accept arbitrary ``h_q``.)
         3. ``torch.ops.vllm.ilu_deepseek_v4_attention(...)`` runs the
            full sparse MLA pipeline (norm, indexer, compressor,
            kv-insert, mla_attn) under the torch.compile boundary; the
@@ -1039,8 +1039,8 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         # 6) Run the sparse MLA forward into the pre-allocated ``out`` buffer
         #    (shape ``(T, n_local_heads, head_dim)``). No head-count padding:
-        #    ixformer kernels (``ds4_flash_mla_sparse_fwd`` /
-        #    ``ds4_flash_mla_with_kvcache``) accept arbitrary ``h_q``.
+        #    ixformer kernels (``flash_mla_sparse_fwd`` /
+        #    ``flash_mla_sparse_with_kvcache``) accept arbitrary ``h_q``.
         #    Handing over ``cos_sin_cache`` makes the layer responsible for
         #    the inverse RoPE too, so it can fold the rotation into the
         #    attention kernel wherever that kernel supports it.
@@ -1300,7 +1300,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         Passing ``cos_sin_cache`` (the RoPE table the layer's Q/K were
         rotated with) makes this layer own the inverse RoPE on
-        ``output``: the branches backed by ``ds4_flash_mla_with_kvcache``
+        ``output``: the branches backed by ``flash_mla_sparse_with_kvcache``
         hand the rotation to the attention kernel, everything else gets a
         standalone ``ds4_inv_rope`` over its own slice. A mixed
         decode+prefill batch therefore still fuses its decode half. Leave
@@ -1356,7 +1356,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             prefill_out = output[num_decode_tokens:]
 
             # bf16-only experimental path: run prefill through the per-token
-            # decode sparse MLA kernel (ds4_flash_mla_with_kvcache).
+            # decode sparse MLA kernel (flash_mla_sparse_with_kvcache).
             prefill_as_decode = (
                 envs.VLLM_ILU_DS4_PREFILL_AS_DECODE
                 and self.kv_cache_dtype != "fp8_ds_mla"
@@ -1433,13 +1433,13 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
     ) -> bool:
-        """Whether this layer's ``ds4_flash_mla_with_kvcache`` calls can
+        """Whether this layer's ``flash_mla_sparse_with_kvcache`` calls can
         absorb the inverse RoPE.
 
         Two things have to line up. The layer must be on the bf16 decode
         kernel -- the ``fp8_ds_mla`` cache goes through
-        ``ds4_flash_mla_with_fp8_kvcache``, which has no such epilogue. And
-        the ixformer backend that ``ds4_flash_mla_with_kvcache`` resolves to
+        ``flash_mla_sparse_with_fp8_kvcache``, which has no such epilogue. And
+        the ixformer backend that ``flash_mla_sparse_with_kvcache`` resolves to
         (which ``IXFORMER_DS4_FLASH_MLA_WITH_KVCACHE_VERSION`` can override
         out from under us) must implement it for the given cos/sin table and
         position dtype. All of those are fixed for the lifetime of the
@@ -1456,7 +1456,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 cos_sin_cache=cos_sin_cache,
             )
         logger.info_once(
-            "ilu DeepSeek-V4: inverse RoPE fused into ds4_flash_mla_with_kvcache: %s.",
+            "ilu DeepSeek-V4: inverse RoPE fused into flash_mla_sparse_with_kvcache: %s.",
             "enabled" if supported else "unsupported on this configuration",
         )
         self._inv_rope_fused = supported
@@ -1480,7 +1480,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         - ``swa_only`` (``compress_ratio <= 1``): no main-MLA cache, only
           the SWA topk window. ``topk_indices`` / ``topk_lens`` stay
-          ``None`` so :func:`ds4_flash_mla_with_kvcache` runs the SWA-only
+          ``None`` so :func:`flash_mla_sparse_with_kvcache` runs the SWA-only
           single-path code path.
         - ``compress_ratio == 4`` (C4A): the indexer wrote per-token *local*
           (per-request) compressed-domain indices into
@@ -1495,7 +1495,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
           ``c128a_decode_topk_lens`` once per build, shared across all
           C128A layers.
 
-        ``ds4_flash_mla_with_kvcache`` replaces the upstream FP8 FlashMLA
+        ``flash_mla_sparse_with_kvcache`` replaces the upstream FP8 FlashMLA
         op: it skips the tile_scheduler_metadata and the ``is_fp8_kvcache``
         flag because the kv cache is bf16 here. ixformer's kernel accepts
         arbitrary ``h_q``, so no head-count padding is required.
@@ -1554,7 +1554,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             # fp8_ds_mla cache is already (num_blocks, block_size, 584);
             # the fp8 attention kernel accepts 3D directly.
             assert inv_rope_cos_sin_cache is None, (
-                "ds4_flash_mla_with_fp8_kvcache has no fused inverse-RoPE "
+                "flash_mla_sparse_with_fp8_kvcache has no fused inverse-RoPE "
                 "epilogue; _inv_rope_fusable must reject fp8_ds_mla layers"
             )
             swa_cache = self.swa_cache_layer.kv_cache
@@ -1604,7 +1604,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         """Gather K cache into bf16 workspace, dispatching by cache format.
 
         When ``kv_cache_dtype == "fp8_ds_mla"``, uses
-        ``ds4_gather_fp8_k_cache`` which dequantizes FP8 NoPE dims and
+        ``dequantize_and_gather_k_cache`` which dequantizes FP8 NoPE dims and
         copies bf16 RoPE dims into the bf16 output workspace.
         Otherwise, calls the standard ``ds4_gather_k_cache`` for bf16 cache.
         """
@@ -1646,9 +1646,9 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         Experimental alternative to :meth:`_forward_prefill` /
         :meth:`_forward_prefill_opt` (gated by ``VLLM_ILU_DS4_PREFILL_AS_DECODE``):
         instead of gathering a shared bf16 workspace and calling
-        ``ds4_flash_mla_sparse_fwd``, treat every prefill query token as its own
+        ``flash_mla_sparse_fwd``, treat every prefill query token as its own
         batch element (``b = num_prefill_tokens``, ``s_q = 1``) and reuse the
-        decode kernel ``ds4_flash_mla_with_kvcache``.
+        decode kernel ``flash_mla_sparse_with_kvcache``.
 
         This is well-defined because the per-token SWA window and compressed
         top-k slot sourcing are purely position-based and identical for decode
@@ -1780,9 +1780,9 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         - ``dequantize_and_gather_k_cache`` → :func:`ds4_gather_k_cache`
           (bf16 paged gather, no fp8 dequant).
         - ``combine_topk_swa_indices`` →
-          :func:`ds4_combine_topk_swa_indices` (matches upstream layout
+          :func:`combine_topk_swa_indices` (matches upstream layout
           and pads to ``ceil((topk + window) / 128) * 128`` columns).
-        - ``flash_mla_sparse_fwd`` → :func:`ds4_flash_mla_sparse_fwd`.
+        - ``flash_mla_sparse_fwd`` → :func:`flash_mla_sparse_fwd`.
 
         ``attn_metadata`` may be ``None`` for SWA-only layers (no main
         MLA cache); the loop then gathers only the SWA segment and
@@ -1833,7 +1833,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             # ``topk_indices`` is unused for SWA-only layers (``top_k = 0``
             # tells the kernel to skip its content). We still need a 2D
             # ``[num_tokens, *]`` int32 buffer for the
-            # ``ds4_combine_topk_swa_indices`` shape check; reuse the full
+            # ``combine_topk_swa_indices`` shape check; reuse the full
             # ``topk_indices_buffer[num_decode_tokens:]`` slice (dim-0 only,
             # so it stays contiguous). Slicing ``[:, :1]`` here would yield
             # strides ``(K, 1)`` on shape ``(N, 1)``, which fails the
@@ -2171,9 +2171,9 @@ class IluDeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         # ``[num_blocks, storage_block_size, head_dim]`` view with no virtual
         # block splitting.
         #
-        # The CUDA ``dsa_indexer_mqa_logits_with_blocks`` kernel itself only
+        # The CUDA ``dsa_indexer_mqa_logits_with_kvcache`` kernel itself only
         # supports block_size in {16, 32, 64}; with block_size=256 the Python
-        # wrapper falls back to ``ref_dsa_indexer_mqa_logits_with_blocks``
+        # wrapper falls back to ``ref_dsa_indexer_mqa_logits_with_kvcache``
         # automatically (see ixformer indexer.py). The fallback is slower but
         # functionally equivalent.
         #
@@ -2333,10 +2333,10 @@ class IluDeepseekV4Indexer(nn.Module):
            ``rope_dim`` of ``q`` plus the fused ``weights *
            softmax_scale * (n_head ** -0.5)`` written directly in
            ``q``'s dtype (kernel scales in fp32 and F2T-casts on store),
-           matching the ``dsa_indexer_mqa_logits_with_blocks`` dtype
+           matching the ``dsa_indexer_mqa_logits_with_kvcache`` dtype
            contract for ``weights``.
         5. Per-prefill-chunk and (single) decode batch:
-           ``dsa_indexer_mqa_logits_with_blocks`` (logits) +
+           ``dsa_indexer_mqa_logits_with_kvcache`` (logits) +
            ``dsa_update_topk_indices`` (writes into
            ``self.topk_indices_buffer``).
 
@@ -2360,7 +2360,7 @@ class IluDeepseekV4Indexer(nn.Module):
 
         # ``ds4_fused_indexer_q_rope`` writes ``weights_out`` in q.dtype
         # directly (scaled in fp32 internally, F2T-cast on store), matching
-        # the downstream ``dsa_indexer_mqa_logits_with_blocks`` dtype
+        # the downstream ``dsa_indexer_mqa_logits_with_kvcache`` dtype
         # contract -- no fp32 -> bf16 cast needed.
         weights = torch.empty(
             (q.shape[0], self.n_head),
@@ -2448,7 +2448,7 @@ class IluDeepseekV4Indexer(nn.Module):
             assert decode_md is not None
             # Ragged (non-uniform query length) decode batches -- e.g. K>=2 MTP
             # where requests carry a variable number of accepted/proposed spec
-            # tokens -- are supported natively. ``dsa_indexer_mqa_logits``
+            # tokens -- are supported natively. ``dsa_indexer_mqa_logits_with_kvcache``
             # iterates requests via ``cu_seqlens_q`` (the same variable-q path
             # prefill uses) and ``cu_seqlen_ks/ke`` carry one causal span per
             # query token, so each decode token is an independent logits/topk

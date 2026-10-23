@@ -227,7 +227,7 @@ class IluV4W8A16BMMLinearMethod(LinearMethodBase):
 
 
 # A/B/C switch for the mhc_pre operator via IXFORMER_DS4_MHC_PRE ∈ {v1,v2,v3}:
-#   v1 (default) : original fused ds4_mhc_pre
+#   v1 (default) : original fused mhc_pre
 #   v2           : bf16 GEMM + single warp-synchronous epilogue (ds4_mhc_pre_v2)
 #   v3           : bf16 GEMM + split epilogue rms/Sinkhorn-coef/apply
 #                  (ds4_mhc_pre_v3, occupancy-isolation experiment)

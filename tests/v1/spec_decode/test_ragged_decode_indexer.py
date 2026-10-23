@@ -10,7 +10,7 @@ forces uniform decode query lengths, so a decode batch can be *ragged* (e.g. one
 request verifying 4 MTP tokens while another only decodes 1). The indexer ops
 used to ``raise NotImplementedError`` on such batches
 (``requires_padding``). That guard was removed because the ilu decode path drives
-``dsa_indexer_mqa_logits_with_blocks`` -- the *same* variable-q kernel prefill
+``dsa_indexer_mqa_logits_with_kvcache`` -- the *same* variable-q kernel prefill
 uses -- via per-request ``cu_seqlens_q`` plus one per-token causal span in
 ``cu_seqlen_ks/ke``. Each decode token is therefore an independent logits/topk
 row and ragged batches need no pack/unpack.

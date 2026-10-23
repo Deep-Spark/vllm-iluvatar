@@ -179,6 +179,7 @@ if TYPE_CHECKING:
     VLLM_ILU_GLM5NEXT_MLA_POOL4_DECODE: bool = True
     VLLM_ILU_GLM5NEXT_GATHER_BEFORE_GATE: bool = True
     VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP: bool = False
+    VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP: bool = True
     VLLM_ILU_GLM_DSA_INDEXER_PREPARE_FUSION: bool = True
     VLLM_ILU_NIXL_WRITE_USE_HOST_BUFFER: bool = False
     VLLM_ILU_NIXL_HOST_DTYPE: str = "auto"
@@ -445,6 +446,11 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # GLM-5.2 LL: shared MLP on an auxiliary stream overlaps dispatch.
     "VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP": _bool_reader(
         "VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP", "0"
+    ),
+    # V4.1 decode NVSM/LL: shared MLP on an auxiliary stream overlaps dispatch.
+    # Default on; set 0 to restore the serial dispatch-window schedule.
+    "VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP": _bool_reader(
+        "VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP", "1"
     ),
     "VLLM_ILU_GLM_SAMPLING_MODE": _glm_sampling_mode,
     # Opt-in local routing and INT8 quant+expand; restart workers to change.

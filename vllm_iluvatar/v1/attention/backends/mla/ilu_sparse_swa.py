@@ -16,7 +16,7 @@ The metadata builder is subclassed as ``IluDeepseekSparseSWAMetadataBuilder``
 to support ``VLLM_ILU_DS4_PREFILL_AS_DECODE``: when enabled, the SWA kernel
 range is extended from decode-only to decode+prefill tokens so that each
 prefill query token gets its own per-token SWA window indices/lens (reusing
-the decode kernel ``ds4_flash_mla_with_kvcache`` for prefill).
+the decode kernel ``flash_mla_sparse_with_kvcache`` for prefill).
 """
 
 from __future__ import annotations

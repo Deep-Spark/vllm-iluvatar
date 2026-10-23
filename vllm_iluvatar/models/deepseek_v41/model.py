@@ -1,4 +1,9 @@
-"""DeepSeek-V4.1-Flash on Iluvatar, raw FP8 checkpoint, text-only!"""
+"""DeepSeek-V4.1-Flash on Iluvatar, raw FP8 checkpoint.
+
+The text backbone (``IluDeepseekV41ForCausalLM``) is wrapped by
+``vl_model.IluDeepseekV41VLForCausalLM`` for vision checkpoints. Text-only
+checkpoints reach this class through that wrapper with the tower stubbed out.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +15,12 @@ from itertools import islice
 import torch
 from torch import nn
 from vllm.config import VllmConfig
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
@@ -28,6 +38,7 @@ from vllm.model_executor.offloader import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from vllm_iluvatar.envs import _ILU_CANONICAL_ONLY_ENV_VARS
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
     IluFusedMoEEP,
 )
@@ -58,8 +69,59 @@ from vllm_iluvatar.models.deepseek_v41.pp_plan import build_rank_plan, local_kv_
 
 logger = init_logger(f"vllm.{__name__}")
 
+# Fold the attention TP all-reduce into mhc_post. Set
+# VLLM_ILU_V41_ALLREDUCE_MHC_POST=0 to keep the separate all-reduce plus
+# hc_post_sqrsum.
+_V41_ALLREDUCE_MHC_POST = (
+    os.environ.get("VLLM_ILU_V41_ALLREDUCE_MHC_POST", "1") == "1"
+)
+logger.info(
+    "V4.1 MHC fused allreduce=%s (0 = split NCCL all-reduce + hc_post_sqrsum)",
+    _V41_ALLREDUCE_MHC_POST,
+)
+
+
+def _v41_ll_shared_dispatch_overlap_enabled() -> bool:
+    """Decode NVSM/LL: overlap shared MLP with IBGDA dispatch. Default on."""
+    return bool(
+        _ILU_CANONICAL_ONLY_ENV_VARS["VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP"]()
+    )
+
+
+def _allreduce_mhc_post_supported(config, tp_size: int) -> bool:
+    return (
+        _V41_ALLREDUCE_MHC_POST
+        and tp_size in (2, 4, 8)
+        and getattr(config, "hidden_size", None) in (4096, 5120, 7168)
+        and getattr(config, "hc_mult", None) == 4
+    )
+
+
 # Engram tables are loaded from mmap, not the vLLM weight iterator.
 _ENGRAM_SKIP = re.compile(r"(^|\.)engram\.")
+
+# ``kDeadId`` in the hash kernel (``dsv41_engram_hash_out`` pad argument),
+# ``DEAD_ID`` in community ``deepseek_v41/common/engram.py``: the token-cache
+# value that stops an n-gram. Only reachable through ``token_map``.
+_ENGRAM_DEAD_ID = -1
+
+
+def _image_dead_token_id(hf_config) -> int | None:
+    """The token id whose positions are dead for n-gram hashing, if any.
+
+    Vision checkpoints fill every image-span position with ``image_token_id``
+    (community ``deepseek_v41/common/mm_preprocess.py``), and those positions
+    must not enter an n-gram. Text-only checkpoints have no such id.
+    """
+    if not getattr(hf_config, "vision_n_layers", 0):
+        return None
+    image_token_id = getattr(hf_config, "image_token_id", None)
+    if image_token_id is None:
+        raise ValueError(
+            "config declares a vision tower but no image_token_id; engram "
+            "hashing needs it to recognize image-span positions"
+        )
+    return int(image_token_id)
 
 
 def default_aux_hidden_state_layers(hf_config) -> tuple[int, ...]:
@@ -94,11 +156,23 @@ class IluDeepseekV41MoE(nn.Module, IluFusedMoEEP):
         )
         self.gate.tid2eid = None
         self.gate.e_score_correction_bias = None
+        self.gate.bias_vl = None
         if getattr(config, "topk_method", None) == "noaux_tc":
             self.gate.e_score_correction_bias = nn.Parameter(
                 torch.empty(config.n_routed_experts, dtype=torch.float32),
                 requires_grad=False,
             )
+        from vllm.models.deepseek_v41.common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
+
+        self.image_sentinel_lo = 0
+        if getattr(config, "vision_n_layers", 0) > 0:
+            # Vision checkpoints route image sentinel tokens with bias_vl
+            # instead of e_score_correction_bias. Created on every MoE layer.
+            self.gate.bias_vl = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
+            self.image_sentinel_lo = IMAGE_SENTINEL_BASE_ID
 
         if config.n_shared_experts is None:
             self.shared_experts = None
@@ -136,6 +210,8 @@ class IluDeepseekV41MoE(nn.Module, IluFusedMoEEP):
             routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
             e_score_correction_bias=self.gate.e_score_correction_bias,
             hash_indices_table=None,
+            bias_vl=self.gate.bias_vl,
+            image_sentinel_lo=self.image_sentinel_lo,
             swiglu_limit=config.swiglu_limit,
             router_logits_dtype=torch.float32,
             enable_eplb=parallel_config.enable_eplb,
@@ -145,18 +221,25 @@ class IluDeepseekV41MoE(nn.Module, IluFusedMoEEP):
         # FusedMoE runner alone does not dispatch/combine activations across
         # that group on Iluvatar; the platform mixin owns that collective.
         self.init_ep()
+        # Decode NVSM/LL: run shared MLP on the aux stream so it overlaps
+        # IBGDA dispatch. GLM already wires this; V4.1 previously left the
+        # mixin default (False) and serialized shared compute behind dispatch.
+        self._ll_shared_dispatch_overlap_enabled = (
+            _v41_ll_shared_dispatch_overlap_enabled()
+        )
 
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
-        del input_ids
+        if self.gate.bias_vl is not None and input_ids is None:
+            raise ValueError("DeepSeek V4.1 vision MoE routing requires input_ids.")
         shape = hidden_states.shape
         if self._should_use_forward_dp_ep():
-            return self.forward_dp_ep(hidden_states).view(shape)
+            return self.forward_dp_ep(hidden_states, input_ids).view(shape)
         return self.experts(
             hidden_states=hidden_states,
             router_logits=hidden_states,
-            input_ids=None,
+            input_ids=input_ids,
         ).view(shape)
 
 
@@ -177,6 +260,10 @@ class IluDeepseekV41DecoderLayer(nn.Module):
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
+        tp_size = get_tensor_model_parallel_world_size()
+        self._fuse_attn_allreduce_post = _allreduce_mhc_post_supported(
+            config, tp_size
+        )
         self.attn = IluDeepseekV41Attention(
             vllm_config,
             prefix=f"{prefix}.attn",
@@ -184,6 +271,7 @@ class IluDeepseekV41DecoderLayer(nn.Module):
             is_kv_forwarder=is_kv_forwarder,
             is_kv_sender=is_kv_sender,
             kv_source_override=kv_source_override,
+            defer_o_proj_reduce=self._fuse_attn_allreduce_post,
         )
         self.ffn = IluDeepseekV41MoE(vllm_config, prefix=f"{prefix}.ffn")
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -309,7 +397,18 @@ class IluDeepseekV41DecoderLayer(nn.Module):
         finally:
             if h_fp8 is not None:
                 clear_activation_prequant()
-        residual, attn_sqrsum = mhc.hc_post_sqrsum(h, residual, attn_post, attn_comb)
+        if self._fuse_attn_allreduce_post:
+            residual, attn_sqrsum = mhc.allreduce_hc_post(
+                h,
+                residual,
+                attn_post,
+                attn_comb,
+                group=get_tp_group().device_group,
+            )
+        else:
+            residual, attn_sqrsum = mhc.hc_post_sqrsum(
+                h, residual, attn_post, attn_comb
+            )
 
         ffn_post, ffn_comb, h, ffn_pre, _, _ = self._hc_pre_mixes(
             residual,
@@ -426,6 +525,7 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
             )
         self.engram_layout: EngramLayout | None = None
         self.engram_hash: NgramHashState | None = None
+        self.image_dead_token_id = _image_dead_token_id(config)
         if self.engram_layer_ids:
             model_config = vllm_config.model_config
             self.model_path = model_config.model
@@ -654,6 +754,8 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 f"declares {expected}; every hash multiplier derives from this "
                 "number, so the tables would be rehashed incorrectly"
             )
+        if self.image_dead_token_id is not None:
+            token_map[self.image_dead_token_id] = _ENGRAM_DEAD_ID
 
         layout = EngramLayout.from_config(config)
         assert layout is not None
@@ -805,6 +907,7 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         submits dead ids so the other replicas' rows, which live on this rank's
         shard, are still read.
         """
+        self._mark_batch_image_tokens(input_ids)
         ready = (
             input_ids is not None
             and self.engram_hash is not None
@@ -816,9 +919,12 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
             hashes = self.engram_hash(
                 input_ids[:n], positions[:n], md, lookback_token_ids
             )
+            keep = md.is_valid_token[:n]
+            if self.image_dead_token_id is not None:
+                keep = keep & (input_ids[:n] != self.image_dead_token_id)
             for engram in self._engram_layers():
                 engram.prepare_embeddings(hashes[:, engram.layer_hash_index])
-                engram._token_mask = md.is_valid_token[:n]
+                engram._token_mask = keep
             return
         if self.engram_layout is None or not any(
             engram.embed._dp_group is not None for engram in self._engram_layers()
@@ -830,6 +936,21 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         for engram in self._engram_layers():
             engram.prepare_embeddings(dummy)
             engram._rows = None
+
+    def _mark_batch_image_tokens(self, input_ids: torch.Tensor | None) -> None:
+        has_image = False
+        if (
+            self.image_dead_token_id is not None
+            and input_ids is not None
+            and input_ids.numel() > 0
+            # `.any().item()` is a GPU→CPU sync; illegal while capturing.
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            has_image = bool((input_ids == self.image_dead_token_id).any().item())
+        try:
+            get_forward_context().ilu_v41_has_image_tokens = has_image
+        except Exception:
+            pass
 
     def forward(
         self,
@@ -932,26 +1053,28 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
 
 
 class IluDeepseekV41ForCausalLM(IluDeepseekV4Fp8ForCausalLM, SupportsEagle3):
-    """DeepSeek-V4.1-Flash on Iluvatar, raw FP8 checkpoint, text-only."""
+    """DeepSeek-V4.1-Flash on Iluvatar, raw FP8 checkpoint."""
 
     is_attention_free = False
 
     model_cls = IluDeepseekV41Model
     hf_to_vllm_mapper = _make_v41_weights_mapper()
 
-    # Text-only: skip DSpark draft, vision tower, and image-token gate bias.
-    _LOAD_SKIP_SUBSTRS = ("mtp.", "vision.", "aligner.", "image_", ".bias_vl")
+    _LOAD_SKIP_SUBSTRS = ("mtp.",)
+
+    requires_raw_input_tokens = True
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
+        raw_input_ids: torch.Tensor | None = None,
     ):
         return self.model(
-            input_ids,
+            input_ids if input_ids is not None else raw_input_ids,
             positions,
             intermediate_tensors,
             inputs_embeds,
@@ -1014,20 +1137,3 @@ class IluDeepseekV41ForCausalLM(IluDeepseekV4Fp8ForCausalLM, SupportsEagle3):
 
     def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
         return default_aux_hidden_state_layers(self.config)
-
-
-def register_model() -> None:
-    from vllm import ModelRegistry
-
-    # Two names, one class. ``DeepseekV41ForCausalLM`` is what the released
-    # raw-FP8 checkpoint declares; the Iluvatar-quantized conversions declare
-    # ``IluDeepseekV41ForCausalLM``, following the V4 convention where the
-    # ``Ilu`` prefix marks a checkpoint quantized for this platform. The two
-    # differ only in ``quantization_config`` -- compressed-tensors
-    # ``iluvatar-mixed`` versus raw FP8 -- which already selects the quant
-    # method per layer, and in module names they agree.
-    for arch in ("DeepseekV41ForCausalLM", "IluDeepseekV41ForCausalLM"):
-        ModelRegistry.register_model(
-            arch,
-            "vllm_iluvatar.models.deepseek_v41.model:IluDeepseekV41ForCausalLM",
-        )

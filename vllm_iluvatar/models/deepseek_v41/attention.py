@@ -104,6 +104,13 @@ warnings.filterwarnings(
 _INDEX_TILE = 256
 _PACKED_MLA_HEADS = (1, 8, 16, 32, 64, 128)
 _PT_MLA_HEADS = (1, 4, 8, 16, 32, 64, 128)
+# Prefill per-tensor FP8 sparse MLA uses the ixmma FMHADSA kernel.
+# Decode stays on dsv41_sparse_mla_fp8_pt. IXFORMER_V41_FMHADSA=0 disables it.
+_V41_PREFILL_FMHADSA = os.environ.get("IXFORMER_V41_FMHADSA", "1") == "1"
+logger.info(
+    "V4.1 prefill FMHADSA=%s (decode stays on ixformer dsv41_sparse_mla_fp8_pt)",
+    _V41_PREFILL_FMHADSA,
+)
 
 # Requests per workspace-gathered prefill chunk. Each one costs a row of
 # ``M * head_dim`` bf16, so this bounds the workspace rather than the batch.
@@ -706,8 +713,10 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         is_kv_forwarder: bool = False,
         is_kv_sender: bool = False,
         kv_source_override: int | None = None,
+        defer_o_proj_reduce: bool = False,
     ) -> None:
         super().__init__()
+        self._defer_o_proj_reduce = defer_o_proj_reduce
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         cache_config = vllm_config.cache_config
@@ -850,6 +859,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=not defer_o_proj_reduce,
             return_bias=False,
             prefix=f"{prefix}.wo_b",
         )
@@ -1661,6 +1671,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         extra_indices: torch.Tensor | None,
         extra_lens: torch.Tensor | None,
         output: torch.Tensor,
+        use_fmhadsa: bool = False,
     ) -> None:
         """Sparse MLA over the window and, for compressed layers, the top-k.
 
@@ -1692,6 +1703,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 extra_indices,
                 extra_lens,
                 output,
+                use_fmhadsa=use_fmhadsa,
             )
             return
         # ixformer 3817cf75: dsv41_mla_with_kvcache 与 ds4 的 decode 稀疏 MLA
@@ -1760,6 +1772,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         extra_indices: torch.Tensor | None,
         extra_lens: torch.Tensor | None,
         output: torch.Tensor,
+        use_fmhadsa: bool = False,
     ) -> None:
         if q.shape[1] not in _PT_MLA_HEADS:
             raise ValueError(f"Unsupported per-tensor FP8 MLA head count: {q.shape[1]}")
@@ -1772,7 +1785,12 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             self._q_quant_workspace_pt,
             backend="ixformer_native",
         )
-        ixfops.dsv41_sparse_mla_fp8_pt(
+        sparse_op = (
+            ixfops.fmhadsa
+            if use_fmhadsa
+            else ixfops.dsv41_sparse_mla_fp8_pt
+        )
+        sparse_op(
             q_fp8,
             q_scale,
             self.swa_cache_layer.kv_cache,
@@ -1837,6 +1855,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             extra_indices,
             extra_lens,
             output,
+            use_fmhadsa=False,
         )
 
     def _forward_prefill_as_decode(
@@ -1907,6 +1926,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             extra_indices,
             extra_lens,
             output,
+            use_fmhadsa=_V41_PREFILL_FMHADSA,
         )
 
     def _gather_k_cache(

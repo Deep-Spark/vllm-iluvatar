@@ -12,10 +12,9 @@ Why      : community spells both in Triton, which does not run on corex, and
            candidate source published.
 How      : same two entry points, same argument order and contract; the two
            reductions move to ``ixfops.v41_candidate_block_scores`` /
-           ``dsv41_apply_candidate_mask`` (ixformer deepseekv41/candidate).
+           ``v41_apply_candidate_mask`` (ixformer deepseekv41/candidate).
            ``torch.topk`` stays in torch; writing the shortlist uses
-           ``dsv41_write_candidate_topk``, the same kernel the plugin
-           ``v41_write_candidate_topk`` used.
+           ``v41_write_candidate_topk``.
 Scope    : DeepSeek-V4.1 indexers with a candidate source.
 Remove   : when community grows a vendor hook for these two.
 """

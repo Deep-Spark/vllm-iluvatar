@@ -351,6 +351,18 @@ class IluFusedMoEEP:
             return input_ids.view(view_shape).expand(org_shape[:-1]).reshape(-1)
         return input_ids.reshape(-1)
 
+    @staticmethod
+    def _router_input_ids(runner, input_ids: torch.Tensor | None):
+        """Token ids the router needs: hash routing and/or vision ``bias_vl``."""
+        if input_ids is None:
+            return None
+        router = runner.router
+        if getattr(router, "_hash_indices_table", None) is not None:
+            return input_ids
+        if getattr(router, "bias_vl", None) is not None:
+            return input_ids
+        return None
+
     def forward_dp_ep(
         self,
         hidden_states: torch.Tensor,
@@ -488,11 +500,7 @@ class IluFusedMoEEP:
         )
 
         with sequence_parallel_ctx:
-            router_input_ids = (
-                input_ids
-                if getattr(runner.router, "_hash_indices_table", None) is not None
-                else None
-            )
+            router_input_ids = self._router_input_ids(runner, input_ids)
             topk_indices_dtype = moe_kernel.prepare_finalize.topk_indices_dtype()
             topk_weights, topk_ids = runner.router.select_experts(
                 hidden_states=hidden_states,
@@ -591,11 +599,7 @@ class IluFusedMoEEP:
             )
             assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]
 
-            router_input_ids = (
-                input_ids
-                if getattr(runner.router, "_hash_indices_table", None) is not None
-                else None
-            )
+            router_input_ids = self._router_input_ids(runner, input_ids)
             tensors_to_gather = [hidden_states]
             if router_input_ids is not None:
                 tensors_to_gather.append(router_input_ids)

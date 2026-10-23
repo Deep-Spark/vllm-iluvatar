@@ -126,6 +126,7 @@ if TYPE_CHECKING:
     VLLM_ILU_FLASH_ATTN_FP8_SCALE_PATH: str = ""
     VLLM_ILU_MLA_ATTN_QUANT_TYPE: str = ""
     VLLM_ILU_MLA_CHUNKED_PREFILL_MAX_WS_SIZE: int = 0
+    VLLM_ILU_HYV4_FUSE_IHC: bool = True
     VLLM_ILU_USE_LORA_FUSION: bool = False
     VLLM_ILU_VIT_ATTN_OPT_LEVEL: int = 0
     VLLM_ILU_VIT_ATTN_LAYER: str = ""
@@ -261,6 +262,7 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     )
     .strip()
     .lower(),
+    "VLLM_ILU_HYV4_FUSE_IHC": _bool_reader("VLLM_ILU_HYV4_FUSE_IHC", "1"),
     "VLLM_ILU_FLASH_ATTN_QUANT_TYPE": lambda: os.environ.get(
         "VLLM_ILU_FLASH_ATTN_QUANT_TYPE", ""
     ).upper(),

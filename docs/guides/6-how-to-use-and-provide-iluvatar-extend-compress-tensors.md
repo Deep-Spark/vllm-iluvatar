@@ -479,7 +479,7 @@ configs 不包含离线转换方法、checkpoint 名称匹配规则或模型配�
 - `to_float32`：将 BF16、FP16 等浮点权重转换为 FP32；
 - `fp8_block`：使用普通浮点 block scale 还原 FP8 权重；
   - `options`：`block_size`。
-- `fp8_block_e8m0`：使用 UE8M0 block scale 还原 FP8 权重；
+- `fp8_block_e8m0`：使用 UE8M0 block scale 还原 FP8 权重。按 scale 形状区分两种布局：最后一维每 `block_size` 个元素一个 scale（HY4 MXFP8，`[N, K/32]`），或两个维度都按 `block_size` 分块（DeepSeek-V4，`[N/128, K/128]`）。
   - `options`：`block_size`。
 - `fp8_static`：使用可广播的静态 scale 还原 FP8 权重；
   - `options`：`block_size`、`allow_unscaled`。
@@ -502,6 +502,7 @@ configs 不包含离线转换方法、checkpoint 名称匹配规则或模型配�
 - `int4_moe`：先生成 per-channel INT8，再通过 ixformer 重排为 MoE INT4，并按版本生成 scale、`i8_weight_scale` 和 `i8_weight_zero`。
   - `options`：`group_size`、`symmetric`、`gemm_format`、`pack_version`、`scale_layout` 和 `transport`；当 `scale_layout` 为 `row` 时，scale 会 reshape 为 `(1, *)`。
 - `pack_int4_moe`：处理三维专家权重，即所有专家位于同一个 tensor 中的情况；该方法会逐个专家调用 `int4_moe`。`options` 在 `int4_moe` 参数之外还包括：`packed`（gate_up 为 `true`，down 为 `false`）；`chunk_dim`（gate_up 的拆分维度）。
+- `stream_pack_int4_moe`：与 `pack_int4_moe` 的输出一致，但反量化与量化交替执行：每个专家依次搬到 `work_device` 上反量化并打包，不会一次性生成完整的三维 FP32 张量，适用于显存或内存不足的大规模 MoE。该方法同时消费所在规则的 `dequant.method` 和 `dequant.options`，`options` 与 `pack_int4_moe` 相同。HY4 W4A8-TN-v2 使用 `rules/tencent/hy4_w4a8.json` 与 `configs/tencent/hy4_w4a8.json`。
 - `pack_int8_moe`：处理三维 MoE expert 权重。先按 expert 做 `int8_per_channel`，scale 为 `(E, N, 1)`，再 `transpose(1, 2)` 成 `(E, K, N)`，对齐`moe_w8a8_group_gemv`（NN-only）。
   - `options`：`gemm_format` 为 `NN`；`symmetric`；`group_size`；`round_through_bfloat16` 和 `transport` 与 `int8_per_channel` 相同。
   - Qwen3.6 MoE W8A8 示例：`rules/qwen/qwen3_6_moe_w8a8.json` 与 `configs/qwen/qwen3_6_moe_w8a8.json`。routed experts 为 NN INT8，dense `self_attn.{q,k,v,o}_proj` 仍为 TN INT8。

@@ -28,7 +28,7 @@ from safetensors.torch import load_file, save_file
 from tqdm import tqdm
 
 if __package__:
-    from .methods import DEQUANT_METHODS, QUANT_METHODS
+    from .methods import DEQUANT_METHODS, DEQUANT_QUANT_METHODS, QUANT_METHODS
     from .recipes import (
         available_recipes,
         canonical_recipe_name,
@@ -36,7 +36,7 @@ if __package__:
         recipe_paths,
     )
 else:  # Allow ``python examples/iluvatar-compressed-tensors/quant.py``.
-    from methods import DEQUANT_METHODS, QUANT_METHODS
+    from methods import DEQUANT_METHODS, DEQUANT_QUANT_METHODS, QUANT_METHODS
     from recipes import (
         available_recipes,
         canonical_recipe_name,
@@ -240,7 +240,28 @@ def _resolve_config(value: Any, rules_doc: Mapping[str, Any]) -> Any:
         raise ProfileError(
             "$config is reversed; put concrete values in rules and use $rules in configs"
         )
-    return {key: _resolve_config(item, rules_doc) for key, item in value.items()}
+    return {
+        key: _resolve_config(item, rules_doc)
+        for key, item in value.items()
+        if not str(key).startswith("_")
+    }
+
+
+def _parse_work_device(raw: object, field: str) -> str:
+    """Parse a rule's ``work_device`` flag.
+
+    ``"cuda"`` (or JSON ``true``) moves the dequantized tensor onto the CLI
+    ``--device`` before quantization; ``"cpu"`` forces CPU quantization.
+    """
+    if raw in (None, "", False):
+        return ""
+    if raw is True:
+        return "cuda"
+    if isinstance(raw, str) and raw.lower() in ("cuda", "cpu"):
+        return raw.lower()
+    raise ProfileError(
+        f'{field} must be omitted, false, true, "cuda", or "cpu", got {raw!r}'
+    )
 
 
 def _contains_config_ref(value: Any) -> bool:
@@ -308,7 +329,10 @@ class RuleSet:
                     raise ProfileError(
                         f"rules[{index}] unknown dequant method {dequant_method!r}"
                     )
-                if quant_method not in QUANT_METHODS:
+                if (
+                    quant_method not in QUANT_METHODS
+                    and quant_method not in DEQUANT_QUANT_METHODS
+                ):
                     raise ProfileError(
                         f"rules[{index}] unknown quant method {quant_method!r}"
                     )
@@ -349,7 +373,9 @@ class RuleSet:
                         quant_method=quant_method,
                         quant_options=quant_options,
                         outputs=item.get("outputs", {}),
-                        work_device=bool(item.get("work_device", "")),
+                        work_device=_parse_work_device(
+                            item.get("work_device"), f"rules[{index}].work_device"
+                        ),
                     ),
                 )
             )
@@ -452,12 +478,31 @@ def _convert_tensor(
             name, rule.scale["from_suffix"], rule.scale["to_suffix"]
         )
         scale = store.get(scale_name)
-    value = DEQUANT_METHODS[rule.dequant_method](  # type: ignore[index]
-        tensor, scale, rule.dequant_options
+
+    target_device = (
+        work_device
+        if rule.work_device == "cuda"
+        else ("cpu" if rule.work_device == "cpu" else str(tensor.device))
     )
-    if rule.work_device:
-        value = value.to(work_device)
-    result = QUANT_METHODS[rule.quant_method](value, rule.quant_options)  # type: ignore[index]
+    dequant_quant = DEQUANT_QUANT_METHODS.get(rule.quant_method or "")
+    if dequant_quant is not None:
+        # The method runs dequant and quant itself, e.g. one expert at a time
+        # instead of materializing the whole dequantized pack.
+        result = dequant_quant(
+            tensor,
+            scale,
+            dequant_method=rule.dequant_method,
+            dequant_options=rule.dequant_options,
+            quant_options=rule.quant_options,
+            work_device=target_device,
+        )
+    else:
+        value = DEQUANT_METHODS[rule.dequant_method](  # type: ignore[index]
+            tensor, scale, rule.dequant_options
+        )
+        if rule.work_device:
+            value = value.to(target_device)
+        result = QUANT_METHODS[rule.quant_method](value, rule.quant_options)  # type: ignore[index]
     weight_name = (
         name
         if "weight" not in rule.outputs

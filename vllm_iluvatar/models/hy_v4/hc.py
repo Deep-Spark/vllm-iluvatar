@@ -9,26 +9,29 @@ channels to one hidden state (`HYV4HCPreLayer`), runs the sub-block, then
 scatters the result back over the channels (`HYV4HCPostLayer`). The final
 `HYV4HCHeadLayer` merges the channels before the model's output norm.
 
-Delta vs upstream: upstream wraps each step in an optional ``HpcIHCPre`` /
-``HpcIHCPost`` / ``HpcIHCHead`` kernel, which needs the hpc ``.so`` plus an
-sm100/sm103 device and is off by default (``VLLM_ENABLE_HPC_OPS=0``). Neither
-the module nor the device exists here, so those are replaced by ixformer's
-``fuse_ihc_pre`` / ``fuse_ihc_post`` / ``fuse_ihc_head``, whose reference
-implementations are the same math (per-branch ``hc_scale``, ``magnitude`` on
-the post branch, ``hc_eps`` on both). The eager bodies are kept as the
-fallback, so a shape/dtype ixformer cannot take still computes the right
-answer.
+Uses ixformer's ``fuse_ihc_pre`` / ``fuse_ihc_post`` / ``fuse_ihc_head`` on
+ivcore11 and ivcore30. On ivcore11, pre/head keep FP32 projection weights and
+only use the native split-K path (up to 64 tokens). Larger batches keep the
+eager FP32 projection: ixformer's large-batch GEMM rounds weights and logits
+to BF16. Unsupported inputs also keep the eager implementation.
 """
 
 from __future__ import annotations
 
 import torch
+import vllm.envs as envs
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 
 logger = init_logger(__name__)
+
+# ixformer's native iHC kernels hard-reject every other shape; these constants
+# describe the kernel contract, while each layer's hc_mult/hidden_size still
+# comes from the model config and is checked against that contract below.
+_NATIVE_HC_MULT = 4
+_NATIVE_HIDDEN_DIMS = (4096, 6144)
 
 
 def _ihc_ops() -> object | None:
@@ -45,12 +48,14 @@ def _ihc_ops() -> object | None:
     silent fallback means capturing a slow graph and measuring it as if it were
     the fused one. The log is what tells the two apart after the fact.
     """
-    from vllm_iluvatar.ilu_util.arch import is_ivcore30
+    from vllm_iluvatar.ilu_util.arch import cuda_arch
 
-    if not is_ivcore30():
+    if not envs.VLLM_ILU_HYV4_FUSE_IHC:
+        return None
+    if cuda_arch() not in ("ivcore11", "ivcore30"):
         logger.warning_once(
-            "HYV4 iHC is running the eager fallback: ixformer's fused iHC ops "
-            "are ivcore30-only. Correct, but far slower than fuse_ihc_*."
+            "HYV4 iHC is running the eager fallback: fused iHC requires "
+            "ivcore11 or ivcore30."
         )
         return None
     try:
@@ -61,7 +66,10 @@ def _ihc_ops() -> object | None:
             "importable. Correct, but far slower than fuse_ihc_*."
         )
         return None
-    if not hasattr(ixf_ops, "fuse_ihc_pre"):
+    if not all(
+        hasattr(ixf_ops, name)
+        for name in ("fuse_ihc_pre", "fuse_ihc_post", "fuse_ihc_head")
+    ):
         logger.warning_once(
             "HYV4 iHC is running the eager fallback: this ixformer build has "
             "no fuse_ihc_pre. Correct, but far slower than fuse_ihc_*."
@@ -71,13 +79,52 @@ def _ihc_ops() -> object | None:
     return ixf_ops
 
 
-def _bf16_projection(module: nn.Module, weight: torch.Tensor) -> torch.Tensor:
-    """Cache a bf16 copy of an iHC projection weight.
+def _native_shape(
+    x: torch.Tensor, *, hc_mult: int, hidden_dim: int
+) -> bool:
+    if hc_mult != _NATIVE_HC_MULT or hidden_dim not in _NATIVE_HIDDEN_DIMS:
+        logger.warning_once(
+            "HYV4 iHC is running the eager fallback: fused iHC supports "
+            "hc_mult=%d and hidden_size in %s, but the model config has "
+            "hc_mult=%d and hidden_size=%d.",
+            _NATIVE_HC_MULT,
+            _NATIVE_HIDDEN_DIMS,
+            hc_mult,
+            hidden_dim,
+        )
+        return False
+    return (
+        x.is_cuda
+        and x.dtype == torch.bfloat16
+        and x.dim() == 3
+        and x.shape[0] > 0
+        and x.shape[1] == hc_mult
+        and x.shape[2] == hidden_dim
+        and x.is_contiguous()
+    )
 
-    The fused ops run the projection as a bf16 GEMM, so an fp32 weight would be
-    cast on every call. The weight is static, so cast it once and hold on to it
-    (ds4 does the same with ``fn``).
+
+def _native_projection_shape(
+    x: torch.Tensor, *, hc_mult: int, hidden_dim: int
+) -> bool:
+    from vllm_iluvatar.ilu_util.arch import is_ivcore11
+
+    # Must match ixformer's kIhcPreSmallBatch. Above this bound the native
+    # GEMM rounds its weight and output to BF16, unlike the eager fallback.
+    return _native_shape(
+        x, hc_mult=hc_mult, hidden_dim=hidden_dim
+    ) and (not is_ivcore11() or x.shape[0] <= 64)
+
+
+def _native_projection(module: nn.Module, weight: torch.Tensor) -> torch.Tensor:
+    """Keep FP32 for BI split-K; cache the existing BF16 path on ivcore30.
+
+    The small-batch native kernel accepts FP32 weights directly.
     """
+    from vllm_iluvatar.ilu_util.arch import is_ivcore11
+
+    if is_ivcore11():
+        return weight
     if weight.dtype != torch.float32:
         return weight
     cached = getattr(module, "_ihc_w_bf16", None)
@@ -154,10 +201,12 @@ class HYV4HCPreLayer(nn.Module):
             gates ``[num_tokens, hc]`` consumed by `HYV4HCPostLayer`.
         """
         ops = _ihc_ops()
-        if ops is not None and x.is_cuda and x.dim() == 3:
+        if ops is not None and _native_projection_shape(
+            x, hc_mult=self.hc_mult, hidden_dim=self.hidden_dim
+        ):
             return ops.fuse_ihc_pre(
                 x,
-                _bf16_projection(self, self.hc_fn.weight),
+                _native_projection(self, self.hc_fn.weight),
                 self.hc_scale,
                 self.hc_base,
                 norm_eps=self.layernorm_epsilon,
@@ -209,6 +258,8 @@ class HYV4HCPostLayer(nn.Module):
     def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.config = config
+        self.hc_mult = config.hc_mult
+        self.hidden_dim = config.hidden_size
 
     def forward(
         self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor
@@ -224,7 +275,16 @@ class HYV4HCPostLayer(nn.Module):
             The updated residual channels ``[num_tokens, hc, d]``.
         """
         ops = _ihc_ops()
-        if ops is not None and x.is_cuda:
+        if (
+            ops is not None
+            and _native_shape(
+                residual, hc_mult=self.hc_mult, hidden_dim=self.hidden_dim
+            )
+            and x.dtype == torch.bfloat16
+            and x.is_contiguous()
+            and post.dtype == torch.float32
+            and post.is_contiguous()
+        ):
             return ops.fuse_ihc_post(x, residual, post)
 
         dtype = x.dtype
@@ -298,10 +358,12 @@ class HYV4HCHeadLayer(nn.Module):
             The merged hidden state ``[num_tokens, d]``.
         """
         ops = _ihc_ops()
-        if ops is not None and x.is_cuda and x.dim() == 3:
+        if ops is not None and _native_projection_shape(
+            x, hc_mult=self.hc_mult, hidden_dim=self.hidden_size
+        ):
             return ops.fuse_ihc_head(
                 x,
-                _bf16_projection(self, self.hc_head_fn.weight),
+                _native_projection(self, self.hc_head_fn.weight),
                 self.hc_head_scale,
                 self.hc_head_base,
                 norm_eps=self.config.rms_norm_eps,

@@ -1030,8 +1030,10 @@ class NixlConnectorScheduler:
             self._drain_safe_releases(meta)
         # P side
         else:
-            # try add waiting to running requests first
+            # A new/resumed request carries its complete current block table.
+            # Preemption invalidates the previously accumulated physical IDs.
             for new_req in scheduler_output.scheduled_new_reqs:
+                self._reqs_blocks.pop(new_req.req_id, None)
                 self.update_prefill_req(
                     meta,
                     new_req.req_id,
@@ -1043,14 +1045,16 @@ class NixlConnectorScheduler:
             # add chunked done requests
             scheduled_cached_reqs = scheduler_output.scheduled_cached_reqs
             for idx, request_id in enumerate(scheduled_cached_reqs.req_ids):
-                if request_id not in scheduled_cached_reqs.resumed_req_ids:
-                    self.update_prefill_req(
-                        meta,
-                        request_id,
-                        scheduler_output.num_scheduled_tokens[request_id],
-                        scheduled_cached_reqs.num_computed_tokens[idx],
-                        scheduled_cached_reqs.new_block_ids[idx],
-                    )
+                if request_id in scheduled_cached_reqs.resumed_req_ids:
+                    logger.info("NIXL rebuilt resumed send blocks req=%s old_sizes=%s new_sizes=%s", request_id, [len(x) for x in self._reqs_blocks.get(request_id, [])], [len(x or []) for x in scheduled_cached_reqs.new_block_ids[idx]])
+                    self._reqs_blocks.pop(request_id, None)
+                self.update_prefill_req(
+                    meta,
+                    request_id,
+                    scheduler_output.num_scheduled_tokens[request_id],
+                    scheduled_cached_reqs.num_computed_tokens[idx],
+                    scheduled_cached_reqs.new_block_ids[idx],
+                )
 
             meta.reqs_to_send_time_record = self._reqs_to_send_time_record
             self._reqs_to_send_time_record = {}

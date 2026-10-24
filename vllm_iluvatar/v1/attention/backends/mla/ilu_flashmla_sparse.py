@@ -8,6 +8,7 @@ import ixformer.inference.functions as ixfops
 import numpy as np
 import torch
 import vllm.envs as envs
+from ixformer.inference.functions.models.glm5next import global_pool_indices
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
@@ -506,6 +507,8 @@ class IluFlashMLASparseImpl(
         self._indexer = indexer
         self.softmax_scale = scale
         self.init_topk_indices_buffer(indexer, topk_indices_buffer)
+        self.index_group = None
+        self.index_group_index = 0
         # Prefill BF16 kernel requires 64 on Hopper, 128 on Blackwell
         self.prefill_padding = (
             128 if current_platform.is_device_capability_family(100) else 64
@@ -519,20 +522,69 @@ class IluFlashMLASparseImpl(
             (q_concat_shape, torch.bfloat16),
         )
         self.use_int8_mla = envs.VLLM_ILU_MLA_ATTN_QUANT_TYPE == "INT8"
+        self.use_pool4_decode = envs.VLLM_ILU_GLM5NEXT_MLA_POOL4_DECODE
+        self.W_UK_T: torch.Tensor | None = None
+        self.W_UV: torch.Tensor | None = None
 
-    def _k_up_proj(self, q_nope: torch.Tensor) -> torch.Tensor:
+    def _prepare_bf16_up_proj_weights(self, act_dtype: torch.dtype) -> None:
+        if self.W_UK_T is not None and self.W_UV is not None:
+            return
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            get_and_maybe_dequant_weights,
+        )
+
+        kv_b_proj_weight = get_and_maybe_dequant_weights(
+            self.kv_b_proj, out_dtype=act_dtype
+        ).T
+        assert kv_b_proj_weight.shape == (
+            self.kv_lora_rank,
+            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+        ), (
+            f"{kv_b_proj_weight.shape=}, {self.kv_lora_rank=}, "
+            f"{self.num_heads=}, {self.qk_nope_head_dim=}, {self.v_head_dim=}"
+        )
+        kv_b_proj_weight = kv_b_proj_weight.view(
+            self.kv_lora_rank,
+            self.num_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+        )
+        W_UK, W_UV = kv_b_proj_weight.split(
+            [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+        )
+        self.W_UK_T = W_UK.permute(1, 2, 0).contiguous()
+        self.W_UV = W_UV.transpose(0, 1).contiguous()
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        self._prepare_bf16_up_proj_weights(act_dtype)
+
+    def _k_up_proj(
+        self, q_nope: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        self._prepare_bf16_up_proj_weights(q_nope.dtype)
         # q_nope: (B, N, P), self.W_UK_T: (N, P, L)
         q_t = q_nope.transpose(0, 1)  # (N, B, P)
+        if out is not None:
+            torch.bmm(q_t, self.W_UK_T, out=out.transpose(0, 1))
+            return out
         ql = torch.bmm(q_t, self.W_UK_T)  # (N, B, L)
         return ql.transpose(0, 1)  # (B, N, L)
 
     def _v_up_proj(
         self, x: torch.Tensor, out: torch.Tensor | None = None
     ) -> torch.Tensor:
+        self._prepare_bf16_up_proj_weights(x.dtype)
         # x: (B, N, L), self.W_UV: (N, L, V)
         x_t = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
-        result = torch.bmm(x_t, self.W_UV)  # (N, B, V)
-        return result.transpose(0, 1)  # (B, N, V)
+        if out is None:
+            out = torch.empty(
+                x_t.shape[1],
+                self.num_heads,
+                self.v_head_dim,
+                device=x.device,
+                dtype=x.dtype,
+            )
+        torch.bmm(x_t, self.W_UV, out=out.transpose(0, 1))
+        return out
 
     def forward_full(
         self,
@@ -545,7 +597,7 @@ class IluFlashMLASparseImpl(
         output: torch.Tensor,
         positions: torch.Tensor | None = None,
         kv_cache_scale: list[torch.Tensor] | None = None,
-    ) -> torch.Tensor | None:
+    ) -> torch.Tensor:
         """Iluvatar-optimized forward_impl aligned with v0.17.0.
 
         Key differences from the default path:
@@ -583,6 +635,8 @@ class IluFlashMLASparseImpl(
         k_pe = k_pe[:num_actual_toks, ...]
         positions = positions[:num_actual_toks, ...]
         num_mqa_tokens = q.size(0)
+        if num_mqa_tokens < output.shape[0]:
+            output[num_mqa_tokens:].zero_()
         if kv_cache_scale:
             kv_cache_scale = kv_cache_scale[0]
         if num_mqa_tokens > 0:
@@ -590,11 +644,16 @@ class IluFlashMLASparseImpl(
             q_nope, q_pe = q.split(
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
             )
-            q_pe, k_pe = layer.rotary_emb(positions[:num_actual_toks], q_pe, k_pe)
+            if layer.rotary_emb is not None:
+                q_pe, k_pe = layer.rotary_emb(positions[:num_actual_toks], q_pe, k_pe)
 
-            q_nope = self._k_up_proj(q_nope)
-            q_nope = q_nope.view(-1, self.num_heads, self.kv_lora_rank)
-            q = torch.cat([q_nope, q_pe], dim=-1)
+            if self.qk_rope_head_dim == 0:
+                q = q.new_empty((num_mqa_tokens, self.num_heads, self.kv_lora_rank))
+                self._k_up_proj(q_nope, out=q)
+            else:
+                q_nope = self._k_up_proj(q_nope)
+                q_nope = q_nope.view(-1, self.num_heads, self.kv_lora_rank)
+                q = torch.cat([q_nope, q_pe], dim=-1)
             if kv_cache.numel() > 0:
                 if self.use_int8_mla:
                     # block_num, block_size, 2 = kv_cache_scale.shape
@@ -607,7 +666,7 @@ class IluFlashMLASparseImpl(
                     rope_i8, rope_scale = ixf_ops.scaled_int8_quant_for_attn(k_pe, 2)
                     kv_i8 = torch.cat([nope_i8, rope_i8], dim=-1).squeeze(1)
                     kv_cache_scale = (nope_scale_cache, rope_scale_cache)
-                    torch.ops._C.concat_and_cache_dsa_int8(
+                    ixf_ops.concat_and_cache_dsa_int8(
                         kv_i8,
                         nope_scale,
                         rope_scale,
@@ -617,7 +676,7 @@ class IluFlashMLASparseImpl(
                         attn_metadata.slot_mapping.flatten(),
                     )
                 else:
-                    ops.concat_and_cache_mla(
+                    ixf_ops.concat_and_cache_mla(
                         k_c_normed,
                         k_pe,
                         kv_cache,
@@ -628,16 +687,10 @@ class IluFlashMLASparseImpl(
             attn_out = self.forward_mqa(
                 q, kv_cache, attn_metadata, self, kv_cache_scale
             )
-            output = torch.empty(
-                output.shape[0],
-                self.num_heads,
-                self.v_head_dim,
-                device=q.device,
-                dtype=q.dtype,
-            )
-            output[:num_actual_toks] = self._v_up_proj(attn_out)
+            output_view = output.view(-1, self.num_heads, self.v_head_dim)
+            self._v_up_proj(attn_out, out=output_view[:num_actual_toks])
 
-            return output.view(output.shape[0], self.v_head_dim * self.num_heads)
+        return output.view(output.shape[0], self.v_head_dim * self.num_heads)
 
     def _forward_bf16_kv(
         self,
@@ -646,17 +699,62 @@ class IluFlashMLASparseImpl(
         topk_indices: torch.Tensor,
         attn_metadata: IluFlashMLASparseMetadata,
     ) -> torch.Tensor:
-        # Convert per-request indices to global slots (decode) or workspace
-        # offsets (prefill).
-        topk_indices = triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token,
-            attn_metadata.block_table,
-            topk_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            NUM_TOPK_TOKENS=topk_indices.shape[1],
+        compact_pools = bool(getattr(self._indexer, "compact_pool_indices", False))
+        pool_prefill = compact_pools and attn_metadata.num_prefills > 0
+        pool_decode = (
+            compact_pools
+            and self.use_pool4_decode
+            and attn_metadata.num_prefills == 0
+            and q.shape[1] in (32, 64)
+            and q.shape[-1] == 512
+            and kv_c_and_k_pe_cache.shape[-1] == 512
         )
+        if compact_pools:
+            selected_pools = attn_metadata.topk_tokens // 4
+            topk_indices, topk_lens = global_pool_indices(
+                topk_indices[:, :selected_pools],
+                attn_metadata.req_id_per_token,
+                attn_metadata.block_table,
+                attn_metadata.seq_lens,
+                attn_metadata.query_start_loc,
+                attn_metadata.block_size,
+                expand=not (pool_prefill or pool_decode),
+            )
+        else:
+            topk_indices, topk_lens = ixf_ops.v41_global_topk_indices_and_lens(
+                topk_indices,
+                attn_metadata.req_id_per_token,
+                attn_metadata.block_table,
+                attn_metadata.block_size,
+                None,
+                None,
+                1,
+                0,
+                False,
+            )
 
-        return self._bf16_flash_mla_kernel(q, kv_c_and_k_pe_cache, topk_indices)
+        if (
+            attn_metadata.num_prefills == 0
+            and not pool_decode
+            and q.shape[-1] == 512
+            and kv_c_and_k_pe_cache.shape[-1] == 512
+        ):
+            page_size = attn_metadata.block_size
+            return ixfops.flash_mla_sparse_with_kvcache(
+                q.unsqueeze(1),
+                kv_c_and_k_pe_cache.view(-1, page_size, 1, 512),
+                topk_indices.view(q.shape[0], 1, -1),
+                topk_lens,
+                self.softmax_scale,
+            ).squeeze(1)
+
+        return self._bf16_flash_mla_kernel(
+            q,
+            kv_c_and_k_pe_cache,
+            topk_indices,
+            topk_lens,
+            kpool=4 if pool_prefill or pool_decode else 1,
+        )
 
     @staticmethod
     def flash_mla_sparse_prefill(
@@ -693,29 +791,39 @@ class IluFlashMLASparseImpl(
         q: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
         topk_indices: torch.Tensor,
+        topk_lens: torch.Tensor | None = None,
+        kpool: int = 1,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
             -1, 1, kv_c_and_k_pe_cache.shape[-1]
         )
 
-        # NOTE(Chen): kernel requires num_local_head to be a multiple of
-        # 64 on hopper and 128 on blackwell
-        if self.num_heads % self.prefill_padding != 0:
-            assert self.prefill_padding % self.num_heads == 0
-            logger.warning_once(
-                f"Padding num_heads from {self.num_heads} to "
-                f"{self.prefill_padding} for BF16 sparse prefill kernel"
+        if kv_c_and_k_pe_cache.shape[-1] == 576:
+            if self.num_heads % self.prefill_padding != 0:
+                assert self.prefill_padding % self.num_heads == 0
+                logger.warning_once(
+                    f"Padding num_heads from {self.num_heads} to "
+                    f"{self.prefill_padding} for BF16 sparse prefill kernel"
+                )
+                q_padded = q.new_empty((q.shape[0], self.prefill_padding, q.shape[2]))
+                q_padded[:, : self.num_heads, :] = q
+                q = q_padded
+            topk_indices = topk_indices.view(num_tokens, 1, -1)
+            output = self.flash_mla_sparse_prefill(
+                q, kv_c_and_k_pe_cache, topk_indices, self.softmax_scale
             )
-            q_padded = q.new_empty((q.shape[0], self.prefill_padding, q.shape[2]))
-            q_padded[:, : self.num_heads, :] = q
-            q = q_padded
-
-        topk_indices = topk_indices.view(num_tokens, 1, -1)
-        output = self.flash_mla_sparse_prefill(
-            q, kv_c_and_k_pe_cache, topk_indices, self.softmax_scale
-        )
-        output = output[:, : self.num_heads, :]
+            output = output[:, : self.num_heads, :]
+        else:
+            output = ixfops.flash_mla_sparse_fwd(
+                q=q,
+                kv=kv_c_and_k_pe_cache.view(-1, 1, q.shape[-1]),
+                indices=topk_indices.view(num_tokens, 1, -1),
+                sm_scale=self.softmax_scale,
+                topk_length=topk_lens,
+                kpool=kpool,
+                backend="ixinfer" if kpool == 4 else None,
+            )
         return output
 
     def _forward_int8_kv(

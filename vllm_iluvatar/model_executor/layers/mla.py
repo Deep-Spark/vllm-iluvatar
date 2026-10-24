@@ -136,6 +136,8 @@ class IluMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         q = q.view(-1, heads, self.qk_head_dim)
         if self.indexer and self.is_sparse and not self.skip_topk:
             self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+        if self.is_sparse:
+            self.mla_attn.impl.record_logical_topk_ready()  # type: ignore[attr-defined]
 
         if llama_4_scaling is not None:
             q *= llama_4_scaling
@@ -152,5 +154,8 @@ class IluMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
             q_dcp_replicated=q_dcp_replicated,
         )
+
+        if self.g_proj is not None:
+            attn_out = attn_out * self.g_proj(hidden_states)[0].sigmoid()
 
         return self.o_proj(attn_out)[0]

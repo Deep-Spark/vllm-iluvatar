@@ -80,6 +80,11 @@ def _ilu_mla_attention_forward(
 ) -> torch.Tensor:
     forward_full = getattr(self.impl, "forward_full", None)
     if not callable(forward_full):
+        if self.rotary_emb is not None:
+            assert position is not None
+            q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
+                position, q[..., self.qk_nope_head_dim :], k_pe
+            )
         return _COMMUNITY_FORWARD(
             self,
             q,
@@ -89,8 +94,8 @@ def _ilu_mla_attention_forward(
             q_dcp_replicated=q_dcp_replicated,
         )
 
-    assert position is not None and getattr(self, "rotary_emb", None) is not None, (
-        "Iluvatar MLA forward_full requires positions and rotary_emb; "
+    assert position is not None, (
+        "Iluvatar MLA forward_full requires positions: "
         "falling back to community MLAAttention.forward is not supported for "
         f"{self.impl.__class__.__name__}."
     )
@@ -98,7 +103,7 @@ def _ilu_mla_attention_forward(
         "q_dcp_replicated is not supported by the Iluvatar MLA full-forward path"
     )
     attn_metadata = _get_mla_attn_metadata(self.layer_name)
-    output = torch.zeros(
+    output = torch.empty(
         output_shape if output_shape is not None else q.shape,
         dtype=q.dtype,
         device=q.device,

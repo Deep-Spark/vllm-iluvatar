@@ -258,6 +258,22 @@ def _make_iluvatar_platform():
 
         @classmethod
         def check_and_update_config(cls, vllm_config) -> None:
+            model_config = getattr(vllm_config, "model_config", None)
+            cache_config = getattr(vllm_config, "cache_config", None)
+            if model_config is not None and cache_config is not None:
+                try:
+                    archs = model_config.architectures or []
+                except Exception:
+                    archs = []
+                if any(
+                    a in archs
+                    for a in (
+                        "Glm5NextForConditionalGeneration",
+                        "Glm5NextForCausalLM",
+                    )
+                ) and cache_config.cache_dtype not in ("auto", "bfloat16"):
+                    cache_config.cache_dtype = "auto"
+
             super().check_and_update_config(vllm_config)
 
             pc = getattr(vllm_config, "parallel_config", None)

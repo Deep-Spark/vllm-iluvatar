@@ -27,6 +27,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_compressed_slot_mapping,
 )
+from vllm.v1.attention.backends.mla.indexer import compute_kpool_tail_slot_mapping
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout, MLAAttentionSpec
 
@@ -156,6 +157,49 @@ class IluDeepseekV32IndexerBackend(AttentionBackend):
     def get_builder_cls() -> type["IluDeepseekV32IndexerMetadataBuilder"]:
         return IluDeepseekV32IndexerMetadataBuilder
 
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        assert num_kv_heads == 1
+        return (num_blocks, block_size, head_size)
+
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+    ) -> tuple[int, ...]:
+        if include_num_layers_dimension:
+            return (0, 1, 2, 3)
+        return (0, 1, 2)
+
+
+class IluKpoolTailBackend(IluDeepseekV32IndexerBackend):
+    """Storage-only backend for the GLM-5.3-Flash kpool tail cache."""
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        return (KVCacheLayout.LBHNC,)
+
+    @staticmethod
+    def get_name() -> str:
+        return "ILU_KPOOL_TAIL"
+
+    @classmethod
+    def get_supported_head_sizes(cls) -> list[int]:
+        return []
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        return [MultipleOf(1)]
+
+    @staticmethod
+    def get_builder_cls() -> type["IluKpoolTailMetadataBuilder"]:  # type: ignore[override]
+        return IluKpoolTailMetadataBuilder
+
 
 @dataclass
 class IluDeepseekV32IndexerPrefillChunkMetadata:
@@ -200,6 +244,9 @@ class IluDeepSeekV32IndexerDecodeMetadata:
     max_context_len: int
     max_q_len: int
     max_kv_len: int
+    per_req_decode_lens: torch.Tensor | None = None
+    decode_is_uniform: bool = True
+    write_max_decode_len: int = 0
 
 
 @dataclass
@@ -207,16 +254,8 @@ class IluDeepseekV32IndexerMetadata:
     # FIXME (zyongye)
     # hacky way to access the data now, need to be in chunked meta
     seq_lens: torch.Tensor
-
-    num_reqs: int
-    max_query_len: int
     max_seq_len: int
-
-    num_actual_tokens: int  # Number of tokens excluding padding.
-    query_start_loc: torch.Tensor
     slot_mapping: torch.Tensor
-    # The dimension of the attention heads
-    head_dim: int
 
     # New for MLA (compared to FlashAttention)
     # For handling prefill decode split
@@ -227,10 +266,92 @@ class IluDeepseekV32IndexerMetadata:
 
     decode: IluDeepSeekV32IndexerDecodeMetadata | None = None
     prefill: IluDeepseekV32IndexerPrefillMetadata | None = None
+    num_reqs: int = None
+    num_actual_tokens: int = None  # Number of tokens excluding padding.
+    max_query_len: int = None
+    positions: torch.Tensor | None = None
     pcp_world_size: int = 1
     block_table: torch.Tensor | None = None
     token_to_req_indices: torch.Tensor | None = None
+    query_start_loc: torch.Tensor = None
+    head_dim: int = None
     num_states: int | None = None
+
+
+class IluKpoolTailMetadataBuilder(AttentionMetadataBuilder):
+    """Build only the circular slot mapping needed by the storage-only tail."""
+
+    _cudagraph_support = AttentionCGSupport.ALWAYS
+    supports_update_block_table = False
+    reorder_batch_threshold = None
+
+    def __init__(
+        self,
+        kv_cache_spec: AttentionSpec,
+        layer_names: list[str],
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self.num_speculative_tokens = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        self.decode_threshold = 1 + self.num_speculative_tokens
+        self.slot_mapping_buffer = torch.empty(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            dtype=torch.int64,
+            device=device,
+        )
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> IluDeepseekV32IndexerMetadata:
+        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+            split_decodes_and_prefills(
+                common_attn_metadata, decode_threshold=self.decode_threshold
+            )
+        )
+        slot_mapping = common_attn_metadata.slot_mapping
+        positions = common_attn_metadata.positions
+        if positions is not None:
+            slot_mapping_buffer = self.slot_mapping_buffer[
+                : slot_mapping.numel()
+            ].view_as(slot_mapping)
+            slot_mapping = compute_kpool_tail_slot_mapping(
+                slot_mapping,
+                common_attn_metadata.block_table_tensor,
+                common_attn_metadata.query_start_loc,
+                positions,
+                common_attn_metadata.num_actual_tokens,
+                common_attn_metadata.num_reqs,
+                self.kv_cache_spec.block_size,
+                out=slot_mapping_buffer,
+            )
+        return IluDeepseekV32IndexerMetadata(
+            seq_lens=common_attn_metadata.seq_lens,
+            max_seq_len=common_attn_metadata.max_seq_len,
+            slot_mapping=slot_mapping,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            num_prefills=num_prefills,
+            num_prefill_tokens=num_prefill_tokens,
+            num_reqs=common_attn_metadata.num_reqs,
+            num_actual_tokens=common_attn_metadata.num_actual_tokens,
+            positions=common_attn_metadata.positions[
+                : common_attn_metadata.num_actual_tokens
+            ]
+            if common_attn_metadata.positions is not None
+            else None,
+            query_start_loc=common_attn_metadata.query_start_loc[
+                : common_attn_metadata.num_reqs + 1
+            ],
+            block_table=common_attn_metadata.block_table_tensor,
+        )
 
 
 # TODO (zyongye) optimize this, this is now vibe coded
@@ -403,6 +524,7 @@ def get_max_decode_context_len(vllm_config: VllmConfig, compress_ratio: int) -> 
 class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     reorder_batch_threshold: int = 1
     natively_supported_next_n: list[int] = [1, 2]
+    requires_block_table_width = True
     # TODO (matt): integrate kernel with next_n = 4 support
 
     @classmethod
@@ -413,7 +535,7 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     ) -> AttentionCGSupport:
         return AttentionCGSupport.UNIFORM_BATCH
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, block_table_width: int | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.pcp_world_size = (
             self.vllm_config.parallel_config.prefill_context_parallel_size
@@ -437,6 +559,7 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # for V4 (compress_ratio == 4 on the indexer cache).
         self.compress_ratio = 1
         if isinstance(self.kv_cache_spec, MLAAttentionSpec):
+            assert isinstance(self.kv_cache_spec.tokens_per_state, int)
             self.compress_ratio = self.kv_cache_spec.tokens_per_state
         if self.pcp_world_size > 1 and self.compress_ratio != 1:
             raise NotImplementedError(
@@ -449,9 +572,14 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # Pre-allocate compressed slot_mapping buffer for CUDA graph address
         # stability when this group needs compression (V4 indexer cache).
         if self.compress_ratio > 1:
-            self.compressed_slot_mapping_buffer = torch.empty(
+            self.compressed_slot_mapping_buffer = torch.zeros(
                 (scheduler_config.max_num_batched_tokens,),
                 dtype=torch.int64,
+                device=self.device,
+            )
+            self.expanded_seq_lens_buffer = torch.zeros(
+                (scheduler_config.max_num_batched_tokens,),
+                dtype=torch.int32,
                 device=self.device,
             )
         self.v41_req_id_per_token_buffer = torch.empty(
@@ -464,6 +592,11 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             next_n, device=self.device, dtype=torch.int32
         )
         self.decode_lens_buffer = torch.zeros(
+            (scheduler_config.max_num_batched_tokens,),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.per_req_decode_lens_buffer = torch.zeros(
             (scheduler_config.max_num_batched_tokens,),
             dtype=torch.int32,
             device=self.device,
@@ -496,10 +629,14 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
-        max_num_blocks_per_req = cdiv(
-            self.vllm_config.model_config.max_model_len,
-            self.kv_cache_spec.block_size
-            * self.vllm_config.parallel_config.decode_context_parallel_size,
+        max_num_blocks_per_req = (
+            block_table_width
+            if block_table_width is not None
+            else cdiv(
+                self.vllm_config.model_config.max_model_len,
+                self.kv_cache_spec.block_size
+                * self.vllm_config.parallel_config.decode_context_parallel_size,
+            )
         )
         self.cu_seqlens_q_buffer = torch.empty(
             (scheduler_config.max_num_seqs + 1,),
@@ -544,6 +681,7 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
+        self.indexer_decode_block_table_buffer: torch.Tensor | None = None
 
         # See: DeepGMM/csrc/apis/attention.hpp
         self.scheduler_metadata_buffer = torch.empty(
@@ -804,6 +942,9 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             max_context_len=max_context_len,
             max_q_len=max_q_len,
             max_kv_len=max_kv_len,
+            per_req_decode_lens=self.per_req_decode_lens_buffer[:num_decodes],
+            decode_is_uniform=(int(decode_lens_cpu.min().item()) == max_q_len),
+            write_max_decode_len=max_q_len,
             # schedule_metadata=self.scheduler_metadata_buffer,
         )
         return decode_metadata
@@ -938,14 +1079,25 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # writes/reads at compressed-domain offsets matching the K-cache
         # layout.  CUDA-graph stability is preserved by reusing
         # ``self.compressed_slot_mapping_buffer``.
+        indexer_block_table = common_attn_metadata.block_table_tensor
         if self.compress_ratio > 1:
+            kernel_block_size = self.kernel_block_size
+            if (
+                kernel_block_size is not None
+                and self.kv_cache_spec.block_size != kernel_block_size
+                and self.kv_cache_spec.block_size % kernel_block_size == 0
+            ):
+                factor = self.kv_cache_spec.block_size // kernel_block_size
+                indexer_block_table = (
+                    common_attn_metadata.block_table_tensor[:, ::factor] // factor
+                ).contiguous()
             padded_num_tokens = common_attn_metadata.slot_mapping.shape[0]
             get_compressed_slot_mapping(
                 common_attn_metadata.num_actual_tokens,
                 common_attn_metadata.slot_mapping,
                 common_attn_metadata.query_start_loc,
                 common_attn_metadata.seq_lens,
-                common_attn_metadata.block_table_tensor.clamp(min=0),
+                indexer_block_table.clamp(min=0),
                 self.kv_cache_spec.num_states,
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
@@ -998,7 +1150,7 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     query_slice,
                     query_start_loc_cpu,
                     seq_lens_cpu,
-                    common_attn_metadata.block_table_tensor,
+                    indexer_block_table,
                     skip_kv_gather=query_slice.start > 0,
                 )
                 for req_slice, query_slice in chunk_specs
@@ -1014,6 +1166,9 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 out=self.decode_lens_buffer[:num_decodes],
             )
             decode_lens = self.decode_lens_buffer[:num_decodes]
+            self.per_req_decode_lens_buffer[:num_decodes].copy_(
+                self.decode_lens_buffer[:num_decodes]
+            )
             decode_lens_cpu = torch.diff(
                 common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
             )
@@ -1050,6 +1205,20 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             decode_metadata = self.build_decode_metadata(
                 common_attn_metadata, num_decodes, decode_lens, num_decode_tokens
             )
+            if indexer_block_table is not common_attn_metadata.block_table_tensor:
+                rows, cols = indexer_block_table[:num_decodes].shape
+                if self.indexer_decode_block_table_buffer is None:
+                    self.indexer_decode_block_table_buffer = torch.zeros(
+                        (self.vllm_config.scheduler_config.max_num_batched_tokens, cols),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                self.indexer_decode_block_table_buffer[:rows, :cols].copy_(
+                    indexer_block_table[:num_decodes]
+                )
+                decode_metadata.block_table = self.indexer_decode_block_table_buffer[
+                    :rows, :cols
+                ]
 
         attn_metadata = IluDeepseekV32IndexerMetadata(
             seq_lens=common_attn_metadata.seq_lens,

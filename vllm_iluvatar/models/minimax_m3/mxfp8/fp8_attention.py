@@ -102,8 +102,35 @@ class FP8MetadataBuilder(AttentionMetadataBuilder[FP8Metadata]):
     )
     reorder_batch_threshold = None
 
+    @classmethod
+    def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
+        spec = vllm_config.speculative_config
+        if spec is not None and spec.use_dspark():
+            # Uniform verification reuses the causal ragged DSA path. cu/seq,
+            # block tables and slots remain runner-owned stable buffers; the
+            # per-builder prefix buffer is refreshed before every replay.
+            # Scratch includes all bonus+draft query tokens (allocated below).
+            return AttentionCGSupport.UNIFORM_BATCH
+        return cls._cudagraph_support
+
+    def build_for_cudagraph_capture(self, common_attn_metadata):
+        c = common_attn_metadata
+        lengths = (
+            c.query_start_loc_cpu[1 : c.num_reqs + 1]
+            - c.query_start_loc_cpu[: c.num_reqs]
+        )
+        if lengths.numel() and not bool((lengths == self.capture_query_width).all()):
+            raise ValueError(
+                "MiniMax FP8 Graph requires uniform configured verification width"
+            )
+        return self.build(0, c)
+
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        spec = vllm_config.speculative_config
+        self.capture_query_width = 1 + (
+            spec.num_speculative_tokens if spec is not None else 0
+        )
         self.prefix_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_seqs,
             dtype=torch.int32,
@@ -289,11 +316,16 @@ class MiniMaxM3FP8Attention(nn.Module, AttentionLayerBase):
             or vc.parallel_config.decode_context_parallel_size != 1
         ):
             raise NotImplementedError("Initial M3 FP8 integration requires PCP1/DCP1")
-        if vc.speculative_config is not None or getattr(
-            vc.parallel_config, "enable_dbo", False
+        if getattr(vc.parallel_config, "enable_dbo", False):
+            raise NotImplementedError(
+                "MiniMax FP8 does not support concurrent DBO scratch use"
+            )
+        if vc.speculative_config is not None and (
+            not vc.speculative_config.use_dspark()
+            or vc.parallel_config.pipeline_parallel_size != 1
         ):
             raise NotImplementedError(
-                "Initial M3 FP8 integration has no speculative/DBO buffer-lifetime contract"
+                "MiniMax FP8 speculative path requires DSpark with PP1"
             )
         if config.hidden_size != 6144 or config.head_dim != 128:
             raise NotImplementedError(
@@ -316,8 +348,21 @@ class MiniMaxM3FP8Attention(nn.Module, AttentionLayerBase):
         self.layer_id, self.sparse, self.layer_name = layer_id, sparse, prefix + ".attn"
         self.kv_cache_dtype = cache_config.cache_dtype
         self.state = get_state(vc, create=True)
-        self.max_tokens = vc.scheduler_config.max_num_batched_tokens
-        self.max_decode_tokens = min(self.max_tokens, vc.scheduler_config.max_num_seqs)
+        # DSpark verification schedules the bonus plus speculative tokens.
+        # Target scratch is distinct from the dense draft and remains live for
+        # one sequential target forward; auxiliary states are copied by model.py.
+        self.max_tokens = (
+            vc.scheduler_config.max_num_scheduled_tokens
+            or vc.scheduler_config.max_num_batched_tokens
+        )
+        query_width = 1 + (
+            vc.speculative_config.num_speculative_tokens
+            if vc.speculative_config is not None
+            else 0
+        )
+        self.max_decode_tokens = min(
+            self.max_tokens, vc.scheduler_config.max_num_seqs * query_width
+        )
         self.score_capacity = (vc.model_config.max_model_len + 127) // 128
         self.B = 128
         self.cache_config = cache_config

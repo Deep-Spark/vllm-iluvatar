@@ -10,14 +10,14 @@ import pytest
 import torch
 from vllm.config import VllmConfig, set_current_vllm_config
 
+from vllm_iluvatar.ilu_util import arch
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_routed_experts import (
     IluRoutedExperts,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8 import (
+from vllm_iluvatar.model_executor.layers.quantization.fp8 import (
     IluFp8Config,
     IluFp8MoEMethod,
 )
-from vllm_iluvatar.ilu_util import arch
 from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8_to_w4a8_moe import (
     IluFp8ToW4A8NNMoEMethod,
     quantize_fp8_to_w4a8_nn,
@@ -78,11 +78,16 @@ def runtime_payload():
 
 
 class Layer(IluRoutedExperts):
-    def __init__(self, tp=1, rank=0):
+    def __init__(self, tp=1, rank=0, intermediate=2048):
         torch.nn.Module.__init__(self)
         self.moe_config = SimpleNamespace(
             has_bias=False,
             is_act_and_mul=True,
+            w13_num_shards=2,
+            tp_shard_with_padding=False,
+            intermediate_size=intermediate,
+            intermediate_size_per_partition=intermediate // tp,
+            moe_backend="auto",
             hidden_dim=256,
             hidden_dim_unpadded=256,
             intermediate_size_per_partition_unpadded=None,
@@ -103,8 +108,8 @@ class Layer(IluRoutedExperts):
         self._loaded_expert_biases = set()
 
 
-def select(tp=1, rank=0, config_mutation=None):
-    layer = Layer(tp, rank)
+def select(tp=1, rank=0, config_mutation=None, intermediate=2048):
+    layer = Layer(tp, rank, intermediate=intermediate)
     config = VllmConfig()
     config.model_config = SimpleNamespace(
         hf_text_config=SimpleNamespace(model_type="glm_moe_dsa"), dtype=torch.bfloat16
@@ -410,7 +415,7 @@ def test_streaming_tp_ep_and_graph(tp, rank, scale_first, monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 @_requires_ivcore30
 def test_invalid_dtype_and_pending():
-    layer, method = select()
+    layer, method = select(intermediate=512)
     with torch.device("cuda"):
         method.create_weights(
             layer, 2, 256, 512, torch.bfloat16, weight_loader=layer.weight_loader
@@ -435,8 +440,8 @@ def test_static_nn_load_matches_online(tp, rank, pack_version, monkeypatch):
 
     from vllm_iluvatar.model_executor.layers.quantization import ilu_w4a8_nn as w4a8
 
-    online, method = select(tp, rank)
-    static = Layer(tp, rank)
+    online, method = select(tp, rank, intermediate=512)
+    static = Layer(tp, rank, intermediate=512)
     ilu_params = {"gemm_format": "NN"}
     if pack_version is not None:
         ilu_params["pack_version"] = pack_version

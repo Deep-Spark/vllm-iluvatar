@@ -16,8 +16,8 @@ Why      : community ``ModelOptNvFp4FusedMoE.__init__`` calls
 How      : ``@register_quantization_config("modelopt_fp4")`` on a subclass that
            overrides only the routed-expert branch of ``get_quant_method`` to
            return ``IluModelOptNvFp4MoEMethod``; that method keeps community
-           ``create_weights`` verbatim (so the checkpoint parameters load
-           unchanged), reprocesses the NVFP4 weights into the ixmm ix30 layout
+           checkpoint parameter layouts (with optional CPU staging and load
+           coverage validation), reprocesses the NVFP4 weights into the ixmm ix30 layout
            at load time, and routes ``apply`` to ``ilu_mxfp4_fused_experts()``.
 Scope    : routed NVFP4 experts on Iluvatar (ivcore30 + ixmm); selected by
            ``IluModelOptNvFp4Config.get_quant_method``.
@@ -48,6 +48,8 @@ our class wins.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
@@ -67,9 +69,13 @@ from vllm.model_executor.layers.quantization.modelopt import (
 from vllm.model_executor.utils import replace_parameter
 
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
+    _STEP3_SWIGLUSTEP_VARIANT,
+    _SWIGLUOAI_VARIANT,
     _ixmm_backend_available,
     ilu_mxfp4_fused_experts,
 )
+
+from .weight_utils import publish_derived_weight
 
 # Process this many experts per dequant/requant temporary. DSv4-scale w13 across
 # all local experts at once would allocate several GB of fp32; mirror the MXFP4
@@ -84,7 +90,6 @@ _FP4_MAX_MAG = 6.0
 # ``"swiglustep"`` (clamp at 7) or ``"silu"`` (no clamp). ``swiglustep_dynamic_
 # scaled_fp8`` clamps after silu and reads a numeric limit with ``limit <= 0`` =
 # no clamp, so we derive it here directly from ``activation``.
-_SWIGLUSTEP_CLAMP = 7.0
 
 
 def preprocess_nvfp4_weight_for_ixmm(
@@ -179,10 +184,21 @@ class IluModelOptNvFp4MoEMethod(ModelOptNvFp4FusedMoE):
         self,
         quant_config: ModelOptNvFp4Config,
         moe_config: FusedMoEConfig,
+        *,
+        stage_on_cpu: bool = False,
+        validate_checkpoint: bool = False,
+        expert_chunk_size: int = _IXMM_EXPERT_CHUNK,
     ) -> None:
         # Skip ModelOptNvFp4FusedMoE.__init__, run its base directly.
         FusedMoEMethodBase.__init__(self, moe_config)
         self.quant_config = quant_config
+        if quant_config.group_size != _NVFP4_GROUP_SIZE:
+            raise ValueError("NVFP4 requires group_size=16")
+        if expert_chunk_size < 1:
+            raise ValueError("expert_chunk_size must be positive")
+        self.stage_on_cpu = stage_on_cpu
+        self.validate_checkpoint = validate_checkpoint
+        self.expert_chunk_size = expert_chunk_size
         self.use_a16 = quant_config.quant_method == "W4A16_NVFP4"
         # No community backend is selected: the ix30 path is our own compute.
         self.nvfp4_backend = None
@@ -197,6 +213,76 @@ class IluModelOptNvFp4MoEMethod(ModelOptNvFp4FusedMoE):
             "is_monolithic() would dereference it"
         )
         assert self.is_monolithic is False
+
+    # [ILU override] ModelOptNvFp4FusedMoE.create_weights — delta: optional
+    # host staging and per-local-expert load coverage; reuse community layouts.
+    def create_weights(
+        self,
+        layer,
+        num_experts,
+        hidden_size,
+        intermediate_size_per_partition,
+        params_dtype,
+        **extra_weight_attrs,
+    ):
+        if not self.moe.is_act_and_mul:
+            raise NotImplementedError("NVFP4 ixmm experts require a gated activation")
+        if (
+            hidden_size % _IXMM_GROUP_SIZE
+            or intermediate_size_per_partition % _IXMM_GROUP_SIZE
+        ):
+            raise ValueError("NVFP4 ixmm expert K dimensions must be divisible by 256")
+        if self.validate_checkpoint:
+            original_loader = extra_weight_attrs["weight_loader"]
+            layer._ilu_nvfp4_loaded = {}
+
+            def checked_loader(
+                param, weight, name, shard_id, expert_id, return_success=False, **extra
+            ):
+                success = original_loader(
+                    param,
+                    weight,
+                    name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                    return_success=True,
+                    **extra,
+                )
+                if success:
+                    key = (name.rsplit(".", 1)[-1], shard_id)
+                    layer._ilu_nvfp4_loaded.setdefault(key, set()).add(expert_id)
+                return success if return_success else None
+
+            extra_weight_attrs["weight_loader"] = checked_loader
+        with torch.device("cpu") if self.stage_on_cpu else nullcontext():
+            super().create_weights(
+                layer,
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                params_dtype,
+                **extra_weight_attrs,
+            )
+
+    def _validate_loaded_experts(self, layer):
+        if not self.validate_checkpoint:
+            return
+        loaded = layer._ilu_nvfp4_loaded
+        expected = {
+            (f"{'w2' if shard == 'w2' else 'w13'}_{kind}", shard)
+            for kind in ("weight", "weight_scale", "weight_scale_2", "input_scale")
+            for shard in ("w1", "w2", "w3")
+        }
+        reference = loaded.get(("w13_weight", "w1"), set())
+        if (
+            set(loaded) != expected
+            or len(reference) != layer.num_experts
+            or any(experts != reference for experts in loaded.values())
+        ):
+            raise ValueError(
+                "Incomplete NVFP4 experts: every local expert requires "
+                "weight/block/global/input scales for w1/w2/w3"
+            )
 
     # [ILU override] FusedMoEMethodBase.is_monolithic — delta: constant False.
     # We always take the modular path (router first, then
@@ -237,6 +323,9 @@ class IluModelOptNvFp4MoEMethod(ModelOptNvFp4FusedMoE):
     # kernel build with a NVFP4 -> ix30 conversion, then drop the now-unused
     # global / input scales so they do not stay resident (see plan §5).
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+        self._validate_loaded_experts(layer)
         if not _ixmm_backend_available():
             raise RuntimeError(
                 "IluModelOptNvFp4MoEMethod requires the ixmm backend (ix30 "
@@ -247,7 +336,10 @@ class IluModelOptNvFp4MoEMethod(ModelOptNvFp4FusedMoE):
 
         # A single global scale per expert for w13 (w1 / w3 must match; community
         # warns otherwise at ``modelopt.py:1560-1566``).
-        w13_global = layer.w13_weight_scale_2[:, 0].contiguous()
+        global13 = layer.w13_weight_scale_2
+        if not torch.equal(global13[:, 0], global13[:, 1]):
+            raise ValueError("NVFP4 gate/up global scales must match")
+        w13_global = global13[:, 0].contiguous()
         w2_global = layer.w2_weight_scale_2.contiguous()
 
         for w_name, s_name, g in (
@@ -264,40 +356,39 @@ class IluModelOptNvFp4MoEMethod(ModelOptNvFp4FusedMoE):
                 f"{s_name} expected float8_e4m3fn, got {s.dtype}"
             )
 
-            weight_parts: list[torch.Tensor] = []
-            scale_parts: list[torch.Tensor] = []
-            for begin in range(0, w.shape[0], _IXMM_EXPERT_CHUNK):
-                end = min(begin + _IXMM_EXPERT_CHUNK, w.shape[0])
-                ixmm_weight, ixmm_scale = preprocess_nvfp4_weight_for_ixmm(
+            if not torch.isfinite(g).all() or not (g > 0).all():
+                raise ValueError(f"Invalid global scales for {w_name}")
+            e, n, half_k = w.shape
+            ixmm_weight = torch.empty(
+                (e, half_k, n), dtype=torch.uint8, device=w.device
+            )
+            ixmm_scale = torch.empty(
+                (e, half_k * 2 // _IXMM_GROUP_SIZE, n),
+                dtype=torch.float32,
+                device=w.device,
+            )
+            for begin in range(0, e, self.expert_chunk_size):
+                end = min(begin + self.expert_chunk_size, e)
+                packed, scale = preprocess_nvfp4_weight_for_ixmm(
                     w[begin:end],
                     s[begin:end],
                     g[begin:end],
                 )
-                weight_parts.append(ixmm_weight)
-                scale_parts.append(ixmm_scale)
-
-            ixmm_weight = torch.cat(weight_parts, dim=0).contiguous()
-            ixmm_scale = torch.cat(scale_parts, dim=0).contiguous()
-            expected_weight_shape = (w.shape[0], w.shape[2], w.shape[1])
-            expected_scale_shape = (
-                w.shape[0],
-                (w.shape[2] * 2) // _IXMM_GROUP_SIZE,
-                w.shape[1],
-            )
-            if tuple(ixmm_weight.shape) != expected_weight_shape:
-                raise ValueError(
-                    f"preprocess_nvfp4_weight_for_ixmm returned shape "
-                    f"{tuple(ixmm_weight.shape)} for {w_name}, expected "
-                    f"{expected_weight_shape}"
-                )
-            if tuple(ixmm_scale.shape) != expected_scale_shape:
-                raise ValueError(
-                    f"preprocess_nvfp4_weight_for_ixmm returned shape "
-                    f"{tuple(ixmm_scale.shape)} for {s_name}, expected "
-                    f"{expected_scale_shape}"
-                )
-            replace_parameter(layer, w_name, ixmm_weight)
-            replace_parameter(layer, s_name, ixmm_scale)
+                if (
+                    packed.shape != ixmm_weight[begin:end].shape
+                    or scale.shape != ixmm_scale[begin:end].shape
+                ):
+                    raise ValueError(
+                        f"Invalid NVFP4 ixmm conversion shapes for {w_name}"
+                    )
+                ixmm_weight[begin:end].copy_(packed)
+                ixmm_scale[begin:end].copy_(scale)
+                del packed, scale
+            # Host-staged checkpoint parameters are restored to CPU by vLLM's
+            # loader context; derived buffers must stay on the compute device.
+            publish = publish_derived_weight if self.stage_on_cpu else replace_parameter
+            publish(layer, w_name, ixmm_weight)
+            publish(layer, s_name, ixmm_scale)
 
         # Free the checkpoint scales the ix30 path no longer references. Phase 1
         # uses dynamic per-token W4A8 activation, so ``*_input_scale`` (W4A4) is
@@ -313,14 +404,14 @@ class IluModelOptNvFp4MoEMethod(ModelOptNvFp4FusedMoE):
             elif hasattr(layer, name):
                 delattr(layer, name)
 
+        layer._already_called_process_weights_after_loading = True
         layer._ilu_mxfp4_ixmm = True
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     # [ILU override] ModelOptNvFp4FusedMoE.apply — delta: wiring only. Community
     # delegates to ``self.moe_kernel.apply``; we call the plugin's ixmm compute
-    # with explicit tensors, selecting the Step-3.5 ``step3_swiglustep`` variant
-    # and deriving its numeric clamp from ``layer.activation``. NVFP4 experts
+    # with explicit tensors, selecting the activation from ``layer.activation``.  NVFP4 experts
     # carry no bias, and the shared output arrives through
     # ``shared_experts_input`` (``extra_residual``), so ``shared_experts`` is
     # accepted for signature compatibility but unused.
@@ -333,13 +424,28 @@ class IluModelOptNvFp4MoEMethod(ModelOptNvFp4FusedMoE):
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
-        # Step-3.5 routed SwiGLU: read the community activation string off the
-        # experts and map it to the numeric clamp the ``step3_swiglustep`` op
-        # expects (``"swiglustep"`` -> 7.0, ``"silu"`` -> 0.0 = no clamp). This
-        # keeps all SwiGLU semantics in the method + ixformer op, so the model
-        # file carries no swiglu wiring.
         activation = getattr(layer, "activation", "silu")
-        swiglu_limit = _SWIGLUSTEP_CLAMP if activation == "swiglustep" else 0.0
+        activation = getattr(activation, "value", activation)
+        alpha = beta = None
+        if activation == "swigluoai_uninterleave":
+            required = ("swiglu_limit", "swiglu_alpha", "swiglu_beta")
+            if any(getattr(layer, name, None) is None for name in required):
+                raise ValueError("SwiGLU-OAI requires explicit limit, alpha and beta")
+            swiglu_limit = float(layer.swiglu_limit)
+            alpha, beta = float(layer.swiglu_alpha), float(layer.swiglu_beta)
+            variant = _SWIGLUOAI_VARIANT
+        elif activation in ("silu", "swiglustep"):
+            if activation == "swiglustep":
+                if getattr(layer, "swiglu_limit", None) is None:
+                    raise ValueError("NVFP4 swiglustep requires explicit swiglu_limit")
+                swiglu_limit = float(layer.swiglu_limit)
+            else:
+                swiglu_limit = 0.0
+            variant = _STEP3_SWIGLUSTEP_VARIANT
+        else:
+            raise NotImplementedError(
+                f"Unsupported NVFP4 expert activation: {activation}"
+            )
         return ilu_mxfp4_fused_experts(
             hidden_states=x,
             w13_weight=layer.w13_weight,
@@ -355,7 +461,9 @@ class IluModelOptNvFp4MoEMethod(ModelOptNvFp4FusedMoE):
             w13_bias=None,
             w2_bias=None,
             backend="ixmm",
-            swiglu_variant="step3_swiglustep",
+            swiglu_variant=variant,
+            swiglu_alpha=alpha,
+            swiglu_beta=beta,
         )
 
 

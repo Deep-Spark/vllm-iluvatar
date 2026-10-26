@@ -13,7 +13,7 @@ This is the third late-phase mechanism, kept deliberately separate from
                        copies)
 
 ``apply_oot_registrations()`` is invoked from ``register_general`` after
-``apply_general_patches()``. It drives two distinct OOT registration paths, kept
+``apply_general_patches()``. It drives op, model and reasoning-parser registration paths, kept
 separate because their mechanisms differ:
 
   1. Op OOT registration (``_register_ops``): import every module under
@@ -22,6 +22,8 @@ separate because their mechanisms differ:
   2. Model registration (``_register_models``): import every module under
      ``_OOT_MODEL_PACKAGES``, then call its ``register_model()`` hook, which does
      ``ModelRegistry.register_model``.
+  3. Reasoning parser registration: call ``register_reasoning_parsers`` via the
+     official ``ReasoningParserManager.register_module`` extension point.
 
 Afterwards it runs a *prefix-compatible* signature check over every OOT subclass
 that came from our packages (see ``ilu_util.signature.validate_oot_override``).
@@ -68,6 +70,7 @@ _OOT_MODEL_PACKAGES = [
     "vllm_iluvatar.models.glm_moe_dsa",
     "vllm_iluvatar.models.hy_v4",
     "vllm_iluvatar.models.minimax_m3",
+    "vllm_iluvatar.models.step5",
     "vllm_iluvatar.models.qwen4_exp",
 ]
 
@@ -85,6 +88,9 @@ def apply_oot_registrations() -> None:
 
     _register_ops()
     _register_models()
+    from .reasoning import register_reasoning_parsers
+
+    register_reasoning_parsers()
     _validate_oot_overrides()
 
 

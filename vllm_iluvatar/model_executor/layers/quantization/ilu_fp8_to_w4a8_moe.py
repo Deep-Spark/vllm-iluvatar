@@ -20,7 +20,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_utils import (
     W4A8GroupGemmInfo,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8 import (
+from vllm_iluvatar.model_executor.layers.quantization.fp8 import (
     IluFp8MoEMethod,
 )
 from vllm_iluvatar.model_executor.layers.quantization.ilu_quant_registry import (

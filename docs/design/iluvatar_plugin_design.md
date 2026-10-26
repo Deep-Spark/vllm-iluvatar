@@ -29,6 +29,7 @@ vllm-iluvatar/
     ├── platforms/          # IluPlatform：Iluvatar OOT 平台 + attention backend 注册（见 §2.3、第 7 章）
     ├── distributed/        # 镜像 vllm/distributed/：通信器 + KV connector + general patch 落点（见 §2.4、§2.7、第 4 章）
     ├── kernels/            # IR provider：iluvatar provider 实现（见第 10 章）
+    ├── reasoning/          # 镜像社区 reasoning parser；由 ilu_register 注册
     ├── lora/               # LoRA punica wrapper override（见第 4 章）
     ├── model_executor/     # 镜像 vllm/model_executor/：算子 / 量化 / 模型 / MoE / kernel OOT 实现（见第 5、6、8 章）
     ├── v1/                 # 镜像 vllm/v1/：attention backend / executor / spec_decode override（见第 4、7 章）
@@ -313,6 +314,8 @@ general patch 示范 copy / rebind 写法，均经 `general_patch` 脚手架 + `
 
 当社区把某个算子（`RMSNorm` 等）建成 `CustomOp` 时，vLLM 提供官方 OOT 扩展点 `CustomOp.register_oot`：可用一个子类替换社区实现，**无需 monkey patch、无社区源码改动**。本章讲算子这一路径；模型注册见第 6 章，二者同由 `ilu_register/` 编排。
 
+未量化 MoE 的 OOT 接入、权重生命周期、TN/NN 执行路径与精度契约见 [BF16 MoE 设计](bf16_moe_design.md)。
+
 ### 5.1 ilu_register 编排概览（第 5、6、8 章共用）
 
 `ilu_register/` 是继 import hook、general patch 之后的**第三种 late phase 机制**，并刻意与 `ilu_patch/` 分开：它走 vLLM **官方扩展点**，挂接的是「替换子类 / 注册表条目」而非「方法体 copy」，因此**不做源码漂移校验**，只做前缀兼容签名校验（§5.5）。
@@ -331,6 +334,11 @@ register_general
         -> ModelRegistry.register_model 覆盖同名架构
      -> _validate_oot_overrides: 前缀兼容签名校验
 ```
+
+Reasoning parser 同样使用官方注册表：`ilu_register/reasoning.py` 的
+`register_reasoning_parsers()` 在模型注册之后调用 `ReasoningParserManager.register_module`。
+实现放在 `reasoning/` 的上游镜像位置，不通过 general patch 注册；目前覆盖
+`minimax_m3` 的当前 assistant turn reasoning 边界，其余解析行为继承社区。
 
 新增算子覆盖时，在 `_OOT_OP_PACKAGES` 下放一个带 `@<Base>.register_oot` 的模块即可，无需修改编排代码（量化配置同理，改用 `@register_quantization_config`，见第 8 章）。
 
@@ -830,3 +838,21 @@ ruff 的规则集与上游对齐，定义在 `pyproject.toml` 的 `[tool.ruff.li
 ### 13.3 纯 Python 机制写 CPU-only 用例
 
 不依赖 GPU 的机制（如 `rebind_module_func` 的传播 / 身份匹配、签名校验）应写成 CPU-only 用例，无卡环境也能跑通。例：`tests/v1/attention/backends/test_fa_utils_patch.py` 用合成伪模块验证 `rebind_module_func` 同时改到源模块与已 `from-import` 的拷贝引用、且按身份不误伤同名异物。
+
+## 14. DSpark context 与模型部署资源
+
+`v1/worker/gpu/spec_decode/dspark/speculator.py` 镜像社区执行器位置。
+执行器保留社区加载和 proposal 流程，仅在顺序 PP1/CP1、无 microbatching/LoRA 时
+询问 draft 的 `try_bind_target_context(target_model, output) -> bool` 能力。
+返回 true 表示 target 已绑定固定 `output`，会在 forward 中完成辅助状态投影；
+propose 使用同一 storage，且不应再收到辅助状态列表。返回 false 或没有此能力时
+完全保留社区辅助状态导出与投影路径。
+
+模型负责辅助层索引和投影语义，runner 负责调度及 buffer 生命周期。
+`dspark/buffers.py` 保存通用投影 buffer；通用批量 Gemma RMSNorm 位于
+`model_executor/layers/layernorm.py`，SwiGLU-OAI FP8/Linear 组合位于
+`model_executor/layers/activation.py`，TP reduction 仍由模型负责。
+
+模型专用部署模板随模型适配资料维护，启动时通过 `--chat-template` 显式指定，
+不作为插件仓库或 wheel 的资源。
+一次性 benchmark/proof 探针不作为生产包模块，也不由模型注册加载。

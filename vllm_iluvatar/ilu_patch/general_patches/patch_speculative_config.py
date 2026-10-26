@@ -50,12 +50,12 @@ def register() -> None:
 
 
 def _apply() -> None:
+    from typing import Literal, get_args
+
+    import vllm.config.speculative as community_speculative
     from vllm.config.speculative import SpeculativeConfig
 
-    from vllm_iluvatar.config.speculative import (
-        make_hf_config_override,
-        make_post_init,
-    )
+    from vllm_iluvatar.config.speculative import make_hf_config_override, make_post_init
 
     orig_hf = SpeculativeConfig.hf_config_override
     orig_post_init = SpeculativeConfig.__post_init__
@@ -79,3 +79,7 @@ def _apply() -> None:
 
     SpeculativeConfig.hf_config_override = staticmethod(wrapped_hf)
     SpeculativeConfig.__post_init__ = wrapped_post_init
+
+    community_speculative.MTPModelTypes = Literal[
+        (*get_args(community_speculative.MTPModelTypes), "step5_mtp")
+    ]

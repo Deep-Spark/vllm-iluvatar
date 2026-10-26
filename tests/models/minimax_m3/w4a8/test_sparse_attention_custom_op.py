@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
+from conftest import requires_cuda
 
 from vllm_iluvatar.models.minimax_m3.w4a8 import attention as m3_attn
 from vllm_iluvatar.models.minimax_m3.w4a8 import (
@@ -153,3 +156,65 @@ def test_profile_attention_impl_allocates_row_temps_and_reserves_tcu(
 
     assert refs == [qkv]
     assert torch.count_nonzero(out) == 0
+
+
+@requires_cuda
+def test_prefill_adapters_match_causal_attention_on_device(monkeypatch):
+    """Exercise the actual positional arguments with distinct Q/KV head counts."""
+    from ixformer.inference.backend_registry import registry
+
+    from vllm_iluvatar.models.minimax_m3.mxfp8 import sparse_attention as mxfp8
+
+    assert (
+        registry.resolve("minimax_m3_sparse_attn", "ixformer_perf") == "ixformer_perf"
+    )
+    gen = torch.Generator(device="cuda").manual_seed(209)
+    q = torch.randn(2, 4, 128, device="cuda", dtype=torch.bfloat16, generator=gen)
+    kv = torch.randn(1, 2, 128, 256, device="cuda", dtype=torch.bfloat16, generator=gen)
+    topk = torch.zeros(2, 2, 1, device="cuda", dtype=torch.int32)
+    table = torch.zeros(1, 1, device="cuda", dtype=torch.int32)
+    cu = torch.tensor([0, 2], device="cuda", dtype=torch.int32)
+    seq = torch.tensor([5], device="cuda", dtype=torch.int32)
+    prefix = torch.tensor([3], device="cuda", dtype=torch.int32)
+    scale = 128**-0.5
+    k = kv[0, :, :5, :128].float().repeat_interleave(2, dim=0)
+    v = kv[0, :, :5, 128:].float().repeat_interleave(2, dim=0)
+    score = q.float().transpose(0, 1) @ k.transpose(1, 2) * scale
+    visible = (
+        torch.arange(5, device="cuda")[None, :]
+        <= torch.tensor([3, 4], device="cuda")[:, None]
+    )
+    expected = (score.masked_fill(~visible, -torch.inf).softmax(-1) @ v).transpose(0, 1)
+
+    out_mx = torch.empty_like(q)
+    mxfp8.minimax_m3_sparse_attn(
+        q, kv, topk, table, cu, seq, prefix, 2, 2, scale, out_mx
+    )
+    torch.testing.assert_close(out_mx.float(), expected, atol=2e-2, rtol=1e-2)
+
+    metadata = m3_sparse.IluMiniMaxM3SparseMetadata(
+        seq_lens=seq,
+        max_seq_len=5,
+        slot_mapping=torch.tensor([3, 4], device="cuda"),
+        num_actual_tokens=2,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_prefills=1,
+        num_prefill_tokens=2,
+        prefill=m3_sparse.IluMiniMaxM3SparsePrefillMetadata(
+            cu, seq, prefix, table, 2, 5
+        ),
+    )
+    monkeypatch.setattr(
+        m3_sparse,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"layer": metadata}),
+    )
+    layer = SimpleNamespace(
+        layer_name="layer", indexer=SimpleNamespace(topk_indices_buffer=topk)
+    )
+    impl = object.__new__(m3_sparse.IluMiniMaxM3SparseImpl)
+    impl.head_size, impl.num_heads, impl.num_kv_heads, impl.scale = 128, 4, 2, scale
+    out_w4 = torch.empty_like(q)
+    assert impl.forward(layer, q, kv, out_w4) is out_w4
+    torch.testing.assert_close(out_w4.float(), expected, atol=2e-2, rtol=1e-2)

@@ -172,6 +172,24 @@ IluQuantConfig.get_quant_method(layer, prefix)
 
 对于 AWQ、GPTQ 等非 Compressed-Tensors 量化类型，可以直接使用与开源实现相同的权重数据。模型创建完成后，再按需对权重执行自定义处理；其使用方式与官方实现一致。
 
+#### MXFP8 Linear + NVFP4 experts 混合 checkpoint
+
+`quant_method=mxfp8` 的 checkpoint 可通过 `moe_quant_algo=NVFP4` 声明专家格式，
+同时要求 `moe_quant_format=nvfp4-pack-quantized` 和 `group_size=16`。
+`IluMxFp8Config` 按格式选择通用 `IluModelOptNvFp4MoEMethod`，保持 Linear、
+KV cache 和 excluded layers 的父类分发。无该声明的 MXFP8 checkpoint 路径不变。
+
+NVFP4 method 复用 ModelOpt 参数布局，可启用 CPU 权重暂存和加载完整性检查；
+加载时按本地 expert 校验 w1/w2/w3 的 weight、block/global/input scales，
+分块生成 ixmm group-256 FP4 权重。CPU 暂存模式将派生权重发布为非持久 buffer，
+防止加载上下文退出时把它们恢复到 CPU。重复后处理不会再次量化。
+gate/up global scale 必须一致且 global scales 有限、为正；不满足时显式报错。
+
+执行按 layer activation 分发：`silu`、`swiglustep` 保持已有 Step 路径；
+`swigluoai_uninterleave` 要求显式 limit/alpha/beta。未知 activation 报错，
+不以模型名决定激活函数。源 checkpoint 特有的参数命名和 scale 倒数转换仍由
+模型 loader 负责，不能把这些约定隐藏在通用量化类中。
+
 ### 3.2 Compressed-Tensors 量化
 
 Iluvatar 支持多种 MoE 权重布局，需要通过离线量化生成与目标算子匹配的数据。当路由专家所在 config group 包含非空 `iluvatar` 时，使用 Iluvatar MoE 后端；否则回落到官方实现。

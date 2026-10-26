@@ -16,6 +16,63 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+
+def load_draft_model(self, target_model, target_attn_layer_names):
+    model = self._ilu_community_load_draft_model(target_model, target_attn_layer_names)
+    self._ilu_target_context_direct = False
+    parallel = self.vllm_config.parallel_config
+    # The runner owns scheduling/stream lifetime; models own their projection
+    # and auxiliary-state semantics. Unsupported models keep community behavior.
+    if (
+        parallel.pipeline_parallel_size != 1
+        or parallel.decode_context_parallel_size != 1
+        or parallel.prefill_context_parallel_size != 1
+        or parallel.use_ubatching
+        or self.vllm_config.lora_config is not None
+    ):
+        return model
+    bind = getattr(model, "try_bind_target_context", None)
+    if callable(bind):
+        self._ilu_target_context_direct = bind(target_model, self.hidden_states)
+    if self._ilu_target_context_direct:
+        logger.info(
+            "DSpark target writes projected auxiliary states into draft context"
+        )
+    return model
+
+
+def propose(
+    self,
+    input_batch,
+    attn_metadata,
+    slot_mappings,
+    last_hidden_states,
+    aux_hidden_states,
+    *args,
+    **kwargs,
+):
+    if getattr(self, "_ilu_target_context_direct", False):
+        if aux_hidden_states:
+            raise ValueError(
+                "DSpark direct context unexpectedly exported auxiliary states"
+            )
+        # Same storage and extent as the destination in community propose:
+        # Tensor.copy_ is a no-op; Graph capture keeps this address fixed.
+        last_hidden_states = self.hidden_states[: input_batch.num_tokens]
+        aux_hidden_states = None
+    return self._ilu_community_propose(
+        input_batch,
+        attn_metadata,
+        slot_mappings,
+        last_hidden_states,
+        aux_hidden_states,
+        *args,
+        **kwargs,
+    )
 
 
 def vocab_parallel_argmax(
@@ -130,6 +187,4 @@ def sample_sequential(self: Any, num_reqs: int, head_hidden: torch.Tensor) -> No
             sample_hidden,
             torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
         )
-        self.draft_token_confidence_probs[:num_reqs] = confidence.view(
-            num_reqs, n_spec
-        )
+        self.draft_token_confidence_probs[:num_reqs] = confidence.view(num_reqs, n_spec)

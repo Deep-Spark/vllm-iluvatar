@@ -6,7 +6,7 @@ Corresponds to: ``vllm/model_executor/layers/quantization/fp8.py::Fp8MoEMethod``
 
 Target   : ``additional_config.ilu_quant`` groups whose weights contract is
            ``fp8-block -> ix30-fp4`` @ ``transform`` + ``weight_load``.
-Baseline : v0.31.0 (db9527a468)
+Baseline : v0.31.0 (341bf7d4)
 Why      : ``IluFp8MoEMethod`` keeps the full FP8 routed-expert weights
            resident until ``process_weights_after_loading``, then converts
            them to ix30 FP4 in one pass. For GLM-5.2 that means every rank
@@ -50,7 +50,7 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.utils import set_weight_attrs
 
-from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8 import (
+from vllm_iluvatar.model_executor.layers.quantization.fp8 import (
     IluFp8MoEMethod,
     _ixmm_backend_available,
 )
@@ -693,6 +693,13 @@ class IluFp8ToFp4OnlineMoEMethod(IluFp8MoEMethod):
                 delattr(layer, name)
 
         layer._ilu_mxfp4_ixmm = True
+        resident_fp8 = [
+            name
+            for name, param in layer.named_parameters()
+            if param.dtype == torch.float8_e4m3fn
+        ]
+        if resident_fp8:
+            raise RuntimeError(f"Online FP4 retained FP8 parameters: {resident_fp8}")
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 

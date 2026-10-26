@@ -9,7 +9,7 @@ Baseline : v0.31.0 (db9527a468)
 Why      : none of the community MXFP4 MoE backends (TRTLLM / DeepGEMM / Marlin /
            FlashInfer / AITER) has an Iluvatar implementation, so the plugin owns
            the compute. Keeping it in a standalone function -- rather than inside
-           the quant method -- mirrors ``ilu_fused_moe.py::ilu_w16a16_fused_experts``
+           the quant method -- mirrors ``fused_moe.py::ilu_w16a16_fused_experts``
            and lets several MXFP4 methods share one implementation.
 How      : callers (currently ``IluMxfp4MoEMethod.apply``) call
            ``ilu_mxfp4_fused_experts`` with explicit tensors. The signature takes

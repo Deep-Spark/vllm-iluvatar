@@ -107,6 +107,7 @@ def check_fingerprint(
     baseline_src: str,
     *,
     resync_hint: str,
+    baseline_is_hash: bool = False,
 ) -> None:
     """Env-gated source drift guard for full-method copies (default ON).
 
@@ -120,7 +121,8 @@ def check_fingerprint(
             symbol,
         )
         return
-    if source_sha(current_src) != source_sha(baseline_src):
+    expected = baseline_src if baseline_is_hash else source_sha(baseline_src)
+    if source_sha(current_src) != expected:
         raise RuntimeError(
             f"ILU patch: community {symbol} source changed vs baseline. {resync_hint}"
         )

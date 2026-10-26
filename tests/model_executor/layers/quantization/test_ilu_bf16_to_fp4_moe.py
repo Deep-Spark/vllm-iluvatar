@@ -13,12 +13,12 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
 
+from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8_to_fp4 import (
+    Fp8SourceLayout,
+)
 from vllm_iluvatar.model_executor.layers.quantization.ilu_fp16_to_fp4_moe import (
     IluFp16ToFp4OnlineMoEMethod,
     convert_native_to_ix30_fp4,
-)
-from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8_to_fp4 import (
-    Fp8SourceLayout,
 )
 from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime_quant_base import (
     IluRuntimeQuantBaseConfig,
@@ -55,10 +55,16 @@ class _StubRoutedExperts(RoutedExperts):
         tp_rank: int,
         local_experts: dict[int, int],
         hidden: int = HIDDEN,
+        intermediate: int = INTERMEDIATE,
     ):
         torch.nn.Module.__init__(self)
         self.moe_config = SimpleNamespace(
             is_act_and_mul=True,
+            w13_num_shards=2,
+            tp_shard_with_padding=False,
+            intermediate_size=intermediate,
+            intermediate_size_per_partition=intermediate // tp_size,
+            moe_backend="auto",
             has_bias=False,
             hidden_dim=hidden,
             hidden_dim_unpadded=hidden,
@@ -101,7 +107,9 @@ def _moe_group(**overrides):
         model_type="minimax_m3_text",
         quant_method="ilu_runtime",
     )
-    return [g for g in config.config_groups if g.group_id.endswith("moe_to_ix30_fp4")][0]
+    return [g for g in config.config_groups if g.group_id.endswith("moe_to_ix30_fp4")][
+        0
+    ]
 
 
 def _context(group, layer):
@@ -163,7 +171,9 @@ def test_example_file_yaml_sha256_matches_the_shipped_json():
 
     payload = yaml.safe_load((EXAMPLE_DIR / "fp8-fp4-file.yaml").read_text())
     declared = payload["additional-config"]["ilu_quant"]["sha256"]
-    actual = hashlib.sha256((EXAMPLE_DIR / "fp8-fp4-runtime.json").read_bytes()).hexdigest()
+    actual = hashlib.sha256(
+        (EXAMPLE_DIR / "fp8-fp4-runtime.json").read_bytes()
+    ).hexdigest()
     assert declared == f"sha256:{actual}"
 
 
@@ -184,7 +194,7 @@ def _has_ixmm_ivcore30() -> bool:
         return False
     try:
         from vllm_iluvatar.ilu_util.arch import is_ivcore30
-        from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8 import (
+        from vllm_iluvatar.model_executor.layers.quantization.fp8 import (
             _ixmm_backend_available,
         )
 
@@ -201,7 +211,7 @@ def _has_ixmm_ivcore30() -> bool:
 def test_load_time_bf16_matches_explicit_native_to_fp4(backend, monkeypatch):
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
-    from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8 import (
+    from vllm_iluvatar.model_executor.layers.quantization.fp8 import (
         _ixmm_backend_available,
     )
 
@@ -358,7 +368,7 @@ def test_load_time_fp4_moe_matches_bf16_reference(hidden, inter, experts, monkey
     )
     torch.manual_seed(0)
     local = {e: e for e in range(experts)}
-    layer = _StubRoutedExperts(1, 0, local, hidden=hidden)
+    layer = _StubRoutedExperts(1, 0, local, hidden=hidden, intermediate=inter)
     quant_config = Fp8Config(
         is_checkpoint_fp8_serialized=True,
         activation_scheme="dynamic",
@@ -417,7 +427,11 @@ def test_load_time_fp4_moe_matches_bf16_reference(hidden, inter, experts, monkey
         num_tokens, hidden, generator=g, dtype=torch.bfloat16, device="cuda"
     )
     topk_ids = torch.randint(
-        0, experts, (num_tokens, top_k), generator=g, device="cuda",
+        0,
+        experts,
+        (num_tokens, top_k),
+        generator=g,
+        device="cuda",
         dtype=torch.int32,
     )
     topk_weights = torch.rand(
@@ -427,8 +441,13 @@ def test_load_time_fp4_moe_matches_bf16_reference(hidden, inter, experts, monkey
 
     got = method.apply(layer, x, topk_weights, topk_ids, None, None).float()
     ref = _bf16_moe_reference(
-        x, ckpt, topk_weights, topk_ids,
-        layer.swiglu_limit, layer.swiglu_alpha, layer.swiglu_beta,
+        x,
+        ckpt,
+        topk_weights,
+        topk_ids,
+        layer.swiglu_limit,
+        layer.swiglu_alpha,
+        layer.swiglu_beta,
     )
 
     assert torch.isfinite(got).all(), "FP4 MoE produced non-finite output"

@@ -15,9 +15,11 @@ from vllm.model_executor.parameter import ModelWeightParameter
 
 from vllm_iluvatar.model_executor.layers.quantization import (
     IluvatarQuantRegistry,
-    ilu_fp8,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8 import (
+from vllm_iluvatar.model_executor.layers.quantization import (
+    fp8 as ilu_fp8,
+)
+from vllm_iluvatar.model_executor.layers.quantization.fp8 import (
     IluFp8Config,
     IluFp8PerChannelOnlineLinearMethod,
 )

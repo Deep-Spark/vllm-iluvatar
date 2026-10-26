@@ -9,7 +9,7 @@ This module is the W4A8 token-major ``[Q,H,K]`` path.
 """
 
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import ixformer.inference.functions as ixfops
 import torch
@@ -34,6 +34,9 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     is_quantized_kv_cache,
 )
+
+if TYPE_CHECKING:
+    from vllm.v1.kv_cache_interface import KVCacheSpec
 
 # One sparse block == one KV page (matches ixformer / upstream MiniMax-M3).
 SPARSE_BLOCK_SIZE = 128

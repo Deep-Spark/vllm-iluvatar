@@ -6,8 +6,9 @@ Policy: this is an Iluvatar build, so its dependencies (the compiled
 dependency is an environment error, NOT a silent skip — tests import them
 directly so collection fails loudly when the build/env is broken.
 
-The only thing legitimately gated via skip is the physical CUDA device: a
-numerical/kernel test genuinely cannot run on a host with no Iluvatar GPU.
+Device tests may skip when there is no Iluvatar GPU or the architecture is
+unsupported. CoreX30-only kernels skip on CoreX11; shared CPU tests still run.
+Missing dependencies on a supported architecture remain environment errors.
 """
 
 from __future__ import annotations
@@ -56,12 +57,9 @@ requires_cuda = pytest.mark.skipif(
 def _compiled_cuda_arch() -> str | None:
     """The ivcore arch ``vllm_iluvatar._C`` was compiled for, e.g. "ivcore30".
 
-    Arch-gated kernels are selected at compile time, so the extension itself is
-    asked rather than the runtime device: that is exactly what decides whether
-    an op runs or raises. Tests gate on the returned value. None means there is
-    no device, in which case they are skipped by ``requires_cuda`` anyway; with
-    a device, a failing import/attribute lookup is an environment error and is
-    left to propagate per the policy above.
+    This identifies the installed artifact, not the device capability. Device
+    support and build mismatches are checked separately below. A missing native
+    dependency with a device is an environment error and propagates.
     """
     if not _cuda_available():
         return None
@@ -73,6 +71,32 @@ def _compiled_cuda_arch() -> str | None:
 
 
 COMPILED_CUDA_ARCH = _compiled_cuda_arch()
+
+
+def _corex30_available() -> bool:
+    if not _cuda_available():
+        return False
+    import torch
+    from ixformer.cuda import cuda_arch
+
+    name = torch.cuda.get_device_name()
+    device_arch = (
+        "ivcore30" if "V300" in name else "ivcore11" if "V150" in name else None
+    )
+    if device_arch is not None and (
+        device_arch != COMPILED_CUDA_ARCH or cuda_arch != device_arch
+    ):
+        raise RuntimeError(
+            f"{name} requires {device_arch}; plugin build={COMPILED_CUDA_ARCH}, "
+            f"ixformer build={cuda_arch}"
+        )
+    return device_arch == "ivcore30"
+
+
+requires_corex30 = pytest.mark.skipif(
+    not _corex30_available(),
+    reason="requires a CoreX30 device",
+)
 
 
 @pytest.fixture(autouse=True)

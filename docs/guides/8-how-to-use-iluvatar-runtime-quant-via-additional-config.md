@@ -762,7 +762,7 @@ FP8 分片；不支持 EPLB、预先切好 K 的 checkpoint 或源 hidden/interm
 | runtime 配置解析与分发 | [`ilu_runtime_quant_config.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime_quant_config.py) |
 | 未量化 checkpoint 的基础 config | [`ilu_runtime_quant_base.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime_quant_base.py) |
 | method 注册表 | [`ilu_quant_registry.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_quant_registry.py) |
-| FP8 基础 config 与 online Linear method | [`ilu_fp8.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_fp8.py) |
+| FP8 基础 config 与 online Linear method | [`fp8.py`](../../vllm_iluvatar/model_executor/layers/quantization/fp8.py) |
 | FP8 source layout 与 ix30 FP4 转换入口 | [`ilu_fp8_to_fp4.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_fp8_to_fp4.py) |
 | MoE 加载期 FP4 method | [`ilu_fp8_to_fp4_moe.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_fp8_to_fp4_moe.py) |
 | 转换算子（双 backend，在 ixformer） | `ixformer/inference/functions/fp4/gemm/fp8_block_preprocess.py` |

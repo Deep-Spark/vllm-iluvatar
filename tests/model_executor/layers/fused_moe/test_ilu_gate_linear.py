@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU-only tests for the Iluvatar GateLinear OOT replacement."""
+"""Iluvatar GateLinear registration, architecture dispatch and dtype contracts."""
 
 from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
 import torch
+from conftest import requires_cuda
 from vllm.model_executor.custom_op import op_registry_oot
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -143,3 +145,80 @@ def test_gate_linear_forward_casts_input_and_output_dtype_for_fallback():
 
     assert output_bias is None
     assert output.dtype == torch.bfloat16
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "m,arch,n,dtype,expected",
+    [
+        (1, "ivcore30", 128, torch.bfloat16, "native"),
+        (8, "ivcore30", 128, torch.bfloat16, "native"),
+        (32, "ivcore30", 128, torch.bfloat16, "native"),
+        (33, "ivcore30", 128, torch.bfloat16, "fallback"),
+        (96, "ivcore30", 128, torch.bfloat16, "fallback"),
+        (127, "ivcore30", 128, torch.bfloat16, "fallback"),
+        (128, "ivcore30", 128, torch.bfloat16, "mixed"),
+        (2048, "ivcore30", 128, torch.bfloat16, "mixed"),
+        (4096, "ivcore30", 128, torch.bfloat16, "mixed"),
+        (4097, "ivcore30", 128, torch.bfloat16, "fallback"),
+        (0, "ivcore11", 128, torch.bfloat16, "native"),
+        (1, "ivcore11", 128, torch.bfloat16, "native"),
+        (6, "ivcore11", 128, torch.bfloat16, "native"),
+        (7, "ivcore11", 128, torch.bfloat16, "torch"),
+        (8, "ivcore11", 128, torch.bfloat16, "torch"),
+        (32, "ivcore11", 128, torch.bfloat16, "torch"),
+        (33, "ivcore11", 128, torch.bfloat16, "fallback"),
+        (128, "ivcore11", 128, torch.bfloat16, "fallback"),
+        (2048, "ivcore11", 128, torch.bfloat16, "fallback"),
+        (4096, "ivcore11", 128, torch.bfloat16, "fallback"),
+        (8, "ivcore20", 128, torch.bfloat16, "fallback"),
+        (2048, "ivcore20", 128, torch.bfloat16, "fallback"),
+        (8, None, 128, torch.bfloat16, "fallback"),
+        (8, "ivcore30", 64, torch.bfloat16, "fallback"),
+        (8, "ivcore30", 128, torch.float32, "fallback"),
+        (6, "ivcore11", 64, torch.bfloat16, "fallback"),
+        (8, "ivcore11", 128, torch.float32, "fallback"),
+    ],
+)
+def test_fp32_router_dispatch_preserves_weight_and_arch_contract(
+    monkeypatch, m, arch, n, dtype, expected
+):
+    import ixformer.inference.functions as ops
+
+    import vllm_iluvatar.model_executor.layers.fused_moe.router.ilu_gate_linear as mod
+
+    gate = IluGateLinear.__new__(IluGateLinear)
+    torch.nn.Module.__init__(gate)
+    gate.weight = torch.nn.Parameter(
+        torch.ones(n, 6144, device="cuda", dtype=torch.float32)
+    )
+    gate.bias = None
+    gate.out_dtype = torch.float32
+    x = torch.zeros(m, 6144, device="cuda", dtype=dtype)
+    calls = []
+    monkeypatch.setattr(mod, "cuda_arch", lambda: arch)
+
+    def router(input, weight, *, backend):
+        assert input is x and weight is gate.weight
+        assert backend in ("ixformer_native", "torch")
+        calls.append("native" if backend == "ixformer_native" else "torch")
+        return torch.zeros(m, n, device="cuda", dtype=torch.float32)
+
+    def mixed(input, weight):
+        assert input is x and weight is gate.weight
+        calls.append("mixed")
+        return torch.zeros(m, n, device="cuda", dtype=torch.float32)
+
+    def fallback(self, input):
+        assert input.dtype == torch.float32
+        calls.append("fallback")
+        return torch.zeros(m, n, device="cuda", dtype=torch.float32), None
+
+    monkeypatch.setattr(ops, "router_gemm_bf16_fp32_fp32", router)
+    monkeypatch.setattr(ops, "mixed_type_linear", mixed)
+    monkeypatch.setattr(ReplicatedLinear, "forward", fallback)
+    ptr = gate.weight.data_ptr()
+    output, bias = gate.forward(x)
+    assert calls == [expected] and bias is None
+    assert output.shape == (m, n) and output.dtype == torch.float32
+    assert gate.weight.data_ptr() == ptr and gate.weight.dtype == torch.float32

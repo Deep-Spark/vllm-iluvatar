@@ -86,6 +86,29 @@ def _get(new: str, old: str, default: str) -> str:
     return os.environ.get(old, default)
 
 
+def _step5_bool(suffix: str, default: str) -> bool:
+    """Step5 switches accept exactly 0/1, including through legacy aliases."""
+    name = f"VLLM_ILU_STEP5_{suffix}"
+    old = f"VLLM_STEP5_{suffix}"
+    value = _get(name, old, default)
+    if value not in ("0", "1"):
+        raise ValueError(f"{name} (legacy {old}) must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
+def _step5_fp8_backend() -> str:
+    value = _get(
+        "VLLM_ILU_STEP5_FP8_ATTENTION_BACKEND",
+        "VLLM_STEP5_FP8_ATTENTION_BACKEND",
+        "ixformer_native",
+    )
+    if value not in ("ixformer_native", "ixattn"):
+        raise ValueError(
+            "VLLM_ILU_STEP5_FP8_ATTENTION_BACKEND must be ixformer_native or ixattn"
+        )
+    return value
+
+
 def _maybe_stripped(value: str) -> str | None:
     value = value.strip()
     return value or None
@@ -119,6 +142,12 @@ def _gdn_attn_backend_default() -> str:
 
 if TYPE_CHECKING:
     # Canonical names (new code should use these).
+    VLLM_ILU_STEP5_SPARSE_ATTENTION: bool = True
+    VLLM_ILU_STEP5_SPARSE_FP8: bool = False
+    VLLM_ILU_STEP5_FP32_TP: bool = False
+    VLLM_ILU_STEP5_FP32_EP: bool = False
+    VLLM_ILU_STEP5_FP8_KV_SCALE_PATH: str = ""
+    VLLM_ILU_STEP5_FP8_ATTENTION_BACKEND: str = "ixformer_native"
     VLLM_ILU_MLA_CUSTOMIZE: bool = True
     VLLM_ILU_MIX_QUANTIZATION_TYPE: str = ""
     VLLM_ILU_FLASH_ATTN_QUANT_TYPE: str = ""
@@ -185,6 +214,15 @@ if TYPE_CHECKING:
 # Canonical (VLLM_ILU_*) readers. Each lambda preserves the exact parsing the
 # fork used in vllm/envs.py, and reads VLLM_ILU_* first then the legacy VLLM_*.
 _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
+    # Step5 retains strict 0/1 parsing and canonical-first legacy compatibility.
+    "VLLM_ILU_STEP5_SPARSE_ATTENTION": lambda: _step5_bool("SPARSE_ATTENTION", "1"),
+    "VLLM_ILU_STEP5_SPARSE_FP8": lambda: _step5_bool("SPARSE_FP8", "0"),
+    "VLLM_ILU_STEP5_FP32_TP": lambda: _step5_bool("FP32_TP", "0"),
+    "VLLM_ILU_STEP5_FP32_EP": lambda: _step5_bool("FP32_EP", "0"),
+    "VLLM_ILU_STEP5_FP8_KV_SCALE_PATH": lambda: _get(
+        "VLLM_ILU_STEP5_FP8_KV_SCALE_PATH", "VLLM_STEP5_FP8_KV_SCALE_PATH", ""
+    ),
+    "VLLM_ILU_STEP5_FP8_ATTENTION_BACKEND": _step5_fp8_backend,
     "VLLM_ILU_MLA_CUSTOMIZE": lambda: (
         _get("VLLM_ILU_MLA_CUSTOMIZE", "VLLM_MLA_CUSTOMIZE", "1").lower()
         in ("1", "true", "yes")
@@ -221,9 +259,9 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
     ),
     # attn.wo_a grouped BMM backend: marlin | msd | w8a8. Read directly from
     # os.environ in models/deepseek_v4/attention.py (module-level constant).
-    "VLLM_ILU_WO_A_QUANT": lambda: os.environ.get("VLLM_ILU_WO_A_QUANT", "marlin")
-    .strip()
-    .lower(),
+    "VLLM_ILU_WO_A_QUANT": lambda: (
+        os.environ.get("VLLM_ILU_WO_A_QUANT", "marlin").strip().lower()
+    ),
     "VLLM_ILU_WO_A_MSD_MIN_TOKENS": _int_reader(
         "VLLM_ILU_WO_A_MSD_MIN_TOKENS", 256, minimum=0
     ),
@@ -346,11 +384,9 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Selects the ilu_mxfp4_fused_experts compute backend. Defaults to "ixmm";
     # "auto" -> ixmm when available else torch; "torch" forces the pure-torch
     # fallback; "ixformer_native" is the correctness-only native kernel.
-    "VLLM_ILU_MXFP4_MOE_BACKEND": lambda: os.environ.get(
-        "VLLM_ILU_MXFP4_MOE_BACKEND", "ixmm"
-    )
-    .strip()
-    .lower(),
+    "VLLM_ILU_MXFP4_MOE_BACKEND": lambda: (
+        os.environ.get("VLLM_ILU_MXFP4_MOE_BACKEND", "ixmm").strip().lower()
+    ),
     "VLLM_ILU_REJECTION_SAMPLER_MAX_CHUNK_BYTES": _int_reader(
         "VLLM_ILU_REJECTION_SAMPLER_MAX_CHUNK_BYTES",
         128 * 1024 * 1024,
@@ -476,6 +512,19 @@ _ILU_GUARD_ENV_VARS: dict[str, Callable[[], Any]] = {
         "VLLM_ILUVATAR_ENABLE_STARTUP_PATCH", "0"
     ),
 }
+
+
+def __getattr__(name: str) -> Any:
+    """Use the same readers without importing vLLM during host-only checks."""
+    for readers in (
+        _ILU_ENV_VARS,
+        _ILU_ENV_ALIASES,
+        _ILU_CANONICAL_ONLY_ENV_VARS,
+        _ILU_GUARD_ENV_VARS,
+    ):
+        if name in readers:
+            return readers[name]()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def apply() -> None:

@@ -6,7 +6,9 @@ from vllm.model_executor.models.interfaces import EagleModelMixin
 from vllm.sequence import IntermediateTensors
 
 from vllm_iluvatar.models.deepseek_v41.model import IluDeepseekV41Model
-from vllm_iluvatar.v1.worker.gpu.spec_decode.dspark import vocab_parallel_argmax
+from vllm_iluvatar.v1.worker.gpu.spec_decode.dspark.speculator import (
+    vocab_parallel_argmax,
+)
 
 
 class _PP:
@@ -61,7 +63,7 @@ def test_aux_slots_follow_idx_plus_one(monkeypatch):
 
 
 def test_vocab_parallel_argmax_tp1(monkeypatch):
-    import vllm_iluvatar.v1.worker.gpu.spec_decode.dspark as dspark_mod
+    import vllm_iluvatar.v1.worker.gpu.spec_decode.dspark.speculator as dspark_mod
 
     monkeypatch.setattr(dspark_mod, "get_tensor_model_parallel_world_size", lambda: 1)
     logits = torch.tensor([[1.0, 3.0, 2.0], [0.5, 0.1, 0.2]])

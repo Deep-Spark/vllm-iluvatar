@@ -8,12 +8,13 @@ looser would let a sharding or pairing bug hide behind FP4's coarse grid.
 """
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
-from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8 import (
+from vllm_iluvatar.model_executor.layers.quantization.fp8 import (
     IluFp8MoEMethod,
     _ixmm_backend_available,
     preprocess_fp8_block_weight_for_ixmm,
@@ -80,10 +81,15 @@ class _StubRoutedExperts(RoutedExperts):
         torch.nn.Module.__init__(self)
         self.moe_config = SimpleNamespace(
             is_act_and_mul=True,
+            w13_num_shards=2,
+            tp_shard_with_padding=False,
+            intermediate_size=INTERMEDIATE,
             has_bias=False,
             hidden_dim=HIDDEN,
             hidden_dim_unpadded=HIDDEN,
             intermediate_size_per_partition_unpadded=None,
+            intermediate_size_per_partition=INTERMEDIATE // tp_size,
+            moe_backend="auto",
             num_local_experts=len(local_experts),
             tp_rank=tp_rank,
             tp_size=tp_size,
@@ -112,7 +118,13 @@ def _make_layer(method_cls, tp_size, tp_rank, local_experts, **method_kwargs):
     layer.quant_method = method
     # Both create_weights implementations allocate with the ambient default
     # device, the way vLLM sets it up during engine init.
-    with torch.device("cuda"):
+    with (
+        torch.device("cuda"),
+        patch(
+            "vllm.distributed.get_tensor_model_parallel_world_size",
+            return_value=tp_size,
+        ),
+    ):
         method.create_weights(
             layer=layer,
             num_experts=len(local_experts),

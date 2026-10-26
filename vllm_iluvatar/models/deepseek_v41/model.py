@@ -81,7 +81,7 @@ logger.info(
 )
 
 
-def _v41_ll_shared_dispatch_overlap_enabled() -> bool:
+def _ll_shared_dispatch_overlap_enabled() -> bool:
     """Decode NVSM/LL: overlap shared MLP with IBGDA dispatch. Default on."""
     return bool(
         _ILU_CANONICAL_ONLY_ENV_VARS["VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP"]()
@@ -100,7 +100,7 @@ def _allreduce_mhc_post_supported(config, tp_size: int) -> bool:
 # Engram tables are loaded from mmap, not the vLLM weight iterator.
 _ENGRAM_SKIP = re.compile(r"(^|\.)engram\.")
 
-# ``kDeadId`` in the hash kernel (``dsv41_engram_hash_out`` pad argument),
+# ``kDeadId`` in the hash kernel (``engram_hash_out`` pad argument),
 # ``DEAD_ID`` in community ``deepseek_v41/common/engram.py``: the token-cache
 # value that stops an n-gram. Only reachable through ``token_map``.
 _ENGRAM_DEAD_ID = -1
@@ -129,7 +129,7 @@ def default_aux_hidden_state_layers(hf_config) -> tuple[int, ...]:
     return tuple(getattr(hf_config, "dspark_target_layer_ids", None) or ())
 
 
-def _make_v41_weights_mapper() -> WeightsMapper:
+def _make_weights_mapper() -> WeightsMapper:
     return _make_fp8_weights_mapper()
 
 
@@ -225,7 +225,7 @@ class IluDeepseekV41MoE(nn.Module, IluFusedMoEEP):
         # IBGDA dispatch. GLM already wires this; V4.1 previously left the
         # mixin default (False) and serialized shared compute behind dispatch.
         self._ll_shared_dispatch_overlap_enabled = (
-            _v41_ll_shared_dispatch_overlap_enabled()
+            _ll_shared_dispatch_overlap_enabled()
         )
 
     def forward(
@@ -1058,7 +1058,7 @@ class IluDeepseekV41ForCausalLM(IluDeepseekV4Fp8ForCausalLM, SupportsEagle3):
     is_attention_free = False
 
     model_cls = IluDeepseekV41Model
-    hf_to_vllm_mapper = _make_v41_weights_mapper()
+    hf_to_vllm_mapper = _make_weights_mapper()
 
     _LOAD_SKIP_SUBSTRS = ("mtp.",)
 

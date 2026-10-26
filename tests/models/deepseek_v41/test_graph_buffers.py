@@ -35,7 +35,7 @@ def test_dspark_context_insert_supports_plain_e4m3():
     ref_q = torch.zeros_like(attn._attn_out)
 
     _insert_context_kv(attn, kv, positions, slots)
-    formal_ops.dsv41_qkv_rope_fp8_pt_insert(
+    formal_ops.qkv_rope_fp8_pt_insert(
         ref_q,
         ref_cache,
         ref_kv,
@@ -115,7 +115,7 @@ def test_sparse_pt_plugin_dispatch_replays_dynamic_q_scale(heads):
     """The plugin combines two PT caches and recomputes device scale on replay."""
     from ixformer.inference.backend_registry import registry
 
-    for name in ("dsv41_quant_mla_q_fp8_pt", "dsv41_sparse_mla_fp8_pt"):
+    for name in ("quant_mla_q_fp8_pt", "sparse_mla_fp8_pt"):
         assert registry.resolve(name) == "ixformer_native", registry.describe(name)
     a = object.__new__(IluDeepseekV41Attention)
     torch.nn.Module.__init__(a)
@@ -378,7 +378,7 @@ def test_fp8_indexer_query_out_replays_current_positions_without_overwrite(n):
     qo, wo = q_storage[1:-1], w_storage[1:-1]
 
     def run():
-        formal_ops.v41_indexer_q_rope_fp8_out(
+        formal_ops.indexer_q_rope_fp8_out(
             q, positions, cs, weights, 0.015625, qo, wo
         )
 
@@ -388,7 +388,7 @@ def test_fp8_indexer_query_out_replays_current_positions_without_overwrite(n):
         run()
     positions.add_(1)
     graph.replay()
-    expected_q, expected_w = formal_ops.v41_indexer_q_rope_fp8(
+    expected_q, expected_w = formal_ops.indexer_q_rope_fp8(
         q, positions, cs, weights, 0.015625
     )
     assert torch.equal(qo.view(torch.uint8), expected_q.view(torch.uint8))
@@ -412,10 +412,10 @@ def test_fp8_indexer_key_store_matches_bf16_quantization_and_pp_mirror(ratio, bs
     bf16 = torch.zeros(pages, bs, 128, device="cuda", dtype=torch.bfloat16)
     fp8 = torch.zeros(pages, bs, 132, device="cuda", dtype=torch.uint8)
     mirror = torch.zeros(n, 132, device="cuda", dtype=torch.uint8)
-    formal_ops.v41_indexer_k_norm_rope_store(
+    formal_ops.indexer_k_norm_rope_store(
         k, pos, cs, weight, 1e-20, bf16, slots, ratio, "bf16", None
     )
-    formal_ops.v41_indexer_k_norm_rope_store(
+    formal_ops.indexer_k_norm_rope_store(
         k, pos, cs, weight, 1e-20, fp8, slots, ratio, "fp8", mirror
     )
     valid = (slots >= 0) & ((pos + 1) % ratio == 0)

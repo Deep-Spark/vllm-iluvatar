@@ -582,7 +582,7 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 dtype=torch.int32,
                 device=self.device,
             )
-        self.v41_req_id_per_token_buffer = torch.empty(
+        self.req_id_per_token_buffer = torch.empty(
             (scheduler_config.max_num_batched_tokens,),
             dtype=torch.int32,
             device=self.device,
@@ -1231,7 +1231,7 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             head_dim=128,
             block_table=common_attn_metadata.block_table_tensor,
             token_to_req_indices=common_attn_metadata.token_to_req_indices(
-                self.v41_req_id_per_token_buffer
+                self.req_id_per_token_buffer
             ),
             num_states=int(self.kv_cache_spec.num_states),
             num_decodes=num_decodes,
@@ -1422,7 +1422,7 @@ class IluDeepseekV41IndexerMetadataBuilder(IluDeepseekV32IndexerMetadataBuilder)
         # Initialize every capture-visible scratch buffer, including padded
         # request/token rows. This is V4.1-only; shared V4/GLM stay unchanged.
         for name in (
-            "v41_req_id_per_token_buffer",
+            "req_id_per_token_buffer",
             "cu_seqlens_q_buffer",
             "cu_seqlens_kv_buffer",
             "cu_seqlen_ks_buffer",

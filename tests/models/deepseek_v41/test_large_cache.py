@@ -27,20 +27,20 @@ def test_sparse_fp8_cache_past_4gib_matches_small_cache():
         shared_ops._pack_fp8_token_to_cache(
             cache, p, 0, 64, fp8, kv[448:].bfloat16(), scales
         )
-    q, qs = formal_ops.dsv41_quant_mla_q_packed_fp8(
+    q, qs = formal_ops.quant_mla_q_packed_fp8(
         torch.randn(1, 32, 512, device="cuda", dtype=torch.bfloat16)
     )
     idx = torch.full((1, 256), -1, device="cuda", dtype=torch.int32)
     lens = torch.ones(1, device="cuda", dtype=torch.int32)
     idx[0, 0] = 64
-    expected = formal_ops.dsv41_sparse_mla_packed_fp8(q, qs, small, idx, 0.04, lens)
+    expected = formal_ops.sparse_mla_packed_fp8(q, qs, small, idx, 0.04, lens)
     idx[0, 0] = page * 64
-    actual = formal_ops.dsv41_sparse_mla_packed_fp8(q, qs, big, idx, 0.04, lens)
+    actual = formal_ops.sparse_mla_packed_fp8(q, qs, big, idx, 0.04, lens)
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        replayed = formal_ops.dsv41_sparse_mla_packed_fp8(q, qs, big, idx, 0.04, lens)
+        replayed = formal_ops.sparse_mla_packed_fp8(q, qs, big, idx, 0.04, lens)
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(replayed, expected, rtol=0, atol=0)

@@ -67,7 +67,7 @@ _is_ivcore30_fn = is_ivcore30
 
 
 # One-forward pre-quantized activation handoff. The DeepSeek-V4.1 MHC pre-norm
-# kernel (``dsv41_mhc_pre_with_sqrsum_fp8``) can fold the per-token fp8 quant of
+# kernel (``mhc_pre_with_sqrsum_fp8``) can fold the per-token fp8 quant of
 # the normed hidden state it just wrote into its own epilogue, bit-identical to
 # ``fp8_per_token_dynamic_scaled`` run here. When the model registers that
 # ``(a_fp8, a_scale)`` pair for a hidden-state buffer, ``apply_block_scaled_mm``

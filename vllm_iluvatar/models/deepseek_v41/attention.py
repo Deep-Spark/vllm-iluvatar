@@ -105,10 +105,10 @@ _INDEX_TILE = 256
 _PACKED_MLA_HEADS = (1, 8, 16, 32, 64, 128)
 _PT_MLA_HEADS = (1, 4, 8, 16, 32, 64, 128)
 # Prefill per-tensor FP8 sparse MLA uses the ixmma FMHADSA kernel.
-# Decode stays on dsv41_sparse_mla_fp8_pt. IXFORMER_V41_FMHADSA=0 disables it.
+# Decode stays on sparse_mla_fp8_pt. IXFORMER_V41_FMHADSA=0 disables it.
 _V41_PREFILL_FMHADSA = os.environ.get("IXFORMER_V41_FMHADSA", "1") == "1"
 logger.info(
-    "V4.1 prefill FMHADSA=%s (decode stays on ixformer dsv41_sparse_mla_fp8_pt)",
+    "V4.1 prefill FMHADSA=%s (decode stays on ixformer sparse_mla_fp8_pt)",
     _V41_PREFILL_FMHADSA,
 )
 
@@ -196,7 +196,7 @@ def _resolve_dsv4_kv_cache_dtype(
     return kv_cache_dtype, torch.bfloat16
 
 
-def _resolve_dsv41_kv_cache_dtype(cache_config: CacheConfig) -> tuple[str, torch.dtype]:
+def _resolve_kv_cache_dtype(cache_config: CacheConfig) -> tuple[str, torch.dtype]:
     """Resolve V4.1 defaults while retaining all three formal KV layouts."""
     if cache_config.cache_dtype in ("auto", "fp8"):
         cache_config.cache_dtype = "fp8_e4m3"
@@ -621,7 +621,7 @@ class IluDeepseekV41Indexer(nn.Module):
                     + indexer_metadata.num_prefill_tokens
                 )
                 if num_tokens > 0:
-                    ixfops.dsv41_fill_short_context_topk(
+                    ixfops.fill_short_context_topk(
                         self.topk_indices_buffer[:num_tokens],
                         topk_lens[:num_tokens],
                         positions,
@@ -641,7 +641,7 @@ class IluDeepseekV41Indexer(nn.Module):
             # which the FP8 scoring kernel wants as fp32.
             q_fp8 = self.q_fp8_buffer[: q.shape[0]]
             folded_weights = self.weights_fp32_buffer[: q.shape[0]]
-            ixfops.v41_indexer_q_rope_fp8_out(
+            ixfops.indexer_q_rope_fp8_out(
                 q,
                 positions,
                 rotary_emb.cos_sin_cache,
@@ -669,7 +669,7 @@ class IluDeepseekV41Indexer(nn.Module):
             )
             return q_int8, None, folded_weights
         # In-place: q is rotated, weights are rescaled.
-        ixfops.v41_indexer_q_rope(
+        ixfops.indexer_q_rope(
             q,
             positions,
             rotary_emb.cos_sin_cache,
@@ -1020,7 +1020,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         )
         self.max_model_len = vllm_config.model_config.max_model_len
 
-        self.kv_cache_dtype, self.kv_cache_torch_dtype = _resolve_dsv41_kv_cache_dtype(
+        self.kv_cache_dtype, self.kv_cache_torch_dtype = _resolve_kv_cache_dtype(
             cache_config
         )
         # Width and dtype of one record on the wire, for the dense buffers the
@@ -1389,7 +1389,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         )
         assert swa_metadata is not None
         if self.kv_cache_dtype == "fp8_e4m3":
-            ixfops.dsv41_qkv_rope_fp8_pt_insert(
+            ixfops.qkv_rope_fp8_pt_insert(
                 q,
                 self.swa_cache_layer.kv_cache,
                 kv,
@@ -1401,9 +1401,9 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             )
             return q
         insert = (
-            ixfops.dsv41_qkv_rope_packed_fp8_insert
+            ixfops.qkv_rope_packed_fp8_insert
             if self.kv_cache_dtype == "fp8_ds_mla"
-            else ixfops.v41_qkv_rope_insert
+            else ixfops.qkv_rope_insert
         )
         insert(
             q,
@@ -1649,7 +1649,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         n = local.shape[0]
         indices = self._global_topk[:n]
         lens = self._global_topk_lens[:n]
-        ixfops.dsv41_compute_global_topk_indices_and_lens(
+        ixfops.compute_global_topk_indices_and_lens(
             local,
             req,
             table,
@@ -1706,7 +1706,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 use_fmhadsa=use_fmhadsa,
             )
             return
-        # ixformer 3817cf75: dsv41_mla_with_kvcache 与 ds4 的 decode 稀疏 MLA
+        # ixformer 3817cf75: mla_with_kvcache 与 ds4 的 decode 稀疏 MLA
         # 统一为 ops 层的 flash_mla_sparse_with_kvcache（签名逐参一致）。
         # 原 ixformer_native 后端已并入 ixformer_perf（同为手写 CUDA 路径）。
         flash_mla_sparse_with_kvcache(
@@ -1748,8 +1748,8 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             raise ValueError(
                 f"ds4_sparse_mla_fp8_decode needs h_q in {_PACKED_MLA_HEADS}, got {heads}"
             )
-        q_packed, q_scales = ixfops.dsv41_quant_mla_q_packed_fp8(q)
-        ixfops.dsv41_sparse_mla_packed_fp8(
+        q_packed, q_scales = ixfops.quant_mla_q_packed_fp8(q)
+        ixfops.sparse_mla_packed_fp8(
             q_packed,
             q_scales,
             self.swa_cache_layer.kv_cache,
@@ -1778,7 +1778,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             raise ValueError(f"Unsupported per-tensor FP8 MLA head count: {q.shape[1]}")
         q_fp8 = self._q_fp8_pt[: q.shape[0]]
         q_scale = self._q_scale_pt[: q.shape[0]]
-        ixfops.dsv41_quant_mla_q_fp8_pt(
+        ixfops.quant_mla_q_fp8_pt(
             q,
             q_fp8,
             q_scale,
@@ -1788,7 +1788,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         sparse_op = (
             ixfops.fmhadsa
             if use_fmhadsa
-            else ixfops.dsv41_sparse_mla_fp8_pt
+            else ixfops.sparse_mla_fp8_pt
         )
         sparse_op(
             q_fp8,
@@ -1876,7 +1876,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         shared-K reuse a real prefill kernel gets across a request's tokens.
 
         Causal windows come from ``prefill_swa_indices``, filled once per step
-        by ``dsv41_compute_swa_decode_indices_and_lens``. The non-causal draft
+        by ``compute_swa_decode_indices_and_lens``. The non-causal draft
         window still goes through :meth:`_window_indices` because that path
         also applies the replay lower bound.
         """
@@ -1894,7 +1894,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             if swa_indices is None or swa_lens is None:
                 raise RuntimeError(
                     "V4.1 causal prefill requires prefill_swa_indices from "
-                    "dsv41_compute_swa_decode_indices_and_lens."
+                    "compute_swa_decode_indices_and_lens."
                 )
         else:
             swa_indices, swa_lens = self._window_indices(
@@ -1945,7 +1945,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         plain bf16 row is copied as it is.
         """
         if self.kv_cache_dtype == "fp8_e4m3":
-            ixfops.dsv41_gather_fp8_pt_k_cache(
+            ixfops.gather_fp8_pt_k_cache(
                 out,
                 k_cache,
                 seq_lens,
@@ -1958,9 +1958,9 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             )
             return
         gather = (
-            ixfops.dsv41_gather_packed_fp8_k_cache
+            ixfops.gather_packed_fp8_k_cache
             if self.kv_cache_dtype == "fp8_ds_mla"
-            else ixfops.dsv41_gather_k_cache
+            else ixfops.gather_k_cache
         )
         gather(
             out=out,
@@ -2081,7 +2081,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
 
-            combined_indices, combined_lens = ixfops.dsv41_combine_topk_swa_indices(
+            combined_indices, combined_lens = ixfops.combine_topk_swa_indices(
                 topk_indices[query_start:query_end],
                 query_start_loc[
                     num_decodes + chunk_start : num_decodes + chunk_end + 1
@@ -2098,7 +2098,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 ],
             )
 
-            # ixformer 3817cf75: dsv41_sparse_mla_prefill → ops 层
+            # ixformer 3817cf75: sparse_mla_prefill → ops 层
             # flash_mla_sparse_fwd（kwargs 全兼容；return_lse 移为纯 kwarg，
             # 本处未用）。
             flash_mla_sparse_fwd(
@@ -2154,7 +2154,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         swa_metadata: DeepseekSparseSWAMetadata,
     ) -> None:
         """Sliding-window attention with the sink, written into ``output``."""
-        ixfops.dsv41_swa_attn(
+        ixfops.swa_attn(
             q=q,
             kv_cache=swa_k_cache,
             block_table=swa_metadata.prefill_swa_block_table,
@@ -2190,7 +2190,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
 
         # The sink belongs to the union, so it enters once, at the merge; this
         # half must not fold it into its own denominator.
-        o_swa, lse_swa = ixfops.dsv41_swa_attn(
+        o_swa, lse_swa = ixfops.swa_attn(
             q=q,
             kv_cache=swa_k_cache,
             block_table=swa_metadata.prefill_swa_block_table,
@@ -2212,7 +2212,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         # against the block table itself and derives each token's causal
         # top-k length from cu_seqlens_q / seq_lens / compress_ratio, so no
         # global-index pass is needed here.
-        o_cmp, lse_cmp = ixfops.dsv41_paged_sparse_attn(
+        o_cmp, lse_cmp = ixfops.paged_sparse_attn(
             q=q,
             kv_cache=compressed_k_cache,
             block_table=attn_metadata.block_table[num_decodes:],
@@ -2225,7 +2225,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             return_lse=True,
         )
 
-        ixfops.dsv41_merge_attn_outputs(
+        ixfops.merge_attn_outputs(
             output,
             o_cmp,
             lse_cmp,

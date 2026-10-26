@@ -473,7 +473,7 @@ def test_glm_ll_shared_dispatch_overlap_env(monkeypatch, value, expected):
 
 
 @pytest.mark.parametrize("value,expected", [(None, True), ("0", False), ("1", True)])
-def test_v41_ll_shared_dispatch_overlap_env(monkeypatch, value, expected):
+def test_ll_shared_dispatch_overlap_env(monkeypatch, value, expected):
     from vllm_iluvatar.envs import _ILU_CANONICAL_ONLY_ENV_VARS
 
     name = "VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP"
@@ -484,14 +484,14 @@ def test_v41_ll_shared_dispatch_overlap_env(monkeypatch, value, expected):
     assert _ILU_CANONICAL_ONLY_ENV_VARS[name]() is expected
 
 
-def test_v41_moe_enables_ll_shared_dispatch_overlap_by_default(monkeypatch):
+def test_moe_enables_ll_shared_dispatch_overlap_by_default(monkeypatch):
     from vllm_iluvatar.models.deepseek_v41.model import (
-        _v41_ll_shared_dispatch_overlap_enabled,
+        _ll_shared_dispatch_overlap_enabled,
     )
 
     monkeypatch.delenv("VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP", raising=False)
-    assert _v41_ll_shared_dispatch_overlap_enabled() is True
+    assert _ll_shared_dispatch_overlap_enabled() is True
     monkeypatch.setenv("VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP", "0")
-    assert _v41_ll_shared_dispatch_overlap_enabled() is False
+    assert _ll_shared_dispatch_overlap_enabled() is False
     monkeypatch.setenv("VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP", "1")
-    assert _v41_ll_shared_dispatch_overlap_enabled() is True
+    assert _ll_shared_dispatch_overlap_enabled() is True

@@ -7,12 +7,12 @@ does not run on this platform, so each body dispatches to the kernel covering
 the same work.
 
 The ratio-2 pooling is a plugin kernel rather than ixformer's
-``ds4_v41_compress_prepare_out``. That one gathers a group's rows from the state
+``ds4_compress_prepare_out``. That one gathers a group's rows from the state
 cache by absolute position, ``block_table[position / capacity]``, so it wants a
 state cache paged over the whole context -- which is what the 0.27.1
 ``IluCompressorStateSpec`` handed it. V4.1's ``CircularBufferSpec`` reserves one
 block per request instead, and every group past the first ``capacity`` positions
-then indexes off the end of the block-table row. ``v41_compress_pool_norm``
+then indexes off the end of the block-table row. ``compress_pool_norm``
 follows official's division of labour, where only a chunk's first token reads
 the ring and every other group is pooled from the batch, which is what makes one
 block per request enough.
@@ -82,7 +82,7 @@ def fused_save_compress_norm(
     if compress_ratio == 1:
         # Ratio 1 pools nothing and carries no state, so the latent is just the
         # normalized row.
-        ixfops.v41_compress_norm_cr1(
+        ixfops.compress_norm_cr1(
             kv_score,
             slot_mapping,
             rms_norm_weight,
@@ -93,7 +93,7 @@ def fused_save_compress_norm(
 
     assert state_cache is not None and token_to_req_indices is not None
     assert query_start_loc is not None
-    ixfops.v41_compress_pool_norm(
+    ixfops.compress_pool_norm(
         kv_score,
         positions,
         state_cache,
@@ -133,7 +133,7 @@ def rope_quant_insert(
     """
     if slot_mapping.numel() == 0:
         return
-    ixfops.v41_rope_insert(
+    ixfops.rope_insert(
         latent,
         positions,
         cos_sin_cache,
@@ -159,6 +159,6 @@ def move_rows_to_paged_cache(
     """
     if slot_mapping.numel() == 0:
         return
-    ixfops.v41_move_rows_to_paged_cache(
+    ixfops.move_rows_to_paged_cache(
         rows, kv_cache, slot_mapping, positions, compress_ratio
     )

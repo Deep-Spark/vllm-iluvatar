@@ -7,7 +7,7 @@ import torch
 from vllm.config import CacheConfig
 
 from vllm_iluvatar.models.deepseek_v41.attention import (
-    _resolve_dsv41_kv_cache_dtype,
+    _resolve_kv_cache_dtype,
     _resolve_swa_bounded_replay,
 )
 
@@ -24,9 +24,9 @@ from vllm_iluvatar.models.deepseek_v41.attention import (
 )
 def test_cache_choice(requested, expected, dtype):
     config = CacheConfig(cache_dtype=requested)
-    assert _resolve_dsv41_kv_cache_dtype(config) == (expected, dtype)
+    assert _resolve_kv_cache_dtype(config) == (expected, dtype)
     assert config.cache_dtype == expected
-    assert _resolve_dsv41_kv_cache_dtype(config) == (expected, dtype)
+    assert _resolve_kv_cache_dtype(config) == (expected, dtype)
 
 
 @pytest.mark.parametrize(
@@ -38,7 +38,7 @@ def test_cache_choice(requested, expected, dtype):
         (True, True, 2, False),
     ],
 )
-def test_v41_replay_matches_community_capability_constraints(
+def test_replay_matches_community_capability_constraints(
     enabled, v2, pcp, expected
 ):
     config = CacheConfig()
@@ -50,7 +50,7 @@ def test_v41_replay_matches_community_capability_constraints(
     assert _resolve_swa_bounded_replay(config, vllm_config) is expected
 
 
-def test_v41_retains_community_model_state_contract():
+def test_retains_community_model_state_contract():
     from vllm.models.deepseek_v41.nvidia.model_state import DeepseekV41ModelState
 
     from vllm_iluvatar.models.deepseek_v41.model import (
@@ -61,7 +61,7 @@ def test_v41_retains_community_model_state_contract():
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_v41_swa_spec_excludes_replayed_window_from_prefix_lookup(enabled):
+def test_swa_spec_excludes_replayed_window_from_prefix_lookup(enabled):
     from vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa import (
         IluDeepseekV4SWACache,
     )
@@ -79,7 +79,7 @@ def test_v41_swa_spec_excludes_replayed_window_from_prefix_lookup(enabled):
     assert spec.prefix_replay_tokens == (128 if enabled else 0)
 
 
-def test_v41_metadata_uses_formal_operators():
+def test_metadata_uses_formal_operators():
     from ixformer.inference.functions import deepseekv41 as ops
 
     from vllm_iluvatar.models.deepseek_v41.sparse_mla import (
@@ -88,11 +88,11 @@ def test_v41_metadata_uses_formal_operators():
 
     assert (
         IluDeepseekV41SparseSWAMetadataBuilder._compute_swa_decode_indices_and_lens
-        is ops.dsv41_compute_swa_decode_indices_and_lens
+        is ops.compute_swa_decode_indices_and_lens
     )
     assert (
         IluDeepseekV41SparseSWAMetadataBuilder._compute_swa_prefill_gather_lens
-        is ops.dsv41_compute_swa_prefill_gather_lens
+        is ops.compute_swa_prefill_gather_lens
     )
 
 

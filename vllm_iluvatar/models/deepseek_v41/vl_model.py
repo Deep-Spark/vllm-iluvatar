@@ -79,7 +79,7 @@ class DeepseekV4VLImagePixelInputs(TensorSchema):
     types: Annotated[torch.Tensor, TensorShape("ns", dynamic_dims={"ns"})]
 
 
-def _make_v41_vl_weights_mapper() -> WeightsMapper:
+def _make_vl_weights_mapper() -> WeightsMapper:
     """Text-checkpoint mapping rules re-rooted under ``language_model.``.
 
     Same construction as community
@@ -180,7 +180,7 @@ class IluDeepseekV41VLForCausalLM(
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.language_model.make_empty_intermediate_tensors
         )
-        self.hf_to_vllm_mapper = _make_v41_vl_weights_mapper()
+        self.hf_to_vllm_mapper = _make_vl_weights_mapper()
 
     @contextmanager
     def _tower_on_first_pp_stage_only(self, vllm_config: VllmConfig) -> Iterator[None]:

@@ -4,7 +4,7 @@ Mirrors ``vllm/models/deepseek_v41/common/ops/``: every function keeps the
 official name, argument order and contract, so the model code above this layer
 reads like the official one. Official implements these in Triton, which does not
 run on this platform, so each body dispatches to an ixformer kernel
-(``ixfops.dsv41_*``, from ixformer ``deepseekv41``). Any remaining divergence
+(``ixfops.*``, from ixformer ``deepseekv41``). Any remaining divergence
 from the official signature is confined to this layer and explained in the
 module that carries it.
 """

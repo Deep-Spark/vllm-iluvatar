@@ -273,7 +273,7 @@ def test_pcp_single_token_prefill_is_not_a_replicated_decode(monkeypatch):
     builder.device = torch.device("cpu")
     # build() feeds this buffer to CommonAttentionMetadata.token_to_req_indices
     # (allocated unconditionally in __init__ since the V4.1 landing).
-    builder.v41_req_id_per_token_buffer = torch.empty(16, dtype=torch.int32)
+    builder.req_id_per_token_buffer = torch.empty(16, dtype=torch.int32)
     builder.kv_cache_spec = SimpleNamespace(num_states=64)
     monkeypatch.setattr(mod.envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 1)
     cm = SimpleNamespace(

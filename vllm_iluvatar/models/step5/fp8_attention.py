@@ -1,4 +1,4 @@
-"""Step5 sparse FP8 cache metadata and frozen per-layer K/V scales."""
+"""Step5 sparse FP8 cache metadata and model-owned K/V scales."""
 
 import json
 import math
@@ -53,11 +53,16 @@ def sparse_fp8_cache_spec(attention, vllm_config):
 
 
 def load_scales(prefix):
+    """Resolve fixed K/V scales once when constructing a sparse attention layer.
+
+    Without a scale file, use unit scales for both cache writes and attention
+    reads. An explicit file overrides that default and must contain valid,
+    independent K/V scales for every requested layer (including MTP layers).
+    This does not change the attention softmax scale or checkpoint weights.
+    """
     path = envs.VLLM_ILU_STEP5_FP8_KV_SCALE_PATH
     if not path:
-        raise ValueError(
-            "Step5 sparse FP8 requires VLLM_ILU_STEP5_FP8_KV_SCALE_PATH (legacy VLLM_STEP5_FP8_KV_SCALE_PATH)"
-        )
+        return 1.0, 1.0
     with open(path, encoding="utf-8") as stream:
         table = json.load(stream)
     if not isinstance(table, dict):

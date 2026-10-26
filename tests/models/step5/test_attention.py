@@ -103,6 +103,7 @@ def test_invalid_frozen_scales(entry, tmp_path, monkeypatch):
 
 
 def test_missing_scale_layer(tmp_path, monkeypatch):
+    monkeypatch.delenv("VLLM_ILU_STEP5_FP8_KV_SCALE_PATH", raising=False)
     path = tmp_path / "scales.json"
     path.write_text(json.dumps({"layer.attn": {"k": 0.01, "v": 0.03}}))
     monkeypatch.setenv("VLLM_STEP5_FP8_KV_SCALE_PATH", str(path))
@@ -110,7 +111,14 @@ def test_missing_scale_layer(tmp_path, monkeypatch):
     with pytest.raises(ValueError):
         load_scales("other.attn")
     monkeypatch.delenv("VLLM_STEP5_FP8_KV_SCALE_PATH")
-    with pytest.raises(ValueError):
+    assert load_scales("layer.attn") == (1.0, 1.0)
+
+
+def test_explicit_missing_scale_file_does_not_fall_back(tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "VLLM_ILU_STEP5_FP8_KV_SCALE_PATH", str(tmp_path / "missing.json")
+    )
+    with pytest.raises(FileNotFoundError):
         load_scales("layer.attn")
 
 
@@ -311,7 +319,8 @@ def test_ixattn_runtime_requires_registered_backend(monkeypatch, available, sele
 
     monkeypatch.setenv("VLLM_STEP5_SPARSE_FP8", "1")
     monkeypatch.setenv("VLLM_STEP5_FP8_ATTENTION_BACKEND", "ixattn")
-    monkeypatch.setenv("VLLM_STEP5_FP8_KV_SCALE_PATH", "frozen-scales.json")
+    monkeypatch.delenv("VLLM_STEP5_FP8_KV_SCALE_PATH", raising=False)
+    monkeypatch.delenv("VLLM_ILU_STEP5_FP8_KV_SCALE_PATH", raising=False)
     monkeypatch.delenv("VLLM_STEP5_FP8_CALIBRATION_DIR", raising=False)
     monkeypatch.setattr(contract, "_is_cuda", lambda c: True)
     monkeypatch.setattr(contract, "_cuda_arch", lambda: "ivcore30")
@@ -373,8 +382,12 @@ def test_sparse_opaque_op_routes_to_context_layer(monkeypatch):
     assert all(actual is expected for actual, expected in zip(calls[0], tensors))
 
 
-def test_sparse_context_key_preserves_frozen_scale_key(monkeypatch):
-    from vllm_iluvatar.models.step5 import fp8_attention, sparse_attention
+@pytest.mark.parametrize(
+    "prefix", ["model.layers.0.self_attn", "model.layers.60.self_attn"]
+)
+@pytest.mark.parametrize("scales", [None, (0.01, 0.02)])
+def test_sparse_context_key_and_scale_buffers(monkeypatch, tmp_path, prefix, scales):
+    from vllm_iluvatar.models.step5 import sparse_attention
 
     monkeypatch.setenv("VLLM_STEP5_FP8_ATTENTION_BACKEND", "ixformer_native")
     monkeypatch.setattr(
@@ -383,13 +396,12 @@ def test_sparse_context_key_preserves_frozen_scale_key(monkeypatch):
         lambda **kwargs: SimpleNamespace(cos_sin_cache=torch.empty(1, 32)),
     )
     monkeypatch.setattr(sparse_attention, "Step5CSA", lambda *args: torch.nn.Module())
-    scale_keys = []
-
-    def load_scales(prefix):
-        scale_keys.append(prefix)
-        return 0.01, 0.02
-
-    monkeypatch.setattr(fp8_attention, "load_scales", load_scales)
+    monkeypatch.delenv("VLLM_ILU_STEP5_FP8_KV_SCALE_PATH", raising=False)
+    monkeypatch.delenv("VLLM_STEP5_FP8_KV_SCALE_PATH", raising=False)
+    if scales is not None:
+        path = tmp_path / "scales.json"
+        path.write_text(json.dumps({f"{prefix}.attn": dict(zip(("k", "v"), scales))}))
+        monkeypatch.setenv("VLLM_ILU_STEP5_FP8_KV_SCALE_PATH", str(path))
     context = {}
     config = SimpleNamespace(
         sparse_config={}, rms_norm_eps=1e-5, max_position_embeddings=16
@@ -398,7 +410,12 @@ def test_sparse_context_key_preserves_frozen_scale_key(monkeypatch):
         model_config=SimpleNamespace(max_model_len=16),
         compilation_config=SimpleNamespace(static_forward_context=context),
     )
-    layer = sparse_attention.Step5SparseAttention(vllm_config, config, "layer", {})
-    assert scale_keys == ["layer.attn"]
-    assert layer.attention_layer_name == "layer.attn"
-    assert context["layer.sparse_attention"] is layer
+    layer = sparse_attention.Step5SparseAttention(vllm_config, config, prefix, {})
+    assert layer.attention_layer_name == f"{prefix}.attn"
+    assert context[f"{prefix}.sparse_attention"] is layer
+    expected = scales if scales is not None else (1.0, 1.0)
+    for name, value in zip(("fp8_k_scale", "fp8_v_scale"), expected):
+        buffer = dict(layer.named_buffers())[name]
+        assert buffer.dtype == torch.float32 and buffer.ndim == 0
+        torch.testing.assert_close(buffer, torch.tensor(value, dtype=torch.float32))
+        assert name not in layer.state_dict()

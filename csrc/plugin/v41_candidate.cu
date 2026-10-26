@@ -30,6 +30,8 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <limits>
+#include <algorithm>
 
 #include "ops.h"
 #include "utils.cuh"
@@ -145,6 +147,58 @@ __global__ void v41_candidate_block_scores_kernel(
     acc = INFINITY;
   }
   scores[row * static_cast<int64_t>(nblocks) + block] = from_float<scalar_t>(acc);
+}
+
+// A bounded-grid alternative for readers that explicitly honor row bounds.
+// No score outside [0, bounds[1, row]) is written or initialized.
+template <typename scalar_t>
+__global__ void v41_candidate_block_scores_bounded_kernel(
+    const scalar_t* logits, int64_t stride_row, int64_t stride_col,
+    const int32_t* starts, int64_t start_stride, const int32_t* ends,
+    int64_t end_stride, scalar_t* scores, int64_t score_stride,
+    int32_t* bounds, int rows, int width, int block_size, int row_repeat) {
+  const int row = blockIdx.x;
+  const int start = starts == nullptr ? 0 :
+      max(0, min(width, load_bound(starts, start_stride, row, row_repeat)));
+  const int end = load_bound(ends, end_stride, row, row_repeat);
+  const int length = max(0, min(width, end) - start);
+  const int valid_blocks = static_cast<int>(
+      (static_cast<int64_t>(length) + block_size - 1) / block_size);
+  if (blockIdx.y == 0 && threadIdx.x == 0) {
+    bounds[row] = 0;
+    bounds[rows + row] = valid_blocks;
+  }
+  for (int64_t block = blockIdx.y * blockDim.x + threadIdx.x;
+       block < valid_blocks; block += gridDim.y * blockDim.x) {
+    float acc = -INFINITY;
+    const int64_t base = start + block * block_size;
+    for (int j = 0; j < block_size && base + j < min(width, end); ++j) {
+      acc = nan_max(acc, to_float(logits[row * stride_row +
+                                       (base + j) * stride_col]));
+    }
+    if (end > start && block == (static_cast<int64_t>(end) - start - 1) / block_size) {
+      acc = INFINITY;
+    }
+    scores[row * score_stride + block] = from_float<scalar_t>(acc);
+  }
+}
+
+template <typename scalar_t>
+__global__ void v41_finalize_bounded_candidates_kernel(
+    const scalar_t* scores, int64_t score_stride, const int32_t* bounds,
+    int32_t* out, int64_t out_stride, int rows, int out_width, int score_width) {
+  const int row = blockIdx.x;
+  const int limit = max(0, min(score_width, bounds[rows + row]));
+  for (int col = blockIdx.y * blockDim.x + threadIdx.x; col < out_width;
+       col += gridDim.y * blockDim.x) {
+    int32_t index = out[row * out_stride + col];
+    if (index < 0 || index >= limit) {
+      index = -1;
+    } else if (to_float(scores[row * score_stride + index]) == -INFINITY) {
+      index = -1;
+    }
+    out[row * out_stride + col] = index;
+  }
 }
 
 // One block per row. Zeroes the row's flags, then marks the shortlisted
@@ -349,6 +403,83 @@ torch::Tensor v41_candidate_block_scores(
           static_cast<int>(width), static_cast<int>(nblocks),
           static_cast<int>(block_size), static_cast<int>(row_repeat)));
   return scores;
+}
+
+void v41_candidate_block_scores_bounded(
+    torch::Tensor& logits, const std::optional<torch::Tensor>& row_ks,
+    torch::Tensor& row_ke, int64_t block_size, int64_t row_repeat,
+    torch::Tensor& scores, torch::Tensor& bounds) {
+  check_logits(logits);
+  check_bound(row_ke, "row_ke");
+  const int64_t rows = logits.size(0), width = logits.size(1);
+  TORCH_CHECK(block_size > 0 && block_size <= std::numeric_limits<int>::max(),
+              "block_size must be a positive int32");
+  TORCH_CHECK(row_repeat <= std::numeric_limits<int>::max(),
+              "row_repeat exceeds int32");
+  TORCH_CHECK(rows <= std::numeric_limits<int>::max() &&
+                  width <= std::numeric_limits<int>::max(), "row/width exceeds int32");
+  check_row_groups(rows, row_ke.numel(), row_repeat, "row_ke");
+  const int64_t nblocks = cdiv_i64(width, block_size);
+  TORCH_CHECK(row_ke.device() == logits.device(), "bounds device mismatch");
+  TORCH_CHECK(scores.device() == logits.device() && scores.dim() == 2 &&
+                  scores.scalar_type() == logits.scalar_type() &&
+                  scores.size(0) == rows && scores.size(1) == nblocks &&
+                  scores.stride(1) == 1 && scores.stride(0) >= nblocks,
+              "scores must be same-device/dtype [rows, ceil(width/block_size)] with disjoint rows");
+  TORCH_CHECK(bounds.device() == logits.device() && bounds.scalar_type() == at::kInt &&
+                  bounds.is_contiguous() && bounds.dim() == 2 &&
+                  bounds.size(0) == 2 && bounds.size(1) == rows,
+              "bounds must be same-device contiguous int32 [2, rows]");
+  const int32_t* starts = nullptr;
+  int64_t start_stride = 0;
+  if (row_ks.has_value()) {
+    check_bound(*row_ks, "row_ks");
+    check_row_groups(rows, row_ks->numel(), row_repeat, "row_ks");
+    TORCH_CHECK(row_ks->device() == logits.device(), "starts device mismatch");
+    starts = row_ks->data_ptr<int32_t>();
+    start_stride = row_ks->stride(0);
+  }
+  if (rows == 0) return;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(logits));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const dim3 grid(static_cast<unsigned>(rows),
+                  static_cast<unsigned>(std::max<int64_t>(1, std::min<int64_t>(32, cdiv_i64(nblocks, kThreads)))));
+  VLLM_ILU_DISPATCH_LOGITS(logits.scalar_type(),
+      v41_candidate_block_scores_bounded_kernel<scalar_t><<<grid, kThreads, 0, stream>>>(
+          reinterpret_cast<const scalar_t*>(logits.data_ptr()), logits.stride(0), logits.stride(1),
+          starts, start_stride, row_ke.data_ptr<int32_t>(), row_ke.stride(0),
+          reinterpret_cast<scalar_t*>(scores.data_ptr()), scores.stride(0),
+          bounds.data_ptr<int32_t>(), static_cast<int>(rows), static_cast<int>(width),
+          static_cast<int>(block_size), static_cast<int>(row_repeat)));
+}
+
+void v41_finalize_bounded_candidates(torch::Tensor& scores,
+                                     torch::Tensor& bounds,
+                                     torch::Tensor& out) {
+  check_logits(scores);
+  const int64_t rows = scores.size(0);
+  TORCH_CHECK(rows <= std::numeric_limits<int>::max() &&
+                  scores.size(1) <= std::numeric_limits<int>::max(),
+              "scores dimensions exceed int32");
+  TORCH_CHECK(out.device() == scores.device() && out.scalar_type() == at::kInt &&
+                  out.dim() == 2 && out.size(0) == rows && out.stride(1) == 1 &&
+                  out.stride(0) >= out.size(1), "out must have same-device disjoint int32 rows");
+  TORCH_CHECK(bounds.device() == scores.device() && bounds.scalar_type() == at::kInt &&
+                  bounds.is_contiguous() && bounds.dim() == 2 &&
+                  bounds.size(0) == 2 && bounds.size(1) == rows,
+              "bounds must be same-device contiguous int32 [2, rows]");
+  TORCH_CHECK(out.size(1) <= std::numeric_limits<int>::max(),
+              "candidate count exceeds int32");
+  TORCH_CHECK(scores.stride(1) == 1, "scores last dimension must be contiguous");
+  if (rows == 0 || out.size(1) == 0) return;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(scores));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const dim3 grid(static_cast<unsigned>(rows), static_cast<unsigned>(cdiv_i64(out.size(1), kThreads)));
+  VLLM_ILU_DISPATCH_LOGITS(scores.scalar_type(),
+      v41_finalize_bounded_candidates_kernel<scalar_t><<<grid, kThreads, 0, stream>>>(
+          reinterpret_cast<const scalar_t*>(scores.data_ptr()), scores.stride(0),
+          bounds.data_ptr<int32_t>(), out.data_ptr<int32_t>(), out.stride(0),
+          static_cast<int>(rows), static_cast<int>(out.size(1)), static_cast<int>(scores.size(1))));
 }
 
 void v41_write_candidate_topk(torch::Tensor& out, torch::Tensor& values,

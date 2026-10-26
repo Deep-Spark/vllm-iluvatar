@@ -117,6 +117,12 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
       "v41_write_candidate_topk("
       "Tensor! out, Tensor values, Tensor indices, int k) -> ()");
   ops.def(
+      "v41_candidate_block_scores_bounded("
+      "Tensor logits, Tensor? row_ks, Tensor row_ke, int block_size, "
+      "int row_repeat, Tensor! scores, Tensor! bounds) -> ()");
+  ops.def(
+      "v41_finalize_bounded_candidates(Tensor scores, Tensor bounds, Tensor! out) -> ()");
+  ops.def(
       "v41_apply_candidate_mask("
       "Tensor! logits, Tensor? row_ks, Tensor row_ke, "
       "Tensor candidate_blocks, int block_size, int row_repeat) -> ()");
@@ -360,6 +366,10 @@ TORCH_LIBRARY_IMPL_EXPAND(_C, CUDA, ops) {
            &vllm_iluvatar::v41_move_rows_to_paged_cache);
   ops.impl("v41_candidate_block_scores",
            &vllm_iluvatar::v41_candidate_block_scores);
+  ops.impl("v41_candidate_block_scores_bounded",
+           &vllm_iluvatar::v41_candidate_block_scores_bounded);
+  ops.impl("v41_finalize_bounded_candidates",
+           &vllm_iluvatar::v41_finalize_bounded_candidates);
   ops.impl("v41_write_candidate_topk",
            &vllm_iluvatar::v41_write_candidate_topk);
   ops.impl("v41_apply_candidate_mask",

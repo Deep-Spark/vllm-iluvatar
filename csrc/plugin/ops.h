@@ -438,6 +438,20 @@ torch::Tensor v41_candidate_block_scores(
     torch::Tensor& logits, const std::optional<torch::Tensor>& row_ks,
     torch::Tensor& row_ke, int64_t block_size, int64_t row_repeat);
 
+// Inputs and caller-owned outputs must not alias. Scores have a valid prefix
+// only. bounds[0] is zero and
+// bounds[1] is the number of initialized blocks per row; all readers must
+// honor those bounds. Storage addresses stay fixed during graph replay.
+void v41_candidate_block_scores_bounded(
+    torch::Tensor& logits, const std::optional<torch::Tensor>& row_ks,
+    torch::Tensor& row_ke, int64_t block_size, int64_t row_repeat,
+    torch::Tensor& scores, torch::Tensor& bounds);
+
+// Preserve -1 padding without reading scores for a negative/out-of-span id.
+void v41_finalize_bounded_candidates(torch::Tensor& scores,
+                                     torch::Tensor& bounds,
+                                     torch::Tensor& out);
+
 // Fold ``torch.topk``'s (values, indices) into the shortlist ``out`` row: the
 // first ``k`` columns take an index (``-1`` where the slot scored ``-inf``),
 // the tail is ``-1``. Replaces the select / cast / copy / tail-fill the caller

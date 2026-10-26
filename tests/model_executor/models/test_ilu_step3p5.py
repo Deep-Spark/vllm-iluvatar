@@ -137,3 +137,30 @@ def test_moe_forward_keeps_w8a8_tuple_on_runner_path():
         router_logits=hidden_states,
     )
     torch.testing.assert_close(output, origin)
+
+def test_mtp_load_weights_skips_unowned_quant_metadata():
+    source = inspect.getsource(ilu_step3p5_mtp.IluStep3p5MTP.load_weights)
+    assert "_drop_unowned_quant_metadata" in source
+    assert any(
+        s.endswith("weight_scale") for s in ilu_step3p5_mtp._UNOWNED_QUANT_SUFFIXES
+    )
+    source = inspect.getsource(
+        ilu_step3p5_mtp.IluStep3p5AMultiTokenPredictorLayer.forward
+    )
+    assert "residual + hidden_states" in source
+
+
+def test_mtp_fused_quant_scales_are_owned_by_graph():
+    params = {
+        "model.layers.45.mtp_block.mlp.gate_up_proj.weight_scale": None,
+        "model.layers.45.mtp_block.self_attn.qkv_proj.weight_scale": None,
+    }
+    assert ilu_step3p5_mtp._checkpoint_name_owned_by_graph(
+        "model.layers.45.mtp_block.mlp.gate_proj.weight_scale", params
+    )
+    assert ilu_step3p5_mtp._checkpoint_name_owned_by_graph(
+        "model.layers.45.mtp_block.self_attn.q_proj.weight_scale", params
+    )
+    assert not ilu_step3p5_mtp._checkpoint_name_owned_by_graph(
+        "model.layers.45.mtp_block.mlp.missing.weight_scale", params
+    )

@@ -89,7 +89,6 @@
     "re:.*e_score_correction_bias$",
     "re:.*\\.(enorm|hnorm|eh_proj)$",
     "re:.*\\.shared_head\\..*",
-    "re:.*\\.mtp_block\\..*",
     "re:.*\\.vision_model\\..*",
     "re:.*\\.vit_large_projector\\..*"
   ]

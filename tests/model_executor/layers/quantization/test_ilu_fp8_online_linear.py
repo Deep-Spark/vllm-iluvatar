@@ -251,3 +251,38 @@ def test_config_dispatches_online_and_preserves_ignored_layers(monkeypatch):
         config.get_quant_method(layer, "model.layers.0.keep"),
         UnquantizedLinearMethod,
     )
+
+
+def test_is_layer_skipped_matches_vl_remapped_ignore_prefix():
+    """Step-3.7 VL remaps ignore paths; MTP drafts still use model.*."""
+    config = ilu_fp8.IluFp8Config(
+        is_checkpoint_fp8_serialized=True,
+        activation_scheme="dynamic",
+        ignored_layers=[
+            "language_model.model.layers.45.mtp_block.self_attn.g_proj",
+        ],
+        weight_block_size=[128, 128],
+        none_moe_use_weight_block_size=True,
+        none_moe_is_checkpoint_fp8_serialized=True,
+    )
+    layer = object.__new__(LinearBase)
+    method = config.get_quant_method(
+        layer, "model.layers.45.mtp_block.self_attn.g_proj"
+    )
+    assert isinstance(method, UnquantizedLinearMethod)
+
+
+def test_is_layer_skipped_matches_draft_style_ignore_for_vl_prefix():
+    config = ilu_fp8.IluFp8Config(
+        is_checkpoint_fp8_serialized=True,
+        activation_scheme="dynamic",
+        ignored_layers=["model.layers.45.mtp_block.self_attn.g_proj"],
+        weight_block_size=[128, 128],
+        none_moe_use_weight_block_size=True,
+        none_moe_is_checkpoint_fp8_serialized=True,
+    )
+    layer = object.__new__(LinearBase)
+    method = config.get_quant_method(
+        layer, "language_model.model.layers.45.mtp_block.self_attn.g_proj"
+    )
+    assert isinstance(method, UnquantizedLinearMethod)

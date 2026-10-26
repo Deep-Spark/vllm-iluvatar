@@ -7,14 +7,20 @@ Baseline : v0.31.0 (341bf7d4d1) residual / W4A8 load semantics
 Why      : Iluvatar Step3.5 decoder layers retain a separate residual stream
            and return ``(hidden_states, residual)``. W4A8 Step-3.7 checkpoints
            pack MTP attn/MLP as int8. ``eh_proj``, enorm, hnorm, and
-           ``shared_head`` stay BF16 via their own ignore entries.
+           ``shared_head`` stay BF16 via their own ignore entries. V2 eagle
+           load reuses the target ``quant_config`` whose ignore list was
+           remapped to ``language_model.model.*`` for Step-3.7 VL; MTP draft
+           layers still use ``model.*`` prefixes, so BF16 ``g_proj`` would
+           otherwise be treated as block-FP8 and fail shape checks.
 How      : Promote the MTP decoder block, add residual back into the hidden
-           state, and skip missing optional attention quant params. MTP
-           attn/MLP follow ``quantization_config``; the W4A8 recipe does not
-           ignore ``mtp_block``.
+           state, skip missing optional attention quant params, and rebuild
+           the draft ``quant_config`` from the draft model config so ignore
+           paths stay ``model.*``. MTP attn/MLP follow ``quantization_config``;
+           the W4A8 recipe does not ignore ``mtp_block``.
 Scope    : Step-3.5 / Step-3.7 speculative decoding on Iluvatar.
-Remove   : when upstream exposes the residual-stream decoder contract and
-           loads W4A8 MTP attention metadata.
+Remove   : when upstream exposes the residual-stream decoder contract,
+           loads W4A8 MTP attention metadata, and gives eagle drafts an
+           unmapped quant config.
 """
 
 from __future__ import annotations
@@ -41,6 +47,7 @@ from vllm.model_executor.models.step3p5_mtp import (
 )
 from vllm.model_executor.models.step3p5_mtp import Step3p5MTP as _Step3p5MTP
 from vllm.model_executor.models.utils import (
+    get_draft_quant_config,
     get_spec_layer_idx_from_weight_name,
     maybe_prefix,
 )
@@ -208,6 +215,9 @@ class IluStep3p5MTP(_Step3p5MTP):
         # V2 constructs the draft with the target VllmConfig. Step-3.7 keeps
         # vocab and MTP fields on text_config; the speculative draft config
         # already promotes that text config to step3p5_mtp. Draft PP stays 1.
+        # Target VL loading remaps ignored_layers onto language_model.model.*;
+        # rebuild a draft quant_config so MTP prefixes (model.*) still match
+        # modules_to_not_convert / ignored_layers.
         cfg = vllm_config
         spec = vllm_config.speculative_config
         draft_model_config = (
@@ -216,6 +226,10 @@ class IluStep3p5MTP(_Step3p5MTP):
         updates: dict[str, object] = {}
         if draft_model_config is not None:
             updates["model_config"] = draft_model_config
+        if spec is not None:
+            draft_quant_config = get_draft_quant_config(vllm_config)
+            if draft_quant_config is not None:
+                updates["quant_config"] = draft_quant_config
         target_pc = vllm_config.parallel_config
         if target_pc.pipeline_parallel_size > 1:
             draft_pc = copy(target_pc)

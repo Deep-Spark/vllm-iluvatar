@@ -360,7 +360,7 @@ class EngramEmbedding(nn.Module):
         return rows
 
     def _lookup(self, hashes, rows):
-        ixfops.dsv41_engram_lookup_out(
+        ixfops.engram_lookup_out(
             hashes,
             self._dev_weight,
             self._dev_scale,
@@ -637,20 +637,20 @@ class IluEngram(nn.Module):
         x = hidden_states.contiguous()
         if not self._shard_keys:
             return (
-                ixfops.dsv41_engram_gate(
+                ixfops.engram_gate(
                     x, kv, self._qk_weight, self.eps, self.clamp_value
                 ),
                 None,
             )
         # qk_weight stays full width; the kernel offsets into it by key_offset.
-        sums = ixfops.dsv41_engram_gate_reduce(x, kv, self._qk_weight, self.key_offset)
+        sums = ixfops.engram_gate_reduce(x, kv, self._qk_weight, self.key_offset)
         sums = tensor_model_parallel_all_reduce(sums)
         if x.shape[0] <= 256:
-            return ixfops.dsv41_engram_gate_apply_with_sqrsum(
+            return ixfops.engram_gate_apply_with_sqrsum(
                 x, kv, sums, self.eps, self.clamp_value
             )
         return (
-            ixfops.dsv41_engram_gate_apply(
+            ixfops.engram_gate_apply(
                 x, kv, sums, self.eps, self.clamp_value
             ),
             None,
@@ -732,7 +732,7 @@ class NgramHashState(nn.Module):
         if self.swa_cache_module.bounded_replay and lookback_token_ids is None:
             raise RuntimeError("SWA bounded replay requires runner Engram lookback")
         out = self._out[: input_ids.shape[0]]
-        ixfops.dsv41_engram_hash_out(
+        ixfops.engram_hash_out(
             input_ids,
             self.token_map,
             positions,

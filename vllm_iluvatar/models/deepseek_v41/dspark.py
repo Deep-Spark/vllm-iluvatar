@@ -233,7 +233,7 @@ def _insert_context_kv(
     dummy_q = attn._attn_out[: kv.shape[0]]
     dummy_q.zero_()
     if attn.kv_cache_dtype == "fp8_ds_mla":
-        ixfops.dsv41_qkv_rope_packed_fp8_insert(
+        ixfops.qkv_rope_packed_fp8_insert(
             dummy_q,
             swa_kv_cache,
             kv,
@@ -243,7 +243,7 @@ def _insert_context_kv(
         )
         return
     if attn.kv_cache_dtype == "fp8_e4m3":
-        ixfops.dsv41_qkv_rope_fp8_pt_insert(
+        ixfops.qkv_rope_fp8_pt_insert(
             dummy_q,
             swa_kv_cache,
             kv,
@@ -255,7 +255,7 @@ def _insert_context_kv(
         )
         return
     # Plain bf16 window cache, same op the target attention uses.
-    ixfops.v41_qkv_rope_insert(
+    ixfops.qkv_rope_insert(
         dummy_q,
         swa_kv_cache,
         kv,

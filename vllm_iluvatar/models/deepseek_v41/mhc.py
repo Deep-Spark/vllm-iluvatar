@@ -43,7 +43,7 @@ def _want_fused_fp8(
 
 
 def hc_pre(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
-    return ixfops.dsv41_hc_collapse(x.contiguous(), pre_mix.contiguous())
+    return ixfops.hc_collapse(x.contiguous(), pre_mix.contiguous())
 
 
 def hc_pre_mixes(
@@ -87,7 +87,7 @@ def hc_pre_mixes(
     h_scale: torch.Tensor | None = None
     if sqrsum is None:
         assert layer_norm_weight is None
-        post, comb, layer_input, pre_out = ixfops.dsv41_mhc_pre(
+        post, comb, layer_input, pre_out = ixfops.mhc_pre_with_pre_mix(
             x.contiguous(),
             fn,
             hc_scale,
@@ -113,7 +113,7 @@ def hc_pre_mixes(
             pre_out,
             fp8_h,
             h_scale,
-        ) = torch.ops._ixformer_C.dsv41_mhc_pre_with_sqrsum_fp8(
+        ) = torch.ops._ixformer_C.mhc_pre_with_sqrsum_fp8(
             x.contiguous(),
             fn,
             hc_scale,
@@ -129,7 +129,7 @@ def hc_pre_mixes(
             layer_norm_eps,
         )
     else:
-        post, comb, layer_input, pre_out = ixfops.dsv41_mhc_pre_with_sqrsum(
+        post, comb, layer_input, pre_out = ixfops.mhc_pre_with_sqrsum(
             x.contiguous(),
             fn,
             hc_scale,
@@ -154,7 +154,7 @@ def hc_post(
     post: torch.Tensor,
     comb: torch.Tensor,
 ) -> torch.Tensor:
-    return ixfops.dsv41_mhc_post(
+    return ixfops.mhc_post(
         x.contiguous(),
         residual.contiguous(),
         post.contiguous(),
@@ -203,9 +203,9 @@ def hc_post_sqrsum(
     residual in between.
     """
     post_op = (
-        ixfops.dsv41_mhc_post_partials
+        ixfops.mhc_post_partials
         if _fuse_reductions and residual.shape[0] <= 16
-        else ixfops.dsv41_mhc_post_with_sqrsum
+        else ixfops.mhc_post_with_sqrsum
     )
     return post_op(
         x.contiguous(),

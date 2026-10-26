@@ -73,7 +73,7 @@ def test_readonly_mmap_uva_lookup_graph(tmp_path):
     out = torch.zeros(2, 3, dim, dtype=torch.bfloat16, device="cuda")
 
     def run():
-        ops.dsv41_engram_lookup_out(ids, dev_w, dev_s, out, 0, rows, 0, 3)
+        ops.engram_lookup_out(ids, dev_w, dev_s, out, 0, rows, 0, 3)
 
     run()
     torch.cuda.synchronize()
@@ -92,16 +92,16 @@ def test_readonly_mmap_uva_lookup_graph(tmp_path):
 def test_hash_graph_cross_chunk_and_padding():
     args = _hash_case()
     expected = [x.clone() if isinstance(x, torch.Tensor) else x for x in args]
-    registry.get_reference_impl("dsv41_engram_hash_out")(*expected)
-    ops.dsv41_engram_hash_out(*args)
+    registry.get_reference_impl("engram_hash_out")(*expected)
+    ops.engram_hash_out(*args)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        ops.dsv41_engram_hash_out(*args)
+        ops.engram_hash_out(*args)
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(args[11], expected[11])
     args[0][0] = 3
-    registry.get_reference_impl("dsv41_engram_hash_out")(
+    registry.get_reference_impl("engram_hash_out")(
         *[args[i] if i != 11 else expected[11] for i in range(len(args))]
     )
     graph.replay()

@@ -77,7 +77,7 @@ def indexer_k_norm_rope_store(
     if num_tokens == 0:
         return
 
-    ixfops.v41_indexer_k_norm_rope_store(
+    ixfops.indexer_k_norm_rope_store(
         k_pre,
         positions,
         cos_sin_cache,

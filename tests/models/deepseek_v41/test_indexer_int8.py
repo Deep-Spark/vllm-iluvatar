@@ -31,7 +31,7 @@ def test_indexer_k_store_int8_record(monkeypatch):
         captured["args"] = args
         captured["kwargs"] = kwargs
 
-    monkeypatch.setattr(store.ixfops, "v41_indexer_k_norm_rope_store", fake)
+    monkeypatch.setattr(store.ixfops, "indexer_k_norm_rope_store", fake)
     k_pre = torch.zeros(2, 128, dtype=torch.bfloat16)
     positions = torch.zeros(2, dtype=torch.int64)
     cos_sin = torch.zeros(8, 64)
@@ -53,7 +53,7 @@ def test_indexer_k_store_fp8_record(monkeypatch):
         captured["args"] = args
         captured["kwargs"] = kwargs
 
-    monkeypatch.setattr(store.ixfops, "v41_indexer_k_norm_rope_store", fake)
+    monkeypatch.setattr(store.ixfops, "indexer_k_norm_rope_store", fake)
     k_pre = torch.zeros(2, 128, dtype=torch.bfloat16)
     positions = torch.zeros(2, dtype=torch.int64)
     cos_sin = torch.zeros(8, 64)

@@ -27,7 +27,7 @@ def _install_pp(monkeypatch, group: _PP) -> None:
     monkeypatch.setattr(ps, "get_pp_group", lambda: group)
 
 
-def test_v41_model_opts_into_aux_relay():
+def test_model_opts_into_aux_relay():
     assert IluDeepseekV41Model.supports_aux_hidden_states_over_pp is True
 
 

@@ -175,7 +175,7 @@ def _shared_worker(rank, rendezvous, checkpoint):
     def run():
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
-            formal_ops.dsv41_engram_lookup_out(
+            formal_ops.engram_lookup_out(
                 ids, device, dev_scales, staged, 3, 8195, 0, 3
             )
             done.record(stream)

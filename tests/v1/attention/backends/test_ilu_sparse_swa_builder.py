@@ -325,7 +325,7 @@ def test_prefill_forwards_replay_start_to_gather_kernel():
     assert metadata.prefill_gather_lens.tolist() == [4]
 
 
-def test_v41_wrapper_forwards_replay_start_to_shared_builder():
+def test_wrapper_forwards_replay_start_to_shared_builder():
     builder = object.__new__(IluDeepseekV41SparseSWAMetadataBuilder)
     builder.block_size = 4
     builder._valid_slots = torch.empty(64, dtype=torch.int64)

@@ -11,10 +11,10 @@ Why      : community spells both in Triton, which does not run on corex, and
            top-k over the whole context instead of over the shortlist the
            candidate source published.
 How      : same two entry points, same argument order and contract; the two
-           reductions move to ``ixfops.v41_candidate_block_scores`` /
-           ``v41_apply_candidate_mask`` (ixformer deepseekv41/candidate).
+           reductions move to ``ixfops.candidate_block_scores`` /
+           ``apply_candidate_mask`` (ixformer deepseekv41/candidate).
            ``torch.topk`` stays in torch; writing the shortlist uses
-           ``v41_write_candidate_topk``.
+           ``write_candidate_topk``.
 Scope    : DeepSeek-V4.1 indexers with a candidate source.
 Remove   : when community grows a vendor hook for these two.
 """
@@ -84,7 +84,7 @@ def select_candidate_blocks(
     for r0 in range(0, rows, step):
         r1 = min(rows, r0 + step)
         g0, g1 = r0 // row_repeat, -(-r1 // row_repeat)
-        scores = ixfops.v41_candidate_block_scores(
+        scores = ixfops.candidate_block_scores(
             logits[r0:r1],
             None if row_ks is None else row_ks[g0:g1],
             row_ke[g0:g1],
@@ -113,7 +113,7 @@ def select_candidate_blocks(
             # One launch writes the kept indices and the ``-1`` tail. A block
             # that scored ``-inf`` is padding; a NaN is kept, matching
             # community.
-            ixfops.v41_write_candidate_topk(
+            ixfops.write_candidate_topk(
                 out[r0 + s : r0 + e], top.values, top.indices, k
             )
             s = e
@@ -131,6 +131,6 @@ def apply_candidate_mask(
     rows, width = logits.shape
     if not rows or not width:
         return
-    ixfops.v41_apply_candidate_mask(
+    ixfops.apply_candidate_mask(
         logits, row_ks, row_ke, candidate_blocks, block_size, row_repeat
     )

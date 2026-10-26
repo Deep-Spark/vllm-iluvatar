@@ -70,5 +70,5 @@ def apply_rope(
     v = x.squeeze(0)
     if v.ndim == 2:
         v = v.unsqueeze(1)
-    op = ixfops.dsv41_inv_rope if inverse else ixfops.dsv41_rope
+    op = ixfops.inv_rope if inverse else ixfops.rope
     op(v, positions, cos_sin, True, None)

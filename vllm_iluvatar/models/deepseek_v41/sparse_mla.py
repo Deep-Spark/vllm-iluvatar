@@ -41,7 +41,7 @@ _V41_LAYER_TYPES: dict[int, str] = {
 }
 
 
-def deepseek_v41_layer_type(compress_ratio: int) -> str:
+def deepseek_layer_type(compress_ratio: int) -> str:
     layer_type = _V41_LAYER_TYPES.get(compress_ratio)
     if layer_type is None:
         raise ValueError(
@@ -82,10 +82,10 @@ class IluDeepseekV41SparseSWAMetadataBuilder(IluDeepseekSparseSWAMetadataBuilder
     """
 
     _compute_swa_decode_indices_and_lens = staticmethod(
-        ixfops.dsv41_compute_swa_decode_indices_and_lens
+        ixfops.compute_swa_decode_indices_and_lens
     )
     _compute_swa_prefill_gather_lens = staticmethod(
-        ixfops.dsv41_compute_swa_prefill_gather_lens
+        ixfops.compute_swa_prefill_gather_lens
     )
 
     def __init__(self, *args, **kwargs):
@@ -108,7 +108,7 @@ class IluDeepseekV41SparseSWAMetadataBuilder(IluDeepseekSparseSWAMetadataBuilder
         )
         compress_ratios = saved or [0]
         self._layer_types = {
-            deepseek_v41_layer_type(int(ratio)) for ratio in compress_ratios
+            deepseek_layer_type(int(ratio)) for ratio in compress_ratios
         }
 
     def build(

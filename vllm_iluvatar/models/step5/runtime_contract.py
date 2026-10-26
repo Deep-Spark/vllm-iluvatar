@@ -166,8 +166,6 @@ def validate_step5_runtime(vllm_config, *, draft=False):
             f"Step5 {role} native extension could not be loaded: {exc}"
         ) from exc
     if envs.VLLM_ILU_STEP5_SPARSE_FP8:
-        if not envs.VLLM_ILU_STEP5_FP8_KV_SCALE_PATH:
-            raise ValueError("Step5 sparse FP8 requires a frozen K/V scale table")
         if vllm_config.cache_config.cache_dtype != "auto":
             raise ValueError("Step5 sparse-only FP8 requires --kv-cache-dtype auto")
         # The composition is one standard native binding, not an experimental

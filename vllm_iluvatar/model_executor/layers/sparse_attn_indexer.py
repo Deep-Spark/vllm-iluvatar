@@ -216,6 +216,18 @@ def ilu_sparse_attn_indexer(
         for chunk in prefill_metadata.chunks:
             if chunk.max_context_len == 0:
                 continue
+            if candidate_blocks is not None and not candidate_write and envs.VLLM_ILU_DS4_CANDIDATE_FILTER:
+                from vllm_iluvatar.model_executor.kernels.attention.dsa.ilu_sparse_candidate_indexer import maybe_topk
+                if maybe_topk(
+                    q[chunk.token_start:chunk.token_end], chunk.cu_seqlens_q,
+                    chunk.cu_seq_lens, kv_cache, kv_scales, chunk.block_table,
+                    weights[chunk.token_start:chunk.token_end], chunk.valid_lens,
+                    candidate_blocks[chunk.token_start:chunk.token_end],
+                    topk_indices_buffer[chunk.token_start:chunk.token_end],
+                    max_q_len=chunk.max_q_len, max_kv_len=chunk.max_kv_len,
+                    group=candidate_block_size, topk=topk_tokens, decode=False,
+                ):
+                    continue
             logits = _mqa_logits(
                 q[chunk.token_start : chunk.token_end],
                 chunk.cu_seqlens_q,
@@ -259,6 +271,18 @@ def ilu_sparse_attn_indexer(
             # with zero columns. Write -1 (no selection) and return.
             topk_indices_buffer[:num_decode_tokens].fill_(-1)
             return topk_indices_buffer
+
+        if candidate_blocks is not None and not candidate_write and envs.VLLM_ILU_DS4_CANDIDATE_FILTER:
+            from vllm_iluvatar.model_executor.kernels.attention.dsa.ilu_sparse_candidate_indexer import maybe_topk
+            if maybe_topk(
+                q[:num_decode_tokens], decode_metadata.cu_seqlens_q,
+                decode_metadata.cu_seqlens_kv, kv_cache, kv_scales, decode_metadata.block_table,
+                weights[:num_decode_tokens], decode_metadata.valid_lens,
+                candidate_blocks[:num_decode_tokens], topk_indices_buffer[:num_decode_tokens],
+                max_q_len=decode_metadata.max_q_len, max_kv_len=decode_metadata.max_kv_len,
+                group=candidate_block_size, topk=topk_tokens, decode=True,
+            ):
+                return topk_indices_buffer
 
         use_owned = (
             not has_prefill and not decode_metadata.requires_padding

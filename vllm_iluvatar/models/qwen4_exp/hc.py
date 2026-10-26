@@ -1,14 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""HyperConnection kernels for Qwen4Exp.
-
-The production path is exclusively ixformer CUDA on CoreX30. Reference
-implementations belong in tests, not in this runtime adapter.
-"""
+"""HyperConnection kernels for Qwen4Exp backed by ixformer CUDA."""
 
 from __future__ import annotations
 
 import torch
+
 from ixformer.inference.functions.models.qwen3_next.hc.float import hc as hc_ops
 
 

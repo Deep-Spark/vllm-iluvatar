@@ -572,12 +572,18 @@ def _quant_one_expert_int4_moe(
         quant_int4_moe(chunk, options)
         for chunk in expert_weight.chunk(2, dim=chunk_dim)
     ]
-    scale_dim = (
-        -2
-        if int(options.get("pack_version", 2)) != 1
+    # Channel scales are [N, 1], or [1, N] with the v2 row layout.
+    # Grouped v1 scales are [K/groups, N]. Concatenate the output channels,
+    # never the singleton/group axis (which would produce [2, N/2]).
+    row_layout = (
+        int(options.get("pack_version", 2)) != 1
         and options.get("scale_layout") == "row"
-        else -1
     )
+    grouped_v1 = (
+        int(options.get("pack_version", 2)) == 1
+        and int(options.get("group_size", -1)) != -1
+    )
+    scale_dim = -1 if row_layout or grouped_v1 else -2
     weight_dim = -2 if gemm_format[0] == "T" else -1
     return QuantResult(
         weight=torch.cat([result.weight for result in chunk_results], dim=weight_dim),

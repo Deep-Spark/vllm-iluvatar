@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import ClassVar, cast
 
 import torch
+
 from ixformer.inference.functions.models.qwen3_next import (
     qwen_qsa_kv_store,
     qwen_qsa_qk_norm_rope_gate,
@@ -52,6 +53,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     get_kv_quant_mode,
 )
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from .config import Qwen4ExpTextConfig
 from .indexer import QSAIndexer
@@ -77,6 +79,11 @@ class Qwen4ExpQSAIxformerBackend(FlashAttentionBackend):
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "bfloat16"]
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        # V2 binds logical [B,H,N,C] views; the ops below transpose to tokens.
+        return (KVCacheLayout.LBHNC,)
 
     @staticmethod
     def get_name() -> str:

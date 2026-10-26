@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
+import torch
 from vllm.model_executor.models.qwen3_vl import Qwen3_VisionTransformer
 
 from vllm_iluvatar.models.qwen4_exp.model import (
@@ -9,6 +10,83 @@ from vllm_iluvatar.models.qwen4_exp.model import (
     Qwen4ExpModel,
     _remap_qsa_cache_scale_name,
 )
+
+
+def test_quantized_loading_rejects_missing_scale_even_if_weight_loaded() -> None:
+    from types import SimpleNamespace
+    from vllm_iluvatar.models.qwen4_exp.loading import verify_quantized_weights_loaded
+
+    model = torch.nn.Module()
+    model.register_parameter("weight", torch.nn.Parameter(torch.ones(4, 4)))
+    model.register_parameter("weight_scale", torch.nn.Parameter(torch.ones(4, 1)))
+    config = SimpleNamespace(get_name=lambda: "compressed-tensors")
+    with pytest.raises(RuntimeError, match="weight_scale"):
+        verify_quantized_weights_loaded(model, {"weight"}, config)
+    verify_quantized_weights_loaded(model, {"weight", "weight_scale"}, config)
+
+
+def test_quantized_loading_resolves_real_moe_runner_parameter_paths() -> None:
+    from types import SimpleNamespace
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+    from vllm_iluvatar.models.qwen4_exp.loading import verify_quantized_weights_loaded
+
+    runner = MoERunner.__new__(MoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.routed_experts = torch.nn.Module()
+    runner.routed_experts.register_parameter("w13_weight", torch.nn.Parameter(torch.ones(1)))
+    runner.routed_experts.register_parameter("w13_weight_scale", torch.nn.Parameter(torch.ones(1)))
+    model = torch.nn.Module()
+    model.experts = runner
+    config = SimpleNamespace(get_name=lambda: "compressed-tensors")
+    with pytest.raises(RuntimeError, match="w13_weight_scale"):
+        verify_quantized_weights_loaded(model, {"experts.w13_weight"}, config)
+    verify_quantized_weights_loaded(model, {"experts.w13_weight", "experts.w13_weight_scale"}, config)
+
+
+def test_conditional_generation_quantized_loading_handles_interleaved_visual_weights() -> None:
+    from types import SimpleNamespace
+    from vllm_iluvatar.models.qwen4_exp.model import Qwen4ExpForCausalLM
+
+    lm = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
+    torch.nn.Module.__init__(lm)
+    lm.config = SimpleNamespace(ple_layer_ids=[])
+    lm.quant_config = SimpleNamespace(
+        get_name=lambda: "compressed-tensors",
+        get_cache_scale_mapper=lambda: Qwen4ExpModel.hf_to_vllm_mapper,
+        get_checkpoint_weight_mapper=lambda: Qwen4ExpModel.hf_to_vllm_mapper,
+        _ignore_unexpected_suffixes=[],
+    )
+    lm._verify_quantized_weights = False
+    lm.model = torch.nn.Module()
+    lm.model.register_parameter("weight", torch.nn.Parameter(torch.zeros(2, 2)))
+    lm.model.register_parameter("weight_scale", torch.nn.Parameter(torch.zeros(2, 1)))
+    lm.lm_head = torch.nn.Module()
+    lm.lm_head.register_parameter("weight", torch.nn.Parameter(torch.zeros(2, 2)))
+
+    visual = torch.nn.Module()
+    visual.register_parameter("weight", torch.nn.Parameter(torch.zeros(2, 2)))
+
+    vl = Qwen4ExpForConditionalGeneration.__new__(Qwen4ExpForConditionalGeneration)
+    torch.nn.Module.__init__(vl)
+    vl.language_model_only = False
+    vl.language_model = lm
+    vl.visual = visual
+
+    # Shard 1 has language_model weights followed by visual weights; a later
+    # shard has lm_head.weight, splitting language_model into two groupby chunks.
+    interleaved = [
+        ("model.language_model.weight", torch.ones(2, 2)),
+        ("model.language_model.weight_scale", torch.ones(2, 1)),
+        ("model.visual.weight", torch.ones(2, 2)),
+        ("lm_head.weight", torch.ones(2, 2)),
+    ]
+    loaded = vl.load_weights(interleaved)
+    assert loaded == {
+        "language_model.model.weight",
+        "language_model.model.weight_scale",
+        "visual.weight",
+        "language_model.lm_head.weight",
+    }
 
 
 @pytest.mark.parametrize(

@@ -71,6 +71,7 @@ from .attention import Qwen4ExpQSAAttention
 from .config import Qwen4ExpConfig, Qwen4ExpTextConfig
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .indexer import QSAPoolCarry
+from .loading import verify_quantized_weights_loaded
 from .ple import Qwen4ExpPLELayer
 from .ple_utils import ple_conv_window_state_shape
 
@@ -699,9 +700,11 @@ def _verify_supported_config(vllm_config: VllmConfig) -> None:
     Every one of them would otherwise fail late and obscurely -- or, worse,
     quietly produce wrong output -- rather than at startup.
     """
-    import vllm.envs as envs
-
-    if not envs.VLLM_USE_V2_MODEL_RUNNER:
+    # NOTE: use the resolved property, not the raw env var. When
+    # VLLM_USE_V2_MODEL_RUNNER is unset, envs.VLLM_USE_V2_MODEL_RUNNER is None
+    # (falsy) but v0.31's default resolution still selects the V2 runner, so
+    # checking the env directly would reject the default configuration.
+    if not vllm_config.use_v2_model_runner:
         raise NotImplementedError(
             "Qwen4Exp requires the V2 model runner (VLLM_USE_V2_MODEL_RUNNER=1): "
             "its PLE GDN-page window routing, PLE n-gram context and QSA group "
@@ -807,6 +810,7 @@ class Qwen4ExpForCausalLM(
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.quant_config = vllm_config.quant_config
+        self._verify_quantized_weights = True
         self.config = config
         self.requires_raw_input_tokens = _requires_raw_input_tokens(config)
         self.scheduler_config = vllm_config.scheduler_config
@@ -948,7 +952,10 @@ class Qwen4ExpForCausalLM(
             self,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(weights, mapper=mapper)
+        loaded = loader.load_weights(weights, mapper=mapper)
+        if getattr(self, "_verify_quantized_weights", True):
+            verify_quantized_weights_loaded(self, loaded, self.quant_config)
+        return loaded
 
 
 class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
@@ -1049,6 +1056,7 @@ class Qwen4ExpForConditionalGeneration(
                 vllm_config=vllm_config,
                 prefix=maybe_prefix(prefix, "language_model"),
             )
+            self.language_model._verify_quantized_weights = False
 
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
@@ -1151,7 +1159,9 @@ class Qwen4ExpForConditionalGeneration(
             self,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(weights, mapper=mapper)
+        loaded = loader.load_weights(weights, mapper=mapper)
+        verify_quantized_weights_loaded(self, loaded, self.language_model.quant_config)
+        return loaded
 
     @classmethod
     def get_mamba_state_dtype_from_config(

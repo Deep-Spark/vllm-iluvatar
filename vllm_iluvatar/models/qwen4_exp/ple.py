@@ -40,7 +40,7 @@ def _require_ple_ops(*names: str):
         import ixformer._C as ixf_c_ops
     except Exception as exc:
         raise RuntimeError(
-            "Qwen4Exp PLE requires the ixformer CUDA extension on CoreX30"
+            "Qwen4Exp PLE requires the ixformer CUDA extension"
         ) from exc
     infer = getattr(ixf_c_ops, "infer", None)
     missing = [name for name in names if infer is None or not hasattr(infer, name)]
@@ -209,7 +209,10 @@ class Qwen4ExpNGramTable(nn.Module):
             self.register_parameter(
                 "weight_scale",
                 nn.Parameter(
-                    torch.zeros(scale_shape, dtype=torch.bfloat16),
+                    torch.zeros(
+                        scale_shape,
+                        dtype=torch.float32 if quant_kind == "int8" else torch.bfloat16,
+                    ),
                     requires_grad=False,
                 ),
             )
@@ -224,7 +227,7 @@ class Qwen4ExpNGramTable(nn.Module):
         rows = F.embedding(local_ids, self.weight)
         if self.quant_kind == "int8":
             scale = F.embedding(local_ids, self.weight_scale)
-            output = rows.to(self.params_dtype) * scale.to(self.params_dtype)
+            output = (rows.float() * scale.float()).to(self.params_dtype)
         elif self.quant_kind == "fp8":
             output = rows.to(self.params_dtype) * self.weight_scale.to(
                 self.params_dtype
@@ -395,13 +398,20 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
     def _cuda_ngram_lookup(self, ngram_ids: torch.Tensor) -> torch.Tensor:
         table = self.ngram_embedding
+        if not ngram_ids.is_cuda:
+            raise RuntimeError("Qwen4Exp PLE n-gram lookup requires a CUDA tensor")
+        if table.quant_kind in ("int8", None):
+            if table.quant_kind == "int8" and table.weight_scale is None:
+                raise RuntimeError("PLE INT8 table requires per-row weight_scale")
+            # Gather before dequantizing: the full table is tens of GiB and
+            # must remain INT8. Table.forward also applies the TP ownership
+            # mask and all-reduce, exactly once.
+            return table(ngram_ids).flatten(-2)
         ops = _require_ple_ops("qwen_ple_ngram_lookup")
         if table.quant_kind != "fp8" or table.weight_scale is None:
             raise RuntimeError(
                 "ixformer PLE n-gram lookup requires an FP8 table with a scale"
             )
-        if not ngram_ids.is_cuda:
-            raise RuntimeError("Qwen4Exp PLE n-gram lookup requires a CUDA tensor")
         if not table.weight.is_contiguous():
             raise ValueError("ple n-gram table weight must be contiguous")
         _require_contiguous(ngram_ids, "ple ngram_ids")

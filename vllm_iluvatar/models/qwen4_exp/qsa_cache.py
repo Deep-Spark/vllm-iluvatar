@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
+
 import vllm.envs as envs
 from ixformer.inference.functions.models.qwen3_next import qwen_qsa_build_metadata
 from torch import nn
@@ -36,6 +37,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
 )
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
     split_indexer_prefill_chunks,
@@ -573,8 +575,8 @@ class QSAStateBackend(AttentionBackend):
         return (num_blocks, num_kv_heads, block_size, head_size)
 
     @classmethod
-    def supported_kv_cache_layouts(cls) -> tuple[str, ...]:
-        return ("NHD", "HND")
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        return (KVCacheLayout.LBHNC,)
 
 
 class _QSAStateCache(nn.Module, AttentionLayerBase):

@@ -16,8 +16,69 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm_iluvatar.models.minimax_m3.mxfp8 import fp8_attention as fp8
 
 
+def _config(max_num_seqs, n_spec=0):
+    spec = (
+        SimpleNamespace(num_speculative_tokens=n_spec, use_dspark=lambda: True)
+        if n_spec
+        else None
+    )
+    return SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        speculative_config=spec,
+    )
+
+
+@pytest.mark.parametrize("n_spec", [0, 1, 7])
+def test_capture_width_and_replay_metadata_keep_stable_storage(n_spec):
+    from vllm.v1.attention.backend import AttentionCGSupport
+
+    config = _config(4, n_spec)
+    builder = fp8.FP8MetadataBuilder(None, ["main"], config, "cpu")
+    width = n_spec + 1
+    cu = torch.arange(5, dtype=torch.int32) * width
+    seq = torch.full((4,), 32 + width, dtype=torch.int32)
+    common = CommonAttentionMetadata(
+        num_reqs=4,
+        num_actual_tokens=4 * width,
+        query_start_loc=cu,
+        query_start_loc_cpu=cu,
+        seq_lens=seq,
+        slot_mapping=torch.full((4 * width,), -1, dtype=torch.int64),
+        block_table_tensor=torch.zeros(4, 2, dtype=torch.int32),
+        max_query_len=width,
+        max_seq_len=32 + width,
+    )
+    captured = builder.build_for_cudagraph_capture(common)
+    expected_support = (
+        AttentionCGSupport.UNIFORM_BATCH
+        if n_spec
+        else AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    )
+    assert builder.get_cudagraph_support(config, None) == expected_support
+    ptr = captured.prefix.data_ptr()
+    for real_reqs in (3, 1, 0, 4):
+        cu.copy_(torch.arange(5, dtype=torch.int32).clamp(max=real_reqs) * width)
+        seq.fill_(0)
+        seq[:real_reqs] = 64 + width
+        common._num_computed_tokens_cache = None
+        replay = builder.build(0, common)
+        assert replay.prefix.data_ptr() == ptr
+        assert replay.cu.data_ptr() == captured.cu.data_ptr()
+        assert replay.dense_valid_tokens == real_reqs * width
+        assert torch.equal(
+            replay.prefix, torch.tensor([64] * real_reqs + [0] * (4 - real_reqs))
+        )
+        assert (
+            sum(s.token_end - s.token_start for s in replay.dense_segments)
+            == real_reqs * width
+        )
+    cu.copy_(torch.arange(5, dtype=torch.int32) * (width + 1))
+    with pytest.raises(ValueError, match="uniform configured verification width"):
+        builder.build_for_cudagraph_capture(common)
+
+
 def test_padded_metadata_keeps_query_end_and_independent_page_tables():
-    config = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=4))
+    config = _config(4)
     builders = [
         fp8.FP8MetadataBuilder(None, [name], config, torch.device("cpu"))
         for name in ("main", "index")
@@ -69,7 +130,7 @@ def test_text_and_outer_configs_share_status_lifetime(monkeypatch):
 
 
 def test_dense_metadata_preserves_mixed_request_order():
-    config = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=6))
+    config = _config(6)
     builder = fp8.FP8MetadataBuilder(None, ["main"], config, torch.device("cpu"))
     cu = torch.tensor([0, 1, 5, 6, 7, 7, 9], dtype=torch.int32)
     seq = torch.tensor([8, 13, 21, 34, 0, 40], dtype=torch.int32)
@@ -111,7 +172,7 @@ def test_fp8_metadata_drives_graph_safe_moe_decode(lengths, expected):
     builder = fp8.FP8MetadataBuilder(
         None,
         ["main"],
-        SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=3)),
+        _config(3),
         "cpu",
     )
     cu = torch.tensor(
@@ -134,7 +195,7 @@ def test_fp8_metadata_drives_graph_safe_moe_decode(lengths, expected):
     from vllm.v1.attention.backend import AttentionCGSupport
 
     assert (
-        builder.get_cudagraph_support(None, None)
+        builder.get_cudagraph_support(_config(3), None)
         == AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
     )
 

@@ -83,7 +83,27 @@ def make_post_init(orig: Callable[..., None]) -> Callable[..., None]:
     @functools.wraps(orig)
     def __post_init__(self) -> None:
         orig(self)
+        if (
+            self.method == "mtp"
+            and self.draft_model_config is not None
+            and getattr(self.draft_model_config.hf_config, "model_type", None)
+            == "step5_mtp"
+        ):
+            self.quantization = None
+            self.draft_model_config.quantization = None
         if self.method != "dspark" or self.draft_model_config is None:
+            return
+        if getattr(self.draft_model_config.hf_config, "_ilu_minimax_dspark", False):
+            from vllm_iluvatar.config.minimax_dspark import normalize_dspark_config
+
+            self.draft_model_config.hf_config = normalize_dspark_config(
+                self.draft_model_config.hf_config
+            )
+            self.update_arch_()
+            self.draft_parallel_config.enable_expert_parallel = False
+            logger.info(
+                "MiniMax DSpark draft: five dense layers, target auxiliary states, shared vocabulary"
+            )
             return
         target_archs = (
             []
@@ -126,6 +146,23 @@ def make_hf_config_override(
         architectures = getattr(hf_config, "architectures", None) or []
         initial_architecture = architectures[0] if architectures else None
 
+        if initial_architecture == "DSparkMiniMaxDraftModel":
+            from vllm_iluvatar.config.minimax_dspark import normalize_dspark_config
+
+            return normalize_dspark_config(hf_config)
+
+        if getattr(hf_config, "model_type", None) in (
+            "step5",
+            "step5_vl",
+            "step5_mtp",
+        ) or initial_architecture in (
+            "Step5ForCausalLM",
+            "Step5ForConditionalGeneration",
+            "Step5MTP",
+        ):
+            from vllm_iluvatar.models.step5.config import Step5MTPConfig
+
+            return Step5MTPConfig.from_target(hf_config)
         hf_config = orig(hf_config)
 
         ilu_mtp_arch = _ILU_MTP_ARCH_MAP.get(initial_architecture)

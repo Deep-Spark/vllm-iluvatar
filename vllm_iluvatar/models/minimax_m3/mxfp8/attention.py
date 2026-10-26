@@ -117,13 +117,7 @@ class MiniMAXGemmaRMSNorm(nn.Module):
             eps=self.variance_epsilon,
             residual=residual,
         )
-        if residual is None:
-            return result
-
-        output, residual_output = result
-        x.copy_(output)
-        residual.copy_(residual_output)
-        return x, residual
+        return result
 
 
 def _require_unquantized_m3_caches(

@@ -17,7 +17,7 @@ Why      : ``ModelOptMxFp8FusedMoE.__init__`` calls ``select_mxfp8_moe_backend``
            ``torch.ops._C.gptq_marlin_repack``, which the Iluvatar build does not
            define. Same failure class as NVFP4/block-FP8 landing on MARLIN.
 How      : ``@register_quantization_config("mxfp8")`` on a subclass that
-           only swaps ``FusedMoEMethodCls``; the inherited
+           swaps ``FusedMoEMethodCls`` for MXFP8 experts; the inherited
            ``ModelOptQuantConfigBase.get_quant_method`` dispatches through that
            attribute, so no method body is copied. The MoE method skips the
            parent ``__init__`` (and therefore the backend selection), converts
@@ -60,6 +60,7 @@ from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMxFp8Config,
     ModelOptMxFp8FusedMoE,
+    ModelOptNvFp4Config,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
@@ -78,14 +79,17 @@ from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
     _ixmm_backend_available,
     ilu_mxfp4_fused_experts,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8 import (
+from vllm_iluvatar.model_executor.layers.quantization.fp8 import (
     _IXMM_EXPERT_CHUNK,
     _IXMM_GROUP_SIZE,
     preprocess_fp8_block_weight_for_ixmm,
 )
 from vllm_iluvatar.model_executor.layers.quantization.ilu_modelopt_nvfp4 import (
+    IluModelOptNvFp4MoEMethod,
     _get_ilu_output_scale,
 )
+
+from .weight_utils import publish_derived_weight as _publish_derived_weight
 
 # Community activation -> the ixformer SwiGLU variant that reproduces exactly
 # its math. Anything else must fail loudly rather than compute a different
@@ -177,30 +181,6 @@ def preprocess_fp8_moe_weight_for_ixmm(
     return ixmm_weight, ixmm_scale
 
 
-def _publish_derived_weight(
-    layer: torch.nn.Module, name: str, tensor: torch.Tensor
-) -> None:
-    """Attach a load-time-derived tensor under ``name``, as a buffer.
-
-    Not ``replace_parameter``: the loader calls
-    ``process_weights_after_loading`` inside ``device_loading_context``, which
-    records every parameter that was on CPU on entry and, on exit, moves
-    whatever still carries that *name* back to CPU. Since the ix30 FP4 image is
-    published under the checkpoint's own names, keeping it a Parameter means the
-    context evicts it to host memory the moment the context closes, and the
-    first ``group_gemm_fp4`` then fails with "weight must be on the same CUDA
-    device as a".
-
-    A non-persistent buffer is both immune to that (the restore loop walks
-    ``named_parameters()``) and the honest description of what this is: a
-    derived, kernel-private tensor, not a checkpoint parameter, so it should
-    also stay out of ``state_dict()``.
-    """
-    layer._parameters.pop(name, None)
-    layer._buffers.pop(name, None)
-    layer.register_buffer(name, tensor, persistent=False)
-
-
 class IluMxFp8FusedMoE(ModelOptMxFp8FusedMoE):
     """MXFP8 routed experts converted to ix30 FP4 and run by ixmm group GEMM."""
 
@@ -213,7 +193,7 @@ class IluMxFp8FusedMoE(ModelOptMxFp8FusedMoE):
     # ``experts_cls`` is deliberately left unset (not None) so community
     # ``FusedMoEMethodBase.is_monolithic`` never dereferences it; the explicit
     # ``is_monolithic`` override below makes the answer independent of that
-    # subtlety regardless. See ``ilu_modelopt_nvfp4.py`` / ``ilu_fp8.py``.
+    # subtlety regardless. See ``ilu_modelopt_nvfp4.py`` / ``fp8.py``.
     def __init__(
         self,
         quant_config: ModelOptMxFp8Config,
@@ -501,7 +481,10 @@ class IluMxFp8FusedMoE(ModelOptMxFp8FusedMoE):
 class IluMxFp8Config(ModelOptMxFp8Config):
     """MXFP8 config whose routed experts use the Iluvatar ix30 compute path.
 
-    Only ``FusedMoEMethodCls`` differs from community: the inherited
+    Mixed checkpoints may declare NVFP4 experts alongside MXFP8 linears.
+    Dispatch is based on the checkpoint format, independently of model architecture.
+
+    For ordinary MXFP8 checkpoints only ``FusedMoEMethodCls`` differs: the inherited
     ``ModelOptQuantConfigBase.get_quant_method`` dispatches Linear layers through
     ``LinearMethodCls`` (unchanged ``ModelOptMxFp8LinearMethod``, which picks up
     ``IluMxfp8LinearKernel`` from the patched kernel list) and ``RoutedExperts``
@@ -513,6 +496,37 @@ class IluMxFp8Config(ModelOptMxFp8Config):
 
     def get_name(self) -> Any:
         return "mxfp8"
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]):
+        result = super().from_config(config)
+        result.moe_quant_algo = config.get("moe_quant_algo", "MXFP8")
+        if result.moe_quant_algo not in ("MXFP8", "NVFP4"):
+            raise ValueError(
+                f"Unsupported moe_quant_algo {result.moe_quant_algo!r}; "
+                "expected MXFP8 or NVFP4"
+            )
+        if result.moe_quant_algo == "NVFP4" and (
+            config.get("moe_quant_format") != "nvfp4-pack-quantized"
+            or config.get("group_size") != 16
+        ):
+            raise ValueError("Unsupported NVFP4 expert checkpoint format")
+        return result
+
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        if (
+            getattr(self, "moe_quant_algo", "MXFP8") == "NVFP4"
+            and isinstance(layer, RoutedExperts)
+            and not self.is_layer_excluded(prefix)
+        ):
+            return IluModelOptNvFp4MoEMethod(
+                ModelOptNvFp4Config(is_checkpoint_nvfp4_serialized=True, group_size=16),
+                layer.moe_config,
+                stage_on_cpu=True,
+                validate_checkpoint=True,
+                expert_chunk_size=2,
+            )
+        return super().get_quant_method(layer, prefix)
 
 
 IluMxFp8Config.FusedMoEMethodCls = IluMxFp8FusedMoE

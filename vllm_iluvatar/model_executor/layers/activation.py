@@ -244,3 +244,60 @@ class IluQuickGELU(QuickGELU):
 
             # [ILU override] QuickGELU.op - delta: use vllm._custom_ops.
             self.op = ops.gelu_quick
+
+
+def swigluoai_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    limit: float = 7.0,
+    alpha: float = 1.702,
+    beta: float = 1.0,
+    use_gemv: bool = False,
+) -> torch.Tensor:
+    """Framework-owned SwiGLU FP8 producer/consumer composition.
+
+    Packed-halves BF16 [M,2K] -> E4M3 [M,K] / FP32 [M] -> BF16 [M,N].
+    Weight is per-channel E4M3 [N,K] with FP32 [N] multiplicative scales.
+    There are TWO native launches: fused activation/quantization and GEMM.
+    No FP8->FP32->BF16 round-trip or second activation quantization is used.
+    The caller owns tensor-parallel reduction; bias is intentionally unsupported.
+    """
+    from ixformer.inference import functions as ixf
+
+    if input.ndim != 2 or input.dtype != torch.bfloat16 or not input.is_cuda:
+        raise ValueError("swigluoai_fp8_linear requires CUDA BF16 [M,2K]")
+    if weight.ndim != 2 or weight.dtype != torch.float8_e4m3fn:
+        raise ValueError("weight must be per-channel E4M3 [N,K]")
+    if (
+        input.shape[1] != 2 * weight.shape[1]
+        or weight_scale.shape != (weight.shape[0],)
+        or weight_scale.dtype != torch.float32
+        or input.device != weight.device
+        or input.device != weight_scale.device
+    ):
+        raise ValueError("SwiGLU projection shape/scale/device mismatch")
+    if (
+        not input.is_contiguous()
+        or not weight.is_contiguous()
+        or not weight_scale.is_contiguous()
+    ):
+        raise ValueError("SwiGLU projection requires contiguous tensors")
+    output = torch.empty(
+        (input.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=input.device
+    )
+    if input.shape[0] == 0:
+        return output
+    values, scales = ixf.swigluoai_uninterleave_dynamic_scaled_fp8(
+        input, limit=limit, alpha=alpha, beta=beta, backend="ixformer_native"
+    )
+    if use_gemv:
+        ixf.fp8_per_channel_gemv(
+            values, weight, scales, weight_scale, output, format="TN", backend="ixmm"
+        )
+    else:
+        ixf.fp8_per_channel_mm(
+            values, weight, scales, weight_scale, output, backend="ixmm"
+        )
+    return output

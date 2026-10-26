@@ -13,6 +13,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
@@ -64,6 +65,8 @@ from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 
+from vllm_iluvatar.ilu_util.arch import is_ivcore30
+from vllm_iluvatar.model_executor.layers.activation import swigluoai_fp8_linear
 from vllm_iluvatar.models.minimax_m3.mxfp8.attention import (
     MiniMAXGemmaRMSNorm,
     MiniMaxM3Attention,
@@ -95,7 +98,8 @@ class MiniMaxM3MLP(nn.Module):
 
     Same layout as community ``MiniMaxM3MLP`` and Iluvatar DS-V4 / GLM shared
     experts: ``gate_up_proj`` -> ``act_fn`` -> ``down_proj``. The activation
-    dispatches through ``ops.silu_and_mul_with_clamp`` into ixformer.
+    uses the fused FP8 producer when down-projection weights are per-channel
+    FP8; this framework module owns the projection and TP reduction.
     """
 
     def __init__(
@@ -127,6 +131,11 @@ class MiniMaxM3MLP(nn.Module):
                 f"Unsupported activation: {config.hidden_act}. "
                 "Only swigluoai is supported."
             )
+        self._swiglu_parameters = dict(
+            limit=float(config.swiglu_limit),
+            alpha=float(config.swiglu_alpha),
+            beta=float(config.swiglu_beta),
+        )
         self.act_fn = SiluAndMulWithClamp(
             swiglu_limit=config.swiglu_limit,
             alpha=config.swiglu_alpha,
@@ -135,8 +144,26 @@ class MiniMaxM3MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
+        down = self.down_proj
+        # The marker is published only after the MXFP8 kernel has converted
+        # weights to per-channel E4M3. Preserve RowParallelLinear's reduction.
+        if is_ivcore30() and hasattr(down, "_ilu_mxfp8_can_use_gemv"):
+            if not down.input_is_parallel or down.bias is not None:
+                raise ValueError("MiniMax fused MLP requires sharded input and no bias")
+            shape = gate_up.shape[:-1]
+            packed = gate_up.reshape(-1, gate_up.shape[-1])
+            result = swigluoai_fp8_linear(
+                packed,
+                down.weight,
+                down.weight_scale,
+                use_gemv=down._ilu_mxfp8_can_use_gemv and packed.shape[0] <= 16,
+                **self._swiglu_parameters,
+            )
+            if down.reduce_results and down.tp_size > 1:
+                result = tensor_model_parallel_all_reduce(result)
+            return result.view(*shape, result.shape[-1])
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = down(x)
         return x
 
 
@@ -333,7 +360,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.fuse_input_allreduce and residual is not None:
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
                 hidden_states, residual, self.input_layernorm
@@ -344,6 +371,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 hidden_states = self.input_layernorm(hidden_states)
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        # The new residual is the preceding layer's complete post-FFN state.
+        # Keep it for DSpark before this layer updates its own residual.
+        preceding_layer_state = residual
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -354,7 +384,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states, residual, self.post_attention_layernorm
         )
         hidden_states = ffn(hidden_states)
-        return hidden_states, residual
+        return hidden_states, residual, preceding_layer_state
 
     @property
     def ffn_all_reduce_deferred(self) -> bool:
@@ -434,8 +464,10 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         # is left un-reduced has that all-reduce fused into the next layer's
         # input_layernorm (or the final norm).
         prev_defers = False
-        for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
-            layer.fuse_input_allreduce = idx > 0 and prev_defers
+        for idx, layer in enumerate(
+            self.layers[self.start_layer : self.end_layer], start=self.start_layer
+        ):
+            layer.fuse_input_allreduce = idx > self.start_layer and prev_defers
             prev_defers = layer.ffn_all_reduce_deferred
         self.fuse_final_norm_allreduce = prev_defers
 
@@ -462,11 +494,19 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
 
         # EAGLE3 is not yet compatible with pipeline parallel
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
-        for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
-            hidden_states, residual = layer(positions, hidden_states, residual)
-            self._maybe_add_hidden_state(
-                aux_hidden_states, idx + 1, hidden_states, residual
+        for idx, layer in enumerate(
+            self.layers[self.start_layer : self.end_layer], start=self.start_layer
+        ):
+            hidden_states, residual, preceding_layer_state = layer(
+                positions, hidden_states, residual
             )
+            # The next layer's input norm already reduced and added the
+            # preceding layer's state. Reuse that result for the selected aux.
+            # Index 0 is the embedding, already collected before the loop.
+            if idx > 0 and idx in self.aux_hidden_state_layers:
+                self._maybe_add_hidden_state(
+                    aux_hidden_states, idx, preceding_layer_state, None
+                )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -474,15 +514,53 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             )
 
         if self.fuse_final_norm_allreduce:
-            hidden_states, _ = fused_allreduce_gemma_rms_norm(
+            hidden_states, final_pre_norm = fused_allreduce_gemma_rms_norm(
                 hidden_states, residual, self.norm
             )
         else:
-            hidden_states, _ = self.norm(hidden_states, residual)
+            hidden_states, final_pre_norm = self.norm(hidden_states, residual)
+
+        if self.end_layer in self.aux_hidden_state_layers:
+            self._maybe_add_hidden_state(
+                aux_hidden_states, self.end_layer, final_pre_norm, None
+            )
 
         if len(aux_hidden_states) > 0:
+            bridge = getattr(self, "_dspark_context_bridge", None)
+            if bridge is not None:
+                bridge(aux_hidden_states)
+                return hidden_states, []
             return hidden_states, aux_hidden_states
         return hidden_states
+
+    def bind_draft_context(self, projection, output: torch.Tensor) -> bool:
+        """Bind a fixed context destination for this model's auxiliary-state order.
+
+        Called before graph capture, only for sequential PP1/CP1 execution.
+        The speculator owns the output storage until its proposal completes.
+        """
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+        from vllm_iluvatar.v1.worker.gpu.spec_decode.dspark.buffers import (
+            IluTargetDraftBuffer,
+        )
+
+        num_layers = len(self.aux_hidden_state_layers)
+        if (
+            not isinstance(projection.quant_method, UnquantizedLinearMethod)
+            or projection.bias is not None
+            or projection.weight.dtype != torch.bfloat16
+            or output.dtype != torch.bfloat16
+            or projection.weight.device != output.device
+            or num_layers == 0
+            or projection.input_size != num_layers * self.config.hidden_size
+            or projection.output_size != output.shape[1]
+        ):
+            return False
+        self._dspark_context_bridge = IluTargetDraftBuffer(
+            projection, output, num_layers
+        )
+        return True
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Checkpoint experts use w1=gate, w2=down, w3=up.
@@ -555,6 +633,16 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             # ModelOpt MXFP8 layers expose them as ``weight_scale``.
             if "weight_scale_inv" in name:
                 name = name.replace("weight_scale_inv", "weight_scale")
+
+            if ".experts." in name:
+                if name.endswith(".weight_packed"):
+                    name = name.removesuffix(".weight_packed") + ".weight"
+                elif name.endswith(".weight_global_scale"):
+                    name = name.removesuffix(".weight_global_scale") + ".weight_scale_2"
+                    loaded_weight = loaded_weight.float().reciprocal()
+                elif name.endswith(".input_global_scale"):
+                    name = name.removesuffix(".input_global_scale") + ".input_scale"
+                    loaded_weight = loaded_weight.float().reciprocal()
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:

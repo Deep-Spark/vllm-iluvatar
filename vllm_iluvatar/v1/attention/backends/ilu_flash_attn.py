@@ -27,10 +27,7 @@ from ixformer.contrib.vllm_flash_attn import (
 )
 from ixformer.inference.functions import flash_attn_unpad_with_kvcache_fp8
 from vllm import _custom_ops as ops  # type: ignore[import]
-from vllm.config import (
-    VllmConfig,
-    get_current_vllm_config_or_none,
-)
+from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
@@ -47,15 +44,13 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.attention.backends.fa_utils import (
-    is_flash_attn_varlen_func_available,
-)
+from vllm.v1.attention.backends.fa_utils import is_flash_attn_varlen_func_available
 from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     split_decodes_and_prefills,
 )
 from vllm.v1.attention.ops.dcp import cp_lse_ag_out_rs, dcp_a2a_lse_reduce
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_iluvatar.v1.attention.ilu_static_quant import (
@@ -370,12 +365,15 @@ class IluFlashAttentionMetadataBuilder(
         key_start_loc = torch.zeros(num_reqs + 1, dtype=torch.int32, device=self.device)
         torch.cumsum(seq_lens[:num_reqs], dim=0, out=key_start_loc[1:])
 
-        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-            split_decodes_and_prefills(
-                common_attn_metadata,
-                decode_threshold=self.reorder_batch_threshold,
-                require_uniform=(self.query_len_support != QueryLenSupport.VARLEN),
-            )
+        (
+            num_decodes,
+            num_prefills,
+            num_decode_tokens,
+            num_prefill_tokens,
+        ) = split_decodes_and_prefills(
+            common_attn_metadata,
+            decode_threshold=self.reorder_batch_threshold,
+            require_uniform=(self.query_len_support != QueryLenSupport.VARLEN),
         )
         assert num_decodes + num_prefills == num_reqs
         assert num_decode_tokens + num_prefill_tokens == num_actual_tokens
@@ -473,12 +471,28 @@ class IluFlashAttentionMetadataBuilder(
             if use_graph:
                 max_decode_seq_len = block_table_tensor.shape[1] * self.block_size
             else:
-                max_decode_seq_len = int(decode_seq_lens.max().item())
+                # This scalar sizes the kernel's work; exact per-row lengths
+                # remain on device. Async speculative decoding may supply only
+                # an upper bound, which is sufficient here and avoids a D2H sync.
+                seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+                max_decode_seq_len = (
+                    int(seq_lens_cpu[:num_decodes].max())
+                    if seq_lens_cpu is not None
+                    else max_seq_len
+                )
+            # Use only the decode prefix: a mixed batch's max_query_len can
+            # describe a much longer prefill. CPU query offsets include padding.
+            decode_query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[
+                : num_decodes + 1
+            ]
+            max_decode_query_len = int(
+                (decode_query_start_loc_cpu[1:] - decode_query_start_loc_cpu[:-1]).max()
+            )
             decode_metadata = IluFlashAttentionDecodeMetadata(
                 block_table=block_table_tensor[:num_decodes],
                 query_start_loc=decode_query_start_loc,
                 seq_lens=decode_seq_lens,
-                max_query_len=decode_query_lens.max().item(),
+                max_query_len=max_decode_query_len,
                 max_decode_seq_len=max_decode_seq_len,
                 use_graph=use_graph,
                 cu_seqlens_q=decode_cu_seqlens_q,
@@ -944,7 +958,91 @@ class IluFlashAttentionImpl(AttentionImpl):
                 )
             else:
                 decode_q = query[:num_decode_tokens]
-                if self.head_size >= 512:
+                # Multi-query SWA reads current device metadata, including graph
+                # padding. Unsupported or unprofitable shapes keep the backend.
+                if (
+                    getattr(layer, "_ilu_step5_native_decode", False)
+                    and self.head_size == 192
+                    and decode_q.dtype == torch.bfloat16
+                    and key_cache.dtype == torch.bfloat16
+                    and key_cache.shape[2] == 16
+                    and key_cache.stride(3) == 1
+                    and key_cache.stride(2) in (192, 384)
+                    and key_cache.stride(1) == 16 * key_cache.stride(2)
+                    and key_cache.stride(0) == key_cache.shape[1] * key_cache.stride(1)
+                    and decode_q.shape[1] // key_cache.shape[1] in (8, 16)
+                    and decode_q.is_contiguous()
+                    and decode_output.is_contiguous()
+                    and all(
+                        x.data_ptr() % 16 == 0
+                        for x in (decode_q, key_cache, value_cache, decode_output)
+                    )
+                    and 1 < attn_metadata.decode.max_query_len <= 4
+                    and decode_q.shape[0] * key_cache.shape[1] <= 64
+                    and attn_metadata.decode.max_decode_seq_len > 128
+                    and self.alibi_slopes is None
+                    and self.sinks is None
+                    and not self.logits_soft_cap
+                    and self.sliding_window == (511, 0)
+                ):
+                    from ixformer.inference.functions.models.step5.attention.float.multi_query_swa import (
+                        multi_query_swa,
+                    )
+
+                    multi_query_swa(
+                        decode_q,
+                        key_cache,
+                        value_cache,
+                        attn_metadata.decode.block_table,
+                        attn_metadata.decode.seq_lens,
+                        attn_metadata.decode.query_start_loc,
+                        attn_metadata.decode.max_decode_seq_len,
+                        self.scale,
+                        decode_output,
+                    )
+                elif (
+                    getattr(layer, "_ilu_step5_native_decode", False)
+                    and self.head_size == 192
+                    and decode_q.dtype == torch.bfloat16
+                    and key_cache.dtype == torch.bfloat16
+                    and key_cache.shape[2] == 16
+                    and key_cache.stride(3) == 1
+                    and key_cache.stride(2) in (192, 384)
+                    and key_cache.stride(1) == 16 * key_cache.stride(2)
+                    and key_cache.stride(0) == key_cache.shape[1] * key_cache.stride(1)
+                    and decode_q.shape[1] // key_cache.shape[1] in (8, 16)
+                    and decode_q.is_contiguous()
+                    and decode_output.is_contiguous()
+                    and all(
+                        x.data_ptr() % 16 == 0
+                        for x in (decode_q, key_cache, value_cache, decode_output)
+                    )
+                    and attn_metadata.decode.max_query_len == 1
+                    and decode_q.shape[0] == attn_metadata.decode.seq_lens.shape[0]
+                    and self.alibi_slopes is None
+                    and self.sinks is None
+                    and not self.logits_soft_cap
+                    and self.sliding_window in (None, (-1, -1), (511, 0))
+                ):
+                    from ixformer.inference.functions.models.step5.attention.float.paged_decode import (
+                        paged_decode,
+                    )
+
+                    paged_decode(
+                        decode_q,
+                        key_cache,
+                        value_cache,
+                        attn_metadata.decode.block_table,
+                        attn_metadata.decode.seq_lens,
+                        attn_metadata.decode.max_decode_seq_len,
+                        -1 if self.sliding_window in (None, (-1, -1)) else 511,
+                        self.scale,
+                        decode_output,
+                    )
+                # The installed cuInfer binary predates packed token-stride
+                # support despite its newer header. Its correct varlen path
+                # remains available for features/layouts outside the new API.
+                elif self.head_size >= 512 or key_cache.stride(-2) != self.head_size:
                     sliding_window_size = (
                         list(self.sliding_window)
                         if self.sliding_window is not None
@@ -957,7 +1055,7 @@ class IluFlashAttentionImpl(AttentionImpl):
                         out=decode_output,
                         cu_seqlens_q=attn_metadata.decode.cu_seqlens_q,
                         cu_seqlens_k=attn_metadata.decode.cu_seqlens_k,
-                        max_seqlen_q=1,
+                        max_seqlen_q=attn_metadata.decode.max_query_len,
                         max_seqlen_k=attn_metadata.decode.max_decode_seq_len,
                         softmax_scale=self.scale,
                         causal=True,
@@ -1510,18 +1608,36 @@ class IluFlashAttentionImpl(AttentionImpl):
         ):
             return
 
-        key_cache, value_cache = kv_cache.unbind(0)
-
-        ops.reshape_and_cache_flash(
-            key,
-            value,
-            key_cache,
-            value_cache,
-            slot_mapping,
-            self.kv_cache_dtype,
-            layer._k_scale,
-            layer._v_scale,
-        )
+        # vLLM 0.31 binds the same packed [P,Hkv,B,K|V] view used by
+        # forward(). DFlash/DSpark precompute context through this standalone
+        # entry point, so it must not interpret the old [2,P,...] layout.
+        key_cache = kv_cache[..., : self.head_size]
+        value_cache = kv_cache[..., self.head_size :]
+        if self.is_fp8:
+            dtype = IluFlashAttentionBackend.get_fp8_dtype_for_flashattn(
+                self.kv_cache_dtype
+            )
+            torch.ops._C.reshape_and_cache_fp8(
+                key,
+                value,
+                key_cache.view(dtype),
+                value_cache.view(dtype),
+                slot_mapping,
+                self.kv_cache_dtype,
+                layer._k_scale.reshape(1),
+                layer._v_scale.reshape(1),
+            )
+        else:
+            ops.reshape_and_cache_flash(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                slot_mapping,
+                self.kv_cache_dtype,
+                layer._k_scale,
+                layer._v_scale,
+            )
 
     def _forward_dcp_attention(
         self,
@@ -1799,9 +1915,10 @@ def cascade_attention(
     s_aux: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert alibi_slopes is None, "Cascade attention does not support ALiBi."
-    assert sliding_window == (-1, -1), (
-        "Cascade attention does not support sliding window."
-    )
+    assert sliding_window == (
+        -1,
+        -1,
+    ), "Cascade attention does not support sliding window."
 
     num_tokens = query.shape[0]
     block_size = key_cache.shape[-2]

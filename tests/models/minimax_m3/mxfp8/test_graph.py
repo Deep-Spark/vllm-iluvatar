@@ -46,7 +46,7 @@ def test_routed_experts_receive_the_config_swiglu_parameters():
     assert passed.get("activation") == "'swigluoai_uninterleave'"
 
 
-def test_dense_mlp_uses_community_act_then_linear():
+def test_dense_mlp_preserves_activation_fallback():
     tree = ast.parse(_MODEL_PY.read_text(), filename=str(_MODEL_PY))
     mlp_cls = next(
         node
@@ -71,7 +71,7 @@ def test_dense_mlp_uses_community_act_then_linear():
     assert assigned.get("self.act_fn", "").startswith("SiluAndMulWithClamp(")
     source = ast.unparse(forward_fn)
     assert "self.act_fn(gate_up)" in source
-    assert "self.down_proj(x)" in source
+    assert "down(x)" in source
     assert "enable_fuse_quant" not in ast.unparse(mlp_cls)
     assert "swigluoai_uninterleave_dynamic_scaled_fp8" not in ast.unparse(mlp_cls)
 

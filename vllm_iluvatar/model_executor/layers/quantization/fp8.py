@@ -71,17 +71,15 @@ from vllm.model_executor.layers.fused_moe import (
     RoutedExperts,
     SharedExperts,
 )
-from vllm.model_executor.layers.fused_moe.config import (
-    mxfp4_w4a8_moe_quant_config,
-)
+from vllm.model_executor.layers.fused_moe.config import mxfp4_w4a8_moe_quant_config
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEExpertsModular,
     FusedMoEPrepareAndFinalizeModular,
 )
-from vllm.model_executor.layers.linear import (
-    LinearBase,
-    UnquantizedLinearMethod,
+from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+    resolve_fp8_moe_weight_block_shape,
 )
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.fp8 import (
     Fp8Config,
@@ -92,7 +90,10 @@ from vllm.model_executor.layers.quantization.online.fp8 import OnlineLinearBase
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_scale_parameter,
 )
-from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    is_layer_skipped,
+    kFp8Dynamic128Sym,
+)
 from vllm.model_executor.model_loader.reload.layerwise import (
     initialize_online_processing,
 )
@@ -102,21 +103,22 @@ from vllm.model_executor.parameter import (
 )
 from vllm.model_executor.utils import replace_parameter
 
+from vllm_iluvatar.model_executor.layers.fused_moe.activation import (
+    swiglustep_limit,
+)
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
     _ixmm_backend_available,
     ilu_mxfp4_fused_experts,
 )
 from vllm_iluvatar.model_executor.layers.quantization import IluvatarQuantRegistry
+from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8_input import IluFP8Input
 from vllm_iluvatar.model_executor.layers.quantization.ilu_modelopt_nvfp4 import (
-    _SWIGLUSTEP_CLAMP,
     _get_ilu_output_scale,
 )
 from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime_quant_config import (
     dtype_name,
     resolve_ilu_runtime_method,
 )
-from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8Dynamic128Sym
-from vllm.model_executor.layers.fused_moe.oracle.fp8 import resolve_fp8_moe_weight_block_shape
 
 # Process this many experts per dequant/requant temporary. Dequanting w13 across
 # all local experts at once would allocate several GB of fp32; mirror the
@@ -126,6 +128,36 @@ _IXMM_GROUP_SIZE = 256
 _FP4_MAX_MAG = 6.0
 _IXMM_FP8_GEMV_MAX_M = 16
 logger = init_logger(__name__)
+
+
+def _can_fuse_bf16_fp8_gemv(x, layer, gemm_format, bias):
+    if not (
+        x.is_cuda
+        and x.dtype == torch.bfloat16
+        and 1 <= x.shape[0] <= 6
+        and 64 <= x.shape[1] <= 8192
+        and x.shape[1] % 64 == 0
+        and x.stride(1) == 1
+        and x.stride(0) % 8 == 0
+        and gemm_format == "TN"
+        and getattr(layer, "_can_use_gemm", False)
+        and layer.weight.shape[0] % 32 == 0
+        and layer.weight.stride(1) == 1
+        and layer.weight.stride(0) % 64 == 0
+        and layer.weight_scale.is_contiguous()
+        and (bias is None or bias.is_contiguous())
+    ):
+        return False
+    # Runtime pointer checks stay in the native op for compiled graphs.
+    if not torch.compiler.is_compiling() and (
+        x.data_ptr() % 16
+        or layer.weight.data_ptr() % 16
+        or (bias is not None and bias.data_ptr() % 4)
+    ):
+        return False
+    from ixformer.cuda import cuda_arch
+
+    return cuda_arch == "ivcore30"
 
 
 @IluvatarQuantRegistry.register_method
@@ -440,6 +472,8 @@ class IluFp8PerChannelOnlineLinearMethod(OnlineLinearBase):
         if layer.weight.data_ptr() != weight_ptr:
             raise RuntimeError("online FP8 quantization replaced the weight buffer")
 
+        # This scale is generated from BF16 staging, never loaded from checkpoint.
+        layer.weight_scale.ilu_derived_at_load = True
         staging_by_name.pop("weight")
         if not staging_by_name:
             layer.__dict__.pop("_ilu_fp8_staging", None)
@@ -454,16 +488,29 @@ class IluFp8PerChannelOnlineLinearMethod(OnlineLinearBase):
             self.gemm_format == "TN",
         )
 
+    def supports_prequantized_input(self, layer: torch.nn.Module) -> bool:
+        """Whether this initialized layer consumes per-token E4M3 activations."""
+        return (
+            not getattr(layer, "_ilu_fp8_online_fallback_reason", None)
+            and layer.weight.dtype == torch.float8_e4m3fn
+            and hasattr(layer, "weight_scale")
+            and (not hasattr(layer, "input_is_parallel") or layer.input_is_parallel)
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: torch.Tensor | IluFP8Input,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         fallback_reason = getattr(layer, "_ilu_fp8_online_fallback_reason", None)
         runtime_context = self._get_runtime_context()
         if runtime_context is not None:
             runtime_context.assert_validation_complete()
+        if isinstance(x, tuple) and not isinstance(x, IluFP8Input):
+            raise TypeError("Prequantized linear input must use IluFP8Input")
+        if isinstance(x, IluFP8Input) and not self.supports_prequantized_input(layer):
+            raise ValueError("This linear layer cannot consume prequantized FP8 input")
         if fallback_reason:
             return self._get_fallback_method().apply(layer, x, bias)
         if layer.weight.dtype != torch.float8_e4m3fn or not hasattr(
@@ -474,8 +521,26 @@ class IluFp8PerChannelOnlineLinearMethod(OnlineLinearBase):
                 "requires a float8_e4m3fn weight and per-channel weight_scale"
             )
 
+        prequantized = isinstance(x, IluFP8Input)
+        if prequantized:
+            x, scale_x, output_dtype = x
+            if (
+                x.ndim < 2
+                or x.dtype != torch.float8_e4m3fn
+                or not x.is_contiguous()
+                or not x.is_cuda
+                or x.device != layer.weight.device
+                or x.shape[-1] != layer.input_size_per_partition
+                or scale_x.dtype != torch.float32
+                or scale_x.device != x.device
+                or not scale_x.is_contiguous()
+                or scale_x.shape != (*x.shape[:-1], 1)
+                or output_dtype != torch.bfloat16
+            ):
+                raise ValueError("invalid prequantized FP8 activation contract")
+        else:
+            output_dtype = x.dtype
         x_2d = x.reshape(-1, x.shape[-1])
-        qx, scale_x = fp8_per_token_dynamic_scaled(x_2d)
 
         output = torch.empty(
             (x_2d.shape[0], layer.output_size_per_partition),
@@ -484,6 +549,19 @@ class IluFp8PerChannelOnlineLinearMethod(OnlineLinearBase):
         )
         bias = None if bias is None else bias.to(torch.bfloat16)
 
+        if not prequantized and _can_fuse_bf16_fp8_gemv(
+            x_2d, layer, self.gemm_format, bias
+        ):
+            ixfops.per_channel_gemv_bf16_fp8_bf16(
+                x_2d, layer.weight, layer.weight_scale, output, bias
+            )
+            return output.view(*x.shape[:-1], layer.output_size_per_partition)
+
+        if prequantized:
+            qx = x_2d
+            scale_x = scale_x.reshape(-1)
+        else:
+            qx, scale_x = fp8_per_token_dynamic_scaled(x_2d)
         scale_w = layer.weight_scale
         m = qx.shape[0]
         can_use_gemm = getattr(layer, "_can_use_gemm", False)
@@ -504,7 +582,7 @@ class IluFp8PerChannelOnlineLinearMethod(OnlineLinearBase):
                 qx, layer.weight, scale_x, scale_w, output, bias, backend="ixmm"
             )
 
-        result = output.to(x.dtype) if x.dtype != torch.bfloat16 else output
+        result = output.to(output_dtype) if output_dtype != torch.bfloat16 else output
         return result.view(*x.shape[:-1], layer.output_size_per_partition)
 
 
@@ -600,7 +678,6 @@ class IluFp8LinearMethod(Fp8LinearMethod):
         if self.block_quant:
             return super().apply(layer, x, bias)
         x_2d = x.reshape(-1, x.shape[-1])
-        qx, scale_x = fp8_per_token_dynamic_scaled(x_2d)
 
         output = torch.empty(
             (x_2d.shape[0], layer.output_size_per_partition),
@@ -609,6 +686,13 @@ class IluFp8LinearMethod(Fp8LinearMethod):
         )
         bias = None if bias is None else bias.to(torch.bfloat16)
 
+        if _can_fuse_bf16_fp8_gemv(x_2d, layer, self.gemm_format, bias):
+            ixfops.per_channel_gemv_bf16_fp8_bf16(
+                x_2d, layer.weight, layer.weight_scale, output, bias
+            )
+            return output.view(*x.shape[:-1], layer.output_size_per_partition)
+
+        qx, scale_x = fp8_per_token_dynamic_scaled(x_2d)
         scale_w = layer.weight_scale
         m = qx.shape[0]
         can_use_gemm = getattr(layer, "_can_use_gemm", False)
@@ -799,7 +883,7 @@ class IluFp8MoEMethod(Fp8MoEMethod):
         # Block quant stores per-block scales under ``*_weight_scale_inv``; the
         # inherited ``create_weights`` reads this name.
         self.weight_scale_name = "weight_scale_inv"
-        
+
         self.weight_scale_refine: tuple[int, int] | None = None
         self.moe_block_shape = self.weight_block_size
 
@@ -815,7 +899,7 @@ class IluFp8MoEMethod(Fp8MoEMethod):
                 self.quant_config.is_checkpoint_fp8_serialized,
             )
         )
-        
+
         # No community backend is selected: the ix30 path is our own compute.
         self.fp8_backend = None
         self.moe_kernel = None
@@ -862,7 +946,11 @@ class IluFp8MoEMethod(Fp8MoEMethod):
         self, layer: RoutedExperts
     ) -> FusedMoEQuantConfig | None:
         activation = getattr(layer.activation, "value", layer.activation)
-        swiglu_limit = _SWIGLUSTEP_CLAMP if activation == "swiglustep" else None
+        swiglu_limit = (
+            swiglustep_limit(getattr(layer, "swiglu_limit", None))
+            if activation == "swiglustep"
+            else None
+        )
         return mxfp4_w4a8_moe_quant_config(
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
@@ -1022,7 +1110,12 @@ class IluFp8MoEMethod(Fp8MoEMethod):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         activation = getattr(layer, "activation", "silu")
-        swiglu_limit = _SWIGLUSTEP_CLAMP if activation == "swiglustep" else 0.0
+        activation = getattr(activation, "value", activation)
+        swiglu_limit = (
+            swiglustep_limit(getattr(layer, "swiglu_limit", None))
+            if activation == "swiglustep"
+            else 0.0
+        )
         return ilu_mxfp4_fused_experts(
             hidden_states=x,
             w13_weight=layer.w13_weight,
@@ -1176,9 +1269,10 @@ class IluFp8Config(Fp8Config):
     # checkpoint's original dispatch, then optionally overlay a strictly
     # validated additional_config.ilu_quant method.
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
-        original_method, original_disposition = (
-            self._get_original_method_and_disposition(layer, prefix)
-        )
+        (
+            original_method,
+            original_disposition,
+        ) = self._get_original_method_and_disposition(layer, prefix)
         runtime_method = resolve_ilu_runtime_method(
             base_quant_config=self,
             original_method=original_method,

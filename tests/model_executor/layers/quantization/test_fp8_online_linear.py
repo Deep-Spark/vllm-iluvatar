@@ -11,7 +11,7 @@ from vllm.model_executor import parameter as parameter_module
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.parameter import ModelWeightParameter
 
-from vllm_iluvatar.model_executor.layers.quantization import ilu_fp8
+from vllm_iluvatar.model_executor.layers.quantization import fp8 as ilu_fp8
 
 
 @pytest.fixture(autouse=True)
@@ -141,6 +141,7 @@ def test_loader_quantizes_into_stable_fp8_buffer_bit_exact(monkeypatch):
     weight_ptr = layer.weight.data_ptr()
 
     method.process_weights_after_loading(layer)
+    assert layer.weight_scale.ilu_derived_at_load
 
     assert layer.weight.data_ptr() == weight_ptr
     assert torch.equal(layer.weight.float(), expected_weight.float())

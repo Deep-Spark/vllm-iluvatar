@@ -29,6 +29,7 @@ testpaths = ["tests"]
 # kernel/layer/model test modules resolves to tests/conftest.py.
 pythonpath = [".", "tests"]
 markers = [
+    "ixinfer: exercises the installed external ixinfer backend",
     "legacy_drift: optional old/new numerical compatibility diagnostic",
 ]
 

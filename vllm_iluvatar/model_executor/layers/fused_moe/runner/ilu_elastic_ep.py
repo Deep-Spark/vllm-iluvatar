@@ -182,7 +182,7 @@ def ilu_modular_apply(
 
     # Fork delta formerly patched community fused_moe.py. Keep this dispatch in
     # the plugin so community fused_moe.py stays identical to upstream main.
-    from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe import (
+    from vllm_iluvatar.model_executor.layers.fused_moe.fused_moe import (
         ilu_w16a16_fused_experts,
     )
 
@@ -193,10 +193,13 @@ def ilu_modular_apply(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         activation=layer.activation,
+        weight_format=layer.__dict__.get("_ilu_w16a16_weight_format", "TN"),
         apply_router_weight_on_input=layer.apply_router_weight_on_input,
         global_num_experts=layer.global_num_experts,
-        expert_map=layer.expert_map,
         quant_config=modular_method.moe_quant_config,
+        expert_map=layer.expert_map,
+        step5_native_activation=getattr(layer, "_ilu_step5_native_activation", False),
+        swiglu_limit=getattr(layer, "swiglu_limit", None),
     )
 
 

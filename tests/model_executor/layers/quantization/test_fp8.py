@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU-only OOT-interface tests for the Iluvatar block-FP8 MoE config.
 
-Pins the registration / routing contract of ``ilu_fp8.py`` without a GPU or the
+Pins the registration / routing contract of ``fp8.py`` without a GPU or the
 ixmm backend:
 
 * ``@register_quantization_config("fp8")`` shadows the community name and the
@@ -49,7 +49,7 @@ def _install_fake_ixformer(monkeypatch) -> None:
 def _load_ilu_fp8(monkeypatch):
     _install_fake_ixformer(monkeypatch)
     return importlib.import_module(
-        "vllm_iluvatar.model_executor.layers.quantization.ilu_fp8"
+        "vllm_iluvatar.model_executor.layers.quantization.fp8"
     )
 
 
@@ -172,11 +172,20 @@ def test_method_init_skips_backend_selection(monkeypatch):
     monkeypatch.setattr(community_fp8, "select_fp8_moe_backend", _boom)
     # Decouple from the heavy base initialiser (env / distributed state).
     monkeypatch.setattr(
-        mod.FusedMoEMethodBase, "__init__", lambda self, moe_config: None
+        mod.FusedMoEMethodBase,
+        "__init__",
+        lambda self, moe_config: setattr(self, "moe", moe_config),
     )
 
     config = mod.IluFp8Config.from_config(_BLOCK_CONFIG)
-    layer = types.SimpleNamespace(moe_config=object())
+    layer = types.SimpleNamespace(
+        moe_config=types.SimpleNamespace(
+            intermediate_size_per_partition=256,
+            hidden_dim=256,
+            tp_size=1,
+            moe_backend="auto",
+        )
+    )
     method = mod.IluFp8MoEMethod(config, layer)
 
     assert method.fp8_backend is None
@@ -286,7 +295,7 @@ def test_preprocess_pads_k_to_ixmm_group_boundary(monkeypatch):
         preprocess_group_scale_for_running_acc=lambda x: x,
     )
     # ixformer 3817cf75: fp4 gemm 从 functions.fp4.gemm 移到
-    # functions.ops.gemm.fp4.gemm（ilu_fp8.py 按新路径懒加载）。
+    # functions.ops.gemm.fp4.gemm（fp8.py 按新路径懒加载）。
     fp4_module = types.ModuleType("ixformer.inference.functions.ops.gemm.fp4")
     gemm_module = types.ModuleType("ixformer.inference.functions.ops.gemm.fp4.gemm")
     gemm_module.gemm = fake_gemm
@@ -307,3 +316,32 @@ def test_preprocess_pads_k_to_ixmm_group_boundary(monkeypatch):
     assert ixmm_scale.shape == (1, 3, 2)
     assert captured["normalized"].shape == (1, 768, 2)
     assert torch.count_nonzero(captured["normalized"][:, 640:, :]) == 0
+
+
+@pytest.mark.parametrize("limit", [3.0, 10.0])
+def test_layer_limit_reaches_quantized_moe(monkeypatch, limit):
+    mod = _load_ilu_fp8(monkeypatch)
+    method = object.__new__(mod.IluFp8MoEMethod)
+    layer = types.SimpleNamespace(
+        activation="swiglustep",
+        swiglu_limit=limit,
+        w13_weight=torch.empty(1),
+        w2_weight=torch.empty(1),
+        w13_weight_scale=torch.empty(1),
+        w2_weight_scale=torch.empty(1),
+        expert_map=None,
+    )
+    config = method.get_fused_moe_quant_config(layer)
+    assert config.gemm1_clamp_limit == limit
+    from unittest.mock import patch
+
+    with patch.object(mod, "ilu_mxfp4_fused_experts") as experts:
+        method.apply(
+            layer,
+            torch.empty(1, 2),
+            torch.ones(1, 1),
+            torch.zeros(1, 1, dtype=torch.int32),
+            None,
+            None,
+        )
+    assert experts.call_args.kwargs["swiglu_limit"] == limit

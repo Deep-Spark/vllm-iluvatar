@@ -36,6 +36,7 @@ from vllm import envs, ir
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.determinism.batch_invariant import rms_norm_batch_invariant
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
+from vllm.triton_utils import tl, triton
 
 
 def fused_add_rms_norm(
@@ -233,3 +234,51 @@ class IluGemmaRMSNorm(GemmaRMSNorm):
             "supported for 2D inputs."
         )
         return self.forward_native(x, residual)
+
+
+@triton.jit
+def _batched_gemma_rms_norm(
+    K,
+    W,
+    Y,
+    N: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    SL: tl.constexpr,
+    ST: tl.constexpr,
+    SH: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    layer = tl.program_id(1)
+    d = tl.arange(0, BLOCK)
+    x = tl.load(
+        K + layer * SL + (row // H) * ST + (row % H) * SH + d, d < D, other=0
+    ).to(tl.float32)
+    w = tl.load(W + layer * D + d, d < D, other=0).to(tl.float32)
+    variance = tl.sum(x * x, 0) / D
+    y = (x * tl.rsqrt(variance + EPS)) * (1.0 + w)
+    tl.store(Y + (layer * N * H + row) * D + d, y, d < D)
+
+
+def batched_gemma_rms_norm(k, weights, eps):
+    """Read strided K from packed KV and write the final contiguous RoPE input."""
+    layers, tokens, heads, dim = k.shape
+    out = torch.empty(k.shape, dtype=k.dtype, device=k.device)
+    if tokens:
+        _batched_gemma_rms_norm[(tokens * heads, layers)](
+            k,
+            weights,
+            out,
+            tokens,
+            heads,
+            dim,
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            eps,
+            triton.next_power_of_2(dim),
+            enable_fp_fusion=False,
+        )
+    return out

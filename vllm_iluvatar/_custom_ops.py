@@ -564,13 +564,14 @@ def reshape_and_cache_flash(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
 ) -> None:
-    assert kv_cache_dtype in ("auto", "float16", "bfloat16"), kv_cache_dtype
+    # The unquantized ixformer facade follows tensor dtype and now accepts
+    # five tensor arguments. Quantized cache writes use separate operators.
+    if kv_cache_dtype not in ("auto", "float16", "bfloat16"):
+        raise ValueError(f"Unquantized cache writer cannot use {kv_cache_dtype!r}")
+    if key.dtype != key_cache.dtype or value.dtype != value_cache.dtype:
+        raise ValueError("Unquantized cache input and backing dtypes must match")
     ixf_ops.reshape_and_cache_flash(
-        key,
-        value,
-        key_cache,
-        value_cache,
-        slot_mapping,
+        key, value, key_cache, value_cache, slot_mapping, backend="ixformer_perf"
     )
 
 

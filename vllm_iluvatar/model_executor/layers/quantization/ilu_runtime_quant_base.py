@@ -4,7 +4,7 @@
 Target   : new Iluvatar-only quantization config, registered as ``ilu_runtime``
 Baseline : v0.31.0 (db9527a468)
 Why      : ``additional_config.ilu_quant`` is resolved from a *base* quant
-           config's ``get_quant_method`` (``ilu_fp8.py:1088``). A native
+           config's ``get_quant_method`` (``fp8.py:1088``). A native
            BF16/FP16 checkpoint has no ``quantization_config``, so
            ``ModelConfig.quantization`` stays ``None``, vLLM never builds a base
            config, ``get_quant_method`` is never called, and the entire

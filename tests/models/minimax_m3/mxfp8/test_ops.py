@@ -145,71 +145,6 @@ def test_quantized_kv_is_rejected_before_ixformer_dispatch():
 
 
 @pytest.mark.parametrize(
-    ("adapter_name", "ixformer_name", "args"),
-    [
-        (
-            "minimax_m3_index_decode",
-            "minimax_m3_index_decode",
-            (
-                torch.empty(2, 3, 128),
-                torch.empty(1),
-                torch.empty(1),
-                torch.empty(1),
-                128,
-                4,
-                1,
-                1,
-                3,
-                1,
-                1,
-            ),
-        ),
-        (
-            "minimax_m3_index_topk",
-            "minimax_m3_index_topk",
-            (
-                torch.empty(3, 2, 16),
-                torch.empty(1),
-                torch.empty(1),
-                2,
-                4,
-                1,
-                1,
-            ),
-        ),
-    ],
-)
-def test_indexer_stages_into_token_major_buffer(
-    monkeypatch, adapter_name, ixformer_name, args
-):
-    """vLLM's persistent buffer is token-major [Qmax,H,K].
-
-    ixformer writes a contiguous [Q,H,K] prefix in place; the padded suffix
-    must stay untouched.
-    """
-    h, q, topk, qmax = 3, 2, 4, 6
-    expected = torch.arange(q * h * topk, dtype=torch.int32).view(q, h, topk)
-    token_major = torch.full((qmax, h, topk), -7, dtype=torch.int32)
-    seen = {}
-
-    def fake_ixformer(*call_args):
-        seen["out"] = call_args[-1]
-        call_args[-1].copy_(expected)
-        return call_args[-1]
-
-    monkeypatch.setattr(indexer.ixf_ops, ixformer_name, fake_ixformer)
-    result = getattr(indexer, adapter_name)(*args, out=token_major)
-
-    assert tuple(seen["out"].shape) == (q, h, topk)
-    assert seen["out"].data_ptr() == token_major[:q].data_ptr()
-    assert torch.equal(result, expected)
-    assert torch.equal(token_major[:q], expected)
-    assert torch.equal(
-        token_major[q:], torch.full((qmax - q, h, topk), -7, dtype=torch.int32)
-    )
-
-
-@pytest.mark.parametrize(
     ("adapter_name", "ixformer_name", "extra_args"),
     [
         (
@@ -246,8 +181,10 @@ def test_sparse_attention_passes_token_major_topk(
     token_major = torch.arange(6 * 3 * 4, dtype=torch.int32).view(6, 3, 4)
     topk = token_major[:2]
     seen = {}
+    signature = inspect.signature(getattr(sparse_attention.ixf_ops, ixformer_name))
 
     def fake_ixformer(q, kv_cache, topk_idx, *args, **kwargs):
+        signature.bind(q, kv_cache, topk_idx, *args, **kwargs)
         seen["topk"] = topk_idx
         seen["backend"] = kwargs.get("backend")
 

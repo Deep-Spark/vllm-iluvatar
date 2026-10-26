@@ -13,12 +13,12 @@ from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMetho
 from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
-from vllm_iluvatar.model_executor.layers.quantization import ilu_fp8
+from vllm_iluvatar.model_executor.layers.quantization import fp8 as ilu_fp8
+from vllm_iluvatar.model_executor.layers.quantization.fp8 import (
+    IluFp8PerChannelOnlineLinearMethod,
+)
 from vllm_iluvatar.model_executor.layers.quantization.ilu_fp16_to_fp4_moe import (
     IluFp16ToFp4OnlineMoEMethod,
-)
-from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8 import (
-    IluFp8PerChannelOnlineLinearMethod,
 )
 from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime_quant_base import (
     IluRuntimeQuantBaseConfig,
@@ -176,7 +176,18 @@ def _experts(prefix: str) -> RoutedExperts:
     layer = object.__new__(RoutedExperts)
     torch.nn.Module.__init__(layer)
     layer.prefix = prefix
-    layer.moe_config = SimpleNamespace()
+    layer.moe_config = SimpleNamespace(
+        is_act_and_mul=True,
+        w13_num_shards=2,
+        tp_shard_with_padding=False,
+        hidden_dim=256,
+        hidden_dim_unpadded=256,
+        intermediate_size=256,
+        intermediate_size_per_partition=256,
+        intermediate_size_per_partition_unpadded=None,
+        tp_size=1,
+        moe_backend="auto",
+    )
     return layer
 
 

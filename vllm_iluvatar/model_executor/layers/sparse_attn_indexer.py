@@ -400,14 +400,18 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
             tuple(6 * batch for batch in range(1, max_num_decode_seqs + 1))
             if owned_decode_state and 1 <= max_num_decode_seqs <= 4 else ()
         )
-        for tokens in self._owned_decode_tokens:
+        if self._owned_decode_tokens:
+            tokens = self._owned_decode_tokens[-1]
             device = topk_indices_buffer.device
             stride = (max_model_len + 31) // 32 * 32
             logits = torch.empty((tokens, stride), dtype=torch.bfloat16,
-                                 device=device)[:, :max_model_len]
+                                 device=device)
             extent = torch.full((tokens,), -1, dtype=torch.int32, device=device)
-            self.register_buffer(f"_owned_decode_logits_{tokens}", logits, persistent=False)
-            self.register_buffer(f"_owned_decode_extent_{tokens}", extent, persistent=False)
+            # Sequential graph shapes reuse physical rows. Exterior validity
+            # therefore belongs to that storage, not to a graph's row count.
+            # Register only owners; derive views after module/device transforms.
+            self.register_buffer("_owned_decode_logits", logits, persistent=False)
+            self.register_buffer("_owned_decode_extent", extent, persistent=False)
 
     def forward_native(
         self,
@@ -438,8 +442,9 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
                         and md.num_prefills == 0 and md.decode is not None
                         and not md.decode.requires_padding
                         and md.num_decode_tokens in self._owned_decode_tokens):
-                    owned_logits = getattr(self, f"_owned_decode_logits_{md.num_decode_tokens}")
-                    previous_extent = getattr(self, f"_owned_decode_extent_{md.num_decode_tokens}")
+                    owned_logits = self._owned_decode_logits[
+                        :md.num_decode_tokens, :self.max_model_len]
+                    previous_extent = self._owned_decode_extent[:md.num_decode_tokens]
         return torch.ops.vllm.ilu_sparse_attn_indexer(
             hidden_states,
             _encode_layer_name(self.k_cache.prefix),

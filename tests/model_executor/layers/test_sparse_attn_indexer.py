@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU-only tests for the Iluvatar sparse attention indexer CustomOp wrapper."""
+"""Indexer wrapper contracts and owned-buffer CUDA graph lifetime tests."""
 
 from __future__ import annotations
 
@@ -237,13 +237,12 @@ def test_owned_buffer_selection_in_forward_context(monkeypatch, default_vllm_con
     assert output is layer.topk_indices_buffer and len(calls) == 1
     if kind.startswith("full"):
         logits, extent = calls[0][-2:]
-        assert logits is getattr(layer, f"_owned_decode_logits_{tokens}")
-        assert extent is getattr(layer, f"_owned_decode_extent_{tokens}")
+        assert logits.data_ptr() == layer._owned_decode_logits.data_ptr()
+        assert extent.data_ptr() == layer._owned_decode_extent.data_ptr()
         assert logits.shape == (tokens, 33) and logits.stride(0) == 64
         assert logits.dtype == torch.bfloat16 and extent.dtype == torch.int32
         assert torch.all(extent == -1)
-        assert layer._owned_decode_logits_6.untyped_storage().data_ptr() != (
-            layer._owned_decode_logits_12.untyped_storage().data_ptr())
+        assert layer._owned_decode_logits.shape == (24, 64)
         assert not any("owned_decode" in name for name in layer.state_dict())
     else:
         assert calls[0][-2:] == (None, None)
@@ -259,15 +258,142 @@ def test_owned_allocation_matches_configured_sequence_limit(
     expected = tuple(range(6, max_seqs * 6 + 1, 6)) if enabled and 1 <= max_seqs <= 4 else ()
     assert layer._owned_decode_tokens == expected
     buffers = dict(layer.named_buffers())
-    assert set(buffers) == {f"_owned_decode_{kind}_{tokens}" for kind in ("logits", "extent")
-                            for tokens in expected}
+    assert set(buffers) == ({"_owned_decode_logits", "_owned_decode_extent"} if expected else set())
     assert sum(t.numel() * t.element_size() for t in buffers.values()) == (
-        sum(expected) * (33 * 2 + 4))
+        (expected[-1] if expected else 0) * (64 * 2 + 4))
     ranges = sorted((t.untyped_storage().data_ptr(),
                      t.untyped_storage().data_ptr() + t.untyped_storage().nbytes())
                     for t in buffers.values())
     assert all(a[1] <= b[0] for a, b in zip(ranges, ranges[1:]))
     assert not layer.state_dict()
+
+
+def test_shared_owner_views_follow_module_storage_transform(monkeypatch, default_vllm_config):
+    from vllm.forward_context import set_forward_context
+
+    sparse = _load_sparse_attn_indexer(monkeypatch)
+    layer = _owned_test_layer(sparse, enabled=True, max_seqs=3)
+    original = layer._owned_decode_logits
+    layer._apply(lambda tensor: tensor.clone())
+    assert original.data_ptr() != layer._owned_decode_logits.data_ptr()
+    calls = []
+    with patch.object(
+        torch.ops.vllm,
+        "ilu_sparse_attn_indexer",
+        lambda *args: calls.append(args) or args[10],
+        create=True,
+    ):
+        for tokens in (6, 18, 12, 6):
+            metadata = {layer.k_cache.prefix: _owned_test_metadata(tokens)}
+            with set_forward_context(metadata, default_vllm_config):
+                layer.forward_cuda(
+                    torch.empty(tokens, 8),
+                    torch.empty(tokens, 32, 128),
+                    torch.empty(tokens, 128),
+                    torch.empty(tokens, 32),
+                )
+            logits, extent = calls[-1][-2:]
+            assert logits.data_ptr() == layer._owned_decode_logits.data_ptr()
+            assert extent.data_ptr() == layer._owned_decode_extent.data_ptr()
+            assert logits.stride(0) == 64
+
+
+@pytest.mark.parametrize("max_seqs", [1, 2, 3, 4])
+def test_owned_graph_shapes_share_physical_extent(
+    monkeypatch, default_vllm_config, max_seqs
+):
+    """Shrink/grow and slot reuse must clear the last physical row contents."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    from ixformer.inference.functions.deepseek.int8_split_cache import (
+        dsa_indexer_mqa_logits_split,
+    )
+
+    sparse = _load_sparse_attn_indexer(monkeypatch)
+    width, length, bs = 8193, 4097, 64
+    tokens = max_seqs * 6
+    layer = sparse.IluSparseAttnIndexer(
+        k_cache=SimpleNamespace(prefix="layer.0.indexer", kv_cache=object()),
+        quant_block_size=128,
+        scale_fmt="ue8m0",
+        topk_tokens=512,
+        head_dim=128,
+        max_model_len=width,
+        max_total_seq_len=width * max_seqs,
+        topk_indices_buffer=torch.empty(
+            (tokens, 512), device="cuda", dtype=torch.int32
+        ),
+        owned_decode_state=True,
+        max_num_decode_seqs=max_seqs,
+    )
+    torch.manual_seed(1026)
+    pages = (length + bs - 1) // bs
+    values = torch.randint(
+        0, 256, (max_seqs * pages, bs, 128), device="cuda", dtype=torch.uint8
+    )
+    scales = torch.rand(max_seqs * pages, bs, device="cuda") * 0.02 + 0.01
+    q = torch.randint(-127, 128, (tokens, 32, 128), device="cuda", dtype=torch.int8)
+    weights = torch.randn(tokens, 32, device="cuda") * 0.001
+    table = torch.randperm(max_seqs * pages, device="cuda").int().view(max_seqs, pages)
+    ends = torch.full((tokens,), length, device="cuda", dtype=torch.int32)
+    cq = torch.arange(max_seqs + 1, device="cuda", dtype=torch.int32) * 6
+    ck = torch.arange(max_seqs + 1, device="cuda", dtype=torch.int32) * length
+    graphs = {}
+
+    def run(batch, owned=True):
+        n = batch * 6
+        return dsa_indexer_mqa_logits_split(
+            q[:n],
+            cq[: batch + 1],
+            ck[: batch + 1],
+            values,
+            scales,
+            table[:batch],
+            weights[:n],
+            max_q_len=6,
+            max_kv_len=length,
+            max_context_len=width,
+            valid_lens=ends[:n],
+            logits=layer._owned_decode_logits[:n, :width] if owned else None,
+            previous_extent=layer._owned_decode_extent[:n] if owned else None,
+        )
+
+    for batch in range(1, max_seqs + 1):
+        run(batch)
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            run(batch)
+        graphs[batch] = g
+    for step, (batch, end) in enumerate(
+        [
+            (1, 17),
+            (max_seqs, length),
+            (max(1, max_seqs - 1), 65),
+            (1, 0),
+            (max_seqs, 1),
+            (1, length),
+            (max_seqs, 0),
+            (max_seqs, length),
+        ]
+    ):
+        ends.fill_(end)
+        if step % 2:
+            table.copy_(table.roll(1, 1))
+            scales.mul_(1.01)
+        untouched = layer._owned_decode_logits[batch * 6 :].clone()
+        untouched_extent = layer._owned_decode_extent[batch * 6 :].clone()
+        graphs[batch].replay()
+        expected = run(batch, False)
+        torch.cuda.synchronize()
+        assert torch.equal(layer._owned_decode_logits[: batch * 6, :width], expected)
+        # Padding is intentionally uninitialized and may contain NaN bits;
+        # guard untouched storage bytewise, including that padding.
+        assert torch.equal(
+            layer._owned_decode_logits[batch * 6 :].view(torch.uint8),
+            untouched.view(torch.uint8),
+        )
+        assert torch.equal(layer._owned_decode_extent[batch * 6 :], untouched_extent)
 
 
 @pytest.mark.parametrize("max_seqs", [1, 2, 3, 5])

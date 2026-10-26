@@ -1118,14 +1118,31 @@ class IluFp8Config(Fp8Config):
         )
 
     def _is_layer_skipped(self, prefix: str) -> bool:
-        """Match exact exclusions and parent-module exclusions."""
-        if is_layer_skipped(
-            prefix=prefix,
-            ignored_layers=self.ignored_layers,
-            fused_mapping=self.packed_modules_mapping,
-        ):
-            return True
-        return any(prefix.startswith(f"{name}.") for name in self.ignored_layers)
+        """Match exact exclusions and parent-module exclusions.
+
+        Step-3.7 VL remaps ``modules_to_not_convert`` onto
+        ``language_model.model.*`` while MTP drafts still build under
+        ``model.*``. Accept both spellings so shared target quant configs
+        still skip BF16 MTP layers (e.g. sliding-attn ``g_proj``).
+        """
+        prefixes = [prefix]
+        if prefix.startswith("model."):
+            prefixes.append(f"language_model.{prefix}")
+        elif prefix.startswith("language_model.model."):
+            prefixes.append(prefix[len("language_model.") :])
+
+        for candidate in prefixes:
+            if is_layer_skipped(
+                prefix=candidate,
+                ignored_layers=self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
+            ):
+                return True
+            if any(
+                candidate.startswith(f"{name}.") for name in self.ignored_layers
+            ):
+                return True
+        return False
 
     def _get_original_method_and_disposition(self, layer: torch.nn.Module, prefix: str):
         if isinstance(layer, LinearBase):

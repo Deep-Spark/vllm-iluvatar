@@ -181,6 +181,47 @@ def test_step3p5_proposer_patch_does_not_wrap_eagle():
     assert Step3p5MTPProposer.propose is not eagle_propose
 
 
+def test_refresh_draft_quant_config_noop_without_spec():
+    from vllm_iluvatar.ilu_patch.general_patches.patch_step3p5_shared_head import (
+        _refresh_draft_quant_config,
+    )
+
+    assert _refresh_draft_quant_config(None) is None
+    cfg = SimpleNamespace(speculative_config=None, quant_config="target-qc")
+    assert _refresh_draft_quant_config(cfg) is cfg
+
+
+def test_refresh_draft_quant_config_replaces_shared_target_config(monkeypatch):
+    from vllm_iluvatar.ilu_patch.general_patches import patch_step3p5_shared_head as mod
+
+    draft_qc = object()
+    calls = {}
+
+    def fake_get_draft_quant_config(vllm_config):
+        calls["cfg"] = vllm_config
+        return draft_qc
+
+    def fake_replace(cfg, **kwargs):
+        return SimpleNamespace(
+            speculative_config=cfg.speculative_config,
+            quant_config=kwargs["quant_config"],
+        )
+
+    monkeypatch.setattr(
+        "vllm.model_executor.models.utils.get_draft_quant_config",
+        fake_get_draft_quant_config,
+    )
+    monkeypatch.setattr("vllm.config.replace", fake_replace)
+
+    cfg = SimpleNamespace(
+        speculative_config=SimpleNamespace(draft_model_config=object()),
+        quant_config="target-qc",
+    )
+    refreshed = mod._refresh_draft_quant_config(cfg)
+    assert calls["cfg"] is cfg
+    assert refreshed.quant_config is draft_qc
+
+
 def test_shared_head_rebind_restores_only_flagged_draft(monkeypatch):
     from vllm_iluvatar.ilu_patch.general_patches.patch_step3p5_shared_head import (
         _wrap_load_eagle_model,

@@ -16,6 +16,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheTensor,
     MLAAttentionSpec,
+    SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
@@ -30,6 +31,7 @@ from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.base_worker 
 from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.fp8_layout import (
     FP8_WIRE_SCRATCH_BUFFER_COUNT,
     get_fp8_wire_scratch_blocks,
+    page_states,
 )
 from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.fp8_staging import (
     FP8DSMLAWireStaging,
@@ -458,13 +460,13 @@ def test_logical_valid_entries_include_chunk_offset():
 
 
 def _indexer_specs(source_dtype, source_head_size):
+    # DeepSeek-V4 indexer specs leave the v0.31 storage_block_size at None.
     source = MLAAttentionSpec(
         block_size=256,
         num_kv_heads=1,
         head_size=source_head_size,
         dtype=source_dtype,
         tokens_per_state=4,
-        storage_block_size=64,
     )
     wire = MLAAttentionSpec(
         block_size=256,
@@ -472,16 +474,84 @@ def _indexer_specs(source_dtype, source_head_size):
         head_size=132,
         dtype=torch.uint8,
         tokens_per_state=4,
-        storage_block_size=64,
         alignment=576,
     )
     return source, wire
 
 
+def test_page_states_reads_rows_with_or_without_storage_override():
+    unset = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        tokens_per_state=4,
+    )
+    # GLM-5.3 kpool sets storage_block_size as a token width.
+    glm_like = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        tokens_per_state=4,
+        storage_block_size=128,
+    )
+    swa = SlidingWindowMLASpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.bfloat16,
+        sliding_window=128,
+    )
+
+    assert unset.storage_block_size is None
+    assert page_states(unset) == 64
+    assert page_states(glm_like) == 32
+    assert not hasattr(swa, "storage_block_size")
+    assert page_states(swa) == 64
+
+
+def test_quantize_pages_accepts_sliding_window_spec(monkeypatch):
+    source_spec = SlidingWindowMLASpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.bfloat16,
+        sliding_window=128,
+    )
+    source = torch.zeros((2, 64, 512), dtype=torch.bfloat16)
+    destination = torch.full((2, 64 * 584), 0xEE, dtype=torch.uint8)
+    calls = {}
+
+    def fake_quantize(rows, dst, slot_mapping, *, block_size, **kwargs):
+        calls["rows"] = rows.shape[0]
+        calls["slots"] = slot_mapping.tolist()
+        calls["block_size"] = block_size
+
+    monkeypatch.setattr(staging_module, "quantize_and_insert_k_cache", fake_quantize)
+    staging = object.__new__(FP8DSMLAWireStaging)
+    staging._quantize_pages(
+        source,
+        destination,
+        torch.tensor([1]),
+        torch.tensor([0]),
+        source_spec,
+        num_tokens=40,
+        total_block_count=1,
+        chunk_offset=0,
+    )
+
+    assert calls["block_size"] == 64
+    assert calls["rows"] == 40
+    assert calls["slots"] == list(range(40))
+    assert destination[0].eq(0).all()
+    assert destination[1].eq(0xEE).all()
+
+
 def test_int8_indexer_staging_transcodes_only_valid_rows(monkeypatch):
     source_spec, wire_spec = _indexer_specs(torch.uint8, 132)
     source = torch.zeros(
-        (2, source_spec.storage_block_size, 132),
+        (2, page_states(source_spec), 132),
         dtype=torch.uint8,
     )
     destination = torch.full(
@@ -519,12 +589,12 @@ def test_int8_indexer_staging_transcodes_only_valid_rows(monkeypatch):
         chunk_offset=0,
     )
 
-    assert calls["grid"] == (source_spec.storage_block_size,)
+    assert calls["grid"] == (page_states(source_spec),)
     assert calls["args"][4].tolist() == [47]
     assert calls["args"][5:8] == (
         source.stride(0),
         destination.stride(0),
-        source_spec.storage_block_size,
+        page_states(source_spec),
     )
     assert calls["kwargs"] == {"HEAD_SIZE": 128}
     assert destination[0].eq(0).all()
@@ -536,7 +606,7 @@ def test_int8_indexer_transcode_matches_torch_reference_for_partial_page(
     cuda_device,
 ):
     source_spec, wire_spec = _indexer_specs(torch.uint8, 132)
-    tokens_per_page = source_spec.storage_block_size
+    tokens_per_page = page_states(source_spec)
     values = torch.linspace(
         -3.0,
         3.0,
@@ -609,7 +679,7 @@ def test_int8_indexer_transcode_matches_torch_reference_for_partial_page(
 def test_bf16_indexer_staging_keeps_quantization_path(monkeypatch):
     source_spec, wire_spec = _indexer_specs(torch.bfloat16, 128)
     source = torch.zeros(
-        (1, source_spec.storage_block_size, 128),
+        (1, page_states(source_spec), 128),
         dtype=torch.bfloat16,
     )
     destination = torch.empty(
@@ -640,7 +710,7 @@ def test_bf16_indexer_staging_keeps_quantization_path(monkeypatch):
         chunk_offset=0,
     )
 
-    assert calls[0] == ("grid", (source_spec.storage_block_size,))
+    assert calls[0] == ("grid", (page_states(source_spec),))
     assert calls[1][0] == "launch"
 
 

@@ -35,6 +35,19 @@ def use_fp8_ds_mla_wire_staging(vllm_config: VllmConfig) -> bool:
     return str(enabled).lower() == "true"
 
 
+def page_states(spec: KVCacheSpec) -> int:
+    """Rows (stored states) in one physical page of ``spec``.
+
+    v0.31 ``storage_block_size`` is an optional token width that defaults to
+    None and does not exist on ``SlidingWindowMLASpec``; without it a page is
+    one ``block_size`` block.
+    """
+    storage_block_size = getattr(spec, "storage_block_size", None)
+    if storage_block_size is None:
+        return int(spec.num_states)
+    return int(spec.get_num_kernel_states(storage_block_size))
+
+
 def get_fp8_wire_scratch_blocks(vllm_config: VllmConfig) -> int:
     """Return and validate blocks per GPU wire scratch buffer."""
     kv_transfer_config = vllm_config.kv_transfer_config

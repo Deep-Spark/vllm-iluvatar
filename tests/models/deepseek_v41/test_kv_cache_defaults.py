@@ -96,7 +96,7 @@ def test_v41_metadata_uses_formal_operators():
     )
 
 
-def test_bf16_attention_uses_supported_native_backend(monkeypatch):
+def test_bf16_attention_does_not_force_mla_backend(monkeypatch):
     from vllm_iluvatar.models.deepseek_v41 import attention as attention_mod
 
     calls = []
@@ -118,6 +118,6 @@ def test_bf16_attention_uses_supported_native_backend(monkeypatch):
     lengths = torch.ones(1, dtype=torch.int32)
     attn._sparse_mla(q, indices, lengths, None, None, None, torch.empty_like(q))
     assert len(calls) == 1
-    # ixformer 3817cf75: dsv41_mla_with_kvcache 的 ixformer_native 后端
-    # 并入 flash_mla_sparse_with_kvcache 的 ixformer_perf 后端。
-    assert calls[0]["backend"] == "ixformer_perf"
+    # Do not force backend; let ixformer pick the default for mixed
+    # prefill/decode warmup used by the BF16 service.
+    assert "backend" not in calls[0]

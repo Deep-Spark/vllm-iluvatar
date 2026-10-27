@@ -1710,10 +1710,6 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             ),
             extra_topk_length=extra_lens,
             output=output.unsqueeze(1),
-            # The ixinfer backend rejects the mixed prefill/decode warmup used
-            # by the BF16 service. The perf (hand-written CUDA) backend supports
-            # this contract and is covered against the torch reference.
-            backend="ixformer_perf",
         )
 
     def _tile_window(self, indices):

@@ -206,10 +206,13 @@ torch::Tensor minimax_qk_var(torch::Tensor& qkv, int64_t q_size,
 
 torch::Tensor minimax_qk_var_meta(torch::Tensor& qkv, int64_t /*q_size*/,
                                   int64_t /*kv_size*/) {
-  return torch::empty(
-      {qkv.size(0), 2},
-      qkv.options().dtype(torch::kFloat32).memory_format(
-          torch::MemoryFormat::Contiguous));
+  // Dynamic dim (tokens): keep SymInt. Static width 2: plain int64.
+  // Never: int64_t n = qkv.size(0); empty({n, 2}) — that specializes.
+  c10::SymInt num_tokens = qkv.sym_size(0);
+  return at::empty_symint(
+      {num_tokens, c10::SymInt(2)},
+      qkv.options().dtype(at::kFloat).memory_format(
+          at::MemoryFormat::Contiguous));
 }
 
 std::tuple<torch::Tensor, torch::Tensor> minimax_qk_rms_apply(
@@ -306,13 +309,14 @@ std::tuple<torch::Tensor, torch::Tensor> minimax_qk_rms_apply_meta(
     torch::Tensor& qkv, torch::Tensor& /*qk_var*/,
     torch::Tensor& /*q_weight*/, torch::Tensor& /*k_weight*/, int64_t q_size,
     int64_t kv_size, int64_t /*tp_world*/, double /*epsilon*/) {
-  const int64_t num_tokens = qkv.size(0);
-  auto q_out = torch::empty(
-      {num_tokens, q_size},
-      qkv.options().memory_format(torch::MemoryFormat::Contiguous));
-  auto k_out = torch::empty(
-      {num_tokens, kv_size},
-      qkv.options().memory_format(torch::MemoryFormat::Contiguous));
+  // Same rule as minimax_qk_var_meta: only tokens is dynamic.
+  c10::SymInt num_tokens = qkv.sym_size(0);
+  auto q_out = at::empty_symint(
+      {num_tokens, c10::SymInt(q_size)},
+      qkv.options().memory_format(at::MemoryFormat::Contiguous));
+  auto k_out = at::empty_symint(
+      {num_tokens, c10::SymInt(kv_size)},
+      qkv.options().memory_format(at::MemoryFormat::Contiguous));
   return {q_out, k_out};
 }
 

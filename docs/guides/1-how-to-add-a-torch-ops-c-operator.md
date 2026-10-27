@@ -21,6 +21,7 @@
   - [4.1 调用链](#41-调用链)
   - [4.2 定义 schema](#42-定义-schema)
   - [4.3 编写 CUDA 内核 + Meta impl](#43-编写-cuda-内核--meta-impl)
+  - [4.3.1 Meta 与 Dynamo 动态维（Sym 接口）](#431-meta-与-dynamo-动态维sym-接口)
   - [4.4 声明函数签名](#44-声明函数签名)
   - [4.5 注册 schema 与 dispatch](#45-注册-schema-与-dispatch)
   - [4.6 编写 OOT override](#46-编写-oot-override)
@@ -324,6 +325,41 @@ torch::Tensor apply_rotary_emb_meta(torch::Tensor& x, torch::Tensor& /*cos*/,
 }
 ```
 
+#### 4.3.1 Meta 与 Dynamo 动态维（Sym 接口）
+
+Meta 只服务 **torch.compile / FakeTensor / Dynamo 形状推导**（`TORCH_LIBRARY_IMPL(_C, Meta)`）。真跑与 CUDA Graph capture 仍走 CUDA impl，**不受 Meta 写法影响**。
+
+在 vLLM `mark_dynamic`（常见 token / batch = dim0）场景下，Meta 输出里被标记的维必须仍是 **SymInt**。`int64_t n = t.size(0)` 会把符号维特化成捕获时的常量 hint（如 2048），随后在 `build_guards` 报 `ConstraintViolationError`。
+
+**规则：**
+
+| 场景 | 做法 |
+| --- | --- |
+| **动态维**（token 等） | `t.sym_size(i)` → `c10::SymInt`；分配用 `at::empty_symint`。**禁止** `int64_t n = t.size(i)` 再 `empty({n, ...})` |
+| **静态维**（heads、head_dim、`q_size` 等） | 普通 `int64_t` / 常量；放进 `empty_symint` 的 shape 时包成 `c10::SymInt(常量)`（类型适配，维仍是静态） |
+| **同形输出** | `at::empty_like(x)` —— 自动继承 `x` 上的 SymInt，无需手写 `sym_size` |
+| **CUDA 真实现** | 可用 `t.size(0)`；只有 Meta / Fake 要守动态维 |
+
+`sym_size` / `empty_symint` 是普通 `size` / `empty` 的**超集**：无符号时行为等价于具体整数；有符号时才能把动态维传下去。
+
+反例（会特化动态维）：
+
+```cpp
+int64_t num_tokens = qkv.size(0);          // ❌ SymInt → 常量 hint
+torch::empty({num_tokens, 2}, ...);
+```
+
+正例（改维、仅 token 动态）：
+
+```cpp
+c10::SymInt num_tokens = qkv.sym_size(0);  // ✅ 保留动态
+at::empty_symint({num_tokens, c10::SymInt(2)}, ...);
+```
+
+正例（同形，见上文 `apply_rotary_emb_meta`）：直接 `empty_like`。
+
+参考实现：[`fused_qk_norm_rope.cu`](../../csrc/plugin/fused_qk_norm_rope.cu)（`fused_qk_*_meta`）、[`minimax_qk_norm.cu`](../../csrc/plugin/minimax_qk_norm.cu)（`minimax_qk_*_meta`）。
+
 ### 4.4 声明函数签名
 
 在 [`csrc/plugin/ops.h`](../../csrc/plugin/ops.h) 中补充声明，**包含 CUDA 实现和 Meta impl 两个签名**：
@@ -365,7 +401,10 @@ TORCH_LIBRARY_IMPL_EXPAND(_C, Meta, ops) {
 }
 ```
 
-注意：**Meta impl 是 plugin 算子的必要条件**。没有它，torch.compile 和 opcheck 都会报错。community 算子的 Meta impl 由上游提供，这里不需要。
+注意：
+
+- **Meta impl 是 plugin 算子的必要条件**。没有它，torch.compile 和 opcheck 都会报错。community 算子的 Meta impl 由上游提供，这里不需要。
+- Meta 中凡被 Dynamo / `mark_dynamic` 的维须用 Sym 接口（见 [4.3.1](#431-meta-与-dynamo-动态维sym-接口)），勿用 `size()` 特化。
 
 ### 4.6 编写 OOT override
 
@@ -466,7 +505,7 @@ plugin 算子没有上游同名测试可以对齐，需自行设计参考实现�
 **plugin 算子**（上游无同名 op）：
 
 1. 自行定义 schema。
-2. 在 `csrc/plugin/` 新增 `.cu` 实现（含 **Meta impl**）。
+2. 在 `csrc/plugin/` 新增 `.cu` 实现（含 **Meta impl**；动态维用 `sym_size` / `empty_symint` / `empty_like`，见 4.3.1）。
 3. 在 `csrc/plugin/ops.h` 声明函数（含 meta 声明）。
 4. 在 `csrc/torch_bindings.cpp` 注册 schema + CUDA dispatch + **Meta impl**。
 5. **编写 OOT override**（`@<CustomOp>.register_oot` 子类）。

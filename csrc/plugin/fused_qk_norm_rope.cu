@@ -492,15 +492,19 @@ fused_qk_rmsnorm_rope_gate_meta(
     torch::Tensor& /*k_weight*/, torch::Tensor& /*cos_sin_cache*/,
     torch::Tensor& /*positions*/, double /*epsilon*/, int64_t num_q_heads,
     int64_t num_kv_heads, int64_t head_dim, int64_t /*rotary_dim*/) {
-  const int64_t num_tokens = q_gate.size(0);
-  auto q_out = torch::empty(
-      {num_tokens, num_q_heads * head_dim},
-      q_gate.options().memory_format(torch::MemoryFormat::Contiguous));
-  auto k_out = torch::empty(
-      {num_tokens, num_kv_heads * head_dim},
-      k.options().memory_format(torch::MemoryFormat::Contiguous));
-  auto gate_out = torch::empty_like(
-      q_out, q_out.options(), torch::MemoryFormat::Contiguous);
+  // Dynamic dim (tokens): keep SymInt. Static dims (widths): plain int64.
+  // Never: int64_t n = q_gate.size(0); empty({n, ...}) — that specializes.
+  c10::SymInt num_tokens = q_gate.sym_size(0);
+  const int64_t q_width = num_q_heads * head_dim;
+  const int64_t k_width = num_kv_heads * head_dim;
+  auto q_out = at::empty_symint(
+      {num_tokens, c10::SymInt(q_width)},
+      q_gate.options().memory_format(at::MemoryFormat::Contiguous));
+  auto k_out = at::empty_symint(
+      {num_tokens, c10::SymInt(k_width)},
+      k.options().memory_format(at::MemoryFormat::Contiguous));
+  auto gate_out =
+      at::empty_like(q_out, q_out.options(), at::MemoryFormat::Contiguous);
   return {q_out, k_out, gate_out};
 }
 
@@ -597,15 +601,18 @@ fused_qk_rmsnorm_gate_meta(
     torch::Tensor& q_gate, torch::Tensor& k, torch::Tensor& /*q_weight*/,
     torch::Tensor& /*k_weight*/, double /*epsilon*/, int64_t num_q_heads,
     int64_t num_kv_heads, int64_t head_dim) {
-  const int64_t num_tokens = q_gate.size(0);
-  auto q_out = torch::empty(
-      {num_tokens, num_q_heads * head_dim},
-      q_gate.options().memory_format(torch::MemoryFormat::Contiguous));
-  auto k_out = torch::empty(
-      {num_tokens, num_kv_heads * head_dim},
-      k.options().memory_format(torch::MemoryFormat::Contiguous));
-  auto gate_out = torch::empty_like(
-      q_out, q_out.options(), torch::MemoryFormat::Contiguous);
+  // Same rule as fused_qk_rmsnorm_rope_gate_meta: only tokens is dynamic.
+  c10::SymInt num_tokens = q_gate.sym_size(0);
+  const int64_t q_width = num_q_heads * head_dim;
+  const int64_t k_width = num_kv_heads * head_dim;
+  auto q_out = at::empty_symint(
+      {num_tokens, c10::SymInt(q_width)},
+      q_gate.options().memory_format(at::MemoryFormat::Contiguous));
+  auto k_out = at::empty_symint(
+      {num_tokens, c10::SymInt(k_width)},
+      k.options().memory_format(at::MemoryFormat::Contiguous));
+  auto gate_out =
+      at::empty_like(q_out, q_out.options(), at::MemoryFormat::Contiguous);
   return {q_out, k_out, gate_out};
 }
 

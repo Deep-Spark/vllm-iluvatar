@@ -66,6 +66,12 @@ from vllm_iluvatar.models.deepseek_v41.indexer_kv import (
     SPLIT_INDEXER_FORMAT,
     indexer_kv_layout,
 )
+from vllm_iluvatar.models.deepseek_v41.query_quant import (
+    QueryActivation,
+    can_fuse_query_quant,
+    fused_query_norm,
+    query_inputs_are_compatible,
+)
 from vllm_iluvatar.models.deepseek_v41.rope import apply_rope
 from vllm_iluvatar.models.deepseek_v41.sparse_mla import (
     IluDeepseekSparseSWAFlashMLABackend,
@@ -483,7 +489,7 @@ class IluDeepseekV41Indexer(nn.Module):
 
     def forward(
         self,
-        qr: torch.Tensor,
+        qr: QueryActivation,
         latent: torch.Tensor | None,
         indexer_weights: torch.Tensor,
         positions: torch.Tensor,
@@ -858,6 +864,13 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 candidate_block_size=self.candidate_block_size,
                 candidate_write=is_candidate_source,
             )
+
+        query_linears = [self.wq_b]
+        if self.indexer is not None:
+            query_linears.append(self.indexer.wq_b)
+        self._fuse_query_quant = can_fuse_query_quant(
+            query_linears, self.q_lora_rank, self.head_dim
+        )
 
         assert cache_config is not None, "DeepseekV4 attention requires cache_config"
         if (
@@ -1290,14 +1303,18 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
 
     def _split_qkv_and_norm(
         self, qr_kv: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[QueryActivation, torch.Tensor]:
         """Split the fused q-lora / kv projection and RMSNorm both halves."""
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
+        if self._fuse_query_quant and query_inputs_are_compatible(qr, kv):
+            return fused_query_norm(
+                qr, kv, self.q_norm.weight, self.kv_norm.weight, self.eps
+            )
         return ixfops.rms_norm_qk(
             qr, kv, self.q_norm.weight, self.kv_norm.weight, self.eps
         )
 
-    def _wq_b_proj(self, qr: torch.Tensor) -> torch.Tensor:
+    def _wq_b_proj(self, qr: QueryActivation) -> torch.Tensor:
         return self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
 
     def _fused_qnorm_rope_kv_insert(
@@ -1335,7 +1352,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
     def _prepare_and_attn(
         self,
         hidden_states: torch.Tensor,
-        qr: torch.Tensor,
+        qr: QueryActivation,
         kv: torch.Tensor,
         kv_score: torch.Tensor | None,
         indexer_weights: torch.Tensor | None,

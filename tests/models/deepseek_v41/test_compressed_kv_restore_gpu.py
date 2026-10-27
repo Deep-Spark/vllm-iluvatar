@@ -133,6 +133,11 @@ def test_actual_family_slices_reuse_views_and_reprepare_across_graphs(
         layer = IluDeepseekV41Attention.__new__(IluDeepseekV41Attention)
         torch.nn.Module.__init__(layer)
         layer.compressed_kv_format, layer.compress_ratio = fmt, ratio
+        # Identity rotation preserves this test's original page/map oracle.
+        layer.rotary_emb = SimpleNamespace(
+            cos_sin_cache=torch.cat((torch.ones(1, 32, device="cuda"),
+                                     torch.zeros(1, 32, device="cuda")), dim=-1)
+        )
         layer.is_kv_source = False
         layer.is_kv_forwarder = forwarder and index == 0
         if layer.is_kv_forwarder:

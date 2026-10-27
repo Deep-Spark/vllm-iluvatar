@@ -28,6 +28,9 @@ def attention(fmt, ratio=2, owner=True):
     layer.is_kv_source = owner
     layer.is_kv_forwarder = False
     layer.compressed_kv_format = fmt
+    layer.rotary_emb = SimpleNamespace(
+        cos_sin_cache=torch.cat((torch.ones(1, 32), torch.zeros(1, 32)), dim=-1)
+    )
     layer.kv_cache_dtype = "bfloat16"
     layer.kv_cache_torch_dtype = torch.bfloat16
     layer.kv_cache = torch.zeros(
@@ -130,7 +133,8 @@ def test_sparse_reader_reaches_the_selected_native_facade(fmt, prefill, monkeypa
     lengths = torch.full((2,), 4, dtype=torch.int32)
     output = torch.empty_like(q)
     layer._sparse_mla(
-        q, indices, lengths, layer.kv_cache, indices, lengths, output, prefill=prefill
+        q, indices, lengths, layer.kv_cache, indices, lengths, output,
+        positions=torch.arange(2), prefill=prefill,
     )
     args, kwargs = calls[0]
     assert args[0].shape == (2, 1, 2, 512)

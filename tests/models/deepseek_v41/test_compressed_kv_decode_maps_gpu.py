@@ -93,6 +93,11 @@ def test_decode_capture_reuses_map_with_changed_inputs_pages_and_aliases(
         layer = IluDeepseekV41Attention.__new__(IluDeepseekV41Attention)
         torch.nn.Module.__init__(layer)
         layer.compressed_kv_format, layer.compress_ratio = fmt, ratio
+        # Rotation accuracy is covered separately; retain this map oracle.
+        layer.rotary_emb = SimpleNamespace(
+            cos_sin_cache=torch.cat((torch.ones(1, 32, device="cuda"),
+                                     torch.zeros(1, 32, device="cuda")), dim=-1)
+        )
         layer.compressed_decode_restore = restore_decode
         layer.is_kv_source, layer.is_kv_forwarder = False, forwarder and index == 0
         if layer.is_kv_forwarder:
@@ -151,9 +156,9 @@ def test_decode_capture_reuses_map_with_changed_inputs_pages_and_aliases(
             if name == "prepare_quantized_sparse_mla_restore_plan":
                 original_prepare = getattr(facade, name)
 
-                def prepared(*args, **kwargs):
+                def prepared(*args, _prepare=original_prepare, **kwargs):
                     prepares.append(args[4])
-                    return original_prepare(*args, **kwargs)
+                    return _prepare(*args, **kwargs)
 
                 monkeypatch.setattr(facade, name, prepared)
         else:

@@ -1190,6 +1190,15 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
     def cos_sin(self) -> torch.Tensor:
         return self.rotary_emb.cos_sin_cache
 
+    def _uses_fused_inverse_rope(self) -> bool:
+        """Quantized main readers rotate their result before BF16 rounding.
+
+        Window-only layers, including DSpark, retain the standalone inverse.
+        The decision is layer-static and shared by the reader and its caller,
+        so mixed decode/prefill slices cannot rotate twice or omit a rotation.
+        """
+        return self.compressed_kv_format is not None and self.compress_ratio > 0
+
     def _load_attn_sink(self, param: nn.Parameter, loaded: torch.Tensor) -> None:
         rank = get_tensor_model_parallel_rank()
         shard = loaded.narrow(0, rank * self.n_local_heads, self.n_local_heads)
@@ -1266,7 +1275,8 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         self._prepare_and_attn(
             hidden_states, qr, kv, kv_score, indexer_weights, positions, attn_out
         )
-        apply_rope(attn_out.unsqueeze(0), positions, self.cos_sin, inverse=True)
+        if not self._uses_fused_inverse_rope():
+            apply_rope(attn_out.unsqueeze(0), positions, self.cos_sin, inverse=True)
         return self._o_proj(attn_out)
 
     def _run_parallel_input_projections(
@@ -1825,6 +1835,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         extra_lens: torch.Tensor | None,
         output: torch.Tensor,
         *,
+        positions: torch.Tensor,
         prefill: bool = False,
         restore_plan=None,
     ) -> None:
@@ -1863,6 +1874,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 raise RuntimeError(
                     "Compressed KV attention workspace is not initialized"
                 )
+            fused_inverse = self._uses_fused_inverse_rope()
             with self.compressed_kv_workspace.acquire(nested=True) as workspace:
                 reader(
                     q.unsqueeze(1),
@@ -1877,6 +1889,8 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                     format=self.compressed_kv_format,
                     attn_sink=self.attn_sink,
                     output=output.unsqueeze(1),
+                    positions=positions if fused_inverse else None,
+                    cos_sin_cache=self.cos_sin if fused_inverse else None,
                     workspace=workspace if restore_plan is None else restore_plan,
                 )
             return
@@ -1978,6 +1992,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 indices,
                 lengths,
                 output,
+                positions=positions,
                 restore_plan=plan,
             )
             return
@@ -2022,6 +2037,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             extra_indices,
             extra_lens,
             output,
+            positions=positions,
         )
 
     def _forward_prefill_as_decode(
@@ -2062,6 +2078,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 indices,
                 lengths,
                 output,
+                positions=positions,
                 prefill=True,
                 restore_plan=plan,
             )
@@ -2104,6 +2121,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             extra_indices,
             extra_lens,
             output,
+            positions=positions,
             prefill=True,
         )
 

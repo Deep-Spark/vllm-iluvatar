@@ -84,6 +84,7 @@ def test_e25_suffix_uses_separate_prefill_and_old_decode_calls(old_tokens, monke
             main_lens,
             output,
             *,
+            positions,
             prefill=False,
             layer_id=layer_id,
         ):
@@ -91,6 +92,7 @@ def test_e25_suffix_uses_separate_prefill_and_old_decode_calls(old_tokens, monke
             assert cache is owner.kv_cache
             assert swa_indices.shape[0] == swa_lens.numel() == q.shape[0]
             assert main_indices.shape[0] == main_lens.numel() == q.shape[0]
+            assert positions.shape[0] == q.shape[0]
             output.fill_(1 if prefill else 2)
 
         layer._sparse_mla = reader

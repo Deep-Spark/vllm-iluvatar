@@ -256,6 +256,9 @@ def suffix(
         layer = IluDeepseekV41Attention.__new__(IluDeepseekV41Attention)
         torch.nn.Module.__init__(layer)
         layer.compressed_kv_format, layer.compress_ratio = fmt, 1
+        layer.rotary_emb = SimpleNamespace(
+            cos_sin_cache=torch.cat((torch.ones(1, 32), torch.zeros(1, 32)), dim=-1)
+        )
         layer.is_kv_source = layer.is_kv_forwarder = False
         layer.compressed_cache_prefix, layer._static_forward_context = prefix, context
         layer.compressed_kv_workspace = pool

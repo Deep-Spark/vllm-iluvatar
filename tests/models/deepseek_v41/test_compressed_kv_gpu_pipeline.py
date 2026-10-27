@@ -102,6 +102,7 @@ def test_native_pp_bytes_scales_boundary_guards_and_neighbor_canaries(fmt, ratio
 def test_actual_compressor_to_quantized_attention_dataflow(fmt, prefill, monkeypatch):
     torch.manual_seed(1014)
     layer = attention(fmt, ratio=1)
+    layer.rotary_emb.cos_sin_cache = layer.cos_sin.cuda()
     config, names = cache_config(fmt)
     # The first view in this actual allocation is the source being exercised.
     context = {name: SimpleNamespace(compressed_kv_format=fmt) for name in names}
@@ -172,6 +173,7 @@ def test_actual_compressor_to_quantized_attention_dataflow(fmt, prefill, monkeyp
         indices,
         lengths,
         output,
+        positions=positions,
         prefill=prefill,
     )
     main_rows = torch.from_numpy(
@@ -204,6 +206,7 @@ def test_actual_mixed_forward_route_translates_main_pages_and_replays(
     monkeypatch.setenv("VLLM_ILU_DS4_PREFILL_OPT", "0")
     monkeypatch.setenv("VLLM_ILU_DS4_PREFILL_AS_DECODE", "1")
     layer = attention(fmt, ratio=ratio)
+    layer.rotary_emb.cos_sin_cache = layer.cos_sin.cuda()
     config, names = cache_config(fmt)
     context = {name: SimpleNamespace(compressed_kv_format=fmt) for name in names}
     context[names[0]] = layer

@@ -1323,10 +1323,17 @@ class _StorageBlockSizeSpec:
 
     @property
     def block_size(self) -> int:
-        storage_block_size = self._spec.storage_block_size
-        if storage_block_size is None:
-            return int(self._spec.block_size)
-        return int(storage_block_size)
+        # Through 0.27.1 ``storage_block_size`` was the computed page width.
+        # From 0.30.1 it is an optional override defaulting to None, and the
+        # computed value lives on ``num_states`` (= block_size // tokens_per_state).
+        storage = getattr(self._spec, "storage_block_size", None)
+        if storage is not None:
+            return int(storage)
+        num_states = getattr(self._spec, "num_states", None)
+        if num_states is not None:
+            return int(num_states)
+        tokens_per_state = int(getattr(self._spec, "tokens_per_state", 1) or 1)
+        return int(self._spec.block_size // tokens_per_state)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._spec, name)

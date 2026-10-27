@@ -64,8 +64,9 @@ def test_forward_has_exactly_one_inverse_owner(format, ratio, rows, monkeypatch)
     "old,new", [(6, 0), (12, 0), (18, 0), (0, 128), (0, 129), (6, 128), (12, 129)]
 )
 @pytest.mark.parametrize("restore_decode", [False, True])
+@pytest.mark.parametrize("grouped_output", [False, True])
 def test_actual_mqa_routes_pass_exact_query_positions(
-    format, ratio, old, new, restore_decode, monkeypatch
+    format, ratio, old, new, restore_decode, grouped_output, monkeypatch
 ):
     from ixformer.inference.functions.deepseek import (
         quantized_sparse_mla as decode_module,
@@ -75,6 +76,7 @@ def test_actual_mqa_routes_pass_exact_query_positions(
     )
 
     layer = attention(format, ratio)
+    layer._grouped_int8_o_proj = grouped_output
     count = old + new
     payload = torch.empty(1, 64, 256, dtype=torch.uint8)
     scales = torch.empty(1, 64, 16, dtype=torch.float16)
@@ -131,10 +133,14 @@ def test_actual_mqa_routes_pass_exact_query_positions(
 
     def reader(label):
         def call(*args, positions, cos_sin_cache, output, **kwargs):
-            assert cos_sin_cache is layer.cos_sin
             assert kwargs["workspace"] is scratch
-            assert positions.shape[0] == args[0].shape[0] == output.shape[0]
-            events.append((label, positions.clone()))
+            if grouped_output:
+                assert positions is None and cos_sin_cache is None
+                events.append((label, args[0].shape[0]))
+            else:
+                assert cos_sin_cache is layer.cos_sin
+                assert positions.shape[0] == args[0].shape[0] == output.shape[0]
+                events.append((label, positions.clone()))
             output.fill_(1)
 
         return call
@@ -155,7 +161,10 @@ def test_actual_mqa_routes_pass_exact_query_positions(
     assert len(events) == len(expected)
     for (label, actual), (expected_label, pos) in zip(events, expected):
         assert label == expected_label
-        torch.testing.assert_close(actual, pos)
+        if grouped_output:
+            assert actual == pos.numel()
+        else:
+            torch.testing.assert_close(actual, pos)
     assert torch.all(output == 1)
     assert not torch.cuda.is_initialized()
 

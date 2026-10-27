@@ -749,6 +749,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             compress_ratio=self.compress_ratio,
         )
         self.indexer_rotary_emb = self.rotary_emb
+        self._configure_grouped_int8_output(vllm_config.model_config.dtype)
         self.topk_indices_buffer = topk_indices_buffer
         self.candidate_block_buffer = candidate_block_buffer
 
@@ -1190,14 +1191,43 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
     def cos_sin(self) -> torch.Tensor:
         return self.rotary_emb.cos_sin_cache
 
+    def _configure_grouped_int8_output(self, dtype) -> None:
+        from vllm_iluvatar.model_executor.layers.quantization.ilu_v4_bmm import (
+            IluV4W8A8BMMLinearMethod,
+            IluV4W8A16BMMLinearMethod,
+        )
+
+        self._grouped_int8_o_proj = False
+        method = self.wo_a.quant_method
+        explicit = isinstance(method, IluV4W8A8BMMLinearMethod)
+        if not explicit and not envs.VLLM_ILU_DS41_GROUPED_INT8_O_PROJ:
+            return
+        supported = IluV4W8A8BMMLinearMethod.supports_geometry(
+            self.wo_a.bmm_geom, dtype, self.rope_head_dim
+        )
+        if explicit:
+            if not supported:
+                raise ValueError("Grouped INT8 output projection geometry is unsupported")
+            self._grouped_int8_o_proj = True
+        elif supported and type(method) is IluV4W8A16BMMLinearMethod:
+            self.wo_a.quant_method = IluV4W8A8BMMLinearMethod(
+                method.parent_config, {"bmm_w8a8_gemm_format": "NN"}
+            )
+            self._grouped_int8_o_proj = True
+
     def _uses_fused_inverse_rope(self) -> bool:
         """Quantized main readers rotate their result before BF16 rounding.
 
-        Window-only layers, including DSpark, retain the standalone inverse.
+        A grouped INT8 projection owns its inverse instead, for either main
+        or window-only attention. Other window-only layers retain the inverse.
         The decision is layer-static and shared by the reader and its caller,
         so mixed decode/prefill slices cannot rotate twice or omit a rotation.
         """
-        return self.compressed_kv_format is not None and self.compress_ratio > 0
+        return (
+            self.compressed_kv_format is not None
+            and self.compress_ratio > 0
+            and not getattr(self, "_grouped_int8_o_proj", False)
+        )
 
     def _load_attn_sink(self, param: nn.Parameter, loaded: torch.Tensor) -> None:
         rank = get_tensor_model_parallel_rank()
@@ -1275,6 +1305,11 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         self._prepare_and_attn(
             hidden_states, qr, kv, kv_score, indexer_weights, positions, attn_out
         )
+        if getattr(self, "_grouped_int8_o_proj", False):
+            grouped = self.wo_a.quant_method.apply_with_rope(
+                self.wo_a, attn_out, positions, self.cos_sin
+            )
+            return self.wo_b(grouped.flatten(1))
         if not self._uses_fused_inverse_rope():
             apply_rope(attn_out.unsqueeze(0), positions, self.cos_sin, inverse=True)
         return self._o_proj(attn_out)

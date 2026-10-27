@@ -1323,7 +1323,10 @@ class _StorageBlockSizeSpec:
 
     @property
     def block_size(self) -> int:
-        return int(self._spec.storage_block_size)
+        storage_block_size = self._spec.storage_block_size
+        if storage_block_size is None:
+            return int(self._spec.block_size)
+        return int(storage_block_size)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._spec, name)

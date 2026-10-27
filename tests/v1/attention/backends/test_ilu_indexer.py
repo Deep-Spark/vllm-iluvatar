@@ -216,6 +216,26 @@ def test_storage_block_size_wrapper_is_scoped_to_compressed_build():
     assert seen == [64, 256]
 
 
+def test_storage_block_size_wrapper_falls_back_when_unset():
+    """DeepSeek-V4.1 compressed indexers leave the v0.31 override at None."""
+    seen = []
+
+    def original(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        seen.append(self.kv_cache_spec.block_size)
+        seen.append(self.kv_cache_spec.num_states)
+
+    wrapped = make_storage_block_size_build(original)
+    builder = SimpleNamespace(
+        compress_ratio=2,
+        kv_cache_spec=SimpleNamespace(
+            block_size=128, storage_block_size=None, num_states=64
+        ),
+    )
+
+    wrapped(builder, 0, None)
+    assert seen == [128, 64]
+
+
 def test_pcp_dual_chunk_causal_spans_and_query_subchunks():
     """Runner represents each PCP segment as a request ending at its own position."""
     from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (

@@ -22,7 +22,11 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
-from .fp8_layout import FP8_WIRE_SCRATCH_BUFFER_COUNT, get_fp8_wire_scratch_blocks
+from .fp8_layout import (
+    FP8_WIRE_SCRATCH_BUFFER_COUNT,
+    get_fp8_wire_scratch_blocks,
+    page_states,
+)
 from .metadata import format_kv_group_page_log
 
 logger = init_logger("vllm." + __name__)
@@ -580,7 +584,7 @@ class FP8DSMLAWireStaging:
             raise ValueError(
                 f"QUANT_PACK requires a BF16 producer cache, got {source.dtype}"
             )
-        tokens_per_page = source_spec.storage_block_size
+        tokens_per_page = page_states(source_spec)
         selected = source.index_select(0, source_block_ids).contiguous()
         selected = selected.reshape(
             source_block_ids.numel(), tokens_per_page, source_spec.head_size
@@ -638,16 +642,18 @@ class FP8DSMLAWireStaging:
         total_block_count: int,
         chunk_offset: int,
     ) -> None:
+        wire_page_states = page_states(wire_spec)
+        source_page_states = page_states(source_spec)
         if (
             wire_spec.dtype != torch.uint8
             or wire_spec.head_size != 132
-            or wire_spec.storage_block_size != source_spec.storage_block_size
+            or wire_page_states != source_page_states
         ):
             raise ValueError(
                 "Indexer wire cache must use D's uint8 [block, 64, 132] "
                 f"layout, got dtype={wire_spec.dtype}, "
                 f"head_size={wire_spec.head_size}, "
-                f"storage_block_size={wire_spec.storage_block_size}"
+                f"page_states={wire_page_states} (source {source_page_states})"
             )
 
         if source_spec.dtype == torch.uint8 and source_spec.head_size == 132:
@@ -656,7 +662,7 @@ class FP8DSMLAWireStaging:
                     "INT8 indexer cache tensor must use uint8 storage, "
                     f"got {source.dtype}"
                 )
-            tokens_per_page = source_spec.storage_block_size
+            tokens_per_page = source_page_states
             valid_entries = self._valid_entries_for_chunk(
                 source_spec,
                 num_tokens,
@@ -696,7 +702,7 @@ class FP8DSMLAWireStaging:
                 f"got dtype={source.dtype}, head_size={source_spec.head_size}"
             )
 
-        tokens_per_page = source_spec.storage_block_size
+        tokens_per_page = source_page_states
         selected = (
             source.index_select(0, source_block_ids)
             .contiguous()
@@ -744,7 +750,7 @@ class FP8DSMLAWireStaging:
             slot_mapping,
             rows.stride(0),
             destination.stride(0),
-            wire_spec.storage_block_size,
+            wire_page_states,
             HEAD_SIZE=128,
         )
 

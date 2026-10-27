@@ -1,0 +1,170 @@
+{
+    "quant_method": "compressed-tensors",
+    "format": "iluvatar-mixed",
+    "config_groups": {
+        "routed_experts": {
+            "targets": [
+                "re:.*\\.experts"
+            ],
+            "weights": {
+                "num_bits": 4,
+                "type": "int",
+                "symmetric": {
+                    "$rules": "rules.routed_mxfp4_to_w4a8.quant.options.symmetric"
+                },
+                "strategy": "channel",
+                "group_size": {
+                    "$rules": "rules.routed_mxfp4_to_w4a8.quant.options.group_size",
+                    "none_as": -1
+                },
+                "dynamic": false
+            },
+            "input_activations": {
+                "num_bits": 8,
+                "type": "int",
+                "symmetric": true,
+                "strategy": "token",
+                "group_size": null,
+                "dynamic": true
+            },
+            "output_activations": null,
+            "iluvatar": {
+                "gemm_format": {
+                    "$rules": "rules.routed_mxfp4_to_w4a8.quant.options.gemm_format"
+                },
+                "pack_version": {
+                    "$rules": "rules.routed_mxfp4_to_w4a8.quant.options.pack_version"
+                }
+            }
+        },
+        "shared_experts": {
+            "format": "int-quantized",
+            "targets": [
+                "re:.*\\.shared_experts\\.(gate_up_proj|down_proj)$"
+            ],
+            "weights": {
+                "num_bits": 8,
+                "type": "int",
+                "symmetric": {
+                    "$rules": "rules.shared_fp8_to_w8a8.quant.options.symmetric"
+                },
+                "strategy": "channel",
+                "group_size": {
+                    "$rules": "rules.shared_fp8_to_w8a8.quant.options.group_size",
+                    "none_as": -1
+                },
+                "dynamic": false
+            },
+            "input_activations": {
+                "num_bits": 8,
+                "type": "int",
+                "symmetric": true,
+                "strategy": "token",
+                "group_size": null,
+                "dynamic": true
+            },
+            "output_activations": null,
+            "iluvatar": {
+                "gemm_format": {
+                    "$rules": "rules.shared_fp8_to_w8a8.quant.options.gemm_format"
+                },
+                "mixed_strategy": {
+                    "$rules": "rules.shared_fp8_to_w8a8.iluvatar.mixed_strategy"
+                },
+                "gemm_mode": {
+                    "$rules": "rules.shared_fp8_to_w8a8.iluvatar.gemm_mode"
+                }
+            }
+        },
+        "dense_linears": {
+            "format": "int-quantized",
+            "targets": [
+                "re:.*\\.attn\\.(fused_wqa_wkv|wq_b|wo_b)$",
+                "re:.*\\.attn\\.indexer\\.wq_b$",
+                "re:.*\\.(e_proj|h_proj)$",
+                "re:.*\\.main_proj$"
+            ],
+            "weights": {
+                "num_bits": 8,
+                "type": "int",
+                "symmetric": {
+                    "$rules": "rules.dense_fp8_to_w8a8.quant.options.symmetric"
+                },
+                "strategy": "channel",
+                "group_size": {
+                    "$rules": "rules.dense_fp8_to_w8a8.quant.options.group_size",
+                    "none_as": -1
+                },
+                "dynamic": false
+            },
+            "input_activations": {
+                "num_bits": 8,
+                "type": "int",
+                "symmetric": true,
+                "strategy": "token",
+                "group_size": null,
+                "dynamic": true
+            },
+            "output_activations": null,
+            "iluvatar": {
+                "gemm_format": {
+                    "$rules": "rules.dense_fp8_to_w8a8.quant.options.gemm_format"
+                },
+                "mixed_strategy": {
+                    "$rules": "rules.dense_fp8_to_w8a8.iluvatar.mixed_strategy"
+                },
+                "gemm_mode": {
+                    "$rules": "rules.dense_fp8_to_w8a8.iluvatar.gemm_mode"
+                }
+            }
+        },
+        "wo_a_w8a16": {
+            "targets": [
+                "re:.*\\.attn\\.wo_a$"
+            ],
+            "weights": {
+                "num_bits": 8,
+                "type": "int",
+                "symmetric": {
+                    "$rules": "rules.dense_fp8_to_w8a8.quant.options.symmetric"
+                },
+                "strategy": "channel",
+                "group_size": {
+                    "$rules": "rules.dense_fp8_to_w8a8.quant.options.group_size",
+                    "none_as": -1
+                },
+                "dynamic": false
+            },
+            "input_activations": null,
+            "output_activations": null,
+            "iluvatar": {
+                "method": {
+                    "$rules": "rules.dense_fp8_to_w8a8.iluvatar.method"
+                },
+                "bmm_w8a16_gemm_format": {
+                    "$rules": "rules.dense_fp8_to_w8a8.iluvatar.bmm_w8a16_gemm_format"
+                }
+            }
+        }
+    },
+    "ignore": [
+        "embed",
+        "lm_head",
+        "head",
+        "re:.*norm.*",
+        "re:^vision\\..*",
+        "re:^aligner\\..*",
+        "re:.*\\.engram\\..*",
+        "re:hc_head_(base|fn|scale)$",
+        "re:.*\\.attn\\.attn_sink$",
+        "re:.*\\.ffn\\.gate$",
+        "re:.*\\.ffn\\.gate\\.(weight|bias|tid2eid)$",
+        "re:.*\\.hc_(attn|ffn|head)_(base|fn|scale)$",
+        "re:.*\\.attn\\.compressor\\..*",
+        "re:.*\\.attn\\.indexer\\.compressor\\..*",
+        "re:.*\\.attn\\.indexer\\.weights_proj$",
+        "re:.*\\.attn\\.indexer\\.wk$",
+        "re:.*markov_head.*",
+        "re:.*confidence_head.*"
+    ]
+}

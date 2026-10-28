@@ -938,6 +938,7 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
                 extra_indices=extra_idx,
                 extra_topk_length=extra_topk_length,
                 backend="ixformer_native",
+                mask_invalid_kv=True,
             )
             return
         q_packed, q_scales = ixfops.ds4_dynamic_quant_mla_q_packed_fp8(q)

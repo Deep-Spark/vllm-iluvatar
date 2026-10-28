@@ -149,3 +149,55 @@ def test_swa_and_compressed_cache_storage_contract(plain):
     assert spec.dtype == dtype
     assert spec.state_content_size_bytes == (512 if plain else 584)
     assert spec.tokens_per_state == 4
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+def test_plain_attention_explicitly_masks_invalid_kv(monkeypatch, compressed):
+    from vllm_iluvatar.models.deepseek_v4 import fp8_attention
+
+    attn = object.__new__(IluDeepseekV4Fp8Attention)
+    torch.nn.Module.__init__(attn)
+    attn.prefix = "mla"
+    attn.compress_ratio = 4 if compressed else 1
+    attn.use_prefill_sparse = False
+    attn.use_fp8_ds_mla_layout = False
+    attn.scale = 512**-0.5
+    attn.attn_sink = torch.zeros(8)
+    cache = torch.zeros((2, 64, 512), dtype=torch.float8_e4m3fn)
+    attn.kv_cache = cache
+    attn.swa_cache_layer = SimpleNamespace(prefix="swa", kv_cache=cache)
+    ids = torch.zeros((2, 256), dtype=torch.int32)
+    lens = torch.tensor([1, 0], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        num_actual_tokens=2,
+        num_prefill_tokens=0,
+        max_prefill_seq_len=0,
+        num_prefills=0,
+        causal=True,
+        all_swa_indices=ids,
+        all_swa_lens=lens,
+    )
+    monkeypatch.setattr(
+        fp8_attention,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={"swa": metadata, "mla": SimpleNamespace()}
+        ),
+    )
+    attn._build_extra_topk = lambda *args: (ids, lens)
+    attn._quant_plain_q = lambda q: (q.to(torch.float8_e4m3fn), torch.ones(q.shape[0]))
+    calls = []
+
+    def attention(**kwargs):
+        calls.append(kwargs)
+        kwargs["output"].fill_(3)
+
+    monkeypatch.setattr(fp8_attention, "sparse_mla_fp8_pt", attention)
+    q = torch.zeros((3, 8, 512), dtype=torch.bfloat16)
+    output = torch.full_like(q, -7)
+    attn.forward_mqa(q, None, torch.arange(3), output)
+    assert len(calls) == 1 and calls[0]["mask_invalid_kv"] is True
+    assert calls[0]["q"].shape[0] == 2
+    assert calls[0]["extra_k_cache"] is (cache if compressed else None)
+    assert torch.equal(output[:2], torch.full_like(output[:2], 3))
+    assert torch.equal(output[2:], torch.full_like(output[2:], -7))

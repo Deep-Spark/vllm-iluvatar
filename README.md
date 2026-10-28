@@ -89,11 +89,12 @@ bash scripts/build_image.sh
 ```
 
 The image is tagged for a container registry with a CPU-arch and build-date
-suffix (`<base-tag>-<arch>-<YYYYMMDD>`, arch defaulting to `uname -m`); override
-the target via the `REGISTRY` / `PROJECT` / `BASE_TAG` / `ARCH` / `BUILD_DATE`
-environment variables. The CoreX driver is deliberately **not** baked into the
-image; install it inside the (privileged) container before serving — see the
-comments at the top of the `Dockerfile`.
+suffix (`<base-tag>-<arch>-<YYYYMMDD>`, arch defaulting to `uname -m`); the vLLM
+version is carried by the repository name rather than the tag. Override the
+target via the `REGISTRY` / `PROJECT` / `NAME` / `BASE_TAG` / `ARCH` /
+`BUILD_DATE` environment variables. The CoreX driver is deliberately **not**
+baked into the image; install it inside the (privileged) container before
+serving — see the comments at the top of the `Dockerfile`.
 
 ## Documentation
 

@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -271,6 +270,10 @@ def _supported_vllm_config(**overrides) -> SimpleNamespace:
     }
     parallel.update(overrides.pop("parallel_config", {}))
     config = {
+        # The resolved property, not VLLM_USE_V2_MODEL_RUNNER: the gate reads
+        # vllm_config.use_v2_model_runner precisely so that an unset env var
+        # still resolves to the V2 runner, so patching the env has no effect.
+        "use_v2_model_runner": True,
         "parallel_config": SimpleNamespace(**parallel),
         "speculative_config": None,
         "compilation_config": SimpleNamespace(
@@ -294,8 +297,7 @@ def _supported_vllm_config(**overrides) -> SimpleNamespace:
 def test_qwen4_exp_accepts_the_supported_configuration() -> None:
     from vllm_iluvatar.models.qwen4_exp.model import _verify_supported_config
 
-    with patch("vllm.envs.VLLM_USE_V2_MODEL_RUNNER", True):
-        _verify_supported_config(_supported_vllm_config())
+    _verify_supported_config(_supported_vllm_config())
 
 
 def test_qwen4_exp_accepts_decode_only_full_cudagraph_without_compile() -> None:
@@ -305,10 +307,9 @@ def test_qwen4_exp_accepts_decode_only_full_cudagraph_without_compile() -> None:
         cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
         mode=CompilationMode.NONE,
     )
-    with patch("vllm.envs.VLLM_USE_V2_MODEL_RUNNER", True):
-        _verify_supported_config(
-            _supported_vllm_config(compilation_config=compilation_config)
-        )
+    _verify_supported_config(
+        _supported_vllm_config(compilation_config=compilation_config)
+    )
 
 
 @pytest.mark.parametrize(
@@ -328,10 +329,7 @@ def test_qwen4_exp_rejects_unsupported_cudagraph_modes(
         cudagraph_mode=cudagraph_mode,
         mode=CompilationMode.NONE,
     )
-    with (
-        patch("vllm.envs.VLLM_USE_V2_MODEL_RUNNER", True),
-        pytest.raises(NotImplementedError, match="FULL_DECODE_ONLY"),
-    ):
+    with pytest.raises(NotImplementedError, match="FULL_DECODE_ONLY"):
         _verify_supported_config(
             _supported_vllm_config(compilation_config=compilation_config)
         )
@@ -344,10 +342,7 @@ def test_qwen4_exp_rejects_compile_with_decode_only_cudagraph() -> None:
         cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
         mode=CompilationMode.VLLM_COMPILE,
     )
-    with (
-        patch("vllm.envs.VLLM_USE_V2_MODEL_RUNNER", True),
-        pytest.raises(NotImplementedError, match="mode=0"),
-    ):
+    with pytest.raises(NotImplementedError, match="mode=0"):
         _verify_supported_config(
             _supported_vllm_config(compilation_config=compilation_config)
         )
@@ -356,11 +351,8 @@ def test_qwen4_exp_rejects_compile_with_decode_only_cudagraph() -> None:
 def test_qwen4_exp_refuses_the_v1_model_runner() -> None:
     from vllm_iluvatar.models.qwen4_exp.model import _verify_supported_config
 
-    with (
-        patch("vllm.envs.VLLM_USE_V2_MODEL_RUNNER", False),
-        pytest.raises(NotImplementedError, match="VLLM_USE_V2_MODEL_RUNNER=1"),
-    ):
-        _verify_supported_config(_supported_vllm_config())
+    with pytest.raises(NotImplementedError, match="VLLM_USE_V2_MODEL_RUNNER=1"):
+        _verify_supported_config(_supported_vllm_config(use_v2_model_runner=False))
 
 
 @pytest.mark.parametrize(
@@ -394,10 +386,7 @@ def test_qwen4_exp_rejects_features_it_does_not_implement(
     """
     from vllm_iluvatar.models.qwen4_exp.model import _verify_supported_config
 
-    with (
-        patch("vllm.envs.VLLM_USE_V2_MODEL_RUNNER", True),
-        pytest.raises(NotImplementedError, match=match),
-    ):
+    with pytest.raises(NotImplementedError, match=match):
         _verify_supported_config(_supported_vllm_config(**overrides))
 
 

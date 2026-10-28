@@ -155,7 +155,9 @@ def test_ilu_full_forward_requires_positions():
         rotary_emb=None,
     )
 
-    with pytest.raises(AssertionError, match="requires positions"):
+    # The full-forward path asserts on positions only; rotary_emb is applied by
+    # the community fallback, which a callable forward_full bypasses entirely.
+    with pytest.raises(AssertionError, match="forward_full requires positions"):
         ilu_mla._ilu_mla_attention_forward(
             layer,
             q=torch.empty(0),

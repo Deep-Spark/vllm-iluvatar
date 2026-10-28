@@ -151,6 +151,18 @@ class IluGlm5NextMLP(Glm5NextMLP):
 
 
 class IluGateLinear(GateLinear):
+    # GLM-5.3's MoE router is a replicated, row-wise linear. Gathering the
+    # hidden states across the DP/EP group before gating is mathematically
+    # identical to gating then gathering (row i's logits depend only on row i),
+    # so at decode-sized batches the runner may run the gate once on the
+    # gathered rows: one larger GEMM plus one fewer logits collective. A model
+    # whose gate is not replicated row-wise simply leaves this False. A false
+    # positive would only pick a slower collective path, never a wrong result.
+    gather_before_gate = True
+    # Upper bound, in tokens per sequence-parallel shard, for preferring the
+    # gather-before-gate path (it only wins on decode-sized batches).
+    gather_before_gate_max_tokens = 32
+
     def forward(self, x):
         output = ixfops.linear(x, self.weight)
         return self._return(output)

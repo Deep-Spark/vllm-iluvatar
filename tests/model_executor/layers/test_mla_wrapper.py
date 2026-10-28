@@ -144,7 +144,7 @@ def test_ilu_mla_metadata_builder_expands_spec_decode_rows():
     assert expanded_seq_lens.tolist() == [4, 5, 5, 6, 7]
 
 
-def test_ilu_full_forward_requires_positions_and_rotary_emb():
+def test_ilu_full_forward_requires_positions():
     import pytest
     import torch
 
@@ -155,7 +155,7 @@ def test_ilu_full_forward_requires_positions_and_rotary_emb():
         rotary_emb=None,
     )
 
-    with pytest.raises(AssertionError, match="requires positions and rotary_emb"):
+    with pytest.raises(AssertionError, match="requires positions"):
         ilu_mla._ilu_mla_attention_forward(
             layer,
             q=torch.empty(0),

@@ -177,6 +177,7 @@ if TYPE_CHECKING:
     VLLM_ILU_GLM_DSA_NATIVE_MQA_LOGITS: bool = False
     VLLM_ILU_INDEXER_KV_DTYPE: str = "bf16"
     VLLM_ILU_GLM5NEXT_MLA_POOL4_DECODE: bool = True
+    VLLM_ILU_GLM5NEXT_GATHER_BEFORE_GATE: bool = True
     VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP: bool = False
     VLLM_ILU_GLM_DSA_INDEXER_PREPARE_FUSION: bool = True
     VLLM_ILU_NIXL_WRITE_USE_HOST_BUFFER: bool = False
@@ -294,6 +295,13 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
 _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_GLM5NEXT_MLA_POOL4_DECODE": _bool_reader(
         "VLLM_ILU_GLM5NEXT_MLA_POOL4_DECODE", "1"
+    ),
+    # Gather hidden states before the replicated GLM-5.3 MoE gate on decode
+    # batches (IluMoERunner._dispatch_before_gate). Default on: the benchmarks
+    # and serving were measured with it enabled. Set 0 for the baseline
+    # gate-then-dispatch path.
+    "VLLM_ILU_GLM5NEXT_GATHER_BEFORE_GATE": _bool_reader(
+        "VLLM_ILU_GLM5NEXT_GATHER_BEFORE_GATE", "1"
     ),
     "VLLM_ILU_INDEXER_KV_DTYPE": lambda: os.environ.get(
         "VLLM_ILU_INDEXER_KV_DTYPE", "bf16"

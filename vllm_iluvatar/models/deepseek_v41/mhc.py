@@ -169,14 +169,16 @@ def allreduce_hc_post(
     comb: torch.Tensor,
     group=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused attention-output all-reduce + V4.1 hc_post, lossless.
+    """Fused attention-output all-reduce + V4.1 hc_post.
 
     The all-reduce of the (tensor-parallel) attention output is folded into
     mhc_post, and the kernel still emits the per-token sum of squares of the
     residual it writes -- the same second output :func:`hc_post_sqrsum` returns.
     ``x`` is the local, unreduced o_proj output (``wo_b`` with
-    ``reduce_results=False``). Set ``VLLM_ILU_V41_ALLREDUCE_MHC_POST=0`` to keep
-    the separate all-reduce plus :func:`hc_post_sqrsum` instead.
+    ``reduce_results=False``). Numerically this matches the two-step path
+    except for floating-point reduction order (NCCL ring/tree vs the kernel's
+    own tree). Set ``VLLM_ILU_V41_ALLREDUCE_MHC_POST=0`` to keep the separate
+    all-reduce plus :func:`hc_post_sqrsum` instead.
 
     Returns ``(residual, sqrsum)`` exactly like :func:`hc_post_sqrsum`.
     """

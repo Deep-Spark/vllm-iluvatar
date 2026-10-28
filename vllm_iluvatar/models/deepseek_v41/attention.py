@@ -47,6 +47,7 @@ from vllm.v1.worker.workspace import current_workspace_manager
 from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.skip_layers import (
     add_skip_layers,
 )
+from vllm_iluvatar.ilu_util.arch import is_ivcore30
 from vllm_iluvatar.model_executor.layers.sparse_attn_indexer import (
     IluSparseAttnIndexer,
 )
@@ -104,13 +105,34 @@ warnings.filterwarnings(
 _INDEX_TILE = 256
 _PACKED_MLA_HEADS = (1, 8, 16, 32, 64, 128)
 _PT_MLA_HEADS = (1, 4, 8, 16, 32, 64, 128)
-# Prefill per-tensor FP8 sparse MLA uses the ixmma FMHADSA kernel.
-# Decode stays on sparse_mla_fp8_pt. IXFORMER_V41_FMHADSA=0 disables it.
-_V41_PREFILL_FMHADSA = os.environ.get("IXFORMER_V41_FMHADSA", "1") == "1"
-logger.info(
-    "V4.1 prefill FMHADSA=%s (decode stays on ixformer sparse_mla_fp8_pt)",
-    _V41_PREFILL_FMHADSA,
-)
+_V41_PREFILL_FMHADSA_ENV = os.environ.get("IXFORMER_V41_FMHADSA", "1") == "1"
+
+
+def _v41_prefill_fmhadsa() -> bool:
+    """Whether prefill should call ixformer ``fmhadsa``.
+
+    Native FMHADSA is an ixmma kernel registered for ivcore30 only. Forcing
+    ``backend=ixformer_native`` on ivcore11 would either error or fall through
+    to the torch reference; take ``sparse_mla_fp8_pt`` instead.
+    """
+    if not _V41_PREFILL_FMHADSA_ENV:
+        return False
+    if not is_ivcore30():
+        logger.warning_once(
+            "V4.1 prefill FMHADSA is off: the ixmma kernel is ivcore30-only; "
+            "falling back to sparse_mla_fp8_pt."
+        )
+        return False
+    if not hasattr(ixfops, "fmhadsa"):
+        logger.warning_once(
+            "V4.1 prefill FMHADSA is off: this ixformer has no fmhadsa; "
+            "falling back to sparse_mla_fp8_pt."
+        )
+        return False
+    logger.info_once(
+        "V4.1 prefill FMHADSA=on (decode stays on ixformer sparse_mla_fp8_pt)"
+    )
+    return True
 
 # Requests per workspace-gathered prefill chunk. Each one costs a row of
 # ``M * head_dim`` bf16, so this bounds the workspace rather than the batch.
@@ -1787,7 +1809,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         )
         sparse_op = (
             ixfops.fmhadsa
-            if use_fmhadsa
+            if use_fmhadsa and _v41_prefill_fmhadsa()
             else ixfops.sparse_mla_fp8_pt
         )
         sparse_op(
@@ -1926,7 +1948,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             extra_indices,
             extra_lens,
             output,
-            use_fmhadsa=_V41_PREFILL_FMHADSA,
+            use_fmhadsa=_v41_prefill_fmhadsa(),
         )
 
     def _gather_k_cache(

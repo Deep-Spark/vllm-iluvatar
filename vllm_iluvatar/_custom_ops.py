@@ -499,7 +499,7 @@ def topk_hash_softplus_sqrt(
             has_image_tokens = bool(
                 getattr(get_forward_context(), "ilu_v41_has_image_tokens", False)
             )
-        except Exception:
+        except AssertionError:
             has_image_tokens = False
     if has_image_tokens:
         # Vision-language bias: ixformer's kernel only takes a 1D

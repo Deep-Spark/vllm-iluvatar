@@ -97,7 +97,7 @@ def test_draft_decode_dispatches_noncausal_indices(monkeypatch):
     monkeypatch.setattr(
         IluDeepseekV41Attention,
         "_sparse_mla",
-        lambda self, q, idx, ln, *args: seen.append((idx, ln)),
+        lambda self, q, idx, ln, *args, **kwargs: seen.append((idx, ln)),
     )
     md = SimpleNamespace(causal=False, num_decodes=1, num_decode_tokens=5)
     a._forward_decode(None, None, None, md, None, True, None)

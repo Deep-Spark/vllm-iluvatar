@@ -821,6 +821,10 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 device=device,
             ),
         }
+        if not get_pp_group().is_first_rank:
+            tensors["input_ids"] = torch.zeros(
+                (batch_size,), dtype=torch.int32, device=device
+            )
         if self.pp_plan.recvs_kv:
             assert self.main_kv_record is not None
             assert self.indexer_kv_record is not None
@@ -949,12 +953,17 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
             has_image = bool((input_ids == self.image_dead_token_id).any().item())
         try:
             get_forward_context().ilu_v41_has_image_tokens = has_image
-        except Exception:
-            pass
+        except AssertionError:
+            # ``get_forward_context`` asserts when no forward context is set
+            # (tests, capture setup). Engram image masking does not use this
+            # flag: ``_prepare_engram`` still ANDs ``input_ids != dead_id``.
+            logger.debug(
+                "V4.1 image-token flag skipped: forward context is not set"
+            )
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
@@ -979,6 +988,7 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             pre_mix = intermediate_tensors["pre_mix"]
+            input_ids = intermediate_tensors["input_ids"]
             # Before any layer runs: the stranded group's caches have to hold
             # this step's rows by the time the first consumer reads them.
             self._accept_remote_kv(intermediate_tensors, positions)
@@ -1028,6 +1038,13 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 # designated sender.
                 assert self.candidate_idxs_buffer is not None
                 tensors["candidates"] = self.candidate_idxs_buffer[:num_tokens]
+            if input_ids is None:
+                raise ValueError(
+                    "DeepSeek V4.1 pipeline stage has no input_ids to forward."
+                )
+            if input_ids.dtype != torch.int32:
+                input_ids = input_ids.to(torch.int32)
+            tensors["input_ids"] = input_ids
             tensors.update(self.pack_local_aux_hidden_states(aux_hidden_states))
             return IntermediateTensors(tensors)
         hidden_states = mhc.hc_pre(hidden_states, pre_mix)

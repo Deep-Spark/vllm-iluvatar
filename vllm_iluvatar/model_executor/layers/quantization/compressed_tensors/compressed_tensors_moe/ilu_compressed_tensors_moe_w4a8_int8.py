@@ -762,6 +762,108 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             output.mul_(output_scale)
         return output
 
+    def _use_ep_packed_decode(
+        self, layer: RoutedExperts, x: torch.Tensor, run_decode: bool
+    ) -> bool:
+        # Preserve existing prefill, smooth-quant and padded intermediate paths.
+        return (
+            run_decode
+            and 0 < x.shape[0] <= 512
+            and x.dtype == torch.bfloat16
+            and x.shape[1] == 4096
+            and layer.global_num_experts == 288
+            and layer.local_num_experts == 18
+            and layer.top_k == 8
+            and self.version == 2
+            and self.group_size == -1
+            and self.gemm1_info.format_str == "TN"
+            and self.gemm2_info.format_str == "TN"
+            and self.gemm1_info.get_n() == self.gemm1_info.get_pad_n()
+            and self.gemm2_info.get_k() == self.gemm2_info.get_pad_k()
+            and layer.w13_input_scale is None
+            and layer.w2_input_scale is None
+            and layer.activation.value in ("silu", "swiglu")
+            and getattr(layer, "swiglu_limit", None) == 10
+        )
+
+    def _apply_ep_packed_decode(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Compact EP rows like GLM5.2; retain Flash's TN V2 GEMV and clamp math."""
+        num_tokens = topk_ids.shape[0]
+        full = num_tokens * layer.top_k
+        start = layer.moe_config.ep_rank * layer.local_num_experts
+        end = min(start + layer.local_num_experts, layer.global_num_experts)
+        # Consumers use inverse routing or the device valid-row count; tail is unread.
+        sorted_token_ids = torch.empty((full,), dtype=torch.int32, device=x.device)
+        src_to_expert_row, dst_to_packed, weights_packed, offsets, counts, total = (
+            ixfops.moe_compute_token_index_ep_packed_for_decode(
+                topk_ids=topk_ids,
+                num_experts=layer.global_num_experts,
+                start_expert_id=start,
+                end_expert_id=end,
+                topk_weights=topk_weights,
+                dst_to_src=sorted_token_ids,
+                graph_safe=True,
+            )
+        )
+        act, scales = self._expand_and_quant(
+            layer,
+            x,
+            full,
+            sorted_token_ids,
+            src_to_expert_row,
+            output_format=1,
+            check_valid=True,
+        )
+        act = ixfops.moe_w4a8_group_gemv(
+            input=act,
+            weight=layer.w13_weight,
+            i_scales=scales,
+            w_scales=layer.w13_weight_scale,
+            output_dtype=x.dtype,
+            tokens_per_experts=counts,
+            w_i8scales=layer.w13_i8_weight_scale,
+            w_i8zeros=layer.w13_i8_weight_zero,
+            bias=layer.w13_bias,
+            format=self.gemm1_info.format,
+            group_size=self.group_size,
+        )
+        act, scales = ixfops.activation_dynamic_scaled_int8(
+            input=act,
+            act_type="swiglu",
+            output_format=1,
+            expand_tokens_gpu=total,
+            limit=layer.swiglu_limit,
+        )
+        out = ixfops.moe_w4a8_group_gemv(
+            input=act,
+            weight=layer.w2_weight,
+            i_scales=scales,
+            w_scales=layer.w2_weight_scale,
+            output_dtype=x.dtype,
+            tokens_per_experts=counts,
+            w_i8scales=layer.w2_i8_weight_scale,
+            w_i8zeros=layer.w2_i8_weight_zero,
+            dst_to_src=dst_to_packed,
+            bias=layer.w2_bias,
+            format=self.gemm2_info.format,
+            group_size=self.group_size,
+        )
+        out = unpad_tensor(out, self.gemm2_info.get_n(), contiguous=False)
+        return ixfops.moe_output_reduce_sum_ep(
+            input=out,
+            token_row_offsets=offsets,
+            weights=weights_packed,
+            scaling_factor=_get_ilu_output_scale(layer),
+            extra_residual=shared_experts_input,
+        )
+
     def _apply_ep(
         self,
         layer: RoutedExperts,
@@ -783,6 +885,11 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         num_experts = layer.global_num_experts
         hidden_size = x.shape[1]
         decode_gemm = run_decode and getattr(self, "decode_group_gemm", False)
+
+        if self._use_ep_packed_decode(layer, x, run_decode):
+            return self._apply_ep_packed_decode(
+                layer, x, topk_weights, topk_ids, shared_experts_input
+            )
 
         if run_decode:
             (
@@ -1445,7 +1552,9 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         #   y    = silu(gate) * up
         # i.e. SiluAndMulWithClamp followed by dynamic int8 quant.
         #
-        # ixformer's ``activation_dynamic_scaled_int8`` doesn't clamp gate/up;
+        # The legacy call below does not request a clamp on
+        # ``activation_dynamic_scaled_int8``; the packed decode path uses its
+        # optional limit together with the device valid-row count.
         # ``activation_swigluoai_dynamic_scaled_int8`` clamps but uses the
         # OpenAI formula ``(clamp_up + 1) * sigmoid(alpha * clamp_gate) *
         # clamp_gate`` which is *not* the DeepSeek-V4 formula. When

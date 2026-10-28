@@ -25,6 +25,7 @@ LEGACY_RECIPES = {
     "stepfun/step3p7_w4a8": "stepfun/step3_7_w4a8",
     "tencent/hy3": "tencent/hy3_w4a8",
     "zhipu/glm_52": "zhipu/glm5_2_w4a8",
+    "zhipu/glm_53": "zhipu/glm5_3_w4a8",
 }
 
 

@@ -66,6 +66,8 @@ def _make_stub_runner(
     obj.moe_config = moe_config
     obj.routed_scaling_factor = routed_scaling_factor
     obj.shared_experts_scaling_factor = 1.0
+    # Normally set in __init__ from envs; the stub bypasses __init__.
+    obj._gather_before_gate_enabled = True
 
     shared = MagicMock() if has_shared_experts else None
     obj._shared_experts = shared

@@ -12,7 +12,7 @@ Override summary (each marked with ``# [ILU override]`` in-line):
   _select_forward                   bypass torch.compile custom ops
   forward                           tuple hidden_states (fused norm-quant)
   _apply_quant_method               fused shared output path
-  _forward_impl                     pass input_ids through dispatch
+  _forward_impl                     pass input_ids; gather before replicated gate
   _maybe_dispatch                   input_ids + _kernel_handles_own_dispatch
   _maybe_combine                    _kernel_handles_own_dispatch guard
   _maybe_apply_routed_scale_to_output  FP16 shared_experts_scaling_factor
@@ -26,8 +26,10 @@ from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
+from vllm import envs
 from vllm.config import get_current_vllm_config
-from vllm.distributed import get_ep_group, get_pcp_group
+from vllm.distributed import get_dp_group, get_ep_group, get_pcp_group
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
     MoERunner,
@@ -39,6 +41,21 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
 )
 
 logger = init_logger(__name__)
+
+# Interface contract for the gather-before-gate path (``_dispatch_before_gate``).
+# A model opts in by setting ``gather_before_gate = True`` on its gate and may
+# override ``gather_before_gate_max_tokens`` to tune the decode-batch bound; see
+# IluGateLinear in vllm_iluvatar/models/glm5next/model.py.
+#
+# The defaults live here rather than on a base class because every ILU gate
+# derives straight from the upstream
+# ``vllm.model_executor.layers.fused_moe.router.gate_linear.GateLinear`` (they are
+# siblings, not a chain), and ``self.gate`` may be any model's gate -- including
+# gates from models we do not override at all. Declaring the defaults upstream is
+# not an option, so both attributes are read through ``getattr`` with these
+# fallbacks: a gate that sets the flag but forgets the bound still works.
+GATHER_BEFORE_GATE_DEFAULT = False
+GATHER_BEFORE_GATE_MAX_TOKENS_DEFAULT = 32
 
 
 class IluMoERunner(MoERunner):
@@ -53,6 +70,11 @@ class IluMoERunner(MoERunner):
     def __init__(self, *args, routed_scaling_factor: float = 1.0, **kwargs):
         super().__init__(*args, routed_scaling_factor=routed_scaling_factor, **kwargs)
         logger.info_once("Use Iluvatar MoERunner.")
+
+        # Performance-path toggle: gather hidden states before the replicated
+        # gate on eligible models (see ``_dispatch_before_gate``). Default on —
+        # the benchmarks and serving were measured with it enabled.
+        self._gather_before_gate_enabled = envs.VLLM_ILU_GLM5NEXT_GATHER_BEFORE_GATE
 
         if get_current_vllm_config().parallel_config.enable_elastic_ep:
             from vllm_iluvatar.model_executor.layers.fused_moe.runner.ilu_elastic_ep import (  # noqa: E501
@@ -240,8 +262,57 @@ class IluMoERunner(MoERunner):
             fused_out,
         )
 
-    # [ILU override] _forward_impl — delta: pass input_ids through
-    # _maybe_dispatch (3-tuple return).
+    def _dispatch_before_gate(self) -> bool:
+        # Gather hidden rows before the gate when the model opts in via its gate
+        # (``gather_before_gate``): the router is replicated row-wise, so this
+        # avoids a second collective for logits and exposes a larger GEMM to the
+        # gate kernel. Eligibility is a model property, not a shape fingerprint;
+        # a false positive only changes the collective path, never the result.
+        gate = self.gate
+        if not (
+            self._gather_before_gate_enabled
+            and getattr(gate, "gather_before_gate", GATHER_BEFORE_GATE_DEFAULT)
+            and self.do_naive_dispatch_combine
+            and not self._kernel_handles_own_dispatch
+            and self.moe_config.moe_parallel_config.all2all_backend
+            == "allgather_reducescatter"
+            and self.moe_config.pcp_size == 1
+            and not self._fse_fuse_gate
+        ):
+            return False
+        metadata = get_forward_context().dp_metadata
+        if metadata is None:
+            return False
+        # Every EP rank must choose the same collective sequence, including
+        # mixed prefill/decode and idle DP ranks. This metadata is already CPU
+        # resident and shared across DP; no extra collective or GPU sync.
+        max_tokens = int(metadata.num_tokens_across_dp_cpu.max())
+        max_per_shard = getattr(
+            gate,
+            "gather_before_gate_max_tokens",
+            GATHER_BEFORE_GATE_MAX_TOKENS_DEFAULT,
+        )
+        return 0 < max_tokens <= max_per_shard * self.moe_config.sp_size
+
+    def _gather_before_gate(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # Called inside _sequence_parallel_context, as with normal dispatch.
+        metadata = get_forward_context().dp_metadata
+        assert metadata is not None
+        sizes = metadata.get_chunk_sizes_across_dp_rank()
+        group = (
+            get_ep_group() if self.moe_config.is_sequence_parallel else get_dp_group()
+        )
+        assert sizes[group.rank_in_group] == hidden_states.shape[0]
+        tensors = [hidden_states]
+        if input_ids is not None:
+            tensors.append(input_ids)
+        gathered = group.all_gatherv(tensors, dim=0, sizes=sizes)
+        return gathered[0], gathered[1] if input_ids is not None else None
+
+    # [ILU override] _forward_impl — pass input_ids through dispatch and
+    # gather hidden states before the replicated GLM decode gate when eligible.
     def _forward_impl(
         self,
         hidden_states: torch.Tensor,
@@ -250,6 +321,7 @@ class IluMoERunner(MoERunner):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         self.routed_experts._ensure_moe_quant_config_init()
+        dispatch_before_gate = self._dispatch_before_gate()
         # vLLM v0.31.0 (db9527a468) removed ``_maybe_sync_shared_experts_stream`` (the
         # pre-dispatch aux-stream sync) and replaced it with
         # ``SharedExperts.maybe_forward_async`` + ``wait``. ILU does NOT use
@@ -257,7 +329,7 @@ class IluMoERunner(MoERunner):
         # orchestrates shared experts synchronously via ``_maybe_apply_shared_experts``
         # (NO_OVERLAP before routed experts, MULTI_STREAM_OVERLAPPED after), so
         # there is nothing to sync here. Drop the stale call.
-        if self.gate is not None:
+        if self.gate is not None and not dispatch_before_gate:
             if self._fse_fuse_gate:
                 self._maybe_fuse_gate_weights()
                 router_logits = F.linear(hidden_states, self._combined_gate_weight)
@@ -265,11 +337,15 @@ class IluMoERunner(MoERunner):
                 router_logits, _ = self.gate(hidden_states)
 
         with self._sequence_parallel_context():
-            hidden_states, router_logits, input_ids = self._maybe_dispatch(
-                hidden_states,
-                router_logits,
-                input_ids,
-            )
+            if dispatch_before_gate:
+                hidden_states, input_ids = self._gather_before_gate(
+                    hidden_states, input_ids
+                )
+                router_logits, _ = self.gate(hidden_states)
+            else:
+                hidden_states, router_logits, input_ids = self._maybe_dispatch(
+                    hidden_states, router_logits, input_ids
+                )
 
             shared_output, hidden_states = self._apply_quant_method(
                 hidden_states=hidden_states,
@@ -282,7 +358,7 @@ class IluMoERunner(MoERunner):
                 shared_output,
                 hidden_states,
             )
-            
+
     @property
     def _needs_pcp_dispatch_combine(self) -> bool:
         return self.moe_config.pcp_size > 1 and (

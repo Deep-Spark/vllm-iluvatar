@@ -8,6 +8,7 @@ from collections import deque
 
 import numpy as np
 import torch
+from vllm.logger import init_logger
 
 from .cache_rows import copy_indexer_row_to_host, main_boundary_sources
 from .configuration import (
@@ -18,6 +19,8 @@ from .configuration import (
 )
 from .runtime import PrefixRuntime
 from .source_state import replay_layout, request_dir
+
+logger = init_logger(__name__)
 
 
 def save(path, value):
@@ -136,6 +139,58 @@ class ProducerPrefixState(PrefixRuntime):
 
     def end_step(self):
         self._src_batch = None
+
+    def tail_ffn_rows(self, num_tokens: int) -> tuple[int, ...] | None:
+        """Rows whose final producer FFN output is still consumed.
+
+        None keeps the original full batch. An empty tuple skips the FFN;
+        every cache write and the attention path still process the full batch.
+        """
+        if (
+            not self._src_ready
+            or self._src_batch is None
+            or self._src_pp != self.topology.boundary_pp
+            or self.vllm_config.parallel_config.tensor_parallel_size != 1
+        ):
+            return None
+        intervals = []
+        covered = retained = 0
+        with self._src_lock:
+            for row in self._src_batch:
+                begin, count = row["q0"], row["q"]
+                end = begin + count
+                if begin != covered or count < 0 or end > num_tokens:
+                    return None
+                covered = end
+                lower, upper = begin, end
+                state = self._src_active.get(row["id"])
+                if (
+                    row["prefill"]
+                    and state is not None
+                    and state["phase"] == "ACTIVE"
+                    and not state["abort"]
+                    and state["pool"] is not None
+                    and state["idx"] == row["idx"]
+                    and state["generation"] == self._src_generations.get(row["idx"])
+                    and state["N"] == row["N"]
+                    and 0 <= row["c"] <= row["c"] + count <= state["N"]
+                    and 0 <= state["S"] <= state["N"]
+                ):
+                    lower = begin + max(0, state["S"] - row["c"])
+                    upper = begin + min(count, state["N"] - row["c"])
+                    lower = min(lower, upper)
+                intervals.append((lower, upper))
+                retained += upper - lower
+        if covered != num_tokens or retained == num_tokens:
+            return None
+        if not getattr(self, "_ffn_trim_reported", False):
+            logger.info(
+                "Producer final FFN keeps %d of %d rows; attention/KV keeps all rows",
+                retained,
+                num_tokens,
+            )
+            self._ffn_trim_reported = True
+        return tuple(index for begin, end in intervals for index in range(begin, end))
 
     def _scalar(self, state):
         result = {

@@ -110,3 +110,67 @@ def test_only_live_rows_enter_prefix_attention_but_all_rows_enter_moe(
         assert torch.equal(actual[:valid], expected)
     assert test.attn.forward.__func__ is original_attention
     assert test.engram.forward.__func__ is original_engram
+
+
+@pytest.mark.parametrize("rows", [None, (), (0, 2, 5), tuple(range(6))])
+def test_tail_ffn_preserves_inputs_and_scopes_selected_padding(rows):
+    from vllm.forward_context import ForwardContext, override_forward_context
+
+    context = ForwardContext(
+        no_compile_layers={}, attn_metadata={}, slot_mapping={},
+        is_padding=torch.tensor([False, True, False, True, False, True]),
+    )
+    seen = []
+
+    class InspectMoE(nn.Module):
+        def forward(self, x, ids):
+            current = module.get_forward_context()
+            current.moe_layer_index += 1
+            seen.append((x.clone(), ids.clone(), current.is_padding.clone()))
+            return x + ids[:, None]
+
+    block = layer(0)
+    block.ffn = InspectMoE()
+    h = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    original = h.clone()
+    ids = torch.arange(6)
+    kept = tuple(range(6)) if rows is None else rows
+    with override_forward_context(context):
+        result = block._forward_tail_ffn(h, ids, rows)
+        assert module.get_forward_context() is context
+    expected = torch.zeros_like(h)
+    if kept:
+        index = torch.tensor(kept)
+        expected[index] = h[index] + ids[index, None]
+        assert len(seen) == 1
+        torch.testing.assert_close(seen[0][0], h[index])
+        torch.testing.assert_close(seen[0][1], ids[index])
+        torch.testing.assert_close(seen[0][2], context.is_padding[index])
+    else:
+        assert not seen
+    torch.testing.assert_close(result, expected)
+    torch.testing.assert_close(h, original)
+    assert context.moe_layer_index == bool(kept)
+
+
+def test_tail_ffn_restores_context_and_inputs_on_exception():
+    from vllm.forward_context import ForwardContext, override_forward_context
+
+    class FailingMoE(nn.Module):
+        def forward(self, x, ids):
+            assert len(module.get_forward_context().is_padding) == 2
+            raise ValueError("synthetic FFN failure")
+
+    block = layer(0)
+    block.ffn = FailingMoE()
+    context = ForwardContext(
+        no_compile_layers={}, attn_metadata={}, slot_mapping={},
+        is_padding=torch.zeros(6, dtype=torch.bool),
+    )
+    h = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    original = h.clone()
+    with override_forward_context(context):
+        with pytest.raises(ValueError, match="synthetic FFN failure"):
+            block._forward_tail_ffn(h, torch.arange(6), (1, 5))
+        assert module.get_forward_context() is context
+    torch.testing.assert_close(h, original)

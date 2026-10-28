@@ -387,3 +387,82 @@ def test_native_connector_scheduler_delivers_receipts_without_scheduler_patches(
     meta = scheduler.build_connector_meta(output)
     assert meta.source_full_ready_receipts["r"]["query_rows"] == 129
     assert meta.source_full_ready_receipts["r"]["groups"][0] == ids[0]
+
+
+def tail_source(batch):
+    from vllm_iluvatar.v1.worker.prefill_state.producer import ProducerPrefixState
+
+    source = ProducerPrefixState.__new__(ProducerPrefixState)
+    source._src_ready = True
+    source._src_pp = 7
+    source.topology = NS(boundary_pp=7)
+    source.vllm_config = NS(parallel_config=NS(tensor_parallel_size=1))
+    source._src_lock = threading.Lock()
+    source._src_batch = batch
+    source._src_active = {}
+    source._src_generations = {}
+    for row in batch:
+        source._src_generations[row["idx"]] = 1
+        source._src_active[row["id"]] = dict(
+            phase="ACTIVE", abort=False, pool=object(), idx=row["idx"], generation=1,
+            N=row["N"], S=max(0, row["N"] - row["N"] % 2 - 128),
+        )
+    return source
+
+
+@pytest.mark.parametrize(
+    "n,chunk,computed",
+    [(96, 2048, 0), (4097, 4096, 0), (8191, 4096, 4096),
+     (8192, 3072, 6144), (1048576, 2048, 0), (1048576, 4096, 1044480)],
+)
+def test_producer_ffn_keeps_complete_even_or_odd_tail(n, chunk, computed):
+    count = min(chunk, n - computed)
+    source = tail_source([
+        dict(id="r", idx=0, q0=0, q=count, c=computed, N=n, prefill=True)
+    ])
+    begin = max(0, n - 128 - n % 2)
+    expected = tuple(i for i in range(count) if computed + i >= begin)
+    assert source.tail_ffn_rows(count) == (
+        None if len(expected) == count else expected
+    )
+
+
+def test_producer_ffn_mixed_rows_preserve_decode_and_unknown_requests():
+    source = tail_source([
+        dict(id="long", idx=0, q0=0, q=10, c=0, N=10000, prefill=True),
+        dict(id="decode", idx=1, q0=10, q=2, c=129, N=128, prefill=False),
+        dict(id="unknown", idx=2, q0=12, q=3, c=0, N=10000, prefill=True),
+    ])
+    source._src_active.pop("unknown")
+    assert source.tail_ffn_rows(15) == tuple(range(10, 15))
+
+
+@pytest.mark.parametrize("unsupported", ["pool", "generation", "phase", "N", "abort"])
+def test_producer_ffn_ineligible_state_keeps_original_batch(unsupported):
+    source = tail_source([
+        dict(id="r", idx=0, q0=0, q=8, c=0, N=10000, prefill=True)
+    ])
+    source._src_active["r"][unsupported] = {
+        "pool": None, "generation": 2, "phase": "EXPORT_PENDING",
+        "N": 9999, "abort": True,
+    }[unsupported]
+    assert source.tail_ffn_rows(8) is None
+
+
+@pytest.mark.parametrize("reason", ["warmup", "other_pp", "tp", "padding", "gap"])
+def test_producer_ffn_unsupported_layout_keeps_original_batch(reason):
+    source = tail_source([
+        dict(id="r", idx=0, q0=0, q=8, c=0, N=10000, prefill=True)
+    ])
+    tokens = 8
+    if reason == "warmup":
+        source._src_ready = False
+    elif reason == "other_pp":
+        source._src_pp = 6
+    elif reason == "tp":
+        source.vllm_config.parallel_config.tensor_parallel_size = 2
+    elif reason == "padding":
+        tokens = 16
+    else:
+        source._src_batch[0]["q0"] = 1
+    assert source.tail_ffn_rows(tokens) is None

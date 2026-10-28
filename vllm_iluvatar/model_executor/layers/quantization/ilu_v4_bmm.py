@@ -192,13 +192,37 @@ class IluV4W8A8BMMLinearMethod(IluV4W8A16BMMLinearMethod):
         import ixformer.inference.functions as ixf_ops
 
         groups = layer.bmm_geom.n_local_groups
-        channels = layer.bmm_geom.o_lora_rank
-        projected = output.new_empty((output.shape[0], groups, channels))
         if output.shape[0] == 0:
-            return projected
+            return output.new_empty((0, groups, layer.bmm_geom.o_lora_rank))
         activations, scales = ixf_ops.ds4_inv_rope_int8_quant(
             output, positions, cos_sin_cache, groups
         )
+        return self.apply_quantized(
+            layer, activations, scales, output_dtype=output.dtype
+        )
+
+    def apply_quantized(self, layer, activations, scales, *, output_dtype):
+        """Consume already rotated grouped INT8 values without re-quantizing."""
+        import ixformer.inference.functions as ixf_ops
+
+        groups = layer.bmm_geom.n_local_groups
+        width = layer.bmm_geom.heads_per_group * layer.bmm_geom.head_dim
+        if (
+            activations.dim() != 3
+            or activations.shape[0] != groups
+            or activations.shape[2] != width
+            or activations.dtype != torch.int8
+            or tuple(scales.shape) != tuple(activations.shape[:2])
+            or scales.dtype != torch.float32
+        ):
+            raise ValueError("Grouped WO-A requires INT8 [G,T,K] and FP32 [G,T]")
+        projected = torch.empty(
+            (activations.shape[1], groups, layer.bmm_geom.o_lora_rank),
+            dtype=output_dtype,
+            device=activations.device,
+        )
+        if activations.shape[1] == 0:
+            return projected
         ixf_ops.w8a8_bmm(
             activations,
             layer.W_int8_grouped,

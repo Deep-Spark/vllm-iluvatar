@@ -118,6 +118,7 @@ if TYPE_CHECKING:
     VLLM_ILU_E25_COMPACT_ENGRAM: bool = False
     VLLM_ILU_DS41_DECODE_KV_RESTORE: bool = False
     VLLM_ILU_DS41_GROUPED_INT8_O_PROJ: bool = False
+    VLLM_ILU_DS41_WOA_INPUT_MODE: str = "legacy"
     VLLM_ILU_DS4_PREFILL_OPT: bool = False
     VLLM_ILU_DS4_PREFILL_AS_DECODE: bool = True
     VLLM_ILU_DS4_C4A_FUSED_INDEXCOMPRESS: bool = False
@@ -252,6 +253,9 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ILU_DS41_GROUPED_INT8_O_PROJ": _bool_reader(
         "VLLM_ILU_DS41_GROUPED_INT8_O_PROJ", "0"
+    ),
+    "VLLM_ILU_DS41_WOA_INPUT_MODE": lambda: os.environ.get(
+        "VLLM_ILU_DS41_WOA_INPUT_MODE", "legacy"
     ),
     "VLLM_ILU_CUDAGRAPH_ASYNC_REPLAY": _bool_reader(
         "VLLM_ILU_CUDAGRAPH_ASYNC_REPLAY", "0"

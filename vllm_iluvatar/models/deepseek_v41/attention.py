@@ -10,6 +10,9 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 import ixformer.inference.functions as ixfops
 import torch
 import vllm.envs as envs
+from ixformer.inference.functions.deepseek.quantized_sparse_mla_int8 import (
+    GroupedInt8AttentionOutput,
+)
 from torch import nn
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -265,7 +268,9 @@ class IluDeepseekV41IndexerCache(torch.nn.Module, AttentionLayerBase):
                 raise ValueError("Split indexer payload must contain128 INT8 values")
             owner = getattr(self, "_indexer_scale_owner", None)
             if owner is None:
-                raise RuntimeError("Split indexer scales must be bound before its payload")
+                raise RuntimeError(
+                    "Split indexer scales must be bound before its payload"
+                )
             owner.bind(self.prefix, cache)
             self.kv_cache = cache
             return
@@ -1171,14 +1176,20 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             indexer_metadata = cast(Any, attn_metadata[indexer_cache.prefix])
             if indexer_cache.split_indexer:
                 ixfops.indexer_int8_insert_split(
-                    indexer_rows, indexer_cache.kv_cache,
-                    indexer_cache.kv_cache_scales, indexer_metadata.slot_mapping,
-                    positions, self.compress_ratio,
+                    indexer_rows,
+                    indexer_cache.kv_cache,
+                    indexer_cache.kv_cache_scales,
+                    indexer_metadata.slot_mapping,
+                    positions,
+                    self.compress_ratio,
                 )
             else:
                 move_rows_to_paged_cache(
-                    indexer_rows, indexer_cache.kv_cache,
-                    indexer_metadata.slot_mapping, positions, self.compress_ratio,
+                    indexer_rows,
+                    indexer_cache.kv_cache,
+                    indexer_metadata.slot_mapping,
+                    positions,
+                    self.compress_ratio,
                 )
 
         # The selection is a plain per-rank buffer, so taking it over is a
@@ -1198,6 +1209,9 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         )
 
         self._grouped_int8_o_proj = False
+        self._woa_input_mode = envs.VLLM_ILU_DS41_WOA_INPUT_MODE
+        if self._woa_input_mode not in ("legacy", "reader_int8"):
+            raise ValueError("WO-A input mode must be legacy or reader_int8")
         method = self.wo_a.quant_method
         explicit = isinstance(method, IluV4W8A8BMMLinearMethod)
         if not explicit and not envs.VLLM_ILU_DS41_GROUPED_INT8_O_PROJ:
@@ -1207,7 +1221,9 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         )
         if explicit:
             if not supported:
-                raise ValueError("Grouped INT8 output projection geometry is unsupported")
+                raise ValueError(
+                    "Grouped INT8 output projection geometry is unsupported"
+                )
             self._grouped_int8_o_proj = True
         elif supported and type(method) is IluV4W8A16BMMLinearMethod:
             self.wo_a.quant_method = IluV4W8A8BMMLinearMethod(
@@ -1302,13 +1318,23 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        self._prepare_and_attn(
+        projection_input = self._prepare_and_attn(
             hidden_states, qr, kv, kv_score, indexer_weights, positions, attn_out
         )
         if getattr(self, "_grouped_int8_o_proj", False):
-            grouped = self.wo_a.quant_method.apply_with_rope(
-                self.wo_a, attn_out, positions, self.cos_sin
-            )
+            if isinstance(projection_input, GroupedInt8AttentionOutput):
+                if not projection_input.inverse_rope_applied:
+                    raise ValueError("Grouped WO-A reader did not apply inverse RoPE")
+                grouped = self.wo_a.quant_method.apply_quantized(
+                    self.wo_a,
+                    projection_input.values,
+                    projection_input.scales,
+                    output_dtype=hidden_states.dtype,
+                )
+            else:
+                grouped = self.wo_a.quant_method.apply_with_rope(
+                    self.wo_a, attn_out, positions, self.cos_sin
+                )
             return self.wo_b(grouped.flatten(1))
         if not self._uses_fused_inverse_rope():
             apply_rope(attn_out.unsqueeze(0), positions, self.cos_sin, inverse=True)
@@ -1403,7 +1429,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         indexer_weights: torch.Tensor | None,
         positions: torch.Tensor,
         out: torch.Tensor,
-    ) -> None:
+    ) -> GroupedInt8AttentionOutput | None:
         """Attention input preparation followed by the sparse indexer and MLA.
 
         Q preparation and the KV insert precede compression; once the latent is
@@ -1455,7 +1481,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 "layer_name", "kv_cache", "attn_metadata"
             )
 
-        self._sparse_indexer_and_attn(
+        return self._sparse_indexer_and_attn(
             hidden_states,
             index_q,
             index_weights_out,
@@ -1471,7 +1497,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         kv: torch.Tensor,
         positions: torch.Tensor,
         output: torch.Tensor,
-    ) -> None:
+    ) -> GroupedInt8AttentionOutput | None:
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
 
@@ -1498,6 +1524,14 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         num_decodes = swa_metadata.num_decodes
         num_prefills = swa_metadata.num_prefills
         num_decode_tokens = swa_metadata.num_decode_tokens
+        quantize_output = (
+            getattr(self, "_grouped_int8_o_proj", False)
+            and getattr(self, "_woa_input_mode", "legacy") == "reader_int8"
+            and num_prefills == 0
+            and num_decodes > 0
+            and q.shape[0] == num_decode_tokens
+            and not swa_only
+        )
 
         if (
             self.compressed_kv_format is not None
@@ -1519,6 +1553,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                     "Compressed KV attention workspace is not initialized"
                 )
             assert flashmla_metadata is not None and self_kv_cache is not None
+            projection_input = None
             with self.compressed_kv_workspace.read_scope() as workspace:
                 selection = self._prepare_compressed_family(
                     q if num_prefills else q[:num_decode_tokens],
@@ -1540,7 +1575,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                         selection=selection,
                     )
                 if num_decodes > 0:
-                    self._forward_decode(
+                    projection_input = self._forward_decode(
                         q=q[:num_decode_tokens],
                         positions=positions[:num_decode_tokens],
                         compressed_k_cache=self_kv_cache,
@@ -1548,8 +1583,9 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                         attn_metadata=flashmla_metadata,
                         swa_metadata=swa_metadata,
                         selection=selection,
+                        quantize_output=quantize_output,
                     )
-            return
+            return projection_input
 
         if num_prefills > 0:
             prefill_q = q[num_decode_tokens:]
@@ -1585,13 +1621,14 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
 
         if num_decodes > 0:
             decode_out = output[:num_decode_tokens]
-            self._forward_decode(
+            return self._forward_decode(
                 q=q[:num_decode_tokens],
                 positions=positions[:num_decode_tokens],
                 compressed_k_cache=self_kv_cache,
                 output=decode_out,
                 attn_metadata=flashmla_metadata if not swa_only else None,
                 swa_metadata=swa_metadata,
+                quantize_output=quantize_output,
             )
 
     def _sparse_indexer_and_attn(
@@ -1603,7 +1640,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         kv: torch.Tensor,
         positions: torch.Tensor,
         out: torch.Tensor,
-    ) -> None:
+    ) -> GroupedInt8AttentionOutput | None:
         if self.indexer is not None and index_q is not None:
             assert index_weights is not None
             self.indexer.indexer_op(
@@ -1615,7 +1652,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             if self.compressed_kv_workspace is not None:
                 self.compressed_kv_workspace.restore.invalidate()
 
-        self.forward_mqa(q, kv, positions, out)
+        return self.forward_mqa(q, kv, positions, out)
 
     def _prepare_compressed_family(
         self, q, positions, output, cache, attn_metadata, swa_metadata, workspace
@@ -1873,7 +1910,8 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         positions: torch.Tensor,
         prefill: bool = False,
         restore_plan=None,
-    ) -> None:
+        quantize_output: bool = False,
+    ) -> GroupedInt8AttentionOutput | None:
         """Sparse MLA over the window and, for compressed layers, the top-k.
 
         Both kernels below are per-token -- every query token is its own batch
@@ -1911,6 +1949,36 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 )
             fused_inverse = self._uses_fused_inverse_rope()
             with self.compressed_kv_workspace.acquire(nested=True) as workspace:
+                if quantize_output and not prefill:
+                    from ixformer.inference.functions.deepseek.quantized_sparse_mla import (
+                        QuantizedSparseMlaAffineView,
+                    )
+                    from ixformer.inference.functions.deepseek.quantized_sparse_mla_int8 import (
+                        quantized_sparse_mla_int8,
+                    )
+
+                    retained = workspace if restore_plan is None else restore_plan
+                    if isinstance(
+                        retained, (torch.Tensor, QuantizedSparseMlaAffineView)
+                    ):
+                        return quantized_sparse_mla_int8(
+                            q.unsqueeze(1),
+                            self.swa_cache_layer.kv_cache.unsqueeze(-2),
+                            _batched_index_rows(swa_indices),
+                            swa_lens,
+                            extra_cache,
+                            self._compressed_kv_scales(),
+                            _batched_index_rows(extra_indices),
+                            extra_lens,
+                            self.scale,
+                            format=self.compressed_kv_format,
+                            groups=self.wo_a.bmm_geom.n_local_groups,
+                            attn_sink=self.attn_sink,
+                            positions=positions,
+                            cos_sin_cache=self.cos_sin,
+                            workspace=retained,
+                            bf16_scratch=output.unsqueeze(1),
+                        )
                 reader(
                     q.unsqueeze(1),
                     self.swa_cache_layer.kv_cache.unsqueeze(-2),
@@ -1994,7 +2062,8 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         swa_metadata: DeepseekSparseSWAMetadata,
         attn_metadata: IluDeepseekV4FlashMLAMetadata | None,
         selection: CompressedFamilySelection | None = None,
-    ) -> None:
+        quantize_output: bool = False,
+    ) -> GroupedInt8AttentionOutput | None:
         if selection is not None:
             if selection.compact_plan is not None:
                 raise ValueError("Compact plans require a pure-prefill family")
@@ -2019,7 +2088,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 # Its packed reader leases only scratch, preserving the new
                 # query rows and map for later consumers of this family.
                 plan = plan.scratch
-            self._sparse_mla(
+            return self._sparse_mla(
                 q,
                 swa_metadata.decode_swa_indices,
                 swa_metadata.decode_swa_lens,
@@ -2029,8 +2098,8 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 output,
                 positions=positions,
                 restore_plan=plan,
+                quantize_output=quantize_output,
             )
-            return
         swa_only = self.compress_ratio == 0
         if not swa_only and self.compress_ratio not in (1, 2):
             raise ValueError(
@@ -2064,7 +2133,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 False,
             )
             extra_cache = compressed_k_cache
-        self._sparse_mla(
+        return self._sparse_mla(
             q,
             swa_indices,
             swa_lens,
@@ -2073,6 +2142,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             extra_lens,
             output,
             positions=positions,
+            quantize_output=quantize_output,
         )
 
     def _forward_prefill_as_decode(

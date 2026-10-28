@@ -26,11 +26,12 @@ class _DenseAttentionLayer(nn.Module):
             self.self_attn.attn.register_parameter(name, nn.Parameter(torch.ones(1)))
 
 
-def test_load_check_skips_runtime_attention_quantization_parameters() -> None:
+@pytest.mark.parametrize("cache_dtype", ["auto", "", None, "float16", "bfloat16"])
+def test_load_check_skips_runtime_attention_quantization_parameters(cache_dtype) -> None:
     model = nn.Module()
     model.layer = _DenseAttentionLayer()
 
-    _assert_m3_parameters_loaded(model, {"layer.weight"}, kv_cache_dtype="auto")
+    _assert_m3_parameters_loaded(model, {"layer.weight"}, kv_cache_dtype=cache_dtype)
 
 
 def test_load_check_requires_kv_scales_when_fp8_cache() -> None:
@@ -41,9 +42,10 @@ def test_load_check_requires_kv_scales_when_fp8_cache() -> None:
         _assert_m3_parameters_loaded(model, {"layer.weight"}, kv_cache_dtype="fp8")
 
 
-def test_load_check_still_rejects_missing_checkpoint_parameters() -> None:
+@pytest.mark.parametrize("cache_dtype", ["auto", "float16", "bfloat16"])
+def test_load_check_still_rejects_missing_checkpoint_parameters(cache_dtype) -> None:
     model = nn.Module()
     model.layer = _DenseAttentionLayer()
 
     with pytest.raises(ValueError, match=r"layer\.weight"):
-        _assert_m3_parameters_loaded(model, set())
+        _assert_m3_parameters_loaded(model, set(), kv_cache_dtype=cache_dtype)

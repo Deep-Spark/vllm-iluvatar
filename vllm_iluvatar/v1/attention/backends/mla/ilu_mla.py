@@ -120,7 +120,6 @@ class IluMLACommonMetadataBuilder(MLACommonMetadataBuilder):
         del max_seq_len
         del max_query_len
         del query_start_loc_device
-        del max_query_len
 
         num_decodes = block_table_tensor.shape[0]
         decode_block_table = block_table_tensor

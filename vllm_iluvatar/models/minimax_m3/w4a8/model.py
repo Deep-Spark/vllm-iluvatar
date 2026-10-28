@@ -121,7 +121,9 @@ def _assert_m3_parameters_loaded(
     kv_cache_dtype: str = "auto",
 ) -> None:
     """Strict reverse check for compressed-tensors (IluQuantConfig) loads."""
-    skip_runtime_attn_quant = kv_cache_dtype in ("auto", "", None)
+    skip_runtime_attn_quant = kv_cache_dtype in (
+        "auto", "", None, "float16", "bfloat16"
+    )
     expected: set[str] = set()
     for name, _ in model.named_parameters():
         if any(s in name for s in skip_substrs):

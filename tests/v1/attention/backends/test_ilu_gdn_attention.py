@@ -176,7 +176,15 @@ def test_builder_packs_strided_block_table_column(monkeypatch):
         seq_lens=[5, 6],
         num_reqs=2,
         num_actual_tokens=2,
+        # The non-spec path asserts on the upper bound and reads is_prefilling to
+        # decide which requests start from no state; both are per-request, so they
+        # line up with seq_lens / query_start_loc.diff() above.
+        seq_lens_cpu_upper_bound=torch.tensor([5, 6], dtype=torch.int32),
+        is_prefilling=None,
     )
+    # The builder hands a narrowed copy to split_decodes_and_prefills, which is
+    # patched above to ignore its argument, so returning the stub itself is enough.
+    common_metadata.replace = lambda **kwargs: common_metadata
     metadata = builder.build(
         common_prefix_len=0,
         common_attn_metadata=common_metadata,

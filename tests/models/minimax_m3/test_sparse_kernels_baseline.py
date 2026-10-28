@@ -53,6 +53,9 @@ def test_index_score_topk_and_sparse_attn_shapes():
     # （v0.30.0 的 5-D 布局不再支持）。
     kv = torch.randn(2, n_heads, blk, 2 * head_dim)
     out = torch.zeros_like(q)
+    # ixformer 24a45588: max_query_len 已从公开签名移除（wrapper 自己填保留字段
+    # 传给 native ABI），多传一个会把后面的实参整体错位一格，output 收到的是
+    # sm_scale 的 float。
     ixf.minimax_m3_sparse_attn(
         q,
         kv,
@@ -61,7 +64,6 @@ def test_index_score_topk_and_sparse_attn_shapes():
         cu,
         seq,
         pref,
-        q_len,
         n_heads,
         head_dim**-0.5,
         out,

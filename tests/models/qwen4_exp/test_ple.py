@@ -424,12 +424,23 @@ def test_resolve_conv_state_indexes_the_assigned_gdn_group() -> None:
     assert torch.equal(indices, torch.tensor([9, 11], dtype=torch.int32))
 
 
+def _skip_without_ple_kernels() -> None:
+    """ixformer registers the PLE kernels with ``archs=("ivcore30",)``.
+
+    On any other arch qwen_ple_dilated_conv and qwen_ple_ngram_hash raise
+    "not available on ivcore11" rather than falling back, so the tests that
+    reach them cannot run on BI150. Checked inside the test, not at import:
+    the arch probe needs a device.
+    """
+    from vllm_iluvatar.ilu_util.arch import is_ivcore30
+
+    if not is_ivcore30():
+        pytest.skip("the qwen_ple_* kernels are built for ivcore30 only")
+
+
 @requires_cuda
 def test_cuda_dilated_conv_accepts_a_padded_kv_page_stride() -> None:
-    from vllm_iluvatar.ilu_util.arch import is_ivcore11, is_ivcore30
-
-    if not (is_ivcore11() or is_ivcore30()):
-        pytest.skip("qwen_ple_dilated_conv requires ivcore11 or ivcore30")
+    _skip_without_ple_kernels()
     channels, state_len, num_blocks, padding = 256, 9, 5, 128
     module = _make_conv_layer(channels, kernel=4, dilation=3).cuda().bfloat16()
     storage = torch.randn(
@@ -494,9 +505,10 @@ def test_splitmix64_and_ngram_vocab_primes_are_deterministic() -> None:
 
 @requires_cuda
 def test_int8_ple_actual_forward_preserves_chunk_and_request_state(monkeypatch) -> None:
-    """Execute hash -> INT8 lookup -> projections -> gate -> conv on BI150."""
+    """Execute hash -> INT8 lookup -> projections -> gate -> conv on CoreX30."""
     from vllm_iluvatar.models.qwen4_exp.ple import Qwen4ExpPLEGroupedNorm
 
+    _skip_without_ple_kernels()
     _single_rank(monkeypatch)
     torch.manual_seed(17)
     config = SimpleNamespace(

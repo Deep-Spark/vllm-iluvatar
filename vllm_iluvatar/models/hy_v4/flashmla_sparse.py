@@ -116,6 +116,13 @@ class HYV4FlashMLASparseImpl(IluFlashMLASparseImpl):
                 )
         self.attn_sink = sinks
 
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        # HYV4MLAAttentionLayer uses the community MLA forward, which owns
+        # W_UK_T/W_UV (and the optional FP8 v-up copy). The base backend's
+        # full-forward projections are unused here; allocating them as well
+        # costs 276.5 MiB/rank for the 78 target layers plus the MTP layer.
+        pass
+
     # [ILU override] IluFlashMLASparseImpl._forward_bf16_kv — delta: a "shared"
     # indexer layer attends with the indices the preceding full layer wrote, so
     # the global-slot conversion and the ``topk_length`` reduction are the same

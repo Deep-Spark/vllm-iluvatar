@@ -17,6 +17,7 @@ def test_engram_apply_sqrsum_restarts_streaming_pre(layer_id, monkeypatch):
     layer.hc_sinkhorn_iters = 20
     layer.hc_post_alpha = 1.0
     layer._hc_fn_io_cache = {}
+    layer._fuse_attn_allreduce_post = False
     for stage in ("attn", "ffn"):
         for suffix in ("fn", "scale", "base"):
             setattr(layer, f"hc_{stage}_{suffix}", torch.ones(1))

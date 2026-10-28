@@ -118,6 +118,7 @@ def test_dummy_forward_without_global_config(across_dp):
         engram_layout=object(),
         _engram_dummy=torch.zeros(2, 24, dtype=torch.int32),
         _engram_layers=lambda: iter([engram]),
+        _mark_batch_image_tokens=lambda input_ids: None,
     )
     IluDeepseekV41Model._prepare_engram(model, torch.zeros(2), torch.arange(2))
     assert len(calls) == int(across_dp)

@@ -721,7 +721,7 @@ class IluFlashMLASparseImpl(
                 expand=not (pool_prefill or pool_decode),
             )
         else:
-            topk_indices, topk_lens = ixf_ops.v41_global_topk_indices_and_lens(
+            topk_indices, topk_lens = ixf_ops.global_topk_indices_and_lens(
                 topk_indices,
                 attn_metadata.req_id_per_token,
                 attn_metadata.block_table,

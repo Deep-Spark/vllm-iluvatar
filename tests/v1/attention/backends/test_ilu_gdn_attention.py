@@ -174,13 +174,11 @@ def test_builder_packs_strided_block_table_column(monkeypatch):
         compute_num_computed_tokens=lambda: torch.tensor([4, 5], dtype=torch.int32),
         block_table_tensor=object(),
         seq_lens=[5, 6],
-        num_reqs=2,
-        num_actual_tokens=2,
-        # The non-spec path asserts on the upper bound and reads is_prefilling to
-        # decide which requests start from no state; both are per-request, so they
-        # line up with seq_lens / query_start_loc.diff() above.
+        # Required by the non-spec metadata path (ilu_gdn_attn.py).
         seq_lens_cpu_upper_bound=torch.tensor([5, 6], dtype=torch.int32),
         is_prefilling=None,
+        num_reqs=2,
+        num_actual_tokens=2,
     )
     # The builder hands a narrowed copy to split_decodes_and_prefills, which is
     # patched above to ignore its argument, so returning the stub itself is enough.

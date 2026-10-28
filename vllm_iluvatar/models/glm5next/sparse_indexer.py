@@ -46,7 +46,7 @@ def _fill_short_decode_causal_indices(
     throwaway_lens = torch.empty(
         num_decode_tokens, dtype=torch.int32, device=rows.device
     )
-    ixfops.dsv41_fill_short_context_topk(
+    ixfops.fill_short_context_topk(
         rows, throwaway_lens, pos, 4 if compact_pool_indices else 1
     )
     return True

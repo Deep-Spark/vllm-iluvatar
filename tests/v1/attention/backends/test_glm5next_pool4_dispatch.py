@@ -68,7 +68,7 @@ def test_pool4_decode_dispatch(
     monkeypatch.setattr(mod, "global_pool_indices", global_pool_indices)
     monkeypatch.setattr(
         mod.ixf_ops,
-        "v41_global_topk_indices_and_lens",
+        "global_topk_indices_and_lens",
         lambda *args: (torch.zeros(3, 2176, dtype=torch.int32), lengths),
     )
     monkeypatch.setattr(mod.ixfops, "flash_mla_sparse_with_kvcache", paged)

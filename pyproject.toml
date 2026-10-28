@@ -23,6 +23,10 @@ include = ["vllm_iluvatar*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# ``importlib`` mode gives every test module a unique dotted name (rootdir
+# relative), so same-basename test files in different directories (e.g.
+# minimax_m3/mxfp8 vs minimax_m3/w4a8) no longer collide at collection time.
+addopts = "--import-mode=importlib"
 # Ensure the repo root is importable so test modules can resolve the installed
 # plugin package and local helpers regardless of invocation cwd. ``tests`` is
 # also needed so the bare ``from conftest import ...`` pattern used by several

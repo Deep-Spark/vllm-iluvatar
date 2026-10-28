@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """fp8-only sliding-window-attention (SWA) stack for DeepSeek-V4.
 
-The fp8 attention unifies prefill and decode onto a single
-``ds4_sparse_mla_fp8_decode`` call over all tokens, which needs a
-contiguous ``[0:num_actual]`` SWA index buffer covering both. So fp8 gets its
-own lean ``IluFp8SWAMetadata`` and a builder that fully overrides ``build()``
+Packed decode and small-prefill batches use a contiguous ``[0:num_actual]``
+SWA index buffer. Large causal TP1 prefill additionally consumes request-local
+coordinates and gather lengths. FP8 therefore has its own
+``IluFp8SWAMetadata`` and a builder that fully overrides ``build()``
 (one position-based SWA pass over the full token range) while still subclassing
 the community builder to inherit ``__init__`` (CUDA-graph-fixed persistent
 buffers + spec-decode ``decode_threshold`` / ``window_size``). Kept model-local
@@ -23,6 +23,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadataBuilder
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.kv_cache_interface import SlidingWindowMLASpec, get_kv_quant_mode
 
 from vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa import (
     IluDeepseekSparseSWABackend,
@@ -41,11 +42,10 @@ _FP8_SWA_INDEX_ALIGN = 256
 
 @dataclass
 class IluFp8SWAMetadata:
-    """Lean SWA metadata for the fp8 unified (single-call) MQA path.
+    """SWA metadata for packed decode and eager sparse FP8 prefill.
 
-    Only carries what ``fp8_attention.py`` consumes; every tensor is a slice of
-    a persistent, fixed-address buffer so CUDA-graph capture / replay stays
-    valid.
+    Decode tensors remain views of persistent buffers for graph replay.
+    Request-local prefill fields are optional and used only in eager prefill.
     """
 
     # Contiguous all-token (decode + prefill) SWA window slots / lengths.
@@ -72,6 +72,19 @@ class IluFp8SWAMetadata:
     num_decode_tokens: int = 0
     num_prefill_tokens: int = 0
 
+    # Eager prefill consumes local query/request coordinates and paged caches.
+    # Pure decode leaves these tensor fields None (its graph buffers unchanged).
+    num_decodes: int = 0
+    num_prefills: int = 0
+    # Scheduler's CPU bound; selecting a measured short-context crossover must
+    # not require reading the GPU seq_lens tensor back to the host.
+    max_prefill_seq_len: int = 0
+    query_start_loc: torch.Tensor | None = None
+    query_start_loc_cpu: torch.Tensor | None = None
+    block_table: torch.Tensor | None = None
+    prefill_seq_lens: torch.Tensor | None = None
+    prefill_gather_lens: torch.Tensor | None = None
+
     # False for a DSpark draft block (all queries attend bidirectionally within
     # the block). Mirrors the ``causal`` field the W4A8 builder exposes so a
     # DSpark/DFlash proposer can verify the builder honored the request.
@@ -79,7 +92,7 @@ class IluFp8SWAMetadata:
 
 
 class IluDeepseekV4Fp8SWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
-    """fp8-only SWA metadata builder for the unified (single-call) MQA path.
+    """FP8 SWA builder for the packed path and request-local prefill gather.
 
     Reuses the community ``__init__`` write buffer (``size(-1)==window_size``).
     ``build()`` is fully overridden and, when ``window_size`` is not 256-aligned,
@@ -137,7 +150,6 @@ class IluDeepseekV4Fp8SWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
         fast_build: bool = False,
         replay_start: torch.Tensor | None = None,
     ) -> IluFp8SWAMetadata:
-        del replay_start
         causal = getattr(common_attn_metadata, "causal", True)
 
         seq_lens = common_attn_metadata.seq_lens
@@ -153,6 +165,15 @@ class IluDeepseekV4Fp8SWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
             )
         )
         num_swa_tokens = num_decode_tokens + num_prefill_tokens
+
+        # The shared prefill combiner uses the full causal SWA window. Until
+        # bounded replay is carried through both gather and combine, reject an
+        # explicit boundary instead of gathering a shorter, incompatible pool.
+        # Pure decode and non-causal DSpark keep their existing behavior.
+        if num_prefills > 0 and causal and replay_start is not None:
+            raise ValueError(
+                "FP8 sparse prefill does not support explicit replay_start"
+            )
 
         # Fixed-address buffers (allocated in the inherited __init__) keep CUDA
         # graph capture valid across replays.
@@ -224,6 +245,25 @@ class IluDeepseekV4Fp8SWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
         else:
             all_swa_indices = self.decode_swa_indices[:num_swa_tokens]
 
+        prefill_seq_lens = None
+        prefill_gather_lens = None
+        if num_prefills > 0 and causal:
+            prefill_seq_lens = seq_lens[num_decodes : num_decodes + num_prefills]
+            prefill_gather_lens = torch.empty(
+                num_prefills,
+                dtype=torch.int32,
+                device=seq_lens.device,
+            )
+            ixfops.ds4_compute_swa_prefill_gather_lens(
+                prefill_gather_lens,
+                seq_lens,
+                query_start_loc,
+                num_prefills,
+                num_decodes,
+                self.window_size,
+                replay_start=self.no_replay_start,
+            )
+
         return IluFp8SWAMetadata(
             all_swa_indices=all_swa_indices,
             all_swa_lens=self.decode_swa_lens[:num_swa_tokens],
@@ -234,6 +274,18 @@ class IluDeepseekV4Fp8SWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
             num_actual_tokens=num_swa_tokens,
             num_decode_tokens=num_decode_tokens,
             num_prefill_tokens=num_prefill_tokens,
+            num_decodes=num_decodes,
+            num_prefills=num_prefills,
+            max_prefill_seq_len=(
+                common_attn_metadata.max_seq_len if num_prefills else 0
+            ),
+            query_start_loc=query_start_loc if num_prefills else None,
+            query_start_loc_cpu=(
+                common_attn_metadata.query_start_loc_cpu if num_prefills else None
+            ),
+            block_table=block_table if num_prefills else None,
+            prefill_seq_lens=prefill_seq_lens,
+            prefill_gather_lens=prefill_gather_lens,
             causal=causal,
         )
 
@@ -259,3 +311,21 @@ class IluDeepseekV4Fp8SWACache(IluDeepseekV4SWACache):
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return IluDeepseekV4Fp8SWABackend
+
+    def get_kv_cache_spec(self, vllm_config):
+        if self.dtype != torch.float8_e4m3fn:
+            return super().get_kv_cache_spec(vllm_config)
+        return SlidingWindowMLASpec(
+            bounded_replay=self.bounded_replay,
+            block_size=self.block_size,
+            num_kv_heads=1,
+            max_tp_shards=1,
+            head_size=self.head_dim,
+            head_size_v=0,
+            dtype=self.dtype,
+            sliding_window=self.window_size,
+            cache_dtype_str="fp8",
+            model_version="deepseek_v4",
+            alignment=64,
+            kv_quant_mode=get_kv_quant_mode("fp8"),
+        )

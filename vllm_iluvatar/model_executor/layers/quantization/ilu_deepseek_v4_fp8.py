@@ -88,6 +88,17 @@ class IluDeepseekV4FP8Config(DeepseekV4FP8Config):
                 from vllm_iluvatar.model_executor.layers.quantization.ilu_mxfp4 import (  # noqa: E501
                     IluMxfp4MoEMethod,
                 )
+                from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime_quant_config import (
+                    resolve_ilu_runtime_method,
+                )
 
-                return IluMxfp4MoEMethod(layer.moe_config)
+                original = IluMxfp4MoEMethod(layer.moe_config)
+                runtime = resolve_ilu_runtime_method(
+                    base_quant_config=self,
+                    original_method=original,
+                    original_disposition="quantized",
+                    layer=layer,
+                    prefix=prefix,
+                )
+                return runtime if runtime is not None else original
         return super().get_quant_method(layer, prefix)

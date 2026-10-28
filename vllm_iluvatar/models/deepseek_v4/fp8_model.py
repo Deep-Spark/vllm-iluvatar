@@ -18,11 +18,13 @@ tilelang MHC kernels and the model allocates three aux streams at build time.
   ``:757-772``): each sub-layer does its own ``hc_post`` and ``attn_norm`` /
   ``ffn_norm`` are called explicitly, rather than NVIDIA's cross-sub-layer
   ``mhc_fused_post_pre`` with the norm folded into the pre.
-* ``IluDeepseekV4Fp8MoE.forward``: the whole FFN goes through the community
-  ``FusedMoE`` runner like the W4A8 fork -- ``IluGateLinear`` for the gate
+* ``IluDeepseekV4Fp8MoE.forward``: native MXFP4 uses the community
+  ``FusedMoE`` runner -- ``IluGateLinear`` for the gate
   GEMM, ``ops.topk_hash_softplus_sqrt`` for the top-k, and
   ``IluMxfp4MoEMethod`` -> ``ilu_mxfp4_fused_experts()`` for the routed MXFP4
-  experts.
+  experts. Runtime-converted W4A8 TN experts additionally reuse
+  ``IluFusedMoEEP`` for synchronized Hybrid EP selection and pre-capture LL
+  initialization, as in the offline W4A8 model.
 * The shared-expert activation is the community ``SiluAndMulWithClamp``, which
   resolves to the plugin's OOT ``IluSiluAndMulWithClamp``.
 
@@ -103,6 +105,12 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 
+from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
+    IluFusedMoEEP,
+)
+from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.ilu_compressed_tensors_moe_w4a8_int8 import (
+    IluCompressedTensorsW4A8Int8MoEMethod,
+)
 from vllm_iluvatar.models.deepseek_v4 import fp8_load_stats
 from vllm_iluvatar.models.deepseek_v4.fp8_attention import (
     IluDeepseekV4Fp8Attention,
@@ -283,7 +291,7 @@ class IluDeepseekV4Fp8MLP(nn.Module):
         return out
 
 
-class IluDeepseekV4Fp8MoE(nn.Module):
+class IluDeepseekV4Fp8MoE(nn.Module, IluFusedMoEEP):
     """DS-V4-Flash FFN: routing gate + shared expert MLP + routed MXFP4 experts.
 
     Community counterpart: ``DeepseekV4MoE.__init__`` /
@@ -437,13 +445,22 @@ class IluDeepseekV4Fp8MoE(nn.Module):
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=eplb_config.num_redundant_experts,
         )
+        # Converted TN weights use the same Hybrid EP consumer as offline W4A8.
+        # Native MXFP4 retains its community runner: it has no LL GEMM backend.
+        method = self.experts._quant_method
+        method = getattr(method, "old_quant_method", method)
+        self._use_ilu_w4a8_ep = isinstance(
+            method, IluCompressedTensorsW4A8Int8MoEMethod
+        )
+        if self._use_ilu_w4a8_ep:
+            self.init_ep()
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Hand the whole FFN to the community runner.
+        """Use Hybrid EP for converted W4A8, otherwise the community runner.
 
         Same shape as community ``DeepseekV4MoE.forward``.  There is **no**
         ``tensor_model_parallel_all_reduce`` here: the runner owns the single
@@ -463,6 +480,8 @@ class IluDeepseekV4Fp8MoE(nn.Module):
             input_ids = input_ids.to(dtype=self.hash_indices_dtype)
 
         org_shape = hidden_states.shape
+        if self._use_ilu_w4a8_ep and self._should_use_forward_dp_ep():
+            return self.forward_dp_ep(hidden_states, input_ids).view(org_shape)
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             router_logits=hidden_states,

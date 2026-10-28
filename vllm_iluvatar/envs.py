@@ -133,6 +133,13 @@ def _glm_sampling_mode() -> str:
     return value
 
 
+def _ds4_attn_mode() -> str:
+    value = os.environ.get("VLLM_ILU_DS4_ATTN_MODE", "packed").strip().lower()
+    if value not in ("packed", "plain_direct"):
+        raise ValueError(f"invalid VLLM_ILU_DS4_ATTN_MODE: {value!r}")
+    return value
+
+
 def _gdn_attn_backend_default() -> str:
     """Enable the tuned ixformer GDN path by default on CoreX30."""
     from vllm_iluvatar.ilu_util.arch import is_ivcore30
@@ -162,6 +169,8 @@ if TYPE_CHECKING:
     VLLM_ILU_GDN_ATTN_BACKEND: bool = False
     VLLM_ILU_DS4_PREFILL_OPT: bool = False
     VLLM_ILU_DS4_PREFILL_AS_DECODE: bool = False
+    VLLM_ILU_DS4_FP8_PREFILL_SPARSE: bool = True
+    VLLM_ILU_DS4_ATTN_MODE: str = "packed"
     VLLM_ILU_DS4_C4A_FUSED_INDEXCOMPRESS: bool = False
     VLLM_ILU_WO_A_QUANT: str = "marlin"
     VLLM_ILU_WO_A_MSD_MIN_TOKENS: int = 256
@@ -216,6 +225,10 @@ if TYPE_CHECKING:
 # Canonical (VLLM_ILU_*) readers. Each lambda preserves the exact parsing the
 # fork used in vllm/envs.py, and reads VLLM_ILU_* first then the legacy VLLM_*.
 _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
+    "VLLM_ILU_DS4_ATTN_MODE": _ds4_attn_mode,
+    "VLLM_ILU_DS4_FP8_PREFILL_SPARSE": lambda: (
+        os.environ.get("VLLM_ILU_DS4_FP8_PREFILL_SPARSE", "1").lower() in ("1", "true")
+    ),
     # Step5 retains strict 0/1 parsing and canonical-first legacy compatibility.
     "VLLM_ILU_STEP5_SPARSE_ATTENTION": lambda: _step5_bool("SPARSE_ATTENTION", "1"),
     "VLLM_ILU_STEP5_SPARSE_FP8": lambda: _step5_bool("SPARSE_FP8", "0"),

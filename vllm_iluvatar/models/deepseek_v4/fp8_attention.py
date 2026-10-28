@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Iluvatar DeepSeek-V4-Flash sparse-MLA attention for the raw FP8 checkpoint.
 
-The KV path is ``fp8_ds_mla`` and the heavy ops reuse ixformer ``ds4_*`` /
+Packed KV uses ``fp8_ds_mla``; plain direct KV uses E4M3 with scale one.
+The heavy ops reuse IxFormer ``ds4_*`` /
 ``dsa_*`` kernels; input/output projections run on the block-fp8 LinearMethod
 (``wo_a`` uses the fp8 grouped-einsum path, see ``_o_proj``). ``forward_mqa``
-runs a single unified ``ds4_sparse_mla_fp8_decode`` over all tokens
-(prefill == decode). The SWA/main-MLA caches and compressor use the ilu
+routes large causal TP1 prefill through gather/dequantize + BF16 sparse prefill
+v2. Decode, small fragments and lower-head paths retain the packed paged
+operation. The SWA/main-MLA caches and compressor use the ilu
 variants (community ones build NV-shaped metadata or launch Triton kernels the
 Iluvatar stack rejects). The lightning indexer is the self-contained
 ``IluDeepseekV4Fp8Indexer`` with a grouped fp8 K cache.
@@ -22,6 +24,17 @@ from typing import ClassVar
 import ixformer.inference.functions as ixfops
 import torch
 import torch.nn as nn
+import vllm.envs as envs
+from ixformer.inference.backend_registry import registry
+from ixformer.inference.functions.models.deepseek_v4.mla_sparse.float.prefill_q_fp8_round_bf16 import (
+    prefill_q_fp8_round_bf16,
+)
+from ixformer.inference.functions.models.deepseek_v41.mla_sparse.fp8.quant_mla_q_fp8_pt import (
+    quant_mla_q_fp8_pt,
+)
+from ixformer.inference.functions.models.deepseek_v41.mla_sparse.fp8.sparse_mla_fp8_pt import (
+    sparse_mla_fp8_pt,
+)
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
@@ -44,9 +57,12 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     get_kv_quant_mode,
 )
+from vllm.v1.worker.workspace import current_workspace_manager
 
 from vllm_iluvatar.models.deepseek_v4.attention import (
+    PREFILL_CHUNK_SIZE,
     IluDeepseekCompressor,
+    IluDeepseekV4MLAAttention,
 )
 from vllm_iluvatar.models.deepseek_v4.flashmla_sparse import (
     IluDeepseekV4Fp8FlashMLASparseBackend,
@@ -449,12 +465,20 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
         cache_config = vllm_config.cache_config
         tp_size = get_tensor_model_parallel_world_size()
         layer_id = extract_layer_index(prefix)
+        self.attn_mode = envs.VLLM_ILU_DS4_ATTN_MODE
+        self.use_fp8_ds_mla_layout = self.attn_mode == "packed"
+        if not self.use_fp8_ds_mla_layout and tp_size not in (1, 2, 4, 8):
+            raise ValueError("DeepSeek V4 plain attention requires TP1/2/4/8")
 
         self.prefix = prefix  # the compressor keys its k-cache off this
         self.hidden_size = config.hidden_size
         self.n_heads = config.num_attention_heads
         assert self.n_heads % tp_size == 0
         self.n_local_heads = self.n_heads // tp_size
+        if not self.use_fp8_ds_mla_layout and self.n_heads != 64:
+            raise ValueError(
+                "DeepSeek V4 plain attention requires Flash with 64 total heads"
+            )
         self.q_lora_rank = config.q_lora_rank
         self.o_lora_rank = config.o_lora_rank
         self.head_dim = config.head_dim
@@ -471,6 +495,33 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
             self.compress_ratio = 1
         self.eps = config.rms_norm_eps
         self.scale = self.head_dim**-0.5
+        self.max_model_len = vllm_config.model_config.max_model_len
+        self.max_num_batched_tokens = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        # The BF16 sparse prefill path is specialized for Flash TP1.
+        # Other head counts retain the paged attention path.
+        self.use_prefill_sparse = (
+            envs.VLLM_ILU_DS4_FP8_PREFILL_SPARSE
+            and self.n_local_heads == 64
+            and self.use_fp8_ds_mla_layout
+        )
+
+        if not self.use_fp8_ds_mla_layout:
+            for op in (
+                "quant_mla_q_fp8_pt",
+                "sparse_mla_fp8_pt",
+            ):
+                if "ixformer_native" not in registry.available_backends(op):
+                    raise RuntimeError(f"plain attention requires {op}/ixformer_native")
+
+        if self.use_prefill_sparse:
+            for op, backend in (
+                ("prefill_q_fp8_round_bf16", "ixformer_native"),
+                ("flash_mla_sparse_fwd", "ixformer_perf"),
+            ):
+                if backend not in registry.available_backends(op):
+                    raise RuntimeError(f"Sparse prefill requires {op}/{backend}")
 
         # No head padding: packed decode buckets ``h_q`` exactly (no pad);
         # ``attn_sink`` carries ``n_local_heads`` values.
@@ -553,6 +604,14 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
             )
 
         assert cache_config is not None, "DeepseekV4 attention requires cache_config"
+
+        if not self.use_fp8_ds_mla_layout:
+            if cache_config.cache_dtype not in ("auto", "fp8"):
+                raise ValueError("plain attention requires auto or fp8 cache dtype")
+            cache_config.cache_dtype = "fp8"
+            logger.info_once(
+                "DeepSeek V4 attention mode=%s, plain E4M3 KV scale=1", self.attn_mode
+            )
 
         # `--kv-cache-dtype fp8_ds_mla` is a hard precondition; the resolver
         # asserts it and normalises the string back onto cache_config.
@@ -723,9 +782,26 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
             # SWA-only: just the fused Q/KV norm+rope+insert.
             self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
 
-        # Dummy / profiling run: the unified MQA path is workspace-free, so just
-        # zero the output and return.
+        # Reserve the real prefill peak before workspace locking and KV sizing.
         if not isinstance(attn_metadata, dict):
+            if self.use_prefill_sparse:
+                N = (
+                    0
+                    if self.compress_ratio <= 1
+                    else (
+                        (self.max_model_len + self.compress_ratio - 1)
+                        // self.compress_ratio
+                    )
+                )
+                M = N + self.window_size + self.max_num_batched_tokens
+                current_workspace_manager().get_simultaneous(
+                    ((PREFILL_CHUNK_SIZE, M, self.head_dim), torch.bfloat16),
+                )
+                # Hold the real additional Q allocation while the KV workspace
+                # is reserved so memory profiling sizes the cache correctly.
+                _prefill_q = prefill_q_fp8_round_bf16(q, backend="ixformer_native")
+            elif not self.use_fp8_ds_mla_layout:
+                _plain_q = self._quant_plain_q(q)
             out.zero_()
             return
 
@@ -745,9 +821,11 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
         positions: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        """Unified sparse MLA forward over *all* tokens (prefill == decode).
+        """Sparse MLA forward: BF16 sparse prefill and packed FP8 decode.
 
-        Packed Q + ``ds4_sparse_mla_fp8_decode``.
+        Selected large TP1 prefill preserves FP8 NoPE Q quantization in a
+        fused BF16 materialization. The original decode operation block also
+        handles small and lower-head prefill.
 
         ``kv`` is unused (the rotated K rows were already written by the
         compressor / ``_fused_qnorm_rope_kv_insert`` step); it is kept for the
@@ -788,6 +866,33 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
         q = q[:num_actual]
         output = output[:num_actual]
 
+        # Avoid gathering long pools for small prefill fragments. Mixed batches
+        # retain the paged all-token launch because its reduction geometry
+        # depends on the complete token count. Noncausal batches use that path too.
+        num_prefill_tokens = swa_metadata.num_prefill_tokens
+        min_prefill_tokens = (
+            512 if 0 < swa_metadata.max_prefill_seq_len <= 8192 else 1024
+        )
+        split_prefill = (
+            self.use_prefill_sparse
+            and swa_metadata.num_decode_tokens == 0
+            and num_prefill_tokens
+            >= min_prefill_tokens * max(1, swa_metadata.num_prefills)
+            and swa_metadata.causal
+        )
+        if split_prefill:
+            num_decode_tokens = swa_metadata.num_decode_tokens
+            if num_decode_tokens + num_prefill_tokens != num_actual:
+                raise ValueError("FP8 SWA decode/prefill token split is inconsistent")
+            self._forward_prefill_fp8(
+                q[num_decode_tokens:],
+                positions[num_decode_tokens:],
+                output[num_decode_tokens:],
+                None if swa_only else flashmla_metadata,
+                swa_metadata,
+            )
+            return
+
         # Contiguous all-token (decode + prefill) SWA slots.
         swa_indices = swa_metadata.all_swa_indices
         swa_lens = swa_metadata.all_swa_lens
@@ -817,6 +922,24 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
         extra_idx = (
             None if extra_indices is None else _as_sparse_decode_indices(extra_indices)
         )
+        if not self.use_fp8_ds_mla_layout:
+            q_fp8, q_scale = self._quant_plain_q(q)
+            sparse_mla_fp8_pt(
+                q=q_fp8,
+                q_scale=q_scale,
+                k_cache=self.swa_cache_layer.kv_cache,
+                indices=indices,
+                output=output,
+                sm_scale=self.scale,
+                kv_scale=1.0,
+                topk_length=swa_lens,
+                attn_sink=self.attn_sink,
+                extra_k_cache=extra_k_cache,
+                extra_indices=extra_idx,
+                extra_topk_length=extra_topk_length,
+                backend="ixformer_native",
+            )
+            return
         q_packed, q_scales = ixfops.ds4_dynamic_quant_mla_q_packed_fp8(q)
         ixfops.ds4_sparse_mla_fp8_decode(
             q_packed=q_packed,
@@ -830,6 +953,67 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
             extra_indices=extra_idx,
             extra_topk_length=extra_topk_length,
             output=output,
+        )
+
+    def _gather_k_cache(
+        self,
+        kv,
+        k_cache,
+        seq_lens,
+        gather_lens,
+        block_table,
+        block_size,
+        offset,
+    ) -> None:
+        # DSA's masked loads use global scratch slot 0. For initial contexts
+        # with zero compressed keys it is otherwise uninitialized; initialize
+        # before gather, which overwrites the slot when a real key 0 exists.
+        if self.compress_ratio > 1 and offset == 0:
+            kv[0, 0].zero_()
+        IluDeepseekV4MLAAttention._gather_k_cache(
+            self,
+            kv,
+            k_cache,
+            seq_lens,
+            gather_lens,
+            block_table,
+            block_size,
+            offset,
+        )
+
+    def _forward_prefill_fp8(
+        self,
+        q,
+        positions,
+        output,
+        attn_metadata,
+        swa_metadata,
+    ) -> None:
+        if not swa_metadata.causal:
+            raise ValueError("Sparse BF16 prefill requires causal metadata")
+        if self.compress_ratio > 1 and attn_metadata is None:
+            raise ValueError("Compressed FP8 prefill requires main MLA metadata")
+        # Preserve the old FP8 NoPE Q quantization before BF16 sparse attention.
+        # RoPE stays unchanged; the helper consumes local C4/C128 topk directly.
+        q = prefill_q_fp8_round_bf16(q, backend="ixformer_native")
+        IluDeepseekV4MLAAttention._forward_prefill(
+            self,
+            q=q,
+            positions=positions,
+            compressed_k_cache=self.kv_cache if self.compress_ratio > 1 else None,
+            swa_k_cache=self.swa_cache_layer.kv_cache,
+            output=output,
+            attn_metadata=attn_metadata,
+            swa_metadata=swa_metadata,
+            prefill_backend="ixformer_perf",
+        )
+
+    def _quant_plain_q(self, q):
+        q_fp8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
+        q_scale = torch.empty(q.shape[0], dtype=torch.float32, device=q.device)
+        workspace = torch.empty(256, dtype=torch.float32, device=q.device)
+        return quant_mla_q_fp8_pt(
+            q, q_fp8, q_scale, workspace, backend="ixformer_native"
         )
 
     def _build_extra_topk(

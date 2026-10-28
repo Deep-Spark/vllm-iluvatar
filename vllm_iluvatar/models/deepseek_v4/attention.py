@@ -41,10 +41,10 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import ixformer.inference.functions as ixfops
-from ixformer.inference.functions.models import deepseek_v4 as d4ops
 import torch
 import torch.nn as nn
 import vllm.envs as envs
+from ixformer.inference.functions.models import deepseek_v4 as d4ops
 from transformers import DeepseekV2Config, DeepseekV3Config
 from vllm.config import (
     CacheConfig,
@@ -390,7 +390,7 @@ class IluDeepseekCompressor(DeepseekCompressor):
         mla_layer = self._static_forward_context[self.k_cache_prefix]
         kv_cache = mla_layer.kv_cache
         kv_cache_dtype = getattr(mla_layer, "kv_cache_dtype", "bfloat16")
-        if kv_cache_dtype == "fp8_ds_mla":
+        if kv_cache_dtype == "fp8_ds_mla" or kv_cache.dtype == torch.float8_e4m3fn:
             ixfops.save_partial_states(
                 kv=kv,
                 score=score,
@@ -1521,16 +1521,14 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             if self.compress_ratio == 4:
                 # C4A: per-layer local topk indices written by the indexer.
                 assert self.topk_indices_buffer is not None
-                global_indices, topk_lens = (
-                    ixfops.compute_global_topk_indices_and_lens(
-                        self.topk_indices_buffer[:num_decode_tokens],
-                        swa_metadata.token_to_req_indices[:num_decode_tokens],
-                        attn_metadata.block_table[:num_decodes],
-                        block_size,
-                        is_valid,
-                        positions,
-                        self.compress_ratio,
-                    )
+                global_indices, topk_lens = ixfops.compute_global_topk_indices_and_lens(
+                    self.topk_indices_buffer[:num_decode_tokens],
+                    swa_metadata.token_to_req_indices[:num_decode_tokens],
+                    attn_metadata.block_table[:num_decodes],
+                    block_size,
+                    is_valid,
+                    positions,
+                    self.compress_ratio,
                 )
                 topk_indices = global_indices.view(num_decode_tokens, 1, -1)
             elif self.compress_ratio == 128:
@@ -1769,6 +1767,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         output: torch.Tensor,
         attn_metadata: IluFlashMLASparseMetadata | None,
         swa_metadata: DeepseekSparseSWAMetadata,
+        prefill_backend: str | None = None,
     ) -> None:
         """Prefill-side sparse MLA attention (BF16, ilu V4 W4A8).
 
@@ -1921,6 +1920,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             #    write into the per-token output slice.
             # ------------------------------------------------------------
             ixfops.flash_mla_sparse_fwd(
+                backend=prefill_backend,
                 q=q[query_start:query_end],
                 kv=kv.view(-1, 1, q.shape[-1]),
                 indices=combined_indices.unsqueeze(1),

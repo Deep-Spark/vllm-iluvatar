@@ -105,7 +105,9 @@ def test_device_conversion_and_tn_group_gemm(n, k):
             w.view(torch.int8).cuda(), s.cuda()
         )
         torch.testing.assert_close(gpu_packed.cpu(), cpu_packed, atol=0, rtol=0)
-        torch.testing.assert_close(gpu_scale.cpu(), cpu_scale, atol=0, rtol=0)
+        # FP32 scale division can round differently on CPU and GPU; use the
+        # same relative tolerance as the scalar-oracle scale checks above.
+        torch.testing.assert_close(gpu_scale.cpu(), cpu_scale, atol=0, rtol=1e-7)
         # Independent TN addressing: each 16-byte tile contains 32 K values.
         tiles = cpu_packed.view(torch.uint8).reshape(n, k // 32, 16)
         low, high = (tiles & 15).int(), (tiles >> 4).int()

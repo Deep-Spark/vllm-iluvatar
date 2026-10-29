@@ -780,6 +780,8 @@ class IluFlashAttentionImpl(AttentionImpl):
         output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        *,
+        backend: str | None = None,
     ) -> torch.Tensor:
         return self._forward_unquantized(
             layer,
@@ -791,6 +793,7 @@ class IluFlashAttentionImpl(AttentionImpl):
             output,
             output_scale,
             output_block_scale,
+            backend=backend,
         )
 
     def _maybe_forward_encoder(
@@ -801,6 +804,8 @@ class IluFlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: IluFlashAttentionMetadata,
         output: torch.Tensor,
+        *,
+        backend: str | None = None,
     ) -> torch.Tensor | None:
         if attn_metadata is None:
             return output.fill_(0)
@@ -814,6 +819,7 @@ class IluFlashAttentionImpl(AttentionImpl):
                 output[:num_actual_tokens],
                 attn_metadata,
                 layer,
+                backend=backend,
             )
         return None
 
@@ -824,6 +830,8 @@ class IluFlashAttentionImpl(AttentionImpl):
         value_cache: torch.Tensor,
         attn_metadata: IluFlashAttentionMetadata,
         output: torch.Tensor,
+        *,
+        backend: str | None = None,
     ) -> torch.Tensor:
         num_actual_tokens = attn_metadata.num_actual_tokens
         cascade_attention(
@@ -844,6 +852,7 @@ class IluFlashAttentionImpl(AttentionImpl):
             block_table=attn_metadata.block_table,
             common_prefix_len=attn_metadata.common_prefix_len,
             s_aux=self.sinks,
+            backend=backend,
         )
         return output
 
@@ -858,11 +867,19 @@ class IluFlashAttentionImpl(AttentionImpl):
         output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        *,
+        backend: str | None = None,
     ) -> torch.Tensor:
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError("fused output quantization is not yet supported")
         early_output = self._maybe_forward_encoder(
-            layer, query, key, value, attn_metadata, output
+            layer,
+            query,
+            key,
+            value,
+            attn_metadata,
+            output,
+            backend=backend,
         )
         if early_output is not None:
             return early_output
@@ -884,7 +901,12 @@ class IluFlashAttentionImpl(AttentionImpl):
 
         if attn_metadata.use_cascade:
             return self._forward_cascade(
-                query, key_cache, value_cache, attn_metadata, output
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata,
+                output,
+                backend=backend,
             )
 
         num_actual_tokens = attn_metadata.num_actual_tokens
@@ -925,6 +947,7 @@ class IluFlashAttentionImpl(AttentionImpl):
                     prefill_v,
                     prefill_out_slice,
                     attn_metadata,
+                    backend=backend,
                 )
             else:
                 flash_attn_varlen_func(
@@ -943,6 +966,7 @@ class IluFlashAttentionImpl(AttentionImpl):
                     window_size=sliding_window_size,
                     block_table=attn_metadata.prefill.block_table,
                     softcap=self.logits_soft_cap,
+                    backend=backend,
                 )
 
         if attn_metadata.num_decodes > 0 and attn_metadata.decode is not None:
@@ -955,6 +979,7 @@ class IluFlashAttentionImpl(AttentionImpl):
                     value_cache,
                     decode_output,
                     attn_metadata,
+                    backend=backend,
                 )
             else:
                 decode_q = query[:num_decode_tokens]
@@ -1063,6 +1088,7 @@ class IluFlashAttentionImpl(AttentionImpl):
                         window_size=sliding_window_size,
                         block_table=attn_metadata.decode.block_table,
                         softcap=self.logits_soft_cap,
+                        backend=backend,
                     )
                 else:
                     flash_attn_with_kvcache(
@@ -1096,6 +1122,8 @@ class IluFlashAttentionImpl(AttentionImpl):
         output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        *,
+        backend: str | None = None,
     ) -> torch.Tensor:
         if (quant_manager := getattr(layer, "quant_manager", None)) is None:
             layer_idx = extract_layer_index(layer.layer_name)
@@ -1121,6 +1149,7 @@ class IluFlashAttentionImpl(AttentionImpl):
             output,
             output_scale,
             output_block_scale,
+            backend=backend,
         )
 
         _, value_scale = ixf_ops.scaled_int8_quant_for_attn(
@@ -1140,6 +1169,8 @@ class IluFlashAttentionImpl(AttentionImpl):
         output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        *,
+        backend: str | None = None,
     ) -> torch.Tensor:
         """Run regular attention and collect static FP8 Q/K/V scales."""
         result = self._forward_unquantized(
@@ -1152,6 +1183,7 @@ class IluFlashAttentionImpl(AttentionImpl):
             output,
             output_scale,
             output_block_scale,
+            backend=backend,
         )
         if attn_metadata is None or key is None or value is None:
             return result
@@ -1187,12 +1219,20 @@ class IluFlashAttentionImpl(AttentionImpl):
         output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        *,
+        backend: str | None = None,
     ) -> torch.Tensor:
         """Static per-tensor FP8 Q/K/V attention."""
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError("fused output quantization is not yet supported")
         early_output = self._maybe_forward_encoder(
-            layer, query, key, value, attn_metadata, output
+            layer,
+            query,
+            key,
+            value,
+            attn_metadata,
+            output,
+            backend=backend,
         )
         if early_output is not None:
             return early_output
@@ -1264,6 +1304,7 @@ class IluFlashAttentionImpl(AttentionImpl):
                 window_left=sliding_window_size[0],
                 window_right=sliding_window_size[1],
                 output_dtype=query.dtype,
+                backend=backend,
             )
 
         if attn_metadata.num_decodes > 0 and attn_metadata.decode is not None:
@@ -1286,6 +1327,7 @@ class IluFlashAttentionImpl(AttentionImpl):
                 window_left=sliding_window_size[0],
                 window_right=sliding_window_size[1],
                 output_dtype=query.dtype,
+                backend=backend,
             )
         return output
 
@@ -1300,11 +1342,19 @@ class IluFlashAttentionImpl(AttentionImpl):
         output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        *,
+        backend: str | None = None,
     ) -> torch.Tensor:
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError("fused output quantization is not yet supported")
         early_output = self._maybe_forward_encoder(
-            layer, query, key, value, attn_metadata, output
+            layer,
+            query,
+            key,
+            value,
+            attn_metadata,
+            output,
+            backend=backend,
         )
         if early_output is not None:
             return early_output
@@ -1435,6 +1485,7 @@ class IluFlashAttentionImpl(AttentionImpl):
                 max_context_len=attn_metadata.decode.max_decode_seq_len,
                 value_cache=i8_value_cache,
                 value_scale_cache=value_scale_cache,
+                backend=backend,
             )
             if decode_only:
                 para_dict.update(
@@ -1468,11 +1519,19 @@ class IluFlashAttentionImpl(AttentionImpl):
         output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        *,
+        backend: str | None = None,
     ) -> torch.Tensor:
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError("fused output quantization is not yet supported")
         early_output = self._maybe_forward_encoder(
-            layer, query, key, value, attn_metadata, output
+            layer,
+            query,
+            key,
+            value,
+            attn_metadata,
+            output,
+            backend=backend,
         )
         if early_output is not None:
             return early_output
@@ -1572,6 +1631,7 @@ class IluFlashAttentionImpl(AttentionImpl):
                 use_cuda_graph=attn_metadata.decode.use_graph if decode_only else False,
                 max_context_len=attn_metadata.decode.max_decode_seq_len,
                 value_cache=value_cache,
+                backend=backend,
             )
             if decode_only:
                 para_dict.update(
@@ -1653,6 +1713,8 @@ class IluFlashAttentionImpl(AttentionImpl):
         dcp_cu_seqlens_k: torch.Tensor,
         max_dcp_context_kv_len: int,
         query_causal: bool,
+        *,
+        backend: str | None = None,
     ) -> None:
         """DCP two-phase attention: context from paged KV + new Q/K/V, then merge."""
         query = query.contiguous()
@@ -1681,6 +1743,7 @@ class IluFlashAttentionImpl(AttentionImpl):
             block_table=block_table,
             softcap=self.logits_soft_cap,
             return_softmax_lse=True,
+            backend=backend,
         )
         context_attn_out, context_lse = flash_attn_varlen_func(**fa_kwargs)
 
@@ -1708,6 +1771,7 @@ class IluFlashAttentionImpl(AttentionImpl):
             window_size=sliding_window_size,
             softcap=self.logits_soft_cap,
             return_softmax_lse=True,
+            backend=backend,
         )
         query_attn_out, query_lse = flash_attn_varlen_func(**query_fa_kwargs)
         query_lse = query_lse.to(torch.float32)
@@ -1730,6 +1794,8 @@ class IluFlashAttentionImpl(AttentionImpl):
         cu_seqlens_q: torch.Tensor,
         max_seqlen_q: int,
         query_causal: bool,
+        *,
+        backend: str | None = None,
     ) -> None:
         query = query.contiguous()
         sliding_window_size = (
@@ -1751,6 +1817,7 @@ class IluFlashAttentionImpl(AttentionImpl):
             window_size=sliding_window_size,
             softcap=self.logits_soft_cap,
             return_softmax_lse=False,
+            backend=backend,
         )
         flash_attn_varlen_func(**query_fa_kwargs)
 
@@ -1761,6 +1828,8 @@ class IluFlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         output: torch.Tensor,
         attn_metadata: IluFlashAttentionMetadata,
+        *,
+        backend: str | None = None,
     ) -> None:
         assert attn_metadata.prefill is not None
         prefill_meta = attn_metadata.prefill
@@ -1772,6 +1841,7 @@ class IluFlashAttentionImpl(AttentionImpl):
             cu_seqlens_q=prefill_meta.query_start_loc,
             max_seqlen_q=prefill_meta.max_query_len,
             query_causal=attn_metadata.causal,
+            backend=backend,
         )
 
     def _forward_with_dcp(
@@ -1783,6 +1853,8 @@ class IluFlashAttentionImpl(AttentionImpl):
         value_cache: torch.Tensor,
         output: torch.Tensor,
         attn_metadata: IluFlashAttentionMetadata,
+        *,
+        backend: str | None = None,
     ) -> None:
         assert attn_metadata.decode is not None
         decode_meta = attn_metadata.decode
@@ -1802,6 +1874,7 @@ class IluFlashAttentionImpl(AttentionImpl):
             dcp_cu_seqlens_k=attn_metadata.dcp_cu_seqlens_k[: num_decodes + 1],
             max_dcp_context_kv_len=attn_metadata.max_dcp_context_kv_len,
             query_causal=True,
+            backend=backend,
         )
 
     def _forward_encoder_attention(
@@ -1812,6 +1885,8 @@ class IluFlashAttentionImpl(AttentionImpl):
         output: torch.Tensor,
         attn_metadata: IluFlashAttentionMetadata,
         layer: torch.nn.Module,
+        *,
+        backend: str | None = None,
     ) -> torch.Tensor:
         """Forward pass for encoder attention without KV cache."""
         if is_quantized_kv_cache(self.kv_cache_dtype):
@@ -1841,6 +1916,7 @@ class IluFlashAttentionImpl(AttentionImpl):
             alibi_slopes=self.alibi_slopes,
             window_size=sliding_window_size,
             softcap=self.logits_soft_cap,
+            backend=backend,
         )
 
         return output
@@ -1913,6 +1989,8 @@ def cascade_attention(
     block_table: torch.Tensor,
     common_prefix_len: int,
     s_aux: torch.Tensor | None = None,
+    *,
+    backend: str | None = None,
 ) -> torch.Tensor:
     assert alibi_slopes is None, "Cascade attention does not support ALiBi."
     assert sliding_window == (
@@ -1940,6 +2018,7 @@ def cascade_attention(
         block_table=block_table[:1],
         softcap=logits_soft_cap,
         return_softmax_lse=True,
+        backend=backend,
     )
 
     suffix_output, suffix_lse = flash_attn_varlen_func(
@@ -1956,6 +2035,7 @@ def cascade_attention(
         block_table=block_table[:, num_common_kv_blocks:],
         softcap=logits_soft_cap,
         return_softmax_lse=True,
+        backend=backend,
     )
 
     merge_attn_states(prefix_output, prefix_lse, suffix_output, suffix_lse, output)

@@ -597,6 +597,8 @@ class IluFlashMLASparseImpl(
         output: torch.Tensor,
         positions: torch.Tensor | None = None,
         kv_cache_scale: list[torch.Tensor] | None = None,
+        *,
+        backend: str | None = None,
     ) -> torch.Tensor:
         """Iluvatar-optimized forward_impl aligned with v0.17.0.
 
@@ -685,7 +687,12 @@ class IluFlashMLASparseImpl(
                         scale=layer._k_scale,
                     )
             attn_out = self.forward_mqa(
-                q, kv_cache, attn_metadata, self, kv_cache_scale
+                q,
+                kv_cache,
+                attn_metadata,
+                self,
+                kv_cache_scale,
+                **({"backend": backend} if backend is not None else {}),
             )
             output_view = output.view(-1, self.num_heads, self.v_head_dim)
             self._v_up_proj(attn_out, out=output_view[:num_actual_toks])
@@ -698,6 +705,8 @@ class IluFlashMLASparseImpl(
         kv_c_and_k_pe_cache: torch.Tensor,
         topk_indices: torch.Tensor,
         attn_metadata: IluFlashMLASparseMetadata,
+        *,
+        backend: str | None = None,
     ) -> torch.Tensor:
         compact_pools = bool(getattr(self._indexer, "compact_pool_indices", False))
         pool_prefill = compact_pools and attn_metadata.num_prefills > 0
@@ -746,6 +755,7 @@ class IluFlashMLASparseImpl(
                 topk_indices.view(q.shape[0], 1, -1),
                 topk_lens,
                 self.softmax_scale,
+                **({"backend": backend} if backend is not None else {}),
             ).squeeze(1)
 
         return self._bf16_flash_mla_kernel(
@@ -754,6 +764,7 @@ class IluFlashMLASparseImpl(
             topk_indices,
             topk_lens,
             kpool=4 if pool_prefill or pool_decode else 1,
+            **({"backend": backend} if backend is not None else {}),
         )
 
     @staticmethod
@@ -763,6 +774,8 @@ class IluFlashMLASparseImpl(
         indices: torch.Tensor,
         sm_scale: float,
         d_v: int = 512,
+        *,
+        backend: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sparse attention prefill kernel
@@ -783,7 +796,7 @@ class IluFlashMLASparseImpl(
         - max_logits:  [s_q, h_q], float
         - lse: [s_q, h_q], float, 2-based log-sum-exp
         """
-        results = ops.sparse_prefill_fwd(q, kv, indices, sm_scale, d_v)
+        results = ops.sparse_prefill_fwd(q, kv, indices, sm_scale, d_v, backend=backend)
         return results
 
     def _bf16_flash_mla_kernel(
@@ -793,6 +806,8 @@ class IluFlashMLASparseImpl(
         topk_indices: torch.Tensor,
         topk_lens: torch.Tensor | None = None,
         kpool: int = 1,
+        *,
+        backend: str | None = None,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
@@ -811,7 +826,11 @@ class IluFlashMLASparseImpl(
                 q = q_padded
             topk_indices = topk_indices.view(num_tokens, 1, -1)
             output = self.flash_mla_sparse_prefill(
-                q, kv_c_and_k_pe_cache, topk_indices, self.softmax_scale
+                q,
+                kv_c_and_k_pe_cache,
+                topk_indices,
+                self.softmax_scale,
+                backend=backend,
             )
             output = output[:, : self.num_heads, :]
         else:
@@ -822,7 +841,11 @@ class IluFlashMLASparseImpl(
                 sm_scale=self.softmax_scale,
                 topk_length=topk_lens,
                 kpool=kpool,
-                backend="ixinfer" if kpool == 4 else None,
+                backend=(
+                    backend
+                    if backend is not None
+                    else ("ixinfer" if kpool == 4 else None)
+                ),
             )
         return output
 
@@ -833,6 +856,8 @@ class IluFlashMLASparseImpl(
         topk_indices: torch.Tensor,
         attn_metadata: IluFlashMLASparseMetadata,
         kv_cache_scale: torch.Tensor,
+        *,
+        backend: str | None = None,
     ) -> torch.Tensor:
         # Convert per-request indices to global slots (decode) or workspace
         # offsets (prefill).
@@ -845,7 +870,11 @@ class IluFlashMLASparseImpl(
         )
 
         return self._int8_flash_mla_kernel(
-            q, kv_c_and_k_pe_cache, topk_indices, kv_cache_scale
+            q,
+            kv_c_and_k_pe_cache,
+            topk_indices,
+            kv_cache_scale,
+            backend=backend,
         )
 
     def _int8_flash_mla_kernel(
@@ -854,6 +883,8 @@ class IluFlashMLASparseImpl(
         kv_c_and_k_pe_cache: torch.Tensor,
         topk_indices: torch.Tensor,
         kv_cache_scale: torch.Tensor,
+        *,
+        backend: str | None = None,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
         topk_indices = topk_indices.view(num_tokens, 1, -1)
@@ -878,6 +909,7 @@ class IluFlashMLASparseImpl(
             topk_indices,
             self.softmax_scale,
             output_dtype=q.dtype,
+            backend=backend,
         )
 
     def setup_projections(
@@ -894,6 +926,8 @@ class IluFlashMLASparseImpl(
         attn_metadata: IluFlashMLASparseMetadata,
         layer: AttentionLayer,
         kv_cache_scale: torch.Tensor | None = None,
+        *,
+        backend: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # NOTE(lucas): for the sparse FlashMLA kernels the kernels want to use
         # MQA 576/512 approach for both prefill and decode
@@ -912,11 +946,20 @@ class IluFlashMLASparseImpl(
 
         if self.use_int8_mla:
             attn_out = self._forward_int8_kv(
-                q, kv_c_and_k_pe_cache, topk_indices, attn_metadata, kv_cache_scale
+                q,
+                kv_c_and_k_pe_cache,
+                topk_indices,
+                attn_metadata,
+                kv_cache_scale,
+                backend=backend,
             )
         else:
             attn_out = self._forward_bf16_kv(
-                q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
+                q,
+                kv_c_and_k_pe_cache,
+                topk_indices,
+                attn_metadata,
+                **({"backend": backend} if backend is not None else {}),
             )
 
         return attn_out

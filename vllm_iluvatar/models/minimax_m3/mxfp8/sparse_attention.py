@@ -281,7 +281,6 @@ class MiniMaxM3SparseIxformerImpl(MiniMaxM3SparseImpl):
                     p.cu_seqlens_q,
                     p.seq_lens,
                     p.context_lens,
-                    p.max_query_len,
                     self.num_kv_heads,
                     self.scale,
                     out[num_decode:],

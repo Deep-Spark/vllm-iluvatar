@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiConnector,
@@ -11,6 +12,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
 )
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 
 from vllm_iluvatar.ilu_patch.general_patches import patch_pp_cpu_offloading
@@ -51,10 +53,25 @@ def _config(
     )
 
 
-def _kv_config(num_blocks: int, total_size: int) -> SimpleNamespace:
+def _kv_config(
+    num_blocks: int, total_size: int, *, layer_names: tuple[str, ...] = ("layer",)
+) -> SimpleNamespace:
     return SimpleNamespace(
         num_blocks=num_blocks,
         kv_cache_tensors=[SimpleNamespace(size=total_size)],
+        hisparse_host_num_blocks=None,
+        prefix_cacheable_group_ids=(0,),
+        kv_cache_groups=[
+            SimpleNamespace(
+                layer_names=layer_names,
+                kv_cache_spec=MLAAttentionSpec(
+                    block_size=128,
+                    num_kv_heads=1,
+                    head_size=128,
+                    dtype=torch.bfloat16,
+                ),
+            )
+        ],
     )
 
 
@@ -527,3 +544,106 @@ def test_runtime_noop_does_not_call_base_rejection() -> None:
 
 def test_cpu_offloading_spec_type_is_available() -> None:
     assert CPUOffloadingSpec is not None
+
+
+def test_swa_only_rank_does_not_charge_gpu_scratch_to_offloading() -> None:
+    config = _kv_config(10, 10 * 65536, layer_names=())
+    assert patch_pp_cpu_offloading._worker_bytes_per_block(config) == 0
+
+
+def test_nonuniform_geometry_keeps_empty_rank_and_populated_peers(monkeypatch):
+    configs = [_kv_config(10, 655360, layer_names=()), _kv_config(10, 3000)]
+    monkeypatch.setattr(
+        patch_pp_cpu_offloading, "_ORIGINAL_GET_CONFIGS", lambda *_: configs
+    )
+    result = patch_pp_cpu_offloading._ilu_get_kv_cache_configs(
+        _config(), [{}, {}], [1, 1]
+    )
+    assert all(c._ilu_offload_worker_bytes_by_rank == (0, 300) for c in result)
+
+
+@pytest.mark.parametrize("geometry", [(0, 0), (-1, 300)])
+def test_invalid_empty_or_negative_geometry_is_rejected(geometry):
+    with pytest.raises(ValueError, match="nonnegative byte sizes"):
+        patch_pp_cpu_offloading._validate_target_geometry(_config(), geometry)
+
+
+def test_empty_rank_uses_same_aggregate_capacity_without_allocating_local_pages(
+    monkeypatch,
+):
+    def original_init(spec, _config):
+        spec.extra_config = {"cpu_bytes_to_use": 10 * 4096}
+        spec.blocks_per_chunk = 2
+        spec.BLOCK_SIZE_ALIGNMENT = 4096
+
+    monkeypatch.setattr(patch_pp_cpu_offloading, "_ORIGINAL_SPEC_INIT", original_init)
+    specs = []
+    for rank in (0, 1):
+        spec = SimpleNamespace()
+        config = SimpleNamespace(
+            canonical_layout=False,
+            parallel=SimpleNamespace(world_size=2, rank=rank),
+            _ilu_offload_worker_bytes_by_rank=(0, 1536),
+            _ilu_rank_safe_offload_required=True,
+        )
+        patch_pp_cpu_offloading._ilu_cpu_offloading_spec_init(spec, config)
+        specs.append(spec)
+    assert specs[0].num_chunks == specs[1].num_chunks == 10
+    assert specs[0].cpu_page_size_per_worker == 0
+    assert specs[1].cpu_page_size_per_worker == 3072
+
+
+def test_empty_worker_reports_each_global_job_once_without_gpu_calls(monkeypatch):
+    from vllm.v1.kv_offload.base import GPULoadStoreSpec, LoadStoreSpec
+
+    from vllm_iluvatar.v1.worker.empty_offloading import EmptyOffloadingWorker
+
+    constructor = MagicMock(side_effect=AssertionError("Unexpected CPU/GPU allocation"))
+    monkeypatch.setattr(
+        "vllm.v1.kv_offload.cpu.gpu_worker.CPUOffloadingWorker", constructor
+    )
+    spec = SimpleNamespace(
+        _ilu_nonuniform_pp_private=True,
+        blocks_per_chunk=1,
+        num_chunks=17,
+        cpu_page_size_per_worker=0,
+        kv_bytes_per_chunk=4096,
+        config=SimpleNamespace(
+            parallel=SimpleNamespace(rank=0),
+            _ilu_offload_worker_bytes_by_rank=(0, 1536),
+        ),
+    )
+    caches = SimpleNamespace(tensors=[], group_data_refs=[[], []])
+    worker = patch_pp_cpu_offloading._ilu_create_cpu_offloading_worker(spec, caches)
+    assert isinstance(worker, EmptyOffloadingWorker)
+    assert worker.submit_store(11, GPULoadStoreSpec([1, 2], [2], [0]), LoadStoreSpec())
+    assert worker.submit_load(12, LoadStoreSpec(), GPULoadStoreSpec([3], [1], [0]))
+    with pytest.raises(ValueError, match="already pending"):
+        worker.submit_store(11, GPULoadStoreSpec([], [], []), LoadStoreSpec())
+    worker.wait({11, 12})
+    assert [(r.job_id, r.success) for r in worker.get_finished()] == [
+        (11, True),
+        (12, True),
+    ]
+    assert worker.get_finished() == []
+    assert worker.submit_load(13, LoadStoreSpec(), GPULoadStoreSpec([], [], []))
+    worker.shutdown()
+    assert worker.get_finished() == []
+    constructor.assert_not_called()
+
+
+def test_empty_worker_rejects_nonempty_group_references():
+    spec = SimpleNamespace(
+        _ilu_nonuniform_pp_private=True,
+        blocks_per_chunk=1,
+        num_chunks=17,
+        cpu_page_size_per_worker=0,
+        kv_bytes_per_chunk=4096,
+        config=SimpleNamespace(
+            parallel=SimpleNamespace(rank=0),
+            _ilu_offload_worker_bytes_by_rank=(0, 1536),
+        ),
+    )
+    caches = SimpleNamespace(tensors=[], group_data_refs=[[object()]])
+    with pytest.raises(RuntimeError, match="nonempty cache references"):
+        patch_pp_cpu_offloading._ilu_create_cpu_offloading_worker(spec, caches)

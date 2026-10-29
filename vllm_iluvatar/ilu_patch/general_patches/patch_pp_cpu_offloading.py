@@ -125,11 +125,23 @@ def attest_required_bindings() -> None:
 
 
 def _worker_bytes_per_block(config) -> int:
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
+        get_offloading_group_ids,
+    )
+
     from vllm_iluvatar.models.deepseek_v41.offloading import (
         has_paired_pages,
         plan_offload_layout,
     )
 
+    # A PP stage containing only bounded-replay SWA still allocates GPU pages,
+    # but none of those pages belongs to the CPU prefix cache. Do not charge
+    # that backing allocation to the offload layout.
+    if not any(
+        config.kv_cache_groups[group_id].layer_names
+        for group_id in get_offloading_group_ids(config)
+    ):
+        return 0
     if has_paired_pages(config):
         return plan_offload_layout(config).bytes_per_block
     if config.num_blocks <= 0 or not config.kv_cache_tensors:
@@ -177,9 +189,10 @@ def _validate_target_geometry(vllm_config, geometry: tuple[int, ...]) -> None:
             "DSV4.1 PP CPU offload requires world_size == pp_size * tp_size: "
             f"{world_size} != {pp_size} * {tp_size}."
         )
-    if any(value <= 0 for value in geometry):
+    if any(value < 0 for value in geometry) or not any(geometry):
         raise ValueError(
-            "DSV4.1 PP CPU offload geometry must contain positive byte sizes: "
+            "DSV4.1 PP CPU offload geometry must contain nonnegative byte "
+            "sizes and at least one positive size: "
             f"{geometry}."
         )
 
@@ -308,6 +321,8 @@ def _ilu_cpu_offloading_spec_init(self, config) -> None:
 
     cpu_bytes_to_use = int(self.extra_config["cpu_bytes_to_use"])
     bytes_per_chunk = sum(geometry) * self.blocks_per_chunk
+    if any(value < 0 for value in geometry) or bytes_per_chunk <= 0:
+        raise ValueError("PP CPU offload requires a positive aggregate chunk size")
     aligned_bytes_per_chunk = round_up(
         bytes_per_chunk,
         self.BLOCK_SIZE_ALIGNMENT,
@@ -354,14 +369,26 @@ def _ilu_create_cpu_offloading_worker(self, kv_caches):
         "propagated_bytes_per_block=%d, actual_canonical_bytes_per_block=%d, "
         "cpu_page_size_per_worker=%d, "
         "aggregate_chunk_stride=%d, num_chunks=%d, mmap_region=None, "
-        "storage=private_pinned",
+        "storage=%s",
         rank,
         geometry[rank],
         actual_worker_bytes_per_block,
         self.cpu_page_size_per_worker,
         self.kv_bytes_per_chunk,
         self.num_chunks,
+        "empty" if actual_worker_bytes_per_block == 0 else "private_pinned",
     )
+    if actual_worker_bytes_per_block == 0:
+        if kv_caches.tensors or any(kv_caches.group_data_refs):
+            raise RuntimeError(
+                "Zero-byte PP offload rank has nonempty cache references"
+            )
+        from vllm_iluvatar.v1.worker.empty_offloading import EmptyOffloadingWorker
+
+        # Every PP worker must acknowledge each global offload job, including
+        # ranks with no local payload. Skipping the worker would leave loads
+        # and stores pending forever in the scheduler.
+        return EmptyOffloadingWorker()
     worker = CPUOffloadingWorker(
         kv_caches=kv_caches,
         blocks_per_chunk=self.blocks_per_chunk,

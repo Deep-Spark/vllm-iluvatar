@@ -23,12 +23,24 @@ PUT_NODE_META_MSG = b"put_node_meta_msg"
 GET_NODE_META_MSG = b"get_node_meta_msg"
 GET_META_MSG = b"get_meta_msg"
 TEARDOWN_COMPLETE_MSG = "teardown_complete"
+# Worker -> own scheduler: this rank can no longer reach a remote engine, or
+# has rebuilt it.  The producer has no channel to the consumer once NIXL is
+# down, so its scheduler answers the consumer's next command instead.
+ENGINE_REACHABILITY_MSG = "engine_reachability"
 TEARDOWN_RESULT_OK = b"teardown_complete"
 TEARDOWN_RESULT_FAILED = b"teardown_failed"
 OWNERSHIP_CANCEL_MSG = "ownership_cancel"
+# Read-only liveness question with the same payload shape as a cancel.  A
+# cancel executes; a probe only asks, so the producer answers it immediately
+# from scheduler state instead of waiting for its workers.
+OWNERSHIP_PROBE_MSG = "ownership_probe"
 OWNERSHIP_RESULT_ACCEPTED = "accepted"
 OWNERSHIP_RESULT_CANCELED = "canceled"
 OWNERSHIP_RESULT_TERMINAL = "terminal"
+# Probe-only answers.  ALIVE lets the consumer renew; UNKNOWN means the
+# producer will not vouch for the generation, so the consumer must cancel.
+OWNERSHIP_RESULT_ALIVE = "alive"
+OWNERSHIP_RESULT_UNKNOWN = "unknown"
 DISCONNECT_MSG = msgspec.msgpack.encode(("disconnect", "test-id"))[
     : msgspec.msgpack.encode(("disconnect", "test-id")).index(b"d") + len("disconnect")
 ]

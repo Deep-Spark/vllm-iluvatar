@@ -46,7 +46,11 @@ from vllm_iluvatar.v1.worker.prefill_state.configuration import (
 from vllm_iluvatar.v1.worker.prefill_state.scheduler_state import PrefixSchedulerState
 
 from .metadata import (
+    ENGINE_REACHABILITY_MSG,
     GET_NODE_META_MSG,
+    OWNERSHIP_PROBE_MSG,
+    OWNERSHIP_RESULT_ALIVE,
+    OWNERSHIP_RESULT_UNKNOWN,
     OWNERSHIP_CANCEL_MSG,
     OWNERSHIP_RESULT_ACCEPTED,
     OWNERSHIP_RESULT_CANCELED,
@@ -261,6 +265,31 @@ class NixlConnectorScheduler:
                 "kv_lease_duration", 480
             )
         )
+        # Grace added per 1K prompt tokens.  A fixed lease silently caps prompt
+        # length: P must finish a remote prefill, possibly restoring an
+        # offloaded prefix, before it can write, and a 700K-token request
+        # legitimately needs far longer than a 100K one.  Expiring first kills
+        # a healthy request, so the bound has to scale with the work.
+        # Zero by default: a probe renews the lease on evidence, which is
+        # strictly better than guessing a coefficient.  Raise it only when
+        # talking to a producer too old to answer a probe.
+        self._kv_lease_per_1k_tokens = float(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "kv_lease_per_1k_tokens", 0.0
+            )
+        )
+        self._lease_renew_interval = float(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "lease_renew_interval", 120.0
+            )
+        )
+        # A producer that keeps answering alive without ever writing must still
+        # lose the request: a probe may extend the wait, never remove its bound.
+        self._max_lease_renewals = int(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "max_lease_renewals", 10
+            )
+        )
         self._teardown_timeout = float(
             vllm_config.kv_transfer_config.get_from_extra_config(
                 # A 256K in-flight transfer can delay a worker's connector
@@ -334,6 +363,24 @@ class NixlConnectorScheduler:
         self._ownership_states: dict[ReqId, RequestOwnershipState] = {}
         self._ownership_deadlines: dict[ReqId, float] = {}
         self._ownership_cancel_pending: set[ReqId] = set()
+        # One outstanding probe per request.  _expire_recv_ownership runs every
+        # scheduler step, so without this the first expiry becomes a storm.
+        self._ownership_probe_pending: set[ReqId] = set()
+        self._lease_renewals: dict[ReqId, int] = {}
+        # Producers too old to know the probe op answer it with an empty frame.
+        self._probe_unsupported: set[str] = set()
+        # Receives whose producer returned a terminal proof.  Consumed by
+        # request_finished_all_groups, which may only release blocks early for
+        # these; it runs after update_connector_output already dropped the
+        # ownership generation, so the generation cannot carry the proof.
+        self._recv_release_proofs: set[ReqId] = set()
+        # Remote engine -> local ranks that reported it unreachable.
+        # Producer-side only; a consumer never answers these commands.
+        self._unreachable_ranks: dict[str, set[int]] = {}
+        # Producer requests this engine has admitted.  A probe must be
+        # answerable while the request only sits in the queue: that wait is
+        # exactly what the consumer's lease must not cut short.
+        self._live_send_reqs: set[ReqId] = set()
         self._ownership_safe_releases: queue.SimpleQueue[
             tuple[ReqId, str, str]
         ] = queue.SimpleQueue()
@@ -402,12 +449,17 @@ class NixlConnectorScheduler:
             self._ownership_states[request.request_id] = (
                 RequestOwnershipState.PREPARED
             )
+        elif params and params.get("do_remote_decode"):
+            # Admitted but possibly not scheduled for a long time under load.
+            self._live_send_reqs.add(request.request_id)
 
     def _stop_recv_tracking(self, req_id: ReqId) -> None:
         """Stop tracking a completed or cancelled local receive."""
         self._live_recv_reqs.discard(req_id)
         self._ownership_deadlines.pop(req_id, None)
         self._ownership_cancel_pending.discard(req_id)
+        self._ownership_probe_pending.discard(req_id)
+        self._lease_renewals.pop(req_id, None)
         self._ownership_generations.pop(req_id, None)
         self._ownership_remote_engines.pop(req_id, None)
         self._ownership_states.pop(req_id, None)
@@ -462,9 +514,77 @@ class NixlConnectorScheduler:
             ),
         )
 
+    def _queue_ownership_probe(self, req_id: ReqId) -> bool:
+        """Ask P whether it still owns this generation before cancelling it.
+
+        Returns whether a probe is outstanding.  A false answer, including a
+        peer too old to understand the op, leaves the caller on the cancel
+        path: the probe may only ever delay a cancel, never replace one.
+        """
+
+        if self._lease_renewals.get(req_id, 0) >= self._max_lease_renewals:
+            return False
+        generation = self._ownership_generations.get(req_id)
+        remote_engine_id = self._ownership_remote_engines.get(req_id)
+        if not generation or not remote_engine_id:
+            return False
+        if remote_engine_id in self._probe_unsupported:
+            return False
+        self._ownership_probe_pending.add(req_id)
+        self._queue_peer_command(
+            remote_engine_id,
+            (
+                OWNERSHIP_PROBE_MSG,
+                (req_id, generation, self.engine_id, "receive lease expired"),
+            ),
+        )
+        return True
+
+    def _fail_open_probe(
+        self, remote_engine_id: str, req_id: ReqId, generation: str
+    ) -> None:
+        """Cancel a probe that never got a definitive answer."""
+
+        if req_id not in self._ownership_probe_pending:
+            return
+        self._ownership_probe_pending.discard(req_id)
+        if self._ownership_generations.get(req_id) != generation:
+            return
+        logger.warning(
+            "No usable probe answer from %s for request %s; cancelling the "
+            "receive lease",
+            remote_engine_id,
+            req_id,
+        )
+        self._request_ownership_cancel(req_id, "receive lease expired")
+
+    def _renew_recv_lease(self, req_id: ReqId) -> None:
+        renewals = self._lease_renewals.get(req_id, 0) + 1
+        self._lease_renewals[req_id] = renewals
+        self._ownership_deadlines[req_id] = (
+            time.perf_counter() + self._lease_renew_interval
+        )
+        logger.info(
+            "NIXL receive lease renewed for request %s (%d/%d): producer still "
+            "owns the generation",
+            req_id,
+            renewals,
+            self._max_lease_renewals,
+        )
+
     def _expire_recv_ownership(self, now: float) -> None:
         for req_id, expires in list(self._ownership_deadlines.items()):
             if now < expires or req_id not in self._live_recv_reqs:
+                continue
+            if (
+                req_id in self._ownership_cancel_pending
+                or req_id in self._ownership_probe_pending
+            ):
+                # build_connector_meta runs this every step; the deadline stays
+                # armed until the producer answers, so only the first pass may
+                # act or log.
+                continue
+            if self._queue_ownership_probe(req_id):
                 continue
             logger.warning(
                 "NIXL receive lease expired for request %s; requesting "
@@ -472,6 +592,111 @@ class NixlConnectorScheduler:
                 req_id,
             )
             self._request_ownership_cancel(req_id, "receive lease expired")
+
+    def _probe_ownership(
+        self,
+        req_id: ReqId,
+        generation: str,
+        consumer_engine_id: str,
+        tombstones: RequestTombstoneStore,
+    ) -> str:
+        """Answer one consumer probe from producer state, without side effects.
+
+        Every answer is scoped to ``generation``: a request that was preempted
+        and re-registered carries a different one, and vouching for the wrong
+        generation would renew a lease nothing is working on.
+        """
+
+        if terminal := tombstones.get(req_id, generation):
+            return terminal.value
+        current = self._ownership_generations.get(req_id)
+        published = (
+            current == generation
+            and self._ownership_states.get(req_id)
+            is RequestOwnershipState.ACCEPTED
+        )
+        if self._unreachable_ranks.get(consumer_engine_id):
+            # Never vouch for a pair no rank can write to.  Blocks that were
+            # never published are safe to reclaim; a published generation may
+            # still have a WRITE in flight, so its proof must come from worker
+            # completion, which a cancel waits for.
+            return (
+                OWNERSHIP_RESULT_UNKNOWN
+                if published
+                else OWNERSHIP_RESULT_CANCELED
+            )
+        if current is not None and current != generation:
+            return OWNERSHIP_RESULT_CANCELED
+        if (
+            req_id in self._live_send_reqs
+            or req_id in self._reqs_to_send
+            or req_id in self._pending_worker_sends
+        ):
+            # Queued, prefilling, or handed to a worker: all still progressing.
+            return OWNERSHIP_RESULT_ALIVE
+        return OWNERSHIP_RESULT_UNKNOWN
+
+    def _apply_probe_reply(
+        self, req_id: ReqId, generation: str, remote_engine_id: str, response: bytes
+    ) -> None:
+        """Resolve one probe.  Leaving it pending means fall back to a cancel.
+
+        Every definitive outcome clears the pending flag; the caller cancels
+        whatever is still pending, so a lost reply, an empty frame from an old
+        producer, a mismatched generation and an unknown verdict all converge
+        on today's behaviour instead of leaving the request waiting.
+        """
+
+        try:
+            result, reply_generation = msgspec.msgpack.decode(response)
+        except Exception:
+            # Producers that predate this op reply with an empty frame.  Stop
+            # probing this peer rather than paying a socket reset per request.
+            self._probe_unsupported.add(remote_engine_id)
+            logger.warning(
+                "Remote engine %s does not support ownership probes; falling "
+                "back to cancel on lease expiry",
+                remote_engine_id,
+            )
+            return
+        if str(reply_generation) != generation:
+            logger.warning(
+                "Ignoring probe answer for %s with generation %r != %r",
+                req_id,
+                reply_generation,
+                generation,
+            )
+            return
+        if self._ownership_generations.get(req_id) != generation:
+            # The receive moved on while the probe was in flight; cancelling
+            # would only log a missing generation.
+            self._ownership_probe_pending.discard(req_id)
+            return
+        if result == OWNERSHIP_RESULT_ALIVE:
+            self._ownership_probe_pending.discard(req_id)
+            self._renew_recv_lease(req_id)
+            return
+        if result in (OWNERSHIP_RESULT_CANCELED, OWNERSHIP_RESULT_TERMINAL):
+            self._ownership_probe_pending.discard(req_id)
+            self._ownership_states[req_id] = RequestOwnershipState.TERMINAL
+            self._ownership_safe_releases.put(
+                (req_id, generation, f"producer ownership {result}")
+            )
+            return
+        if result != OWNERSHIP_RESULT_UNKNOWN:
+            logger.warning(
+                "Unexpected probe answer %r for %s; treating it as unknown",
+                result,
+                req_id,
+            )
+
+    def _recv_lease_for(self, request: "Request") -> float:
+        """Receive lease for one request, scaled by the work P owes it."""
+
+        prompt_tokens = request.num_prompt_tokens or 0
+        return self._kv_lease_duration + (
+            self._kv_lease_per_1k_tokens * prompt_tokens / 1024
+        )
 
     def _drain_safe_releases(self, meta: NixlConnectorMetadata) -> None:
         while True:
@@ -486,6 +711,10 @@ class NixlConnectorScheduler:
                     generation,
                 )
                 continue
+            # The only proof that no late WRITE can target this generation.
+            # Releases driven by anything else -- a locally rejected receive, a
+            # session still draining -- must keep delaying the block release.
+            self._recv_release_proofs.add(req_id)
             self._ownership_states[req_id] = RequestOwnershipState.TERMINAL
             self._ownership_deadlines.pop(req_id, None)
             meta.reqs_to_release[req_id] = (generation, reason)
@@ -908,7 +1137,7 @@ class NixlConnectorScheduler:
                         block_ids_send_to_remote,
                     )
                     self._ownership_deadlines[request.request_id] = (
-                        time.perf_counter() + self._kv_lease_duration
+                        time.perf_counter() + self._recv_lease_for(request)
                     )
                     # Replay groups are deliberately empty; a request with no
                     # destination at all would leave P nothing to write.
@@ -1238,6 +1467,8 @@ class NixlConnectorScheduler:
             # request that finishes normally would otherwise stay here forever.
             fully_local = request.request_id in self._reqs_not_send_to_worker
             self._reqs_not_send_to_worker.discard(request.request_id)
+            proven_terminal = request.request_id in self._recv_release_proofs
+            self._recv_release_proofs.discard(request.request_id)
             if (
                 request.status
                 not in (
@@ -1252,18 +1483,27 @@ class NixlConnectorScheduler:
                     # this req is full cache by local, when aborted, return False
                     self._stop_recv_tracking(request.request_id)
                     return False, {}
-                else:
-                    # Keep D blocks until P proves every native WRITE terminal.
-                    self._request_ownership_cancel(
-                        request.request_id, "consumer request aborted"
-                    )
-                    self._reqs_not_processed_recv.add(request.request_id)
-                    return True, {}
+                if proven_terminal:
+                    # P already proved every native WRITE terminal, so the
+                    # release is safe and nothing will report this request
+                    # again.  Delaying here would strand its blocks, and the
+                    # request itself, for the engine's lifetime.
+                    self._stop_recv_tracking(request.request_id)
+                    return False, {}
+                # Keep D blocks until P proves every native WRITE terminal.
+                self._request_ownership_cancel(
+                    request.request_id, "consumer request aborted"
+                )
+                self._reqs_not_processed_recv.add(request.request_id)
+                return True, {}
 
             self._stop_recv_tracking(request.request_id)
             return False, None
         # P side
         else:
+            # Whatever happens below, this engine stops progressing it, so a
+            # probe must stop vouching for it.
+            self._live_send_reqs.discard(request.request_id)
             if params.get("do_remote_decode"):
                 params["do_remote_decode"] = False
                 # when a reqs aborted, p workers will always get d block info and only notify info.:
@@ -1544,6 +1784,42 @@ class NixlConnectorScheduler:
                         continue
                     op_type, payload = message
 
+                    if op_type == ENGINE_REACHABILITY_MSG:
+                        engine_id, rank, reachable = payload
+                        await reply(identity, b"")
+                        ranks = self._unreachable_ranks.setdefault(
+                            str(engine_id), set()
+                        )
+                        if reachable:
+                            ranks.discard(int(rank))
+                        else:
+                            ranks.add(int(rank))
+                        logger.warning(
+                            "NIXL rank %s reports remote engine %s as %s "
+                            "(unreachable ranks: %s)",
+                            rank,
+                            engine_id,
+                            "reachable" if reachable else "unreachable",
+                            sorted(ranks),
+                        )
+                        continue
+
+                    if op_type == OWNERSHIP_PROBE_MSG:
+                        req_id, generation, consumer_engine_id, _reason = payload
+                        result = self._probe_ownership(
+                            str(req_id),
+                            str(generation),
+                            str(consumer_engine_id),
+                            ownership_tombstones,
+                        )
+                        # Read-only: a probe never records a tombstone, never
+                        # publishes to workers, and never arms a cancel.
+                        await reply(
+                            identity,
+                            msgspec.msgpack.encode((result, str(generation))),
+                        )
+                        continue
+
                     if op_type == TEARDOWN_COMPLETE_MSG:
                         (
                             remote_engine_id,
@@ -1607,6 +1883,41 @@ class NixlConnectorScheduler:
                             )
                             continue
                         current = self._ownership_generations.get(req_id)
+                        # Only a generation this loop published can have a
+                        # WRITE in flight; D retries block_ids whenever an ACK
+                        # is lost, so a repeat of a published generation must
+                        # never be answered from the unreachable shortcut.
+                        published = (
+                            current == generation
+                            and self._ownership_states.get(req_id)
+                            is RequestOwnershipState.ACCEPTED
+                        )
+                        if not published and self._unreachable_ranks.get(
+                            remote_engine_id
+                        ):
+                            # Refusing to disclose the destination blocks is a
+                            # cancel, not a terminal proof: no worker ever
+                            # learned them, so nothing can target them, but
+                            # this says nothing about any other generation.
+                            logger.warning(
+                                "Refusing block_ids for %s: ranks %s cannot "
+                                "reach remote engine %s",
+                                req_id,
+                                sorted(self._unreachable_ranks[remote_engine_id]),
+                                remote_engine_id,
+                            )
+                            ownership_tombstones.record(
+                                req_id,
+                                generation,
+                                RequestOwnershipState.CANCELED,
+                            )
+                            await reply(
+                                identity,
+                                msgspec.msgpack.encode(
+                                    (OWNERSHIP_RESULT_CANCELED, generation)
+                                ),
+                            )
+                            continue
                         if current is not None and current != generation:
                             # This scheduler never accepted the stale generation;
                             # reject it without disturbing the active one.
@@ -1812,16 +2123,33 @@ class NixlConnectorScheduler:
                 remote_engine_id,
                 "dropped, peer gone" if peer_meta is None else peer_meta.addr,
             )
+            # A probe is never retried: whatever its outcome, the request must
+            # end up either renewed or cancelled before this item is dropped.
+            unresolved_probe: tuple[ReqId, str] | None = (
+                (str(send_infos[1][0]), str(send_infos[1][1]))
+                if send_infos[0] == OWNERSHIP_PROBE_MSG
+                else None
+            )
             if peer_meta is None:
-                asyncio.create_task(
-                    retry_later(remote_engine_id, send_infos, attempt)
-                )
+                if unresolved_probe is not None:
+                    self._fail_open_probe(remote_engine_id, *unresolved_probe)
+                else:
+                    asyncio.create_task(
+                        retry_later(remote_engine_id, send_infos, attempt)
+                    )
                 continue
             try:
                 await peer_meta.socket.send(msgspec.msgpack.encode(send_infos))
                 response = await peer_meta.socket.recv()
                 op_type, payload = send_infos
-                if op_type in ("block_ids", OWNERSHIP_CANCEL_MSG):
+                if op_type == OWNERSHIP_PROBE_MSG:
+                    self._apply_probe_reply(
+                        str(payload[0]),
+                        str(payload[1]),
+                        remote_engine_id,
+                        response,
+                    )
+                elif op_type in ("block_ids", OWNERSHIP_CANCEL_MSG):
                     req_id, generation = str(payload[0]), str(payload[1])
                     result, reply_generation = msgspec.msgpack.decode(response)
                     if str(reply_generation) != generation:
@@ -1870,3 +2198,9 @@ class NixlConnectorScheduler:
                 asyncio.create_task(
                     retry_later(remote_engine_id, send_infos, attempt)
                 )
+            finally:
+                # Structural guarantee: anything that did not resolve the probe
+                # definitively -- a timeout, a reset socket, a decode failure --
+                # lands on the cancel path rather than waiting forever.
+                if unresolved_probe is not None:
+                    self._fail_open_probe(remote_engine_id, *unresolved_probe)

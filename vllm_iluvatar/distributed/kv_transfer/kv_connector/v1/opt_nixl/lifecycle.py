@@ -220,6 +220,9 @@ class SendRequestState:
     ownership_state: RequestOwnershipState = RequestOwnershipState.PREPARED
     cancel_requested: bool = False
     command_fingerprint: bytes | None = None
+    # Whether the extra window granted to a send whose halves never joined has
+    # already been used, so the next expiry reaps it.
+    orphan_grace_armed: bool = False
 
     def install_metadata(self, metadata: Any, deadline: float | None) -> None:
         """Merge scheduler metadata without dropping earlier join inputs."""

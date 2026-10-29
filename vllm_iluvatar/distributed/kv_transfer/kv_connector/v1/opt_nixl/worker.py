@@ -90,6 +90,7 @@ from .memory_registration import (
     validate_registered_allocation_alias,
 )
 from .metadata import (
+    ENGINE_REACHABILITY_MSG,
     GET_META_MSG,
     OWNERSHIP_CANCEL_MSG,
     NixlAgentMetadata,
@@ -163,6 +164,29 @@ def byte_compatible_kv_layouts(
         and spec.num_kv_heads == 1
         for spec in registered_specs
     )
+
+
+# A status that can only come from the peer's endpoint being gone.
+_SESSION_TERMINAL_STATUSES = ("REMOTEDISCONNECT",)
+# Ambiguous between an unknown agent and an unknown descriptor.  Only a call
+# that carries no descriptors at all -- a notification -- proves the former.
+_AGENT_SCOPED_TERMINAL_STATUSES = ("NOTFOUND",)
+
+
+def _is_session_terminal_error(error: BaseException, *, agent_scoped: bool) -> bool:
+    """Whether a NIXL status proves the whole session is unusable.
+
+    ``_is_terminal_xfer_query_error`` classifies one handle, which is a much
+    weaker statement: INVALID_PARAM, MISMATCH or the CANCELED this worker asked
+    for are request-scoped and must never tear a session down, or one bad
+    request would fail every other request mapped to the same pair.
+    """
+
+    text = f"{type(error).__name__}{error}".upper().replace("_", "")
+    statuses = _SESSION_TERMINAL_STATUSES
+    if agent_scoped:
+        statuses += _AGENT_SCOPED_TERMINAL_STATUSES
+    return any(status in text for status in statuses)
 
 
 def _is_terminal_xfer_query_error(error: BaseException) -> bool:
@@ -527,6 +551,23 @@ class NixlConnectorWorker:
                 "producer_disconnect_drain_timeout", 45.0
             )
         )
+        # Extra window for a send whose local metadata and remote blocks never
+        # joined, e.g. because the client killed the request before the
+        # consumer disclosed its destination.  Must exceed the worst-case delay
+        # between this engine finishing a prefill and the consumer allocating.
+        self.producer_orphan_timeout = float(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "producer_orphan_timeout", 600.0
+            )
+        )
+        # A peer whose transport died answers neither the proxy nor the
+        # handshake, so every rebuild attempt costs this thread one proxy
+        # timeout per remote rank.  Rate-limit the retry per engine.
+        self.rehandshake_retry_interval = float(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "rehandshake_retry_interval", 5.0
+            )
+        )
         self._connector_metadata = None
 
         # thread and related resources
@@ -539,6 +580,24 @@ class NixlConnectorWorker:
         # The following lifecycle objects are owned exclusively by _async_loop.
         self.remote_sessions: dict[EngineId, RemoteEngineSession] = {}
         self._engine_generations: dict[EngineId, int] = {}
+        # Connect metadata of every engine handshaken with, so a session the
+        # transport invalidated can be rebuilt without a new connect: the agent
+        # metadata itself comes from the proxy, not from the peer.
+        self._remote_node_metas: dict[EngineId, NodeMeta] = {}
+        # Engines whose NIXL mappings this worker tore down after a terminal
+        # transport status.  The peer cannot learn of such a failure -- the only
+        # producer-to-consumer channel is the notification that just proved
+        # unusable -- so recovery is driven from here.
+        self._engines_needing_rehandshake: set[EngineId] = set()
+        self._rehandshake_retry_at: dict[EngineId, float] = {}
+        self._rehandshake_failures: dict[EngineId, int] = {}
+        self._reachability_outbox: asyncio.Queue[
+            tuple[EngineId, bool]
+        ] = asyncio.Queue()
+        self._reported_reachability: dict[EngineId, bool] = {}
+        # Engine -> reason, applied on the next progress tick.  Invalidating in
+        # place would tear down the dlists a running _write_blocks still reads.
+        self._pending_transport_failures: dict[EngineId, str] = {}
         self._loop_tasks: set[asyncio.Task[Any]] = set()
         self._loop_exit_event = asyncio.Event()
         self._teardown_outbox: asyncio.Queue[
@@ -1766,9 +1825,22 @@ class NixlConnectorWorker:
             logger.error(reason)
             return False
 
+        if (
+            self._accepting_work
+            and not self.is_consumer
+            and meta.engine_id in self._engines_needing_rehandshake
+        ):
+            # A placeholder would accept this request and then wait for an
+            # ACTIVE session that only a handshake can produce, so rebuild the
+            # session here or reject the request rather than let it hang.
+            self._rehandshake_remote_engine(meta.engine_id)
+        needs_rehandshake = meta.engine_id in self._engines_needing_rehandshake
+
         session = self.remote_sessions.get(meta.engine_id)
-        if self._accepting_work and (
-            session is None or session.state == RemoteSessionState.CLOSED
+        if (
+            self._accepting_work
+            and not needs_rehandshake
+            and (session is None or session.state == RemoteSessionState.CLOSED)
         ):
             # Request metadata and the scheduler-side connect message travel on
             # independent paths.  Create a placeholder so either may arrive
@@ -1784,11 +1856,19 @@ class NixlConnectorWorker:
             self.remote_sessions[meta.engine_id] = session
             if self.is_consumer:
                 session.activate()
-        if self._accepting_work and session is not None and session.accepts_work:
+        if (
+            self._accepting_work
+            and not needs_rehandshake
+            and session is not None
+            and session.accepts_work
+        ):
             return True
         reason = (
             "worker is shutting down"
             if not self._accepting_work
+            else f"remote engine {meta.engine_id!r} transport failed and is "
+            "waiting for a new handshake"
+            if needs_rehandshake
             else f"remote engine {meta.engine_id!r} is unavailable"
             if session is None
             else f"remote engine {meta.engine_id!r} is {session.state.name}"
@@ -1985,6 +2065,7 @@ class NixlConnectorWorker:
         except Exception as e:
             reason = f"failed to start NIXL transfer: {e}"
             self._log_failure("transfer_start_failed", req_id, error=e)
+            self._note_transport_failure(meta.engine_id, e, "transfer start failed")
             self._send_failures[req_id] = reason
             wrapper = self._send_transfers.get(req_id)
             if wrapper is None:
@@ -2145,6 +2226,9 @@ class NixlConnectorWorker:
                 )
                 self.xfer_stats.record_failed_transfer()
                 self._send_failures[request_id] = f"transfer setup failed: {e}"
+                self._note_transport_failure(
+                    dst_engine_id, e, "transfer setup failed"
+                )
                 try:
                     self.nixl_wrapper.send_notif(
                         cell.remote_agent_name,
@@ -2161,6 +2245,14 @@ class NixlConnectorWorker:
                         "failure_notification_failed",
                         request_id,
                         error=notify_error,
+                    )
+                    # D is now unreachable even for a one-byte notification,
+                    # so it cannot be told about this or any later failure.
+                    self._note_transport_failure(
+                        dst_engine_id,
+                        notify_error,
+                        "failure notification failed",
+                        agent_scoped=True,
                     )
                 if handle is not None:
                     try:
@@ -2598,6 +2690,9 @@ class NixlConnectorWorker:
                 try:
                     xfer_state = self.nixl_wrapper.check_xfer_state(handle)
                 except Exception as e:
+                    self._note_transport_failure(
+                        _remote_engine_id, e, "transfer state query failed"
+                    )
                     if _is_terminal_xfer_query_error(e):
                         item[1] = True
                         if req_id not in self._send_failures:
@@ -2667,11 +2762,13 @@ class NixlConnectorWorker:
             if state.deadline is None or now < state.deadline:
                 continue
             if not state.started:
-                if state.generation:
-                    # A queued D request can legitimately wait longer than the
-                    # legacy producer lease before disclosing destination
-                    # blocks. Keep source ownership until D sends CANCEL, the
-                    # remote session disconnects, or WRITE reaches terminal.
+                if state.generation and state.metadata is not None and (
+                    state.has_remote_blocks
+                ):
+                    # Both halves joined, so a WRITE still follows once the
+                    # local layers are ready.  Keep source ownership until D
+                    # sends CANCEL, the remote session disconnects, or WRITE
+                    # reaches terminal.
                     state.deadline = None
                     logger.warning(
                         "Producer lease expired for request %s generation %s "
@@ -2681,8 +2778,35 @@ class NixlConnectorWorker:
                         state.generation,
                     )
                     continue
+                if state.generation and not state.orphan_grace_armed:
+                    # A consumer queued behind other work can disclose its
+                    # destination blocks after the first lease, so grant one
+                    # more window before calling this ownerless.
+                    state.orphan_grace_armed = True
+                    state.deadline = now + self.producer_orphan_timeout
+                    logger.warning(
+                        "Producer send %s generation %s is still unjoined "
+                        "(metadata=%s remote_blocks=%s); holding it for %.0fs "
+                        "more before reclaiming the source blocks",
+                        req_id,
+                        state.generation,
+                        state.metadata is not None,
+                        state.has_remote_blocks,
+                        self.producer_orphan_timeout,
+                    )
+                    continue
+                # Nobody ever claimed both halves: an aborted client leaves the
+                # consumer with nothing to send and this engine would otherwise
+                # hold the source blocks for its whole lifetime.  No WRITE was
+                # issued, so _finish_send's tombstone also fences a late
+                # PREPARED instead of letting it start one.
                 self.xfer_stats.record_kv_expired_req()
-                self._finish_send(req_id, "send lease expired before transfer")
+                self._finish_send(
+                    req_id,
+                    "ownerless send reclaimed: metadata="
+                    f"{state.metadata is not None} "
+                    f"remote_blocks={state.has_remote_blocks}",
+                )
 
     def _progress_sessions(self, now: float) -> None:
         for session in list(self.remote_sessions.values()):
@@ -2736,6 +2860,7 @@ class NixlConnectorWorker:
             self._poll_new_notifs()
         else:
             self._poll_send_transfers()
+        self._apply_transport_failures()
         now = time.perf_counter()
         self._expire_requests(now)
         self._progress_sessions(now)
@@ -2928,6 +3053,54 @@ class NixlConnectorWorker:
             )
         )
 
+    async def _deliver_to_scheduler(self, path: str, payload: bytes) -> bool:
+        """Send one report to this rank's scheduler, retrying a lost ACK."""
+        for attempt in range(5):
+            try:
+                with make_zmq_socket(
+                    path=path,
+                    ctx=self.ctx,
+                    socket_type=zmq.REQ,
+                    bind=False,
+                    linger=0,
+                ) as socket:
+                    socket.setsockopt(zmq.SNDTIMEO, 3000)
+                    socket.setsockopt(zmq.RCVTIMEO, 3000)
+                    await socket.send(payload)
+                    await socket.recv()
+                return True
+            except Exception as error:
+                logger.warning(
+                    "NIXL worker report retry %d/5 failed: %s", attempt + 1, error
+                )
+                await asyncio.sleep(0.2 * (attempt + 1))
+        return False
+
+    async def _run_reachability_reports(self) -> None:
+        """Tell this rank's scheduler which remote engines it can still reach.
+
+        The scheduler answers the consumer's commands, so this is the only way
+        a consumer can learn about a dead pair before its own lease expires:
+        the producer cannot reach it over NIXL by definition.
+        """
+        path = make_zmq_path("tcp", self.side_channel_addr)
+        while True:
+            engine_id, reachable = await self._reachability_outbox.get()
+            payload = msgspec.msgpack.encode(
+                (
+                    ENGINE_REACHABILITY_MSG,
+                    (engine_id, self.global_rank, bool(reachable)),
+                )
+            )
+            if not await self._deliver_to_scheduler(path, payload):
+                logger.error(
+                    "Unable to report remote engine %s as %s from rank %s",
+                    engine_id,
+                    "reachable" if reachable else "unreachable",
+                    self.global_rank,
+                )
+            self._reachability_outbox.task_done()
+
     async def _run_teardown_reports(self) -> None:
         """Deliver worker teardown completion to this rank's scheduler."""
         path = make_zmq_path("tcp", self.side_channel_addr)
@@ -2947,33 +3120,7 @@ class NixlConnectorWorker:
                     ),
                 )
             )
-            delivered = False
-            for attempt in range(5):
-                try:
-                    with make_zmq_socket(
-                        path=path,
-                        ctx=self.ctx,
-                        socket_type=zmq.REQ,
-                        bind=False,
-                        linger=0,
-                    ) as socket:
-                        socket.setsockopt(zmq.SNDTIMEO, 3000)
-                        socket.setsockopt(zmq.RCVTIMEO, 3000)
-                        await socket.send(payload)
-                        await socket.recv()
-                    delivered = True
-                    break
-                except Exception as error:
-                    logger.warning(
-                        "NIXL teardown report retry %d/5 failed for %s "
-                        "generation %s: %s",
-                        attempt + 1,
-                        engine_id,
-                        generation,
-                        error,
-                    )
-                    await asyncio.sleep(0.2 * (attempt + 1))
-            if not delivered:
+            if not await self._deliver_to_scheduler(path, payload):
                 # Router remains fenced when an ACK is lost; never fake safety.
                 logger.error(
                     "Unable to report teardown for %s generation %s rank %s",
@@ -3089,6 +3236,163 @@ class NixlConnectorWorker:
         )
         self.remote_sessions[engine_id] = session
         return session
+
+    def _note_transport_failure(
+        self,
+        engine_id: EngineId | None,
+        error: BaseException,
+        context: str,
+        *,
+        agent_scoped: bool = False,
+    ) -> None:
+        """Queue a session invalidation for a session-terminal status.
+
+        ``agent_scoped`` marks a call that names only the remote agent, so an
+        unknown-object status there proves the agent itself is gone rather than
+        one descriptor of this request.
+        """
+
+        if engine_id is None or not _is_session_terminal_error(
+            error, agent_scoped=agent_scoped
+        ):
+            return
+        self._pending_transport_failures.setdefault(
+            engine_id, f"{context}: {type(error).__name__}: {error}"
+        )
+
+    def _apply_transport_failures(self) -> None:
+        while self._pending_transport_failures:
+            engine_id, reason = self._pending_transport_failures.popitem()
+            self._invalidate_remote_engine(engine_id, reason)
+
+    def _invalidate_remote_engine(self, engine_id: EngineId, reason: str) -> None:
+        """Stop feeding work to a session whose transport is terminal."""
+
+        session = self.remote_sessions.get(engine_id)
+        if session is not None and not session.accepts_work:
+            # Already draining or closed; its requests fail through the
+            # disconnect path and a rebuild is attempted when they are done.
+            self._engines_needing_rehandshake.add(engine_id)
+            return
+        logger.error(
+            "Invalidating NIXL session for remote engine %s: %s", engine_id, reason
+        )
+        self._engines_needing_rehandshake.add(engine_id)
+        self._rehandshake_retry_at.pop(engine_id, None)
+        self._report_reachability(engine_id, reachable=False)
+        self._mark_engine_disconnected(engine_id)
+
+    def _report_reachability(self, engine_id: EngineId, *, reachable: bool) -> None:
+        """Publish this rank's view of a remote engine to its own scheduler."""
+
+        if self.is_consumer:
+            # Only a producer's scheduler answers a peer's ownership commands.
+            return
+        if self._reported_reachability.get(engine_id) == reachable:
+            return
+        self._reported_reachability[engine_id] = reachable
+        self._reachability_outbox.put_nowait((engine_id, reachable))
+
+    def _note_handshake_failure(
+        self, engine_id: EngineId, error: BaseException
+    ) -> None:
+        """Keep a failed connect recoverable instead of silently dead.
+
+        D caches its peer on the first connect and never re-sends one, so a
+        request arriving after this would otherwise sit behind a CONNECTING
+        placeholder that nothing can ever activate.  Flagging the engine makes
+        the next request either rebuild the session or fail fast with a reason.
+        """
+
+        self._log_failure(
+            "handshake_failed",
+            None,
+            msg=f"remote engine {engine_id}",
+            error=error,
+        )
+        self._report_reachability(engine_id, reachable=False)
+        self._mark_engine_disconnected(engine_id)
+        self._engines_needing_rehandshake.add(engine_id)
+        failures = self._rehandshake_failures.get(engine_id, 0)
+        self._rehandshake_failures[engine_id] = failures + 1
+        # The handshake just failed; do not let the next request retry it
+        # immediately.
+        self._rehandshake_retry_at[engine_id] = (
+            time.perf_counter() + self.rehandshake_retry_interval
+        )
+
+    def _retract_teardown_if_unsettled(
+        self, session: RemoteEngineSession | None
+    ) -> None:
+        """Tell the scheduler a teardown this rank reported no longer holds.
+
+        Re-activating an engine undoes a teardown already reported as closed.
+        Re-reporting the same id overwrites this rank's ack, which turns a
+        pending result into a failure so the Router retries instead of
+        believing the pair is gone.  A teardown the scheduler already finished
+        is out of reach; fencing that needs an epoch on connect itself.
+        """
+
+        if session is None or session.teardown_id is None:
+            return
+        if session.reported_teardown_id != session.teardown_id:
+            return
+        session.reported_teardown_id = None
+        self._report_teardown(session, "reconnected")
+
+    def _rehandshake_remote_engine(self, engine_id: EngineId) -> bool:
+        """Rebuild an invalidated session from the cached connect metadata.
+
+        D never re-sends connect for a session only this side knows is dead, so
+        the rebuild has to start here.  Returns whether the session is ACTIVE
+        again; the caller rejects the request when it is not.
+        """
+
+        node_meta = self._remote_node_metas.get(engine_id)
+        if node_meta is None or not self._accepting_work:
+            return False
+        now = time.perf_counter()
+        retry_at = self._rehandshake_retry_at.get(engine_id)
+        if retry_at is not None and now < retry_at:
+            return False
+        session = self._new_connect_session(engine_id)
+        if session is None:
+            # Old generation still owns live handles.  No handshake ran, so no
+            # cooldown is owed: retry as soon as it drains.
+            return False
+        # The handshake blocks this thread, so arm the cooldown around the
+        # attempt itself and back off while the peer stays unreachable.
+        failures = self._rehandshake_failures.get(engine_id, 0)
+        self._rehandshake_retry_at[engine_id] = now + min(
+            self.rehandshake_retry_interval * (2**failures),
+            self.rehandshake_retry_interval * 8,
+        )
+        try:
+            per_layer_infos, per_rank_info = self._nixl_handshake(node_meta)
+        except Exception as e:
+            self._rehandshake_failures[engine_id] = failures + 1
+            self._log_failure(
+                "rehandshake_failed",
+                None,
+                msg=f"remote engine {engine_id}",
+                error=e,
+            )
+            self._mark_engine_disconnected(engine_id)
+            self._engines_needing_rehandshake.add(engine_id)
+            return False
+        self._remote_agents_per_layer[engine_id] = per_layer_infos
+        self._remote_agents_per_rank[engine_id] = per_rank_info
+        session.activate()
+        self._engines_needing_rehandshake.discard(engine_id)
+        self._rehandshake_retry_at.pop(engine_id, None)
+        self._rehandshake_failures.pop(engine_id, None)
+        self._report_reachability(engine_id, reachable=True)
+        logger.info(
+            "Rebuilt NIXL session for remote engine %s generation %s",
+            engine_id,
+            session.generation,
+        )
+        return True
 
     def _mark_engine_disconnected(
         self, engine_id: EngineId, teardown_id: int | None = None
@@ -3229,6 +3533,7 @@ class NixlConnectorWorker:
                 self._run_progress(),
                 self._run_write_kv_cache(),
                 self._run_teardown_reports(),
+                self._run_reachability_reports(),
             ]
             if host_kv_enabled():
                 coroutines.append(self._run_d2h())
@@ -3292,6 +3597,16 @@ class NixlConnectorWorker:
                             remote_engine_id,
                             remote_engine_id in self.remote_sessions,
                         )
+                        if (
+                            not self.is_consumer
+                            and remote_engine_id
+                            in self._engines_needing_rehandshake
+                        ):
+                            # block_ids normally arrives before this request's
+                            # local prefill ends, so rebuilding here lets the
+                            # first request after a transport failure still
+                            # transfer instead of being rejected.
+                            self._rehandshake_remote_engine(remote_engine_id)
                         # D-side block_ids and local prefill metadata travel on
                         # independent paths. Preserve unmatched block_ids in a
                         # placeholder until metadata and handshake also arrive.
@@ -3358,6 +3673,14 @@ class NixlConnectorWorker:
                         else:
                             remote_engine_id = remote_infos
                             teardown_id = None
+                        # A router teardown is authoritative and gets ACKed, so
+                        # drop the cached connect metadata: a queued request
+                        # must not silently rebuild a session the router has
+                        # been told is gone.  Only a fresh connect re-enables it.
+                        self._remote_node_metas.pop(remote_engine_id, None)
+                        self._engines_needing_rehandshake.discard(remote_engine_id)
+                        self._rehandshake_retry_at.pop(remote_engine_id, None)
+                        self._rehandshake_failures.pop(remote_engine_id, None)
                         self._mark_engine_disconnected(
                             remote_engine_id, teardown_id
                         )
@@ -3369,6 +3692,10 @@ class NixlConnectorWorker:
                                 node_meta.engine_id,
                             )
                             continue
+                        # Kept so a session invalidated by a terminal transport
+                        # status can be rebuilt without another connect.
+                        self._remote_node_metas[node_meta.engine_id] = node_meta
+                        previous = self.remote_sessions.get(node_meta.engine_id)
                         session = self._new_connect_session(node_meta.engine_id)
                         if session is not None:
                             try:
@@ -3387,6 +3714,20 @@ class NixlConnectorWorker:
                                     per_rank_info
                                 )
                                 session.activate()
+                                if previous is not session:
+                                    self._retract_teardown_if_unsettled(previous)
+                                self._engines_needing_rehandshake.discard(
+                                    node_meta.engine_id
+                                )
+                                self._rehandshake_retry_at.pop(
+                                    node_meta.engine_id, None
+                                )
+                                self._rehandshake_failures.pop(
+                                    node_meta.engine_id, None
+                                )
+                                self._report_reachability(
+                                    node_meta.engine_id, reachable=True
+                                )
                                 for req_id, state in list(self._send_requests.items()):
                                     if (
                                         state.metadata is not None
@@ -3404,13 +3745,9 @@ class NixlConnectorWorker:
                                     session.generation,
                                 )
                             except Exception as e:
-                                self._log_failure(
-                                    "handshake_failed",
-                                    None,
-                                    msg=f"remote engine {node_meta.engine_id}",
-                                    error=e,
+                                self._note_handshake_failure(
+                                    node_meta.engine_id, e
                                 )
-                                self._mark_engine_disconnected(node_meta.engine_id)
                     else:
                         logger.info(
                             "get a unsupported op: %s, supported ops: block_ids, "

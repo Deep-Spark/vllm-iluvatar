@@ -10,9 +10,6 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 import ixformer.inference.functions as ixfops
 import torch
 import vllm.envs as envs
-from ixformer.inference.functions.deepseek.quantized_sparse_mla_int8 import (
-    GroupedInt8AttentionOutput,
-)
 from torch import nn
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -89,6 +86,9 @@ from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
 from vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa import IluDeepseekV4SWACache
 
 if TYPE_CHECKING:
+    from ixformer.inference.functions.deepseek.quantized_sparse_mla_int8 import (
+        GroupedInt8AttentionOutput,
+    )
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 logger = init_logger(f"vllm.{__name__}")
@@ -1322,7 +1322,16 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             hidden_states, qr, kv, kv_score, indexer_weights, positions, attn_out
         )
         if getattr(self, "_grouped_int8_o_proj", False):
-            if isinstance(projection_input, GroupedInt8AttentionOutput):
+            if projection_input is not None:
+                # The producer and legacy grouped path do not require the
+                # optional reader extension. Resolve its payload type only
+                # when the reader actually returns a quantized result.
+                from ixformer.inference.functions.deepseek.quantized_sparse_mla_int8 import (
+                    GroupedInt8AttentionOutput,
+                )
+
+                if not isinstance(projection_input, GroupedInt8AttentionOutput):
+                    raise TypeError("Unsupported grouped attention reader output")
                 if not projection_input.inverse_rope_applied:
                     raise ValueError("Grouped WO-A reader did not apply inverse RoPE")
                 grouped = self.wo_a.quant_method.apply_quantized(

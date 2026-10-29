@@ -930,7 +930,14 @@ def sparse_prefill_fwd(
     sm_scale: float,
     d_v: int = 512,
     topk_length: torch.Tensor | None = None,
+    *,
+    backend: str | None = None,
 ):
+    """Sparse prefill; backend is forwarded unchanged to ixformer.
+
+    None lets ixformer resolve its backend. Callers can select a backend
+    explicitly; this wrapper does not choose one based on the architecture.
+    """
     # Valid indices from dsa_update_topk_indices are a prefix; cap softmax
     # gather so padded -1 / OOB entries cannot pull cache slot 0. Callers that
     # already ran triton_convert_req_index_to_global_index can pass its
@@ -939,7 +946,13 @@ def sparse_prefill_fwd(
         idx = indices.reshape(indices.shape[0], -1)
         topk_length = (idx >= 0).sum(dim=-1).to(torch.int32)
     return ixf_ops.sparse_flash_attn(
-        q, kv, indices, sm_scale, d_v, topk_length=topk_length
+        q,
+        kv,
+        indices,
+        sm_scale,
+        d_v,
+        topk_length=topk_length,
+        backend=backend,
     )
 
 

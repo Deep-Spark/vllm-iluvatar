@@ -66,6 +66,7 @@ from vllm_iluvatar.models.deepseek_v41.indexer_kv import (
     SPLIT_INDEXER_FORMAT,
     indexer_kv_layout,
 )
+from vllm_iluvatar.models.deepseek_v41.prefill_query import ProducerQuerySelection
 from vllm_iluvatar.models.deepseek_v41.query_quant import (
     QueryActivation,
     can_fuse_query_quant,
@@ -537,6 +538,16 @@ class IluDeepseekV41Indexer(nn.Module):
             # (skip_k_cache_insert=True).
             self._produce_k(latent, positions, rotary_emb)
 
+        return self.prepare_query(qr, indexer_weights, positions, rotary_emb)
+
+    def prepare_query(
+        self,
+        qr: QueryActivation,
+        indexer_weights: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_emb,
+    ) -> tuple[torch.Tensor, None, torch.Tensor]:
+        """Prepare query rows independently of full-token key publication."""
         # ReplicatedLinear returns (output, bias).
         q = self.wq_b(qr)[0].view(-1, self.n_head, self.head_dim)
         if self.store_fp8_kv:
@@ -1349,6 +1360,110 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             apply_rope(attn_out.unsqueeze(0), positions, self.cos_sin, inverse=True)
         return self._o_proj(attn_out)
 
+    def forward_producer_queries(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        selection: ProducerQuerySelection,
+    ) -> torch.Tensor:
+        """Publish every source KV row but evaluate only consumed queries.
+
+        The caller owns the E25 eligibility/generation checks. Full metadata
+        remains installed for all cache writers; selected readers take explicit
+        row views and never replace another layer's metadata or workspaces.
+        """
+        metadata = get_forward_context().attn_metadata
+        swa = (
+            metadata.get(self.swa_cache_layer.prefix)
+            if isinstance(metadata, dict)
+            else None
+        )
+        main = (
+            metadata.get(self.compressed_cache_prefix)
+            if isinstance(metadata, dict)
+            else None
+        )
+        if (
+            swa is None
+            or main is None
+            or swa.num_decodes
+            or not swa.num_prefills
+            or self.indexer is None
+            or not self.indexer.owns_k
+            or self.swa_cache_layer.kv_cache.dtype != torch.bfloat16
+            or getattr(self, "_grouped_int8_o_proj", False)
+        ):
+            return self.forward(positions, hidden_states)
+
+        qr_kv, kv_score, indexer_weights = self._run_parallel_input_projections(
+            hidden_states
+        )
+        qr, kv = self._split_qkv_and_norm(qr_kv)
+        latent = self._produce_compressed_kv(kv_score, positions)
+        # Empty head axes are the established KV-only contract used by the
+        # draft context writer. No full-size high-dimensional Q is allocated.
+        empty_q = kv.new_empty((0, 0, self.head_dim))
+        self._fused_qnorm_rope_kv_insert(empty_q, kv, positions, metadata)
+        self.indexer._produce_k(latent, positions, self.indexer_rotary_emb)
+        if has_kv_transfer_group():
+            get_kv_transfer_group().save_kv_layer(
+                "layer_name", "kv_cache", "attn_metadata"
+            )
+        if self.compressed_kv_workspace is not None:
+            self.compressed_kv_workspace.restore.invalidate()
+        if not getattr(self, "_producer_query_trim_reported", False):
+            logger.info(
+                "Producer attention keeps %d of %d query rows; KV publication keeps all rows",
+                selection.count,
+                hidden_states.shape[0],
+            )
+            self._producer_query_trim_reported = True
+        carrier = torch.zeros_like(hidden_states)
+        if not selection.count:
+            return carrier
+
+        selected_qr = selection.select_activation(qr)
+        selected_positions = selection.select(positions)
+        q = self._wq_b_proj(selected_qr)
+        apply_rope(q.unsqueeze(0), selected_positions, self.cos_sin)
+        index_q, _, index_weights = self.indexer.prepare_query(
+            selected_qr,
+            selection.select(indexer_weights),
+            selected_positions,
+            self.indexer_rotary_emb,
+        )
+        self.indexer.indexer_op.forward_selected(index_q, index_weights, selection)
+        assert self.topk_indices_buffer is not None
+        indices, lengths = torch.ops._C.v41_global_topk_indices_and_lens(
+            selection.select(self.topk_indices_buffer),
+            selection.select(swa.token_to_req_indices),
+            main.block_table,
+            main.block_size // self.compress_ratio,
+            selection.select(swa.is_valid_token),
+            selected_positions,
+            self.compress_ratio,
+            0,
+            False,
+        )
+        output = torch.empty_like(q)
+        self._sparse_mla(
+            q,
+            selection.select(swa.prefill_swa_indices),
+            selection.select(swa.prefill_swa_lens),
+            self._compressed_kv_cache(),
+            indices,
+            lengths,
+            output,
+            positions=selected_positions,
+            prefill=True,
+        )
+        if not self._uses_fused_inverse_rope():
+            apply_rope(
+                output.unsqueeze(0), selected_positions, self.cos_sin, inverse=True
+            )
+        selection.scatter(self._o_proj(output), carrier)
+        return carrier
+
     def _run_parallel_input_projections(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
@@ -1447,26 +1562,10 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         """
         attn_metadata = get_forward_context().attn_metadata
         indexer = self.indexer
-        compressor = self.compressor
 
         index_q: torch.Tensor | None = None
         index_weights_out: torch.Tensor | None = None
-        latent: torch.Tensor | None = None
-
-        if compressor is not None:
-            latent = compressor(
-                kv_score,
-                positions,
-                rotary_emb=self.rotary_emb,
-                row_out=self.main_kv_rows if self.is_kv_sender else None,
-                scale_out=self.main_kv_scale_rows if self.is_kv_sender else None,
-            )
-            compressor.insert_cache(
-                latent,
-                positions,
-                self.rotary_emb,
-                row_out=self.main_kv_rows if self.is_kv_sender else None,
-            )
+        latent = self._produce_compressed_kv(kv_score, positions)
 
         q = self._wq_b_proj(qr)
         self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
@@ -1499,6 +1598,25 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             positions,
             out,
         )
+
+    def _produce_compressed_kv(self, kv_score, positions):
+        compressor = self.compressor
+        if compressor is None:
+            return None
+        latent = compressor(
+            kv_score,
+            positions,
+            rotary_emb=self.rotary_emb,
+            row_out=self.main_kv_rows if self.is_kv_sender else None,
+            scale_out=self.main_kv_scale_rows if self.is_kv_sender else None,
+        )
+        compressor.insert_cache(
+            latent,
+            positions,
+            self.rotary_emb,
+            row_out=self.main_kv_rows if self.is_kv_sender else None,
+        )
+        return latent
 
     def forward_mqa(
         self,

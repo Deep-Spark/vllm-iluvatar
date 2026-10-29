@@ -54,6 +54,10 @@ from vllm_iluvatar.models.deepseek_v41.engram import (
     engram_dp_group,
 )
 from vllm_iluvatar.models.deepseek_v41.pp_plan import build_rank_plan, local_kv_source
+from vllm_iluvatar.models.deepseek_v41.prefill_query import (
+    ProducerQuerySelection,
+    producer_query_compaction_enabled,
+)
 
 logger = init_logger(f"vllm.{__name__}")
 
@@ -175,6 +179,7 @@ class IluDeepseekV41DecoderLayer(IluDeepseekV4Fp8DecoderLayer):
         residual: torch.Tensor | None = None,
         *,
         ffn_rows: tuple[int, ...] | None = None,
+        query_selection: ProducerQuerySelection | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """``(x, residual, post_mix, res_mix, ffn_pre)``; FFN post is delayed."""
         # Each post hands the pre that follows it the sum of squares of the
@@ -217,7 +222,10 @@ class IluDeepseekV41DecoderLayer(IluDeepseekV4Fp8DecoderLayer):
             self.attn_norm,
         )
         if valid_prefix is None:
-            h = self.attn(positions, h, None)
+            if query_selection is None:
+                h = self.attn(positions, h, None)
+            else:
+                h = self.attn.forward_producer_queries(positions, h, query_selection)
         else:
             # Padded ranks still participate in MoE collectives, but never issue
             # attention/cache writes for rows that have no local request.
@@ -311,6 +319,9 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         self.config = config
         self.quant_config = vllm_config.quant_config
         self.parallel_config = vllm_config.parallel_config
+        self._producer_query_compaction = producer_query_compaction_enabled(
+            vllm_config.additional_config
+        )
         self._producer_ffn_layer = (
             producer_last_layer(vllm_config)
             if envs.VLLM_ILU_DS41_PRODUCER_TAIL_FFN
@@ -865,12 +876,19 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
             context = self.consumer_prefix_state
             if context is not None:
                 return context.forward(
-                    self._forward_full, input_ids, positions, intermediate_tensors,
-                    inputs_embeds, lookback_token_ids,
+                    self._forward_full,
+                    input_ids,
+                    positions,
+                    intermediate_tensors,
+                    inputs_embeds,
+                    lookback_token_ids,
                 )
             return self._forward_full(
-                input_ids, positions, intermediate_tensors,
-                inputs_embeds, lookback_token_ids,
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                lookback_token_ids,
             )
 
     def _forward_full(
@@ -912,6 +930,7 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         residual = post_mix = res_mix = None
         aux_hidden_states: list[torch.Tensor] = []
         ffn_rows = None
+        query_selection = None
         source_layer = getattr(self, "_producer_ffn_layer", None)
         if (
             source_layer is not None
@@ -921,6 +940,16 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
             and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.NONE
         ):
             ffn_rows = self.producer_prefix_state.tail_ffn_rows(positions.shape[0])
+            batch = self.producer_prefix_state._src_batch
+            if (
+                self._producer_query_compaction
+                and ffn_rows is not None
+                and batch
+                and all(row["prefill"] for row in batch)
+            ):
+                query_selection = ProducerQuerySelection.from_rows(
+                    ffn_rows, positions.shape[0]
+                )
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer), self.start_layer
         ):
@@ -934,6 +963,7 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                     res_mix,
                     residual,
                     ffn_rows=ffn_rows,
+                    query_selection=query_selection,
                 )
             else:
                 hidden_states, residual, post_mix, res_mix, pre_mix = layer(

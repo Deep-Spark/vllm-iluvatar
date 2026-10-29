@@ -437,6 +437,71 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
             self.register_buffer("_owned_decode_logits", logits, persistent=False)
             self.register_buffer("_owned_decode_extent", extent, persistent=False)
 
+    def forward_selected(self, q, weights, selection):
+        """Score retained prefill row spans against their unchanged full KV.
+
+        Query cumulative lengths are clipped on device, retaining zero-query
+        requests and their original block-table/concatenated-KV ordering. The
+        causal spans and candidate/top-k output rows keep original offsets.
+        """
+        metadata = get_forward_context().attn_metadata
+        assert isinstance(metadata, dict)
+        md = metadata[self.k_cache.prefix]
+        if md.num_decodes or md.prefill is None or not self.skip_k_cache_insert:
+            raise ValueError("Selected query scoring requires published prefill keys")
+        scales = (
+            self.k_cache.kv_cache_scales
+            if getattr(self.k_cache, "split_indexer", False)
+            else None
+        )
+        for chunk in md.prefill.chunks:
+            for begin, end, packed_start in selection.intersections(
+                chunk.token_start, chunk.token_end
+            ):
+                count = end - begin
+                local_begin, local_end = (
+                    begin - chunk.token_start,
+                    end - chunk.token_start,
+                )
+                if chunk.max_context_len == 0:
+                    self.topk_indices_buffer[begin:end].fill_(-1)
+                    continue
+                query_lens = (chunk.cu_seqlens_q - local_begin).clamp(min=0, max=count)
+                logits = _mqa_logits(
+                    q[packed_start : packed_start + count],
+                    query_lens,
+                    chunk.cu_seq_lens,
+                    self.k_cache.kv_cache,
+                    chunk.block_table,
+                    weights[packed_start : packed_start + count],
+                    max_q_len=min(chunk.max_q_len, count),
+                    max_kv_len=chunk.max_kv_len,
+                    max_context_len=chunk.max_context_len,
+                    cu_seqlen_ks=chunk.cu_seqlen_ks[local_begin:local_end],
+                    cu_seqlen_ke=chunk.cu_seqlen_ke[local_begin:local_end],
+                    valid_lens=chunk.valid_lens[local_begin:local_end],
+                    kv_scales=scales,
+                )
+                _two_level_filter(
+                    logits,
+                    chunk.cu_seqlen_ks[local_begin:local_end],
+                    chunk.cu_seqlen_ke[local_begin:local_end],
+                    chunk.valid_lens[local_begin:local_end],
+                    self.candidate_blocks,
+                    self.candidate_block_size,
+                    self.candidate_write,
+                    begin,
+                    end,
+                )
+                ixfops.dsa_update_topk_indices(
+                    logits,
+                    chunk.cu_seqlen_ks[local_begin:local_end],
+                    chunk.cu_seqlen_ke[local_begin:local_end],
+                    self.topk_tokens,
+                    self.topk_indices_buffer[begin:end],
+                )
+        return self.topk_indices_buffer
+
     def forward_native(
         self,
         hidden_states: torch.Tensor,

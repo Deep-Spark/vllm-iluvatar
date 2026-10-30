@@ -9,9 +9,12 @@ communication when the draft implements ``compute_draft_logits_local``.
 
 from __future__ import annotations
 
+import functools
+from collections.abc import Callable
 from typing import Any
 
 import torch
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
@@ -19,6 +22,43 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def make_init_cudagraph_manager(
+    orig_init_cg: Callable[..., None],
+) -> Callable[..., None]:
+    """Honor ``speculative_config.enforce_eager`` on DFlash/DSpark speculators."""
+
+    @functools.wraps(orig_init_cg)
+    def init_cudagraph_manager(
+        self: Any, cudagraph_mode: CUDAGraphMode
+    ) -> None:
+        if getattr(self.speculative_config, "enforce_eager", False):
+            logger.info(
+                "%s speculator has enforce_eager=True; running the draft eagerly.",
+                self._speculator_name,
+            )
+            cudagraph_mode = CUDAGraphMode.NONE
+        orig_init_cg(self, cudagraph_mode)
+
+    return init_cudagraph_manager
+
+
+def make_capture(orig_capture: Callable[..., None]) -> Callable[..., None]:
+    """Skip CUDA graph capture when the DFlash/DSpark speculator runs eagerly."""
+
+    @functools.wraps(orig_capture)
+    def capture(self: Any) -> None:
+        assert self.query_cudagraph_manager is not None
+        if self.query_cudagraph_manager.cudagraph_mode == CUDAGraphMode.NONE:
+            logger.info(
+                "Skipping CUDA graph capture for %s speculator (eager mode).",
+                self._speculator_name,
+            )
+            return
+        orig_capture(self)
+
+    return capture
 
 
 def load_draft_model(self, target_model, target_attn_layer_names):

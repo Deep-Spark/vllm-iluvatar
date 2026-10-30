@@ -588,6 +588,7 @@ def test_router_request_id_generation_is_notification_wire_safe() -> None:
 def _ownership_worker() -> NixlConnectorWorker:
     worker = object.__new__(NixlConnectorWorker)
     worker._send_requests = {}
+    worker._sends_still_progressing = set()
     worker._send_transfers = {}
     worker._send_failures = {}
     worker._send_tombstones = RequestTombstoneStore(ttl=60.0, limit=16)
@@ -664,6 +665,50 @@ def test_generation_send_lease_waits_for_consumer_cancel() -> None:
         worker._send_tombstones.get(state.req_id, state.generation)
         == RequestOwnershipState.CANCELED
     )
+
+
+def test_unjoined_send_survives_while_still_queued_on_producer() -> None:
+    # A deep prefill queue holds a request far longer than the orphan window,
+    # and the producer's own scheduler keeps answering the consumer's ownership
+    # probes with ALIVE for exactly that reason.  Reclaiming the send behind
+    # that answer drops a healthy request, so the worker has to consult the
+    # same truth before calling a send ownerless.
+    worker = _ownership_worker()
+    worker._early_recv_deadlines = {}
+    worker._early_recv_notifications = {}
+    worker.producer_orphan_timeout = 600.0
+    worker.xfer_stats = SimpleNamespace(
+        record_failed_transfer=lambda: None,
+        record_transfer=lambda _telemetry: None,
+        record_kv_expired_req=lambda: None,
+    )
+    state = SendRequestState(
+        req_id="request",
+        generation="generation-1",
+        deadline=1.0,
+        ownership_state=RequestOwnershipState.PREPARED,
+    )
+    state.remote_block_ids = [np.array([[2]], dtype=np.int32)]
+    worker._send_requests[state.req_id] = state
+    worker._sends_still_progressing = {"request"}
+
+    # First expiry still only arms the grace window.
+    worker._expire_requests(now=2.0)
+    assert state.orphan_grace_armed is True
+    assert state.deadline == pytest.approx(602.0)
+
+    # The grace window elapses, but this engine is still going to serve it.
+    worker._expire_requests(now=700.0)
+    assert worker._send_requests[state.req_id] is state
+    assert state.deadline == pytest.approx(1300.0)
+    assert worker._completion_outbox.empty()
+
+    # Once the scheduler stops vouching, the reclaim proceeds as before.
+    worker._sends_still_progressing = set()
+    worker._expire_requests(now=1400.0)
+    assert state.req_id not in worker._send_requests
+    batch = worker._completion_outbox.get_nowait()
+    assert "ownerless send reclaimed" in batch.failures["request"]
 
 
 @pytest.mark.parametrize(

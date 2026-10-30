@@ -569,6 +569,10 @@ class NixlConnectorWorker:
             )
         )
         self._connector_metadata = None
+        # Refreshed every step from this engine's own scheduler; see
+        # ``_expire_requests``.  Owned by the uvloop thread, like the rest of
+        # the send state.
+        self._sends_still_progressing: set[ReqId] = set()
 
         # thread and related resources
         self.ctx = zmq.asyncio.Context()
@@ -1767,6 +1771,7 @@ class NixlConnectorWorker:
             set(metadata.reqs_to_abort),
             dict(metadata.reqs_to_send_time_record),
             dict(metadata.reqs_to_release),
+            set(metadata.sends_still_progressing),
         )
 
     def _put_completion(self, batch: CompletionBatch) -> None:
@@ -1895,8 +1900,11 @@ class NixlConnectorWorker:
         reqs_to_abort: set[ReqId],
         send_expirations: dict[ReqId, float],
         safe_releases: dict[ReqId, tuple[str, str]],
+        sends_still_progressing: set[ReqId] | None = None,
     ) -> None:
         """Apply model-runner metadata on the uvloop owner thread."""
+        if sends_still_progressing is not None:
+            self._sends_still_progressing = sends_still_progressing
         if not self._accepting_work:
             all_reqs = {
                 **reqs_to_recv,
@@ -2792,6 +2800,22 @@ class NixlConnectorWorker:
                         state.generation,
                         state.metadata is not None,
                         state.has_remote_blocks,
+                        self.producer_orphan_timeout,
+                    )
+                    continue
+                if req_id in self._sends_still_progressing:
+                    # Queued, prefilling, or handed to a worker: this engine is
+                    # still going to serve it, and its own scheduler keeps
+                    # answering the consumer's probes with ALIVE.  Reclaiming
+                    # here would contradict that answer and drop a healthy
+                    # request whose only fault is a deep prefill queue.
+                    state.deadline = now + self.producer_orphan_timeout
+                    logger.info(
+                        "Producer send %s generation %s is unjoined but still "
+                        "queued on this engine; extending by %.0fs instead of "
+                        "reclaiming the source blocks",
+                        req_id,
+                        state.generation,
                         self.producer_orphan_timeout,
                     )
                     continue

@@ -593,6 +593,20 @@ class NixlConnectorScheduler:
             )
             self._request_ownership_cancel(req_id, "receive lease expired")
 
+    def _send_still_progressing(self, req_id: ReqId) -> bool:
+        """Whether this engine still intends to serve ``req_id``'s prefill.
+
+        Queued, prefilling, or already handed to a worker all count.  A deep
+        prefill queue can legitimately hold a request for far longer than the
+        producer's orphan window, so this is the difference between a send
+        that is merely waiting its turn and one nobody will ever complete.
+        """
+        return (
+            req_id in self._live_send_reqs
+            or req_id in self._reqs_to_send
+            or req_id in self._pending_worker_sends
+        )
+
     def _probe_ownership(
         self,
         req_id: ReqId,
@@ -627,12 +641,7 @@ class NixlConnectorScheduler:
             )
         if current is not None and current != generation:
             return OWNERSHIP_RESULT_CANCELED
-        if (
-            req_id in self._live_send_reqs
-            or req_id in self._reqs_to_send
-            or req_id in self._pending_worker_sends
-        ):
-            # Queued, prefilling, or handed to a worker: all still progressing.
+        if self._send_still_progressing(req_id):
             return OWNERSHIP_RESULT_ALIVE
         return OWNERSHIP_RESULT_UNKNOWN
 
@@ -1299,6 +1308,13 @@ class NixlConnectorScheduler:
 
             meta.reqs_to_send_time_record = self._reqs_to_send_time_record
             self._reqs_to_send_time_record = {}
+            # Same truth this scheduler reports to the consumer's ownership
+            # probes.  Without it the worker reclaims sends for requests this
+            # engine is still going to serve, while the scheduler keeps
+            # answering those probes with ALIVE.
+            meta.sends_still_progressing = set(self._live_send_reqs)
+            meta.sends_still_progressing.update(self._reqs_to_send)
+            meta.sends_still_progressing.update(self._pending_worker_sends)
 
         if self.prefix_state is not None:
             self.prefix_state.add_metadata(meta, scheduler_output, self.peer_node_metas)

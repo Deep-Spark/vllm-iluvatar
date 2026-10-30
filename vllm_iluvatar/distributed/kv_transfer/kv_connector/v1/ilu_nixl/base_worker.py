@@ -581,7 +581,6 @@ class IluNixlWorkerMixin:
         layer_region_ids: dict[str, list[int]] = defaultdict(list)
         transfer_regions: list[IluNixlTransferRegion] = []
         region_is_mla: list[bool] = []
-        block_stride: int | None = None
 
         for tensor_config in layout_config.kv_cache_tensors:
             shared_by = [
@@ -596,12 +595,16 @@ class IluNixlWorkerMixin:
                 raise ValueError(
                     "Packed IluNixl layout contains a non-packed tensor slot"
                 )
-            if block_stride is None:
-                block_stride = tensor_stride
-            elif block_stride != tensor_stride:
+            # Main K/V and the indexer page are different sizes (65536 vs
+            # 32768 on MiniMax TP4). Each slot keeps its own block stride,
+            # matching upstream NIXL's per-region block_strides.
+            block_span = tensor_stride * layout_config.num_blocks
+            if block_span <= 0 or backing_nbytes % block_span != 0:
                 raise ValueError(
-                    "Packed IluNixl slots must share one block stride: "
-                    f"{block_stride} != {tensor_stride}"
+                    "Packed IluNixl backing size is not a whole number of "
+                    "num_blocks * block_stride: "
+                    f"{backing_nbytes} != N * {layout_config.num_blocks} * "
+                    f"{tensor_stride}"
                 )
             if int(tensor_config.size) != backing_nbytes:
                 raise ValueError(
@@ -720,17 +723,8 @@ class IluNixlWorkerMixin:
                 )
                 region_is_mla.append(is_mla_region)
 
-        if not transfer_regions or block_stride is None:
+        if not transfer_regions:
             raise ValueError("Packed IluNixl layout has no local semantic slots")
-        # Block-outermost packing is one span. Layer-major packing repeats
-        # that span once per layer in the same storage.
-        block_span = block_stride * layout_config.num_blocks
-        if block_span <= 0 or backing_nbytes % block_span != 0:
-            raise ValueError(
-                "Packed IluNixl backing size is not a whole number of "
-                "num_blocks * block_stride: "
-                f"{backing_nbytes} != N * {layout_config.num_blocks} * {block_stride}"
-            )
 
         region_ids_by_group = self._build_region_ids_by_group(dict(layer_region_ids))
         return (

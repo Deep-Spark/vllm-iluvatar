@@ -882,3 +882,495 @@ def test_finish_memory_registration_records_region_memory_type():
 
     assert seen["mem_types"] == ["VRAM", "VRAM", "VRAM"]
     assert worker.dst_region_mem_types["engine"] == ["VRAM", "VRAM", "VRAM"]
+
+
+def test_glm5_flash_cache_kind_recognition():
+    assert (
+        IluNixlWorkerMixin._cache_kind_from_layer_name(
+            "model.layers.3.self_attn.mla_attn"
+        )
+        == "main_mla"
+    )
+    assert (
+        IluNixlWorkerMixin._cache_kind_from_layer_name(
+            "model.layers.3.self_attn.indexer.k_cache"
+        )
+        == "indexer_k_cache"
+    )
+    assert (
+        IluNixlWorkerMixin._cache_kind_from_layer_name(
+            "model.layers.3.self_attn.indexer.tail_cache"
+        )
+        == "kpool_tail_cache"
+    )
+    assert (
+        IluNixlWorkerMixin._cache_kind_from_layer_name(
+            "model.layers.0.self_attn"
+        )
+        == "mamba_cache"
+    )
+    assert (
+        IluNixlWorkerMixin._cache_kind_from_layer_name(
+            "model.layers.1.linear_attn"
+        )
+        == "mamba_cache"
+    )
+    assert (
+        IluNixlWorkerMixin._cache_kind_from_layer_name(
+            "model.layers.0.self_attn.ilu_deepseek_v4_multi_head_latent_attention"
+        )
+        == "main_mla"
+    )
+
+
+def test_glm5_flash_mamba_hma_routes_7_to_6_groups_and_cross_cycle_offset():
+    """Verify P (7 groups: 6,6,6,6,6,6,5,4) -> D (6 groups: 23,22) routing."""
+    worker = object.__new__(IluNixlWorkerMixin)
+    worker._group_spec_types = (
+        MLAAttentionSpec,
+        MLAAttentionSpec,
+        MambaSpec,
+        MambaSpec,
+        MambaSpec,
+        MambaSpec,
+    )
+    worker.num_regions = 4
+    # Even regions are 64KB MLA+Mamba shared; odd regions are 4KB indexer+tail.
+    worker._ssm_region_indices = [0, 2]
+
+    local_regions = [
+        _region(
+            0,
+            65536,
+            [
+                "0:mamba_cache:group2",
+                "1:mamba_cache:group3",
+                "2:mamba_cache:group4",
+                "3:main_mla:group0",
+                "4:mamba_cache:group5",
+            ],
+        ),
+        _region(
+            1,
+            4096,
+            [
+                "3:indexer_k_cache:group0",
+                "3:kpool_tail_cache:group1",
+            ],
+        ),
+        _region(
+            2,
+            65536,
+            [
+                "5:mamba_cache:group2",
+                "6:mamba_cache:group3",
+                "7:main_mla:group0",
+                "8:mamba_cache:group4",
+                "9:mamba_cache:group5",
+            ],
+        ),
+        _region(
+            3,
+            4096,
+            [
+                "7:indexer_k_cache:group0",
+                "7:kpool_tail_cache:group1",
+            ],
+        ),
+    ]
+    # P_PP0 owns layers 0..5 with 7 groups (group 6 holds layer 5 on P_R0).
+    remote_regions = [
+        _region(
+            0,
+            65536,
+            [
+                "0:mamba_cache:group2",
+                "1:mamba_cache:group3",
+                "2:mamba_cache:group4",
+                "3:main_mla:group0",
+                "4:mamba_cache:group5",
+                "5:mamba_cache:group6",
+            ],
+        ),
+        _region(
+            1,
+            4096,
+            [
+                "3:indexer_k_cache:group0",
+                "3:kpool_tail_cache:group1",
+            ],
+        ),
+    ]
+
+    routes, fa_local_ids, fa_remote_ids, ssm_remote_ids = (
+        worker._build_mamba_hma_transfer_routes(
+            selected_local_region_ids=[0, 1, 2],
+            selected_remote_region_ids=[0, 1],
+            local_transfer_regions=local_regions,
+            remote_transfer_regions=remote_regions,
+            overlap_start=0,
+            overlap_end=6,
+        )
+    )
+
+    # FA channel only includes D_R0/D_R1 <-> P_R0/P_R1, not polluted by D_R2.
+    assert fa_local_ids == [0, 1]
+    assert fa_remote_ids == [0, 1]
+    # SSM channel only includes 64KB P_R0, excluding 4KB P_R1.
+    assert ssm_remote_ids == [0]
+
+    route_map = {
+        (r.local_group_idx, r.remote_group_idx): (
+            r.is_ssm,
+            r.local_desc_region_ids.tolist(),
+            r.remote_desc_region_ids.tolist(),
+        )
+        for r in routes
+    }
+    assert route_map == {
+        (0, 0): (False, [0, 1], [0, 1]),
+        (1, 1): (False, [1], [1]),
+        (2, 2): (True, [0], [0]),
+        (3, 3): (True, [0], [0]),
+        (4, 4): (True, [0], [0]),
+        (5, 5): (True, [0], [0]),
+        # Layer 5: P_g6 on P_R0 (slot 0) -> D_g2 on D_R2 (compact SSM slot 1).
+        (2, 6): (True, [1], [0]),
+    }
+
+
+def test_validate_pp_hma_region_lengths_allows_shared_mla_mamba_under_hetero_tp():
+    worker = object.__new__(IluNixlWorkerMixin)
+    worker._has_mamba = True
+    worker.use_mla = True
+    worker._group_spec_types = (
+        MLAAttentionSpec,
+        MLAAttentionSpec,
+        MambaSpec,
+    )
+    worker.block_len_per_layer = [65536, 4096, 65536]
+    worker._is_region_replicated = lambda _: True
+    worker.dst_num_blocks = {"prefill": 140}
+    worker.transfer_topo = SimpleNamespace(
+        block_size_ratio=lambda _: 1,
+        tp_ratio=lambda _: 4,
+    )
+    remote_meta = SimpleNamespace(
+        engine_id="prefill",
+        block_size=128,
+        block_lens=[65536, 4096],
+        num_blocks=140,
+    )
+    routes = [
+        base_worker_module._HmaTransferRoute(
+            local_group_idx=0,
+            remote_group_idx=0,
+            is_ssm=False,
+            local_desc_region_ids=np.asarray([0, 1], dtype=np.int64),
+            remote_desc_region_ids=np.asarray([0, 1], dtype=np.int64),
+            raw_local_region_ids=(0, 1),
+            raw_remote_region_ids=(0, 1),
+        ),
+        base_worker_module._HmaTransferRoute(
+            local_group_idx=2,
+            remote_group_idx=6,
+            is_ssm=True,
+            local_desc_region_ids=np.asarray([1], dtype=np.int64),
+            remote_desc_region_ids=np.asarray([0], dtype=np.int64),
+            raw_local_region_ids=(2,),
+            raw_remote_region_ids=(0,),
+        ),
+    ]
+
+    # Should not raise AssertionError (65536 != 262144).
+    worker._validate_pp_hma_region_lengths(
+        remote_meta,
+        local_region_ids_by_group=[],
+        remote_region_ids_by_group=[],
+        selected_remote_region_ids=[0, 1],
+        remote_tp_size=1,
+        routes=routes,
+    )
+
+
+def test_glm5_flash_remote_handle_and_read_blocks_filter_non_ssm_regions():
+    worker = object.__new__(IluNixlWorkerMixin)
+    worker.engine_id = "decode"
+    worker.world_size = 4
+    worker.tp_rank = 0
+    worker.pp_world_size = 2
+    worker.pp_rank = 0
+    worker.pp_split = "23,22"
+    worker.use_mla = True
+    worker._has_mamba = True
+    worker._is_hma_required = True
+    worker.num_regions = 4
+    worker._ssm_region_indices = [0, 2]
+    worker.block_len_per_layer = [65536, 4096, 65536, 4096]
+    worker._is_region_replicated = lambda _: True
+    worker._group_spec_types = (
+        MLAAttentionSpec,
+        MLAAttentionSpec,
+        MambaSpec,
+        MambaSpec,
+        MambaSpec,
+        MambaSpec,
+    )
+    worker._physical_blocks_per_logical_kv_block = 2
+    worker.dst_num_blocks = {"decode": 4, "prefill": 4}
+    worker._mamba_ssm_size = (300, 1000)
+    worker._conv_decomp = SimpleNamespace(
+        local_conv_offsets=[(0, 100), (100, 100), (200, 100)],
+        remote_conv_offsets=lambda offset, tp_ratio: [
+            (0, 100),
+            (100, 100),
+            (200, 100),
+        ],
+    )
+    worker._stack_descs = lambda addrs, length, dev: np.column_stack(
+        [
+            addrs,
+            np.full(len(addrs), length, dtype=np.uint64),
+            np.full(len(addrs), dev, dtype=np.uint64),
+        ]
+    )
+    worker.transfer_topo = SimpleNamespace(
+        block_size_ratio=lambda _: 1,
+        tp_ratio=lambda _: 4,
+        get_engine_info=lambda _: SimpleNamespace(
+            remote_tp_size=1,
+            remote_physical_blocks_per_logical=2,
+            remote_block_size=128,
+        ),
+    )
+    worker.tp_mappings = {
+        "prefill": SimpleNamespace(
+            source_ranks_per_group=((0,), (0,), (0,), (0,), (0,), (0,)),
+            all_source_ranks=(0,),
+            rank_offset_factor=0,
+        )
+    }
+    worker._remote_pp_size_by_engine = {"prefill": 8}
+    worker._remote_pp_split_by_engine = {"prefill": "6,6,6,6,6,6,5,4"}
+    worker._semantic_region_engines = {"prefill"}
+    worker._engine_last_active = {}
+    worker._remote_agents = {"prefill": {0: "prefill_agent_0"}}
+    worker.src_xfer_handles_by_block_size = {128: 101}
+    worker.dst_xfer_side_handles = {"prefill": {}}
+    worker._recving_transfers = {"req-1": []}
+    worker.kv_cache_config = SimpleNamespace(
+        transfer_groups=[
+            SimpleNamespace(kv_cache_spec=object.__new__(MLAAttentionSpec)),
+            SimpleNamespace(kv_cache_spec=object.__new__(MLAAttentionSpec)),
+            SimpleNamespace(kv_cache_spec=object.__new__(MambaSpec)),
+            SimpleNamespace(kv_cache_spec=object.__new__(MambaSpec)),
+            SimpleNamespace(kv_cache_spec=object.__new__(MambaSpec)),
+            SimpleNamespace(kv_cache_spec=object.__new__(MambaSpec)),
+        ]
+    )
+
+    prepped_descs = {}
+    xfer_calls = []
+
+    class FakeNixlWrapper:
+        def get_xfer_descs(self, blocks_data, memory_type):
+            return (np.asarray(blocks_data, dtype=np.uint64), memory_type)
+
+        def prep_xfer_dlist(self, agent_name, descs):
+            prepped_descs[agent_name] = descs[0]
+            return 202
+
+        def make_prepped_xfer(
+            self,
+            op,
+            local_handle,
+            local_ids,
+            remote_handle,
+            remote_ids,
+            notif_msg=None,
+        ):
+            xfer_calls.append(
+                (
+                    op,
+                    local_handle,
+                    local_ids.tolist(),
+                    remote_handle,
+                    remote_ids.tolist(),
+                    notif_msg,
+                )
+            )
+            return 303
+
+        def transfer(self, handle):
+            pass
+
+    worker.nixl_wrapper = FakeNixlWrapper()
+    remote_meta = SimpleNamespace(
+        engine_id="prefill",
+        device_id=0,
+        memory_type="VRAM",
+        block_size=128,
+        num_blocks=4,
+        physical_blocks_per_logical_kv_block=2,
+        kv_caches_base_addr=[1000000, 2000000],
+        block_lens=[65536, 4096],
+        block_strides=[65536, 4096],
+        ssm_sizes=(1200, 4000),
+        transfer_regions=None,
+    )
+
+    # Register remote handle: FA has [0, 1], SSM only has [0] (skips 4KB region 1).
+    worker._register_pp_remote_xfer_handle(
+        engine_id="prefill",
+        remote_key=0,
+        remote_agent_name="prefill_agent_0",
+        nixl_agent_meta=remote_meta,
+        selected_local_region_ids=[0, 1],
+        selected_remote_region_ids=[0, 1],
+        selected_ssm_remote_region_ids=[0],
+    )
+
+    remote_descs = prepped_descs["prefill_agent_0"]
+    # 2 FA regions * 4 physical blocks + 1 SSM region * 4 sub-regions * 2 logical blocks = 16
+    assert remote_descs.shape == (16, 3)
+    # First 4 descs are 64KB single-page FA descs on region 0; next 4 are 4KB on region 1.
+    assert remote_descs[:4, 1].tolist() == [65536] * 4
+    assert remote_descs[4:8, 1].tolist() == [4096] * 4
+    # Remaining 8 descs are Mamba sub-descs all within region 0 (base 1000000), none in region 1.
+    assert all(1000000 <= addr < 2000000 for addr in remote_descs[8:, 0].tolist())
+
+    worker._mamba_hma_routes = {
+        "prefill": {
+            0: [
+                base_worker_module._HmaTransferRoute(
+                    local_group_idx=0,
+                    remote_group_idx=0,
+                    is_ssm=False,
+                    local_desc_region_ids=np.asarray([0, 1], dtype=np.int64),
+                    remote_desc_region_ids=np.asarray([0, 1], dtype=np.int64),
+                    raw_local_region_ids=(0, 1),
+                    raw_remote_region_ids=(0, 1),
+                ),
+                base_worker_module._HmaTransferRoute(
+                    local_group_idx=2,
+                    remote_group_idx=6,
+                    is_ssm=True,
+                    local_desc_region_ids=np.asarray([1], dtype=np.int64),
+                    remote_desc_region_ids=np.asarray([0], dtype=np.int64),
+                    raw_local_region_ids=(2,),
+                    raw_remote_region_ids=(0,),
+                ),
+            ]
+        }
+    }
+    worker._apply_prefix_caching = (
+        lambda decode_block_ids, prefill_block_ids, **_: (
+            decode_block_ids,
+            prefill_block_ids,
+        )
+    )
+    worker._logical_to_kernel_block_ids = lambda block_ids, ratio: [
+        [b * ratio + o for b in grp for o in range(ratio)] if idx < 2 else list(grp)
+        for idx, grp in enumerate(block_ids)
+    ]
+
+    meta = SimpleNamespace(
+        remote=SimpleNamespace(
+            engine_id="prefill",
+            request_id="r-prefill",
+            # 7 remote groups on P; group 6 has logical block [1]
+            block_ids=([0], [0], [0], [0], [0], [0], [1]),
+        ),
+        # 6 local groups on D (already expanded for FA: [0, 1]); group 2 has logical block [1]
+        local_physical_block_ids=([0, 1], [0, 1], [1], [0], [0], [0]),
+        awaiting_kvs=False,
+    )
+
+    worker._read_blocks_for_req("req-1", meta)
+
+    assert len(xfer_calls) == 1
+    _, local_handle, local_ids, remote_handle, remote_ids, _ = xfer_calls[0]
+    assert local_handle == 101
+    assert remote_handle == 202
+    # FA desc IDs: local regions [0, 1] * 4 blocks + [0, 1] -> [0, 1, 4, 5]
+    # SSM desc IDs (local): num_fa_regions(4)*4=16 + (slot(1)*4 + [0,1,2,3])*2 + block(1) -> [25, 27, 29, 31]
+    assert local_ids == [0, 1, 4, 5, 25, 27, 29, 31]
+    # FA desc IDs (remote): compact regions [0, 1] * 4 blocks + [0, 1] -> [0, 1, 4, 5]
+    # SSM desc IDs (remote): num_fa_regions(2)*4=8 + (slot(0)*4 + [0,1,2,3])*2 + block(1) -> [9, 11, 13, 15]
+    assert remote_ids == [0, 1, 4, 5, 9, 11, 13, 15]
+
+
+def test_glm5_flash_6_vs_6_hetero_pp_cross_cycle_mounting():
+    """Verify 6 vs 6 hetero PP where Mamba layers mount on offset MLA regions."""
+    worker = object.__new__(IluNixlWorkerMixin)
+    worker._group_spec_types = (
+        MLAAttentionSpec,
+        MLAAttentionSpec,
+        MambaSpec,
+        MambaSpec,
+        MambaSpec,
+        MambaSpec,
+    )
+    worker.num_regions = 8
+    worker._ssm_region_indices = [0, 2, 4, 6]
+
+    # D_PP0 holds layers 0..22; in cycle 3 (layers 12..15), layer 13 (group 2)
+    # mounts on D_R4 (slot 2) while layer 15 MLA is on D_R6/D_R7.
+    local_regions = [
+        _region(4, 65536, ["11:main_mla:group0", "13:mamba_cache:group2"]),
+        _region(6, 65536, ["15:main_mla:group0", "14:mamba_cache:group3"]),
+        _region(
+            7,
+            4096,
+            ["15:indexer_k_cache:group0", "15:kpool_tail_cache:group1"],
+        ),
+    ]
+    # P stage holds layers 12..16 (1 MLA at layer 15 -> P_R0/P_R1).
+    remote_regions = [
+        _region(
+            0,
+            65536,
+            [
+                "13:mamba_cache:group2",
+                "14:mamba_cache:group3",
+                "15:main_mla:group0",
+            ],
+        ),
+        _region(
+            1,
+            4096,
+            ["15:indexer_k_cache:group0", "15:kpool_tail_cache:group1"],
+        ),
+    ]
+
+    routes, fa_local_ids, fa_remote_ids, ssm_remote_ids = (
+        worker._build_mamba_hma_transfer_routes(
+            selected_local_region_ids=[4, 6, 7],
+            selected_remote_region_ids=[0, 1],
+            local_transfer_regions=local_regions,
+            remote_transfer_regions=remote_regions,
+            overlap_start=12,
+            overlap_end=17,
+        )
+    )
+
+    assert fa_local_ids == [6, 7]
+    assert fa_remote_ids == [0, 1]
+    assert ssm_remote_ids == [0]
+    route_map = {
+        (r.local_group_idx, r.remote_group_idx): (
+            r.local_desc_region_ids.tolist(),
+            r.remote_desc_region_ids.tolist(),
+        )
+        for r in routes
+    }
+    assert route_map == {
+        (0, 0): ([6, 7], [0, 1]),
+        (1, 1): ([7], [1]),
+        # D_R4 is compact SSM slot 2; P_R0 is compact SSM slot 0.
+        (2, 2): ([2], [0]),
+        # D_R6 is compact SSM slot 3; P_R0 is compact SSM slot 0.
+        (3, 3): ([3], [0]),
+    }
+
+

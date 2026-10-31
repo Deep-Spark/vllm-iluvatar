@@ -611,9 +611,9 @@ class IluFlashMLASparseImpl(
         if attn_metadata is None:
             _ = torch.empty(
                 (
-                    layer.chunked_prefill_workspace_size,
+                    q.shape[0],
                     self.num_heads,
-                    self.qk_nope_head_dim + self.v_head_dim,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
                 ),
                 device=k_c_normed.device,
                 dtype=k_c_normed.dtype,
@@ -709,7 +709,13 @@ class IluFlashMLASparseImpl(
         backend: str | None = None,
     ) -> torch.Tensor:
         compact_pools = bool(getattr(self._indexer, "compact_pool_indices", False))
-        pool_prefill = compact_pools and attn_metadata.num_prefills > 0
+        pool_prefill = (
+            compact_pools
+            and attn_metadata.num_prefills > 0
+            and q.shape[1] in (16, 32, 64)
+            and q.shape[-1] == 512
+            and kv_c_and_k_pe_cache.shape[-1] == 512
+        )
         pool_decode = (
             compact_pools
             and self.use_pool4_decode

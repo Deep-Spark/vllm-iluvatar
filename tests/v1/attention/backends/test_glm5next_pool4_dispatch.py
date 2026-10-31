@@ -19,6 +19,8 @@ import torch
         (True, False, 1, 32, "token"),
         (True, True, 0, 16, "paged"),
         (True, True, 1, 16, "pool4"),
+        (True, True, 0, 8, "paged"),
+        (True, True, 1, 8, "token"),
     ],
 )
 def test_pool4_decode_dispatch(
@@ -76,7 +78,7 @@ def test_pool4_decode_dispatch(
     result = impl._forward_bf16_kv(q, kv, selection, metadata)
     assert result.shape == q.shape
     if compact:
-        assert calls[0] == ("expand", expected == "paged")
+        assert calls[0] == ("expand", expected != "pool4")
     assert calls[-1] == (
         ("paged", 2176)
         if expected == "paged"

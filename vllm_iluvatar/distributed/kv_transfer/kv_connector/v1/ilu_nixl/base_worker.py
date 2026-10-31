@@ -6,6 +6,7 @@ import time
 from collections import defaultdict
 from concurrent.futures import Future
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import Any
 
 import msgspec
@@ -48,6 +49,17 @@ from .pp_utils import infer_pp_split
 logger = init_logger(__name__)
 
 _SEMANTIC_COMPAT_BACKEND = "ILU_NIXL_SEMANTIC_REGIONS_V1"
+
+
+@dataclass(frozen=True)
+class _HmaTransferRoute:
+    local_group_idx: int
+    remote_group_idx: int
+    is_ssm: bool
+    local_desc_region_ids: np.ndarray
+    remote_desc_region_ids: np.ndarray
+    raw_local_region_ids: tuple[int, ...]
+    raw_remote_region_ids: tuple[int, ...]
 
 
 class _BlocksFirstTopologyBackend:
@@ -130,6 +142,9 @@ class IluNixlWorkerMixin:
         self.transfer_regions: list[IluNixlTransferRegion] = []
         self.local_region_ids_by_group: dict[str, dict[int, list[np.ndarray]]] = {}
         self.remote_region_ids_by_group: dict[str, dict[int, list[np.ndarray]]] = {}
+        self._mamba_hma_routes: dict[str, dict[int, list[_HmaTransferRoute]]] = {}
+        self._remote_fa_num_regions: dict[str, dict[int, int]] = {}
+        self._selected_ssm_remote_region_ids: dict[str, dict[int, list[int]]] = {}
         self._remote_pp_size_by_engine: dict[str, int] = {}
         self._remote_pp_split_by_engine: dict[str, str] = {}
         self._pp_mamba_local_xfer_handle: int | None = None
@@ -263,14 +278,18 @@ class IluNixlWorkerMixin:
             return "swa_cache"
         if ".indexer.k_cache" in layer_name:
             return "indexer_k_cache"
+        if ".indexer.tail_cache" in layer_name:
+            return "kpool_tail_cache"
         if ".indexer.compressor" in layer_name:
             return "indexer_compressor"
         if ".compressor.state_cache" in layer_name:
             return "compressor_state_cache"
         if ".ilu_deepseek_v4_multi_head_latent_attention" in layer_name:
             return "main_mla"
-        if layer_name.endswith(".attn"):
+        if layer_name.endswith(".mla_attn") or layer_name.endswith(".attn"):
             return "main_mla"
+        if layer_name.endswith(".linear_attn") or layer_name.endswith(".self_attn"):
+            return "mamba_cache"
         return "unknown"
 
     @classmethod
@@ -1193,6 +1212,263 @@ class IluNixlWorkerMixin:
             selected_remote_ids,
         )
 
+    @staticmethod
+    def _parse_transfer_identity(identity: str) -> tuple[int, str, int]:
+        layer_idx, kind, group = identity.split(":", 2)
+        return (int(layer_idx), kind, int(group.removeprefix("group")))
+
+    def _build_mamba_hma_transfer_routes(
+        self,
+        selected_local_region_ids: list[int],
+        selected_remote_region_ids: list[int],
+        local_transfer_regions: list[IluNixlTransferRegion],
+        remote_transfer_regions: list[IluNixlTransferRegion],
+        overlap_start: int | None = None,
+        overlap_end: int | None = None,
+    ) -> tuple[
+        list[_HmaTransferRoute],
+        list[int],
+        list[int],
+        list[int],
+    ]:
+        local_regions = self._regions_by_id(local_transfer_regions)
+        remote_regions = self._regions_by_id(remote_transfer_regions)
+
+        selected_local = [
+            local_regions[region_id]
+            for region_id in selected_local_region_ids
+            if region_id in local_regions
+        ]
+        selected_remote = [
+            remote_regions[region_id]
+            for region_id in selected_remote_region_ids
+            if region_id in remote_regions
+        ]
+
+        def in_overlap(layer_idx: int) -> bool:
+            if overlap_start is None or overlap_end is None or layer_idx < 0:
+                return True
+            return overlap_start <= layer_idx < overlap_end
+
+        local_by_key: dict[tuple[int, str], tuple[int, int]] = {}
+        for region in selected_local:
+            for identity in region.identities:
+                layer_idx, kind, group_idx = self._parse_transfer_identity(identity)
+                if in_overlap(layer_idx):
+                    local_by_key[(layer_idx, kind)] = (region.region_id, group_idx)
+
+        remote_by_key: dict[tuple[int, str], tuple[int, int]] = {}
+        for region in selected_remote:
+            for identity in region.identities:
+                layer_idx, kind, group_idx = self._parse_transfer_identity(identity)
+                if in_overlap(layer_idx):
+                    remote_by_key[(layer_idx, kind)] = (region.region_id, group_idx)
+
+        common_keys = sorted(
+            set(local_by_key).intersection(remote_by_key),
+            key=lambda key: (
+                key[0],
+                local_by_key[key][0],
+                remote_by_key[key][0],
+                key[1],
+            ),
+        )
+        if not common_keys:
+            raise RuntimeError(
+                "Heterogeneous PP HMA semantic alignment found no shared "
+                "cache identities between local and remote selected regions. "
+                f"local_regions={selected_local_region_ids}, "
+                f"remote_regions={selected_remote_region_ids}"
+            )
+
+        num_local_groups = len(
+            getattr(self, "_group_spec_types", None)
+            or getattr(self, "region_ids_by_group", ())
+        )
+        route_buckets: dict[
+            tuple[int, int], list[tuple[int, int, tuple[int, str]]]
+        ] = defaultdict(list)
+        for key in common_keys:
+            local_region_id, local_group_idx = local_by_key[key]
+            remote_region_id, remote_group_idx = remote_by_key[key]
+            if num_local_groups and local_group_idx >= num_local_groups:
+                continue
+            route_buckets[(local_group_idx, remote_group_idx)].append(
+                (local_region_id, remote_region_id, key)
+            )
+
+        conflicts: list[dict[str, Any]] = []
+        bucket_regions: list[tuple[int, int, bool, list[int], list[int]]] = []
+        fa_region_pairs: list[tuple[int, int]] = []
+        fa_local_to_remote: dict[int, int] = {}
+        fa_remote_to_local: dict[int, int] = {}
+        selected_ssm_remote_ids: list[int] = []
+
+        group_spec_types = getattr(self, "_group_spec_types", None)
+        for (local_group_idx, remote_group_idx), pairs in sorted(
+            route_buckets.items()
+        ):
+            if group_spec_types is not None and local_group_idx < len(group_spec_types):
+                is_ssm = _is_ssm_spec(group_spec_types[local_group_idx])
+            else:
+                is_ssm = any(key[1] == "mamba_cache" for _, _, key in pairs)
+
+            local_to_remote: dict[int, int] = {}
+            remote_to_local: dict[int, int] = {}
+            raw_local_group: list[int] = []
+            raw_remote_group: list[int] = []
+
+            for local_region_id, remote_region_id, key in pairs:
+                identity_str = (
+                    f"{key[0]}:{key[1]}:group{local_group_idx}->"
+                    f"group{remote_group_idx}"
+                )
+                prior_remote = local_to_remote.get(local_region_id)
+                prior_local = remote_to_local.get(remote_region_id)
+                if prior_remote is not None and prior_remote != remote_region_id:
+                    conflicts.append(
+                        {
+                            "group": (local_group_idx, remote_group_idx),
+                            "local_region": local_region_id,
+                            "remote_regions": sorted({prior_remote, remote_region_id}),
+                            "identity": identity_str,
+                        }
+                    )
+                    continue
+                if prior_local is not None and prior_local != local_region_id:
+                    conflicts.append(
+                        {
+                            "group": (local_group_idx, remote_group_idx),
+                            "remote_region": remote_region_id,
+                            "local_regions": sorted({prior_local, local_region_id}),
+                            "identity": identity_str,
+                        }
+                    )
+                    continue
+                local_to_remote[local_region_id] = remote_region_id
+                remote_to_local[remote_region_id] = local_region_id
+                if local_region_id not in raw_local_group:
+                    raw_local_group.append(local_region_id)
+                if remote_region_id not in raw_remote_group:
+                    raw_remote_group.append(remote_region_id)
+
+                if is_ssm:
+                    if remote_region_id not in selected_ssm_remote_ids:
+                        selected_ssm_remote_ids.append(remote_region_id)
+                else:
+                    prior_fa_remote = fa_local_to_remote.get(local_region_id)
+                    prior_fa_local = fa_remote_to_local.get(remote_region_id)
+                    if (
+                        prior_fa_remote is not None
+                        and prior_fa_remote != remote_region_id
+                    ) or (
+                        prior_fa_local is not None
+                        and prior_fa_local != local_region_id
+                    ):
+                        conflicts.append(
+                            {
+                                "group": (local_group_idx, remote_group_idx),
+                                "local_region": local_region_id,
+                                "remote_region": remote_region_id,
+                                "identity": identity_str,
+                            }
+                        )
+                        continue
+                    fa_local_to_remote[local_region_id] = remote_region_id
+                    fa_remote_to_local[remote_region_id] = local_region_id
+                    pair = (local_region_id, remote_region_id)
+                    if pair not in fa_region_pairs:
+                        fa_region_pairs.append(pair)
+
+            bucket_regions.append(
+                (
+                    local_group_idx,
+                    remote_group_idx,
+                    is_ssm,
+                    raw_local_group,
+                    raw_remote_group,
+                )
+            )
+
+        if conflicts:
+            raise RuntimeError(
+                "Heterogeneous PP HMA needs slice/scatter transfer inside a "
+                "single KV group because one semantic owner maps to multiple "
+                f"physical regions. conflicts={conflicts[:8]}"
+            )
+
+        selected_fa_local_ids = [pair[0] for pair in fa_region_pairs]
+        selected_fa_remote_ids = [pair[1] for pair in fa_region_pairs]
+        compact_fa_remote_map = {
+            reg_id: compact_id
+            for compact_id, reg_id in enumerate(selected_fa_remote_ids)
+        }
+
+        ssm_region_indices = getattr(self, "_ssm_region_indices", None)
+        num_local_regions = getattr(self, "num_regions", len(local_transfer_regions))
+        local_ssm_regions = (
+            list(ssm_region_indices)
+            if ssm_region_indices
+            else list(range(num_local_regions))
+        )
+        local_ssm_slot_map = {
+            int(reg_id): slot_idx
+            for slot_idx, reg_id in enumerate(local_ssm_regions)
+        }
+        remote_ssm_slot_map = {
+            int(reg_id): slot_idx
+            for slot_idx, reg_id in enumerate(selected_ssm_remote_ids)
+        }
+
+        routes: list[_HmaTransferRoute] = []
+        for (
+            local_group_idx,
+            remote_group_idx,
+            is_ssm,
+            raw_local_group,
+            raw_remote_group,
+        ) in bucket_regions:
+            if is_ssm:
+                for reg_id in raw_local_group:
+                    if reg_id not in local_ssm_slot_map:
+                        raise RuntimeError(
+                            f"Local SSM region {reg_id} is not registered in "
+                            f"_ssm_region_indices={local_ssm_regions}"
+                        )
+                local_desc_ids = np.asarray(
+                    [local_ssm_slot_map[reg_id] for reg_id in raw_local_group],
+                    dtype=np.int64,
+                )
+                remote_desc_ids = np.asarray(
+                    [remote_ssm_slot_map[reg_id] for reg_id in raw_remote_group],
+                    dtype=np.int64,
+                )
+            else:
+                local_desc_ids = np.asarray(raw_local_group, dtype=np.int64)
+                remote_desc_ids = np.asarray(
+                    [compact_fa_remote_map[reg_id] for reg_id in raw_remote_group],
+                    dtype=np.int64,
+                )
+
+            routes.append(
+                _HmaTransferRoute(
+                    local_group_idx=local_group_idx,
+                    remote_group_idx=remote_group_idx,
+                    is_ssm=is_ssm,
+                    local_desc_region_ids=local_desc_ids,
+                    remote_desc_region_ids=remote_desc_ids,
+                    raw_local_region_ids=tuple(raw_local_group),
+                    raw_remote_region_ids=tuple(raw_remote_group),
+                )
+            )
+
+        return (
+            routes,
+            selected_fa_local_ids,
+            selected_fa_remote_ids,
+            selected_ssm_remote_ids,
+        )
+
     def _validate_pp_selected_region_lengths(
         self,
         nixl_agent_meta: IluNixlAgentMetadata,
@@ -1260,6 +1536,7 @@ class IluNixlWorkerMixin:
         remote_region_ids_by_group: list[np.ndarray],
         selected_remote_region_ids: list[int],
         remote_tp_size: int,
+        routes: list[_HmaTransferRoute] | None = None,
     ) -> None:
         assert self.transfer_topo is not None
         block_size_ratio = self.transfer_topo.block_size_ratio(
@@ -1268,6 +1545,53 @@ class IluNixlWorkerMixin:
         assert block_size_ratio == 1, (
             "HMA does not support different remote block size yet"
         )
+        hybrid_mla_mamba = bool(
+            getattr(self, "_has_mamba", False) and getattr(self, "use_mla", False)
+        )
+        tp_ratio = self.transfer_topo.tp_ratio(remote_tp_size)
+
+        if routes is not None:
+            for route in routes:
+                if len(route.raw_local_region_ids) != len(route.raw_remote_region_ids):
+                    raise AssertionError(
+                        "KV cache selected region count must match within each "
+                        "HMA route after semantic alignment: "
+                        f"group={route.local_group_idx}->{route.remote_group_idx}, "
+                        f"local={len(route.raw_local_region_ids)}, "
+                        f"remote={len(route.raw_remote_region_ids)}"
+                    )
+                for pair_idx, (local_region_id, remote_region_id) in enumerate(
+                    zip(route.raw_local_region_ids, route.raw_remote_region_ids)
+                ):
+                    local_block_len = self.block_len_per_layer[int(local_region_id)]
+                    remote_block_len = nixl_agent_meta.block_lens[int(remote_region_id)]
+                    replicated = hybrid_mla_mamba or (
+                        not route.is_ssm
+                        and self._is_region_replicated(int(local_region_id))
+                    )
+                    expected_remote_len = local_block_len // block_size_ratio
+                    if not replicated:
+                        expected_remote_len = (
+                            local_block_len * tp_ratio
+                            if tp_ratio >= 1
+                            else local_block_len // -tp_ratio
+                        )
+                    assert remote_block_len == expected_remote_len, (
+                        "KV cache selected region size must match between P and D "
+                        "when using HMA with heterogeneous PP at "
+                        f"group={route.local_group_idx}->{route.remote_group_idx}, "
+                        f"pair={pair_idx}: "
+                        f"local_region={int(local_region_id)} "
+                        f"local={local_block_len}, "
+                        f"remote_region={int(remote_region_id)} "
+                        f"remote={remote_block_len}, "
+                        f"expected_remote={expected_remote_len}"
+                    )
+            assert self.dst_num_blocks[nixl_agent_meta.engine_id] == (
+                nixl_agent_meta.num_blocks
+            )
+            return
+
         assert len(local_region_ids_by_group) == len(remote_region_ids_by_group), (
             "KV cache HMA group count must match after semantic alignment: "
             f"local={len(local_region_ids_by_group)}, "
@@ -1289,12 +1613,11 @@ class IluNixlWorkerMixin:
                 remote_region_id = selected_remote_region_ids[int(remote_compact_id)]
                 local_block_len = self.block_len_per_layer[int(local_region_id)]
                 remote_block_len = nixl_agent_meta.block_lens[int(remote_region_id)]
-                replicated = (
+                replicated = hybrid_mla_mamba or (
                     not _is_ssm_spec(self._group_spec_types[group_idx])
                     and self._is_region_replicated(int(local_region_id))
                 )
-                tp_ratio = self.transfer_topo.tp_ratio(remote_tp_size)
-                expected_remote_len = local_block_len
+                expected_remote_len = local_block_len // block_size_ratio
                 if not replicated:
                     expected_remote_len = (
                         local_block_len * tp_ratio
@@ -1429,6 +1752,8 @@ class IluNixlWorkerMixin:
         selected_remote_region_ids: list[int],
     ) -> list[tuple[int, int, int]]:
         """Return (remote_region_id, transfer_len, rank_offset)."""
+        if not selected_local_region_ids:
+            return []
         assert self.transfer_topo is not None
         fa_group_idx = next(
             i for i, t in enumerate(self._group_spec_types) if _is_attention_spec(t)
@@ -1466,6 +1791,8 @@ class IluNixlWorkerMixin:
         selected_remote_region_ids: list[int],
         remote_tp_size: int,
     ) -> np.ndarray:
+        if not selected_remote_region_ids:
+            return np.empty((0, 3), dtype=np.uint64)
         assert self.transfer_topo is not None and self._conv_decomp is not None
         tp_ratio = self.transfer_topo.tp_ratio(remote_tp_size)
         local_offset = self.tp_rank % max(tp_ratio, 1)
@@ -1478,9 +1805,10 @@ class IluNixlWorkerMixin:
         remote_ratio = nixl_agent_meta.physical_blocks_per_logical_kv_block
         num_blocks = nixl_agent_meta.num_blocks // remote_ratio
         block_arange = np.arange(num_blocks, dtype=np.uint64)
+        block_strides = nixl_agent_meta.block_strides or nixl_agent_meta.block_lens
         parts: list[np.ndarray] = []
         for region_id in selected_remote_region_ids:
-            page_stride = nixl_agent_meta.block_lens[region_id] * remote_ratio
+            page_stride = block_strides[region_id] * remote_ratio
             block_addrs = (
                 nixl_agent_meta.kv_caches_base_addr[region_id]
                 + block_arange * page_stride
@@ -1501,31 +1829,45 @@ class IluNixlWorkerMixin:
                     ssm_addrs, ssm_read_size, nixl_agent_meta.device_id
                 )
             )
-        return np.concatenate(parts)
+        return np.concatenate(parts) if parts else np.empty((0, 3), dtype=np.uint64)
 
     def _ensure_pp_mamba_local_xfer_handle(self) -> int:
         if self._pp_mamba_local_xfer_handle is not None:
             return self._pp_mamba_local_xfer_handle
+        if (
+            hasattr(self, "src_xfer_handles_by_block_size")
+            and getattr(self, "block_size", None) in self.src_xfer_handles_by_block_size
+        ):
+            self._pp_mamba_local_xfer_handle = self.src_xfer_handles_by_block_size[
+                self.block_size
+            ]
+            return self._pp_mamba_local_xfer_handle
 
         base_addresses = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
         blocks_data: list[tuple[int, int, int]] = []
+        block_strides = getattr(
+            self, "block_stride_per_layer", self.block_len_per_layer
+        )
         for region_id, base_addr in enumerate(base_addresses):
             page_size = self.block_len_per_layer[region_id]
-            component_size = page_size // 2
-            for component in range(2):
-                component_base = base_addr + component * component_size
-                for block_id in range(self.num_blocks):
-                    blocks_data.append(
-                        (
-                            component_base + block_id * page_size,
-                            component_size,
-                            self.device_id,
-                        )
+            page_stride = block_strides[region_id]
+            for block_id in range(self.num_blocks):
+                blocks_data.append(
+                    (
+                        base_addr + block_id * page_stride,
+                        page_size,
+                        self.device_id,
                     )
+                )
 
+        fa_blocks = (
+            np.asarray(blocks_data, dtype=np.uint64)
+            if blocks_data
+            else np.empty((0, 3), dtype=np.uint64)
+        )
         blocks = np.concatenate(
             [
-                np.asarray(blocks_data, dtype=np.uint64),
+                fa_blocks,
                 self._build_mamba_local(base_addresses),
             ]
         )
@@ -1543,10 +1885,12 @@ class IluNixlWorkerMixin:
         nixl_agent_meta: IluNixlAgentMetadata,
         selected_local_region_ids: list[int],
         selected_remote_region_ids: list[int],
+        selected_ssm_remote_region_ids: list[int] | None = None,
     ) -> None:
-        blocks_data = []
+        blocks_data: list[tuple[int, int, int]] = []
         remote_regions = self._regions_by_id(nixl_agent_meta.transfer_regions)
         virtual_packed = self._metadata_uses_virtual_packed_regions(nixl_agent_meta)
+        block_strides = nixl_agent_meta.block_strides or nixl_agent_meta.block_lens
         for region_id, transfer_len, rank_offset in self._remote_transfer_regions(
             engine_id,
             nixl_agent_meta,
@@ -1580,40 +1924,43 @@ class IluNixlWorkerMixin:
                 page_stride = region.block_stride
             else:
                 slot_base = nixl_agent_meta.kv_caches_base_addr[region_id]
-                page_stride = nixl_agent_meta.block_lens[region_id]
-            if getattr(self, "_has_mamba", False):
-                component_size = nixl_agent_meta.block_lens[region_id] // 2
-                component_transfer_len = transfer_len // 2
-                component_rank_offset = rank_offset // 2
-                for component in range(2):
-                    component_base = slot_base + component * component_size
-                    for block_id in range(nixl_agent_meta.num_blocks):
-                        blocks_data.append(
-                            (
-                                component_base
-                                + block_id * page_stride
-                                + component_rank_offset,
-                                component_transfer_len,
-                                nixl_agent_meta.device_id,
-                            )
-                        )
-            else:
-                for block_id in range(nixl_agent_meta.num_blocks):
-                    blocks_data.append(
-                        (
-                            slot_base + block_id * page_stride + rank_offset,
-                            transfer_len,
-                            nixl_agent_meta.device_id,
-                        )
+                page_stride = block_strides[region_id]
+            for block_id in range(nixl_agent_meta.num_blocks):
+                blocks_data.append(
+                    (
+                        slot_base + block_id * page_stride + rank_offset,
+                        transfer_len,
+                        nixl_agent_meta.device_id,
                     )
+                )
+
+        if not hasattr(self, "_remote_fa_num_regions"):
+            self._remote_fa_num_regions = {}
+        self._remote_fa_num_regions.setdefault(engine_id, {})[remote_key] = len(
+            selected_remote_region_ids
+        )
 
         if getattr(self, "_has_mamba", False):
+            ssm_remote_ids = selected_ssm_remote_region_ids
+            if ssm_remote_ids is None:
+                ssm_remote_ids = (
+                    getattr(self, "_selected_ssm_remote_region_ids", {})
+                    .get(engine_id, {})
+                    .get(remote_key)
+                )
+            if ssm_remote_ids is None:
+                ssm_remote_ids = selected_remote_region_ids
+            fa_blocks = (
+                np.asarray(blocks_data, dtype=np.uint64)
+                if blocks_data
+                else np.empty((0, 3), dtype=np.uint64)
+            )
             blocks_data = np.concatenate(
                 [
-                    np.asarray(blocks_data, dtype=np.uint64),
+                    fa_blocks,
                     self._build_pp_mamba_remote(
                         nixl_agent_meta,
-                        selected_remote_region_ids,
+                        ssm_remote_ids,
                         self.transfer_topo.get_engine_info(
                             engine_id
                         ).remote_tp_size,
@@ -1627,21 +1974,27 @@ class IluNixlWorkerMixin:
             self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
         )
 
+    def _needs_split_local_xfer_handles(self, tp_ratio: int, plan) -> bool:
+        return tp_ratio < 0 and (
+            not getattr(self, "use_mla", False)
+            or len(getattr(plan, "all_source_ranks", ())) > 1
+        )
+
     def _ensure_pp_local_split_handles(
         self, engine_id: str, remote_tp_size: int
     ) -> None:
         assert self.transfer_topo is not None
         tp_ratio = self.transfer_topo.tp_ratio(remote_tp_size)
+        plan = self.tp_mappings[engine_id]
         if (
-            tp_ratio >= 0
-            or self.use_mla
+            not self._needs_split_local_xfer_handles(tp_ratio, plan)
             or tp_ratio in self.src_xfer_handles_by_tp_ratio
         ):
             return
 
         self.src_xfer_handles_by_tp_ratio[tp_ratio] = []
         for handle_data in self._build_local_splits_from_plan(
-            self.tp_mappings[engine_id],
+            plan,
             self.src_blocks_data,
             self.num_descs,
         ):
@@ -1665,6 +2018,7 @@ class IluNixlWorkerMixin:
         )
         if (
             remote_pp_size == self.pp_world_size
+            and nixl_agent_meta.pp_split in ("", self.pp_split)
             and not self._virtual_packed_regions
             and not remote_virtual_packed
         ):
@@ -1687,9 +2041,13 @@ class IluNixlWorkerMixin:
                 "IluNixl handshake metadata."
             )
         engine_id = nixl_agent_meta.engine_id
+        is_hetero_pp_topology = remote_pp_size != self.pp_world_size or (
+            bool(nixl_agent_meta.pp_split)
+            and nixl_agent_meta.pp_split != self.pp_split
+        )
         remote_key = (
             remote_pp_rank * remote_tp_size + remote_tp_rank
-            if remote_pp_size != self.pp_world_size
+            if is_hetero_pp_topology
             else remote_tp_rank
         )
         if remote_key in self._remote_agents.get(engine_id, {}):
@@ -1715,12 +2073,80 @@ class IluNixlWorkerMixin:
         self._remote_pp_split_by_engine[engine_id] = nixl_agent_meta.pp_split
         self._semantic_region_engines.add(engine_id)
 
-        (
-            local_region_ids_by_group,
-            remote_region_ids_by_group,
-            selected_local_region_ids,
-            selected_remote_region_ids,
-        ) = self._select_pp_regions(nixl_agent_meta, remote_pp_rank)
+        routes: list[_HmaTransferRoute] | None = None
+        selected_ssm_remote_ids: list[int] | None = None
+        if self._is_hma_required and getattr(self, "_has_mamba", False):
+            local_start, local_end = self._pp_layer_range(self.pp_split, self.pp_rank)
+            remote_start, remote_end = self._pp_layer_range(
+                nixl_agent_meta.pp_split, remote_pp_rank
+            )
+            overlap_start = max(local_start, remote_start)
+            overlap_end = min(local_end, remote_end)
+            if overlap_start >= overlap_end:
+                raise RuntimeError(
+                    "Heterogeneous PP handshake selected a remote PP stage "
+                    "with no overlapping layers: "
+                    f"local=[{local_start}, {local_end}), "
+                    f"remote=[{remote_start}, {remote_end})."
+                )
+            raw_selected_local = self._region_ids_for_layer_range(
+                self.layer_region_ids, overlap_start, overlap_end
+            )
+            assert nixl_agent_meta.layer_region_ids is not None
+            raw_selected_remote = self._region_ids_for_layer_range(
+                nixl_agent_meta.layer_region_ids, overlap_start, overlap_end
+            )
+            assert nixl_agent_meta.transfer_regions is not None
+            (
+                routes,
+                selected_local_region_ids,
+                selected_remote_region_ids,
+                selected_ssm_remote_ids,
+            ) = self._build_mamba_hma_transfer_routes(
+                raw_selected_local,
+                raw_selected_remote,
+                self.transfer_regions,
+                nixl_agent_meta.transfer_regions,
+                overlap_start=overlap_start,
+                overlap_end=overlap_end,
+            )
+            num_groups = len(self.region_ids_by_group)
+            local_by_group: list[list[int]] = [[] for _ in range(num_groups)]
+            remote_by_group: list[list[int]] = [[] for _ in range(num_groups)]
+            for route in routes:
+                if route.local_group_idx < num_groups:
+                    for rid in route.local_desc_region_ids.tolist():
+                        if rid not in local_by_group[route.local_group_idx]:
+                            local_by_group[route.local_group_idx].append(rid)
+                    for rid in route.remote_desc_region_ids.tolist():
+                        if rid not in remote_by_group[route.local_group_idx]:
+                            remote_by_group[route.local_group_idx].append(rid)
+            local_region_ids_by_group = [
+                np.asarray(g, dtype=np.int64) for g in local_by_group
+            ]
+            remote_region_ids_by_group = [
+                np.asarray(g, dtype=np.int64) for g in remote_by_group
+            ]
+            if not hasattr(self, "_mamba_hma_routes"):
+                self._mamba_hma_routes = {}
+            if not hasattr(self, "_remote_fa_num_regions"):
+                self._remote_fa_num_regions = {}
+            if not hasattr(self, "_selected_ssm_remote_region_ids"):
+                self._selected_ssm_remote_region_ids = {}
+            self._mamba_hma_routes.setdefault(engine_id, {})[remote_key] = routes
+            self._remote_fa_num_regions.setdefault(engine_id, {})[remote_key] = len(
+                selected_remote_region_ids
+            )
+            self._selected_ssm_remote_region_ids.setdefault(engine_id, {})[
+                remote_key
+            ] = selected_ssm_remote_ids
+        else:
+            (
+                local_region_ids_by_group,
+                remote_region_ids_by_group,
+                selected_local_region_ids,
+                selected_remote_region_ids,
+            ) = self._select_pp_regions(nixl_agent_meta, remote_pp_rank)
 
         if engine_id not in self.dst_num_blocks:
             self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
@@ -1732,6 +2158,7 @@ class IluNixlWorkerMixin:
                 remote_region_ids_by_group,
                 selected_remote_region_ids,
                 remote_tp_size,
+                routes=routes,
             )
         else:
             self._validate_pp_selected_region_lengths(
@@ -1767,9 +2194,8 @@ class IluNixlWorkerMixin:
             nixl_agent_meta,
             selected_local_region_ids,
             selected_remote_region_ids,
+            selected_ssm_remote_region_ids=selected_ssm_remote_ids,
         )
-        if self._has_mamba:
-            self._ensure_pp_mamba_local_xfer_handle()
         self._ensure_pp_local_split_handles(engine_id, remote_tp_size)
         return remote_agent_name
 
@@ -1894,7 +2320,13 @@ class IluNixlWorkerMixin:
                     )
                     remote_key = (
                         target_rank
-                        if remote_pp_size != self.pp_world_size
+                        if (
+                            remote_pp_size != self.pp_world_size
+                            or (
+                                bool(remote_pp_split)
+                                and remote_pp_split != self.pp_split
+                            )
+                        )
                         else remote_rank
                     )
                     remote_rank_to_agent_name[remote_key] = remote_agent_name
@@ -2039,6 +2471,25 @@ class IluNixlWorkerMixin:
             + np.asarray(block_ids, dtype=np.int64)[None, None, :]
         ).flatten()
 
+    def _logical_to_kernel_block_ids(self, block_ids, ratio: int):
+        if ratio == 1:
+            return block_ids
+        transfer_groups = getattr(
+            getattr(self, "kv_cache_config", None),
+            "transfer_groups",
+            getattr(getattr(self, "kv_cache_config", None), "kv_cache_groups", ()),
+        )
+        if not transfer_groups or len(block_ids) <= len(transfer_groups):
+            return super()._logical_to_kernel_block_ids(block_ids, ratio)
+        prefix = super()._logical_to_kernel_block_ids(
+            block_ids[: len(transfer_groups)], ratio
+        )
+        # Extra groups from heterogeneous PP Mamba group splitting are SSM
+        # groups whose block IDs are single state slots (never ratio-expanded).
+        return list(prefix) + [
+            list(group) for group in block_ids[len(transfer_groups) :]
+        ]
+
     def _read_blocks_for_req(self, req_id: str, meta):
         assert meta.remote is not None and self.transfer_topo is not None
         engine_id = meta.remote.engine_id
@@ -2057,11 +2508,27 @@ class IluNixlWorkerMixin:
         remote_block_ids = meta.remote.block_ids
         local_block_ids = meta.local_physical_block_ids
 
-        # A decode-only speculative model owns an additional EAGLE KV group.
-        # That group has no producer-side blocks and must stay local to decode.
-        # Keep the common target-model groups positionally aligned for transfer.
+        engine_routes = getattr(self, "_mamba_hma_routes", {}).get(engine_id)
         transfer_group_ids = list(range(len(local_block_ids)))
-        if len(remote_block_ids) < len(local_block_ids):
+        if engine_routes:
+            for routes in engine_routes.values():
+                for route in routes:
+                    if (
+                        route.local_group_idx >= len(local_block_ids)
+                        or route.remote_group_idx >= len(remote_block_ids)
+                    ):
+                        raise RuntimeError(
+                            "Cannot align producer and consumer KV cache groups "
+                            "for Mamba HMA route: "
+                            f"local_group={route.local_group_idx}/"
+                            f"{len(local_block_ids)}, "
+                            f"remote_group={route.remote_group_idx}/"
+                            f"{len(remote_block_ids)}"
+                        )
+        elif len(remote_block_ids) < len(local_block_ids):
+            # A decode-only speculative model owns an additional EAGLE KV group.
+            # That group has no producer-side blocks and must stay local to decode.
+            # Keep the common target-model groups positionally aligned for transfer.
             transfer_groups = getattr(
                 self.kv_cache_config,
                 "transfer_groups",
@@ -2083,21 +2550,41 @@ class IluNixlWorkerMixin:
         remote_keys = sorted(self._remote_agents[engine_id])
         for remote_key in remote_keys:
             remote_tp_rank = remote_key % remote_info.remote_tp_size
-            read_spec = ReadSpec(
-                remote_rank=remote_key,
-                local_block_ids=[
-                    list(local_block_ids[local_group_id])
-                    if remote_tp_rank in plan.source_ranks_per_group[local_group_id]
-                    else []
-                    for local_group_id in transfer_group_ids
-                ],
-                remote_block_ids=[
-                    list(remote_block_ids[remote_group_id])
-                    if remote_tp_rank in plan.source_ranks_per_group[local_group_id]
-                    else []
-                    for remote_group_id, local_group_id in enumerate(transfer_group_ids)
-                ],
-            )
+            if engine_routes:
+                read_spec = ReadSpec(
+                    remote_rank=remote_key,
+                    local_block_ids=[
+                        list(local_block_ids[local_group_id])
+                        if local_group_id < len(plan.source_ranks_per_group)
+                        and remote_tp_rank
+                        in plan.source_ranks_per_group[local_group_id]
+                        else []
+                        for local_group_id in range(len(local_block_ids))
+                    ],
+                    remote_block_ids=[
+                        list(group_blocks) for group_blocks in remote_block_ids
+                    ],
+                )
+            else:
+                read_spec = ReadSpec(
+                    remote_rank=remote_key,
+                    local_block_ids=[
+                        list(local_block_ids[local_group_id])
+                        if remote_tp_rank
+                        in plan.source_ranks_per_group[local_group_id]
+                        else []
+                        for local_group_id in transfer_group_ids
+                    ],
+                    remote_block_ids=[
+                        list(remote_block_ids[remote_group_id])
+                        if remote_tp_rank
+                        in plan.source_ranks_per_group[local_group_id]
+                        else []
+                        for remote_group_id, local_group_id in enumerate(
+                            transfer_group_ids
+                        )
+                    ],
+                )
             if not any(read_spec.local_block_ids):
                 if self.use_mla:
                     notif_id = self._make_pp_aware_notif_id(
@@ -2109,13 +2596,11 @@ class IluNixlWorkerMixin:
                     )
                 continue
 
-            if tp_ratio < 0 and not self.use_mla:
+            if self._needs_split_local_xfer_handles(tp_ratio, plan):
                 split_idx = plan.all_source_ranks.index(remote_tp_rank)
                 local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[tp_ratio][
                     split_idx
                 ]
-            elif getattr(self, "_has_mamba", False):
-                local_xfer_side_handle = self._ensure_pp_mamba_local_xfer_handle()
             else:
                 local_xfer_side_handle = self.src_xfer_handles_by_block_size[
                     remote_info.remote_block_size
@@ -2180,97 +2665,175 @@ class IluNixlWorkerMixin:
                 self._recving_transfers.setdefault(request_id, [])
             return
 
-        # Local blocks are the decode side; remote blocks are the prefill side.
-        # The two physical-per-logical ratios are independent under hetero PD.
-        local_block_ids, remote_block_ids = self._apply_prefix_caching(
-            decode_block_ids=local_block_ids,
-            prefill_block_ids=remote_block_ids,
-            decode_physical_per_logical=self._physical_blocks_per_logical_kv_block,
-            prefill_physical_per_logical=(
-                remote_info.remote_physical_blocks_per_logical
-            ),
+        routes = (
+            getattr(self, "_mamba_hma_routes", {})
+            .get(dst_engine_id, {})
+            .get(remote_key)
         )
-
-        local_region_ids_by_group = self.local_region_ids_by_group[dst_engine_id][
-            remote_key
-        ]
-        remote_region_ids_by_group = self.remote_region_ids_by_group[dst_engine_id][
-            remote_key
-        ]
-
         local_descs_list: list[np.ndarray] = []
         remote_descs_list: list[np.ndarray] = []
-        for group_idx, (group_local_blocks, group_remote_blocks) in enumerate(
-            zip(local_block_ids, remote_block_ids)
-        ):
-            if not group_local_blocks:
-                continue
-            if _is_ssm_spec(self._group_spec_types[group_idx]):
-                remote_num_regions = max(
+
+        if routes is not None:
+            num_local_groups = len(local_block_ids)
+            num_remote_fa_regions = (
+                getattr(self, "_remote_fa_num_regions", {})
+                .get(dst_engine_id, {})
+                .get(remote_key)
+            )
+            if num_remote_fa_regions is None:
+                num_remote_fa_regions = max(
                     (
-                        int(ids.max()) + 1
-                        for ids in remote_region_ids_by_group
-                        if len(ids)
+                        int(r.remote_desc_region_ids.max()) + 1
+                        for r in routes
+                        if not r.is_ssm and len(r.remote_desc_region_ids)
                     ),
                     default=0,
                 )
+            for route in routes:
+                group_local_blocks = list(local_block_ids[route.local_group_idx])
+                if not group_local_blocks:
+                    continue
+                group_remote_blocks = list(remote_block_ids[route.remote_group_idx])
+                padded_local = [[] for _ in range(num_local_groups)]
+                padded_remote = [[] for _ in range(num_local_groups)]
+                padded_local[route.local_group_idx] = group_local_blocks
+                padded_remote[route.local_group_idx] = group_remote_blocks
+                aligned_local, aligned_remote = self._apply_prefix_caching(
+                    decode_block_ids=padded_local,
+                    prefill_block_ids=padded_remote,
+                    decode_physical_per_logical=(
+                        self._physical_blocks_per_logical_kv_block
+                    ),
+                    prefill_physical_per_logical=(
+                        remote_info.remote_physical_blocks_per_logical
+                    ),
+                )
+                group_local_blocks = aligned_local[route.local_group_idx]
+                group_remote_blocks = aligned_remote[route.local_group_idx]
+                if not group_local_blocks:
+                    continue
+                if route.is_ssm:
+                    local_descs_list.append(
+                        self._compute_mamba_desc_ids_for_regions(
+                            group_local_blocks,
+                            route.local_desc_region_ids,
+                            self.dst_num_blocks[self.engine_id],
+                            self._physical_blocks_per_logical_kv_block,
+                            self.num_regions,
+                            1,
+                        )
+                    )
+                    remote_descs_list.append(
+                        self._compute_mamba_desc_ids_for_regions(
+                            group_remote_blocks,
+                            route.remote_desc_region_ids,
+                            self.dst_num_blocks[dst_engine_id],
+                            remote_info.remote_physical_blocks_per_logical,
+                            num_remote_fa_regions,
+                            1,
+                        )
+                    )
+                else:
+                    local_descs_list.append(
+                        self._compute_desc_ids_for_regions(
+                            group_local_blocks,
+                            route.local_desc_region_ids,
+                            self.dst_num_blocks[self.engine_id],
+                            block_size_ratio,
+                        )
+                    )
+                    remote_descs_list.append(
+                        self._compute_desc_ids_for_regions(
+                            group_remote_blocks,
+                            route.remote_desc_region_ids,
+                            self.dst_num_blocks[dst_engine_id],
+                            None,
+                        )
+                    )
+        else:
+            # Local blocks are the decode side; remote blocks are the prefill side.
+            # The two physical-per-logical ratios are independent under hetero PD.
+            local_block_ids, remote_block_ids = self._apply_prefix_caching(
+                decode_block_ids=local_block_ids,
+                prefill_block_ids=remote_block_ids,
+                decode_physical_per_logical=(
+                    self._physical_blocks_per_logical_kv_block
+                ),
+                prefill_physical_per_logical=(
+                    remote_info.remote_physical_blocks_per_logical
+                ),
+            )
+
+            local_region_ids_by_group = self.local_region_ids_by_group[dst_engine_id][
+                remote_key
+            ]
+            remote_region_ids_by_group = self.remote_region_ids_by_group[dst_engine_id][
+                remote_key
+            ]
+
+            for group_idx, (group_local_blocks, group_remote_blocks) in enumerate(
+                zip(local_block_ids, remote_block_ids)
+            ):
+                if not group_local_blocks:
+                    continue
+                if _is_ssm_spec(self._group_spec_types[group_idx]):
+                    remote_num_regions = (
+                        getattr(self, "_remote_fa_num_regions", {})
+                        .get(dst_engine_id, {})
+                        .get(remote_key)
+                    )
+                    if remote_num_regions is None:
+                        remote_num_regions = max(
+                            (
+                                int(ids.max()) + 1
+                                for ids in remote_region_ids_by_group
+                                if len(ids)
+                            ),
+                            default=0,
+                        )
+                    local_descs_list.append(
+                        self._compute_mamba_desc_ids_for_regions(
+                            group_local_blocks,
+                            local_region_ids_by_group[group_idx],
+                            self.dst_num_blocks[self.engine_id],
+                            self._physical_blocks_per_logical_kv_block,
+                            self.num_regions,
+                            1,
+                        )
+                    )
+                    remote_descs_list.append(
+                        self._compute_mamba_desc_ids_for_regions(
+                            group_remote_blocks,
+                            remote_region_ids_by_group[group_idx],
+                            self.dst_num_blocks[dst_engine_id],
+                            remote_info.remote_physical_blocks_per_logical,
+                            remote_num_regions,
+                            1,
+                        )
+                    )
+                    continue
                 local_descs_list.append(
-                    self._compute_mamba_desc_ids_for_regions(
+                    self._compute_desc_ids_for_regions(
                         group_local_blocks,
                         local_region_ids_by_group[group_idx],
                         self.dst_num_blocks[self.engine_id],
-                        self._physical_blocks_per_logical_kv_block,
-                        self.num_regions,
-                        2,
+                        block_size_ratio,
                     )
                 )
                 remote_descs_list.append(
-                    self._compute_mamba_desc_ids_for_regions(
+                    self._compute_desc_ids_for_regions(
                         group_remote_blocks,
                         remote_region_ids_by_group[group_idx],
                         self.dst_num_blocks[dst_engine_id],
-                        remote_info.remote_physical_blocks_per_logical,
-                        remote_num_regions,
-                        2,
+                        None,
                     )
                 )
-                continue
-            if self._has_mamba:
-                local_descs_list.append(
-                    self._compute_fa_component_desc_ids(
-                        group_local_blocks,
-                        local_region_ids_by_group[group_idx],
-                        self.dst_num_blocks[self.engine_id],
-                    )
-                )
-                remote_descs_list.append(
-                    self._compute_fa_component_desc_ids(
-                        group_remote_blocks,
-                        remote_region_ids_by_group[group_idx],
-                        self.dst_num_blocks[dst_engine_id],
-                    )
-                )
-                continue
-            local_descs_list.append(
-                self._compute_desc_ids_for_regions(
-                    group_local_blocks,
-                    local_region_ids_by_group[group_idx],
-                    self.dst_num_blocks[self.engine_id],
-                    block_size_ratio,
-                )
-            )
-            remote_descs_list.append(
-                self._compute_desc_ids_for_regions(
-                    group_remote_blocks,
-                    remote_region_ids_by_group[group_idx],
-                    self.dst_num_blocks[dst_engine_id],
-                    None,
-                )
-            )
 
         if not local_descs_list:
             agent_name = self._remote_agents[dst_engine_id][remote_key]
             self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
+            if awaiting_kvs:
+                self._recving_transfers.setdefault(request_id, [])
             return
 
         local_block_descs_ids = np.concatenate(local_descs_list)

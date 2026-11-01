@@ -57,7 +57,10 @@ from vllm_iluvatar.models.deepseek_v41.compressed_kv_restore import (
     TensorLayoutKey,
     TensorViewKey,
     compact_owner_capacity,
+    consumer_selection,
     family_key,
+    prefill_validity_family,
+    union_validity,
 )
 from vllm_iluvatar.models.deepseek_v41.compressor import (
     IluDeepseekCompressor,
@@ -1814,6 +1817,9 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             reader_ranges.append((slice(n0, n1), swa_metadata.prefill_swa_indices))
         if swa_metadata.num_decodes > 0:
             reader_ranges.append((slice(0, n0), swa_metadata.decode_swa_indices))
+        family_masks = prefill_validity_family(
+            self, get_forward_context().attn_metadata, swa_metadata, n1
+        )
         key = family_key(
             owner=self.compressed_cache_prefix,
             index_source_layer_id=self.index_source_layer_id,
@@ -1831,7 +1837,14 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 # Each decode consumer still masks its own main lengths below.
                 "per-consumer-decode-validity"
                 if restore_decode
-                else TensorViewKey.of(valid),
+                else (
+                    (
+                        "prefill-mask-union",
+                        tuple(TensorViewKey.of(m) for m in family_masks),
+                    )
+                    if family_masks
+                    else TensorViewKey.of(valid)
+                ),
                 TensorViewKey.of(positions),
                 TensorViewKey.of(attn_metadata.block_table),
                 attn_metadata.block_size,
@@ -1847,8 +1860,11 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         tracker = self.compressed_kv_workspace.restore
         selection = tracker.lookup(key)
         if selection is not None:
-            return selection
+            return consumer_selection(selection, valid) if family_masks else selection
         ticket = tracker.begin_prepare(key)
+        consumer_valid = valid
+        if family_masks:
+            valid = union_validity(family_masks)
         if restore_decode:
             # A later consumer can have a valid query where the first does
             # not. Prepare its physical rows too, while guarding every request
@@ -1948,7 +1964,9 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             indices, lengths, plan, scratch_bytes, compact_plan=compact_plan
         )
         tracker.publish(ticket, selection)
-        return selection
+        return (
+            consumer_selection(selection, consumer_valid) if family_masks else selection
+        )
 
     def _prepare_compact_family(
         self,

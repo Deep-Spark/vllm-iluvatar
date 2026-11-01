@@ -890,7 +890,7 @@ class NixlConnectorScheduler:
         """
 
         params = request.kv_transfer_params
-        logger.info(
+        logger.debug(
             "NIXLConnector get_num_new_matched_tokens: "
             "num_computed_tokens=%s, kv_transfer_params=%s",
             num_computed_tokens,
@@ -910,7 +910,7 @@ class NixlConnectorScheduler:
                 token_ids = request.prompt_token_ids or []
                 actual = self._mamba_prefill_token_count(len(token_ids))
                 count = actual - num_computed_tokens
-                logger.info(
+                logger.debug(
                     "NIXL D matched tokens for %s: prompt=%d, local_computed=%d, "
                     "external=%d, load_async=%s",
                     request.request_id,

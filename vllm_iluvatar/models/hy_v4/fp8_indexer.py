@@ -135,6 +135,14 @@ def _indexer_rope_table(
     mrope_emb = getattr(indexer, "mrope_emb", None)
     if mrope_emb is None or positions.shape[0] != 3:
         raise ValueError("HYV4 2-D positions require three rows and an M-RoPE module")
+    section = getattr(mrope_emb, "_ixf_mrope_section", None)
+    if positions.is_cuda and positions.shape[1] <= 16 and section is not None:
+        return ixfops.mrope_cos_sin_table(
+            positions,
+            mrope_emb._match_cos_sin_cache_dtype(dtype_ref),
+            section,
+            mrope_emb.mrope_interleaved,
+        )
     table = _mixed_mrope_cos_sin(mrope_emb, positions, dtype_ref)
     token_pos = torch.arange(table.shape[0], device=table.device, dtype=positions.dtype)
     return token_pos, table

@@ -106,6 +106,26 @@ def apply_qk_rope(
             raise ValueError(
                 "HYV4 2-D positions require three rows and an M-RoPE module"
             )
+        section = getattr(mrope_emb, "_ixf_mrope_section", None)
+        if (
+            q_pe.is_cuda
+            and positions.shape[1] <= _FUSED_MAX_TOKENS
+            and section is not None
+        ):
+            result = _ixf_functions().m_rotary_embedding(
+                positions,
+                q_pe,
+                k_pe,
+                q_pe.shape[-1],
+                mrope_emb._match_cos_sin_cache_dtype(q_pe),
+                section,
+                is_neox_style=mrope_emb.is_neox_style,
+                mrope_interleaved=mrope_emb.mrope_interleaved,
+                round_products=True,
+            )
+            # Native updates the original strided views; the reference backend
+            # returns fresh tensors and retains the caller's writeback path.
+            return (q_pe, k_pe) if result is None else result
         q_out, k_out = mrope_emb(
             positions,
             # M-RoPE rotates these buffers in place. A reshape may alias the
@@ -154,6 +174,12 @@ def build_hy4_ropes(
             },
             is_neox_style=is_neox_style,
         )
+        # Host metadata is created once, outside forward/capture. Do not make
+        # it a buffer: Module.to(cuda) must not move it to the device.
+        if os.environ.get("VLLM_ILU_HYV4_NATIVE_MROPE", "1") != "0":
+            mrope._ixf_mrope_section = torch.tensor(
+                section, dtype=torch.int32, device="cpu"
+            )
     return rotary, mrope
 
 

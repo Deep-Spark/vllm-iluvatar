@@ -47,6 +47,12 @@ def get_last_all_ranks_decode_only() -> bool:
     return _ILU_LAST_ALL_RANKS_DECODE_ONLY
 
 
+def set_last_all_ranks_decode_only(value: bool) -> None:
+    # [ILU addition] Publishing hook for non-V1 DP coordinators.
+    global _ILU_LAST_ALL_RANKS_DECODE_ONLY
+    _ILU_LAST_ALL_RANKS_DECODE_ONLY = bool(value)
+
+
 def _get_device_and_group(parallel_config: ParallelConfig):
     device = get_dp_group().device
     group = get_dp_group().device_group

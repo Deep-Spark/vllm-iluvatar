@@ -39,6 +39,9 @@ class RemoteEngineSession:
     inflight_send: set[ReqId] = field(default_factory=set)
     pending_recv: set[ReqId] = field(default_factory=set)
     stuck_reported: bool = False
+    # Router teardown token carried through the existing drain/close path.
+    teardown_id: int | None = None
+    reported_teardown_id: int | None = None
 
     def activate(self) -> None:
         if self.state not in (

@@ -319,19 +319,36 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
                     "speculation mode, but causal=False was set without DSpark."
                 )
                 decode_swa_indices = self.decode_swa_indices_noncausal
-                build_dspark_noncausal_swa_indices(
-                    seq_lens=seq_lens,
-                    query_start_loc=query_start_loc,
-                    block_table=block_table,
-                    is_valid_token=is_valid_token,
-                    block_size=self.block_size,
-                    window_size=self.window_size,
-                    index_width=self.noncausal_index_width,
-                    num_decode_tokens=num_decode_tokens,
-                    device=self.device,
-                    out_indices=decode_swa_indices,
-                    out_lens=self.decode_swa_lens,
-                )
+                if seq_lens.is_cuda and hasattr(
+                    ixfops, "ds4_compute_dspark_noncausal_swa_indices_and_lens"
+                ):
+                    ixfops.ds4_compute_dspark_noncausal_swa_indices_and_lens(
+                        swa_indices=decode_swa_indices,
+                        swa_lens=self.decode_swa_lens,
+                        window_size=self.window_size,
+                        index_width=self.noncausal_index_width,
+                        query_start_loc=query_start_loc,
+                        seq_lens=seq_lens,
+                        token_to_req_indices=token_to_req_indices,
+                        is_valid_token=is_valid_token,
+                        block_table=block_table,
+                        block_size=self.block_size,
+                        num_decode_tokens=num_decode_tokens,
+                    )
+                else:
+                    build_dspark_noncausal_swa_indices(
+                        seq_lens=seq_lens,
+                        query_start_loc=query_start_loc,
+                        block_table=block_table,
+                        is_valid_token=is_valid_token,
+                        block_size=self.block_size,
+                        window_size=self.window_size,
+                        index_width=self.noncausal_index_width,
+                        num_decode_tokens=num_decode_tokens,
+                        device=self.device,
+                        out_indices=decode_swa_indices,
+                        out_lens=self.decode_swa_lens,
+                    )
             else:
                 self._compute_swa_decode_indices_and_lens(
                     swa_indices=self.decode_swa_indices,

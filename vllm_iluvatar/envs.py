@@ -167,6 +167,12 @@ if TYPE_CHECKING:
     VLLM_ILU_VIT_ATTN_OPT_LEVEL: int = 0
     VLLM_ILU_VIT_ATTN_LAYER: str = ""
     VLLM_ILU_GDN_ATTN_BACKEND: bool = False
+    VLLM_ILU_CUDAGRAPH_ASYNC_REPLAY: bool = False
+    VLLM_ILU_COMPACT_RAGGED_GATHER: bool = False
+    VLLM_ILU_DP_VOCAB_GROUP_SIZE: int = 0
+    VLLM_ILU_FUSE_EP_COMBINE: bool = True
+    VLLM_ILU_E25_COMPACT_ENGRAM: bool = False
+    VLLM_ILU_DS41_DECODE_KV_RESTORE: bool = False
     VLLM_ILU_DS4_PREFILL_OPT: bool = False
     VLLM_ILU_DS4_PREFILL_AS_DECODE: bool = False
     VLLM_ILU_DS4_FP8_PREFILL_SPARSE: bool = True
@@ -175,6 +181,21 @@ if TYPE_CHECKING:
     VLLM_ILU_WO_A_QUANT: str = "marlin"
     VLLM_ILU_WO_A_MSD_MIN_TOKENS: int = 256
     VLLM_ILU_DS4_MQA_QUANT_TYPE: str = ""
+    VLLM_ILU_DS41_INDEXER_KV_LAYOUT: str = "legacy"
+    VLLM_ILU_DS41_COMPRESSED_KV_FORMAT: str = "none"
+    VLLM_ILU_PP_CPU_OFFLOAD_REQUIRED: bool = False
+    VLLM_ILU_ONCHIP_CHECK: bool = False
+    VLLM_ILU_ONCHIP_CHECK_LEVEL_MASK: int = 0
+    VLLM_ILU_ONCHIP_CHECK_KMSG: bool = False
+    VLLM_ILU_ONCHIP_CHECK_STARTUP_RETRIES: int = 2
+    VLLM_ILU_ONCHIP_CHECK_RETRY_DELAY_MS: float = 100.0
+    VLLM_ILU_ONCHIP_CHECK_INCOMPLETE_LOG_INTERVAL: int = 100
+    VLLM_ILU_HBM_ECC_CHECK: bool = False
+    VLLM_ILU_HBM_ECC_POLL_INTERVAL_MS: float = 1000.0
+    VLLM_ILU_HBM_ECC_HEARTBEAT_TIMEOUT_MS: float = 5000.0
+    VLLM_ILU_HBM_ECC_MAX_QUERY_FAILURES: int = 3
+    VLLM_ILU_HBM_ECC_KMSG: bool = False
+    VLLM_ILU_HBM_ECC_KILL_PROCESS_GROUP: bool = False
     VLLM_ILU_FUSE_NORM_QUANT: bool = True
     VLLM_ILU_FUSE_MOE_W13: bool = True
     VLLM_ILU_GLM_SAMPLING_MODE: str = "off"
@@ -207,6 +228,7 @@ if TYPE_CHECKING:
     VLLM_ILU_DP_ROUND_ROBIN_LB: bool = False
     VLLM_ILU_DP_ROUND_ROBIN_LB_FILE: str = ""
     VLLM_ILU_DP_ENABLE_SYNC_PREFILLS: bool = False
+    VLLM_ILU_DP_SYNC_READY_REPLAY: bool = False
     VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS: int = 8
     VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS: float = 0.0
     VLLM_ILU_MOE_EP_LL_MOE_ALGO: str = "GEMV"
@@ -323,6 +345,56 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     .strip()
     .lower(),
     "VLLM_ILU_HYV4_FUSE_IHC": _bool_reader("VLLM_ILU_HYV4_FUSE_IHC", "1"),
+    "VLLM_ILU_CUDAGRAPH_ASYNC_REPLAY": _bool_reader(
+        "VLLM_ILU_CUDAGRAPH_ASYNC_REPLAY", "0"
+    ),
+    "VLLM_ILU_COMPACT_RAGGED_GATHER": _bool_reader(
+        "VLLM_ILU_COMPACT_RAGGED_GATHER", "0"
+    ),
+    # AG/RS DP+EP only. Collapses the MoE runner's five collectives per layer
+    # (3x dispatch all-gather + DP reduce-scatter + TP all-reduce) into two:
+    # one all-gather of hidden_states, and one EP all-reduce that subsumes the
+    # reduce-scatter, the TP reduction, and the shared-expert add. Set to 0 to
+    # go back to the community schedule. See IluMoERunner._ilu_fused_ep_combine.
+    "VLLM_ILU_FUSE_EP_COMBINE": _bool_reader("VLLM_ILU_FUSE_EP_COMBINE", "1"),
+    "VLLM_ILU_E25_COMPACT_ENGRAM": _bool_reader("VLLM_ILU_E25_COMPACT_ENGRAM", "0"),
+    "VLLM_ILU_ONCHIP_CHECK": _bool_reader("VLLM_ILU_ONCHIP_CHECK", "0"),
+    "VLLM_ILU_ONCHIP_CHECK_LEVEL_MASK": _int_reader(
+        "VLLM_ILU_ONCHIP_CHECK_LEVEL_MASK", 0
+    ),
+    "VLLM_ILU_ONCHIP_CHECK_KMSG": _bool_reader("VLLM_ILU_ONCHIP_CHECK_KMSG", "0"),
+    "VLLM_ILU_ONCHIP_CHECK_STARTUP_RETRIES": _int_reader(
+        "VLLM_ILU_ONCHIP_CHECK_STARTUP_RETRIES", 2, minimum=0
+    ),
+    "VLLM_ILU_ONCHIP_CHECK_RETRY_DELAY_MS": lambda: max(
+        0.0, float(os.environ.get("VLLM_ILU_ONCHIP_CHECK_RETRY_DELAY_MS", "100"))
+    ),
+    "VLLM_ILU_ONCHIP_CHECK_INCOMPLETE_LOG_INTERVAL": _int_reader(
+        "VLLM_ILU_ONCHIP_CHECK_INCOMPLETE_LOG_INTERVAL", 100, minimum=1
+    ),
+    "VLLM_ILU_HBM_ECC_CHECK": _bool_reader("VLLM_ILU_HBM_ECC_CHECK", "0"),
+    "VLLM_ILU_HBM_ECC_POLL_INTERVAL_MS": lambda: max(
+        0.0, float(os.environ.get("VLLM_ILU_HBM_ECC_POLL_INTERVAL_MS", "1000"))
+    ),
+    "VLLM_ILU_HBM_ECC_HEARTBEAT_TIMEOUT_MS": lambda: max(
+        0.0, float(os.environ.get("VLLM_ILU_HBM_ECC_HEARTBEAT_TIMEOUT_MS", "5000"))
+    ),
+    "VLLM_ILU_HBM_ECC_MAX_QUERY_FAILURES": _int_reader(
+        "VLLM_ILU_HBM_ECC_MAX_QUERY_FAILURES", 3, minimum=1
+    ),
+    "VLLM_ILU_HBM_ECC_KMSG": _bool_reader("VLLM_ILU_HBM_ECC_KMSG", "0"),
+    "VLLM_ILU_HBM_ECC_KILL_PROCESS_GROUP": _bool_reader(
+        "VLLM_ILU_HBM_ECC_KILL_PROCESS_GROUP", "0"
+    ),
+    "VLLM_ILU_DS41_DECODE_KV_RESTORE": _bool_reader(
+        "VLLM_ILU_DS41_DECODE_KV_RESTORE", "0"
+    ),
+    "VLLM_ILU_DS41_COMPRESSED_KV_FORMAT": lambda: os.environ.get(
+        "VLLM_ILU_DS41_COMPRESSED_KV_FORMAT", "none"
+    ),
+    "VLLM_ILU_DS41_INDEXER_KV_LAYOUT": lambda: os.environ.get(
+        "VLLM_ILU_DS41_INDEXER_KV_LAYOUT", "legacy"
+    ),
     "VLLM_ILU_FLASH_ATTN_QUANT_TYPE": lambda: os.environ.get(
         "VLLM_ILU_FLASH_ATTN_QUANT_TYPE", ""
     ).upper(),
@@ -381,6 +453,10 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_DP_ENABLE_SYNC_PREFILLS": _bool_reader(
         "VLLM_ILU_DP_ENABLE_SYNC_PREFILLS",
         "1" if _hybrid_dp_sync_prefills_default() else "0",
+    ),
+    "VLLM_ILU_DP_SYNC_READY_REPLAY": _bool_reader(
+        "VLLM_ILU_DP_SYNC_READY_REPLAY",
+        "0",
     ),
     "VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS": lambda: max(
         0,
@@ -460,10 +536,14 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP": _bool_reader(
         "VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP", "0"
     ),
-    # V4.1 decode NVSM/LL: shared MLP on an auxiliary stream overlaps dispatch.
-    # Default on; set 0 to restore the serial dispatch-window schedule.
+    # V4.1 decode NVSM/LL: shared MLP runs on the main stream between
+    # dispatch_begin and dispatch_finish by default; set 1 to move it to the
+    # auxiliary stream.
     "VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP": _bool_reader(
-        "VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP", "1"
+        "VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP", "0"
+    ),
+    "VLLM_ILU_DP_VOCAB_GROUP_SIZE": _int_reader(
+        "VLLM_ILU_DP_VOCAB_GROUP_SIZE", 0, minimum=0
     ),
     "VLLM_ILU_GLM_SAMPLING_MODE": _glm_sampling_mode,
     # Opt-in local routing and INT8 quant+expand; restart workers to change.
@@ -537,6 +617,9 @@ _ILU_GUARD_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_PATCH_VERBOSE": _bool_reader("VLLM_ILU_PATCH_VERBOSE", "0"),
     "VLLM_ILUVATAR_ENABLE_STARTUP_PATCH": _bool_reader(
         "VLLM_ILUVATAR_ENABLE_STARTUP_PATCH", "0"
+    ),
+    "VLLM_ILU_PP_CPU_OFFLOAD_REQUIRED": _bool_reader(
+        "VLLM_ILU_PP_CPU_OFFLOAD_REQUIRED", "0"
     ),
 }
 

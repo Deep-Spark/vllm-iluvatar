@@ -18,8 +18,14 @@ import numpy as np
 import torch
 import uvloop
 import zmq
-from nixl._api import nixl_agent as NixlWrapper
-from nixl._api import nixl_agent_config, nixl_prepped_dlist_handle
+try:
+    from nixl._api import nixl_agent as NixlWrapper
+    from nixl._api import nixl_agent_config, nixl_prepped_dlist_handle
+except ImportError:
+    NixlWrapper = None
+    nixl_agent_config = None
+    nixl_prepped_dlist_handle = Any
+from vllm import envs
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineId,
@@ -34,8 +40,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import
     derive_mamba_conv_split,
 )
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
-from vllm.distributed.utils import get_pp_indices
 from vllm.logger import init_logger
+from vllm.utils.network_utils import make_zmq_path
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionMetadata
@@ -49,11 +55,15 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_iluvatar.v1.worker.prefill_state.configuration import config_pipeline_bounds
+
 from ..skip_layers import get_skip_layers, producer_last_layer
 from .handshake_validation import (
     validate_block_id_groups,
     validate_compatibility_hash,
     validate_descriptor_geometry,
+    validate_indexer_kv_layout,
+    validate_main_kv_format,
     validate_parallel_topology,
 )
 from .host_kv_stub import (
@@ -84,6 +94,7 @@ from .memory_registration import (
 )
 from .metadata import (
     GET_META_MSG,
+    TEARDOWN_COMPLETE_MSG,
     NixlAgentMetadata,
     NixlConnectorMetadata,
     NixlHandshakePayload,
@@ -93,6 +104,7 @@ from .metadata import (
     TransferIntent,
     TransferNotificationStatus,
     compute_nixl_compatibility_hash,
+    parse_disconnect_payload,
 )
 from .stats import (
     NixlKVConnectorStats,
@@ -125,6 +137,35 @@ if TYPE_CHECKING:
 BufferedRecvNotification = tuple[TransferNotificationStatus, NotifyPayload]
 
 logger = init_logger("vllm." + __name__)
+
+
+def byte_compatible_kv_layouts(
+    local_layout: str,
+    remote_layout: str,
+    registered_specs: list[KVCacheSpec],
+) -> bool:
+    """Return whether registered blocks have identical bytes in two layouts.
+
+    The listed mixed layout pairs are equivalent only for singleton-head MLA:
+    descriptor offsets and strides account for outer layer/block packing, and
+    the in-block head dimension has length one.
+    """
+    if local_layout == remote_layout:
+        return True
+    layout_pair = {local_layout, remote_layout}
+    if layout_pair not in (
+        {"LBNHC", "BLHNC"},
+        {"LBNHC", "LBHNC"},
+        {"LBHNC", "BLHNC"},
+    ):
+        return False
+    # A PP stage with no registered NIXL tensors transfers no layout-sensitive
+    # bytes, so the certified layout mismatch is vacuously safe there.
+    return all(
+        isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+        and spec.num_kv_heads == 1
+        for spec in registered_specs
+    )
 
 
 class NixlConnectorWorker:
@@ -233,7 +274,7 @@ class NixlConnectorWorker:
         )
         # all local registered data
         self._registered_descs: list[Any] = []
-        self.xfer_handshake_metadata: NixlAgentMetadata | None = None
+        self.xfer_handshake_metadata: NixlHandshakePayload | None = None
         # infos about registered kv cache
         self.layer_ptr_mapping = defaultdict(list[int])
         self.layer_desc_mapping = defaultdict(list[tuple[int, int]])
@@ -391,7 +432,15 @@ class NixlConnectorWorker:
         self.scheduler_addr = dp_scoped_addr(
             _SCHEDULER_ADDR, vllm_config.parallel_config.data_parallel_index
         )
+        dp_index = vllm_config.parallel_config.data_parallel_index
+        self.side_channel_addr = (
+            f"{envs.VLLM_NIXL_SIDE_CHANNEL_HOST}:"
+            f"{envs.VLLM_NIXL_SIDE_CHANNEL_PORT + dp_index}"
+        )
         self.global_rank = self.pp_rank * self.tp_world_size + self.tp_rank
+        self._teardown_outbox: asyncio.Queue[tuple[str, int, int, int, str]] | None = (
+            None
+        )
         self.enable_permute_local_kv = False
         self.use_quant_to_fp8 = False
         self.device_id: int = 0
@@ -439,9 +488,8 @@ class NixlConnectorWorker:
             if vllm_config.model_config.hf_text_config is not None
             else vllm_config.model_config.hf_config.num_hidden_layers
         )
-        self.pp_layer_start, self.pp_layer_end = get_pp_indices(
-            self.num_hidden_layers, self.pp_rank, self.pp_world_size
-        )
+        pp_bounds = config_pipeline_bounds(vllm_config)
+        self.pp_layer_start, self.pp_layer_end = pp_bounds[self.pp_rank]
         # A PD prefiller stops at the last kv source (producer_last_layer), so
         # only that many layers run their save hook. Leaving the stage bounds
         # at the full depth would make un_send_layer_nums never reach 0 and
@@ -450,10 +498,7 @@ class NixlConnectorWorker:
             self.pp_layer_start = min(self.pp_layer_start, last_layer + 1)
             self.pp_layer_end = min(self.pp_layer_end, last_layer + 1)
         self.pp_layer_end_closed = self.pp_layer_end - 1
-        self.pp_split = [
-            get_pp_indices(self.num_hidden_layers, i, self.pp_world_size)[0]
-            for i in range(self.pp_world_size)
-        ]
+        self.pp_split = [start for start, _ in pp_bounds]
         self.num_layers = self.pp_layer_end - self.pp_layer_start
         self.num_layers_end_index = self.num_layers - 1
         self.total_num_kv_heads = self.model_config.get_total_num_kv_heads()
@@ -690,7 +735,8 @@ class NixlConnectorWorker:
         return [(offset + start, size) for start, size in split] + [(offset, whole)]
 
     def _register_kv_views(
-        self, kv_caches: dict[str, torch.Tensor]
+        self, kv_caches: dict[str, torch.Tensor],
+        kv_cache_scales: dict[str, torch.Tensor] | None = None,
     ) -> tuple[list, list]:
         """Register every KV view with NIXL.
 
@@ -714,6 +760,16 @@ class NixlConnectorWorker:
         registered_allocation_sizes: dict[int, int] = {}
         plain_storage_nbytes: int | None = None
         self._reset_registration_mappings()
+        from ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_format import (
+            resolve_quant_format,
+        )
+
+        from vllm_iluvatar.models.deepseek_v41.compressed_kv import (
+            is_quantized_main_spec,
+        )
+        from vllm_iluvatar.models.deepseek_v41.indexer_kv import is_split_indexer_spec
+
+        forward_context = self.vllm_config.compilation_config.static_forward_context
         skip_layers = get_skip_layers()
         unknown_skip_layers = skip_layers - kv_caches.keys()
         if unknown_skip_layers:
@@ -770,6 +826,36 @@ class NixlConnectorWorker:
                     seen_base_addresses_check=seen_base_addresses_check,
                     registered_allocation_sizes=registered_allocation_sizes,
                 )
+                if is_quantized_main_spec(layer_spec) or is_split_indexer_spec(layer_spec):
+                    scales = (kv_cache_scales or {}).get(layer_name)
+                    if scales is None:
+                        scales = getattr(forward_context[layer_name], "kv_cache_scales", None)
+                    if not isinstance(scales, torch.Tensor):
+                        raise ValueError(
+                            f"{layer_name}: compressed KV registration requires its scale plane"
+                        )
+                    if is_split_indexer_spec(layer_spec):
+                        scale_registration = (
+                            self._memory_registration_planner.describe_indexer_scale_plane(
+                                layer_name=layer_name, scales=scales, payload=registration,
+                            )
+                        )
+                    else:
+                        fmt = resolve_quant_format(layer_spec.cache_dtype_str)
+                        scale_registration = self._memory_registration_planner.describe_scale_plane(
+                            layer_name=layer_name,
+                            scales=scales,
+                            payload=registration,
+                            scale_page_bytes=fmt.scale_page_bytes(layer_spec.head_size),
+                        )
+                    self._record_registered_kv_region(
+                        layer_name=layer_name, cache=scales, layer_spec=layer_spec,
+                        registration=scale_registration,
+                        segments=list(scale_registration.payload_segments),
+                        caches_data=caches_data, seen_base_addresses=seen_base_addresses,
+                        seen_base_addresses_check=seen_base_addresses_check,
+                        registered_allocation_sizes=registered_allocation_sizes,
+                    )
 
         return caches_data, seen_base_addresses
 
@@ -807,9 +893,14 @@ class NixlConnectorWorker:
     def register_kv_caches(
         self,
         kv_caches: dict[str, torch.Tensor],
-        kv_cache_scales: dict[str, tuple[torch.Tensor]] | None = None,
+        kv_cache_scales: dict[str, torch.Tensor] | None = None,
     ) -> None:
         """Register the KV Cache data in nixl."""
+        from vllm_iluvatar.models.deepseek_v41.compressed_kv import main_kv_format
+
+        main_format = main_kv_format()
+        if main_format is not None and host_kv_enabled():
+            raise NotImplementedError("Compressed main KV requires paired direct-VRAM registration")
         self.gpu_kv_cache = kv_caches
         kv_caches = may_override_kv_cache(kv_caches)
         self.cpu_kv_cache = kv_caches
@@ -848,7 +939,7 @@ class NixlConnectorWorker:
         )
         self.compat_hash = compute_nixl_compatibility_hash(self.vllm_config)
 
-        caches_data, seen_base_addresses = self._register_kv_views(kv_caches)
+        caches_data, seen_base_addresses = self._register_kv_views(kv_caches, kv_cache_scales)
         if caches_data:
             self._register_nixl_memory(caches_data, seen_base_addresses)
         else:
@@ -893,6 +984,7 @@ class NixlConnectorWorker:
             global_rank=self.global_rank,
             tp_rank=self.tp_rank,
             pp_rank=self.pp_rank,
+            main_kv_format=main_format.name if main_format is not None else "none",
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -900,6 +992,8 @@ class NixlConnectorWorker:
         self.xfer_handshake_metadata = NixlHandshakePayload(
             compatibility_hash=self.compat_hash,
             agent_metadata_bytes=encoder.encode(agent_metadata),
+            main_kv_format=agent_metadata.main_kv_format,
+            indexer_kv_layout=os.getenv("VLLM_ILU_DS41_INDEXER_KV_LAYOUT", "legacy"),
         )
 
     ############################################################
@@ -1063,15 +1157,35 @@ class NixlConnectorWorker:
                 f"an incompatibility between connector version. Error: {e}"
             ) from e
 
+        from vllm_iluvatar.models.deepseek_v41.compressed_kv import main_kv_format
+
+        main_format = main_kv_format()
+        local_format = main_format.name if main_format is not None else "none"
+        requires_compat = validate_main_kv_format(
+            local_format,
+            handshake_payload.main_kv_format,
+            remote_engine_id=engine_id,
+        )
+        validate_indexer_kv_layout(
+            os.getenv("VLLM_ILU_DS41_INDEXER_KV_LAYOUT", "legacy"),
+            getattr(handshake_payload, "indexer_kv_layout", "legacy"),
+            remote_engine_id=engine_id,
+        )
         validate_compatibility_hash(
             self.compat_hash,
             handshake_payload.compatibility_hash,
             remote_engine_id=engine_id,
-            enforce=self.enforce_handshake_compat,
+            enforce=self.enforce_handshake_compat or requires_compat,
         )
         metadata: NixlAgentMetadata = decoder.decode(
             handshake_payload.agent_metadata_bytes
         )
+        if metadata.main_kv_format != handshake_payload.main_kv_format:
+            raise RuntimeError(
+                f"Remote NIXL main KV format tag disagrees with agent metadata "
+                f"for engine {engine_id}: envelope={handshake_payload.main_kv_format}, "
+                f"agent={metadata.main_kv_format}"
+            )
         if metadata.engine_id != engine_id:
             raise RuntimeError(
                 f"Remote NIXL agent engine ID mismatch. "
@@ -1116,11 +1230,26 @@ class NixlConnectorWorker:
             )
         # Blocks are copied byte for byte, so a different in-block layout
         # would not fail the transfer, it would silently scramble the KV.
-        if self.kv_cache_layout != metadata.kv_cache_layout:
+        registered_specs = [
+            self._layer_specs[layer_name] for layer_name in self.layer_ptr_mapping
+        ]
+        if not byte_compatible_kv_layouts(
+            self.kv_cache_layout,
+            metadata.kv_cache_layout,
+            registered_specs,
+        ):
             raise RuntimeError(
-                "P/D KV cache layouts must match: "
+                "P/D KV cache layouts must be byte-compatible: "
                 f"local={self.kv_cache_layout}, "
                 f"remote={metadata.kv_cache_layout}"
+            )
+        if self.kv_cache_layout != metadata.kv_cache_layout:
+            logger.info_once(
+                "Allowing byte-compatible P/D KV cache layouts: "
+                "local=%s, remote=%s, registered_specs=%d",
+                self.kv_cache_layout,
+                metadata.kv_cache_layout,
+                len(registered_specs),
             )
         self._remember_remote_engine(metadata, remote_tp_size, remote_pp_size)
 
@@ -2219,6 +2348,7 @@ class NixlConnectorWorker:
                         session.engine_id,
                         session.generation,
                     )
+                    self._report_teardown(session, "stuck")
             self._cleanup_session_if_drained(session)
 
     def _progress_once(self) -> None:
@@ -2413,6 +2543,7 @@ class NixlConnectorWorker:
             engine_id,
             session.generation,
         )
+        self._report_teardown(session, "closed")
 
     def _new_connect_session(self, engine_id: EngineId) -> RemoteEngineSession | None:
         current = self.remote_sessions.get(engine_id)
@@ -2437,9 +2568,19 @@ class NixlConnectorWorker:
         self.remote_sessions[engine_id] = session
         return session
 
-    def _mark_engine_disconnected(self, engine_id: EngineId) -> None:
+    def _mark_engine_disconnected(
+        self,
+        engine_id: EngineId,
+        teardown_id: int = 0,
+    ) -> None:
         now = time.perf_counter()
         session = self.remote_sessions.get(engine_id)
+        if session is not None and session.state == RemoteSessionState.CLOSED:
+            if teardown_id:
+                session.teardown_id = teardown_id
+                session.reported_teardown_id = None
+                self._report_teardown(session, "closed")
+            return
         if session is None:
             generation = self._engine_generations.get(engine_id, 0) + 1
             self._engine_generations[engine_id] = generation
@@ -2449,6 +2590,8 @@ class NixlConnectorWorker:
                 role=self._session_role,
             )
             self.remote_sessions[engine_id] = session
+        if teardown_id:
+            session.teardown_id = teardown_id
         timeout = (
             self.consumer_disconnect_grace
             if self.is_consumer
@@ -2476,6 +2619,11 @@ class NixlConnectorWorker:
             for req_id in pending:
                 self._finish_send(req_id, "remote engine disconnected before transfer")
         self._cleanup_session_if_drained(session)
+        if (
+            session.state == RemoteSessionState.STUCK
+            and session.teardown_id is not None
+        ):
+            self._report_teardown(session, "stuck")
 
     async def _shutdown_on_loop(self) -> None:
         if self._shutdown_started_on_loop:
@@ -2546,6 +2694,87 @@ class NixlConnectorWorker:
             for desc in self._registered_descs:
                 self._deregister_memory(desc)
             self._registered_descs.clear()
+        reports = self._teardown_outbox
+        if reports is not None:
+            try:
+                await asyncio.wait_for(reports.join(), timeout=5.0)
+            except TimeoutError:
+                logger.error("NIXL teardown reports are still pending at shutdown")
+
+    def _report_teardown(self, session: RemoteEngineSession, status: str) -> None:
+        """Report one terminal drain result per worker and router token."""
+        if session.teardown_id is None or self._teardown_outbox is None:
+            return
+        if session.reported_teardown_id == session.teardown_id:
+            return
+        session.reported_teardown_id = session.teardown_id
+        self._teardown_outbox.put_nowait(
+            (
+                session.engine_id,
+                session.generation,
+                session.teardown_id,
+                self.global_rank,
+                status,
+            )
+        )
+
+    async def _run_teardown_reports(self) -> None:
+        """Deliver worker drain completion to this rank's scheduler ROUTER."""
+        path = make_zmq_path("tcp", self.side_channel_addr)
+        while not self.stop_event.is_set():
+            try:
+                (
+                    engine_id,
+                    generation,
+                    teardown_id,
+                    global_rank,
+                    status,
+                ) = await asyncio.wait_for(self._teardown_outbox.get(), timeout=0.2)
+            except TimeoutError:
+                continue
+            payload = msgspec.msgpack.encode(
+                (
+                    TEARDOWN_COMPLETE_MSG,
+                    (
+                        engine_id,
+                        generation,
+                        teardown_id,
+                        global_rank,
+                        status,
+                    ),
+                )
+            )
+            delivered = False
+            for attempt in range(5):
+                try:
+                    with make_zmq_socket(
+                        path=path,
+                        ctx=self.ctx,
+                        socket_type=zmq.REQ,
+                        bind=False,
+                        linger=0,
+                    ) as socket:
+                        socket.setsockopt(zmq.SNDTIMEO, 3000)
+                        socket.setsockopt(zmq.RCVTIMEO, 3000)
+                        await socket.send(payload)
+                        await socket.recv()
+                    delivered = True
+                    break
+                except Exception as error:
+                    logger.warning(
+                        "NIXL teardown report retry %d/5 failed for %s: %s",
+                        attempt + 1,
+                        engine_id,
+                        error,
+                    )
+                    await asyncio.sleep(0.2 * (attempt + 1))
+            if not delivered:
+                logger.error(
+                    "Unable to report teardown for %s rank %s",
+                    engine_id,
+                    global_rank,
+                )
+            self._teardown_outbox.task_done()
 
     ############################################################
     # async loop for recv info from scheduler, run kv cache sending...
@@ -2555,10 +2784,12 @@ class NixlConnectorWorker:
         torch.cuda.set_device(torch.distributed.get_rank())
 
         async def tasks():
+            self._teardown_outbox = asyncio.Queue()
             coroutines = [
                 self._scheduler_listener(),
                 self._run_progress(),
                 self._run_write_kv_cache(),
+                self._run_teardown_reports(),
             ]
             if host_kv_enabled():
                 coroutines.append(self._run_d2h())
@@ -2634,8 +2865,12 @@ class NixlConnectorWorker:
                             )
                         self._maybe_start_or_continue_send(state)
                     elif op_type == "disconnect":
-                        remote_engine_id = remote_infos
-                        self._mark_engine_disconnected(remote_engine_id)
+                        remote_engine_id, teardown_id = parse_disconnect_payload(
+                            remote_infos
+                        )
+                        self._mark_engine_disconnected(
+                            remote_engine_id, teardown_id
+                        )
                     elif op_type == "connect":
                         node_meta = NodeMeta(**remote_infos)
                         if not self._accepting_work:

@@ -53,7 +53,7 @@ def producer_last_layer(vllm_config: "VllmConfig") -> int | None:
         return None
     # Truncation leaves layers above the last kv source without a window.
     # That is valid only when the decoder rebuilds the window.
-    if not getattr(vllm_config.cache_config, "swa_bounded_replay", False):
+    if not getattr(vllm_config.cache_config, "swa_bounded_replay", True):
         return None
     config = vllm_config.model_config.hf_text_config
     sources = getattr(config, "kv_source_layer_ids", None) or ()

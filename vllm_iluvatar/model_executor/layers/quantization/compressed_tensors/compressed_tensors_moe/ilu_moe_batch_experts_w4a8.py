@@ -33,6 +33,13 @@ class IluMoEBatchedExpertsW4A8(BaseBatchExperts):
                 f"IluMoEBatchedExpertsW4A8 requires quant_mode='w4a8', got {self.quant_mode!r}"
             )
 
+    def moe_problem_size(self, a1, w1, w2, topk_ids):
+        # BaseBatchExperts reads N from w1.shape[1], which is K for packed NN.
+        experts, tokens, _, hidden, topk = super().moe_problem_size(
+            a1, w1, w2, topk_ids
+        )
+        return experts, tokens, self.gemm1_info.get_pad_n(), hidden, topk
+
     def apply(self, *args, **kwargs):
         if MOE_ALGO == "FUSED":
             return self.apply_fused(*args, **kwargs)
@@ -251,6 +258,7 @@ class IluMoEBatchedExpertsW4A8(BaseBatchExperts):
             input=output_1,
             expert_num_tokens=expert_num_tokens_gpu,
             max_num_tokens_per_expert=max_num_tokens_per_expert,
+            limit=self.swiglu_limit,
         )
 
         ixff.moe_w4a8_group_gemv(

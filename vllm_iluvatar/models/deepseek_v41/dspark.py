@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Iterable
+from contextlib import nullcontext
 from copy import copy, deepcopy
 from typing import cast
 
@@ -53,6 +54,19 @@ def _local_vocab_weight(
     return weight.narrow(0, vocab_start, local_vocab_size)
 
 
+def _make_vocab_layer(
+    factory: Callable[..., nn.Module],
+    vocab_size: int,
+    hidden_size: int,
+    *,
+    prefix: str,
+    owns_weight: bool,
+) -> nn.Module:
+    """Keep sharing metadata without allocating a throwaway vocabulary weight."""
+    with nullcontext() if owns_weight else torch.device("meta"):
+        return factory(vocab_size, hidden_size, prefix=prefix)
+
+
 def remap_dspark_name(name: str, load_own_embed: bool = False) -> str | None:
     """Map a checkpoint name onto this draft.
 
@@ -87,7 +101,9 @@ _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 class IluDSparkV41Model(nn.Module):
     """Iluvatar DeepSeek-V4.1 backbone used by the DSpark draft."""
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+    def __init__(
+        self, *, vllm_config: VllmConfig, prefix: str = "", owns_embedding: bool = True
+    ) -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None
         config = vllm_config.speculative_config.draft_model_config.hf_config
@@ -104,10 +120,12 @@ class IluDSparkV41Model(nn.Module):
         ):
             raise ValueError("V4.1 DSpark expects three pure-SWA draft layers")
 
-        self.embed_tokens = VocabParallelEmbedding(
+        self.embed_tokens = _make_vocab_layer(
+            VocabParallelEmbedding,
             config.vocab_size,
             config.hidden_size,
             prefix=maybe_prefix(prefix, "embed_tokens"),
+            owns_weight=owns_embedding,
         )
         self.main_proj = ReplicatedLinear(
             config.hidden_size * len(self.target_layer_ids),
@@ -273,6 +291,14 @@ class IluDSparkV41DraftModel(nn.Module):
     draft_id_to_target_id = None
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        # Same Hybrid-EP budget as the target; draft MoE may init its own NVSM
+        # communicator (different topk / expert count) during CUDA graph capture.
+        from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
+            _decode_max_tokens_per_rank_from_config,
+            set_max_num_seqs,
+        )
+
+        set_max_num_seqs(_decode_max_tokens_per_rank_from_config(vllm_config))
         super().__init__()
         assert vllm_config.speculative_config is not None
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
@@ -291,12 +317,16 @@ class IluDSparkV41DraftModel(nn.Module):
             and not vllm_config.parallel_config.use_sequence_parallel_moe
         )
         self.model = IluDSparkV41Model(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+            vllm_config=vllm_config,
+            prefix=maybe_prefix(prefix, "model"),
+            owns_embedding=self.load_own_embed_tokens or self.has_own_embed_tokens,
         )
-        self.lm_head = ParallelLMHead(
+        self.lm_head = _make_vocab_layer(
+            ParallelLMHead,
             self.config.vocab_size,
             self.config.hidden_size,
             prefix=maybe_prefix(prefix, "lm_head"),
+            owns_weight=self.has_own_lm_head,
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
 
@@ -368,7 +398,10 @@ class IluDSparkV41DraftModel(nn.Module):
         indices = self.lm_head.shard_indices
         local_vocab_size = self.lm_head.num_embeddings_per_partition
 
-        if markov_w2.weight.shape[0] == local_vocab_size:
+        if (
+            markov_w2.weight.shape[0] == local_vocab_size
+            and self.logits_processor.head_dtype in (None, markov_embed.dtype)
+        ):
             return self._compute_local_logits(markov_w2, markov_embed)
 
         weight = _local_vocab_weight(

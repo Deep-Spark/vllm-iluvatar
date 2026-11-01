@@ -44,6 +44,9 @@ from vllm.model_executor.layers.fused_moe import FusedMoEActivationFormat
 from vllm.utils.torch_utils import aux_stream, current_stream
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
+from vllm_iluvatar.model_executor.layers.fused_moe.ilu_moe_padding import (
+    _gathered_router_padding,
+)
 from vllm_iluvatar.model_executor.layers.fused_moe.prepare_finalize.ilu_deepep_ll import (
     VLLM_ILU_DEEPEP_USE_SCATTER,
     VLLM_ILU_LL_FUSED_AG_AR,
@@ -124,15 +127,19 @@ def _check_shared_gate_up(
 
 
 class IluFusedMoEEP:
+    # Shared DeepEP LL manager; NVSM communicators are keyed by MoE shape so
+    # target (e.g. 384/topk6) and DSpark draft (128/topk3) do not collide.
     _dp_ep_ll_all2all_manager = None
-    _dp_ep_ll_all2all_handle = None
-    _dp_ep_ll_all2all_handle_args = None
+    _dp_ep_ll_handles: dict = {}
     _dp_ep_ll_preinit_done = False
+    _dp_ep_ll_preinit_shapes: set[tuple[int | None, int | None]] = set()
 
     def init_ep(self):
         if not self._should_preinit_dp_ep_ll_handle():
             return
         runner = self.experts
+        if getattr(runner, "_ilu_nvsm_init_patched", False):
+            return
         # Seed the module-global max-num-seqs consumed by ``_get_max_num_seqs``
         # (called later from ``_get_forward_dp_ep_ll_all2all``). deepseek_v4 —
         # unlike step3p5 / minimax_m2 — does not call ``set_max_num_seqs`` in its
@@ -154,7 +161,7 @@ class IluFusedMoEEP:
         # ``runner.maybe_init_modular_kernel``) — which runs after weight
         # processing and before CUDA graph capture. Wrap that hook to also
         # bring up the DeepEP low-latency all2all handle + NVSM dispatch
-        # state at the same point; patch only once.
+        # state at the same point; patch once per MoE shape.
         routed_experts = runner.routed_experts
 
         original_init = routed_experts._ensure_moe_quant_config_init
@@ -173,7 +180,15 @@ class IluFusedMoEEP:
             ensure_moe_quant_config_and_nvsm,
             routed_experts,
         )
+        runner._ilu_nvsm_init_patched = True
+        moe_config = runner.moe_config
         IluFusedMoEEP._dp_ep_ll_preinit_done = True
+        IluFusedMoEEP._dp_ep_ll_preinit_shapes.add(
+            (
+                getattr(moe_config, "num_experts", None),
+                getattr(moe_config, "experts_per_token", None),
+            )
+        )
 
     def _should_use_forward_dp_ep(self) -> bool:
         moe_parallel_config = self.experts.moe_config.moe_parallel_config
@@ -192,6 +207,7 @@ class IluFusedMoEEP:
             )
             and (
                 all2all_backend in ("deepep_low_latency", "deepep_high_throughput")
+                or _DS4_DECODE_EP_BACKEND == "deepep_low_latency"
                 or not self.experts._quant_method.supports_internal_mk
             )
             and not self.experts._quant_method.is_monolithic
@@ -204,10 +220,17 @@ class IluFusedMoEEP:
         )
 
     def _should_preinit_dp_ep_ll_handle(self) -> bool:
-        # Process-wide handle; first EP MoE layer wins (not always layer 0).
-        if IluFusedMoEEP._dp_ep_ll_preinit_done:
+        moe_config = self.experts.moe_config
+        shape = (
+            getattr(moe_config, "num_experts", None),
+            getattr(moe_config, "experts_per_token", None),
+        )
+        if shape == (None, None):
+            if IluFusedMoEEP._dp_ep_ll_preinit_done:
+                return False
+        elif shape in IluFusedMoEEP._dp_ep_ll_preinit_shapes:
             return False
-        configured_backend = self.experts.moe_config.moe_parallel_config.all2all_backend
+        configured_backend = moe_config.moe_parallel_config.all2all_backend
         return (
             _DS4_DECODE_EP_BACKEND == "deepep_low_latency"
             and configured_backend != "deepep_low_latency"
@@ -225,6 +248,24 @@ class IluFusedMoEEP:
             "use_fp8": False,
         }
 
+    def _dp_ep_ll_handle_key(
+        self,
+        all_to_all_args: dict,
+        max_tokens_per_rank: int,
+        topk: int,
+        dispatch_quant_kwargs: dict[str, object],
+    ) -> tuple:
+        quant_items = tuple(sorted(dispatch_quant_kwargs.items(), key=lambda kv: kv[0]))
+        return (
+            all_to_all_args["num_global_experts"],
+            topk,
+            all_to_all_args["token_hidden_size"],
+            all_to_all_args["num_ep_ranks"],
+            all_to_all_args["max_num_tokens_per_dp_rank"],
+            max_tokens_per_rank,
+            quant_items,
+        )
+
     def _get_forward_dp_ep_ll_all2all(self):
         from vllm_iluvatar.distributed.device_communicators.all2all import (
             DeepEPLLAll2AllManager,
@@ -232,41 +273,42 @@ class IluFusedMoEEP:
 
         ep_comm = get_ep_group().device_communicator
         assert ep_comm is not None
-        ll_manager = IluFusedMoEEP._dp_ep_ll_all2all_manager
-        handle = IluFusedMoEEP._dp_ep_ll_all2all_handle
-        if ll_manager is not None and handle is not None:
-            return ll_manager, handle
-
-        if ll_manager is None:
-            ll_manager = DeepEPLLAll2AllManager(
+        if IluFusedMoEEP._dp_ep_ll_all2all_manager is None:
+            IluFusedMoEEP._dp_ep_ll_all2all_manager = DeepEPLLAll2AllManager(
                 ep_comm.cpu_group,
                 getattr(ep_comm, "tcp_store_group", None),
             )
-            IluFusedMoEEP._dp_ep_ll_all2all_manager = ll_manager
+        ll_manager = IluFusedMoEEP._dp_ep_ll_all2all_manager
 
         moe_config = self.experts.moe_config
+        max_tokens_per_rank = _decode_ll_max_tokens_per_rank()
+        # Size the BufferWrapper cache key by the NVSM token budget, not
+        # moe_config.max_num_tokens (prefill-scale), so handle.buffer matches
+        # the compiled EPConfig.
         all_to_all_args = dict(
-            max_num_tokens_per_dp_rank=moe_config.max_num_tokens,
+            max_num_tokens_per_dp_rank=max_tokens_per_rank,
             token_hidden_size=moe_config.hidden_dim,
             num_ep_ranks=ll_manager.world_size,
             num_global_experts=moe_config.num_experts,
             num_local_experts=moe_config.num_experts // ll_manager.world_size,
         )
-        if (
-            handle is None
-            or IluFusedMoEEP._dp_ep_ll_all2all_handle_args != all_to_all_args
-        ):
+
+        dispatch_quant_kwargs = self._nvsm_dispatch_quant_kwargs()
+        cache_key = self._dp_ep_ll_handle_key(
+            all_to_all_args,
+            max_tokens_per_rank,
+            moe_config.experts_per_token,
+            dispatch_quant_kwargs,
+        )
+        handle = IluFusedMoEEP._dp_ep_ll_handles.get(cache_key)
+        if handle is None:
             handle = ll_manager.get_handle(all_to_all_args)
-            IluFusedMoEEP._dp_ep_ll_all2all_handle = handle
-            IluFusedMoEEP._dp_ep_ll_all2all_handle_args = all_to_all_args
+            IluFusedMoEEP._dp_ep_ll_handles[cache_key] = handle
 
         if hasattr(handle, "buffer") and handle.buffer is None:
             from ixformer.distributed import nvsm_ep
 
-            max_tokens_per_rank = _decode_ll_max_tokens_per_rank()
             tp_size = get_tensor_model_parallel_world_size()
-
-            dispatch_quant_kwargs = self._nvsm_dispatch_quant_kwargs()
             handle.buffer = nvsm_ep.nvsm_init_ep_comm(
                 max_num_tokens=max_tokens_per_rank,
                 hidden_size=moe_config.hidden_dim,
@@ -616,12 +658,13 @@ class IluFusedMoEEP:
                 router_logits, _ = runner.gate(hidden_states)
             else:
                 router_logits, _ = self.gate(hidden_states)
-            topk_weights, topk_ids = runner.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                topk_indices_dtype=quant_method.topk_indices_dtype,
-                input_ids=router_input_ids,
-            )
+            with _gathered_router_padding(ctx, dist_group, sizes):
+                topk_weights, topk_ids = runner.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    topk_indices_dtype=quant_method.topk_indices_dtype,
+                    input_ids=router_input_ids,
+                )
             shared_output = None
             apply_fused_moe = (
                 getattr(quant_method, "apply_fused_moe", None)

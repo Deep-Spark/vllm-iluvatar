@@ -22,7 +22,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
 )
-from vllm.distributed.utils import get_pp_indices
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
@@ -32,14 +31,25 @@ from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
     MambaSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
+
+from vllm_iluvatar.v1.worker.prefill_state.configuration import (
+    config_pipeline_bounds,
+    enabled,
+)
+from vllm_iluvatar.v1.worker.prefill_state.scheduler_state import PrefixSchedulerState
 
 from .metadata import (
     DISCONNECT_MSG,
     GET_NODE_META_MSG,
     PUT_NODE_META_MSG,
+    TEARDOWN_COMPLETE_MSG,
+    TEARDOWN_RESULT_FAILED,
+    TEARDOWN_RESULT_OK,
     NixlAgentMetadata,
     NixlConnectorMetadata,
     NixlHandshakePayload,
@@ -48,6 +58,7 @@ from .metadata import (
     ReqId,
     ReqMeta,
     TransferIntent,
+    parse_disconnect_payload,
 )
 from .utils import (
     NodeError,
@@ -59,6 +70,7 @@ from .utils import (
 _SERVER_ADDR = os.getenv("VLLM_ILU_NIXL_SERVER_ADDR", "172.31.0.123:8000")
 _PROXY_ADDR = os.getenv("VLLM_ILU_NIXL_PROXY_ADDR", "tcp://172.31.0.123:8079")
 _SCHEDULER_ADDR = os.getenv("VLLM_ILU_NIXL_SCHEDULER_ADDR", "tcp://127.0.0.1:19001")
+_KEEPALIVE_RETRY_INTERVAL_S = 5.0
 _FORCE_PER_RANK_SEND = os.getenv("VLLM_ILU_NIXL_FORCE_PER_RANK_SEND", "0").lower() in {
     "1",
     "true",
@@ -105,6 +117,9 @@ def transfer_slice(spec: "KVCacheSpec") -> slice | None:
 
 class NixlConnectorScheduler:
     """Implementation of Scheduler side methods"""
+
+    # Shutdown and the endpoint loop may run before optional state is ready.
+    prefix_state: PrefixSchedulerState | None = None
 
     def __init__(
         self,
@@ -205,25 +220,47 @@ class NixlConnectorScheduler:
             "kv_consumer",
         ], f"Unsupported kv role: {vllm_config.kv_transfer_config.kv_role}"
         self.is_consumer = vllm_config.kv_transfer_config.kv_role == "kv_consumer"
-        pp_split: list[int] = []
-        pp_world_size = vllm_config.parallel_config.pipeline_parallel_size
-        num_hidden_layers = (
-            vllm_config.model_config.hf_text_config.num_hidden_layers
-            if vllm_config.model_config.hf_text_config is not None
-            else vllm_config.model_config.hf_config.num_hidden_layers
-        )
-        for i in range(pp_world_size):
-            pp_split.append(
-                get_pp_indices(
-                    num_hidden_layers,
-                    i,
-                    pp_world_size,
-                )[0]
+        # Partial prompt blocks are private receive destinations; the even hit
+        # keeps CR2 replay aligned and its first SWA block live.
+        replay_specs = [s for s in self._all_specs if s.prefix_replay_tokens]
+        self.prefix_replay_alignment = (
+            2
+            if (
+                enabled(vllm_config)
+                or os.getenv("VLLM_ILU_V41_REMOTE_REPLAY_ALIGN2", "0") == "1"
             )
-        self.pp_split = pp_split
+            and self.is_consumer
+            and vllm_config.model_config.hf_config.model_type
+            in ("deepseek_v41", "deepseek_v41_text")
+            and not self._has_mamba
+            and replay_specs
+            and all(
+                isinstance(s, SlidingWindowMLASpec)
+                and s.prefix_replay_tokens == 128
+                and s.block_size == 64
+                for s in replay_specs
+            )
+            and all(
+                isinstance(
+                    s,
+                    (SlidingWindowMLASpec, MLAAttentionSpec, CircularBufferSpec),
+                )
+                and getattr(s, "tokens_per_state", 1) in (1, 2)
+                for s in self._all_specs
+            )
+            else None
+        )
+        logger.info("Remote-prefix replay alignment: %s", self.prefix_replay_alignment)
+        self.pp_split = [start for start, _ in config_pipeline_bounds(vllm_config)]
         self._kv_lease_duration: int = (
             vllm_config.kv_transfer_config.get_from_extra_config(
                 "kv_lease_duration", 480
+            )
+        )
+        # Match the router default (330s) so a late worker drain can still ACK.
+        self._teardown_timeout = float(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "reconnect_teardown_timeout", 330.0
             )
         )
         self.local_addr = f"{self.side_channel_host}:{self.side_channel_port}"
@@ -233,9 +270,11 @@ class NixlConnectorScheduler:
             "pp_size": vllm_config.parallel_config.pipeline_parallel_size,
             "tp_size": vllm_config.parallel_config.tensor_parallel_size,
             "engine_id": self.engine_id,
-            "pp_split": pp_split,
+            "pp_split": self.pp_split,
             "dp_rank": vllm_config.parallel_config.data_parallel_rank,
             "kv_role": vllm_config.kv_transfer_config.kv_role,
+            # Router (tp1 SWAPP-1825) rejects registration unless this is 1.
+            "teardown_protocol_version": 1,
             "kv_group_infos": self.kv_group_infos,  # the p/d kv group must be the same
         }
 
@@ -275,7 +314,11 @@ class NixlConnectorScheduler:
             _FORCE_PER_RANK_SEND or self._force_rank_wise_sends
         )
 
+        self.prefix_state = PrefixSchedulerState.create(vllm_config, kv_cache_config)
+
     def shutdown(self):
+        if self.prefix_state is not None:
+            self.prefix_state.shutdown()
         self._stop_event.set()
         if self._scheduler_loop_t is not None:
             self._scheduler_loop_t.join()
@@ -350,7 +393,9 @@ class NixlConnectorScheduler:
         """
         encoded_data: dict[int, bytes] = {}
         decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
-        physical_block_size = self.registered_block_size
+        physical_block_size = getattr(
+            self, "registered_block_size", getattr(self, "block_size", None)
+        )
         for global_rank, rank_metadata in metadata.items():
             if not isinstance(rank_metadata, NixlHandshakePayload):
                 raise ValueError(
@@ -369,7 +414,13 @@ class NixlConnectorScheduler:
                     "blocks per logical KV block; NIXL registers scheduler "
                     "blocks and only supports 1"
                 )
-            if nixl_meta.physical_block_size != physical_block_size:
+            # Hybrid groups carry their own token widths and kernel splits.
+            # EngineCore may change its global prefix-cache width after workers
+            # were spawned; that scalar is not the geometry of every group.
+            if (
+                not getattr(self, "_has_multi_size", False)
+                and nixl_meta.physical_block_size != physical_block_size
+            ):
                 raise ValueError(
                     f"rank {global_rank} block size "
                     f"{nixl_meta.physical_block_size} != {physical_block_size}; "
@@ -513,7 +564,10 @@ class NixlConnectorScheduler:
         # engines must agree on the block size.  Multi-size groups are checked
         # per pointer by the worker handshake (layer_block_tokens_mapping).
         remote_physical_block_size = peer_infos["physical_block_size"]
-        if not self._has_multi_size and remote_physical_block_size != self.block_size:
+        if (
+            not getattr(self, "_has_multi_size", False)
+            and remote_physical_block_size != self.block_size
+        ):
             raise ValueError(
                 f"remote engine {remote_engine_id} block size "
                 f"{remote_physical_block_size} != local block size "
@@ -555,6 +609,8 @@ class NixlConnectorScheduler:
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
+        if self.prefix_state is not None:
+            self.prefix_state.allocated(request, blocks, num_external_tokens)
         params = request.kv_transfer_params
 
         if not params:
@@ -735,6 +791,8 @@ class NixlConnectorScheduler:
             meta.reqs_to_send_time_record = self._reqs_to_send_time_record
             self._reqs_to_send_time_record = {}
 
+        if self.prefix_state is not None:
+            self.prefix_state.add_metadata(meta, scheduler_output, self.peer_node_metas)
         return meta
 
     def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
@@ -748,6 +806,8 @@ class NixlConnectorScheduler:
         worker, so anything outside that set is a completion whose blocks are
         already freed and must not be reported again.
         """
+        if self.prefix_state is not None:
+            self.prefix_state.completed(connector_output)
         finished = connector_output.finished_sending
         if not finished:
             return
@@ -907,15 +967,19 @@ class NixlConnectorScheduler:
         """
         TODO(gyf): add a zmq based to keep alive
         """
+        connect_failures = 0
+        disconnect_failures = 0
         while not self._stop_event.is_set():
             addr = _PROXY_ADDR.replace("tcp://", "")
             host, port = addr.rsplit(":", 1)
+            keepalive_port = int(port) + 1
             # this port is used for keep alive
-            addr = host + ":" + str(int(port) + 1)
+            addr = f"{host}:{keepalive_port}"
+            writer = None
+            connected = False
+            connected_at = 0.0
             try:
-                connected = False
-                reader, writer = await asyncio.open_connection(host, int(port) + 1)
-                connected = True
+                reader, writer = await asyncio.open_connection(host, keepalive_port)
                 writer.write(
                     msgspec.msgpack.encode(
                         (PUT_NODE_META_MSG, self.node_info, metadata)
@@ -923,20 +987,69 @@ class NixlConnectorScheduler:
                 )
                 writer.write(b"info_done\0")
                 await writer.drain()
+                connected = True
+                connected_at = time.monotonic()
+                if connect_failures > 0:
+                    logger.info(
+                        "Connected to proxy keepalive %s after %d retry attempt(s)",
+                        addr,
+                        connect_failures,
+                    )
+                    connect_failures = 0
                 await reader.readexactly(1)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                logger.error("%s", e)
-                logger.error("Cannot connect to: %s(use PORT+1 to keep alive)", addr)
-                await asyncio.sleep(1)
-            finally:
+                if self._stop_event.is_set():
+                    break
                 if connected:
+                    if time.monotonic() - connected_at >= 1.0:
+                        disconnect_failures = 0
+                    disconnect_failures += 1
+                    if disconnect_failures == 1:
+                        logger.warning(
+                            "Proxy keepalive connection to %s closed (%s); "
+                            "reconnecting...",
+                            addr,
+                            e,
+                        )
+                    else:
+                        logger.debug(
+                            "Proxy keepalive connection to %s closed "
+                            "(attempt %d): %s",
+                            addr,
+                            disconnect_failures,
+                            e,
+                        )
+                else:
+                    disconnect_failures = 0
+                    connect_failures += 1
+                    if connect_failures == 1:
+                        logger.warning(
+                            "Cannot connect to: %s(use PORT+1 to keep alive): %s; "
+                            "waiting for proxy...",
+                            addr,
+                            e,
+                        )
+                    else:
+                        logger.debug(
+                            "Cannot connect to: %s(use PORT+1 to keep alive) "
+                            "(attempt %d): %s",
+                            addr,
+                            connect_failures,
+                            e,
+                        )
+                await asyncio.sleep(_KEEPALIVE_RETRY_INTERVAL_S)
+            finally:
+                if writer is not None:
                     writer.close()
-                    await writer.wait_closed()
+                    with suppress(Exception):
+                        await writer.wait_closed()
 
     async def _worker_data_forward(
         self,
     ):
-        """Background thread for pub info to workers."""
+        """Forward peer control messages and ACK router teardown on this loop."""
         # a socket publish infos to workers, tcp://ip:port
         scheduler_addr = self.scheduler_addr
         path = make_zmq_path("tcp", self.local_addr)
@@ -955,28 +1068,176 @@ class NixlConnectorScheduler:
             ) as publish_to_connector,
         ):
             # get sub from worker
-            for _ in range(self.node_info["tp_size"] * self.node_info["pp_size"]):
+            expected_workers = self.node_info["tp_size"] * self.node_info["pp_size"]
+            for _ in range(expected_workers):
                 if await publish_to_connector.recv() != b"\x01":
                     raise RuntimeError(
                         "NIXL handshake listener failed to connect to connector"
                     )
             await publish_to_connector.send(b"READY")
-            recv_from.setsockopt(zmq.RCVTIMEO, 1000)
+            recv_from.setsockopt(zmq.RCVTIMEO, 100)
+            pending: dict[int, dict[str, Any]] = {}
+            completed: dict[int, tuple[str, bytes]] = {}
+
+            async def reply(identity: bytes, payload: bytes) -> None:
+                await recv_from.send_multipart((identity, b"", payload))
+
+            def remember_completed(
+                teardown_id: int, engine_id: str, result: bytes
+            ) -> None:
+                completed[teardown_id] = (engine_id, result)
+                if len(completed) > 4096:
+                    completed.pop(next(iter(completed)))
+
+            async def expire_teardowns() -> None:
+                now = time.monotonic()
+                for teardown_id, state in list(pending.items()):
+                    if now < state["deadline"]:
+                        continue
+                    logger.error(
+                        "NIXL teardown %s timed out for %s: %d/%d worker ACKs",
+                        teardown_id,
+                        state["engine_id"],
+                        len(state["acks"]),
+                        expected_workers,
+                    )
+                    for waiter in state["waiters"]:
+                        await reply(waiter, TEARDOWN_RESULT_FAILED)
+                    remember_completed(
+                        teardown_id, state["engine_id"], TEARDOWN_RESULT_FAILED
+                    )
+                    del pending[teardown_id]
 
             while True:
                 try:
+                    await expire_teardowns()
                     identity, _, data = await recv_from.recv_multipart()
-                    # do not want to decoding the data when get a msg from proxy,
-                    # because scheduler only need "disconnect" msg, a little trick here.
+                    # E25 uses this existing P/D endpoint. State messages are
+                    # handled locally and never published as worker commands.
+                    from vllm_iluvatar.v1.worker.prefill_state.source_state import (
+                        GET_STATE,
+                        serve_state,
+                    )
+
+                    try:
+                        message = msgspec.msgpack.decode(data)
+                    except Exception:
+                        message = None
                     if (
-                        len(data) >= len(DISCONNECT_MSG)
+                        isinstance(message, (tuple, list))
+                        and message
+                        and message[0] == GET_STATE
+                    ):
+                        state_reply, state_payload = serve_state(
+                            self.prefix_state.wire
+                            if self.prefix_state is not None and not self.is_consumer
+                            else None,
+                            self.engine_id,
+                            message,
+                        )
+                        await recv_from.send_multipart(
+                            (
+                                identity,
+                                b"",
+                                msgspec.msgpack.encode(state_reply),
+                                state_payload,
+                            )
+                        )
+                        continue
+
+                    if (
+                        isinstance(message, (tuple, list))
+                        and len(message) >= 2
+                        and message[0] == TEARDOWN_COMPLETE_MSG
+                    ):
+                        (
+                            remote_engine_id,
+                            _generation,
+                            teardown_id,
+                            rank,
+                            status,
+                        ) = message[1]
+                        await reply(identity, b"")
+                        state = pending.get(int(teardown_id))
+                        if (
+                            state is None
+                            or state["engine_id"] != remote_engine_id
+                            or not 0 <= int(rank) < expected_workers
+                        ):
+                            continue
+                        state["acks"][int(rank)] = str(status)
+                        logger.info(
+                            "NIXL teardown ACK id=%s engine=%s rank=%s "
+                            "status=%s (%d/%d)",
+                            teardown_id,
+                            remote_engine_id,
+                            rank,
+                            status,
+                            len(state["acks"]),
+                            expected_workers,
+                        )
+                        if len(state["acks"]) >= expected_workers:
+                            result = (
+                                TEARDOWN_RESULT_OK
+                                if all(item == "closed" for item in state["acks"].values())
+                                else TEARDOWN_RESULT_FAILED
+                            )
+                            for waiter in state["waiters"]:
+                                await reply(waiter, result)
+                            remember_completed(
+                                int(teardown_id), remote_engine_id, result
+                            )
+                            del pending[int(teardown_id)]
+                        continue
+
+                    if (
+                        isinstance(message, (tuple, list))
+                        and message
+                        and message[0] == "disconnect"
+                    ):
+                        remote_engine_id, teardown_id = parse_disconnect_payload(
+                            message[1] if len(message) > 1 else ""
+                        )
+                        self.send_to_peer_infos.put_nowait((remote_engine_id, None))
+                        await publish_to_connector.send(data)
+                        if teardown_id == 0:
+                            await reply(identity, b"")
+                            continue
+                        if teardown_id in completed:
+                            completed_engine, result = completed[teardown_id]
+                            await reply(
+                                identity,
+                                result
+                                if completed_engine == remote_engine_id
+                                else TEARDOWN_RESULT_FAILED,
+                            )
+                            continue
+                        state = pending.setdefault(
+                            teardown_id,
+                            {
+                                "engine_id": remote_engine_id,
+                                "acks": {},
+                                "waiters": [],
+                                "deadline": time.monotonic() + self._teardown_timeout,
+                            },
+                        )
+                        if state["engine_id"] != remote_engine_id:
+                            await reply(identity, TEARDOWN_RESULT_FAILED)
+                            continue
+                        state["waiters"].append(identity)
+                        continue
+
+                    # Prefix match covers a raw disconnect that failed decode.
+                    if (
+                        message is None
+                        and len(data) >= len(DISCONNECT_MSG)
                         and data[: len(DISCONNECT_MSG)] == DISCONNECT_MSG
                     ):
-                        _, remote_engine_id = msgspec.msgpack.decode(data)
-                        self.send_to_peer_infos.put_nowait((remote_engine_id, None))
-                    await recv_from.send_multipart((identity, b"", b""))
+                        self.send_to_peer_infos.put_nowait(("", None))
+                    await reply(identity, b"")
                     await publish_to_connector.send(data)
                 except zmq.Again:
+                    await expire_teardowns()
                     if self._stop_event.is_set():
                         break
                     continue

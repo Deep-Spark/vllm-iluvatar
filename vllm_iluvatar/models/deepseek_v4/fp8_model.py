@@ -107,6 +107,7 @@ from vllm.utils.math_utils import cdiv
 
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
     IluFusedMoEEP,
+    _DS4_DECODE_EP_BACKEND,
 )
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.ilu_compressed_tensors_moe_w4a8_int8 import (
     IluCompressedTensorsW4A8Int8MoEMethod,
@@ -332,6 +333,7 @@ class IluDeepseekV4Fp8MoE(nn.Module, IluFusedMoEEP):
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
 
+        self.prefix = prefix
         self.tp_size = get_tensor_model_parallel_world_size()
 
         self.hidden_size = config.hidden_size
@@ -452,7 +454,14 @@ class IluDeepseekV4Fp8MoE(nn.Module, IluFusedMoEEP):
         self._use_ilu_w4a8_ep = isinstance(
             method, IluCompressedTensorsW4A8Int8MoEMethod
         )
-        if self._use_ilu_w4a8_ep:
+        # The 0.31 runner owns the normal path; explicitly opt decode into LL.
+        self._ilu_decode_ll = (
+            not self._use_ilu_w4a8_ep
+            and hasattr(method, "select_gemm_impl")
+            and _DS4_DECODE_EP_BACKEND == "deepep_low_latency"
+            and self._should_use_forward_dp_ep()
+        )
+        if self._use_ilu_w4a8_ep or self._ilu_decode_ll:
             self.init_ep()
 
     def forward(
@@ -472,15 +481,19 @@ class IluDeepseekV4Fp8MoE(nn.Module, IluFusedMoEEP):
         ``router_logits`` is a placeholder (``hidden_states``) and the real
         gate GEMM runs inside the runner (see ``MoERunner._forward_impl``).
         The community dropped the ``is_internal_router`` branch, so it is
-        dropped here too.
+        dropped here too. An explicit LL decode override uses the existing
+        EP helper; prefill stays on this runner.
         """
         if self.gate.tid2eid is not None:
             if input_ids is None:
                 raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
             input_ids = input_ids.to(dtype=self.hash_indices_dtype)
 
+        if getattr(self, "_ilu_decode_ll", False) and self._is_all_ranks_decode_only():
+            return self.forward_dp_ep_deep_ep(hidden_states, input_ids)
+
         org_shape = hidden_states.shape
-        if self._use_ilu_w4a8_ep and self._should_use_forward_dp_ep():
+        if getattr(self, "_use_ilu_w4a8_ep", False) and self._should_use_forward_dp_ep():
             return self.forward_dp_ep(hidden_states, input_ids).view(org_shape)
         final_hidden_states = self.experts(
             hidden_states=hidden_states,

@@ -200,6 +200,38 @@ def _is_terminal_xfer_query_error(error: BaseException) -> bool:
     return "NIXL_ERR_" in str(error).upper()
 
 
+def _rank_nixl_devices() -> str | None:
+    """The RDMA devices this rank may use, from ``VLLM_NIXL_DEVICE_MAPPING``.
+
+    The mapping is ``gpu:dev[, dev]*`` entries joined by ``;``, keyed by the
+    index a rank sees after ``CUDA_VISIBLE_DEVICES`` is applied.  UCX reads
+    ``UCX_NET_DEVICES`` once per process, so every rank of a pipeline- or
+    data-parallel engine would otherwise open queue pairs on all of them;
+    naming the device per rank is what holds a rank to the NIC its GPU sits
+    behind.
+
+    Device names carry no port suffix, NIXL appends ``:1`` itself, and NIXL
+    splits the list on ", ", so the space after each comma is required.
+    """
+    mapping = os.environ.get("VLLM_NIXL_DEVICE_MAPPING", "").strip()
+    if not mapping:
+        return None
+    devices: dict[int, str] = {}
+    for entry in mapping.split(";"):
+        if not entry.strip():
+            continue
+        gpu, _, names = entry.partition(":")
+        devices[int(gpu)] = names.strip()
+    index = torch.cuda.current_device()
+    if index not in devices:
+        raise RuntimeError(
+            f"VLLM_NIXL_DEVICE_MAPPING covers GPUs {sorted(devices)}, but this "
+            f"rank runs on local GPU {index}: {mapping!r}"
+        )
+    logger.info("NIXL on local GPU %d uses RDMA device(s) %s", index, devices[index])
+    return devices[index]
+
+
 class NixlConnectorWorker:
     """Implementation of Worker side methods"""
 
@@ -238,8 +270,14 @@ class NixlConnectorWorker:
         num_threads = vllm_config.kv_transfer_config.get_from_extra_config(
             "num_threads", 4
         )
+        device_list = _rank_nixl_devices()
         if nixl_agent_config is None:
             config = None
+        elif device_list is not None:
+            # The UCX backend is built by hand below so it can be told which
+            # NIC to use; an agent that builds it itself takes every device UCX
+            # can see.
+            config = nixl_agent_config(backends=[], capture_telemetry=True)
         else:
             # Enable telemetry by default for NIXL 0.7.1 and above.
             config = (
@@ -283,6 +321,14 @@ class NixlConnectorWorker:
             self.nixl_memory_type = "DRAM"
 
         self.nixl_wrapper = nixl_wrapper_cls(str(uuid.uuid4()), config)
+        if device_list is not None:
+            # num_threads normally reaches UCX through the agent config; with no
+            # backend left there for it to apply to, it has to be repeated here.
+            self.nixl_wrapper.create_backend(
+                "UCX", {"device_list": device_list, "num_threads": str(num_threads)}
+            )
+            for backend in non_ucx_backends:
+                self.nixl_wrapper.create_backend(backend, {})
         # Map of engine_id -> [remote_agent0, remote_agent1, ...]
         self._remote_agents: dict[EngineId, list[str]] = {}
         # Local dlist layout (tuple of regions) -> prepped handle.  Shared by

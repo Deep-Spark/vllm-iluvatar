@@ -2850,11 +2850,11 @@ class NixlConnectorWorker:
                     )
                     continue
                 if req_id in self._sends_still_progressing:
-                    # Queued, prefilling, or handed to a worker: this engine is
-                    # still going to serve it, and its own scheduler keeps
-                    # answering the consumer's probes with ALIVE.  Reclaiming
-                    # here would contradict that answer and drop a healthy
-                    # request whose only fault is a deep prefill queue.
+                    # Queued or still prefilling: this engine is still going
+                    # to serve it, and its own scheduler keeps answering the
+                    # consumer's probes with ALIVE.  Reclaiming here would
+                    # contradict that answer and drop a healthy request whose
+                    # only fault is a deep prefill queue.
                     state.deadline = now + self.producer_orphan_timeout
                     logger.info(
                         "Producer send %s generation %s is unjoined but still "

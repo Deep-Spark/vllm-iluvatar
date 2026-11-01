@@ -274,10 +274,10 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         # D-side release proofs returned by P after every native WRITE is
         # terminal, or after P tombstones a request before any WRITE starts.
         self.reqs_to_release: dict[ReqId, tuple[str, str]] = {}
-        # P-side: requests this engine still intends to serve, i.e. queued,
-        # prefilling, or already handed to a worker.  The worker's orphan
-        # reclaim runs on its own clock and cannot see the scheduler queues,
-        # so it needs this to tell a stalled send from an abandoned one.
+        # P-side: requests this engine still intends to prefill, i.e. queued
+        # or prefilling.  The worker's orphan reclaim runs on its own clock and
+        # cannot see the scheduler queues, so it needs this to tell a stalled
+        # send from an abandoned one.
         self.sends_still_progressing: set[ReqId] = set()
 
     def _add_new_req(

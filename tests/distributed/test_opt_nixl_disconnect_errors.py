@@ -2019,6 +2019,76 @@ def test_producer_stops_vouching_once_the_request_finishes() -> None:
     assert _probe(scheduler) == OWNERSHIP_RESULT_UNKNOWN
 
 
+def _finishing_producer() -> NixlConnectorScheduler:
+    scheduler = _probe_producer()
+    scheduler.mm_replay = None
+    scheduler._reqs_blocks = {}
+    scheduler._sends_completed_early = set()
+    scheduler._sends_awaiting_release = set()
+    return scheduler
+
+
+def _aborted_send_request() -> SimpleNamespace:
+    from vllm.v1.request import RequestStatus
+
+    # update_state_after_alloc cleared do_remote_decode at the first chunk.
+    return SimpleNamespace(
+        request_id="req",
+        status=RequestStatus.FINISHED_ABORTED,
+        kv_transfer_params={"do_remote_decode": False},
+    )
+
+
+def test_producer_abort_before_handoff_frees_blocks_now() -> None:
+    # The router cut a 1M-token prefill mid-way: no worker was ever handed the
+    # send, so no completion it reports is accepted later, and a delayed free
+    # pinned these blocks until the engine restarted.
+    scheduler = _finishing_producer()
+    request = _aborted_send_request()
+    scheduler._live_send_reqs.add("req")
+    scheduler._reqs_to_send["req"] = (1024, False, "decode-0", "generation-1")
+    scheduler._reqs_blocks["req"] = [[1, 2]]
+
+    delay_free, _params = scheduler.request_finished_all_groups(request, ([1, 2],))
+
+    assert delay_free is False
+    assert "req" not in scheduler._reqs_to_send
+    assert "req" not in scheduler._reqs_blocks
+    assert _probe(scheduler) == OWNERSHIP_RESULT_UNKNOWN
+
+
+def test_producer_abort_after_handoff_still_waits_for_the_worker() -> None:
+    # The final chunk was scheduled, so a WRITE may still read these blocks.
+    scheduler = _finishing_producer()
+    request = _aborted_send_request()
+    scheduler._pending_worker_sends.add("req")
+
+    delay_free, _params = scheduler.request_finished_all_groups(request, ([1, 2],))
+
+    assert delay_free is True
+    assert scheduler._sends_awaiting_release == {"req"}
+
+
+def test_worker_may_reclaim_a_handed_off_send_after_its_request_finished() -> None:
+    scheduler = _probe_producer()
+    scheduler.prefix_state = None
+    scheduler._reqs_to_send_time_record = {}
+    scheduler._live_send_reqs.add("queued")
+    scheduler._reqs_to_send["prefilling"] = (1, False, "decode-0", "generation-1")
+    scheduler._pending_worker_sends.add("handed-off")
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[], resumed_req_ids=set()),
+        num_scheduled_tokens={},
+    )
+
+    meta = scheduler.build_connector_meta(scheduler_output)
+
+    # Only the consumer can still join "handed-off"; producer_orphan_timeout
+    # bounds that wait instead of extending it forever.
+    assert meta.sends_still_progressing == {"queued", "prefilling"}
+
+
 def test_probe_round_trip_over_the_side_channel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1308,13 +1308,14 @@ class NixlConnectorScheduler:
 
             meta.reqs_to_send_time_record = self._reqs_to_send_time_record
             self._reqs_to_send_time_record = {}
-            # Same truth this scheduler reports to the consumer's ownership
-            # probes.  Without it the worker reclaims sends for requests this
-            # engine is still going to serve, while the scheduler keeps
-            # answering those probes with ALIVE.
+            # Without it the worker reclaims sends for requests this engine is
+            # still going to prefill, while the scheduler keeps answering the
+            # consumer's ownership probes with ALIVE.  _pending_worker_sends
+            # stays out: once its request finished, only the consumer can
+            # still join a handed-off send, and producer_orphan_timeout is
+            # what bounds that wait.
             meta.sends_still_progressing = set(self._live_send_reqs)
             meta.sends_still_progressing.update(self._reqs_to_send)
-            meta.sends_still_progressing.update(self._pending_worker_sends)
 
         if self.prefix_state is not None:
             self.prefix_state.add_metadata(meta, scheduler_output, self.peer_node_metas)
@@ -1546,6 +1547,19 @@ class NixlConnectorScheduler:
                 and params.get("do_remote_decode") is not None
             ):
                 assert not params.get("do_remote_decode")
+                if request.request_id not in self._pending_worker_sends:
+                    # Aborted before the final chunk handed the send to a
+                    # worker.  update_connector_output drops completions for
+                    # sends it is not waiting on, so delaying the free here
+                    # would pin these blocks for the engine's lifetime.
+                    logger.info(
+                        "NIXL freeing blocks of %s now: aborted before its send "
+                        "reached a worker",
+                        request.request_id,
+                    )
+                    self._reqs_to_send.pop(request.request_id, None)
+                    self._reqs_blocks.pop(request.request_id, None)
+                    return False, None
                 # for P, when P send info to worker then aborted, all we can do is wait kv write(may write) done
                 self._await_send_release(request.request_id)
                 return True, {}

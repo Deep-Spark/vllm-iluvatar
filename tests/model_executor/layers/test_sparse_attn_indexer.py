@@ -74,6 +74,67 @@ def test_int8_query_scores_with_ixinfer(monkeypatch):
     assert torch.equal(calls[0][1]["valid_lens"], ke - ks)
 
 
+@pytest.mark.parametrize("legacy_env", [None, "ixformer_native", "ixinfer"])
+def test_fp8_score_delegates_selection_to_registry(monkeypatch, legacy_env):
+    sparse_attn_indexer = _load_sparse_attn_indexer(monkeypatch)
+    if legacy_env is None:
+        monkeypatch.delenv("VLLM_ILU_V41_FP8_INDEXER_BACKEND", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_ILU_V41_FP8_INDEXER_BACKEND", legacy_env)
+    calls = []
+
+    def fp8(*args, **kwargs):
+        calls.append(kwargs)
+        return "fp8"
+
+    monkeypatch.setattr(
+        sparse_attn_indexer.ixfops,
+        "dsa_indexer_mqa_logits_with_kvcache_fp8",
+        fp8,
+        raising=False,
+    )
+    q = torch.empty((2, 32, 128), dtype=torch.float8_e4m3fn)
+    result = sparse_attn_indexer._mqa_logits(
+        q,
+        torch.empty(2, dtype=torch.int32),
+        torch.empty(2, dtype=torch.int32),
+        torch.empty((1, 64, 132), dtype=torch.uint8),
+        torch.empty((1, 1), dtype=torch.int32),
+        torch.empty((2, 32)),
+        valid_lens=torch.tensor([1, 2], dtype=torch.int32),
+        context_lower_bound=1,
+    )
+    assert result == "fp8"
+    assert "backend" not in calls[0]
+    assert calls[0]["context_lower_bound"] == 1
+
+
+def test_bf16_score_keeps_original_backend_selection(monkeypatch):
+    sparse_attn_indexer = _load_sparse_attn_indexer(monkeypatch)
+    monkeypatch.setattr(
+        sparse_attn_indexer.envs, "VLLM_ILU_GLM_DSA_NATIVE_MQA_LOGITS", False
+    )
+    calls = []
+
+    def bf16(*args, **kwargs):
+        calls.append(kwargs)
+        return "bf16"
+
+    monkeypatch.setattr(
+        sparse_attn_indexer.ixfops, "dsa_indexer_mqa_logits_with_kvcache", bf16
+    )
+    result = sparse_attn_indexer._mqa_logits(
+        torch.empty((1, 64, 128), dtype=torch.bfloat16),
+        torch.empty(2, dtype=torch.int32),
+        torch.empty(2, dtype=torch.int32),
+        torch.empty((1, 64, 128), dtype=torch.bfloat16),
+        torch.empty((1, 1), dtype=torch.int32),
+        torch.empty((1, 64)),
+    )
+    assert result == "bf16"
+    assert "backend" not in calls[0]
+
+
 def test_sparse_attn_indexer_package_is_auto_discovered():
     assert "vllm_iluvatar.model_executor.layers" in ilu_register._OOT_OP_PACKAGES
 

@@ -86,6 +86,77 @@ _HYV4_DSA_FP8_CACHE_DTYPES = ("fp8", "fp8_e4m3")
 _MLA_KV_FUSE_LOGGED = False
 
 
+def apply_qk_rope(
+    rotary_emb: nn.Module,
+    positions: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_pe: torch.Tensor,
+    mrope_emb: nn.Module | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate MLA q/k.
+
+    ``q_pe`` is ``[tokens, heads, rope]`` and ``k_pe`` is ``[tokens, 1, rope]``
+    or ``[tokens, rope]``. Three-row positions always use M-RoPE, including
+    text with identical rows. Selecting by device values would synchronize
+    during CUDA Graph capture and freeze the choice across replay. The M-RoPE
+    kernel reads ``[tokens, heads * rope]``; its 1-D flash-attn path is unused.
+    """
+    if positions.ndim == 2:
+        if positions.shape[0] != 3 or mrope_emb is None:
+            raise ValueError(
+                "HYV4 2-D positions require three rows and an M-RoPE module"
+            )
+        q_out, k_out = mrope_emb(
+            positions,
+            # M-RoPE rotates these buffers in place. A reshape may alias the
+            # original slices (especially a one-token K), and its returned
+            # view can have different singleton strides. The caller copies
+            # results back into q/k; independent buffers avoid overlapping
+            # copy_ and keep this contract valid for prefill and decode.
+            q_pe.reshape(q_pe.shape[0], -1).clone(),
+            k_pe.reshape(k_pe.shape[0], -1).clone(),
+        )
+        return q_out.reshape(q_pe.shape), k_out.reshape(k_pe.shape)
+    return rotary_emb(positions, q_pe, k_pe)
+
+
+def build_hy4_ropes(
+    head_size: int,
+    max_position: int,
+    rope_parameters: dict | None,
+    *,
+    is_neox_style: bool = False,
+) -> tuple[nn.Module, nn.Module | None]:
+    """1-D Iluvatar RoPE, plus M-RoPE when the checkpoint asks for it.
+
+    ``mrope_section`` stays on the HF config so the runner supplies 3-row
+    positions. It is removed from the 1-D module: ``MRotaryEmbedding``'s 1-D
+    path imports flash-attn, which is not available here.
+    """
+    params = dict(rope_parameters or {})
+    section = params.pop("mrope_section", None)
+    interleaved = bool(params.pop("mrope_interleaved", False))
+    rotary = get_rope(
+        head_size,
+        max_position=max_position,
+        rope_parameters=params,
+        is_neox_style=is_neox_style,
+    )
+    mrope = None
+    if section:
+        mrope = get_rope(
+            head_size,
+            max_position=max_position,
+            rope_parameters={
+                **params,
+                "mrope_section": section,
+                "mrope_interleaved": interleaved,
+            },
+            is_neox_style=is_neox_style,
+        )
+    return rotary, mrope
+
+
 @lru_cache(maxsize=4)
 def _load_hyv4_fp8_kv_scale_table(path: str) -> dict[str, float]:
     with open(path, encoding="utf-8") as f:
@@ -181,6 +252,25 @@ def _quant_per_out_channel(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
     return q, padded
 
 
+def indexer_fused_quant_config(quant_config, prefix):
+    """Expose the BF16 assembled wk/weights_proj to the runtime resolver.
+
+    Mixed checkpoints dequantize wk before loading shard 0, while shard 1 is
+    BF16. Keep that existing assembly contract, including MTP, and let only an
+    explicit runtime group quantize the fully assembled fused parameter. The
+    shared target/draft quant config and their other dispatches stay unchanged.
+    """
+    from vllm_iluvatar.model_executor.layers.quantization.fp8 import IluFp8Config
+
+    if not isinstance(quant_config, IluFp8Config):
+        return None
+    fused_config = copy.copy(quant_config)
+    fused_config.ignored_layers = list(quant_config.ignored_layers) + [
+        f"{prefix}.wk_weights_proj"
+    ]
+    return fused_config
+
+
 class HYV4MLAAttentionLayer(MLAAttention):
     """Community MLA layer with HYV4's physical 640-byte fp8 cache spec."""
 
@@ -224,6 +314,16 @@ class HYV4MLAAttentionLayer(MLAAttention):
             facade_cache_config.cache_dtype = "auto"
             kwargs["cache_config"] = facade_cache_config
         super().__init__(*args, **kwargs)
+        # FP8 absorb is the default for HY4's all-sparse-MQA path. Keep the
+        # community BF16 implementation for execution modes it cannot serve.
+        self.fp8_k_up = (
+            self.impl.is_sparse
+            and self.impl.dcp_world_size == 1
+            and not self.use_pcp
+            and self._vllm_config.attention_config.sparse_mla_force_mqa
+        )
+        self.W_UK_FP8: torch.Tensor | None = None
+        self.W_UK_FP8_S: torch.Tensor | None = None
         if self.use_hyv4_fp8_attn:
             self._k_scale.fill_(init_scale)
             self._non_persistent_buffers_set.add("_k_scale")
@@ -245,19 +345,137 @@ class HYV4MLAAttentionLayer(MLAAttention):
         self.gated_rows = 0
 
     # [ILU override] MLAAttention.process_weights_after_loading — delta: keep an
-    # FP8 copy of the absorbed v-up weight, laid out for the gated up-proj ops.
-    # ``W_UK_T`` is left alone: the k-up bmm is inlined in the community
-    # ``forward_impl`` with no hook to replace it (see 2.1-实现记录.md §7).
-    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
-        super().process_weights_after_loading(act_dtype)
-        if not self.fuse_v_up:
+    # FP8 absorbed weights, laid out with scales on the output channel axis.
+    def _dequant_per_channel_kv_b(self, act_dtype: torch.dtype) -> None:
+        """Undo the Iluvatar block->per-channel requant before MLA absorbs kv_b.
+
+        ``IluFp8BlockScaledMMKernel`` replaces the 128x128 ``weight_scale_inv``
+        with a fp32 ``[N]`` channel scale. Community ``MLAAttention`` then
+        dequantizes with ``group_shape=(128, 128)`` and rejects that 1D scale.
+        Materialize BF16 and drop the quant method so the absorb sees a plain
+        weight. BF16 ``kv_b_proj`` (no channel scale) is left untouched.
+        """
+        layer = self.kv_b_proj
+        while hasattr(layer, "base_layer") and hasattr(
+            layer.base_layer, "quant_method"
+        ):
+            layer = layer.base_layer
+        weight = getattr(layer, "weight", None)
+        if weight is None or weight.dtype != torch.float8_e4m3fn:
             return
-        # Community layout is ``W_UV[N, L, V]``; both ops want ``[G, D, R]``
-        # with the scale on the output axis D, i.e. D=V, R=L.
-        self.W_UV_FP8, self.W_UV_FP8_S = _quant_per_out_channel(
-            self.W_UV.transpose(1, 2)
-        )
-        self.W_UV = None  # ~0.5 GB/rank; the FP8 copy is the only consumer now
+        scale = getattr(layer, "weight_scale_inv", None)
+        if scale is None:
+            scale = getattr(layer, "weight_scale", None)
+        if (
+            scale is None
+            or scale.ndim != 1
+            or scale.shape[0] != weight.shape[0]
+            or scale.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        ):
+            return
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+        from vllm.model_executor.utils import replace_parameter
+
+        bf16 = (weight.to(act_dtype) * scale.to(act_dtype).unsqueeze(-1)).contiguous()
+        replace_parameter(layer, "weight", bf16)
+        layer.quant_method = UnquantizedLinearMethod()
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        self._dequant_per_channel_kv_b(act_dtype)
+        super().process_weights_after_loading(act_dtype)
+        if self.fp8_k_up:
+            # Community W_UK_T is [H, nope, latent]. GLM grouped einsum
+            # consumes [H, latent, nope] with scales [H, latent].
+            self.W_UK_FP8, self.W_UK_FP8_S = _quant_per_out_channel(
+                self.W_UK_T.transpose(1, 2)
+            )
+            self.W_UK_T = None
+        if self.fuse_v_up:
+            # Community W_UV[N, L, V] -> [G, D=V, R=L], scale per D.
+            self.W_UV_FP8, self.W_UV_FP8_S = _quant_per_out_channel(
+                self.W_UV.transpose(1, 2)
+            )
+            self.W_UV = None
+        if self.fp8_k_up or self.fuse_v_up:
+            logger.info(
+                "HYV4 absorbed projection ready: layer=%s K=%s V=%s gate_fused=%s",
+                self.layer_name,
+                tuple(self.W_UK_FP8.shape) if self.fp8_k_up else "BF16",
+                tuple(self.W_UV_FP8.shape) if self.fuse_v_up else "BF16",
+                self.fuse_gate,
+            )
+
+    def _k_up_proj(self, q_nope: torch.Tensor) -> torch.Tensor:
+        """Absorb K into Q using GLM's existing FP8 grouped GEMM contract."""
+        ops = _ixf_functions()
+        a, a_s = ops.fp8_grouped_per_token_quant(q_nope, self.num_heads)
+        return ops.fp8_per_channel_einsum(a, self.W_UK_FP8, a_s, self.W_UK_FP8_S)
+
+    def forward_impl(
+        self,
+        q,
+        k_c_normed,
+        k_pe,
+        kv_cache,
+        attn_metadata,
+        output,
+        output_scale=None,
+        output_block_scale=None,
+        quant_group_size=None,
+        quant_scale_ue8m0=None,
+        quant_col_major=None,
+        quant_tma_aligned=None,
+        q_dcp_replicated=None,
+    ):
+        """HY4's all-MQA FP8 absorb path; cache insertion remains in vLLM.
+
+        Corresponds to MLAAttention.forward_impl at community 341bf7d4.
+        The baseline inlines BF16 K-up BMM without an override hook. This
+        model-owned path retains HY4's sink-aware backend and existing V-up
+        hook, consuming only real tokens from graph-padded inputs. DCP/PCP
+        and dense MHA retain the original BF16 path, selected at construction.
+        Output quantization fusion is not
+        supported here: HY4 applies its gate before the following Linear.
+        """
+        if not self.fp8_k_up:
+            return super().forward_impl(
+                q,
+                k_c_normed,
+                k_pe,
+                kv_cache,
+                attn_metadata,
+                output,
+                output_scale,
+                output_block_scale,
+                quant_group_size,
+                quant_scale_ue8m0,
+                quant_col_major,
+                quant_tma_aligned,
+                q_dcp_replicated,
+            )
+        if (
+            output.dtype != q.dtype
+            or output_scale is not None
+            or output_block_scale is not None
+            or q_dcp_replicated is not None
+        ):
+            raise ValueError("HYV4 FP8 K-up requires unquantized, local-head output")
+        if attn_metadata is None:
+            # Profile/warmup contains no real KV or query. In particular DP
+            # dummy ranks must not route uninitialized attention outputs.
+            return output.zero_()
+        n = attn_metadata.num_actual_tokens
+        if n:
+            q_nope, q_pe = q[:n].split(
+                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
+            q_latent = self._k_up_proj(q_nope)
+            attn_out, _ = self.impl.forward_mqa(
+                (q_latent, q_pe), kv_cache, attn_metadata, self
+            )
+            self._v_up_proj(attn_out, out=output[:n])
+        output[n:].zero_()
+        return output
 
     # [ILU override] MLAAttention._v_up_proj — delta: FP8 instead of a BF16 bmm,
     # plus HY4's elementwise output gate folded into the store so the layer no
@@ -364,6 +582,34 @@ def compute_skip_topk_layers(config: PretrainedConfig) -> set[int]:
     return skip_layers
 
 
+def hyv4_layer_skip_topk(config: PretrainedConfig, layer_id: int) -> bool:
+    """Whether ``layer_id`` reads a previous full layer's top-k buffer.
+
+    This is the same predicate as ``HYV4MLAAttention.skip_topk``. ``HYV4Model``
+    uses it to choose which pipeline-stage boundaries carry the buffer, so the
+    two must stay identical: a mismatch makes the send and recv key sets differ
+    and the pipeline hangs.
+
+    MTP draft layers (``layer_id >= num_hidden_layers``) always return False.
+    They build their own indexer. ``compute_skip_topk_layers`` only covers
+    backbone layers, and returning True here would make a stage try to read a
+    buffer the draft never receives.
+    """
+    num_hidden_layers = getattr(config, "num_hidden_layers", None)
+    if num_hidden_layers is not None and layer_id >= num_hidden_layers:
+        return False
+    if not hasattr(config, "index_topk"):
+        return False
+    layer_types = getattr(config, "layer_types", None)
+    if (
+        layer_types is None
+        or not (0 <= layer_id < len(layer_types))
+        or layer_types[layer_id] not in _SPARSE_LAYER_TYPES
+    ):
+        return False
+    return layer_id in compute_skip_topk_layers(config)
+
+
 def is_skip_topk_indexer_weight(weight_name: str, skip_topk_layers: set[int]) -> bool:
     """Return whether an indexer weight belongs to a top-k sharing layer.
 
@@ -415,12 +661,13 @@ class Indexer(nn.Module):
         )
         # Fused wk + weights_proj: single GEMM producing [head_dim + n_head].
         # Quantized wk weights are upcast to BF16 while loading to keep the
-        # fusion (see ``weight_utils.try_load_quantized_indexer_wk``).
+        # fusion (see ``weight_utils.try_load_quantized_indexer_wk``). An
+        # explicit runtime group may quantize after both shards are assembled.
         self.wk_weights_proj = MergedColumnParallelLinear(
             hidden_size,
             [self.head_dim, self.n_head],
             bias=False,
-            quant_config=None,
+            quant_config=indexer_fused_quant_config(quant_config, prefix),
             disable_tp=True,
             prefix=f"{prefix}.wk_weights_proj",
         )
@@ -516,7 +763,9 @@ class Indexer(nn.Module):
         q_pe = q[..., nope_dim:]
         # ``k_pe`` is [num_tokens, 1, rope_dim] (MQA).
         k_pe = k[:, nope_dim:].unsqueeze(1)
-        q_pe_out, k_pe_out = rotary_emb(positions, q_pe, k_pe)
+        q_pe_out, k_pe_out = apply_qk_rope(
+            rotary_emb, positions, q_pe, k_pe, getattr(self, "mrope_emb", None)
+        )
         if q_pe_out is not q_pe:
             # The CustomOp fallback (``forward_native``) returns fresh tensors
             # instead of rotating in place, so copy them back.
@@ -586,9 +835,7 @@ class HYV4MLAAttention(nn.Module):
             and layer_types[self.layer_id] in _SPARSE_LAYER_TYPES
         )
         # Only actual sparse layers may share another layer's top-k indices.
-        self.skip_topk = requested_sparse and self.layer_id in compute_skip_topk_layers(
-            config
-        )
+        self.skip_topk = hyv4_layer_skip_topk(config, self.layer_id)
         # The skip pattern only governs backbone layers. MTP/nextn layers
         # (layer_id >= num_hidden_layers) always build a full indexer: they
         # compute indices at draft step 0 and toggle at runtime.
@@ -687,13 +934,13 @@ class HYV4MLAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
-        self.rotary_emb = get_rope(
+        self.rotary_emb, self.mrope_emb = build_hy4_ropes(
             qk_rope_head_dim,
-            max_position=max_position_embeddings,
-            rope_parameters=config.rope_parameters,
-            is_neox_style=False,
+            max_position_embeddings,
+            config.rope_parameters,
         )
         self.indexer_rope_emb: nn.Module | None
+        self.indexer_mrope_emb: nn.Module | None
         self.indexer: Indexer | None
         if self.create_indexer:
             # The checkpoint stores indexer q_pe/k_pe in interleaved
@@ -701,11 +948,10 @@ class HYV4MLAAttention(nn.Module):
             # (is_neox_style=False) like the main attention path. Using NeoX
             # here loses the relative-position dependence and corrupts the DSA
             # top-k selection.
-            self.indexer_rope_emb = get_rope(
+            self.indexer_rope_emb, self.indexer_mrope_emb = build_hy4_ropes(
                 qk_rope_head_dim,
-                max_position=max_position_embeddings,
-                rope_parameters=config.rope_parameters,
-                is_neox_style=False,
+                max_position_embeddings,
+                config.rope_parameters,
             )
             # The indexer projects its queries from the MLA q_lora activations,
             # so a sparse layer requires a query down-projection.
@@ -722,8 +968,10 @@ class HYV4MLAAttention(nn.Module):
                 topk_indices_buffer,
                 f"{prefix}.indexer",
             )
+            self.indexer.mrope_emb = self.indexer_mrope_emb
         else:
             self.indexer_rope_emb = None
+            self.indexer_mrope_emb = None
             self.indexer = None
 
         self.gated_mla = bool(getattr(config, "gated_mla", False))
@@ -990,7 +1238,9 @@ class HYV4MLAAttention(nn.Module):
             return kv_c
         kv_c_normed = self.kv_a_layernorm(kv_c)
         q_pe = q[..., self.qk_nope_head_dim :]
-        q_out, k_out = self.rotary_emb(positions, q_pe, k_pe)
+        q_out, k_out = apply_qk_rope(
+            self.rotary_emb, positions, q_pe, k_pe, self.mrope_emb
+        )
         if q_out is not q_pe:
             q_pe.copy_(q_out.reshape(q_pe.shape))
             k_pe.copy_(k_out.reshape(k_pe.shape))
@@ -1008,6 +1258,11 @@ class HYV4MLAAttention(nn.Module):
             return False
         impl = getattr(self.mla_attn, "impl", None)
         if impl is None or not getattr(impl, "use_fp8_attn", False):
+            return False
+        # Under PCP the community MLAAttention layer gathers kv_c/k_pe across
+        # ranks before do_kv_cache_update. This fused insert bypasses that path,
+        # so it would cache only the local shard. Let the gather path run.
+        if getattr(impl, "pcp_world_size", 1) > 1:
             return False
         if not getattr(impl, "_fp8_kv_scale_frozen", False):
             return False
@@ -1033,6 +1288,10 @@ class HYV4MLAAttention(nn.Module):
             return False
         n = q.shape[0]
         slots = slots.reshape(-1)
+        # The fused insert consumes a 1-D table; use the M-RoPE path for all
+        # three-row inputs without inspecting device values during capture.
+        if positions.ndim == 2:
+            return False
         pos = positions.reshape(-1)
         if slots.numel() < n or pos.numel() < n or kv_c.shape[0] < n:
             return False

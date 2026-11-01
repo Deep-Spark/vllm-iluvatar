@@ -70,14 +70,18 @@ def _remap_mtp_quant_exclusions(
 
     extra: list[str] = []
     for offset in range(num_mtp_layers):
-        source_prefix = f"model.mtp_layers.{offset}."
+        # The VL target rewrites ``model.`` to ``language_model.model.`` on the
+        # shared quant config before the draft is built, so the checkpoint
+        # prefix may already be ``language_model.model.mtp_layers.<i>.``.
+        marker = f"mtp_layers.{offset}."
         draft_prefix = f"model.layers.{mtp_start_layer_idx + offset}."
         for pattern in patterns:
             stripped = pattern.rstrip("*")
-            if not stripped.startswith(source_prefix):
+            idx = stripped.find(marker)
+            if idx < 0:
                 continue
             trailing_stars = pattern[len(stripped) :]
-            extra.append(draft_prefix + stripped[len(source_prefix) :] + trailing_stars)
+            extra.append(draft_prefix + stripped[idx + len(marker) :] + trailing_stars)
     if not extra:
         return quant_config
 
@@ -126,6 +130,34 @@ class HYV4MTPDecoderLayer(HYV4DecoderLayer):
 
 class HYV4MultiTokenPredictorLayer(IluGlmMoeDsaMultiTokenPredictorLayer):
     decoder_layer_cls = HYV4MTPDecoderLayer
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        previous_hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_step_index: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert inputs_embeds is not None
+        # M-RoPE positions are [3, num_tokens]. unsqueeze(-1) would broadcast
+        # the embed to 3D and break the cat with the 2D hidden state. The
+        # position-0 mask is per token; the text row is enough. The decoder
+        # still gets the full 3-row positions.
+        mask_positions = positions[0] if positions.ndim == 2 else positions
+        inputs_embeds = torch.where(mask_positions.unsqueeze(-1) == 0, 0, inputs_embeds)
+        inputs_embeds = self.enorm(inputs_embeds)
+        previous_hidden_states = self.hnorm(previous_hidden_states)
+        hidden_states = self.eh_proj(
+            torch.cat([inputs_embeds, previous_hidden_states], dim=-1)
+        )
+        hidden_states, residual = self.mtp_block(
+            positions=positions,
+            hidden_states=hidden_states,
+            residual=None,
+        )
+        hidden_states = residual + hidden_states
+        return hidden_states, self.shared_head(hidden_states)
 
 
 class HYV4MultiTokenPredictor(IluGlmMoeDsaMultiTokenPredictor):
@@ -216,6 +248,14 @@ class HYV4MTP(IluGlmMoeDsaMTP):
                     continue
 
                 name = self._translate_mtp_weight_name(raw_name)
+                # FP4 stores block-FP8 linear scales as ``.scale`` (uint8 E8M0).
+                # Draft params are ``weight_scale_inv`` in float8_e8m0fnu. The
+                # FP8 preview already used ``.weight_scale``; leave those alone
+                # (MXFP4 expert scales keep their uint8 bytes for the MoE loader).
+                if name.endswith(".scale") and not name.endswith(".weight_scale"):
+                    name = name[: -len(".scale")] + ".weight_scale_inv"
+                    if loaded_weight.dtype == torch.uint8:
+                        loaded_weight = loaded_weight.view(torch.float8_e8m0fnu)
 
                 layer_idx = self.model.mtp_start_layer_idx
                 rewritten = self._rewrite_spec_layer_name(layer_idx, name)
@@ -302,7 +342,7 @@ class HYV4MTP(IluGlmMoeDsaMTP):
         unscaled = sorted(
             name
             for name in params_dict
-            if name.endswith("weight_scale")
+            if name.endswith(("weight_scale", "weight_scale_inv"))
             and name not in loaded
             and ".shared_head.head." not in name
         )
@@ -311,4 +351,15 @@ class HYV4MTP(IluGlmMoeDsaMTP):
                 "HY4 MTP quantization scale(s) received no checkpoint value: "
                 + ", ".join(unscaled)
             )
+        # The GLM parent reports before HY4's sink/router/indexer additions
+        # are merged. Audit the final set, not that intermediate warning.
+        missing = sorted(set(params_dict) - loaded)
+        if missing:
+            raise ValueError("HY4 MTP parameters not loaded: " + ", ".join(missing))
+        logger.info(
+            "HY4 MTP final load audit: %d/%d parameters, %d HY4 additions, missing=0",
+            len(loaded & params_dict.keys()),
+            len(params_dict),
+            len(loaded_extra),
+        )
         return loaded

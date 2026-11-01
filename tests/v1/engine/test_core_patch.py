@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import inspect
 import queue
+from collections import deque
 from types import SimpleNamespace
 
+import pytest
 import torch.distributed as dist
 from vllm.v1.engine import EngineCoreRequestType
-from vllm.v1.engine.core import DPEngineCoreProc
+from vllm.v1.engine.core import DPEngineCoreProc, EngineCore
 from vllm.v1.request import RequestStatus
 
 from vllm_iluvatar.ilu_patch import general_patch
@@ -310,3 +312,180 @@ def test_disabled_sync_preserves_start_wave_exclusion():
     )
 
     assert captured == [(EngineCoreRequestType.START_DP_WAVE, (7, 2))]
+
+
+class _PPArrivals:
+    def __init__(self, *items):
+        self.items = deque(items)
+        self.timeouts = []
+
+    def get(self, timeout):
+        self.timeouts.append(timeout)
+        if not self.items:
+            raise queue.Empty
+        return self.items.popleft()
+
+
+def _pp_request(name):
+    return SimpleNamespace(
+        request_id=name,
+        num_tokens=85909,
+        num_prompt_tokens=85909,
+        num_computed_tokens=79040,
+        resumable=False,
+    )
+
+
+def _pp_engine():
+    engine = SimpleNamespace(
+        batch_queue=deque(),
+        batch_queue_size=8,
+        is_pooling_model=False,
+        scheduler=SimpleNamespace(
+            running=[_pp_request("a")],
+            waiting=[],
+            max_num_scheduled_tokens=2048,
+        ),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_size=1),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            speculative_config=None,
+            kv_transfer_config=None,
+        ),
+        input_queue=_PPArrivals(
+            ("add", _pp_request("b")),
+            ("add", _pp_request("c")),
+        ),
+        scheduled=[],
+        _ilu_pp_initial_fill=True,
+        _ilu_pp_coalesce_remaining_s=0.2,
+    )
+    engine._handle_client_request = lambda kind, request: (
+        engine.scheduler.running.append(request)
+    )
+    engine._process_input_queue = lambda: None
+    return engine
+
+
+def _pp_original_step(engine):
+    left = 2048
+    for request in engine.scheduler.running:
+        take = min(left, max(0, request.num_tokens - request.num_computed_tokens))
+        request.num_computed_tokens += take
+        left -= take
+    engine.scheduled.append(2048 - left)
+    engine.batch_queue.appendleft(2048 - left)
+    if len(engine.batch_queue) == 8:
+        engine.batch_queue.pop()
+        return {}, True
+    return None, left < 2048
+
+
+def test_pp_community_method_fingerprint_matches():
+    assert (
+        general_patch.source_sha(
+            inspect.getsource(inspect.unwrap(EngineCore.step_with_batch_queue))
+        )
+        == patch_core.PP_BATCH_STEP_SOURCE_SHA
+    )
+
+
+def test_pp_arrivals_fill_partial_batches_before_first_result():
+    engine = _pp_engine()
+    wrapped = core._make_pp_prefill_coalesce(_pp_original_step, 0.2)
+    for _ in range(8):
+        wrapped(engine)
+    assert engine.scheduled == [2048] * 8
+    assert len(engine.input_queue.timeouts) == 2
+    assert engine._ilu_pp_initial_fill is False
+
+
+def test_pp_disabled_preserves_short_and_empty_batches():
+    engine = _pp_engine()
+    wrapped = core._make_pp_prefill_coalesce(_pp_original_step, 0)
+    for _ in range(8):
+        wrapped(engine)
+    assert engine.scheduled == [2048, 2048, 2048, 725, 0, 0, 0, 0]
+    assert engine.input_queue.timeouts == []
+
+
+def test_pp_new_idle_wave_resets_budget_and_prior_state():
+    engine = _pp_engine()
+    engine._ilu_pp_initial_fill = False
+    engine._ilu_pp_coalesce_remaining_s = 0
+    engine._ilu_pp_coalesce_last = (("a", 85184),)
+    wrapped = core._make_pp_prefill_coalesce(_pp_original_step, 0.2)
+    for _ in range(8):
+        wrapped(engine)
+    assert engine.scheduled == [2048] * 8
+    assert len(engine.input_queue.timeouts) == 2
+
+
+def test_pp_wait_budget_is_shared_across_gaps(monkeypatch):
+    engine = _pp_engine()
+    engine.batch_queue.extend([1, 1])
+    engine.scheduler.running[0].num_computed_tokens = 85909
+    wrapped = core._make_pp_prefill_coalesce(lambda _: (None, False), 0.2)
+    times = iter([0, 0.15, 0.16, 0.22])
+    monkeypatch.setattr(core.time, "monotonic", lambda: next(times))
+    wrapped(engine)
+    engine.scheduler.running[-1].num_computed_tokens = 85909
+    wrapped(engine)
+    assert engine.input_queue.timeouts == pytest.approx([0.2, 0.05])
+    assert engine._ilu_pp_coalesce_remaining_s == 0
+    engine.scheduler.running[-1].num_computed_tokens = 85909
+    wrapped(engine)
+    assert len(engine.input_queue.timeouts) == 2
+
+
+def test_pp_unchanged_state_waits_only_once():
+    engine = _pp_engine()
+    engine.input_queue = _PPArrivals()
+    engine.batch_queue.extend([1, 1])
+    engine.scheduler.running[0].num_computed_tokens = 85909
+    wrapped = core._make_pp_prefill_coalesce(lambda _: (None, False), 0.2)
+    wrapped(engine)
+    wrapped(engine)
+    assert len(engine.input_queue.timeouts) == 1
+
+
+@pytest.mark.parametrize(
+    "skip",
+    [
+        "decode",
+        "after_result",
+        "dp",
+        "async",
+        "kv",
+        "spec",
+        "pool",
+        "resumable",
+        "in_process",
+    ],
+)
+def test_pp_other_execution_paths_delegate_without_wait(skip):
+    engine = _pp_engine()
+    engine.batch_queue.extend([1, 1])
+    engine.scheduler.running[0].num_computed_tokens = 85909
+    if skip == "decode":
+        engine.scheduler.running[0].num_tokens += 1
+    elif skip == "after_result":
+        engine._ilu_pp_initial_fill = False
+    elif skip == "dp":
+        engine.vllm_config.parallel_config.data_parallel_size = 2
+    elif skip == "async":
+        engine.vllm_config.scheduler_config.async_scheduling = True
+    elif skip == "kv":
+        engine.vllm_config.kv_transfer_config = object()
+    elif skip == "spec":
+        engine.vllm_config.speculative_config = object()
+    elif skip == "pool":
+        engine.is_pooling_model = True
+    elif skip == "resumable":
+        engine.scheduler.running[0].resumable = True
+    else:
+        del engine.input_queue
+    expected = (None, False)
+    assert core._make_pp_prefill_coalesce(lambda _: expected, 0.2)(engine) is expected
+    if hasattr(engine, "input_queue"):
+        assert engine.input_queue.timeouts == []

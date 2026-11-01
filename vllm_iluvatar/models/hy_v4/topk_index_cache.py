@@ -57,6 +57,18 @@ class HYV4TopkIndexCache:
         self._indices = indices
         self._topk_length = topk_length
 
+    def clear(self) -> None:
+        """Drop the cached conversion.
+
+        A pipeline stage that starts on a shared layer receives a new
+        ``topk_indices_buffer`` from the previous stage. The converted indices
+        stored here belong to the previous step's full layer on this rank, so
+        the first shared layer of this step must not reuse them.
+        """
+        self._indices = None
+        self._topk_length = None
+        self._num_tokens = -1
+
     def load(self, num_tokens: int) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Return the cached pair, or None when this layer must recompute.
 

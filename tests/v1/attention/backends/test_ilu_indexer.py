@@ -9,6 +9,8 @@ import pytest
 import torch
 
 from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
+    IluDeepseekV32IndexerMetadataBuilder,
+    _prefill_context_lower_bound,
     get_max_decode_context_len,
     get_max_prefill_buffer_size,
     kv_spans_from_batches,
@@ -16,6 +18,73 @@ from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
     make_storage_block_size_build,
     split_indexer_prefill_chunks,
 )
+
+
+@pytest.mark.parametrize(
+    "query_starts,seq_lens,q_slice,ratio,expected",
+    [
+        ([0, 21], [85909], (0, 21), 1, 85889),
+        ([0, 6869], [85909], (0, 64), 1, 79041),
+        ([0, 6869], [85909], (2048, 2112), 1, 81089),
+        ([0, 6869], [85909], (6848, 6869), 1, 85889),
+        ([0, 21], [21], (0, 21), 1, 1),
+        ([0, 5], [33], (0, 5), 4, 7),
+        ([0, 0, 9], [0, 20000], (0, 9), 1, 19992),
+        ([0, 21, 42], [85909, 10000], (0, 42), 1, 9980),
+        ([0, 21, 42], [85909, 10000], (21, 42), 1, 9980),
+        ([0, 21, 42], [100, 300], (20, 22), 1, 100),
+        ([0, 21], [128], (0, 21), 1, 108),
+        ([0, 0], [0], (0, 0), 1, 0),
+        ([0, 2], [2], (0, 2), 4, 0),
+    ],
+)
+def test_prefill_context_bound_uses_exact_cpu_query_positions(
+    query_starts, seq_lens, q_slice, ratio, expected
+):
+    result = _prefill_context_lower_bound(
+        torch.tensor(query_starts), torch.tensor(seq_lens), slice(*q_slice), ratio
+    )
+    assert result == expected
+
+
+def test_prefill_context_bound_refuses_device_metadata():
+    with pytest.raises(ValueError, match="CPU metadata"):
+        _prefill_context_lower_bound(
+            torch.empty(2, device="meta"), torch.tensor([21]), slice(0, 21), 1
+        )
+
+
+@pytest.mark.parametrize(
+    "query_lens,seq_lens,q_slice,ratio,expected",
+    [
+        ([21], [85909], (0, 21), 1, 85889),
+        ([6869], [85909], (2048, 2112), 1, 81089),
+        ([21, 21], [85909, 10000], (0, 42), 1, 9980),
+        ([21, 20], [85909, 10000], (0, 41), 1, 0),  # nonuniform
+        ([90], [85909], (0, 90), 1, 0),  # already enough Q CTAs
+        ([8], [85909], (0, 8), 1, 0),  # decode policy is unchanged
+        ([21], [128], (0, 21), 1, 0),  # long capacity is not long live context
+        ([21], [85909], (0, 21), 4, 21472),
+    ],
+)
+def test_prefill_builder_propagates_only_supported_context_bounds(
+    query_lens, seq_lens, q_slice, ratio, expected
+):
+    builder = object.__new__(IluDeepseekV32IndexerMetadataBuilder)
+    builder.device = torch.device("cpu")
+    builder.compress_ratio = ratio
+    builder.max_prefill_buffer_size = 1_000_000
+    starts = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(0)
+    chunk = builder.build_one_prefill_chunk(
+        slice(0, len(query_lens)),
+        slice(*q_slice),
+        starts,
+        torch.tensor(seq_lens, dtype=torch.int32),
+        torch.zeros(len(query_lens), 4096, dtype=torch.int32),
+    )
+    assert chunk.context_lower_bound == expected
+    if expected:
+        assert expected == int(chunk.valid_lens.min())
 
 
 def _spans_device(start_seq_loc, seq_len_per_batch, compress_ratio):

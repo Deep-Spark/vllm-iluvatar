@@ -242,6 +242,7 @@ if TYPE_CHECKING:
     VLLM_ILU_DP_SYNC_READY_REPLAY: bool = False
     VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS: int = 8
     VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS: float = 0.0
+    VLLM_ILU_PP_PREFILL_COALESCE_MS: float = 0.0
     VLLM_ILU_MOE_EP_LL_MOE_ALGO: str = "GEMV"
     VLLM_ILU_MXFP4_MOE_BACKEND: str = "ixmm"
     VLLM_ILU_REJECTION_SAMPLER_MAX_CHUNK_BYTES: int = 128 * 1024 * 1024
@@ -486,6 +487,11 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_MOE_EP_LL_MOE_ALGO": lambda: os.environ.get(
         "VLLM_ILU_MOE_EP_LL_MOE_ALGO", "GEMV"
     ).upper(),
+    # Total host wait budget while initially filling a PP pipeline. Opt-in:
+    # sparse arrivals can trade up to this delay for fuller prefill batches.
+    "VLLM_ILU_PP_PREFILL_COALESCE_MS": lambda: max(
+        0.0, float(os.environ.get("VLLM_ILU_PP_PREFILL_COALESCE_MS", "0"))
+    ),
     # Selects the ilu_mxfp4_fused_experts compute backend. Defaults to "ixmm";
     # "auto" -> ixmm when available else torch; "torch" forces the pure-torch
     # fallback; "ixformer_native" is the correctness-only native kernel.

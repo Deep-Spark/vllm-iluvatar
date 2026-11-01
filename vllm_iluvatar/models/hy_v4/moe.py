@@ -10,8 +10,10 @@ Iluvatar delta for the routed experts lives in the quantization method
 (`IluModelOptMxFp8Config` -> `IluMxFp8FusedMoE`), which `FusedMoEFactory`
 reaches through ``quant_config``, so nothing model-side has to change.
 
-The one model-side delta is the router dtype: it stays in the model dtype rather
-than upstream's fp32 (see `HYV4MoEFused.__init__`).
+The FP32 sigmoid-top8 path uses BF16 operands with FP32 accumulation/output
+when its FP32 router weights are exactly representable as BF16. The derived
+weight is prepared after loading; other weights retain the FP32 fallback.
+The legacy grouped-topk path keeps its BF16/FP16 input contract.
 
 ``swiglu_limit`` is threaded through `FusedMoEFactory` so the clamp travels via
 the quant config to the expert backend; `IluMxFp8FusedMoE.apply` reads it off
@@ -31,10 +33,101 @@ from vllm.model_executor.layers.fused_moe import FusedMoEFactory, GateLinear
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
+from vllm_iluvatar.ilu_util.arch import IVCORE11, IVCORE30, cuda_arch
+from vllm_iluvatar.model_executor.layers.fused_moe.router.ilu_gate_linear import (
+    IluGateLinear,
+)
+
 logger = init_logger(__name__)
+
+
+class _HYV4RouterLinearMethod(UnquantizedLinearMethod):
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        layer.prepare_router_weight()
+
+
+class HYV4RouterGate(IluGateLinear):
+    """HY4 router: preserve FP32 parameters/logits and cache lossless BF16 W.
+
+    The standard loader postprocessing hook owns the derived buffer. Checkpoint
+    loads invalidate it; changed/replaced parameters cannot consume stale data.
+    Explicit architecture dispatch leaves other models' gate policy unchanged.
+    """
+
+    def __init__(self, input_size: int, output_size: int, prefix: str):
+        super().__init__(
+            input_size,
+            output_size,
+            bias=False,
+            params_dtype=torch.float32,
+            out_dtype=torch.float32,
+            prefix=prefix,
+        )
+        self.quant_method = _HYV4RouterLinearMethod()
+        self.router_backend = {IVCORE11: "ixinfer", IVCORE30: "ixmm"}.get(cuda_arch())
+        self.register_buffer("_router_weight_bf16", None, persistent=False)
+        self._router_weight_version = -1
+        self._router_weight_ptr = 0
+
+    def weight_loader(self, param, loaded_weight):
+        self._router_weight_bf16 = None
+        super().weight_loader(param, loaded_weight)
+
+    def prepare_router_weight(self) -> None:
+        self._router_weight_bf16 = None
+        if self.router_backend is None:
+            return
+        from ixformer.inference.backend_registry import registry
+
+        if self.router_backend not in registry.available_backends(
+            "gemm_bf16_bf16_fp32"
+        ):
+            raise RuntimeError(f"HYV4 router requires backend {self.router_backend!r}")
+        weight = self.weight.detach()
+        bf16 = weight.to(torch.bfloat16).contiguous()
+        if not torch.equal(bf16.float(), weight):
+            logger.warning(
+                "HYV4 router %s retains FP32 GEMM: weight is not lossless BF16",
+                self.prefix,
+            )
+            return
+        self._router_weight_bf16 = bf16
+        self._router_weight_version = (
+            None if self.weight.is_inference() else self.weight._version
+        )
+        self._router_weight_ptr = self.weight.data_ptr()
+        logger.info(
+            "HYV4 router BF16 operands ready: %s backend=%s logits=FP32",
+            self.prefix,
+            self.router_backend,
+        )
+
+    def forward(self, x: torch.Tensor):
+        weight = self._router_weight_bf16
+        if (
+            weight is not None
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and x.is_contiguous()
+            and x.device == weight.device
+            and self._router_weight_version
+            == (None if self.weight.is_inference() else self.weight._version)
+            and self.weight.data_ptr() == self._router_weight_ptr
+        ):
+            import ixformer.inference.functions as ixf_ops
+
+            return ixf_ops.gemm_bf16_bf16_fp32(
+                x,
+                weight,
+                format="TN",
+                backend=self.router_backend,
+            ), None
+        return super().forward(x)
 
 
 class HYV4FeedForward(nn.Module):
@@ -131,20 +224,30 @@ class HYV4MoEFused(nn.Module):
             self.physical_expert_start + self.n_local_physical_experts
         )
 
-        # [ILU delta] Upstream pins the router to fp32 (``params_dtype`` and
-        # ``out_dtype``). Route in the model dtype instead: ixformer's
-        # grouped-topk kernel only accepts fp16/bf16 logits (it hard-asserts on
-        # the gating dtype), same reason ``glm_moe_dsa`` opts out of the fp32
-        # router. Nothing is lost -- the checkpoint ships ``mlp.gate.weight`` as
-        # BF16 and sets no ``moe_router_dtype``, so upstream's fp32 is an upcast
-        # of bf16 data, and with ``n_group == topk_group == 1`` the grouped
-        # selection degenerates to a plain top-k.
-        self.gate = GateLinear(
-            config.hidden_size,
-            config.num_experts,
-            bias=False,
-            prefix=f"{prefix}.gate",
+        # The legacy grouped-topk kernel only accepts BF16/FP16 logits, but
+        # the existing sigmoid-top8 kernel supports FP32 logits and bias.
+        # With its exact HY4 contract enabled, preserve reference FP32 router
+        # accumulation rather than rounding logits before sigmoid/top-k.
+        from vllm import envs
+
+        fp32_router = (
+            envs.VLLM_ILU_GLM_MOE_PREPARE_FUSION
+            and config.num_experts == 256
+            and top_k == 8
+            and config.route_norm
         )
+        if fp32_router:
+            self.gate = HYV4RouterGate(
+                config.hidden_size, config.num_experts, prefix=f"{prefix}.gate"
+            )
+        else:
+            self.gate = GateLinear(
+                config.hidden_size,
+                config.num_experts,
+                bias=False,
+                prefix=f"{prefix}.gate",
+            )
+        logger.info_once("HYV4 router FP32 compute: %s", fp32_router)
 
         self.shared_experts: HYV4FeedForward | None
         if config.num_shared_experts > 0:
@@ -198,7 +301,7 @@ class HYV4MoEFused(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts), in the model dtype.
+        # router_logits: (num_tokens, n_experts), FP32 on sigmoid-top8 path.
         router_logits, _ = self.gate(hidden_states)
 
         final_hidden_states = self.experts(

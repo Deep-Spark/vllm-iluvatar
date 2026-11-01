@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Wiring for Iluvatar DP EngineCore scheduling wrappers.
+"""Wiring for Iluvatar DP and PP EngineCore scheduling wrappers.
+
+PP target: EngineCore.step_with_batch_queue at vLLM 341bf7d4.
+Why: early short batches can block admission while the PP queue fills.
+How: VLLM_ILU_PP_PREFILL_COALESCE_MS enables a bounded initial-fill wrapper;
+     the upstream method is fingerprinted and retains batch execution ownership.
+Scope: opt-in synchronous PP, DP=1 generation without KV transfer or speculation.
+Remove when upstream supports bounded admission during initial PP fill.
 
 Corresponds to: vllm/v1/engine/core.py
 Target   : EngineCore.get_kv_cache_group_metadata;
@@ -40,6 +47,11 @@ from vllm.logger import init_logger
 from vllm_iluvatar.ilu_patch import general_patch as p
 
 logger = init_logger(__name__)
+
+# vLLM 341bf7d4, EngineCore.step_with_batch_queue; normalized source SHA256.
+PP_BATCH_STEP_SOURCE_SHA = (
+    "bf90acc52f5ba588c735e817690f8725675e6c8e2b299e7a546efeae0dcb8eeb"
+)
 
 SHOULD_THROTTLE_PREFILLS = """\
 def _should_throttle_prefills(self) -> bool:
@@ -122,6 +134,27 @@ def _apply() -> None:
     EngineCore.get_kv_cache_group_metadata = (  # type: ignore[method-assign]
         get_kv_cache_group_metadata
     )
+
+    coalesce_ms = float(envs.VLLM_ILU_PP_PREFILL_COALESCE_MS)
+    if coalesce_ms > 0:
+        p.check_fingerprint(
+            "EngineCore.step_with_batch_queue",
+            inspect.getsource(EngineCore.step_with_batch_queue),
+            PP_BATCH_STEP_SOURCE_SHA,
+            baseline_is_hash=True,
+            resync_hint="Review PP prefill admission before updating the source hash.",
+        )
+        step_with_batch_queue = impl._make_pp_prefill_coalesce(
+            EngineCore.step_with_batch_queue, coalesce_ms / 1000
+        )
+        p.check_signatures(
+            EngineCore,
+            types.SimpleNamespace(step_with_batch_queue=step_with_batch_queue),
+            ["step_with_batch_queue"],
+            strict=True,
+        )
+        EngineCore.step_with_batch_queue = step_with_batch_queue
+        logger.info("PP prefill initial-fill coalescing budget: %.1f ms", coalesce_ms)
 
     sync_prefills = bool(envs.VLLM_ILU_DP_ENABLE_SYNC_PREFILLS)
     replacement_wait_ms = float(envs.VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS)

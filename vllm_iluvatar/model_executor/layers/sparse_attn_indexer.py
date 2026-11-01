@@ -7,16 +7,18 @@ from __future__ import annotations
 import os
 
 import ixformer.inference.functions as ixfops
-from ixformer.inference.functions.models.deepseek_v41.indexer.fp8.indexer_mqa_topk_fp8 import indexer_mqa_topk_fp8
 import torch
+from ixformer.inference.functions.models.deepseek_v41.indexer.fp8.indexer_mqa_topk_fp8 import (
+    indexer_mqa_topk_fp8,
+)
 from vllm import _custom_ops as ops
 from vllm import envs
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import CustomOp
-from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
 
 from vllm_iluvatar.model_executor.kernels.attention.dsa.ilu_candidate_blocks import (
     apply_candidate_mask,
@@ -82,11 +84,7 @@ def _mqa_logits(*args, **kwargs):
         kwargs["backend"] = "ixinfer"
         return ixfops.dsa_indexer_mqa_logits_with_kvcache(*args, **kwargs)
     if kv_cache.dtype == torch.uint8:
-        # ixinfer supports only 64/256-row pages. Ratio1's 128 rows use native.
-        kwargs.setdefault(
-            "backend",
-            os.environ.get("VLLM_ILU_V41_FP8_INDEXER_BACKEND", "ixformer_native"),
-        )
+        # The IxFormer facade registry owns FP8 backend selection.
         return ixfops.dsa_indexer_mqa_logits_with_kvcache_fp8(*args, **kwargs)
     if envs.VLLM_ILU_GLM_DSA_NATIVE_MQA_LOGITS:
         kwargs.setdefault("backend", "ixformer_native")
@@ -194,9 +192,6 @@ def _indexer_logits_and_topk(
             max_context_len=max_context_len,
             valid_lens=valid_lens,
             logits=logits,
-            backend=os.environ.get(
-                "VLLM_ILU_V41_FP8_INDEXER_BACKEND", "ixformer_native"
-            ),
         )
         return
 
@@ -388,7 +383,9 @@ def ilu_sparse_attn_indexer(
         if logits_buffer is not None:
             if num_decode_tokens > logits_buffer.shape[0]:
                 raise ValueError("FP8 indexer decode exceeds preallocated logits rows")
-            decode_logits = logits_buffer[:num_decode_tokens, :decode_metadata.max_context_len]
+            decode_logits = logits_buffer[
+                :num_decode_tokens, : decode_metadata.max_context_len
+            ]
         _indexer_logits_and_topk(
             candidate_blocks=candidate_blocks,
             candidate_block_size=candidate_block_size,

@@ -84,6 +84,8 @@ _HYV4_DSA_FP8_ROW_BYTES = 640
 _HYV4_DSA_FP8_E4M3_MAX = 448.0
 _HYV4_DSA_FP8_CACHE_DTYPES = ("fp8", "fp8_e4m3")
 _MLA_KV_FUSE_LOGGED = False
+# Validated HY4 prefill chunks; larger batches retain the original path.
+_MROPE_MAX_TOKENS = 2560
 
 
 def apply_qk_rope(
@@ -109,7 +111,7 @@ def apply_qk_rope(
         section = getattr(mrope_emb, "_ixf_mrope_section", None)
         if (
             q_pe.is_cuda
-            and positions.shape[1] <= _FUSED_MAX_TOKENS
+            and positions.shape[1] <= _MROPE_MAX_TOKENS
             and section is not None
         ):
             result = _ixf_functions().m_rotary_embedding(

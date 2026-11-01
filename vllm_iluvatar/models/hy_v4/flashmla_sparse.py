@@ -173,22 +173,33 @@ class HYV4FlashMLASparseImpl(IluFlashMLASparseImpl):
         return global_indices, topk_length
 
     def _maybe_init_fp8_kv_scale(
-        self, kv_c: torch.Tensor, k_scale: torch.Tensor
+        self,
+        kv_c: torch.Tensor,
+        k_scale: torch.Tensor,
+        slot_mapping: torch.Tensor,
     ) -> None:
         if self._fp8_kv_scale_frozen or kv_c.numel() == 0:
             return
         if torch.cuda.is_current_stream_capturing():
             return
-        amax = float(kv_c.detach().float().abs().amax())
+        # Match GLM: padding and warmup rows with no cache slot must not
+        # determine the scale, even if their projections are nonzero/NaN.
+        abs_kv = kv_c.detach().float().abs()
+        abs_kv = abs_kv.masked_fill(slot_mapping.reshape(-1, 1) < 0, 0.0)
+        amax = float(abs_kv.amax())
         if not math.isfinite(amax) or amax <= 0.0:
             return
         scale = amax / _HYV4_DSA_FP8_E4M3_MAX
         k_scale.fill_(scale)
         self._fp8_kv_scale_frozen = True
         logger.info(
-            "HYV4 DSA fp8 KV scale for %s frozen online = %.8g (amax/448)",
+            "HYV4 DSA fp8 KV scale for %s frozen online = %.8g "
+            "(amax/448, amax=%.8g, valid_slots=%d/%d)",
             self.prefix,
             scale,
+            amax,
+            int((slot_mapping >= 0).sum()),
+            slot_mapping.numel(),
         )
 
     def do_kv_cache_update(
@@ -215,7 +226,7 @@ class HYV4FlashMLASparseImpl(IluFlashMLASparseImpl):
             return
         import ixformer.inference.functions as ixf_ops
 
-        self._maybe_init_fp8_kv_scale(kv_c_normed, k_scale)
+        self._maybe_init_fp8_kv_scale(kv_c_normed, k_scale, slot_mapping)
         ixf_ops.glm_dsa_fp8_kv_insert(
             kv_c_normed,
             k_pe,

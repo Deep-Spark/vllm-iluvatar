@@ -53,6 +53,7 @@ _ILU_MTP_ARCH_MAP = {
     "GlmMoeDsaForCausalLM": "IluGlmMoeDsaFp8MTPModel",
     "IluDeepseekV4ForCausalLM": "IluDeepSeekV4MTPModel",
     "HYV4ForCausalLM": "HYV4MTPModel",
+    "HYV4VLForConditionalGeneration": "HYV4MTPModel",
 }
 
 # Community draft arch -> ilu draft arch, keyed by the architecture community
@@ -168,7 +169,10 @@ def make_hf_config_override(
         ilu_mtp_arch = _ILU_MTP_ARCH_MAP.get(initial_architecture)
         if ilu_mtp_arch is not None:
             hf_config.update({"architectures": [ilu_mtp_arch]})
-            if initial_architecture == "HYV4ForCausalLM":
+            if initial_architecture in (
+                "HYV4ForCausalLM",
+                "HYV4VLForConditionalGeneration",
+            ):
                 # The baseline's MTPModelTypes predates HY V4. Use the generic
                 # DeepSeek tuple-MTP model_type only on the draft config so
                 # SpeculativeConfig accepts method="mtp"; the architecture

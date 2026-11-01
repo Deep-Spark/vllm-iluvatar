@@ -46,6 +46,7 @@ from __future__ import annotations
 import queue
 import time
 from dataclasses import dataclass, field
+from functools import wraps
 from typing import TYPE_CHECKING
 
 import torch.distributed as dist
@@ -55,6 +56,92 @@ from vllm.v1.request import RequestStatus
 if TYPE_CHECKING:
     import torch
     from torch.distributed import Store
+
+
+def _make_pp_prefill_coalesce(orig, max_wait_s: float):
+    """Admit arrivals before short initial PP batches within one wait budget.
+
+    Opt-in for synchronous PP with DP=1. The upstream scheduler and executor
+    still own every batch, including empty batches. Waiting stops after the
+    first worker result and is never applied to decode or KV-transfer paths.
+
+    Target: EngineCore.step_with_batch_queue at vLLM 341bf7d4.
+    Why: early short batches can fill the PP queue before arrivals are admitted.
+    How: share one bounded arrival wait across the initial pipeline fill.
+    Scope: opt-in synchronous PP, DP=1, non-resumable generation only.
+    Remove when upstream supports bounded admission during initial PP fill.
+    """
+
+    @wraps(orig)
+    def step_with_batch_queue(self):
+        config = self.vllm_config
+        if (
+            max_wait_s <= 0
+            or config.parallel_config.data_parallel_size != 1
+            or config.scheduler_config.async_scheduling
+            or config.speculative_config is not None
+            or config.kv_transfer_config is not None
+            or self.is_pooling_model
+            or not hasattr(self, "input_queue")
+        ):
+            return orig(self)
+
+        batches = self.batch_queue
+        if not batches:
+            self._ilu_pp_initial_fill = True
+            self._ilu_pp_coalesce_remaining_s = max_wait_s
+            self._ilu_pp_coalesce_last = None
+
+        running = self.scheduler.running
+        budget = self.scheduler.max_num_scheduled_tokens
+        if (
+            getattr(self, "_ilu_pp_initial_fill", False)
+            and self._ilu_pp_coalesce_remaining_s > 0
+            and batches
+            and 2 <= len(batches) < self.batch_queue_size
+            and running
+            and not self.scheduler.waiting
+            and all(
+                request.num_tokens == request.num_prompt_tokens
+                and not request.resumable
+                for request in running
+            )
+        ):
+            remaining = sum(
+                max(0, request.num_tokens - request.num_computed_tokens)
+                for request in running
+            )
+            state = tuple(
+                (request.request_id, request.num_computed_tokens) for request in running
+            )
+            if (
+                remaining < budget
+                and getattr(self, "_ilu_pp_coalesce_last", None) != state
+            ):
+                self._ilu_pp_coalesce_last = state
+                started = time.monotonic()
+                try:
+                    item = self.input_queue.get(
+                        timeout=self._ilu_pp_coalesce_remaining_s
+                    )
+                except queue.Empty:
+                    pass
+                else:
+                    self._handle_client_request(*item)
+                    self._process_input_queue()
+                finally:
+                    self._ilu_pp_coalesce_remaining_s = max(
+                        0.0,
+                        self._ilu_pp_coalesce_remaining_s
+                        - (time.monotonic() - started),
+                    )
+
+        result = orig(self)
+        if result[0] is not None:
+            self._ilu_pp_initial_fill = False
+        return result
+
+    return step_with_batch_queue
 
 
 @dataclass(slots=True)

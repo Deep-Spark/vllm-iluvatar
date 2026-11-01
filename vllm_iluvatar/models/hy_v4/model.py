@@ -52,7 +52,6 @@ from vllm.model_executor.models.utils import (
     WeightsMapper,
     get_pp_missing_layer_names,
     is_pp_missing_parameter,
-    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
@@ -62,6 +61,7 @@ from vllm.sequence import IntermediateTensors
 from .attention import (
     HYV4MLAAttention,
     compute_skip_topk_layers,
+    hyv4_layer_skip_topk,
     is_skip_topk_indexer_weight,
 )
 from .hc import HYV4HCHeadLayer, HYV4HCLayer
@@ -70,6 +70,10 @@ from .topk_index_cache import HYV4TopkIndexCache
 from .weight_utils import try_load_quantized_indexer_wk
 
 logger = init_logger(__name__)
+
+# IntermediateTensors key carrying the DSA top-k buffer across a pipeline
+# boundary whose first layer is shared. See ``HYV4Model``.
+_TOPK_INDICES_KEY = "topk_indices"
 
 
 def _normalize_hyv4_config(config: PretrainedConfig) -> PretrainedConfig:
@@ -280,17 +284,29 @@ class HYV4Model(nn.Module):
                 )
             else:
                 self.hc_head = PPMissingLayer()
-            self.make_empty_intermediate_tensors = (
-                make_empty_intermediate_tensors_factory(
-                    ["hidden_states"], config.hc_mult * config.hidden_size
-                )
-            )
+            self._pp_intermediate_keys = ("hidden_states",)
+            self._pp_intermediate_hidden = config.hc_mult * config.hidden_size
         else:
-            self.make_empty_intermediate_tensors = (
-                make_empty_intermediate_tensors_factory(
-                    ["hidden_states", "residual"], config.hidden_size
-                )
-            )
+            self._pp_intermediate_keys = ("hidden_states", "residual")
+            self._pp_intermediate_hidden = config.hidden_size
+
+        # ``topk_indices_buffer`` lives on this rank, while the full/shared
+        # split is global. A stage whose first layer is shared would otherwise
+        # read whatever the previous forward left in its own buffer. Carry the
+        # buffer only across those boundaries. A stage that already starts on a
+        # full layer sends nothing, and pipeline-parallel size 1 sends nothing.
+        # ``end_layer`` is the next stage's ``start_layer``, so the send and
+        # recv key sets match.
+        self.recv_topk = (
+            self.is_sparse
+            and not get_pp_group().is_first_rank
+            and hyv4_layer_skip_topk(config, self.start_layer)
+        )
+        self.send_topk = (
+            self.is_sparse
+            and not get_pp_group().is_last_rank
+            and hyv4_layer_skip_topk(config, self.end_layer)
+        )
 
         # MoE hyperparameters (consumed by EPLB).
         self.expert_weights: MutableSequence[Sequence[torch.Tensor]] = []
@@ -359,6 +375,25 @@ class HYV4Model(nn.Module):
             )
         return self._cached_expert_params_mapping
 
+    def make_empty_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        tensors = {
+            key: torch.zeros(
+                (batch_size, self._pp_intermediate_hidden),
+                dtype=dtype,
+                device=device,
+            )
+            for key in self._pp_intermediate_keys
+        }
+        if self.recv_topk:
+            tensors[_TOPK_INDICES_KEY] = torch.zeros(
+                (batch_size, self.config.index_topk),
+                dtype=torch.int32,
+                device=device,
+            )
+        return IntermediateTensors(tensors)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -379,18 +414,28 @@ class HYV4Model(nn.Module):
             # previous PP stage is reshaped back to 3D by the first layer's
             # prepare_input, and residual is unused.
             residual = None if self.enable_ihc else intermediate_tensors["residual"]
+            if self.recv_topk:
+                topk_indices = intermediate_tensors[_TOPK_INDICES_KEY]
+                assert self.topk_indices_buffer is not None
+                self.topk_indices_buffer[: topk_indices.shape[0]].copy_(topk_indices)
+                if self.topk_index_cache is not None:
+                    self.topk_index_cache.clear()
 
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
+            num_tokens = hidden_states.shape[0]
             if self.enable_ihc:
                 # hidden_states is [num_tokens, hc, h]; flatten the channel dim
                 # for PP transfer (matches the 2D receive buffer).
-                return IntermediateTensors({"hidden_states": hidden_states.flatten(1)})
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+                tensors = {"hidden_states": hidden_states.flatten(1)}
+            else:
+                tensors = {"hidden_states": hidden_states, "residual": residual}
+            if self.send_topk:
+                assert self.topk_indices_buffer is not None
+                tensors[_TOPK_INDICES_KEY] = self.topk_indices_buffer[:num_tokens]
+            return IntermediateTensors(tensors)
         if self.enable_ihc:
             hidden_states = self.hc_head(hidden_states)
         else:
@@ -741,6 +786,15 @@ def register_model() -> None:
 
     register_configs()
 
+    # Import for its ``@ReasoningParserManager.register_module("hy_v4")`` side
+    # effect so ``--reasoning-parser hy_v4`` resolves. Kept out of module import
+    # time (vllm.reasoning pulls in the serving stack) and off the hot path.
+    from . import reasoning as _hy_v4_reasoning  # noqa: F401
+
+    # Import for its ``@MULTIMODAL_REGISTRY.register_processor`` side effect so the
+    # VL model's image/video processor is registered before the model is built.
+    from . import vl_model as _hy_v4_vl_model  # noqa: F401
+
     # Registered under the checkpoint's own arch name: ``config.json`` says
     # ``HYV4ForCausalLM`` and community vLLM has no entry for it, so this is a
     # new registration rather than an override of a community model.
@@ -751,4 +805,10 @@ def register_model() -> None:
     ModelRegistry.register_model(
         "HYV4MTPModel",
         "vllm_iluvatar.models.hy_v4.mtp:HYV4MTP",
+    )
+    # VL composition for the hy_v4_vl checkpoint: vision tower + HYV4ForCausalLM,
+    # registered under the checkpoint's own arch name.
+    ModelRegistry.register_model(
+        "HYV4VLForConditionalGeneration",
+        "vllm_iluvatar.models.hy_v4.vl_model:HYV4VLForConditionalGeneration",
     )

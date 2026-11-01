@@ -1176,6 +1176,17 @@ class IluFp8Config(Fp8Config):
         ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
         store_dtype = cls.get_from_keys_or(config, ["store_dtype"], None)
+        # HY4 names the routed-expert storage format ``expert_dtype`` even
+        # though the mixed checkpoint's top-level quant_method remains fp8.
+        expert_dtype = cls.get_from_keys_or(config, ["expert_dtype"], None)
+        if (
+            store_dtype is not None
+            and expert_dtype is not None
+            and store_dtype != expert_dtype
+        ):
+            raise ValueError("Conflicting store_dtype and expert_dtype in FP8 config")
+        if store_dtype is None:
+            store_dtype = expert_dtype
         gemm_format = cls.get_from_keys_or(config, ["gemm_format"], "TN")
         gemm_format = gemm_format.upper()
         # for models that not the all weights are fp8, those layer's name are passed with ignored_layers
@@ -1252,6 +1263,18 @@ class IluFp8Config(Fp8Config):
             else:
                 method = IluFp8PerChannelOnlineLinearMethod(new_quant)
             return method, "quantized"
+
+        if (
+            isinstance(layer, RoutedExperts)
+            and self.is_checkpoint_fp8_serialized
+            and self.store_dtype == "mxfp4"
+            and not self._is_layer_skipped(prefix)
+        ):
+            from vllm_iluvatar.model_executor.layers.quantization.ilu_mxfp4 import (
+                IluMxfp4MoEMethod,
+            )
+
+            return IluMxfp4MoEMethod(layer.moe_config), "quantized"
 
         if (
             isinstance(layer, RoutedExperts)

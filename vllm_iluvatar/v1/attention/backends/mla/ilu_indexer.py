@@ -29,7 +29,12 @@ from vllm.v1.attention.backends.mla.compressor_utils import (
 )
 from vllm.v1.attention.backends.mla.indexer import compute_kpool_tail_slot_mapping
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheLayout,
+    KVCacheSpec,
+    MLAAttentionSpec,
+)
 
 
 def indexer_kv_dtype() -> str:
@@ -41,8 +46,7 @@ def indexer_kv_dtype() -> str:
     dtype = os.environ.get("VLLM_ILU_V41_INDEXER_KV_DTYPE", "fp8").strip().lower()
     if dtype not in ("bf16", "fp8", "int8"):
         raise ValueError(
-            "VLLM_ILU_V41_INDEXER_KV_DTYPE must be bf16, fp8, or int8, "
-            f"got {dtype!r}"
+            f"VLLM_ILU_V41_INDEXER_KV_DTYPE must be bf16, fp8, or int8, got {dtype!r}"
         )
     return dtype
 
@@ -218,6 +222,9 @@ class IluDeepseekV32IndexerPrefillChunkMetadata:
     max_q_len: int  # Maximum query length for dsa_indexer_mqa_logits_with_kvcache
     max_kv_len: int  # Maximum key-value length for dsa_indexer_mqa_logits_with_kvcache
     skip_kv_gather: bool = False
+    # Proven minimum causal context over this Q subchunk, from exact prefill
+    # CPU metadata. Zero means unknown; never infer this from cache capacity.
+    context_lower_bound: int = 0
 
 
 @dataclass
@@ -352,6 +359,45 @@ class IluKpoolTailMetadataBuilder(AttentionMetadataBuilder):
             ],
             block_table=common_attn_metadata.block_table_tensor,
         )
+
+
+def _prefill_context_lower_bound(
+    query_start_loc_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    query_slice: slice,
+    compress_ratio: int,
+) -> int:
+    """Minimum visible prefix in a concatenated Q slice, without device reads.
+
+    ``seq_lens_cpu`` must be exact for these prefill rows. The upstream
+    ``seq_lens_cpu_upper_bound`` contract guarantees this for prefill, not for
+    async speculative decode. Positions/counts are in uncompressed tokens;
+    the result uses the indexer's compressed K-column domain.
+    """
+    if query_start_loc_cpu.device.type != "cpu" or seq_lens_cpu.device.type != "cpu":
+        raise ValueError("prefill context bounds require CPU metadata")
+    if compress_ratio < 1:
+        raise ValueError("compress_ratio must be positive")
+    start, stop = query_slice.start, query_slice.stop
+    if start >= stop:
+        return 0
+    # This runs only for <=10 small Q CTAs (at most five participating
+    # requests). Reading these already-CPU scalars avoids tiny tensor kernels
+    # and allocations whose host cost would eat the small-M GPU savings.
+    q = query_start_loc_cpu.tolist()
+    lengths = seq_lens_cpu.tolist()
+    lower_bound = None
+    for request, (q_start, q_end) in enumerate(zip(q[:-1], q[1:])):
+        first = max(q_start, start)
+        if first >= min(q_end, stop):
+            continue
+        first_context = (
+            lengths[request] - (q_end - q_start) + (first - q_start) + 1
+        ) // compress_ratio
+        lower_bound = (
+            first_context if lower_bound is None else min(lower_bound, first_context)
+        )
+    return max(0, lower_bound) if lower_bound is not None else 0
 
 
 # TODO (zyongye) optimize this, this is now vibe coded
@@ -768,6 +814,23 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # valid_lens here so forward never subtracts.
         valid_lens = chunk_ke - chunk_ks
 
+        context_lower_bound = 0
+        # The score specialization requires uniform Q and <=10 Q CTAs.
+        # Avoid extra CPU work for the large-M path or short contexts. These
+        # are prefill-only exact lengths, not optimistic decode upper bounds.
+        if (
+            max_context_len >= 8192
+            and max_q_len > 8
+            and sub_m == num_reqs * max_q_len
+            and cdiv(max_q_len, 8) * num_reqs <= 10
+        ):
+            context_lower_bound = _prefill_context_lower_bound(
+                prefill_query_start_loc,
+                seq_lens_cpu[req_slice],
+                query_slice,
+                compress_ratio,
+            )
+
         return IluDeepseekV32IndexerPrefillChunkMetadata(
             cu_seqlen_ks=chunk_ks,
             cu_seqlen_ke=chunk_ke,
@@ -784,6 +847,7 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             max_q_len=max_q_len,
             max_kv_len=max_context_len,
             skip_kv_gather=skip_kv_gather,
+            context_lower_bound=context_lower_bound,
         )
 
     def build_decode_metadata(
@@ -1210,7 +1274,10 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 rows, cols = indexer_block_table[:num_decodes].shape
                 if self.indexer_decode_block_table_buffer is None:
                     self.indexer_decode_block_table_buffer = torch.zeros(
-                        (self.vllm_config.scheduler_config.max_num_batched_tokens, cols),
+                        (
+                            self.vllm_config.scheduler_config.max_num_batched_tokens,
+                            cols,
+                        ),
                         dtype=torch.int32,
                         device=self.device,
                     )

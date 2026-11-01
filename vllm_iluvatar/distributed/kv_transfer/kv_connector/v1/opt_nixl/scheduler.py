@@ -369,10 +369,11 @@ class NixlConnectorScheduler:
         self._lease_renewals: dict[ReqId, int] = {}
         # Producers too old to know the probe op answer it with an empty frame.
         self._probe_unsupported: set[str] = set()
-        # Receives whose producer returned a terminal proof.  Consumed by
-        # request_finished_all_groups, which may only release blocks early for
-        # these; it runs after update_connector_output already dropped the
-        # ownership generation, so the generation cannot carry the proof.
+        # Receives proven terminal: every WRITE landed, or the producer
+        # returned a terminal proof.  Consumed by request_finished_all_groups,
+        # which may only release blocks early for these; it runs after
+        # update_connector_output already dropped the ownership generation, so
+        # the generation cannot carry the proof.
         self._recv_release_proofs: set[ReqId] = set()
         # Remote engine -> local ranks that reported it unreachable.
         # Producer-side only; a consumer never answers these commands.
@@ -720,9 +721,10 @@ class NixlConnectorScheduler:
                     generation,
                 )
                 continue
-            # The only proof that no late WRITE can target this generation.
-            # Releases driven by anything else -- a locally rejected receive, a
-            # session still draining -- must keep delaying the block release.
+            # Short of the receive completing, the only proof that no late
+            # WRITE can target this generation.  Releases driven by anything
+            # else -- a locally rejected receive, a session still draining --
+            # must keep delaying the block release.
             self._recv_release_proofs.add(req_id)
             self._ownership_states[req_id] = RequestOwnershipState.TERMINAL
             self._ownership_deadlines.pop(req_id, None)
@@ -1353,9 +1355,15 @@ class NixlConnectorScheduler:
             else:
                 connector_output.failed_recving.update(failed)
 
+        failed_recving = connector_output.failed_recving or set()
         for req_id in connector_output.finished_recving or ():
+            if req_id not in failed_recving:
+                # A completed receive is itself a terminal proof.  Once the
+                # generation is gone, request_finished_all_groups can no longer
+                # tell it from a rejected receive that P may still write to.
+                self._recv_release_proofs.add(req_id)
             self._stop_recv_tracking(req_id)
-        for req_id in connector_output.failed_recving or ():
+        for req_id in failed_recving:
             self._stop_recv_tracking(req_id)
 
         if self.prefix_state is not None:
@@ -1501,10 +1509,11 @@ class NixlConnectorScheduler:
                     self._stop_recv_tracking(request.request_id)
                     return False, {}
                 if proven_terminal:
-                    # P already proved every native WRITE terminal, so the
-                    # release is safe and nothing will report this request
-                    # again.  Delaying here would strand its blocks, and the
-                    # request itself, for the engine's lifetime.
+                    # Every native WRITE is terminal -- the receive completed,
+                    # or P proved it -- so the release is safe and nothing will
+                    # report this request again.  Delaying here would strand
+                    # its blocks, and the request itself, for the engine's
+                    # lifetime.
                     self._stop_recv_tracking(request.request_id)
                     return False, {}
                 # Keep D blocks until P proves every native WRITE terminal.

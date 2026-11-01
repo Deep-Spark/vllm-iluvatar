@@ -1440,6 +1440,56 @@ def test_safe_release_records_the_terminal_proof() -> None:
     }
 
 
+def _receive_completed(
+    scheduler: NixlConnectorScheduler, req_id: str, *, failed: bool
+) -> None:
+    scheduler._scheduler_failed_recvs = set()
+    scheduler._live_recv_reqs.add(req_id)
+    scheduler._ownership_generations[req_id] = "generation-1"
+    scheduler._ownership_remote_engines[req_id] = "prefill-0"
+    scheduler.update_connector_output(
+        SimpleNamespace(
+            finished_recving={req_id},
+            failed_recving={req_id} if failed else None,
+            finished_sending=None,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "status", ["FINISHED_ABORTED", "FINISHED_ERROR", "FINISHED_STOPPED"]
+)
+def test_completed_receive_releases_blocks_on_any_finish(status: str) -> None:
+    from vllm.v1.request import RequestStatus
+
+    scheduler = _aborted_recv_scheduler()
+    request = _failed_recv_request()
+    request.status = getattr(RequestStatus, status)
+    # The router cut a request D was already decoding.  Its completion
+    # dropped the generation, so no producer proof can follow, and only the
+    # completion itself shows that every WRITE landed.
+    _receive_completed(scheduler, request.request_id, failed=False)
+
+    delay_free, _params = scheduler.request_finished_all_groups(request, ([1, 2],))
+
+    assert delay_free is False
+    assert scheduler._reqs_not_processed_recv == set()
+    assert scheduler._recv_release_proofs == set()
+
+
+def test_failed_receive_completion_is_not_a_proof() -> None:
+    scheduler = _aborted_recv_scheduler()
+    request = _failed_recv_request()
+    # Rejected while its session was draining, after P had already accepted
+    # the destination blocks: P may still issue a late WRITE.
+    _receive_completed(scheduler, request.request_id, failed=True)
+
+    delay_free, _params = scheduler.request_finished_all_groups(request, ([1, 2],))
+
+    assert delay_free is True
+    assert scheduler._reqs_not_processed_recv == {request.request_id}
+
+
 @pytest.mark.parametrize(
     "error",
     [

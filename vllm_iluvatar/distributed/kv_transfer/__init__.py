@@ -54,7 +54,7 @@ def apply_kv_transfer_registrations() -> None:
             )
             del registered[name]
         KVConnectorFactory.register_connector(name, module_path, class_name)
-        logger.info(
+        logger.debug(
             "ILU KV connector registered: %s -> %s:%s",
             name,
             module_path,

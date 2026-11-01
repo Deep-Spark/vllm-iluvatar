@@ -592,6 +592,41 @@ class IluFusedMoEEP:
 
         return runner._maybe_add_zero_expert_output(final_hidden_states).view(org_shape)
 
+    @staticmethod
+    def _combine_agrs_output(
+        fused_output: torch.Tensor,
+        shared_output: torch.Tensor | None,
+        dist_group,
+        sizes: list[int],
+        *,
+        sequence_parallel: bool,
+    ) -> torch.Tensor:
+        """Return this rank's slice of the gathered routed output.
+
+        Shared experts are added into the local slice first. The default then
+        reduce-scatters over ``dist_group`` and, outside sequence parallel,
+        all-reduces that slice across TP. ``VLLM_ILU_FUSE_EP_COMBINE`` folds
+        those two collectives into one EP all-reduce. Sequence parallel keeps
+        the reduce-scatter: its ``dist_group`` is already the EP group.
+        """
+        rank = dist_group.rank_in_group
+        start = sum(sizes[:rank])
+        stop = start + sizes[rank]
+        if shared_output is not None:
+            fused_output[start:stop] += shared_output
+        fuse = (not sequence_parallel) and envs.VLLM_ILU_FUSE_EP_COMBINE
+        if fuse:
+            ep_comm = get_ep_group().device_communicator
+            assert ep_comm is not None and ep_comm.ixfd_group is not None
+            # Stream-ordered: the slice below runs on the same stream, so the
+            # dropped handle needs no explicit wait.
+            ixfd.all_reduce(fused_output, group=ep_comm.ixfd_group, async_op=True)
+            return fused_output[start:stop]
+        local = dist_group.reduce_scatterv(fused_output, dim=0, sizes=sizes)
+        if not sequence_parallel and get_tensor_model_parallel_world_size() > 1:
+            local = get_tp_group().all_reduce(local)
+        return local
+
     def forward_dp_ep_naive(
         self,
         hidden_states: torch.Tensor,
@@ -728,35 +763,19 @@ class IluFusedMoEEP:
         if runner._fused_output_is_reduced:
             raise NotImplementedError(
                 "IluDeepseekV4MoE.forward_dp_ep expects unreduced fused output "
-                "so shared and routed outputs can be added before one all-reduce."
+                "so shared and routed outputs can be added before the combine."
             )
 
         if shared_output is not None and fused_output.dtype == torch.float16:
             shared_output *= runner.shared_experts_scaling_factor
         fused_output = runner.apply_routed_output_transform(fused_output)
-        final_hidden_states = fused_output
-        if shared_output is not None:
-            shard_rank = (
-                get_ep_group().rank_in_group
-                if moe_config.is_sequence_parallel
-                else get_dp_group().rank_in_group
-            )
-            assert shard_rank < len(sizes)
-            shard_start = 0 if shard_rank == 0 else sum(sizes[:shard_rank])
-            shard_end = shard_start + sizes[shard_rank]
-            final_hidden_states[shard_start:shard_end] += shared_output
-        ep_comm = get_ep_group().device_communicator
-        assert ep_comm is not None and ep_comm.ixfd_group is not None
-        ixfd.all_reduce(final_hidden_states, group=ep_comm.ixfd_group, async_op=True)
-        shard_rank = (
-            get_ep_group().rank_in_group
-            if moe_config.is_sequence_parallel
-            else get_dp_group().rank_in_group
+        final_hidden_states = self._combine_agrs_output(
+            fused_output,
+            shared_output,
+            dist_group,
+            sizes,
+            sequence_parallel=moe_config.is_sequence_parallel,
         )
-        assert shard_rank < len(sizes)
-        shard_start = 0 if shard_rank == 0 else sum(sizes[:shard_rank])
-        shard_end = shard_start + sizes[shard_rank]
-        final_hidden_states = final_hidden_states[shard_start:shard_end]
         if post_xform_trunc_size is not None:
             final_hidden_states = final_hidden_states[..., :post_xform_trunc_size]
 

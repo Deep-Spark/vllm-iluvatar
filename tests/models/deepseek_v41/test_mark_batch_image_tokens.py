@@ -27,21 +27,36 @@ def test_mark_image_tokens_skips_item_sync_during_capture(monkeypatch) -> None:
     model._mark_batch_image_tokens(ids)
 
     assert ctx.ilu_v41_has_image_tokens is False
+    assert ctx.ilu_v41_image_token_pred is None
 
 
-def test_mark_image_tokens_eager_sets_flag(monkeypatch) -> None:
+def test_mark_image_tokens_eager_defers_the_flag(monkeypatch) -> None:
+    """Eager steps queue the predicate. The flag stays false until MoE."""
     model = _stub()
-    ctx = SimpleNamespace()
+    ctx = SimpleNamespace(ilu_v41_has_image_tokens=True)
     monkeypatch.setattr(
         "vllm_iluvatar.models.deepseek_v41.model.get_forward_context",
         lambda: ctx,
     )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    ids = torch.tensor([1, 99, 2])
 
-    model._mark_batch_image_tokens(ids)
+    model._mark_batch_image_tokens(torch.tensor([1, 99, 2]))
 
+    assert ctx.ilu_v41_has_image_tokens is False
+    assert bool(ctx.ilu_v41_image_token_pred.item()) is True
+
+
+def test_moe_resolves_image_token_flag_once() -> None:
+    from vllm_iluvatar._custom_ops import _take_v41_image_token_flag
+
+    ctx = SimpleNamespace(
+        ilu_v41_image_token_pred=torch.tensor(True),
+        ilu_v41_has_image_tokens=False,
+    )
+    assert _take_v41_image_token_flag(ctx) is True
+    assert ctx.ilu_v41_image_token_pred is None
     assert ctx.ilu_v41_has_image_tokens is True
+    assert _take_v41_image_token_flag(ctx) is True
 
 
 def test_mark_image_tokens_without_forward_context_does_not_raise(

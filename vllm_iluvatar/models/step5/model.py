@@ -23,7 +23,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
-from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory, MoERunner
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -77,9 +76,6 @@ def _checkpoint_parameter_audit(model: nn.Module) -> tuple[set[str], list[str]]:
                 continue
         expected.add(name)
     return (expected, exemptions)
-
-
-logger = init_logger(__name__)
 
 
 class Step5RMSNorm(nn.Module):
@@ -902,7 +898,7 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
         paired = getattr(self.model, "_online_expert_loader", None)
         if paired is not None:
             paired.finalize()
-        expected, exemptions = _checkpoint_parameter_audit(self)
+        expected, _ = _checkpoint_parameter_audit(self)
         missing = expected - loaded
         if missing:
             raise ValueError(
@@ -918,26 +914,6 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
             raise RuntimeError(
                 f"Step5 requires GPU-resident parameters: {cpu_parameters}"
             )
-        import json
-
-        offload = self.model.vllm_config.offload_config
-        logger.info(
-            "STEP5_LOAD_AUDIT %s",
-            json.dumps(
-                {
-                    "pp_rank": get_pp_group().rank_in_group,
-                    "tp_rank": get_tensor_model_parallel_rank(),
-                    "ep_rank": get_ep_group().rank_in_group,
-                    "ep_size": get_ep_group().world_size,
-                    "start": self.model.start_layer,
-                    "end": self.model.end_layer,
-                    "cpu_parameters": cpu_parameters,
-                    "cpu_offload_gb": offload.uva.cpu_offload_gb,
-                    "offload_group_size": offload.prefetch.offload_group_size,
-                    "checkpoint_exemptions": exemptions,
-                }
-            ),
-        )
         return loaded
 
 

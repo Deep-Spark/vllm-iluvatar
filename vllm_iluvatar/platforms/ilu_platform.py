@@ -287,22 +287,8 @@ def _make_iluvatar_platform():
             initialize_config(vllm_config)
 
             pc = getattr(vllm_config, "parallel_config", None)
-            import sys
-
-            print(
-                f"[ILU platform] check_and_update_config: "
-                f"pc={pc is not None}, "
-                f"worker_cls={getattr(pc, 'worker_cls', '<none>')!r}",
-                file=sys.stderr,
-                flush=True,
-            )
             if pc is not None and pc.worker_cls == "vllm.v1.worker.gpu_worker.Worker":
                 pc.worker_cls = "vllm_iluvatar.v1.worker.gpu_worker.IluWorker"
-                print(
-                    "[ILU platform] set worker_cls -> IluWorker",
-                    file=sys.stderr,
-                    flush=True,
-                )
 
             # Community ModelConfig only auto-selects the deepseek_v4 tokenizer
             # for the upstream "DeepseekV4ForCausalLM" arch. The Iluvatar W4A8

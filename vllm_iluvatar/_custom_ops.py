@@ -434,6 +434,22 @@ def topk_sigmoid(
     _mask_topk_padding(topk_weights, topk_ids, is_padding)
 
 
+def _take_v41_image_token_flag(ctx) -> bool:
+    """Resolve the image-token predicate on the first MoE call of this step.
+
+    ``_mark_batch_image_tokens`` only enqueues a device scalar. Reading it
+    here happens after that forward has already queued attention launches.
+    Later MoE layers reuse the cached bool and do not sync again.
+    """
+    pred = getattr(ctx, "ilu_v41_image_token_pred", None)
+    if pred is None:
+        return bool(getattr(ctx, "ilu_v41_has_image_tokens", False))
+    has_image_tokens = bool(pred.item())
+    ctx.ilu_v41_image_token_pred = None
+    ctx.ilu_v41_has_image_tokens = has_image_tokens
+    return has_image_tokens
+
+
 def topk_hash_softplus_sqrt(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -497,11 +513,12 @@ def topk_hash_softplus_sqrt(
         try:
             from vllm.forward_context import get_forward_context
 
-            has_image_tokens = bool(
-                getattr(get_forward_context(), "ilu_v41_has_image_tokens", False)
-            )
+            ctx = get_forward_context()
         except AssertionError:
-            has_image_tokens = False
+            ctx = None
+        has_image_tokens = (
+            False if ctx is None else _take_v41_image_token_flag(ctx)
+        )
     if has_image_tokens:
         # Vision-language bias: ixformer's kernel only takes a 1D
         # e_score_correction_bias broadcast across tokens, so fall back to

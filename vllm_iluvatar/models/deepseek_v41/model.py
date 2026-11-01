@@ -77,10 +77,6 @@ logger = init_logger(f"vllm.{__name__}")
 _V41_ALLREDUCE_MHC_POST = (
     os.environ.get("VLLM_ILU_V41_ALLREDUCE_MHC_POST", "1") == "1"
 )
-logger.info(
-    "V4.1 MHC fused allreduce=%s (0 = split NCCL all-reduce + hc_post_sqrsum)",
-    _V41_ALLREDUCE_MHC_POST,
-)
 
 
 def _ll_shared_dispatch_overlap_enabled() -> bool:
@@ -1011,17 +1007,25 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
             engram._rows = None
 
     def _mark_batch_image_tokens(self, input_ids: torch.Tensor | None) -> None:
-        has_image = False
+        # Leave the predicate on the device. ``.any().item()`` would sync the
+        # compute stream here, while the previous step's CUDA graph may still
+        # be running. The first MoE op reads it after this forward has queued
+        # more launches.
+        pred = None
         if (
             self.image_dead_token_id is not None
             and input_ids is not None
             and input_ids.numel() > 0
-            # `.any().item()` is a GPU→CPU sync; illegal while capturing.
             and not torch.cuda.is_current_stream_capturing()
         ):
-            has_image = bool((input_ids == self.image_dead_token_id).any().item())
+            pred = (input_ids == self.image_dead_token_id).any()
         try:
-            get_forward_context().ilu_v41_has_image_tokens = has_image
+            ctx = get_forward_context()
+            # Reset the resolved flag together with the predicate so a reader
+            # that runs before the first MoE layer cannot see the previous
+            # step's answer. False is the conservative default.
+            ctx.ilu_v41_has_image_tokens = False
+            ctx.ilu_v41_image_token_pred = pred
         except AssertionError:
             # ``get_forward_context`` asserts when no forward context is set
             # (tests, capture setup). Engram image masking does not use this

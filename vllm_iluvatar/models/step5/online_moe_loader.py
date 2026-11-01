@@ -14,9 +14,7 @@ from pathlib import Path
 
 import torch
 from safetensors import safe_open
-from vllm.logger import init_logger
 
-logger = init_logger(__name__)
 _BANK = re.compile(
     "^(?:model\\.)?layers\\.(\\d+)\\.moe\\.(gate_proj|up_proj|down_proj)\\.(weight|weight_scale_inv)$"
 )
@@ -38,7 +36,6 @@ class Step5OnlineExpertLoader:
         self.loaded_names = set()
         self.seen = set()
         self.completed = set()
-        self.staging_peak_bytes = 0
         self.expected = {}
         self.owned = {}
         for index, layer in layers.items():
@@ -103,7 +100,6 @@ class Step5OnlineExpertLoader:
                 f"Step5 online missing checkpoint mates: {sorted(missing)}"
             )
         budget = 2 * method._intermediate_size * method._hidden_size
-        layer_peak = 0
         with torch.device("cpu"), ExitStack() as stack:
             files = {
                 filename: stack.enter_context(
@@ -151,8 +147,6 @@ class Step5OnlineExpertLoader:
                             )
                         self.loaded_names.add(local_name)
                         current = self._staging_bytes()
-                        layer_peak = max(layer_peak, current)
-                        self.staging_peak_bytes = max(self.staging_peak_bytes, current)
                         if current > budget:
                             raise RuntimeError(
                                 f"Step5 online staging {current} exceeds one-expert budget {budget}"
@@ -166,22 +160,6 @@ class Step5OnlineExpertLoader:
                 f"Step5 online layer {index}: incomplete conversion count"
             )
         self.completed.add(index)
-        method._step5_loading_audit = {
-            "layer": index,
-            "local_experts": len(self.owned[index]),
-            "converted": method._conversions,
-            "pending_peak": method._pending_peak,
-            "staging_peak_bytes": layer_peak,
-            "cross_layer_staging_peak_bytes": self.staging_peak_bytes,
-            "staging_remaining_bytes": self._staging_bytes(),
-            "source_scale_semantics": "multiplicative",
-            "source_dtype": "float8_e4m3fn",
-            "converter_backend": method.converter_backend or "auto",
-            "gpu_allocated_after_layer": torch.cuda.memory_allocated(),
-            "gpu_reserved_after_layer": torch.cuda.memory_reserved(),
-            "gpu_max_allocated": torch.cuda.max_memory_allocated(),
-        }
-        logger.info("STEP5_ONLINE_LOAD %s", json.dumps(method._step5_loading_audit))
 
     def remaining_weights(self, weights, *, finalize=True):
         for name, tensor in weights:

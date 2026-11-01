@@ -479,14 +479,6 @@ class IluFp8PerChannelOnlineLinearMethod(OnlineLinearBase):
             layer.__dict__.pop("_ilu_fp8_staging", None)
         layer._can_use_gemm = True
         layer._already_called_process_weights_after_loading = True
-        logger.info(
-            "Online FP8 ready for %s: dtype=%s shape=%s scale_shape=%s gemv=%s",
-            getattr(layer, "prefix", "<unknown>"),
-            layer.weight.dtype,
-            tuple(layer.weight.shape),
-            tuple(layer.weight_scale.shape),
-            self.gemm_format == "TN",
-        )
 
     def supports_prequantized_input(self, layer: torch.nn.Module) -> bool:
         """Whether this initialized layer consumes per-token E4M3 activations."""

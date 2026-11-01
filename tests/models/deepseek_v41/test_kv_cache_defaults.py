@@ -57,7 +57,7 @@ def test_retains_community_model_state_contract():
         IluDeepseekV41ForCausalLM,
     )
 
-    assert IluDeepseekV41ForCausalLM.get_model_state_cls() is DeepseekV41ModelState
+    assert issubclass(IluDeepseekV41ForCausalLM.get_model_state_cls(), DeepseekV41ModelState)
 
 
 @pytest.mark.parametrize("enabled", [False, True])

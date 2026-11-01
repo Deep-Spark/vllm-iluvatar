@@ -199,6 +199,10 @@ def test_main_backend_negotiates_physical_page_for_indexer(
 
 
 def test_int8_indexer_splits_ratio_pages(monkeypatch):
+    from vllm.config import CacheConfig
+    from vllm.v1.worker.utils import select_common_block_size
+
+    from vllm_iluvatar.models.deepseek_v41.attention import IluDeepseekV41IndexerCache
     from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
         IluDeepseekV41IndexerBackend,
         IluDeepseekV41IndexerRatio2Backend,
@@ -212,6 +216,21 @@ def test_int8_indexer_splits_ratio_pages(monkeypatch):
     assert IluDeepseekV41IndexerRatio2Backend.get_supported_kernel_block_sizes() == [
         128
     ]
+    cache_config = CacheConfig(block_size=64, cache_dtype="bfloat16")
+    for ratio, expected in ((1, 64), (2, 128)):
+        layer = object.__new__(IluDeepseekV41IndexerCache)
+        layer.cache_config = cache_config
+        layer.record = "int8"
+        layer.compress_ratio = ratio
+        layer.dtype = torch.uint8
+        layer.head_dim = 132
+        layer.split_indexer = True
+        layer.prefix = f"layer.r{ratio}"
+        spec = layer.get_kv_cache_spec(SimpleNamespace())
+        backend = indexer_backend_cls(ratio)
+        assert spec.block_size == expected
+        assert spec.storage_block_size is None
+        assert select_common_block_size(spec.block_size, [backend]) == expected
 
 
 @pytest.mark.parametrize("n", [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64])

@@ -41,6 +41,7 @@ def indexer_k_norm_rope_store(
     compress_ratio: int,
     record: str,
     row_out: torch.Tensor | None = None,
+    scales: torch.Tensor | None = None,
 ) -> None:
     """k_norm -> RoPE -> store for indexer keys.
 
@@ -75,6 +76,23 @@ def indexer_k_norm_rope_store(
     num_tokens = kv_slot_mapping.numel()
     assert num_tokens <= k_pre.shape[0] and num_tokens <= positions.numel()
     if num_tokens == 0:
+        return
+
+    if scales is not None:
+        if record != "int8":
+            raise ValueError("Separate indexer scales require INT8 keys")
+        ixfops.indexer_norm_rope_int8_store_split(
+            k_pre,
+            positions,
+            cos_sin_cache,
+            rms_norm_weight,
+            rms_norm_eps,
+            k_cache,
+            scales,
+            kv_slot_mapping,
+            compress_ratio,
+            row_out,
+        )
         return
 
     ixfops.indexer_k_norm_rope_store(

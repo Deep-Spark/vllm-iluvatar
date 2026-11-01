@@ -18,11 +18,13 @@ Override summary (each marked with ``# [ILU override]`` in-line):
   _maybe_apply_routed_scale_to_output  FP16 shared_experts_scaling_factor
   do_naive_dispatch_combine         drop supports_internal_mk check
   _kernel_handles_own_dispatch      new property (monolithic W16A16 guard)
+  _ilu_fused_ep_combine + helpers   5 collectives per layer -> 2 (PCP/tuple safe)
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -31,13 +33,21 @@ from vllm.config import get_current_vllm_config
 from vllm.distributed import get_dp_group, get_ep_group, get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
     MoERunner,
     _moe_forward_shared,
     _unpack,
 )
+from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
+    ZeroExpertRouter,
+)
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExpertsOrder,
+)
+
+from vllm_iluvatar.model_executor.layers.fused_moe.ilu_moe_padding import (
+    _gathered_router_padding,
 )
 
 logger = init_logger(__name__)
@@ -76,7 +86,12 @@ class IluMoERunner(MoERunner):
         # the benchmarks and serving were measured with it enabled.
         self._gather_before_gate_enabled = envs.VLLM_ILU_GLM5NEXT_GATHER_BEFORE_GATE
 
-        if get_current_vllm_config().parallel_config.enable_elastic_ep:
+        # Read here rather than in forward: the thread-local VllmConfig is not
+        # guaranteed to be set during CUDA graph capture.
+        self._ilu_elastic_ep = bool(
+            get_current_vllm_config().parallel_config.enable_elastic_ep
+        )
+        if self._ilu_elastic_ep:
             from vllm_iluvatar.model_executor.layers.fused_moe.runner.ilu_elastic_ep import (  # noqa: E501
                 install_ilu_elastic_ep_patches,
             )
@@ -110,6 +125,25 @@ class IluMoERunner(MoERunner):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self._ilu_fused_ep_combine:
+            if isinstance(hidden_states, tuple):
+                assert len(hidden_states) == 3, (
+                    "Expected hidden_states tuple of "
+                    "(quantized_output, output_scales, fp_output)"
+                )
+                shared_experts_input = (
+                    *hidden_states[:2],
+                    hidden_states[-1].dtype,
+                )
+                hidden_states = hidden_states[-1]
+                hidden_states, _ = super().apply_routed_input_transform(hidden_states)
+                return self._forward_fused_ep_combine(
+                    hidden_states, router_logits, input_ids, shared_experts_input
+                )
+            return self._forward_fused_ep_combine(
+                hidden_states, router_logits, input_ids, None
+            )
+
         if not isinstance(hidden_states, tuple):
             return super().forward(hidden_states, router_logits, input_ids)
 
@@ -321,6 +355,10 @@ class IluMoERunner(MoERunner):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         self.routed_experts._ensure_moe_quant_config_init()
+        if getattr(self, "_ilu_fused_ep_combine", False):
+            return self._forward_impl_fused_ep_combine(
+                hidden_states, router_logits, shared_experts_input, input_ids
+            )
         dispatch_before_gate = self._dispatch_before_gate()
         # vLLM v0.31.0 (db9527a468) removed ``_maybe_sync_shared_experts_stream`` (the
         # pre-dispatch aux-stream sync) and replaced it with
@@ -455,3 +493,198 @@ class IluMoERunner(MoERunner):
         )
 
         return ilu_kernel_handles_own_dispatch(self._quant_method)
+
+    # ------------------------------------------------------------------
+    # [ILU addition] fused EP combine — collective launch reduction
+    # ------------------------------------------------------------------
+    # On the AG/RS naive DP+EP path the community schedule costs five
+    # collective launches per MoE layer. Feat's runner still owns PCP
+    # all-gather and the fused-norm-quant tuple path, so this fast path
+    # is rewritten against those contracts rather than the 0.30 runner:
+    #
+    #   * all-gather only hidden_states (and input_ids if hash routing)
+    #   * recompute the gate after the gather
+    #   * fold this rank's shared-expert partial into its DP rows
+    #   * one EP all-reduce replaces DP reduce-scatter + TP all-reduce
+    #
+    # PCP, SP, elastic EP, EPLB and kernels that already reduce stay on
+    # the community schedule. Kill switch: ``VLLM_ILU_FUSE_EP_COMBINE=0``.
+    @property
+    def _ilu_fused_ep_combine(self) -> bool:
+        cached = self.__dict__.get("_ilu_fused_ep_combine_cached")
+        if cached is None:
+            cached = self._ilu_compute_fused_ep_combine()
+            self.__dict__["_ilu_fused_ep_combine_cached"] = cached
+        return cached
+
+    def _ilu_compute_fused_ep_combine(self) -> bool:
+        """Config-only eligibility check, evaluated once on first forward."""
+        if not envs.VLLM_ILU_FUSE_EP_COMBINE:
+            return False
+
+        moe = self.moe_config
+        reasons: list[str] = []
+        if getattr(self, "_ilu_elastic_ep", False):
+            reasons.append("elastic_ep")
+        if getattr(getattr(moe, "moe_parallel_config", None), "enable_eplb", False):
+            reasons.append("eplb")
+        if not self.do_naive_dispatch_combine:
+            reasons.append("not_naive_dispatch_combine")
+        if self._kernel_handles_own_dispatch:
+            reasons.append("kernel_owns_dispatch")
+        if getattr(self, "_fused_output_is_reduced", False):
+            reasons.append("fused_output_already_reduced")
+        if getattr(moe, "ep_size", 1) <= 1:
+            reasons.append(f"ep_size={getattr(moe, 'ep_size', 1)}")
+        if getattr(moe, "is_sequence_parallel", False):
+            reasons.append("sequence_parallel")
+        if getattr(moe, "pcp_size", 1) != 1:
+            reasons.append(f"pcp_size={getattr(moe, 'pcp_size', 1)}")
+        if getattr(self, "gate", None) is None:
+            reasons.append("no_gate")
+        if moe.in_dtype == torch.float16:
+            reasons.append("fp16_shared_scaling")
+        if self._is_unquantized_fused_moe_method():
+            reasons.append("unquantized_output_scale")
+        if getattr(self, "routed_output_transform", None) is not None:
+            reasons.append("routed_output_transform")
+        if getattr(moe, "skip_final_all_reduce", False):
+            reasons.append("skip_final_all_reduce")
+        if isinstance(getattr(self, "router", None), ZeroExpertRouter):
+            reasons.append("zero_expert_router")
+        if getattr(self, "is_monolithic", False):
+            reasons.append("monolithic_quant_method")
+
+        enabled = not reasons
+        logger.debug(
+            "ILU fused EP combine: %s%s",
+            "enabled" if enabled else "disabled",
+            "" if enabled else " (" + ", ".join(reasons) + ")",
+        )
+        return enabled
+
+    def _ilu_dp_chunk_sizes(self) -> list[int]:
+        """Per-DP-rank token counts, readable outside the SP context.
+
+        Sequence parallelism is rejected by the eligibility check, so
+        ``num_tokens_across_dp_cpu`` is the chunk list all-gatherv uses.
+        """
+        # Eligibility already rejects sequence parallelism.
+        dp_metadata = get_forward_context().dp_metadata
+        assert dp_metadata is not None
+        return dp_metadata.num_tokens_across_dp_cpu.tolist()
+
+    @property
+    def _ilu_router_reads_input_ids(self) -> bool:
+        """Whether ``input_ids`` still has to be put on the wire."""
+        router = getattr(self, "router", None)
+        return (
+            getattr(router, "_hash_indices_table", None) is not None
+            or getattr(router, "bias_vl", None) is not None
+        )
+
+    def _forward_impl_fused_ep_combine(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+        input_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        """``_forward_impl`` with a 1-tensor DP gather and no combine."""
+        dp_group = get_dp_group()
+        sizes = self._ilu_dp_chunk_sizes()
+        assert sizes[dp_group.rank_in_group] == hidden_states.shape[0], (
+            f"{sizes[dp_group.rank_in_group]} != {hidden_states.shape[0]}"
+        )
+
+        with self._sequence_parallel_context():
+            if input_ids is not None and self._ilu_router_reads_input_ids:
+                hidden_states, input_ids = dp_group.all_gatherv(
+                    [hidden_states, input_ids], dim=0, sizes=sizes
+                )
+            else:
+                hidden_states = dp_group.all_gatherv(
+                    hidden_states, dim=0, sizes=sizes
+                )
+                input_ids = None
+
+            assert self.gate is not None
+            if self._fse_fuse_gate:
+                self._maybe_fuse_gate_weights()
+                router_logits = F.linear(hidden_states, self._combined_gate_weight)
+            else:
+                router_logits, _ = self.gate(hidden_states)
+
+            with _gathered_router_padding(get_forward_context(), dp_group, sizes):
+                shared_output, fused_output = self._apply_quant_method(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    shared_experts_input=shared_experts_input,
+                    input_ids=input_ids,
+                )
+
+        assert not isinstance(fused_output, UnfinalizedMoEOutput), (
+            "fused EP combine requires a materialized routed output"
+        )
+        return shared_output, fused_output
+
+    def _forward_fused_ep_combine(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """``forward`` tail with RS(DP) + AR(TP) folded into AR(EP)."""
+        if shared_experts_input is None:
+            hidden_states, shared_experts_input = self.apply_routed_input_transform(
+                hidden_states
+            )
+
+        # Tuple shared input from fused norm-quant has no ``.shape[-1]``.
+        pad_input = (
+            None if isinstance(shared_experts_input, tuple) else shared_experts_input
+        )
+        hidden_states, og_hidden_dim_pre_xform, og_hidden_dim_post_xform = (
+            self._maybe_pad_hidden_states(
+                pad_input,
+                hidden_states,
+            )
+        )
+
+        result = self._forward_entry(
+            hidden_states,
+            router_logits,
+            shared_experts_input,
+            input_ids,
+            self._encode_layer_name(),
+            self.moe_config.hidden_dim_unpadded
+            if self._quant_method.has_unpadded_output
+            else 0,
+        )
+
+        shared_output, fused_output = _unpack(result)
+        fused_output = cast(torch.Tensor, fused_output)
+
+        if og_hidden_dim_pre_xform is not None:
+            fused_output = fused_output[..., :og_hidden_dim_pre_xform]
+        fused_output = fused_output.contiguous()
+
+        sizes = self._ilu_dp_chunk_sizes()
+        dp_rank = get_dp_group().rank_in_group
+        start = sum(sizes[:dp_rank])
+        end = start + sizes[dp_rank]
+        assert fused_output.shape[0] == sum(sizes), (
+            f"{fused_output.shape[0]} != {sum(sizes)}"
+        )
+
+        if shared_output is not None:
+            fused_output[start:end] += shared_output
+
+        fused_output = get_ep_group().all_reduce(fused_output)
+        result = fused_output[start:end]
+
+        if og_hidden_dim_post_xform is not None:
+            result = result[..., :og_hidden_dim_post_xform]
+        return result
+

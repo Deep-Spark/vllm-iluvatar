@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import os
 from typing import TYPE_CHECKING
 
 import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import envs
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
@@ -60,11 +61,39 @@ def nvsm_dispatch_quant_kwargs(
         "use_int8": use_int8,
         "use_fp8": use_fp8,
     }
+    # Standard MoE top-k selects distinct experts for each token, including
+    # physical IDs after EPLB mapping. This optional NVSM contract reduces
+    # each expert's receive capacity to world_size * max_input_tokens; the
+    # library's default retains support for callers with duplicate routes.
+    unique_topk = os.environ.get("IXFORMER_NVSM_UNIQUE_TOPK", "0")
+    if unique_topk not in ("0", "1"):
+        raise ValueError("IXFORMER_NVSM_UNIQUE_TOPK must be 0 or 1")
+    if unique_topk == "1":
+        kwargs["unique_topk"] = True
+    reuse_ipc = os.environ.get("IXFORMER_NVSM_REUSE_EP_COMM", "0")
+    if reuse_ipc not in ("0", "1"):
+        raise ValueError("IXFORMER_NVSM_REUSE_EP_COMM must be 0 or 1")
+    if reuse_ipc == "1":
+        # The EP device communicator is initialized before MoE weight loading.
+        # Reuse only its IPC setup transport, never NVSM data or signal buffers.
+        kwargs["ipc_group"] = get_ep_group().device_group
     if use_fp8:
         kwargs.update(
             fp8_format=current_platform.fp8_dtype(),
             fp8_group_size=None,
         )
+
+    # Dispatch quantization does not select the Combine wire format. Expose
+    # the FP8 Combine implemented by the fused AG/AR kernel as an opt-in.
+    combine_fp8 = os.environ.get("IXFORMER_NVSM_COMBINE_FP8", "0")
+    if combine_fp8 not in ("0", "1"):
+        raise ValueError("IXFORMER_NVSM_COMBINE_FP8 must be 0 or 1")
+    if combine_fp8 == "1":
+        kwargs["use_combine_fp8"] = True
+        kwargs.setdefault("fp8_format", current_platform.fp8_dtype())
+        if kwargs.get("fp8_group_size") is None:
+            # Fused Combine AG/AR does not support per-token FP8.
+            kwargs["fp8_group_size"] = 128
     return kwargs
 
 
@@ -256,8 +285,11 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                     )
                 self.buffer = self.buffer.buffer
 
+            split_dispatch = os.environ.get("IXFORMER_NVSM_DISPATCH_VARIANT") == "batch_split"
+            dispatch_fn = (nvsm_ep.nvsm_low_latency_dispatch_begin if split_dispatch
+                           else nvsm_ep.nvsm_low_latency_dispatch)
             recv_x, num_tokens_per_local_experts_gpu, recv_scales, *_ = (
-                nvsm_ep.nvsm_low_latency_dispatch(
+                dispatch_fn(
                     self.buffer, a1, topk_ids.int(), topk_weights
                 )
             )
@@ -266,10 +298,15 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 expert_num_tokens=num_tokens_per_local_experts_gpu,
                 expert_num_tokens_cpu=None,
             )
-            return (
-                lambda: 1,
-                lambda: (recv_x, recv_scales, expert_tokens_meta, None, None),
-            )
+            def receive():
+                if split_dispatch:
+                    nvsm_ep.nvsm_low_latency_dispatch_finish(self.buffer, recv_x, recv_scales)
+                return recv_x, recv_scales, expert_tokens_meta, None, None
+
+            if split_dispatch and not getattr(self, "_split_dispatch_reported", False):
+                print("NVSM_SPLIT_RECEIVER_ACTIVE", flush=True)
+                self._split_dispatch_reported = True
+            return (lambda: 1, receive)
 
         # Dispatch
         dispatch_topk_ids = self._map_global_to_physical_ids(topk_ids)

@@ -16,6 +16,7 @@ from ixformer.inference.functions import (
     flash_mla_sparse_with_kvcache,
 )
 from torch import nn
+from vllm import envs
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -58,7 +59,22 @@ from vllm_iluvatar.models.deepseek_v41.common.ops import (
 from vllm_iluvatar.models.deepseek_v41.compressor import (
     IluDeepseekCompressor,
 )
+from vllm_iluvatar.models.deepseek_v41.indexer_kv import (
+    SPLIT_INDEXER_FORMAT,
+    indexer_kv_layout,
+)
 from vllm_iluvatar.models.deepseek_v41.rope import apply_rope
+from vllm_iluvatar.models.deepseek_v41.compressed_kv import (
+    main_kv_format,
+    move_quantized_records,
+)
+from vllm_iluvatar.models.deepseek_v41.compressed_kv_restore import (
+    CompressedFamilySelection,
+    TensorLayoutKey,
+    TensorViewKey,
+    compact_owner_capacity,
+    family_key,
+)
 from vllm_iluvatar.models.deepseek_v41.sparse_mla import (
     IluDeepseekSparseSWAFlashMLABackend,
     IluDeepseekV4FlashMLABackend,
@@ -253,13 +269,18 @@ def _replace_layer_index(prefix: str, layer_id: int) -> str:
 # ``VLLM_ILU_V41_INDEXER_KV_DTYPE``; unset stays fp8.
 _INDEXER_KV_DTYPE = indexer_kv_dtype()
 
-# Quantized index pages are allocated at a power-of-two row so page unification
-# can divide the sliding-window page (65536 bytes). The record itself stays
-# 132 bytes; ``bind_kv_cache`` narrows the view and keeps the allocated pitch
-# in ``stride(0)``. FP8 stays on the contiguous 132-byte spec.
+# Legacy packed pages reserve a power-of-two row width to satisfy common-page
+# unification. Split INT8 pages instead allocate 128-byte values here and budget
+# FP32 scales through indexer_kv, preserving the 132-byte PP record on the wire.
+# ``bind_kv_cache`` still narrows packed views; FP8 stays on the 132-byte spec.
 _INDEX_PAGE_ROW_BYTES = 256
 
+_INDEXER_SCRATCH_CACHE: dict[tuple, dict[str, torch.Tensor]] = {}
+_INDEXER_LOGITS_CACHE: dict[tuple[int, int], torch.Tensor] = {}
+_ATTN_SCRATCH_CACHE: dict[tuple, dict[str, torch.Tensor]] = {}
+
 _DBG_TOPK = os.environ.get("VLLM_V41_DEBUG_TOPK", "0") == "1"
+
 _dbg_topk_seen: dict[str, int] = {}
 
 
@@ -317,6 +338,9 @@ def _indexer_k_cache_row(index_head_dim: int, kv_dtype: str) -> tuple[int, torch
 class IluDeepseekV41IndexerCache(torch.nn.Module, AttentionLayerBase):
     """The paged index-key cache an ``owns_k`` layer publishes into."""
 
+    split_indexer = False
+    prefix = ""
+
     def __init__(
         self,
         head_dim: int,
@@ -333,6 +357,8 @@ class IluDeepseekV41IndexerCache(torch.nn.Module, AttentionLayerBase):
         self.dtype = dtype
         self.record = _INDEXER_KV_DTYPE
         self.compress_ratio = compress_ratio
+        self.split_indexer = indexer_kv_layout() == "split"
+        self.kv_cache_scales = None
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -351,6 +377,17 @@ class IluDeepseekV41IndexerCache(torch.nn.Module, AttentionLayerBase):
         # [B, H=1, N, C] -> [B, N, C]
         cache = kv_cache.squeeze(1)
         cache[0].zero_()
+        if self.split_indexer:
+            if cache.shape[-1] != 128:
+                raise ValueError("Split indexer payload must contain 128 INT8 values")
+            owner = getattr(self, "_indexer_scale_owner", None)
+            if owner is None:
+                raise RuntimeError(
+                    "Split indexer scales must be bound before its payload"
+                )
+            owner.bind(self.prefix, cache)
+            self.kv_cache = cache
+            return
         if cache.size(-1) != self.head_dim:
             # INT8 pages are allocated at ``_INDEX_PAGE_ROW_BYTES`` and narrowed
             # here. Page pitch stays in stride(0); the row is the 132-byte record.
@@ -362,16 +399,22 @@ class IluDeepseekV41IndexerCache(torch.nn.Module, AttentionLayerBase):
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         del vllm_config
-        # INT8 ratio-1 cannot share the 128-token manager page. States per page
-        # are ``block_size / compress_ratio``, and ixinfer only accepts 64 or
-        # 256. Ratio-2 at 128 tokens is 64 states; ratio-1 at 128 tokens is
-        # 128 states. v0.31 packs MLA specs with the same ``block_size`` into
-        # one KV group and then requires one kernel block for every backend in
-        # it, so the two ratios have to be different block sizes to land in
-        # different groups. 64 tokens is one legal page and needs no split.
+        # INT8 mqa-logits pages 64 or 256 states. A kernel block is counted in
+        # tokens, so ratio-1 stays at 64 and ratio-2 needs 128. Platform
+        # negotiation leaves ``cache_config.block_size`` at the INT8 preferred
+        # 64, and v0.31 then packs same-``block_size`` MLA specs into one group
+        # and asks ``select_common_block_size`` for one kernel size. Forcing
+        # both pages here keeps the two ratios in different groups and makes
+        # the manager size match the ratio-2 backend's [128].
+        record = getattr(
+            self, "record", "int8" if self.dtype is torch.uint8 else "bf16"
+        )
         block_size = self.block_size
-        if self.record == "int8" and self.compress_ratio == 1:
-            block_size = 64
+        if record == "int8":
+            if self.compress_ratio == 1:
+                block_size = 64
+            elif self.compress_ratio == 2:
+                block_size = 128
         if block_size % self.compress_ratio:
             raise ValueError(
                 f"block_size {block_size} must be a multiple of "
@@ -379,7 +422,7 @@ class IluDeepseekV41IndexerCache(torch.nn.Module, AttentionLayerBase):
                 f"fractional row (layer {self.prefix})"
             )
         rows_per_page = block_size // self.compress_ratio
-        if self.record == "fp8" and rows_per_page % 64:
+        if record == "fp8" and self.prefix and rows_per_page % 64:
             raise ValueError(
                 f"FP8 indexer requires rows_per_page % 64 == 0, got "
                 f"{rows_per_page} at {self.prefix}; use --block-size 128"
@@ -387,24 +430,25 @@ class IluDeepseekV41IndexerCache(torch.nn.Module, AttentionLayerBase):
         # INT8 is allocated wider than the record so the page byte count is a
         # power of two. FP8 keeps the contiguous 132-byte row.
         head_size = (
-            _INDEX_PAGE_ROW_BYTES if self.record == "int8" else self.head_dim
+            _INDEX_PAGE_ROW_BYTES if record in ("int8", "fp8") else self.head_dim
         )
         logger.info_once(
             "Indexer cache %s: record=%s dtype=%s row_width=%d "
             "rows_per_page=%d",
             self.prefix,
-            self.record,
+            record,
             self.dtype,
             head_size,
             rows_per_page,
         )
-        if self.record == "int8":
+        if record == "int8":
             return MLAAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=1,
-                head_size=head_size,
+                head_size=128 if self.split_indexer else head_size,
                 dtype=self.dtype,
                 tokens_per_state=self.compress_ratio,
+                cache_dtype_str=SPLIT_INDEXER_FORMAT if self.split_indexer else None,
             )
         return MLAAttentionSpec(
             block_size=block_size,
@@ -514,23 +558,35 @@ class IluDeepseekV41Indexer(nn.Module):
         self.k_cache = k_cache
         if self.record in ("fp8", "int8"):
             max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-            self.weights_fp32_buffer = torch.empty(
-                (max_tokens, self.n_head),
-                dtype=torch.float32,
-                device="cuda",
-            )
+            dev_idx = torch.cuda.current_device()
+            idx_key = (dev_idx, max_tokens, self.n_head, self.head_dim, self.record)
+            idx_scratch = _INDEXER_SCRATCH_CACHE.get(idx_key)
+            if idx_scratch is None:
+                idx_scratch = {
+                    "weights_fp32": torch.empty(
+                        (max_tokens, self.n_head),
+                        dtype=torch.float32,
+                        device="cuda",
+                    ),
+                }
+                if self.record == "fp8":
+                    idx_scratch["q_quant"] = torch.empty(
+                        (max_tokens, self.n_head, self.head_dim),
+                        dtype=torch.float8_e4m3fn,
+                        device="cuda",
+                    )
+                else:
+                    idx_scratch["q_quant"] = torch.empty(
+                        (max_tokens, self.n_head, self.head_dim),
+                        dtype=torch.int8,
+                        device="cuda",
+                    )
+                _INDEXER_SCRATCH_CACHE[idx_key] = idx_scratch
+            self.weights_fp32_buffer = idx_scratch["weights_fp32"]
             if self.record == "fp8":
-                self.q_fp8_buffer = torch.empty(
-                    (max_tokens, self.n_head, self.head_dim),
-                    dtype=torch.float8_e4m3fn,
-                    device="cuda",
-                )
+                self.q_fp8_buffer = idx_scratch["q_quant"]
             else:
-                self.q_int8_buffer = torch.empty(
-                    (max_tokens, self.n_head, self.head_dim),
-                    dtype=torch.int8,
-                    device="cuda",
-                )
+                self.q_int8_buffer = idx_scratch["q_quant"]
             if not hasattr(k_cache, "logits_buffer"):
                 decode_rows = max(
                     vllm_config.compilation_config.max_cudagraph_capture_size or 0,
@@ -544,10 +600,25 @@ class IluDeepseekV41Indexer(nn.Module):
                         )
                     ),
                 )
-                k_cache.logits_buffer = torch.empty(
-                    (decode_rows, (self.max_model_len + 31) // 32 * 32),
-                    dtype=torch.bfloat16,
-                    device="cuda",
+                stride = (self.max_model_len + 31) // 32 * 32
+                full_stride = max(
+                    stride,
+                    (vllm_config.model_config.max_model_len + 31) // 32 * 32,
+                )
+                logits_key = (dev_idx, decode_rows)
+                shared_logits = _INDEXER_LOGITS_CACHE.get(logits_key)
+                if (
+                    shared_logits is None
+                    or shared_logits.numel() < decode_rows * full_stride
+                ):
+                    shared_logits = torch.empty(
+                        (decode_rows * full_stride,),
+                        dtype=torch.bfloat16,
+                        device="cuda",
+                    )
+                    _INDEXER_LOGITS_CACHE[logits_key] = shared_logits
+                k_cache.logits_buffer = shared_logits[: decode_rows * stride].view(
+                    decode_rows, stride
                 )
 
         # Scoring and selection live behind the platform's subclass of official's
@@ -567,6 +638,17 @@ class IluDeepseekV41Indexer(nn.Module):
             candidate_blocks=candidate_block_buffer,
             candidate_block_size=candidate_block_size,
             candidate_write=candidate_write,
+            owned_decode_state=(
+                self.record == "int8"
+                and self.n_head == 32
+                and self.head_dim == 128
+                and topk_indices_buffer is not None
+                and topk_indices_buffer.is_cuda
+                and 1 <= vllm_config.scheduler_config.max_num_seqs <= 4
+                and vllm_config.speculative_config is not None
+                and vllm_config.speculative_config.num_speculative_tokens == 5
+            ),
+            max_num_decode_seqs=vllm_config.scheduler_config.max_num_seqs,
         )
 
     def _produce_k(
@@ -609,6 +691,7 @@ class IluDeepseekV41Indexer(nn.Module):
             self.compress_ratio,
             self.record,
             row_out=self.k_row_buffer,
+            scales=self.k_cache.kv_cache_scales,
         )
 
     def forward(
@@ -720,6 +803,13 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
     ``kv_source_layer_ids`` do; the rest read that cache.
     """
 
+    compressed_kv_format = None
+    compressed_decode_restore = False
+    kv_cache_scales = None
+    compressed_kv_workspace = None
+    main_kv_scale_rows = None
+    main_scale_transfer_width = 0
+
     backend_cls: ClassVar[type[AttentionBackend]] = IluDeepseekV4FlashMLABackend
     swa_backend_cls: ClassVar[type[AttentionBackend]] = (
         IluDeepseekSparseSWAFlashMLABackend
@@ -778,6 +868,11 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 f"{self.compress_ratio}; only 0 (sliding window), 1 and 2 are "
                 "supported."
             )
+        self.compressed_kv_format = main_kv_format()
+        self.compressed_decode_restore = envs.VLLM_ILU_DS41_DECODE_KV_RESTORE
+        self.kv_cache_scales = None
+        self.compressed_kv_workspace = None
+        self.main_kv_scale_rows = None
         self.kv_source_layers = tuple(
             getattr(config, "kv_source_layer_ids", None) or ()
         )
@@ -898,35 +993,60 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         self.candidate_block_buffer = candidate_block_buffer
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         device = current_platform.device_type
-        self._attn_out = torch.zeros(
+        dev_idx = torch.cuda.current_device() if torch.cuda.is_available() else -1
+        window_cols = max(256, ((self.window_size + 255) // 256) * 256)
+        scratch_key = (
+            dev_idx,
             max_tokens,
             self.n_local_heads,
             self.head_dim,
-            dtype=torch.bfloat16,
-            device=device,
+            config.index_topk,
+            self.window_size,
         )
-        self._global_topk = torch.full(
-            (max_tokens, config.index_topk),
-            -1,
-            dtype=torch.int32,
-            device=device,
-        )
-        self._global_topk_lens = torch.zeros(
-            max_tokens, dtype=torch.int32, device=device
-        )
-        # A 256-wide row satisfies the FP8 reader's tile-stride contract.
-        self._window_idx = torch.full(
-            (max_tokens, 256),
-            -1,
-            dtype=torch.int32,
-            device=device,
-        )
-        self._window_lens = torch.zeros(max_tokens, dtype=torch.int32, device=device)
-        self._insert_slots = torch.full(
-            (max_tokens,), -1, dtype=torch.int64, device=device
-        )
-        self._window_offsets = torch.arange(self.window_size, device=device)
-        self._draft_window_offsets = torch.arange(256, device=device)
+        scratch = _ATTN_SCRATCH_CACHE.get(scratch_key)
+        if scratch is None:
+            scratch = {
+                "_attn_out": torch.zeros(
+                    max_tokens,
+                    self.n_local_heads,
+                    self.head_dim,
+                    dtype=torch.bfloat16,
+                    device=device,
+                ),
+                "_global_topk": torch.full(
+                    (max_tokens, config.index_topk),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                "_global_topk_lens": torch.zeros(
+                    max_tokens, dtype=torch.int32, device=device
+                ),
+                # A 256-wide row satisfies the FP8 reader's tile-stride contract.
+                "_window_idx": torch.full(
+                    (max_tokens, window_cols),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                "_window_lens": torch.zeros(
+                    max_tokens, dtype=torch.int32, device=device
+                ),
+                "_insert_slots": torch.full(
+                    (max_tokens,), -1, dtype=torch.int64, device=device
+                ),
+                "_window_offsets": torch.arange(self.window_size, device=device),
+                "_draft_window_offsets": torch.arange(window_cols, device=device),
+            }
+            _ATTN_SCRATCH_CACHE[scratch_key] = scratch
+        self._attn_out = scratch["_attn_out"]
+        self._global_topk = scratch["_global_topk"]
+        self._global_topk_lens = scratch["_global_topk_lens"]
+        self._window_idx = scratch["_window_idx"]
+        self._window_lens = scratch["_window_lens"]
+        self._insert_slots = scratch["_insert_slots"]
+        self._window_offsets = scratch["_window_offsets"]
+        self._draft_window_offsets = scratch["_draft_window_offsets"]
 
         # Register with compilation context for metadata lookup. Done before
         # indexer/compressor creation so consumers can resolve their source
@@ -1067,6 +1187,15 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 "Use fp8_ds_mla, bfloat16 or fp8_e4m3."
             )
         self.main_transfer_dtype = self.kv_cache_torch_dtype
+        self.main_scale_transfer_width = 0
+        if self.compressed_kv_format is not None:
+            self.main_transfer_width = self.compressed_kv_format.payload_bytes(
+                self.head_dim
+            )
+            self.main_transfer_dtype = torch.uint8
+            self.main_scale_transfer_width = self.compressed_kv_format.scale_groups(
+                self.head_dim
+            )
         (
             self.indexer_transfer_width,
             self.indexer_transfer_dtype,
@@ -1147,6 +1276,19 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         # a pipeline cut left on an earlier rank.
         if not self.is_kv_source and not self.is_kv_forwarder:
             return None
+        if self.compressed_kv_format is not None:
+            fmt = self.compressed_kv_format
+            block_size = fmt.rows_per_page(self.head_dim) * self.compress_ratio
+            return MLAAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=self.head_dim,
+                dtype=torch.uint8,
+                state_content_bytes=fmt.payload_bytes(self.head_dim),
+                tokens_per_state=self.compress_ratio,
+                cache_dtype_str=fmt.name,
+                storage_block_size=block_size,
+            )
         # Tied to the resolved record rather than restated, so the spec and the
         # tensor the store kernel writes cannot drift apart.
         if self.kv_cache_dtype != "fp8_ds_mla":
@@ -1184,7 +1326,24 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         self.kv_cache = kv_cache.squeeze(1)
-        self.kv_cache[0].zero_()
+        if self.compressed_kv_format is not None:
+            fmt = self.compressed_kv_format
+            if self.kv_cache.dtype is not torch.uint8 or self.kv_cache.shape[1:] != (
+                fmt.rows_per_page(self.head_dim),
+                fmt.payload_bytes(self.head_dim),
+            ):
+                raise ValueError(
+                    "Main compressed KV view does not match its immutable format"
+                )
+            if (
+                self.kv_cache_scales is None
+                or self.kv_cache_scales.shape[:2] != self.kv_cache.shape[:2]
+            ):
+                raise ValueError(
+                    "Main compressed KV scale view is not paired with its payload"
+                )
+        else:
+            self.kv_cache[0].zero_()
 
     def _compressed_kv_cache(self) -> torch.Tensor:
         """The compressed-KV cache this layer reads.
@@ -1198,12 +1357,29 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         source = self._static_forward_context[self.compressed_cache_prefix]
         return source.kv_cache
 
+    def _compressed_kv_scales(self) -> torch.Tensor:
+        source = (
+            self
+            if self.is_kv_source or self.is_kv_forwarder
+            else self._static_forward_context[self.compressed_cache_prefix]
+        )
+        if (
+            source.compressed_kv_format != self.compressed_kv_format
+            or source.kv_cache_scales is None
+        ):
+            raise ValueError(
+                "Compressed KV consumer has no matching source scale plane"
+            )
+        return source.kv_cache_scales
+
     def accept_remote_kv(
         self,
         main_rows: torch.Tensor,
         indexer_rows: torch.Tensor,
         topk_rows: torch.Tensor | None,
         positions: torch.Tensor,
+        *,
+        main_scale_rows: torch.Tensor | None = None,
     ) -> None:
         """Replay a previous rank's records into this forwarder's caches.
 
@@ -1221,13 +1397,31 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             return
 
         main_metadata = cast(Any, attn_metadata[self.prefix])
-        move_rows_to_paged_cache(
-            main_rows,
-            self.kv_cache,
-            main_metadata.slot_mapping,
-            positions,
-            self.compress_ratio,
-        )
+        if self.compressed_kv_format is not None:
+            if main_scale_rows is None or self.kv_cache_scales is None:
+                raise ValueError(
+                    "Compressed KV PP forwarding requires both payload and scales"
+                )
+            move_quantized_records(
+                main_rows,
+                main_scale_rows,
+                self.kv_cache,
+                self.kv_cache_scales,
+                main_metadata.slot_mapping,
+                positions,
+                self.compress_ratio,
+                format=self.compressed_kv_format,
+            )
+            if self.compressed_kv_workspace is not None:
+                self.compressed_kv_workspace.main_cache_written()
+        else:
+            move_rows_to_paged_cache(
+                main_rows,
+                self.kv_cache,
+                main_metadata.slot_mapping,
+                positions,
+                self.compress_ratio,
+            )
 
         indexer_cache = self.forwarder_indexer_cache
         assert indexer_cache is not None
@@ -1241,13 +1435,23 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             )
         if indexer_cache.kv_cache.numel():
             indexer_metadata = cast(Any, attn_metadata[indexer_cache.prefix])
-            move_rows_to_paged_cache(
-                indexer_rows,
-                indexer_cache.kv_cache,
-                indexer_metadata.slot_mapping,
-                positions,
-                self.compress_ratio,
-            )
+            if indexer_cache.split_indexer:
+                ixfops.indexer_int8_insert_split(
+                    indexer_rows,
+                    indexer_cache.kv_cache,
+                    indexer_cache.kv_cache_scales,
+                    indexer_metadata.slot_mapping,
+                    positions,
+                    self.compress_ratio,
+                )
+            else:
+                move_rows_to_paged_cache(
+                    indexer_rows,
+                    indexer_cache.kv_cache,
+                    indexer_metadata.slot_mapping,
+                    positions,
+                    self.compress_ratio,
+                )
 
         # The selection is a plain per-rank buffer, so taking it over is a
         # copy rather than a paged write.
@@ -1440,6 +1644,8 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
     def _padded_insert_slots(
         self, slots: torch.Tensor, num_tokens: int
     ) -> torch.Tensor:
+        if slots.shape[0] >= num_tokens:
+            return slots[:num_tokens]
         # Eager DP padding can exceed the local metadata's token count.
         out = self._insert_slots[:num_tokens]
         out.fill_(-1)
@@ -1489,7 +1695,13 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         latent: torch.Tensor | None = None
 
         if compressor is not None:
-            latent = compressor(kv_score, positions)
+            latent = compressor(
+                kv_score,
+                positions,
+                rotary_emb=self.rotary_emb,
+                row_out=self.main_kv_rows if self.is_kv_sender else None,
+                scale_out=self.main_kv_scale_rows if self.is_kv_sender else None,
+            )
             compressor.insert_cache(
                 latent,
                 positions,
@@ -1560,6 +1772,61 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         num_decodes = swa_metadata.num_decodes
         num_prefills = swa_metadata.num_prefills
         num_decode_tokens = swa_metadata.num_decode_tokens
+        selection = None
+        if (
+            self.compressed_kv_format is not None
+            and not swa_only
+            and self.compressed_kv_workspace is not None
+            and (
+                num_prefills > 0
+                or (
+                    num_decodes > 0
+                    and (
+                        self.compressed_kv_workspace.capturing
+                        or getattr(self, "compressed_decode_restore", False)
+                    )
+                )
+            )
+        ):
+            if flashmla_metadata is None or self_kv_cache is None:
+                raise RuntimeError(
+                    "Compressed KV attention requires FlashMLA metadata and a main cache"
+                )
+            with self.compressed_kv_workspace.read_scope() as workspace:
+                selection = self._prepare_compressed_family(
+                    q if num_prefills else q[:num_decode_tokens],
+                    positions if num_prefills else positions[:num_decode_tokens],
+                    output if num_prefills else output[:num_decode_tokens],
+                    self_kv_cache,
+                    flashmla_metadata,
+                    swa_metadata,
+                    workspace,
+                )
+                if num_prefills > 0:
+                    prefill_q = q[num_decode_tokens:]
+                    prefill_out = output[num_decode_tokens:]
+                    self._forward_prefill_as_decode(
+                        q=prefill_q,
+                        positions=positions[num_decode_tokens:],
+                        compressed_k_cache=self_kv_cache,
+                        output=prefill_out,
+                        attn_metadata=flashmla_metadata if not swa_only else None,
+                        swa_metadata=swa_metadata,
+                        selection=selection,
+                    )
+                if num_decodes > 0:
+                    decode_out = output[:num_decode_tokens]
+                    self._forward_decode(
+                        q=q[:num_decode_tokens],
+                        kv_cache=self_kv_cache,
+                        positions=positions[:num_decode_tokens],
+                        swa_metadata=swa_metadata,
+                        attn_metadata=flashmla_metadata if not swa_only else None,
+                        swa_only=swa_only,
+                        output=decode_out,
+                        selection=selection,
+                    )
+            return
 
         if num_prefills > 0:
             prefill_q = q[num_decode_tokens:]
@@ -1579,6 +1846,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 output=prefill_out,
                 attn_metadata=flashmla_metadata if not swa_only else None,
                 swa_metadata=swa_metadata,
+                selection=selection,
             )
         if num_decodes > 0:
             decode_out = output[:num_decode_tokens]
@@ -1590,6 +1858,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 attn_metadata=flashmla_metadata if not swa_only else None,
                 swa_only=swa_only,
                 output=decode_out,
+                selection=selection,
             )
 
     def _sparse_indexer_and_attn(
@@ -1612,6 +1881,8 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             )
             if _DBG_TOPK and self.topk_indices_buffer is not None:
                 _dbg_topk(self.prefix, index_q, index_weights, self.topk_indices_buffer)
+            if self.compressed_kv_workspace is not None:
+                self.compressed_kv_workspace.restore.invalidate()
 
         self.forward_mqa(q, kv, positions, out)
 
@@ -1669,9 +1940,22 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
 
     def _global_indices(self, local, req, table, block_size, valid, positions):
         n = local.shape[0]
-        indices = self._global_topk[:n]
-        lens = self._global_topk_lens[:n]
-        ixfops.compute_global_topk_indices_and_lens(
+        if hasattr(self, "_global_topk") and hasattr(self, "_global_topk_lens"):
+            indices = self._global_topk[:n]
+            lens = self._global_topk_lens[:n]
+            ixfops.compute_global_topk_indices_and_lens(
+                local,
+                req,
+                table,
+                block_size,
+                valid,
+                positions,
+                self.compress_ratio,
+                output=indices,
+                output_lens=lens,
+            )
+            return indices, lens
+        return ixfops.global_topk_indices_and_lens(
             local,
             req,
             table,
@@ -1679,10 +1963,252 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             valid,
             positions,
             self.compress_ratio,
-            output=indices,
-            output_lens=lens,
+            0,
+            False,
         )
-        return indices, lens
+
+    def _prepare_compressed_family(
+        self, q, positions, output, cache, attn_metadata, swa_metadata, workspace
+    ) -> CompressedFamilySelection:
+        """Map once and prepare one main-KV family in the yielded worker span.
+
+        The old and new query slices share the same map and retained rows.
+        New steps/captures always record preparation; only later consumers
+        in the current forward may reuse the active family. Pure decode uses
+        mapping reuse during capture; its optional selected-row path restores
+        the full decode selection inside the same bounded worker lease.
+        Producer-only partial prefill may replace the linear plan with a
+        bounded compact plan; mixed batches retain suffix-only restoration.
+        """
+        assert self.topk_indices_buffer is not None
+        assert swa_metadata.is_valid_token is not None
+        assert swa_metadata.token_to_req_indices is not None
+        n0 = swa_metadata.num_decode_tokens
+        n1 = n0 + swa_metadata.num_prefill_tokens
+        restore_decode = swa_metadata.num_prefills == 0 and getattr(
+            self, "compressed_decode_restore", False
+        )
+        restore_start = 0 if restore_decode else n0
+        restore_tokens = n1 - restore_start
+        topk = self.topk_indices_buffer[:n1]
+        reqs = swa_metadata.token_to_req_indices[:n1]
+        valid = swa_metadata.is_valid_token[:n1]
+        scales = self._compressed_kv_scales()
+        swa_cache = self.swa_cache_layer.kv_cache
+        reader_ranges = []
+        if swa_metadata.num_prefills > 0:
+            reader_ranges.append((slice(n0, n1), swa_metadata.prefill_swa_indices))
+        if swa_metadata.num_decodes > 0:
+            reader_ranges.append((slice(0, n0), swa_metadata.decode_swa_indices))
+        key = family_key(
+            owner=self.compressed_cache_prefix,
+            index_source_layer_id=self.index_source_layer_id,
+            payload=cache,
+            scales=scales,
+            workspace=workspace,
+            query=q,
+            output=output,
+            indices=topk,
+            format=self.compressed_kv_format,
+            mapping_layout=(
+                TensorViewKey.of(topk),
+                TensorViewKey.of(reqs),
+                # Physical selection is independent of a layer's query mask.
+                # Each decode consumer still masks its own main lengths below.
+                "per-consumer-decode-validity"
+                if restore_decode
+                else TensorViewKey.of(valid),
+                TensorViewKey.of(positions),
+                TensorViewKey.of(attn_metadata.block_table),
+                attn_metadata.block_size,
+                self.compress_ratio,
+            ),
+            reader_layouts=(
+                TensorLayoutKey.of(swa_cache),
+                tuple(TensorLayoutKey.of(indices) for _, indices in reader_ranges),
+            ),
+            restore_start=restore_start,
+            restore_tokens=restore_tokens,
+        )
+        tracker = self.compressed_kv_workspace.restore
+        selection = tracker.lookup(key)
+        if selection is not None:
+            return selection
+        ticket = tracker.begin_prepare(key)
+        if restore_decode:
+            # A later consumer can have a valid query where the first does
+            # not. Prepare its physical rows too, while guarding every request
+            # index before the native mapper reads the block table.
+            valid = (reqs >= 0) & (reqs < attn_metadata.block_table.shape[0])
+        indices, lengths = ixfops.global_topk_indices_and_lens(
+            topk,
+            reqs,
+            attn_metadata.block_table,
+            attn_metadata.block_size // self.compress_ratio,
+            valid,
+            positions,
+            self.compress_ratio,
+            0,
+            False,
+        )
+        if swa_metadata.num_prefills == 0 and not restore_decode:
+            selection = CompressedFamilySelection(indices, lengths, None, 0)
+            tracker.publish(ticket, selection)
+            return selection
+
+        from ixformer.inference.functions.models.deepseek_v41.mla_sparse.float.quantized_sparse_mla import (
+            QuantizedSparseMlaRestoreCapacityError,
+            make_quantized_sparse_mla_restore_plan,
+            prepare_quantized_sparse_mla_restore_plan,
+            quantized_sparse_mla_scratch_bytes,
+        )
+
+        scratch_bytes = max(
+            quantized_sparse_mla_scratch_bytes(
+                q[token_slice].unsqueeze(1),
+                swa_cache.unsqueeze(-2),
+                _batched_index_rows(swa_indices),
+                cache,
+                scales,
+                _batched_index_rows(indices[token_slice]),
+                format=self.compressed_kv_format,
+                output=output[token_slice].unsqueeze(1),
+            )
+            for token_slice, swa_indices in reader_ranges
+        )
+        try:
+            plan = make_quantized_sparse_mla_restore_plan(
+                workspace,
+                _batched_index_rows(indices),
+                q.shape[-1],
+                scratch_bytes=scratch_bytes,
+                restore_start=restore_start,
+                restore_tokens=restore_tokens,
+                owner=self.compressed_cache_prefix,
+                index_source_layer_id=self.index_source_layer_id,
+                compressed_capacity=cache.shape[0] * cache.shape[1],
+            )
+        except QuantizedSparseMlaRestoreCapacityError:
+            # A complete restore map may be unaffordable for a valid large
+            # chunk. The packed reader still consumes every selected row.
+            plan = None
+        compact_plan = None
+        if (
+            getattr(self.compressed_kv_workspace, "prefill_producer", False)
+            and swa_metadata.num_decodes == 0
+            and n0 == 0
+            and (
+                plan is None
+                or (
+                    plan.mode == 0
+                    and plan.selected_flags is None
+                    and plan.rows.shape[0]
+                    < plan.restore_tokens * plan.row_map.shape[-1]
+                )
+            )
+        ):
+            compact_plan = self._prepare_compact_family(
+                q,
+                output,
+                cache,
+                scales,
+                indices,
+                lengths,
+                swa_metadata.prefill_swa_indices,
+                workspace,
+                scratch_bytes,
+            )
+        if compact_plan is not None:
+            plan = None
+            scratch_bytes = compact_plan.scratch.numel()
+        elif plan is not None:
+            prepare_quantized_sparse_mla_restore_plan(
+                cache,
+                scales,
+                _batched_index_rows(indices),
+                lengths,
+                plan,
+                format=self.compressed_kv_format,
+            )
+        selection = CompressedFamilySelection(
+            indices, lengths, plan, scratch_bytes, compact_plan=compact_plan
+        )
+        tracker.publish(ticket, selection)
+        return selection
+
+    def _prepare_compact_family(
+        self,
+        q,
+        output,
+        cache,
+        scales,
+        indices,
+        lengths,
+        swa_indices,
+        workspace,
+        scratch_bytes,
+    ):
+        """Prepare one P-only compact plan inside the existing family lease."""
+        capacity = cache.shape[0] * cache.shape[1]
+        owners = compact_owner_capacity(indices.numel(), capacity)
+        if owners is None:
+            return None
+        from ixformer.inference.functions.models.deepseek_v41.mla_sparse.float.quantized_sparse_mla_compact import (
+            QuantizedSparseMlaCompactCapacityError,
+            make_quantized_sparse_mla_compact_plan,
+            prepare_quantized_sparse_mla_compact_plan,
+            quantized_sparse_mla_compact_prepare_scratch_bytes,
+            quantized_sparse_mla_compact_scratch_bytes,
+        )
+
+        indices = _batched_index_rows(indices)
+        prepare_bytes = quantized_sparse_mla_compact_prepare_scratch_bytes(
+            cache,
+            scales,
+            indices,
+            lengths,
+            q.shape[-1],
+            format=self.compressed_kv_format,
+        )
+        arguments = dict(
+            compressed_capacity=capacity,
+            owner_capacity=owners,
+            owner_kind="hash",
+            prepare_scratch_bytes=prepare_bytes,
+        )
+        try:
+            plan = make_quantized_sparse_mla_compact_plan(
+                workspace,
+                indices,
+                q.shape[-1],
+                scratch_bytes=scratch_bytes,
+                **arguments,
+            )
+            needed = quantized_sparse_mla_compact_scratch_bytes(
+                q.unsqueeze(1),
+                self.swa_cache_layer.kv_cache.unsqueeze(-2),
+                _batched_index_rows(swa_indices),
+                cache,
+                scales,
+                indices,
+                format=self.compressed_kv_format,
+                workspace=plan.view(),
+                output=output.unsqueeze(1),
+            )
+            if needed > plan.scratch.numel():
+                plan = make_quantized_sparse_mla_compact_plan(
+                    workspace,
+                    indices,
+                    q.shape[-1],
+                    scratch_bytes=max(scratch_bytes, needed),
+                    **arguments,
+                )
+        except QuantizedSparseMlaCompactCapacityError:
+            return None
+        prepare_quantized_sparse_mla_compact_plan(
+            cache, scales, indices, lengths, plan, format=self.compressed_kv_format
+        )
+        return plan
 
     def _sparse_mla(
         self,
@@ -1694,6 +2220,9 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         extra_lens: torch.Tensor | None,
         output: torch.Tensor,
         use_fmhadsa: bool = False,
+        *,
+        prefill: bool = False,
+        restore_plan=None,
     ) -> None:
         """Sparse MLA over the window and, for compressed layers, the top-k.
 
@@ -1705,6 +2234,48 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         takes the query as it is and the caches with an explicit single-KV-head
         axis.
         """
+        if (
+            self.compressed_kv_format is not None
+            and self.compress_ratio > 0
+            and extra_cache is None
+        ):
+            raise ValueError(
+                "Compressed attention requires its main payload and scale planes"
+            )
+        if self.compressed_kv_format is not None and extra_cache is not None:
+            if extra_indices is None or extra_lens is None:
+                raise ValueError(
+                    "Compressed KV attention requires physical row indices and lengths"
+                )
+            if prefill:
+                from ixformer.inference.functions.models.deepseek_v41.mla_sparse.float.quantized_sparse_mla_prefill import (
+                    quantized_sparse_mla_prefill as reader,
+                )
+            else:
+                from ixformer.inference.functions.models.deepseek_v41.mla_sparse.float.quantized_sparse_mla import (
+                    quantized_sparse_mla as reader,
+                )
+            if self.compressed_kv_workspace is None:
+                raise RuntimeError(
+                    "Compressed KV attention workspace is not initialized"
+                )
+            with self.compressed_kv_workspace.acquire(nested=True) as workspace:
+                reader(
+                    q.unsqueeze(1),
+                    self.swa_cache_layer.kv_cache.unsqueeze(-2),
+                    _batched_index_rows(swa_indices),
+                    swa_lens,
+                    extra_cache,
+                    self._compressed_kv_scales(),
+                    _batched_index_rows(extra_indices),
+                    extra_lens,
+                    self.scale,
+                    format=self.compressed_kv_format,
+                    attn_sink=self.attn_sink,
+                    output=output.unsqueeze(1),
+                    workspace=workspace if restore_plan is None else restore_plan,
+                )
+            return
         if self.kv_cache_dtype == "fp8_ds_mla":
             self._sparse_fp8_mla(
                 q,
@@ -1835,9 +2406,47 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         positions: torch.Tensor,
         swa_metadata: DeepseekSparseSWAMetadata,
         attn_metadata: IluDeepseekV4FlashMLAMetadata | None,
-        swa_only: bool,
-        output: torch.Tensor,
+        swa_only: bool = False,
+        output: torch.Tensor | None = None,
+        selection: CompressedFamilySelection | None = None,
     ) -> None:
+        if output is None and isinstance(swa_metadata, torch.Tensor):
+            output = swa_metadata
+            swa_metadata = attn_metadata
+            attn_metadata = None
+            swa_only = self.compress_ratio == 0
+        if selection is not None:
+            if selection.compact_plan is not None:
+                raise ValueError("Compact plans require a pure-prefill family")
+            indices, lengths, plan = selection.for_queries(
+                slice(0, swa_metadata.num_decode_tokens)
+            )
+            if (
+                getattr(self, "compressed_decode_restore", False)
+                and swa_metadata.num_prefills == 0
+            ):
+                assert swa_metadata.is_valid_token is not None
+                lengths = torch.where(
+                    swa_metadata.is_valid_token[: swa_metadata.num_decode_tokens],
+                    lengths,
+                    0,
+                )
+            if (
+                plan is not None
+                and selection.plan.restore_start >= swa_metadata.num_decode_tokens
+            ):
+                plan = plan.scratch
+            self._sparse_mla(
+                q,
+                swa_metadata.decode_swa_indices,
+                swa_metadata.decode_swa_lens,
+                kv_cache,
+                indices,
+                lengths,
+                output,
+                restore_plan=plan,
+            )
+            return
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
         extra_cache = None
@@ -1860,7 +2469,14 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 positions,
             )
             extra_cache = kv_cache
-        if not getattr(swa_metadata, "causal", True):
+        if (
+            not getattr(swa_metadata, "causal", True)
+            and getattr(swa_metadata, "decode_swa_indices", None) is not None
+            and swa_metadata.decode_swa_indices.shape[-1] >= 256
+        ):
+            swa_indices = swa_metadata.decode_swa_indices
+            swa_lens = swa_metadata.decode_swa_lens
+        elif not getattr(swa_metadata, "causal", True):
             swa_indices, swa_lens = self._window_indices(
                 swa_metadata, 0, num_decode_tokens, positions
             )
@@ -1869,6 +2485,12 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             swa_lens = swa_metadata.decode_swa_lens
         assert swa_indices is not None
         assert swa_lens is not None
+        kwargs = (
+            dict(use_fmhadsa=False)
+            if getattr(self._sparse_mla, "__func__", None)
+            is IluDeepseekV41Attention._sparse_mla
+            else {}
+        )
         self._sparse_mla(
             q,
             swa_indices,
@@ -1877,7 +2499,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             extra_indices,
             extra_lens,
             output,
-            use_fmhadsa=False,
+            **kwargs,
         )
 
     def _forward_prefill_as_decode(
@@ -1888,6 +2510,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         output: torch.Tensor,
         attn_metadata: IluDeepseekV4FlashMLAMetadata | None,
         swa_metadata: DeepseekSparseSWAMetadata,
+        selection: CompressedFamilySelection | None = None,
     ) -> None:
         """Prefill through the per-token decode kernel.
 
@@ -1903,6 +2526,25 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         also applies the replay lower bound.
         """
         swa_only = self.compress_ratio == 0
+        if swa_metadata is None:
+            swa_metadata = attn_metadata
+            attn_metadata = None
+        n0 = swa_metadata.num_decode_tokens
+        n1 = n0 + swa_metadata.num_prefill_tokens
+        if selection is not None:
+            indices, lengths, plan = selection.for_queries(slice(n0, n1))
+            self._sparse_mla(
+                q,
+                swa_metadata.prefill_swa_indices,
+                swa_metadata.prefill_swa_lens,
+                compressed_k_cache,
+                indices,
+                lengths,
+                output,
+                prefill=True,
+                restore_plan=plan,
+            )
+            return
         if not swa_only and self.compress_ratio not in (1, 2):
             raise ValueError(
                 f"Unsupported compress_ratio={self.compress_ratio}; expected 0, 1, or 2."
@@ -1940,6 +2582,12 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 positions,
             )
             extra_cache = compressed_k_cache
+        kwargs = (
+            dict(use_fmhadsa=_v41_prefill_fmhadsa(), prefill=True)
+            if getattr(self._sparse_mla, "__func__", None)
+            is IluDeepseekV41Attention._sparse_mla
+            else dict(prefill=True)
+        )
         self._sparse_mla(
             q,
             swa_indices,
@@ -1948,7 +2596,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             extra_indices,
             extra_lens,
             output,
-            use_fmhadsa=_v41_prefill_fmhadsa(),
+            **kwargs,
         )
 
     def _gather_k_cache(
@@ -1966,6 +2614,10 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         The packed fp8_ds_mla record has to be dequantized on the way out; a
         plain bf16 row is copied as it is.
         """
+        if self.compressed_kv_format is not None and k_cache.dtype is torch.uint8:
+            raise ValueError(
+                "Compressed main KV must use its tile reader instead of a full-pool gather"
+            )
         if self.kv_cache_dtype == "fp8_e4m3":
             ixfops.gather_fp8_pt_k_cache(
                 out,

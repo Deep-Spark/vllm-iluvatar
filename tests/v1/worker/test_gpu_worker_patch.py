@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import logging
 import sys
-from types import ModuleType
+from contextlib import nullcontext
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -26,6 +27,31 @@ def _stub_gpu_worker(monkeypatch):
     gpu_worker_mod = ModuleType("vllm.v1.worker.gpu_worker")
 
     class _FakeWorker:
+        def determine_available_memory(self):
+            self.base_calls.append("profile")
+            explicit = getattr(self.cache_config, "kv_cache_memory_bytes", None)
+            return self.available_memory if explicit is None else explicit
+
+        def initialize_from_config(self, config):
+            self.base_calls.append(("initialize", config))
+
+        def _maybe_get_memory_pool_context(self, *, tag):
+            assert tag == "kv_cache"
+            return nullcontext()
+
+        def compile_or_warm_up_model(self):
+            self.base_calls.append("compile")
+            return "compilation-times"
+
+        def execute_model(self, scheduler_output):
+            self.base_calls.append(("execute", scheduler_output))
+            return "model-output"
+
+        def shutdown(self) -> None:
+            self.base_calls.append("shutdown")
+            if error := getattr(self, "base_shutdown_error", None):
+                raise error
+
         def execute_dummy_batch(self) -> None:
             raise NotImplementedError
 
@@ -52,8 +78,20 @@ def _stub_gpu_worker(monkeypatch):
     logger_mod = ModuleType("vllm.logger")
     logger_mod.init_logger = logging.getLogger
 
+    platforms_mod = ModuleType("vllm.platforms")
+    platforms_mod.current_platform = type(
+        "FakePlatform",
+        (),
+        {
+            "device_id_to_physical_device_id": staticmethod(
+                lambda device_id: device_id + 24
+            )
+        },
+    )()
+
     modules = {
         "vllm.logger": logger_mod,
+        "vllm.platforms": platforms_mod,
         "vllm": vllm_mod,
         "vllm.v1": vllm_v1_mod,
         "vllm.v1.worker": worker_package,
@@ -78,7 +116,15 @@ def _make_worker(model_runner):
     from vllm_iluvatar.v1.worker.gpu_worker import IluWorker
 
     w = IluWorker.__new__(IluWorker)
+    if hasattr(model_runner, "__dict__") and not hasattr(
+        model_runner, "profile_cudagraph_memory"
+    ):
+        model_runner.profile_cudagraph_memory = lambda: 0
     w.model_runner = model_runner
+    w.base_calls = []
+    w.local_rank = 0
+    w.rank = 0
+    w.device = None
     return w
 
 
@@ -158,7 +204,6 @@ def test_pcp_profile_bound_covers_mixed_dual_chunk_batches():
 @pytest.mark.parametrize("raise_inside", [False, True])
 def test_pcp_profile_only_changes_profile_calls_and_restores(raise_inside):
     from types import SimpleNamespace
-
     calls = []
 
     class Runner:

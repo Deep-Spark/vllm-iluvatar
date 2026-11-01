@@ -76,6 +76,13 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(_C, ops) {
   ops.def("get_cuda_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor");
 }
 
+// Native vLLM CPU KV offload calls this operator through _C_cache_ops.
+TORCH_LIBRARY_FRAGMENT_EXPAND(_C_cache_ops, ops) {
+  ops.def(
+      "swap_blocks_batch(Tensor src_ptrs, Tensor dst_ptrs, Tensor sizes, "
+      "bool is_src_access_order_any=False) -> ()");
+}
+
 TORCH_LIBRARY_IMPL_EXPAND(_C, CUDA, ops) {
   ops.impl("rms_norm", &vllm_iluvatar::rms_norm);
   ops.impl("rotary_embedding", &vllm_iluvatar::rotary_embedding);
@@ -100,6 +107,10 @@ TORCH_LIBRARY_IMPL_EXPAND(_C, CPU, ops) {
   // Input is a CPU tensor; registered on the CPU key like upstream.
   ops.impl("get_cuda_view_from_cpu_tensor",
            &vllm_iluvatar::get_cuda_view_from_cpu_tensor);
+}
+
+TORCH_LIBRARY_IMPL_EXPAND(_C_cache_ops, CPU, ops) {
+  ops.impl("swap_blocks_batch", &vllm_iluvatar::swap_blocks_batch);
 }
 
 TORCH_LIBRARY_IMPL_EXPAND(_C, Meta, ops) {

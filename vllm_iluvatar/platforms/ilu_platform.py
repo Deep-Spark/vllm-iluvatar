@@ -280,6 +280,11 @@ def _make_iluvatar_platform():
                     cache_config.cache_dtype = "auto"
 
             super().check_and_update_config(vllm_config)
+            from vllm_iluvatar.v1.worker.prefill_state.configuration import (
+                initialize_config,
+            )
+
+            initialize_config(vllm_config)
 
             pc = getattr(vllm_config, "parallel_config", None)
             import sys

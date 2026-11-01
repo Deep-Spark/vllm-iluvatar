@@ -12,6 +12,7 @@ any ixfd awareness.
 Registered via IluPlatform.get_device_communicator_cls().
 """
 
+import math
 import os
 
 import ixformer.distributed as ixfd
@@ -22,6 +23,8 @@ from vllm.distributed.device_communicators.cuda_communicator import (
     CudaCommunicator,
 )
 from vllm.distributed.utils import StatelessProcessGroup
+
+from .compact_ragged import compact_all_gather, compact_gather_beneficial
 
 
 def _as_gather_bytes(t: torch.Tensor) -> tuple[torch.Tensor, torch.dtype | None]:
@@ -45,6 +48,10 @@ class IluCommunicator(CudaCommunicator):
         tcp_store_group: StatelessProcessGroup | None = None,
         use_all2all: bool = False,
     ):
+        compact = os.environ.get("VLLM_ILU_COMPACT_RAGGED_GATHER", "0")
+        if compact not in ("0", "1"):
+            raise ValueError("VLLM_ILU_COMPACT_RAGGED_GATHER must be 0 or 1")
+        self._compact_ragged_gather = compact == "1"
         super().__init__(
             cpu_group,
             device,
@@ -232,6 +239,19 @@ class IluCommunicator(CudaCommunicator):
             s_self = sizes[comm.rank_in_group]
             assert inp_c.shape[0] == s_self, f"{inp_c.shape[0]} != {s_self}"
             rest = tuple(inp_c.shape[1:])
+            if (
+                getattr(comm, "_compact_ragged_gather", False)
+                and compact_gather_beneficial(
+                    sizes, math.prod(rest) * inp_c.element_size()
+                )
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                result = compact_all_gather(
+                    inp_c, sizes, comm.rank_in_group, comm.all_reduce
+                )
+                if restore_dtype is not None:
+                    result = result.view(restore_dtype)
+                return result
             padded = torch.zeros(
                 (max_size,) + rest, dtype=inp_c.dtype, device=inp_c.device
             )

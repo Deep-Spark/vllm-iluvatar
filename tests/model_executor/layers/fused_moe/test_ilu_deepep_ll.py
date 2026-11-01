@@ -107,6 +107,46 @@ def test_nvsm_dispatch_quant_kwargs_cover_quant_dtype_families(monkeypatch):
             assert "fp8_group_size" not in kwargs
 
 
+def test_unique_topk_receive_capacity_is_explicit(monkeypatch):
+    config = SimpleNamespace(quant_dtype=torch.int8, weight_quant_dtype=None)
+    monkeypatch.delenv("IXFORMER_NVSM_COMBINE_FP8", raising=False)
+    monkeypatch.delenv("IXFORMER_NVSM_UNIQUE_TOPK", raising=False)
+    assert "unique_topk" not in ilu_deepep_ll.nvsm_dispatch_quant_kwargs(config)
+    monkeypatch.setenv("IXFORMER_NVSM_UNIQUE_TOPK", "1")
+    assert ilu_deepep_ll.nvsm_dispatch_quant_kwargs(config)["unique_topk"] is True
+    monkeypatch.setenv("IXFORMER_NVSM_UNIQUE_TOPK", "2")
+    with pytest.raises(ValueError, match="IXFORMER_NVSM_UNIQUE_TOPK"):
+        ilu_deepep_ll.nvsm_dispatch_quant_kwargs(config)
+
+
+def test_nvsm_reuses_initialized_ep_transport_only_when_requested(monkeypatch):
+    config = SimpleNamespace(quant_dtype=torch.int8, weight_quant_dtype=None)
+    group = object()
+    monkeypatch.setattr(
+        ilu_deepep_ll, "get_ep_group", lambda: SimpleNamespace(device_group=group)
+    )
+    monkeypatch.delenv("IXFORMER_NVSM_REUSE_EP_COMM", raising=False)
+    assert "ipc_group" not in ilu_deepep_ll.nvsm_dispatch_quant_kwargs(config)
+    monkeypatch.setenv("IXFORMER_NVSM_REUSE_EP_COMM", "1")
+    assert ilu_deepep_ll.nvsm_dispatch_quant_kwargs(config)["ipc_group"] is group
+    monkeypatch.setenv("IXFORMER_NVSM_REUSE_EP_COMM", "invalid")
+    with pytest.raises(ValueError, match="IXFORMER_NVSM_REUSE_EP_COMM"):
+        ilu_deepep_ll.nvsm_dispatch_quant_kwargs(config)
+
+
+def test_nvsm_combine_fp8_is_opt_in(monkeypatch):
+    config = SimpleNamespace(quant_dtype=torch.int8, weight_quant_dtype=None)
+    monkeypatch.delenv("IXFORMER_NVSM_COMBINE_FP8", raising=False)
+    assert "use_combine_fp8" not in ilu_deepep_ll.nvsm_dispatch_quant_kwargs(config)
+    monkeypatch.setenv("IXFORMER_NVSM_COMBINE_FP8", "1")
+    kwargs = ilu_deepep_ll.nvsm_dispatch_quant_kwargs(config)
+    assert kwargs["use_combine_fp8"] is True
+    assert kwargs["fp8_group_size"] == 128
+    monkeypatch.setenv("IXFORMER_NVSM_COMBINE_FP8", "2")
+    with pytest.raises(ValueError, match="IXFORMER_NVSM_COMBINE_FP8"):
+        ilu_deepep_ll.nvsm_dispatch_quant_kwargs(config)
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("tp_size", [1, 2])
 @pytest.mark.parametrize("num_tokens", [0, 4])
@@ -472,7 +512,7 @@ def test_glm_ll_shared_dispatch_overlap_env(monkeypatch, value, expected):
     assert _ILU_CANONICAL_ONLY_ENV_VARS[name]() is expected
 
 
-@pytest.mark.parametrize("value,expected", [(None, True), ("0", False), ("1", True)])
+@pytest.mark.parametrize("value,expected", [(None, False), ("0", False), ("1", True)])
 def test_ll_shared_dispatch_overlap_env(monkeypatch, value, expected):
     from vllm_iluvatar.envs import _ILU_CANONICAL_ONLY_ENV_VARS
 
@@ -484,13 +524,13 @@ def test_ll_shared_dispatch_overlap_env(monkeypatch, value, expected):
     assert _ILU_CANONICAL_ONLY_ENV_VARS[name]() is expected
 
 
-def test_moe_enables_ll_shared_dispatch_overlap_by_default(monkeypatch):
+def test_moe_disables_ll_shared_dispatch_overlap_by_default(monkeypatch):
     from vllm_iluvatar.models.deepseek_v41.model import (
         _ll_shared_dispatch_overlap_enabled,
     )
 
     monkeypatch.delenv("VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP", raising=False)
-    assert _ll_shared_dispatch_overlap_enabled() is True
+    assert _ll_shared_dispatch_overlap_enabled() is False
     monkeypatch.setenv("VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP", "0")
     assert _ll_shared_dispatch_overlap_enabled() is False
     monkeypatch.setenv("VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP", "1")

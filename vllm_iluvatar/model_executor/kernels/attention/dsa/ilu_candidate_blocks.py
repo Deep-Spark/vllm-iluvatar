@@ -13,7 +13,9 @@ Why      : community spells both in Triton, which does not run on corex, and
 How      : same two entry points, same argument order and contract; the two
            reductions move to ``ixfops.candidate_block_scores`` /
            ``apply_candidate_mask`` (ixformer deepseekv41/candidate).
-           ``torch.topk`` stays in torch; writing the shortlist uses
+           decode top-k for 6/12/18/24 rows scans GPU row bounds with the
+           native radix kernel; other shapes retain the bounded Torch
+           implementation. writing the shortlist uses
            ``write_candidate_topk``.
 Scope    : DeepSeek-V4.1 indexers with a candidate source.
 Remove   : when community grows a vendor hook for these two.
@@ -23,6 +25,7 @@ from __future__ import annotations
 
 import torch
 
+from ixformer.inference.functions import dsa_update_topk_indices
 from ixformer.inference.functions.models import deepseek_v41 as ixfops
 
 # Rows per ``topk`` call in ``select_candidate_blocks``. Above 128 rows corex
@@ -64,6 +67,32 @@ def select_candidate_blocks(
 
     nblocks = -(-width // block_size)
     k = min(topk_blocks, nblocks)
+    if (
+        rows in (6, 12, 18, 24)
+        and logits.dtype == torch.bfloat16
+        and row_ks is None
+        and row_repeat == 1
+        and block_size == 8
+        and topk_blocks == 2048
+        and nblocks >= topk_blocks
+        and width % 16 == 0
+        and out.is_contiguous()
+    ):
+        scores = ixfops.candidate_block_scores(
+            logits, None, row_ke, block_size, row_repeat
+        )
+        ends = torch.div(
+            row_ke.clamp(min=0, max=width) + block_size - 1,
+            block_size,
+            rounding_mode="floor",
+        )
+        starts = torch.zeros_like(ends)
+        dsa_update_topk_indices(scores, starts, ends, topk_blocks, out)
+        # The score producer initializes all columns. The radix pads with -1;
+        # an in-span block with no finite column is padding as well.
+        selected = scores.gather(1, out.clamp(min=0).long())
+        out.masked_fill_((out < 0) | (selected == -float("inf")), -1)
+        return
     if k >= nblocks:
         ke = row_ke if row_repeat == 1 else row_ke.repeat_interleave(row_repeat)
         ke = ke[:rows].to(torch.int64)
@@ -134,3 +163,22 @@ def apply_candidate_mask(
     ixfops.apply_candidate_mask(
         logits, row_ks, row_ke, candidate_blocks, block_size, row_repeat
     )
+
+
+def apply_initialized_decode_candidate_mask(
+    logits: torch.Tensor,
+    row_ke: torch.Tensor,
+    candidate_blocks: torch.Tensor,
+) -> None:
+    """Mask block8 decode logits whose exterior the scorer already initialized."""
+    if (
+        logits.dtype == torch.bfloat16
+        and logits.shape[0] in (6, 12, 18, 24)
+        and logits.stride(1) == 1
+    ):
+        if logits.shape[1]:
+            ixfops.apply_initialized_decode_mask(
+                logits, row_ke, candidate_blocks
+            )
+        return
+    apply_candidate_mask(logits, None, row_ke, candidate_blocks, 8)

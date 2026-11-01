@@ -64,6 +64,7 @@ def _make_stub_runner(
     moe_config.hidden_dim_unpadded = 128
 
     obj.moe_config = moe_config
+    obj.__dict__["_ilu_fused_ep_combine_cached"] = False
     obj.routed_scaling_factor = routed_scaling_factor
     obj.shared_experts_scaling_factor = 1.0
     # Normally set in __init__ from envs; the stub bypasses __init__.

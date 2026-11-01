@@ -13,6 +13,8 @@ Why      : Closed-loop traffic can deliver replacement prefills to DP ranks at
            work, adding a second prefill-sized step to TTFT.
            - VLLM_ILU_DP_ENABLE_SYNC_PREFILLS enables rank-synchronized
            prefills.
+           - VLLM_ILU_DP_SYNC_READY_REPLAY includes completed remote-KV SWA
+             replays in the pre-scheduling readiness vote.
            - VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS bounds how many model steps a
            partial prefill may wait before fail-open.
            - VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS bounds the post-completion wait
@@ -48,6 +50,7 @@ from typing import TYPE_CHECKING
 
 import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
+from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
     import torch
@@ -60,6 +63,7 @@ class DPPrefillSyncState:
     max_replacement_wait_s: float
     max_defer_steps: int
     sync_group: dist.ProcessGroup | None
+    sync_ready_replay: bool = False
     coalesce_steps: int = 2
     partial_steps: int = 0
     force_throttle: bool = False
@@ -104,8 +108,46 @@ def _clone_dp_process_group(
     )
 
 
-def _local_prefill_state(scheduler) -> tuple[bool, bool]:
-    prefill_ready = bool(scheduler.waiting) or any(
+def _iter_pre_schedule_waiting(scheduler):
+    """Walk the queues that still hold a remote-KV / replay request.
+
+    Community 0.31 Scheduler has no ``skipped_waiting``. Skipped and
+    WAITING_FOR_REMOTE_KVS holders go back to ``waiting`` /
+    ``kv_holding_waiting``. A leftover ``skipped_waiting`` attribute is
+    walked only when a scheduler still exposes it.
+    """
+    skipped = getattr(scheduler, "skipped_waiting", None)
+    if skipped is not None:
+        yield from skipped
+        return
+    yield from getattr(scheduler, "waiting", ())
+    yield from getattr(scheduler, "kv_holding_waiting", ())
+
+
+def _local_prefill_state(
+    scheduler,
+    sync_ready_replay: bool = False,
+) -> tuple[bool, bool]:
+    # Count a finished async P/D receive before schedule() promotes it so the
+    # DP gate can coalesce 128-token SWA replays across ranks. After
+    # promotion, a throttled replay stays WAITING with replay_start set.
+    replay_ready = False
+    if sync_ready_replay:
+        finished_recvs = getattr(scheduler, "finished_recving_kv_req_ids", ())
+        replay_ready = any(
+            (
+                getattr(request, "status", None)
+                == RequestStatus.WAITING_FOR_REMOTE_KVS
+                and getattr(request, "request_id", None) in finished_recvs
+            )
+            or (
+                getattr(request, "status", None)
+                in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+                and getattr(request, "replay_start", 0) > 0
+            )
+            for request in _iter_pre_schedule_waiting(scheduler)
+        )
+    prefill_ready = bool(scheduler.waiting) or replay_ready or any(
         request.is_prefill_chunk for request in scheduler.running
     )
     running_decode = any(not request.is_prefill_chunk for request in scheduler.running)
@@ -166,6 +208,7 @@ def _make_process_engine_step(orig):
                 ),
                 max_defer_steps=envs.VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS,
                 sync_group=_clone_dp_process_group(self.dp_group, self.dp_store),
+                sync_ready_replay=envs.VLLM_ILU_DP_SYNC_READY_REPLAY,
             )
         prefill_sync_state = self._ilu_dp_prefill_sync_state
         waiting = False
@@ -174,7 +217,10 @@ def _make_process_engine_step(orig):
             self.engines_running or self.scheduler.has_unfinished_requests()
         )
         if sync_active:
-            waiting, running_decode = _local_prefill_state(self.scheduler)
+            waiting, running_decode = _local_prefill_state(
+                self.scheduler,
+                prefill_sync_state.sync_ready_replay,
+            )
             state = prefill_sync_state.sync_tensor
             assert state is not None
             state[0] = int(waiting)

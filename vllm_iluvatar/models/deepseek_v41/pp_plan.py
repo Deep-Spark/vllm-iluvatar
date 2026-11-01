@@ -46,6 +46,7 @@ layers 0-20:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 from vllm.distributed.utils import get_pp_indices
@@ -171,10 +172,18 @@ def build_rank_plan(
     because vLLM cannot size a KV pool for it.
     """
     depth = num_layers if last_layer is None else min(num_layers, last_layer + 1)
+    if last_layer is not None:
+        from vllm_iluvatar.v1.worker.prefill_state.configuration import pipeline_bounds
+
+        cuts = pipeline_bounds(
+            num_layers, world, last_layer, os.getenv("VLLM_PP_LAYER_PARTITION")
+        )
+    else:
+        cuts = tuple(get_pp_indices(num_layers, r, world) for r in range(world))
 
     def bounds(of_rank: int) -> tuple[int, int]:
-        start_i, end_i = get_pp_indices(num_layers, of_rank, world)
-        return min(start_i, depth), min(end_i, depth)
+        start, end = cuts[of_rank]
+        return min(start, depth), min(end, depth)
 
     rank_bounds = [bounds(of_rank) for of_rank in range(world)]
     if last_layer is not None:

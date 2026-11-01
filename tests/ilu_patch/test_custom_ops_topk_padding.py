@@ -102,3 +102,48 @@ def test_topk_hash_softplus_sqrt_masks_padding_rows(monkeypatch):
 
     assert torch.equal(topk_weights[1], torch.zeros_like(topk_weights[1]))
     assert torch.equal(topk_indices[1], torch.full_like(topk_indices[1], -1))
+
+
+def test_mask_topk_padding_skips_row_mismatch():
+    topk_weights = torch.ones(8, 6)
+    topk_ids = torch.arange(48, dtype=torch.int32).reshape(8, 6)
+    # Local dummy rows vs gathered Hybrid EP naive tokens.
+    is_padding = torch.ones(2, 1, dtype=torch.bool)
+
+    ilu_ops._mask_topk_padding(topk_weights, topk_ids, is_padding)
+
+    assert torch.equal(topk_weights, torch.ones(8, 6))
+    assert torch.equal(topk_ids, torch.arange(48, dtype=torch.int32).reshape(8, 6))
+
+
+def test_mask_topk_padding_preserves_dp1_and_skips_ungathered_dp(monkeypatch):
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    ctx = SimpleNamespace(dp_metadata=None)
+    fc = ModuleType("vllm.forward_context")
+    fc.is_forward_context_available = lambda: True
+    fc.get_forward_context = lambda: ctx
+    monkeypatch.setitem(sys.modules, "vllm.forward_context", fc)
+
+    # DP=1 (dp_metadata is None): local padding must be masked.
+    w = torch.ones(2, 2)
+    ids = torch.ones(2, 2, dtype=torch.int32)
+    ilu_ops._mask_topk_padding(w, ids, torch.tensor([False, True]))
+    assert w[:, 0].tolist() == [1.0, 0.0]
+    assert ids[:, 0].tolist() == [1, -1]
+
+    # DP>1 non-decode without gathered mask: skip even if row count matches.
+    ctx.dp_metadata = SimpleNamespace(all_ranks_decode_only=False)
+    w = torch.ones(2, 2)
+    ids = torch.ones(2, 2, dtype=torch.int32)
+    ilu_ops._mask_topk_padding(w, ids, torch.tensor([False, True]))
+    assert w[:, 0].tolist() == [1.0, 1.0]
+    assert ids[:, 0].tolist() == [1, 1]
+
+    # DP>1 with gathered mask flag set: mask is applied.
+    ctx._ilu_is_padding_gathered = True
+    ilu_ops._mask_topk_padding(w, ids, torch.tensor([False, True]))
+    assert w[:, 0].tolist() == [1.0, 0.0]
+    assert ids[:, 0].tolist() == [1, -1]
+

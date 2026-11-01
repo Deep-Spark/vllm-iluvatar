@@ -31,9 +31,7 @@ def _config(**settings):
     )
 
 
-@pytest.mark.parametrize(
-    "setting", ["cpu_offload", "use_thp", "private", "legacy", "shm"]
-)
+@pytest.mark.parametrize("setting", ["cpu_offload", "use_thp", "private", "legacy"])
 def test_reject_storage_before_allocation(setting, monkeypatch):
     config = _config()
     monkeypatch.delenv("VLLM_PLE_CPU_OFFLOAD", raising=False)
@@ -46,12 +44,15 @@ def test_reject_storage_before_allocation(setting, monkeypatch):
         config.engram_config.dp_shared_memory = False
     elif setting == "legacy":
         monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "0")
-    else:
-        monkeypatch.setattr(
-            storage.shutil, "disk_usage", lambda p: SimpleNamespace(total=1)
-        )
     with pytest.raises(ValueError):
         storage.validate_engram_config(config)
+
+
+def test_shared_checkpoint_mmap_does_not_require_dev_shm_capacity(monkeypatch):
+    config = _config(dp_shared_memory=True)
+    monkeypatch.delenv("VLLM_PLE_CPU_OFFLOAD", raising=False)
+    monkeypatch.delenv("VLLM_ILU_V41_DISABLE_ENGRAM", raising=False)
+    storage.validate_engram_config(config)
 
 
 def test_across_dp_and_disabled_engram(monkeypatch):
@@ -128,6 +129,8 @@ def test_dummy_forward_without_global_config(across_dp):
 
 
 def _shared_worker(rank, rendezvous, checkpoint):
+    import os
+
     import torch.distributed as dist
     from ixformer.inference.functions import deepseekv41 as formal_ops
 
@@ -162,9 +165,20 @@ def _shared_worker(rank, rendezvous, checkpoint):
         group,
         mod._safetensors_entry,
     )
-    # Changing one process's mapping must change the peer's bytes, not a copy.
+    # Updating the underlying checkpoint file must be visible through both
+    # processes' shared page-cache mappings without copying into /dev/shm.
     if rank == 0:
-        host[0].fill_(2)
+        offset, _, _ = mod._safetensors_entry(checkpoint, "weight")
+        with open(checkpoint, "r+b") as f:
+            f.seek(offset + 3 * 256)
+            f.write(
+                torch.full((256,), 2.0, dtype=torch.float32)
+                .to(torch.float8_e4m3fn)
+                .view(torch.uint8)
+                .numpy()
+                .tobytes()
+            )
+            f.flush()
     dist.barrier()
     assert torch.all(host[0].float() == 2)
     ids = torch.tensor([[3, 4, -1], [8194, 8195, 3]], device="cuda", dtype=torch.int32)
@@ -201,16 +215,205 @@ def _shared_worker(rank, rendezvous, checkpoint):
     graph.replay()
     torch.cuda.synchronize()
     assert torch.all(output == 0)
-    # Inspect our mapping, allowing another service to initialize its own tables.
+    # Inspect our mapping: must be a read-only shared mapping of the checkpoint
+    # file itself (r--s), with zero /dev/shm tmpfs copies.
+    real_checkpoint = os.path.realpath(checkpoint)
     with open("/proc/self/maps") as maps:
         for line in maps:
             lo, hi = (int(addr, 16) for addr in line.split()[0].split("-"))
             if lo <= host.data_ptr() < hi:
-                assert "/dev/shm/ilu_engram_" in line and "(deleted)" in line
+                perms = line.split()[1]
+                assert perms == "r--s"
+                assert real_checkpoint in line
+                assert "/dev/shm" not in line
                 break
         else:
             raise AssertionError("shared Engram mapping not found")
     dist.destroy_process_group()
+
+
+def test_map_shared_checkpoint_rows_maps_file_directly_without_shm(
+    tmp_path, monkeypatch
+):
+    import mmap
+    import os
+
+    import ixformer.inference.functions as ixf_ops
+
+    rows, dim = 64, 256
+    path = str(tmp_path / "table.safetensors")
+    save_file(
+        {
+            "weight": torch.arange(rows * dim, dtype=torch.float32)
+            .reshape(rows, dim)
+            .to(torch.float8_e4m3fn),
+        },
+        path,
+    )
+    registered = []
+    unregistered = []
+
+    class FakeCudart:
+        def cudaHostRegister(self, ptr, size, flags):
+            registered.append((ptr, size, flags))
+            return SimpleNamespace(value=0)
+
+        def cudaHostUnregister(self, ptr):
+            unregistered.append(ptr)
+            return SimpleNamespace(value=0)
+
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: FakeCudart())
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: True)
+    monkeypatch.setattr(ixf_ops, "get_cuda_view_from_cpu_tensor", lambda t: t)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda out, obj, group=None: out.__setitem__(0, obj),
+    )
+    group = SimpleNamespace(world_size=1, rank_in_group=0, cpu_group=None)
+
+    host, view, mapping = storage.map_shared_checkpoint_rows(
+        path, "weight", 3, 19, group, mod._safetensors_entry
+    )
+    assert host.shape == (16, dim)
+    assert view is host
+    assert len(registered) == 1
+    reg_base, reg_size, reg_flags = registered[0]
+    assert reg_flags == 2
+    assert reg_base % mmap.PAGESIZE == 0
+    assert reg_size % mmap.PAGESIZE == 0
+    assert reg_base <= host.data_ptr()
+    assert reg_base + reg_size >= host.data_ptr() + host.nbytes
+
+    real_checkpoint = os.path.realpath(path)
+    with open("/proc/self/maps") as maps:
+        for line in maps:
+            lo, hi = (int(addr, 16) for addr in line.split()[0].split("-"))
+            if lo <= host.data_ptr() < hi:
+                assert line.split()[1] == "r--s"
+                assert real_checkpoint in line
+                assert "/dev/shm" not in line
+                break
+        else:
+            raise AssertionError("shared Engram mapping not found")
+
+    del host, view
+    import gc
+
+    gc.collect()
+    assert unregistered == [reg_base]
+    assert mapping.closed
+
+
+def test_map_shared_checkpoint_rows_cleans_up_on_register_view_and_peer_errors(
+    tmp_path, monkeypatch
+):
+    import mmap
+
+    import ixformer.inference.functions as ixf_ops
+
+    rows, dim = 32, 256
+    path = str(tmp_path / "table.safetensors")
+    save_file(
+        {
+            "weight": torch.ones(rows, dim, dtype=torch.float32).to(
+                torch.float8_e4m3fn
+            ),
+        },
+        path,
+    )
+
+    created_mmaps: list[mmap.mmap] = []
+    real_mmap = mmap.mmap
+
+    def tracking_mmap(*args, **kwargs):
+        m = real_mmap(*args, **kwargs)
+        created_mmaps.append(m)
+        return m
+
+    monkeypatch.setattr(mmap, "mmap", tracking_mmap)
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: True)
+
+    # Case 1: cudaHostRegister fails -> sticky error cleared, mmap closed.
+    cleared_errors = []
+    unregistered = []
+
+    class FailRegisterCudart:
+        def cudaHostRegister(self, ptr, size, flags):
+            return SimpleNamespace(value=11)
+
+        def cudaHostUnregister(self, ptr):
+            unregistered.append(ptr)
+            return SimpleNamespace(value=0)
+
+        def cudaGetLastError(self):
+            cleared_errors.append(True)
+            return 11
+
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: FailRegisterCudart())
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda out, obj, group=None: out.__setitem__(0, obj),
+    )
+    group = SimpleNamespace(world_size=1, rank_in_group=0, cpu_group=None)
+
+    with pytest.raises(RuntimeError, match="Engram cudaHostRegister failed"):
+        storage.map_shared_checkpoint_rows(
+            path, "weight", 0, rows, group, mod._safetensors_entry
+        )
+    assert cleared_errors == [True]
+    assert unregistered == []
+    assert len(created_mmaps) == 1 and created_mmaps[-1].closed
+
+    # Case 2: cudaHostRegister succeeds, get_cuda_view_from_cpu_tensor fails
+    # -> cudaHostUnregister called and mmap closed immediately.
+    registered = []
+
+    class OkCudart:
+        def cudaHostRegister(self, ptr, size, flags):
+            registered.append(ptr)
+            return SimpleNamespace(value=0)
+
+        def cudaHostUnregister(self, ptr):
+            unregistered.append(ptr)
+            return SimpleNamespace(value=0)
+
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: OkCudart())
+
+    def fail_view(_t):
+        raise RuntimeError("UVA view failed")
+
+    monkeypatch.setattr(ixf_ops, "get_cuda_view_from_cpu_tensor", fail_view)
+    with pytest.raises(RuntimeError, match="UVA view failed"):
+        storage.map_shared_checkpoint_rows(
+            path, "weight", 0, rows, group, mod._safetensors_entry
+        )
+    assert len(registered) == 1
+    assert unregistered == registered
+    assert len(created_mmaps) == 2 and created_mmaps[-1].closed
+
+    # Case 3: Local rank succeeds, peer rank fails in all_gather_object
+    # -> local rank unregisters and closes mmap before raising.
+    registered.clear()
+    unregistered.clear()
+    monkeypatch.setattr(ixf_ops, "get_cuda_view_from_cpu_tensor", lambda t: t)
+    group2 = SimpleNamespace(world_size=2, rank_in_group=0, cpu_group=None)
+
+    def peer_failure_all_gather(out, obj, group=None):
+        out[0] = obj
+        out[1] = "RuntimeError: peer failed"
+
+    monkeypatch.setattr(
+        torch.distributed, "all_gather_object", peer_failure_all_gather
+    )
+    with pytest.raises(RuntimeError, match="peer failed"):
+        storage.map_shared_checkpoint_rows(
+            path, "weight", 0, rows, group2, mod._safetensors_entry
+        )
+    assert len(registered) == 1
+    assert unregistered == registered
+    assert len(created_mmaps) == 3 and created_mmaps[-1].closed
 
 
 def test_shared_pages_uva_prefetch_graph(tmp_path):

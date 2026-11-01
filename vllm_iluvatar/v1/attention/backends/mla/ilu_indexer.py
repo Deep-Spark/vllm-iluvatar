@@ -721,12 +721,13 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         token_start = query_start_loc_cpu[req_slice.start].item()
         total_seq_lens = seq_lens_cpu_chunk_comp.sum()
         num_reqs = req_slice.stop - req_slice.start
-        seq_idx = torch.arange(0, num_reqs, dtype=torch.int32)
-        # token_to_seq is currently unused by the indexer kernels but kept on
-        # the dataclass for parity with V3.2; populate it in compressed-domain.
-        token_to_seq = torch.repeat_interleave(seq_idx, seq_lens_cpu_chunk_comp).to(
-            self.device
-        )
+        # token_to_seq is unused by the indexer kernels (kept on the dataclass
+        # for parity with V3.2). Do NOT materialise it: a chunked 1M prefill is
+        # split into K sub-chunks, and building one full-length int32 tensor per
+        # sub-chunk costs K * seq_len * 4 B simultaneously (256 MiB on the PP0
+        # ratio-2 stage, 1.00 GiB on the ratio-1 stages at 1M), which is what
+        # pushed PP0 past its 32 GiB card during a 1M request.
+        token_to_seq = torch.empty(0, dtype=torch.int32, device=self.device)
         assert total_seq_lens <= self.max_prefill_buffer_size
         cu_seq_lens = (
             torch.cat(
@@ -1374,6 +1375,16 @@ def make_storage_block_size_build(orig: Callable[..., Any]) -> Callable[..., Any
 
 class IluDeepseekV41IndexerBackend(IluDeepseekV4IndexerBackend):
     """V4.1 indexer backend with independent BF16/FP8/INT8 cache selection."""
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        # tp1 has no supported_kv_cache_layouts; its identity stride_order
+        # keeps layers first (≈ LBNHC). 0.31 default preference is also
+        # LBNHC-first. Do not also advertise LBHNC: resolve then lets Prefill
+        # and Decode pick different layouts (P=LBHNC via connector/intersection,
+        # D=LBNHC), and NIXL page geometry will not match. Pin both sides
+        # to the one layout tp1 actually uses.
+        return (KVCacheLayout.LBNHC,)
 
     @staticmethod
     def get_builder_cls():

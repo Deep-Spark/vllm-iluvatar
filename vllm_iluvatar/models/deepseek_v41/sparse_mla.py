@@ -20,6 +20,10 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_iluvatar.models.deepseek_v41.compressed_kv import (
+    is_quantized_main_spec,
+    main_kv_format,
+)
 from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import indexer_kv_dtype
 from vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa import (
     IluDeepseekSparseSWABackend,
@@ -126,7 +130,6 @@ class IluDeepseekV41SparseSWAMetadataBuilder(IluDeepseekSparseSWAMetadataBuilder
         slots.masked_fill_(slots < self.block_size, -1)
         cm.slot_mapping = slots
         causal = cm.causal
-        cm.causal = True
         try:
             metadata = super().build(
                 common_prefix_len, cm, fast_build, replay_start=replay_start
@@ -172,6 +175,7 @@ class IluDeepseekV4FlashMLAMetadata(AttentionMetadata):
     req_id_per_token: torch.Tensor
     block_size: int
     topk_tokens: int
+    compressed_kv_format: Any = None
 
 
 class IluDeepseekV4SparseMLAMetadataBuilder(
@@ -199,6 +203,18 @@ class IluDeepseekV4SparseMLAMetadataBuilder(
         )
 
         self.compress_ratio = _spec_compress_ratio(self.kv_cache_spec)
+        self.compressed_kv_format = (
+            main_kv_format() if is_quantized_main_spec(kv_cache_spec) else None
+        )
+        if self.compressed_kv_format is not None:
+            expected_rows = self.compressed_kv_format.rows_per_page(512)
+            if (
+                _spec_compressed_block_size(kv_cache_spec, self.compress_ratio)
+                != expected_rows
+            ):
+                raise ValueError(
+                    "Compressed KV metadata cannot split a physical payload page"
+                )
         # Only kv-source layers own a compressed cache, and v4.1 compresses at
         # ratio 1 or 2.
         if self.compress_ratio not in (1, 2):
@@ -229,7 +245,11 @@ class IluDeepseekV4SparseMLAMetadataBuilder(
                 cm.slot_mapping,
                 cm.query_start_loc,
                 cm.seq_lens,
-                cm.block_table_tensor.clamp(min=0),
+                (
+                    cm.block_table_tensor
+                    if getattr(self, "compressed_kv_format", None) is not None
+                    else cm.block_table_tensor.clamp(min=0)
+                ),
                 _spec_compressed_block_size(self.kv_cache_spec, self.compress_ratio),
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
@@ -256,6 +276,7 @@ class IluDeepseekV4SparseMLAMetadataBuilder(
             req_id_per_token=req_id_per_token,
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,
+            compressed_kv_format=self.compressed_kv_format,
         )
 
 
@@ -286,6 +307,11 @@ class IluDeepseekV4SparseMLABackend(AttentionBackend):
     def get_supported_kernel_block_sizes(
         kv_cache_spec: "KVCacheSpec | None" = None,
     ) -> list[int]:
+        del kv_cache_spec
+        fmt = main_kv_format()
+        if fmt is not None:
+            rows = fmt.rows_per_page(512)
+            return [rows, rows * 2]
         return [64, 128]
 
     @classmethod

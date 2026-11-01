@@ -13,6 +13,7 @@ The patch_custom_ops.py patch layer splats these into vllm._custom_ops.
 from __future__ import annotations
 
 import math
+import sys
 
 import ixformer.inference.functions as ixf_ops  # type: ignore[import]
 import torch
@@ -558,8 +559,25 @@ def _mask_topk_padding(
 ) -> None:
     if is_padding is None:
         return
+    # Hybrid EP naive all_gatherv gathers tokens (e.g. [1024, 6]) while local
+    # is_padding stays [128, 1]. Skip rather than crash; decode-only NVSM keeps
+    # local rows so the mask still zeros real graph padding.
+    if is_padding.shape[0] != topk_weights.shape[0]:
+        return
+    context_module = sys.modules.get("vllm.forward_context")
+    if context_module is not None and getattr(
+        context_module, "is_forward_context_available", lambda: False
+    )():
+        context = context_module.get_forward_context()
+        dp_metadata = getattr(context, "dp_metadata", None)
+        if (
+            dp_metadata is not None
+            and getattr(dp_metadata, "all_ranks_decode_only", False) is not True
+            and not getattr(context, "_ilu_is_padding_gathered", False)
+        ):
+            return
     padding = is_padding.to(device=topk_weights.device, dtype=torch.bool)
-    padding = padding[: topk_weights.shape[0]].view(-1, 1)
+    padding = padding.view(-1, 1)
     topk_weights.masked_fill_(padding, 0.0)
     topk_ids.masked_fill_(padding.to(device=topk_ids.device), -1)
 

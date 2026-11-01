@@ -25,6 +25,7 @@ def _install_fake_ixformer(monkeypatch):
     functions = ModuleType("ixformer.inference.functions")
     functions.dsa_indexer_mqa_logits_with_kvcache = object()
     functions.dsa_update_topk_indices = object()
+    functions.dsa_indexer_mqa_logits_ixinfer_owned = object()
     monkeypatch.setitem(sys.modules, "ixformer", ixformer)
     monkeypatch.setitem(sys.modules, "ixformer.inference", inference)
     monkeypatch.setitem(sys.modules, "ixformer.inference.functions", functions)

@@ -10,6 +10,8 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Iterable
+from contextlib import nullcontext
+from functools import partial
 from itertools import islice
 
 import torch
@@ -82,7 +84,7 @@ logger.info(
 
 
 def _ll_shared_dispatch_overlap_enabled() -> bool:
-    """Decode NVSM/LL: overlap shared MLP with IBGDA dispatch. Default on."""
+    """Decode NVSM/LL: overlap shared MLP on the auxiliary stream. Default off."""
     return bool(
         _ILU_CANONICAL_ONLY_ENV_VARS["VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP"]()
     )
@@ -246,6 +248,8 @@ class IluDeepseekV41MoE(nn.Module, IluFusedMoEEP):
 class IluDeepseekV41DecoderLayer(nn.Module):
     """Independent V4.1 decoder layer with optional Engram write."""
 
+    _fuse_attn_allreduce_post = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -372,10 +376,28 @@ class IluDeepseekV41DecoderLayer(nn.Module):
         else:
             residual, sqrsum = mhc.hc_post_sqrsum(x, residual, post_mix, res_mix)
 
-        if self.engram is not None and self.engram._rows is not None:
-            residual, sqrsum = self.engram(
-                residual, self.engram._hash_ids, self.engram._token_mask
+        try:
+            valid_prefix = get_forward_context().additional_kwargs.get(
+                "prefix_decode_tokens"
             )
+        except AssertionError:
+            valid_prefix = None
+        if self.engram is not None and self.engram._rows is not None:
+            if valid_prefix is None:
+                residual, sqrsum = self.engram(
+                    residual, self.engram._hash_ids, self.engram._token_mask
+                )
+            elif valid_prefix:
+                mask = self.engram._token_mask
+                prefix_residual, _ = self.engram(
+                    residual[:valid_prefix],
+                    self.engram._hash_ids[:valid_prefix],
+                    mask[:valid_prefix] if mask is not None else None,
+                )
+                residual[:valid_prefix].copy_(prefix_residual)
+                sqrsum = None
+            else:
+                sqrsum = None
 
         attn_post, attn_comb, h, attn_pre, h_fp8, h_scale = self._hc_pre_mixes(
             residual,
@@ -390,13 +412,22 @@ class IluDeepseekV41DecoderLayer(nn.Module):
         )
         # The fused_wqa_wkv fp8 GEMM reads this exact normed ``h``; hand it the
         # per-token quant the pre-norm kernel already produced so it skips its own.
-        if h_fp8 is not None:
-            register_activation_prequant(h, h_fp8, h_scale)
-        try:
-            h = self.attn(positions, h, None)
-        finally:
+        if valid_prefix is None:
             if h_fp8 is not None:
-                clear_activation_prequant()
+                register_activation_prequant(h, h_fp8, h_scale)
+            try:
+                h = self.attn(positions, h, None)
+            finally:
+                if h_fp8 is not None:
+                    clear_activation_prequant()
+        else:
+            # Padded ranks still participate in MoE collectives, but never issue
+            # attention/cache writes for rows that have no local request.
+            if valid_prefix:
+                h[:valid_prefix].copy_(
+                    self.attn(positions[:valid_prefix], h[:valid_prefix], None)
+                )
+            h[valid_prefix:].zero_()
         if self._fuse_attn_allreduce_post:
             residual, attn_sqrsum = mhc.allreduce_hc_post(
                 h,
@@ -443,6 +474,8 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
 
     decoder_layer_cls = IluDeepseekV41DecoderLayer
     supports_aux_hidden_states_over_pp = True
+    main_kv_scale_width = 0
+    main_kv_scale_rows = None
 
     # Shared-expert gate_up, plus attention's wq_a/wkv (both read the same normed
     # hidden state, so they are one GEMM), plus the compressor's wkv/wgate, which
@@ -499,6 +532,9 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 quant_config=self.quant_config,
                 prefix=f"{prefix}.embed_tokens",
             )
+            self.embed_tokens = get_offloader().wrap_modules(
+                iter([self.embed_tokens]), prefix=f"{prefix}.embed_tokens"
+            )[0]
         else:
             self.embed_tokens = PPMissingLayer()
 
@@ -653,10 +689,12 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         is read off a layer whether or not anything is allocated here.
         """
         self.main_kv_rows: torch.Tensor | None = None
+        self.main_kv_scale_rows: torch.Tensor | None = None
         self.indexer_kv_rows: torch.Tensor | None = None
         self.main_kv_record: tuple[int, torch.dtype] | None = None
         self.indexer_kv_record: tuple[int, torch.dtype] | None = None
         sample = self.layers[self.start_layer].attn
+        self.main_kv_scale_width = sample.main_scale_transfer_width
         self.main_kv_record = (sample.main_transfer_width, sample.main_transfer_dtype)
         self.indexer_kv_record = (
             sample.indexer_transfer_width,
@@ -674,12 +712,20 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         self.main_kv_rows = torch.empty(
             max_tokens, main_width, dtype=main_dtype, device=self.device
         )
+        if self.main_kv_scale_width:
+            self.main_kv_scale_rows = torch.empty(
+                max_tokens,
+                self.main_kv_scale_width,
+                dtype=torch.float16,
+                device=self.device,
+            )
         self.indexer_kv_rows = torch.empty(
             max_tokens, indexer_width, dtype=indexer_dtype, device=self.device
         )
         if self.kv_sender_layer is not None:
             sender = self.layers[self.kv_sender_layer].attn
             sender.main_kv_rows = self.main_kv_rows
+            sender.main_kv_scale_rows = self.main_kv_scale_rows
             assert sender.indexer is not None, (
                 f"layer {self.kv_sender_layer} is a kv source and must own an "
                 "indexer to mirror its index keys"
@@ -821,7 +867,11 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 device=device,
             ),
         }
-        if not get_pp_group().is_first_rank:
+        try:
+            is_first_rank = get_pp_group().is_first_rank
+        except AssertionError:
+            is_first_rank = True
+        if not is_first_rank:
             tensors["input_ids"] = torch.zeros(
                 (batch_size,), dtype=torch.int32, device=device
             )
@@ -833,6 +883,12 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
             tensors["main_kv"] = torch.zeros(
                 (batch_size, main_width), dtype=main_dtype, device=device
             )
+            if self.main_kv_scale_width:
+                tensors["main_kv_scales"] = torch.zeros(
+                    (batch_size, self.main_kv_scale_width),
+                    dtype=torch.float16,
+                    device=device,
+                )
             tensors["indexer_kv"] = torch.zeros(
                 (batch_size, indexer_width), dtype=indexer_dtype, device=device
             )
@@ -865,7 +921,15 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         indexer_rows = intermediate_tensors["indexer_kv"]
         topk_rows = intermediate_tensors["topk"] if self.pp_plan.recvs_topk else None
         self.layers[forwarder].attn.accept_remote_kv(
-            main_rows, indexer_rows, topk_rows, positions
+            main_rows,
+            indexer_rows,
+            topk_rows,
+            positions,
+            main_scale_rows=(
+                intermediate_tensors["main_kv_scales"]
+                if self.main_kv_scale_width
+                else None
+            ),
         )
         if self.relays_kv:
             # No local source will refill the outgoing buffer, so the group
@@ -874,6 +938,11 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
             assert self.indexer_kv_rows is not None
             num_tokens = main_rows.shape[0]
             self.main_kv_rows[:num_tokens].copy_(main_rows)
+            if self.main_kv_scale_width:
+                assert self.main_kv_scale_rows is not None
+                self.main_kv_scale_rows[:num_tokens].copy_(
+                    intermediate_tensors["main_kv_scales"]
+                )
             self.indexer_kv_rows[:num_tokens].copy_(indexer_rows)
 
     def _accept_remote_candidates(
@@ -961,9 +1030,43 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 "V4.1 image-token flag skipped: forward context is not set"
             )
 
+    producer_prefix_state = None
+    consumer_prefix_state = None
+
+    def _compressed_kv_workspace(self):
+        if self.start_layer >= self.end_layer:
+            return None
+        attn = getattr(self.layers[self.start_layer], "attn", None)
+        return getattr(attn, "compressed_kv_workspace", None)
+
+    def compressed_kv_forward_scope(self):
+        """Scope the complete local forward, including producer-prefix replay."""
+        workspace = self._compressed_kv_workspace()
+        return nullcontext() if workspace is None else workspace.forward_scope()
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None = None,
+        lookback_token_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        with self.compressed_kv_forward_scope():
+            context = self.consumer_prefix_state
+            if context is not None:
+                return context.forward(
+                    self._forward, input_ids, positions, intermediate_tensors,
+                    inputs_embeds, lookback_token_ids,
+                )
+            return self._forward(
+                input_ids, positions, intermediate_tensors,
+                inputs_embeds, lookback_token_ids,
+            )
+
+    def _forward_full(
+        self,
+        input_ids: torch.Tensor,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
@@ -1019,6 +1122,8 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 )
 
         hidden_states = mhc.hc_post(hidden_states, residual, post_mix, res_mix)
+        if self.producer_prefix_state is not None:
+            self.producer_prefix_state.capture(self, hidden_states, pre_mix, positions)
         if not get_pp_group().is_last_rank:
             tensors = {"hidden_states": hidden_states, "pre_mix": pre_mix}
             num_tokens = positions.shape[0]
@@ -1026,6 +1131,9 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 assert self.main_kv_rows is not None
                 assert self.indexer_kv_rows is not None
                 tensors["main_kv"] = self.main_kv_rows[:num_tokens]
+                if self.main_kv_scale_width:
+                    assert self.main_kv_scale_rows is not None
+                    tensors["main_kv_scales"] = self.main_kv_scale_rows[:num_tokens]
                 tensors["indexer_kv"] = self.indexer_kv_rows[:num_tokens]
             if self.pp_plan.sends_topk:
                 # No designated sender: every index source rewrites this
@@ -1057,6 +1165,8 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
+    _forward = _forward_full
+
     def load_engram_weights(self) -> None:
         """Load the engram tensors that bypass the vLLM weight path."""
         for layer_id in self.engram_layer_ids:
@@ -1079,6 +1189,9 @@ class IluDeepseekV41ForCausalLM(IluDeepseekV4Fp8ForCausalLM, SupportsEagle3):
 
     _LOAD_SKIP_SUBSTRS = ("mtp.",)
 
+    # The runner hands ``input_ids`` to the model even when it also builds
+    # ``inputs_embeds``: both the MoE image routing and the engram hashing read
+    # raw ids. ``IluDeepseekV41ModelState`` forwards them past the first PP rank.
     requires_raw_input_tokens = True
 
     def forward(
@@ -1134,12 +1247,12 @@ class IluDeepseekV41ForCausalLM(IluDeepseekV4Fp8ForCausalLM, SupportsEagle3):
 
     @staticmethod
     def get_model_state_cls():
-        """Use community replay slot protection and token-history lookback."""
-        from vllm.models.deepseek_v41.nvidia.model_state import (
-            DeepseekV41ModelState,
+        """Iluvatar V4.1 state: SWA bounded replay, PP raw token ids, prefix reuse."""
+        from vllm_iluvatar.models.deepseek_v41.model_state import (
+            IluDeepseekV41ModelState,
         )
 
-        return DeepseekV41ModelState
+        return IluDeepseekV41ModelState
 
     @property
     def token_lookback_depth(self) -> int:

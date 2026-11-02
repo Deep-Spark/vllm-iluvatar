@@ -516,9 +516,7 @@ def topk_hash_softplus_sqrt(
             ctx = get_forward_context()
         except AssertionError:
             ctx = None
-        has_image_tokens = (
-            False if ctx is None else _take_v41_image_token_flag(ctx)
-        )
+        has_image_tokens = False if ctx is None else _take_v41_image_token_flag(ctx)
     if has_image_tokens:
         # Vision-language bias: ixformer's kernel only takes a 1D
         # e_score_correction_bias broadcast across tokens, so fall back to
@@ -582,9 +580,10 @@ def _mask_topk_padding(
     if is_padding.shape[0] != topk_weights.shape[0]:
         return
     context_module = sys.modules.get("vllm.forward_context")
-    if context_module is not None and getattr(
-        context_module, "is_forward_context_available", lambda: False
-    )():
+    if (
+        context_module is not None
+        and getattr(context_module, "is_forward_context_available", lambda: False)()
+    ):
         context = context_module.get_forward_context()
         dp_metadata = getattr(context, "dp_metadata", None)
         if (

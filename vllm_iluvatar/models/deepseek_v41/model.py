@@ -11,7 +11,6 @@ import os
 import re
 from collections.abc import Iterable
 from contextlib import nullcontext
-from functools import partial
 from itertools import islice
 
 import torch
@@ -40,7 +39,14 @@ from vllm.model_executor.offloader import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.skip_layers import (
+    producer_last_layer,
+)
 from vllm_iluvatar.envs import _ILU_CANONICAL_ONLY_ENV_VARS
+from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (  # noqa: E501
+    clear_activation_prequant,
+    register_activation_prequant,
+)
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
     IluFusedMoEEP,
 )
@@ -49,10 +55,6 @@ from vllm_iluvatar.models.deepseek_v4.fp8_model import (
     IluDeepseekV4Fp8MLP,
     IluDeepseekV4Fp8Model,
     _make_fp8_weights_mapper,
-)
-from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (  # noqa: E501
-    clear_activation_prequant,
-    register_activation_prequant,
 )
 from vllm_iluvatar.models.deepseek_v41 import mhc
 from vllm_iluvatar.models.deepseek_v41.attention import IluDeepseekV41Attention
@@ -64,9 +66,6 @@ from vllm_iluvatar.models.deepseek_v41.engram import (
     build_compressed_token_map,
     compute_hash_multipliers,
 )
-from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.skip_layers import (
-    producer_last_layer,
-)
 from vllm_iluvatar.models.deepseek_v41.pp_plan import build_rank_plan, local_kv_source
 
 logger = init_logger(f"vllm.{__name__}")
@@ -74,9 +73,7 @@ logger = init_logger(f"vllm.{__name__}")
 # Fold the attention TP all-reduce into mhc_post. Set
 # VLLM_ILU_V41_ALLREDUCE_MHC_POST=0 to keep the separate all-reduce plus
 # hc_post_sqrsum.
-_V41_ALLREDUCE_MHC_POST = (
-    os.environ.get("VLLM_ILU_V41_ALLREDUCE_MHC_POST", "1") == "1"
-)
+_V41_ALLREDUCE_MHC_POST = os.environ.get("VLLM_ILU_V41_ALLREDUCE_MHC_POST", "1") == "1"
 
 
 def _ll_shared_dispatch_overlap_enabled() -> bool:
@@ -222,9 +219,7 @@ class IluDeepseekV41MoE(nn.Module, IluFusedMoEEP):
         # Decode NVSM/LL: run shared MLP on the aux stream so it overlaps
         # IBGDA dispatch. GLM already wires this; V4.1 previously left the
         # mixin default (False) and serialized shared compute behind dispatch.
-        self._ll_shared_dispatch_overlap_enabled = (
-            _ll_shared_dispatch_overlap_enabled()
-        )
+        self._ll_shared_dispatch_overlap_enabled = _ll_shared_dispatch_overlap_enabled()
 
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
@@ -261,9 +256,7 @@ class IluDeepseekV41DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
         tp_size = get_tensor_model_parallel_world_size()
-        self._fuse_attn_allreduce_post = _allreduce_mhc_post_supported(
-            config, tp_size
-        )
+        self._fuse_attn_allreduce_post = _allreduce_mhc_post_supported(config, tp_size)
         self.attn = IluDeepseekV41Attention(
             vllm_config,
             prefix=f"{prefix}.attn",
@@ -1030,9 +1023,7 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
             # ``get_forward_context`` asserts when no forward context is set
             # (tests, capture setup). Engram image masking does not use this
             # flag: ``_prepare_engram`` still ANDs ``input_ids != dead_id``.
-            logger.debug(
-                "V4.1 image-token flag skipped: forward context is not set"
-            )
+            logger.debug("V4.1 image-token flag skipped: forward context is not set")
 
     producer_prefix_state = None
     consumer_prefix_state = None
@@ -1060,12 +1051,19 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
             context = self.consumer_prefix_state
             if context is not None:
                 return context.forward(
-                    self._forward, input_ids, positions, intermediate_tensors,
-                    inputs_embeds, lookback_token_ids,
+                    self._forward,
+                    input_ids,
+                    positions,
+                    intermediate_tensors,
+                    inputs_embeds,
+                    lookback_token_ids,
                 )
             return self._forward(
-                input_ids, positions, intermediate_tensors,
-                inputs_embeds, lookback_token_ids,
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                lookback_token_ids,
             )
 
     def _forward_full(

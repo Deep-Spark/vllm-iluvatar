@@ -218,16 +218,22 @@ def test_real_hybrid_allocator_keeps_fp8_page16(groups):
 
 
 @pytest.mark.parametrize("with_spec", [False, True])
-def test_swa_kernel_block_query_matches_v031_allocator_contract(with_spec):
+def test_swa_kernel_block_query_matches_v031_allocator_contract(with_spec, monkeypatch):
     from vllm.model_executor.layers.attention.attention import (
         _largest_kernel_block_within,
     )
+    from vllm.v1.attention.backend import MultipleOf
     from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
     from vllm_iluvatar.v1.attention.backends.ilu_flash_attn import (
         IluFlashAttentionBackend,
     )
 
+    monkeypatch.setattr(
+        "vllm_iluvatar.v1.attention.backends.ilu_flash_attn.envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE",
+        "",
+        raising=False,
+    )
     spec = (
         SlidingWindowSpec(
             block_size=16,
@@ -239,9 +245,20 @@ def test_swa_kernel_block_query_matches_v031_allocator_contract(with_spec):
         if with_spec
         else None
     )
+    # 1536 B/token * 16 tokens = 24576 B/page. Default FA advertises
+    # MultipleOf(16); the allocator still picks 16 for this SWA budget.
     assert (
         _largest_kernel_block_within(IluFlashAttentionBackend, 1536, 24576, 16, spec)
         == 16
+    )
+    sizes = IluFlashAttentionBackend.get_supported_kernel_block_sizes()
+    assert len(sizes) == 1
+    assert isinstance(sizes[0], MultipleOf) and sizes[0].base == 16
+
+    monkeypatch.setattr(
+        "vllm_iluvatar.v1.attention.backends.ilu_flash_attn.envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE",
+        "KVINT8",
+        raising=False,
     )
     assert IluFlashAttentionBackend.get_supported_kernel_block_sizes() == [
         16,
@@ -250,6 +267,10 @@ def test_swa_kernel_block_query_matches_v031_allocator_contract(with_spec):
         128,
         256,
     ]
+    assert (
+        _largest_kernel_block_within(IluFlashAttentionBackend, 1536, 24576, 16, spec)
+        == 16
+    )
 
 
 def test_head_wise_gate_reaches_existing_native_facade(monkeypatch):

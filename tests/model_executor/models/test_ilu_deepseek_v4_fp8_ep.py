@@ -87,7 +87,7 @@ def test_method_admission_and_forward(monkeypatch, kind, eligible, hash_layer):
 
 
 def test_native_mxfp4_decode_ll_override(monkeypatch):
-    monkeypatch.setattr(mod, "_DS4_DECODE_EP_BACKEND", "deepep_low_latency")
+    monkeypatch.setattr(mod, "_DECODE_EP_BACKEND", "deepep_low_latency")
     monkeypatch.setattr(
         mod.IluDeepseekV4Fp8MoE, "_should_use_forward_dp_ep", lambda self: True
     )

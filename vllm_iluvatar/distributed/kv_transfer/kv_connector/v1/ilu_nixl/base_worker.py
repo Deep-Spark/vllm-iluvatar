@@ -547,9 +547,17 @@ class IluNixlWorkerMixin:
                 "Packed virtual slot stride and page size must be positive "
                 "and the page must fit in one block"
             )
-        # Layer-major packing puts later layers at multiples of the block
-        # stride. The page still has to sit inside one block window.
-        if slot_offset < 0 or (slot_offset % block_stride) + page_size > block_stride:
+        if slot_offset < 0:
+            raise ValueError(
+                "Packed virtual slot offset must be non-negative: "
+                f"offset={slot_offset}"
+            )
+        # Block-outer: slot_offset is an intra-block window offset, so the page
+        # must fit in [slot_offset, block_stride).
+        # Layer-outer (LBHNC): slot_offset is the absolute layer base and may
+        # be >> block_stride (and need not be stride-aligned when mixed pages
+        # share a pool). Addr = backing + slot_offset + block_id * stride.
+        if slot_offset < block_stride and slot_offset + page_size > block_stride:
             raise ValueError(
                 "Packed virtual slot lies outside its block stride: "
                 f"offset={slot_offset}, page_size={page_size}, "
@@ -595,17 +603,6 @@ class IluNixlWorkerMixin:
                 raise ValueError(
                     "Packed IluNixl layout contains a non-packed tensor slot"
                 )
-            # Main K/V and the indexer page are different sizes (65536 vs
-            # 32768 on MiniMax TP4). Each slot keeps its own block stride,
-            # matching upstream NIXL's per-region block_strides.
-            block_span = tensor_stride * layout_config.num_blocks
-            if block_span <= 0 or backing_nbytes % block_span != 0:
-                raise ValueError(
-                    "Packed IluNixl backing size is not a whole number of "
-                    "num_blocks * block_stride: "
-                    f"{backing_nbytes} != N * {layout_config.num_blocks} * "
-                    f"{tensor_stride}"
-                )
             if int(tensor_config.size) != backing_nbytes:
                 raise ValueError(
                     "Packed IluNixl slot size does not cover the registered "
@@ -621,6 +618,7 @@ class IluNixlWorkerMixin:
             }
             layer_stride = int(getattr(tensor_config, "layer_stride", 0))
             tensor_offset = int(tensor_config.offset)
+            num_blocks = int(layout_config.num_blocks)
 
             def layer_byte_offset(layer_name: str) -> int:
                 return tensor_offset + layer_positions[layer_name] * layer_stride
@@ -633,6 +631,39 @@ class IluNixlWorkerMixin:
                     "Packed IluNixl layout has no KV cache spec for layers: "
                     + ", ".join(sorted(missing_specs))
                 )
+
+            # Main K/V and the indexer page are different sizes (e.g. 262144 vs
+            # 32768 on MiniMax). Each slot keeps its own block stride. Under
+            # layer-outer (LBHNC) the shared pool is N * sum(pages), so it need
+            # not be a multiple of one tensor's block_stride * N; only each
+            # layer's last page must fit. Block-outer / overlaid slots still
+            # require the stride to tile the backing.
+            block_span = tensor_stride * num_blocks
+            is_block_outer = layer_stride == 0 or layer_stride < tensor_stride
+            if is_block_outer and (block_span <= 0 or backing_nbytes % block_span != 0):
+                raise ValueError(
+                    "Packed IluNixl backing size is not a whole number of "
+                    "num_blocks * block_stride: "
+                    f"{backing_nbytes} != N * {num_blocks} * {tensor_stride}"
+                )
+            if num_blocks <= 0 or block_span <= 0:
+                raise ValueError(
+                    "Packed IluNixl layout has non-positive num_blocks or "
+                    f"block_stride: N={num_blocks}, stride={tensor_stride}"
+                )
+            for layer_name in shared_by:
+                page_size = int(specs[layer_name].page_size_bytes)
+                last_end = (
+                    layer_byte_offset(layer_name)
+                    + (num_blocks - 1) * tensor_stride
+                    + page_size
+                )
+                if last_end > backing_nbytes:
+                    raise ValueError(
+                        "Packed IluNixl layer page exceeds registered backing: "
+                        f"{layer_name} end={last_end} > backing={backing_nbytes}"
+                    )
+
             for layer_name in shared_by:
                 cache = kv_caches[layer_name]
                 if cache.untyped_storage().data_ptr() != backing_ptr:

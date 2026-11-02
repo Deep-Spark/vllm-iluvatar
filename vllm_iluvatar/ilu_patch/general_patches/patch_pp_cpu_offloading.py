@@ -18,6 +18,7 @@ from vllm.logger import init_logger
 
 from vllm_iluvatar.ilu_patch import general_patch as p
 from vllm_iluvatar.ilu_patch.dsv41_utils import is_ilu_dsv41_config
+from vllm_iluvatar.ilu_util.mmap_utils import mmap_byte_array
 
 logger = init_logger("vllm.ilu_pp_cpu_offloading")
 
@@ -506,7 +507,7 @@ def _allocate_private_cpu_tensor(
     tensor = None
     try:
         _populate_anonymous_mmap(mmap_obj, aligned_bytes)
-        owner = np.frombuffer(mmap_obj, dtype=np.int8, count=nbytes)
+        owner = mmap_byte_array(mmap_obj, nbytes).view(np.int8)
         tensor = torch.from_numpy(owner).view(
             num_cpu_chunks, cpu_page_size_bytes
         )

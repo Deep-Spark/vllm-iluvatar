@@ -64,6 +64,11 @@ def make_indexer(monkeypatch, *, tokens=8, enabled=True, device="cpu", pcp_size=
         def __init__(self, value):
             super().__init__()
             self.register_buffer("value", value)
+            # Match the real parallel-linear interface without entering the
+            # unrelated small-batch BF16 GEMM fast path in this fusion test.
+            self.register_buffer(
+                "weight", torch.empty(0, dtype=torch.float32, device=value.device)
+            )
 
         def forward(self, x):
             return self.value.clone(), None

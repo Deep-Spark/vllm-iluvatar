@@ -95,6 +95,7 @@ class PrepareLayoutCPU(unittest.TestCase):
         namespace = {
             "torch": torch,
             "ixf_ops": ops,
+            "logger": SimpleNamespace(info_once=lambda *args, **kwargs: None),
             "get_forward_context": lambda: SimpleNamespace(attn_metadata=metadata),
             "_FP8_MAX": 448.0,
             "_FP8_DTYPE": torch.float8_e4m3fn,

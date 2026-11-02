@@ -107,7 +107,7 @@ from vllm.utils.math_utils import cdiv
 
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
     IluFusedMoEEP,
-    _DS4_DECODE_EP_BACKEND,
+    _DECODE_EP_BACKEND,
 )
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.ilu_compressed_tensors_moe_w4a8_int8 import (
     IluCompressedTensorsW4A8Int8MoEMethod,
@@ -458,7 +458,7 @@ class IluDeepseekV4Fp8MoE(nn.Module, IluFusedMoEEP):
         self._ilu_decode_ll = (
             not self._use_ilu_w4a8_ep
             and hasattr(method, "select_gemm_impl")
-            and _DS4_DECODE_EP_BACKEND == "deepep_low_latency"
+            and _DECODE_EP_BACKEND == "deepep_low_latency"
             and self._should_use_forward_dp_ep()
         )
         if self._use_ilu_w4a8_ep or self._ilu_decode_ll:

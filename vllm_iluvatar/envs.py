@@ -114,6 +114,16 @@ def _maybe_stripped(value: str) -> str | None:
     return value or None
 
 
+def _decode_ep_backend() -> str | None:
+    value = _maybe_stripped(os.environ.get("VLLM_ILU_DECODE_EP_BACKEND", ""))
+    if value not in (None, "naive", "deepep_low_latency"):
+        raise ValueError(
+            f"Invalid VLLM_ILU_DECODE_EP_BACKEND: {value!r}; "
+            "expected 'naive' or 'deepep_low_latency'."
+        )
+    return value
+
+
 def _hybrid_dp_sync_prefills_default() -> bool:
     return (
         os.environ.get("VLLM_ILU_DECODE_EP_BACKEND", "").strip() == "deepep_low_latency"
@@ -209,6 +219,7 @@ if TYPE_CHECKING:
     VLLM_ILU_GLM5NEXT_MLA_POOL4_DECODE: bool = True
     VLLM_ILU_GLM5NEXT_GATHER_BEFORE_GATE: bool = True
     VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP: bool = False
+    VLLM_ILU_MOE_AG_SHARED_OVERLAP: bool = False
     VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP: bool = True
     VLLM_ILU_GLM_DSA_INDEXER_PREPARE_FUSION: bool = True
     VLLM_ILU_NIXL_WRITE_USE_HOST_BUFFER: bool = False
@@ -339,11 +350,9 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_GLM5NEXT_GATHER_BEFORE_GATE": _bool_reader(
         "VLLM_ILU_GLM5NEXT_GATHER_BEFORE_GATE", "1"
     ),
-    "VLLM_ILU_INDEXER_KV_DTYPE": lambda: os.environ.get(
-        "VLLM_ILU_INDEXER_KV_DTYPE", "bf16"
-    )
-    .strip()
-    .lower(),
+    "VLLM_ILU_INDEXER_KV_DTYPE": lambda: (
+        os.environ.get("VLLM_ILU_INDEXER_KV_DTYPE", "bf16").strip().lower()
+    ),
     "VLLM_ILU_HYV4_FUSE_IHC": _bool_reader("VLLM_ILU_HYV4_FUSE_IHC", "1"),
     "VLLM_ILU_CUDAGRAPH_ASYNC_REPLAY": _bool_reader(
         "VLLM_ILU_CUDAGRAPH_ASYNC_REPLAY", "0"
@@ -443,9 +452,7 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_DISABLE_DEEPEP": _bool_reader("VLLM_ILU_DISABLE_DEEPEP", "0"),
     "VLLM_ILU_DEEPEP_USE_SCATTER": _bool_reader("VLLM_ILU_DEEPEP_USE_SCATTER", "1"),
     "VLLM_ILU_LL_FUSED_AG_AR": _bool_reader("VLLM_ILU_LL_FUSED_AG_AR", "1"),
-    "VLLM_ILU_DECODE_EP_BACKEND": lambda: _maybe_stripped(
-        os.environ.get("VLLM_ILU_DECODE_EP_BACKEND", "")
-    ),
+    "VLLM_ILU_DECODE_EP_BACKEND": _decode_ep_backend,
     "VLLM_ILU_DP_ROUND_ROBIN_LB": _bool_reader("VLLM_ILU_DP_ROUND_ROBIN_LB", "0"),
     "VLLM_ILU_DP_ROUND_ROBIN_LB_FILE": lambda: os.environ.get(
         "VLLM_ILU_DP_ROUND_ROBIN_LB_FILE", ""
@@ -552,6 +559,10 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ILU_GLM_DSA_PREPARE_FUSION": _bool_reader(
         "VLLM_ILU_GLM_DSA_PREPARE_FUSION", "0"
+    ),
+    # MoERunner AG/RS: overlap local shared MLP with input dispatch.
+    "VLLM_ILU_MOE_AG_SHARED_OVERLAP": _bool_reader(
+        "VLLM_ILU_MOE_AG_SHARED_OVERLAP", "0"
     ),
     # GLM indexer preparation fusion. Default 1; set 0 for the split path:
     # - glm_dsa_indexer_q_rope_weights: in-place RoPE on Q's first 64 dims

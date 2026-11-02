@@ -12,7 +12,9 @@ What differs from W4A8, and why:
   which splits it into Marlin-repacked ``W_UK`` / ``W_UV``. The official FP8
   checkpoint has no such field, so ``kv_b_proj`` falls to the ordinary
   ``IluFp8LinearMethod`` and ``W_UK`` / ``W_UV`` never exist -- the absorbed
-  up-proj has nothing to read. This module builds them.
+  up-proj has nothing to read. This module builds them. An ``ilu_quant`` group
+  can instead convert ``kv_b_proj`` to W8A16 at load time, and then
+  ``IluGlmMoeDsaFp8MLAAttention`` keeps the base class rather than this one.
 
 * The RMSNorm+RoPE+FP8-KV-insert fusion is pinned off, see ``__init__``.
 
@@ -270,4 +272,26 @@ class IluGlmMoeDsaFp8SparseMLA(IluGlmMoeDsaSparseMLA):
 
 
 class IluGlmMoeDsaFp8MLAAttention(IluGlmMoeDsaMLAAttention):
-    sparse_mla_cls = IluGlmMoeDsaFp8SparseMLA
+    @property
+    def sparse_mla_cls(self) -> type[IluGlmMoeDsaSparseMLA]:
+        """Pick the inner attention from ``kv_b_proj``'s actual method.
+
+        ``additional_config.ilu_quant`` can convert ``kv_b_proj`` to the same
+        W8A16 grouped-marlin layout the offline W4A8 NN checkpoint uses, in
+        which case ``W_UK`` / ``W_UV`` already exist and the base class is
+        correct verbatim -- rebuilding them as FP8 einsums would both waste the
+        conversion and keep the slower kernel. Read after ``kv_b_proj`` is
+        constructed, which is where the base ``__init__`` uses this.
+
+        Taking the base class also means ``use_rms_rope_fp8_kv_fusion`` is no
+        longer pinned off: a runtime-converted model behaves exactly like the
+        offline one, including arming that fusion when a frozen KV scale table
+        is supplied.
+        """
+        from vllm_iluvatar.models.glm_moe_dsa.model import IluGlmKVBProjW8A16Method
+
+        if isinstance(
+            getattr(self.kv_b_proj, "quant_method", None), IluGlmKVBProjW8A16Method
+        ):
+            return IluGlmMoeDsaSparseMLA
+        return IluGlmMoeDsaFp8SparseMLA

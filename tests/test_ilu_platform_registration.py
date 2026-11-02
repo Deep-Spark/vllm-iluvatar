@@ -29,6 +29,27 @@ def test_dsa_indexer_prepare_env_reader_defaults_on(monkeypatch):
     assert reader() is True
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "VLLM_ILU_MOE_AG_SHARED_OVERLAP",
+    ],
+)
+def test_moe_all_gather_env_readers_are_opt_in(monkeypatch, name):
+    envs = importlib.import_module("vllm_iluvatar.envs")
+    monkeypatch.setattr(
+        vllm_envs, "environment_variables", dict(vllm_envs.environment_variables)
+    )
+    monkeypatch.delenv(name, raising=False)
+    envs.apply()
+    reader = vllm_envs.environment_variables[name]
+    assert reader() is False
+    monkeypatch.setenv(name, "1")
+    assert reader() is True
+    monkeypatch.setenv(name, "0")
+    assert reader() is False
+
+
 def test_new_ilu_env_readers_are_registered(monkeypatch):
     envs = importlib.import_module("vllm_iluvatar.envs")
     monkeypatch.setattr(

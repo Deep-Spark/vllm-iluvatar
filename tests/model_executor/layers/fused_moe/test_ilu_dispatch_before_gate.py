@@ -141,10 +141,17 @@ def test_gather_before_gate_env_switch(monkeypatch, raw, expected):
 @pytest.mark.parametrize("with_ids", [False, True])
 @pytest.mark.parametrize("idle", [False, True])
 @pytest.mark.parametrize("mixed", [False, True])
-def test_forward_order_and_local_shared_input(monkeypatch, sp, with_ids, idle, mixed):
+@pytest.mark.parametrize("gather_enabled", [False, True])
+def test_forward_order_and_local_shared_input(
+    monkeypatch, sp, with_ids, idle, mixed, gather_enabled
+):
     obj = runner(sp)
+    obj._gather_before_gate_enabled = gather_enabled
     counts = [16 * sp, 0, 2048 if mixed else 18, 2]
     meta = DPMetadata(torch.tensor(counts, dtype=torch.int32))
+    # The model opt-in owns this policy. Even a decode-only phase must not
+    # bypass its env switch or token threshold through the generic phase path.
+    meta.all_ranks_decode_only = True
     monkeypatch.setattr(
         mod, "get_forward_context", lambda: SimpleNamespace(dp_metadata=meta)
     )
@@ -160,13 +167,19 @@ def test_forward_order_and_local_shared_input(monkeypatch, sp, with_ids, idle, m
     shared = torch.randn_like(x)
     gathered_x = torch.cat(chunks)
     gathered_ids = torch.cat(id_chunks) if with_ids else None
+    use_gather = gather_enabled and not mixed
     events = []
     obj.routed_experts = SimpleNamespace(_ensure_moe_quant_config_init=lambda: None)
+    obj._quant_method = SimpleNamespace(
+        is_monolithic=False, supports_prequantized_input=False
+    )
+    obj._shared_experts = None
+    obj._ag_shared_overlap_enabled = False
     obj._sequence_parallel_context = lambda: meta.sp_local_sizes(sp, use_ep=True)
 
     def gate(hidden):
         events.append("gate")
-        torch.testing.assert_close(hidden, x if mixed else gathered_x)
+        torch.testing.assert_close(hidden, gathered_x if use_gather else x)
         return hidden[:, :288], None
 
     obj.gate.side_effect = gate
@@ -211,8 +224,8 @@ def test_forward_order_and_local_shared_input(monkeypatch, sp, with_ids, idle, m
     result = obj._forward_impl(x, torch.empty(x.shape[0], 288), shared, ids)
     assert result[0] is shared and result[1] is x
     assert events == (
-        ["gate", "old_dispatch", "quant", "combine"]
-        if mixed
-        else ["hidden_ag", "gate", "quant", "combine"]
+        ["hidden_ag", "gate", "quant", "combine"]
+        if use_gather
+        else ["gate", "old_dispatch", "quant", "combine"]
     )
     assert meta.local_sizes is None

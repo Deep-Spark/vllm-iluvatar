@@ -2,18 +2,21 @@
 """Wiring for Iluvatar DP batch coordination overrides.
 
 Corresponds to: vllm/v1/worker/dp_utils.py
+                vllm/v1/worker/gpu/dp_utils.py
                 vllm/forward_context.py
 
 Target   : vllm.v1.worker.dp_utils.coordinate_batch_across_dp
+           vllm.v1.worker.gpu.dp_utils.dispatch_cg_and_sync_dp
            vllm.forward_context.DPMetadata.make
            vllm.forward_context.set_forward_context
 Baseline : v0.31.0 (db9527a468) runtime source
 Why      : hybrid DeepSeek-V4 EP may switch decode to LL only when every DP
            rank is decode-only; otherwise collective paths can diverge.
 How      : coordinate_batch_across_dp is a full-function copy with optional
-           all-ranks decode-only synchronization. The DPMetadata methods are
-           lightweight wrappers that attach the synchronized bit while keeping
-           existing call contracts.
+           all-ranks decode-only synchronization. The V2 dispatch wrapper
+           derives the same bit from its existing uniform-token agreement, so
+           it adds no collective or payload. The DPMetadata methods attach the
+           synchronized bit while keeping existing call contracts.
 Scope    : DP+EP MoE forward on Iluvatar.
 Remove   : when upstream DPMetadata carries this field or exposes a hook.
 Fingerprint: coordinate_batch_across_dp community source is hashed at
@@ -123,6 +126,7 @@ def register() -> None:
 def _apply() -> None:
     import vllm.forward_context as fc_mod
     import vllm.v1.worker.dp_utils as dp_mod
+    import vllm.v1.worker.gpu.dp_utils as gpu_dp_mod
 
     import vllm_iluvatar.v1.worker.dp_utils as impl
 
@@ -148,6 +152,68 @@ def _apply() -> None:
         dp_mod,
         "coordinate_batch_across_dp",
         impl.coordinate_batch_across_dp,
+    )
+
+    # The V2 runner no longer calls coordinate_batch_across_dp. Its dispatch
+    # already agrees ``uniform_token_count`` in the same DP all-reduce used for
+    # CUDA-graph selection and padding. Publish that result for DPMetadata
+    # instead of adding another collective to every model step.
+    orig_dispatch_cg_and_sync_dp = gpu_dp_mod.dispatch_cg_and_sync_dp
+
+    @wraps(orig_dispatch_cg_and_sync_dp)
+    def dispatch_cg_and_sync_dp_with_decode_only(
+        cudagraph_manager,
+        num_reqs,
+        num_tokens,
+        uniform_token_count,
+        dp_size,
+        dp_rank,
+        max_query_len=None,
+        need_eager=False,
+        num_active_loras=0,
+        parallel_config=None,
+        allow_ubatching=False,
+        uniform_decode=False,
+        dp_sync=None,
+    ):
+        batch_desc, synced = orig_dispatch_cg_and_sync_dp(
+            cudagraph_manager,
+            num_reqs,
+            num_tokens,
+            uniform_token_count,
+            dp_size,
+            dp_rank,
+            max_query_len=max_query_len,
+            need_eager=need_eager,
+            num_active_loras=num_active_loras,
+            parallel_config=parallel_config,
+            allow_ubatching=allow_ubatching,
+            uniform_decode=uniform_decode,
+            dp_sync=dp_sync,
+        )
+        if dp_size == 1:
+            all_ranks_decode_only = bool(uniform_decode)
+        else:
+            all_ranks_decode_only = bool(
+                uniform_decode
+                and synced is not None
+                and synced.uniform_token_count == uniform_token_count
+            )
+        impl.set_last_all_ranks_decode_only(all_ranks_decode_only)
+        return batch_desc, synced
+
+    p.check_signatures(
+        types.SimpleNamespace(dispatch_cg_and_sync_dp=orig_dispatch_cg_and_sync_dp),
+        types.SimpleNamespace(
+            dispatch_cg_and_sync_dp=dispatch_cg_and_sync_dp_with_decode_only
+        ),
+        ["dispatch_cg_and_sync_dp"],
+        strict=True,
+    )
+    p.rebind_module_func(
+        gpu_dp_mod,
+        "dispatch_cg_and_sync_dp",
+        dispatch_cg_and_sync_dp_with_decode_only,
     )
 
     orig_make = fc_mod.DPMetadata.make

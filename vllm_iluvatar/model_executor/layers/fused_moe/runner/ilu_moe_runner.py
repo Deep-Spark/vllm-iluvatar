@@ -11,8 +11,8 @@ Override summary (each marked with ``# [ILU override]`` in-line):
                                     RoutedExperts scale placement
   _select_forward                   bypass torch.compile custom ops
   forward                           tuple hidden_states (fused norm-quant)
-  _apply_quant_method               fused shared output path
-  _forward_impl                     pass input_ids; gather before replicated gate
+  _apply_quant_method               precomputed shared and quantized inputs
+  _forward_impl                     phase-aware AG and opt-in gather-before-gate
   _maybe_dispatch                   input_ids + _kernel_handles_own_dispatch
   _maybe_combine                    _kernel_handles_own_dispatch guard
   _maybe_apply_routed_scale_to_output  FP16 shared_experts_scaling_factor
@@ -34,13 +34,13 @@ from vllm.distributed import get_dp_group, get_ep_group, get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
+from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
+    ZeroExpertRouter,
+)
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
     MoERunner,
     _moe_forward_shared,
     _unpack,
-)
-from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
-    ZeroExpertRouter,
 )
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExpertsOrder,
@@ -79,6 +79,7 @@ class IluMoERunner(MoERunner):
     # Iluvatar output scale placement for kernels that scale after reduction.
     def __init__(self, *args, routed_scaling_factor: float = 1.0, **kwargs):
         super().__init__(*args, routed_scaling_factor=routed_scaling_factor, **kwargs)
+        self._ag_shared_overlap_enabled = envs.VLLM_ILU_MOE_AG_SHARED_OVERLAP
         logger.info_once("Use Iluvatar MoERunner.")
 
         # Performance-path toggle: gather hidden states before the replicated
@@ -170,9 +171,11 @@ class IluMoERunner(MoERunner):
             shared_experts_input,
             input_ids,
             self._encode_layer_name(),
-            self.moe_config.hidden_dim_unpadded
-            if self._quant_method.has_unpadded_output
-            else 0,
+            (
+                self.moe_config.hidden_dim_unpadded
+                if self._quant_method.has_unpadded_output
+                else 0
+            ),
         )
 
         shared_output, fused_output = _unpack(result)
@@ -212,9 +215,11 @@ class IluMoERunner(MoERunner):
         router_logits: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
+        shared_output: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        shared_ready = shared_output is not None
         experts_order = SharedExpertsOrder.NONE
-        if self._shared_experts is not None:
+        if not shared_ready and self._shared_experts is not None:
             experts_order = self._shared_experts._determine_shared_experts_order(
                 shared_experts_input
             )
@@ -230,9 +235,10 @@ class IluMoERunner(MoERunner):
             experts_order == SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
         )
 
-        self._maybe_apply_shared_experts(
-            shared_experts_input, SharedExpertsOrder.NO_OVERLAP
-        )
+        if not shared_ready:
+            self._maybe_apply_shared_experts(
+                shared_experts_input, SharedExpertsOrder.NO_OVERLAP
+            )
 
         if self.routed_experts.quant_method.is_monolithic:
             fused_out = self.routed_experts.forward_monolithic(
@@ -242,7 +248,11 @@ class IluMoERunner(MoERunner):
             )
         else:
             topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
+                hidden_states=(
+                    hidden_states[0]
+                    if isinstance(hidden_states, tuple)
+                    else hidden_states
+                ),
                 router_logits=router_logits,
                 topk_indices_dtype=self._quant_method.topk_indices_dtype,
                 input_ids=input_ids,
@@ -268,6 +278,9 @@ class IluMoERunner(MoERunner):
                 ),
             )
 
+        if shared_ready:
+            return shared_output, fused_out
+
         self._maybe_apply_shared_experts(
             shared_experts_input,
             SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
@@ -286,14 +299,59 @@ class IluMoERunner(MoERunner):
         )
 
         return (
-            self._shared_experts.output
-            if (
-                self._shared_experts is not None
-                and return_shared_output
-                and not can_fused_shared_output
-            )
-            else None,
+            (
+                self._shared_experts.output
+                if (
+                    self._shared_experts is not None
+                    and return_shared_output
+                    and not can_fused_shared_output
+                )
+                else None
+            ),
             fused_out,
+        )
+
+    def _prepare_routed_input(self, hidden_states, shared_input):
+        """Reuse norm quantization only when it describes the routed input."""
+        if (
+            isinstance(shared_input, tuple)
+            and self.routed_input_transform is None
+            and shared_input[0].shape == hidden_states.shape
+        ):
+            q, scale, dtype = shared_input
+            if dtype != hidden_states.dtype or q.dtype != torch.int8:
+                raise ValueError("norm quantization dtype does not match routed input")
+            if (
+                q.device != hidden_states.device
+                or scale.device != q.device
+                or scale.dtype != torch.float32
+                or scale.numel() != hidden_states.shape[0]
+            ):
+                raise ValueError("norm scales must be one FP32 value per routed token")
+            return q, scale.reshape(-1, 1), dtype
+        if hidden_states.shape[0] == 0:
+            return (
+                torch.empty_like(hidden_states, dtype=torch.int8),
+                torch.empty((0, 1), device=hidden_states.device, dtype=torch.float32),
+                hidden_states.dtype,
+            )
+        import ixformer.inference.functions as ixfops
+
+        q, scale = ixfops.scaled_int8_quant(hidden_states)
+        return q, scale.reshape(-1, 1), hidden_states.dtype
+
+    def _shared_can_reuse_routed_quant(self):
+        from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes import (
+            IluCompressedTensorsW8A8Int8,
+        )
+
+        layer = getattr(self._shared_experts, "_layer", None)
+        scheme = getattr(getattr(layer, "gate_up_proj", None), "scheme", None)
+        return (
+            self.routed_input_transform is None
+            and isinstance(scheme, IluCompressedTensorsW8A8Int8)
+            and not scheme.is_static_input_scheme
+            and scheme.input_symmetric
         )
 
     def _dispatch_before_gate(self) -> bool:
@@ -345,8 +403,8 @@ class IluMoERunner(MoERunner):
         gathered = group.all_gatherv(tensors, dim=0, sizes=sizes)
         return gathered[0], gathered[1] if input_ids is not None else None
 
-    # [ILU override] _forward_impl — pass input_ids through dispatch and
-    # gather hidden states before the replicated GLM decode gate when eligible.
+    # [ILU override] retain dispatch -> quant method -> combine for every phase,
+    # while preserving model-opted gather-before-gate policies.
     def _forward_impl(
         self,
         hidden_states: torch.Tensor,
@@ -360,42 +418,102 @@ class IluMoERunner(MoERunner):
                 hidden_states, router_logits, shared_experts_input, input_ids
             )
         dispatch_before_gate = self._dispatch_before_gate()
-        # vLLM v0.31.0 (db9527a468) removed ``_maybe_sync_shared_experts_stream`` (the
-        # pre-dispatch aux-stream sync) and replaced it with
-        # ``SharedExperts.maybe_forward_async`` + ``wait``. ILU does NOT use
-        # pre-dispatch async shared experts — ``_apply_quant_method`` below
-        # orchestrates shared experts synchronously via ``_maybe_apply_shared_experts``
-        # (NO_OVERLAP before routed experts, MULTI_STREAM_OVERLAPPED after), so
-        # there is nothing to sync here. Drop the stale call.
-        if self.gate is not None and not dispatch_before_gate:
+        ag_rs = (
+            self.moe_config.moe_parallel_config.all2all_backend
+            in ("allgather_reducescatter", "ag-rs", "ag_rs")
+            and not self._kernel_handles_own_dispatch
+            and not self._quant_method.is_monolithic
+        )
+        decode_only = False
+        if ag_rs:
+            metadata = get_forward_context().dp_metadata
+            # DP=1 + PCP>1 without SP MoE has no DPMetadata: use the
+            # pre-gate/INT8 branch, including local decode-only batches.
+            decode_only = metadata is not None and metadata.all_ranks_decode_only
+        gate_owns_gather_policy = bool(
+            getattr(self.gate, "gather_before_gate", GATHER_BEFORE_GATE_DEFAULT)
+        )
+        phase_gate_after_dispatch = (
+            ag_rs
+            and decode_only
+            and self.gate is not None
+            and not self._fse_fuse_gate
+            and not gate_owns_gather_policy
+        )
+        gate_after_dispatch = dispatch_before_gate or phase_gate_after_dispatch
+        schedule_shared = (
+            ag_rs and self._shared_experts is not None and not self._fse_fuse_gate
+        )
+        if gate_after_dispatch:
+            router_logits = None
+        elif self.gate is not None:
             if self._fse_fuse_gate:
                 self._maybe_fuse_gate_weights()
                 router_logits = F.linear(hidden_states, self._combined_gate_weight)
             else:
                 router_logits, _ = self.gate(hidden_states)
 
+        if (
+            ag_rs
+            and not decode_only
+            and not dispatch_before_gate
+            and getattr(self._quant_method, "supports_prequantized_input", False)
+            is True
+            and self.routed_experts.custom_routing_function is None
+        ):
+            hidden_states = self._prepare_routed_input(
+                hidden_states, shared_experts_input
+            )
+            shared_tensor = (
+                shared_experts_input[0]
+                if isinstance(shared_experts_input, tuple)
+                else shared_experts_input
+            )
+            if (
+                self._shared_can_reuse_routed_quant()
+                and shared_tensor is not None
+                and shared_tensor.shape == hidden_states[0].shape
+            ):
+                shared_experts_input = hidden_states
+
         with self._sequence_parallel_context():
+            stream = None
+            if schedule_shared:
+                stream = self._shared_experts.begin_dispatch(
+                    shared_experts_input,
+                    overlap=self._ag_shared_overlap_enabled,
+                )
             if dispatch_before_gate:
                 hidden_states, input_ids = self._gather_before_gate(
                     hidden_states, input_ids
                 )
-                router_logits, _ = self.gate(hidden_states)
             else:
                 hidden_states, router_logits, input_ids = self._maybe_dispatch(
-                    hidden_states, router_logits, input_ids
+                    hidden_states,
+                    router_logits,
+                    input_ids,
                 )
-
+            shared_output = (
+                self._shared_experts.end_dispatch(stream) if schedule_shared else None
+            )
+            # All dispatch (including PCP) is complete before the deferred gate.
+            if gate_after_dispatch:
+                router_logits, _ = self.gate(hidden_states)
             shared_output, hidden_states = self._apply_quant_method(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
                 shared_experts_input=shared_experts_input,
                 input_ids=input_ids,
+                shared_output=shared_output,
             )
-
-            return self._maybe_combine(
-                shared_output,
-                hidden_states,
-            )
+            if ag_rs:
+                logger.info_once(
+                    "MoERunner phase=%s, gate_after_dispatch=%s, shared_overlap=%s",
+                    "decode" if decode_only else "prefill/mixed",
+                    gate_after_dispatch,
+                    self._ag_shared_overlap_enabled,
+                )
+            return self._maybe_combine(shared_output, hidden_states)
 
     @property
     def _needs_pcp_dispatch_combine(self) -> bool:
@@ -410,34 +528,42 @@ class IluMoERunner(MoERunner):
     # because _forward_impl is also overridden.
     def _maybe_dispatch(
         self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.dtype],
+        router_logits: torch.Tensor | None,
         input_ids: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ):
+        quantized = isinstance(hidden_states, tuple)
+        extras = []
+        if quantized:
+            hidden_states, scale, compute_dtype = hidden_states
+            extras.append(scale)
+        if input_ids is not None:
+            extras.append(input_ids)
         if self.do_naive_dispatch_combine and not self._kernel_handles_own_dispatch:
             result = get_ep_group().dispatch_router_logits(
                 hidden_states,
                 router_logits,
                 self.moe_config.is_sequence_parallel,
-                extra_tensors=[input_ids] if input_ids is not None else None,
+                extra_tensors=extras or None,
             )
-            if input_ids is not None:
-                assert len(result) == 3
-                hidden_states, router_logits, extra_tensors = result
-                assert len(extra_tensors) == 1
-                input_ids = extra_tensors[0]
+            if extras:
+                hidden_states, router_logits, extras = result
             else:
-                assert len(result) == 2
                 hidden_states, router_logits = result
 
         if self._needs_pcp_dispatch_combine:
-            # EP alone does not install a dispatch kernel. Native W4A8 still
-            # needs all PCP tokens on every expert shard before local GEMMs.
-            hidden_states = get_pcp_group().all_gather(hidden_states, dim=0)
-            router_logits = get_pcp_group().all_gather(router_logits, dim=0)
-            if input_ids is not None:
-                input_ids = get_pcp_group().all_gather(input_ids, dim=0)
+            # Preserve upstream PCP redistribution for both floating and INT8
+            # inputs. Scales and token IDs must follow exactly the same order.
+            group = get_pcp_group()
+            hidden_states = group.all_gather(hidden_states, dim=0)
+            if router_logits is not None:
+                router_logits = group.all_gather(router_logits, dim=0)
+            extras = [group.all_gather(tensor, dim=0) for tensor in extras]
 
+        if input_ids is not None:
+            input_ids = extras[-1]
+        if quantized:
+            hidden_states = (hidden_states, extras[0], compute_dtype)
         return hidden_states, router_logits, input_ids
 
     # [ILU override] _maybe_combine — delta: guard with
@@ -603,9 +729,7 @@ class IluMoERunner(MoERunner):
                     [hidden_states, input_ids], dim=0, sizes=sizes
                 )
             else:
-                hidden_states = dp_group.all_gatherv(
-                    hidden_states, dim=0, sizes=sizes
-                )
+                hidden_states = dp_group.all_gatherv(hidden_states, dim=0, sizes=sizes)
                 input_ids = None
 
             assert self.gate is not None
@@ -687,4 +811,3 @@ class IluMoERunner(MoERunner):
         if og_hidden_dim_post_xform is not None:
             result = result[..., :og_hidden_dim_post_xform]
         return result
-

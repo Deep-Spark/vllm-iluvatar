@@ -21,6 +21,19 @@
 - 新增 DeepSeek-V4 Flash 社区 block-outermost KV 布局 CPU 回归测试。
 - 将 DeepSeek-V4 / V4.1 插件适配到 vLLM 0.31，并打通 sparse SWA
   bounded replay（`replay_start`）。
+- DeepSeek-V4 FP8 原生 MXFP4（f4f8）routed experts 在
+  `VLLM_ILU_DECODE_EP_BACKEND=deepep_low_latency` 且配置 backend 不是
+  `deepep_low_latency` 时走 batched DP+EP：`IluMxfp4MoEMethod` 返回
+  `mxfp4_w4a8` quant config，`select_gemm_impl` 复用
+  `IluMoEBatchedExpertsFp8`，并在 `silu`/`swiglu` 缺少正的
+  `swiglu_limit` 或权重不是 ixmm 布局时直接报错。把
+  `--all2all_backend` 本身配成 `deepep_low_latency` 不会走这条实现。
+- `IluDeepseekV4Fp8MoE` 保留 feat 上的 decode-only 低延迟入口：非 W4A8
+  且实现了 `select_gemm_impl` 的方法（含原生 MXFP4）在
+  `VLLM_ILU_DECODE_EP_BACKEND=deepep_low_latency` 且所有 rank 都是 decode
+  时走 `forward_dp_ep_deep_ep`。Prefill 仍走社区 runner。转换后的 W4A8
+  仍在整个 DP+EP step 上走 `forward_dp_ep`。纯低延迟 decode 的数值结果
+  尚未覆盖。
 
 ### Removed
 

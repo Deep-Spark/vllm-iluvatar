@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""FP8 model wiring for converted W4A8 Hybrid EP; no collective simulation."""
+"""FP8 model wiring for converted W4A8 Hybrid EP and MXFP4 decode LL."""
 
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -55,7 +55,10 @@ def make_moe(monkeypatch, kind, hash_layer=True):
 @pytest.mark.parametrize("hash_layer", [False, True])
 def test_method_admission_and_forward(monkeypatch, kind, eligible, hash_layer):
     moe, runner, init = make_moe(monkeypatch, kind, hash_layer)
+    # Native MXFP4 stays on the community runner unless the decode LL
+    # override is enabled. Converted/wrapped W4A8 always install Hybrid EP.
     assert init.call_count == (kind != "native")
+    assert moe._ilu_decode_ll is False
     guard = Mock(return_value=eligible)
     hybrid = Mock(return_value=torch.full((2, 8), 7.0))
     monkeypatch.setattr(moe, "_should_use_forward_dp_ep", guard)
@@ -81,6 +84,25 @@ def test_method_admission_and_forward(monkeypatch, kind, eligible, hash_layer):
         assert torch.equal(routed_ids, ids)
     else:
         assert routed_ids is None
+
+
+def test_native_mxfp4_decode_ll_override(monkeypatch):
+    monkeypatch.setattr(mod, "_DS4_DECODE_EP_BACKEND", "deepep_low_latency")
+    monkeypatch.setattr(
+        mod.IluDeepseekV4Fp8MoE, "_should_use_forward_dp_ep", lambda self: True
+    )
+    moe, runner, init = make_moe(monkeypatch, "native", hash_layer=False)
+    assert init.call_count == 1
+    assert moe._ilu_decode_ll is True
+    low_latency = Mock(return_value=torch.full((2, 8), 9.0))
+    monkeypatch.setattr(moe, "forward_dp_ep_deep_ep", low_latency)
+    monkeypatch.setattr(moe, "_is_all_ranks_decode_only", lambda: True)
+    runner.return_value = torch.full((2, 8), 3.0)
+    hidden = torch.zeros(2, 8)
+    output = moe(hidden, None)
+    assert torch.equal(output, torch.full_like(hidden, 9.0))
+    assert low_latency.call_count == 1
+    runner.assert_not_called()
 
 
 @pytest.mark.parametrize("kind", ["native", "converted"])

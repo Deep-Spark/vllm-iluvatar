@@ -33,6 +33,7 @@ class IluMoEBatchedExpertsFp8(BaseBatchExperts):
         num_dispatchers: int,
         swiglu_limit: float | None = None,
         out_dtype: torch.dtype = torch.bfloat16,
+        runner_scaling_factor: float = 1.0,
     ) -> None:
         super().__init__(
             moe_config=moe_config,
@@ -44,6 +45,7 @@ class IluMoEBatchedExpertsFp8(BaseBatchExperts):
             swiglu_limit=swiglu_limit,
             max_num_tokens=max_num_tokens,
             num_dispatchers=num_dispatchers,
+            runner_scaling_factor=runner_scaling_factor,
         )
 
     def _scratch(

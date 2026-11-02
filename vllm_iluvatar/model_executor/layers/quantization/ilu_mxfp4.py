@@ -25,8 +25,8 @@ DeepSeek-V4-specific (``swiglu_limit``, hash routing) already lives in
 as-is. The checkpoint-shaped decisions live one level up, in
 ``ilu_deepseek_v4_fp8.py``.
 
-Overrides (five, each marked ``[ILU override]`` inline)
-------------------------------------------------------
+Overrides (each marked ``[ILU override]`` inline)
+------------------------------------------------
 ``__init__``                      do not call ``select_deepseek_v4_mxfp4_moe_backend``;
                                   pin ``mxfp4_backend`` to ``NONE`` and set no
                                   ``experts_cls`` attribute at all
@@ -35,9 +35,10 @@ Overrides (five, each marked ``[ILU override]`` inline)
 ``process_weights_after_loading`` fallback: zero-copy dtype re-label;
                                   default: chunked
                                   ``preprocess_weight_for_ixmm`` on ivcore30
-``get_fused_moe_quant_config``    ``None`` -> no community MoE kernel is built
-``maybe_make_prepare_finalize``   ``None`` -> never wrapped into
-                                  ``FusedMoEModularMethod``
+``get_fused_moe_quant_config``    describe the ix30 tensors (FP8 act / MXFP4
+                                  weight) for the batched DP+EP path
+``maybe_make_prepare_finalize``   return None; Hybrid EP owns LL prepare/finalize
+``select_gemm_impl``              batched FP4-weight / FP8-activation experts
 ``apply``                         wiring only; the compute lives in
                                   ``ilu_mxfp4_fused_moe.py``
 
@@ -68,13 +69,18 @@ import torch
 # package root, not the defining modules, which is what keeps this free of the
 # fused_moe <-> quantization import cycle.
 from vllm.model_executor.layers.fused_moe import (
+    FusedMoEActivationFormat,
     FusedMoEConfig,
     FusedMoEMethodBase,
     FusedMoEQuantConfig,
     RoutedExperts,
     SharedExperts,
 )
+from vllm.model_executor.layers.fused_moe.config import (
+    mxfp4_w4a8_moe_quant_config,
+)
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
+    FusedMoEExpertsModular,
     FusedMoEPrepareAndFinalizeModular,
 )
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
@@ -267,32 +273,143 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
 
         layer._ilu_mxfp4_ixmm = use_ixmm
 
-    # [ILU override] Mxfp4MoEMethod.get_fused_moe_quant_config — delta: None.
-    # A ``FusedMoEQuantConfig`` only exists to configure a community modular
-    # kernel; we build none. Returning None also keeps ``topk_indices_dtype``
-    # at ``None`` (``fused_moe_method_base.py:135-140``), so the router emits
-    # int32 ids -- the dtype ``ilu_mxfp4_fused_experts`` expects. Same choice as
-    # the W4A8 method (``ilu_compressed_tensors_moe_w4a8_int8.py:491-494``).
+    # [ILU override] Mxfp4MoEMethod.get_fused_moe_quant_config — delta: describe
+    # the ix30 tensors ``process_weights_after_loading`` left on the layer (FP8
+    # activations over MXFP4 weights) instead of returning None.
+    #
+    # ``apply`` still reads the weights straight off the layer, and no community
+    # MoE kernel is built either way -- ``moe_kernel`` stays ``None``, so
+    # ``topk_indices_dtype`` stays None
+    # (``fused_moe_method_base.py:109-112``) and the router still emits the
+    # int32 ids ``ilu_mxfp4_fused_experts`` expects. The config exists for the
+    # batched DP+EP path: ``select_gemm_impl`` hands ``w1_scale`` / ``w2_scale``
+    # to ``IluMoEBatchedExpertsFp8``, and ``nvsm_dispatch_quant_kwargs``
+    # (``prepare_finalize/ilu_deepep_ll.py:42-68``) reads the ``"mxfp4"`` weight
+    # dtype to put the LL dispatch into FP8 mode. Without it that helper falls
+    # back to ``use_int8=VLLM_ILU_DEEPEP_USE_INT8, use_fp8=False`` and the
+    # dispatched activations no longer match what the experts consume.
+    #
+    # ``gemm1_clamp_limit`` carries DeepSeek-V4's ``swiglu_limit`` through to the
+    # batched activation; see ``select_gemm_impl`` for why a missing limit is a
+    # hard error rather than "no clamp".
     def get_fused_moe_quant_config(
         self, layer: RoutedExperts
     ) -> FusedMoEQuantConfig | None:
-        return None
+        return mxfp4_w4a8_moe_quant_config(
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
+        )
 
-    # [ILU override] FusedMoEMethodBase.maybe_make_prepare_finalize — delta:
-    # None. Community would build a prepare/finalize pair once
-    # ``use_all2all_kernels`` is true (EP together with DP / PCP / SP); the
-    # runner's lazy ``routed_experts._ensure_moe_quant_config_init``
-    # (introduced by the MoE modular-kernel refactor, replacing the removed
-    # ``maybe_init_modular_kernel``) then materializes a
-    # ``FusedMoEModularMethod`` whose ``apply`` expects a real kernel. Iluvatar
-    # dispatch/combine is the naive EP-group path instead
-    # (``IluMoERunner.do_naive_dispatch_combine``), so we opt out explicitly
-    # rather than relying on the deployment happening to have ``dp_size == 1``.
+    # [ILU override] — delta: return None.
+    #
+    # vLLM v0.31.0 (db9527a468) has no
+    # ``FusedMoEMethodBase.maybe_make_prepare_finalize``. The factory is the
+    # free function ``all2all_utils.maybe_make_prepare_finalize``, and nothing
+    # on this pin calls it through the quant method. With
+    # ``allow_new_interface`` left false it returns None for naive /
+    # allgather_reducescatter (``all2all_utils.py:189``; the AG-RS branch at
+    # ``:392`` also requires the flag). Returning None here keeps
+    # ``moe_kernel`` unset, so ``supports_internal_mk`` stays False and
+    # ``IluFusedMoEEP`` keeps driving dispatch/combine.
+    #
+    # The low-latency kernel is built in
+    # ``IluFusedMoEEP._get_forward_dp_ep_ll_moe_kernel`` via
+    # ``select_gemm_impl``, and only when the configured backend is not
+    # already ``deepep_low_latency``. That function returns ``moe_kernel``
+    # for a configured LL backend; this method leaves it None, so
+    # ``forward_dp_ep_deep_ep`` raises ``NotImplementedError``. The supported
+    # MXFP4 entry is ``VLLM_ILU_DECODE_EP_BACKEND=deepep_low_latency`` on top
+    # of a non-LL configured backend.
     def maybe_make_prepare_finalize(
         self,
         routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> FusedMoEPrepareAndFinalizeModular | None:
         return None
+
+    # [ILU override] FusedMoEMethodBase.select_gemm_impl — delta: build the
+    # batched FP4-weight / FP8-activation experts instead of raising.
+    #
+    # Reached from ``IluFusedMoEEP._get_forward_dp_ep_ll_moe_kernel`` when
+    # ``VLLM_ILU_DECODE_EP_BACKEND=deepep_low_latency`` and the configured
+    # backend is not itself ``deepep_low_latency``. Under ``ixmm`` our
+    # ``process_weights_after_loading`` leaves exactly the ix30 pair
+    # (``uint8 [E, k/2, n]`` weight + ``float32 [E, k/256, n]`` running-acc
+    # scale) that ``IluMoEBatchedExpertsFp8`` was written against -- the same
+    # tensors ``IluFp8MoEMethod`` produces by dequantising block-FP8 -- so the
+    # experts are reused verbatim rather than reimplemented here.
+    def select_gemm_impl(
+        self,
+        prepare_finalize: FusedMoEPrepareAndFinalizeModular,
+        layer: RoutedExperts,
+    ) -> FusedMoEExpertsModular:
+        # Private import on purpose: the LL decode sizing rule belongs to
+        # whichever method owns the NVSHMEM buffer, and both FP8 and MXFP4
+        # routed experts share one.
+        from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8 import (
+            _shrink_ll_max_tokens_to_decode,
+        )
+        from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8_batch_experts import (  # noqa: E501
+            IluMoEBatchedExpertsFp8,
+        )
+
+        if (
+            prepare_finalize.activation_format
+            != FusedMoEActivationFormat.BatchedExperts
+        ):
+            raise NotImplementedError(
+                "IluMoEBatchedExpertsFp8 requires the batched activation format, "
+                f"got {prepare_finalize.activation_format}"
+            )
+
+        # The fallback layouts keep the checkpoint's ``int8 [E, n, k/2]``
+        # weights and ``float8_e8m0fnu`` scales, which the batched experts
+        # reject by dtype. Fail here instead of at the first decode step.
+        if not getattr(layer, "_ilu_mxfp4_ixmm", False):
+            raise NotImplementedError(
+                "batched MXFP4 experts require the ixmm weight layout; "
+                "VLLM_ILU_MXFP4_MOE_BACKEND resolved to a torch / "
+                "ixformer_native layout. Use the configured all2all backend "
+                "(no decode override) or set VLLM_ILU_MXFP4_MOE_BACKEND=ixmm."
+            )
+
+        assert self.moe_quant_config is not None
+        activation = getattr(layer.activation, "value", layer.activation)
+        swiglu_limit = self.moe_quant_config.gemm1_clamp_limit
+        if activation in ("silu", "swiglu"):
+            # ``IluMoEBatchedExpertsFp8`` maps silu/swiglu onto
+            # ``moe_group_gemv_swiglu_quant_fp8(act_type="swiglu")``, whose
+            # clamp is DeepSeek-V4's ``SiluAndMulWithClamp`` only while a limit
+            # is supplied -- a ``None`` silently degrades to plain SwiGLU
+            # instead of raising the way the legacy ``dsv4_clamp`` variant does.
+            if swiglu_limit is None or swiglu_limit <= 0:
+                raise ValueError(
+                    "batched MXFP4 experts need a positive swiglu_limit for "
+                    f"activation {activation!r} (clamp-before-silu), got "
+                    f"{swiglu_limit!r}"
+                )
+        elif activation != "swiglustep":
+            raise NotImplementedError(
+                "batched MXFP4 experts support silu/swiglu (clamped) and "
+                f"swiglustep activations, got {activation!r}"
+            )
+
+        _shrink_ll_max_tokens_to_decode(prepare_finalize)
+        max_num_tokens = prepare_finalize.max_num_tokens_per_rank()
+        if max_num_tokens is None:
+            raise ValueError("batched MXFP4 experts require max_num_tokens")
+        return IluMoEBatchedExpertsFp8(
+            moe_config=self.moe,
+            quant_config=self.moe_quant_config,
+            max_num_tokens=max_num_tokens,
+            num_dispatchers=prepare_finalize.num_dispatchers(),
+            swiglu_limit=swiglu_limit,
+            # ``apply`` folds this into ``ilu_mxfp4_fused_experts``'
+            # ``output_scale``; the batched combine reads it back off the
+            # experts (``ilu_fused_moe_ep.py:889-896``), so pass it through
+            # rather than letting the two paths disagree if it ever leaves 1.0.
+            runner_scaling_factor=_get_ilu_output_scale(layer),
+        )
 
     # [ILU override] Mxfp4MoEMethod.apply — delta: wiring only. Community
     # delegates to ``self.moe_kernel.apply``; we call the plugin's compute

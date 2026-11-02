@@ -30,7 +30,23 @@ def _has_ixmm_ivcore30() -> bool:
 @pytest.mark.skipif(
     not _has_ixmm_ivcore30(), reason="requires an ivcore30 GPU with ixmm backend"
 )
-def test_batched_fp8_experts_match_legacy_fp4_fp8_path():
+# ``activation`` is what ``RoutedExperts.activation`` reports and
+# ``legacy_variant`` the matching ``ilu_mxfp4_fused_experts`` step-4 op. The
+# ``silu`` row is DeepSeek-V4: the batched path maps it onto
+# ``moe_group_gemv_swiglu_quant_fp8(act_type="swiglu")``, whose clamp only
+# reproduces ``SiluAndMulWithClamp`` while a limit is supplied.
+@pytest.mark.parametrize(
+    "activation,legacy_variant,swiglu_limit",
+    [
+        ("swiglustep", "step3_swiglustep", 7.0),
+        ("silu", "dsv4_clamp", 10.0),
+    ],
+)
+def test_batched_fp8_experts_match_legacy_fp4_fp8_path(
+    activation: str,
+    legacy_variant: str,
+    swiglu_limit: float,
+):
     torch.manual_seed(7)
     device = torch.device("cuda")
     num_tokens, num_experts, topk = 8, 2, 2
@@ -92,9 +108,9 @@ def test_batched_fp8_experts_match_legacy_fp4_fp8_path():
         w2_weight_scale=w2_scale,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        swiglu_limit=7.0,
+        swiglu_limit=swiglu_limit,
         backend="ixmm",
-        swiglu_variant="step3_swiglustep",
+        swiglu_variant=legacy_variant,
     )
 
     batched_input = torch.zeros(
@@ -122,7 +138,7 @@ def test_batched_fp8_experts_match_legacy_fp4_fp8_path():
 
     experts = object.__new__(IluMoEBatchedExpertsFp8)
     experts.out_dtype = torch.bfloat16
-    experts.swiglu_limit = 7.0
+    experts.swiglu_limit = swiglu_limit
     experts.quant_config = SimpleNamespace(
         w1_scale=w1_scale,
         w2_scale=w2_scale,
@@ -147,7 +163,7 @@ def test_batched_fp8_experts_match_legacy_fp4_fp8_path():
             w2=w2,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            activation=SimpleNamespace(value="swiglustep"),
+            activation=SimpleNamespace(value=activation),
             global_num_experts=num_experts,
             expert_map=None,
             a1q_scale=input_scales,

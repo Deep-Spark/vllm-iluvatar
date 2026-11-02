@@ -18,13 +18,13 @@ tilelang MHC kernels and the model allocates three aux streams at build time.
   ``:757-772``): each sub-layer does its own ``hc_post`` and ``attn_norm`` /
   ``ffn_norm`` are called explicitly, rather than NVIDIA's cross-sub-layer
   ``mhc_fused_post_pre`` with the norm folded into the pre.
-* ``IluDeepseekV4Fp8MoE.forward``: native MXFP4 uses the community
-  ``FusedMoE`` runner -- ``IluGateLinear`` for the gate
-  GEMM, ``ops.topk_hash_softplus_sqrt`` for the top-k, and
-  ``IluMxfp4MoEMethod`` -> ``ilu_mxfp4_fused_experts()`` for the routed MXFP4
-  experts. Runtime-converted W4A8 TN experts additionally reuse
-  ``IluFusedMoEEP`` for synchronized Hybrid EP selection and pre-capture LL
-  initialization, as in the offline W4A8 model.
+* ``IluDeepseekV4Fp8MoE.forward``: native MXFP4 stays on the community
+  ``FusedMoE`` runner (``IluGateLinear``, ``ops.topk_hash_softplus_sqrt``,
+  ``IluMxfp4MoEMethod`` -> ``ilu_mxfp4_fused_experts()``). When
+  ``VLLM_ILU_DECODE_EP_BACKEND=deepep_low_latency`` and every rank is
+  decode-only, a method that implements ``select_gemm_impl`` (native MXFP4
+  included) takes ``forward_dp_ep_deep_ep`` instead. Runtime-converted W4A8
+  TN still uses ``forward_dp_ep`` for the whole DP + EP step.
 * The shared-expert activation is the community ``SiluAndMulWithClamp``, which
   resolves to the plugin's OOT ``IluSiluAndMulWithClamp``.
 
@@ -325,6 +325,12 @@ class IluDeepseekV4Fp8MoE(nn.Module, IluFusedMoEEP):
     intermediate size).  Nothing here forces that split: ``FusedMoE`` derives it
     from ``FusedMoEParallelConfig.make``, so a TP-only launch would give
     different per-rank shapes.  The shared-expert MLP is TP-sharded either way.
+
+    ``IluFusedMoEEP`` is mixed in so converted W4A8 can take the full DP + EP
+    path and so a decode-only low-latency override can call
+    ``forward_dp_ep_deep_ep``. Native MXFP4 does not enter that mixin for
+    prefill; it does when ``select_gemm_impl`` exists and
+    ``VLLM_ILU_DECODE_EP_BACKEND=deepep_low_latency``.
     """
 
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -447,14 +453,15 @@ class IluDeepseekV4Fp8MoE(nn.Module, IluFusedMoEEP):
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=eplb_config.num_redundant_experts,
         )
-        # Converted TN weights use the same Hybrid EP consumer as offline W4A8.
-        # Native MXFP4 retains its community runner: it has no LL GEMM backend.
+        # Converted W4A8 uses Hybrid EP on every DP + EP step. Any other
+        # method with ``select_gemm_impl`` (native MXFP4) stays on the
+        # community runner unless the decode override is deepep_low_latency.
         method = self.experts._quant_method
         method = getattr(method, "old_quant_method", method)
         self._use_ilu_w4a8_ep = isinstance(
             method, IluCompressedTensorsW4A8Int8MoEMethod
         )
-        # The 0.31 runner owns the normal path; explicitly opt decode into LL.
+        # The 0.31 runner owns prefill. Opt decode into LL only.
         self._ilu_decode_ll = (
             not self._use_ilu_w4a8_ep
             and hasattr(method, "select_gemm_impl")
@@ -469,7 +476,8 @@ class IluDeepseekV4Fp8MoE(nn.Module, IluFusedMoEEP):
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Use Hybrid EP for converted W4A8, otherwise the community runner.
+        """Use Hybrid EP for converted W4A8. Native MXFP4 stays on the
+        community runner unless the decode LL override is active.
 
         Same shape as community ``DeepseekV4MoE.forward``.  There is **no**
         ``tensor_model_parallel_all_reduce`` here: the runner owns the single
@@ -481,8 +489,8 @@ class IluDeepseekV4Fp8MoE(nn.Module, IluFusedMoEEP):
         ``router_logits`` is a placeholder (``hidden_states``) and the real
         gate GEMM runs inside the runner (see ``MoERunner._forward_impl``).
         The community dropped the ``is_internal_router`` branch, so it is
-        dropped here too. An explicit LL decode override uses the existing
-        EP helper; prefill stays on this runner.
+        dropped here too. An explicit LL decode override uses
+        ``forward_dp_ep_deep_ep``; prefill stays on this runner.
         """
         if self.gate.tid2eid is not None:
             if input_ids is None:

@@ -735,6 +735,16 @@ def test_virtual_slot_descriptor_address_math():
         device_id=2,
     ) == (2280, 256, 2)
 
+    # Layer-outer mixed-page pool: layer base need not be stride-aligned.
+    assert IluNixlWorkerMixin._virtual_slot_desc(
+        backing_base=0,
+        block_id=1,
+        block_stride=131072,
+        slot_offset=2682322944,
+        page_size=131072,
+        device_id=0,
+    ) == (2682322944 + 131072, 131072, 0)
+
     with pytest.raises(ValueError, match="outside its block stride"):
         IluNixlWorkerMixin._virtual_slot_desc(1000, 0, 64, 32, 64, 0)
 
@@ -844,6 +854,95 @@ def test_packed_virtual_layout_places_each_layer_at_its_page():
     }
     assert [region.block_len for region in regions] == [page, page, page]
     assert [region.block_stride for region in regions] == [block_stride] * 3
+
+
+def test_packed_virtual_layout_layer_outer_mixed_pages_share_pool():
+    """LBHNC-style shared pool: backing need not be a multiple of main stride*N.
+
+    MiniMax packs main (large page) and indexer (small page) into one buffer.
+    Under layer-outer, each tensor's block_stride is its own page, so
+    bytes_per_block / main_page is not an integer when L is not a multiple of
+    main_page/gcd. The old check ``backing % (stride * N) == 0`` rejected this.
+    """
+    num_blocks = 2
+    main_page = 8
+    idx_page = 1
+    main_layers = [
+        "model.layers.0.attn",
+        "model.layers.1.attn",
+    ]
+    idx_layers = [
+        "model.layers.0.attn.indexer.k_cache",
+        "model.layers.1.attn.indexer.k_cache",
+    ]
+    bytes_per_block = len(main_layers) * main_page + len(idx_layers) * idx_page
+    size = bytes_per_block * num_blocks
+    assert size % (main_page * num_blocks) != 0
+
+    main_spec = SimpleNamespace(page_size_bytes=main_page)
+    idx_spec = SimpleNamespace(page_size_bytes=idx_page)
+    # One group per layer so page sizes stay correct (not a single UniformType).
+    groups = [
+        *[
+            SimpleNamespace(layer_names=[name], kv_cache_spec=main_spec)
+            for name in main_layers
+        ],
+        *[
+            SimpleNamespace(layer_names=[name], kv_cache_spec=idx_spec)
+            for name in idx_layers
+        ],
+    ]
+    main_layer_stride = main_page * num_blocks
+    idx_layer_stride = idx_page * num_blocks
+    idx_offset = len(main_layers) * main_page * num_blocks
+    layout_config = SimpleNamespace(
+        num_blocks=num_blocks,
+        kv_cache_groups=groups,
+        kv_cache_tensors=[
+            SimpleNamespace(
+                size=size,
+                layers=main_layers,
+                offset=0,
+                layer_stride=main_layer_stride,
+                block_stride=main_page,
+            ),
+            SimpleNamespace(
+                size=size,
+                layers=idx_layers,
+                offset=idx_offset,
+                layer_stride=idx_layer_stride,
+                block_stride=idx_page,
+            ),
+        ],
+    )
+
+    backing = torch.zeros(size, dtype=torch.uint8)
+    kv_caches = {}
+    for index, name in enumerate(main_layers):
+        kv_caches[name] = torch.as_strided(
+            backing,
+            size=(num_blocks, main_page),
+            stride=(main_page, 1),
+            storage_offset=index * main_layer_stride,
+        )
+    for index, name in enumerate(idx_layers):
+        kv_caches[name] = torch.as_strided(
+            backing,
+            size=(num_blocks, idx_page),
+            stride=(idx_page, 1),
+            storage_offset=idx_offset + index * idx_layer_stride,
+        )
+
+    worker = object.__new__(IluNixlWorkerMixin)
+    worker.kv_cache_config = layout_config
+
+    layer_region_ids, _region_ids_by_group, regions, _region_is_mla = (
+        worker._build_packed_virtual_layout(kv_caches, layout_config, layout_config)
+    )
+
+    assert set(layer_region_ids) == set(main_layers + idx_layers)
+    assert {region.block_stride for region in regions} == {main_page, idx_page}
+    assert {region.block_len for region in regions} == {main_page, idx_page}
 
 
 def test_finish_memory_registration_records_region_memory_type():

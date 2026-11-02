@@ -76,6 +76,9 @@ from vllm.v1.worker.utils import (
     bind_kv_cache_to_layers,
     copy_kv_cache_blocks_inplace,
 )
+from vllm_iluvatar.v1.attention.backends.ilu_flash_attn import (
+    IluFlashAttentionBackend,
+)
 
 # Iluvatar GPU model runner customizations.
 #
@@ -359,22 +362,53 @@ def _replane_interleaved_fa_kv_to_kv_planes(
 def _replane_fa_kv_caches_for_ixformer(
     kv_caches: dict[str, Any],
     kv_cache_config: KVCacheConfig,
+    forward_context: dict[str, Any],
 ) -> None:
-    """Plane-major FA views so decode can use ``flash_attn_with_kvcache``."""
+    """Plane-major FA views so decode can use ``flash_attn_with_kvcache``.
+
+    Only ``IluFlashAttentionBackend`` consumes ``[B, 2, H, N, hs]``. QSA's
+    main cache is also K|V-packed ``FullAttentionSpec`` (``head_size_v`` set,
+    ``tokens_per_state == 1``), but ``qwen_qsa_kv_store`` reads the logical
+    ``[B, H, N, 2*hs]`` view and splits it itself. Replaning that view yields
+    ``[B, 2, H, N, hs]`` (e.g. ``[16, 2, 1, 576, 256]``) and the split fails.
+    """
     # Skip when ILU int8 FA already stores K alone (C=head_size) + separate V.
     if envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE in ("KINT8", "KVINT8"):
         return
+
+    def _replane_eligible(name: str, spec: Any) -> bool:
+        # Single-content (MLA, head_size_v == 0) and compressed-state
+        # (tokens_per_state != 1) caches are not K|V-interleaved pages.
+        head_size_v = getattr(spec, "head_size_v", None)
+        tokens_per_state = getattr(spec, "tokens_per_state", 1)
+        if not (bool(head_size_v) and tokens_per_state == 1):
+            return False
+        layer = forward_context.get(name)
+        get_backend = getattr(layer, "get_attn_backend", None)
+        if get_backend is None:
+            return False
+        backend = get_backend()
+        return isinstance(backend, type) and issubclass(
+            backend, IluFlashAttentionBackend
+        )
+
     attn_layers: list[str] = []
     for group in kv_cache_config.kv_cache_groups:
         spec = group.kv_cache_spec
         if isinstance(spec, UniformTypeKVCacheSpecs):
-            specs = list(spec.kv_cache_specs.values())
+            specs = list(spec.kv_cache_specs.items())
         else:
-            specs = [spec]
-        if any(isinstance(s, AttentionSpec) for s in specs):
-            attn_layers.extend(
-                name for name in group.layer_names if name in kv_caches
-            )
+            specs = [
+                (name, spec)
+                for name in group.layer_names
+            ]
+        for name, layer_spec in specs:
+            if (
+                name in kv_caches
+                and isinstance(layer_spec, AttentionSpec)
+                and _replane_eligible(name, layer_spec)
+            ):
+                attn_layers.append(name)
     replane_count = 0
     for layer_name in attn_layers:
         before = kv_caches[layer_name]
@@ -477,7 +511,9 @@ def init_kv_cache(
             # Before any cache fill / bind: reinterpret interleaved LBHNC
             # [B,H,N,2*hs] as plane-major [B,2,H,N,hs] so ixformer decode can
             # use flash_attn_with_kvcache (token stride == head_size).
-            _replane_fa_kv_caches_for_ixformer(kv_caches, kv_cache_config)
+            _replane_fa_kv_caches_for_ixformer(
+                kv_caches, kv_cache_config, forward_context
+            )
             _verify_hybrid_kv_cache_blocks_first(kv_caches, kv_cache_config, layout)
         kv_scale_caches = allocate_kv_cache_scale(
             kv_caches,

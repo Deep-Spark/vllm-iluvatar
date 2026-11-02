@@ -118,10 +118,24 @@ class IluWorker(Worker):
                 "VLLM_ILU_FLASH_ATTN_QUANT_TYPE/VLLM_ILU_MLA_ATTN_QUANT_TYPE."
             )
 
-        if quant_kv_cache_requested:
-            logger.info(
-                "Enable quant kv cache, replace self.model_runner.__class__ to IluvatarGPUModelRunner temporarily"
-            )
+        # Community V2 allocate leaves LBHNC interleaved [B,H,N,2*hs]. ixformer
+        # flash_attn_with_kvcache needs plane-major [B,2,H,N,hs] (token stride
+        # == head_size); otherwise IluFlashAttention falls back to varlen and
+        # long-decode TPOT roughly doubles (agent40k c1 ~50ms vs ~28ms).
+        # IluvatarGPUModelRunner.init_kv_cache replanes; previously we only
+        # swapped the class for quant KV, so unquant hybrid never replaned.
+        if is_v2_runner or quant_kv_cache_requested:
+            if quant_kv_cache_requested:
+                logger.info(
+                    "Enable quant kv cache, replace self.model_runner.__class__ "
+                    "to IluvatarGPUModelRunner temporarily"
+                )
+            else:
+                logger.info_once(
+                    "Replace model_runner with IluvatarGPUModelRunner for "
+                    "LBHNC plane-major FA KV replane "
+                    "(ixformer flash_attn_with_kvcache)."
+                )
             from vllm_iluvatar.v1.worker.gpu.model_runner import (
                 IluvatarGPUModelRunner,
             )

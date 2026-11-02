@@ -11,7 +11,7 @@ Scope: enabled only when ``VLLM_ILU_GDN_ATTN_BACKEND`` is true.
 Remove: when community GDN metadata exposes the same ordering information.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from vllm.config import VllmConfig
@@ -110,6 +110,14 @@ class IluGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        # Community GDNAttentionMetadataBuilder only opts into MRV2 aligned-index
+        # precompute when ``type(self) is GDNAttentionMetadataBuilder``. The Ilu
+        # subclass fails that exact-type check, so mamba_hybrid never injects
+        # ``mamba_aligned_state_indices`` and align-mode prefix hits read the
+        # wrong GDN state page. Opt in explicitly (same V2+CUDA gate).
+        if vllm_config.use_v2_model_runner and device.type == "cuda":
+            self.supports_update_block_table = True
+            self.mamba_aligned_state_indices: torch.Tensor | None = None
         self.spec_conv_state_indices = torch.empty(
             self.decode_cudagraph_max_bs, dtype=torch.int32, device=device
         )
@@ -126,7 +134,8 @@ class IluGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
 
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
-        context_lens_tensor = m.compute_num_computed_tokens()
+        # Match community: defer compute_num_computed_tokens to num_prefills > 0
+        # so pure-decode steps avoid the host/GPU sync.
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
         aligned_state_indices = getattr(self, "mamba_aligned_state_indices", None)
         if aligned_state_indices is not None:
@@ -333,6 +342,7 @@ class IluGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         n_chunk_total = 1
 
         if num_prefills > 0:
+            context_lens_tensor = m.compute_num_computed_tokens()
             has_initial_state = context_lens_tensor > 0
             if spec_sequence_masks_cpu is not None:
                 has_initial_state = has_initial_state[~spec_sequence_masks_cpu]
@@ -499,3 +509,30 @@ class IluGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             n_chunk_total=n_chunk_total,
         )
         return attn_metadata
+
+    def update_block_table(
+        self,
+        metadata: GDNAttentionMetadata,
+        blk_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> GDNAttentionMetadata:
+        """Parent returns ``blk_table[:, 0]`` column views; ixformer needs packed 1D.
+
+        Opting into ``supports_update_block_table`` for align-mode prefix made the
+        runner call this after ``build()``, undoing ``_pack_int32_1d``. MTP prefill
+        graph capture hits that path (num_prefills > 0 → no decode staging).
+        """
+        m = super().update_block_table(metadata, blk_table, slot_mapping)
+        idx_buf = getattr(self, "non_spec_state_indices_tensor", None)
+        non_spec = _pack_int32_1d(m.non_spec_state_indices_tensor, idx_buf)
+        spec_conv = getattr(m, "spec_conv_state_indices", None)
+        if m.spec_state_indices_tensor is not None:
+            spec_conv = _pack_int32_1d(
+                m.spec_state_indices_tensor[:, 0],
+                getattr(self, "spec_conv_state_indices", None),
+            )
+        return replace(
+            m,
+            non_spec_state_indices_tensor=non_spec,
+            spec_conv_state_indices=spec_conv,
+        )

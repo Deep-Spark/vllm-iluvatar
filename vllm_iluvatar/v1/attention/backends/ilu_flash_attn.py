@@ -62,6 +62,21 @@ from vllm_iluvatar.v1.attention.ilu_static_quant import (
 logger = init_logger(__name__)
 
 
+def _split_kv_cache_planes(
+    kv_cache: torch.Tensor,
+    head_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split a layer KV view into HND key/value caches for ixformer FA.
+
+    Supports:
+    * plane-major ``[B, 2, H, N, hs]`` (ILU replane after allocate)
+    * interleaved LBHNC ``[B, H, N, C]`` with ``C = head_size + head_size_v``
+    """
+    if kv_cache.ndim == 5 and kv_cache.shape[1] == 2:
+        return kv_cache[:, 0], kv_cache[:, 1]
+    return kv_cache[..., :head_size], kv_cache[..., head_size:]
+
+
 def get_flash_attn_version(
     requires_alibi: bool = False,
     head_size: int | None = None,
@@ -114,12 +129,21 @@ class IluFlashAttentionBackend(AttentionBackend):
     def get_supported_kernel_block_sizes(
         kv_cache_spec: "KVCacheSpec | None" = None,
     ) -> list[int | MultipleOf]:
-        # The Iluvatar int8 paged FMHA kernel (cuinferFmhaFwdInt8QUnpadKVPageFuncV3)
-        # only accepts power-of-2 page sizes. The previous range(16, 257, 16)
-        # exposed non-power-of-2 sizes (48/96/192/...) which, on hybrid models
-        # whose attention block_size aligns to the mamba page (e.g. 2112), made
-        # prepare_kernel_block_sizes pick 192 and triggered CUINFER_STATUS_BAD_PARAM.
-        return [16, 32, 64, 128, 256]
+        # Int8 paged FMHA (cuinferFmhaFwdInt8QUnpadKVPageFuncV3) only accepts
+        # power-of-2 page sizes. A previous MultipleOf(16) / range(16,257,16)
+        # list let hybrid models (attn block_size aligned to mamba, e.g. 2112)
+        # pick non-PoT kernel pages (192/...) and hit CUINFER_STATUS_BAD_PARAM.
+        #
+        # Non-int8 (bf16/fp16/fp8 KV) matches community FlashAttention:
+        # MultipleOf(16). That lets hybrid manager block_size (e.g. 784 for
+        # Qwen3.8 GDN+FA) be used as the kernel page instead of splitting into
+        # 784/16=49 virtual pages — long-ctx decode TPOT is highly sensitive
+        # to page-table length.
+        del kv_cache_spec  # select_common_block_size does not pass the spec.
+        quant = envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE
+        if quant in ("KINT8", "KVINT8"):
+            return [16, 32, 64, 128, 256]
+        return [MultipleOf(16)]
 
     forward_includes_kv_cache_update: bool = True
 
@@ -884,14 +908,11 @@ class IluFlashAttentionImpl(AttentionImpl):
         if early_output is not None:
             return early_output
 
-        # v0.31.0 (db9527a468) KV-cache layout: per-layer view is [B, H, N, C] with K/V packed
-        # in the content dim C = head_size + head_size_v. ixformer's
-        # reshape_and_cache_flash expects HND [num_blocks, num_kv_heads,
-        # block_size, head_size] (it reads block_size from dim 2), so split the
-        # content dim directly WITHOUT transposing (community's transpose+split
-        # yields NHD, which only matches vLLM's own reshape_and_cache_flash op).
-        key_cache = kv_cache[..., : self.head_size]
-        value_cache = kv_cache[..., self.head_size :]
+        # v0.31 LBHNC allocates [B,H,N,C] (K|V packed). ILU init_kv_cache may
+        # replane to [B,2,H,N,hs] so token stride == head_size for ixformer
+        # flash_attn_with_kvcache. reshape_and_cache_flash expects HND
+        # [num_blocks, num_kv_heads, block_size, head_size] (block_size at dim 2).
+        key_cache, value_cache = _split_kv_cache_planes(kv_cache, self.head_size)
         if is_quantized_kv_cache(self.kv_cache_dtype):
             dtype = IluFlashAttentionBackend.get_fp8_dtype_for_flashattn(
                 self.kv_cache_dtype
@@ -1261,8 +1282,7 @@ class IluFlashAttentionImpl(AttentionImpl):
         fp8_query = torch.empty(query.shape, dtype=fp8_dtype, device=query.device)
         torch.ops._C.static_scaled_fp8_quant(fp8_query, query, query_scale)
 
-        key_cache = kv_cache[..., : self.head_size]
-        value_cache = kv_cache[..., self.head_size :]
+        key_cache, value_cache = _split_kv_cache_planes(kv_cache, self.head_size)
         key_cache = key_cache.view(fp8_dtype)
         value_cache = value_cache.view(fp8_dtype)
         if (
@@ -1670,9 +1690,8 @@ class IluFlashAttentionImpl(AttentionImpl):
 
         # vLLM 0.31 binds the same packed [P,Hkv,B,K|V] view used by
         # forward(). DFlash/DSpark precompute context through this standalone
-        # entry point, so it must not interpret the old [2,P,...] layout.
-        key_cache = kv_cache[..., : self.head_size]
-        value_cache = kv_cache[..., self.head_size :]
+        # entry point; accept both interleaved LBHNC and plane-major views.
+        key_cache, value_cache = _split_kv_cache_planes(kv_cache, self.head_size)
         if self.is_fp8:
             dtype = IluFlashAttentionBackend.get_fp8_dtype_for_flashattn(
                 self.kv_cache_dtype

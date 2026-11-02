@@ -31,6 +31,7 @@ import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.aux_output_connector.worker import get_aux_output_connector
+from vllm.logger import init_logger
 from vllm.v1.hisparse.binding import init_hisparse_kv_cache
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
@@ -39,12 +40,15 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     CircularBufferSpec,
     KVCacheConfig,
     KVCacheLayout,
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+
+logger = init_logger(__name__)
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
@@ -75,10 +79,10 @@ from vllm.v1.worker.utils import (
 
 # Iluvatar GPU model runner customizations.
 #
-# ``IluvatarGPUModelRunner(GPUModelRunner)`` -- a normal subclass overriding
-# the Attention/MLA KV-cache methods. Active when
-# ``VLLM_ILU_FLASH_ATTN_QUANT_TYPE!=""`` or
-# ``VLLM_ILU_MLA_ATTN_QUANT_TYPE!=""``. See vllm/v1/worker/gpu_worker.py.
+# ``IluvatarGPUModelRunner(GPUModelRunner)`` -- subclass overriding KV init
+# (LBHNC plane-major FA replane + optional int8 scale caches). Swapped in by
+# ``IluWorker._try_replace_model_runner_class`` for all V2 runs (and for quant
+# KV). See vllm_iluvatar/v1/worker/gpu_worker.py.
 
 
 def _recover_int8_buf(kv_caches: dict[str, torch.Tensor], device: torch.device):
@@ -308,6 +312,137 @@ def bind_kv_cache_scale(
         forward_context[layer_name].bind_kv_cache_scale(kv_scale_cache)
 
 
+def _replane_interleaved_fa_kv_to_kv_planes(
+    cache: torch.Tensor,
+) -> torch.Tensor:
+    """Reinterpret LBHNC ``[B,H,N,2*hs]`` as plane-major ``[B,2,H,N,hs]``.
+
+    Community v0.31 packs K|V in the content dim (token-interleaved). ixformer's
+    ``flash_attn_with_kvcache`` requires HND pages with token stride == head_size;
+    the interleaved view forces the slower ``flash_attn_varlen`` decode path
+    (see ilu_flash_attn stride check). Same storage / page bytes — only strides
+    change — so hybrid Mamba shared block IDs stay valid. Must run before any
+    cache fill; writers use ``cache[:,0]`` / ``cache[:,1]``.
+    """
+    if not isinstance(cache, torch.Tensor) or cache.ndim != 4:
+        return cache
+    # KINT8 / single-sided: C == head_size already dense; leave alone.
+    num_blocks, num_kv_heads, block_size, content = cache.shape
+    if content % 2 != 0:
+        return cache
+    head_size = content // 2
+    # Dense blocks-first page: token stride must currently be the packed C.
+    if cache.stride(-1) != 1 or cache.stride(-2) != content:
+        return cache
+    expected = (
+        num_kv_heads * block_size * content,
+        block_size * content,
+        content,
+        1,
+    )
+    if tuple(cache.stride()) != expected:
+        return cache
+    return torch.as_strided(
+        cache,
+        size=(num_blocks, 2, num_kv_heads, block_size, head_size),
+        stride=(
+            num_kv_heads * block_size * 2 * head_size,
+            num_kv_heads * block_size * head_size,
+            block_size * head_size,
+            head_size,
+            1,
+        ),
+        storage_offset=cache.storage_offset(),
+    )
+
+
+def _replane_fa_kv_caches_for_ixformer(
+    kv_caches: dict[str, Any],
+    kv_cache_config: KVCacheConfig,
+) -> None:
+    """Plane-major FA views so decode can use ``flash_attn_with_kvcache``."""
+    # Skip when ILU int8 FA already stores K alone (C=head_size) + separate V.
+    if envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE in ("KINT8", "KVINT8"):
+        return
+    attn_layers: list[str] = []
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            specs = list(spec.kv_cache_specs.values())
+        else:
+            specs = [spec]
+        if any(isinstance(s, AttentionSpec) for s in specs):
+            attn_layers.extend(
+                name for name in group.layer_names if name in kv_caches
+            )
+    replane_count = 0
+    for layer_name in attn_layers:
+        before = kv_caches[layer_name]
+        after = _replane_interleaved_fa_kv_to_kv_planes(before)
+        if after is not before and after.ndim == 5:
+            kv_caches[layer_name] = after
+            replane_count += 1
+    if replane_count:
+        logger.info_once(
+            "Replaned %d FA KV cache(s) from interleaved [B,H,N,2*hs] to "
+            "plane-major [B,2,H,N,hs] for ixformer flash_attn_with_kvcache.",
+            replane_count,
+        )
+
+
+def _verify_hybrid_kv_cache_blocks_first(
+    kv_caches: dict[str, Any],
+    kv_cache_config: KVCacheConfig,
+    layout: KVCacheLayout,
+) -> None:
+    """Confirm hybrid attention+Mamba overlays share blocks-first addressing.
+
+    v0.27 needed ``patch_attn_utils`` to restride K/V-first ``(2, B, ...)`` FA
+    views to contiguous pages so Mamba block IDs hit the same bytes. Community
+    v0.31 ``allocate_kv_cache`` builds per-layer blocks-first views under LBHNC;
+    after optional plane-major replane the shape is ``[B,2,H,N,hs]`` (still
+    blocks-first). Warn if dim0 looks like a K/V plane instead of num_blocks.
+    """
+    has_mamba = False
+    attn_layers: list[str] = []
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            specs = list(spec.kv_cache_specs.values())
+        else:
+            specs = [spec]
+        if any(isinstance(s, MambaSpec) for s in specs):
+            has_mamba = True
+        if any(isinstance(s, AttentionSpec) for s in specs):
+            attn_layers.extend(
+                name for name in group.layer_names if name in kv_caches
+            )
+    if not has_mamba or not attn_layers:
+        return
+
+    for layer_name in attn_layers:
+        cache = kv_caches[layer_name]
+        if not isinstance(cache, torch.Tensor) or cache.ndim < 2:
+            continue
+        # Old K/V-first physical layout: shape[0] == 2 is the plane dim.
+        if cache.shape[0] == 2 and cache.ndim >= 3 and (
+            cache.ndim == 4 or (cache.ndim == 5 and cache.shape[1] != 2)
+        ):
+            logger.warning_once(
+                "Hybrid Mamba KV cache: attention view %s has shape %s under "
+                "layout %s; expected blocks-first [B,...]. Shared block "
+                "IDs may not be byte-compatible with Mamba pages.",
+                layer_name,
+                tuple(cache.shape),
+                layout.name,
+            )
+            return
+    logger.info_once(
+        "Hybrid Mamba KV cache: blocks-first attention views are "
+        "Mamba page-compatible; v0.27 K/V-first restride is not required."
+    )
+
+
 def init_kv_cache(
     runner_kv_scale_caches: list[torch.Tensor | list[torch.Tensor]],
     forward_context: dict[str, Any],
@@ -320,6 +455,7 @@ def init_kv_cache(
     block_tables: BlockTables | None = None,
 ) -> dict[str, Any]:
     allocation_context = kv_cache_allocation_context or nullcontext()
+    layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
     with allocation_context:
         if vllm_config.attention_config.hisparse_config is not None:
             assert block_tables is not None
@@ -335,14 +471,19 @@ def init_kv_cache(
             kv_caches = allocate_kv_cache(
                 kv_cache_config,
                 device,
-                vllm_config.cache_config.get_resolved_kv_cache_layout(),
+                layout,
                 kernel_block_sizes,
             )
+            # Before any cache fill / bind: reinterpret interleaved LBHNC
+            # [B,H,N,2*hs] as plane-major [B,2,H,N,hs] so ixformer decode can
+            # use flash_attn_with_kvcache (token stride == head_size).
+            _replane_fa_kv_caches_for_ixformer(kv_caches, kv_cache_config)
+            _verify_hybrid_kv_cache_blocks_first(kv_caches, kv_cache_config, layout)
         kv_scale_caches = allocate_kv_cache_scale(
             kv_caches,
             kv_cache_config,
             device,
-            vllm_config.cache_config.get_resolved_kv_cache_layout(),
+            layout,
             kernel_block_sizes,
             vllm_config=vllm_config,
         )

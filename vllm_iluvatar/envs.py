@@ -269,6 +269,7 @@ if TYPE_CHECKING:
     VLLM_ILU_MOE_RUNTIME_LAYOUT: str | None = None
     VLLM_ILU_MOE_W4A8_GEMV_PERF: bool = False
     VLLM_ILU_MOE_EP_LL_MOE_ALGO: str = "GEMV"
+    VLLM_ILU_MOE_EP_RS_TP_AG: bool = False
     VLLM_ILU_MXFP4_MOE_BACKEND: str = "ixmm"
     VLLM_ILU_REJECTION_SAMPLER_MAX_CHUNK_BYTES: int = 128 * 1024 * 1024
     # GLM DSA fp8 KV: single float shared by ALL layers. Prefer PATH for
@@ -540,6 +541,7 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
             )
         ),
     ),
+    "VLLM_ILU_MOE_EP_RS_TP_AG": _bool_reader("VLLM_ILU_MOE_EP_RS_TP_AG", "0"),
     "VLLM_ILU_MOE_EP_LL_MOE_ALGO": lambda: os.environ.get(
         "VLLM_ILU_MOE_EP_LL_MOE_ALGO", "GEMV"
     ).upper(),

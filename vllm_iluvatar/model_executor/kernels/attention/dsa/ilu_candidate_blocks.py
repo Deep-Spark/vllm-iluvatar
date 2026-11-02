@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 
 import torch
+from ixformer.cuda import cuda_arch
 from ixformer.inference.functions import dsa_update_topk_indices
 from ixformer.inference.functions.models import deepseek_v41 as ixfops
 
@@ -116,7 +117,22 @@ def select_candidate_blocks(
         return
     # Slice on group boundaries so each slice's bounds start at a group. The row
     # cap shrinks as nblocks grows so ``rows * nblocks`` stays within budget.
-    max_rows = max(1, min(_TOPK_ROWS, _TOPK_COL_BUDGET // max(1, nblocks)))
+    # This bounded BF16 decode case fits in one top-k call. Its consumers
+    # build membership flags, so ordering the selected blocks is unnecessary.
+    # Keep the conservative scratch budget for larger/prefill workloads.
+    compact_decode = (
+        cuda_arch == "ivcore30"
+        and 48 <= rows <= 96
+        and width == 278528
+        and logits.dtype == torch.bfloat16
+        and row_ks is None
+        and row_repeat == 1
+        and topk_blocks == 2048
+        and block_size == 8
+    )
+    max_rows = rows if compact_decode else max(
+        1, min(_TOPK_ROWS, _TOPK_COL_BUDGET // max(1, nblocks))
+    )
     step = max(1, max_rows // row_repeat) * row_repeat
     for r0 in range(0, rows, step):
         r1 = min(rows, r0 + step)
@@ -137,7 +153,7 @@ def select_candidate_blocks(
         while s < n:
             e = min(n, s + sub)
             try:
-                top = scores[s:e].topk(k, dim=-1)
+                top = scores[s:e].topk(k, dim=-1, sorted=not compact_decode)
             except RuntimeError as err:
                 if "out of memory" in str(err).lower() and sub > 1:
                     with contextlib.suppress(Exception):

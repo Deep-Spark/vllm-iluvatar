@@ -19,6 +19,7 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
+from ixformer.cuda import cuda_arch
 from ixformer.inference.functions.models import deepseek_v41 as dsv41
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import (
@@ -380,6 +381,28 @@ def vocab_parallel_argmax(
     return gathered[..., 1].gather(-1, max_rank).squeeze(-1).to(torch.int64)
 
 
+def add_bias_vocab_parallel_argmax(
+    base: torch.Tensor,
+    bias: torch.Tensor,
+    vocab_start: int,
+    num_vocab_padding: int,
+) -> torch.Tensor:
+    """Reduce rounded base+bias directly to one pair per shard before TP gather."""
+    from importlib import import_module
+
+    # Generic sampling API supplies a Torch fallback on non-CQ architectures.
+    add_argmax_pairs = import_module(
+        "ixformer.inference.functions.ops.sampling.float.add_argmax"
+    ).add_argmax_pairs
+    pairs = add_argmax_pairs(base, bias, vocab_start, base.shape[-1] - num_vocab_padding)
+    tp_size = get_tensor_model_parallel_world_size()
+    if tp_size == 1:
+        return pairs[:, 1].to(torch.int64)
+    gathered = tensor_model_parallel_all_gather(pairs, dim=-1).view(-1, tp_size, 2)
+    max_rank = gathered[..., 0].argmax(dim=-1, keepdim=True)
+    return gathered[..., 1].gather(-1, max_rank).squeeze(-1).to(torch.int64)
+
+
 def gather_vocab_parallel_logits(
     local_logits: torch.Tensor,
     vocab_size: int,
@@ -402,6 +425,11 @@ def sample_sequential(self: Any, num_reqs: int, head_hidden: torch.Tensor) -> No
     if _can_use_fused_markov(self):
         return _sample_sequential_fused(self, num_reqs, head_hidden)
 
+    # CQ C16 decode has four requests per DP engine. Preserve its original
+    # full-gather path; the new reduction is enabled for larger decode batches.
+    use_local_argmax_reduction = self.use_local_argmax_reduction and (
+        cuda_arch != "ivcore30" or num_reqs >= 8
+    )
     n_spec = self.num_speculative_steps
     num_sample = num_reqs * n_spec
     sample_hidden = head_hidden[self.sample_indices[:num_sample]]
@@ -427,6 +455,26 @@ def sample_sequential(self: Any, num_reqs: int, head_hidden: torch.Tensor) -> No
         if self.use_confidence_head:
             confidence_markov_embeds.append(markov_embed)
         bias = self.model.markov_bias_local(markov_embed)
+        if (
+            self.draft_logits is None
+            and use_local_argmax_reduction
+            and base_logits.dtype in (torch.bfloat16, torch.float32)
+            and bias.dtype == base_logits.dtype
+            and bias.shape == (num_reqs, local_vocab_size)
+            and base_logits.stride(-1) == bias.stride(-1) == 1
+            and 0 <= num_reqs <= 65535
+            and local_vocab_size <= base_logits.stride(0) <= 2**31 - 1
+            and local_vocab_size <= bias.stride(0) <= 2**31 - 1
+            and 0 <= num_vocab_padding < local_vocab_size
+            and 0 <= vocab_start <= 2**24 - local_vocab_size
+        ):
+            draft_ids = add_bias_vocab_parallel_argmax(
+                base_logits[:, i], bias, vocab_start, num_vocab_padding
+            )
+            draft_sampled_i = self.model.map_draft_to_target(draft_ids)
+            self.draft_tokens[:num_reqs, i] = draft_sampled_i
+            prev = draft_sampled_i
+            continue
         logits_i = base_logits[:, i] + bias
         if self.draft_logits is not None:
             logits_i = gather_vocab_parallel_logits(
@@ -437,7 +485,7 @@ def sample_sequential(self: Any, num_reqs: int, head_hidden: torch.Tensor) -> No
             draft_sampled_i = self._sample_logits(
                 logits_i, idx_map_t[i], sample_pos_t[i], i
             )
-        elif self.use_local_argmax_reduction:
+        elif use_local_argmax_reduction:
             draft_ids = vocab_parallel_argmax(
                 logits_i,
                 vocab_start,

@@ -1,38 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Wiring for the Iluvatar thinking-budget marker-cache kernel replacement.
+"""Wire the Iluvatar thinking-budget kernels into Model Runner V2.
 
-Corresponds to: vllm/v1/worker/gpu/sample/thinking_budget.py
-
-ILU general-plugins patch, auto-discovered from the centralized
-``ilu_patch.general_patches`` package during ``register_general``.
-
-The override implementation lives in
-``vllm_iluvatar.v1.worker.gpu.thinking_budget``; this module only performs
-register-time wiring.
-
-Target   : vllm.v1.worker.gpu.sample.thinking_budget.apply_thinking_budget
-Baseline : bytedance_release_ds41:20261101v14rc3 / community V2 runner
-Why      : ilu's Triton frontend rejects the chained ``and`` in
-           ``_update_committed_marker_cache_kernel`` ("chained boolean
-           operators (A or B or C) are not supported; use parentheses to
-           split the chain"), so the kernel fails to compile. Reached when a
-           request sets ``thinking_token_budget`` on the V2 GPU model runner
-           (dspark path).
-How      : replace the module-level ``apply_thinking_budget`` with one that
-           launches a copy of the kernels whose only change is the
-           parenthesized cold-scan ``if`` / ``while`` chains.
-           ``ThinkingBudgetState.apply`` resolves the module global at call
-           time, so rebinding the module attribute is enough; the kernels
-           themselves have to be copied because ``@triton.jit`` compiles from
-           the decorated function's own source text.
-Scope    : thinking_token_budget on Iluvatar. Numerics and launch geometry
-           are unchanged.
-Remove   : when the ilu Triton frontend accepts chained boolean operators, or
-           when community parenthesizes the chains itself.
-
-Timing   : ``load_general_plugins()`` runs in ``create_engine_config``, long
-           before a request with ``thinking_token_budget`` first compiles the
-           marker-cache kernel.
+The override keeps the upstream committed marker cache and replaces draft and
+forced-suffix matching with bounded masked scans. It also avoids chained
+boolean expressions rejected by the Iluvatar Triton frontend. General plugin
+registration applies the override before the sampler handles its first request.
 """
 
 from __future__ import annotations
@@ -45,7 +17,7 @@ def register() -> None:
     p.register_once(
         __name__,
         _apply,
-        detail="thinking_budget marker-cache kernel without chained-and ilu Triton rejects",
+        detail="thinking_budget kernels with bounded draft-prefix marker scans",
     )
 
 
@@ -54,6 +26,5 @@ def _apply() -> None:
 
     from vllm_iluvatar.v1.worker.gpu.thinking_budget import apply_thinking_budget
 
-    # [ILU override] apply_thinking_budget — delta: launches kernel copies whose
-    # cold-scan ``and`` chains are parenthesized.
+    # ThinkingBudgetState resolves this module global for each application.
     community.apply_thinking_budget = apply_thinking_budget

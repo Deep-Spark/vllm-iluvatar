@@ -1,23 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Thinking-budget marker-cache kernel, re-emitted for the Iluvatar Triton frontend.
+"""Thinking-budget kernels adapted to the Iluvatar Triton backend.
 
-Byte-for-byte community ``_update_committed_marker_cache_kernel`` /
-``_thinking_budget_kernel`` / ``apply_thinking_budget``
-(vllm/v1/worker/gpu/sample/thinking_budget.py, baseline bytedance_release_ds41
-20261101v14rc3) except for two lines: ilu's Triton rejects chained ``and``,
-and says so itself --
-
-    ``if scan_pos == 0 and last_start < 0 and last_end < 0:``
-                  ^
-    chained boolean operators (A or B or C) are not supported; use parentheses
-    to split the chain.
-
-so the cold-scan ``if`` / ``while`` chains are parenthesized here. The kernels
-are copied rather than wrapped because ``@triton.jit`` compiles from the
-function's own source text, leaving no seam to patch a single statement.
-
-Reached when a request sets ``thinking_token_budget`` on the V2 GPU model
-runner (dspark / Model Runner V2 path).
+The committed marker cache retains the upstream cold/incremental scan. Draft
+prefix marker matching uses bounded masked vectors: the expanded logits batch
+bounds every request's draft prefix, so no dynamic zero-trip loop is needed.
 """
 
 from __future__ import annotations
@@ -26,25 +12,6 @@ import torch
 from vllm.triton_utils import tl, triton
 
 _COLD_SCAN_BLOCK = 1024
-
-@triton.jit
-def _load_effective_token(
-    all_token_ids_ptr,
-    all_token_ids_stride,
-    input_ids_ptr,
-    cur_req_first_pos,
-    req_state_idx,
-    total_len,
-    pos,
-):
-    if pos < total_len:
-        return tl.load(all_token_ids_ptr + req_state_idx * all_token_ids_stride + pos)
-    # In decode/spec-decode, input_ids at local position 0 is the already
-    # committed last sampled token. Effective draft-prefix positions start at
-    # local position 1.
-    input_pos = cur_req_first_pos + pos - total_len + 1
-    return tl.load(input_ids_ptr + input_pos)
-
 
 @triton.jit
 def _update_committed_marker_cache_kernel(
@@ -114,7 +81,7 @@ def _update_committed_marker_cache_kernel(
             last_start = tl.max(tl.where(start_match, offs, -1), axis=0)
             last_end = tl.max(tl.where(end_match, offs, -1), axis=0)
             block_hi = block_lo
-    else:
+    elif scan_pos < total_len:
         for i in tl.range(scan_pos, total_len):
             if i + START_LEN <= total_len:
                 start_match = True
@@ -147,6 +114,39 @@ def _update_committed_marker_cache_kernel(
 
 
 @triton.jit
+def _last_effective_marker(
+    all_token_ids_ptr,
+    all_token_ids_stride,
+    input_ids_ptr,
+    cur_req_first_pos,
+    req_state_idx,
+    total_len,
+    effective_len,
+    marker_ptr,
+    MARKER_LEN: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    scan_lo = tl.maximum(total_len - MARKER_LEN + 1, 0)
+    positions = scan_lo + tl.arange(0, BLOCK)
+    matches = positions + MARKER_LEN <= effective_len
+    for j in tl.static_range(0, MARKER_LEN):
+        pos = positions + j
+        committed = tl.load(
+            all_token_ids_ptr + req_state_idx * all_token_ids_stride + pos,
+            mask=matches & (pos < total_len),
+            other=-1,
+        )
+        draft = tl.load(
+            input_ids_ptr + cur_req_first_pos + pos - total_len + 1,
+            mask=matches & (pos >= total_len),
+            other=-1,
+        )
+        actual = tl.where(pos < total_len, committed, draft)
+        matches = matches & (actual == tl.load(marker_ptr + j))
+    return tl.max(tl.where(matches, positions, -1), axis=0)
+
+
+@triton.jit
 def _thinking_budget_kernel(
     logits_ptr,
     logits_stride,
@@ -165,6 +165,8 @@ def _thinking_budget_kernel(
     START_LEN: tl.constexpr,
     NATURAL_END_LEN: tl.constexpr,
     END_LEN: tl.constexpr,
+    SCAN_BLOCK: tl.constexpr,
+    PREFIX_BLOCK: tl.constexpr,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
@@ -180,45 +182,23 @@ def _thinking_budget_kernel(
     last_start = tl.load(cached_last_start_ptr + req_state_idx)
     last_end = tl.load(cached_last_end_ptr + req_state_idx)
 
-    start_lo = total_len - START_LEN + 1
-    if start_lo < 0:
-        start_lo = 0
-    for i in tl.range(start_lo, effective_len - START_LEN + 1):
-        start_match = True
-        for j in tl.static_range(0, START_LEN):
-            expected = tl.load(reasoning_start_token_ids_ptr + j)
-            actual = _load_effective_token(
-                all_token_ids_ptr,
-                all_token_ids_stride,
-                input_ids_ptr,
-                cur_req_first_pos,
-                req_state_idx,
-                total_len,
-                i + j,
-            )
-            start_match = start_match & (actual == expected)
-        if start_match:
-            last_start = i
-
-    end_lo = total_len - NATURAL_END_LEN + 1
-    if end_lo < 0:
-        end_lo = 0
-    for i in tl.range(end_lo, effective_len - NATURAL_END_LEN + 1):
-        end_match = True
-        for j in tl.static_range(0, NATURAL_END_LEN):
-            expected = tl.load(natural_reasoning_end_token_ids_ptr + j)
-            actual = _load_effective_token(
-                all_token_ids_ptr,
-                all_token_ids_stride,
-                input_ids_ptr,
-                cur_req_first_pos,
-                req_state_idx,
-                total_len,
-                i + j,
-            )
-            end_match = end_match & (actual == expected)
-        if end_match:
-            last_end = i
+    last_start = tl.maximum(
+        last_start,
+        _last_effective_marker(
+            all_token_ids_ptr, all_token_ids_stride, input_ids_ptr,
+            cur_req_first_pos, req_state_idx, total_len, effective_len,
+            reasoning_start_token_ids_ptr, MARKER_LEN=START_LEN, BLOCK=SCAN_BLOCK,
+        ),
+    )
+    last_end = tl.maximum(
+        last_end,
+        _last_effective_marker(
+            all_token_ids_ptr, all_token_ids_stride, input_ids_ptr,
+            cur_req_first_pos, req_state_idx, total_len, effective_len,
+            natural_reasoning_end_token_ids_ptr,
+            MARKER_LEN=NATURAL_END_LEN, BLOCK=SCAN_BLOCK,
+        ),
+    )
 
     if last_start < 0 or last_start <= last_end:
         return
@@ -230,32 +210,28 @@ def _thinking_budget_kernel(
     if num_reasoning_tokens < budget:
         return
 
-    # If the tail already ends with a prefix of the forced end sequence
-    # (even from a resumed prompt), continue from the next marker token.
     end_prefix_len = 0
-    max_prefix_len = END_LEN - 1
-    if effective_len < max_prefix_len:
-        max_prefix_len = effective_len
-
-    for prefix_len in tl.static_range(1, END_LEN):
-        if prefix_len <= max_prefix_len:
-            prefix_match = True
-            suffix_start = effective_len - prefix_len
-            for j in tl.static_range(0, END_LEN):
-                if j < prefix_len:
-                    expected = tl.load(reasoning_end_token_ids_ptr + j)
-                    actual = _load_effective_token(
-                        all_token_ids_ptr,
-                        all_token_ids_stride,
-                        input_ids_ptr,
-                        cur_req_first_pos,
-                        req_state_idx,
-                        total_len,
-                        suffix_start + j,
-                    )
-                    prefix_match = prefix_match & (actual == expected)
-            if prefix_match:
-                end_prefix_len = prefix_len
+    if END_LEN > 1:
+        prefix_lengths = tl.arange(0, PREFIX_BLOCK)
+        prefix_match = ((prefix_lengths > 0) & (prefix_lengths < END_LEN)
+                        & (prefix_lengths <= effective_len))
+        suffix_start = effective_len - prefix_lengths
+        for j in tl.static_range(0, END_LEN - 1):
+            pos = suffix_start + j
+            active = prefix_match & (j < prefix_lengths)
+            committed = tl.load(
+                all_token_ids_ptr + req_state_idx * all_token_ids_stride + pos,
+                mask=active & (pos < total_len), other=-1,
+            )
+            draft = tl.load(
+                input_ids_ptr + cur_req_first_pos + pos - total_len + 1,
+                mask=active & (pos >= total_len), other=-1,
+            )
+            actual = tl.where(pos < total_len, committed, draft)
+            expected = tl.load(reasoning_end_token_ids_ptr + j)
+            prefix_match = prefix_match & ((j >= prefix_lengths)
+                                           | (actual == expected))
+        end_prefix_len = tl.max(tl.where(prefix_match, prefix_lengths, 0), axis=0)
 
     force_token_id = tl.load(reasoning_end_token_ids_ptr + end_prefix_len)
     tl.store(logits_ptr + token_idx * logits_stride + force_token_id, 1.0e9)
@@ -278,6 +254,8 @@ def apply_thinking_budget(
     reasoning_end_token_ids: torch.Tensor,
 ) -> None:
     num_tokens = logits.shape[0]
+    if num_tokens == 0:
+        return
     start_len = reasoning_start_token_ids.shape[0]
     natural_end_len = natural_reasoning_end_token_ids.shape[0]
     end_len = reasoning_end_token_ids.shape[0]
@@ -317,4 +295,7 @@ def apply_thinking_budget(
         START_LEN=start_len,
         NATURAL_END_LEN=natural_end_len,
         END_LEN=end_len,
+        # Every request draft prefix fits in the expanded logits batch.
+        SCAN_BLOCK=triton.next_power_of_2(num_tokens),
+        PREFIX_BLOCK=triton.next_power_of_2(end_len),
     )

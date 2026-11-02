@@ -2,7 +2,7 @@
 
 本文介绍如何在 Iluvatar GPU 上使用 vLLM 的 Data Parallel（DP）与 Expert
 Parallel（EP），重点说明 DeepSeek-V4 的 Hybrid EP 配置、环境变量、服务
-启动命令和调度机制。
+启动命令和调度机制，并区分 GLM-5.2 默认 MoERunner 与自定义 DP + EP 路径。
 
 ## 目录
 
@@ -20,8 +20,11 @@ Parallel（EP），重点说明 DeepSeek-V4 的 Hybrid EP 配置、环境变量�
 4. [推荐启动配置](#4-推荐启动配置)
    - [DP + EP 核心环境变量](#41-dp--ep-核心环境变量)
    - [DP + EP 最小核心服务命令](#42-dp--ep-最小核心服务命令)
+   - [确认配置生效](#43-确认配置生效)
+   - [GLM-5.2 的入口配置](#44-glm-52-的入口配置)
 5. [Backend 选择规则](#5-backend-选择规则)
    - [当前限制](#51-当前限制)
+   - [本轮改动的验证范围](#52-本轮改动的验证范围)
 6. [DP Prefill 调度为何必要](#6-dp-prefill-调度为何必要)
    - [短请求](#61-短请求)
    - [长输出](#62-长输出)
@@ -127,7 +130,8 @@ padding，避免 rank 间进入不同执行路径。
 模型需要通过 `IluFusedMoEEP` 接入 Hybrid EP。参考当前 DeepSeek-V4 MoE
 实现
 [`models/deepseek_v4/model.py`](../../vllm_iluvatar/models/deepseek_v4/model.py)，
-接入步骤如下。
+以下示例描述 DeepSeek-V4 的接入方式。GLM-5.2 默认使用 MoERunner，
+仅在纯 Decode 命中 override 时进入自定义路径，两者的入口不能直接互换。
 
 1. 导入 `IluFusedMoEEP`，让模型的 MoE 类同时继承 `nn.Module` 和
    `IluFusedMoEEP`。完成 routed experts、shared experts、quant method
@@ -193,6 +197,26 @@ class ModelMoE(nn.Module, IluFusedMoEEP):
         return final_hidden_states.view(org_shape)
 ```
 
+GLM-5.2 的入口参考
+[`models/glm_moe_dsa/model.py`](../../vllm_iluvatar/models/glm_moe_dsa/model.py)：
+
+```python
+# router_in 是展开后的浮点输入；shared_gate_up_input 是可选的预量化输入。
+if self._use_decode_ep_override():
+    return self.forward_dp_ep(
+        router_in,
+        shared_gate_up_input=shared_gate_up_input,
+    ).view(org_shape)
+
+# 其余情况交给 self.experts / MoERunner，保留原有内部或外部 gate 接口，
+# 并将 norm 提供的量化结果继续传入 runner。
+```
+
+`_use_decode_ep_override()` 要求已设置 override 且
+`DPMetadata.all_ranks_decode_only=true`；metadata 缺失时不触发。
+初始化时 `init_ep()` 会校验 override 是否适用于该层。不要将 GLM 的入口
+改成仅判断 `_should_use_forward_dp_ep()`，否则 AG/RS 会绕过默认 runner。
+
 当配置的 Prefill backend 不是 LL、Decode override 为 LL 时，`init_ep()`
 会提前创建并缓存 LL manager 和通信 handle，避免在 CUDA Graph capture
 中初始化通信资源。未进入 DP + EP 路径时，应保留模型原有的 `FusedMoE`
@@ -221,15 +245,23 @@ vllm serve /path/to/model \
 
 #### `VLLM_ILU_DECODE_EP_BACKEND`
 
-- 默认值：未设置。
-- 推荐值：`deepep_low_latency`。
-- 作用：当且仅当 `all_ranks_decode_only=true` 时，将 Decode 的 EP backend
-  覆盖为 LL；Prefill 仍使用 `--all2all_backend`。
-- 合法覆盖值：当前仅支持 `deepep_low_latency`。
+- 默认值：未设置（空字符串也视为未设置）。GLM 默认使用 MoERunner。
+- 合法覆盖值：`naive`、`deepep_low_latency`；其它非空值报错。
+- 作用：仅在所有 DP rank 都是 decode-only 时覆盖模型的执行入口；
+  Prefill/混合批次继续使用模型原入口和配置的 backend。
+- `naive`：调用 `forward_dp_ep_naive()`；要求配置 backend 为
+  `allgather_reducescatter`（内部也接受 `ag-rs`、`ag_rs`），不能与
+  DeepEP backend 搭配。CLI 的 `--all2all-backend=naive` 是已弃用的兼容值，
+  当前 vLLM `ParallelConfig` 会先将它归一化为 `allgather_reducescatter`，
+  因而能通过该校验；新配置应直接使用 `allgather_reducescatter`。
+- `deepep_low_latency`：调用 LL 路径，用于本文的 Hybrid LL 配置。
+- 两种 override 都要求该层满足第 5 节的自定义 DP + EP 准入条件，
+  否则初始化报错。该变量在模块 import 时读取，修改后需重启服务。
 
-设置该变量后，LL manager 和通信 handle 会由 `init_ep()` 在 CUDA Graph
-capture 前预初始化，避免在 stream capture 期间执行 barrier。LL MoE
-kernel 由 profile/warmup 或首次对应 forward 路径完成初始化。
+仅当 override 为 `deepep_low_latency` 且配置 backend 不是 LL 时，
+`init_ep()` 才安排 LL manager 和通信 handle 在 CUDA Graph capture 前
+预初始化。`naive` override 不初始化 LL handle。LL MoE kernel 由
+profile/warmup 或首次对应 forward 路径完成初始化。
 
 #### `VLLM_ILU_DISABLE_DEEPEP`
 
@@ -280,6 +312,42 @@ A/B 定位。
   与 EP dispatch 重叠。该开关与全局 `VLLM_DISABLE_SHARED_EXPERTS_STREAM` 独立。
 
 该开关仅改变执行调度。实际收益需在目标并发与 CUDA Graph 模式下对照验证。
+
+#### `VLLM_ILU_MOE_AG_SHARED_OVERLAP`
+
+- 默认值：`0`；设置为 `1` 后重启模型进程。
+- 作用：符合调度条件的 MoERunner 使用 AG/RS 时，将本地 shared MLP 提交到辅助
+  CUDA stream，与主流 dispatch 并行；dispatch（包括 PCP gather）后等待
+  shared，再执行后置 gate 和 routed experts。关闭时仍在 dispatch 前于主流
+  串行计算 shared，然后执行 AG，不恢复此前的 shared 调度。
+- runner 初始化时直接读取该通用开关，模型无需转传；要求有 shared experts、
+  未启用 shared/gate 权重融合，且 backend 不由 kernel 自行 dispatch、quant
+  method 不是 monolithic。仅实际进入此 runner 调度的模型生效；DSv4 默认的
+  自定义 DP + EP 路径不受此开关控制。
+- 原 `VLLM_ILU_GLM_AG_SHARED_OVERLAP` 已移除，启动脚本需改用新名字。
+- shared 输出保持本地，routed 输出完成 combine/reduce-scatter 后再相加。
+- 支持 BF16 输入以及 fused norm/quant 提供的 INT8/scales；独立于
+  `VLLM_DISABLE_SHARED_EXPERTS_STREAM`。LL dispatch 仍由
+  `VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP` 控制。
+
+MoERunner 的 AG/RS 数据格式使用 `dp_metadata.all_ranks_decode_only` 判断：
+该字段为真时通信 BF16，gate 后置；为假或缺少 `dp_metadata` 时在本地 gate，支持预量化输入的
+W4A8 NN 方法传 INT8/scales/logits，并在适用时复用 norm 的量化结果。
+不支持预量化的方法保留浮点输入；由 kernel 自行 dispatch 的 backend
+继续使用原执行协议。PCP 的 gather/reduce-scatter 沿用 runner 的通信归属判断。
+
+**DP=1 / PCP>1 的阶段边界：** 未启用 sequence-parallel MoE 时，生产
+`set_forward_context()` 不创建 `dp_metadata`。因此即使当前请求全是 decode，
+runner 也采用前置 gate；支持预量化输入且无 custom routing 的 W4A8 NN
+走 INT8/scales/logits dispatch。PCP gather/reduce-scatter 仍正常执行，但
+不会命中 BF16 dispatch + 后置 gate 的 decode 优化。当前不从本地 attention
+metadata 或 token 数推断阶段，也不人为补造 DP metadata。
+
+测试分别覆盖真实 context 缺少 DP metadata 时的分派，以及两卡 PCP 的
+INT8 通信、shared 串行/overlap 和 Graph replay；后者不代表 PCP decode
+后置 gate 策略已在生产可达。支持该策略需要后续单独设计阶段判断。
+
+该开关只控制 shared 调度，不控制上述阶段策略。收益需在目标负载下验证。
 
 ### 3.2 DP 请求分配与 Prefill 同步
 
@@ -449,28 +517,84 @@ vllm serve "${MODEL}" \
 2. `Initialized Hybrid EP low-latency decode backend`：LL decode backend 和
    通信 handle 已初始化。
 
-若缺少第一条，检查 `VLLM_ILU_DP_ENABLE_SYNC_PREFILLS=1` 且
+使用默认 runner 或 `naive` override 时，不应要求出现 LL 初始化日志。
+
+若配置了上述功能却缺少第一条，检查 `VLLM_ILU_DP_ENABLE_SYNC_PREFILLS=1` 且
 `VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS > 0`；若缺少第二条，检查
 `VLLM_ILU_DECODE_EP_BACKEND=deepep_low_latency` 和 DP + EP 是否启用。
 
+### 4.4 GLM-5.2 的入口配置
+
+以下配置均配合 `--enable-expert-parallel` 和
+`--all2all_backend=allgather_reducescatter`，并设置适合设备数的 TP/DP。
+
+```bash
+# 默认：Prefill、混合批次、Decode 均走 MoERunner。
+unset VLLM_ILU_DECODE_EP_BACKEND
+
+# shared MLP 串行；设为 1 才开启 AG/shared overlap。
+export VLLM_ILU_MOE_AG_SHARED_OVERLAP=0
+```
+
+临时让所有 DP rank 纯 Decode 时回到 `forward_dp_ep_naive()`：
+
+```bash
+export VLLM_ILU_DECODE_EP_BACKEND=naive
+```
+
+若要纯 Decode 使用 LL，则改为：
+
+```bash
+export VLLM_ILU_DECODE_EP_BACKEND=deepep_low_latency
+```
+
+两种 override 下，GLM 的 Prefill/混合批次仍走 MoERunner。没有额外的
+`VLLM_ILU_GLM_MOE_USE_RUNNER` 开关。AG/RS runner 的阶段策略不由
+`VLLM_ILU_MOE_AG_SHARED_OVERLAP` 控制；该变量只改变 shared 调度。
+运行 AG/RS runner 后可检查 `MoERunner phase=...` 日志中的
+`gate_after_dispatch` 和 `shared_overlap`。日志只说明该 forward 路径曾执行，
+不等同于逐步 CUDA Graph replay 的 trace。
+
 ## 5. Backend 选择规则
 
-当前 DP + EP 自定义路径要求同时满足：
+先区分模型入口，再判断自定义路径内部的 backend。
 
-1. DP size 大于 1。
-2. 已启用 EP。
-3. `--all2all_backend` 是 `naive`、`allgather_reducescatter`、
+| 模型 | 进入 `forward_dp_ep()` 的条件 | 其它情况 |
+|---|---|---|
+| GLM-5.2 | 设置了合法 override，且所有 DP rank 都是纯 Decode | 使用 `self.experts` / MoERunner，按配置 backend 执行 |
+| DeepSeek-V4 | `_should_use_forward_dp_ep()` 为真 | 保留模型原有 `FusedMoE` forward |
+
+`_should_use_forward_dp_ep()` 要求同时满足：
+
+1. DP size 大于 1，且已启用 EP。
+2. 配置 backend 是 `naive`、`allgather_reducescatter`、`ag-rs`、`ag_rs`、
    `deepep_low_latency` 或 `deepep_high_throughput`。
+3. quant method 的 `is_monolithic=False`。
+4. backend 为 DeepEP LL/HT，或者 quant method 的
+   `supports_internal_mk=False`。
 
-满足条件后，按以下顺序选择 backend：
+这些是自定义 DP + EP 路径及 override 的准入条件，不是 MoERunner 的
+通用准入条件。`naive` override 另要求配置 AG/RS backend，详见第 3.1 节。
 
-1. 所有 DP rank 都是 decode-only，且
-   `VLLM_ILU_DECODE_EP_BACKEND=deepep_low_latency`：使用 LL。
-2. 配置 backend 本身是 `deepep_low_latency`：使用 LL。
-3. 配置 backend 是 `deepep_high_throughput`：使用 HT。
-4. 配置 backend 是 naive/AG-RS 别名：使用 naive AG/reduce 路径。
-5. 已经进入 `forward_dp_ep()` 后，其它未命中 override 的情况回退到配置的
-   modular MoE 路径。
+已经进入 `forward_dp_ep()` 后，按以下优先级执行：
+
+1. 所有 DP rank 纯 Decode 且设置 override：`naive` 调用
+   `forward_dp_ep_naive()`；`deepep_low_latency` 调用 LL。
+2. 未命中 override 且配置 backend 为 LL：调用 LL。
+3. 未命中 override 且配置 backend 为 HT：调用 HT。
+4. 未命中 override 且配置 backend 为 naive/AG-RS：调用
+   `forward_dp_ep_naive()`。
+5. 其它情况保留 `forward_dp_ep_modular()` 兜底。
+
+第 4 条不能用于推断 GLM 的默认入口：GLM 未命中 override 时根本不会进入
+该函数，而是走 MoERunner。DSv4 仍遵循其原有入口判断。
+
+AG/RS MoERunner 的纯 Decode 后置 gate 要求 runner 持有 gate 且未启用
+shared/gate 权重融合；Prefill/混合批次的 INT8 dispatch 要求 quant method
+支持预量化输入且没有 custom routing function。kernel 自行处理 dispatch 或
+monolithic 方法不走这套阶段策略。PCP 通信继续由 runner 的
+`_needs_pcp_dispatch_combine()` 判断归属，不能将自定义路径的 DP>1 条件
+套用到 PCP runner。
 
 ### 5.1 当前限制
 
@@ -481,6 +605,20 @@ vllm serve "${MODEL}" \
    EP 通信。
 4. sync-prefill 每个活跃 EngineCore step 会增加一次小型 CPU DP
    all-reduce；多节点和非 round-robin 部署必须单独压测。
+
+### 5.2 本轮改动的验证范围
+
+- 单元测试覆盖通用 runner 配置读取、shared 串行/overlap 调度、DP 阶段策略，
+  以及真实 `set_forward_context()` 在 DP=1/PCP>1 时不产生 DP metadata。
+- 使用真实 `ParallelConfig` 验证 CLI `naive` 的归一化及 naive override；
+  GLM 与 DSv4 测试从各自真实模型 `forward()` 入口验证派发和输入传递。
+  这些入口测试使用下游 test doubles，不代表完整模型初始化和 kernel 验证。
+- 两卡测试覆盖原生 NN MoE、DP/PCP 通信、空 DP shard、预量化输入、shared
+  串行/overlap 与改输入后的 CUDA Graph replay。PCP 无 metadata 的覆盖范围
+  见第 3.1 节。
+- 尚未完成 GLM 配置 HT/LL 后的完整 runner 初始化与数值 forward、DSv4
+  整模精度/性能回归。LL 协议 mock 测试不能证明 LL kernel 数值正确。
+  不据这些测试宣称所有模型和 backend 均无回归。
 
 ## 6. DP Prefill 调度为何必要
 
@@ -587,8 +725,12 @@ kernel 做大范围 profiling。
    request 等待和跨 DP rank 的 Prefill admission 同步。
 8. [`patch_core.py`](../../vllm_iluvatar/ilu_patch/general_patches/patch_core.py)：
    安装 EngineCore wrapper，并校验社区方法的 fingerprint 和签名。
+9. [`ilu_moe_runner.py`](../../vllm_iluvatar/model_executor/layers/fused_moe/runner/ilu_moe_runner.py)：
+   AG/RS 阶段策略、预量化输入复用、shared 调度及 PCP dispatch/combine。
 
 ### 9.2 配置步骤速览
+
+以下为本文 DSv4 Hybrid LL 示例；GLM 默认 runner 或 naive override 配置见第 4.4 节。
 
 1. 根据 GPU 数量确定 TP 和 DP，PP=1 时总 GPU 数为 `TP × DP`。
 2. 使用 `--enable-expert-parallel` 启用 EP。

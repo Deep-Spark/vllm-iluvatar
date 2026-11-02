@@ -100,6 +100,7 @@ _RMS_ROPE_FP8_KV_ENGAGE_LOGGED = False
 _RMS_ROPE_FP8_KV_SKIP_LOGGED = False
 _Q_A_NORM_QUANT_FAILED = False
 
+
 def _gather_and_cache_packed_fp8_kv(
     kv_c: torch.Tensor,
     k_pe: torch.Tensor,
@@ -146,6 +147,7 @@ def _gather_and_cache_packed_fp8_kv(
         "auto",
         scale,
     )
+
 
 def _can_fuse_q_a_norm_quant(
     attn: "IluGlmMoeDsaMLAAttention",
@@ -267,6 +269,7 @@ class IluGlmMoeDsaPCPBackend(IluFlashMLASparseBackend):
     @classmethod
     def supports_pcp(cls) -> bool:
         return True
+
 
 class IluGlmMoeDsaIndexerCache(torch.nn.Module, AttentionLayerBase):
     """BF16 lightning-indexer K cache for GLM-5.2 (ilu W4A8).
@@ -427,7 +430,18 @@ class IluGlmMoeDsaIndexer(nn.Module):
         q = q.view(-1, self.n_head, self.head_dim)
 
         # Fused wk + weights_proj: one GEMM, then split.
-        kw, _ = self.wk_weights_proj(hidden_states)
+        # Small decode batches are faster through the BF16 torch GEMM than
+        # through the quantized linear dispatch. Same cutoff as the 0.27
+        # GLM path (one DP rank, bs <= 128).
+        if (
+            hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape[0] <= 128
+            and self.wk_weights_proj.weight.dtype == torch.bfloat16
+        ):
+            kw = torch.nn.functional.linear(hidden_states, self.wk_weights_proj.weight)
+            logger.info_once("GLM decode indexer BF16 torch GEMM path")
+        else:
+            kw, _ = self.wk_weights_proj(hidden_states)
         k = kw[:, : self.head_dim]
         weights = kw[:, self.head_dim :]
 
@@ -558,6 +572,7 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
     ``_v_up_proj_w8a8`` (``vllm/v1/attention/backends/mla/ilu_mla.py``). There
     is no BF16 absorb fallback (the converted checkpoint is always INT8).
     """
+
     _fp8_kv_scale_calibration_enabled: bool = True
 
     def __init__(
@@ -1096,6 +1111,7 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
                     # Keep compatible token-major (including padded) Q as-is.
                     if q_nope.stride(0) < self.num_heads * q_nope.stride(1):
                         q_nope = q_nope.contiguous()
+                    logger.info_once("GLM decode glm_dsa_prepare path")
                     prepared_q = ixf_ops.glm_dsa_prepare(
                         q_nope,
                         q_pe,
@@ -1142,7 +1158,7 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
                     kv_cache_dtype=self.kv_cache_dtype,
                     scale=self._k_scale,
                 )
-                
+
         if num_actual_toks == 0:
             return q.new_zeros((num_tokens, self.num_heads * self.v_head_dim))
 

@@ -34,12 +34,12 @@ class AgRsAll2AllManager(All2AllManagerBase):
     def dispatch_router_logits(
         self,
         hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
+        router_logits: torch.Tensor | None,
         is_sequence_parallel: bool = False,
         extra_tensors: list[torch.Tensor] | None = None,
     ) -> (
-        tuple[torch.Tensor, torch.Tensor]
-        | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]
+        tuple[torch.Tensor, torch.Tensor | None]
+        | tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]
     ):
         """
         Gather hidden_states and router_logits from all dp ranks.
@@ -51,7 +51,9 @@ class AgRsAll2AllManager(All2AllManagerBase):
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
         assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]
 
-        tensors_to_gather = [hidden_states, router_logits]
+        tensors_to_gather = [hidden_states]
+        if router_logits is not None:
+            tensors_to_gather.append(router_logits)
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
 
@@ -61,9 +63,11 @@ class AgRsAll2AllManager(All2AllManagerBase):
             sizes=sizes,
         )
 
+        offset = 1 if router_logits is None else 2
+        logits = None if router_logits is None else gathered_tensors[1]
         if extra_tensors is not None:
-            return (gathered_tensors[0], gathered_tensors[1], gathered_tensors[2:])
-        return gathered_tensors[0], gathered_tensors[1]
+            return gathered_tensors[0], logits, gathered_tensors[offset:]
+        return gathered_tensors[0], logits
 
     def dispatch(
         self,

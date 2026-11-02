@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for IluMoERunner.
 
-CPU-only tests use mocks to verify override behaviour without constructing
-a full MoE layer stack. GPU-only tests (marked ``requires_cuda``) would
-exercise the numerical forward path — those are deferred to P2 and can be
-added when the full environment is available.
+CPU-only tests verify scheduling, phase selection and real context boundaries.
+Native two-rank DP/PCP collectives and CUDA Graph replay are covered in
+``tests/distributed/test_moe_runner_ag.py``. These are not full-model accuracy
+or DeepEP HT/LL kernel validation.
 """
 
 from __future__ import annotations
@@ -67,6 +67,7 @@ def _make_stub_runner(
     obj.__dict__["_ilu_fused_ep_combine_cached"] = False
     obj.routed_scaling_factor = routed_scaling_factor
     obj.shared_experts_scaling_factor = 1.0
+    obj._ag_shared_overlap_enabled = False
     # Normally set in __init__ from envs; the stub bypasses __init__.
     obj._gather_before_gate_enabled = True
 
@@ -490,3 +491,240 @@ def test_pcp_moe_collectives_are_owned_by_one_dispatch_path(all2all, kernel_disp
     assert group.reduce_scatter.call_count == (1 if runner_dispatch else 0)
     assert scores.shape[0] == tokens.shape[0] == (6 if runner_dispatch else 3)
     torch.testing.assert_close(output, x * 2 if runner_dispatch else x)
+
+
+@pytest.mark.parametrize("deferred_gate", [False, True])
+@pytest.mark.parametrize("quantized", [False, True])
+def test_pcp_dispatch_keeps_scales_and_token_ids_aligned(quantized, deferred_gate):
+    runner = _make_stub_runner(has_shared_experts=False)
+    runner.moe_config.pcp_size = 2
+    runner.moe_config.moe_parallel_config.use_all2all_kernels = False
+    x = torch.arange(12).reshape(3, 4).to(torch.int8 if quantized else torch.bfloat16)
+    scale = torch.tensor([[0.1], [0.2], [0.3]])
+    ids = torch.tensor([17, 42, 83])
+    logits = None if deferred_gate else torch.arange(6).reshape(3, 2).float()
+    group = MagicMock()
+    # Distinct remote values expose permutations and missing gathers.
+    group.all_gather.side_effect = lambda tensor, dim: torch.cat(
+        (tensor, tensor + 1), dim=dim
+    )
+    with patch(
+        "vllm_iluvatar.model_executor.layers.fused_moe.runner.ilu_moe_runner.get_pcp_group",
+        return_value=group,
+    ):
+        routed, scores, tokens = runner._maybe_dispatch(
+            (x, scale, torch.bfloat16) if quantized else x, logits, ids
+        )
+    torch.testing.assert_close(tokens, torch.cat((ids, ids + 1)))
+    if quantized:
+        values, scales, dtype = routed
+        assert dtype == torch.bfloat16
+        torch.testing.assert_close(scales, torch.cat((scale, scale + 1)))
+    else:
+        values = routed
+    torch.testing.assert_close(values, torch.cat((x, x + 1)))
+    if deferred_gate:
+        assert scores is None
+    else:
+        torch.testing.assert_close(scores, torch.cat((logits, logits + 1)))
+    assert group.all_gather.call_count == 2 + quantized + (not deferred_gate)
+
+
+@pytest.mark.parametrize("pcp_size", [1, 2])
+def test_precomputed_shared_stays_separate_until_combine(pcp_size):
+    runner = _make_stub_runner()
+    runner.moe_config.pcp_size = pcp_size
+    runner.moe_config.moe_parallel_config.use_all2all_kernels = False
+    runner.routed_experts.quant_method.is_monolithic = False
+    runner.routed_output_transform = None
+    runner.router = MagicMock()
+    runner.router.select_experts.return_value = (
+        torch.ones(6, 8),
+        torch.zeros(6, 8, dtype=torch.int32),
+    )
+    local_shared = torch.full((6 // pcp_size, 6144), 5, dtype=torch.bfloat16)
+    routed = torch.full((6, 6144), 2, dtype=torch.bfloat16)
+    runner.routed_experts.forward_modular.return_value = routed
+    runner._maybe_apply_shared_experts = MagicMock()
+    group = MagicMock()
+    group.reduce_scatter.side_effect = lambda x, dim: x.chunk(2, dim=dim)[0] * 2
+    shared, output = runner._apply_quant_method(
+        routed, torch.zeros(6, 8), None, shared_output=local_shared
+    )
+    with patch(
+        "vllm_iluvatar.model_executor.layers.fused_moe.runner.ilu_moe_runner.get_pcp_group",
+        return_value=group,
+    ):
+        shared, output = runner._maybe_combine(shared, output)
+    assert shared is local_shared
+    torch.testing.assert_close(
+        shared + output, torch.full_like(local_shared, 5 + 2 * pcp_size)
+    )
+    runner._maybe_apply_shared_experts.assert_not_called()
+    assert group.reduce_scatter.call_count == (pcp_size > 1)
+
+
+@pytest.mark.parametrize(
+    "decode",
+    [False, True, None],
+    ids=["dp-prefill", "dp-decode", "pcp-decode-no-metadata"],
+)
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_phase_schedule_uses_original_dispatch_and_join_before_gate(
+    decode, overlap, dtype
+):
+    from types import SimpleNamespace
+
+    import ixformer.inference.functions as ops
+
+    runner = _make_stub_runner(in_dtype=dtype)
+    runner.moe_config.moe_parallel_config.all2all_backend = "allgather_reducescatter"
+    runner.routed_experts.quant_method.is_monolithic = False
+    runner.routed_experts.quant_method.supports_prequantized_input = True
+    runner.routed_experts.custom_routing_function = None
+    runner.routed_input_transform = None
+    runner._fse_fuse_gate = False
+    runner._ag_shared_overlap_enabled = overlap
+    runner._sequence_parallel_context = nullcontext
+    runner._shared_can_reuse_routed_quant = lambda: False
+    events = []
+    x = torch.ones(3, 256, dtype=dtype)
+    q = x.to(torch.int8)
+    scale = torch.ones(3, 1)
+    shared = x * 2
+
+    def gate(value):
+        events.append("gate")
+        assert value.dtype == dtype
+        return torch.ones(value.shape[0], 8), None
+
+    def begin(value, *, overlap):
+        events.append("shared")
+        assert value is x
+        assert overlap == runner._ag_shared_overlap_enabled
+        return None
+
+    def join(stream):
+        events.append("join")
+        return shared
+
+    def dispatch(value, logits, ids):
+        events.append("dispatch")
+        if decode:
+            assert value is x and logits is None
+        else:
+            assert value[0] is q and value[2] == dtype
+            torch.testing.assert_close(value[1], scale)
+            assert logits is not None
+        return value, logits, ids
+
+    def apply(**kw):
+        events.append("experts")
+        assert kw["shared_output"] is shared
+        assert kw["router_logits"] is not None
+        return shared, x
+
+    runner.gate = gate
+    runner._shared_experts.begin_dispatch.side_effect = begin
+    runner._shared_experts.end_dispatch.side_effect = join
+    runner._maybe_dispatch = dispatch
+    runner._apply_quant_method = apply
+    runner._maybe_combine = lambda s, r: s + r
+    if decode is None:
+        from vllm.forward_context import get_forward_context, set_forward_context
+
+        # Production context creation: PCP alone does not create DPMetadata.
+        runner.moe_config.pcp_size = 2
+        config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                data_parallel_size=1,
+                prefill_context_parallel_size=2,
+                use_sequence_parallel_moe=False,
+                is_moe_model=True,
+            ),
+            compilation_config=SimpleNamespace(
+                fast_moe_cold_start=False,
+                static_forward_context={},
+            ),
+        )
+        context_scope = set_forward_context(
+            SimpleNamespace(num_prefills=0, num_decode_tokens=3),
+            config,
+            num_tokens=3,
+        )
+        context_patch = nullcontext()
+    else:
+        context_scope = nullcontext()
+        context_patch = patch(
+            "vllm_iluvatar.model_executor.layers.fused_moe.runner.ilu_moe_runner.get_forward_context",
+            return_value=SimpleNamespace(
+                dp_metadata=SimpleNamespace(all_ranks_decode_only=decode)
+            ),
+        )
+    with (
+        context_scope,
+        context_patch,
+        patch.object(ops, "scaled_int8_quant", return_value=(q, scale)) as quant,
+    ):
+        if decode is None:
+            assert get_forward_context().dp_metadata is None
+        torch.testing.assert_close(runner._forward_impl(x, None, x), x * 3)
+    assert quant.call_count == (not decode)
+    assert events == (
+        ["shared", "dispatch", "join", "gate", "experts"]
+        if decode
+        else ["gate", "shared", "dispatch", "join", "experts"]
+    )
+
+
+@pytest.mark.parametrize("shared_width", [128, 256])
+def test_shared_quant_reuse_requires_matching_input_shape(shared_width):
+    from types import SimpleNamespace
+
+    import ixformer.inference.functions as ops
+
+    runner = _make_stub_runner()
+    runner.moe_config.moe_parallel_config.all2all_backend = "allgather_reducescatter"
+    runner.routed_experts.quant_method.is_monolithic = False
+    runner.routed_experts.quant_method.supports_prequantized_input = True
+    runner.routed_experts.custom_routing_function = None
+    runner.routed_input_transform = None
+    runner.gate = None
+    runner._fse_fuse_gate = False
+    runner._sequence_parallel_context = nullcontext
+    runner._shared_can_reuse_routed_quant = lambda: True
+    x = torch.ones(3, 256, dtype=torch.bfloat16)
+    shared_x = x[:, :shared_width]
+    q, scale = x.to(torch.int8), torch.ones(3, 1)
+    runner._maybe_dispatch = lambda x, logits, ids: (x, logits, ids)
+    runner._apply_quant_method = MagicMock(return_value=(None, x))
+    runner._maybe_combine = lambda shared, routed: routed
+    with (
+        patch(
+            "vllm_iluvatar.model_executor.layers.fused_moe.runner.ilu_moe_runner.get_forward_context",
+            return_value=SimpleNamespace(dp_metadata=None),
+        ),
+        patch.object(ops, "scaled_int8_quant", return_value=(q, scale)),
+    ):
+        runner._forward_impl(x, torch.zeros(3, 8), shared_x)
+    value = runner._shared_experts.begin_dispatch.call_args.args[0]
+    if shared_width == 256:
+        assert value[0] is q and value[2] == x.dtype
+    else:
+        assert value is shared_x
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_runner_initializes_ag_shared_overlap_without_model_wiring(enabled):
+    runner = _make_stub_runner()
+    module = "vllm_iluvatar.model_executor.layers.fused_moe.runner.ilu_moe_runner"
+    config = MagicMock()
+    config.parallel_config.enable_elastic_ep = False
+    with (
+        patch.object(MoERunner, "__init__", return_value=None),
+        patch(f"{module}.get_current_vllm_config", return_value=config),
+        patch(f"{module}.envs.VLLM_ILU_MOE_AG_SHARED_OVERLAP", enabled),
+    ):
+        IluMoERunner.__init__(runner)
+    assert runner._ag_shared_overlap_enabled is enabled

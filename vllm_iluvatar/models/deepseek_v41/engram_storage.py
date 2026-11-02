@@ -12,6 +12,8 @@ import weakref
 import numpy as np
 import torch
 
+from vllm_iluvatar.ilu_util.mmap_utils import mmap_byte_array
+
 
 def validate_engram_config(vllm_config):
     """Reject unsupported storage before workers allocate model weights."""
@@ -90,7 +92,12 @@ def map_shared_checkpoint_rows(path, name, start, end, group, entry):
                 prot=mmap.PROT_READ,
                 offset=map_offset,
             )
-        owner = np.frombuffer(mapping, dtype=np.uint8, count=num_bytes, offset=skew)
+        owner = mmap_byte_array(
+            mapping,
+            num_bytes,
+            offset=skew,
+            readonly=True,
+        )
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             tensor = torch.from_numpy(owner).view(dtype).view(end - start, *shape[1:])

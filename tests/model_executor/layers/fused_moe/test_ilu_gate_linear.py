@@ -147,6 +147,50 @@ def test_gate_linear_forward_casts_input_and_output_dtype_for_fallback():
     assert output.dtype == torch.bfloat16
 
 
+def test_glm_bf16_gate_keeps_small_batch_fast_path():
+    gate = IluGateLinear.__new__(IluGateLinear)
+    torch.nn.Module.__init__(gate)
+    gate.weight = torch.nn.Parameter(torch.ones(256, 6144, dtype=torch.bfloat16))
+    gate.bias = None
+    gate.skip_bias_add = False
+    gate.out_dtype = None
+    gate.use_bf16_small_batch_gate = True
+    x = torch.ones(2, 6144, dtype=torch.bfloat16)
+
+    with patch.object(
+        ReplicatedLinear,
+        "forward",
+        side_effect=AssertionError("GLM gate should use the BF16 fast path"),
+    ):
+        output, output_bias = gate.forward(x)
+
+    assert output_bias is None
+    assert output.shape == (2, 256)
+    assert output.dtype == torch.bfloat16
+    torch.testing.assert_close(output, torch.full_like(output, 6144))
+
+
+def test_bf16_gate_shape_does_not_opt_other_models_into_glm_fast_path():
+    gate = IluGateLinear.__new__(IluGateLinear)
+    torch.nn.Module.__init__(gate)
+    gate.weight = torch.nn.Parameter(torch.ones(256, 6144, dtype=torch.bfloat16))
+    gate.bias = None
+    gate.skip_bias_add = False
+    gate.out_dtype = None
+    x = torch.ones(2, 6144, dtype=torch.bfloat16)
+    expected = torch.full((2, 256), 7, dtype=torch.bfloat16)
+
+    def fallback(self, input_):
+        assert self is gate and input_ is x
+        return expected, None
+
+    with patch.object(ReplicatedLinear, "forward", fallback):
+        output, output_bias = gate.forward(x)
+
+    assert output is expected
+    assert output_bias is None
+
+
 @requires_cuda
 @pytest.mark.parametrize(
     "m,arch,n,dtype,expected",

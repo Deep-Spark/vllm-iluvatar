@@ -68,6 +68,29 @@ class IluGateLinear(GateLinear):
             if arch == IVCORE30 and 128 <= x.shape[0] <= 4096:
                 return ixfops.mixed_type_linear(x, self.weight), None
 
+        # A model must explicitly opt in: the shape alone is not a model
+        # identity and another model may also use a BF16 [256, 6144] gate.
+        # GLM-5.2 decode batches here are one DP rank (bs <= 128), where
+        # torch's BF16 GEMM beats the quantized dispatch. The 0.27 server
+        # logged this path at bs 16.
+        if (
+            getattr(self, "use_bf16_small_batch_gate", False)
+            and x.dtype == torch.bfloat16
+            and self.weight.dtype == x.dtype
+            and x.ndim == 2
+            and 0 < x.shape[0] <= 128
+            and self.weight.shape == (256, 6144)
+            and (self.skip_bias_add or self.bias is None or self.bias.dtype == x.dtype)
+            and self.out_dtype in (None, torch.bfloat16)
+        ):
+            from vllm.logger import init_logger
+
+            init_logger(__name__).info_once("GLM BF16 torch gate path")
+            bias = None if self.skip_bias_add else self.bias
+            return torch.nn.functional.linear(x, self.weight, bias), (
+                self.bias if self.skip_bias_add else None
+            )
+
         if self.out_dtype is not None and x.dtype != self.weight.dtype:
             x = x.to(self.weight.dtype)
 

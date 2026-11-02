@@ -34,7 +34,7 @@ def test_ffn_selects_ll_only_for_opted_in_decode(enabled, decode):
 
 
 def test_decode_override_preinitializes_nonzero_draft_layer(monkeypatch):
-    monkeypatch.setattr(ep, "_DS4_DECODE_EP_BACKEND", "deepep_low_latency")
+    monkeypatch.setattr(ep, "_DECODE_EP_BACKEND", "deepep_low_latency")
     ffn = ep.IluFusedMoEEP()
     ffn.prefix = "model.layers.40.ffn"
     ffn.experts = SimpleNamespace(
@@ -50,7 +50,7 @@ def test_decode_override_preinitializes_nonzero_draft_layer(monkeypatch):
 
 
 def test_initialization_runs_after_quant_config_init(monkeypatch):
-    monkeypatch.setattr(ep, "_DS4_DECODE_EP_BACKEND", "deepep_low_latency")
+    monkeypatch.setattr(ep, "_DECODE_EP_BACKEND", "deepep_low_latency")
     monkeypatch.setattr(ep, "_MAX_NUM_SEQS", 4)
     monkeypatch.setattr(ep.IluFusedMoEEP, "_dp_ep_ll_preinit_done", False)
     ffn = ep.IluFusedMoEEP()

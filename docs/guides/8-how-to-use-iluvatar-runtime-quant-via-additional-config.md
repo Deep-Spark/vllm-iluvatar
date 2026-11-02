@@ -303,6 +303,9 @@ transform + weight_load
 | `IluFp8PerChannelOnlineLinearMethod` | `transform + process_weights_after_loading` | Linear |
 | `IluFp8ToFp4OnlineMoEMethod` | `transform + weight_load` | RoutedExperts |
 | `IluFp8ToW4A8NNMoEMethod` | `transform + weight_load`（FP8 → ixmm W4A8 NN） | RoutedExperts |
+| `IluFp8ToW8A8Int8LinearMethod` | `transform + process_weights_after_loading`（FP8 → per-channel INT8） | Linear |
+| `IluNativeToW8A8Int8LinearMethod` | `transform + process_weights_after_loading`（BF16 → per-channel INT8） | Linear |
+| `IluFp8ToGlmKVBProjW8A16Method` | `transform + process_weights_after_loading`（FP8 → Marlin W8A16） | GLM-5.2 `kv_b_proj` |
 
 schema 对 `direct` 的支持不代表已有 method 实现了它。
 
@@ -678,17 +681,104 @@ NN method 固定选择 graph-safe 算子，不提供 `decode_backend` 或
 `enable_cuda_graph` 配置项；实际捕获/重放仍由 vLLM 自身配置控制。
 AG INT8 通信及 router fusion 仍由各自的开关控制，准入条件是 ivcore30 NN method。
 
-### 8.6 官方 FP8 checkpoint：加载时直接量化为 W4A8 NN
+### 8.6 官方 FP8 checkpoint：加载时量化为完整的 W4A8 NN 布局
 
-在仓库外的部署配置中，通过 `additional_config.ilu_quant`
-选择 `IluFp8ToW4A8NNMoEMethod`。checkpoint 的 `quant_method` 保持 `fp8`，
-不需要生成 TN/v2 权重，也不修改模型目录。将配置的 `additional_config`
-合并到已有服务配置，或通过 `vllm serve --config` 传入。
+本节把官方 FP8 权重加载成**离线 `GLM-5.2-w4a8-NN` 的全部运行时布局**，
+而不只是 routed experts。checkpoint 的 `quant_method` 保持 `fp8`，
+不需要生成 TN/v2 权重，也不修改模型目录。
 
-契约为 `fp8-block`（128×128、E4M3、乘法 FP32 block scale）→
-`int4-packed-nn`（per-channel、ixmm NN），`transform@weight_load`。
-target 的 `pack_version` 也可省略，旧值 `1` 仅作为兼容标记。
-仅匹配 routed experts；attention、dense 和 shared experts 保持原 FP8 路径。
+仓库内提供两份可直接复用的配置：
+
+| 文件 | 适用 | config groups |
+| --- | --- | --- |
+| [`w4a8-nn-moe-inline.yaml`](../../examples/iluvatar-runtime-quant/ZhipuAI/GLM-5.2/w4a8-nn-moe-inline.yaml) | MTP off | 3 |
+| [`w4a8-nn-moe-mtp-inline.yaml`](../../examples/iluvatar-runtime-quant/ZhipuAI/GLM-5.2/w4a8-nn-moe-mtp-inline.yaml) | MTP on | 4 |
+
+```bash
+vllm serve /path/to/GLM-5.2-FP8 \
+  --config examples/iluvatar-runtime-quant/ZhipuAI/GLM-5.2/w4a8-nn-moe-inline.yaml \
+  --tensor-parallel-size 2 \
+  --data-parallel-size 8 \
+  --enable-expert-parallel \
+  --trust-remote-code
+```
+
+NN 与 TN 是两个显式部署选择，不由 checkpoint 名称、shape 或环境变量自动猜测。
+未来 FP8 → W4A8 TN 支持合入后，应提供独立的
+`w4a8-tn-moe-inline.yaml` 和 TN runtime method；不得改变本 NN 配置的语义，也不得
+从本配置静默回退到 TN。
+
+#### 8.6.1 为什么必须覆盖 routed experts 以外的层
+
+离线 NN checkpoint 的 `config_groups` 有四组，只转换 routed experts 会留下
+三类仍在跑 block-FP8 的层，并连带关闭两个**靠特征检测武装**的 INT8 融合：
+
+| 离线 group | 运行时模块 | 只转 MoE 时实际走的路径 |
+| --- | --- | --- |
+| `routed_experts` | `mlp.experts` | W4A8 NN（已覆盖） |
+| `dense_linears` | `self_attn.fused_qkv_a_proj` / `q_b_proj` / `o_proj`、`indexer.wq_b`、前 3 层 `mlp.gate_up_proj` / `down_proj`、MTP `eh_proj` | `IluFp8BlockScaledMMKernel` |
+| `shared_experts` | `mlp.shared_experts.gate_up_proj` / `down_proj` | `IluFp8BlockScaledMMKernel` |
+| `kv_b_w8a16` | `self_attn.kv_b_proj` | FP8 grouped einsum（`fp8_attention` 自建 absorbed up-proj） |
+
+两个受影响的融合：
+
+- `IluGlmMoeDsaFp8DecoderLayer.fuse_norm_quant`：只有当 `fused_qkv_a_proj` 与
+  `mlp` 侧消费者全部是 W8A8 / W4A8 NN 时才启用，否则两个 RMSNorm 都走分离路径。
+- `_can_fuse_q_a_norm_quant`：要求 `q_b_proj.scheme` 和 `indexer.wq_b.scheme`
+  都是 `IluCompressedTensorsW8A8Int8`。
+
+这两个开关都不看环境变量，所以"只转 routed experts"不会报错，只会安静变慢。
+
+micro-D decode 实测（TP2 / DP8 / EP16、1500 MHz、输入 46080、MTP off、
+repeats=5、CPU governor performance），单位 ms：
+
+| 配置 | BS/DP=8 | BS/DP=16 |
+| --- | --- | --- |
+| 离线 `GLM-5.2-w4a8-NN` | 44.281 | 52.243 |
+| 在线，四组全覆盖 | **44.216** | **52.194** |
+| 在线，只转 routed experts | 47.706 | 56.111 |
+
+**`self.mlp.experts` 不是持有 `quant_method` 的对象。** `FusedMoEFactory`
+返回的是 `MoERunner`，method 挂在它内部的 `routed_experts` 上，runner 只用私有
+的 `_quant_method` 代理。对 runner 直接 `getattr(..., "quant_method", None)`
+会拿到 `None`，于是 75 个 MoE 层的 `fuse_norm_quant` 全部静默变成 False，两个
+RMSNorm 都退回 split 路径，MoE 入口也从 `moe_expand_input_kernel_vec4` 退成
+`quant_expand`。这条路径不报错、不打日志，只在 eager ixsys trace 里看得出来
+（约 +290 µs/step），最终表现为约 1.5% 的回退。`fp8_model._consumer_quant_method`
+负责解析这层间接，解析不出 method 时直接抛错而不是当成"不支持"。
+
+#### 8.6.2 三类加载契约
+
+| group | source → target | stage | method |
+| --- | --- | --- | --- |
+| routed experts | `fp8-block` → `int4-packed-nn` | `weight_load` | `IluFp8ToW4A8NNMoEMethod` |
+| dense / shared Linear | `fp8-block` → `int8-channel` | `process_weights_after_loading` | `IluFp8ToW8A8Int8LinearMethod` |
+| `kv_b_proj` | `fp8-block` → `int8-channel-marlin` | `process_weights_after_loading` | `IluFp8ToGlmKVBProjW8A16Method` |
+| MTP `eh_proj` | `native` → `int8-channel` | `process_weights_after_loading` | `IluNativeToW8A8Int8LinearMethod` |
+
+只有 routed experts 需要 `weight_load`（§8.1 的显存理由）。dense Linear 的整层
+staging 只有单层大小，用 `weight_load` 只会换来重写 loader 的复杂度。
+
+`kv_b_proj` 转成 W8A16 后，`IluGlmMoeDsaFp8MLAAttention` 会改用基类
+`IluGlmMoeDsaSparseMLA`，直接消费 `IluGlmKVBProjW8A16Method` 产出的
+`W_UK` / `W_UV` 与 `marlin_w8a16`，不再自建 FP8 absorbed up-proj。
+该 group 的激活保持 BF16，因此 `input_activations` 与 `output_activations`
+都必须是 `null`。
+
+`eh_proj` 是唯一一个在 FP8 checkpoint 里仍是 BF16 的候选层
+（它在 `modules_to_not_convert` 中），所以它的 `require.original_disposition`
+是 `ignored`、source 是 `native`，需要单独的 method。它也只存在于 MTP 层：
+**声明了却匹配不到任何层的 target 在 PP=1 下是硬失败**（§9 的
+`targets matched no layers`，在首次 forward 前复核），所以 MTP on/off 必须用
+两份不同的 YAML，不能靠一份配置兼容。
+
+`indexer.wk` 不在任何 group 里。它在 FP8 盘上是 block-FP8、在离线 NN 盘上是
+BF16，`fp8_model.dequant_indexer_wk` 已经在权重流里把它折叠成 BF16，
+与离线布局一致；它在运行时的模块是与 `weights_proj` 融合后的
+`indexer.wk_weights_proj`，没有 scale 槽位。
+
+#### 8.6.3 routed experts 的量化算法
+
 激活为动态 per-token INT8；`IluFp8ToW4A8NNMoEMethod` 继承
 `IluW4A8NNMoEMethod` 的全部执行入口，仅覆盖 FP8 checkpoint 的创建和加载转换。
 `iluvatar` 只需指定 `method: IluFp8ToW4A8NNMoEMethod`，可选
@@ -714,6 +804,32 @@ GLM-5.2 纯 TP8 的 down_proj 本地 K=256；TP16 本地 K=128，目标权重和
 补零到 NN graph GEMM 要求的 K=256，有效 INT4 数值及通道 scale 不变。
 目前仅支持顺序 checkpoint loader、无 bias 的 gate/up experts、128 对齐的
 FP8 分片；不支持 EPLB、预先切好 K 的 checkpoint 或源 hidden/intermediate padding。
+
+#### 8.6.4 W8A8 / W8A16 的量化算法与 TP 行为
+
+两者共用同一个对称 per-output-channel 量化：反量化 block-FP8 后令
+`s = max(abs(W), dim=K) / 127`、`q = clamp(round(W/s), -127, 127)`，
+全零通道取 `s = 1` 以避免除零。转换按源 block 的行块逐块进行，
+大矩阵不会出现整层的 FP32 副本。
+
+与 routed experts 不同，**这里允许按本 rank 分片统计**。gate/up、`q_b_proj`、
+`kv_b_proj` 沿输出通道切分，本来就持有完整 K；`o_proj` 与 `down_proj` 沿 K
+切分，每个 rank 用自己的 K 分片算通道 scale。这在数值上成立：每个 rank 先把
+自己的部分积反量化成 BF16 再参与 reduce，而 W4A8 NN 那种"第二级 scale 依赖
+INT8 amax 恰为 127"的约束在 W8A8 上不存在。离线 checkpoint 的
+`weight_scale` 不随 K 切分，所以同一层在线得到的 scale 比离线更细，
+精度相当或略好，但**不与离线权重逐位相等**。
+
+实测对照（`GLM-5.2-FP8` → 在线 W8A8 vs 离线 `GLM-5.2-w4a8-NN` 的同名张量，
+未切分、即本 rank 持有完整 K 的情形）：INT8 权重逐元素一致率 ≥ 0.9999，
+全部差异不超过 1 LSB，通道 scale 相对误差 1.2e-07（FP32 epsilon）。
+剩余差异来自离线转换在中间值上用了 BF16，不是布局错误。
+
+`fused_qkv_a_proj` 与 `gate_up_proj` 是运行时融合模块，source block scale 由
+loader 按 128 的倍数拼接。GLM-5.2 的 `q_lora_rank=2048`、`intermediate_size`
+与 `moe_intermediate_size` 在 TP2 下的每个分片都是 128 对齐的，
+所以 `row // 128` 的 scale 映射成立；不满足时 FP8 的
+`BlockQuantScaleParameter` 会先一步报错。
 
 ## 9. 故障定位
 
@@ -765,10 +881,12 @@ FP8 分片；不支持 EPLB、预先切好 K 的 checkpoint 或源 hidden/interm
 | FP8 基础 config 与 online Linear method | [`fp8.py`](../../vllm_iluvatar/model_executor/layers/quantization/fp8.py) |
 | FP8 source layout 与 ix30 FP4 转换入口 | [`ilu_fp8_to_fp4.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_fp8_to_fp4.py) |
 | MoE 加载期 FP4 method | [`ilu_fp8_to_fp4_moe.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_fp8_to_fp4_moe.py) |
+| Linear 加载期 W8A8 INT8 method | [`ilu_fp8_to_w8a8_linear.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_fp8_to_w8a8_linear.py) |
+| GLM-5.2 `kv_b_proj` W8A16 method | [`glm_moe_dsa/model.py`](../../vllm_iluvatar/models/glm_moe_dsa/model.py) |
 | 转换算子（双 backend，在 ixformer） | `ixformer/inference/functions/fp4/gemm/fp8_block_preprocess.py` |
 | Qwen3.8-Flash-Next 示例 | [`examples/iluvatar-runtime-quant/Qwen/Qwen3.8-Flash-Next/`](../../examples/iluvatar-runtime-quant/Qwen/Qwen3.8-Flash-Next/) |
 | Qwen3.8-27B 示例（未量化 checkpoint） | [`examples/iluvatar-runtime-quant/Qwen/Qwen3.8-27B/`](../../examples/iluvatar-runtime-quant/Qwen/Qwen3.8-27B/) |
-| GLM-5.2 示例（MoE 加载期 FP4） | [`examples/iluvatar-runtime-quant/ZhipuAI/GLM-5.2/`](../../examples/iluvatar-runtime-quant/ZhipuAI/GLM-5.2/) |
+| GLM-5.2 示例（MoE 加载期 FP4、完整 W4A8 NN 布局） | [`examples/iluvatar-runtime-quant/ZhipuAI/GLM-5.2/`](../../examples/iluvatar-runtime-quant/ZhipuAI/GLM-5.2/) |
 | 派生目录生成器（模式 A） | [`qwen38_flash_next_fp8_online.py`](../../examples/iluvatar-compressed-tensors/qwen38_flash_next_fp8_online.py) |
 
 ### 10.2 步骤速览

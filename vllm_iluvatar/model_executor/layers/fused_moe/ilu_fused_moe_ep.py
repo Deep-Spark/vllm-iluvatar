@@ -55,7 +55,8 @@ from vllm_iluvatar.model_executor.layers.fused_moe.prepare_finalize.ilu_deepep_l
 
 logger = init_logger(__name__)
 
-_DS4_DECODE_EP_BACKEND = envs.VLLM_ILU_DECODE_EP_BACKEND
+# Named for DS4 originally; the override now also serves GLM-5.2 (``naive``).
+_DECODE_EP_BACKEND = envs.VLLM_ILU_DECODE_EP_BACKEND
 _USE_FUSED_MOE = envs.VLLM_ILU_MOE_EP_LL_MOE_ALGO == "FUSED"
 _MAX_NUM_SEQS: int | None = None
 
@@ -135,6 +136,7 @@ class IluFusedMoEEP:
     _dp_ep_ll_preinit_shapes: set[tuple[int | None, int | None]] = set()
 
     def init_ep(self):
+        self._validate_decode_ep_backend()
         if not self._should_preinit_dp_ep_ll_handle():
             return
         runner = self.experts
@@ -173,7 +175,7 @@ class IluFusedMoEEP:
                 "Initialized Hybrid EP low-latency decode backend "
                 "(configured_backend=%s, decode_override=%s).",
                 runner.moe_config.moe_parallel_config.all2all_backend,
-                _DS4_DECODE_EP_BACKEND,
+                _DECODE_EP_BACKEND,
             )
 
         routed_experts._ensure_moe_quant_config_init = MethodType(
@@ -207,11 +209,32 @@ class IluFusedMoEEP:
             )
             and (
                 all2all_backend in ("deepep_low_latency", "deepep_high_throughput")
-                or _DS4_DECODE_EP_BACKEND == "deepep_low_latency"
+                or _DECODE_EP_BACKEND == "deepep_low_latency"
                 or not self.experts._quant_method.supports_internal_mk
             )
             and not self.experts._quant_method.is_monolithic
         )
+
+    def _validate_decode_ep_backend(self) -> None:
+        if _DECODE_EP_BACKEND is None:
+            return
+        if not self._should_use_forward_dp_ep():
+            raise ValueError(
+                "VLLM_ILU_DECODE_EP_BACKEND requires a supported DP+EP layer."
+            )
+        backend = self.experts.moe_config.moe_parallel_config.all2all_backend
+        if _DECODE_EP_BACKEND == "naive" and backend not in (
+            "allgather_reducescatter",
+            "ag-rs",
+            "ag_rs",
+        ):
+            raise ValueError(
+                "VLLM_ILU_DECODE_EP_BACKEND=naive requires an AG-RS "
+                f"all2all_backend; got {backend!r}."
+            )
+
+    def _use_decode_ep_override(self) -> bool:
+        return _DECODE_EP_BACKEND is not None and self._is_all_ranks_decode_only()
 
     def _is_all_ranks_decode_only(self) -> bool:
         ctx = get_forward_context()
@@ -232,7 +255,7 @@ class IluFusedMoEEP:
             return False
         configured_backend = moe_config.moe_parallel_config.all2all_backend
         return (
-            _DS4_DECODE_EP_BACKEND == "deepep_low_latency"
+            _DECODE_EP_BACKEND == "deepep_low_latency"
             and configured_backend != "deepep_low_latency"
             and self._should_use_forward_dp_ep()
         )
@@ -409,22 +432,19 @@ class IluFusedMoEEP:
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None = None,
-        shared_gate_up_input: tuple[torch.Tensor, torch.Tensor, torch.dtype]
-        | None = None,
+        shared_gate_up_input: (
+            tuple[torch.Tensor, torch.Tensor, torch.dtype] | None
+        ) = None,
     ) -> torch.Tensor:
         all2all_backend = self.experts.moe_config.moe_parallel_config.all2all_backend
-        all_ranks_decode_only = self._is_all_ranks_decode_only()
-
-        if _DS4_DECODE_EP_BACKEND is not None and all_ranks_decode_only:
-            if _DS4_DECODE_EP_BACKEND == "deepep_low_latency":
-                return self.forward_dp_ep_deep_ep(
-                    hidden_states,
-                    input_ids,
-                    shared_gate_up_input=shared_gate_up_input,
-                )
-            raise ValueError(
-                f"Invalid VLLM_ILU_DECODE_EP_BACKEND: {_DS4_DECODE_EP_BACKEND!r}, "
-                f"allowed value is 'deepep_low_latency'."
+        if self._use_decode_ep_override():
+            forward = (
+                self.forward_dp_ep_naive
+                if _DECODE_EP_BACKEND == "naive"
+                else self.forward_dp_ep_deep_ep
+            )
+            return forward(
+                hidden_states, input_ids, shared_gate_up_input=shared_gate_up_input
             )
 
         if all2all_backend == "deepep_low_latency":
@@ -481,8 +501,9 @@ class IluFusedMoEEP:
         input_ids: torch.Tensor | None = None,
         enable_fused_ag_ar: bool = True,
         moe_kernel=None,
-        shared_gate_up_input: tuple[torch.Tensor, torch.Tensor, torch.dtype]
-        | None = None,
+        shared_gate_up_input: (
+            tuple[torch.Tensor, torch.Tensor, torch.dtype] | None
+        ) = None,
     ) -> torch.Tensor:
         org_shape = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, org_shape[-1])
@@ -575,8 +596,9 @@ class IluFusedMoEEP:
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None = None,
-        shared_gate_up_input: tuple[torch.Tensor, torch.Tensor, torch.dtype]
-        | None = None,
+        shared_gate_up_input: (
+            tuple[torch.Tensor, torch.Tensor, torch.dtype] | None
+        ) = None,
     ) -> torch.Tensor:
         org_shape = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, org_shape[-1])
@@ -771,8 +793,9 @@ class IluFusedMoEEP:
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
-        shared_gate_up_input: tuple[torch.Tensor, torch.Tensor, torch.dtype]
-        | None = None,
+        shared_gate_up_input: (
+            tuple[torch.Tensor, torch.Tensor, torch.dtype] | None
+        ) = None,
         pre_xform_trunc_size: int = None,
         enable_fused_ag_ar: bool = True,
         moe_kernel=None,

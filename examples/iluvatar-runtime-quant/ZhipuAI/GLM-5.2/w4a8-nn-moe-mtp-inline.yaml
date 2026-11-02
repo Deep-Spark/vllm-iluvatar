@@ -1,0 +1,158 @@
+# ZhipuAI/GLM-5.2-FP8 -> the offline GLM-5.2-w4a8-NN runtime layout, at load
+# time, without writing a converted checkpoint.
+#
+# Reproduces every config group of the offline checkpoint: routed experts to
+# W4A8 NN, the dense / attention / shared-expert Linears to per-channel W8A8,
+# and kv_b_proj to W8A16 grouped marlin. Converting all three matters for
+# performance, not just footprint: the decoder's fused RMSNorm+INT8 path and
+# the q_a norm+quant fusion arm themselves only when their consumers are W8A8,
+# and kv_b_proj's absorbed up-proj falls back to grouped FP8 einsums while it
+# is not W8A16.
+#
+# The checkpoint already declares quant_method=fp8, so do not pass
+# --quantization. NN and TN are separate deployment choices: this file only
+# selects NN and never infers or falls back to a TN method.
+#
+# MTP on. Identical to w4a8-nn-moe-inline.yaml plus the eh_proj group, which
+# only exists on the MTP layer: a declared target that matches no layer is a
+# hard error, so the two deployments need separate files. The draft shares the
+# target's quant config, so the backbone groups cover its layers too.
+#
+#   vllm serve /path/to/GLM-5.2-FP8 \
+#     --config examples/iluvatar-runtime-quant/ZhipuAI/GLM-5.2/w4a8-nn-moe-mtp-inline.yaml \
+#     --speculative-config '{"method":"glm_moe_dsa_mtp","num_speculative_tokens":1}' \
+#     --tensor-parallel-size 2 --data-parallel-size 8 \
+#     --enable-expert-parallel --trust-remote-code
+additional-config:
+  ilu_quant:
+    source: inline
+    schema_version: 1
+    enabled: true
+    applies_to:
+      model_types: [glm_moe_dsa]
+      quant_methods: [fp8]
+    ignore: []
+    config_groups:
+      # Routed experts: block-FP8 -> packed INT4 in the ixmm NN layout.
+      glm52_moe_fp8_to_w4a8_nn:
+        priority: 100
+        targets:
+          - 're:.*\.mlp\.experts$'
+        require:
+          original_disposition: quantized
+          checkpoint_dtypes: [float8_e4m3fn]
+        weights:
+          source:
+            format: fp8-block
+            dtypes: [float8_e4m3fn]
+            block_shape: [128, 128]
+          target:
+            format: int4-packed-nn
+            dtype: int8
+            strategy: channel
+            pack_version: 1
+          loading:
+            mode: transform
+            stage: weight_load
+        input_activations:
+          num_bits: 8
+          type: int
+          strategy: token
+          dynamic: true
+        output_activations: null
+        iluvatar:
+          method: IluFp8ToW4A8NNMoEMethod
+          max_pending_shards: 8
+      # Absorbed MLA up-proj: block-FP8 -> per-channel INT8, split into
+      # W_UK/W_UV and Marlin-repacked. Activations stay BF16, hence W8A16 and
+      # null input_activations.
+      glm52_kv_b_fp8_to_w8a16:
+        priority: 95
+        targets:
+          - 're:.*\.self_attn\.kv_b_proj$'
+        require:
+          original_disposition: quantized
+          checkpoint_dtypes: [float8_e4m3fn]
+        weights:
+          source:
+            format: fp8-block
+            dtypes: [float8_e4m3fn]
+            block_shape: [128, 128]
+          target:
+            format: int8-channel-marlin
+            dtype: int8
+            strategy: channel
+          loading:
+            mode: transform
+            stage: process_weights_after_loading
+        input_activations: null
+        output_activations: null
+        iluvatar:
+          method: IluFp8ToGlmKVBProjW8A16Method
+      # Dense Linears and shared experts: block-FP8 -> per-channel INT8.
+      # fused_qkv_a_proj is the runtime module; the checkpoint's q_a_proj and
+      # kv_a_proj_with_mqa are merged into it by the loader.
+      glm52_linear_fp8_to_w8a8:
+        priority: 90
+        targets:
+          - 're:.*\.self_attn\.(fused_qkv_a_proj|q_b_proj|o_proj)$'
+          - 're:.*\.self_attn\.indexer\.wq_b$'
+          - 're:.*\.mlp\.(gate_up_proj|down_proj)$'
+          - 're:.*\.mlp\.shared_experts\.(gate_up_proj|down_proj)$'
+        require:
+          original_disposition: quantized
+          checkpoint_dtypes: [float8_e4m3fn]
+        weights:
+          source:
+            format: fp8-block
+            dtypes: [float8_e4m3fn]
+            block_shape: [128, 128]
+          target:
+            format: int8-channel
+            dtype: int8
+            strategy: channel
+          loading:
+            mode: transform
+            stage: process_weights_after_loading
+        input_activations:
+          num_bits: 8
+          type: int
+          strategy: token
+          dynamic: true
+        output_activations: null
+        iluvatar:
+          method: IluFp8ToW8A8Int8LinearMethod
+          gemm_format: TN
+          mixed_strategy: CHANNEL
+          gemm_mode: PERF
+      # MTP eh_proj: the only candidate the FP8 conversion left BF16, so it
+      # takes the native source contract and the ignored disposition.
+      glm52_eh_proj_native_to_w8a8:
+        priority: 85
+        targets:
+          - 're:.*\.eh_proj$'
+        require:
+          original_disposition: ignored
+          checkpoint_dtypes: [bfloat16]
+        weights:
+          source:
+            format: native
+            dtypes: [bfloat16]
+          target:
+            format: int8-channel
+            dtype: int8
+            strategy: channel
+          loading:
+            mode: transform
+            stage: process_weights_after_loading
+        input_activations:
+          num_bits: 8
+          type: int
+          strategy: token
+          dynamic: true
+        output_activations: null
+        iluvatar:
+          method: IluNativeToW8A8Int8LinearMethod
+          gemm_format: TN
+          mixed_strategy: CHANNEL
+          gemm_mode: PERF

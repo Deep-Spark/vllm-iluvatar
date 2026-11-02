@@ -826,11 +826,11 @@ def _shrink_ll_max_tokens_to_decode(
     the prefill bound costs GiBs of workspace and output per captured graph.
     """
     from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
-        _DS4_DECODE_EP_BACKEND,
+        _DECODE_EP_BACKEND,
         _decode_ll_max_tokens_per_rank,
     )
 
-    if _DS4_DECODE_EP_BACKEND != "deepep_low_latency":
+    if _DECODE_EP_BACKEND != "deepep_low_latency":
         return
 
     current = getattr(prepare_finalize, "max_tokens_per_rank", None)
@@ -1231,9 +1231,7 @@ class IluFp8Config(Fp8Config):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return True
-            if any(
-                candidate.startswith(f"{name}.") for name in self.ignored_layers
-            ):
+            if any(candidate.startswith(f"{name}.") for name in self.ignored_layers):
                 return True
         return False
 

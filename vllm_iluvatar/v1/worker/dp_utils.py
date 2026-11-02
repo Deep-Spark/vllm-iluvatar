@@ -48,7 +48,7 @@ def get_last_all_ranks_decode_only() -> bool:
 
 
 def set_last_all_ranks_decode_only(value: bool) -> None:
-    # [ILU addition] Publishing hook for non-V1 DP coordinators.
+    """Publish the decode phase agreed by any V1 or external DP coordinator."""
     global _ILU_LAST_ALL_RANKS_DECODE_ONLY
     _ILU_LAST_ALL_RANKS_DECODE_ONLY = bool(value)
 

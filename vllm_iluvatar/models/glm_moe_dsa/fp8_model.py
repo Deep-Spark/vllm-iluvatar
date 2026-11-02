@@ -14,12 +14,20 @@ checkpoint's tensor set differs from the converted W4A8 one:
    would cost a kernel launch per layer in the indexer hot path.
 
 2. ``kv_b_proj`` has no ``mla_bmm_w8a16`` entry to route it to the W4A8
-   grouped-Marlin method, so the absorbed up-proj is rebuilt as BF16 -- see
-   :mod:`.fp8_attention`.
+   grouped-Marlin method, so the absorbed up-proj is rebuilt from the FP8
+   weight -- see :mod:`.fp8_attention`.
 
 Everything else the FP8 checkpoint needs is already handled by
 ``IluFp8Config``: dense linears requantise 128x128 block scale to per-channel
 FP8 at load time, and MoE experts convert to ix30 FP4.
+
+With ``additional_config.ilu_quant`` (guide 8 §8.6) the checkpoint instead
+loads into the offline W4A8 NN layout: routed experts become W4A8 NN, the dense
+and shared-expert Linears become per-channel W8A8, and ``kv_b_proj`` becomes
+W8A16. Both deltas above then disappear -- ``fp8_attention`` hands
+``kv_b_proj`` back to the base grouped-Marlin path, and the decoder re-arms the
+fused RMSNorm+INT8 path below. Nothing here infers that conversion from the
+checkpoint; it happens only when a group explicitly selects it.
 
 Registered under the community arch name ``GlmMoeDsaForCausalLM``, which
 overrides vLLM's own (NV-kernel) implementation.
@@ -116,16 +124,80 @@ def dequant_indexer_wk(
     logger.info("[GLM-5.2 FP8] dequantised %d indexer.wk weights to BF16", n_folded)
 
 
+def _consumer_quant_method(module: object) -> object:
+    """The quant method that will actually consume ``module``'s input.
+
+    ``FusedMoEFactory`` hands back a ``MoERunner``, which keeps the method on
+    the nested ``RoutedExperts`` and exposes it only as the private
+    ``_quant_method``. Reading ``quant_method`` off the runner silently yields
+    ``None``, which would disarm the fusion for every MoE layer, so resolve
+    through ``routed_experts`` first and refuse to guess when neither holds a
+    method.
+    """
+    routed = getattr(module, "routed_experts", None)
+    holder = module if routed is None else routed
+    method = getattr(holder, "quant_method", None)
+    if method is None:
+        raise RuntimeError(
+            f"{type(module).__name__} exposes no quant_method "
+            f"(resolved through {type(holder).__name__}); cannot tell whether "
+            "it can unpack the fused RMSNorm+INT8 triple"
+        )
+    return method
+
+
+def _consumes_int8_tuple(module: object) -> bool:
+    """True when ``module`` can unpack the fused ``(q, scales, ...)`` triple."""
+    from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes import (  # noqa: E501
+        IluCompressedTensorsW8A8Int8,
+    )
+    from vllm_iluvatar.model_executor.layers.quantization.ilu_w4a8_nn import (
+        IluW4A8NNMoEMethod,
+    )
+
+    if isinstance(getattr(module, "scheme", None), IluCompressedTensorsW8A8Int8):
+        return True
+    # Routed experts carry no ``scheme``; W4A8 NN is the method that unpacks.
+    return isinstance(_consumer_quant_method(module), IluW4A8NNMoEMethod)
+
+
 class IluGlmMoeDsaFp8DecoderLayer(IluGlmMoeDsaDecoderLayer):
     mla_attention_cls = IluGlmMoeDsaFp8MLAAttention
 
-    # The W4A8 layer fuses each RMSNorm with an INT8 quant and hands the
-    # ``(q, scales, ...)`` triple straight to the next GEMM. None of the FP8
-    # consumers can unpack that -- ``BlockScaledMMLinearKernel.apply_weights``
-    # calls ``x.view()`` on it -- so the fusion is off and every layer takes
-    # the plain-BF16 path. Re-fusing RMSNorm with *FP8* quant is D3 in the
-    # plan: a performance item for stage E, not needed to run.
-    fuse_norm_quant = False
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # The W4A8 layer fuses each RMSNorm with an INT8 quant and hands the
+        # ``(q, scales, ...)`` triple straight to the next GEMM. Plain FP8
+        # consumers cannot unpack it -- ``BlockScaledMMLinearKernel.apply_weights``
+        # calls ``x.view()`` on it -- so on an unconverted FP8 checkpoint both
+        # norms take the split path. ``additional_config.ilu_quant`` can convert
+        # every consumer to the offline checkpoint's W8A8 / W4A8 NN methods, and
+        # only then is the inherited contract safe. Decide per layer, since the
+        # dense and MoE layers feed different consumers.
+        consumers = {"fused_qkv_a_proj": self.self_attn.fused_qkv_a_proj}
+        if self.is_moe_layer:
+            consumers["experts"] = self.mlp.experts
+            if self.mlp.shared_experts is not None:
+                consumers["shared_experts.gate_up_proj"] = (
+                    self.mlp.shared_experts.gate_up_proj
+                )
+        else:
+            consumers["gate_up_proj"] = self.mlp.gate_up_proj
+        split = [name for name, m in consumers.items() if not _consumes_int8_tuple(m)]
+        self.fuse_norm_quant = not split
+        if self.fuse_norm_quant:
+            logger.info_once(
+                "GLM-5.2 FP8: runtime quant converted every RMSNorm consumer; "
+                "enabling the fused RMSNorm+INT8 path"
+            )
+        else:
+            # Silence here is expensive: an unconverted consumer costs the
+            # fused kernel on both norms of every layer it appears in.
+            logger.info_once(
+                "GLM-5.2 FP8: taking the split RMSNorm path; these consumers "
+                "cannot unpack the INT8 triple: %s",
+                ", ".join(split),
+            )
 
 
 class IluGlmMoeDsaFp8Model(IluGlmMoeDsaModel):

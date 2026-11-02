@@ -137,7 +137,13 @@ class DeepEPAll2AllManagerBase(All2AllManagerBase):
     """
 
     def __init__(self, cpu_group, tcp_store_group=None):
-        assert has_deep_ep(), (
+        # ``DISABLE_DEEPEP`` routes the low-latency path through ixformer NVSM
+        # instead (``BufferWrapper`` + ``nvsm_low_latency_dispatch/combine``),
+        # so the DeepEP kernels are genuinely not needed there and this platform
+        # ships no ``deep_ep`` package at all. The high-throughput manager has no
+        # such path: it still imports ``deep_ep`` in ``get_handle`` and fails
+        # there if the package really is missing.
+        assert DISABLE_DEEPEP or has_deep_ep(), (
             "DeepEP kernels not found. Please follow https://github.com/vllm-project/vllm/blob/main/tools/ep_kernels/README.md"
             " to install DeepEP kernels."
         )  # noqa
@@ -385,19 +391,26 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
         num_global_experts: Number of experts in the model.
         num_local_experts: Number of experts in an EP rank.
         """
-        import deep_ep  # type: ignore[import-not-found]
-
         # Defaults for internode and intranode are taken from DeepEP tests.
         num_nvl_bytes = envs.VLLM_DEEPEP_BUFFER_SIZE_MB * 1024 * 1024
         num_qps_per_rank = num_local_experts
-        num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(
-            num_max_dispatch_tokens_per_rank=max_num_tokens_per_dp_rank,
-            hidden=token_hidden_size,
-            num_ranks=num_ep_ranks,
-            num_experts=num_global_experts,
-        )
+        if DISABLE_DEEPEP:
+            # ``get_handle`` hands these to ``BufferWrapper``, which only records
+            # them -- the real buffer comes from ``nvsm_init_ep_comm``. Sizing an
+            # RDMA region we never allocate would need the ``deep_ep`` package
+            # this path exists to avoid.
+            num_rdma_bytes = 0
+        else:
+            import deep_ep  # type: ignore[import-not-found]
 
-        assert num_rdma_bytes is not None
+            num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(
+                num_max_dispatch_tokens_per_rank=max_num_tokens_per_dp_rank,
+                hidden=token_hidden_size,
+                num_ranks=num_ep_ranks,
+                num_experts=num_global_experts,
+            )
+
+            assert num_rdma_bytes is not None
         # TODO: remove platform-specific logic
         # once ROCm DeepEP is updated with the latest APIs.
         kwargs = dict(
@@ -417,13 +430,15 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
         The kwargs for DeepEPLLAll2AllManager is dictated by
         _make_all2all_kwargs.
         """
-        import deep_ep  # type: ignore[import-not-found]
-
         buffer_kwargs = self._make_all2all_kwargs(**kwargs)
         logger.debug("DeepEP all2all args %s", buffer_kwargs)
-        handle: deep_ep.Buffer = self.handle_cache.get_or_create(
-            buffer_kwargs, deep_ep.Buffer if not DISABLE_DEEPEP else BufferWrapper
-        )
+        if DISABLE_DEEPEP:
+            buffer_cls = BufferWrapper
+        else:
+            import deep_ep  # type: ignore[import-not-found]
+
+            buffer_cls = deep_ep.Buffer
+        handle = self.handle_cache.get_or_create(buffer_kwargs, buffer_cls)
         return handle
 
     # DeepEP LL uses RDMA so no SMs are used for communication

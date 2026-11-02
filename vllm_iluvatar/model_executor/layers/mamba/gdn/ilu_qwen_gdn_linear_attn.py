@@ -10,9 +10,11 @@ How      : Official OOT hooks keep community source untouched:
            ``ChunkGatedDeltaRule.register_oot`` owns the chunk op and
            ``QwenGatedDeltaNetAttention.register_oot`` narrows the attention delta to
            CoreX kernel preparation/dispatch.
-Scope    : Shared Iluvatar GDN metadata/OOT for Qwen3-Next / Qwen3.5. The CoreX30
-           ixformer CUDA math is opt-in per layer via ``use_qwen38_ixformer`` and is
-           only set by the Qwen4Exp model package.
+Scope    : Shared Iluvatar GDN metadata/OOT for Qwen3-Next / Qwen3.5 / Qwen3.8.
+           On CoreX30, ``_qwen38_kernel()`` returns ``ixformer`` and
+           ``_forward_core`` dispatches to ``_forward_core_ixformer`` (the
+           community ``Falling back to the Triton GDN decode path`` log is
+           parent ``__init__`` only and is not the hot path).
 """
 
 from __future__ import annotations
@@ -516,10 +518,10 @@ class IluQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             )
         conv_state = conv_cache
         ssm_cache = self.kv_cache[1]
-        if ssm_cache.dtype != torch.float32:
+        if ssm_cache.dtype not in (torch.float32, torch.bfloat16, torch.float16):
             raise RuntimeError(
-                "Qwen GDN ixformer kernel needs fp32 SSM cache "
-                f"(got {ssm_cache.dtype}). Pass --mamba-ssm-cache-dtype float32."
+                "Qwen GDN ixformer kernel needs a float32/bfloat16/float16 SSM "
+                f"cache (got {ssm_cache.dtype}). Set --mamba-ssm-cache-dtype."
             )
         # Packed pages are strided on dim0; the CUDA op accepts that stride.
         ssm_state = ssm_cache

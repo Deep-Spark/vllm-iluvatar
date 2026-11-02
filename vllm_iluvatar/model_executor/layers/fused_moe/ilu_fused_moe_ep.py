@@ -58,6 +58,7 @@ logger = init_logger(__name__)
 # Named for DS4 originally; the override now also serves GLM-5.2 (``naive``).
 _DECODE_EP_BACKEND = envs.VLLM_ILU_DECODE_EP_BACKEND
 _USE_FUSED_MOE = envs.VLLM_ILU_MOE_EP_LL_MOE_ALGO == "FUSED"
+_USE_EP_RS_TP_AG = envs.VLLM_ILU_MOE_EP_RS_TP_AG
 _MAX_NUM_SEQS: int | None = None
 
 
@@ -612,12 +613,47 @@ class IluFusedMoEEP:
         all-reduces that slice across TP. ``VLLM_ILU_FUSE_EP_COMBINE`` folds
         those two collectives into one EP all-reduce. Sequence parallel keeps
         the reduce-scatter: its ``dist_group`` is already the EP group.
+        ``VLLM_ILU_MOE_EP_RS_TP_AG`` uses EP reduce-scatter + TP all-gather
+        for equal DP chunks with 18–162 local tokens.
         """
         rank = dist_group.rank_in_group
         start = sum(sizes[:rank])
         stop = start + sizes[rank]
         if shared_output is not None:
             fused_output[start:stop] += shared_output
+        tp_group = get_tp_group()
+        local_tokens = sizes[rank]
+        use_rs_ag = (
+            _USE_EP_RS_TP_AG
+            and not sequence_parallel
+            and tp_group.world_size > 1
+            and 18 <= local_tokens <= 162
+            and local_tokens % tp_group.world_size == 0
+            and all(size == local_tokens for size in sizes)
+            and get_ep_group().world_size == len(sizes) * tp_group.world_size
+        )
+        if use_rs_ag:
+            logger.info_once(
+                "MoE EP reduce-scatter + TP all-gather: local_tokens=%d",
+                local_tokens,
+            )
+            ep_comm = get_ep_group().device_communicator
+            assert ep_comm is not None and ep_comm.ixfd_group is not None
+            tp_comm = tp_group.device_communicator
+            assert tp_comm is not None and tp_comm.ixfd_group is not None
+            shard = fused_output.new_empty(
+                (local_tokens // tp_group.world_size, *fused_output.shape[1:])
+            )
+            ixfd.reduce_scatter_tensor(
+                shard, fused_output, group=ep_comm.ixfd_group, async_op=True
+            )
+            gathered = fused_output.new_empty(
+                (local_tokens, *fused_output.shape[1:])
+            )
+            ixfd.all_gather_into_tensor(
+                gathered, shard, group=tp_comm.ixfd_group, async_op=True
+            )
+            return gathered
         fuse = (not sequence_parallel) and envs.VLLM_ILU_FUSE_EP_COMBINE
         if fuse:
             ep_comm = get_ep_group().device_communicator

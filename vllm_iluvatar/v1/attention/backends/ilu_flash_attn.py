@@ -129,21 +129,15 @@ class IluFlashAttentionBackend(AttentionBackend):
     def get_supported_kernel_block_sizes(
         kv_cache_spec: "KVCacheSpec | None" = None,
     ) -> list[int | MultipleOf]:
-        # Int8 paged FMHA (cuinferFmhaFwdInt8QUnpadKVPageFuncV3) only accepts
-        # power-of-2 page sizes. A previous MultipleOf(16) / range(16,257,16)
-        # list let hybrid models (attn block_size aligned to mamba, e.g. 2112)
-        # pick non-PoT kernel pages (192/...) and hit CUINFER_STATUS_BAD_PARAM.
-        #
-        # Non-int8 (bf16/fp16/fp8 KV) matches community FlashAttention:
-        # MultipleOf(16). That lets hybrid manager block_size (e.g. 784 for
-        # Qwen3.8 GDN+FA) be used as the kernel page instead of splitting into
-        # 784/16=49 virtual pages — long-ctx decode TPOT is highly sensitive
-        # to page-table length.
+        # cuinferFmhaFwdFunc (and the int8 page variant) reject a kernel page
+        # outside 16..256 or not a multiple of 16 (CUINFER_STATUS_BAD_PARAM).
+        # Hybrid alignment may raise the *manager* block above that (Qwen3-Next
+        # GDN page match, e.g. 576). MultipleOf(16) would then adopt 576 as the
+        # kernel page and flash_attn_unpad_with_kvcache fails the check.
+        # select_common_block_size keeps the manager block and picks the
+        # largest divisor in this list (576 -> 64).
         del kv_cache_spec  # select_common_block_size does not pass the spec.
-        quant = envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE
-        if quant in ("KINT8", "KVINT8"):
-            return [16, 32, 64, 128, 256]
-        return [MultipleOf(16)]
+        return [16, 32, 64, 128, 256]
 
     forward_includes_kv_cache_update: bool = True
 

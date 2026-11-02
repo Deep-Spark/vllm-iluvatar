@@ -92,6 +92,15 @@ def _mqa_logits(*args, **kwargs):
         return ixfops.dsa_indexer_mqa_logits_with_kvcache(*args, **kwargs)
     if kv_cache.dtype == torch.uint8:
         # The IxFormer facade registry owns FP8 backend selection.
+        # ixinfer supports only 64/256-row pages. Ratio1's 128 rows use native.
+        kwargs.setdefault(
+            "backend",
+            os.environ.get("VLLM_ILU_V41_FP8_INDEXER_BACKEND", "ixformer_native"),
+        )
+        if owned_logits is not None:
+            kwargs["logits"] = owned_logits
+        if previous_extent is not None:
+            kwargs["previous_extent"] = previous_extent
         return ixfops.dsa_indexer_mqa_logits_with_kvcache_fp8(*args, **kwargs)
     if envs.VLLM_ILU_GLM_DSA_NATIVE_MQA_LOGITS:
         kwargs.setdefault("backend", "ixformer_native")
@@ -200,6 +209,10 @@ def _indexer_logits_and_topk(
             max_context_len=max_context_len,
             valid_lens=valid_lens,
             logits=logits,
+            backend=os.environ.get(
+                "VLLM_ILU_V41_FP8_INDEXER_BACKEND", "ixformer_native"
+            ),
+            previous_extent=previous_extent,
         )
         return
 
@@ -449,7 +462,7 @@ def ilu_sparse_attn_indexer(
         use_owned = (
             not has_prefill
             and not decode_metadata.requires_padding
-            and q.dtype == torch.int8
+            and q.dtype in (torch.int8, torch.float8_e4m3fn)
             and q.shape[1:] == (32, 128)
             and num_decode_tokens in (6, 12, 18, 24)
             and decode_metadata.max_q_len == 6

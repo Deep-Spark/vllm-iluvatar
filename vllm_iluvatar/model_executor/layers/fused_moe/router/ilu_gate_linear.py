@@ -91,9 +91,6 @@ class IluGateLinear(GateLinear):
         if self.out_dtype is not None and x.dtype != self.weight.dtype:
             x = x.to(self.weight.dtype)
 
-        # [ILU override] GateLinear.forward — delta: ixformer bf16×bf16→fp32
-        # GEMM for mixed-precision router logits (replaces community Tier 3
-        # cuBLAS path on NVIDIA).
         if (
             self.out_dtype is not None
             and self.out_dtype == torch.float32
@@ -102,7 +99,10 @@ class IluGateLinear(GateLinear):
         ):
             import ixformer.inference.functions as ixfops
 
-            output = ixfops.gemm_bf16_bf16_fp32(x, self.weight, format="TN")
+            if hasattr(ixfops, "router_gate_gemm"):
+                output = ixfops.router_gate_gemm(x, self.weight)
+            else:
+                output = ixfops.gemm_bf16_bf16_fp32(x, self.weight, format="TN")
             output_bias = self.bias if self.skip_bias_add else None
             return output, output_bias
 

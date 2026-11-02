@@ -293,6 +293,27 @@ class IluDSparkDeepseekV4Fp8ForCausalLM(nn.Module):
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.compute_logits(hidden_states)
 
+    def _compute_local_logits(
+        self, lm_head, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        """TP-local logits: skip TP gather, just apply head + optional scale."""
+        logits = self.logits_processor._apply_head(lm_head, hidden_states, None)
+        if self.logits_processor.soft_cap is not None:
+            soft_cap = self.logits_processor.soft_cap
+            logits = torch.tanh(logits / soft_cap) * soft_cap
+        if self.logits_processor.scale != 1.0:
+            logits = logits * self.logits_processor.scale
+        return logits
+
+    def compute_draft_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Compute TP-local draft logits (skip TP all-gather)."""
+        hidden_states = self.model.norm(hidden_states)
+        return self._compute_local_logits(self.lm_head, hidden_states)
+
+    def get_draft_vocab_shard(self) -> tuple[int, int]:
+        indices = self.lm_head.shard_indices
+        return indices.org_vocab_start_index, indices.num_org_vocab_padding
+
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids
 
@@ -301,6 +322,26 @@ class IluDSparkDeepseekV4Fp8ForCausalLM(nn.Module):
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
+
+    def markov_bias_local(self, markov_embed: torch.Tensor) -> torch.Tensor:
+        """TP-local Markov bias: only compute rows for this LM-head shard."""
+        import torch.nn.functional as F
+
+        markov_w2 = self.model.markov_head.markov_w2
+        local_vocab_size = self.lm_head.num_embeddings_per_partition
+
+        if markov_w2.weight.shape[0] == local_vocab_size:
+            return self._compute_local_logits(markov_w2, markov_embed)
+
+        indices = self.lm_head.shard_indices
+        weight = markov_w2.weight[
+            indices.org_vocab_start_index
+            : indices.org_vocab_start_index + local_vocab_size
+        ]
+        logits = F.linear(markov_embed, weight)
+        if self.logits_processor.scale != 1.0:
+            logits = logits * self.logits_processor.scale
+        return logits
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.attn.swa_cache_layer.prefix for layer in self.model.layers]

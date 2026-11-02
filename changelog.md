@@ -61,6 +61,9 @@
   Triton 语法。
 - DeepSeek-V4 Flash FP8 sparse MLA 使用 ixformer a64 gather，修复单层 KV
   cache 跨距超过 4 GiB 时的 32 位 per-lane 地址截断。
+- `VLLM_ILU_DISABLE_DEEPEP=1` 时低延迟 all2all 不再要求安装 `deep_ep`：
+  基类断言放行，RDMA size hint 跳过，`deep_ep` 仅在构造真实 Buffer 时
+  导入。high-throughput 路径仍依赖该包。
 
 ## [0.26.0] - 2026-08-27
 

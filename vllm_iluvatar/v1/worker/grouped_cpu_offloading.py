@@ -139,6 +139,7 @@ class GroupCPUOffloadingManager(OffloadingManager):
         return groups
 
     def on_new_request(self, req_context):
+        req_context.set_state(_GroupRequestState(self))
         return RequestOffloadingContext()
 
     def lookup(self, key, req_context):
@@ -151,6 +152,13 @@ class GroupCPUOffloadingManager(OffloadingManager):
     def prepare_load(self, keys, req_context):
         keys = list(keys)
         grouped = self._group_keys(keys)
+        # Validate the entire transaction before a child manager increments
+        # any references. A failed child load can otherwise pin its prefix.
+        for gid, group_keys in grouped.items():
+            child = self._context(req_context, gid)
+            if any(self.managers[gid].lookup(key, child) is not LookupResult.HIT
+                   for key in group_keys):
+                raise ValueError("CPU load keys must all be ready")
         prepared, locations = [], {}
         try:
             for gid, group_keys in grouped.items():

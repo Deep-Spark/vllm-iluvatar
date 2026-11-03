@@ -68,6 +68,33 @@ def test_invalid_or_insufficient_group_budget_fails(rows, tokens, budget):
         plan_cpu_groups([NS(group_id=3, tokens_per_block=tokens)], rows, 1, budget)
 
 
+def test_finished_context_can_start_a_new_request_lifetime():
+    manager = GroupCPUOffloadingManager(two_groups())
+    ctx = ReqContext("reused")
+    manager.on_new_request(ctx)
+    output = manager.prepare_store([key(1, 3)], ctx)
+    manager.complete_store(output.keys_to_store, ctx)
+    manager.on_request_finished(ctx)
+    manager.on_new_request(ctx)
+    output = manager.prepare_store([key(2, 3)], ctx)
+    assert output is not None and output.keys_to_store == [key(2, 3)]
+    manager.complete_store(output.keys_to_store, ctx)
+    manager.on_request_finished(ctx)
+
+
+def test_missing_key_in_same_load_group_does_not_pin_earlier_keys():
+    manager = GroupCPUOffloadingManager(two_groups())
+    ctx = ReqContext("failed-load")
+    manager.on_new_request(ctx)
+    first = key(1, 3)
+    output = manager.prepare_store([first], ctx)
+    manager.complete_store(output.keys_to_store, ctx)
+    with pytest.raises((AssertionError, ValueError)):
+        manager.prepare_load([first, key(2, 3)], ctx)
+    replacement = manager.prepare_store([key(3, 3)], ReqContext("replacement"))
+    assert replacement is not None
+
+
 def test_worker_layout_duplicates_aliases_only_for_live_groups():
     tensors = [
         CanonicalKVCacheTensor(torch.zeros(2, n, dtype=torch.int8), n)

@@ -34,7 +34,7 @@ def request(rid, total, done=0, status="WAITING", prefix="seen"):
     )
 
 
-def scheduler(running=(), waiting=(), skipped=(), cached=0):
+def scheduler(running=(), waiting=(), skipped=(), cached=0, pp=8):
     reads = []
 
     def get_computed_blocks(req):
@@ -43,7 +43,8 @@ def scheduler(running=(), waiting=(), skipped=(), cached=0):
 
     result = NS(
         vllm_config=NS(
-            kv_transfer_config=NS(is_kv_producer=True, is_kv_consumer=False)
+            kv_transfer_config=NS(is_kv_producer=True, is_kv_consumer=False),
+            parallel_config=NS(pipeline_parallel_size=pp),
         ),
         running=list(running),
         waiting=Queue(waiting),
@@ -106,13 +107,34 @@ def test_mostly_cached_multichunk_request_uses_real_residency():
     assert medium.num_computed_tokens == 0
 
 
+@pytest.mark.parametrize("pp,selected", [(1, False), (2, False), (4, False),
+                                         (8, True), (16, True)])
+def test_latency_window_tracks_pipeline_depth(pp, selected):
+    medium = request("medium", 5 * 2048, prefix="unseen")
+    sched, _ = scheduler([request("long", 1_000_000)], [medium], pp=pp)
+    plan = supply.plan(sched, 2048)
+    assert (plan is not None) is selected
+    if selected:
+        assert "medium" in plan.short_ids and plan.long_budget >= 1024
+
+
+def test_cache_alignment_tail_fits_pipeline_window():
+    medium = request("medium", 80030)
+    sched, reads = scheduler([request("long", 800000)], [medium], cached=63616)
+    supply.state(sched).seen["seen"] = None
+    plan = supply.plan(sched, 4096)
+    assert reads == ["medium"]
+    assert plan is not None and "medium" in plan.short_ids
+    assert medium.num_computed_tokens == 0
+
+
 def test_all_bounded_running_work_keeps_full_normal_budget():
     sched, _ = scheduler([request("a", 6000), request("b", 9000)])
     assert supply.plan(sched, 4096) is None
 
 
 def test_uncached_work_beyond_the_bound_is_not_promoted():
-    req = request("large", 4 * 4096 + 1, prefix="unseen")
+    req = request("large", 40000, prefix="unseen")
     sched, _ = scheduler([request("long", 800000)], [req])
     assert supply.plan(sched, 4096) is None
     assert sched.waiting == [req]
@@ -128,7 +150,7 @@ def test_single_class_uses_original_scheduler(total):
 def test_seen_hint_requires_resident_coverage(cached, selected):
     cold = request("cold", 110000, prefix="unseen")
     warm = request("warm", 100000)
-    sched, reads = scheduler([request("long", 10000)], [cold, warm], cached=cached)
+    sched, reads = scheduler([request("long", 100000)], [cold, warm], cached=cached)
     supply.state(sched).seen["seen"] = None
     plan = supply.plan(sched, 2048)
     assert (plan is not None) == selected
@@ -142,7 +164,7 @@ def test_common_prefix_does_not_exhaust_probe_budget():
     for req in cold:
         req.block_hashes = ["seen"] * 128 + ["unseen"] * 372
     warm = request("warm", 100000)
-    sched, reads = scheduler([request("long", 10000)], cold + [warm], cached=99000)
+    sched, reads = scheduler([request("long", 100000)], cold + [warm], cached=99000)
     supply.state(sched).seen["seen"] = None
     assert supply.plan(sched, 2048) is not None
     assert reads == ["warm"]
@@ -151,7 +173,7 @@ def test_common_prefix_does_not_exhaust_probe_budget():
 
 def test_remote_completion_fence_is_required():
     loaded = request("loaded", 100000, 99000, "WAITING_FOR_REMOTE_KVS")
-    sched, _ = scheduler([request("long", 10000)], skipped=[loaded])
+    sched, _ = scheduler([request("long", 100000)], skipped=[loaded])
     assert supply.plan(sched, 2048) is None
     assert loaded.status.name == "WAITING_FOR_REMOTE_KVS"
     sched.finished_recving_kv_req_ids.add("loaded")
@@ -162,7 +184,7 @@ def test_remote_completion_fence_is_required():
 
 def test_event_enabled_cache_is_not_probed():
     sched, reads = scheduler(
-        [request("long", 10000)], [request("warm", 100000)], cached=99000
+        [request("long", 100000)], [request("warm", 100000)], cached=99000
     )
     supply.state(sched).seen["seen"] = None
     sched.kv_cache_manager.enable_kv_cache_events = True
@@ -175,7 +197,7 @@ def test_event_enabled_cache_is_not_probed():
     ["no_partition", "consumer", "kv_both", "no_kv", "paused", "priority", "lora"],
 )
 def test_other_schedulers_unchanged(mode, monkeypatch):
-    sched, _ = scheduler([request("long", 10000)], [request("short", 512)])
+    sched, _ = scheduler([request("long", 100000)], [request("short", 512)])
     if mode == "no_partition":
         monkeypatch.delenv("VLLM_PP_LAYER_PARTITION")
     elif mode in ("consumer", "kv_both"):
@@ -199,7 +221,7 @@ def test_other_schedulers_unchanged(mode, monkeypatch):
 
 def test_probe_limit():
     sched, reads = scheduler(
-        [request("long", 10000)],
+        [request("long", 100000)],
         [request(str(i), 100000) for i in range(10)],
         cached=100,
     )

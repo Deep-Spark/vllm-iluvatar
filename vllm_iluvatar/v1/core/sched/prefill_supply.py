@@ -12,7 +12,7 @@ not the seen-prefix hint (the hint only bounds expensive cache probes).
 import collections
 import os
 
-_SHORT_WORK_CHUNKS = 4
+_MIN_SHORT_WORK_CHUNKS = 4
 
 
 class SupplyState:
@@ -96,7 +96,13 @@ def plan(scheduler, budget):
     ):
         return None
     st = state(scheduler)
-    short_limit = _SHORT_WORK_CHUNKS * budget
+    # A bounded request may span one pipeline-filling wave of chunk work.
+    # Preserve the existing floor for shallow pipelines.
+    short_chunks = max(
+        _MIN_SHORT_WORK_CHUNKS,
+        scheduler.vllm_config.parallel_config.pipeline_parallel_size,
+    )
+    short_limit = short_chunks * budget
     short = {
         r.request_id: remaining(r)
         for r in scheduler.running

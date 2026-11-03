@@ -58,6 +58,7 @@ from vllm_iluvatar.models.deepseek_v41.prefill_query import (
     ProducerQuerySelection,
     producer_query_compaction_enabled,
 )
+from vllm_iluvatar.models.deepseek_v41.runtime_config import configure_w8a8_input_rows
 
 logger = init_logger(f"vllm.{__name__}")
 
@@ -314,6 +315,13 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)
+
+        pad_w8a8_input_rows = configure_w8a8_input_rows(vllm_config)
+        logger.info(
+            "V4.1 W8A8 GEMM input tile padding: %s (max_num_seqs=%d)",
+            pad_w8a8_input_rows,
+            vllm_config.scheduler_config.max_num_seqs,
+        )
 
         config = vllm_config.model_config.hf_config
         self.config = config

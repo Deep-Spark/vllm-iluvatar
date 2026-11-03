@@ -15,11 +15,13 @@ from vllm_iluvatar.ilu_patch.dsv41_utils import is_ilu_dsv41_config
 logger = init_logger("vllm.ilu_pp_cpu_offloading")
 
 _GEOMETRY_ATTR = "_ilu_offload_worker_bytes_by_rank"
+_GROUP_GEOMETRY_ATTR = "_ilu_offload_group_bytes_by_rank"
 _RANK_SAFE_REQUIRED_ATTR = "_ilu_rank_safe_offload_required"
 _ORIGINAL_GET_CONFIGS = None
 _ORIGINAL_BUILD_CONFIG = None
 _ORIGINAL_SPEC_INIT = None
 _ORIGINAL_CREATE_WORKER = None
+_ORIGINAL_GET_MANAGER = None
 _ORIGINAL_REGISTER_KV = None
 _REQUIRED_ENV = "VLLM_ILU_PP_CPU_OFFLOAD_REQUIRED"
 _REVIEWED_PARTITIONS = {
@@ -85,6 +87,8 @@ def attest_required_bindings() -> None:
         "connector_builder": offloading_connector.build_offloading_config
         is _ilu_build_offloading_config,
         "spec_init": CPUOffloadingSpec.__init__ is _ilu_cpu_offloading_spec_init,
+        "spec_manager": CPUOffloadingSpec.get_manager
+        is _ilu_get_cpu_offloading_manager,
         "spec_worker": CPUOffloadingSpec.create_worker
         is _ilu_create_cpu_offloading_worker,
         "paired_registration": OffloadingConnectorWorker.register_kv_caches
@@ -257,10 +261,35 @@ def _ilu_get_kv_cache_configs(vllm_config, kv_cache_specs, available_memory):
     if not needs_geometry:
         return configs
 
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
+        get_offloading_group_ids,
+    )
+    from vllm_iluvatar.models.deepseek_v41.offloading import (
+        has_paired_pages,
+        plan_offload_layout,
+    )
+
+    group_geometry = None
+    if any(has_paired_pages(config) for config in configs):
+        selected = get_offloading_group_ids(configs[0])
+        rows = []
+        for config in configs:
+            if get_offloading_group_ids(config) != selected:
+                raise ValueError("PP offload group IDs must agree across workers")
+            layout = plan_offload_layout(config)
+            rows.append(
+                tuple(
+                    sum(layout.regions[i].page_bytes for i in refs)
+                    for refs in layout.group_regions
+                )
+            )
+        group_geometry = tuple(rows)
     geometry = tuple(_worker_bytes_per_block(config) for config in configs)
     _validate_target_geometry(vllm_config, geometry)
     for config in configs:
         setattr(config, _GEOMETRY_ATTR, geometry)
+        if group_geometry is not None:
+            setattr(config, _GROUP_GEOMETRY_ATTR, group_geometry)
     logger.info(
         "DSV4.1 PP CPU offload rank geometry: bytes_per_block=%s, "
         "aggregate_bytes_per_block=%d, world_size=%d, pp_size=%d, tp_size=%d",
@@ -282,6 +311,9 @@ def _ilu_build_offloading_config(vllm_config, kv_cache_config):
     config = _ORIGINAL_BUILD_CONFIG(vllm_config, kv_cache_config)
     if geometry is not None:
         object.__setattr__(config, _GEOMETRY_ATTR, tuple(geometry))
+    group_geometry = getattr(kv_cache_config, _GROUP_GEOMETRY_ATTR, None)
+    if group_geometry is not None:
+        object.__setattr__(config, _GROUP_GEOMETRY_ATTR, group_geometry)
     if needs_geometry:
         object.__setattr__(config, _RANK_SAFE_REQUIRED_ATTR, True)
     return config
@@ -317,6 +349,39 @@ def _ilu_cpu_offloading_spec_init(self, config) -> None:
             f"rank={rank}, world_size={config.parallel.world_size}."
         )
 
+    from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+
+    group_geometry = getattr(config, _GROUP_GEOMETRY_ATTR, None)
+    # Secondary tiers address a flat primary buffer and keep the legacy layout.
+    if group_geometry is not None and type(self) is CPUOffloadingSpec:
+        from vllm_iluvatar.v1.worker.grouped_cpu_offloading import plan_cpu_groups
+
+        allocations = plan_cpu_groups(
+            config.groups,
+            group_geometry,
+            self.blocks_per_chunk,
+            int(self.extra_config["cpu_bytes_to_use"]),
+        )
+        self._ilu_group_allocations = allocations
+        self.num_chunks = sum(g.num_chunks for g in allocations)
+        self.kv_bytes_per_chunk = 0  # Group widths replace the uniform stride.
+        self.cpu_page_size_per_worker = geometry[rank] * self.blocks_per_chunk
+        self.replicated_layout = False
+        self._ilu_nonuniform_pp_private = True
+        logger.info(
+            "DSV4.1 PP CPU compact arenas: groups=%d, prefix_tokens=%d, "
+            "cpu_bytes=%d, bytes_by_rank=%s, chunks_by_group=%s",
+            len(allocations),
+            allocations[0].num_chunks * allocations[0].tokens_per_chunk,
+            sum(g.num_chunks * g.bytes_per_chunk for g in allocations),
+            tuple(
+                sum(g.num_chunks * g.bytes_per_worker[r] for g in allocations)
+                for r in range(config.parallel.world_size)
+            ),
+            tuple(g.num_chunks for g in allocations),
+        )
+        return
+
     from vllm.utils.math_utils import round_up
 
     cpu_bytes_to_use = int(self.extra_config["cpu_bytes_to_use"])
@@ -337,6 +402,27 @@ def _ilu_cpu_offloading_spec_init(self, config) -> None:
     self.cpu_page_size_per_worker = geometry[rank] * self.blocks_per_chunk
     self.replicated_layout = False
     self._ilu_nonuniform_pp_private = True
+
+
+def _ilu_get_cpu_offloading_manager(self):
+    allocations = getattr(self, "_ilu_group_allocations", None)
+    if allocations is None:
+        assert _ORIGINAL_GET_MANAGER is not None
+        return _ORIGINAL_GET_MANAGER(self)
+    if self._manager is None:
+        from vllm_iluvatar.v1.worker.grouped_cpu_offloading import (
+            GroupCPUOffloadingManager,
+        )
+
+        self._manager = GroupCPUOffloadingManager(
+            allocations,
+            cache_policy=self.eviction_policy,
+            cache_policy_module_path=self.cache_policy_module_path,
+            enable_events=self.kv_events_config.enable_kv_cache_events,
+            store_threshold=int(self.extra_config.get("store_threshold", 0)),
+            max_tracker_size=int(self.extra_config.get("max_tracker_size", 64_000)),
+        )
+    return self._manager
 
 
 def _ilu_create_cpu_offloading_worker(self, kv_caches):
@@ -389,6 +475,31 @@ def _ilu_create_cpu_offloading_worker(self, kv_caches):
         # ranks with no local payload. Skipping the worker would leave loads
         # and stores pending forever in the scheduler.
         return EmptyOffloadingWorker()
+    allocations = getattr(self, "_ilu_group_allocations", None)
+    if allocations is not None:
+        from vllm_iluvatar.v1.worker.grouped_cpu_offloading import compact_worker_cache
+
+        compact, counts = compact_worker_cache(
+            kv_caches,
+            allocations,
+            rank,
+            self.blocks_per_chunk,
+        )
+        logger.info(
+            "DSV4.1 PP CPU compact worker: rank=%d, tensors=%d, cpu_bytes=%d",
+            rank,
+            len(compact.tensors),
+            sum(g.num_chunks * g.bytes_per_worker[rank] for g in allocations),
+        )
+        from vllm_iluvatar.v1.worker.grouped_cpu_offloading_worker import (
+            GroupCPUOffloadingWorker,
+        )
+
+        return GroupCPUOffloadingWorker(
+            kv_caches=compact,
+            blocks_per_chunk=self.blocks_per_chunk,
+            cpu_chunks_per_tensor=counts,
+        )
     worker = CPUOffloadingWorker(
         kv_caches=kv_caches,
         blocks_per_chunk=self.blocks_per_chunk,
@@ -430,7 +541,7 @@ def _apply() -> None:
 
     global _ORIGINAL_GET_CONFIGS, _ORIGINAL_BUILD_CONFIG
     global _ORIGINAL_SPEC_INIT, _ORIGINAL_CREATE_WORKER
-    global _ORIGINAL_REGISTER_KV
+    global _ORIGINAL_REGISTER_KV, _ORIGINAL_GET_MANAGER
 
     current_get_configs = kv_cache_utils.get_kv_cache_configs
     if current_get_configs is not _ilu_get_kv_cache_configs:
@@ -459,6 +570,11 @@ def _apply() -> None:
     if current_init is not _ilu_cpu_offloading_spec_init:
         _ORIGINAL_SPEC_INIT = current_init
     CPUOffloadingSpec.__init__ = _ilu_cpu_offloading_spec_init
+
+    current_manager = CPUOffloadingSpec.get_manager
+    if current_manager is not _ilu_get_cpu_offloading_manager:
+        _ORIGINAL_GET_MANAGER = current_manager
+    CPUOffloadingSpec.get_manager = _ilu_get_cpu_offloading_manager
 
     current_create = CPUOffloadingSpec.create_worker
     if current_create is not _ilu_create_cpu_offloading_worker:

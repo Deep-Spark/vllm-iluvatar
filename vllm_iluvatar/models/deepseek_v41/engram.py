@@ -697,10 +697,22 @@ class EngramEmbedding(nn.Module):
             return tensor.clone(), None
 
     def ensure_device_view(self) -> bool:
-        """Register the mmap once so lookup reads it through UVA. No copy."""
+        """Map shared locked tables once; anonymous fallbacks use CPU gather."""
         if self._dev_weight is not None:
             return True
         if self._uva_failed or self.weight is None or self.scale is None:
+            return False
+        if any(region is None for region in self._regions):
+            # _load_rows returns None for an anonymous fallback after mlock
+            # fails. Bulk registration of those private pages can stall the
+            # driver's page-unpin path on process exit. Keep the existing
+            # bounded CPU-gather staging path instead.
+            logger.warning(
+                "Engram anonymous fallback stays on CPU gather; "
+                "skipping bulk host registration"
+            )
+            self._uva_failed = True
+            self._dev_weight = self._dev_scale = None
             return False
         try:
             weight = self.weight.view(torch.uint8)

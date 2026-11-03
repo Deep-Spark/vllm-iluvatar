@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -130,6 +131,28 @@ class IluDeepseekV41Bf16DequantLinearMethod(LinearMethodBase):
             out_dtype=getattr(layer, "ilu_dequant_dtype", torch.bfloat16),
         )
         layer.weight = torch.nn.Parameter(dequantized, requires_grad=False)
+        if (
+            os.environ.get("VLLM_ILU_V41_PREFILL_FP8_O_PROJ", "0") == "1"
+            and hasattr(layer, "bmm_geom")
+        ):
+            geom = layer.bmm_geom
+            groups = int(geom.n_local_groups)
+            channels = int(geom.o_lora_rank)
+            width = int(geom.heads_per_group) * int(geom.head_dim)
+            assert dequantized.shape == (groups * channels, width)
+            assert dequantized.dtype is torch.bfloat16
+            # Powers-of-two scales preserve checkpoint FP8 mantissas.
+            block_scales = layer.weight_scale_inv.data.float()
+            scale = block_scales.amax(dim=1).repeat_interleave(self.block_size[0])
+            scale = scale[:dequantized.shape[0]].contiguous()
+            fp8_weight = (dequantized.float() / scale[:, None]).to(torch.float8_e4m3fn)
+            layer.register_buffer(
+                "prefill_bmm_b_fp8", fp8_weight.view(groups, channels, width),
+                persistent=False,
+            )
+            layer.register_buffer(
+                "prefill_bmm_bs", scale.view(groups, channels), persistent=False,
+            )
         # The scale has been folded in; keeping it would waste memory and let
         # stale state be read.
         if hasattr(layer, "weight_scale_inv"):

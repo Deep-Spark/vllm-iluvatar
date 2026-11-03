@@ -46,6 +46,7 @@ answer independent of that subtlety altogether. ``__init__`` asserts both.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from vllm.config import get_current_vllm_config_or_none
 
 # Same import surface community ``quantization/mxfp4.py:8-15`` uses -- the
@@ -230,21 +231,33 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
             # processing all 32 local experts at once would require several GB.
             weight_parts: list[torch.Tensor] = []
             scale_parts: list[torch.Tensor] = []
+            packed_k = w.shape[2]
+            # The TP shard of the down projection may end inside an ixmm
+            # scale group. Match the activation padding in the MoE runner.
+            pad_k = (-(packed_k * 2) % 256) if w_name == "w2_weight" else 0
             for begin in range(0, w_int8.shape[0], _IXMM_EXPERT_CHUNK):
                 end = min(begin + _IXMM_EXPERT_CHUNK, w_int8.shape[0])
+                weight_chunk = w_int8[begin:end]
+                scale_chunk = s_e8m0[begin:end]
+                if pad_k:
+                    weight_chunk = F.pad(weight_chunk, (0, pad_k // 2))
+                    # E8M0 byte 127 encodes 1.0; padded FP4 nibbles encode zero.
+                    scale_chunk = F.pad(
+                        scale_chunk.view(torch.uint8), (0, pad_k // 32), value=127
+                    ).view(torch.float8_e8m0fnu)
                 ixmm_weight, ixmm_scale = ixfops.preprocess_weight_for_ixmm(
-                    w_int8[begin:end],
-                    s_e8m0[begin:end],
+                    weight_chunk,
+                    scale_chunk,
                 )
                 weight_parts.append(ixmm_weight)
                 scale_parts.append(ixmm_scale)
 
             ixmm_weight = torch.cat(weight_parts, dim=0).contiguous()
             ixmm_scale = torch.cat(scale_parts, dim=0).contiguous()
-            expected_weight_shape = (w.shape[0], w.shape[2], w.shape[1])
+            expected_weight_shape = (w.shape[0], packed_k + pad_k // 2, w.shape[1])
             expected_scale_shape = (
                 w.shape[0],
-                (w.shape[2] * 2) // 256,
+                (packed_k * 2 + pad_k) // 256,
                 w.shape[1],
             )
             if ixmm_weight.dtype is not torch.uint8:

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 
+from ixformer.cuda import cuda_arch
 import ixformer.inference.functions as ixfops
 import torch
 from ixformer.inference.functions.models.deepseek_v41.indexer.fp8.indexer_mqa_topk_fp8 import (
@@ -14,6 +15,7 @@ from ixformer.inference.functions.models.deepseek_v41.indexer.fp8.indexer_mqa_to
 from vllm import _custom_ops as ops
 from vllm import envs
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.platforms import current_platform
@@ -28,6 +30,11 @@ from vllm_iluvatar.model_executor.kernels.attention.dsa.ilu_candidate_blocks imp
 from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
     IluDeepseekV32IndexerMetadata,
 )
+
+
+logger = init_logger(__name__)
+
+_PREFILL_SCORE_MASK = os.environ.get("VLLM_ILU_V41_PREFILL_SCORE_MASK", "0") == "1"
 
 
 def _mqa_logits(*args, **kwargs):
@@ -162,6 +169,7 @@ def _indexer_logits_and_topk(
     previous_extent: torch.Tensor | None = None,
     initialized_decode: bool = False,
     kv_scales: torch.Tensor | None = None,
+    is_prefill: bool = False,
 ) -> None:
     """Score the indexer, mask to candidate blocks, then select the top-k.
 
@@ -195,34 +203,60 @@ def _indexer_logits_and_topk(
         )
         return
 
-    logits = _mqa_logits_for_candidates(
-        candidate_blocks,
-        q,
-        cu_seqlens_q,
-        cu_seqlens_kv,
-        kv_cache,
-        block_table,
-        weights,
-        logits=logits,
-        max_q_len=max_q_len,
-        max_kv_len=max_kv_len,
-        max_context_len=max_context_len,
-        valid_lens=valid_lens,
-        owned_logits=owned_logits,
-        previous_extent=previous_extent,
-        kv_scales=kv_scales,
-    )
-    _two_level_filter(
-        logits,
-        cu_seqlen_ks,
-        cu_seqlen_ke,
-        candidate_blocks,
-        candidate_block_size,
-        candidate_write,
-        token_start,
-        token_end,
-        initialized_decode=initialized_decode,
-    )
+    if (
+        _PREFILL_SCORE_MASK
+        and is_prefill
+        and cuda_arch == "ivcore30"
+        and candidate_blocks is not None
+        and not candidate_write
+        and candidate_block_size == 8
+        and q.dtype == torch.float8_e4m3fn
+        and kv_cache.dtype == torch.uint8
+        and q.shape[1] == 32
+        and 128 < q.shape[0] <= 16384
+        and 16384 < max_context_len <= 32768
+        and candidate_blocks.is_contiguous()
+    ):
+        logits = ixfops.dsa_indexer_mqa_logits_with_candidate_mask_fp8(
+            q, cu_seqlens_q, cu_seqlens_kv, kv_cache, block_table, weights,
+            candidate_blocks[token_start:token_end], logits=logits,
+            max_q_len=max_q_len, max_kv_len=max_kv_len,
+            max_context_len=max_context_len, valid_lens=valid_lens,
+            backend="ixformer_native",
+        )
+        logger.info_once(
+            "Using fused H32 FP8 indexer scoring and candidate masking for prefill.",
+            scope="process",
+        )
+    else:
+        logits = _mqa_logits_for_candidates(
+            candidate_blocks,
+            q,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            kv_cache,
+            block_table,
+            weights,
+            logits=logits,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            max_context_len=max_context_len,
+            valid_lens=valid_lens,
+            owned_logits=owned_logits,
+            previous_extent=previous_extent,
+            kv_scales=kv_scales,
+        )
+        _two_level_filter(
+            logits,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            candidate_blocks,
+            candidate_block_size,
+            candidate_write,
+            token_start,
+            token_end,
+            initialized_decode=initialized_decode,
+        )
     ixfops.dsa_update_topk_indices(
         logits,
         cu_seqlen_ks,
@@ -345,6 +379,7 @@ def ilu_sparse_attn_indexer(
                 ):
                     continue
             _indexer_logits_and_topk(
+                is_prefill=True,
                 candidate_blocks=candidate_blocks,
                 candidate_block_size=candidate_block_size,
                 candidate_write=candidate_write,

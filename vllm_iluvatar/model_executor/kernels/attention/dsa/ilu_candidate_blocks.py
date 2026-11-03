@@ -24,11 +24,14 @@ Remove   : when community grows a vendor hook for these two.
 from __future__ import annotations
 
 import contextlib
+import os
 
 import torch
 from ixformer.cuda import cuda_arch
 from ixformer.inference.functions import dsa_update_topk_indices
 from ixformer.inference.functions.models import deepseek_v41 as ixfops
+
+_PREFILL_UNSORTED = os.environ.get("VLLM_ILU_V41_PREFILL_UNSORTED", "0") == "1"
 
 # Rows per ``topk`` call in ``select_candidate_blocks``. Above 128 rows corex
 # torch's topk takes scratch memory outside the caching allocator -- tens of
@@ -130,6 +133,17 @@ def select_candidate_blocks(
         and topk_blocks == 2048
         and block_size == 8
     )
+    fast_prefill = (
+        _PREFILL_UNSORTED
+        and cuda_arch == "ivcore30"
+        and 128 < rows <= 16384
+        and 16384 < width <= 32768
+        and logits.dtype == torch.bfloat16
+        and row_ks is None
+        and row_repeat == 1
+        and topk_blocks == 2048
+        and block_size == 8
+    )
     max_rows = rows if compact_decode else max(
         1, min(_TOPK_ROWS, _TOPK_COL_BUDGET // max(1, nblocks))
     )
@@ -153,7 +167,7 @@ def select_candidate_blocks(
         while s < n:
             e = min(n, s + sub)
             try:
-                top = scores[s:e].topk(k, dim=-1, sorted=not compact_decode)
+                top = scores[s:e].topk(k, dim=-1, sorted=not (compact_decode or fast_prefill))
             except RuntimeError as err:
                 if "out of memory" in str(err).lower() and sub > 1:
                     with contextlib.suppress(Exception):

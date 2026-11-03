@@ -131,6 +131,9 @@ def _make_weights_mapper() -> WeightsMapper:
     return _make_fp8_weights_mapper()
 
 
+_PP_QUANT_SENDERS = os.environ.get("VLLM_ILU_V41_PREFILL_PP_QUANT_SENDERS", "")
+
+
 class IluDeepseekV41MoE(nn.Module, IluFusedMoEEP):
     """V4.1 routed FFN.
 
@@ -1228,6 +1231,20 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         if not get_pp_group().is_last_rank:
             tensors = {"hidden_states": hidden_states, "pre_mix": pre_mix}
             num_tokens = positions.shape[0]
+            if (
+                _PP_QUANT_SENDERS
+                and num_tokens > 128
+                and hidden_states.dtype == torch.bfloat16
+                and hidden_states.is_contiguous()
+                and get_tensor_model_parallel_world_size() == 1
+                and isinstance(get_forward_context().attn_metadata, dict)
+                and (
+                    _PP_QUANT_SENDERS == "all"
+                    or str(get_pp_group().rank_in_group) in _PP_QUANT_SENDERS.split(",")
+                )
+            ):
+                from ._prefill_pp_codec import encode
+                tensors["hidden_states"], tensors["prefill_pp_scale"] = encode(hidden_states)
             if self.pp_plan.sends_kv:
                 assert self.main_kv_rows is not None
                 assert self.indexer_kv_rows is not None

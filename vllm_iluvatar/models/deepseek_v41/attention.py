@@ -130,6 +130,8 @@ warnings.filterwarnings(
     "ignore", message=".*bgemm_internal_cublaslt error.*", category=UserWarning
 )
 
+_PREFILL_FUSED_Q = os.environ.get("VLLM_ILU_V41_PREFILL_FUSED_Q", "0") == "1"
+
 _INDEX_TILE = 256
 _PACKED_MLA_HEADS = (1, 8, 16, 32, 64, 128)
 _PT_MLA_HEADS = (1, 4, 8, 16, 32, 64, 128)
@@ -1643,9 +1645,25 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                     self.wo_a, attn_out, positions, self.cos_sin
                 )
             return self.wo_b(grouped.flatten(1))
-        if not self._uses_fused_inverse_rope():
-            apply_rope(attn_out.unsqueeze(0), positions, self.cos_sin, inverse=True)
-        result = self._o_proj(attn_out)
+        if (
+            not self._uses_fused_inverse_rope()
+            and attn_out.shape[0] > 128
+            and hasattr(self.wo_a, "prefill_bmm_b_fp8")
+        ):
+            grouped, scales = ixfshared.fused_inv_rope_fp8_quant(
+                attn_out, positions, self.cos_sin, self.n_local_groups
+            )
+            projected = ixfshared.fp8_per_channel_einsum(
+                grouped,
+                self.wo_a.prefill_bmm_b_fp8,
+                scales,
+                self.wo_a.prefill_bmm_bs,
+            )
+            result = self.wo_b(projected.flatten(1))
+        else:
+            if not self._uses_fused_inverse_rope():
+                apply_rope(attn_out.unsqueeze(0), positions, self.cos_sin, inverse=True)
+            result = self._o_proj(attn_out)
         return result
 
     def _run_parallel_input_projections(
@@ -1708,6 +1726,8 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         ),
     ) -> torch.Tensor:
         """RoPE q in place and publish kv as this layer's window record."""
+        if _PREFILL_FUSED_Q:
+            self._prefill_q_source = None
         if not isinstance(attn_metadata, dict):
             return q
 
@@ -1725,8 +1745,12 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 positions,
                 self.cos_sin,
                 kv_scale=self.kv_scale,
+                q_fp8=self._q_fp8_pt[: q.shape[0]] if _PREFILL_FUSED_Q and q.shape[0] > 128 else None,
+                q_scale=self._q_scale_pt[: q.shape[0]] if _PREFILL_FUSED_Q and q.shape[0] > 128 else None,
                 backend="ixformer_native",
             )
+            if _PREFILL_FUSED_Q and q.shape[0] > 128:
+                self._prefill_q_source = (q.data_ptr(), q.shape[0], q.stride(0) * q.element_size())
             return q
         insert = (
             ixfops.qkv_rope_packed_fp8_insert
@@ -2535,15 +2559,31 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
     ) -> None:
         if q.shape[1] not in _PT_MLA_HEADS:
             raise ValueError(f"Unsupported per-tensor FP8 MLA head count: {q.shape[1]}")
-        q_fp8 = self._q_fp8_pt[: q.shape[0]]
-        q_scale = self._q_scale_pt[: q.shape[0]]
-        ixfops.quant_mla_q_fp8_pt(
-            q,
-            q_fp8,
-            q_scale,
-            self._q_quant_workspace_pt,
-            backend="ixformer_native",
-        )
+        source = getattr(self, "_prefill_q_source", None) if _PREFILL_FUSED_Q else None
+        start = 0
+        ready = False
+        if source is not None:
+            base, count, row_bytes = source
+            offset = q.data_ptr() - base
+            ready = (
+                offset >= 0
+                and offset % row_bytes == 0
+                and q.is_contiguous()
+                and q.stride(0) * q.element_size() == row_bytes
+                and offset // row_bytes + q.shape[0] <= count
+            )
+            if ready:
+                start = offset // row_bytes
+        q_fp8 = self._q_fp8_pt[start : start + q.shape[0]]
+        q_scale = self._q_scale_pt[start : start + q.shape[0]]
+        if not ready:
+            ixfops.quant_mla_q_fp8_pt(
+                q,
+                q_fp8,
+                q_scale,
+                self._q_quant_workspace_pt,
+                backend="ixformer_native",
+            )
         sparse_op = (
             ixfops.fmhadsa
             if use_fmhadsa and _v41_prefill_fmhadsa()

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Share a PP producer's chunk budget between long and short prefills.
+"""Share a PP producer's chunk budget between long and bounded prefills.
 
 Long running prefills retain at least half of the step budget. At most one
 waiting short request is promoted per step; normal KV admission still applies.
@@ -11,6 +11,8 @@ not the seen-prefix hint (the hint only bounds expensive cache probes).
 
 import collections
 import os
+
+_SHORT_WORK_CHUNKS = 4
 
 
 class SupplyState:
@@ -94,12 +96,13 @@ def plan(scheduler, budget):
     ):
         return None
     st = state(scheduler)
+    short_limit = _SHORT_WORK_CHUNKS * budget
     short = {
         r.request_id: remaining(r)
         for r in scheduler.running
-        if 0 < remaining(r) <= budget
+        if 0 < remaining(r) <= short_limit
     }
-    long_exists = any(remaining(r) > budget for r in scheduler.running)
+    long_exists = any(remaining(r) > short_limit for r in scheduler.running)
     if not long_exists:
         return None
 
@@ -125,7 +128,7 @@ def plan(scheduler, budget):
                 count = request.num_tokens
             elif (
                 probes < 4
-                and st.key(request, budget, scheduler.prefix_replay_tokens) in st.seen
+                and st.key(request, short_limit, scheduler.prefix_replay_tokens) in st.seen
                 and not scheduler.kv_cache_manager.enable_kv_cache_events
             ):
                 # Read-only coverage probe. Do not retain block views or mutate
@@ -136,9 +139,11 @@ def plan(scheduler, budget):
                 count = request.num_tokens - max(
                     0, cached - scheduler.prefix_replay_tokens
                 )
+            elif request.num_tokens <= short_limit:
+                count = request.num_tokens
             else:
                 continue
-            if 0 < count <= budget:
+            if 0 < count <= short_limit:
                 candidates.append((count, n, queue, request))
     # One bounded promotion per step. Retain original order of all other requests.
     if candidates:

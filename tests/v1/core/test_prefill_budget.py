@@ -86,6 +86,38 @@ def test_conserves_budget_and_keeps_long_progress():
     assert supply.BudgetPlan(2048, {"short"}, 10000).long_budget == 1024
 
 
+@pytest.mark.parametrize("budget", [512, 2048, 4096])
+def test_bounded_multichunk_work_can_bypass_a_long_prefill(budget):
+    medium = request("medium", 3 * budget, prefix="unseen")
+    sched, _ = scheduler([request("long", 100 * budget)], [medium])
+    plan = supply.plan(sched, budget)
+    assert plan is not None and "medium" in plan.short_ids
+    assert plan.long_budget >= budget // 2
+    assert plan.limit("long", 100 * budget) + plan.limit("medium", 3 * budget) == budget
+
+
+def test_mostly_cached_multichunk_request_uses_real_residency():
+    medium = request("medium", 80000)
+    sched, reads = scheduler([request("long", 800000)], [medium], cached=64000)
+    supply.state(sched).seen["seen"] = None
+    plan = supply.plan(sched, 4096)
+    assert reads == ["medium"]
+    assert plan is not None and "medium" in plan.short_ids
+    assert medium.num_computed_tokens == 0
+
+
+def test_all_bounded_running_work_keeps_full_normal_budget():
+    sched, _ = scheduler([request("a", 6000), request("b", 9000)])
+    assert supply.plan(sched, 4096) is None
+
+
+def test_uncached_work_beyond_the_bound_is_not_promoted():
+    req = request("large", 4 * 4096 + 1, prefix="unseen")
+    sched, _ = scheduler([request("long", 800000)], [req])
+    assert supply.plan(sched, 4096) is None
+    assert sched.waiting == [req]
+
+
 @pytest.mark.parametrize("total", [512, 10000])
 def test_single_class_uses_original_scheduler(total):
     sched, _ = scheduler([request("r", total)])

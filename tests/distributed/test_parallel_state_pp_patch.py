@@ -397,3 +397,52 @@ class TestUpperLayerCompat:
         assert len(postprocess) == 1, (
             "postprocess callback for all_gather should still be collected"
         )
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+def test_prefill_codec_decodes_before_persistent_bf16_copy(monkeypatch, compressed):
+    """TP1 must retain shapes; raw payloads retain the existing postprocess path."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_iluvatar.models.deepseek_v41 import _prefill_pp_codec
+
+    quantized = torch.arange(1024).remainder(255).sub(127).to(torch.int8).view(2, 512)
+    scales = torch.full((2, 1), 0.125)
+    expected = (quantized.float() * scales).to(torch.bfloat16)
+    payload = {"hidden_states": quantized if compressed else expected}
+    if compressed:
+        payload["prefill_pp_scale"] = scales
+    queue = iter(payload.values())
+
+    def recv(out, src, group):
+        out.copy_(next(queue).reshape_as(out))
+
+    def decode(q, s):
+        assert q.shape == (2, 512) and s.shape == (2, 1)
+        return (q.float() * s).to(torch.bfloat16)
+
+    monkeypatch.setattr(impl, "torch", torch)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "recv", recv)
+    monkeypatch.setattr(_prefill_pp_codec, "decode", decode)
+    group = FakeGroupCoordinator(world_size=8, rank=4)
+    group.recv_object = lambda src: [
+        (key, TensorMetadata("cpu", value.dtype, value.shape))
+        for key, value in payload.items()
+    ]
+    group._should_use_all_gather = lambda *args: True
+    tp = SimpleNamespace(world_size=1, rank_in_group=0, all_gather=lambda x, dim: x)
+    result, handles, postprocess = impl._ilu_irecv_tensor_dict_sync(
+        group, all_gather_group=tp
+    )
+    assert not handles
+    assert len(postprocess) == (0 if compressed else 1)
+    for callback in postprocess:
+        callback()
+    assert "prefill_pp_scale" not in result
+    assert result["hidden_states"].dtype == torch.bfloat16
+    persistent = torch.empty_like(expected)
+    persistent.copy_(result["hidden_states"])
+    assert torch.equal(persistent, expected)

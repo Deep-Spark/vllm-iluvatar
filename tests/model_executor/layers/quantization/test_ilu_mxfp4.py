@@ -137,18 +137,22 @@ def test_process_weights_rejects_non_contiguous_input():
         method.process_weights_after_loading(layer)
 
 
-def test_process_weights_preprocesses_ixmm_layout(monkeypatch):
+@pytest.mark.parametrize("intermediate", [256, 1152, 2304])
+def test_process_weights_preprocesses_ixmm_layout(monkeypatch, intermediate):
     import vllm.envs as envs
 
     monkeypatch.setattr(envs, "VLLM_ILU_MXFP4_MOE_BACKEND", "ixmm", raising=False)
     monkeypatch.setattr(ilu_mxfp4, "_ixmm_backend_available", lambda: True)
 
     fake_ixfops = MagicMock()
+    seen = []
 
     def _preprocess(weight, scale):
         assert weight.dtype is torch.int8
         assert scale.dtype is torch.float8_e8m0fnu
         expert, out_dim, packed_k = weight.shape
+        assert packed_k * 2 % 256 == 0
+        seen.append((weight.clone(), scale.view(torch.uint8).clone()))
         return (
             torch.zeros(expert, packed_k, out_dim, dtype=torch.uint8),
             torch.ones(expert, (packed_k * 2) // 256, out_dim, dtype=torch.float32),
@@ -164,7 +168,9 @@ def test_process_weights_preprocesses_ixmm_layout(monkeypatch):
     monkeypatch.setitem(sys.modules, "ixformer.inference.functions", fake_ixfops)
 
     method = _make_method()
-    layer, (w13, _, w2, _) = _make_layer()
+    w13, s13 = _rand_mxfp4(5, 2 * intermediate, 512, seed=1)
+    w2, s2 = _rand_mxfp4(5, 512, intermediate, seed=2)
+    layer = _FakeRoutedExperts(w13, s13, w2, s2)
     method.process_weights_after_loading(layer)
 
     assert layer._ilu_mxfp4_ixmm is True
@@ -172,6 +178,18 @@ def test_process_weights_preprocesses_ixmm_layout(monkeypatch):
     assert layer.w13_weight.shape == (w13.shape[0], w13.shape[2], w13.shape[1])
     assert layer.w13_weight_scale.dtype is torch.float32
     assert layer.w2_weight.dtype is torch.uint8
-    assert layer.w2_weight.shape == (w2.shape[0], w2.shape[2], w2.shape[1])
+    padded_k = (intermediate + 255) // 256 * 256
+    assert layer.w2_weight.shape == (5, padded_k // 2, 512)
     assert layer.w2_weight_scale.dtype is torch.float32
-    assert fake_ixfops.preprocess_weight_for_ixmm.call_count == 2
+    assert layer.w2_weight_scale.shape == (5, padded_k // 256, 512)
+    assert fake_ixfops.preprocess_weight_for_ixmm.call_count == 4
+    actual_w13 = torch.cat([x[0] for x in seen[:2]]).view(torch.uint8)
+    actual_s13 = torch.cat([x[1] for x in seen[:2]])
+    assert torch.equal(actual_w13, w13)
+    assert torch.equal(actual_s13, s13)
+    actual_w2 = torch.cat([x[0] for x in seen[2:]]).view(torch.uint8)
+    actual_s2 = torch.cat([x[1] for x in seen[2:]])
+    assert torch.equal(actual_w2[..., :intermediate // 2], w2)
+    assert torch.equal(actual_s2[..., :intermediate // 32], s2)
+    assert torch.all(actual_w2[..., intermediate // 2:] == 0)
+    assert torch.all(actual_s2[..., intermediate // 32:] == 127)

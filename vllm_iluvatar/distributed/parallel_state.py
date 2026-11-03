@@ -279,6 +279,9 @@ def _ilu_irecv_tensor_dict_sync(
     metadata_group = self.cpu_group
 
     recv_metadata_list = self.recv_object(src=src)
+    compressed_prefill = all_gather_size == 1 and any(
+        key == "prefill_pp_scale" for key, _ in recv_metadata_list
+    )
     tensor_dict: dict[str, Any] = {}
     handles: list[Handle] = []
     postprocess: list[Callable[[], None]] = []
@@ -292,7 +295,7 @@ def _ilu_irecv_tensor_dict_sync(
                 tensor_dict[key] = full_tensor
                 continue
 
-            if self._should_use_all_gather(
+            if not compressed_prefill and self._should_use_all_gather(
                 key, full_tensor.numel(), all_gather_group, all_gather_tensors
             ):
                 orig_shape = full_tensor.shape
@@ -328,6 +331,14 @@ def _ilu_irecv_tensor_dict_sync(
         else:
             tensor_dict[key] = value
 
+    # Decode before the V2 runner copies payloads into its persistent BF16
+    # intermediate buffers; decoding in model.forward would be too late.
+    if "prefill_pp_scale" in tensor_dict:
+        assert all_gather_size == 1
+        from vllm_iluvatar.models.deepseek_v41._prefill_pp_codec import decode
+        tensor_dict["hidden_states"] = decode(
+            tensor_dict["hidden_states"], tensor_dict.pop("prefill_pp_scale")
+        )
     return tensor_dict, handles, postprocess
 
 

@@ -229,11 +229,17 @@ def test_swa_kernel_block_query_matches_v031_allocator_contract(with_spec, monke
         IluFlashAttentionBackend,
     )
 
-    monkeypatch.setattr(
-        "vllm_iluvatar.v1.attention.backends.ilu_flash_attn.envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE",
-        "",
-        raising=False,
-    )
+    def _set_flash_attn_quant(value: str) -> None:
+        # vllm.envs.__getattr__ always re-reads os.environ; setattr on the
+        # module only shadows if the name is already in __dict__. Cover both.
+        monkeypatch.setenv("VLLM_ILU_FLASH_ATTN_QUANT_TYPE", value)
+        monkeypatch.setattr(
+            "vllm_iluvatar.v1.attention.backends.ilu_flash_attn.envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE",
+            value,
+            raising=False,
+        )
+
+    _set_flash_attn_quant("")
     spec = (
         SlidingWindowSpec(
             block_size=16,
@@ -255,11 +261,7 @@ def test_swa_kernel_block_query_matches_v031_allocator_contract(with_spec, monke
     assert len(sizes) == 1
     assert isinstance(sizes[0], MultipleOf) and sizes[0].base == 16
 
-    monkeypatch.setattr(
-        "vllm_iluvatar.v1.attention.backends.ilu_flash_attn.envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE",
-        "KVINT8",
-        raising=False,
-    )
+    _set_flash_attn_quant("KVINT8")
     assert IluFlashAttentionBackend.get_supported_kernel_block_sizes() == [
         16,
         32,

@@ -11,7 +11,8 @@ The override implementation lives in
 module only performs register-time wiring.
 
 Target   : vllm.v1.worker.gpu.spec_decode.autoregressive.speculator.
-           AutoRegressiveSpeculator.__init__ / capture / _multi_step_decode
+           AutoRegressiveSpeculator.__init__ / capture / _multi_step_decode /
+           init_cudagraph_manager
            (+ new _generate_draft_graph_part / _generate_draft_tail methods)
 Baseline : v0.31.0 (db9527a468)
 Why      : ixfd TP all_gather (inside sample_draft/compute_logits) is not
@@ -19,14 +20,25 @@ Why      : ixfd TP all_gather (inside sample_draft/compute_logits) is not
            the shared ixfd communicator and produces garbage output. all_reduce
            is graph-safe (in-place), so only the draft — which captured the
            whole _generate_draft — broke; the target was never affected.
+           Option B leaves the draft alternating captured replays with eager
+           all_gather tails on one communicator; community
+           AutoRegressiveSpeculator ties the draft's graph mode to the target's
+           and ignores speculative_config.enforce_eager, so there is no way to
+           take the draft out of CUDA graphs without also giving up the
+           target's decode graph. DFlashSpeculator already has this override.
 How      : wrap __init__ to add two persistent graph-output buffers; wrap
            capture to route the non-fused decode_fn to the graph-safe part via
            a temporary instance-attr swap; wrap _multi_step_decode to call the
            eager tail after each run_fullgraph replay; add the two new methods.
+           Additionally wrap init_cudagraph_manager to force CUDAGraphMode.NONE
+           when speculative_config.enforce_eager is set, and wrap capture once
+           more to skip graph capture in that case.
            No long upstream methods are copied (drift-free).
 Scope    : non-fused draft decode on Iluvatar (MTP/Eagle). Fused path untouched.
 Remove   : when ixfd exposes a graph-safe all_gather (stream-bound or
-           buffer-registered) so the collective can stay in the captured graph.
+           buffer-registered) so the collective can stay in the captured graph,
+           and when upstream honors speculative_config.enforce_eager in
+           AutoRegressiveSpeculator.
 """
 
 from __future__ import annotations
@@ -54,17 +66,23 @@ def _apply() -> None:
         _generate_draft_graph_part,
         _generate_draft_tail,
         make_capture,
+        make_capture_eager,
         make_init,
+        make_init_cudagraph_manager,
         make_multi_step_decode,
     )
 
     orig_init = AutoRegressiveSpeculator.__init__
     orig_capture = AutoRegressiveSpeculator.capture
     orig_msd = AutoRegressiveSpeculator._multi_step_decode
+    orig_init_cg = AutoRegressiveSpeculator.init_cudagraph_manager
 
     wrapped_init = make_init(orig_init)
-    wrapped_capture = make_capture(orig_capture)
+    # Option B capture first, then the eager-draft skip on the outside so the
+    # skip wins before any graph-safe routing is set up.
+    wrapped_capture = make_capture_eager(make_capture(orig_capture))
     wrapped_msd = make_multi_step_decode(orig_msd)
+    wrapped_init_cg = make_init_cudagraph_manager(orig_init_cg)
 
     p.check_signatures(
         AutoRegressiveSpeculator,
@@ -72,8 +90,9 @@ def _apply() -> None:
             __init__=wrapped_init,
             capture=wrapped_capture,
             _multi_step_decode=wrapped_msd,
+            init_cudagraph_manager=wrapped_init_cg,
         ),
-        ["__init__", "capture", "_multi_step_decode"],
+        ["__init__", "capture", "_multi_step_decode", "init_cudagraph_manager"],
         strict=True,
     )
 
@@ -81,10 +100,14 @@ def _apply() -> None:
     # buffers (_cg_out_last_hidden / _cg_out_hidden) for the captured part.
     AutoRegressiveSpeculator.__init__ = wrapped_init
     # [ILU override] capture - delta: non-fused decode_fn routes to
-    # _generate_draft_graph_part (graph-safe) instead of _generate_draft.
+    # _generate_draft_graph_part (graph-safe) instead of _generate_draft, and
+    # capture is skipped entirely when the draft runs eagerly.
     AutoRegressiveSpeculator.capture = wrapped_capture
     # [ILU override] _multi_step_decode - delta: each FULL replay is followed
     # by the eager tail _generate_draft_tail (all_gather + argmax + update).
     AutoRegressiveSpeculator._multi_step_decode = wrapped_msd
+    # [ILU override] init_cudagraph_manager - delta: honor
+    # speculative_config.enforce_eager by forcing CUDAGraphMode.NONE.
+    AutoRegressiveSpeculator.init_cudagraph_manager = wrapped_init_cg
     AutoRegressiveSpeculator._generate_draft_graph_part = _generate_draft_graph_part
     AutoRegressiveSpeculator._generate_draft_tail = _generate_draft_tail

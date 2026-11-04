@@ -363,6 +363,8 @@ def _replane_fa_kv_caches_for_ixformer(
     kv_caches: dict[str, Any],
     kv_cache_config: KVCacheConfig,
     forward_context: dict[str, Any],
+    *,
+    kv_transfer_enabled: bool = False,
 ) -> None:
     """Plane-major FA views so decode can use ``flash_attn_with_kvcache``.
 
@@ -371,10 +373,36 @@ def _replane_fa_kv_caches_for_ixformer(
     ``tokens_per_state == 1``), but ``qwen_qsa_kv_store`` reads the logical
     ``[B, H, N, 2*hs]`` view and splits it itself. Replaning that view yields
     ``[B, 2, H, N, hs]`` (e.g. ``[16, 2, 1, 576, 256]``) and the split fails.
+
+    Related commits (replane / eligibility):
+      * ``136510ae`` — introduce LBHNC -> plane-major replane for ixformer
+      * ``18dbe2a4`` — skip QSA; cap FA kernel pages at 256
+      * ``d7728e86`` — replane only dense interleaved K|V FA pages
+
+    PD / kv_transfer (temporary): keep community interleaved LBHNC. Plane-major
+    page bytes break IluNixl hetero-TP head splits (``rank_offset * block_len``
+    assumes each head is a contiguous K|V slab), e.g. Step-3.7-FP8 Prefill
+    TP1 -> Decode TP2.
+
+    Remove this PD gate (and ideally the whole replane) once ixinfer's
+    ``flash_attn_with_kvcache`` (and FP8 unpad path) natively supports
+    community interleaved layout (token stride == 2 * head_size), so decode
+    no longer needs plane-major pages.
     """
     # Skip when ILU int8 FA already stores K alone (C=head_size) + separate V.
     if envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE in ("KINT8", "KVINT8"):
         return
+    # >>> ILU TEMPORARY (PD) >>>
+    # Wait: drop after ixinfer supports community interleaved LBHNC in the
+    # decode kvcache ops (see docstring). Related: 136510ae / 18dbe2a4 / d7728e86.
+    if kv_transfer_enabled:
+        logger.info_once(
+            "Skip FA KV plane-major replane under kv_transfer_config (PD); "
+            "keep interleaved LBHNC for IluNixl TP remapping. Remove once "
+            "ixinfer supports community layout in flash_attn_with_kvcache."
+        )
+        return
+    # <<< ILU TEMPORARY (PD) <<<
 
     def _replane_eligible(name: str, spec: Any) -> bool:
         # Single-content (MLA, head_size_v == 0) and compressed-state
@@ -511,8 +539,13 @@ def init_kv_cache(
             # Before any cache fill / bind: reinterpret interleaved LBHNC
             # [B,H,N,2*hs] as plane-major [B,2,H,N,hs] so ixformer decode can
             # use flash_attn_with_kvcache (token stride == head_size).
+            # PD skips replane until ixinfer supports community layout
+            # (136510ae / 18dbe2a4 / d7728e86; see helper docstring).
             _replane_fa_kv_caches_for_ixformer(
-                kv_caches, kv_cache_config, forward_context
+                kv_caches,
+                kv_cache_config,
+                forward_context,
+                kv_transfer_enabled=vllm_config.kv_transfer_config is not None,
             )
             _verify_hybrid_kv_cache_blocks_first(kv_caches, kv_cache_config, layout)
         kv_scale_caches = allocate_kv_cache_scale(

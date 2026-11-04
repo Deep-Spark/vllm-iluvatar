@@ -3,12 +3,12 @@
 
 Corresponds to: vllm/v1/sample/ops/topk_topp_sampler.py
 
-Target   : TopKTopPSampler.forward_native
+Target   : TopKTopPSampler.forward_native and apply_top_k_top_p
 Baseline : v0.31.0 (db9527a468)
 Why      : VLLM_ILU_GLM_SAMPLING_MODE selects native CQ sorted/radix sampling.
-           apply_top_k_top_p is left on upstream.
-How      : rebind TopKTopPSampler.forward_native only. The fallback calls the
-           original method, which uses upstream apply_top_k_top_p.
+           TOP_P_RADIX separately enables the native mask for MTP verification.
+How      : rebind the method and the free function, including imported aliases
+           in V1 rejection and V2 sampling states. Fallback stays upstream.
 Scope    : ivcore30 GLM sampling when the contract matches.
 Remove   : when upstream provides this GLM sampling path.
 """
@@ -33,4 +33,6 @@ def _apply() -> None:
     import vllm_iluvatar.v1.sample.ops.topk_topp_sampler as impl
 
     p.check_signatures(_m.TopKTopPSampler, impl, ["forward_native"], strict=True)
+    p.check_signatures(_m, impl, ["apply_top_k_top_p"], strict=True)
     _m.TopKTopPSampler.forward_native = impl.forward_native
+    p.rebind_module_func(_m, "apply_top_k_top_p", impl.apply_top_k_top_p)

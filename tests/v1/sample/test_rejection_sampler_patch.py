@@ -66,6 +66,7 @@ def _install_fake_vllm(monkeypatch) -> ModuleType:
     def rejection_random_sample_kernel():
         return "community-random"
 
+    community.sample_recovered_tokens = lambda: None
     community.rejection_sample = rejection_sample
     community.generate_uniform_probs = generate_uniform_probs
     community.rejection_greedy_sample_kernel = rejection_greedy_sample_kernel
@@ -100,19 +101,23 @@ def _load_impl(monkeypatch) -> ModuleType:
 
 
 def test_rejection_sampler_fingerprint_baselines_match_declared_main_source():
-    assert patch_rejection_sampler._OVERRIDES == ["generate_uniform_probs"]
+    assert patch_rejection_sampler._OVERRIDES == [
+        "generate_uniform_probs",
+        "rejection_sample",
+    ]
     assert patch_rejection_sampler._BASELINE_SOURCE_SHAS == {
+        "sample_recovered_tokens": "a9661935216650b56990382b6400f6b030c8441a734a613a9f6acfb0012c3412",
         "rejection_sample": _MAIN_DB9527A468_REJECTION_SAMPLE_SHA,
         "generate_uniform_probs": _MAIN_DB9527A468_GENERATE_UNIFORM_PROBS_SHA,
     }
 
 
-def test_rejection_sampler_impl_keeps_only_float32_uniform_delta(monkeypatch):
+def test_rejection_sampler_impl_preserves_upstream_kernels(monkeypatch):
     _install_fake_vllm(monkeypatch)
     impl = _load_impl(monkeypatch)
     uniform_source = inspect.getsource(impl.generate_uniform_probs)
 
-    assert not hasattr(impl, "rejection_sample")
+    assert callable(impl.rejection_sample)
     assert not hasattr(impl, "rejection_greedy_sample_kernel")
     assert not hasattr(impl, "rejection_random_sample_kernel")
     assert not hasattr(impl, "sample_recovered_tokens_kernel")
@@ -120,7 +125,7 @@ def test_rejection_sampler_impl_keeps_only_float32_uniform_delta(monkeypatch):
     assert "dtype=torch.float32" in uniform_source
 
 
-def test_patch_apply_rebinds_uniform_probs_only(monkeypatch):
+def test_patch_apply_rebinds_entry_points_and_preserves_kernels(monkeypatch):
     community = _install_fake_vllm(monkeypatch)
     impl = _load_impl(monkeypatch)
 
@@ -143,8 +148,8 @@ def test_patch_apply_rebinds_uniform_probs_only(monkeypatch):
 
     assert community.generate_uniform_probs is impl.generate_uniform_probs
     assert consumer.generate_uniform_probs is impl.generate_uniform_probs
-    assert community.rejection_sample is old_sample
-    assert consumer.rejection_sample is old_sample
+    assert community.rejection_sample is impl.rejection_sample
+    assert consumer.rejection_sample is impl.rejection_sample
     assert community.rejection_greedy_sample_kernel is old_greedy
     assert community.rejection_random_sample_kernel is old_random
     assert consumer.rejection_greedy_sample_kernel is old_greedy

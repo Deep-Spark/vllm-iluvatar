@@ -89,6 +89,19 @@ def _coordinate_and_dispatch(rank, rendezvous, override, coordinator_api):
             ((True, False), (0, 5)),
             ((True, True), (3, 5)),
         ]
+        # Independent draft graphs must agree on exact token counts. Exercise
+        # the real collective, including an empty shard, before shared routing.
+        for rows, expected_mode in [((4, 4), 2), ((4, 8), 0), ((0, 4), 0)]:
+            _, sizes, mode = dp_utils.coordinate_batch_across_dp(
+                rows[rank],
+                False,
+                parallel,
+                cudagraph_mode=2,
+                require_uniform_graph_tokens=True,
+            )
+            assert mode == expected_mode
+            assert sizes.tolist() == list(rows)
+
         for phases, rows in steps:
             decode = all(phases)
             if coordinator_api == "legacy":

@@ -144,6 +144,7 @@ def coordinate_batch_across_dp(
     num_tokens_pre_cudagraph_padding: int | None = None,
     sync_decode_only: bool = True,
     return_all_ranks_decode_only: bool = False,
+    require_uniform_graph_tokens: bool = False,
 ) -> (
     tuple[bool, torch.Tensor | None, int] | tuple[bool, torch.Tensor | None, int, bool]
 ):
@@ -189,6 +190,9 @@ def coordinate_batch_across_dp(
     # the local uniform_decode value; publish it and honor the opt-in 4-value
     # return contract the same way as the DP-size-1 early exit above.
     if should_skip_dp_coordination():
+        # Without a collective, exact draft layouts cannot be agreed across DP.
+        if require_uniform_graph_tokens:
+            cudagraph_mode = 0
         should_ubatch = should_attempt_ubatching and not is_last_ubatch_empty(
             num_tokens_unpadded,
             num_tokens_padded,
@@ -231,6 +235,12 @@ def coordinate_batch_across_dp(
     if sync_decode_only and uniform_decode is not None and not all_ranks_decode_only:
         synced_cudagraph_mode = 0
     # <<< ILU MODIFICATION <<<
+
+    # Independent V1 draft graphs cannot pad an unequal DP layout.
+    if require_uniform_graph_tokens and not bool(
+        torch.all(tensor[1] == tensor[1, 0]).item()
+    ):
+        synced_cudagraph_mode = 0
 
     should_ubatch = _post_process_ubatch(tensor, parallel_config.num_ubatches)
     should_dp_pad = synced_cudagraph_mode != 0 or should_ubatch

@@ -170,10 +170,19 @@ class IluNixlWorkerMixin:
             )
 
     @staticmethod
-    def _pp_layer_range(pp_split: str, pp_rank: int) -> tuple[int, int]:
+    def _pp_layer_range(
+        pp_split: str,
+        pp_rank: int,
+        layer_region_ids: dict[str, list[int]] | None = None,
+    ) -> tuple[int, int]:
         split = [int(x) for x in pp_split.split(",")]
         start = sum(split[:pp_rank])
-        return start, start + split[pp_rank]
+        end = start + split[pp_rank]
+        if pp_rank == len(split) - 1 and layer_region_ids:
+            for layer_name in layer_region_ids:
+                with suppress(AssertionError, ValueError):
+                    end = max(end, extract_layer_index(layer_name) + 1)
+        return start, end
 
     def _compute_compatibility_hash(
         self, _cross_layers_blocks: bool | None = None
@@ -1668,9 +1677,13 @@ class IluNixlWorkerMixin:
         nixl_agent_meta: IluNixlAgentMetadata,
         remote_pp_rank: int,
     ) -> tuple[list[np.ndarray], list[np.ndarray], list[int], list[int]]:
-        local_start, local_end = self._pp_layer_range(self.pp_split, self.pp_rank)
+        local_start, local_end = self._pp_layer_range(
+            self.pp_split, self.pp_rank, self.layer_region_ids
+        )
         remote_start, remote_end = self._pp_layer_range(
-            nixl_agent_meta.pp_split, remote_pp_rank
+            nixl_agent_meta.pp_split,
+            remote_pp_rank,
+            nixl_agent_meta.layer_region_ids,
         )
         overlap_start = max(local_start, remote_start)
         overlap_end = min(local_end, remote_end)
@@ -2101,9 +2114,13 @@ class IluNixlWorkerMixin:
         routes: list[_HmaTransferRoute] | None = None
         selected_ssm_remote_ids: list[int] | None = None
         if self._is_hma_required and getattr(self, "_has_mamba", False):
-            local_start, local_end = self._pp_layer_range(self.pp_split, self.pp_rank)
+            local_start, local_end = self._pp_layer_range(
+                self.pp_split, self.pp_rank, self.layer_region_ids
+            )
             remote_start, remote_end = self._pp_layer_range(
-                nixl_agent_meta.pp_split, remote_pp_rank
+                nixl_agent_meta.pp_split,
+                remote_pp_rank,
+                nixl_agent_meta.layer_region_ids,
             )
             overlap_start = max(local_start, remote_start)
             overlap_end = min(local_end, remote_end)
@@ -2532,6 +2549,22 @@ class IluNixlWorkerMixin:
         )
         remote_block_ids = meta.remote.block_ids
         local_block_ids = meta.local_physical_block_ids
+
+        # abort 清理伪请求 / 本地 prefix cache 全命中时会拿到空的 local_block_ids（或空的 remote_block_ids）。
+        # 此时 decode 侧没有任何本地块需要写入，只需向远端各 PP/TP rank 发送释放通知。
+        # 若不跳过下面的 route 对齐检查，会触发 route.local_group_idx >= len([]) 即 0 >= 0 恒真而 raise。
+        if not any(local_block_ids) or not any(remote_block_ids):
+            for remote_key in sorted(self._remote_agents.get(engine_id, ())):
+                notif_id = self._make_pp_aware_notif_id(
+                    meta.remote.request_id, engine_id, remote_key
+                )
+                self.nixl_wrapper.send_notif(
+                    self._remote_agents[engine_id][remote_key],
+                    notif_msg=notif_id,
+                )
+            if getattr(meta, "awaiting_kvs", False):
+                self._recving_transfers.setdefault(req_id, [])
+            return
 
         engine_routes = getattr(self, "_mamba_hma_routes", {}).get(engine_id)
         transfer_group_ids = list(range(len(local_block_ids)))

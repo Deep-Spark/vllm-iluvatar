@@ -49,7 +49,7 @@ def _mqa_logits(*args, **kwargs):
     if kwargs.get("valid_lens") is None and ks is not None and ke is not None:
         kwargs["valid_lens"] = ke - ks
     # INT8 stores K in the same uint8 pages as FP8. Check the query first:
-    # ixinfer is the only kernel that reads an int8 query.
+    # INT8 has local split/owned kernels and the legacy packed dispatch path.
     if q.dtype is torch.int8:
         if kv_scales is not None:
             return ixfops.dsa_indexer_mqa_logits_split(
@@ -68,7 +68,7 @@ def _mqa_logits(*args, **kwargs):
                 previous_extent=previous_extent,
             )
         if owned_logits is not None and previous_extent is not None:
-            return ixfops.dsa_indexer_mqa_logits_ixinfer_owned(
+            return ixfops.dsa_indexer_mqa_logits_owned(
                 q,
                 args[1],
                 args[2],
@@ -497,7 +497,13 @@ def ilu_sparse_attn_indexer_fake(
 direct_register_custom_op(
     op_name="ilu_sparse_attn_indexer",
     op_func=ilu_sparse_attn_indexer,
-    mutates_args=["kv_cache", "topk_indices_buffer", "candidate_blocks", "owned_logits", "previous_extent"],
+    mutates_args=[
+        "kv_cache",
+        "topk_indices_buffer",
+        "candidate_blocks",
+        "owned_logits",
+        "previous_extent",
+    ],
     fake_impl=ilu_sparse_attn_indexer_fake,
     dispatch_key=current_platform.dispatch_key,
 )

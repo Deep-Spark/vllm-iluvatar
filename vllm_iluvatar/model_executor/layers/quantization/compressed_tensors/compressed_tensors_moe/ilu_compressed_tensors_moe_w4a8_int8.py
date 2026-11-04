@@ -7,7 +7,6 @@ describes 4-bit weights with 8-bit activations. Layout is taken from
 ``iluvatar.gemm_format`` and ``iluvatar.pack_version``.
 """
 
-import os
 from typing import Any
 
 import ixformer.inference.functions as ixfops  # type: ignore
@@ -40,9 +39,16 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.utils import set_weight_attrs
 
+from vllm_iluvatar import envs as ilu_envs
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_decode_metadata import (
     _ensure_cuda_graph_safe_dispatch,
     _is_only_decode,
+)
+from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.ilu_w4a8_gemv import (
+    w4a8_group_gemv,
+)
+from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.ilu_w4a8_layout import (  # noqa: E501
+    repack_w4a8_tn_to_nn,
 )
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_utils import (
     W4A8GroupGemmInfo,
@@ -50,9 +56,6 @@ from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_uti
     pad_tensor,
     replace_with_padded,
     unpad_tensor,
-)
-from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.ilu_w4a8_layout import (  # noqa: E501
-    repack_w4a8_tn_to_nn,
 )
 
 logger = init_logger(__name__)
@@ -203,9 +206,9 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         self.weight_symmetric = self.weight_quant.symmetric
         self.gemm_format = ilu_params.get("gemm_format", "")
         # Allocate in checkpoint layout; optionally switch the loaded runtime copy.
-        self.runtime_gemm_format = os.environ.get(
-            "VLLM_ILU_MOE_RUNTIME_LAYOUT", self.gemm_format
-        ).upper()
+        self.runtime_gemm_format = (
+            ilu_envs.VLLM_ILU_MOE_RUNTIME_LAYOUT or self.gemm_format
+        )
         self.version = ilu_params.get("pack_version", -1)
         assert self.version in (1, 2), (
             "IluCompressedTensorsW4A8Int8MoEMethod only supports pack_version 1 or 2"
@@ -916,7 +919,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             output_format=1,
             check_valid=True,
         )
-        act = ixfops.moe_w4a8_group_gemv(
+        act = w4a8_group_gemv(
             input=act,
             weight=layer.w13_weight,
             i_scales=scales,
@@ -936,7 +939,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             expand_tokens_gpu=total,
             limit=layer.swiglu_limit,
         )
-        out = ixfops.moe_w4a8_group_gemv(
+        out = w4a8_group_gemv(
             input=act,
             weight=layer.w2_weight,
             i_scales=scales,
@@ -1070,7 +1073,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 sorted_token_ids=sorted_token_ids,
             )
             if fused is None:
-                act = ixfops.moe_w4a8_group_gemv(
+                act = w4a8_group_gemv(
                     input=act,
                     weight=layer.w13_weight,
                     i_scales=a_scale,
@@ -1136,7 +1139,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 output=out,
             )
         elif run_decode:
-            ixfops.moe_w4a8_group_gemv(
+            w4a8_group_gemv(
                 input=act,
                 weight=layer.w2_weight,
                 i_scales=a_scale,
@@ -1241,7 +1244,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 sorted_token_ids=sorted_token_ids,
             )
             if fused is None:
-                act = ixfops.moe_w4a8_group_gemv(
+                act = w4a8_group_gemv(
                     input=act,
                     weight=layer.w13_weight,
                     i_scales=a_scale,
@@ -1278,7 +1281,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 dst_to_src=sorted_token_ids,
             )
         else:
-            act = ixfops.moe_w4a8_group_gemv(
+            act = w4a8_group_gemv(
                 input=act,
                 weight=layer.w2_weight,
                 i_scales=a_scale,

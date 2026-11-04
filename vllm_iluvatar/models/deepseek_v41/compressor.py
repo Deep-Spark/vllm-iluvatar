@@ -30,6 +30,35 @@ from vllm_iluvatar.models.deepseek_v41.common.ops.fused_compress_quant_cache imp
 )
 
 
+def _overlapping_byte_ranges(first: torch.Tensor, second: torch.Tensor) -> bool:
+    """Conservative host-only alias query; offsets/strides/dtype widths count."""
+    if first.device != second.device or not first.numel() or not second.numel():
+        return False
+    if (
+        first.is_meta
+        and first.untyped_storage()._cdata != second.untyped_storage()._cdata
+    ):
+        return False
+
+    def interval(tensor):
+        start = (
+            tensor.storage_offset() * tensor.element_size()
+            if tensor.is_meta
+            else tensor.data_ptr()
+        )
+        span = (
+            1
+            + sum(
+                (size - 1) * stride
+                for size, stride in zip(tensor.shape, tensor.stride())
+            )
+        ) * tensor.element_size()
+        return start, start + span
+
+    a, b = interval(first), interval(second)
+    return max(a[0], b[0]) < min(a[1], b[1])
+
+
 class IluCompressorBackend(CompressorBackend):
     @staticmethod
     def get_name() -> str:
@@ -37,7 +66,7 @@ class IluCompressorBackend(CompressorBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes(
-        kv_cache_spec: "KVCacheSpec | None" = None,
+        kv_cache_spec: KVCacheSpec | None = None,
     ) -> list[int | MultipleOf]:
         return [MultipleOf(1)]
 
@@ -280,40 +309,77 @@ class IluDeepseekCompressor(nn.Module):
         cache_layer = self._static_forward_context[self.k_cache_prefix]
         fmt = getattr(cache_layer, "compressed_kv_format", None)
         if fmt is not None:
-            from ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_cache import (
+            from ixformer.inference.functions.models.deepseek_v41.kv.common.quantized_kv_cache import (
                 compress_norm_rope_quant_store,
+                rope_quant_store,
             )
 
             metadata = cast(Any, attn_metadata[self.k_cache_prefix])
-            if rotary_emb is None or getattr(metadata, "compressed_kv_format", None) != fmt:
+            if (
+                rotary_emb is None
+                or getattr(metadata, "compressed_kv_format", None) != fmt
+            ):
                 raise ValueError(
                     "Compressed KV producer requires matching format and RoPE metadata"
                 )
             if cache_layer.kv_cache_scales is None:
                 raise RuntimeError("Compressed KV scale plane is not initialized")
-            compress_norm_rope_quant_store(
-                kv_score,
-                positions,
-                state_cache,
-                slot_mapping,
-                query_start_loc,
-                token_to_req_indices,
-                self.norm.weight,
-                self.rms_norm_eps,
-                latent,
-                rotary_emb.cos_sin_cache,
-                cache_layer.kv_cache,
-                cache_layer.kv_cache_scales,
-                metadata.slot_mapping,
-                self.compress_ratio,
-                format=fmt,
-                # PP carriers retain max-batch capacity; the producer writes
-                # exactly this invocation's token rows, including graph pad.
-                row_out=None if row_out is None else row_out[: kv_score.shape[0]],
-                scale_out=(
-                    None if scale_out is None else scale_out[: kv_score.shape[0]]
-                ),
-            )
+            # The V2 allocator packs ring/cache views into one arena. Their
+            # padded byte intervals may overlap even though their logical
+            # records are distinct. Finish pooling/state updates before cache
+            # publication, using the existing pre-RoPE latent, without a clone
+            # or another workspace. Independent CR2 and CR1 keep fusion.
+            pp_rows = None if row_out is None else row_out[: kv_score.shape[0]]
+            pp_scales = None if scale_out is None else scale_out[: kv_score.shape[0]]
+            if (
+                self.compress_ratio == 2
+                and state_cache is not None
+                and _overlapping_byte_ranges(state_cache, cache_layer.kv_cache)
+            ):
+                fused_save_compress_norm(
+                    kv_score,
+                    positions,
+                    state_cache,
+                    slot_mapping,
+                    query_start_loc,
+                    token_to_req_indices,
+                    self.norm.weight,
+                    self.rms_norm_eps,
+                    self.compress_ratio,
+                    latent,
+                )
+                rope_quant_store(
+                    latent,
+                    positions,
+                    rotary_emb.cos_sin_cache,
+                    cache_layer.kv_cache,
+                    cache_layer.kv_cache_scales,
+                    metadata.slot_mapping,
+                    self.compress_ratio,
+                    format=fmt,
+                    row_out=pp_rows,
+                    scale_out=pp_scales,
+                )
+            else:
+                compress_norm_rope_quant_store(
+                    kv_score,
+                    positions,
+                    state_cache,
+                    slot_mapping,
+                    query_start_loc,
+                    token_to_req_indices,
+                    self.norm.weight,
+                    self.rms_norm_eps,
+                    latent,
+                    rotary_emb.cos_sin_cache,
+                    cache_layer.kv_cache,
+                    cache_layer.kv_cache_scales,
+                    metadata.slot_mapping,
+                    self.compress_ratio,
+                    format=fmt,
+                    row_out=pp_rows,
+                    scale_out=pp_scales,
+                )
             workspace = getattr(cache_layer, "compressed_kv_workspace", None)
             if workspace is not None:
                 workspace.main_cache_written()

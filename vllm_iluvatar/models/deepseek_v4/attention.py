@@ -1180,6 +1180,12 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         **extra_impl_args,
     ) -> None:
         super().__init__()
+        if not callable(getattr(ixfops, "flash_mla_sparse_with_kvcache_plan", None)):
+            raise RuntimeError(
+                "DeepSeek-V4 sparse attention requires the matching IxFormer "
+                "sparse-MLA plan API; rebuild/install the companion IxFormer first."
+            )
+
         self.num_heads = num_heads
         self.num_kv_heads = 1
         self.head_dim = head_dim
@@ -1230,11 +1236,6 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             compilation_config.static_forward_context[prefix] = self
 
         self.kv_cache = torch.tensor([])
-
-        # Resolved on the first real batch by ``_inv_rope_fusable`` -- it
-        # needs to see the cos/sin table and the position dtype, which only
-        # arrive with the forward call.
-        self._inv_rope_fused: bool | None = None
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         # vLLM v0.31.0 (db9527a468) KV-cache layout: allocate_kv_cache binds a 4D
@@ -1343,8 +1344,10 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         # The two ``inv_rope_*`` locals are non-None only for the branches
         # that can absorb the rotation; every other slice gets the standalone
         # ``ds4_inv_rope`` after its attention call.
-        fuse_inv_rope = cos_sin_cache is not None and self._inv_rope_fusable(
-            positions, cos_sin_cache
+        # Cache the shared int32 positions once per step. Fusion itself is
+        # decided separately at each complete prefill/decode attention call.
+        fuse_inv_rope = (
+            cos_sin_cache is not None and self.kv_cache_dtype != "fp8_ds_mla"
         )
         inv_rope_cos_sin_cache = cos_sin_cache if fuse_inv_rope else None
         inv_rope_positions = (
@@ -1361,8 +1364,9 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 envs.VLLM_ILU_DS4_PREFILL_AS_DECODE
                 and self.kv_cache_dtype != "fp8_ds_mla"
             )
+            prefill_fused = False
             if prefill_as_decode:
-                self._forward_prefill_as_decode(
+                prefill_fused = self._forward_prefill_as_decode(
                     q=prefill_q,
                     kv_cache=self_kv_cache,
                     positions=positions[num_decode_tokens:],
@@ -1397,7 +1401,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     swa_metadata=swa_metadata,
                 )
 
-            if cos_sin_cache is not None and not (prefill_as_decode and fuse_inv_rope):
+            if cos_sin_cache is not None and not prefill_fused:
                 ixfops.ds4_inv_rope(
                     prefill_out,
                     positions[num_decode_tokens:],
@@ -1406,7 +1410,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 )
         if num_decodes > 0:
             decode_out = output[:num_decode_tokens]
-            self._forward_decode(
+            decode_fused = self._forward_decode(
                 q=q[:num_decode_tokens],
                 kv_cache=self_kv_cache,
                 positions=positions[:num_decode_tokens],
@@ -1420,47 +1424,13 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 inv_rope_cos_sin_cache=inv_rope_cos_sin_cache,
             )
 
-            if cos_sin_cache is not None and not fuse_inv_rope:
+            if cos_sin_cache is not None and not decode_fused:
                 ixfops.ds4_inv_rope(
                     decode_out,
                     positions[:num_decode_tokens],
                     cos_sin_cache,
                     inplace=True,
                 )
-
-    def _inv_rope_fusable(
-        self,
-        positions: torch.Tensor,
-        cos_sin_cache: torch.Tensor,
-    ) -> bool:
-        """Whether this layer's ``flash_mla_sparse_with_kvcache`` calls can
-        absorb the inverse RoPE.
-
-        Two things have to line up. The layer must be on the bf16 decode
-        kernel -- the ``fp8_ds_mla`` cache goes through
-        ``flash_mla_sparse_with_fp8_kvcache``, which has no such epilogue. And
-        the ixformer backend that ``flash_mla_sparse_with_kvcache`` resolves to
-        (which ``IXFORMER_DS4_FLASH_MLA_WITH_KVCACHE_VERSION`` can override
-        out from under us) must implement it for the given cos/sin table and
-        position dtype. All of those are fixed for the lifetime of the
-        process, so the answer is resolved on the first batch and cached.
-        """
-        if self._inv_rope_fused is not None:
-            return self._inv_rope_fused
-
-        if self.kv_cache_dtype == "fp8_ds_mla":
-            supported = False
-        else:
-            supported = ixfops.flash_mla_sparse_with_kvcache_supports_inv_rope(
-                positions=positions,
-                cos_sin_cache=cos_sin_cache,
-            )
-        logger.info_once(
-            "ilu DeepSeek-V4: inverse RoPE fused into flash_mla_sparse_with_kvcache: %s.",
-            "enabled" if supported else "unsupported on this configuration",
-        )
-        self._inv_rope_fused = supported
-        return supported
 
     def _forward_decode(
         self,
@@ -1473,7 +1443,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         output: torch.Tensor,
         inv_rope_positions: torch.Tensor | None = None,
         inv_rope_cos_sin_cache: torch.Tensor | None = None,
-    ) -> None:
+    ) -> bool:
         """Decode-side sparse MLA attention (BF16, ilu V4 W4A8).
 
         Three-branch topk sourcing matches the upstream V4 layout:
@@ -1502,7 +1472,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         ``inv_rope_cos_sin_cache`` (with ``inv_rope_positions``) folds the
         inverse RoPE into that kernel; the caller only sets it when
-        :meth:`_inv_rope_fusable` said yes, and rotates ``output`` itself
+        the complete-call planner admits it, and rotates ``output`` itself
         otherwise. The fp8 branch below never receives it.
         """
         num_decodes = swa_metadata.num_decodes
@@ -1548,12 +1518,13 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         # sparse MLA kernel can attend over per-token topk slices.
         q = q.unsqueeze(1)
 
+        fused = False
         if self.kv_cache_dtype == "fp8_ds_mla":
             # fp8_ds_mla cache is already (num_blocks, block_size, 584);
             # the fp8 attention kernel accepts 3D directly.
             assert inv_rope_cos_sin_cache is None, (
                 "flash_mla_sparse_with_fp8_kvcache has no fused inverse-RoPE "
-                "epilogue; _inv_rope_fusable must reject fp8_ds_mla layers"
+                "epilogue; fp8_ds_mla layers keep standalone inverse RoPE"
             )
             swa_cache = self.swa_cache_layer.kv_cache
             ixfops.flash_mla_sparse_with_fp8_kvcache(
@@ -1574,7 +1545,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             if kv_cache is not None:
                 kv_cache = kv_cache.unsqueeze(-2)
 
-            ixfops.flash_mla_sparse_with_kvcache(
+            args = dict(
                 q=q,
                 k_cache=swa_cache,
                 indices=swa_indices,
@@ -1585,9 +1556,19 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 extra_indices=topk_indices,
                 extra_topk_length=topk_lens,
                 output=output.unsqueeze(1),
+            )
+            backend, fused = ixfops.flash_mla_sparse_with_kvcache_plan(
+                **args,
                 positions=inv_rope_positions,
                 cos_sin_cache=inv_rope_cos_sin_cache,
             )
+            ixfops.flash_mla_sparse_with_kvcache(
+                **args,
+                backend=backend,
+                positions=inv_rope_positions if fused else None,
+                cos_sin_cache=inv_rope_cos_sin_cache if fused else None,
+            )
+        return fused
 
     def _gather_k_cache(
         self,
@@ -1638,7 +1619,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         output: torch.Tensor,
         inv_rope_positions: torch.Tensor | None = None,
         inv_rope_cos_sin_cache: torch.Tensor | None = None,
-    ) -> None:
+    ) -> bool:
         """Prefill-side sparse MLA via the per-token *decode* kernel (bf16 only).
 
         Experimental alternative to :meth:`_forward_prefill` /
@@ -1680,7 +1661,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         num_decode_tokens = swa_metadata.num_decode_tokens
         num_prefill_tokens = swa_metadata.num_prefill_tokens
         if num_prefill_tokens == 0:
-            return
+            return False
 
         swa_indices = swa_metadata.prefill_swa_indices
         swa_lens = swa_metadata.prefill_swa_lens
@@ -1743,7 +1724,7 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         if kv_cache is not None:
             kv_cache = kv_cache.unsqueeze(-2)
 
-        ixfops.flash_mla_sparse_with_kvcache(
+        args = dict(
             q=q,
             k_cache=swa_cache,
             indices=swa_indices,
@@ -1754,9 +1735,19 @@ class IluDeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             extra_indices=topk_indices,
             extra_topk_length=topk_lens,
             output=output.unsqueeze(1),
+        )
+        backend, fused = ixfops.flash_mla_sparse_with_kvcache_plan(
+            **args,
             positions=inv_rope_positions,
             cos_sin_cache=inv_rope_cos_sin_cache,
         )
+        ixfops.flash_mla_sparse_with_kvcache(
+            **args,
+            backend=backend,
+            positions=inv_rope_positions if fused else None,
+            cos_sin_cache=inv_rope_cos_sin_cache if fused else None,
+        )
+        return fused
 
     def _forward_prefill(
         self,

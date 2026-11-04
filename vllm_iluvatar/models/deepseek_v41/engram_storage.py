@@ -155,9 +155,11 @@ def _clear_cuda_last_error():
 
 
 def _cleanup_failed_mapping(mapping, finalizer):
-    if finalizer is not None:
-        with contextlib.suppress(Exception):
-            finalizer()
+    # A callback or its traceback may retain a Tensor storage owner after
+    # local views are detached. The upstream mmap helper has no buffer export
+    # protecting that memory: wait for the last storage reference to die.
+    if finalizer is not None and finalizer.alive:
+        return
     if mapping is not None and not mapping.closed:
         with contextlib.suppress(Exception):
             mapping.close()

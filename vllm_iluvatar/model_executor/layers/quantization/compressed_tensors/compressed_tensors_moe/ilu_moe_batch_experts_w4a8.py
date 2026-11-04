@@ -23,6 +23,9 @@ from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compres
     _group_gemv_format,
     grouped_act_int8,
 )
+from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.ilu_w4a8_gemv import (
+    w4a8_group_gemv,
+)
 
 
 class IluMoEBatchedExpertsW4A8(BaseBatchExperts):
@@ -238,7 +241,7 @@ class IluMoEBatchedExpertsW4A8(BaseBatchExperts):
         w1_bias = self.w1_bias
         w2_bias = self.w2_bias
 
-        output_1 = ixff.moe_w4a8_group_gemv(
+        output_1 = w4a8_group_gemv(
             input=input_1,
             weight=w1,
             i_scales=scale_1,
@@ -261,7 +264,7 @@ class IluMoEBatchedExpertsW4A8(BaseBatchExperts):
             limit=self.swiglu_limit,
         )
 
-        ixff.moe_w4a8_group_gemv(
+        w4a8_group_gemv(
             input=output_2,
             weight=w2,
             i_scales=a2_scale,

@@ -5,20 +5,22 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from ixformer.inference.functions.models.deepseek_v41.mla_sparse.float import (
-    quantized_sparse_mla as facade,
+from ixformer.inference.functions.models.deepseek_v41.kv.common.quantized_kv_cache import (
+    quantize_paged_kv,
 )
-from ixformer.inference.functions.models.deepseek_v41.mla_sparse.float import (
-    quantized_sparse_mla_prefill as prefill_facade,
-)
-from ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_cache import quantize_paged_kv
-from ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_format import (
+from ixformer.inference.functions.models.deepseek_v41.kv.common.quantized_kv_format import (
     I4G32,
     I8G64,
     dequantize_reference,
     quantize_reference,
 )
-from ixformer.inference.functions.models.deepseek_v41.mla_sparse.float.quantized_sparse_mla import (
+from ixformer.inference.functions.models.deepseek_v41.mla_sparse.common import (
+    quantized_sparse_mla as facade,
+)
+from ixformer.inference.functions.models.deepseek_v41.mla_sparse.common import (
+    quantized_sparse_mla_prefill as prefill_facade,
+)
+from ixformer.inference.functions.models.deepseek_v41.mla_sparse.common.quantized_sparse_mla import (
     QuantizedSparseMlaAffineView,
 )
 from vllm.forward_context import override_forward_context
@@ -196,7 +198,10 @@ def test_actual_family_slices_reuse_views_and_reprepare_across_graphs(
     native_prepare = facade.prepare_quantized_sparse_mla_restore_plan
     native_reader = facade.quantized_sparse_mla
     native_prefill = prefill_facade.quantized_sparse_mla_prefill
-    assert prefill_facade.quantized_sparse_mla is native_reader
+    assert (
+        prefill_facade._quantized_sparse_mla_native
+        is facade._quantized_sparse_mla_native
+    )
     mappings, plans, affine_views = [], [], []
 
     def mapped(*args):
@@ -233,9 +238,7 @@ def test_actual_family_slices_reuse_views_and_reprepare_across_graphs(
             torch.testing.assert_close(plan.row_map, before_map, rtol=0, atol=0)
         return result
 
-    monkeypatch.setattr(
-        attention_mod.ixfops, "global_topk_indices_and_lens", mapped
-    )
+    monkeypatch.setattr(attention_mod.ixfops, "global_topk_indices_and_lens", mapped)
     monkeypatch.setattr(facade, "prepare_quantized_sparse_mla_restore_plan", prepared)
     monkeypatch.setattr(facade, "quantized_sparse_mla", guarded_reader)
     monkeypatch.setattr(prefill_facade, "quantized_sparse_mla_prefill", guarded_prefill)

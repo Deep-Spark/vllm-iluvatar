@@ -5,10 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from ixformer.inference.functions.models.deepseek_v41.mla_sparse.float._quantized_sparse_mla_affine import (
+from ixformer.inference.functions.models.deepseek_v41.mla_sparse.common._quantized_sparse_mla_affine import (
     LinearRestoreGeometry,
 )
-from ixformer.inference.functions.models.deepseek_v41.mla_sparse.float.quantized_sparse_mla import (
+from ixformer.inference.functions.models.deepseek_v41.mla_sparse.common.quantized_sparse_mla import (
     QuantizedSparseMlaAffineView,
     QuantizedSparseMlaRestorePlan,
 )

@@ -86,7 +86,7 @@ def main_kv_format():
     value = os.environ.get("VLLM_ILU_DS41_COMPRESSED_KV_FORMAT", "none")
     if value == "none":
         return None
-    from ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_format import (
+    from ixformer.inference.functions.models.deepseek_v41.kv.common.quantized_kv_format import (
         resolve_quant_format,
     )
 
@@ -170,7 +170,7 @@ class CacheBudget:
         retained_mapper_bytes: int = 0,
         prefill_producer: bool = False,
     ):
-        from ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_format import (
+        from ixformer.inference.functions.models.deepseek_v41.kv.common.quantized_kv_format import (
             payload_budget_bytes,
         )
 
@@ -462,10 +462,10 @@ def move_quantized_records(
     Validate both planes before the fused replay writer publishes them on
     the current stream, before the caller emits its layer-ready event.
     """
-    from ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_cache import (
+    from ixformer.inference.functions.models.deepseek_v41.kv.common.quantized_kv_cache import (
         move_paged_records,
     )
-    from ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_format import (
+    from ixformer.inference.functions.models.deepseek_v41.kv.common.quantized_kv_format import (
         resolve_quant_format,
     )
 
@@ -492,6 +492,7 @@ def move_quantized_records(
         or slots.dtype is not torch.int64
         or slots.ndim != 1
         or not slots.is_contiguous()
+        or positions.ndim != 1
         or not positions.is_contiguous()
         or positions.dtype not in (torch.int32, torch.int64)
         or slots.numel() > rows.shape[0]
@@ -504,8 +505,18 @@ def move_quantized_records(
     }
     if len(devices) != 1:
         raise ValueError("Paired compressed-KV PP records must share a device")
+    # PP staging buffers carry capacity; slots describes this transfer's
+    # effective prefix. The native writer requires one row/position per slot.
+    count = slots.numel()
     move_paged_records(
-        rows, scale_rows, cache, scales, slots, positions, compress_ratio, format=fmt
+        rows[:count],
+        scale_rows[:count],
+        cache,
+        scales,
+        slots,
+        positions[:count],
+        compress_ratio,
+        format=fmt,
     )
 
 
@@ -577,8 +588,10 @@ class CompressedKVState:
         from vllm_iluvatar.models.deepseek_v41.indexer_kv import extend_kv_zeroer
 
         extend_kv_zeroer(
-            zeroer, self.layout.num_blocks,
-            (*self.scales.values(), *extra_planes), self.workspace,
+            zeroer,
+            self.layout.num_blocks,
+            (*self.scales.values(), *extra_planes),
+            self.workspace,
         )
 
     def release(self) -> None:

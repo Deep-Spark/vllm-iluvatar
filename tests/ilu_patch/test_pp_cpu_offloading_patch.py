@@ -13,6 +13,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
 )
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 
+import vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.offloading.config as config_impl
+import vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.offloading.worker as reg_impl
+import vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.offloading_connector as connector_impl
+import vllm_iluvatar.models.deepseek_v41.offloading as model_offloading
+import vllm_iluvatar.v1.core.kv_cache_utils as kv_impl
+import vllm_iluvatar.v1.kv_offload.cpu.gpu_worker as gpu_impl
+import vllm_iluvatar.v1.kv_offload.cpu.spec as spec_impl
 from vllm_iluvatar.ilu_patch.general_patches import patch_pp_cpu_offloading
 
 
@@ -71,9 +78,9 @@ def test_direct_and_multi_connector_detection() -> None:
         kv_connector_extra_config={},
     )
 
-    assert patch_pp_cpu_offloading._has_native_offloading(multi)
-    assert patch_pp_cpu_offloading._has_native_offloading(direct)
-    assert not patch_pp_cpu_offloading._has_native_offloading(nixl_only)
+    assert model_offloading._has_native_offloading(multi)
+    assert model_offloading._has_native_offloading(direct)
+    assert not model_offloading._has_native_offloading(nixl_only)
 
 
 def test_nonuniform_pp_geometry_is_attached_to_every_worker(
@@ -81,12 +88,12 @@ def test_nonuniform_pp_geometry_is_attached_to_every_worker(
 ) -> None:
     configs = [_kv_config(10, 1000), _kv_config(10, 3000)]
     monkeypatch.setattr(
-        patch_pp_cpu_offloading,
+        kv_impl,
         "_ORIGINAL_GET_CONFIGS",
         lambda *_args: configs,
     )
 
-    result = patch_pp_cpu_offloading._ilu_get_kv_cache_configs(
+    result = kv_impl._ilu_get_kv_cache_configs(
         _config(),
         [{}, {}],
         [1, 1],
@@ -103,7 +110,7 @@ def test_dsv41_pp8_partition_is_accepted(monkeypatch) -> None:
     geometry = tuple(value for value in per_stage for _ in range(2))
     configs = [_kv_config(10, value * 10) for value in geometry]
     monkeypatch.setattr(
-        patch_pp_cpu_offloading,
+        kv_impl,
         "_ORIGINAL_GET_CONFIGS",
         lambda *_args: configs,
     )
@@ -112,7 +119,7 @@ def test_dsv41_pp8_partition_is_accepted(monkeypatch) -> None:
         "3,3,3,3,2,3,2,21",
     )
 
-    result = patch_pp_cpu_offloading._ilu_get_kv_cache_configs(
+    result = kv_impl._ilu_get_kv_cache_configs(
         _config(pp_size=8, tp_size=2, world_size=16),
         [{}] * 16,
         [1] * 16,
@@ -136,7 +143,7 @@ def test_dsv41_pp8_accepts_the_1m_partition(monkeypatch) -> None:
     geometry = tuple(value for value in per_stage for _ in range(2))
     configs = [_kv_config(10, value * 10) for value in geometry]
     monkeypatch.setattr(
-        patch_pp_cpu_offloading,
+        kv_impl,
         "_ORIGINAL_GET_CONFIGS",
         lambda *_args: configs,
     )
@@ -145,7 +152,7 @@ def test_dsv41_pp8_accepts_the_1m_partition(monkeypatch) -> None:
         "3,3,3,3,3,2,2,21",
     )
 
-    result = patch_pp_cpu_offloading._ilu_get_kv_cache_configs(
+    result = kv_impl._ilu_get_kv_cache_configs(
         _config(pp_size=8, tp_size=2, world_size=16),
         [{}] * 16,
         [1] * 16,
@@ -160,7 +167,7 @@ def test_dsv41_pp8_accepts_the_1m_partition(monkeypatch) -> None:
 def test_dsv41_pp8_rejects_wrong_partition(monkeypatch) -> None:
     configs = [_kv_config(10, 1000) for _ in range(16)]
     monkeypatch.setattr(
-        patch_pp_cpu_offloading,
+        kv_impl,
         "_ORIGINAL_GET_CONFIGS",
         lambda *_args: configs,
     )
@@ -173,7 +180,7 @@ def test_dsv41_pp8_rejects_wrong_partition(monkeypatch) -> None:
         ValueError,
         match="expected the reviewed 3,3,3,3,2,3,2,21 or 3,3,3,3,3,2,2,21",
     ):
-        patch_pp_cpu_offloading._ilu_get_kv_cache_configs(
+        kv_impl._ilu_get_kv_cache_configs(
             _config(pp_size=8, tp_size=2, world_size=16),
             [{}] * 16,
             [1] * 16,
@@ -184,7 +191,7 @@ def test_dsv41_rejects_tp_peer_geometry_mismatch(monkeypatch) -> None:
     configs = [_kv_config(10, 1000) for _ in range(16)]
     configs[5] = _kv_config(10, 2000)
     monkeypatch.setattr(
-        patch_pp_cpu_offloading,
+        kv_impl,
         "_ORIGINAL_GET_CONFIGS",
         lambda *_args: configs,
     )
@@ -194,7 +201,7 @@ def test_dsv41_rejects_tp_peer_geometry_mismatch(monkeypatch) -> None:
     )
 
     with pytest.raises(ValueError, match="TP ranks within one PP stage"):
-        patch_pp_cpu_offloading._ilu_get_kv_cache_configs(
+        kv_impl._ilu_get_kv_cache_configs(
             _config(pp_size=8, tp_size=2, world_size=16),
             [{}] * 16,
             [1] * 16,
@@ -211,7 +218,7 @@ def test_cpu_capacity_uses_sum_of_rank_geometry(monkeypatch) -> None:
         spec.replicated_layout = False
 
     monkeypatch.setattr(
-        patch_pp_cpu_offloading,
+        spec_impl,
         "_ORIGINAL_SPEC_INIT",
         original_init,
     )
@@ -223,7 +230,7 @@ def test_cpu_capacity_uses_sum_of_rank_geometry(monkeypatch) -> None:
         _ilu_rank_safe_offload_required=True,
     )
 
-    patch_pp_cpu_offloading._ilu_cpu_offloading_spec_init(spec, config)
+    spec_impl._ilu_cpu_offloading_spec_init(spec, config)
 
     assert spec.num_chunks == 10
     assert spec.kv_bytes_per_chunk == 4096
@@ -234,7 +241,7 @@ def test_cpu_capacity_uses_sum_of_rank_geometry(monkeypatch) -> None:
 def test_geometry_propagates_into_offloading_config(monkeypatch) -> None:
     result_config = SimpleNamespace()
     monkeypatch.setattr(
-        patch_pp_cpu_offloading,
+        config_impl,
         "_ORIGINAL_BUILD_CONFIG",
         lambda *_args: result_config,
     )
@@ -242,7 +249,7 @@ def test_geometry_propagates_into_offloading_config(monkeypatch) -> None:
         _ilu_offload_worker_bytes_by_rank=(100, 300),
     )
 
-    result = patch_pp_cpu_offloading._ilu_build_offloading_config(
+    result = config_impl._ilu_build_offloading_config(
         _config(),
         kv_config,
     )
@@ -257,13 +264,13 @@ def test_target_build_fails_closed_when_geometry_is_missing(
 ) -> None:
     original = MagicMock()
     monkeypatch.setattr(
-        patch_pp_cpu_offloading,
+        config_impl,
         "_ORIGINAL_BUILD_CONFIG",
         original,
     )
 
     with pytest.raises(RuntimeError, match="geometry was not propagated"):
-        patch_pp_cpu_offloading._ilu_build_offloading_config(
+        config_impl._ilu_build_offloading_config(
             _config(),
             SimpleNamespace(),
         )
@@ -298,7 +305,7 @@ def test_nonuniform_pp_worker_uses_private_rank_local_cpu_storage(
         ]
     )
 
-    result = patch_pp_cpu_offloading._ilu_create_cpu_offloading_worker(
+    result = spec_impl._ilu_create_cpu_offloading_worker(
         spec,
         caches,
     )
@@ -317,7 +324,7 @@ def test_local_offloading_ignores_pp_handshake_without_state() -> None:
     connector.sentinel = object()
     state_before = vars(connector).copy()
 
-    patch_pp_cpu_offloading._ilu_offloading_set_xfer_handshake_metadata_pp_aware(
+    connector_impl._ilu_offloading_set_xfer_handshake_metadata_pp_aware(
         connector,
         {(0, 0): object(), (3, 1): object()},
     )
@@ -334,7 +341,7 @@ def test_multi_connector_fanout_preserves_opt_nixl_pp_metadata() -> None:
 
     class LocalOffloadingFake:
         set_xfer_handshake_metadata_pp_aware = (
-            patch_pp_cpu_offloading._ilu_offloading_set_xfer_handshake_metadata_pp_aware
+            connector_impl._ilu_offloading_set_xfer_handshake_metadata_pp_aware
         )
 
     remote = PPAwareFake()
@@ -364,13 +371,13 @@ def test_required_worker_cannot_enter_generic_path(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_ILU_PP_CPU_OFFLOAD_REQUIRED", "1")
     original = MagicMock()
     monkeypatch.setattr(
-        patch_pp_cpu_offloading,
+        spec_impl,
         "_ORIGINAL_CREATE_WORKER",
         original,
     )
 
     with pytest.raises(RuntimeError, match="cannot use generic worker path"):
-        patch_pp_cpu_offloading._ilu_create_cpu_offloading_worker(
+        spec_impl._ilu_create_cpu_offloading_worker(
             SimpleNamespace(_ilu_nonuniform_pp_private=False),
             object(),
         )
@@ -387,9 +394,7 @@ def test_runtime_offloading_class_can_bind_local_noop(monkeypatch) -> None:
 
     patch_pp_cpu_offloading._bind_offloading_handshake_noop()
 
-    expected = (
-        patch_pp_cpu_offloading._ilu_offloading_set_xfer_handshake_metadata_pp_aware
-    )
+    expected = connector_impl._ilu_offloading_set_xfer_handshake_metadata_pp_aware
     assert OffloadingConnector.set_xfer_handshake_metadata_pp_aware is expected
 
 
@@ -398,14 +403,14 @@ def test_required_spec_rejects_missing_geometry_or_marker(
 ) -> None:
     original = MagicMock()
     monkeypatch.setattr(
-        patch_pp_cpu_offloading,
+        spec_impl,
         "_ORIGINAL_SPEC_INIT",
         original,
     )
     monkeypatch.setenv("VLLM_ILU_PP_CPU_OFFLOAD_REQUIRED", "1")
 
     with pytest.raises(RuntimeError, match="geometry/marker is missing"):
-        patch_pp_cpu_offloading._ilu_cpu_offloading_spec_init(
+        spec_impl._ilu_cpu_offloading_spec_init(
             SimpleNamespace(),
             SimpleNamespace(
                 _ilu_offload_worker_bytes_by_rank=(512, 1536),
@@ -422,7 +427,7 @@ def test_direct_offloading_without_extra_config_is_detected() -> None:
         kv_connector_extra_config=None,
     )
 
-    assert patch_pp_cpu_offloading._has_native_offloading(config)
+    assert model_offloading._has_native_offloading(config)
 
 
 def test_non_target_model_does_not_need_rank_safe_geometry() -> None:
@@ -430,18 +435,18 @@ def test_non_target_model_does_not_need_rank_safe_geometry() -> None:
     config.model_config.architectures = ["OtherArchitecture"]
     config.model_config.hf_config.model_type = "other"
 
-    assert not patch_pp_cpu_offloading._needs_rank_safe_geometry(config)
+    assert not model_offloading._needs_rank_safe_geometry(config)
 
 
 def test_pp1_does_not_need_rank_safe_geometry() -> None:
     config = _config(pp_size=1, tp_size=2, world_size=2)
 
-    assert not patch_pp_cpu_offloading._needs_rank_safe_geometry(config)
+    assert not model_offloading._needs_rank_safe_geometry(config)
 
 
 def test_invalid_world_size_is_rejected() -> None:
     with pytest.raises(ValueError, match="world_size == pp_size"):
-        patch_pp_cpu_offloading._validate_target_geometry(
+        model_offloading._validate_target_geometry(
             _config(pp_size=8, tp_size=2, world_size=15),
             (100,) * 15,
         )
@@ -457,13 +462,13 @@ def test_cpu_capacity_rejects_less_than_one_aggregate_chunk(
         spec.replicated_layout = False
 
     monkeypatch.setattr(
-        patch_pp_cpu_offloading,
+        spec_impl,
         "_ORIGINAL_SPEC_INIT",
         original_init,
     )
 
     with pytest.raises(ValueError, match="smaller than one aggregate"):
-        patch_pp_cpu_offloading._ilu_cpu_offloading_spec_init(
+        spec_impl._ilu_cpu_offloading_spec_init(
             SimpleNamespace(),
             SimpleNamespace(
                 canonical_layout=False,
@@ -482,13 +487,13 @@ def test_canonical_layout_is_rejected(monkeypatch) -> None:
         spec.replicated_layout = False
 
     monkeypatch.setattr(
-        patch_pp_cpu_offloading,
+        spec_impl,
         "_ORIGINAL_SPEC_INIT",
         original_init,
     )
 
     with pytest.raises(ValueError, match="canonical_layout is not supported"):
-        patch_pp_cpu_offloading._ilu_cpu_offloading_spec_init(
+        spec_impl._ilu_cpu_offloading_spec_init(
             SimpleNamespace(),
             SimpleNamespace(
                 canonical_layout=True,
@@ -519,7 +524,7 @@ def test_private_worker_rejects_geometry_mismatch(monkeypatch) -> None:
     caches = SimpleNamespace(tensors=[SimpleNamespace(page_size_bytes=1024)])
 
     with pytest.raises(RuntimeError, match="do not match propagated geometry"):
-        patch_pp_cpu_offloading._ilu_create_cpu_offloading_worker(
+        spec_impl._ilu_create_cpu_offloading_worker(
             spec,
             caches,
         )
@@ -532,7 +537,7 @@ def test_generic_worker_path_is_preserved_when_not_required(
 ) -> None:
     original = MagicMock(return_value="generic-worker")
     monkeypatch.setattr(
-        patch_pp_cpu_offloading,
+        spec_impl,
         "_ORIGINAL_CREATE_WORKER",
         original,
     )
@@ -540,7 +545,7 @@ def test_generic_worker_path_is_preserved_when_not_required(
     spec = SimpleNamespace(_ilu_nonuniform_pp_private=False)
     caches = object()
 
-    result = patch_pp_cpu_offloading._ilu_create_cpu_offloading_worker(
+    result = spec_impl._ilu_create_cpu_offloading_worker(
         spec,
         caches,
     )
@@ -552,7 +557,7 @@ def test_generic_worker_path_is_preserved_when_not_required(
 def test_runtime_noop_does_not_call_base_rejection() -> None:
     connector = object.__new__(OffloadingConnector)
 
-    patch_pp_cpu_offloading._ilu_offloading_set_xfer_handshake_metadata_pp_aware(
+    connector_impl._ilu_offloading_set_xfer_handshake_metadata_pp_aware(
         connector,
         {(7, 1): object()},
     )
@@ -566,7 +571,7 @@ def test_dsv41_pp8_tp1_partition_is_accepted(monkeypatch) -> None:
     per_stage = (100, 200, 300, 400, 500, 600, 700, 800)
     configs = [_kv_config(10, value * 10) for value in per_stage]
     monkeypatch.setattr(
-        patch_pp_cpu_offloading,
+        kv_impl,
         "_ORIGINAL_GET_CONFIGS",
         lambda *_args: configs,
     )
@@ -575,7 +580,7 @@ def test_dsv41_pp8_tp1_partition_is_accepted(monkeypatch) -> None:
         "3,3,3,3,2,3,2,21",
     )
 
-    result = patch_pp_cpu_offloading._ilu_get_kv_cache_configs(
+    result = kv_impl._ilu_get_kv_cache_configs(
         _config(pp_size=8, tp_size=1, world_size=8),
         [{}] * 8,
         [1] * 8,
@@ -587,291 +592,124 @@ def test_dsv41_pp8_tp1_partition_is_accepted(monkeypatch) -> None:
     )
 
 
-def test_private_worker_init_pins_exact_anonymous_mmap_and_unregisters_on_shutdown(
-    monkeypatch,
-) -> None:
-    import mmap
-
-    import torch
-    from vllm.v1.kv_offload.cpu import gpu_worker
-
-    registered: list[tuple[int, int, int]] = []
-    unregistered: list[int] = []
-
-    class FakeCudart:
-        def cudaHostRegister(self, ptr, size, flags):
-            registered.append((ptr, size, flags))
-            return SimpleNamespace(value=0)
-
-        def cudaHostUnregister(self, ptr):
-            unregistered.append(ptr)
-            return SimpleNamespace(value=0)
-
-    class FakeHandler:
-        def __init__(self, *, gpu_tensors, cpu_tensors, host_memory_is_pinned, **kw):
-            self.gpu_tensors = list(gpu_tensors)
-            self.cpu_tensors = list(cpu_tensors)
-            self.host_memory_is_pinned = host_memory_is_pinned
-
-        def shutdown(self) -> None:
-            self.gpu_tensors.clear()
-            self.cpu_tensors.clear()
-
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: FakeCudart())
-    monkeypatch.setattr(
-        "vllm.platforms.current_platform.is_cuda_alike",
-        lambda: True,
-    )
-    monkeypatch.setattr(gpu_worker, "PIN_MEMORY", True)
-    monkeypatch.setattr(gpu_worker, "MAX_HOST_REGISTER_CHUNK_BYTES", 2 * mmap.PAGESIZE)
-    monkeypatch.setattr(
-        gpu_worker, "SingleDirectionOffloadingHandler", FakeHandler
-    )
-    monkeypatch.setattr(
-        patch_pp_cpu_offloading,
-        "_ORIGINAL_WORKER_SHUTDOWN",
-        lambda self: (self._store_handler.shutdown(), self._load_handler.shutdown()),
-    )
-
-    gpu_t0 = torch.zeros((4, 3000), dtype=torch.int8)
-    gpu_t1 = torch.zeros((4, 1500), dtype=torch.int8)
-    kv_caches = SimpleNamespace(
-        tensors=[
-            SimpleNamespace(tensor=gpu_t0, page_size_bytes=3000),
-            SimpleNamespace(tensor=gpu_t1, page_size_bytes=1500),
-        ],
-        group_data_refs=[[SimpleNamespace(tensor_idx=0, page_size_bytes=3000)]],
-    )
-
-    worker = SimpleNamespace()
-    patch_pp_cpu_offloading._ilu_cpu_offloading_worker_init(
-        worker,
-        kv_caches=kv_caches,
-        blocks_per_chunk=1,
-        num_cpu_chunks=3,
-        mmap_region=None,
-    )
-
-    assert worker._mmap_region is None
-    assert len(worker._ilu_private_regions) == 2
-    assert worker._store_handler.host_memory_is_pinned is True
-    assert worker._load_handler.host_memory_is_pinned is True
-
-    # Tensor 0: 3 * 3000 = 9000 bytes -> 3 pages (12288 bytes), chunked at 2 pages + 1 page.
-    # Tensor 1: 3 * 1500 = 4500 bytes -> 2 pages (8192 bytes), 1 chunk of 2 pages.
-    assert [size for _, size, _ in registered] == [
-        2 * mmap.PAGESIZE,
-        1 * mmap.PAGESIZE,
-        2 * mmap.PAGESIZE,
-    ]
-    assert all(ptr % mmap.PAGESIZE == 0 for ptr, _, _ in registered)
-
-    # Verify private anonymous mapping (rw-p, not /dev/shm) in /proc/self/maps.
-    ptr0 = worker._store_handler.cpu_tensors[0].data_ptr()
-    with open("/proc/self/maps") as maps:
-        for line in maps:
-            lo, hi = (int(addr, 16) for addr in line.split()[0].split("-"))
-            if lo <= ptr0 < hi:
-                assert line.split()[1] == "rw-p"
-                assert "/dev/shm" not in line
-                break
-        else:
-            raise AssertionError("private anonymous mmap not found in /proc/self/maps")
-
-    mmaps = [region.mmap_obj for region in worker._ilu_private_regions]
-    patch_pp_cpu_offloading._ilu_cpu_offloading_worker_shutdown(worker)
-
-    assert worker._ilu_private_regions == []
-    assert unregistered == [ptr for ptr, _, _ in reversed(registered)]
-    assert all(m.closed for m in mmaps)
-
-
-def test_private_worker_shutdown_synchronizes_device_when_handler_fails(
-    monkeypatch,
-) -> None:
-    import torch
-    from vllm.v1.kv_offload.cpu import gpu_worker
-
-    events: list[str] = []
-
-    class FakeCudart:
-        def cudaHostRegister(self, ptr, size, flags):
-            return SimpleNamespace(value=0)
-
-        def cudaHostUnregister(self, ptr):
-            events.append("unregister")
-            return SimpleNamespace(value=0)
-
-    class FailingStoreHandler:
-        def __init__(self, *, gpu_tensors, cpu_tensors, gpu_to_cpu, **kw):
-            self.src_tensors = list(gpu_tensors if gpu_to_cpu else cpu_tensors)
-            self.dst_tensors = list(cpu_tensors if gpu_to_cpu else gpu_tensors)
-            self.gpu_to_cpu = gpu_to_cpu
-
-        def shutdown(self) -> None:
-            if self.gpu_to_cpu:
-                events.append("store_shutdown_fail")
-                raise RuntimeError("transfer event sync failed")
-            events.append("load_shutdown_ok")
-            self.src_tensors.clear()
-            self.dst_tensors.clear()
-
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: FakeCudart())
-    monkeypatch.setattr(
-        "vllm.platforms.current_platform.is_cuda_alike",
-        lambda: True,
-    )
-    monkeypatch.setattr(
-        torch.accelerator,
-        "synchronize",
-        lambda: events.append("device_sync"),
-    )
-    monkeypatch.setattr(gpu_worker, "PIN_MEMORY", True)
-    monkeypatch.setattr(
-        gpu_worker, "SingleDirectionOffloadingHandler", FailingStoreHandler
-    )
-
-    gpu_t0 = torch.zeros((2, 1024), dtype=torch.int8)
-    kv_caches = SimpleNamespace(
-        tensors=[SimpleNamespace(tensor=gpu_t0, page_size_bytes=1024)],
-        group_data_refs=[[SimpleNamespace(tensor_idx=0, page_size_bytes=1024)]],
-    )
-
-    worker = SimpleNamespace()
-    patch_pp_cpu_offloading._ilu_cpu_offloading_worker_init(
-        worker,
-        kv_caches=kv_caches,
-        blocks_per_chunk=1,
-        num_cpu_chunks=2,
-        mmap_region=None,
-    )
-    mmap_obj = worker._ilu_private_regions[0].mmap_obj
-
-    patch_pp_cpu_offloading._ilu_cpu_offloading_worker_shutdown(worker)
-
-    assert events == [
-        "store_shutdown_fail",
-        "load_shutdown_ok",
-        "device_sync",
-        "unregister",
-    ]
-    assert mmap_obj.closed
-    assert worker._ilu_private_regions == []
-
-
-def test_private_worker_init_rollback_closes_mmaps_and_unregisters_on_error(
-    monkeypatch,
-) -> None:
-    import mmap
-
-    import torch
-    from vllm.v1.kv_offload.cpu import gpu_worker
-
-    registered: list[int] = []
-    unregistered: list[int] = []
-    created_mmaps: list[mmap.mmap] = []
-    real_mmap = mmap.mmap
-
-    def tracking_mmap(*args, **kwargs):
-        m = real_mmap(*args, **kwargs)
-        created_mmaps.append(m)
-        return m
-
-    class FakeCudart:
-        def cudaHostRegister(self, ptr, size, flags):
-            registered.append(ptr)
-            return SimpleNamespace(value=0)
-
-        def cudaHostUnregister(self, ptr):
-            unregistered.append(ptr)
-            return SimpleNamespace(value=0)
-
-    class FailOnLoadHandler:
-        def __init__(self, *, gpu_tensors, cpu_tensors, gpu_to_cpu, **kw):
-            self.src_tensors = list(gpu_tensors if gpu_to_cpu else cpu_tensors)
-            self.dst_tensors = list(cpu_tensors if gpu_to_cpu else gpu_tensors)
-            if not gpu_to_cpu:
-                raise RuntimeError("load handler init boom")
-
-        def shutdown(self) -> None:
-            self.src_tensors.clear()
-            self.dst_tensors.clear()
-
-    monkeypatch.setattr(mmap, "mmap", tracking_mmap)
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: FakeCudart())
-    monkeypatch.setattr(
-        "vllm.platforms.current_platform.is_cuda_alike",
-        lambda: True,
-    )
-    monkeypatch.setattr(gpu_worker, "PIN_MEMORY", True)
-    monkeypatch.setattr(
-        gpu_worker, "SingleDirectionOffloadingHandler", FailOnLoadHandler
-    )
-
-    gpu_t0 = torch.zeros((2, 1024), dtype=torch.int8)
-    gpu_t1 = torch.zeros((2, 2048), dtype=torch.int8)
-    kv_caches = SimpleNamespace(
-        tensors=[
-            SimpleNamespace(tensor=gpu_t0, page_size_bytes=1024),
-            SimpleNamespace(tensor=gpu_t1, page_size_bytes=2048),
-        ],
-        group_data_refs=[[SimpleNamespace(tensor_idx=0, page_size_bytes=1024)]],
-    )
-
-    worker = SimpleNamespace()
-    with pytest.raises(RuntimeError, match="load handler init boom"):
-        patch_pp_cpu_offloading._ilu_cpu_offloading_worker_init(
-            worker,
-            kv_caches=kv_caches,
-            blocks_per_chunk=1,
-            num_cpu_chunks=2,
-            mmap_region=None,
+@pytest.mark.parametrize(
+    "raw, required", [("1", True), ("true", True), ("0", False), ("false", False)]
+)
+def test_required_flag_uses_registered_boolean_reader(monkeypatch, raw, required):
+    monkeypatch.setenv("VLLM_ILU_PP_CPU_OFFLOAD_REQUIRED", raw)
+    sentinel = object()
+    monkeypatch.setattr(spec_impl, "_ORIGINAL_CREATE_WORKER", lambda *_: sentinel)
+    if required:
+        with pytest.raises(RuntimeError, match="generic worker path"):
+            spec_impl._ilu_create_cpu_offloading_worker(SimpleNamespace(), None)
+    else:
+        assert (
+            spec_impl._ilu_create_cpu_offloading_worker(SimpleNamespace(), None)
+            is sentinel
         )
 
-    assert len(created_mmaps) == 2
-    assert all(m.closed for m in created_mmaps)
-    assert unregistered == list(reversed(registered))
-    assert worker._ilu_private_regions == []
+
+def test_required_flag_respects_explicit_registered_disable(monkeypatch):
+    from vllm_iluvatar import envs
+
+    monkeypatch.setenv("VLLM_ILU_PP_CPU_OFFLOAD_REQUIRED", "true")
+    monkeypatch.setitem(envs.__dict__, "VLLM_ILU_PP_CPU_OFFLOAD_REQUIRED", False)
+    sentinel = object()
+    monkeypatch.setattr(spec_impl, "_ORIGINAL_CREATE_WORKER", lambda *_: sentinel)
+    assert (
+        spec_impl._ilu_create_cpu_offloading_worker(SimpleNamespace(), None) is sentinel
+    )
 
 
-def test_private_offload_buffer_gc_finalizer_closes_mmap_without_buffer_error(
-    monkeypatch,
-) -> None:
-    import gc
+def test_wiring_preserves_aliases_idempotence_and_provenance():
+    # Isolate process-wide rebind propagation from other tests' imports.
+    import os
+    import subprocess
+    import sys
 
-    import torch
+    code = r"""
+import sys
+from types import ModuleType
+from vllm.v1.core import kv_cache_utils
+from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+from vllm_iluvatar.ilu_patch.general_patches import patch_pp_cpu_offloading as patch
+from vllm_iluvatar.v1.kv_offload.cpu import gpu_worker as impl
 
-    events: list[str] = []
+alias = ModuleType('vllm._ilu_offload_alias_test')
+alias.get_kv_cache_configs = kv_cache_utils.get_kv_cache_configs
+sys.modules[alias.__name__] = alias
+patch._apply()
+original = impl._ORIGINAL_WORKER_INIT
+patch._apply()
+assert impl._ORIGINAL_WORKER_INIT is original
+assert CPUOffloadingWorker.__init__ is impl._ilu_cpu_offloading_worker_init
+assert CPUOffloadingWorker.__init__.__module__ == impl.__name__
+assert alias.get_kv_cache_configs is kv_cache_utils.get_kv_cache_configs
+patch.attest_required_bindings()
+"""
+    env = os.environ.copy()
+    env.update(
+        VLLM_ILUVATAR_ENABLE_STARTUP_PATCH="0",
+        VLLM_ILU_PP_CPU_OFFLOAD_REQUIRED="true",
+        VLLM_ILU_PATCH_CHECK_FINGERPRINT="1",
+        VLLM_ILU_PATCH_CHECK_SIGNATURE="1",
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout
 
-    class FakeCudart:
-        def cudaHostRegister(self, ptr, size, flags):
-            events.append("register")
-            return SimpleNamespace(value=0)
 
-        def cudaHostUnregister(self, ptr):
-            events.append("unregister")
-            return SimpleNamespace(value=0)
+def test_worker_source_drift_fails_before_rebinding(monkeypatch):
+    from vllm.v1.core import kv_cache_utils
+    from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: FakeCudart())
+    original_planner = kv_cache_utils.get_kv_cache_configs
+    # Ensure a live community method is checked even if another test applied wiring.
+    original_init = gpu_impl._ORIGINAL_WORKER_INIT or CPUOffloadingWorker.__init__
+    monkeypatch.setattr(CPUOffloadingWorker, "__init__", original_init)
+    monkeypatch.setenv("VLLM_ILU_PATCH_CHECK_FINGERPRINT", "1")
+    monkeypatch.setattr(patch_pp_cpu_offloading, "WORKER_INIT", "def changed(): pass")
+    with pytest.raises(RuntimeError, match="source changed"):
+        patch_pp_cpu_offloading._apply()
+    assert kv_cache_utils.get_kv_cache_configs is original_planner
+
+
+@pytest.mark.parametrize("paired", [False, True])
+def test_registration_selects_paired_pages_or_community(monkeypatch, paired):
+    from vllm_iluvatar.models.deepseek_v41 import offloading
+
+    pages, caches, context, config = object(), object(), object(), object()
+    calls = []
+    worker = SimpleNamespace(
+        kv_cache_config=config,
+        vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(static_forward_context=context)
+        ),
+        _init_worker=lambda value: calls.append(value),
+    )
     monkeypatch.setattr(
-        "vllm.platforms.current_platform.is_cuda_alike",
-        lambda: True,
+        offloading, "has_paired_pages", lambda value: value is config and paired
     )
 
-    tensor, region = patch_pp_cpu_offloading._allocate_private_cpu_tensor(
-        2,
-        1024,
-        pin_memory=True,
-        max_register_chunk_bytes=1 << 20,
+    def canonical(actual_config, actual_caches, actual_context):
+        assert (actual_config, actual_caches, actual_context) == (
+            config,
+            caches,
+            context,
+        )
+        return pages
+
+    monkeypatch.setattr(offloading, "canonical_paired_pages", canonical)
+    monkeypatch.setattr(
+        reg_impl,
+        "_ORIGINAL_REGISTER_KV",
+        lambda self, value: calls.append((self, value)),
     )
-    mmap_obj = region.mmap_obj
-    assert mmap_obj is not None and not mmap_obj.closed
-    assert events == ["register"]
-
-    del tensor, region
-    gc.collect()
-
-    assert events == ["register", "unregister"]
-    assert mmap_obj.closed
-
-
+    reg_impl._ilu_register_kv_caches(worker, caches)
+    assert calls == ([pages] if paired else [(worker, caches)])

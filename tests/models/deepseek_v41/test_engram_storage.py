@@ -190,9 +190,7 @@ def _shared_worker(rank, rendezvous, checkpoint):
     def run():
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
-            formal_ops.engram_lookup_out(
-                ids, device, dev_scales, staged, 3, 8195, 0, 3
-            )
+            formal_ops.engram_lookup_out(ids, device, dev_scales, staged, 3, 8195, 0, 3)
             done.record(stream)
         # Represents preceding decoder work on the main stream.
         output.zero_()
@@ -232,8 +230,9 @@ def _shared_worker(rank, rendezvous, checkpoint):
     dist.destroy_process_group()
 
 
+@pytest.mark.parametrize("retain_view", [False, True])
 def test_map_shared_checkpoint_rows_maps_file_directly_without_shm(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, retain_view
 ):
     import mmap
     import os
@@ -297,10 +296,17 @@ def test_map_shared_checkpoint_rows_maps_file_directly_without_shm(
         else:
             raise AssertionError("shared Engram mapping not found")
 
+    retained = host.view(-1) if retain_view else None
     del host, view
     import gc
 
     gc.collect()
+    if retain_view:
+        assert not mapping.closed
+        assert not unregistered
+        assert retained.numel() == 16 * dim
+        del retained
+        gc.collect()
     assert unregistered == [reg_base]
     assert mapping.closed
 
@@ -404,9 +410,7 @@ def test_map_shared_checkpoint_rows_cleans_up_on_register_view_and_peer_errors(
         out[0] = obj
         out[1] = "RuntimeError: peer failed"
 
-    monkeypatch.setattr(
-        torch.distributed, "all_gather_object", peer_failure_all_gather
-    )
+    monkeypatch.setattr(torch.distributed, "all_gather_object", peer_failure_all_gather)
     with pytest.raises(RuntimeError, match="peer failed"):
         storage.map_shared_checkpoint_rows(
             path, "weight", 0, rows, group2, mod._safetensors_entry
@@ -433,3 +437,60 @@ def test_shared_pages_uva_prefetch_graph(tmp_path):
         args=(f"file://{tmp_path / 'rendezvous'}", path),
         nprocs=2,
     )
+
+
+def test_failed_mapping_waits_for_storage_retained_by_callback(tmp_path, monkeypatch):
+    import gc
+    import mmap
+
+    import ixformer.inference.functions as ixf_ops
+
+    path = str(tmp_path / "small.safetensors")
+    save_file({"weight": torch.ones(8, 256, dtype=torch.uint8)}, path)
+    held, mappings, events = [], [], []
+    real_mmap = mmap.mmap
+
+    def tracked_mmap(*args, **kwargs):
+        mapping = real_mmap(*args, **kwargs)
+        mappings.append(mapping)
+        return mapping
+
+    class FakeCudart:
+        def cudaHostRegister(self, *args):
+            events.append("register")
+            return SimpleNamespace(value=0)
+
+        def cudaHostUnregister(self, *args):
+            events.append("unregister")
+            return SimpleNamespace(value=0)
+
+    def fail_view(tensor):
+        held.append(tensor._base)
+        raise RuntimeError("retained UVA callback failure")
+
+    monkeypatch.setattr(mmap, "mmap", tracked_mmap)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: FakeCudart())
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: True)
+    monkeypatch.setattr(ixf_ops, "get_cuda_view_from_cpu_tensor", fail_view)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda out, obj, group=None: out.__setitem__(0, obj),
+    )
+    with pytest.raises(RuntimeError, match="retained UVA callback failure"):
+        storage.map_shared_checkpoint_rows(
+            path,
+            "weight",
+            0,
+            8,
+            SimpleNamespace(world_size=1, cpu_group=None),
+            mod._safetensors_entry,
+        )
+    assert held[0] is not None and held[0].numel() == 2048
+    assert not mappings[0].closed
+    assert events == ["register"]
+    assert held[0].eq(1).all()
+    held.clear()
+    gc.collect()
+    assert mappings[0].closed
+    assert events == ["register", "unregister"]

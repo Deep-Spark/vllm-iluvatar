@@ -150,6 +150,16 @@ def _ds4_attn_mode() -> str:
     return value
 
 
+def _moe_runtime_layout() -> str | None:
+    value = os.environ.get("VLLM_ILU_MOE_RUNTIME_LAYOUT")
+    if value is None:
+        return None
+    value = value.strip().upper()
+    if value not in ("NN", "TN"):
+        raise ValueError("VLLM_ILU_MOE_RUNTIME_LAYOUT must be NN or TN")
+    return value
+
+
 def _gdn_attn_backend_default() -> str:
     """Enable the tuned ixformer GDN path by default on CoreX30."""
     from vllm_iluvatar.ilu_util.arch import is_ivcore30
@@ -248,6 +258,9 @@ if TYPE_CHECKING:
     VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS: int = 8
     VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS: float = 0.0
     VLLM_ILU_PP_PREFILL_COALESCE_MS: float = 0.0
+
+    VLLM_ILU_MOE_RUNTIME_LAYOUT: str | None = None
+    VLLM_ILU_MOE_W4A8_GEMV_PERF: bool = False
     VLLM_ILU_MOE_EP_LL_MOE_ALGO: str = "GEMV"
     VLLM_ILU_MXFP4_MOE_BACKEND: str = "ixmm"
     VLLM_ILU_REJECTION_SAMPLER_MAX_CHUNK_BYTES: int = 128 * 1024 * 1024
@@ -346,6 +359,9 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
 
 
 _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
+    "VLLM_ILU_MOE_RUNTIME_LAYOUT": _moe_runtime_layout,
+    # Opt in to supported NN MoE W4A8 GEMV perf kernels; layout is separate.
+    "VLLM_ILU_MOE_W4A8_GEMV_PERF": _bool_reader("VLLM_ILU_MOE_W4A8_GEMV_PERF", "0"),
     "VLLM_ILU_GLM5NEXT_MLA_POOL4_DECODE": _bool_reader(
         "VLLM_ILU_GLM5NEXT_MLA_POOL4_DECODE", "1"
     ),

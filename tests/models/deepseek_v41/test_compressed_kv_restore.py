@@ -7,8 +7,11 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
-from ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_format import I4G32, I8G64
-from ixformer.inference.functions.models.deepseek_v41.mla_sparse.float.quantized_sparse_mla import (
+from ixformer.inference.functions.models.deepseek_v41.kv.common.quantized_kv_format import (
+    I4G32,
+    I8G64,
+)
+from ixformer.inference.functions.models.deepseek_v41.mla_sparse.common.quantized_sparse_mla import (
     QuantizedSparseMlaRestoreCapacityError,
 )
 from vllm.forward_context import override_forward_context
@@ -236,7 +239,9 @@ def suffix(
             assert shape == args[6].shape
         kwargs["output"].fill_(args[0].shape[0])
 
-    module = ModuleType("ixformer.inference.functions.models.deepseek_v41.mla_sparse.float.quantized_sparse_mla")
+    module = ModuleType(
+        "ixformer.inference.functions.models.deepseek_v41.mla_sparse.common.quantized_sparse_mla"
+    )
     module.QuantizedSparseMlaRestoreCapacityError = (
         QuantizedSparseMlaRestoreCapacityError
     )
@@ -246,15 +251,13 @@ def suffix(
     module.quantized_sparse_mla = reader
     monkeypatch.setitem(sys.modules, module.__name__, module)
     prefill = ModuleType(
-        "ixformer.inference.functions.models.deepseek_v41.mla_sparse.float.quantized_sparse_mla_prefill"
+        "ixformer.inference.functions.models.deepseek_v41.mla_sparse.common.quantized_sparse_mla_prefill"
     )
     prefill.quantized_sparse_mla_prefill = reader
     monkeypatch.setitem(sys.modules, prefill.__name__, prefill)
     from vllm_iluvatar.models.deepseek_v41 import attention as attention_mod
 
-    monkeypatch.setattr(
-        attention_mod.ixfops, "global_topk_indices_and_lens", mapper
-    )
+    monkeypatch.setattr(attention_mod.ixfops, "global_topk_indices_and_lens", mapper)
     layers = []
     for layer_id in range(21, 40):
         layer = IluDeepseekV41Attention.__new__(IluDeepseekV41Attention)
@@ -554,7 +557,7 @@ def compact_sdk(
         assert lengths.shape[0] == indices.shape[0]
 
     module = ModuleType(
-        "ixformer.inference.functions.models.deepseek_v41.mla_sparse.float.quantized_sparse_mla_compact"
+        "ixformer.inference.functions.models.deepseek_v41.mla_sparse.common.quantized_sparse_mla_compact"
     )
     module.QuantizedSparseMlaCompactCapacityError = CompactCapacityError
     module.make_quantized_sparse_mla_compact_plan = factory
@@ -662,10 +665,10 @@ def test_compact_final_scratch_capacity_failure_restores_the_original_route(
 
 @pytest.mark.parametrize("fmt", [I8G64, I4G32])
 def test_producer_complete_linear_keeps_the_public_affine_route(fmt, monkeypatch):
-    from ixformer.inference.functions.models.deepseek_v41.mla_sparse.float._quantized_sparse_mla_affine import (
+    from ixformer.inference.functions.models.deepseek_v41.mla_sparse.common._quantized_sparse_mla_affine import (
         LinearRestoreGeometry,
     )
-    from ixformer.inference.functions.models.deepseek_v41.mla_sparse.float.quantized_sparse_mla import (
+    from ixformer.inference.functions.models.deepseek_v41.mla_sparse.common.quantized_sparse_mla import (
         QuantizedSparseMlaAffineView,
         QuantizedSparseMlaRestorePlan,
     )
@@ -674,7 +677,9 @@ def test_producer_complete_linear_keeps_the_public_affine_route(fmt, monkeypatch
         fmt, monkeypatch, old=0, prefill_producer=True
     )
     compact = compact_sdk(monkeypatch)
-    module = sys.modules["ixformer.inference.functions.models.deepseek_v41.mla_sparse.float.quantized_sparse_mla"]
+    module = sys.modules[
+        "ixformer.inference.functions.models.deepseek_v41.mla_sparse.common.quantized_sparse_mla"
+    ]
 
     def factory(workspace, indices, dim, **kwargs):
         shape = tuple(indices.shape)
@@ -722,7 +727,9 @@ def test_producer_preserves_existing_owner_table_plans(plane, monkeypatch):
         I8G64, monkeypatch, old=0, prefill_producer=True
     )
     compact = compact_sdk(monkeypatch)
-    module = sys.modules["ixformer.inference.functions.models.deepseek_v41.mla_sparse.float.quantized_sparse_mla"]
+    module = sys.modules[
+        "ixformer.inference.functions.models.deepseek_v41.mla_sparse.common.quantized_sparse_mla"
+    ]
     original_factory = module.make_quantized_sparse_mla_restore_plan
 
     def factory(*args, **kwargs):

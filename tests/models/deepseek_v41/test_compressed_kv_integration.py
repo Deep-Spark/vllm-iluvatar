@@ -9,7 +9,10 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
-from ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_format import I4G32, I8G64
+from ixformer.inference.functions.models.deepseek_v41.kv.common.quantized_kv_format import (
+    I4G32,
+    I8G64,
+)
 from vllm.sequence import IntermediateTensors
 
 from vllm_iluvatar.models.deepseek_v41.attention import IluDeepseekV41Attention
@@ -115,7 +118,7 @@ def test_sparse_reader_reaches_the_selected_native_facade(fmt, prefill, monkeypa
         calls.append((args, kwargs))
         kwargs["output"].fill_(9)
 
-    name = "ixformer.inference.functions.models.deepseek_v41.mla_sparse.float." + (
+    name = "ixformer.inference.functions.models.deepseek_v41.mla_sparse.common." + (
         "quantized_sparse_mla_prefill" if prefill else "quantized_sparse_mla"
     )
     facade = ModuleType(name)
@@ -142,7 +145,9 @@ def test_sparse_reader_reaches_the_selected_native_facade(fmt, prefill, monkeypa
 
 @pytest.mark.parametrize("fmt", [I8G64, I4G32])
 @pytest.mark.parametrize("capacity", [3, 8])
-def test_fused_producer_retains_latent_and_writes_paired_records_once(fmt, capacity, monkeypatch):
+def test_fused_producer_retains_latent_and_writes_paired_records_once(
+    fmt, capacity, monkeypatch
+):
     layer = attention(fmt, ratio=1)
     compressor = IluDeepseekCompressor.__new__(IluDeepseekCompressor)
     torch.nn.Module.__init__(compressor)
@@ -169,9 +174,14 @@ def test_fused_producer_retains_latent_and_writes_paired_records_once(fmt, capac
         kwargs["row_out"].fill_(0x3B)
         kwargs["scale_out"].fill_(2)
 
-    name = "ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_cache"
+    name = (
+        "ixformer.inference.functions.models.deepseek_v41.kv.common.quantized_kv_cache"
+    )
     facade = ModuleType(name)
     facade.compress_norm_rope_quant_store = produce
+    facade.rope_quant_store = lambda *args, **kwargs: pytest.fail(
+        "compress producer must publish once without the rope-only fallback"
+    )
     monkeypatch.setitem(sys.modules, name, facade)
     rotary = SimpleNamespace(cos_sin_cache=torch.empty(8, 64))
     records = torch.zeros(capacity, fmt.payload_bytes(512), dtype=torch.uint8)

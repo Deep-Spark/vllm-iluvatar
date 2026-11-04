@@ -1,12 +1,16 @@
 """Compare published split keys with the original production quantizer."""
 
+import ixformer._C as _ixf_c
 import pytest
 import torch
 from ixformer.inference.functions.models import deepseek_v41 as ixfops
-import ixformer._C as _ixf_c
 from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
 
 from vllm_iluvatar.models.deepseek_v41.indexer_kv import extend_kv_zeroer
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires a CUDA device"
+)
 
 _HAS_SPLIT_STORE_OP = hasattr(
     getattr(_ixf_c, "infer", None), "indexer_norm_rope_int8_store_split"
@@ -15,10 +19,6 @@ _HAS_SPLIT_STORE_OP = hasattr(
 )
 
 
-@pytest.mark.skipif(
-    not _HAS_SPLIT_STORE_OP,
-    reason="requires compiled ixformer indexer_norm_rope_int8_store_split",
-)
 @pytest.mark.parametrize("ratio", [1, 2])
 @pytest.mark.parametrize("tokens", [129, 2048])
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
@@ -31,6 +31,10 @@ def test_split_key_publication_matches_original_production_quantizer(
         indexer_norm_rope_int8_store_split,
     )
 
+    # The compiled dependency is mandatory on supported devices.
+    assert _HAS_SPLIT_STORE_OP, (
+        "required ixformer indexer_norm_rope_int8_store_split binding is missing"
+    )
     torch.manual_seed(1021)
     block = 64
     count = (tokens + block - 1) // block + 2

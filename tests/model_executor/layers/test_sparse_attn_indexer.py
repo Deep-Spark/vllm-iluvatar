@@ -25,7 +25,7 @@ def _install_fake_ixformer(monkeypatch):
     functions = ModuleType("ixformer.inference.functions")
     functions.dsa_indexer_mqa_logits_with_kvcache = object()
     functions.dsa_update_topk_indices = object()
-    functions.dsa_indexer_mqa_logits_ixinfer_owned = object()
+    functions.dsa_indexer_mqa_logits_owned = object()
     monkeypatch.setitem(sys.modules, "ixformer", ixformer)
     monkeypatch.setitem(sys.modules, "ixformer.inference", inference)
     monkeypatch.setitem(sys.modules, "ixformer.inference.functions", functions)
@@ -133,6 +133,43 @@ def test_bf16_score_keeps_original_backend_selection(monkeypatch):
     )
     assert result == "bf16"
     assert "backend" not in calls[0]
+
+
+def test_int8_owned_query_uses_backend_neutral_facade(monkeypatch):
+    sparse_attn_indexer = _load_sparse_attn_indexer(monkeypatch)
+    calls = []
+    output = torch.empty((2, 8), dtype=torch.bfloat16)
+    extent = torch.zeros(2, dtype=torch.int32)
+
+    def owned(*args, **kwargs):
+        calls.append((args, kwargs))
+        return args[6]
+
+    monkeypatch.setattr(
+        sparse_attn_indexer.ixfops, "dsa_indexer_mqa_logits_owned", owned
+    )
+    q = torch.empty((2, 32, 128), dtype=torch.int8)
+    result = sparse_attn_indexer._mqa_logits(
+        q,
+        torch.tensor([0, 2], dtype=torch.int32),
+        torch.tensor([0, 8], dtype=torch.int32),
+        torch.empty((1, 64, 132), dtype=torch.uint8),
+        torch.zeros((1, 1), dtype=torch.int32),
+        torch.empty((2, 32), dtype=torch.float32),
+        owned_logits=output,
+        previous_extent=extent,
+        cu_seqlen_ks=torch.tensor([0, 0], dtype=torch.int32),
+        cu_seqlen_ke=torch.tensor([4, 8], dtype=torch.int32),
+        max_q_len=2,
+        max_kv_len=8,
+    )
+    assert result is output
+    assert len(calls) == 1
+    assert calls[0][0][7] is extent
+    assert "backend" not in calls[0][1]
+    assert torch.equal(
+        calls[0][1]["valid_lens"], torch.tensor([4, 8], dtype=torch.int32)
+    )
 
 
 def test_sparse_attn_indexer_package_is_auto_discovered():

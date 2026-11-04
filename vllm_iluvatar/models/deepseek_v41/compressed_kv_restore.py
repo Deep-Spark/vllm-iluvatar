@@ -114,7 +114,7 @@ def family_key(
     sizing. Equal layouts determine the same native scratch requirement; the
     first consumer queries it and every native reader checks its supplied span.
     """
-    from ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_format import (
+    from ixformer.inference.functions.models.deepseek_v41.kv.common.quantized_kv_format import (
         resolve_quant_format,
     )
 

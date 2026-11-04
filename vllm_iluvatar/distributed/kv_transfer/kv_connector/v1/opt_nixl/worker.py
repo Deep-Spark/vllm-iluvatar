@@ -48,9 +48,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import
 )
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.logger import init_logger
-from vllm.utils.network_utils import make_zmq_path
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
+from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -761,7 +761,8 @@ class NixlConnectorWorker:
         return [(offset + start, size) for start, size in split] + [(offset, whole)]
 
     def _register_kv_views(
-        self, kv_caches: dict[str, torch.Tensor],
+        self,
+        kv_caches: dict[str, torch.Tensor],
         kv_cache_scales: dict[str, torch.Tensor] | None = None,
     ) -> tuple[list, list]:
         """Register every KV view with NIXL.
@@ -786,7 +787,7 @@ class NixlConnectorWorker:
         registered_allocation_sizes: dict[int, int] = {}
         plain_storage_nbytes: int | None = None
         self._reset_registration_mappings()
-        from ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_format import (
+        from ixformer.inference.functions.models.deepseek_v41.kv.common.quantized_kv_format import (
             resolve_quant_format,
         )
 
@@ -852,33 +853,44 @@ class NixlConnectorWorker:
                     seen_base_addresses_check=seen_base_addresses_check,
                     registered_allocation_sizes=registered_allocation_sizes,
                 )
-                if is_quantized_main_spec(layer_spec) or is_split_indexer_spec(layer_spec):
+                if is_quantized_main_spec(layer_spec) or is_split_indexer_spec(
+                    layer_spec
+                ):
                     scales = (kv_cache_scales or {}).get(layer_name)
                     if scales is None:
-                        scales = getattr(forward_context[layer_name], "kv_cache_scales", None)
+                        scales = getattr(
+                            forward_context[layer_name], "kv_cache_scales", None
+                        )
                     if not isinstance(scales, torch.Tensor):
                         raise ValueError(
                             f"{layer_name}: compressed KV registration requires its scale plane"
                         )
                     if is_split_indexer_spec(layer_spec):
-                        scale_registration = (
-                            self._memory_registration_planner.describe_indexer_scale_plane(
-                                layer_name=layer_name, scales=scales, payload=registration,
-                            )
-                        )
-                    else:
-                        fmt = resolve_quant_format(layer_spec.cache_dtype_str)
-                        scale_registration = self._memory_registration_planner.describe_scale_plane(
+                        scale_registration = self._memory_registration_planner.describe_indexer_scale_plane(
                             layer_name=layer_name,
                             scales=scales,
                             payload=registration,
-                            scale_page_bytes=fmt.scale_page_bytes(layer_spec.head_size),
+                        )
+                    else:
+                        fmt = resolve_quant_format(layer_spec.cache_dtype_str)
+                        scale_registration = (
+                            self._memory_registration_planner.describe_scale_plane(
+                                layer_name=layer_name,
+                                scales=scales,
+                                payload=registration,
+                                scale_page_bytes=fmt.scale_page_bytes(
+                                    layer_spec.head_size
+                                ),
+                            )
                         )
                     self._record_registered_kv_region(
-                        layer_name=layer_name, cache=scales, layer_spec=layer_spec,
+                        layer_name=layer_name,
+                        cache=scales,
+                        layer_spec=layer_spec,
                         registration=scale_registration,
                         segments=list(scale_registration.payload_segments),
-                        caches_data=caches_data, seen_base_addresses=seen_base_addresses,
+                        caches_data=caches_data,
+                        seen_base_addresses=seen_base_addresses,
                         seen_base_addresses_check=seen_base_addresses_check,
                         registered_allocation_sizes=registered_allocation_sizes,
                     )
@@ -926,7 +938,9 @@ class NixlConnectorWorker:
 
         main_format = main_kv_format()
         if main_format is not None and host_kv_enabled():
-            raise NotImplementedError("Compressed main KV requires paired direct-VRAM registration")
+            raise NotImplementedError(
+                "Compressed main KV requires paired direct-VRAM registration"
+            )
         self.gpu_kv_cache = kv_caches
         kv_caches = may_override_kv_cache(kv_caches)
         self.cpu_kv_cache = kv_caches
@@ -965,7 +979,9 @@ class NixlConnectorWorker:
         )
         self.compat_hash = compute_nixl_compatibility_hash(self.vllm_config)
 
-        caches_data, seen_base_addresses = self._register_kv_views(kv_caches, kv_cache_scales)
+        caches_data, seen_base_addresses = self._register_kv_views(
+            kv_caches, kv_cache_scales
+        )
         if caches_data:
             self._register_nixl_memory(caches_data, seen_base_addresses)
         else:
@@ -2897,9 +2913,7 @@ class NixlConnectorWorker:
                         remote_engine_id, teardown_id = parse_disconnect_payload(
                             remote_infos
                         )
-                        self._mark_engine_disconnected(
-                            remote_engine_id, teardown_id
-                        )
+                        self._mark_engine_disconnected(remote_engine_id, teardown_id)
                     elif op_type == "connect":
                         node_meta = NodeMeta(**remote_infos)
                         if not self._accepting_work:

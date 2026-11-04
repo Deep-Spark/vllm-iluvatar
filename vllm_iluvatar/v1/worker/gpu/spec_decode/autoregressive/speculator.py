@@ -20,6 +20,15 @@ copy into persistent buffers) and an eager tail (``_generate_draft_tail``:
 in ``__init__`` (regular pool, before any graph pool), so their addresses are
 stable across capture and replay; no graph-pool tensor is held past capture.
 
+Option B still alternates a captured graph replay with an eager all_gather
+tail on the same ixfd communicator. ``make_init_cudagraph_manager`` /
+``make_capture_eager`` add an escape hatch: with
+``speculative_config.enforce_eager`` the draft runs without any CUDA graph, so
+that alternation disappears while the target keeps its decode graph. The
+community ``AutoRegressiveSpeculator`` derives the draft graph mode purely from
+the target's and never reads ``enforce_eager``; ``DFlashSpeculator`` already has
+the equivalent override.
+
 Baseline : v0.31.0 (db9527a468)
 """
 
@@ -31,9 +40,12 @@ from typing import Any
 
 import torch
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     update_draft_inputs,
 )
+
+logger = init_logger(__name__)
 
 
 def make_init(orig_init: Callable[..., None]) -> Callable[..., None]:
@@ -193,3 +205,51 @@ def _generate_draft_tail(self, num_reqs: int) -> None:
         self.num_speculative_steps,
         advance_draft_positions=self.advance_draft_positions,
     )
+
+
+def make_init_cudagraph_manager(
+    orig_init_cg: Callable[..., None],
+) -> Callable[..., None]:
+    """Honor ``speculative_config.enforce_eager`` on autoregressive speculators.
+
+    Community ``init_cudagraph_manager`` derives the draft's graph mode from the
+    target's, so a FULL target decode graph forces FULL draft decode graphs with
+    no way to separate them. Forcing ``NONE`` here runs the draft eagerly while
+    the target keeps its own graphs.
+    """
+
+    @functools.wraps(orig_init_cg)
+    def init_cudagraph_manager(  # type: ignore[no-redef]
+        self, cudagraph_mode: CUDAGraphMode
+    ) -> None:
+        if getattr(self.speculative_config, "enforce_eager", False):
+            logger.info(
+                "%s has speculative_config.enforce_eager=True; running the "
+                "draft eagerly (no CUDA graph for the draft model).",
+                type(self).__name__,
+            )
+            cudagraph_mode = CUDAGraphMode.NONE
+        orig_init_cg(self, cudagraph_mode)
+
+    return init_cudagraph_manager
+
+
+def make_capture_eager(orig_capture: Callable[..., None]) -> Callable[..., None]:
+    """Skip draft CUDA graph capture when the draft runs eagerly.
+
+    Wraps whatever ``capture`` is already installed (including Option B's), so
+    the graph-safe routing stays in place for the non-eager path.
+    """
+
+    @functools.wraps(orig_capture)
+    def capture(self) -> None:  # type: ignore[no-redef]
+        mgr = self.prefill_cudagraph_manager
+        if mgr is not None and mgr.cudagraph_mode == CUDAGraphMode.NONE:
+            logger.info(
+                "Skipping CUDA graph capture for %s (eager draft).",
+                type(self).__name__,
+            )
+            return
+        orig_capture(self)
+
+    return capture

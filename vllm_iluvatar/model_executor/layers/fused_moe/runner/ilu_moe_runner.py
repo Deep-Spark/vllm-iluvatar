@@ -634,7 +634,7 @@ class IluMoERunner(MoERunner):
     #   * one EP all-reduce replaces DP reduce-scatter + TP all-reduce
     #
     # PCP, SP, elastic EP, EPLB and kernels that already reduce stay on
-    # the community schedule. Kill switch: ``VLLM_ILU_FUSE_EP_COMBINE=0``.
+    # the community schedule. Opt in with ``VLLM_ILU_FUSE_EP_COMBINE=1``.
     @property
     def _ilu_fused_ep_combine(self) -> bool:
         cached = self.__dict__.get("_ilu_fused_ep_combine_cached")

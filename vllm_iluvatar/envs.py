@@ -180,7 +180,7 @@ if TYPE_CHECKING:
     VLLM_ILU_CUDAGRAPH_ASYNC_REPLAY: bool = False
     VLLM_ILU_COMPACT_RAGGED_GATHER: bool = False
     VLLM_ILU_DP_VOCAB_GROUP_SIZE: int = 0
-    VLLM_ILU_FUSE_EP_COMBINE: bool = True
+    VLLM_ILU_FUSE_EP_COMBINE: bool = False
     VLLM_ILU_E25_COMPACT_ENGRAM: bool = False
     VLLM_ILU_DS41_DECODE_KV_RESTORE: bool = False
     VLLM_ILU_DS4_PREFILL_OPT: bool = False
@@ -364,9 +364,10 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # AG/RS DP+EP only. Collapses the MoE runner's five collectives per layer
     # (3x dispatch all-gather + DP reduce-scatter + TP all-reduce) into two:
     # one all-gather of hidden_states, and one EP all-reduce that subsumes the
-    # reduce-scatter, the TP reduction, and the shared-expert add. Set to 0 to
-    # go back to the community schedule. See IluMoERunner._ilu_fused_ep_combine.
-    "VLLM_ILU_FUSE_EP_COMBINE": _bool_reader("VLLM_ILU_FUSE_EP_COMBINE", "1"),
+    # reduce-scatter, the TP reduction, and the shared-expert add. Opt in with
+    # VLLM_ILU_FUSE_EP_COMBINE=1 after validating workload performance.
+    # See IluMoERunner._ilu_fused_ep_combine.
+    "VLLM_ILU_FUSE_EP_COMBINE": _bool_reader("VLLM_ILU_FUSE_EP_COMBINE", "0"),
     "VLLM_ILU_E25_COMPACT_ENGRAM": _bool_reader("VLLM_ILU_E25_COMPACT_ENGRAM", "0"),
     "VLLM_ILU_ONCHIP_CHECK": _bool_reader("VLLM_ILU_ONCHIP_CHECK", "0"),
     "VLLM_ILU_ONCHIP_CHECK_LEVEL_MASK": _int_reader(

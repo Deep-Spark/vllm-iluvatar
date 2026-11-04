@@ -287,9 +287,6 @@ class IluW4A8NNMoEMethod(IluCompressedTensorsW4A8Int8MoEMethod):
         )
         a_scale = torch.empty((rows,), dtype=torch.float32, device=x.device)
         if fuse_quant:
-            from vllm.logger import init_logger
-
-            init_logger(__name__).info_once("GLM decode fused quant+gather path")
             ixfops.moe_expand_input_ep_dynamic_scaled_int8(
                 x, src_to_dst, act, a_scale, topk=layer.top_k
             )

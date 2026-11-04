@@ -83,9 +83,6 @@ class IluGateLinear(GateLinear):
             and (self.skip_bias_add or self.bias is None or self.bias.dtype == x.dtype)
             and self.out_dtype in (None, torch.bfloat16)
         ):
-            from vllm.logger import init_logger
-
-            init_logger(__name__).info_once("GLM BF16 torch gate path")
             bias = None if self.skip_bias_add else self.bias
             return torch.nn.functional.linear(x, self.weight, bias), (
                 self.bias if self.skip_bias_add else None

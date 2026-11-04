@@ -5,10 +5,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_format import I4G32, I8G64
-from tests.models.deepseek_v41.test_compressed_kv_state import cache_config
+from ixformer.inference.functions.models.deepseek_v41.kv.common.quantized_kv_format import (
+    I4G32,
+    I8G64,
+)
 from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
 
+from tests.models.deepseek_v41.test_compressed_kv_state import cache_config
 from vllm_iluvatar.models.deepseek_v41.compressed_kv import (
     WORKSPACE_BYTES,
     CompressedKVState,

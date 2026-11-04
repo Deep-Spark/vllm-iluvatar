@@ -4,7 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_format import I4G32, I8G64
+from ixformer.inference.functions.models.deepseek_v41.kv.common.quantized_kv_format import (
+    I4G32,
+    I8G64,
+)
 
 from vllm_iluvatar.models.deepseek_v41.compressed_kv import (
     PAYLOAD_PAGE_BYTES,
@@ -85,13 +88,15 @@ def test_promoted_manager_pages_match_payload_kernel_views(fmt, pages):
     cfg = KVCacheConfig(
         num_blocks=2,
         kv_cache_groups=[KVCacheGroupSpec(["main"], spec)],
-        kv_cache_tensors=[KVCacheTensor(
-            size=2 * spec.page_size_bytes,
-            layers=["main"],
-            offset=0,
-            layer_stride=2 * spec.page_size_bytes,
-            block_stride=spec.page_size_bytes,
-        )],
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=2 * spec.page_size_bytes,
+                layers=["main"],
+                offset=0,
+                layer_stride=2 * spec.page_size_bytes,
+                block_stride=spec.page_size_bytes,
+            )
+        ],
     )
     context = {"main": SimpleNamespace(compressed_kv_format=fmt)}
     state = CompressedKVState(
@@ -115,7 +120,9 @@ def test_promoted_manager_pages_match_payload_kernel_views(fmt, pages):
             layer_name="main", tensor=payload.squeeze(1), spec=spec, num_blocks=2
         )
         scale_registration = planner.describe_scale_plane(
-            layer_name="main", scales=scales, payload=registration,
+            layer_name="main",
+            scales=scales,
+            payload=registration,
             scale_page_bytes=fmt.scale_page_bytes(512),
         )
         assert registration.kernel_blocks == scale_registration.kernel_blocks == pages

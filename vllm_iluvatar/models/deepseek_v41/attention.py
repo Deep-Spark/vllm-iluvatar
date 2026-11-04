@@ -10,11 +10,11 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import ixformer.inference.functions as ixfshared
 import torch
-from ixformer.inference.functions.models import deepseek_v41 as ixfops
 from ixformer.inference.functions import (
     flash_mla_sparse_fwd,
     flash_mla_sparse_with_kvcache,
 )
+from ixformer.inference.functions.models import deepseek_v41 as ixfops
 from torch import nn
 from vllm import envs
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
@@ -56,14 +56,6 @@ from vllm_iluvatar.models.deepseek_v41.common.ops import (
     indexer_k_norm_rope_store,
     move_rows_to_paged_cache,
 )
-from vllm_iluvatar.models.deepseek_v41.compressor import (
-    IluDeepseekCompressor,
-)
-from vllm_iluvatar.models.deepseek_v41.indexer_kv import (
-    SPLIT_INDEXER_FORMAT,
-    indexer_kv_layout,
-)
-from vllm_iluvatar.models.deepseek_v41.rope import apply_rope
 from vllm_iluvatar.models.deepseek_v41.compressed_kv import (
     main_kv_format,
     move_quantized_records,
@@ -84,6 +76,14 @@ from vllm_iluvatar.models.deepseek_v41.query_quant import (
     fused_query_norm,
     query_inputs_are_compatible,
 )
+from vllm_iluvatar.models.deepseek_v41.compressor import (
+    IluDeepseekCompressor,
+)
+from vllm_iluvatar.models.deepseek_v41.indexer_kv import (
+    SPLIT_INDEXER_FORMAT,
+    indexer_kv_layout,
+)
+from vllm_iluvatar.models.deepseek_v41.rope import apply_rope
 from vllm_iluvatar.models.deepseek_v41.sparse_mla import (
     IluDeepseekSparseSWAFlashMLABackend,
     IluDeepseekV4FlashMLABackend,
@@ -161,6 +161,7 @@ def _v41_prefill_fmhadsa() -> bool:
         "V4.1 prefill FMHADSA=on (decode stays on ixformer sparse_mla_fp8_pt)"
     )
     return True
+
 
 # Requests per workspace-gathered prefill chunk. Each one costs a row of
 # ``M * head_dim`` bf16, so this bounds the workspace rather than the batch.
@@ -445,8 +446,7 @@ class IluDeepseekV41IndexerCache(torch.nn.Module, AttentionLayerBase):
             _INDEX_PAGE_ROW_BYTES if record in ("int8", "fp8") else self.head_dim
         )
         logger.info_once(
-            "Indexer cache %s: record=%s dtype=%s row_width=%d "
-            "rows_per_page=%d",
+            "Indexer cache %s: record=%s dtype=%s row_width=%d rows_per_page=%d",
             self.prefix,
             record,
             self.dtype,
@@ -1756,8 +1756,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         return out
 
     def _covered_tokens(self, num_tokens: int) -> int:
-        """Rows the sparse-MLA kernels are guaranteed to write this step.
-        """
+        """Rows the sparse-MLA kernels are guaranteed to write this step."""
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
             return 0
@@ -2188,7 +2187,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             tracker.publish(ticket, selection)
             return selection
 
-        from ixformer.inference.functions.models.deepseek_v41.mla_sparse.float.quantized_sparse_mla import (
+        from ixformer.inference.functions.models.deepseek_v41.mla_sparse.common.quantized_sparse_mla import (
             QuantizedSparseMlaRestoreCapacityError,
             make_quantized_sparse_mla_restore_plan,
             prepare_quantized_sparse_mla_restore_plan,
@@ -2287,7 +2286,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         owners = compact_owner_capacity(indices.numel(), capacity)
         if owners is None:
             return None
-        from ixformer.inference.functions.models.deepseek_v41.mla_sparse.float.quantized_sparse_mla_compact import (
+        from ixformer.inference.functions.models.deepseek_v41.mla_sparse.common.quantized_sparse_mla_compact import (
             QuantizedSparseMlaCompactCapacityError,
             make_quantized_sparse_mla_compact_plan,
             prepare_quantized_sparse_mla_compact_plan,
@@ -2384,11 +2383,11 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                     "Compressed KV attention requires physical row indices and lengths"
                 )
             if prefill:
-                from ixformer.inference.functions.models.deepseek_v41.mla_sparse.float.quantized_sparse_mla_prefill import (
+                from ixformer.inference.functions.models.deepseek_v41.mla_sparse.common.quantized_sparse_mla_prefill import (
                     quantized_sparse_mla_prefill as reader,
                 )
             else:
-                from ixformer.inference.functions.models.deepseek_v41.mla_sparse.float.quantized_sparse_mla import (
+                from ixformer.inference.functions.models.deepseek_v41.mla_sparse.common.quantized_sparse_mla import (
                     quantized_sparse_mla as reader,
                 )
             if self.compressed_kv_workspace is None:

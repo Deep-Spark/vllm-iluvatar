@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
-from collections.abc import Callable
 import os
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -285,22 +285,26 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                     )
                 self.buffer = self.buffer.buffer
 
-            split_dispatch = os.environ.get("IXFORMER_NVSM_DISPATCH_VARIANT") == "batch_split"
-            dispatch_fn = (nvsm_ep.nvsm_low_latency_dispatch_begin if split_dispatch
-                           else nvsm_ep.nvsm_low_latency_dispatch)
-            recv_x, num_tokens_per_local_experts_gpu, recv_scales, *_ = (
-                dispatch_fn(
-                    self.buffer, a1, topk_ids.int(), topk_weights
-                )
+            split_dispatch = nvsm_ep.nvsm_ep_comm_supports_split_dispatch(self.buffer)
+            dispatch_fn = (
+                nvsm_ep.nvsm_low_latency_dispatch_begin
+                if split_dispatch
+                else nvsm_ep.nvsm_low_latency_dispatch
+            )
+            recv_x, num_tokens_per_local_experts_gpu, recv_scales, *_ = dispatch_fn(
+                self.buffer, a1, topk_ids.int(), topk_weights
             )
 
             expert_tokens_meta = mk.ExpertTokensMetadata(
                 expert_num_tokens=num_tokens_per_local_experts_gpu,
                 expert_num_tokens_cpu=None,
             )
+
             def receive():
                 if split_dispatch:
-                    nvsm_ep.nvsm_low_latency_dispatch_finish(self.buffer, recv_x, recv_scales)
+                    nvsm_ep.nvsm_low_latency_dispatch_finish(
+                        self.buffer, recv_x, recv_scales
+                    )
                 return recv_x, recv_scales, expert_tokens_meta, None, None
 
             if split_dispatch and not getattr(self, "_split_dispatch_reported", False):

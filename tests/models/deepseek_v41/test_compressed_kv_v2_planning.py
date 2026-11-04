@@ -8,7 +8,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_format import I4G32, I8G64
+from ixformer.inference.functions.models.deepseek_v41.kv.common.quantized_kv_format import (
+    I4G32,
+    I8G64,
+)
 from vllm.config import CacheConfig
 from vllm.v1.core import kv_cache_utils
 from vllm.v1.worker.utils import allocate_kv_cache

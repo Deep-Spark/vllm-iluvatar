@@ -110,7 +110,11 @@ def test_real_1m_allocator_budgets_only_owning_and_forwarded_index_keys(
     """Use production grouping and the requested PP8 cut, without GPU allocation."""
     import inspect
 
-    from ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_format import I4G32
+    from ixformer.inference.functions.models.deepseek_v41.kv.common.quantized_kv_format import (
+        I4G32,
+    )
+    from vllm.v1.core import kv_cache_utils
+
     from tests.models.deepseek_v41.test_compressed_kv_v2_planning import (
         INDEX_SOURCES,
         RATIOS,
@@ -118,8 +122,6 @@ def test_real_1m_allocator_budgets_only_owning_and_forwarded_index_keys(
         config,
         specs_for_rank,
     )
-    from vllm.v1.core import kv_cache_utils
-
     from vllm_iluvatar.models.deepseek_v41.compressed_kv import (
         CacheBudget,
         plan_scale_layout,

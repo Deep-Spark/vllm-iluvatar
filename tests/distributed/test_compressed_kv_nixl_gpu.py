@@ -10,7 +10,10 @@ import msgspec
 import numpy as np
 import pytest
 import torch
-from ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_format import I4G32, I8G64
+from ixformer.inference.functions.models.deepseek_v41.kv.common.quantized_kv_format import (
+    I4G32,
+    I8G64,
+)
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.opt_nixl.layer_mapping import (

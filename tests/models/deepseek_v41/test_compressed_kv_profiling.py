@@ -10,10 +10,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_format import I4G32, I8G64
-from tests.models.deepseek_v41.test_compressed_kv_v2_planning import (
-    config,
-    specs_for_rank,
+from ixformer.inference.functions.models.deepseek_v41.kv.common.quantized_kv_format import (
+    I4G32,
+    I8G64,
 )
 from vllm.config import CUDAGraphMode
 from vllm.v1.worker.gpu.attn_utils import init_kv_cache
@@ -24,6 +23,10 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.utils import KVBlockZeroer
 
+from tests.models.deepseek_v41.test_compressed_kv_v2_planning import (
+    config,
+    specs_for_rank,
+)
 from vllm_iluvatar.models.deepseek_v41.compressed_kv import (
     PREFILL_WORKSPACE_BYTES,
     WORKSPACE_BYTES,

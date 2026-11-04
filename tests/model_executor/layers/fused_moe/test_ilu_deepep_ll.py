@@ -535,3 +535,66 @@ def test_moe_disables_ll_shared_dispatch_overlap_by_default(monkeypatch):
     assert _ll_shared_dispatch_overlap_enabled() is False
     monkeypatch.setenv("VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP", "1")
     assert _ll_shared_dispatch_overlap_enabled() is True
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_prepare_uses_communicator_capability_after_environment_change(
+    monkeypatch, split
+):
+    from ixformer.distributed import nvsm_ep
+
+    comm = object()
+    calls = []
+    outputs = (torch.zeros(1, 1, 5120), torch.ones(1, dtype=torch.int32), None)
+    monkeypatch.setattr(ilu_deepep_ll, "DISABLE_DEEPEP", True)
+    monkeypatch.setattr(ilu_deepep_ll, "dbo_current_ubatch_id", lambda: 0)
+    monkeypatch.setattr(
+        ilu_deepep_ll,
+        "nvsm_dispatch_quant_kwargs",
+        lambda config: {
+            "use_int8": True,
+            "use_fp8": False,
+        },
+    )
+    monkeypatch.setenv(
+        "IXFORMER_NVSM_DISPATCH_VARIANT", "0" if split else "batch_split"
+    )
+
+    def capability(actual):
+        assert actual is comm
+        return split
+
+    monkeypatch.setattr(nvsm_ep, "nvsm_ep_comm_supports_split_dispatch", capability)
+    for name in ("nvsm_low_latency_dispatch", "nvsm_low_latency_dispatch_begin"):
+
+        def dispatch(*args, _name=name):
+            calls.append(_name)
+            assert args[0] is comm
+            return outputs
+
+        monkeypatch.setattr(nvsm_ep, name, dispatch)
+    monkeypatch.setattr(
+        nvsm_ep,
+        "nvsm_low_latency_dispatch_finish",
+        lambda *args: calls.append("finish"),
+    )
+    prepare = ilu_deepep_ll.DeepEPLLPrepareAndFinalize.__new__(
+        ilu_deepep_ll.DeepEPLLPrepareAndFinalize
+    )
+    prepare.buffer = comm
+    _, receive = prepare.prepare_async(
+        torch.zeros(1, 5120),
+        torch.ones(1, 6),
+        torch.zeros(1, 6, dtype=torch.int32),
+        384,
+        None,
+        False,
+        object(),
+    )
+    result = receive()
+    assert result[0] is outputs[0]
+    assert calls == (
+        ["nvsm_low_latency_dispatch_begin", "finish"]
+        if split
+        else ["nvsm_low_latency_dispatch"]
+    )

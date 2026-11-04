@@ -5,17 +5,21 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from ixformer.inference.functions.models.deepseek_v41.mla_sparse.float import quantized_sparse_mla as facade
-from ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_cache import quantize_paged_kv
-from ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_format import (
+from ixformer.inference.functions.models.deepseek_v41.kv.common.quantized_kv_cache import (
+    quantize_paged_kv,
+)
+from ixformer.inference.functions.models.deepseek_v41.kv.common.quantized_kv_format import (
     I4G32,
     I8G64,
     dequantize_reference,
     quantize_reference,
 )
-from tests.models.deepseek_v41.test_compressed_kv_restore_gpu import oracle
+from ixformer.inference.functions.models.deepseek_v41.mla_sparse.common import (
+    quantized_sparse_mla as facade,
+)
 from vllm.forward_context import override_forward_context
 
+from tests.models.deepseek_v41.test_compressed_kv_restore_gpu import oracle
 from vllm_iluvatar.models.deepseek_v41.attention import IluDeepseekV41Attention
 from vllm_iluvatar.models.deepseek_v41.compressed_kv import (
     WORKSPACE_BYTES,
@@ -142,9 +146,7 @@ def test_decode_capture_reuses_map_with_changed_inputs_pages_and_aliases(
             "Pure decode capture must not size, create or prepare restored rows"
         )
 
-    monkeypatch.setattr(
-        attention_mod.ixfops, "global_topk_indices_and_lens", mapped
-    )
+    monkeypatch.setattr(attention_mod.ixfops, "global_topk_indices_and_lens", mapped)
     prepares = []
     for name in (
         "quantized_sparse_mla_scratch_bytes",
@@ -155,9 +157,9 @@ def test_decode_capture_reuses_map_with_changed_inputs_pages_and_aliases(
             if name == "prepare_quantized_sparse_mla_restore_plan":
                 original_prepare = getattr(facade, name)
 
-                def prepared(*args, **kwargs):
+                def prepared(*args, _original_prepare=original_prepare, **kwargs):
                     prepares.append(args[4])
-                    return original_prepare(*args, **kwargs)
+                    return _original_prepare(*args, **kwargs)
 
                 monkeypatch.setattr(facade, name, prepared)
         else:

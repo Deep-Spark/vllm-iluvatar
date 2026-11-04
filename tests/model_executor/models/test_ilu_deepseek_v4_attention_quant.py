@@ -174,3 +174,93 @@ def test_c4a_merged_weight_lifecycle_concatenates_once(
         torch.bfloat16,
     )
     assert wrapper._c4a_merged_wq_b_weight is first_weight
+
+
+@pytest.mark.parametrize(
+    "first,second", [((True, False), (False, True)), ((True, True), (False, False))]
+)
+def test_sparse_inverse_rope_is_planned_for_each_slice_and_batch(
+    first, second, monkeypatch
+):
+    owner = attention.IluDeepseekV4MLAAttention.__new__(
+        attention.IluDeepseekV4MLAAttention
+    )
+    torch.nn.Module.__init__(owner)
+    owner.prefix, owner.compress_ratio = "main", 1
+    owner.kv_cache_dtype, owner.scale = "bfloat16", 0.1
+    owner.attn_sink = torch.zeros(16)
+    owner.kv_cache = torch.empty(0)
+    owner.swa_cache_layer = SimpleNamespace(
+        prefix="swa", kv_cache=torch.zeros(2, 64, 512, dtype=torch.bfloat16)
+    )
+    md = SimpleNamespace(
+        num_decodes=2,
+        num_prefills=1,
+        num_decode_tokens=2,
+        num_prefill_tokens=3,
+        decode_swa_indices=torch.zeros(2, 1, 128, dtype=torch.int32),
+        decode_swa_lens=torch.full((2,), 128, dtype=torch.int32),
+        prefill_swa_indices=torch.zeros(3, 1, 128, dtype=torch.int32),
+        prefill_swa_lens=torch.full((3,), 128, dtype=torch.int32),
+    )
+    monkeypatch.setattr(
+        attention,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"swa": md}),
+    )
+    monkeypatch.setattr(attention.envs, "VLLM_ILU_DS4_PREFILL_AS_DECODE", True)
+    decisions, planned, executed, rotations = [], [], [], []
+
+    def plan(**kw):
+        assert set(
+            (
+                "q",
+                "k_cache",
+                "indices",
+                "topk_length",
+                "sm_scale",
+                "attn_sink",
+                "extra_k_cache",
+                "extra_indices",
+                "extra_topk_length",
+                "output",
+                "positions",
+                "cos_sin_cache",
+            )
+        ) <= set(kw)
+        planned.append(kw["q"].shape[0])
+        return "ixformer_perf", decisions.pop(0)
+
+    def execute(**kw):
+        executed.append((kw["q"].shape[0], kw["backend"], kw["positions"] is not None))
+        assert (kw["positions"] is None) == (kw["cos_sin_cache"] is None)
+        kw["output"].zero_()
+
+    monkeypatch.setattr(attention.ixfops, "flash_mla_sparse_with_kvcache_plan", plan)
+    monkeypatch.setattr(attention.ixfops, "flash_mla_sparse_with_kvcache", execute)
+    monkeypatch.setattr(
+        attention.ixfops,
+        "ds4_inv_rope",
+        lambda value, *a, **kw: rotations.append(value.shape[0]),
+    )
+    q = torch.zeros(5, 16, 512, dtype=torch.bfloat16)
+    positions = torch.arange(5)
+    trig = torch.zeros(8, 64)
+    for choices in (first, second):
+        decisions[:] = choices
+        planned.clear()
+        executed.clear()
+        rotations.clear()
+        owner.forward(
+            q=q,
+            kv=None,
+            positions=positions,
+            output=torch.empty_like(q),
+            cos_sin_cache=trig,
+        )
+        assert planned == [3, 2]
+        assert executed == [
+            (3, "ixformer_perf", choices[0]),
+            (2, "ixformer_perf", choices[1]),
+        ]
+        assert rotations == [n for n, fused in zip((3, 2), choices) if not fused]

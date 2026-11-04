@@ -7,14 +7,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_cache import (
+from ixformer.inference.functions.models.deepseek_v41.kv.common.quantized_kv_cache import (
     dequantize_paged_kv,
     quantize_paged_kv,
 )
-from ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_format import I4G32, I8G64
-from tests.models.deepseek_v41.test_compressed_kv_profiling import (
-    ProfilingRunner,
-    assert_clean,
+from ixformer.inference.functions.models.deepseek_v41.kv.common.quantized_kv_format import (
+    I4G32,
+    I8G64,
 )
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.config import CUDAGraphMode
@@ -27,6 +26,10 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.worker.gpu.cudagraph_utils import _teardown_profiling_state
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
+from tests.models.deepseek_v41.test_compressed_kv_profiling import (
+    ProfilingRunner,
+    assert_clean,
+)
 from vllm_iluvatar.models.deepseek_v41.compressed_kv import (
     WORKSPACE_BYTES,
     CompressedKVState,
@@ -39,6 +42,20 @@ pytestmark = pytest.mark.skipif(
     os.environ.get("KV_COMPRESSED_KV_GPU_TESTS") != "1",
     reason="requires an explicitly leased GPU and KV_COMPRESSED_KV_GPU_TESTS=1",
 )
+
+
+@pytest.fixture(autouse=True)
+def non_default_capture_stream():
+    """The real vLLM capture manager requires a non-default CUDA stream."""
+    previous = torch.cuda.current_stream()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(previous)
+    try:
+        with torch.cuda.stream(stream):
+            yield
+    finally:
+        previous.wait_stream(stream)
+        stream.synchronize()
 
 
 class PairModel(torch.nn.Module):

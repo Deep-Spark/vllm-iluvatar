@@ -1,6 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Corresponds to: vllm/v1/core/kv_cache_utils.py
 
+PP geometry adapter (wired by patch_pp_cpu_offloading):
+Target   : get_kv_cache_configs
+Baseline : v0.31.0 (341bf7d4d124)
+Why      : Preserve non-uniform DSV4.1 PP rank-local offload capacity.
+How      : Delegate the community planner/shrink loop and attach rank geometry.
+Scope    : Only DSV4.1 native PP CPU offload; all other configs delegate unchanged.
+Remove   : When community propagates non-uniform per-rank offload geometry.
+
 ILU override implementations for attention quantization (Int8 KV cache
 scale) and FP8 wire staging.
 
@@ -85,6 +93,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_iluvatar import envs as ilu_envs
 from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.fp8_layout import (
     FP8_WIRE_SCRATCH_BUFFER_COUNT,
     build_fp8_ds_mla_wire_config,
@@ -92,6 +101,13 @@ from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.fp8_layout i
     get_fp8_wire_scratch_blocks,
     packed_bytes_per_block,
     use_fp8_ds_mla_wire_staging,
+)
+from vllm_iluvatar.models.deepseek_v41.offloading import (
+    _GEOMETRY_ATTR,
+    _has_native_offloading,
+    _needs_rank_safe_geometry,
+    _validate_target_geometry,
+    _worker_bytes_per_block,
 )
 
 logger = init_logger(__name__)
@@ -349,9 +365,7 @@ class _OrderedWorkerSpecs:
         count, so the same projected groups can be planned more than once.
         """
         layer_names = {
-            layer_name
-            for group in kv_cache_groups
-            for layer_name in group.layer_names
+            layer_name for group in kv_cache_groups for layer_name in group.layer_names
         }
         matches = [spec for spec in self.specs if set(spec) == layer_names]
         if not matches:
@@ -526,3 +540,57 @@ def make_generate_scheduler_kv_cache_config(
         return cfg
 
     return generate_scheduler_kv_cache_config
+
+
+_ORIGINAL_GET_CONFIGS = None
+
+
+# [ILU override] get_kv_cache_configs — delta: propagate rank-local PP geometry.
+def _ilu_get_kv_cache_configs(vllm_config, kv_cache_specs, available_memory):
+    assert _ORIGINAL_GET_CONFIGS is not None
+    needs_geometry = _needs_rank_safe_geometry(vllm_config)
+    if ilu_envs.VLLM_ILU_PP_CPU_OFFLOAD_REQUIRED:
+        model = getattr(vllm_config, "model_config", None)
+        hf_config = getattr(model, "hf_config", None)
+        parallel = vllm_config.parallel_config
+        transfer = getattr(vllm_config, "kv_transfer_config", None)
+        logger.info(
+            "DSV4.1 PP CPU offload target gate: architecture=%s, "
+            "model_type=%s, pp_size=%d, tp_size=%d, world_size=%d, "
+            "connector=%s, offloading_child=%s, "
+            "needs_rank_safe_geometry=%s",
+            getattr(model, "architectures", None),
+            getattr(hf_config, "model_type", None),
+            parallel.pipeline_parallel_size,
+            parallel.tensor_parallel_size,
+            parallel.world_size,
+            getattr(transfer, "kv_connector", None),
+            _has_native_offloading(vllm_config),
+            needs_geometry,
+        )
+        if not needs_geometry:
+            raise RuntimeError(
+                "Required DSV4.1 PP CPU offload target predicate is false"
+            )
+    configs = _ORIGINAL_GET_CONFIGS(
+        vllm_config,
+        kv_cache_specs,
+        available_memory,
+    )
+    if not needs_geometry:
+        return configs
+
+    geometry = tuple(_worker_bytes_per_block(config) for config in configs)
+    _validate_target_geometry(vllm_config, geometry)
+    for config in configs:
+        setattr(config, _GEOMETRY_ATTR, geometry)
+    logger.info(
+        "DSV4.1 PP CPU offload rank geometry: bytes_per_block=%s, "
+        "aggregate_bytes_per_block=%d, world_size=%d, pp_size=%d, tp_size=%d",
+        geometry,
+        sum(geometry),
+        vllm_config.parallel_config.world_size,
+        vllm_config.parallel_config.pipeline_parallel_size,
+        vllm_config.parallel_config.tensor_parallel_size,
+    )
+    return configs

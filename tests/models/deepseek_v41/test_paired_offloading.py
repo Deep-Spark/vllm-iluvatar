@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from ixformer.inference.functions.models.deepseek_v41.kv.float.quantized_kv_format import (
+from ixformer.inference.functions.models.deepseek_v41.kv.common.quantized_kv_format import (
     I4G32,
     I8G64,
 )
@@ -16,9 +16,6 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 
-from vllm_iluvatar.ilu_patch.general_patches.patch_pp_cpu_offloading import (
-    _worker_bytes_per_block,
-)
 from vllm_iluvatar.models.deepseek_v41.compressed_kv import (
     CompressedKVState,
     plan_scale_layout,
@@ -29,6 +26,7 @@ from vllm_iluvatar.models.deepseek_v41.indexer_kv import (
     plan_indexer_scales,
 )
 from vllm_iluvatar.models.deepseek_v41.offloading import (
+    _worker_bytes_per_block,
     canonical_paired_pages,
     plan_offload_layout,
 )
@@ -164,6 +162,9 @@ def test_native_cpu_worker_restores_payload_and_scales_as_one_group(fmt, block_o
     from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
     from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 
+    from vllm_iluvatar.ilu_patch.general_patches import patch_pp_cpu_offloading
+
+    patch_pp_cpu_offloading._apply()
     config, caches, context, states = paired_cache(fmt, block_outer, "cuda")
     worker = None
     try:
@@ -173,6 +174,9 @@ def test_native_cpu_worker_restores_payload_and_scales_as_one_group(fmt, block_o
         expected = [tensor.tensor[1].clone() for tensor in canonical.tensors]
         untouched = [tensor.tensor[0].clone() for tensor in canonical.tensors]
         worker = CPUOffloadingWorker(canonical, blocks_per_chunk=1, num_cpu_chunks=2)
+        assert worker._mmap_region is None
+        assert len(worker._ilu_private_regions) == len(canonical.tensors)
+        assert all(region.is_pinned for region in worker._ilu_private_regions)
         groups = len(canonical.group_data_refs)
         src = GPULoadStoreSpec([1] * groups, [1] * groups, [1] * groups)
         cpu = CPULoadStoreSpec([0] * groups)

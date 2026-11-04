@@ -23,11 +23,15 @@ def _pack_reference(raw: torch.Tensor, layout: str) -> torch.Tensor:
     rows, columns = raw.shape[-2:]
     pairs = raw.view(experts, rows, columns // 32, 32)
     return (
-        (pairs[..., :16] & 0x0F) | (pairs[..., 16:] << 4)
-    ).reshape(experts, rows, columns // 2).contiguous()
+        ((pairs[..., :16] & 0x0F) | (pairs[..., 16:] << 4))
+        .reshape(experts, rows, columns // 2)
+        .contiguous()
+    )
 
 
-@pytest.mark.parametrize("shape", [(2, 128, 256), (3, 256, 128), (1, 144, 192), (1, 129, 257)])
+@pytest.mark.parametrize(
+    "shape", [(2, 128, 256), (3, 256, 128), (1, 144, 192), (1, 129, 257)]
+)
 def test_tn_to_nn_matches_reference_with_padding(shape):
     experts, n, k = shape
     torch.manual_seed(19 + n + k)
@@ -70,9 +74,7 @@ def test_tn_to_nn_matches_ixformer_v2_packer():
     torch.manual_seed(42)
     raw = torch.randint(-8, 8, (2, 128, 256), dtype=torch.int8).float() * 18
     tn, _, _ = quant_repack_int4(raw, group_size=-1, version=2, format="TN")
-    expected, _, _ = quant_repack_int4(
-        raw, group_size=-1, version=2, format="NN"
-    )
+    expected, _, _ = quant_repack_int4(raw, group_size=-1, version=2, format="NN")
     actual = repack_w4a8_tn_to_nn(
         tn,
         logical_n=128,
@@ -86,11 +88,11 @@ def test_tn_to_nn_matches_ixformer_v2_packer():
 def test_loaded_w4a8_weights_repack_without_requantization(monkeypatch):
     from ixformer.inference.functions import quant_repack_int4
 
-    from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_utils import (  # noqa: E501
-        W4A8GroupGemmInfo,
-    )
     from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.ilu_compressed_tensors_moe_w4a8_int8 import (  # noqa: E501
         IluCompressedTensorsW4A8Int8MoEMethod,
+    )
+    from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_utils import (  # noqa: E501
+        W4A8GroupGemmInfo,
     )
 
     monkeypatch.setenv("VLLM_ILU_MOE_EP_LL_MOE_ALGO", "GEMV")
@@ -125,6 +127,14 @@ def test_loaded_w4a8_weights_repack_without_requantization(monkeypatch):
     method.process_weights_after_loading(layer)
     assert method.gemm_format == "NN"
     assert method.gemm1_info.format == method.gemm2_info.format == 0
+    saved = {
+        name: (getattr(layer, name).data_ptr(), getattr(layer, name).clone())
+        for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale")
+    }
+    method.process_weights_after_loading(layer)
+    for name, (pointer, value) in saved.items():
+        assert getattr(layer, name).data_ptr() == pointer
+        torch.testing.assert_close(getattr(layer, name), value, rtol=0, atol=0)
     for name, shard_dim in (("w13", 1), ("w2", 0)):
         actual = getattr(layer, name + "_weight")
         assert actual.shard_dim == shard_dim
@@ -132,14 +142,14 @@ def test_loaded_w4a8_weights_repack_without_requantization(monkeypatch):
 
 
 def test_nn_experts_use_logical_output_width():
-    from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_utils import (  # noqa: E501
-        W4A8GroupGemmInfo,
-    )
     from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.ilu_moe_batch_experts_w4a8 import (  # noqa: E501
         IluMoEBatchedExpertsW4A8,
     )
     from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.ilu_moe_standard_experts_w4a8 import (  # noqa: E501
         IluMoEStandardExpertsW4A8,
+    )
+    from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_utils import (  # noqa: E501
+        W4A8GroupGemmInfo,
     )
 
     for cls in (IluMoEBatchedExpertsW4A8, IluMoEStandardExpertsW4A8):

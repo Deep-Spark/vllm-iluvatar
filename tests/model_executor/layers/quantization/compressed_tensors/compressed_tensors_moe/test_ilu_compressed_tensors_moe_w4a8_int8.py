@@ -50,6 +50,7 @@ def _install_zero_expert_ep(monkeypatch):
         0,
     )
     monkeypatch.setattr(w4a8_moe, "ixfops", fake_ixfops)
+    monkeypatch.setattr(w4a8_moe, "w4a8_group_gemv", fake_ixfops.moe_w4a8_group_gemv)
     return fake_ixfops
 
 
@@ -142,6 +143,7 @@ def test_w4a8_non_ep_uses_regular_token_index_and_group_gemm(monkeypatch):
     ]
     fake_ixfops.moe_output_reduce_sum.return_value = expected
     monkeypatch.setattr(w4a8_moe, "ixfops", fake_ixfops)
+    monkeypatch.setattr(w4a8_moe, "w4a8_group_gemv", fake_ixfops.moe_w4a8_group_gemv)
     monkeypatch.setattr(
         w4a8_moe, "unpad_tensor", lambda tensor, *_args, **_kwargs: tensor
     )
@@ -191,6 +193,7 @@ def test_w4a8_decode_uses_decode_token_index_and_group_gemv(monkeypatch):
     ]
     fake_ixfops.moe_output_reduce_sum.return_value = expected
     monkeypatch.setattr(w4a8_moe, "ixfops", fake_ixfops)
+    monkeypatch.setattr(w4a8_moe, "w4a8_group_gemv", fake_ixfops.moe_w4a8_group_gemv)
     monkeypatch.setattr(
         w4a8_moe, "unpad_tensor", lambda tensor, *_args, **_kwargs: tensor
     )
@@ -417,6 +420,7 @@ def test_w4a8_decode_group_gemm_uses_graph_gemm(monkeypatch):
     )
     fake_ixfops.moe_output_reduce_sum.return_value = expected
     monkeypatch.setattr(w4a8_moe, "ixfops", fake_ixfops)
+    monkeypatch.setattr(w4a8_moe, "w4a8_group_gemv", fake_ixfops.moe_w4a8_group_gemv)
     monkeypatch.setattr(
         w4a8_moe, "unpad_tensor", lambda tensor, *_args, **_kwargs: tensor
     )
@@ -521,6 +525,7 @@ def test_ep_decode_quantizes_activation_once_with_matching_layout(
     )
     ops.moe_w4a8_group_gemv.return_value = torch.ones((3, 5))
     monkeypatch.setattr(w4a8_moe, "ixfops", ops)
+    monkeypatch.setattr(w4a8_moe, "w4a8_group_gemv", ops.moe_w4a8_group_gemv)
     monkeypatch.setattr(w4a8_moe, "unpad_tensor", lambda tensor, *_a, **_kw: tensor)
     layer = _non_ep_layer()
     layer.moe_config.ep_rank = 0
@@ -541,6 +546,7 @@ def test_ep_decode_quantizes_activation_once_with_matching_layout(
     )
     assert ops.moe_w4a8_group_gemm.call_count == (2 if decode_gemm else 0)
     assert ops.moe_w4a8_group_gemv.call_count == (0 if decode_gemm else 2)
+
 
 @pytest.mark.parametrize(
     "use_ep,local_prefills,global_decode,expected_decode",
@@ -574,9 +580,7 @@ def test_apply_dispatch_uses_gathered_batch_semantics(
     monkeypatch.setattr(
         w4a8_moe,
         "get_forward_context",
-        lambda: SimpleNamespace(
-            attn_metadata={"attention": metadata}, dp_metadata=dp
-        ),
+        lambda: SimpleNamespace(attn_metadata={"attention": metadata}, dp_metadata=dp),
     )
     guard = MagicMock()
     monkeypatch.setattr(w4a8_moe, "_ensure_cuda_graph_safe_dispatch", guard)
@@ -643,3 +647,325 @@ def test_apply_dispatch_uses_dummy_decode_metadata_during_capture(monkeypatch):
     assert method._apply_ep.call_args.kwargs["run_decode"] is True
     guard.assert_called_once_with(True, {"attention": metadata})
 
+
+@pytest.mark.parametrize(
+    "setting,expected", [(None, "TN"), ("nn", "NN"), (" TN ", "TN")]
+)
+def test_runtime_layout_is_frozen_at_construction(monkeypatch, setting, expected):
+    if setting is None:
+        monkeypatch.delenv("VLLM_ILU_MOE_RUNTIME_LAYOUT", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_ILU_MOE_RUNTIME_LAYOUT", setting)
+    method = _make_w4a8_method("TN", 2)
+    assert method.runtime_gemm_format == expected
+    monkeypatch.setenv("VLLM_ILU_MOE_RUNTIME_LAYOUT", "invalid-after-construction")
+    assert method.runtime_gemm_format == expected
+
+
+@pytest.mark.parametrize("setting", ["", "NT", "invalid"])
+def test_runtime_layout_rejects_invalid_configuration(monkeypatch, setting):
+    monkeypatch.setenv("VLLM_ILU_MOE_RUNTIME_LAYOUT", setting)
+    with pytest.raises(ValueError, match="must be NN or TN"):
+        _make_w4a8_method("TN", 2)
+
+
+@pytest.mark.parametrize(
+    "available,supported,expected",
+    [
+        (["ixinfer", "ixformer_perf"], True, "ixformer_perf"),
+        (["ixinfer", "ixformer_perf"], False, "ixinfer"),
+        (["ixinfer"], True, "ixinfer"),
+        (["ixformer_perf"], False, None),
+    ],
+)
+def test_nn_backend_selected_before_execution(
+    monkeypatch, available, supported, expected
+):
+    from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+        ilu_w4a8_gemv as gemv,
+    )
+
+    monkeypatch.setenv("VLLM_ILU_MOE_W4A8_GEMV_PERF", "1")
+
+    monkeypatch.setattr(gemv.registry, "available_backends", lambda op: available)
+    seen = []
+    monkeypatch.setattr(
+        gemv.ixf, "moe_w4a8_group_gemv_perf_supported", lambda **kw: supported
+    )
+    monkeypatch.setattr(
+        gemv.ixf, "moe_w4a8_group_gemv", lambda **kw: seen.append(kw) or "output"
+    )
+    remap = object()
+    if expected is None:
+        with pytest.raises(RuntimeError, match="No available"):
+            gemv.w4a8_group_gemv(format=0, dst_to_src=remap)
+        assert not seen
+    else:
+        assert gemv.w4a8_group_gemv(format=0, dst_to_src=remap) == "output"
+        assert seen == [dict(format=0, dst_to_src=remap, backend=expected)]
+
+
+def test_g1_g2_backend_decisions_are_independent_and_tn_uses_registry(monkeypatch):
+    from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+        ilu_w4a8_gemv as gemv,
+    )
+
+    monkeypatch.setenv("VLLM_ILU_MOE_W4A8_GEMV_PERF", "1")
+
+    monkeypatch.setattr(
+        gemv.registry, "available_backends", lambda op: ["ixinfer", "ixformer_perf"]
+    )
+    monkeypatch.setattr(
+        gemv.ixf,
+        "moe_w4a8_group_gemv_perf_supported",
+        lambda **kw: kw["dst_to_src"] is None,
+    )
+    seen = []
+    monkeypatch.setattr(gemv.ixf, "moe_w4a8_group_gemv", lambda **kw: seen.append(kw))
+    remap = object()
+    gemv.w4a8_group_gemv(format=0, dst_to_src=None)
+    gemv.w4a8_group_gemv(format=0, dst_to_src=remap)
+    gemv.w4a8_group_gemv(format=2, dst_to_src=remap)
+    assert [call["backend"] for call in seen] == ["ixformer_perf", "ixinfer", None]
+    assert seen[1]["dst_to_src"] is remap and seen[2]["dst_to_src"] is remap
+
+
+def test_nn_vendor_rejection_is_not_retried(monkeypatch):
+    from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+        ilu_w4a8_gemv as gemv,
+    )
+
+    monkeypatch.setattr(gemv.registry, "available_backends", lambda op: ["ixinfer"])
+    calls = []
+
+    def reject(**kw):
+        calls.append(kw)
+        raise RuntimeError("vendor unsupported shape")
+
+    monkeypatch.setattr(gemv.ixf, "moe_w4a8_group_gemv", reject)
+    with pytest.raises(RuntimeError, match="vendor unsupported shape"):
+        gemv.w4a8_group_gemv(format=0, dst_to_src="preserved")
+    assert calls == [dict(format=0, dst_to_src="preserved", backend="ixinfer")]
+
+
+def test_batched_g1_g2_use_actual_separate_calls(monkeypatch):
+    from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+        ilu_moe_batch_experts_w4a8 as batch,
+    )
+    from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+        ilu_w4a8_gemv as gemv,
+    )
+
+    expert = batch.IluMoEBatchedExpertsW4A8.__new__(batch.IluMoEBatchedExpertsW4A8)
+    expert.quant_mode = "w4a8"
+    expert.version, expert.group_size, expert.format, expert.out_dtype = (
+        2,
+        -1,
+        "NN",
+        torch.bfloat16,
+    )
+    expert.quant_config = SimpleNamespace(
+        w1_scale=torch.ones(2, 128),
+        w2_scale=torch.ones(2, 64),
+        g1_alphas=None,
+        g2_alphas=None,
+        w1_zp=None,
+        w2_zp=None,
+        w1_bias=None,
+        w2_bias=None,
+    )
+    expert.swiglu_limit = None
+    x = torch.ones(4, 64, dtype=torch.int8)
+    w1 = torch.zeros(2, 64, 64, dtype=torch.int8)
+    w2 = torch.zeros(2, 64, 32, dtype=torch.int8)
+    output = torch.full((4, 64), 7, dtype=torch.bfloat16)
+    dense = torch.zeros(5, dtype=torch.uint32)
+    monkeypatch.setenv("VLLM_ILU_MOE_W4A8_GEMV_PERF", "1")
+
+    monkeypatch.setattr(
+        batch.ixff,
+        "moe_group_gemv_reformat_input_fused_dense",
+        lambda **kw: (kw["input"], kw["input_scales"], dense),
+    )
+    monkeypatch.setattr(
+        batch.ixff,
+        "moe_group_gemv_swiglu_quant",
+        lambda **kw: (torch.zeros(4, 64, dtype=torch.int8), torch.ones(4)),
+    )
+    monkeypatch.setattr(
+        gemv.registry, "available_backends", lambda op: ["ixformer_perf", "ixinfer"]
+    )
+    monkeypatch.setattr(
+        gemv.ixf, "moe_w4a8_group_gemv_perf_supported", lambda **kw: kw["weight"] is w1
+    )
+    calls = []
+
+    def run(**kw):
+        calls.append(kw)
+        out = kw.get("output", torch.zeros(4, 128, dtype=torch.bfloat16))
+        out.fill_(3)
+        return out
+
+    monkeypatch.setattr(gemv.ixf, "moe_w4a8_group_gemv", run)
+    ids = torch.zeros(1, 1, dtype=torch.int32)
+    result = expert.apply_group_gemv(
+        output,
+        x,
+        w1,
+        w2,
+        torch.ones(1, 1),
+        ids,
+        None,
+        2,
+        None,
+        torch.ones(4),
+        None,
+        None,
+        None,
+    )
+    # The existing batched method reshapes output and returns that view.
+    assert result.data_ptr() == output.data_ptr()
+    assert torch.equal(output, torch.full_like(output, 3))
+    assert [kw["backend"] for kw in calls] == ["ixformer_perf", "ixinfer"]
+    assert calls[0]["weight"] is w1 and calls[1]["weight"] is w2
+    assert calls[0]["output_dtype"] == calls[1]["output_dtype"] == torch.bfloat16
+    assert (
+        calls[0]["dense_tokens_per_experts"]
+        is calls[1]["dense_tokens_per_experts"]
+        is dense
+    )
+    assert calls[1]["output"] is result
+
+
+@pytest.mark.parametrize("operand", ["weight", "w_scales", "output"])
+def test_nn_cross_device_rejects_before_vendor_selection(monkeypatch, operand):
+    from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+
+    from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+        ilu_w4a8_gemv as gemv,
+    )
+
+    mode = FakeTensorMode()
+
+    def fake(shape, dtype, device="cuda:0"):
+        return FakeTensor(
+            mode, torch.empty(shape, dtype=dtype, device="meta"), torch.device(device)
+        )
+
+    kwargs = dict(
+        input=fake((128, 5120), torch.int8),
+        weight=fake((8, 5120, 2304), torch.int8),
+        i_scales=fake((128,), torch.float32),
+        w_scales=fake((8, 4608), torch.float32),
+        output_dtype=torch.bfloat16,
+        tokens_per_experts=fake((8,), torch.int32),
+        dense_tokens_per_experts=fake((17,), torch.uint32),
+        output=fake((128, 4608), torch.bfloat16),
+        format=0,
+    )
+    assert gemv.ixf.moe_w4a8_group_gemv_perf_supported(**kwargs)
+    original = kwargs[operand]
+    kwargs[operand] = fake(original.shape, original.dtype, "cuda:1")
+    assert not gemv.ixf.moe_w4a8_group_gemv_perf_supported(**kwargs)
+    monkeypatch.setattr(
+        gemv.registry, "available_backends", lambda op: ["ixformer_perf", "ixinfer"]
+    )
+    execute = MagicMock()
+    monkeypatch.setattr(gemv.ixf, "moe_w4a8_group_gemv", execute)
+    with pytest.raises(ValueError, match="must share the input device"):
+        gemv.w4a8_group_gemv(**kwargs)
+    execute.assert_not_called()
+
+
+@pytest.fixture(autouse=True)
+def _clear_nn_perf_policy_cache():
+    from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+        ilu_w4a8_gemv as gemv,
+    )
+
+    gemv._nn_perf_enabled.cache_clear()
+    yield
+    gemv._nn_perf_enabled.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "setting,enabled",
+    [(None, False), ("0", False), ("false", False), ("1", True), (" true ", True)],
+)
+def test_nn_perf_opt_in_defaults_off_and_preserves_arguments(
+    monkeypatch, setting, enabled
+):
+    from vllm_iluvatar import envs as ilu_envs
+    from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+        ilu_w4a8_gemv as gemv,
+    )
+
+    key = "VLLM_ILU_MOE_W4A8_GEMV_PERF"
+    if setting is None:
+        monkeypatch.delenv(key, raising=False)
+    else:
+        monkeypatch.setenv(key, setting)
+    assert ilu_envs._ILU_CANONICAL_ONLY_ENV_VARS[key]() is enabled
+    monkeypatch.setattr(
+        gemv.registry, "available_backends", lambda op: ["ixformer_perf", "ixinfer"]
+    )
+    query = MagicMock(return_value=True)
+    execute = MagicMock(return_value="output")
+    monkeypatch.setattr(gemv.ixf, "moe_w4a8_group_gemv_perf_supported", query)
+    monkeypatch.setattr(gemv.ixf, "moe_w4a8_group_gemv", execute)
+    weight, metadata = object(), object()
+    assert (
+        gemv.w4a8_group_gemv(format=0, weight=weight, dense_tokens_per_experts=metadata)
+        == "output"
+    )
+    assert execute.call_args.kwargs == dict(
+        format=0,
+        weight=weight,
+        dense_tokens_per_experts=metadata,
+        backend="ixformer_perf" if enabled else "ixinfer",
+    )
+    assert query.call_count == int(enabled)
+
+
+def test_disabled_perf_is_not_an_implicit_fallback_when_vendor_missing(monkeypatch):
+    from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+        ilu_w4a8_gemv as gemv,
+    )
+
+    monkeypatch.delenv("VLLM_ILU_MOE_W4A8_GEMV_PERF", raising=False)
+    monkeypatch.setattr(
+        gemv.registry, "available_backends", lambda op: ["ixformer_perf"]
+    )
+    query, execute = MagicMock(), MagicMock()
+    monkeypatch.setattr(gemv.ixf, "moe_w4a8_group_gemv_perf_supported", query)
+    monkeypatch.setattr(gemv.ixf, "moe_w4a8_group_gemv", execute)
+    with pytest.raises(RuntimeError, match="perf opt-in"):
+        gemv.w4a8_group_gemv(format=0)
+    query.assert_not_called()
+    execute.assert_not_called()
+
+
+@pytest.mark.parametrize("initial", ["0", "1"])
+def test_nn_perf_opt_in_is_frozen_after_first_call(monkeypatch, initial):
+    from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+        ilu_w4a8_gemv as gemv,
+    )
+
+    key = "VLLM_ILU_MOE_W4A8_GEMV_PERF"
+    monkeypatch.setenv(key, initial)
+    monkeypatch.setattr(
+        gemv.registry, "available_backends", lambda op: ["ixformer_perf", "ixinfer"]
+    )
+    monkeypatch.setattr(
+        gemv.ixf, "moe_w4a8_group_gemv_perf_supported", lambda **kw: True
+    )
+    execute = MagicMock()
+    monkeypatch.setattr(gemv.ixf, "moe_w4a8_group_gemv", execute)
+    gemv.w4a8_group_gemv(format=0)
+    monkeypatch.setenv(key, "1" if initial == "0" else "0")
+    gemv.w4a8_group_gemv(format=0)
+    expected = "ixformer_perf" if initial == "1" else "ixinfer"
+    assert [call.kwargs["backend"] for call in execute.call_args_list] == [
+        expected,
+        expected,
+    ]

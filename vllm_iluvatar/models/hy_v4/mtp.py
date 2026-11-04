@@ -21,6 +21,7 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.kv_cache import KVCacheScaleParameter
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import get_pp_missing_layer_names
 
@@ -353,13 +354,22 @@ class HYV4MTP(IluGlmMoeDsaMTP):
             )
         # The GLM parent reports before HY4's sink/router/indexer additions
         # are merged. Audit the final set, not that intermediate warning.
-        missing = sorted(set(params_dict) - loaded)
+        # KV-cache scalar placeholders have defaults applied after loading.
+        # The proposer replaces the draft head with the target head.
+        expected = {
+            name
+            for name, param in params_dict.items()
+            if not isinstance(param, KVCacheScaleParameter)
+            and ".shared_head.head." not in name
+        }
+        missing = sorted(expected - loaded)
         if missing:
             raise ValueError("HY4 MTP parameters not loaded: " + ", ".join(missing))
         logger.info(
-            "HY4 MTP final load audit: %d/%d parameters, %d HY4 additions, missing=0",
-            len(loaded & params_dict.keys()),
-            len(params_dict),
+            "HY4 MTP final load audit: %d/%d checkpoint parameters, "
+            "%d HY4 additions, missing=0",
+            len(loaded & expected),
+            len(expected),
             len(loaded_extra),
         )
         return loaded

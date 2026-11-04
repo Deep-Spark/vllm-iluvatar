@@ -218,28 +218,20 @@ def test_real_hybrid_allocator_keeps_fp8_page16(groups):
 
 
 @pytest.mark.parametrize("with_spec", [False, True])
-def test_swa_kernel_block_query_matches_v031_allocator_contract(with_spec, monkeypatch):
+@pytest.mark.parametrize("quant_type", ["", "KVINT8"])
+def test_swa_kernel_block_query_matches_v031_allocator_contract(
+    with_spec, quant_type, monkeypatch
+):
     from vllm.model_executor.layers.attention.attention import (
         _largest_kernel_block_within,
     )
-    from vllm.v1.attention.backend import MultipleOf
     from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
     from vllm_iluvatar.v1.attention.backends.ilu_flash_attn import (
         IluFlashAttentionBackend,
     )
 
-    def _set_flash_attn_quant(value: str) -> None:
-        # vllm.envs.__getattr__ always re-reads os.environ; setattr on the
-        # module only shadows if the name is already in __dict__. Cover both.
-        monkeypatch.setenv("VLLM_ILU_FLASH_ATTN_QUANT_TYPE", value)
-        monkeypatch.setattr(
-            "vllm_iluvatar.v1.attention.backends.ilu_flash_attn.envs.VLLM_ILU_FLASH_ATTN_QUANT_TYPE",
-            value,
-            raising=False,
-        )
-
-    _set_flash_attn_quant("")
+    monkeypatch.setenv("VLLM_ILU_FLASH_ATTN_QUANT_TYPE", quant_type)
     spec = (
         SlidingWindowSpec(
             block_size=16,
@@ -251,24 +243,17 @@ def test_swa_kernel_block_query_matches_v031_allocator_contract(with_spec, monke
         if with_spec
         else None
     )
-    # 1536 B/token * 16 tokens = 24576 B/page. Default FA advertises
-    # MultipleOf(16); the allocator still picks 16 for this SWA budget.
-    assert (
-        _largest_kernel_block_within(IluFlashAttentionBackend, 1536, 24576, 16, spec)
-        == 16
-    )
-    sizes = IluFlashAttentionBackend.get_supported_kernel_block_sizes()
-    assert len(sizes) == 1
-    assert isinstance(sizes[0], MultipleOf) and sizes[0].base == 16
-
-    _set_flash_attn_quant("KVINT8")
-    assert IluFlashAttentionBackend.get_supported_kernel_block_sizes() == [
+    # Both unquantized and INT8 paged FMHA use bounded kernel pages.
+    # MultipleOf(16) would also advertise unsupported pages above 256.
+    assert IluFlashAttentionBackend.get_supported_kernel_block_sizes(spec) == [
         16,
         32,
         64,
         128,
         256,
     ]
+    # 1536 B/token * 16 tokens = 24576 B/page. The allocator must keep
+    # the 16-token SWA kernel page, with or without the cache spec.
     assert (
         _largest_kernel_block_within(IluFlashAttentionBackend, 1536, 24576, 16, spec)
         == 16

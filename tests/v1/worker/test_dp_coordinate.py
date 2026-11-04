@@ -25,6 +25,7 @@ def test_coordinate_batch_signature_preserves_community_prefix():
         "num_tokens_pre_cudagraph_padding",
         "sync_decode_only",
         "return_all_ranks_decode_only",
+        "require_uniform_graph_tokens",
     ]
 
 

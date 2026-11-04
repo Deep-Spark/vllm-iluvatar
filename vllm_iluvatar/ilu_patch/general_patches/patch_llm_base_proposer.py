@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Wiring for the Iluvatar ``SpecDecodeBaseProposer.model_returns_tuple`` override.
+"""Wiring for Iluvatar V1 MTP tuple returns and optional draft graphs.
 
 Corresponds to: vllm/v1/spec_decode/llm_base_proposer.py
 
@@ -34,7 +34,7 @@ def register() -> None:
     p.register_once(
         __name__,
         _apply,
-        detail="SpecDecodeBaseProposer.model_returns_tuple ilu MTP tuple contract",
+        detail="V1 MTP tuple contract and opt-in GLM draft graphs",
     )
 
 
@@ -49,3 +49,21 @@ def _apply() -> None:
     # [ILU override] model_returns_tuple - delta: treat IluGlmMoeDsaMTPModel as
     # a DeepSeek-family tuple-returning MTP draft; delegate otherwise.
     SpecDecodeBaseProposer.model_returns_tuple = make_model_returns_tuple(orig)
+
+    # V1 only: V2 already owns independent prefill/decode draft managers.
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    from vllm_iluvatar.v1.spec_decode import draft_cudagraph as graphs
+
+    for name, factory in (
+        ("load_model", graphs.make_load_model),
+        ("propose", graphs.make_propose),
+        ("build_per_group_and_layer_attn_metadata", graphs.make_build_metadata),
+        ("_determine_batch_execution_and_padding", graphs.make_determine_batch),
+    ):
+        setattr(
+            SpecDecodeBaseProposer, name, factory(getattr(SpecDecodeBaseProposer, name))
+        )
+    GPUModelRunner._capture_cudagraphs = graphs.make_capture_cudagraphs(
+        GPUModelRunner._capture_cudagraphs
+    )

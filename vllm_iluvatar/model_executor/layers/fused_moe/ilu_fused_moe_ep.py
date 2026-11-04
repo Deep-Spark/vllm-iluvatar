@@ -263,6 +263,11 @@ class IluFusedMoEEP:
     def _nvsm_dispatch_quant_kwargs(self) -> dict[str, object]:
         quant_method = self.experts._quant_method
         base_quant_method = getattr(quant_method, "old_quant_method", quant_method)
+        if (
+            base_quant_method.moe_quant_config is None
+            and hasattr(self.experts, "routed_experts")
+        ):
+            self.experts.routed_experts._ensure_moe_quant_config_init()
         quant_config = base_quant_method.moe_quant_config
         if quant_config is not None:
             return nvsm_dispatch_quant_kwargs(quant_config)

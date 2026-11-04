@@ -346,7 +346,7 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
         # Private import on purpose: the LL decode sizing rule belongs to
         # whichever method owns the NVSHMEM buffer, and both FP8 and MXFP4
         # routed experts share one.
-        from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8 import (
+        from vllm_iluvatar.model_executor.layers.quantization.fp8 import (
             _shrink_ll_max_tokens_to_decode,
         )
         from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8_batch_experts import (  # noqa: E501

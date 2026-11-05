@@ -48,7 +48,7 @@ def _patch_custom_ops(module=None) -> None:
     post-import hook; falls back to importing it (already cached) when called
     without an argument.
     """
-    import vllm_iluvatar._custom_ops as _ilu_co
+    from vllm_iluvatar.backends.ops import implementation as _ilu_co
 
     if module is not None:
         _co = module

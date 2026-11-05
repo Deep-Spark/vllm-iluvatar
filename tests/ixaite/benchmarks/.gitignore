@@ -1,0 +1,4 @@
+# Cross-provider benchmark outputs (keep reports/.gitkeep)
+/reports/*
+!/reports/.gitkeep
+/e2e-runs/

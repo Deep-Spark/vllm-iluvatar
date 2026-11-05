@@ -1,0 +1,64 @@
+schema_version: 1
+slug: qwen36_35b_a3b_w8a8_tp4
+
+# Qwen3.6-35B-A3B-W8A8 TP=4. The model has two KV heads, so four ranks
+# replicate them: each rank gets Hq=4, Hkv=1, D=256 and the TP-local GQA
+# ratio drops to 4. That shape uses the pre-existing GQA4 path, so this
+# profile is the regression guard for the GQA8 work rather than its coverage.
+# e2e still enables ngram spec decode; TP-local GQA4 stays on the SIMT
+# multi-token path.
+l2:
+  attention:
+    batch: 1
+    contexts: [128, 177, 256, 352, 512, 1024, 1169, 2048, 16384, 131072]
+    prefill_contexts: [128, 177, 256, 352, 512, 1024, 1169, 2048, 16384]
+    decode_contexts: [128, 177, 256, 352, 512, 1024, 1169, 2048, 16384, 131072]
+    head_dim: 256
+    num_kv_heads: 1
+    num_query_heads: 4
+    page_size: 16
+  reshape_and_cache_flash:
+    head_dim: 256
+    num_kv_heads: 1
+    page_size: 16
+  fused_qk_rmsnorm_rope_gate:
+    cache_rows: 4096
+    head_dim: 256
+    num_kv_heads: 1
+    num_query_heads: 4
+    rotary_dim: 64
+  attn_output_sigmoid_gate:
+    hidden_size: 1024
+
+e2e:
+  ops:
+    - flash_attn
+    - reshape_and_cache_flash
+    - fused_qk_rmsnorm_rope_gate
+    - attn_output_sigmoid_gate
+  env: {}
+  serve_args:
+    - --tensor-parallel-size
+    - "4"
+    - --trust-remote-code
+    - --max-model-len
+    - "4096"
+    - --limit-mm-per-prompt
+    - '{"image":0,"video":0}'
+    - --compilation-config
+    - '{"cudagraph_mode":"FULL_DECODE_ONLY","mode":0}'
+    - --speculative-config
+    - '{"method":"ngram","num_speculative_tokens":3}'
+  startup_timeout_s: 3600
+  warmup_requests: 8
+  workloads:
+    - id: bs1_128_128
+      input_len: 128
+      max_concurrency: 1
+      num_prompts: 8
+      output_len: 128
+    - id: bs8_128_128
+      input_len: 128
+      max_concurrency: 8
+      num_prompts: 8
+      output_len: 128

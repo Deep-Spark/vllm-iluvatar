@@ -1,0 +1,91 @@
+schema_version: 1
+slug: qwen3_30b_a3b_w4a8
+
+# Qwen3-30B-A3B W4A8 (compressed-tensors) routed-expert path. --model-path must
+# point at the quantized checkpoint. Prefill hits moe_w4a8_group_gemm; decode
+# hits moe_w4a8_group_gemv; both share activation_dynamic_scaled_int8 (swiglu).
+# Standard-experts apply always uses moe_compute_token_index_ep (even TP=1),
+# plus expand / reduce / fused top-k. L2 uses production N/K with 8 experts so
+# the microbench stays cheap; the checkpoint itself has 128 routed experts /
+# topk 8.
+l2:
+  activation_dynamic_scaled_int8:
+    # Routed expert swiglu: 2 * moe_intermediate_size.
+    hidden_size: 768
+    act_type: swiglu
+    output_formats: [0, 1]
+  moe_w4a8_group_gemm:
+    calls:
+      # Routed gate_up (w13) and down_proj (w2). Prefill and decode hit both.
+      w13:
+        N: 1536
+        K: 2048
+        tokens: [32, 0, 16, 8, 0, 24, 0, 16]
+      w2:
+        N: 2048
+        K: 768
+        tokens: [32, 0, 16, 8, 0, 24, 0, 16]
+  moe_w4a8_group_gemv:
+    calls:
+      w13:
+        N: 1536
+        K: 2048
+        tokens: [1, 0, 1, 1, 0, 1, 0, 1]
+      w2:
+        N: 2048
+        K: 768
+        tokens: [1, 0, 1, 1, 0, 1, 0, 1]
+  moe_compute_token_index:
+    num_experts: 128
+    topk: 8
+    num_tokens: [1, 32, 128]
+    variants: [plain, ep, decode]
+  moe_expand_input_dynamic_scaled_int8:
+    hidden_size: 2048
+    topk: 8
+    output_formats: [0, 1]
+  moe_fused_topk_bias:
+    num_experts: 128
+    topk: 8
+    scoring_func: softmax
+  moe_output_reduce_sum:
+    hidden_size: 2048
+    topk: 8
+
+e2e:
+  ops:
+    - activation_dynamic_scaled_int8
+    - moe_w4a8_group_gemm
+    - moe_w4a8_group_gemv
+    - moe_compute_token_index_ep
+    - moe_expand_input_dynamic_scaled_int8
+    - moe_fused_topk_bias
+    - moe_output_reduce_sum
+  serve_args:
+    - --tensor-parallel-size
+    - "1"
+    - --trust-remote-code
+    - --max-model-len
+    - "8192"
+    - --limit-mm-per-prompt
+    - '{"image":0,"video":0}'
+    - --compilation-config
+    - '{"cudagraph_mode":"FULL","mode":0}'
+  startup_timeout_s: 1800
+  warmup_requests: 10
+  workloads:
+    - id: bs1_128_128
+      input_len: 128
+      max_concurrency: 1
+      num_prompts: 40
+      output_len: 128
+    - id: bs8_128_128
+      input_len: 128
+      max_concurrency: 8
+      num_prompts: 80
+      output_len: 128
+    - id: bs1_1024_128
+      input_len: 1024
+      max_concurrency: 1
+      num_prompts: 40
+      output_len: 128

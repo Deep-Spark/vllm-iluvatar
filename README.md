@@ -62,6 +62,25 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model":"/path/to/model","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
+## Kernel provider
+
+If a different kernel provider is needed,
+set `VLLM_ILU_KERNEL_PROVIDER` before starting vLLM. The process uses one
+backend throughout loading, repacking, warmup, capture, inference, and replay.
+
+| Value | Behavior |
+| --- | --- |
+| `baseline` | Default. Use the original ixformer, Torch, Triton/FLA, and plugin CUDA implementations; startup does not require ixaite. |
+| `ixaite` | Use the implementations in `vllm_iluvatar/backends/ixaite`. Unsupported operators and formats fail explicitly before modifying weights, cache, or state. |
+
+Ixaite-specific implementation code must live only in
+`vllm_iluvatar/backends/ixaite/`. Related tests and benchmarks must live under
+`tests/ixaite/`, including `tests/ixaite/benchmarks/`.
+
+```bash
+VLLM_ILU_KERNEL_PROVIDER=ixaite vllm serve /path/to/model
+```
+
 ## Documentation
 
 - [Development setup](docs/guides/7-how-to-set-up-the-dev-environment.md)

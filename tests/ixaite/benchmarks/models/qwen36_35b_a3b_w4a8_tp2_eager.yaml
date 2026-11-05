@@ -1,0 +1,69 @@
+schema_version: 1
+slug: qwen36_35b_a3b_w4a8_tp2_eager
+
+# Eager-decode variant of qwen36_35b_a3b_w4a8_tp2 for per-call kernel
+# instrumentation (CUDA graph replay bypasses Python wrappers, so host/GPU
+# timing of _moe_w4a8_group_gemv requires eager decode).
+l2: {}
+e2e:
+  ops:
+    - linear
+    - reshape_and_cache_flash
+    - embedding_gather
+    - causal_conv1d_fn
+    - causal_conv1d_update
+    - gdn_post_conv_prep
+    - gdn_chunk
+    - gdn_packed_decode
+    - rms_norm_gated
+    - fused_qk_rmsnorm_rope_gate
+    - attn_output_sigmoid_gate
+    - moe_fused_topk_bias
+    - moe_compute_token_index
+    - moe_compute_token_index_for_decode
+    - moe_expand_input_dynamic_scaled_int8
+    - moe_w4a8_group_gemm
+    - moe_w4a8_group_gemv
+    - activation_dynamic_scaled_int8
+    - moe_output_reduce_sum
+  env:
+    VLLM_W8A8_MOE_USE_W4A8: "1"
+    PYTHONUNBUFFERED: "1"
+    NCCL_P2P_DISABLE: "1"
+    NCCL_IB_DISABLE: "1"
+    GLOO_SOCKET_IFNAME: "lo"
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  serve_args:
+    - --tensor-parallel-size
+    - "2"
+    - --trust-remote-code
+    - --max-model-len
+    - "4096"
+    - --gpu-memory-utilization
+    - "0.85"
+    - --limit-mm-per-prompt
+    - '{"image":0,"video":0}'
+    - --enforce-eager
+  startup_timeout_s: 3600
+  warmup_requests: 32
+  workloads:
+    - id: bs1_128_128
+      input_len: 128
+      max_concurrency: 1
+      num_prompts: 32
+      output_len: 128
+    - id: bs8_128_128
+      input_len: 128
+      max_concurrency: 8
+      num_prompts: 32
+      output_len: 128
+    - id: bs16_128_128
+      input_len: 128
+      max_concurrency: 16
+      num_prompts: 32
+      output_len: 128
+    - id: bs32_128_128
+      input_len: 128
+      max_concurrency: 32
+      num_prompts: 32
+      output_len: 128

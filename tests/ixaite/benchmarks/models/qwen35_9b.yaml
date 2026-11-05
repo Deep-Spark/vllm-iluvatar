@@ -1,0 +1,200 @@
+schema_version: 1
+slug: qwen35_9b
+
+l2:
+  attention:
+    batch: 1
+    contexts: [128, 177, 256, 352, 512, 1024, 1169, 2048]
+    graph_capacity: 8192
+    head_dim: 256
+    num_kv_heads: 4
+    num_query_heads: 16
+    page_size: 16
+  attn_output_sigmoid_gate:
+    hidden_size: 4096
+  causal_conv1d_fn:
+    dim: 8192
+    width: 4
+  causal_conv1d_update:
+    dim: 8192
+    width: 4
+  chunk_gated_delta_rule:
+    head_k_dim: 128
+    head_v_dim: 128
+    num_k_heads: 16
+    num_v_heads: 32
+    lengths:
+      - [512]
+      - [512, 1536]
+  embedding_gather:
+    hidden_size: 4096
+    num_tokens: [1, 8, 32, 128, 256, 512, 1024, 2048]
+    vocab_size: 248320
+  fused_add_rms_norm:
+    hidden_size: 4096
+  fused_post_conv_prep:
+    head_k_dim: 128
+    head_v_dim: 128
+    l2norm_min_t: 512
+    num_k_heads: 16
+    num_v_heads: 32
+  fused_qk_rmsnorm_gate:
+    head_dim: 256
+    num_kv_heads: 4
+    num_query_heads: 16
+  fused_qk_rmsnorm_rope_gate:
+    cache_rows: 4096
+    head_dim: 256
+    num_kv_heads: 4
+    num_query_heads: 16
+    rotary_dim: 64
+  gelu:
+    sequence_lengths: [16, 32, 64, 128, 256, 512, 2048]
+    tanh_widths: [4304, 2152, 1076]
+    erf_widths: [4608, 2304, 1152]
+  gdn_packed_decode:
+    head_k_dim: 128
+    head_v_dim: 128
+    num_k_heads: 16
+    num_tokens: [1, 8, 128]
+    num_v_heads: 32
+  gdn_spec_delta_update:
+    head_k_dim: 128
+    head_v_dim: 128
+    num_k_heads: 16
+    num_v_heads: 32
+    shapes:
+      - [1, 2]
+      - [8, 2]
+      - [1, 4]
+      - [8, 4]
+  gemma_rms_norm:
+    hidden_size: 4096
+  layer_norm:
+    # ViT block norm1/norm2 and the merger entry norm. TP does not shard the
+    # vision hidden dim, so tp2/tp4 microbench the same shape.
+    hidden_size: 1152
+  vit_qkv_layout:
+    sequence_lengths: [784, 3136]
+    num_heads: [16, 8, 4]
+    head_dim: 72
+  vit_qkv_rope:
+    sequence_lengths: [784, 3136]
+    num_heads: [16, 8, 4]
+    head_dim: 72
+  linear:
+    attn_o_proj:
+      K: 4096
+      N: 4096
+      bias: false
+      tags: [gemm, decode, prefill, attn]
+    attn_qkv_proj:
+      K: 4096
+      N: 10240
+      bias: false
+      tags: [gemm, decode, prefill, attn]
+    gdn_out_proj:
+      K: 4096
+      N: 4096
+      bias: false
+      tags: [gemm, decode, prefill, gdn]
+    gdn_in_proj_ba:
+      K: 4096
+      N: 64
+      bias: false
+      tags: [gemm, decode, prefill, gdn]
+    gdn_in_proj_qkvz:
+      K: 4096
+      N: 12288
+      bias: false
+      tags: [gemm, decode, prefill, gdn]
+    lm_head:
+      K: 4096
+      N: 248320
+      bias: false
+      max_t: 256
+      tags: [gemm, decode, lm_head]
+    mlp_down_proj:
+      K: 12288
+      N: 4096
+      bias: false
+      tags: [gemm, decode, prefill, mlp]
+    mlp_gate_up_proj:
+      K: 4096
+      N: 24576
+      bias: false
+      tags: [gemm, decode, prefill, mlp]
+    vis_attn_qkv:
+      K: 1152
+      N: 3456
+      bias: true
+      tags: [gemm, vision]
+    vis_attn_o_proj:
+      K: 1152
+      N: 1152
+      bias: false
+      tags: [gemm, vision]
+    vis_merger_fc2:
+      K: 4608
+      N: 4096
+      bias: true
+      tags: [gemm, vision, merger]
+  reshape_and_cache_flash:
+    head_dim: 256
+    num_kv_heads: 4
+    num_kv_heads_tp: [4, 2, 1]
+    page_size: 16
+  rms_norm_gated:
+    dim: 128
+    heads: 32
+  silu_and_mul:
+    d: 12288
+
+e2e:
+  ops:
+    - silu_and_mul
+    - linear
+    - embedding_gather
+    - rms_norm_gated
+    - fused_add_rms_norm
+    - gemma_rms_norm
+    - reshape_and_cache_flash
+    - causal_conv1d_fn
+    - causal_conv1d_update
+    - gdn_post_conv_prep
+    - gdn_chunk
+    - gdn_packed_decode
+    - gdn_spec_delta_update
+    - fused_qk_rmsnorm_rope_gate
+    - fused_qk_rmsnorm_gate
+    - attn_output_sigmoid_gate
+    - flash_attn
+  env: {}
+  serve_args:
+    - --tensor-parallel-size
+    - "1"
+    - --trust-remote-code
+    - --max-model-len
+    - "8192"
+    - --limit-mm-per-prompt
+    - '{"image":0,"video":0}'
+    - --compilation-config
+    - '{"cudagraph_mode":"FULL","mode":0}'
+  startup_timeout_s: 1800
+  warmup_requests: 10
+  workloads:
+    - id: bs1_128_128
+      input_len: 128
+      max_concurrency: 1
+      num_prompts: 40
+      output_len: 128
+    - id: bs8_128_128
+      input_len: 128
+      max_concurrency: 8
+      num_prompts: 80
+      output_len: 128
+    - id: bs1_1024_128
+      input_len: 1024
+      max_concurrency: 1
+      num_prompts: 40
+      output_len: 128

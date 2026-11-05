@@ -1,0 +1,45 @@
+schema_version: 1
+slug: qwen35_9b_kint8
+
+# Same BF16 Qwen3.5-9B checkpoint as qwen35_9b. KINT8 writes int8 K + BF16 V
+# via reshape_and_cache_mix; the default BF16 profile never takes that path.
+l2:
+  reshape_and_cache_mix:
+    head_dim: 256
+    num_kv_heads: 4
+    num_kv_heads_tp: [4, 2, 1]
+    page_size: 16
+
+e2e:
+  ops:
+    - reshape_and_cache_mix
+  env:
+    VLLM_ILU_FLASH_ATTN_QUANT_TYPE: "KINT8"
+  serve_args:
+    - --tensor-parallel-size
+    - "1"
+    - --trust-remote-code
+    - --max-model-len
+    - "8192"
+    - --limit-mm-per-prompt
+    - '{"image":0,"video":0}'
+    - --compilation-config
+    - '{"cudagraph_mode":"FULL","mode":0}'
+  startup_timeout_s: 1800
+  warmup_requests: 10
+  workloads:
+    - id: bs1_128_128
+      input_len: 128
+      max_concurrency: 1
+      num_prompts: 40
+      output_len: 128
+    - id: bs8_128_128
+      input_len: 128
+      max_concurrency: 8
+      num_prompts: 80
+      output_len: 128
+    - id: bs1_1024_128
+      input_len: 1024
+      max_concurrency: 1
+      num_prompts: 40
+      output_len: 128

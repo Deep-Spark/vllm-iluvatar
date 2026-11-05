@@ -12,7 +12,12 @@ numerical/kernel test genuinely cannot run on a host with no Iluvatar GPU.
 
 from __future__ import annotations
 
+import sys
+
 import pytest
+
+# Preserve legacy fixture imports after tests becomes an explicit package.
+sys.modules.setdefault("conftest", sys.modules[__name__])
 
 
 def _cuda_available() -> bool:

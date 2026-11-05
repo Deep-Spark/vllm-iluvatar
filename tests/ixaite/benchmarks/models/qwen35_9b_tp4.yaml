@@ -1,0 +1,84 @@
+schema_version: 1
+slug: qwen35_9b_tp4
+
+l2:
+  linear:
+    attn_o_proj:
+      K: 1024
+      N: 4096
+      bias: false
+      tags: [gemm, decode, prefill, attn, tp4]
+    attn_qkv_proj:
+      K: 4096
+      N: 2560
+      bias: false
+      tags: [gemm, decode, prefill, attn, tp4]
+    gdn_out_proj:
+      K: 1024
+      N: 4096
+      bias: false
+      tags: [gemm, decode, prefill, gdn, tp4]
+    gdn_in_proj_ba:
+      K: 4096
+      N: 16
+      bias: false
+      tags: [gemm, decode, prefill, gdn, tp4]
+    gdn_in_proj_qkvz:
+      K: 4096
+      N: 3072
+      bias: false
+      tags: [gemm, decode, prefill, gdn, tp4]
+    lm_head:
+      K: 4096
+      N: 62080
+      bias: false
+      max_t: 256
+      tags: [gemm, decode, lm_head, tp4]
+    mlp_down_proj:
+      K: 3072
+      N: 4096
+      bias: false
+      tags: [gemm, decode, prefill, mlp, tp4]
+    mlp_gate_up_proj:
+      K: 4096
+      N: 6144
+      bias: false
+      tags: [gemm, decode, prefill, mlp, tp4]
+    vis_attn_qkv:
+      K: 1152
+      N: 864
+      bias: true
+      tags: [gemm, vision, tp4]
+    vis_attn_o_proj:
+      K: 288
+      N: 1152
+      bias: false
+      tags: [gemm, vision, tp4]
+    vis_merger_fc2:
+      K: 1152
+      N: 4096
+      bias: true
+      tags: [gemm, vision, merger, tp4]
+
+e2e:
+  ops:
+    - linear
+  env: {}
+  serve_args:
+    - --tensor-parallel-size
+    - "4"
+    - --trust-remote-code
+    - --max-model-len
+    - "8192"
+    - --limit-mm-per-prompt
+    - '{"image":0,"video":0}'
+    - --compilation-config
+    - '{"cudagraph_mode":"FULL","mode":0}'
+  startup_timeout_s: 1800
+  warmup_requests: 10
+  workloads:
+    - id: bs1_128_128
+      input_len: 128
+      max_concurrency: 1
+      num_prompts: 40
+      output_len: 128

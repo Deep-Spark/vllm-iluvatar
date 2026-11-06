@@ -336,9 +336,9 @@ evalscope eval \
 
 | 作用 | 文件 |
 | --- | --- |
-| StaticQuantManager 功能提供 | [`vllm-iluvatar/vllm_iluvatar/v1/attention/ilu_static_quant.py`](../../vllm_iluvatar/v1/attention/ilu_static_quant.py) |
-| FlashAttention Backend 实现 | [`vllm-iluvatar/vllm_iluvatar/v1/attention/backends/ilu_flash_attn.py`](../../vllm_iluvatar/v1/attention/backends/ilu_flash_attn.py) |
-| MLA Backend 实现 | [`vllm-iluvatar/vllm_iluvatar/v1/attention/backends/mla/ilu_mla.py`](../../vllm_iluvatar/v1/attention/backends/mla/ilu_mla.py) |
+| StaticQuantManager 功能提供 | [`vllm-iluvatar/vllm_iluvatar/v1/attention/ilu_static_quant.py`](../../../vllm_iluvatar/v1/attention/ilu_static_quant.py) |
+| FlashAttention Backend 实现 | [`vllm-iluvatar/vllm_iluvatar/v1/attention/backends/ilu_flash_attn.py`](../../../vllm_iluvatar/v1/attention/backends/ilu_flash_attn.py) |
+| MLA Backend 实现 | [`vllm-iluvatar/vllm_iluvatar/v1/attention/backends/mla/ilu_mla.py`](../../../vllm_iluvatar/v1/attention/backends/mla/ilu_mla.py) |
 
 ---
 

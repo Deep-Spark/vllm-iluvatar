@@ -112,10 +112,10 @@ Hybrid EP 必须满足：
 > 只有所有参与的 DP rank 都是 decode-only 时，才允许统一切换到 LL。
 
 不能根据单个 rank 的本地 metadata 选择 backend。当前实现会在
-[`v1/worker/dp_utils.py`](../../vllm_iluvatar/v1/worker/dp_utils.py)
+[`v1/worker/dp_utils.py`](../../../vllm_iluvatar/v1/worker/dp_utils.py)
 中同步各 DP rank 的 decode-only 状态，通过 `DPMetadata` 和
 `ForwardContext` 传递 `all_ranks_decode_only`，最后由
-[`ilu_fused_moe_ep.py`](../../vllm_iluvatar/model_executor/layers/fused_moe/ilu_fused_moe_ep.py)
+[`ilu_fused_moe_ep.py`](../../../vllm_iluvatar/model_executor/layers/fused_moe/ilu_fused_moe_ep.py)
 选择 backend。
 
 当各 DP rank 处于 Prefill/Decode 混合状态时，实现还会同步关闭该 step 的
@@ -126,7 +126,7 @@ padding，避免 rank 间进入不同执行路径。
 
 模型需要通过 `IluFusedMoEEP` 接入 Hybrid EP。参考当前 DeepSeek-V4 MoE
 实现
-[`models/deepseek_v4/model.py`](../../vllm_iluvatar/models/deepseek_v4/model.py)，
+[`models/deepseek_v4/model.py`](../../../vllm_iluvatar/models/deepseek_v4/model.py)，
 接入步骤如下。
 
 1. 导入 `IluFusedMoEEP`，让模型的 MoE 类同时继承 `nn.Module` 和
@@ -530,29 +530,29 @@ kernel 做大范围 profiling。
 
 ## 8. 变更记录
 
-版本变更见 [Changelog](../../changelog.md)。具体运行行为、环境变量和
+版本变更见 [Changelog](../../../changelog.md)。具体运行行为、环境变量和
 注意事项见本文前面的配置与排查章节。
 
 ## 9. 附录
 
 ### 9.1 关键文件
 
-1. [`envs.py`](../../vllm_iluvatar/envs.py)：定义 DP、Hybrid EP 和 LL
+1. [`envs.py`](../../../vllm_iluvatar/envs.py)：定义 DP、Hybrid EP 和 LL
    相关环境变量及默认值。
-2. [`ilu_fused_moe_ep.py`](../../vllm_iluvatar/model_executor/layers/fused_moe/ilu_fused_moe_ep.py)：
+2. [`ilu_fused_moe_ep.py`](../../../vllm_iluvatar/model_executor/layers/fused_moe/ilu_fused_moe_ep.py)：
    实现 DP + EP MoE 数据流、Hybrid backend 选择、TP scatter、fused
    AG/AR 和 LL 初始化。
-3. [`ilu_deepep_ll.py`](../../vllm_iluvatar/model_executor/layers/fused_moe/prepare_finalize/ilu_deepep_ll.py)：
+3. [`ilu_deepep_ll.py`](../../../vllm_iluvatar/model_executor/layers/fused_moe/prepare_finalize/ilu_deepep_ll.py)：
    实现 LL prepare/finalize，以及 NVSM dispatch 和 combine。
-4. [`all2all.py`](../../vllm_iluvatar/distributed/device_communicators/all2all.py)：
+4. [`all2all.py`](../../../vllm_iluvatar/distributed/device_communicators/all2all.py)：
    创建 AG/RS、DeepEP HT 和 DeepEP LL all-to-all manager。
-5. [`dp_utils.py`](../../vllm_iluvatar/v1/worker/dp_utils.py)：同步 DP batch、
+5. [`dp_utils.py`](../../../vllm_iluvatar/v1/worker/dp_utils.py)：同步 DP batch、
    CUDA Graph mode 和 `all_ranks_decode_only`。
-6. [`core_client.py`](../../vllm_iluvatar/v1/engine/core_client.py)：实现 DP
+6. [`core_client.py`](../../../vllm_iluvatar/v1/engine/core_client.py)：实现 DP
    round-robin 请求分配。
-7. [`core.py`](../../vllm_iluvatar/v1/engine/core.py)：实现 replacement
+7. [`core.py`](../../../vllm_iluvatar/v1/engine/core.py)：实现 replacement
    request 等待和跨 DP rank 的 Prefill admission 同步。
-8. [`patch_core.py`](../../vllm_iluvatar/ilu_patch/general_patches/patch_core.py)：
+8. [`patch_core.py`](../../../vllm_iluvatar/ilu_patch/general_patches/patch_core.py)：
    安装 EngineCore wrapper，并校验社区方法的 fingerprint 和签名。
 
 ### 9.2 配置步骤速览

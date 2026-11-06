@@ -35,7 +35,7 @@
 
 2. **模型算法链完全重写，尽量走插件接口**。运行路径走 `vllm-iluvatar` 内部接口，**不走社区**的 `MultiHeadLatentAttentionWrapper` / `MLAAttention` / `SparseMLAAttentionImpl` / `sparse_attn_indexer`。attention 的 rope、吸收 up-proj、sparse kernel、indexer top-k 全部由插件自行实现或经 `ixf_ops` / ilu backend 完成。只有**基础设施**（`*Linear` / `RMSNorm` / `get_rope` / ilu FlashMLA backend 的 metadata 与 cache）才复用。
 
-3. **通过官方 OOT 扩展点接入**。`vllm-iluvatar` 有三套后期接入机制，各司其职（见 [`vllm_iluvatar/ilu_register/__init__.py`](../../vllm_iluvatar/ilu_register/__init__.py)）：
+3. **通过官方 OOT 扩展点接入**。`vllm-iluvatar` 有三套后期接入机制，各司其职（见 [`vllm_iluvatar/ilu_register/__init__.py`](../../../vllm_iluvatar/ilu_register/__init__.py)）：
    - **import-hook**：import 期的 `vllm._custom_ops` 覆盖；
    - **`ilu_patch`**：运行期 monkey-patch（带指纹 / 签名校验）；
    - **`ilu_register`**：官方 OOT 扩展点，即 `ModelRegistry.register_model` 与 `@register_quantization_config`（无指纹，因为它们是替换性的注册项，而非方法拷贝）。
@@ -58,7 +58,7 @@
     mtp.py          # （可选）MTP draft 模型
   ```
 
-- **登记到 `_OOT_MODEL_PACKAGES`**：`ilu_register` 的自动发现不递归子包，多文件模型包须显式列进 [`vllm_iluvatar/ilu_register/__init__.py`](../../vllm_iluvatar/ilu_register/__init__.py) 的 `_OOT_MODEL_PACKAGES`：
+- **登记到 `_OOT_MODEL_PACKAGES`**：`ilu_register` 的自动发现不递归子包，多文件模型包须显式列进 [`vllm_iluvatar/ilu_register/__init__.py`](../../../vllm_iluvatar/ilu_register/__init__.py) 的 `_OOT_MODEL_PACKAGES`：
 
   ```python
   _OOT_MODEL_PACKAGES = [
@@ -120,7 +120,7 @@
 
 ### 3.2 模型适配
 
-以 [`glm_moe_dsa/model.py`](../../vllm_iluvatar/models/glm_moe_dsa/model.py) 为模板搭建模型图与权重加载：
+以 [`glm_moe_dsa/model.py`](../../../vllm_iluvatar/models/glm_moe_dsa/model.py) 为模板搭建模型图与权重加载：
 
 - **类结构**：`IluXXXForCausalLM(nn.Module, SupportsPP)` → `IluXXXModel` → `IluXXXDecoderLayer` → `MoE` / `MLP`。顶层持有 `lm_head` / `logits_processor`，`model_cls` 指向内层 `Model`。
 - **`register_model()` 钩子**：在文件末尾注册 causal-LM 与 MTP 两个 arch，用**字符串路径惰性引用**类，把 attention / mtp 的重依赖延迟到模型真正加载时：
@@ -146,7 +146,7 @@
 
 ### 3.3 attention 抽离
 
-这是天数优化的核心。以 [`glm_moe_dsa/attention.py`](../../vllm_iluvatar/models/glm_moe_dsa/attention.py) 为模板，把整条 attention 算法链**自包含**在插件内，分三层（对齐 `deepseek_v4`）：
+这是天数优化的核心。以 [`glm_moe_dsa/attention.py`](../../../vllm_iluvatar/models/glm_moe_dsa/attention.py) 为模板，把整条 attention 算法链**自包含**在插件内，分三层（对齐 `deepseek_v4`）：
 
 - **外层 `IluXXXMLAAttention`**（`nn.Module`）：持有投影（`fused_qkv_a_proj` / `q_b_proj` / `kv_b_proj` / `o_proj`）、norms、DSA indexer，等价于社区 `MultiHeadLatentAttentionWrapper.forward_opt` 的 pre/post 处理，但**不引入社区 wrapper**。
 - **内层 `IluXXXSparseMLA`**（`nn.Module, AttentionLayerBase`）：负责 `get_attn_backend` / `get_kv_cache_spec`，驱动 rope + 吸收 k-up + `concat_and_cache_mla` + FlashMLA sparse kernel + v-up。吸收的 up-proj 是 grouped W8A16 marlin：k-up / v-up 直接读 `kv_b_proj.W_UK` / `W_UV`（加载期由量化 method 拆好并 repack）并调 `ixf_ops.marlin_w8a16`。它注册为 `AttentionLayerBase`，由 runner 为其分配 paged KV cache 并按 `prefix` 建 metadata。
@@ -174,7 +174,7 @@ direct_register_custom_op(
 
 ### 3.4 MoE 与混合量化
 
-混合量化配置以 [`compressed_tensors.py`](../../vllm_iluvatar/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py) 为模板。它是统一的量化 config，新模型可直接复用.
+混合量化配置以 [`compressed_tensors.py`](../../../vllm_iluvatar/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py) 为模板。它是统一的量化 config，新模型可直接复用.
 
 - **注册与激活**：`IluQuantConfig` 标注 `@register_quantization_config("compressed-tensors")`（由 `ilu_register` 在 import 期触发），替换官方同名配置类。checkpoint 的 `quantization_config.quant_method` 为 `compressed-tensors` 时自动走插件后端，社区的 quantization 注册表与 `config/model.py` 保持零改动。详细内容，请见[`6-how-to-use-and-provide-iluvatar-extend-compress-tensors.md`](../guides/6-how-to-use-and-provide-iluvatar-extend-compress-tensors.md)
 
@@ -202,7 +202,7 @@ direct_register_custom_op(
 
 #### （3）MTP —— 多 token 投机解码（可叠加 cuda-graph）
 
-新增 [`glm_moe_dsa/mtp.py`](../../vllm_iluvatar/models/glm_moe_dsa/mtp.py)，实现 `IluXXXMTP`（标准 DeepSeek-V3.2 MTP 布局：`enorm` / `hnorm` + 融合 `eh_proj` + `shared_head` + 一个 `mtp_block` 解码层）。要点：
+新增 [`glm_moe_dsa/mtp.py`](../../../vllm_iluvatar/models/glm_moe_dsa/mtp.py)，实现 `IluXXXMTP`（标准 DeepSeek-V3.2 MTP 布局：`enorm` / `hnorm` + 融合 `eh_proj` + `shared_head` + 一个 `mtp_block` 解码层）。要点：
 
 - **`mtp_block` 复用 target 的 ilu 解码层**（`IluXXXDecoderLayer`），使 draft 与 target 共享同一套 ilu attention / W8A16 `kv_b_proj` / DSA kernel，不引入社区 `DeepseekV2DecoderLayer`。
 - `eh_proj` 用 `ReplicatedLinear` 并绑 `quant_config`（离线转换把它量化成 INT8 W8A8）。
@@ -211,8 +211,8 @@ direct_register_custom_op(
 
 MTP 还需两个 `ilu_patch.general_patches`（各暴露 `register()`，由 `apply_general_patches` 在 `register_general` 期自动发现）：
 
-- [`patch_speculative_config.py`](../../vllm_iluvatar/ilu_patch/general_patches/patch_speculative_config.py)：包装社区 `SpeculativeConfig.hf_config_override`，在社区路由跑完后，把 target arch 的 MTP draft arch 重定向到插件专用 draft arch（实现见 [`config/speculative.py`](../../vllm_iluvatar/config/speculative.py) 的 `_ILU_MTP_ARCH_MAP`，例如 `DeepseekV32MTPModel`、`DeepSeekV4MTPModel`、`IluGlmMoeDsaMTPModel`）。
-- [`patch_llm_base_proposer.py`](../../vllm_iluvatar/ilu_patch/general_patches/patch_llm_base_proposer.py)：包装 `SpecDecodeBaseProposer.model_returns_tuple`，让 proposer 识别插件 draft arch 的 `(logit_hidden, recycle_hidden)` tuple 返回契约（实现见 [`v1/spec_decode/llm_base_proposer.py`](../../vllm_iluvatar/v1/spec_decode/llm_base_proposer.py)）。
+- [`patch_speculative_config.py`](../../../vllm_iluvatar/ilu_patch/general_patches/patch_speculative_config.py)：包装社区 `SpeculativeConfig.hf_config_override`，在社区路由跑完后，把 target arch 的 MTP draft arch 重定向到插件专用 draft arch（实现见 [`config/speculative.py`](../../../vllm_iluvatar/config/speculative.py) 的 `_ILU_MTP_ARCH_MAP`，例如 `DeepseekV32MTPModel`、`DeepSeekV4MTPModel`、`IluGlmMoeDsaMTPModel`）。
+- [`patch_llm_base_proposer.py`](../../../vllm_iluvatar/ilu_patch/general_patches/patch_llm_base_proposer.py)：包装 `SpecDecodeBaseProposer.model_returns_tuple`，让 proposer 识别插件 draft arch 的 `(logit_hidden, recycle_hidden)` tuple 返回契约（实现见 [`v1/spec_decode/llm_base_proposer.py`](../../../vllm_iluvatar/v1/spec_decode/llm_base_proposer.py)）。
 
 启动约束（以通用形式给出，具体拓扑按部署环境调整）：
 
@@ -240,15 +240,15 @@ MTP 还需两个 `ilu_patch.general_patches`（各暴露 `register()`，由 `app
 
 | 作用 | 文件 |
 | --- | --- |
-| OOT 注册入口（登记模型包） | [`vllm_iluvatar/ilu_register/__init__.py`](../../vllm_iluvatar/ilu_register/__init__.py) |
-| 模型图 + 权重加载 + `register_model()` | [`vllm_iluvatar/models/glm_moe_dsa/model.py`](../../vllm_iluvatar/models/glm_moe_dsa/model.py) |
-| 自包含 attention 链 + plugin-local opaque op | [`vllm_iluvatar/models/glm_moe_dsa/attention.py`](../../vllm_iluvatar/models/glm_moe_dsa/attention.py) |
-| MTP draft 模型 | [`vllm_iluvatar/models/glm_moe_dsa/mtp.py`](../../vllm_iluvatar/models/glm_moe_dsa/mtp.py) |
-| 官方 FP8 权重（社区 arch 覆盖） | [`fp8_model.py`](../../vllm_iluvatar/models/glm_moe_dsa/fp8_model.py) · [`fp8_attention.py`](../../vllm_iluvatar/models/glm_moe_dsa/fp8_attention.py) · [`fp8_mtp.py`](../../vllm_iluvatar/models/glm_moe_dsa/fp8_mtp.py) |
-| 混合量化 config（W4A8/W8A8/W8A16 分发） | [`vllm_iluvatar/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py`](../../vllm_iluvatar/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py) |
-| MTP draft-arch 重定向实现 | [`vllm_iluvatar/config/speculative.py`](../../vllm_iluvatar/config/speculative.py) |
-| MTP tuple 返回契约实现 | [`vllm_iluvatar/v1/spec_decode/llm_base_proposer.py`](../../vllm_iluvatar/v1/spec_decode/llm_base_proposer.py) |
-| MTP 两个 patch 的 register-time 接线 | [`patch_speculative_config.py`](../../vllm_iluvatar/ilu_patch/general_patches/patch_speculative_config.py) · [`patch_llm_base_proposer.py`](../../vllm_iluvatar/ilu_patch/general_patches/patch_llm_base_proposer.py) |
+| OOT 注册入口（登记模型包） | [`vllm_iluvatar/ilu_register/__init__.py`](../../../vllm_iluvatar/ilu_register/__init__.py) |
+| 模型图 + 权重加载 + `register_model()` | [`vllm_iluvatar/models/glm_moe_dsa/model.py`](../../../vllm_iluvatar/models/glm_moe_dsa/model.py) |
+| 自包含 attention 链 + plugin-local opaque op | [`vllm_iluvatar/models/glm_moe_dsa/attention.py`](../../../vllm_iluvatar/models/glm_moe_dsa/attention.py) |
+| MTP draft 模型 | [`vllm_iluvatar/models/glm_moe_dsa/mtp.py`](../../../vllm_iluvatar/models/glm_moe_dsa/mtp.py) |
+| 官方 FP8 权重（社区 arch 覆盖） | [`fp8_model.py`](../../../vllm_iluvatar/models/glm_moe_dsa/fp8_model.py) · [`fp8_attention.py`](../../../vllm_iluvatar/models/glm_moe_dsa/fp8_attention.py) · [`fp8_mtp.py`](../../../vllm_iluvatar/models/glm_moe_dsa/fp8_mtp.py) |
+| 混合量化 config（W4A8/W8A8/W8A16 分发） | [`vllm_iluvatar/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py`](../../../vllm_iluvatar/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py) |
+| MTP draft-arch 重定向实现 | [`vllm_iluvatar/config/speculative.py`](../../../vllm_iluvatar/config/speculative.py) |
+| MTP tuple 返回契约实现 | [`vllm_iluvatar/v1/spec_decode/llm_base_proposer.py`](../../../vllm_iluvatar/v1/spec_decode/llm_base_proposer.py) |
+| MTP 两个 patch 的 register-time 接线 | [`patch_speculative_config.py`](../../../vllm_iluvatar/ilu_patch/general_patches/patch_speculative_config.py) · [`patch_llm_base_proposer.py`](../../../vllm_iluvatar/ilu_patch/general_patches/patch_llm_base_proposer.py) |
 
 ### 步骤速览
 

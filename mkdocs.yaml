@@ -1,0 +1,118 @@
+site_name: vLLM-Iluvatar
+site_url: !ENV [READTHEDOCS_CANONICAL_URL, "http://localhost:8000/"]
+repo_url: https://github.com/Deep-Spark/vllm-iluvatar
+edit_uri: edit/release/0.27.1/docs/
+
+exclude_docs: |
+  *.inc.md
+  *.template.md
+  # Provenance ledger for maintainers and compliance review: it lists the
+  # upstream vLLM file each copied/adapted plugin file came from. Keep it in the
+  # repository but out of the site, so it does not show up in navigation or
+  # search; the license texts themselves stay in LICENSE / THIRD_PARTY_NOTICES.md.
+  licensing/
+  developer_guide/design/
+  developer_guide/guides/
+  developer_guide/rfcs/
+
+validation:
+  links:
+    absolute_links: relative_to_docs
+    anchors: warn
+    unrecognized_links: warn
+
+theme:
+  name: material
+  custom_dir: overrides
+  language: zh
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    # Follow system preference
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: 切换到浅色模式 / Switch to light mode
+    # Light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: white
+      toggle:
+        icon: material/brightness-7
+        name: 切换到深色模式 / Switch to dark mode
+    # Dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      toggle:
+        icon: material/brightness-2
+        name: 跟随系统 / Switch to system preference
+  features:
+    - content.action.edit
+    - content.code.copy
+    - content.tabs.link
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - search.highlight
+    - search.share
+    - toc.follow
+
+hooks:
+  - hooks/remove_announcement.py
+  - hooks/url_schemes.py
+  - hooks/doc_sources.py
+  - hooks/release_navigation.py
+
+plugins:
+  - search:
+      lang:
+        - zh
+        - en
+  - awesome-nav
+  - glightbox
+  - minify:
+      minify_html: true
+      cache_safe: true
+      # Only minify our own custom assets, not plugin-provided bundles
+      # (those are already minified). Add entries here when we add custom files.
+      css_files:
+        - mkdocs/stylesheets/extra.css
+
+markdown_extensions:
+  - attr_list
+  - md_in_html
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - toc:
+      permalink: true
+      # Chinese headings lose every CJK character under the default slugify,
+      # so anchors like #3-配置入口 become #3 and in-page links break.
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds: {case: lower}
+
+extra_css:
+  - mkdocs/stylesheets/extra.css
+
+extra:
+  generator: false
+
+# README.md generates as index.html, available at /index.html (RTD-friendly).
+use_directory_urls: false

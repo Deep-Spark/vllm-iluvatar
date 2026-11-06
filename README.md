@@ -44,7 +44,7 @@ python3 -c "import torch; import vllm_iluvatar._C; from vllm.platforms import cu
 ```
 
 The output should identify the Iluvatar platform. For editable installation,
-see the [development guide](docs/guides/7-how-to-set-up-the-dev-environment.md).
+see the [development guide](docs/developer_guide/guides/7-how-to-set-up-the-dev-environment.md).
 
 ## Quick Start
 
@@ -64,10 +64,11 @@ curl http://localhost:8000/v1/chat/completions \
 
 ## Documentation
 
-- [Development setup](docs/guides/7-how-to-set-up-the-dev-environment.md)
-- [Model integration](docs/guides/2-how-to-quickly-adapt-a-community-model.md)
-- [Quantization](docs/guides/8-how-to-use-iluvatar-runtime-quant-via-additional-config.md)
-- [Distributed inference](docs/guides/5-how-to-use-dp-ep.md)
+- [Development setup](docs/developer_guide/guides/7-how-to-set-up-the-dev-environment.md)
+- [Model integration](docs/developer_guide/guides/2-how-to-quickly-adapt-a-community-model.md)
+- [Quantization](docs/developer_guide/guides/8-how-to-use-iluvatar-runtime-quant-via-additional-config.md)
+- [Distributed inference](docs/developer_guide/guides/5-how-to-use-dp-ep.md)
+- [Plugin design](docs/developer_guide/design/iluvatar_plugin_design.md) — Detailed implementation notes
 - [Changelog](changelog.md)
 
 For general serving options and API usage, see the [vLLM documentation](https://docs.vllm.ai/).

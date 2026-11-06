@@ -1,0 +1,37 @@
+nav:
+  - 首页: README.md
+  - 用户指南:
+    - user_guide/index.md
+    - 快速开始: user_guide/quickstart.md
+    - 支持模型: user_guide/supported_models.md
+    - 安装:
+      - user_guide/installation/index.md
+      - 镜像安装: user_guide/installation/image_installation.md
+      - 安装自检: user_guide/installation/installation_check.md
+    - 配置与功能:
+      - user_guide/config_features/index.md
+      - 启动参数与环境变量: user_guide/config_features/launch_args_and_env.md
+      - 量化: user_guide/config_features/quantization.md
+      - 数据并行与专家并行（DP / EP）: user_guide/config_features/data_parallel_expert_parallel.md
+      - CUDA Graph: user_guide/config_features/cuda_graph.md
+      - Model Runner V2: user_guide/config_features/model_runner_v2.md
+      - 投机解码（DSpark）: user_guide/config_features/dspark_speculative_decoding.md
+    - 示例:
+      - user_guide/examples/index.md
+      - DeepSeek 启动: user_guide/examples/deepseek_v4_serving.md
+      - 精度验证: user_guide/examples/evalscope_accuracy.md
+      - 性能压测: user_guide/examples/vllm_bench_serve.md
+    - 参考:
+      - 版本说明:
+        - user_guide/reference/release_notes/index.md
+        - vLLM v0.27.1: user_guide/reference/release_notes/vllm_v0.27.1.md
+      - 软件栈运行链路: user_guide/reference/software_stack_runtime.md
+    - 常见问题: user_guide/faq.md
+  - 开发者文档:
+    - developer_guide/index.md
+    - 插件架构: developer_guide/plugin_architecture.md
+    - patch 与插件机制: developer_guide/patch_and_plugin.md
+    - 开发环境搭建: developer_guide/dev_environment.md
+    - 接入模型: developer_guide/model_integration.md
+    - 自定义算子: developer_guide/custom_ops.md
+    - 扩展量化: developer_guide/extend_quantization.md

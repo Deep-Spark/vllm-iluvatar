@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from ixformer.inference.functions.models import deepseek_v41 as ixfops  # type: ignore[import]
+from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -193,24 +194,72 @@ class IluDSparkV41Model(nn.Module):
         context_slot_mappings: torch.Tensor | list[torch.Tensor | None] | None = None,
     ) -> None:
         # Context projection uses the same combined target states in all layers.
+        quant_x: tuple[torch.Tensor, torch.Tensor, torch.dtype] | None = None
         for i, layer in enumerate(self.layers):
             slot_mapping = (
                 context_slot_mappings[i]
                 if isinstance(context_slot_mappings, list)
                 else context_slot_mappings
             )
-            attn = layer.attn
-            qr_kv, _ = attn.fused_wqa_wkv(main_x)
-            qr, kv = qr_kv.split([attn.q_lora_rank, attn.head_dim], dim=-1)
-            _, kv = ixfshared.rms_norm_qk(
-                qr,
-                kv,
-                attn.q_norm.weight,
-                attn.kv_norm.weight,
-                attn.eps,
-            )
             if slot_mapping is None:
                 continue
+            attn = layer.attn
+            w_q = getattr(attn.fused_wqa_wkv, "weight", None)
+            w_s = getattr(attn.fused_wqa_wkv, "weight_scale", None)
+            if (
+                w_q is not None
+                and w_s is not None
+                and w_q.dtype == torch.int8
+                and getattr(attn.fused_wqa_wkv, "input_scale", None) is None
+                and getattr(attn.fused_wqa_wkv, "bias", None) is None
+                and main_x.ndim == 2
+            ):
+                if quant_x is None:
+                    x_q, x_s, _ = ops.scaled_int8_quant(
+                        main_x.contiguous(), None, None, symmetric=True
+                    )
+                    quant_x = (x_q, x_s, main_x.dtype)
+                wkv_w = getattr(attn, "_context_wkv_weight", None)
+                if wkv_w is None:
+                    if w_q.shape == (
+                        attn.hidden_size,
+                        attn.q_lora_rank + attn.head_dim,
+                    ):
+                        wkv_w = w_q[:, attn.q_lora_rank :].contiguous()
+                        wkv_fmt = "NN"
+                    else:
+                        wkv_w = w_q[attn.q_lora_rank :, :].contiguous()
+                        wkv_fmt = "TN"
+                    wkv_s = w_s[attn.q_lora_rank :].contiguous()
+                    attn._context_wkv_weight = wkv_w
+                    attn._context_wkv_scale = wkv_s
+                    attn._context_wkv_fmt = wkv_fmt
+                kv = torch.empty(
+                    (main_x.shape[0], attn.head_dim),
+                    dtype=main_x.dtype,
+                    device=main_x.device,
+                )
+                ixfshared.w8a8(
+                    quant_x[0],
+                    attn._context_wkv_weight,
+                    quant_x[1],
+                    attn._context_wkv_scale,
+                    None,
+                    format=attn._context_wkv_fmt,
+                    output=kv,
+                    out_dtype=main_x.dtype,
+                )
+                kv = attn.kv_norm(kv)
+            else:
+                qr_kv, _ = attn.fused_wqa_wkv(main_x)
+                qr, kv = qr_kv.split([attn.q_lora_rank, attn.head_dim], dim=-1)
+                _, kv = ixfshared.rms_norm_qk(
+                    qr,
+                    kv,
+                    attn.q_norm.weight,
+                    attn.kv_norm.weight,
+                    attn.eps,
+                )
             _insert_context_kv(attn, kv, context_positions, slot_mapping)
 
     def forward(

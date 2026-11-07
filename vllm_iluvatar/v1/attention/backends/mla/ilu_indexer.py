@@ -40,10 +40,15 @@ from vllm.v1.kv_cache_interface import (
 def indexer_kv_dtype() -> str:
     """Record the lightning indexer keeps its index keys in.
 
-    ``VLLM_ILU_V41_INDEXER_KV_DTYPE``; unset means ``fp8``. Read live so a test
-    can point the process at another record before the model is built.
+    ``VLLM_ILU_V41_INDEXER_KV_DTYPE`` (or legacy ``VLLM_ILU_DS4_INDEXER_KV_DTYPE``);
+    unset means ``fp8``. Read live so a test can point the process at another
+    record before the model is built.
     """
-    dtype = os.environ.get("VLLM_ILU_V41_INDEXER_KV_DTYPE", "fp8").strip().lower()
+    dtype = (
+        os.environ.get("VLLM_ILU_V41_INDEXER_KV_DTYPE")
+        or os.environ.get("VLLM_ILU_DS4_INDEXER_KV_DTYPE")
+        or "fp8"
+    ).strip().lower()
     if dtype not in ("bf16", "fp8", "int8"):
         raise ValueError(
             f"VLLM_ILU_V41_INDEXER_KV_DTYPE must be bf16, fp8, or int8, got {dtype!r}"
@@ -937,28 +942,41 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # Built device-side: the host variant needs ``seq_lens_cpu``, which the
         # spec-decode proposer invalidates every draft step, so it would cost a
         # blocking D2H per step.
-        cu_seqlen_ks_tmp, cu_seqlen_ke_tmp = kv_spans_from_batches_device(
-            cu_seqlens_q,
-            common_attn_metadata.seq_lens[:num_decodes],
-            self.decode_token_arange_p1_buffer,
-            num_real_decode_tokens,
-            compress_ratio=self.compress_ratio,
+        use_cuda_spans = (
+            self.compress_ratio in (1, 2)
+            and 1 <= num_decodes <= 8
+            and 1 <= num_decode_tokens <= 64
+            and not requires_padding
+            and common_attn_metadata.seq_lens.is_cuda
+            and common_attn_metadata.seq_lens.dtype == torch.int32
+            and common_attn_metadata.seq_lens.is_contiguous()
         )
+        if use_cuda_spans:
+            from ixformer.inference.functions.models import deepseek_v41 as dsv41
 
-        # Copy into persistent buffers for CUDA graph address stability. There
-        # is one ks/ke entry per **real** decode query token; the topk kernel
-        # only reads ``ke - ks`` (the per-token causal length), so the absolute
-        # offsets need not match the per-request logits layout. CUDA-graph
-        # padding rows [real, padded) get zero-length spans (ks == ke == 0) so
-        # ``dsa_update_topk_indices`` writes -1 for them without touching the
-        # (uninitialised) padded logits rows. Slicing to the padded length
-        # keeps ``cu_seqlen_ks.shape[0] == logits.shape[0]`` (the consumer
-        # builds logits from ``q[:num_decode_tokens]``).
-        assert cu_seqlen_ks_tmp.shape[0] == num_real_decode_tokens
-        self.cu_seqlen_ks_buffer[:num_real_decode_tokens] = cu_seqlen_ks_tmp
-        self.cu_seqlen_ke_buffer[:num_real_decode_tokens] = cu_seqlen_ke_tmp
-        self.cu_seqlen_ks_buffer[num_real_decode_tokens:num_decode_tokens] = 0
-        self.cu_seqlen_ke_buffer[num_real_decode_tokens:num_decode_tokens] = 0
+            dsv41.indexer_decode_spans(
+                common_attn_metadata.seq_lens[:num_decodes],
+                cu_seqlens_q,
+                self.cu_seqlen_ks_buffer[:num_decode_tokens],
+                self.cu_seqlen_ke_buffer[:num_decode_tokens],
+                num_decodes,
+                num_real_decode_tokens,
+                num_decode_tokens,
+                self.compress_ratio,
+            )
+        else:
+            cu_seqlen_ks_tmp, cu_seqlen_ke_tmp = kv_spans_from_batches_device(
+                cu_seqlens_q,
+                common_attn_metadata.seq_lens[:num_decodes],
+                self.decode_token_arange_p1_buffer,
+                num_real_decode_tokens,
+                compress_ratio=self.compress_ratio,
+            )
+            assert cu_seqlen_ks_tmp.shape[0] == num_real_decode_tokens
+            self.cu_seqlen_ks_buffer[:num_real_decode_tokens] = cu_seqlen_ks_tmp
+            self.cu_seqlen_ke_buffer[:num_real_decode_tokens] = cu_seqlen_ke_tmp
+            self.cu_seqlen_ks_buffer[num_real_decode_tokens:num_decode_tokens] = 0
+            self.cu_seqlen_ke_buffer[num_real_decode_tokens:num_decode_tokens] = 0
         cu_seqlen_ks = self.cu_seqlen_ks_buffer[:num_decode_tokens]
         cu_seqlen_ke = self.cu_seqlen_ke_buffer[:num_decode_tokens]
         torch.sub(

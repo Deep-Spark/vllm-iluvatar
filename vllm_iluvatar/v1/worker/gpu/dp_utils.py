@@ -86,7 +86,7 @@ def sync_cudagraph_and_dp_padding(
     """Community V2 DP sync, plus the all-ranks decode-only bit."""
     if _ORIGINAL_SYNC is None:
         raise RuntimeError("sync_cudagraph_and_dp_padding patch is not installed")
-    if os.environ.get("VLLM_ILU_MERGE_DP_SYNC", "0") == "1":
+    if os.environ.get("VLLM_ILU_MERGE_DP_SYNC", "1") == "1":
         from .merged_dp_sync import sync_cudagraph_and_dp_padding as sync
     else:
         _publish_all_ranks_decode_only(uniform_decode, dp_size, dp_rank)

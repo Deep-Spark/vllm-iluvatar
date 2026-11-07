@@ -18,13 +18,20 @@ import numpy as np
 import torch
 import uvloop
 import zmq
+os.environ.setdefault("UCX_MEM_MALLOC_HOOKS", "n")
+os.environ.setdefault("UCX_MEM_MALLOC_RELOC", "n")
 try:
     from nixl._api import nixl_agent as NixlWrapper
     from nixl._api import nixl_agent_config, nixl_prepped_dlist_handle
+    try:
+        from nixl._api import nixl_thread_sync_t
+    except ImportError:
+        nixl_thread_sync_t = None
 except ImportError:
     NixlWrapper = None
     nixl_agent_config = None
     nixl_prepped_dlist_handle = Any
+    nixl_thread_sync_t = None
 from vllm import envs
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.utils import (
@@ -206,15 +213,34 @@ class NixlConnectorWorker:
         num_threads = vllm_config.kv_transfer_config.get_from_extra_config(
             "num_threads", 4
         )
+        enable_prog_thread = self.kv_transfer_config.get_from_extra_config(
+            "enable_prog_thread", True
+        )
+        self._nixl_polling = not enable_prog_thread
+        if not enable_prog_thread and num_threads:
+            raise ValueError("Polling NIXL requires num_threads=0")
         if nixl_agent_config is None:
             config = None
         else:
             # Enable telemetry by default for NIXL 0.7.1 and above.
+            ucx_kwargs = dict(
+                num_threads=num_threads,
+                enable_prog_thread=enable_prog_thread,
+                capture_telemetry=True,
+            )
+            if nixl_thread_sync_t is not None and not enable_prog_thread:
+                ucx_kwargs["sync_mode"] = nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT
             config = (
                 nixl_agent_config(backends=self.nixl_backends, capture_telemetry=True)
                 if len(non_ucx_backends) > 0
-                else nixl_agent_config(num_threads=num_threads, capture_telemetry=True)
+                else nixl_agent_config(**ucx_kwargs)
             )
+        logger.info(
+            "NIXL progress mode: background=%s num_threads=%s sync=%s",
+            enable_prog_thread,
+            num_threads,
+            "default" if enable_prog_thread else "STRICT",
+        )
         # KV Caches and nixl tracking data.
         self.device_type = current_platform.device_type
         self.kv_buffer_device: str = vllm_config.kv_transfer_config.kv_buffer_device
@@ -2355,6 +2381,9 @@ class NixlConnectorWorker:
         if self.is_consumer:
             self._poll_new_notifs()
         else:
+            # Plain UCX needs progress even after transfer handles complete.
+            if self._nixl_polling:
+                self._poll_new_notifs()
             self._poll_send_transfers()
         now = time.perf_counter()
         self._expire_requests(now)

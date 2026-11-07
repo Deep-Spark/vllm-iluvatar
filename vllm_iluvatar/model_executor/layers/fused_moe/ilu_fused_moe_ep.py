@@ -1082,7 +1082,15 @@ class IluFusedMoEEP:
             output.mul_(routed_experts_scaling_factor)
 
         fused_output = output
-        if runner._fused_output_is_reduced:
-            shared_output = runner._maybe_reduce_shared_expert_output(shared_output)
+        output_is_reduced = getattr(moe_kernel, "output_is_reduced", None)
+        active_output_is_reduced = (
+            output_is_reduced()
+            if callable(output_is_reduced)
+            else getattr(runner, "_fused_output_is_reduced", False)
+        )
+        if active_output_is_reduced:
+            shared_output = runner._maybe_reduce_shared_expert_output(
+                shared_output, fused_output_is_reduced=active_output_is_reduced
+            )
 
         return fused_output if shared_output is None else shared_output + fused_output

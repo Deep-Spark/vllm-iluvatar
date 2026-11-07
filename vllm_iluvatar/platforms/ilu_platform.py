@@ -284,6 +284,30 @@ def _make_iluvatar_platform():
         def check_and_update_config(cls, vllm_config) -> None:
             model_config = getattr(vllm_config, "model_config", None)
             cache_config = getattr(vllm_config, "cache_config", None)
+            compilation_config = getattr(vllm_config, "compilation_config", None)
+            scheduler_config = getattr(vllm_config, "scheduler_config", None)
+            if (
+                compilation_config is not None
+                and scheduler_config is not None
+                and compilation_config.cudagraph_capture_sizes
+            ):
+                decode_query_len = getattr(vllm_config, "uniform_decode_query_len", 1)
+                max_num_seqs = getattr(scheduler_config, "max_num_seqs", 0)
+                max_tokens = getattr(scheduler_config, "max_num_batched_tokens", 0)
+                if decode_query_len > 1 and 1 <= max_num_seqs <= 16:
+                    # Ensure every uniform decode batch size (1..max_num_seqs)
+                    # is captured so 3-req (M=18) does not pad up to 4-req (M=24).
+                    extra_sizes = [
+                        n * decode_query_len
+                        for n in range(1, max_num_seqs + 1)
+                        if n * decode_query_len <= max_tokens
+                    ]
+                    merged = sorted(
+                        set(compilation_config.cudagraph_capture_sizes) | set(extra_sizes)
+                    )
+                    compilation_config.cudagraph_capture_sizes = merged
+                    if merged:
+                        compilation_config.max_cudagraph_capture_size = merged[-1]
             if model_config is not None and cache_config is not None:
                 try:
                     archs = model_config.architectures or []
@@ -330,13 +354,7 @@ def _make_iluvatar_platform():
             except Exception:
                 archs = []
             if model_config.tokenizer_mode == "auto":
-                if any(
-                    a in archs
-                    for a in (
-                        "IluDeepseekV41ForCausalLM",
-                        "IluDeepseekV41VLForCausalLM",
-                    )
-                ):
+                if any(a in archs for a in _DSV41_ARCHS):
                     model_config.tokenizer_mode = "deepseek_v41"
                     logger.info(
                         "ILU: set tokenizer_mode='deepseek_v41' for %s",

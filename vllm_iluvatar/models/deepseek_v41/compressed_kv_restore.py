@@ -269,3 +269,70 @@ class RestorePlanTracker:
         if selection is None:
             raise ValueError("Cannot publish an absent compressed family")
         self._family, self._selection, self._pending = ticket.family, selection, None
+
+
+def prefill_validity_family(attention, metadata, swa_metadata, tokens):
+    """Collect local consumers' masks without assuming they have equal values.
+
+    Only pure producer prefill is eligible. All consumers must use the same
+    request order and TopK view. A union prepares every row needed by any
+    consumer; each consumer still applies its own original mask to lengths.
+    The caller's forward-scoped tracker owns freshness of all tensor views.
+    """
+    workspace = attention.compressed_kv_workspace
+    if not (
+        getattr(workspace, "prefill_producer", False)
+        and swa_metadata.num_decodes == 0
+        and swa_metadata.num_prefills > 0
+        and isinstance(metadata, dict)
+    ):
+        return ()
+    peers = getattr(attention, "_restore_validity_peers", None)
+    if peers is None:
+        peers = tuple(
+            peer
+            for _, peer in sorted(attention._static_forward_context.items())
+            if getattr(peer, "compressed_cache_prefix", None)
+            == attention.compressed_cache_prefix
+            and getattr(peer, "index_source_layer_id", None)
+            == attention.index_source_layer_id
+            and hasattr(peer, "swa_cache_layer")
+        )
+        attention._restore_validity_peers = peers
+    reqs = TensorViewKey.of(swa_metadata.token_to_req_indices[:tokens])
+    topk = TensorViewKey.of(attention.topk_indices_buffer[:tokens])
+    masks = []
+    for peer in peers:
+        m = metadata.get(peer.swa_cache_layer.prefix)
+        if (
+            m is None
+            or m.num_decodes != 0
+            or m.num_prefill_tokens != tokens
+            or m.is_valid_token is None
+            or m.is_valid_token.numel() < tokens
+            or m.token_to_req_indices is None
+            or TensorViewKey.of(m.token_to_req_indices[:tokens]) != reqs
+            or peer.topk_indices_buffer is None
+            or TensorViewKey.of(peer.topk_indices_buffer[:tokens]) != topk
+        ):
+            return ()
+        masks.append(m.is_valid_token[:tokens])
+    return tuple(masks) if len(masks) > 1 else ()
+
+
+def union_validity(masks):
+    valid = masks[0]
+    for other in masks[1:]:
+        valid = torch.logical_or(valid, other)
+    return valid
+
+
+def consumer_selection(selection, valid):
+    """Keep the shared prepared rows while retaining this layer's exact mask."""
+    return CompressedFamilySelection(
+        selection.indices,
+        torch.where(valid, selection.lengths, 0),
+        selection.plan,
+        selection.scratch_bytes,
+        compact_plan=selection.compact_plan,
+    )

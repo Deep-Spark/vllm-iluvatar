@@ -226,6 +226,114 @@ class IluV4W8A16BMMLinearMethod(LinearMethodBase):
         )
 
 
+def _grouped_checkpoint_parameters(layer):
+    geometry = layer.bmm_geom
+    groups = geometry.n_local_groups
+    channels = geometry.o_lora_rank
+    width = geometry.heads_per_group * geometry.head_dim
+    weight, scales = layer.weight.data, layer.weight_scale.data
+    if weight.dtype != torch.int8 or weight.shape != (groups * channels, width):
+        raise ValueError("Grouped projection needs INT8 weights matching bmm_geom")
+    if scales.dtype != torch.float32 or scales.shape != (groups * channels, 1):
+        raise ValueError("Grouped projection needs FP32 per-channel weight scales")
+    return weight.view(groups, channels, width), scales.view(groups, channels)
+
+
+@IluvatarQuantRegistry.register_method
+class IluV4W8A8BMMLinearMethod(IluV4W8A16BMMLinearMethod):
+    """Grouped INT8 output projection with fused inverse-RoPE activation quant.
+
+    The checkpoint-loading contract is shared with W8A16. Post-loading keeps
+    one INT8 layout and releases the original parameters, without a second
+    Marlin weight copy. Attention supplies positions through apply_with_rope.
+    """
+
+    def __init__(self, parent_config, ilu_params: dict[str, Any]) -> None:
+        self.parent_config = parent_config
+        self.gemm_format = ilu_params.get("bmm_w8a8_gemm_format", "NN")
+        if self.gemm_format not in ("TN", "NN"):
+            raise ValueError("Grouped INT8 projection supports TN or NN weights")
+
+    @staticmethod
+    def supports_geometry(geometry, dtype, rope_dim) -> bool:
+        groups = geometry.n_local_groups
+        channels = geometry.o_lora_rank
+        heads = geometry.heads_per_group
+        dim = geometry.head_dim
+        width = heads * dim
+        return (
+            dtype in (torch.bfloat16, torch.float16)
+            and groups > 0
+            and heads > 0
+            and channels > 0
+            and channels % 64 == 0
+            and dim > 0
+            and dim % 8 == 0
+            and width <= 16384
+            and width % 64 == 0
+            and 0 < rope_dim <= dim
+            and rope_dim % 8 == 0
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        grouped, scales = _grouped_checkpoint_parameters(layer)
+        if self.gemm_format == "NN":
+            grouped = grouped.transpose(1, 2)
+        layer.W_int8_grouped = grouped.contiguous()
+        layer.W_int8_scales = scales.contiguous()
+        delattr(layer, "weight")
+        delattr(layer, "weight_scale")
+
+    def apply_with_rope(self, layer, output, positions, cos_sin_cache):
+        """Return token-major grouped output without a post-GEMM transpose."""
+        from ixformer.inference.functions.models.deepseek_v4.mla_sparse.int8.ds4_inv_rope_int8_quant import (
+            ds4_inv_rope_int8_quant,
+        )
+
+        groups = layer.bmm_geom.n_local_groups
+        if output.shape[0] == 0:
+            return output.new_empty((0, groups, layer.bmm_geom.o_lora_rank))
+        activations, scales = ds4_inv_rope_int8_quant(
+            output, positions, cos_sin_cache, groups
+        )
+        return self.apply_quantized(
+            layer, activations, scales, output_dtype=output.dtype
+        )
+
+    def apply_quantized(self, layer, activations, scales, *, output_dtype):
+        """Consume already rotated grouped INT8 values without re-quantizing."""
+        import ixformer.inference.functions as ixf_ops
+
+        groups = layer.bmm_geom.n_local_groups
+        width = layer.bmm_geom.heads_per_group * layer.bmm_geom.head_dim
+        if (
+            activations.dim() != 3
+            or activations.shape[0] != groups
+            or activations.shape[2] != width
+            or activations.dtype != torch.int8
+            or tuple(scales.shape) != tuple(activations.shape[:2])
+            or scales.dtype != torch.float32
+        ):
+            raise ValueError("Grouped WO-A requires INT8 [G,T,K] and FP32 [G,T]")
+        projected = torch.empty(
+            (activations.shape[1], groups, layer.bmm_geom.o_lora_rank),
+            dtype=output_dtype,
+            device=activations.device,
+        )
+        if activations.shape[1] == 0:
+            return projected
+        ixf_ops.w8a8_bmm(
+            activations,
+            layer.W_int8_grouped,
+            scales,
+            layer.W_int8_scales,
+            output=projected.transpose(0, 1),
+            format=self.gemm_format,
+            batched_scales=True,
+        )
+        return projected
+
+
 # A/B/C switch for the mhc_pre operator via IXFORMER_DS4_MHC_PRE ∈ {v1,v2,v3}:
 #   v1 (default) : original fused mhc_pre
 #   v2           : bf16 GEMM + single warp-synchronous epilogue (ds4_mhc_pre_v2)

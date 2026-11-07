@@ -11,17 +11,19 @@ import os
 import re
 from collections.abc import Iterable
 from contextlib import nullcontext
+from copy import copy
 from itertools import islice
 
 import torch
 from torch import nn
-from vllm.config import VllmConfig
+from vllm import envs
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context, override_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
@@ -40,6 +42,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.skip_layers import (
+    producer_kv_only_layer,
     producer_last_layer,
 )
 from vllm_iluvatar.envs import _ILU_CANONICAL_ONLY_ENV_VARS
@@ -255,6 +258,8 @@ class IluDeepseekV41DecoderLayer(nn.Module):
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
+        self.layer_id = extract_layer_index(prefix)
+        self.producer_kv_only = producer_kv_only_layer(vllm_config) == self.layer_id
         tp_size = get_tensor_model_parallel_world_size()
         self._fuse_attn_allreduce_post = _allreduce_mhc_post_supported(config, tp_size)
         self.attn = IluDeepseekV41Attention(
@@ -266,7 +271,18 @@ class IluDeepseekV41DecoderLayer(nn.Module):
             kv_source_override=kv_source_override,
             defer_o_proj_reduce=self._fuse_attn_allreduce_post,
         )
-        self.ffn = IluDeepseekV41MoE(vllm_config, prefix=f"{prefix}.ffn")
+        self.ffn = (
+            PPMissingLayer()
+            if self.producer_kv_only
+            else IluDeepseekV41MoE(vllm_config, prefix=f"{prefix}.ffn")
+        )
+        if self.producer_kv_only:
+            logger.info(
+                "DeepSeek V4.1 PD terminal layer %s runs cache writes only; "
+                "index selection, attention output and FFN are skipped; "
+                "FFN weights are not allocated",
+                self.layer_id,
+            )
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
 
@@ -294,7 +310,6 @@ class IluDeepseekV41DecoderLayer(nn.Module):
         self.hc_ffn_scale = nn.Parameter(
             torch.empty(3, dtype=torch.float32), requires_grad=False
         )
-        self.layer_id = extract_layer_index(prefix)
         # Set by IluDeepseekV41Model for the engram layers only.
         self.engram: IluEngram | None = None
         self._hc_fn_io_cache: dict[str, torch.Tensor] = {}
@@ -353,6 +368,8 @@ class IluDeepseekV41DecoderLayer(nn.Module):
         post_mix: torch.Tensor | None = None,
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
+        *,
+        ffn_rows: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """``(x, residual, post_mix, res_mix, ffn_pre)``; FFN post is delayed."""
         # Each post hands the pre that follows it the sum of squares of the
@@ -399,6 +416,29 @@ class IluDeepseekV41DecoderLayer(nn.Module):
             self.attn_norm,
             want_fp8=True,
         )
+        if getattr(self, "producer_kv_only", False):
+            # Only a discarded producer token consumes this placeholder. Keep
+            # the delayed-post contract so PP/sampling/connector completion is
+            # unchanged, without executing the terminal layer's FFN. Padded
+            # ranks still skip cache writes for rows that have no local request.
+            if valid_prefix is None:
+                if h_fp8 is not None:
+                    register_activation_prequant(h, h_fp8, h_scale)
+                try:
+                    h = self.attn(positions, h, None, cache_only=True)
+                finally:
+                    if h_fp8 is not None:
+                        clear_activation_prequant()
+            elif valid_prefix:
+                h[:valid_prefix].copy_(
+                    self.attn(
+                        positions[:valid_prefix],
+                        h[:valid_prefix],
+                        None,
+                        cache_only=True,
+                    )
+                )
+            return h, residual, attn_post, attn_comb, attn_pre
         # The fused_wqa_wkv fp8 GEMM reads this exact normed ``h``; hand it the
         # per-token quant the pre-norm kernel already produced so it skips its own.
         if valid_prefix is None:
@@ -440,8 +480,38 @@ class IluDeepseekV41DecoderLayer(nn.Module):
             attn_sqrsum,
             self.ffn_norm,
         )
-        h = self.ffn(h, input_ids)
+        if ffn_rows is None:
+            h = self.ffn(h, input_ids)
+        else:
+            h = self._forward_tail_ffn(h, input_ids, ffn_rows)
         return h, residual, ffn_post, ffn_comb, ffn_pre
+
+    def _forward_tail_ffn(self, h, input_ids, rows):
+        if rows is None:
+            return self.ffn(h, input_ids)
+        if not rows:
+            return torch.zeros_like(h)
+        # Fresh pinned storage is stream-owned during the asynchronous copy;
+        # a mutable persistent host index buffer could race the next PP step.
+        indices = torch.tensor(
+            rows, dtype=torch.int64, device="cpu", pin_memory=h.is_cuda
+        ).to(device=h.device, non_blocking=h.is_cuda)
+        selected = h.index_select(0, indices)
+        selected_ids = None if input_ids is None else input_ids.index_select(0, indices)
+        context = get_forward_context()
+        mask = getattr(context, "is_padding", None)
+        scoped = copy(context) if mask is not None else context
+        if mask is not None:
+            scoped.is_padding = mask.index_select(0, indices)
+        try:
+            with override_forward_context(scoped):
+                output = self.ffn(selected, selected_ids)
+        finally:
+            if scoped is not context:
+                context.moe_layer_index = scoped.moe_layer_index
+        result = torch.zeros_like(h)
+        result.index_copy_(0, indices, output)
+        return result
 
 
 class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
@@ -485,6 +555,13 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         self.config = config
         self.quant_config = vllm_config.quant_config
         self.parallel_config = vllm_config.parallel_config
+        self._producer_ffn_layer = (
+            producer_last_layer(vllm_config)
+            if envs.VLLM_ILU_DS41_PRODUCER_TAIL_FFN
+            and self.parallel_config.tensor_parallel_size == 1
+            and self.parallel_config.data_parallel_size == 1
+            else None
+        )
         self.vocab_size = config.vocab_size
         self.hc_eps = config.hc_eps
         self.hc_mult = config.hc_mult
@@ -1102,18 +1179,40 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         self._prepare_engram(input_ids, positions, lookback_token_ids)
         residual = post_mix = res_mix = None
         aux_hidden_states: list[torch.Tensor] = []
+        ffn_rows = None
+        source_layer = getattr(self, "_producer_ffn_layer", None)
+        if (
+            source_layer is not None
+            and self.end_layer == source_layer + 1
+            and source_layer + 1 not in self.aux_hidden_state_layers
+            and self.producer_prefix_state is not None
+            and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.NONE
+        ):
+            ffn_rows = self.producer_prefix_state.tail_ffn_rows(positions.shape[0])
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer), self.start_layer
         ):
-            hidden_states, residual, post_mix, res_mix, pre_mix = layer(
-                hidden_states,
-                positions,
-                input_ids,
-                pre_mix,
-                post_mix,
-                res_mix,
-                residual,
-            )
+            if idx == source_layer and ffn_rows is not None:
+                hidden_states, residual, post_mix, res_mix, pre_mix = layer(
+                    hidden_states,
+                    positions,
+                    input_ids,
+                    pre_mix,
+                    post_mix,
+                    res_mix,
+                    residual,
+                    ffn_rows=ffn_rows,
+                )
+            else:
+                hidden_states, residual, post_mix, res_mix, pre_mix = layer(
+                    hidden_states,
+                    positions,
+                    input_ids,
+                    pre_mix,
+                    post_mix,
+                    res_mix,
+                    residual,
+                )
             if (idx + 1) in self.aux_hidden_state_layers:
                 # ``hidden_states`` is this layer's delayed FFN output, not the
                 # hc stream, so folding it is what the next layer would do first.

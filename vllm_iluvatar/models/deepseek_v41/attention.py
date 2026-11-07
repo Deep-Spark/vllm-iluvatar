@@ -73,7 +73,16 @@ from vllm_iluvatar.models.deepseek_v41.compressed_kv_restore import (
     TensorLayoutKey,
     TensorViewKey,
     compact_owner_capacity,
+    consumer_selection,
     family_key,
+    prefill_validity_family,
+    union_validity,
+)
+from vllm_iluvatar.models.deepseek_v41.query_quant import (
+    QueryActivation,
+    can_fuse_query_quant,
+    fused_query_norm,
+    query_inputs_are_compatible,
 )
 from vllm_iluvatar.models.deepseek_v41.sparse_mla import (
     IluDeepseekSparseSWAFlashMLABackend,
@@ -88,6 +97,9 @@ from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
 from vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa import IluDeepseekV4SWACache
 
 if TYPE_CHECKING:
+    from ixformer.inference.functions.models.deepseek_v41.mla_sparse.float.quantized_sparse_mla import (
+        GroupedInt8AttentionOutput,
+    )
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 logger = init_logger(f"vllm.{__name__}")
@@ -644,7 +656,7 @@ class IluDeepseekV41Indexer(nn.Module):
                 and self.head_dim == 128
                 and topk_indices_buffer is not None
                 and topk_indices_buffer.is_cuda
-                and 1 <= vllm_config.scheduler_config.max_num_seqs <= 4
+                and 1 <= vllm_config.scheduler_config.max_num_seqs <= 5
                 and vllm_config.speculative_config is not None
                 and vllm_config.speculative_config.num_speculative_tokens == 5
             ),
@@ -696,7 +708,7 @@ class IluDeepseekV41Indexer(nn.Module):
 
     def forward(
         self,
-        qr: torch.Tensor,
+        qr: QueryActivation,
         latent: torch.Tensor | None,
         indexer_weights: torch.Tensor,
         positions: torch.Tensor,
@@ -989,6 +1001,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             compress_ratio=self.compress_ratio,
         )
         self.indexer_rotary_emb = self.rotary_emb
+        self._configure_grouped_int8_output(vllm_config.model_config.dtype)
         self.topk_indices_buffer = topk_indices_buffer
         self.candidate_block_buffer = candidate_block_buffer
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -1154,6 +1167,13 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 candidate_block_size=self.candidate_block_size,
                 candidate_write=is_candidate_source,
             )
+
+        query_linears = [self.wq_b]
+        if self.indexer is not None:
+            query_linears.append(self.indexer.wq_b)
+        self._fuse_query_quant = can_fuse_query_quant(
+            query_linears, self.q_lora_rank, self.head_dim
+        )
 
         assert cache_config is not None, "DeepseekV4 attention requires cache_config"
         # ---- Attention / KV-cache setup ----
@@ -1460,8 +1480,53 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             self.topk_indices_buffer[:num_tokens].copy_(topk_rows)
 
     @property
-    def cos_sin(self) -> torch.Tensor:
-        return self.rotary_emb.cos_sin_cache
+    def cos_sin(self) -> torch.Tensor | None:
+        rotary_emb = getattr(self, "rotary_emb", None)
+        return None if rotary_emb is None else rotary_emb.cos_sin_cache
+
+    def _configure_grouped_int8_output(self, dtype) -> None:
+        from vllm_iluvatar.models.deepseek_v4.model import (
+            IluV4W8A8BMMLinearMethod,
+            IluV4W8A16BMMLinearMethod,
+        )
+
+        self._grouped_int8_o_proj = False
+        self._woa_input_mode = envs.VLLM_ILU_DS41_WOA_INPUT_MODE
+        if self._woa_input_mode not in ("legacy", "reader_int8"):
+            raise ValueError("WO-A input mode must be legacy or reader_int8")
+        method = self.wo_a.quant_method
+        explicit = isinstance(method, IluV4W8A8BMMLinearMethod)
+        if not explicit and not envs.VLLM_ILU_DS41_GROUPED_INT8_O_PROJ:
+            return
+        supported = IluV4W8A8BMMLinearMethod.supports_geometry(
+            self.wo_a.bmm_geom, dtype, self.rope_head_dim
+        )
+        if explicit:
+            if not supported:
+                raise ValueError(
+                    "Grouped INT8 output projection geometry is unsupported"
+                )
+            self._grouped_int8_o_proj = True
+        elif supported and type(method) is IluV4W8A16BMMLinearMethod:
+            self.wo_a.quant_method = IluV4W8A8BMMLinearMethod(
+                method.parent_config, {"bmm_w8a8_gemm_format": "NN"}
+            )
+            self._grouped_int8_o_proj = True
+
+    def _uses_fused_inverse_rope(self) -> bool:
+        """Quantized main readers rotate their result before BF16 rounding.
+
+        A grouped INT8 projection owns its inverse instead, for either main
+        or window-only attention. Other window-only layers retain the inverse.
+        The decision is layer-static and shared by the reader and its caller,
+        so mixed decode/prefill slices cannot rotate twice or omit a rotation.
+        """
+        return (
+            self.compressed_kv_format is not None
+            and self.compress_ratio > 0
+            and self.cos_sin is not None
+            and not getattr(self, "_grouped_int8_o_proj", False)
+        )
 
     def _load_attn_sink(self, param: nn.Parameter, loaded: torch.Tensor) -> None:
         rank = get_tensor_model_parallel_rank()
@@ -1528,20 +1593,58 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
+        *,
+        cache_only: bool = False,
     ) -> torch.Tensor:
         del llama_4_scaling
         qr_kv, kv_score, indexer_weights = self._run_parallel_input_projections(
             hidden_states
         )
         qr, kv = self._split_qkv_and_norm(qr_kv)
-        attn_out = self._attn_out[: hidden_states.shape[0]]
-        covered = self._covered_tokens(attn_out.shape[0])
-        if covered < attn_out.shape[0]:
-            attn_out[covered:].zero_()
-        self._prepare_and_attn(
-            hidden_states, qr, kv, kv_score, indexer_weights, positions, attn_out
+        attn_out = None
+        if not cache_only:
+            attn_out = self._attn_out[: hidden_states.shape[0]]
+            covered = self._covered_tokens(attn_out.shape[0])
+            if covered < attn_out.shape[0]:
+                attn_out[covered:].zero_()
+        projection_input = self._prepare_and_attn(
+            hidden_states,
+            qr,
+            kv,
+            kv_score,
+            indexer_weights,
+            positions,
+            attn_out,
+            cache_only=cache_only,
         )
-        apply_rope(attn_out.unsqueeze(0), positions, self.cos_sin, inverse=True)
+        if cache_only:
+            # No consumer uses this hidden state: the producer ends here and
+            # PD discards its sampled token. All transferred caches are ready.
+            return hidden_states
+        assert attn_out is not None
+        if getattr(self, "_grouped_int8_o_proj", False):
+            if projection_input is not None:
+                from ixformer.inference.functions.models.deepseek_v41.mla_sparse.float.quantized_sparse_mla import (
+                    GroupedInt8AttentionOutput,
+                )
+
+                if not isinstance(projection_input, GroupedInt8AttentionOutput):
+                    raise TypeError("Unsupported grouped attention reader output")
+                if not projection_input.inverse_rope_applied:
+                    raise ValueError("Grouped WO-A reader did not apply inverse RoPE")
+                grouped = self.wo_a.quant_method.apply_quantized(
+                    self.wo_a,
+                    projection_input.values,
+                    projection_input.scales,
+                    output_dtype=hidden_states.dtype,
+                )
+            else:
+                grouped = self.wo_a.quant_method.apply_with_rope(
+                    self.wo_a, attn_out, positions, self.cos_sin
+                )
+            return self.wo_b(grouped.flatten(1))
+        if not self._uses_fused_inverse_rope():
+            apply_rope(attn_out.unsqueeze(0), positions, self.cos_sin, inverse=True)
         result = self._o_proj(attn_out)
         return result
 
@@ -1564,18 +1667,11 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         if self.compressor is not None:
             # Local ref so the closure keeps a non-None type.
             compressor = self.compressor
-            if hidden_states.shape[0] <= 16:
-                kv_score = ixfshared.gemm_bf16_bf16_fp32(
-                    hidden_states,
-                    compressor.fused_wkv_wgate.weight,
-                    format="TN",
-                )
-            else:
-                kv_score = torch.mm(
-                    hidden_states,
-                    compressor.fused_wkv_wgate.weight.T,
-                    out_dtype=torch.float32,
-                )
+            kv_score = ixfshared.gemm_bf16_bf16_fp32(
+                hidden_states,
+                compressor.fused_wkv_wgate.weight,
+                format="TN",
+            )
 
         if self.indexer is not None:
             # ReplicatedLinear returns (output, bias); bias is None.
@@ -1586,14 +1682,20 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
 
     def _split_qkv_and_norm(
         self, qr_kv: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[QueryActivation, torch.Tensor]:
         """Split the fused q-lora / kv projection and RMSNorm both halves."""
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
+        if getattr(self, "_fuse_query_quant", False) and query_inputs_are_compatible(
+            qr, kv
+        ):
+            return fused_query_norm(
+                qr, kv, self.q_norm.weight, self.kv_norm.weight, self.eps
+            )
         return ixfshared.rms_norm_qk(
             qr, kv, self.q_norm.weight, self.kv_norm.weight, self.eps
         )
 
-    def _wq_b_proj(self, qr: torch.Tensor) -> torch.Tensor:
+    def _wq_b_proj(self, qr: QueryActivation) -> torch.Tensor:
         return self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
 
     def _fused_qnorm_rope_kv_insert(
@@ -1673,13 +1775,15 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
     def _prepare_and_attn(
         self,
         hidden_states: torch.Tensor,
-        qr: torch.Tensor,
+        qr: QueryActivation,
         kv: torch.Tensor,
         kv_score: torch.Tensor | None,
         indexer_weights: torch.Tensor | None,
         positions: torch.Tensor,
-        out: torch.Tensor,
-    ) -> None:
+        out: torch.Tensor | None,
+        *,
+        cache_only: bool = False,
+    ) -> GroupedInt8AttentionOutput | None:
         """Attention input preparation followed by the sparse indexer and MLA.
 
         Q preparation and the KV insert precede compression; once the latent is
@@ -1730,7 +1834,10 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 self.prefix, self.kv_cache, attn_metadata
             )
 
-        self._sparse_indexer_and_attn(
+        if cache_only:
+            return None
+        assert out is not None
+        return self._sparse_indexer_and_attn(
             hidden_states,
             index_q,
             index_weights_out,
@@ -1746,13 +1853,13 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         kv: torch.Tensor,
         positions: torch.Tensor,
         output: torch.Tensor,
-    ) -> None:
+    ) -> GroupedInt8AttentionOutput | None:
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
 
         if attn_metadata is None:
             output.zero_()
-            return
+            return None
 
         assert isinstance(attn_metadata, dict)
         flashmla_metadata = cast(
@@ -1772,6 +1879,14 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         num_decodes = swa_metadata.num_decodes
         num_prefills = swa_metadata.num_prefills
         num_decode_tokens = swa_metadata.num_decode_tokens
+        quantize_output = (
+            getattr(self, "_grouped_int8_o_proj", False)
+            and getattr(self, "_woa_input_mode", "legacy") == "reader_int8"
+            and num_prefills == 0
+            and num_decodes > 0
+            and q.shape[0] == num_decode_tokens
+            and not swa_only
+        )
         selection = None
         if (
             self.compressed_kv_format is not None
@@ -1792,6 +1907,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 raise RuntimeError(
                     "Compressed KV attention requires FlashMLA metadata and a main cache"
                 )
+            projection_input = None
             with self.compressed_kv_workspace.read_scope() as workspace:
                 selection = self._prepare_compressed_family(
                     q if num_prefills else q[:num_decode_tokens],
@@ -1816,7 +1932,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                     )
                 if num_decodes > 0:
                     decode_out = output[:num_decode_tokens]
-                    self._forward_decode(
+                    projection_input = self._forward_decode(
                         q=q[:num_decode_tokens],
                         kv_cache=self_kv_cache,
                         positions=positions[:num_decode_tokens],
@@ -1825,8 +1941,9 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                         swa_only=swa_only,
                         output=decode_out,
                         selection=selection,
+                        quantize_output=quantize_output,
                     )
-            return
+            return projection_input
 
         if num_prefills > 0:
             prefill_q = q[num_decode_tokens:]
@@ -1850,7 +1967,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             )
         if num_decodes > 0:
             decode_out = output[:num_decode_tokens]
-            self._forward_decode(
+            return self._forward_decode(
                 q=q[:num_decode_tokens],
                 kv_cache=self_kv_cache,
                 positions=positions[:num_decode_tokens],
@@ -1859,7 +1976,9 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 swa_only=swa_only,
                 output=decode_out,
                 selection=selection,
+                quantize_output=quantize_output,
             )
+        return None
 
     def _sparse_indexer_and_attn(
         self,
@@ -1870,7 +1989,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         kv: torch.Tensor,
         positions: torch.Tensor,
         out: torch.Tensor,
-    ) -> None:
+    ) -> GroupedInt8AttentionOutput | None:
         if self.indexer is not None and index_q is not None:
             assert index_weights is not None
             self.indexer.indexer_op(
@@ -1884,7 +2003,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             if self.compressed_kv_workspace is not None:
                 self.compressed_kv_workspace.restore.invalidate()
 
-        self.forward_mqa(q, kv, positions, out)
+        return self.forward_mqa(q, kv, positions, out)
 
     def _window_indices(
         self,
@@ -2000,6 +2119,9 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             reader_ranges.append((slice(n0, n1), swa_metadata.prefill_swa_indices))
         if swa_metadata.num_decodes > 0:
             reader_ranges.append((slice(0, n0), swa_metadata.decode_swa_indices))
+        family_masks = prefill_validity_family(
+            self, get_forward_context().attn_metadata, swa_metadata, n1
+        )
         key = family_key(
             owner=self.compressed_cache_prefix,
             index_source_layer_id=self.index_source_layer_id,
@@ -2017,7 +2139,14 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 # Each decode consumer still masks its own main lengths below.
                 "per-consumer-decode-validity"
                 if restore_decode
-                else TensorViewKey.of(valid),
+                else (
+                    (
+                        "prefill-mask-union",
+                        tuple(TensorViewKey.of(m) for m in family_masks),
+                    )
+                    if family_masks
+                    else TensorViewKey.of(valid)
+                ),
                 TensorViewKey.of(positions),
                 TensorViewKey.of(attn_metadata.block_table),
                 attn_metadata.block_size,
@@ -2033,8 +2162,11 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         tracker = self.compressed_kv_workspace.restore
         selection = tracker.lookup(key)
         if selection is not None:
-            return selection
+            return consumer_selection(selection, valid) if family_masks else selection
         ticket = tracker.begin_prepare(key)
+        consumer_valid = valid
+        if family_masks:
+            valid = union_validity(family_masks)
         if restore_decode:
             # A later consumer can have a valid query where the first does
             # not. Prepare its physical rows too, while guarding every request
@@ -2134,7 +2266,9 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             indices, lengths, plan, scratch_bytes, compact_plan=compact_plan
         )
         tracker.publish(ticket, selection)
-        return selection
+        return (
+            consumer_selection(selection, consumer_valid) if family_masks else selection
+        )
 
     def _prepare_compact_family(
         self,
@@ -2221,9 +2355,11 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         output: torch.Tensor,
         use_fmhadsa: bool = False,
         *,
+        positions: torch.Tensor | None = None,
         prefill: bool = False,
         restore_plan=None,
-    ) -> None:
+        quantize_output: bool = False,
+    ) -> GroupedInt8AttentionOutput | None:
         """Sparse MLA over the window and, for compressed layers, the top-k.
 
         The kernels below are per-token -- every query token is its own batch
@@ -2259,7 +2395,36 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 raise RuntimeError(
                     "Compressed KV attention workspace is not initialized"
                 )
+            fused_inverse = self._uses_fused_inverse_rope() and positions is not None
             with self.compressed_kv_workspace.acquire(nested=True) as workspace:
+                if quantize_output and not prefill:
+                    from ixformer.inference.functions.models.deepseek_v41.mla_sparse.float.quantized_sparse_mla import (
+                        QuantizedSparseMlaAffineView,
+                        quantized_sparse_mla_int8,
+                    )
+
+                    retained = workspace if restore_plan is None else restore_plan
+                    if isinstance(
+                        retained, (torch.Tensor, QuantizedSparseMlaAffineView)
+                    ):
+                        return quantized_sparse_mla_int8(
+                            q.unsqueeze(1),
+                            self.swa_cache_layer.kv_cache.unsqueeze(-2),
+                            _batched_index_rows(swa_indices),
+                            swa_lens,
+                            extra_cache,
+                            self._compressed_kv_scales(),
+                            _batched_index_rows(extra_indices),
+                            extra_lens,
+                            self.scale,
+                            format=self.compressed_kv_format,
+                            groups=self.wo_a.bmm_geom.n_local_groups,
+                            attn_sink=self.attn_sink,
+                            positions=positions,
+                            cos_sin_cache=self.cos_sin,
+                            workspace=retained,
+                            bf16_scratch=output.unsqueeze(1),
+                        )
                 reader(
                     q.unsqueeze(1),
                     self.swa_cache_layer.kv_cache.unsqueeze(-2),
@@ -2273,9 +2438,11 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                     format=self.compressed_kv_format,
                     attn_sink=self.attn_sink,
                     output=output.unsqueeze(1),
+                    positions=positions if fused_inverse else None,
+                    cos_sin_cache=self.cos_sin if fused_inverse else None,
                     workspace=workspace if restore_plan is None else restore_plan,
                 )
-            return
+            return None
         if self.kv_cache_dtype == "fp8_ds_mla":
             self._sparse_fp8_mla(
                 q,
@@ -2409,7 +2576,8 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         swa_only: bool = False,
         output: torch.Tensor | None = None,
         selection: CompressedFamilySelection | None = None,
-    ) -> None:
+        quantize_output: bool = False,
+    ) -> GroupedInt8AttentionOutput | None:
         if output is None and isinstance(swa_metadata, torch.Tensor):
             output = swa_metadata
             swa_metadata = attn_metadata
@@ -2436,7 +2604,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 and selection.plan.restore_start >= swa_metadata.num_decode_tokens
             ):
                 plan = plan.scratch
-            self._sparse_mla(
+            return self._sparse_mla(
                 q,
                 swa_metadata.decode_swa_indices,
                 swa_metadata.decode_swa_lens,
@@ -2444,9 +2612,10 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 indices,
                 lengths,
                 output,
+                positions=positions,
                 restore_plan=plan,
+                quantize_output=quantize_output,
             )
-            return
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
         extra_cache = None
@@ -2486,12 +2655,16 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         assert swa_indices is not None
         assert swa_lens is not None
         kwargs = (
-            dict(use_fmhadsa=False)
+            dict(
+                use_fmhadsa=False,
+                positions=positions,
+                quantize_output=quantize_output,
+            )
             if getattr(self._sparse_mla, "__func__", None)
             is IluDeepseekV41Attention._sparse_mla
             else {}
         )
-        self._sparse_mla(
+        return self._sparse_mla(
             q,
             swa_indices,
             swa_lens,
@@ -2541,6 +2714,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 indices,
                 lengths,
                 output,
+                positions=positions,
                 prefill=True,
                 restore_plan=plan,
             )
@@ -2583,7 +2757,11 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             )
             extra_cache = compressed_k_cache
         kwargs = (
-            dict(use_fmhadsa=_v41_prefill_fmhadsa(), prefill=True)
+            dict(
+                use_fmhadsa=_v41_prefill_fmhadsa(),
+                positions=positions,
+                prefill=True,
+            )
             if getattr(self._sparse_mla, "__func__", None)
             is IluDeepseekV41Attention._sparse_mla
             else dict(prefill=True)

@@ -183,6 +183,10 @@ if TYPE_CHECKING:
     VLLM_ILU_FUSE_EP_COMBINE: bool = False
     VLLM_ILU_E25_COMPACT_ENGRAM: bool = False
     VLLM_ILU_DS41_DECODE_KV_RESTORE: bool = False
+    VLLM_ILU_DS41_GROUPED_INT8_O_PROJ: bool = True
+    VLLM_ILU_DS41_WOA_INPUT_MODE: str = "reader_int8"
+    VLLM_ILU_DS41_PRODUCER_TAIL_FFN: bool = False
+    VLLM_ILU_DS4_CANDIDATE_FILTER: bool = False
     VLLM_ILU_DS4_PREFILL_OPT: bool = False
     VLLM_ILU_DS4_PREFILL_AS_DECODE: bool = False
     VLLM_ILU_DS4_FP8_PREFILL_SPARSE: bool = True
@@ -240,6 +244,7 @@ if TYPE_CHECKING:
     VLLM_ILU_DP_ROUND_ROBIN_LB_FILE: str = ""
     VLLM_ILU_DP_ENABLE_SYNC_PREFILLS: bool = False
     VLLM_ILU_DP_SYNC_READY_REPLAY: bool = False
+    VLLM_ILU_DP_PREFILL_REARM: bool = True
     VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS: int = 8
     VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS: float = 0.0
     VLLM_ILU_PP_PREFILL_COALESCE_MS: float = 0.0
@@ -400,6 +405,18 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_DS41_DECODE_KV_RESTORE": _bool_reader(
         "VLLM_ILU_DS41_DECODE_KV_RESTORE", "0"
     ),
+    "VLLM_ILU_DS41_GROUPED_INT8_O_PROJ": _bool_reader(
+        "VLLM_ILU_DS41_GROUPED_INT8_O_PROJ", "1"
+    ),
+    "VLLM_ILU_DS41_WOA_INPUT_MODE": lambda: os.environ.get(
+        "VLLM_ILU_DS41_WOA_INPUT_MODE", "reader_int8"
+    ),
+    "VLLM_ILU_DS41_PRODUCER_TAIL_FFN": _bool_reader(
+        "VLLM_ILU_DS41_PRODUCER_TAIL_FFN", "0"
+    ),
+    "VLLM_ILU_DS4_CANDIDATE_FILTER": _bool_reader(
+        "VLLM_ILU_DS4_CANDIDATE_FILTER", "0"
+    ),
     "VLLM_ILU_DS41_COMPRESSED_KV_FORMAT": lambda: os.environ.get(
         "VLLM_ILU_DS41_COMPRESSED_KV_FORMAT", "none"
     ),
@@ -467,6 +484,7 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
         "VLLM_ILU_DP_SYNC_READY_REPLAY",
         "0",
     ),
+    "VLLM_ILU_DP_PREFILL_REARM": _bool_reader("VLLM_ILU_DP_PREFILL_REARM", "1"),
     "VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS": lambda: max(
         0,
         int(
@@ -626,6 +644,12 @@ _ILU_ENV_ALIASES: dict[str, Callable[[], Any]] = {
 #   VLLM_ILUVATAR_ENABLE_STARTUP_PATCH
 #       -> vllm_iluvatar/__init__.py (STARTUP_PATCH_ENV)
 _ILU_GUARD_ENV_VARS: dict[str, Callable[[], Any]] = {
+    "VLLM_ILU_TOP_P_BF16_SORT": _bool_reader("VLLM_ILU_TOP_P_BF16_SORT", "1"),
+    "VLLM_ILU_TOP_P_BF16_HIST": _bool_reader("VLLM_ILU_TOP_P_BF16_HIST", "0"),
+    "VLLM_ILU_PD_PREFILL_KV_ONLY": _bool_reader("VLLM_ILU_PD_PREFILL_KV_ONLY", "1"),
+    "VLLM_ILU_DSPARK_FUSED_MARKOV": _bool_reader("VLLM_ILU_DSPARK_FUSED_MARKOV", "1"),
+    "VLLM_ILU_DSPARK_BACKBONE_CG": _bool_reader("VLLM_ILU_DSPARK_BACKBONE_CG", "1"),
+    "VLLM_ILU_MERGE_DP_SYNC": _bool_reader("VLLM_ILU_MERGE_DP_SYNC", "1"),
     "VLLM_ILU_PATCH_CHECK_SIGNATURE": _bool_reader(
         "VLLM_ILU_PATCH_CHECK_SIGNATURE", "1"
     ),

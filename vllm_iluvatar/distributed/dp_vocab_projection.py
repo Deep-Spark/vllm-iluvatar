@@ -16,6 +16,7 @@ from functools import wraps
 from inspect import Parameter, signature
 from typing import Any
 
+import ixformer.inference.functions as ixfops
 import torch
 import torch.distributed as dist
 from vllm.distributed import get_dp_group, get_pp_group, get_tp_group
@@ -117,15 +118,23 @@ class DPVocabProjection:
             gathered = gathered[: self.group_size * capacity]
             partial = partial[: self.group_size * capacity]
             received = received[: self.group_size * capacity]
-        inputs.zero_()
         inputs[: hidden.shape[0]].copy_(hidden)
+        if hidden.shape[0] < capacity:
+            inputs[hidden.shape[0] :].zero_()
         dist.all_gather_into_tensor(gathered, inputs, group=self.group)
-        torch.mm(gathered, shard.t(), out=partial)
+        if (
+            gathered.shape[0] > 64
+            and gathered.is_cuda
+            and gathered.dtype in (torch.float16, torch.bfloat16)
+        ):
+            ixfops.linear(gathered, shard, output=partial)
+        else:
+            torch.mm(gathered, shard.t(), out=partial)
         dist.all_to_all_single(received, partial, group=self.group)
         local = received.view(self.group_size, capacity, self.shard_rows)
-        return local.transpose(0, 1).reshape(capacity, self.vocab_size)[
-            : hidden.shape[0]
-        ]
+        return local[:, : hidden.shape[0], :].transpose(0, 1).reshape(
+            hidden.shape[0], self.vocab_size
+        )
 
 
 class DPVocabController:

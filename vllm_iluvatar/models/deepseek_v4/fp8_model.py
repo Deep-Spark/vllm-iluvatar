@@ -528,6 +528,8 @@ class IluDeepseekV4Fp8DecoderLayer(nn.Module):
         vllm_config: VllmConfig,
         prefix: str,
         topk_indices_buffer: torch.Tensor | None = None,
+        *,
+        skip_ffn: bool = False,
     ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -539,7 +541,14 @@ class IluDeepseekV4Fp8DecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
         )
-        self.ffn = IluDeepseekV4Fp8MoE(vllm_config, prefix=f"{prefix}.ffn")
+        # V4.1's terminal KV-only producer exits before the FFN. Avoid
+        # constructing it at all: replacing it afterwards would leave MoE
+        # registrations (and their tensors) in static_forward_context.
+        self.ffn = (
+            PPMissingLayer()
+            if skip_ffn
+            else IluDeepseekV4Fp8MoE(vllm_config, prefix=f"{prefix}.ffn")
+        )
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -1004,6 +1013,11 @@ class IluDeepseekV4Fp8Model(nn.Module):
             # ``name`` is rewritten in place by the stacked / expert branches, so
             # keep the incoming checkpoint name for the Load_Verifier.
             ckpt_name = name
+            # A missing subtree may have no routed-expert mapping at all.
+            # Drop it before mapping/padding, while keeping verifier coverage.
+            if is_pp_missing_parameter(name, self):
+                consumed_ckpt_names.add(ckpt_name)
+                continue
             if pad_shared_expert and ".shared_experts." in name:
                 loaded_weight = self._pad_shared_expert_weight(name, loaded_weight)
             for param_name, weight_name, shard_id in stacked_params_mapping:

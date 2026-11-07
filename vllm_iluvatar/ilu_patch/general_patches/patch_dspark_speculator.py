@@ -94,3 +94,13 @@ def _apply() -> None:
     DSparkSpeculator._ilu_community_propose = DSparkSpeculator.propose
     # [ILU override] propose — delta: reuse the target-projected context buffer.
     DSparkSpeculator.propose = impl.propose
+    if hasattr(DSparkSpeculator, "_generate_draft"):
+        DSparkSpeculator._generate_draft = impl.make_generate_draft(
+            DSparkSpeculator._generate_draft
+        )
+    if hasattr(DSparkSpeculator, "_build_uniform_attn_metadata"):
+        DSparkSpeculator._build_uniform_attn_metadata = (
+            impl.make_build_uniform_attn_metadata(
+                DSparkSpeculator._build_uniform_attn_metadata
+            )
+        )

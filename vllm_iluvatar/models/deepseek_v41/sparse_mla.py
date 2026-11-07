@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import torch
+import vllm.envs as envs
 from ixformer.inference.functions.models import deepseek_v41 as ixfops
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
@@ -142,7 +143,7 @@ class IluDeepseekV41SparseSWAMetadataBuilder(IluDeepseekSparseSWAMetadataBuilder
         # op decode already uses, instead of recomputing it in every layer.
         # Non-causal draft rows stay on the layer path: that window also has to
         # honor replay, which the non-causal op does not take.
-        if causal:
+        if causal and not envs.VLLM_ILU_DS4_PREFILL_AS_DECODE:
             self._populate_prefill_swa_as_decode(metadata)
         return metadata
 

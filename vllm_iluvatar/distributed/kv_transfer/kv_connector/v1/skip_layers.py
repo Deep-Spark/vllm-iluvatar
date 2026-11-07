@@ -60,3 +60,19 @@ def producer_last_layer(vllm_config: "VllmConfig") -> int | None:
     if not sources:
         return None
     return max(sources)
+
+
+def producer_kv_only_layer(vllm_config: "VllmConfig") -> int | None:
+    """Opt-in dead-compute elimination at a truncated producer's final source.
+
+    Only cache writes from this layer can reach D. Index selections and the
+    post-attention hidden state are transient; D rebuilds them during replay.
+    Full-depth producers, consumers and standalone inference keep full compute.
+    """
+    if os.getenv("VLLM_ILU_PD_PREFILL_KV_ONLY", "1").lower() not in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return None
+    return producer_last_layer(vllm_config)

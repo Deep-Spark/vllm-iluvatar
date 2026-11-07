@@ -151,6 +151,7 @@ class DPPrefillSyncState:
     max_defer_steps: int
     sync_group: dist.ProcessGroup | None
     sync_ready_replay: bool = False
+    rearm_after_admission: bool = False
     coalesce_steps: int = 2
     partial_steps: int = 0
     force_throttle: bool = False
@@ -160,11 +161,26 @@ class DPPrefillSyncState:
         if self.enabled:
             import torch
 
-            self.sync_tensor = torch.empty(2, dtype=torch.int32, device="cpu")
+            counters = 3 if self.rearm_after_admission else 2
+            self.sync_tensor = torch.empty(counters, dtype=torch.int32, device="cpu")
         else:
             self.sync_tensor = None
 
-    def update(self, ready_ranks: int, decode_ranks: int, dp_size: int) -> bool:
+    def update(
+        self,
+        ready_ranks: int,
+        decode_ranks: int,
+        dp_size: int,
+        *,
+        continuing_ranks: int = 0,
+        admission_allowed: bool = True,
+    ) -> bool:
+        # An already-running chunked prefill must keep advancing. This vote is
+        # global: otherwise ranks could enter different model/EP schedules.
+        if self.rearm_after_admission and continuing_ranks:
+            self.partial_steps = 0
+            self.force_throttle = False
+            return False
         partial_prefill = 0 < ready_ranks < dp_size
         if not partial_prefill:
             self.partial_steps = 0
@@ -176,6 +192,11 @@ class DPPrefillSyncState:
         if decode_ranks == 0:
             defer_limit = min(defer_limit, self.coalesce_steps)
         self.force_throttle = self.partial_steps <= defer_limit
+        if self.rearm_after_admission and not self.force_throttle and admission_allowed:
+            # Start a new bounded coalescing window after this admission slot.
+            # A community cadence veto must not consume the slot: otherwise
+            # the two periods can unnecessarily multiply admission latency.
+            self.partial_steps = 0
         return self.force_throttle
 
 
@@ -215,30 +236,46 @@ def _local_prefill_state(
     scheduler,
     sync_ready_replay: bool = False,
 ) -> tuple[bool, bool]:
-    # Count a finished async P/D receive before schedule() promotes it so the
-    # DP gate can coalesce 128-token SWA replays across ranks. After
-    # promotion, a throttled replay stays WAITING with replay_start set.
-    replay_ready = False
-    if sync_ready_replay:
-        finished_recvs = getattr(scheduler, "finished_recving_kv_req_ids", ())
-        replay_ready = any(
-            (
-                getattr(request, "status", None)
-                == RequestStatus.WAITING_FOR_REMOTE_KVS
-                and getattr(request, "request_id", None) in finished_recvs
-            )
-            or (
-                getattr(request, "status", None)
-                in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
-                and getattr(request, "replay_start", 0) > 0
-            )
-            for request in _iter_pre_schedule_waiting(scheduler)
-        )
-    prefill_ready = bool(scheduler.waiting) or replay_ready or any(
-        request.is_prefill_chunk for request in scheduler.running
-    )
     running_decode = any(not request.is_prefill_chunk for request in scheduler.running)
-    return prefill_ready, running_decode
+    running_prefill = any(request.is_prefill_chunk for request in scheduler.running)
+    if not sync_ready_replay:
+        return bool(scheduler.waiting) or running_prefill, running_decode
+
+    # Transport admission is not replay readiness. In particular a fresh PD
+    # request can sit in WAITING while allocate_slots fails, before its receive
+    # has even started. Do not let that request keep the global gate ready.
+    finished_recvs = getattr(scheduler, "finished_recving_kv_req_ids", ())
+
+    def compute_ready(request) -> bool:
+        status = getattr(request, "status", None)
+        if status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            return getattr(request, "request_id", None) in finished_recvs
+        if status not in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+            return False
+        if (
+            getattr(request, "num_stale_output_tokens", 0) > 0
+            and not getattr(request, "drop_stale_output", False)
+        ):
+            return False
+        params = getattr(request, "kv_transfer_params", None) or {}
+        if (
+            params.get("do_remote_prefill")
+            and getattr(request, "num_computed_tokens", 0) == 0
+        ):
+            # Scheduler.schedule still runs on this rank and can allocate/start
+            # the receive during a coalescing window (load_kv_async bypass).
+            return False
+        return True
+
+    active = len(scheduler.running) + getattr(
+        scheduler, "num_waiting_for_streaming_input", 0
+    )
+    max_num_active_reqs = getattr(scheduler, "max_num_active_reqs", None)
+    has_slot = max_num_active_reqs is None or active < max_num_active_reqs
+    queued_ready = has_slot and any(
+        compute_ready(r) for r in _iter_pre_schedule_waiting(scheduler)
+    )
+    return running_prefill or queued_ready, running_decode
 
 
 def _make_should_throttle_prefills(orig):
@@ -279,11 +316,12 @@ def _make_handle_client_request(orig):
     return _handle_client_request
 
 
-def _make_process_engine_step(orig):
+def _make_process_engine_step(orig, *, community_should_throttle=None):
     # [ILU override] Wrapper, not a full-method copy. Deltas:
     # 1) synchronize prefills before delegating to community scheduling;
     # 2) bounded-wait for a replacement after community execution empties
     #    the local scheduler.
+    @wraps(orig)
     def _process_engine_step(self) -> bool:
         if not hasattr(self, "_ilu_dp_prefill_sync_state"):
             import vllm.envs as envs
@@ -296,6 +334,7 @@ def _make_process_engine_step(orig):
                 max_defer_steps=envs.VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS,
                 sync_group=_clone_dp_process_group(self.dp_group, self.dp_store),
                 sync_ready_replay=envs.VLLM_ILU_DP_SYNC_READY_REPLAY,
+                rearm_after_admission=envs.VLLM_ILU_DP_PREFILL_REARM,
             )
         prefill_sync_state = self._ilu_dp_prefill_sync_state
         waiting = False
@@ -303,6 +342,7 @@ def _make_process_engine_step(orig):
         sync_active = prefill_sync_state.enabled and (
             self.engines_running or self.scheduler.has_unfinished_requests()
         )
+        self.scheduler._ilu_ready_replay_throttle = False
         if sync_active:
             waiting, running_decode = _local_prefill_state(
                 self.scheduler,
@@ -312,14 +352,35 @@ def _make_process_engine_step(orig):
             assert state is not None
             state[0] = int(waiting)
             state[1] = int(running_decode)
+            if prefill_sync_state.rearm_after_admission:
+                state[2] = int(
+                    any(request.is_prefill_chunk for request in self.scheduler.running)
+                )
             dist.all_reduce(
                 state,
                 op=dist.ReduceOp.SUM,
                 group=prefill_sync_state.sync_group,
             )
-            ready_ranks, decode_ranks = (int(value) for value in state.tolist())
-
-            prefill_sync_state.update(ready_ranks, decode_ranks, self.dp_size)
+            values = state.tolist()
+            ready_ranks, decode_ranks = values[:2]
+            continuing_ranks = 0
+            admission_allowed = True
+            if prefill_sync_state.rearm_after_admission:
+                continuing_ranks = int(values[2])
+                if community_should_throttle is not None:
+                    admission_allowed = not community_should_throttle(self)
+            prefill_sync_state.update(
+                ready_ranks,
+                decode_ranks,
+                self.dp_size,
+                continuing_ranks=continuing_ranks,
+                admission_allowed=admission_allowed,
+            )
+            # Preserve the globally agreed replay gate despite local capacity heuristics.
+            self.scheduler._ilu_ready_replay_throttle = (
+                prefill_sync_state.sync_ready_replay
+                and prefill_sync_state.force_throttle
+            )
             # Every rank that participates in prefill synchronization must
             # execute exactly one real or dummy worker step. Otherwise worker
             # and EngineCore collectives can advance in different orders.

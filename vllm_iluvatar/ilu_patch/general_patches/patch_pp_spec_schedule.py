@@ -43,6 +43,41 @@ from vllm_iluvatar.ilu_patch import general_patch as p
 
 _IDLE_CHECK = "if num_new_tokens == 0:"
 _IDLE_CHECK_FIXED = "if num_new_tokens <= 0:"
+_READY_GATE_OLD = """\
+    defer_prefills = (
+        throttle_prefills and not self.prefill_capacity_bound
+    ) and any(not r.is_prefill_chunk for r in self.running)
+"""
+_READY_GATE_NEW = """\
+    defer_prefills = getattr(self, "_ilu_ready_replay_throttle", False) or (
+        (throttle_prefills and not self.prefill_capacity_bound)
+        and any(not r.is_prefill_chunk for r in self.running)
+    )
+"""
+
+
+def _patch_ready_replay_throttle_source(source: str) -> str:
+    """Apply the EngineCore readiness decision to the live scheduler body.
+
+    A completed remote-KV replay must obey the common DP admission gate even
+    when the previous scheduling pass left transport requests in ``waiting``.
+    That queue sets ``prefill_capacity_bound`` and would otherwise bypass the
+    gate. With the readiness flag false, preserve the community expression.
+    """
+    if _READY_GATE_NEW in source:
+        if source.count(_READY_GATE_NEW) != 1 or _READY_GATE_OLD in source:
+            raise RuntimeError("Ambiguous Scheduler.schedule ready-replay gate")
+        return source
+    if _READY_GATE_OLD in source:
+        if source.count(_READY_GATE_OLD) != 1:
+            raise RuntimeError("Ambiguous Scheduler.schedule ready-replay gate")
+        return source.replace(_READY_GATE_OLD, _READY_GATE_NEW, 1)
+    if "defer_prefills" in source:
+        raise RuntimeError(
+            "Scheduler.schedule prefill throttle changed; re-sync the "
+            "authoritative ready-replay source patch"
+        )
+    return source
 
 
 def register() -> None:
@@ -54,12 +89,13 @@ def register() -> None:
 
 
 def _patched_schedule_source(source: str) -> str:
-    """Widen idle checks and apply even remote-prefix replay alignment."""
+    """Patch the live schedule's idle, remote-prefix and ready-replay gates."""
     from vllm_iluvatar.ilu_patch.general_patches.patch_prefix_replay_alignment import (
         patch_schedule_source,
     )
 
     source = patch_schedule_source(source)
+    source = _patch_ready_replay_throttle_source(source)
     if _IDLE_CHECK not in source:
         raise RuntimeError(
             "Scheduler.schedule no longer contains "
@@ -130,6 +166,11 @@ def _apply() -> None:
     # replacement is not inspect-able, so never getsource the patched method.
     source = textwrap.dedent(inspect.getsource(Scheduler.schedule))
     patched = _patched_schedule_source(source)
+    if _READY_GATE_NEW not in patched:
+        raise RuntimeError(
+            "Scheduler.schedule prefill throttle changed; re-sync the "
+            "authoritative ready-replay source patch"
+        )
     namespace: dict[str, object] = {}
     exec(patched, sched_mod.__dict__, namespace)  # noqa: S102
     schedule = namespace["schedule"]

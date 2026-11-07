@@ -308,6 +308,14 @@ class NixlConnectorScheduler:
         # report finished_sending.  This keeps a producer-only engine stepping
         # even after its local prefill request has left the scheduler.
         self._pending_worker_sends: set[ReqId] = set()
+        # Both halves of the release handshake, each a subset of
+        # ``_pending_worker_sends``.  The send is registered when the final
+        # prefill chunk is scheduled, several engine steps before
+        # ``update_from_output`` finishes the request, so a worker completion
+        # can arrive while the scheduler would still refuse to free the
+        # blocks.  Park such a completion rather than reporting it.
+        self._sends_completed_early: set[ReqId] = set()
+        self._sends_awaiting_release: set[ReqId] = set()
 
         # Default per-layer unless cross or the env forces per-rank.
         self.prefer_layer_wise = not (
@@ -737,6 +745,10 @@ class NixlConnectorScheduler:
             prefill_tokens,
         )
         self._pending_worker_sends.add(request_id)
+        # Preemption can re-register a request; a half-handshake from the run
+        # it invalidated must not resolve this one.
+        self._sends_completed_early.discard(request_id)
+        self._sends_awaiting_release.discard(request_id)
         # for write, start time record after schedule
         self._reqs_to_send_time_record[request_id] = (
             time.perf_counter() + self._kv_lease_duration
@@ -766,8 +778,10 @@ class NixlConnectorScheduler:
             self._reqs_not_processed_recv = set()
         # P side
         else:
-            # try add waiting to running requests first
+            # A new/resumed request carries its complete current block table.
+            # Preemption invalidates the previously accumulated physical IDs.
             for new_req in scheduler_output.scheduled_new_reqs:
+                self._reqs_blocks.pop(new_req.req_id, None)
                 self.update_prefill_req(
                     meta,
                     new_req.req_id,
@@ -779,14 +793,21 @@ class NixlConnectorScheduler:
             # add chunked done requests
             scheduled_cached_reqs = scheduler_output.scheduled_cached_reqs
             for idx, request_id in enumerate(scheduled_cached_reqs.req_ids):
-                if request_id not in scheduled_cached_reqs.resumed_req_ids:
-                    self.update_prefill_req(
-                        meta,
+                if request_id in scheduled_cached_reqs.resumed_req_ids:
+                    logger.info(
+                        "NIXL rebuilt resumed send blocks req=%s old_sizes=%s new_sizes=%s",
                         request_id,
-                        scheduler_output.num_scheduled_tokens[request_id],
-                        scheduled_cached_reqs.num_computed_tokens[idx],
-                        scheduled_cached_reqs.new_block_ids[idx],
+                        [len(x) for x in self._reqs_blocks.get(request_id, [])],
+                        [len(x or []) for x in scheduled_cached_reqs.new_block_ids[idx]],
                     )
+                    self._reqs_blocks.pop(request_id, None)
+                self.update_prefill_req(
+                    meta,
+                    request_id,
+                    scheduler_output.num_scheduled_tokens[request_id],
+                    scheduled_cached_reqs.num_computed_tokens[idx],
+                    scheduled_cached_reqs.new_block_ids[idx],
+                )
 
             meta.reqs_to_send_time_record = self._reqs_to_send_time_record
             self._reqs_to_send_time_record = {}
@@ -822,7 +843,28 @@ class NixlConnectorScheduler:
                 sorted(stale),
             )
             finished -= stale
+
+        # The scheduler frees blocks only for a request it has finished, so a
+        # completion that overtakes the finish would trip its
+        # ``assert request.is_finished()``.  ``request_finished_all_groups``
+        # releases these instead, once the finish actually lands.
+        early = finished - self._sends_awaiting_release
+        if early:
+            logger.info(
+                "Withholding send completion for %d unfinished request(s): %s",
+                len(early),
+                sorted(early),
+            )
+            self._sends_completed_early |= early
+            finished -= early
+
+        self._sends_awaiting_release -= finished
         self._pending_worker_sends -= finished
+
+    def _await_send_release(self, req_id: ReqId) -> None:
+        """Record that the scheduler is holding blocks for a worker send."""
+        if req_id in self._pending_worker_sends:
+            self._sends_awaiting_release.add(req_id)
 
     def has_pending_push_work(self) -> bool:
         """Keep the engine loop alive while push work can still make progress."""
@@ -921,6 +963,14 @@ class NixlConnectorScheduler:
                 self._reqs_blocks.pop(request.request_id, None)
                 return False, None
 
+            if request.request_id in self._sends_completed_early:
+                # The worker proved this send terminal while the request was
+                # still running, so the completion was withheld. The caller
+                # has asserted the request is finished, so release it here.
+                self._sends_completed_early.discard(request.request_id)
+                self._pending_worker_sends.discard(request.request_id)
+                return False, {}
+
             if (
                 request.status
                 not in (
@@ -931,9 +981,13 @@ class NixlConnectorScheduler:
             ):
                 assert not params.get("do_remote_decode")
                 # for P, when P send info to worker then aborted, all we can do is wait kv write(may write) done
+                self._await_send_release(request.request_id)
                 return True, {}
 
-            return any(len(block_id) for block_id in block_ids), {}
+            delay_free = any(len(block_id) for block_id in block_ids)
+            if delay_free:
+                self._await_send_release(request.request_id)
+            return delay_free, {}
 
     def scheduler_loop(self, metadata: dict[int, KVConnectorHandshakeMetadata]):
         asyncio.set_event_loop(self._async_loop)

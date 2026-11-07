@@ -408,15 +408,16 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
             tile_sched_c128a=tile_sched[_LAYER_TYPE_C128A],
             **deepseek_v4_fields,  # type: ignore[arg-type]
         )
-        self._populate_prefill_opt_fields(
-            metadata,
-            num_decodes,
-            num_prefills,
-            seq_lens,
-            query_start_loc,
-            query_start_loc_cpu,
-            block_table,
-        )
+        if envs.VLLM_ILU_DS4_PREFILL_OPT:
+            self._populate_prefill_opt_fields(
+                metadata,
+                num_decodes,
+                num_prefills,
+                seq_lens,
+                query_start_loc,
+                query_start_loc_cpu,
+                block_table,
+            )
 
         if envs.VLLM_ILU_DS4_PREFILL_AS_DECODE:
             self._populate_prefill_swa_as_decode(metadata)
@@ -465,7 +466,9 @@ class IluDeepseekSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
         del block_table
         result: dict[str, torch.Tensor | int | None] = {}
 
-        if num_prefills == 0:
+        if num_prefills == 0 or (
+            envs.VLLM_ILU_DS4_PREFILL_AS_DECODE and not envs.VLLM_ILU_DS4_PREFILL_OPT
+        ):
             return result
 
         assert seq_lens_cpu is not None

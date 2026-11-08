@@ -86,6 +86,25 @@ _INDEXER_FP8_SCALE_BYTES = 4
 _SPARSE_DECODE_H_Q = (1, 8, 16, 32, 64, 128)
 _SPARSE_DECODE_INDEX_ALIGN = 256
 
+# flash_mla_sparse_fwd/ixformer_perf: h_q is a kernel bucket, and the backend
+# raises rather than falling back on anything outside it.
+_SPARSE_PREFILL_H_Q = (8, 16, 32, 64, 128)
+
+# Both prefill paths are legal for every bucket the two kernels share, so the
+# split-prefill gate is a throughput choice, not a capability one. Measured on
+# ivcore30 at index_topk 512 + window 128 (640 index columns), head_dim 512,
+# s_kv 164352, per 8192 prefill tokens -- flash_mla_sparse_fwd/ixformer_perf
+# versus ds4_sparse_mla_fp8_decode fed the same tokens:
+#
+#   h_q    8     16     32     64
+#   fwd   10.9   7.5    7.0    7.4   ms
+#   dec    4.9   4.7    8.1   13.4   ms
+#
+# flash_mla_sparse_fwd is flat in h_q (it is bound by the topk KV gather), while
+# the decode kernel scales with h_q, so they cross between 16 and 32. Below the
+# crossover the paged kernel also skips the bf16 KV workspace materialisation
+# entirely, so keep those head counts on it. Ratios held at 1k/2k/4k tokens too.
+_SPARSE_PREFILL_MIN_H_Q = 32
 
 def _as_sparse_decode_indices(indices: torch.Tensor) -> torch.Tensor:
     """``(T, 1, K)`` or ``(T, K)`` → ``(T, K)`` with ``stride(0) % 256 == 0``."""
@@ -499,12 +518,14 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
         self.max_num_batched_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
         )
-        # The BF16 sparse prefill path is specialized for Flash TP1.
-        # Other head counts retain the paged attention path.
+        # Wide shards take the split-prefill path; narrow ones are faster on the
+        # paged decode kernel (see _SPARSE_PREFILL_MIN_H_Q). Both kernels bucket
+        # h_q, so a shard that is not a bucket has no split-prefill kernel at all.
         self.use_prefill_sparse = (
             envs.VLLM_ILU_DS4_FP8_PREFILL_SPARSE
-            and self.n_local_heads == 64
             and self.use_fp8_ds_mla_layout
+            and self.n_local_heads >= _SPARSE_PREFILL_MIN_H_Q
+            and self.n_local_heads in _SPARSE_PREFILL_H_Q
         )
 
         if not self.use_fp8_ds_mla_layout:
@@ -823,9 +844,9 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
     ) -> None:
         """Sparse MLA forward: BF16 sparse prefill and packed FP8 decode.
 
-        Selected large TP1 prefill preserves FP8 NoPE Q quantization in a
-        fused BF16 materialization. The original decode operation block also
-        handles small and lower-head prefill.
+        Prefill on a wide shard preserves FP8 NoPE Q quantization in a fused
+        BF16 materialization. The decode operation block also handles small
+        prefills and narrow shards, where it is the faster of the two.
 
         ``kv`` is unused (the rotated K rows were already written by the
         compressor / ``_fused_qnorm_rope_kv_insert`` step); it is kept for the
@@ -1006,6 +1027,10 @@ class IluDeepseekV4Fp8Attention(nn.Module, AttentionLayerBase):
             output=output,
             attn_metadata=attn_metadata,
             swa_metadata=swa_metadata,
+            # Pinned rather than left to the registry default (ixinfer), whose
+            # rationale is an ivcore11 measurement. On ivcore30 the two are
+            # within 5% for every bucket this path runs (h_q >= 32), and the
+            # registry default can move without this path noticing.
             prefill_backend="ixformer_perf",
         )
 

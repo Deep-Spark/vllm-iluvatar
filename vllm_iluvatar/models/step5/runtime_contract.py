@@ -29,6 +29,50 @@ _FACADE_MODULES = {
     "sparse_gqa_fp8_workspace_size": "ixformer.inference.functions.models.step5.attention.fp8.sparse_gqa_fp8",
 }
 
+# Present in the ivcore11 ixformer build. The Python registry still labels
+# them ivcore30; the binding itself runs on ivcore11.
+_IVCORE11_NATIVE_OPS = frozenset(
+    {
+        "rmsnorm",
+        "residual_add",
+        "qk_rmsnorm",
+        "moe_swiglu",
+        "logits_reorder",
+        "mtp_norm_concat",
+        "vocab_parallel_embedding",
+        "csa_cache_update",
+        "indexer_norm_rope",
+        "top512",
+        "qk_norm_rope",
+    }
+)
+# Absent from the ivcore11 ixformer build. Dense GQA uses IluFlashAttention.
+# The router uses the existing GEMM / FP32 linear path instead of this GEMV.
+_IVCORE11_SUBSTITUTE_OPS = frozenset(
+    {
+        "paged_decode",
+        "gemv_bf16_bf16_fp32",
+    }
+)
+
+
+def _widen_ivcore11_native(op):
+    """Allow Step5 ixformer_native bindings labeled ivcore30-only on ivcore11.
+
+    The compiled kernels ship in the ivcore11 ixformer build; the Python
+    registry still advertises ivcore30. This mutation is Step5-local and runs
+    only inside validate_step5_runtime.
+    """
+    from ixformer.inference.backend_registry import registry
+
+    entry = registry._ops.get(op)
+    if entry is None:
+        return
+    backend = entry.backends.get("ixformer_native")
+    if backend is None or backend.archs is None or "ivcore11" in backend.archs:
+        return
+    backend.archs = frozenset(set(backend.archs) | {"ivcore11"})
+
 
 def _is_cuda(vllm_config):
     device = vllm_config.device_config
@@ -152,13 +196,20 @@ def validate_step5_runtime(vllm_config, *, draft=False):
         arch = _cuda_arch()
     except (ImportError, OSError) as exc:
         raise RuntimeError(
-            f"Step5 {role} requires an ivcore30 native extension: {exc}"
+            f"Step5 {role} requires an ivcore30 or ivcore11 native extension: {exc}"
         ) from exc
-    if arch != "ivcore30":
+    if arch not in ("ivcore30", "ivcore11"):
         raise RuntimeError(
-            f"Step5 {role} GPU execution requires ivcore30; detected {arch!r}. "
+            f"Step5 {role} GPU execution requires ivcore30 or ivcore11; "
+            f"detected {arch!r}. "
             "Disabling sparse attention does not remove this requirement."
         )
+    if arch == "ivcore11":
+        # Decode QK-norm+RoPE is not part of the startup op list, but every
+        # decode step calls it. The kernel is in this ivcore11 build.
+        import ixformer.inference.functions.models.step5.norm.float.decode_fusions  # noqa: F401
+
+        _widen_ivcore11_native("qk_norm_rope")
     try:
         functions, infer, binding, registry = _native_runtime()
     except (ImportError, OSError, AttributeError) as exc:
@@ -182,7 +233,8 @@ def validate_step5_runtime(vllm_config, *, draft=False):
                 or registry.resolve("sparse_gqa_fp8", "ixattn") != "ixattn"
             ):
                 raise RuntimeError("missing Step5 ixattn split backend")
-    if not draft:
+    # ivcore30 FP8 GEMV. W4A8/INT8 linears on ivcore11 use the INT8 TN path.
+    if not draft and arch == "ivcore30":
         _ = functions.per_channel_gemv_bf16_fp8_bf16
         if (
             registry.resolve("per_channel_gemv_bf16_fp8_bf16", "ixformer_perf")
@@ -190,6 +242,15 @@ def validate_step5_runtime(vllm_config, *, draft=False):
         ):
             raise RuntimeError("Step5 fused BF16/FP8 GEMV backend unavailable")
     for op in ops:
+        if arch == "ivcore11" and op in _IVCORE11_SUBSTITUTE_OPS:
+            continue
+        if arch == "ivcore11" and op not in _IVCORE11_NATIVE_OPS:
+            raise RuntimeError(
+                f"Step5 {role} has no ivcore11 kernel for {op}. "
+                "sparse_gqa_fp8 and indexer_scores are ivcore30-only in this "
+                "ixformer build; dense GQA requires "
+                "VLLM_ILU_STEP5_SPARSE_ATTENTION=0."
+            )
         try:
             for label, namespace in (
                 ("facade", functions),
@@ -198,6 +259,8 @@ def validate_step5_runtime(vllm_config, *, draft=False):
             ):
                 if not callable(getattr(namespace, op, None)):
                     raise RuntimeError(f"missing {label}")
+            if arch == "ivcore11":
+                _widen_ivcore11_native(op)
             if "ixformer_native" not in registry.available_backends(op):
                 raise RuntimeError("native backend unavailable")
             selected = registry.resolve(op, "ixformer_native")

@@ -13,7 +13,7 @@
 | `minimax/` | MiniMax M2.5、M2.7、M3 |
 | `moonshot/` | Kimi K2.5 |
 | `qwen/` | Qwen2、Qwen3 及现有变体 |
-| `stepfun/` | Step 3.5、3.7 |
+| `stepfun/` | Step 3.5、3.7、5 |
 | `tencent/` | HY3、HY4 |
 | `zhipu/` | GLM 5.2 |
 
@@ -44,7 +44,7 @@ python examples/iluvatar-compressed-tensors/quant.py \
 
 `python examples/iluvatar-compressed-tensors/quant.py --help` 列出可选配方。
 添加配方时，在 `configs/<vendor>/` 与 `rules/<vendor>/` 中加入同名 JSON，
-无需再维护名称注册表。本次目录调整不改变张量匹配、反量化、量化或打包逻辑。
+无需再维护名称注册表。配方目录布局不改变张量匹配、反量化、量化或打包逻辑。
 
 ## 显式路径与兼容性
 

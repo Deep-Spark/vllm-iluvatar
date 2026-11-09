@@ -57,11 +57,23 @@ class Step5GateLinear(GateLinear):
             )
             return self._return(output)
 
-        if self._prepared_router_weight is not None:
+        if self._prepared_router_weight_nt is not None and not is_ivcore30():
             from ixformer.inference.functions import gemm_bf16_bf16_fp32
 
+            # ivcore11 native NN returns non-finite values for this router
+            # shape. TN matches the fp32 reference. ixmm is ivcore30-only.
             output = gemm_bf16_bf16_fp32(
-                x, self._prepared_router_weight, format="NN", backend="ixmm"
+                x,
+                self._prepared_router_weight_nt,
+                format="TN",
+                backend="ixformer_native",
+            )
+        elif self._prepared_router_weight is not None:
+            from ixformer.inference.functions import gemm_bf16_bf16_fp32
+
+            backend = "ixmm" if is_ivcore30() else "ixinfer"
+            output = gemm_bf16_bf16_fp32(
+                x, self._prepared_router_weight, format="NN", backend=backend
             )
         else:
             # Keep original FP32 weights when conversion would lose precision.

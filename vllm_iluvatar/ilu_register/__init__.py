@@ -75,6 +75,16 @@ _applied = False
 
 def apply_oot_registrations() -> None:
     """Auto-discover and apply all OOT registrations (idempotent)."""
+    from vllm_iluvatar.backends import provider_mode
+
+    if provider_mode() == "ixaite":
+        from vllm_iluvatar.backends.ixaite.oot_registration import (
+            apply_oot_registrations as apply_ixaite_registrations,
+        )
+
+        apply_ixaite_registrations()
+        return
+
     global _applied
     if _applied:
         return

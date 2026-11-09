@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: Apache-2.0
+schema_version: 1
+slug: qwen3_8b
+
+# Dense Qwen3-8B on ivcore11 (not GDN / Qwen3.5).
+# H=4096, I=12288, layers=36, GQA 32/8, head_dim=128, vocab=151936.
+
+l2:
+  attention:
+    batch: 1
+    contexts: [128, 256, 512, 1024, 2048]
+    graph_capacity: 8192
+    head_dim: 128
+    num_kv_heads: 8
+    num_query_heads: 32
+    page_size: 16
+  embedding_gather:
+    hidden_size: 4096
+    num_tokens: [1, 8, 32, 128, 256, 512, 1024, 2048]
+    vocab_size: 151936
+  fused_add_rms_norm:
+    hidden_size: 4096
+  linear:
+    attn_o_proj:
+      K: 4096
+      N: 4096
+      bias: false
+      tags: [gemm, decode, prefill, attn]
+    attn_qkv_proj:
+      K: 4096
+      N: 6144
+      bias: false
+      tags: [gemm, decode, prefill, attn]
+    lm_head:
+      K: 4096
+      N: 151936
+      bias: false
+      max_t: 256
+      tags: [gemm, decode, lm_head]
+    mlp_down_proj:
+      K: 12288
+      N: 4096
+      bias: false
+      tags: [gemm, decode, prefill, mlp]
+    mlp_gate_up_proj:
+      K: 4096
+      N: 24576
+      bias: false
+      tags: [gemm, decode, prefill, mlp]
+  reshape_and_cache_flash:
+    head_dim: 128
+    num_kv_heads: 8
+    num_kv_heads_tp: [8, 4, 2]
+    page_size: 16
+  rms_norm:
+    hidden_size: 4096
+  rms_norm_qk:
+    head_dim: 128
+    num_kv_heads: 8
+    num_query_heads: 32
+  silu_and_mul:
+    d: 12288
+
+e2e:
+  ops:
+    - silu_and_mul
+    - linear
+    - embedding_gather
+    - rms_norm
+    - rms_norm_qk
+    - fused_add_rms_norm
+    - reshape_and_cache_flash
+    - flash_attn
+  env: {}
+  serve_args:
+    - --tensor-parallel-size
+    - "1"
+    - --trust-remote-code
+    - --max-model-len
+    - "8192"
+    - --compilation-config
+    - '{"cudagraph_mode":"FULL","mode":0}'

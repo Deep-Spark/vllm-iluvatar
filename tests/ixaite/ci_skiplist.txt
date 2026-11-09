@@ -1,0 +1,31 @@
+# One pytest path or node ID per line, relative to the repository root.
+# Paths are ignored during collection; node IDs are deselected.
+# Examples: tests/ixaite/benchmarks
+#           tests/test_module.py::test_name[param]
+# Reason: the expected RuntimeError is not raised.
+tests/model_executor/layers/fused_moe/test_ilu_mxfp4_fused_moe.py::test_resolve_backend_explicit_ixmm_rejects_original_layout
+# Reason: the ixaite fused_qk_rmsnorm_rope_gate operator cannot be imported.
+tests/ixaite/models/test_ilu_qwen3_5_fused_qk_provider.py::test_ixaite_routed_ops_match_plugin
+# Reason: PyTorch expects a CUDA generator but receives a CPU generator.
+tests/model_executor/layers/fused_moe/test_ilu_mxfp4_fused_moe.py::test_dequant_is_dtype_agnostic_after_normalisation
+tests/model_executor/layers/quantization/test_ilu_mxfp4.py::test_process_weights_relables_dtypes
+tests/model_executor/layers/quantization/test_ilu_mxfp4.py::test_process_weights_is_zero_copy
+tests/model_executor/layers/quantization/test_ilu_mxfp4.py::test_process_weights_rejects_non_uint8_input
+tests/model_executor/layers/quantization/test_ilu_mxfp4.py::test_process_weights_rejects_non_contiguous_input
+tests/model_executor/layers/quantization/test_ilu_mxfp4.py::test_process_weights_preprocesses_ixmm_layout
+tests/model_executor/layers/fused_moe/test_ilu_mxfp4_fused_moe.py::test_matches_module_4_reference_without_ep
+tests/model_executor/layers/fused_moe/test_ilu_mxfp4_fused_moe.py::test_matches_module_4_reference_with_contiguous_ep_shard
+tests/model_executor/layers/fused_moe/test_ilu_mxfp4_fused_moe.py::test_non_contiguous_expert_map_is_honoured
+tests/model_executor/layers/fused_moe/test_ilu_mxfp4_fused_moe.py::test_no_local_expert_selected_returns_zeros
+tests/model_executor/layers/fused_moe/test_ilu_mxfp4_fused_moe.py::test_output_scale_applies_to_the_routed_sum_only
+tests/model_executor/layers/fused_moe/test_ilu_mxfp4_fused_moe.py::test_extra_residual_is_added_after_scaling_and_not_mutated
+tests/model_executor/layers/fused_moe/test_ilu_mxfp4_fused_moe.py::test_swiglu_limit_none_disables_clamping
+tests/model_executor/layers/fused_moe/test_ilu_mxfp4_fused_moe.py::test_w2_bias_is_applied_when_present
+tests/model_executor/layers/fused_moe/test_ilu_mxfp4_fused_moe.py::test_w13_bias_changes_the_result
+tests/model_executor/layers/fused_moe/test_ilu_mxfp4_fused_moe.py::test_dispatcher_on_cpu_routes_to_torch_and_does_not_import_ixformer
+tests/model_executor/layers/fused_moe/test_ilu_mxfp4_fused_moe.py::test_torch_impl_is_invariant_under_dtype_normalisation
+tests/model_executor/layers/fused_moe/test_ilu_mxfp4_fused_moe.py::test_ixformer_pipeline_wires_args_correctly
+tests/model_executor/layers/fused_moe/test_ilu_mxfp4_fused_moe.py::test_ixmm_pipeline_uses_preprocessed_weight_dimensions
+tests/model_executor/layers/fused_moe/test_ilu_mxfp4_fused_moe.py::test_ixformer_pipeline_forwards_expert_map_without_remapping
+# Reason: benchmark modules are unavailable in wheel-isolated CI collection.
+tests/ixaite/benchmarks

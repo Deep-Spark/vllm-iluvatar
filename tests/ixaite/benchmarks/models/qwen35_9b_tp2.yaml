@@ -1,0 +1,95 @@
+schema_version: 1
+slug: qwen35_9b_tp2
+
+l2:
+  linear:
+    attn_o_proj:
+      K: 2048
+      N: 4096
+      bias: false
+      tags: [gemm, decode, prefill, attn, tp2]
+    attn_qkv_proj:
+      K: 4096
+      N: 5120
+      bias: false
+      tags: [gemm, decode, prefill, attn, tp2]
+    gdn_out_proj:
+      K: 2048
+      N: 4096
+      bias: false
+      tags: [gemm, decode, prefill, gdn, tp2]
+    gdn_in_proj_ba:
+      K: 4096
+      N: 32
+      bias: false
+      tags: [gemm, decode, prefill, gdn, tp2]
+    gdn_in_proj_qkvz:
+      K: 4096
+      N: 6144
+      bias: false
+      tags: [gemm, decode, prefill, gdn, tp2]
+    lm_head:
+      K: 4096
+      N: 124160
+      bias: false
+      max_t: 256
+      tags: [gemm, decode, lm_head, tp2]
+    mlp_down_proj:
+      K: 6144
+      N: 4096
+      bias: false
+      tags: [gemm, decode, prefill, mlp, tp2]
+    mlp_gate_up_proj:
+      K: 4096
+      N: 12288
+      bias: false
+      tags: [gemm, decode, prefill, mlp, tp2]
+    vis_attn_qkv:
+      K: 1152
+      N: 1728
+      bias: true
+      tags: [gemm, vision, tp2]
+    vis_attn_o_proj:
+      K: 576
+      N: 1152
+      bias: false
+      tags: [gemm, vision, tp2]
+    vis_merger_fc2:
+      K: 2304
+      N: 4096
+      bias: true
+      tags: [gemm, vision, merger, tp2]
+
+e2e:
+  ops:
+    - linear
+  env: {}
+  serve_args:
+    - --tensor-parallel-size
+    - "2"
+    - --trust-remote-code
+    - --max-model-len
+    - "8192"
+    - --limit-mm-per-prompt
+    - '{"image":0,"video":0}'
+    - --compilation-config
+    - '{"cudagraph_mode":"FULL","mode":0}'
+  startup_timeout_s: 1800
+  warmup_requests: 10
+  workloads:
+    - id: bs1_128_128
+      input_len: 128
+      max_concurrency: 1
+      num_prompts: 40
+      output_len: 128
+  # Decode runs inside a captured graph (cudagraph_mode FULL). A collective
+  # that advances its barrier flag on the host still times, but the replay
+  # returns a stale sum. This probe catches that without a second model.
+  correctness:
+    kind: tp_graph_vs_eager
+    prompt: Count from one to forty in words, separated by commas.
+    temperature: 0
+    max_tokens: 64
+    random_seed: 0
+    repeats: 4
+    request_timeout_s: 600

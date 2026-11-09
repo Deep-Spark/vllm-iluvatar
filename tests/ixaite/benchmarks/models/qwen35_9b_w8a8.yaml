@@ -1,0 +1,54 @@
+schema_version: 1
+slug: qwen35_9b_w8a8
+
+# W8A8 INT8 (compressed-tensors) quantized Qwen3.5-9B. --model-path must point
+# at the quantized checkpoint. Only the quantized GEMM and the activation
+# quant feeding it depend on that checkpoint, so this profile claims those two
+# and leaves the rest to qwen35_9b.yaml.
+l2:
+  # Activation quant runs on each quantized linear's input, so these are
+  # in_features. Every projection off the residual stream takes 4096; only
+  # down_proj takes 12288, its input being the post-silu intermediate.
+  # qkv_proj's 10240 is an out_features and never reaches this op.
+  scaled_int8_quant:
+    hidden_sizes: [4096, 12288]
+  scaled_int8_quant_asym:
+    hidden_sizes: [4096, 12288]
+  w8a8:
+    attn_qkv_proj:
+      K: 4096
+      N: 10240
+
+e2e:
+  ops:
+    - w8a8
+    - scaled_int8_quant
+  env: {}
+  serve_args:
+    - --tensor-parallel-size
+    - "1"
+    - --trust-remote-code
+    - --max-model-len
+    - "8192"
+    - --limit-mm-per-prompt
+    - '{"image":0,"video":0}'
+    - --compilation-config
+    - '{"cudagraph_mode":"FULL","mode":0}'
+  startup_timeout_s: 1800
+  warmup_requests: 10
+  workloads:
+    - id: bs1_128_128
+      input_len: 128
+      max_concurrency: 1
+      num_prompts: 40
+      output_len: 128
+    - id: bs8_128_128
+      input_len: 128
+      max_concurrency: 8
+      num_prompts: 80
+      output_len: 128
+    - id: bs1_1024_128
+      input_len: 1024
+      max_concurrency: 1
+      num_prompts: 40
+      output_len: 128

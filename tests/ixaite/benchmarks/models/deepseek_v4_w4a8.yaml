@@ -1,0 +1,164 @@
+schema_version: 1
+slug: deepseek_v4_w4a8
+
+# DeepSeek-V4 mixed W4A8. Routed experts go through
+# IluCompressedTensorsW4A8Int8MoEMethod.apply (not the Qwen3-30B
+# standard-experts EP kernel). TP=1 prefill selects moe_compute_token_index;
+# decode selects moe_compute_token_index_for_decode. --model-path must point
+# at that checkpoint.
+l2:
+  ds4_fused_qnorm_rope_kv_insert:
+    block_size: 64
+    head_dim: 512
+    num_query_heads: 8
+    rotary_dim: 64
+  ds4_inv_rope:
+    head_dim: 512
+    num_query_heads: 8
+    rotary_dim: 64
+  ds4_mhc_pre:
+    hidden: 4096
+    n_hc: 4
+  ds4_mhc_post:
+    hidden: 4096
+    n_hc: 4
+  ds4_hc_head:
+    hidden: 4096
+    n_hc: 4
+  ds4_compressor_save_partial_states:
+    head_dim: 512
+    compress_ratio: 4
+    state_block_size: 64
+    kv_block_size: 64
+  ds4_compressor_pool_norm_rope_insert:
+    head_dim: 512
+    compress_ratio: 4
+    state_block_size: 64
+    kv_block_size: 64
+  gemm_bf16_bf16_fp32:
+    n: 2048
+    k: 4096
+  marlin_w8a16:
+    batch: 8
+    n: 1024
+    k: 4096
+  moe_w4a8_group_gemm:
+    calls:
+      # 0731 routed w13 (gate_up) and w2 (down_proj). 256 experts, top-6.
+      w13_prefill:
+        N: 4096
+        K: 4096
+        tokens: [32, 0, 16, 8, 0, 24, 0, 16]
+      w2_prefill:
+        N: 4096
+        K: 2048
+        tokens: [32, 0, 16, 8, 0, 24, 0, 16]
+  moe_w4a8_group_gemv:
+    calls:
+      w13_decode:
+        N: 4096
+        K: 4096
+        tokens: [1, 0, 1, 1, 0, 1, 0, 1]
+      w2_decode:
+        N: 4096
+        K: 2048
+        tokens: [1, 0, 1, 1, 0, 1, 0, 1]
+  moe_compute_token_index:
+    num_experts: 256
+    topk: 8
+    num_tokens: [1, 32, 128]
+    variants: [plain, decode]
+  # Sparse indexer / top-k chain. The indexer runs on the compressed K cache at
+  # compress_ratio 4, so a logits width of W corresponds to ISL 4*W.
+  dsa_update_topk_indices:
+    topk: 512
+    # [tokens, logits_width]. Widths above topk take the selection path; the
+    # ones at or below it degenerate to "keep every valid column".
+    shapes:
+      - [1, 256]
+      - [1, 512]
+      - [8, 256]
+      - [128, 128]
+      - [128, 512]
+      - [1, 1024]
+      - [1, 2048]
+      - [1, 4096]
+      - [8, 1024]
+  dsa_indexer_mqa_logits_bf16:
+    index_n_heads: 64
+    index_head_dim: 128
+    block_size: 256
+  ds4_compute_global_topk:
+    topk: 512
+    topk_block_size: 64
+  ds4_compute_swa_decode_indices:
+    sliding_window: 128
+    block_size: 256
+  ds4_gather_k_cache:
+    head_dim: 512
+    block_size: 64
+  ds4_combine_topk_swa:
+    topk: 512
+    sliding_window: 128
+    compress_ratio: 4
+
+e2e:
+  ops:
+    - moe_compute_token_index
+    - moe_compute_token_index_for_decode
+    - ds4_fused_qnorm_rope_kv_insert
+    - ds4_inv_rope
+    - ds4_mhc_pre
+    - ds4_mhc_pre_v2
+    - ds4_mhc_pre_v3
+    - ds4_mhc_post
+    - ds4_hc_head
+    - ds4_compressor_save_partial_states
+    - ds4_compressor_pool_norm_rope_insert
+    - gemm_bf16_bf16_fp32
+    - marlin_w8a16
+    - ds4_compute_global_topk_indices_and_lens
+    - ds4_combine_topk_swa_indices
+    - ds4_compute_swa_decode_indices_and_lens
+    - ds4_compute_swa_prefill_gather_lens
+    - ds4_gather_k_cache
+    - ds4_merge_attn_outputs
+    - ds4_fused_indexer_q_rope
+    - dsa_indexer_mqa_logits_with_blocks_bf16
+    - dsa_update_topk_indices
+    - ds4_flash_mla_with_kvcache
+    - ds4_flash_mla_sparse_fwd
+    - ds4_swa_attn_fwd
+    - ds4_paged_sparse_attn_fwd
+    - ds4_dense_compressed_attn_fwd
+  env:
+    VLLM_W8A8_MOE_USE_W4A8: "1"
+  serve_args:
+    - --tensor-parallel-size
+    - "8"
+    - --trust-remote-code
+    - --max-model-len
+    - "8192"
+    - --gpu-memory-utilization
+    - "0.92"
+    - --max-num-seqs
+    - "32"
+    - --max-num-batched-tokens
+    - "2049"
+    - --speculative-config
+    - '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"greedy"}'
+    - --compilation-config
+    - '{"cudagraph_mode":"FULL","mode":0}'
+  startup_timeout_s: 1800
+  warmup_requests: 10
+  workloads:
+    - id: bs1_128_128
+      input_len: 128
+      max_concurrency: 1
+      num_prompts: 40
+      output_len: 128
+    - id: bs1_1024_1024_dspark
+      input_len: 1024
+      max_concurrency: 1
+      num_prompts: 8
+      output_len: 1024

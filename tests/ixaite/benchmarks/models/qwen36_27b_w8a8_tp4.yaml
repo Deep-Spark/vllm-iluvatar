@@ -1,0 +1,281 @@
+schema_version: 1
+slug: qwen36_27b_w8a8_tp4
+
+# Qwen3.6-27B-W8A8 TP=4. GDN-out K is 6144/4=1536. in_proj_ba N=24 is the narrow
+# MR path (24 % 16 != 0). Attention L2 is the full-attn shard (Hq=6, Hkv=1);
+# reshape_and_cache_flash pins that Hkv=1 writer.
+# MLP / full-attn qkv/o are W8A8. intermediate_size=17408, so the TP-local
+# silu_and_mul width is D=4352.
+# Default e2e serve matches ixformer (no speculative decode). ngram spec=3 is
+# qwen36_27b_w8a8_tp4_ngram -- default serve never hits gdn_spec_delta_update.
+l2:
+  attention:
+    batch: 1
+    contexts: [128, 177, 256, 352, 512, 1024, 1169, 2048, 16384, 131072]
+    prefill_contexts: [128, 177, 256, 352, 512, 1024, 1169, 2048, 16384]
+    decode_contexts: [128, 177, 256, 352, 512, 1024, 1169, 2048, 16384, 131072]
+    head_dim: 256
+    num_kv_heads: 1
+    num_query_heads: 6
+    page_size: 16
+  reshape_and_cache_flash:
+    head_dim: 256
+    num_kv_heads: 1
+    page_size: 16
+  embedding_gather:
+    hidden_size: 5120
+    num_tokens: [1, 8, 32, 128, 256, 512, 1024, 2048]
+    vocab_size: 248320
+  # GDN conv is column-sharded: 10240/4 = 2560 with the global Hk=16, Hv=48,
+  # Dk=Dv=128. Not the 9B TP4 2048.
+  causal_conv1d_fn:
+    dim: 2560
+    width: 4
+  causal_conv1d_update:
+    dim: 2560
+    width: 4
+  # GDN shard: 16/4 / TP=4 is 4/12, not the 9B TP4 4/8.
+  fused_post_conv_prep:
+    head_k_dim: 128
+    head_v_dim: 128
+    l2norm_min_t: 512
+    num_k_heads: 4
+    num_v_heads: 12
+  chunk_gated_delta_rule:
+    head_k_dim: 128
+    head_v_dim: 128
+    lengths:
+      - [512]
+      - [512, 1536]
+    num_k_heads: 4
+    num_v_heads: 12
+  gdn_packed_decode:
+    head_k_dim: 128
+    head_v_dim: 128
+    num_k_heads: 4
+    num_tokens: [1, 8, 128]
+    num_v_heads: 12
+  gdn_spec_delta_update:
+    head_k_dim: 128
+    head_v_dim: 128
+    num_k_heads: 4
+    num_v_heads: 12
+    shapes:
+      - [1, 2]
+      - [8, 2]
+      - [1, 4]
+      - [8, 4]
+  rms_norm_gated:
+    dim: 128
+    heads: 12
+  # Gate multiplies attn_output before o_proj. Last dim is 6*256 = 1536,
+  # not hidden 5120 and not the TP2 3072.
+  attn_output_sigmoid_gate:
+    hidden_size: 1536
+  # Full-attn shard: 24/4 / TP=4, same D=256 and rotary_dim=64 as TP2.
+  fused_qk_rmsnorm_rope_gate:
+    cache_rows: 4096
+    head_dim: 256
+    num_kv_heads: 1
+    num_query_heads: 6
+    rotary_dim: 64
+  gemma_rms_norm:
+    hidden_size: 5120
+  linear:
+    gdn_in_proj_qkvz:
+      K: 5120
+      N: 4096
+      bias: false
+      tags: [gemm, decode, prefill, gdn, tp4]
+    gdn_in_proj_ba:
+      K: 5120
+      N: 24
+      bias: false
+      tags: [gemm, decode, prefill, gdn, tp4]
+    gdn_out_proj:
+      K: 1536
+      N: 5120
+      bias: false
+      tags: [gemm, decode, prefill, gdn, tp4]
+    lm_head:
+      K: 5120
+      N: 62080
+      bias: false
+      max_t: 256
+      tags: [gemm, decode, lm_head, tp4]
+  # MLP / full-attn qkv/o are W8A8. TP-local silu width is 17408/4.
+  silu_and_mul:
+    d: 4352
+  fused_add_rms_norm:
+    hidden_size: 5120
+  # Activation quant sees each W8A8 linear's in_features (K), not N.
+  # qkv N is (Hq + 2*Hkv + Hq)*D: TP4 14*256=3584 (gate fused into qkv).
+  scaled_int8_quant:
+    hidden_sizes: [5120, 1536, 4352]
+  distributed:
+    hidden_size: 5120
+    num_tokens: [1, 8, 128, 256]
+  w8a8:
+    attn_qkv_proj:
+      K: 5120
+      N: 3584
+      bias: false
+      tags: [gemm, decode, prefill, attn, tp4]
+    attn_o_proj:
+      K: 1536
+      N: 5120
+      bias: false
+      tags: [gemm, decode, prefill, attn, tp4]
+    mlp_gate_up_proj:
+      K: 5120
+      N: 8704
+      bias: false
+      tags: [gemm, decode, prefill, mlp, tp4]
+    mlp_down_proj:
+      K: 4352
+      N: 5120
+      bias: false
+      tags: [gemm, decode, prefill, mlp, tp4]
+
+e2e:
+  ops:
+    - silu_and_mul
+    - linear
+    - w8a8
+    - scaled_int8_quant
+    - embedding_gather
+    - distributed
+    - rms_norm_gated
+    - fused_add_rms_norm
+    - gemma_rms_norm
+    - reshape_and_cache_flash
+    - causal_conv1d_fn
+    - causal_conv1d_update
+    - gdn_post_conv_prep
+    - gdn_chunk
+    - gdn_packed_decode
+    - fused_qk_rmsnorm_rope_gate
+    - attn_output_sigmoid_gate
+    - flash_attn
+  env: {}
+  serve_args:
+    - --tensor-parallel-size
+    - "4"
+    - --trust-remote-code
+    - --max-model-len
+    - "4096"
+    - --limit-mm-per-prompt
+    - '{"image":0,"video":0}'
+    - --compilation-config
+    - '{"cudagraph_mode":"FULL_DECODE_ONLY","mode":0}'
+  startup_timeout_s: 3600
+  warmup_requests: 32
+  correctness:
+    kind: tp_graph_vs_eager
+    prompt: Count from one to forty in words, separated by commas.
+    temperature: 0
+    max_tokens: 64
+    random_seed: 0
+    repeats: 4
+    request_timeout_s: 600
+  workloads:
+    - id: bs1_128_128
+      input_len: 128
+      max_concurrency: 1
+      num_prompts: 32
+      output_len: 128
+    - id: bs8_128_128
+      input_len: 128
+      max_concurrency: 8
+      num_prompts: 32
+      output_len: 128
+    - id: bs16_128_128
+      input_len: 128
+      max_concurrency: 16
+      num_prompts: 32
+      output_len: 128
+    - id: bs32_128_128
+      input_len: 128
+      max_concurrency: 32
+      num_prompts: 32
+      output_len: 128
+    - id: bs1_128_2048
+      input_len: 128
+      max_concurrency: 1
+      num_prompts: 32
+      output_len: 2048
+    - id: bs8_128_2048
+      input_len: 128
+      max_concurrency: 8
+      num_prompts: 32
+      output_len: 2048
+    - id: bs16_128_2048
+      input_len: 128
+      max_concurrency: 16
+      num_prompts: 32
+      output_len: 2048
+    - id: bs32_128_2048
+      input_len: 128
+      max_concurrency: 32
+      num_prompts: 32
+      output_len: 2048
+    - id: bs1_2048_128
+      input_len: 2048
+      max_concurrency: 1
+      num_prompts: 32
+      output_len: 128
+    - id: bs8_2048_128
+      input_len: 2048
+      max_concurrency: 8
+      num_prompts: 32
+      output_len: 128
+    - id: bs16_2048_128
+      input_len: 2048
+      max_concurrency: 16
+      num_prompts: 32
+      output_len: 128
+    - id: bs32_2048_128
+      input_len: 2048
+      max_concurrency: 32
+      num_prompts: 32
+      output_len: 128
+    - id: bs1_2048_2048
+      input_len: 2048
+      max_concurrency: 1
+      num_prompts: 32
+      output_len: 2048
+    - id: bs8_2048_2048
+      input_len: 2048
+      max_concurrency: 8
+      num_prompts: 32
+      output_len: 2048
+    - id: bs16_2048_2048
+      input_len: 2048
+      max_concurrency: 16
+      num_prompts: 32
+      output_len: 2048
+    - id: bs32_2048_2048
+      input_len: 2048
+      max_concurrency: 32
+      num_prompts: 32
+      output_len: 2048
+    - id: bs1_1024_1024
+      input_len: 1024
+      max_concurrency: 1
+      num_prompts: 32
+      output_len: 1024
+    - id: bs8_1024_1024
+      input_len: 1024
+      max_concurrency: 8
+      num_prompts: 32
+      output_len: 1024
+    - id: bs16_1024_1024
+      input_len: 1024
+      max_concurrency: 16
+      num_prompts: 32
+      output_len: 1024
+    - id: bs32_1024_1024
+      input_len: 1024
+      max_concurrency: 32
+      num_prompts: 32
+      output_len: 1024

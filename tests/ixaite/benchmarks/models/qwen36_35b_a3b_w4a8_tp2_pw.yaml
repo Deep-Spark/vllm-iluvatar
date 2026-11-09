@@ -1,0 +1,238 @@
+schema_version: 1
+slug: qwen36_35b_a3b_w4a8_tp2_pw
+
+# Qwen3.6-35B-A3B-W4A8 TP=2.
+# Hidden=2048; GDN Hk=16 Hv=32 Dk=Dv=128; full-attn Hq=16 Hkv=2 D=256.
+# MoE 256 experts top-8, I=512. Text-only e2e (vision skipped).
+l2:
+  attention:
+    batch: 1
+    contexts: [128, 177, 256, 352, 512, 1024, 1169, 2048, 16384, 131072]
+    prefill_contexts: [128, 177, 256, 352, 512, 1024, 1169, 2048, 16384]
+    decode_contexts: [128, 177, 256, 352, 512, 1024, 1169, 2048, 16384, 131072]
+    head_dim: 256
+    num_kv_heads: 1
+    num_query_heads: 8
+    page_size: 16
+  reshape_and_cache_flash:
+    head_dim: 256
+    num_kv_heads: 1
+    page_size: 16
+  embedding_gather:
+    hidden_size: 2048
+    num_tokens: [1, 8, 32, 128, 256, 512, 1024, 2048]
+    vocab_size: 248320
+  # conv_dim = (2*Hk*Dk + Hv*Dv) / TP = (2*16*128 + 32*128) / 2 = 4096
+  causal_conv1d_fn:
+    dim: 4096
+    width: 4
+  causal_conv1d_update:
+    dim: 4096
+    width: 4
+  fused_post_conv_prep:
+    head_k_dim: 128
+    head_v_dim: 128
+    l2norm_min_t: 512
+    num_k_heads: 8
+    num_v_heads: 16
+  chunk_gated_delta_rule:
+    head_k_dim: 128
+    head_v_dim: 128
+    lengths:
+      - [128]
+      - [512]
+      - [512, 1536]
+    num_k_heads: 8
+    num_v_heads: 16
+  gdn_packed_decode:
+    head_k_dim: 128
+    head_v_dim: 128
+    num_k_heads: 8
+    num_tokens: [1, 8, 128]
+    num_v_heads: 16
+  rms_norm_gated:
+    dim: 128
+    heads: 16
+  # Gate multiplies attn_output before o_proj. TP-local Hq*D = 8*256 = 2048.
+  attn_output_sigmoid_gate:
+    hidden_size: 2048
+  fused_qk_rmsnorm_rope_gate:
+    cache_rows: 4096
+    head_dim: 256
+    num_kv_heads: 1
+    num_query_heads: 8
+    rotary_dim: 64
+  linear:
+    gdn_in_proj_qkvz:
+      K: 2048
+      N: 6144
+      bias: false
+      tags: [gemm, decode, prefill, gdn, tp2]
+    gdn_in_proj_ba:
+      K: 2048
+      N: 32
+      bias: false
+      tags: [gemm, decode, prefill, gdn, tp2]
+    gdn_out_proj:
+      K: 2048
+      N: 2048
+      bias: false
+      tags: [gemm, decode, prefill, gdn, tp2]
+    lm_head:
+      K: 2048
+      N: 124160
+      bias: false
+      max_t: 256
+      tags: [gemm, decode, lm_head, tp2]
+
+e2e:
+  ops:
+    - linear
+    - reshape_and_cache_flash
+    - embedding_gather
+    - causal_conv1d_fn
+    - causal_conv1d_update
+    - gdn_post_conv_prep
+    - gdn_chunk
+    - gdn_packed_decode
+    - rms_norm_gated
+    - fused_qk_rmsnorm_rope_gate
+    - attn_output_sigmoid_gate
+    - moe_fused_topk_bias
+    - moe_compute_token_index
+    - moe_compute_token_index_for_decode
+    - moe_expand_input_dynamic_scaled_int8
+    - moe_w4a8_group_gemm
+    - moe_w4a8_group_gemv
+    - activation_dynamic_scaled_int8
+    - moe_output_reduce_sum
+  env:
+    VLLM_ENFORCE_CUDA_GRAPH: "1"
+    VLLM_W8A8_MOE_USE_W4A8: "1"
+    PYTHONUNBUFFERED: "1"
+    NCCL_P2P_DISABLE: "1"
+    NCCL_IB_DISABLE: "1"
+    GLOO_SOCKET_IFNAME: "lo"
+    # Sampler logits.sort at BS32 needs a few tens of MiB; 0.92 left ~20 MiB
+    # and OOM'd ixaite on (2048,128) BS32 after MoE workspace fragmentation.
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  serve_args:
+    - --tensor-parallel-size
+    - "2"
+    - --trust-remote-code
+    - --max-model-len
+    - "4096"
+    - --gpu-memory-utilization
+    - "0.85"
+    - --limit-mm-per-prompt
+    - '{"image":0,"video":0}'
+    - --compilation-config
+    - '{"cudagraph_mode":"FULL_AND_PIECEWISE","mode":3,"custom_ops":["+GemmaRMSNorm"],"cudagraph_capture_sizes":[1,8,16,32,64,128,256,512,1024,2048]}'
+  startup_timeout_s: 3600
+  warmup_requests: 32
+  # No tp_graph_vs_eager probe here: VLLM_COMPILE numerics diverge from eager
+  # by design (inductor fusion + unfused shared-expert add under the opaque
+  # MoE op), so an exact-match gate would always fail. Replay correctness is
+  # instead covered by comparing against cudagraph_mode NONE at the same
+  # compilation mode (bitwise-identical on an 11-prompt battery).
+  workloads:
+    - id: bs1_128_128
+      input_len: 128
+      max_concurrency: 1
+      num_prompts: 32
+      output_len: 128
+    - id: bs8_128_128
+      input_len: 128
+      max_concurrency: 8
+      num_prompts: 32
+      output_len: 128
+    - id: bs16_128_128
+      input_len: 128
+      max_concurrency: 16
+      num_prompts: 32
+      output_len: 128
+    - id: bs32_128_128
+      input_len: 128
+      max_concurrency: 32
+      num_prompts: 32
+      output_len: 128
+    - id: bs1_128_2048
+      input_len: 128
+      max_concurrency: 1
+      num_prompts: 32
+      output_len: 2048
+    - id: bs8_128_2048
+      input_len: 128
+      max_concurrency: 8
+      num_prompts: 32
+      output_len: 2048
+    - id: bs16_128_2048
+      input_len: 128
+      max_concurrency: 16
+      num_prompts: 32
+      output_len: 2048
+    - id: bs32_128_2048
+      input_len: 128
+      max_concurrency: 32
+      num_prompts: 32
+      output_len: 2048
+    - id: bs1_2048_128
+      input_len: 2048
+      max_concurrency: 1
+      num_prompts: 32
+      output_len: 128
+    - id: bs8_2048_128
+      input_len: 2048
+      max_concurrency: 8
+      num_prompts: 32
+      output_len: 128
+    - id: bs16_2048_128
+      input_len: 2048
+      max_concurrency: 16
+      num_prompts: 32
+      output_len: 128
+    - id: bs32_2048_128
+      input_len: 2048
+      max_concurrency: 32
+      num_prompts: 32
+      output_len: 128
+    - id: bs1_2048_2048
+      input_len: 2048
+      max_concurrency: 1
+      num_prompts: 32
+      output_len: 2048
+    - id: bs8_2048_2048
+      input_len: 2048
+      max_concurrency: 8
+      num_prompts: 32
+      output_len: 2048
+    - id: bs16_2048_2048
+      input_len: 2048
+      max_concurrency: 16
+      num_prompts: 32
+      output_len: 2048
+    - id: bs32_2048_2048
+      input_len: 2048
+      max_concurrency: 32
+      num_prompts: 32
+      output_len: 2048
+    - id: bs1_1024_1024
+      input_len: 1024
+      max_concurrency: 1
+      num_prompts: 32
+      output_len: 1024
+    - id: bs8_1024_1024
+      input_len: 1024
+      max_concurrency: 8
+      num_prompts: 32
+      output_len: 1024
+    - id: bs16_1024_1024
+      input_len: 1024
+      max_concurrency: 16
+      num_prompts: 32
+      output_len: 1024
+    - id: bs32_1024_1024
+      input_len: 1024
+      max_concurrency: 32
+      num_prompts: 32
+      output_len: 1024

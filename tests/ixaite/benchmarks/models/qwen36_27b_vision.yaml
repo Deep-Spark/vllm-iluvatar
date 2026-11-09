@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: Apache-2.0
+# Qwen3.6-27B with the vision tower live. L2 merger is the TP=2 shard
+# (N=5120, K=2304). e2e serve is TP=4, same 32GB reason as qwen36_27b.
+# ViT hidden stays 1152; merger fc2 writes hidden 5120.
+schema_version: 1
+slug: qwen36_27b_vision
+
+l2:
+  layer_norm:
+    hidden_size: 1152
+  vit_qkv_layout:
+    sequence_lengths: [784, 3136]
+    num_heads: [16, 8, 4]
+    head_dim: 72
+  vit_qkv_rope:
+    sequence_lengths: [784, 3136]
+    num_heads: [16, 8, 4]
+    head_dim: 72
+  attention:
+    # ViT FA: TP2 native D72 (ixaite API shim), TP2 serving D128 after the
+    # QKV graph pad (TP=2, 8 heads), and TP4 serving D128. Softmax
+    # stays 1/sqrt(72) in every layout.
+    mode: packed_encoder
+    batch: 1
+    contexts: [784, 3136]
+    softmax_head_dim: 72
+    layouts:
+      - num_query_heads: 8
+        num_kv_heads: 8
+        head_dim: 72
+      - num_query_heads: 8
+        num_kv_heads: 8
+        head_dim: 128
+      - num_query_heads: 4
+        num_kv_heads: 4
+        head_dim: 128
+  gelu:
+    sequence_lengths: [16, 32, 64, 128, 256, 512, 2048]
+    tanh_widths: [4304, 2152]
+    erf_widths: [4608, 2304]
+  linear:
+    vis_attn_qkv:
+      K: 1152
+      N: 1728
+      bias: true
+      tags: [gemm, vision, tp2]
+    vis_attn_o_proj:
+      K: 576
+      N: 1152
+      bias: false
+      tags: [gemm, vision, tp2]
+    vis_merger_fc2:
+      K: 2304
+      N: 5120
+      bias: true
+      tags: [gemm, vision, merger, tp2]
+
+e2e:
+  ops:
+    - layer_norm
+    - gelu
+    - linear
+    - vit_qkv_layout
+    - vit_qkv_rope
+    - flash_attn
+  env: {}
+  serve_args:
+    - --tensor-parallel-size
+    - "4"
+    - --trust-remote-code
+    - --max-model-len
+    - "4096"
+    - --limit-mm-per-prompt
+    - '{"image":1,"video":0}'
+    - --compilation-config
+    - '{"cudagraph_mode":"FULL_DECODE_ONLY","mode":0}'
+  startup_timeout_s: 3600
+  warmup_requests: 4
+  workloads:
+    - id: bs1_img896_128
+      dataset: random-mm
+      input_len: 128
+      max_concurrency: 1
+      num_prompts: 8
+      output_len: 128
+      mm:
+        base_items_per_request: 1
+        limit_mm_per_prompt: '{"image": 1, "video": 0}'
+        bucket_config: '{(896, 896, 1): 1.0}'

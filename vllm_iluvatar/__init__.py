@@ -111,6 +111,10 @@ def register_platform() -> str:
     shims now (current_platform is resolved before parallel_state import),
     injects the Iluvatar env config, then returns the IluPlatform class path.
     """
+    from vllm_iluvatar.backends import provider_mode
+
+    mode = provider_mode()
+    os.environ.setdefault("VLLM_ILU_KERNEL_PROVIDER", mode)
     try:
         import ixformer  # noqa: F401 — presence means Iluvatar hardware
     except ImportError as e:
@@ -134,6 +138,12 @@ def register_platform() -> str:
     from vllm_iluvatar.platforms.ilu_platform import register_attention_backends
 
     register_attention_backends()
+    if mode == "ixaite":
+        from vllm_iluvatar.backends.ixaite.register import (
+            register_platform as register_ixaite_platform,
+        )
+
+        return register_ixaite_platform()
 
     from vllm_iluvatar.ilu_patch.patch_platform_import_hooks import (
         register_platform_import_hooks,
@@ -176,9 +186,16 @@ def register_general() -> None:
     except ImportError:
         return
 
-    from vllm_iluvatar.distributed.kv_transfer import (
-        apply_kv_transfer_registrations,
-    )
+    from vllm_iluvatar.backends import provider_mode
+
+    if provider_mode() == "ixaite":
+        from vllm_iluvatar.backends.ixaite.register import (
+            register_general as register_ixaite_general,
+        )
+
+        return register_ixaite_general()
+
+    from vllm_iluvatar.distributed.kv_transfer import apply_kv_transfer_registrations
     from vllm_iluvatar.ilu_patch import apply_general_patches
     from vllm_iluvatar.ilu_register import apply_oot_registrations
 

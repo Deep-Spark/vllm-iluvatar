@@ -407,8 +407,20 @@ _ILU_GUARD_ENV_VARS: dict[str, Callable[[], Any]] = {
 }
 
 
+# Keep backend additions separate from the upstream environment definitions.
+if TYPE_CHECKING:
+    VLLM_ILU_KERNEL_PROVIDER: str = "baseline"
+
+_ILU_CANONICAL_ONLY_ENV_VARS["VLLM_ILU_KERNEL_PROVIDER"] = lambda: (
+    os.environ.get("VLLM_ILU_KERNEL_PROVIDER", "baseline").strip().lower()
+)
+
+
 def apply() -> None:
     """Inject Iluvatar env defaults and register env readers."""
+    from vllm_iluvatar.backends import provider_mode
+
+    mode = provider_mode()
     for key, value in _ILU_DEFAULTS.items():
         os.environ.setdefault(key, value)
         logger.debug("ILU envs: setdefault %s=%s", key, value)
@@ -419,6 +431,10 @@ def apply() -> None:
     envs.environment_variables.update(_ILU_ENV_ALIASES)
     envs.environment_variables.update(_ILU_CANONICAL_ONLY_ENV_VARS)
     envs.environment_variables.update(_ILU_GUARD_ENV_VARS)
+    if mode == "ixaite":
+        from vllm_iluvatar.backends.ixaite.envs import apply as apply_ixaite_envs
+
+        apply_ixaite_envs()
     logger.debug(
         "ILU envs: registered %d canonical + %d legacy-alias + "
         "%d canonical-only + %d guard env vars",

@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: Apache-2.0
+# Qwen3.5-9B TP=1 with the vision tower live.
+#
+# The other qwen35_9b profiles serve with '{"image":0,"video":0}', so their
+# forward never enters Qwen3_VisionTransformer and cannot cover a ViT op.
+# This profile exists to give the vision path a serve run: it is the e2e home
+# for ops whose only call sites are inside the tower.
+#
+# Kept separate rather than folded into qwen35_9b so that enabling the
+# multimodal encoder budget -- which takes memory away from the KV cache --
+# does not move that profile's text throughput baseline.
+schema_version: 1
+slug: qwen35_9b_vision
+
+l2:
+  layer_norm:
+    # ViT block norm1/norm2 and the merger entry norm; TP does not shard the
+    # vision hidden dim.
+    hidden_size: 1152
+  vit_qkv_layout:
+    sequence_lengths: [784, 3136]
+    num_heads: [16]
+    head_dim: 72
+  vit_qkv_rope:
+    sequence_lengths: [784, 3136]
+    num_heads: [16]
+    head_dim: 72
+
+e2e:
+  # Ops this profile is responsible for covering on the vision path. The
+  # tower's LayerNorm and GELU have no other serve route, and linear also runs
+  # the vision QKV / o_proj / merger GEMMs here.
+  ops:
+    - layer_norm
+    - gelu
+    - linear
+    - vit_qkv_layout
+    - vit_qkv_rope
+  env: {}
+  serve_args:
+    - --tensor-parallel-size
+    - "1"
+    - --trust-remote-code
+    - --max-model-len
+    - "8192"
+    - --limit-mm-per-prompt
+    - '{"image":1,"video":0}'
+    - --compilation-config
+    - '{"cudagraph_mode":"FULL","mode":0}'
+  startup_timeout_s: 1800
+  warmup_requests: 10
+  workloads:
+    # patch_size 16 -> a 896x896 image is 56x56 = 3136 ViT rows through 55
+    # LayerNorms, then spatial_merge_size 2 packs them to 784 LLM tokens.
+    - id: bs1_img896_128
+      dataset: random-mm
+      input_len: 128
+      max_concurrency: 1
+      num_prompts: 20
+      output_len: 128
+      mm:
+        base_items_per_request: 1
+        limit_mm_per_prompt: '{"image": 1, "video": 0}'
+        bucket_config: '{(896, 896, 1): 1.0}'
+    - id: bs4_img896_128
+      dataset: random-mm
+      input_len: 128
+      max_concurrency: 4
+      num_prompts: 40
+      output_len: 128
+      mm:
+        base_items_per_request: 1
+        limit_mm_per_prompt: '{"image": 1, "video": 0}'
+        bucket_config: '{(896, 896, 1): 1.0}'
+    # Smaller image: 448x448 is 28x28 = 784 ViT rows, so the tower runs at a
+    # row count where the norm is launch-bound rather than bandwidth-bound.
+    - id: bs4_img448_128
+      dataset: random-mm
+      input_len: 128
+      max_concurrency: 4
+      num_prompts: 40
+      output_len: 128
+      mm:
+        base_items_per_request: 1
+        limit_mm_per_prompt: '{"image": 1, "video": 0}'
+        bucket_config: '{(448, 448, 1): 1.0}'

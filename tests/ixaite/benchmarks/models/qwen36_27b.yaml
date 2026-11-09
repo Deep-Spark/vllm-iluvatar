@@ -1,0 +1,181 @@
+# SPDX-License-Identifier: Apache-2.0
+# Qwen3.6-27B BF16. L2 shapes below are the TP=2 shard (tighter GEMM).
+# e2e serve is TP=4: a 32GB card cannot hold the 25.2 GiB TP=2 weight
+# shard plus cudagraph KV profiling (OOM allocating 392 MiB with 332 MiB free).
+# Full-attn TP=4 shard is Hq=6, Hkv=1. GDN shard is Hk=4, Hv=12.
+# MLP silu width at TP=4 is 17408/4 = 4352.
+# Default e2e serve matches ixformer (no speculative decode).
+schema_version: 1
+slug: qwen36_27b
+
+l2:
+  attention:
+    batch: 1
+    contexts: [128, 177, 256, 352, 512, 1024, 1169, 2048]
+    graph_capacity: 8192
+    head_dim: 256
+    num_kv_heads: 2
+    num_query_heads: 12
+    page_size: 16
+  attn_output_sigmoid_gate:
+    hidden_size: 3072
+  causal_conv1d_fn:
+    dim: 5120
+    width: 4
+  causal_conv1d_update:
+    dim: 5120
+    width: 4
+  chunk_gated_delta_rule:
+    head_k_dim: 128
+    head_v_dim: 128
+    num_k_heads: 8
+    num_v_heads: 24
+    lengths:
+      - [512]
+      - [512, 1536]
+  embedding_gather:
+    hidden_size: 5120
+    num_tokens: [1, 8, 32, 128, 256, 512, 1024, 2048]
+    vocab_size: 248320
+  fused_add_rms_norm:
+    hidden_size: 5120
+  fused_post_conv_prep:
+    head_k_dim: 128
+    head_v_dim: 128
+    l2norm_min_t: 512
+    num_k_heads: 8
+    num_v_heads: 24
+  fused_qk_rmsnorm_gate:
+    head_dim: 256
+    num_kv_heads: 2
+    num_query_heads: 12
+  fused_qk_rmsnorm_rope_gate:
+    cache_rows: 4096
+    head_dim: 256
+    num_kv_heads: 2
+    num_query_heads: 12
+    rotary_dim: 64
+  gdn_packed_decode:
+    head_k_dim: 128
+    head_v_dim: 128
+    num_k_heads: 8
+    num_tokens: [1, 8, 128]
+    num_v_heads: 24
+  gdn_spec_delta_update:
+    head_k_dim: 128
+    head_v_dim: 128
+    num_k_heads: 8
+    num_v_heads: 24
+    shapes:
+      - [1, 2]
+      - [8, 2]
+      - [1, 4]
+      - [8, 4]
+  gemma_rms_norm:
+    hidden_size: 5120
+  linear:
+    attn_o_proj:
+      K: 3072
+      N: 5120
+      bias: false
+      tags: [gemm, decode, prefill, attn, tp2]
+    attn_qkv_proj:
+      K: 5120
+      N: 7168
+      bias: false
+      tags: [gemm, decode, prefill, attn, tp2]
+    gdn_out_proj:
+      K: 3072
+      N: 5120
+      bias: false
+      tags: [gemm, decode, prefill, gdn, tp2]
+    gdn_in_proj_ba:
+      K: 5120
+      N: 48
+      bias: false
+      tags: [gemm, decode, prefill, gdn, tp2]
+    gdn_in_proj_qkvz:
+      K: 5120
+      N: 8192
+      bias: false
+      tags: [gemm, decode, prefill, gdn, tp2]
+    lm_head:
+      K: 5120
+      N: 124160
+      bias: false
+      max_t: 256
+      tags: [gemm, decode, lm_head, tp2]
+    mlp_down_proj:
+      K: 8704
+      N: 5120
+      bias: false
+      tags: [gemm, decode, prefill, mlp, tp2]
+    mlp_gate_up_proj:
+      K: 5120
+      N: 17408
+      bias: false
+      tags: [gemm, decode, prefill, mlp, tp2]
+  reshape_and_cache_flash:
+    head_dim: 256
+    num_kv_heads: 2
+    page_size: 16
+  rms_norm_gated:
+    dim: 128
+    heads: 24
+  silu_and_mul:
+    d: 8704
+  distributed:
+    hidden_size: 5120
+    num_tokens: [1, 8, 128, 256]
+
+e2e:
+  ops:
+    - silu_and_mul
+    - linear
+    - embedding_gather
+    - distributed
+    - rms_norm_gated
+    - fused_add_rms_norm
+    - gemma_rms_norm
+    - reshape_and_cache_flash
+    - causal_conv1d_fn
+    - causal_conv1d_update
+    - gdn_post_conv_prep
+    - gdn_chunk
+    - gdn_packed_decode
+    - fused_qk_rmsnorm_rope_gate
+    - fused_qk_rmsnorm_gate
+    - attn_output_sigmoid_gate
+    - flash_attn
+  env: {}
+  serve_args:
+    - --tensor-parallel-size
+    - "4"
+    - --trust-remote-code
+    - --max-model-len
+    - "4096"
+    - --limit-mm-per-prompt
+    - '{"image":0,"video":0}'
+    - --compilation-config
+    - '{"cudagraph_mode":"FULL_DECODE_ONLY","mode":0}'
+  startup_timeout_s: 3600
+  warmup_requests: 10
+  correctness:
+    kind: tp_graph_vs_eager
+    prompt: Count from one to forty in words, separated by commas.
+    temperature: 0
+    max_tokens: 64
+    random_seed: 0
+    repeats: 4
+    request_timeout_s: 600
+  workloads:
+    - id: bs1_128_128
+      input_len: 128
+      max_concurrency: 1
+      num_prompts: 16
+      output_len: 128
+    - id: bs1_1024_128
+      input_len: 1024
+      max_concurrency: 1
+      num_prompts: 8
+      output_len: 128

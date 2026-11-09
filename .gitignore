@@ -39,3 +39,7 @@ htmlcov/
 
 # logs
 *.log
+site/
+site-preview/
+site-300/
+.mkdocs.local-serve.*

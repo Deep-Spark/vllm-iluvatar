@@ -20,7 +20,7 @@ repos:
   rev: v0.21.0
   hooks:
   - id: markdownlint-cli2
-    exclude: ^docs/guides/4-how-to-use-iluvatar-optimized-kv-quant.md
+    exclude: ^docs/developer_guide/guides/4-how-to-use-iluvatar-optimized-kv-quant.md
     language_version: lts
     args: [--fix]
 - repo: local

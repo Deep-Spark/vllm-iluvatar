@@ -578,7 +578,7 @@ FP4 只有 FP8 的约 1/4，所以**稳态完全放得下，放不下的是那�
 峰值额外显存从"整层 FP8"降到"一个 expert 的 FP8"。
 
 产出的四个参数与旧路径**逐字节相同**，
-[`test_ilu_fp8_to_fp4_moe.py`](../../tests/model_executor/layers/quantization/test_ilu_fp8_to_fp4_moe.py)
+[`test_ilu_fp8_to_fp4_moe.py`](../../../tests/model_executor/layers/quantization/test_ilu_fp8_to_fp4_moe.py)
 在 TP1 / TP2 两个 rank / EP 下都做了对拍，所以精度结论可以直接继承，
 不需要重跑一遍评测。
 
@@ -695,17 +695,17 @@ padding 过的 hidden dim 或 intermediate size、融合成 3D 的 expert 张量
 
 | 作用 | 文件 |
 | --- | --- |
-| runtime 配置解析与分发 | [`ilu_runtime_quant_config.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime_quant_config.py) |
-| 未量化 checkpoint 的基础 config | [`ilu_runtime_quant_base.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime_quant_base.py) |
-| method 注册表 | [`ilu_quant_registry.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_quant_registry.py) |
-| FP8 基础 config 与 online Linear method | [`ilu_fp8.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_fp8.py) |
-| FP8 source layout 与 ix30 FP4 转换入口 | [`ilu_fp8_to_fp4.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_fp8_to_fp4.py) |
-| MoE 加载期 FP4 method | [`ilu_fp8_to_fp4_moe.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_fp8_to_fp4_moe.py) |
+| runtime 配置解析与分发 | [`ilu_runtime_quant_config.py`](../../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime_quant_config.py) |
+| 未量化 checkpoint 的基础 config | [`ilu_runtime_quant_base.py`](../../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime_quant_base.py) |
+| method 注册表 | [`ilu_quant_registry.py`](../../../vllm_iluvatar/model_executor/layers/quantization/ilu_quant_registry.py) |
+| FP8 基础 config 与 online Linear method | [`ilu_fp8.py`](../../../vllm_iluvatar/model_executor/layers/quantization/ilu_fp8.py) |
+| FP8 source layout 与 ix30 FP4 转换入口 | [`ilu_fp8_to_fp4.py`](../../../vllm_iluvatar/model_executor/layers/quantization/ilu_fp8_to_fp4.py) |
+| MoE 加载期 FP4 method | [`ilu_fp8_to_fp4_moe.py`](../../../vllm_iluvatar/model_executor/layers/quantization/ilu_fp8_to_fp4_moe.py) |
 | 转换算子（双 backend，在 ixformer） | `ixformer/inference/functions/fp4/gemm/fp8_block_preprocess.py` |
-| Qwen3.8-Flash-Next 示例 | [`examples/iluvatar-runtime-quant/Qwen/Qwen3.8-Flash-Next/`](../../examples/iluvatar-runtime-quant/Qwen/Qwen3.8-Flash-Next/) |
-| Qwen3.8-27B 示例（未量化 checkpoint） | [`examples/iluvatar-runtime-quant/Qwen/Qwen3.8-27B/`](../../examples/iluvatar-runtime-quant/Qwen/Qwen3.8-27B/) |
-| GLM-5.2 示例（MoE 加载期 FP4） | [`examples/iluvatar-runtime-quant/ZhipuAI/GLM-5.2/`](../../examples/iluvatar-runtime-quant/ZhipuAI/GLM-5.2/) |
-| 派生目录生成器（模式 A） | [`qwen38_flash_next_fp8_online.py`](../../examples/iluvatar-compressed-tensors/qwen38_flash_next_fp8_online.py) |
+| Qwen3.8-Flash-Next 示例 | [`examples/iluvatar-runtime-quant/Qwen/Qwen3.8-Flash-Next/`](../../../examples/iluvatar-runtime-quant/Qwen/Qwen3.8-Flash-Next/) |
+| Qwen3.8-27B 示例（未量化 checkpoint） | [`examples/iluvatar-runtime-quant/Qwen/Qwen3.8-27B/`](../../../examples/iluvatar-runtime-quant/Qwen/Qwen3.8-27B/) |
+| GLM-5.2 示例（MoE 加载期 FP4） | [`examples/iluvatar-runtime-quant/ZhipuAI/GLM-5.2/`](../../../examples/iluvatar-runtime-quant/ZhipuAI/GLM-5.2/) |
+| 派生目录生成器（模式 A） | [`qwen38_flash_next_fp8_online.py`](../../../examples/iluvatar-compressed-tensors/qwen38_flash_next_fp8_online.py) |
 
 ### 10.2 步骤速览
 

@@ -37,7 +37,7 @@
 
 2. **只替换真正的天数差异**。绝大多数通用模型的天数差异极小——例如 hy_v3 / qwen3 相对社区**唯一**的功能改动就是把 attention 里两次独立的 `q_norm`/`k_norm` 融合成一次 `RMSNormQK`（ixformer `rms_norm_qk`）。运行路径其余部分（社区 `Attention` / `FusedMoE` / `get_rope` / 量化 method）全部复用，不重写。
 
-3. **通过官方 OOT 扩展点接入**。用 `ilu_register` 的 `ModelRegistry.register_model` 以**社区 arch 名**（不是 `IluXXX`）重新注册指向插件子类，社区源文件与 checkpoint 的 `config.json::architectures` 都保持不变，加载时该 arch 即解析到插件子类。单文件模型放在 `vllm_iluvatar/model_executor/models/` 包下、暴露一个 `register_model()` 钩子即可被 [`apply_oot_registrations`](../../vllm_iluvatar/ilu_register/__init__.py) 自动发现，**无需改动 `ilu_register/__init__.py` 或 `_OOT_MODEL_PACKAGES`**（后者只用于登记多文件的天数优化模型子包）。注册完成后，`_validate_oot_overrides` 会对插件子类跑一次 prefix-compatible 的签名校验（覆盖的方法签名须与社区兼容）。
+3. **通过官方 OOT 扩展点接入**。用 `ilu_register` 的 `ModelRegistry.register_model` 以**社区 arch 名**（不是 `IluXXX`）重新注册指向插件子类，社区源文件与 checkpoint 的 `config.json::architectures` 都保持不变，加载时该 arch 即解析到插件子类。单文件模型放在 `vllm_iluvatar/model_executor/models/` 包下、暴露一个 `register_model()` 钩子即可被 [`apply_oot_registrations`](../../../vllm_iluvatar/ilu_register/__init__.py) 自动发现，**无需改动 `ilu_register/__init__.py` 或 `_OOT_MODEL_PACKAGES`**（后者只用于登记多文件的天数优化模型子包）。注册完成后，`_validate_oot_overrides` 会对插件子类跑一次 prefix-compatible 的签名校验（覆盖的方法签名须与社区兼容）。
 
 ---
 
@@ -88,7 +88,7 @@
                                        └─▶ 4.4 隔离可选取舍(overrides)  →  4.5 register_model  →  4.6 量化加载(继承，无需改)
 ```
 
-下文代码以 [`hy_v3.py`](../../vllm_iluvatar/model_executor/models/hy_v3.py) 为准，qwen3 结构相同（无 MoE，故无 4.4）。
+下文代码以 [`hy_v3.py`](../../../vllm_iluvatar/model_executor/models/hy_v3.py) 为准，qwen3 结构相同（无 MoE，故无 4.4）。
 
 ### 4.1 定位天数 delta
 
@@ -228,7 +228,7 @@ def register_model() -> None:
 
 ## 5. 测试
 
-新增 `tests/model_executor/models/test_ilu_<arch>.py`（如 [`test_ilu_hy_v3.py`](../../tests/model_executor/models/test_ilu_hy_v3.py)），至少覆盖：
+新增 `tests/model_executor/models/test_ilu_<arch>.py`（如 [`test_ilu_hy_v3.py`](../../../tests/model_executor/models/test_ilu_hy_v3.py)），至少覆盖：
 
 - **OOT 注册（无需 GPU）**：`apply_oot_registrations()` 后，该 arch 解析到插件模块，且插件类是社区类的子类。
 
@@ -276,11 +276,11 @@ def register_model() -> None:
 
 | 作用 | 文件 |
 | --- | --- |
-| OOT 注册入口（自动发现 `register_model()`） | [`vllm_iluvatar/ilu_register/__init__.py`](../../vllm_iluvatar/ilu_register/__init__.py) |
-| 落地示例：hy_v3 子类化（fusion + overrides + register） | [`vllm_iluvatar/model_executor/models/hy_v3.py`](../../vllm_iluvatar/model_executor/models/hy_v3.py) |
-| 对照示例：qwen3 子类化（仅 fusion） | [`vllm_iluvatar/model_executor/models/qwen3.py`](../../vllm_iluvatar/model_executor/models/qwen3.py) |
-| 天数融合 op | [`vllm_iluvatar/model_executor/layers/layernorm.py`](../../vllm_iluvatar/model_executor/layers/layernorm.py) |
-| 测试示例 | [`tests/model_executor/models/test_ilu_hy_v3.py`](../../tests/model_executor/models/test_ilu_hy_v3.py) |
+| OOT 注册入口（自动发现 `register_model()`） | [`vllm_iluvatar/ilu_register/__init__.py`](../../../vllm_iluvatar/ilu_register/__init__.py) |
+| 落地示例：hy_v3 子类化（fusion + overrides + register） | [`vllm_iluvatar/model_executor/models/hy_v3.py`](../../../vllm_iluvatar/model_executor/models/hy_v3.py) |
+| 对照示例：qwen3 子类化（仅 fusion） | [`vllm_iluvatar/model_executor/models/qwen3.py`](../../../vllm_iluvatar/model_executor/models/qwen3.py) |
+| 天数融合 op | [`vllm_iluvatar/model_executor/layers/layernorm.py`](../../../vllm_iluvatar/model_executor/layers/layernorm.py) |
+| 测试示例 | [`tests/model_executor/models/test_ilu_hy_v3.py`](../../../tests/model_executor/models/test_ilu_hy_v3.py) |
 
 ### 步骤速览
 

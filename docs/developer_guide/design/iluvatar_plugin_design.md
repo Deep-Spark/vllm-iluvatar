@@ -825,7 +825,7 @@ ruff 的规则集与上游对齐，定义在 `pyproject.toml` 的 `[tool.ruff.li
 
 ### 13.2 仅硬件用 skip gating
 
-唯一允许 skip 的是**物理 CUDA / Iluvatar 设备不在**：数值 / kernel 用例确实无法在无卡机跑。统一用 [tests/conftest.py](../../tests/conftest.py) 的 `requires_cuda` mark 与 `cuda_device` fixture（内部 `torch.cuda.is_available()` 判定）gating。
+唯一允许 skip 的是**物理 CUDA / Iluvatar 设备不在**：数值 / kernel 用例确实无法在无卡机跑。统一用 [tests/conftest.py](../../../tests/conftest.py) 的 `requires_cuda` mark 与 `cuda_device` fixture（内部 `torch.cuda.is_available()` 判定）gating。
 
 ### 13.3 纯 Python 机制写 CPU-only 用例
 

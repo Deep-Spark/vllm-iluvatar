@@ -308,7 +308,7 @@ N、K 以及 TP / fused 分片边界必须是 32 的倍数。`create_weights` �
 
 ## 5. 特殊量化与混合量化
 
-除第 3、4 节的 W8A8 / W4A8 字段外，config group 的 `iluvatar.method` 用于选择 Iluvatar 特定量化实现。配置该字段后，会跳过官方 scheme 选择，直接从 [`IluvatarQuantRegistry`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_quant_registry.py) 加载对应类。
+除第 3、4 节的 W8A8 / W4A8 字段外，config group 的 `iluvatar.method` 用于选择 Iluvatar 特定量化实现。配置该字段后，会跳过官方 scheme 选择，直接从 [`IluvatarQuantRegistry`](../../../vllm_iluvatar/model_executor/layers/quantization/ilu_quant_registry.py) 加载对应类。
 
 该方法主要用于：
 

@@ -93,7 +93,7 @@ csrc/
 
 ## 3. community 算子完整流程
 
-> 示例：`rotary_embedding` · 参考实现：[`csrc/community/pos_encoding_kernels.cu`](../../csrc/community/pos_encoding_kernels.cu)
+> 示例：`rotary_embedding` · 参考实现：[`csrc/community/pos_encoding_kernels.cu`](../../../csrc/community/pos_encoding_kernels.cu)
 
 ### 3.1 调用链
 
@@ -138,7 +138,7 @@ rotary_embedding(Tensor positions, Tensor! query, Tensor!? key,
 
 host 端负责 shape / stride 推导与校验（建议逐行对齐上游同名内核的 host 逻辑），device 端负责实际计算。
 
-参考：[`csrc/community/pos_encoding_kernels.cu`](../../csrc/community/pos_encoding_kernels.cu)
+参考：[`csrc/community/pos_encoding_kernels.cu`](../../../csrc/community/pos_encoding_kernels.cu)
 
 ```cpp
 void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
@@ -166,7 +166,7 @@ void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
 
 ### 3.4 声明函数签名
 
-在 [`csrc/community/ops.h`](../../csrc/community/ops.h) 中补充声明（注释附上社区 schema 原文）：
+在 [`csrc/community/ops.h`](../../../csrc/community/ops.h) 中补充声明（注释附上社区 schema 原文）：
 
 ```cpp
 namespace vllm_iluvatar {
@@ -184,7 +184,7 @@ void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
 
 ### 3.5 注册 schema 与 dispatch
 
-在 [`csrc/torch_bindings.cpp`](../../csrc/torch_bindings.cpp) 中完成两件事：
+在 [`csrc/torch_bindings.cpp`](../../../csrc/torch_bindings.cpp) 中完成两件事：
 
 1. `ops.def(...)` 声明 schema（与上游逐字一致）
 2. `ops.impl(...)` 绑定到实现（选对 dispatch key）
@@ -210,7 +210,7 @@ TORCH_LIBRARY_IMPL_EXPAND(_C, CUDA, ops) {
 
 ### 3.6 构建
 
-[`CMakeLists.txt`](../../CMakeLists.txt) 用 `GLOB_RECURSE ... CONFIGURE_DEPENDS` 递归收集 `csrc/` 下所有源文件：
+[`CMakeLists.txt`](../../../CMakeLists.txt) 用 `GLOB_RECURSE ... CONFIGURE_DEPENDS` 递归收集 `csrc/` 下所有源文件：
 
 ```cmake
 file(GLOB_RECURSE VLLM_ILUVATAR_EXT_SRC CONFIGURE_DEPENDS
@@ -247,13 +247,13 @@ community 算子注册后，社区调用点会自动通过 PyTorch dispatcher �
 - cache dtype 与 q/k 异构（fp32 cache + bf16 q/k）
 - 非连续（strided）张量
 
-**注意事项**：构造 `CustomOp`（如 `RotaryEmbedding`）需要活跃的 `VllmConfig` 上下文，使用 [`tests/conftest.py`](../../tests/conftest.py) 中的 `default_vllm_config` fixture 即可。
+**注意事项**：构造 `CustomOp`（如 `RotaryEmbedding`）需要活跃的 `VllmConfig` 上下文，使用 [`tests/conftest.py`](../../../tests/conftest.py) 中的 `default_vllm_config` fixture 即可。
 
 ---
 
 ## 4. plugin 算子完整流程
 
-> 示例：`apply_rotary_emb` · 参考实现：[`csrc/plugin/apply_rotary_emb.cu`](../../csrc/plugin/apply_rotary_emb.cu)
+> 示例：`apply_rotary_emb` · 参考实现：[`csrc/plugin/apply_rotary_emb.cu`](../../../csrc/plugin/apply_rotary_emb.cu)
 
 plugin 算子是上游 `torch.ops._C` 中**不存在**的算子，由插件自行新增。社区 Python 代码不会自动调用它，因此除了 C++ 侧的内核实现外，还**必须编写 OOT override** 将社区调用点接到新算子。
 
@@ -296,7 +296,7 @@ apply_rotary_emb(Tensor x, Tensor cos, Tensor sin, bool interleaved) -> Tensor
 1. **CUDA 实现**：`vllm_iluvatar::apply_rotary_emb` —— 实际的 GPU 计算。
 2. **Meta impl**：`vllm_iluvatar::apply_rotary_emb_meta` —— 仅做 shape 推导，用于 torch.compile / FakeTensor / opcheck。
 
-参考：[`csrc/plugin/apply_rotary_emb.cu`](../../csrc/plugin/apply_rotary_emb.cu)
+参考：[`csrc/plugin/apply_rotary_emb.cu`](../../../csrc/plugin/apply_rotary_emb.cu)
 
 CUDA 实现（host 入口）：
 
@@ -326,7 +326,7 @@ torch::Tensor apply_rotary_emb_meta(torch::Tensor& x, torch::Tensor& /*cos*/,
 
 ### 4.4 声明函数签名
 
-在 [`csrc/plugin/ops.h`](../../csrc/plugin/ops.h) 中补充声明，**包含 CUDA 实现和 Meta impl 两个签名**：
+在 [`csrc/plugin/ops.h`](../../../csrc/plugin/ops.h) 中补充声明，**包含 CUDA 实现和 Meta impl 两个签名**：
 
 ```cpp
 namespace vllm_iluvatar {
@@ -343,7 +343,7 @@ torch::Tensor apply_rotary_emb_meta(torch::Tensor& x, torch::Tensor& cos,
 
 ### 4.5 注册 schema 与 dispatch
 
-在 [`csrc/torch_bindings.cpp`](../../csrc/torch_bindings.cpp) 中完成**三件事**（比 community 多一个 Meta 注册）：
+在 [`csrc/torch_bindings.cpp`](../../../csrc/torch_bindings.cpp) 中完成**三件事**（比 community 多一个 Meta 注册）：
 
 1. `ops.def(...)` 声明自定义 schema
 2. `ops.impl(...)` 绑定 CUDA 实现
@@ -373,7 +373,7 @@ TORCH_LIBRARY_IMPL_EXPAND(_C, Meta, ops) {
 
 具体做法：在 `vllm_iluvatar/model_executor/layers/` 下对应模块中编写 `@<CustomOp>.register_oot` 子类，重写 `forward_cuda`。
 
-参考：[`vllm_iluvatar/model_executor/layers/rotary_embedding/common.py`](../../vllm_iluvatar/model_executor/layers/rotary_embedding/common.py)
+参考：[`vllm_iluvatar/model_executor/layers/rotary_embedding/common.py`](../../../vllm_iluvatar/model_executor/layers/rotary_embedding/common.py)
 
 ```python
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
@@ -415,7 +415,7 @@ class IluApplyRotaryEmb(ApplyRotaryEmb):
 
 plugin 算子没有上游同名测试可以对齐，需自行设计参考实现和覆盖范围。
 
-**注意事项**：构造 `CustomOp` 需要活跃的 `VllmConfig` 上下文，使用 [`tests/conftest.py`](../../tests/conftest.py) 中的 `default_vllm_config` fixture 即可。
+**注意事项**：构造 `CustomOp` 需要活跃的 `VllmConfig` 上下文，使用 [`tests/conftest.py`](../../../tests/conftest.py) 中的 `default_vllm_config` fixture 即可。
 
 ---
 
@@ -429,27 +429,27 @@ plugin 算子没有上游同名测试可以对齐，需自行设计参考实现�
 | --- | --- | --- |
 | schema 来源 | 上游 vllm | `csrc/libtorch_stable/torch_bindings.cpp` |
 | 社区包装函数 | 上游 vllm | `vllm/_custom_ops.py` |
-| 内核实现（示例） | vllm-iluvatar | [`csrc/community/pos_encoding_kernels.cu`](../../csrc/community/pos_encoding_kernels.cu) |
-| 函数声明 | vllm-iluvatar | [`csrc/community/ops.h`](../../csrc/community/ops.h) |
-| 统一注册入口 | vllm-iluvatar | [`csrc/torch_bindings.cpp`](../../csrc/torch_bindings.cpp) |
-| 内核测试（示例） | vllm-iluvatar | [`tests/kernels/core/test_pos_encoding.py`](../../tests/kernels/core/test_pos_encoding.py) |
+| 内核实现（示例） | vllm-iluvatar | [`csrc/community/pos_encoding_kernels.cu`](../../../csrc/community/pos_encoding_kernels.cu) |
+| 函数声明 | vllm-iluvatar | [`csrc/community/ops.h`](../../../csrc/community/ops.h) |
+| 统一注册入口 | vllm-iluvatar | [`csrc/torch_bindings.cpp`](../../../csrc/torch_bindings.cpp) |
+| 内核测试（示例） | vllm-iluvatar | [`tests/kernels/core/test_pos_encoding.py`](../../../tests/kernels/core/test_pos_encoding.py) |
 
 **plugin 算子相关：**
 
 | 作用 | 所在仓库 | 文件 |
 | --- | --- | --- |
-| 内核实现 + Meta impl（示例） | vllm-iluvatar | [`csrc/plugin/apply_rotary_emb.cu`](../../csrc/plugin/apply_rotary_emb.cu) |
-| 函数声明 | vllm-iluvatar | [`csrc/plugin/ops.h`](../../csrc/plugin/ops.h) |
-| 统一注册入口 | vllm-iluvatar | [`csrc/torch_bindings.cpp`](../../csrc/torch_bindings.cpp) |
-| OOT override（示例） | vllm-iluvatar | [`vllm_iluvatar/model_executor/layers/rotary_embedding/common.py`](../../vllm_iluvatar/model_executor/layers/rotary_embedding/common.py) |
-| 内核测试（示例） | vllm-iluvatar | [`tests/kernels/core/test_apply_rotary_emb.py`](../../tests/kernels/core/test_apply_rotary_emb.py) |
+| 内核实现 + Meta impl（示例） | vllm-iluvatar | [`csrc/plugin/apply_rotary_emb.cu`](../../../csrc/plugin/apply_rotary_emb.cu) |
+| 函数声明 | vllm-iluvatar | [`csrc/plugin/ops.h`](../../../csrc/plugin/ops.h) |
+| 统一注册入口 | vllm-iluvatar | [`csrc/torch_bindings.cpp`](../../../csrc/torch_bindings.cpp) |
+| OOT override（示例） | vllm-iluvatar | [`vllm_iluvatar/model_executor/layers/rotary_embedding/common.py`](../../../vllm_iluvatar/model_executor/layers/rotary_embedding/common.py) |
+| 内核测试（示例） | vllm-iluvatar | [`tests/kernels/core/test_apply_rotary_emb.py`](../../../tests/kernels/core/test_apply_rotary_emb.py) |
 
 **共用：**
 
 | 作用 | 文件 |
 | --- | --- |
-| 构建 | [`CMakeLists.txt`](../../CMakeLists.txt) |
-| 注册宏 | [`csrc/core/registration.h`](../../csrc/core/registration.h) |
+| 构建 | [`CMakeLists.txt`](../../../CMakeLists.txt) |
+| 注册宏 | [`csrc/core/registration.h`](../../../csrc/core/registration.h) |
 
 ### 步骤速览
 

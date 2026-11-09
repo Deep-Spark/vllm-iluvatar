@@ -1,0 +1,8 @@
+/* vllm-iluvatar docs — custom styles.
+ * Keep this minimal; rely on Material defaults for the version dropdown and
+ * header behavior (Read the Docs provides native multi-version switching). */
+
+/* Make the current version label in the header stand out a little. */
+.md-version__current {
+  font-weight: 700;
+}

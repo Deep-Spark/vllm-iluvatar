@@ -2,8 +2,8 @@
 
 本仓库只包含 vLLM Iluvatar 插件。vLLM、CoreX PyTorch、Triton 和 ixformer
 由匹配的 CoreX 软件环境提供，源码不作为 Git 子模块随本仓库发布。
-版本要求见 [README](../../README.md#requirements) 和
-[version.json](../../version.json) 的 `dependencies`。
+版本要求见 [README](../../../README.md#requirements) 和
+[version.json](../../../version.json) 的 `dependencies`。
 
 ## 环境检查
 

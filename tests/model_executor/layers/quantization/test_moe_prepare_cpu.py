@@ -159,7 +159,8 @@ class Ops:
 
     def moe_grouped_topk(self, *args, **kwargs):
         self.calls.append("router_old")
-        return Tensor((3, 8), "fp32"), Tensor((3, 8), "int32")
+        scale = kwargs.get("routed_scaling_factor", 1.0)
+        return Tensor((3, 8), "fp32", value=scale), Tensor((3, 8), "int32")
 
     def moe_sigmoid_topk(self, *args, **kwargs):
         self.calls.append("router_native")
@@ -328,7 +329,9 @@ class MoECPU(unittest.TestCase):
                     ns = {
                         "torch": TORCH,
                         "ixff": ops,
-                        "get_ep_group": lambda: SimpleNamespace(rank=1, rank_in_group=0),
+                        "get_ep_group": lambda: SimpleNamespace(
+                            rank=1, rank_in_group=0
+                        ),
                         "unpad_tensor": lambda x, *a, **k: x,
                     }
                     fn = load(STD, "_apply_nn", ns, "IluMoEStandardExpertsW4A8NN")

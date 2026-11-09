@@ -37,7 +37,8 @@ def test_grouped_topk_calls_ixformer_and_applies_routed_scale(monkeypatch):
 
     def fake_grouped_topk(*args, **kwargs):
         calls.append((args, kwargs))
-        return raw_weights, raw_ids
+        scale = kwargs.get("routed_scaling_factor", 1.0)
+        return raw_weights * scale, raw_ids
 
     _install_fake_ixformer(monkeypatch, fake_grouped_topk)
     gating_output = torch.tensor([[0.1, 0.2, 0.3, 0.4]], dtype=torch.bfloat16)
@@ -60,7 +61,7 @@ def test_grouped_topk_calls_ixformer_and_applies_routed_scale(monkeypatch):
     args, kwargs = calls[0]
     assert args[:5] == (gating_output, 2, 2, 1, "sigmoid")
     assert args[5].dtype is torch.bfloat16
-    assert kwargs == {"renormalize": True}
+    assert kwargs == {"renormalize": True, "routed_scaling_factor": 3.0}
 
 
 def test_grouped_topk_patch_rebinds_module_function_and_new_custom_op():
@@ -94,9 +95,7 @@ _FUSION_REASON = _requires_ivcore30_fusion() or ""
         pytest.param(torch.float16),
         pytest.param(
             torch.float32,
-            marks=pytest.mark.skipif(
-                _FUSION_REASON != "", reason=_FUSION_REASON
-            ),
+            marks=pytest.mark.skipif(_FUSION_REASON != "", reason=_FUSION_REASON),
         ),
     ],
 )

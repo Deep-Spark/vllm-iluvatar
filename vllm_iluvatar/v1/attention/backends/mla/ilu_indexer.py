@@ -783,7 +783,8 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 ]
             )
             .to(torch.int32)
-            .to(self.device)
+            .pin_memory()
+            .to(self.device, non_blocking=True)
         )
         max_context_len = int(seq_lens_cpu_chunk_comp.max().item())
         # cu_seqlens_q / max_q_len must match the sliced q rows passed to the
@@ -794,7 +795,11 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         full_q = int(prefill_query_start_loc[-1].item())
         sub_m = int(query_slice.stop - query_slice.start)
         if query_slice.start == 0 and query_slice.stop == full_q:
-            cu_seqlens_q = prefill_query_start_loc.to(torch.int32).to(self.device)
+            cu_seqlens_q = (
+                prefill_query_start_loc.to(torch.int32)
+                .pin_memory()
+                .to(self.device, non_blocking=True)
+            )
             max_q_len = (
                 (prefill_query_start_loc[1:] - prefill_query_start_loc[:-1])
                 .max()

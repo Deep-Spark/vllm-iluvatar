@@ -23,7 +23,7 @@ from vllm.models.glm5next.common.mtp import (
 from vllm.platforms import current_platform
 
 from .attention import IluGlm5NextMLAAttention, glm5next_topk_buffer_width
-from .model import IluGlm5NextDecoderLayer
+from .model import _GLM5_PACKED_MODULES_MAPPING, IluGlm5NextDecoderLayer
 
 
 class IluGlm5NextEhProj(nn.Module):
@@ -108,6 +108,8 @@ class IluGlm5NextMultiTokenPredictor(Glm5NextMultiTokenPredictor):
 
 
 class IluGlm5NextMTP(Glm5NextMTP, SupportsPP):
+    packed_modules_mapping = _GLM5_PACKED_MODULES_MAPPING
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super(Glm5NextMTP, self).__init__()
         self.config = vllm_config.model_config.hf_config

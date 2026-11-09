@@ -8,14 +8,17 @@ import os
 import ixformer.inference.functions as ixfops
 import torch
 from torch import nn
+from vllm import envs
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory, GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -57,57 +60,23 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 
+from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
+    IluFusedMoEEP,
+)
+from vllm_iluvatar.model_executor.layers.quantization.fp8 import IluFp8Config
+
+from . import mhc
 from .attention import IluGlm5NextMLAAttention, glm5next_topk_buffer_width
 from .kda import IluGlm5NextLinearAttention
 
+logger = init_logger(__name__)
+
 _ILU_GLM5_PROFILE = os.environ.get("ILU_GLM5_PROFILE")
 
-
-def _ilu_mhc_pre_v2(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    rms_eps: float,
-    hc_eps: float,
-    post_mult: float,
-    sinkhorn_repeat: int,
-    norm_weight: torch.Tensor | None,
-    norm_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    fn = fn.to(dtype=residual.dtype)
-    rms_weight = (
-        norm_weight.to(dtype=residual.dtype) if norm_weight is not None else None
-    )
-    fuse_norm = rms_weight is not None and ixfops.enable_hc_pre_norm_fusion(
-        *residual.shape, dtype=residual.dtype
-    )
-    post, comb, layer_input = ixfops.ds4_mhc_pre_v2(
-        residual=residual,
-        fn=fn,
-        hc_scale=hc_scale,
-        hc_base=hc_base,
-        rms_eps=rms_eps,
-        hc_pre_eps=hc_eps,
-        hc_sinkhorn_eps=hc_eps,
-        hc_post_mult_value=post_mult,
-        sinkhorn_repeat=sinkhorn_repeat,
-        need_rms=fuse_norm,
-        rms_weight=rms_weight if fuse_norm else None,
-        layer_rms_eps=norm_eps,
-    )
-    if rms_weight is not None and not fuse_norm:
-        layer_input = ixfops.rms_norm(layer_input, rms_weight, norm_eps)
-    return post, comb, layer_input
-
-
-def _ilu_mhc_post(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    post: torch.Tensor,
-    comb: torch.Tensor,
-) -> torch.Tensor:
-    return ixfops.mhc_post(x, residual, post, comb)
+_GLM5_PACKED_MODULES_MAPPING = {
+    "gate_up_proj": ["gate_proj", "up_proj"],
+    "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+}
 
 
 class IluGlm5NextMLP(Glm5NextMLP):
@@ -168,7 +137,7 @@ class IluGateLinear(GateLinear):
         return self._return(output)
 
 
-class IluGlm5NextMoE(Glm5NextMoE):
+class IluGlm5NextMoE(Glm5NextMoE, IluFusedMoEEP):
     def __init__(
         self,
         config: Glm5NextConfig,
@@ -189,7 +158,13 @@ class IluGlm5NextMoE(Glm5NextMoE):
         self.n_routed_experts: int = config.n_routed_experts
         self.n_shared_experts: int = config.n_shared_experts
 
-        self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+        if parallel_config.use_sequence_parallel_moe:
+            logger.warning_once(
+                "Outer sequence parallelism (use_sequence_parallel_moe) is "
+                "disabled for Glm5Next on Iluvatar; TP/DP/EP sharding is "
+                "handled inside the MoE runner."
+            )
+        self.is_sequence_parallel = False
 
         if config.hidden_act != "silu":
             raise ValueError(
@@ -265,6 +240,15 @@ class IluGlm5NextMoE(Glm5NextMoE):
             router_logits_dtype=self.gate.out_dtype,
             swiglu_limit=swiglu_limit,
         )
+        # Hybrid EP: prefill keeps the configured all2all backend while an
+        # all-ranks-decode-only step switches to DeepEP low latency. Opt-in via
+        # VLLM_ILU_DECODE_EP_BACKEND; init_ep() is a no-op without it.
+        self._ll_shared_dispatch_overlap_enabled = True
+        self.use_decode_ep = (
+            envs.VLLM_ILU_DECODE_EP_BACKEND == "deepep_low_latency"
+            and self._should_use_forward_dp_ep()
+        )
+        self.init_ep()
 
     def forward(
         self,
@@ -276,9 +260,12 @@ class IluGlm5NextMoE(Glm5NextMoE):
         if self.is_sequence_parallel and not already_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=hidden_states
-        )
+        if self.use_decode_ep and self._is_all_ranks_decode_only():
+            final_hidden_states = self.forward_dp_ep_deep_ep(hidden_states)
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=hidden_states
+            )
 
         if self.is_sequence_parallel and not already_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
@@ -316,7 +303,7 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
         self.mhc = config.mhc
         is_kda_layer = not is_mtp_layer and config.is_kda_layer(layer_idx)
         self.layer_kind = "kda" if is_kda_layer else "mla"
-        self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+        self.is_sequence_parallel = False
 
         if is_kda_layer:
             self.self_attn = IluGlm5NextLinearAttention(
@@ -327,6 +314,9 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
         else:
             assert config.v_head_dim is not None
             assert config.kv_lora_rank is not None
+            mla_quant_config = (
+                quant_config if isinstance(quant_config, IluFp8Config) else None
+            )
             self.self_attn = IluGlm5NextMLAAttention(
                 vllm_config=vllm_config,
                 config=config,
@@ -339,7 +329,7 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
                 kv_lora_rank=config.kv_lora_rank,
                 max_position_embeddings=config.max_position_embeddings,
                 cache_config=cache_config,
-                quant_config=None,
+                quant_config=mla_quant_config,
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
                 skip_rope=config.mla_nope,
@@ -370,7 +360,15 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self._mlp_is_moe = isinstance(self.mlp, Glm5NextMoE)
-        if self.is_sequence_parallel and not is_mtp_layer:
+        tp_size = get_tensor_model_parallel_world_size()
+        self._fuse_attn_allreduce_post = (
+            self.mhc
+            and not is_mtp_layer
+            and mhc.allreduce_mhc_post_supported(config, tp_size)
+        )
+        if (
+            self.is_sequence_parallel or self._fuse_attn_allreduce_post
+        ) and not is_mtp_layer:
             self.self_attn.o_proj.reduce_results = False
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -400,6 +398,16 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
             )
             self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
             self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+            self._hc_fn_io_cache: dict[str, torch.Tensor] = {}
+
+    def _get_hc_fn_io(
+        self, name: str, hc_fn: torch.Tensor, dtype: torch.dtype
+    ) -> torch.Tensor:
+        cached = self._hc_fn_io_cache.get(name)
+        if cached is None or cached.dtype != dtype:
+            cached = hc_fn.to(dtype).contiguous()
+            self._hc_fn_io_cache[name] = cached
+        return cached
 
     def forward(
         self,
@@ -438,7 +446,7 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
             residual = x
             post, comb, x = self.hc_pre(
                 x,
-                self.hc_attn_fn,
+                self._get_hc_fn_io("attn", self.hc_attn_fn, residual.dtype),
                 self.hc_attn_scale,
                 self.hc_attn_base,
                 norm_weight=self.input_layernorm.weight.data,
@@ -450,7 +458,7 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
                 residual,
                 post,
                 comb,
-                self.hc_attn_fn,
+                self._get_hc_fn_io("attn", self.hc_attn_fn, residual.dtype),
                 self.hc_attn_scale,
                 self.hc_attn_base,
                 norm_weight=self.input_layernorm.weight.data,
@@ -473,11 +481,12 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
             residual,
             post,
             comb,
-            self.hc_ffn_fn,
+            self._get_hc_fn_io("ffn", self.hc_ffn_fn, residual.dtype),
             self.hc_ffn_scale,
             self.hc_ffn_base,
             norm_weight=self.post_attention_layernorm.weight.data,
             norm_eps=self.post_attention_layernorm.variance_epsilon,
+            reduce_x=self._fuse_attn_allreduce_post,
         )
 
         if self._mlp_is_moe:
@@ -501,7 +510,7 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ):
-        return _ilu_mhc_pre_v2(
+        return mhc.mhc_pre(
             x,
             hc_fn,
             hc_scale,
@@ -510,8 +519,8 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
             self.hc_eps,
             self.mhc_post_mult_value,
             self.mhc_sinkhorn_iterations,
-            norm_weight,
-            norm_eps,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
         )
 
     def hc_post(
@@ -521,7 +530,7 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
         post: torch.Tensor,
         comb: torch.Tensor,
     ):
-        return _ilu_mhc_post(x, residual, post, comb)
+        return mhc.mhc_post(x, residual, post, comb)
 
     def hc_fused_post_pre(
         self,
@@ -534,12 +543,26 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
         hc_base: torch.Tensor,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
+        *,
+        reduce_x: bool = False,
     ):
-        residual = _ilu_mhc_post(x, residual, post, comb)
-        new_post, new_comb, layer_input = self.hc_pre(
-            residual, hc_fn, hc_scale, hc_base, norm_weight, norm_eps
+        return mhc.mhc_fused_post_pre(
+            x,
+            residual,
+            post,
+            comb,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.mhc_post_mult_value,
+            self.mhc_sinkhorn_iterations,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            reduce_x=reduce_x,
+            tp_group=get_tp_group().device_group if reduce_x else None,
         )
-        return residual, new_post, new_comb, layer_input
 
 
 class IluGlm5NextModel(Glm5NextModel):
@@ -599,9 +622,7 @@ class IluGlm5NextModel(Glm5NextModel):
         else:
             self.norm = PPMissingLayer()
 
-        self.is_sequence_parallel = (
-            vllm_config.parallel_config.use_sequence_parallel_moe
-        )
+        self.is_sequence_parallel = False
 
         world_size = get_tensor_model_parallel_world_size()
         assert config.num_attention_heads % world_size == 0, (
@@ -715,6 +736,8 @@ class IluGlm5NextModel(Glm5NextModel):
 
 
 class IluGlm5NextForCausalLM(Glm5NextForCausalLM):
+    packed_modules_mapping = _GLM5_PACKED_MODULES_MAPPING
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super(Glm5NextForCausalLM, self).__init__()
         self.model_config = vllm_config.model_config
@@ -764,6 +787,8 @@ class IluGlm5NextForCausalLM(Glm5NextForCausalLM):
     dummy_inputs=Glm4vDummyInputsBuilder,
 )
 class IluGlm5NextForConditionalGeneration(Glm5NextForConditionalGeneration):
+    packed_modules_mapping = _GLM5_PACKED_MODULES_MAPPING
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.make_empty_intermediate_tensors = (

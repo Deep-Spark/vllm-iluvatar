@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import ixformer.inference.functions as ixfops
 import torch
-import vllm.envs as envs
 from torch import nn
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -210,7 +209,7 @@ class IluGlm5NextLinearAttention(GatedDeltaNetAttention):
         g1 = self.f_b_proj(f_a)[0].view(shape)
         g2 = self.g_b_proj(g_a)[0].view(shape)
 
-        core_attn_out = torch.zeros_like(g1)
+        core_attn_out = torch.empty_like(g1)
 
         self._forward(
             qkv_proj_states=qkv,
@@ -264,6 +263,12 @@ class IluGlm5NextLinearAttention(GatedDeltaNetAttention):
 
         lower_bound = self.kda_lower_bound
         constant_caches = self.kv_cache
+
+        # The KDA kernels only write the rows their token indices cover, so the
+        # graph-padding tail is this function's to clear. ``core_attn_out`` is
+        # uninitialised on entry; ``o_norm`` reads all of it.
+        if num_actual_tokens < core_attn_out.shape[0]:
+            core_attn_out[num_actual_tokens:].zero_()
 
         qkv_proj_states = qkv_proj_states[:num_actual_tokens]
         g1 = g1[:num_actual_tokens]

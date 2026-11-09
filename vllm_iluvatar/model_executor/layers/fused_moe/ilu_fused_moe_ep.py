@@ -263,9 +263,8 @@ class IluFusedMoEEP:
     def _nvsm_dispatch_quant_kwargs(self) -> dict[str, object]:
         quant_method = self.experts._quant_method
         base_quant_method = getattr(quant_method, "old_quant_method", quant_method)
-        if (
-            base_quant_method.moe_quant_config is None
-            and hasattr(self.experts, "routed_experts")
+        if base_quant_method.moe_quant_config is None and hasattr(
+            self.experts, "routed_experts"
         ):
             self.experts.routed_experts._ensure_moe_quant_config_init()
         quant_config = base_quant_method.moe_quant_config
@@ -927,13 +926,6 @@ class IluFusedMoEEP:
             expert_topk_weights,
         ) = prepare_receiver()
 
-        # Join before routed GEMMs: shared compute overlaps only dispatch,
-        # and the original fused combine/AG/AR can consume shared_output.
-        if shared_stream is not None:
-            current_stream().wait_stream(shared_stream)
-            assert shared_output is not None
-            shared_output.record_stream(current_stream())
-
         # moe forward
         if expert_topk_ids is not None:
             topk_ids = expert_topk_ids
@@ -964,6 +956,14 @@ class IluFusedMoEEP:
             expert_tokens_meta=expert_tokens_meta,
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
+
+        # Join after routed GEMMs: shared compute on aux_stream overlaps both
+        # NVSM dispatch and routed expert GEMMs before combine/AG/AR consumes
+        # shared_output.
+        if shared_stream is not None:
+            current_stream().wait_stream(shared_stream)
+            assert shared_output is not None
+            shared_output.record_stream(current_stream())
 
         if pre_xform_trunc_size is not None:
             fused_output = fused_output[..., :pre_xform_trunc_size]

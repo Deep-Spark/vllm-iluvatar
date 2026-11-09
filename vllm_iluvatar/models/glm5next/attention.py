@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM5Next projections and complete Iluvatar Kpool indexing."""
 
+import os
+
 import ixformer.inference.functions as ixfops
 import torch
 import triton
@@ -33,6 +35,19 @@ from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
+
+from vllm_iluvatar.ilu_util.arch import is_ivcore30
+from vllm_iluvatar.model_executor.layers.quantization.fp8 import IluFp8Config
+
+
+def resolve_glm5next_indexer_kv_dtype(
+    quant_config: QuantizationConfig | None = None,
+) -> str:
+    if "VLLM_ILU_INDEXER_KV_DTYPE" in os.environ:
+        return envs.VLLM_ILU_INDEXER_KV_DTYPE
+    if is_ivcore30() and isinstance(quant_config, IluFp8Config):
+        return "fp8"
+    return "bf16"
 
 
 @triton.jit
@@ -135,8 +150,8 @@ class IluGlm5NextIndexerCache(DeepseekV32IndexerCache):
             page_size = max_page_size
         else:
             page_size = min_page_size
-        assert self._scale_fmt != "float32" or page_size in (64, 256), (
-            "IluGlm5NextIndexerCache: the int8 index cache needs a pool page of "
+        assert self._scale_fmt == "None" or page_size in (64, 256), (
+            "IluGlm5NextIndexerCache: the quantized index cache needs a pool page of "
             f"64 or 256, got {page_size} from block_size={spec.block_size} and "
             f"index_kpool={self._index_kpool}. Launch with --block-size "
             f"{64 * self._index_kpool} (or any multiple of it)."
@@ -248,11 +263,12 @@ class IluIndexer(nn.Module):
         self.softmax_scale = self.head_dim**-0.5
 
         self.quant_block_size = 128
-        if envs.VLLM_ILU_INDEXER_KV_DTYPE == "bf16":
+        indexer_kv_dtype = resolve_glm5next_indexer_kv_dtype(quant_config)
+        if indexer_kv_dtype == "bf16":
             self.k_cache_dtype = torch.bfloat16
             self.k_cache_head_dim = self.head_dim
             self.scale_fmt = "None"
-        elif envs.VLLM_ILU_INDEXER_KV_DTYPE == "int8":
+        elif indexer_kv_dtype == "int8":
             self.k_cache_dtype = torch.uint8
             self.k_cache_head_dim = self.head_dim + 4
             self.scale_fmt = "float32"
@@ -350,9 +366,7 @@ class IluIndexer(nn.Module):
             q_scale = q_scale.view(-1, self.n_head, 1)
             weights = self._fused_indexer_weight_scale(weights, q_scale, weight_scale)
         elif self.scale_fmt == "float32":
-            q, weights = fwht128_quant_int8_with_weights(
-                q, weights, weight_scale
-            )
+            q, weights = fwht128_quant_int8_with_weights(q, weights, weight_scale)
         else:
             weights = _scale_to_bf16(weights, weight_scale)
 
@@ -541,7 +555,7 @@ class IluGlm5NextMLAAttention(nn.Module):
             self.kv_lora_rank,
             mla_modules,
             cache_config,
-            quant_config,
+            None,
             prefix,
             skip_topk=False,
             fuse_qkv_rmsnorm=True,

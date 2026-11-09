@@ -79,7 +79,6 @@ def grouped_topk(
         scoring_func,
         e_score_correction_bias,
         renormalize=renormalize,
+        routed_scaling_factor=routed_scaling_factor,
     )
-    if routed_scaling_factor != 1.0:
-        topk_weights = topk_weights * routed_scaling_factor
     return topk_weights, topk_ids

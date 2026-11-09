@@ -262,6 +262,25 @@ def _make_iluvatar_platform():
             )
 
         @classmethod
+        def _get_indexer_block_alignment(cls, vllm_config) -> int | None:
+            index_kpool = getattr(
+                vllm_config.model_config.hf_text_config, "index_kpool", None
+            )
+            if index_kpool and index_kpool > 1:
+                from vllm_iluvatar.models.glm5next.attention import (
+                    resolve_glm5next_indexer_kv_dtype,
+                )
+
+                if (
+                    resolve_glm5next_indexer_kv_dtype(vllm_config.quant_config)
+                    != "bf16"
+                ):
+                    from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
+
+                    return index_kpool * max(PAGED_MQA_PAGE_SIZES)
+            return super()._get_indexer_block_alignment(vllm_config)
+
+        @classmethod
         def check_and_update_config(cls, vllm_config) -> None:
             model_config = getattr(vllm_config, "model_config", None)
             cache_config = getattr(vllm_config, "cache_config", None)

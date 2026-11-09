@@ -218,6 +218,8 @@ if TYPE_CHECKING:
     VLLM_ILU_INDEXER_KV_DTYPE: str = "bf16"
     VLLM_ILU_GLM5NEXT_MLA_POOL4_DECODE: bool = True
     VLLM_ILU_GLM5NEXT_GATHER_BEFORE_GATE: bool = True
+    VLLM_ILU_GLM5_MHC_FUSE_REDUCTIONS: bool = True
+    VLLM_ILU_GLM5_ALLREDUCE_MHC_POST: bool = True
     VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP: bool = False
     VLLM_ILU_MOE_AG_SHARED_OVERLAP: bool = False
     VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP: bool = True
@@ -350,6 +352,12 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # gate-then-dispatch path.
     "VLLM_ILU_GLM5NEXT_GATHER_BEFORE_GATE": _bool_reader(
         "VLLM_ILU_GLM5NEXT_GATHER_BEFORE_GATE", "1"
+    ),
+    "VLLM_ILU_GLM5_MHC_FUSE_REDUCTIONS": _bool_reader(
+        "VLLM_ILU_GLM5_MHC_FUSE_REDUCTIONS", "1"
+    ),
+    "VLLM_ILU_GLM5_ALLREDUCE_MHC_POST": _bool_reader(
+        "VLLM_ILU_GLM5_ALLREDUCE_MHC_POST", "1"
     ),
     "VLLM_ILU_INDEXER_KV_DTYPE": lambda: (
         os.environ.get("VLLM_ILU_INDEXER_KV_DTYPE", "bf16").strip().lower()

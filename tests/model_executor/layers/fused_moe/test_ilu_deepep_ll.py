@@ -272,9 +272,9 @@ def test_glm_ll_shared_expert_overlaps_dispatch_when_enabled(
             "dispatch",
             "dispatch_hook",
             "dispatch_receiver",
+            "routed",
             "main_wait_shared",
             "record_shared_output",
-            "routed",
             "finalize",
         ]
     else:

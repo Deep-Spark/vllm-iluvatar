@@ -111,7 +111,23 @@ class IluMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 ],
                 dim=1,
             )
-            q_c = self.q_a_layernorm(q_c)
+            if (
+                self.fuse_qkv_rmsnorm
+                and self.q_a_layernorm.variance_epsilon
+                == self.kv_a_layernorm.variance_epsilon
+            ):
+                from vllm_iluvatar.model_executor.layers.layernorm import rms_norm_qk
+
+                q_c, kv_c_normed = rms_norm_qk(
+                    q_c,
+                    kv_c,
+                    self.q_a_layernorm.weight.data,
+                    self.kv_a_layernorm.weight.data,
+                    self.q_a_layernorm.variance_epsilon,
+                )
+            else:
+                q_c = self.q_a_layernorm(q_c)
+                kv_c_normed = self.kv_a_layernorm(kv_c)
             q_proj_layer = self.q_b_proj
             q_proj_input = q_c
         else:
@@ -128,7 +144,7 @@ class IluMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             kv_c, k_pe = kv_lora.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=1
             )
-        kv_c_normed = self.kv_a_layernorm(kv_c)
+            kv_c_normed = self.kv_a_layernorm(kv_c)
         q = q_proj_layer(q_proj_input)[0]
         heads = self.num_heads
         if self.dcp_q_replicate:

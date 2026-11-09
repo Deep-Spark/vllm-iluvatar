@@ -40,6 +40,9 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 )
 from vllm.model_executor.utils import set_weight_attrs
 
+from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+    ixmm_moe,
+)
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_decode_metadata import (
     _ensure_cuda_graph_safe_dispatch,
     _is_only_decode,
@@ -138,6 +141,7 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         ilu_params: dict[str, Any] | None = None,
     ):
         super().__init__(moe)
+        self._ixmm_layer_name = layer_name
         ilu_params = ilu_params or {}
         self.has_bias = self.moe.has_bias
         self.weight_quant = weight_quant
@@ -588,6 +592,8 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 layer.w2_weight,
             )
 
+        ixmm_moe.prepare(self, layer)
+
     @torch.no_grad()
     def _repack_loaded_weights_to_nn(self, layer: torch.nn.Module) -> None:
         """Switch real TN checkpoint bytes to ixformer's packed NN layout."""
@@ -789,6 +795,19 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         shared_experts_input: torch.Tensor | None,
         run_decode: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if (
+            ixmm_moe.enabled()
+            and ixmm_moe.state_for(layer.w13_weight, layer.w2_weight) is not None
+        ):
+            return ixmm_moe.apply_monolithic(
+                self,
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                shared_experts_input,
+                _get_ilu_output_scale(layer),
+            )
         ep_rank = layer.moe_config.ep_rank
         start_eid = ep_rank * layer.local_num_experts
         end_eid = min(

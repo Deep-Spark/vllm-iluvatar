@@ -26,6 +26,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
 )
 
+from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+    ixmm_moe,
+)
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.ilu_moe_standard_experts import (
     BaseStandardExperts,
 )
@@ -102,6 +105,25 @@ class IluMoEStandardExpertsW4A8(BaseStandardExperts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None = None,
         apply_router_weight_on_input: bool = False,
     ):
+        if ixmm_moe.enabled() and ixmm_moe.state_for(w1, w2) is not None:
+            return ixmm_moe.apply_standard(
+                self,
+                output,
+                hidden_states,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                activation,
+                global_num_experts,
+                expert_map,
+                a1q_scale,
+                a2_scale,
+                workspace13,
+                workspace2,
+                expert_tokens_meta,
+                apply_router_weight_on_input,
+            )
         assert self.local_num_experts is not None
 
         ep_rank = get_ep_group().rank

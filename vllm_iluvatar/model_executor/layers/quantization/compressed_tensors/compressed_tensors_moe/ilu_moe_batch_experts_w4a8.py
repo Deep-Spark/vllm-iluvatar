@@ -19,6 +19,9 @@ import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe import MoEActivation
 
+from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+    ixmm_moe,
+)
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.ilu_moe_batch_experts import (
     MOE_ALGO,
     BaseBatchExperts,
@@ -71,6 +74,8 @@ class IluMoEBatchedExpertsW4A8(BaseBatchExperts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None = None,
         apply_router_weight_on_input: bool = False,
     ):
+        if ixmm_moe.enabled():
+            ixmm_moe.reject_unhandled(w1, w2)
         del (
             topk_weights,
             topk_ids,
@@ -161,6 +166,10 @@ class IluMoEBatchedExpertsW4A8(BaseBatchExperts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None = None,
         apply_router_weight_on_input: bool = False,
     ):
+        if ixmm_moe.enabled() and ixmm_moe.decode(
+            self, output, hidden_states, w1, w2, a1q_scale, expert_tokens_meta
+        ):
+            return output
         del global_num_experts, expert_map, a2_scale, workspace13, workspace2
 
         assert topk_weights.size() == topk_ids.size(), "topk shape mismatch"
@@ -300,6 +309,8 @@ class IluMoEBatchedExpertsW4A8(BaseBatchExperts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None = None,
         apply_router_weight_on_input: bool = False,
     ):
+        if ixmm_moe.enabled():
+            ixmm_moe.reject_unhandled(w1, w2)
         assert topk_weights.size() == topk_ids.size(), "topk shape mismatch"
         assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
         assert w1.stride(-1) == 1, "Stride of last dimension must be 1"

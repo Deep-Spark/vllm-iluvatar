@@ -7,10 +7,6 @@ import ixformer.inference.functions as ixfops
 import torch
 from ixformer.inference.functions.models import deepseek_v41 as ixf_mhc
 
-from vllm_iluvatar import envs
-
-_FUSE_REDUCTIONS = envs.VLLM_ILU_GLM5_MHC_FUSE_REDUCTIONS
-_ALLREDUCE_MHC_POST = envs.VLLM_ILU_GLM5_ALLREDUCE_MHC_POST
 _PRE_V2_WORKSPACES: dict[torch.device, torch.Tensor] = {}
 
 
@@ -25,8 +21,7 @@ def _get_pre_v2_workspace(device: torch.device) -> torch.Tensor:
 def allreduce_mhc_post_supported(config, tp_size: int) -> bool:
     """Whether ``allreduce_mhc_post_with_sqrsum`` can fuse attention TP AllReduce + MHC post."""
     return (
-        _ALLREDUCE_MHC_POST
-        and tp_size in (2, 4, 8)
+        tp_size in (2, 4, 8)
         and getattr(config, "hidden_size", None) in (4096, 5120, 7168)
         and getattr(config, "mhc_num_residual_streams", None) == 4
     )
@@ -70,7 +65,7 @@ def mhc_pre(
             None,
             norm_weight,
             norm_eps,
-            fuse_reductions=_FUSE_REDUCTIONS,
+            fuse_reductions=True,
         )
         return post, comb, layer_input
 
@@ -123,7 +118,7 @@ def mhc_post_with_sqrsum(
     res_c = residual.contiguous()
     post_c = post.contiguous()
     comb_c = comb.contiguous()
-    if _FUSE_REDUCTIONS and x_c.shape[0] <= 16:
+    if x_c.shape[0] <= 16:
         return ixf_mhc.mhc_post_partials(x_c, res_c, post_c, comb_c)
     return ixf_mhc.mhc_post_with_sqrsum(x_c, res_c, post_c, comb_c)
 

@@ -70,18 +70,18 @@ from vllm_iluvatar.models.deepseek_v41.compressed_kv_restore import (
     prefill_validity_family,
     union_validity,
 )
-from vllm_iluvatar.models.deepseek_v41.query_quant import (
-    QueryActivation,
-    can_fuse_query_quant,
-    fused_query_norm,
-    query_inputs_are_compatible,
-)
 from vllm_iluvatar.models.deepseek_v41.compressor import (
     IluDeepseekCompressor,
 )
 from vllm_iluvatar.models.deepseek_v41.indexer_kv import (
     SPLIT_INDEXER_FORMAT,
     indexer_kv_layout,
+)
+from vllm_iluvatar.models.deepseek_v41.query_quant import (
+    QueryActivation,
+    can_fuse_query_quant,
+    fused_query_norm,
+    query_inputs_are_compatible,
 )
 from vllm_iluvatar.models.deepseek_v41.rope import apply_rope
 from vllm_iluvatar.models.deepseek_v41.sparse_mla import (

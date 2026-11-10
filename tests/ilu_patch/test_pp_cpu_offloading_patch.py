@@ -83,10 +83,16 @@ def test_direct_and_multi_connector_detection() -> None:
     assert not model_offloading._has_native_offloading(nixl_only)
 
 
+@pytest.mark.parametrize("empty_stage", [False, True])
 def test_nonuniform_pp_geometry_is_attached_to_every_worker(
     monkeypatch,
+    empty_stage,
 ) -> None:
     configs = [_kv_config(10, 1000), _kv_config(10, 3000)]
+    if empty_stage:
+        configs[0].kv_cache_groups = [SimpleNamespace(layer_names=[])]
+        configs[0].hisparse_host_num_blocks = None
+        configs[0].prefix_cacheable_group_ids = ()
     monkeypatch.setattr(
         kv_impl,
         "_ORIGINAL_GET_CONFIGS",
@@ -99,9 +105,10 @@ def test_nonuniform_pp_geometry_is_attached_to_every_worker(
         [1, 1],
     )
 
+    expected = (0, 300) if empty_stage else (100, 300)
     assert result is configs
     assert all(
-        config._ilu_offload_worker_bytes_by_rank == (100, 300) for config in configs
+        config._ilu_offload_worker_bytes_by_rank == expected for config in configs
     )
 
 
@@ -317,6 +324,30 @@ def test_nonuniform_pp_worker_uses_private_rank_local_cpu_storage(
         num_cpu_chunks=17,
         mmap_region=None,
     )
+
+
+def test_zero_byte_rank_acknowledges_offload_jobs() -> None:
+    from vllm_iluvatar.v1.worker.empty_offloading import EmptyOffloadingWorker
+
+    spec = SimpleNamespace(
+        _ilu_nonuniform_pp_private=True,
+        num_chunks=17,
+        cpu_page_size_per_worker=0,
+        kv_bytes_per_chunk=4096,
+        config=SimpleNamespace(
+            parallel=SimpleNamespace(rank=0),
+            _ilu_offload_worker_bytes_by_rank=(0, 1536),
+        ),
+    )
+    caches = SimpleNamespace(tensors=[], group_data_refs=[[]])
+
+    worker = spec_impl._ilu_create_cpu_offloading_worker(spec, caches)
+
+    assert isinstance(worker, EmptyOffloadingWorker)
+    assert worker.submit_store(7, MagicMock(), MagicMock())
+    worker.wait({7})
+    (result,) = worker.get_finished()
+    assert result.job_id == 7 and result.success
 
 
 def test_local_offloading_ignores_pp_handshake_without_state() -> None:

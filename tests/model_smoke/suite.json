@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "owner": "iluvatar-aiac-llmfp-inference",
+  "checked_date": "2026-11-10",
+  "runtime_family": "vLLM 0.31.0 / CoreX 5.0.1 / ivcore11",
+  "source_modelzoo_commit": "8dabf9b3022fde16a3398582729f2549affda5c3",
+  "weight_policy": "Pinned ModelHub files copied and SHA256-verified once, then read-only local /opt/ci-models. Never load from NFS or .incoming.",
+  "models": [
+    "qwen3-6-35b-a3b",
+    "qwen3-8-27b",
+    "deepseek-v4-flash",
+    "deepseek-v4-1-flash-1017",
+    "deepseek-r1",
+    "glm-5-3",
+    "glm-5-3-flash",
+    "step-3-5-flash",
+    "minimax-m3",
+    "hy4-preview",
+    "qwen3-8-flash-next"
+  ]
+}

@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "protocol": "Ten fixed questions, serial once and concurrency=4 once; no retries; 20/20 required.",
+  "cases": [
+    {
+      "id": "addition",
+      "prompt": "Compute 17 + 25.\nEnd your response with FINAL: followed by the numeric answer only. Put this final answer after any reasoning.",
+      "kind": "number",
+      "expected": "42"
+    },
+    {
+      "id": "subtraction",
+      "prompt": "计算 100 - 37。\nEnd your response with FINAL: followed by the numeric answer only. Put this final answer after any reasoning.",
+      "kind": "number",
+      "expected": "63"
+    },
+    {
+      "id": "multiply",
+      "prompt": "Compute 12 times 8.\nEnd your response with FINAL: followed by the numeric answer only. Put this final answer after any reasoning.",
+      "kind": "number",
+      "expected": "96"
+    },
+    {
+      "id": "divide",
+      "prompt": "Compute 81 divided by 9.\nEnd your response with FINAL: followed by the numeric answer only. Put this final answer after any reasoning.",
+      "kind": "number",
+      "expected": "9"
+    },
+    {
+      "id": "decimal",
+      "prompt": "Compute 1.5 + 2.25.\nEnd your response with FINAL: followed by the numeric answer only. Put this final answer after any reasoning.",
+      "kind": "number",
+      "expected": "3.75"
+    },
+    {
+      "id": "word-problem",
+      "prompt": "A box has 8 red balls and 5 blue balls. Two red balls are removed. How many balls remain?\nEnd your response with FINAL: followed by the numeric answer only. Put this final answer after any reasoning.",
+      "kind": "number",
+      "expected": "11"
+    },
+    {
+      "id": "extract",
+      "prompt": "Extract the value of code from this record: name=Alice; code=ZX47; city=Paris.\nEnd your response with FINAL: followed by the extracted value only. Put this final answer after any reasoning.",
+      "kind": "text",
+      "expected": "ZX47"
+    },
+    {
+      "id": "chinese-extract",
+      "prompt": "记录：姓名=李明；城市=杭州；年龄=28。城市是什么？\nEnd your response with FINAL: followed by the extracted value only. Put this final answer after any reasoning.",
+      "kind": "text",
+      "expected": "杭州"
+    },
+    {
+      "id": "sort-json",
+      "prompt": "Sort these numbers in ascending order and return a JSON array: [8, 3, 5, 1, 9, 2, 7, 4, 10, 6].\nEnd your response with FINAL: followed by the answer as valid single-line JSON. Put this final answer after any reasoning.",
+      "kind": "json",
+      "expected": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10
+      ]
+    },
+    {
+      "id": "extract-json",
+      "prompt": "Input record: name=Alice; age=27; city=Rome.\nTask: Return a JSON object containing ONLY the keys \"name\" and \"age\" extracted from the input. Do not include \"city\" or any other key. The age must be a JSON number.\nEnd your response with FINAL: followed by the answer as valid single-line JSON. Put this final answer after any reasoning.",
+      "kind": "json",
+      "expected": {
+        "name": "Alice",
+        "age": 27
+      }
+    }
+  ]
+}

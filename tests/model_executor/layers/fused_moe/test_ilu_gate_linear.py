@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
 import torch
 from vllm.model_executor.custom_op import op_registry_oot
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
@@ -89,17 +90,24 @@ def test_gate_linear_set_out_dtype_keeps_community_flag_behavior():
     assert gate.allow_cublas_router_gemm is True
 
 
-def test_gate_linear_fallback_calls_replicated_linear_directly():
+def _fallback_gate(out_dtype):
     gate = IluGateLinear.__new__(IluGateLinear)
     torch.nn.Module.__init__(gate)
     gate.weight = torch.nn.Parameter(torch.eye(2, dtype=torch.float32))
     gate.input_size = 2
     gate.output_size = 2
-    gate.out_dtype = None
-    gate.allow_dsv3_router_gemm = False
+    gate.out_dtype = out_dtype
+    gate.is_unquantized = True
+    gate.return_bias = True
+    gate.allow_ll_bf16_gemm = False
     gate.allow_fp32_router_gemm = False
+    gate.allow_bf16x3_router_gemm = False
     gate.allow_cublas_router_gemm = False
+    return gate
 
+
+def test_gate_linear_fallback_delegates_to_community():
+    gate = _fallback_gate(None)
     x = torch.tensor([[1.0, 2.0]])
     calls = []
 
@@ -107,24 +115,14 @@ def test_gate_linear_fallback_calls_replicated_linear_directly():
         calls.append((self, input_))
         return "fallback-output", "fallback-bias"
 
-    with patch.object(
-        GateLinear,
-        "forward",
-        side_effect=AssertionError("GateLinear.forward should not be re-entered"),
-    ):
-        with patch.object(ReplicatedLinear, "forward", fake_replicated_forward):
-            assert gate.forward(x) == ("fallback-output", "fallback-bias")
+    with patch.object(ReplicatedLinear, "forward", fake_replicated_forward):
+        assert gate.forward(x) == ("fallback-output", "fallback-bias")
 
     assert calls == [(gate, x)]
 
 
 def test_gate_linear_forward_casts_input_and_output_dtype_for_fallback():
-    gate = IluGateLinear.__new__(IluGateLinear)
-    torch.nn.Module.__init__(gate)
-    gate.weight = torch.nn.Parameter(torch.eye(2, dtype=torch.float32))
-    gate.input_size = 2
-    gate.output_size = 2
-    gate.out_dtype = torch.bfloat16
+    gate = _fallback_gate(torch.bfloat16)
     x = torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)
 
     def fake_replicated_forward(self, input_):
@@ -137,3 +135,61 @@ def test_gate_linear_forward_casts_input_and_output_dtype_for_fallback():
 
     assert output_bias is None
     assert output.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("enabled,n,k,expected", [
+    (False, 384, 5120, "stock"),
+    (True, 384, 5120, "split"),
+    (True, 256, 5120, "stock"),
+    (True, 384, 3072, "stock"),
+])
+@pytest.mark.parametrize("return_bias", [False, True])
+def test_gate_linear_splitk_opt_in_and_shape_guard(enabled, n, k, expected, return_bias):
+    import ixformer.inference.functions as ixfops
+    from vllm_iluvatar.model_executor.layers.fused_moe.router import ilu_gate_linear
+
+    gate = _fallback_gate(torch.float32)
+    gate.weight = torch.nn.Parameter(torch.empty(n, k, dtype=torch.bfloat16))
+    gate.return_bias = return_bias
+    x = torch.empty(3, k, dtype=torch.bfloat16)
+    value = torch.zeros(3, n, dtype=torch.float32)
+    with patch.object(ilu_gate_linear, "_DS41_ROUTER_SPLITK", enabled):
+        with patch.object(ixfops, "gemm_bf16_bf16_fp32", return_value=value) as stock:
+            with patch.object(ixfops, "ds4_router_gate_gemm", return_value=value) as split:
+                result = gate(x)
+    if expected == "split":
+        split.assert_called_once_with(x, gate.weight)
+        stock.assert_not_called()
+    else:
+        stock.assert_called_once_with(x, gate.weight, format="TN")
+        split.assert_not_called()
+    if return_bias:
+        assert result[0] is value and result[1] is None
+    else:
+        assert result is value
+
+
+@pytest.mark.parametrize("quantized,bias,out_dtype", [
+    (True, False, torch.float32),
+    (False, True, torch.float32),
+    (False, False, torch.bfloat16),
+])
+def test_gate_linear_splitk_preserves_community_exclusions(quantized, bias, out_dtype):
+    import ixformer.inference.functions as ixfops
+    from vllm_iluvatar.model_executor.layers.fused_moe.router import ilu_gate_linear
+
+    gate = _fallback_gate(out_dtype)
+    gate.is_unquantized = not quantized
+    if quantized:
+        del gate.weight  # Quantized gates need not expose a plain weight.
+    else:
+        gate.weight = torch.nn.Parameter(torch.empty(384, 5120, dtype=torch.bfloat16))
+    gate.bias = torch.nn.Parameter(torch.zeros(384)) if bias else None
+    x = torch.empty(3, 5120, dtype=torch.bfloat16)
+    sentinel = object()
+    with patch.object(ilu_gate_linear, "_DS41_ROUTER_SPLITK", True):
+        with patch.object(ixfops, "ds4_router_gate_gemm") as split:
+            with patch.object(GateLinear, "forward", return_value=sentinel) as parent:
+                assert gate(x) is sentinel
+    split.assert_not_called()
+    parent.assert_called_once_with(x)

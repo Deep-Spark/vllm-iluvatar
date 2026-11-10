@@ -28,9 +28,17 @@ Remove   : when Iluvatar provides compatible router GEMM kernels for these
 
 from __future__ import annotations
 
+import os
+
 import torch
 from torch.nn.parameter import Parameter
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+
+logger = init_logger("vllm." + __name__)
+# Opt-in: FP32 split-K accumulation can change top-k routing relative to the
+# stock small-batch GEMV. Keep model quality validation separate from op error.
+_DS41_ROUTER_SPLITK = os.getenv("VLLM_ILU_DS41_ROUTER_SPLITK", "0") == "1"
 
 
 @GateLinear.register_oot()
@@ -62,7 +70,15 @@ class IluGateLinear(GateLinear):
         ):
             import ixformer.inference.functions as ixfops
 
-            output = ixfops.gemm_bf16_bf16_fp32(x, self.weight, format="TN")
+            if _DS41_ROUTER_SPLITK and self.weight.shape == (384, 5120):
+                logger.info_once(
+                    f"IX11_DS41_ROUTER_SPLITK_ACTIVE pid={os.getpid()}", scope="process"
+                )
+                # The existing operator handles large/unsupported input shapes
+                # through its stock fallback, and supports CUDA graph capture.
+                output = ixfops.ds4_router_gate_gemm(x, self.weight)
+            else:
+                output = ixfops.gemm_bf16_bf16_fp32(x, self.weight, format="TN")
             return self._return(output)
 
         return super().forward(x)

@@ -1,0 +1,51 @@
+{
+  "name": "Qwen3.6-35B-A3B",
+  "owner": "iluvatar-aiac-llmfp-inference",
+  "slug": "Qwen3.6-35B-A3B-iluvatar-compressed-tensors-v0",
+  "platform_version": "v4",
+  "revision": "8b94566f1e6be1e01832d5adbe92044b6874f1fb3dedbf165db09afc48ab0e33",
+  "weight_manifest": "weights/qwen3-6-35b-a3b.json",
+  "id": "qwen3-6-35b-a3b",
+  "logical_gpus": 4,
+  "parallel": {
+    "tp": 4,
+    "pp": 1,
+    "dp": 1
+  },
+  "serve_args": [
+    "--trust-remote-code",
+    "--dtype",
+    "bfloat16",
+    "--max-model-len",
+    "16384",
+    "--max-num-seqs",
+    "16",
+    "--max-num-batched-tokens",
+    "2048",
+    "--gpu-memory-utilization",
+    "0.90",
+    "--enable-prefix-caching",
+    "--compilation-config",
+    "{\"mode\": 0, \"cudagraph_mode\": \"FULL_DECODE_ONLY\", \"cudagraph_capture_sizes\": [1, 2, 4, 8, 16], \"max_cudagraph_capture_size\": 16}",
+    "--tensor-parallel-size",
+    "4",
+    "--pipeline-parallel-size",
+    "1",
+    "--data-parallel-size",
+    "1",
+    "--reasoning-parser",
+    "qwen3",
+    "--limit-mm-per-prompt",
+    "{\"image\":0,\"video\":0}"
+  ],
+  "environment": {
+    "VLLM_PLUGINS": "iluvatar",
+    "VLLM_FORCE_NCCL_COMM": "1",
+    "TORCH_NCCL_BLOCKING_WAIT": "1"
+  },
+  "check_speculative": false,
+  "ready_timeout_seconds": 1800,
+  "request_timeout_seconds": 300,
+  "max_tokens": 4096,
+  "request_options": {}
+}

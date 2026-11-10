@@ -1,0 +1,51 @@
+{
+  "name": "DeepSeek-V4-Flash",
+  "owner": "iluvatar-aiac-llmfp-inference",
+  "slug": "DeepSeek-V4-Flash-iluvatar-compressed-tensors-v0",
+  "platform_version": "v6",
+  "revision": "f56d02e3ce20d7145071728620825ef8a5cbd30baef27d8d62030f3555ba80d2",
+  "weight_manifest": "weights/deepseek-v4-flash.json",
+  "id": "deepseek-v4-flash",
+  "logical_gpus": 8,
+  "parallel": {
+    "tp": 8,
+    "pp": 1,
+    "dp": 1
+  },
+  "serve_args": [
+    "--trust-remote-code",
+    "--dtype",
+    "bfloat16",
+    "--max-model-len",
+    "16384",
+    "--max-num-seqs",
+    "16",
+    "--max-num-batched-tokens",
+    "2048",
+    "--gpu-memory-utilization",
+    "0.90",
+    "--enable-prefix-caching",
+    "--compilation-config",
+    "{\"mode\": 0, \"cudagraph_mode\": \"FULL_DECODE_ONLY\", \"cudagraph_capture_sizes\": [1, 2, 4, 8, 16], \"max_cudagraph_capture_size\": 16}",
+    "--tensor-parallel-size",
+    "8",
+    "--pipeline-parallel-size",
+    "1",
+    "--data-parallel-size",
+    "1",
+    "--tokenizer-mode",
+    "deepseek_v4",
+    "--reasoning-parser",
+    "deepseek_v4"
+  ],
+  "environment": {
+    "VLLM_PLUGINS": "iluvatar",
+    "VLLM_FORCE_NCCL_COMM": "1",
+    "TORCH_NCCL_BLOCKING_WAIT": "1"
+  },
+  "check_speculative": false,
+  "ready_timeout_seconds": 1800,
+  "request_timeout_seconds": 300,
+  "max_tokens": 4096,
+  "request_options": {}
+}

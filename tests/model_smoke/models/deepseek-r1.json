@@ -1,0 +1,52 @@
+{
+  "name": "DeepSeek-R1",
+  "owner": "iluvatar-aiac-llmfp-inference",
+  "slug": "DeepSeek-R1-iluvatar-compressed-tensors-v0",
+  "platform_version": "v3",
+  "revision": "a4a389819eb559f5a309247449520391d717451ebc59c8526dffe8787c702519",
+  "weight_manifest": "weights/deepseek-r1.json",
+  "id": "deepseek-r1",
+  "logical_gpus": 16,
+  "parallel": {
+    "tp": 4,
+    "pp": 4,
+    "dp": 1
+  },
+  "serve_args": [
+    "--trust-remote-code",
+    "--dtype",
+    "bfloat16",
+    "--max-model-len",
+    "16384",
+    "--max-num-seqs",
+    "16",
+    "--max-num-batched-tokens",
+    "2048",
+    "--gpu-memory-utilization",
+    "0.90",
+    "--enable-prefix-caching",
+    "--compilation-config",
+    "{\"mode\": 0, \"cudagraph_mode\": \"FULL_DECODE_ONLY\", \"cudagraph_capture_sizes\": [1, 2, 4, 8, 16], \"max_cudagraph_capture_size\": 16}",
+    "--tensor-parallel-size",
+    "4",
+    "--pipeline-parallel-size",
+    "4",
+    "--data-parallel-size",
+    "1",
+    "--reasoning-parser",
+    "deepseek_r1",
+    "--no-async-scheduling"
+  ],
+  "environment": {
+    "VLLM_PLUGINS": "iluvatar",
+    "VLLM_FORCE_NCCL_COMM": "1",
+    "TORCH_NCCL_BLOCKING_WAIT": "1",
+    "VLLM_USE_V2_MODEL_RUNNER": "1"
+  },
+  "check_speculative": false,
+  "ready_timeout_seconds": 1800,
+  "request_timeout_seconds": 300,
+  "max_tokens": 4096,
+  "request_options": {},
+  "prompt_suffix": "Finish reasoning with </think> before the final answer. In the final response write exactly one FINAL: answer and stop. Do not put FINAL inside reasoning or repeat it. 思考结束后先关闭思考区，最终回答只写一次 FINAL: 答案。"
+}

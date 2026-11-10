@@ -1,0 +1,65 @@
+{
+  "name": "GLM-5.3",
+  "owner": "iluvatar-aiac-llmfp-inference",
+  "slug": "GLM-5.3-iluvatar-compressed-tensors-v0",
+  "platform_version": "v1",
+  "revision": "6d1c657efa09e339b9bc768245ba56429c5a02f9e1a98c672d042fa019a212f1",
+  "weight_manifest": "weights/glm-5-3.json",
+  "id": "glm-5-3",
+  "logical_gpus": 16,
+  "parallel": {
+    "tp": 4,
+    "pp": 4,
+    "dp": 1
+  },
+  "serve_args": [
+    "--trust-remote-code",
+    "--dtype",
+    "bfloat16",
+    "--tensor-parallel-size",
+    "4",
+    "--pipeline-parallel-size",
+    "4",
+    "--distributed-executor-backend",
+    "mp",
+    "--async-scheduling",
+    "--speculative-config",
+    "{\"method\": \"mtp\", \"num_speculative_tokens\": 3, \"enforce_eager\": true}",
+    "--compilation-config",
+    "{\"mode\": 0, \"cudagraph_mode\": \"FULL_DECODE_ONLY\", \"cudagraph_capture_sizes\": [1, 2, 4, 8, 16, 32, 64, 128, 256], \"max_cudagraph_capture_size\": 256}",
+    "--kv-cache-dtype",
+    "auto",
+    "--max-model-len",
+    "16384",
+    "--max-num-batched-tokens",
+    "2048",
+    "--max-num-seqs",
+    "64",
+    "--gpu-memory-utilization",
+    "0.95",
+    "--enable-prefix-caching",
+    "--reasoning-parser",
+    "glm45"
+  ],
+  "environment": {
+    "VLLM_HOST_IP": "127.0.0.1",
+    "HF_HUB_OFFLINE": "1",
+    "TRANSFORMERS_OFFLINE": "1",
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "VLLM_USE_V2_MODEL_RUNNER": "1",
+    "PYTHONFAULTHANDLER": "1",
+    "PYTHONUNBUFFERED": "1",
+    "TORCH_SHOW_CPP_STACKTRACES": "1"
+  },
+  "check_speculative": true,
+  "ready_timeout_seconds": 1800,
+  "request_timeout_seconds": 300,
+  "max_tokens": 4096,
+  "request_options": {
+    "reasoning_effort": "max",
+    "chat_template_kwargs": {
+      "enable_thinking": true
+    }
+  }
+}

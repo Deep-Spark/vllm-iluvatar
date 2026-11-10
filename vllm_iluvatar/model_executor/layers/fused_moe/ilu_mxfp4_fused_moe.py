@@ -583,13 +583,17 @@ def _ilu_mxfp4_fused_experts_ixformer(
         "fallen back to the torch path"
     )
 
-    # --- 1) Routing: expert_map + F4F8 [E, 3] group_layout ----------------
-    #     Maps stay expert-major with -1 padding on unused slots. Layout is
-    #     [start, end, local_expert_id] sorted by descending token count so
-    #     ix30 F4F8 grouped GEMM schedules heavy experts first. Token storage
-    #     is not reordered.
+    # --- 1) Routing: expert_map + F4F8 group_layout ------------------------
+    #     Maps stay expert-major with -1 padding on unused slots.
+    #     [E, 3] = [start, end, expert_id] sorted by descending token count
+    #     (ixmm F4F8 schedules heavy experts first).
+    #     [E, 2] = [start, end] in natural expert-id order (no sort kernel).
+    #     For decode (M <= 256), each expert has 0–few tokens; skip sort. 
+    _skip_moe_sort = M <= 256
     group_layout = torch.empty(
-        (E_local, 3), dtype=torch.int32, device=hidden_states.device
+        (E_local, 2 if _skip_moe_sort else 3),
+        dtype=torch.int32,
+        device=hidden_states.device,
     )
     src_to_dst, dst_to_src, group_layout = (
         ixfops.moe_compute_token_index_ep_group_layout(

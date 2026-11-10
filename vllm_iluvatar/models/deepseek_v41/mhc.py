@@ -13,6 +13,10 @@ from vllm_iluvatar.ilu_util.arch import is_ivcore30
 _fuse_reductions = os.getenv("VLLM_ILU_V41_MHC_FUSE_REDUCTIONS", "1") != "0"
 # Fold the fused_wqa_wkv per-token fp8 activation quant into the pre-norm kernel.
 _fuse_fp8_norm = os.getenv("VLLM_ILU_V41_FUSE_FP8_NORM", "1") != "0"
+# Allow the fused fp8 epilogue for small batches (decode T<=16).
+_fuse_fp8_norm_small_batch = (
+    os.getenv("VLLM_ILU_V41_FP8_NORM_SMALL_BATCH", "1") != "0"
+)
 
 
 def _want_fused_fp8(
@@ -23,19 +27,24 @@ def _want_fused_fp8(
 ) -> bool:
     """Whether to emit the fp8 activation from the pre-norm kernel.
 
-    Only the non-fused folded-norm path carries the fp8 epilogue: the norm must
-    be folded (``layer_norm_weight``), and the op must take the T>16 dense-sqrsum
-    branch (the small-batch fused kernel has no fp8 variant, so decode stays on
-    the plain op and quantizes in the GEMM as before).
+    The fp8 epilogue folds per-token e4m3 dynamic quantisation of
+    ``layer_input`` into the pre-norm kernel, eliminating a separate
+    ``fp8_per_token_dynamic_scaled`` call.
 
-    The quant's only consumer is ``apply_block_scaled_mm``, which is ivcore30
-    only, so elsewhere the plain op runs and nothing asks for the fp8 epilogue.
+    Requirements:
+    - ivcore30 only (quant consumer is ``apply_block_scaled_mm``).
+    - ``layer_norm_weight`` must be provided (folded-norm path).
+    - ``sqrsum`` must be dense (1-D) — the fp8 kernel has no partial variant.
+
+    For T<=16 (decode), the non-fused fp8 kernel launches 1 block per token
+    which is equivalent to the fused small-batch path for T=1, so enabling it
+    saves one kernel launch with no regression.
     """
     if not is_ivcore30():
         return False
     if not (_fuse_fp8_norm and want_fp8 and layer_norm_weight is not None):
         return False
-    if _fuse_reductions and num_tokens <= 16:
+    if _fuse_reductions and num_tokens <= 16 and not _fuse_fp8_norm_small_batch:
         return False
     return not (sqrsum.dim() == 2 and sqrsum.shape[1] > 1)
 
@@ -111,7 +120,7 @@ def hc_pre_mixes(
             pre_out,
             fp8_h,
             h_scale,
-        ) = torch.ops._ixformer_C.mhc_pre_with_sqrsum_fp8(
+        ) = ixfops.mhc_pre_with_sqrsum_fp8(
             x.contiguous(),
             fn,
             hc_scale,

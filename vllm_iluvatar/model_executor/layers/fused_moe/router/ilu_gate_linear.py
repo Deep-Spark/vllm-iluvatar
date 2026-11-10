@@ -20,11 +20,17 @@ Remove   : when Iluvatar provides compatible router GEMM kernels for these
 
 from __future__ import annotations
 
+import os
+
 import torch
 from torch.nn.parameter import Parameter
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 
 from vllm_iluvatar.ilu_util.arch import IVCORE11, IVCORE30, cuda_arch
+
+_ROUTER_GATE_GEMM_N_THRESHOLD = int(
+    os.getenv("IXFORMER_ROUTER_GATE_GEMM_N_THRESHOLD", "256")
+)
 
 
 @GateLinear.register_oot()
@@ -99,7 +105,11 @@ class IluGateLinear(GateLinear):
         ):
             import ixformer.inference.functions as ixfops
 
-            if hasattr(ixfops, "router_gate_gemm"):
+            n = self.weight.shape[0]
+            if (
+                hasattr(ixfops, "router_gate_gemm")
+                and n > _ROUTER_GATE_GEMM_N_THRESHOLD
+            ):
                 output = ixfops.router_gate_gemm(x, self.weight)
             else:
                 output = ixfops.gemm_bf16_bf16_fp32(x, self.weight, format="TN")

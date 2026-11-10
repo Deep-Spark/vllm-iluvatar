@@ -335,8 +335,8 @@ class IluDSparkDeepseekV4Fp8ForCausalLM(nn.Module):
 
         indices = self.lm_head.shard_indices
         weight = markov_w2.weight[
-            indices.org_vocab_start_index
-            : indices.org_vocab_start_index + local_vocab_size
+            indices.org_vocab_start_index : indices.org_vocab_start_index
+            + local_vocab_size
         ]
         logits = F.linear(markov_embed, weight)
         if self.logits_processor.scale != 1.0:

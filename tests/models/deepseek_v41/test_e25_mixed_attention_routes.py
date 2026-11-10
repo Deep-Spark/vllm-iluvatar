@@ -86,6 +86,7 @@ def test_e25_suffix_uses_separate_prefill_and_old_decode_calls(old_tokens, monke
             *,
             prefill=False,
             layer_id=layer_id,
+            **kwargs,
         ):
             calls.append((layer_id, "prefill" if prefill else "decode", q.shape[0]))
             assert cache is owner.kv_cache

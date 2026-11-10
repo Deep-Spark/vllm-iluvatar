@@ -647,9 +647,7 @@ class IluFusedMoEEP:
             ixfd.reduce_scatter_tensor(
                 shard, fused_output, group=ep_comm.ixfd_group, async_op=True
             )
-            gathered = fused_output.new_empty(
-                (local_tokens, *fused_output.shape[1:])
-            )
+            gathered = fused_output.new_empty((local_tokens, *fused_output.shape[1:]))
             ixfd.all_gather_into_tensor(
                 gathered, shard, group=tp_comm.ixfd_group, async_op=True
             )

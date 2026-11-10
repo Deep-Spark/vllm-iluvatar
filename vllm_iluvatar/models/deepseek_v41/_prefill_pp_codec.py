@@ -1,4 +1,5 @@
 """Optional CQ prefill PP transport: symmetric INT8 blocks of 512 elements."""
+
 from math import prod
 
 import torch

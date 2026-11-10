@@ -1,4 +1,5 @@
 """Fused Q buffers must follow views of the current batch, never stale pointers."""
+
 from types import SimpleNamespace
 
 import pytest
@@ -41,8 +42,11 @@ def test_current_batch_slices(reuse, begin, end):
     obj, q, calls = reuse
     obj._sparse_fp8_pt_mla(q[begin:end], None, None, None, None, None, None)
     assert calls == [
-        ("attention", obj._q_fp8_pt[begin:end].data_ptr(),
-         obj._q_scale_pt[begin:end].data_ptr())
+        (
+            "attention",
+            obj._q_fp8_pt[begin:end].data_ptr(),
+            obj._q_scale_pt[begin:end].data_ptr(),
+        )
     ]
 
 

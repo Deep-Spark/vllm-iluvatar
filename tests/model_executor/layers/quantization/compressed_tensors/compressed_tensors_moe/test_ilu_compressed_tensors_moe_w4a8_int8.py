@@ -687,7 +687,7 @@ def test_nn_backend_selected_before_execution(
 
     monkeypatch.setenv("VLLM_ILU_MOE_W4A8_GEMV_PERF", "1")
 
-    monkeypatch.setattr(gemv.registry, "available_backends", lambda op: available)
+    monkeypatch.setattr(gemv.registry, "available_backends", lambda op, arch: available)
     seen = []
     monkeypatch.setattr(
         gemv.ixf, "moe_w4a8_group_gemv_perf_supported", lambda **kw: supported
@@ -713,7 +713,9 @@ def test_g1_g2_backend_decisions_are_independent_and_tn_uses_registry(monkeypatc
     monkeypatch.setenv("VLLM_ILU_MOE_W4A8_GEMV_PERF", "1")
 
     monkeypatch.setattr(
-        gemv.registry, "available_backends", lambda op: ["ixinfer", "ixformer_perf"]
+        gemv.registry,
+        "available_backends",
+        lambda op, arch: ["ixinfer", "ixformer_perf"],
     )
     monkeypatch.setattr(
         gemv.ixf,
@@ -735,7 +737,9 @@ def test_nn_vendor_rejection_is_not_retried(monkeypatch):
         ilu_w4a8_gemv as gemv,
     )
 
-    monkeypatch.setattr(gemv.registry, "available_backends", lambda op: ["ixinfer"])
+    monkeypatch.setattr(
+        gemv.registry, "available_backends", lambda op, arch: ["ixinfer"]
+    )
     calls = []
 
     def reject(**kw):
@@ -793,7 +797,9 @@ def test_batched_g1_g2_use_actual_separate_calls(monkeypatch):
         lambda **kw: (torch.zeros(4, 64, dtype=torch.int8), torch.ones(4)),
     )
     monkeypatch.setattr(
-        gemv.registry, "available_backends", lambda op: ["ixformer_perf", "ixinfer"]
+        gemv.registry,
+        "available_backends",
+        lambda op, arch: ["ixformer_perf", "ixinfer"],
     )
     monkeypatch.setattr(
         gemv.ixf, "moe_w4a8_group_gemv_perf_supported", lambda **kw: kw["weight"] is w1
@@ -838,7 +844,7 @@ def test_batched_g1_g2_use_actual_separate_calls(monkeypatch):
 
 
 @pytest.mark.parametrize("operand", ["weight", "w_scales", "output"])
-def test_nn_cross_device_rejects_before_vendor_selection(monkeypatch, operand):
+def test_nn_cross_device_inputs_are_not_sent_to_perf(monkeypatch, operand):
     from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 
     from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
@@ -868,13 +874,15 @@ def test_nn_cross_device_rejects_before_vendor_selection(monkeypatch, operand):
     kwargs[operand] = fake(original.shape, original.dtype, "cuda:1")
     assert not gemv.ixf.moe_w4a8_group_gemv_perf_supported(**kwargs)
     monkeypatch.setattr(
-        gemv.registry, "available_backends", lambda op: ["ixformer_perf", "ixinfer"]
+        gemv.registry,
+        "available_backends",
+        lambda op, arch: ["ixformer_perf", "ixinfer"],
     )
     execute = MagicMock()
     monkeypatch.setattr(gemv.ixf, "moe_w4a8_group_gemv", execute)
-    with pytest.raises(ValueError, match="must share the input device"):
-        gemv.w4a8_group_gemv(**kwargs)
-    execute.assert_not_called()
+    monkeypatch.setenv("VLLM_ILU_MOE_W4A8_GEMV_PERF", "1")
+    gemv.w4a8_group_gemv(**kwargs)
+    execute.assert_called_once_with(**kwargs, backend="ixinfer")
 
 
 @pytest.fixture(autouse=True)
@@ -883,8 +891,10 @@ def _clear_nn_perf_policy_cache():
         ilu_w4a8_gemv as gemv,
     )
 
+    gemv._nn_backends.cache_clear()
     gemv._nn_perf_enabled.cache_clear()
     yield
+    gemv._nn_backends.cache_clear()
     gemv._nn_perf_enabled.cache_clear()
 
 
@@ -907,7 +917,9 @@ def test_nn_perf_opt_in_defaults_off_and_preserves_arguments(
         monkeypatch.setenv(key, setting)
     assert ilu_envs._ILU_CANONICAL_ONLY_ENV_VARS[key]() is enabled
     monkeypatch.setattr(
-        gemv.registry, "available_backends", lambda op: ["ixformer_perf", "ixinfer"]
+        gemv.registry,
+        "available_backends",
+        lambda op, arch: ["ixformer_perf", "ixinfer"],
     )
     query = MagicMock(return_value=True)
     execute = MagicMock(return_value="output")
@@ -934,7 +946,7 @@ def test_disabled_perf_is_not_an_implicit_fallback_when_vendor_missing(monkeypat
 
     monkeypatch.delenv("VLLM_ILU_MOE_W4A8_GEMV_PERF", raising=False)
     monkeypatch.setattr(
-        gemv.registry, "available_backends", lambda op: ["ixformer_perf"]
+        gemv.registry, "available_backends", lambda op, arch: ["ixformer_perf"]
     )
     query, execute = MagicMock(), MagicMock()
     monkeypatch.setattr(gemv.ixf, "moe_w4a8_group_gemv_perf_supported", query)
@@ -953,9 +965,8 @@ def test_nn_perf_opt_in_is_frozen_after_first_call(monkeypatch, initial):
 
     key = "VLLM_ILU_MOE_W4A8_GEMV_PERF"
     monkeypatch.setenv(key, initial)
-    monkeypatch.setattr(
-        gemv.registry, "available_backends", lambda op: ["ixformer_perf", "ixinfer"]
-    )
+    available = MagicMock(return_value=["ixformer_perf", "ixinfer"])
+    monkeypatch.setattr(gemv.registry, "available_backends", available)
     monkeypatch.setattr(
         gemv.ixf, "moe_w4a8_group_gemv_perf_supported", lambda **kw: True
     )
@@ -969,3 +980,4 @@ def test_nn_perf_opt_in_is_frozen_after_first_call(monkeypatch, initial):
         expected,
         expected,
     ]
+    available.assert_called_once()

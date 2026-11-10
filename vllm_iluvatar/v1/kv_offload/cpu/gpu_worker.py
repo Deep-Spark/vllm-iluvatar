@@ -263,6 +263,15 @@ def _ilu_cpu_offloading_worker_init(
 
     from vllm.v1.kv_offload.cpu import gpu_worker
 
+    if _ORIGINAL_WORKER_INIT is not None:
+        from vllm_iluvatar.ilu_patch.general_patches.patch_pp_cpu_offloading import (
+            validate_private_worker_baseline,
+        )
+
+        validate_private_worker_baseline(
+            _ORIGINAL_WORKER_INIT, _ORIGINAL_WORKER_SHUTDOWN
+        )
+
     assert not canonical_layout
     self._mmap_region = None
     self._ilu_private_regions = []

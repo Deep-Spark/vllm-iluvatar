@@ -14,9 +14,7 @@ _fuse_reductions = os.getenv("VLLM_ILU_V41_MHC_FUSE_REDUCTIONS", "1") != "0"
 # Fold the fused_wqa_wkv per-token fp8 activation quant into the pre-norm kernel.
 _fuse_fp8_norm = os.getenv("VLLM_ILU_V41_FUSE_FP8_NORM", "1") != "0"
 # Allow the fused fp8 epilogue for small batches (decode T<=16).
-_fuse_fp8_norm_small_batch = (
-    os.getenv("VLLM_ILU_V41_FP8_NORM_SMALL_BATCH", "1") != "0"
-)
+_fuse_fp8_norm_small_batch = os.getenv("VLLM_ILU_V41_FP8_NORM_SMALL_BATCH", "1") != "0"
 
 
 def _want_fused_fp8(

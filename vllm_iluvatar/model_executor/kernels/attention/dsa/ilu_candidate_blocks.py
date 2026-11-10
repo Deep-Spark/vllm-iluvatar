@@ -144,8 +144,10 @@ def select_candidate_blocks(
         and topk_blocks == 2048
         and block_size == 8
     )
-    max_rows = rows if compact_decode else max(
-        1, min(_TOPK_ROWS, _TOPK_COL_BUDGET // max(1, nblocks))
+    max_rows = (
+        rows
+        if compact_decode
+        else max(1, min(_TOPK_ROWS, _TOPK_COL_BUDGET // max(1, nblocks)))
     )
     step = max(1, max_rows // row_repeat) * row_repeat
     for r0 in range(0, rows, step):
@@ -167,7 +169,9 @@ def select_candidate_blocks(
         while s < n:
             e = min(n, s + sub)
             try:
-                top = scores[s:e].topk(k, dim=-1, sorted=not (compact_decode or fast_prefill))
+                top = scores[s:e].topk(
+                    k, dim=-1, sorted=not (compact_decode or fast_prefill)
+                )
             except RuntimeError as err:
                 if "out of memory" in str(err).lower() and sub > 1:
                     with contextlib.suppress(Exception):

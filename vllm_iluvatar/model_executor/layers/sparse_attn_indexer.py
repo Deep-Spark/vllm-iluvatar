@@ -6,9 +6,9 @@ from __future__ import annotations
 
 import os
 
-from ixformer.cuda import cuda_arch
 import ixformer.inference.functions as ixfops
 import torch
+from ixformer.cuda import cuda_arch
 from ixformer.inference.functions.models.deepseek_v41.indexer.fp8.indexer_mqa_topk_fp8 import (
     indexer_mqa_topk_fp8,
 )
@@ -30,7 +30,6 @@ from vllm_iluvatar.model_executor.kernels.attention.dsa.ilu_candidate_blocks imp
 from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
     IluDeepseekV32IndexerMetadata,
 )
-
 
 logger = init_logger(__name__)
 
@@ -93,10 +92,6 @@ def _mqa_logits(*args, **kwargs):
     if kv_cache.dtype == torch.uint8:
         # The IxFormer facade registry owns FP8 backend selection.
         # ixinfer supports only 64/256-row pages. Ratio1's 128 rows use native.
-        kwargs.setdefault(
-            "backend",
-            os.environ.get("VLLM_ILU_V41_FP8_INDEXER_BACKEND", "ixformer_native"),
-        )
         if owned_logits is not None:
             kwargs["logits"] = owned_logits
         if previous_extent is not None:
@@ -231,10 +226,18 @@ def _indexer_logits_and_topk(
         and candidate_blocks.is_contiguous()
     ):
         logits = ixfops.dsa_indexer_mqa_logits_with_candidate_mask_fp8(
-            q, cu_seqlens_q, cu_seqlens_kv, kv_cache, block_table, weights,
-            candidate_blocks[token_start:token_end], logits=logits,
-            max_q_len=max_q_len, max_kv_len=max_kv_len,
-            max_context_len=max_context_len, valid_lens=valid_lens,
+            q,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            kv_cache,
+            block_table,
+            weights,
+            candidate_blocks[token_start:token_end],
+            logits=logits,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            max_context_len=max_context_len,
+            valid_lens=valid_lens,
             backend="ixformer_native",
         )
         logger.info_once(

@@ -39,17 +39,19 @@ def test_sequential_selection_and_fallbacks(
         assert base.stride(0) >= base.shape[1]
         assert bias.stride(0) >= bias.shape[1]
         fused_calls.append(base.shape[0])
-        return (base + bias)[:, :base.shape[1] - padding].argmax(-1) + start
+        return (base + bias)[:, : base.shape[1] - padding].argmax(-1) + start
 
     monkeypatch.setattr(impl, "add_bias_vocab_parallel_argmax", fused)
+
     def gather(logits, vocab, padding):
         gather_calls.append(logits.shape[0])
         return logits[:, :vocab]
 
     monkeypatch.setattr(impl, "gather_vocab_parallel_logits", gather)
     monkeypatch.setattr(
-        impl, "vocab_parallel_argmax",
-        lambda x, start, p: x[:, :x.shape[1] - p].argmax(-1) + start,
+        impl,
+        "vocab_parallel_argmax",
+        lambda x, start, p: x[:, : x.shape[1] - p].argmax(-1) + start,
     )
 
     def project(hidden):
@@ -77,9 +79,14 @@ def test_sequential_selection_and_fallbacks(
 
     def state(local):
         owner = SimpleNamespace(
-            _draft_topk=None, model=model, num_speculative_steps=5,
-            sample_indices=torch.arange(40), _d2t_scatter_index=None, vocab_size=31,
-            sample_idx_mapping=torch.arange(40), sample_pos=torch.arange(40),
+            _draft_topk=None,
+            model=model,
+            num_speculative_steps=5,
+            sample_indices=torch.arange(40),
+            _d2t_scatter_index=None,
+            vocab_size=31,
+            sample_idx_mapping=torch.arange(40),
+            sample_pos=torch.arange(40),
             use_confidence_head=confidence,
             input_buffers=SimpleNamespace(input_ids=torch.arange(8)),
             _anchor_idx=torch.arange(8),
@@ -119,5 +126,9 @@ def test_sequential_selection_and_fallbacks(
             else [4] * 5 + [1] * 5 + [7] * 5 + [8] * 5 + [4] * 5
         )
         assert fused_calls == expected
-    if full_logits or layout in ("strided_bias", "broadcast_base") or dtype == torch.float16:
+    if (
+        full_logits
+        or layout in ("strided_bias", "broadcast_base")
+        or dtype == torch.float16
+    ):
         assert not fused_calls

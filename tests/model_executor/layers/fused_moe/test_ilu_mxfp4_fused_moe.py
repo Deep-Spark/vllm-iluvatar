@@ -885,7 +885,8 @@ def test_ixformer_pipeline_wires_args_correctly(
     assert r_args[2] == w13_n.shape[0]
     assert r_kwargs["expert_map"] is None
     assert r_kwargs["group_layout"] is group_layout
-    assert tuple(r_kwargs["group_layout"].shape) == (w13_n.shape[0], 3)
+    # Decode-sized batches (M<=256) skip expert-count sort: layout is [E, 2].
+    assert tuple(r_kwargs["group_layout"].shape) == (w13_n.shape[0], 2)
 
     # 2) expand: dst_to_src + top_k forwarded.
     expand_call = fake_ixfops.moe_expand_input_dynamic_scaled_fp8
@@ -1091,4 +1092,4 @@ def test_ixformer_pipeline_forwards_expert_map_without_remapping(
     assert r_args[1] == 0
     assert r_args[2] == expert_count
     assert r_kwargs["expert_map"] is expert_map
-    assert tuple(r_kwargs["group_layout"].shape) == (expert_count, 3)
+    assert tuple(r_kwargs["group_layout"].shape) == (expert_count, 2)

@@ -1,8 +1,9 @@
 """Unsorted prefill top-k preserves causal membership, including tied scores."""
+
 import pytest
 import torch
-
 from conftest import requires_corex30
+
 from vllm_iluvatar.model_executor.kernels.attention.dsa import ilu_candidate_blocks
 
 pytestmark = requires_corex30
@@ -16,8 +17,9 @@ def test_prefill_membership(monkeypatch, rows, width, ties):
     if ties:
         logits.zero_()
         logits[:, 512:1024] = 1
-    edge = torch.tensor([0, 1, 7, 8, 16383, width - 1, width],
-                        device="cuda", dtype=torch.int32)
+    edge = torch.tensor(
+        [0, 1, 7, 8, 16383, width - 1, width], device="cuda", dtype=torch.int32
+    )
     ends = edge.repeat((rows + 6) // 7)[:rows]
     expected = torch.empty(rows, 2048, device="cuda", dtype=torch.int32)
     actual = torch.empty_like(expected)

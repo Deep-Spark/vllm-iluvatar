@@ -25,6 +25,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    model_parallel_is_initialized,
     tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
@@ -52,7 +53,10 @@ def _can_use_fused_markov(self: Any) -> bool:
         return False
     if self.use_local_argmax_reduction:
         return False
-    if get_tensor_model_parallel_world_size() != 1:
+    if (
+        not model_parallel_is_initialized()
+        or get_tensor_model_parallel_world_size() != 1
+    ):
         return False
     if not _draft_supports_local_logits(self.model):
         return False
@@ -394,7 +398,9 @@ def add_bias_vocab_parallel_argmax(
     add_argmax_pairs = import_module(
         "ixformer.inference.functions.ops.sampling.float.add_argmax"
     ).add_argmax_pairs
-    pairs = add_argmax_pairs(base, bias, vocab_start, base.shape[-1] - num_vocab_padding)
+    pairs = add_argmax_pairs(
+        base, bias, vocab_start, base.shape[-1] - num_vocab_padding
+    )
     tp_size = get_tensor_model_parallel_world_size()
     if tp_size == 1:
         return pairs[:, 1].to(torch.int64)

@@ -1244,7 +1244,10 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 )
             ):
                 from ._prefill_pp_codec import encode
-                tensors["hidden_states"], tensors["prefill_pp_scale"] = encode(hidden_states)
+
+                tensors["hidden_states"], tensors["prefill_pp_scale"] = encode(
+                    hidden_states
+                )
             if self.pp_plan.sends_kv:
                 assert self.main_kv_rows is not None
                 assert self.indexer_kv_rows is not None

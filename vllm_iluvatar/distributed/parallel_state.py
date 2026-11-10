@@ -336,6 +336,7 @@ def _ilu_irecv_tensor_dict_sync(
     if "prefill_pp_scale" in tensor_dict:
         assert all_gather_size == 1
         from vllm_iluvatar.models.deepseek_v41._prefill_pp_codec import decode
+
         tensor_dict["hidden_states"] = decode(
             tensor_dict["hidden_states"], tensor_dict.pop("prefill_pp_scale")
         )

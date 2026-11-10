@@ -766,11 +766,13 @@ class IluDeepseekV41Indexer(nn.Module):
         # fused_wqb_rope_fp8 supports both BF16 and FP8 per-channel weights.
         wq_b_w = self.wq_b.weight
         _has_buf = hasattr(self, "q_bf16_buffer")
-        _bf16_ok = (wq_b_w.dtype == qr.dtype
-                    and wq_b_w.dtype in (torch.bfloat16, torch.float16))
-        _fp8_ok = (wq_b_w.dtype == torch.float8_e4m3fn
-                   and (hasattr(self.wq_b, "weight_scale_inv")
-                        or hasattr(self.wq_b, "weight_scale")))
+        _bf16_ok = wq_b_w.dtype == qr.dtype and wq_b_w.dtype in (
+            torch.bfloat16,
+            torch.float16,
+        )
+        _fp8_ok = wq_b_w.dtype == torch.float8_e4m3fn and (
+            hasattr(self.wq_b, "weight_scale_inv") or hasattr(self.wq_b, "weight_scale")
+        )
         fused_mm_ok = _has_buf and (_bf16_ok or _fp8_ok)
 
         if (
@@ -785,8 +787,10 @@ class IluDeepseekV41Indexer(nn.Module):
             wq_b_scales = None
             if _fp8_ok:
                 wq_b_scales = getattr(
-                    self.wq_b, "weight_scale_inv",
-                    getattr(self.wq_b, "weight_scale", None))
+                    self.wq_b,
+                    "weight_scale_inv",
+                    getattr(self.wq_b, "weight_scale", None),
+                )
             ixfops.fused_wqb_rope_fp8(
                 qr,
                 wq_b_w,
@@ -874,6 +878,9 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
     compressed_kv_workspace = None
     main_kv_scale_rows = None
     main_scale_transfer_width = 0
+    # Stubs in unit tests use ``__new__`` and only fill fields they exercise.
+    kv_source_layer_id = None
+    index_source_layer_id = None
 
     backend_cls: ClassVar[type[AttentionBackend]] = IluDeepseekV4FlashMLABackend
     swa_backend_cls: ClassVar[type[AttentionBackend]] = (
@@ -1744,9 +1751,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 inverse=True,
             )
         else:
-            apply_rope(
-                attn_out.unsqueeze(0), positions, self.cos_sin, inverse=True
-            )
+            apply_rope(attn_out.unsqueeze(0), positions, self.cos_sin, inverse=True)
         return self._o_proj(attn_out)
 
     def _run_parallel_input_projections(
@@ -2190,12 +2195,13 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         return out, lens
 
     def _global_indices(self, local, req, table, block_size, valid, positions):
-        forward_context = get_forward_context()
         cache_key = None
+        forward_context = None
         if (
-            self.index_source_layer_id is not None
-            and self.kv_source_layer_id is not None
+            getattr(self, "index_source_layer_id", None) is not None
+            and getattr(self, "kv_source_layer_id", None) is not None
         ):
+            forward_context = get_forward_context()
             cache_key = (
                 "global_indices",
                 self.index_source_layer_id,
@@ -2644,6 +2650,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             from ixformer.inference.functions.ops.attn.flash_mla_sparse.float.flash_mla_sparse_with_kvcache import (
                 flash_mla_sparse_with_kvcache_supports_inv_rope,
             )
+
             if flash_mla_sparse_with_kvcache_supports_inv_rope(
                 positions=positions, cos_sin_cache=cos_sin_cache
             ):

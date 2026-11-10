@@ -62,21 +62,6 @@ from vllm_iluvatar.v1.attention.ilu_static_quant import (
 logger = init_logger(__name__)
 
 
-def _split_kv_cache_planes(
-    kv_cache: torch.Tensor,
-    head_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Split a layer KV view into HND key/value caches for ixformer FA.
-
-    Supports:
-    * plane-major ``[B, 2, H, N, hs]`` (ILU replane after allocate)
-    * interleaved LBHNC ``[B, H, N, C]`` with ``C = head_size + head_size_v``
-    """
-    if kv_cache.ndim == 5 and kv_cache.shape[1] == 2:
-        return kv_cache[:, 0], kv_cache[:, 1]
-    return kv_cache[..., :head_size], kv_cache[..., head_size:]
-
-
 def get_flash_attn_version(
     requires_alibi: bool = False,
     head_size: int | None = None,
@@ -902,11 +887,8 @@ class IluFlashAttentionImpl(AttentionImpl):
         if early_output is not None:
             return early_output
 
-        # v0.31 LBHNC allocates [B,H,N,C] (K|V packed). ILU init_kv_cache may
-        # replane to [B,2,H,N,hs] so token stride == head_size for ixformer
-        # flash_attn_with_kvcache. reshape_and_cache_flash expects HND
-        # [num_blocks, num_kv_heads, block_size, head_size] (block_size at dim 2).
-        key_cache, value_cache = _split_kv_cache_planes(kv_cache, self.head_size)
+        key_cache = kv_cache[..., : self.head_size]
+        value_cache = kv_cache[..., self.head_size :]
         if is_quantized_kv_cache(self.kv_cache_dtype):
             dtype = IluFlashAttentionBackend.get_fp8_dtype_for_flashattn(
                 self.kv_cache_dtype
@@ -1079,10 +1061,11 @@ class IluFlashAttentionImpl(AttentionImpl):
                         self.scale,
                         decode_output,
                     )
-                # The installed cuInfer binary predates packed token-stride
-                # support despite its newer header. Its correct varlen path
-                # remains available for features/layouts outside the new API.
-                elif self.head_size >= 512 or key_cache.stride(-2) != self.head_size:
+                # head_size >= 512 stays on varlen: the cuInfer kvcache path
+                # does not cover these shapes. The community interleaved LBHNC
+                # layout (token stride == 2 * head_size) is supported natively
+                # by the installed ixinfer build (verified by kernel probe).
+                elif self.head_size >= 512:
                     sliding_window_size = (
                         list(self.sliding_window)
                         if self.sliding_window is not None
@@ -1276,7 +1259,8 @@ class IluFlashAttentionImpl(AttentionImpl):
         fp8_query = torch.empty(query.shape, dtype=fp8_dtype, device=query.device)
         torch.ops._C.static_scaled_fp8_quant(fp8_query, query, query_scale)
 
-        key_cache, value_cache = _split_kv_cache_planes(kv_cache, self.head_size)
+        key_cache = kv_cache[..., : self.head_size]
+        value_cache = kv_cache[..., self.head_size :]
         key_cache = key_cache.view(fp8_dtype)
         value_cache = value_cache.view(fp8_dtype)
         if (
@@ -1684,8 +1668,9 @@ class IluFlashAttentionImpl(AttentionImpl):
 
         # vLLM 0.31 binds the same packed [P,Hkv,B,K|V] view used by
         # forward(). DFlash/DSpark precompute context through this standalone
-        # entry point; accept both interleaved LBHNC and plane-major views.
-        key_cache, value_cache = _split_kv_cache_planes(kv_cache, self.head_size)
+        # entry point; slice the interleaved LBHNC view into K and V.
+        key_cache = kv_cache[..., : self.head_size]
+        value_cache = kv_cache[..., self.head_size :]
         if self.is_fp8:
             dtype = IluFlashAttentionBackend.get_fp8_dtype_for_flashattn(
                 self.kv_cache_dtype

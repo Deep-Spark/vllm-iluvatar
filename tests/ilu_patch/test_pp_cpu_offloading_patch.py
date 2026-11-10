@@ -665,19 +665,25 @@ patch.attest_required_bindings()
     assert result.returncode == 0, result.stdout
 
 
-def test_worker_source_drift_fails_before_rebinding(monkeypatch):
-    from vllm.v1.core import kv_cache_utils
+@pytest.mark.parametrize("method", ["__init__", "shutdown"])
+def test_worker_source_drift_only_blocks_private_allocation(monkeypatch, method):
     from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 
-    original_planner = kv_cache_utils.get_kv_cache_configs
-    # Ensure a live community method is checked even if another test applied wiring.
-    original_init = gpu_impl._ORIGINAL_WORKER_INIT or CPUOffloadingWorker.__init__
-    monkeypatch.setattr(CPUOffloadingWorker, "__init__", original_init)
     monkeypatch.setenv("VLLM_ILU_PATCH_CHECK_FINGERPRINT", "1")
-    monkeypatch.setattr(patch_pp_cpu_offloading, "WORKER_INIT", "def changed(): pass")
-    with pytest.raises(RuntimeError, match="source changed"):
-        patch_pp_cpu_offloading._apply()
-    assert kv_cache_utils.get_kv_cache_configs is original_planner
+    snapshot = "WORKER_INIT" if method == "__init__" else "WORKER_SHUTDOWN"
+    monkeypatch.setattr(patch_pp_cpu_offloading, snapshot, "def changed(): pass")
+    patch_pp_cpu_offloading.validate_private_worker_baseline.cache_clear()
+    patch_pp_cpu_offloading._apply()
+    assert CPUOffloadingWorker.__init__ is gpu_impl._ilu_cpu_offloading_worker_init
+
+    original_init = MagicMock()
+    with monkeypatch.context() as shared:
+        shared.setattr(gpu_impl, "_ORIGINAL_WORKER_INIT", original_init)
+        CPUOffloadingWorker(object(), 1, 1, mmap_region=object())
+    original_init.assert_called_once()
+
+    with pytest.raises(RuntimeError, match=f"{method} source changed"):
+        CPUOffloadingWorker(object(), 1, 1)
 
 
 @pytest.mark.parametrize("paired", [False, True])

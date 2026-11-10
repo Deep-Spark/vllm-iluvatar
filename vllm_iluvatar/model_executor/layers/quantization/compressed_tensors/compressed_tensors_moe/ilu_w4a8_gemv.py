@@ -4,8 +4,7 @@
 from functools import cache
 
 import ixformer.inference.functions as ixf
-import torch
-from ixformer.inference.backend_registry import registry
+from ixformer.inference.backend_registry import current_cuda_arch, registry
 
 from vllm_iluvatar import envs
 
@@ -14,6 +13,11 @@ from vllm_iluvatar import envs
 def _nn_perf_enabled() -> bool:
     """Snapshot the worker-wide opt-in at first NN GEMV; restart to change it."""
     return envs.VLLM_ILU_MOE_W4A8_GEMV_PERF
+
+
+@cache
+def _nn_backends(arch: str | None) -> frozenset[str]:
+    return frozenset(registry.available_backends("moe_w4a8_group_gemv", arch))
 
 
 def w4a8_group_gemv(**kwargs):
@@ -29,7 +33,7 @@ def w4a8_group_gemv(**kwargs):
     """
     backend = None
     if kwargs.get("format", 0) == 0:
-        available = registry.available_backends("moe_w4a8_group_gemv")
+        available = _nn_backends(current_cuda_arch())
         if (
             _nn_perf_enabled()
             and "ixformer_perf" in available
@@ -37,21 +41,6 @@ def w4a8_group_gemv(**kwargs):
         ):
             backend = "ixformer_perf"
         elif "ixinfer" in available:
-            # A failed perf query may mean invalid cross-device operands,
-            # which the vendor bridge does not comprehensively validate.
-            owner = kwargs.get("input")
-            if isinstance(owner, torch.Tensor):
-                for name, tensor in kwargs.items():
-                    if (
-                        isinstance(tensor, torch.Tensor)
-                        and tensor.device != owner.device
-                    ):
-                        raise ValueError(
-                            f"NN W4A8 GEMV {name} must share the input device"
-                        )
-            # The vendor bridge supports NN bias/remapping and validates its
-            # shape/version/group contract before launching. It receives the
-            # original kwargs, including dst_to_src and the NN-packed weight.
             backend = "ixinfer"
         else:
             raise RuntimeError(

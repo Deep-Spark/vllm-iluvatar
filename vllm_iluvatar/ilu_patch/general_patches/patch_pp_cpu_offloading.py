@@ -10,13 +10,14 @@ How      : Lazy mirror-module binding; unchanged paths delegate to community.
 Scope    : Geometry adapters are model-specific; private worker storage is generic.
 Remove   : When community owns equivalent geometry and private-storage lifetime.
 Fingerprint: CPUOffloadingWorker.__init__ and shutdown copies are checked against
-             the verbatim community snapshots below before any binding changes.
+             the verbatim community snapshots below before private allocation.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+from functools import cache
 from multiprocessing import current_process
 
 from vllm_iluvatar.ilu_patch import general_patch as p
@@ -240,10 +241,42 @@ def _bind_offloading_handshake_noop() -> None:
     )
 
 
-def _apply() -> None:
+@cache
+def validate_private_worker_baseline(original_init, original_shutdown) -> None:
     import inspect
     from types import SimpleNamespace
 
+    from vllm_iluvatar.v1.kv_offload.cpu import gpu_worker as gpu_impl
+
+    for name, original, override, baseline in (
+        (
+            "__init__",
+            original_init,
+            gpu_impl._ilu_cpu_offloading_worker_init,
+            WORKER_INIT,
+        ),
+        (
+            "shutdown",
+            original_shutdown,
+            gpu_impl._ilu_cpu_offloading_worker_shutdown,
+            WORKER_SHUTDOWN,
+        ),
+    ):
+        p.check_fingerprint(
+            f"CPUOffloadingWorker.{name}",
+            inspect.getsource(original),
+            baseline,
+            resync_hint="Reconcile the private worker with the new community baseline.",
+        )
+        p.check_signatures(
+            SimpleNamespace(**{name: original}),
+            SimpleNamespace(**{name: override}),
+            [name],
+            strict=True,
+        )
+
+
+def _apply() -> None:
     from vllm.distributed.kv_transfer.kv_connector.v1 import offloading_connector
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading import config
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
@@ -258,33 +291,6 @@ def _apply() -> None:
     import vllm_iluvatar.v1.core.kv_cache_utils as kv_impl
     import vllm_iluvatar.v1.kv_offload.cpu.gpu_worker as gpu_impl
     import vllm_iluvatar.v1.kv_offload.cpu.spec as spec_impl
-
-    if CPUOffloadingWorker.__init__ is not gpu_impl._ilu_cpu_offloading_worker_init:
-        p.check_fingerprint(
-            "CPUOffloadingWorker.__init__",
-            inspect.getsource(CPUOffloadingWorker.__init__),
-            WORKER_INIT,
-            resync_hint="Reconcile the private worker with the new community baseline.",
-        )
-        p.check_signatures(
-            SimpleNamespace(__init__=CPUOffloadingWorker.__init__),
-            SimpleNamespace(__init__=gpu_impl._ilu_cpu_offloading_worker_init),
-            ["__init__"],
-            strict=True,
-        )
-    if CPUOffloadingWorker.shutdown is not gpu_impl._ilu_cpu_offloading_worker_shutdown:
-        p.check_fingerprint(
-            "CPUOffloadingWorker.shutdown",
-            inspect.getsource(CPUOffloadingWorker.shutdown),
-            WORKER_SHUTDOWN,
-            resync_hint="Reconcile the private worker with the new community baseline.",
-        )
-        p.check_signatures(
-            SimpleNamespace(shutdown=CPUOffloadingWorker.shutdown),
-            SimpleNamespace(shutdown=gpu_impl._ilu_cpu_offloading_worker_shutdown),
-            ["shutdown"],
-            strict=True,
-        )
 
     current_get_configs = kv_cache_utils.get_kv_cache_configs
     if current_get_configs is not kv_impl._ilu_get_kv_cache_configs:

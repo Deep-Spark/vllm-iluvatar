@@ -130,7 +130,9 @@ warnings.filterwarnings(
     "ignore", message=".*bgemm_internal_cublaslt error.*", category=UserWarning
 )
 
+# Fold Q E4M3 quant into qkv_rope_fp8_pt_insert so decode (and prefill)
 _PREFILL_FUSED_Q = os.environ.get("VLLM_ILU_V41_PREFILL_FUSED_Q", "0") == "1"
+_FUSED_INSERT_Q_QUANT = os.environ.get("VLLM_ILU_V41_FUSED_Q_QUANT", "1") == "1"
 
 _INDEX_TILE = 256
 _PACKED_MLA_HEADS = (1, 8, 16, 32, 64, 128)
@@ -1696,13 +1698,22 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 )
             return self.wo_b(grouped.flatten(1))
         fused = getattr(self, "_inv_rope_fused_tokens", 0)
+        n_dec = self._num_decode_tokens(attn_out.shape[0])
+        n_pref = attn_out.shape[0] - n_dec
+        # Cherry-pick glue: CQ prefill_bmm does inv_rope+o_proj on the whole
+        # batch. Our decode path already fused inv_rope into MLA, so a mixed
+        # step (decode prefix + prefill suffix, GSM8K conc=32) would rope
+        # decode tokens twice. Restrict prefill_bmm to the prefill suffix.
         if (
             not self._uses_fused_inverse_rope()
-            and attn_out.shape[0] > 128
+            and n_pref > 128
             and hasattr(self.wo_a, "prefill_bmm_b_fp8")
         ):
             grouped, scales = ixfshared.fused_inv_rope_fp8_quant(
-                attn_out, positions, self.cos_sin, self.n_local_groups
+                attn_out[n_dec:],
+                positions[n_dec:],
+                self.cos_sin,
+                self.n_local_groups,
             )
             projected = ixfshared.fp8_per_channel_einsum(
                 grouped,
@@ -1710,24 +1721,33 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 scales,
                 self.wo_a.prefill_bmm_bs,
             )
-            result = self.wo_b(projected.flatten(1))
-        else:
-            if self._uses_fused_inverse_rope() or fused >= attn_out.shape[0]:
-                pass  # inv_rope already fused into the reader / MLA
-            elif fused > 0:
-                # partial: only apply to unfused suffix (prefill tokens)
+            prefill_out = self.wo_b(projected.flatten(1))
+            if n_dec == 0:
+                return prefill_out
+            # Decode ran last; fused == n_dec means MLA already applied inv_rope.
+            if fused != n_dec:
                 apply_rope(
-                    attn_out[fused:].unsqueeze(0),
-                    positions[fused:],
+                    attn_out[:n_dec].unsqueeze(0),
+                    positions[:n_dec],
                     self.cos_sin,
                     inverse=True,
                 )
-            else:
-                apply_rope(
-                    attn_out.unsqueeze(0), positions, self.cos_sin, inverse=True
-                )
-            result = self._o_proj(attn_out)
-        return result
+            return torch.cat((self._o_proj(attn_out[:n_dec]), prefill_out), dim=0)
+        if self._uses_fused_inverse_rope() or fused >= attn_out.shape[0]:
+            pass  # inv_rope already fused into the reader / MLA
+        elif fused > 0:
+            # partial: only apply to unfused suffix (prefill tokens)
+            apply_rope(
+                attn_out[fused:].unsqueeze(0),
+                positions[fused:],
+                self.cos_sin,
+                inverse=True,
+            )
+        else:
+            apply_rope(
+                attn_out.unsqueeze(0), positions, self.cos_sin, inverse=True
+            )
+        return self._o_proj(attn_out)
 
     def _run_parallel_input_projections(
         self, hidden_states: torch.Tensor
@@ -1789,8 +1809,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         ),
     ) -> torch.Tensor:
         """RoPE q in place and publish kv as this layer's window record."""
-        if _PREFILL_FUSED_Q:
-            self._prefill_q_source = None
+        self._prefill_q_source = None
         if not isinstance(attn_metadata, dict):
             return q
 
@@ -1800,20 +1819,34 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         )
         assert swa_metadata is not None
         if self.kv_cache_dtype == "fp8_e4m3":
+            n = q.shape[0]
+            fuse_q = (
+                (_FUSED_INSERT_Q_QUANT or _PREFILL_FUSED_Q)
+                and hasattr(self, "_q_fp8_pt")
+                and hasattr(self, "_q_scale_pt")
+            )
             ixfops.qkv_rope_fp8_pt_insert(
                 q,
                 self.swa_cache_layer.kv_cache,
                 kv,
-                self._padded_insert_slots(swa_metadata.slot_mapping, q.shape[0]),
+                self._padded_insert_slots(swa_metadata.slot_mapping, n),
                 positions,
                 self.cos_sin,
                 kv_scale=self.kv_scale,
-                q_fp8=self._q_fp8_pt[: q.shape[0]] if _PREFILL_FUSED_Q and q.shape[0] > 128 else None,
-                q_scale=self._q_scale_pt[: q.shape[0]] if _PREFILL_FUSED_Q and q.shape[0] > 128 else None,
+                q_fp8=self._q_fp8_pt[:n] if fuse_q else None,
+                q_scale=self._q_scale_pt[:n] if fuse_q else None,
                 backend="ixformer_native",
             )
-            if _PREFILL_FUSED_Q and q.shape[0] > 128:
-                self._prefill_q_source = (q.data_ptr(), q.shape[0], q.stride(0) * q.element_size())
+            if fuse_q:
+                self._prefill_q_source = (
+                    q.data_ptr(),
+                    n,
+                    q.stride(0) * q.element_size(),
+                )
+                logger.info_once(
+                    "V4.1 fused insert Q-quant: qkv_insert_qquant tokens=%s",
+                    n,
+                )
             return q
         insert = (
             ixfops.qkv_rope_packed_fp8_insert
@@ -1857,6 +1890,19 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             num_tokens,
             swa_metadata.num_decode_tokens + swa_metadata.num_prefill_tokens,
         )
+
+    def _num_decode_tokens(self, num_tokens: int) -> int:
+        """Decode prefix length in the packed [decode | prefill] token layout."""
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return 0
+        swa_metadata = cast(
+            "DeepseekSparseSWAMetadata | None",
+            attn_metadata.get(self.swa_cache_layer.prefix),
+        )
+        if swa_metadata is None:
+            return 0
+        return min(num_tokens, int(swa_metadata.num_decode_tokens))
 
     def _prepare_and_attn(
         self,
@@ -2674,7 +2720,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         """Returns True when inverse RoPE was fused into the kernel."""
         if q.shape[1] not in _PT_MLA_HEADS:
             raise ValueError(f"Unsupported per-tensor FP8 MLA head count: {q.shape[1]}")
-        source = getattr(self, "_prefill_q_source", None) if _PREFILL_FUSED_Q else None
+        source = getattr(self, "_prefill_q_source", None)
         start = 0
         ready = False
         if source is not None:

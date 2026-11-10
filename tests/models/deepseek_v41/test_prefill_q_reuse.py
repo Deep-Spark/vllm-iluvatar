@@ -55,6 +55,40 @@ def test_requantizes_when_reuse_is_invalid(reuse, monkeypatch, reason):
         obj._fused_qnorm_rope_kv_insert(q, None, None, None)
         assert obj._prefill_q_source is None
     else:
-        monkeypatch.setattr(attention, "_PREFILL_FUSED_Q", False)
+        obj._prefill_q_source = None
     obj._sparse_fp8_pt_mla(q[:64], None, None, None, None, None, None)
     assert [call[0] for call in calls] == ["quant", "attention"]
+
+
+def test_decode_insert_folds_q_quant(monkeypatch):
+    monkeypatch.setattr(attention, "_FUSED_INSERT_Q_QUANT", True)
+    monkeypatch.setattr(attention, "_PREFILL_FUSED_Q", False)
+    obj = SimpleNamespace()
+    q = torch.zeros(1, 16, 512, dtype=torch.bfloat16)
+    kv = torch.zeros(1, 512, dtype=torch.bfloat16)
+    obj.kv_cache_dtype = "fp8_e4m3"
+    obj.cos_sin = torch.zeros(8, 64)
+    obj.kv_scale = 1.0
+    obj._q_fp8_pt = torch.empty_like(q, dtype=torch.float8_e4m3fn)
+    obj._q_scale_pt = torch.empty(1)
+    obj.swa_cache_layer = SimpleNamespace(
+        prefix="swa", kv_cache=torch.empty(1, 8, 512, dtype=torch.float8_e4m3fn)
+    )
+    obj._padded_insert_slots = lambda slots, n: slots[:n]
+    seen = {}
+
+    def insert(*args, **kwargs):
+        seen["q_fp8"] = kwargs.get("q_fp8")
+        seen["q_scale"] = kwargs.get("q_scale")
+
+    monkeypatch.setattr(attention.ixfops, "qkv_rope_fp8_pt_insert", insert)
+    meta = {
+        "swa": SimpleNamespace(slot_mapping=torch.zeros(1, dtype=torch.int64)),
+    }
+    attention.IluDeepseekV41Attention._fused_qnorm_rope_kv_insert(
+        obj, q, kv, torch.zeros(1, dtype=torch.int64), meta
+    )
+    assert seen["q_fp8"] is not None and seen["q_fp8"].shape[0] == 1
+    assert seen["q_scale"] is not None and seen["q_scale"].shape[0] == 1
+    assert obj._prefill_q_source is not None
+    assert obj._prefill_q_source[1] == 1

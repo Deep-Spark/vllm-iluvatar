@@ -43,11 +43,6 @@ def test_private_worker_init_pins_exact_anonymous_mmap_and_unregisters_on_shutdo
     monkeypatch.setattr(gpu_worker, "PIN_MEMORY", True)
     monkeypatch.setattr(gpu_worker, "MAX_HOST_REGISTER_CHUNK_BYTES", 2 * mmap.PAGESIZE)
     monkeypatch.setattr(gpu_worker, "SingleDirectionOffloadingHandler", FakeHandler)
-    monkeypatch.setattr(
-        gpu_impl,
-        "_ORIGINAL_WORKER_SHUTDOWN",
-        lambda self: (self._store_handler.shutdown(), self._load_handler.shutdown()),
-    )
 
     gpu_t0 = torch.zeros((4, 3000), dtype=torch.int8)
     gpu_t1 = torch.zeros((4, 1500), dtype=torch.int8)

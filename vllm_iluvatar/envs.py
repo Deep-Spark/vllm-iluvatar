@@ -430,9 +430,7 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_DS41_PRODUCER_TAIL_FFN": _bool_reader(
         "VLLM_ILU_DS41_PRODUCER_TAIL_FFN", "0"
     ),
-    "VLLM_ILU_DS4_CANDIDATE_FILTER": _bool_reader(
-        "VLLM_ILU_DS4_CANDIDATE_FILTER", "0"
-    ),
+    "VLLM_ILU_DS4_CANDIDATE_FILTER": _bool_reader("VLLM_ILU_DS4_CANDIDATE_FILTER", "0"),
     "VLLM_ILU_DS41_COMPRESSED_KV_FORMAT": lambda: os.environ.get(
         "VLLM_ILU_DS41_COMPRESSED_KV_FORMAT", "none"
     ),

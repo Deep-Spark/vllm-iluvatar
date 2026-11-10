@@ -18,11 +18,13 @@ import numpy as np
 import torch
 import uvloop
 import zmq
+
 os.environ.setdefault("UCX_MEM_MALLOC_HOOKS", "n")
 os.environ.setdefault("UCX_MEM_MALLOC_RELOC", "n")
 try:
     from nixl._api import nixl_agent as NixlWrapper
     from nixl._api import nixl_agent_config, nixl_prepped_dlist_handle
+
     try:
         from nixl._api import nixl_thread_sync_t
     except ImportError:

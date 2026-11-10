@@ -559,12 +559,8 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
             tokens = self._owned_decode_tokens[-1]
             device = topk_indices_buffer.device
             stride = (max_model_len + 31) // 32 * 32
-            logits = torch.empty(
-                (tokens, stride), dtype=torch.bfloat16, device=device
-            )
-            extent = torch.full(
-                (tokens,), -1, dtype=torch.int32, device=device
-            )
+            logits = torch.empty((tokens, stride), dtype=torch.bfloat16, device=device)
+            extent = torch.full((tokens,), -1, dtype=torch.int32, device=device)
             # Sequential graph shapes reuse physical rows. Exterior validity
             # therefore belongs to that storage, not to a graph's row count.
             # Register only owners; derive views after module/device transforms.
@@ -610,9 +606,7 @@ class IluSparseAttnIndexer(SparseAttnIndexer):
                     owned_logits = self._owned_decode_logits[
                         : md.num_decode_tokens, : self.max_model_len
                     ]
-                    previous_extent = self._owned_decode_extent[
-                        : md.num_decode_tokens
-                    ]
+                    previous_extent = self._owned_decode_extent[: md.num_decode_tokens]
         return torch.ops.vllm.ilu_sparse_attn_indexer(
             hidden_states,
             self.k_cache.prefix,

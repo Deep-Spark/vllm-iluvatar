@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <string_view>
 
 #include "ops.h"
 
@@ -18,6 +19,16 @@ namespace {
 
 constexpr int kThreads = 256;
 constexpr int kMaxWarps = 32;
+
+inline void check_sampling_fp64(bool needs_fp64) {
+  // MR has no FP64 arithmetic support. Its device double conversions and
+  // log overload can return finite but incorrect values, so do not silently
+  // execute or downcast a requested FP64 sampling path.
+  TORCH_CHECK(!needs_fp64 ||
+                  std::string_view(VLLM_ILUVATAR_CUDA_ARCH) != "ivcore11",
+              "FP64 sampling is not supported on CoreX MR/ivcore11; "
+              "use FP32 logits and use_fp64=False");
+}
 
 template <typename T>
 __device__ __forceinline__ float load_float(const T* ptr, int64_t index) {
@@ -283,10 +294,9 @@ __global__ void gumbel_sample_kernel(
       value /= static_cast<acc_t>(temp);
     }
     if (temp != 0.0f) {
-      // CoreX lowers Triton's vector RNG one value per hardware warp. Match
-      // the baseline exactly: all 64 lanes use the warp's first token key.
-      const uint32_t noise_key = token - token % warpSize;
-      value = add_gumbel(value, seed, pos, noise_key);
+      // Each vocabulary item needs its own Gumbel draw. Sharing a draw across
+      // a warp makes every nonmaximal logit in that warp impossible to sample.
+      value = add_gumbel(value, seed, pos, static_cast<uint32_t>(token));
     }
     best = choose_max(best, MaxPair<acc_t>{value, token});
   }
@@ -599,9 +609,9 @@ __global__ void resample_kernel(
     }
     acc_t value = static_cast<acc_t>(residual);
     if (temp != 0.0f) {
-      const uint32_t noise_key = token - token % warpSize;
       value =
-          add_gumbel(value, seeds[state], positions[resample_row], noise_key);
+          add_gumbel(value, seeds[state], positions[resample_row],
+                     static_cast<uint32_t>(token));
     }
     best = choose_max(best, MaxPair<acc_t>{value, token});
   }
@@ -752,6 +762,7 @@ void triton_gumbel_sample(
     torch::Tensor& positions, torch::Tensor& temperatures, int64_t vocab_size,
     int64_t block_size, bool is_drafting, bool apply_temperature,
     bool use_fp64, bool per_token_col) {
+  check_sampling_fp64(use_fp64 || logits.scalar_type() == at::kDouble);
   const int num_tokens = logits.size(0);
   const int num_blocks = (vocab_size + block_size - 1) / block_size;
   if (num_tokens == 0 || num_blocks == 0) {
@@ -805,6 +816,8 @@ void triton_compute_local_logits_stats(
     torch::Tensor& expanded_local_pos, torch::Tensor& temperatures,
     int64_t vocab_size, int64_t num_speculative_steps,
     int64_t vocab_block_size, bool has_draft_logits) {
+  check_sampling_fp64(target_logits.scalar_type() == at::kDouble ||
+                      (draft_logits && draft_logits->scalar_type() == at::kDouble));
   const int num_logits = target_logits.size(0);
   const int num_blocks = (vocab_size + vocab_block_size - 1) / vocab_block_size;
   if (num_logits == 0 || num_blocks == 0) {
@@ -852,6 +865,8 @@ void triton_rejection(
     const std::optional<torch::Tensor>& synthetic_rates,
     int64_t vocab_num_blocks, bool has_draft_logits, bool synthetic_mode,
     bool use_block_verification) {
+  check_sampling_fp64(target_logits.scalar_type() == at::kDouble ||
+                      (draft_logits && draft_logits->scalar_type() == at::kDouble));
   TORCH_CHECK(!use_block_verification,
               "native CUDA rejection does not support block verification");
   const int num_reqs = idx_mapping.numel();
@@ -901,6 +916,8 @@ void triton_resample(
     const std::optional<torch::Tensor>& cumulative_log_p, int64_t vocab_size,
     int64_t block_size, bool has_draft_logits, bool use_fp64,
     bool use_block_verification) {
+  check_sampling_fp64(use_fp64 || target_logits.scalar_type() == at::kDouble ||
+                      (draft_logits && draft_logits->scalar_type() == at::kDouble));
   const int num_reqs = rejected_step.numel();
   const int num_blocks = (vocab_size + block_size - 1) / block_size;
   if (num_reqs == 0 || num_blocks == 0) {
@@ -959,6 +976,7 @@ void triton_insert_resampled(
     int64_t resample_num_blocks, torch::Tensor& cu_num_logits,
     torch::Tensor& expanded_idx_mapping, torch::Tensor& temperatures,
     bool use_fp64) {
+  check_sampling_fp64(use_fp64 || local_max.scalar_type() == at::kDouble);
   const int num_reqs = num_sampled.numel();
   if (num_reqs == 0) {
     return;

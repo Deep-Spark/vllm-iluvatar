@@ -325,14 +325,19 @@ class Step5Attention(IluStep3p5Attention):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q_shape = q.shape
         k_shape = k.shape
-        from .decode_fusions import can_fuse_gate, decode_actual_tokens
+        from .decode_fusions import (
+            can_fuse_gate,
+            can_fuse_qk_norm_rope,
+            fusion_actual_tokens,
+        )
 
-        decode_actual = decode_actual_tokens(self.attn, qkv.shape[0])
-        if (
-            decode_actual is not None
-            and self.head_dim == 192
-            and qkv.dtype == torch.bfloat16
-            and self.rotary_emb.cos_sin_cache.dtype == torch.bfloat16
+        fusion_actual = fusion_actual_tokens(self.attn, qkv.shape[0], device=qkv.device)
+        if can_fuse_qk_norm_rope(
+            qkv,
+            self.rotary_emb.cos_sin_cache,
+            fusion_actual,
+            head_dim=self.head_dim,
+            rotary_dim=self.rotary_dim if self.use_rope else 0,
         ):
             from ixformer.inference.functions.models.step5.norm.float.decode_fusions import (
                 qk_norm_rope,
@@ -344,7 +349,7 @@ class Step5Attention(IluStep3p5Attention):
                 self.k_norm.weight,
                 self.rotary_emb.cos_sin_cache,
                 positions,
-                decode_actual,
+                fusion_actual,
                 self.num_heads,
                 self.num_kv_heads,
                 self.q_norm.variance_epsilon,
@@ -384,12 +389,12 @@ class Step5Attention(IluStep3p5Attention):
             gate, _ = self.g_proj(
                 prequantized if prequantized is not None else hidden_states
             )
-            if can_fuse_gate(self.o_proj, attn_output, decode_actual):
+            if can_fuse_gate(self.o_proj, attn_output, fusion_actual):
                 from ixformer.inference.functions.models.step5.norm.float.decode_fusions import (
                     gate_fp8,
                 )
 
-                q_gate, gate_scale = gate_fp8(attn_output, gate, decode_actual)
+                q_gate, gate_scale = gate_fp8(attn_output, gate, fusion_actual)
                 # RowParallelLinear still owns bias and TP reduction. Its FP8
                 # method consumes these already quantized activations directly.
                 output, _ = self.o_proj(IluFP8Input(q_gate, gate_scale))
@@ -428,30 +433,34 @@ class Step5MLP(IluStep3p5MLP):
         # Dense rows are independent; unlike routed MoE there is no gather map.
         # All rows, including allocated padding, keep the original elementwise
         # semantics. vLLM consumes only valid rows; no cross-row reduction occurs.
+        # Reserve the prefill and decode/MTP budgets before CUDA graph capture.
+        # The buffer address must remain stable for every later graph replay.
+        from .decode_fusions import dense_row_mask_capacity
+
         self.register_buffer(
-            "_decode_dense_rows", torch.zeros(32, dtype=torch.int32), persistent=False
+            "_decode_dense_rows",
+            torch.zeros(dense_row_mask_capacity(), dtype=torch.int32),
+            persistent=False,
         )
 
     def forward(self, hidden_states):
-        from .decode_fusions import accepts_prequant, decode_actual_tokens
+        from .decode_fusions import can_fuse_swiglu_fp8, dense_valid_row_mask
 
         gate_up, _ = self.gate_up_proj(hidden_states)
-        actual = decode_actual_tokens(None, gate_up.shape[0])
-        if (
-            actual is not None
-            and 6 < gate_up.shape[0] <= 16
-            and gate_up.dtype == torch.bfloat16
-            and self.down_proj.input_is_parallel
-            and accepts_prequant(self.down_proj)
-            and self._decode_dense_rows.device == gate_up.device
-        ):
+        rows = gate_up.shape[0]
+        # Dense rows have no EP gather map; sign(row_mask)>=0 marks every row valid.
+        self._decode_dense_rows, row_mask = dense_valid_row_mask(
+            self._decode_dense_rows, rows, gate_up.device
+        )
+        # Prefill and decode: fuse SwiGLU-step + per-token FP8 into down_proj.
+        if can_fuse_swiglu_fp8(self.down_proj, gate_up, row_mask):
             from ixformer.inference.functions.models.step5.norm.float.decode_fusions import (
                 swiglu_fp8,
             )
 
             q, scales = swiglu_fp8(
                 gate_up,
-                self._decode_dense_rows[: gate_up.shape[0]],
+                row_mask,
                 float(self.limit or 0.0),
             )
             output, _ = self.down_proj(IluFP8Input(q, scales.unsqueeze(-1)))
@@ -634,9 +643,30 @@ class Step5DecoderLayer(nn.Module):
             )
             return residual_add(hidden_states, residual, backend="ixformer_native")
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self._for_params(hidden_states)
-        hidden_states = self.self_attn(positions, hidden_states)
+        from .decode_fusions import can_share_norm_quant, fusion_actual_tokens
+
+        actual = fusion_actual_tokens(
+            self.self_attn.attn, hidden_states.shape[0], device=hidden_states.device
+        )
+        prepared = None
+        if can_share_norm_quant(self.self_attn, hidden_states, actual):
+            from ixformer.inference.functions.models.step5.norm.float.decode_fusions import (
+                norm_fp8,
+            )
+
+            # residual=None: fuse RMSNorm + dyn FP8 for qkv/g; keep BF16 residual path.
+            hidden_states, _, prepared = norm_fp8(
+                hidden_states,
+                None,
+                self.input_layernorm.weight,
+                actual,
+                self.input_layernorm.variance_epsilon,
+            )
+            prepared = IluFP8Input(*prepared)
+        else:
+            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states = self._for_params(hidden_states)
+        hidden_states = self.self_attn(positions, hidden_states, prequantized=prepared)
         hidden_states = self._for_residual(hidden_states) + residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -659,9 +689,11 @@ class Step5DecoderLayer(nn.Module):
         """
         if not self.fp32_residual_connection:
             raise RuntimeError("residual-stream path requires FP32 residual config")
-        from .decode_fusions import can_share_norm_quant, decode_actual_tokens
+        from .decode_fusions import can_share_norm_quant, fusion_actual_tokens
 
-        actual = decode_actual_tokens(self.self_attn.attn, hidden_states.shape[0])
+        actual = fusion_actual_tokens(
+            self.self_attn.attn, hidden_states.shape[0], device=hidden_states.device
+        )
         prepared = None
         if can_share_norm_quant(self.self_attn, hidden_states, actual):
             from ixformer.inference.functions.models.step5.norm.float.decode_fusions import (

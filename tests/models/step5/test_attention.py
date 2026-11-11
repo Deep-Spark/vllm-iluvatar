@@ -285,6 +285,7 @@ def test_head_wise_gate_reaches_existing_native_facade(monkeypatch):
     layer.q_norm = layer.k_norm = torch.nn.Identity()
     layer.head_dim, layer.num_heads = 4, 2
     layer.use_rope = layer.sparse_enabled = False
+    layer.rotary_emb = SimpleNamespace(cos_sin_cache=torch.empty((3, 4)))
     layer.use_head_wise_attn_gate = True
     layer.g_proj = Projection(gates)
     layer.attn = Attention()

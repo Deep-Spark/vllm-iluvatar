@@ -823,7 +823,10 @@ def _install_fake_ixfops(monkeypatch):
     return fake_ixfops, _routing_out
 
 
-def test_ixformer_pipeline_wires_args_correctly(weights, hidden_states, monkeypatch):
+@pytest.mark.parametrize("gemm_mode,w13_gemm_mode", [(0, None), (None, 1)])
+def test_ixformer_pipeline_wires_args_correctly(
+    weights, hidden_states, monkeypatch, gemm_mode, w13_gemm_mode
+):
     """Mock-based argument assertion for the six-step pipeline (§6 CPU suite:
     'CPU 侧改为对传给每个 op 的实参做 MagicMock 断言'). Pins
     ``fuse_swiglu=False`` / ``row_mapping=None`` / ``scaling_factor=output_scale``
@@ -867,7 +870,8 @@ def test_ixformer_pipeline_wires_args_correctly(weights, hidden_states, monkeypa
         w13_bias=None,
         w2_bias=None,
         gemm_backend="ixformer_native",
-        gemm_mode=0,
+        gemm_mode=gemm_mode,
+        w13_gemm_mode=w13_gemm_mode,
         swiglu_variant="dsv4_clamp",
     )
 
@@ -894,8 +898,9 @@ def test_ixformer_pipeline_wires_args_correctly(weights, hidden_states, monkeypa
     for call in fake_ixfops.group_gemm_fp4.call_args_list:
         assert call.kwargs["fuse_swiglu"] is False
         assert call.kwargs["row_mapping"] is None
-        assert call.kwargs["mode"] == 0
         assert call.kwargs["backend"] == "ixformer_native"
+    modes = [call.kwargs["mode"] for call in fake_ixfops.group_gemm_fp4.call_args_list]
+    assert modes == [gemm_mode if w13_gemm_mode is None else w13_gemm_mode, gemm_mode]
     # GEMM1 gets w13, GEMM2 gets w2.
     assert fake_ixfops.group_gemm_fp4.call_args_list[0].args[2] is w13_n
     assert fake_ixfops.group_gemm_fp4.call_args_list[1].args[2] is w2_n

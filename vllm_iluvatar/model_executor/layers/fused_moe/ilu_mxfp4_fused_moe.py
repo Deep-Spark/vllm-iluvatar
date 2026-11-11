@@ -487,6 +487,7 @@ def _ilu_mxfp4_fused_experts_ixformer(
     gemm_backend: str,
     gemm_mode: int | None,
     swiglu_variant: str,
+    w13_gemm_mode: int | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
 ) -> torch.Tensor:
@@ -617,7 +618,7 @@ def _ilu_mxfp4_fused_experts_ixformer(
         group_layout,
         gemm1_out,
         row_mapping=None,
-        mode=gemm_mode,
+        mode=w13_gemm_mode if w13_gemm_mode is not None else gemm_mode,
         fuse_swiglu=False,
         backend=gemm_backend,
     )
@@ -689,17 +690,21 @@ def ilu_mxfp4_fused_experts(
     w13_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
     backend: str | None = None,
+    w13_gemm_mode: int | None = None,
     swiglu_variant: str = _DSV4_CLAMP_VARIANT,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
 ) -> torch.Tensor:
     """Dispatcher for the routed MXFP4 expert compute.
 
-    Takes the same arguments as ``ilu_mxfp4_fused_experts_torch`` plus two
-    kw-only ones:
+    Takes the same arguments as ``ilu_mxfp4_fused_experts_torch`` with
+    backend-specific options:
 
     * ``backend``: force a ``group_gemm_fp4`` backend. ``None`` defers to
       ``VLLM_ILU_MXFP4_MOE_BACKEND``, whose default is ``ixmm``.
+    * ``w13_gemm_mode``: override the W13 tile selection. Callers must ensure
+      the mode supports every expert's row count. W2 still selects its tile
+      automatically.
     * ``swiglu_variant``: step-4 activation semantics. ``"dsv4_clamp"``
       (default, DSv4/MXFP4, unchanged), ``"step3_swiglustep"`` (Step-3.7
       NVFP4, clamp-after-silu + native no-clamp), or ``"swigluoai"``
@@ -766,6 +771,7 @@ def ilu_mxfp4_fused_experts(
         w2_bias=w2_bias,
         gemm_backend=be,
         gemm_mode=None,
+        w13_gemm_mode=w13_gemm_mode,
         swiglu_variant=swiglu_variant,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,

@@ -103,6 +103,7 @@ from vllm.model_executor.parameter import (
 )
 from vllm.model_executor.utils import replace_parameter
 
+from vllm_iluvatar import envs as ilu_envs
 from vllm_iluvatar.model_executor.layers.fused_moe.activation import (
     swiglustep_limit,
 )
@@ -1108,6 +1109,17 @@ class IluFp8MoEMethod(Fp8MoEMethod):
             if activation == "swiglustep"
             else 0.0
         )
+        # Step5 routes each token to distinct experts. For 17–64 gathered
+        # rows, mode 1 can cover every W13 expert; smaller batches already use
+        # the small tile automatically. W2 keeps the backend's default.
+        w13_gemm_mode = (
+            1
+            if getattr(layer, "_ilu_step5_native_activation", False)
+            and ilu_envs.VLLM_ILU_STEP5_FP4_SMALL_TILES
+            and topk_ids.shape[1] == 8
+            and 16 < topk_ids.shape[0] <= 64
+            else None
+        )
         return ilu_mxfp4_fused_experts(
             hidden_states=x,
             w13_weight=layer.w13_weight,
@@ -1123,6 +1135,7 @@ class IluFp8MoEMethod(Fp8MoEMethod):
             w13_bias=None,
             w2_bias=None,
             backend="ixmm",
+            w13_gemm_mode=w13_gemm_mode,
             swiglu_variant="step3_swiglustep",
         )
 

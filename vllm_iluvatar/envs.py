@@ -175,6 +175,7 @@ if TYPE_CHECKING:
     VLLM_ILU_STEP5_FP32_EP: bool = False
     VLLM_ILU_STEP5_FP8_KV_SCALE_PATH: str = ""
     VLLM_ILU_STEP5_FP8_ATTENTION_BACKEND: str = "ixformer_native"
+    VLLM_ILU_STEP5_FP4_SMALL_TILES: bool = False
     VLLM_ILU_MLA_CUSTOMIZE: bool = True
     VLLM_ILU_MIX_QUANTIZATION_TYPE: str = ""
     VLLM_ILU_FLASH_ATTN_QUANT_TYPE: str = ""
@@ -290,6 +291,7 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
         "VLLM_ILU_STEP5_FP8_KV_SCALE_PATH", "VLLM_STEP5_FP8_KV_SCALE_PATH", ""
     ),
     "VLLM_ILU_STEP5_FP8_ATTENTION_BACKEND": _step5_fp8_backend,
+    "VLLM_ILU_STEP5_FP4_SMALL_TILES": lambda: _step5_bool("FP4_SMALL_TILES", "0"),
     "VLLM_ILU_MLA_CUSTOMIZE": lambda: (
         _get("VLLM_ILU_MLA_CUSTOMIZE", "VLLM_MLA_CUSTOMIZE", "1").lower()
         in ("1", "true", "yes")

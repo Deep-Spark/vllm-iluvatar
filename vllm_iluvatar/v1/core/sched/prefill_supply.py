@@ -7,6 +7,14 @@ Only FCFS pure KV producers with an explicit PP partition use this policy.
 
 Select short work using actual resident cache coverage / confirmed remote completion,
 not the seen-prefix hint (the hint only bounds expensive cache probes).
+
+VLLM_ILU_PREFILL_LOOKUP_AHEAD=K (default 0, off) drives the connector lookups
+of the K shortest candidates each step and promotes the first resolved one, so
+an asynchronous lookup does not hold the short share for several steps.
+VLLM_ILU_PREFILL_LOOKUP_SUBMIT=N (default 0, off) submits, each step, the
+connector lookup of up to N waiting requests not yet looked up, long or short,
+so the lookup is in flight before the waiting loop first visits the request.
+Both apply only when the connector includes LMCacheMPConnector.
 """
 
 import collections
@@ -19,6 +27,8 @@ class SupplyState:
     def __init__(self, block_size):
         self.hash_block_size = block_size
         self.seen = collections.OrderedDict()
+        # Waiting requests whose connector lookup was submitted ahead.
+        self.submitted = set()
 
     def key(self, request, budget, replay):
         # Only a prefix covering the required boundary can make this request
@@ -96,6 +106,7 @@ def plan(scheduler, budget):
     ):
         return None
     st = state(scheduler)
+    _submit_lookups(scheduler, st)
     # A bounded request may span one pipeline-filling wave of chunk work.
     # Preserve the existing floor for shallow pipelines.
     short_chunks = max(
@@ -153,7 +164,10 @@ def plan(scheduler, budget):
                 candidates.append((count, n, queue, request))
     # One bounded promotion per step. Retain original order of all other requests.
     if candidates:
-        count, _, queue, request = min(candidates, key=lambda x: (x[0], x[1]))
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        count, _, queue, request = (
+            _first_resolved(scheduler, candidates) or candidates[0]
+        )
         if queue.peek_request() is not request:
             queue.remove_request(request)
             queue.prepend_request(request)
@@ -161,6 +175,111 @@ def plan(scheduler, budget):
     if not short:
         return None
     return BudgetPlan(budget, short, sum(short.values()))
+
+
+def _env_count(name):
+    try:
+        return max(0, int(os.environ.get(name, "0")))
+    except ValueError:
+        return 0
+
+
+def _lookup_ahead():
+    return _env_count("VLLM_ILU_PREFILL_LOOKUP_AHEAD")
+
+
+_ASYNC_LOOKUP_CONNECTORS = frozenset({"LMCacheMPConnector"})
+
+
+def _async_lookup_connector(scheduler):
+    """The scheduler's connector if it carries an LMCache MP lookup, else None.
+
+    Only that connector answers lookups asynchronously; a synchronous one
+    (CPU offload) resolves on the first visit, so lookahead buys it nothing.
+    """
+    cached = scheduler.__dict__.get("_p_async_lookup_connector", False)
+    if cached is not False:
+        return cached
+    connector = getattr(scheduler, "connector", None)
+    children = getattr(connector, "sub_connectors", None) or [connector]
+    found = any(
+        cls.__name__ in _ASYNC_LOOKUP_CONNECTORS
+        for child in children
+        if child is not None
+        for cls in type(child).__mro__
+    )
+    result = connector if found else None
+    scheduler.__dict__["_p_async_lookup_connector"] = result
+    return result
+
+
+def _lookup_hit(scheduler, connector, request):
+    """The connector call the waiting loop makes on a visit."""
+    _, local, _, _ = scheduler._get_local_prefix_cache_hit(request)
+    local -= local % scheduler.block_size
+    ext_tokens, _ = connector.get_num_new_matched_tokens(request, local)
+    return ext_tokens
+
+
+def _submit_lookups(scheduler, st):
+    """Submit the connector lookup of waiting requests before they are visited.
+
+    The waiting loop reaches a request only while step budget is left, and its
+    first visit is the one that submits the lookup, so an asynchronous lookup
+    always costs that request at least one more visit. With a connector that
+    finishes lookups in the background (LMCache #5960 callbacks), one early
+    call per request is enough for the result to be ready by admission.
+    """
+    limit = _env_count("VLLM_ILU_PREFILL_LOOKUP_SUBMIT")
+    if limit <= 0:
+        return
+    connector = _async_lookup_connector(scheduler)
+    if connector is None:
+        return
+    if scheduler.kv_cache_manager.enable_kv_cache_events:
+        return
+    waiting = [*scheduler.skipped_waiting, *scheduler.waiting]
+    st.submitted.intersection_update(r.request_id for r in waiting)
+    for request in waiting:
+        if limit <= 0:
+            break
+        if (
+            request.request_id in st.submitted
+            or request.status.name != "WAITING"
+            or request.num_computed_tokens
+            or request.has_encoder_inputs
+        ):
+            continue
+        st.submitted.add(request.request_id)
+        _lookup_hit(scheduler, connector, request)
+        limit -= 1
+
+
+def _first_resolved(scheduler, candidates):
+    """Return the first candidate whose connector lookup has resolved.
+
+    An asynchronous connector (LMCache MP) answers None until its lookup
+    resolves, which takes several scheduler visits. A promoted request still
+    waiting on it leaves the short share idle and keeps the slot for those
+    steps. Driving the leading candidates' lookups every step lets them
+    resolve in parallel; the first resolved one takes the slot. The calls are
+    the ones the waiting loop would make on a visit.
+    """
+    limit = _lookup_ahead()
+    if limit <= 0:
+        return None
+    connector = _async_lookup_connector(scheduler)
+    if connector is None:
+        return None
+    if scheduler.kv_cache_manager.enable_kv_cache_events:
+        return None
+    for candidate in candidates[:limit]:
+        request = candidate[3]
+        if request.num_computed_tokens:
+            return candidate
+        if _lookup_hit(scheduler, connector, request) is not None:
+            return candidate
+    return None
 
 
 def finish(scheduler, request):

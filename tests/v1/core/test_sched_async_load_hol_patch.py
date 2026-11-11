@@ -53,6 +53,18 @@ def test_has_finished_inflight_load():
     assert patch.has_finished_inflight_load(scheduler)
 
 
+def test_promoted_inflight_load_waiting_to_compute_counts():
+    """A loaded request back in WAITING still holds its reservation."""
+    promoted = SimpleNamespace(request_id="c", status=RequestStatus.WAITING)
+    prefilling = SimpleNamespace(request_id="b", status=RequestStatus.RUNNING)
+    scheduler = SimpleNamespace(
+        _inflight_prefills=[prefilling], finished_recving_kv_req_ids=set()
+    )
+    assert not patch.has_finished_inflight_load(scheduler)
+    scheduler._inflight_prefills.append(promoted)
+    assert patch.has_finished_inflight_load(scheduler)
+
+
 def test_note_refused_async_load_is_rate_limited(monkeypatch):
     logged = []
     monkeypatch.setattr(patch.logger, "info", lambda *a: logged.append(a))

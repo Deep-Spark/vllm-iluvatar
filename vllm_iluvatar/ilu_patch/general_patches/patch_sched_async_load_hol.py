@@ -14,9 +14,13 @@ Why      : #44560 admits an async KV load only if it fits in (free blocks -
            engine spins on empty steps with every waiting request frozen; no
            LOOKUP is polled, so no deadline fires either. Hit on DSv4.1 P/D
            prefill with LMCache when a large request's lookup resolved right
-           after small loads were admitted behind it.
-How      : when the reservation refuses an async load while a finished
-           in-flight load is waiting to be promoted, skip the refused request
+           after small loads were admitted behind it. The same holds for loads
+           already promoted back to WAITING: they keep their reservation until
+           their remaining prefill is scheduled (seen with early LMCache
+           lookups: a 400K-token load refused by an 800K load queued behind).
+How      : when the reservation refuses an async load while an in-flight
+           load is queued behind it (finished but not promoted, or promoted
+           and waiting to compute), skip the refused request
            instead of breaking, and for the rest of that step only let
            requests that already hold a reservation (``_inflight_prefills``)
            through. New work keeps its FCFS place behind the refused request.
@@ -126,12 +130,21 @@ def register() -> None:
 
 
 def has_finished_inflight_load(scheduler: Any) -> bool:
-    """Whether an in-flight async load has finished but is not promoted yet."""
+    """Whether a reservation holder is queued and could release it if let past.
+
+    That is an in-flight async load that finished but is not promoted yet, or
+    one already promoted back to WAITING to compute the rest of its prompt.
+    Both keep their reservation until their prefill runs.
+    """
     from vllm.v1.request import RequestStatus
 
     done = scheduler.finished_recving_kv_req_ids
-    return bool(done) and any(
-        req.status == RequestStatus.WAITING_FOR_REMOTE_KVS and req.request_id in done
+    return any(
+        req.status == RequestStatus.WAITING
+        or (
+            req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            and req.request_id in done
+        )
         for req in scheduler._inflight_prefills
     )
 

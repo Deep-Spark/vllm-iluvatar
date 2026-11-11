@@ -182,6 +182,173 @@ def test_remote_completion_fence_is_required():
     assert loaded.status.name == "WAITING"
 
 
+class LMCacheMPConnector:
+    """Answers None for requests whose lookup has not resolved yet."""
+
+    def __init__(self, resolved=()):
+        self.resolved = set(resolved)
+        self.calls = []
+
+    def get_num_new_matched_tokens(self, req, num_computed_tokens):
+        self.calls.append((req.request_id, num_computed_tokens))
+        if req.request_id in self.resolved:
+            return 0, False
+        return None, True
+
+
+class OffloadingConnector:
+    """A synchronous connector: every lookup resolves on the first call."""
+
+    def __init__(self):
+        self.calls = []
+
+    def get_num_new_matched_tokens(self, req, num_computed_tokens):
+        self.calls.append((req.request_id, num_computed_tokens))
+        return 0, False
+
+
+class MultiConnector:
+    def __init__(self, *children):
+        self.sub_connectors = list(children)
+
+    def get_num_new_matched_tokens(self, req, num_computed_tokens):
+        for child in self.sub_connectors:
+            child.get_num_new_matched_tokens(req, num_computed_tokens)
+        return None, True
+
+
+def with_connector(sched, connector, local_hit=0, block_size=64):
+    sched.connector = connector
+    sched.block_size = block_size
+    sched._get_local_prefix_cache_hit = lambda req: (None, local_hit, 0, False)
+    return sched
+
+
+def test_lookup_ahead_is_off_by_default():
+    a, b = request("a", 800, prefix="unseen"), request("b", 8000, prefix="unseen")
+    connector = LMCacheMPConnector(resolved={"b"})
+    sched, _ = scheduler([request("long", 800000)], [b, a])
+    with_connector(sched, connector)
+    plan = supply.plan(sched, 4096)
+    assert plan is not None and "a" in plan.short_ids
+    assert sched.waiting == [a, b]
+    assert connector.calls == []
+
+
+def test_lookup_ahead_promotes_first_resolved(monkeypatch):
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_AHEAD", "4")
+    a, b = request("a", 800, prefix="unseen"), request("b", 8000, prefix="unseen")
+    connector = LMCacheMPConnector(resolved={"b"})
+    sched, _ = scheduler([request("long", 800000)], [a, b])
+    with_connector(sched, connector, local_hit=130)
+    plan = supply.plan(sched, 4096)
+    assert plan is not None and "b" in plan.short_ids and "a" not in plan.short_ids
+    assert sched.waiting == [b, a]
+    # Block-aligned local hit, as the waiting loop passes it.
+    assert connector.calls == [("a", 128), ("b", 128)]
+    assert a.num_computed_tokens == b.num_computed_tokens == 0
+
+
+def test_lookup_ahead_falls_back_to_shortest(monkeypatch):
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_AHEAD", "1")
+    a, b = request("a", 800, prefix="unseen"), request("b", 8000, prefix="unseen")
+    connector = LMCacheMPConnector(resolved={"b"})
+    sched, _ = scheduler([request("long", 800000)], [b, a])
+    with_connector(sched, connector)
+    plan = supply.plan(sched, 4096)
+    assert plan is not None and "a" in plan.short_ids
+    assert sched.waiting == [a, b]
+    assert connector.calls == [("a", 0)]
+
+
+def test_lookup_ahead_without_connector(monkeypatch):
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_AHEAD", "4")
+    a = request("a", 800, prefix="unseen")
+    sched, _ = scheduler([request("long", 800000)], [a])
+    sched.connector = None
+    plan = supply.plan(sched, 4096)
+    assert plan is not None and "a" in plan.short_ids
+
+
+def test_lookup_submit_is_off_by_default():
+    sched, _ = scheduler([request("long", 800000)], [request("w", 100000)])
+    connector = LMCacheMPConnector()
+    with_connector(sched, connector)
+    supply.plan(sched, 4096)
+    assert connector.calls == []
+
+
+def test_lookup_submit_sends_each_waiting_request_once(monkeypatch):
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_SUBMIT", "2")
+    reqs = [request(str(i), 100000 * (i + 1), prefix="unseen") for i in range(3)]
+    sched, _ = scheduler([request("long", 800000)], reqs)
+    connector = LMCacheMPConnector()
+    with_connector(sched, connector)
+    supply.plan(sched, 4096)
+    assert [rid for rid, _ in connector.calls] == ["0", "1"]
+    supply.plan(sched, 4096)
+    assert [rid for rid, _ in connector.calls] == ["0", "1", "2"]
+    supply.plan(sched, 4096)
+    assert len(connector.calls) == 3
+
+
+def test_lookup_submit_runs_without_long_prefill(monkeypatch):
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_SUBMIT", "8")
+    sched, _ = scheduler(waiting=[request("w", 100000)])
+    connector = LMCacheMPConnector()
+    with_connector(sched, connector)
+    assert supply.plan(sched, 4096) is None
+    assert connector.calls == [("w", 0)]
+
+
+def test_lookup_submit_skips_requests_that_need_no_lookup(monkeypatch):
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_SUBMIT", "8")
+    partial = request("partial", 100000, done=4096)
+    remote = request("remote", 100000, status="WAITING_FOR_REMOTE_KVS")
+    mm = request("mm", 100000)
+    mm.has_encoder_inputs = True
+    sched, _ = scheduler(waiting=[partial, remote, mm])
+    connector = LMCacheMPConnector()
+    with_connector(sched, connector)
+    supply.plan(sched, 4096)
+    assert connector.calls == []
+
+
+def test_lookup_submit_forgets_requests_that_left(monkeypatch):
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_SUBMIT", "8")
+    w = request("w", 100000)
+    sched, _ = scheduler(waiting=[w])
+    connector = LMCacheMPConnector()
+    with_connector(sched, connector)
+    supply.plan(sched, 4096)
+    sched.waiting.remove(w)
+    supply.plan(sched, 4096)
+    assert supply.state(sched).submitted == set()
+
+
+@pytest.mark.parametrize(
+    "env", ["VLLM_ILU_PREFILL_LOOKUP_AHEAD", "VLLM_ILU_PREFILL_LOOKUP_SUBMIT"]
+)
+def test_lookahead_skips_cpu_offload(env, monkeypatch):
+    monkeypatch.setenv(env, "8")
+    offload = OffloadingConnector()
+    short = request("a", 800, prefix="unseen")
+    sched, _ = scheduler([request("long", 800000)], [short])
+    with_connector(sched, MultiConnector(offload))
+    plan = supply.plan(sched, 4096)
+    assert plan is not None and "a" in plan.short_ids
+    assert offload.calls == []
+
+
+def test_lookahead_finds_lmcache_inside_multiconnector(monkeypatch):
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_SUBMIT", "8")
+    lmcache, offload = LMCacheMPConnector(), OffloadingConnector()
+    sched, _ = scheduler(waiting=[request("w", 100000)])
+    with_connector(sched, MultiConnector(offload, lmcache))
+    supply.plan(sched, 4096)
+    assert lmcache.calls == [("w", 0)]
+
+
 def test_event_enabled_cache_is_not_probed():
     sched, reads = scheduler(
         [request("long", 100000)], [request("warm", 100000)], cached=99000

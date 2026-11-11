@@ -12,12 +12,8 @@ Self-written model rather than subclassing community ``DeepseekV4Model`` /
 ``DeepseekV4DecoderLayer`` because the community forwards are wired to the
 tilelang MHC kernels and the model allocates three aux streams at build time.
 
-* MHC (``hc_pre`` / ``hc_post`` / ``hc_head``) runs on the ixformer kernels
-  ``ixfops.ds4_mhc_pre_v2`` / ``ds4_mhc_post`` / ``ds4_hc_head``.  The
-  orchestration matches the W4A8 fork (``deepseek_v4/model.py:561-635``,
-  ``:757-772``): each sub-layer does its own ``hc_post`` and ``attn_norm`` /
-  ``ffn_norm`` are called explicitly, rather than NVIDIA's cross-sub-layer
-  ``mhc_fused_post_pre`` with the norm folded into the pre.
+* MHC uses ixformer kernels. Each sub-layer performs its own ``hc_post``;
+  supported decode batches fold RMSNorm into ``ds4_mhc_pre_v2``.
 * ``IluDeepseekV4Fp8MoE.forward``: native MXFP4 stays on the community
   ``FusedMoE`` runner (``IluGateLinear``, ``ops.topk_hash_softplus_sqrt``,
   ``IluMxfp4MoEMethod`` -> ``ilu_mxfp4_fused_experts()``). When
@@ -58,6 +54,7 @@ W4A8 pair (``IluDeepseekV4ForCausalLM`` / ``IluDeepSeekV4MTPModel``).
 
 from __future__ import annotations
 
+import os
 import re
 import typing
 from collections.abc import Callable, Iterable
@@ -106,8 +103,8 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
-    IluFusedMoEEP,
     _DECODE_EP_BACKEND,
+    IluFusedMoEEP,
 )
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.ilu_compressed_tensors_moe_w4a8_int8 import (
     IluCompressedTensorsW4A8Int8MoEMethod,
@@ -118,6 +115,7 @@ from vllm_iluvatar.models.deepseek_v4.fp8_attention import (
 )
 
 logger = init_logger(__name__)
+_HC_PRE_NORM_FUSION = os.environ.get("IXFORMER_DS4_HC_PRE_NORM_FUSION", "1") == "1"
 
 # Use a logger inside the ``vllm.`` namespace so that vLLM's configured handler
 # picks up INFO-level messages (load statistics).  A ``vllm_iluvatar.…`` logger
@@ -501,7 +499,10 @@ class IluDeepseekV4Fp8MoE(nn.Module, IluFusedMoEEP):
             return self.forward_dp_ep_deep_ep(hidden_states, input_ids)
 
         org_shape = hidden_states.shape
-        if getattr(self, "_use_ilu_w4a8_ep", False) and self._should_use_forward_dp_ep():
+        if (
+            getattr(self, "_use_ilu_w4a8_ep", False)
+            and self._should_use_forward_dp_ep()
+        ):
             return self.forward_dp_ep(hidden_states, input_ids).view(org_shape)
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
@@ -584,6 +585,13 @@ class IluDeepseekV4Fp8DecoderLayer(nn.Module):
         self.hc_ffn_scale = nn.Parameter(
             torch.empty(3, dtype=torch.float32), requires_grad=False
         )
+        self.register_buffer(
+            "_hc_pre_workspace",
+            torch.zeros(1, dtype=torch.int32, device=current_platform.device_type)
+            if _HC_PRE_NORM_FUSION
+            else None,
+            persistent=False,
+        )
 
     def hc_pre(
         self,
@@ -591,19 +599,16 @@ class IluDeepseekV4Fp8DecoderLayer(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
+        norm: RMSNorm,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """MHC pre: ``(T, hc_mult, H)`` -> sub-layer input + the two mixes.
-
-        Same call as the W4A8 fork (``deepseek_v4/model.py:561-587``), pinned to
-        the default operator version ``ds4_mhc_pre_v2`` (bf16 GEMM + a single
-        fp32 epilogue). ``layer_input`` comes back **un-normed** -- the kernel has
-        no ``norm_weight`` parameter, so ``attn_norm`` / ``ffn_norm`` are applied
-        explicitly in ``forward``.
-
-        Returns ``(layer_input (T,H), post_mix (T,hc_mult,1) fp32,
-        comb_mix (T,hc_mult,hc_mult) fp32)`` -- note the kernel itself returns
-        ``layer_input`` last; the order here follows W4A8.
-        """
+        """Return normalized sub-layer input and the two MHC mixes."""
+        fuse_norm = (
+            self._hc_pre_workspace is not None
+            and norm.has_weight
+            and norm.variance_size_override is None
+            and norm.weight.dtype == x.dtype
+            and ixfops.enable_hc_pre_norm_fusion(*x.shape, x.dtype)
+        )
         post_mix, comb_mix, layer_input = ixfops.ds4_mhc_pre_v2(
             residual=x,
             fn=hc_fn,
@@ -614,8 +619,12 @@ class IluDeepseekV4Fp8DecoderLayer(nn.Module):
             hc_sinkhorn_eps=self.hc_eps,
             hc_post_mult_value=self.hc_post_alpha,
             sinkhorn_repeat=self.hc_sinkhorn_iters,
+            workspace=self._hc_pre_workspace if fuse_norm else None,
+            need_rms=fuse_norm,
+            rms_weight=norm.weight if fuse_norm else None,
+            layer_rms_eps=norm.variance_epsilon,
         )
-        return layer_input, post_mix, comb_mix
+        return (layer_input if fuse_norm else norm(layer_input)), post_mix, comb_mix
 
     def hc_post(
         self,
@@ -639,20 +648,7 @@ class IluDeepseekV4Fp8DecoderLayer(nn.Module):
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
     ) -> torch.Tensor:
-        """MHC pre/post around attention and MoE.
-
-        Structure follows the W4A8 fork (``deepseek_v4/model.py:597-635``): each
-        sub-layer runs ``hc_pre -> norm -> sub-layer -> hc_post`` and carries no
-        state across the layer boundary -- ``x`` is always the full
-        ``(T, hc_mult, H)`` residual stream.
-
-        NVIDIA instead defers each ``mhc_post`` and fuses it into the next
-        sub-layer's ``mhc_pre`` (``nvidia/model.py:868-957``), with the norm
-        folded in as well.  That is the same operator sequence in the same order
-        with the same bf16 rounding points, so the two forms are exactly
-        value-preserving; ixformer has no fused post+pre op, so nothing would be
-        gained by keeping the deferred shape here.
-        """
+        """MHC pre/post around attention and MoE."""
         # ``ds4_mhc_pre_v2`` feeds ``fn`` straight into a same-dtype GEMM, so the
         # fp32 checkpoint weights are cast once on the first forward and cached
         # in place (W4A8 ``model.py:605-612``). ``hc_head_fn`` must stay fp32 --
@@ -665,18 +661,16 @@ class IluDeepseekV4Fp8DecoderLayer(nn.Module):
         # --- attention sub-layer -------------------------------------------
         residual = x
         x, post, comb = self.hc_pre(
-            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base, self.attn_norm
         )
-        x = self.attn_norm(x)
         x = self.attn(positions, x, None)
         x = self.hc_post(x, residual, post, comb)
 
         # --- FFN sub-layer --------------------------------------------------
         residual = x
         x, post, comb = self.hc_pre(
-            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base, self.ffn_norm
         )
-        x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
         return self.hc_post(x, residual, post, comb)
 

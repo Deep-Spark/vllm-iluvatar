@@ -98,6 +98,9 @@ serving — see the comments at the top of the `Dockerfile`.
 
 ## Documentation
 
+The documentation is a MkDocs project (`mkdocs.yaml`) published through Read the Docs.
+
+- [User guide](docs/getting_started/quickstart.md) — installation, quick start, models, and release notes
 - [Plugin design](docs/design/iluvatar_plugin_design.md)
 - [Development setup](docs/guides/7-how-to-set-up-the-dev-environment.md)
 - [Model integration](docs/guides/2-how-to-quickly-adapt-a-community-model.md)

@@ -1,0 +1,52 @@
+{% set title = lang.t("toc") %}
+{% if config.mdx_configs.toc and config.mdx_configs.toc.title %}
+  {% set title = config.mdx_configs.toc.title %}
+{% endif %}
+<nav class="md-nav md-nav--secondary" aria-label="{{ title | e }}">
+  {% set toc = page.toc %}
+  {% set first = toc | first %}
+  {% if first and first.level == 1 %}
+    {% set toc = first.children %}
+  {% endif %}
+  {% set ns = namespace(fallback=[]) %}
+  {% macro consider(items) %}
+    {% for item in items %}
+      {% if item.children and item.active %}
+        {% set ns.fallback = item.children %}
+        {{ consider(item.children) }}
+      {% endif %}
+    {% endfor %}
+  {% endmacro %}
+  {{ consider(nav) }}
+  {% if toc or ns.fallback %}
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      {{ title }}
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      {% if toc %}
+        {% for toc_item in toc %}
+          {% include "partials/toc-item.html" %}
+        {% endfor %}
+      {% else %}
+        {% for item in ns.fallback %}
+          {% if not item.title %}
+          {% elif item.is_page and item.file and item.file.src_uri and item.file.src_uri.endswith("/index.md") %}
+          {% else %}
+            {% set href = item.url %}
+            {% if not href and item.page %}
+              {% set href = item.page.url %}
+            {% endif %}
+            {% if href %}
+              <li class="md-nav__item">
+                <a href="{{ href | url }}" class="md-nav__link{% if item.page is defined and item.page == page %} md-nav__link--active{% endif %}">
+                  <span class="md-ellipsis">{{ item.title }}</span>
+                </a>
+              </li>
+            {% endif %}
+          {% endif %}
+        {% endfor %}
+      {% endif %}
+    </ul>
+  {% endif %}
+</nav>

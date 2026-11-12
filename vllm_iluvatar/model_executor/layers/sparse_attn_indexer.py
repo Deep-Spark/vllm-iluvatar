@@ -20,6 +20,7 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
 
+from vllm_iluvatar import envs as ilu_envs
 from vllm_iluvatar.model_executor.kernels.attention.dsa.ilu_candidate_blocks import (
     apply_candidate_mask,
     apply_initialized_decode_candidate_mask,

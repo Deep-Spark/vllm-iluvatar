@@ -648,8 +648,13 @@ def _ilu_mxfp4_fused_experts_ixformer(
         )
     else:
         # DSv4 / MXFP4: clamp before silu (unchanged legacy behaviour).
+        padded_a2 = None
+        if w2_k > inter_size:
+            padded_a2 = torch.empty(
+                (M, w2_k), dtype=torch.float8_e4m3fn, device=gemm1_out.device
+            )
         a2_fp8, a2_scale = ixfops.swiglu_limit_dynamic_scaled_fp8(
-            gemm1_out, dst_to_src, float(swiglu_limit)
+            gemm1_out, dst_to_src, float(swiglu_limit), fp8_output=padded_a2
         )
     a2_fp8 = _zero_pad_last_dim(a2_fp8, w2_k)
 

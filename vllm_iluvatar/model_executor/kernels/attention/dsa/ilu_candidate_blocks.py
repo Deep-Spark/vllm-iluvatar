@@ -116,32 +116,24 @@ def select_candidate_blocks(
         if nblocks < out.shape[1]:
             out[:rows, nblocks:] = -1
         return
-    # Slice on group boundaries so each slice's bounds start at a group. The row
-    # cap shrinks as nblocks grows so ``rows * nblocks`` stays within budget.
-    # This bounded BF16 decode case fits in one top-k call. Its consumers
-    # build membership flags, so ordering the selected blocks is unnecessary.
-    # Keep the conservative scratch budget for larger/prefill workloads.
-    compact_decode = (
+    # Both fast paths select block membership, so top-k order is irrelevant.
+    supports_unsorted = (
         cuda_arch == "ivcore30"
-        and 48 <= rows <= 96
-        and width == 278528
         and logits.dtype == torch.bfloat16
         and row_ks is None
         and row_repeat == 1
         and topk_blocks == 2048
         and block_size == 8
     )
+    compact_decode = supports_unsorted and 48 <= rows <= 96 and width == 278528
     fast_prefill = (
         envs.VLLM_ILU_V41_PREFILL_UNSORTED
         and cuda_arch == "ivcore30"
         and 128 < rows <= 16384
         and 16384 < width <= 32768
-        and logits.dtype == torch.bfloat16
-        and row_ks is None
-        and row_repeat == 1
-        and topk_blocks == 2048
-        and block_size == 8
+        and ilu_envs.VLLM_ILU_V41_PREFILL_UNSORTED
     )
+    # Retain the scratch budget and group boundaries for other workloads.
     max_rows = (
         rows
         if compact_decode

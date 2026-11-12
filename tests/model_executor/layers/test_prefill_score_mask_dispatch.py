@@ -40,9 +40,7 @@ def test_score_mask_dispatch(
     )
     monkeypatch.setattr(indexer, "_mqa_logits_for_candidates", original)
     monkeypatch.setattr(indexer, "_two_level_filter", filtering)
-    monkeypatch.setattr(
-        indexer.ixfops, "dsa_update_topk_indices", topk, raising=False
-    )
+    monkeypatch.setattr(indexer.ixfops, "dsa_update_topk_indices", topk, raising=False)
     indexer._indexer_logits_and_topk(
         candidate_blocks=torch.empty(rows, 2048, dtype=torch.int32),
         candidate_block_size=8,

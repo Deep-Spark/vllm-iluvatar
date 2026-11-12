@@ -99,3 +99,22 @@ def test_decode_insert_folds_q_quant(monkeypatch):
     assert seen["q_scale"] is not None and seen["q_scale"].shape[0] == 1
     assert obj._prefill_q_source is not None
     assert obj._prefill_q_source[1] == 1
+
+
+@pytest.mark.parametrize(
+    ("canonical", "legacy", "expected"),
+    [(None, None, True), ("0", None, False), ("0", "1", True)],
+)
+def test_q_quant_has_one_effective_switch(monkeypatch, canonical, legacy, expected):
+    for name in (
+        "VLLM_ILU_V41_FUSED_Q_QUANT",
+        "VLLM_V41_FUSED_Q_QUANT",
+        "VLLM_ILU_V41_PREFILL_FUSED_Q",
+        "VLLM_V41_PREFILL_FUSED_Q",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    if canonical is not None:
+        monkeypatch.setenv("VLLM_ILU_V41_FUSED_Q_QUANT", canonical)
+    if legacy is not None:
+        monkeypatch.setenv("VLLM_V41_PREFILL_FUSED_Q", legacy)
+    assert attention.ilu_envs.VLLM_ILU_V41_FUSED_Q_QUANT is expected

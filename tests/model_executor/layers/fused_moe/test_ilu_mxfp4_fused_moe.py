@@ -998,10 +998,15 @@ def test_ixmm_pipeline_pads_only_w2_k(monkeypatch):
         torch.empty(_TOKENS * _TOPK, hidden_size, dtype=torch.float8_e4m3fn),
         torch.ones(_TOKENS * _TOPK, dtype=torch.float32),
     )
-    fake_ixfops.swiglu_limit_dynamic_scaled_fp8.return_value = (
-        torch.empty(_TOKENS * _TOPK, logical_inter_size, dtype=torch.float8_e4m3fn),
-        torch.ones(_TOKENS * _TOPK, dtype=torch.float32),
-    )
+
+    def _swiglu(*args, fp8_output):
+        assert fp8_output.shape == (_TOKENS * _TOPK, padded_inter_size)
+        out = fp8_output.view(torch.uint8)
+        out[:, :logical_inter_size].fill_(0x38)
+        out[:, logical_inter_size:].zero_()
+        return fp8_output, torch.ones(_TOKENS * _TOPK, dtype=torch.float32)
+
+    fake_ixfops.swiglu_limit_dynamic_scaled_fp8.side_effect = _swiglu
     fake_ixfops.moe_gather_output_reduce_sum.return_value = torch.zeros(
         _TOKENS, hidden_size, dtype=torch.bfloat16
     )
@@ -1035,6 +1040,8 @@ def test_ixmm_pipeline_pads_only_w2_k(monkeypatch):
         _TOKENS * _TOPK,
         2 * logical_inter_size,
     )
+    quant_call = fake_ixfops.swiglu_limit_dynamic_scaled_fp8.call_args
+    assert gemm_calls[1].args[0] is quant_call.kwargs["fp8_output"]
     assert gemm_calls[1].args[0].shape[-1] == padded_inter_size
     assert (
         torch.count_nonzero(gemm_calls[1].args[0][:, logical_inter_size:].float()) == 0

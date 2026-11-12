@@ -121,3 +121,41 @@ def test_e25_suffix_uses_separate_prefill_and_old_decode_calls(old_tokens, monke
         32: 4,
         36: 4,
     }
+
+
+@pytest.mark.parametrize(
+    ("reader_fused", "fused_prefix", "rope_start"),
+    [(False, 0, 0), (False, 2, 2), (False, 4, None), (True, 0, None)],
+)
+def test_output_projection_applies_inverse_rope_only_to_unfused_rows(
+    monkeypatch, reader_fused, fused_prefix, rope_start
+):
+    from types import SimpleNamespace
+
+    import torch
+
+    import vllm_iluvatar.models.deepseek_v41.attention as attention
+
+    obj = SimpleNamespace(
+        _uses_fused_inverse_rope=lambda: reader_fused,
+        _inv_rope_fused_tokens=fused_prefix,
+        _num_decode_tokens=lambda rows: 2,
+        _o_proj=lambda values: values,
+        wo_a=None,
+        cos_sin=None,
+    )
+    positions = torch.arange(4)
+    values = torch.zeros(4, 2)
+    applied = []
+
+    def apply_rope(q, positions, cos_sin, *, inverse):
+        assert inverse
+        applied.extend(positions.tolist())
+        q.add_(1)
+
+    monkeypatch.setattr(attention, "apply_rope", apply_rope)
+    result = attention.IluDeepseekV41Attention._project_attention_output(
+        obj, values, positions
+    )
+    assert result is values
+    assert applied == ([] if rope_start is None else list(range(rope_start, 4)))

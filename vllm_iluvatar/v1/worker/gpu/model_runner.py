@@ -204,6 +204,31 @@ def allocate_kv_cache_scale(
                 if quant == "KVINT8":
                     layer_idx = extract_layer_index(layer_name)
                     key = f"mtp.{layer_idx}" if "mtp" in layer_name else f"{layer_idx}"
+                    # MTP draft layers are not in the calibrated scale file
+                    # (keys are the base layers "0".."N"). Reuse the last base
+                    # layer, matching the 0.27 KVINT8 fallback.
+                    if key not in v_scales_map:
+                        if "mtp" not in layer_name:
+                            raise KeyError(
+                                f"KVINT8 v_scale file has no entry for layer {key}"
+                            )
+                        base_layer_keys = [
+                            scale_key
+                            for scale_key in v_scales_map
+                            if str(scale_key).isdecimal()
+                        ]
+                        if not base_layer_keys:
+                            raise RuntimeError(
+                                "No numeric base-layer key found in the KVINT8 V scale file"
+                            )
+                        fallback_idx = max(base_layer_keys, key=int)
+                        logger.warning(
+                            "[KVINT8] layer_idx=%s not in v_scale file, "
+                            "fallback to layer_idx:%s",
+                            key,
+                            fallback_idx,
+                        )
+                        key = fallback_idx
                     v_scale = v_scales_map[key]
                     assert v_scale.shape == (_h, v_head_size), (
                         f"KVINT8 v_scale for {key}: shape {tuple(v_scale.shape)} "

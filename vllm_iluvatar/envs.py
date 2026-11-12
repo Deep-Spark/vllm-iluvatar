@@ -86,6 +86,18 @@ def _get(new: str, old: str, default: str) -> str:
     return os.environ.get(old, default)
 
 
+def _ilu_bool_reader(name: str, default: str) -> Callable[[], bool]:
+    """Read an Iluvatar switch with its automatically derived legacy alias."""
+    old = "VLLM_" + name[len("VLLM_ILU_") :]
+    return lambda: _get(name, old, default).strip().lower() in _TRUE_VALS
+
+
+def _ilu_str_reader(name: str, default: str = "") -> Callable[[], str]:
+    """Read an Iluvatar string switch with its legacy alias."""
+    old = "VLLM_" + name[len("VLLM_ILU_") :]
+    return lambda: _get(name, old, default).strip()
+
+
 def _step5_bool(suffix: str, default: str) -> bool:
     """Step5 switches accept exactly 0/1, including through legacy aliases."""
     name = f"VLLM_ILU_STEP5_{suffix}"
@@ -240,6 +252,18 @@ if TYPE_CHECKING:
     VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP: bool = False
     VLLM_ILU_MOE_AG_SHARED_OVERLAP: bool = False
     VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP: bool = True
+    VLLM_ILU_V41_PREFILL_UNSORTED: bool = False
+    VLLM_ILU_V41_PREFILL_FP8_O_PROJ: bool = False
+    VLLM_ILU_V41_PREFILL_SCORE_MASK: bool = False
+    VLLM_ILU_V41_PREFILL_FUSED_Q: bool = False
+    VLLM_ILU_V41_FUSED_Q_QUANT: bool = True
+    VLLM_ILU_V41_PREFILL_PP_QUANT_SENDERS: str = ""
+    VLLM_ILU_V41_FP8_NORM_SMALL_BATCH: bool = True
+    VLLM_ILU_V41_FP8_INDEXER_BACKEND: str = "ixformer_native"
+    VLLM_ILU_V41_INDEXER_KV_DTYPE: str = ""
+    VLLM_ILU_V41_MHC_FUSE_REDUCTIONS: bool = True
+    VLLM_ILU_V41_FUSE_FP8_NORM: bool = True
+    VLLM_ILU_V41_ALLREDUCE_MHC_POST: bool = True
     VLLM_ILU_GLM_DSA_INDEXER_PREPARE_FUSION: bool = True
     VLLM_ILU_NIXL_WRITE_USE_HOST_BUFFER: bool = False
     VLLM_ILU_NIXL_HOST_DTYPE: str = "auto"
@@ -364,6 +388,45 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
             "0",
         ).lower()
         in ("1", "true")
+    ),
+    # DeepSeek-V4.1 optimization switches. Keep these in the same reader
+    # registry as the other Iluvatar switches so both canonical and legacy
+    # names are recognized and values are read at use time.
+    "VLLM_ILU_V41_PREFILL_UNSORTED": _ilu_bool_reader(
+        "VLLM_ILU_V41_PREFILL_UNSORTED", "0"
+    ),
+    "VLLM_ILU_V41_PREFILL_FP8_O_PROJ": _ilu_bool_reader(
+        "VLLM_ILU_V41_PREFILL_FP8_O_PROJ", "0"
+    ),
+    "VLLM_ILU_V41_PREFILL_SCORE_MASK": _ilu_bool_reader(
+        "VLLM_ILU_V41_PREFILL_SCORE_MASK", "0"
+    ),
+    "VLLM_ILU_V41_PREFILL_FUSED_Q": _ilu_bool_reader(
+        "VLLM_ILU_V41_PREFILL_FUSED_Q", "0"
+    ),
+    "VLLM_ILU_V41_FUSED_Q_QUANT": _ilu_bool_reader(
+        "VLLM_ILU_V41_FUSED_Q_QUANT", "1"
+    ),
+    "VLLM_ILU_V41_PREFILL_PP_QUANT_SENDERS": _ilu_str_reader(
+        "VLLM_ILU_V41_PREFILL_PP_QUANT_SENDERS"
+    ),
+    "VLLM_ILU_V41_FP8_NORM_SMALL_BATCH": _ilu_bool_reader(
+        "VLLM_ILU_V41_FP8_NORM_SMALL_BATCH", "1"
+    ),
+    "VLLM_ILU_V41_FP8_INDEXER_BACKEND": _ilu_str_reader(
+        "VLLM_ILU_V41_FP8_INDEXER_BACKEND", "ixformer_native"
+    ),
+    "VLLM_ILU_V41_INDEXER_KV_DTYPE": _ilu_str_reader(
+        "VLLM_ILU_V41_INDEXER_KV_DTYPE"
+    ),
+    "VLLM_ILU_V41_MHC_FUSE_REDUCTIONS": _ilu_bool_reader(
+        "VLLM_ILU_V41_MHC_FUSE_REDUCTIONS", "1"
+    ),
+    "VLLM_ILU_V41_FUSE_FP8_NORM": _ilu_bool_reader(
+        "VLLM_ILU_V41_FUSE_FP8_NORM", "1"
+    ),
+    "VLLM_ILU_V41_ALLREDUCE_MHC_POST": _ilu_bool_reader(
+        "VLLM_ILU_V41_ALLREDUCE_MHC_POST", "1"
     ),
 }
 

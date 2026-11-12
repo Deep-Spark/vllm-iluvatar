@@ -3,18 +3,11 @@
 
 from __future__ import annotations
 
-import os
-
 import torch
 from ixformer.inference.functions.models import deepseek_v41 as ixfops
+from vllm import envs
 
 from vllm_iluvatar.ilu_util.arch import is_ivcore30
-
-_fuse_reductions = os.getenv("VLLM_ILU_V41_MHC_FUSE_REDUCTIONS", "1") != "0"
-# Fold the fused_wqa_wkv per-token fp8 activation quant into the pre-norm kernel.
-_fuse_fp8_norm = os.getenv("VLLM_ILU_V41_FUSE_FP8_NORM", "1") != "0"
-# Allow the fused fp8 epilogue for small batches (decode T<=16).
-_fuse_fp8_norm_small_batch = os.getenv("VLLM_ILU_V41_FP8_NORM_SMALL_BATCH", "1") != "0"
 
 
 def _want_fused_fp8(
@@ -40,9 +33,17 @@ def _want_fused_fp8(
     """
     if not is_ivcore30():
         return False
-    if not (_fuse_fp8_norm and want_fp8 and layer_norm_weight is not None):
+    if not (
+        envs.VLLM_ILU_V41_FUSE_FP8_NORM
+        and want_fp8
+        and layer_norm_weight is not None
+    ):
         return False
-    if _fuse_reductions and num_tokens <= 16 and not _fuse_fp8_norm_small_batch:
+    if (
+        envs.VLLM_ILU_V41_MHC_FUSE_REDUCTIONS
+        and num_tokens <= 16
+        and not envs.VLLM_ILU_V41_FP8_NORM_SMALL_BATCH
+    ):
         return False
     return not (sqrsum.dim() == 2 and sqrsum.shape[1] > 1)
 
@@ -103,7 +104,7 @@ def hc_pre_mixes(
             post_mult,
             sinkhorn_iters,
             pre_mix_in,
-            fuse_reductions=_fuse_reductions,
+            fuse_reductions=envs.VLLM_ILU_V41_MHC_FUSE_REDUCTIONS,
         )
     elif _want_fused_fp8(want_fp8, layer_norm_weight, sqrsum, x.shape[0]):
         # Fold the per-token fp8 activation quant of ``layer_input`` into the
@@ -148,7 +149,7 @@ def hc_pre_mixes(
             pre_mix_in,
             layer_norm_weight,
             layer_norm_eps,
-            fuse_reductions=_fuse_reductions,
+            fuse_reductions=envs.VLLM_ILU_V41_MHC_FUSE_REDUCTIONS,
         )
     return post.squeeze(-1), comb, layer_input, pre_out, fp8_h, h_scale
 
@@ -211,7 +212,7 @@ def hc_post_sqrsum(
     """
     post_op = (
         ixfops.mhc_post_partials
-        if _fuse_reductions and residual.shape[0] <= 16
+        if envs.VLLM_ILU_V41_MHC_FUSE_REDUCTIONS and residual.shape[0] <= 16
         else ixfops.mhc_post_with_sqrsum
     )
     return post_op(

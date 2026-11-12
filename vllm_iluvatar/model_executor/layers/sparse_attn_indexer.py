@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-import os
-
 import ixformer.inference.functions as ixfops
 import torch
 from ixformer.cuda import cuda_arch
@@ -32,9 +30,6 @@ from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
 )
 
 logger = init_logger(__name__)
-
-_PREFILL_SCORE_MASK = os.environ.get("VLLM_ILU_V41_PREFILL_SCORE_MASK", "0") == "1"
-
 
 def _mqa_logits(*args, **kwargs):
     """Paged MQA logits for one chunk.
@@ -186,7 +181,7 @@ def _indexer_logits_and_topk(
     if (
         candidate_blocks is None
         and kv_cache.dtype == torch.uint8
-        and os.environ.get("VLLM_ILU_V41_INDEXER_KV_DTYPE") == "fp8"
+        and envs.VLLM_ILU_V41_INDEXER_KV_DTYPE == "fp8"
     ):
         indexer_mqa_topk_fp8(
             q,
@@ -204,15 +199,13 @@ def _indexer_logits_and_topk(
             max_context_len=max_context_len,
             valid_lens=valid_lens,
             logits=logits,
-            backend=os.environ.get(
-                "VLLM_ILU_V41_FP8_INDEXER_BACKEND", "ixformer_native"
-            ),
+            backend=envs.VLLM_ILU_V41_FP8_INDEXER_BACKEND,
             previous_extent=previous_extent,
         )
         return
 
     if (
-        _PREFILL_SCORE_MASK
+        envs.VLLM_ILU_V41_PREFILL_SCORE_MASK
         and is_prefill
         and cuda_arch == "ivcore30"
         and candidate_blocks is not None

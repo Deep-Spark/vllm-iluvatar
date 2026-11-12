@@ -33,6 +33,9 @@ def _install_fake_ixformer(monkeypatch):
 
 def _load_sparse_attn_indexer(monkeypatch):
     _install_fake_ixformer(monkeypatch)
+    from vllm_iluvatar import envs as ilu_envs
+
+    ilu_envs.apply()
     return importlib.import_module(
         "vllm_iluvatar.model_executor.layers.sparse_attn_indexer"
     )

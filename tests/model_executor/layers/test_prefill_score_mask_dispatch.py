@@ -5,6 +5,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm_iluvatar import envs as ilu_envs
 from vllm_iluvatar.model_executor.layers import sparse_attn_indexer as indexer
 
 
@@ -23,12 +24,13 @@ from vllm_iluvatar.model_executor.layers import sparse_attn_indexer as indexer
 def test_score_mask_dispatch(
     monkeypatch, prefill, enabled, writer, heads, width, expected
 ):
+    ilu_envs.apply()
+    monkeypatch.setenv("VLLM_ILU_V41_PREFILL_SCORE_MASK", "1" if enabled else "0")
     rows = 256
     fake_logits = torch.empty(rows, 1)
     masked = Mock(return_value=fake_logits)
     original = Mock(return_value=fake_logits)
     filtering, topk = Mock(), Mock()
-    monkeypatch.setattr(indexer, "_PREFILL_SCORE_MASK", enabled)
     monkeypatch.setattr(indexer, "cuda_arch", "ivcore30")
     monkeypatch.setattr(
         indexer.ixfops,

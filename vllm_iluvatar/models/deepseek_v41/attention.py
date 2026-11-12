@@ -131,9 +131,6 @@ warnings.filterwarnings(
 )
 
 # Fold Q E4M3 quant into qkv_rope_fp8_pt_insert so decode (and prefill)
-_PREFILL_FUSED_Q = os.environ.get("VLLM_ILU_V41_PREFILL_FUSED_Q", "0") == "1"
-_FUSED_INSERT_Q_QUANT = os.environ.get("VLLM_ILU_V41_FUSED_Q_QUANT", "1") == "1"
-
 _INDEX_TILE = 256
 _PACKED_MLA_HEADS = (1, 8, 16, 32, 64, 128)
 _PT_MLA_HEADS = (1, 4, 8, 16, 32, 64, 128)
@@ -1826,7 +1823,10 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         if self.kv_cache_dtype == "fp8_e4m3":
             n = q.shape[0]
             fuse_q = (
-                (_FUSED_INSERT_Q_QUANT or _PREFILL_FUSED_Q)
+                (
+                    envs.VLLM_ILU_V41_FUSED_Q_QUANT
+                    or envs.VLLM_ILU_V41_PREFILL_FUSED_Q
+                )
                 and hasattr(self, "_q_fp8_pt")
                 and hasattr(self, "_q_scale_pt")
             )

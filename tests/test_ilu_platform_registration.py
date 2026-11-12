@@ -99,6 +99,55 @@ def test_new_ilu_env_readers_are_registered(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("name", "default", "enabled"),
+    [
+        ("VLLM_ILU_V41_PREFILL_UNSORTED", False, True),
+        ("VLLM_ILU_V41_PREFILL_SCORE_MASK", False, True),
+        ("VLLM_ILU_V41_FUSED_Q_QUANT", True, False),
+        ("VLLM_ILU_V41_FP8_NORM_SMALL_BATCH", True, False),
+    ],
+)
+def test_v41_optimization_envs_have_canonical_and_legacy_readers(
+    monkeypatch, name, default, enabled
+):
+    envs = importlib.import_module("vllm_iluvatar.envs")
+    monkeypatch.setattr(
+        vllm_envs, "environment_variables", dict(vllm_envs.environment_variables)
+    )
+    canonical = name
+    legacy = "VLLM_" + name[len("VLLM_ILU_") :]
+    monkeypatch.delenv(canonical, raising=False)
+    monkeypatch.delenv(legacy, raising=False)
+    envs.apply()
+
+    registered = vllm_envs.environment_variables
+    assert canonical in registered
+    assert legacy in registered
+    assert registered[canonical]() is default
+
+    monkeypatch.setenv(legacy, "1" if enabled else "0")
+    assert registered[canonical]() is enabled
+    monkeypatch.setenv(canonical, "0" if enabled else "1")
+    assert registered[canonical]() is not enabled
+
+
+def test_v41_string_env_reader_prefers_canonical_name(monkeypatch):
+    envs = importlib.import_module("vllm_iluvatar.envs")
+    monkeypatch.setattr(
+        vllm_envs, "environment_variables", dict(vllm_envs.environment_variables)
+    )
+    canonical = "VLLM_ILU_V41_PREFILL_PP_QUANT_SENDERS"
+    legacy = "VLLM_V41_PREFILL_PP_QUANT_SENDERS"
+    monkeypatch.setenv(legacy, "0, 1")
+    monkeypatch.delenv(canonical, raising=False)
+    envs.apply()
+    reader = vllm_envs.environment_variables[canonical]
+    assert reader() == "0, 1"
+    monkeypatch.setenv(canonical, "all")
+    assert reader() == "all"
+
+
+@pytest.mark.parametrize(
     ("is_ivcore30", "expected"),
     [(True, True), (False, False)],
     ids=["ivcore30", "other-arch"],

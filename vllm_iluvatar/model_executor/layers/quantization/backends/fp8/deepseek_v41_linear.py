@@ -3,10 +3,10 @@
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING
 
 import torch
+from vllm import envs
 from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_scale_parameter,
@@ -131,7 +131,7 @@ class IluDeepseekV41Bf16DequantLinearMethod(LinearMethodBase):
             out_dtype=getattr(layer, "ilu_dequant_dtype", torch.bfloat16),
         )
         layer.weight = torch.nn.Parameter(dequantized, requires_grad=False)
-        if os.environ.get("VLLM_ILU_V41_PREFILL_FP8_O_PROJ", "0") == "1" and hasattr(
+        if envs.VLLM_ILU_V41_PREFILL_FP8_O_PROJ and hasattr(
             layer, "bmm_geom"
         ):
             geom = layer.bmm_geom

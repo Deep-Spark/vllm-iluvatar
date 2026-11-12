@@ -18,7 +18,6 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 
 logger = init_logger("vllm." + __name__)
 
@@ -143,17 +142,43 @@ def sample_sequential(self: Any, num_reqs: int, head_hidden: torch.Tensor) -> No
 def make_init_cudagraph_manager(
     original: Callable[..., None],
 ) -> Callable[..., None]:
-    """Make speculative enforce_eager apply only to the DSpark draft graph."""
+    """Select the independent DSpark eager or backbone-only graph policy."""
 
     def init_cudagraph_manager(self: Any, cudagraph_mode: Any) -> None:
+        from vllm import envs
         from vllm.config.compilation import CUDAGraphMode
+        from vllm.distributed import get_pp_group
 
-        if self.speculative_config.enforce_eager:
+        backbone_only = envs.VLLM_ILU_DSPARK_BACKBONE_GRAPH
+        if backbone_only and (
+            get_tensor_model_parallel_world_size() != 1
+            or get_pp_group().world_size != 1
+            or envs.VLLM_ILU_DP_VOCAB_GROUP_SIZE < 2
+            or cudagraph_mode.decode_mode() != CUDAGraphMode.FULL
+            or self.vllm_config.lora_config is not None
+        ):
+            raise ValueError(
+                "DSpark backbone graphs require TP1/PP1, DP vocabulary "
+                "projection, full decode graphs, and no LoRA adapters"
+            )
+        if self.speculative_config.enforce_eager and not backbone_only:
             logger.info(
                 "DSpark CUDA graph disabled by speculative_config.enforce_eager; "
                 "target CUDA graph policy is unchanged."
             )
             cudagraph_mode = CUDAGraphMode.NONE
         original(self, cudagraph_mode)
+        if backbone_only:
+            from .dspark_backbone_graph import DSparkBackboneGraph
+
+            state = getattr(self, "_ilu_backbone_graph", None)
+            if state is None:
+                state = DSparkBackboneGraph(self)
+                self._ilu_backbone_graph = state
+            state.bind_manager(self.query_cudagraph_manager)
+            logger.info(
+                "DSpark backbone CUDA graph enabled; distributed projection "
+                "and Markov sampling stay eager."
+            )
 
     return init_cudagraph_manager

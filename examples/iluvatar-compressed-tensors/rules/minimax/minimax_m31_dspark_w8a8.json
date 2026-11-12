@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "name": "minimax_m31_dspark_w8a8",
+  "load_device": "cpu",
+  "model_config_patch": {},
+  "default_action": "keep",
+  "rules": [
+    {
+      "id": "drop_dspark_scale_inv",
+      "priority": 300,
+      "match": {
+        "regex": [
+          "\\.weight_scale_inv$"
+        ]
+      },
+      "action": "drop"
+    },
+    {
+      "id": "dspark_mxfp8_to_w8a8",
+      "priority": 200,
+      "match": {
+        "regex": [
+          "^language_model\\.model\\.dspark\\.layers\\.\\d+\\.decoder_layer\\.(self_attn\\.(q_proj|k_proj|v_proj|o_proj)|mlp\\.(gate_proj|up_proj|down_proj))\\.weight$"
+        ],
+        "dtypes": [
+          "float8_e4m3fn"
+        ]
+      },
+      "action": "convert",
+      "scale": {
+        "from_suffix": ".weight",
+        "to_suffix": ".weight_scale_inv"
+      },
+      "dequant": {
+        "method": "mxfp8_ue8m0",
+        "options": {
+          "block_size": 32
+        }
+      },
+      "quant": {
+        "method": "int8_per_channel",
+        "options": {
+          "group_size": -1,
+          "symmetric": true
+        }
+      },
+      "outputs": {
+        "weight": ".weight",
+        "weight_scale": ".weight_scale"
+      }
+    }
+  ]
+}

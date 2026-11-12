@@ -33,15 +33,24 @@ def normalize_dspark_config(config):
         rope_theta=raw["rope_theta"],
         partial_rotary_factor=raw["partial_rotary_factor"],
     )
-    quant = copy.deepcopy(raw["quantization_config"])
-    quant["ignored_layers"] = list(quant.get("ignored_layers", [])) + [
-        "model.fc",
-        "markov_head",
-        "confidence_head",
-        "lm_head",
-        "embed_tokens",
-    ]
-    raw["quantization_config"] = quant
+    # Tolerate drafts that carry no quantization_config at all, and extend
+    # ``ignored_layers`` only for the ModelOpt/MXFP8 schema that field belongs
+    # to: a compressed-tensors doc (e.g. the W8A8 DSpark recipe) uses
+    # ``ignore`` instead and must not get a foreign key injected.
+    quant = raw.get("quantization_config") or None
+    if quant is None:
+        raw.pop("quantization_config", None)
+    else:
+        quant = copy.deepcopy(quant)
+        if "ignored_layers" in quant or quant.get("quant_method") == "mxfp8":
+            quant["ignored_layers"] = list(quant.get("ignored_layers", [])) + [
+                "model.fc",
+                "markov_head",
+                "confidence_head",
+                "lm_head",
+                "embed_tokens",
+            ]
+        raw["quantization_config"] = quant
     result = PretrainedConfig(**raw)
     result.model_type = "minimax_m3_dspark"
     return result

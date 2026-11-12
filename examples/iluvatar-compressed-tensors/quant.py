@@ -337,11 +337,16 @@ class RuleSet:
                         f"rules[{index}] unknown quant method {quant_method!r}"
                     )
             scale = item.get("scale")
+            allowed_scale_keys = {"from_suffix", "to_suffix", "global_to_suffix"}
             if scale is not None and (
                 not isinstance(scale, dict)
-                or set(scale) != {"from_suffix", "to_suffix"}
+                or set(scale) - allowed_scale_keys
+                or not {"from_suffix", "to_suffix"} <= set(scale)
             ):
-                raise ProfileError(f"rules[{index}].scale needs from_suffix/to_suffix")
+                raise ProfileError(
+                    f"rules[{index}].scale needs from_suffix/to_suffix "
+                    "(and optional global_to_suffix)"
+                )
             dequant_options = dequant.get("options", {})
             quant_options = quant.get("options", {})
             if not isinstance(dequant_options, dict) or not isinstance(
@@ -473,11 +478,24 @@ def _convert_tensor(
         return {name: tensor}
 
     scale = None
+    dequant_options = rule.dequant_options
     if rule.scale is not None:
         scale_name = _replace_suffix(
             name, rule.scale["from_suffix"], rule.scale["to_suffix"]
         )
         scale = store.get(scale_name)
+        global_to_suffix = rule.scale.get("global_to_suffix")
+        if global_to_suffix:
+            # A per-tensor global scale companion (e.g. CT NVFP4
+            # ``weight_global_scale``) cannot live in static rule options, so
+            # fetch it here and inject it into the dequant options.
+            global_name = _replace_suffix(
+                name, rule.scale["from_suffix"], global_to_suffix
+            )
+            dequant_options = {
+                **rule.dequant_options,
+                "global_scale": store.get(global_name).to(tensor.device),
+            }
 
     target_device = (
         work_device
@@ -492,13 +510,13 @@ def _convert_tensor(
             tensor,
             scale,
             dequant_method=rule.dequant_method,
-            dequant_options=rule.dequant_options,
+            dequant_options=dequant_options,
             quant_options=rule.quant_options,
             work_device=target_device,
         )
     else:
         value = DEQUANT_METHODS[rule.dequant_method](  # type: ignore[index]
-            tensor, scale, rule.dequant_options
+            tensor, scale, dequant_options
         )
         if rule.work_device:
             value = value.to(target_device)
@@ -591,7 +609,14 @@ def _write_model_config(
             target.pop(key, None)
         else:
             target[key] = value
-    model_config["quantization_config"] = quant_config
+    if quant_config:
+        model_config["quantization_config"] = quant_config
+    else:
+        # A falsy (empty) configs document means the output must NOT declare
+        # any quantization method, so vllm builds every projection
+        # unquantized. Writing an empty ``quantization_config`` dict instead
+        # would crash ModelConfig's quant_method lookup with a KeyError.
+        model_config.pop("quantization_config", None)
     with (output_path / "config.json").open("w", encoding="utf-8") as file:
         json.dump(model_config, file, indent=2)
 
@@ -660,12 +685,19 @@ def convert(
         save_file(output, str(output_dir / shard_path.name))
 
     for source in input_dir.iterdir():
-        if (
-            source.is_file()
-            and source.suffix != ".safetensors"
-            and source.name not in {"model.safetensors.index.json", "config.json"}
-        ):
-            shutil.copy(source, output_dir / source.name)
+        if source.is_file():
+            if (
+                source.suffix != ".safetensors"
+                and source.name not in {"model.safetensors.index.json", "config.json"}
+            ):
+                shutil.copy(source, output_dir / source.name)
+        else:
+            # Carry companion directories verbatim, e.g. the dspark draft
+            # model (``dspark/`` with its own config, safetensors shard and
+            # index). Top-level ``*.safetensors`` and the model index are the
+            # converted outputs and stay excluded; nested drafts must ship
+            # with the quantized model for speculative decoding to work.
+            shutil.copytree(source, output_dir / source.name, dirs_exist_ok=True)
 
     # Rebuild only after a complete conversion. Partial jobs can be merged and
     # finalized by rerunning with the complete output directory.

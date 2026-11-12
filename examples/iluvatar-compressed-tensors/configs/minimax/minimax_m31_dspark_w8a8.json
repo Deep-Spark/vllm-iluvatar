@@ -1,0 +1,42 @@
+{
+  "quant_method": "compressed-tensors",
+  "format": "iluvatar-mixed",
+  "config_groups": {
+    "draft_linears": {
+      "format": "int-quantized",
+      "targets": [
+        "re:.*\\.self_attn\\.(qkv_proj|o_proj)$",
+        "re:.*\\.mlp\\.(gate_up_proj|down_proj)$"
+      ],
+      "weights": {
+        "num_bits": 8,
+        "type": "int",
+        "symmetric": true,
+        "strategy": "channel",
+        "group_size": null,
+        "dynamic": false
+      },
+      "input_activations": {
+        "num_bits": 8,
+        "type": "int",
+        "symmetric": true,
+        "strategy": "token",
+        "group_size": null,
+        "dynamic": true
+      },
+      "output_activations": null,
+      "iluvatar": {
+        "gemm_format": "TN",
+        "mixed_strategy": "CHANNEL",
+        "gemm_mode": "PERF"
+      }
+    }
+  },
+  "ignore": [
+    "lm_head",
+    "embed_tokens",
+    "fc",
+    "markov_head",
+    "confidence_head"
+  ]
+}

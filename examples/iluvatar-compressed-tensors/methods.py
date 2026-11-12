@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -79,6 +80,19 @@ def _decode_e8m0(scale: torch.Tensor) -> torch.Tensor:
         scale = scale.view(torch.uint8).view(torch.float8_e8m0fnu)
     return scale.float()
 
+
+def _decode_fp4_e2m1_nibbles(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack uint8 NV/MX FP4 nibbles ``[N, K/2]`` → float32 ``[N, K]``."""
+    lut = _FP4_E2M1_MAGNITUDES.to(device=packed.device, dtype=torch.float32)
+
+    def decode(nibble: torch.Tensor) -> torch.Tensor:
+        sign = ((nibble & 0x08) != 0).to(torch.float32)
+        magnitude = lut[(nibble & 0x07).long()]
+        return magnitude * (1.0 - 2.0 * sign)
+
+    low = decode(packed & 0x0F)
+    high = decode((packed >> 4) & 0x0F)
+    return torch.stack((low, high), dim=-1).reshape(packed.shape[0], packed.shape[1] * 2)
 
 def _block_dequant_1d(
     weight: torch.Tensor,
@@ -296,6 +310,179 @@ def dequant_mxfp4_block32(
     unpacked = torch.stack((low, high), dim=-1).reshape(out_dim, in_dim)
     return unpacked * _decode_e8m0(scale).repeat_interleave(32, dim=1)
 
+@register_dequant("mxfp8_ue8m0")
+def dequant_mxfp8_ue8m0(
+    weight: torch.Tensor,
+    scale: torch.Tensor | None,
+    options: Mapping[str, Any],
+) -> torch.Tensor:
+    """MXFP8 e4m3 + UE8M0 block scale with ``weight_block_size=[1, block]``.
+
+    MiniMax-M3.1-Flash dense/shared linears store scale as ``[N, K/block]`` and
+    broadcast **only along K** (not a 2-D ``block×block`` tile). Matches
+    ``IluMxFp8ToW8A8OnlineLinearMethod`` / ``_dequant_mxfp8_to_fp32``.
+    """
+    scale = _require_scale(scale, "mxfp8_ue8m0", weight)
+    if weight.dim() != 2 or scale.dim() != 2:
+        raise ValueError(
+            f"mxfp8_ue8m0 expects 2-D weight/scale, got {weight.shape}/{scale.shape}"
+        )
+    block_size = int(options.get("block_size", 32))
+    rows, cols = weight.shape
+    if block_size <= 0 or cols % block_size:
+        raise ValueError(
+            f"mxfp8_ue8m0 K={cols} must be divisible by block_size={block_size}"
+        )
+    expected = (rows, cols // block_size)
+    if tuple(scale.shape) != expected:
+        raise ValueError(
+            f"mxfp8_ue8m0 scale shape {tuple(scale.shape)} != expected {expected}"
+        )
+    sc = _decode_e8m0(scale).repeat_interleave(block_size, dim=-1)
+    return weight.float() * sc
+
+
+def _decode_e4m3(scale: torch.Tensor) -> torch.Tensor:
+    """Decode FP8 E4M3 block scales that may be stored as raw int8/uint8 bytes.
+
+    An e4m3 byte read as an integer is silently wrong by orders of magnitude
+    (``0x38`` decodes to ``56.0`` instead of ``0.5``), so view-then-float is
+    required whenever the scale is not already a float dtype.
+    """
+    if scale.dtype in (torch.int8, torch.uint8):
+        scale = scale.view(torch.float8_e4m3fn)
+    return scale.float()
+
+
+def _nvfp4_global_scales(value: Any, count: int, device: torch.device) -> list[float]:
+    """Read ``count`` CT ``weight_global_scale`` **divisors** for one weight pack.
+
+    Accepts a scalar (tensor or number, shared by every expert) or a ``[count]``
+    tensor of per-expert scalars (stacked checkpoints).
+    """
+    if value is None:
+        raise TypeError(
+            "nvfp4_pack requires options['global_scale'] (the CT divisor "
+            "companion tensor); it must be injected by the caller, since static "
+            "rule options cannot carry per-tensor checkpoint values"
+        )
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        raw = [float(value)] * count
+    elif isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            raw = [
+                float(value.detach().to(device=device, dtype=torch.float32).reshape(()))
+            ] * count
+        elif value.numel() == count:
+            flat = value.detach().to(device=device, dtype=torch.float32).reshape(-1)
+            raw = flat.cpu().tolist()
+        else:
+            raise ValueError(
+                "NVFP4 global_scale must be scalar or "
+                f"[{count}], got shape {tuple(value.shape)}"
+            )
+    else:
+        raise TypeError(
+            "nvfp4_pack global_scale must be a scalar tensor, a number, or a "
+            f"[{count}] tensor, got {type(value)}"
+        )
+    for g in raw:
+        if not math.isfinite(g) or g <= 0.0:
+            raise ValueError(f"NVFP4 global_scale must be finite and >0, got {g}")
+    return raw
+
+
+def _dequant_nvfp4_pack_2d(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    inv_global: float,
+    group_size: int,
+) -> torch.Tensor:
+    """Dequantize one expert: uint8 nibbles + e4m3 blocks + global divisor."""
+    out_dim, packed_dim = packed.shape
+    in_dim = packed_dim * 2
+    if in_dim % group_size:
+        raise ValueError(
+            f"NVFP4 K={in_dim} must be divisible by group_size={group_size}"
+        )
+    expected_scale = (out_dim, in_dim // group_size)
+    if tuple(scale.shape) != expected_scale:
+        raise ValueError(
+            f"NVFP4 scale shape {tuple(scale.shape)} != expected {expected_scale}"
+        )
+
+    block = _decode_e4m3(scale)
+    if not bool(torch.isfinite(block).all()):
+        raise ValueError("NVFP4 block scales contain non-finite values")
+    if bool((block < 0).any()):
+        raise ValueError("NVFP4 block scales must be non-negative (e4m3 absmax)")
+
+    unpacked = _decode_fp4_e2m1_nibbles(packed)  # [N, K]
+    # Broadcast per-group scales without materializing a full [N, K] copy.
+    value = unpacked.view(out_dim, in_dim // group_size, group_size)
+    value.mul_(block.unsqueeze(-1))
+    return value.reshape(out_dim, in_dim).mul_(inv_global)
+
+
+@register_dequant("nvfp4_pack")
+def dequant_nvfp4_pack(
+    weight: torch.Tensor,
+    scale: torch.Tensor | None,
+    options: Mapping[str, Any],
+) -> torch.Tensor:
+    """MiniMax-M3.1-Flash NVFP4 experts: uint8 pack + e4m3 block + CT global divisor.
+
+    Checkpoint layout is ``[N, K/2]`` packed (low nibble first, matching
+    ``break_fp4_bytes``) + ``[N, K/group_size]`` e4m3 block scale + scalar
+    ``weight_global_scale``. Compressed-Tensors stores the global scale as a
+    **divisor**: ``w = fp4 * block_scale / g`` with ``g ≈ 448*6/amax`` (large).
+    Verified on the M3.1-Flash checkpoint (``g ≈ 1.5e4``, blocks in
+    ``[88, 208]``; dequant gives ~1e-2 weights, the ModelOpt-style *multiply*
+    convention would give ~1e6). Do not confuse with ModelOpt's
+    ``weight_scale_2`` (``amax/(448*6)``, small, a multiplier).
+
+    ``options["global_scale"]`` is the scalar checkpoint companion tensor (or a
+    number, or an ``[E]`` per-expert tensor for stacked input) and must be
+    injected by the caller — static rule options cannot carry it.
+    """
+    scale = _require_scale(scale, "nvfp4_pack", weight)
+    group_size = int(options.get("group_size", 16))
+    if group_size <= 0:
+        raise ValueError(f"NVFP4 group_size must be positive, got {group_size}")
+
+    if weight.dtype == torch.int8:
+        packed = weight.view(torch.uint8)
+    elif weight.dtype == torch.uint8:
+        packed = weight
+    else:
+        raise TypeError(f"NVFP4 weight must be int8/uint8, got {weight.dtype}")
+
+    if packed.dim() == 3 and scale.dim() == 3:
+        # Stacked MoE packs: [num_experts, N, K/2] + [num_experts, N, K/gs].
+        inv_globals = [
+            1.0 / g
+            for g in _nvfp4_global_scales(
+                options.get("global_scale"), packed.shape[0], weight.device
+            )
+        ]
+        return torch.stack(
+            [
+                _dequant_nvfp4_pack_2d(w, s, ig, group_size)
+                for w, s, ig in zip(
+                    packed.unbind(0), scale.unbind(0), inv_globals, strict=True
+                )
+            ],
+            dim=0,
+        )
+    if packed.dim() != 2:
+        raise ValueError(
+            "NVFP4 weight expects 2-D [N, K/2] or 3-D [E, N, K/2], got "
+            f"{tuple(packed.shape)}"
+        )
+    inv_global = 1.0 / _nvfp4_global_scales(
+        options.get("global_scale"), 1, weight.device
+    )[0]
+    return _dequant_nvfp4_pack_2d(packed, scale, inv_global, group_size)
 
 @register_dequant("int4_group")
 def dequant_int4_group(

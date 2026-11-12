@@ -293,6 +293,19 @@ class IluMiniMaxDSparkForCausalLM(Qwen3DSparkForCausalLM):
             "confidence_head.proj.weight",
             "confidence_head.proj.bias",
         }
+        # Projections must ship ``.weight_scale`` only when the draft module
+        # was actually built with a scale-carrying linear method (MXFP8 on
+        # ivcore30, W8A8 via the ``minimax_m31_dspark_w8a8`` recipe on
+        # ivcore11). Deriving the contract from the module instead of
+        # hardcoding the MXFP8 shape keeps the loader correct for either
+        # construction and turns a module/checkpoint mismatch into an
+        # actionable error rather than a generic "missing weights" list.
+        module_param_names = {name for name, _ in self.model.named_parameters()}
+        module_param_names.update(name for name, _ in self.model.named_buffers())
+        has_scale_params = any(
+            name.endswith(".weight_scale") for name in module_param_names
+        )
+        proj_suffixes = (".weight", ".weight_scale") if has_scale_params else (".weight",)
         for i in range(self.config.num_hidden_layers):
             stem = f"layers.{i}."
             expected.update(
@@ -315,7 +328,7 @@ class IluMiniMaxDSparkForCausalLM(Qwen3DSparkForCausalLM):
                     "mlp.up_proj",
                     "mlp.down_proj",
                 )
-                for suffix in (".weight", ".weight_scale")
+                for suffix in proj_suffixes
             )
         seen = set()
 
@@ -331,6 +344,14 @@ class IluMiniMaxDSparkForCausalLM(Qwen3DSparkForCausalLM):
                     name = "norm." + name.removeprefix("final_norm.")
                 name = name.replace("weight_scale_inv", "weight_scale")
                 if name in seen or name not in expected:
+                    if name.endswith(".weight_scale") and not has_scale_params:
+                        raise ValueError(
+                            "MiniMax DSpark checkpoint ships weight scales but "
+                            "the draft projections were built unquantized; serve "
+                            "a draft matching the module construction (e.g. the "
+                            "minimax_m31_dspark_w8a8 recipe on ivcore11, or the "
+                            "original MXFP8 draft on ivcore30)"
+                        )
                     raise ValueError(
                         f"Duplicate/unexpected MiniMax DSpark tensor: {name}"
                     )

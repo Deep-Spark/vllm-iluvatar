@@ -1,0 +1,28 @@
+nav:
+  - 首页: README.md
+  # 每个 section 的 index.md 都登记在此、且排在 glob 之前，作为该 section 的入口页。
+  # 它会被 navigation.indexes 提升成 section 本身，所以导航里不单独占一行。
+  # 缺了它不报错，但面包屑（navigation.path）该层会指向当前页自己 —— 见 README §5。
+  - 用户指南:
+    - getting_started/index.md
+    - 快速开始: getting_started/quickstart.md
+    - 安装: getting_started/installation.md
+    - 支持模型: models/supported_models.md
+    - 版本说明:
+      - release/index.md
+      - glob: release/[0-9]*/
+        sort:
+          direction: desc
+  - 开发者指南:
+    - 开发与适配:
+      - guides/index.md
+      - glob: guides/*.md
+        sort:
+          direction: asc
+        ignore: index.md
+    - 设计文档:
+      - design/index.md
+      - glob: design/*.md
+        sort:
+          direction: asc
+        ignore: index.md

@@ -1,0 +1,10 @@
+# Documentation build dependencies (Read the Docs + local preview).
+# Kept separate from the plugin runtime/build requirements.
+mkdocs>=1.6,<2.0.0
+mkdocs-material
+mkdocs-awesome-nav
+mkdocs-glightbox
+mkdocs-minify-plugin
+regex
+# Bilingual (P3): add the i18n plugin when the en/zh content lands, e.g.
+# mkdocs-static-i18n

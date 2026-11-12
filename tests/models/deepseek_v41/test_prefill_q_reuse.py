@@ -5,12 +5,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_iluvatar import envs as ilu_envs
 import vllm_iluvatar.models.deepseek_v41.attention as attention
 
 
 @pytest.fixture
 def reuse(monkeypatch):
-    monkeypatch.setattr(attention, "_PREFILL_FUSED_Q", True)
+    ilu_envs.apply()
+    monkeypatch.setenv("VLLM_ILU_V41_PREFILL_FUSED_Q", "1")
     obj = attention.IluDeepseekV41Attention.__new__(attention.IluDeepseekV41Attention)
     torch.nn.Module.__init__(obj)
     q = torch.zeros(256, 64, 512, dtype=torch.bfloat16)
@@ -65,8 +67,9 @@ def test_requantizes_when_reuse_is_invalid(reuse, monkeypatch, reason):
 
 
 def test_decode_insert_folds_q_quant(monkeypatch):
-    monkeypatch.setattr(attention, "_FUSED_INSERT_Q_QUANT", True)
-    monkeypatch.setattr(attention, "_PREFILL_FUSED_Q", False)
+    ilu_envs.apply()
+    monkeypatch.setenv("VLLM_ILU_V41_FUSED_Q_QUANT", "1")
+    monkeypatch.setenv("VLLM_ILU_V41_PREFILL_FUSED_Q", "0")
     obj = SimpleNamespace()
     q = torch.zeros(1, 16, 512, dtype=torch.bfloat16)
     kv = torch.zeros(1, 512, dtype=torch.bfloat16)

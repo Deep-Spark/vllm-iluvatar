@@ -5,8 +5,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_iluvatar import envs as ilu_envs
 import vllm_iluvatar.models.deepseek_v41.attention as attention
+from vllm_iluvatar import envs as ilu_envs
 
 
 @pytest.fixture
@@ -117,4 +117,4 @@ def test_q_quant_has_one_effective_switch(monkeypatch, canonical, legacy, expect
         monkeypatch.setenv("VLLM_ILU_V41_FUSED_Q_QUANT", canonical)
     if legacy is not None:
         monkeypatch.setenv("VLLM_V41_PREFILL_FUSED_Q", legacy)
-    assert attention.ilu_envs.VLLM_ILU_V41_FUSED_Q_QUANT is expected
+    assert ilu_envs.VLLM_ILU_V41_FUSED_Q_QUANT is expected

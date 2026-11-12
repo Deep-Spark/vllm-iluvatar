@@ -131,9 +131,7 @@ class IluDeepseekV41Bf16DequantLinearMethod(LinearMethodBase):
             out_dtype=getattr(layer, "ilu_dequant_dtype", torch.bfloat16),
         )
         layer.weight = torch.nn.Parameter(dequantized, requires_grad=False)
-        if envs.VLLM_ILU_V41_PREFILL_FP8_O_PROJ and hasattr(
-            layer, "bmm_geom"
-        ):
+        if envs.VLLM_ILU_V41_PREFILL_FP8_O_PROJ and hasattr(layer, "bmm_geom"):
             geom = layer.bmm_geom
             groups = int(geom.n_local_groups)
             channels = int(geom.o_lora_rank)

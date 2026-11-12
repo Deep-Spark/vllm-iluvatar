@@ -7,7 +7,6 @@ import torch
 from ixformer.inference.functions.models import deepseek_v41 as ixfops
 from vllm import envs
 
-from vllm_iluvatar import envs as ilu_envs
 from vllm_iluvatar.ilu_util.arch import is_ivcore30
 
 
@@ -35,9 +34,7 @@ def _want_fused_fp8(
     if not is_ivcore30():
         return False
     if not (
-        envs.VLLM_ILU_V41_FUSE_FP8_NORM
-        and want_fp8
-        and layer_norm_weight is not None
+        envs.VLLM_ILU_V41_FUSE_FP8_NORM and want_fp8 and layer_norm_weight is not None
     ):
         return False
     if (

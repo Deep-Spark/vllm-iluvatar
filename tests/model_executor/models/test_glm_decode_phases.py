@@ -191,7 +191,7 @@ def test_real_sparse_backend_prepare_ab_and_graph(
             indices[row, 0, : valid.numel()] = valid.to(torch.int32)
             lengths[row] = valid.numel()
     native_prepare = F.glm_dsa_prepare
-    native_sparse = F.dsa_flash_mla_with_fp8_kvcache
+    native_sparse = F.dsa_flash_mla_sparse_with_fp8_kvcache_diff_kv
     calls = {"prepare": 0, "sparse": 0}
 
     def checked_prepare(*args, **kwargs):

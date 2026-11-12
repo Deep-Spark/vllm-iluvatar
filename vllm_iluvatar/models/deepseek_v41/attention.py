@@ -23,7 +23,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -45,7 +45,6 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
-from vllm_iluvatar import envs as ilu_envs
 from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.skip_layers import (
     add_skip_layers,
 )
@@ -1665,7 +1664,8 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             covered = self._covered_tokens(attn_out.shape[0])
             if covered < attn_out.shape[0]:
                 attn_out[covered:].zero_()
-        self._inv_rope_fused_tokens = 0
+        self._decode_inv_rope_applied = False
+        self._prefill_inv_rope_applied = False
         projection_input = self._prepare_and_attn(
             hidden_states,
             qr,
@@ -1710,12 +1710,9 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         if self._uses_fused_inverse_rope():
             return self._o_proj(attn_out)
 
-        fused = self._inv_rope_fused_tokens
         n_dec = self._num_decode_tokens(attn_out.shape[0])
         n_pref = attn_out.shape[0] - n_dec
-        # MLA can apply inverse RoPE to the decode prefix of a mixed batch.
-        # The prefill projection applies it only to the prefill suffix.
-        if n_pref > 128 and hasattr(self.wo_a, "prefill_bmm_b_fp8"):
+        if self._uses_prefill_fp8_o_proj(n_pref):
             grouped, scales = ixfshared.fused_inv_rope_fp8_quant(
                 attn_out[n_dec:],
                 positions[n_dec:],
@@ -1731,22 +1728,31 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             prefill_out = self.wo_b(projected.flatten(1))
             if n_dec == 0:
                 return prefill_out
-            if fused < n_dec:
+            if not self._decode_inv_rope_applied:
                 apply_rope(
-                    attn_out[fused:n_dec].unsqueeze(0),
-                    positions[fused:n_dec],
+                    attn_out[:n_dec].unsqueeze(0),
+                    positions[:n_dec],
                     self.cos_sin,
                     inverse=True,
                 )
             return torch.cat((self._o_proj(attn_out[:n_dec]), prefill_out), dim=0)
-        if fused < attn_out.shape[0]:
+        start = n_dec if self._decode_inv_rope_applied else 0
+        end = n_dec if self._prefill_inv_rope_applied else attn_out.shape[0]
+        if start < end:
             apply_rope(
-                attn_out[fused:].unsqueeze(0),
-                positions[fused:],
+                attn_out[start:end].unsqueeze(0),
+                positions[start:end],
                 self.cos_sin,
                 inverse=True,
             )
         return self._o_proj(attn_out)
+
+    def _uses_prefill_fp8_o_proj(self, num_tokens: int) -> bool:
+        return (
+            num_tokens > 128
+            and envs.VLLM_ILU_V41_PREFILL_FP8_O_PROJ
+            and hasattr(self.wo_a, "prefill_bmm_b_fp8")
+        )
 
     def _run_parallel_input_projections(
         self, hidden_states: torch.Tensor
@@ -1820,10 +1826,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         if self.kv_cache_dtype == "fp8_e4m3":
             n = q.shape[0]
             fuse_q = (
-                (
-                    envs.VLLM_ILU_V41_FUSED_Q_QUANT
-                    or envs.VLLM_ILU_V41_PREFILL_FUSED_Q
-                )
+                (envs.VLLM_ILU_V41_FUSED_Q_QUANT or envs.VLLM_ILU_V41_PREFILL_FUSED_Q)
                 and hasattr(self, "_q_fp8_pt")
                 and hasattr(self, "_q_scale_pt")
             )
@@ -2200,23 +2203,41 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         ):
             forward_context = get_forward_context()
             cache_key = (
-                "global_indices",
                 self.index_source_layer_id,
                 self.kv_source_layer_id,
                 self.compress_ratio,
-                local.data_ptr(),
-                local.shape[0],
+                block_size,
+                TensorViewKey.of(local),
+                TensorViewKey.of(req),
+                TensorViewKey.of(table),
+                TensorViewKey.of(valid),
+                TensorViewKey.of(positions),
             )
-            cached = getattr(forward_context, "_global_indices_cache", {}).get(
-                cache_key
-            )
-            if cached is not None:
-                return cached
+        elif is_forward_context_available():
+            forward_context = get_forward_context()
+
+        cache = None
+        if forward_context is not None:
+            cache = getattr(forward_context, "_global_indices_cache", None)
+            if cache is None:
+                cache = forward_context._global_indices_cache = {}
 
         n = local.shape[0]
         if hasattr(self, "_global_topk") and hasattr(self, "_global_topk_lens"):
             indices = self._global_topk[:n]
             lens = self._global_topk_lens[:n]
+            # Each scratch pair can hold only its most recent mapping. Even
+            # an uncached writer replaces the previous contents.
+            scratch_key = (
+                self._global_topk.data_ptr(),
+                self._global_topk_lens.data_ptr(),
+            )
+            if cache is not None:
+                cached = cache.get(scratch_key)
+                if cached is not None:
+                    if cached[0] == cache_key:
+                        return cached[1]
+                    del cache[scratch_key]
             ixfops.compute_global_topk_indices_and_lens(
                 local,
                 req,
@@ -2229,7 +2250,11 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 output_lens=lens,
             )
             result = (indices, lens)
+            if cache is not None and cache_key is not None:
+                cache[scratch_key] = (cache_key, result)
         else:
+            if cache is not None and cache_key is not None and cache_key in cache:
+                return cache[cache_key]
             result = ixfops.global_topk_indices_and_lens(
                 local,
                 req,
@@ -2242,10 +2267,8 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 False,
             )
 
-        if cache_key is not None:
-            if not hasattr(forward_context, "_global_indices_cache"):
-                forward_context._global_indices_cache = {}
-            forward_context._global_indices_cache[cache_key] = result
+            if cache is not None and cache_key is not None:
+                cache[cache_key] = result
         return result
 
     def _prepare_compressed_family(
@@ -2508,7 +2531,11 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
 
     def _mla_inv_rope_kwargs(self, positions: torch.Tensor | None) -> dict:
         """Pass positions/cos_sin into sparse MLA when inverse RoPE can fuse."""
-        if positions is not None and hasattr(self, "cos_sin"):
+        if (
+            positions is not None
+            and getattr(self, "cos_sin", None) is not None
+            and not getattr(self, "_grouped_int8_o_proj", False)
+        ):
             return {"positions": positions, "cos_sin_cache": self.cos_sin}
         return {}
 
@@ -2612,6 +2639,9 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                     workspace=workspace if restore_plan is None else restore_plan,
                 )
             return None
+        # The FP8 prefill projection applies inverse RoPE during quantization.
+        if prefill and self._uses_prefill_fp8_o_proj(output.shape[0]):
+            cos_sin_cache = None
         if self.kv_cache_dtype == "fp8_ds_mla":
             self._sparse_fp8_mla(
                 q,
@@ -2637,23 +2667,9 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 cos_sin_cache=cos_sin_cache,
             )
             if inv_rope_done:
-                self._inv_rope_fused_tokens = output.shape[0]
+                self._mark_inverse_rope_applied(prefill)
             return
-        # ixformer 3817cf75: mla_with_kvcache 与 ds4 的 decode 稀疏 MLA
-        # 统一为 ops 层的 flash_mla_sparse_with_kvcache（签名逐参一致）。
-        # 原 ixformer_native 后端已并入 ixformer_perf（同为手写 CUDA 路径）。
-        inv_rope_kwargs = {}
-        if positions is not None and cos_sin_cache is not None:
-            from ixformer.inference.functions.ops.attn.flash_mla_sparse.float.flash_mla_sparse_with_kvcache import (
-                flash_mla_sparse_with_kvcache_supports_inv_rope,
-            )
-
-            if flash_mla_sparse_with_kvcache_supports_inv_rope(
-                positions=positions, cos_sin_cache=cos_sin_cache
-            ):
-                inv_rope_kwargs["positions"] = positions
-                inv_rope_kwargs["cos_sin_cache"] = cos_sin_cache
-        flash_mla_sparse_with_kvcache(
+        mla_args = dict(
             q=q.unsqueeze(1),
             k_cache=self.swa_cache_layer.kv_cache.unsqueeze(-2),
             indices=_batched_index_rows(swa_indices),
@@ -2666,8 +2682,27 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             ),
             extra_topk_length=extra_lens,
             output=output.unsqueeze(1),
-            **inv_rope_kwargs,
         )
+        if positions is not None and cos_sin_cache is not None:
+            from ixformer.inference.functions.ops.attn.flash_mla_sparse.float.flash_mla_sparse_with_kvcache import (
+                flash_mla_sparse_with_kvcache_supports_inv_rope,
+            )
+
+            if flash_mla_sparse_with_kvcache_supports_inv_rope(
+                positions=positions, cos_sin_cache=cos_sin_cache, **mla_args
+            ):
+                flash_mla_sparse_with_kvcache(
+                    positions=positions, cos_sin_cache=cos_sin_cache, **mla_args
+                )
+                self._mark_inverse_rope_applied(prefill)
+                return
+        flash_mla_sparse_with_kvcache(**mla_args)
+
+    def _mark_inverse_rope_applied(self, prefill: bool) -> None:
+        if prefill:
+            self._prefill_inv_rope_applied = True
+        else:
+            self._decode_inv_rope_applied = True
 
     def _tile_window(self, indices):
         rows = indices.reshape(indices.shape[0], -1)
@@ -2721,7 +2756,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         positions: torch.Tensor | None = None,
         cos_sin_cache: torch.Tensor | None = None,
     ) -> bool:
-        """Returns True when inverse RoPE was fused into the kernel."""
+        """Return whether the reader applied inverse RoPE to the output."""
         if q.shape[1] not in _PT_MLA_HEADS:
             raise ValueError(f"Unsupported per-tensor FP8 MLA head count: {q.shape[1]}")
         source = getattr(self, "_prefill_q_source", None)
@@ -2755,7 +2790,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             and not use_fmhadsa
             and hasattr(ixfops, "sparse_mla_fp8_pt_inv_rope")
         ):
-            _, fused = ixfops.sparse_mla_fp8_pt_inv_rope(
+            ixfops.sparse_mla_fp8_pt_inv_rope(
                 q_fp8,
                 q_scale,
                 self.swa_cache_layer.kv_cache,
@@ -2771,7 +2806,8 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 positions=positions,
                 cos_sin_cache=cos_sin_cache,
             )
-            return fused
+            # The ixformer fallback applies inverse RoPE in a separate op.
+            return True
         sparse_op = (
             ixfops.fmhadsa
             if use_fmhadsa and _v41_prefill_fmhadsa()
@@ -2948,9 +2984,9 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 indices,
                 lengths,
                 output,
+                positions=positions,
                 prefill=True,
                 restore_plan=plan,
-                **self._mla_inv_rope_kwargs(positions),
             )
             return
         if not swa_only and self.compress_ratio not in (1, 2):

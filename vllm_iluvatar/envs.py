@@ -252,6 +252,7 @@ if TYPE_CHECKING:
     VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP: bool = False
     VLLM_ILU_MOE_AG_SHARED_OVERLAP: bool = False
     VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP: bool = True
+    VLLM_ILU_V41_AGRS_TP1_RS: bool = False
     VLLM_ILU_V41_PREFILL_UNSORTED: bool = False
     VLLM_ILU_V41_PREFILL_FP8_O_PROJ: bool = False
     VLLM_ILU_V41_PREFILL_SCORE_MASK: bool = False
@@ -294,13 +295,6 @@ if TYPE_CHECKING:
     VLLM_ILU_MOE_W4A8_GEMV_PERF: bool = False
     VLLM_ILU_MOE_EP_LL_MOE_ALGO: str = "GEMV"
     VLLM_ILU_MOE_EP_RS_TP_AG: bool = False
-    VLLM_ILU_V41_PREFILL_UNSORTED: bool = False
-    VLLM_ILU_V41_PREFILL_FP8_O_PROJ: bool = False
-    VLLM_ILU_V41_PREFILL_SCORE_MASK: bool = False
-    VLLM_ILU_V41_FUSED_Q_QUANT: bool = True
-    VLLM_ILU_V41_FP8_NORM_SMALL_BATCH: bool = True
-    VLLM_ILU_V41_FP8_INDEXER_BACKEND: str = "ixformer_native"
-    VLLM_ILU_V41_PREFILL_PP_QUANT_SENDERS: str = ""
     VLLM_ILU_ROUTER_GATE_GEMM_N_THRESHOLD: int = 256
     VLLM_ILU_MXFP4_MOE_BACKEND: str = "ixmm"
     VLLM_ILU_REJECTION_SAMPLER_MAX_CHUNK_BYTES: int = 128 * 1024 * 1024
@@ -317,37 +311,13 @@ if TYPE_CHECKING:
 # Canonical (VLLM_ILU_*) readers. Each lambda preserves the exact parsing the
 # fork used in vllm/envs.py, and reads VLLM_ILU_* first then the legacy VLLM_*.
 _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
-    "VLLM_ILU_V41_PREFILL_UNSORTED": lambda: (
-        _get("VLLM_ILU_V41_PREFILL_UNSORTED", "VLLM_V41_PREFILL_UNSORTED", "0") == "1"
-    ),
-    "VLLM_ILU_V41_PREFILL_FP8_O_PROJ": lambda: (
-        _get("VLLM_ILU_V41_PREFILL_FP8_O_PROJ", "VLLM_V41_PREFILL_FP8_O_PROJ", "0")
-        == "1"
-    ),
-    "VLLM_ILU_V41_PREFILL_SCORE_MASK": lambda: (
-        _get("VLLM_ILU_V41_PREFILL_SCORE_MASK", "VLLM_V41_PREFILL_SCORE_MASK", "0")
-        == "1"
-    ),
-    "VLLM_ILU_V41_FUSED_Q_QUANT": lambda: (
-        _get("VLLM_ILU_V41_FUSED_Q_QUANT", "VLLM_V41_FUSED_Q_QUANT", "1") == "1"
-        # Older launchers enabled the same kernel through the prefill flag.
-        or _get("VLLM_ILU_V41_PREFILL_FUSED_Q", "VLLM_V41_PREFILL_FUSED_Q", "0") == "1"
-    ),
-    "VLLM_ILU_V41_FP8_NORM_SMALL_BATCH": lambda: (
-        _get("VLLM_ILU_V41_FP8_NORM_SMALL_BATCH", "VLLM_V41_FP8_NORM_SMALL_BATCH", "1")
-        != "0"
+    "VLLM_ILU_V41_AGRS_TP1_RS": lambda: (
+        _get("VLLM_ILU_V41_AGRS_TP1_RS", "VLLM_V41_AGRS_TP1_RS", "0").strip().lower()
+        in _TRUE_VALS
     ),
     "VLLM_ILU_MOE_EP_RS_TP_AG": lambda: (
         _get("VLLM_ILU_MOE_EP_RS_TP_AG", "VLLM_MOE_EP_RS_TP_AG", "0").strip().lower()
         in _TRUE_VALS
-    ),
-    "VLLM_ILU_V41_FP8_INDEXER_BACKEND": lambda: _get(
-        "VLLM_ILU_V41_FP8_INDEXER_BACKEND",
-        "VLLM_V41_FP8_INDEXER_BACKEND",
-        "ixformer_native",
-    ),
-    "VLLM_ILU_V41_PREFILL_PP_QUANT_SENDERS": lambda: _get(
-        "VLLM_ILU_V41_PREFILL_PP_QUANT_SENDERS", "VLLM_V41_PREFILL_PP_QUANT_SENDERS", ""
     ),
     "VLLM_ILU_ROUTER_GATE_GEMM_N_THRESHOLD": lambda: int(
         _get(
@@ -451,8 +421,10 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_V41_PREFILL_FUSED_Q": _ilu_bool_reader(
         "VLLM_ILU_V41_PREFILL_FUSED_Q", "0"
     ),
-    "VLLM_ILU_V41_FUSED_Q_QUANT": _ilu_bool_reader(
-        "VLLM_ILU_V41_FUSED_Q_QUANT", "1"
+    "VLLM_ILU_V41_FUSED_Q_QUANT": lambda: (
+        _get("VLLM_ILU_V41_FUSED_Q_QUANT", "VLLM_V41_FUSED_Q_QUANT", "1") == "1"
+        # Older launchers enabled the same kernel through the prefill flag.
+        or _get("VLLM_ILU_V41_PREFILL_FUSED_Q", "VLLM_V41_PREFILL_FUSED_Q", "0") == "1"
     ),
     "VLLM_ILU_V41_PREFILL_PP_QUANT_SENDERS": _ilu_str_reader(
         "VLLM_ILU_V41_PREFILL_PP_QUANT_SENDERS"
@@ -463,15 +435,11 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_V41_FP8_INDEXER_BACKEND": _ilu_str_reader(
         "VLLM_ILU_V41_FP8_INDEXER_BACKEND", "ixformer_native"
     ),
-    "VLLM_ILU_V41_INDEXER_KV_DTYPE": _ilu_str_reader(
-        "VLLM_ILU_V41_INDEXER_KV_DTYPE"
-    ),
+    "VLLM_ILU_V41_INDEXER_KV_DTYPE": _ilu_str_reader("VLLM_ILU_V41_INDEXER_KV_DTYPE"),
     "VLLM_ILU_V41_MHC_FUSE_REDUCTIONS": _ilu_bool_reader(
         "VLLM_ILU_V41_MHC_FUSE_REDUCTIONS", "1"
     ),
-    "VLLM_ILU_V41_FUSE_FP8_NORM": _ilu_bool_reader(
-        "VLLM_ILU_V41_FUSE_FP8_NORM", "1"
-    ),
+    "VLLM_ILU_V41_FUSE_FP8_NORM": _ilu_bool_reader("VLLM_ILU_V41_FUSE_FP8_NORM", "1"),
     "VLLM_ILU_V41_ALLREDUCE_MHC_POST": _ilu_bool_reader(
         "VLLM_ILU_V41_ALLREDUCE_MHC_POST", "1"
     ),
@@ -727,6 +695,9 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # GLM-5.2 LL: shared MLP on an auxiliary stream overlaps dispatch.
     "VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP": _bool_reader(
         "VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP", "0"
+    ),
+    "VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP": _bool_reader(
+        "VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP", "0"
     ),
     "VLLM_ILU_DP_VOCAB_GROUP_SIZE": _int_reader(
         "VLLM_ILU_DP_VOCAB_GROUP_SIZE", 0, minimum=0

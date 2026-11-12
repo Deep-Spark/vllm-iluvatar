@@ -53,6 +53,12 @@ def draft():
     model = IluMiniMaxDSparkForCausalLM.__new__(IluMiniMaxDSparkForCausalLM)
     torch.nn.Module.__init__(model)
     model.config = SimpleNamespace(num_hidden_layers=1, dspark_target_layer_ids=[0])
+    inner = torch.nn.Module()
+    proj = torch.nn.Module()
+    proj.register_buffer("weight_scale", torch.ones(1))
+    inner.add_module("q_proj", proj)
+    # Keep this a plain attribute so later tests can replace it with a namespace.
+    object.__setattr__(model, "model", inner)
     return model
 
 

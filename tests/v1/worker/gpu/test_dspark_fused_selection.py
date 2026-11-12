@@ -69,6 +69,7 @@ def test_sequential_selection_and_fallbacks(
         return result
 
     model = SimpleNamespace(
+        prefer_full_gather_for_small_batches=True,
         compute_draft_logits_local=project,
         get_draft_vocab_shard=lambda: (0, 0),
         markov_embed=lambda ids: embedding[ids],
@@ -132,3 +133,41 @@ def test_sequential_selection_and_fallbacks(
         or dtype == torch.float16
     ):
         assert not fused_calls
+
+
+def test_non_v41_small_batch_keeps_local_argmax(monkeypatch):
+    monkeypatch.setattr(impl, "cuda_arch", "ivcore30")
+    monkeypatch.setattr(impl, "_can_use_fused_markov", lambda self: False)
+    calls = []
+
+    def fused(base, bias, start, padding):
+        calls.append(base.shape[0])
+        return torch.ones(base.shape[0], dtype=torch.int64)
+
+    monkeypatch.setattr(impl, "add_bias_vocab_parallel_argmax", fused)
+    model = SimpleNamespace(
+        compute_draft_logits_local=lambda hidden: torch.zeros((len(hidden), 3)),
+        get_draft_vocab_shard=lambda: (0, 0),
+        markov_embed=lambda ids: ids,
+        markov_bias_local=lambda ids: torch.zeros((len(ids), 3)),
+        map_draft_to_target=lambda ids: ids,
+    )
+    state = SimpleNamespace(
+        _draft_topk=None,
+        model=model,
+        num_speculative_steps=1,
+        sample_indices=torch.arange(4),
+        sample_idx_mapping=torch.arange(4),
+        sample_pos=torch.arange(4),
+        _d2t_scatter_index=None,
+        vocab_size=3,
+        use_confidence_head=False,
+        input_buffers=SimpleNamespace(input_ids=torch.zeros(4, dtype=torch.int64)),
+        _anchor_idx=torch.arange(4),
+        draft_logits=None,
+        use_local_argmax_reduction=True,
+        draft_tokens=torch.empty((4, 1), dtype=torch.int64),
+    )
+    impl.sample_sequential(state, 4, torch.zeros((4, 2)))
+    assert calls == [4]
+    assert torch.equal(state.draft_tokens, torch.ones_like(state.draft_tokens))

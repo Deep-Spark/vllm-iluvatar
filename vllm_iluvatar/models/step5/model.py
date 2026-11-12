@@ -166,15 +166,20 @@ class Step5Attention(IluStep3p5Attention):
         layer_type = _layer_value(config.layer_types, layer_idx, "full_attention")
         from .fp8_attention import sparse_fp8_enabled
 
+        # Full layers: FP8 paged KV + sparse_gqa_fp8. SWA layers: same FP8 KV
+        # dtype so IluFlashAttention takes _forward_fp8 / reshape_and_cache_fp8
+        # (backend already supports sliding_window + FP8).
+        fp8_kv = sparse_fp8_enabled()
         fp8_sparse = (
-            sparse_fp8_enabled()
+            fp8_kv
             and layer_type == "full_attention"
             and bool(
                 (getattr(config, "sparse_config", None) or {}).get("enabled", False)
             )
             and (envs.VLLM_ILU_STEP5_SPARSE_ATTENTION)
         )
-        if fp8_sparse:
+        fp8_swa = fp8_kv and layer_type != "full_attention"
+        if fp8_sparse or fp8_swa:
             from .fp8_attention import sparse_fp8_cache_config
 
             cache_config = sparse_fp8_cache_config(cache_config)
@@ -215,6 +220,10 @@ class Step5Attention(IluStep3p5Attention):
         self.q_norm = qk_norm_cls(self.head_dim, config.rms_norm_eps)
         self.k_norm = qk_norm_cls(self.head_dim, config.rms_norm_eps)
         self.attn._ilu_step5_native_decode = True
+        # SWA FP8 KV has no checkpoint q/k/v/prob_scale; use unit scales via
+        # IluFlashAttention._forward_fp8 (same contract as sparse full-attn).
+        if fp8_swa:
+            self.attn._ilu_step5_external_fp8_scales = True
         self.partial_rotary_factor = partial_rotary_factor
         self.rotary_dim = int(self.head_dim * partial_rotary_factor)
         if self.rotary_dim <= 0 or self.rotary_dim % 2:

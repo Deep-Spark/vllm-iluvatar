@@ -23,7 +23,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
-from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.forward_context import get_forward_context, override_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
@@ -75,11 +74,10 @@ from vllm_iluvatar.models.deepseek_v41.pp_plan import build_rank_plan, local_kv_
 
 logger = init_logger(f"vllm.{__name__}")
 
+
 def _ll_shared_dispatch_overlap_enabled() -> bool:
     """Decode NVSM/LL: overlap shared MLP on the auxiliary stream. Default off."""
-    return bool(
-        _ILU_CANONICAL_ONLY_ENV_VARS["VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP"]()
-    )
+    return bool(ilu_envs.VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP)
 
 
 def _allreduce_mhc_post_supported(config, tp_size: int) -> bool:
@@ -154,6 +152,8 @@ class IluDeepseekV41MoE(nn.Module, IluFusedMoEEP):
     V4.1 has no hash-routed layers, so this owns its routing construction
     instead of relying on the V4 class and its ``num_hash_layers`` contract.
     """
+
+    _supports_agrs_tp1_rs = True
 
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()

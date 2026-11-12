@@ -604,6 +604,7 @@ class IluFusedMoEEP:
         sizes: list[int],
         *,
         sequence_parallel: bool,
+        use_tp1_rs: bool = False,
     ) -> torch.Tensor:
         """Return this rank's slice of the gathered routed output.
 
@@ -653,7 +654,16 @@ class IluFusedMoEEP:
             return gathered
         fuse = (not sequence_parallel) and envs.VLLM_ILU_FUSE_EP_COMBINE
         if fuse:
-            ep_comm = get_ep_group().device_communicator
+            ep_group = get_ep_group()
+            if (
+                use_tp1_rs
+                and tp_group.world_size == 1
+                and local_tokens > 0
+                and all(size == local_tokens for size in sizes)
+                and dist_group.ranks == ep_group.ranks
+            ):
+                return dist_group.reduce_scatterv(fused_output, dim=0, sizes=sizes)
+            ep_comm = ep_group.device_communicator
             assert ep_comm is not None and ep_comm.ixfd_group is not None
             # Stream-ordered: the slice below runs on the same stream, so the
             # dropped handle needs no explicit wait.
@@ -812,6 +822,10 @@ class IluFusedMoEEP:
             dist_group,
             sizes,
             sequence_parallel=moe_config.is_sequence_parallel,
+            use_tp1_rs=(
+                getattr(self, "_supports_agrs_tp1_rs", False)
+                and envs.VLLM_ILU_V41_AGRS_TP1_RS
+            ),
         )
         if post_xform_trunc_size is not None:
             final_hidden_states = final_hidden_states[..., :post_xform_trunc_size]

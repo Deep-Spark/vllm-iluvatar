@@ -431,10 +431,11 @@ def sample_sequential(self: Any, num_reqs: int, head_hidden: torch.Tensor) -> No
     if _can_use_fused_markov(self):
         return _sample_sequential_fused(self, num_reqs, head_hidden)
 
-    # CQ C16 decode has four requests per DP engine. Preserve its original
-    # full-gather path; the new reduction is enabled for larger decode batches.
-    use_local_argmax_reduction = self.use_local_argmax_reduction and (
-        cuda_arch != "ivcore30" or num_reqs >= 8
+    # V4.1 CQ C16 has four requests per DP engine and favors full gather.
+    use_local_argmax_reduction = self.use_local_argmax_reduction and not (
+        cuda_arch == "ivcore30"
+        and num_reqs < 8
+        and getattr(self.model, "prefer_full_gather_for_small_batches", False)
     )
     n_spec = self.num_speculative_steps
     num_sample = num_reqs * n_spec

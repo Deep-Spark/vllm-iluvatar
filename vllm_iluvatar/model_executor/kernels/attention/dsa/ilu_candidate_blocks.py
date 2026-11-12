@@ -24,12 +24,12 @@ Remove   : when community grows a vendor hook for these two.
 from __future__ import annotations
 
 import contextlib
+
 import torch
 from ixformer.cuda import cuda_arch
 from ixformer.inference.functions import dsa_update_topk_indices
 from ixformer.inference.functions.models import deepseek_v41 as ixfops
 from vllm import envs
-
 
 # Rows per ``topk`` call in ``select_candidate_blocks``. Above 128 rows corex
 # torch's topk takes scratch memory outside the caching allocator -- tens of
@@ -131,7 +131,6 @@ def select_candidate_blocks(
         and cuda_arch == "ivcore30"
         and 128 < rows <= 16384
         and 16384 < width <= 32768
-        and ilu_envs.VLLM_ILU_V41_PREFILL_UNSORTED
     )
     # Retain the scratch budget and group boundaries for other workloads.
     max_rows = (

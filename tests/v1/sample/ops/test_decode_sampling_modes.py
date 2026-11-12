@@ -93,7 +93,9 @@ def test_broadcast_top_p_uses_upstream(monkeypatch, mode):
     p = torch.tensor([0.9], device="cuda")
     sampler = SimpleNamespace(logprobs_mode="raw_logprobs", use_fp64_gumbel=False)
     state = torch.cuda.get_rng_state()
-    expected = impl._original_forward_native(sampler, logits.clone(), {}, None, p)
+    expected = impl._original_forward_native(
+        sampler, logits.clone(), {}, None, p.expand(logits.shape[0]).contiguous()
+    )
     expected_state = torch.cuda.get_rng_state()
     torch.cuda.set_rng_state(state)
     actual = impl.forward_native(sampler, logits.clone(), {}, None, p)

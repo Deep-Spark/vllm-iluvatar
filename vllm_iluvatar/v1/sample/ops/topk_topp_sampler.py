@@ -46,6 +46,14 @@ def forward_native(self, logits, generators, k, p):
         or p.shape[0] != logits.shape[0]
         or p.device != logits.device
     ):
+        if (
+            p is not None
+            and p.ndim == 1
+            and p.shape[0] == 1
+            and logits.ndim == 2
+            and logits.shape[0] != 1
+        ):
+            p = p.expand(logits.shape[0]).contiguous()
         return _original_forward_native(self, logits, generators, k, p)
 
     import ixformer.inference.functions as F

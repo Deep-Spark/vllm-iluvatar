@@ -340,6 +340,7 @@ class IluDSparkV41DraftModel(nn.Module):
     has_own_embed_tokens = False
     has_own_lm_head = False
     draft_id_to_target_id = None
+    prefer_full_gather_for_small_batches = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         # Same Hybrid-EP budget as the target; draft MoE may init its own NVSM

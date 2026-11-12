@@ -219,7 +219,9 @@ def standard_experts(method, layer, monkeypatch):
     experts.quant_config = SimpleNamespace(
         w1_scale=layer.w13_weight_scale, w2_scale=layer.w2_weight_scale
     )
-    monkeypatch.setattr(std, "get_ep_group", lambda: SimpleNamespace(rank=1))
+    monkeypatch.setattr(
+        std, "get_ep_group", lambda: SimpleNamespace(rank=1, rank_in_group=1)
+    )
     return experts
 
 

@@ -10,7 +10,7 @@
 | 目录 | 模型系列 |
 | --- | --- |
 | `deepseek/` | DeepSeek R1、V3.2、V4 |
-| `minimax/` | MiniMax M2.5、M2.7、M3 |
+| `minimax/` | MiniMax M2.5、M2.7、M3、M3.1-Flash |
 | `moonshot/` | Kimi K2.5 |
 | `qwen/` | Qwen2、Qwen3 及现有变体 |
 | `stepfun/` | Step 3.5、3.7 |
@@ -90,6 +90,51 @@ per-channel FP8；Step 3.7 Flash 的 FP8 配方将选中 BF16 线性层转为 pe
 `step3_7_flash_fp8_w8a8` 与 `step3_7_flash_mix_fp8_w8a8` 保留为两套独立配方：
 前者普通 MLP 运行时 target 为 `re:model\.layers\.[0-2]...`，后者为 `re:.*\.[0-2]...`。
 本次不合并或修改这些匹配规则。
+
+## DSpark 草稿模型 W8A8 量化（`minimax/minimax_m31_dspark_w8a8`）
+
+MiniMax M3.1-Flash 的 DSpark 草稿模型存放在模型目录的 `dspark/` 子目录中，
+自带独立的 index 与 `config.json`，其中 5 层投影为 MXFP8
+（`F8_E4M3` 权重 + U8 e8m0 `weight_scale_inv [N, K/32]`）。在 ivcore11 上
+草稿需要转换为逐通道对称 INT8（W8A8，与目标模型 dense 层同一方法）才能
+随 `--speculative-config` 一起部署。主模型先用
+`minimax/minimax_m31_flash_w4a8`（NVFP4→W4A8）转换；转换产物中的
+`dspark/` 子目录再按本配方单独运行：
+
+```bash
+python examples/iluvatar-compressed-tensors/quant.py \
+  --input /path/to/quantized-checkpoint/dspark \
+  --output /path/to/quantized-checkpoint/dspark-w8a8 \
+  --recipe minimax/minimax_m31_dspark_w8a8
+```
+
+也支持成对显式路径（容器内仓库为旧快照、或配方在仓库外时使用）：
+
+```bash
+python examples/iluvatar-compressed-tensors/quant.py \
+  --input /path/to/quantized-checkpoint/dspark \
+  --output /path/to/quantized-checkpoint/dspark-w8a8 \
+  --configs examples/iluvatar-compressed-tensors/configs/minimax/minimax_m31_dspark_w8a8.json \
+  --rules   examples/iluvatar-compressed-tensors/rules/minimax/minimax_m31_dspark_w8a8.json
+```
+
+规则行为：35 个 fp8 投影经 `mxfp8_ue8m0`（block 32）反量化后用
+`int8_per_channel` 重新量化为逐通道对称 INT8，输出 `.weight`(int8) +
+`.weight_scale`(fp32, `[N,1]`)，checkpoint 张量名与 draft loader 的
+硬编码期望集天然对齐；35 个源 `weight_scale_inv` 丢弃，其余 bf16 张量
+（norm、fc、markov、confidence head）原样保留。configs 文档是
+compressed-tensors 风格的 quantization_config，使 vllm 为草稿投影层挂载
+W8A8 线性方法（worker 对该方法的 draft 量化解析已验证可用）。
+
+注意 `targets` 匹配的是**模块名**而非 checkpoint 分片名：draft 与目标
+dense 共用同一套 MiniMax 构件，attention 是融合的 `qkv_proj`、MLP 是
+融合的 `gate_up_proj`，所以 targets 与目标模型 dense 组一致
+（`qkv_proj|o_proj`、`gate_up_proj|down_proj`）。写
+`q_proj/k_proj/gate_proj` 这类分片名会导致融合模块不挂量化方法、
+其 `weight_scale` 加载时 `getattr` 回退成模块自身而崩溃。
+
+ivcore30 等 mxfp8 可用平台应继续使用原始 `dspark/` 目录（fp8+scale，
+与那边挂载 MXFP8 线性方法的模块匹配）。
 
 ## 历史名称对照
 

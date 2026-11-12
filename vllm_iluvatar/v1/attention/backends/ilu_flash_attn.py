@@ -33,6 +33,7 @@ from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms.interface import DeviceCapability
+from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
@@ -50,7 +51,12 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.attention.ops.dcp import cp_lse_ag_out_rs, dcp_a2a_lse_reduce
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheSpec,
+    KVQuantMode,
+    SlidingWindowSpec,
+)
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_iluvatar.v1.attention.ilu_static_quant import (
@@ -207,6 +213,7 @@ class IluFlashAttentionPrefillMetadata:
     query_start_loc: torch.Tensor
     key_start_loc: torch.Tensor
     max_query_len: int
+    max_seq_len: int | None = None
 
 
 @dataclass
@@ -256,6 +263,77 @@ class IluFlashAttentionMetadata:
     decode: IluFlashAttentionDecodeMetadata | None = None
 
     causal: bool = True
+
+
+@triton.jit
+def _compact_swa_block_table_kernel(
+    src,
+    dst,
+    seq_lens,
+    query_start_loc,
+    local_seq_lens,
+    SRC_STRIDE: tl.constexpr,
+    SRC_WIDTH: tl.constexpr,
+    DST_STRIDE: tl.constexpr,
+    DST_WIDTH: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    WINDOW_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    k_len = tl.load(seq_lens + row)
+    q_len = tl.load(query_start_loc + row + 1) - tl.load(query_start_loc + row)
+    first_key = tl.maximum(0, k_len - q_len - (WINDOW_SIZE - 1))
+    first_page = first_key // PAGE_SIZE
+    col = tl.arange(0, BLOCK_SIZE)
+    page = first_page + col
+    live = (q_len > 0) & (page * PAGE_SIZE < k_len)
+    block_ids = tl.load(
+        src + row * SRC_STRIDE + page,
+        mask=(col < DST_WIDTH) & (page < SRC_WIDTH) & live,
+        other=0,
+    )
+    tl.store(dst + row * DST_STRIDE + col, block_ids, mask=col < DST_WIDTH)
+    tl.store(
+        local_seq_lens + row, tl.where(q_len > 0, k_len - first_page * PAGE_SIZE, 0)
+    )
+
+
+def _swa_block_table_width(
+    window_size: int, max_query_len: int, block_size: int
+) -> int:
+    # The union of the query windows has window_size + max_query_len - 1
+    # tokens. Rebasing at a page boundary may keep up to one partial page.
+    return cdiv(window_size + max_query_len - 1 + block_size - 1, block_size)
+
+
+def _compact_swa_block_table(
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    compact_table: torch.Tensor,
+    block_size: int,
+    window_size: int,
+) -> torch.Tensor:
+    """Exclude fully masked pages and preserve the Q-to-K position offset."""
+    local_seq_lens = torch.empty_like(seq_lens)
+    width = compact_table.shape[1]
+    _compact_swa_block_table_kernel[(seq_lens.numel(),)](
+        block_table,
+        compact_table,
+        seq_lens,
+        query_start_loc,
+        local_seq_lens,
+        block_table.stride(0),
+        block_table.shape[1],
+        compact_table.stride(0),
+        width,
+        block_size,
+        window_size,
+        triton.next_power_of_2(width),
+        num_warps=1 if width <= 128 else 4,
+    )
+    return local_seq_lens
 
 
 class IluFlashAttentionMetadataBuilder(
@@ -337,6 +415,22 @@ class IluFlashAttentionMetadataBuilder(
             dtype=torch.int32,
             device=self.device,
         )
+        self._fp8_swa_window = None
+        if (
+            isinstance(kv_cache_spec, SlidingWindowSpec)
+            and kv_cache_spec.kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
+            and self.dcp_world_size == 1
+        ):
+            self._fp8_swa_window = kv_cache_spec.sliding_window
+            width = _swa_block_table_width(
+                self._fp8_swa_window, self.reorder_batch_threshold, self.block_size
+            )
+            self._fp8_swa_decode_table = torch.empty(
+                (max_num_reqs, width), dtype=torch.int32, device=self.device
+            )
+            # A compact table depends on the source block IDs, so reusing
+            # another group's metadata through update_block_table is unsafe.
+            self.supports_update_block_table = False
         if self.dcp_world_size > 1:
             self._dcp_context_kv_lens = torch.zeros(
                 max_num_reqs,
@@ -443,26 +537,62 @@ class IluFlashAttentionMetadataBuilder(
 
         prefill_metadata = None
         decode_metadata = None
+        fp8_swa_window = self._fp8_swa_window
 
         if num_prefills > 0:
+            prefill_table = block_table_tensor[num_decodes:]
+            prefill_q = query_start_loc[num_decodes:] - num_decode_tokens
+            prefill_k = key_start_loc[num_decodes:] - key_start_loc[num_decodes]
+            prefill_max_k = None
+            if fp8_swa_window is not None:
+                width = _swa_block_table_width(
+                    fp8_swa_window, max_query_len, self.block_size
+                )
+                compact_table = prefill_table.new_empty((num_prefills, width))
+                prefill_lens = _compact_swa_block_table(
+                    prefill_table,
+                    seq_lens[num_decodes:],
+                    prefill_q,
+                    compact_table,
+                    self.block_size,
+                    fp8_swa_window,
+                )
+                prefill_k[1:] = prefill_lens.cumsum(0, dtype=torch.int32)
+                prefill_table = compact_table
+                prefill_max_k = width * self.block_size
             prefill_metadata = IluFlashAttentionPrefillMetadata(
-                block_table=block_table_tensor[num_decodes:],
-                query_start_loc=(query_start_loc[num_decodes:] - num_decode_tokens),
-                key_start_loc=(
-                    key_start_loc[num_decodes:] - key_start_loc[num_decodes]
-                ),
+                block_table=prefill_table,
+                query_start_loc=prefill_q,
+                key_start_loc=prefill_k,
                 max_query_len=max_query_len,
+                max_seq_len=prefill_max_k,
             )
 
         if num_decodes > 0:
             decode_query_start_loc = query_start_loc[: num_decodes + 1]
             decode_query_lens = decode_query_start_loc[1:] - decode_query_start_loc[:-1]
             decode_seq_lens = seq_lens[:num_decodes]
+            decode_table = block_table_tensor[:num_decodes]
             decode_cu_seqlens_q = self.decode_cu_seqlens_q[: num_decodes + 1]
             if self.has_spec:
                 decode_cu_seqlens_q[1:] = decode_query_lens.cumsum(0)
             decode_cu_seqlens_k = self.decode_cu_seqlens_k[: num_decodes + 1]
-            decode_cu_seqlens_k[1:] = decode_seq_lens.cumsum(0)
+            flash_seq_lens = decode_seq_lens
+            if fp8_swa_window is not None:
+                # The score mask does not stop ixattn's value tile load.
+                # Recycled pages can contain NaN when read as FP8, and the
+                # masked probability multiplied by that value is still NaN.
+                compact_table = self._fp8_swa_decode_table[:num_decodes]
+                flash_seq_lens = _compact_swa_block_table(
+                    decode_table,
+                    decode_seq_lens,
+                    decode_query_start_loc,
+                    compact_table,
+                    self.block_size,
+                    fp8_swa_window,
+                )
+                decode_table = compact_table
+            decode_cu_seqlens_k[1:] = flash_seq_lens.cumsum(0)
             use_graph = (
                 self.use_full_cuda_graph
                 and self.max_cudagraph_size is not None
@@ -471,7 +601,9 @@ class IluFlashAttentionMetadataBuilder(
             # In full CUDA graph mode, max_context_len is a Python scalar baked at
             # capture time. Use the paged KV capacity as a fixed upper bound so
             # replay does not truncate the KV context.
-            if use_graph:
+            if fp8_swa_window is not None:
+                max_decode_seq_len = decode_table.shape[1] * self.block_size
+            elif use_graph:
                 max_decode_seq_len = block_table_tensor.shape[1] * self.block_size
             else:
                 # This scalar sizes the kernel's work; exact per-row lengths
@@ -492,7 +624,7 @@ class IluFlashAttentionMetadataBuilder(
                 (decode_query_start_loc_cpu[1:] - decode_query_start_loc_cpu[:-1]).max()
             )
             decode_metadata = IluFlashAttentionDecodeMetadata(
-                block_table=block_table_tensor[:num_decodes],
+                block_table=decode_table,
                 query_start_loc=decode_query_start_loc,
                 seq_lens=decode_seq_lens,
                 max_query_len=max_decode_query_len,
@@ -1295,7 +1427,9 @@ class IluFlashAttentionImpl(AttentionImpl):
                 cu_seqlens_q=attn_metadata.prefill.query_start_loc,
                 cu_seqlens_k=attn_metadata.prefill.key_start_loc,
                 max_seqlen_q=attn_metadata.prefill.max_query_len,
-                max_seqlen_k=attn_metadata.max_seq_len,
+                max_seqlen_k=(
+                    attn_metadata.prefill.max_seq_len or attn_metadata.max_seq_len
+                ),
                 is_causal=attn_metadata.causal,
                 atten_scale=self.scale,
                 out=output[num_decode_tokens : num_decode_tokens + prefill_q.shape[0]],

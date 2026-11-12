@@ -31,6 +31,8 @@ def make_builder(device, graph, n_spec):
     builder.use_full_cuda_graph = graph
     builder.max_cudagraph_size = 128
     builder.block_size = 128
+    # This fixture bypasses __init__ and exercises the non-FP8 path.
+    builder._fp8_swa_window = None
     builder.decode_cu_seqlens_q = torch.arange(17, dtype=torch.int32, device=device)
     builder.decode_cu_seqlens_k = torch.zeros(17, dtype=torch.int32, device=device)
     return builder

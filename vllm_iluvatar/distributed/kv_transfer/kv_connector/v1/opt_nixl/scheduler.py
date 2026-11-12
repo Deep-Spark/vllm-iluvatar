@@ -69,6 +69,7 @@ from .metadata import (
     TransferIntent,
 )
 from .lifecycle import RequestOwnershipState, RequestTombstoneStore
+from .cancel_progress import ProducerCancelProgress
 from .utils import (
     NodeError,
     dp_scoped_addr,
@@ -363,6 +364,7 @@ class NixlConnectorScheduler:
         self._ownership_states: dict[ReqId, RequestOwnershipState] = {}
         self._ownership_deadlines: dict[ReqId, float] = {}
         self._ownership_cancel_pending: set[ReqId] = set()
+        self._producer_cancel_progress = ProducerCancelProgress()
         # One outstanding probe per request.  _expire_recv_ownership runs every
         # scheduler step, so without this the first expiry becomes a storm.
         self._ownership_probe_pending: set[ReqId] = set()
@@ -1421,6 +1423,10 @@ class NixlConnectorScheduler:
         if req_id in self._pending_worker_sends:
             self._sends_awaiting_release.add(req_id)
 
+    def bind_engine_wakeup(self, wake) -> None:
+        """Wake the inference loop when a peer cancel needs worker proof."""
+        self._producer_cancel_progress.bind(wake)
+
     def has_pending_push_work(self) -> bool:
         """Keep the engine loop alive while push work can still make progress."""
         return bool(
@@ -1430,6 +1436,7 @@ class NixlConnectorScheduler:
             or self._pending_worker_sends
             or self._live_recv_reqs
             or self._ownership_cancel_pending
+            or self._producer_cancel_progress.has_pending()
         )
 
     def request_finished_all_groups(
@@ -1736,6 +1743,10 @@ class NixlConnectorScheduler:
                             error,
                         )
                         continue
+                    # Clear only after recording the real all-rank proof. A
+                    # repeated CANCEL can arrive between main-thread completion
+                    # and this actor; deleting the gate earlier would lose it.
+                    self._producer_cancel_progress.complete(req_id, generation)
                     encoded = msgspec.msgpack.encode((state.value, generation))
                     for waiter in ownership_waiters.pop(
                         (req_id, generation), set()
@@ -2002,6 +2013,7 @@ class NixlConnectorScheduler:
                         if terminal := ownership_tombstones.get(
                             req_id, generation
                         ):
+                            self._producer_cancel_progress.complete(req_id, generation)
                             await reply(
                                 identity,
                                 msgspec.msgpack.encode(
@@ -2016,6 +2028,7 @@ class NixlConnectorScheduler:
                                 generation,
                                 RequestOwnershipState.CANCELED,
                             )
+                            self._producer_cancel_progress.complete(req_id, generation)
                             await reply(
                                 identity,
                                 msgspec.msgpack.encode(
@@ -2031,6 +2044,7 @@ class NixlConnectorScheduler:
                         ownership_waiters.setdefault(
                             (req_id, generation), set()
                         ).add(identity)
+                        self._producer_cancel_progress.begin(req_id, generation)
                         # Do not reply until Multiproc reports all TP/PP workers
                         # terminal. Duplicate CANCEL is safe and helps a worker
                         # that missed an earlier publication.

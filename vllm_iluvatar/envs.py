@@ -294,6 +294,14 @@ if TYPE_CHECKING:
     VLLM_ILU_MOE_W4A8_GEMV_PERF: bool = False
     VLLM_ILU_MOE_EP_LL_MOE_ALGO: str = "GEMV"
     VLLM_ILU_MOE_EP_RS_TP_AG: bool = False
+    VLLM_ILU_V41_PREFILL_UNSORTED: bool = False
+    VLLM_ILU_V41_PREFILL_FP8_O_PROJ: bool = False
+    VLLM_ILU_V41_PREFILL_SCORE_MASK: bool = False
+    VLLM_ILU_V41_FUSED_Q_QUANT: bool = True
+    VLLM_ILU_V41_FP8_NORM_SMALL_BATCH: bool = True
+    VLLM_ILU_V41_FP8_INDEXER_BACKEND: str = "ixformer_native"
+    VLLM_ILU_V41_PREFILL_PP_QUANT_SENDERS: str = ""
+    VLLM_ILU_ROUTER_GATE_GEMM_N_THRESHOLD: int = 256
     VLLM_ILU_MXFP4_MOE_BACKEND: str = "ixmm"
     VLLM_ILU_REJECTION_SAMPLER_MAX_CHUNK_BYTES: int = 128 * 1024 * 1024
     # GLM DSA fp8 KV: single float shared by ALL layers. Prefer PATH for
@@ -309,6 +317,45 @@ if TYPE_CHECKING:
 # Canonical (VLLM_ILU_*) readers. Each lambda preserves the exact parsing the
 # fork used in vllm/envs.py, and reads VLLM_ILU_* first then the legacy VLLM_*.
 _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
+    "VLLM_ILU_V41_PREFILL_UNSORTED": lambda: (
+        _get("VLLM_ILU_V41_PREFILL_UNSORTED", "VLLM_V41_PREFILL_UNSORTED", "0") == "1"
+    ),
+    "VLLM_ILU_V41_PREFILL_FP8_O_PROJ": lambda: (
+        _get("VLLM_ILU_V41_PREFILL_FP8_O_PROJ", "VLLM_V41_PREFILL_FP8_O_PROJ", "0")
+        == "1"
+    ),
+    "VLLM_ILU_V41_PREFILL_SCORE_MASK": lambda: (
+        _get("VLLM_ILU_V41_PREFILL_SCORE_MASK", "VLLM_V41_PREFILL_SCORE_MASK", "0")
+        == "1"
+    ),
+    "VLLM_ILU_V41_FUSED_Q_QUANT": lambda: (
+        _get("VLLM_ILU_V41_FUSED_Q_QUANT", "VLLM_V41_FUSED_Q_QUANT", "1") == "1"
+        # Older launchers enabled the same kernel through the prefill flag.
+        or _get("VLLM_ILU_V41_PREFILL_FUSED_Q", "VLLM_V41_PREFILL_FUSED_Q", "0") == "1"
+    ),
+    "VLLM_ILU_V41_FP8_NORM_SMALL_BATCH": lambda: (
+        _get("VLLM_ILU_V41_FP8_NORM_SMALL_BATCH", "VLLM_V41_FP8_NORM_SMALL_BATCH", "1")
+        != "0"
+    ),
+    "VLLM_ILU_MOE_EP_RS_TP_AG": lambda: (
+        _get("VLLM_ILU_MOE_EP_RS_TP_AG", "VLLM_MOE_EP_RS_TP_AG", "0").strip().lower()
+        in _TRUE_VALS
+    ),
+    "VLLM_ILU_V41_FP8_INDEXER_BACKEND": lambda: _get(
+        "VLLM_ILU_V41_FP8_INDEXER_BACKEND",
+        "VLLM_V41_FP8_INDEXER_BACKEND",
+        "ixformer_native",
+    ),
+    "VLLM_ILU_V41_PREFILL_PP_QUANT_SENDERS": lambda: _get(
+        "VLLM_ILU_V41_PREFILL_PP_QUANT_SENDERS", "VLLM_V41_PREFILL_PP_QUANT_SENDERS", ""
+    ),
+    "VLLM_ILU_ROUTER_GATE_GEMM_N_THRESHOLD": lambda: int(
+        _get(
+            "VLLM_ILU_ROUTER_GATE_GEMM_N_THRESHOLD",
+            "VLLM_ROUTER_GATE_GEMM_N_THRESHOLD",
+            os.environ.get("IXFORMER_ROUTER_GATE_GEMM_N_THRESHOLD", "256"),
+        )
+    ),
     "VLLM_ILU_DS4_ATTN_MODE": _ds4_attn_mode,
     "VLLM_ILU_DS4_FP8_PREFILL_SPARSE": lambda: (
         os.environ.get("VLLM_ILU_DS4_FP8_PREFILL_SPARSE", "1").lower() in ("1", "true")
@@ -604,7 +651,6 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
             )
         ),
     ),
-    "VLLM_ILU_MOE_EP_RS_TP_AG": _bool_reader("VLLM_ILU_MOE_EP_RS_TP_AG", "0"),
     "VLLM_ILU_MOE_EP_LL_MOE_ALGO": lambda: os.environ.get(
         "VLLM_ILU_MOE_EP_LL_MOE_ALGO", "GEMV"
     ).upper(),
@@ -682,12 +728,6 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP": _bool_reader(
         "VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP", "0"
     ),
-    # V4.1 decode NVSM/LL: shared MLP runs on the main stream between
-    # dispatch_begin and dispatch_finish by default; set 1 to move it to the
-    # auxiliary stream.
-    "VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP": _bool_reader(
-        "VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP", "0"
-    ),
     "VLLM_ILU_DP_VOCAB_GROUP_SIZE": _int_reader(
         "VLLM_ILU_DP_VOCAB_GROUP_SIZE", 0, minimum=0
     ),
@@ -746,6 +786,9 @@ _ILU_ENV_ALIASES: dict[str, Callable[[], Any]] = {
     _canonical_to_legacy(canonical): reader
     for canonical, reader in _ILU_ENV_VARS.items()
 }
+
+for _alias in ("VLLM_ILU_V41_PREFILL_FUSED_Q", "VLLM_V41_PREFILL_FUSED_Q"):
+    _ILU_ENV_ALIASES[_alias] = _ILU_ENV_VARS["VLLM_ILU_V41_FUSED_Q_QUANT"]
 
 
 # Iluvatar plugin control vars that are read directly via os.environ where they

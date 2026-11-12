@@ -45,6 +45,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
+from vllm_iluvatar import envs as ilu_envs
 from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.skip_layers import (
     add_skip_layers,
 )
@@ -1701,18 +1702,20 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                     self.wo_a, attn_out, positions, self.cos_sin
                 )
             return self.wo_b(grouped.flatten(1))
-        fused = getattr(self, "_inv_rope_fused_tokens", 0)
+        return self._project_attention_output(attn_out, positions)
+
+    def _project_attention_output(
+        self, attn_out: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        if self._uses_fused_inverse_rope():
+            return self._o_proj(attn_out)
+
+        fused = self._inv_rope_fused_tokens
         n_dec = self._num_decode_tokens(attn_out.shape[0])
         n_pref = attn_out.shape[0] - n_dec
-        # Cherry-pick glue: CQ prefill_bmm does inv_rope+o_proj on the whole
-        # batch. Our decode path already fused inv_rope into MLA, so a mixed
-        # step (decode prefix + prefill suffix, GSM8K conc=32) would rope
-        # decode tokens twice. Restrict prefill_bmm to the prefill suffix.
-        if (
-            not self._uses_fused_inverse_rope()
-            and n_pref > 128
-            and hasattr(self.wo_a, "prefill_bmm_b_fp8")
-        ):
+        # MLA can apply inverse RoPE to the decode prefix of a mixed batch.
+        # The prefill projection applies it only to the prefill suffix.
+        if n_pref > 128 and hasattr(self.wo_a, "prefill_bmm_b_fp8"):
             grouped, scales = ixfshared.fused_inv_rope_fp8_quant(
                 attn_out[n_dec:],
                 positions[n_dec:],
@@ -1728,27 +1731,21 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             prefill_out = self.wo_b(projected.flatten(1))
             if n_dec == 0:
                 return prefill_out
-            # Decode ran last; fused == n_dec means MLA already applied inv_rope.
-            if fused != n_dec:
+            if fused < n_dec:
                 apply_rope(
-                    attn_out[:n_dec].unsqueeze(0),
-                    positions[:n_dec],
+                    attn_out[fused:n_dec].unsqueeze(0),
+                    positions[fused:n_dec],
                     self.cos_sin,
                     inverse=True,
                 )
             return torch.cat((self._o_proj(attn_out[:n_dec]), prefill_out), dim=0)
-        if self._uses_fused_inverse_rope() or fused >= attn_out.shape[0]:
-            pass  # inv_rope already fused into the reader / MLA
-        elif fused > 0:
-            # partial: only apply to unfused suffix (prefill tokens)
+        if fused < attn_out.shape[0]:
             apply_rope(
                 attn_out[fused:].unsqueeze(0),
                 positions[fused:],
                 self.cos_sin,
                 inverse=True,
             )
-        else:
-            apply_rope(attn_out.unsqueeze(0), positions, self.cos_sin, inverse=True)
         return self._o_proj(attn_out)
 
     def _run_parallel_input_projections(

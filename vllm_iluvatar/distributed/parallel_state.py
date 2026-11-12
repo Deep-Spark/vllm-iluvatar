@@ -295,7 +295,11 @@ def _ilu_irecv_tensor_dict_sync(
                 tensor_dict[key] = full_tensor
                 continue
 
-            if not compressed_prefill and self._should_use_all_gather(
+            compressed_tensor = compressed_prefill and key in (
+                "hidden_states",
+                "prefill_pp_scale",
+            )
+            if not compressed_tensor and self._should_use_all_gather(
                 key, full_tensor.numel(), all_gather_group, all_gather_tensors
             ):
                 orig_shape = full_tensor.shape

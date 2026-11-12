@@ -49,7 +49,7 @@ def test_batched_fp8_experts_match_legacy_fp4_fp8_path(
 ):
     torch.manual_seed(7)
     device = torch.device("cuda")
-    num_tokens, num_experts, topk = 8, 2, 2
+    num_tokens, num_experts, topk = 8, 4, 2
     hidden_size = intermediate_size = 256
     max_tokens_per_expert = num_tokens
 
@@ -60,7 +60,7 @@ def test_batched_fp8_experts_match_legacy_fp4_fp8_path(
         device=device,
     )
     topk_ids = torch.tensor(
-        [[0, 1], [1, 0], [0, 1], [1, 0], [0, 1], [1, 0], [0, 1], [1, 0]],
+        [[0, 1]] * 7 + [[0, 2]],
         dtype=torch.int32,
         device=device,
     )

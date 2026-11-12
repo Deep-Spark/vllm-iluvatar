@@ -26,6 +26,7 @@ def test_prefill_membership(monkeypatch, rows, width, ties):
     ends = edge.repeat((rows + 6) // 7)[:rows]
     expected = torch.empty(rows, 2048, device="cuda", dtype=torch.int32)
     actual = torch.empty_like(expected)
+    monkeypatch.setenv("VLLM_ILU_V41_PREFILL_UNSORTED", "0")
     ilu_candidate_blocks.select_candidate_blocks(logits, None, ends, 2048, 8, expected)
     monkeypatch.setenv("VLLM_ILU_V41_PREFILL_UNSORTED", "1")
     ilu_candidate_blocks.select_candidate_blocks(logits, None, ends, 2048, 8, actual)

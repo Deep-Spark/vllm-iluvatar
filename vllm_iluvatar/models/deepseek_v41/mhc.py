@@ -7,6 +7,7 @@ import torch
 from ixformer.inference.functions.models import deepseek_v41 as ixfops
 from vllm import envs
 
+from vllm_iluvatar import envs as ilu_envs
 from vllm_iluvatar.ilu_util.arch import is_ivcore30
 
 

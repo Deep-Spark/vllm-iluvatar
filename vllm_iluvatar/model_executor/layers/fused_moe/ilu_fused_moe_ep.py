@@ -58,7 +58,6 @@ logger = init_logger(__name__)
 # Named for DS4 originally; the override now also serves GLM-5.2 (``naive``).
 _DECODE_EP_BACKEND = envs.VLLM_ILU_DECODE_EP_BACKEND
 _USE_FUSED_MOE = envs.VLLM_ILU_MOE_EP_LL_MOE_ALGO == "FUSED"
-_USE_EP_RS_TP_AG = envs.VLLM_ILU_MOE_EP_RS_TP_AG
 _MAX_NUM_SEQS: int | None = None
 
 
@@ -624,7 +623,7 @@ class IluFusedMoEEP:
         tp_group = get_tp_group()
         local_tokens = sizes[rank]
         use_rs_ag = (
-            _USE_EP_RS_TP_AG
+            envs.VLLM_ILU_MOE_EP_RS_TP_AG
             and not sequence_parallel
             and tp_group.world_size > 1
             and 18 <= local_tokens <= 162

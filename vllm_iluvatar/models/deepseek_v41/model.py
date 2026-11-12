@@ -23,6 +23,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
+from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.forward_context import get_forward_context, override_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
@@ -41,11 +42,12 @@ from vllm.model_executor.offloader import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from vllm_iluvatar import envs as ilu_envs
 from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.skip_layers import (
     producer_kv_only_layer,
     producer_last_layer,
 )
-from vllm_iluvatar.envs import _ILU_CANONICAL_ONLY_ENV_VARS
+from vllm_iluvatar.ilu_util.arch import is_ivcore30
 from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (  # noqa: E501
     clear_activation_prequant,
     register_activation_prequant,
@@ -234,10 +236,6 @@ class IluDeepseekV41MoE(nn.Module, IluFusedMoEEP):
         # FusedMoE runner alone does not dispatch/combine activations across
         # that group on Iluvatar; the platform mixin owns that collective.
         self.init_ep()
-        # Decode NVSM/LL: run shared MLP on the aux stream so it overlaps
-        # IBGDA dispatch. GLM already wires this; V4.1 previously left the
-        # mixin default (False) and serialized shared compute behind dispatch.
-        self._ll_shared_dispatch_overlap_enabled = _ll_shared_dispatch_overlap_enabled()
 
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
@@ -1240,7 +1238,8 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         hidden_states = mhc.hc_post(hidden_states, residual, post_mix, res_mix)
         if self.producer_prefix_state is not None:
             self.producer_prefix_state.capture(self, hidden_states, pre_mix, positions)
-        if not get_pp_group().is_last_rank:
+        pp_group = get_pp_group()
+        if not pp_group.is_last_rank:
             tensors = {"hidden_states": hidden_states, "pre_mix": pre_mix}
             num_tokens = positions.shape[0]
             attn_metadata = get_forward_context().attn_metadata
@@ -1254,6 +1253,8 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
                 and hidden_states.dtype == torch.bfloat16
                 and hidden_states.is_contiguous()
                 and get_tensor_model_parallel_world_size() == 1
+                and is_ivcore30()
+                and not pp_group.use_cpu_custom_send_recv
                 and _is_pure_prefill(attn_metadata, num_tokens)
                 and (
                     pp_quant_senders == "all"

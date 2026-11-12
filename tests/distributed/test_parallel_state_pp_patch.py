@@ -446,3 +446,22 @@ def test_prefill_codec_decodes_before_persistent_bf16_copy(monkeypatch, compress
     persistent = torch.empty_like(expected)
     persistent.copy_(result["hidden_states"])
     assert torch.equal(persistent, expected)
+
+
+@pytest.mark.parametrize(
+    ("prefill", "decode", "num_tokens", "expected"),
+    [
+        (256, 0, 256, True),
+        (0, 256, 256, False),
+        (192, 64, 256, False),
+        (255, 0, 256, False),
+    ],
+)
+def test_pp_quant_requires_pure_prefill(prefill, decode, num_tokens, expected):
+    from vllm_iluvatar.models.deepseek_v41 import _prefill_pp_codec
+
+    metadata = MagicMock(spec=_prefill_pp_codec.DeepseekSparseSWAMetadata)
+    metadata.num_prefill_tokens = prefill
+    metadata.num_decode_tokens = decode
+    assert _prefill_pp_codec.is_pure_prefill({"swa": metadata}, num_tokens) is expected
+    assert not _prefill_pp_codec.is_pure_prefill({}, num_tokens)

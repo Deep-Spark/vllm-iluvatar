@@ -185,26 +185,50 @@ def test_remote_completion_fence_is_required():
 class LMCacheMPConnector:
     """Answers None for requests whose lookup has not resolved yet."""
 
-    def __init__(self, resolved=()):
+    def __init__(self, resolved=(), hits=None):
         self.resolved = set(resolved)
+        self.hits = dict(hits or {})
         self.calls = []
+        self.allocs = []
 
     def get_num_new_matched_tokens(self, req, num_computed_tokens):
         self.calls.append((req.request_id, num_computed_tokens))
+        if req.request_id in self.hits:
+            ext = max(0, self.hits[req.request_id] - num_computed_tokens)
+            return ext, ext > 0
         if req.request_id in self.resolved:
             return 0, False
         return None, True
+
+    def update_state_after_alloc(self, req, blocks, num_external_tokens):
+        self.allocs.append((req.request_id, num_external_tokens))
 
 
 class OffloadingConnector:
     """A synchronous connector: every lookup resolves on the first call."""
 
-    def __init__(self):
+    def __init__(self, hits=None):
+        self.hits = dict(hits or {})
         self.calls = []
+        self.allocs = []
 
     def get_num_new_matched_tokens(self, req, num_computed_tokens):
         self.calls.append((req.request_id, num_computed_tokens))
+        ext = max(0, self.hits.get(req.request_id, 0) - num_computed_tokens)
+        return ext, ext > 0
+
+    def update_state_after_alloc(self, req, blocks, num_external_tokens):
+        self.allocs.append((req.request_id, num_external_tokens))
+
+
+class OptNixlConnector:
+    """Producer-side NIXL connector stub: never loads external prefix tokens."""
+
+    def get_num_new_matched_tokens(self, req, num_computed_tokens):
         return 0, False
+
+    def update_state_after_alloc(self, req, blocks, num_external_tokens):
+        pass
 
 
 class MultiConnector:
@@ -212,9 +236,21 @@ class MultiConnector:
         self.sub_connectors = list(children)
 
     def get_num_new_matched_tokens(self, req, num_computed_tokens):
+        chosen = (0, False)
         for child in self.sub_connectors:
-            child.get_num_new_matched_tokens(req, num_computed_tokens)
-        return None, True
+            toks, load_async = child.get_num_new_matched_tokens(
+                req, num_computed_tokens
+            )
+            if toks is None:
+                return None, False
+            if chosen[0] == 0 and toks > 0:
+                chosen = (toks, load_async)
+        return chosen
+
+    def update_state_after_alloc(self, req, blocks, num_external_tokens):
+        for child in self.sub_connectors:
+            if hasattr(child, "update_state_after_alloc"):
+                child.update_state_after_alloc(req, blocks, num_external_tokens)
 
 
 def with_connector(sched, connector, local_hit=0, block_size=64):
@@ -229,10 +265,20 @@ def test_lookup_ahead_is_off_by_default():
     connector = LMCacheMPConnector(resolved={"b"})
     sched, _ = scheduler([request("long", 800000)], [b, a])
     with_connector(sched, connector)
+    # Without LOOKUP_AHEAD, only the shortest candidate ("a") is probed; since
+    # "a" is unresolved, it is not promoted so long prefill keeps full budget.
+    assert supply.plan(sched, 4096) is None
+    assert sched.waiting == [b, a]
+    assert connector.calls == [("a", 0)]
+    assert supply.state(sched).submitted == set()
+
+    # Once "a" resolves, it is promoted and isolates the waiting loop.
+    connector.resolved.add("a")
     plan = supply.plan(sched, 4096)
     assert plan is not None and "a" in plan.short_ids
+    assert plan.isolate_waiting is True
+    assert plan.promoted_waiting_id == "a"
     assert sched.waiting == [a, b]
-    assert connector.calls == []
 
 
 def test_lookup_ahead_promotes_first_resolved(monkeypatch):
@@ -243,22 +289,46 @@ def test_lookup_ahead_promotes_first_resolved(monkeypatch):
     with_connector(sched, connector, local_hit=130)
     plan = supply.plan(sched, 4096)
     assert plan is not None and "b" in plan.short_ids and "a" not in plan.short_ids
+    assert plan.isolate_waiting is True
+    assert plan.promoted_waiting_id == "b"
     assert sched.waiting == [b, a]
     # Block-aligned local hit, as the waiting loop passes it.
     assert connector.calls == [("a", 128), ("b", 128)]
     assert a.num_computed_tokens == b.num_computed_tokens == 0
 
 
-def test_lookup_ahead_falls_back_to_shortest(monkeypatch):
+def test_lookup_ahead_defers_when_unresolved(monkeypatch):
     monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_AHEAD", "1")
     a, b = request("a", 800, prefix="unseen"), request("b", 8000, prefix="unseen")
     connector = LMCacheMPConnector(resolved={"b"})
     sched, _ = scheduler([request("long", 800000)], [b, a])
     with_connector(sched, connector)
-    plan = supply.plan(sched, 4096)
-    assert plan is not None and "a" in plan.short_ids
-    assert sched.waiting == [a, b]
+    assert supply.plan(sched, 4096) is None
+    assert sched.waiting == [b, a]
     assert connector.calls == [("a", 0)]
+
+    # If running already has bounded short work, keep its share without
+    # promoting the unresolved waiting candidate.
+    running_short = request("s_run", 1024, status="RUNNING")
+    sched2, _ = scheduler([request("long", 800000), running_short], [b, a])
+    with_connector(sched2, LMCacheMPConnector(resolved={"b"}))
+    plan = supply.plan(sched2, 4096)
+    assert plan is not None
+    assert plan.short_ids == {"s_run"}
+    assert plan.promoted_waiting_id is None
+    assert plan.isolate_waiting is True
+    assert sched2.waiting == [b, a]
+
+
+def test_lookup_submit_and_candidate_probe_do_not_double_query(monkeypatch):
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_SUBMIT", "4")
+    long_w = request("long_w", 800000, prefix="unseen")
+    short_w = request("short_w", 800, prefix="unseen")
+    connector = LMCacheMPConnector()
+    sched, _ = scheduler([request("long", 800000)], [long_w, short_w])
+    with_connector(sched, connector)
+    assert supply.plan(sched, 4096) is None
+    assert connector.calls == [("long_w", 0), ("short_w", 0)]
 
 
 def test_lookup_ahead_without_connector(monkeypatch):
@@ -268,6 +338,7 @@ def test_lookup_ahead_without_connector(monkeypatch):
     sched.connector = None
     plan = supply.plan(sched, 4096)
     assert plan is not None and "a" in plan.short_ids
+    assert plan.isolate_waiting is False
 
 
 def test_lookup_submit_is_off_by_default():
@@ -420,9 +491,497 @@ def test_real_schedule_composes_and_is_idempotent(monkeypatch):
     assert "_ilu_align_prefix_replay_ext_tokens" in source
     assert "if num_new_tokens <= 0:" in source
     assert source.count("_ilu_prefill_supply.plan(") == 1
-    assert source.count("supply_plan.limit(") == 1
-    assert source.count("supply_plan.consume(") == 1
+    assert source.count("supply_plan.limit(") == 3
+    assert source.count("supply_plan.consume(") == 2
+    assert source.count("supply_plan.should_skip_waiting(") == 1
+    assert patch.patch_schedule_source(source) == source
     patch._apply()
     assert Scheduler.schedule is schedule and Scheduler._free_request is free
     with pytest.raises(RuntimeError, match="re-sync"):
         patch.patch_schedule_source("def schedule(self): pass")
+
+
+def test_prefill_budget_and_async_load_hol_compose_in_both_orders(monkeypatch):
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    from vllm_iluvatar.ilu_patch.general_patches import (
+        patch_pp_spec_schedule,
+        patch_sched_async_load_hol,
+    )
+
+    patch_pp_spec_schedule.register()
+    if not getattr(Scheduler.schedule, "_ilu_pp_spec_schedule_patched", False):
+        patch_pp_spec_schedule._apply()
+    base_schedule = Scheduler.schedule
+    base_free = Scheduler._free_request
+
+    monkeypatch.setattr(Scheduler, "schedule", base_schedule)
+    monkeypatch.setattr(Scheduler, "_free_request", base_free)
+    patch._apply()
+    patch_sched_async_load_hol._apply()
+    sched_ab = Scheduler.schedule
+    source_ab = sched_ab._ilu_pp_spec_schedule_source
+    assert getattr(sched_ab, "_ilu_pp_spec_schedule_patched", False)
+    assert getattr(sched_ab, "_ilu_prefill_budget_patched", False)
+    assert getattr(sched_ab, "_ilu_async_load_hol_patched", False)
+
+    # Reverse order must produce the exact same rewritten schedule source.
+    Scheduler.schedule = base_schedule
+    Scheduler._free_request = base_free
+    patch_sched_async_load_hol._apply()
+    patch._apply()
+    sched_ba = Scheduler.schedule
+    source_ba = sched_ba._ilu_pp_spec_schedule_source
+    assert getattr(sched_ba, "_ilu_pp_spec_schedule_patched", False)
+    assert getattr(sched_ba, "_ilu_prefill_budget_patched", False)
+    assert getattr(sched_ba, "_ilu_async_load_hol_patched", False)
+    assert source_ab == source_ba
+
+    # Re-applying both again is a strict no-op.
+    patch._apply()
+    patch_sched_async_load_hol._apply()
+    assert Scheduler.schedule is sched_ba
+
+
+def test_connector_detection_nested_and_rebind():
+    class LMCacheMPConnectorUpstream:
+        def get_num_new_matched_tokens(self, req, num_computed_tokens):
+            return 0, False
+
+    sched, _ = scheduler([request("long", 800000)], [request("a", 800, prefix="unseen")])
+    with_connector(sched, MultiConnector(OptNixlConnector(), OffloadingConnector()))
+    plan_offload = supply.plan(sched, 4096)
+    assert plan_offload is not None and plan_offload.isolate_waiting is False
+
+    # Rebinding connector on the same scheduler invalidates the cached lookup.
+    sched.waiting = Queue([request("a", 800, prefix="unseen")])
+    nested = NS(_connectors=[OptNixlConnector(), MultiConnector(LMCacheMPConnectorUpstream())])
+    nested.get_num_new_matched_tokens = lambda req, n: (0, False)
+    with_connector(sched, nested)
+    plan_lmcache = supply.plan(sched, 4096)
+    assert plan_lmcache is not None and plan_lmcache.isolate_waiting is True
+
+
+class _FakeBlocks:
+    def __init__(self, ids=(1,)):
+        self._ids = (list(ids),)
+
+    def get_block_ids(self):
+        return self._ids
+
+
+class _LiveRequest(NS):
+    __hash__ = object.__hash__
+    __eq__ = object.__eq__
+
+
+def _live_request(rid, total, done=0, status=None, prefix="unseen"):
+    from vllm.v1.request import RequestStatus
+
+    st = status if status is not None else RequestStatus.WAITING
+    return _LiveRequest(
+        request_id=rid,
+        prompt_token_ids=[],
+        _all_token_ids=[],
+        all_token_ids=range(total),
+        mm_features=[],
+        sampling_params=None,
+        pooling_params=None,
+        lora_request=None,
+        prompt_embeds=None,
+        prompt_is_token_ids=None,
+        replay_start=0,
+        num_tokens=total,
+        num_tokens_with_spec=total,
+        num_prompt_tokens=total,
+        num_computed_tokens=done,
+        num_output_placeholders=0,
+        num_in_flight_tokens=0,
+        max_tokens=16,
+        next_decode_eligible_step=0,
+        is_prefill_chunk=done < total,
+        has_encoder_inputs=False,
+        spec_token_ids=[],
+        num_stale_output_tokens=0,
+        drop_stale_output=False,
+        skip_reading_prefix_cache=False,
+        shared_prefix_boundary=0,
+        prefill_stats=None,
+        num_preemptions=0,
+        use_structured_output=False,
+        status=st,
+        block_hashes=[prefix] * 500,
+        kv_transfer_params=None,
+        is_finished=lambda: False,
+    )
+
+
+def _live_scheduler(
+    monkeypatch,
+    *,
+    running=(),
+    waiting=(),
+    skipped=(),
+    connector=None,
+    budget=4096,
+    pp=8,
+    local_hits=None,
+    reserved_blocks=0,
+    refuse_async_loads=(),
+):
+    from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
+    from vllm.v1.core.sched.scheduler import PauseState, Scheduler
+
+    from vllm_iluvatar.ilu_patch.general_patches import patch_sched_async_load_hol
+
+    monkeypatch.setattr(Scheduler, "schedule", Scheduler.schedule)
+    monkeypatch.setattr(Scheduler, "_free_request", Scheduler._free_request)
+    patch._apply()
+    patch_sched_async_load_hol._apply()
+
+    hits = dict(local_hits or {})
+    refused = set(refuse_async_loads)
+    empty_blocks = _FakeBlocks(())
+
+    def get_computed_blocks(req):
+        return empty_blocks, hits.get(req.request_id, 0), 0
+
+    def get_computed_blocks_for_connector(req):
+        return empty_blocks, hits.get(req.request_id, 0), 0, False
+
+    def allocate_slots(req, num_tokens, **kwargs):
+        if kwargs.get("delay_cache_blocks") and req.request_id in refused:
+            return None
+        return _FakeBlocks((1,))
+
+    sched = Scheduler.__new__(Scheduler)
+    sched.current_step = 0
+    sched.max_num_scheduled_tokens = budget
+    sched.vllm_config = NS(
+        speculative_config=None,
+        kv_transfer_config=NS(is_kv_producer=True, is_kv_consumer=False),
+        parallel_config=NS(pipeline_parallel_size=pp),
+    )
+    sched.scheduler_config = NS(
+        max_num_batched_tokens=budget,
+        long_prefill_token_threshold=0,
+        enable_chunked_prefill=True,
+    )
+    sched._pause_state = PauseState.UNPAUSED
+    sched.max_num_encoder_input_tokens = 0
+    sched.prefill_capacity_bound = False
+    sched.policy = SchedulingPolicy.FCFS
+    sched.lora_config = None
+    sched.ec_connector = None
+    sched.aux_output_connector = None
+    sched.connector = connector
+    sched.connector_prefix_cache_stats = None
+    sched.max_model_len = 2_000_000
+    sched.num_sampled_tokens_per_step = 1
+    sched.need_mamba_block_aligned_split = False
+    sched.num_prefill_lookahead = 0
+    sched.num_lookahead_tokens = 0
+    sched.num_waiting_for_streaming_input = 0
+    sched.max_num_active_reqs = 64
+    sched.max_num_running_reqs = 64
+    sched.block_size = 64
+    sched.hash_block_size = 256
+    sched.prefix_replay_tokens = 128
+    sched.num_spec_tokens = 0
+    sched.dynamic_sd_lookup = None
+    sched.is_encoder_decoder = False
+    sched.scheduler_reserve_full_isl = False
+    sched._inflight_prefills = set()
+    sched.finished_recving_kv_req_ids = set()
+    sched.failed_recving_kv_req_ids = set()
+    sched.needs_kv_cache_zeroing = False
+    sched._skip_zero_block_ids = set()
+    sched.log_stats = False
+    sched.kv_cache_config = NS(kv_cache_groups=[NS()])
+    sched.use_v2_model_runner = True
+    sched.model_uses_mrope = False
+    sched.sched_step_seq = 0
+    sched.defer_block_free = False
+    sched.reset_preempted_req_ids = set()
+    sched.finished_req_ids = set()
+    sched.encoder_cache_manager = NS(
+        get_freed_mm_hashes=lambda: [],
+        get_manager_metadata=lambda: None,
+    )
+    sched.kv_cache_manager = NS(
+        enable_kv_cache_events=False,
+        empty_kv_cache_blocks=empty_blocks,
+        new_step_starts=lambda: None,
+        get_computed_blocks=get_computed_blocks,
+        get_computed_blocks_for_connector=get_computed_blocks_for_connector,
+        truncate_computed_blocks=lambda blocks, n: blocks,
+        allocate_slots=allocate_slots,
+        get_blocks=lambda rid: _FakeBlocks((1,)),
+        get_block_ids=lambda rid: ([1],),
+        cache_blocks=lambda req, n: None,
+        record_prefix_cache_stats=lambda req, n: None,
+        get_num_common_prefix_blocks=lambda rid: [0],
+        take_boundary_state_offloads=lambda: {},
+        take_kv_cache_block_copies=lambda: ([], []),
+    )
+    sched._get_new_block_ids_to_zero = lambda: None
+    sched._inflight_prefill_reserved_blocks = lambda: reserved_blocks
+    sched._spec_decode_step_blocks = lambda: 0
+    sched._build_kv_connector_meta = lambda conn, out: None
+    sched._make_cached_request_data = lambda *a, **k: NS()
+    sched._get_local_prefix_cache_hit = (
+        lambda req: (empty_blocks, hits.get(req.request_id, 0), 0, False)
+    )
+
+    sched.running = list(running)
+    sched.waiting = FCFSRequestQueue()
+    for r in waiting:
+        sched.waiting.add_request(r)
+    sched.skipped_waiting = FCFSRequestQueue()
+    for r in skipped:
+        sched.skipped_waiting.add_request(r)
+    sched.requests = {
+        r.request_id: r for r in [*running, *waiting, *skipped]
+    }
+    return sched
+
+
+def test_schedule_e2e_cpu_offload_behavior_unchanged(monkeypatch):
+    from vllm.v1.request import RequestStatus
+
+    long_1 = _live_request("long_1", 800_000, done=4096, status=RequestStatus.RUNNING)
+    long_2 = _live_request("long_2", 800_000)
+    short_1 = _live_request("short_1", 8000)
+    long_3 = _live_request("long_3", 800_000)
+    conn = MultiConnector(OptNixlConnector(), OffloadingConnector())
+
+    sched = _live_scheduler(
+        monkeypatch,
+        running=[long_1],
+        waiting=[long_2, short_1, long_3],
+        connector=conn,
+        budget=4096,
+    )
+    out = sched.schedule()
+    assert out.num_scheduled_tokens == {"long_1": 2048, "short_1": 2048}
+    assert [r.request_id for r in sched.running] == ["long_1", "short_1"]
+    assert [r.request_id for r in sched.waiting] == ["long_2", "long_3"]
+
+
+@pytest.mark.parametrize("ahead", ["0", "4"])
+def test_schedule_e2e_lmcache_unresolved_short_never_leaks_to_800k_long(
+    monkeypatch, ahead
+):
+    from vllm.v1.request import RequestStatus
+
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_AHEAD", ahead)
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_SUBMIT", "16")
+
+    long_1 = _live_request("long_1", 800_000, done=4096, status=RequestStatus.RUNNING)
+    long_2 = _live_request("long_2", 800_000)
+    long_3 = _live_request("long_3", 800_000)
+    short_1 = _live_request("short_1", 8000)
+    # Queued 800k requests already resolved to (0, False) via early lookup submit,
+    # while short_1 just arrived and its lookup is still in flight (None, True).
+    lmcache = LMCacheMPConnector(resolved={"long_2", "long_3"})
+    conn = MultiConnector(OptNixlConnector(), lmcache)
+
+    sched = _live_scheduler(
+        monkeypatch,
+        running=[long_1],
+        waiting=[long_2, short_1, long_3],
+        connector=conn,
+        budget=4096,
+    )
+    out1 = sched.schedule()
+    # Step 1: short_1 is unresolved -> long_1 retains full 4096 budget, and
+    # neither long_2 nor long_3 leaks into running!
+    assert out1.num_scheduled_tokens == {"long_1": 4096}
+    assert [r.request_id for r in sched.running] == ["long_1"]
+    assert [r.request_id for r in sched.waiting] == ["long_2", "short_1", "long_3"]
+    assert ("short_1", 0) in lmcache.calls
+
+    # Step 2: short_1 resolves -> promoted and scheduled for 2048; long_2/3 stay queued.
+    lmcache.resolved.add("short_1")
+    out2 = sched.schedule()
+    assert out2.num_scheduled_tokens == {"long_1": 2048, "short_1": 2048}
+    assert [r.request_id for r in sched.running] == ["long_1", "short_1"]
+    assert [r.request_id for r in sched.waiting] == ["long_2", "long_3"]
+
+
+def test_schedule_e2e_lmcache_async_kv_load_short_never_leaks_to_800k_long(monkeypatch):
+    from vllm.v1.request import RequestStatus
+
+    long_1 = _live_request("long_1", 800_000, done=4096, status=RequestStatus.RUNNING)
+    long_2 = _live_request("long_2", 800_000)
+    long_3 = _live_request("long_3", 800_000)
+    short_1 = _live_request("short_1", 8000)
+    # short_1 hits 6144 tokens in LMCache (load_kv_async=True -> num_new_tokens=0),
+    # while long_2 and long_3 resolved to (0, False).
+    lmcache = LMCacheMPConnector(
+        resolved={"long_2", "long_3"}, hits={"short_1": 6144}
+    )
+    conn = MultiConnector(OptNixlConnector(), lmcache)
+
+    sched = _live_scheduler(
+        monkeypatch,
+        running=[long_1],
+        waiting=[long_2, short_1, long_3],
+        connector=conn,
+        budget=4096,
+    )
+    out1 = sched.schedule()
+    # Step 1: short_1 enters WAITING_FOR_REMOTE_KVS consuming 0 compute budget.
+    # The remaining 2048 short budget MUST NOT leak to long_2 or long_3!
+    assert out1.num_scheduled_tokens == {"long_1": 2048}
+    assert short_1.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert [r.request_id for r in sched.running] == ["long_1"]
+    assert [r.request_id for r in sched.skipped_waiting] == ["short_1"]
+    assert [r.request_id for r in sched.waiting] == ["long_2", "long_3"]
+
+    # Step 2: while short_1 DMA is in flight, long_1 gets full 4096 budget.
+    out2 = sched.schedule()
+    assert out2.num_scheduled_tokens == {"long_1": 4096}
+    assert [r.request_id for r in sched.running] == ["long_1"]
+    assert [r.request_id for r in sched.waiting] == ["long_2", "long_3"]
+
+    # Step 3: short_1 finishes async KV recv (6144 - 128 SWA replay = 6016,
+    # leaving 1984 tokens) and runs to completion without admitting long_2.
+    sched.finished_recving_kv_req_ids.add("short_1")
+    out3 = sched.schedule()
+    assert out3.num_scheduled_tokens == {"long_1": 2112, "short_1": 1984}
+    assert [r.request_id for r in sched.running] == ["long_1", "short_1"]
+    assert [r.request_id for r in sched.waiting] == ["long_2", "long_3"]
+
+
+def test_schedule_e2e_lmcache_partial_short_consumption_never_leaks_to_long(
+    monkeypatch,
+):
+    from vllm.v1.request import RequestStatus
+
+    # Case A: short_1 (8000) gets short_budget=2048 in plan(), then hits 7168
+    # local APC tokens in WAITING loop (7168 - 128 replay = 7040 -> 960 new
+    # tokens < 2048). Remaining 1088 tokens must not leak to long_2!
+    long_1 = _live_request("long_1", 800_000, done=4096, status=RequestStatus.RUNNING)
+    long_2 = _live_request("long_2", 800_000)
+    short_1 = _live_request("short_1", 8000)
+    lmcache = LMCacheMPConnector(resolved={"short_1", "long_2"})
+    sched = _live_scheduler(
+        monkeypatch,
+        running=[long_1],
+        waiting=[long_2, short_1],
+        connector=MultiConnector(OptNixlConnector(), lmcache),
+        budget=4096,
+        local_hits={"short_1": 7168},
+    )
+    out = sched.schedule()
+    assert out.num_scheduled_tokens == {"long_1": 2048, "short_1": 960}
+    assert [r.request_id for r in sched.running] == ["long_1", "short_1"]
+    assert [r.request_id for r in sched.waiting] == ["long_2"]
+
+    # Case B: running already has short_run (skipped due to decode cadence),
+    # while waiting has resolved long_2 and unresolved short_wait.
+    long_a = _live_request("long_a", 800_000, done=4096, status=RequestStatus.RUNNING)
+    short_run = _live_request("short_run", 4096, done=3072, status=RequestStatus.RUNNING)
+    short_run.next_decode_eligible_step = 99
+    long_b = _live_request("long_b", 800_000)
+    short_wait = _live_request("short_wait", 800)
+    sched2 = _live_scheduler(
+        monkeypatch,
+        running=[long_a, short_run],
+        waiting=[long_b, short_wait],
+        connector=MultiConnector(
+            OptNixlConnector(), LMCacheMPConnector(resolved={"long_b"})
+        ),
+        budget=4096,
+    )
+    out2 = sched2.schedule()
+    assert out2.num_scheduled_tokens == {"long_a": 3072}
+    assert [r.request_id for r in sched2.running] == ["long_a", "short_run"]
+    assert [r.request_id for r in sched2.waiting] == ["long_b", "short_wait"]
+
+
+def test_schedule_e2e_lmcache_skipped_waiting_long_does_not_block_promoted_short(
+    monkeypatch,
+):
+    from vllm.v1.request import RequestStatus
+
+    long_1 = _live_request("long_1", 800_000, done=4096, status=RequestStatus.RUNNING)
+    # A long request in skipped_waiting whose remote KV load already finished
+    # (remaining = 160k > short_limit), plus an in-progress remote KV load.
+    long_loaded = _live_request(
+        "long_loaded", 800_000, done=640_000, status=RequestStatus.WAITING
+    )
+    still_loading = _live_request(
+        "still_loading", 200_000, done=160_000, status=RequestStatus.WAITING_FOR_REMOTE_KVS
+    )
+    long_2 = _live_request("long_2", 800_000)
+    short_1 = _live_request("short_1", 1500)
+
+    lmcache = LMCacheMPConnector(resolved={"short_1", "long_2"})
+    sched = _live_scheduler(
+        monkeypatch,
+        running=[long_1],
+        skipped=[long_loaded, still_loading],
+        waiting=[long_2, short_1],
+        connector=MultiConnector(OptNixlConnector(), lmcache),
+        budget=4096,
+    )
+    out = sched.schedule()
+    # short_1 in waiting is reached past skipped_waiting, scheduled for 1500,
+    # long_2 is not admitted, and FCFS order in both queues is preserved!
+    assert out.num_scheduled_tokens == {"long_1": 2596, "short_1": 1500}
+    assert [r.request_id for r in sched.running] == ["long_1", "short_1"]
+    assert [r.request_id for r in sched.skipped_waiting] == [
+        "long_loaded",
+        "still_loading",
+    ]
+    assert [r.request_id for r in sched.waiting] == ["long_2"]
+
+
+def test_schedule_e2e_lmcache_composes_with_async_load_hol_refusal(monkeypatch):
+    from vllm.v1.request import RequestStatus
+
+    long_1 = _live_request("long_1", 800_000, done=4096, status=RequestStatus.RUNNING)
+    short_hit = _live_request("short_hit", 8000)
+    in_progress = [
+        _live_request(
+            f"loading_{i}",
+            100_000,
+            done=64_000,
+            status=RequestStatus.WAITING_FOR_REMOTE_KVS,
+        )
+        for i in range(64)
+    ]
+    # Placed past plan()'s 64-entry scan window so only the waiting loop's
+    # HOL bypass + BudgetPlan.should_skip_waiting reaches and promotes it.
+    inflight_done = _live_request(
+        "inflight_done",
+        400_000,
+        done=320_000,
+        status=RequestStatus.WAITING_FOR_REMOTE_KVS,
+    )
+    long_2 = _live_request("long_2", 800_000)
+
+    lmcache = LMCacheMPConnector(
+        resolved={"long_2"}, hits={"short_hit": 6144}
+    )
+    sched = _live_scheduler(
+        monkeypatch,
+        running=[long_1],
+        skipped=[short_hit, *in_progress, inflight_done],
+        waiting=[long_2],
+        connector=MultiConnector(OptNixlConnector(), lmcache),
+        budget=4096,
+        reserved_blocks=128,
+        refuse_async_loads={"short_hit"},
+    )
+    sched._inflight_prefills.update([*in_progress, inflight_done])
+    sched.finished_recving_kv_req_ids.add("inflight_done")
+
+    out = sched.schedule()
+    assert out.num_scheduled_tokens == {"long_1": 2048}
+    assert inflight_done.status == RequestStatus.WAITING
+    assert "inflight_done" not in sched.finished_recving_kv_req_ids
+    assert [r.request_id for r in sched.running] == ["long_1"]
+    assert [r.request_id for r in sched.waiting] == ["long_2"]

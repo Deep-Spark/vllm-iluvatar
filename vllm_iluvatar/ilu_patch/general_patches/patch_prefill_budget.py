@@ -39,8 +39,48 @@ def patch_schedule_source(source: str) -> str:
                 "            supply_plan.consume(request_id, num_new_tokens)\n"
             ),
         ),
+        (
+            "            num_external_computed_tokens = 0\n"
+            "            load_kv_async = False\n",
+            (
+                "            if (\n"
+                "                supply_plan is not None\n"
+                "                and supply_plan.isolate_waiting\n"
+                "                and supply_plan.limit(request_id, token_budget) <= 0\n"
+                "            ):\n"
+                "                if supply_plan.should_skip_waiting(self, request_id):\n"
+                "                    request_queue.pop_request()\n"
+                "                    step_skipped_waiting.prepend_request(request)\n"
+                "                    continue\n"
+                "                break\n\n"
+                "            num_external_computed_tokens = 0\n"
+                "            load_kv_async = False\n"
+            ),
+        ),
+        (
+            "                request_token_budget = min(token_budget, input_budget - draft_slots)\n",
+            (
+                "                request_token_budget = min(token_budget, input_budget - draft_slots)\n"
+                "                if supply_plan is not None and supply_plan.isolate_waiting:\n"
+                "                    request_token_budget = supply_plan.limit(\n"
+                "                        request_id, request_token_budget\n"
+                "                    )\n"
+            ),
+        ),
+        (
+            "            num_scheduled_tokens[request_id] = num_new_tokens\n"
+            "            token_budget -= num_new_tokens\n",
+            (
+                "            num_scheduled_tokens[request_id] = num_new_tokens\n"
+                "            if supply_plan is not None and supply_plan.isolate_waiting:\n"
+                "                supply_plan.consume(request_id, num_new_tokens)\n"
+                "            token_budget -= num_new_tokens\n"
+            ),
+        ),
     )
     for old, new in replacements:
+        if "\n" + new in source:
+            continue
         if source.count("\n" + old) != 1:
             raise RuntimeError(
                 f"Scheduler.schedule changed; re-sync prefill budget hook: {old!r}"
@@ -58,6 +98,8 @@ def _apply() -> None:
     # general-plugin discovery order. Exec'd methods have no inspectable source.
     patch_pp_spec_schedule.register()
     scheduler = sched_mod.Scheduler
+    if not getattr(scheduler.schedule, "_ilu_pp_spec_schedule_patched", False):
+        patch_pp_spec_schedule._apply()
     if getattr(scheduler.schedule, "_ilu_prefill_budget_patched", False):
         return
     original = scheduler.schedule
@@ -71,12 +113,14 @@ def _apply() -> None:
     schedule._ilu_prefill_budget_patched = True
     scheduler.schedule = schedule
 
-    free_request = scheduler._free_request
+    if not getattr(scheduler._free_request, "_ilu_prefill_budget_free_patched", False):
+        free_request = scheduler._free_request
 
-    @wraps(free_request)
-    def finish(self, request, *args, **kwargs):
-        if request.is_finished():
-            prefill_supply.finish(self, request)
-        return free_request(self, request, *args, **kwargs)
+        @wraps(free_request)
+        def finish(self, request, *args, **kwargs):
+            if request.is_finished():
+                prefill_supply.finish(self, request)
+            return free_request(self, request, *args, **kwargs)
 
-    scheduler._free_request = finish
+        finish._ilu_prefill_budget_free_patched = True
+        scheduler._free_request = finish

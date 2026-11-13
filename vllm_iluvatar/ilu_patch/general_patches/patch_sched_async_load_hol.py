@@ -186,6 +186,8 @@ def _apply() -> None:
     # Compose with the PP / remote replay rewrite regardless of general-plugin
     # discovery order; it must read the community source first.
     patch_pp_spec_schedule.register()
+    if not getattr(Scheduler.schedule, "_ilu_pp_spec_schedule_patched", False):
+        patch_pp_spec_schedule._apply()
     current = Scheduler.schedule
     if getattr(current, _MARK, False):
         return

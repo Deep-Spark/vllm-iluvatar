@@ -9,12 +9,16 @@ Select short work using actual resident cache coverage / confirmed remote comple
 not the seen-prefix hint (the hint only bounds expensive cache probes).
 
 VLLM_ILU_PREFILL_LOOKUP_AHEAD=K (default 0, off) drives the connector lookups
-of the K shortest candidates each step and promotes the first resolved one, so
-an asynchronous lookup does not hold the short share for several steps.
+of up to K shortest candidates each step in parallel and promotes the first
+resolved one; when 0, only the shortest candidate's lookup is driven. With
+LMCacheMPConnector, unresolved candidates are never promoted ahead of lookup
+completion, and the waiting loop is isolated to each request's BudgetPlan bucket
+so unused short budget cannot leak into unpromoted long prefills.
 VLLM_ILU_PREFILL_LOOKUP_SUBMIT=N (default 0, off) submits, each step, the
 connector lookup of up to N waiting requests not yet looked up, long or short,
 so the lookup is in flight before the waiting loop first visits the request.
-Both apply only when the connector includes LMCacheMPConnector.
+Synchronous connectors (e.g. CPU offload) and no-connector runs keep the
+original single-step promotion and waiting-loop behavior unchanged.
 """
 
 import collections
@@ -48,12 +52,22 @@ class SupplyState:
 
 
 class BudgetPlan:
-    def __init__(self, budget, short_ids, short_work):
+    def __init__(
+        self,
+        budget,
+        short_ids,
+        short_work,
+        *,
+        isolate_waiting=False,
+        promoted_waiting_id=None,
+    ):
         self.short_ids = set(short_ids)
         # The oldest long-running prefill retains >= half of the step budget.
         self.short_budget = min(budget // 2, short_work)
         self.long_budget = budget - self.short_budget
         self.short_used = self.long_used = 0
+        self.isolate_waiting = bool(isolate_waiting)
+        self.promoted_waiting_id = promoted_waiting_id
 
     def limit(self, rid, tokens):
         available = (
@@ -68,6 +82,22 @@ class BudgetPlan:
             self.short_used += tokens
         else:
             self.long_used += tokens
+
+    def should_skip_waiting(self, scheduler, rid):
+        target = self.promoted_waiting_id
+        if target is not None and rid != target:
+            if (
+                scheduler.waiting
+                and scheduler.waiting.peek_request().request_id == target
+            ) or any(r.request_id == target for r in scheduler.skipped_waiting):
+                return True
+        done = getattr(scheduler, "finished_recving_kv_req_ids", None)
+        if done and scheduler.skipped_waiting:
+            return any(
+                r.status.name == "WAITING_FOR_REMOTE_KVS" and r.request_id in done
+                for r in scheduler.skipped_waiting
+            )
+        return False
 
 
 def state(scheduler):
@@ -106,7 +136,7 @@ def plan(scheduler, budget):
     ):
         return None
     st = state(scheduler)
-    _submit_lookups(scheduler, st)
+    probed = _submit_lookups(scheduler, st)
     # A bounded request may span one pipeline-filling wave of chunk work.
     # Preserve the existing floor for shallow pipelines.
     short_chunks = max(
@@ -163,18 +193,26 @@ def plan(scheduler, budget):
             if 0 < count <= short_limit:
                 candidates.append((count, n, queue, request))
     # One bounded promotion per step. Retain original order of all other requests.
+    promoted_waiting_id = None
     if candidates:
         candidates.sort(key=lambda x: (x[0], x[1]))
-        count, _, queue, request = (
-            _first_resolved(scheduler, candidates) or candidates[0]
-        )
-        if queue.peek_request() is not request:
-            queue.remove_request(request)
-            queue.prepend_request(request)
-        short[request.request_id] = count
+        selected = _select_candidate(scheduler, st, candidates, probed)
+        if selected is not None:
+            count, _, queue, request = selected
+            if queue.peek_request() is not request:
+                queue.remove_request(request)
+                queue.prepend_request(request)
+            short[request.request_id] = count
+            promoted_waiting_id = request.request_id
     if not short:
         return None
-    return BudgetPlan(budget, short, sum(short.values()))
+    return BudgetPlan(
+        budget,
+        short,
+        sum(short.values()),
+        isolate_waiting=_async_lookup_connector(scheduler) is not None,
+        promoted_waiting_id=promoted_waiting_id,
+    )
 
 
 def _env_count(name):
@@ -188,28 +226,43 @@ def _lookup_ahead():
     return _env_count("VLLM_ILU_PREFILL_LOOKUP_AHEAD")
 
 
-_ASYNC_LOOKUP_CONNECTORS = frozenset({"LMCacheMPConnector"})
+_ASYNC_LOOKUP_CONNECTORS = frozenset(
+    {"LMCacheMPConnector", "LMCacheMPConnectorUpstream"}
+)
 
 
 def _async_lookup_connector(scheduler):
     """The scheduler's connector if it carries an LMCache MP lookup, else None.
 
     Only that connector answers lookups asynchronously; a synchronous one
-    (CPU offload) resolves on the first visit, so lookahead buys it nothing.
+    (CPU offload) resolves on the first visit, so lookahead and waiting-loop
+    budget isolation leave synchronous paths untouched.
     """
-    cached = scheduler.__dict__.get("_p_async_lookup_connector", False)
-    if cached is not False:
-        return cached
     connector = getattr(scheduler, "connector", None)
-    children = getattr(connector, "sub_connectors", None) or [connector]
-    found = any(
-        cls.__name__ in _ASYNC_LOOKUP_CONNECTORS
-        for child in children
-        if child is not None
-        for cls in type(child).__mro__
-    )
+    cached = scheduler.__dict__.get("_p_async_lookup_connector")
+    if isinstance(cached, tuple) and cached[0] is connector:
+        return cached[1]
+    seen = set()
+    stack = [connector]
+    found = False
+    while stack:
+        child = stack.pop()
+        if child is None or id(child) in seen:
+            continue
+        seen.add(id(child))
+        if any(
+            cls.__name__ in _ASYNC_LOOKUP_CONNECTORS for cls in type(child).__mro__
+        ):
+            found = True
+            break
+        children = (
+            getattr(child, "sub_connectors", None)
+            or getattr(child, "_connectors", None)
+        )
+        if children:
+            stack.extend(children)
     result = connector if found else None
-    scheduler.__dict__["_p_async_lookup_connector"] = result
+    scheduler.__dict__["_p_async_lookup_connector"] = (connector, result)
     return result
 
 
@@ -230,14 +283,15 @@ def _submit_lookups(scheduler, st):
     finishes lookups in the background (LMCache #5960 callbacks), one early
     call per request is enough for the result to be ready by admission.
     """
+    probed = {}
     limit = _env_count("VLLM_ILU_PREFILL_LOOKUP_SUBMIT")
     if limit <= 0:
-        return
+        return probed
     connector = _async_lookup_connector(scheduler)
     if connector is None:
-        return
+        return probed
     if scheduler.kv_cache_manager.enable_kv_cache_events:
-        return
+        return probed
     waiting = [*scheduler.skipped_waiting, *scheduler.waiting]
     st.submitted.intersection_update(r.request_id for r in waiting)
     for request in waiting:
@@ -251,33 +305,41 @@ def _submit_lookups(scheduler, st):
         ):
             continue
         st.submitted.add(request.request_id)
-        _lookup_hit(scheduler, connector, request)
+        probed[request.request_id] = _lookup_hit(scheduler, connector, request)
         limit -= 1
+    return probed
 
 
-def _first_resolved(scheduler, candidates):
-    """Return the first candidate whose connector lookup has resolved.
+def _select_candidate(scheduler, st, candidates, probed):
+    """Select at most one waiting short candidate to promote this step.
 
+    Synchronous connectors (CPU offload) and no-connector runs resolve on the
+    first waiting-loop visit, so the shortest candidate is promoted directly.
     An asynchronous connector (LMCache MP) answers None until its lookup
-    resolves, which takes several scheduler visits. A promoted request still
-    waiting on it leaves the short share idle and keeps the slot for those
-    steps. Driving the leading candidates' lookups every step lets them
-    resolve in parallel; the first resolved one takes the slot. The calls are
-    the ones the waiting loop would make on a visit.
+    resolves; promoting an unresolved request throttles long prefills and
+    leaves unused short budget in the waiting loop. Drive at least the shortest
+    candidate's lookup (or VLLM_ILU_PREFILL_LOOKUP_AHEAD candidates in
+    parallel) and promote only once a candidate's lookup has resolved.
     """
-    limit = _lookup_ahead()
-    if limit <= 0:
-        return None
     connector = _async_lookup_connector(scheduler)
-    if connector is None:
-        return None
-    if scheduler.kv_cache_manager.enable_kv_cache_events:
-        return None
+    if connector is None or scheduler.kv_cache_manager.enable_kv_cache_events:
+        return candidates[0]
+    track_submitted = _env_count("VLLM_ILU_PREFILL_LOOKUP_SUBMIT") > 0
+    limit = max(1, _lookup_ahead())
     for candidate in candidates[:limit]:
         request = candidate[3]
-        if request.num_computed_tokens:
+        if request.num_computed_tokens or getattr(
+            request, "skip_reading_prefix_cache", False
+        ):
             return candidate
-        if _lookup_hit(scheduler, connector, request) is not None:
+        rid = request.request_id
+        if rid in probed:
+            hit = probed[rid]
+        else:
+            if track_submitted:
+                st.submitted.add(rid)
+            hit = _lookup_hit(scheduler, connector, request)
+        if hit is not None:
             return candidate
     return None
 

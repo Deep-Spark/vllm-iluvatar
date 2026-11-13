@@ -1503,6 +1503,35 @@ class IluNixlWorkerMixin:
             selected_ssm_remote_ids,
         )
 
+    def _gqa_expected_remote_block_len(
+        self,
+        local_len: int,
+        remote_tp_size: int,
+        block_size_ratio: int,
+    ) -> int:
+        """Expected remote FA region bytes for GQA/MHA under heterogeneous TP.
+
+        Raw ``tp_ratio`` is wrong when ``TP > num_kv_heads``: extra ranks
+        replicate heads, so per-rank bytes track physical heads, not world size.
+        Example: heads=4, Decode TP8, Prefill TP1 → ratio 4, not 8.
+        """
+        assert self.transfer_topo is not None
+        total_heads = self.transfer_topo.total_num_kv_heads
+        local_heads = max(1, total_heads // self.transfer_topo.tp_size)
+        remote_heads = max(1, total_heads // remote_tp_size)
+        assert (local_len * remote_heads) % local_heads == 0, (
+            "GQA region length not divisible by physical head ratio: "
+            f"local={local_len}, local_heads={local_heads}, "
+            f"remote_heads={remote_heads}, total_heads={total_heads}, "
+            f"local_tp={self.transfer_topo.tp_size}, remote_tp={remote_tp_size}"
+        )
+        if remote_heads < local_heads:
+            assert block_size_ratio == 1, (
+                "Different local/remote block sizes are not supported "
+                "when remote has fewer KV heads per rank than local."
+            )
+        return (local_len * remote_heads) // local_heads // block_size_ratio
+
     def _validate_pp_selected_region_lengths(
         self,
         nixl_agent_meta: IluNixlAgentMetadata,
@@ -1533,9 +1562,9 @@ class IluNixlWorkerMixin:
         block_size_ratio = self.transfer_topo.block_size_ratio(
             nixl_agent_meta.block_size
         )
-        model_replicated = self.use_mla or self.transfer_topo.is_kv_replicated(
-            nixl_agent_meta.engine_id
-        )
+        # MLA (and region-level full replicas) keep equal per-rank bytes.
+        # GQA must use physical-head ratio — not tp_ratio — when TP>kv_heads.
+        model_replicated = self.use_mla
         for pair_idx, (local_region_id, remote_region_id) in enumerate(
             zip(selected_local_region_ids, selected_remote_region_ids)
         ):
@@ -1544,20 +1573,18 @@ class IluNixlWorkerMixin:
             replicated = model_replicated or self._is_region_replicated(local_region_id)
             if replicated:
                 expected_remote_len = local_len // block_size_ratio
-            elif tp_ratio > 0:
-                expected_remote_len = (local_len * tp_ratio) // block_size_ratio
             else:
-                assert block_size_ratio == 1, (
-                    "Different local/remote block sizes are not supported "
-                    "when P TP > D TP."
+                expected_remote_len = self._gqa_expected_remote_block_len(
+                    local_len, remote_tp_size, block_size_ratio
                 )
-                expected_remote_len = local_len // (-tp_ratio)
             assert remote_len == expected_remote_len, (
                 "Heterogeneous PP selected region size mismatch at "
                 f"pair={pair_idx}: local_region={local_region_id}, "
                 f"remote_region={remote_region_id}, local={local_len}, "
                 f"remote={remote_len}, expected_remote={expected_remote_len}, "
-                f"tp_ratio={tp_ratio}, block_size_ratio={block_size_ratio}"
+                f"tp_ratio={tp_ratio}, block_size_ratio={block_size_ratio}, "
+                f"local_heads={max(1, self.transfer_topo.total_num_kv_heads // self.transfer_topo.tp_size)}, "
+                f"remote_heads={max(1, self.transfer_topo.total_num_kv_heads // remote_tp_size)}"
             )
         assert self.dst_num_blocks[nixl_agent_meta.engine_id] == (
             nixl_agent_meta.num_blocks
@@ -1605,11 +1632,17 @@ class IluNixlWorkerMixin:
                     )
                     expected_remote_len = local_block_len // block_size_ratio
                     if not replicated:
-                        expected_remote_len = (
-                            local_block_len * tp_ratio
-                            if tp_ratio >= 1
-                            else local_block_len // -tp_ratio
-                        )
+                        if route.is_ssm:
+                            # SSM follows TP world-size sharding, not KV heads.
+                            expected_remote_len = (
+                                local_block_len * tp_ratio
+                                if tp_ratio >= 1
+                                else local_block_len // -tp_ratio
+                            )
+                        else:
+                            expected_remote_len = self._gqa_expected_remote_block_len(
+                                local_block_len, remote_tp_size, block_size_ratio
+                            )
                     assert remote_block_len == expected_remote_len, (
                         "KV cache selected region size must match between P and D "
                         "when using HMA with heterogeneous PP at "
@@ -1647,17 +1680,22 @@ class IluNixlWorkerMixin:
                 remote_region_id = selected_remote_region_ids[int(remote_compact_id)]
                 local_block_len = self.block_len_per_layer[int(local_region_id)]
                 remote_block_len = nixl_agent_meta.block_lens[int(remote_region_id)]
+                is_ssm = _is_ssm_spec(self._group_spec_types[group_idx])
                 replicated = hybrid_mla_mamba or (
-                    not _is_ssm_spec(self._group_spec_types[group_idx])
-                    and self._is_region_replicated(int(local_region_id))
+                    not is_ssm and self._is_region_replicated(int(local_region_id))
                 )
                 expected_remote_len = local_block_len // block_size_ratio
                 if not replicated:
-                    expected_remote_len = (
-                        local_block_len * tp_ratio
-                        if tp_ratio >= 1
-                        else local_block_len // -tp_ratio
-                    )
+                    if is_ssm:
+                        expected_remote_len = (
+                            local_block_len * tp_ratio
+                            if tp_ratio >= 1
+                            else local_block_len // -tp_ratio
+                        )
+                    else:
+                        expected_remote_len = self._gqa_expected_remote_block_len(
+                            local_block_len, remote_tp_size, block_size_ratio
+                        )
                 assert remote_block_len == expected_remote_len, (
                     "KV cache selected region size must match between P and D "
                     "when using HMA with heterogeneous PP at "

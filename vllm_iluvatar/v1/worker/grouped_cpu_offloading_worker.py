@@ -12,6 +12,7 @@ from vllm.v1.kv_offload.cpu.gpu_worker import (
     CPUOffloadingWorker,
     SingleDirectionOffloadingHandler,
 )
+from vllm_iluvatar.v1.worker.pinned_tensor_storage import allocate_pinned_tensor_views
 
 logger = init_logger(__name__)
 
@@ -34,35 +35,41 @@ class GroupCPUOffloadingWorker(CPUOffloadingWorker):
         ):
             raise ValueError("Invalid per-tensor CPU chunk capacities")
         self._mmap_region = None
-        gpu_tensors, cpu_tensors = [], []
+        gpu_tensors, cpu_shapes = [], []
         for tensor, chunks in zip(kv_caches.tensors, cpu_chunks_per_tensor):
             page_bytes = tensor.page_size_bytes
             gpu_tensors.append(tensor.tensor.view(torch.int8).view(-1, page_bytes))
-            cpu_tensors.append(
-                torch.zeros(
-                    (chunks, page_bytes * blocks_per_chunk),
-                    dtype=torch.int8,
-                    device="cpu",
-                    pin_memory=PIN_MEMORY,
-                )
-            )
+            cpu_shapes.append((chunks, page_bytes * blocks_per_chunk))
+        cpu_tensors, layout = allocate_pinned_tensor_views(
+            cpu_shapes, pin_memory=PIN_MEMORY
+        )
         logger.info(
-            "CPU group planes allocated in plugin: tensors=%d, bytes=%d, rows=%s",
+            "CPU group planes allocated in plugin: tensors=%d, logical_bytes=%d, "
+            "torch_storage_bytes=%d, torch_arenas=%s, rows=%s",
             len(cpu_tensors),
             sum(t.numel() * t.element_size() for t in cpu_tensors),
+            layout.storage_bytes,
+            layout.arena_bytes,
             tuple(cpu_chunks_per_tensor),
         )
         handler_args = dict(
-            gpu_tensors=gpu_tensors,
-            cpu_tensors=cpu_tensors,
             blocks_per_chunk=blocks_per_chunk,
             layer_refs_per_group=kv_caches.group_data_refs,
             canonical_layout=False,
             host_memory_is_pinned=PIN_MEMORY,
         )
+        # Shutdown clears each direction's tensor lists after draining it.
+        # Keep distinct lists so one direction cannot drop the other's views
+        # while that direction still has asynchronous copies in flight.
         self._store_handler = SingleDirectionOffloadingHandler(
-            gpu_to_cpu=True, **handler_args
+            gpu_tensors=list(gpu_tensors),
+            cpu_tensors=list(cpu_tensors),
+            gpu_to_cpu=True,
+            **handler_args,
         )
         self._load_handler = SingleDirectionOffloadingHandler(
-            gpu_to_cpu=False, **handler_args
+            gpu_tensors=list(gpu_tensors),
+            cpu_tensors=list(cpu_tensors),
+            gpu_to_cpu=False,
+            **handler_args,
         )

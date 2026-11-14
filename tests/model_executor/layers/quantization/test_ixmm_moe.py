@@ -94,17 +94,31 @@ def test_registry_does_not_retain_layer_weights(fusion):
     assert fusion.state_for(w1, w2) is None
 
 
-@pytest.mark.parametrize("tp,ep", [(2, 16), (1, 8), (1, 32)])
+@pytest.mark.parametrize("tp,ep", [(3, 16), (1, 8), (1, 32)])
 def test_unsupported_parallelism_fails_before_conversion(fusion, tp, ep):
     fusion.envs.VLLM_ILU_MOE_IXMM_FUSION = True
     with patch.dict(
         sys.modules,
         {"vllm.distributed": NS(get_tensor_model_parallel_world_size=lambda: tp)},
     ):
-        with pytest.raises(RuntimeError, match="TP1/EP16"):
+        with pytest.raises(RuntimeError, match="TP1/2 EP16"):
             fusion.prepare(
                 NS(_ixmm_layer_name="model.layers.21.mlp"),
                 NS(moe_config=NS(ep_size=ep)),
+            )
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+def test_supported_parallelism_still_checks_weight_format(fusion, tp):
+    fusion.envs.VLLM_ILU_MOE_IXMM_FUSION = True
+    with patch.dict(
+        sys.modules,
+        {"vllm.distributed": NS(get_tensor_model_parallel_world_size=lambda: tp)},
+    ):
+        with pytest.raises(RuntimeError, match="NN V2"):
+            fusion.prepare(
+                NS(_ixmm_layer_name="model.layers.21.mlp", gemm_format="TN"),
+                NS(moe_config=NS(ep_size=16)),
             )
 
 

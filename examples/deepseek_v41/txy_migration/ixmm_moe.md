@@ -28,7 +28,8 @@ bridge at build time; requesting fusion then reports an installation error.
 
 ## D configuration
 
-The validated configuration is TP1×DP16/EP16, BF16, W4A8 NN V2 per-channel
+The supported configurations are TP1×DP16/EP16 and TP2×DP8/EP16, BF16,
+W4A8 NN V2 per-channel
 weights, 384 routed experts, 24 local experts, hidden size 5120, intermediate
 size 2304, SwiGLU clamp 10. Target layer 0–39 is converted once during loading;
 draft weights remain unchanged. For a TN checkpoint, keep the existing
@@ -51,9 +52,12 @@ export IXFORMER_MOE_NN_COMPACT_TASKS=1
 ```
 
 Keep the existing **NVSM** backend selection and **BF16 combine**. The direct
-chain supports target top-k 6 with 18 or 24 tokens per rank (3 or 4 requests
-with MTP5). FP8 combine, TP2, DeepEP-LL, concurrent/DBO invocation and other
-capacities are not supported by this integration.
+chain supports target top-k 6 and actual registered capacities up to 24 tokens
+per TP lane. With MTP5, seq1–4 use capacities 6/12/18/24 for TP1 and 3/6/9/12
+for TP2; allocation and dispatch validation use the actual capacity. TP1 uses
+combine stripes 4. TP2 retains the existing `VLLM_ILU_LL_FUSED_AG_AR=1` path
+and its fused finalizer; its stripe setting can retain the configured default.
+FP8 combine, DeepEP-LL and concurrent/DBO invocation are not supported.
 
 - Decode consumes NVSM fixed-slot INT8 dispatch output directly. The fused
   FC2 stores into the borrowed combine buffer; the ordinary NVSM combine

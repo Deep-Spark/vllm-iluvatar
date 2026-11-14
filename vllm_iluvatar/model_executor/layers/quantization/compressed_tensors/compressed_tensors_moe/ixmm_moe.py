@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in DSV4.1 target FFN fusion for TP1/EP16, decode and eager replay."""
+"""Opt-in DSV4.1 target FFN fusion for TP1/2 EP16, decode and eager replay."""
 
 import re
 import weakref
@@ -58,8 +58,9 @@ def prepare(method, layer):
     from vllm.distributed import get_tensor_model_parallel_world_size
 
     require(
-        layer.moe_config.ep_size == 16 and get_tensor_model_parallel_world_size() == 1,
-        "ixmm fused MoE requires target TP1/EP16; enable only on D",
+        layer.moe_config.ep_size == 16
+        and get_tensor_model_parallel_world_size() in (1, 2),
+        "ixmm fused MoE requires target TP1/2 EP16; enable only on D",
     )
     require(
         method.gemm_format == "NN" and method.group_size == -1 and method.version == 2,
@@ -136,7 +137,8 @@ def decode(experts, output, hidden_states, w1, w2, scales, metadata):
     counts = metadata.expert_num_tokens
     indices, peers, offset, slots, stride = _w2_direct.fused_descriptor(counts)
     require(
-        slots in (108, 144)
+        0 < slots <= 24 * 6
+        and slots % 6 == 0
         and hidden_states.dtype == torch.int8
         and experts.out_dtype == torch.bfloat16,
         "unsupported fused NVSM decode capacity/dtype",
@@ -146,7 +148,9 @@ def decode(experts, output, hidden_states, w1, w2, scales, metadata):
     require(
         rx.is_contiguous()
         and rs.is_contiguous()
-        and indices.numel() == rx.shape[0] * rx.shape[1],
+        and indices.numel() == rs.numel() == rx.shape[0] * rx.shape[1]
+        and rs.numel() == 24 * 16 * (slots // 6)
+        and stride == 16 * 24 * slots,
         "fused decode requires the native NVSM fixed-slot layout",
     )
     ws, layout = scratch(w1.device, rs.numel(), decode=True)

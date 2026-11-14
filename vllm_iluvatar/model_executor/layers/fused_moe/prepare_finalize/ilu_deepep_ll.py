@@ -238,6 +238,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool = False,
+        w2_direct_finalize: str | None = None,
     ) -> tuple[Callable, mk.ReceiverType]:
         if defer_input_quant:
             raise NotImplementedError(
@@ -289,7 +290,8 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                            else nvsm_ep.nvsm_low_latency_dispatch)
             recv_x, num_tokens_per_local_experts_gpu, recv_scales, *_ = (
                 dispatch_fn(
-                    self.buffer, a1, topk_ids.int(), topk_weights
+                    self.buffer, a1, topk_ids.int(), topk_weights,
+                    w2_direct_finalize=w2_direct_finalize,
                 )
             )
 

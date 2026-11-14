@@ -711,6 +711,11 @@ class IluFusedMoEEP:
 
         # dispatch
         assert prepare_finalize.supports_async()
+        # Declare this call's finalizer before dispatch can arm peer W2 stores.
+        direct_finalize_kwargs = (
+            {"w2_direct_finalize": "tp_fused"}
+            if tp_size == 2 and use_fused_ag_ar else {}
+        )
         prepare_ret = prepare_finalize.prepare_async(
             hidden_states,
             topk_weights,
@@ -720,6 +725,7 @@ class IluFusedMoEEP:
             apply_router_weight_on_input,
             fused_experts.quant_config,
             defer_input_quant=fused_experts.expects_unquantized_inputs,
+            **direct_finalize_kwargs,
         )
         prepare_hook, prepare_receiver = (
             prepare_ret if isinstance(prepare_ret, tuple) else (None, prepare_ret)

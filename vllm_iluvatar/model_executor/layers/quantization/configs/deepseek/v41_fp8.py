@@ -98,20 +98,22 @@ class IluDeepseekV41FP8Config(IluDeepseekV4FP8Config):
                     )
 
                     return IluDeepseekV41Fp8GroupedInt8Method(self)
-            if FP8_ALL_DENSE and not grouped_wo_a:
-                from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.config import (
-                    resolve_ilu_runtime_method,
-                )
+            from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.config import (
+                resolve_ilu_runtime_method,
+            )
 
-                original = IluDeepseekV41FP8LinearMethod(self)
-                runtime = resolve_ilu_runtime_method(
-                    base_quant_config=self,
-                    original_method=original,
-                    original_disposition="quantized",
-                    layer=layer,
-                    prefix=prefix,
-                )
-                return runtime if runtime is not None else original
-            return IluDeepseekV41Bf16DequantLinearMethod(self)
+            original = (
+                IluDeepseekV41FP8LinearMethod(self)
+                if FP8_ALL_DENSE and not grouped_wo_a
+                else IluDeepseekV41Bf16DequantLinearMethod(self)
+            )
+            runtime = resolve_ilu_runtime_method(
+                base_quant_config=self,
+                original_method=original,
+                original_disposition="quantized",
+                layer=layer,
+                prefix=prefix,
+            )
+            return runtime if runtime is not None else original
         # RoutedExperts -> V4's MXFP4 branch; everything else -> community.
         return super().get_quant_method(layer, prefix)

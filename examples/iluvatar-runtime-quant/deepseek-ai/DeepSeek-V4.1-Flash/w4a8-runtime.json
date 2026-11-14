@@ -1,0 +1,149 @@
+{
+  "schema_version": 1,
+  "enabled": true,
+  "applies_to": {
+    "model_types": [
+      "deepseek_v41_text",
+      "deepseek_v41"
+    ],
+    "quant_methods": [
+      "deepseek_v41_fp8"
+    ]
+  },
+  "ignore": [],
+  "config_groups": {
+    "dsv41_routed_mxfp4_to_w4a8": {
+      "priority": 100,
+      "targets": [
+        "re:.*\\.ffn\\.experts$"
+      ],
+      "require": {
+        "original_disposition": "quantized",
+        "checkpoint_dtypes": [
+          "int8",
+          "uint8"
+        ]
+      },
+      "weights": {
+        "source": {
+          "format": "mxfp4",
+          "dtypes": [
+            "int8",
+            "uint8"
+          ],
+          "block_size": 32,
+          "scale_format": "ue8m0"
+        },
+        "target": {
+          "format": "int4-packed-nn",
+          "dtype": "int8",
+          "strategy": "channel",
+          "pack_version": 1
+        },
+        "loading": {
+          "mode": "transform",
+          "stage": "weight_load"
+        }
+      },
+      "input_activations": {
+        "num_bits": 8,
+        "type": "int",
+        "strategy": "token",
+        "dynamic": true
+      },
+      "output_activations": null,
+      "iluvatar": {
+        "method": "IluMxfp4ToW4A8NNMoEMethod",
+        "max_pending_shards": 8
+      }
+    },
+    "dsv41_dense_fp8_to_w8a8": {
+      "priority": 100,
+      "targets": [
+        "re:.*\\.(attn\\.(fused_wqa_wkv|wq_b|wo_b|indexer\\.wq_b)|ffn\\.shared_experts\\.(gate_up_proj|down_proj))$"
+      ],
+      "require": {
+        "original_disposition": "quantized",
+        "checkpoint_dtypes": [
+          "float8_e4m3fn"
+        ]
+      },
+      "weights": {
+        "source": {
+          "format": "fp8-block",
+          "dtypes": [
+            "float8_e4m3fn"
+          ],
+          "block_shape": [
+            32,
+            32
+          ],
+          "scale_format": "ue8m0"
+        },
+        "target": {
+          "format": "int8-channel",
+          "dtype": "int8",
+          "strategy": "channel"
+        },
+        "loading": {
+          "mode": "transform",
+          "stage": "process_weights_after_loading"
+        }
+      },
+      "input_activations": {
+        "num_bits": 8,
+        "type": "int",
+        "strategy": "token",
+        "dynamic": true
+      },
+      "output_activations": null,
+      "iluvatar": {
+        "method": "IluDsv41Fp8ToW8A8LinearMethod"
+      }
+    },
+    "dsv41_grouped_wo_a_to_w8a8": {
+      "priority": 100,
+      "targets": [
+        "re:.*\\.attn\\.wo_a$"
+      ],
+      "require": {
+        "original_disposition": "quantized",
+        "checkpoint_dtypes": [
+          "float8_e4m3fn"
+        ]
+      },
+      "weights": {
+        "source": {
+          "format": "fp8-block",
+          "dtypes": [
+            "float8_e4m3fn"
+          ],
+          "block_shape": [
+            32,
+            32
+          ],
+          "scale_format": "ue8m0"
+        },
+        "target": {
+          "format": "int8-channel",
+          "dtype": "int8",
+          "strategy": "channel"
+        },
+        "loading": {
+          "mode": "transform",
+          "stage": "process_weights_after_loading"
+        }
+      },
+      "input_activations": {
+        "num_bits": 8,
+        "type": "int",
+        "strategy": "token",
+        "dynamic": true
+      },
+      "output_activations": null,
+      "iluvatar": {
+        "method": "IluDsv41Fp8ToW8A8GroupedLinearMethod"
+      }
+    }
+  }
+}

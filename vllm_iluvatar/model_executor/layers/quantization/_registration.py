@@ -20,12 +20,14 @@ from .ilu_runtime import base_config as _online_base_config
 from .ilu_runtime.linear import (
     fp8_to_glm_kv_b_w8a16 as _fp8_to_glm_kv_b_w8a16,
 )
+from .ilu_runtime.linear import dsv41_fp8_to_w8a8 as _dsv41_fp8_to_w8a8
 from .ilu_runtime.linear import fp8_to_w8a8 as _fp8_to_w8a8
 from .ilu_runtime.linear import native_to_fp8 as _native_to_fp8
 from .ilu_runtime.linear import native_to_w8a8 as _native_to_w8a8
 from .ilu_runtime.moe import fp16_to_fp4 as _fp16_to_fp4
 from .ilu_runtime.moe import fp8_to_fp4 as _fp8_to_fp4
 from .ilu_runtime.moe import fp8_to_w4a8_nn as _fp8_to_w4a8_nn
+from .ilu_runtime.moe import mxfp4_to_w4a8_nn as _mxfp4_to_w4a8_nn
 from .ilu_runtime.moe import mxfp4_to_w4a8_tn as _mxfp4_to_w4a8_tn
 
 # Checkpoint quantization configs.

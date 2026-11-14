@@ -24,6 +24,7 @@ Override summary (each marked with ``# [ILU override]`` in-line):
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import nullcontext
 from typing import cast
 
 import torch
@@ -430,11 +431,15 @@ class IluMoERunner(MoERunner):
             # DP=1 + PCP>1 without SP MoE has no DPMetadata: use the
             # pre-gate/INT8 branch, including local decode-only batches.
             decode_only = metadata is not None and metadata.all_ranks_decode_only
+        packed_int8 = ag_rs and decode_only and self._can_pack_int8_dispatch()
+        if packed_int8:
+            dispatch_before_gate = False
         gate_owns_gather_policy = bool(
             getattr(self.gate, "gather_before_gate", GATHER_BEFORE_GATE_DEFAULT)
         )
         phase_gate_after_dispatch = (
             ag_rs
+            and not packed_int8
             and decode_only
             and self.gate is not None
             and not self._fse_fuse_gate
@@ -455,7 +460,7 @@ class IluMoERunner(MoERunner):
 
         if (
             ag_rs
-            and not decode_only
+            and (not decode_only or packed_int8)
             and not dispatch_before_gate
             and getattr(self._quant_method, "supports_prequantized_input", False)
             is True
@@ -483,7 +488,11 @@ class IluMoERunner(MoERunner):
                     shared_experts_input,
                     overlap=self._ag_shared_overlap_enabled,
                 )
-            if dispatch_before_gate:
+            if packed_int8:
+                hidden_states, router_logits, input_ids = self._dispatch_packed_int8(
+                    hidden_states, router_logits, input_ids
+                )
+            elif dispatch_before_gate:
                 hidden_states, input_ids = self._gather_before_gate(
                     hidden_states, input_ids
                 )
@@ -499,13 +508,23 @@ class IluMoERunner(MoERunner):
             # All dispatch (including PCP) is complete before the deferred gate.
             if gate_after_dispatch:
                 router_logits, _ = self.gate(hidden_states)
-            shared_output, hidden_states = self._apply_quant_method(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                shared_experts_input=shared_experts_input,
-                input_ids=input_ids,
-                shared_output=shared_output,
+            padding_context = (
+                _gathered_router_padding(
+                    get_forward_context(),
+                    get_dp_group(),
+                    get_forward_context().dp_metadata.get_chunk_sizes_across_dp_rank(),
+                )
+                if packed_int8
+                else nullcontext()
             )
+            with padding_context:
+                shared_output, hidden_states = self._apply_quant_method(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    shared_experts_input=shared_experts_input,
+                    input_ids=input_ids,
+                    shared_output=shared_output,
+                )
             if ag_rs:
                 logger.info_once(
                     "MoERunner phase=%s, gate_after_dispatch=%s, shared_overlap=%s",
@@ -514,6 +533,42 @@ class IluMoERunner(MoERunner):
                     self._ag_shared_overlap_enabled,
                 )
             return self._maybe_combine(shared_output, hidden_states)
+
+    def _dispatch_packed_int8(self, hidden_states, router_logits, input_ids):
+        from .ilu_int8_router_pack import pack_router_input, unpack_router_input
+
+        if not isinstance(hidden_states, tuple) or router_logits is None:
+            raise ValueError(
+                "Packed AG requires locally quantized input and local FP32 router logits"
+            )
+        q, scale, dtype = hidden_states
+        group = get_dp_group()
+        sizes = get_forward_context().dp_metadata.get_chunk_sizes_across_dp_rank()
+        if len(sizes) != group.world_size or sizes[group.rank_in_group] != q.shape[0]:
+            raise ValueError("Packed AG sizes do not match the DP contribution")
+        packet, layout = pack_router_input(q, scale, router_logits, input_ids)
+        gathered = group.all_gatherv(packet, dim=0, sizes=sizes)
+        return unpack_router_input(gathered, layout, dtype)
+
+    def _can_pack_int8_dispatch(self) -> bool:
+        """Pack one DP contribution only for the supported native NN dataflow."""
+        return (
+            self.moe_config.moe_parallel_config.use_ep
+            and self.moe_config.pcp_size == 1
+            and self.moe_config.tp_size == 1
+            # Expert TP is always one under EP; also exclude attention TP.
+            and self.moe_config.ep_size == self.moe_config.dp_size
+            and not self.moe_config.is_sequence_parallel
+            and not self._ilu_elastic_ep
+            and not self._fse_fuse_gate
+            and self.gate is not None
+            and getattr(self.gate, "out_dtype", None) == torch.float32
+            and not getattr(self.gate, "gather_before_gate", GATHER_BEFORE_GATE_DEFAULT)
+            and self.routed_input_transform is None
+            and self.routed_experts.custom_routing_function is None
+            and self.do_naive_dispatch_combine
+            and getattr(self._quant_method, "supports_packed_int8_input", False) is True
+        )
 
     @property
     def _needs_pcp_dispatch_combine(self) -> bool:

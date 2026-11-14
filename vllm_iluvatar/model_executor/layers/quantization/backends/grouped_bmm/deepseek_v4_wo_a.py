@@ -224,7 +224,7 @@ class IluV4W8A8BMMLinearMethod(IluV4W8A16BMMLinearMethod):
         )
         if activations.shape[1] == 0:
             return projected
-        ixf_ops.w8a8_bmm(
+        ixf_ops.w8a8(
             activations,
             layer.W_int8_grouped,
             scales,

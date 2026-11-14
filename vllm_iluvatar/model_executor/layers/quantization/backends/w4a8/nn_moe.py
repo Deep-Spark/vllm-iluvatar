@@ -170,10 +170,29 @@ class IluW4A8NNMoEMethod(IluCompressedTensorsW4A8Int8MoEMethod):
     def supports_prequantized_input(self) -> bool:
         return True
 
+    @property
+    def supports_packed_int8_input(self) -> bool:
+        return True
+
     def _unpack_input(self, x):
         if not isinstance(x, tuple):
             return x, None, x.dtype
         q, scale, dtype = x
+        if type(scale) is int:
+            if (
+                q.dtype != torch.int8
+                or q.ndim != 2
+                or not q.is_contiguous()
+                or scale != self.gemm1_info.pad_k
+                or q.shape[1] < scale + 4
+                or q.shape[1] % 16
+                or scale % 4
+                or dtype not in (torch.bfloat16, torch.float16)
+            ):
+                raise ValueError(
+                    "Packed INT8 MoE input requires aligned [tokens, row_bytes] and scale offset K"
+                )
+            return q, scale, dtype
         if (
             q.dtype != torch.int8
             or q.ndim != 2
@@ -300,7 +319,8 @@ class IluW4A8NNMoEMethod(IluCompressedTensorsW4A8Int8MoEMethod):
                 topk=layer.top_k,
                 output=act,
                 output_scale=a_scale,
-                input_scale=input_scale,
+                input_scale=None if type(input_scale) is int else input_scale,
+                packed_scale_offset=input_scale if type(input_scale) is int else None,
             )
         act = self._group_gemm(
             self.gemm1_info,

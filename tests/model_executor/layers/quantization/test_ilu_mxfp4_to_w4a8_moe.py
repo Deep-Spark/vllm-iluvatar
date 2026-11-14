@@ -15,6 +15,10 @@ from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp4_moe imp
 from vllm_iluvatar.model_executor.layers.quantization.configs.deepseek.v4_fp8 import (
     IluDeepseekV4FP8Config,
 )
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.moe.mxfp4_to_w4a8_nn import (
+    IluMxfp4ToW4A8NNMoEMethod,
+    quantize_mxfp4_to_w4a8_nn,
+)
 from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.moe.mxfp4_to_w4a8_tn import (
     IluMxfp4ToW4A8TNOnlineMoEMethod,
     quantize_mxfp4_to_w4a8_tn,
@@ -195,9 +199,10 @@ class Layer(torch.nn.Module):
         return {2: 0, 5: 1}.get(expert, -1)
 
 
-def method(tp=1, pending=8, ep=1):
+def method(tp=1, pending=8, ep=1, fmt="TN"):
     layer = Layer(tp, ep)
-    impl = IluMxfp4ToW4A8TNOnlineMoEMethod(layer, max_pending_shards=pending)
+    cls = IluMxfp4ToW4A8TNOnlineMoEMethod if fmt == "TN" else IluMxfp4ToW4A8NNMoEMethod
+    impl = cls(layer, max_pending_shards=pending)
     with set_current_vllm_config(VllmConfig()):
         impl.create_weights(layer, 2, 256, 256, torch.bfloat16)
     return layer, impl
@@ -214,8 +219,14 @@ def load(layer, shard, expert, *, scale=False, tensor=None):
 @pytest.mark.parametrize(
     "scale_first,ep", [(False, 1), (True, 1), (False, 8), (True, 8)]
 )
-def test_pair_order_placement_and_finalization(scale_first, ep):
-    layer, impl = method(pending=1, ep=ep)
+@pytest.mark.parametrize("fmt", ["TN", "NN"])
+def test_pair_order_placement_and_finalization(scale_first, ep, fmt):
+    if fmt == "NN":
+        from vllm_iluvatar.ilu_util.arch import is_ivcore30
+
+        if not is_ivcore30():
+            pytest.skip("NN requires ivcore30")
+    layer, impl = method(pending=1, ep=ep, fmt=fmt)
     assert not load(layer, "w1", 99)
     assert not impl._pending
     for expert in (3, 2) if ep > 1 else (5, 2):
@@ -224,9 +235,12 @@ def test_pair_order_placement_and_finalization(scale_first, ep):
                 assert load(layer, shard, expert, scale=scale)
             assert not impl._pending
     assert len(impl._converted) == 6
-    expected, scales = quantize_mxfp4_to_w4a8_tn(*source())
-    torch.testing.assert_close(layer.w13_weight[0, :256], expected, atol=0, rtol=0)
-    torch.testing.assert_close(layer.w13_weight[1, 256:], expected, atol=0, rtol=0)
+    convert = quantize_mxfp4_to_w4a8_tn if fmt == "TN" else quantize_mxfp4_to_w4a8_nn
+    expected, scales = convert(*source())
+    w1 = layer.w13_weight[0, :256] if fmt == "TN" else layer.w13_weight[0, :, :128]
+    w3 = layer.w13_weight[1, 256:] if fmt == "TN" else layer.w13_weight[1, :, 128:]
+    torch.testing.assert_close(w1, expected, atol=0, rtol=0)
+    torch.testing.assert_close(w3, expected, atol=0, rtol=0)
     torch.testing.assert_close(layer.w2_weight_scale[1], scales, atol=0, rtol=0)
     impl.process_weights_after_loading(layer)
     assert impl._finalized
@@ -351,8 +365,20 @@ def select(payload):
         return quant.get_quant_method(layer, "model.layers.2.ffn.experts")
 
 
-def test_config_dispatch_and_disabled_preserves_mxfp4():
-    assert isinstance(select(runtime_payload()), IluMxfp4ToW4A8TNOnlineMoEMethod)
+@pytest.mark.parametrize("fmt", ["TN", "NN"])
+def test_config_dispatch_and_disabled_preserves_mxfp4(fmt):
+    payload = runtime_payload()
+    cls = IluMxfp4ToW4A8TNOnlineMoEMethod
+    if fmt == "NN":
+        from vllm_iluvatar.ilu_util.arch import is_ivcore30
+
+        if not is_ivcore30():
+            pytest.skip("NN requires ivcore30")
+        cls = IluMxfp4ToW4A8NNMoEMethod
+        group = payload["config_groups"]["tn"]
+        group["weights"]["target"].update(format="int4-packed-nn", pack_version=1)
+        group["iluvatar"]["method"] = cls.__name__
+    assert isinstance(select(payload), cls)
     assert isinstance(select(None), IluMxfp4MoEMethod)
     payload = runtime_payload()
     payload["enabled"] = False

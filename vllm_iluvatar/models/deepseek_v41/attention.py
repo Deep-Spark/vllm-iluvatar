@@ -763,12 +763,20 @@ class IluDeepseekV41Indexer(nn.Module):
         # fused_wqb_rope_fp8 supports both BF16 and FP8 per-channel weights.
         wq_b_w = self.wq_b.weight
         _has_buf = hasattr(self, "q_bf16_buffer")
-        _bf16_ok = wq_b_w.dtype == qr.dtype and wq_b_w.dtype in (
-            torch.bfloat16,
-            torch.float16,
+        # Prequantized W8A8 tuples belong to the linear method, not these
+        # tensor-only BF16/FP8 projection kernels.
+        _bf16_ok = (
+            isinstance(qr, torch.Tensor)
+            and wq_b_w.dtype == qr.dtype
+            and wq_b_w.dtype in (torch.bfloat16, torch.float16)
         )
-        _fp8_ok = wq_b_w.dtype == torch.float8_e4m3fn and (
-            hasattr(self.wq_b, "weight_scale_inv") or hasattr(self.wq_b, "weight_scale")
+        _fp8_ok = (
+            isinstance(qr, torch.Tensor)
+            and wq_b_w.dtype == torch.float8_e4m3fn
+            and (
+                hasattr(self.wq_b, "weight_scale_inv")
+                or hasattr(self.wq_b, "weight_scale")
+            )
         )
         fused_mm_ok = _has_buf and (_bf16_ok or _fp8_ok)
 

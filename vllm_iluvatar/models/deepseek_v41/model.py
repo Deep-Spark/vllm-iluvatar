@@ -52,6 +52,7 @@ from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_
     register_activation_prequant,
 )
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
+    _DECODE_EP_BACKEND,
     IluFusedMoEEP,
 )
 from vllm_iluvatar.models.deepseek_v4.fp8_model import (
@@ -204,6 +205,19 @@ class IluDeepseekV41MoE(nn.Module, IluFusedMoEEP):
                 prefix=f"{prefix}.shared_experts",
             )
 
+        from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes import (
+            IluCompressedTensorsW8A8Int8,
+        )
+        from vllm_iluvatar.model_executor.layers.quantization.ilu_w4a8_nn import (
+            IluW4A8NNMoEMethod,
+        )
+
+        if self.shared_experts is not None and isinstance(
+            getattr(self.shared_experts.down_proj, "scheme", None),
+            IluCompressedTensorsW8A8Int8,
+        ):
+            self.shared_experts.act_fn.enable_fuse_quant()
+
         eplb_config = parallel_config.eplb_config
         n_physical_experts = config.n_routed_experts + eplb_config.num_redundant_experts
         if n_physical_experts % tp_size != 0:
@@ -236,18 +250,41 @@ class IluDeepseekV41MoE(nn.Module, IluFusedMoEEP):
         # FusedMoE runner alone does not dispatch/combine activations across
         # that group on Iluvatar; the platform mixin owns that collective.
         self.init_ep()
+        quant = self.experts._quant_method
+        quant = getattr(quant, "old_quant_method", quant)
+        parallel = self.experts.moe_config.moe_parallel_config
+        self._use_moe_runner = (
+            isinstance(quant, IluW4A8NNMoEMethod)
+            and _DECODE_EP_BACKEND is None
+            and parallel.all2all_backend
+            in ("allgather_reducescatter", "ag-rs", "ag_rs")
+        )
+        self.reuse_norm_quant = (
+            self._use_moe_runner
+            and envs.VLLM_ILU_FUSE_NORM_QUANT
+            and (
+                self.shared_experts is None
+                or isinstance(
+                    getattr(self.shared_experts.gate_up_proj, "scheme", None),
+                    IluCompressedTensorsW8A8Int8,
+                )
+            )
+        )
 
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
         if self.gate.bias_vl is not None and input_ids is None:
             raise ValueError("DeepSeek V4.1 vision MoE routing requires input_ids.")
-        shape = hidden_states.shape
-        if self._should_use_forward_dp_ep():
+        router_input = (
+            hidden_states[-1] if isinstance(hidden_states, tuple) else hidden_states
+        )
+        shape = router_input.shape
+        if not self._use_moe_runner and self._should_use_forward_dp_ep():
             return self.forward_dp_ep(hidden_states, input_ids).view(shape)
         return self.experts(
             hidden_states=hidden_states,
-            router_logits=hidden_states,
+            router_logits=router_input,
             input_ids=input_ids,
         ).view(shape)
 
@@ -338,6 +375,7 @@ class IluDeepseekV41DecoderLayer(nn.Module):
         sqrsum: torch.Tensor | None = None,
         norm: torch.nn.Module | None = None,
         want_fp8: bool = False,
+        want_int8: bool = False,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -350,7 +388,7 @@ class IluDeepseekV41DecoderLayer(nn.Module):
         if cached is None or cached.dtype != x.dtype:
             cached = hc_fn.to(x.dtype).contiguous()
             self._hc_fn_io_cache[name] = cached
-        can_fold = norm is not None and sqrsum is not None
+        can_fold = norm is not None and sqrsum is not None and not want_int8
         post, comb, h, pre, h_fp8, h_scale = mhc.hc_pre_mixes(
             x,
             hc_fn,
@@ -368,6 +406,15 @@ class IluDeepseekV41DecoderLayer(nn.Module):
             layer_norm_eps=self.rms_norm_eps,
             want_fp8=want_fp8 and can_fold,
         )
+        if want_int8:
+            import ixformer.inference.functions as ixfops
+
+            if norm is None:
+                raise ValueError("INT8 Norm reuse requires RMSNorm weights")
+            h_quant, h, _, h_scale = ixfops.residual_rmsnorm_with_quant(
+                h, norm.weight, eps=self.rms_norm_eps, return_normed=True
+            )
+            return post, comb, h, pre, h_quant, h_scale
         if norm is not None and not can_fold:
             h = norm(h)
         return post, comb, h, pre, h_fp8, h_scale
@@ -427,7 +474,7 @@ class IluDeepseekV41DecoderLayer(nn.Module):
             pre_mix,
             sqrsum,
             self.attn_norm,
-            want_fp8=True,
+            want_fp8=self.attn.fused_wqa_wkv.weight.dtype == torch.float8_e4m3fn,
         )
         if getattr(self, "producer_kv_only", False):
             # Only a discarded producer token consumes this placeholder. Keep
@@ -483,7 +530,10 @@ class IluDeepseekV41DecoderLayer(nn.Module):
                 h, residual, attn_post, attn_comb
             )
 
-        ffn_post, ffn_comb, h, ffn_pre, _, _ = self._hc_pre_mixes(
+        reuse_ffn_quant = (
+            getattr(self.ffn, "reuse_norm_quant", False) and ffn_rows is None
+        )
+        ffn_post, ffn_comb, h, ffn_pre, h_quant, h_scale = self._hc_pre_mixes(
             residual,
             "ffn",
             self.hc_ffn_fn,
@@ -492,9 +542,10 @@ class IluDeepseekV41DecoderLayer(nn.Module):
             attn_pre,
             attn_sqrsum,
             self.ffn_norm,
+            want_int8=reuse_ffn_quant,
         )
         if ffn_rows is None:
-            h = self.ffn(h, input_ids)
+            h = self.ffn((h_quant, h_scale, h) if reuse_ffn_quant else h, input_ids)
         else:
             h = self._forward_tail_ffn(h, input_ids, ffn_rows)
         return h, residual, ffn_post, ffn_comb, ffn_pre

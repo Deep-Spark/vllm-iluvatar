@@ -1694,7 +1694,19 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         #                         (MiniMax-M3); layout is converted first.
         # Other ``MoEActivation`` values (gelu, relu2, *_no_mul) are NOT
         # implemented by the W4A8 kernel.
-        if use_fused_swiglu_limit:
+        if (
+            use_fused_swiglu_limit
+            and expand_tokens_gpu is not None
+            and self.gemm_format == "NN"
+        ):
+            output, scale = ixfops.activation_dynamic_scaled_int8(
+                act_type="swiglu",
+                limit=float(swiglu_limit),
+                expand_tokens_gpu=expand_tokens_gpu,
+                backend="ixformer_perf",
+                **kwargs,
+            )
+        elif use_fused_swiglu_limit:
             output, scale = ixfops.swiglu_limit_dynamic_scaled_int8(
                 limit=float(swiglu_limit), **kwargs
             )

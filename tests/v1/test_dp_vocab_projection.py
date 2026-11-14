@@ -352,3 +352,221 @@ def test_packed_peer_routing_preserves_owner_and_unused_storage(
     # Later draft traffic must not overwrite returned target logits.
     p.received.fill_(987)
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "tp,dp,external,group", [(1, 16, 1, 4), (2, 8, 1, 2), (2, 8, 1, 4), (2, 8, 2, 4)]
+)
+def test_every_global_rank_creates_all_vocab_groups_in_the_same_order(
+    monkeypatch, tp, dp, external, group
+):
+    # Use the actual vLLM ExternalDP x DP x TP transpose to form the oracle.
+    ranks = torch.arange(external * dp * tp).view(external, dp, tp)
+    lanes = ranks.transpose(1, 2).reshape(-1, dp).tolist()
+    expected = [lane[lo : lo + group] for lane in lanes for lo in range(0, dp, group)]
+    monkeypatch.setattr(impl.dist, "get_world_size", lambda: ranks.numel())
+    for external_rank in range(external):
+        for dp_rank in range(dp):
+            for tp_rank in range(tp):
+                rank = int(ranks[external_rank, dp_rank, tp_rank])
+                dp_ranks = ranks[external_rank, :, tp_rank].tolist()
+                tp_ranks = ranks[external_rank, dp_rank].tolist()
+                monkeypatch.setattr(impl.dist, "get_rank", lambda rank=rank: rank)
+                monkeypatch.setattr(
+                    impl,
+                    "get_tp_group",
+                    lambda tp_ranks=tp_ranks: SimpleNamespace(ranks=tp_ranks),
+                )
+                created = []
+
+                def new_group(members, *, backend, timeout, created=created):
+                    assert backend == "nccl" and timeout.total_seconds() == 90
+                    created.append(members.copy())
+                    return tuple(members)
+
+                monkeypatch.setattr(impl.dist, "new_group", new_group)
+                owner, owner_rank = impl._create_projection_group(dp_ranks, group)
+                assert created == expected
+                assert owner[owner_rank] == rank
+                assert set(owner).issubset(dp_ranks)
+                assert all(member % tp == tp_rank for member in owner)
+    assert sorted(member for members in expected for member in members) == list(
+        range(ranks.numel())
+    )
+
+
+@pytest.mark.parametrize(
+    "dp_ranks,tp_ranks,rank,world,group",
+    [
+        ([0, 2, 4, 6], [0, 1], 0, 8, 3),  # group does not divide DP
+        ([0, 2, 4, 6], [0, 1], 0, 8, 1),
+        ([0, 2, 4, 6], [0, 1], 0, 8, True),
+        ([0, 2, 4, 6], [0, 1], 0, 9, 2),  # incomplete replica
+        ([0, 2, 4, 6], [0, 1], 1, 8, 2),  # other TP lane
+        ([0, 4, 2, 6], [0, 1], 0, 8, 2),  # rank-order mismatch
+        ([0, 2, 4, 6], [1, 0], 0, 8, 2),
+        ([0, 4, 8, 12], [0, 1], 0, 16, 2),  # PCP>1 or noncartesian DP
+        ([0, 2, 4, 4], [0, 1], 0, 8, 2),
+    ],
+)
+def test_invalid_vocab_topology_fails_before_any_group_creation(
+    monkeypatch, dp_ranks, tp_ranks, rank, world, group
+):
+    monkeypatch.setattr(impl.dist, "get_rank", lambda: rank)
+    monkeypatch.setattr(impl.dist, "get_world_size", lambda: world)
+    monkeypatch.setattr(impl, "get_tp_group", lambda: SimpleNamespace(ranks=tp_ranks))
+    created = []
+    monkeypatch.setattr(impl.dist, "new_group", lambda *a, **k: created.append(a))
+    with pytest.raises(ValueError, match="static"):
+        impl._create_projection_group(dp_ranks, group)
+    assert not created
+
+
+@pytest.mark.parametrize("group", [2, 4])
+@pytest.mark.parametrize("capacity", [6, 12, 18])
+def test_tp2_projection_returns_local_vocab_before_the_callers_tp_gather(
+    monkeypatch, group, capacity
+):
+    hidden_size, local_vocab = 4, 16
+    weight = torch.arange(2 * local_vocab * hidden_size).float().view(-1, hidden_size)
+    # Include an idle owner and unequal target/draft row counts under one bound.
+    peers = [
+        torch.full((rows, hidden_size), 1.0 + owner)
+        for owner, rows in enumerate([0, 1, capacity - 1, capacity][:group])
+    ]
+    for owner, hidden in enumerate(peers):
+        local_results = []
+        for lane in range(2):
+            local_weight = weight.chunk(2)[lane]
+            p = impl.DPVocabProjection.__new__(impl.DPVocabProjection)
+            p.capacity, p.group_size, p.group_rank = 18, group, owner
+            p.hidden_size, p.vocab_size = hidden_size, local_vocab
+            p.shard_rows, p.dtype, p.device = (
+                local_vocab // group,
+                weight.dtype,
+                weight.device,
+            )
+            p.group = (lane, group)
+            p.input = torch.empty(18, hidden_size)
+            p.gathered = torch.empty(group * 18, hidden_size)
+            p.partial = torch.empty(group * 18, p.shard_rows)
+            p.received = torch.empty_like(p.partial)
+            padded = [F.pad(x, (0, 0, 0, capacity - len(x))) for x in peers]
+
+            def gather(out, inp, *, group, p=p, padded=padded, owner=owner):
+                assert group == p.group
+                torch.testing.assert_close(inp, padded[owner])
+                out.copy_(torch.cat(padded))
+
+            def exchange(
+                out,
+                partial,
+                *,
+                group,
+                p=p,
+                local_weight=local_weight,
+                padded=padded,
+                owner=owner,
+            ):
+                assert group == p.group
+                shard = local_weight.chunk(p.group_size)[owner]
+                torch.testing.assert_close(partial, F.linear(torch.cat(padded), shard))
+                out.copy_(
+                    torch.cat(
+                        [
+                            F.linear(padded[owner], w)
+                            for w in local_weight.chunk(p.group_size)
+                        ]
+                    )
+                )
+
+            monkeypatch.setattr(impl.dist, "all_gather_into_tensor", gather)
+            monkeypatch.setattr(impl.dist, "all_to_all_single", exchange)
+            result = p.project(hidden, local_weight, capacity)
+            assert result.shape == (len(hidden), local_vocab)
+            torch.testing.assert_close(result, F.linear(hidden, local_weight))
+            local_results.append(result)
+        # Existing target and draft callers concatenate TP lanes in vocab order.
+        full_logits = torch.cat(local_results, dim=-1)
+        torch.testing.assert_close(full_logits, F.linear(hidden, weight))
+
+
+def _install_harness(monkeypatch, tp=2):
+    weight = torch.arange(32).view(8, 4).to(torch.bfloat16)
+    head = SimpleNamespace(
+        weight=weight,
+        quant_method=impl.UnquantizedLinearMethod(),
+        tp_size=tp,
+        num_embeddings_per_partition=len(weight),
+        shard_indices=(0, len(weight)),
+    )
+    language = SimpleNamespace(
+        lm_head=head, logits_processor=SimpleNamespace(head_dtype=None)
+    )
+    draft = type("DSparkSpeculator", (), {})()
+    draft.model = SimpleNamespace(lm_head=head)
+    draft.speculative_config = SimpleNamespace(enforce_eager=True)
+    draft._draft_topk, draft.num_speculative_steps = None, 5
+    draft._sample_sequential = lambda *args: None
+    draft.propose = lambda hidden, dp_sync=None, dummy_run=False: None
+    runner = SimpleNamespace(
+        model=language,
+        speculator=draft,
+        scheduler_config=SimpleNamespace(max_num_seqs=3),
+        parallel_config=SimpleNamespace(distributed_executor_backend="mp"),
+        model_state=SimpleNamespace(num_new_sampled_tokens_per_step=1),
+        sample=lambda *args: None,
+    )
+    monkeypatch.setattr(impl, "get_pp_group", lambda: SimpleNamespace(world_size=1))
+    monkeypatch.setattr(impl, "get_tp_group", lambda: SimpleNamespace(world_size=tp))
+    monkeypatch.setattr(
+        impl, "get_dp_group", lambda: SimpleNamespace(ranks=[0, 2, 4, 6])
+    )
+    calls = []
+
+    def projector(current_weight, capacity, ranks, group):
+        calls.append((current_weight, capacity, ranks, group))
+        return SimpleNamespace(
+            capacity=capacity,
+            shard_rows=len(weight) // group,
+            vocab_size=len(weight),
+            dtype=weight.dtype,
+            dummy=torch.zeros(1, 4),
+            project=lambda *args: None,
+        )
+
+    monkeypatch.setattr(impl, "DPVocabProjection", projector)
+    monkeypatch.setattr(impl, "_enable_scoped_head_dispatch", lambda: None)
+    monkeypatch.setattr(impl.torch.cuda, "synchronize", lambda: None)
+    return runner, calls
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+def test_installer_keeps_local_head_metadata_and_dynamic_pair_contract(monkeypatch, tp):
+    runner, calls = _install_harness(monkeypatch, tp)
+    head = runner.model.lm_head
+    controller = impl.install_dp_vocab_projection(runner, 4)
+    assert calls == [(head.weight, 18, [0, 2, 4, 6], 4)]
+    assert runner.model.lm_head is head and runner.speculator.model.lm_head is head
+    assert head.tp_size == tp and head.num_embeddings_per_partition == 8
+    assert controller.heads == (head, head)
+    assert controller.dynamic_capacity_supported and not controller.dynamic_capacity
+    controller.enable_dynamic_capacity()
+    assert controller.capacity_for(SimpleNamespace(num_reqs=1)) == 6
+
+
+@pytest.mark.parametrize("mismatch", ["tp", "local_rows", "draft_indices"])
+def test_installer_rejects_inconsistent_local_vocab_before_collectives(
+    monkeypatch, mismatch
+):
+    runner, calls = _install_harness(monkeypatch)
+    if mismatch == "tp":
+        runner.model.lm_head.tp_size = 1
+    elif mismatch == "local_rows":
+        runner.model.lm_head.num_embeddings_per_partition = 16
+    else:
+        runner.speculator.model.lm_head = SimpleNamespace(**vars(runner.model.lm_head))
+        runner.speculator.model.lm_head.shard_indices = (8, 16)
+    with pytest.raises(ValueError, match="same TP vocabulary shard"):
+        impl.install_dp_vocab_projection(runner, 4)
+    assert not calls

@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Replicated dense vocabulary projection distributed over fixed DP subgroups.
+"""Dense local-vocabulary projection distributed over fixed DP subgroups.
 
 Weights keep their checkpoint precision and original ownership. Each member
 computes a vocabulary slice for the subgroup's inputs, then returns BF16/FP16
 logits to their request owner. One worker stream serializes the shared staging
-buffers. Process-group teardown belongs to the worker's distributed lifecycle.
+buffers. TP vocabulary shards stay local until their normal logits gather.
+Process-group teardown belongs to the worker's distributed lifecycle.
 """
 
 from __future__ import annotations
@@ -30,6 +31,73 @@ logger = init_logger(__name__)
 _active_projection: ContextVar[DPVocabController | None] = ContextVar(
     "ilu_dp_vocab_projection", default=None
 )
+
+
+def _projection_rank_groups(
+    dp_ranks: list[int],
+    tp_ranks: list[int],
+    rank: int,
+    world_size: int,
+    group_size: int,
+) -> list[list[int]]:
+    """Enumerate every subgroup in the same order on every global rank.
+
+    Static PP1/PCP1 vLLM ranks are ExternalDP x DP x TP. DP peers have the
+    same TP vocabulary interval. Validate that layout before creating any
+    group; a local DP rank list alone is insufficient for global new_group.
+    """
+    dp_size, tp_size = len(dp_ranks), len(tp_ranks)
+    if (
+        type(group_size) is not int
+        or group_size <= 1
+        or not dp_size
+        or dp_size % group_size
+        or not tp_size
+        or type(world_size) is not int
+        or world_size <= 0
+        or world_size % (dp_size * tp_size)
+        or type(rank) is not int
+        or not 0 <= rank < world_size
+    ):
+        raise ValueError("Vocabulary group size must divide the static DP world size")
+    replica_size = dp_size * tp_size
+    replica_start = rank // replica_size * replica_size
+    tp_lane = rank % tp_size
+    expected_dp = list(
+        range(replica_start + tp_lane, replica_start + replica_size, tp_size)
+    )
+    expected_tp = list(range(rank - tp_lane, rank - tp_lane + tp_size))
+    if dp_ranks != expected_dp or tp_ranks != expected_tp:
+        raise ValueError(
+            "DP vocabulary projection requires static PP1/PCP1 DP x TP rank layout"
+        )
+    return [
+        [start + dp * tp_size + lane for dp in range(begin, begin + group_size)]
+        for start in range(0, world_size, replica_size)
+        for lane in range(tp_size)
+        for begin in range(0, dp_size, group_size)
+    ]
+
+
+def _create_projection_group(dp_ranks: list[int], group_size: int):
+    rank = dist.get_rank()
+    groups = _projection_rank_groups(
+        dp_ranks,
+        list(get_tp_group().ranks),
+        rank,
+        dist.get_world_size(),
+        group_size,
+    )
+    selected = None
+    for members in groups:
+        # new_group requires nonmembers to join creation too. Both TP lanes
+        # must create all groups in this global order, not only their DP lane.
+        group = dist.new_group(members, backend="nccl", timeout=timedelta(seconds=90))
+        if rank in members:
+            selected = group, members.index(rank)
+    if selected is None:
+        raise ValueError("Worker is not a member of the configured DP ranks")
+    return selected
 
 
 class DPVocabProjection:
@@ -63,17 +131,7 @@ class DPVocabProjection:
         self.vocab_size, self.hidden_size = weight.shape
         self.dtype, self.device = weight.dtype, weight.device
         self.shard_rows = self.vocab_size // group_size
-        self.group = None
-        rank = dist.get_rank()
-        for begin in range(0, len(ranks), group_size):
-            members = ranks[begin : begin + group_size]
-            group = dist.new_group(
-                members, backend="nccl", timeout=timedelta(seconds=90)
-            )
-            if rank in members:
-                self.group, self.group_rank = group, members.index(rank)
-        if self.group is None:
-            raise ValueError("Worker is not a member of the configured DP ranks")
+        self.group, self.group_rank = _create_projection_group(ranks, group_size)
         options = dict(device=self.device, dtype=self.dtype)
         self.input = torch.zeros((capacity, self.hidden_size), **options)
         self.gathered = torch.empty(
@@ -314,15 +372,18 @@ def _enable_scoped_head_dispatch() -> None:
 def install_dp_vocab_projection(runner, group_size: int) -> DPVocabController:
     """Install the opt-in policy after all target and draft weights are loaded.
 
-    The supported contract is V2 DSpark, TP1/PP1, independent draft eager.
+    The supported contract is V2 DSpark, static PP1/PCP1 DP x TP, independent
+    draft eager. DP subgroups split each TP-local weight, and the ordinary TP
+    gather remains owned by the target/draft logits caller.
     Prompt-logprob projections outside the sampler scope retain the original
     implementation. The whole fixed-size subgroup is initialized collectively
     before memory profiling so its buffers are included in the KV budget.
     """
     if hasattr(runner, "_ilu_dp_vocab_projection"):
         raise RuntimeError("DP vocabulary projection is already installed")
-    if get_tp_group().world_size != 1 or get_pp_group().world_size != 1:
-        raise ValueError("DP vocabulary projection requires TP1 and PP1")
+    if get_pp_group().world_size != 1:
+        raise ValueError("DP vocabulary projection requires PP1")
+    tp_size = get_tp_group().world_size
     draft = runner.speculator
     if (
         draft is None
@@ -344,6 +405,15 @@ def install_dp_vocab_projection(runner, group_size: int) -> DPVocabController:
             )
     if target_head.weight.data_ptr() != draft_head.weight.data_ptr():
         raise ValueError("Target and draft must share the replicated vocabulary weight")
+    if (
+        any(
+            head.tp_size != tp_size
+            or head.num_embeddings_per_partition != head.weight.shape[0]
+            for head in (target_head, draft_head)
+        )
+        or target_head.shard_indices != draft_head.shard_indices
+    ):
+        raise ValueError("Target and draft must preserve the same TP vocabulary shard")
     if language.logits_processor.head_dtype not in (None, target_head.weight.dtype):
         raise ValueError("DP vocabulary projection preserves the checkpoint head dtype")
     capacity = runner.scheduler_config.max_num_seqs * (draft.num_speculative_steps + 1)
@@ -374,8 +444,11 @@ def install_dp_vocab_projection(runner, group_size: int) -> DPVocabController:
     draft.propose = controller.wrap_propose(draft.propose)
     runner._ilu_dp_vocab_projection = controller
     logger.info(
-        "DP vocabulary projection: group=%d capacity=%d dtype=%s dynamic=%s",
+        "DP vocabulary projection: group=%d TP=%d local_vocab=%d "
+        "capacity=%d dtype=%s dynamic=%s",
         group_size,
+        tp_size,
+        owner.vocab_size,
         capacity,
         owner.dtype,
         dynamic_supported,

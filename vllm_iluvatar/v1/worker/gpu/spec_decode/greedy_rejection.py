@@ -33,6 +33,7 @@ def make_verify_with_greedy_cuda(original: Callable[..., Any]) -> Callable[..., 
             draft_logits is None
             and self.synthetic_conditional_rates is None
             and not self.use_block_verification
+            and getattr(self, "fly_window_size", 0) == 0
             and not self.enable_adaptive_verification
             and self.watermark_key is None
             and np.all(idx_mapping_np >= 0)

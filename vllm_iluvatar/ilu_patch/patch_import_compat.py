@@ -409,6 +409,7 @@ def _patch_triton_gluon_symbols() -> None:
     try:
         from triton.experimental import gluon as _gluon  # noqa: F401
         from triton.experimental.gluon import language as _gl  # noqa: F401
+
         return
     except Exception:
         pass
@@ -497,6 +498,10 @@ def apply() -> None:
         return
     _applying = True
     try:
+        # Register before any shim can import a configuration/schema consumer.
+        from vllm_iluvatar.ilu_patch.patch_fly import register as register_fly
+
+        register_fly()
         # Stand-ins must land before any other shim imports community vLLM.
         # fa_utils imports vllm.vllm_flash_attn at module scope on the cuda branch.
         _install_import_shims()

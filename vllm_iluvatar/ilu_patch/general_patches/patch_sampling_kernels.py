@@ -26,6 +26,9 @@ def _apply() -> None:
         make_verify_with_greedy_cuda,
     )
 
+    # Only standard verification is redirected to the unchanged native ABI.
+    # Plugin-owned FLy dispatches its separate _fly_rejection_kernel entry;
+    # native stats/resampling and the exact dtype-alignment wrapper are shared.
     replacements = (
         (gumbel, "_gumbel_sample_kernel", sampling_kernels.gumbel_sample_kernel),
         (

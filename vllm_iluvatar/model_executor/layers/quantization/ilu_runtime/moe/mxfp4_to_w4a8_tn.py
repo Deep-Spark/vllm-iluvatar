@@ -1,10 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Bounded load-time MXFP4 -> channel W4A8 TN/v2 conversion.
-
-The source uses adjacent E2M1 nibbles and UE8M0 blocks of 32. The target
-uses TN 16+16 nibble packing, INT8 channel scales, and the v2 kernel's fixed
-INT4-to-INT8 factor 18. No checkpoint files or non-expert methods change.
-"""
+"""Bounded MXFP4 loading with the TN/v2 W4A8 compute method."""
 
 import torch
 from compressed_tensors.quantization import QuantizationArgs
@@ -28,14 +23,8 @@ __all__ = [
 ]
 
 
-def quantize_mxfp4_to_w4a8_tn(weight, block_scale):
-    """[N,K/2] int8/uint8 E2M1 + [N,K/32] uint8 UE8M0 -> TN INT4, [1,N] FP32.
-
-    Computation is FP32, per output channel over the entire K. Zero channels
-    use scale 1. Reject NaN exponent 255 and overflow instead of writing an
-    apparently valid packed tensor. This is a loading operation, not Graph
-    safe: finite checks intentionally synchronize before accepting weights.
-    """
+def _quantize_mxfp4_to_int4(weight, block_scale):
+    """Decode E2M1/UE8M0 and quantize per channel in FP32 at load time."""
     if (
         weight.dtype not in (torch.int8, torch.uint8)
         or block_scale.dtype != torch.uint8
@@ -66,23 +55,21 @@ def quantize_mxfp4_to_w4a8_tn(weight, block_scale):
     if not torch.isfinite(values).all():
         raise ValueError("MXFP4 dequantization is not finite in FP32")
     channel = values.abs().amax(-1, keepdim=True) / 127
+    factor = torch.where(channel > 0, 18.0, 1.0)
     channel = torch.where(channel > 0, channel, torch.ones_like(channel))
     q8 = torch.round(values / channel).clamp(-127, 127)
-    q4 = torch.round(q8 / 18).clamp(-8, 7).to(torch.int8)
-    # TN/v2 applies 18 in its kernel. Folding 18 here would scale twice.
+    q4 = torch.round(q8 / factor).clamp(-8, 7).to(torch.int8)
+    return q4, channel, factor
+
+
+def quantize_mxfp4_to_w4a8_tn(weight, block_scale):
+    """TN/v2 applies factor 18 in the kernel; store the INT8 channel scale."""
+    q4, channel, _ = _quantize_mxfp4_to_int4(weight, block_scale)
     return _pack_int4(q4), channel.T.contiguous()
 
 
-@IluvatarQuantRegistry.register_method
-class IluMxfp4ToW4A8TNOnlineMoEMethod(IluCompressedTensorsW4A8Int8MoEMethod):
-    """Unsharded local MXFP4 experts with the existing TN/v2 compute surface.
-
-    EP owns complete experts even when attention uses multiple TP ranks:
-    upstream FusedMoEParallelConfig sets the expert TP size to one. Global
-    expert IDs are mapped before staging, so nonlocal shards allocate nothing.
-    EP placement must be equal contiguous ranges, as required by the TN
-    consumer. Tensor-sharded experts without EP and EPLB remain unsupported.
-    """
+class _IluMxfp4W4A8Loader:
+    """Shared bounded shard loading for unsharded, contiguous local experts."""
 
     def __init__(self, layer, *, runtime_context=None, max_pending_shards=8):
         super().__init__(
@@ -93,7 +80,10 @@ class IluMxfp4ToW4A8TNOnlineMoEMethod(IluCompressedTensorsW4A8Int8MoEMethod):
                 num_bits=8, type="int", strategy="token", symmetric=True, dynamic=True
             ),
             moe=layer.moe_config,
-            ilu_params={"gemm_format": "TN", "pack_version": 2},
+            ilu_params={
+                "gemm_format": self._format,
+                "pack_version": self._pack_version,
+            },
         )
         self._runtime_context = runtime_context
         self.max_pending_shards = max_pending_shards
@@ -110,11 +100,11 @@ class IluMxfp4ToW4A8TNOnlineMoEMethod(IluCompressedTensorsW4A8Int8MoEMethod):
         if not isinstance(context.layer, RoutedExperts) or not isinstance(
             context.original_method, IluMxfp4MoEMethod
         ):
-            raise TypeError("MXFP4 -> W4A8 TN requires MXFP4 routed experts")
+            raise TypeError("MXFP4 -> W4A8 requires MXFP4 routed experts")
         if g.require.original_disposition != "quantized":
-            raise ValueError("MXFP4 -> W4A8 TN requires quantized disposition")
+            raise ValueError("MXFP4 -> W4A8 requires quantized disposition")
         if w.loading.mode != "transform" or w.loading.stage != "weight_load":
-            raise ValueError("MXFP4 -> W4A8 TN requires transform@weight_load")
+            raise ValueError("MXFP4 -> W4A8 requires transform@weight_load")
         if (
             w.source.format != "mxfp4"
             or not set(w.source.dtypes) <= {"int8", "uint8"}
@@ -122,12 +112,14 @@ class IluMxfp4ToW4A8TNOnlineMoEMethod(IluCompressedTensorsW4A8Int8MoEMethod):
         ):
             raise ValueError("source must be MXFP4 with 32-element UE8M0 blocks")
         if (
-            w.target.format != "int4-packed-tn"
+            w.target.format != f"int4-packed-{cls._format.lower()}"
             or w.target.dtype != "int8"
             or w.target.strategy != "channel"
-            or dict(w.target.extra) != {"pack_version": 2}
+            or dict(w.target.extra) != {"pack_version": cls._pack_version}
         ):
-            raise ValueError("target must be channel INT4 TN/v2")
+            raise ValueError(
+                f"target must be channel INT4 {cls._format}/v{cls._pack_version}"
+            )
         if (
             a is None
             or a.num_bits != 8
@@ -137,9 +129,9 @@ class IluMxfp4ToW4A8TNOnlineMoEMethod(IluCompressedTensorsW4A8Int8MoEMethod):
             or bool(a.extra)
             or g.output_activations is not None
         ):
-            raise ValueError("W4A8 TN requires dynamic per-token INT8 activations")
+            raise ValueError("W4A8 requires dynamic per-token INT8 activations")
         if set(g.options) - {"max_pending_shards"}:
-            raise ValueError("unknown MXFP4 -> W4A8 TN option")
+            raise ValueError("unknown MXFP4 -> W4A8 option")
         pending = g.options.get("max_pending_shards", 8)
         if type(pending) is not int or pending < 1:
             raise ValueError("max_pending_shards must be a positive integer")
@@ -167,7 +159,7 @@ class IluMxfp4ToW4A8TNOnlineMoEMethod(IluCompressedTensorsW4A8Int8MoEMethod):
             or i % 32
         ):
             raise ValueError(
-                "MXFP4 -> W4A8 TN requires expert TP1 (EP allowed), unpadded bias-free gate/up experts"
+                "MXFP4 -> W4A8 requires expert TP1 (EP allowed), unpadded bias-free gate/up experts"
             )
         ep_size = getattr(moe, "ep_size", 1)
         if ep_size > 1 or layer.expert_map is not None:
@@ -179,7 +171,7 @@ class IluMxfp4ToW4A8TNOnlineMoEMethod(IluCompressedTensorsW4A8Int8MoEMethod):
                 or mapping.numel() != num_experts * ep_size
                 or not 0 <= rank < ep_size
             ):
-                raise ValueError("W4A8 TN EP requires equally partitioned experts")
+                raise ValueError("W4A8 EP requires equally partitioned experts")
             expected = torch.full_like(mapping, -1)
             expected[rank * num_experts : (rank + 1) * num_experts] = torch.arange(
                 num_experts, device=mapping.device, dtype=mapping.dtype
@@ -187,9 +179,7 @@ class IluMxfp4ToW4A8TNOnlineMoEMethod(IluCompressedTensorsW4A8Int8MoEMethod):
             # Loading-time synchronization is deliberate; the inherited TN
             # consumer derives expert IDs from ep_rank * local_num_experts.
             if not torch.equal(mapping, expected):
-                raise ValueError(
-                    "W4A8 TN EP requires contiguous linear expert placement"
-                )
+                raise ValueError("W4A8 EP requires contiguous linear expert placement")
         config = get_current_vllm_config()
         fmt = config.load_config.load_format
         if str(getattr(fmt, "value", fmt)) not in {
@@ -256,14 +246,16 @@ class IluMxfp4ToW4A8TNOnlineMoEMethod(IluCompressedTensorsW4A8Int8MoEMethod):
             parts = self._pending.setdefault(unit, {})
             parts[part] = loaded_weight.to(device=param.device, copy=True)
             if len(parts) == 2:
-                packed, channel = quantize_mxfp4_to_w4a8_tn(
-                    parts["weight"], parts["scale"]
-                )
+                packed, channel = self._quantize_shard(parts["weight"], parts["scale"])
                 target = getattr(layer, f"{group}_weight").data[expert]
                 scales = getattr(layer, f"{group}_weight_scale").data[expert]
                 if group == "w13":
                     offset = 0 if shard_id == "w1" else self._intermediate
-                    target = target.narrow(0, offset, n)
+                    target = (
+                        target.narrow(1, offset // 2, n // 2)
+                        if self._format == "NN"
+                        else target.narrow(0, offset, n)
+                    )
                     scales = scales.narrow(1, offset, n)
                 target.copy_(packed)
                 scales.copy_(channel)
@@ -275,7 +267,7 @@ class IluMxfp4ToW4A8TNOnlineMoEMethod(IluCompressedTensorsW4A8Int8MoEMethod):
 
     def process_weights_after_loading(self, layer):
         if self._layer is not layer or self._finalized:
-            raise RuntimeError("TN finalization requires its own unfinalized layer")
+            raise RuntimeError("MXFP4 finalization requires its own unfinalized layer")
         expected = {
             (g, e, s)
             for e in range(self._num_experts)
@@ -300,3 +292,14 @@ class IluMxfp4ToW4A8TNOnlineMoEMethod(IluCompressedTensorsW4A8Int8MoEMethod):
         return super().apply(
             layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input
         )
+
+
+@IluvatarQuantRegistry.register_method
+class IluMxfp4ToW4A8TNOnlineMoEMethod(
+    _IluMxfp4W4A8Loader, IluCompressedTensorsW4A8Int8MoEMethod
+):
+    """MXFP4 streaming loader with the existing TN/v2 compute method."""
+
+    _format = "TN"
+    _pack_version = 2
+    _quantize_shard = staticmethod(quantize_mxfp4_to_w4a8_tn)

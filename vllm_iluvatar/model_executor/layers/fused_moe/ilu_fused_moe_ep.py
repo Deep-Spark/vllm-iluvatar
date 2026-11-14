@@ -892,7 +892,9 @@ class IluFusedMoEEP:
             shared_output *= runner.shared_experts_scaling_factor
 
         fused_output = output
-        if runner._fused_output_is_reduced:
-            shared_output = runner._maybe_reduce_shared_expert_output(shared_output)
+        # A decode override can use a different kernel than the quant method.
+        shared_output = runner._maybe_reduce_shared_expert_output(
+            shared_output, fused_output_is_reduced=moe_kernel.output_is_reduced()
+        )
 
         return fused_output if shared_output is None else shared_output + fused_output

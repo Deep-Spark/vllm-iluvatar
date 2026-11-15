@@ -9,6 +9,7 @@ communication when the draft implements ``compute_draft_logits_local``.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -18,6 +19,8 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
+
+from .dspark_bias_sample import FusedBiasWorkspace, fused_bias_gumbel_sample
 
 logger = init_logger("vllm." + __name__)
 
@@ -94,12 +97,84 @@ def sample_sequential(self: Any, num_reqs: int, head_hidden: torch.Tensor) -> No
     sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
     confidence_markov_embeds: list[torch.Tensor] = []
     prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+    fuse_bias = (
+        getattr(self, "_ilu_fused_bias_sample", False)
+        and self.draft_logits is not None
+        and self.acceptance_estimator is None
+        and self._d2t_scatter_index is None
+        and self.draft_watermarker is None
+        and get_tensor_model_parallel_world_size() == 1
+    )
+    sample_vocab_size = min(draft_vocab_size, local_vocab_size)
+    sample_padding = max(0, sample_vocab_size - (local_vocab_size - num_vocab_padding))
+    fused_workspace = None
+    if fuse_bias and hasattr(torch.ops._C, "ilu_dspark_bias_sample_v4"):
+        fused_workspace = getattr(self, "_ilu_fused_bias_workspace", None)
+        if fused_workspace is None:
+            fused_workspace = FusedBiasWorkspace(
+                self.draft_tokens.shape[0],
+                sample_vocab_size,
+                base_logits.device,
+                self.use_fp64_gumbel,
+            )
+            self._ilu_fused_bias_workspace = fused_workspace
+        if (
+            fused_workspace.vocab_size != sample_vocab_size
+            or fused_workspace.use_fp64 != self.use_fp64_gumbel
+        ):
+            raise RuntimeError("DSpark sampler workspace configuration changed")
+    if fuse_bias and not getattr(self, "_ilu_fused_bias_sample_logged", False):
+        logger.info(
+            "DSpark fused bias sampler active: version=%d rows=%d vocab=%d dtype=%s; "
+            "native RNG and draft-logits cache preserved",
+            4
+            if fused_workspace is not None
+            else 2
+            if hasattr(torch.ops._C, "ilu_dspark_bias_sample_v2")
+            else 1,
+            num_reqs,
+            sample_vocab_size,
+            base_logits.dtype,
+        )
+        self._ilu_fused_bias_sample_logged = True
 
     for i in range(n_spec):
         markov_embed = self.model.markov_embed(prev)
         if self.use_confidence_head:
             confidence_markov_embeds.append(markov_embed)
         bias = self.model.markov_bias_local(markov_embed)
+        if fused_workspace is not None:
+            draft_sampled_i = self.draft_tokens[:num_reqs, i]
+            fused_workspace.sample_into(
+                base_logits[:, i, :sample_vocab_size],
+                bias[:, :sample_vocab_size],
+                idx_map[:, i],
+                self.temperature,
+                self.seeds,
+                sample_pos[:, i],
+                self.draft_logits,
+                self._step_cols[i],
+                draft_sampled_i,
+                sample_padding,
+            )
+            prev = draft_sampled_i
+            continue
+        if fuse_bias:
+            draft_sampled_i = fused_bias_gumbel_sample(
+                base_logits[:, i, :sample_vocab_size],
+                bias[:, :sample_vocab_size],
+                idx_map[:, i],
+                self.temperature,
+                self.seeds,
+                sample_pos[:, i] - 1,
+                self.draft_logits,
+                self._step_cols[i],
+                self.use_fp64_gumbel,
+                sample_padding,
+            )
+            self.draft_tokens[:num_reqs, i] = draft_sampled_i
+            prev = draft_sampled_i
+            continue
         logits_i = base_logits[:, i] + bias
         if self.draft_logits is not None:
             logits_i = gather_vocab_parallel_logits(
@@ -148,6 +223,23 @@ def make_init_cudagraph_manager(
         from vllm import envs
         from vllm.config.compilation import CUDAGraphMode
         from vllm.distributed import get_pp_group
+
+        library = os.environ.get("VLLM_ILU_DSPARK_FUSED_BIAS_LIBRARY")
+        if library and not hasattr(torch.ops._C, "ilu_dspark_bias_sample_v2"):
+            torch.ops.load_library(library)
+        state_library = os.environ.get("VLLM_ILU_DSPARK_FUSED_BIAS_STATE_LIBRARY")
+        if state_library and not hasattr(torch.ops._C, "ilu_dspark_bias_sample_v4"):
+            torch.ops.load_library(state_library)
+        self._ilu_fused_bias_sample = envs.VLLM_ILU_DSPARK_FUSED_BIAS_SAMPLE
+        if self._ilu_fused_bias_sample and not any(
+            hasattr(torch.ops._C, name)
+            for name in (
+                "ilu_dspark_bias_sample_v4",
+                "ilu_dspark_bias_sample_v2",
+                "ilu_fused_bias_gumbel_sample",
+            )
+        ):
+            raise RuntimeError("Rebuild vllm-iluvatar for DSpark bias fusion")
 
         backbone_only = envs.VLLM_ILU_DSPARK_BACKBONE_GRAPH
         if backbone_only and (

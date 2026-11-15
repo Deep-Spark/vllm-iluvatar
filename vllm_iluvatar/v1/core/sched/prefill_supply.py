@@ -120,7 +120,11 @@ def plan(scheduler, budget):
                 and request.request_id in scheduler.finished_recving_kv_req_ids
             ):
                 # Retain the original completion fence and cache bookkeeping.
-                scheduler._try_promote_blocked_waiting_request(request)
+                # The v0.31 scheduler renamed this hook.
+                promote = getattr(scheduler, "_handle_blocked_waiting_request", None)
+                if promote is None:
+                    promote = scheduler._try_promote_blocked_waiting_request
+                promote(request)
                 status = request.status.name
             if status != "WAITING" or request.has_encoder_inputs:
                 continue

@@ -230,16 +230,14 @@ def make_init_cudagraph_manager(
         state_library = os.environ.get("VLLM_ILU_DSPARK_FUSED_BIAS_STATE_LIBRARY")
         if state_library and not hasattr(torch.ops._C, "ilu_dspark_bias_sample_v4"):
             torch.ops.load_library(state_library)
-        self._ilu_fused_bias_sample = envs.VLLM_ILU_DSPARK_FUSED_BIAS_SAMPLE
-        if self._ilu_fused_bias_sample and not any(
+        self._ilu_fused_bias_sample = any(
             hasattr(torch.ops._C, name)
             for name in (
                 "ilu_dspark_bias_sample_v4",
                 "ilu_dspark_bias_sample_v2",
                 "ilu_fused_bias_gumbel_sample",
             )
-        ):
-            raise RuntimeError("Rebuild vllm-iluvatar for DSpark bias fusion")
+        )
 
         backbone_only = envs.VLLM_ILU_DSPARK_BACKBONE_GRAPH
         if backbone_only and (

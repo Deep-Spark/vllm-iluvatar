@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """The fused Markov sampler must preserve rejection-sampling inputs."""
 
-import os
-
 import pytest
 import torch
 
+import vllm_iluvatar._C  # Register the production extension's default sampler.
 from vllm_iluvatar.v1.worker.gpu.spec_decode.dspark_bias_sample import (
     FusedBiasWorkspace,
     fused_bias_gumbel_sample,
@@ -24,12 +23,6 @@ def test_fused_bias_preserves_sampled_ids_and_rejection_logits(
 
     from vllm_iluvatar.v1.worker.gpu.spec_decode import sampling_kernels
 
-    library = os.environ.get("VLLM_ILU_DSPARK_FUSED_BIAS_LIBRARY")
-    if library and not hasattr(torch.ops._C, "ilu_dspark_bias_sample_v2"):
-        torch.ops.load_library(library)
-    state_library = os.environ.get("VLLM_ILU_DSPARK_FUSED_BIAS_STATE_LIBRARY")
-    if state_library and not hasattr(torch.ops._C, "ilu_dspark_bias_sample_v4"):
-        torch.ops.load_library(state_library)
     monkeypatch.setattr(
         gumbel, "_gumbel_sample_kernel", sampling_kernels.gumbel_sample_kernel
     )

@@ -37,11 +37,12 @@ The package includes:
 
 For implementation details, see the [plugin design](docs/design/iluvatar_plugin_design.md).
 
-### Optional DSpark draft sampling fusion
+### DSpark draft sampling fusion
 
-After rebuilding the native extension, set `VLLM_ILU_DSPARK_FUSED_BIAS_SAMPLE=1`
-before starting workers to enable the TP1 full-vocabulary Markov sampling path.
-The default is `0`. The fused path preserves the native random-number sequence,
+The TP1 full-vocabulary Markov sampling path automatically uses the fused
+sampler when its native operators are available; no enable switch is needed.
+Rebuild the native extension to include these operators.
+The fused path preserves the native random-number sequence,
 logit rounding, vocabulary padding and draft-logit cache, and reuses strided
 sampling workspace. Unsupported sampling configurations retain the existing
 path. Standalone development builds can be loaded through

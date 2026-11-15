@@ -493,7 +493,9 @@ def test_real_schedule_composes_and_is_idempotent(monkeypatch):
     assert source.count("_ilu_prefill_supply.plan(") == 1
     assert source.count("supply_plan.limit(") == 3
     assert source.count("supply_plan.consume(") == 2
-    assert source.count("supply_plan.should_skip_waiting(") == 1
+    assert source.count("supply_plan.should_skip_waiting(") == 2
+    assert source.count("supply_plan.can_admit_waiting(") == 1
+    assert source.count("supply_plan.on_admit_waiting(") == 1
     assert patch.patch_schedule_source(source) == source
     patch._apply()
     assert Scheduler.schedule is schedule and Scheduler._free_request is free
@@ -985,3 +987,361 @@ def test_schedule_e2e_lmcache_composes_with_async_load_hol_refusal(monkeypatch):
     assert "inflight_done" not in sched.finished_recving_kv_req_ids
     assert [r.request_id for r in sched.running] == ["long_1"]
     assert [r.request_id for r in sched.waiting] == ["long_2"]
+
+
+def test_parallel_lmcache_module_dispatch():
+    from vllm_iluvatar.v1.core.sched import prefill_supply_lmcache as lmc_supply
+
+    sched_off, _ = scheduler([request("long", 800_000)], [request("a", 800, prefix="unseen")])
+    with_connector(sched_off, MultiConnector(OptNixlConnector(), OffloadingConnector()))
+    plan_off = supply.plan(sched_off, 4096)
+    assert type(plan_off) is supply.BudgetPlan
+
+    sched_lmc, _ = scheduler([request("long", 800_000)], [request("a", 800, prefix="unseen")])
+    with_connector(
+        sched_lmc,
+        MultiConnector(OptNixlConnector(), LMCacheMPConnector(resolved={"a"})),
+    )
+    plan_lmc = supply.plan(sched_lmc, 4096)
+    assert type(plan_lmc) is lmc_supply.LMCacheBudgetPlan
+
+
+def test_strategy_b_caps_second_ultra_long_and_skips_to_mid_request(monkeypatch):
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LONG_CAP_TOKENS", "256000")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LONG_CAP_MAX", "1")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LONG_CAP_IDLE_MAX", "2")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_SUBMIT", "16")
+
+    # long_1 hits 64k in LMCache (load_kv_async=True -> consumes 0 compute budget!),
+    # long_2 is cold 800k, mid_1 is cold 35k (< 256k -> creates short pressure).
+    long_1 = _live_request("long_1", 800_000)
+    long_2 = _live_request("long_2", 800_000)
+    mid_1 = _live_request("mid_1", 35_030)
+    lmcache = LMCacheMPConnector(
+        resolved={"long_2", "mid_1"},
+        hits={"long_1": 64_000},
+    )
+    sched = _live_scheduler(
+        monkeypatch,
+        running=[],
+        waiting=[long_1, long_2, mid_1],
+        connector=MultiConnector(OptNixlConnector(), lmcache),
+        budget=4096,
+    )
+
+    out = sched.schedule()
+    # long_1 enters WAITING_FOR_REMOTE_KVS and claims the 1 ultra-long slot;
+    # long_2 is blocked by B's cap and skipped; mid_1 is admitted for 4096 tokens!
+    assert out.num_scheduled_tokens == {"mid_1": 4096}
+    assert [r.request_id for r in sched.running] == ["mid_1"]
+    assert [r.request_id for r in sched.skipped_waiting] == ["long_1", "long_2"]
+    assert supply.state(sched).b_cap_skips >= 1
+
+
+def test_strategy_b_relaxes_in_pure_ultra_long_and_releases_on_tail(monkeypatch):
+    from vllm.v1.request import RequestStatus
+
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LONG_CAP_TOKENS", "256000")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LONG_CAP_MAX", "1")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LONG_CAP_IDLE_MAX", "2")
+
+    # Pure ultra-long queue (no <256k requests) -> idle cap = 2 allows 2 async loads,
+    # while the 3rd ultra-long is capped.
+    u1 = _live_request("u1", 800_000)
+    u2 = _live_request("u2", 400_000)
+    u3 = _live_request("u3", 300_000)
+    lmcache = LMCacheMPConnector(
+        hits={"u1": 64_000, "u2": 64_000},
+        resolved={"u3"},
+    )
+    sched = _live_scheduler(
+        monkeypatch,
+        running=[],
+        waiting=[u1, u2, u3],
+        connector=MultiConnector(OptNixlConnector(), lmcache),
+        budget=4096,
+    )
+    out = sched.schedule()
+    assert out.num_scheduled_tokens == {}
+    assert u1.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert u2.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert u3.status == RequestStatus.WAITING
+    assert [r.request_id for r in sched.running] == []
+
+    # Tail release under short pressure: running ultra-long with remaining <= 32k
+    # releases its slot so the next ultra-long can start.
+    tail_u = _live_request("tail_u", 800_000, done=798_000, status=RequestStatus.RUNNING)
+    next_u = _live_request("next_u", 400_000)
+    short_unres = _live_request("short_unres", 8000)
+    lmcache2 = LMCacheMPConnector(resolved={"next_u"})
+    sched2 = _live_scheduler(
+        monkeypatch,
+        running=[tail_u],
+        waiting=[next_u, short_unres],
+        connector=MultiConnector(OptNixlConnector(), lmcache2),
+        budget=4096,
+    )
+    supply.state(sched2).ultra_ids.add("tail_u")
+    out2 = sched2.schedule()
+    assert out2.num_scheduled_tokens == {"tail_u": 2000, "next_u": 2096}
+    assert [r.request_id for r in sched2.running] == ["tail_u", "next_u"]
+
+
+def test_strategy_b_warm_long_below_cap_and_inflight_holder_not_blocked(monkeypatch):
+    from vllm.v1.request import RequestStatus
+
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LONG_CAP_TOKENS", "256000")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LONG_CAP_MAX", "1")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_SUBMIT", "16")
+
+    # active_u holds the 1 ultra-long slot in WAITING_FOR_REMOTE_KVS, while
+    # warm_400k hits 380k in LMCache -> eff_rem ~20k < 256k -> NOT capped by B!
+    active_u = _live_request(
+        "active_u", 800_000, done=64_000, status=RequestStatus.WAITING_FOR_REMOTE_KVS
+    )
+    warm_400k = _live_request("warm_400k", 400_000)
+    short_w = _live_request("short_w", 8000)
+    lmcache = LMCacheMPConnector(hits={"warm_400k": 384_000})
+    sched = _live_scheduler(
+        monkeypatch,
+        running=[],
+        skipped=[active_u],
+        waiting=[warm_400k, short_w],
+        connector=MultiConnector(OptNixlConnector(), lmcache),
+        budget=4096,
+    )
+    sched._inflight_prefills.add(active_u)
+
+    out = sched.schedule()
+    assert warm_400k.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert out.num_scheduled_tokens == {}
+
+    # Even if another ultra-long is running, an already-allocated _inflight_prefills
+    # request (active_u) finishing KV recv is NEVER blocked from entering running.
+    run_u = _live_request("run_u", 800_000, done=800_000 - 2000, status=RequestStatus.RUNNING)
+    sched2 = _live_scheduler(
+        monkeypatch,
+        running=[run_u],
+        skipped=[active_u],
+        waiting=[short_w],
+        connector=MultiConnector(OptNixlConnector(), LMCacheMPConnector()),
+        budget=4096,
+    )
+    supply.state(sched2).ultra_ids.update({"run_u", "active_u"})
+    # Keep run_u above release_tokens on a smaller custom release threshold
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LONG_RELEASE_TOKENS", "1024")
+    sched2._inflight_prefills.add(active_u)
+    sched2.finished_recving_kv_req_ids.add("active_u")
+
+    out2 = sched2.schedule()
+    assert out2.num_scheduled_tokens == {"run_u": 2000, "active_u": 2096}
+    assert [r.request_id for r in sched2.running] == ["run_u", "active_u"]
+
+
+def test_strategy_ab_short_first_reorders_transition_burst_and_holds_unresolved(
+    monkeypatch,
+):
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LONG_CAP_TOKENS", "256000")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_SHORT_FIRST", "1")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_AHEAD", "8")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_SUBMIT", "16")
+
+    long_skip = _live_request("long_skip", 800_000)
+    long_skip.arrival_time = 100.0
+    mid_80k = _live_request("mid_80k", 80_030)
+    mid_80k.arrival_time = 101.0
+    mid_35k = _live_request("mid_35k", 35_030)
+    mid_35k.arrival_time = 102.0
+    short_1 = _live_request("short_1", 800)
+    short_1.arrival_time = 103.0
+    short_2 = _live_request("short_2", 800)
+    short_2.arrival_time = 104.0
+
+    lmcache = LMCacheMPConnector(
+        resolved={"long_skip", "mid_80k", "mid_35k", "short_1", "short_2"}
+    )
+    monkeypatch.setattr("time.time", lambda: 110.0)
+    sched = _live_scheduler(
+        monkeypatch,
+        running=[],
+        skipped=[long_skip],
+        waiting=[mid_80k, mid_35k, short_1, short_2],
+        connector=MultiConnector(OptNixlConnector(), lmcache),
+        budget=4096,
+    )
+
+    out = sched.schedule()
+    # short_1 (800) + short_2 (800) + mid_35k (2496) pack the 4096 step ahead of
+    # both mid_80k and skipped_waiting's long_skip!
+    assert out.num_scheduled_tokens == {
+        "short_1": 800,
+        "short_2": 800,
+        "mid_35k": 2496,
+    }
+    assert [r.request_id for r in sched.running] == ["short_1", "short_2", "mid_35k"]
+    assert [r.request_id for r in sched.skipped_waiting] == ["long_skip"]
+
+    # If a shorter 35k request is unresolved while an 800-token request is resolved,
+    # an 800k request does NOT steal the leftover 3296 tokens on that step!
+    long_w = _live_request("long_w", 800_000)
+    long_w.arrival_time = 100.0
+    unres_35k = _live_request("unres_35k", 35_030)
+    unres_35k.arrival_time = 101.0
+    res_800 = _live_request("res_800", 800)
+    res_800.arrival_time = 102.0
+    sched2 = _live_scheduler(
+        monkeypatch,
+        running=[],
+        waiting=[long_w, unres_35k, res_800],
+        connector=MultiConnector(
+            OptNixlConnector(), LMCacheMPConnector(resolved={"long_w", "res_800"})
+        ),
+        budget=4096,
+    )
+    out2 = sched2.schedule()
+    assert out2.num_scheduled_tokens == {"res_800": 800}
+    assert [r.request_id for r in sched2.running] == ["res_800"]
+
+
+def test_strategy_ab_aging_promotes_and_respects_b_cap(monkeypatch):
+    from vllm.v1.request import RequestStatus
+
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LONG_CAP_TOKENS", "256000")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LONG_CAP_MAX", "1")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_SHORT_FIRST", "1")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_STARVE_SEC", "60")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_AHEAD", "8")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_SUBMIT", "16")
+
+    now = 200.0
+    monkeypatch.setattr("time.time", lambda: now)
+
+    # 1. Running ultra-long holds B's 1 slot; aged ultra-long (waited 70s) MUST NOT
+    #    bypass B's cap, so fresh short_1 still gets the short lane!
+    run_u = _live_request("run_u", 800_000, done=100_000, status=RequestStatus.RUNNING)
+    run_u.arrival_time = 120.0
+    aged_u = _live_request("aged_u", 400_000)
+    aged_u.arrival_time = 130.0  # age = 70s >= 60s -> tier=0, but blocked by B cap=1
+    fresh_s = _live_request("fresh_s", 2048)
+    fresh_s.arrival_time = 199.0
+
+    lmcache = LMCacheMPConnector(resolved={"aged_u", "fresh_s"})
+    sched = _live_scheduler(
+        monkeypatch,
+        running=[run_u],
+        waiting=[aged_u, fresh_s],
+        connector=MultiConnector(OptNixlConnector(), lmcache),
+        budget=4096,
+    )
+    out1 = sched.schedule()
+    assert out1.num_scheduled_tokens == {"run_u": 2048, "fresh_s": 2048}
+    assert [r.request_id for r in sched.running] == ["run_u", "fresh_s"]
+    assert [r.request_id for r in sched.waiting] == ["aged_u"]
+
+    # 2. Once run_u drops to <= 32k tail (releasing B's ultra-long slot), aged_u (tier=0)
+    #    claims the freed ultra-long slot ahead of fresh short/mid requests!
+    tail_u = _live_request("tail_u", 800_000, done=798_000, status=RequestStatus.RUNNING)
+    tail_u.arrival_time = 120.0
+    aged_u2 = _live_request("aged_u2", 400_000)
+    aged_u2.arrival_time = 130.0  # age = 70s >= 60s -> tier=0!
+    fresh_35k = _live_request("fresh_35k", 35_030)
+    fresh_35k.arrival_time = 199.0
+    fresh_8k = _live_request("fresh_8k", 8000)
+    fresh_8k.arrival_time = 199.5
+
+    sched2 = _live_scheduler(
+        monkeypatch,
+        running=[tail_u],
+        waiting=[fresh_35k, fresh_8k, aged_u2],
+        connector=MultiConnector(
+            OptNixlConnector(),
+            LMCacheMPConnector(resolved={"aged_u2", "fresh_35k", "fresh_8k"}),
+        ),
+        budget=4096,
+    )
+    supply.state(sched2).ultra_ids.add("tail_u")
+    out2 = sched2.schedule()
+    assert out2.num_scheduled_tokens == {"tail_u": 2000, "aged_u2": 2096}
+    assert [r.request_id for r in sched2.running] == ["tail_u", "aged_u2"]
+
+    # 3. Optimization 1 (strict <=32k fast-lane isolation): while run_u3 (800k)
+    #    is running in Regime 1, an aged medium-long request (aged_80k, tier=0)
+    #    MUST NOT borrow/steal the <=32k fast lane from fresh_800!
+    run_u3 = _live_request("run_u3", 800_000, done=100_000, status=RequestStatus.RUNNING)
+    aged_80k = _live_request("aged_80k", 80_000)
+    aged_80k.arrival_time = 130.0  # age = 70s >= 60s -> tier=0, but > short_limit (32k)
+    fresh_800 = _live_request("fresh_800", 800)
+    fresh_800.arrival_time = 199.0
+
+    sched3 = _live_scheduler(
+        monkeypatch,
+        running=[run_u3],
+        waiting=[aged_80k, fresh_800],
+        connector=MultiConnector(
+            OptNixlConnector(),
+            LMCacheMPConnector(resolved={"aged_80k", "fresh_800"}),
+        ),
+        budget=4096,
+    )
+    out3 = sched3.schedule()
+    assert out3.num_scheduled_tokens == {"run_u3": 3296, "fresh_800": 800}
+    assert [r.request_id for r in sched3.running] == ["run_u3", "fresh_800"]
+    assert [r.request_id for r in sched3.waiting] == ["aged_80k"]
+
+
+def test_strategy_ab_opt2_smooth_aging_and_tier0_fcfs_anti_starvation(monkeypatch):
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LONG_CAP_TOKENS", "256000")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LONG_CAP_MAX", "1")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_SHORT_FIRST", "1")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_STARVE_SEC", "120")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_AGING_RATE", "2500")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_AHEAD", "8")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_SUBMIT", "16")
+
+    # 1. Smooth linear aging before STARVE_SEC (120s):
+    #    mid_80k waited 25s -> aged_score = 80,000 - 2500 * 25 = 17,500 < 35,030!
+    #    So mid_80k smoothly advances ahead of brand-new fresh_35k without waiting 120s.
+    monkeypatch.setattr("time.time", lambda: 200.0)
+    mid_80k = _live_request("mid_80k", 80_000)
+    mid_80k.arrival_time = 175.0  # wait = 25s -> score = 17,500
+    fresh_35k = _live_request("fresh_35k", 35_030)
+    fresh_35k.arrival_time = 199.5  # wait = 0.5s -> score = 33,780
+
+    sched1 = _live_scheduler(
+        monkeypatch,
+        running=[],
+        waiting=[fresh_35k, mid_80k],
+        connector=MultiConnector(
+            OptNixlConnector(),
+            LMCacheMPConnector(resolved={"mid_80k", "fresh_35k"}),
+        ),
+        budget=4096,
+    )
+    out1 = sched1.schedule()
+    assert out1.num_scheduled_tokens == {"mid_80k": 4096}
+    assert [r.request_id for r in sched1.running] == ["mid_80k"]
+    assert [r.request_id for r in sched1.waiting] == ["fresh_35k"]
+
+    # 2. Tier-0 oldest-first (FCFS) anti-starvation under sustained congestion:
+    #    Both ultra_800k (waited 150s) and mid_35k_aged (waited 125s) crossed STARVE_SEC=120s.
+    #    Tier 0 orders by arrival_time so ultra_800k is NOT jumped again by younger aged mid_35k!
+    ultra_800k = _live_request("ultra_800k", 800_000)
+    ultra_800k.arrival_time = 50.0  # wait = 150s >= 120s -> tier=0, older!
+    mid_35k_aged = _live_request("mid_35k_aged", 35_030)
+    mid_35k_aged.arrival_time = 75.0  # wait = 125s >= 120s -> tier=0, younger!
+
+    sched2 = _live_scheduler(
+        monkeypatch,
+        running=[],
+        waiting=[mid_35k_aged, ultra_800k],
+        connector=MultiConnector(
+            OptNixlConnector(),
+            LMCacheMPConnector(resolved={"ultra_800k", "mid_35k_aged"}),
+        ),
+        budget=4096,
+    )
+    out2 = sched2.schedule()
+    assert out2.num_scheduled_tokens == {"ultra_800k": 4096}
+    assert [r.request_id for r in sched2.running] == ["ultra_800k"]
+    assert [r.request_id for r in sched2.waiting] == ["mid_35k_aged"]
+

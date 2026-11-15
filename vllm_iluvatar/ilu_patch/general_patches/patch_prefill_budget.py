@@ -58,6 +58,22 @@ def patch_schedule_source(source: str) -> str:
             ),
         ),
         (
+            "            encoder_inputs_to_schedule = None\n"
+            "            external_load_encoder_input = []\n",
+            (
+                "            if supply_plan is not None and not supply_plan.can_admit_waiting(\n"
+                "                self, request, num_computed_tokens, load_kv_async\n"
+                "            ):\n"
+                "                if supply_plan.should_skip_waiting(self, request_id):\n"
+                "                    request_queue.pop_request()\n"
+                "                    step_skipped_waiting.prepend_request(request)\n"
+                "                    continue\n"
+                "                break\n\n"
+                "            encoder_inputs_to_schedule = None\n"
+                "            external_load_encoder_input = []\n"
+            ),
+        ),
+        (
             "                request_token_budget = min(token_budget, input_budget - draft_slots)\n",
             (
                 "                request_token_budget = min(token_budget, input_budget - draft_slots)\n"
@@ -65,6 +81,18 @@ def patch_schedule_source(source: str) -> str:
                 "                    request_token_budget = supply_plan.limit(\n"
                 "                        request_id, request_token_budget\n"
                 "                    )\n"
+            ),
+        ),
+        (
+            "            request = request_queue.pop_request()\n"
+            "            if load_kv_async:\n",
+            (
+                "            request = request_queue.pop_request()\n"
+                "            if supply_plan is not None:\n"
+                "                supply_plan.on_admit_waiting(\n"
+                "                    self, request, num_computed_tokens, load_kv_async\n"
+                "                )\n"
+                "            if load_kv_async:\n"
             ),
         ),
         (

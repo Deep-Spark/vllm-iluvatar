@@ -67,6 +67,26 @@ def test_entropy_all_masked_logits_and_zero_probabilities_are_zero():
     )
 
 
+@pytest.mark.parametrize("rows", [0, 3])
+def test_entropy_returns_the_full_vocabulary_log_normalizer(rows):
+    logits = torch.randn(rows, 17, generator=torch.Generator().manual_seed(42))
+    if rows:
+        logits[1] = -math.inf
+        logits[2, 1:] = -math.inf
+    entropy, logsumexp = compute_fly_entropy(
+        logits, 3, from_logits=True, return_logsumexp=True
+    )
+    torch.testing.assert_close(
+        entropy, compute_fly_entropy(logits, 3, from_logits=True)
+    )
+    torch.testing.assert_close(logsumexp, logits.logsumexp(-1))
+
+
+def test_entropy_log_normalizer_requires_logits():
+    with pytest.raises(ValueError, match="requires logits"):
+        compute_fly_entropy(torch.ones(1, 3), 3, return_logsumexp=True)
+
+
 @pytest.mark.parametrize(
     ("shape", "top_k", "message"),
     [

@@ -38,12 +38,14 @@ def _fly_entropy_tiles(
     values_ptr,
     partial_ptr,
     output_ptr,
+    logsumexp_ptr,
     row_stride,
     col_stride,
     vocab_size: tl.constexpr,
     num_tiles: tl.constexpr,
     TOP_K: tl.constexpr,
     FROM_LOGITS: tl.constexpr,
+    RETURN_LOGSUMEXP: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
@@ -62,6 +64,8 @@ def _fly_entropy_tiles(
         denominator = tl.sum(tl.exp(value - safe_maximum), 0)
         if num_tiles == 1:
             log_normalizer = safe_maximum + tl.log(denominator)
+            if RETURN_LOGSUMEXP:
+                tl.store(logsumexp_ptr + row, log_normalizer)
         else:
             tl.store(partial_ptr + partial_base + TOP_K, maximum)
             tl.store(partial_ptr + partial_base + TOP_K + 1, denominator)
@@ -95,9 +99,11 @@ def _fly_entropy_tiles(
 def _fly_entropy_merge(
     partial_ptr,
     output_ptr,
+    logsumexp_ptr,
     num_tiles: tl.constexpr,
     TOP_K: tl.constexpr,
     FROM_LOGITS: tl.constexpr,
+    RETURN_LOGSUMEXP: tl.constexpr,
     BLOCK: tl.constexpr,
     LSE_BLOCK: tl.constexpr,
 ):
@@ -127,6 +133,8 @@ def _fly_entropy_merge(
         safe_maximum = tl.where(global_maximum == -float("inf"), 0.0, global_maximum)
         total = tl.sum(denominator * tl.exp(maximum - safe_maximum), 0)
         log_normalizer = safe_maximum + tl.log(total)
+        if RETURN_LOGSUMEXP:
+            tl.store(logsumexp_ptr + row, log_normalizer)
 
     keys = tl.where(offsets < num_tiles * TOP_K, _fly_order_key(selected), 0)
     entropy = tl.full((), 0.0, tl.float32)
@@ -146,14 +154,22 @@ def _fly_entropy_merge(
 
 
 def compute_fly_entropy(
-    values: torch.Tensor, entropy_top_k: int, *, from_logits: bool = False
-) -> torch.Tensor:
+    values: torch.Tensor,
+    entropy_top_k: int,
+    *,
+    from_logits: bool = False,
+    return_logsumexp: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Compute top-k terms of FLy's full-distribution entropy in FP32.
 
     The selected probabilities retain their full-vocabulary normalization.
     FP16/BF16/FP32 CUDA inputs with k <= 8 use tiled selection/normalization
     and one small merge. Other inputs retain the upstream Torch path.
     Neither path normalizes only the selected k entries.
+
+    Logit inputs may also return their full-vocabulary log-normalizer. The
+    tiled kernels already compute it for entropy, so the probability gate can
+    reuse it without another vocabulary scan or kernel launch.
     """
     if values.ndim != 2:
         raise ValueError("FLy expects 2-D target probabilities or logits")
@@ -161,6 +177,8 @@ def compute_fly_entropy(
         raise ValueError("FLy requires a non-empty target vocabulary")
     if entropy_top_k <= 0:
         raise ValueError("fly_entropy_top_k must be greater than zero")
+    if return_logsumexp and not from_logits:
+        raise ValueError("FLy logsumexp output requires logits")
     top_k = min(entropy_top_k, values.shape[-1])
     if (
         not values.is_cuda
@@ -168,10 +186,16 @@ def compute_fly_entropy(
         or top_k > 8
         or values.requires_grad
     ):
-        return _compute_fly_entropy_torch(values, top_k, from_logits)
+        output = _compute_fly_entropy_torch(values, top_k, from_logits)
+        if return_logsumexp:
+            return output, values.float().logsumexp(dim=-1)
+        return output
     rows, vocab_size = values.shape
     output = torch.empty(rows, device=values.device, dtype=torch.float32)
+    logsumexp = torch.empty_like(output) if return_logsumexp else None
     if rows == 0:
+        if return_logsumexp:
+            return output, logsumexp
         return output
     block = min(4096, triton.next_power_of_2(vocab_size))
     num_tiles = triton.cdiv(vocab_size, block)
@@ -183,12 +207,14 @@ def compute_fly_entropy(
             values,
             partial,
             output,
+            logsumexp,
             values.stride(0),
             values.stride(1),
             vocab_size,
             num_tiles,
             top_k,
             from_logits,
+            return_logsumexp,
             block,
             num_warps=4,
         )
@@ -196,11 +222,15 @@ def compute_fly_entropy(
             _fly_entropy_merge[(rows,)](
                 partial,
                 output,
+                logsumexp,
                 num_tiles,
                 top_k,
                 from_logits,
+                return_logsumexp,
                 triton.next_power_of_2(num_tiles * top_k),
                 triton.next_power_of_2(num_tiles),
                 num_warps=1,
             )
+    if return_logsumexp:
+        return output, logsumexp
     return output

@@ -51,7 +51,7 @@ def _build_rejection_sample_inputs(
     cu_num_logits = torch.arange(num_trials + 1, dtype=torch.int32, device=device) * (
         K + 1
     )
-    pos = torch.arange(num_logits, dtype=torch.int32, device=device)
+    pos = torch.arange(num_logits, dtype=torch.int64, device=device)
     idx_mapping = torch.arange(num_trials, dtype=torch.int32, device=device)
     expanded_idx_mapping = torch.arange(
         num_trials, dtype=torch.int32, device=device
@@ -83,6 +83,7 @@ def _build_rejection_sample_inputs(
     [
         (0.0, False, 0.0),
         (0.0, True, 0.0),
+        (0.0, True, 0.01),
         (1.0, False, 0.0),
         (1.0, True, 0.0),
         (1.0, True, 0.01),
@@ -150,6 +151,99 @@ def test_fly_requires_entropy_and_native_lookahead(
     else:
         assert sampled[0, 0].item() >= 8
     assert sampled[1:6, 0].min().item() >= 8
+
+
+@pytest.mark.parametrize("vocab_size", [17, 8193, 129280])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_greedy_fly_probability_gate_uses_pre_argmax_confidence(vocab_size, dtype):
+    """Above-floor rescue must remain possible for temperature-zero requests."""
+    k = 5
+    inputs = _build_rejection_sample_inputs(
+        torch.zeros(vocab_size, device="cuda", dtype=dtype),
+        torch.zeros(vocab_size, device="cuda", dtype=dtype),
+        k,
+        temperature=0,
+        num_trials=3,
+    )
+    probabilities = torch.zeros(3, k + 1, vocab_size, device="cuda")
+    for request, probability in enumerate([0.05, 0.005, 0.0]):
+        probabilities[request, 0, 7] = probability
+        probabilities[request, 0, -2:] = (1 - probability) / 2
+    draft_ids = [7, 2, 3, 4, 8]
+    for step, token in enumerate(draft_ids[1:], start=1):
+        probabilities[:, step, token] = 1
+    probabilities[:, -1, 9] = 1
+    # Different shifts and storage strides catch accidental top-k-only
+    # normalization, stale outputs and assumptions about contiguous rows.
+    shifts = torch.arange(3 * (k + 1), device="cuda").view(3, k + 1, 1) * 11
+    storage = torch.empty(3 * (k + 1), vocab_size + 13, device="cuda", dtype=dtype)
+    inputs["target_logits"] = storage[:, :vocab_size]
+    inputs["target_logits"].copy_((probabilities.log() + shifts).flatten(0, 1))
+    inputs["draft_logits"].fill_(-torch.inf)
+    for step, token in enumerate(draft_ids):
+        inputs["draft_logits"][:, step, token] = 0
+    inputs["draft_sampled"].view(3, k + 1)[:, 1:] = torch.tensor(
+        draft_ids, device="cuda"
+    )
+    sampled, counts = rejection_sample(
+        **inputs,
+        num_speculative_steps=k,
+        fly_window_size=2,
+        fly_min_target_probability=0.01,
+    )
+    assert counts.tolist() == [k + 1, 1, 1]
+    assert sampled[0].tolist() == [*draft_ids, 9]
+    assert sampled[1:, 0].min().item() >= vocab_size - 2
+
+
+def test_greedy_probability_gate_replays_updated_logits_in_cuda_graph():
+    k, vocab_size = 5, 17
+    inputs = _build_rejection_sample_inputs(
+        torch.zeros(vocab_size, device="cuda"),
+        torch.zeros(vocab_size, device="cuda"),
+        k,
+        temperature=0,
+        num_trials=1,
+    )
+    probabilities = torch.zeros(k + 1, vocab_size, device="cuda")
+    probabilities[0, 7] = 0.05
+    probabilities[0, -2:] = 0.475
+    ids = [7, 2, 3, 4, 8]
+    for step, token in enumerate(ids[1:], start=1):
+        probabilities[step, token] = 1
+    probabilities[-1, 9] = 1
+    inputs["target_logits"].copy_(probabilities.log())
+    inputs["draft_logits"].fill_(-torch.inf)
+    for step, token in enumerate(ids):
+        inputs["draft_logits"][0, step, token] = 0
+    inputs["draft_sampled"][1:] = torch.tensor(ids, device="cuda")
+
+    def run():
+        return rejection_sample(
+            **inputs,
+            num_speculative_steps=k,
+            fly_window_size=2,
+            fly_min_target_probability=0.01,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        sampled, counts = run()
+    graph.replay()
+    assert counts.item() == k + 1
+    assert sampled[0].tolist() == [*ids, 9]
+    probabilities[0, 7] = 0.005
+    probabilities[0, -2:] = 0.4975
+    inputs["target_logits"].copy_(probabilities.log())
+    graph.replay()
+    assert counts.item() == 1
+    assert sampled[0, 0].item() >= vocab_size - 2
 
 
 @pytest.mark.parametrize("temperature", [0.0, 0.7])

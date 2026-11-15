@@ -36,7 +36,9 @@ class SpeculativeConfig(CommunitySpeculativeConfig):
     )
     """Minimum processed target p(draft) for an initial FLy rescue.
     Zero disables this gate. A positive floor requires probabilistic drafting;
-    native accepts and pending-window confirmations are unaffected."""
+    native accepts and pending-window confirmations are unaffected. Greedy
+    target requests use the unit-temperature softmax of the processed logits,
+    matching the confidence distribution used by FLy's entropy check."""
 
     @model_validator(mode="after")
     def _verify_fly_args(self) -> Self:

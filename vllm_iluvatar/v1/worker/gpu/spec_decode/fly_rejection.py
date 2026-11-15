@@ -88,6 +88,8 @@ def _fly_rejection_kernel(
     local_residual_mass_stride,
     # [num_logits]
     fly_entropy_ptr,
+    # [num_logits], full-vocabulary normalizer from the entropy pass
+    fly_logsumexp_ptr,
     fly_entropy_threshold,
     vocab_num_blocks,
     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
@@ -164,6 +166,14 @@ def _fly_rejection_kernel(
                         other=float("-inf"),
                     ).to(tl.float32)
                     can_defer = is_valid_draft and target_logit > float("-inf")
+                    if FLY_MIN_TARGET_LOGPROB is not None:
+                        # Greedy acceptance remains an argmax comparison. Use
+                        # the same unit-temperature confidence distribution as
+                        # entropy to gate a lossy rescue, before argmax makes
+                        # the target distribution one-hot.
+                        target_logprob = target_logit - tl.load(
+                            fly_logsumexp_ptr + logit_idx
+                        )
             elif USE_BLOCK_VERIFICATION:
                 # Block verification (Sun et al., 2024): https://arxiv.org/abs/2403.10444
                 prefix_joint_ratio = tl.exp(
@@ -259,13 +269,14 @@ def _fly_rejection_kernel(
                         ) and entropy >= fly_entropy_threshold
                         if FLY_MIN_TARGET_LOGPROB is not None:
                             absolute_probability_allowed = (
-                                ~is_greedy
-                                & is_valid_draft
+                                is_valid_draft
                                 & (target_logprob >= FLY_MIN_TARGET_LOGPROB)
                                 & (target_logprob <= 0.0)
-                                & (draft_logprob > -float("inf"))
-                                & (draft_logprob <= 0.0)
                             )
+                            if not is_greedy:
+                                absolute_probability_allowed &= (
+                                    draft_logprob > -float("inf")
+                                ) & (draft_logprob <= 0.0)
                             verifying &= absolute_probability_allowed
                         if verifying:
                             pending_rejection = i
@@ -398,11 +409,19 @@ def rejection_sample(
         vocab_size = min(vocab_size, draft_logits.size(-1))
 
     fly_entropy = None
+    fly_logsumexp = None
     if fly_window_size > 0:
         assert synthetic_conditional_rates is None and not use_block_verification
-        fly_entropy = compute_fly_entropy(
-            target_logits[:, :vocab_size], fly_entropy_top_k, from_logits=True
+        entropy_result = compute_fly_entropy(
+            target_logits[:, :vocab_size],
+            fly_entropy_top_k,
+            from_logits=True,
+            return_logsumexp=fly_min_target_probability > 0,
         )
+        if fly_min_target_probability > 0:
+            fly_entropy, fly_logsumexp = entropy_result
+        else:
+            fly_entropy = entropy_result
 
     # Compute the per-vocab-block logits stats, such as target argmax
     # (for greedy requests), and target max + softmax exponential
@@ -568,6 +587,7 @@ def rejection_sample(
             local_residual_mass,
             local_residual_mass.stride(0) if local_residual_mass is not None else 0,
             fly_entropy,
+            fly_logsumexp,
             fly_entropy_threshold,
             vocab_num_blocks,
             PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,

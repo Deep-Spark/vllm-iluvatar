@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM5Next MTP draft on Iluvatar."""
 
+import copy
+
 import ixformer.inference.functions as ixfops
 import torch
 from torch import nn
@@ -139,3 +141,50 @@ class IluGlm5NextMTP(Glm5NextMTP, SupportsPP):
                 for w in weights
             )
         return super().load_weights(weights)
+
+
+def prepare_draft_head_w8a8(draft: IluGlm5NextMTP) -> None:
+    """Pack private MTP heads after vLLM has finished sharing target weights.
+
+    vLLM aliases the target head *module*, not only its parameter. Copy the
+    module dictionaries before replacing its quantization method and weights.
+    The target head remains BF16 and the existing local argmax/TP reduction
+    route is unchanged. Called once after loading, before graph capture.
+    """
+    from vllm.logger import init_logger
+
+    from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes.ilu_compressed_tensors_w8a8_int8 import (
+        IluW8A8OnlineLinearMethod,
+    )
+
+    class LoadedWeights:
+        def process_weights_after_loading(self, layer):
+            # The original method has already run during model loading.
+            pass
+
+    for layer in draft.model._mtp_layers:
+        original = layer.shared_head.head
+        if isinstance(original.quant_method, IluW8A8OnlineLinearMethod):
+            continue
+        if original.weight.dtype != torch.bfloat16:
+            raise ValueError("Draft-only W8A8 requires a loaded BF16 target head")
+        head = copy.copy(original)
+        head._parameters = original._parameters.copy()
+        head._buffers = original._buffers.copy()
+        head._modules = original._modules.copy()
+        head._non_persistent_buffers_set = original._non_persistent_buffers_set.copy()
+        source_weight = original.weight
+        source_pointer = source_weight.data_ptr()
+        method = IluW8A8OnlineLinearMethod(LoadedWeights())
+        method.process_weights_after_loading(head)
+        head.quant_method = method
+        if (
+            original.weight is not source_weight
+            or original.weight.data_ptr() != source_pointer
+            or original.weight.dtype != torch.bfloat16
+        ):
+            raise RuntimeError("Draft quantization modified the target vocabulary head")
+        layer.shared_head.head = head
+    init_logger(__name__).info(
+        "GLM5Next draft-only W8A8 vocabulary projection ready; target head remains BF16"
+    )

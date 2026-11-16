@@ -185,3 +185,46 @@ def test_gpu_projection_and_graph(m, n, k, rows):
         actual = output.cpu().float()
         assert torch.isfinite(actual).all()
         assert ((actual - reference).norm() / reference.norm()).item() < 0.003
+
+
+@pytest.mark.parametrize("m", [1, 4, 24, 36, 48, 127])
+@torch.inference_mode()
+def test_gpu_split_qkv_gates_exact(m):
+    torch.manual_seed(91)
+    weight = torch.randn(12576, 4096, dtype=torch.bfloat16, device="cuda")
+    layer, _ = make_layer(weight, rows=12288)
+    x = torch.randn(m, 4096, dtype=torch.bfloat16, device="cuda")
+    joined = layer.quant_method.apply(layer, x)
+    layer.quant_method.cat_output = False
+    qkv, gates = layer.quant_method.apply(layer, x)
+    torch.testing.assert_close(qkv, joined[:, :12288], atol=0, rtol=0)
+    torch.testing.assert_close(gates, joined[:, 12288:], atol=0, rtol=0)
+    assert gates.shape == (m, 288)
+
+
+@torch.inference_mode()
+def test_draft_head_keeps_shared_target_unchanged():
+    from types import SimpleNamespace
+
+    from vllm_iluvatar.models.glm5next.mtp import prepare_draft_head_w8a8
+
+    target = nn.Module()
+    target.weight = nn.Parameter(
+        torch.randn(512, 64, dtype=torch.bfloat16, device="cuda")
+    )
+    target.quant_method = OriginalMethod()
+    original = target.weight
+    saved = original.clone()
+    shared = nn.Module()
+    shared.head = target
+    draft = SimpleNamespace(
+        model=SimpleNamespace(_mtp_layers=[SimpleNamespace(shared_head=shared)])
+    )
+    prepare_draft_head_w8a8(draft)
+    assert shared.head is not target
+    assert target.weight is original and target.weight.dtype == torch.bfloat16
+    torch.testing.assert_close(target.weight, saved, atol=0, rtol=0)
+    assert shared.head.weight.dtype == torch.int8
+    packed = shared.head.weight
+    prepare_draft_head_w8a8(draft)
+    assert shared.head.weight is packed

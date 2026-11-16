@@ -7,6 +7,18 @@ import ixformer.inference.functions as ixfops
 import torch
 from ixformer.inference.functions.models import deepseek_v41 as ixf_mhc
 
+from vllm_iluvatar import envs
+
+
+def _decode_splitk(residual: torch.Tensor) -> bool:
+    return (
+        envs.VLLM_ILU_GLM5NEXT_MHC_DECODE_SPLITK
+        and 5 <= residual.shape[0] < 128
+        and residual.shape[1:] == (4, 4096)
+        and residual.dtype == torch.bfloat16
+    )
+
+
 _PRE_V2_WORKSPACES: dict[torch.device, torch.Tensor] = {}
 
 
@@ -50,7 +62,7 @@ def mhc_pre(
     cross-PP stage entry), uses ``ds4_mhc_pre_v2`` with a preallocated workspace.
     """
     residual = residual.contiguous()
-    if sqrsum is not None:
+    if sqrsum is not None and not _decode_splitk(residual):
         post, comb, layer_input, _ = ixf_mhc.mhc_pre_with_sqrsum(
             residual,
             fn,
@@ -159,6 +171,21 @@ def mhc_fused_post_pre(
     tp_group=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused MHC post + next sub-block MHC pre (via explicit sqrsum handoff)."""
+    if _decode_splitk(residual) and not reduce_x:
+        residual = mhc_post(x, residual, post, comb)
+        new_post, new_comb, layer_input = mhc_pre(
+            residual,
+            fn,
+            scale,
+            base,
+            rms_eps,
+            hc_eps,
+            post_mult,
+            sinkhorn_repeat,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )
+        return residual, new_post, new_comb, layer_input
     if reduce_x:
         residual, sqrsum = allreduce_mhc_post_with_sqrsum(
             x, residual, post, comb, group=tp_group

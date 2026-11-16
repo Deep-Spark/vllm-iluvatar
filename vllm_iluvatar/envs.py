@@ -232,6 +232,9 @@ if TYPE_CHECKING:
     VLLM_ILU_GLM_DSA_NATIVE_MQA_LOGITS: bool = False
     VLLM_ILU_INDEXER_KV_DTYPE: str = "bf16"
     VLLM_ILU_GLM5NEXT_MLA_POOL4_DECODE: bool = True
+    VLLM_ILU_GLM5NEXT_MHC_DECODE_SPLITK: bool = False
+    VLLM_ILU_GLM5NEXT_DRAFT_HEAD_W8A8: bool = False
+    VLLM_ILU_SKIP_CUDAGRAPH_MEMORY_PROFILE: bool = False
     VLLM_ILU_GLM5NEXT_MLA_PROJ_W8A8: bool = False
     VLLM_ILU_GLM5NEXT_KDA_PROJ_W8A8: bool = False
     VLLM_ILU_GLM5NEXT_GATHER_BEFORE_GATE: bool = True
@@ -369,6 +372,15 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Opt in to supported NN MoE W4A8 GEMV perf kernels; layout is separate.
     "VLLM_ILU_MOE_W4A8_GEMV_PERF": _bool_reader("VLLM_ILU_MOE_W4A8_GEMV_PERF", "0"),
     # Quantize BF16 GLM5Next projections after loading; KDA gates stay BF16.
+    "VLLM_ILU_GLM5NEXT_MHC_DECODE_SPLITK": _bool_reader(
+        "VLLM_ILU_GLM5NEXT_MHC_DECODE_SPLITK", "0"
+    ),
+    "VLLM_ILU_GLM5NEXT_DRAFT_HEAD_W8A8": _bool_reader(
+        "VLLM_ILU_GLM5NEXT_DRAFT_HEAD_W8A8", "0"
+    ),
+    "VLLM_ILU_SKIP_CUDAGRAPH_MEMORY_PROFILE": _bool_reader(
+        "VLLM_ILU_SKIP_CUDAGRAPH_MEMORY_PROFILE", "0"
+    ),
     "VLLM_ILU_GLM5NEXT_MLA_PROJ_W8A8": _bool_reader(
         "VLLM_ILU_GLM5NEXT_MLA_PROJ_W8A8", "0"
     ),

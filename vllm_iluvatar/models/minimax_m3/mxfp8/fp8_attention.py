@@ -14,9 +14,12 @@ from typing import ClassVar
 
 import ixformer.inference.functions as ixf
 import torch
-from ixformer.inference.backend_registry import registry
 from ixformer.inference.functions.models.minimax_m3.data_quant.fp8.fp8_attention_output_quant import (
     fp8_attention_output_quant as _ixf_fp8_attention_output_quant,
+)
+from ixformer.inference.functions.models.minimax_m3.dense.fp8.minimax_m3_dense_paged_fwd import (
+    minimax_m3_dense_paged_fwd,
+    minimax_m3_dense_paged_fwd_workspace_size,
 )
 from ixformer.inference.functions.models.minimax_m3.fused_kv.fp8.qknorm_rope_fp8_kv_insert import (
     qknorm_rope_fp8_kv_insert,
@@ -27,7 +30,10 @@ from ixformer.inference.functions.models.minimax_m3.indexer.float.index_topk imp
 from ixformer.inference.functions.models.minimax_m3.indexer.fp8.fp8_index_score import (
     fp8_index_score,
 )
-from ixformer.inference.functions.models.minimax_m3.sparse.fp8.fp8_dsa import fp8_dsa
+from ixformer.inference.functions.models.minimax_m3.sparse.fp8.fp8_dsa import (
+    minimax_m3_fp8_dsa,
+    minimax_m3_fp8_dsa_workspace_size,
+)
 from torch import nn
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -59,6 +65,68 @@ from vllm_iluvatar.ilu_util.arch import is_ivcore30
 from vllm_iluvatar.models.minimax_m3.mxfp8.attention import MiniMAXGemmaRMSNorm
 
 logger = init_logger(__name__)
+
+
+def _ixattn_dense_local_heads(num_heads: int, num_kv_heads: int) -> bool:
+    """ixattn dense paged accepts local (64, 4), (32, 2) and (16, 1).
+
+    MiniMax-M3 has 64 query heads and 4 KV heads. TP8 replicates the KV
+    heads, so the local pair is (8, 1). That pair is a valid DSA shape and
+    is not a valid ixattn dense shape.
+    """
+    return num_kv_heads > 0 and num_heads == 16 * num_kv_heads and num_heads <= 64
+
+
+def _dense_ixattn_workspace_bytes(
+    total_q,
+    max_seqs,
+    num_q_heads,
+    num_kv_heads,
+    block_size,
+    max_blocks,
+    backend=None,
+) -> int:
+    """Host upper bound covering prefill and single-token decode.
+
+    Decode scratch is ``T * Hq * splits`` and the automatic split count falls
+    as the batch grows, so the max-batch query is not the byte maximum.
+    Table width saturates the split cap at 16 pages; a wider real table does
+    not ask for more scratch than that query.
+    """
+    width = max(int(max_blocks), 16)
+    tokens = int(total_q)
+    seqs = int(max_seqs)
+    if tokens <= 0 or seqs <= 0 or num_q_heads <= 0 or num_kv_heads <= 0:
+        return 0
+    _, prefill = minimax_m3_dense_paged_fwd_workspace_size(
+        tokens,
+        seqs,
+        int(num_q_heads),
+        int(num_kv_heads),
+        int(block_size),
+        width,
+        0,
+        True,
+        backend=backend,
+    )
+    nbytes = int(prefill)
+    for batch in range(1, min(tokens, seqs) + 1):
+        _, decode = minimax_m3_dense_paged_fwd_workspace_size(
+            batch,
+            batch,
+            int(num_q_heads),
+            int(num_kv_heads),
+            int(block_size),
+            width,
+            1,
+            True,
+            backend=backend,
+        )
+        decode = int(decode)
+        if decode == 0:
+            break
+        nbytes = max(nbytes, decode)
+    return nbytes
 
 
 def _resolve_fp8_indexer_dtype(attention_config):
@@ -119,7 +187,11 @@ class FP8MetadataBuilder(AttentionMetadataBuilder[FP8Metadata]):
             c.query_start_loc_cpu[1 : c.num_reqs + 1]
             - c.query_start_loc_cpu[: c.num_reqs]
         )
-        if lengths.numel() and not bool((lengths == self.capture_query_width).all()):
+        # CUDA-graph padding repeats the last query start, so unused
+        # requests have width 0. Only real queries must share the
+        # configured verification width.
+        active = lengths[lengths > 0]
+        if active.numel() and not bool((active == self.capture_query_width).all()):
             raise ValueError(
                 "MiniMax FP8 Graph requires uniform configured verification width"
             )
@@ -331,14 +403,7 @@ class MiniMaxM3FP8Attention(nn.Module, AttentionLayerBase):
             raise NotImplementedError(
                 "MiniMax FP8 native producer/projection requires C6144/D128"
             )
-        if sparse and "ixformer_native" not in registry.available_backends("fp8_dsa"):
-            raise RuntimeError("MiniMax FP8 DSA requires its matching native build")
-        if not sparse:
-            for name in ("paged_attention_prefill_fp8", "paged_attention_decode_fp8"):
-                if "ixformer_native" not in registry.available_backends(name):
-                    raise RuntimeError(
-                        "MiniMax FP8 Full attention requires the generic native paged-attention build"
-                    )
+        self.max_num_seqs = int(vc.scheduler_config.max_num_seqs)
         tp = get_tensor_model_parallel_world_size()
         if tp not in (1, 2, 4, 8):
             raise NotImplementedError("MiniMax FP8 TP whitelist is 1/2/4/8")
@@ -346,6 +411,36 @@ class MiniMaxM3FP8Attention(nn.Module, AttentionLayerBase):
         self.num_kv_heads = max(1, config.num_key_value_heads // tp)
         self.head_dim, self.hidden_size = 128, 6144
         self.layer_id, self.sparse, self.layer_name = layer_id, sparse, prefix + ".attn"
+        if self.sparse:
+            logger.info_once(
+                "M3 FP8 DSA enabled op=%s heads=%s kv_heads=%s group=%s",
+                "ixattn.fmha_minimax_m3_dsa_fp8",
+                self.num_heads,
+                self.num_kv_heads,
+                self.num_heads // self.num_kv_heads,
+            )
+        else:
+            # TP1/2/4 keep the ixattn dense kernel. TP8's local heads are
+            # (8, 1), which that kernel rejects, so those ranks stay on the
+            # generic FP8 paged kernels this path used before.
+            self.use_ixattn_dense = _ixattn_dense_local_heads(
+                self.num_heads, self.num_kv_heads
+            )
+            if self.use_ixattn_dense:
+                logger.info_once(
+                    "M3 FP8 dense paged enabled op=%s heads=%s kv_heads=%s group=%s",
+                    "minimax_m3_dense_paged_fwd",
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.num_heads // self.num_kv_heads,
+                )
+            else:
+                logger.info_once(
+                    "M3 FP8 dense paged uses generic paged attention "
+                    "heads=%s kv_heads=%s",
+                    self.num_heads,
+                    self.num_kv_heads,
+                )
         self.kv_cache_dtype = cache_config.cache_dtype
         self.state = get_state(vc, create=True)
         # DSpark verification schedules the bonus plus speculative tokens.
@@ -413,6 +508,9 @@ class MiniMaxM3FP8Attention(nn.Module, AttentionLayerBase):
         )
         self.calculate_kv_scales = False
         self.kv_cache = torch.tensor([])
+        # None keeps the operator default: ixattn when it is built, native DSA
+        # scratch when it is not, and torch only if a caller sets this field.
+        self.attn_backend = None
         self.index_cache = None
         if sparse:
             cfg = config.sparse_attention_config
@@ -487,28 +585,35 @@ class MiniMaxM3FP8Attention(nn.Module, AttentionLayerBase):
         self.q8 = make("q8", (T, H, 128), torch.float8_e4m3fn)
         self.qs = make("qs", (T, H), torch.float32)
         self.attn_out = make("attn_out", (T, H, 128), torch.bfloat16)
-        # Flat scratch is shared by sequential layers in this PP worker. Kernels
-        # pack current [S,Tsegment,H,130] into its prefix, never retain Tmax stride.
+        # Same backend the forward call passes, so ixattn uint8 bytes and
+        # native FP32 elements cannot be mixed. Dense has no native plan;
+        # its default scratch is the ixattn uint8 query.
+        batch = max(int(self.max_num_seqs), 1 if T else 0)
         if self.sparse:
-            # Retain the standalone 64-split scratch bound. Prefill's 32/16-split
-            # plans are restricted to T*HK<=16/32. The padded-layout S4
-            # fallback has floor(Tsegment/Nrequests)<=128, hence at most
-            # 129*Nrequests-1 tokens; Nrequests is scheduler-bounded.
-            prefill_tokens = min(
-                T, 129 * self.max_decode_tokens - 1 if HK >= 2 else 128 // HK
+            numel, dtype = minimax_m3_fp8_dsa_workspace_size(
+                int(T), batch, int(H), int(HK), backend=self.attn_backend
             )
-            workspace_units = max(
-                64 * self.max_decode_tokens,
-                4 * prefill_tokens,
-                32 * min(T, 16 // HK),
-                16 * min(T, 32 // HK),
+        elif self._dense_uses_ixattn():
+            numel = _dense_ixattn_workspace_bytes(
+                T,
+                batch,
+                H,
+                HK,
+                self.B,
+                self.score_capacity,
+                backend=self.attn_backend,
             )
+            dtype = torch.uint8
         else:
-            workspace_units = 64 * max(self.max_decode_tokens, min(T, 1023 // HK))
-        self.attn_workspace = make(
+            workspace_units = 64 * max(
+                self.max_decode_tokens, min(T, 1023 // HK)
+            )
+            numel = workspace_units * H * 130
+            dtype = torch.float32
+        self.attn_workspace = self.state.buffer(
             kind + "_attn_workspace",
-            (workspace_units * H * 130,),
-            torch.float32,
+            (int(numel),),
+            dtype,
         )
         self.y8 = make("y8", (T, H * 128), torch.float8_e4m3fn)
         self.ys = make("ys", (T,), torch.float32)
@@ -518,6 +623,10 @@ class MiniMaxM3FP8Attention(nn.Module, AttentionLayerBase):
             self.iq = make("iq", (T, HK, 128), torch.float8_e4m3fn)
             self.scores = make("scores", (T, HK, M), torch.bfloat16)
             self.top = make("top", (T, HK, 16), torch.int32)
+
+    def _dense_uses_ixattn(self) -> bool:
+        # Tests that build the layer without __init__ keep the ixattn stub.
+        return bool(getattr(self, "use_ixattn_dense", True))
 
     def _project(self, layer, A, As, out):
         if layer.weight_scale.dim() != 1 or layer.weight.dtype != torch.float8_e4m3fn:
@@ -631,7 +740,7 @@ class MiniMaxM3FP8Attention(nn.Module, AttentionLayerBase):
                 continue
             first, last = segment.request_start, segment.request_end
             if self.sparse:
-                fp8_dsa(
+                minimax_m3_fp8_dsa(
                     q=self.q8[begin:end],
                     kv_cache=self.kv_cache,
                     topk_idx=self.top[begin:end],
@@ -643,9 +752,29 @@ class MiniMaxM3FP8Attention(nn.Module, AttentionLayerBase):
                     k_scale=self._k_scale,
                     v_scale=self._v_scale,
                     out=self.attn_out[begin:end],
-                    backend="ixformer_native",
                     phase="decode" if segment.decode_query_len else "prefill",
                     workspace=self.attn_workspace,
+                    backend=self.attn_backend,
+                )
+            elif self._dense_uses_ixattn():
+                if segment.decode_query_len not in (0, 1):
+                    raise RuntimeError(
+                        "M3 ixattn dense paged accepts decode_query_len 0 or 1 only"
+                    )
+                minimax_m3_dense_paged_fwd(
+                    q=self.q8[begin:end],
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    block_table=main.block_table[first:last],
+                    cu_seqlens_q=None if segment.decode_query_len else segment.cu,
+                    seq_lens=main.seq[first:last],
+                    q_scale=self.qs[begin:end],
+                    k_scale=self._k_scale,
+                    v_scale=self._v_scale,
+                    out=self.attn_out[begin:end],
+                    decode_query_len=segment.decode_query_len,
+                    workspace=self.attn_workspace,
+                    backend=self.attn_backend,
                 )
             else:
                 dense_args = dict(

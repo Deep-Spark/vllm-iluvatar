@@ -202,13 +202,16 @@ class MiniMaxM3MoE(nn.Module):
         else:
             self.e_score_correction_bias = None
 
-        # Router weights are stored in fp32; GateLinear upcasts the bf16
-        # activations and computes the gate in fp32 (fp32 router logits).
+        # Router weights are stored in bf16; GateLinear runs the bf16×bf16→fp32
+        # GEMM (gemm_bf16_bf16_fp32) so router logits stay fp32. The fp32
+        # fast path in IluGateLinear (router_gemm_bf16_fp32_fp32 /
+        # mixed_type_linear) is guarded on weight.dtype == fp32 and is
+        # therefore not reached.
         self.gate = GateLinear(
             config.hidden_size,
             config.num_local_experts,
             bias=False,
-            params_dtype=torch.float32,
+            params_dtype=torch.bfloat16,
             out_dtype=torch.float32,
             prefix=f"{prefix}.gate",
         )
@@ -255,7 +258,8 @@ class MiniMaxM3MoE(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts); GateLinear casts to fp32.
+        # router_logits: (num_tokens, n_experts). The bf16 gate weight
+        # produces fp32 logits via gemm_bf16_bf16_fp32.
         router_logits, _ = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits

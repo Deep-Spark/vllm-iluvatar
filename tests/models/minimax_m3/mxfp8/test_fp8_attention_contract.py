@@ -62,6 +62,8 @@ def test_capture_width_and_replay_metadata_keep_stable_storage(n_spec):
         seq[:real_reqs] = 64 + width
         common._num_computed_tokens_cache = None
         replay = builder.build(0, common)
+        captured_pad = builder.build_for_cudagraph_capture(common)
+        assert captured_pad.dense_valid_tokens == real_reqs * width
         assert replay.prefix.data_ptr() == ptr
         assert replay.cu.data_ptr() == captured.cu.data_ptr()
         assert replay.dense_valid_tokens == real_reqs * width
@@ -286,6 +288,7 @@ def test_forward_separates_model_and_attention_padding(
     layer.num_heads = layer.num_kv_heads = 1
     layer.score_capacity = 16
     layer.attn_workspace = torch.empty(64 * T * 130)
+    layer.attn_backend = None
     layer._k_scale = layer._v_scale = 1.0
     norm = SimpleNamespace(weight=torch.ones(128), variance_epsilon=1e-6)
     layer.q_norm = layer.k_norm = norm
@@ -380,6 +383,7 @@ def test_forward_separates_model_and_attention_padding(
     dense_calls = []
 
     def reader(**kw):
+        assert kw.get("backend") is None
         if partitioned:
             dense_calls.append(kw["q"].shape[0])
             assert kw["q"].shape[0] == kw["out"].shape[0] == kw["q_scale"].shape[0]
@@ -390,9 +394,11 @@ def test_forward_separates_model_and_attention_padding(
                 assert kw["prefix_lens"].tolist() == [0]
                 assert kw["workspace"] is layer.attn_workspace
                 assert "num_splits" not in kw
-            elif "decode_query_len" in kw:
-                assert kw["decode_query_len"] == 1 and kw["seq_lens"].tolist() == [1]
+            elif kw["decode_query_len"] == 1:
+                assert kw["cu_seqlens_q"] is None
+                assert kw["seq_lens"].tolist() == [1]
             else:
+                assert kw["decode_query_len"] == 0
                 assert kw["cu_seqlens_q"].tolist() == [0, 3]
                 assert kw["seq_lens"].tolist() == [3]
             if not sparse:
@@ -431,9 +437,19 @@ def test_forward_separates_model_and_attention_padding(
 
     monkeypatch.setattr(fp8, "fp8_index_score", score)
     monkeypatch.setattr(fp8, "index_topk", topk)
-    monkeypatch.setattr(fp8, "fp8_dsa", reader)
-    monkeypatch.setattr(fp8.ixf, "paged_attention_prefill_fp8", reader)
-    monkeypatch.setattr(fp8.ixf, "paged_attention_decode_fp8", reader)
+
+    def reject_paged(*args, **kwargs):
+        raise AssertionError("mxfp8 attention called generic paged_attention_*_fp8")
+
+    def reject_other(*args, **kwargs):
+        raise AssertionError("mxfp8 attention called the other attention op")
+
+    monkeypatch.setattr(fp8, "minimax_m3_fp8_dsa", reader if sparse else reject_other)
+    monkeypatch.setattr(
+        fp8, "minimax_m3_dense_paged_fwd", reject_other if sparse else reader
+    )
+    monkeypatch.setattr(fp8.ixf, "paged_attention_prefill_fp8", reject_paged)
+    monkeypatch.setattr(fp8.ixf, "paged_attention_decode_fp8", reject_paged)
     monkeypatch.setattr(fp8, "_ixf_fp8_attention_output_quant", output_quant)
     hidden = torch.ones(T, 6144)
     hidden[n:].fill_(float("nan"))
@@ -444,6 +460,295 @@ def test_forward_separates_model_and_attention_padding(
     assert torch.all(out[:n] == 3) and torch.all(out[n:] == 0)
     if partitioned:
         assert dense_calls == [1, 3, 1]
+
+
+def test_dense_ixattn_branch_calls_wrapper_not_paged(monkeypatch):
+    """Dense mxfp8 calls the M3 ixattn op and not generic paged FP8.
+
+    Hq=1 is illegal for fmha_minimax_m3_dense_paged_fwd. This test stubs the
+    wrapper and does not enter the kernel.
+    """
+    T, n = 8, 5
+    layer = fp8.MiniMaxM3FP8Attention.__new__(fp8.MiniMaxM3FP8Attention)
+    torch.nn.Module.__init__(layer)
+    layer.max_tokens = T
+    layer.layer_name = "main"
+    layer.sparse = False
+    layer.num_heads = layer.num_kv_heads = 1
+    layer.attn_workspace = torch.empty(16, dtype=torch.uint8)
+    layer.attn_backend = None
+    layer._k_scale = layer._v_scale = 1.0
+    norm = SimpleNamespace(weight=torch.ones(128), variance_epsilon=1e-6)
+    layer.q_norm = layer.k_norm = norm
+    layer.rotary_emb = SimpleNamespace(cos_sin_cache=torch.ones(16, 128))
+    layer.kv_cache = torch.zeros(2, 1, 128, 256)
+    layer.qkv_proj, layer.o_proj = "qkv", "o"
+    for name, shape in {
+        "x8": (T, 6144),
+        "xs": (T,),
+        "packed": (T, 384),
+        "q8": (T, 1, 128),
+        "qs": (T, 1),
+        "attn_out": (T, 1, 128),
+        "y8": (T, 128),
+        "ys": (T,),
+        "result": (T, 6144),
+    }.items():
+        setattr(layer, name, torch.ones(shape))
+    metadata = fp8.FP8Metadata(
+        n,
+        torch.tensor([0, 1, 4, 5], dtype=torch.int32),
+        torch.tensor([1, 3, 1], dtype=torch.int32),
+        torch.tensor([0, 0, 0], dtype=torch.int32),
+        torch.tensor([[1], [0], [1]], dtype=torch.int32),
+        5,
+        5,
+        dense_segments=(
+            fp8.DenseQuerySegment(
+                0, 1, 0, 1, 1, torch.tensor([0, 1], dtype=torch.int32)
+            ),
+            fp8.DenseQuerySegment(
+                1, 2, 1, 4, 0, torch.tensor([0, 3], dtype=torch.int32)
+            ),
+            fp8.DenseQuerySegment(
+                2, 3, 4, 5, 1, torch.tensor([0, 1], dtype=torch.int32)
+            ),
+        ),
+        dense_valid_tokens=5,
+    )
+    slots = torch.arange(n, dtype=torch.int64)
+    monkeypatch.setattr(
+        fp8,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={"main": metadata},
+            slot_mapping={"main": slots},
+        ),
+    )
+
+    def quant(**kw):
+        kw["fp8_output"].fill_(1)
+        kw["output_scales"].fill_(1)
+
+    def project(which, A, As, out):
+        out.fill_(3)
+        return out
+
+    def producer(**kw):
+        kw["q_out"].fill_(4)
+        kw["q_scale_out"].fill_(1)
+
+    seen = []
+
+    def dense(**kw):
+        seen.append(kw)
+        # Omitted backend lets the op apply ixattn, or native when ixattn
+        # is absent. It must not force ixattn or silently request torch.
+        assert kw.get("backend") is None
+        assert kw["workspace"] is layer.attn_workspace
+        assert kw["workspace"].dtype == torch.uint8
+        kw["out"].fill_(2)
+
+    def reject_paged(**kw):
+        raise AssertionError("ixattn dense branch called paged_attention_*_fp8")
+
+    monkeypatch.setattr(fp8.ixf, "fp8_per_token_dynamic_scaled", quant)
+    monkeypatch.setattr(layer, "_project", project)
+    monkeypatch.setattr(fp8, "qknorm_rope_fp8_kv_insert", producer)
+    monkeypatch.setattr(fp8, "minimax_m3_dense_paged_fwd", dense)
+    monkeypatch.setattr(fp8.ixf, "paged_attention_prefill_fp8", reject_paged)
+    monkeypatch.setattr(fp8.ixf, "paged_attention_decode_fp8", reject_paged)
+    monkeypatch.setattr(
+        fp8,
+        "_ixf_fp8_attention_output_quant",
+        lambda **kw: (kw["out_fp8"].fill_(2), kw["out_scale"].fill_(1)),
+    )
+    layer(torch.arange(T, dtype=torch.int64), torch.ones(T, 6144))
+    assert [kw["q"].shape[0] for kw in seen] == [1, 3, 1]
+    assert seen[0]["decode_query_len"] == 1 and seen[0]["cu_seqlens_q"] is None
+    assert seen[1]["decode_query_len"] == 0
+    assert seen[1]["cu_seqlens_q"].tolist() == [0, 3]
+    assert seen[2]["decode_query_len"] == 1 and seen[2]["cu_seqlens_q"] is None
+
+
+def test_tp8_dense_local_heads_use_generic_paged(monkeypatch):
+    """64 query heads and 4 KV heads become (8, 1) at TP8.
+
+    That pair is valid for DSA and is not a valid ixattn dense shape, so the
+    dense layer keeps the generic FP8 paged kernels.
+    """
+    assert fp8._ixattn_dense_local_heads(64, 4)
+    assert fp8._ixattn_dense_local_heads(32, 2)
+    assert fp8._ixattn_dense_local_heads(16, 1)
+    assert not fp8._ixattn_dense_local_heads(8, 1)
+
+    T, n = 4, 2
+    layer = fp8.MiniMaxM3FP8Attention.__new__(fp8.MiniMaxM3FP8Attention)
+    torch.nn.Module.__init__(layer)
+    layer.max_tokens = T
+    layer.layer_name = "main"
+    layer.sparse = False
+    layer.num_heads, layer.num_kv_heads = 8, 1
+    layer.use_ixattn_dense = False
+    layer.attn_workspace = torch.empty(8, dtype=torch.float32)
+    layer.attn_backend = None
+    layer._k_scale = layer._v_scale = 1.0
+    norm = SimpleNamespace(weight=torch.ones(128), variance_epsilon=1e-6)
+    layer.q_norm = layer.k_norm = norm
+    layer.rotary_emb = SimpleNamespace(cos_sin_cache=torch.ones(16, 128))
+    layer.kv_cache = torch.zeros(2, 1, 128, 256)
+    layer.qkv_proj, layer.o_proj = "qkv", "o"
+    for name, shape in {
+        "x8": (T, 6144),
+        "xs": (T,),
+        "packed": (T, 384),
+        "q8": (T, 8, 128),
+        "qs": (T, 8),
+        "attn_out": (T, 8, 128),
+        "y8": (T, 8 * 128),
+        "ys": (T,),
+        "result": (T, 6144),
+    }.items():
+        setattr(layer, name, torch.ones(shape))
+    metadata = fp8.FP8Metadata(
+        n,
+        torch.tensor([0, 2], dtype=torch.int32),
+        torch.tensor([2], dtype=torch.int32),
+        torch.tensor([0], dtype=torch.int32),
+        torch.tensor([[0]], dtype=torch.int32),
+        n,
+        n,
+    )
+    monkeypatch.setattr(
+        fp8,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={"main": metadata},
+            slot_mapping={"main": torch.arange(n, dtype=torch.int64)},
+        ),
+    )
+    seen = []
+
+    def quant(**kw):
+        kw["fp8_output"].fill_(1)
+        kw["output_scales"].fill_(1)
+
+    def project(which, A, As, out):
+        out.fill_(3)
+        return out
+
+    def producer(**kw):
+        kw["q_out"].fill_(4)
+        kw["q_scale_out"].fill_(1)
+
+    def reject_ixattn(**kw):
+        raise AssertionError("TP8 dense called minimax_m3_dense_paged_fwd")
+
+    def paged(**kw):
+        seen.append(kw)
+        kw["out"].fill_(2)
+
+    monkeypatch.setattr(fp8.ixf, "fp8_per_token_dynamic_scaled", quant)
+    monkeypatch.setattr(layer, "_project", project)
+    monkeypatch.setattr(fp8, "qknorm_rope_fp8_kv_insert", producer)
+    monkeypatch.setattr(fp8, "minimax_m3_dense_paged_fwd", reject_ixattn)
+    monkeypatch.setattr(fp8.ixf, "paged_attention_prefill_fp8", paged)
+    monkeypatch.setattr(fp8.ixf, "paged_attention_decode_fp8", paged)
+    monkeypatch.setattr(
+        fp8,
+        "_ixf_fp8_attention_output_quant",
+        lambda **kw: (kw["out_fp8"].fill_(2), kw["out_scale"].fill_(1)),
+    )
+    layer(torch.arange(T, dtype=torch.int64), torch.ones(T, 6144))
+    assert len(seen) == 1
+    assert seen[0]["backend"] == "ixformer_native"
+    assert seen[0]["cu_seqlens_q"].tolist() == [0, 2]
+
+
+def test_workspace_allocation_uses_the_same_unforced_backend(monkeypatch):
+    """Init scratch and forward both pass backend=None into the ixformer API."""
+    seen = []
+
+    def dsa_size(*args, **kwargs):
+        seen.append(("dsa", kwargs.get("backend")))
+        return 12, torch.float32
+
+    def dense_size(*args, **kwargs):
+        seen.append(("dense", kwargs.get("backend")))
+        return 1, 32
+
+    monkeypatch.setattr(fp8, "minimax_m3_fp8_dsa_workspace_size", dsa_size)
+    monkeypatch.setattr(fp8, "minimax_m3_dense_paged_fwd_workspace_size", dense_size)
+
+    class State:
+        def buffer(self, name, shape, dtype):
+            return torch.empty(shape, dtype=dtype)
+
+    def allocate(sparse):
+        layer = fp8.MiniMaxM3FP8Attention.__new__(fp8.MiniMaxM3FP8Attention)
+        layer.state = State()
+        layer.max_tokens = 4
+        layer.max_num_seqs = 2
+        layer.num_heads = 8
+        layer.num_kv_heads = 1
+        layer.sparse = sparse
+        layer.B = 128
+        layer.score_capacity = 4
+        layer.attn_backend = None
+        fp8.MiniMaxM3FP8Attention._allocate_buffers(layer)
+        return layer
+
+    sparse = allocate(True)
+    assert sparse.attn_workspace.dtype is torch.float32
+    assert sparse.attn_workspace.numel() == 12
+    dense = allocate(False)
+    assert dense.attn_workspace.dtype is torch.uint8
+    assert dense.attn_workspace.numel() == 32
+    assert seen and {item[1] for item in seen} == {None}
+
+
+def test_explicit_native_and_ixattn_stay_reachable():
+    """Default selection is never the torch reference; explicit names still resolve."""
+    import ixformer.inference.functions.models.minimax_m3.dense.fp8.minimax_m3_dense_paged_fwd as dense
+    import ixformer.inference.functions.models.minimax_m3.sparse.fp8.fp8_dsa as dsa
+    from ixformer.inference.backend_registry import registry
+
+    assert registry._require(dsa._OP).default_backend == "ixattn"
+    assert registry.reference_backend(dsa._OP) == "torch"
+    assert registry._require(dense._OP).default_backend == "ixattn"
+    assert registry.reference_backend(dense._OP) == "torch"
+    assert "torch" not in registry.available_backends(dense._OP)
+    try:
+        selected = dsa._select_backend(None)
+    except RuntimeError:
+        selected = None
+    assert selected != "torch"
+    if selected == "ixformer_native":
+        count, dtype = dsa.minimax_m3_fp8_dsa_workspace_size(2, 1, 8, 1)
+        assert dtype is torch.float32 and count == 64 * 2 * 8 * 130
+    if "ixformer_native" in registry.available_backends(dsa._OP):
+        assert dsa._select_backend("ixformer_native") == "ixformer_native"
+        native_count, native_dtype = dsa.minimax_m3_fp8_dsa_workspace_size(
+            2, 1, 8, 1, backend="ixformer_native"
+        )
+        assert native_dtype is torch.float32
+        assert native_count == 64 * 2 * 8 * 130
+    if "ixattn" in registry.available_backends(dsa._OP):
+        assert dsa._select_backend("ixattn") == "ixattn"
+        count, dtype = dsa.minimax_m3_fp8_dsa_workspace_size(
+            2, 1, 8, 1, backend="ixattn"
+        )
+        assert dtype is torch.uint8
+        if selected == "ixattn":
+            default_count, default_dtype = dsa.minimax_m3_fp8_dsa_workspace_size(
+                2, 1, 8, 1
+            )
+            assert (default_count, default_dtype) == (count, dtype)
+    assert dsa._select_backend("torch") == "torch"
+    assert dsa.minimax_m3_fp8_dsa_workspace_size(2, 1, 8, 1, backend="torch") == (
+        0,
+        torch.float32,
+    )
 
 
 @pytest.mark.parametrize("dtype", ["auto", "fp8", "bf16", "mxfp4", "nvfp4"])

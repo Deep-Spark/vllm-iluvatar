@@ -535,9 +535,36 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
             x_zp = None
         else:
             out_dtype = x.dtype
-            x_q, x_s, x_zp = ops.scaled_int8_quant(
-                x.contiguous(), i_s, i_zp, symmetric=symmetric
+            # MR GEMM input tiles can fetch beyond a partial row tile. Own the
+            # complete tile at quantization time, keeping logical M unchanged.
+            # This also covers flattened batch dimensions used by draft heads.
+            rows = x.numel() // x.shape[-1]
+            reserve_row_tile = (
+                self.arch == "ivcore11"
+                and x.ndim in (2, 3)
+                and rows > 0
+                and rows % 64 != 0
+                and x.shape[-1] == self.gemm_info.pad_k
+                and symmetric
+                and i_s is None
+                and i_zp is None
+                and self._get_perf_func(self.gemm_info.n, self.gemm_info.k, x.shape[0])
+                is w8a8_gemm
             )
+            if reserve_row_tile:
+                padded_rows = (rows + 63) // 64 * 64
+                x_q = torch.empty(
+                    (padded_rows, x.shape[-1]), device=x.device, dtype=torch.int8
+                )[:rows].view(x.shape)
+                x_s = torch.empty(
+                    (padded_rows, 1), device=x.device, dtype=torch.float32
+                )[:rows]
+                ixf_ops.dynamic_scaled_int8_quant(x_q, x.contiguous(), x_s)
+                x_zp = None
+            else:
+                x_q, x_s, x_zp = ops.scaled_int8_quant(
+                    x.contiguous(), i_s, i_zp, symmetric=symmetric
+                )
 
         if x_zp is not None:
             # Currently, static is always per-tensor and dynamic is per-token

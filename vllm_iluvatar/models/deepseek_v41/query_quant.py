@@ -12,6 +12,7 @@ import ixformer.inference.functions as ixfops
 import torch
 from torch import nn
 
+from vllm_iluvatar.ilu_util.arch import IVCORE11, cuda_arch
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes.ilu_compressed_tensors_w8a8_int8 import (
     IluCompressedTensorsW8A8Int8,
 )
@@ -61,11 +62,26 @@ def fused_query_norm(
     q, k, q_weight, k_weight, eps
 ) -> tuple[QueryActivation, torch.Tensor]:
     """Normalize Q/K once and retain a shared per-token INT8 query activation."""
+    quantized_q = q_scales = None
+    rows = q.shape[0]
+    if cuda_arch() == IVCORE11 and rows % 64:
+        # Projection consumers may issue a complete SME row tile. Keep that
+        # tile in the producer's allocation without changing logical M or
+        # adding a quantization/copy kernel for either query consumer.
+        physical_rows = (rows + 63) // 64 * 64
+        quantized_q = torch.empty(
+            (physical_rows, q.shape[1]), device=q.device, dtype=torch.int8
+        )[:rows]
+        q_scales = torch.empty(
+            (physical_rows, 1), device=q.device, dtype=torch.float32
+        )[:rows]
     normalized_q, normalized_k, quantized, scales = ixfops.rms_norm_qk_dynamic_int8(
         q,
         k,
         q_weight,
         k_weight,
         eps,
+        quantized_q=quantized_q,
+        q_scales=q_scales,
     )
     return (quantized, scales, normalized_q.dtype), normalized_k

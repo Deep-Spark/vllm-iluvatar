@@ -40,17 +40,15 @@ class InputStoragePolicyTests(unittest.TestCase):
             )
         )
 
-    def test_decode_seq4_enables_without_launcher_flag(self):
+    def test_decode_seq4_uses_producer_storage_without_copied_padding(self):
         with patch.dict(os.environ, {}, clear=True):
-            self.assertTrue(self.configure("kv_consumer", 4))
-        self.assertTrue(self.config.IXFORMER_W8A8_GEMM_PAD_INPUT_ROWS)
+            self.assertFalse(self.configure("kv_consumer", 4))
+        self.assertFalse(self.config.IXFORMER_W8A8_GEMM_PAD_INPUT_ROWS)
 
     def test_other_roles_and_sequence_limits_clear_inherited_enable(self):
         with patch.dict(os.environ, {"IXFORMER_W8A8_GEMM_PAD_INPUT_ROWS": "1"}):
             for role in (None, "kv_producer", "kv_consumer", "kv_both"):
                 for seqs in (1, 2, 3, 4, 5, 8, 32):
-                    if role == "kv_consumer" and seqs == 4:
-                        continue
                     with self.subTest(role=role, max_num_seqs=seqs):
                         self.config.IXFORMER_W8A8_GEMM_PAD_INPUT_ROWS = True
                         self.assertFalse(self.configure(role, seqs))
@@ -58,16 +56,16 @@ class InputStoragePolicyTests(unittest.TestCase):
 
     def test_decode_seq4_ignores_inherited_disable(self):
         with patch.dict(os.environ, {"IXFORMER_W8A8_GEMM_PAD_INPUT_ROWS": "0"}):
-            self.assertTrue(self.configure("kv_consumer", 4))
-        self.assertTrue(self.config.IXFORMER_W8A8_GEMM_PAD_INPUT_ROWS)
+            self.assertFalse(self.configure("kv_consumer", 4))
+        self.assertFalse(self.config.IXFORMER_W8A8_GEMM_PAD_INPUT_ROWS)
 
     def test_reconfiguration_does_not_keep_previous_model_policy(self):
         for role, seqs, expected in (
-            ("kv_consumer", 4, True),
+            ("kv_consumer", 4, False),
             ("kv_producer", 4, False),
             ("kv_consumer", 3, False),
             (None, 4, False),
-            ("kv_consumer", 4, True),
+            ("kv_consumer", 4, False),
         ):
             self.assertEqual(self.configure(role, seqs), expected)
             self.assertEqual(self.config.IXFORMER_W8A8_GEMM_PAD_INPUT_ROWS, expected)

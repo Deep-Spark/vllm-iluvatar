@@ -318,7 +318,8 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
 
         pad_w8a8_input_rows = configure_w8a8_input_rows(vllm_config)
         logger.info(
-            "V4.1 W8A8 GEMM input tile padding: %s (max_num_seqs=%d)",
+            "V4.1 W8A8 GEMM producer-owned row tiles; copied padding: %s "
+            "(max_num_seqs=%d)",
             pad_w8a8_input_rows,
             vllm_config.scheduler_config.max_num_seqs,
         )

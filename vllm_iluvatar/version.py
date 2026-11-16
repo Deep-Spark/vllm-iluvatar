@@ -36,13 +36,18 @@ __version__ = _resolve_version()
 
 
 try:
-    from ._git_id import __git_id__
+    from . import _git_id
 except ImportError:
     __git_id__ = "unknown"
+    __git_dirty__ = None
+else:
+    __git_id__ = _git_id.__git_id__
+    __git_dirty__ = getattr(_git_id, "__git_dirty__", None)
 
 
 def format_identity() -> str:
-    """Release version plus baked git id, for logs and collect-env."""
+    """Release version and build provenance used by serve and collect-env."""
     if __git_id__ and __git_id__ != "unknown":
-        return f"{__version__} {__git_id__}"
+        suffix = " (dirty)" if __git_dirty__ else ""
+        return f"{__version__} {__git_id__}{suffix}"
     return str(__version__)

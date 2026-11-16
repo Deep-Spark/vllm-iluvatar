@@ -63,8 +63,9 @@ def _load_version() -> str:
 
 
 def write_git_id() -> None:
-    """Bake `[branch] <sha>` into vllm_iluvatar/_git_id.py for the installed wheel."""
+    """Record the source commit and working tree state in the wheel."""
     git_id = "unknown"
+    git_dirty = None
     if (ROOT_DIR / ".git").exists():
         try:
             git = ["git", "-c", f"safe.directory={ROOT_DIR}", "-C", str(ROOT_DIR)]
@@ -77,12 +78,17 @@ def write_git_id() -> None:
                 text=True,
             ).strip()
             git_id = f"[{branch}] {sha}"
+            status = subprocess.check_output(
+                git + ["status", "--porcelain=v1"], text=True
+            )
+            git_dirty = bool(status.strip())
         except (OSError, subprocess.CalledProcessError):
             pass
     (ROOT_DIR / "vllm_iluvatar" / "_git_id.py").write_text(
-        f'__git_id__ = "{git_id}"\n', encoding="utf-8"
+        f"__git_id__ = {git_id!r}\n__git_dirty__ = {git_dirty!r}\n",
+        encoding="utf-8",
     )
-    logging.info("Wrote vllm_iluvatar/_git_id.py: %s", git_id)
+    logging.info("Wrote vllm_iluvatar/_git_id.py: %s, dirty=%s", git_id, git_dirty)
 
 
 def get_requirements() -> list[str]:

@@ -94,21 +94,21 @@ def test_registry_does_not_retain_layer_weights(fusion):
     assert fusion.state_for(w1, w2) is None
 
 
-@pytest.mark.parametrize("tp,ep", [(3, 16), (1, 8), (1, 32)])
+@pytest.mark.parametrize("tp,ep", [(3, 16), (8, 16), (1, 8), (1, 32)])
 def test_unsupported_parallelism_fails_before_conversion(fusion, tp, ep):
     fusion.envs.VLLM_ILU_MOE_IXMM_FUSION = True
     with patch.dict(
         sys.modules,
         {"vllm.distributed": NS(get_tensor_model_parallel_world_size=lambda: tp)},
     ):
-        with pytest.raises(RuntimeError, match="TP1/2 EP16"):
+        with pytest.raises(RuntimeError, match="target EP16"):
             fusion.prepare(
                 NS(_ixmm_layer_name="model.layers.21.mlp"),
                 NS(moe_config=NS(ep_size=ep)),
             )
 
 
-@pytest.mark.parametrize("tp", [1, 2])
+@pytest.mark.parametrize("tp", [1, 2, 4])
 def test_supported_parallelism_still_checks_weight_format(fusion, tp):
     fusion.envs.VLLM_ILU_MOE_IXMM_FUSION = True
     with patch.dict(
@@ -141,3 +141,34 @@ def test_fusion_flag_uses_registered_vllm_env(monkeypatch):
             for value, expected in (("0", False), ("1", True)):
                 monkeypatch.setenv("VLLM_ILU_MOE_IXMM_FUSION", value)
                 assert mod.enabled() is expected
+
+
+def test_local_decode_writes_output_for_combine(fusion, monkeypatch):
+    activations = torch.zeros((24, 2, 5120), dtype=torch.int8)
+    output = torch.zeros_like(activations, dtype=torch.bfloat16)
+    counts = torch.tensor([2] + [0] * 23, dtype=torch.int32)
+    scales = torch.ones(24, 2)
+    state = NS(local_output=True, scale1=None, scale2=None)
+    layout = torch.empty(24, 3, dtype=torch.int32)
+    workspace = torch.empty(0)
+
+    def run_local(x, w1, w2, sx, sw1, sw2, expert_layout, scratch, out):
+        assert x.shape == out.shape == (48, 5120)
+        assert expert_layout is layout and scratch is workspace
+        assert sx.data_ptr() == scales.data_ptr()
+        out[:2].fill_(7)
+
+    ops = NS(moe_ixmm_local=run_local, moe_ixmm_layout=lambda c, dst: None)
+    monkeypatch.setattr(fusion, "state_for", lambda w1, w2: state)
+    monkeypatch.setattr(fusion, "scratch", lambda *args, **kw: (workspace, layout))
+    monkeypatch.setattr(fusion, "kernels", lambda: ops)
+    assert fusion.decode(None, output, activations, torch.empty(0), None, scales,
+                         NS(expert_num_tokens=counts))
+    assert torch.all(output[0] == 7)
+
+@pytest.mark.parametrize("tp,direct,local", [
+    (1, "1", False), (2, "1", False), (2, "0", True), (4, "0", True), (4, "1", True),
+])
+def test_selects_compatible_output(fusion, monkeypatch, tp, direct, local):
+    monkeypatch.setenv("IXFORMER_NVSM_W2_DIRECT_COMBINE", direct)
+    assert fusion._uses_local_output(tp) is local

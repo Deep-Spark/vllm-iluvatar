@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in DSV4.1 target FFN fusion for TP1/2 EP16, decode and eager replay."""
+"""Opt-in DSV4.1 target FFN fusion for EP16 with TP1, TP2 or TP4, decode and eager replay."""
 
+import os
 import re
 import weakref
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ class FusedWeights:
     w2: object
     scale1: torch.Tensor
     scale2: torch.Tensor
+    local_output: bool = False
 
 
 def state_for(w1, w2):
@@ -47,6 +49,13 @@ def state_for(w1, w2):
     return state
 
 
+def _uses_local_output(tp_size):
+    # TP2 can write into NVSM directly when the deployment opts into it.
+    return tp_size == 4 or (
+        tp_size == 2 and os.environ.get("IXFORMER_NVSM_W2_DIRECT_COMBINE", "0") == "0"
+    )
+
+
 @torch.no_grad()
 def prepare(method, layer):
     if not enabled():
@@ -57,10 +66,10 @@ def prepare(method, layer):
         return  # Draft and other models retain their original weight layout.
     from vllm.distributed import get_tensor_model_parallel_world_size
 
+    tp_size = get_tensor_model_parallel_world_size()
     require(
-        layer.moe_config.ep_size == 16
-        and get_tensor_model_parallel_world_size() in (1, 2),
-        "ixmm fused MoE requires target TP1/2 EP16; enable only on D",
+        layer.moe_config.ep_size == 16 and tp_size in (1, 2, 4),
+        "ixmm fused MoE requires target EP16 and TP1, TP2 or TP4; enable only on D",
     )
     require(
         method.gemm_format == "NN" and method.group_size == -1 and method.version == 2,
@@ -101,6 +110,7 @@ def prepare(method, layer):
         weakref.ref(layer.w2_weight),
         (layer.w13_weight_scale.reshape(24, 4608)[:, perm] * 18).contiguous(),
         (layer.w2_weight_scale.reshape(24, 5120) * 18).contiguous(),
+        local_output=_uses_local_output(tp_size),
     )
     for kind, weight in ((1, layer.w13_weight), (2, layer.w2_weight)):
         converted = torch.empty_like(weight)
@@ -128,13 +138,31 @@ def decode(experts, output, hidden_states, w1, w2, scales, metadata):
     state = state_for(w1, w2)
     if state is None:
         return False
-    from ixformer.distributed import _w2_direct
 
     require(
         metadata is not None and scales is not None,
         "fused decode requires NVSM counts and scales",
     )
     counts = metadata.expert_num_tokens
+    if state.local_output:
+        require(
+            counts.numel() == 24 and hidden_states.is_contiguous()
+            and hidden_states.dtype == torch.int8 and hidden_states.shape[-1] == 5120,
+            "invalid local expert activation layout",
+        )
+        activations = hidden_states.view(-1, 5120)
+        rows = activations.size(0)
+        require(0 < rows <= 16384 and rows % 24 == 0 and scales.numel() == rows,
+                "invalid local expert slot capacity")
+        ws, layout = scratch(w1.device, rows, decode=True)
+        ops = kernels()
+        ops.moe_ixmm_layout(counts, layout)
+        ops.moe_ixmm_local(activations, w1, w2, scales.reshape(-1), state.scale1,
+                           state.scale2, layout, ws, output.view_as(activations))
+        return True
+
+    from ixformer.distributed import _w2_direct
+
     indices, peers, offset, slots, stride = _w2_direct.fused_descriptor(counts)
     require(
         0 < slots <= 24 * 6

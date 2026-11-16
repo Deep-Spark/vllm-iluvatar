@@ -1,3 +1,5 @@
+from inspect import signature
+
 import pytest
 import torch
 from torch import nn
@@ -5,6 +7,32 @@ from torch import nn
 from vllm_iluvatar.models.deepseek_v41 import engram as engram_mod
 from vllm_iluvatar.models.deepseek_v41 import mhc
 from vllm_iluvatar.models.deepseek_v41.model import IluDeepseekV41DecoderLayer
+
+
+@pytest.mark.parametrize("abi", ["keyword", "legacy", "opaque"])
+def test_mhc_pre_resolves_fuse_reductions_once(abi, monkeypatch):
+    inspected = []
+
+    def legacy(x):
+        return x, None
+
+    def modern(x, *, fuse_reductions):
+        return x, fuse_reductions
+
+    def op_signature(op):
+        inspected.append(op)
+        if abi == "opaque":
+            raise ValueError("signature unavailable")
+        return signature(op)
+
+    monkeypatch.setattr(mhc, "signature", op_signature)
+    op = modern if abi == "keyword" else legacy
+    call = mhc._bind_mhc_pre(op)
+    assert (call is op) == (abi == "keyword")
+    for enabled in (True, False):
+        expected = enabled if abi == "keyword" else None
+        assert call("input", fuse_reductions=enabled) == ("input", expected)
+    assert inspected == [op]
 
 
 @pytest.mark.parametrize("layer_id", [1, 14])
@@ -50,6 +78,7 @@ def test_engram_apply_sqrsum_restarts_streaming_pre(layer_id, monkeypatch):
 
     layer.engram = Engram()
     layer.attn = lambda positions, h, unused: h
+    layer.attn.fused_wqa_wkv = nn.Linear(8, 8, bias=False)
     layer.ffn = lambda h, input_ids: h
     calls = []
 

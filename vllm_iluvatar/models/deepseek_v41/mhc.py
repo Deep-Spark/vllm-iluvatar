@@ -3,11 +3,36 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from inspect import Parameter, signature
+
 import torch
 from ixformer.inference.functions.models import deepseek_v41 as ixfops
 from vllm import envs
 
 from vllm_iluvatar.ilu_util.arch import is_ivcore30
+
+
+def _bind_mhc_pre(op: Callable) -> Callable:
+    """Adapt older ixformer pre-ops once, before the model's forward path."""
+    try:
+        parameters = signature(op).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    flag = parameters.get("fuse_reductions")
+    if (flag is not None and flag.kind != Parameter.POSITIONAL_ONLY) or any(
+        param.kind == Parameter.VAR_KEYWORD for param in parameters.values()
+    ):
+        return op
+
+    def legacy_pre(*args, fuse_reductions: bool):
+        return op(*args)
+
+    return legacy_pre
+
+
+_mhc_pre_with_pre_mix = _bind_mhc_pre(ixfops.mhc_pre_with_pre_mix)
+_mhc_pre_with_sqrsum = _bind_mhc_pre(ixfops.mhc_pre_with_sqrsum)
 
 
 def _want_fused_fp8(
@@ -91,7 +116,7 @@ def hc_pre_mixes(
     h_scale: torch.Tensor | None = None
     if sqrsum is None:
         assert layer_norm_weight is None
-        post, comb, layer_input, pre_out = ixfops.mhc_pre_with_pre_mix(
+        post, comb, layer_input, pre_out = _mhc_pre_with_pre_mix(
             x.contiguous(),
             fn,
             hc_scale,
@@ -133,7 +158,7 @@ def hc_pre_mixes(
             layer_norm_eps,
         )
     else:
-        post, comb, layer_input, pre_out = ixfops.mhc_pre_with_sqrsum(
+        post, comb, layer_input, pre_out = _mhc_pre_with_sqrsum(
             x.contiguous(),
             fn,
             hc_scale,

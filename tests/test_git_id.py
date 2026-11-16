@@ -3,6 +3,7 @@
 import re
 from types import SimpleNamespace
 
+from vllm_iluvatar import version
 from vllm_iluvatar.ilu_patch.general_patches.patch_version_print import (
     _wrap_collect_env,
     _wrap_log_version_and_model,
@@ -24,6 +25,13 @@ def test_format_identity_includes_version():
     assert ident.startswith(__version__)
     if __git_id__ != "unknown":
         assert __git_id__ in ident
+
+
+def test_format_identity_marks_dirty_build(monkeypatch):
+    git_id = "[branch] " + "a" * 40
+    monkeypatch.setattr(version, "__git_id__", git_id)
+    monkeypatch.setattr(version, "__git_dirty__", True)
+    assert format_identity() == f"{__version__} {git_id} (dirty)"
 
 
 def test_wrap_collect_env_appends_plugin_identity():

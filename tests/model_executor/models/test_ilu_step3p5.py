@@ -138,6 +138,7 @@ def test_moe_forward_keeps_w8a8_tuple_on_runner_path():
     )
     torch.testing.assert_close(output, origin)
 
+
 def test_mtp_load_weights_skips_unowned_quant_metadata():
     source = inspect.getsource(ilu_step3p5_mtp.IluStep3p5MTP.load_weights)
     assert "_drop_unowned_quant_metadata" in source

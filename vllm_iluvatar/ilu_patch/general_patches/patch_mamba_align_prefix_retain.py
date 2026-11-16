@@ -27,7 +27,7 @@ import inspect
 from vllm_iluvatar.ilu_patch import general_patch as p
 
 # Community baseline snapshot (v0.31.0 / 341bf7d4d1) — no ILU delta.
-REMOVE_BLOCKS_IN_RANGE = '''\
+REMOVE_BLOCKS_IN_RANGE = """\
     def _remove_blocks_in_range(
         self, request_id: str, first_block: int, last_block: int
     ) -> None:
@@ -48,7 +48,7 @@ REMOVE_BLOCKS_IN_RANGE = '''\
         if freed:
             self.block_pool.free_blocks(freed)
         self._num_retired_blocks[request_id] = last_block
-'''
+"""
 
 
 def register() -> None:

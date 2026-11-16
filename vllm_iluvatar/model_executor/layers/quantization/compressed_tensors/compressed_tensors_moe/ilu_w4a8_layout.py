@@ -51,9 +51,9 @@ def repack_w4a8_tn_to_nn(
         # In TN each 16-byte group has K[0:16] in low nibbles and
         # K[16:32] in high nibbles. Keep the raw 4-bit payloads unsigned.
         chunks = packed_tn[expert].view(tn_n, tn_k // 32, 16)
-        unpacked = torch.cat(
-            (chunks & 0x0F, (chunks >> 4) & 0x0F), dim=-1
-        ).reshape(tn_n, tn_k)
+        unpacked = torch.cat((chunks & 0x0F, (chunks >> 4) & 0x0F), dim=-1).reshape(
+            tn_n, tn_k
+        )
 
         # NN begins with K-major storage, then swizzles each 32x32 tile.
         k_major = torch.zeros((nn_k, nn_n), dtype=torch.int8, device=packed_tn.device)
@@ -68,9 +68,7 @@ def repack_w4a8_tn_to_nn(
         )
         pairs = swizzled.view(nn_k, nn_n // 32, 32)
         packed_nn[expert].copy_(
-            ((pairs[..., :16] & 0x0F) | (pairs[..., 16:] << 4)).reshape(
-                nn_k, nn_n // 2
-            )
+            ((pairs[..., :16] & 0x0F) | (pairs[..., 16:] << 4)).reshape(nn_k, nn_n // 2)
         )
 
     return packed_nn

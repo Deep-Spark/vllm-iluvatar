@@ -4,7 +4,6 @@
 from types import SimpleNamespace
 
 import torch
-
 from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
 from vllm.v1.core.kv_cache_utils import (
     _get_packed_kv_cache_groups,
@@ -137,9 +136,7 @@ def test_flash_fp8_group_table_uses_community_block_outermost_layout():
         config, groups, available_memory=bytes_per_block * 7
     )
     assert cache.num_blocks == 7
-    assert {tensor.size for tensor in cache.kv_cache_tensors} == {
-        bytes_per_block * 7
-    }
+    assert {tensor.size for tensor in cache.kv_cache_tensors} == {bytes_per_block * 7}
     assert {tensor.block_stride for tensor in cache.kv_cache_tensors} == {
         bytes_per_block
     }

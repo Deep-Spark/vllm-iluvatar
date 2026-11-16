@@ -157,8 +157,7 @@ class IluNixlWorkerMixin:
             )
         if self.fp8_wire_staging_enabled and self.use_host_buffer:
             raise ValueError(
-                "IluNixl FP8 DS MLA wire staging is incompatible with "
-                "use_host_buffer"
+                "IluNixl FP8 DS MLA wire staging is incompatible with use_host_buffer"
             )
         if (
             self.fp8_wire_staging_enabled
@@ -217,9 +216,7 @@ class IluNixlWorkerMixin:
         """
         return bool(
             self.transfer_topo is not None
-            and getattr(
-                self.transfer_topo, "virtually_split_kv_in_blocks", False
-            )
+            and getattr(self.transfer_topo, "virtually_split_kv_in_blocks", False)
             and not self._has_mamba
         )
 
@@ -344,9 +341,8 @@ class IluNixlWorkerMixin:
         for actual_region_id in range(len(self.block_len_per_layer)):
             mapping[actual_region_id] = [next_region_id]
             next_region_id += 1
-            if (
-                self._should_split_virtual_region()
-                and not self._is_region_replicated(actual_region_id)
+            if self._should_split_virtual_region() and not self._is_region_replicated(
+                actual_region_id
             ):
                 mapping[actual_region_id].append(next_region_id)
                 next_region_id += 1
@@ -457,9 +453,8 @@ class IluNixlWorkerMixin:
                     return block_len // 2
                 return block_len
             next_region_id += 1
-            if (
-                self._should_split_virtual_region()
-                and not self._is_region_replicated(actual_region_id)
+            if self._should_split_virtual_region() and not self._is_region_replicated(
+                actual_region_id
             ):
                 if region_id == next_region_id:
                     return block_len // 2
@@ -558,8 +553,7 @@ class IluNixlWorkerMixin:
             )
         if slot_offset < 0:
             raise ValueError(
-                "Packed virtual slot offset must be non-negative: "
-                f"offset={slot_offset}"
+                f"Packed virtual slot offset must be non-negative: offset={slot_offset}"
             )
         # Block-outer: slot_offset is an intra-block window offset, so the page
         # must fit in [slot_offset, block_stride).
@@ -844,9 +838,7 @@ class IluNixlWorkerMixin:
         self.device_kv_caches = kv_caches
         self._set_handshake_metadata(memory_type=memory_type)
 
-    def _uses_kv_first_fa_layout(
-        self, kv_caches: dict[str, torch.Tensor]
-    ) -> bool:
+    def _uses_kv_first_fa_layout(self, kv_caches: dict[str, torch.Tensor]) -> bool:
         if self.use_mla or self._has_mamba or not kv_caches:
             return False
         registered = [
@@ -861,9 +853,7 @@ class IluNixlWorkerMixin:
             for cache in registered
         )
 
-    def _register_kv_first_fa_caches(
-        self, kv_caches: dict[str, torch.Tensor]
-    ) -> None:
+    def _register_kv_first_fa_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """Register legacy ``[K/V, blocks, heads, block, dim]`` caches."""
         if self.use_host_buffer:
             raise ValueError(
@@ -1319,9 +1309,9 @@ class IluNixlWorkerMixin:
             getattr(self, "_group_spec_types", None)
             or getattr(self, "region_ids_by_group", ())
         )
-        route_buckets: dict[
-            tuple[int, int], list[tuple[int, int, tuple[int, str]]]
-        ] = defaultdict(list)
+        route_buckets: dict[tuple[int, int], list[tuple[int, int, tuple[int, str]]]] = (
+            defaultdict(list)
+        )
         for key in common_keys:
             local_region_id, local_group_idx = local_by_key[key]
             remote_region_id, remote_group_idx = remote_by_key[key]
@@ -1339,9 +1329,7 @@ class IluNixlWorkerMixin:
         selected_ssm_remote_ids: list[int] = []
 
         group_spec_types = getattr(self, "_group_spec_types", None)
-        for (local_group_idx, remote_group_idx), pairs in sorted(
-            route_buckets.items()
-        ):
+        for (local_group_idx, remote_group_idx), pairs in sorted(route_buckets.items()):
             if group_spec_types is not None and local_group_idx < len(group_spec_types):
                 is_ssm = _is_ssm_spec(group_spec_types[local_group_idx])
             else:
@@ -1354,8 +1342,7 @@ class IluNixlWorkerMixin:
 
             for local_region_id, remote_region_id, key in pairs:
                 identity_str = (
-                    f"{key[0]}:{key[1]}:group{local_group_idx}->"
-                    f"group{remote_group_idx}"
+                    f"{key[0]}:{key[1]}:group{local_group_idx}->group{remote_group_idx}"
                 )
                 prior_remote = local_to_remote.get(local_region_id)
                 prior_local = remote_to_local.get(remote_region_id)
@@ -1396,8 +1383,7 @@ class IluNixlWorkerMixin:
                         prior_fa_remote is not None
                         and prior_fa_remote != remote_region_id
                     ) or (
-                        prior_fa_local is not None
-                        and prior_fa_local != local_region_id
+                        prior_fa_local is not None and prior_fa_local != local_region_id
                     ):
                         conflicts.append(
                             {
@@ -1446,8 +1432,7 @@ class IluNixlWorkerMixin:
             else list(range(num_local_regions))
         )
         local_ssm_slot_map = {
-            int(reg_id): slot_idx
-            for slot_idx, reg_id in enumerate(local_ssm_regions)
+            int(reg_id): slot_idx for slot_idx, reg_id in enumerate(local_ssm_regions)
         }
         remote_ssm_slot_map = {
             int(reg_id): slot_idx
@@ -1545,10 +1530,7 @@ class IluNixlWorkerMixin:
             if self.use_host_buffer
             else self.kv_cache_layout
         )
-        if (
-            not self.use_mla
-            and nixl_agent_meta.kv_cache_layout != local_layout
-        ):
+        if not self.use_mla and nixl_agent_meta.kv_cache_layout != local_layout:
             raise RuntimeError(
                 "Heterogeneous PP expects the same non-MLA KV cache layout: "
                 f"local={local_layout}, remote={nixl_agent_meta.kv_cache_layout}"
@@ -1874,9 +1856,7 @@ class IluNixlWorkerMixin:
         local_offset = self.tp_rank % max(tp_ratio, 1)
         conv_offsets = self._conv_decomp.remote_conv_offsets(local_offset, tp_ratio)
         ssm_read_size = (
-            self._mamba_ssm_size[1]
-            if tp_ratio >= 1
-            else nixl_agent_meta.ssm_sizes[1]
+            self._mamba_ssm_size[1] if tp_ratio >= 1 else nixl_agent_meta.ssm_sizes[1]
         )
         remote_ratio = nixl_agent_meta.physical_blocks_per_logical_kv_block
         num_blocks = nixl_agent_meta.num_blocks // remote_ratio
@@ -1901,9 +1881,7 @@ class IluNixlWorkerMixin:
                 + local_offset * ssm_read_size
             )
             parts.append(
-                self._stack_descs(
-                    ssm_addrs, ssm_read_size, nixl_agent_meta.device_id
-                )
+                self._stack_descs(ssm_addrs, ssm_read_size, nixl_agent_meta.device_id)
             )
         return np.concatenate(parts) if parts else np.empty((0, 3), dtype=np.uint64)
 
@@ -2037,9 +2015,7 @@ class IluNixlWorkerMixin:
                     self._build_pp_mamba_remote(
                         nixl_agent_meta,
                         ssm_remote_ids,
-                        self.transfer_topo.get_engine_info(
-                            engine_id
-                        ).remote_tp_size,
+                        self.transfer_topo.get_engine_info(engine_id).remote_tp_size,
                     ),
                 ]
             )
@@ -2118,8 +2094,7 @@ class IluNixlWorkerMixin:
             )
         engine_id = nixl_agent_meta.engine_id
         is_hetero_pp_topology = remote_pp_size != self.pp_world_size or (
-            bool(nixl_agent_meta.pp_split)
-            and nixl_agent_meta.pp_split != self.pp_split
+            bool(nixl_agent_meta.pp_split) and nixl_agent_meta.pp_split != self.pp_split
         )
         remote_key = (
             remote_pp_rank * remote_tp_size + remote_tp_rank
@@ -2609,10 +2584,9 @@ class IluNixlWorkerMixin:
         if engine_routes:
             for routes in engine_routes.values():
                 for route in routes:
-                    if (
-                        route.local_group_idx >= len(local_block_ids)
-                        or route.remote_group_idx >= len(remote_block_ids)
-                    ):
+                    if route.local_group_idx >= len(
+                        local_block_ids
+                    ) or route.remote_group_idx >= len(remote_block_ids):
                         raise RuntimeError(
                             "Cannot align producer and consumer KV cache groups "
                             "for Mamba HMA route: "
@@ -2666,15 +2640,13 @@ class IluNixlWorkerMixin:
                     remote_rank=remote_key,
                     local_block_ids=[
                         list(local_block_ids[local_group_id])
-                        if remote_tp_rank
-                        in plan.source_ranks_per_group[local_group_id]
+                        if remote_tp_rank in plan.source_ranks_per_group[local_group_id]
                         else []
                         for local_group_id in transfer_group_ids
                     ],
                     remote_block_ids=[
                         list(remote_block_ids[remote_group_id])
-                        if remote_tp_rank
-                        in plan.source_ranks_per_group[local_group_id]
+                        if remote_tp_rank in plan.source_ranks_per_group[local_group_id]
                         else []
                         for remote_group_id, local_group_id in enumerate(
                             transfer_group_ids

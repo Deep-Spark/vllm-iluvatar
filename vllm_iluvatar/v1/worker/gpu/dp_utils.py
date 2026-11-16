@@ -129,6 +129,7 @@ def make_capture(original: Callable[..., None]) -> Callable[..., None]:
 
     return capture
 
+
 _ORIGINAL_DISPATCH: Callable[..., Any] | None = None
 
 

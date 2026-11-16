@@ -78,7 +78,9 @@ def compressed_kv_profiling(
 
                 index_layout = plan_indexer_scales(config)
                 if index_layout.placements:
-                    index_state = IndexerScaleState(index_layout, runner.device, context)
+                    index_state = IndexerScaleState(
+                        index_layout, runner.device, context
+                    )
                     owners.append(index_state)
                 if fmt is not None:
                     state = CompressedKVState(
@@ -104,9 +106,13 @@ def compressed_kv_profiling(
                 if state is not None:
                     state.bind_zeroer(runner.kv_block_zeroer, extra_planes)
                 elif index_state is not None:
-                    from vllm_iluvatar.models.deepseek_v41.indexer_kv import extend_kv_zeroer
+                    from vllm_iluvatar.models.deepseek_v41.indexer_kv import (
+                        extend_kv_zeroer,
+                    )
 
-                    extend_kv_zeroer(runner.kv_block_zeroer, config.num_blocks, extra_planes)
+                    extend_kv_zeroer(
+                        runner.kv_block_zeroer, config.num_blocks, extra_planes
+                    )
             return result
 
         initialize._ilu_compressed_kv_profiling = True

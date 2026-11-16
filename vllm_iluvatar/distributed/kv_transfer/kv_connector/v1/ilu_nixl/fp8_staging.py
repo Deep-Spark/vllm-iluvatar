@@ -27,7 +27,6 @@ from .fp8_layout import (
     get_fp8_wire_scratch_blocks,
     page_states,
 )
-from .metadata import format_kv_group_page_log
 
 logger = init_logger("vllm." + __name__)
 

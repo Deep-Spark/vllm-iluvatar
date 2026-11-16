@@ -25,7 +25,6 @@ row (448 E4M3 NoPE bytes, 64 BF16 RoPE values, 7 UE8M0 scales), or a plain
 from __future__ import annotations
 
 import torch
-
 from ixformer.inference.functions.models import deepseek_v41 as ixfops
 
 

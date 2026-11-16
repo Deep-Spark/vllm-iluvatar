@@ -132,8 +132,10 @@ class DPVocabProjection:
             torch.mm(gathered, shard.t(), out=partial)
         dist.all_to_all_single(received, partial, group=self.group)
         local = received.view(self.group_size, capacity, self.shard_rows)
-        return local[:, : hidden.shape[0], :].transpose(0, 1).reshape(
-            hidden.shape[0], self.vocab_size
+        return (
+            local[:, : hidden.shape[0], :]
+            .transpose(0, 1)
+            .reshape(hidden.shape[0], self.vocab_size)
         )
 
 

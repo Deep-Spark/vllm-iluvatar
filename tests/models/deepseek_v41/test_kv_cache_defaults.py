@@ -38,9 +38,7 @@ def test_cache_choice(requested, expected, dtype):
         (True, True, 2, False),
     ],
 )
-def test_replay_matches_community_capability_constraints(
-    enabled, v2, pcp, expected
-):
+def test_replay_matches_community_capability_constraints(enabled, v2, pcp, expected):
     config = CacheConfig()
     config.swa_bounded_replay = enabled
     vllm_config = SimpleNamespace(
@@ -57,7 +55,9 @@ def test_retains_community_model_state_contract():
         IluDeepseekV41ForCausalLM,
     )
 
-    assert issubclass(IluDeepseekV41ForCausalLM.get_model_state_cls(), DeepseekV41ModelState)
+    assert issubclass(
+        IluDeepseekV41ForCausalLM.get_model_state_cls(), DeepseekV41ModelState
+    )
 
 
 @pytest.mark.parametrize("enabled", [False, True])

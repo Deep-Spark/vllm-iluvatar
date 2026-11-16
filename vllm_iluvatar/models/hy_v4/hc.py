@@ -79,9 +79,7 @@ def _ihc_ops() -> object | None:
     return ixf_ops
 
 
-def _native_shape(
-    x: torch.Tensor, *, hc_mult: int, hidden_dim: int
-) -> bool:
+def _native_shape(x: torch.Tensor, *, hc_mult: int, hidden_dim: int) -> bool:
     if hc_mult != _NATIVE_HC_MULT or hidden_dim not in _NATIVE_HIDDEN_DIMS:
         logger.warning_once(
             "HYV4 iHC is running the eager fallback: fused iHC supports "
@@ -104,16 +102,14 @@ def _native_shape(
     )
 
 
-def _native_projection_shape(
-    x: torch.Tensor, *, hc_mult: int, hidden_dim: int
-) -> bool:
+def _native_projection_shape(x: torch.Tensor, *, hc_mult: int, hidden_dim: int) -> bool:
     from vllm_iluvatar.ilu_util.arch import is_ivcore11
 
     # Must match ixformer's kIhcPreSmallBatch. Above this bound the native
     # GEMM rounds its weight and output to BF16, unlike the eager fallback.
-    return _native_shape(
-        x, hc_mult=hc_mult, hidden_dim=hidden_dim
-    ) and (not is_ivcore11() or x.shape[0] <= 64)
+    return _native_shape(x, hc_mult=hc_mult, hidden_dim=hidden_dim) and (
+        not is_ivcore11() or x.shape[0] <= 64
+    )
 
 
 def _native_projection(module: nn.Module, weight: torch.Tensor) -> torch.Tensor:

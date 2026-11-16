@@ -305,7 +305,9 @@ class IluMiniMaxDSparkForCausalLM(Qwen3DSparkForCausalLM):
         has_scale_params = any(
             name.endswith(".weight_scale") for name in module_param_names
         )
-        proj_suffixes = (".weight", ".weight_scale") if has_scale_params else (".weight",)
+        proj_suffixes = (
+            (".weight", ".weight_scale") if has_scale_params else (".weight",)
+        )
         for i in range(self.config.num_hidden_layers):
             stem = f"layers.{i}."
             expected.update(

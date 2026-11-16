@@ -297,9 +297,8 @@ def _supported_vllm_config(**overrides) -> SimpleNamespace:
             dtype=torch.bfloat16,
             hf_text_config=SimpleNamespace(mamba_ssm_dtype="float32"),
         ),
-        "use_v2_model_runner": getattr(
-            envs, "VLLM_USE_V2_MODEL_RUNNER", None
-        ) is not False,
+        "use_v2_model_runner": getattr(envs, "VLLM_USE_V2_MODEL_RUNNER", None)
+        is not False,
     }
     config.update(overrides)
     return SimpleNamespace(**config)

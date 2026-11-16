@@ -77,9 +77,7 @@ def test_minimax_qk_var_compile_mark_dynamic_matches_eager() -> None:
     compiled = torch.compile(fn, fullgraph=True, dynamic=True)
 
     def _run(num_tokens: int) -> None:
-        qkv = torch.randn(
-            num_tokens, q_size + 2 * kv_size, dtype=dtype, device="cuda"
-        )
+        qkv = torch.randn(num_tokens, q_size + 2 * kv_size, dtype=dtype, device="cuda")
         torch._dynamo.mark_dynamic(qkv, 0)
         eager = fn(qkv)
         out = compiled(qkv)

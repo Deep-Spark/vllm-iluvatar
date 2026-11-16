@@ -1,4 +1,5 @@
 """Keep the DS4 FP8 FFN connected to the opt-in decode LL implementation."""
+
 from types import SimpleNamespace
 
 import pytest
@@ -55,7 +56,9 @@ def test_initialization_runs_after_quant_config_init(monkeypatch):
     monkeypatch.setattr(ep.IluFusedMoEEP, "_dp_ep_ll_preinit_done", False)
     ffn = ep.IluFusedMoEEP()
     events = []
-    routed = SimpleNamespace(_ensure_moe_quant_config_init=lambda: events.append("quant"))
+    routed = SimpleNamespace(
+        _ensure_moe_quant_config_init=lambda: events.append("quant")
+    )
     ffn.experts = SimpleNamespace(
         routed_experts=routed,
         moe_config=SimpleNamespace(

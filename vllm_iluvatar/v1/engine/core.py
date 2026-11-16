@@ -252,9 +252,8 @@ def _local_prefill_state(
             return getattr(request, "request_id", None) in finished_recvs
         if status not in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
             return False
-        if (
-            getattr(request, "num_stale_output_tokens", 0) > 0
-            and not getattr(request, "drop_stale_output", False)
+        if getattr(request, "num_stale_output_tokens", 0) > 0 and not getattr(
+            request, "drop_stale_output", False
         ):
             return False
         params = getattr(request, "kv_transfer_params", None) or {}

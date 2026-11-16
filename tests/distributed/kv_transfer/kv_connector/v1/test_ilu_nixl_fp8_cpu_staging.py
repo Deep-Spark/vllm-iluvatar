@@ -52,9 +52,7 @@ def _config(**extra):
     config.attention_config.hisparse_config = None
     config.cache_config.num_gpu_blocks_override = None
     config.cache_config.prefix_cache_retention_interval = None
-    config.cache_config.get_resolved_kv_cache_layout.return_value = (
-        KVCacheLayout.BLHNC
-    )
+    config.cache_config.get_resolved_kv_cache_layout.return_value = KVCacheLayout.BLHNC
     config.scheduler_config.disable_hybrid_kv_cache_manager = False
     config.speculative_config = None
     transfer = config.kv_transfer_config = MagicMock()
@@ -615,9 +613,7 @@ def test_int8_indexer_transcode_matches_torch_reference_for_partial_page(
         device=cuda_device,
     ).reshape(tokens_per_page, 128)
     int8_scale = values.abs().amax(dim=1).clamp(min=1e-10) / 127.0
-    int8_values = (
-        (values / int8_scale[:, None]).round().clamp(-127, 127).to(torch.int8)
-    )
+    int8_values = (values / int8_scale[:, None]).round().clamp(-127, 127).to(torch.int8)
     source = torch.zeros(
         (1, tokens_per_page, 132),
         dtype=torch.uint8,
@@ -661,9 +657,7 @@ def test_int8_indexer_transcode_matches_torch_reference_for_partial_page(
         .view(torch.uint8)
     )
     destination_flat = destination.view(-1)
-    actual_fp8 = destination_flat[: tokens_per_page * 128].reshape(
-        tokens_per_page, 128
-    )
+    actual_fp8 = destination_flat[: tokens_per_page * 128].reshape(tokens_per_page, 128)
     scale_start = tokens_per_page * 128
     actual_scale = destination_flat[
         scale_start : scale_start + tokens_per_page * 4

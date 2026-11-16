@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bit-preserving, compact all-gather for strongly uneven row counts."""
 
-from collections.abc import Callable, Sequence
 import math
+from collections.abc import Callable, Sequence
 
 import torch
 

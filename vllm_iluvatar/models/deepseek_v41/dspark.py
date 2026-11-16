@@ -13,7 +13,9 @@ import ixformer.inference.functions as ixfshared
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from ixformer.inference.functions.models import deepseek_v41 as ixfops  # type: ignore[import]
+from ixformer.inference.functions.models import (
+    deepseek_v41 as ixfops,  # type: ignore[import]
+)
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -447,9 +449,11 @@ class IluDSparkV41DraftModel(nn.Module):
         indices = self.lm_head.shard_indices
         local_vocab_size = self.lm_head.num_embeddings_per_partition
 
-        if (
-            markov_w2.weight.shape[0] == local_vocab_size
-            and self.logits_processor.head_dtype in (None, markov_embed.dtype)
+        if markov_w2.weight.shape[
+            0
+        ] == local_vocab_size and self.logits_processor.head_dtype in (
+            None,
+            markov_embed.dtype,
         ):
             return self._compute_local_logits(markov_w2, markov_embed)
 
@@ -537,9 +541,7 @@ class IluDSparkV41DraftModel(nn.Module):
         )
 
         for name, loaded_weight in weights:
-            mapped = remap_dspark_name(
-                name, load_own_embed=self.load_own_embed_tokens
-            )
+            mapped = remap_dspark_name(name, load_own_embed=self.load_own_embed_tokens)
             if mapped is None:
                 continue
             name = mapped

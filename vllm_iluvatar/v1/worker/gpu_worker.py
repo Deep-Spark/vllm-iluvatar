@@ -206,9 +206,8 @@ class IluWorker(Worker):
                     workspace_bytes=0,
                     prefill_producer=prefill_producer_for_config(self.vllm_config),
                 )
-            with profiling:
-                with self._pcp_memory_profile():
-                    available = super().determine_available_memory()
+            with profiling, self._pcp_memory_profile():
+                available = super().determine_available_memory()
             self._indexer_kv_available_memory = available
             return available
         finally:
@@ -280,7 +279,9 @@ class IluWorker(Worker):
         if getattr(self, "prefix_state", None) is not None:
             from vllm.distributed.kv_transfer import get_kv_transfer_group
 
-            from vllm_iluvatar.v1.worker.prefill_state.runtime import attach_prefix_state
+            from vllm_iluvatar.v1.worker.prefill_state.runtime import (
+                attach_prefix_state,
+            )
 
             self.prefix_state.initialize_cache()
             attach_prefix_state(get_kv_transfer_group(), self.prefix_state)

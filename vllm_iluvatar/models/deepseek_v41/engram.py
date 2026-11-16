@@ -743,9 +743,7 @@ class IluEngram(nn.Module):
         x = hidden_states.contiguous()
         if not self._shard_keys:
             return (
-                ixfops.engram_gate(
-                    x, kv, self._qk_weight, self.eps, self.clamp_value
-                ),
+                ixfops.engram_gate(x, kv, self._qk_weight, self.eps, self.clamp_value),
                 None,
             )
         # qk_weight stays full width; the kernel offsets into it by key_offset.
@@ -756,9 +754,7 @@ class IluEngram(nn.Module):
                 x, kv, sums, self.eps, self.clamp_value
             )
         return (
-            ixfops.engram_gate_apply(
-                x, kv, sums, self.eps, self.clamp_value
-            ),
+            ixfops.engram_gate_apply(x, kv, sums, self.eps, self.clamp_value),
             None,
         )
 

@@ -14,9 +14,7 @@ Remove:
 from __future__ import annotations
 
 import torch
-
 from vllm.v1.sample.ops import topk_topp_sampler as _community
-
 
 # Keep the original method for unsupported contracts and the disabled mode.
 _original_forward_native = _community.TopKTopPSampler.forward_native

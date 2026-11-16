@@ -54,17 +54,17 @@ def test_one_dim_layout_dispatches_to_block_dequant_1d():
     scale = _e8m0(torch.tensor([[0, 1], [1, 0], [2, 0], [0, 2]]))
 
     got = methods.DEQUANT_METHODS["fp8_block_e8m0"](weight, scale, {"block_size": 4})
-    want = methods._block_dequant_1d(
-        weight, scale, block_size=4, decode_e8m0=True
-    )
+    want = methods._block_dequant_1d(weight, scale, block_size=4, decode_e8m0=True)
     assert torch.equal(got, want)
 
     # Every row must use its own scale, not row // block_size's.
     expected = weight * torch.tensor(
-        [[1.0] * 4 + [2.0] * 4,
-         [2.0] * 4 + [1.0] * 4,
-         [4.0] * 4 + [1.0] * 4,
-         [1.0] * 4 + [4.0] * 4]
+        [
+            [1.0] * 4 + [2.0] * 4,
+            [2.0] * 4 + [1.0] * 4,
+            [4.0] * 4 + [1.0] * 4,
+            [1.0] * 4 + [4.0] * 4,
+        ]
     )
     assert torch.equal(got, expected)
 

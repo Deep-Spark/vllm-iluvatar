@@ -28,9 +28,7 @@ def _config(connector: str = "IluNixlConnector"):
     config.attention_config.hisparse_config = None
     config.cache_config.num_gpu_blocks_override = None
     config.cache_config.prefix_cache_retention_interval = None
-    config.cache_config.get_resolved_kv_cache_layout.return_value = (
-        KVCacheLayout.BLHNC
-    )
+    config.cache_config.get_resolved_kv_cache_layout.return_value = KVCacheLayout.BLHNC
     config.scheduler_config.disable_hybrid_kv_cache_manager = False
     config.speculative_config = None
     transfer_config = config.kv_transfer_config = MagicMock()

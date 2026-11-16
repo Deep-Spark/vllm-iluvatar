@@ -14,6 +14,7 @@ from vllm_iluvatar.models.qwen4_exp.model import (
 
 def test_quantized_loading_rejects_missing_scale_even_if_weight_loaded() -> None:
     from types import SimpleNamespace
+
     from vllm_iluvatar.models.qwen4_exp.loading import verify_quantized_weights_loaded
 
     model = torch.nn.Module()
@@ -27,24 +28,35 @@ def test_quantized_loading_rejects_missing_scale_even_if_weight_loaded() -> None
 
 def test_quantized_loading_resolves_real_moe_runner_parameter_paths() -> None:
     from types import SimpleNamespace
+
     from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
     from vllm_iluvatar.models.qwen4_exp.loading import verify_quantized_weights_loaded
 
     runner = MoERunner.__new__(MoERunner)
     torch.nn.Module.__init__(runner)
     runner.routed_experts = torch.nn.Module()
-    runner.routed_experts.register_parameter("w13_weight", torch.nn.Parameter(torch.ones(1)))
-    runner.routed_experts.register_parameter("w13_weight_scale", torch.nn.Parameter(torch.ones(1)))
+    runner.routed_experts.register_parameter(
+        "w13_weight", torch.nn.Parameter(torch.ones(1))
+    )
+    runner.routed_experts.register_parameter(
+        "w13_weight_scale", torch.nn.Parameter(torch.ones(1))
+    )
     model = torch.nn.Module()
     model.experts = runner
     config = SimpleNamespace(get_name=lambda: "compressed-tensors")
     with pytest.raises(RuntimeError, match="w13_weight_scale"):
         verify_quantized_weights_loaded(model, {"experts.w13_weight"}, config)
-    verify_quantized_weights_loaded(model, {"experts.w13_weight", "experts.w13_weight_scale"}, config)
+    verify_quantized_weights_loaded(
+        model, {"experts.w13_weight", "experts.w13_weight_scale"}, config
+    )
 
 
-def test_conditional_generation_quantized_loading_handles_interleaved_visual_weights() -> None:
+def test_conditional_generation_quantized_loading_handles_interleaved_visual_weights() -> (
+    None
+):
     from types import SimpleNamespace
+
     from vllm_iluvatar.models.qwen4_exp.model import Qwen4ExpForCausalLM
 
     lm = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)

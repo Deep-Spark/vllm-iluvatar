@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
-
 import vllm.envs as envs
 from ixformer.inference.functions.models.qwen3_next import qwen_qsa_build_metadata
 from torch import nn

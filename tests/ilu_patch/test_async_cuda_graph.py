@@ -39,9 +39,7 @@ def test_replay_policy(
 
     old, new = object(), object()
     torch = ModuleType("torch")
-    torch.cuda = SimpleNamespace(
-        CUDAGraph=old, graphs=SimpleNamespace(CUDAGraph=old)
-    )
+    torch.cuda = SimpleNamespace(CUDAGraph=old, graphs=SimpleNamespace(CUDAGraph=old))
     ixformer = ModuleType("ixformer")
     ixformer.__path__ = []
     ixformer.cuda = ModuleType("ixformer.cuda")

@@ -686,10 +686,10 @@ def convert(
 
     for source in input_dir.iterdir():
         if source.is_file():
-            if (
-                source.suffix != ".safetensors"
-                and source.name not in {"model.safetensors.index.json", "config.json"}
-            ):
+            if source.suffix != ".safetensors" and source.name not in {
+                "model.safetensors.index.json",
+                "config.json",
+            }:
                 shutil.copy(source, output_dir / source.name)
         else:
             # Carry companion directories verbatim, e.g. the dspark draft

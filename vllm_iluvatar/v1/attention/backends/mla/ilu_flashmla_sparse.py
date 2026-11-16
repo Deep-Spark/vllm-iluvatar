@@ -337,20 +337,18 @@ class IluFlashMLASparseMetadataBuilder(
         if positions_int32.dtype != torch.int32:
             positions_int32 = positions_int32.to(torch.int32)
 
-        global_decode, decode_lens, prefill_local = (
-            ixfops.build_c128a_topk_metadata(
-                positions_int32,
-                self.compress_ratio,
-                num_decode_tokens,
-                req_id_per_token[:num_total],
-                cm.block_table_tensor[:num_decodes],
-                block_size,
-                cm.slot_mapping[:num_total],
-                self.c128a_global_decode_buffer,
-                self.c128a_decode_lens_buffer,
-                self.c128a_prefill_buffer,
-                max_compressed_tokens=self.c128a_max_compressed,
-            )
+        global_decode, decode_lens, prefill_local = ixfops.build_c128a_topk_metadata(
+            positions_int32,
+            self.compress_ratio,
+            num_decode_tokens,
+            req_id_per_token[:num_total],
+            cm.block_table_tensor[:num_decodes],
+            block_size,
+            cm.slot_mapping[:num_total],
+            self.c128a_global_decode_buffer,
+            self.c128a_decode_lens_buffer,
+            self.c128a_prefill_buffer,
+            max_compressed_tokens=self.c128a_max_compressed,
         )
 
         result: dict[str, torch.Tensor | None] = {}

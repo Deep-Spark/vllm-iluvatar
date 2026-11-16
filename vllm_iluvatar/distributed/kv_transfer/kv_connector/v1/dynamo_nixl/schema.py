@@ -188,7 +188,9 @@ def _classify_role(
             or ".ilu_deepseek_v4_multi_head_latent_attention" in name
         ):
             classifications.add((family, "K_Comp", True, True))
-        elif glm_dsa and not family and ".self_attn" in name and ".indexer." not in name:
+        elif (
+            glm_dsa and not family and ".self_attn" in name and ".indexer." not in name
+        ):
             # GLM-5.2 MLA: ``model.layers.N.self_attn.attn``, tokens_per_state=1.
             # Reuse CSA/K_Comp so KVBM's existing whitelist and canonical
             # block-size picker apply without a runtime fork.
@@ -413,7 +415,9 @@ def _spec_compress_ratio(spec: Any) -> int:
     return 1
 
 
-def _spec_storage_block_size(spec: Any, logical_block_size: int, compress_ratio: int) -> int:
+def _spec_storage_block_size(
+    spec: Any, logical_block_size: int, compress_ratio: int
+) -> int:
     # 0.31 MLAAttentionSpec.storage_block_size is optional; derive when absent.
     value = getattr(spec, "storage_block_size", None)
     if value is not None:
@@ -542,9 +546,7 @@ def _build_entries_from_shared_spec(
         )
         buckets.setdefault((family, role), []).append(name)
     return tuple(
-        _build_entry(
-            tuple(sorted(names)), spec, tensors, kv_caches, glm_dsa=glm_dsa
-        )
+        _build_entry(tuple(sorted(names)), spec, tensors, kv_caches, glm_dsa=glm_dsa)
         for (_, _), names in sorted(buckets.items())
     )
 

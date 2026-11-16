@@ -104,9 +104,7 @@ class OnchipChecker:
             return device
         index = getattr(device, "index", None)
         if index is None:
-            raise WorkerHealthCheckError(
-                f"Cannot determine GPU index from {device!r}"
-            )
+            raise WorkerHealthCheckError(f"Cannot determine GPU index from {device!r}")
         return int(index)
 
     @staticmethod
@@ -191,8 +189,7 @@ class OnchipChecker:
             if init_result.status is not OnchipStatus.OK:
                 raise WorkerHealthCheckError(
                     f"Failed to initialize worker health checker "
-                    f"({self._device_context()}): "
-                    + self._format_result(init_result)
+                    f"({self._device_context()}): " + self._format_result(init_result)
                 )
             self._initialized = True
             config = self._native.config()
@@ -243,9 +240,7 @@ class OnchipChecker:
         if not self.enabled():
             return
         if not self._initialized:
-            raise WorkerHealthCheckError(
-                "Worker health checker is not initialized"
-            )
+            raise WorkerHealthCheckError("Worker health checker is not initialized")
 
         import vllm.envs as envs
 

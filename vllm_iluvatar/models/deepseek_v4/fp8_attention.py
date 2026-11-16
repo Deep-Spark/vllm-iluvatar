@@ -106,6 +106,7 @@ _SPARSE_PREFILL_H_Q = (8, 16, 32, 64, 128)
 # entirely, so keep those head counts on it. Ratios held at 1k/2k/4k tokens too.
 _SPARSE_PREFILL_MIN_H_Q = 32
 
+
 def _as_sparse_decode_indices(indices: torch.Tensor) -> torch.Tensor:
     """``(T, 1, K)`` or ``(T, K)`` → ``(T, K)`` with ``stride(0) % 256 == 0``."""
     if indices.dim() == 3:

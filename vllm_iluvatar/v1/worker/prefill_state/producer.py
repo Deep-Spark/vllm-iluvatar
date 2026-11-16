@@ -11,7 +11,12 @@ import torch
 from vllm.logger import init_logger
 
 from .cache_rows import copy_indexer_row_to_host, main_boundary_sources
-from .configuration import PrefixGeometry, ProducerTopology, prefix_transfer_config, session_paths
+from .configuration import (
+    PrefixGeometry,
+    ProducerTopology,
+    prefix_transfer_config,
+    session_paths,
+)
 from .runtime import PrefixRuntime
 from .source_state import replay_layout, request_dir
 
@@ -247,8 +252,9 @@ class ProducerPrefixState(PrefixRuntime):
                     name.endswith(".attn") or name.endswith(".attn.indexer.k_cache")
                 ):
                     if name.endswith(".attn"):
-                        self._src_specs.extend(main_boundary_sources(
-                            static[name], name, g, self.geometry))
+                        self._src_specs.extend(
+                            main_boundary_sources(static[name], name, g, self.geometry)
+                        )
                         continue
                     kind = "indexer_tail"
                     self._src_specs.append(
@@ -413,8 +419,9 @@ class ProducerPrefixState(PrefixRuntime):
                 if spec["kind"] in ("main_tail", "main_tail_scale"):
                     host[0].copy_(cache[block, row], non_blocking=True)
                 else:
-                    copy_indexer_row_to_host(host, cache, block, row,
-                                             spec.get("scales"))
+                    copy_indexer_row_to_host(
+                        host, cache, block, row, spec.get("scales")
+                    )
                 segments.append(
                     dict(
                         logical_rows=[start, stop],

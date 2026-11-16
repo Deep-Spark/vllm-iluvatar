@@ -7,7 +7,6 @@ from __future__ import annotations
 from typing import ClassVar, cast
 
 import torch
-
 from ixformer.inference.functions.models.qwen3_next import (
     qwen_qsa_kv_store,
     qwen_qsa_qk_norm_rope_gate,
@@ -91,7 +90,7 @@ class Qwen4ExpQSAIxformerBackend(FlashAttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes(
-        kv_cache_spec: "KVCacheSpec | None" = None,
+        kv_cache_spec: KVCacheSpec | None = None,
     ) -> list[int | MultipleOf]:
         # QSA consumes manager pages directly and does not use FA4 paged attention.
         return [MultipleOf(16)]

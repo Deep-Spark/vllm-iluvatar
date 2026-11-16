@@ -107,9 +107,7 @@ def test_upstream_pp_guards_are_masked_by_phase(
     )
     vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(pipeline_parallel_size=pp_size),
-        kv_transfer_config=SimpleNamespace(
-            kv_role=role, kv_connector="NixlConnector"
-        ),
+        kv_transfer_config=SimpleNamespace(kv_role=role, kv_connector="NixlConnector"),
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
     )
 
@@ -809,9 +807,7 @@ def test_packed_virtual_layout_places_each_layer_at_its_page():
         "model.layers.2.attn.swa_cache",
         "model.layers.2.attn.indexer.k_cache",
     ]
-    specs = {
-        name: SimpleNamespace(page_size_bytes=page) for name in layers
-    }
+    specs = {name: SimpleNamespace(page_size_bytes=page) for name in layers}
     groups = [
         SimpleNamespace(layer_names=[name], kv_cache_spec=specs[name])
         for name in layers
@@ -1003,15 +999,11 @@ def test_glm5_flash_cache_kind_recognition():
         == "kpool_tail_cache"
     )
     assert (
-        IluNixlWorkerMixin._cache_kind_from_layer_name(
-            "model.layers.0.self_attn"
-        )
+        IluNixlWorkerMixin._cache_kind_from_layer_name("model.layers.0.self_attn")
         == "mamba_cache"
     )
     assert (
-        IluNixlWorkerMixin._cache_kind_from_layer_name(
-            "model.layers.1.linear_attn"
-        )
+        IluNixlWorkerMixin._cache_kind_from_layer_name("model.layers.1.linear_attn")
         == "mamba_cache"
     )
     assert (
@@ -1362,11 +1354,9 @@ def test_glm5_flash_remote_handle_and_read_blocks_filter_non_ssm_regions():
             ]
         }
     }
-    worker._apply_prefix_caching = (
-        lambda decode_block_ids, prefill_block_ids, **_: (
-            decode_block_ids,
-            prefill_block_ids,
-        )
+    worker._apply_prefix_caching = lambda decode_block_ids, prefill_block_ids, **_: (
+        decode_block_ids,
+        prefill_block_ids,
     )
     worker._logical_to_kernel_block_ids = lambda block_ids, ratio: [
         [b * ratio + o for b in grp for o in range(ratio)] if idx < 2 else list(grp)
@@ -1471,5 +1461,3 @@ def test_glm5_flash_6_vs_6_hetero_pp_cross_cycle_mounting():
         # D_R6 is compact SSM slot 3; P_R0 is compact SSM slot 0.
         (3, 3): ([3], [0]),
     }
-
-

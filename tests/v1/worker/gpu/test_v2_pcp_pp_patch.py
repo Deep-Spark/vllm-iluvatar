@@ -93,7 +93,9 @@ def test_non_last_stage_receives_and_updates_global_requests(local_rows, schedul
     local_batch = batch(
         local_rows, [0] * len(local_rows), [2] * len(local_rows), [16] * len(local_rows)
     )
-    state = ExecuteModelState(local_batch, None, None, None, None, None, set(), None, None)
+    state = ExecuteModelState(
+        local_batch, None, None, None, None, None, set(), None, None
+    )
     computed = np.array([0, 20])
     received = []
     postprocessed = []

@@ -37,11 +37,11 @@ def test_gathered_padding_is_cached_and_restored(monkeypatch):
 
 
 def test_fused_ep_prefill_routes_with_global_padding(monkeypatch):
-    from vllm_iluvatar import _custom_ops
-    from vllm_iluvatar.model_executor.layers.fused_moe.runner import ilu_moe_runner
     from tests.model_executor.layers.fused_moe.test_ilu_moe_runner import (
         _make_stub_runner,
     )
+    from vllm_iluvatar import _custom_ops
+    from vllm_iluvatar.model_executor.layers.fused_moe.runner import ilu_moe_runner
 
     runner = _make_stub_runner(has_shared_experts=False)
     runner._fse_fuse_gate = False
@@ -73,7 +73,10 @@ def test_fused_ep_prefill_routes_with_global_padding(monkeypatch):
     monkeypatch.setattr(runner, "_apply_quant_method", apply)
     for _ in range(2):
         _, output = runner._forward_impl_fused_ep_combine(
-            torch.ones(2, 2), torch.ones(2, 2), None, None,
+            torch.ones(2, 2),
+            torch.ones(2, 2),
+            None,
+            None,
         )
         assert output.shape == (5, 2)
         assert ctx.is_padding is local_mask
@@ -122,7 +125,8 @@ def test_naive_ep_prefill_restores_local_mask(monkeypatch):
     ep.experts = SimpleNamespace(
         moe_config=SimpleNamespace(pcp_size=1, sp_size=1, is_sequence_parallel=False),
         _quant_method=SimpleNamespace(
-            skip_forward_padding=True, topk_indices_dtype=torch.int32,
+            skip_forward_padding=True,
+            topk_indices_dtype=torch.int32,
         ),
         shared_experts=None,
         routed_experts=SimpleNamespace(_ensure_moe_quant_config_init=lambda: None),

@@ -21,8 +21,8 @@ def _apply() -> None:
     if setting == "0":
         return
 
-    import torch
     import ixformer.cuda
+    import torch
 
     if ixformer.cuda.cuda_arch != "ivcore11":
         raise RuntimeError("Asynchronous CUDA graph replay is supported on MR")

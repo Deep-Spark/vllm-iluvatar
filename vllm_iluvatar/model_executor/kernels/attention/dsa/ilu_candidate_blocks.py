@@ -24,7 +24,6 @@ Remove   : when community grows a vendor hook for these two.
 from __future__ import annotations
 
 import torch
-
 from ixformer.inference.functions import dsa_update_topk_indices
 from ixformer.inference.functions.models import deepseek_v41 as ixfops
 
@@ -83,9 +82,7 @@ def select_candidate_blocks(
         for r0 in range(0, rows, _TOPK_ROWS):
             r1 = min(rows, r0 + _TOPK_ROWS)
             scores = logits.new_empty((r1 - r0, stride))[:, :nblocks]
-            bounds = torch.empty(
-                (2, r1 - r0), dtype=torch.int32, device=logits.device
-            )
+            bounds = torch.empty((2, r1 - r0), dtype=torch.int32, device=logits.device)
             ixfops.candidate_block_scores_bounded(
                 logits[r0:r1],
                 None,
@@ -186,8 +183,6 @@ def apply_initialized_decode_candidate_mask(
         and logits.stride(1) == 1
     ):
         if logits.shape[1]:
-            ixfops.apply_initialized_decode_mask(
-                logits, row_ke, candidate_blocks
-            )
+            ixfops.apply_initialized_decode_mask(logits, row_ke, candidate_blocks)
         return
     apply_candidate_mask(logits, None, row_ke, candidate_blocks, 8)

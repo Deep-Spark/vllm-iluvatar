@@ -28,7 +28,6 @@ import types
 
 from vllm_iluvatar.ilu_patch import general_patch as p
 
-
 RECEIVE_BASELINE = r'''
     def receive(self, input_batch: InputBatch) -> bool:
         """Returns True iff sampled tokens need to be gathered from *all*
@@ -89,7 +88,7 @@ RECEIVE_BASELINE = r'''
         return bool(need_sampled_mask.all())
 '''
 
-BROADCAST_BASELINE = r'''
+BROADCAST_BASELINE = r"""
     def broadcast(
         self,
         sampled_token_ids: torch.Tensor,
@@ -124,7 +123,7 @@ BROADCAST_BASELINE = r'''
             )
             for tensor in (sampled_token_ids, num_sampled, num_rejected):
                 tensor.record_stream(self.broadcast_stream)
-'''
+"""
 
 BROADCAST_DRAFTS_BASELINE = r'''
     def broadcast_drafts(

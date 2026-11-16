@@ -94,9 +94,7 @@ def test_engram_sqrsum_apply_dispatch(tokens, expect_sqrsum, monkeypatch):
     kv = torch.zeros(tokens, 4 * 4 + 8)
     partials = torch.ones(tokens, 4, 2)
     calls = []
-    monkeypatch.setattr(
-        engram_mod.ixfops, "engram_gate_reduce", lambda *args: partials
-    )
+    monkeypatch.setattr(engram_mod.ixfops, "engram_gate_reduce", lambda *args: partials)
     monkeypatch.setattr(
         engram_mod, "tensor_model_parallel_all_reduce", lambda value: value
     )

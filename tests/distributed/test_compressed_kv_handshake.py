@@ -66,8 +66,10 @@ def test_scheduler_global_prefix_width_is_not_a_hybrid_group_width(hybrid):
     # EngineCore updates its prefix-cache width after spawning workers. The
     # hybrid connector transfers scheduler blocks using per-layer descriptors.
     scheduler = SimpleNamespace(
-        block_size=128, _has_multi_size=hybrid,
-        group_block_sizes=[64, 128, 256], node_info={},
+        block_size=128,
+        _has_multi_size=hybrid,
+        group_block_sizes=[64, 128, 256],
+        node_info={},
         _scheduler_loop_t=object(),
     )
     if hybrid:
@@ -156,7 +158,9 @@ def test_unknown_remote_format_is_rejected_with_legacy_toggle_off(monkeypatch):
         fetch("none", msgspec.msgpack.encode(payload("new-format")), monkeypatch)
 
 
-@pytest.mark.parametrize("local_layout,remote_layout", [("legacy", "split"), ("split", "legacy")])
+@pytest.mark.parametrize(
+    "local_layout,remote_layout", [("legacy", "split"), ("split", "legacy")]
+)
 @pytest.mark.parametrize("enforce", [False, True])
 def test_split_vs_legacy_indexer_is_rejected_when_main_kv_is_none(
     local_layout, remote_layout, enforce, monkeypatch

@@ -387,12 +387,20 @@ class MemoryRegistrationPlanner:
         return result
 
     def describe_indexer_scale_plane(
-        self, *, layer_name: str, scales: torch.Tensor, payload: TensorRegistration,
+        self,
+        *,
+        layer_name: str,
+        scales: torch.Tensor,
+        payload: TensorRegistration,
     ) -> TensorRegistration:
         """Register compact FP32 indexer scales paired by physical page ID."""
-        if (scales.dtype != torch.float32 or scales.ndim != 2
-                or scales.shape[0] != payload.num_blocks * payload.kernel_blocks
-                or scales.stride(1) != 1 or scales.stride(0) != scales.shape[1]):
+        if (
+            scales.dtype != torch.float32
+            or scales.ndim != 2
+            or scales.shape[0] != payload.num_blocks * payload.kernel_blocks
+            or scales.stride(1) != 1
+            or scales.stride(0) != scales.shape[1]
+        ):
             raise ValueError(f"{layer_name}: invalid paired indexer scale geometry")
         page_bytes = scales.shape[1] * 4
         storage = scales.untyped_storage()
@@ -400,10 +408,15 @@ class MemoryRegistrationPlanner:
         stride = scales.stride(0) * 4 * payload.kernel_blocks
         layout = self._indexer_scale_layout
         placement = layout.placements.get(layer_name) if layout is not None else None
-        if (placement is None or offset != placement.offset * 4
-                or stride != placement.rows_per_manager_block * 4
-                or storage.nbytes() != layout.nbytes):
-            raise ValueError(f"{layer_name}: indexer scales do not match payload ownership")
+        if (
+            placement is None
+            or offset != placement.offset * 4
+            or stride != placement.rows_per_manager_block * 4
+            or storage.nbytes() != layout.nbytes
+        ):
+            raise ValueError(
+                f"{layer_name}: indexer scales do not match payload ownership"
+            )
         result = TensorRegistration(
             registration_base=storage.data_ptr(),
             registration_nbytes=storage.nbytes(),
@@ -415,8 +428,11 @@ class MemoryRegistrationPlanner:
         )
         result.validate(layer_name)
         MemoryRegistrationPlanner.validate_block_geometry(
-            layer_name=layer_name, tensor=scales, block_stride=stride,
-            num_blocks=payload.num_blocks, payload_segments=result.payload_segments,
+            layer_name=layer_name,
+            tensor=scales,
+            block_stride=stride,
+            num_blocks=payload.num_blocks,
+            payload_segments=result.payload_segments,
             kernel_blocks=payload.kernel_blocks,
         )
         return result

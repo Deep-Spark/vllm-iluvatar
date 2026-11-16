@@ -5,6 +5,7 @@
 Keep all six upstream metadata rows and DPSyncState semantics intact.
 Derived from the paired vLLM source; only row 6 and bit publication are added.
 """
+
 from __future__ import annotations
 
 import torch

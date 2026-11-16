@@ -40,9 +40,7 @@ def validate_indexer_kv_layout(
     supported = ("legacy", "split")
     for side, value in (("local", local_layout), ("remote", remote_layout)):
         if value not in supported:
-            raise RuntimeError(
-                f"Unsupported {side} NIXL indexer KV layout: {value!r}"
-            )
+            raise RuntimeError(f"Unsupported {side} NIXL indexer KV layout: {value!r}")
     if local_layout != remote_layout:
         raise RuntimeError(
             f"NIXL indexer KV layout mismatch for remote engine "

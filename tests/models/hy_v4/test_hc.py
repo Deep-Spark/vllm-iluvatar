@@ -60,9 +60,7 @@ def test_non_native_model_config_warns_once(monkeypatch, hc_mult, hidden_dim):
     monkeypatch.setattr(hc.logger, "warning_once", warning_once)
     residual = torch.empty(1, hc_mult, hidden_dim, dtype=torch.bfloat16)
 
-    assert not hc._native_shape(
-        residual, hc_mult=hc_mult, hidden_dim=hidden_dim
-    )
+    assert not hc._native_shape(residual, hc_mult=hc_mult, hidden_dim=hidden_dim)
     warning_once.assert_called_once()
     assert "model config" in warning_once.call_args.args[0]
 
@@ -93,8 +91,9 @@ def test_bi_ihc_matches_eager(monkeypatch, hidden, tokens):
     y, gates = pre(residual)
     torch.testing.assert_close(y, y_ref, atol=2e-2, rtol=1e-2)
     torch.testing.assert_close(gates, gates_ref, atol=2e-6, rtol=1e-5)
-    torch.testing.assert_close(post(x, residual, gates_ref), post_ref,
-                               atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        post(x, residual, gates_ref), post_ref, atol=2e-2, rtol=1e-2
+    )
     torch.testing.assert_close(head(residual), head_ref, atol=2e-2, rtol=1e-2)
     # The large-batch projection must retain the exact eager path.
     if tokens > 64:

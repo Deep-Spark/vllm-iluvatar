@@ -303,7 +303,8 @@ def _make_iluvatar_platform():
                         if n * decode_query_len <= max_tokens
                     ]
                     merged = sorted(
-                        set(compilation_config.cudagraph_capture_sizes) | set(extra_sizes)
+                        set(compilation_config.cudagraph_capture_sizes)
+                        | set(extra_sizes)
                     )
                     compilation_config.cudagraph_capture_sizes = merged
                     if merged:

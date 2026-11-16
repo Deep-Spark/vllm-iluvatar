@@ -31,9 +31,7 @@ def _group(layer_names: tuple[str, ...], spec: _Spec) -> SimpleNamespace:
     return SimpleNamespace(kv_cache_spec=spec, layer_names=layer_names)
 
 
-def _schema(
-    groups: tuple[SimpleNamespace, ...], *, model_type: str | None = None
-):
+def _schema(groups: tuple[SimpleNamespace, ...], *, model_type: str | None = None):
     return build_kv_cache_schema(
         SimpleNamespace(kv_cache_groups=groups, kv_cache_tensors=()),
         model_type=model_type,
@@ -109,9 +107,7 @@ def test_dsv4_tokens_per_state_derives_storage_block_size():
     schema = _schema(
         (
             _group(
-                (
-                    "model.layers.3.attn.ilu_deepseek_v4_multi_head_latent_attention",
-                ),
+                ("model.layers.3.attn.ilu_deepseek_v4_multi_head_latent_attention",),
                 _Spec(256, 8192, tokens_per_state=4),
             ),
         ),
@@ -128,9 +124,7 @@ def test_dsv4_tokens_per_state_roles():
     schema = _schema(
         (
             _group(
-                (
-                    "model.layers.3.attn.ilu_deepseek_v4_multi_head_latent_attention",
-                ),
+                ("model.layers.3.attn.ilu_deepseek_v4_multi_head_latent_attention",),
                 _Spec(256, 8192, tokens_per_state=4),
             ),
             _group(

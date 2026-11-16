@@ -11,10 +11,9 @@ own H1, and only when MkDocs fell back to the file name.
 """
 
 import re
-from pathlib import Path
 
-from mkdocs.utils import get_markdown_title
 from mkdocs.structure.pages import Page
+from mkdocs.utils import get_markdown_title
 
 H1_RE = re.compile(r"^#\s+(.+?)\s*$", re.MULTILINE)
 

@@ -10,26 +10,35 @@ deployments never execute LMCache-specific code:
   loop so unused short budget never leaks into unpromoted long prefills.
 - ``VLLM_ILU_PREFILL_LOOKUP_SUBMIT=N`` (default 0): submits up to N waiting
   connector lookups per step ahead of admission.
-- Strategy B — conditional ultra-long concurrency cap:
-  ``VLLM_ILU_PREFILL_LONG_CAP_TOKENS`` (default 0, off; e.g. 256000): caps
-  concurrent ultra-long prefills in ``running`` / in-flight loads to
-  ``VLLM_ILU_PREFILL_LONG_CAP_MAX`` (default 1) when non-ultra work is present,
-  and relaxes to ``VLLM_ILU_PREFILL_LONG_CAP_IDLE_MAX`` (default 2; 0 = no cap)
-  when no non-ultra pressure exists. An active ultra-long request releases its
-  slot once its remaining work drops to ``<= VLLM_ILU_PREFILL_LONG_RELEASE_TOKENS``
-  (default 0 -> ``short_limit``).
-- Strategy A — cache-aware waiting short-first + smooth linear aging:
+- Strategy B — two-dimensional concurrency control (compute vs in-flight DMA):
+  1. Compute concurrency cap: ``VLLM_ILU_PREFILL_LONG_CAP_TOKENS`` (default 0,
+     off; e.g. 256000) caps concurrent ultra-long *compute* prefills
+     (``compute_rem >= cap_tokens``) to ``VLLM_ILU_PREFILL_LONG_CAP_MAX``
+     (default 1) under non-ultra pressure, relaxing to
+     ``VLLM_ILU_PREFILL_LONG_CAP_IDLE_MAX`` (default 2; 0 = no cap) when idle,
+     and releasing the slot once remaining compute drops to
+     ``<= VLLM_ILU_PREFILL_LONG_RELEASE_TOKENS`` (default 0 -> ``short_limit``).
+  2. Transient large async-load DMA gate: while ``LONG_CAP_TOKENS > 0``, large
+     LMCache async KV loads (``async_load_toks >= VLLM_ILU_PREFILL_ASYNC_LOAD_CAP_TOKENS``,
+     default 131072) currently in ``WAITING_FOR_REMOTE_KVS`` are bounded to
+     ``VLLM_ILU_PREFILL_ASYNC_LOAD_CAP_MAX`` (default 1; idle 2) so duplicate
+     same-prefix requests wait 1–2 steps to share the freshly cached GPU blocks
+     instead of multiplying HBM & ``#44560`` reservations, and release the DMA
+     gate immediately once the transfer completes!
+- Strategy A — tier-aware waiting short-first + zero-bubble fast lane + smooth aging:
   ``VLLM_ILU_PREFILL_SHORT_FIRST=1`` (default 0, off):
-  1. Strict fast-lane isolation (Opt 1): while a ``> short_limit`` prefill is
-     running, the 50% bounded short lane is strictly reserved for ``<= short_limit``
-     work; ``> short_limit`` requests never borrow the short lane and instead
-     contend at main-lane handover steps.
-  2. Smooth linear aging + FCFS starvation ceiling (Opt 2): normal candidates
-     are ordered by ``max(0, effective_remaining - AGING_RATE * wait_sec)``
-     (``VLLM_ILU_PREFILL_AGING_RATE``, default 2500 tok/s); requests waiting
-     ``>= VLLM_ILU_PREFILL_STARVE_SEC`` (default 120s; 0 = off) promote to
-     ``starve_tier=0`` ordered oldest-arrival-first (``arrival_time``), while
-     still respecting Strategy B's ultra-long concurrency cap.
+  1. Distinguishes zero-copy GPU APC hits from LMCache H2D DMA hits via
+     ``sched_cost = compute_rem + (1024 + ASYNC_LOAD_WEIGHT * async_load_toks)``
+     (``VLLM_ILU_PREFILL_ASYNC_LOAD_WEIGHT``, default 0.05) and eliminates the
+     ``probes < 4`` local-cache blind spot by caching ``local_hit`` from early
+     lookup submissions.
+  2. Zero-bubble Regime 1 fast lane: initiating an async KV load
+     (``num_new_tokens = 0``) in Regime 1 reserves ``0`` compute tokens from the
+     running long prefill's budget (and can co-schedule alongside a ready local
+     short request in the same step).
+  3. Smooth linear aging (``VLLM_ILU_PREFILL_AGING_RATE``, default 2500 tok/s) +
+     oldest-first FCFS anti-starvation ceiling at ``VLLM_ILU_PREFILL_STARVE_SEC``
+     (default 120s).
 """
 
 from __future__ import annotations
@@ -42,6 +51,8 @@ _ASYNC_LOOKUP_CONNECTORS = frozenset(
     {"LMCacheMPConnector", "LMCacheMPConnectorUpstream"}
 )
 _MIN_SHORT_WORK_CHUNKS = 4
+_ASYNC_STEP_PENALTY_TOKENS = 1024
+_DEFAULT_ASYNC_LOAD_CAP_TOKENS = 131072
 
 
 def _env_int(name: str, default: int = 0) -> int:
@@ -129,7 +140,8 @@ class LMCacheBudgetPlan:
         *,
         budget_split: bool = True,
         isolate_waiting: bool = True,
-        promoted_waiting_id: str | None = None,
+        promoted_waiting_ids: tuple[str, ...] | list[str] = (),
+        async_init_ids: set[str] | tuple[str, ...] = (),
         ordered_ids: list[str] | None = None,
         strict_ordered: bool = False,
         st=None,
@@ -139,9 +151,14 @@ class LMCacheBudgetPlan:
         release_tokens: int = 0,
         active_ultra_ids: set[str] | None = None,
         has_short_pressure: bool = False,
+        async_cap_tokens: int = 0,
+        async_cap_max: int = 1,
+        async_cap_idle_max: int = 2,
+        active_large_dma_ids: set[str] | None = None,
     ):
         self.budget_split = bool(budget_split)
         self.short_ids = set(short_ids)
+        self.async_init_ids = set(async_init_ids)
         if self.budget_split:
             # The oldest long-running prefill retains >= half of the step budget.
             self.short_budget = min(budget // 2, short_work)
@@ -151,7 +168,10 @@ class LMCacheBudgetPlan:
             self.long_budget = budget
         self.short_used = self.long_used = 0
         self.isolate_waiting = bool(isolate_waiting)
-        self.promoted_waiting_id = promoted_waiting_id
+        self._promoted_queue = collections.deque(promoted_waiting_ids)
+        self.promoted_waiting_id = (
+            self._promoted_queue[0] if self._promoted_queue else None
+        )
         self.ordered_queue = collections.deque(ordered_ids or ())
         self.strict_ordered = bool(strict_ordered)
         self.st = st
@@ -161,11 +181,24 @@ class LMCacheBudgetPlan:
         self.release_tokens = int(release_tokens)
         self.active_ultra_ids = set(active_ultra_ids or ())
         self.has_short_pressure = bool(has_short_pressure)
+        self.async_cap_tokens = int(async_cap_tokens)
+        self.async_cap_max = int(async_cap_max)
+        self.async_cap_idle_max = int(async_cap_idle_max)
+        self.active_large_dma_ids = set(active_large_dma_ids or ())
         self._last_reject_reason: str | None = None
+
+    def has_pending_async_init(self) -> bool:
+        return bool(self.async_init_ids)
 
     def limit(self, rid: str, tokens: int) -> int:
         if not self.budget_split:
             return tokens
+        if rid in self.async_init_ids:
+            # Allow passing the pre-lookup isolate_waiting gate even when
+            # token_budget == 0 (long prefill took full 4096); if lookup
+            # unexpectedly downgraded to local compute, can_admit_waiting
+            # defers it cleanly without consuming compute budget.
+            return 1
         available = (
             self.short_budget - self.short_used
             if rid in self.short_ids
@@ -187,6 +220,16 @@ class LMCacheBudgetPlan:
             r.request_id == rid for r in scheduler.waiting
         )
 
+    def _current_promoted(self, scheduler) -> str | None:
+        while self._promoted_queue:
+            cand = self._promoted_queue[0]
+            if self._in_waiting_queues(scheduler, cand):
+                self.promoted_waiting_id = cand
+                return cand
+            self._promoted_queue.popleft()
+        self.promoted_waiting_id = None
+        return None
+
     def _current_target(self, scheduler) -> str | None:
         while self.ordered_queue:
             cand = self.ordered_queue[0]
@@ -204,20 +247,54 @@ class LMCacheBudgetPlan:
             return self.cap_idle_max
         return None
 
+    def _effective_async_cap(self) -> int | None:
+        if self.async_cap_tokens <= 0:
+            return None
+        if self.has_short_pressure:
+            return self.async_cap_max
+        if self.async_cap_idle_max > 0:
+            return self.async_cap_idle_max
+        return None
+
     def _quick_eff_rem(self, scheduler, request) -> int:
         if request.num_computed_tokens:
             return _remaining(request)
-        if self.st is not None and request.request_id in self.st.resolved_hits:
-            hit = self.st.resolved_hits[request.request_id]
+        if self.st is not None:
             replay = getattr(scheduler, "prefix_replay_tokens", 0)
-            return max(1, request.num_tokens - max(0, hit - replay))
+            loc = self.st.local_hits.get(request.request_id, 0)
+            tot = self.st.resolved_hits.get(request.request_id, 0)
+            best = max(loc, tot)
+            if best > 0:
+                return max(1, request.num_tokens - max(0, best - replay))
         return request.num_tokens
+
+    def _quick_async_load(self, request) -> int:
+        if request.num_computed_tokens or self.st is None:
+            return 0
+        loc = self.st.local_hits.get(request.request_id, 0)
+        tot = self.st.resolved_hits.get(request.request_id)
+        if tot is None:
+            return 0
+        return max(0, tot - loc)
 
     def can_admit_waiting(
         self, scheduler, request, num_computed_tokens: int, load_kv_async: bool
     ) -> bool:
         self._last_reject_reason = None
         rid = request.request_id
+
+        # If a request was co-promoted purely to kick off a 0-compute async DMA
+        # in Regime 1, do not admit it for synchronous compute if its hit shrank;
+        # and when token_budget == 0, only async-init requests may enter.
+        if rid in self.async_init_ids and not load_kv_async:
+            self.async_init_ids.discard(rid)
+            if self._promoted_queue and self._promoted_queue[0] == rid:
+                self._promoted_queue.popleft()
+            self._last_reject_reason = "async_init_downgraded"
+            return False
+        if self.async_init_ids and rid not in self.async_init_ids and rid not in self.short_ids:
+            self._last_reject_reason = "awaiting_async_init"
+            return False
 
         # Strategy A ordered sequence check (when transition-step ordering is active).
         if not self.budget_split:
@@ -227,23 +304,41 @@ class LMCacheBudgetPlan:
                     self._last_reject_reason = "ordered"
                     return False
             elif self.strict_ordered:
-                # An unresolved shorter request sits ahead of remaining candidates
-                # while this step already scheduled higher-priority work.
                 self._last_reject_reason = "strict_ordered"
                 return False
 
-        # Strategy B conditional ultra-long concurrency cap.
         # Never block a request that already holds in-flight reserved KV blocks.
         inflight = getattr(scheduler, "_inflight_prefills", ())
-        if self.cap_tokens > 0 and request not in inflight:
-            rem = max(0, request.num_tokens - num_computed_tokens)
-            if rem >= self.cap_tokens:
-                cap = self._effective_cap()
-                if cap is not None and len(self.active_ultra_ids) >= cap:
-                    if self.st is not None:
-                        self.st.b_cap_skips += 1
-                    self._last_reject_reason = "b_cap"
-                    return False
+        if request not in inflight:
+            # 1. Strategy B1: ultra-long compute concurrency cap.
+            if self.cap_tokens > 0:
+                rem = max(0, request.num_tokens - num_computed_tokens)
+                if rem >= self.cap_tokens:
+                    cap = self._effective_cap()
+                    if cap is not None and len(self.active_ultra_ids) >= cap:
+                        if self.st is not None:
+                            self.st.b_cap_skips += 1
+                        self._last_reject_reason = "b_cap"
+                        return False
+
+            # 2. Strategy B2: transient large async-load DMA gate.
+            # Prevents multiple large LMCache async loads (e.g. duplicate 392k
+            # prefix hits before the first transfer caches its blocks) from
+            # multiplying HBM allocations & #44560 reservations simultaneously.
+            if self.async_cap_tokens > 0 and load_kv_async:
+                loc = (
+                    self.st.local_hits.get(rid, 0)
+                    if self.st is not None
+                    else 0
+                )
+                ext_load = max(0, num_computed_tokens - loc)
+                if ext_load >= self.async_cap_tokens:
+                    acap = self._effective_async_cap()
+                    if acap is not None and len(self.active_large_dma_ids) >= acap:
+                        if self.st is not None:
+                            self.st.b_async_cap_skips += 1
+                        self._last_reject_reason = "b_async_cap"
+                        return False
 
         return True
 
@@ -251,6 +346,12 @@ class LMCacheBudgetPlan:
         self, scheduler, request, num_computed_tokens: int, load_kv_async: bool
     ) -> None:
         rid = request.request_id
+        self.async_init_ids.discard(rid)
+        if self._promoted_queue and self._promoted_queue[0] == rid:
+            self._promoted_queue.popleft()
+            self.promoted_waiting_id = (
+                self._promoted_queue[0] if self._promoted_queue else None
+            )
         if self.ordered_queue and self.ordered_queue[0] == rid:
             self.ordered_queue.popleft()
         if self.cap_tokens > 0:
@@ -263,16 +364,16 @@ class LMCacheBudgetPlan:
                     self.st.ultra_ids.add(rid)
                 if rem > self.release_tokens:
                     self.active_ultra_ids.add(rid)
+        if self.async_cap_tokens > 0 and load_kv_async:
+            loc = self.st.local_hits.get(rid, 0) if self.st is not None else 0
+            if max(0, num_computed_tokens - loc) >= self.async_cap_tokens:
+                self.active_large_dma_ids.add(rid)
 
     def should_skip_waiting(self, scheduler, rid: str) -> bool:
-        # 1. Baseline promoted short target.
-        target = self.promoted_waiting_id
+        # 1. Promoted short / async-init targets in Regime 1.
+        target = self._current_promoted(scheduler)
         if target is not None and rid != target:
-            if (
-                scheduler.waiting
-                and scheduler.waiting.peek_request().request_id == target
-            ) or any(r.request_id == target for r in scheduler.skipped_waiting):
-                return True
+            return True
 
         # 2. Strategy A ordered target waiting behind skipped_waiting items.
         if not self.budget_split:
@@ -298,9 +399,12 @@ class LMCacheBudgetPlan:
             ):
                 return True
 
-        # 4. Strategy B rejected an ultra-long candidate: skip it only if there is
-        #    a non-ultra-long (or already in-flight) request behind it to try.
-        if self._last_reject_reason == "b_cap" and not self.isolate_waiting:
+        # 4. Strategy B rejected an ultra-long compute or large async-load candidate:
+        #    skip it if there is an eligible request behind it to try.
+        if (
+            self._last_reject_reason in ("b_cap", "b_async_cap")
+            and not self.isolate_waiting
+        ):
             inflight = getattr(scheduler, "_inflight_prefills", ())
             for q in (scheduler.skipped_waiting, scheduler.waiting):
                 for other in q:
@@ -311,7 +415,24 @@ class LMCacheBudgetPlan:
                         continue
                     if other in inflight:
                         return True
-                    if self._quick_eff_rem(scheduler, other) < self.cap_tokens:
+                    eff_ok = (
+                        self.cap_tokens <= 0
+                        or self._quick_eff_rem(scheduler, other) < self.cap_tokens
+                        or (
+                            self._effective_cap() is not None
+                            and len(self.active_ultra_ids) < self._effective_cap()
+                        )
+                    )
+                    async_ok = (
+                        self.async_cap_tokens <= 0
+                        or self._quick_async_load(other) < self.async_cap_tokens
+                        or (
+                            self._effective_async_cap() is not None
+                            and len(self.active_large_dma_ids)
+                            < self._effective_async_cap()
+                        )
+                    )
+                    if eff_ok and async_ok:
                         return True
             return False
 
@@ -322,6 +443,8 @@ def _lookup_hit(scheduler, connector, request, st=None):
     """The connector call the waiting loop makes on a visit."""
     _, local, _, _ = scheduler._get_local_prefix_cache_hit(request)
     local -= local % scheduler.block_size
+    if st is not None:
+        st.local_hits[request.request_id] = local
     ext_tokens, _ = connector.get_num_new_matched_tokens(request, local)
     if ext_tokens is not None and st is not None:
         st.resolved_hits[request.request_id] = local + ext_tokens
@@ -345,21 +468,35 @@ def _passive_adapter_hit(lmc_child, rid: str, st) -> int | None:
     return hit
 
 
+def _sched_cost(
+    compute_rem: int, async_load_toks: int, async_weight: float
+) -> float:
+    if async_load_toks > 0:
+        return (
+            float(compute_rem)
+            + _ASYNC_STEP_PENALTY_TOKENS
+            + async_weight * float(async_load_toks)
+        )
+    return float(compute_rem)
+
+
 def _priority_key(
-    eff_rem: int,
+    sched_cost: float,
+    is_async_load: bool,
     request,
     st,
     now: float,
     starve_sec: float,
     aging_rate: float,
-) -> tuple[int, float, float, str]:
-    """Compute cache-aware short-first priority key with smooth aging & FCFS bailout.
+) -> tuple[int, float, int, float, str]:
+    """Compute tier-aware short-first priority key with smooth aging & FCFS bailout.
 
     - ``tier == 0`` (waited >= ``starve_sec``): ordered strictly oldest-first by
       ``arrival_time`` so aged ultra-long requests cannot be jumped anymore by
       younger aged medium requests under heavy steady-state queues.
-    - ``tier == 1`` (normal): ordered by ``max(0, eff_rem - aging_rate * wait_sec)``,
-      smoothly advancing waiting requests without a binary threshold cliff.
+    - ``tier == 1`` (normal): ordered by ``max(0, sched_cost - aging_rate * wait_sec)``,
+      breaking ties in favor of locally ready work (``is_async_load=0``) before
+      async DMA loads (``is_async_load=1``), then ``arrival_time``.
     """
     rid_str = str(request.request_id)
     raw_arr = getattr(request, "arrival_time", None)
@@ -368,10 +505,11 @@ def _priority_key(
     else:
         arr = float(raw_arr)
     wait_sec = max(0.0, now - arr)
+    async_flag = 1 if is_async_load else 0
     if starve_sec > 0.0 and wait_sec >= starve_sec:
-        return (0, arr, float(eff_rem), rid_str)
-    aged_score = max(0.0, float(eff_rem) - aging_rate * wait_sec)
-    return (1, aged_score, arr, rid_str)
+        return (0, arr, async_flag, sched_cost, rid_str)
+    aged_score = max(0.0, sched_cost - aging_rate * wait_sec)
+    return (1, aged_score, async_flag, arr, rid_str)
 
 
 def _submit_lookups(
@@ -404,7 +542,7 @@ def _submit_lookups(
     if short_first and len(eligible) > 1:
         eligible.sort(
             key=lambda r: _priority_key(
-                _remaining(r), r, st, now, starve_sec, aging_rate
+                float(_remaining(r)), False, r, st, now, starve_sec, aging_rate
             )
         )
     for request in eligible[:limit]:
@@ -455,6 +593,9 @@ def _prune_state(scheduler, st) -> None:
     if st.resolved_hits:
         for k in [k for k in st.resolved_hits if k not in active_rids]:
             st.resolved_hits.pop(k, None)
+    if st.local_hits:
+        for k in [k for k in st.local_hits if k not in active_rids]:
+            st.local_hits.pop(k, None)
     if st.first_seen:
         for k in [k for k in st.first_seen if k not in active_rids]:
             st.first_seen.pop(k, None)
@@ -529,43 +670,63 @@ def _baseline_plan(scheduler, connector, budget: int, st):
         sum(short.values()),
         budget_split=True,
         isolate_waiting=True,
-        promoted_waiting_id=promoted_waiting_id,
+        promoted_waiting_ids=(promoted_waiting_id,) if promoted_waiting_id else (),
         st=st,
     )
 
 
 def _estimate_candidate(
     scheduler, lmc_child, st, request, short_limit: int, probes: int
-) -> tuple[int, bool, bool, int]:
-    """Return ``(eff_rem, resolved_hint, async_hint, probes)``."""
+) -> tuple[int, int, bool, bool, int]:
+    """Return ``(compute_rem, async_load_toks, resolved_hint, async_hint, probes)``."""
     rid = request.request_id
     replay = getattr(scheduler, "prefix_replay_tokens", 0)
     inflight = getattr(scheduler, "_inflight_prefills", ())
 
+    # Already completed remote KV load (or preempted with computed tokens):
+    # blocks are resident in GPU HBM now -> 0 async load!
     if request.num_computed_tokens or getattr(
         request, "skip_reading_prefix_cache", False
     ):
-        return _remaining(request), True, False, probes
+        return _remaining(request), 0, True, False, probes
 
-    ext_hit = _passive_adapter_hit(lmc_child, rid, st)
-    local_cached = 0
-    if (
+    total_ext_hit = _passive_adapter_hit(lmc_child, rid, st)
+
+    # Reuse exact local hit recorded during early _lookup_hit submission first
+    # (eliminates the 4-probe blind spot for up to LOOKUP_SUBMIT=16 requests).
+    if rid in st.local_hits:
+        local_cached = st.local_hits[rid]
+    elif (
         probes < 4
-        and st.key(request, short_limit, replay) in st.seen
+        and (
+            total_ext_hit is not None
+            or st.key(request, short_limit, replay) in st.seen
+        )
         and not scheduler.kv_cache_manager.enable_kv_cache_events
     ):
         probes += 1
-        _, local_cached, _ = scheduler.kv_cache_manager.get_computed_blocks(request)
-
-    best_hit = max(local_cached, ext_hit or 0)
-    if best_hit > 0:
-        eff_rem = max(1, request.num_tokens - max(0, best_hit - replay))
+        if hasattr(scheduler, "_get_local_prefix_cache_hit"):
+            _, local_cached, _, _ = scheduler._get_local_prefix_cache_hit(request)
+        else:
+            _, local_cached, _ = scheduler.kv_cache_manager.get_computed_blocks(request)
+        local_cached -= local_cached % getattr(scheduler, "block_size", 64)
+        st.local_hits[rid] = local_cached
     else:
-        eff_rem = request.num_tokens
+        local_cached = 0
 
-    resolved = ext_hit is not None or request in inflight
-    async_hint = bool(ext_hit is not None and ext_hit > local_cached and ext_hit > replay)
-    return eff_rem, resolved, async_hint, probes
+    best_hit = max(local_cached, total_ext_hit or 0)
+    if best_hit > 0:
+        compute_rem = max(1, request.num_tokens - max(0, best_hit - replay))
+    else:
+        compute_rem = request.num_tokens
+
+    raw_async = (
+        max(0, total_ext_hit - local_cached) if total_ext_hit is not None else 0
+    )
+    async_hint = bool(raw_async > 0 and (local_cached + raw_async) > replay)
+    async_load_toks = raw_async if async_hint else 0
+    resolved = total_ext_hit is not None or request in inflight
+    return compute_rem, async_load_toks, resolved, async_hint, probes
 
 
 def plan(scheduler, budget: int, st):
@@ -583,6 +744,7 @@ def plan(scheduler, budget: int, st):
     now = time.time()
     starve_sec = _env_float("VLLM_ILU_PREFILL_STARVE_SEC", 120.0)
     aging_rate = _env_float("VLLM_ILU_PREFILL_AGING_RATE", 2500.0)
+    async_weight = _env_float("VLLM_ILU_PREFILL_ASYNC_LOAD_WEIGHT", 0.05)
     probed = _submit_lookups(
         scheduler,
         connector,
@@ -598,14 +760,55 @@ def plan(scheduler, budget: int, st):
     cap_idle_max = _env_int("VLLM_ILU_PREFILL_LONG_CAP_IDLE_MAX", 2)
     release_tokens = _env_int("VLLM_ILU_PREFILL_LONG_RELEASE_TOKENS", 0) or short_limit
 
+    # Strategy B2 transient large async-load DMA gate (active whenever B is on).
+    async_cap_tokens = (
+        _env_int(
+            "VLLM_ILU_PREFILL_ASYNC_LOAD_CAP_TOKENS", _DEFAULT_ASYNC_LOAD_CAP_TOKENS
+        )
+        if cap_tokens > 0
+        else 0
+    )
+    async_cap_max = max(1, _env_int("VLLM_ILU_PREFILL_ASYNC_LOAD_CAP_MAX", 1))
+    async_cap_idle_max = _env_int("VLLM_ILU_PREFILL_ASYNC_LOAD_CAP_IDLE_MAX", 2)
+
     inflight = getattr(scheduler, "_inflight_prefills", ())
+
+    # Promote finished WAITING_FOR_REMOTE_KVS requests within the 128-entry scan
+    # window up-front so active DMA / ultra-long slot counts reflect transfers
+    # that already completed this step (leaving entries >128 to the waiting loop's
+    # HOL bypass path). When any remote KV load completes, newly cached GPU
+    # blocks enter the local prefix hash table, so clear cached local_hits<total
+    # entries so sibling same-prefix requests refresh their local GPU hit!
+    done_recvs = getattr(scheduler, "finished_recving_kv_req_ids", ())
+    if done_recvs:
+        if st.local_hits:
+            st.local_hits.clear()
+        for n_sk, request in enumerate(list(scheduler.skipped_waiting)):
+            if n_sk >= 128:
+                break
+            if (
+                request.status.name == "WAITING_FOR_REMOTE_KVS"
+                and request.request_id in done_recvs
+            ):
+                scheduler._try_promote_blocked_waiting_request(request)
+
     active_ultra_ids: set[str] = set()
+    active_large_dma_ids: set[str] = set()
     if cap_tokens > 0:
         for r in (*scheduler.running, *inflight):
             rem = _remaining(r)
-            if (r.request_id in st.ultra_ids or rem >= cap_tokens) and rem > release_tokens:
+            if (
+                r.request_id in st.ultra_ids or rem >= cap_tokens
+            ) and rem > release_tokens:
                 active_ultra_ids.add(r.request_id)
                 st.ultra_ids.add(r.request_id)
+            if (
+                async_cap_tokens > 0
+                and r.status.name == "WAITING_FOR_REMOTE_KVS"
+                and (r.num_computed_tokens - st.local_hits.get(r.request_id, 0))
+                >= async_cap_tokens
+            ):
+                active_large_dma_ids.add(r.request_id)
 
     has_short_pressure = False
     if cap_tokens > 0:
@@ -614,7 +817,7 @@ def plan(scheduler, budget: int, st):
             for r in scheduler.running
         )
 
-    # Scan waiting queues: promote finished remote KV loads and inspect candidates.
+    # Scan waiting queues and inspect candidates.
     scanned = []
     probes = 0
     seq_idx = 0
@@ -623,12 +826,6 @@ def plan(scheduler, budget: int, st):
             if n >= 128:
                 break
             status = request.status.name
-            if (
-                status == "WAITING_FOR_REMOTE_KVS"
-                and request.request_id in scheduler.finished_recving_kv_req_ids
-            ):
-                scheduler._try_promote_blocked_waiting_request(request)
-                status = request.status.name
             if status != "WAITING" or request.has_encoder_inputs:
                 if (
                     cap_tokens > 0
@@ -640,24 +837,34 @@ def plan(scheduler, budget: int, st):
                     has_short_pressure = True
                 continue
 
-            eff_rem, resolved_hint, async_hint, probes = _estimate_candidate(
-                scheduler, lmc_child, st, request, short_limit, probes
+            compute_rem, async_load_toks, resolved_hint, async_hint, probes = (
+                _estimate_candidate(
+                    scheduler, lmc_child, st, request, short_limit, probes
+                )
             )
             if request.request_id in probed and probed[request.request_id] is not None:
                 resolved_hint = True
             if (
                 cap_tokens > 0
                 and not has_short_pressure
-                and eff_rem < cap_tokens
+                and compute_rem < cap_tokens
                 and request.request_id not in st.ultra_ids
             ):
                 has_short_pressure = True
 
-            pkey = _priority_key(eff_rem, request, st, now, starve_sec, aging_rate)
+            cost = _sched_cost(
+                compute_rem,
+                async_load_toks if short_first else 0,
+                async_weight if short_first else 0.0,
+            )
+            pkey = _priority_key(
+                cost, async_hint, request, st, now, starve_sec, aging_rate
+            )
             scanned.append(
                 (
                     pkey,
-                    eff_rem,
+                    compute_rem,
+                    async_load_toks,
                     seq_idx,
                     q_idx,
                     queue,
@@ -669,25 +876,78 @@ def plan(scheduler, budget: int, st):
             seq_idx += 1
 
     eff_cap: int | None = None
+    eff_async_cap: int | None = None
     if cap_tokens > 0:
         if has_short_pressure:
             eff_cap = cap_max
-        elif cap_idle_max > 0:
-            eff_cap = cap_idle_max
+            eff_async_cap = async_cap_max
+        else:
+            if cap_idle_max > 0:
+                eff_cap = cap_idle_max
+            if async_cap_idle_max > 0:
+                eff_async_cap = async_cap_idle_max
 
-    def _allowed_by_b(request, eff_rem: int, cur_ultra_count: int) -> bool:
+    def _allowed_by_b(
+        request, compute_rem: int, async_load_toks: int, cur_ultra: int, cur_dma: int
+    ) -> bool:
         if cap_tokens <= 0 or request in inflight:
             return True
-        if eff_rem < cap_tokens:
-            return True
-        if eff_cap is None:
-            return True
-        return cur_ultra_count < eff_cap
+        if compute_rem >= cap_tokens and eff_cap is not None and cur_ultra >= eff_cap:
+            return False
+        if (
+            async_cap_tokens > 0
+            and async_load_toks >= async_cap_tokens
+            and eff_async_cap is not None
+            and cur_dma >= eff_async_cap
+        ):
+            return False
+        return True
 
-    # Optimization 1: Strict fast-lane isolation.
-    # Only requests with remaining <= short_limit enter the 50% bounded short lane.
-    # Medium/long requests (> short_limit) NEVER borrow short_budget while another
-    # > short_limit prefill is running; they take over at Regime 2 handover steps.
+    def _resolve_one_lane_candidate(candidates, cur_ultra: int, cur_dma: int):
+        """Resolve at most LOOKUP_AHEAD candidates and return the first B-eligible one."""
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0])
+        if connector is None or scheduler.kv_cache_manager.enable_kv_cache_events:
+            return candidates[0]
+        track_sub = _env_int("VLLM_ILU_PREFILL_LOOKUP_SUBMIT", 0) > 0
+        limit = max(1, _lookup_ahead())
+        replay = getattr(scheduler, "prefix_replay_tokens", 0)
+        for cand in candidates[:limit]:
+            _k, c_rem, a_load, tier, q_idx, queue, is_async, req = cand
+            if req.num_computed_tokens or getattr(
+                req, "skip_reading_prefix_cache", False
+            ):
+                if _allowed_by_b(req, c_rem, 0, cur_ultra, cur_dma):
+                    return (_k, c_rem, 0, tier, q_idx, queue, False, req)
+                continue
+            rid = req.request_id
+            if rid in probed and probed[rid] is not None:
+                ext = probed[rid]
+                loc = st.local_hits.get(rid, 0)
+                tot = loc + ext
+            elif rid in st.resolved_hits:
+                tot = st.resolved_hits[rid]
+                loc = st.local_hits.get(rid, 0)
+            else:
+                if track_sub:
+                    st.submitted.add(rid)
+                ext = _lookup_hit(scheduler, connector, req, st)
+                if ext is None:
+                    continue
+                loc = st.local_hits.get(rid, 0)
+                tot = loc + ext
+            best = max(loc, tot)
+            c_rem = max(1, req.num_tokens - max(0, best - replay)) if best > 0 else req.num_tokens
+            raw_a = max(0, tot - loc)
+            is_async = bool(raw_a > 0 and tot > replay)
+            a_load = raw_a if is_async else 0
+            if c_rem <= short_limit and _allowed_by_b(
+                req, c_rem, a_load, cur_ultra, cur_dma
+            ):
+                return (_k, c_rem, a_load, tier, q_idx, queue, is_async, req)
+        return None
+
     short = {
         r.request_id: _remaining(r)
         for r in scheduler.running
@@ -696,44 +956,110 @@ def plan(scheduler, budget: int, st):
     long_exists = any(_remaining(r) > short_limit for r in scheduler.running)
 
     # Regime 1: running already holds > short_limit prefill work -> share chunk budget
-    # exclusively with <= short_limit requests.
+    # exclusively with <= short_limit requests, with ZERO compute-budget bubble on
+    # async KV load initiation!
     if long_exists:
         lane_candidates = []
         for item in scanned:
-            pkey, eff_rem, s_idx, _q_idx, queue, _res, _async, req = item
-            if eff_rem <= 0 or eff_rem > short_limit:
+            (
+                pkey,
+                compute_rem,
+                async_load_toks,
+                s_idx,
+                q_idx,
+                queue,
+                _res,
+                is_async,
+                req,
+            ) = item
+            if compute_rem <= 0 or compute_rem > short_limit:
                 continue
-            if not _allowed_by_b(req, eff_rem, len(active_ultra_ids)):
+            if not _allowed_by_b(
+                req,
+                compute_rem,
+                async_load_toks,
+                len(active_ultra_ids),
+                len(active_large_dma_ids),
+            ):
                 continue
-            sort_key = pkey if short_first else (eff_rem, s_idx)
-            lane_candidates.append((sort_key, eff_rem, pkey[0], queue, req))
-
-        promoted_waiting_id = None
-        if lane_candidates:
-            lane_candidates.sort(key=lambda x: x[0])
-            selected = _select_candidate(
-                scheduler, connector, st, lane_candidates, probed
+            sort_key = pkey if short_first else (compute_rem, s_idx)
+            lane_candidates.append(
+                (
+                    sort_key,
+                    compute_rem,
+                    async_load_toks,
+                    pkey[0],
+                    q_idx,
+                    queue,
+                    is_async,
+                    req,
+                )
             )
-            if selected is not None:
-                _key, eff_rem, tier, queue, req = selected
+
+        promoted_ids: list[str] = []
+        async_init_ids: set[str] = set()
+        sim_dma = len(active_large_dma_ids)
+        chosen_by_q: tuple[list, list] = ([], [])
+
+        selected = _resolve_one_lane_candidate(
+            lane_candidates, len(active_ultra_ids), sim_dma
+        )
+        if selected is not None:
+            _k, c_rem, a_load, tier, q_idx, _queue, is_async, req = selected
+            promoted_ids.append(req.request_id)
+            chosen_by_q[q_idx].append(req)
+            if short_first:
+                st.a_promotions += 1
+                if tier == 0:
+                    st.a_starve_promotions += 1
+
+            if short_first and is_async:
+                # Zero-bubble async initiation: initiating WAITING_FOR_REMOTE_KVS
+                # consumes 0 compute tokens this step! Keep full 4096 budget for
+                # the running long prefill, OR co-promote one ready synchronous
+                # <= short_limit candidate if one is waiting right now.
+                async_init_ids.add(req.request_id)
+                if async_cap_tokens > 0 and a_load >= async_cap_tokens:
+                    sim_dma += 1
+                sync_cands = [
+                    c
+                    for c in lane_candidates
+                    if c[-1] is not req
+                    and not c[6]  # not is_async
+                    and (c[4] >= q_idx)  # preserve skipped_waiting -> waiting visit order
+                ]
+                sync_sel = _resolve_one_lane_candidate(
+                    sync_cands, len(active_ultra_ids), sim_dma
+                )
+                if sync_sel is not None and not sync_sel[6]:
+                    _k2, c_rem2, _a2, tier2, q_idx2, _q2, _isa2, req2 = sync_sel
+                    if q_idx2 >= q_idx:
+                        promoted_ids.append(req2.request_id)
+                        chosen_by_q[q_idx2].append(req2)
+                        short[req2.request_id] = c_rem2
+                        st.a_promotions += 1
+                        if tier2 == 0:
+                            st.a_starve_promotions += 1
+            else:
+                # Synchronous ready short request (or legacy non-short_first mode):
+                # reserve bounded short_budget for immediate compute.
+                short[req.request_id] = c_rem
+
+        for q_idx, queue in enumerate((scheduler.skipped_waiting, scheduler.waiting)):
+            for req in reversed(chosen_by_q[q_idx]):
                 if queue.peek_request() is not req:
                     queue.remove_request(req)
                     queue.prepend_request(req)
-                short[req.request_id] = eff_rem
-                promoted_waiting_id = req.request_id
-                if short_first:
-                    st.a_promotions += 1
-                    if tier == 0:
-                        st.a_starve_promotions += 1
 
-        if short:
+        if short or async_init_ids:
             return LMCacheBudgetPlan(
                 budget,
                 short,
                 sum(short.values()),
                 budget_split=True,
                 isolate_waiting=True,
-                promoted_waiting_id=promoted_waiting_id,
+                promoted_waiting_ids=promoted_ids,
+                async_init_ids=async_init_ids,
                 st=st,
                 cap_tokens=cap_tokens,
                 cap_max=cap_max,
@@ -741,6 +1067,10 @@ def plan(scheduler, budget: int, st):
                 release_tokens=release_tokens,
                 active_ultra_ids=active_ultra_ids,
                 has_short_pressure=has_short_pressure,
+                async_cap_tokens=async_cap_tokens,
+                async_cap_max=async_cap_max,
+                async_cap_idle_max=async_cap_idle_max,
+                active_large_dma_ids=active_large_dma_ids,
             )
 
         if cap_tokens <= 0 and not short_first:
@@ -759,22 +1089,34 @@ def plan(scheduler, budget: int, st):
         ahead_used = 0
         cum_compute = 0
         sim_ultra = len(active_ultra_ids)
+        sim_dma = len(active_large_dma_ids)
         sim_long_admits = 0
         chosen_by_queue: tuple[list, list] = ([], [])
         seen_waiting_queue = False
         max_pack = max(
             1, getattr(scheduler, "max_num_active_reqs", 32) - len(scheduler.running)
         )
+        replay = getattr(scheduler, "prefix_replay_tokens", 0)
 
         for item in sorted_items:
             if len(ordered_ids) >= max_pack or cum_compute >= avail_budget:
                 break
-            pkey, eff_rem, _s_idx, q_idx, queue, res_hint, async_hint, req = item
-            if not _allowed_by_b(req, eff_rem, sim_ultra):
+            (
+                pkey,
+                compute_rem,
+                async_load_toks,
+                _s_idx,
+                q_idx,
+                queue,
+                res_hint,
+                async_hint,
+                req,
+            ) = item
+            if not _allowed_by_b(
+                req, compute_rem, async_load_toks, sim_ultra, sim_dma
+            ):
                 continue
-            # Avoid burst-admitting >2 main-lane (>short_limit) async loads in one
-            # handover step, which would bloat #44560 reserved_blocks.
-            if eff_rem > short_limit and sim_long_admits >= 2:
+            if compute_rem > short_limit and sim_long_admits >= 2:
                 continue
 
             # Check/drive lookup resolution.
@@ -785,33 +1127,39 @@ def plan(scheduler, budget: int, st):
                     is_resolved = True
                 elif ahead_used < ahead_budget:
                     rid = req.request_id
-                    if rid in probed:
-                        hit = probed[rid]
+                    if rid in probed and probed[rid] is not None:
+                        ext = probed[rid]
                     else:
                         if track_submitted:
                             st.submitted.add(rid)
-                        hit = _lookup_hit(scheduler, connector, req, st)
+                        ext = _lookup_hit(scheduler, connector, req, st)
                     ahead_used += 1
-                    if hit is not None:
+                    if ext is not None:
                         is_resolved = True
-                        replay = getattr(scheduler, "prefix_replay_tokens", 0)
-                        eff_rem = max(1, req.num_tokens - max(0, hit - replay))
-                        is_async = hit > replay
-                        if not _allowed_by_b(req, eff_rem, sim_ultra):
+                        loc = st.local_hits.get(rid, 0)
+                        tot = loc + ext
+                        best = max(loc, tot)
+                        compute_rem = (
+                            max(1, req.num_tokens - max(0, best - replay))
+                            if best > 0
+                            else req.num_tokens
+                        )
+                        raw_a = max(0, tot - loc)
+                        is_async = bool(raw_a > 0 and tot > replay)
+                        async_load_toks = raw_a if is_async else 0
+                        if not _allowed_by_b(
+                            req, compute_rem, async_load_toks, sim_ultra, sim_dma
+                        ):
                             continue
-                        if eff_rem > short_limit and sim_long_admits >= 2:
+                        if compute_rem > short_limit and sim_long_admits >= 2:
                             continue
 
             if not is_resolved:
-                # If we already scheduled real compute this step, stop before
-                # letting a longer resolved request leapfrog an unresolved shorter one.
                 if cum_compute > 0:
                     strict_ordered = True
                     break
                 continue
 
-            # scheduler visits skipped_waiting (q_idx=0) before waiting (q_idx=1);
-            # do not append a skipped_waiting item after a waiting item in the same step.
             if q_idx == 0 and seen_waiting_queue:
                 strict_ordered = True
                 break
@@ -823,17 +1171,24 @@ def plan(scheduler, budget: int, st):
             st.a_promotions += 1
             if pkey[0] == 0:
                 st.a_starve_promotions += 1
-            if eff_rem > short_limit:
+            if compute_rem > short_limit:
                 sim_long_admits += 1
             if (
                 cap_tokens > 0
                 and req not in inflight
-                and eff_rem >= cap_tokens
-                and eff_rem > release_tokens
+                and compute_rem >= cap_tokens
+                and compute_rem > release_tokens
             ):
                 sim_ultra += 1
+            if (
+                async_cap_tokens > 0
+                and req not in inflight
+                and is_async
+                and async_load_toks >= async_cap_tokens
+            ):
+                sim_dma += 1
             if not is_async:
-                cum_compute += eff_rem
+                cum_compute += compute_rem
 
         # Place chosen candidates at the front of their respective queues in exact order.
         for q_idx, queue in enumerate((scheduler.skipped_waiting, scheduler.waiting)):
@@ -859,4 +1214,8 @@ def plan(scheduler, budget: int, st):
         release_tokens=release_tokens,
         active_ultra_ids=active_ultra_ids,
         has_short_pressure=has_short_pressure,
+        async_cap_tokens=async_cap_tokens,
+        async_cap_max=async_cap_max,
+        async_cap_idle_max=async_cap_idle_max,
+        active_large_dma_ids=active_large_dma_ids,
     )

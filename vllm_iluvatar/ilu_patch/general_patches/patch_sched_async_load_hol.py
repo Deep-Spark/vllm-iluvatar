@@ -51,15 +51,13 @@ _LOG_INTERVAL_S = 10.0
 
 # Dedented ``Scheduler.schedule`` source fragments.
 _OLD_LOOP_HEAD = """\
+    if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
         step_skipped_waiting = create_request_queue(self.policy)
-
-        while (self.waiting or self.skipped_waiting) and token_budget > 0:
 """
 _NEW_LOOP_HEAD = """\
+    if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
         step_skipped_waiting = create_request_queue(self.policy)
         ilu_refused_async_load = False
-
-        while (self.waiting or self.skipped_waiting) and token_budget > 0:
 """
 
 _OLD_AFTER_PROMOTE = """\

@@ -40,6 +40,21 @@ def patch_schedule_source(source: str) -> str:
             ),
         ),
         (
+            "        while (self.waiting or self.skipped_waiting) and token_budget > 0:\n"
+            "            if input_budget <= draft_slots:\n"
+            "                break\n",
+            (
+                "        while (self.waiting or self.skipped_waiting) and (\n"
+                "            token_budget > 0\n"
+                "            or (supply_plan is not None and supply_plan.has_pending_async_init())\n"
+                "        ):\n"
+                "            if input_budget <= draft_slots and (\n"
+                "                supply_plan is None or not supply_plan.has_pending_async_init()\n"
+                "            ):\n"
+                "                break\n"
+            ),
+        ),
+        (
             "            num_external_computed_tokens = 0\n"
             "            load_kv_async = False\n",
             (

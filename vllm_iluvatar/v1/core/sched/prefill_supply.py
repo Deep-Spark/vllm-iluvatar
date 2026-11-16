@@ -29,8 +29,10 @@ class SupplyState:
         self.submitted = set()
         self.ultra_ids = set()
         self.resolved_hits = {}
+        self.local_hits = {}
         self.first_seen = {}
         self.b_cap_skips = 0
+        self.b_async_cap_skips = 0
         self.a_promotions = 0
         self.a_starve_promotions = 0
 
@@ -54,6 +56,7 @@ class SupplyState:
             self.ultra_ids.discard(rid)
             self.submitted.discard(rid)
             self.resolved_hits.pop(rid, None)
+            self.local_hits.pop(rid, None)
             self.first_seen.pop(rid, None)
 
 
@@ -82,6 +85,9 @@ class BudgetPlan:
             self.long_used += tokens
 
     def should_skip_waiting(self, scheduler, rid):
+        return False
+
+    def has_pending_async_init(self):
         return False
 
     def can_admit_waiting(self, scheduler, request, num_computed_tokens, load_kv_async):

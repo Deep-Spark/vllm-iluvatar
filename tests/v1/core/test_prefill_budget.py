@@ -491,6 +491,7 @@ def test_real_schedule_composes_and_is_idempotent(monkeypatch):
     assert "_ilu_align_prefix_replay_ext_tokens" in source
     assert "if num_new_tokens <= 0:" in source
     assert source.count("_ilu_prefill_supply.plan(") == 1
+    assert source.count("supply_plan.has_pending_async_init(") == 2
     assert source.count("supply_plan.limit(") == 3
     assert source.count("supply_plan.consume(") == 2
     assert source.count("supply_plan.should_skip_waiting(") == 2
@@ -641,7 +642,7 @@ def _live_scheduler(
     patch._apply()
     patch_sched_async_load_hol._apply()
 
-    hits = dict(local_hits or {})
+    hits = local_hits if isinstance(local_hits, dict) else dict(local_hits or {})
     refused = set(refuse_async_loads)
     empty_blocks = _FakeBlocks(())
 
@@ -1344,4 +1345,178 @@ def test_strategy_ab_opt2_smooth_aging_and_tier0_fcfs_anti_starvation(monkeypatc
     assert out2.num_scheduled_tokens == {"ultra_800k": 4096}
     assert [r.request_id for r in sched2.running] == ["ultra_800k"]
     assert [r.request_id for r in sched2.waiting] == ["mid_35k_aged"]
+
+
+def test_tier_aware_gpu_hit_vs_lmcache_hit_and_zero_bubble_regime1(monkeypatch):
+    from vllm.v1.request import RequestStatus
+
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LONG_CAP_TOKENS", "256000")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_SHORT_FIRST", "1")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_AHEAD", "8")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_SUBMIT", "16")
+    monkeypatch.setattr("time.time", lambda: 100.0)
+
+    # Case 1: Regime 1 with ONLY an async-load short request (400k prompt hitting
+    # 392k in LMCache -> 8k compute left, load_kv_async=True -> num_new_tokens=0).
+    # Running long_1 MUST keep the full 4096 budget (zero bubble!), while lmc_warm
+    # still initiates WAITING_FOR_REMOTE_KVS on the same step!
+    long_1 = _live_request("long_1", 800_000, done=4096, status=RequestStatus.RUNNING)
+    lmc_warm = _live_request("lmc_warm", 400_000)
+    lmc_warm.arrival_time = 99.0
+    long_2 = _live_request("long_2", 800_000)
+    long_2.arrival_time = 98.0
+
+    lmcache1 = LMCacheMPConnector(
+        resolved={"long_2"},
+        hits={"lmc_warm": 392_000},
+    )
+    sched1 = _live_scheduler(
+        monkeypatch,
+        running=[long_1],
+        waiting=[long_2, lmc_warm],
+        connector=MultiConnector(OptNixlConnector(), lmcache1),
+        budget=4096,
+    )
+    out1 = sched1.schedule()
+    assert lmc_warm.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert out1.num_scheduled_tokens == {"long_1": 4096}
+    assert [r.request_id for r in sched1.running] == ["long_1"]
+    assert [r.request_id for r in sched1.skipped_waiting] == ["lmc_warm"]
+    assert [r.request_id for r in sched1.waiting] == ["long_2"]
+
+    # Case 2: GPU local APC hit (400k -> 392k GPU hit -> 8k sync compute) vs
+    # LMCache external hit (400k -> 392k LMCache hit -> 8k compute + 392k DMA),
+    # placed past the 4-probe seen window so early LOOKUP_SUBMIT local_hits cache
+    # discovers gpu_warm! gpu_warm ranks #1 (sched_cost ~8k < ~28.6k) and runs
+    # immediately for 2048 tokens without wasting budget.
+    long_r = _live_request("long_r", 800_000, done=4096, status=RequestStatus.RUNNING)
+    cold_mid = [
+        _live_request(f"cold_{i}", 100_000) for i in range(6)
+    ]
+    for i, r in enumerate(cold_mid):
+        r.arrival_time = 90.0 + i
+    lmc_hit_req = _live_request("lmc_hit_req", 400_000)
+    lmc_hit_req.arrival_time = 97.0
+    gpu_hit_req = _live_request("gpu_hit_req", 400_000)
+    gpu_hit_req.arrival_time = 98.0  # arrived AFTER lmc_hit_req, but local HBM!
+
+    lmcache2 = LMCacheMPConnector(
+        resolved={*(r.request_id for r in cold_mid), "gpu_hit_req"},
+        hits={"lmc_hit_req": 392_000},
+    )
+    sched2 = _live_scheduler(
+        monkeypatch,
+        running=[long_r],
+        waiting=[*cold_mid, lmc_hit_req, gpu_hit_req],
+        connector=MultiConnector(OptNixlConnector(), lmcache2),
+        budget=4096,
+        local_hits={"gpu_hit_req": 392_000},
+    )
+    out2 = sched2.schedule()
+    assert out2.num_scheduled_tokens == {"long_r": 2048, "gpu_hit_req": 2048}
+    assert [r.request_id for r in sched2.running] == ["long_r", "gpu_hit_req"]
+
+    # Case 3: Co-promotion in Regime 1 when lmc_hit_35k (27k DMA -> 8k left,
+    # sched_cost ~10.4k) beats ready_16k (16k cold -> sched_cost 16k):
+    # lmc_hit_35k initiates 0-token async DMA AND ready_16k gets the 2048 short
+    # compute budget in the VERY SAME STEP!
+    long_r3 = _live_request("long_r3", 800_000, done=4096, status=RequestStatus.RUNNING)
+    lmc_hit_35k = _live_request("lmc_hit_35k", 35_000)
+    lmc_hit_35k.arrival_time = 98.0
+    ready_16k = _live_request("ready_16k", 16_000)
+    ready_16k.arrival_time = 99.0
+    sched3 = _live_scheduler(
+        monkeypatch,
+        running=[long_r3],
+        waiting=[ready_16k, lmc_hit_35k],
+        connector=MultiConnector(
+            OptNixlConnector(),
+            LMCacheMPConnector(resolved={"ready_16k"}, hits={"lmc_hit_35k": 27_008}),
+        ),
+        budget=4096,
+    )
+    out3 = sched3.schedule()
+    assert lmc_hit_35k.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert out3.num_scheduled_tokens == {"long_r3": 2048, "ready_16k": 2048}
+    assert [r.request_id for r in sched3.running] == ["long_r3", "ready_16k"]
+
+
+def test_strategy_b2_transient_large_async_dma_gate_prevents_duplicate_pull_and_releases_on_recv(
+    monkeypatch,
+):
+    from vllm.v1.request import RequestStatus
+
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LONG_CAP_TOKENS", "256000")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_ASYNC_LOAD_CAP_TOKENS", "131072")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_ASYNC_LOAD_CAP_MAX", "1")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_SHORT_FIRST", "1")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_AHEAD", "8")
+    monkeypatch.setenv("VLLM_ILU_PREFILL_LOOKUP_SUBMIT", "16")
+    monkeypatch.setattr("time.time", lambda: 100.0)
+
+    # Three 400k requests sharing the same 392k prefix in LMCache arrive together,
+    # plus a cold 35k request (non-ultra pressure -> async_cap_max=1).
+    b1 = _live_request("b1", 400_000)
+    b1.arrival_time = 95.0
+    b2 = _live_request("b2", 400_000)
+    b2.arrival_time = 96.0
+    b3 = _live_request("b3", 400_000)
+    b3.arrival_time = 97.0
+    mid_35k = _live_request("mid_35k", 35_030)
+    mid_35k.arrival_time = 98.0
+
+    local_hits_map = {}
+    lmcache = LMCacheMPConnector(
+        resolved={"mid_35k"},
+        hits={"b1": 392_000, "b2": 392_000, "b3": 392_000},
+    )
+    sched = _live_scheduler(
+        monkeypatch,
+        running=[],
+        waiting=[b1, b2, b3, mid_35k],
+        connector=MultiConnector(OptNixlConnector(), lmcache),
+        budget=4096,
+        local_hits=local_hits_map,
+    )
+
+    # Step 1: ONLY b1 enters WAITING_FOR_REMOTE_KVS (392k >= 128k transient DMA cap=1);
+    # b2 and b3 are held back instead of allocating 3 x 392k duplicate HBM blocks!
+    # Meanwhile mid_35k is NOT blocked and runs for 4096 tokens!
+    out1 = sched.schedule()
+    assert b1.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert b2.status == RequestStatus.WAITING
+    assert b3.status == RequestStatus.WAITING
+    assert out1.num_scheduled_tokens == {"mid_35k": 4096}
+    assert supply.state(sched).b_async_cap_skips >= 0
+
+    # Step 2: b1 finishes its 0.2s DMA transfer -> its 392k blocks are now cached
+    # in GPU HBM! mid_35k has 30,934 tokens left (<= 32,768 short_limit -> Regime 2
+    # transition step), so mid_35k runs for 4096 while b1 is promoted to WAITING
+    # and ordered right at the front of waiting!
+    mid_35k.num_computed_tokens += 4096
+    sched.finished_recving_kv_req_ids.add("b1")
+    local_hits_map["b2"] = 392_000
+    local_hits_map["b3"] = 392_000
+
+    out2 = sched.schedule()
+    assert b1.status == RequestStatus.WAITING
+    assert out2.num_scheduled_tokens == {"mid_35k": 4096}
+
+    # Now probe Regime 1 directly with long_run (800k) running: b1 (DMA done ->
+    # 8128 left) and b2 (now local GPU hit -> 8128 left, 0 DMA!) run cleanly
+    # in the short lane without any DMA cap or WAITING_FOR_REMOTE_KVS!
+    long_run = _live_request("long_run", 800_000, done=4096, status=RequestStatus.RUNNING)
+    sched.requests["long_run"] = long_run
+    sched.running = [long_run]
+    out3 = sched.schedule()
+    assert b1.status == RequestStatus.RUNNING
+    assert out3.num_scheduled_tokens == {"long_run": 2048, "b1": 2048}
+
+    long_run.num_computed_tokens += 2048
+    b1.num_computed_tokens += 8128  # b1 finishes its 8128 prefill tail
+    sched.running = [long_run]
+    out4 = sched.schedule()
+    assert b2.status == RequestStatus.RUNNING
+    assert out4.num_scheduled_tokens == {"long_run": 2048, "b2": 2048}
+
 

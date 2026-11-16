@@ -26,6 +26,8 @@ from vllm.forward_context import (
 )
 from vllm.logger import init_logger
 
+from vllm_iluvatar.ilu_util.arch import IVCORE11, cuda_arch
+
 logger = init_logger(f"vllm.{__name__}")
 
 
@@ -34,6 +36,19 @@ _FP8_BLOCK = 32
 _DEAD_HASH = -1
 
 _PREFIX_LOOKUP_PLAN = "_ilu_prefix_engram_lookup"
+
+
+def _bf16_projection_row_capacity(rows: torch.Tensor, weight: torch.Tensor) -> int:
+    """Reserve a complete MR GEMM row tile while retaining the logical batch."""
+    count = rows.shape[0]
+    if (
+        16 < count < 32
+        and rows.is_cuda
+        and rows.dtype == weight.dtype == torch.bfloat16
+        and cuda_arch() == IVCORE11
+    ):
+        return 32
+    return count
 
 
 @dataclass(frozen=True)
@@ -1078,6 +1093,19 @@ class IluEngram(nn.Module):
         # is in play.
         if self.wkv_scale is None:
             x = rows.flatten(-2)
+            capacity = _bf16_projection_row_capacity(x, self.wkv_weight)
+            if capacity > x.shape[0]:
+                available = (
+                    x.untyped_storage().nbytes() - x.storage_offset() * x.element_size()
+                )
+                if (
+                    not x.is_contiguous()
+                    or available < capacity * x.shape[1] * x.element_size()
+                ):
+                    storage = x.new_empty((capacity, x.shape[1]))
+                    padded = storage[: x.shape[0]]
+                    padded.copy_(x)
+                    x = padded
             if (
                 os.getenv("VLLM_ILU_ENGRAM_LINEAR", "0") == "1"
                 and 0 < x.shape[0] <= 32
@@ -1114,7 +1142,17 @@ class IluEngram(nn.Module):
             # ``wkv`` has no bias, so those rows give kv == 0, and the gate
             # adds ``gate * value`` with ``value == 0`` -- the position passes
             # through untouched, same as community.
-            rows = rows.masked_fill(~token_mask.view(-1, 1, 1), 0)
+            capacity = (
+                _bf16_projection_row_capacity(rows, self.wkv_weight)
+                if self.wkv_scale is None
+                else rows.shape[0]
+            )
+            mask = ~token_mask.view(-1, 1, 1)
+            if capacity > rows.shape[0]:
+                masked = rows.new_empty((capacity, *rows.shape[1:]))[: rows.shape[0]]
+                rows = torch.ops.aten.masked_fill.Scalar_out(rows, mask, 0, out=masked)
+            else:
+                rows = rows.masked_fill(mask, 0)
         return self.apply(hidden_states, rows)
 
     def forward_from_history(

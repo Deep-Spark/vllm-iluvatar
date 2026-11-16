@@ -81,6 +81,79 @@ logger = init_logger(__name__)
 # See vllm_iluvatar/v1/worker/gpu_worker.py.
 
 
+def warmup_topp_split_kernels(runner: GPUModelRunner) -> None:
+    if (
+        not getattr(runner, "is_last_pp_rank", False)
+        or getattr(runner, "is_pooling_model", False)
+        or getattr(getattr(runner, "device", None), "type", None) != "cuda"
+    ):
+        return
+    from vllm.triton_utils import HAS_TRITON
+
+    if not HAS_TRITON:
+        return
+    import time
+
+    from vllm.utils.platform_utils import num_compute_units
+    from vllm.v1.sample.ops.topk_topp_triton import (
+        _SPLIT_MAX_BATCH,
+        _apply_topp_split,
+        _topp_split_count,
+    )
+
+    t0 = time.perf_counter()
+    device_index = runner.device.index
+    num_sm = (
+        num_compute_units(device_index)
+        if device_index is not None
+        else num_compute_units()
+    )
+    decode_query_len = getattr(
+        runner, "decode_query_len", runner.num_speculative_steps + 1
+    )
+    max_bs = min(runner.max_num_reqs * decode_query_len, _SPLIT_MAX_BATCH)
+    seen_splits: set[int] = set()
+    warmup_pairs: list[tuple[int, int]] = []
+    for bs in range(1, max_bs + 1):
+        splits = _topp_split_count(bs, num_sm)
+        if splits not in seen_splits:
+            seen_splits.add(splits)
+            warmup_pairs.append((bs, splits))
+    if not warmup_pairs:
+        return
+
+    max_warmup_bs = max(bs for bs, _ in warmup_pairs)
+    dummy_logits = torch.zeros(
+        (max_warmup_bs, runner.vocab_size),
+        dtype=torch.float32,
+        device=runner.device,
+    )
+    dummy_p = torch.full(
+        (max_warmup_bs,),
+        0.95,
+        dtype=torch.float32,
+        device=runner.device,
+    )
+    for bs, _ in warmup_pairs:
+        _apply_topp_split(
+            dummy_logits[:bs],
+            None,
+            dummy_p[:bs],
+            float("-inf"),
+            num_sm,
+        )
+    torch.cuda.synchronize(runner.device)
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    logger.info(
+        "Warmed up Triton top-p split kernels (HAS_K=False, vocab=%d, "
+        "num_sm=%d, (batch_size, S)=%s) in %.2f ms",
+        runner.vocab_size,
+        num_sm,
+        warmup_pairs,
+        elapsed_ms,
+    )
+
+
 def _recover_int8_buf(kv_caches: dict[str, torch.Tensor], device: torch.device):
     """Recover the shared int8 backing buffer from any KV view's storage."""
     first_view = next(iter(kv_caches.values()))

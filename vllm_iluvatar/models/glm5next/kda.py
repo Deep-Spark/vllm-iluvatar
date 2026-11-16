@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ixformer.inference.functions as ixfops
 import torch
+import vllm.envs as envs
 from torch import nn
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -32,6 +33,9 @@ from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 
 from vllm_iluvatar.model_executor.layers.mamba.ops.ilu_causal_conv1d import (
     causal_conv1d_fn,
+)
+from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes.ilu_compressed_tensors_w8a8_int8 import (  # noqa: E501
+    IluW8A8OnlineLinearMethod,
 )
 from vllm_iluvatar.v1.attention.backends.ilu_gdn_attn import IluGDNAttentionMetadata
 
@@ -174,6 +178,15 @@ class IluGlm5NextLinearAttention(GatedDeltaNetAttention):
             quant_config=self.quant_config,
             prefix=f"{prefix}.o_proj",
         )
+
+        if envs.VLLM_ILU_GLM5NEXT_KDA_PROJ_W8A8:
+            self.in_proj_qkvbfg_a.quant_method = IluW8A8OnlineLinearMethod(
+                self.in_proj_qkvbfg_a.quant_method,
+                quantized_rows=3 * self.local_projection_size,
+            )
+            self.o_proj.quant_method = IluW8A8OnlineLinearMethod(
+                self.o_proj.quant_method
+            )
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:

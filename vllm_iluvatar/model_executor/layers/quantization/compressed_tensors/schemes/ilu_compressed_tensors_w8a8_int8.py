@@ -17,6 +17,7 @@ from ixformer.inference.functions.ops.gemm.int8.w8a8_shapes import (
 )
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_scheme import (  # noqa: E501
     CompressedTensorsScheme,
 )
@@ -691,3 +692,61 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
         else:
             out = out[..., : self.gemm_info.get_n()].contiguous()
         return out
+
+
+class IluW8A8OnlineLinearMethod(LinearMethodBase):
+    """Load BF16 weights, then delegate execution to the W8A8 scheme.
+
+    An optional trailing set of output rows stays BF16, for merged projections
+    such as KDA QKV/B/F/G. The original method owns checkpoint loading and TP
+    sharding; the scheme owns packing, activation quantization and dispatch.
+    """
+
+    def __init__(self, original, quantized_rows: int | None = None):
+        self.original = original
+        self.quantized_rows = quantized_rows
+        self.scheme = IluCompressedTensorsW8A8Int8(
+            strategy="channel",
+            is_static_input_scheme=False,
+            input_symmetric=True,
+            ilu_params={
+                "mixed_strategy": "CHANNEL",
+                "gemm_format": "NN",
+                "gemm_mode": "PERF",
+            },
+        )
+
+    def create_weights(self, *args, **kwargs):
+        return self.original.create_weights(*args, **kwargs)
+
+    def process_weights_after_loading(self, layer):
+        self.original.process_weights_after_loading(layer)
+        weight = layer.weight.detach()
+        if weight.dtype != torch.bfloat16 or weight.ndim != 2:
+            raise ValueError("Online W8A8 requires a 2D BF16 weight")
+        rows = weight.shape[0] if self.quantized_rows is None else self.quantized_rows
+        if not 0 < rows <= weight.shape[0]:
+            raise ValueError("Quantized row count must be within the projection weight")
+        weight_fp32 = weight[:rows].float()
+        scale = weight_fp32.abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / 127
+        quantized = (weight_fp32 / scale).round().clamp(-127, 127).to(torch.int8)
+        if self.quantized_rows is not None:
+            layer.register_buffer(
+                "bf16_tail_weight", weight[rows:].contiguous().clone()
+            )
+        layer.weight = torch.nn.Parameter(quantized, requires_grad=False)
+        layer.register_parameter(
+            "weight_scale", torch.nn.Parameter(scale, requires_grad=False)
+        )
+        layer.logical_widths = [rows]
+        self.scheme.process_weights_after_loading(layer)
+
+    def apply(self, layer, x, bias=None):
+        if bias is not None:
+            raise ValueError("Online W8A8 mixed projections do not support bias")
+        flat = x.reshape(-1, x.shape[-1])
+        output = self.scheme.apply_weights(layer, flat, bias=None)
+        if self.quantized_rows is not None:
+            tail = torch.nn.functional.linear(flat, layer.bf16_tail_weight)
+            output = torch.cat((output, tail), dim=-1)
+        return output.view(*x.shape[:-1], output.shape[-1])

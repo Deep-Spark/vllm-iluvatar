@@ -266,6 +266,12 @@ class IluWorker(Worker):
                         index_layout.num_blocks,
                         index_state.scales.values(),
                     )
+            if isinstance(self.model_runner, _gpu_model_runner.GPUModelRunner):
+                from vllm_iluvatar.v1.worker.gpu.model_runner import (
+                    warmup_topp_split_kernels,
+                )
+
+                warmup_topp_split_kernels(self.model_runner)
             self._initialize_prefix_cache()
         except BaseException:
             if index_state is not None:

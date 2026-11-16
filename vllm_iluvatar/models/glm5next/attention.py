@@ -36,7 +36,7 @@ from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
 
-from vllm_iluvatar.ilu_util.arch import is_ivcore30
+from vllm_iluvatar.ilu_util.arch import is_ivcore11, is_ivcore30
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes.ilu_compressed_tensors_w8a8_int8 import (  # noqa: E501
     IluW8A8OnlineLinearMethod,
 )
@@ -228,6 +228,7 @@ class IluIndexer(nn.Module):
         super().__init__()
         self.vllm_config = vllm_config
         self.config = config
+        self.supports_query_stream_overlap = is_ivcore11()
         self.quant_config = quant_config
         assert config.index_topk is not None
         assert config.index_n_heads is not None

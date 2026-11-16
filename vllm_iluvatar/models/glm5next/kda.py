@@ -7,6 +7,7 @@ import ixformer.inference.functions as ixfops
 import torch
 import vllm.envs as envs
 from torch import nn
+from torch.nn.functional import linear
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import divide
@@ -31,6 +32,8 @@ from vllm.models.glm5next.common.kda import (
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 
+from vllm_iluvatar.ilu_util.arch import is_ivcore11
+from vllm_iluvatar.ilu_util.streams import get_prefill_aux_stream
 from vllm_iluvatar.model_executor.layers.mamba.ops.ilu_causal_conv1d import (
     causal_conv1d_fn,
 )
@@ -40,6 +43,21 @@ from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes
 from vllm_iluvatar.v1.attention.backends.ilu_gdn_attn import IluGDNAttentionMetadata
 
 logger = init_logger(f"vllm.{__name__}")
+
+
+def _project_gates_async(x, weight, gate_sizes, f_projection, g_projection, shape):
+    caller = torch.cuda.current_stream(x.device)
+    stream = get_prefill_aux_stream(x.device)
+    stream.wait_stream(caller)
+    x.record_stream(stream)
+    with torch.cuda.stream(stream):
+        beta, f_a, g_a = linear(x, weight).split(gate_sizes, dim=-1)
+        g1 = f_projection(f_a)[0].view(shape)
+        g2 = g_projection(g_a)[0].view(shape)
+        ready = stream.record_event()
+    for output in (beta, g1, g2):
+        output.record_stream(caller)
+    return beta, g1, g2, ready
 
 
 class IluGlm5NextLinearAttention(GatedDeltaNetAttention):
@@ -209,26 +227,56 @@ class IluGlm5NextLinearAttention(GatedDeltaNetAttention):
     def forward(
         self, hidden_states: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
-        projected = self.in_proj_qkvbfg_a(hidden_states)[0]
-        if self._split_qkvbfg_output:
-            qkv, gates = projected
-            beta_raw, f_a, g_a = gates.split(
-                [self.local_num_heads, self.head_dim, self.head_dim], dim=-1
-            )
-        else:
-            qkv, beta_raw, f_a, g_a = projected.split(
-                [
-                    3 * self.local_projection_size,
-                    self.local_num_heads,
-                    self.head_dim,
-                    self.head_dim,
-                ],
-                dim=-1,
-            )
-
         shape = (-1, self.local_num_heads, self.head_dim)
-        g1 = self.f_b_proj(f_a)[0].view(shape)
-        g2 = self.g_b_proj(g_a)[0].view(shape)
+        ready = None
+        projection = self.in_proj_qkvbfg_a
+        method = projection.quant_method
+        gate_sizes = [self.local_num_heads, self.head_dim, self.head_dim]
+        if (
+            self.tp_size == 1
+            and hidden_states.ndim == 2
+            and hidden_states.shape[0] >= 512
+            and is_ivcore11()
+            and isinstance(method, IluW8A8OnlineLinearMethod)
+            and method.quantized_rows == 3 * self.local_projection_size
+            and projection.bias is None
+            and not projection.gather_output
+            and not torch.cuda.is_current_stream_capturing()
+            and not torch.compiler.is_compiling()
+        ):
+            attn = get_forward_context().attn_metadata
+            metadata = attn.get(self.prefix) if isinstance(attn, dict) else None
+            if (
+                isinstance(metadata, IluGDNAttentionMetadata)
+                and metadata.num_prefills > 0
+                and metadata.num_decodes == metadata.num_spec_decodes == 0
+            ):
+                logger.info_once(
+                    "ILU KDA Prefill gate stream active on %s", hidden_states.device
+                )
+                beta_raw, g1, g2, ready = _project_gates_async(
+                    hidden_states,
+                    projection.bf16_tail_weight,
+                    gate_sizes,
+                    self.f_b_proj,
+                    self.g_b_proj,
+                    shape,
+                )
+                qkv = method.scheme.apply_weights(projection, hidden_states, bias=None)
+
+        if ready is None:
+            projected = projection(hidden_states)[0]
+            if self._split_qkvbfg_output:
+                qkv, gates = projected
+                beta_raw, f_a, g_a = gates.split(gate_sizes, dim=-1)
+            else:
+                qkv, beta_raw, f_a, g_a = projected.split(
+                    [3 * self.local_projection_size, *gate_sizes],
+                    dim=-1,
+                )
+
+            g1 = self.f_b_proj(f_a)[0].view(shape)
+            g2 = self.g_b_proj(g_a)[0].view(shape)
 
         core_attn_out = torch.empty_like(g1)
 
@@ -237,7 +285,10 @@ class IluGlm5NextLinearAttention(GatedDeltaNetAttention):
             g1=g1,
             beta=beta_raw,
             core_attn_out=core_attn_out,
+            gate_ready=ready,
         )
+        if ready is not None:
+            ready.wait(torch.cuda.current_stream(core_attn_out.device))
         core_attn_out = self.o_norm(core_attn_out, g2)
         core_attn_out = core_attn_out.reshape(core_attn_out.size(0), -1)
         return self.o_proj(core_attn_out)[0]
@@ -249,6 +300,7 @@ class IluGlm5NextLinearAttention(GatedDeltaNetAttention):
         g1: torch.Tensor,
         beta: torch.Tensor,
         core_attn_out: torch.Tensor,
+        gate_ready: torch.cuda.Event | None = None,
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
@@ -350,6 +402,8 @@ class IluGlm5NextLinearAttention(GatedDeltaNetAttention):
                 input_index=non_spec_token_indx,
             ).transpose(0, 1)
             q_ns, k_ns, v_ns = qkv_ns.split(self.local_projection_size, dim=-1)
+            if gate_ready is not None:
+                gate_ready.wait(torch.cuda.current_stream(q_ns.device))
             ixfops.chunk_kda_with_fused_gate(
                 q_ns,
                 k_ns,

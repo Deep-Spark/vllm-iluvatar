@@ -61,26 +61,37 @@ if TYPE_CHECKING:
 def _make_pp_prefill_coalesce(orig, max_wait_s: float):
     """Admit arrivals before short initial PP batches within one wait budget.
 
-    Opt-in for synchronous PP with DP=1. The upstream scheduler and executor
-    still own every batch, including empty batches. Waiting stops after the
-    first worker result and is never applied to decode or KV-transfer paths.
+    Opt-in for PP with DP=1 (sync or async V2). The upstream scheduler and
+    executor still own every batch, including empty batches. Waiting stops on
+    the first completed batch or when enough prompt tokens are buffered, and is
+    never applied to decode or KV-consumer paths.
 
     Target: EngineCore.step_with_batch_queue at vLLM 341bf7d4.
     Why: early short batches can fill the PP queue before arrivals are admitted.
     How: share one bounded arrival wait across the initial pipeline fill.
-    Scope: opt-in synchronous PP, DP=1, non-resumable generation only.
+    Scope: opt-in PP, DP=1, non-resumable generation only.
     Remove when upstream supports bounded admission during initial PP fill.
     """
+
+    def _uncomputed_prompt_tokens(scheduler) -> int:
+        total = 0
+        for req in scheduler.running:
+            if not req.resumable:
+                total += max(0, req.num_prompt_tokens - req.num_computed_tokens)
+        for req in getattr(scheduler, "waiting", ()):
+            if not getattr(req, "resumable", False):
+                total += max(0, req.num_prompt_tokens - req.num_computed_tokens)
+        return total
 
     @wraps(orig)
     def step_with_batch_queue(self):
         config = self.vllm_config
+        kv_cfg = config.kv_transfer_config
         if (
             max_wait_s <= 0
             or config.parallel_config.data_parallel_size != 1
-            or config.scheduler_config.async_scheduling
             or config.speculative_config is not None
-            or config.kv_transfer_config is not None
+            or (kv_cfg is not None and not getattr(kv_cfg, "is_kv_producer", False))
             or self.is_pooling_model
             or not hasattr(self, "input_queue")
         ):
@@ -97,12 +108,12 @@ def _make_pp_prefill_coalesce(orig, max_wait_s: float):
         if (
             getattr(self, "_ilu_pp_initial_fill", False)
             and self._ilu_pp_coalesce_remaining_s > 0
-            and batches
-            and 2 <= len(batches) < self.batch_queue_size
+            and 1 <= len(batches) < self.batch_queue_size
             and running
             and not self.scheduler.waiting
             and all(
                 request.num_tokens == request.num_prompt_tokens
+                and getattr(request, "num_output_placeholders", 0) == 0
                 and not request.resumable
                 for request in running
             )
@@ -119,22 +130,26 @@ def _make_pp_prefill_coalesce(orig, max_wait_s: float):
                 and getattr(self, "_ilu_pp_coalesce_last", None) != state
             ):
                 self._ilu_pp_coalesce_last = state
-                started = time.monotonic()
-                try:
-                    item = self.input_queue.get(
-                        timeout=self._ilu_pp_coalesce_remaining_s
-                    )
-                except queue.Empty:
-                    pass
-                else:
-                    self._handle_client_request(*item)
-                    self._process_input_queue()
-                finally:
-                    self._ilu_pp_coalesce_remaining_s = max(
-                        0.0,
-                        self._ilu_pp_coalesce_remaining_s
-                        - (time.monotonic() - started),
-                    )
+                while self._ilu_pp_coalesce_remaining_s > 0 and self.is_running():
+                    if batches[-1][2].done():
+                        break
+                    if _uncomputed_prompt_tokens(self.scheduler) >= budget:
+                        break
+                    slice_s = min(self._ilu_pp_coalesce_remaining_s, 0.002)
+                    started = time.monotonic()
+                    try:
+                        item = self.input_queue.get(timeout=slice_s)
+                    except queue.Empty:
+                        pass
+                    else:
+                        self._handle_client_request(*item)
+                        self._process_input_queue()
+                    finally:
+                        self._ilu_pp_coalesce_remaining_s = max(
+                            0.0,
+                            self._ilu_pp_coalesce_remaining_s
+                            - (time.monotonic() - started),
+                        )
 
         result = orig(self)
         if result[0] is not None:

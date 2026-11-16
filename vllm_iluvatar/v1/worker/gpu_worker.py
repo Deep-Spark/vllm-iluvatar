@@ -13,14 +13,66 @@ IluWorker — subclass of the community Worker with following overrides:
 from __future__ import annotations
 
 from contextlib import contextmanager
+from functools import partial
 
+import torch
+import torch.distributed as dist
 import vllm.v1.worker.gpu.model_runner as _gpu_model_runner
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu_worker import Worker
 
+from vllm_iluvatar.ilu_util.arch import is_ivcore11
+
+from .pp_exchange import (
+    defer_pp_send_wait,
+    drain_pp_send_wait,
+    schema_bytes,
+    schema_pp_exchange,
+)
+
 logger = init_logger(__name__)
+
+
+def _execute_with_received_pp_tensors(
+    runner, execute_model, scheduler_output, intermediate_tensors=None, **kwargs
+):
+    """Borrow received PP buffers for one eager forward, retaining their owner."""
+    saved = runner.intermediate_tensors
+    if intermediate_tensors is not None:
+        runner.intermediate_tensors = intermediate_tensors
+    try:
+        return execute_model(scheduler_output, intermediate_tensors, **kwargs)
+    finally:
+        runner.intermediate_tensors = saved
+
+
+def _persistent_runner_storage_ptrs(runner) -> set[int]:
+    ptrs: set[int] = set()
+    model = getattr(runner, "model", None)
+    if model is not None:
+        for t in model.parameters():
+            ptrs.add(t.untyped_storage().data_ptr())
+        for t in model.buffers():
+            ptrs.add(t.untyped_storage().data_ptr())
+    inter = getattr(runner, "intermediate_tensors", None)
+    if inter is not None and hasattr(inter, "tensors"):
+        for t in inter.tensors.values():
+            if isinstance(t, torch.Tensor):
+                ptrs.add(t.untyped_storage().data_ptr())
+    for attr in ("input_buffers", "model_state"):
+        state = getattr(runner, attr, None)
+        if state is None or not hasattr(state, "__dict__"):
+            continue
+        for val in vars(state).values():
+            if isinstance(val, torch.Tensor):
+                ptrs.add(val.untyped_storage().data_ptr())
+            elif isinstance(val, dict):
+                for item in val.values():
+                    if isinstance(item, torch.Tensor):
+                        ptrs.add(item.untyped_storage().data_ptr())
+    return ptrs
 
 
 def _pcp_profile_local_tokens(num_tokens: int, pcp_size: int, max_num_reqs: int) -> int:
@@ -31,6 +83,183 @@ def _pcp_profile_local_tokens(num_tokens: int, pcp_size: int, max_num_reqs: int)
 
 
 class IluWorker(Worker):
+    def _scoped_allocator_max_split(self, max_split_size_mb: int):
+        if (
+            max_split_size_mb == 20
+            and self.parallel_config.pipeline_parallel_size > 1
+            and self.model_config.enforce_eager
+        ):
+            max_split_size_mb = 21
+        return super()._scoped_allocator_max_split(max_split_size_mb)
+
+    def _eager_pp_direct_input_supported(self) -> bool:
+        parallel = getattr(self, "parallel_config", None)
+        model_cfg = getattr(self, "model_config", None)
+        vllm_cfg = getattr(self, "vllm_config", None)
+        runner = getattr(self, "model_runner", None)
+        if parallel is None or model_cfg is None or vllm_cfg is None or runner is None:
+            return False
+        if not getattr(self, "use_v2_model_runner", False):
+            return False
+        if not getattr(model_cfg, "enforce_eager", False):
+            return False
+        from vllm.config.compilation import CUDAGraphMode
+
+        if vllm_cfg.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            return False
+        return (
+            parallel.pipeline_parallel_size > 1
+            and parallel.data_parallel_size == 1
+            and parallel.prefill_context_parallel_size == 1
+            and parallel.decode_context_parallel_size == 1
+            and not parallel.use_sequence_parallel_moe
+            and not vllm_cfg.compilation_config.pass_config.enable_sp
+            and not getattr(parallel, "enable_dbo", False)
+            and getattr(runner, "ubatch_runner", None) is None
+        )
+
+    def _configure_eager_pp_exchange(self) -> None:
+        self._pp_send_schema = None
+        self._pp_recv_schema = None
+        self._pp_defer_send_wait = False
+        if not self._eager_pp_direct_input_supported() or not is_ivcore11():
+            return
+        if getattr(self.device, "type", None) != "cuda":
+            return
+        parallel = self.parallel_config
+        runner = self.model_runner
+        if (
+            parallel.tensor_parallel_size != 1
+            or getattr(runner, "is_pooling_model", False)
+            or getattr(runner, "is_encoder_decoder", False)
+            or getattr(runner, "use_aux_hidden_state_outputs", False)
+            or getattr(
+                getattr(runner, "pp_handler", None), "aux_hidden_state_relay_keys", None
+            )
+            or not callable(getattr(runner, "model", None))
+            or not callable(getattr(runner, "_dummy_run", None))
+        ):
+            return
+
+        from vllm.distributed import get_pp_group
+        from vllm.sequence import IntermediateTensors
+
+        pp = get_pp_group()
+        model = runner.model
+        if not hasattr(model, "register_forward_hook"):
+            return
+
+        probe_tokens = max(
+            2,
+            getattr(runner, "decode_query_len", 1),
+            getattr(runner, "uniform_decode_query_len", 1),
+        )
+        persistent_ptrs = _persistent_runner_storage_ptrs(runner)
+        captured: dict[str, object] = {}
+
+        def _capture_output(_module, _args, out):
+            if not pp.is_last_rank and isinstance(out, IntermediateTensors):
+                valid = all(
+                    t.is_cuda
+                    and t.is_contiguous()
+                    and t.ndim >= 1
+                    and t.shape[0] == probe_tokens
+                    for t in out.tensors.values()
+                )
+                if valid and out.tensors:
+                    captured["send_schema"] = tuple(
+                        (k, tuple(t.shape[1:]), t.dtype) for k, t in out.tensors.items()
+                    )
+                    captured["fresh_alloc"] = all(
+                        t.untyped_storage().data_ptr() not in persistent_ptrs
+                        for t in out.tensors.values()
+                    )
+
+        hook_handle = model.register_forward_hook(_capture_output)
+        try:
+            runner._dummy_run(probe_tokens, skip_attn=True, is_profile=True)
+        finally:
+            hook_handle.remove()
+            runner.execute_model_state = None
+            if not pp.is_last_rank and hasattr(runner, "step_timing"):
+                runner.step_timing.forward_end()
+
+        # Reclaim the oversized runner.intermediate_tensors allocation on
+        # non-first ranks now that eager PP steps borrow received buffers.
+        recv_schema = None
+        if not pp.is_first_rank:
+            inter = getattr(runner, "intermediate_tensors", None)
+            if (
+                isinstance(inter, IntermediateTensors)
+                and inter.tensors
+                and all(
+                    t.is_cuda and t.is_contiguous() and t.ndim >= 1
+                    for t in inter.tensors.values()
+                )
+            ):
+                recv_schema = tuple(
+                    (k, tuple(t.shape[1:]), t.dtype) for k, t in inter.tensors.items()
+                )
+                dummy_cap = max(
+                    16,
+                    getattr(runner, "decode_query_len", 1),
+                    getattr(runner, "uniform_decode_query_len", 1),
+                )
+                cur_rows = next(iter(inter.tensors.values())).shape[0]
+                if cur_rows > dummy_cap and hasattr(
+                    model, "make_empty_intermediate_tensors"
+                ):
+                    runner.intermediate_tensors = model.make_empty_intermediate_tensors(
+                        batch_size=dummy_cap,
+                        dtype=self.model_config.dtype,
+                        device=self.device,
+                    )
+                    torch.cuda.empty_cache()
+
+        free_bytes, _ = torch.cuda.mem_get_info(self.device)
+        local_info = {
+            "send_schema": captured.get("send_schema"),
+            "recv_schema": recv_schema,
+            "fresh_alloc": bool(captured.get("fresh_alloc", False)),
+            "free_bytes": int(free_bytes),
+        }
+        gathered: list[dict] = [None] * pp.world_size  # type: ignore[list-item]
+        dist.all_gather_object(gathered, local_info, group=pp.cpu_group)
+
+        schemas_match = all(
+            gathered[h]["send_schema"] is not None
+            and gathered[h]["send_schema"] == gathered[h + 1]["recv_schema"]
+            for h in range(pp.world_size - 1)
+        )
+        if not schemas_match:
+            return
+
+        max_tokens = getattr(
+            runner, "max_num_tokens", self.scheduler_config.max_num_batched_tokens
+        )
+        max_hop_bytes = max(
+            schema_bytes(gathered[h]["send_schema"], max_tokens)
+            for h in range(pp.world_size - 1)
+        )
+        min_free = min(info["free_bytes"] for info in gathered)
+        min_headroom = max(256 << 20, 2 * max_hop_bytes)
+        defer_send_wait = (
+            all(gathered[h]["fresh_alloc"] for h in range(pp.world_size - 1))
+            and min_free >= min_headroom
+        )
+
+        if not pp.is_last_rank:
+            self._pp_send_schema = gathered[pp.rank_in_group]["send_schema"]
+        if not pp.is_first_rank:
+            self._pp_recv_schema = gathered[pp.rank_in_group]["recv_schema"]
+        self._pp_defer_send_wait = defer_send_wait
+        if pp.is_first_rank:
+            logger.info(
+                "ILU eager PP schema exchange active (defer_send_wait=%s, free_min_mib=%.1f)",
+                defer_send_wait,
+                min_free / (1024 * 1024),
+            )
+
     def load_model(self, *args, **kwargs):
         result = super().load_model(*args, **kwargs)
         from vllm_iluvatar import envs as ilu_envs
@@ -471,6 +700,7 @@ class IluWorker(Worker):
                 physical_gpu=physical_gpu,
             )
             result = super().compile_or_warm_up_model()
+            self._configure_eager_pp_exchange()
             controller = getattr(self.model_runner, "_ilu_dp_vocab_projection", None)
             if controller is not None:
                 controller.enable_dynamic_capacity()
@@ -499,25 +729,58 @@ class IluWorker(Worker):
         with controller.pair(dp_sync):
             return super().sample_tokens(grammar_output)
 
+    def _run_execute_model(self, scheduler_output):
+        state = getattr(self, "_compressed_kv_state", None)
+        if state is not None:
+            # Lease the shared arena for eager work and graph replay alike.
+            with state.workspace.acquire():
+                return super().execute_model(scheduler_output)
+        return super().execute_model(scheduler_output)
+
     def execute_model(self, scheduler_output):
         self._get_hbm_ecc_monitor().check()
-        if scheduler_output.total_num_scheduled_tokens > 0:
+        rows = scheduler_output.total_num_scheduled_tokens
+        if rows > 0:
             self._get_onchip_checker().before_batch()
         context = getattr(self, "prefix_state", None)
         if context is not None:
             context.observe_scheduler_output(scheduler_output)
+
+        original = None
+        if rows > 0 and self._eager_pp_direct_input_supported():
+            original = self.model_runner.execute_model
+            self.model_runner.execute_model = partial(
+                _execute_with_received_pp_tensors, self.model_runner, original
+            )
         try:
-            state = getattr(self, "_compressed_kv_state", None)
-            if state is not None:
-                # Lease the shared arena for eager work and graph replay alike.
-                with state.workspace.acquire():
-                    return super().execute_model(scheduler_output)
-            return super().execute_model(scheduler_output)
+            send_schema = getattr(self, "_pp_send_schema", None)
+            recv_schema = getattr(self, "_pp_recv_schema", None)
+            if rows > 0 and (send_schema is not None or recv_schema is not None):
+                from vllm.distributed import get_pp_group
+
+                defer = bool(getattr(self, "_pp_defer_send_wait", False))
+                pending = defer_pp_send_wait(self) if defer else ()
+                with schema_pp_exchange(
+                    get_pp_group(),
+                    rows,
+                    self.device,
+                    send_schema=send_schema,
+                    recv_schema=recv_schema,
+                    pending=pending,
+                    retain_send=defer,
+                ):
+                    return self._run_execute_model(scheduler_output)
+            if getattr(self, "_pp_deferred_sends", None):
+                drain_pp_send_wait(self)
+            return self._run_execute_model(scheduler_output)
         finally:
+            if original is not None:
+                self.model_runner.execute_model = original
             if context is not None:
                 context.end_step()
 
     def shutdown(self) -> None:
+        drain_pp_send_wait(self)
         if getattr(self, "prefix_state", None) is not None:
             self.prefix_state.shutdown()
         orig_cls = self._try_replace_model_runner_class()

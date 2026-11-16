@@ -845,11 +845,7 @@ class IluFlashMLASparseImpl(
                 sm_scale=self.softmax_scale,
                 topk_length=topk_lens,
                 kpool=kpool,
-                backend=(
-                    backend
-                    if backend is not None
-                    else ("ixinfer" if kpool == 4 else None)
-                ),
+                **({"backend": backend} if backend is not None else {}),
             )
         return output
 

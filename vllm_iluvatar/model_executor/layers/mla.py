@@ -22,15 +22,20 @@ from __future__ import annotations
 
 import torch
 from vllm.config import CacheConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.mla import (
     MLAModules,
     MultiHeadLatentAttentionWrapper,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
+from vllm_iluvatar.ilu_util.streams import get_prefill_aux_stream
 from vllm_iluvatar.model_executor.layers.attention.mla_attention import (
+    _get_mla_attn_metadata,
     install_ilu_mla_attention_overrides,
 )
+
+logger = init_logger(__name__)
 
 
 @MultiHeadLatentAttentionWrapper.register_oot()
@@ -127,7 +132,7 @@ class IluMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 )
             else:
                 q_c = self.q_a_layernorm(q_c)
-                kv_c_normed = self.kv_a_layernorm(kv_c)
+                kv_c_normed = None
             q_proj_layer = self.q_b_proj
             q_proj_input = q_c
         else:
@@ -144,16 +149,53 @@ class IluMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             kv_c, k_pe = kv_lora.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=1
             )
+            kv_c_normed = None
+        run_indexer = bool(self.indexer and self.is_sparse and not self.skip_topk)
+        q_ready = None
+        caller = None
+        if (
+            run_indexer
+            and getattr(self.indexer, "supports_query_stream_overlap", False)
+            and q_c is not None
+            and getattr(q_proj_layer, "tp_size", None) == 1
+            and not getattr(q_proj_layer, "gather_output", False)
+            and not self.dcp_q_replicate
+            and q_c.shape[0] >= 512
+            and not torch.cuda.is_current_stream_capturing()
+            and not torch.compiler.is_compiling()
+        ):
+            metadata = _get_mla_attn_metadata(self.mla_attn.layer_name)
+            if (
+                metadata is not None
+                and metadata.num_prefills > 0
+                and metadata.num_decodes == 0
+            ):
+                caller = torch.cuda.current_stream(q_c.device)
+                stream = get_prefill_aux_stream(q_c.device)
+                logger.info_once(
+                    "ILU sparse MLA Prefill query stream active on %s", q_c.device
+                )
+                stream.wait_stream(caller)
+                q_c.record_stream(stream)
+                with torch.cuda.stream(stream):
+                    q = q_proj_layer(q_proj_input)[0]
+                    q_ready = stream.record_event()
+                q.record_stream(caller)
+
+        if kv_c_normed is None:
             kv_c_normed = self.kv_a_layernorm(kv_c)
-        q = q_proj_layer(q_proj_input)[0]
+        if q_ready is None:
+            q = q_proj_layer(q_proj_input)[0]
+        if run_indexer:
+            self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+        if self.is_sparse:
+            self.mla_attn.impl.record_logical_topk_ready()  # type: ignore[attr-defined]
+        if q_ready is not None:
+            q_ready.wait(caller)
         heads = self.num_heads
         if self.dcp_q_replicate:
             heads *= q_proj_layer.group_size
         q = q.view(-1, heads, self.qk_head_dim)
-        if self.indexer and self.is_sparse and not self.skip_topk:
-            self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
-        if self.is_sparse:
-            self.mla_attn.impl.record_logical_topk_ready()  # type: ignore[attr-defined]
 
         if llama_4_scaling is not None:
             q *= llama_4_scaling

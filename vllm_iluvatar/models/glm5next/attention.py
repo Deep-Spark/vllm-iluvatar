@@ -37,6 +37,9 @@ from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
 
 from vllm_iluvatar.ilu_util.arch import is_ivcore30
+from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes.ilu_compressed_tensors_w8a8_int8 import (  # noqa: E501
+    IluW8A8OnlineLinearMethod,
+)
 from vllm_iluvatar.model_executor.layers.quantization.configs.fp8 import IluFp8Config
 
 
@@ -472,6 +475,17 @@ class IluGlm5NextMLAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+
+        if envs.VLLM_ILU_GLM5NEXT_MLA_PROJ_W8A8 and quant_config is None:
+            projections = (
+                (self.fused_qkv_a_proj, self.q_b_proj, self.o_proj)
+                if self.q_lora_rank is not None
+                else (self.kv_a_proj_with_mqa, self.q_proj, self.o_proj)
+            )
+            for projection in projections:
+                projection.quant_method = IluW8A8OnlineLinearMethod(
+                    projection.quant_method
+                )
 
         if not skip_rope:
             assert config.rope_parameters is not None

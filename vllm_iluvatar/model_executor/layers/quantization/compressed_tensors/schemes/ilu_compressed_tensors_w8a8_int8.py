@@ -702,9 +702,12 @@ class IluW8A8OnlineLinearMethod(LinearMethodBase):
     sharding; the scheme owns packing, activation quantization and dispatch.
     """
 
-    def __init__(self, original, quantized_rows: int | None = None):
+    def __init__(
+        self, original, quantized_rows: int | None = None, *, cat_output: bool = True
+    ):
         self.original = original
         self.quantized_rows = quantized_rows
+        self.cat_output = cat_output
         self.scheme = IluCompressedTensorsW8A8Int8(
             strategy="channel",
             is_static_input_scheme=False,
@@ -748,5 +751,10 @@ class IluW8A8OnlineLinearMethod(LinearMethodBase):
         output = self.scheme.apply_weights(layer, flat, bias=None)
         if self.quantized_rows is not None:
             tail = torch.nn.functional.linear(flat, layer.bf16_tail_weight)
+            if not self.cat_output:
+                return (
+                    output.view(*x.shape[:-1], output.shape[-1]),
+                    tail.view(*x.shape[:-1], tail.shape[-1]),
+                )
             output = torch.cat((output, tail), dim=-1)
         return output.view(*x.shape[:-1], output.shape[-1])

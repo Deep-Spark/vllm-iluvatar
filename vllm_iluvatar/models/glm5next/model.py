@@ -364,6 +364,7 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
         self._fuse_attn_allreduce_post = (
             self.mhc
             and not is_mtp_layer
+            and not envs.VLLM_ILU_GLM5NEXT_MHC_DECODE_SPLITK
             and mhc.allreduce_mhc_post_supported(config, tp_size)
         )
         if (
@@ -388,13 +389,29 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
             self.n = n
 
             self.hc_attn_fn = nn.Parameter(
-                torch.empty(mix_hc, d_model, dtype=torch.float32)
+                torch.empty(
+                    mix_hc,
+                    d_model,
+                    dtype=(
+                        torch.bfloat16
+                        if envs.VLLM_ILU_GLM5NEXT_MHC_DECODE_SPLITK
+                        else torch.float32
+                    ),
+                )
             )
             self.hc_attn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
             self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 
             self.hc_ffn_fn = nn.Parameter(
-                torch.empty(mix_hc, d_model, dtype=torch.float32)
+                torch.empty(
+                    mix_hc,
+                    d_model,
+                    dtype=(
+                        torch.bfloat16
+                        if envs.VLLM_ILU_GLM5NEXT_MHC_DECODE_SPLITK
+                        else torch.float32
+                    ),
+                )
             )
             self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
             self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
@@ -403,6 +420,8 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
     def _get_hc_fn_io(
         self, name: str, hc_fn: torch.Tensor, dtype: torch.dtype
     ) -> torch.Tensor:
+        if hc_fn.dtype == dtype:
+            return hc_fn
         cached = self._hc_fn_io_cache.get(name)
         if cached is None or cached.dtype != dtype:
             cached = hc_fn.to(dtype).contiguous()

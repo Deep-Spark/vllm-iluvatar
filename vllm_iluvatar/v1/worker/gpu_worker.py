@@ -33,6 +33,22 @@ def _pcp_profile_local_tokens(num_tokens: int, pcp_size: int, max_num_reqs: int)
 class IluWorker(Worker):
     def load_model(self, *args, **kwargs):
         result = super().load_model(*args, **kwargs)
+        from vllm_iluvatar import envs as ilu_envs
+
+        if ilu_envs.VLLM_ILU_GLM5NEXT_DRAFT_HEAD_W8A8:
+            from vllm_iluvatar.models.glm5next.mtp import (
+                IluGlm5NextMTP,
+                prepare_draft_head_w8a8,
+            )
+
+            speculator = getattr(self.model_runner, "speculator", None)
+            draft = getattr(speculator, "model", None)
+            if not isinstance(draft, IluGlm5NextMTP):
+                raise ValueError(
+                    "Draft head W8A8 requires GLM5Next MTP with model runner V2"
+                )
+            prepare_draft_head_w8a8(draft)
+
         configure = (
             getattr(self.model_runner.model_state, "configure_prefix_reuse", None)
             if self.vllm_config.use_v2_model_runner
@@ -135,6 +151,31 @@ class IluWorker(Worker):
         return orig_cls
 
     def determine_available_memory(self) -> int:
+        from vllm_iluvatar import envs as ilu_envs
+
+        if (
+            not ilu_envs.VLLM_ILU_SKIP_CUDAGRAPH_MEMORY_PROFILE
+            or not self.vllm_config.use_v2_model_runner
+        ):
+            return self._determine_available_memory()
+        # Avoid the CoreX throwaway collective graph lifecycle. Activation
+        # profiling and the final FULL decode graph capture still run.
+        runner = self.model_runner
+        previous = runner.profile_cudagraph_memory
+        had_override = "profile_cudagraph_memory" in vars(runner)
+        runner.profile_cudagraph_memory = lambda: 0
+        logger.warning(
+            "Skipping throwaway CUDA graph memory estimate; real capture remains enabled"
+        )
+        try:
+            return self._determine_available_memory()
+        finally:
+            if had_override:
+                runner.profile_cudagraph_memory = previous
+            else:
+                del runner.profile_cudagraph_memory
+
+    def _determine_available_memory(self) -> int:
         from vllm_iluvatar.models.deepseek_v41.compressed_kv import (
             CacheBudget,
             main_kv_format,

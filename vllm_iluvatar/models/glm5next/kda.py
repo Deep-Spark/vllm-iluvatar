@@ -179,10 +179,12 @@ class IluGlm5NextLinearAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.o_proj",
         )
 
-        if envs.VLLM_ILU_GLM5NEXT_KDA_PROJ_W8A8:
+        self._split_qkvbfg_output = envs.VLLM_ILU_GLM5NEXT_KDA_PROJ_W8A8
+        if self._split_qkvbfg_output:
             self.in_proj_qkvbfg_a.quant_method = IluW8A8OnlineLinearMethod(
                 self.in_proj_qkvbfg_a.quant_method,
                 quantized_rows=3 * self.local_projection_size,
+                cat_output=False,
             )
             self.o_proj.quant_method = IluW8A8OnlineLinearMethod(
                 self.o_proj.quant_method
@@ -208,15 +210,21 @@ class IluGlm5NextLinearAttention(GatedDeltaNetAttention):
         self, hidden_states: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
         projected = self.in_proj_qkvbfg_a(hidden_states)[0]
-        qkv, beta_raw, f_a, g_a = projected.split(
-            [
-                3 * self.local_projection_size,
-                self.local_num_heads,
-                self.head_dim,
-                self.head_dim,
-            ],
-            dim=-1,
-        )
+        if self._split_qkvbfg_output:
+            qkv, gates = projected
+            beta_raw, f_a, g_a = gates.split(
+                [self.local_num_heads, self.head_dim, self.head_dim], dim=-1
+            )
+        else:
+            qkv, beta_raw, f_a, g_a = projected.split(
+                [
+                    3 * self.local_projection_size,
+                    self.local_num_heads,
+                    self.head_dim,
+                    self.head_dim,
+                ],
+                dim=-1,
+            )
 
         shape = (-1, self.local_num_heads, self.head_dim)
         g1 = self.f_b_proj(f_a)[0].view(shape)

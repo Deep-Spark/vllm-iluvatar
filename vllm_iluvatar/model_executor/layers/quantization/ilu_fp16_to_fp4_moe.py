@@ -120,6 +120,8 @@ def convert_native_to_ix30_fp4(
         backend=backend,
     )
     return ixmm_weight.squeeze(0), ixmm_scale.squeeze(0)
+
+
 @IluvatarQuantRegistry.register_method
 class IluFp16ToFp4OnlineMoEMethod(IluFp8ToFp4OnlineMoEMethod):
     """GLM load-time FP4 loader fed from MiniMax-M3 native BF16 expert shards."""
@@ -141,8 +143,7 @@ class IluFp16ToFp4OnlineMoEMethod(IluFp8ToFp4OnlineMoEMethod):
             )
         if group.require.original_disposition != "ignored":
             raise ValueError(
-                f"{gid}: MiniMax-M3 load-time FP4 requires "
-                "original_disposition=ignored"
+                f"{gid}: MiniMax-M3 load-time FP4 requires original_disposition=ignored"
             )
         if (
             weights.loading.mode != "transform"

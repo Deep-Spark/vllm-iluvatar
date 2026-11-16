@@ -41,7 +41,6 @@ from vllm.model_executor.layers.quantization import (
     register_quantization_config,
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
-
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_scale_parameter,
     create_fp8_weight_parameter,
@@ -189,7 +188,7 @@ class IluDeepseekV41FP8LinearMethod(Fp8LinearMethod):
     is invisible to the weight loader either way.
     """
 
-    def __init__(self, quant_config: "IluDeepseekV41FP8Config") -> None:
+    def __init__(self, quant_config: IluDeepseekV41FP8Config) -> None:
         super().__init__(quant_config)
         self._bf16: IluDeepseekV41Bf16DequantLinearMethod | None = None
 

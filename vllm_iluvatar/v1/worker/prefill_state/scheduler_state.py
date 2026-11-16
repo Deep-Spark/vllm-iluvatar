@@ -15,7 +15,11 @@ import numpy as np
 from vllm_iluvatar.models.deepseek_v41.compressed_kv import cache_group_geometry
 
 from .configuration import (
-    PrefixGeometry, ProducerTopology, enabled, prefix_transfer_config, session_paths,
+    PrefixGeometry,
+    ProducerTopology,
+    enabled,
+    prefix_transfer_config,
+    session_paths,
 )
 from .source_state import StatePublisher, replay_layout, save
 

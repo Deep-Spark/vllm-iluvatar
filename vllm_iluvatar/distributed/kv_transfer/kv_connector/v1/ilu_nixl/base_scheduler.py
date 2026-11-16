@@ -278,9 +278,7 @@ class IluNixlBaseConnectorScheduler(NixlBaseConnectorScheduler):
                 "transfer_group_ids",
                 tuple(range(len(clipped))),
             )
-            for group_id, group_blocks in zip(
-                transfer_group_ids, clipped
-            ):
+            for group_id, group_blocks in zip(transfer_group_ids, clipped):
                 exported[group_id] = list(group_blocks)
             exported_block_ids = tuple(exported)
             self._fp8_exported_block_ids[req_id] = exported_block_ids

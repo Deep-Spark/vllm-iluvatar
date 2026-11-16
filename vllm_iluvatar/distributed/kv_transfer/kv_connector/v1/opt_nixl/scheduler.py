@@ -798,7 +798,10 @@ class NixlConnectorScheduler:
                         "NIXL rebuilt resumed send blocks req=%s old_sizes=%s new_sizes=%s",
                         request_id,
                         [len(x) for x in self._reqs_blocks.get(request_id, [])],
-                        [len(x or []) for x in scheduled_cached_reqs.new_block_ids[idx]],
+                        [
+                            len(x or [])
+                            for x in scheduled_cached_reqs.new_block_ids[idx]
+                        ],
                     )
                     self._reqs_blocks.pop(request_id, None)
                 self.update_prefill_req(
@@ -1069,8 +1072,7 @@ class NixlConnectorScheduler:
                         )
                     else:
                         logger.debug(
-                            "Proxy keepalive connection to %s closed "
-                            "(attempt %d): %s",
+                            "Proxy keepalive connection to %s closed (attempt %d): %s",
                             addr,
                             disconnect_failures,
                             e,
@@ -1233,7 +1235,9 @@ class NixlConnectorScheduler:
                         if len(state["acks"]) >= expected_workers:
                             result = (
                                 TEARDOWN_RESULT_OK
-                                if all(item == "closed" for item in state["acks"].values())
+                                if all(
+                                    item == "closed" for item in state["acks"].values()
+                                )
                                 else TEARDOWN_RESULT_FAILED
                             )
                             for waiter in state["waiters"]:

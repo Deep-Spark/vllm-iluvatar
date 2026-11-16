@@ -326,7 +326,6 @@ def test_compressor_metadata_never_maps_null_page_in_eager_and_graph():
 
 @pytest.mark.parametrize("ratio", [1, 2])
 def test_global_topk_graph_padding_uses_current_device_metadata(ratio):
-
     a = object.__new__(IluDeepseekV41Attention)
     a.compress_ratio = ratio
     a._global_topk = torch.full((64, 512), -1, dtype=torch.int32, device="cuda")
@@ -397,9 +396,7 @@ def test_fp8_indexer_query_out_replays_current_positions_without_overwrite(n):
     qo, wo = q_storage[1:-1], w_storage[1:-1]
 
     def run():
-        formal_ops.indexer_q_rope_fp8_out(
-            q, positions, cs, weights, 0.015625, qo, wo
-        )
+        formal_ops.indexer_q_rope_fp8_out(q, positions, cs, weights, 0.015625, qo, wo)
 
     run()
     graph = torch.cuda.CUDAGraph()

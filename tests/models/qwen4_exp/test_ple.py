@@ -512,14 +512,24 @@ def test_int8_ple_actual_forward_preserves_chunk_and_request_state(monkeypatch) 
     _single_rank(monkeypatch)
     torch.manual_seed(17)
     config = SimpleNamespace(
-        ngram_size=3, heads_per_ngram=8, eos_token_id=31, vocab_size=32,
-        split_ngram_parts=4, ngram_vocab_size_base=31,
+        ngram_size=3,
+        heads_per_ngram=8,
+        eos_token_id=31,
+        vocab_size=32,
+        split_ngram_parts=4,
+        ngram_vocab_size_base=31,
         make_ngram_vocab_size_divisible_by=4,
     )
     quant_config = SimpleNamespace(get_name=lambda: "compressed-tensors", ignore=[])
     embedding = Qwen4ExpNGramEmbedding(
-        config, 32, 0, 32, 4, "ple.ple_embedding",
-        quant_config=quant_config, params_dtype=torch.bfloat16,
+        config,
+        32,
+        0,
+        32,
+        4,
+        "ple.ple_embedding",
+        quant_config=quant_config,
+        params_dtype=torch.bfloat16,
     ).cuda()
     table = embedding.ngram_embedding
     rows = table.org_vocab_size
@@ -530,10 +540,15 @@ def test_int8_ple_actual_forward_preserves_chunk_and_request_state(monkeypatch) 
     for shard in range(4):
         section = slice(shard * shard_rows, min((shard + 1) * shard_rows, rows))
         prefix = f"ngram_embedding.shard_{shard}"
-        weights.extend([(prefix + ".weight", weight[section]),
-                        (prefix + ".weight_scale", scale[section])])
+        weights.extend(
+            [
+                (prefix + ".weight", weight[section]),
+                (prefix + ".weight_scale", scale[section]),
+            ]
+        )
     assert embedding.load_weights(weights) == {
-        "ngram_embedding.weight", "ngram_embedding.weight_scale",
+        "ngram_embedding.weight",
+        "ngram_embedding.weight_scale",
     }
     torch.testing.assert_close(table.weight.cpu(), weight)
     torch.testing.assert_close(table.weight_scale.cpu(), scale)
@@ -548,7 +563,9 @@ def test_int8_ple_actual_forward_preserves_chunk_and_request_state(monkeypatch) 
     layer.key_proj = Projection(32, 128, bias=False).cuda().bfloat16()
     layer.value_proj = Projection(32, 32, bias=False).cuda().bfloat16()
     for name in ("norm_key", "norm_query", "norm_conv"):
-        setattr(layer, name, Qwen4ExpPLEGroupedNorm(128, 1e-6, 32, torch.bfloat16).cuda())
+        setattr(
+            layer, name, Qwen4ExpPLEGroupedNorm(128, 1e-6, 32, torch.bfloat16).cuda()
+        )
     tokens = torch.tensor([1, 2, 3, 4, 31, 5, 6, 7, 8, 9, 10], device="cuda")
     hidden = torch.randn(11, 128, device="cuda", dtype=torch.bfloat16)
     context = torch.full((1, 2), 31, device="cuda", dtype=torch.int32)
@@ -560,25 +577,37 @@ def test_int8_ple_actual_forward_preserves_chunk_and_request_state(monkeypatch) 
     pieces = []
     for lo, hi in ((0, 4), (4, 7), (7, 11)):
         cu = torch.tensor([0, hi - lo], device="cuda", dtype=torch.int32)
-        ctx = context if lo == 0 else tokens[lo - 2:lo].int().unsqueeze(0)
+        ctx = context if lo == 0 else tokens[lo - 2 : lo].int().unsqueeze(0)
         pieces.append(layer(hidden[lo:hi], tokens[lo:hi], cu, ctx, chunk_state, slot))
     torch.testing.assert_close(torch.cat(pieces), expected, atol=0, rtol=0)
     torch.testing.assert_close(chunk_state, state, atol=0, rtol=0)
     assert torch.count_nonzero(state[:3]) == 0
 
     batch_state = torch.zeros_like(state)
-    batched = layer(hidden, tokens,
-                    torch.tensor([0, 5, 11], device="cuda", dtype=torch.int32),
-                    context.expand(2, -1).contiguous(), batch_state,
-                    torch.tensor([1, 3], device="cuda", dtype=torch.int32))
+    batched = layer(
+        hidden,
+        tokens,
+        torch.tensor([0, 5, 11], device="cuda", dtype=torch.int32),
+        context.expand(2, -1).contiguous(),
+        batch_state,
+        torch.tensor([1, 3], device="cuda", dtype=torch.int32),
+    )
     outputs = []
     for lo, hi, index in ((0, 5, 1), (5, 11, 3)):
         reference_state = torch.zeros_like(state)
-        outputs.append(layer(hidden[lo:hi], tokens[lo:hi],
-                             torch.tensor([0, hi - lo], device="cuda", dtype=torch.int32),
-                             context, reference_state,
-                             torch.tensor([index], device="cuda", dtype=torch.int32)))
-        torch.testing.assert_close(batch_state[index], reference_state[index], atol=0, rtol=0)
+        outputs.append(
+            layer(
+                hidden[lo:hi],
+                tokens[lo:hi],
+                torch.tensor([0, hi - lo], device="cuda", dtype=torch.int32),
+                context,
+                reference_state,
+                torch.tensor([index], device="cuda", dtype=torch.int32),
+            )
+        )
+        torch.testing.assert_close(
+            batch_state[index], reference_state[index], atol=0, rtol=0
+        )
     torch.testing.assert_close(batched, torch.cat(outputs), atol=0, rtol=0)
     assert torch.count_nonzero(batch_state[[0, 2]]) == 0
 
@@ -587,17 +616,23 @@ def test_int8_ple_actual_forward_preserves_chunk_and_request_state(monkeypatch) 
 def test_int8_actual_lookup_masks_tp_rows_before_reduce(monkeypatch) -> None:
     _single_rank(monkeypatch, rank=1, size=2)
     reduced = []
-    monkeypatch.setattr(ple_layer_module, "tensor_model_parallel_all_reduce",
-                        lambda x: reduced.append(x.clone()) or x)
-    table = Qwen4ExpNGramTable(6, 2, quant_kind="int8",
-                              params_dtype=torch.bfloat16, divisible_by=1).cuda()
+    monkeypatch.setattr(
+        ple_layer_module,
+        "tensor_model_parallel_all_reduce",
+        lambda x: reduced.append(x.clone()) or x,
+    )
+    table = Qwen4ExpNGramTable(
+        6, 2, quant_kind="int8", params_dtype=torch.bfloat16, divisible_by=1
+    ).cuda()
     table.weight.data.fill_(4)
     table.weight_scale.data.copy_(torch.tensor([[0.25], [0.5], [1]], device="cuda"))
     embedding = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
     nn.Module.__init__(embedding)
     embedding.ngram_embedding = table
     output = embedding._cuda_ngram_lookup(torch.tensor([[0, 3, 4, 5]], device="cuda"))
-    expected = torch.tensor([[0, 0, 1, 1, 2, 2, 4, 4]], device="cuda", dtype=torch.bfloat16)
+    expected = torch.tensor(
+        [[0, 0, 1, 1, 2, 2, 4, 4]], device="cuda", dtype=torch.bfloat16
+    )
     torch.testing.assert_close(output, expected)
     assert len(reduced) == 1
 
@@ -606,12 +641,18 @@ def test_int8_actual_lookup_masks_tp_rows_before_reduce(monkeypatch) -> None:
 def test_unquantized_actual_lookup_masks_tp_rows_before_reduce(monkeypatch) -> None:
     _single_rank(monkeypatch, rank=1, size=2)
     reduced = []
-    monkeypatch.setattr(ple_layer_module, "tensor_model_parallel_all_reduce",
-                        lambda x: reduced.append(x.clone()) or x)
-    table = Qwen4ExpNGramTable(6, 2, quant_kind=None,
-                              params_dtype=torch.bfloat16, divisible_by=1).cuda()
+    monkeypatch.setattr(
+        ple_layer_module,
+        "tensor_model_parallel_all_reduce",
+        lambda x: reduced.append(x.clone()) or x,
+    )
+    table = Qwen4ExpNGramTable(
+        6, 2, quant_kind=None, params_dtype=torch.bfloat16, divisible_by=1
+    ).cuda()
     table.weight.data.copy_(
-        torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], device="cuda", dtype=torch.bfloat16)
+        torch.tensor(
+            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], device="cuda", dtype=torch.bfloat16
+        )
     )
     embedding = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
     nn.Module.__init__(embedding)

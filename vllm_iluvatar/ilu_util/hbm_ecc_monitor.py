@@ -8,8 +8,9 @@ import os
 import signal
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from vllm_iluvatar.ilu_util.onchip_check import WorkerHealthCheckError
 

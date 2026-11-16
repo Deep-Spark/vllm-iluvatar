@@ -153,10 +153,7 @@ class IluCompressedTensorsMoEMethod:
         ):
             from vllm_iluvatar.ilu_util.arch import is_ivcore30
 
-            if (
-                is_ivcore30()
-                and ilu_params.get("gemm_format") == "NN"
-            ):
+            if is_ivcore30() and ilu_params.get("gemm_format") == "NN":
                 from vllm_iluvatar.model_executor.layers.quantization.ilu_w4a8_nn import (
                     IluW4A8NNMoEMethod,
                 )

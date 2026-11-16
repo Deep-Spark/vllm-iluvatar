@@ -58,12 +58,14 @@ def on_page_content(html, **kwargs):
     for m in ASIDE_RE.finditer(html):
         if m.start() < pos:
             continue
-        out.append(html[pos:m.start()])
+        out.append(html[pos : m.start()])
         nxt = NEXT_HEADING_RE.search(html, m.end())
         end = nxt.start() if nxt else len(html)
         aside = m.group(0).strip()
-        body = html[m.end():end]
-        out.append(f'<div class="ds-row"><div class="ds-body">{body}</div>{aside}</div>')
+        body = html[m.end() : end]
+        out.append(
+            f'<div class="ds-row"><div class="ds-body">{body}</div>{aside}</div>'
+        )
         pos = end
     out.append(html[pos:])
     return PREVIEW_CSS + "".join(out)

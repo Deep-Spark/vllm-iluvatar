@@ -28,8 +28,7 @@ from .compact_ragged import compact_all_gather, compact_gather_beneficial
 
 
 def _as_gather_bytes(t: torch.Tensor) -> tuple[torch.Tensor, torch.dtype | None]:
-    """Reinterpret an fp8 payload as raw bytes for a movement-only collective.
-    """
+    """Reinterpret an fp8 payload as raw bytes for a movement-only collective."""
     dtype = t.dtype
     if dtype.is_floating_point and dtype.itemsize == 1:
         return t.contiguous().view(torch.uint8), dtype

@@ -203,7 +203,6 @@ def test_pcp_profile_bound_covers_mixed_dual_chunk_batches():
 
 @pytest.mark.parametrize("raise_inside", [False, True])
 def test_pcp_profile_only_changes_profile_calls_and_restores(raise_inside):
-    from types import SimpleNamespace
     calls = []
 
     class Runner:
@@ -237,8 +236,6 @@ def test_pcp_profile_only_changes_profile_calls_and_restores(raise_inside):
     "v2,pcp,spec", [(False, 16, None), (True, 1, None), (True, 16, object())]
 )
 def test_pcp_profile_does_not_change_other_runner_modes(v2, pcp, spec):
-    from types import SimpleNamespace
-
     class Runner:
         def _dummy_run(self, n, **kwargs):
             return n
@@ -254,8 +251,6 @@ def test_pcp_profile_does_not_change_other_runner_modes(v2, pcp, spec):
 
 
 def test_non_glm_warmup_delegates_to_upstream(monkeypatch):
-    from types import SimpleNamespace
-
     attention = ModuleType("vllm_iluvatar.models.glm_moe_dsa.attention")
     attention.IluGlmMoeDsaSparseMLA = type("GlmLayer", (), {})
     monkeypatch.setitem(sys.modules, attention.__name__, attention)
@@ -276,8 +271,6 @@ def test_non_glm_warmup_delegates_to_upstream(monkeypatch):
 
 @pytest.mark.parametrize("pcp_size", [1, 16])
 def test_warmup_temporarily_disables_glm_calibration(monkeypatch, pcp_size):
-    from types import SimpleNamespace
-
     class GlmLayer:
         _fp8_kv_scale_calibration_enabled = True
 

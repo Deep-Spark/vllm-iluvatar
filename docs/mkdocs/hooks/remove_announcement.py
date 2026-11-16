@@ -86,5 +86,7 @@ def on_post_build(config, **kwargs) -> None:
 def on_startup(command: Literal["build", "gh-deploy", "serve"], dirty: bool):
     """Report the intended behaviour up front, so builds are self-explanatory."""
     if os.getenv(_VERSION_TYPE) == "tag":
-        print("[remove_announcement] tagged build: stripping the preview banner "
-              "from rendered pages (source files untouched)")
+        print(
+            "[remove_announcement] tagged build: stripping the preview banner "
+            "from rendered pages (source files untouched)"
+        )

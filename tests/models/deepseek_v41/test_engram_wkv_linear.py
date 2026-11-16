@@ -1,4 +1,5 @@
 """Check opt-in WKV backend selection and fallback without requiring a GPU."""
+
 from types import SimpleNamespace
 
 import pytest

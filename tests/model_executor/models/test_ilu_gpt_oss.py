@@ -2,6 +2,7 @@
 """CPU-only tests for Iluvatar GPT-OSS OOT model wiring."""
 
 from __future__ import annotations
+
 from vllm_iluvatar.model_executor.models import gpt_oss as ilu_gpt_oss
 
 

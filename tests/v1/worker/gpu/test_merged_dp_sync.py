@@ -1,4 +1,5 @@
 """Differential tests against the exact upstream DP agreement protocol."""
+
 import inspect
 from types import SimpleNamespace
 
@@ -9,7 +10,8 @@ from vllm.v1.worker.gpu import dp_utils as upstream
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor as Desc
 
 from vllm_iluvatar.v1.worker.dp_utils import get_last_all_ranks_decode_only
-from vllm_iluvatar.v1.worker.gpu import dp_utils, merged_dp_sync as merged
+from vllm_iluvatar.v1.worker.gpu import dp_utils
+from vllm_iluvatar.v1.worker.gpu import merged_dp_sync as merged
 
 
 @pytest.mark.parametrize(
@@ -103,6 +105,6 @@ def test_agreement_matches_upstream(monkeypatch, scenario, rank):
 
 
 def test_signature():
-    assert inspect.signature(
-        merged.sync_cudagraph_and_dp_padding
-    ) == inspect.signature(upstream.sync_cudagraph_and_dp_padding)
+    assert inspect.signature(merged.sync_cudagraph_and_dp_padding) == inspect.signature(
+        upstream.sync_cudagraph_and_dp_padding
+    )

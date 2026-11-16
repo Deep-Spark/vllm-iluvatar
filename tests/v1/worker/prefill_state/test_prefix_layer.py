@@ -62,13 +62,15 @@ def layer(n):
         "ffn_norm",
     ):
         setattr(result, name, None)
-    result._hc_pre_mixes = lambda residual, tag, fn, scale, base, pre, squares, norm, **_kwargs: (
-        None,
-        None,
-        residual.mean(1),
-        pre,
-        None,
-        None,
+    result._hc_pre_mixes = (
+        lambda residual, tag, fn, scale, base, pre, squares, norm, **_kwargs: (
+            None,
+            None,
+            residual.mean(1),
+            pre,
+            None,
+            None,
+        )
     )
     return result
 

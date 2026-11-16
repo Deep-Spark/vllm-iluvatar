@@ -69,8 +69,7 @@ def test_baselines_match_declared_community_source():
     assert p.source_sha(wiring.RECEIVE_BASELINE) == _RECEIVE_BASELINE_SHA
     assert p.source_sha(wiring.BROADCAST_BASELINE) == _BROADCAST_BASELINE_SHA
     assert (
-        p.source_sha(wiring.BROADCAST_DRAFTS_BASELINE)
-        == _BROADCAST_DRAFTS_BASELINE_SHA
+        p.source_sha(wiring.BROADCAST_DRAFTS_BASELINE) == _BROADCAST_DRAFTS_BASELINE_SHA
     )
 
 
@@ -100,13 +99,13 @@ def test_non_last_rank_receives_from_the_last_rank():
 
 def test_falls_back_to_the_community_collective_without_an_ixfd_group():
     handler = SimpleNamespace(
-        _ilu_token_p2p=None, is_last_rank=False, last_rank=15,
+        _ilu_token_p2p=None,
+        is_last_rank=False,
+        last_rank=15,
         broadcast_group="pp_broadcast",
     )
     seen: list[tuple[object, int, str]] = []
-    dist = SimpleNamespace(
-        broadcast=lambda t, src, group: seen.append((t, src, group))
-    )
+    dist = SimpleNamespace(broadcast=lambda t, src, group: seen.append((t, src, group)))
     tensor = object()
     with _patched(pp_impl.torch, distributed=dist):
         pp_impl.ilu_token_broadcast(handler, tensor)
@@ -117,9 +116,7 @@ def test_init_disables_the_transport_when_the_comm_is_missing():
     handler = SimpleNamespace()
     communicator = SimpleNamespace(ixfd_group=None, ranks=[0, 1])
     with _patched(
-        pp_impl, get_pp_group=lambda: SimpleNamespace(
-            device_communicator=communicator
-        )
+        pp_impl, get_pp_group=lambda: SimpleNamespace(device_communicator=communicator)
     ):
         pp_impl._init_token_p2p(handler)
     assert handler._ilu_token_p2p is None
@@ -129,9 +126,7 @@ def test_init_records_the_ixfd_group_and_ranks():
     handler = SimpleNamespace()
     communicator = SimpleNamespace(ixfd_group="g", ranks=[0, 4, 8, 12])
     with _patched(
-        pp_impl, get_pp_group=lambda: SimpleNamespace(
-            device_communicator=communicator
-        )
+        pp_impl, get_pp_group=lambda: SimpleNamespace(device_communicator=communicator)
     ):
         pp_impl._init_token_p2p(handler)
     assert handler._ilu_token_p2p == ("g", [0, 4, 8, 12])

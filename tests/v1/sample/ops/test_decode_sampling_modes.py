@@ -19,6 +19,7 @@ pytestmark = pytest.mark.skipif(
     reason="requires ivcore30 (CQ); GLM sampling override scope",
 )
 
+
 @pytest.mark.parametrize("mode", ["sorted", "radix"])
 @pytest.mark.parametrize("seeded", ["none", "mixed", "all"])
 def test_sampling_generators(monkeypatch, mode, seeded):

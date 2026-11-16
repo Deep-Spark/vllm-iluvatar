@@ -6,6 +6,7 @@ Feat 0.31 already ships a warp-ballot block scan in ixformer
 contract so a GPU host can still check the native op. Local py_compile
 does not execute it.
 """
+
 from __future__ import annotations
 
 import pytest

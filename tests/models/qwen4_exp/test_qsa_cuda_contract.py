@@ -14,9 +14,12 @@ def test_v2_qsa_backends_negotiate_enum_cache_layouts() -> None:
     from vllm.v1.attention.backends.utils import get_supported_kv_cache_layouts
     from vllm.v1.kv_cache_layout import KVCacheLayout
 
-    layouts = get_supported_kv_cache_layouts([
-        attention.Qwen4ExpQSAIxformerBackend, qsa_cache.QSAStateBackend,
-    ])
+    layouts = get_supported_kv_cache_layouts(
+        [
+            attention.Qwen4ExpQSAIxformerBackend,
+            qsa_cache.QSAStateBackend,
+        ]
+    )
     assert layouts == [KVCacheLayout.LBHNC]
     assert [layout.name for layout in layouts] == ["LBHNC"]
 

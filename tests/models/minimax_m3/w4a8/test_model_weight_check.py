@@ -27,7 +27,9 @@ class _DenseAttentionLayer(nn.Module):
 
 
 @pytest.mark.parametrize("cache_dtype", ["auto", "", None, "float16", "bfloat16"])
-def test_load_check_skips_runtime_attention_quantization_parameters(cache_dtype) -> None:
+def test_load_check_skips_runtime_attention_quantization_parameters(
+    cache_dtype,
+) -> None:
     model = nn.Module()
     model.layer = _DenseAttentionLayer()
 

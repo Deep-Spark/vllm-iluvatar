@@ -313,6 +313,7 @@ class PreparationSelectionTest(unittest.TestCase):
             ),
         }
         self.assertFalse(eval(compile(ast.Expression(node), path, "eval"), ns))
+
         class RemovePcpGuard(ast.NodeTransformer):
             def visit_UnaryOp(self, n):
                 if (

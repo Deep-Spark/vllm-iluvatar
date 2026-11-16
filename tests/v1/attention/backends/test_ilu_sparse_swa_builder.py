@@ -11,12 +11,12 @@ import torch
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import CommonAttentionMetadata
 
+from vllm_iluvatar.models.deepseek_v41.sparse_mla import (
+    IluDeepseekV41SparseSWAMetadataBuilder,
+)
 from vllm_iluvatar.v1.attention.backends.mla.ilu_sparse_swa import (
     IluDeepseekSparseSWAMetadataBuilder,
     build_dspark_noncausal_swa_indices,
-)
-from vllm_iluvatar.models.deepseek_v41.sparse_mla import (
-    IluDeepseekV41SparseSWAMetadataBuilder,
 )
 
 
@@ -291,6 +291,7 @@ def test_decode_pads_replay_start_for_graph_padded_seq_lens():
     assert padded.shape == builder.no_replay_start.shape
     assert padded[:2].tolist() == [8, 0]
     assert metadata.replay_start is padded
+
 
 def test_prefill_forwards_replay_start_to_gather_kernel():
     from types import MethodType

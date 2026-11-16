@@ -39,9 +39,7 @@ def _require_ple_ops(*names: str):
     try:
         import ixformer._C as ixf_c_ops
     except Exception as exc:
-        raise RuntimeError(
-            "Qwen4Exp PLE requires the ixformer CUDA extension"
-        ) from exc
+        raise RuntimeError("Qwen4Exp PLE requires the ixformer CUDA extension") from exc
     infer = getattr(ixf_c_ops, "infer", None)
     missing = [name for name in names if infer is None or not hasattr(infer, name)]
     if missing:

@@ -25,9 +25,7 @@ def test_ilu_v41_arch_is_an_engram_model():
     register()
     from vllm.config.engram import model_has_engram_layers
 
-    assert model_has_engram_layers(
-        _model("IluDeepseekV41ForCausalLM", [1, 14])
-    )
+    assert model_has_engram_layers(_model("IluDeepseekV41ForCausalLM", [1, 14]))
     assert model_has_engram_layers(_model("DeepseekV41ForCausalLM", [1]))
     assert not model_has_engram_layers(_model("IluDeepseekV41ForCausalLM", []))
     assert not model_has_engram_layers(_model("IluDeepseekV4ForCausalLM", [1]))

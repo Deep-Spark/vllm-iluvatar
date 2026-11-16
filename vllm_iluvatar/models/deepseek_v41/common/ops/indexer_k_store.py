@@ -24,7 +24,6 @@ kernel reads.
 from __future__ import annotations
 
 import torch
-
 from ixformer.inference.functions.models import deepseek_v41 as ixfops
 
 _RECORDS = ("bf16", "fp8", "int8")
@@ -67,9 +66,7 @@ def indexer_k_norm_rope_store(
 
     """
     if record not in _RECORDS:
-        raise ValueError(
-            f"indexer record must be one of {_RECORDS}, got {record!r}"
-        )
+        raise ValueError(f"indexer record must be one of {_RECORDS}, got {record!r}")
     assert k_pre.ndim == 2 and k_pre.shape[1] == 128
     assert k_pre.dtype == torch.bfloat16 and k_pre.stride(1) == 1
     assert compress_ratio in (1, 2)

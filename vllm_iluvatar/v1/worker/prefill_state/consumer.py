@@ -11,7 +11,7 @@ import time
 import numpy as np
 import torch
 
-from .cache_rows import indexer_row_views, restore_indexer_row, main_boundary_sources
+from .cache_rows import indexer_row_views, main_boundary_sources, restore_indexer_row
 from .configuration import PrefixGeometry, prefix_transfer_config, session_paths
 from .decode_prefix import PrefixBuffers
 from .runtime import PrefixRuntime
@@ -218,8 +218,9 @@ class ConsumerPrefixState(PrefixRuntime):
                     else None
                 )
                 if layer == self.geometry.prefix_depth - 1 and name.endswith(".attn"):
-                    self._p21_cache_sources.extend(main_boundary_sources(
-                        static[name], name, g, self.geometry))
+                    self._p21_cache_sources.extend(
+                        main_boundary_sources(static[name], name, g, self.geometry)
+                    )
                     continue
                 if kind is None and layer == self.geometry.prefix_depth - 1:
                     kind = (
@@ -242,8 +243,10 @@ class ConsumerPrefixState(PrefixRuntime):
                     )
         assert (
             len(self._p21_cache_sources)
-            == self.geometry.prefix_depth + len(self.geometry.ring_layers)
-            + len(self.geometry.main_tail_fields()) + 1
+            == self.geometry.prefix_depth
+            + len(self.geometry.ring_layers)
+            + len(self.geometry.main_tail_fields())
+            + 1
         )
         self._p21_ring_rows = {
             s["layer"]: s["cache"].shape[1]
@@ -414,7 +417,12 @@ class ConsumerPrefixState(PrefixRuntime):
                         }
                         with self._p21_lock:
                             current = self._p21_states.get(rid)
-                            if self._p21_recv_metadata.get(rid, {}).get("source_endpoint") == endpoint:
+                            if (
+                                self._p21_recv_metadata.get(rid, {}).get(
+                                    "source_endpoint"
+                                )
+                                == endpoint
+                            ):
                                 if current is not None and (
                                     state["generation"] is None
                                     or current["generation"] == state["generation"]
@@ -753,18 +761,24 @@ class ConsumerPrefixState(PrefixRuntime):
                                 sum(
                                     v.numel()
                                     for v in indexer_row_views(
-                                        cache, int(blocks[logical]), row,
+                                        cache,
+                                        int(blocks[logical]),
+                                        row,
                                         source.get("scales"),
                                     )
                                 )
                                 == field["byte_count"]
                             )
                         elif valid:
-                            field = next(f for f in packet["metadata"]["fields"]
-                                         if f["kind"] == source["kind"])
+                            field = next(
+                                f
+                                for f in packet["metadata"]["fields"]
+                                if f["kind"] == source["kind"]
+                            )
                             eligible &= (
                                 str(cache.dtype) in DTYPES
-                                and DTYPES[str(cache.dtype)][0] == DTYPES[field["dtype"]][0]
+                                and DTYPES[str(cache.dtype)][0]
+                                == DTYPES[field["dtype"]][0]
                                 and tuple(field["shape"]) == (1, cache.shape[-1])
                             )
         free, _ = torch.cuda.mem_get_info()
@@ -906,8 +920,9 @@ class ConsumerPrefixState(PrefixRuntime):
                     if source["kind"] in ("main_tail", "main_tail_scale"):
                         cache[block, row].copy_(data[0], non_blocking=True)
                     else:
-                        restore_indexer_row(cache, block, row, data,
-                                            source.get("scales"))
+                        restore_indexer_row(
+                            cache, block, row, data, source.get("scales")
+                        )
             region = slice(int(q[i]), int(q[i + 1]))
             h[region].copy_(view(fields["HC"]), non_blocking=True)
             pre[region].copy_(view(fields["pre_mix"]), non_blocking=True)
@@ -985,7 +1000,9 @@ class ConsumerPrefixState(PrefixRuntime):
                             CUDAGraphMode.NONE,
                             subtables,
                             subslots,
-                            getattr(self, "_p21_prefix_attn_groups", runner.attn_groups),
+                            getattr(
+                                self, "_p21_prefix_attn_groups", runner.attn_groups
+                            ),
                             runner.kv_cache_config,
                             for_capture=False,
                         )
@@ -1038,8 +1055,12 @@ class ConsumerPrefixState(PrefixRuntime):
                     overlap_groups = [
                         [g for g in p_g if g in s_g]
                         for p_g, s_g in zip(
-                            getattr(self, "_p21_prefix_attn_groups", runner.attn_groups),
-                            getattr(self, "_p21_suffix_attn_groups", runner.attn_groups),
+                            getattr(
+                                self, "_p21_prefix_attn_groups", runner.attn_groups
+                            ),
+                            getattr(
+                                self, "_p21_suffix_attn_groups", runner.attn_groups
+                            ),
                         )
                     ]
                     if any(overlap_groups):

@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import ixformer.inference.functions as ixf
 import torch
-from ixformer.inference.functions.models.minimax_m3.indexer.float.indexer import SPARSE_BLOCK_SIZE
+from ixformer.inference.functions.models.minimax_m3.indexer.float.indexer import (
+    SPARSE_BLOCK_SIZE,
+)
 
 
 def test_index_score_topk_and_sparse_attn_shapes():

@@ -92,7 +92,10 @@ def _decode_fp4_e2m1_nibbles(packed: torch.Tensor) -> torch.Tensor:
 
     low = decode(packed & 0x0F)
     high = decode((packed >> 4) & 0x0F)
-    return torch.stack((low, high), dim=-1).reshape(packed.shape[0], packed.shape[1] * 2)
+    return torch.stack((low, high), dim=-1).reshape(
+        packed.shape[0], packed.shape[1] * 2
+    )
+
 
 def _block_dequant_1d(
     weight: torch.Tensor,
@@ -310,6 +313,7 @@ def dequant_mxfp4_block32(
     unpacked = torch.stack((low, high), dim=-1).reshape(out_dim, in_dim)
     return unpacked * _decode_e8m0(scale).repeat_interleave(32, dim=1)
 
+
 @register_dequant("mxfp8_ue8m0")
 def dequant_mxfp8_ue8m0(
     weight: torch.Tensor,
@@ -479,10 +483,11 @@ def dequant_nvfp4_pack(
             "NVFP4 weight expects 2-D [N, K/2] or 3-D [E, N, K/2], got "
             f"{tuple(packed.shape)}"
         )
-    inv_global = 1.0 / _nvfp4_global_scales(
-        options.get("global_scale"), 1, weight.device
-    )[0]
+    inv_global = (
+        1.0 / _nvfp4_global_scales(options.get("global_scale"), 1, weight.device)[0]
+    )
     return _dequant_nvfp4_pack_2d(packed, scale, inv_global, group_size)
+
 
 @register_dequant("int4_group")
 def dequant_int4_group(
@@ -780,9 +785,7 @@ def _quant_one_expert_int4_moe(
         i8_weight_scale=_merge_optional_quant_field(
             chunk_results, "i8_weight_scale", -2
         ),
-        i8_weight_zero=_merge_optional_quant_field(
-            chunk_results, "i8_weight_zero", -2
-        ),
+        i8_weight_zero=_merge_optional_quant_field(chunk_results, "i8_weight_zero", -2),
     )
 
 
@@ -810,8 +813,7 @@ def pack_int4_moe_stream_dequant(
         raise ValueError(f"unknown dequant method {dequant_method!r}")
     if scale is not None and scale.shape[0] != weight.shape[0]:
         raise ValueError(
-            "expert scale batch mismatch: "
-            f"weight={weight.shape}, scale={scale.shape}"
+            f"expert scale batch mismatch: weight={weight.shape}, scale={scale.shape}"
         )
 
     device = torch.device(work_device)

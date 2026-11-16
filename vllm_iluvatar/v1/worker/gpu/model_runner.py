@@ -29,22 +29,18 @@ from typing import Any
 import torch
 import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.aux_output_connector.worker import get_aux_output_connector
 from vllm.logger import init_logger
-from vllm.v1.hisparse.binding import init_hisparse_kv_cache
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.hisparse.binding import init_hisparse_kv_cache
 from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
-    CircularBufferSpec,
     KVCacheConfig,
     KVCacheLayout,
-    MambaSpec,
     UniformTypeKVCacheSpecs,
 )
 
@@ -75,9 +71,6 @@ from vllm.v1.worker.utils import (
     allocate_kv_cache,
     bind_kv_cache_to_layers,
     copy_kv_cache_blocks_inplace,
-)
-from vllm_iluvatar.v1.attention.backends.ilu_flash_attn import (
-    IluFlashAttentionBackend,
 )
 
 # Iluvatar GPU model runner customizations.
@@ -338,6 +331,7 @@ def bind_kv_cache_scale(
     # expose the hook, so the call is uniform across hybrid forward_context.
     for layer_name, kv_scale_cache in kv_scale_caches.items():
         forward_context[layer_name].bind_kv_cache_scale(kv_scale_cache)
+
 
 def init_kv_cache(
     runner_kv_scale_caches: list[torch.Tensor | list[torch.Tensor]],
@@ -615,8 +609,6 @@ class IluvatarGPUModelRunner(GPUModelRunner):
                 "ILU int8 KV-cache quantization is not supported with a "
                 "kv_connector because scale buffers are not transferred"
             )
-
-
 
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
         # [ILU override] delegate to community update_requests (which does the

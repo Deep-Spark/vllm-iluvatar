@@ -3,9 +3,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 from functools import cache, wraps
-from typing import Any, Callable
+from typing import Any
 
 from vllm_iluvatar.ilu_patch import general_patch as p
 
@@ -29,9 +30,7 @@ def register() -> None:
 
 
 def _configure_passthrough(adapter: Any, request: Any) -> None:
-    adapter._parser_engine.skip_tool_parsing = not bool(
-        getattr(request, "tools", None)
-    )
+    adapter._parser_engine.skip_tool_parsing = not bool(getattr(request, "tools", None))
 
 
 def _patch_parser_config(
@@ -132,6 +131,7 @@ def _wrap_extract_tool_calls_streaming(original: Callable) -> Callable:
 def _apply() -> None:
     from vllm.parser.deepseek_v4 import DeepSeekV4Parser
     from vllm.parser.deepseek_v41 import DeepSeekV41Parser
+
     # V4.1 adapters come from a separate ``make_adapters`` call, so they do not
     # inherit the V4 wrappers even though both share the DSML grammar.
     from vllm.parser.engine.registered_adapters import (
@@ -149,15 +149,11 @@ def _apply() -> None:
         if getattr(adapter_cls, _PATCH_MARKER, False):
             continue
 
-        adapter_cls.adjust_request = _wrap_adjust_request(
-            adapter_cls.adjust_request
-        )
+        adapter_cls.adjust_request = _wrap_adjust_request(adapter_cls.adjust_request)
         adapter_cls.extract_tool_calls = _wrap_extract_tool_calls(
             adapter_cls.extract_tool_calls
         )
-        adapter_cls.extract_tool_calls_streaming = (
-            _wrap_extract_tool_calls_streaming(
-                adapter_cls.extract_tool_calls_streaming
-            )
+        adapter_cls.extract_tool_calls_streaming = _wrap_extract_tool_calls_streaming(
+            adapter_cls.extract_tool_calls_streaming
         )
         setattr(adapter_cls, _PATCH_MARKER, True)

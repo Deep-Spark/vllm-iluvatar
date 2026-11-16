@@ -19,9 +19,13 @@ def is_ilu_dsv41_model_config(model_config: Any | None) -> bool:
         return False
     hf_config = getattr(model_config, "hf_config", None)
     hf_text_config = getattr(model_config, "hf_text_config", None)
-    if getattr(hf_config, "model_type", None) in ("deepseek_v41", "deepseek_v41_text") or getattr(
-        hf_text_config, "model_type", None
-    ) in ("deepseek_v41", "deepseek_v41_text"):
+    if getattr(hf_config, "model_type", None) in (
+        "deepseek_v41",
+        "deepseek_v41_text",
+    ) or getattr(hf_text_config, "model_type", None) in (
+        "deepseek_v41",
+        "deepseek_v41_text",
+    ):
         return True
     try:
         architectures = tuple(

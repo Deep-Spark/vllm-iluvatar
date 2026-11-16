@@ -146,4 +146,3 @@ def test_mask_topk_padding_preserves_dp1_and_skips_ungathered_dp(monkeypatch):
     ilu_ops._mask_topk_padding(w, ids, torch.tensor([False, True]))
     assert w[:, 0].tolist() == [1.0, 0.0]
     assert ids[:, 0].tolist() == [1, -1]
-

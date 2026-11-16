@@ -45,10 +45,14 @@ def indexer_kv_dtype() -> str:
     record before the model is built.
     """
     dtype = (
-        os.environ.get("VLLM_ILU_V41_INDEXER_KV_DTYPE")
-        or os.environ.get("VLLM_ILU_DS4_INDEXER_KV_DTYPE")
-        or "fp8"
-    ).strip().lower()
+        (
+            os.environ.get("VLLM_ILU_V41_INDEXER_KV_DTYPE")
+            or os.environ.get("VLLM_ILU_DS4_INDEXER_KV_DTYPE")
+            or "fp8"
+        )
+        .strip()
+        .lower()
+    )
     if dtype not in ("bf16", "fp8", "int8"):
         raise ValueError(
             f"VLLM_ILU_V41_INDEXER_KV_DTYPE must be bf16, fp8, or int8, got {dtype!r}"

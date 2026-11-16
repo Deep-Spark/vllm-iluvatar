@@ -157,9 +157,7 @@ def _sample_sequential_fused(
             sample_hidden,
             torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
         )
-        self.draft_token_confidence_probs[:num_reqs] = confidence.view(
-            num_reqs, n_spec
-        )
+        self.draft_token_confidence_probs[:num_reqs] = confidence.view(num_reqs, n_spec)
 
 
 def make_init_cudagraph_manager(
@@ -170,9 +168,7 @@ def make_init_cudagraph_manager(
     sequential Markov sampling eager when VLLM_ILU_DSPARK_BACKBONE_CG=1."""
 
     @functools.wraps(orig_init_cg)
-    def init_cudagraph_manager(
-        self: Any, cudagraph_mode: CUDAGraphMode
-    ) -> None:
+    def init_cudagraph_manager(self: Any, cudagraph_mode: CUDAGraphMode) -> None:
         is_dspark = self.__class__.__name__ == "DSparkSpeculator"
         backbone_cg = (
             is_dspark
@@ -422,9 +418,7 @@ def sample_sequential(self: Any, num_reqs: int, head_hidden: torch.Tensor) -> No
     idx_map_t = (
         self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec).t().contiguous()
     )
-    sample_pos_t = (
-        self.sample_pos[:num_sample].view(num_reqs, n_spec).t().contiguous()
-    )
+    sample_pos_t = self.sample_pos[:num_sample].view(num_reqs, n_spec).t().contiguous()
     confidence_markov_embeds: list[torch.Tensor] = []
     prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import warnings
+from functools import partial
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -108,6 +109,30 @@ _PACKED_MLA_HEADS = (1, 8, 16, 32, 64, 128)
 # Requests per workspace-gathered prefill chunk. Each one costs a row of
 # ``M * head_dim`` bf16, so this bounds the workspace rather than the batch.
 PREFILL_CHUNK_SIZE = 4
+
+
+def _padded_decode_reader(reader, q, *args, **kwargs):
+    """Run the 32-head decode kernel and keep the original 16 heads."""
+    from ixformer.inference.functions.deepseek.quantized_sparse_mla_int8 import (
+        GroupedInt8AttentionOutput,
+    )
+
+    padded_q = torch.cat((q, q), dim=2)
+    sink = kwargs.get("attn_sink")
+    if sink is not None:
+        kwargs["attn_sink"] = torch.cat((sink, sink))
+    if "groups" in kwargs:
+        groups = kwargs["groups"]
+        kwargs["groups"] = 2 * groups
+        kwargs.pop("bf16_scratch", None)
+        result = reader(padded_q, *args, **kwargs)
+        return GroupedInt8AttentionOutput(
+            result.values[:groups], result.scales[:groups], result.inverse_rope_applied
+        )
+    output = kwargs.pop("output")
+    result = reader(padded_q, *args, **kwargs)
+    output.copy_(result[:, :, :q.shape[2]])
+    return output
 
 
 def _tiled_index_rows(idx: torch.Tensor) -> torch.Tensor:
@@ -1893,16 +1918,21 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             quantized_sparse_mla_scratch_bytes,
         )
 
+        size_q = q
+        size_out = output
+        if q.shape[-2:] == (16, 512):
+            size_q = q.new_empty((*q.shape[:-2], 32, 512))
+            size_out = torch.empty_like(size_q)
         scratch_bytes = max(
             quantized_sparse_mla_scratch_bytes(
-                q[token_slice].unsqueeze(1),
+                size_q[token_slice].unsqueeze(1),
                 swa_cache.unsqueeze(-2),
                 _batched_index_rows(swa_indices),
                 cache,
                 scales,
                 _batched_index_rows(indices[token_slice]),
                 format=self.compressed_kv_format,
-                output=output[token_slice].unsqueeze(1),
+                output=size_out[token_slice].unsqueeze(1),
             )
             for token_slice, swa_indices in reader_ranges
         )
@@ -2106,6 +2136,10 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                     if isinstance(
                         retained, (torch.Tensor, QuantizedSparseMlaAffineView)
                     ):
+                        if q.shape[-2:] == (16, 512):
+                            quantized_sparse_mla_int8 = partial(
+                                _padded_decode_reader, quantized_sparse_mla_int8
+                            )
                         return quantized_sparse_mla_int8(
                             q.unsqueeze(1),
                             self.swa_cache_layer.kv_cache.unsqueeze(-2),
@@ -2124,6 +2158,8 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                             workspace=retained,
                             bf16_scratch=output.unsqueeze(1),
                         )
+                if not prefill and q.shape[-2:] == (16, 512):
+                    reader = partial(_padded_decode_reader, reader)
                 reader(
                     q.unsqueeze(1),
                     self.swa_cache_layer.kv_cache.unsqueeze(-2),

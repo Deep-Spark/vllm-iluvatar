@@ -31,3 +31,7 @@ ba = "ba"
 moew = "moew"
 # Broadcom BNXT RDMA header basename (``bnxt_re_hsi.h``); not a typo of ``his``.
 hsi = "hsi"
+
+# All-gather / reduce-scatter communication backend (AGRS), not "args".
+# Preserve existing method names, environment variables and test filenames.
+agrs = "agrs"

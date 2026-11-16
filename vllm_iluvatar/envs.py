@@ -259,6 +259,7 @@ if TYPE_CHECKING:
     VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS: int = 8
     VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS: float = 0.0
     VLLM_ILU_PP_PREFILL_COALESCE_MS: float = 0.0
+    VLLM_ILU_ENABLE_V2_PP_TOKEN_P2P: bool = False
 
     VLLM_ILU_MOE_RUNTIME_LAYOUT: str | None = None
     VLLM_ILU_MOE_W4A8_GEMV_PERF: bool = False
@@ -526,6 +527,15 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # sparse arrivals can trade up to this delay for fuller prefill batches.
     "VLLM_ILU_PP_PREFILL_COALESCE_MS": lambda: max(
         0.0, float(os.environ.get("VLLM_ILU_PP_PREFILL_COALESCE_MS", "0"))
+    ),
+    # Opt-in gate for relaying V2 PP sampled/draft tokens with ixfd
+    # send/recv instead of a broadcast (ilu_patch/general_patches/
+    # patch_v2_pp_token_p2p.py). IXCCL has no copy-engine broadcast, so the
+    # community collective leaves a resident RING_LL kernel pending for the
+    # whole PP rank skew; per SWDRV-5168 that pins a compute kernel until it
+    # retires. Needs NCCL_PRIM_P2P_LEVEL=1 for the copy-engine send/recv path.
+    "VLLM_ILU_ENABLE_V2_PP_TOKEN_P2P": _bool_reader(
+        "VLLM_ILU_ENABLE_V2_PP_TOKEN_P2P", "0"
     ),
     # Selects the ilu_mxfp4_fused_experts compute backend. Defaults to "ixmm";
     # "auto" -> ixmm when available else torch; "torch" forces the pure-torch

@@ -42,6 +42,7 @@ def _scaled_mq_limits(
     max_chunks: int,
     max_chunk_bytes: int,
     env_raw: str = "",
+    min_chunks: int = 0,
 ) -> tuple[int, int]:
     """Scale default-10 rings; leave explicit caller sizes unchanged."""
     if max_chunks != _COMMUNITY_DEFAULT_CHUNKS:
@@ -51,7 +52,7 @@ def _scaled_mq_limits(
         return max(_COMMUNITY_DEFAULT_CHUNKS, int(env_raw)), max_chunk_bytes
     if n_reader > 1:
         return (
-            max(_COMMUNITY_DEFAULT_CHUNKS, 2 * int(n_reader) + 8),
+            max(_COMMUNITY_DEFAULT_CHUNKS, 2 * int(n_reader) + 8, int(min_chunks)),
             max_chunk_bytes,
         )
     chunks = max(_COMMUNITY_DEFAULT_CHUNKS, 48)
@@ -87,8 +88,10 @@ def _apply() -> None:
         max_chunks = bound.arguments["max_chunks"]
         max_chunk_bytes = bound.arguments["max_chunk_bytes"]
         env_raw = str(getattr(envs, "VLLM_ILU_MQ_MAX_CHUNKS", "") or "")
+        pp_batches = int(getattr(envs, "VLLM_ILU_PP_MAX_CONCURRENT_BATCHES", 0) or 0)
+        min_chunks = (2 * pp_batches + 4) if pp_batches > 0 else 0
         new_chunks, new_bytes = _scaled_mq_limits(
-            n_reader, max_chunks, max_chunk_bytes, env_raw
+            n_reader, max_chunks, max_chunk_bytes, env_raw, min_chunks=min_chunks
         )
         if (new_chunks, new_bytes) != (max_chunks, max_chunk_bytes):
             bound.arguments["max_chunks"] = new_chunks

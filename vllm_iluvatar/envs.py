@@ -264,6 +264,7 @@ if TYPE_CHECKING:
     VLLM_ILU_DP_PREFILL_MAX_DEFER_STEPS: int = 8
     VLLM_ILU_DP_MAX_REPLACEMENT_WAIT_MS: float = 0.0
     VLLM_ILU_PP_PREFILL_COALESCE_MS: float = 0.0
+    VLLM_ILU_PP_MAX_CONCURRENT_BATCHES: int = 0
     VLLM_ILU_ENABLE_V2_PP_TOKEN_P2P: bool = False
 
     VLLM_ILU_MOE_RUNTIME_LAYOUT: str | None = None
@@ -550,6 +551,9 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # sparse arrivals can trade up to this delay for fuller prefill batches.
     "VLLM_ILU_PP_PREFILL_COALESCE_MS": lambda: max(
         0.0, float(os.environ.get("VLLM_ILU_PP_PREFILL_COALESCE_MS", "0"))
+    ),
+    "VLLM_ILU_PP_MAX_CONCURRENT_BATCHES": _int_reader(
+        "VLLM_ILU_PP_MAX_CONCURRENT_BATCHES", 0, minimum=0
     ),
     # Opt-in gate for relaying V2 PP sampled/draft tokens with ixfd
     # send/recv instead of a broadcast (ilu_patch/general_patches/

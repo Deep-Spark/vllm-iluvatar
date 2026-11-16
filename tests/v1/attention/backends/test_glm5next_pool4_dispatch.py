@@ -129,3 +129,63 @@ def test_logical_topk_width_and_mtp_row_compaction(
     )
     Glm5NextMultiTokenPredictor.compact_topk_indices(model, selected)
     torch.testing.assert_close(indices[:3], expected)
+
+
+@pytest.mark.parametrize(
+    "cache_bytes,prefills,decodes,heads,explicit_backend,expected_kpool,expected_backend",
+    [
+        ((1 << 31) + 1024, 1, 0, 64, None, 4, None),
+        ((1 << 31) + 1024, 1, 1, 64, None, 4, None),
+        (4096, 0, 1, 64, None, 4, None),
+        (4096, 1, 0, 64, "ixinfer", 4, "ixinfer"),
+        (4096, 1, 0, 8, None, 1, None),
+    ],
+)
+def test_compact_kpool4_dispatch_without_env(
+    monkeypatch,
+    cache_bytes,
+    prefills,
+    decodes,
+    heads,
+    explicit_backend,
+    expected_kpool,
+    expected_backend,
+):
+    from vllm_iluvatar.v1.attention.backends.mla import ilu_flashmla_sparse as mod
+
+    impl = mod.IluFlashMLASparseImpl.__new__(mod.IluFlashMLASparseImpl)
+    impl._indexer = SimpleNamespace(compact_pool_indices=True)
+    impl.use_pool4_decode = True
+    impl.softmax_scale = 0.0625
+    impl.num_heads = heads
+    q = torch.empty(512, heads, 512, dtype=torch.bfloat16, device="meta")
+    kv = torch.empty(cache_bytes // 1024, 1, 512, dtype=torch.bfloat16, device="meta")
+    selection = torch.empty(512, 512, dtype=torch.int32, device="meta")
+    lengths = torch.empty(512, dtype=torch.int32, device="meta")
+    metadata = SimpleNamespace(
+        num_prefills=prefills,
+        num_decodes=decodes,
+        topk_tokens=2048,
+        req_id_per_token=None,
+        block_table=None,
+        seq_lens=None,
+        query_start_loc=None,
+        block_size=128,
+    )
+    calls = []
+
+    def producer(*args, expand):
+        calls.append(("expand", expand))
+        return selection, lengths
+
+    def sparse_fwd(**kwargs):
+        calls.append(("fwd", kwargs["kpool"], kwargs.get("backend")))
+        assert kwargs["topk_length"] is lengths
+        return torch.empty_like(q)
+
+    monkeypatch.setattr(mod, "global_pool_indices", producer)
+    monkeypatch.setattr(mod.ixfops, "flash_mla_sparse_fwd", sparse_fwd)
+    out = impl._forward_bf16_kv(q, kv, selection, metadata, backend=explicit_backend)
+    assert out.shape == q.shape
+    assert calls[0] == ("expand", expected_kpool != 4)
+    assert calls[-1] == ("fwd", expected_kpool, expected_backend)

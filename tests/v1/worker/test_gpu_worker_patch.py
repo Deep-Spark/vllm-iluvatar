@@ -291,3 +291,279 @@ def test_warmup_temporarily_disables_glm_calibration(monkeypatch, pcp_size):
     monkeypatch.setattr(base, "compile_or_warm_up_model", base_warmup, raising=False)
     assert worker.compile_or_warm_up_model() == "base"
     assert layer._fp8_kv_scale_calibration_enabled is True
+
+
+@pytest.mark.parametrize(
+    "limit,pp,eager,expected",
+    [(20, 8, True, 21), (20, 1, True, 20), (20, 8, False, 20), (32, 8, True, 32)],
+)
+def test_eager_pp_allocator_limit(
+    _stub_gpu_worker, monkeypatch, limit, pp, eager, expected
+):
+    from types import SimpleNamespace
+
+    seen = []
+    sentinel = object()
+
+    def scoped(self, value):
+        seen.append(value)
+        return sentinel
+
+    monkeypatch.setattr(
+        _stub_gpu_worker.Worker, "_scoped_allocator_max_split", scoped, raising=False
+    )
+    worker = _make_worker(None)
+    worker.parallel_config = SimpleNamespace(pipeline_parallel_size=pp)
+    worker.model_config = SimpleNamespace(enforce_eager=eager)
+    assert worker._scoped_allocator_max_split(limit) is sentinel
+    assert seen == [expected]
+
+
+def test_pp_exchange_schema_and_drain(monkeypatch):
+    import torch
+
+    from vllm_iluvatar.v1.worker import pp_exchange as pe
+
+    schema = (
+        ("hidden_states", (4096,), torch.bfloat16),
+        ("residual", (4, 4096), torch.bfloat16),
+    )
+
+    class FakeWork:
+        def __init__(self):
+            self.waited = False
+
+        def wait(self):
+            self.waited = True
+
+        def is_completed(self):
+            return self.waited
+
+    works = []
+
+    def fake_isend(tensor, dst, group):
+        w = FakeWork()
+        works.append(w)
+        return w
+
+    monkeypatch.setattr(pe.dist, "isend", fake_isend)
+    pp = SimpleNamespace(
+        rank_in_group=0,
+        world_size=2,
+        ranks=[0, 1],
+        device_group="g",
+        isend_tensor_dict=None,
+        irecv_tensor_dict=None,
+    )
+
+    class CudaMeta:
+        def __init__(self, t):
+            self._t = t
+            self.shape = t.shape
+            self.dtype = t.dtype
+            self.device = t.device
+            self.is_cuda = True
+            self.recorded_streams = []
+
+        def is_contiguous(self):
+            return True
+
+        def untyped_storage(self):
+            return self._t.untyped_storage()
+
+        def record_stream(self, stream):
+            self.recorded_streams.append(stream)
+
+    wrapped = {
+        k: CudaMeta(torch.zeros((4, *shape), dtype=dtype, device="meta"))
+        for k, shape, dtype in schema
+    }
+    handles = pe.send_schema_tensors(pp, wrapped, 4, schema, retain_send=True)
+    assert handles[0] is None
+    assert all(isinstance(h, pe.RetainedSend) for h in handles[1:])
+    assert all(isinstance(h.tensor, CudaMeta) for h in handles[1:])
+
+    worker = SimpleNamespace(_pp_send_work=handles[1:])
+    pending = pe.defer_pp_send_wait(worker)
+    assert len(pending) == 1
+    assert worker._pp_send_work == []
+    with (
+        pe.schema_pp_exchange(
+            pp, 4, "meta", send_schema=schema, pending=pending, retain_send=True
+        ),
+        pytest.raises(ValueError, match="reused"),
+    ):
+        pp.isend_tensor_dict(wrapped)
+
+    pe.drain_pp_send_wait(worker)
+    assert len(pending) == 0
+    assert all(w.waited for w in works)
+
+    # Non-retained mode returns raw work handles and records current stream.
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _dev: "stream0")
+    handles_direct = pe.send_schema_tensors(pp, wrapped, 4, schema, retain_send=False)
+    assert handles_direct[0] is None
+    assert all(isinstance(h, FakeWork) for h in handles_direct[1:])
+    assert all(w.recorded_streams == ["stream0"] for w in wrapped.values())
+
+
+@pytest.mark.parametrize(
+    "fresh_alloc,free_bytes,schema_match,expected_active,expected_defer",
+    [
+        (True, 2 << 30, True, True, True),
+        (False, 2 << 30, True, True, False),
+        (True, 64 << 20, True, True, False),
+        (True, 2 << 30, False, False, False),
+    ],
+)
+def test_configure_eager_pp_exchange_negotiation(
+    monkeypatch, fresh_alloc, free_bytes, schema_match, expected_active, expected_defer
+):
+    import torch
+
+    import vllm_iluvatar.v1.worker.gpu_worker as gw
+
+    cg_mode = type("CUDAGraphMode", (), {"NONE": "NONE", "FULL": "FULL"})
+    vllm_cfg_mod = ModuleType("vllm.config")
+    vllm_comp_mod = ModuleType("vllm.config.compilation")
+    vllm_comp_mod.CUDAGraphMode = cg_mode
+    vllm_cfg_mod.compilation = vllm_comp_mod
+    monkeypatch.setitem(sys.modules, "vllm.config", vllm_cfg_mod)
+    monkeypatch.setitem(sys.modules, "vllm.config.compilation", vllm_comp_mod)
+
+    monkeypatch.setattr(gw, "is_ivcore11", lambda: True)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _dev: (free_bytes, 32 << 30))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    class FakeTensor:
+        def __init__(self, shape, dtype, ptr):
+            self.shape = shape
+            self.ndim = len(shape)
+            self.dtype = dtype
+            self.is_cuda = True
+            self._ptr = ptr
+
+        def is_contiguous(self):
+            return True
+
+        def numel(self):
+            n = 1
+            for s in self.shape:
+                n *= s
+            return n
+
+        def element_size(self):
+            return self.dtype.itemsize
+
+        def untyped_storage(self):
+            return SimpleNamespace(data_ptr=lambda: self._ptr)
+
+    class FakeIntermediate:
+        def __init__(self, tensors):
+            self.tensors = tensors
+
+    vllm_seq = ModuleType("vllm.sequence")
+    vllm_seq.IntermediateTensors = FakeIntermediate
+    monkeypatch.setitem(sys.modules, "vllm.sequence", vllm_seq)
+
+    persistent_buf = torch.empty((1,), dtype=torch.bfloat16)
+    persistent_ptr = persistent_buf.untyped_storage().data_ptr()
+
+    class FakeModel:
+        def __init__(self):
+            self._hooks = []
+
+        def register_forward_hook(self, fn):
+            self._hooks.append(fn)
+            return SimpleNamespace(remove=lambda: self._hooks.remove(fn))
+
+        def parameters(self):
+            return []
+
+        def buffers(self):
+            return [persistent_buf]
+
+        def make_empty_intermediate_tensors(self, batch_size, dtype, device):
+            return FakeIntermediate({"h": FakeTensor((batch_size, 16), dtype, 999)})
+
+        def __call__(self, *args, **kwargs):
+            ptr = 12345 if fresh_alloc else persistent_ptr
+            out = FakeIntermediate({"h": FakeTensor((2, 16), torch.bfloat16, ptr)})
+            for fn in list(self._hooks):
+                fn(self, args, out)
+            return out
+
+    pp = SimpleNamespace(
+        rank_in_group=1,
+        world_size=2,
+        is_first_rank=False,
+        is_last_rank=True,
+        cpu_group="cpu_g",
+    )
+    vllm_dist = ModuleType("vllm.distributed")
+    vllm_dist.get_pp_group = lambda: pp
+    monkeypatch.setitem(sys.modules, "vllm.distributed", vllm_dist)
+
+    def fake_all_gather_object(dst, local_val, group=None):
+        dst[0] = {
+            "send_schema": (("h", (16,), torch.bfloat16),),
+            "recv_schema": None,
+            "fresh_alloc": fresh_alloc,
+            "free_bytes": free_bytes,
+        }
+        dst[1] = (
+            local_val
+            if schema_match
+            else {
+                "send_schema": None,
+                "recv_schema": (("other", (16,), torch.bfloat16),),
+                "fresh_alloc": fresh_alloc,
+                "free_bytes": free_bytes,
+            }
+        )
+
+    monkeypatch.setattr(gw.dist, "all_gather_object", fake_all_gather_object)
+
+    class Runner:
+        decode_query_len = 1
+        uniform_decode_query_len = 1
+        max_num_tokens = 2560
+        is_pooling_model = False
+        is_encoder_decoder = False
+        use_aux_hidden_state_outputs = False
+        pp_handler = SimpleNamespace(aux_hidden_state_relay_keys=None)
+        ubatch_runner = None
+        execute_model_state = "stale"
+        model = FakeModel()
+        intermediate_tensors = FakeIntermediate(
+            {"h": FakeTensor((2560, 16), torch.bfloat16, 777)}
+        )
+
+        def _dummy_run(self, n, **kwargs):
+            self.model()
+
+    worker = _make_worker(Runner())
+    worker.device = SimpleNamespace(type="cuda")
+    worker.use_v2_model_runner = True
+    worker.model_config = SimpleNamespace(enforce_eager=True, dtype=torch.bfloat16)
+    worker.scheduler_config = SimpleNamespace(max_num_batched_tokens=2560)
+    worker.parallel_config = SimpleNamespace(
+        pipeline_parallel_size=2,
+        tensor_parallel_size=1,
+        data_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        use_sequence_parallel_moe=False,
+        enable_dbo=False,
+    )
+    worker.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=cg_mode.NONE,
+            pass_config=SimpleNamespace(enable_sp=False),
+        )
+    )
+
+    worker._configure_eager_pp_exchange()
+    assert (worker._pp_recv_schema is not None) is expected_active
+    assert worker._pp_defer_send_wait is expected_defer
+    assert worker.model_runner.intermediate_tensors.tensors["h"].shape[0] == 16

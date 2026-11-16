@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <limits>
 
+#include "sampling_precision.h"
+
 #include <torch/library.h>
 #include <c10/cuda/CUDAException.h>
 
@@ -285,10 +287,8 @@ __global__ void bias_gumbel_sample_kernel(
       value /= static_cast<acc_t>(temp);
     }
     if (temp != 0.0f) {
-      // CoreX lowers Triton's vector RNG one value per hardware warp. Match
-      // the baseline exactly: all 64 lanes use the warp's first token key.
-      const uint32_t noise_key = token - token % warpSize;
-      value = add_gumbel(value, seed, pos, noise_key);
+      // Match the corrected sampler: independent noise for every token.
+      value = add_gumbel(value, seed, pos, static_cast<uint32_t>(token));
     }
     best = choose_max(best, MaxPair<acc_t>{value, token});
   }
@@ -382,6 +382,7 @@ void launch_finish(const torch::Tensor& values, const torch::Tensor& indices,
 }  // namespace
 
 void dspark_bias_finish_v4(torch::Tensor values, torch::Tensor indices, torch::Tensor output) {
+  check_sampling_fp64(values.scalar_type() == at::kDouble);
   TORCH_CHECK(values.is_cuda() && indices.device() == values.device());
   TORCH_CHECK(output.device() == values.device() && output.is_contiguous());
   TORCH_CHECK(values.dim() == 2 && values.sizes() == indices.sizes());
@@ -400,6 +401,7 @@ void dspark_bias_sample_v4(
     torch::Tensor cache, torch::Tensor columns, bool fp64, int64_t padding,
     int64_t block_size, int64_t threads, int64_t position_offset,
     torch::Tensor ids, torch::Tensor values, torch::Tensor output) {
+  check_sampling_fp64(fp64 || logits.scalar_type() == at::kDouble);
   TORCH_CHECK(logits.is_cuda() && logits.dim() == 2);
   TORCH_CHECK(bias.sizes() == logits.sizes() && bias.device() == logits.device());
   TORCH_CHECK(logits.scalar_type() == bias.scalar_type());

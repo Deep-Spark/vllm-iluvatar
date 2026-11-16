@@ -579,7 +579,7 @@ def _load_checkpoint_index(input_dir: Path) -> tuple[dict[str, Any], bool]:
     if shards != [single_path]:
         raise FileNotFoundError(f"missing {index_path}")
     with safe_open(str(single_path), framework="pt") as file:
-        weight_map = {key: "model.safetensors" for key in file.keys()}
+        weight_map = {key: "model.safetensors" for key in file.keys()}  # noqa: SIM118
     return {"metadata": {}, "weight_map": weight_map}, False
 
 

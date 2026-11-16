@@ -352,7 +352,7 @@ def _rebuild_index(output_path: Path, source_index: Mapping[str, Any]) -> None:
     total_size = 0
     for shard_path in sorted(output_path.glob("*.safetensors")):
         with safe_open(str(shard_path), framework="pt") as file:
-            for key in file.keys():
+            for key in file.keys():  # noqa: SIM118
                 tensor_slice = file.get_slice(key)
                 numel = 1
                 for size in tensor_slice.get_shape():

@@ -54,6 +54,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.dcp import cp_lse_ag_out_rs
+from vllm.v1.kv_cache_interface import KVCacheSpec
 
 logger = init_logger("vllm." + __name__)
 

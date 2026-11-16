@@ -41,7 +41,7 @@ python3 tests/model_smoke/runner.py --models all --output /work/model-smoke-resu
 每款只选一个代表配置，逻辑 GPU 上限16。完整命令参数以 models/ 下的模型JSON为准；每次运行将实际命令和环境写入 `launch.json`，除Hy4使用当前支持的eager模式外，其余模型使用 mode=0 的 FULL_DECODE_ONLY。
 
 | model ID | 模型 | TP×PP×DP | 投机解码 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | deepseek-v4-flash | DeepSeek-V4-Flash | 8×1×1 | 无 |
 | deepseek-v4-1-flash-1017 | DeepSeek-V4.1-Flash-1017 | 4×4×1 | DSpark 5 |
 | deepseek-r1 | DeepSeek-R1 | 4×4×1 | 无 |

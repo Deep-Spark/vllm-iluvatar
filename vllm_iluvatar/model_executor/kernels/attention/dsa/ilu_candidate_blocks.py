@@ -23,6 +23,8 @@ Remove   : when community grows a vendor hook for these two.
 
 from __future__ import annotations
 
+import contextlib
+
 import torch
 from ixformer.inference.functions import dsa_update_topk_indices
 from ixformer.inference.functions.models import deepseek_v41 as ixfops
@@ -138,10 +140,8 @@ def select_candidate_blocks(
                 top = scores[s:e].topk(k, dim=-1)
             except RuntimeError as err:
                 if "out of memory" in str(err).lower() and sub > 1:
-                    try:
+                    with contextlib.suppress(Exception):
                         torch.cuda.empty_cache()
-                    except Exception:
-                        pass
                     sub = max(1, sub // 2)
                     continue
                 raise

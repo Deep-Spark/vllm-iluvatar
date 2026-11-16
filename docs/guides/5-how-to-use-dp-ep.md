@@ -560,7 +560,7 @@ export VLLM_ILU_DECODE_EP_BACKEND=deepep_low_latency
 先区分模型入口，再判断自定义路径内部的 backend。
 
 | 模型 | 进入 `forward_dp_ep()` 的条件 | 其它情况 |
-|---|---|---|
+| --- | --- | --- |
 | GLM-5.2 | 设置了合法 override，且所有 DP rank 都是纯 Decode | 使用 `self.experts` / MoERunner，按配置 backend 执行 |
 | DeepSeek-V4 | `_should_use_forward_dp_ep()` 为真 | 保留模型原有 `FusedMoE` forward |
 

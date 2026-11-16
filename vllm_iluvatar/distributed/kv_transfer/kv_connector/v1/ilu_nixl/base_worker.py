@@ -623,8 +623,14 @@ class IluNixlWorkerMixin:
             tensor_offset = int(tensor_config.offset)
             num_blocks = int(layout_config.num_blocks)
 
-            def layer_byte_offset(layer_name: str) -> int:
-                return tensor_offset + layer_positions[layer_name] * layer_stride
+            def layer_byte_offset(
+                layer_name: str,
+                *,
+                _tensor_offset: int = tensor_offset,
+                _layer_positions: dict[str, int] = layer_positions,
+                _layer_stride: int = layer_stride,
+            ) -> int:
+                return _tensor_offset + _layer_positions[layer_name] * _layer_stride
 
             missing_specs = [
                 layer_name for layer_name in shared_by if layer_name not in specs

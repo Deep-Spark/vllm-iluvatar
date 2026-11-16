@@ -257,14 +257,12 @@ def _local_prefill_state(
         ):
             return False
         params = getattr(request, "kv_transfer_params", None) or {}
-        if (
+        # Scheduler.schedule still runs on this rank and can allocate/start
+        # the receive during a coalescing window (load_kv_async bypass).
+        return not (
             params.get("do_remote_prefill")
             and getattr(request, "num_computed_tokens", 0) == 0
-        ):
-            # Scheduler.schedule still runs on this rank and can allocate/start
-            # the receive during a coalescing window (load_kv_async bypass).
-            return False
-        return True
+        )
 
     active = len(scheduler.running) + getattr(
         scheduler, "num_waiting_for_streaming_input", 0

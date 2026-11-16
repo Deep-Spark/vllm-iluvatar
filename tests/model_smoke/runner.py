@@ -5,6 +5,7 @@
 
 import argparse
 import concurrent.futures
+import contextlib
 import hashlib
 import json
 import math
@@ -462,9 +463,11 @@ def preflight(model, cache_root):
         # Full shard checksums were verified before the READY atomic rename.
         # Recheck small configuration/tokenizer/code files, without rereading TB
         # of immutable tensors on every PR. The container mounts this tree :ro.
-        if file["size"] <= 16 * 1024 * 1024:
-            if hashlib.sha256(target.read_bytes()).hexdigest() != file["sha256"]:
-                raise ValueError("Local metadata checksum mismatch: " + str(target))
+        if (
+            file["size"] <= 16 * 1024 * 1024
+            and hashlib.sha256(target.read_bytes()).hexdigest() != file["sha256"]
+        ):
+            raise ValueError("Local metadata checksum mismatch: " + str(target))
     if (
         hashlib.sha256((path / "config.json").read_bytes()).hexdigest()
         != model["config_sha256"]
@@ -514,10 +517,8 @@ class RunControl:
     @staticmethod
     def terminate(proc):
         if proc.poll() is None:
-            try:
+            with contextlib.suppress(ProcessLookupError):
                 os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
 
     def register(self, proc):
         with self.lock:
@@ -562,18 +563,12 @@ def stop_process(proc):
         return
     # The session/group belongs only to this server. Always clean descendants,
     # even if the group leader already died; never pkill another model/server.
-    try:
+    with contextlib.suppress(ProcessLookupError):
         os.killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
+    with contextlib.suppress(subprocess.TimeoutExpired):
         proc.wait(timeout=20)
-    except subprocess.TimeoutExpired:
-        pass
-    try:
+    with contextlib.suppress(ProcessLookupError):
         os.killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
     proc.wait(timeout=10)
     deadline = time.monotonic() + 10
     while True:
@@ -870,10 +865,9 @@ def schedule_models(selected, cases, args, on_result=None, run=run_model):
     finally:
         pool.shutdown(wait=True)
         for future in list(active):
-            try:
+            # A missing model remains a failure in the suite report.
+            with contextlib.suppress(Exception):
                 collect(future)
-            except Exception:
-                pass  # A missing model remains a failure in the suite report.
     return results
 
 

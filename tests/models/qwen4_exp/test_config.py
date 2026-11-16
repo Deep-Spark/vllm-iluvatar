@@ -264,12 +264,10 @@ def _supported_vllm_config(**overrides) -> SimpleNamespace:
     """Minimal VllmConfig stand-in that ``_verify_supported_config`` accepts.
 
     The runner check reads the resolved ``vllm_config.use_v2_model_runner``
-    property (v0.31 defaults an unset env to V2), so mirror that here: an
-    unpatched ``vllm.envs.VLLM_USE_V2_MODEL_RUNNER`` (None) maps to True and
-    an explicit ``patch(..., False)`` still rejects the V1 runner.
+    (v0.31 defaults an unset env to V2), so default that field to ``True``
+    here. Reject V1 via ``use_v2_model_runner=False`` in overrides — not by
+    patching ``VLLM_USE_V2_MODEL_RUNNER``.
     """
-    import vllm.envs as envs
-
     parallel = {
         "pipeline_parallel_size": 1,
         "enable_eplb": False,
@@ -297,8 +295,6 @@ def _supported_vllm_config(**overrides) -> SimpleNamespace:
             dtype=torch.bfloat16,
             hf_text_config=SimpleNamespace(mamba_ssm_dtype="float32"),
         ),
-        "use_v2_model_runner": getattr(envs, "VLLM_USE_V2_MODEL_RUNNER", None)
-        is not False,
     }
     config.update(overrides)
     return SimpleNamespace(**config)

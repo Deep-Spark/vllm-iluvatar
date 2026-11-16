@@ -143,9 +143,9 @@ class Rotary(torch.nn.Module):
 
 def install_metadata(monkeypatch, layer, slots, mode):
     n = slots.numel()
-    nd = n if mode == "decode" else n // 2 if mode == "mixed" else 0
+    num_decode = n if mode == "decode" else n // 2 if mode == "mixed" else 0
     chunk = SimpleNamespace(
-        token_start=nd,
+        token_start=num_decode,
         token_end=n,
         max_context_len=16,
         max_q_len=1,
@@ -178,10 +178,10 @@ def install_metadata(monkeypatch, layer, slots, mode):
         query_start_loc=None,
         slot_mapping=slots,
         head_dim=128,
-        num_decodes=int(nd > 0),
-        num_decode_tokens=nd,
-        num_prefills=int(nd < n),
-        num_prefill_tokens=n - nd,
+        num_decodes=int(num_decode > 0),
+        num_decode_tokens=num_decode,
+        num_prefills=int(num_decode < n),
+        num_prefill_tokens=n - num_decode,
         decode=decode,
         prefill=SimpleNamespace(chunks=[chunk]),
     )

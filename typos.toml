@@ -29,3 +29,5 @@ ba = "ba"
 # ``MOEW`` is the ILU MoE W16A16 expert-class acronym (e.g. ``IluMOEW16A16``);
 # not a typo of ``MEOW`` / ``MORE`` / ``MOW``.
 moew = "moew"
+# Broadcom BNXT RDMA header basename (``bnxt_re_hsi.h``); not a typo of ``his``.
+hsi = "hsi"

@@ -597,7 +597,7 @@ class IluFusedMoEEP:
         return runner._maybe_add_zero_expert_output(final_hidden_states).view(org_shape)
 
     @staticmethod
-    def _combine_agrs_output(
+    def _combine_ag_rs_output(
         fused_output: torch.Tensor,
         shared_output: torch.Tensor | None,
         dist_group,
@@ -773,7 +773,7 @@ class IluFusedMoEEP:
         if shared_output is not None and fused_output.dtype == torch.float16:
             shared_output *= runner.shared_experts_scaling_factor
         fused_output = runner.apply_routed_output_transform(fused_output)
-        final_hidden_states = self._combine_agrs_output(
+        final_hidden_states = self._combine_ag_rs_output(
             fused_output,
             shared_output,
             dist_group,

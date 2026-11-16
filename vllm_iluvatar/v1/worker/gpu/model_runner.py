@@ -43,8 +43,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     UniformTypeKVCacheSpecs,
 )
-
-logger = init_logger(__name__)
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
@@ -72,6 +70,8 @@ from vllm.v1.worker.utils import (
     bind_kv_cache_to_layers,
     copy_kv_cache_blocks_inplace,
 )
+
+logger = init_logger(__name__)
 
 # Iluvatar GPU model runner customizations.
 #

@@ -42,7 +42,7 @@ intervals. The following complete 40-layer cuts retain a nonempty executed
 prefix on every producer stage:
 
 | Producer | Full layer partition | Executed prefix counts |
-|---|---|---|
+| --- | --- | --- |
 | TP2 PP4 | `5,5,5,25` | `5,5,5,6` |
 | TP1/TP2 PP8 | `3,3,3,3,3,2,2,21` | `3,3,3,3,3,2,2,2` |
 | TP1 PP16 | five `2`, ten `1`, then `20` | five `2`, eleven `1` |

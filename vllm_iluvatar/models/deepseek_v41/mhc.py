@@ -37,9 +37,7 @@ def _want_fused_fp8(
         return False
     if _fuse_reductions and num_tokens <= 16:
         return False
-    if sqrsum.dim() == 2 and sqrsum.shape[1] > 1:
-        return False
-    return True
+    return not (sqrsum.dim() == 2 and sqrsum.shape[1] > 1)
 
 
 def hc_pre(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:

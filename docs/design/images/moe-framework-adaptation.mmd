@@ -1,0 +1,28 @@
+flowchart TB
+    subgraph V["vLLM 社区接口"]
+        C["量化 Config<br/>get_quant_method"]
+        M["社区 MoE Method<br/>如 Mxfp4MoEMethod"]
+        C --> M
+    end
+
+    subgraph I["Iluvatar 插件适配"]
+        IC["插件量化 Config"]
+        IM["插件 MoE Method"]
+        IC --> IM
+    end
+
+    C -->|"注册插件 Config"| IC
+    M -->|"继承并适配"| IM
+
+    IM --> L["加载与转换权重"]
+    IM --> B["选择并绑定计算 backend"]
+    L -->|"统一运行权重格式"| B
+    B --> X["IxFormer 算子"]
+
+    classDef upstream fill:#eef4ff,stroke:#6485b5,color:#172b4d
+    classDef plugin fill:#eef8f2,stroke:#619879,color:#173d2a
+    classDef backend fill:#fff5e8,stroke:#bb9156,color:#51391b
+
+    class C,M upstream
+    class IC,IM,L plugin
+    class B,X backend

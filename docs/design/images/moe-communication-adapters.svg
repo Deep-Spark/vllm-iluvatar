@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 681.5429999999999 916" width="681.5429999999999" height="916">
+<rect width="100%" height="100%" fill="white"/>
+
+<defs>
+  <marker id="arrowhead" markerWidth="8" markerHeight="5" refX="7" refY="2.5" orient="auto">
+    <polygon points="0 0, 8 2.5, 0 5" fill="#64748b" stroke="#64748b" stroke-width="0.75" stroke-linejoin="round" />
+  </marker>
+  <marker id="arrowhead-start" markerWidth="8" markerHeight="5" refX="1" refY="2.5" orient="auto-start-reverse">
+    <polygon points="8 0, 0 2.5, 8 5" fill="#64748b" stroke="#64748b" stroke-width="0.75" stroke-linejoin="round" />
+  </marker>
+</defs>
+<g class="subgraph" data-id="ADAPTER" data-label="ilu_compute_experts.py：协议适配">
+  <rect x="35.89024999999998" y="233" width="584.1979999999999" height="166.7" rx="0" ry="0" fill="#ffffff" stroke="#94a3b8" stroke-width="1" />
+  <rect x="35.89024999999998" y="233" width="584.1979999999999" height="28" rx="0" ry="0" fill="#f3f5f8" stroke="#94a3b8" stroke-width="1" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="47.89024999999998" y="247" font-size="12" font-weight="600" fill="#52657a" dy="4.199999999999999">ilu_compute_experts.py：协议适配</text>
+</g>
+<g class="subgraph" data-id="COMPUTE" data-label="计算 backend：本地专家计算">
+  <rect x="72.56974999999996" y="463.7" width="502.688" height="130.7" rx="0" ry="0" fill="#ffffff" stroke="#94a3b8" stroke-width="1" />
+  <rect x="72.56974999999996" y="463.7" width="502.688" height="28" rx="0" ry="0" fill="#f3f5f8" stroke="#94a3b8" stroke-width="1" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="84.56974999999996" y="477.7" font-size="12" font-weight="600" fill="#52657a" dy="4.199999999999999">计算 backend：本地专家计算</text>
+</g>
+<g class="subgraph" data-id="FINAL" data-label="vLLM Finalize / Combine">
+  <rect x="32" y="658.4" width="617.5429999999999" height="130.7" rx="0" ry="0" fill="#ffffff" stroke="#94a3b8" stroke-width="1" />
+  <rect x="32" y="658.4" width="617.5429999999999" height="28" rx="0" ry="0" fill="#f3f5f8" stroke="#94a3b8" stroke-width="1" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="44" y="672.4" font-size="12" font-weight="600" fill="#52657a" dy="4.199999999999999">vLLM Finalize / Combine</text>
+</g>
+<polyline class="edge" data-from="SELECT" data-to="S" data-style="solid" data-arrow-start="false" data-arrow-end="true" data-label="Standard" points="146.82783333333327,111.15 146.82783333333327,142.7 147.3218333333333,142.7 147.3218333333333,215 143.43158333333332,215 143.43158333333332,315.81666666666666" fill="none" stroke="#64748b" stroke-width="1" marker-end="url(#arrowhead)" />
+<polyline class="edge" data-from="SELECT" data-to="B" data-style="solid" data-arrow-start="false" data-arrow-end="true" data-label="BatchedExperts" points="244.79116666666658,111.15 244.79116666666658,142.7 287.8730833333333,142.7 287.8730833333333,215 335.33924999999994,215 335.33925,301 445.70558333333327,301 445.70558333333327,315.81666666666666" fill="none" stroke="#64748b" stroke-width="1" marker-end="url(#arrowhead)" />
+<polyline class="edge" data-from="P" data-to="S" data-style="solid" data-arrow-start="false" data-arrow-end="true" data-label="token 布局" points="456.0178333333332,94.25 456.0178333333332,142.7 402.8706666666666,142.7 402.8706666666666,215 345.33924999999994,215 345.33925,289 234.97291666666663,289 234.97291666666663,315.81666666666666" fill="none" stroke="#64748b" stroke-width="1" marker-end="url(#arrowhead)" />
+<polyline class="edge" data-from="P" data-to="B" data-style="solid" data-arrow-start="false" data-arrow-end="true" data-label="expert 分组布局" points="529.2811666666665,94.25 529.2811666666665,142.7 536.3134999999999,142.7 536.3134999999999,215 524.8969166666666,215 524.8969166666666,315.81666666666666" fill="none" stroke="#64748b" stroke-width="1" marker-end="url(#arrowhead)" />
+<polyline class="edge" data-from="S" data-to="RS" data-style="solid" data-arrow-start="false" data-arrow-end="true" points="189.20224999999996,369.6166666666667 189.20224999999996,445.7 209.57974999999993,445.7 209.57974999999996,507.7" fill="none" stroke="#64748b" stroke-width="1" marker-end="url(#arrowhead)" />
+<polyline class="edge" data-from="B" data-to="RB" data-style="solid" data-arrow-start="false" data-arrow-end="true" points="485.30124999999987,386.51666666666665 485.30125,445.7 464.9237499999999,445.7 464.9237499999999,507.7" fill="none" stroke="#64748b" stroke-width="1" marker-end="url(#arrowhead)" />
+<polyline class="edge" data-from="RS" data-to="FS" data-style="solid" data-arrow-start="false" data-arrow-end="true" points="209.57974999999993,578.4 209.57974999999993,640.4 176.42,640.4 176.42,702.4" fill="none" stroke="#64748b" stroke-width="1" marker-end="url(#arrowhead)" />
+<polyline class="edge" data-from="RB" data-to="FB" data-style="solid" data-arrow-start="false" data-arrow-end="true" points="464.9237499999999,578.4 464.9237499999999,640.4 489.1914999999999,640.4 489.1914999999999,702.4" fill="none" stroke="#64748b" stroke-width="1" marker-end="url(#arrowhead)" />
+<polyline class="edge" data-from="FS" data-to="O" data-style="solid" data-arrow-start="false" data-arrow-end="true" points="176.42,773.1 176.42,810.1 337.2517499999999,810.1 337.2517499999999,847.1" fill="none" stroke="#64748b" stroke-width="1" marker-end="url(#arrowhead)" />
+<polyline class="edge" data-from="FB" data-to="O" data-style="solid" data-arrow-start="false" data-arrow-end="true" points="489.1914999999999,773.1 489.1914999999999,810.1 337.2517499999999,810.1 337.2517499999999,847.1" fill="none" stroke="#64748b" stroke-width="1" marker-end="url(#arrowhead)" />
+<g class="edge-label" data-from="SELECT" data-to="S" data-label="Standard">
+  <rect x="116.3218333333333" y="149.7" width="61.605999999999995" height="30.3" rx="2" ry="2" fill="#ffffff" stroke="#dce1e8" stroke-width="1" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="147.1248333333333" y="164.85" text-anchor="middle" font-size="11" font-weight="400" fill="#52657a" dy="3.8499999999999996">Standard</text>
+</g>
+<g class="edge-label" data-from="SELECT" data-to="B" data-label="BatchedExperts">
+  <rect x="240.37308333333328" y="149.7" width="94.87000000000003" height="30.3" rx="2" ry="2" fill="#ffffff" stroke="#dce1e8" stroke-width="1" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="287.8080833333333" y="164.85" text-anchor="middle" font-size="11" font-weight="400" fill="#52657a" dy="3.8499999999999996">BatchedExperts</text>
+</g>
+<g class="edge-label" data-from="P" data-to="S" data-label="token 布局">
+  <rect x="367.8706666666666" y="149.7" width="69.328" height="30.3" rx="2" ry="2" fill="#ffffff" stroke="#dce1e8" stroke-width="1" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="402.53466666666657" y="164.85" text-anchor="middle" font-size="11" font-weight="400" fill="#52657a" dy="3.8499999999999996">token 布局</text>
+</g>
+<g class="edge-label" data-from="P" data-to="B" data-label="expert 分组布局">
+  <rect x="487.3134999999998" y="149.7" width="97.84000000000002" height="30.3" rx="2" ry="2" fill="#ffffff" stroke="#dce1e8" stroke-width="1" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="536.2334999999998" y="164.85" text-anchor="middle" font-size="11" font-weight="400" fill="#52657a" dy="3.8499999999999996">expert 分组布局</text>
+</g>
+<g class="node" data-id="SELECT" data-label="bind_compute_experts
+根据 Prepare/Finalize 的 activation_format
+绑定对应适配器" data-shape="rectangle">
+  <rect x="48.86449999999999" y="40.45" width="293.8899999999999" height="70.7" rx="0" ry="0" fill="#eef8f2" stroke="#619879" stroke-width="0.75" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="195.80949999999993" y="75.80000000000001" text-anchor="middle" font-size="13" font-weight="500" fill="#173d2a"><tspan x="195.80949999999993" dy="-12.350000000000001">bind_compute_experts</tspan><tspan x="195.80949999999993" dy="16.900000000000002">根据 Prepare/Finalize 的 activation_format</tspan><tspan x="195.80949999999993" dy="16.900000000000002">绑定对应适配器</tspan></text>
+</g>
+<g class="node" data-id="P" data-label="vLLM Prepare / Dispatch
+准备输入、路由信息及通信" data-shape="rectangle">
+  <rect x="382.7544999999999" y="40.45" width="219.78999999999996" height="53.800000000000004" rx="0" ry="0" fill="#eef4ff" stroke="#6485b5" stroke-width="0.75" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="492.6494999999999" y="67.35000000000001" text-anchor="middle" font-size="13" font-weight="500" fill="#172b4d"><tspan x="492.6494999999999" dy="-3.9000000000000012">vLLM Prepare / Dispatch</tspan><tspan x="492.6494999999999" dy="16.900000000000002">准备输入、路由信息及通信</tspan></text>
+</g>
+<g class="node" data-id="O" data-label="返回 token 输出" data-shape="rectangle">
+  <rect x="268.1117499999999" y="847.1" width="138.28" height="36.900000000000006" rx="0" ry="0" fill="#eef4ff" stroke="#6485b5" stroke-width="0.75" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="337.2517499999999" y="865.5500000000001" text-anchor="middle" font-size="13" font-weight="500" fill="#172b4d" dy="4.55">返回 token 输出</text>
+</g>
+<g class="node" data-id="S" data-label="IluStandardComputeExperts
+传递 token 输入、TopK 与 expert_map" data-shape="rectangle">
+  <rect x="51.89024999999998" y="315.81666666666666" width="274.62399999999997" height="53.800000000000004" rx="0" ry="0" fill="#eef8f2" stroke="#619879" stroke-width="0.75" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="189.20224999999996" y="342.71666666666664" text-anchor="middle" font-size="13" font-weight="500" fill="#173d2a"><tspan x="189.20224999999996" dy="-3.9000000000000012">IluStandardComputeExperts</tspan><tspan x="189.20224999999996" dy="16.900000000000002">传递 token 输入、TopK 与 expert_map</tspan></text>
+</g>
+<g class="node" data-id="B" data-label="IluBatchedComputeExperts
+传递按专家分组的输入、scale
+及每个专家的有效 token 数" data-shape="rectangle">
+  <rect x="366.5142499999999" y="315.81666666666666" width="237.57399999999996" height="70.7" rx="0" ry="0" fill="#eef8f2" stroke="#619879" stroke-width="0.75" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="485.30124999999987" y="351.1666666666667" text-anchor="middle" font-size="13" font-weight="500" fill="#173d2a"><tspan x="485.30124999999987" dy="-12.350000000000001">IluBatchedComputeExperts</tspan><tspan x="485.30124999999987" dy="16.900000000000002">传递按专家分组的输入、scale</tspan><tspan x="485.30124999999987" dy="16.900000000000002">及每个专家的有效 token 数</tspan></text>
+</g>
+<g class="node" data-id="RS" data-label="run_standard
+计算并完成本地 TopK 加权归约
+输出 token 结果" data-shape="rectangle">
+  <rect x="88.56974999999996" y="507.7" width="242.01999999999998" height="70.7" rx="0" ry="0" fill="#fff5e8" stroke="#bb9156" stroke-width="0.75" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="209.57974999999993" y="543.05" text-anchor="middle" font-size="13" font-weight="500" fill="#51391b"><tspan x="209.57974999999993" dy="-12.350000000000001">run_standard</tspan><tspan x="209.57974999999993" dy="16.900000000000002">计算并完成本地 TopK 加权归约</tspan><tspan x="209.57974999999993" dy="16.900000000000002">输出 token 结果</tspan></text>
+</g>
+<g class="node" data-id="RB" data-label="run_batched
+按专家计算
+输出未加权 expert 结果" data-shape="rectangle">
+  <rect x="370.5897499999999" y="507.7" width="188.668" height="70.7" rx="0" ry="0" fill="#fff5e8" stroke="#bb9156" stroke-width="0.75" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="464.9237499999999" y="543.05" text-anchor="middle" font-size="13" font-weight="500" fill="#51391b"><tspan x="464.9237499999999" dy="-12.350000000000001">run_batched</tspan><tspan x="464.9237499999999" dy="16.900000000000002">按专家计算</tspan><tspan x="464.9237499999999" dy="16.900000000000002">输出未加权 expert 结果</tspan></text>
+</g>
+<g class="node" data-id="FS" data-label="Standard
+TopKWeightAndReduceNoOP
+保留所需通信，不重复 TopK 加权" data-shape="rectangle">
+  <rect x="48" y="702.4" width="256.84" height="70.7" rx="0" ry="0" fill="#eef4ff" stroke="#6485b5" stroke-width="0.75" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="176.42" y="737.75" text-anchor="middle" font-size="13" font-weight="500" fill="#172b4d"><tspan x="176.42" dy="-12.350000000000001">Standard</tspan><tspan x="176.42" dy="16.900000000000002">TopKWeightAndReduceNoOP</tspan><tspan x="176.42" dy="16.900000000000002">保留所需通信，不重复 TopK 加权</tspan></text>
+</g>
+<g class="node" data-id="FB" data-label="Batched
+TopKWeightAndReduceDelegate
+由 Finalize/Combine 完成 TopK 加权归约" data-shape="rectangle">
+  <rect x="344.8399999999999" y="702.4" width="288.703" height="70.7" rx="0" ry="0" fill="#eef4ff" stroke="#6485b5" stroke-width="0.75" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="489.1914999999999" y="737.75" text-anchor="middle" font-size="13" font-weight="500" fill="#172b4d"><tspan x="489.1914999999999" dy="-12.350000000000001">Batched</tspan><tspan x="489.1914999999999" dy="16.900000000000002">TopKWeightAndReduceDelegate</tspan><tspan x="489.1914999999999" dy="16.900000000000002">由 Finalize/Combine 完成 TopK 加权归约</tspan></text>
+</g>
+</svg>

@@ -8,6 +8,9 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+    MoEComputeSelection,
+)
 from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp4_moe import (
     IluMxfp4MoEMethod,
 )
@@ -21,6 +24,15 @@ def make_moe(monkeypatch, kind, hash_layer=True):
     method = object.__new__(
         IluMxfp4MoEMethod if kind == "native" else IluMxfp4ToW4A8TNOnlineMoEMethod
     )
+    if kind in ("ixinfer_w4a8", "ixmm_w4a8", "ixmm_fp4fp8"):
+        method = IluMxfp4MoEMethod(
+            SimpleNamespace(max_capture_size=32),
+            MoEComputeSelection(
+                kind,
+                "fp4fp8" if kind == "ixmm_fp4fp8" else "NN",
+                "ivcore11" if kind == "ixinfer_w4a8" else "ivcore30",
+            ),
+        )
     if kind == "wrapped":
         method = SimpleNamespace(old_quant_method=method)
     runner = Mock(_quant_method=method)
@@ -52,14 +64,18 @@ def make_moe(monkeypatch, kind, hash_layer=True):
     return mod.IluDeepseekV4Fp8MoE(cfg, "model.layers.0.ffn"), runner, init
 
 
-@pytest.mark.parametrize("kind", ["native", "converted", "wrapped"])
+@pytest.mark.parametrize(
+    "kind",
+    ["native", "converted", "wrapped", "ixinfer_w4a8", "ixmm_w4a8", "ixmm_fp4fp8"],
+)
 @pytest.mark.parametrize("eligible", [False, True])
 @pytest.mark.parametrize("hash_layer", [False, True])
 def test_method_admission_and_forward(monkeypatch, kind, eligible, hash_layer):
     moe, runner, init = make_moe(monkeypatch, kind, hash_layer)
-    # Native MXFP4 stays on the community runner unless the decode LL
-    # override is enabled. Converted/wrapped W4A8 always install Hybrid EP.
-    assert init.call_count == (kind != "native")
+    # Independent W4A8 must keep the same communication path as converted
+    # W4A8 without inheriting its compute class. FP4FP8 keeps the native path.
+    prefers_hybrid = kind not in ("native", "ixmm_fp4fp8")
+    assert init.call_count == prefers_hybrid
     assert moe._ilu_decode_ll is False
     guard = Mock(return_value=eligible)
     hybrid = Mock(return_value=torch.full((2, 8), 7.0))
@@ -69,10 +85,10 @@ def test_method_admission_and_forward(monkeypatch, kind, eligible, hash_layer):
     hidden = torch.arange(16).reshape(2, 8).float()
     ids = torch.tensor([1, 2], dtype=torch.int64) if hash_layer else None
     output = moe(hidden, ids)
-    use_hybrid = kind != "native" and eligible
+    use_hybrid = prefers_hybrid and eligible
     assert output.shape == hidden.shape
     assert torch.equal(output, torch.full_like(hidden, 7 if use_hybrid else 3))
-    assert guard.call_count == (kind != "native")
+    assert guard.call_count == prefers_hybrid
     assert hybrid.call_count == use_hybrid
     assert runner.call_count == (not use_hybrid)
     if use_hybrid:

@@ -1,0 +1,32 @@
+flowchart TB
+    subgraph BASE["ilu_compute_backend.py：公共设计"]
+        R["注册、选择与创建 backend<br/>register_moe_backend<br/>select_moe_backend / make_moe_compute"]
+        W["统一数据契约<br/>WeightSpec：权重格式<br/>Weights：运行权重引用<br/>Config：层配置<br/>Workspace：调用期间的临时空间"]
+        I["MoEComputeBackend 基类<br/>公共检查与辅助方法<br/>定义 run_standard / run_batched"]
+    end
+
+    subgraph IMPL["ilu_ixmm_fp4fp8.py：具体实现"]
+        D["IxMMFP4FP8Backend<br/>继承基类并注册<br/>声明 300 / FP4 权重 / FP8 激活"]
+        S["run_standard<br/>重排与量化输入<br/>W13 → 激活 → W2<br/>TopK 加权归约"]
+        B["run_batched<br/>接收按专家分组的输入<br/>W13 → 激活 → W2<br/>输出未加权结果"]
+    end
+
+    C["MoE Method / Experts adapter"]
+    X["IxFormer 算子接口"]
+
+    C -->|"选择并创建"| R
+    R -->|"返回具体 backend 实例"| D
+    I -->|"继承并实现接口"| D
+    W -->|"约束输入与运行状态"| D
+    D --> S
+    D --> B
+    S --> X
+    B --> X
+
+    classDef common fill:#eef4ff,stroke:#6485b5,color:#172b4d
+    classDef impl fill:#eef8f2,stroke:#619879,color:#173d2a
+    classDef operator fill:#fff5e8,stroke:#bb9156,color:#51391b
+
+    class R,W,I,C common
+    class D,S,B impl
+    class X operator

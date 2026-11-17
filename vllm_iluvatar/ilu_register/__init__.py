@@ -91,6 +91,9 @@ def apply_oot_registrations() -> None:
     from .reasoning import register_reasoning_parsers
 
     register_reasoning_parsers()
+    from .model_loader import register_model_loaders
+
+    register_model_loaders()
     _validate_oot_overrides()
 
 

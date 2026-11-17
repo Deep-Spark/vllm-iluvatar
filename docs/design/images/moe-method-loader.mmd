@@ -1,0 +1,28 @@
+%%{init: {"theme":"base","fontFamily":"Arial, PingFang SC, sans-serif","fontSize":16,"flowchart":{"htmlLabels":true,"wrappingWidth":400,"nodeSpacing":30,"rankSpacing":35,"padding":12}}}%%
+flowchart TB
+    V["vLLM 模型创建 / 加载 / 后处理"]
+    subgraph METHOD["backends/fp4/mxfp4_moe.py：框架接口"]
+        S["选择 compute 与完整 WeightSpec"]
+        M["create_weights<br/>检查层配置，构造 Layer Loader"]
+        B["process_weights_after_loading<br/>取得 MoEWeights，校验并绑定 compute"]
+    end
+    subgraph LOADER["common/mxfp4_loader.py：每层 Loader"]
+        A["分配最终 weight / scale 参数<br/>绑定带 mxfp4_loader 标记的回调"]
+        L["校验 projection / EP 映射<br/>TP 切片 → 固定槽 → 原生转换<br/>同步后记录已提交分片"]
+        F["finalize<br/>完整性 / scale 有限值检查<br/>返回引用最终参数的 MoEWeights"]
+    end
+    subgraph SESSION["model_loader：公共会话与来源读取"]
+        P["发现全部 Loader<br/>原 model.load_weights 只执行一次<br/>延迟来源路由与预期配对检查"]
+        R["每 device 一个共享上传槽<br/>按 weight → scale 读取<br/>正常及异常统一清理"]
+    end
+    X["apply / select_gemm_impl<br/>本地计算 / 通信适配"]
+    V --> S --> M --> A
+    A --> P --> R --> L
+    L --> F --> B --> X
+    R -. 生命周期 .-> L
+    classDef framework fill:#eef4ff,stroke:#6485b5,color:#172b4d
+    classDef method fill:#eef8f2,stroke:#619879,color:#173d2a
+    classDef loader fill:#fff5e8,stroke:#bb9156,color:#51391b
+    class V,X,P,R framework
+    class S,M,B method
+    class A,L,F loader

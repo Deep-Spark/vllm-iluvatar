@@ -1,0 +1,40 @@
+flowchart TB
+    SELECT["bind_compute_experts<br/>根据 Prepare/Finalize 的 activation_format<br/>绑定对应适配器"]
+
+    P["vLLM Prepare / Dispatch<br/>准备输入、路由信息及通信"]
+
+    subgraph ADAPTER["ilu_compute_experts.py：协议适配"]
+        S["IluStandardComputeExperts<br/>传递 token 输入、TopK 与 expert_map"]
+        B["IluBatchedComputeExperts<br/>传递按专家分组的输入、scale<br/>及每个专家的有效 token 数"]
+    end
+
+    subgraph COMPUTE["计算 backend：本地专家计算"]
+        RS["run_standard<br/>计算并完成本地 TopK 加权归约<br/>输出 token 结果"]
+        RB["run_batched<br/>按专家计算<br/>输出未加权 expert 结果"]
+    end
+
+    subgraph FINAL["vLLM Finalize / Combine"]
+        FS["Standard<br/>TopKWeightAndReduceNoOP<br/>保留所需通信，不重复 TopK 加权"]
+        FB["Batched<br/>TopKWeightAndReduceDelegate<br/>由 Finalize/Combine 完成 TopK 加权归约"]
+    end
+
+    O["返回 token 输出"]
+
+    SELECT -->|"Standard"| S
+    SELECT -->|"BatchedExperts"| B
+    P -->|"token 布局"| S
+    P -->|"expert 分组布局"| B
+    S --> RS
+    B --> RB
+    RS --> FS
+    RB --> FB
+    FS --> O
+    FB --> O
+
+    classDef framework fill:#eef4ff,stroke:#6485b5,color:#172b4d
+    classDef adapter fill:#eef8f2,stroke:#619879,color:#173d2a
+    classDef compute fill:#fff5e8,stroke:#bb9156,color:#51391b
+
+    class P,FS,FB,O framework
+    class SELECT,S,B adapter
+    class RS,RB compute

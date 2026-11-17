@@ -49,28 +49,38 @@ def test_conflicting_storage_fields_fail_before_loading():
         _config(store_dtype="fp8", expert_dtype="mxfp4")
 
 
-def test_mxfp4_experts_use_ilu_method_and_keep_runtime_overlay(monkeypatch):
+@pytest.mark.parametrize("with_runtime", [False, True])
+def test_mxfp4_experts_use_ilu_method_and_keep_runtime_overlay(
+    monkeypatch, with_runtime
+):
     config = _config(expert_dtype="mxfp4")
     layer = RoutedExperts.__new__(RoutedExperts)
     torch.nn.Module.__init__(layer)
     layer.moe_config = SimpleNamespace()
-    original = object()
-    override = object()
+    override = object() if with_runtime else None
+    selected = object()
     seen = []
 
-    def make_method(moe_config):
-        assert moe_config is layer.moe_config
-        return original
+    class Method:
+        def __init__(self, moe_config):
+            assert moe_config is layer.moe_config
+
+    def select(actual_layer, original, runtime):
+        assert actual_layer is layer
+        assert isinstance(original, Method)
+        assert runtime is override
+        return selected
 
     def resolve(**kwargs):
         seen.append(kwargs)
         return override
 
-    monkeypatch.setattr(ilu_mxfp4, "IluMxfp4MoEMethod", make_method)
+    monkeypatch.setattr(ilu_mxfp4, "IluMxfp4MoEMethod", Method)
+    monkeypatch.setattr(ilu_mxfp4, "select_mxfp4_method", select)
     monkeypatch.setattr(fp8, "resolve_ilu_runtime_method", resolve)
     prefix = "language_model.model.layers.1.mlp.experts"
-    assert config.get_quant_method(layer, prefix) is override
-    assert seen[0]["original_method"] is original
+    assert config.get_quant_method(layer, prefix) is selected
+    assert isinstance(seen[0]["original_method"], Method)
     assert seen[0]["original_disposition"] == "quantized"
     assert seen[0]["prefix"] == prefix
     assert seen[0]["layer"] is layer

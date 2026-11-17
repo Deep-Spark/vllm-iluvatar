@@ -1,0 +1,52 @@
+%%{init: {"theme":"base","fontFamily":"Arial, PingFang SC, sans-serif","fontSize":16,"flowchart":{"htmlLabels":true,"wrappingWidth":400,"nodeSpacing":30,"rankSpacing":35,"padding":12}}}%%
+flowchart TD
+    A["模型创建最终参数及 weight_loader 回调"] --> B{"发现 Mxfp4WeightLoader 回调？"}
+    B -- 否 --> C["委托社区默认加载流程"]
+    B -- 是 --> D["检查顺序加载策略 / 单 checkpoint 等准入<br/>创建公共会话，绑定本 rank 全部相关 Loader"]
+    D -. 准入或 fresh-state 检查失败 .-> REJECT["直接终止；尚未读取文件或分配上传槽"]
+    subgraph PLAN["阶段一：复用原模型映射，建立配对计划"]
+        D --> G["委托社区 load_weights<br/>调用一次原 model.load_weights（主模型 / VL / DSpark）"]
+        G --> E["原映射开始消费 iterator<br/>社区文件选择 / index 过滤<br/>确认 safetensors，扫描全部选中文件 header"]
+        E --> PF["若策略为 prefetch，调用社区文件预读<br/>这一步不做 MXFP4 tensor 上传与转换"]
+        PF --> F["逐项交付延迟 tensor<br/>记录文件、key、shape、dtype 及允许的视图操作"]
+        F --> H{"原模型如何消费此项？"}
+        H -- 忽略或非本 rank --> N["继续原加载循环"]
+        H -- 普通参数 --> I["需要真实数据时读取<br/>按原 loader 写入参数"]
+        I --> N
+        H -- MXFP4 回调 --> J["校验本地 expert / projection / shape / dtype<br/>来源必须可延迟、同会话，目标不能重复"]
+        J --> K["登记 (Loader, local expert, w1/w2/w3)<br/>的 weight / scale 来源和视图；不上传、不转换"]
+        K --> N
+        N --> L{"原加载流程结束？"}
+        L -- 否 --> F
+        L -- 是 --> M["session.finish 遍历全部 Loader 的预期集合<br/>检查缺半对、整对缺失及整层缺失"]
+    end
+    M -- 完整 --> O["每个 device 分配一个共享上传槽<br/>固定 pinned CPU 缓冲 + GPU 缓冲；容量取该设备最大投影"]
+    subgraph CONVERT["阶段二：按登记顺序逐对读取，跨层复用缓冲"]
+        O --> P["读取本对 weight → 重放视图 → Loader 做 TP 切片<br/>copy 到固定 CPU 槽的 weight 区"]
+        P --> Q["读取本对 scale → 重放视图 → Loader 做 TP 切片<br/>copy 到同一 CPU 槽的 scale 区"]
+        Q --> R["copy_ non_blocking 上传到固定 GPU 槽"]
+        R --> S["调用现有 IxFormer 原生 converter<br/>直接写入最终 weight / scale 参数切片"]
+        S --> T["同步该 device 的 current CUDA stream<br/>确认 CPU / GPU 槽可复用，再登记本对已提交"]
+        T --> U{"还有下一对？"}
+        U -- 有 --> P
+    end
+    U -- 无 --> DONE["session.complete = True"]
+    DONE --> V["finally: 关闭全部文件句柄<br/>逐槽同步 current stream 并清除 CPU/GPU 引用<br/>解除所有 Loader 的 session / buffer / pending 引用"]
+    PLAN -. 文件选择 / header / 映射 / 回调异常 .-> ERR["保留加载异常；本次会话未完成"]
+    M -- 不完整 --> ERR
+    CONVERT -. 分配 / 读取 / copy / 转换 / 同步异常 .-> ERR
+    ERR --> V
+    V --> CHECK{"会话完整且清理无异常？"}
+    CHECK -- 否 --> FAIL["终止本次模型加载<br/>会话失败时标记所有绑定 Loader 失败<br/>不回滚已写参数，不重用失败模型"]
+    CHECK -- 是 --> W["框架进入量化后处理<br/>检查已提交分片、scale 有限值和权重契约<br/>按最终 runner 配置绑定 compute backend"]
+    W -. finalize 或 backend 校验异常 .-> STOP["终止模型初始化；会话已经关闭"]
+    W --> X["继续框架初始化及通信适配绑定<br/>全部成功后模型加载完成"]
+
+    classDef plan fill:#eef4ff,stroke:#6485b5,color:#172b4d
+    classDef convert fill:#eef8f2,stroke:#619879,color:#173d2a
+    classDef cleanup fill:#fff5e8,stroke:#bb9156,color:#51391b
+    classDef failure fill:#fff0ef,stroke:#b56b68,color:#642d2b
+    class G,E,PF,F,H,I,J,K,N,L,M plan
+    class O,P,Q,R,S,T,U,DONE convert
+    class V,CHECK,W,X cleanup
+    class ERR,FAIL,STOP,REJECT failure

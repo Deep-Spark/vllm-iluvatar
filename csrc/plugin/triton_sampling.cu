@@ -10,15 +10,25 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <string_view>
 
 #include "ops.h"
-#include "sampling_precision.h"
 
 namespace vllm_iluvatar {
 namespace {
 
 constexpr int kThreads = 256;
 constexpr int kMaxWarps = 32;
+
+inline void check_sampling_fp64(bool needs_fp64) {
+  // MR has no FP64 arithmetic support. Its device double conversions and
+  // log overload can return finite but incorrect values, so do not silently
+  // execute or downcast a requested FP64 sampling path.
+  TORCH_CHECK(!needs_fp64 ||
+                  std::string_view(VLLM_ILUVATAR_CUDA_ARCH) != "ivcore11",
+              "FP64 sampling is not supported on CoreX MR/ivcore11; "
+              "use FP32 logits and use_fp64=False");
+}
 
 template <typename T>
 __device__ __forceinline__ float load_float(const T* ptr, int64_t index) {

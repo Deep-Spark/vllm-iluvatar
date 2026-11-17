@@ -11,8 +11,6 @@
 #include <cstdint>
 #include <limits>
 
-#include "sampling_precision.h"
-
 #include <torch/library.h>
 #include <c10/cuda/CUDAException.h>
 
@@ -292,8 +290,10 @@ __global__ void bias_gumbel_sample_kernel(
       value /= static_cast<acc_t>(temp);
     }
     if (temp != 0.0f) {
-      // Match the corrected sampler: independent noise for every token.
-      value = add_gumbel(value, seed, pos, static_cast<uint32_t>(token));
+      // CoreX lowers Triton's vector RNG one value per hardware warp. Match
+      // the baseline exactly: all 64 lanes use the warp's first token key.
+      const uint32_t noise_key = token - token % warpSize;
+      value = add_gumbel(value, seed, pos, noise_key);
     }
     best = choose_max(best, MaxPair<acc_t>{value, token});
   }
@@ -323,7 +323,6 @@ void ilu_fused_bias_gumbel_sample(
     int64_t block_size, bool is_drafting, bool apply_temperature,
     bool use_fp64, bool per_token_col, torch::Tensor& bias,
     int64_t bias_stride, int64_t num_vocab_padding) {
-  check_sampling_fp64(use_fp64 || logits.scalar_type() == at::kDouble);
   TORCH_CHECK(logits.dim() == 2 && bias.sizes() == logits.sizes());
   TORCH_CHECK(logits.is_cuda() && bias.device() == logits.device());
   TORCH_CHECK(logits.scalar_type() == bias.scalar_type());

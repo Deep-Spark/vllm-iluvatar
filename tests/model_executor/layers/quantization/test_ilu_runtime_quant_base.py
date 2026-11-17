@@ -14,6 +14,13 @@ from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
 import vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear.native_to_fp8 as ilu_fp8
+from vllm_iluvatar.model_executor.layers.quantization import capabilities
+from vllm_iluvatar.model_executor.layers.quantization.capabilities import (
+    require_ivcore30,
+)
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime import (
+    config as ilu_runtime_config,
+)
 from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.base_config import (
     IluRuntimeQuantBaseConfig,
 )
@@ -144,6 +151,40 @@ def test_missing_or_disabled_payload_fails_fast():
         pytest.raises(ValueError, match="ilu_quant.enabled is false"),
     ):
         disabled.get_quant_method(_linear(TARGET_PREFIX), TARGET_PREFIX)
+
+
+@pytest.mark.parametrize("detected", ["ivcore11", None])
+def test_enabled_payload_requires_ivcore30(monkeypatch, detected):
+    monkeypatch.setattr(ilu_runtime_config, "require_ivcore30", require_ivcore30)
+    monkeypatch.setattr(capabilities, "cuda_arch", lambda: detected)
+    config = IluRuntimeQuantBaseConfig()
+    with (
+        set_current_vllm_config(_vllm_config(_payload())),
+        pytest.raises(
+            RuntimeError, match=r"additional_config\.ilu_quant requires ivcore30"
+        ),
+    ):
+        config.get_quant_method(_linear(TARGET_PREFIX), TARGET_PREFIX)
+
+
+def test_enabled_payload_passes_the_gate_on_ivcore30(monkeypatch):
+    monkeypatch.setattr(ilu_runtime_config, "require_ivcore30", require_ivcore30)
+    monkeypatch.setattr(capabilities, "cuda_arch", lambda: "ivcore30")
+    config = IluRuntimeQuantBaseConfig()
+    with set_current_vllm_config(_vllm_config(_payload())):
+        method = config.get_quant_method(_linear(TARGET_PREFIX), TARGET_PREFIX)
+    assert isinstance(method, IluFp8PerChannelOnlineLinearMethod)
+
+
+def test_disabled_payload_skips_the_arch_gate(monkeypatch):
+    monkeypatch.setattr(ilu_runtime_config, "require_ivcore30", require_ivcore30)
+    monkeypatch.setattr(capabilities, "cuda_arch", lambda: "ivcore11")
+    config = IluRuntimeQuantBaseConfig()
+    with (
+        set_current_vllm_config(_vllm_config(_payload(enabled=False))),
+        pytest.raises(ValueError, match="ilu_quant.enabled is false"),
+    ):
+        config.get_quant_method(_linear(TARGET_PREFIX), TARGET_PREFIX)
 
 
 def test_payload_declaring_another_quant_method_is_rejected():

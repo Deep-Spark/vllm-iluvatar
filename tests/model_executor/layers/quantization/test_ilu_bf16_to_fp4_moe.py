@@ -13,18 +13,18 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
 
-from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8_to_fp4 import (
+from vllm_iluvatar.model_executor.layers.quantization.conversions.ivcore30.fp8_to_fp4 import (
     Fp8SourceLayout,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_fp16_to_fp4_moe import (
-    IluFp16ToFp4OnlineMoEMethod,
-    convert_native_to_ix30_fp4,
-)
-from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime_quant_base import (
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.base_config import (
     IluRuntimeQuantBaseConfig,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime_quant_config import (
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.config import (
     parse_ilu_runtime_quant_config,
+)
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.moe.fp16_to_fp4 import (
+    IluFp16ToFp4OnlineMoEMethod,
+    convert_native_to_ix30_fp4,
 )
 
 BLOCK = (128, 128)
@@ -194,7 +194,7 @@ def _has_ixmm_ivcore30() -> bool:
         return False
     try:
         from vllm_iluvatar.ilu_util.arch import is_ivcore30
-        from vllm_iluvatar.model_executor.layers.quantization.fp8 import (
+        from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.fp8_moe import (
             _ixmm_backend_available,
         )
 
@@ -211,7 +211,7 @@ def _has_ixmm_ivcore30() -> bool:
 def test_load_time_bf16_matches_explicit_native_to_fp4(backend, monkeypatch):
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
-    from vllm_iluvatar.model_executor.layers.quantization.fp8 import (
+    from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.fp8_moe import (
         _ixmm_backend_available,
     )
 

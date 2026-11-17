@@ -8,16 +8,18 @@ import pytest
 import torch
 from torch import nn
 
-from vllm_iluvatar.model_executor.layers.quantization.ilu_mxfp4 import IluMxfp4MoEMethod
-from vllm_iluvatar.model_executor.layers.quantization.ilu_mxfp4_to_w4a8_moe import (
-    IluMxfp4ToW4A8TNMoEMethod,
+from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.mxfp4_moe import (
+    IluMxfp4MoEMethod,
+)
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.moe.mxfp4_to_w4a8_tn import (
+    IluMxfp4ToW4A8TNOnlineMoEMethod,
 )
 from vllm_iluvatar.models.deepseek_v4 import fp8_model as mod
 
 
 def make_moe(monkeypatch, kind, hash_layer=True):
     method = object.__new__(
-        IluMxfp4MoEMethod if kind == "native" else IluMxfp4ToW4A8TNMoEMethod
+        IluMxfp4MoEMethod if kind == "native" else IluMxfp4ToW4A8TNOnlineMoEMethod
     )
     if kind == "wrapped":
         method = SimpleNamespace(old_quant_method=method)

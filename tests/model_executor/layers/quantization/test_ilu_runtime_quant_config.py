@@ -13,18 +13,16 @@ from vllm.model_executor import parameter as parameter_module
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.parameter import ModelWeightParameter
 
+import vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear.native_to_fp8 as ilu_fp8
 from vllm_iluvatar.model_executor.layers.quantization import (
     IluvatarQuantRegistry,
 )
-from vllm_iluvatar.model_executor.layers.quantization import (
-    fp8 as ilu_fp8,
-)
-from vllm_iluvatar.model_executor.layers.quantization.fp8 import (
-    IluFp8Config,
-    IluFp8PerChannelOnlineLinearMethod,
-)
-from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime_quant_config import (
+from vllm_iluvatar.model_executor.layers.quantization.configs.fp8 import IluFp8Config
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.config import (
     parse_ilu_runtime_quant_config,
+)
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear.native_to_fp8 import (
+    IluFp8PerChannelOnlineLinearMethod,
 )
 
 PREFIX = "model.layers.0.mlp.shared_expert.gate_proj"
@@ -253,7 +251,7 @@ def test_priority_tie_and_target_coverage_are_rejected():
 
 
 def test_pp_stage_may_miss_targets_owned_by_another_stage(monkeypatch):
-    import vllm_iluvatar.model_executor.layers.quantization.ilu_runtime_quant_config as mod
+    import vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.config as mod
 
     payload = _payload(targets=[PREFIX, "re:.*\\.mlp\\.(?:gate_up_proj|down_proj)$"])
     config = _parse(payload)

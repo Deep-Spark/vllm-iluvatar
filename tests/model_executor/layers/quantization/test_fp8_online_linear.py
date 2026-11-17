@@ -11,7 +11,13 @@ from vllm.model_executor import parameter as parameter_module
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.parameter import ModelWeightParameter
 
-from vllm_iluvatar.model_executor.layers.quantization import fp8 as ilu_fp8
+from vllm_iluvatar.model_executor.layers.quantization.configs import (
+    fp8 as ilu_fp8_config,
+)
+from vllm_iluvatar.model_executor.layers.quantization.configs.fp8 import IluFp8Config
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear import (
+    native_to_fp8 as ilu_fp8,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -231,7 +237,7 @@ def test_missing_staging_fails_instead_of_silent_fp8_cast():
 
 
 def test_config_dispatches_online_and_preserves_ignored_layers(monkeypatch):
-    config = ilu_fp8.IluFp8Config.from_config(
+    config = IluFp8Config.from_config(
         {
             "quant_method": "fp8",
             "activation_scheme": "dynamic",
@@ -242,8 +248,9 @@ def test_config_dispatches_online_and_preserves_ignored_layers(monkeypatch):
         }
     )
     online = object()
+    # The config resolves the method in its own namespace, not the defining one.
     monkeypatch.setattr(
-        ilu_fp8, "IluFp8PerChannelOnlineLinearMethod", lambda config: online
+        ilu_fp8_config, "IluFp8PerChannelOnlineLinearMethod", lambda config: online
     )
     layer = object.__new__(LinearBase)
 
@@ -256,7 +263,7 @@ def test_config_dispatches_online_and_preserves_ignored_layers(monkeypatch):
 
 def test_is_layer_skipped_matches_vl_remapped_ignore_prefix():
     """Step-3.7 VL remaps ignore paths; MTP drafts still use model.*."""
-    config = ilu_fp8.IluFp8Config(
+    config = IluFp8Config(
         is_checkpoint_fp8_serialized=True,
         activation_scheme="dynamic",
         ignored_layers=[
@@ -274,7 +281,7 @@ def test_is_layer_skipped_matches_vl_remapped_ignore_prefix():
 
 
 def test_is_layer_skipped_matches_draft_style_ignore_for_vl_prefix():
-    config = ilu_fp8.IluFp8Config(
+    config = IluFp8Config(
         is_checkpoint_fp8_serialized=True,
         activation_scheme="dynamic",
         ignored_layers=["model.layers.45.mtp_block.self_attn.g_proj"],

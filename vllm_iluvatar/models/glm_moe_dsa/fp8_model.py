@@ -148,11 +148,11 @@ def _consumer_quant_method(module: object) -> object:
 
 def _consumes_int8_tuple(module: object) -> bool:
     """True when ``module`` can unpack the fused ``(q, scales, ...)`` triple."""
+    from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.w4a8.nn_moe import (
+        IluW4A8NNMoEMethod,
+    )
     from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes import (  # noqa: E501
         IluCompressedTensorsW8A8Int8,
-    )
-    from vllm_iluvatar.model_executor.layers.quantization.ilu_w4a8_nn import (
-        IluW4A8NNMoEMethod,
     )
 
     if isinstance(getattr(module, "scheme", None), IluCompressedTensorsW8A8Int8):

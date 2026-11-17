@@ -28,7 +28,7 @@ def _install_fake_ixformer(monkeypatch) -> None:
 def _load_ilu_auto_gptq(monkeypatch):
     _install_fake_ixformer(monkeypatch)
     return importlib.import_module(
-        "vllm_iluvatar.model_executor.layers.quantization.ilu_auto_gptq"
+        "vllm_iluvatar.model_executor.layers.quantization.configs.gptq"
     )
 
 
@@ -80,16 +80,11 @@ def test_ilu_auto_gptq_override_selects_auto_gptq(monkeypatch):
     assert selected == "auto_gptq"
 
 
-def test_ilu_auto_gptq_imports_plugin_linear_selector(monkeypatch):
-    mod = _load_ilu_auto_gptq(monkeypatch)
-    selector = importlib.import_module("vllm_iluvatar.model_executor.kernels.linear")
-
-    assert mod.choose_mp_linear_kernel is selector.choose_mp_linear_kernel
-    assert mod.MPLinearLayerConfig is selector.MPLinearLayerConfig
-
-
 def test_ilu_auto_gptq_get_quant_method_uses_ilu_linear_method(monkeypatch):
     mod = _load_ilu_auto_gptq(monkeypatch)
+    linear = importlib.import_module(
+        "vllm_iluvatar.model_executor.layers.quantization.backends.gptq.linear"
+    )
 
     class DummyRoutedExperts:
         pass
@@ -98,7 +93,7 @@ def test_ilu_auto_gptq_get_quant_method_uses_ilu_linear_method(monkeypatch):
 
     def fake_get_linear_quant_method(config, layer, prefix, method_cls):
         assert isinstance(config, mod.IluAutoGPTQConfig)
-        assert method_cls is mod.IluAutoGPTQLinearMethod
+        assert method_cls is linear.IluAutoGPTQLinearMethod
         return selected
 
     monkeypatch.setattr(mod, "RoutedExperts", DummyRoutedExperts)

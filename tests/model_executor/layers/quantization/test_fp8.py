@@ -49,7 +49,23 @@ def _install_fake_ixformer(monkeypatch) -> None:
 def _load_ilu_fp8(monkeypatch):
     _install_fake_ixformer(monkeypatch)
     return importlib.import_module(
-        "vllm_iluvatar.model_executor.layers.quantization.fp8"
+        "vllm_iluvatar.model_executor.layers.quantization.configs.fp8"
+    )
+
+
+def _load_linear_backend(monkeypatch):
+    """The module the linear method resolves its community symbols in."""
+    _install_fake_ixformer(monkeypatch)
+    return importlib.import_module(
+        "vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp8.linear"
+    )
+
+
+def _load_moe_backend(monkeypatch):
+    """The module the MoE method resolves its community symbols in."""
+    _install_fake_ixformer(monkeypatch)
+    return importlib.import_module(
+        "vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.fp8_moe"
     )
 
 
@@ -70,6 +86,7 @@ class _DummyRoutedExperts:
 
 def test_ilu_fp8_shadows_community_fp8_name(monkeypatch):
     mod = _load_ilu_fp8(monkeypatch)
+    moe_mod = _load_moe_backend(monkeypatch)
 
     from vllm.model_executor.layers.quantization import (
         _CUSTOMIZED_METHOD_TO_QUANT_CONFIG,
@@ -77,7 +94,7 @@ def test_ilu_fp8_shadows_community_fp8_name(monkeypatch):
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
     assert issubclass(mod.IluFp8Config, Fp8Config)
-    assert issubclass(mod.IluFp8MoEMethod, mod.Fp8MoEMethod)
+    assert issubclass(mod.IluFp8MoEMethod, moe_mod.Fp8MoEMethod)
     assert _CUSTOMIZED_METHOD_TO_QUANT_CONFIG["fp8"] is mod.IluFp8Config
 
 
@@ -162,6 +179,7 @@ def test_get_quant_method_delegates_skipped_layer(monkeypatch):
 def test_method_init_skips_backend_selection(monkeypatch):
     """``IluFp8MoEMethod.__init__`` must not call ``select_fp8_moe_backend``."""
     mod = _load_ilu_fp8(monkeypatch)
+    moe_mod = _load_moe_backend(monkeypatch)
 
     import vllm.model_executor.layers.quantization.fp8 as community_fp8
 
@@ -172,7 +190,7 @@ def test_method_init_skips_backend_selection(monkeypatch):
     monkeypatch.setattr(community_fp8, "select_fp8_moe_backend", _boom)
     # Decouple from the heavy base initialiser (env / distributed state).
     monkeypatch.setattr(
-        mod.FusedMoEMethodBase,
+        moe_mod.FusedMoEMethodBase,
         "__init__",
         lambda self, moe_config: setattr(self, "moe", moe_config),
     )
@@ -206,7 +224,7 @@ def _linear_method(mod, *, block: bool) -> object:
 
 def test_block_linear_create_weights_keeps_scale_inv(monkeypatch):
     """Official block-FP8 must not overlay a channel ``weight_scale``."""
-    mod = _load_ilu_fp8(monkeypatch)
+    mod = _load_linear_backend(monkeypatch)
     method = _linear_method(mod, block=True)
 
     def _super_create(self, layer, *args, **kwargs):
@@ -230,7 +248,7 @@ def test_block_linear_create_weights_keeps_scale_inv(monkeypatch):
 
 
 def test_block_linear_process_and_apply_delegate_to_parent(monkeypatch):
-    mod = _load_ilu_fp8(monkeypatch)
+    mod = _load_linear_backend(monkeypatch)
     method = _linear_method(mod, block=True)
     called = {}
     monkeypatch.setattr(
@@ -255,7 +273,7 @@ def test_block_linear_process_and_apply_delegate_to_parent(monkeypatch):
 
 
 def test_per_tensor_linear_create_weights_still_overlays_channel_scale(monkeypatch):
-    mod = _load_ilu_fp8(monkeypatch)
+    mod = _load_linear_backend(monkeypatch)
     method = _linear_method(mod, block=False)
     dummy = torch.nn.Parameter(torch.ones(64, 1), requires_grad=False)
     monkeypatch.setattr(mod, "create_fp8_scale_parameter", lambda *a, **k: dummy)
@@ -281,7 +299,7 @@ def test_per_tensor_linear_create_weights_still_overlays_channel_scale(monkeypat
 
 
 def test_preprocess_pads_k_to_ixmm_group_boundary(monkeypatch):
-    mod = _load_ilu_fp8(monkeypatch)
+    mod = _load_moe_backend(monkeypatch)
 
     captured = {}
 
@@ -295,7 +313,7 @@ def test_preprocess_pads_k_to_ixmm_group_boundary(monkeypatch):
         preprocess_group_scale_for_running_acc=lambda x: x,
     )
     # ixformer 3817cf75: fp4 gemm 从 functions.fp4.gemm 移到
-    # functions.ops.gemm.fp4.gemm（fp8.py 按新路径懒加载）。
+    # functions.ops.gemm.fp4.gemm（fp8_moe.py 按新路径懒加载）。
     fp4_module = types.ModuleType("ixformer.inference.functions.ops.gemm.fp4")
     gemm_module = types.ModuleType("ixformer.inference.functions.ops.gemm.fp4.gemm")
     gemm_module.gemm = fake_gemm
@@ -320,7 +338,7 @@ def test_preprocess_pads_k_to_ixmm_group_boundary(monkeypatch):
 
 @pytest.mark.parametrize("limit", [3.0, 10.0])
 def test_layer_limit_reaches_quantized_moe(monkeypatch, limit):
-    mod = _load_ilu_fp8(monkeypatch)
+    mod = _load_moe_backend(monkeypatch)
     method = object.__new__(mod.IluFp8MoEMethod)
     layer = types.SimpleNamespace(
         activation="swiglustep",

@@ -9,7 +9,7 @@ import torch
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
-from vllm_iluvatar.model_executor.layers.quantization.fp8 import IluFp8Config
+from vllm_iluvatar.model_executor.layers.quantization.configs.fp8 import IluFp8Config
 from vllm_iluvatar.models.hy_v4.attention import (
     HYV4MLAAttentionLayer,
     indexer_fused_quant_config,

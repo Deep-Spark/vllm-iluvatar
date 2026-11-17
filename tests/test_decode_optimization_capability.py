@@ -175,10 +175,13 @@ class PreparationSelectionTest(unittest.TestCase):
 
     def test_moe_padded_k_predicates(self):
         for selector, file in (
-            ("fuse_quant", "ilu_w4a8_nn.py"),
-            ("standard", "ilu_w4a8_nn_experts.py"),
+            ("fuse_quant", "nn_moe.py"),
+            ("standard", "nn_experts.py"),
         ):
-            path = "vllm_iluvatar/model_executor/layers/quantization/" + file
+            path = (
+                "vllm_iluvatar/model_executor/layers/quantization/"
+                "backends/ivcore30/w4a8/" + file
+            )
             for hidden, expected in ((192, False), (256, True), (8193, False)):
                 x = Tensor()
                 x.dtype, x.shape = "bf16", (2, hidden)

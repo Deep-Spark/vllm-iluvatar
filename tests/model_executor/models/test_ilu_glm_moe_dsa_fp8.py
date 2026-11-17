@@ -101,7 +101,7 @@ def test_moe_runner_keeps_its_method_on_routed_experts():
 
 
 def test_consumer_quant_method_resolves_through_moe_runner():
-    from vllm_iluvatar.model_executor.layers.quantization.ilu_w4a8_nn import (
+    from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.w4a8.nn_moe import (
         IluW4A8NNMoEMethod,
     )
 

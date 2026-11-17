@@ -17,15 +17,17 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.linear import LinearBase
 
 from vllm_iluvatar.ilu_util import arch
-from vllm_iluvatar.model_executor.layers.quantization.fp8 import IluFp8Config
-from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8_to_w8a8_linear import (
-    IluFp8ToW8A8Int8LinearMethod,
-    IluNativeToW8A8Int8LinearMethod,
-    quantize_fp8_block_to_w8a8_int8,
-    quantize_native_to_w8a8_int8,
-)
-from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime_quant_config import (
+from vllm_iluvatar.model_executor.layers.quantization.configs.fp8 import IluFp8Config
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.config import (
     parse_ilu_runtime_quant_config,
+)
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear.fp8_to_w8a8 import (
+    IluFp8ToW8A8Int8OnlineLinearMethod,
+    quantize_fp8_block_to_w8a8_int8,
+)
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear.native_to_w8a8 import (
+    IluNativeToW8A8Int8OnlineLinearMethod,
+    quantize_native_to_w8a8_int8,
 )
 
 # The W8A8 scheme resolves ixformer kernels for the local arch at __init__.
@@ -266,7 +268,7 @@ def test_eh_proj_group_is_absent_without_mtp():
 )
 def test_block_fp8_linear_dispatch(prefix):
     method = select_method(prefix)
-    assert isinstance(method, IluFp8ToW8A8Int8LinearMethod)
+    assert isinstance(method, IluFp8ToW8A8Int8OnlineLinearMethod)
     assert method.block_shape == (128, 128)
     assert method.scheme.format == "TN"
     assert method.scheme.perf_mode == "PERF"
@@ -278,7 +280,7 @@ def test_block_fp8_linear_dispatch(prefix):
 def test_native_eh_proj_dispatch():
     prefix = "model.layers.78.eh_proj"
     method = select_method(prefix, "w4a8-nn-moe-mtp-inline.yaml")
-    assert isinstance(method, IluNativeToW8A8Int8LinearMethod)
+    assert isinstance(method, IluNativeToW8A8Int8OnlineLinearMethod)
 
 
 @_requires_device

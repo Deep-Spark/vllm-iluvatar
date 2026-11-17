@@ -17,8 +17,11 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[4]
-NN = "vllm_iluvatar/model_executor/layers/quantization/ilu_w4a8_nn.py"
-STD = "vllm_iluvatar/model_executor/layers/quantization/ilu_w4a8_nn_experts.py"
+NN = "vllm_iluvatar/model_executor/layers/quantization/backends/ivcore30/w4a8/nn_moe.py"
+STD = (
+    "vllm_iluvatar/model_executor/layers/quantization/"
+    "backends/ivcore30/w4a8/nn_experts.py"
+)
 ROUTER = (
     "vllm_iluvatar/model_executor/layers/fused_moe/router/ilu_grouped_topk_router.py"
 )
@@ -101,6 +104,10 @@ def modules(enabled=True, arch="ivcore30", ops=None):
         "vllm.envs",
         "vllm_iluvatar.ilu_util",
         "vllm_iluvatar.ilu_util.arch",
+        "vllm_iluvatar.model_executor",
+        "vllm_iluvatar.model_executor.layers",
+        "vllm_iluvatar.model_executor.layers.quantization",
+        "vllm_iluvatar.model_executor.layers.quantization.capabilities",
         "ixformer",
         "ixformer.inference",
         "ixformer.inference.functions",
@@ -111,7 +118,13 @@ def modules(enabled=True, arch="ivcore30", ops=None):
         module.__path__ = []
     opt = result["vllm.envs"]
     opt.VLLM_ILU_GLM_MOE_PREPARE_FUSION = enabled
-    result["vllm_iluvatar.ilu_util.arch"].is_ivcore30 = lambda: arch == "ivcore30"
+    is_ivcore30 = lambda: arch == "ivcore30"  # noqa: E731
+    result["vllm_iluvatar.ilu_util.arch"].is_ivcore30 = is_ivcore30
+    # Quantization code reads the predicate through `capabilities`, which binds
+    # its own name at import time, so stubbing `ilu_util.arch` alone is not seen.
+    result[
+        "vllm_iluvatar.model_executor.layers.quantization.capabilities"
+    ].is_ivcore30 = is_ivcore30
     result["vllm.logger"].init_logger = lambda _: SimpleNamespace(
         info_once=lambda *a: None
     )

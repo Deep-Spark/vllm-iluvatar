@@ -15,7 +15,7 @@ from vllm_iluvatar.model_executor.layers.quantization.configs import (
     fp8 as ilu_fp8_config,
 )
 from vllm_iluvatar.model_executor.layers.quantization.configs.fp8 import IluFp8Config
-from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear import (
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.linear import (
     native_to_fp8 as ilu_fp8,
 )
 

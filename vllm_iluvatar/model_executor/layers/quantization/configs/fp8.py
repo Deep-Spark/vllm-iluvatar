@@ -13,16 +13,16 @@ from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 
-from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.fp8_moe import (
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe import (
     IluFp8MoEMethod,
 )
-from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp8.linear import (
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp8.linear import (
     IluFp8LinearMethod,
 )
 from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.config import (
     resolve_ilu_runtime_method,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear.native_to_fp8 import (
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.linear.native_to_fp8 import (
     IluFp8PerChannelOnlineLinearMethod,
 )
 
@@ -162,7 +162,7 @@ class IluFp8Config(Fp8Config):
             and self.store_dtype == "mxfp4"
             and not self._is_layer_skipped(prefix)
         ):
-            from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.mxfp4_moe import (
+            from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp4_moe import (
                 IluMxfp4MoEMethod,
             )
 

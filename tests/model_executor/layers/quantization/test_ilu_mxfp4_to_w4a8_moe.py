@@ -9,13 +9,13 @@ import torch
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 
-from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.mxfp4_moe import (
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp4_moe import (
     IluMxfp4MoEMethod,
 )
 from vllm_iluvatar.model_executor.layers.quantization.configs.deepseek.v4_fp8 import (
     IluDeepseekV4FP8Config,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.moe.mxfp4_to_w4a8_tn import (
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.moe.mxfp4_to_w4a8_tn import (
     IluMxfp4ToW4A8TNOnlineMoEMethod,
     quantize_mxfp4_to_w4a8_tn,
 )

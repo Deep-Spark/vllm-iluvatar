@@ -21,11 +21,11 @@ from vllm_iluvatar.model_executor.layers.quantization.configs.fp8 import IluFp8C
 from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.config import (
     parse_ilu_runtime_quant_config,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear.fp8_to_w8a8 import (
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.linear.fp8_to_w8a8 import (
     IluFp8ToW8A8Int8OnlineLinearMethod,
     quantize_fp8_block_to_w8a8_int8,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear.native_to_w8a8 import (
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.linear.native_to_w8a8 import (
     IluNativeToW8A8Int8OnlineLinearMethod,
     quantize_native_to_w8a8_int8,
 )
@@ -286,7 +286,7 @@ def test_native_eh_proj_dispatch():
 
 @_requires_device
 def test_kv_b_dispatch_is_the_w8a16_method():
-    from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear.fp8_to_glm_kv_b_w8a16 import (
+    from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.linear.fp8_to_glm_kv_b_w8a16 import (
         IluFp8ToGlmKVBProjW8A16Method,
     )
 

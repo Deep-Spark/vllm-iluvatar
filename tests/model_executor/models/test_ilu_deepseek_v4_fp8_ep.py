@@ -8,10 +8,10 @@ import pytest
 import torch
 from torch import nn
 
-from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.mxfp4_moe import (
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp4_moe import (
     IluMxfp4MoEMethod,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.moe.mxfp4_to_w4a8_tn import (
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.moe.mxfp4_to_w4a8_tn import (
     IluMxfp4ToW4A8TNOnlineMoEMethod,
 )
 from vllm_iluvatar.models.deepseek_v4 import fp8_model as mod

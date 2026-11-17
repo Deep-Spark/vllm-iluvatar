@@ -44,18 +44,18 @@ from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
     _ixmm_backend_available,
     ilu_mxfp4_fused_experts,
 )
-from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.fp8_moe import (
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe import (
     _IXMM_EXPERT_CHUNK,
     _IXMM_GROUP_SIZE,
     preprocess_fp8_block_weight_for_ixmm,
 )
-from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.nvfp4_moe import (
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.nvfp4_moe import (
     _get_ilu_output_scale,
 )
 from vllm_iluvatar.model_executor.layers.quantization.common.weight_utils import (
     publish_derived_weight as _publish_derived_weight,
 )
-from vllm_iluvatar.model_executor.layers.quantization.conversions.ivcore30.fp8_to_fp4 import (
+from vllm_iluvatar.model_executor.layers.quantization.conversions.fp8_to_fp4 import (
     IX30_GROUP_SIZE,
     Fp8SourceLayout,
     convert_to_ix30_fp4,

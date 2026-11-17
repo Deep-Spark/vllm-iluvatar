@@ -154,7 +154,7 @@ def test_other_sampling_paths_unchanged(last, pcp, has_state):
 
 @pytest.mark.parametrize("stage", [0, 1])
 def test_nn_expert_range_is_stage_local(monkeypatch, stage):
-    from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.w4a8 import (
+    from vllm_iluvatar.model_executor.layers.quantization.backends.w4a8 import (
         nn_experts as nn,
     )
 

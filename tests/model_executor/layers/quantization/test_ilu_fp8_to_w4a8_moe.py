@@ -14,11 +14,11 @@ from vllm_iluvatar.ilu_util import arch
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_routed_experts import (
     IluRoutedExperts,
 )
-from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.fp8_moe import (
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe import (
     IluFp8MoEMethod,
 )
 from vllm_iluvatar.model_executor.layers.quantization.configs.fp8 import IluFp8Config
-from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.moe.fp8_to_w4a8_nn import (
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.moe.fp8_to_w4a8_nn import (
     IluFp8ToW4A8NNOnlineMoEMethod,
     quantize_fp8_to_w4a8_nn,
 )
@@ -448,7 +448,7 @@ def test_invalid_dtype_and_pending():
 def test_static_nn_load_matches_online(tp, rank, pack_version, monkeypatch):
     import ixformer.inference.functions as ops
 
-    from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.w4a8 import (
+    from vllm_iluvatar.model_executor.layers.quantization.backends.w4a8 import (
         nn_moe as w4a8,
     )
 

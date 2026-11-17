@@ -13,7 +13,7 @@ from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMetho
 from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
-import vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear.native_to_fp8 as ilu_fp8
+import vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.linear.native_to_fp8 as ilu_fp8
 from vllm_iluvatar.model_executor.layers.quantization import capabilities
 from vllm_iluvatar.model_executor.layers.quantization.capabilities import (
     require_ivcore30,
@@ -24,10 +24,10 @@ from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime import (
 from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.base_config import (
     IluRuntimeQuantBaseConfig,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear.native_to_fp8 import (
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.linear.native_to_fp8 import (
     IluFp8PerChannelOnlineLinearMethod,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.moe.fp16_to_fp4 import (
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.moe.fp16_to_fp4 import (
     IluFp16ToFp4OnlineMoEMethod,
 )
 

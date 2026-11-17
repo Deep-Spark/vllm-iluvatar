@@ -11,7 +11,7 @@ from compressed_tensors.quantization import QuantizationArgs
 from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 
-from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.mxfp4_moe import (
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp4_moe import (
     IluMxfp4MoEMethod,
 )
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.ilu_compressed_tensors_moe_w4a8_int8 import (

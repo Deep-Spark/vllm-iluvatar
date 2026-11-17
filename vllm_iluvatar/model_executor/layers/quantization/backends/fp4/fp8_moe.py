@@ -32,7 +32,7 @@ from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
     _ixmm_backend_available,
     ilu_mxfp4_fused_experts,
 )
-from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.nvfp4_moe import (
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.nvfp4_moe import (
     _get_ilu_output_scale,
 )
 from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.registry import (
@@ -293,7 +293,7 @@ class IluFp8MoEMethod(Fp8MoEMethod):
         prepare_finalize: FusedMoEPrepareAndFinalizeModular,
         layer: RoutedExperts,
     ) -> FusedMoEExpertsModular:
-        from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.batch_experts import (
+        from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.batch_experts import (
             IluMoEBatchedExpertsFp8,
         )
 

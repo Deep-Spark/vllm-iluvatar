@@ -822,7 +822,7 @@ class Step5Model(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.moe.fp8_to_fp4 import (
+        from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.moe.fp8_to_fp4 import (
             IluFp8ToFp4OnlineMoEMethod,
         )
 

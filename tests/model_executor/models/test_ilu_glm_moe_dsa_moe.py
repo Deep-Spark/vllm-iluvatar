@@ -224,7 +224,7 @@ def test_configured_ll_does_not_preinit_duplicate_handle(monkeypatch):
 
 @pytest.mark.parametrize("override", [None, "naive", "deepep_low_latency"])
 def test_fp8_ll_capacity_tracks_override(monkeypatch, override):
-    from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.fp8_moe import (
+    from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe import (
         _shrink_ll_max_tokens_to_decode,
     )
 

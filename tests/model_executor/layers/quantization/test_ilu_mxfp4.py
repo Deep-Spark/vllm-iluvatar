@@ -25,8 +25,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-import vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.mxfp4_moe as ilu_mxfp4
-from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.mxfp4_moe import (
+import vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp4_moe as ilu_mxfp4
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp4_moe import (
     IluMxfp4MoEMethod,
 )
 

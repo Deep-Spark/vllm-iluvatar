@@ -19,7 +19,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from tests.model_executor.layers.quantization.moe_test_utils import (
     make_nn_graph_method as _make_nn_graph_method,
 )
-from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.w4a8 import (
+from vllm_iluvatar.model_executor.layers.quantization.backends.w4a8 import (
     nn_moe as w4a8_moe,
 )
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
@@ -260,7 +260,7 @@ def test_nn_standard_experts_prefill_matches_monolithic(
     from vllm import envs as opt
     from vllm.model_executor.layers.fused_moe import MoEActivation
 
-    from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.w4a8 import (
+    from vllm_iluvatar.model_executor.layers.quantization.backends.w4a8 import (
         nn_experts as std_w4a8,
     )
 
@@ -494,7 +494,7 @@ def test_nn_class_rejects_missing_ixmm(monkeypatch):
 def test_modular_factory_selects_dedicated_nn_experts(monkeypatch, algorithm, batched):
     from vllm.model_executor.layers.fused_moe import FusedMoEActivationFormat
 
-    from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.w4a8 import (
+    from vllm_iluvatar.model_executor.layers.quantization.backends.w4a8 import (
         nn_experts as ilu_w4a8_nn_experts,
     )
     from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
@@ -644,7 +644,7 @@ def test_ll_nn_fixed_capacity_and_graph(
 ):
     from vllm.model_executor.layers.fused_moe import MoEActivation
 
-    from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.w4a8 import (
+    from vllm_iluvatar.model_executor.layers.quantization.backends.w4a8 import (
         nn_experts as batch,
     )
 

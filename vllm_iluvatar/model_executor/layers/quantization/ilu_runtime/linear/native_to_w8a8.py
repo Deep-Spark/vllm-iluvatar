@@ -8,7 +8,7 @@ from typing import Any
 import torch
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
-from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear._w8a8 import (
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.linear._w8a8 import (
     _IluRuntimeW8A8Int8LinearMethod,
     _quantize_per_channel_int8,
 )

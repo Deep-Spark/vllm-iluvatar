@@ -7,7 +7,7 @@ import pytest
 import torch
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 
-from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4 import (
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp4 import (
     mxfp4_moe as ilu_mxfp4,
 )
 from vllm_iluvatar.model_executor.layers.quantization.configs import fp8

@@ -20,7 +20,7 @@ from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
     _ixmm_backend_available,
     ilu_mxfp4_fused_experts,
 )
-from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.fp8_moe import (
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe import (
     _FP4_MAX_MAG,
     _IXMM_EXPERT_CHUNK,
     _IXMM_GROUP_SIZE,
@@ -30,7 +30,7 @@ from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.fp8_
     preprocess_fp8_block_weight_for_ixmm,
     swiglustep_limit,
 )
-from vllm_iluvatar.model_executor.layers.quantization.conversions.ivcore30.fp8_to_fp4 import (
+from vllm_iluvatar.model_executor.layers.quantization.conversions.fp8_to_fp4 import (
     IX30_GROUP_SIZE,
     Fp8SourceLayout,
     convert_to_ix30_fp4,

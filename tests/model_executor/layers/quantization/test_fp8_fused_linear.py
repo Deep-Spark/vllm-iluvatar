@@ -5,10 +5,10 @@ import pytest
 import torch
 from conftest import requires_corex30
 
-from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp8 import (
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp8 import (
     linear as fp8_linear,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear import (
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.linear import (
     native_to_fp8 as fp8_online,
 )
 

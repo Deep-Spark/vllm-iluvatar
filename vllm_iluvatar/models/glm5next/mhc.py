@@ -11,9 +11,12 @@ from vllm_iluvatar import envs
 
 
 def _decode_splitk(residual: torch.Tensor) -> bool:
+    # mHC small-batch split-K (decode tuning): match IxFormer's no-padding
+    # M=16..120 dispatch. M<16 keeps its existing fused/sqrsum path; larger
+    # prefill batches keep sqrsum reuse. M is local input rows, not global BS.
     return (
         envs.VLLM_ILU_GLM5NEXT_MHC_DECODE_SPLITK
-        and 5 <= residual.shape[0] < 128
+        and 16 <= residual.shape[0] <= 120
         and residual.shape[1:] == (4, 4096)
         and residual.dtype == torch.bfloat16
     )

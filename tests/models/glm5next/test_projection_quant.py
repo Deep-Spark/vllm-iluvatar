@@ -56,10 +56,15 @@ def test_independent_switches(monkeypatch, mla, kda):
             assert not list(layer.buffers())
 
 
-def test_default_off(monkeypatch):
-    for name in ("MLA", "KDA"):
-        key = f"VLLM_ILU_GLM5NEXT_{name}_PROJ_W8A8"
+def test_projection_defaults_on(monkeypatch):
+    for key in (
+        "VLLM_ILU_GLM5NEXT_MLA_PROJ_W8A8",
+        "VLLM_ILU_GLM5NEXT_KDA_PROJ_W8A8",
+        "VLLM_ILU_GLM5NEXT_DRAFT_HEAD_W8A8",
+    ):
         monkeypatch.delenv(key, raising=False)
+        assert ilu_envs._ILU_CANONICAL_ONLY_ENV_VARS[key]() is True
+        monkeypatch.setenv(key, "0")
         assert ilu_envs._ILU_CANONICAL_ONLY_ENV_VARS[key]() is False
 
 
@@ -203,10 +208,15 @@ def test_gpu_split_qkv_gates_exact(m):
 
 
 @torch.inference_mode()
-def test_draft_head_keeps_shared_target_unchanged():
+@pytest.mark.parametrize("enabled", [False, True])
+def test_draft_head_attachment_keeps_shared_target_unchanged(
+    monkeypatch, enabled, default_vllm_config
+):
     from types import SimpleNamespace
 
-    from vllm_iluvatar.models.glm5next.mtp import prepare_draft_head_w8a8
+    from vllm_iluvatar.models.glm5next.mtp import IluGlm5NextSharedHead
+
+    monkeypatch.setattr(ilu_envs, "VLLM_ILU_GLM5NEXT_DRAFT_HEAD_W8A8", enabled)
 
     target = nn.Module()
     target.weight = nn.Parameter(
@@ -215,16 +225,19 @@ def test_draft_head_keeps_shared_target_unchanged():
     target.quant_method = OriginalMethod()
     original = target.weight
     saved = original.clone()
-    shared = nn.Module()
-    shared.head = target
-    draft = SimpleNamespace(
-        model=SimpleNamespace(_mtp_layers=[SimpleNamespace(shared_head=shared)])
+    shared = IluGlm5NextSharedHead(
+        config=SimpleNamespace(hidden_size=64, rms_norm_eps=1e-6),
+        prefix="test",
+        defer_lm_head=True,
     )
-    prepare_draft_head_w8a8(draft)
-    assert shared.head is not target
+    assert shared.head is None
+    # Match vLLM's target-head sharing: delete the deferred slot, then attach.
+    del shared.head
+    shared.head = target
+    assert (shared.head is not target) == enabled
     assert target.weight is original and target.weight.dtype == torch.bfloat16
     torch.testing.assert_close(target.weight, saved, atol=0, rtol=0)
-    assert shared.head.weight.dtype == torch.int8
+    assert shared.head.weight.dtype == (torch.int8 if enabled else torch.bfloat16)
     packed = shared.head.weight
-    prepare_draft_head_w8a8(draft)
+    shared.head = shared.head
     assert shared.head.weight is packed

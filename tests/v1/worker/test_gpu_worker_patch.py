@@ -125,6 +125,10 @@ def _make_worker(model_runner):
     w.local_rank = 0
     w.rank = 0
     w.device = None
+    # This CPU-only fixture does not run platform/env registration or own a
+    # GPU. Keep hardware monitors inert while testing warmup and PP routing.
+    w._onchip_checker = SimpleNamespace(start=lambda *a, **kw: None, free=lambda: None)
+    w._hbm_ecc_monitor = SimpleNamespace(start=lambda *a, **kw: None, free=lambda: None)
     return w
 
 

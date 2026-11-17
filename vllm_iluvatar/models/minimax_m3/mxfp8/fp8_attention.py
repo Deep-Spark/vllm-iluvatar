@@ -605,9 +605,7 @@ class MiniMaxM3FP8Attention(nn.Module, AttentionLayerBase):
             )
             dtype = torch.uint8
         else:
-            workspace_units = 64 * max(
-                self.max_decode_tokens, min(T, 1023 // HK)
-            )
+            workspace_units = 64 * max(self.max_decode_tokens, min(T, 1023 // HK))
             numel = workspace_units * H * 130
             dtype = torch.float32
         self.attn_workspace = self.state.buffer(

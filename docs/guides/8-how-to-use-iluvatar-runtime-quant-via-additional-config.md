@@ -911,3 +911,22 @@ loader 按 128 的倍数拼接。GLM-5.2 的 `q_lora_rank=2048`、`intermediate_
 5. **核对审计计数**：worker 日志中的 `selected` / `transformed` / `fallback`
    应与 `validation` 一致（Qwen TP4 为 242 / 158 / 84）。
 6. **确认原目录未变**：启动前后 checkpoint 文件清单、大小和 SHA256 一致。
+
+## 原始 FP8 Linear 的执行选择
+
+原始 FP8 Linear 的执行偏好通过 `additional_config.ilu_compute` 设置，
+不修改 checkpoint 的 `quantization_config`。`linear.fp8_backend` 支持
+`auto`、`fp8` 和 `w8a8_int8`：ivcore11 默认 INT8 W8A8，ivcore30 默认 FP8。
+在 ivcore30 显式选择 INT8：
+
+```bash
+--additional-config '{"ilu_compute":{"schema_version":1,"linear":{"fp8_backend":"w8a8_int8"}}}'
+```
+
+INT8 分支保留源 FP8 参数及 TP/fused loader，加载后转换为 per-channel INT8，
+再调用已有 W8A8 scheme 的布局、padding 与 GEMM/GEMV 选择。转换器支持
+128×128/32×32 block 和 FP32/E8M0 scales。Row-parallel channel scale 按本 rank
+的 K 分片计算，不保证与离线 full-K 量化字节一致。原生 BF16 不受此选项影响；
+需要转换时仍须显式 `ilu_quant`。已有 FP8 Linear online quant factory 继续有效，
+显式 FP8 执行与 INT8 target 冲突时拒绝。旧 compressed-tensors checkpoint
+继续使用其已有入口。所有权重转换发生在加载阶段，不进入 forward/Graph replay。

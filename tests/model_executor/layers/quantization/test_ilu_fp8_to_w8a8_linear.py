@@ -378,3 +378,26 @@ def test_kv_b_rejects_bad_contract(mutation, message):
         pytest.raises((ValueError, TypeError), match=message),
     ):
         fp8_config().get_quant_method(Linear(prefix), prefix)
+
+
+@pytest.mark.parametrize("scale_dtype", [torch.float8_e8m0fnu, torch.float32])
+def test_block32_fp32_quantization_reference(scale_dtype):
+    torch.manual_seed(19)
+    weight = torch.randn(65, 288).to(torch.float8_e4m3fn)
+    scales = torch.pow(2.0, torch.randint(-9, 4, (3, 9)))
+    if scale_dtype == torch.float32:
+        # Non-power-of-two scales make an unintended BF16 intermediate visible.
+        scales *= 1.0031
+    scales = scales.to(scale_dtype)
+    actual_q, actual_s = quantize_fp8_block_to_w8a8_int8(weight, scales, (32, 32))
+    value = (
+        weight.float()
+        * scales.float().repeat_interleave(32, 0).repeat_interleave(32, 1)[:65, :288]
+    )
+    expected_s = value.abs().amax(1, keepdim=True) / 127
+    expected_q = torch.round(value / expected_s).clamp(-127, 127).to(torch.int8)
+    torch.testing.assert_close(actual_q, expected_q, atol=0, rtol=0)
+    torch.testing.assert_close(actual_s, expected_s, atol=0, rtol=0)
+    if scale_dtype == torch.float32:
+        rounded_s = value.bfloat16().float().abs().amax(1, keepdim=True) / 127
+        assert not torch.equal(actual_s, rounded_s)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DeepSeek V4.1 block-FP8 linear methods for ivcore30."""
+"""DeepSeek V4.1 block-FP8 source methods and grouped BF16 fallback."""
 
 from __future__ import annotations
 
@@ -7,12 +7,15 @@ from typing import TYPE_CHECKING
 
 import torch
 from vllm.model_executor.layers.linear import LinearMethodBase
-from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_scale_parameter,
     create_fp8_weight_parameter,
 )
 from vllm.model_executor.parameter import BlockQuantScaleParameter
+
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp8.linear import (
+    IluFp8LinearMethod,
+)
 
 if TYPE_CHECKING:
     from vllm_iluvatar.model_executor.layers.quantization.configs.deepseek.v41_fp8 import (
@@ -141,22 +144,19 @@ class IluDeepseekV41Bf16DequantLinearMethod(LinearMethodBase):
         return torch.nn.functional.linear(x, layer.weight, bias)
 
 
-class IluDeepseekV41FP8LinearMethod(Fp8LinearMethod):
-    """Community block-fp8 dense linear, falling back to bf16 on K the kernel
-    cannot take.
+class IluDeepseekV41FP8LinearMethod(IluFp8LinearMethod):
+    """OOT FP8-source linear; FP8 execution falls back to BF16 for unsupported K.
 
-    ``IluFp8BlockScaledMMKernel``'s load-time per-channel requant and
-    ``fp8_per_channel_mm`` both require ``K % 64 == 0``. Every V4.1 attention
-    linear satisfies it (5120 / 5120 / 1280 / 1024 at TP8), but
-    ``ffn.shared_experts.w2`` is row-parallel over ``moe_intermediate_size``,
-    leaving ``K = 2304 / 8 = 288`` at TP8.
+    ``IluFp8BlockScaledMMKernel``'s load-time per-channel requant and ``fp8_per_channel_mm``
+    both require ``K % 64 == 0``. Every V4.1 attention linear satisfies it (5120 / 5120 /
+    1280 / 1024 at TP8), but ``ffn.shared_experts.w2`` is row-parallel over
+    ``moe_intermediate_size``, leaving ``K = 2304 / 8 = 288`` at TP8.
 
-    The split has to happen here rather than in ``get_quant_method``: that runs
-    from ``LinearBase.__init__`` before ``tp_size`` or any per-partition size
-    exists, so ``create_weights`` is the first place the real ``K`` is known.
-    Both paths register the same two parameters (fp8 ``weight`` + e8m0 block
-    ``weight_scale_inv``), so the choice is invisible to the weight loader
-    either way.
+    The split has to happen here rather than in ``get_quant_method``: that runs from
+    ``LinearBase.__init__`` before ``tp_size`` or any per-partition size exists, so
+    ``create_weights`` is the first place the real ``K`` is known. Both paths register the
+    same two parameters (fp8 ``weight`` + e8m0 block ``weight_scale_inv``), so the choice
+    is invisible to the weight loader either way.
     """
 
     def __init__(self, quant_config: IluDeepseekV41FP8Config) -> None:
@@ -173,7 +173,9 @@ class IluDeepseekV41FP8LinearMethod(Fp8LinearMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        if input_size_per_partition % 64 or input_size_per_partition < 64:
+        if self.int8_scheme is None and (
+            input_size_per_partition % 64 or input_size_per_partition < 64
+        ):
             self._bf16 = IluDeepseekV41Bf16DequantLinearMethod(self.quant_config)
             self._bf16.create_weights(
                 layer,

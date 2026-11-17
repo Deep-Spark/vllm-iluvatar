@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1110" viewBox="0 0 1200 1110" role="img">
+<rect width="100%" height="100%" fill="white"/>
+<rect x="340" y="30" width="520" height="85" rx="8" fill="#F4F5F7" stroke="#718096"/>
+<text x="600.0" y="57.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="22" fill="#172B4D">INT8 源布局：weight [N, K]</text>
+<text x="600.0" y="88.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="22" fill="#172B4D">N / K 为当前 TP rank 的本地尺寸</text>
+<polyline points="600,115 600,160" fill="none" stroke="#52657A" stroke-width="2"/>
+<polygon points="600,160 595.5146350163448,149.95602165656462 604.4853649836552,149.95602165656462" fill="#52657A"/>
+<rect x="340" y="160" width="520" height="90" rx="8" fill="#DEEBFF" stroke="#718096"/>
+<text x="600.0" y="189.5" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="22" fill="#172B4D">PERF 模式：_choose_format(N, K)</text>
+<text x="600.0" y="220.5" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="22" fill="#172B4D">查找 perf_table[arch][N, K]</text>
+<polyline points="430,250 260,250 260,350" fill="none" stroke="#52657A" stroke-width="2"/>
+<polygon points="260,350 255.51463501634473,339.9560216565646 264.48536498365524,339.9560216565646" fill="#52657A"/>
+<text x="210" y="295.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="21" fill="#172B4D">命中</text>
+<polyline points="770,250 900,250 900,350" fill="none" stroke="#52657A" stroke-width="2"/>
+<polygon points="900,350 895.5146350163448,339.9560216565646 904.4853649836552,339.9560216565646" fill="#52657A"/>
+<text x="955" y="295.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="21" fill="#172B4D">未命中</text>
+<rect x="40" y="350" width="440" height="90" rx="8" fill="#F4F5F7" stroke="#718096"/>
+<text x="260.0" y="379.5" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="22" fill="#172B4D">采用性能表指定的格式</text>
+<text x="260.0" y="410.5" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="22" fill="#172B4D">TN 或 NN</text>
+<rect x="680" y="350" width="440" height="90" rx="8" fill="#DEEBFF" stroke="#718096"/>
+<text x="900.0" y="395.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="22" fill="#172B4D">N 和 K 是否均为 64 的倍数？</text>
+<polyline points="780,440 780,505" fill="none" stroke="#52657A" stroke-width="2"/>
+<polygon points="780,505 775.5146350163448,494.9560216565646 784.4853649836552,494.9560216565646" fill="#52657A"/>
+<text x="745" y="472.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="20" fill="#172B4D">是</text>
+<polyline points="1020,440 1020,505" fill="none" stroke="#52657A" stroke-width="2"/>
+<polygon points="1020,505 1015.5146350163448,494.9560216565646 1024.4853649836552,494.9560216565646" fill="#52657A"/>
+<text x="1055" y="472.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="20" fill="#172B4D">否</text>
+<rect x="680" y="505" width="200" height="65" rx="8" fill="#F4F5F7" stroke="#718096"/>
+<text x="780.0" y="537.5" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="23" fill="#172B4D">选择 NN</text>
+<rect x="920" y="505" width="200" height="65" rx="8" fill="#F4F5F7" stroke="#718096"/>
+<text x="1020.0" y="537.5" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="23" fill="#172B4D">选择 TN</text>
+<polyline points="260,440 260,650 340,650" fill="none" stroke="#52657A" stroke-width="2"/>
+<polygon points="340,650 329.9560216565646,654.4853649836552 329.9560216565646,645.5146350163448" fill="#52657A"/>
+<polyline points="780,570 780,605 600,605 600,615" fill="none" stroke="#52657A" stroke-width="2"/>
+<polygon points="600,615 595.5146350163448,604.9560216565646 604.4853649836552,604.9560216565646" fill="#52657A"/>
+<polyline points="1020,570 1020,650 860,650" fill="none" stroke="#52657A" stroke-width="2"/>
+<polygon points="860,650 870.0439783434354,645.5146350163448 870.0439783434354,654.4853649836552" fill="#52657A"/>
+<rect x="340" y="615" width="520" height="75" rx="8" fill="#DEEBFF" stroke="#718096"/>
+<text x="600.0" y="652.5" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="24" fill="#172B4D">最终布局已确定</text>
+<polyline points="430,690 430,740 260,740 260,805" fill="none" stroke="#52657A" stroke-width="2"/>
+<polygon points="260,805 255.51463501634473,794.9560216565646 264.48536498365524,794.9560216565646" fill="#52657A"/>
+<text x="220" y="765.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="21" fill="#172B4D">NN</text>
+<polyline points="770,690 770,740 900,740 900,805" fill="none" stroke="#52657A" stroke-width="2"/>
+<polygon points="900,805 895.5146350163448,794.9560216565646 904.4853649836552,794.9560216565646" fill="#52657A"/>
+<text x="940" y="765.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="21" fill="#172B4D">TN</text>
+<rect x="40" y="805" width="440" height="95" rx="8" fill="#E3FCEF" stroke="#718096"/>
+<text x="260.0" y="836.5" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="23" fill="#172B4D">转置并连续化</text>
+<text x="260.0" y="868.5" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="23" fill="#172B4D">[N, K] → [K, N]</text>
+<rect x="680" y="805" width="440" height="95" rx="8" fill="#E3FCEF" stroke="#718096"/>
+<text x="900.0" y="836.5" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="23" fill="#172B4D">保持 [N, K] 方向</text>
+<text x="900.0" y="868.5" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="23" fill="#172B4D">按 kernel 要求 padding</text>
+<polyline points="260,900 260,970 340,970" fill="none" stroke="#52657A" stroke-width="2"/>
+<polygon points="340,970 329.9560216565646,974.4853649836552 329.9560216565646,965.5146350163448" fill="#52657A"/>
+<polyline points="900,900 900,970 860,970" fill="none" stroke="#52657A" stroke-width="2"/>
+<polygon points="860,970 870.0439783434354,965.5146350163448 870.0439783434354,974.4853649836552" fill="#52657A"/>
+<rect x="340" y="930" width="520" height="85" rx="8" fill="#F4F5F7" stroke="#718096"/>
+<text x="600.0" y="957.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="22" fill="#172B4D">准备配套 scale / bias / gemm_info</text>
+<text x="600.0" y="988.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="22" fill="#172B4D">加载后固定布局</text>
+<text x="600" y="1060.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="21" fill="#172B4D">forward 根据 M 选择 GEMV/GEMM，不重复转换权重布局。</text>
+</svg>

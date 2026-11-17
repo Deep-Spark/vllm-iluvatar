@@ -240,3 +240,44 @@ __all__ = [
     "IluV4W8A16BMMLinearMethod",
     "IluV4W8A8BMMLinearMethod",
 ]
+
+
+class IluDeepseekV41Fp8GroupedInt8Method(IluV4W8A8BMMLinearMethod):
+    """Original block-FP8 WO-A source, consumed by the existing grouped path."""
+
+    def __init__(self, quant_config):
+        super().__init__(quant_config, {"bmm_w8a8_gemm_format": "NN"})
+        self.quant_config = quant_config
+
+    def create_weights(
+        self,
+        layer,
+        input_size_per_partition,
+        output_partition_sizes,
+        input_size,
+        output_size,
+        params_dtype,
+        **attrs,
+    ):
+        from vllm_iluvatar.model_executor.layers.quantization.common.fp8_weights import (
+            create_fp8_source_weights,
+        )
+
+        create_fp8_source_weights(
+            self,
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            params_dtype,
+            **attrs,
+        )
+
+    def process_weights_after_loading(self, layer):
+        from vllm_iluvatar.model_executor.layers.quantization.common.fp8_weights import (
+            finalize_fp8_to_int8,
+        )
+
+        finalize_fp8_to_int8(layer)
+        super().process_weights_after_loading(layer)

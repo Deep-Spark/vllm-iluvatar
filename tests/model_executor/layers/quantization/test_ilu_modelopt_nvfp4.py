@@ -7,7 +7,7 @@ import pytest
 import torch
 from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
 
-import vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.nvfp4_moe as impl
+import vllm_iluvatar.model_executor.layers.quantization.backends.fp4.nvfp4_moe as impl
 import vllm_iluvatar.model_executor.layers.quantization.configs.mxfp8 as mixed
 
 

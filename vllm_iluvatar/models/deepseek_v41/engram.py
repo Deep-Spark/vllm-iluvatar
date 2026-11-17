@@ -596,6 +596,8 @@ class IluEngram(nn.Module):
             with safe_open(shard, framework="pt", device="cpu") as f:
                 return f.get_tensor(f"{prefix}.{name}")
 
+        from vllm_iluvatar.ilu_util.arch import is_ivcore11
+
         device = self.primes.device
         wkv_q = read("wkv.weight")
         wkv_s = read("wkv.scale") if f"{prefix}.wkv.scale" in weight_map else None
@@ -618,6 +620,18 @@ class IluEngram(nn.Module):
                 wkv_s = torch.cat([keys_s.flatten(0, 1), wkv_s[n_s:]])
         if wkv_s is None:
             self.wkv_weight = wkv_q.contiguous().to(device)
+            self.wkv_scale = None
+        elif is_ivcore11():
+            from vllm_iluvatar.model_executor.layers.quantization.backends.fp8.deepseek_v41_linear import (
+                dequantize_block_fp8,
+            )
+
+            # Match the existing ivcore11 checkpoint conversion. This projection
+            # bypasses LinearMethod and its FP8 forward requires ivcore30 IxMM.
+            # Decode on CPU before the copy to avoid a full FP32 GPU temporary.
+            self.wkv_weight = dequantize_block_fp8(
+                wkv_q.contiguous(), wkv_s.contiguous(), (_FP8_BLOCK, _FP8_BLOCK)
+            ).to(device)
             self.wkv_scale = None
         else:
             self.wkv_weight, self.wkv_scale = (

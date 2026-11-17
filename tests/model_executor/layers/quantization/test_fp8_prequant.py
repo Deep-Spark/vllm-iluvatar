@@ -8,7 +8,7 @@ from conftest import requires_corex30
 from vllm_iluvatar.model_executor.layers.quantization.common.fp8_input import (
     IluFP8Input,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear.native_to_fp8 import (
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.linear.native_to_fp8 import (
     IluFp8PerChannelOnlineLinearMethod,
 )
 

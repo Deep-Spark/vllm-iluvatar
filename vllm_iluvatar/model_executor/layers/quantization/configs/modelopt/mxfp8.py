@@ -50,7 +50,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
 
-from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.mxfp8_moe import (  # noqa: E501
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp8_moe import (  # noqa: E501
     IluMxFp8ToFp4OnlineMoE,
 )
 

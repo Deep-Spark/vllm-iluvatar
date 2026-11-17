@@ -179,8 +179,7 @@ class PreparationSelectionTest(unittest.TestCase):
             ("standard", "nn_experts.py"),
         ):
             path = (
-                "vllm_iluvatar/model_executor/layers/quantization/"
-                "backends/ivcore30/w4a8/" + file
+                "vllm_iluvatar/model_executor/layers/quantization/backends/w4a8/" + file
             )
             for hidden, expected in ((192, False), (256, True), (8193, False)):
                 x = Tensor()

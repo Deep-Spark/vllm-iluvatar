@@ -11,7 +11,7 @@ from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
     _ixmm_backend_available,
     ilu_mxfp4_fused_experts,
 )
-from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.batch_experts import (
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.batch_experts import (
     IluMoEBatchedExpertsFp8,
 )
 

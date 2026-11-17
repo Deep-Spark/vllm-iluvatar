@@ -32,8 +32,8 @@ import torch
 import torch.nn as nn
 from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8FusedMoE
 
-import vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.mxfp8_moe as ilu_mxfp8
-from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.mxfp8_moe import (
+import vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp8_moe as ilu_mxfp8
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp8_moe import (
     IluMxFp8FusedMoE,
     e8m0_to_fp32,
 )

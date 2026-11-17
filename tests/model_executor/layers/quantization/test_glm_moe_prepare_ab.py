@@ -206,7 +206,7 @@ def test_full_nn_prepare_off_on(
 def standard_experts(method, layer, monkeypatch):
     from types import SimpleNamespace
 
-    from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.w4a8 import (
+    from vllm_iluvatar.model_executor.layers.quantization.backends.w4a8 import (
         nn_experts as std,
     )
 

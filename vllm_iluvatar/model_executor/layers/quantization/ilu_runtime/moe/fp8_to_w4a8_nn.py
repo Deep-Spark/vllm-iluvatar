@@ -17,10 +17,10 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 
-from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.fp8_moe import (
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe import (
     IluFp8MoEMethod,
 )
-from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.w4a8.nn_moe import (
+from vllm_iluvatar.model_executor.layers.quantization.backends.w4a8.nn_moe import (
     IluW4A8NNMoEMethod,
     validate_nn_pack_version,
 )

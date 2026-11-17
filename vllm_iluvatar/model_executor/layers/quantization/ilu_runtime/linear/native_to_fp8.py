@@ -19,7 +19,7 @@ from vllm.model_executor.model_loader.reload.layerwise import (
 from vllm.model_executor.parameter import ModelWeightParameter
 
 from vllm_iluvatar.model_executor.layers.quantization import IluvatarQuantRegistry
-from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp8.linear import (
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp8.linear import (
     _IXMM_FP8_GEMV_MAX_M,
     _can_fuse_bf16_fp8_gemv,
 )

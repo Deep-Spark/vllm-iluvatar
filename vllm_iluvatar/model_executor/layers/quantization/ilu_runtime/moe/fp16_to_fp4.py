@@ -30,18 +30,18 @@ from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
     _SWIGLUOAI_VARIANT,
     ilu_mxfp4_fused_experts,
 )
-from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.mxfp8_moe import (
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp8_moe import (
     _SUPPORTED_ACTIVATIONS,
     _get_ilu_output_scale,
 )
-from vllm_iluvatar.model_executor.layers.quantization.conversions.ivcore30.fp8_to_fp4 import (
+from vllm_iluvatar.model_executor.layers.quantization.conversions.fp8_to_fp4 import (
     IX30_GROUP_SIZE,
     Fp8SourceLayout,
 )
 from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.config import (
     dtype_name,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.moe.fp8_to_fp4 import (
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.moe.fp8_to_fp4 import (
     _DEFAULT_MAX_PENDING_SHARDS,
     _W13,
     IluFp8ToFp4OnlineMoEMethod,

@@ -11,22 +11,22 @@ all nested config and runtime-method registrars in dependency order.
 # the registration does not depend on that.
 from .backends.grouped_bmm import deepseek_v4_wo_a as _deepseek_v4_wo_a
 from .backends.grouped_bmm import glm_kv_b_proj as _glm_kv_b_proj
-from .backends.ivcore30.fp4 import fp8_moe as _fp8_moe
-from .backends.ivcore30.fp8 import linear as _fp8_linear
+from .backends.fp4 import fp8_moe as _fp8_moe
+from .backends.fp8 import linear as _fp8_linear
 
 # Runtime registry and method implementations must exist before configs start
 # resolving ``additional_config.ilu_quant`` groups.
 from .ilu_runtime import base_config as _online_base_config
-from .ilu_runtime.ivcore30.linear import (
+from .ilu_runtime.linear import (
     fp8_to_glm_kv_b_w8a16 as _fp8_to_glm_kv_b_w8a16,
 )
-from .ilu_runtime.ivcore30.linear import fp8_to_w8a8 as _fp8_to_w8a8
-from .ilu_runtime.ivcore30.linear import native_to_fp8 as _native_to_fp8
-from .ilu_runtime.ivcore30.linear import native_to_w8a8 as _native_to_w8a8
-from .ilu_runtime.ivcore30.moe import fp16_to_fp4 as _fp16_to_fp4
-from .ilu_runtime.ivcore30.moe import fp8_to_fp4 as _fp8_to_fp4
-from .ilu_runtime.ivcore30.moe import fp8_to_w4a8_nn as _fp8_to_w4a8_nn
-from .ilu_runtime.ivcore30.moe import mxfp4_to_w4a8_tn as _mxfp4_to_w4a8_tn
+from .ilu_runtime.linear import fp8_to_w8a8 as _fp8_to_w8a8
+from .ilu_runtime.linear import native_to_fp8 as _native_to_fp8
+from .ilu_runtime.linear import native_to_w8a8 as _native_to_w8a8
+from .ilu_runtime.moe import fp16_to_fp4 as _fp16_to_fp4
+from .ilu_runtime.moe import fp8_to_fp4 as _fp8_to_fp4
+from .ilu_runtime.moe import fp8_to_w4a8_nn as _fp8_to_w4a8_nn
+from .ilu_runtime.moe import mxfp4_to_w4a8_tn as _mxfp4_to_w4a8_tn
 
 # Checkpoint quantization configs.
 from .configs import awq as _awq

@@ -8,7 +8,7 @@ from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
 
-from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.nvfp4_moe import (
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.nvfp4_moe import (
     IluModelOptNvFp4MoEMethod,
 )
 

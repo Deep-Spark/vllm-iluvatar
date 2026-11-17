@@ -57,7 +57,7 @@ def _load_linear_backend(monkeypatch):
     """The module the linear method resolves its community symbols in."""
     _install_fake_ixformer(monkeypatch)
     return importlib.import_module(
-        "vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp8.linear"
+        "vllm_iluvatar.model_executor.layers.quantization.backends.fp8.linear"
     )
 
 
@@ -65,7 +65,7 @@ def _load_moe_backend(monkeypatch):
     """The module the MoE method resolves its community symbols in."""
     _install_fake_ixformer(monkeypatch)
     return importlib.import_module(
-        "vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.fp8_moe"
+        "vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe"
     )
 
 

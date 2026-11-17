@@ -13,7 +13,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
 
-from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp8.deepseek_v41_linear import (
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp8.deepseek_v41_linear import (
     IluDeepseekV41Bf16DequantLinearMethod,
     IluDeepseekV41FP8LinearMethod,
 )

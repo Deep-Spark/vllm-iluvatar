@@ -17,11 +17,8 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[4]
-NN = "vllm_iluvatar/model_executor/layers/quantization/backends/ivcore30/w4a8/nn_moe.py"
-STD = (
-    "vllm_iluvatar/model_executor/layers/quantization/"
-    "backends/ivcore30/w4a8/nn_experts.py"
-)
+NN = "vllm_iluvatar/model_executor/layers/quantization/backends/w4a8/nn_moe.py"
+STD = "vllm_iluvatar/model_executor/layers/quantization/backends/w4a8/nn_experts.py"
 ROUTER = (
     "vllm_iluvatar/model_executor/layers/fused_moe/router/ilu_grouped_topk_router.py"
 )

@@ -13,7 +13,7 @@ from vllm.model_executor import parameter as parameter_module
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.parameter import ModelWeightParameter
 
-import vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear.native_to_fp8 as ilu_fp8
+import vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.linear.native_to_fp8 as ilu_fp8
 from vllm_iluvatar.model_executor.layers.quantization import (
     IluvatarQuantRegistry,
 )
@@ -21,7 +21,7 @@ from vllm_iluvatar.model_executor.layers.quantization.configs.fp8 import IluFp8C
 from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.config import (
     parse_ilu_runtime_quant_config,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear.native_to_fp8 import (
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.linear.native_to_fp8 import (
     IluFp8PerChannelOnlineLinearMethod,
 )
 

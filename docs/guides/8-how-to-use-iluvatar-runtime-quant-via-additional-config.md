@@ -885,12 +885,12 @@ loader 按 128 的倍数拼接。GLM-5.2 的 `q_lora_rank=2048`、`intermediate_
 | 未量化 checkpoint 的基础 config | [`ilu_runtime/base_config.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime/base_config.py) |
 | method 注册表 | [`ilu_runtime/registry.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime/registry.py) |
 | FP8 基础 config | [`configs/fp8.py`](../../vllm_iluvatar/model_executor/layers/quantization/configs/fp8.py) |
-| Online FP8 Linear method | [`ilu_runtime/ivcore30/linear/native_to_fp8.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime/ivcore30/linear/native_to_fp8.py) |
-| FP8 source layout 与 ix30 FP4 转换入口 | [`conversions/ivcore30/fp8_to_fp4.py`](../../vllm_iluvatar/model_executor/layers/quantization/conversions/ivcore30/fp8_to_fp4.py) |
-| MoE 加载期 FP4 method | [`ilu_runtime/ivcore30/moe/fp8_to_fp4.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime/ivcore30/moe/fp8_to_fp4.py) |
-| FP8 Linear 加载期 W8A8 INT8 method | [`ilu_runtime/ivcore30/linear/fp8_to_w8a8.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime/ivcore30/linear/fp8_to_w8a8.py) |
-| Native Linear 加载期 W8A8 INT8 method | [`ilu_runtime/ivcore30/linear/native_to_w8a8.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime/ivcore30/linear/native_to_w8a8.py) |
-| GLM-5.2 `kv_b_proj` 加载期 W8A16 method | [`ilu_runtime/ivcore30/linear/fp8_to_glm_kv_b_w8a16.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime/ivcore30/linear/fp8_to_glm_kv_b_w8a16.py) |
+| Online FP8 Linear method | [`ilu_runtime/linear/native_to_fp8.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime/linear/native_to_fp8.py) |
+| FP8 source layout 与 ix30 FP4 转换入口 | [`conversions/fp8_to_fp4.py`](../../vllm_iluvatar/model_executor/layers/quantization/conversions/fp8_to_fp4.py) |
+| MoE 加载期 FP4 method | [`ilu_runtime/moe/fp8_to_fp4.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime/moe/fp8_to_fp4.py) |
+| FP8 Linear 加载期 W8A8 INT8 method | [`ilu_runtime/linear/fp8_to_w8a8.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime/linear/fp8_to_w8a8.py) |
+| Native Linear 加载期 W8A8 INT8 method | [`ilu_runtime/linear/native_to_w8a8.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime/linear/native_to_w8a8.py) |
+| GLM-5.2 `kv_b_proj` 加载期 W8A16 method | [`ilu_runtime/linear/fp8_to_glm_kv_b_w8a16.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime/linear/fp8_to_glm_kv_b_w8a16.py) |
 | GLM-5.2 `kv_b_proj` W8A16 backend | [`backends/grouped_bmm/glm_kv_b_proj.py`](../../vllm_iluvatar/model_executor/layers/quantization/backends/grouped_bmm/glm_kv_b_proj.py) |
 | 转换算子（双 backend，在 ixformer） | `ixformer/inference/functions/fp4/gemm/fp8_block_preprocess.py` |
 | Qwen3.8-Flash-Next 示例 | [`examples/iluvatar-runtime-quant/Qwen/Qwen3.8-Flash-Next/`](../../examples/iluvatar-runtime-quant/Qwen/Qwen3.8-Flash-Next/) |

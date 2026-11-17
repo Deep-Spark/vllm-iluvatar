@@ -85,7 +85,7 @@ class IluDeepseekV4FP8Config(DeepseekV4FP8Config):
                 fused_mapping=self.packed_modules_mapping,
             )
             if not skipped and self.moe_quant_algo != "NVFP4":
-                from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.mxfp4_moe import (  # noqa: E501
+                from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp4_moe import (  # noqa: E501
                     IluMxfp4MoEMethod,
                 )
                 from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.config import (

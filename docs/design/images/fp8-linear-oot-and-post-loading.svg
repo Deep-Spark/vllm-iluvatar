@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1080" viewBox="0 0 1200 1080" role="img">
+<rect width="100%" height="100%" fill="white"/>
+<rect x="40" y="35" width="510" height="105" rx="8" fill="#F4F5F7" stroke="#718096"/>
+<text x="295.0" y="72.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="22" fill="#172B4D">社区 Fp8LinearMethod</text>
+<text x="295.0" y="103.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="22" fill="#172B4D">vllm/.../quantization/fp8.py</text>
+<rect x="650" y="35" width="510" height="105" rx="8" fill="#F4F5F7" stroke="#718096"/>
+<text x="905.0" y="72.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="22" fill="#172B4D">OOT 量化 Config 注册入口</text>
+<text x="905.0" y="103.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="22" fill="#172B4D">IluFp8Config.get_quant_method()</text>
+<polyline points="295,140 295,225 350,225" fill="none" stroke="#52657A" stroke-width="2"/>
+<polygon points="350,225 339.9560216565646,229.48536498365527 339.9560216565646,220.51463501634473" fill="#52657A"/>
+<text x="225" y="182.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="20" fill="#172B4D">继承</text>
+<polyline points="905,140 905,225 850,225" fill="none" stroke="#52657A" stroke-width="2"/>
+<polygon points="850,225 860.0439783434354,220.51463501634473 860.0439783434354,229.48536498365527" fill="#52657A"/>
+<text x="1000" y="182.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="20" fill="#172B4D">返回插件 Method</text>
+<rect x="350" y="185" width="500" height="80" rx="8" fill="#DEEBFF" stroke="#718096"/>
+<text x="600.0" y="225.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="25" fill="#172B4D">IluFp8LinearMethod</text>
+<polyline points="600,265 600,315" fill="none" stroke="#52657A" stroke-width="2"/>
+<polygon points="600,315 595.5146350163448,304.9560216565646 604.4853649836552,304.9560216565646" fill="#52657A"/>
+<rect x="350" y="315" width="500" height="105" rx="8" fill="#F4F5F7" stroke="#718096"/>
+<text x="600.0" y="352.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="22" fill="#172B4D">初始化时读取 ilu_compute</text>
+<text x="600.0" y="383.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="22" fill="#172B4D">创建参数并加载原始 FP8 权重</text>
+<polyline points="600,420 600,470" fill="none" stroke="#52657A" stroke-width="2"/>
+<polygon points="600,470 595.5146350163448,459.9560216565646 604.4853649836552,459.9560216565646" fill="#52657A"/>
+<rect x="350" y="470" width="500" height="75" rx="8" fill="#DEEBFF" stroke="#718096"/>
+<text x="600.0" y="507.5" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="24" fill="#172B4D">按已选定的 backend 分流</text>
+<polyline points="430,545 430,590 80,590 80,665" fill="none" stroke="#52657A" stroke-width="2"/>
+<polygon points="80,665 75.51463501634473,654.9560216565646 84.48536498365527,654.9560216565646" fill="#52657A"/>
+<text x="310" y="607.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="21" fill="#172B4D">150：auto</text>
+<text x="310" y="637.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="21" fill="#172B4D">300：显式 w8a8_int8</text>
+<polyline points="770,545 770,590 1125,590 1125,665" fill="none" stroke="#52657A" stroke-width="2"/>
+<polygon points="1125,665 1120.5146350163448,654.9560216565646 1129.4853649836552,654.9560216565646" fill="#52657A"/>
+<text x="900" y="622.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="21" fill="#172B4D">300：auto 或显式 fp8</text>
+<rect x="55" y="665" width="470" height="110" rx="8" fill="#E3FCEF" stroke="#718096"/>
+<text x="290.0" y="689.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="22" fill="#172B4D">finalize_fp8_to_int8()</text>
+<text x="290.0" y="720.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="22" fill="#172B4D">FP8 × scale → FP32 → INT8</text>
+<text x="290.0" y="751.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="22" fill="#172B4D">生成 FP32 channel scale</text>
+<rect x="675" y="665" width="470" height="110" rx="8" fill="#DEEBFF" stroke="#718096"/>
+<text x="910.0" y="689.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="22" fill="#172B4D">原有 FP8 后处理</text>
+<text x="910.0" y="720.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="22" fill="#172B4D">准备原 FP8 kernel 所需权重</text>
+<text x="910.0" y="751.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="22" fill="#172B4D">block / 非 block 各走原有路径</text>
+<polyline points="290,775 290,830" fill="none" stroke="#52657A" stroke-width="2"/>
+<polygon points="290,830 285.51463501634476,819.9560216565646 294.48536498365524,819.9560216565646" fill="#52657A"/>
+<polyline points="910,775 910,830" fill="none" stroke="#52657A" stroke-width="2"/>
+<polygon points="910,830 905.5146350163448,819.9560216565646 914.4853649836552,819.9560216565646" fill="#52657A"/>
+<rect x="55" y="830" width="470" height="105" rx="8" fill="#F4F5F7" stroke="#718096"/>
+<text x="290.0" y="852.5" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="21" fill="#172B4D">已有 W8A8 scheme 后处理</text>
+<text x="290.0" y="882.5" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="21" fill="#172B4D">自动选择 TN/NN、转置或 padding</text>
+<text x="290.0" y="912.5" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="21" fill="#172B4D">准备 scale / bias / gemm_info</text>
+<rect x="675" y="830" width="470" height="105" rx="8" fill="#F4F5F7" stroke="#718096"/>
+<text x="910.0" y="867.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="22" fill="#172B4D">FP8 运行权重就绪</text>
+<text x="910.0" y="898.0" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="22" fill="#172B4D">后续复用原 FP8 计算路径</text>
+<polyline points="290,935 290,980" fill="none" stroke="#52657A" stroke-width="2"/>
+<polygon points="290,980 285.51463501634476,969.9560216565646 294.48536498365524,969.9560216565646" fill="#52657A"/>
+<rect x="55" y="980" width="470" height="65" rx="8" fill="#E3FCEF" stroke="#718096"/>
+<text x="290.0" y="1012.5" text-anchor="middle" dominant-baseline="central" font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif" font-size="23" fill="#172B4D">INT8 运行权重就绪</text>
+</svg>

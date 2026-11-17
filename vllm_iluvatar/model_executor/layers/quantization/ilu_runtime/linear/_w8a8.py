@@ -16,16 +16,6 @@ from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes
 _ALLOWED_OPTIONS = frozenset({"gemm_format", "mixed_strategy", "gemm_mode"})
 
 
-def _quantize_per_channel_int8(
-    value: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Symmetric per-output-channel INT8 of an FP32 ``[N, K]`` block."""
-    amax = value.abs().amax(dim=1, keepdim=True)
-    # An all-zero channel would divide by zero; a scale of 1 keeps it zero.
-    scale = torch.where(amax > 0, amax / 127.0, torch.ones_like(amax))
-    return torch.round(value / scale).clamp(-127, 127).to(torch.int8), scale
-
-
 class _IluRuntimeW8A8Int8LinearMethod(LinearMethodBase):
     """Shared load/compute surface for the two W8A8 source contracts.
 

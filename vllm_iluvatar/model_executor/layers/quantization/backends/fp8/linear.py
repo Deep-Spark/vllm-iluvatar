@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Serialized/prequantized FP8 linear implementation for ivcore30."""
+"""Serialized FP8 sources with architecture-selected FP8 or INT8 execution."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import ixformer.inference.functions as ixfops
 import torch
 from ixformer.inference.functions import fp8_per_token_dynamic_scaled
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_scale_parameter,
@@ -22,6 +23,8 @@ if TYPE_CHECKING:
     from vllm_iluvatar.model_executor.layers.quantization.configs.fp8 import (
         IluFp8Config,
     )
+
+logger = init_logger(__name__)
 
 _IXMM_FP8_GEMV_MAX_M = 16
 
@@ -56,17 +59,39 @@ def _can_fuse_bf16_fp8_gemv(x, layer, gemm_format, bias):
 
 @IluvatarQuantRegistry.register_method
 class IluFp8LinearMethod(Fp8LinearMethod):
-    """Serialized FP8 linear method backed directly by GEMM/GEMV.
+    """Serialized FP8 source with a load-time FP8 or INT8 compute choice.
 
-    Checkpoint weights remain in their native TN layout, ``[N, K]``. Block
-    quantization keeps the parent ``Fp8LinearMethod`` path (Iluvatar selects
-    ``IluFp8BlockScaledMMKernel``); non-block checkpoints overlay a
-    per-channel ``weight_scale`` epilogue.
+    ivcore11 defaults to INT8 W8A8; ivcore30 preserves FP8 unless explicitly
+    overridden. Both keep checkpoint parameters and TP loaders until post-load.
+    Only the selected compute implementation performs weight finalization.
     """
 
     def __init__(self, quant_config: IluFp8Config) -> None:
         super().__init__(quant_config)
-        self.gemm_format = quant_config.gemm_format.upper()
+        from vllm_iluvatar.config.ilu_compute import fp8_linear_backend
+
+        self.gemm_format = getattr(quant_config, "gemm_format", "TN").upper()
+        self.compute_backend = fp8_linear_backend()
+        self.int8_scheme = None
+        if self.compute_backend == "w8a8_int8":
+            from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes import (
+                IluCompressedTensorsW8A8Int8,
+            )
+
+            if self.act_q_static:
+                raise ValueError("FP8 -> INT8 currently requires dynamic activations")
+            self.int8_scheme = IluCompressedTensorsW8A8Int8(
+                strategy="channel",
+                is_static_input_scheme=False,
+                input_symmetric=True,
+                ilu_params={
+                    "gemm_format": "TN",
+                    "mixed_strategy": "CHANNEL",
+                    "gemm_mode": "PERF",
+                },
+            )
+        self.supports_pre_processed_weights = self.int8_scheme is None
+        logger.info_once("FP8 Linear execution backend: %s", self.compute_backend)
 
     def create_weights(
         self,
@@ -78,6 +103,23 @@ class IluFp8LinearMethod(Fp8LinearMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
+        if self.int8_scheme is not None:
+            from vllm_iluvatar.model_executor.layers.quantization.common.fp8_weights import (
+                create_fp8_source_weights,
+            )
+
+            create_fp8_source_weights(
+                self,
+                layer,
+                input_size_per_partition,
+                output_partition_sizes,
+                input_size,
+                output_size,
+                params_dtype,
+                **extra_weight_attrs,
+            )
+            layer.scheme = self.int8_scheme
+            return
         super().create_weights(
             layer,
             input_size_per_partition,
@@ -110,7 +152,15 @@ class IluFp8LinearMethod(Fp8LinearMethod):
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Keep weights unchanged and materialize per-channel scales."""
+        """Finalize the selected precision and layout once, before graph capture."""
+        if self.int8_scheme is not None:
+            from vllm_iluvatar.model_executor.layers.quantization.common.fp8_weights import (
+                finalize_fp8_to_int8,
+            )
+
+            finalize_fp8_to_int8(layer)
+            self.int8_scheme.process_weights_after_loading(layer)
+            return
         if self.block_quant:
             return super().process_weights_after_loading(layer)
 
@@ -143,6 +193,8 @@ class IluFp8LinearMethod(Fp8LinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.int8_scheme is not None:
+            return self.int8_scheme.apply_weights(layer, x, bias)
         if self.block_quant:
             return super().apply(layer, x, bias)
         x_2d = x.reshape(-1, x.shape[-1])

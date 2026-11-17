@@ -218,6 +218,7 @@ def test_method_init_skips_backend_selection(monkeypatch):
 def _linear_method(mod, *, block: bool) -> object:
     method = object.__new__(mod.IluFp8LinearMethod)
     method.block_quant = block
+    method.int8_scheme = None  # Exercise the retained FP8 execution path.
     method.gemm_format = "TN"
     return method
 

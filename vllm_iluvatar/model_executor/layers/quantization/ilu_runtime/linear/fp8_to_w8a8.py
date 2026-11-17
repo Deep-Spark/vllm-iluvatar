@@ -18,44 +18,15 @@ import torch
 from vllm_iluvatar.model_executor.layers.quantization.backends.fp8.linear import (
     IluFp8LinearMethod,
 )
+from vllm_iluvatar.model_executor.layers.quantization.conversions.fp8_to_int8 import (
+    quantize_fp8_block_to_w8a8_int8,
+)
 from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.linear._w8a8 import (
     _IluRuntimeW8A8Int8LinearMethod,
-    _quantize_per_channel_int8,
 )
 from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.registry import (
     IluvatarQuantRegistry,
 )
-
-
-def quantize_fp8_block_to_w8a8_int8(
-    weight: torch.Tensor,
-    block_scale: torch.Tensor,
-    block_shape: tuple[int, int],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Convert one block-FP8 ``[N, K]`` tensor to INT8 + ``[N, 1]`` scale.
-
-    Dequantize and requantize one source row-block at a time so a large
-    projection never needs a full FP32 copy of itself.
-    """
-    if weight.ndim != 2 or weight.dtype != torch.float8_e4m3fn:
-        raise ValueError("W8A8 conversion requires a 2-D float8_e4m3fn weight")
-    n, k = weight.shape
-    bn, bk = block_shape
-    expected = ((n + bn - 1) // bn, (k + bk - 1) // bk)
-    if tuple(block_scale.shape) != expected or block_scale.dtype != torch.float32:
-        raise ValueError(
-            f"block scale shape/dtype {tuple(block_scale.shape)}/{block_scale.dtype} "
-            f"does not match expected {expected}/torch.float32"
-        )
-
-    qweight = torch.empty_like(weight, dtype=torch.int8)
-    channel_scale = torch.empty((n, 1), dtype=torch.float32, device=weight.device)
-    for n0 in range(0, n, bn):
-        n1 = min(n0 + bn, n)
-        row_scale = block_scale[n0 // bn].repeat_interleave(bk)[:k]
-        value = weight[n0:n1].float() * row_scale.unsqueeze(0)
-        qweight[n0:n1], channel_scale[n0:n1] = _quantize_per_channel_int8(value)
-    return qweight, channel_scale
 
 
 @IluvatarQuantRegistry.register_method
@@ -74,17 +45,25 @@ class IluFp8ToW8A8Int8OnlineLinearMethod(_IluRuntimeW8A8Int8LinearMethod):
     @classmethod
     def from_ilu_runtime_config(cls, context: Any):
         source = context.group.weights.source
-        if set(source.extra) != {"block_shape"} or tuple(
-            source.extra["block_shape"]
-        ) != (128, 128):
+        block_shape = tuple(source.extra.get("block_shape", ()))
+        if set(source.extra) != {"block_shape"} or block_shape not in (
+            (128, 128),
+            (32, 32),
+        ):
             raise ValueError(
                 f"{context.group.group_id}: block-FP8 source requires "
-                "block_shape [128, 128]"
+                "block_shape [128, 128] or [32, 32]"
             )
-        if tuple(context.base_quant_config.weight_block_size or ()) != (128, 128):
+        if tuple(context.base_quant_config.weight_block_size or ()) != block_shape:
             raise ValueError(
                 f"{context.group.group_id}: block_shape must match the "
                 "checkpoint's weight_block_size"
+            )
+        from vllm_iluvatar.config.ilu_compute import compute_options
+
+        if compute_options("linear").get("fp8_backend") == "fp8":
+            raise ValueError(
+                "Explicit FP8 execution conflicts with FP8 -> INT8 online quant"
             )
         return super().from_ilu_runtime_config(context)
 
@@ -93,7 +72,9 @@ class IluFp8ToW8A8Int8OnlineLinearMethod(_IluRuntimeW8A8Int8LinearMethod):
         if scale is None:
             raise RuntimeError("block-FP8 source scale is missing")
         qweight, channel_scale = quantize_fp8_block_to_w8a8_int8(
-            layer.weight.data, scale.data, self.block_shape
+            layer.weight.data,
+            scale.data,
+            self.block_shape,
         )
         del layer._parameters["weight_scale_inv"]
         return qweight, channel_scale

@@ -21,6 +21,8 @@ def _method(online):
     impl = _impl(online)
     cls = impl.IluFp8PerChannelOnlineLinearMethod if online else impl.IluFp8LinearMethod
     method = object.__new__(cls)
+    if not online:
+        method.int8_scheme = None
     method.gemm_format = "TN"
     method.block_quant = False
     method._runtime_context = None

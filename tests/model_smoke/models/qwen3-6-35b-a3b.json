@@ -47,5 +47,10 @@
   "ready_timeout_seconds": 1800,
   "request_timeout_seconds": 300,
   "max_tokens": 4096,
-  "request_options": {}
+  "request_options": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20
+  },
+  "prompt_suffix": "Keep reasoning concise and solve only the given instance. No code is needed."
 }

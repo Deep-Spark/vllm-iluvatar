@@ -48,7 +48,7 @@ The weights mapper accounts for three concrete differences vs upstream:
 import os
 from collections.abc import Callable, Iterable
 from itertools import islice
-from typing import Any, cast
+from typing import cast
 
 import ixformer.cuda as ixcuda
 import ixformer.inference.functions as ixfops  # type: ignore[import]
@@ -73,7 +73,6 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
-    LinearMethodBase,
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
@@ -102,236 +101,16 @@ from vllm.utils.multi_stream_utils import EventType
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
     IluFusedMoEEP,
 )
-from vllm_iluvatar.model_executor.layers.quantization import IluvatarQuantRegistry
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes import (
     IluCompressedTensorsW8A8Int8,
 )
 from vllm_iluvatar.models.deepseek_v4.attention import (
-    _WO_A_QUANT,
     IluDeepseekV4Indexer,
     IluDeepseekV4MLAModules,
     IluDeepseekV4MultiHeadLatentAttentionWrapper,
 )
 
 logger = init_logger(__name__)
-
-
-@IluvatarQuantRegistry.register_method
-class IluV4W8A16BMMLinearMethod(LinearMethodBase):
-    """W8A16 grouped-BMM method for DeepSeek-V4 ``attn.wo_a``."""
-
-    def __init__(self, parent_config, ilu_params: dict[str, Any]) -> None:
-        self.parent_config = parent_config
-        try:
-            self.gemm_format = ilu_params.get("bmm_w8a16_gemm_format", "")
-            assert self.gemm_format != ""
-        except KeyError as exc:
-            raise ValueError(
-                "IluV4W8A16BMMLinearMethod requires "
-                "`bmm_w8a16_gemm_format` in its config group"
-            ) from exc
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ) -> None:
-        from vllm.model_executor.parameter import (
-            ChannelQuantScaleParameter,
-            ModelWeightParameter,
-        )
-
-        out_total = sum(output_partition_sizes)
-        layer.logical_widths = output_partition_sizes
-        weight_loader = extra_weight_attrs.get("weight_loader")
-
-        weight = ModelWeightParameter(
-            data=torch.empty(out_total, input_size_per_partition, dtype=torch.int8),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight", weight)
-
-        weight_scale = ChannelQuantScaleParameter(
-            data=torch.empty((out_total, 1), dtype=torch.float32),
-            output_dim=0,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight_scale", weight_scale)
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Reshape and Marlin-repack ``wo_a.weight`` for grouped W8A16."""
-        import ixformer.inference.functions as ixf_ops
-
-        bmm_geom = getattr(layer, "bmm_geom", None)
-        assert bmm_geom is not None, (
-            "IluV4W8A16BMMLinearMethod requires layer.bmm_geom to be set "
-            "by the attention wrapper before process_weights_after_loading."
-        )
-        n_local_groups: int = bmm_geom.n_local_groups
-        o_lora_rank: int = bmm_geom.o_lora_rank
-        k_per_group: int = bmm_geom.heads_per_group * bmm_geom.head_dim
-
-        weight = layer.weight.data
-        weight_scale = layer.weight_scale.data
-
-        assert weight.shape == (n_local_groups * o_lora_rank, k_per_group), (
-            f"wo_a weight shape {tuple(weight.shape)} does not match "
-            f"({n_local_groups} * {o_lora_rank}, {k_per_group}) implied by "
-            f"bmm_geom={bmm_geom!r}"
-        )
-        assert weight_scale.shape == (n_local_groups * o_lora_rank, 1), (
-            f"wo_a weight_scale shape {tuple(weight_scale.shape)} != "
-            f"({n_local_groups * o_lora_rank}, 1)"
-        )
-
-        w_grouped = (
-            weight.view(n_local_groups, o_lora_rank, k_per_group)
-            .permute(0, 2, 1)
-            .contiguous()
-        )
-        s_grouped = weight_scale.view(n_local_groups, o_lora_rank, 1).contiguous()
-
-        if _WO_A_QUANT in ("msd", "w8a8"):
-            layer.W = weight.view(n_local_groups, o_lora_rank, k_per_group).contiguous()
-            layer.W_scale = weight_scale.view(n_local_groups, o_lora_rank).contiguous()
-
-        layer.W_repacked = ixf_ops.marlin_w8_weight_repack(
-            weights=w_grouped,
-            weight_format="int8",
-            reformat=self.gemm_format,
-        )
-        layer.W_scale_repacked = s_grouped
-        layer.W_format = self.gemm_format
-
-        delattr(layer, "weight")
-        delattr(layer, "weight_scale")
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        raise NotImplementedError(
-            "IluV4W8A16BMMLinearMethod.apply must not be called; "
-            "wo_a is consumed by IluDeepseekV4MultiHeadLatentAttentionWrapper "
-            "via marlin_w8a16(W_repacked, W_scale_repacked)."
-        )
-
-
-def _grouped_checkpoint_parameters(layer):
-    geometry = layer.bmm_geom
-    groups = geometry.n_local_groups
-    channels = geometry.o_lora_rank
-    width = geometry.heads_per_group * geometry.head_dim
-    weight, scales = layer.weight.data, layer.weight_scale.data
-    if weight.dtype != torch.int8 or weight.shape != (groups * channels, width):
-        raise ValueError("Grouped projection needs INT8 weights matching bmm_geom")
-    if scales.dtype != torch.float32 or scales.shape != (groups * channels, 1):
-        raise ValueError("Grouped projection needs FP32 per-channel weight scales")
-    return weight.view(groups, channels, width), scales.view(groups, channels)
-
-
-@IluvatarQuantRegistry.register_method
-class IluV4W8A8BMMLinearMethod(IluV4W8A16BMMLinearMethod):
-    """Grouped INT8 output projection with fused inverse-RoPE activation quant.
-
-    The checkpoint-loading contract is shared with W8A16. Post-loading keeps
-    one INT8 layout and releases the original parameters, without a second
-    Marlin weight copy. Attention supplies positions through apply_with_rope.
-    """
-
-    def __init__(self, parent_config, ilu_params: dict[str, Any]) -> None:
-        self.parent_config = parent_config
-        self.gemm_format = ilu_params.get("bmm_w8a8_gemm_format", "NN")
-        if self.gemm_format not in ("TN", "NN"):
-            raise ValueError("Grouped INT8 projection supports TN or NN weights")
-
-    @staticmethod
-    def supports_geometry(geometry, dtype, rope_dim) -> bool:
-        groups = geometry.n_local_groups
-        channels = geometry.o_lora_rank
-        heads = geometry.heads_per_group
-        dim = geometry.head_dim
-        width = heads * dim
-        return (
-            dtype in (torch.bfloat16, torch.float16)
-            and groups > 0
-            and heads > 0
-            and channels > 0
-            and channels % 64 == 0
-            and dim > 0
-            and dim % 8 == 0
-            and width <= 16384
-            and width % 64 == 0
-            and 0 < rope_dim <= dim
-            and rope_dim % 8 == 0
-        )
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        grouped, scales = _grouped_checkpoint_parameters(layer)
-        if self.gemm_format == "NN":
-            grouped = grouped.transpose(1, 2)
-        layer.W_int8_grouped = grouped.contiguous()
-        layer.W_int8_scales = scales.contiguous()
-        delattr(layer, "weight")
-        delattr(layer, "weight_scale")
-
-    def apply_with_rope(self, layer, output, positions, cos_sin_cache):
-        """Return token-major grouped output without a post-GEMM transpose."""
-        from ixformer.inference.functions.models.deepseek_v4.mla_sparse.int8.ds4_inv_rope_int8_quant import (
-            ds4_inv_rope_int8_quant,
-        )
-
-        groups = layer.bmm_geom.n_local_groups
-        if output.shape[0] == 0:
-            return output.new_empty((0, groups, layer.bmm_geom.o_lora_rank))
-        activations, scales = ds4_inv_rope_int8_quant(
-            output, positions, cos_sin_cache, groups
-        )
-        return self.apply_quantized(
-            layer, activations, scales, output_dtype=output.dtype
-        )
-
-    def apply_quantized(self, layer, activations, scales, *, output_dtype):
-        """Consume already rotated grouped INT8 values without re-quantizing."""
-        import ixformer.inference.functions as ixf_ops
-
-        groups = layer.bmm_geom.n_local_groups
-        width = layer.bmm_geom.heads_per_group * layer.bmm_geom.head_dim
-        if (
-            activations.dim() != 3
-            or activations.shape[0] != groups
-            or activations.shape[2] != width
-            or activations.dtype != torch.int8
-            or tuple(scales.shape) != tuple(activations.shape[:2])
-            or scales.dtype != torch.float32
-        ):
-            raise ValueError("Grouped WO-A requires INT8 [G,T,K] and FP32 [G,T]")
-        projected = torch.empty(
-            (activations.shape[1], groups, layer.bmm_geom.o_lora_rank),
-            dtype=output_dtype,
-            device=activations.device,
-        )
-        if activations.shape[1] == 0:
-            return projected
-        ixf_ops.w8a8_bmm(
-            activations,
-            layer.W_int8_grouped,
-            scales,
-            layer.W_int8_scales,
-            output=projected.transpose(0, 1),
-            format=self.gemm_format,
-            batched_scales=True,
-        )
-        return projected
 
 
 # A/B/C switch for the mhc_pre operator via IXFORMER_DS4_MHC_PRE ∈ {v1,v2,v3}:

@@ -9,12 +9,17 @@ all nested config and runtime-method registrars in dependency order.
 # Backend methods that register under their own name. The configs below import
 # them too, but only as a side effect of their own wiring; list them here so
 # the registration does not depend on that.
+from .backends.grouped_bmm import deepseek_v4_wo_a as _deepseek_v4_wo_a
+from .backends.grouped_bmm import glm_kv_b_proj as _glm_kv_b_proj
 from .backends.ivcore30.fp4 import fp8_moe as _fp8_moe
 from .backends.ivcore30.fp8 import linear as _fp8_linear
 
 # Runtime registry and method implementations must exist before configs start
 # resolving ``additional_config.ilu_quant`` groups.
 from .ilu_runtime import base_config as _online_base_config
+from .ilu_runtime.ivcore30.linear import (
+    fp8_to_glm_kv_b_w8a16 as _fp8_to_glm_kv_b_w8a16,
+)
 from .ilu_runtime.ivcore30.linear import fp8_to_w8a8 as _fp8_to_w8a8
 from .ilu_runtime.ivcore30.linear import native_to_fp8 as _native_to_fp8
 from .ilu_runtime.ivcore30.linear import native_to_w8a8 as _native_to_w8a8

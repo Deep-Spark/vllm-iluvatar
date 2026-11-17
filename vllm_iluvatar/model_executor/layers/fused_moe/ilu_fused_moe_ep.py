@@ -25,6 +25,7 @@
 
 
 from contextlib import nullcontext
+import os
 from types import MethodType
 
 import ixformer.distributed as ixfd
@@ -744,52 +745,73 @@ class IluFusedMoEEP:
                 get_ep_group() if moe_config.is_sequence_parallel else get_dp_group()
             )
             assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]
-
-            router_input_ids = self._router_input_ids(runner, input_ids)
-            tensors_to_gather = [hidden_states]
-            if router_input_ids is not None:
-                tensors_to_gather.append(router_input_ids)
-
-            gathered_tensors = dist_group.all_gatherv(
-                tensors_to_gather,
-                dim=0,
-                sizes=sizes,
-            )
-            hidden_states = gathered_tensors[0]
-            if router_input_ids is not None:
-                router_input_ids = gathered_tensors[1]
-            if runner.gate is not None:
-                router_logits, _ = runner.gate(hidden_states)
-            else:
-                router_logits, _ = self.gate(hidden_states)
-            with _gathered_router_padding(ctx, dist_group, sizes):
-                topk_weights, topk_ids = runner.router.select_experts(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits,
-                    topk_indices_dtype=quant_method.topk_indices_dtype,
-                    input_ids=router_input_ids,
-                )
             shared_output = None
-            apply_fused_moe = (
-                getattr(quant_method, "apply_fused_moe", None)
-                if _USE_FUSED_MOE
-                else None
-            )
-            if apply_fused_moe is None:
-                fused_output = runner.routed_experts.forward_modular(
-                    x=hidden_states,
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids,
-                    shared_experts=None,
-                    shared_experts_input=None,
+
+            if os.environ.get("VLLM_ILU_V41_PACKED_FP8_DISPATCH", "0") == "1":
+                from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fp8_packed_dispatch import (
+                    maybe_packed_experts,
                 )
+                packed_output = maybe_packed_experts(
+                    self, hidden_states, input_ids, ctx, dist_group, sizes
+                )
+                if packed_output is not None:
+                    fused_output = packed_output
+                    router_input_ids = self._router_input_ids(runner, input_ids)
+                    hidden_states = None
+                else:
+                    fused_output = None
             else:
-                fused_output = apply_fused_moe(
-                    layer=runner.routed_experts,
-                    x=hidden_states,
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids,
+                fused_output = None
+
+            if fused_output is not None:
+                pass
+            else:
+
+                router_input_ids = self._router_input_ids(runner, input_ids)
+                tensors_to_gather = [hidden_states]
+                if router_input_ids is not None:
+                    tensors_to_gather.append(router_input_ids)
+
+                gathered_tensors = dist_group.all_gatherv(
+                    tensors_to_gather,
+                    dim=0,
+                    sizes=sizes,
                 )
+                hidden_states = gathered_tensors[0]
+                if router_input_ids is not None:
+                    router_input_ids = gathered_tensors[1]
+                if runner.gate is not None:
+                    router_logits, _ = runner.gate(hidden_states)
+                else:
+                    router_logits, _ = self.gate(hidden_states)
+                with _gathered_router_padding(ctx, dist_group, sizes):
+                    topk_weights, topk_ids = runner.router.select_experts(
+                        hidden_states=hidden_states,
+                        router_logits=router_logits,
+                        topk_indices_dtype=quant_method.topk_indices_dtype,
+                        input_ids=router_input_ids,
+                    )
+                shared_output = None
+                apply_fused_moe = (
+                    getattr(quant_method, "apply_fused_moe", None)
+                    if _USE_FUSED_MOE
+                    else None
+                )
+                if apply_fused_moe is None:
+                    fused_output = runner.routed_experts.forward_modular(
+                        x=hidden_states,
+                        topk_weights=topk_weights,
+                        topk_ids=topk_ids,
+                        shared_experts=None,
+                        shared_experts_input=None,
+                    )
+                else:
+                    fused_output = apply_fused_moe(
+                        layer=runner.routed_experts,
+                        x=hidden_states,
+                        topk_weights=topk_weights,
+                        topk_ids=topk_ids,
+                    )
             if shared_experts is not None:
                 assert shared_experts_input is not None
                 shared_layer_input = (

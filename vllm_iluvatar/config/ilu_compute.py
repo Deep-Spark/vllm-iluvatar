@@ -9,14 +9,14 @@ def compute_options(section: str) -> dict:
     raw = (config.additional_config or {}).get("ilu_compute", {})
     if not isinstance(raw, dict):
         raise ValueError("ilu_compute must be an object")
-    if set(raw) - {"schema_version", "linear"}:
+    if set(raw) - {"schema_version", "linear", "moe"}:
         raise ValueError("Unknown ilu_compute field")
     if (
         type(raw.get("schema_version", 1)) is not int
         or raw.get("schema_version", 1) != 1
     ):
         raise ValueError("ilu_compute.schema_version must be 1")
-    allowed = {"linear": {"fp8_backend"}}
+    allowed = {"linear": {"fp8_backend"}, "moe": {"mode"}}
     for key, fields in allowed.items():
         value = raw.get(key, {})
         if not isinstance(value, dict) or set(value) - fields:

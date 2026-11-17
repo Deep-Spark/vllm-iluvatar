@@ -451,14 +451,15 @@ class IluDeepseekV4Fp8MoE(nn.Module, IluFusedMoEEP):
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=eplb_config.num_redundant_experts,
         )
-        # Converted W4A8 uses Hybrid EP on every DP + EP step. Any other
+        # W4A8 uses Hybrid EP on every DP + EP step, including independent
+        # original-weight compute methods declaring this capability. Any other
         # method with ``select_gemm_impl`` (native MXFP4) stays on the
         # community runner unless the decode override is deepep_low_latency.
         method = self.experts._quant_method
         method = getattr(method, "old_quant_method", method)
         self._use_ilu_w4a8_ep = isinstance(
             method, IluCompressedTensorsW4A8Int8MoEMethod
-        )
+        ) or getattr(method, "ilu_prefer_hybrid_ep", False)
         # The 0.31 runner owns prefill. Opt decode into LL only.
         self._ilu_decode_ll = (
             not self._use_ilu_w4a8_ep

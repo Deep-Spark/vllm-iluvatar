@@ -1,0 +1,67 @@
+%%{init: {"theme":"base","fontFamily":"Arial, PingFang SC, sans-serif","fontSize":16,"flowchart":{"htmlLabels":true,"wrappingWidth":400,"nodeSpacing":30,"rankSpacing":35,"padding":12}}}%%
+flowchart TB
+    subgraph V["vLLM 接口"]
+        C["量化 Config 扩展点<br/>register_quantization_config"]
+        M["Mxfp4MoEMethod"]
+        PF["Router / Prepare / Finalize<br/>跨 rank Dispatch / Combine"]
+    end
+
+    subgraph O["Iluvatar OOT 接入"]
+        CM["通用 FP8 / DeepSeek Config<br/>共享 select_mxfp4_method"]
+        S["选择计算 backend 与权重格式<br/>根据架构、配置及支持条件"]
+        IM["IluMxfp4MoEMethod<br/>管理加载与计算绑定"]
+    end
+
+    C --> CM
+    M -->|"继承适配"| IM
+    CM -->|"MXFP4 专家"| S
+    S --> IM
+
+    subgraph LOAD["MXFP4 加载与运行权重生命周期"]
+        ALLOC["创建权重参数<br/>按目标 WeightSpec 分配最终存储"]
+        LOADER["公共会话复用原模型映射<br/>完整配对后逐对读取<br/>固定上传槽 + TP/EP 处理"]
+        CONVERT["权重格式转换<br/>通过 IxFormer 写入目标权重与 scale"]
+        FINAL["会话关闭后进入量化 finalize<br/>校验完整性、scale 与格式"]
+        BIND["绑定运行权重与计算 backend<br/>MoEWeights + MoEComputeBackend"]
+    end
+
+    IM --> ALLOC
+    ALLOC --> LOADER
+    LOADER --> CONVERT
+    CONVERT --> FINAL
+    FINAL --> BIND
+
+    subgraph ADAPT["框架调用与通信适配"]
+        DIRECT["Method.apply<br/>普通执行入口"]
+        STD["Standard Experts adapter<br/>backend 完成 TopK 加权归约<br/>Finalize 使用 NoOP"]
+        BAT["Batched Experts adapter<br/>backend 输出未加权 expert 结果<br/>Combine 负责 TopK"]
+        EXEC["统一 backend 执行接口<br/>run_standard / run_batched<br/>直接写入调用方 output"]
+    end
+
+    BIND --> DIRECT
+    BIND --> STD
+    BIND --> BAT
+    PF -->|"Standard 协议"| STD
+    PF -->|"Batched 协议"| BAT
+    DIRECT --> EXEC
+    STD --> EXEC
+    BAT --> EXEC
+
+    subgraph B["计算 backend 与架构"]
+        BI["IxInfer W4A8 · 150<br/>NN：默认<br/>TN：可选"]
+        BF["IxMM FP4FP8 · 300<br/>默认<br/>FP4 权重 + FP8 激活"]
+        BW["IxMM W4A8 · 300<br/>NN：可选<br/>INT4 权重 + INT8 激活"]
+    end
+
+    EXEC --> BI
+    EXEC --> BF
+    EXEC --> BW
+
+    classDef upstream fill:#eef4ff,stroke:#6485b5,color:#172b4d
+    classDef plugin fill:#eef8f2,stroke:#619879,color:#173d2a
+    classDef backend fill:#fff5e8,stroke:#bb9156,color:#51391b
+
+    class C,M,PF upstream
+    class CM,S,IM,ALLOC,LOADER,CONVERT,FINAL,BIND plugin
+    class DIRECT,STD,BAT,EXEC plugin
+    class BI,BF,BW backend

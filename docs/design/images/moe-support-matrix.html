@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MoE 计算与通信支持矩阵</title>
+  <style>
+    body { margin: 0; background: #fff; color: #253247; font: 15px/1.5 Arial, "PingFang SC", sans-serif; }
+    main { padding: 20px; }
+    .table-container { overflow-x: auto; }
+    table { width: 100%; min-width: 940px; border-collapse: collapse; }
+    th, td { padding: 15px 14px; border: 1px solid #d6dce5; text-align: center; vertical-align: middle; }
+    thead th { background: #f1f4f8; font-weight: 600; }
+    tbody th { font-weight: 600; }
+    code { font: 13px/1.6 "SFMono-Regular", Consolas, monospace; }
+    .mode { display: block; margin-top: 5px; color: #536174; }
+    .status { font-size: 23px; font-weight: 600; }
+    .yes { color: #16803c; }
+    .no { color: #c72e36; }
+    .unknown { color: #737d8a; }
+    .legend { display: flex; justify-content: center; gap: 28px; margin-top: 14px; font-size: 13px; }
+    .legend .status { font-size: 18px; vertical-align: middle; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="table-container">
+      <table aria-label="MoE 计算与通信支持矩阵">
+        <thead>
+          <tr>
+            <th scope="col">架构</th>
+            <th scope="col">MoE Method</th>
+            <th scope="col">计算 backend / 配置 mode</th>
+            <th scope="col">通信方式</th>
+            <th scope="col">支持</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th rowspan="4" scope="rowgroup">ivcore11</th>
+            <td rowspan="8"><code>IluMxfp4MoEMethod</code></td>
+            <td rowspan="2">IxInfer W4A8 / NN（默认）<code class="mode">ixinfer_w4a8_nn_v2</code></td>
+            <td>AG/RS</td>
+            <td><span class="status yes" aria-label="支持">✓</span></td>
+          </tr>
+          <tr>
+            <td>Hybrid LL / NVSM</td>
+            <td><span class="status yes" aria-label="支持">✓</span></td>
+          </tr>
+          <tr>
+            <td rowspan="2">IxInfer W4A8 / TN<code class="mode">ixinfer_w4a8_tn_v2</code></td>
+            <td>AG/RS</td>
+            <td><span class="status yes" aria-label="支持">✓</span></td>
+          </tr>
+          <tr>
+            <td>Hybrid LL / NVSM</td>
+            <td><span class="status yes" aria-label="支持">✓</span></td>
+          </tr>
+          <tr>
+            <th rowspan="4" scope="rowgroup">ivcore30</th>
+            <td rowspan="2">IxMM FP4FP8（默认）<code class="mode">ixmm_fp4fp8</code></td>
+            <td>AG/RS</td>
+            <td><span class="status yes" aria-label="支持">✓</span></td>
+          </tr>
+          <tr>
+            <td>Hybrid LL / NVSM</td>
+            <td><span class="status unknown" aria-label="未验证">—</span></td>
+          </tr>
+          <tr>
+            <td rowspan="2">IxMM W4A8 / NN<code class="mode">ixmm_w4a8_nn</code></td>
+            <td>AG/RS</td>
+            <td><span class="status yes" aria-label="支持">✓</span></td>
+          </tr>
+          <tr>
+            <td>Hybrid LL / NVSM</td>
+            <td><span class="status unknown" aria-label="未验证">—</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="legend" aria-label="符号说明">
+      <span><span class="status yes">✓</span> 支持</span>
+      <span><span class="status no">✗</span> 不支持</span>
+      <span><span class="status unknown">—</span> 未验证</span>
+    </div>
+  </main>
+</body>
+</html>

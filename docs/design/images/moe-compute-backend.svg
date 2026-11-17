@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 968.7499999999999 897.2" width="968.7499999999999" height="897.2">
+<rect width="100%" height="100%" fill="white"/>
+
+<defs>
+  <marker id="arrowhead" markerWidth="8" markerHeight="5" refX="7" refY="2.5" orient="auto">
+    <polygon points="0 0, 8 2.5, 0 5" fill="#64748b" stroke="#64748b" stroke-width="0.75" stroke-linejoin="round" />
+  </marker>
+  <marker id="arrowhead-start" markerWidth="8" markerHeight="5" refX="1" refY="2.5" orient="auto-start-reverse">
+    <polygon points="8 0, 0 2.5, 8 5" fill="#64748b" stroke="#64748b" stroke-width="0.75" stroke-linejoin="round" />
+  </marker>
+</defs>
+<g class="subgraph" data-id="BASE" data-label="ilu_compute_backend.py：公共设计">
+  <rect x="32" y="199.2" width="904.7499999999999" height="164.5" rx="0" ry="0" fill="#ffffff" stroke="#94a3b8" stroke-width="1" />
+  <rect x="32" y="199.2" width="904.7499999999999" height="28" rx="0" ry="0" fill="#f3f5f8" stroke="#94a3b8" stroke-width="1" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="44" y="213.2" font-size="12" font-weight="600" fill="#52657a" dy="4.199999999999999">ilu_compute_backend.py：公共设计</text>
+</g>
+<g class="subgraph" data-id="IMPL" data-label="ilu_ixmm_fp4fp8.py：具体实现">
+  <rect x="263.78249999999997" y="500" width="407.84" height="270.3" rx="0" ry="0" fill="#ffffff" stroke="#94a3b8" stroke-width="1" />
+  <rect x="263.78249999999997" y="500" width="407.84" height="28" rx="0" ry="0" fill="#f3f5f8" stroke="#94a3b8" stroke-width="1" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="275.78249999999997" y="514" font-size="12" font-weight="600" fill="#52657a" dy="4.199999999999999">ilu_ixmm_fp4fp8.py：具体实现</text>
+</g>
+<polyline class="edge" data-from="C" data-to="R" data-style="solid" data-arrow-start="false" data-arrow-end="true" data-label="选择并创建" points="773.4344999999998,68.9 773.4344999999998,260.1" fill="none" stroke="#64748b" stroke-width="1" marker-end="url(#arrowhead)" />
+<polyline class="edge" data-from="R" data-to="D" data-style="solid" data-arrow-start="false" data-arrow-end="true" data-label="返回具体 backend 实例" points="773.4344999999998,330.8 773.4344999999998,409.7 681.7959999999999,409.7 681.7959999999999,482 513.2022499999999,482 513.2022499999999,544" fill="none" stroke="#64748b" stroke-width="1" marker-end="url(#arrowhead)" />
+<polyline class="edge" data-from="I" data-to="D" data-style="solid" data-arrow-start="false" data-arrow-end="true" data-label="继承并实现接口" points="167.528,330.8 167.52800000000002,409.7 253.65275,409.7 253.65275,482 399.97274999999996,482 399.97274999999996,544" fill="none" stroke="#64748b" stroke-width="1" marker-end="url(#arrowhead)" />
+<polyline class="edge" data-from="W" data-to="D" data-style="solid" data-arrow-start="false" data-arrow-end="true" data-label="约束输入与运行状态" points="456.5874999999999,364.6 456.5875,544" fill="none" stroke="#64748b" stroke-width="1" marker-end="url(#arrowhead)" />
+<polyline class="edge" data-from="S" data-to="X" data-style="solid" data-arrow-start="false" data-arrow-end="true" points="352.62749999999994,754.3000000000001 352.62749999999994,791.3000000000001 426.489875,791.3000000000001 426.489875,828.3000000000001" fill="none" stroke="#64748b" stroke-width="1" marker-end="url(#arrowhead)" />
+<polyline class="edge" data-from="B" data-to="X" data-style="solid" data-arrow-start="false" data-arrow-end="true" points="560.5474999999999,754.3000000000001 560.5474999999999,791.3000000000001 426.489875,791.3000000000001 426.489875,828.3000000000001" fill="none" stroke="#64748b" stroke-width="1" marker-end="url(#arrowhead)" />
+<polyline class="edge" data-from="D" data-to="S" data-style="solid" data-arrow-start="false" data-arrow-end="true" points="456.5875,614.7 456.5875,640.7 352.62749999999994,640.7 352.62749999999994,666.7" fill="none" stroke="#64748b" stroke-width="1" marker-end="url(#arrowhead)" />
+<polyline class="edge" data-from="D" data-to="B" data-style="solid" data-arrow-start="false" data-arrow-end="true" points="456.5875,614.7 456.5875,640.7 560.5474999999999,640.7 560.5474999999999,666.7" fill="none" stroke="#64748b" stroke-width="1" marker-end="url(#arrowhead)" />
+<g class="edge-label" data-from="C" data-to="R" data-label="选择并创建">
+  <rect x="734.4344999999998" y="115.9" width="77.05000000000001" height="30.3" rx="2" ry="2" fill="#ffffff" stroke="#dce1e8" stroke-width="1" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="772.9594999999998" y="131.05" text-anchor="middle" font-size="11" font-weight="400" fill="#52657a" dy="3.8499999999999996">选择并创建</text>
+</g>
+<g class="edge-label" data-from="R" data-to="D" data-label="返回具体 backend 实例">
+  <rect x="614.2959999999999" y="416.7" width="134.074" height="30.3" rx="2" ry="2" fill="#ffffff" stroke="#dce1e8" stroke-width="1" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="681.333" y="431.84999999999997" text-anchor="middle" font-size="11" font-weight="400" fill="#52657a" dy="3.8499999999999996">返回具体 backend 实例</text>
+</g>
+<g class="edge-label" data-from="I" data-to="D" data-label="继承并实现接口">
+  <rect x="203.15275" y="416.7" width="100.81000000000002" height="30.3" rx="2" ry="2" fill="#ffffff" stroke="#dce1e8" stroke-width="1" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="253.55775" y="431.84999999999997" text-anchor="middle" font-size="11" font-weight="400" fill="#52657a" dy="3.8499999999999996">继承并实现接口</text>
+</g>
+<g class="edge-label" data-from="W" data-to="D" data-label="约束输入与运行状态">
+  <rect x="394.0875" y="416.7" width="124.57000000000001" height="30.3" rx="2" ry="2" fill="#ffffff" stroke="#dce1e8" stroke-width="1" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="456.3725" y="431.84999999999997" text-anchor="middle" font-size="11" font-weight="400" fill="#52657a" dy="3.8499999999999996">约束输入与运行状态</text>
+</g>
+<g class="node" data-id="C" data-label="MoE Method / Experts adapter" data-shape="rectangle">
+  <rect x="663.9099999999999" y="32" width="219.04899999999998" height="36.900000000000006" rx="0" ry="0" fill="#eef4ff" stroke="#6485b5" stroke-width="0.75" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="773.4344999999998" y="50.45" text-anchor="middle" font-size="13" font-weight="500" fill="#172b4d" dy="4.55">MoE Method / Experts adapter</text>
+</g>
+<g class="node" data-id="X" data-label="IxFormer 算子接口" data-shape="rectangle">
+  <rect x="347.346375" y="828.3000000000001" width="158.28699999999998" height="36.900000000000006" rx="0" ry="0" fill="#fff5e8" stroke="#bb9156" stroke-width="0.75" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="426.489875" y="846.7500000000001" text-anchor="middle" font-size="13" font-weight="500" fill="#51391b" dy="4.55">IxFormer 算子接口</text>
+</g>
+<g class="node" data-id="R" data-label="注册、选择与创建 backend
+register_moe_backend
+select_moe_backend / make_moe_compute" data-shape="rectangle">
+  <rect x="626.1189999999999" y="260.1" width="294.631" height="70.7" rx="0" ry="0" fill="#eef4ff" stroke="#6485b5" stroke-width="0.75" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="773.4344999999998" y="295.45000000000005" text-anchor="middle" font-size="13" font-weight="500" fill="#172b4d"><tspan x="773.4344999999998" dy="-12.350000000000001">注册、选择与创建 backend</tspan><tspan x="773.4344999999998" dy="16.900000000000002">register_moe_backend</tspan><tspan x="773.4344999999998" dy="16.900000000000002">select_moe_backend / make_moe_compute</tspan></text>
+</g>
+<g class="node" data-id="W" data-label="统一数据契约
+WeightSpec：权重格式
+Weights：运行权重引用
+Config：层配置
+Workspace：调用期间的临时空间" data-shape="rectangle">
+  <rect x="327.0559999999999" y="260.1" width="259.063" height="104.50000000000001" rx="0" ry="0" fill="#eef4ff" stroke="#6485b5" stroke-width="0.75" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="456.5874999999999" y="312.35" text-anchor="middle" font-size="13" font-weight="500" fill="#172b4d"><tspan x="456.5874999999999" dy="-29.250000000000004">统一数据契约</tspan><tspan x="456.5874999999999" dy="16.900000000000002">WeightSpec：权重格式</tspan><tspan x="456.5874999999999" dy="16.900000000000002">Weights：运行权重引用</tspan><tspan x="456.5874999999999" dy="16.900000000000002">Config：层配置</tspan><tspan x="456.5874999999999" dy="16.900000000000002">Workspace：调用期间的临时空间</tspan></text>
+</g>
+<g class="node" data-id="I" data-label="MoEComputeBackend 基类
+公共检查与辅助方法
+定义 run_standard / run_batched" data-shape="rectangle">
+  <rect x="48" y="260.1" width="239.05599999999998" height="70.7" rx="0" ry="0" fill="#eef4ff" stroke="#6485b5" stroke-width="0.75" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="167.528" y="295.45000000000005" text-anchor="middle" font-size="13" font-weight="500" fill="#172b4d"><tspan x="167.528" dy="-12.350000000000001">MoEComputeBackend 基类</tspan><tspan x="167.528" dy="16.900000000000002">公共检查与辅助方法</tspan><tspan x="167.528" dy="16.900000000000002">定义 run_standard / run_batched</tspan></text>
+</g>
+<g class="node" data-id="D" data-label="IxMMFP4FP8Backend
+继承基类并注册
+声明 300 / FP4 权重 / FP8 激活" data-shape="rectangle">
+  <rect x="343.35799999999995" y="544" width="226.459" height="70.7" rx="0" ry="0" fill="#eef8f2" stroke="#619879" stroke-width="0.75" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="456.5875" y="579.35" text-anchor="middle" font-size="13" font-weight="500" fill="#173d2a"><tspan x="456.5875" dy="-12.350000000000001">IxMMFP4FP8Backend</tspan><tspan x="456.5875" dy="16.900000000000002">继承基类并注册</tspan><tspan x="456.5875" dy="16.900000000000002">声明 300 / FP4 权重 / FP8 激活</tspan></text>
+</g>
+<g class="node" data-id="S" data-label="run_standard
+重排与量化输入
+W13 → 激活 → W2
+TopK 加权归约" data-shape="rectangle">
+  <rect x="279.78249999999997" y="666.7" width="145.69" height="87.60000000000001" rx="0" ry="0" fill="#eef8f2" stroke="#619879" stroke-width="0.75" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="352.62749999999994" y="710.5" text-anchor="middle" font-size="13" font-weight="500" fill="#173d2a"><tspan x="352.62749999999994" dy="-20.8">run_standard</tspan><tspan x="352.62749999999994" dy="16.900000000000002">重排与量化输入</tspan><tspan x="352.62749999999994" dy="16.900000000000002">W13 → 激活 → W2</tspan><tspan x="352.62749999999994" dy="16.900000000000002">TopK 加权归约</tspan></text>
+</g>
+<g class="node" data-id="B" data-label="run_batched
+接收按专家分组的输入
+W13 → 激活 → W2
+输出未加权结果" data-shape="rectangle">
+  <rect x="465.47249999999997" y="666.7" width="190.14999999999998" height="87.60000000000001" rx="0" ry="0" fill="#eef8f2" stroke="#619879" stroke-width="0.75" />
+  <text font-family="PingFang SC, Arial, sans-serif" x="560.5474999999999" y="710.5" text-anchor="middle" font-size="13" font-weight="500" fill="#173d2a"><tspan x="560.5474999999999" dy="-20.8">run_batched</tspan><tspan x="560.5474999999999" dy="16.900000000000002">接收按专家分组的输入</tspan><tspan x="560.5474999999999" dy="16.900000000000002">W13 → 激活 → W2</tspan><tspan x="560.5474999999999" dy="16.900000000000002">输出未加权结果</tspan></text>
+</g>
+</svg>

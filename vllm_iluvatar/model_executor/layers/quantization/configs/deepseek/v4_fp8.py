@@ -100,5 +100,9 @@ class IluDeepseekV4FP8Config(DeepseekV4FP8Config):
                     layer=layer,
                     prefix=prefix,
                 )
-                return runtime if runtime is not None else original
+                from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp4_moe import (
+                    select_mxfp4_method,
+                )
+
+                return select_mxfp4_method(layer, original, runtime)
         return super().get_quant_method(layer, prefix)

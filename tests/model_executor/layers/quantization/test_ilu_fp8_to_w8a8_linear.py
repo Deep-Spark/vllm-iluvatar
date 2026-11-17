@@ -30,10 +30,11 @@ from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linea
     quantize_native_to_w8a8_int8,
 )
 
-# The W8A8 scheme resolves ixformer kernels for the local arch at __init__.
+# The W8A8 scheme resolves ixformer kernels for the local arch at __init__, and
+# additional_config.ilu_quant is supported on ivcore30 only.
 _requires_device = pytest.mark.skipif(
-    not (arch.is_ivcore30() or arch.is_ivcore11()),
-    reason="constructing the W8A8 scheme requires an Iluvatar device",
+    not arch.is_ivcore30(),
+    reason="runtime W8A8 dispatch requires an ivcore30 device",
 )
 
 EXAMPLES = (

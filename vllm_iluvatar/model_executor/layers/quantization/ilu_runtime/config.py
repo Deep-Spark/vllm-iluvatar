@@ -23,6 +23,9 @@ from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
 )
 
+from vllm_iluvatar.model_executor.layers.quantization.capabilities import (
+    require_ivcore30,
+)
 from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.registry import (
     IluvatarQuantRegistry,
 )
@@ -683,6 +686,8 @@ def _get_cached_config(
     resolved = parse_ilu_runtime_quant_config(
         raw, model_type=model_type, quant_method=quant_method
     )
+    if resolved.enabled:
+        require_ivcore30("additional_config.ilu_quant")
     setattr(base_quant_config, _CACHE_ATTR, resolved)
     return resolved
 

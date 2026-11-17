@@ -13,6 +13,7 @@ Qwen3.8-27B。
 | 项目 | 说明 |
 | --- | --- |
 | **适用对象** | 磁盘权重尚未完全量化、需要在加载时转换成 Iluvatar kernel 布局的模型 |
+| **硬件要求** | 仅支持 ivcore30。`ilu_quant.enabled: true` 时在其他架构上启动直接报错 |
 | **改动范围** | `vllm-iluvatar` 插件仓库。配置放在 vLLM `additional-config`，不写回模型 `config.json` |
 | **参考实现** | `IluFp8PerChannelOnlineLinearMethod`；示例对齐 [Qwen/Qwen3.8-Flash-Next](https://modelscope.cn/models/Qwen/Qwen3.8-Flash-Next) 与 [Qwen/Qwen3.8-27B](https://modelscope.cn/models/Qwen/Qwen3.8-27B) |
 
@@ -835,6 +836,9 @@ loader 按 128 的倍数拼接。GLM-5.2 的 `q_lora_rank=2048`、`intermediate_
 
 ## 9. 故障定位
 
+- `additional_config.ilu_quant requires ivcore30`：在 ivcore11 或无法识别架构
+  的环境上启用了运行时量化。换 ivcore30 设备，或去掉 `ilu_quant` / 设
+  `enabled: false`。
 - `does not apply to model_type/quant_method`：配置用于了错误模型或基础量化类型。
 - `multiple ilu_quant groups`：多个命中 group 的最高 priority 相同。
 - `requires original disposition ignored`：target 命中了原本已经量化的层，可能

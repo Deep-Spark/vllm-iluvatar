@@ -14,13 +14,16 @@ from vllm_iluvatar.ilu_util import arch
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_routed_experts import (
     IluRoutedExperts,
 )
-from vllm_iluvatar.model_executor.layers.quantization.fp8 import (
-    IluFp8Config,
+from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.fp8_moe import (
     IluFp8MoEMethod,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8_to_w4a8_moe import (
-    IluFp8ToW4A8NNMoEMethod,
+from vllm_iluvatar.model_executor.layers.quantization.configs.fp8 import IluFp8Config
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.moe.fp8_to_w4a8_nn import (
+    IluFp8ToW4A8NNOnlineMoEMethod,
     quantize_fp8_to_w4a8_nn,
+)
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.registry import (
+    IluvatarQuantRegistry,
 )
 
 # IluW4A8NNMoEMethod 自带 require_ivcore30_nn() 硬校验；只有真正构造
@@ -69,7 +72,7 @@ def runtime_payload():
                 },
                 "output_activations": None,
                 "iluvatar": {
-                    "method": "IluFp8ToW4A8NNMoEMethod",
+                    "method": "IluFp8ToW4A8NNOnlineMoEMethod",
                     "max_pending_shards": 8,
                 },
             }
@@ -131,12 +134,19 @@ def select(tp=1, rank=0, config_mutation=None, intermediate=2048):
 @_requires_ivcore30
 def test_dispatch():
     _, method = select()
-    assert isinstance(method, IluFp8ToW4A8NNMoEMethod)
+    assert isinstance(method, IluFp8ToW4A8NNOnlineMoEMethod)
     assert method.gemm_format == "NN"
     assert not hasattr(method, "version")
     _, original = select(config_mutation=lambda c: c.update(enabled=False))
     assert isinstance(original, IluFp8MoEMethod)
-    assert not isinstance(original, IluFp8ToW4A8NNMoEMethod)
+    assert not isinstance(original, IluFp8ToW4A8NNOnlineMoEMethod)
+
+
+def test_canonical_class_and_config_name():
+    assert (
+        IluvatarQuantRegistry.get_method("IluFp8ToW4A8NNOnlineMoEMethod")
+        is IluFp8ToW4A8NNOnlineMoEMethod
+    )
 
 
 @_requires_ivcore30
@@ -147,7 +157,7 @@ def test_runtime_target_can_omit_pack_version():
         ]
 
     _, method = select(config_mutation=mutate)
-    assert isinstance(method, IluFp8ToW4A8NNMoEMethod)
+    assert isinstance(method, IluFp8ToW4A8NNOnlineMoEMethod)
     assert not hasattr(method, "version")
 
 
@@ -438,7 +448,9 @@ def test_invalid_dtype_and_pending():
 def test_static_nn_load_matches_online(tp, rank, pack_version, monkeypatch):
     import ixformer.inference.functions as ops
 
-    from vllm_iluvatar.model_executor.layers.quantization import ilu_w4a8_nn as w4a8
+    from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.w4a8 import (
+        nn_moe as w4a8,
+    )
 
     online, method = select(tp, rank, intermediate=512)
     static = Layer(tp, rank, intermediate=512)

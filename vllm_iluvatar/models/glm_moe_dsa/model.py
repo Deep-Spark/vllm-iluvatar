@@ -274,7 +274,7 @@ class IluFp8ToGlmKVBProjW8A16Method(IluGlmKVBProjW8A16Method):
     def from_ilu_runtime_config(cls, context: Any) -> "IluFp8ToGlmKVBProjW8A16Method":
         from vllm.model_executor.layers.linear import LinearBase
 
-        from vllm_iluvatar.model_executor.layers.quantization.fp8 import (
+        from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp8.linear import (
             IluFp8LinearMethod,
         )
 
@@ -348,7 +348,7 @@ class IluFp8ToGlmKVBProjW8A16Method(IluGlmKVBProjW8A16Method):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         from vllm.model_executor.layers.quantization.utils import replace_parameter
 
-        from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8_to_w8a8_linear import (  # noqa: E501
+        from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear.fp8_to_w8a8 import (  # noqa: E501
             quantize_fp8_block_to_w8a8_int8,
         )
 

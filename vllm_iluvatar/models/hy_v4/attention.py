@@ -290,7 +290,9 @@ def indexer_fused_quant_config(quant_config, prefix):
     explicit runtime group quantize the fully assembled fused parameter. The
     shared target/draft quant config and their other dispatches stay unchanged.
     """
-    from vllm_iluvatar.model_executor.layers.quantization.fp8 import IluFp8Config
+    from vllm_iluvatar.model_executor.layers.quantization.configs.fp8 import (
+        IluFp8Config,
+    )
 
     if not isinstance(quant_config, IluFp8Config):
         return None

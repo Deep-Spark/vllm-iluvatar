@@ -60,7 +60,7 @@ additional-config:
           dynamic: true
         output_activations: null
         iluvatar:
-          method: IluFp8ToW4A8NNMoEMethod
+          method: IluFp8ToW4A8NNOnlineMoEMethod
           max_pending_shards: 8
       # Absorbed MLA up-proj: block-FP8 -> per-channel INT8, split into
       # W_UK/W_UV and Marlin-repacked. Activations stay BF16, hence W8A16 and
@@ -120,7 +120,7 @@ additional-config:
           dynamic: true
         output_activations: null
         iluvatar:
-          method: IluFp8ToW8A8Int8LinearMethod
+          method: IluFp8ToW8A8Int8OnlineLinearMethod
           gemm_format: TN
           mixed_strategy: CHANNEL
           gemm_mode: PERF

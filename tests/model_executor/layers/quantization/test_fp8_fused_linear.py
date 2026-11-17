@@ -5,15 +5,21 @@ import pytest
 import torch
 from conftest import requires_corex30
 
-from vllm_iluvatar.model_executor.layers.quantization import fp8 as ilu_fp8
+from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp8 import (
+    linear as fp8_linear,
+)
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear import (
+    native_to_fp8 as fp8_online,
+)
+
+
+def _impl(online):
+    return fp8_online if online else fp8_linear
 
 
 def _method(online):
-    cls = (
-        ilu_fp8.IluFp8PerChannelOnlineLinearMethod
-        if online
-        else ilu_fp8.IluFp8LinearMethod
-    )
+    impl = _impl(online)
+    cls = impl.IluFp8PerChannelOnlineLinearMethod if online else impl.IluFp8LinearMethod
     method = object.__new__(cls)
     method.gemm_format = "TN"
     method.block_quant = False
@@ -44,8 +50,9 @@ def test_fused_linear_uses_bf16_input_without_quant_workspace(monkeypatch, onlin
         .to(torch.bfloat16)
         .float()
     )
+    impl = _impl(online)
     monkeypatch.setattr(
-        ilu_fp8,
+        impl,
         "fp8_per_token_dynamic_scaled",
         lambda *a, **kw: pytest.fail("fused linear allocated a quantization workspace"),
     )
@@ -80,9 +87,10 @@ def test_unoptimized_bs_retains_separate_quantization(monkeypatch, online, m):
         calls.append("mm")
         out.fill_(7)
 
-    monkeypatch.setattr(ilu_fp8, "fp8_per_token_dynamic_scaled", quant)
-    monkeypatch.setattr(ilu_fp8.ixfops, "fp8_per_channel_gemv", gemv)
-    monkeypatch.setattr(ilu_fp8.ixfops, "fp8_per_channel_mm", mm)
+    impl = _impl(online)
+    monkeypatch.setattr(impl, "fp8_per_token_dynamic_scaled", quant)
+    monkeypatch.setattr(impl.ixfops, "fp8_per_channel_gemv", gemv)
+    monkeypatch.setattr(impl.ixfops, "fp8_per_channel_mm", mm)
     result = _method(online).apply(layer, x)
     assert calls == ["quant", "gemv" if m <= 16 else "mm"]
     assert result.dtype == x.dtype and result.shape == (m, 96)
@@ -104,7 +112,7 @@ def test_fused_linear_traces_as_a_full_graph(monkeypatch, online):
     layer.weight_scale = torch.ones(96, device="cuda") * 0.01
     x = torch.randn(3, 128, device="cuda", dtype=torch.bfloat16)
     monkeypatch.setattr(
-        ilu_fp8,
+        _impl(online),
         "fp8_per_token_dynamic_scaled",
         lambda *a, **kw: pytest.fail("compiled fusion used separate quantization"),
     )

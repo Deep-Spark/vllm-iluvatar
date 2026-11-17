@@ -28,7 +28,7 @@ def _install_fake_ixformer(monkeypatch) -> None:
 def _load_ilu_auto_awq(monkeypatch):
     _install_fake_ixformer(monkeypatch)
     return importlib.import_module(
-        "vllm_iluvatar.model_executor.layers.quantization.ilu_auto_awq"
+        "vllm_iluvatar.model_executor.layers.quantization.configs.awq"
     )
 
 

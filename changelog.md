@@ -41,6 +41,17 @@
 
 ### Changed
 
+- 量化模块按职责重新组织:`configs/`(checkpoint 配置)、`backends/`(执行
+  实现)、`ilu_runtime/`(runtime 配置驱动的加载期量化)、`conversions/`(格式转换)、`common/`。顶层
+  `ilu_*.py` 不再逐个自动发现,改由 `_registration.py` 按依赖顺序显式导入。
+  对外注册的量化方法名与行为不变。
+- **(不兼容)** 四个 online 量化方法改名,`additional_config` 中的
+  `iluvatar.method` 需同步更新:`IluFp8ToW4A8NNMoEMethod` →
+  `IluFp8ToW4A8NNOnlineMoEMethod`、`IluFp8ToW8A8Int8LinearMethod` →
+  `IluFp8ToW8A8Int8OnlineLinearMethod`、`IluMxfp4ToW4A8TNMoEMethod` →
+  `IluMxfp4ToW4A8TNOnlineMoEMethod`、`IluNativeToW8A8Int8LinearMethod` →
+  `IluNativeToW8A8Int8OnlineLinearMethod`。旧名字不再解析,沿用旧名的配置
+  会在启动时报错并列出当前已注册的方法名。
 - 面向开源:README 精简为公开版(logo/badge/License 小节);清理 guide 文档中的内部引用(私有数据路径改为 `/path/to/model`、移除内部 bitbucket commit 链接)。
 - GLM / DeepSeek-V4 MoE 构造改为社区 `FusedMoEFactory`（0.27 去掉 `FusedMoE` 导出）。
 - `IluMultiHeadLatentAttentionWrapper.__init__` 增加

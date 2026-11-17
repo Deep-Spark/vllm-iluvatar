@@ -14,16 +14,16 @@ import pytest
 import torch
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
-from vllm_iluvatar.model_executor.layers.quantization.fp8 import (
+from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.fp8_moe import (
     IluFp8MoEMethod,
     _ixmm_backend_available,
     preprocess_fp8_block_weight_for_ixmm,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8_to_fp4 import (
+from vllm_iluvatar.model_executor.layers.quantization.conversions.ivcore30.fp8_to_fp4 import (
     Fp8SourceLayout,
     convert_to_ix30_fp4,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8_to_fp4_moe import (
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.moe.fp8_to_fp4 import (
     IluFp8ToFp4OnlineMoEMethod,
 )
 
@@ -556,7 +556,7 @@ def _glm_payload():
 
 
 def _glm_group(**overrides):
-    from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime_quant_config import (  # noqa: E501
+    from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.config import (
         parse_ilu_runtime_quant_config,
     )
 

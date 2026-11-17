@@ -6,7 +6,9 @@ from types import SimpleNamespace
 import ixformer.inference.functions as ixf_ops
 import torch
 
-from vllm_iluvatar.model_executor.layers.quantization import ilu_w4a8_nn as w4a8_moe
+from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.w4a8 import (
+    nn_moe as w4a8_moe,
+)
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_utils import (
     W4A8GroupGemmInfo,
 )

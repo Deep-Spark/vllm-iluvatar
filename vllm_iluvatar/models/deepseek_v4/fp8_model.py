@@ -36,7 +36,7 @@ Quantization-config constraint
 ``IluDeepseekV4Fp8MoE`` builds a community ``FusedMoE``, and which MoE method
 its routed experts get is decided entirely by ``vllm_config.quant_config``.  It
 has to be ``IluDeepseekV4FP8Config``
-(``layers/quantization/ilu_deepseek_v4_fp8.py``, registered under the community
+(``layers/quantization/configs/deepseek/v4_fp8.py``, registered under the community
 name ``deepseek_v4_fp8``), which returns ``IluMxfp4MoEMethod``.  In production
 that is automatic: the checkpoint's ``quant_method="fp8"`` plus
 ``model_type="deepseek_v4"`` resolve to ``deepseek_v4_fp8``, and the plugin's

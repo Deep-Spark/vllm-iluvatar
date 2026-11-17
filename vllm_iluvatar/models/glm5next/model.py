@@ -63,7 +63,7 @@ from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
     IluFusedMoEEP,
 )
-from vllm_iluvatar.model_executor.layers.quantization.fp8 import IluFp8Config
+from vllm_iluvatar.model_executor.layers.quantization.configs.fp8 import IluFp8Config
 
 from . import mhc
 from .attention import IluGlm5NextMLAAttention, glm5next_topk_buffer_width

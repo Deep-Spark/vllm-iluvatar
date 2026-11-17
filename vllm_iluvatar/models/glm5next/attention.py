@@ -37,7 +37,7 @@ from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
 
 from vllm_iluvatar.ilu_util.arch import is_ivcore30
-from vllm_iluvatar.model_executor.layers.quantization.fp8 import IluFp8Config
+from vllm_iluvatar.model_executor.layers.quantization.configs.fp8 import IluFp8Config
 
 
 def resolve_glm5next_indexer_kv_dtype(

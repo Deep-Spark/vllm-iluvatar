@@ -44,7 +44,9 @@ from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
     IluFusedMoEEP,
     set_max_num_seqs,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8_input import IluFP8Input
+from vllm_iluvatar.model_executor.layers.quantization.common.fp8_input import (
+    IluFP8Input,
+)
 from vllm_iluvatar.model_executor.models.step3p5 import (
     IluStep3p5Attention,
     IluStep3p5MLP,
@@ -820,7 +822,7 @@ class Step5Model(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        from vllm_iluvatar.model_executor.layers.quantization.ilu_fp8_to_fp4_moe import (
+        from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.moe.fp8_to_fp4 import (
             IluFp8ToFp4OnlineMoEMethod,
         )
 

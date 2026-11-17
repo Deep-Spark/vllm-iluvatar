@@ -9,13 +9,18 @@ import torch
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 
-from vllm_iluvatar.model_executor.layers.quantization.ilu_deepseek_v4_fp8 import (
+from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp4.mxfp4_moe import (
+    IluMxfp4MoEMethod,
+)
+from vllm_iluvatar.model_executor.layers.quantization.configs.deepseek.v4_fp8 import (
     IluDeepseekV4FP8Config,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_mxfp4 import IluMxfp4MoEMethod
-from vllm_iluvatar.model_executor.layers.quantization.ilu_mxfp4_to_w4a8_moe import (
-    IluMxfp4ToW4A8TNMoEMethod,
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.moe.mxfp4_to_w4a8_tn import (
+    IluMxfp4ToW4A8TNOnlineMoEMethod,
     quantize_mxfp4_to_w4a8_tn,
+)
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.registry import (
+    IluvatarQuantRegistry,
 )
 
 
@@ -192,7 +197,7 @@ class Layer(torch.nn.Module):
 
 def method(tp=1, pending=8, ep=1):
     layer = Layer(tp, ep)
-    impl = IluMxfp4ToW4A8TNMoEMethod(layer, max_pending_shards=pending)
+    impl = IluMxfp4ToW4A8TNOnlineMoEMethod(layer, max_pending_shards=pending)
     with set_current_vllm_config(VllmConfig()):
         impl.create_weights(layer, 2, 256, 256, torch.bfloat16)
     return layer, impl
@@ -262,7 +267,7 @@ def test_ep_placement_rejected_before_allocating(invalid):
         layer.expert_map = None
     else:
         layer.enable_eplb = True
-    impl = IluMxfp4ToW4A8TNMoEMethod(layer)
+    impl = IluMxfp4ToW4A8TNOnlineMoEMethod(layer)
     with set_current_vllm_config(VllmConfig()), pytest.raises(ValueError):
         impl.create_weights(layer, 2, 256, 256, torch.bfloat16)
     assert not list(layer.parameters())
@@ -319,7 +324,7 @@ def runtime_payload():
                 },
                 "output_activations": None,
                 "iluvatar": {
-                    "method": "IluMxfp4ToW4A8TNMoEMethod",
+                    "method": "IluMxfp4ToW4A8TNOnlineMoEMethod",
                     "max_pending_shards": 8,
                 },
             }
@@ -347,11 +352,18 @@ def select(payload):
 
 
 def test_config_dispatch_and_disabled_preserves_mxfp4():
-    assert isinstance(select(runtime_payload()), IluMxfp4ToW4A8TNMoEMethod)
+    assert isinstance(select(runtime_payload()), IluMxfp4ToW4A8TNOnlineMoEMethod)
     assert isinstance(select(None), IluMxfp4MoEMethod)
     payload = runtime_payload()
     payload["enabled"] = False
     assert isinstance(select(payload), IluMxfp4MoEMethod)
+
+
+def test_canonical_class_and_config_name():
+    assert (
+        IluvatarQuantRegistry.get_method("IluMxfp4ToW4A8TNOnlineMoEMethod")
+        is IluMxfp4ToW4A8TNOnlineMoEMethod
+    )
 
 
 @pytest.mark.parametrize("invalid", ["symmetric", "typo", "layout", "stage", "pending"])

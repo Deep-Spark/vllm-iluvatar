@@ -13,15 +13,15 @@ from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMetho
 from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
-from vllm_iluvatar.model_executor.layers.quantization import fp8 as ilu_fp8
-from vllm_iluvatar.model_executor.layers.quantization.fp8 import (
+import vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear.native_to_fp8 as ilu_fp8
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.base_config import (
+    IluRuntimeQuantBaseConfig,
+)
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear.native_to_fp8 import (
     IluFp8PerChannelOnlineLinearMethod,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_fp16_to_fp4_moe import (
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.moe.fp16_to_fp4 import (
     IluFp16ToFp4OnlineMoEMethod,
-)
-from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime_quant_base import (
-    IluRuntimeQuantBaseConfig,
 )
 
 MODEL_TYPE = "qwen3_5_text"

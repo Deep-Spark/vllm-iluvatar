@@ -302,9 +302,11 @@ transform + weight_load
 | --- | --- | --- |
 | `IluFp8PerChannelOnlineLinearMethod` | `transform + process_weights_after_loading` | Linear |
 | `IluFp8ToFp4OnlineMoEMethod` | `transform + weight_load` | RoutedExperts |
-| `IluFp8ToW4A8NNMoEMethod` | `transform + weight_load`（FP8 → ixmm W4A8 NN） | RoutedExperts |
-| `IluFp8ToW8A8Int8LinearMethod` | `transform + process_weights_after_loading`（FP8 → per-channel INT8） | Linear |
-| `IluNativeToW8A8Int8LinearMethod` | `transform + process_weights_after_loading`（BF16 → per-channel INT8） | Linear |
+| `IluFp8ToW4A8NNOnlineMoEMethod` | `transform + weight_load`（FP8 → ixmm W4A8 NN） | RoutedExperts |
+| `IluFp16ToFp4OnlineMoEMethod` | `transform + weight_load`（native BF16 → ix30 FP4） | RoutedExperts |
+| `IluMxfp4ToW4A8TNOnlineMoEMethod` | `transform + weight_load`（MXFP4 → TN/v2 W4A8） | RoutedExperts |
+| `IluFp8ToW8A8Int8OnlineLinearMethod` | `transform + process_weights_after_loading`（FP8 → per-channel INT8） | Linear |
+| `IluNativeToW8A8Int8OnlineLinearMethod` | `transform + process_weights_after_loading`（BF16 → per-channel INT8） | Linear |
 | `IluFp8ToGlmKVBProjW8A16Method` | `transform + process_weights_after_loading`（FP8 → Marlin W8A16） | GLM-5.2 `kv_b_proj` |
 
 schema 对 `direct` 的支持不代表已有 method 实现了它。
@@ -751,10 +753,10 @@ RMSNorm 都退回 split 路径，MoE 入口也从 `moe_expand_input_kernel_vec4`
 
 | group | source → target | stage | method |
 | --- | --- | --- | --- |
-| routed experts | `fp8-block` → `int4-packed-nn` | `weight_load` | `IluFp8ToW4A8NNMoEMethod` |
-| dense / shared Linear | `fp8-block` → `int8-channel` | `process_weights_after_loading` | `IluFp8ToW8A8Int8LinearMethod` |
+| routed experts | `fp8-block` → `int4-packed-nn` | `weight_load` | `IluFp8ToW4A8NNOnlineMoEMethod` |
+| dense / shared Linear | `fp8-block` → `int8-channel` | `process_weights_after_loading` | `IluFp8ToW8A8Int8OnlineLinearMethod` |
 | `kv_b_proj` | `fp8-block` → `int8-channel-marlin` | `process_weights_after_loading` | `IluFp8ToGlmKVBProjW8A16Method` |
-| MTP `eh_proj` | `native` → `int8-channel` | `process_weights_after_loading` | `IluNativeToW8A8Int8LinearMethod` |
+| MTP `eh_proj` | `native` → `int8-channel` | `process_weights_after_loading` | `IluNativeToW8A8Int8OnlineLinearMethod` |
 
 只有 routed experts 需要 `weight_load`（§8.1 的显存理由）。dense Linear 的整层
 staging 只有单层大小，用 `weight_load` 只会换来重写 loader 的复杂度。
@@ -779,9 +781,9 @@ BF16，`fp8_model.dequant_indexer_wk` 已经在权重流里把它折叠成 BF16�
 
 #### 8.6.3 routed experts 的量化算法
 
-激活为动态 per-token INT8；`IluFp8ToW4A8NNMoEMethod` 继承
+激活为动态 per-token INT8；`IluFp8ToW4A8NNOnlineMoEMethod` 继承
 `IluW4A8NNMoEMethod` 的全部执行入口，仅覆盖 FP8 checkpoint 的创建和加载转换。
-`iluvatar` 只需指定 `method: IluFp8ToW4A8NNMoEMethod`，可选
+`iluvatar` 只需指定 `method: IluFp8ToW4A8NNOnlineMoEMethod`，可选
 `max_pending_shards`（默认 8）；不再指定 decode 后端或 graph 开关。
 
 量化与离线 per-channel 算法一致：先反量化 FP8，令
@@ -875,13 +877,15 @@ loader 按 128 的倍数拼接。GLM-5.2 的 `q_lora_rank=2048`、`intermediate_
 
 | 作用 | 文件 |
 | --- | --- |
-| runtime 配置解析与分发 | [`ilu_runtime_quant_config.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime_quant_config.py) |
-| 未量化 checkpoint 的基础 config | [`ilu_runtime_quant_base.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime_quant_base.py) |
-| method 注册表 | [`ilu_quant_registry.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_quant_registry.py) |
-| FP8 基础 config 与 online Linear method | [`fp8.py`](../../vllm_iluvatar/model_executor/layers/quantization/fp8.py) |
-| FP8 source layout 与 ix30 FP4 转换入口 | [`ilu_fp8_to_fp4.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_fp8_to_fp4.py) |
-| MoE 加载期 FP4 method | [`ilu_fp8_to_fp4_moe.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_fp8_to_fp4_moe.py) |
-| Linear 加载期 W8A8 INT8 method | [`ilu_fp8_to_w8a8_linear.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_fp8_to_w8a8_linear.py) |
+| runtime 配置解析与分发 | [`ilu_runtime/config.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime/config.py) |
+| 未量化 checkpoint 的基础 config | [`ilu_runtime/base_config.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime/base_config.py) |
+| method 注册表 | [`ilu_runtime/registry.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime/registry.py) |
+| FP8 基础 config | [`configs/fp8.py`](../../vllm_iluvatar/model_executor/layers/quantization/configs/fp8.py) |
+| Online FP8 Linear method | [`ilu_runtime/ivcore30/linear/native_to_fp8.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime/ivcore30/linear/native_to_fp8.py) |
+| FP8 source layout 与 ix30 FP4 转换入口 | [`conversions/ivcore30/fp8_to_fp4.py`](../../vllm_iluvatar/model_executor/layers/quantization/conversions/ivcore30/fp8_to_fp4.py) |
+| MoE 加载期 FP4 method | [`ilu_runtime/ivcore30/moe/fp8_to_fp4.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime/ivcore30/moe/fp8_to_fp4.py) |
+| FP8 Linear 加载期 W8A8 INT8 method | [`ilu_runtime/ivcore30/linear/fp8_to_w8a8.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime/ivcore30/linear/fp8_to_w8a8.py) |
+| Native Linear 加载期 W8A8 INT8 method | [`ilu_runtime/ivcore30/linear/native_to_w8a8.py`](../../vllm_iluvatar/model_executor/layers/quantization/ilu_runtime/ivcore30/linear/native_to_w8a8.py) |
 | GLM-5.2 `kv_b_proj` W8A16 method | [`glm_moe_dsa/model.py`](../../vllm_iluvatar/models/glm_moe_dsa/model.py) |
 | 转换算子（双 backend，在 ixformer） | `ixformer/inference/functions/fp4/gemm/fp8_block_preprocess.py` |
 | Qwen3.8-Flash-Next 示例 | [`examples/iluvatar-runtime-quant/Qwen/Qwen3.8-Flash-Next/`](../../examples/iluvatar-runtime-quant/Qwen/Qwen3.8-Flash-Next/) |

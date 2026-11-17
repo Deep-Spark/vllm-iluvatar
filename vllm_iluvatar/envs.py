@@ -328,7 +328,8 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
         in ("1", "true")
     ),
     # attn.wo_a grouped BMM backend: marlin | msd | w8a8. Read directly from
-    # os.environ in models/deepseek_v4/attention.py (module-level constant).
+    # os.environ in models/deepseek_v4/attention.py (module-level constant),
+    # and through this reader by IluV4W8A16BMMLinearMethod at weight loading.
     "VLLM_ILU_WO_A_QUANT": lambda: (
         os.environ.get("VLLM_ILU_WO_A_QUANT", "marlin").strip().lower()
     ),

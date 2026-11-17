@@ -288,7 +288,9 @@ class IluGlmMoeDsaFp8MLAAttention(IluGlmMoeDsaMLAAttention):
         offline one, including arming that fusion when a frozen KV scale table
         is supplied.
         """
-        from vllm_iluvatar.models.glm_moe_dsa.model import IluGlmKVBProjW8A16Method
+        from vllm_iluvatar.model_executor.layers.quantization.backends.grouped_bmm.glm_kv_b_proj import (
+            IluGlmKVBProjW8A16Method,
+        )
 
         if isinstance(
             getattr(self.kv_b_proj, "quant_method", None), IluGlmKVBProjW8A16Method

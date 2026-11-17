@@ -286,7 +286,9 @@ def test_native_eh_proj_dispatch():
 
 @_requires_device
 def test_kv_b_dispatch_is_the_w8a16_method():
-    from vllm_iluvatar.models.glm_moe_dsa.model import IluFp8ToGlmKVBProjW8A16Method
+    from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear.fp8_to_glm_kv_b_w8a16 import (
+        IluFp8ToGlmKVBProjW8A16Method,
+    )
 
     method = select_method("model.layers.3.self_attn.kv_b_proj")
     assert isinstance(method, IluFp8ToGlmKVBProjW8A16Method)

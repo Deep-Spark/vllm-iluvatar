@@ -1485,7 +1485,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         return None if rotary_emb is None else rotary_emb.cos_sin_cache
 
     def _configure_grouped_int8_output(self, dtype) -> None:
-        from vllm_iluvatar.models.deepseek_v4.model import (
+        from vllm_iluvatar.model_executor.layers.quantization.backends.grouped_bmm.deepseek_v4_wo_a import (
             IluV4W8A8BMMLinearMethod,
             IluV4W8A16BMMLinearMethod,
         )

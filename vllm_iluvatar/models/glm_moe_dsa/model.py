@@ -42,7 +42,7 @@ separate, so no re-conversion is needed and there is no runtime merge.
 
 from collections.abc import Callable, Iterable
 from itertools import islice
-from typing import Any, cast
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -59,7 +59,6 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
-    LinearMethodBase,
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
@@ -86,7 +85,6 @@ from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
     IluFusedMoEEP,
     set_max_num_seqs_from_config,
 )
-from vllm_iluvatar.model_executor.layers.quantization import IluvatarQuantRegistry
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes import (
     IluCompressedTensorsW8A8Int8,
 )
@@ -144,227 +142,6 @@ def _residual_rms_norm_with_quant(
             )
             _FUSE_NORM_QUANT_WARNED = True
         return None
-
-
-@IluvatarQuantRegistry.register_method
-class IluGlmKVBProjW8A16Method(LinearMethodBase):
-    """W8A16 grouped-BMM method for GLM-5.2 ``kv_b_proj``."""
-
-    def __init__(self, parent_config, ilu_params: dict[str, Any]) -> None:
-        self.parent_config = parent_config
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ) -> None:
-        from vllm.model_executor.parameter import (
-            ChannelQuantScaleParameter,
-            ModelWeightParameter,
-        )
-
-        out_total = sum(output_partition_sizes)
-        layer.logical_widths = output_partition_sizes
-        weight_loader = extra_weight_attrs.get("weight_loader")
-
-        weight = ModelWeightParameter(
-            data=torch.empty(out_total, input_size_per_partition, dtype=torch.int8),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight", weight)
-
-        weight_scale = ChannelQuantScaleParameter(
-            data=torch.empty((out_total, 1), dtype=torch.float32),
-            output_dim=0,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight_scale", weight_scale)
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Split ``kv_b_proj`` into W_UK/W_UV and Marlin-repack each."""
-        import ixformer.inference.functions as ixf_ops
-
-        geom = getattr(layer, "bmm_geom", None)
-        assert geom is not None, (
-            "IluGlmKVBProjW8A16Method requires layer.bmm_geom to be set by "
-            "the attention wrapper before process_weights_after_loading."
-        )
-        num_heads: int = geom.num_heads
-        nope: int = geom.qk_nope_head_dim
-        v: int = geom.v_head_dim
-        kv_lora: int = geom.kv_lora_rank
-
-        weight = layer.weight.data
-        weight_scale = layer.weight_scale.data
-
-        assert weight.shape == (num_heads * (nope + v), kv_lora), (
-            f"kv_b_proj weight shape {tuple(weight.shape)} does not match "
-            f"({num_heads} * ({nope} + {v}), {kv_lora}) implied by "
-            f"bmm_geom={geom!r}"
-        )
-        assert weight_scale.shape == (num_heads * (nope + v), 1), (
-            f"kv_b_proj weight_scale shape {tuple(weight_scale.shape)} != "
-            f"({num_heads * (nope + v)}, 1)"
-        )
-
-        w = weight.view(num_heads, nope + v, kv_lora)
-        s = weight_scale.view(num_heads, nope + v, 1)
-        w_uk, w_uv = w.split([nope, v], dim=1)
-        w_uk_s, w_uv_s = s.split([nope, v], dim=1)
-
-        layer.W_UK = ixf_ops.marlin_w8_weight_repack(
-            weights=w_uk.contiguous(),
-            weight_format="int8",
-            reformat="k16n16_grouped_n",
-        )
-        layer.W_UK_S = w_uk_s.contiguous()
-        layer.W_UV = ixf_ops.marlin_w8_weight_repack(
-            weights=w_uv.permute(0, 2, 1).contiguous(),
-            weight_format="int8",
-            reformat="k16n16",
-        )
-        layer.W_UV_S = w_uv_s.contiguous()
-
-        delattr(layer, "weight")
-        delattr(layer, "weight_scale")
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        raise NotImplementedError(
-            "IluGlmKVBProjW8A16Method.apply must not be called; kv_b_proj is "
-            "consumed by IluGlmMoeDsaSparseMLA via "
-            "marlin_w8a16(W_UK/W_UV, W_UK_S/W_UV_S)."
-        )
-
-
-@IluvatarQuantRegistry.register_method
-class IluFp8ToGlmKVBProjW8A16Method(IluGlmKVBProjW8A16Method):
-    """Load a block-FP8 ``kv_b_proj`` into the W8A16 grouped-marlin layout.
-
-    The official FP8 checkpoint has no ``mla_bmm_w8a16`` field to route
-    ``kv_b_proj`` here, so without this method it stays on
-    ``IluFp8LinearMethod`` and ``fp8_attention`` rebuilds the absorbed up-proj
-    as grouped FP8 einsums instead. Selecting this group restores the offline
-    checkpoint's kernel: the FP8 loader still fills ``weight`` /
-    ``weight_scale_inv``, then the block scale is folded into a per-channel INT8
-    weight and handed to the inherited split + Marlin repack.
-
-    Activations stay BF16 (W8A16), so the group carries no
-    ``input_activations``.
-    """
-
-    def __init__(self, context: Any) -> None:
-        self.context = context
-        self.parent_config = context.base_quant_config
-        self.original_method = context.original_method
-        self.block_shape = tuple(context.group.weights.source.extra["block_shape"])
-
-    @classmethod
-    def from_ilu_runtime_config(cls, context: Any) -> "IluFp8ToGlmKVBProjW8A16Method":
-        from vllm.model_executor.layers.linear import LinearBase
-
-        from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.fp8.linear import (
-            IluFp8LinearMethod,
-        )
-
-        group = context.group
-        weights = group.weights
-        source, target = weights.source, weights.target
-        where = group.group_id
-        if not isinstance(context.layer, LinearBase) or not isinstance(
-            context.original_method, IluFp8LinearMethod
-        ):
-            raise TypeError(f"{where}: W8A16 kv_b_proj requires a block-FP8 Linear")
-        if group.require.original_disposition != "quantized":
-            raise ValueError(f"{where}: W8A16 kv_b_proj requires quantized sources")
-        if (
-            weights.loading.mode != "transform"
-            or weights.loading.stage != "process_weights_after_loading"
-        ):
-            raise ValueError(
-                f"{where}: W8A16 kv_b_proj requires "
-                "loading=transform@process_weights_after_loading"
-            )
-        if (
-            source.format != "fp8-block"
-            or tuple(source.dtypes) != ("float8_e4m3fn",)
-            or set(source.extra) != {"block_shape"}
-            or tuple(source.extra["block_shape"]) != (128, 128)
-        ):
-            raise ValueError(f"{where}: expected a 128x128 block-FP8 source")
-        if tuple(context.base_quant_config.weight_block_size or ()) != (128, 128):
-            raise ValueError(
-                f"{where}: block_shape must match the checkpoint's weight_block_size"
-            )
-        if (
-            target.format != "int8-channel-marlin"
-            or target.dtype != "int8"
-            or target.strategy != "channel"
-            or set(target.extra)
-        ):
-            raise ValueError(f"{where}: unsupported W8A16 kv_b_proj weight target")
-        if group.input_activations is not None or group.output_activations is not None:
-            raise ValueError(
-                f"{where}: W8A16 keeps BF16 activations, so both activation "
-                "fields must be null"
-            )
-        if set(group.options):
-            raise ValueError(f"{where}: unsupported options: {sorted(group.options)}")
-        return cls(context)
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ) -> None:
-        self.original_method.create_weights(
-            layer,
-            input_size_per_partition,
-            output_partition_sizes,
-            input_size,
-            output_size,
-            params_dtype,
-            **extra_weight_attrs,
-        )
-        layer.logical_widths = output_partition_sizes
-        self.context.record_shape_result(transformed=True)
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from vllm.model_executor.layers.quantization.utils import replace_parameter
-
-        from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear.fp8_to_w8a8 import (  # noqa: E501
-            quantize_fp8_block_to_w8a8_int8,
-        )
-
-        scale = getattr(layer, "weight_scale_inv", None)
-        if scale is None:
-            raise RuntimeError("block-FP8 kv_b_proj scale is missing")
-        qweight, channel_scale = quantize_fp8_block_to_w8a8_int8(
-            layer.weight.data, scale.data, self.block_shape
-        )
-        replace_parameter(layer, "weight", qweight)
-        del layer._parameters["weight_scale_inv"]
-        layer.register_parameter(
-            "weight_scale",
-            torch.nn.Parameter(channel_scale, requires_grad=False),
-        )
-        super().process_weights_after_loading(layer)
 
 
 def _get_moe_router_dtype(config) -> torch.dtype | None:

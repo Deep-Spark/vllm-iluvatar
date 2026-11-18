@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Make native CPU KV offload rank-safe for non-uniform DSV4.1 PP."""
+"""Extend native CPU KV offload with DSV4.1 PP geometry and occupancy metrics."""
 
 from __future__ import annotations
 
 import os
 import sys
+from functools import wraps
 from multiprocessing import current_process
 
 from vllm.logger import init_logger
@@ -24,6 +25,8 @@ _ORIGINAL_CREATE_WORKER = None
 _ORIGINAL_GET_MANAGER = None
 _ORIGINAL_REGISTER_KV = None
 _REQUIRED_ENV = "VLLM_ILU_PP_CPU_OFFLOAD_REQUIRED"
+_CPU_CACHE_USED_BYTES = "vllm:kv_offload_cpu_cache_used_bytes"
+_CPU_CACHE_OCCUPANCY_RATIO = "vllm:kv_offload_cpu_cache_occupancy_ratio"
 _REVIEWED_PARTITIONS = {
     (4, 2, 8): (5, 5, 5, 25),
     (8, 2, 16): (3, 3, 3, 3, 2, 3, 2, 21),
@@ -34,7 +37,7 @@ def register() -> None:
     p.register_once(
         __name__,
         _apply,
-        detail="DSV4.1 non-uniform PP native CPU offload geometry",
+        detail="Native CPU offload occupancy metrics and DSV4.1 PP geometry",
     )
 
 
@@ -530,6 +533,89 @@ def _bind_offloading_handshake_noop() -> None:
     )
 
 
+def _bind_cpu_offload_metrics() -> None:
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        OffloadingConnectorScheduler,
+    )
+    from vllm.v1.kv_offload.base import OffloadingGaugeMetadata
+    from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+
+    from vllm_iluvatar.v1.worker.grouped_cpu_offloading import (
+        GroupCPUOffloadingManager,
+    )
+
+    build_metrics = CPUOffloadingSpec.build_metric_definitions.__func__
+    init_scheduler = OffloadingConnectorScheduler.__init__
+    collect_stats = OffloadingConnectorScheduler.get_stats
+
+    @wraps(build_metrics)
+    def build_metric_definitions(cls, extra_config):
+        definitions = build_metrics(cls, extra_config)
+        if cls is CPUOffloadingSpec:
+            definitions[_CPU_CACHE_USED_BYTES] = OffloadingGaugeMetadata(
+                documentation=(
+                    "Bytes occupied in the CPU KV cache, including evictable "
+                    "entries and space reserved for in-flight stores."
+                )
+            )
+            definitions[_CPU_CACHE_OCCUPANCY_RATIO] = OffloadingGaugeMetadata(
+                documentation=(
+                    "Fraction of allocated CPU KV cache capacity that is occupied "
+                    "(0.0 = empty, 1.0 = full)."
+                )
+            )
+        return definitions
+
+    @wraps(init_scheduler)
+    def init_with_cpu_cache_geometry(self, spec, vllm_config, kv_cache_config):
+        init_scheduler(self, spec, vllm_config, kv_cache_config)
+        if type(spec) is not CPUOffloadingSpec:
+            return
+
+        manager = self.manager
+        if isinstance(manager, GroupCPUOffloadingManager):
+            groups = tuple(
+                (manager.managers[gid], allocation.bytes_per_chunk)
+                for gid, allocation in manager.allocations.items()
+            )
+            capacity = manager.allocated_bytes
+        else:
+            bytes_per_chunk = spec.kv_bytes_per_chunk
+            if getattr(spec, "_ilu_nonuniform_pp_private", False):
+                # Rank-private tensors do not use shared-region padding.
+                bytes_per_chunk = (
+                    sum(getattr(spec.config, _GEOMETRY_ATTR)) * spec.blocks_per_chunk
+                )
+            groups = ((manager, bytes_per_chunk),)
+            capacity = spec.num_chunks * bytes_per_chunk
+
+        self._ilu_cpu_cache_metric_geometry = (capacity, groups)
+
+    @wraps(collect_stats)
+    def collect_stats_with_cpu_cache_occupancy(self):
+        stats = collect_stats(self)
+        geometry = getattr(self, "_ilu_cpu_cache_metric_geometry", None)
+        if stats is None or geometry is None:
+            return stats
+
+        capacity, groups = geometry
+        # Free slots include ones the scheduler has never allocated. Evictable
+        # KV and slots reserved for in-flight stores both consume capacity.
+        free_bytes = sum(
+            manager._get_num_free_chunks() * bytes_per_chunk
+            for manager, bytes_per_chunk in groups
+        )
+        used_bytes = capacity - free_bytes
+        stats.set_gauge(_CPU_CACHE_USED_BYTES, used_bytes)
+        occupancy = used_bytes / capacity if capacity else 0.0
+        stats.set_gauge(_CPU_CACHE_OCCUPANCY_RATIO, occupancy)
+        return stats
+
+    CPUOffloadingSpec.build_metric_definitions = classmethod(build_metric_definitions)
+    OffloadingConnectorScheduler.__init__ = init_with_cpu_cache_geometry
+    OffloadingConnectorScheduler.get_stats = collect_stats_with_cpu_cache_occupancy
+
+
 def _apply() -> None:
     from vllm.distributed.kv_transfer.kv_connector.v1 import offloading_connector
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading import config
@@ -587,3 +673,4 @@ def _apply() -> None:
     OffloadingConnectorWorker.register_kv_caches = _ilu_register_kv_caches
 
     _bind_offloading_handshake_noop()
+    p.register_once(f"{__name__}.metrics", _bind_cpu_offload_metrics)

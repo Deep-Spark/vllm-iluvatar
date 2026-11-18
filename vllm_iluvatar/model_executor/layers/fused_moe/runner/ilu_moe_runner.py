@@ -553,7 +553,10 @@ class IluMoERunner(MoERunner):
     def _can_pack_int8_dispatch(self) -> bool:
         """Pack one DP contribution only for the supported native NN dataflow."""
         return (
-            self.moe_config.moe_parallel_config.use_ep
+            getattr(self._quant_method, "supports_packed_int8_input", False) is True
+            and self.gate is not None
+            and getattr(self.gate, "out_dtype", None) == torch.float32
+            and self.moe_config.moe_parallel_config.use_ep
             and self.moe_config.pcp_size == 1
             and self.moe_config.tp_size == 1
             # Expert TP is always one under EP; also exclude attention TP.
@@ -561,13 +564,10 @@ class IluMoERunner(MoERunner):
             and not self.moe_config.is_sequence_parallel
             and not self._ilu_elastic_ep
             and not self._fse_fuse_gate
-            and self.gate is not None
-            and getattr(self.gate, "out_dtype", None) == torch.float32
             and not getattr(self.gate, "gather_before_gate", GATHER_BEFORE_GATE_DEFAULT)
             and self.routed_input_transform is None
             and self.routed_experts.custom_routing_function is None
             and self.do_naive_dispatch_combine
-            and getattr(self._quant_method, "supports_packed_int8_input", False) is True
         )
 
     @property

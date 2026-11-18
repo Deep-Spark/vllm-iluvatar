@@ -230,3 +230,22 @@ def test_forward_order_and_local_shared_input(
         else ["gate", "old_dispatch", "quant", "combine"]
     )
     assert meta.local_sizes is None
+
+
+@pytest.mark.parametrize(
+    ("quant_method", "gate"),
+    [
+        (object(), object()),
+        (None, None),
+        (SimpleNamespace(supports_packed_int8_input=False), object()),
+        (SimpleNamespace(supports_packed_int8_input=True), None),
+        (SimpleNamespace(supports_packed_int8_input=True), object()),
+        (
+            SimpleNamespace(supports_packed_int8_input=True),
+            SimpleNamespace(out_dtype=torch.bfloat16),
+        ),
+    ],
+)
+def test_unsupported_packet_inputs_reject_before_topology_access(quant_method, gate):
+    runner = SimpleNamespace(_quant_method=quant_method, gate=gate)
+    assert mod.IluMoERunner._can_pack_int8_dispatch(runner) is False

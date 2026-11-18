@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Load-time conversion of a block-FP8 Linear to the static GLM W8A8 path.
+"""Load-time conversion of a block-FP8 Linear to channel W8A8.
 
 Per-channel scales are computed from this rank's shard. For the column-parallel
 and replicated layers that is the whole checkpoint row; for the row-parallel
@@ -31,7 +31,7 @@ from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.registry impor
 
 @IluvatarQuantRegistry.register_method
 class IluFp8ToW8A8Int8OnlineLinearMethod(_IluRuntimeW8A8Int8LinearMethod):
-    """Replace a serialized block-FP8 Linear with the static GLM W8A8 path."""
+    """Convert a serialized block-FP8 Linear to channel W8A8."""
 
     source_format = "fp8-block"
     source_dtypes = ("float8_e4m3fn",)
@@ -46,13 +46,14 @@ class IluFp8ToW8A8Int8OnlineLinearMethod(_IluRuntimeW8A8Int8LinearMethod):
     def from_ilu_runtime_config(cls, context: Any):
         source = context.group.weights.source
         block_shape = tuple(source.extra.get("block_shape", ()))
-        if set(source.extra) != {"block_shape"} or block_shape not in (
-            (128, 128),
-            (32, 32),
+        if (
+            set(source.extra) - {"block_shape", "scale_format"}
+            or block_shape not in ((128, 128), (32, 32))
+            or source.extra.get("scale_format", "ue8m0") != "ue8m0"
         ):
             raise ValueError(
                 f"{context.group.group_id}: block-FP8 source requires "
-                "block_shape [128, 128] or [32, 32]"
+                "block_shape [128, 128] or [32, 32], with optional scale_format ue8m0"
             )
         if tuple(context.base_quant_config.weight_block_size or ()) != block_shape:
             raise ValueError(
@@ -61,19 +62,30 @@ class IluFp8ToW8A8Int8OnlineLinearMethod(_IluRuntimeW8A8Int8LinearMethod):
             )
         from vllm_iluvatar.config.ilu_compute import compute_options
 
-        if compute_options("linear").get("fp8_backend") == "fp8":
+        if (
+            isinstance(context.original_method, IluFp8LinearMethod)
+            and compute_options("linear").get("fp8_backend") == "fp8"
+        ):
             raise ValueError(
                 "Explicit FP8 execution conflicts with FP8 -> INT8 online quant"
             )
         return super().from_ilu_runtime_config(context)
 
-    def _quantize(self, layer: torch.nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
+    def _get_block_scale(self, layer: torch.nn.Module) -> torch.Tensor:
         scale = getattr(layer, "weight_scale_inv", None)
         if scale is None:
             raise RuntimeError("block-FP8 source scale is missing")
+        if (
+            self.context.group.weights.source.extra.get("scale_format") == "ue8m0"
+            and scale.dtype != torch.float8_e8m0fnu
+        ):
+            raise ValueError("UE8M0 block-FP8 source requires E8M0 scales")
+        return scale.data
+
+    def _quantize(self, layer: torch.nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
         qweight, channel_scale = quantize_fp8_block_to_w8a8_int8(
             layer.weight.data,
-            scale.data,
+            self._get_block_scale(layer),
             self.block_shape,
         )
         del layer._parameters["weight_scale_inv"]

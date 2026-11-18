@@ -158,6 +158,21 @@ def test_fp8_block_quantizer_rejects_mismatched_scale():
         )
 
 
+@pytest.mark.parametrize("invalid_part", ["weight", "scale"])
+@pytest.mark.parametrize("scale_dtype", [torch.float32, torch.float8_e8m0fnu])
+def test_fp8_block_quantizer_rejects_non_finite(invalid_part, scale_dtype):
+    values = torch.ones(32, 32)
+    scales = torch.ones(1, 1)
+    if invalid_part == "weight":
+        values[0, 0] = float("nan")
+    else:
+        scales[0, 0] = float("nan")
+    with pytest.raises(ValueError, match="non-finite"):
+        quantize_fp8_block_to_w8a8_int8(
+            values.to(torch.float8_e4m3fn), scales.to(scale_dtype), (32, 32)
+        )
+
+
 def test_fp8_block_quantizer_rejects_non_fp8():
     with pytest.raises(ValueError, match="float8_e4m3fn"):
         quantize_fp8_block_to_w8a8_int8(

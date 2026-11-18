@@ -80,6 +80,58 @@ def test_dispatch_and_disabled(suffix, expected, monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "method_name",
+    ["IluDsv41Fp8ToW8A8LinearMethod", "IluFp8ToW8A8Int8OnlineLinearMethod"],
+)
+def test_dense_method_names_use_shared_implementation(method_name, monkeypatch):
+    from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.linear.fp8_to_w8a8 import (
+        IluFp8ToW8A8Int8OnlineLinearMethod,
+    )
+
+    def choose_method(payload):
+        payload["config_groups"]["dsv41_dense_fp8_to_w8a8"]["iluvatar"]["method"] = (
+            method_name
+        )
+
+    _, method = select("model.layers.0.attn.wq_b", monkeypatch, mutation=choose_method)
+    assert type(method) is IluFp8ToW8A8Int8OnlineLinearMethod
+
+
+def test_grouped_runtime_reuses_existing_source_method(monkeypatch):
+    from vllm_iluvatar.config import ilu_compute
+    from vllm_iluvatar.model_executor.layers.quantization.backends.grouped_bmm.deepseek_v4_wo_a import (
+        IluDeepseekV41Fp8GroupedInt8Method,
+    )
+
+    monkeypatch.setattr(
+        ilu_compute, "compute_options", lambda section: {"fp8_backend": "fp8"}
+    )
+    _, method = select("model.layers.0.attn.wo_a", monkeypatch)
+    assert isinstance(method, IluDeepseekV41Fp8GroupedInt8Method)
+    assert (
+        method.apply_with_rope.__func__
+        is IluDeepseekV41Fp8GroupedInt8Method.apply_with_rope
+    )
+    assert not hasattr(method, "scheme")
+
+
+@pytest.mark.parametrize("suffix", ["wq_b", "wo_a"])
+def test_ue8m0_source_rejects_fp32_scale(suffix, monkeypatch):
+    layer, method = select("model.layers.0.attn." + suffix, monkeypatch)
+    layer.register_parameter(
+        "weight",
+        torch.nn.Parameter(
+            torch.ones(32, 32).to(torch.float8_e4m3fn), requires_grad=False
+        ),
+    )
+    layer.register_parameter(
+        "weight_scale_inv", torch.nn.Parameter(torch.ones(1, 1), requires_grad=False)
+    )
+    with pytest.raises(ValueError, match="E8M0 scales"):
+        method.process_weights_after_loading(layer)
+
+
+@pytest.mark.parametrize(
     "field,value", [("block_shape", [128, 128]), ("scale_format", "fp32")]
 )
 def test_reject_wrong_source_contract(field, value, monkeypatch):

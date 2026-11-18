@@ -205,7 +205,7 @@ class IluDeepseekV41MoE(nn.Module, IluFusedMoEEP):
                 prefix=f"{prefix}.shared_experts",
             )
 
-        from vllm_iluvatar.model_executor.layers.quantization.backends.ivcore30.w4a8.nn_moe import (
+        from vllm_iluvatar.model_executor.layers.quantization.backends.w4a8.nn_moe import (
             IluW4A8NNMoEMethod,
         )
         from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes import (

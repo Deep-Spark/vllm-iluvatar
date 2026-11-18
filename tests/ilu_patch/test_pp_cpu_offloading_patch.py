@@ -112,9 +112,14 @@ def test_nonuniform_pp_geometry_is_attached_to_every_worker(
     )
 
 
-def test_dsv41_pp8_partition_is_accepted(monkeypatch) -> None:
+@pytest.mark.parametrize("tp_size", [1, 2])
+@pytest.mark.parametrize(
+    "partition",
+    ["3,3,3,3,2,3,2,21", "2,3,3,3,3,2,3,21"],
+)
+def test_dsv41_pp8_partition_is_accepted(monkeypatch, tp_size, partition) -> None:
     per_stage = (100, 200, 300, 400, 500, 600, 700, 800)
-    geometry = tuple(value for value in per_stage for _ in range(2))
+    geometry = tuple(value for value in per_stage for _ in range(tp_size))
     configs = [_kv_config(10, value * 10) for value in geometry]
     monkeypatch.setattr(
         kv_impl,
@@ -123,13 +128,13 @@ def test_dsv41_pp8_partition_is_accepted(monkeypatch) -> None:
     )
     monkeypatch.setenv(
         "VLLM_PP_LAYER_PARTITION",
-        "3,3,3,3,2,3,2,21",
+        partition,
     )
 
     result = kv_impl._ilu_get_kv_cache_configs(
-        _config(pp_size=8, tp_size=2, world_size=16),
-        [{}] * 16,
-        [1] * 16,
+        _config(pp_size=8, tp_size=tp_size, world_size=8 * tp_size),
+        [{}] * (8 * tp_size),
+        [1] * (8 * tp_size),
     )
 
     assert result is configs
@@ -169,6 +174,26 @@ def test_dsv41_pp8_accepts_the_1m_partition(monkeypatch) -> None:
     assert all(
         config._ilu_offload_worker_bytes_by_rank == geometry for config in configs
     )
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_baseline_partition_keeps_geometry_validation(monkeypatch, tp_size) -> None:
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "2,3,3,3,3,2,3,21")
+    config = _config(pp_size=8, tp_size=tp_size, world_size=8 * tp_size)
+    geometry = tuple(value for value in range(8) for _ in range(tp_size))
+    model_offloading._validate_target_geometry(config, geometry)
+    with pytest.raises(ValueError, match="one KV geometry per worker"):
+        model_offloading._validate_target_geometry(config, geometry[:-1])
+    with pytest.raises(ValueError, match="byte"):
+        model_offloading._validate_target_geometry(config, (-1,) * (8 * tp_size))
+    with pytest.raises(ValueError, match="byte"):
+        model_offloading._validate_target_geometry(config, (0,) * (8 * tp_size))
+    if tp_size > 1:
+        with pytest.raises(ValueError, match="TP ranks within one PP stage"):
+            model_offloading._validate_target_geometry(config, (99,) + geometry[1:])
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "5,5,5,5,5,5,5,5")
+    with pytest.raises(ValueError, match="expected the reviewed"):
+        model_offloading._validate_target_geometry(config, geometry)
 
 
 def test_dsv41_pp8_rejects_wrong_partition(monkeypatch) -> None:

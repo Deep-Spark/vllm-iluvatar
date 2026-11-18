@@ -184,7 +184,7 @@ _GEOMETRY_ATTR = "_ilu_offload_worker_bytes_by_rank"
 _RANK_SAFE_REQUIRED_ATTR = "_ilu_rank_safe_offload_required"
 _REVIEWED_PARTITIONS = {
     (4, 2, 8): ((5, 5, 5, 25),),
-    # Both PP8 cuts are reviewed. 3,3,3,3,2,3,2,21 is the 256K profile and is
+    # The baseline 2,3,3,3,3,2,3,21 cut and both existing PP8 cuts are reviewed. 3,3,3,3,2,3,2,21 is the 256K profile and is
     # 0.19 GiB cheaper per 1M request (PP5 starts on KV source 14, so it needs no
     # 7th forwarder replica). 3,3,3,3,3,2,2,21 is what
     # prefill_state/configuration.py:layer_partitions derives by default for
@@ -193,10 +193,13 @@ _REVIEWED_PARTITIONS = {
     (8, 1, 8): (
         (3, 3, 3, 3, 2, 3, 2, 21),
         (3, 3, 3, 3, 3, 2, 2, 21),
+        # 4.4.4 KV producer stops at layer 20: PP7 runs only L19 and L20.
+        (2, 3, 3, 3, 3, 2, 3, 21),
     ),
     (8, 2, 16): (
         (3, 3, 3, 3, 2, 3, 2, 21),
         (3, 3, 3, 3, 3, 2, 2, 21),
+        (2, 3, 3, 3, 3, 2, 3, 21),
     ),
 }
 

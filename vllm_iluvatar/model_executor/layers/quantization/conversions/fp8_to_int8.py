@@ -39,6 +39,11 @@ def quantize_fp8_block_to_w8a8_int8(
         )
 
     block_scale = block_scale.float()
+    if (
+        not torch.isfinite(block_scale).all()
+        or not torch.isfinite(weight.float()).all()
+    ):
+        raise ValueError("block-FP8 source contains non-finite weights or scales")
     qweight = torch.empty_like(weight, dtype=torch.int8)
     channel_scale = torch.empty((n, 1), dtype=torch.float32, device=weight.device)
     for n0 in range(0, n, bn):

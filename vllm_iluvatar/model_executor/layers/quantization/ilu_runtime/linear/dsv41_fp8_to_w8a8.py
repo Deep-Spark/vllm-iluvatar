@@ -4,6 +4,9 @@
 import torch
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 
+from vllm_iluvatar.model_executor.layers.quantization.backends.grouped_bmm.deepseek_v4_wo_a import (
+    IluV4W8A8BMMLinearMethod,
+)
 from vllm_iluvatar.model_executor.layers.quantization.backends.fp8.deepseek_v41_linear import (
     IluDeepseekV41Bf16DequantLinearMethod,
     IluDeepseekV41FP8LinearMethod,
@@ -17,7 +20,6 @@ from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.linear.fp8_to_
 from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.registry import (
     IluvatarQuantRegistry,
 )
-from vllm_iluvatar.model_executor.layers.quantization.backends.grouped_bmm.deepseek_v4_wo_a import IluV4W8A8BMMLinearMethod
 
 
 @IluvatarQuantRegistry.register_method

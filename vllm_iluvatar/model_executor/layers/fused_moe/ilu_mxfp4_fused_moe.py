@@ -65,9 +65,9 @@ gate.
 from __future__ import annotations
 
 import functools
-import os
 
 import torch
+from vllm import envs
 from vllm.logger import init_logger
 
 from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (  # noqa: E501
@@ -76,7 +76,6 @@ from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_
 from vllm_iluvatar.model_executor.layers.activation import swiglu_clamp
 
 logger = init_logger(__name__)
-_DECODE_MOE_MODE1 = os.environ.get("VLLM_ILU_V41_DECODE_MOE_MODE1", "0") == "1"
 
 # MXFP4 microscaling block size: 32 fp4 (e2m1) values share one e8m0 exponent.
 MXFP4_BLOCK = 32
@@ -616,7 +615,13 @@ def _ilu_mxfp4_fused_experts_ixformer(
     gemm1_out = torch.empty(
         (M, 2 * inter_size), dtype=torch.bfloat16, device=hidden_states.device
     )
-    decode_mode = 1 if (_DECODE_MOE_MODE1 and M <= 768 and H == 5120 and top_k == 6) else gemm_mode
+    decode_mode = (
+        1
+        if (
+            envs.VLLM_ILU_V41_DECODE_MOE_MODE1 and M <= 768 and H == 5120 and top_k == 6
+        )
+        else gemm_mode
+    )
     ixfops.group_gemm_fp4(
         a1_fp8,
         a1_scale,

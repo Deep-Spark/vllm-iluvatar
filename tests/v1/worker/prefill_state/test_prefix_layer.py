@@ -13,6 +13,9 @@ class Attention(nn.Module):
     def __init__(self):
         super().__init__()
         self.rows = []
+        self.fused_wqa_wkv = SimpleNamespace(
+            weight=torch.empty(0, dtype=torch.bfloat16)
+        )
 
     def forward(self, positions, x, scaling):
         self.rows.append(len(x))

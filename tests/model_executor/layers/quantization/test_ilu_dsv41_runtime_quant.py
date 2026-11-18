@@ -13,8 +13,10 @@ from conftest import requires_corex30, requires_cuda
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.linear import LinearBase
 
-from vllm_iluvatar.model_executor.layers.quantization import ilu_deepseek_v41_fp8 as fp8
-from vllm_iluvatar.model_executor.layers.quantization.ilu_dsv41_fp8_to_w8a8 import (
+from vllm_iluvatar.model_executor.layers.quantization.configs.deepseek.v41_fp8 import (
+    IluDeepseekV41FP8Config,
+)
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear.dsv41_fp8_to_w8a8 import (
     IluDsv41Fp8ToW8A8GroupedLinearMethod,
     IluDsv41Fp8ToW8A8LinearMethod,
 )
@@ -43,7 +45,7 @@ def select(prefix, monkeypatch, enabled=True, mutation=None):
         hf_config=hf, hf_text_config=hf, dtype=torch.bfloat16
     )
     config.additional_config = {"ilu_quant": payload}
-    quant = fp8.IluDeepseekV41FP8Config(
+    quant = IluDeepseekV41FP8Config(
         is_checkpoint_fp8_serialized=True,
         activation_scheme="dynamic",
         weight_block_size=[32, 32],
@@ -187,7 +189,7 @@ def test_load_and_compute(grouped, rows, monkeypatch):
 
 @requires_corex30
 def test_mxfp4_direct_nn_matches_native_packing():
-    from vllm_iluvatar.model_executor.layers.quantization.ilu_mxfp4_to_w4a8_moe import (
+    from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.moe.mxfp4_to_w4a8_nn import (
         quantize_mxfp4_to_w4a8_nn,
     )
 

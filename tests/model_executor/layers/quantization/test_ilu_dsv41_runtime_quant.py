@@ -16,7 +16,7 @@ from vllm.model_executor.layers.linear import LinearBase
 from vllm_iluvatar.model_executor.layers.quantization.configs.deepseek.v41_fp8 import (
     IluDeepseekV41FP8Config,
 )
-from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.linear.dsv41_fp8_to_w8a8 import (
+from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.linear.dsv41_fp8_to_w8a8 import (
     IluDsv41Fp8ToW8A8GroupedLinearMethod,
     IluDsv41Fp8ToW8A8LinearMethod,
 )
@@ -189,7 +189,7 @@ def test_load_and_compute(grouped, rows, monkeypatch):
 
 @requires_corex30
 def test_mxfp4_direct_nn_matches_native_packing():
-    from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.ivcore30.moe.mxfp4_to_w4a8_nn import (
+    from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.moe.mxfp4_to_w4a8_nn import (
         quantize_mxfp4_to_w4a8_nn,
     )
 

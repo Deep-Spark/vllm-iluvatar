@@ -6,6 +6,7 @@ from __future__ import annotations
 import inspect
 import queue
 from collections import deque
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 import pytest
@@ -336,10 +337,16 @@ def _pp_request(name):
     )
 
 
+def _pp_batch():
+    # Match EngineCore.batch_queue: (output future, scheduler output, exec future).
+    return Future(), None, Future()
+
+
 def _pp_engine():
     engine = SimpleNamespace(
         batch_queue=deque(),
         batch_queue_size=8,
+        is_running=lambda: True,
         is_pooling_model=False,
         scheduler=SimpleNamespace(
             running=[_pp_request("a")],
@@ -374,7 +381,7 @@ def _pp_original_step(engine):
         request.num_computed_tokens += take
         left -= take
     engine.scheduled.append(2048 - left)
-    engine.batch_queue.appendleft(2048 - left)
+    engine.batch_queue.appendleft(_pp_batch())
     if len(engine.batch_queue) == 8:
         engine.batch_queue.pop()
         return {}, True
@@ -390,8 +397,10 @@ def test_pp_community_method_fingerprint_matches():
     )
 
 
-def test_pp_arrivals_fill_partial_batches_before_first_result():
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_pp_arrivals_fill_partial_batches_before_first_result(async_scheduling):
     engine = _pp_engine()
+    engine.vllm_config.scheduler_config.async_scheduling = async_scheduling
     wrapped = core._make_pp_prefill_coalesce(_pp_original_step, 0.2)
     for _ in range(8):
         wrapped(engine)
@@ -423,7 +432,7 @@ def test_pp_new_idle_wave_resets_budget_and_prior_state():
 
 def test_pp_wait_budget_is_shared_across_gaps(monkeypatch):
     engine = _pp_engine()
-    engine.batch_queue.extend([1, 1])
+    engine.batch_queue.extend([_pp_batch(), _pp_batch()])
     engine.scheduler.running[0].num_computed_tokens = 85909
     wrapped = core._make_pp_prefill_coalesce(lambda _: (None, False), 0.2)
     times = iter([0, 0.15, 0.16, 0.22])
@@ -431,22 +440,35 @@ def test_pp_wait_budget_is_shared_across_gaps(monkeypatch):
     wrapped(engine)
     engine.scheduler.running[-1].num_computed_tokens = 85909
     wrapped(engine)
-    assert engine.input_queue.timeouts == pytest.approx([0.2, 0.05])
+    assert engine.input_queue.timeouts == pytest.approx([0.002, 0.002])
     assert engine._ilu_pp_coalesce_remaining_s == 0
     engine.scheduler.running[-1].num_computed_tokens = 85909
     wrapped(engine)
     assert len(engine.input_queue.timeouts) == 2
 
 
-def test_pp_unchanged_state_waits_only_once():
+def test_pp_unchanged_state_waits_only_once(monkeypatch):
     engine = _pp_engine()
     engine.input_queue = _PPArrivals()
-    engine.batch_queue.extend([1, 1])
+    engine.batch_queue.extend([_pp_batch(), _pp_batch()])
     engine.scheduler.running[0].num_computed_tokens = 85909
     wrapped = core._make_pp_prefill_coalesce(lambda _: (None, False), 0.2)
+
+    # Complete the oldest batch during the first empty wait. There is still
+    # budget left, but an unchanged prompt state must not start another wait.
+    def empty_then_complete(timeout):
+        engine.input_queue.timeouts.append(timeout)
+        engine.batch_queue[-1][2].set_result(None)
+        raise queue.Empty
+
+    engine.input_queue.get = empty_then_complete
+    times = iter([0, 0.001])
+    monkeypatch.setattr(core.time, "monotonic", lambda: next(times))
     wrapped(engine)
+    assert engine._ilu_pp_coalesce_remaining_s == pytest.approx(0.199)
+    engine.batch_queue[-1] = _pp_batch()
     wrapped(engine)
-    assert len(engine.input_queue.timeouts) == 1
+    assert engine.input_queue.timeouts == [0.002]
 
 
 @pytest.mark.parametrize(
@@ -455,7 +477,7 @@ def test_pp_unchanged_state_waits_only_once():
         "decode",
         "after_result",
         "dp",
-        "async",
+        "output_placeholders",
         "kv",
         "spec",
         "pool",
@@ -465,7 +487,7 @@ def test_pp_unchanged_state_waits_only_once():
 )
 def test_pp_other_execution_paths_delegate_without_wait(skip):
     engine = _pp_engine()
-    engine.batch_queue.extend([1, 1])
+    engine.batch_queue.extend([_pp_batch(), _pp_batch()])
     engine.scheduler.running[0].num_computed_tokens = 85909
     if skip == "decode":
         engine.scheduler.running[0].num_tokens += 1
@@ -473,8 +495,8 @@ def test_pp_other_execution_paths_delegate_without_wait(skip):
         engine._ilu_pp_initial_fill = False
     elif skip == "dp":
         engine.vllm_config.parallel_config.data_parallel_size = 2
-    elif skip == "async":
-        engine.vllm_config.scheduler_config.async_scheduling = True
+    elif skip == "output_placeholders":
+        engine.scheduler.running[0].num_output_placeholders = 1
     elif skip == "kv":
         engine.vllm_config.kv_transfer_config = object()
     elif skip == "spec":
@@ -489,3 +511,32 @@ def test_pp_other_execution_paths_delegate_without_wait(skip):
     assert core._make_pp_prefill_coalesce(lambda _: expected, 0.2)(engine) is expected
     if hasattr(engine, "input_queue"):
         assert engine.input_queue.timeouts == []
+
+
+@pytest.mark.parametrize("stop", ["completed_batch", "stopped_engine"])
+def test_pp_wait_stops_before_reading_arrivals(stop):
+    engine = _pp_engine()
+    engine.batch_queue.append(_pp_batch())
+    engine.scheduler.running[0].num_computed_tokens = 85909
+    if stop == "completed_batch":
+        engine.batch_queue[-1][2].set_result(None)
+    else:
+        engine.is_running = lambda: False
+    expected = (None, False)
+    assert core._make_pp_prefill_coalesce(lambda _: expected, 0.2)(engine) is expected
+    assert engine.input_queue.timeouts == []
+
+
+def test_pp_empty_slice_retries_until_wait_budget_expires(monkeypatch):
+    engine = _pp_engine()
+    engine.input_queue = _PPArrivals()
+    engine.batch_queue.append(_pp_batch())
+    engine.scheduler.running[0].num_computed_tokens = 85909
+    engine._ilu_pp_coalesce_remaining_s = 0.005
+    # Use a deterministic clock: no wall-clock busy waiting in the test.
+    times = iter([0, 0.002, 0.002, 0.004, 0.004, 0.005])
+    monkeypatch.setattr(core.time, "monotonic", lambda: next(times))
+    expected = (None, False)
+    assert core._make_pp_prefill_coalesce(lambda _: expected, 0.005)(engine) is expected
+    assert engine.input_queue.timeouts == pytest.approx([0.002, 0.002, 0.001])
+    assert engine._ilu_pp_coalesce_remaining_s == 0

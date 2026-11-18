@@ -25,7 +25,6 @@
 
 
 from contextlib import nullcontext
-import os
 from types import MethodType
 
 import ixformer.distributed as ixfd
@@ -747,26 +746,17 @@ class IluFusedMoEEP:
             assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]
             shared_output = None
 
-            if os.environ.get("VLLM_ILU_V41_PACKED_FP8_DISPATCH", "0") == "1":
+            fused_output = None
+            if envs.VLLM_ILU_V41_PACKED_FP8_DISPATCH:
                 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fp8_packed_dispatch import (
                     maybe_packed_experts,
                 )
-                packed_output = maybe_packed_experts(
+
+                fused_output = maybe_packed_experts(
                     self, hidden_states, input_ids, ctx, dist_group, sizes
                 )
-                if packed_output is not None:
-                    fused_output = packed_output
-                    router_input_ids = self._router_input_ids(runner, input_ids)
-                    hidden_states = None
-                else:
-                    fused_output = None
-            else:
-                fused_output = None
 
-            if fused_output is not None:
-                pass
-            else:
-
+            if fused_output is None:
                 router_input_ids = self._router_input_ids(runner, input_ids)
                 tensors_to_gather = [hidden_states]
                 if router_input_ids is not None:

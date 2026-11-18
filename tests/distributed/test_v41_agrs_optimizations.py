@@ -38,7 +38,7 @@ def test_tp1_reduce_scatter_route(monkeypatch, enabled, sizes, ep_ranks, tp, exp
     values = torch.zeros(sum(sizes), 3, dtype=torch.bfloat16)
     shared = torch.ones(sizes[1], 3, dtype=values.dtype)
 
-    got = moe.IluFusedMoEEP._combine_agrs_output(
+    got = moe.IluFusedMoEEP._combine_ag_rs_output(
         values, shared, group, sizes, sequence_parallel=False, use_tp1_rs=enabled
     )
 

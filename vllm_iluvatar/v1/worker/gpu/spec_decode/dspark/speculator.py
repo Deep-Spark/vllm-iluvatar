@@ -379,10 +379,28 @@ def vocab_parallel_argmax(
     # follow increasing vocabulary order, so argmax over rank maxima preserves
     # torch.argmax's first-ID tie rule on the fully gathered vocabulary.
     local_pairs = torch.stack((local_max_values.float(), global_ids.float()), dim=-1)
+    return _argmax_across_shards(local_pairs, tp_size)
+
+
+def _argmax_across_shards(local_pairs: torch.Tensor, tp_size: int) -> torch.Tensor:
     gathered = tensor_model_parallel_all_gather(local_pairs, dim=-1)
-    gathered = gathered.view(*local_max_values.shape, tp_size, 2)
+    gathered = gathered.view(*local_pairs.shape[:-1], tp_size, 2)
     max_rank = gathered[..., 0].argmax(dim=-1, keepdim=True)
     return gathered[..., 1].gather(-1, max_rank).squeeze(-1).to(torch.int64)
+
+
+@functools.cache
+def _get_add_argmax_pairs():
+    # Older ixformer wheels do not ship the optional sampling module.
+    from importlib import import_module
+
+    module = "ixformer.inference.functions.ops.sampling.float.add_argmax"
+    try:
+        return import_module(module).add_argmax_pairs
+    except ModuleNotFoundError as exc:
+        if exc.name and (module == exc.name or module.startswith(exc.name + ".")):
+            return None
+        raise
 
 
 def add_bias_vocab_parallel_argmax(
@@ -391,22 +409,27 @@ def add_bias_vocab_parallel_argmax(
     vocab_start: int,
     num_vocab_padding: int,
 ) -> torch.Tensor:
-    """Reduce rounded base+bias directly to one pair per shard before TP gather."""
-    from importlib import import_module
-
-    # Generic sampling API supplies a Torch fallback on non-CQ architectures.
-    add_argmax_pairs = import_module(
-        "ixformer.inference.functions.ops.sampling.float.add_argmax"
-    ).add_argmax_pairs
-    pairs = add_argmax_pairs(
-        base, bias, vocab_start, base.shape[-1] - num_vocab_padding
-    )
-    tp_size = get_tensor_model_parallel_world_size()
-    if tp_size == 1:
-        return pairs[:, 1].to(torch.int64)
-    gathered = tensor_model_parallel_all_gather(pairs, dim=-1).view(-1, tp_size, 2)
-    max_rank = gathered[..., 0].argmax(dim=-1, keepdim=True)
-    return gathered[..., 1].gather(-1, max_rank).squeeze(-1).to(torch.int64)
+    """Select a greedy draft ID, fusing the addition for supported matrices."""
+    rows, width = base.shape
+    if (
+        base.dtype in (torch.bfloat16, torch.float32)
+        and bias.dtype == base.dtype
+        and bias.device == base.device
+        and bias.shape == base.shape
+        and base.stride(1) == bias.stride(1) == 1
+        and 0 <= rows <= 65535
+        and width <= base.stride(0) <= 2**31 - 1
+        and width <= bias.stride(0) <= 2**31 - 1
+        and 0 <= num_vocab_padding < width
+        and 0 <= vocab_start <= 2**24 - width
+        and (add_pairs := _get_add_argmax_pairs()) is not None
+    ):
+        pairs = add_pairs(base, bias, vocab_start, width - num_vocab_padding)
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size == 1:
+            return pairs[:, 1].to(torch.int64)
+        return _argmax_across_shards(pairs, tp_size)
+    return vocab_parallel_argmax(base + bias, vocab_start, num_vocab_padding)
 
 
 def gather_vocab_parallel_logits(
@@ -432,10 +455,14 @@ def sample_sequential(self: Any, num_reqs: int, head_hidden: torch.Tensor) -> No
         return _sample_sequential_fused(self, num_reqs, head_hidden)
 
     # V4.1 CQ C16 has four requests per DP engine and favors full gather.
-    use_local_argmax_reduction = self.use_local_argmax_reduction and not (
-        cuda_arch == "ivcore30"
-        and num_reqs < 8
-        and getattr(self.model, "prefer_full_gather_for_small_batches", False)
+    local_greedy = (
+        self.draft_logits is None
+        and self.use_local_argmax_reduction
+        and not (
+            cuda_arch == "ivcore30"
+            and num_reqs < 8
+            and getattr(self.model, "prefer_full_gather_for_small_batches", False)
+        )
     )
     n_spec = self.num_speculative_steps
     num_sample = num_reqs * n_spec
@@ -450,10 +477,13 @@ def sample_sequential(self: Any, num_reqs: int, head_hidden: torch.Tensor) -> No
     else:
         draft_vocab_size = self.vocab_size
 
-    idx_map_t = (
-        self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec).t().contiguous()
-    )
-    sample_pos_t = self.sample_pos[:num_sample].view(num_reqs, n_spec).t().contiguous()
+    if not local_greedy:
+        idx_map_t = (
+            self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec).t().contiguous()
+        )
+        sample_pos_t = (
+            self.sample_pos[:num_sample].view(num_reqs, n_spec).t().contiguous()
+        )
     confidence_markov_embeds: list[torch.Tensor] = []
     prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
 
@@ -462,48 +492,15 @@ def sample_sequential(self: Any, num_reqs: int, head_hidden: torch.Tensor) -> No
         if self.use_confidence_head:
             confidence_markov_embeds.append(markov_embed)
         bias = self.model.markov_bias_local(markov_embed)
-        if (
-            self.draft_logits is None
-            and use_local_argmax_reduction
-            and base_logits.dtype in (torch.bfloat16, torch.float32)
-            and bias.dtype == base_logits.dtype
-            and bias.shape == (num_reqs, local_vocab_size)
-            and base_logits.stride(-1) == bias.stride(-1) == 1
-            and 0 <= num_reqs <= 65535
-            and local_vocab_size <= base_logits.stride(0) <= 2**31 - 1
-            and local_vocab_size <= bias.stride(0) <= 2**31 - 1
-            and 0 <= num_vocab_padding < local_vocab_size
-            and 0 <= vocab_start <= 2**24 - local_vocab_size
-        ):
+        base = base_logits[:, i]
+        if local_greedy:
             draft_ids = add_bias_vocab_parallel_argmax(
-                base_logits[:, i], bias, vocab_start, num_vocab_padding
-            )
-            draft_sampled_i = self.model.map_draft_to_target(draft_ids)
-            self.draft_tokens[:num_reqs, i] = draft_sampled_i
-            prev = draft_sampled_i
-            continue
-        logits_i = base_logits[:, i] + bias
-        if self.draft_logits is not None:
-            logits_i = gather_vocab_parallel_logits(
-                logits_i,
-                draft_vocab_size,
-                num_vocab_padding,
-            )
-            draft_sampled_i = self._sample_logits(
-                logits_i, idx_map_t[i], sample_pos_t[i], i
-            )
-        elif use_local_argmax_reduction:
-            draft_ids = vocab_parallel_argmax(
-                logits_i,
-                vocab_start,
-                num_vocab_padding,
+                base, bias, vocab_start, num_vocab_padding
             )
             draft_sampled_i = self.model.map_draft_to_target(draft_ids)
         else:
             logits_i = gather_vocab_parallel_logits(
-                logits_i,
-                draft_vocab_size,
-                num_vocab_padding,
+                base + bias, draft_vocab_size, num_vocab_padding
             )
             draft_sampled_i = self._sample_logits(
                 logits_i, idx_map_t[i], sample_pos_t[i], i

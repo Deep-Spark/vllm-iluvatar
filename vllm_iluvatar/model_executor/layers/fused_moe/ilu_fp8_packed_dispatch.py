@@ -12,6 +12,10 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 _IDENTITY_ROUTES = {}
+# One FP8 activation row, one FP32 scale, then top-k INT32 IDs and FP32 weights.
+_HIDDEN_SIZE = 5120
+_TOP_K = 6
+_PACKET_BYTES = _HIDDEN_SIZE + 4 + 2 * _TOP_K * 4
 
 
 @triton.jit
@@ -25,6 +29,9 @@ def _pack_quantized_routes(
     packet_stride: tl.constexpr,
     block_size: tl.constexpr,
 ):
+    metadata_bytes: tl.constexpr = packet_stride - hidden_size
+    id_bytes: tl.constexpr = (metadata_bytes - 4) // 2
+    weights_offset: tl.constexpr = 4 + id_bytes
     row = tl.program_id(0)
     columns = tl.program_id(1) * block_size + tl.arange(0, block_size)
     quantized_values = tl.load(
@@ -36,13 +43,13 @@ def _pack_quantized_routes(
         other=0,
     )
     index_values = tl.load(
-        expert_indices + row * 24 + columns - hidden_size - 4,
-        (columns >= hidden_size + 4) & (columns < hidden_size + 28),
+        expert_indices + row * id_bytes + columns - hidden_size - 4,
+        (columns >= hidden_size + 4) & (columns < hidden_size + weights_offset),
         other=0,
     )
     weight_values = tl.load(
-        expert_weights + row * 24 + columns - hidden_size - 28,
-        (columns >= hidden_size + 28) & (columns < packet_stride),
+        expert_weights + row * id_bytes + columns - hidden_size - weights_offset,
+        (columns >= hidden_size + weights_offset) & (columns < packet_stride),
         other=0,
     )
     tl.store(
@@ -53,7 +60,9 @@ def _pack_quantized_routes(
             tl.where(
                 columns < hidden_size + 4,
                 scale_values,
-                tl.where(columns < hidden_size + 28, index_values, weight_values),
+                tl.where(
+                    columns < hidden_size + weights_offset, index_values, weight_values
+                ),
             ),
         ),
         columns < packet_stride,
@@ -69,19 +78,26 @@ def _unpack_route_metadata(
     hidden_size: tl.constexpr,
     packet_stride: tl.constexpr,
 ):
+    metadata_bytes: tl.constexpr = packet_stride - hidden_size
+    id_bytes: tl.constexpr = (metadata_bytes - 4) // 2
+    weights_offset: tl.constexpr = 4 + id_bytes
     row = tl.program_id(0)
-    columns = tl.arange(0, 64)
+    columns = tl.arange(0, triton.next_power_of_2(metadata_bytes))
     value = tl.load(
-        packet + row * packet_stride + hidden_size + columns, columns < 52, other=0
+        packet + row * packet_stride + hidden_size + columns,
+        columns < metadata_bytes,
+        other=0,
     )
     tl.store(input_scales + row * 4 + columns, value, columns < 4)
     tl.store(
-        expert_indices + row * 24 + columns - 4, value, (columns >= 4) & (columns < 28)
+        expert_indices + row * id_bytes + columns - 4,
+        value,
+        (columns >= 4) & (columns < weights_offset),
     )
     tl.store(
-        expert_weights + row * 24 + columns - 28,
+        expert_weights + row * id_bytes + columns - weights_offset,
         value,
-        (columns >= 28) & (columns < 52),
+        (columns >= weights_offset) & (columns < metadata_bytes),
     )
 
 
@@ -147,26 +163,27 @@ def _quantize_and_pack_routes(
         (output + row * packet_stride + hidden_size).to(tl.pointer_type(tl.float32)),
         scale,
     )
-    route_columns = tl.arange(0, 8)
+    top_k: tl.constexpr = (packet_stride - hidden_size - 4) // 8
+    route_columns = tl.arange(0, triton.next_power_of_2(top_k))
     expert_indices = tl.load(
-        expert_indices + row * 6 + route_columns, route_columns < 6, other=0
+        expert_indices + row * top_k + route_columns, route_columns < top_k, other=0
     )
     expert_weights = tl.load(
-        expert_weights + row * 6 + route_columns, route_columns < 6, other=0
+        expert_weights + row * top_k + route_columns, route_columns < top_k, other=0
     )
     tl.store(
         (output + row * packet_stride + hidden_size + 4).to(tl.pointer_type(tl.int32))
         + route_columns,
         expert_indices,
-        route_columns < 6,
+        route_columns < top_k,
     )
     tl.store(
-        (output + row * packet_stride + hidden_size + 28).to(
+        (output + row * packet_stride + hidden_size + 4 + top_k * 4).to(
             tl.pointer_type(tl.float32)
         )
         + route_columns,
         expert_weights,
-        route_columns < 6,
+        route_columns < top_k,
     )
 
 
@@ -214,8 +231,8 @@ def maybe_packed_experts(owner, hidden_states, input_ids, ctx, group, sizes):
         and all(n == sizes[0] for n in sizes)
         and 24 <= sizes[0] <= 96
         and hidden_states.dtype == torch.bfloat16
-        and hidden_states.shape[1] == 5120
-        and getattr(runner.moe_config, "experts_per_token", 0) == 6
+        and hidden_states.shape[1] == _HIDDEN_SIZE
+        and getattr(runner.moe_config, "experts_per_token", 0) == _TOP_K
         and layer.w13_weight.dtype == torch.uint8
         and getattr(layer, "w13_bias", None) is None
         and getattr(layer, "w2_bias", None) is None
@@ -243,10 +260,10 @@ def maybe_packed_experts(owner, hidden_states, input_ids, ctx, group, sizes):
     local_expert_indices = local_expert_indices.to(torch.int32).contiguous()
     local_weights = local_weights.float().contiguous()
     packet = torch.empty(
-        (local_tokens, 5172), device=hidden_states.device, dtype=torch.uint8
+        (local_tokens, _PACKET_BYTES), device=hidden_states.device, dtype=torch.uint8
     )
     gathered = torch.empty(
-        (total_tokens, 5172), device=hidden_states.device, dtype=torch.uint8
+        (total_tokens, _PACKET_BYTES), device=hidden_states.device, dtype=torch.uint8
     )
     if envs.VLLM_ILU_V41_PACKED_FP8_FUSED_QUANT:
         _quantize_and_pack_routes[(local_tokens,)](
@@ -254,9 +271,9 @@ def maybe_packed_experts(owner, hidden_states, input_ids, ctx, group, sizes):
             local_expert_indices,
             local_weights,
             packet,
-            5120,
-            5172,
-            8192,
+            _HIDDEN_SIZE,
+            _PACKET_BYTES,
+            triton.next_power_of_2(_HIDDEN_SIZE),
             num_warps=8,
         )
     else:
@@ -268,14 +285,14 @@ def maybe_packed_experts(owner, hidden_states, input_ids, ctx, group, sizes):
         quantized_input, input_scales = ops.moe_expand_input_dynamic_scaled_fp8(
             hidden_states, _IDENTITY_ROUTES[key], 1
         )
-        _pack_quantized_routes[(local_tokens, 6)](
+        _pack_quantized_routes[(local_tokens, triton.cdiv(_PACKET_BYTES, 1024))](
             quantized_input.view(torch.uint8),
             input_scales.view(torch.uint8),
             local_expert_indices.view(torch.uint8),
             local_weights.view(torch.uint8),
             packet,
-            5120,
-            5172,
+            _HIDDEN_SIZE,
+            _PACKET_BYTES,
             1024,
         )
     ixfd.all_gather_into_tensor(
@@ -285,18 +302,18 @@ def maybe_packed_experts(owner, hidden_states, input_ids, ctx, group, sizes):
         total_tokens, device=hidden_states.device, dtype=torch.float32
     )
     expert_indices = torch.empty(
-        (total_tokens, 6), device=hidden_states.device, dtype=torch.int32
+        (total_tokens, _TOP_K), device=hidden_states.device, dtype=torch.int32
     )
     expert_weights = torch.empty(
-        (total_tokens, 6), device=hidden_states.device, dtype=torch.float32
+        (total_tokens, _TOP_K), device=hidden_states.device, dtype=torch.float32
     )
     _unpack_route_metadata[(total_tokens,)](
         gathered,
         full_scales.view(torch.uint8),
         expert_indices.view(torch.uint8),
         expert_weights.view(torch.uint8),
-        5120,
-        5172,
+        _HIDDEN_SIZE,
+        _PACKET_BYTES,
     )
     logger.info_once("V4.1 packed FP8 dispatch active")
     # Only shape/device/dtype are consumed when prequantized input is provided.
@@ -323,5 +340,8 @@ def maybe_packed_experts(owner, hidden_states, input_ids, ctx, group, sizes):
             and envs.VLLM_ILU_V41_MOE_SKIP_SORT
         ),
         swiglu_variant="dsv4_clamp",
-        quantized_input=(gathered[:, :5120].view(torch.float8_e4m3fn), full_scales),
+        quantized_input=(
+            gathered[:, :_HIDDEN_SIZE].view(torch.float8_e4m3fn),
+            full_scales,
+        ),
     )

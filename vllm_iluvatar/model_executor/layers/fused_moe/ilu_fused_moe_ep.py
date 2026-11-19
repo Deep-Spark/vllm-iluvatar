@@ -674,6 +674,59 @@ class IluFusedMoEEP:
             local = get_tp_group().all_reduce(local)
         return local
 
+    def _agrs_routed_experts(self, hidden_states, input_ids, ctx, dist_group, sizes):
+        """Gather routing inputs and compute the unreduced expert output."""
+        if envs.VLLM_ILU_V41_PACKED_FP8_DISPATCH:
+            from .ilu_fp8_packed_dispatch import maybe_packed_experts
+
+            packed_output = maybe_packed_experts(
+                self, hidden_states, input_ids, ctx, dist_group, sizes
+            )
+            if packed_output is not None:
+                return packed_output
+
+        runner = self.experts
+        quant_method = runner._quant_method
+        router_input_ids = self._router_input_ids(runner, input_ids)
+        tensors_to_gather = [hidden_states]
+        if router_input_ids is not None:
+            tensors_to_gather.append(router_input_ids)
+
+        gathered_tensors = dist_group.all_gatherv(
+            tensors_to_gather,
+            dim=0,
+            sizes=sizes,
+        )
+        hidden_states = gathered_tensors[0]
+        if router_input_ids is not None:
+            router_input_ids = gathered_tensors[1]
+        gate = runner.gate if runner.gate is not None else self.gate
+        router_logits, _ = gate(hidden_states)
+        with _gathered_router_padding(ctx, dist_group, sizes):
+            topk_weights, topk_ids = runner.router.select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                topk_indices_dtype=quant_method.topk_indices_dtype,
+                input_ids=router_input_ids,
+            )
+        apply_fused_moe = (
+            getattr(quant_method, "apply_fused_moe", None) if _USE_FUSED_MOE else None
+        )
+        if apply_fused_moe is None:
+            return runner.routed_experts.forward_modular(
+                x=hidden_states,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                shared_experts=None,
+                shared_experts_input=None,
+            )
+        return apply_fused_moe(
+            layer=runner.routed_experts,
+            x=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        )
+
     def forward_dp_ep_naive(
         self,
         hidden_states: torch.Tensor,
@@ -702,7 +755,6 @@ class IluFusedMoEEP:
         if routed_shared_input is not None:
             shared_experts_input = routed_shared_input
         hidden_dim = hidden_states.shape[-1]
-        pre_xform_trunc_size = None
         post_xform_trunc_size = None
         if (
             not quant_method.skip_forward_padding
@@ -746,62 +798,9 @@ class IluFusedMoEEP:
             assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]
             shared_output = None
 
-            fused_output = None
-            if envs.VLLM_ILU_V41_PACKED_FP8_DISPATCH:
-                from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fp8_packed_dispatch import (
-                    maybe_packed_experts,
-                )
-
-                fused_output = maybe_packed_experts(
-                    self, hidden_states, input_ids, ctx, dist_group, sizes
-                )
-
-            if fused_output is None:
-                router_input_ids = self._router_input_ids(runner, input_ids)
-                tensors_to_gather = [hidden_states]
-                if router_input_ids is not None:
-                    tensors_to_gather.append(router_input_ids)
-
-                gathered_tensors = dist_group.all_gatherv(
-                    tensors_to_gather,
-                    dim=0,
-                    sizes=sizes,
-                )
-                hidden_states = gathered_tensors[0]
-                if router_input_ids is not None:
-                    router_input_ids = gathered_tensors[1]
-                if runner.gate is not None:
-                    router_logits, _ = runner.gate(hidden_states)
-                else:
-                    router_logits, _ = self.gate(hidden_states)
-                with _gathered_router_padding(ctx, dist_group, sizes):
-                    topk_weights, topk_ids = runner.router.select_experts(
-                        hidden_states=hidden_states,
-                        router_logits=router_logits,
-                        topk_indices_dtype=quant_method.topk_indices_dtype,
-                        input_ids=router_input_ids,
-                    )
-                shared_output = None
-                apply_fused_moe = (
-                    getattr(quant_method, "apply_fused_moe", None)
-                    if _USE_FUSED_MOE
-                    else None
-                )
-                if apply_fused_moe is None:
-                    fused_output = runner.routed_experts.forward_modular(
-                        x=hidden_states,
-                        topk_weights=topk_weights,
-                        topk_ids=topk_ids,
-                        shared_experts=None,
-                        shared_experts_input=None,
-                    )
-                else:
-                    fused_output = apply_fused_moe(
-                        layer=runner.routed_experts,
-                        x=hidden_states,
-                        topk_weights=topk_weights,
-                        topk_ids=topk_ids,
-                    )
+            fused_output = self._agrs_routed_experts(
+                hidden_states, input_ids, ctx, dist_group, sizes
+            )
             if shared_experts is not None:
                 assert shared_experts_input is not None
                 shared_layer_input = (
@@ -816,8 +815,6 @@ class IluFusedMoEEP:
                     ),
                 )
                 shared_output = shared_experts.output
-        if pre_xform_trunc_size is not None:
-            fused_output = fused_output[..., :pre_xform_trunc_size]
 
         if runner._fused_output_is_reduced:
             raise NotImplementedError(

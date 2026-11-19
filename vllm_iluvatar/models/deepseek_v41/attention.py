@@ -1834,7 +1834,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         if self.kv_cache_dtype == "fp8_e4m3":
             n = q.shape[0]
             fuse_q = (
-                (envs.VLLM_ILU_V41_FUSED_Q_QUANT or envs.VLLM_ILU_V41_PREFILL_FUSED_Q)
+                envs.VLLM_ILU_V41_FUSED_Q_QUANT
                 and hasattr(self, "_q_fp8_pt")
                 and hasattr(self, "_q_scale_pt")
             )
@@ -2792,35 +2792,22 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
                 self._q_quant_workspace_pt,
                 backend="ixformer_native",
             )
-        if (
+        apply_inverse_rope = (
             positions is not None
             and cos_sin_cache is not None
             and not use_fmhadsa
             and hasattr(ixfops, "sparse_mla_fp8_pt_inv_rope")
-        ):
-            ixfops.sparse_mla_fp8_pt_inv_rope(
-                q_fp8,
-                q_scale,
-                self.swa_cache_layer.kv_cache,
-                self._tile_window(swa_indices),
-                output,
-                self.scale,
-                self.kv_scale,
-                swa_lens,
-                self.attn_sink,
-                extra_cache,
-                None if extra_indices is None else _tiled_index_rows(extra_indices),
-                extra_lens,
-                positions=positions,
-                cos_sin_cache=cos_sin_cache,
-            )
-            # The ixformer fallback applies inverse RoPE in a separate op.
-            return True
-        sparse_op = (
-            ixfops.fmhadsa
-            if use_fmhadsa and _v41_prefill_fmhadsa()
-            else ixfops.sparse_mla_fp8_pt
         )
+        if apply_inverse_rope:
+            sparse_op = ixfops.sparse_mla_fp8_pt_inv_rope
+            kwargs = {"positions": positions, "cos_sin_cache": cos_sin_cache}
+        else:
+            sparse_op = (
+                ixfops.fmhadsa
+                if use_fmhadsa and _v41_prefill_fmhadsa()
+                else ixfops.sparse_mla_fp8_pt
+            )
+            kwargs = {"backend": "ixformer_native"}
         sparse_op(
             q_fp8,
             q_scale,
@@ -2834,9 +2821,10 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             extra_cache,
             None if extra_indices is None else _tiled_index_rows(extra_indices),
             extra_lens,
-            backend="ixformer_native",
+            **kwargs,
         )
-        return False
+        # The inverse-RoPE facade also rotates on its fallback path.
+        return apply_inverse_rope
 
     def _forward_decode(
         self,

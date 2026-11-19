@@ -118,3 +118,5 @@ def test_q_quant_has_one_effective_switch(monkeypatch, canonical, legacy, expect
     if legacy is not None:
         monkeypatch.setenv("VLLM_V41_PREFILL_FUSED_Q", legacy)
     assert ilu_envs.VLLM_ILU_V41_FUSED_Q_QUANT is expected
+    assert ilu_envs.VLLM_ILU_V41_PREFILL_FUSED_Q is expected
+    assert ilu_envs.VLLM_V41_PREFILL_FUSED_Q is expected

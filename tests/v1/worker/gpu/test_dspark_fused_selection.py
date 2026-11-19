@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from conftest import requires_corex30
 
 from vllm_iluvatar.v1.worker.gpu.spec_decode.dspark import speculator as impl
 
@@ -30,7 +31,7 @@ def test_sequential_selection_and_fallbacks(
     fused_calls = []
     gather_calls = []
 
-    def fused(base, bias, start, padding):
+    def fused(base, bias, start, valid_cols):
         # Enforce the native input contract so unsupported layouts must take
         # the original path, rather than silently passing via this CPU oracle.
         assert base.shape == bias.shape and base.dtype == bias.dtype
@@ -39,9 +40,11 @@ def test_sequential_selection_and_fallbacks(
         assert base.stride(0) >= base.shape[1]
         assert bias.stride(0) >= bias.shape[1]
         fused_calls.append(base.shape[0])
-        return (base + bias)[:, : base.shape[1] - padding].argmax(-1) + start
+        values, ids = (base + bias)[:, :valid_cols].max(-1)
+        return torch.stack((values.float(), (ids + start).float()), dim=-1)
 
-    monkeypatch.setattr(impl, "add_bias_vocab_parallel_argmax", fused)
+    monkeypatch.setattr(impl, "_get_add_argmax_pairs", lambda: fused)
+    monkeypatch.setattr(impl, "get_tensor_model_parallel_world_size", lambda: 1)
 
     def gather(logits, vocab, padding):
         gather_calls.append(logits.shape[0])
@@ -171,3 +174,30 @@ def test_non_v41_small_batch_keeps_local_argmax(monkeypatch):
     impl.sample_sequential(state, 4, torch.zeros((4, 2)))
     assert calls == [4]
     assert torch.equal(state.draft_tokens, torch.ones_like(state.draft_tokens))
+
+
+def test_greedy_argmax_with_older_ixformer(monkeypatch):
+    monkeypatch.setattr(impl, "_get_add_argmax_pairs", lambda: None)
+    monkeypatch.setattr(impl, "get_tensor_model_parallel_world_size", lambda: 1)
+    base = torch.tensor([[1, 3, 3, 99], [2, 1, 0, 99]], dtype=torch.bfloat16)
+    actual = impl.add_bias_vocab_parallel_argmax(base, torch.zeros_like(base), 32, 1)
+    assert actual.tolist() == [33, 32]
+
+
+@requires_corex30
+@pytest.mark.parametrize("rows", [1, 8, 17])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_add_bias_argmax_on_strided_logits(monkeypatch, rows, dtype):
+    monkeypatch.setattr(impl, "get_tensor_model_parallel_world_size", lambda: 1)
+    generator = torch.Generator(device="cuda").manual_seed(17)
+    base = torch.randn((rows, 3, 129), generator=generator, device="cuda", dtype=dtype)[
+        :, 1
+    ]
+    bias = torch.randn_like(base)
+    # Highest padded score must be ignored; the first tied valid ID must win.
+    base[:, -1] = 256
+    base[:, 31:33] = 64
+    bias[:, 31:33] = 0
+    actual = impl.add_bias_vocab_parallel_argmax(base, bias, 32768, 1)
+    expected = (base + bias)[:, :-1].argmax(-1) + 32768
+    assert torch.equal(actual, expected)

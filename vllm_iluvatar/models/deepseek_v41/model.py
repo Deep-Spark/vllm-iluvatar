@@ -46,7 +46,6 @@ from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.skip_layers import (
     producer_kv_only_layer,
     producer_last_layer,
 )
-from vllm_iluvatar.ilu_util.arch import is_ivcore30
 from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (  # noqa: E501
     clear_activation_prequant,
     register_activation_prequant,
@@ -124,27 +123,6 @@ def default_aux_hidden_state_layers(hf_config) -> tuple[int, ...]:
 
 def _make_weights_mapper() -> WeightsMapper:
     return _make_fp8_weights_mapper()
-
-
-def _is_pure_prefill(attn_metadata: object, num_tokens: int) -> bool:
-    """Return whether metadata describes a prefill-only batch of this size."""
-    if not isinstance(attn_metadata, dict):
-        return False
-    metadata = next(
-        (
-            value
-            for value in attn_metadata.values()
-            if hasattr(value, "num_prefill_tokens")
-            and hasattr(value, "num_decode_tokens")
-        ),
-        None,
-    )
-    if metadata is None:
-        return False
-    return (
-        int(metadata.num_decode_tokens) == 0
-        and int(metadata.num_prefill_tokens) == num_tokens
-    )
 
 
 class IluDeepseekV41MoE(nn.Module, IluFusedMoEEP):
@@ -1296,30 +1274,10 @@ class IluDeepseekV41Model(IluDeepseekV4Fp8Model, EagleModelMixin):
         if not pp_group.is_last_rank:
             tensors = {"hidden_states": hidden_states, "pre_mix": pre_mix}
             num_tokens = positions.shape[0]
-            attn_metadata = get_forward_context().attn_metadata
-            pp_quant_senders = envs.VLLM_ILU_V41_PREFILL_PP_QUANT_SENDERS
-            sender_ranks = {
-                rank.strip() for rank in pp_quant_senders.split(",") if rank.strip()
-            }
-            if (
-                pp_quant_senders
-                and num_tokens > 128
-                and hidden_states.dtype == torch.bfloat16
-                and hidden_states.is_contiguous()
-                and get_tensor_model_parallel_world_size() == 1
-                and is_ivcore30()
-                and not pp_group.use_cpu_custom_send_recv
-                and _is_pure_prefill(attn_metadata, num_tokens)
-                and (
-                    pp_quant_senders == "all"
-                    or str(get_pp_group().rank_in_group) in sender_ranks
-                )
-            ):
-                from ._prefill_pp_codec import encode
+            if senders := envs.VLLM_ILU_V41_PREFILL_PP_QUANT_SENDERS:
+                from ._prefill_pp_codec import maybe_encode_hidden_states
 
-                tensors["hidden_states"], tensors["prefill_pp_scale"] = encode(
-                    hidden_states
-                )
+                maybe_encode_hidden_states(tensors, senders, pp_group)
             if self.pp_plan.sends_kv:
                 assert self.main_kv_rows is not None
                 assert self.indexer_kv_rows is not None

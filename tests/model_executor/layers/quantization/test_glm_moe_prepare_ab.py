@@ -44,7 +44,8 @@ def dense_reference(q, scale, raw, scales, ids, weights, layer):
         act = torch.nn.functional.silu(gate) * up
         sa = act.abs().amax(-1, keepdim=True) / 127
         inv = torch.where(sa > 0, sa.reciprocal(), 0)
-        qa = (act.bfloat16().float() * inv).round().clamp(-128, 127)
+        # The unclamped SwiGLU kernel quantizes its FP32 product directly.
+        qa = (act * inv).round().clamp(-128, 127)
         routed = (
             ((qa @ raw[1][local].float().T) * sa * (scales[1][local] * 18))
             .bfloat16()

@@ -77,7 +77,7 @@ runner 从 展开后的模型配置 取每款参数，执行 `vllm serve <本地
 2. 10题串行一遍，再以并发4执行同一组10题，共20次，无自动重试。默认temperature=0、top_p=1；Qwen3.6按固定ModelHub generation_config使用temperature=1.0、top_p=0.95、top_k=20，保留思考模式；Step使用temperature=0.6、top_p=0.95。seed固定、每请求最多4096 tokens/300秒。
 3. **请求成功20/20且正确20/20**。必须返回本次模型名、一个非空最终答案、`finish_reason=stop`；超时、报错、截断、只有思考文本均失败。取最后一行末尾显式 `FINAL:` 标记后的完整答案（允许标记前有解释文字），数值按完整数字比较，文本按规范化后完整值比较，JSON按结构和值比较，不用“包含关键词”判正确。
 4. 启用投机的3款还要求 `num_drafts`、`num_draft_tokens`、`num_accepted_tokens` 的运行增量均大于0，accepted不得超过draft；只有命令行开关不算生效。最多额外等20秒指标刷新，不重跑请求。
-5. 结束时服务存活、健康检查通过，日志无 EngineDead/OOM/worker异常退出；随后清理本款进程组。清理失败则停止整组，不再启动下一款。
+5. 结束时服务存活、健康检查通过，日志无 EngineDead/OOM/worker异常退出；随后清理本款进程组。清理失败则停止整组，不再启动下一款。 先仅通知 API 主进程退出。worker 有 30 秒自行清理，引擎的总退出期限为 90 秒（`--shutdown-timeout 90`），随后为 API 进程自身退出预留 30 秒。runner 最多等 120 秒，进程组提前清空即返回；主进程提前退出也继续等待子进程。超时才向本款进程组发送 SIGTERM，再等待10秒后以 SIGKILL 兜底；设备只有在整组进程退出后才归还。若 runner 最终使用 SIGKILL，或退出日志显示引擎/worker 被内部强杀，即使进程已消失，也按清理失败停止整组，不能据此认定 GPU 资源正常释放。
 
 每款落盘 `launch.json`、`server.log`、`answers.jsonl`、`result.json`，投机款额外保存前后 metrics；整体保存 展开后的模型配置、summary、JUnit。没跑完的模型也在 JUnit 中记失败，不能跳过后显示全绿。
 

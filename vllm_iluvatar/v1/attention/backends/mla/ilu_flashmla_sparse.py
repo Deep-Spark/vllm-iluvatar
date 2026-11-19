@@ -362,7 +362,7 @@ class IluFlashMLASparseMetadataBuilder(
         return result
 
     def _stage_req_id_per_token(
-        self, query_start_loc_cpu: torch.Tensor, num_tokens: int
+        self, common_attn_metadata: CommonAttentionMetadata
     ) -> torch.Tensor:
         """Upload this step's token -> request index map.
 
@@ -371,7 +371,8 @@ class IluFlashMLASparseMetadataBuilder(
         buffer would let the next build's host write land in a copy the GPU has
         not executed yet.
         """
-        starts = np.asarray(query_start_loc_cpu, dtype=np.int32)
+        num_tokens = common_attn_metadata.num_actual_tokens
+        starts = np.asarray(common_attn_metadata.query_start_loc_cpu, dtype=np.int32)
         seg_lengths = np.diff(starts)
         req_id_per_token = np.repeat(
             np.arange(seg_lengths.shape[0], dtype=np.int32), seg_lengths
@@ -398,10 +399,7 @@ class IluFlashMLASparseMetadataBuilder(
         fast_build: bool = False,
     ) -> IluFlashMLASparseMetadata:
         cm = common_attn_metadata
-        num_tokens = cm.num_actual_tokens
-        req_id_per_token = self._stage_req_id_per_token(
-            cm.query_start_loc_cpu, num_tokens
-        )
+        req_id_per_token = self._stage_req_id_per_token(cm)
 
         # V4 main MLA: convert raw token slot_mapping to compressed-domain so
         # ``DeepseekCompressor._fused_kernel`` writes to the right cache slot.

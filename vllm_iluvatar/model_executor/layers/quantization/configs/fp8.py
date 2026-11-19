@@ -200,6 +200,13 @@ class IluFp8Config(Fp8Config):
 
         if isinstance(original_method, IluMxfp4MoEMethod):
             return select_mxfp4_method(layer, original_method, runtime_method)
+        from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe import (
+            IluFp8MoEMethod,
+            select_fp8_method,
+        )
+
+        if isinstance(original_method, IluFp8MoEMethod):
+            return select_fp8_method(original_method, runtime_method)
         return runtime_method if runtime_method is not None else original_method
 
 

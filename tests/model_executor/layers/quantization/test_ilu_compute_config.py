@@ -132,3 +132,39 @@ def test_mxfp4_explicit_mode_overrides_legacy_env(monkeypatch):
     monkeypatch.setattr(mod, "IluMxfp4MoEMethod", lambda config, selection: selection)
     selected = mod.select_mxfp4_method(SimpleNamespace(moe_config=None), object())
     assert selected.layout == "TN"
+
+
+@pytest.mark.parametrize(
+    "device,mode,backend,layout",
+    [
+        ("ivcore11", "auto", "ixinfer_w4a8", "NN"),
+        ("ivcore11", "ixinfer_w4a8_tn_v2", "ixinfer_w4a8", "TN"),
+        ("ivcore30", "auto", "ixmm_fp4fp8", "fp4fp8"),
+        ("ivcore30", "ixmm_w4a8_nn", "ixmm_w4a8", "NN"),
+    ],
+)
+def test_fp8_compute_modes(device, mode, backend, layout):
+    from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe import (
+        select_fp8_compute,
+    )
+
+    selection = select_fp8_compute(device, mode)
+    assert (selection.name, selection.layout) == (backend, layout)
+
+
+def test_fp8_runtime_compute_conflict(monkeypatch):
+    from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe import (
+        select_fp8_method,
+    )
+
+    original, runtime = object(), object()
+    monkeypatch.setattr(
+        ilu_compute, "compute_options", lambda section: {"mode": "ixmm_fp4fp8"}
+    )
+    with pytest.raises(ValueError, match="cannot be combined"):
+        select_fp8_method(original, runtime)
+    monkeypatch.setattr(
+        ilu_compute, "compute_options", lambda section: {"mode": "auto"}
+    )
+    assert select_fp8_method(original, runtime) is runtime
+    assert select_fp8_method(original, None) is original

@@ -41,7 +41,7 @@ class _IluComputeExperts(FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_activation(activation):
-        return activation.value in ("silu", "swiglu")
+        return activation.value in ("silu", "swiglu", "swiglustep")
 
     @staticmethod
     def _supports_parallel_config(config):

@@ -709,6 +709,7 @@ def resolve_ilu_runtime_method(
     base_quant_config: QuantizationConfig,
     original_method: QuantizeMethodBase | None,
     original_disposition: str,
+    unsupported_reason: str | None = None,
     layer: torch.nn.Module,
     prefix: str,
 ) -> QuantizeMethodBase | None:
@@ -718,6 +719,8 @@ def resolve_ilu_runtime_method(
     group = config.select_group(layer, prefix, base_quant_config.packed_modules_mapping)
     if group is None:
         return None
+    if unsupported_reason is not None:
+        raise ValueError(f"{prefix}: {unsupported_reason}")
     required = group.require.original_disposition
     if required != "any" and required != original_disposition:
         raise ValueError(

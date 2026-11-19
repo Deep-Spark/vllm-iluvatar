@@ -14,7 +14,7 @@ from tests.model_executor.layers.quantization.test_ilu_mxfp4_loader import (
 )
 from vllm_iluvatar.model_executor.model_loader.ilu_default_loader import (
     IluDefaultModelLoader,
-    Mxfp4LoadSession,
+    PairedLoadSession,
 )
 from vllm_iluvatar.model_executor.model_loader.ilu_paired_weights import (
     DeferredCheckpointTensor,
@@ -92,7 +92,7 @@ def route(model, files, session):
 def test_actual_routing_builds_pairs_across_files_and_layers(tmp_path, split_scales):
     model = MappedModel()
     files = checkpoint(tmp_path, model, split_scales=split_scales)
-    session = Mxfp4LoadSession(dict.fromkeys(model.loaders, "blocks"))
+    session = PairedLoadSession(dict.fromkeys(model.loaders, "blocks"))
     session.readers = SafetensorsReaders(capacity=2)
     session.bind()
     try:
@@ -130,7 +130,7 @@ def test_actual_routing_builds_pairs_across_files_and_layers(tmp_path, split_sca
 def test_missing_half_or_whole_pair_fails_before_conversion(tmp_path, roles):
     model = MappedModel(1)
     files = checkpoint(tmp_path, model, omit=[(0, 4, "w1", role) for role in roles])
-    session = Mxfp4LoadSession({model.loaders[0]: "block"})
+    session = PairedLoadSession({model.loaders[0]: "block"})
     session.bind()
     try:
         route(model, files, session)
@@ -147,7 +147,7 @@ def test_duplicate_sources_and_targets(tmp_path):
     files = checkpoint(tmp_path, model)
     with pytest.raises(ValueError, match="Duplicate checkpoint"):
         checkpoint_references(files + files[:1])
-    session = Mxfp4LoadSession({model.loaders[0]: "block"})
+    session = PairedLoadSession({model.loaders[0]: "block"})
     session.bind()
     try:
         route(model, files, session)
@@ -160,7 +160,7 @@ def test_duplicate_sources_and_targets(tmp_path):
 def test_deferred_views_and_unsupported_expert_data_transform(tmp_path):
     model = MappedModel(1)
     files = checkpoint(tmp_path, model)
-    session = Mxfp4LoadSession({model.loaders[0]: "block"})
+    session = PairedLoadSession({model.loaders[0]: "block"})
     session.bind()
     ref = next(r for r in checkpoint_references(files) if r.source.name == "source_000")
     tensor = DeferredCheckpointTensor(ref, session.readers)
@@ -289,7 +289,7 @@ def test_dspark_existing_loader_needs_no_pairing_interface(tmp_path, monkeypatch
         pad_shared_expert=False,
         load_own_embed_tokens=False,
     )
-    session = Mxfp4LoadSession({model.loaders[0]: "draft"})
+    session = PairedLoadSession({model.loaders[0]: "draft"})
     session.bind()
     try:
         loaded = dspark.IluDSparkV41DraftModel.load_weights(
@@ -311,7 +311,7 @@ def test_dspark_existing_loader_needs_no_pairing_interface(tmp_path, monkeypatch
 def test_conversion_failure_releases_allocated_buffers(tmp_path):
     model = MappedModel(1)
     files = checkpoint(tmp_path, model)
-    session = Mxfp4LoadSession({model.loaders[0]: "block"})
+    session = PairedLoadSession({model.loaders[0]: "block"})
     session.bind()
     route(model, files, session)
 
@@ -349,7 +349,7 @@ def test_cleanup_failure_invalidates_completed_session():
     from unittest.mock import Mock
 
     model = MappedModel(1)
-    session = Mxfp4LoadSession({model.loaders[0]: "block"})
+    session = PairedLoadSession({model.loaders[0]: "block"})
     session.bind()
     session.complete = True
     session.readers.close = Mock(side_effect=RuntimeError("close failed"))

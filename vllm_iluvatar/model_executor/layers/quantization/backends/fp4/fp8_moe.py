@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""ivcore30 backend for serialized block-FP8 routed experts."""
+"""Serialized block-FP8 routed experts, including paired whole-layer checkpoints."""
 
 from __future__ import annotations
-
-from typing import Any
 
 import torch
 from vllm.logger import init_logger
@@ -11,12 +9,9 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEActivationFormat,
     FusedMoEMethodBase,
     FusedMoEQuantConfig,
-    RoutedExperts,
-    SharedExperts,
 )
 from vllm.model_executor.layers.fused_moe.config import mxfp4_w4a8_moe_quant_config
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
-    FusedMoEExpertsModular,
     FusedMoEPrepareAndFinalizeModular,
 )
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
@@ -24,13 +19,11 @@ from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8Dynamic128Sym
-from vllm.model_executor.utils import replace_parameter
 
 from vllm_iluvatar import envs as ilu_envs
 from vllm_iluvatar.model_executor.layers.fused_moe.activation import swiglustep_limit
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
-    _ixmm_backend_available,
-    ilu_mxfp4_fused_experts,
+    _ixmm_backend_available,  # noqa: F401
 )
 from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.nvfp4_moe import (
     _get_ilu_output_scale,
@@ -63,7 +56,8 @@ def preprocess_fp8_block_weight_for_ixmm(
     verbatim, which is what guarantees the output is byte-compatible with the
     MXFP4/NVFP4 ix30 tensors the compute path already accepts.
 
-    This is the bulk path: it runs once in ``process_weights_after_loading``,
+    This retained diagnostic reference is not used by the Method lifecycle.
+    Historically it ran in ``process_weights_after_loading``,
     with the whole FP8 layer resident. MoE also has a load-time path
     (``ilu_fp8_to_fp4_moe.py``) that converts each checkpoint shard as it
     lands, through ixformer's ``preprocess_fp8_block_weight_for_ixmm`` op.
@@ -180,48 +174,29 @@ def _shrink_ll_max_tokens_to_decode(
 
 @IluvatarQuantRegistry.register_method
 class IluFp8MoEMethod(Fp8MoEMethod):
-    """Block-FP8 routed-expert method backed by ``ilu_mxfp4_fused_experts()``."""
+    """Block-FP8 source -> paired loader -> MoEWeights -> shared local compute.
 
-    # [ILU override] Fp8MoEMethod.__init__ — delta: skip the parent body (it
-    # calls select_fp8_moe_backend, which off NVIDIA raises or lands on an
-    # unusable backend) and mirror only the field initialisation the inherited
-    # ``create_weights`` needs.
-    #
-    # ``experts_cls`` is deliberately left unset (not None) so community
-    # ``FusedMoEMethodBase.is_monolithic`` never dereferences it; the explicit
-    # ``is_monolithic`` override below makes the answer independent of that
-    # subtlety regardless. See ``ilu_modelopt_nvfp4.py``.
-    def __init__(
-        self,
-        quant_config: Fp8Config | Any,
-        layer: RoutedExperts,
-        ilu_params: dict[str, Any] | None = None,
-    ) -> None:
+    Checkpoint tensor organization never selects execution. Model loaders adapt
+    their names/views to the community per-expert callback. All original FP8
+    experts use the same lifecycle and communication adapters as MXFP4.
+    """
+
+    def __init__(self, quant_config, layer, ilu_params=None):
         if not isinstance(quant_config, Fp8Config):
-            ilu_params = ilu_params or {}
-            weight_block_size = ilu_params.get("weight_block_size", [128, 128])
             quant_config = Fp8Config(
                 is_checkpoint_fp8_serialized=True,
                 activation_scheme="dynamic",
-                weight_block_size=weight_block_size,
+                weight_block_size=(ilu_params or {}).get(
+                    "weight_block_size", [128, 128]
+                ),
             )
-
-        # Skip Fp8MoEMethod.__init__, run its base directly.
         FusedMoEMethodBase.__init__(self, layer.moe_config)
         self.quant_config = quant_config
         self.weight_block_size = quant_config.weight_block_size
-        self.block_quant = self.weight_block_size is not None
-        # Block quant stores per-block scales under ``*_weight_scale_inv``; the
-        # inherited ``create_weights`` reads this name.
+        if self.weight_block_size is None:
+            raise ValueError("IluFp8MoEMethod requires block-FP8 weights")
+        self.block_quant = True
         self.weight_scale_name = "weight_scale_inv"
-
-        self.weight_scale_refine: tuple[int, int] | None = None
-        self.moe_block_shape = self.weight_block_size
-
-        # Set weight key and activation key for kernel compatibility
-        assert self.weight_block_size is not None
-        # Adapt the checkpoint block shape to TP sharding before
-        # building the weight key.
         self.moe_block_shape, self.weight_scale_refine = (
             resolve_fp8_moe_weight_block_shape(
                 self.moe,
@@ -230,227 +205,182 @@ class IluFp8MoEMethod(Fp8MoEMethod):
                 self.quant_config.is_checkpoint_fp8_serialized,
             )
         )
+        self.fp8_backend = self.moe_kernel = None
+        self.selection = None
+        self._checkpoint_loader = self._compute = self._runtime_weights = None
+        self.supports_pre_processed_weights = False
 
-        # No community backend is selected: the ix30 path is our own compute.
-        self.fp8_backend = None
-        self.moe_kernel = None
-
-        assert self.block_quant, (
-            "IluFp8MoEMethod only handles block-wise FP8 routed experts; "
-            "IluFp8Config.get_quant_method must not route per-tensor FP8 here"
-        )
-        assert not hasattr(self, "experts_cls"), (
-            "IluFp8MoEMethod must not define experts_cls; community "
-            "is_monolithic() would dereference it"
-        )
-        assert self.is_monolithic is False
-
-    # [ILU override] FusedMoEMethodBase.is_monolithic — delta: constant False.
-    # We always take the modular path (router first, then
-    # ``RoutedExperts.forward_modular`` -> ``apply``).
     @property
-    def is_monolithic(self) -> bool:
+    def is_monolithic(self):
         return False
 
-    # [ILU override] Fp8MoEMethod.supports_eplb — delta: community returns True.
-    # Phase 1's ixmm expert loop records no expert load, so claiming EPLB
-    # support would silently disable rebalancing; matches the NVFP4 method.
     @property
-    def supports_eplb(self) -> bool:
+    def supports_eplb(self):
         return False
 
-    # [ILU override] Fp8MoEMethod.maybe_make_prepare_finalize — delta: None.
-    # Community *raises* here (it assumes the modular-kernel init path);
-    # Iluvatar dispatch/combine is the naive EP-group path, so opt out.
-    def maybe_make_prepare_finalize(
+    def _select_compute(self):
+        if self.selection is None:
+            from vllm_iluvatar.config.ilu_compute import compute_options
+            from vllm_iluvatar.ilu_util.arch import cuda_arch
+
+            self.selection = select_fp8_compute(
+                cuda_arch(), compute_options("moe").get("mode", "auto")
+            )
+        return self.selection
+
+    def _compute_config(self, layer):
+        from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+            MoEComputeConfig,
+        )
+
+        activation = getattr(layer.activation, "value", layer.activation)
+        limit = getattr(layer, "swiglu_limit", None)
+        if activation == "swiglustep":
+            limit = swiglustep_limit(limit)
+        return MoEComputeConfig(
+            hidden=layer.moe_config.hidden_dim,
+            intermediate=layer.moe_config.intermediate_size_per_partition,
+            local_num_experts=layer.local_num_experts,
+            global_num_experts=layer.global_num_experts,
+            ep_rank=layer.moe_config.ep_rank,
+            activation=activation,
+            limit=limit,
+            output_scale=float(_get_ilu_output_scale(layer)),
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
+        )
+
+    def create_weights(
         self,
-        routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
-    ) -> FusedMoEPrepareAndFinalizeModular | None:
+        layer,
+        num_experts,
+        hidden_size,
+        intermediate_size_per_partition,
+        params_dtype,
+        **attrs,
+    ):
+        from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+            get_moe_backend,
+        )
+        from vllm_iluvatar.model_executor.layers.quantization.common.block_fp8_loader import (
+            BlockFp8LoadSpec,
+            make_block_fp8_loader,
+        )
+
+        if self._checkpoint_loader is not None:
+            raise RuntimeError("FP8 Method cannot create weights twice")
+        if (
+            self.moe.has_bias
+            or not self.moe.is_act_and_mul
+            or self.moe.hidden_dim_unpadded != hidden_size
+            or self.moe.intermediate_size_per_partition_unpadded
+            not in (None, intermediate_size_per_partition)
+        ):
+            raise ValueError(
+                "Block-FP8 loading requires unpadded bias-free gated experts"
+            )
+        selection = self._select_compute()
+        backend = get_moe_backend(selection)
+        error = backend.support_error(self._compute_config(layer), selection)
+        if error:
+            raise ValueError(error)
+        if backend.requires_contiguous_experts and layer.expert_map is not None:
+            start = self.moe.ep_rank * num_experts
+            expected = torch.full_like(layer.expert_map, -1)
+            expected[start : start + num_experts] = torch.arange(
+                num_experts, device=expected.device, dtype=expected.dtype
+            )
+            if not torch.equal(expected, layer.expert_map):
+                raise ValueError("W4A8 compute requires contiguous expert placement")
+        loader = make_block_fp8_loader(
+            backend.weight_specs[selection.layout],
+            BlockFp8LoadSpec(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                tuple(self.weight_block_size),
+                self.moe.tp_size,
+                self.moe.tp_rank,
+            ),
+        )
+        layer.params_dtype = params_dtype
+        self.num_experts = layer.num_experts = num_experts
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size_per_partition
+        loader.create_weights(layer, attrs)
+        self._checkpoint_loader = loader
+
+    def _bind_compute(self, layer, weights=None):
+        from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+            MoEWeights,
+            make_moe_compute,
+        )
+
+        if self._compute is not None:
+            raise RuntimeError("FP8 compute has already been bound")
+        compute = make_moe_compute(self._compute_config(layer), self._select_compute())
+        if weights is None:
+            weights = MoEWeights.from_layer(layer, compute.weight_spec)
+        compute.validate_weights(weights)
+        self._runtime_weights, self._compute = weights, compute
+        layer._ilu_mxfp4_ixmm = self.selection.name == "ixmm_fp4fp8"
+
+    def process_weights_after_loading(self, layer):
+        loader = self._checkpoint_loader
+        if loader is None or loader._layer is not layer or self._compute is not None:
+            raise RuntimeError("FP8 finalization requires its own newly loaded layer")
+        self._bind_compute(layer, loader.finalize())
+
+    def maybe_make_prepare_finalize(self, routing_tables=None):
         return FusedMoEMethodBase.maybe_make_prepare_finalize(self, routing_tables)
 
-    # [ILU override] Fp8MoEMethod.get_fused_moe_quant_config — delta: None. A
-    # ``FusedMoEQuantConfig`` only configures a community modular kernel, which
-    # we do not build. Returning None also keeps ``topk_indices_dtype`` at None
-    # so the router emits int32 ids -- the dtype ``ilu_mxfp4_fused_experts``
-    # expects.
-    def get_fused_moe_quant_config(
-        self, layer: RoutedExperts
-    ) -> FusedMoEQuantConfig | None:
-        activation = getattr(layer.activation, "value", layer.activation)
-        swiglu_limit = (
-            swiglustep_limit(getattr(layer, "swiglu_limit", None))
-            if activation == "swiglustep"
-            else None
-        )
-        return mxfp4_w4a8_moe_quant_config(
+    def get_fused_moe_quant_config(self, layer):
+        if self._select_compute().name == "ixmm_fp4fp8":
+            return mxfp4_w4a8_moe_quant_config(
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                gemm1_clamp_limit=self._compute_config(layer).limit,
+            )
+        return FusedMoEQuantConfig.make(
+            torch.int8,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            gemm1_clamp_limit=swiglu_limit,
+            per_act_token_quant=True,
+            weight_dtype="int4",
         )
 
-    def select_gemm_impl(
-        self,
-        prepare_finalize: FusedMoEPrepareAndFinalizeModular,
-        layer: RoutedExperts,
-    ) -> FusedMoEExpertsModular:
-        from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.batch_experts import (
-            IluMoEBatchedExpertsFp8,
+    def select_gemm_impl(self, prepare_finalize, layer):
+        from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_experts import (
+            bind_compute_experts,
         )
 
+        if self._compute is None:
+            raise RuntimeError(
+                "FP8 weights must be finalized before binding communication"
+            )
         if (
             prepare_finalize.activation_format
-            != FusedMoEActivationFormat.BatchedExperts
+            == FusedMoEActivationFormat.BatchedExperts
         ):
-            raise NotImplementedError(
-                "IluMoEBatchedExpertsFp8 requires the batched activation format, "
-                f"got {prepare_finalize.activation_format}"
-            )
-        _shrink_ll_max_tokens_to_decode(prepare_finalize)
-        max_num_tokens = prepare_finalize.max_num_tokens_per_rank()
-        if max_num_tokens is None:
-            raise ValueError("batched FP8 experts require max_num_tokens")
-        assert self.moe_quant_config is not None
-        return IluMoEBatchedExpertsFp8(
-            moe_config=self.moe,
-            quant_config=self.moe_quant_config,
-            max_num_tokens=max_num_tokens,
-            num_dispatchers=prepare_finalize.num_dispatchers(),
-            swiglu_limit=self.moe_quant_config.gemm1_clamp_limit,
+            _shrink_ll_max_tokens_to_decode(prepare_finalize)
+        return bind_compute_experts(
+            self._compute,
+            self._runtime_weights,
+            self.moe,
+            self.moe_quant_config,
+            prepare_finalize,
         )
 
-    # [ILU override] Fp8MoEMethod.process_weights_after_loading — delta: replace
-    # community's ``select_fp8_moe_backend`` + kernel build with a block-FP8 ->
-    # ix30 conversion, then drop the now-unused ``*_weight_scale_inv`` so they do
-    # not stay resident (see plan §4). The dynamic activation scheme means there
-    # are no ``*_input_scale`` params to drop.
-    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
-        if not _ixmm_backend_available():
-            raise RuntimeError(
-                "IluFp8MoEMethod requires the ixmm backend (ix30 group_gemm_fp4 "
-                "only accepts the preprocessed uint8 layout). Install the ixmm "
-                "wheel and rebuild ixformer with HAVE_IXMM on ivcore30."
-            )
-
-        # Use the runtime (TP-refined) block shape, NOT the checkpoint one.
-        # When TP slicing leaves ``intermediate_size_per_partition`` indivisible
-        # by the checkpoint block, ``resolve_fp8_moe_weight_block_shape``
-        # (mirrored in ``__init__``) refines the grid (e.g. 128 -> 32) and the
-        # inherited ``create_weights`` + loader upsample ``weight_scale_inv``
-        # onto that finer grid. Dequant stays mathematically identical (every
-        # fine sub-block inherits its parent scale), but the element-wise scale
-        # expansion below must use the grid the parameter actually carries --
-        # passing the checkpoint block here would repeat-and-truncate into
-        # silently wrong scales.
-        block = (self.moe_block_shape[0], self.moe_block_shape[1])
-
-        for w_name, s_in_name, s_out_name in (
-            ("w13_weight", "w13_weight_scale_inv", "w13_weight_scale"),
-            ("w2_weight", "w2_weight_scale_inv", "w2_weight_scale"),
-        ):
-            w = getattr(layer, w_name)
-            s = getattr(layer, s_in_name)
-            assert w.dtype is torch.float8_e4m3fn, (
-                f"{w_name} expected float8_e4m3fn, got {w.dtype}"
-            )
-            assert s.dtype is torch.float32, (
-                f"{s_in_name} expected float32, got {s.dtype}"
-            )
-
-            weight_parts: list[torch.Tensor] = []
-            scale_parts: list[torch.Tensor] = []
-            allow_k_padding = w_name == "w2_weight"
-            for begin in range(0, w.shape[0], _IXMM_EXPERT_CHUNK):
-                end = min(begin + _IXMM_EXPERT_CHUNK, w.shape[0])
-                ixmm_weight, ixmm_scale = preprocess_fp8_block_weight_for_ixmm(
-                    w[begin:end],
-                    s[begin:end],
-                    block,
-                    allow_k_padding,
-                )
-                weight_parts.append(ixmm_weight)
-                scale_parts.append(ixmm_scale)
-
-            ixmm_weight = torch.cat(weight_parts, dim=0).contiguous()
-            ixmm_scale = torch.cat(scale_parts, dim=0).contiguous()
-            if not allow_k_padding:
-                # Un-packed input [E, n, k] -> ix30 weight [E, k/2, n] + scale
-                # [E, k/256, n].
-                expected_weight_shape = (w.shape[0], w.shape[2] // 2, w.shape[1])
-                expected_scale_shape = (
-                    w.shape[0],
-                    w.shape[2] // _IXMM_GROUP_SIZE,
-                    w.shape[1],
-                )
-            else:
-                padded_k = (
-                    (w.shape[2] + _IXMM_GROUP_SIZE - 1)
-                    // _IXMM_GROUP_SIZE
-                    * _IXMM_GROUP_SIZE
-                )
-                expected_weight_shape = (w.shape[0], padded_k // 2, w.shape[1])
-                expected_scale_shape = (
-                    w.shape[0],
-                    padded_k // _IXMM_GROUP_SIZE,
-                    w.shape[1],
-                )
-
-            if tuple(ixmm_weight.shape) != expected_weight_shape:
-                raise ValueError(
-                    f"preprocess_fp8_block_weight_for_ixmm returned shape "
-                    f"{tuple(ixmm_weight.shape)} for {w_name}, expected "
-                    f"{expected_weight_shape}"
-                )
-            if tuple(ixmm_scale.shape) != expected_scale_shape:
-                raise ValueError(
-                    f"preprocess_fp8_block_weight_for_ixmm returned shape "
-                    f"{tuple(ixmm_scale.shape)} for {s_in_name}, expected "
-                    f"{expected_scale_shape}"
-                )
-            replace_parameter(layer, w_name, ixmm_weight)
-            # ix30 scale lives under a new name (``*_weight_scale``); the
-            # community ``*_weight_scale_inv`` is dropped below.
-            layer.register_parameter(
-                s_out_name,
-                torch.nn.Parameter(ixmm_scale, requires_grad=False),
-            )
-
-        for name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
-            if name in layer._parameters:
-                del layer._parameters[name]
-            elif hasattr(layer, name):
-                delattr(layer, name)
-
-        layer._ilu_mxfp4_ixmm = True
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    # [ILU override] Fp8MoEMethod.apply — delta: wiring only. Community delegates
-    # to ``self.moe_kernel.apply``; we call the plugin's ixmm compute with
-    # explicit tensors, selecting the Step-3.5 ``step3_swiglustep`` variant and
-    # deriving its numeric clamp from ``layer.activation``. Block-FP8 routed
-    # experts carry no bias, and the shared output arrives through
-    # ``shared_experts_input`` (``extra_residual``), so ``shared_experts`` is
-    # accepted for signature compatibility but unused.
     def apply(
-        self,
-        layer: RoutedExperts,
-        x: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        shared_experts: SharedExperts | None,
-        shared_experts_input: torch.Tensor | None,
-    ) -> torch.Tensor:
-        activation = getattr(layer, "activation", "silu")
-        activation = getattr(activation, "value", activation)
-        swiglu_limit = (
-            swiglustep_limit(getattr(layer, "swiglu_limit", None))
-            if activation == "swiglustep"
-            else 0.0
-        )
-        # Step5 routes each token to distinct experts. For 17–64 gathered
-        # rows, mode 1 can cover every W13 expert; smaller batches already use
-        # the small tile automatically. W2 keeps the backend's default.
-        w13_gemm_mode = (
+        self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input
+    ):
+        if self._compute is None:
+            raise RuntimeError("FP8 weights have not been finalized")
+        residual = shared_experts_input
+        if residual is not None and residual.shape[0] != x.shape[0]:
+            residual = None
+        # Preserve the measured Step5 W13 tile choice without selecting a
+        # different weight format, quantization lifecycle or compute backend.
+        mode = (
             1
             if getattr(layer, "_ilu_step5_native_activation", False)
             and ilu_envs.VLLM_ILU_STEP5_FP4_SMALL_TILES
@@ -458,21 +388,35 @@ class IluFp8MoEMethod(Fp8MoEMethod):
             and 16 < topk_ids.shape[0] <= 64
             else None
         )
-        return ilu_mxfp4_fused_experts(
-            hidden_states=x,
-            w13_weight=layer.w13_weight,
-            w13_weight_scale=layer.w13_weight_scale,
-            w2_weight=layer.w2_weight,
-            w2_weight_scale=layer.w2_weight_scale,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            swiglu_limit=swiglu_limit,
-            expert_map=layer.expert_map,
-            output_scale=_get_ilu_output_scale(layer),
-            extra_residual=shared_experts_input,
-            w13_bias=None,
-            w2_bias=None,
-            backend="ixmm",
-            w13_gemm_mode=w13_gemm_mode,
-            swiglu_variant="step3_swiglustep",
+        workspace = self._compute.workspace_spec(topk_ids.numel(), x.dtype).allocate(
+            x.device
         )
+        return self._compute.run_standard(
+            x,
+            self._runtime_weights,
+            topk_weights,
+            topk_ids,
+            layer.expert_map,
+            workspace=workspace,
+            residual=residual,
+            w13_gemm_mode=mode,
+        )
+
+
+def select_fp8_compute(arch, mode="auto"):
+    from vllm_iluvatar.config.ilu_compute import select_four_bit_expert_compute
+
+    return select_four_bit_expert_compute(arch, mode, source="block-FP8")
+
+
+def select_fp8_method(original, runtime):
+    """Resolve explicit conversion before original-source compute preferences."""
+    if runtime is not None:
+        from vllm_iluvatar.config.ilu_compute import compute_options
+
+        if any(value != "auto" for value in compute_options("moe").values()):
+            raise ValueError(
+                "Explicit ilu_quant MoE conversion cannot be combined with ilu_compute.moe overrides yet"
+            )
+        return runtime
+    return original

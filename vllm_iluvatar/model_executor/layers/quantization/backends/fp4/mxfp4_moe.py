@@ -675,36 +675,10 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
         )
 
 
-# Public MXFP4 execution modes. Backend/layout mechanics remain internal; source
-# compatibility and the supported platform matrix belong to the Method policy.
-_MXFP4_MODES = {
-    "ivcore11": {
-        "ixinfer_w4a8_nn_v2": ("ixinfer_w4a8", "NN"),
-        "ixinfer_w4a8_tn_v2": ("ixinfer_w4a8", "TN"),
-    },
-    "ivcore30": {
-        "ixmm_fp4fp8": ("ixmm_fp4fp8", "fp4fp8"),
-        "ixmm_w4a8_nn": ("ixmm_w4a8", "NN"),
-    },
-}
-_MXFP4_DEFAULTS = {"ivcore11": "ixinfer_w4a8_nn_v2", "ivcore30": "ixmm_fp4fp8"}
-
-
 def select_mxfp4_compute(arch, mode="auto"):
-    """Resolve one public mode before loading; reject unsupported overrides."""
-    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
-        select_moe_backend,
-    )
+    from vllm_iluvatar.config.ilu_compute import select_four_bit_expert_compute
 
-    modes = _MXFP4_MODES.get(arch, {})
-    if mode == "auto":
-        mode = _MXFP4_DEFAULTS.get(arch)
-    if not isinstance(mode, str) or mode not in modes:
-        raise ValueError(
-            f"Unsupported MXFP4 mode {mode!r} on {arch}; supported: {tuple(modes)}"
-        )
-    name, layout = modes[mode]
-    return select_moe_backend(arch, name=name, layout=layout)
+    return select_four_bit_expert_compute(arch, mode, source="MXFP4")
 
 
 def select_mxfp4_method(layer, original, runtime=None):

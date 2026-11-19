@@ -66,7 +66,7 @@ def test_non_native_model_config_warns_once(monkeypatch, hc_mult, hidden_dim):
 
 
 @requires_cuda
-@pytest.mark.parametrize("hidden", [4096, 6144])
+@pytest.mark.parametrize("hidden", [3072, 4096, 6144])
 @pytest.mark.parametrize("tokens", [1, 4, 64, 65, 256])
 @torch.inference_mode()
 def test_bi_ihc_matches_eager(monkeypatch, hidden, tokens):

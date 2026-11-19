@@ -25,7 +25,8 @@ from vllm_iluvatar.model_executor.layers.quantization.common.mxfp4_loader import
     "backend,layout",
     [("ixinfer_w4a8", "TN"), ("ixinfer_w4a8", "NN"), ("ixmm_w4a8", "NN")],
 )
-def test_w4a8_runtime_weight_contract(backend, layout):
+@pytest.mark.parametrize("source", ["mxfp4", "block_fp8"])
+def test_w4a8_runtime_weight_contract(backend, layout, source):
     arch = cuda_arch()
     if (backend == "ixmm_w4a8" and arch != "ivcore30") or (
         backend == "ixinfer_w4a8" and layout == "NN" and arch != "ivcore11"
@@ -33,16 +34,43 @@ def test_w4a8_runtime_weight_contract(backend, layout):
         pytest.skip("Not a supported architecture/layout combination")
     torch.manual_seed(41)
     e, n, k = 2, 512, 512
-    raw = torch.randint(0, 256, (e, n, k // 2), device="cuda", dtype=torch.uint8)
-    scales = torch.randint(119, 123, (e, n, k // 32), device="cuda", dtype=torch.uint8)
-    pairs = [mxfp4_channel_int4(raw[j], scales[j]) for j in range(e)]
-    logical = torch.stack([p[0] for p in pairs])
-    channel = torch.stack([p[1] for p in pairs])
+    if source == "mxfp4":
+        raw = torch.randint(0, 256, (e, n, k // 2), device="cuda", dtype=torch.uint8)
+        scales = torch.randint(
+            119, 123, (e, n, k // 32), device="cuda", dtype=torch.uint8
+        )
+        pairs = [mxfp4_channel_int4(raw[j], scales[j]) for j in range(e)]
+        logical = torch.stack([p[0] for p in pairs])
+        channel = torch.stack([p[1] for p in pairs])
+        scale_rows, weight_cols, scale_cols = 1, 2, 32
+    else:
+        # Independent decoded source and two-stage channel quantization oracle.
+        # The GEMM consumes the real FP8 loader's native output below.
+        raw = (torch.randn(e, n, k) * 30).to(torch.float8_e4m3fn)
+        scales = (torch.rand(e, n // 128, k // 128) + 0.1).to(torch.bfloat16)
+        decoded = raw.float() * scales.float().repeat_interleave(
+            128, 1
+        ).repeat_interleave(128, 2)
+        channel = decoded.abs().amax(-1) / 127
+        channel = torch.where(channel == 0, 1.0, channel)
+        logical = (
+            (decoded / channel.unsqueeze(-1)).round().clamp(-127, 127) / 18
+        ).round()
+        logical, channel = logical.cuda(), channel.cuda()
+        scale_rows, weight_cols, scale_cols = 128, 1, 128
     layer = torch.nn.Module()
     layer._map_global_expert_id_to_local_expert_id = lambda expert: expert
     selection = select_moe_backend(arch, name=backend, layout=layout)
     spec = get_moe_backend(selection).weight_specs[layout]
-    loader = make_mxfp4_loader(spec, Mxfp4LoadSpec(e, k, n // 2))
+    if source == "mxfp4":
+        loader = make_mxfp4_loader(spec, Mxfp4LoadSpec(e, k, n // 2))
+    else:
+        from vllm_iluvatar.model_executor.layers.quantization.common.block_fp8_loader import (
+            BlockFp8LoadSpec,
+            make_block_fp8_loader,
+        )
+
+        loader = make_block_fp8_loader(spec, BlockFp8LoadSpec(e, k, n // 2, (128, 128)))
     with torch.device("cuda"):
         loader.create_weights(layer, {})
     buffer = Mxfp4UploadBuffer(loader.staging_bytes, layer.w13_weight.device)
@@ -50,9 +78,13 @@ def test_w4a8_runtime_weight_contract(backend, layout):
     addresses = (buffer.host.data_ptr(), buffer.gpu.data_ptr())
     for expert in range(e):
         for shard, w, sc in (
-            ("w1", raw[expert, : n // 2], scales[expert, : n // 2]),
-            ("w3", raw[expert, n // 2 :], scales[expert, n // 2 :]),
-            ("w2", raw[expert, :k, : n // 4], scales[expert, :k, : n // 64]),
+            ("w1", raw[expert, : n // 2], scales[expert, : n // 2 // scale_rows]),
+            ("w3", raw[expert, n // 2 :], scales[expert, n // 2 // scale_rows :]),
+            (
+                "w2",
+                raw[expert, :k, : n // 2 // weight_cols],
+                scales[expert, : k // scale_rows, : n // 2 // scale_cols],
+            ),
         ):
             group = "w2" if shard == "w2" else "w13"
             loader.load_shard(group, False, w.cpu(), shard, expert)
@@ -101,8 +133,17 @@ def test_w4a8_runtime_weight_contract(backend, layout):
     torch.testing.assert_close(out, expected, rtol=0.016, atol=0.016)
 
 
-def test_fp4fp8_independent_forward_matches_existing_contract():
-    activation, variant, limit = "silu", "dsv4_clamp", 10.0
+@pytest.mark.parametrize(
+    "activation,variant,limit",
+    [
+        ("silu", "dsv4_clamp", 10.0),
+        ("swiglustep", "step3_swiglustep", 3.0),
+        ("silu", "step3_swiglustep", None),
+    ],
+)
+def test_fp4fp8_independent_forward_matches_existing_contract(
+    activation, variant, limit
+):
     if cuda_arch() != "ivcore30":
         pytest.skip("FP4FP8 requires ivcore30")
     from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_ixmm_fp4fp8 import (
@@ -175,12 +216,43 @@ def test_fp4fp8_independent_forward_matches_existing_contract():
         layer.w2_weight_scale,
         scores,
         ids,
-        swiglu_limit=limit,
+        swiglu_limit=limit if limit is not None else 0.0,
         expert_map=layer.expert_map,
         backend="ixmm",
         swiglu_variant=variant,
     )
     torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    # Exercise the Method's actual backend binding, late runner scaling and
+    # shared residual through the same public apply entry used by model runners.
+    from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe import (
+        IluFp8MoEMethod,
+    )
+
+    method = object.__new__(IluFp8MoEMethod)
+    method.selection = compute.selection
+    method._compute = None
+    layer._ilu_output_scale = 2.5
+    method._bind_compute(layer, runtime)
+    residual = torch.randn_like(x) * 0.25
+    merged = method.apply(layer, x, scores, ids, None, residual)
+    expected_merged = ilu_mxfp4_fused_experts(
+        x,
+        runtime.w13_weight,
+        runtime.w13_weight_scale,
+        runtime.w2_weight,
+        runtime.w2_weight_scale,
+        scores,
+        ids,
+        swiglu_limit=limit if limit is not None else 0.0,
+        expert_map=layer.expert_map,
+        output_scale=2.5,
+        extra_residual=residual,
+        backend="ixmm",
+        swiglu_variant=variant,
+    )
+    torch.testing.assert_close(merged, expected_merged, rtol=0, atol=0)
+    with pytest.raises(RuntimeError, match="already been bound"):
+        method._bind_compute(layer, runtime)
     # Replay with changed routing, so capture cannot freeze expert metadata.
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

@@ -42,6 +42,7 @@
     "glm45"
   ],
   "environment": {
+    "CUDA_MODULE_LOADING": "EAGER",
     "VLLM_HOST_IP": "127.0.0.1",
     "HF_HUB_OFFLINE": "1",
     "TRANSFORMERS_OFFLINE": "1",

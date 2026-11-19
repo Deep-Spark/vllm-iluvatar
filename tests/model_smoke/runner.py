@@ -26,6 +26,9 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+WORKER_SHUTDOWN_SECONDS = 30
+ENGINE_SHUTDOWN_SECONDS = 90
+API_EXIT_GRACE_SECONDS = 30
 METRICS = (
     "vllm:spec_decode_num_drafts_total",
     "vllm:spec_decode_num_draft_tokens_total",
@@ -34,6 +37,10 @@ METRICS = (
 FATAL = re.compile(
     r"EngineDeadError|CUDA out of memory|OutOfMemoryError|"
     r"(?i:worker[^\n]*(?:died unexpectedly|exited unexpectedly))"
+)
+
+FORCED_SHUTDOWN = re.compile(
+    r"\[shutdown\].*(?:force killing remaining process|sending SIGKILL)"
 )
 
 
@@ -518,7 +525,7 @@ class RunControl:
     def terminate(proc):
         if proc.poll() is None:
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGTERM)
+                proc.terminate()
 
     def register(self, proc):
         with self.lock:
@@ -558,35 +565,81 @@ def server_ready(base, served, proc, timeout, control=None):
     raise TimeoutError("Model startup timeout")
 
 
-def stop_process(proc):
+def process_group_members(group):
+    live = []
+    for stat in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            fields = stat.read_text().rsplit(")", 1)[1].split()
+            if int(fields[2]) == group and fields[0] not in ("Z", "X"):
+                live.append(stat.parent.name)
+        except (OSError, ValueError, IndexError):
+            continue
+    return live
+
+
+def wait_process_group(proc, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        proc.poll()
+        if not process_group_members(proc.pid):
+            proc.wait(timeout=10)
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
+def log_shutdown_waiters(group, model_id, sig):
+    waiters = []
+    for pid in process_group_members(group):
+        path = Path("/proc") / pid
+        try:
+            name = (path / "comm").read_text().strip()
+            argv = (path / "cmdline").read_bytes().split(b"\0")
+            if (
+                len(argv) > 2
+                and argv[1] == b"-c"
+                and argv[2].startswith(
+                    b"from multiprocessing.resource_tracker import main;"
+                )
+            ):
+                name = "multiprocessing.resource_tracker"
+            waiters.append((pid, name, (path / "wchan").read_text().strip()))
+        except OSError:
+            continue
+    print(
+        f"[model-smoke] {model_id} escalating to {sig.name} for pgid={group}; "
+        f"remaining (pid, name, wchan): {waiters}",
+        flush=True,
+    )
+
+
+def stop_process(proc, model_id="server"):
     if proc is None:
         return
-    # The session/group belongs only to this server. Always clean descendants,
-    # even if the group leader already died; never pkill another model/server.
+    # Let the API server drain its EngineCore/worker hierarchy before signalling
+    # descendants. Signalling the whole group immediately bypasses that cleanup.
+    with contextlib.suppress(ProcessLookupError):
+        proc.terminate()
+    if wait_process_group(proc, ENGINE_SHUTDOWN_SECONDS + API_EXIT_GRACE_SECONDS):
+        return
+    # The session/group belongs only to this server. Clean orphaned workers too,
+    # even if the API server exited; retain the devices if any member survives.
+    log_shutdown_waiters(proc.pid, model_id, signal.SIGTERM)
     with contextlib.suppress(ProcessLookupError):
         os.killpg(proc.pid, signal.SIGTERM)
-    with contextlib.suppress(subprocess.TimeoutExpired):
-        proc.wait(timeout=20)
+    if wait_process_group(proc, 10):
+        return
+    log_shutdown_waiters(proc.pid, model_id, signal.SIGKILL)
     with contextlib.suppress(ProcessLookupError):
         os.killpg(proc.pid, signal.SIGKILL)
     proc.wait(timeout=10)
-    deadline = time.monotonic() + 10
-    while True:
-        live = []
-        for stat in Path("/proc").glob("[0-9]*/stat"):
-            try:
-                fields = stat.read_text().rsplit(")", 1)[1].split()
-                if int(fields[2]) == proc.pid and fields[0] not in ("Z", "X"):
-                    live.append(stat.parent.name)
-            except (OSError, ValueError, IndexError):
-                continue
-        if not live:
-            return
-        if time.monotonic() >= deadline:
-            raise RuntimeError(
-                "Server processes remain after SIGKILL: " + ",".join(live)
-            )
-        time.sleep(0.1)
+    if not wait_process_group(proc, 10):
+        raise RuntimeError(
+            "Server processes remain after SIGKILL: "
+            + ",".join(process_group_members(proc.pid))
+        )
+    raise RuntimeError("Server required SIGKILL; GPU resource cleanup is unverified")
 
 
 def run_model(model, cases, args, control=None):
@@ -633,6 +686,8 @@ def run_model(model, cases, args, control=None):
             "127.0.0.1",
             "--port",
             str(port),
+            "--shutdown-timeout",
+            str(ENGINE_SHUTDOWN_SECONDS),
         ]
         command += [
             str(a).replace("{master_port}", str(master_port))
@@ -658,6 +713,7 @@ def run_model(model, cases, args, control=None):
             CUDA_VISIBLE_DEVICES=",".join(devices[: model["logical_gpus"]]),
             VLLM_HOST_IP="127.0.0.1",
             VLLM_USAGE_STATS_DISABLED="1",
+            VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS=str(WORKER_SHUTDOWN_SECONDS),
             HF_HUB_OFFLINE="1",
             TRANSFORMERS_OFFLINE="1",
             OMP_NUM_THREADS="1",
@@ -679,6 +735,7 @@ def run_model(model, cases, args, control=None):
                 "HF_HUB_OFFLINE",
                 "TRANSFORMERS_OFFLINE",
                 "VLLM_HOST_IP",
+                "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS",
             }
         }
         write_json(
@@ -775,7 +832,15 @@ def run_model(model, cases, args, control=None):
         control.unregister(proc)
         cleanup_start = time.monotonic()
         try:
-            stop_process(proc)
+            stop_process(proc, model["id"])
+            if log:
+                log.flush()
+                with (directory / "server.log").open(errors="replace") as stream:
+                    for line in stream:
+                        if FORCED_SHUTDOWN.search(line):
+                            raise RuntimeError(
+                                "Forced engine/worker shutdown: " + line[:500].strip()
+                            )
         except Exception as exc:
             result["failures"].append("Server cleanup failed: " + str(exc))
             result["cleanup_failed"] = True

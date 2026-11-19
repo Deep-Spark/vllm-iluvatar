@@ -13,6 +13,36 @@ import pytest
 vllm_envs = importlib.import_module("vllm.envs")
 
 
+@pytest.mark.parametrize(
+    ("command", "should_load"),
+    [
+        ("from multiprocessing.resource_tracker import main;main(17)", False),
+        (
+            "from multiprocessing.spawn import spawn_main; spawn_main(pipe_handle=17)",
+            True,
+        ),
+        (
+            "from multiprocessing.resource_tracker import main;main(17); import vllm",
+            True,
+        ),
+    ],
+)
+def test_early_patch_for_child_interpreter(monkeypatch, command, should_load):
+    plugin = importlib.import_module("vllm_iluvatar")
+    monkeypatch.setattr(sys, "orig_argv", [sys.executable, "-c", command])
+    monkeypatch.delitem(
+        sys.modules, "vllm_iluvatar._early_import_compat", raising=False
+    )
+    attempts = []
+    monkeypatch.setattr(
+        importlib.util,
+        "spec_from_file_location",
+        lambda name, path: attempts.append(name),
+    )
+    plugin._load_import_compat_patch()
+    assert attempts == (["vllm_iluvatar._early_import_compat"] if should_load else [])
+
+
 def test_dsa_indexer_prepare_env_reader_defaults_on(monkeypatch):
     name = "VLLM_ILU_GLM_DSA_INDEXER_PREPARE_FUSION"
     envs = importlib.import_module("vllm_iluvatar.envs")

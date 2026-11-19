@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -68,6 +69,19 @@ def _load_import_compat_patch() -> None:
     raise ``JSONDecodeError``. Routing them to stderr during the patch keeps the
     pipe clean; vllm's handler stream is restored to the real stdout afterwards.
     """
+    # The stdlib tracker only owns a pipe and IPC names. Importing the GPU
+    # stack here makes it tear down Torch after the last service process exits.
+    argv = sys.orig_argv
+    if (
+        len(argv) >= 2
+        and argv[-2] == "-c"
+        and re.fullmatch(
+            r"from multiprocessing\.resource_tracker import main;main\([0-9]+\)",
+            argv[-1],
+        )
+    ):
+        return
+
     module_name = "vllm_iluvatar._early_import_compat"
     if module_name in sys.modules:
         return

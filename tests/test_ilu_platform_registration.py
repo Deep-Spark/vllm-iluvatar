@@ -102,6 +102,8 @@ def test_new_ilu_env_readers_are_registered(monkeypatch):
     ("name", "default", "enabled"),
     [
         ("VLLM_ILU_V41_PREFILL_UNSORTED", False, True),
+        ("VLLM_ILU_V41_PACKED_INT8_DISPATCH", False, True),
+        ("VLLM_ILU_V41_MOE_SKIP_SORT", False, True),
         ("VLLM_ILU_V41_PREFILL_SCORE_MASK", False, True),
         ("VLLM_ILU_V41_FUSED_Q_QUANT", True, False),
         ("VLLM_ILU_V41_FP8_NORM_SMALL_BATCH", True, False),

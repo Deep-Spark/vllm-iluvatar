@@ -96,6 +96,29 @@ def _get_ilu_output_scale(layer: RoutedExperts) -> float:
     return getattr(layer, "_ilu_output_scale", 1.0)
 
 
+def _v41_decode_skip_sort(layer) -> bool:
+    from vllm_iluvatar import envs
+
+    if not (
+        getattr(layer, "_ilu_v41_skip_sort_supported", False)
+        and envs.VLLM_ILU_V41_MOE_SKIP_SORT
+    ):
+        return False
+    from vllm.forward_context import get_forward_context
+
+    ctx = get_forward_context()
+    if ctx.dp_metadata is not None:
+        return ctx.dp_metadata.all_ranks_decode_only
+    metadata = ctx.attn_metadata
+    if not isinstance(metadata, dict) or not metadata:
+        return False
+    return all(
+        getattr(value, "num_prefill_tokens", None) == 0
+        and getattr(value, "num_decode_tokens", 0) > 0
+        for value in metadata.values()
+    )
+
+
 class IluMxfp4MoEMethod(Mxfp4MoEMethod):
     """Load MXFP4 checkpoints and compose the selected runtime expert backend.
 
@@ -465,6 +488,7 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
             w13_bias=getattr(layer, "w13_bias", None),
             w2_bias=getattr(layer, "w2_bias", None),
             backend=None,
+            skip_moe_sort=_v41_decode_skip_sort(layer),
         )
 
     def _compute_config(self, layer):

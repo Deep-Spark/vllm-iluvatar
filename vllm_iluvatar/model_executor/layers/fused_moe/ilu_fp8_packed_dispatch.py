@@ -311,6 +311,10 @@ def maybe_packed_experts(owner, hidden_states, input_ids, ctx, group, sizes):
         w2_bias=None,
         gemm_backend="ixmm",
         gemm_mode=mode,
+        skip_moe_sort=(
+            getattr(layer, "_ilu_v41_skip_sort_supported", False)
+            and envs.VLLM_ILU_V41_MOE_SKIP_SORT
+        ),
         swiglu_variant="dsv4_clamp",
         quantized_input=(gathered[:, :5120].view(torch.float8_e4m3fn), full_scales),
     )

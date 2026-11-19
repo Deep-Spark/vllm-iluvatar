@@ -885,8 +885,8 @@ def test_ixformer_pipeline_wires_args_correctly(
     assert r_args[2] == w13_n.shape[0]
     assert r_kwargs["expert_map"] is None
     assert r_kwargs["group_layout"] is group_layout
-    # Decode-sized batches (M<=256) skip expert-count sort: layout is [E, 2].
-    assert tuple(r_kwargs["group_layout"].shape) == (w13_n.shape[0], 2)
+    # Small batches retain sorting unless the model caller explicitly opts in.
+    assert tuple(r_kwargs["group_layout"].shape) == (w13_n.shape[0], 3)
 
     # 2) expand: dst_to_src + top_k forwarded.
     expand_call = fake_ixfops.moe_expand_input_dynamic_scaled_fp8
@@ -969,7 +969,8 @@ def test_ixmm_uses_parameterized_fused_packed_swiglu_quant(
     fake_ixfops.fp8_per_token_dynamic_scaled.assert_not_called()
 
 
-def test_ixmm_pipeline_pads_only_w2_k(monkeypatch):
+@pytest.mark.parametrize("skip_sort", [False, True])
+def test_ixmm_pipeline_pads_only_w2_k(monkeypatch, skip_sort):
     """w13 keeps its K while w2 and the SwiGLU activation pad 640 to 768."""
     expert_count = 4
     hidden_size = 256
@@ -1026,9 +1027,15 @@ def test_ixmm_pipeline_pads_only_w2_k(monkeypatch):
         w13_bias=None,
         w2_bias=None,
         gemm_backend="ixmm",
+        skip_moe_sort=skip_sort,
         gemm_mode=0,
         swiglu_variant="dsv4_clamp",
     )
+
+    layout = fake_ixfops.moe_compute_token_index_ep_group_layout.call_args.kwargs[
+        "group_layout"
+    ]
+    assert layout.shape == (expert_count, 2 if skip_sort else 3)
 
     expand_input = fake_ixfops.moe_expand_input_dynamic_scaled_fp8.call_args.args[0]
     assert expand_input is hidden_states
@@ -1099,4 +1106,38 @@ def test_ixformer_pipeline_forwards_expert_map_without_remapping(
     assert r_args[1] == 0
     assert r_args[2] == expert_count
     assert r_kwargs["expert_map"] is expert_map
-    assert tuple(r_kwargs["group_layout"].shape) == (expert_count, 2)
+    assert tuple(r_kwargs["group_layout"].shape) == (expert_count, 3)
+
+
+@pytest.mark.parametrize(
+    "v41,enabled,prefill,dp_decode,expected",
+    [
+        (False, True, 0, None, False),
+        (True, False, 0, None, False),
+        (True, True, 0, None, True),
+        (True, True, 1, None, False),
+        (True, True, 0, False, False),
+        (True, True, 0, True, True),
+    ],
+)
+def test_skip_sort_is_model_opt_in(
+    monkeypatch, v41, enabled, prefill, dp_decode, expected
+):
+    from types import SimpleNamespace
+
+    from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp4_moe import (
+        _v41_decode_skip_sort,
+    )
+
+    monkeypatch.setenv("VLLM_ILU_V41_MOE_SKIP_SORT", str(int(enabled)))
+    ctx = SimpleNamespace(
+        dp_metadata=None
+        if dp_decode is None
+        else SimpleNamespace(all_ranks_decode_only=dp_decode),
+        attn_metadata={
+            "attn": SimpleNamespace(num_prefill_tokens=prefill, num_decode_tokens=1)
+        },
+    )
+    monkeypatch.setattr("vllm.forward_context.get_forward_context", lambda: ctx)
+    layer = SimpleNamespace(_ilu_v41_skip_sort_supported=v41)
+    assert _v41_decode_skip_sort(layer) == expected

@@ -207,6 +207,7 @@ if TYPE_CHECKING:
     VLLM_ILU_E25_COMPACT_ENGRAM: bool = False
     VLLM_ILU_DS41_DECODE_KV_RESTORE: bool = False
     VLLM_ILU_DS41_GROUPED_INT8_O_PROJ: bool = True
+    VLLM_ILU_DS41_IVCORE30_FP8_WOA_INT8: bool = False
     VLLM_ILU_DS41_WOA_INPUT_MODE: str = "reader_int8"
     VLLM_ILU_DS41_PRODUCER_TAIL_FFN: bool = False
     VLLM_ILU_DS4_CANDIDATE_FILTER: bool = False
@@ -543,6 +544,11 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ILU_DS41_GROUPED_INT8_O_PROJ": _bool_reader(
         "VLLM_ILU_DS41_GROUPED_INT8_O_PROJ", "1"
+    ),
+    # Opt in to INT8 grouped WO-A for FP8-source V4.1 checkpoints on ivcore30
+    # (TP < 8). Keep the existing BF16 / prefill FP8 paths by default.
+    "VLLM_ILU_DS41_IVCORE30_FP8_WOA_INT8": _bool_reader(
+        "VLLM_ILU_DS41_IVCORE30_FP8_WOA_INT8", "0"
     ),
     "VLLM_ILU_DS41_WOA_INPUT_MODE": lambda: os.environ.get(
         "VLLM_ILU_DS41_WOA_INPUT_MODE", "reader_int8"

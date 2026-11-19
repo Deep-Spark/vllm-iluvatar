@@ -90,9 +90,14 @@ class IluDeepseekV41FP8Config(IluDeepseekV4FP8Config):
                 from vllm_iluvatar import envs
                 from vllm_iluvatar.ilu_util.arch import cuda_arch
 
-                # Match the existing converted-checkpoint consumer on ivcore11.
+                # Preserve ivcore11 policy. CQ deployments already enable the
+                # old switch, so FP8-source INT8 on ivcore30 needs its own opt-in.
                 # Ordinary Linear execution preferences never control this BMM.
-                if cuda_arch() == "ivcore11" and envs.VLLM_ILU_DS41_GROUPED_INT8_O_PROJ:
+                arch = cuda_arch()
+                use_grouped_int8 = (
+                    arch == "ivcore11" and envs.VLLM_ILU_DS41_GROUPED_INT8_O_PROJ
+                ) or (arch == "ivcore30" and envs.VLLM_ILU_DS41_IVCORE30_FP8_WOA_INT8)
+                if use_grouped_int8:
                     from vllm_iluvatar.model_executor.layers.quantization.backends.grouped_bmm.deepseek_v4_wo_a import (
                         IluDeepseekV41Fp8GroupedInt8Method,
                     )

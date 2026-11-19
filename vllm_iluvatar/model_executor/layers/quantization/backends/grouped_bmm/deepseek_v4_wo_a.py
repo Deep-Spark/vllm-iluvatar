@@ -280,7 +280,7 @@ class IluDeepseekV41Fp8GroupedInt8Method(IluV4W8A8BMMLinearMethod):
         )
 
         if (
-            self.quant_config.is_scale_e8m0
+            getattr(self.quant_config, "is_scale_e8m0", False)
             and layer.weight_scale_inv.dtype != torch.float8_e8m0fnu
         ):
             raise ValueError("UE8M0 block-FP8 source requires E8M0 scales")

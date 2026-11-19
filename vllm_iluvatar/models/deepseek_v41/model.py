@@ -250,7 +250,9 @@ class IluDeepseekV41MoE(nn.Module, IluFusedMoEEP):
         # FusedMoE runner alone does not dispatch/combine activations across
         # that group on Iluvatar; the platform mixin owns that collective.
         self.init_ep()
-        self.experts.routed_experts._ilu_v41_skip_sort_supported = True
+        routed_experts = getattr(self.experts, "routed_experts", None)
+        if routed_experts is not None:
+            routed_experts._ilu_v41_skip_sort_supported = True
         quant = self.experts._quant_method
         quant = getattr(quant, "old_quant_method", quant)
         parallel = self.experts.moe_config.moe_parallel_config

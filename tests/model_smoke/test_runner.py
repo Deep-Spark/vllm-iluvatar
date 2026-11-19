@@ -491,7 +491,7 @@ class SmokeTests(unittest.TestCase):
         bindir.mkdir(exist_ok=True)
         executable = bindir / "vllm"
         executable.write_text("""#!/usr/bin/env python3
-import json, os, sys
+import json, os, signal, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from threading import Lock
@@ -516,12 +516,17 @@ class Handler(BaseHTTPRequestHandler):
   self.send(json.dumps({'model':served,'choices':[{'message':{'content':'FINAL: '+answer},'finish_reason':'stop'}]}))
 class Server(ThreadingMixIn,HTTPServer): daemon_threads=True
 if os.environ.get('SMOKE_TEST_FATAL')=='1': print('EngineDeadError: injected failure',flush=True)
+if os.environ.get('SMOKE_TEST_SHUTDOWN_FATAL')=='1':
+ def stop(signum,frame):
+  print('[shutdown] Process manager: force killing remaining process EngineCore pid=123',flush=True)
+  raise SystemExit(0)
+ signal.signal(signal.SIGTERM,stop)
 Server(('127.0.0.1',port),Handler).serve_forever()
 """)
         executable.chmod(0o755)
         return bindir
 
-    def run_fake(self, wrong=False, fatal=False):
+    def run_fake(self, wrong=False, fatal=False, shutdown_fatal=False):
         bindir = self.fake_executable()
         output = self.root / "results"
         output.mkdir()
@@ -536,6 +541,7 @@ Server(('127.0.0.1',port),Handler).serve_forever()
             SMOKE_TEST_CASES=str(SMOKE / "cases.json"),
             SMOKE_TEST_WRONG="1" if wrong else "0",
             SMOKE_TEST_FATAL="1" if fatal else "0",
+            SMOKE_TEST_SHUTDOWN_FATAL="1" if shutdown_fatal else "0",
         )
         with (
             patch.dict(os.environ, env),
@@ -604,6 +610,13 @@ Server(('127.0.0.1',port),Handler).serve_forever()
         self.assertEqual(result["status"], "PASS", result["failures"])
         self.assertEqual(result["correct_answers"], 20)
         self.assertEqual(result["speculative_delta"][smoke.METRICS[1]], 80)
+
+    def test_forced_engine_shutdown_fails_after_all_correct_answers(self):
+        result = self.run_fake(shutdown_fatal=True)
+        self.assertEqual(result["correct_answers"], 20)
+        self.assertEqual(result["status"], "FAIL")
+        self.assertTrue(result["cleanup_failed"])
+        self.assertIn("Forced engine/worker shutdown", " ".join(result["failures"]))
 
     def test_wrong_answer_fails_even_with_http_success(self):
         result = self.run_fake(wrong=True)

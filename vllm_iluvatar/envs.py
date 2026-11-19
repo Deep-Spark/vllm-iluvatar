@@ -255,6 +255,8 @@ if TYPE_CHECKING:
     VLLM_ILU_V41_AGRS_TP1_RS: bool = False
     VLLM_ILU_V41_PACKED_FP8_DISPATCH: bool = False
     VLLM_ILU_V41_PACKED_FP8_FUSED_QUANT: bool = False
+    VLLM_ILU_V41_PACKED_INT8_DISPATCH: bool = False
+    VLLM_ILU_V41_MOE_SKIP_SORT: bool = False
     VLLM_ILU_V41_DECODE_MOE_MODE1: bool = False
     VLLM_ILU_V41_PREFILL_UNSORTED: bool = False
     VLLM_ILU_V41_PREFILL_FP8_O_PROJ: bool = False
@@ -418,6 +420,10 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_V41_PACKED_FP8_FUSED_QUANT": _ilu_bool_reader(
         "VLLM_ILU_V41_PACKED_FP8_FUSED_QUANT", "0"
     ),
+    "VLLM_ILU_V41_PACKED_INT8_DISPATCH": _ilu_bool_reader(
+        "VLLM_ILU_V41_PACKED_INT8_DISPATCH", "0"
+    ),
+    "VLLM_ILU_V41_MOE_SKIP_SORT": _ilu_bool_reader("VLLM_ILU_V41_MOE_SKIP_SORT", "0"),
     "VLLM_ILU_V41_DECODE_MOE_MODE1": _ilu_bool_reader(
         "VLLM_ILU_V41_DECODE_MOE_MODE1", "0"
     ),

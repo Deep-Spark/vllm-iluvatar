@@ -491,6 +491,7 @@ def _ilu_mxfp4_fused_experts_ixformer(
     w13_gemm_mode: int | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
+    skip_moe_sort: bool = False,
 ) -> torch.Tensor:
     """The ixformer pipeline.
 
@@ -589,8 +590,8 @@ def _ilu_mxfp4_fused_experts_ixformer(
     #     [E, 3] = [start, end, expert_id] sorted by descending token count
     #     (ixmm F4F8 schedules heavy experts first).
     #     [E, 2] = [start, end] in natural expert-id order (no sort kernel).
-    #     For decode (M <= 256), each expert has 0–few tokens; skip sort.
-    _skip_moe_sort = M <= 256
+    #     Only an opted-in model caller may bypass sorting on ixmm decode.
+    _skip_moe_sort = skip_moe_sort and gemm_backend == "ixmm" and M <= 256
     group_layout = torch.empty(
         (E_local, 2 if _skip_moe_sort else 3),
         dtype=torch.int32,
@@ -658,6 +659,7 @@ def _ilu_mxfp4_fused_experts_ixformer(
         # DSv4 / MXFP4: clamp before silu (unchanged legacy behaviour).
         padded_a2 = None
         if w2_k > inter_size:
+            # The SwiGLU kernel writes all rows and zeros the wider K tail.
             padded_a2 = torch.empty(
                 (M, w2_k), dtype=torch.float8_e4m3fn, device=gemm1_out.device
             )
@@ -711,6 +713,7 @@ def ilu_mxfp4_fused_experts(
     swiglu_variant: str = _DSV4_CLAMP_VARIANT,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
+    skip_moe_sort: bool = False,
 ) -> torch.Tensor:
     """Dispatcher for the routed MXFP4 expert compute.
 
@@ -792,4 +795,5 @@ def ilu_mxfp4_fused_experts(
         swiglu_variant=swiglu_variant,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
+        skip_moe_sort=skip_moe_sort,
     )

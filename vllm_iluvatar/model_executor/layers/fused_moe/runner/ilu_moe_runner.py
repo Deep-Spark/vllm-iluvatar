@@ -553,7 +553,8 @@ class IluMoERunner(MoERunner):
     def _can_pack_int8_dispatch(self) -> bool:
         """Pack one DP contribution only for the supported native NN dataflow."""
         return (
-            getattr(self._quant_method, "supports_packed_int8_input", False) is True
+            envs.VLLM_ILU_V41_PACKED_INT8_DISPATCH
+            and getattr(self._quant_method, "supports_packed_int8_input", False) is True
             and self.gate is not None
             and getattr(self.gate, "out_dtype", None) == torch.float32
             and self.moe_config.moe_parallel_config.use_ep

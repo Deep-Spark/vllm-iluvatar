@@ -35,7 +35,9 @@ from vllm_iluvatar.model_executor.layers.fused_moe.runner.ilu_moe_runner import 
         "transform",
     ],
 )
-def test_packed_dispatch_capability(unsupported):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_packed_dispatch_capability(unsupported, enabled, monkeypatch):
+    monkeypatch.setenv("VLLM_ILU_V41_PACKED_INT8_DISPATCH", str(int(enabled)))
     runner = _make_stub_runner()
     runner.moe_config.moe_parallel_config.use_ep = True
     runner.moe_config.ep_size = runner.moe_config.dp_size = 2
@@ -70,7 +72,7 @@ def test_packed_dispatch_capability(unsupported):
         new_callable=PropertyMock,
         return_value=True,
     ):
-        assert runner._can_pack_int8_dispatch() == (unsupported is None)
+        assert runner._can_pack_int8_dispatch() == (enabled and unsupported is None)
 
 
 @requires_corex30
@@ -151,6 +153,7 @@ def test_packed_nn_moe_graph_and_changing_routes(limit, monkeypatch):
 
 @pytest.mark.parametrize("overlap", [False, True])
 def test_runner_reuses_norm_quant_and_gathers_one_packet(overlap, monkeypatch):
+    monkeypatch.setenv("VLLM_ILU_V41_PACKED_INT8_DISPATCH", "1")
     from contextlib import nullcontext
     from functools import partial
 

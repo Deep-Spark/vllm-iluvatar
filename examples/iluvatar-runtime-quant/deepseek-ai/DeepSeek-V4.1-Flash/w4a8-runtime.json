@@ -100,50 +100,6 @@
       "iluvatar": {
         "method": "IluFp8ToW8A8Int8OnlineLinearMethod"
       }
-    },
-    "dsv41_grouped_wo_a_to_w8a8": {
-      "priority": 100,
-      "targets": [
-        "re:.*\\.attn\\.wo_a$"
-      ],
-      "require": {
-        "original_disposition": "quantized",
-        "checkpoint_dtypes": [
-          "float8_e4m3fn"
-        ]
-      },
-      "weights": {
-        "source": {
-          "format": "fp8-block",
-          "dtypes": [
-            "float8_e4m3fn"
-          ],
-          "block_shape": [
-            32,
-            32
-          ],
-          "scale_format": "ue8m0"
-        },
-        "target": {
-          "format": "int8-channel",
-          "dtype": "int8",
-          "strategy": "channel"
-        },
-        "loading": {
-          "mode": "transform",
-          "stage": "process_weights_after_loading"
-        }
-      },
-      "input_activations": {
-        "num_bits": 8,
-        "type": "int",
-        "strategy": "token",
-        "dynamic": true
-      },
-      "output_activations": null,
-      "iluvatar": {
-        "method": "IluDsv41Fp8ToW8A8GroupedLinearMethod"
-      }
     }
   }
 }

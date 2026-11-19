@@ -17,7 +17,6 @@ from vllm_iluvatar.model_executor.layers.quantization.configs.deepseek.v41_fp8 i
     IluDeepseekV41FP8Config,
 )
 from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.linear.dsv41_fp8_to_w8a8 import (
-    IluDsv41Fp8ToW8A8GroupedLinearMethod,
     IluDsv41Fp8ToW8A8LinearMethod,
 )
 
@@ -68,7 +67,6 @@ def select(prefix, monkeypatch, enabled=True, mutation=None):
         ("attn.indexer.wq_b", IluDsv41Fp8ToW8A8LinearMethod),
         ("ffn.shared_experts.gate_up_proj", IluDsv41Fp8ToW8A8LinearMethod),
         ("ffn.shared_experts.down_proj", IluDsv41Fp8ToW8A8LinearMethod),
-        ("attn.wo_a", IluDsv41Fp8ToW8A8GroupedLinearMethod),
     ],
 )
 def test_dispatch_and_disabled(suffix, expected, monkeypatch):
@@ -97,7 +95,8 @@ def test_dense_method_names_use_shared_implementation(method_name, monkeypatch):
     assert type(method) is IluFp8ToW8A8Int8OnlineLinearMethod
 
 
-def test_grouped_runtime_reuses_existing_source_method(monkeypatch):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_grouped_runtime_reuses_existing_source_method(monkeypatch, enabled):
     from vllm_iluvatar.config import ilu_compute
     from vllm_iluvatar.model_executor.layers.quantization.backends.grouped_bmm.deepseek_v4_wo_a import (
         IluDeepseekV41Fp8GroupedInt8Method,
@@ -106,7 +105,9 @@ def test_grouped_runtime_reuses_existing_source_method(monkeypatch):
     monkeypatch.setattr(
         ilu_compute, "compute_options", lambda section: {"fp8_backend": "fp8"}
     )
-    _, method = select("model.layers.0.attn.wo_a", monkeypatch)
+    monkeypatch.setattr("vllm_iluvatar.ilu_util.arch.cuda_arch", lambda: "ivcore11")
+    monkeypatch.setenv("VLLM_ILU_DS41_GROUPED_INT8_O_PROJ", "1")
+    _, method = select("model.layers.0.attn.wo_a", monkeypatch, enabled=enabled)
     assert isinstance(method, IluDeepseekV41Fp8GroupedInt8Method)
     assert (
         method.apply_with_rope.__func__
@@ -115,9 +116,8 @@ def test_grouped_runtime_reuses_existing_source_method(monkeypatch):
     assert not hasattr(method, "scheme")
 
 
-@pytest.mark.parametrize("suffix", ["wq_b", "wo_a"])
-def test_ue8m0_source_rejects_fp32_scale(suffix, monkeypatch):
-    layer, method = select("model.layers.0.attn." + suffix, monkeypatch)
+def test_ue8m0_source_rejects_fp32_scale(monkeypatch):
+    layer, method = select("model.layers.0.attn.wq_b", monkeypatch)
     layer.register_parameter(
         "weight",
         torch.nn.Parameter(
@@ -159,9 +159,14 @@ def test_load_and_compute(grouped, rows, monkeypatch):
     prefix = "model.layers.0.attn." + ("wo_a" if grouped else "wq_b")
 
     def only_tested_group(payload):
-        key = "dsv41_grouped_wo_a_to_w8a8" if grouped else "dsv41_dense_fp8_to_w8a8"
-        payload["config_groups"] = {key: payload["config_groups"][key]}
+        key = "dsv41_dense_fp8_to_w8a8"
+        payload["config_groups"] = (
+            {} if grouped else {key: payload["config_groups"][key]}
+        )
 
+    if grouped:
+        monkeypatch.setattr("vllm_iluvatar.ilu_util.arch.cuda_arch", lambda: "ivcore11")
+        monkeypatch.setenv("VLLM_ILU_DS41_GROUPED_INT8_O_PROJ", "1")
     layer, method = select(prefix, monkeypatch, mutation=only_tested_group)
     loader = Mock()
     with set_current_vllm_config(VllmConfig()):
@@ -264,3 +269,34 @@ def test_mxfp4_direct_nn_matches_native_packing():
     zeros, zero_scale = quantize_mxfp4_to_w4a8_nn(torch.zeros_like(weight), scale)
     assert not zeros.count_nonzero()
     assert torch.equal(zero_scale, torch.ones_like(zero_scale))
+
+
+@pytest.mark.parametrize("arch,enabled", [("ivcore11", False), ("ivcore30", True)])
+def test_grouped_default_preserves_bf16_fallback(monkeypatch, arch, enabled):
+    from vllm_iluvatar.model_executor.layers.quantization.backends.fp8.deepseek_v41_linear import (
+        IluDeepseekV41Bf16DequantLinearMethod,
+    )
+
+    monkeypatch.setattr("vllm_iluvatar.ilu_util.arch.cuda_arch", lambda: arch)
+    monkeypatch.setenv("VLLM_ILU_DS41_GROUPED_INT8_O_PROJ", str(int(enabled)))
+    _, method = select("model.layers.0.attn.wo_a", monkeypatch)
+    assert isinstance(method, IluDeepseekV41Bf16DequantLinearMethod)
+
+
+def test_grouped_ue8m0_source_rejects_fp32_scale(monkeypatch):
+    from vllm.distributed import parallel_state
+
+    monkeypatch.setattr(
+        parallel_state, "_TP", SimpleNamespace(rank_in_group=0, world_size=1)
+    )
+    monkeypatch.setattr("vllm_iluvatar.ilu_util.arch.cuda_arch", lambda: "ivcore11")
+    monkeypatch.setenv("VLLM_ILU_DS41_GROUPED_INT8_O_PROJ", "1")
+    layer, method = select("model.layers.0.attn.wo_a", monkeypatch)
+    with set_current_vllm_config(VllmConfig()):
+        method.create_weights(
+            layer, 256, [256], 256, 256, torch.bfloat16, weight_loader=Mock()
+        )
+    assert layer.weight_block_size == [32, 32]
+    layer.weight_scale_inv.data = torch.ones(8, 8)
+    with pytest.raises(ValueError, match="E8M0 scales"):
+        method.process_weights_after_loading(layer)

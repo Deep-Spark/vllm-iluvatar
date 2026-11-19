@@ -38,3 +38,35 @@ def fp8_linear_backend() -> str:
     if backend == "w8a8_int8" and arch not in ("ivcore11", "ivcore30"):
         raise ValueError(f"INT8 W8A8 Linear backend is not supported on {arch}")
     return backend
+
+
+# Public four-bit expert execution modes. Backend/layout mechanics remain internal; source
+# compatibility and the supported platform matrix belong to the Method policy.
+_EXPERT_MODES = {
+    "ivcore11": {
+        "ixinfer_w4a8_nn_v2": ("ixinfer_w4a8", "NN"),
+        "ixinfer_w4a8_tn_v2": ("ixinfer_w4a8", "TN"),
+    },
+    "ivcore30": {
+        "ixmm_fp4fp8": ("ixmm_fp4fp8", "fp4fp8"),
+        "ixmm_w4a8_nn": ("ixmm_w4a8", "NN"),
+    },
+}
+_EXPERT_DEFAULTS = {"ivcore11": "ixinfer_w4a8_nn_v2", "ivcore30": "ixmm_fp4fp8"}
+
+
+def select_four_bit_expert_compute(arch, mode, *, source):
+    """Resolve one public mode before loading; reject unsupported overrides."""
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+        select_moe_backend,
+    )
+
+    modes = _EXPERT_MODES.get(arch, {})
+    if mode == "auto":
+        mode = _EXPERT_DEFAULTS.get(arch)
+    if not isinstance(mode, str) or mode not in modes:
+        raise ValueError(
+            f"Unsupported {source} mode {mode!r} on {arch}; supported: {tuple(modes)}"
+        )
+    name, layout = modes[mode]
+    return select_moe_backend(arch, name=name, layout=layout)

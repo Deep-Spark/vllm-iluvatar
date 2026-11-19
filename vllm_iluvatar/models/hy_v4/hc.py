@@ -11,12 +11,14 @@ scatters the result back over the channels (`HYV4HCPostLayer`). The final
 
 Uses ixformer's ``fuse_ihc_pre`` / ``fuse_ihc_post`` / ``fuse_ihc_head`` on
 ivcore11 and ivcore30. On ivcore11, pre/head keep FP32 projection weights and
-only use the native split-K path (up to 64 tokens). Larger batches keep the
-eager FP32 projection: ixformer's large-batch GEMM rounds weights and logits
-to BF16. Unsupported inputs also keep the eager implementation.
+use the native split-K path up to 64 tokens. Larger Flash batches retain the
+FP32 GEMM with fused staging and gate application. Unsupported inputs keep
+the eager implementation.
 """
 
 from __future__ import annotations
+
+from functools import cache
 
 import torch
 import vllm.envs as envs
@@ -31,7 +33,7 @@ logger = init_logger(__name__)
 # describe the kernel contract, while each layer's hc_mult/hidden_size still
 # comes from the model config and is checked against that contract below.
 _NATIVE_HC_MULT = 4
-_NATIVE_HIDDEN_DIMS = (4096, 6144)
+_NATIVE_HIDDEN_DIMS = (3072, 4096, 6144)
 
 
 def _ihc_ops() -> object | None:
@@ -79,6 +81,25 @@ def _ihc_ops() -> object | None:
     return ixf_ops
 
 
+@cache
+def _native_supports_3072(device):
+    """The older pinned binary exports the same ops but rejects this width."""
+    import ixformer.inference.functions as ops
+
+    residual = torch.zeros((1, 4, 3072), dtype=torch.bfloat16, device=device)
+    gates = torch.zeros((1, 4), dtype=torch.float32, device=device)
+    try:
+        ops.fuse_ihc_post(residual[:, 0], residual, gates, backend="ixformer_native")
+    except RuntimeError as error:
+        if "hidden dim must be 6144 (HYV4 production) or 4096" not in str(error):
+            raise
+        logger.warning_once(
+            "Installed IxFormer lacks native 3072-wide iHC; using the FP32 fallback."
+        )
+        return False
+    return True
+
+
 def _native_shape(x: torch.Tensor, *, hc_mult: int, hidden_dim: int) -> bool:
     if hc_mult != _NATIVE_HC_MULT or hidden_dim not in _NATIVE_HIDDEN_DIMS:
         logger.warning_once(
@@ -99,6 +120,7 @@ def _native_shape(x: torch.Tensor, *, hc_mult: int, hidden_dim: int) -> bool:
         and x.shape[1] == hc_mult
         and x.shape[2] == hidden_dim
         and x.is_contiguous()
+        and (hidden_dim != 3072 or _native_supports_3072(x.device))
     )
 
 
@@ -151,9 +173,12 @@ class HYV4HCPreLayer(nn.Module):
         hc_eps: float = 1e-6,
         layernorm_epsilon: float = 1e-5,
         prefix: str = "",
+        *,
+        fused_fp32_projection: bool = False,
     ):
         super().__init__()
         self.config = config
+        self.fused_fp32_projection = fused_fp32_projection
         self.hidden_dim = hidden_dim
         self.hc_mult = hc_mult
         self.magnitude = magnitude
@@ -208,6 +233,23 @@ class HYV4HCPreLayer(nn.Module):
                 norm_eps=self.layernorm_epsilon,
                 hc_eps=self.hc_eps,
                 magnitude=self.magnitude,
+            )
+
+        if (
+            ops is not None
+            and self.fused_fp32_projection
+            and _native_shape(x, hc_mult=self.hc_mult, hidden_dim=self.hidden_dim)
+        ):
+            from .ihc_fused import fp32_ihc
+
+            return fp32_ihc(
+                x,
+                self.hc_fn,
+                self.hc_scale,
+                self.hc_base,
+                self.layernorm_epsilon,
+                self.hc_eps,
+                self.magnitude,
             )
 
         shape = x.size()  # [num_tokens, hc, d]
@@ -309,9 +351,12 @@ class HYV4HCHeadLayer(nn.Module):
         init_std: float = 6e-3,
         base_noise_std: float = 0.0,
         prefix: str = "",
+        *,
+        fused_fp32_projection: bool = False,
     ):
         super().__init__()
         self.config = config
+        self.fused_fp32_projection = fused_fp32_projection
         self.hidden_size = hidden_size
         self.hc_mult = hc_mult
         self.hc_eps = hc_eps
@@ -366,6 +411,23 @@ class HYV4HCHeadLayer(nn.Module):
                 hc_eps=self.hc_eps,
             )
 
+        if (
+            ops is not None
+            and self.fused_fp32_projection
+            and _native_shape(x, hc_mult=self.hc_mult, hidden_dim=self.hidden_size)
+        ):
+            from .ihc_fused import fp32_ihc
+
+            y, _ = fp32_ihc(
+                x,
+                self.hc_head_fn,
+                self.hc_head_scale,
+                self.hc_head_base,
+                self.config.rms_norm_eps,
+                self.hc_eps,
+            )
+            return y
+
         shape, x_dtype = x.size(), x.dtype
 
         x = x.flatten(1).float()  # [num_tokens, hc*d]
@@ -393,6 +455,8 @@ class HYV4HCLayer(nn.Module):
         init_std: float = 6e-3,
         base_noise_std: float = 0.0,
         prefix: str = "",
+        *,
+        fused_fp32_projection: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -409,6 +473,7 @@ class HYV4HCLayer(nn.Module):
                 config.hc_eps,
                 config.rms_norm_eps,
                 prefix=f"{prefix}.hc_pre",
+                fused_fp32_projection=fused_fp32_projection,
             )
             self.hc_post = HYV4HCPostLayer(config)
 

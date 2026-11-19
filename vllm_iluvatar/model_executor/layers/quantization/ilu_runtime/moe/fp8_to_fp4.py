@@ -683,7 +683,7 @@ class IluFp8ToFp4OnlineMoEMethod(IluFp8MoEMethod):
             elif hasattr(layer, name):
                 delattr(layer, name)
 
-        layer._ilu_mxfp4_ixmm = True
+        self._bind_compute(layer)
         resident_fp8 = [
             name
             for name, param in layer.named_parameters()

@@ -39,6 +39,7 @@ def _install_fake_ixformer(monkeypatch) -> None:
     ixformer.core = core
     ixformer.inference = inference
     inference.functions = functions
+    functions.fp8_per_token_dynamic_scaled = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "ixformer", ixformer)
     monkeypatch.setitem(sys.modules, "ixformer.core", core)
     monkeypatch.setitem(sys.modules, "ixformer.core.config", config)
@@ -338,29 +339,20 @@ def test_preprocess_pads_k_to_ixmm_group_boundary(monkeypatch):
 
 
 @pytest.mark.parametrize("limit", [3.0, 10.0])
-def test_layer_limit_reaches_quantized_moe(monkeypatch, limit):
+def test_layer_limit_reaches_compute_contract(monkeypatch, limit):
     mod = _load_moe_backend(monkeypatch)
     method = object.__new__(mod.IluFp8MoEMethod)
     layer = types.SimpleNamespace(
+        moe_config=types.SimpleNamespace(
+            hidden_dim=256, intermediate_size_per_partition=128, ep_rank=0
+        ),
+        local_num_experts=2,
+        global_num_experts=2,
         activation="swiglustep",
         swiglu_limit=limit,
-        w13_weight=torch.empty(1),
-        w2_weight=torch.empty(1),
-        w13_weight_scale=torch.empty(1),
-        w2_weight_scale=torch.empty(1),
-        expert_map=None,
+        apply_router_weight_on_input=False,
     )
-    config = method.get_fused_moe_quant_config(layer)
-    assert config.gemm1_clamp_limit == limit
-    from unittest.mock import patch
-
-    with patch.object(mod, "ilu_mxfp4_fused_experts") as experts:
-        method.apply(
-            layer,
-            torch.empty(1, 2),
-            torch.ones(1, 1),
-            torch.zeros(1, 1, dtype=torch.int32),
-            None,
-            None,
-        )
-    assert experts.call_args.kwargs["swiglu_limit"] == limit
+    config = method._compute_config(layer)
+    assert config.activation == "swiglustep"
+    assert config.limit == limit
+    assert config.intermediate == 128

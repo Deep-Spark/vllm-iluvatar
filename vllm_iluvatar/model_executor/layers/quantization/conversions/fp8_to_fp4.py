@@ -40,7 +40,7 @@ _KNOWN_FORMATS = ("fp8-block", "fp8-channel", "fp8-tensor")
 _IMPLEMENTED_FORMATS = ("fp8-block",)
 
 _SUPPORTED_WEIGHT_DTYPES = (torch.float8_e4m3fn,)
-_SUPPORTED_SCALE_DTYPES = (torch.float32,)
+_SUPPORTED_SCALE_DTYPES = (torch.float32, torch.bfloat16)
 
 IX30_GROUP_SIZE = 256
 

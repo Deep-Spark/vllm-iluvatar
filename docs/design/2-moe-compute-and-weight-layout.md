@@ -35,7 +35,7 @@ vLLM 通过量化 Config 的 `get_quant_method()` 为专家层选择 MoE Method�
 
 [可编辑 SVG 源图](images/moe-framework-adaptation.svg) · [Mermaid 源码](images/moe-framework-adaptation.mmd)
 
-本文以 vLLM 0.31 接口及 `IluMxfp4MoEMethod` 的统一 backend 路径说明设计。其他源格式可沿用相同职责划分；是否已经接入，以文末支持矩阵为准。
+本文以 vLLM 0.31 接口及 `IluMxfp4MoEMethod` 的统一 backend 路径说明设计。`IluFp8MoEMethod` 已按相同职责划分接入，block-FP8 的源转换见 §3.7；各模型实际验证的计算与通信组合见文末支持矩阵。
 
 ---
 
@@ -79,13 +79,13 @@ runner 的输出缩放信息可能在创建参数后才写入层，因此最终�
 `quantization/common/mxfp4_loader.py` 中每层一个 `Mxfp4WeightLoader`：
 
 - 按目标 `MoEWeightSpec` 分配最终 `w13_weight`、`w2_weight` 和 scale，不先分配整层 MXFP4 源参数。
-- 注册带 `mxfp4_loader` 标记的社区签名 `weight_loader` 回调。
+- 注册带 `paired_weight_loader` 标记的社区签名 `weight_loader` 回调。
 - 用层已有的 expert 映射把全局 expert ID 映射为本地 ID；非本 rank 返回未加载。
 - 校验 projection、源 shape/dtype，w1/w3 沿 N 分片，w2 沿 K 分片；TP 切片发生在转换前。
 - 把本地源切片搬到公共上传槽，调用 IxFormer converter 直接写最终参数；同步后才把该 `(expert, w1/w2/w3)` 记为已提交。
 - `finalize()` 检查所有预期分片已提交、无 pending 和 scale 有限值，返回引用最终参数的 `MoEWeights`。
 
-`model_loader/ilu_default_loader.py` 的 `Mxfp4LoadSession` 负责跨层收集配对、完整性检查、调度读取与上传槽生命周期；`ilu_paired_weights.py` 负责来源描述、延迟视图与有界文件句柄缓存。Layer Loader 不根据文件排列猜配对，读取器也不重新实现模型的权重名称映射。
+`model_loader/ilu_default_loader.py` 的 `PairedLoadSession` 负责跨层收集配对、完整性检查、调度读取与上传槽生命周期；`ilu_paired_weights.py` 负责来源描述、延迟视图与有界文件句柄缓存。Layer Loader 不根据文件排列猜配对，读取器也不重新实现模型的权重名称映射。
 
 图 3：Method、公共加载会话与 Layer Loader 的职责
 
@@ -107,7 +107,7 @@ MXFP4 回调校验目标与来源后，公共会话以 `(Loader, local expert, w
 
 ### 3.4 阶段二：成对读取，跨层复用固定上传槽
 
-全部配对检查通过后，每个 device 按本次所有层中最大的本地投影 staging 大小分配一个 `Mxfp4UploadBuffer`：CUDA 路径为固定 pinned CPU 缓冲加固定 GPU 缓冲。单个本地 N×K 投影需要 `N*K/2 + N*K/32` 字节，分别保存 packed weight 与 E8M0 scale 字节；按单个 w1/w2/w3 计算，不是整层融合 w13 的双倍容量。
+全部配对检查通过后，每个 device 按本次所有层中最大的本地投影 staging 大小分配一个 `ExpertUploadBuffer`：CUDA 路径为固定 pinned CPU 缓冲加固定 GPU 缓冲。单个本地 N×K 投影需要 `N*K/2 + N*K/32` 字节，分别保存 packed weight 与 E8M0 scale 字节；按单个 w1/w2/w3 计算，不是整层融合 w13 的双倍容量。
 
 会话按配对登记顺序处理各对，**每对固定先 weight 后 scale**，不再依赖 checkpoint 的 key/file 顺序或 `max_pending_shards=8`：
 
@@ -142,6 +142,20 @@ payload 读取器默认缓存最多 16 个 safetensors 句柄，LRU 淘汰；同
 
 换模型不新增模型专用配对接口：先确认该模型原有映射是否保持可追溯的来源和允许的视图、回调是否具有相容的 projection/TP/EP 语义，以及激活与通信是否满足 backend 契约。直接绕过回调写 expert、未知 fused 源布局、加载中提前消费尚未转换的参数都不能仅凭“权重是 MXFP4”判定兼容。
 
+### 3.7 block-FP8 使用同一生命周期
+
+`IluFp8MoEMethod` 与 MXFP4 一样在加载前选择目标 `MoEWeightSpec`，注册最终参数，完成配对转换后绑定公共 compute。`select_fp8_compute()` 使用相同的公共 mode 表；Config 先处理显式 runtime 转换，与非 auto compute 配置冲突时报错。源 checkpoint 是整层三维张量还是逐专家张量，不改变 Method、compute 或通信适配器。
+
+Flash 的模型映射只将整层 gate/up、down 表示为逐专家 `w1/w3/w2` 的延迟视图，并调用社区签名的权重回调；普通模型沿用自己的映射。`BlockFp8WeightLoader` 接受 E4M3FN 和 BF16/FP32 乘法 block scale。它按完整 WeightSpec 选择转换器，不通过字符串模型名或 packed 开关裁剪计算能力。尚未实现的源格式仍明确拒绝。
+
+MXFP4 与 FP8 共享 `PairedMoEWeightLoader` 的最终参数分配、回调、目标切片、完整性校验，以及 `ExpertUploadBuffer`。block-FP8 的上传槽按单个本地投影计算：`N*K + 4*ceil(N/bn)*ceil(K/bk)` 字节。BF16 scale 在 CPU staging copy 时转换为 FP32；TP 分区从 block 内开始时，按原 block 的归属索引细化 scale 网格，之后再转换本地投影，避免先量化全局权重后切片。
+
+FP8 加载阶段以 `w13_weight_scale_inv/w2_weight_scale_inv` 注册 scale 参数，使社区原有名称映射保持有效；这些参数的存储从创建时就是目标 scale 的大小和 dtype。加载完整性检查后将同一 Parameter 更名为 `*_weight_scale`，不保留重复参数或整层源 scale。计算只消费最终 `MoEWeights`。
+
+150 的 IxInfer NN/TN 与 300 的 IxMM W4A8 使用 IxFormer `fp8_block_to_w4a8`：一个原生 kernel 完成 block 反量化、全 K channel amax、INT8 RNE、除 18 后 INT4 RNE 和目标布局写入。IxInfer scale 不吸收倍率 18，IxMM scale 吸收。Loader 要求该 native backend 存在；缺失即报错。300 的 FP4FP8 继续使用 `preprocess_fp8_block_weight_for_ixmm`，保留其既有形状 fallback 与输出 view copy 契约，不能将其表述为所有形状均单次原生直接写入。
+
+普通 FP8 已有的 swiglustep、无 clamp 的 SiLU/SwiGLU、TP scale 细化与 W2 K padding 由源 Loader 和 FP4FP8 compute 各自负责。显式 online quant Method 保留其源转换与到达顺序约束，完成转换后也绑定公共 compute。`apply()` 传递 shared residual 和最终输出倍率；`select_gemm_impl()` 绑定同一实例的 Standard/Batched adapter。适配器数值验证与某个模型的分布式通信验收分别记录，不以接口存在性宣称所有模型均支持 LL。
+
 ---
 
 ## 4. 计算 backend 的公共设计与实现
@@ -163,7 +177,7 @@ backend 的注册名、架构和布局声明决定其可选范围；注册不等
 
 `ilu_ixmm_fp4fp8.py` 的 `IxMMFP4FP8Backend` 继承公共基类，并使用 `@register_moe_backend` 注册。它声明支持 300（`ivcore30`）和 `fp4fp8` 布局，消费 uint8 packed FP4 权重、float32 scale，以及 FP8 激活。
 
-对于单个投影的逻辑尺寸 N×K，运行权重形状为 `[E, K/2, N]`，scale 为 `[E, K/256, N]`。这里 E 是本地 expert 数；w13 的 N 为两倍 intermediate，w2 的 N 为 hidden。scale 的含义必须与转换算子和计算算子一致。
+对于单个投影的逻辑尺寸 N×K，运行权重形状为 `[E, Kp/2, N]`，scale 为 `[E, Kp/256, N]`，其中 `Kp=ceil(K/256)*256`。FP4FP8 compute 接受 32 对齐的逻辑维度，激活按运行权重的 Kp 补零；MXFP4 native 源转换仍要求 256 对齐。这里 E 是本地 expert 数；w13 的 N 为两倍 intermediate，w2 的 N 为 hidden。scale 的含义必须与转换算子和计算算子一致。
 
 - **`run_standard()`**：根据 TopK/expert_map 重排 token 并量化，依次执行 W13、带 limit 的激活与再量化、W2，最后完成本地 TopK 加权归约。
 - **`run_batched()`**：接收按 expert 分组的输入和有效 token 数，执行同样的两次投影与激活，写出未加权的 expert 结果。
@@ -293,7 +307,9 @@ export VLLM_ILU_DISABLE_DEEPEP=1
 - `vllm_iluvatar/model_executor/layers/quantization/backends/fp4/mxfp4_moe.py`：公共 mode、Method 生命周期和执行绑定。
 - `vllm_iluvatar/model_executor/model_loader/ilu_default_loader.py`：社区加载器扩展、实际路由配对计划与上传会话生命周期。
 - `vllm_iluvatar/model_executor/model_loader/ilu_paired_weights.py`：源元数据、延迟 tensor 及有界文件句柄缓存。
-- `vllm_iluvatar/model_executor/layers/quantization/common/mxfp4_loader.py`：分片、固定上传缓冲、转换写入与加载完整性。
+- `vllm_iluvatar/model_executor/layers/quantization/common/paired_moe_loader.py`：公共参数、上传槽和加载完整性。
+- 同目录 `mxfp4_loader.py`、`block_fp8_loader.py`：各源格式的分片、scale 解释与转换调度。
+- `quantization/backends/fp4/fp8_moe.py`：通用 block-FP8 Method、mode 与计算绑定。
 - `vllm_iluvatar/model_executor/layers/fused_moe/experts/ilu_compute_backend.py`：运行权重契约、backend 基类、registry 与工厂。
 - 同目录 `ilu_ixmm_fp4fp8.py`、`ilu_ixinfer_w4a8.py`、`ilu_ixmm_w4a8.py`：具体计算实现。
 - 同目录 `ilu_compute_experts.py`：Standard/Batched 协议适配。
@@ -332,26 +348,41 @@ PNG 用于文档展示，SVG 保留可编辑图形，MMD 保留流程图源码�
 
 ## 8. 支持矩阵
 
-本表列出已接入统一 compute backend 的 **MoE Method** 及其计算、通信组合。当前仅包含 `IluMxfp4MoEMethod`，处理原始 MXFP4 专家权重，并在加载时转换为所选 backend 的运行格式。旧预转换 W4A8 checkpoint 使用已有 Config/Method，不因复用部分算子就归入本表；新增其他源格式 Method 时，应另列其适配范围。
+本表列出已接入统一 compute backend 的 **MoE Method** 及其计算、通信组合。`IluMxfp4MoEMethod` 读取原始 MXFP4 专家权重，`IluFp8MoEMethod` 读取原始 block-FP8 专家权重，两者均在加载时转换为所选 backend 的运行格式。FP8 已覆盖 Hy4 Flash 双架构回归，以及 GLM-5.2-FP8 在 300 上的通用逐专家加载与整模验证。旧预转换 W4A8 checkpoint 使用已有 Config/Method，不因复用部分算子就归入本表。
 
 ![MoE Method、计算 backend 与通信支持矩阵](images/moe-support-matrix.png)
 
 [可编辑 HTML 源表](images/moe-support-matrix.html)
 
-**✓ 支持；✗ 不支持；— 未验证。** “默认”指架构的计算 mode 默认值，不代表自动启用某种通信方式。支持范围以 DeepSeek V4.1 的实际接线与验证组合为依据，其他模型复用仍需满足第 5 节的接口契约；性能与精度结果另见测试报告。
+**✓ 已验证的模型组合；✗ 不支持；— 尚未完成该组合的模型验证。** “默认”指架构的计算 mode 默认值，不代表自动启用某种通信方式。✓ 的范围以图中模型及下述拓扑为准；算子/Loader/adapter 单测通过不等于所有模型与通信模式均已验收。性能、精度与设备稳定性分别记录，不由一个 ✓ 代替。
+
+### 8.1 模型验证范围
+
+- **DeepSeek V4.1 / MXFP4**：保留既有验证范围。150 的 IxInfer W4A8 NN/TN 均覆盖 AG/RS 与 Hybrid LL/NVSM；300 的 IxMM FP4FP8、IxMM W4A8 NN 覆盖 AG/RS，Hybrid LL/NVSM 尚未验证。
+- **Hy4 Flash / block-FP8**：150 默认 IxInfer W4A8 NN v2，300 默认 IxMM FP4FP8；两机均完成 DP16+EP、AG/RS、DFly5、FULL_DECODE_ONLY，以及 PP8×TP1/TP2 的整模回归和全量 GSM8K。PP 用例验证本地专家计算与权重分片，不额外构成 Hybrid LL/NVSM 验证。原始 FP8 权重在加载时转换，不需要预转换 checkpoint。
+- **GLM-5.2-FP8 / block-FP8**：300 的 IxMM FP4FP8 + AG/RS 已验证，包含 TP2×DP4+EP8（4k 上下文）与 ModelZoo TP2×DP8+EP16（131072 上下文）、MTP3、FP8 KV 和 FULL_DECODE_ONLY。使用默认 `IluFp8MoEMethod` 配对 Loader 完成 FP8→FP4FP8，不需要额外的 `fp4-moe-inline.yaml` 或显式 online-quant 配置。起服及 curl 已验证，TP2×DP8 全量 GSM8K 已完成；性能结果另行记录，不将 GLM-5.3、GLM 的 PP8 或 Hybrid LL/NVSM 一并标为已验证。
+- **FP8 的其他 mode**：150 IxInfer TN 与 300 IxMM W4A8 NN 已有转换/compute 设备测试，尚未完成对应模型与通信组合的整模验收，矩阵保留“—”。显式 online-quant Method 的兼容单测与上述默认 block-FP8 路径分开统计。
+
+GLM 的 ModelZoo 复测保留了模型参数；已激活开发环境时需避免脚本重复加载 CoreX 覆盖 `PYTHONPATH`。README 的 64-token curl 在 thinking 模式下可能截断，关闭 thinking 的冒烟请求已返回 `2` 并正常 stop。这些启动环境和请求预算问题不要求改动默认 FP8 MoE 配置。该轮关服后曾出现设备异常并执行恢复，模型路径的已验证状态不代表设备收尾稳定性也已验收。
+
+验证依据：Hy4 Flash 150 示例、Hy4 Flash 300 示例、GLM-5.2-FP8 ModelZoo及 2026-11-20 的「[测试 GLM FP8 MoE 部署](codex://threads/01a1f671-3d8c-7182-a747-b375e9a2961d)」验证记录。Hy4 示例的历史成绩对应其记录版本，本次统一 FP8 实现的回归结果不覆盖写入历史成绩。
+
+本次 FP8 路径使用的 IxFormer 为 `0200d4b1f78aff47765a681c41d98f3b586326c6`，包含 150 原生 `fp8_block_to_w4a8`；构建 pin 的唯一来源为根目录 `Dockerfile`。
+
+### 8.2 通信与公共约束
 
 通信接口及适用条件：
 
-- **AG/RS**：配置 `allgather_reducescatter`，本地专家计算经 `IluMxfp4MoEMethod.apply() → backend.run_standard()`。ivcore11 的已验证组合在 Hybrid 的 Prefill／混合步骤使用该路径；ivcore30 的已验证组合在 Prefill 与 Decode 均使用该路径。
+- **AG/RS**：配置 `allgather_reducescatter`，本地专家计算经对应 Method 的 `apply() → backend.run_standard()`。DeepSeek V4.1 在 ivcore11 的 Hybrid Prefill／混合步骤使用该路径；本表 Hy4 Flash、GLM-5.2-FP8 的 EP 用例，以及 ivcore30 的既有 MXFP4 验证，在 Prefill 与 Decode 均使用该路径。
 - **Hybrid LL / NVSM**：基础通信仍为 AG/RS，显式配置 `VLLM_ILU_DECODE_EP_BACKEND=deepep_low_latency` 与 `VLLM_ILU_DISABLE_DEEPEP=1`。所有 DP rank 均为纯 Decode 时，经 `IluBatchedComputeExperts → backend.run_batched()` 使用 IxFormer NVSM dispatch/combine；其他步骤保持基础通信。这不包含原生 DeepEP LL/HT 或直接将 LL 配为基础 all2all backend。
-- **未验证的组合**：ivcore30 的两种 mode 已覆盖 AG/RS；已有 backend/adapter 接口不足以构成 LL/NVSM 的整模支持承诺，不将“未验证”写成“不支持”。
+- **未验证的组合**：MXFP4 在 ivcore30 的两种 mode 已覆盖 AG/RS；FP8 当前模型验证覆盖各架构默认 mode 的 AG/RS。已有 backend/adapter 接口不足以构成其他 mode 或 LL/NVSM 的整模支持承诺，不将“未验证”写成“不支持”。
 - **适配器边界**：当前 AG/RS 接线直接调用 Method，不经过 `IluStandardComputeExperts`。后者提供 Standard modular 协议接口，其独立通信接线不能由上述 AG/RS 结论代替。
 - **并行边界**：PP 属于模型并行拓扑，不是 MoE all2all backend。未启用 EP 时，本地专家同样通过 `apply → run_standard` 执行；P/D KV 传输也不属于本表的专家通信。
 
 公共约束：
 
 - Hybrid 自定义通信入口要求 DP>1、EP、PCP=1；LL hidden size 当前限定为 2048、2560、3072、4096、5120、6144、7168、8192，并需配置足够的 token 容量。
-- 当前 MXFP4 Method 不支持 EPLB。W4A8 要求连续 expert placement；FP4FP8 backend 可使用 expert_map。
-- 底层 registry 中的 ivcore30/IxInfer TN 不属于当前 MXFP4 公共 mode，不列入本表。
+- 当前 MXFP4 与 block-FP8 Method 均不支持 EPLB。W4A8 要求连续 expert placement；FP4FP8 backend 可使用 expert_map。
+- 底层 registry 中的 ivcore30/IxInfer TN 不属于当前 MXFP4/block-FP8 公共 mode，不列入本表。
 
 维护矩阵时同步更新 HTML 源表与 PNG，保证 Method、mode、通信状态及默认标注一致。

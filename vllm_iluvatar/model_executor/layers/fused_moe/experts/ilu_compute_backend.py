@@ -111,6 +111,8 @@ class MoEComputeBackend(ABC):
     standard_layout_columns: ClassVar[int] = 2
     requires_contiguous_experts: ClassVar[bool] = True
     prefer_hybrid_ep: ClassVar[bool] = True
+    supported_activations: ClassVar[tuple[str, ...]] = ("silu", "swiglu")
+    requires_activation_limit: ClassVar[bool] = True
 
     def __init__(self, config: MoEComputeConfig, selection):
         self.config = config
@@ -137,8 +139,10 @@ class MoEComputeBackend(ABC):
             return f"{cls.name} requires {spec.alignment}-aligned dimensions"
         if config.apply_router_weight_on_input:
             return "Compute backends require output TopK weighting"
-        if config.activation not in ("silu", "swiglu") or config.limit is None:
-            return "Compute backends require clamped SwiGLU"
+        if config.activation not in cls.supported_activations:
+            return f"{cls.name} does not support activation {config.activation}"
+        if cls.requires_activation_limit and config.limit is None:
+            return f"{cls.name} requires clamped SwiGLU"
         return None
 
     @property

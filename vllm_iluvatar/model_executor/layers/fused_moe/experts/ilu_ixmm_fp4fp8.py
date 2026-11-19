@@ -14,13 +14,15 @@ class IxMMFP4FP8Backend(MoEComputeBackend):
     supported_layouts = {"ivcore30": ("fp4fp8",)}
     weight_specs = {
         "fp4fp8": MoEWeightSpec(
-            "ixmm_fp4fp8", "fp4fp8", torch.uint8, scale_group_size=256
+            "ixmm_fp4fp8", "fp4fp8", torch.uint8, scale_group_size=256, alignment=32
         )
     }
     activation_dtype = torch.float8_e4m3fn
     standard_layout_columns = 3
     requires_contiguous_experts = False
     prefer_hybrid_ep = False
+    supported_activations = ("silu", "swiglu", "swiglustep")
+    requires_activation_limit = False
 
     def gemm(self, weights, x, scale, prefix, layout, output=None, mode=None):
         return ops.group_gemm_fp4(
@@ -62,9 +64,14 @@ class IxMMFP4FP8Backend(MoEComputeBackend):
         self.gemm(weights, q, scale, "w13", layout, intermediate, mode=w13_gemm_mode)
         del q, scale
         workspace.release("input", "input_scale")
-        q, scale = ops.swiglu_limit_dynamic_scaled_fp8(
-            intermediate, order, float(self.limit)
-        )
+        if self.config.activation == "swiglustep" or self.limit is None:
+            q, scale = ops.swiglustep_dynamic_scaled_fp8(
+                intermediate, order, float(self.limit or 0.0)
+            )
+        else:
+            q, scale = ops.swiglu_limit_dynamic_scaled_fp8(
+                intermediate, order, float(self.limit)
+            )
         padded_k = weights.w2_weight.shape[1] * 2
         if q.shape[-1] != padded_k:
             q = torch.nn.functional.pad(q, (0, padded_k - q.shape[-1]))
@@ -105,7 +112,9 @@ class IxMMFP4FP8Backend(MoEComputeBackend):
             input=intermediate,
             expert_num_tokens=counts,
             max_num_tokens_per_expert=capacity,
-            act_type="swiglu",
+            act_type="swiglustep"
+            if self.config.activation == "swiglustep"
+            else "swiglu",
             limit=self.limit,
         )
         del intermediate

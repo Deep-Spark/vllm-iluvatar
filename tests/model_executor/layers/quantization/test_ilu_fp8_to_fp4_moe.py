@@ -91,6 +91,7 @@ class _StubRoutedExperts(RoutedExperts):
             intermediate_size_per_partition=INTERMEDIATE // tp_size,
             moe_backend="auto",
             num_local_experts=len(local_experts),
+            ep_rank=0,
             tp_rank=tp_rank,
             tp_size=tp_size,
             moe_parallel_config=SimpleNamespace(tp_size=tp_size),
@@ -101,6 +102,10 @@ class _StubRoutedExperts(RoutedExperts):
         self.quant_config = None
         self.quant_method = None
         self.activation = "silu"
+        self.global_num_experts = NUM_EXPERTS
+        self.local_num_experts = len(local_experts)
+        self.swiglu_limit = None
+        self.apply_router_weight_on_input = False
         self.prefix = "model.layers.0.mlp.experts"
         self._loaded_expert_biases = set()
 
@@ -114,7 +119,9 @@ def _make_layer(method_cls, tp_size, tp_rank, local_experts, **method_kwargs):
         activation_scheme="dynamic",
         weight_block_size=list(BLOCK),
     )
-    method = method_cls(quant_config, layer, **method_kwargs)
+    with patch("vllm_iluvatar.config.ilu_compute.compute_options", return_value={}):
+        method = method_cls(quant_config, layer, **method_kwargs)
+        method._select_compute()
     layer.quant_method = method
     # Both create_weights implementations allocate with the ambient default
     # device, the way vLLM sets it up during engine init.
@@ -192,17 +199,34 @@ def _arrival_order(ckpt):
 
 
 def _feed(layer, ckpt, order):
+    loader = getattr(layer.quant_method, "_checkpoint_loader", None)
+    if loader is not None:
+        from vllm_iluvatar.model_executor.layers.quantization.common.paired_moe_loader import (
+            ExpertUploadBuffer,
+        )
+
+        loader.bind_upload_buffer(
+            ExpertUploadBuffer(loader.staging_bytes, layer.w13_weight.device)
+        )
+        # The original Method now consumes adjacent CPU pairs from the common
+        # reader; arbitrary online arrival order remains tested on the runtime loader.
+        order = _arrival_order(ckpt)
     for expert_id, shard, kind in order:
         param_name = _PARAM_OF[(shard, kind)]
         param = getattr(layer, param_name)
         param.weight_loader(
             param=param,
-            loaded_weight=ckpt[(expert_id, shard, kind)],
+            loaded_weight=ckpt[(expert_id, shard, kind)].cpu()
+            if loader is not None
+            else ckpt[(expert_id, shard, kind)],
             weight_name=f"model.layers.0.mlp.experts.{param_name}",
             shard_id=shard,
             expert_id=expert_id,
             return_success=True,
         )
+    if loader is not None:
+        loader._upload_buffer.close()
+        loader._upload_buffer = None
 
 
 _FINAL_PARAMS = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")

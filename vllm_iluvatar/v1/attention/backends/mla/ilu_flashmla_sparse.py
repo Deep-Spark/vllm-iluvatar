@@ -49,6 +49,7 @@ logger = init_logger(__name__)
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention.mla_attention import MLAAttention
     from vllm.model_executor.models.deepseek_v2 import Indexer
+    from vllm.v1.kv_cache_interface import KVCacheSpec
 
 
 """
@@ -392,6 +393,23 @@ class IluFlashMLASparseMetadataBuilder(
         )
         return self.req_id_per_token_buffer[:num_tokens]
 
+    def _build_req_id_per_token(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> torch.Tensor:
+        """Build from device boundaries without reusing an in-flight host source."""
+        num_tokens = common_attn_metadata.num_actual_tokens
+        result = self.req_id_per_token_buffer[:num_tokens]
+        if num_tokens == 0:
+            return result
+        request_ids = common_attn_metadata.token_to_req_indices(
+            self.req_id_per_token_buffer
+        )
+        # Other attention groups may have populated the common mapping cache.
+        # Keep this builder's captured input address regardless of cache reuse.
+        if request_ids.data_ptr() != result.data_ptr():
+            result.copy_(request_ids)
+        return result
+
     def build(
         self,
         common_prefix_len: int,
@@ -399,7 +417,14 @@ class IluFlashMLASparseMetadataBuilder(
         fast_build: bool = False,
     ) -> IluFlashMLASparseMetadata:
         cm = common_attn_metadata
-        req_id_per_token = self._stage_req_id_per_token(cm)
+        if (
+            type(self)._stage_req_id_per_token
+            is IluFlashMLASparseMetadataBuilder._stage_req_id_per_token
+            and getattr(torch, "corex_arch", None) == "ivcore30"
+        ):
+            req_id_per_token = self._build_req_id_per_token(cm)
+        else:
+            req_id_per_token = self._stage_req_id_per_token(cm)
 
         # V4 main MLA: convert raw token slot_mapping to compressed-domain so
         # ``DeepseekCompressor._fused_kernel`` writes to the right cache slot.
@@ -519,8 +544,130 @@ class IluFlashMLASparseImpl(
         )
         self.use_int8_mla = envs.VLLM_ILU_MLA_ATTN_QUANT_TYPE == "INT8"
         self.use_pool4_decode = envs.VLLM_ILU_GLM5NEXT_MLA_POOL4_DECODE
+        self.use_ixattn_kpool4 = (
+            torch.corex_arch == "ivcore30"
+            and getattr(indexer, "index_kpool", None) == 4
+            and getattr(indexer, "compact_pool_indices", False)
+        )
+        self.use_ixattn_compact_pools = self.use_ixattn_kpool4 and bool(
+            getattr(indexer, "compact_pool_indices", False)
+        )
+        self._reuse_ixattn_pool_indices = False
+        if self.use_ixattn_kpool4:
+            from ixformer.inference.ixattn_backend import ixattn_available
+
+            if (
+                torch.corex_arch != "ivcore30"
+                or not ixattn_available()
+                or self.use_int8_mla
+                or kv_cache_dtype not in ("auto", "bfloat16")
+                or self.kv_lora_rank != 512
+                or abs(self.softmax_scale - 1 / 16) > 1e-7
+                or self.qk_rope_head_dim != 0
+                or num_heads not in (16, 32, 64)
+            ):
+                raise ValueError(
+                    "ixattn pool4 requires CQ BF16 MLA, latent=512, "
+                    "scale=1/16, no RoPE, and 16/32/64 local heads"
+                )
+            token_buffer = self.topk_indices_buffer
+            assert token_buffer is not None
+            required_pools = (
+                token_buffer.shape[1] + 1
+                if self.use_ixattn_compact_pools
+                else (token_buffer.shape[1] + 3) // 4
+            )
+            pool_columns = max(64, (required_pools + 63) // 64 * 64)
+            self._ixattn_pool_starts = torch.empty(
+                (max_tokens, 1, pool_columns),
+                dtype=torch.int32,
+                device=self.q_concat_buffer.device,
+            )
+            self._ixattn_token_counts = torch.empty(
+                max_tokens,
+                dtype=torch.int32,
+                device=self.q_concat_buffer.device,
+            )
+            topk_hint = pool_columns * 4
+            self._ixattn_decode_plans = [(0, 0)] + [
+                ixfops.flash_mla_sparse_fwd_ixattn_workspace_size(
+                    t, num_heads, topk_hint
+                )
+                for t in range(1, max_tokens + 1)
+            ]
+            scratch_bytes = max(size for size, _ in self._ixattn_decode_plans)
+            self._ixattn_decode_workspace = (
+                current_workspace_manager().get_persistent(
+                    ("glm5next_ixattn_pool4", num_heads, max_tokens, topk_hint),
+                    (scratch_bytes,),
+                    torch.uint8,
+                )
+                if scratch_bytes
+                else None
+            )
+            logger.info_once(
+                "GLM5Next sparse MLA: ixattn kpool4, compact logical pools=%s; "
+                "scratch capacity %d bytes",
+                self.use_ixattn_compact_pools,
+                scratch_bytes,
+            )
         self.W_UK_T: torch.Tensor | None = None
         self.W_UV: torch.Tensor | None = None
+
+    def _ixattn_physical_pool_rows(self, rows, topk_indices, attn_metadata, positions):
+        if self._reuse_ixattn_pool_indices:
+            # The MTP lifecycle compacts these together once after its first
+            # pass. Later draft positions must not change the selected tail.
+            pool_starts = self._ixattn_reuse_starts[:rows]
+            token_counts = self._ixattn_reuse_counts[:rows]
+        else:
+            pool_starts = self._ixattn_pool_starts[:rows]
+            token_counts = self._ixattn_token_counts[:rows]
+            if self.use_ixattn_compact_pools:
+                assert positions is not None
+                ixfops.pool_indices_to_ixattn_kpool4(
+                    topk_indices,
+                    positions[:rows],
+                    attn_metadata.req_id_per_token[:rows],
+                    attn_metadata.block_table,
+                    attn_metadata.block_size,
+                    pool_starts,
+                    token_counts,
+                    row_slots=attn_metadata.slot_mapping.flatten()[:rows],
+                )
+            else:
+                ixfops.indexer_to_ixattn_kpool4(
+                    topk_indices,
+                    attn_metadata.req_id_per_token[:rows],
+                    attn_metadata.block_table,
+                    attn_metadata.block_size,
+                    pool_starts,
+                    token_counts,
+                )
+        return pool_starts, token_counts
+
+    def configure_mtp_pool_reuse(self, max_num_reqs: int) -> bool:
+        """Own a disjoint, stable destination for the MTP decode graphs."""
+        if not self.use_ixattn_compact_pools:
+            return False
+        assert max_num_reqs <= self._ixattn_pool_starts.shape[0]
+        self._ixattn_reuse_max_reqs = max_num_reqs
+        # Graph padding may exceed max_num_reqs. Those extra rows are always
+        # empty; only the request-capacity prefix needs clearing per proposal.
+        self._ixattn_reuse_starts = torch.full_like(self._ixattn_pool_starts, -1)
+        self._ixattn_reuse_counts = torch.zeros_like(self._ixattn_token_counts)
+        logger.info_once("GLM5Next MTP: reusing physical pool indices and token counts")
+        return True
+
+    def compact_mtp_pool_indices(self, slot_ids: torch.Tensor) -> None:
+        capacity = self._ixattn_reuse_max_reqs
+        ixfops.gather_kpool4_rows(
+            self._ixattn_pool_starts,
+            self._ixattn_token_counts,
+            slot_ids,
+            self._ixattn_reuse_starts[:capacity],
+            self._ixattn_reuse_counts[:capacity],
+        )
 
     def _prepare_bf16_up_proj_weights(self, act_dtype: torch.dtype) -> None:
         if self.W_UK_T is not None and self.W_UV is not None:
@@ -688,6 +835,7 @@ class IluFlashMLASparseImpl(
                 attn_metadata,
                 self,
                 kv_cache_scale,
+                **({"positions": positions} if self.use_ixattn_compact_pools else {}),
                 **({"backend": backend} if backend is not None else {}),
             )
             output_view = output.view(-1, self.num_heads, self.v_head_dim)
@@ -703,7 +851,30 @@ class IluFlashMLASparseImpl(
         attn_metadata: IluFlashMLASparseMetadata,
         *,
         backend: str | None = None,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.use_ixattn_kpool4:
+            rows = q.shape[0]
+            if rows == 0:
+                return torch.empty_like(q)
+            if not kv_c_and_k_pe_cache.is_contiguous():
+                raise ValueError("ixattn pool4 requires a contiguous latent KV cache")
+            pool_starts, token_counts = self._ixattn_physical_pool_rows(
+                rows, topk_indices, attn_metadata, positions
+            )
+            _, num_splits = self._ixattn_decode_plans[rows]
+            return ixfops.flash_mla_sparse_fwd(
+                q=q,
+                kv=kv_c_and_k_pe_cache.view(-1, 1, q.shape[-1]),
+                indices=pool_starts,
+                topk_length=token_counts,
+                sm_scale=self.softmax_scale,
+                kpool=4,
+                backend="ixattn",
+                workspace=self._ixattn_decode_workspace if num_splits > 1 else None,
+                num_splits=num_splits,
+            )
+
         compact_pools = bool(getattr(self._indexer, "compact_pool_indices", False))
         pool_prefill = (
             compact_pools
@@ -926,6 +1097,7 @@ class IluFlashMLASparseImpl(
         kv_cache_scale: torch.Tensor | None = None,
         *,
         backend: str | None = None,
+        positions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # NOTE(lucas): for the sparse FlashMLA kernels the kernels want to use
         # MQA 576/512 approach for both prefill and decode
@@ -957,6 +1129,7 @@ class IluFlashMLASparseImpl(
                 kv_c_and_k_pe_cache,
                 topk_indices,
                 attn_metadata,
+                **({"positions": positions} if self.use_ixattn_compact_pools else {}),
                 **({"backend": backend} if backend is not None else {}),
             )
 

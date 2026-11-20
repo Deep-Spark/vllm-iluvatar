@@ -103,6 +103,8 @@ def _kpool_mqa_logits(
             valid_lens=valid_lens,
             backend="ixinfer" if indexer_type == IndexerType.INT8 else None,
             packed_queries=packed_queries,
+            # Top-k reads only ke - ks == valid_lens; padded rows have length 0.
+            mask_invalid=indexer_type != IndexerType.BF16,
         )
     else:
         raise NotImplementedError(f"Unsupported indexer type: {indexer_type}")

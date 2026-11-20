@@ -7,6 +7,7 @@ import ixformer.inference.functions as ixfops
 import torch
 from ixformer.inference.functions.models import deepseek_v41 as ixf_mhc
 
+from vllm_iluvatar.ilu_util.arch import is_ivcore30
 from vllm_iluvatar import envs
 
 
@@ -36,7 +37,8 @@ def _get_pre_v2_workspace(device: torch.device) -> torch.Tensor:
 def allreduce_mhc_post_supported(config, tp_size: int) -> bool:
     """Whether ``allreduce_mhc_post_with_sqrsum`` can fuse attention TP AllReduce + MHC post."""
     return (
-        tp_size in (2, 4, 8)
+        not is_ivcore30()
+        and tp_size in (2, 4, 8)
         and getattr(config, "hidden_size", None) in (4096, 5120, 7168)
         and getattr(config, "mhc_num_residual_streams", None) == 4
     )
@@ -174,7 +176,7 @@ def mhc_fused_post_pre(
     tp_group=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused MHC post + next sub-block MHC pre (via explicit sqrsum handoff)."""
-    if _decode_splitk(residual) and not reduce_x:
+    if not reduce_x and (is_ivcore30() or _decode_splitk(residual)):
         residual = mhc_post(x, residual, post, comb)
         new_post, new_comb, layer_input = mhc_pre(
             residual,

@@ -26,7 +26,11 @@ from vllm.platforms import current_platform
 
 from vllm_iluvatar import envs
 
-from .attention import IluGlm5NextMLAAttention, glm5next_topk_buffer_width
+from .attention import (
+    IluGlm5NextMLAAttention,
+    glm5next_topk_buffer_width,
+    prepare_indexer_projection_weights,
+)
 from .model import _GLM5_PACKED_MODULES_MAPPING, IluGlm5NextDecoderLayer
 
 
@@ -127,10 +131,46 @@ class IluGlm5NextMultiTokenPredictor(Glm5NextMultiTokenPredictor):
             self_attn = layer.mtp_block.self_attn
             assert isinstance(self_attn, IluGlm5NextMLAAttention)
             self._mtp_mla_attns.append(self_attn.mla_attn)
+        self._mtp_pool_impls = []
+        spec = vllm_config.speculative_config
+        share_config = spec.draft_model_config.hf_config if spec is not None else config
+        share_indices = bool(
+            getattr(share_config, "index_share_for_mtp_iteration", False)
+        )
+        for mla_attn in self._mtp_mla_attns:
+            impl = mla_attn.mla_attn.impl
+            configure_reuse = getattr(impl, "configure_mtp_pool_reuse", None)
+            enabled = (
+                share_indices
+                and configure_reuse is not None
+                and configure_reuse(vllm_config.scheduler_config.max_num_seqs)
+            )
+            self._mtp_pool_impls.append(impl if enabled else None)
         self.logits_processor = LogitsProcessor(config.vocab_size)
+
+    def set_skip_topk(self, skip: bool) -> None:
+        super().set_skip_topk(skip)
+        # V2 calls this for both graph capture and replay: the first-pass graph
+        # always maps fresh pools and the decode graphs always use the compacted
+        # physical rows. Reset at every proposal even when request count repeats.
+        for impl in self._mtp_pool_impls:
+            if impl is not None:
+                impl._reuse_ixattn_pool_indices = skip
+
+    def compact_topk_indices(self, slot_ids: torch.Tensor) -> None:
+        for mla_attn, impl in zip(self._mtp_mla_attns, self._mtp_pool_impls):
+            if impl is not None:
+                impl.compact_mtp_pool_indices(slot_ids)
+            else:
+                indices = mla_attn.topk_indices_buffer
+                assert indices is not None
+                indices[: slot_ids.numel()] = indices[slot_ids]
 
 
 class IluGlm5NextMTP(Glm5NextMTP, SupportsPP):
+    def process_weights_after_loading(self) -> None:
+        prepare_indexer_projection_weights(self)
+
     packed_modules_mapping = _GLM5_PACKED_MODULES_MAPPING
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):

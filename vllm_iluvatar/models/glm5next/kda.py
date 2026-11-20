@@ -6,6 +6,7 @@ from __future__ import annotations
 import ixformer.inference.functions as ixfops
 import torch
 import vllm.envs as envs
+from ixformer.inference.backend_registry import registry as ix_registry
 from torch import nn
 from torch.nn.functional import linear
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
@@ -16,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -65,13 +67,105 @@ class IluGlm5NextLinearAttention(GatedDeltaNetAttention):
     num_heads: int
     conv_size: int
 
+    def get_attn_backend(self):
+        if self.cache_config.use_kda_recoverssm:
+            from vllm_iluvatar.v1.attention.backends.ilu_glm5next_kda import (
+                IluGlm5NextKDAAttentionBackend,
+            )
+
+            return IluGlm5NextKDAAttentionBackend
+        return super().get_attn_backend()
+
+    def bind_kv_cache(self, kv_cache):
+        ref = getattr(self, "_recoverssm_resources_ref", None)
+        resources = ref() if ref is not None else None
+        if resources is not None:
+            resources.before_layer_binding()
+        super().bind_kv_cache(kv_cache)
+        if resources is not None:
+            resources.after_layer_binding()
+
+    @torch.no_grad()
+    def _prepare_recoverssm_parameters(self):
+        if not self.use_recoverssm:
+            return
+        ref = self._recoverssm_resources_ref
+        resources = ref() if ref is not None else None
+        if (
+            resources is not None
+            and resources.captured_generation is not None
+            and (
+                self.A_log_view.data_ptr() != self.A_log.data_ptr()
+                or self.dt_bias_view.data_ptr() != self.dt_bias.data_ptr()
+            )
+        ):
+            raise RuntimeError(
+                "Recapture GLM graphs after KDA parameter storage changes"
+            )
+        self.A_log_view = self.A_log.reshape(self.local_num_heads)
+        self.dt_bias_view = self.dt_bias.reshape(self.local_num_heads, self.head_dim)
+        for i, module in enumerate((self.q_conv1d, self.k_conv1d, self.v_conv1d)):
+            self._merged_conv_weight[
+                i * self.local_projection_size : (i + 1) * self.local_projection_size
+            ].copy_(module.weight.reshape(self.local_projection_size, 4))
+        self._recoverssm_weights_ready = True
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        """Prepare paired dense weights after the per-linear loading hooks."""
+        if getattr(self, "use_recoverssm", False):
+            self._prepare_recoverssm_parameters()
+        previous = self._fg_b_weight
+        self._fg_b_weight = None
+        if ix_registry.resolve("bmm") != "ixmm":
+            return
+        f, g = self.f_b_proj, self.g_b_proj
+        if not all(
+            isinstance(layer.quant_method, UnquantizedLinearMethod)
+            and layer.bias is None
+            for layer in (f, g)
+        ):
+            return
+        if (
+            f.weight.dtype not in (torch.float16, torch.bfloat16)
+            or f.weight.dtype != act_dtype
+            or g.weight.dtype != f.weight.dtype
+            or f.weight.shape != g.weight.shape
+            or self.head_dim % 32 != 0
+            or self.local_projection_size % 2 != 0
+            or (self.local_num_heads * f.weight.element_size()) % 64 != 0
+        ):
+            return
+        # The B/F/G tail starts with beta. Its width determines both the
+        # f/g starting offset and row alignment required by ixmm.
+        if (
+            previous is not None
+            and previous.shape == (2, *f.weight.shape)
+            and previous.dtype == f.weight.dtype
+            and previous.device == f.weight.device
+        ):
+            paired = previous
+            for index, weight in enumerate((f.weight, g.weight)):
+                if weight.data_ptr() != paired[index].data_ptr():
+                    paired[index].copy_(weight.detach())
+        else:
+            paired = torch.stack((f.weight.detach(), g.weight.detach()))
+        # Preserve parameter names, TP loading attributes and reload behavior.
+        # The original Parameters become contiguous views of the pair, so there
+        # is no additional persistent copy of the projection weights.
+        f.weight.data = paired[0]
+        g.weight.data = paired[1]
+        self._fg_b_weight = paired
+        logger.info_once("GLM5Next KDA paired gate projections enabled")
+
     def get_state_dtype(
         self,
     ) -> tuple[torch.dtype, torch.dtype]:
         if self.model_config is None or self.cache_config is None:
             raise ValueError("model_config and cache_config must be set")
         return MambaStateDtypeCalculator.kda_state_dtype(
-            self.model_config.dtype, self.cache_config.mamba_cache_dtype
+            self.model_config.dtype,
+            self.cache_config.mamba_cache_dtype,
+            self.cache_config.mamba_ssm_cache_dtype,
         )
 
     def get_state_shape(
@@ -188,6 +282,7 @@ class IluGlm5NextLinearAttention(GatedDeltaNetAttention):
             quant_config=self.quant_config,
             prefix=f"{prefix}.g_b_proj",
         )
+        self.register_buffer("_fg_b_weight", None, persistent=False)
         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
         self.o_proj = RowParallelLinear(
             projection_size,
@@ -223,6 +318,91 @@ class IluGlm5NextLinearAttention(GatedDeltaNetAttention):
         self.kda_safe_gate = True
         self.kda_lower_bound = config.linear_lower_bound
         self._conv_state_dim_first = is_conv_state_dim_first()
+
+        self.use_recoverssm = self.cache_config.use_kda_recoverssm
+        self._recoverssm_resources_ref = None
+        if self.use_recoverssm:
+            rows = vllm_config.scheduler_config.max_num_seqs
+            t = self.num_spec + 1
+            self.register_buffer(
+                "_recoverssm_correction",
+                torch.empty(
+                    rows,
+                    self.local_num_heads,
+                    t,
+                    128,
+                    dtype=torch.float32,
+                    device=self.A_log.device,
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_recoverssm_key_gate",
+                torch.empty(
+                    rows,
+                    self.local_num_heads,
+                    t,
+                    256,
+                    dtype=torch.bfloat16,
+                    device=self.A_log.device,
+                ),
+                persistent=False,
+            )
+            del self._merged_conv_weight
+            self.register_buffer(
+                "_merged_conv_weight",
+                torch.empty(
+                    3 * self.local_projection_size,
+                    4,
+                    dtype=torch.float32,
+                    device=self.A_log.device,
+                ),
+                persistent=False,
+            )
+            self._recoverssm_weights_ready = False
+
+    def _project_qkv_and_gates(self, hidden_states: torch.Tensor):
+        projection = self.in_proj_qkvbfg_a
+        method = projection.quant_method
+        if (
+            hidden_states.ndim == 2
+            and isinstance(method, IluW8A8OnlineLinearMethod)
+            and method.quantized_rows == 3 * self.local_projection_size
+            and projection.bias is None
+            and not projection.gather_output
+        ):
+            # This merged column-parallel layer has no bias or output gather.
+            # Keep QKV and the BF16 B/F/G tail in their existing separate buffers.
+            qkv, tail = method.apply_parts(self.in_proj_qkvbfg_a, hidden_states)
+            beta_raw, fg = tail.split([self.local_num_heads, 2 * self.head_dim], dim=-1)
+        else:
+            projected = self.in_proj_qkvbfg_a(hidden_states)[0]
+            if isinstance(projected, tuple):
+                qkv, tail = projected
+                beta_raw, fg = tail.split(
+                    [self.local_num_heads, 2 * self.head_dim], dim=-1
+                )
+            else:
+                qkv, beta_raw, fg = projected.split(
+                    [
+                        3 * self.local_projection_size,
+                        self.local_num_heads,
+                        2 * self.head_dim,
+                    ],
+                    dim=-1,
+                )
+        shape = (-1, self.local_num_heads, self.head_dim)
+        if self._fg_b_weight is not None:
+            # f_a/g_a are adjacent column slices. view/transpose expose a
+            # non-overlapping [2, tokens, head_dim] batch without copying.
+            paired_input = fg.view(-1, 2, self.head_dim).transpose(0, 1)
+            gates = ixfops.bmm(paired_input, self._fg_b_weight, format="TN")
+            g1, g2 = gates[0].view(shape), gates[1].view(shape)
+        else:
+            f_a, g_a = fg.split(self.head_dim, dim=-1)
+            g1 = self.f_b_proj(f_a)[0].view(shape)
+            g2 = self.g_b_proj(g_a)[0].view(shape)
+        return qkv, beta_raw, g1, g2
 
     def forward(
         self, hidden_states: torch.Tensor, positions: torch.Tensor
@@ -265,18 +445,7 @@ class IluGlm5NextLinearAttention(GatedDeltaNetAttention):
                 qkv = method.scheme.apply_weights(projection, hidden_states, bias=None)
 
         if ready is None:
-            projected = projection(hidden_states)[0]
-            if self._split_qkvbfg_output:
-                qkv, gates = projected
-                beta_raw, f_a, g_a = gates.split(gate_sizes, dim=-1)
-            else:
-                qkv, beta_raw, f_a, g_a = projected.split(
-                    [3 * self.local_projection_size, *gate_sizes],
-                    dim=-1,
-                )
-
-            g1 = self.f_b_proj(f_a)[0].view(shape)
-            g2 = self.g_b_proj(g_a)[0].view(shape)
+            qkv, beta_raw, g1, g2 = self._project_qkv_and_gates(hidden_states)
 
         core_attn_out = torch.empty_like(g1)
 
@@ -332,7 +501,9 @@ class IluGlm5NextLinearAttention(GatedDeltaNetAttention):
         non_spec_token_indx = attn_metadata_narrowed.non_spec_token_indx
         num_accepted_tokens = attn_metadata_narrowed.num_accepted_tokens
         num_spec_decodes = attn_metadata_narrowed.num_spec_decodes
-        use_spec = spec_sequence_masks is not None and num_spec_decodes > 0
+        use_spec = num_spec_decodes > 0 and (
+            self.use_recoverssm or spec_sequence_masks is not None
+        )
 
         lower_bound = self.kda_lower_bound
         constant_caches = self.kv_cache
@@ -366,27 +537,51 @@ class IluGlm5NextLinearAttention(GatedDeltaNetAttention):
 
         if use_spec:
             q, k, v = qkv_proj_states.split(self.local_projection_size, dim=-1)
-            ixfops.fused_recurrent_kda(
-                q,
-                k,
-                v,
-                g1,
-                beta,
-                self.A_log_view,
-                self.dt_bias_view,
-                core_attn_out,
-                recurrent_state,
-                spec_query_start_loc[: num_spec_decodes + 1],
-                spec_state_indices_tensor,
-                self.head_dim**-0.5,
-                lower_bound,
-                None,
-                num_accepted_tokens,
-                spec_token_indx,
-                conv_weight=conv_weights,
-                conv_state_pool=conv_state,
-                pad_slot_id=0,
-            )
+            if self.use_recoverssm:
+                ixfops.kda_recoverssm_verify(
+                    q,
+                    k,
+                    v,
+                    g1,
+                    beta,
+                    self.A_log_view,
+                    self.dt_bias_view,
+                    recurrent_state,
+                    self._recoverssm_correction,
+                    self._recoverssm_key_gate,
+                    spec_query_start_loc[: num_spec_decodes + 1],
+                    spec_state_indices_tensor[:num_spec_decodes, 0],
+                    spec_query_len=self.num_spec + 1,
+                    lower_bound=lower_bound,
+                    out=core_attn_out,
+                    record_rows=attn_metadata_narrowed.recoverssm_record_rows,
+                    token_index=spec_token_indx,
+                    conv_weight=conv_weights,
+                    conv_state_pool=conv_state,
+                    pad_slot_id=0,
+                )
+            else:
+                ixfops.fused_recurrent_kda(
+                    q,
+                    k,
+                    v,
+                    g1,
+                    beta,
+                    self.A_log_view,
+                    self.dt_bias_view,
+                    core_attn_out,
+                    recurrent_state,
+                    spec_query_start_loc[: num_spec_decodes + 1],
+                    spec_state_indices_tensor,
+                    self.head_dim**-0.5,
+                    lower_bound,
+                    None,
+                    num_accepted_tokens,
+                    spec_token_indx,
+                    conv_weight=conv_weights,
+                    conv_state_pool=conv_state,
+                    pad_slot_id=0,
+                )
 
         if attn_metadata_narrowed.num_prefills > 0:
             qkv_ns = causal_conv1d_fn(

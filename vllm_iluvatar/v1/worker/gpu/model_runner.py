@@ -770,3 +770,61 @@ def make_pcp_pp_sample_tokens(original_sample_tokens):
         return original_sample_tokens(self, grammar_output)
 
     return sample_tokens
+
+
+def make_recoverssm_initialize_kv_cache(original):
+    """Cover both the upstream BF16 runner and the optional ILU quantized runner."""
+    from functools import wraps
+
+    @wraps(original)
+    def initialize_kv_cache(
+        self,
+        kv_cache_config,
+        is_profiling=False,
+        kv_cache_allocation_context=None,
+    ):
+        from vllm_iluvatar.models.glm5next.recoverssm import (
+            begin_recoverssm_cache_binding,
+            finish_recoverssm_cache_binding,
+            get_recoverssm_resources,
+        )
+
+        resources = get_recoverssm_resources(self.model)
+        owns_binding = resources is not None and not resources.binding
+        if owns_binding:
+            begin_recoverssm_cache_binding(self, is_profiling)
+        try:
+            result = original(
+                self,
+                kv_cache_config,
+                is_profiling=is_profiling,
+                kv_cache_allocation_context=kv_cache_allocation_context,
+            )
+            if owns_binding:
+                finish_recoverssm_cache_binding(self)
+            return result
+        except BaseException:
+            if owns_binding:
+                resources.release_cache_binding()
+            raise
+
+    return initialize_kv_cache
+
+
+def make_recoverssm_profiling_teardown(original):
+    from functools import wraps
+
+    @wraps(original)
+    def teardown(runner):
+        from vllm_iluvatar.models.glm5next.recoverssm import get_recoverssm_resources
+
+        resources = get_recoverssm_resources(runner.model)
+        if resources is not None:
+            # Layers and runner.kv_caches retain the original cache tensors until
+            # upstream synchronizes and detaches them. Drop only our extra refs
+            # before its allocator flush, retaining the persistent record storage.
+            resources.release_cache_binding()
+            runner.model_state.recoverssm.clear()
+        return original(runner)
+
+    return teardown

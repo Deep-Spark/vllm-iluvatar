@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import os
-
 import ixformer.inference.functions as ixfops
 import torch
 from torch import nn
@@ -23,6 +21,7 @@ from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory, GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.mamba.mamba_utils import MambaStateDtypeCalculator
 from vllm.model_executor.layers.mhc import hc_contract, hc_expand
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -31,6 +30,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.models.deepseek_v2 import _get_moe_router_dtype
 from vllm.model_executor.models.glm4_1v import Glm4vDummyInputsBuilder
+from vllm.model_executor.models.interfaces import EagleModelMixin, SupportsEagle3
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
     is_pp_missing_parameter,
@@ -60,23 +60,45 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 
+from vllm_iluvatar.ilu_util.arch import is_ivcore30
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
     IluFusedMoEEP,
 )
 from vllm_iluvatar.model_executor.layers.quantization.configs.fp8 import IluFp8Config
 
 from . import mhc
-from .attention import IluGlm5NextMLAAttention, glm5next_topk_buffer_width
+from .attention import (
+    IluGlm5NextMLAAttention,
+    glm5next_topk_buffer_width,
+    prepare_indexer_projection_weights,
+)
 from .kda import IluGlm5NextLinearAttention
 
 logger = init_logger(__name__)
-
-_ILU_GLM5_PROFILE = os.environ.get("ILU_GLM5_PROFILE")
 
 _GLM5_PACKED_MODULES_MAPPING = {
     "gate_up_proj": ["gate_proj", "up_proj"],
     "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
 }
+
+
+def _target_sequence_parallel(vllm_config: VllmConfig, *, is_mtp_layer=False):
+    # The draft model keeps its existing TP layout and execution schedule.
+    if is_mtp_layer:
+        return False
+    parallel = vllm_config.parallel_config
+    return (
+        vllm_config.model_config.hf_config.mhc
+        and parallel.use_sequence_parallel_moe
+        and parallel.all2all_backend == "allgather_reducescatter"
+        and parallel.pipeline_parallel_size == 1
+        and parallel.prefill_context_parallel_size == 1
+        and parallel.decode_context_parallel_size == 1
+        and not parallel.enable_dbo
+        and not parallel.enable_eplb
+        and not parallel.enable_elastic_ep
+        and envs.VLLM_ILU_DECODE_EP_BACKEND != "deepep_low_latency"
+    )
 
 
 class IluGlm5NextMLP(Glm5NextMLP):
@@ -145,6 +167,7 @@ class IluGlm5NextMoE(Glm5NextMoE, IluFusedMoEEP):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         apply_routed_scale_to_output: bool = False,
+        is_sequence_parallel: bool = False,
     ):
         super(Glm5NextMoE, self).__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -158,13 +181,7 @@ class IluGlm5NextMoE(Glm5NextMoE, IluFusedMoEEP):
         self.n_routed_experts: int = config.n_routed_experts
         self.n_shared_experts: int = config.n_shared_experts
 
-        if parallel_config.use_sequence_parallel_moe:
-            logger.warning_once(
-                "Outer sequence parallelism (use_sequence_parallel_moe) is "
-                "disabled for Glm5Next on Iluvatar; TP/DP/EP sharding is "
-                "handled inside the MoE runner."
-            )
-        self.is_sequence_parallel = False
+        self.is_sequence_parallel = is_sequence_parallel
 
         if config.hidden_act != "silu":
             raise ValueError(
@@ -303,7 +320,9 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
         self.mhc = config.mhc
         is_kda_layer = not is_mtp_layer and config.is_kda_layer(layer_idx)
         self.layer_kind = "kda" if is_kda_layer else "mla"
-        self.is_sequence_parallel = False
+        self.is_sequence_parallel = _target_sequence_parallel(
+            vllm_config, is_mtp_layer=is_mtp_layer
+        )
 
         if is_kda_layer:
             self.self_attn = IluGlm5NextLinearAttention(
@@ -345,6 +364,15 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
             self.mlp = IluGlm5NextMoE(
                 config=config,
                 parallel_config=parallel_config,
+                is_sequence_parallel=(
+                    self.is_sequence_parallel
+                    or (
+                        is_mtp_layer
+                        and parallel_config.use_sequence_parallel_moe
+                        and quant_config is not None
+                        and quant_config.get_name() == "ilu_f4f8"
+                    )
+                ),
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
@@ -365,6 +393,7 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
             self.mhc
             and not is_mtp_layer
             and not envs.VLLM_ILU_GLM5NEXT_MHC_DECODE_SPLITK
+            and not self.is_sequence_parallel
             and mhc.allreduce_mhc_post_supported(config, tp_size)
         )
         if (
@@ -584,7 +613,7 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
         )
 
 
-class IluGlm5NextModel(Glm5NextModel):
+class IluGlm5NextModel(Glm5NextModel, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super(Glm5NextModel, self).__init__()
 
@@ -641,15 +670,36 @@ class IluGlm5NextModel(Glm5NextModel):
         else:
             self.norm = PPMissingLayer()
 
-        self.is_sequence_parallel = False
+        self.is_sequence_parallel = _target_sequence_parallel(vllm_config)
 
         world_size = get_tensor_model_parallel_world_size()
+        self._send_completed_mhc_residual = (
+            config.mhc
+            and vllm_config.parallel_config.pipeline_parallel_size > 1
+            and world_size == 1
+            and is_ivcore30()
+        )
         assert config.num_attention_heads % world_size == 0, (
             "num_attention_heads must be divisible by world_size"
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    def _aux_hidden_state(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        post: torch.Tensor | None,
+        comb: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Contract completed residual streams when the drafter requests a layer output."""
+        if post is not None:
+            assert residual is not None and comb is not None
+            hidden_states = mhc.mhc_post(hidden_states, residual, post, comb)
+        if hidden_states.ndim == 3:
+            return hc_contract(hidden_states, self.config.mhc_num_residual_streams)
+        return hidden_states
 
     def make_empty_intermediate_tensors(
         self,
@@ -659,6 +709,14 @@ class IluGlm5NextModel(Glm5NextModel):
     ) -> IntermediateTensors:
         n = self.config.mhc_num_residual_streams
         d = self.config.hidden_size
+        if self._send_completed_mhc_residual:
+            return IntermediateTensors(
+                {
+                    "hidden_states": torch.zeros(
+                        (batch_size, n, d), dtype=dtype, device=device
+                    )
+                }
+            )
         return IntermediateTensors(
             {
                 "hidden_states": torch.zeros(
@@ -681,14 +739,15 @@ class IluGlm5NextModel(Glm5NextModel):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor:
-        if _ILU_GLM5_PROFILE is None:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        profile = envs.VLLM_ILU_GLM5_PROFILE
+        if profile is None:
             return self._forward_impl(
                 input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
             )
         nt = positions.numel()
-        arm = (_ILU_GLM5_PROFILE == "decode" and nt <= 6) or (
-            _ILU_GLM5_PROFILE == "prefill" and nt > 64
+        arm = (profile == "decode" and nt <= 6) or (
+            profile == "prefill" and nt > 64
         )
         if arm:
             torch.cuda.profiler.start()
@@ -707,32 +766,61 @@ class IluGlm5NextModel(Glm5NextModel):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor:
-        if get_pp_group().is_first_rank:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        pp_group = get_pp_group()
+        residual = post = comb = None
+        if pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
-            residual = None
-            post = None
-            comb = None
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
-            post = intermediate_tensors["post"]
-            comb = intermediate_tensors["comb"]
+            if not self._send_completed_mhc_residual:
+                residual = intermediate_tensors["residual"]
+                post = intermediate_tensors["post"]
+                comb = intermediate_tensors["comb"]
 
         full_num_tokens = positions.shape[0]
         if self.is_sequence_parallel:
             hidden_states = sp_shard(hidden_states)
 
-        for layer in self._active_layers:
-            hidden_states, residual, post, comb = layer(
-                positions, hidden_states, residual, post, comb
-            )
+        aux_hidden_states: list[torch.Tensor] = []
+        if self.aux_hidden_state_layers:
+            for idx, layer in enumerate(self._active_layers, start=self.start_layer):
+                if idx in self.aux_hidden_state_layers:
+                    aux = self._aux_hidden_state(hidden_states, residual, post, comb)
+                    if self.is_sequence_parallel:
+                        aux = sp_all_gather(aux)[:full_num_tokens]
+                    aux_hidden_states.append(aux)
+                hidden_states, residual, post, comb = layer(
+                    positions, hidden_states, residual, post, comb
+                )
+        else:
+            for layer in self._active_layers:
+                hidden_states, residual, post, comb = layer(
+                    positions, hidden_states, residual, post, comb
+                )
 
-        if not get_pp_group().is_last_rank:
+        if self._send_completed_mhc_residual and not pp_group.is_last_rank:
+            # CQ computes post and pre separately. Finish post on the sender so
+            # the next rank only receives the completed residual [tokens, n, d].
+            hidden_states = mhc.mhc_post(hidden_states, residual, post, comb)
+            residual = post = comb = None
+
+        if (
+            self.aux_hidden_state_layers
+            and self.end_layer in self.aux_hidden_state_layers
+        ):
+            aux = self._aux_hidden_state(hidden_states, residual, post, comb)
+            if self.is_sequence_parallel:
+                aux = sp_all_gather(aux)[:full_num_tokens]
+            aux_hidden_states.append(aux)
+
+        if not pp_group.is_last_rank:
+            if self._send_completed_mhc_residual:
+                return IntermediateTensors({"hidden_states": hidden_states})
             return IntermediateTensors(
                 {
                     "hidden_states": hidden_states,
@@ -746,6 +834,8 @@ class IluGlm5NextModel(Glm5NextModel):
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
         hidden_states = self.norm(hidden_states)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def load_weights(self, weights):
@@ -754,8 +844,37 @@ class IluGlm5NextModel(Glm5NextModel):
         )
 
 
-class IluGlm5NextForCausalLM(Glm5NextForCausalLM):
+class IluGlm5NextForCausalLM(Glm5NextForCausalLM, SupportsEagle3):
     packed_modules_mapping = _GLM5_PACKED_MODULES_MAPPING
+    supports_replayssm = True
+
+    def get_model_state_cls(self):
+        if getattr(self, "_recoverssm_resources", None) is not None:
+            from vllm_iluvatar.v1.worker.gpu.model_states.glm5next import (
+                IluGlm5NextModelState,
+            )
+
+            return IluGlm5NextModelState
+        from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+
+        return MambaHybridModelState
+
+    def process_weights_after_loading(self):
+        original = getattr(super(), "process_weights_after_loading", None)
+        if original is not None:
+            original()
+        prepare_indexer_projection_weights(self)
+        resources = getattr(self, "_recoverssm_resources", None)
+        if resources is not None:
+            resources.refresh_parameters()
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig):
+        return MambaStateDtypeCalculator.kda_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super(Glm5NextForCausalLM, self).__init__()
@@ -783,6 +902,10 @@ class IluGlm5NextForCausalLM(Glm5NextForCausalLM):
             self.model.make_empty_intermediate_tensors
         )
 
+        from .recoverssm import initialize_recoverssm_resources
+
+        initialize_recoverssm_resources(self, vllm_config)
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
@@ -805,14 +928,49 @@ class IluGlm5NextForCausalLM(Glm5NextForCausalLM):
     info=Glm5NextProcessingInfo,
     dummy_inputs=Glm4vDummyInputsBuilder,
 )
-class IluGlm5NextForConditionalGeneration(Glm5NextForConditionalGeneration):
+class IluGlm5NextForConditionalGeneration(
+    Glm5NextForConditionalGeneration, SupportsEagle3
+):
     packed_modules_mapping = _GLM5_PACKED_MODULES_MAPPING
+    supports_replayssm = True
+
+    def get_model_state_cls(self):
+        if getattr(self, "_recoverssm_resources", None) is not None:
+            from vllm_iluvatar.v1.worker.gpu.model_states.glm5next import (
+                IluGlm5NextModelState,
+            )
+
+            return IluGlm5NextModelState
+        from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+
+        return MambaHybridModelState
+
+    def process_weights_after_loading(self):
+        original = getattr(super(), "process_weights_after_loading", None)
+        if original is not None:
+            original()
+        prepare_indexer_projection_weights(self)
+        resources = getattr(self, "_recoverssm_resources", None)
+        if resources is not None:
+            resources.refresh_parameters()
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig):
+        return MambaStateDtypeCalculator.kda_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
+
+        from .recoverssm import initialize_recoverssm_resources
+
+        initialize_recoverssm_resources(self, vllm_config)
 
 
 def register_model() -> None:

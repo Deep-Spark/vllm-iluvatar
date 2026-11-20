@@ -142,9 +142,31 @@ def test_forward_shape_and_gate(monkeypatch, rows, use_perf):
     with pytest.raises(ValueError, match="bias"):
         layer.quant_method.apply(layer, x, torch.zeros(10))
 
+    body, tail = layer.quant_method.apply_parts(layer, x.reshape(-1, x.shape[-1]))
+    torch.testing.assert_close(
+        body, output.reshape(-1, 128)[:, : rows or 128], rtol=0, atol=0
+    )
+    if rows is not None:
+        torch.testing.assert_close(
+            tail, output.reshape(-1, 128)[:, rows:], rtol=0, atol=0
+        )
+    else:
+        assert tail is None
+    with pytest.raises(ValueError, match="2D"):
+        layer.quant_method.apply_parts(layer, x)
+    assert bool(dispatched) == use_perf
+    assert output.shape == (2, 3, 128)
+    assert output.dtype == torch.bfloat16
+    if rows:
+        torch.testing.assert_close(
+            output[..., rows:], torch.nn.functional.linear(x, weight[rows:])
+        )
+    with pytest.raises(ValueError, match="bias"):
+        layer.quant_method.apply(layer, x, torch.zeros(10))
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires Iluvatar GPU")
-@pytest.mark.parametrize("m", [4, 8, 24, 48])
+@pytest.mark.parametrize("m", [4, 8, 24, 48, 60])
 @pytest.mark.parametrize(
     "n,k,rows",
     [

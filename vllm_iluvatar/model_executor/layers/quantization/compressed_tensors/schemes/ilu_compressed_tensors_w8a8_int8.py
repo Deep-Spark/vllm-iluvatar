@@ -751,13 +751,22 @@ class IluW8A8OnlineLinearMethod(LinearMethodBase):
         layer.logical_widths = [rows]
         self.scheme.process_weights_after_loading(layer)
 
+    def apply_parts(self, layer, flat):
+        """Return the W8A8 output and optional BF16 tail for a 2D input."""
+        if flat.ndim != 2:
+            raise ValueError("Online W8A8 projection parts require a 2D input")
+        output = self.scheme.apply_weights(layer, flat, bias=None)
+        tail = None
+        if self.quantized_rows is not None:
+            tail = torch.nn.functional.linear(flat, layer.bf16_tail_weight)
+        return output, tail
+
     def apply(self, layer, x, bias=None):
         if bias is not None:
             raise ValueError("Online W8A8 mixed projections do not support bias")
         flat = x.reshape(-1, x.shape[-1])
-        output = self.scheme.apply_weights(layer, flat, bias=None)
-        if self.quantized_rows is not None:
-            tail = torch.nn.functional.linear(flat, layer.bf16_tail_weight)
+        output, tail = self.apply_parts(layer, flat)
+        if tail is not None:
             if not self.cat_output:
                 return (
                     output.view(*x.shape[:-1], output.shape[-1]),

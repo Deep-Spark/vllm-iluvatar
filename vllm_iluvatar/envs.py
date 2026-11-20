@@ -250,6 +250,7 @@ if TYPE_CHECKING:
     VLLM_ILU_GLM5NEXT_MLA_PROJ_W8A8: bool = True
     VLLM_ILU_GLM5NEXT_KDA_PROJ_W8A8: bool = True
     VLLM_ILU_GLM5NEXT_GATHER_BEFORE_GATE: bool = True
+    VLLM_ILU_GLM5_PROFILE: str | None = None
     VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP: bool = False
     VLLM_ILU_MOE_AG_SHARED_OVERLAP: bool = False
     VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP: bool = True
@@ -492,6 +493,11 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # gate-then-dispatch path.
     "VLLM_ILU_GLM5NEXT_GATHER_BEFORE_GATE": _bool_reader(
         "VLLM_ILU_GLM5NEXT_GATHER_BEFORE_GATE", "1"
+    ),
+    "VLLM_ILU_GLM5_PROFILE": lambda: _maybe_stripped(
+        os.environ.get("VLLM_ILU_GLM5_PROFILE")
+        or os.environ.get("ILU_GLM5_PROFILE")
+        or ""
     ),
     "VLLM_ILU_INDEXER_KV_DTYPE": lambda: (
         os.environ.get("VLLM_ILU_INDEXER_KV_DTYPE", "bf16").strip().lower()
@@ -816,6 +822,20 @@ _ILU_GUARD_ENV_VARS: dict[str, Callable[[], Any]] = {
         "VLLM_ILU_PP_CPU_OFFLOAD_REQUIRED", "0"
     ),
 }
+
+
+def is_set(name: str) -> bool:
+    """Check if a registered Iluvatar environment variable is explicitly set."""
+    if name in _ILU_ENV_VARS:
+        return name in os.environ or _canonical_to_legacy(name) in os.environ
+    for readers in (
+        _ILU_ENV_ALIASES,
+        _ILU_CANONICAL_ONLY_ENV_VARS,
+        _ILU_GUARD_ENV_VARS,
+    ):
+        if name in readers:
+            return name in os.environ
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __getattr__(name: str) -> Any:

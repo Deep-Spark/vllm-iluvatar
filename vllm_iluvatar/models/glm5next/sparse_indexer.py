@@ -101,6 +101,8 @@ def _kpool_mqa_logits(
             max_context_len=max_context_len,
             valid_lens=valid_lens,
             backend="ixinfer",
+            # Top-k reads only ke - ks == valid_lens; padded rows have length 0.
+            mask_invalid=indexer_type != IndexerType.BF16,
         )
     else:
         raise NotImplementedError(f"Unsupported indexer type: {indexer_type}")

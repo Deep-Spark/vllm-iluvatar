@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import wraps
 from typing import Any
 
@@ -35,6 +35,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
 )
+
+from .indexer_decode_metadata import build_indexer_decode_metadata
 
 
 def indexer_kv_dtype() -> str:
@@ -620,6 +622,17 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             raise NotImplementedError(
                 "Iluvatar PCP requires an uncompressed indexer cache"
             )
+        self._fused_glm5next_decode_metadata = (
+            self.device.type == "cuda"
+            and getattr(torch, "corex_arch", None) == "ivcore30"
+            and getattr(
+                getattr(self.vllm_config.model_config, "hf_config", None),
+                "model_type",
+                None,
+            )
+            in ("glm5_next", "glm5_next_text", "glm5next")
+            and self.compress_ratio == 4
+        )
         self.max_decode_context_len = get_max_decode_context_len(
             self.vllm_config, self.compress_ratio
         )
@@ -632,20 +645,22 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 dtype=torch.int64,
                 device=self.device,
             )
-            self.expanded_seq_lens_buffer = torch.zeros(
-                (scheduler_config.max_num_batched_tokens,),
-                dtype=torch.int32,
-                device=self.device,
-            )
+            if not self._fused_glm5next_decode_metadata:
+                self.expanded_seq_lens_buffer = torch.zeros(
+                    (scheduler_config.max_num_batched_tokens,),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
         self.req_id_per_token_buffer = torch.empty(
             (scheduler_config.max_num_batched_tokens,),
             dtype=torch.int32,
             device=self.device,
         )
 
-        self.offsets_buffer = torch.arange(
-            next_n, device=self.device, dtype=torch.int32
-        )
+        if not self._fused_glm5next_decode_metadata:
+            self.offsets_buffer = torch.arange(
+                next_n, device=self.device, dtype=torch.int32
+            )
         self.decode_lens_buffer = torch.zeros(
             (scheduler_config.max_num_batched_tokens,),
             dtype=torch.int32,
@@ -659,31 +674,35 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         if not self.use_flattening and next_n > 1:
             # Native MTP: 2D buffer for per-token seq_lens.
             # Flattening path is never used, so no expanded_seq_lens_buffer.
-            self.decode_seq_lens_buffer = torch.zeros(
-                (scheduler_config.max_num_seqs, next_n),
-                dtype=torch.int32,
-                device=self.device,
-            )
+            if not self._fused_glm5next_decode_metadata:
+                self.decode_seq_lens_buffer = torch.zeros(
+                    (scheduler_config.max_num_seqs, next_n),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
         else:
             # Flattening or no MTP: 1D buffer for expanded per-token seq_lens.
-            self.decode_seq_lens_buffer = torch.zeros(
-                (scheduler_config.max_num_batched_tokens,),
+            if not self._fused_glm5next_decode_metadata:
+                self.decode_seq_lens_buffer = torch.zeros(
+                    (scheduler_config.max_num_batched_tokens,),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+        if not self._fused_glm5next_decode_metadata:
+            self.decode_position_offsets_buffer = torch.arange(
+                scheduler_config.max_num_seqs * next_n,
                 dtype=torch.int32,
                 device=self.device,
             )
-        self.decode_position_offsets_buffer = torch.arange(
-            scheduler_config.max_num_seqs * next_n,
-            dtype=torch.int32,
-            device=self.device,
-        )
         # 1-based arange for the device-side cu_seqlen_ks/ke build, kept int32
         # so that whole computation stays in one dtype.
-        self.decode_token_arange_p1_buffer = torch.arange(
-            1,
-            scheduler_config.max_num_batched_tokens + 1,
-            dtype=torch.int32,
-            device=self.device,
-        )
+        if not self._fused_glm5next_decode_metadata:
+            self.decode_token_arange_p1_buffer = torch.arange(
+                1,
+                scheduler_config.max_num_batched_tokens + 1,
+                dtype=torch.int32,
+                device=self.device,
+            )
         max_num_blocks_per_req = (
             block_table_width
             if block_table_width is not None
@@ -728,19 +747,50 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             device=self.device,
         )
 
-        self.expanded_block_table_buffer = torch.zeros(
+        if not self._fused_glm5next_decode_metadata:
+            self.expanded_block_table_buffer = torch.zeros(
+                (
+                    scheduler_config.max_num_batched_tokens,
+                    max_num_blocks_per_req,
+                ),
+                dtype=torch.int32,
+                device=self.device,
+            )
+        self._kernel_block_table_width = max_num_blocks_per_req
+        self._storage_block_table_buffer: torch.Tensor | None = None
+
+        # See: DeepGMM/csrc/apis/attention.hpp
+        if not self._fused_glm5next_decode_metadata:
+            self.scheduler_metadata_buffer = torch.empty(
+                (self.num_sms + 1, 2), dtype=torch.int32, device=self.device
+            )
+
+    def set_kernel_block_size(self, kernel_block_size: int) -> None:
+        super().set_kernel_block_size(kernel_block_size)
+        self._storage_block_table_buffer = None
+        if self.compress_ratio <= 1:
+            return
+        # Match make_storage_block_size_build: the optional override takes
+        # precedence, otherwise num_states is the physical compressed page.
+        storage_tokens = _StorageBlockSizeSpec(self.kv_cache_spec).block_size
+        if storage_tokens <= kernel_block_size:
+            return
+        if storage_tokens % kernel_block_size:
+            raise ValueError("Indexer storage pages must contain whole kernel pages")
+        factor = storage_tokens // kernel_block_size
+        if self._kernel_block_table_width % factor:
+            raise ValueError(
+                "Indexer block-table width must contain whole storage pages"
+            )
+        # One request table is shared by the compressed writer and all readers.
+        # Reserve it before profiling/capture, including future decode batches.
+        self._storage_block_table_buffer = torch.empty(
             (
-                scheduler_config.max_num_batched_tokens,
-                max_num_blocks_per_req,
+                self.vllm_config.scheduler_config.max_num_seqs,
+                self._kernel_block_table_width // factor,
             ),
             dtype=torch.int32,
             device=self.device,
-        )
-        self.indexer_decode_block_table_buffer: torch.Tensor | None = None
-
-        # See: DeepGMM/csrc/apis/attention.hpp
-        self.scheduler_metadata_buffer = torch.empty(
-            (self.num_sms + 1, 2), dtype=torch.int32, device=self.device
         )
 
     def build_one_prefill_chunk(
@@ -863,6 +913,117 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             skip_kv_gather=skip_kv_gather,
             context_lower_bound=context_lower_bound,
         )
+
+    def _build_fused_decode_metadata(
+        self, common_attn_metadata, num_decodes, num_decode_tokens
+    ):
+        # Per-request query lengths in the (uncompressed) token domain. With
+        # MTP the verify step schedules ``next_n = 1 + num_speculative_tokens``
+        # query tokens per request, so each request emits multiple decode
+        # tokens. We mirror ``build_one_prefill_chunk``: build per-query-token
+        # ``cu_seqlen_ks/ke`` in persistent buffers and a per-request
+        # ``cu_seqlens_q`` so the (shared with prefill) kernel
+        # ``dsa_indexer_mqa_logits_with_kvcache`` handles >1 query per request.
+        #
+        # ``decode_qsl_cpu`` is the per-request query start loc relative to the
+        # first decode token (decodes are at the front of the batch). For plain
+        # single-token decode this is [0, 1, 2, ..., R], for uniform MTP it is
+        # [0, next_n, 2*next_n, ...]. CUDA-graph FULL_DECODE_ONLY pads the
+        # request dimension up to the captured size; padded rows carry
+        # query_len=0 (query_start_loc_cpu is flat-filled for them), so the
+        # real requests form a uniform prefix and the trailing entries repeat
+        # the last real offset. We allow 0 and only forbid negative lengths.
+        #
+        # ``num_decode_tokens`` is the **padded** decode token count (==
+        # common_attn_metadata.num_actual_tokens under CUDA graph, which the
+        # consumer uses to slice q/weights/logits). ``num_real_decode_tokens``
+        # is the unpadded count (decode_qsl_cpu[-1]); the gap [real, padded) is
+        # CUDA-graph padding rows that must be no-ops downstream.
+        decode_qsl_cpu = (
+            common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
+            - common_attn_metadata.query_start_loc_cpu[0]
+        )
+        decode_lens_cpu = torch.diff(decode_qsl_cpu)
+        assert decode_lens_cpu.min().item() >= 0, (
+            "Negative decode query length in dsa_indexer backend"
+        )
+        num_real_decode_tokens = int(decode_qsl_cpu[-1].item())
+        assert num_real_decode_tokens <= num_decode_tokens, (
+            f"real decode tokens {num_real_decode_tokens} exceed padded "
+            f"num_decode_tokens {num_decode_tokens}"
+        )
+        # Max query length per real request: 1 for plain decode, next_n for MTP
+        # (trailing zero-length padding rows never raise the max).
+        max_q_len = int(decode_lens_cpu.max().item())
+        # ``requires_padding`` flags a *genuinely ragged* batch that needs
+        # pack/unpack (e.g. variable accepted spec tokens). CUDA-graph trailing
+        # zero-length padding rows are NOT ragged -- the real (non-zero) query
+        # lengths are uniform and the padding is handled as no-ops by the
+        # mqa-logits kernel (empty batch -> early return) and the topk kernel
+        # (cur_len<=0 -> writes -1). So only flag when the real lengths differ.
+        nonzero_lens = decode_lens_cpu[decode_lens_cpu > 0]
+        requires_padding = bool(
+            nonzero_lens.numel() > 0
+            and (nonzero_lens.max() != nonzero_lens.min()).item()
+        )
+
+        # These host scalars are fixed at CUDA graph capture time. Actual
+        # per-request lengths remain device-driven through cu_seqlens_kv.
+        max_context_len = self.max_decode_context_len
+        max_kv_len = max_context_len
+
+        next_n = self.num_speculative_tokens + 1
+        use_native = not self.use_flattening and max_q_len == next_n
+        flatten = not use_native and max_q_len > 1
+        decode_lens = self.decode_lens_buffer[
+            : num_decode_tokens if flatten else num_decodes
+        ]
+        cu_seqlens_q = self.cu_seqlens_q_buffer[: num_decodes + 1]
+        cu_seqlens_kv = self.cu_seqlens_kv_buffer[: num_decodes + 1]
+        decode_seq_lens = self.decode_compressed_seq_lens_buffer[:num_decodes]
+        cu_seqlen_ks = self.cu_seqlen_ks_buffer[:num_decode_tokens]
+        cu_seqlen_ke = self.cu_seqlen_ke_buffer[:num_decode_tokens]
+        valid_lens = self.valid_lens_buffer[:num_decode_tokens]
+        request_ids = getattr(common_attn_metadata, "_token_to_req_indices_cache", None)
+        # CommonAttentionMetadata caches the whole batch's mapping. A decode
+        # prefix may reuse it, but a nonzero query origin must not index it as
+        # though it were a new local batch.
+        if int(common_attn_metadata.query_start_loc_cpu[0]) != 0:
+            request_ids = None
+        build_indexer_decode_metadata(
+            common_attn_metadata.query_start_loc[: num_decodes + 1],
+            common_attn_metadata.seq_lens[:num_decodes],
+            compress_ratio=self.compress_ratio,
+            flatten_decode_lens=flatten,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            per_req_decode_lens=self.per_req_decode_lens_buffer[:num_decodes],
+            compressed_seq_lens=decode_seq_lens,
+            decode_lens=decode_lens,
+            cu_seqlen_ks=cu_seqlen_ks,
+            cu_seqlen_ke=cu_seqlen_ke,
+            valid_lens=valid_lens,
+            token_to_req_indices=request_ids,
+        )
+
+        decode_metadata = IluDeepSeekV32IndexerDecodeMetadata(
+            block_table=common_attn_metadata.block_table_tensor[:num_decodes, ...],
+            seq_lens=decode_seq_lens,
+            decode_lens=decode_lens,
+            requires_padding=requires_padding,
+            cu_seqlen_ks=cu_seqlen_ks,
+            cu_seqlen_ke=cu_seqlen_ke,
+            valid_lens=valid_lens,
+            cu_seqlens_kv=cu_seqlens_kv,
+            cu_seqlens_q=cu_seqlens_q,
+            max_context_len=max_context_len,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            per_req_decode_lens=self.per_req_decode_lens_buffer[:num_decodes],
+            decode_is_uniform=(int(decode_lens_cpu.min().item()) == max_q_len),
+            write_max_decode_len=max_q_len,
+        )
+        return decode_metadata
 
     def build_decode_metadata(
         self, common_attn_metadata, num_decodes, decode_lens, num_decode_tokens
@@ -1174,15 +1335,23 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         indexer_block_table = common_attn_metadata.block_table_tensor
         if self.compress_ratio > 1:
             kernel_block_size = self.kernel_block_size
-            if (
-                kernel_block_size is not None
-                and self.kv_cache_spec.block_size != kernel_block_size
-                and self.kv_cache_spec.block_size % kernel_block_size == 0
-            ):
-                factor = self.kv_cache_spec.block_size // kernel_block_size
-                indexer_block_table = (
-                    common_attn_metadata.block_table_tensor[:, ::factor] // factor
-                ).contiguous()
+            storage_tokens = _StorageBlockSizeSpec(self.kv_cache_spec).block_size
+            if kernel_block_size is not None and storage_tokens > kernel_block_size:
+                if storage_tokens % kernel_block_size:
+                    raise ValueError(
+                        "Indexer storage pages must contain whole kernel pages"
+                    )
+                factor = storage_tokens // kernel_block_size
+                assert self._storage_block_table_buffer is not None
+                assert indexer_block_table.shape[1] == self._kernel_block_table_width
+                assert num_reqs <= self._storage_block_table_buffer.shape[0]
+                indexer_block_table = self._storage_block_table_buffer[:num_reqs]
+                torch.div(
+                    common_attn_metadata.block_table_tensor[:num_reqs, ::factor],
+                    factor,
+                    rounding_mode="floor",
+                    out=indexer_block_table,
+                )
             padded_num_tokens = common_attn_metadata.slot_mapping.shape[0]
             get_compressed_slot_mapping(
                 common_attn_metadata.num_actual_tokens,
@@ -1252,7 +1421,9 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             )
 
         decode_metadata = None
-        if num_decodes > 0:
+        if num_decodes > 0 and not getattr(
+            self, "_fused_glm5next_decode_metadata", False
+        ):
             torch.diff(
                 common_attn_metadata.query_start_loc[: num_decodes + 1],
                 out=self.decode_lens_buffer[:num_decodes],
@@ -1294,26 +1465,22 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     self.kv_cache_spec.block_size,
                     self.num_sms,
                 )
-            decode_metadata = self.build_decode_metadata(
-                common_attn_metadata, num_decodes, decode_lens, num_decode_tokens
+            # Leave the runner's kernel-page metadata unchanged for MLA/tail
+            # consumers. Indexer decode reads the same table as its writer and
+            # prefill, with no second mapping or decode-only allocation.
+            indexer_common_metadata = replace(
+                common_attn_metadata, block_table_tensor=indexer_block_table
             )
-            if indexer_block_table is not common_attn_metadata.block_table_tensor:
-                rows, cols = indexer_block_table[:num_decodes].shape
-                if self.indexer_decode_block_table_buffer is None:
-                    self.indexer_decode_block_table_buffer = torch.zeros(
-                        (
-                            self.vllm_config.scheduler_config.max_num_batched_tokens,
-                            cols,
-                        ),
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                self.indexer_decode_block_table_buffer[:rows, :cols].copy_(
-                    indexer_block_table[:num_decodes]
-                )
-                decode_metadata.block_table = self.indexer_decode_block_table_buffer[
-                    :rows, :cols
-                ]
+            decode_metadata = self.build_decode_metadata(
+                indexer_common_metadata, num_decodes, decode_lens, num_decode_tokens
+            )
+        elif num_decodes > 0:
+            indexer_common_metadata = replace(
+                common_attn_metadata, block_table_tensor=indexer_block_table
+            )
+            decode_metadata = self._build_fused_decode_metadata(
+                indexer_common_metadata, num_decodes, num_decode_tokens
+            )
 
         attn_metadata = IluDeepseekV32IndexerMetadata(
             seq_lens=common_attn_metadata.seq_lens,
@@ -1324,7 +1491,7 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             query_start_loc=common_attn_metadata.query_start_loc,
             slot_mapping=slot_mapping,
             head_dim=128,
-            block_table=common_attn_metadata.block_table_tensor,
+            block_table=indexer_block_table,
             token_to_req_indices=common_attn_metadata.token_to_req_indices(
                 self.req_id_per_token_buffer
             ),

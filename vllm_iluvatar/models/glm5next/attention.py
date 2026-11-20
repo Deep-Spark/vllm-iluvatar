@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM5Next projections and complete Iluvatar Kpool indexing."""
 
-import os
-
 import ixformer.inference.functions as ixfops
 import torch
 import triton
 import triton.language as tl
 import vllm.envs as envs
+from ixformer.cuda import cuda_arch
 from ixformer.inference.functions.models.glm5next import (
     fwht128_quant_int8_with_weights,
 )
@@ -20,6 +19,7 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -46,7 +46,7 @@ from vllm_iluvatar.model_executor.layers.quantization.configs.fp8 import IluFp8C
 def resolve_glm5next_indexer_kv_dtype(
     quant_config: QuantizationConfig | None = None,
 ) -> str:
-    if "VLLM_ILU_INDEXER_KV_DTYPE" in os.environ:
+    if envs.is_set("VLLM_ILU_INDEXER_KV_DTYPE"):
         return envs.VLLM_ILU_INDEXER_KV_DTYPE
     if is_ivcore30() and isinstance(quant_config, IluFp8Config):
         return "fp8"
@@ -88,11 +88,28 @@ def _scale_to_bf16(weights: torch.Tensor, scale: float) -> torch.Tensor:
 
 
 def glm5next_uses_compact_pool_indices(vllm_config: VllmConfig, kpool: int) -> bool:
-    return (
+    if not (
         kpool == 4
         and vllm_config.cache_config.cache_dtype in ("auto", "bfloat16")
         and vllm_config.model_config.dtype == torch.bfloat16
-        and getattr(torch, "corex_arch", None) == "ivcore11"
+    ):
+        return False
+    arch = getattr(torch, "corex_arch", None)
+    if arch == "ivcore11":
+        return True
+    if arch != "ivcore30" or envs.VLLM_ILU_MLA_ATTN_QUANT_TYPE == "INT8":
+        return False
+    from ixformer.inference.ixattn_backend import ixattn_available
+
+    config = vllm_config.model_config.hf_text_config
+    tp_size = vllm_config.parallel_config.tensor_parallel_size
+    return (
+        ixattn_available()
+        and config.kv_lora_rank == 512
+        and config.qk_nope_head_dim == 256
+        and config.qk_rope_head_dim == 0
+        and config.num_attention_heads % tp_size == 0
+        and config.num_attention_heads // tp_size in (16, 32, 64)
     )
 
 
@@ -263,6 +280,7 @@ class IluIndexer(nn.Module):
             disable_tp=True,
             prefix=f"{prefix}.wk_weights_proj",
         )
+        self.register_buffer("_kw_gate_weight", None, persistent=False)
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
         self.softmax_scale = self.head_dim**-0.5
 
@@ -324,6 +342,54 @@ class IluIndexer(nn.Module):
         )
         self.indexer_op.compact_pool_indices = self.compact_pool_indices
 
+    def prepare_projection_weights(self) -> None:
+        previous = self._kw_gate_weight
+        self._kw_gate_weight = None
+        wk = self.wk_weights_proj
+        gate = self.index_kpool_compress_gate
+        if (
+            cuda_arch != "ivcore30"
+            or not wk.weight.is_cuda
+            or not isinstance(wk.quant_method, UnquantizedLinearMethod)
+            or wk.weight.dtype not in (torch.bfloat16, torch.float16)
+            or wk.weight.dtype != gate.dtype
+            or wk.weight.device != gate.device
+        ):
+            return
+        split = self.head_dim + self.n_head
+        shape = (split + self.head_dim, wk.weight.shape[1])
+        if (
+            previous is not None
+            and previous.shape == shape
+            and previous.dtype == wk.weight.dtype
+            and previous.device == wk.weight.device
+        ):
+            combined = previous
+            if wk.weight.data_ptr() != combined.data_ptr():
+                combined[:split].copy_(wk.weight.detach())
+            if gate.data_ptr() != combined[split:].data_ptr():
+                combined[split:].copy_(gate.detach())
+        else:
+            combined = torch.cat((wk.weight.detach(), gate.detach()))
+        # Keep checkpoint names and loader attributes on the original Parameters.
+        wk.weight.data = combined[:split]
+        gate.data = combined[split:]
+        self._kw_gate_weight = combined
+
+    def _project_k_weights_gate(self, hidden_states: torch.Tensor):
+        # Larger batches keep the separate GEMMs: the merged-N dispatch is not
+        # uniformly faster across prefill shapes.
+        if self._kw_gate_weight is not None and hidden_states.shape[0] <= 128:
+            output = ixfops.linear(hidden_states, self._kw_gate_weight)
+            split = self.head_dim + self.n_head
+            return (
+                output[:, : self.head_dim],
+                output[:, self.head_dim : split],
+                output[:, split:],
+            )
+        kw = ixfops.linear(hidden_states, self.wk_weights_proj.weight)
+        return kw[:, : self.head_dim], kw[:, self.head_dim :], None
+
     def _fused_indexer_k_norm(
         self,
         x: torch.Tensor,
@@ -348,12 +414,7 @@ class IluIndexer(nn.Module):
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
 
-        kw = ixfops.linear(
-            hidden_states,
-            self.wk_weights_proj.weight,
-        )
-        k = kw[:, : self.head_dim]
-        weights = kw[:, self.head_dim :]
+        k, weights, gate_score = self._project_k_weights_gate(hidden_states)
 
         k = self._fused_indexer_k_norm(
             k, self.k_norm.weight, self.k_norm.bias, self.head_dim, self.k_norm.eps
@@ -374,7 +435,8 @@ class IluIndexer(nn.Module):
         else:
             weights = _scale_to_bf16(weights, weight_scale)
 
-        gate_score = ixfops.linear(hidden_states, self.index_kpool_compress_gate)
+        if gate_score is None:
+            gate_score = ixfops.linear(hidden_states, self.index_kpool_compress_gate)
 
         return self.indexer_op(
             hidden_states,
@@ -386,6 +448,12 @@ class IluIndexer(nn.Module):
             index_kpool=self.index_kpool,
             positions=positions,
         )
+
+
+def prepare_indexer_projection_weights(model: nn.Module) -> None:
+    for module in model.modules():
+        if isinstance(module, IluIndexer):
+            module.prepare_projection_weights()
 
 
 class IluGlm5NextMLAAttention(nn.Module):
@@ -477,13 +545,17 @@ class IluGlm5NextMLAAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        if envs.VLLM_ILU_GLM5NEXT_MLA_PROJ_W8A8 and quant_config is None:
+        if envs.VLLM_ILU_GLM5NEXT_MLA_PROJ_W8A8 and (
+            quant_config is None or quant_config.get_name() == "ilu_f4f8"
+        ):
             projections = (
                 (self.fused_qkv_a_proj, self.q_b_proj, self.o_proj)
                 if self.q_lora_rank is not None
                 else (self.kv_a_proj_with_mqa, self.q_proj, self.o_proj)
             )
             for projection in projections:
+                if not isinstance(projection.quant_method, UnquantizedLinearMethod):
+                    continue
                 projection.quant_method = IluW8A8OnlineLinearMethod(
                     projection.quant_method
                 )

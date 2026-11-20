@@ -111,7 +111,7 @@ vLLM 进程启动
 - `opaque_attention_op()`、`use_custom_op_collectives()` 改为 `False`。
 - `get_device_communicator_cls()` 返回 `IluCommunicator` 的字符串路径。
 - `get_attn_backend_cls()`：先 `register_attention_backends()` 用官方 `register_backend` 覆盖 `FLASH_ATTN` / `FLASHMLA` / `FLASHMLA_SPARSE` / `FLASHMLA_SPARSE_DSV4` 成员的类路径，再按 `use_mla` / `use_sparse` 选官方成员并返回 `get_path()`（详见第 7 章）。
-- `check_and_update_config()`：为 OOT 注册的全新架构 `IluDeepseekV4ForCausalLM` 补 `tokenizer_mode="deepseek_v4"`（详见 §6.5）。
+- `check_and_update_config()`：为 OOT 注册的全新架构 `IluDeepseekV41ForCausalLM` 补 `tokenizer_mode="deepseek_v41"`（详见 §6.5）。
 
 平台类在模块首次 import 时由 `_make_iluvatar_platform()` 动态构建。构建过程中会先 stub 掉 Iluvatar 上可能不存在的 `vllm._C` / `vllm._C_stable_libtorch` 扩展，并撤销社区 `cuda.py` 模块级关闭 cudnn sdp 的副作用。社区平台文件本身保持不变。
 
@@ -404,48 +404,51 @@ vLLM 对模型**没有「按方法 patch」的官方扩展点**，唯一入口�
 - `install_qwen3_attention_fusion`：遍历各层，把 `self_attn.__class__` 交换为 `Qwen3Attention`（= `_Qwen3AttentionFusedMixin` + 上游 `Qwen3Attention`，提供融合 `forward`），并用社区 `q_norm` 的 head dim / eps 补建 `qk_norm`(`RMSNormQK`)。
 - `register_model()`：把架构 `"Qwen3ForCausalLM"` 指向 `vllm_iluvatar.model_executor.models.qwen3:Qwen3ForCausalLM`，由 `apply_oot_registrations` 调用。
 
-### 6.5 全新架构注册（不覆盖社区）+ tokenizer_mode：deepseek_v4 示例
+### 6.5 全新架构注册（不覆盖社区）+ tokenizer_mode：deepseek_v41 示例
 
-§6.4 的 qwen3 是**覆盖社区已有架构**（注册同名 `Qwen3ForCausalLM`，后注册者胜）。另一类场景是注册一个**社区不存在的全新架构**，对社区原生模型零副作用。`model_executor/models/deepseek_v4/`（镜像 `vllm/models/deepseek_v4/`）即此类：注册全新 arch `IluDeepseekV4ForCausalLM`，与社区原生 `DeepseekV4ForCausalLM` 并存、互不影响。
+§6.4 的 qwen3 是**覆盖社区已有架构**（注册同名 `Qwen3ForCausalLM`，后注册者胜）。另一类场景是注册一个**社区不存在的全新架构**，对社区原生模型零副作用。`models/deepseek_v41/` 两者兼有：既覆盖社区名 `DeepseekV41ForCausalLM`，也注册社区不存在的 `IluDeepseekV41ForCausalLM` / `IluDeepseekV41VLForCausalLM` 作为别名，后者用于经 `--hf-overrides` 强制走视觉路径。
 
-- **注册全新 arch**：`model.py` 的 `register_model()` 同时注册主模型与投机解码（MTP）两个全新架构，均为字符串类路径，由 `ModelRegistry` 懒解析：
+- **注册全新 arch**：一次循环把三个 arch 指向同一个实现，字符串类路径由 `ModelRegistry` 懒解析：
 
 ```python
 def register_model() -> None:
     from vllm import ModelRegistry
 
-    ModelRegistry.register_model(
-        "IluDeepseekV4ForCausalLM",
-        "vllm_iluvatar.model_executor.models.deepseek_v4.model:"
-        "IluDeepseekV4ForCausalLM",
-    )
-    ModelRegistry.register_model(
-        "IluDeepSeekV4MTPModel",
-        "vllm_iluvatar.model_executor.models.deepseek_v4.mtp:IluDeepSeekV4MTP",
-    )
+    for arch in (
+        "DeepseekV41ForCausalLM",
+        "IluDeepseekV41ForCausalLM",
+        "IluDeepseekV41VLForCausalLM",
+    ):
+        ModelRegistry.register_model(
+            arch,
+            "vllm_iluvatar.models.deepseek_v41.vl_model:IluDeepseekV41VLForCausalLM",
+        )
 ```
 
-- **多文件模型包：子包须显式登记**：`_iter_package_modules` 只扫顶层模块、**跳过子包**（见 §5.1）。故 deepseek_v4 这种「一个目录多文件（`model.py` / `mtp.py` / `attention.py`）」的模型包，必须把子包路径 `vllm_iluvatar.model_executor.models.deepseek_v4` **显式**加进 `_OOT_MODEL_PACKAGES`，否则其 `register_model()` 不会被调用。单文件模型（如 `qwen3.py`）则由 `model_executor.models` 顶层自动发现，无需额外登记。
-- **tokenizer_mode 补齐**：社区 `ModelConfig` 只为社区名 `DeepseekV4ForCausalLM` 自动选 `deepseek_v4` tokenizer；全新 arch 在社区还原后不再命中该映射，`tokenizer_mode` 停在 `"auto"`。由 `IluPlatform.check_and_update_config`（社区在 `config/vllm.py` 的 `VllmConfig.__post_init__` 调用，早于 tokenizer 构建）在 arch 命中时补齐：
+- **多文件模型包：子包须显式登记**：`_iter_package_modules` 只扫顶层模块、**跳过子包**（见 §5.1）。故 deepseek_v41 这种「一个目录多文件（`model.py` / `vl_model.py` / `dspark.py` / `attention.py`）」的模型包，必须把子包路径 `vllm_iluvatar.models.deepseek_v41` **显式**加进 `_OOT_MODEL_PACKAGES`，否则其 `register_model()` 不会被调用。单文件模型（如 `qwen3.py`）则由 `model_executor.models` 顶层自动发现，无需额外登记。
+- **钩子不限于 `model.py`**：`_register_models` 对包内每个顶层模块都找一次 `register_model()`，所以钩子放在哪个模块都行，一个包里有多个也行。deepseek_v41 就把主模型的钩子放在 `vl_model.py`、DSpark draft 的放在 `dspark.py`。
+- **tokenizer_mode 补齐**：社区 `ModelConfig` 只为社区名自动选对应 tokenizer；全新 arch 在社区还原后不再命中该映射，`tokenizer_mode` 停在 `"auto"`。由 `IluPlatform.check_and_update_config`（社区在 `config/vllm.py` 的 `VllmConfig.__post_init__` 调用，早于 tokenizer 构建）在 arch 命中时补齐：
 
 ```python
-@classmethod
-def check_and_update_config(cls, vllm_config) -> None:
-    super().check_and_update_config(vllm_config)
-    mc = getattr(vllm_config, "model_config", None)
-    if (
-        mc is not None
-        and "IluDeepseekV4ForCausalLM" in (mc.architectures or [])
-        and mc.tokenizer_mode == "auto"
-    ):
-        mc.tokenizer_mode = "deepseek_v4"
+_DSV41_ARCHS = (
+    "DeepseekV41ForCausalLM",
+    "IluDeepseekV41ForCausalLM",
+    "IluDeepseekV41VLForCausalLM",
+)
+
+if model_config.tokenizer_mode == "auto" and any(
+    a in archs for a in _DSV41_ARCHS
+):
+    model_config.tokenizer_mode = "deepseek_v41"
 ```
 
 - **时序安全**：`load_general_plugins()`（触发 `register_model`）在 `EngineArgs.__post_init__` 中执行，**早于** `ModelConfig` 解析架构；故加载时全新 arch 已在 `ModelRegistry` 中，架构解析不会失败。
 
+> 反例：`models/deepseek_v4/` 只注册社区名 `DeepseekV4ForCausalLM`（以及 `DeepSeekV4MTPModel` / `DSparkDraftModel`），属于 §6.4 的覆盖范式。正因为保留了社区 arch 名，checkpoint 的 `config.json` 不用改，`tokenizer_mode` 也由社区 `ModelConfig` 自动选成 `deepseek_v4`，这里无需补齐。
+
 ### 6.6 其他已接入模型与新增指南
 
-除 qwen3（§6.4，覆盖社区已有架构）和 deepseek_v4（§6.5，全新 arch）外，当前还接入了以下模型：`hy_v3`、`qwen2_5_vl`、`qwen3_moe`、`qwen3_vl_moe`、`glm_moe_dsa`。它们分别属于上述两类范式之一。
+除 qwen3（§6.4，覆盖社区已有架构）和 deepseek_v41（§6.5，全新 arch）外，当前还接入了以下模型：`deepseek_v4`、`deepseek_v32`、`hy_v3`、`hy_v4`、`qwen2_5_vl`、`qwen3_moe`、`qwen3_vl_moe`、`glm_moe_dsa`、`glm5next`、`minimax_m3`。它们分别属于上述两类范式之一。
 
 新增模型的具体步骤参见：
 
@@ -551,7 +554,7 @@ class IluQuantConfig(CompressedTensorsConfig):
     ...
 ```
 
-插件用 `IluQuantConfig` 替换官方同名配置类。W4A8 / W8A8 的选用基于 checkpoint 的 `quantization_config`（`quant_method` 为 `compressed-tensors`），与模型 arch 解耦：`IluDeepseekV4ForCausalLM`（§6.5）负责架构，`IluQuantConfig` 负责权重量化方案，两条注册路径相互独立。详细字段与分发见 [`docs/guides/6-how-to-use-and-provide-iluvatar-extend-compress-tensors.md`](../guides/6-how-to-use-and-provide-iluvatar-extend-compress-tensors.md)。
+插件用 `IluQuantConfig` 替换官方同名配置类。W4A8 / W8A8 的选用基于 checkpoint 的 `quantization_config`（`quant_method` 为 `compressed-tensors`），与模型 arch 解耦：`IluDeepseekV41ForCausalLM`（§6.5）负责架构，`IluQuantConfig` 负责权重量化方案，两条注册路径相互独立。详细字段与分发见 [`docs/guides/6-how-to-use-and-provide-iluvatar-extend-compress-tensors.md`](../guides/6-how-to-use-and-provide-iluvatar-extend-compress-tensors.md)。
 
 ---
 
@@ -722,7 +725,7 @@ IluPlatform.import_ir_kernels / get_default_ir_op_priority
    - `envs.py`（对应 `vllm/envs.py`）
    - `distributed/device_communicators/all2all.py`（对应上游同名文件）
    - general patch 的 override 实现文件同理用上游同名（如 `distributed/parallel_state.py`、`distributed/utils.py`、`v1/attention/backends/fa_utils.py`，见第 4 章）。
-   - OOT 注册的实现文件也镜像上游同名（如 `model_executor/layers/layernorm.py`、`model_executor/models/qwen3.py`、`model_executor/layers/quantization/compressed_tensors/compressed_tensors.py`、`model_executor/models/deepseek_v4/`，保留社区架构类名，见第 5、6、8 章）。
+   - OOT 注册的实现文件也镜像上游同名（如 `model_executor/layers/layernorm.py`、`model_executor/models/qwen3.py`、`model_executor/layers/quantization/compressed_tensors/compressed_tensors.py`、`models/deepseek_v4/`，保留社区架构类名，见第 5、6、8 章）。
    - **模块替身 shim `ilu_patch/import_shims/` 内部文件镜像被替身的上游模块同名**（如 `vllm_flash_attn.py` ↔ `vllm/vllm_flash_attn/`），便于对照；这是规则 4「`ilu_` 文件夹内部不缀」之外、为「整模块替身」保留上游名的特例（与 `csrc/` 镜像上游同理，见 §3.6）。
    - **原生扩展 `csrc/` 按 community / plugin 分目录**：`community/` 内的文件名与上游 `vllm/csrc` 对应（`layernorm.cpp`、`pos_encoding_kernels.cu`、`cuda_view.cu`）；`plugin/` 存放插件独有算子（`apply_rotary_emb.cu`）；注册入口 `torch_bindings.cpp` 与 `core/registration.h` 保持在根，唯一插件特有的 `ixformer_ops.h` 置于 `community/`（ixformer 未 ship `infer/` 头，需自带前置声明，见第 9 章）。
 2. **general patch 接线 -> 集中到 `ilu_patch/general_patches/`**：

@@ -7,7 +7,6 @@ import pytest
 import torch
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
-from vllm_iluvatar import envs
 from vllm_iluvatar.config import ilu_compute
 from vllm_iluvatar.ilu_util import arch
 from vllm_iluvatar.model_executor.layers.quantization.configs.deepseek.v41_fp8 import (
@@ -25,7 +24,10 @@ def test_grouped_wo_a_keeps_bf16(
     monkeypatch, tp_size, preference, architecture, enabled
 ):
     monkeypatch.setattr(arch, "cuda_arch", lambda: architecture)
-    monkeypatch.setattr(envs, "VLLM_ILU_DS41_GROUPED_INT8_O_PROJ", enabled)
+    # setenv, not setattr: vllm_iluvatar.envs resolves names through module
+    # __getattr__, so monkeypatch would plant a real attribute and restore it
+    # as one, permanently shadowing the reader for every later test.
+    monkeypatch.setenv("VLLM_ILU_DS41_GROUPED_INT8_O_PROJ", str(int(enabled)))
     monkeypatch.setattr(
         "vllm.distributed.get_tensor_model_parallel_world_size", lambda: tp_size
     )
@@ -65,7 +67,7 @@ def test_ivcore11_grouped_loader_reuses_existing_bmm(monkeypatch, preference):
     )
 
     monkeypatch.setattr(arch, "cuda_arch", lambda: "ivcore11")
-    monkeypatch.setattr(envs, "VLLM_ILU_DS41_GROUPED_INT8_O_PROJ", True)
+    monkeypatch.setenv("VLLM_ILU_DS41_GROUPED_INT8_O_PROJ", "1")
     monkeypatch.setattr(
         "vllm.distributed.get_tensor_model_parallel_world_size", lambda: 1
     )

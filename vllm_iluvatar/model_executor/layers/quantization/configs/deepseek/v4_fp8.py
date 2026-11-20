@@ -50,6 +50,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from vllm.model_executor.layers.fused_moe import RoutedExperts
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.models.deepseek_v4.quant_config import DeepseekV4FP8Config
@@ -78,6 +79,10 @@ class IluDeepseekV4FP8Config(DeepseekV4FP8Config):
     # (``quant_config.py:135-153``); calling super() first would already have
     # built a community ``Mxfp4MoEMethod``.
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        if isinstance(layer, LinearBase):
+            method = self._int8_linear_method(layer, prefix)
+            if method is not None:
+                return method
         if isinstance(layer, RoutedExperts) and self.expert_dtype == "fp4":
             skipped = is_layer_skipped(
                 prefix=prefix,
@@ -106,3 +111,49 @@ class IluDeepseekV4FP8Config(DeepseekV4FP8Config):
 
                 return select_mxfp4_method(layer, original, runtime)
         return super().get_quant_method(layer, prefix)
+
+    def _int8_linear_method(self, layer: torch.nn.Module, prefix: str):
+        """ivcore11 W8A8 INT8 dense execution from the block-FP8 source, or ``None``.
+
+        Only ivcore11 is claimed. Every other architecture gets ``None`` and
+        stays on ``super()`` -- community ``Fp8LinearMethod`` plus the
+        ``IluFp8BlockScaledMMKernel`` prepended by
+        ``patch_fp8_block_scaled_kernel``, which is the ivcore30 FP8 execution
+        path. ``fp8_linear_backend()`` is still consulted so an explicit
+        ``ilu_compute.linear.fp8_backend`` is validated rather than silently
+        ignored; on ivcore11 it can only resolve to ``w8a8_int8``.
+
+        There is no ``ilu_quant`` overlay here: that entry point is ivcore30
+        only (``require_ivcore30``), so on ivcore11 the checkpoint dispatch is
+        the whole story.
+
+        V4 and V4.1 share the source format (block-FP8 weight + UE8M0
+        ``weight_scale_inv``) and therefore the loaders, only the block shape
+        differs: ``[128, 128]`` here against ``[32, 32]`` on V4.1.
+        """
+        from vllm_iluvatar.config.ilu_compute import fp8_linear_backend
+        from vllm_iluvatar.ilu_util.arch import cuda_arch
+
+        if cuda_arch() != "ivcore11" or fp8_linear_backend() != "w8a8_int8":
+            return None
+        if is_layer_skipped(
+            prefix=prefix,
+            ignored_layers=self.ignored_layers,
+            fused_mapping=self.packed_modules_mapping,
+        ):
+            return UnquantizedLinearMethod()
+        if prefix.endswith(".wo_a"):
+            # wo_a is block-diagonal over o_groups and attention contracts it
+            # per group, never as a flat linear, so it needs the grouped
+            # loader regardless of TP. (The class name says V4.1; the method
+            # is the shared block-FP8 source adapter for both.)
+            from vllm_iluvatar.model_executor.layers.quantization.backends.grouped_bmm.deepseek_v4_wo_a import (  # noqa: E501
+                IluDeepseekV41Fp8GroupedInt8Method,
+            )
+
+            return IluDeepseekV41Fp8GroupedInt8Method(self)
+        from vllm_iluvatar.model_executor.layers.quantization.backends.fp8.linear import (  # noqa: E501
+            IluFp8LinearMethod,
+        )
+
+        return IluFp8LinearMethod(self)

@@ -4,19 +4,20 @@
 Corresponds to: vllm/config/speculative.py ::
 ``SpeculativeConfig.hf_config_override`` / ``SpeculativeConfig.__post_init__``
 
-On Iluvatar the W4A8 forks of the speculative draft models ship dedicated,
-self-contained draft archs (``IluGlmMoeDsaMTPModel`` / ``IluDeepSeekV4MTPModel`` /
-``DeepseekV32MTPModel`` / ``IluDSparkDraftModel``). Two wrappers re-point the
-draft architecture at them, each hooking the community function that actually
-assigns the arch, so the community path stays untouched for non-ilu models:
+Some ilu models ship dedicated, self-contained MTP draft archs
+(``IluGlmMoeDsaMTPModel`` / ``DeepseekV32MTPModel`` / ``HYV4MTPModel``).
+``make_hf_config_override`` re-points the draft architecture at them: the
+community/public method maps ``glm_moe_dsa`` -> ``DeepSeekMTPModel`` and
+``deepseek_v4`` -> ``DeepSeekV4MTPModel``, and the wrapper remaps that result
+keyed on the target model's original architecture, so the community path stays
+untouched for non-ilu models.
 
-- MTP (``make_hf_config_override``): the community/public method maps
-  ``glm_moe_dsa`` -> ``DeepSeekMTPModel`` and ``deepseek_v4`` ->
-  ``DeepSeekV4MTPModel``; the wrapper remaps the result keyed on the target
-  model's original architecture.
-- DSpark (``make_post_init``): community assigns ``DSparkDraftModel`` in
-  ``__post_init__``, after ``ModelConfig`` construction and therefore after
-  ``hf_config_override`` has run, so that remap has to happen there instead.
+``make_post_init`` hooks the later of the two community entry points -- it runs
+after ``ModelConfig`` construction, i.e. after ``hf_config_override`` -- for the
+things that can only be decided there: the step5 MTP quantization reset, the
+MiniMax DSpark config normalization, and the DSpark draft-arch log line. DSpark
+needs no arch remap: every ilu DSpark draft is registered under the community
+``DSparkDraftModel`` name by its own model module.
 
 ``create_draft_parallel_config`` keeps the draft on a single PP stage: ilu MTP
 drafts are one layer and do not implement ``SupportsPP``. Community
@@ -51,34 +52,18 @@ _ILU_MTP_ARCH_MAP = {
     "DeepseekV32ForCausalLM": "DeepseekV32MTPModel",
     "IluGlmMoeDsaForCausalLM": "IluGlmMoeDsaMTPModel",
     "GlmMoeDsaForCausalLM": "IluGlmMoeDsaFp8MTPModel",
-    "IluDeepseekV4ForCausalLM": "IluDeepSeekV4MTPModel",
     "HYV4ForCausalLM": "HYV4MTPModel",
     "HYV4VLForConditionalGeneration": "HYV4MTPModel",
 }
 
-# Community draft arch -> ilu draft arch, keyed by the architecture community
-# assigns in SpeculativeConfig.__post_init__. DSpark reuses the DeepSeek-V4
-# stack but is a separate draft arch from MTP, so it must never be routed
-# through _ILU_MTP_ARCH_MAP.
-_ILU_DSPARK_ARCH_MAP = {
-    "DSparkDraftModel": "IluDSparkDraftModel",
-}
-
-# Target architectures whose DSpark draft should be remapped to the W4A8 ilu
-# implementation (``IluDSparkDraftModel``). The FP8 target
-# (``DeepseekV4ForCausalLM``) is intentionally excluded: it keeps the community
-# ``DSparkDraftModel`` arch, which ``fp8_model.register_model`` re-points at the
-# FP8 draft (``IluDSparkDeepseekV4Fp8ForCausalLM``) -- mirroring how the FP8 MTP
-# reuses the community ``DeepSeekV4MTPModel`` name instead of ``_ILU_MTP_ARCH_MAP``.
-_ILU_DSPARK_TARGET_ARCHS = ("IluDeepseekV4ForCausalLM",)
-
 
 def make_post_init(orig: Callable[..., None]) -> Callable[..., None]:
-    """Re-point the DSpark draft architecture at the ilu implementation.
+    """Apply the ilu fixups that need the draft ``ModelConfig``.
 
-    Community assigns ``["DSparkDraftModel"]`` inside ``__post_init__``, after
-    ``ModelConfig`` construction and therefore after ``hf_config_override`` has
-    already run, so the remap has to happen here to survive.
+    Community builds it inside ``__post_init__``, after ``hf_config_override``
+    has already run, so none of this can happen there: the step5 MTP
+    quantization reset, the MiniMax DSpark config normalization, and reporting
+    the architecture the DSpark draft actually resolved to.
     """
 
     @functools.wraps(orig)
@@ -106,18 +91,6 @@ def make_post_init(orig: Callable[..., None]) -> Callable[..., None]:
                 "MiniMax DSpark draft: five dense layers, target auxiliary states, shared vocabulary"
             )
             return
-        target_archs = (
-            []
-            if self.target_model_config is None
-            else list(self.target_model_config.architectures)
-        )
-        if any(arch in _ILU_DSPARK_TARGET_ARCHS for arch in target_archs):
-            hf_config = self.draft_model_config.hf_config
-            current = list(getattr(hf_config, "architectures", None) or [])
-            remapped = [_ILU_DSPARK_ARCH_MAP.get(arch, arch) for arch in current]
-            if remapped != current:
-                hf_config.architectures = remapped
-                self.update_arch_()
 
         # The draft ModelConfig logs "Resolved architecture" while the MTP
         # remap is still in effect, so that line names the wrong arch for

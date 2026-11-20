@@ -55,7 +55,7 @@ from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
     _DECODE_EP_BACKEND,
     IluFusedMoEEP,
 )
-from vllm_iluvatar.models.deepseek_v4.fp8_model import (
+from vllm_iluvatar.models.deepseek_v4.model import (
     IluDeepseekV4Fp8ForCausalLM,
     IluDeepseekV4Fp8MLP,
     IluDeepseekV4Fp8Model,

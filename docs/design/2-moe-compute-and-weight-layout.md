@@ -320,7 +320,7 @@ export VLLM_ILU_DISABLE_DEEPEP=1
 
 ### 7.2 通信接线
 
-- `vllm_iluvatar/models/deepseek_v4/fp8_model.py`：模型侧选择 runner 或 Hybrid EP 入口。
+- `vllm_iluvatar/models/deepseek_v4/model.py`：模型侧选择 runner 或 Hybrid EP 入口。
 - `vllm_iluvatar/model_executor/layers/fused_moe/ilu_fused_moe_ep.py`：AG/RS、LL decode kernel 组装、通信与计算串接、输出缩放。
 - 同目录 `prepare_finalize/ilu_deepep_ll.py`：LL 的 dispatch/combine、激活格式与有效 token 元数据。
 - 同目录 `runner/ilu_moe_runner.py`：普通 runner 的 dispatch/combine。

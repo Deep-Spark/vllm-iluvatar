@@ -48,7 +48,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
-from vllm_iluvatar.models.deepseek_v4.fp8_model import _make_fp8_weights_mapper
+from vllm_iluvatar.models.deepseek_v4.model import _make_fp8_weights_mapper
 from vllm_iluvatar.models.deepseek_v41.model import IluDeepseekV41ForCausalLM
 
 logger = init_logger(f"vllm.{__name__}")

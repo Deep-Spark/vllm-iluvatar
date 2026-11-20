@@ -11,9 +11,10 @@ Covers the runtime path introduced on top of the torch-equivalent stage:
   place on ``weight.data``, and only the scale parameter is replaced. The requant
   numerics (incl. the e8m0 decode) live in the ixformer op's own test suite;
 * a non-conforming ``K % 64 != 0`` raises at load time;
-* ``apply_block_scaled_mm`` drives the ixformer per-token dynamic quant +
-  ``fp8_per_channel_mm`` path (mocked, so it is device-independent and asserts the
-  per-channel call contract);
+* ``apply_block_scaled_mm`` drives either the fused ``nt_v2`` quant +
+  ``fp8_per_channel_gemv(TN_V2)`` decode path (unquantized + shape gate) or the
+  plain per-token quant + ``fp8_per_channel_mm`` path (prequant / gate miss);
+  both are mocked so the tests stay device-independent and assert call contracts;
 * the on-device ``is_supported`` gate (arch forced to ivcore30).
 
 The pure-torch block reference ``_apply_block_scaled_mm_torch`` (no longer on the
@@ -252,7 +253,15 @@ def test_process_weights_after_loading_k_not_multiple_of_64_raises(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def _boom(name: str):
+    def _fn(*args, **kwargs):
+        raise AssertionError(f"{name} must not be called on this path")
+
+    return _fn
+
+
 def test_apply_block_scaled_mm_per_channel_path(monkeypatch):
+    """Gate miss (N % 16 != 0): plain quant + mm, not TN_V2 gemv."""
     import ixformer.inference.functions as ixfops
 
     captured: dict = {}
@@ -271,8 +280,12 @@ def test_apply_block_scaled_mm_per_channel_path(monkeypatch):
 
     monkeypatch.setattr(ixfops, "fp8_per_token_dynamic_scaled", fake_quant)
     monkeypatch.setattr(ixfops, "fp8_per_channel_mm", fake_mm)
+    monkeypatch.setattr(
+        ixfops, "fp8_per_token_dynamic_scaled_nt_v2", _boom("nt_v2 quant")
+    )
+    monkeypatch.setattr(ixfops, "fp8_per_channel_gemv", _boom("gemv"))
 
-    M, N, K = 4, 8, 128
+    M, N, K = 4, 8, 128  # N % 16 != 0 → mm fallback
     kernel = _make_kernel(128, 128, torch.bfloat16)
     A = torch.randn(M, K, dtype=torch.bfloat16)
     B = torch.zeros(N, K, dtype=torch.float8_e4m3fn)
@@ -292,6 +305,158 @@ def test_apply_block_scaled_mm_per_channel_path(monkeypatch):
     assert mm_bs is Bs
     assert mm_as.shape == (M,)
     assert mm_a.dtype == torch.float8_e4m3fn
+
+
+def test_apply_block_scaled_mm_gemv_nt_v2_unquantized(monkeypatch):
+    """No prequant + gemv gate: fused nt_v2 quant + TN_V2 gemv."""
+    import ixformer.inference.functions as ixfops
+
+    captured: dict = {}
+
+    def fake_nt_v2(x, *, backend=None):
+        captured["nt_v2_in"] = x
+        m, k = x.shape
+        m_pad = ((m + 3) // 4) * 4
+        a_fp8 = torch.zeros(m_pad, k, dtype=torch.float8_e4m3fn, device=x.device)
+        a_scale = torch.ones(m_pad, dtype=torch.float32, device=x.device)
+        return a_fp8, a_scale, m
+
+    def fake_gemv(A, B, As, Bs, output=None, *args, **kwargs):
+        captured["gemv"] = {
+            "A": A,
+            "B": B,
+            "As": As,
+            "Bs": Bs,
+            "format": kwargs.get("format"),
+            "backend": kwargs.get("backend"),
+            "output": output,
+        }
+        m, n = A.shape[0], B.shape[0]
+        vals = torch.full((m, n), 3.0, dtype=torch.bfloat16, device=A.device)
+        if output is not None:
+            output.copy_(vals)
+            return output
+        return vals
+
+    monkeypatch.setattr(ixfops, "fp8_per_token_dynamic_scaled_nt_v2", fake_nt_v2)
+    monkeypatch.setattr(ixfops, "fp8_per_channel_gemv", fake_gemv)
+    monkeypatch.setattr(
+        ixfops, "fp8_per_token_dynamic_scaled", _boom("plain quant")
+    )
+    monkeypatch.setattr(ixfops, "fp8_per_channel_mm", _boom("mm"))
+    if hasattr(ixfops, "pack_act_fp8_gemv_nt_v2"):
+        monkeypatch.setattr(
+            ixfops, "pack_act_fp8_gemv_nt_v2", _boom("pack_act")
+        )
+
+    M, N, K = 1, 64, 128  # decode shape; contiguous B → stride0 % 64 == 0
+    kernel = _make_kernel(128, 128, torch.bfloat16)
+    A = torch.randn(M, K, dtype=torch.bfloat16)
+    B = torch.zeros(N, K, dtype=torch.float8_e4m3fn)
+    As = A.new_empty(1)
+    Bs = torch.ones(N, dtype=torch.float32)
+
+    out = kernel.apply_block_scaled_mm(A, B, As, Bs)
+
+    assert out.shape == (M, N)
+    assert out.dtype == torch.bfloat16
+    assert captured["nt_v2_in"] is A
+    gemv = captured["gemv"]
+    assert gemv["B"] is B
+    assert gemv["Bs"] is Bs
+    assert gemv["format"] == "TN_V2"
+    assert gemv["backend"] == "ixmm"
+    assert gemv["A"].shape[0] == 4  # m_pad = ceil(1/4)*4
+    assert gemv["As"].shape == (4,)
+    assert gemv["output"] is not None
+
+
+def test_apply_block_scaled_mm_prequant_uses_mm(monkeypatch):
+    """Prefetched plain FP8 always stays on mm; no pack / gemv / nt_v2."""
+    import ixformer.inference.functions as ixfops
+
+    captured: dict = {}
+
+    def fake_mm(A, B, As, Bs, *args, **kwargs):
+        captured["mm_args"] = (A, B, As, Bs)
+        m, n = A.shape[0], B.shape[0]
+        return torch.full((m, n), 2.0, dtype=torch.bfloat16, device=A.device)
+
+    monkeypatch.setattr(ixfops, "fp8_per_channel_mm", fake_mm)
+    monkeypatch.setattr(
+        ixfops, "fp8_per_token_dynamic_scaled", _boom("plain quant")
+    )
+    monkeypatch.setattr(
+        ixfops, "fp8_per_token_dynamic_scaled_nt_v2", _boom("nt_v2 quant")
+    )
+    monkeypatch.setattr(ixfops, "fp8_per_channel_gemv", _boom("gemv"))
+    if hasattr(ixfops, "pack_act_fp8_gemv_nt_v2"):
+        monkeypatch.setattr(
+            ixfops, "pack_act_fp8_gemv_nt_v2", _boom("pack_act")
+        )
+
+    M, N, K = 1, 64, 128  # would pass gemv gate if unquantized
+    kernel = _make_kernel(128, 128, torch.bfloat16)
+    A = torch.randn(M, K, dtype=torch.bfloat16)
+    a_fp8 = torch.zeros(M, K, dtype=torch.float8_e4m3fn)
+    a_scale = torch.ones(M, dtype=torch.float32)
+    B = torch.zeros(N, K, dtype=torch.float8_e4m3fn)
+    As = A.new_empty(1)
+    Bs = torch.ones(N, dtype=torch.float32)
+
+    mod.clear_activation_prequant()
+    try:
+        mod.register_activation_prequant(A, a_fp8, a_scale)
+        out = kernel.apply_block_scaled_mm(A, B, As, Bs)
+    finally:
+        mod.clear_activation_prequant()
+
+    assert out.shape == (M, N)
+    mm_a, mm_b, mm_as, mm_bs = captured["mm_args"]
+    assert mm_a is a_fp8
+    assert mm_as is a_scale
+    assert mm_b is B
+    assert mm_bs is Bs
+
+
+def test_apply_block_scaled_mm_falls_back_when_m_too_large(monkeypatch):
+    """Unquantized but M > 16: plain quant + mm."""
+    import ixformer.inference.functions as ixfops
+
+    captured: dict = {}
+
+    def fake_quant(x, fp8_output=None, output_scales=None, backend=None):
+        captured["quant_in"] = x
+        m, k = x.shape
+        a_fp8 = torch.zeros(m, k, dtype=torch.float8_e4m3fn, device=x.device)
+        a_scale = torch.ones(m, dtype=torch.float32, device=x.device)
+        return a_fp8, a_scale
+
+    def fake_mm(A, B, As, Bs, *args, **kwargs):
+        captured["mm_args"] = (A, B, As, Bs)
+        return torch.zeros(
+            A.shape[0], B.shape[0], dtype=torch.bfloat16, device=A.device
+        )
+
+    monkeypatch.setattr(ixfops, "fp8_per_token_dynamic_scaled", fake_quant)
+    monkeypatch.setattr(ixfops, "fp8_per_channel_mm", fake_mm)
+    monkeypatch.setattr(
+        ixfops, "fp8_per_token_dynamic_scaled_nt_v2", _boom("nt_v2 quant")
+    )
+    monkeypatch.setattr(ixfops, "fp8_per_channel_gemv", _boom("gemv"))
+
+    M, N, K = 32, 64, 128  # M > 16
+    kernel = _make_kernel(128, 128, torch.bfloat16)
+    A = torch.randn(M, K, dtype=torch.bfloat16)
+    B = torch.zeros(N, K, dtype=torch.float8_e4m3fn)
+    As = A.new_empty(1)
+    Bs = torch.ones(N, dtype=torch.float32)
+
+    out = kernel.apply_block_scaled_mm(A, B, As, Bs)
+
+    assert out.shape == (M, N)
+    assert captured["quant_in"] is A
+    assert captured["mm_args"][1] is B
 
 
 # ---------------------------------------------------------------------------

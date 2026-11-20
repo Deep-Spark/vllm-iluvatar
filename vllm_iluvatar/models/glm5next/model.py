@@ -18,7 +18,7 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
-from vllm.model_executor.layers.fused_moe import FusedMoEFactory, GateLinear
+from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateDtypeCalculator
@@ -61,8 +61,18 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 
 from vllm_iluvatar.ilu_util.arch import is_ivcore30
+from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (
+    clear_activation_prequant,
+    register_activation_prequant,
+)
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
     IluFusedMoEEP,
+)
+from vllm_iluvatar.model_executor.layers.fused_moe.router.ilu_gate_linear import (
+    IluGateLinear as IluRouterGateLinear,
+)
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp8.linear import (
+    IluFp8LinearMethod,
 )
 from vllm_iluvatar.model_executor.layers.quantization.configs.fp8 import IluFp8Config
 
@@ -99,6 +109,12 @@ def _target_sequence_parallel(vllm_config: VllmConfig, *, is_mtp_layer=False):
         and not parallel.enable_elastic_ep
         and envs.VLLM_ILU_DECODE_EP_BACKEND != "deepep_low_latency"
     )
+
+
+def _linear_consumes_fp8_prequant(linear: nn.Module | None) -> bool:
+    """Whether ``linear`` reads ``register_activation_prequant`` in forward."""
+    qm = getattr(linear, "quant_method", None)
+    return isinstance(qm, IluFp8LinearMethod) and qm.int8_scheme is None
 
 
 class IluGlm5NextMLP(Glm5NextMLP):
@@ -141,7 +157,7 @@ class IluGlm5NextMLP(Glm5NextMLP):
         return x
 
 
-class IluGateLinear(GateLinear):
+class IluGateLinear(IluRouterGateLinear):
     # GLM-5.3's MoE router is a replicated, row-wise linear. Gathering the
     # hidden states across the DP/EP group before gating is mathematically
     # identical to gating then gathering (row i's logits depend only on row i),
@@ -155,8 +171,9 @@ class IluGateLinear(GateLinear):
     gather_before_gate_max_tokens = 32
 
     def forward(self, x):
-        output = ixfops.linear(x, self.weight)
-        return self._return(output)
+        if is_ivcore30():
+            return super().forward(x)
+        return self._return(ixfops.linear(x, self.weight))
 
 
 class IluGlm5NextMoE(Glm5NextMoE, IluFusedMoEEP):
@@ -197,8 +214,9 @@ class IluGlm5NextMoE(Glm5NextMoE, IluFusedMoEEP):
             prefix=f"{prefix}.gate",
         )
         if config.topk_method == "noaux_tc":
+            bias_dtype = torch.float32 if is_ivcore30() else torch.bfloat16
             self.gate.e_score_correction_bias = nn.Parameter(
-                torch.empty(config.n_routed_experts, dtype=torch.bfloat16)
+                torch.empty(config.n_routed_experts, dtype=bias_dtype)
             )
         else:
             self.gate.e_score_correction_bias = None
@@ -368,9 +386,12 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
                     self.is_sequence_parallel
                     or (
                         is_mtp_layer
-                        and parallel_config.use_sequence_parallel_moe
+                        and _target_sequence_parallel(vllm_config, is_mtp_layer=False)
                         and quant_config is not None
-                        and quant_config.get_name() == "ilu_f4f8"
+                        and (
+                            quant_config.get_name() == "ilu_f4f8"
+                            or (is_ivcore30() and isinstance(quant_config, IluFp8Config))
+                        )
                     )
                 ),
                 quant_config=quant_config,
@@ -388,6 +409,23 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self._mlp_is_moe = isinstance(self.mlp, Glm5NextMoE)
+        if self.layer_kind == "mla":
+            attn_consumers = (
+                (self.self_attn.fused_qkv_a_proj,)
+                if self.self_attn.q_lora_rank is not None
+                else (self.self_attn.kv_a_proj_with_mqa, self.self_attn.q_proj)
+            )
+        else:
+            attn_consumers = (self.self_attn.in_proj_qkvbfg_a,)
+        ffn_consumer = (
+            self.mlp.shared_experts.gate_up_proj
+            if self._mlp_is_moe and self.mlp.shared_experts is not None
+            else (None if self._mlp_is_moe else self.mlp.gate_up_proj)
+        )
+        self._attn_wants_fp8_pre = any(
+            _linear_consumes_fp8_prequant(m) for m in attn_consumers
+        )
+        self._ffn_wants_fp8_pre = _linear_consumes_fp8_prequant(ffn_consumer)
         tp_size = get_tensor_model_parallel_world_size()
         self._fuse_attn_allreduce_post = (
             self.mhc
@@ -488,11 +526,13 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
             return hidden_states, residual, None, None
 
         x = hidden_states
+        attn_fp8: torch.Tensor | None = None
+        attn_scale: torch.Tensor | None = None
         if post is None:
             if self.layer_idx == 0:
                 x = hc_expand(x, self.n)
             residual = x
-            post, comb, x = self.hc_pre(
+            post, comb, x, attn_fp8, attn_scale = self.hc_pre(
                 x,
                 self._get_hc_fn_io("attn", self.hc_attn_fn, residual.dtype),
                 self.hc_attn_scale,
@@ -501,7 +541,7 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
                 norm_eps=self.input_layernorm.variance_epsilon,
             )
         else:
-            residual, post, comb, x = self.hc_fused_post_pre(
+            residual, post, comb, x, attn_fp8, attn_scale = self.hc_fused_post_pre(
                 x,
                 residual,
                 post,
@@ -511,20 +551,24 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
                 self.hc_attn_base,
                 norm_weight=self.input_layernorm.weight.data,
                 norm_eps=self.input_layernorm.variance_epsilon,
+                want_fp8=(not self.is_sequence_parallel) and self._attn_wants_fp8_pre,
             )
 
         if self.is_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
 
-        x = self.self_attn(
-            hidden_states=x,
-            positions=positions,
-        )
+        if attn_fp8 is not None and attn_scale is not None:
+            register_activation_prequant(x, attn_fp8, attn_scale)
+        try:
+            x = self.self_attn(hidden_states=x, positions=positions)
+        finally:
+            if attn_fp8 is not None:
+                clear_activation_prequant()
 
         if self.is_sequence_parallel:
             x = sp_reduce_scatter(x)
 
-        residual, post, comb, x = self.hc_fused_post_pre(
+        residual, post, comb, x, ffn_fp8, ffn_scale = self.hc_fused_post_pre(
             x,
             residual,
             post,
@@ -535,12 +579,20 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
             norm_weight=self.post_attention_layernorm.weight.data,
             norm_eps=self.post_attention_layernorm.variance_epsilon,
             reduce_x=self._fuse_attn_allreduce_post,
+            want_fp8=(not self.is_sequence_parallel) and self._ffn_wants_fp8_pre,
         )
 
-        if self._mlp_is_moe:
-            x = self.mlp(x, already_sequence_parallel=self.is_sequence_parallel)
-        else:
-            x = self.mlp(x)
+        if ffn_fp8 is not None and ffn_scale is not None:
+            register_activation_prequant(x, ffn_fp8, ffn_scale)
+        try:
+            x = (
+                self.mlp(x, already_sequence_parallel=self.is_sequence_parallel)
+                if self._mlp_is_moe
+                else self.mlp(x)
+            )
+        finally:
+            if ffn_fp8 is not None:
+                clear_activation_prequant()
 
         if self.layer_idx == self.num_hidden_layers - 1:
             x = self.hc_post(x, residual, post, comb)
@@ -593,6 +645,7 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
         norm_eps: float = 0.0,
         *,
         reduce_x: bool = False,
+        want_fp8: bool = False,
     ):
         return mhc.mhc_fused_post_pre(
             x,
@@ -610,6 +663,7 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
             norm_eps=norm_eps,
             reduce_x=reduce_x,
             tp_group=get_tp_group().device_group if reduce_x else None,
+            want_fp8=want_fp8,
         )
 
 

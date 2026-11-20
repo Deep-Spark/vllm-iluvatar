@@ -7,8 +7,8 @@ import ixformer.inference.functions as ixfops
 import torch
 from ixformer.inference.functions.models import deepseek_v41 as ixf_mhc
 
-from vllm_iluvatar.ilu_util.arch import is_ivcore30
 from vllm_iluvatar import envs
+from vllm_iluvatar.ilu_util.arch import is_ivcore30
 
 
 def _decode_splitk(residual: torch.Tensor) -> bool:
@@ -37,10 +37,25 @@ def _get_pre_v2_workspace(device: torch.device) -> torch.Tensor:
 def allreduce_mhc_post_supported(config, tp_size: int) -> bool:
     """Whether ``allreduce_mhc_post_with_sqrsum`` can fuse attention TP AllReduce + MHC post."""
     return (
-        not is_ivcore30()
-        and tp_size in (2, 4, 8)
+        tp_size in (2, 4, 8)
         and getattr(config, "hidden_size", None) in (4096, 5120, 7168)
         and getattr(config, "mhc_num_residual_streams", None) == 4
+    )
+
+
+def _can_use_mhc_pre_fp8(
+    want_fp8: bool,
+    norm_weight: torch.Tensor | None,
+    sqrsum: torch.Tensor | None,
+    num_tokens: int,
+) -> bool:
+    return (
+        want_fp8
+        and norm_weight is not None
+        and sqrsum is not None
+        and num_tokens > 16
+        and sqrsum.dim() == 1
+        and is_ivcore30()
     )
 
 
@@ -56,18 +71,39 @@ def mhc_pre(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     sqrsum: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute ``(post_mix, comb_mix, layer_input)`` for GLM5Next MHC pre.
+    want_fp8: bool = False,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
+    """Return ``(post, comb, layer_input, fp8_h, h_scale)``.
 
-    When ``sqrsum`` is provided from :func:`mhc_post_with_sqrsum` or
-    :func:`allreduce_mhc_post_with_sqrsum`, uses ``mhc_pre_with_sqrsum`` to
-    eliminate the token-wide RMS reduction pass and fold ``norm_weight`` in a
-    single streaming epilogue (with ``ixmm`` GEMM for prefill and fused split-K
-    for decode). When ``sqrsum`` is ``None`` (Layer 0's first attention pre or
-    cross-PP stage entry), uses ``ds4_mhc_pre_v2`` with a preallocated workspace.
+    A handed-off ``sqrsum`` skips the token RMS reduction. ``want_fp8`` folds
+    per-token FP8 quant into that epilogue when the kernel constraints hold.
     """
     residual = residual.contiguous()
     if sqrsum is not None and not _decode_splitk(residual):
+        if _can_use_mhc_pre_fp8(want_fp8, norm_weight, sqrsum, residual.shape[0]):
+            post, comb, layer_input, _, fp8_h, h_scale = ixf_mhc.mhc_pre_with_sqrsum_fp8(
+                residual,
+                fn,
+                scale,
+                base,
+                sqrsum,
+                rms_eps,
+                hc_eps,
+                hc_eps,
+                post_mult,
+                sinkhorn_repeat,
+                None,
+                norm_weight,
+                norm_eps,
+            )
+            return post, comb, layer_input, fp8_h, h_scale
+
         post, comb, layer_input, _ = ixf_mhc.mhc_pre_with_sqrsum(
             residual,
             fn,
@@ -84,7 +120,7 @@ def mhc_pre(
             norm_eps,
             fuse_reductions=True,
         )
-        return post, comb, layer_input
+        return post, comb, layer_input, None, None
 
     fuse_norm = norm_weight is not None and ixfops.enable_hc_pre_norm_fusion(
         *residual.shape, dtype=residual.dtype
@@ -106,7 +142,7 @@ def mhc_pre(
     )
     if norm_weight is not None and not fuse_norm:
         layer_input = ixfops.rms_norm(layer_input, norm_weight, norm_eps)
-    return post, comb, layer_input
+    return post, comb, layer_input, None, None
 
 
 def mhc_post(
@@ -174,11 +210,23 @@ def mhc_fused_post_pre(
     *,
     reduce_x: bool = False,
     tp_group=None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    want_fp8: bool = False,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
     """Fused MHC post + next sub-block MHC pre (via explicit sqrsum handoff)."""
-    if not reduce_x and (is_ivcore30() or _decode_splitk(residual)):
+    if (
+        not reduce_x
+        and not want_fp8
+        and ((is_ivcore30() and residual.shape[0] <= 16) or _decode_splitk(residual))
+    ):
         residual = mhc_post(x, residual, post, comb)
-        new_post, new_comb, layer_input = mhc_pre(
+        new_post, new_comb, layer_input, fp8_h, h_scale = mhc_pre(
             residual,
             fn,
             scale,
@@ -190,7 +238,7 @@ def mhc_fused_post_pre(
             norm_weight=norm_weight,
             norm_eps=norm_eps,
         )
-        return residual, new_post, new_comb, layer_input
+        return residual, new_post, new_comb, layer_input, fp8_h, h_scale
     if reduce_x:
         residual, sqrsum = allreduce_mhc_post_with_sqrsum(
             x, residual, post, comb, group=tp_group
@@ -198,7 +246,7 @@ def mhc_fused_post_pre(
     else:
         residual, sqrsum = mhc_post_with_sqrsum(x, residual, post, comb)
 
-    new_post, new_comb, layer_input = mhc_pre(
+    new_post, new_comb, layer_input, fp8_h, h_scale = mhc_pre(
         residual,
         fn,
         scale,
@@ -210,5 +258,6 @@ def mhc_fused_post_pre(
         norm_weight=norm_weight,
         norm_eps=norm_eps,
         sqrsum=sqrsum,
+        want_fp8=want_fp8,
     )
-    return residual, new_post, new_comb, layer_input
+    return residual, new_post, new_comb, layer_input, fp8_h, h_scale

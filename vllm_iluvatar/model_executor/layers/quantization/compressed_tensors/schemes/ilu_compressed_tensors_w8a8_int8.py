@@ -368,14 +368,15 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
     def _get_perf_func(self, n: int, k: int, m: int):
         """In PERF mode, select the best kernel for the given m from
         perf_table.  Returns None when PERF mode is off or shape not in
-        table, signalling the caller to use the default w8a8 path.
+        table, signalling the caller to use the default w8a8 path. CQ always
+        uses that public path, independently of its weight layout.
 
         ``m`` is the kernel batch after flattening leading dims
-        (``numel // k``), not ``x.shape[0]``. Small-M rows go to
-        ``ixformer_perf`` (legal M ``<= 64``, or ``<= 16`` for
-        ``(32768, 1024)``); larger M uses ``w8a8_gemm``.
+        (``numel // k``), not ``x.shape[0]``.
         """
-        if self.perf_mode != "PERF":
+        # CQ uses the shared backend registry, which prefers ixmm. Keep the
+        # layout selection separate from the legacy PERF kernel thresholds.
+        if self.arch == "ivcore30" or self.perf_mode != "PERF":
             return None
         entry = self._get_perf_entry(n, k)
         if entry is None:
@@ -675,14 +676,20 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
                 out_dtype=out_dtype,
             )
         else:
+            gemm_input, gemm_output = x_q, out
+            if self.arch == "ivcore30" and x_q.dim() == 3:
+                # A linear shares one 2D weight across all leading dimensions.
+                # Present it as GEMM so the registry can select ixmm directly.
+                gemm_input = x_q.reshape(-1, x_q.shape[-1])
+                gemm_output = out.view(-1, out.shape[-1])
             ixf_ops.w8a8(
-                x_q,
+                gemm_input,
                 w_q,
                 x_s,
                 w_s,
                 bias,
                 format=self.gemm_info.format_str,
-                output=out,
+                output=gemm_output,
                 out_dtype=out_dtype,
             )
 

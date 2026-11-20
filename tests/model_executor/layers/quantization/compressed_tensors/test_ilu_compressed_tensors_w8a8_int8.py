@@ -217,3 +217,71 @@ def test_ivcore11_flash_wq_b_wo_b_perf_table_is_tn():
     # indexer / shared stay on the 64-aligned NN fallback
     assert scheme._choose_format(8192, 1024) == "NN"
     assert scheme._choose_format(4096, 4096) == "NN"
+
+
+@pytest.mark.skipif(COMPILED_CUDA_ARCH != "ivcore30", reason="CQ W8A8 dispatch")
+@pytest.mark.parametrize(
+    "shape,k,prequantized,dtype,with_bias,replay",
+    [
+        ((8,), 4096, False, torch.bfloat16, False, False),
+        ((24,), 2048, True, torch.bfloat16, False, False),
+        ((2, 24), 4096, False, torch.bfloat16, False, False),
+        ((2, 24), 2048, True, torch.bfloat16, False, True),
+        ((128,), 4096, True, torch.bfloat16, False, False),
+        ((32,), 2048, True, torch.float16, True, False),
+    ],
+)
+def test_cq_shared_w8a8_numerics(shape, k, prequantized, dtype, with_bias, replay):
+    torch.manual_seed(4262)
+    n = 4096
+    layer = _DummyLinear([n])
+    scheme = IluCompressedTensorsW8A8Int8(
+        strategy=QuantizationStrategy.CHANNEL,
+        is_static_input_scheme=False,
+        input_symmetric=True,
+        ilu_params={
+            "mixed_strategy": "CHANNEL",
+            "gemm_format": "TN",
+            "gemm_mode": "PERF",
+        },
+    )
+    scheme.create_weights(
+        layer, [n], k, dtype, weight_loader=lambda *_args, **_kwargs: None
+    )
+    _set_quantized_weight_params(
+        layer,
+        (k, n),
+        strategy=QuantizationStrategy.CHANNEL,
+        dtype=dtype,
+        has_bias=with_bias,
+    )
+    layer = layer.cuda()
+    weight_ref = layer.weight.detach().clone()
+    scale_ref = layer.weight_scale.detach().clone()
+    scheme.process_weights_after_loading(layer)
+    x = torch.randn(*shape, k, dtype=dtype, device="cuda")
+    x_q, x_s, _ = ops.scaled_int8_quant(x.contiguous(), None, None, symmetric=True)
+    value = (x_q, x_s, dtype) if prequantized else x
+
+    def reference():
+        return ref_w8a8(
+            x_q.reshape(-1, k),
+            weight_ref,
+            x_s.reshape(-1),
+            scale_ref,
+            bias=layer.bias,
+            format="TN",
+            out_dtype=dtype,
+        ).view(*shape, n)
+
+    actual = scheme.apply_weights(layer, value, layer.bias)
+    torch.testing.assert_close(actual, reference(), atol=2e-2, rtol=2e-2)
+    if replay:
+        graph = torch.cuda.CUDAGraph()
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            captured = scheme.apply_weights(layer, value, layer.bias)
+        for _ in range(2):
+            x_q.random_(-127, 128)
+            graph.replay()
+            torch.testing.assert_close(captured, reference(), atol=2e-2, rtol=2e-2)

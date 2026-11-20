@@ -21,7 +21,7 @@ def test_sqrsum_handoff_kept_outside_splitk(monkeypatch, m, enabled):
     monkeypatch.setattr(mhc.ixfops, "ds4_mhc_pre_v2", split)
     monkeypatch.setattr(mhc.ixf_mhc, "mhc_pre_with_sqrsum", reuse)
     actual = mhc.mhc_pre(residual, None, None, None, 1e-6, 1e-6, 2.0, 20, sqrsum=sqrsum)
-    assert actual == expected
+    assert actual == (*expected, None, None)
     if enabled and 16 <= m <= 120:
         split.assert_called_once()
         reuse.assert_not_called()
@@ -40,7 +40,7 @@ def test_splitk_never_skips_required_tp_allreduce(monkeypatch, m):
     group = object()
     reduce = Mock(return_value=(reduced, sqrsum))
     post = Mock(side_effect=AssertionError("required allreduce was skipped"))
-    pre = Mock(return_value=(object(), object(), object()))
+    pre = Mock(return_value=(object(), object(), object(), None, None))
     monkeypatch.setattr(mhc, "allreduce_mhc_post_with_sqrsum", reduce)
     monkeypatch.setattr(mhc, "mhc_post", post)
     monkeypatch.setattr(mhc, "mhc_pre", pre)

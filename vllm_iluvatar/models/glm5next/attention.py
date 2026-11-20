@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM5Next projections and complete Iluvatar Kpool indexing."""
 
+from types import MethodType
+
 import ixformer.inference.functions as ixfops
 import torch
 import triton
@@ -9,10 +11,14 @@ import vllm.envs as envs
 from ixformer.cuda import cuda_arch
 from ixformer.inference.functions.models.glm5next import (
     fwht128_quant_int8_with_weights,
+    global_pool_indices,
 )
+from ixformer.inference import ixattn_backend
 from torch import nn
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed.parallel_state import get_dcp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -34,7 +40,11 @@ from vllm.models.glm5next.sparse_indexer import SparseAttnIndexerKpool
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
 from vllm.utils.math_utils import cdiv, next_power_of_2
-from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import (
+    KpoolTailSpec,
+    MLAAttentionSpec,
+    get_kv_quant_mode,
+)
 
 from vllm_iluvatar.ilu_util.arch import is_ivcore11, is_ivcore30
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes.ilu_compressed_tensors_w8a8_int8 import (  # noqa: E501
@@ -88,6 +98,8 @@ def _scale_to_bf16(weights: torch.Tensor, scale: float) -> torch.Tensor:
 
 
 def glm5next_uses_compact_pool_indices(vllm_config: VllmConfig, kpool: int) -> bool:
+    if kpool == 4 and glm5next_fp8_attn_enabled_for_config(vllm_config):
+        return True
     if not (
         kpool == 4
         and vllm_config.cache_config.cache_dtype in ("auto", "bfloat16")
@@ -99,12 +111,11 @@ def glm5next_uses_compact_pool_indices(vllm_config: VllmConfig, kpool: int) -> b
         return True
     if arch != "ivcore30" or envs.VLLM_ILU_MLA_ATTN_QUANT_TYPE == "INT8":
         return False
-    from ixformer.inference.ixattn_backend import ixattn_available
 
     config = vllm_config.model_config.hf_text_config
     tp_size = vllm_config.parallel_config.tensor_parallel_size
     return (
-        ixattn_available()
+        ixattn_backend.ixattn_available()
         and config.kv_lora_rank == 512
         and config.qk_nope_head_dim == 256
         and config.qk_rope_head_dim == 0
@@ -120,6 +131,305 @@ def glm5next_topk_buffer_width(
         return topk_tokens // kpool
     width = topk_tokens + (kpool - 1 if kpool > 1 else 0)
     return (width + 127) // 128 * 128
+
+
+logger = init_logger(__name__)
+
+# One set of query staging tensors per (device, capacity, heads, kv_lora_rank),
+# shared across every NoPE MLA layer in the process for zero-alloc CUDA graphs.
+_FP8_MLA_SCRATCH: dict[tuple, dict[str, torch.Tensor]] = {}
+
+# The architectures this module's layers back, for config-phase checks that run
+# before the model class is resolved.
+GLM5NEXT_ARCHS = (
+    "Glm5NextForConditionalGeneration",
+    "Glm5NextForCausalLM",
+)
+
+
+def _glm5next_fp8_mla_unmet_reason(vllm_config: VllmConfig) -> str | None:
+    if not is_ivcore30() or getattr(torch, "corex_arch", "ivcore30") != "ivcore30":
+        return "requires ivcore30"
+    if not ixattn_backend.ixattn_available():
+        return "ixformer built without CQ ixattn"
+    model_config = getattr(vllm_config, "model_config", None)
+    if getattr(model_config, "dtype", None) != torch.bfloat16:
+        return f"requires dtype=bfloat16, got {getattr(model_config, 'dtype', None)}"
+    hf_text = getattr(model_config, "hf_text_config", None)
+    if (
+        getattr(hf_text, "qk_rope_head_dim", None) != 0
+        or getattr(hf_text, "kv_lora_rank", None) != 512
+        or getattr(hf_text, "qk_nope_head_dim", None) != 256
+        or getattr(hf_text, "index_kpool", None) != 4
+    ):
+        return (
+            "requires NoPE MLA (qk_rope_head_dim=0, kv_lora_rank=512, "
+            "qk_nope_head_dim=256, index_kpool=4)"
+        )
+    num_heads = getattr(hf_text, "num_attention_heads", None)
+    parallel_cfg = getattr(vllm_config, "parallel_config", None)
+    tp = (
+        getattr(parallel_cfg, "tensor_parallel_size", 1)
+        if parallel_cfg is not None
+        else 1
+    )
+    spec_cfg = getattr(vllm_config, "speculative_config", None)
+    draft_tp = (
+        getattr(spec_cfg, "draft_tensor_parallel_size", None)
+        if spec_cfg is not None
+        else None
+    )
+    for shard_tp in (tp,) if draft_tp is None else (tp, draft_tp):
+        if (
+            not isinstance(num_heads, int)
+            or shard_tp <= 0
+            or num_heads % shard_tp != 0
+            or (num_heads // shard_tp) not in (16, 32, 64)
+        ):
+            return f"local heads ({num_heads} // tp={shard_tp}) must be 16, 32, or 64"
+    return None
+
+
+def glm5next_fp8_attn_enabled_for_config(vllm_config: VllmConfig | None) -> bool:
+    """Single-source-of-truth config predicate for CQ GLM5Next FP8 NoPE MLA."""
+    if vllm_config is None:
+        return False
+    model_config = getattr(vllm_config, "model_config", None)
+    archs = getattr(model_config, "architectures", None) or []
+    if not any(arch in archs for arch in GLM5NEXT_ARCHS):
+        return False
+    cache_config = getattr(vllm_config, "cache_config", None)
+    requested = (
+        envs.VLLM_ILU_GLM5_FP8_ATTN
+        if envs.is_set("VLLM_ILU_GLM5_FP8_ATTN")
+        else bool(
+            getattr(cache_config, "_ilu_glm5next_fp8_kv", False)
+            or envs.VLLM_ILU_GLM5_FP8_ATTN
+        )
+    )
+    if not requested:
+        return False
+    reason = _glm5next_fp8_mla_unmet_reason(vllm_config)
+    if reason is not None:
+        logger.warning_once(
+            "Disabling GLM5Next FP8 MLA (%s); falling back to BF16 MLA.",
+            reason,
+        )
+        return False
+    return True
+
+
+def glm5next_fp8_attn_enabled(
+    qk_rope_head_dim: int,
+    vllm_config: VllmConfig | None = None,
+) -> bool:
+    return qk_rope_head_dim == 0 and glm5next_fp8_attn_enabled_for_config(vllm_config)
+
+
+def _fp8_mla_scratch(
+    device: torch.device,
+    capacity: int,
+    num_heads: int,
+    kv_lora_rank: int,
+) -> dict[str, torch.Tensor]:
+    key = (device, capacity, num_heads, kv_lora_rank)
+    scratch = _FP8_MLA_SCRATCH.get(key)
+    if scratch is None:
+        scratch = {
+            "q_fp8": torch.empty(
+                (capacity, num_heads, kv_lora_rank),
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            ),
+            "q_scale": torch.empty(
+                (capacity, num_heads), dtype=torch.float32, device=device
+            ),
+            "empty_pe": torch.empty(
+                (capacity, 1, 0), dtype=torch.bfloat16, device=device
+            ),
+            "unit_kv_scale": torch.ones((1,), dtype=torch.float32, device=device),
+        }
+        _FP8_MLA_SCRATCH[key] = scratch
+    return scratch
+
+
+def _resolve_fp8_kv_scale(layer, scratch: dict[str, torch.Tensor]) -> torch.Tensor:
+    k_scale = getattr(layer, "_k_scale", None)
+    if (
+        isinstance(k_scale, torch.Tensor)
+        and k_scale.is_cuda
+        and k_scale.dtype == torch.float32
+        and k_scale.numel() == 1
+    ):
+        return k_scale.reshape(1)
+    return scratch["unit_kv_scale"]
+
+
+def _fp8_mla_get_kv_cache_spec(self, vllm_config: VllmConfig) -> MLAAttentionSpec:
+    """512 pure-E4M3 bytes per token (no RoPE tail, per-tensor static scale)."""
+    return MLAAttentionSpec(
+        block_size=vllm_config.cache_config.block_size,
+        num_kv_heads=1,
+        max_tp_shards=1,
+        head_size=self.head_size,
+        dtype=torch.float8_e4m3fn,
+        cache_dtype_str="fp8_e4m3",
+        kv_quant_mode=get_kv_quant_mode("fp8_e4m3"),
+        is_index_group_leader=self.indexer is not None,
+        non_causal_multi_token_decode=self.non_causal_multi_token_decode,
+        block_stride_alignment=self.head_size,
+    )
+
+
+def _fp8_mla_forward_mqa(
+    self,
+    q: torch.Tensor,
+    kv_c_and_k_pe_cache: torch.Tensor,
+    attn_metadata,
+    layer,
+    kv_cache_scale: torch.Tensor | None = None,
+    *,
+    backend: str | None = None,
+    positions: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Sparse MLA over E4M3 query and latent cache via ixattn kpool=4."""
+    num_tokens = q.shape[0]
+    if num_tokens == 0:
+        return q
+    scratch = self._fp8_mla_scratch
+    assert num_tokens <= scratch["q_fp8"].shape[0], (
+        f"FP8 NoPE MLA staging holds {scratch['q_fp8'].shape[0]} tokens, "
+        f"got {num_tokens}"
+    )
+    q_fp8 = scratch["q_fp8"][:num_tokens]
+    q_scale = scratch["q_scale"][:num_tokens]
+    ixfops.dynamic_scaled_fp8_quant(q_fp8, q, q_scale)
+
+    assert self.topk_indices_buffer is not None
+    selected_pools = attn_metadata.topk_tokens // 4
+    pool_ids = self.topk_indices_buffer[:num_tokens, :selected_pools]
+    if getattr(self, "use_ixattn_compact_pools", False) and positions is not None:
+        phys_pools, topk_lens = self._ixattn_physical_pool_rows(
+            num_tokens, pool_ids, attn_metadata, positions
+        )
+    else:
+        phys_pools, topk_lens = global_pool_indices(
+            pool_ids,
+            attn_metadata.req_id_per_token,
+            attn_metadata.block_table,
+            attn_metadata.seq_lens,
+            attn_metadata.query_start_loc,
+            attn_metadata.block_size,
+            expand=False,
+        )
+
+    kv_scale = _resolve_fp8_kv_scale(layer, scratch)
+    ixfops.flash_mla_sparse_fwd(
+        q=q_fp8,
+        kv=kv_c_and_k_pe_cache.view(-1, 1, self.kv_lora_rank),
+        indices=phys_pools.view(num_tokens, 1, -1),
+        sm_scale=self.softmax_scale,
+        topk_length=topk_lens,
+        output=q,
+        kpool=4,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+        backend=backend if backend is not None else "ixattn",
+    )
+    return q
+
+
+def _fp8_mla_forward_full(
+    self,
+    layer,
+    q: torch.Tensor,
+    k_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata,
+    output: torch.Tensor,
+    positions: torch.Tensor | None = None,
+    kv_cache_scale: list[torch.Tensor] | None = None,
+    *,
+    backend: str | None = None,
+) -> torch.Tensor:
+    """NoPE sparse MLA forward_full writing E4M3 KV cache and running ixattn."""
+    if attn_metadata is None:
+        num_toks = q.shape[0]
+        _ = torch.empty(
+            (num_toks, self.num_heads, self.kv_lora_rank),
+            device=k_c_normed.device,
+            dtype=k_c_normed.dtype,
+        )
+        _ = torch.empty((num_toks, 576), device=k_c_normed.device, dtype=torch.int32)
+        return torch.empty(
+            output.shape[0],
+            self.v_head_dim * self.num_heads,
+            device=q.device,
+            dtype=q.dtype,
+        )
+    if self.dcp_world_size == -1:
+        self.dcp_world_size = get_dcp_group().world_size
+
+    num_actual_toks = attn_metadata.num_actual_tokens
+    q = q[:num_actual_toks]
+    k_c_normed = k_c_normed[:num_actual_toks]
+    if num_actual_toks < output.shape[0]:
+        output[num_actual_toks:].zero_()
+    if num_actual_toks > 0:
+        scratch = self._fp8_mla_scratch
+        ql_nope = q.new_empty((num_actual_toks, self.num_heads, self.kv_lora_rank))
+        self._k_up_proj(q, out=ql_nope)
+        if kv_cache.numel() > 0:
+            ixfops.concat_and_cache_mla(
+                k_c_normed,
+                scratch["empty_pe"][:num_actual_toks],
+                kv_cache,
+                attn_metadata.slot_mapping.flatten()[:num_actual_toks],
+                kv_cache_dtype="fp8_e4m3",
+                scale=_resolve_fp8_kv_scale(layer, scratch),
+            )
+        attn_out = self.forward_mqa(
+            ql_nope,
+            kv_cache,
+            attn_metadata,
+            layer,
+            backend=backend,
+            positions=positions,
+        )
+        output_view = output.view(-1, self.num_heads, self.v_head_dim)
+        self._v_up_proj(attn_out, out=output_view[:num_actual_toks])
+    return output.view(output.shape[0], self.v_head_dim * self.num_heads)
+
+
+def install_glm5next_fp8_mla(layer, vllm_config: VllmConfig) -> None:
+    """Route one validated NoPE MLA layer onto ixattn's kpool=4 FP8 forward."""
+    impl = layer.impl
+    assert (
+        layer.head_size == layer.kv_lora_rank == 512
+        and impl.num_heads in (16, 32, 64)
+        and impl.softmax_scale == 1 / 16
+        and (
+            impl._indexer is None
+            or getattr(impl._indexer, "compact_pool_indices", False)
+        )
+    )
+    layer.kv_cache_dtype = "fp8_e4m3"
+    impl.kv_cache_dtype = "fp8_e4m3"
+
+    device = torch.device(
+        vllm_config.device_config.device_type, torch.cuda.current_device()
+    )
+    impl._fp8_mla_scratch = _fp8_mla_scratch(
+        device,
+        vllm_config.scheduler_config.max_num_batched_tokens,
+        impl.num_heads,
+        impl.kv_lora_rank,
+    )
+
+    layer.get_kv_cache_spec = MethodType(_fp8_mla_get_kv_cache_spec, layer)
+    impl.forward_full = MethodType(_fp8_mla_forward_full, impl)
+    impl.forward_mqa = MethodType(_fp8_mla_forward_mqa, impl)
 
 
 class IluGlm5NextIndexerCache(DeepseekV32IndexerCache):
@@ -647,6 +957,13 @@ class IluGlm5NextMLAAttention(nn.Module):
             skip_topk=False,
             fuse_qkv_rmsnorm=True,
         )
+
+        self.fp8_attn = self.is_v32 and glm5next_fp8_attn_enabled(
+            self.qk_rope_head_dim, vllm_config
+        )
+        if self.fp8_attn:
+            assert topk_indices_buffer is not None
+            install_glm5next_fp8_mla(self.mla_attn.mla_attn, vllm_config)
 
     def forward(
         self, hidden_states: torch.Tensor, positions: torch.Tensor

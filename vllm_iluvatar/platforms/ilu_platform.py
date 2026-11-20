@@ -283,9 +283,14 @@ def _make_iluvatar_platform():
 
         @classmethod
         def _get_indexer_block_alignment(cls, vllm_config) -> int | None:
+            from math import lcm
+
+            from vllm_iluvatar.ilu_util.arch import is_ivcore30
+
             index_kpool = getattr(
                 vllm_config.model_config.hf_text_config, "index_kpool", None
             )
+            alignment = None
             if index_kpool and index_kpool > 1:
                 from vllm_iluvatar.models.glm5next.attention import (
                     resolve_glm5next_indexer_kv_dtype,
@@ -297,8 +302,84 @@ def _make_iluvatar_platform():
                 ):
                     from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
 
-                    return index_kpool * max(PAGED_MQA_PAGE_SIZES)
-            return super()._get_indexer_block_alignment(vllm_config)
+                    alignment = index_kpool * max(PAGED_MQA_PAGE_SIZES)
+            if alignment is None:
+                alignment = super()._get_indexer_block_alignment(vllm_config)
+
+            cache = getattr(vllm_config, "cache_config", None)
+            model = getattr(vllm_config, "model_config", None)
+            unit = getattr(cache, "prefix_match_unit", None)
+            if (
+                unit
+                and getattr(cache, "enable_mamba_shared_prefix_checkpoint", False)
+                and getattr(cache, "enable_prefix_caching", False)
+                and getattr(cache, "mamba_cache_mode", None) == "align"
+                and getattr(model, "is_hybrid", False)
+                and is_ivcore30()
+            ):
+                return lcm(alignment or 1, unit)
+            return alignment
+
+        @classmethod
+        def update_block_size_for_backend(cls, vllm_config) -> None:
+            """Size ``block_size`` for the cache the model will actually write.
+
+            The GLM-5.3 NoPE MLA layers trade the 1024-byte BF16 latent for a
+            512-byte E4M3 one, which halves the MLA page and requires a wider
+            ``block_size`` so each attention page still covers the KDA mamba
+            state. Quote ``fp8_e4m3`` during the hybrid sizing pass and also
+            enforce ``_get_indexer_block_alignment`` when prefix caching takes
+            the ``mamba_cache_mode == "all"`` branch.
+            """
+            from math import lcm
+
+            from vllm.utils.math_utils import cdiv
+            from vllm_iluvatar.models.glm5next.attention import (
+                GLM5NEXT_ARCHS,
+                glm5next_fp8_attn_enabled_for_config,
+            )
+
+            cache_config = getattr(vllm_config, "cache_config", None)
+            model_config = getattr(vllm_config, "model_config", None)
+            archs = getattr(model_config, "architectures", None) or []
+            if cache_config is None or not any(
+                arch in archs for arch in GLM5NEXT_ARCHS
+            ):
+                super().update_block_size_for_backend(vllm_config)
+                return
+
+            if glm5next_fp8_attn_enabled_for_config(vllm_config):
+                requested = cache_config.cache_dtype
+                cache_config.cache_dtype = "fp8_e4m3"
+                try:
+                    super().update_block_size_for_backend(vllm_config)
+                finally:
+                    cache_config.cache_dtype = requested
+            else:
+                super().update_block_size_for_backend(vllm_config)
+
+            indexer_align = cls._get_indexer_block_alignment(vllm_config) or 1
+            match_unit = getattr(cache_config, "prefix_match_unit", None) or 1
+            align_unit = lcm(indexer_align, match_unit)
+            if align_unit > 1 and cache_config.block_size % align_unit != 0:
+                prev_block_size = cache_config.block_size
+                step = align_unit
+                if cache_config.mamba_cache_mode == "all":
+                    mamba_chunk = (
+                        cache_config.mamba_block_size
+                        if cache_config.user_specified_mamba_block_size
+                        else vllm_config.model_config.get_mamba_chunk_size()
+                    )
+                    if mamba_chunk:
+                        step = lcm(step, mamba_chunk)
+                aligned = step * cdiv(prev_block_size, step)
+                if cache_config.mamba_block_size == prev_block_size:
+                    cache_config.mamba_block_size = aligned
+                if getattr(cache_config, "mamba_page_size_padded", None) is not None:
+                    cache_config.mamba_page_size_padded = (
+                        cache_config.mamba_page_size_padded // prev_block_size
+                    ) * aligned
+                cache_config.block_size = aligned
 
         @classmethod
         def check_and_update_config(cls, vllm_config) -> None:
@@ -336,21 +417,61 @@ def _make_iluvatar_platform():
                     compilation_config.cudagraph_capture_sizes = merged
                     if merged:
                         compilation_config.max_cudagraph_capture_size = merged[-1]
+            is_glm5next = False
             if model_config is not None and cache_config is not None:
                 try:
                     archs = model_config.architectures or []
                 except Exception:
                     archs = []
-                if any(
+                is_glm5next = any(
                     a in archs
                     for a in (
                         "Glm5NextForConditionalGeneration",
                         "Glm5NextForCausalLM",
                     )
-                ) and cache_config.cache_dtype not in ("auto", "bfloat16"):
+                )
+                if is_glm5next and cache_config.cache_dtype not in (
+                    "auto",
+                    "bfloat16",
+                ):
+                    if cache_config.cache_dtype in ("fp8", "fp8_e4m3"):
+                        cache_config._ilu_glm5next_fp8_kv = True
+                    else:
+                        from vllm.logger import init_logger
+
+                        init_logger(__name__).warning_once(
+                            "GLM5Next does not support kv_cache_dtype=%r; "
+                            "falling back to BF16 MLA.",
+                            cache_config.cache_dtype,
+                        )
                     cache_config.cache_dtype = "auto"
 
             super().check_and_update_config(vllm_config)
+            if is_glm5next and cache_config is not None:
+                from math import lcm
+
+                from vllm_iluvatar.ilu_util.arch import is_ivcore30
+                from vllm_iluvatar.models.glm5next.attention import (
+                    glm5next_fp8_attn_enabled_for_config,
+                )
+
+                glm5next_fp8_attn_enabled_for_config(vllm_config)
+                if (
+                    is_ivcore30()
+                    and getattr(model_config, "is_hybrid", False)
+                    and getattr(cache_config, "enable_prefix_caching", False)
+                    and getattr(cache_config, "mamba_cache_mode", None) == "align"
+                    and getattr(cache_config, "prefix_match_unit", None) is None
+                ):
+                    unit = lcm(
+                        256, cls._get_indexer_block_alignment(vllm_config) or 1
+                    )
+                    if (
+                        not getattr(cache_config, "user_specified_block_size", False)
+                        or cache_config.block_size % unit == 0
+                    ):
+                        cache_config.prefix_match_unit = unit
+                        cache_config.enable_mamba_shared_prefix_checkpoint = True
             from vllm_iluvatar.v1.worker.prefill_state.configuration import (
                 initialize_config,
             )

@@ -258,6 +258,7 @@ if TYPE_CHECKING:
     VLLM_ILU_GLM5NEXT_KDA_PROJ_W8A8: bool = True
     VLLM_ILU_GLM5NEXT_GATHER_BEFORE_GATE: bool = True
     VLLM_ILU_GLM5_PROFILE: str | None = None
+    VLLM_ILU_GLM5_FP8_ATTN: bool = False
     VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP: bool = False
     VLLM_ILU_MOE_AG_SHARED_OVERLAP: bool = False
     VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP: bool = False
@@ -507,6 +508,11 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
         or os.environ.get("ILU_GLM5_PROFILE")
         or ""
     ),
+    # Cache the GLM-5.3 NoPE MLA latent as 512 E4M3 bytes per token instead of
+    # 1024 BF16 ones, and serve those layers with ixattn's kpool=4 FP8
+    # ``fmha_mla_sparse_fwd``. Off by default: it halves the MLA page, which
+    # widens ``block_size`` so the KDA mamba state still fits.
+    "VLLM_ILU_GLM5_FP8_ATTN": _bool_reader("VLLM_ILU_GLM5_FP8_ATTN", "0"),
     "VLLM_ILU_INDEXER_KV_DTYPE": lambda: (
         os.environ.get("VLLM_ILU_INDEXER_KV_DTYPE", "bf16").strip().lower()
     ),

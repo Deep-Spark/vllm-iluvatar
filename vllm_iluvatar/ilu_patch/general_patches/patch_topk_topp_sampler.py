@@ -3,13 +3,14 @@
 
 Corresponds to: vllm/v1/sample/ops/topk_topp_sampler.py
 
-Target   : TopKTopPSampler.forward_native
+Target   : TopKTopPSampler.forward_native, apply_top_k_top_p
 Baseline : v0.31.0 (db9527a468)
-Why      : VLLM_ILU_GLM_SAMPLING_MODE selects native CQ sorted/radix sampling.
-           apply_top_k_top_p is left on upstream.
-How      : rebind TopKTopPSampler.forward_native only. The fallback calls the
-           original method, which uses upstream apply_top_k_top_p.
-Scope    : ivcore30 GLM sampling when the contract matches.
+Why      : VLLM_ILU_GLM_SAMPLING_MODE selects native CQ sorted/radix sampling;
+           supported MR/CQ distributions use the weighted-radix mask.
+How      : retain the CQ method override and rebind apply_top_k_top_p,
+           including imported V2 references. Disabled/unsupported calls use
+           their original mainline implementation.
+Scope    : Iluvatar sampling when the selected contract matches.
 Remove   : when upstream provides this GLM sampling path.
 """
 
@@ -23,7 +24,7 @@ def register() -> None:
     p.register_once(
         __name__,
         _apply,
-        detail="GLM CQ sampling on TopKTopPSampler.forward_native",
+        detail="GLM CQ sampler and supported MR/CQ top-p mask",
     )
 
 
@@ -34,3 +35,5 @@ def _apply() -> None:
 
     p.check_signatures(_m.TopKTopPSampler, impl, ["forward_native"], strict=True)
     _m.TopKTopPSampler.forward_native = impl.forward_native
+    p.check_signatures(_m, impl, ["apply_top_k_top_p"], strict=True)
+    p.rebind_module_func(_m, "apply_top_k_top_p", impl.apply_top_k_top_p)

@@ -30,6 +30,7 @@ def _install_fake_vllm(monkeypatch, *, is_cpu: bool) -> ModuleType:
     torch.Tensor = object
 
     vllm = _package("vllm")
+    vllm.envs = SimpleNamespace()
     platforms = ModuleType("vllm.platforms")
     platforms.current_platform = SimpleNamespace(is_cpu=lambda: is_cpu)
     v1 = _package("vllm.v1")
@@ -85,7 +86,7 @@ def _load_impl(monkeypatch, *, is_cpu: bool = False) -> ModuleType:
     return impl
 
 
-def test_patch_apply_rebinds_forward_native_only(monkeypatch):
+def test_patch_apply_rebinds_both_entries_and_preserves_default(monkeypatch):
     from vllm_iluvatar.ilu_patch.general_patches import patch_topk_topp_sampler
 
     impl = _load_impl(monkeypatch, is_cpu=False)
@@ -94,6 +95,7 @@ def test_patch_apply_rebinds_forward_native_only(monkeypatch):
 
     patch_topk_topp_sampler._apply()
 
-    assert community.apply_top_k_top_p is upstream_apply
-    assert not hasattr(impl, "apply_top_k_top_p")
+    assert community.apply_top_k_top_p is impl.apply_top_k_top_p
+    assert impl._original_apply_top_k_top_p is upstream_apply
+    assert community.apply_top_k_top_p(None, None, None) == "community"
     assert community.TopKTopPSampler.forward_native is impl.forward_native

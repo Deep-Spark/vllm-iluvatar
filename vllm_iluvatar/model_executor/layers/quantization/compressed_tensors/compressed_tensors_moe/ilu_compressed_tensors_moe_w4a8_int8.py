@@ -40,6 +40,7 @@ from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_iluvatar import envs as ilu_envs
+from vllm_iluvatar.ilu_util.arch import is_ivcore11
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_decode_metadata import (
     _ensure_cuda_graph_safe_dispatch,
     _is_only_decode,
@@ -658,6 +659,51 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 layer.w2_weight,
             )
 
+        # The MR NN V1 checkpoint is already packed; only resolve its backend.
+        layer._use_ixmm_decode = self._supports_ixmm_decode(layer)
+        if layer._use_ixmm_decode:
+            from ixformer.inference.backend_registry import registry
+
+            registry.resolve("moe_w4a8_group_gemm_ixmm", "ixmm")
+
+    def _supports_ixmm_decode(self, layer: torch.nn.Module) -> bool:
+        """Supported NN V1 EP16 layout for the ixformer ixmm decode backend."""
+        from ixformer.inference.ixmm_backend import ixmm_available
+
+        return (
+            is_ivcore11()
+            and ixmm_available()
+            and self.weight_symmetric
+            and not self.has_bias
+            and envs.VLLM_ILU_MOE_EP_LL_MOE_ALGO != "FUSED"
+            and self.version == 1
+            and self.group_size == -1
+            and self.gemm_format == "NN"
+            and self.gemm1_info.format_str == self.gemm2_info.format_str == "NN"
+            and layer.global_num_experts == 288
+            and layer.local_num_experts == 18
+            and layer.top_k == 8
+            and self.gemm1_info.get_k() == self.gemm1_info.get_pad_k() == 4096
+            and self.gemm1_info.get_n() == self.gemm1_info.get_pad_n() == 4096
+            and self.gemm2_info.get_k() == self.gemm2_info.get_pad_k() == 2048
+            and self.gemm2_info.get_n() == self.gemm2_info.get_pad_n() == 4096
+            and layer.activation.value in ("silu", "swiglu")
+            and getattr(layer, "swiglu_limit", None) == 10
+            and all(
+                getattr(layer, name) is None
+                for name in (
+                    "w13_input_scale",
+                    "w2_input_scale",
+                    "w13_i8_weight_scale",
+                    "w2_i8_weight_scale",
+                    "w13_i8_weight_zero",
+                    "w2_i8_weight_zero",
+                    "w13_bias",
+                    "w2_bias",
+                )
+            )
+        )
+
     @torch.no_grad()
     def _repack_loaded_weights_to_nn(self, layer: torch.nn.Module) -> None:
         """Switch real TN checkpoint bytes to ixformer's packed NN layout."""
@@ -872,10 +918,18 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             and layer.global_num_experts == 288
             and layer.local_num_experts == 18
             and layer.top_k == 8
-            and self.version == 2
             and self.group_size == -1
-            and self.gemm1_info.format_str == "TN"
-            and self.gemm2_info.format_str == "TN"
+            and (
+                (
+                    self.version == 2
+                    and self.gemm1_info.format_str == self.gemm2_info.format_str == "TN"
+                )
+                or (
+                    self.version == 1
+                    and self.gemm1_info.format_str == self.gemm2_info.format_str == "NN"
+                    and getattr(layer, "_use_ixmm_decode", False)
+                )
+            )
             and self.gemm1_info.get_n() == self.gemm1_info.get_pad_n()
             and self.gemm2_info.get_k() == self.gemm2_info.get_pad_k()
             and layer.w13_input_scale is None
@@ -892,7 +946,11 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Compact EP rows like GLM5.2; retain Flash's TN V2 GEMV and clamp math."""
+        """Compact EP rows, preserving the mainline TN V2 path."""
+        if getattr(layer, "_use_ixmm_decode", False):
+            return self._apply_ep_packed_ixmm(
+                layer, x, topk_weights, topk_ids, shared_experts_input
+            )
         num_tokens = topk_ids.shape[0]
         full = num_tokens * layer.top_k
         start = layer.moe_config.ep_rank * layer.local_num_experts
@@ -960,6 +1018,82 @@ class IluCompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             weights=weights_packed,
             scaling_factor=_get_ilu_output_scale(layer),
             extra_residual=shared_experts_input,
+        )
+
+    def _apply_ep_packed_ixmm(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        full = topk_ids.shape[0] * layer.top_k
+        start = layer.moe_config.ep_rank * layer.local_num_experts
+        sorted_ids = torch.empty(full, dtype=torch.int32, device=x.device)
+        inverse = torch.empty_like(sorted_ids)
+        layout = torch.empty(
+            (layer.local_num_experts, 2), dtype=torch.int32, device=x.device
+        )
+        src, _, weights, offsets, _, total = (
+            ixfops.moe_compute_token_index_ep_packed_for_decode(
+                topk_ids=topk_ids,
+                num_experts=layer.global_num_experts,
+                start_expert_id=start,
+                end_expert_id=start + layer.local_num_experts,
+                topk_weights=topk_weights,
+                dst_to_src=sorted_ids,
+                graph_safe=True,
+                group_layout=layout,
+                packed_to_expert_row=inverse,
+            )
+        )
+        act, scales = self._expand_and_quant(
+            layer, x, full, sorted_ids, src, output_format=0, check_valid=True
+        )
+        out = torch.empty(
+            (full, self.gemm1_info.get_n()), dtype=x.dtype, device=x.device
+        )
+        ixfops.moe_w4a8_group_gemm_ixmm(
+            act,
+            layer.w13_weight,
+            scales,
+            layer.w13_weight_scale.reshape(layer.local_num_experts, -1),
+            layout,
+            output=out,
+            group_size=0,
+            alpha=1.0,
+            backend="ixmm",
+        )
+        act, scales = ixfops.activation_dynamic_scaled_int8(
+            input=out,
+            act_type="swiglu",
+            output_format=0,
+            expand_tokens_gpu=total,
+            limit=layer.swiglu_limit,
+        )
+        out = torch.empty(
+            (full, self.gemm2_info.get_n()), dtype=x.dtype, device=x.device
+        )
+        ixfops.moe_w4a8_group_gemm_ixmm(
+            act,
+            layer.w2_weight,
+            scales,
+            layer.w2_weight_scale.reshape(layer.local_num_experts, -1),
+            layout,
+            output=out,
+            group_size=0,
+            alpha=1.0,
+            backend="ixmm",
+        )
+        # W2 stays expert-major: the reduction consumes the inverse mapping.
+        return ixfops.moe_output_reduce_sum_ep(
+            input=out,
+            token_row_offsets=offsets,
+            weights=weights,
+            scaling_factor=_get_ilu_output_scale(layer),
+            extra_residual=shared_experts_input,
+            packed_to_expert_row=inverse,
         )
 
     def _apply_ep(

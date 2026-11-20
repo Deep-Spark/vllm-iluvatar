@@ -383,7 +383,7 @@ class MoECPU(unittest.TestCase):
                         ops.calls, ["fused"] if fused else ["quant", "expand"]
                     )
 
-    def test_router_selection_and_scaling_fallback(self):
+    def test_router_delegation_and_scaling(self):
         for enabled, arch, topk, scoring in [
             (True, "ivcore30", 8, "sigmoid"),
             (False, "ivcore30", 8, "sigmoid"),
@@ -392,7 +392,11 @@ class MoECPU(unittest.TestCase):
             (True, "ivcore30", 8, "softmax"),
         ]:
             ops = Ops()
-            fn = load(ROUTER, "grouped_topk", {"torch": TORCH})
+            fn = load(
+                ROUTER,
+                "grouped_topk",
+                {"torch": TORCH, "is_ivcore30": lambda: arch == "ivcore30"},
+            )
             with patch.dict(sys.modules, modules(enabled, arch, ops)):
                 weights, _ = fn(
                     Tensor(),
@@ -405,12 +409,8 @@ class MoECPU(unittest.TestCase):
                     0.375,
                     Tensor((256,), "fp32"),
                 )
-            fused = (
-                enabled and arch == "ivcore30" and topk == 8 and scoring == "sigmoid"
-            )
-            self.assertEqual(ops.calls, ["router_native"] if fused else ["router_old"])
-            if not fused:
-                self.assertEqual(weights.value, 0.375)
+            self.assertEqual(ops.calls, ["router_old"])
+            self.assertEqual(weights.value, 0.375)
 
     def test_native_errors_are_not_silent_fallback(self):
         ops = Ops(fail_native=True)
@@ -421,24 +421,6 @@ class MoECPU(unittest.TestCase):
         ):
             fn(obj, layer, Tensor(), Tensor((3, 8)), Tensor((3, 8), "int32"), None)
         self.assertEqual(ops.calls, ["fused"])
-        ops = Ops(fail_native=True)
-        fn = load(ROUTER, "grouped_topk", {"torch": TORCH})
-        with (
-            patch.dict(sys.modules, modules(ops=ops)),
-            self.assertRaisesRegex(RuntimeError, "native sentinel"),
-        ):
-            fn(
-                Tensor(),
-                Tensor(),
-                8,
-                True,
-                1,
-                1,
-                "sigmoid",
-                1.0,
-                Tensor((256,), "fp32"),
-            )
-        self.assertEqual(ops.calls, ["router_native"])
 
     def test_static_input_scale_rejection(self):
         ops = Ops()

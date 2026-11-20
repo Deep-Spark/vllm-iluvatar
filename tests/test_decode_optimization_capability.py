@@ -121,12 +121,13 @@ class CapabilityTest(unittest.TestCase):
                 fn = load_function(
                     "vllm_iluvatar/model_executor/layers/fused_moe/router/ilu_grouped_topk_router.py",
                     "grouped_topk",
-                    {"torch": torch},
+                    {"torch": torch, "is_ivcore30": arch_module.is_ivcore30},
                 )
                 args = (x, x, 8, True, 1, 1, "sigmoid", 1.0, Tensor())
-            expected_native = arch == "ivcore30" and (
-                selector != "sampler"
-                or (0 < shape[0] <= 65535 and 0 < x.numel() <= 2147483647)
+            expected_native = (
+                selector == "sampler"
+                and arch == "ivcore30"
+                and (0 < shape[0] <= 65535 and 0 < x.numel() <= 2147483647)
             )
             if expected_native:
                 with self.assertRaisesRegex(RuntimeError, "must propagate"):

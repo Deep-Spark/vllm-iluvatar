@@ -5,9 +5,8 @@ Corresponds to: vllm/model_executor/layers/fused_moe/router/grouped_topk_router.
 
 Target   : vllm.model_executor.layers.fused_moe.router.grouped_topk_router.grouped_topk
 Baseline : v0.31.0 (db9527a468)
-Why      : Iluvatar uses ixformer's grouped-topk kernel instead of community
-           CUDA/Torch grouped-topk paths. ixformer requires the noaux_tc
-           correction bias dtype to match the router logits dtype.
+Why      : Iluvatar delegates grouped-topk routing (including architecture-specific
+           single-group sigmoid fast paths and general fallbacks) to ixformer.
 How      : general patch rebinds the module-level ``grouped_topk`` function to
            this implementation. No community method body is copied.
 Scope    : grouped-topk MoE routing on Iluvatar.
@@ -18,6 +17,8 @@ Remove   : when upstream exposes a grouped-topk backend hook or supports the
 from __future__ import annotations
 
 import torch
+
+from vllm_iluvatar.ilu_util.arch import is_ivcore30
 
 
 def grouped_topk(
@@ -35,43 +36,18 @@ def grouped_topk(
     from ixformer.inference.functions import (  # type: ignore[import]
         moe_grouped_topk as _ixf_grouped_topk,
     )
-    from vllm import envs
 
-    from vllm_iluvatar.ilu_util.arch import is_ivcore30
+    group_scoring = "max"
+    if e_score_correction_bias is not None:
+        if is_ivcore30():
+            group_scoring = "top2sum"
+            if e_score_correction_bias.dtype not in (gating_output.dtype, torch.float32):
+                e_score_correction_bias = e_score_correction_bias.to(gating_output.dtype)
+        elif e_score_correction_bias.dtype != gating_output.dtype:
+            # Preserve the MR native/FlyDSL route and its bias dtype.
+            e_score_correction_bias = e_score_correction_bias.to(gating_output.dtype)
 
-    if (
-        envs.VLLM_ILU_GLM_MOE_PREPARE_FUSION
-        and is_ivcore30()
-        and gating_output.is_cuda
-        and gating_output.dtype in (torch.bfloat16, torch.float16, torch.float32)
-        and gating_output.ndim == 2
-        and gating_output.is_contiguous()
-        and gating_output.shape[-1] == 256
-        and topk == 8
-        and num_expert_group == 1
-        and topk_group == 1
-        and scoring_func == "sigmoid"
-        and renormalize
-        and e_score_correction_bias is not None
-        and e_score_correction_bias.is_contiguous()
-        and e_score_correction_bias.dtype in (gating_output.dtype, torch.float32)
-    ):
-        from ixformer.inference.functions import moe_sigmoid_topk
-
-        return moe_sigmoid_topk(
-            gating_output,
-            e_score_correction_bias,
-            routed_scaling_factor=routed_scaling_factor,
-        )
-
-    # [ILU override] grouped_topk - delta: route selection through ixformer.
-    if (
-        e_score_correction_bias is not None
-        and e_score_correction_bias.dtype != gating_output.dtype
-    ):
-        e_score_correction_bias = e_score_correction_bias.to(dtype=gating_output.dtype)
-
-    topk_weights, topk_ids = _ixf_grouped_topk(
+    return _ixf_grouped_topk(
         gating_output,
         topk,
         num_expert_group,
@@ -80,5 +56,5 @@ def grouped_topk(
         e_score_correction_bias,
         renormalize=renormalize,
         routed_scaling_factor=routed_scaling_factor,
+        group_scoring_func=group_scoring,
     )
-    return topk_weights, topk_ids

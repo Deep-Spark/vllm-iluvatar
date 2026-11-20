@@ -16,12 +16,19 @@ ivcore30-native CUDA kernel + torch reference, so corex11 / non-ivcore30 fall
 back automatically). The op decodes the block scale (fp32 or e8m0) and handles
 strided inputs internally, and is called in place (``fp8_output=weight``) so the
 requant reuses the weight buffer. At runtime ``apply_block_scaled_mm``
-dynamically per-token-quantizes the bf16 activation
-(``ixfops.fp8_per_token_dynamic_scaled``) and runs the per-channel GEMM
-(``ixfops.fp8_per_channel_mm``); the ixformer registry handles the ixmm-native
-vs torch-reference dispatch, so no arch branching lives here. This is the
-standard W8A8 recipe (per-token activation x per-channel weight): a small
-precision drop from the 128x128 block scale, sufficient for "跑通 + 单句正确".
+dynamically per-token-quantizes the bf16 activation. When the activation is
+*not* prefetched, decode shape fits the gemv gate (``M <= 16``,
+``N % 16 == 0``, …), *and* the matching ixformer API plus ixmm gemv backend
+are available, it fuses quant with the CUDA ``nt_v2`` pack
+(``fp8_per_token_dynamic_scaled_nt_v2``, exact ``M``, no pad-to-4) and runs
+``fp8_per_channel_gemv(..., format=\"TN_V2\", backend=\"ixmm\")``. Prefetched
+plain FP8, shapes outside the gate, an older ixformer without the nt_v2
+helper, or a build without usable ixmm gemv keep
+``fp8_per_token_dynamic_scaled`` (or the prequant pair) +
+``fp8_per_channel_mm`` — no separate ``pack_act`` on the prequant path, and no
+``RuntimeError`` catch around the gemv call. This is the standard W8A8 recipe
+(per-token activation x per-channel weight): a small precision drop from the
+128x128 block scale, sufficient for "跑通 + 单句正确".
 
 Grouped ``wo_a``-style weights (marked ``is_bmm=True`` and carrying a
 ``bmm_geom``) are also requantized to per-channel fp8 at load time, but are then
@@ -65,6 +72,10 @@ from vllm_iluvatar.ilu_util.arch import is_ivcore30
 # ``distributed/parallel_state.py::_is_ivcore30_fn`` and the mxfp4 oracle).
 _is_ivcore30_fn = is_ivcore30
 
+# ixmm fp8 gemv decode regime; TN_V2 needs N % 16 and packed activation.
+_IXMM_FP8_GEMV_MAX_M = 16
+_IXMM_FP8_GEMV_OP = "fp8_per_channel_gemv"
+_IXMM_BACKEND = "ixmm"
 
 # One-forward pre-quantized activation handoff. The DeepSeek-V4.1 MHC pre-norm
 # kernel (``mhc_pre_with_sqrsum_fp8``) can fold the per-token fp8 quant of
@@ -76,6 +87,10 @@ _is_ivcore30_fn = is_ivcore30
 # norm kernel's bandwidth. Keyed by storage ``data_ptr`` (which survives the
 # ``apply_weights`` ``x.view(-1, K)``); validated by shape + dtype and read
 # without popping so one hidden state can feed several fp8 GEMMs.
+#
+# Prefetched FP8 is always *plain* row-major and always feeds
+# ``fp8_per_channel_mm`` (TN_V2 gemv is only used when quant+pack is fused
+# from bf16 via ``fp8_per_token_dynamic_scaled_nt_v2``).
 _PREQUANT: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
@@ -100,6 +115,75 @@ def _lookup_activation_prequant(
         if a_fp8.shape == A.shape and a_scale.numel() == A.shape[0]:
             return (a_fp8, a_scale)
     return None
+
+
+def _nt_v2_gemv_ready(ixfops) -> bool:
+    """True iff fused nt_v2 quant API and ixmm gemv backend are usable.
+
+    Probe happens *before* quant+pack so an older ixformer (no
+    ``fp8_per_token_dynamic_scaled_nt_v2``) or a build without a compiled ixmm
+    gemv backend returns to plain quant + ``fp8_per_channel_mm`` instead of
+    raising ``AttributeError`` / ``RuntimeError``. Does not catch gemv runtime
+    failures — only missing capability.
+    """
+    if not hasattr(ixfops, "fp8_per_token_dynamic_scaled_nt_v2"):
+        return False
+    try:
+        from ixformer.inference.backend_registry import registry
+    except ImportError:
+        return False
+    try:
+        return _IXMM_BACKEND in registry.available_backends(_IXMM_FP8_GEMV_OP)
+    except Exception:
+        # Probe broken ≠ "ixmm absent"; degrade to the always-available MM path.
+        return False
+
+
+def _apply_fp8_per_channel_gemv_nt_v2(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    *,
+    out_dtype: torch.dtype,
+    ixfops,
+) -> torch.Tensor | None:
+    """Decode path: fused quant+nt_v2 pack then gemv TN_V2.
+
+    Caller must only invoke this for *unquantized* activations. Returns
+    ``None`` when the shape/stride gate fails, or when the nt_v2 API / ixmm
+    gemv backend is unavailable, so the caller can fall back to plain quant +
+    ``fp8_per_channel_mm``.
+    """
+    m = int(A.shape[0])
+    n = int(B.shape[0])
+    k = int(A.shape[1])
+    if not (
+        m <= _IXMM_FP8_GEMV_MAX_M
+        and n % 16 == 0
+        and k % 64 == 0
+        and B.stride(0) % 64 == 0
+    ):
+        return None
+    if not _nt_v2_gemv_ready(ixfops):
+        return None
+
+    # fused quant+pack
+    a_fp8, a_scale, logical_m = ixfops.fp8_per_token_dynamic_scaled_nt_v2(A)
+    out = torch.empty(
+        (a_fp8.shape[0], n),
+        dtype=torch.bfloat16,
+        device=A.device,
+    )
+    ixfops.fp8_per_channel_gemv(
+        a_fp8,
+        B,
+        a_scale,
+        Bs,
+        out,
+        format="TN_V2",
+        backend=_IXMM_BACKEND,
+    )
+    return out[:logical_m].to(out_dtype)
 
 
 def _e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
@@ -264,12 +348,21 @@ class IluFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         # (matches the patch/is_supported arch gate).
         import ixformer.inference.functions as ixfops
 
+        prequant = _lookup_activation_prequant(A)
+        # Unquantized decode only: fused quant+pack+ gemv TN_V2.
+        # Prefetched plain FP8 always stays on the mm path below.
+        if prequant is None:
+            gemv_out = _apply_fp8_per_channel_gemv_nt_v2(
+                A, B, Bs, out_dtype=self.config.out_dtype, ixfops=ixfops
+            )
+            if gemv_out is not None:
+                return gemv_out
+
         # ``fp8_per_token_dynamic_scaled`` only requires the last dim contiguous
         # (``stride(-1) == 1``), which the base ``apply_weights`` guarantees via
         # ``x.view(-1, x.shape[-1])`` — no explicit ``.contiguous()`` needed.
         # A V4.1 pre-norm kernel may already have produced this exact quant for
         # ``A`` (bit-identical, same hidden-state storage); reuse it when present.
-        prequant = _lookup_activation_prequant(A)
         if prequant is not None:
             a_fp8, a_scale = prequant
         else:

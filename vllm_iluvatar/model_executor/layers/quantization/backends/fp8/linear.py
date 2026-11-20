@@ -206,13 +206,23 @@ class IluFp8LinearMethod(Fp8LinearMethod):
         )
         bias = None if bias is None else bias.to(torch.bfloat16)
 
-        if _can_fuse_bf16_fp8_gemv(x_2d, layer, self.gemm_format, bias):
+        from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (
+            _lookup_activation_prequant,
+        )
+
+        prequant = _lookup_activation_prequant(x_2d)
+        if prequant is None and _can_fuse_bf16_fp8_gemv(
+            x_2d, layer, self.gemm_format, bias
+        ):
             ixfops.per_channel_gemv_bf16_fp8_bf16(
                 x_2d, layer.weight, layer.weight_scale, output, bias
             )
             return output.view(*x.shape[:-1], layer.output_size_per_partition)
 
-        qx, scale_x = fp8_per_token_dynamic_scaled(x_2d)
+        if prequant is not None:
+            qx, scale_x = prequant
+        else:
+            qx, scale_x = fp8_per_token_dynamic_scaled(x_2d)
         scale_w = layer.weight_scale
         m = qx.shape[0]
         can_use_gemm = getattr(layer, "_can_use_gemm", False)

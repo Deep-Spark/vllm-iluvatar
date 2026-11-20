@@ -50,6 +50,7 @@ viable block-FP8 dense path.
 
 from __future__ import annotations
 
+import threading
 from typing import ClassVar
 
 import torch
@@ -76,30 +77,53 @@ _is_ivcore30_fn = is_ivcore30
 # norm kernel's bandwidth. Keyed by storage ``data_ptr`` (which survives the
 # ``apply_weights`` ``x.view(-1, K)``); validated by shape + dtype and read
 # without popping so one hidden state can feed several fp8 GEMMs.
-_PREQUANT: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+_PREQUANT_LOCAL = threading.local()
+
+
+def _prequant_table() -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+    table = getattr(_PREQUANT_LOCAL, "entries", None)
+    if table is None:
+        table = {}
+        _PREQUANT_LOCAL.entries = table
+    return table
 
 
 def register_activation_prequant(
     a: torch.Tensor, a_fp8: torch.Tensor, a_scale: torch.Tensor
 ) -> None:
     """Hand ``apply_block_scaled_mm`` a ready per-token quant for ``a``."""
-    _PREQUANT[a.data_ptr()] = (a_fp8, a_scale)
+    if a.is_contiguous() and a.dtype == torch.bfloat16:
+        _prequant_table()[a.data_ptr()] = (a_fp8, a_scale)
 
 
 def clear_activation_prequant() -> None:
     """Drop all registered pre-quants (call once the consumers have run)."""
-    _PREQUANT.clear()
+    table = getattr(_PREQUANT_LOCAL, "entries", None)
+    if table:
+        table.clear()
 
 
 def _lookup_activation_prequant(
     A: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    hit = _PREQUANT.get(A.data_ptr())
-    if hit is not None:
-        a_fp8, a_scale = hit
-        if a_fp8.shape == A.shape and a_scale.numel() == A.shape[0]:
-            return (a_fp8, a_scale)
-    return None
+    if not (A.is_contiguous() and A.dtype == torch.bfloat16):
+        return None
+    table = getattr(_PREQUANT_LOCAL, "entries", None)
+    hit = table.get(A.data_ptr()) if table else None
+    if hit is None:
+        return None
+    a_fp8, a_scale = hit
+    if (
+        a_fp8.shape != A.shape
+        or a_scale.numel() != A.shape[0]
+        or a_fp8.device != A.device
+    ):
+        return None
+    if A.is_cuda and not torch.cuda.is_current_stream_capturing():
+        stream = torch.cuda.current_stream(A.device)
+        a_fp8.record_stream(stream)
+        a_scale.record_stream(stream)
+    return (a_fp8, a_scale)
 
 
 def _e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:

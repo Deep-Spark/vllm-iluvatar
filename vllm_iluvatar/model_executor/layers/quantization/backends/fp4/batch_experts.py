@@ -88,7 +88,6 @@ class IluMoEBatchedExpertsFp8(BaseBatchExperts):
     ) -> torch.Tensor:
         del (
             topk_weights,
-            topk_ids,
             global_num_experts,
             expert_map,
             a2_scale,
@@ -159,6 +158,19 @@ class IluMoEBatchedExpertsFp8(BaseBatchExperts):
             ),
         )
 
+        # The GLM-5.3-Flash layout benefits from GEMV for small batches.
+        # Bound the live rows by the per-dispatcher router input size.
+        gemm_mode = 0
+        if (
+            hidden_size == 4096
+            and getattr(self.moe_config, "num_logical_experts", self.moe_config.num_experts) == 288
+            and topk_ids is not None
+            and topk_ids.ndim == 2
+            and topk_ids.shape[1] == 8
+            and 0 < topk_ids.shape[0] * self.num_dispatchers <= 256
+        ):
+            gemm_mode = 1
+
         # ix30-packed w1 is [expert, k/2, 2 * intermediate].
         inter_x2 = w1.shape[2]
         gemm1_output = ixff.group_gemm_fp4(
@@ -168,6 +180,7 @@ class IluMoEBatchedExpertsFp8(BaseBatchExperts):
             scale_weight=self.w1_scale,
             group_layout=group_layout,
             output=self._scratch("gemm1", (rows, inter_x2), torch.bfloat16, device),
+            mode=gemm_mode,
             backend="ixmm",
         )
 
@@ -197,6 +210,7 @@ class IluMoEBatchedExpertsFp8(BaseBatchExperts):
             scale_weight=self.w2_scale,
             group_layout=group_layout,
             output=output_2d,
+            mode=gemm_mode,
             backend="ixmm",
         )
         return output

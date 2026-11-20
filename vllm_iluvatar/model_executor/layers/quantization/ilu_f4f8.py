@@ -9,12 +9,20 @@ import torch
 from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
+    FusedMoEActivationFormat,
     FusedMoEMethodBase,
     RoutedExperts,
     SharedExperts,
 )
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEQuantConfig,
+    mxfp4_w4a8_moe_quant_config,
+)
+from vllm.model_executor.layers.fused_moe.modular_kernel import (
+    FusedMoEExpertsModular,
+    FusedMoEPrepareAndFinalizeModular,
+)
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
@@ -293,7 +301,55 @@ class IluF4F8MoEMethod(FusedMoEMethodBase):
     def get_fused_moe_quant_config(
         self, layer: RoutedExperts
     ) -> FusedMoEQuantConfig | None:
-        return None
+        from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe import (
+            _resolve_fp8_moe_activation,
+        )
+
+        _, _, clamp_limit = _resolve_fp8_moe_activation(layer)
+        return mxfp4_w4a8_moe_quant_config(
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            gemm1_clamp_limit=clamp_limit,
+        )
+
+    def select_gemm_impl(
+        self,
+        prepare_finalize: FusedMoEPrepareAndFinalizeModular,
+        layer: RoutedExperts,
+    ) -> FusedMoEExpertsModular:
+        from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.batch_experts import (
+            IluMoEBatchedExpertsFp8,
+        )
+        from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe import (
+            _shrink_ll_max_tokens_to_decode,
+        )
+        from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.nvfp4_moe import (
+            _get_ilu_output_scale,
+        )
+
+        if (
+            prepare_finalize.activation_format
+            != FusedMoEActivationFormat.BatchedExperts
+        ):
+            raise NotImplementedError(
+                "IluMoEBatchedExpertsFp8 requires the batched activation format, "
+                f"got {prepare_finalize.activation_format}"
+            )
+        _shrink_ll_max_tokens_to_decode(prepare_finalize)
+        max_num_tokens = prepare_finalize.max_num_tokens_per_rank()
+        if max_num_tokens is None:
+            raise ValueError("batched FP8 experts require max_num_tokens")
+        if self.moe_quant_config is None:
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        assert self.moe_quant_config is not None
+        return IluMoEBatchedExpertsFp8(
+            moe_config=self.moe,
+            quant_config=self.moe_quant_config,
+            max_num_tokens=max_num_tokens,
+            num_dispatchers=prepare_finalize.num_dispatchers(),
+            swiglu_limit=self.moe_quant_config.gemm1_clamp_limit,
+            runner_scaling_factor=_get_ilu_output_scale(layer),
+        )
 
     def apply(
         self,

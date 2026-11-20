@@ -29,7 +29,6 @@ _FACADE_MODULES = {
     "sparse_gqa_fp8_workspace_size": "ixformer.inference.functions.models.step5.attention.fp8.sparse_gqa_fp8",
 }
 
-
 def _is_cuda(vllm_config):
     device = vllm_config.device_config
     return device.device_type == "cuda"
@@ -65,10 +64,10 @@ def _native_requirements(vllm_config, *, draft):
     else:
         # Target Step5 requires MoE; checkpoint exception layers can remain
         # unquantized even when the other experts use the online FP4 method.
+        # gemv_bf16_bf16_fp32 is ivcore30-only and validated separately below.
         ops.update(
             (
                 "residual_add",
-                "gemv_bf16_bf16_fp32",
                 "moe_swiglu",
             )
         )
@@ -152,11 +151,12 @@ def validate_step5_runtime(vllm_config, *, draft=False):
         arch = _cuda_arch()
     except (ImportError, OSError) as exc:
         raise RuntimeError(
-            f"Step5 {role} requires an ivcore30 native extension: {exc}"
+            f"Step5 {role} requires an ivcore30 or ivcore11 native extension: {exc}"
         ) from exc
-    if arch != "ivcore30":
+    if arch not in ("ivcore30", "ivcore11"):
         raise RuntimeError(
-            f"Step5 {role} GPU execution requires ivcore30; detected {arch!r}. "
+            f"Step5 {role} GPU execution requires ivcore30 or ivcore11; "
+            f"detected {arch!r}. "
             "Disabling sparse attention does not remove this requirement."
         )
     try:
@@ -182,13 +182,15 @@ def validate_step5_runtime(vllm_config, *, draft=False):
                 or registry.resolve("sparse_gqa_fp8", "ixattn") != "ixattn"
             ):
                 raise RuntimeError("missing Step5 ixattn split backend")
-    if not draft:
-        _ = functions.per_channel_gemv_bf16_fp8_bf16
-        if (
-            registry.resolve("per_channel_gemv_bf16_fp8_bf16", "ixformer_perf")
-            != "ixformer_perf"
+    # ivcore30-only GEMV paths. ivcore11 router uses gemm_bf16 TN instead.
+    if not draft and arch == "ivcore30":
+        for op, backend in (
+            ("gemv_bf16_bf16_fp32", "ixformer_native"),
+            ("per_channel_gemv_bf16_fp8_bf16", "ixformer_perf"),
         ):
-            raise RuntimeError("Step5 fused BF16/FP8 GEMV backend unavailable")
+            _ = getattr(functions, op)
+            if registry.resolve(op, backend) != backend:
+                raise RuntimeError(f"Step5 {op} backend unavailable")
     for op in ops:
         try:
             for label, namespace in (

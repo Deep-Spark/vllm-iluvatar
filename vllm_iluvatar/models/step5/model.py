@@ -58,8 +58,20 @@ from .native_layers import Step5GateLinear, Step5VocabParallelEmbedding
 from .runtime_contract import validate_step5_runtime
 
 
+# Compressed-tensors attention always allocates these. Zero points are unused.
+# Scales are checkpoint weights only for a quantized KV cache.
+_ATTN_KV_PLACEHOLDERS = (
+    "q_scale",
+    "k_scale",
+    "v_scale",
+    "prob_scale",
+    "q_zero_point",
+    "k_zero_point",
+    "v_zero_point",
+)
+
+
 def _checkpoint_parameter_audit(model: nn.Module) -> tuple[set[str], list[str]]:
-    from vllm.model_executor.layers.quantization.kv_cache import KVCacheScaleParameter
     from vllm.utils.torch_utils import is_quantized_kv_cache
 
     expected, exemptions = (set(), [])
@@ -67,13 +79,15 @@ def _checkpoint_parameter_audit(model: nn.Module) -> tuple[set[str], list[str]]:
         if getattr(param, "ilu_derived_at_load", False):
             exemptions.append(name)
             continue
-        if isinstance(param, KVCacheScaleParameter):
-            parent_name, leaf = name.rsplit(".", 1)
-            parent = model.get_submodule(parent_name)
-            if leaf in ("q_scale", "k_scale", "v_scale", "prob_scale") and (
-                not is_quantized_kv_cache(parent.kv_cache_dtype)
-                or getattr(parent, "_ilu_step5_external_fp8_scales", False)
-            ):
+        parent_name, _, leaf = name.rpartition(".")
+        parent = model.get_submodule(parent_name) if parent_name else model
+        kv_dtype = getattr(parent, "kv_cache_dtype", None)
+        if leaf in _ATTN_KV_PLACEHOLDERS and kv_dtype is not None:
+            external = getattr(parent, "_ilu_step5_external_fp8_scales", False)
+            quantized = is_quantized_kv_cache(kv_dtype)
+            # Zero-points are never checkpointed. Scales are only required when
+            # the attention module stores a quantized KV cache locally.
+            if leaf.endswith("_zero_point") or (not quantized) or external:
                 exemptions.append(name)
                 continue
         expected.add(name)
@@ -221,7 +235,11 @@ class Step5Attention(IluStep3p5Attention):
         qk_norm_cls = Step5QKRMSNorm if self.head_dim == 192 else Step5RMSNorm
         self.q_norm = qk_norm_cls(self.head_dim, config.rms_norm_eps)
         self.k_norm = qk_norm_cls(self.head_dim, config.rms_norm_eps)
-        self.attn._ilu_step5_native_decode = True
+        # BF16 paged_decode / multi_query_swa are registered for ivcore11 and
+        # ivcore30 in ixformer; dense decode uses the native path on both.
+        from vllm_iluvatar.ilu_util.arch import cuda_arch
+
+        self.attn._ilu_step5_native_decode = cuda_arch() in ("ivcore11", "ivcore30")
         # SWA FP8 KV has no checkpoint q/k/v/prob_scale; use unit scales via
         # IluFlashAttention._forward_fp8 (same contract as sparse full-attn).
         if fp8_swa:
@@ -308,6 +326,15 @@ class Step5Attention(IluStep3p5Attention):
             and (envs.VLLM_ILU_STEP5_SPARSE_ATTENTION)
         )
         if self.sparse_enabled:
+            from vllm_iluvatar.ilu_util.arch import cuda_arch, is_ivcore30
+
+            if not is_ivcore30():
+                raise RuntimeError(
+                    "Step5 sparse FP8 attention requires sparse_gqa_fp8 and "
+                    "indexer_scores, which this ixformer build does not provide "
+                    f"on {cuda_arch()}. "
+                    "Disable VLLM_ILU_STEP5_SPARSE_ATTENTION to use dense GQA."
+                )
             if self.head_dim != 192 or num_kv_heads != 4:
                 raise ValueError(
                     "Step5 sparse attention requires D192 and four KV providers"
@@ -941,7 +968,7 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
         paired = getattr(self.model, "_online_expert_loader", None)
         if paired is not None:
             paired.finalize()
-        expected, _ = _checkpoint_parameter_audit(self)
+        expected, exemptions = _checkpoint_parameter_audit(self)
         missing = expected - loaded
         if missing:
             raise ValueError(
@@ -950,8 +977,11 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
         for layer in self.model.layers[self.model.start_layer : self.model.end_layer]:
             if layer.use_moe:
                 layer.moe.gate.prepare_native_weights()
+        exempt = set(exemptions)
         cpu_parameters = [
-            name for name, param in self.named_parameters() if not param.is_cuda
+            name
+            for name, param in self.named_parameters()
+            if not param.is_cuda and name not in exempt
         ]
         if cpu_parameters:
             raise RuntimeError(

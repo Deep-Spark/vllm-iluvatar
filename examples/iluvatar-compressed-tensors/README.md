@@ -13,7 +13,7 @@
 | `minimax/` | MiniMax M2.5、M2.7、M3、M3.1-Flash |
 | `moonshot/` | Kimi K2.5 |
 | `qwen/` | Qwen2、Qwen3 及现有变体 |
-| `stepfun/` | Step 3.5、3.7 |
+| `stepfun/` | Step 3.5、3.7、5 |
 | `tencent/` | HY3、HY4 |
 | `zhipu/` | GLM 5.2 |
 

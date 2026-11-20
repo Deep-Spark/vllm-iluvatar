@@ -16,15 +16,21 @@ def test_real_kv_placeholders_follow_cache_contract(cache_dtype):
     root.weight = torch.nn.Parameter(torch.ones(2))
     for name in ("q_scale", "k_scale", "v_scale", "prob_scale"):
         setattr(root.attn, name, KVCacheScaleParameter())
+    for name in ("q_zero_point", "k_zero_point", "v_zero_point"):
+        setattr(root.attn, name, torch.nn.Parameter(torch.zeros(1)))
     expected, exemptions = _checkpoint_parameter_audit(root)
     assert "weight" in expected
     scales = {
         f"attn.{name}" for name in ("q_scale", "k_scale", "v_scale", "prob_scale")
     }
+    zeros = {
+        f"attn.{name}"
+        for name in ("q_zero_point", "k_zero_point", "v_zero_point")
+    }
     if cache_dtype == "auto":
-        assert set(exemptions) == scales and expected == {"weight"}
+        assert set(exemptions) == scales | zeros and expected == {"weight"}
     else:
-        assert not exemptions and expected == scales | {"weight"}
+        assert set(exemptions) == zeros and expected == scales | {"weight"}
 
 
 def test_same_scale_names_are_not_a_blanket_exemption():

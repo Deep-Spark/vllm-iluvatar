@@ -210,7 +210,10 @@ class Step5MTP(_Step3p5MTP):
         return name
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loaded = super().load_weights(weights)
+        # Draft construction clears quant_config (BF16 dense MTP). W4A8 kits still
+        # store INT8 dense linears + weight_scale for layers 92–94; fold those into
+        # BF16 before the community Step3.5 MTP loader runs.
+        loaded = super().load_weights(_dequant_w8a8_dense_mtp_weights(weights))
         expected, _ = _checkpoint_parameter_audit(self)
         missing = expected - loaded
         if missing:
@@ -218,6 +221,46 @@ class Step5MTP(_Step3p5MTP):
                 f"Step5 MTP checkpoint parameters not loaded: {sorted(missing)}"
             )
         return loaded
+
+
+def _dequant_w8a8_dense_mtp_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Fold INT8 + weight_scale MTP dense tensors into BF16 for the draft.
+
+    Only layers 92–94 are rewritten. Other checkpoint tensors pass through
+    unchanged so MoE / target-only W8A8 shards are not reinterpreted here.
+    """
+    materialised = list(weights)
+    by_name = {name: tensor for name, tensor in materialised}
+    dequanted: dict[str, torch.Tensor] = {}
+    drop: set[str] = set()
+    for name, scale in materialised:
+        if not name.endswith(".weight_scale"):
+            continue
+        if not any(f".layers.{index}." in name for index in (92, 93, 94)):
+            continue
+        weight_name = name[: -len("weight_scale")] + "weight"
+        weight = by_name.get(weight_name)
+        if weight is None or weight.dtype != torch.int8:
+            continue
+        try:
+            torch.broadcast_shapes(weight.shape, scale.shape)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Step5 MTP W8A8 dequant shape mismatch for {weight_name}: "
+                f"weight {tuple(weight.shape)} vs scale {tuple(scale.shape)}"
+            ) from exc
+        dq = weight.to(torch.float32) * scale.to(dtype=torch.float32)
+        dequanted[weight_name] = dq.to(torch.bfloat16)
+        drop.add(name)
+        drop.add(weight_name)
+    for name, tensor in materialised:
+        if name in drop:
+            if name in dequanted:
+                yield name, dequanted[name]
+            continue
+        yield name, tensor
 
 
 def register_model():

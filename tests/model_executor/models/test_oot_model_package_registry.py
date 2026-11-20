@@ -22,12 +22,16 @@ _MIGRATED_MODEL_PACKAGES = {
     ],
     "vllm_iluvatar.models.deepseek_v4": [
         (
-            "IluDeepseekV4ForCausalLM",
-            "vllm_iluvatar.models.deepseek_v4.model:IluDeepseekV4ForCausalLM",
+            "DeepseekV4ForCausalLM",
+            "vllm_iluvatar.models.deepseek_v4.model:IluDeepseekV4Fp8ForCausalLM",
         ),
         (
-            "IluDeepSeekV4MTPModel",
-            "vllm_iluvatar.models.deepseek_v4.mtp:IluDeepSeekV4MTP",
+            "DeepSeekV4MTPModel",
+            "vllm_iluvatar.models.deepseek_v4.mtp:IluDeepseekV4Fp8MTP",
+        ),
+        (
+            "DSparkDraftModel",
+            "vllm_iluvatar.models.deepseek_v4.dspark:IluDSparkDeepseekV4Fp8ForCausalLM",
         ),
     ],
     "vllm_iluvatar.models.glm_moe_dsa": [
@@ -73,10 +77,6 @@ _MIGRATED_MODEL_PACKAGES = {
 }
 
 
-def _register_hook_module(package_name: str) -> str:
-    return f"{package_name}.model"
-
-
 def test_migrated_model_packages_are_explicitly_discovered():
     for package in _MIGRATED_MODEL_PACKAGES:
         assert package in ilu_register._OOT_MODEL_PACKAGES
@@ -88,7 +88,7 @@ def test_migrated_model_packages_are_explicitly_discovered():
     ids=list(_MIGRATED_MODEL_PACKAGES),
 )
 def test_migrated_model_package_exposes_register_model_hook(package_name: str):
-    model_module = importlib.import_module(_register_hook_module(package_name))
+    model_module = importlib.import_module(f"{package_name}.model")
 
     assert callable(model_module.register_model)
 
@@ -113,7 +113,7 @@ def test_migrated_model_register_model_points_at_plugin_paths(
         lambda arch, path: calls.append((arch, path)),
     )
 
-    model_module = importlib.import_module(_register_hook_module(package_name))
+    model_module = importlib.import_module(f"{package_name}.model")
     model_module.register_model()
 
     for call, expected_call in zip(calls, expected_calls):

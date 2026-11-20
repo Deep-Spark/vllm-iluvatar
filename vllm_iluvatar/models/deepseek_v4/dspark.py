@@ -1,24 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DSpark draft model for the iluvatar W4A8 DeepSeek-V4.
+"""DSpark draft model for the iluvatar *raw FP8* DeepSeek-V4.
 
-Ilu counterpart of :mod:`vllm.models.deepseek_v4.nvidia.dspark`. DSpark drafts
-a whole block in one parallel (non-causal) pass, then a low-rank Markov head
-injects intra-block dependency during sequential sampling.
+Wired against :mod:`.model` / :mod:`.fp8_attention`, the same way :mod:`.mtp` is.
 
-Differences from the nvidia draft:
+DSpark drafts a whole block in one parallel (non-causal) pass, then a low-rank
+Markov head injects intra-block dependency during sequential sampling. The
+proposer-facing interface is ``combine_hidden_states`` / ``forward`` /
+``compute_logits`` / ``markov_*`` / ``precompute_and_store_context_kv`` /
+``get_draft_kv_cache_layer_names``.
 
-* the backbone layer is :class:`IluDeepseekV4DecoderLayer`, whose ``forward``
-  returns a single tensor (hc_post is applied inline), so the nvidia 4-tuple
-  unpack and explicit ``mhc_post_tilelang`` call are dropped;
-* ``hc_head`` uses ``ixfops.hc_head`` instead of the tilelang kernel;
-* the offline converter already writes ``.weight_scale``, so the nvidia
-  ``.scale`` rewrite is removed; ilu renames (``shared_experts.w2`` ->
-  ``down_proj``, ``ffn.gate.bias`` -> ``e_score_correction_bias``) are applied
-  exactly as in :mod:`.mtp`;
-* constructor prefixes use ``layers.{num_hidden_layers + i}`` so
-  ``extract_layer_index`` yields ``compress_ratio = 1``, but the
-  ``nn.ModuleList`` parameter path is still ``model.layers.{i}`` (0/1/2),
-  matching community nvidia/amd/xpu DSpark loaders — not the MTP offset.
+Notable points:
+
+* the backbone layer is :class:`IluDeepseekV4Fp8DecoderLayer`, constructed
+  without an ``aux_stream_dict`` (FP8 attention takes no aux streams -- same as
+  :mod:`.mtp`);
+* the MLA wrapper is reached through :func:`_mla_wrapper` rather than a fixed
+  path: ``model._build_attention`` picks the attention stack by
+  architecture, and ``IluDeepseekV4Fp8Attention`` (ivcore30) *is* the wrapper
+  while ``IluDeepseekV4Attention`` (ivcore11) keeps it at ``.mla_attn``.
+  ``precompute_and_store_context_kv`` / ``get_draft_kv_cache_layer_names`` go
+  through it, as does :func:`_kv_cache_dtype`;
+* ``load_weights`` applies the raw-FP8 ``.scale`` rewrite (``.weight_scale`` for
+  E8M0 routed-expert scales, ``.weight_scale_inv`` for every other block-FP8
+  scale), the E8M0 ``view(uint8)`` bitcast, and the shared-expert intermediate
+  pad -- all as in :mod:`.mtp` -- on top of the DSpark ``mtp.{i}.*`` name remap.
 """
 
 from __future__ import annotations
@@ -30,7 +35,6 @@ from typing import cast
 import ixformer.inference.functions as ixfops  # type: ignore[import]
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -49,12 +53,16 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.platforms import current_platform
-from vllm.utils.multi_stream_utils import EventType
+from vllm.utils.math_utils import cdiv
 
-from .model import IluDeepseekV4DecoderLayer
+from .model import IluDeepseekV4Fp8DecoderLayer
 
 logger = init_logger(__name__)
 
+# MoE expert scales land on the MXFP4 MoE method's ``w{1,2,3}_weight_scale``;
+# every other block-FP8 linear scale is the ``weight_scale_inv`` companion.
+# Same rule as mtp / model's ``_make_fp8_weights_mapper``.
+_EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 _MTP_RE = re.compile(r"mtp\.(\d+)\.(.*)")
 
 # Head-stack params live at model level; everything else is a decoder block.
@@ -65,21 +73,6 @@ _HEAD_PREFIXES = (
     "hc_head_scale",
     "markov_head.",
 )
-
-
-def _local_vocab_weight(
-    weight: torch.Tensor, vocab_start: int, local_vocab_size: int
-) -> torch.Tensor:
-    """Return this TP rank's rows from a local or replicated vocab weight."""
-    if weight.shape[0] == local_vocab_size:
-        return weight
-    vocab_end = vocab_start + local_vocab_size
-    if vocab_start < 0 or vocab_end > weight.shape[0]:
-        raise ValueError(
-            "Cannot select local vocabulary rows "
-            f"[{vocab_start}:{vocab_end}] from weight shape {tuple(weight.shape)}."
-        )
-    return weight.narrow(0, vocab_start, local_vocab_size)
 
 
 def remap_dspark_name(name: str, num_hidden_layers: int) -> str | None:
@@ -109,11 +102,9 @@ def remap_dspark_name(name: str, num_hidden_layers: int) -> str | None:
     return f"model.layers.{stage}.{rest}"
 
 
-class IluDSparkDeepseekV4Model(nn.Module):
-    """Iluvatar DeepSeek-V4 backbone used by the DSpark draft."""
+class IluDSparkDeepseekV4Fp8Model(nn.Module):
+    """Iluvatar FP8 DeepSeek-V4 backbone used by the DSpark draft."""
 
-    # Ported from vllm/models/deepseek_v4/nvidia/dspark.py:57-198 at
-    # v0.31.0 (db9527a468), with the Iluvatar substitutions documented above.
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None
@@ -148,16 +139,15 @@ class IluDSparkDeepseekV4Model(nn.Module):
             dtype=torch.int32,
             device=current_platform.device_type,
         )
-        aux_stream_dict = {EventType.Attention: torch.cuda.Stream()}
 
         current_vllm_config = get_current_vllm_config()
+        # FP8 decoder layer: no aux_stream_dict (fp8 attention takes none).
         self.layers = nn.ModuleList(
             [
-                IluDeepseekV4DecoderLayer(
+                IluDeepseekV4Fp8DecoderLayer(
                     current_vllm_config,
                     maybe_prefix(prefix, f"layers.{self.num_hidden_layers + i}"),
                     topk_indices_buffer=self.topk_indices_buffer,
-                    aux_stream_dict=aux_stream_dict,
                 )
                 for i in range(self.num_dspark_layers)
             ]
@@ -195,23 +185,13 @@ class IluDSparkDeepseekV4Model(nn.Module):
         context_positions: torch.Tensor,
         context_slot_mappings: torch.Tensor | list[torch.Tensor | None] | None = None,
     ) -> None:
-        # Mirror attention.py:788-904 (wrapper.forward + attention_impl):
-        # fused_wqa_wkv -> split -> rms_norm_qk, then SWA insert. Using the
-        # fused norm (not a standalone kv_norm call) keeps context KV
-        # byte-identical to what the target's own forward would write.
-        #
-        # Some callers pass one shared 1D slot mapping. V2 may pass a
-        # per-layer list when draft layers use different cache groups.
         for i, layer in enumerate(self.layers):
             slot_mapping = (
                 context_slot_mappings[i]
                 if isinstance(context_slot_mappings, list)
                 else context_slot_mappings
             )
-            # layer.attn is IluDeepseekV4Attention; the wrapper that owns
-            # swa_cache_layer / rotary_emb / fused projections is one level
-            # down (same object the MTP loader reaches as attn.mla_attn.*).
-            attn = layer.attn.mla_attn
+            attn = _mla_wrapper(layer.attn)
             qr_kv, _ = attn.fused_wqa_wkv(main_x)
             qr, kv = qr_kv.split([attn.q_lora_rank, attn.head_dim], dim=-1)
             _, kv = ixfops.rms_norm_qk(
@@ -246,15 +226,37 @@ class IluDSparkDeepseekV4Model(nn.Module):
         )
 
 
+def _mla_wrapper(attn: nn.Module) -> nn.Module:
+    """The module owning ``swa_cache_layer`` and the pre-attention projections.
+
+    ``model._build_attention`` picks the attention stack by architecture and
+    the two put these in different places. :class:`IluDeepseekV4Fp8Attention`
+    (ivcore30) is flat and owns them itself; :class:`IluDeepseekV4Attention`
+    (ivcore11) keeps them on its inner MLA wrapper, one level down.
+    """
+    return getattr(attn, "mla_attn", attn)
+
+
+def _kv_cache_dtype(attn: nn.Module) -> str:
+    """``kv_cache_dtype`` of the module ``_mla_wrapper`` returned.
+
+    The flat fp8 attention records it on itself; the ivcore11 wrapper leaves it
+    on *its* inner :class:`IluDeepseekV4MLAAttention`.
+    """
+    dtype = getattr(attn, "kv_cache_dtype", None)
+    return dtype if dtype is not None else attn.mla_attn.kv_cache_dtype
+
+
 def _insert_context_kv(
     attn: nn.Module,
     kv: torch.Tensor,
     positions: torch.Tensor,
     slot_mapping: torch.Tensor,
 ) -> None:
-    """Insert precomputed context KV into one draft layer's SWA cache."""
-    # Mirrors attention.py:998-1024. Unlike that in-forward path, the proposer
-    # supplies slot_mapping explicitly because no attention metadata is bound.
+    """Insert precomputed context KV into one draft layer's SWA cache.
+
+    ``attn`` is what :func:`_mla_wrapper` returned, not ``layer.attn``.
+    """
     swa_kv_cache = attn.swa_cache_layer.kv_cache
     block_size = attn.swa_cache_layer.block_size
     dummy_q = torch.zeros(
@@ -264,7 +266,7 @@ def _insert_context_kv(
         dtype=kv.dtype,
         device=kv.device,
     )
-    if attn.mla_attn.kv_cache_dtype == "fp8_ds_mla":
+    if _kv_cache_dtype(attn) == "fp8_ds_mla":
         ixfops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
             dummy_q,
             kv,
@@ -288,21 +290,26 @@ def _insert_context_kv(
         )
 
 
-class IluDSparkDeepseekV4ForCausalLM(nn.Module):
-    """Iluvatar DeepSeek-V4 DSpark draft model with shared target heads."""
+class IluDSparkDeepseekV4Fp8ForCausalLM(nn.Module):
+    """Iluvatar FP8 DeepSeek-V4 DSpark draft model with shared target heads."""
 
     has_own_embed_tokens = False
     has_own_lm_head = False
     draft_id_to_target_id = None
 
-    # Ported from vllm/models/deepseek_v4/nvidia/dspark.py:268-344 at
-    # v0.31.0 (db9527a468), with the Iluvatar backbone and loader below.
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
-        self.model = IluDSparkDeepseekV4Model(
+        self.quant_config = vllm_config.quant_config
+        # Block-FP8 shared experts round the intermediate axis up to a whole
+        # number of TP shards, same as model / mtp.
+        self.pad_shared_expert = (
+            getattr(self.quant_config, "weight_block_size", None) is not None
+            and not vllm_config.parallel_config.use_sequence_parallel_moe
+        )
+        self.model = IluDSparkDeepseekV4Fp8Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         self.lm_head = ParallelLMHead(
@@ -343,8 +350,9 @@ class IluDSparkDeepseekV4ForCausalLM(nn.Module):
         return self.compute_logits(hidden_states)
 
     def _compute_local_logits(
-        self, lm_head: ParallelLMHead, hidden_states: torch.Tensor
+        self, lm_head, hidden_states: torch.Tensor
     ) -> torch.Tensor:
+        """TP-local logits: skip TP gather, just apply head + optional scale."""
         logits = self.logits_processor._apply_head(lm_head, hidden_states, None)
         if self.logits_processor.soft_cap is not None:
             soft_cap = self.logits_processor.soft_cap
@@ -354,13 +362,9 @@ class IluDSparkDeepseekV4ForCausalLM(nn.Module):
         return logits
 
     def compute_draft_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Compute TP-local draft logits (skip TP all-gather)."""
         hidden_states = self.model.norm(hidden_states)
         return self._compute_local_logits(self.lm_head, hidden_states)
-
-    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.logits_processor.get_top_tokens(
-            self.lm_head, self.model.norm(hidden_states)
-        )
 
     def get_draft_vocab_shard(self) -> tuple[int, int]:
         indices = self.lm_head.shard_indices
@@ -376,53 +380,53 @@ class IluDSparkDeepseekV4ForCausalLM(nn.Module):
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
 
     def markov_bias_local(self, markov_embed: torch.Tensor) -> torch.Tensor:
+        """TP-local Markov bias: only compute rows for this LM-head shard."""
+        import torch.nn.functional as F
+
         markov_w2 = self.model.markov_head.markov_w2
-        indices = self.lm_head.shard_indices
         local_vocab_size = self.lm_head.num_embeddings_per_partition
 
-        # DSparkMarkovHead replicates markov_w2 (disable_tp=True). Project only
-        # the rows belonging to this LM-head shard. Older layouts already shard
-        # markov_w2, so retain their normal quant/head-dtype-aware path.
         if markov_w2.weight.shape[0] == local_vocab_size:
             return self._compute_local_logits(markov_w2, markov_embed)
 
-        weight = _local_vocab_weight(
-            markov_w2.weight,
-            indices.org_vocab_start_index,
-            local_vocab_size,
-        )
-        head_dtype = self.logits_processor.head_dtype
-        if head_dtype is None or head_dtype == markov_embed.dtype:
-            logits = F.linear(markov_embed, weight)
-        elif (
-            head_dtype == torch.float32
-            and (current_platform.is_cuda() or current_platform.is_rocm())
-            and markov_embed.is_cuda
-        ):
-            flat = markov_embed.reshape(-1, markov_embed.shape[-1])
-            logits = torch.mm(flat, weight.t(), out_dtype=head_dtype)
-            logits = logits.reshape(*markov_embed.shape[:-1], -1)
-        else:
-            logits = F.linear(
-                markov_embed.to(head_dtype),
-                weight.to(head_dtype),
-            )
-        if self.logits_processor.soft_cap is not None:
-            soft_cap = self.logits_processor.soft_cap
-            logits = torch.tanh(logits / soft_cap) * soft_cap
+        indices = self.lm_head.shard_indices
+        weight = markov_w2.weight[
+            indices.org_vocab_start_index : indices.org_vocab_start_index
+            + local_vocab_size
+        ]
+        logits = F.linear(markov_embed, weight)
         if self.logits_processor.scale != 1.0:
             logits = logits * self.logits_processor.scale
         return logits
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [
-            layer.attn.mla_attn.swa_cache_layer.prefix for layer in self.model.layers
+            _mla_wrapper(layer.attn).swa_cache_layer.prefix
+            for layer in self.model.layers
         ]
 
+    def _pad_shared_expert_weight(
+        self, name: str, loaded_weight: torch.Tensor
+    ) -> torch.Tensor:
+        """Same pad as ``IluDeepseekV4Fp8Model._pad_shared_expert_weight``."""
+        block_size = getattr(self.quant_config, "weight_block_size", None)
+        assert block_size is not None
+        step = 1 if name.endswith("weight_scale_inv") else block_size[0]
+        dim = 1 if ".down_proj." in name else 0
+        mult = get_tensor_model_parallel_world_size() * step
+        pad = cdiv(loaded_weight.shape[dim], mult) * mult - loaded_weight.shape[dim]
+        if pad == 0:
+            return loaded_weight
+        pad_shape = list(loaded_weight.shape)
+        pad_shape[dim] = pad
+        return torch.cat([loaded_weight, loaded_weight.new_zeros(pad_shape)], dim=dim)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load the ``mtp.{0,1,2}.*`` weights embedded in the target checkpoint."""
-        # Copied from vllm_iluvatar/.../deepseek_v4/mtp.py:284-449, with
-        # only DSpark name resolution and strict parameter completeness changed.
+        """Load the ``mtp.{0,1,2}.*`` weights embedded in the FP8 target checkpoint.
+
+        Combines the DSpark name remap of :mod:`.dspark` with the raw-FP8 scale
+        handling of :mod:`.mtp`.
+        """
         stacked_params_mapping = [
             ("gate_up_proj", "w1", 0),
             ("gate_up_proj", "w3", 1),
@@ -445,12 +449,34 @@ class IluDSparkDeepseekV4ForCausalLM(nn.Module):
             ckpt_up_proj_name="w3",
             num_experts=self.config.n_routed_experts,
         )
+        # MXFP4 (expert_dtype=fp4) -> weight_scale; block-FP8 experts would
+        # use weight_scale_inv. Matches mtp / community nvidia MTP.
+        expert_scale_suffix = (
+            ".weight_scale"
+            if getattr(self.config, "expert_dtype", "fp4") == "fp4"
+            else ".weight_scale_inv"
+        )
 
         for name, loaded_weight in weights:
             mapped = remap_dspark_name(name, self.config.num_hidden_layers)
             if mapped is None:
                 continue
             name = mapped
+
+            # Raw-FP8 block scales arrive as ``.scale``; rewrite to the param
+            # name the linear / MoE method expects.
+            if name.endswith(".scale"):
+                suffix = (
+                    expert_scale_suffix
+                    if _EXPERT_SCALE_RE.search(name)
+                    else ".weight_scale_inv"
+                )
+                name = name.removesuffix(".scale") + suffix
+
+            if ".shared_experts.w2" in name:
+                name = name.replace(".shared_experts.w2", ".shared_experts.down_proj")
+            if self.pad_shared_expert and ".shared_experts." in name:
+                loaded_weight = self._pad_shared_expert_weight(name, loaded_weight)
 
             is_layer_param = name.startswith("model.layers.")
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -465,6 +491,12 @@ class IluDSparkDeepseekV4ForCausalLM(nn.Module):
                 break
             else:
                 if ".experts." in name:
+                    # E8M0 scales must be bitcast, not numerically converted.
+                    if (
+                        "weight_scale" in name
+                        and loaded_weight.dtype == torch.float8_e8m0fnu
+                    ):
+                        loaded_weight = loaded_weight.view(torch.uint8)
                     for mapping in expert_mapping:
                         param_name, weight_name, expert_id, expert_shard_id = mapping
                         if weight_name not in name:
@@ -490,10 +522,6 @@ class IluDSparkDeepseekV4ForCausalLM(nn.Module):
                     params_dict[name][:n].copy_(narrow_weight)
                     loaded_params.add(name)
                     continue
-                if ".shared_experts.w2" in name:
-                    name = name.replace(
-                        ".shared_experts.w2", ".shared_experts.down_proj"
-                    )
                 if name.endswith(".ffn.gate.bias"):
                     name = name.replace(
                         ".ffn.gate.bias",
@@ -513,9 +541,11 @@ class IluDSparkDeepseekV4ForCausalLM(nn.Module):
         if missing:
             preview = sorted(missing)[:20]
             raise ValueError(
-                "[IluDSparkDeepseekV4ForCausalLM.load_weights] "
+                "[IluDSparkDeepseekV4Fp8ForCausalLM.load_weights] "
                 f"{len(missing)} parameter(s) were not initialized from the "
                 "checkpoint. Showing up to 20:\n  " + "\n  ".join(preview)
             )
-        logger.info_once("ilu DSpark draft model loaded: %d params", len(loaded_params))
+        logger.info_once(
+            "ilu FP8 DSpark draft model loaded: %d params", len(loaded_params)
+        )
         return loaded_params

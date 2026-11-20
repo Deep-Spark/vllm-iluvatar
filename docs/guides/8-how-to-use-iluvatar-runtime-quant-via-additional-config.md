@@ -747,7 +747,7 @@ repeats=5、CPU governor performance），单位 ms：
 会拿到 `None`，于是 75 个 MoE 层的 `fuse_norm_quant` 全部静默变成 False，两个
 RMSNorm 都退回 split 路径，MoE 入口也从 `moe_expand_input_kernel_vec4` 退成
 `quant_expand`。这条路径不报错、不打日志，只在 eager ixsys trace 里看得出来
-（约 +290 µs/step），最终表现为约 1.5% 的回退。`fp8_model._consumer_quant_method`
+（约 +290 µs/step），最终表现为约 1.5% 的回退。`deepseek_v4/model.py` 的 `_consumer_quant_method`
 负责解析这层间接，解析不出 method 时直接抛错而不是当成"不支持"。
 
 #### 8.6.2 三类加载契约
@@ -776,7 +776,7 @@ staging 只有单层大小，用 `weight_load` 只会换来重写 loader 的复�
 两份不同的 YAML，不能靠一份配置兼容。
 
 `indexer.wk` 不在任何 group 里。它在 FP8 盘上是 block-FP8、在离线 NN 盘上是
-BF16，`fp8_model.dequant_indexer_wk` 已经在权重流里把它折叠成 BF16，
+BF16，`deepseek_v4/model.py` 的 `dequant_indexer_wk` 已经在权重流里把它折叠成 BF16，
 与离线布局一致；它在运行时的模块是与 `weights_proj` 融合后的
 `indexer.wk_weights_proj`，没有 scale 槽位。
 

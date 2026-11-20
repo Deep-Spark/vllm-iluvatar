@@ -46,7 +46,7 @@
 
 ## 2. 命名与目录约定
 
-- **arch 命名**：registry key 使用"要让 checkpoint 命中的名字"。已有社区 arch 时优先复用社区名（如 `DeepseekV4ForCausalLM` → `IluDeepseekV4ForCausalLM`）；新增架构时再使用 `IluXXXForCausalLM`。MTP draft 同理，优先使用稳定的模型语义名（如 `DeepseekV32MTPModel`、`DeepSeekV4MTPModel`），不强制带 `Ilu`。
+- **arch 命名**：registry key 使用"要让 checkpoint 命中的名字"。已有社区 arch 时优先直接注册社区名、覆盖社区实现（如 `deepseek_v4` 注册 `DeepseekV4ForCausalLM`），这样 checkpoint 的 `config.json` 不用改，`tokenizer_mode` 等按社区名生效的推断也能继续命中；只有社区不存在该架构、或需要一个强制走特定实现的别名时，才使用 `IluXXXForCausalLM`。MTP draft 同理，优先使用稳定的模型语义名（如 `DeepseekV32MTPModel`、`DeepSeekV4MTPModel`），不强制带 `Ilu`。
 - **包命名**：`vllm_iluvatar/models/` 下的包名按模型/架构语义命名，尽量对齐 HF `model_type` 或社区包名，例如 `deepseek_v32`、`deepseek_v4`、`glm_moe_dsa`；不要用 `ilu_` 前缀作为包名。
 - **包布局**：每个天数模型是 `vllm_iluvatar/models/<model_type>/` 下的一个**多文件包**，布局对齐 `deepseek_v4`：
 

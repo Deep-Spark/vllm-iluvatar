@@ -24,6 +24,9 @@ def test_grouped_wo_a_keeps_bf16(
     monkeypatch, tp_size, preference, architecture, enabled
 ):
     monkeypatch.setattr(arch, "cuda_arch", lambda: architecture)
+    # setenv, not setattr: vllm_iluvatar.envs resolves names through module
+    # __getattr__, so monkeypatch would plant a real attribute and restore it
+    # as one, permanently shadowing the reader for every later test.
     monkeypatch.setenv("VLLM_ILU_DS41_GROUPED_INT8_O_PROJ", str(int(enabled)))
     monkeypatch.setattr(
         "vllm.distributed.get_tensor_model_parallel_world_size", lambda: tp_size

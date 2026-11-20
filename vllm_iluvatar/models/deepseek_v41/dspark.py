@@ -97,7 +97,7 @@ logger = init_logger(__name__)
 
 # MoE expert scales land on the MXFP4 MoE method's ``w{1,2,3}_weight_scale``;
 # every other block-FP8 linear scale is the ``weight_scale_inv`` companion.
-# Same rule as fp8_mtp / fp8_model's ``_make_fp8_weights_mapper``.
+# Same rule as deepseek_v4 mtp / model's ``_make_fp8_weights_mapper``.
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 
 
@@ -363,7 +363,7 @@ class IluDSparkV41DraftModel(nn.Module):
         if self.load_own_embed_tokens:
             self.has_own_embed_tokens = True
         # Block-FP8 shared experts round the intermediate axis up to a whole
-        # number of TP shards, same as fp8_model / fp8_mtp.
+        # number of TP shards, same as deepseek_v4 model / mtp.
         self.pad_shared_expert = (
             getattr(self.quant_config, "weight_block_size", None) is not None
             and not vllm_config.parallel_config.use_sequence_parallel_moe
@@ -534,7 +534,7 @@ class IluDSparkV41DraftModel(nn.Module):
             num_experts=self.config.dspark_n_routed_experts,
         )
         # MXFP4 (expert_dtype=fp4) -> weight_scale; block-FP8 experts would
-        # use weight_scale_inv. Matches fp8_mtp / community nvidia MTP.
+        # use weight_scale_inv. Matches deepseek_v4 mtp / community nvidia MTP.
         expert_scale_suffix = (
             ".weight_scale"
             if getattr(self.config, "expert_dtype", "fp4") == "fp4"

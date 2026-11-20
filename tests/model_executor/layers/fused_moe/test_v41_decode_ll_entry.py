@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from vllm_iluvatar.model_executor.layers.fused_moe import ilu_fused_moe_ep as ep
-from vllm_iluvatar.models.deepseek_v4.fp8_model import IluDeepseekV4Fp8MoE
+from vllm_iluvatar.models.deepseek_v4.model import IluDeepseekV4Fp8MoE
 
 
 @pytest.mark.parametrize("enabled,decode", [(False, True), (True, False), (True, True)])

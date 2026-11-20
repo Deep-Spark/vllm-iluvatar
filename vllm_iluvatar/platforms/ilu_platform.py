@@ -481,12 +481,12 @@ def _make_iluvatar_platform():
             if pc is not None and pc.worker_cls == "vllm.v1.worker.gpu_worker.Worker":
                 pc.worker_cls = "vllm_iluvatar.v1.worker.gpu_worker.IluWorker"
 
-            # Community ModelConfig only auto-selects the deepseek_v4 tokenizer
-            # for the upstream "DeepseekV4ForCausalLM" arch. The Iluvatar W4A8
-            # arch is OOT-registered under "IluDeepseekV4ForCausalLM", so set its
-            # tokenizer_mode here (runs in VllmConfig.__post_init__, before the
-            # tokenizer is built). V4.1's upstream name is "DeepseekV41ForCausalLM"
-            # (mode deepseek_v41); the W4A8 arch is "IluDeepseekV41ForCausalLM".
+            # Community ModelConfig auto-selects the deepseek_v4 tokenizer for
+            # the upstream "DeepseekV4ForCausalLM" arch, which the ilu V4 model
+            # keeps, so V4 needs nothing here. V4.1 does: its upstream name is
+            # "DeepseekV41ForCausalLM" (mode deepseek_v41) and the W4A8 arch is
+            # "IluDeepseekV41ForCausalLM", so set tokenizer_mode here (runs in
+            # VllmConfig.__post_init__, before the tokenizer is built).
             model_config = getattr(vllm_config, "model_config", None)
             if model_config is None:
                 return
@@ -501,19 +501,14 @@ def _make_iluvatar_platform():
                 archs = model_config.architectures or []
             except Exception:
                 archs = []
-            if model_config.tokenizer_mode == "auto":
-                if any(a in archs for a in _DSV41_ARCHS):
-                    model_config.tokenizer_mode = "deepseek_v41"
-                    logger.info(
-                        "ILU: set tokenizer_mode='deepseek_v41' for %s",
-                        archs,
-                    )
-                elif "IluDeepseekV4ForCausalLM" in archs:
-                    model_config.tokenizer_mode = "deepseek_v4"
-                    logger.info(
-                        "ILU: set tokenizer_mode='deepseek_v4' for "
-                        "IluDeepseekV4ForCausalLM"
-                    )
+            if model_config.tokenizer_mode == "auto" and any(
+                a in archs for a in _DSV41_ARCHS
+            ):
+                model_config.tokenizer_mode = "deepseek_v41"
+                logger.info(
+                    "ILU: set tokenizer_mode='deepseek_v41' for %s",
+                    archs,
+                )
             mm_config = getattr(model_config, "multimodal_config", None)
             if (
                 mm_config is not None

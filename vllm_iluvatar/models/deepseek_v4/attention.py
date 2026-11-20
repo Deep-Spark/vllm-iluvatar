@@ -58,8 +58,14 @@ from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.compressor import (
     CompressorMetadata,
@@ -839,6 +845,23 @@ class IluDeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self.wo_a.W,
                 activation_scales,
                 self.wo_a.W_scale,
+                output_dtype=o_view.dtype,
+            )
+        elif hasattr(self.wo_a, "W_int8_grouped"):
+            # Raw block-FP8 checkpoint requantised to grouped INT8
+            # (``IluDeepseekV41Fp8GroupedInt8Method``, the ivcore11 default).
+            # ``o`` comes out of the custom op already inverse-RoPE'd, so the
+            # method's fused ``apply_with_rope`` would rotate it twice; quantize
+            # per (token, group) here and hand it the rotated values.
+            o_i8, o_scales = ixfops.scaled_int8_quant(
+                o_view.view(num_tokens * self.n_local_groups, -1)
+            )
+            z = self.wo_a.quant_method.apply_quantized(
+                self.wo_a,
+                o_i8.view(num_tokens, self.n_local_groups, -1)
+                .transpose(0, 1)
+                .contiguous(),
+                o_scales.view(num_tokens, self.n_local_groups).t().contiguous(),
                 output_dtype=o_view.dtype,
             )
         elif hasattr(self.wo_a, "W_repacked"):
@@ -2674,3 +2697,201 @@ direct_register_custom_op(
     mutates_args=["out"],
     fake_impl=ilu_deepseek_v4_attention_fake,
 )
+
+
+class IluDeepseekV4Attention(nn.Module):
+    """Top-level attention for an ilu DeepSeek-V4 layer.
+
+    Wires the per-layer modules required by ``load_weights`` and delegates
+    to :class:`IluDeepseekV4MultiHeadLatentAttentionWrapper`.
+
+    This is the bf16-KV stack: the float ``mla_sparse`` / float compressor /
+    int8 indexer kernels, which is what ivcore11 has. The packed fp8 pipeline in
+    ``fp8_attention.py`` registers its sparse-MLA kernels for ivcore30 only and
+    silently falls back to ixformer's ``torch`` reference backend elsewhere, so
+    ``model._build_attention`` picks between the two by architecture.
+
+    The submodule names match :class:`IluDeepseekV4Fp8Attention` exactly, so a
+    checkpoint loads either way; only the compressor sits one level deeper here
+    (on the wrapper), which ``_make_v4_fp8_weights_mapper`` accounts for.
+    """
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str,
+        topk_indices_buffer: torch.Tensor | None = None,
+        aux_stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
+        layer_id = extract_layer_index(prefix)
+
+        self.layer_id = layer_id
+        self.hidden_size = config.hidden_size
+        self.n_heads = config.num_attention_heads
+        tp_size = get_tensor_model_parallel_world_size()
+        assert self.n_heads % tp_size == 0
+        self.n_local_heads = self.n_heads // tp_size
+
+        self.q_lora_rank = config.q_lora_rank
+        self.o_lora_rank = config.o_lora_rank
+        self.head_dim = config.head_dim
+        self.rope_head_dim = config.qk_rope_head_dim
+        self.nope_head_dim = self.head_dim - self.rope_head_dim
+        self.n_groups = config.o_groups
+        self.n_local_groups = self.n_groups // tp_size
+        self.window_size = config.sliding_window
+
+        if layer_id < config.num_hidden_layers:
+            self.compress_ratio = max(1, config.compress_ratios[layer_id])
+        else:
+            self.compress_ratio = 1
+        self.eps = config.rms_norm_eps
+        self.max_position_embeddings = config.max_position_embeddings
+
+        # Per-head sparse-MLA attn sink (ixformer kernels require
+        # `attn_sink.shape == [h_q]`; h_q == n_local_heads, no head padding).
+        # Init to -inf so a missing/partial load leaves the sink in the
+        # "no effect" state (an attended row with -inf sink behaves as if
+        # the sink weren't merged into the online softmax).
+        self.attn_sink = nn.Parameter(
+            torch.full((self.n_local_heads,), -float("inf"), dtype=torch.float32),
+            requires_grad=False,
+        )
+
+        self.fused_wqa_wkv = MergedColumnParallelLinear(
+            self.hidden_size,
+            [self.q_lora_rank, self.head_dim],
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.fused_wqa_wkv",
+            disable_tp=True,
+        )
+        self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
+        self.wq_b = ColumnParallelLinear(
+            self.q_lora_rank,
+            self.n_heads * self.head_dim,
+            bias=False,
+            quant_config=quant_config,
+            return_bias=False,
+            prefix=f"{prefix}.wq_b",
+        )
+        self.kv_norm = RMSNorm(self.head_dim, self.eps)
+        self.wo_a = ColumnParallelLinear(
+            self.n_heads * self.head_dim // self.n_groups,
+            self.n_groups * self.o_lora_rank,
+            bias=False,
+            quant_config=quant_config,
+            return_bias=False,
+            prefix=f"{prefix}.wo_a",
+        )
+        self.wo_a.is_bmm = True
+        self.wo_a.bmm_batch_size = self.n_local_groups
+        self.wo_b = RowParallelLinear(
+            self.n_groups * self.o_lora_rank,
+            self.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            # The W4A8 layer used to leave this unreduced and fold the TP
+            # all-reduce into ``allreduce_mhc_post``. The FP8 decoder layer that
+            # builds this class has no ``reduce_x`` on its ``hc_post``, so the
+            # linear reduces on its own.
+            reduce_results=True,
+            return_bias=False,
+            prefix=f"{prefix}.wo_b",
+        )
+        self.softmax_scale = self.head_dim**-0.5
+        # The compressed-tensors IluQuantConfig path doesn't carry scale_fmt;
+        # default to ue8m0 for forward-time helpers (stage 1 doesn't use it).
+        self.scale_fmt = (
+            (config.quantization_config or {}).get("scale_fmt", "ue8m0")
+            if isinstance(config.quantization_config, dict)
+            else "ue8m0"
+        )
+
+        rope_parameters = config.rope_parameters
+        rope_parameters["rope_theta"] = (
+            config.compress_rope_theta if self.compress_ratio > 1 else config.rope_theta
+        )
+        if config.rope_parameters["rope_type"] != "default":
+            config.rope_parameters["rope_type"] = (
+                "deepseek_yarn"
+                if config.rope_parameters.get("apply_yarn_scaling", True)
+                else "deepseek_llama_scaling"
+            )
+        rope_parameters["mscale"] = 0
+        rope_parameters["mscale_all_dim"] = 0
+        rope_parameters["is_deepseek_v4"] = True
+        rope_parameters["rope_dim"] = self.rope_head_dim
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            max_position=self.max_position_embeddings,
+            rope_parameters=rope_parameters,
+            is_neox_style=False,
+            dtype=config.torch_dtype,
+        )
+
+        self.indexer = None
+        if self.compress_ratio == 4:
+            self.indexer = IluDeepseekV4Indexer(
+                vllm_config,
+                config=config,
+                hidden_size=self.hidden_size,
+                q_lora_rank=self.q_lora_rank,
+                quant_config=quant_config,
+                cache_config=vllm_config.cache_config,
+                topk_indices_buffer=topk_indices_buffer,
+                compress_ratio=self.compress_ratio,
+                prefix=f"{prefix}.indexer",
+            )
+
+        mla_modules = IluDeepseekV4MLAModules(
+            vllm_config=vllm_config,
+            fused_wqa_wkv=self.fused_wqa_wkv,
+            q_norm=self.q_norm,
+            wq_b=self.wq_b,
+            kv_norm=self.kv_norm,
+            wo_a=self.wo_a,
+            wo_b=self.wo_b,
+            attn_sink=self.attn_sink,
+            rotary_emb=self.rotary_emb,
+            indexer=self.indexer,
+            indexer_rotary_emb=self.rotary_emb,
+            topk_indices_buffer=topk_indices_buffer,
+            aux_stream=aux_stream,
+        )
+        self.mla_attn = IluDeepseekV4MultiHeadLatentAttentionWrapper(
+            hidden_size=self.hidden_size,
+            num_heads=self.n_local_heads,
+            head_dim=self.head_dim,
+            scale=self.softmax_scale,
+            qk_nope_head_dim=self.nope_head_dim,
+            qk_rope_head_dim=self.rope_head_dim,
+            v_head_dim=self.head_dim,
+            q_lora_rank=self.q_lora_rank,
+            kv_lora_rank=self.head_dim,
+            o_lora_rank=self.o_lora_rank,
+            mla_modules=mla_modules,
+            window_size=self.window_size,
+            compress_ratio=self.compress_ratio,
+            cache_config=vllm_config.cache_config,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        llama_4_scaling: torch.Tensor | None,
+        fused_wqa_wkv_input: tuple[torch.Tensor, torch.Tensor, torch.dtype]
+        | None = None,
+    ):
+        return self.mla_attn(
+            positions,
+            hidden_states,
+            llama_4_scaling,
+            fused_wqa_wkv_input=fused_wqa_wkv_input,
+        )

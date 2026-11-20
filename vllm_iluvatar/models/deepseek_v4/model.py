@@ -1,84 +1,87 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Iluvatar DeepSeek-V4 W4A8 model.
+"""Iluvatar DeepSeek-V4-Flash model for the *raw FP8* checkpoint.
 
-Adapted from :mod:`vllm.model_executor.models.deepseek_v4`. The ilu fork
-diverges in three places:
+Three-layer module tree (``ForCausalLM`` / ``Model`` / ``DecoderLayer``), the
+MoE FFN (``IluDeepseekV4Fp8MoE``), the ``WeightsMapper`` that renames the
+checkpoint keys, weight-loading rules, Load_Verifier, and arch registration.
+This module registers no torch custom op.
 
-1. **Quantization scheme** - this model expects checkpoints converted by
-   ``my_tests/deepseek/deepseek-v4/convert_w4a8/convert_v4_to_w4a8.py``,
-   which write a fresh ``quantization_config`` block whose
-   ``quant_method == "compressed-tensors"`` (handled by
-   :class:`IluQuantConfig`). Only ``IluDeepseekV4ForCausalLM``
-   should be paired with that config; the upstream ``DeepseekV4ForCausalLM``
-   continues to handle the original FP4/FP8 layouts.
+Architecture
+------------
+Self-written model rather than subclassing community ``DeepseekV4Model`` /
+``DeepseekV4DecoderLayer`` because the community forwards are wired to the
+tilelang MHC kernels and the model allocates three aux streams at build time.
 
-2. **MegaMoE removed** - the deep-gemm MegaMoE path, its triton input
-   staging kernel, the bespoke expert params mapping and the
-   ``deepseek_v4_mega_moe_experts`` custom op are all gone. Only the
-   :class:`FusedMoE` route remains.
+* MHC uses ixformer kernels. Each sub-layer performs its own ``hc_post``;
+  supported decode batches fold RMSNorm into ``ds4_mhc_pre_v2``.
+* ``IluDeepseekV4Fp8MoE.forward``: native MXFP4 stays on the community
+  ``FusedMoE`` runner (``IluGateLinear``, ``ops.topk_hash_softplus_sqrt``,
+  ``IluMxfp4MoEMethod`` -> ``ilu_mxfp4_fused_experts()``). When
+  ``VLLM_ILU_DECODE_EP_BACKEND=deepep_low_latency`` and every rank is
+  decode-only, a method that implements ``select_gemm_impl`` (native MXFP4
+  included) takes ``forward_dp_ep_deep_ep`` instead. Runtime-converted W4A8
+  TN still uses ``forward_dp_ep`` for the whole DP + EP step.
+* The shared-expert activation is the community ``SiluAndMulWithClamp``, which
+  resolves to the plugin's OOT ``IluSiluAndMulWithClamp``.
 
-3. **Attention path** - imports :class:`IluDeepseekV4Indexer` /
-   :class:`IluDeepseekV4MLAModules` /
-   :class:`IluDeepseekV4MultiHeadLatentAttentionWrapper` from
-   :mod:`vllm_iluvatar.models.deepseek_v4.attention`. KV cache is
-   bf16 throughout (no ``fp8_ds_mla``).
+Weight loading
+--------------
+``IluDeepseekV4Fp8Model.load_weights`` holds the stacked / experts /
+``attn_sink`` main loop.  ``IluDeepseekV4Fp8ForCausalLM.load_weights`` wraps it
+with the Load_Verifier (statistics, unconsumed-tensor report, strict reverse
+check).  Tensor classification for the statistics lives in ``fp8_load_stats``.
 
-Registration: ``register_model()`` below is invoked by
-``vllm_iluvatar.ilu_register.apply_oot_registrations`` during register_general.
-It registers both the causal-LM arch and the MTP draft arch.
+Quantization-config constraint
+------------------------------
+``IluDeepseekV4Fp8MoE`` builds a community ``FusedMoE``, and which MoE method
+its routed experts get is decided entirely by ``vllm_config.quant_config``.  It
+has to be ``IluDeepseekV4FP8Config``
+(``layers/quantization/configs/deepseek/v4_fp8.py``, registered under the community
+name ``deepseek_v4_fp8``), which returns ``IluMxfp4MoEMethod``.  In production
+that is automatic: the checkpoint's ``quant_method="fp8"`` plus
+``model_type="deepseek_v4"`` resolve to ``deepseek_v4_fp8``, and the plugin's
+registration shadows the community class.
 
-The weights mapper accounts for three concrete differences vs upstream:
-
-- The offline converter renames ``.scale`` to ``.weight_scale`` already, so
-  the regex ``\\.scale$ -> .weight_scale_inv`` is dropped (vLLM's internal
-  parameter names for both W4A8 MoE and W8A8 Linear are ``weight_scale``).
-
-- ``"head.weight"``, ``"embed.weight"``, ``".ffn.gate.bias"``,
-  ``".attn.compressor."`` and ``".shared_experts.w2"`` are renamed as in
-  upstream's mapper (vLLM groups gate/up into a single
-  ``gate_up_proj`` and exposes the bias as ``e_score_correction_bias``).
-
-- The ``stacked_params_mapping`` keeps the ``("gate_up_proj", "w1"/"w3", ...)``
-  shards (covers shared_experts), the
-  ``("attn.fused_wqa_wkv", "attn.wq_a/wkv", ...)`` shards and the
-  ``("compressor.fused_wkv_wgate", "compressor.wkv/wgate", ...)`` shards;
-  there is nothing MegaMoE-specific to remove.
+Coexistence
+-----------
+``ilu_register._iter_package_modules`` imports every top-level module of this
+package at start-up, so this module coexists with ``attention.py``, which still
+owns the bf16-KV MLA stack this model builds on ivcore11.  It therefore
+registers no torch custom op and no quantization config.  Arch names override
+the community pair (``DeepseekV4ForCausalLM`` / ``DeepSeekV4MTPModel``).
 """
 
+from __future__ import annotations
+
 import os
+import re
+import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
-from typing import cast
 
-import ixformer.cuda as ixcuda
 import ixformer.inference.functions as ixfops  # type: ignore[import]
-import regex as re
 import torch
 import torch.nn as nn
-from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    get_tp_group,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
+from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
-    GateLinear,
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -96,140 +99,222 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.utils.multi_stream_utils import EventType
+from vllm.utils.math_utils import cdiv
 
+from vllm_iluvatar.ilu_util.arch import is_ivcore11
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
+    _DECODE_EP_BACKEND,
     IluFusedMoEEP,
 )
-from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes import (
-    IluCompressedTensorsW8A8Int8,
+from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.ilu_compressed_tensors_moe_w4a8_int8 import (
+    IluCompressedTensorsW4A8Int8MoEMethod,
 )
-from vllm_iluvatar.models.deepseek_v4.attention import (
-    IluDeepseekV4Indexer,
-    IluDeepseekV4MLAModules,
-    IluDeepseekV4MultiHeadLatentAttentionWrapper,
+from vllm_iluvatar.models.deepseek_v4 import fp8_load_stats
+from vllm_iluvatar.models.deepseek_v4.attention import IluDeepseekV4Attention
+from vllm_iluvatar.models.deepseek_v4.fp8_attention import (
+    IluDeepseekV4Fp8Attention,
 )
 
 logger = init_logger(__name__)
+_HC_PRE_NORM_FUSION = os.environ.get("IXFORMER_DS4_HC_PRE_NORM_FUSION", "1") == "1"
+
+# Use a logger inside the ``vllm.`` namespace so that vLLM's configured handler
+# picks up INFO-level messages (load statistics).  A ``vllm_iluvatar.…`` logger
+# would only hit ``logging.lastResort`` (WARNING), dropping the stats lines.
+
+# ``mtp.*`` is skipped end to end: at load time via AutoWeightsLoader, and in
+# both directions of the Load_Verifier (community ``nvidia/model.py:1468-1469``).
+_LOAD_SKIP_SUBSTRS: tuple[str, ...] = ("mtp.",)
+
+# Cap reported names in load diagnostics.
+_MAX_REPORTED_NAMES = 20
+
+# The attribute name ``IluDeepseekV4Fp8Model`` is registered under on
+# ``IluDeepseekV4Fp8ForCausalLM``, i.e. the single prefix level
+# ``AutoWeightsLoader._groupby_prefix`` strips off (``name.split(".", 1)[1]``)
+# before handing a weight to that child. The Load_Verifier has to put it back to
+# compare the child's bookkeeping against the checkpoint-side names.
+_MODEL_PREFIX = "model."
 
 
-# A/B/C switch for the mhc_pre operator via IXFORMER_DS4_MHC_PRE ∈ {v1,v2,v3}:
-#   v1 (default) : original fused mhc_pre
-#   v2           : bf16 GEMM + single warp-synchronous epilogue (ds4_mhc_pre_v2)
-#   v3           : bf16 GEMM + split epilogue rms/Sinkhorn-coef/apply
-#                  (ds4_mhc_pre_v3, occupancy-isolation experiment)
-# Legacy IXFORMER_DS4_MHC_PRE_V2=1 still selects v2 when the new var is unset.
-_DS4_MHC_PRE_VERSION = os.environ.get("IXFORMER_DS4_MHC_PRE", "").strip().lower()
-if not _DS4_MHC_PRE_VERSION:
-    _DS4_MHC_PRE_VERSION = (
-        "v2" if os.environ.get("IXFORMER_DS4_MHC_PRE_V2", "1") == "1" else "v1"
-    )
-if _DS4_MHC_PRE_VERSION not in ("v1", "v2", "v3"):
-    logger.warning(
-        "IXFORMER_DS4_MHC_PRE=%s is invalid; falling back to v1",
-        _DS4_MHC_PRE_VERSION,
-    )
-    _DS4_MHC_PRE_VERSION = "v1"
-# attn_norm / ffn_norm folded into the mhc_pre epilogue (ds4_mhc_pre_v2
-# need_rms). On by default for every step the kernel supports;
-# IXFORMER_DS4_HC_PRE_NORM_FUSION=0 opts out for A/B against the standalone
-# rms_norm call.
-_DS4_HC_PRE_NORM_FUSION = os.environ.get("IXFORMER_DS4_HC_PRE_NORM_FUSION", "1") == "1"
-_DS4_MHC_DYNAMIC_INT8 = (
-    os.environ.get(
-        "IXFORMER_DS4_MHC_DYNAMIC_INT8",
-        "1" if ixcuda.cuda_arch == "ivcore30" else "0",
-    )
-    == "1"
-)
-_DS4_ALLREDUCE_MHC_POST = os.environ.get("IXFORMER_DS4_ALLREDUCE_MHC_POST", "1") == "1"
+def _is_load_skipped(name: str) -> bool:
+    """Whether ``AutoWeightsLoader`` would drop this (mapped) name.
 
-
-def _hc_pre_norm_fusion_available() -> bool:
-    """Static half of the hc_pre + RMSNorm fusion decision.
-
-    Only ds4_mhc_pre_v2 implements the fusion, and the env var above opts out.
-    Whether a given *step* fuses additionally depends on the layer geometry and
-    the token count, which is ixformer's ``enable_hc_pre_norm_fusion``.
+    vLLM v0.31.0 (db9527a468) removed ``AutoWeightsLoader.ROTARY_EMBEDS_UNUSED_WEIGHTS``
+    (a list appended to ``skip_substrs``); rotary leftovers are now dropped
+    by ``AutoWeightsLoader.REMOVE_UNUSED_ROTARY_EMBEDS_MAPPER``, which the
+    loader composes with the model mapper internally. ``mtp.*`` is dropped by
+    the model mapper (``"mtp.": None``). Used by both Load_Verifier directions
+    so the whitelist is identical on the parameter and the checkpoint side.
     """
-    return _DS4_HC_PRE_NORM_FUSION and _DS4_MHC_PRE_VERSION == "v2"
+    return any(substr in name for substr in _LOAD_SKIP_SUBSTRS) or not (
+        AutoWeightsLoader.REMOVE_UNUSED_ROTARY_EMBEDS_MAPPER.apply_list([name])
+    )
 
 
-class _HcPreNormFusion:
-    """Per-step state for folding attn_norm / ffn_norm into the mhc_pre epilogue.
+def default_aux_hidden_state_layers(hf_config) -> tuple[int, ...]:
+    """Aux capture layers for a DSpark draft (FP8 fork).
 
-    Owns the two things every fused call needs:
-
-    * The per-step verdict. ``need_rms=True`` routes ds4_mhc_pre_v2 into its
-      single-launch GEMV + epilogue kernel, which is only built for small token
-      counts, so decode steps fuse while a large prefill step falls back to the
-      standalone rms_norm. ixformer holds the exact condition; this class only
-      caches the layer geometry to feed it once per forward.
-    * A zeroed uint32 sync flag per call. The epilogue blocks spin on that
-      counter until the GEMV blocks bump it, and it is left non-zero on return,
-      so a flag cannot be reused before it is zeroed again. One buffer covering
-      the whole step (two calls per decoder layer) is zeroed up front instead of
-      allocating + zeroing one flag per call.
+    ``dspark_target_layer_ids`` names the *source* decoder layers; capture
+    happens after that layer runs, so the runner-facing ids are shifted by one
+    (same convention as community eagle3 / DFlash and the W4A8 ``model.py``).
     """
+    layer_ids = getattr(hf_config, "dspark_target_layer_ids", None) or ()
+    return tuple(i + 1 for i in layer_ids)
 
-    def __init__(
-        self,
-        num_layers: int,
-        n_hc: int,
-        hidden_size: int,
-        dtype: torch.dtype,
-        device: str | torch.device,
-    ) -> None:
-        self._flags = torch.zeros(2 * num_layers, dtype=torch.int32, device=device)
-        self._n_hc = n_hc
-        self._hidden_size = hidden_size
-        self._dtype = dtype
-        self._next = 0
-        self.enabled = False
 
-    def begin_step(self, num_tokens: int) -> None:
-        """Decide whether this step fuses and, if so, refresh the sync flags."""
-        self.enabled = ixfops.enable_hc_pre_norm_fusion(
-            num_tokens=num_tokens,
-            n_hc=self._n_hc,
-            hidden_size=self._hidden_size,
-            dtype=self._dtype,
+def _make_fp8_weights_mapper() -> WeightsMapper:
+    """Checkpoint-name -> parameter-name map for the raw FP8 checkpoint.
+
+    Equivalent to community ``_make_deepseek_v4_weights_mapper("fp4")``
+    (``vllm/models/deepseek_v4/nvidia/model.py:1311-1350``).
+
+    ``orig_to_new_regex`` **must stay ordered**. ``WeightsMapper``
+    (``vllm/model_executor/models/utils.py``) walks the regex mapping in
+    insertion order and does not stop at the first hit, so the MXFP4 experts
+    rule has to run first: routed experts live on ``Mxfp4MoEMethod``, which
+    registers ``w{1,2,3}_weight_scale`` (no ``_inv``), while every other FP8
+    block scale is ``Fp8LinearMethod``'s ``weight_scale_inv``. Reversed, the
+    generic rule would rewrite ``.scale`` first and the experts rule could never
+    match. (After the experts rule fires the key ends in ``_scale``, not
+    ``.scale``, so the generic rule correctly misses it -- which is also why the
+    ``hc_*_scale`` plain tensors are left alone.)
+    """
+    return WeightsMapper(
+        orig_to_new_regex={
+            re.compile(r"(\.experts\.\d+\.w[123])\.scale$"): r"\1.weight_scale",
+            re.compile(r"\.scale$"): ".weight_scale_inv",
+        },
+        orig_to_new_prefix={
+            "layers.": "model.layers.",
+            "embed.": "model.embed.",
+            "norm.": "model.norm.",
+            # No trailing dot: the parameters are ``hc_head_fn`` /
+            # ``hc_head_base`` / ``hc_head_scale``, so a dot would produce
+            # ``model.hc_head._fn``.  Community is dot-less too
+            # (``nvidia/model.py:1330``).
+            "hc_head": "model.hc_head",
+            "mtp.": "model.mtp.",
+        },
+        orig_to_new_suffix={
+            "head.weight": "lm_head.weight",
+            "embed.weight": "embed_tokens.weight",
+            ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
+        },
+        orig_to_new_substr={
+            # Only the shared expert's ``w2`` is renamed; ``w1`` / ``w3`` are
+            # fused into ``gate_up_proj`` by the loader's stacked mapping,
+            # and routed ``w2`` is untouched because the pattern is anchored
+            # on ``.shared_experts.``.
+            ".shared_experts.w2": ".shared_experts.down_proj",
+            # vLLM v0.31.0 (db9527a468) dropped AutoWeightsLoader.skip_substrs; the MTP
+            # weights are loaded by the separate IluDeepseekV4Fp8MTP draft
+            # model, so the base model drops them here via the mapper (maps
+            # to None). The orig_to_new_prefix rename ``mtp.`` -> ``model.mtp.``
+            # runs first, then this substr rule drops the renamed name.
+            "mtp.": None,
+        },
+    )
+
+
+def _make_v4_fp8_weights_mapper() -> WeightsMapper:
+    """``_make_fp8_weights_mapper`` plus the ivcore11 compressor rename.
+
+    ivcore11 builds :class:`IluDeepseekV4Attention` (see
+    :func:`_build_attention`), which owns the compressor on its inner MLA
+    wrapper instead of on the attention module, so the checkpoint name has to
+    move with it. Only the main compressor moves; the key is anchored on
+    ``.attn.compressor.`` so ``.attn.indexer.compressor.`` (inside the indexer in
+    both forks) is left alone. V4.1 and the VL model call
+    ``_make_fp8_weights_mapper`` directly and keep their own layout.
+    """
+    mapper = _make_fp8_weights_mapper()
+    if is_ivcore11():
+        mapper.orig_to_new_substr = {
+            ".attn.compressor.": ".attn.mla_attn.compressor.",
+            **mapper.orig_to_new_substr,
+        }
+    return mapper
+
+
+def _build_attention(
+    vllm_config: VllmConfig,
+    *,
+    prefix: str,
+    topk_indices_buffer: torch.Tensor | None,
+) -> nn.Module:
+    """The attention stack whose kernels exist on this architecture.
+
+    :class:`IluDeepseekV4Fp8Attention` runs the packed fp8 sparse-MLA pipeline.
+    ixformer registers the fast backend of every kernel it needs --
+    ``ds4_sparse_mla_fp8_decode``, ``ds4_dynamic_quant_mla_q_packed_fp8``,
+    ``fused_inv_rope_fp8_quant`` -- with ``archs=("ivcore30",)``, and each of
+    those ops also carries an unrestricted ``torch`` reference backend. So on
+    ivcore11 the registry does not fail, it quietly resolves to the reference
+    implementation; ``VLLM_ILU_DS4_ATTN_MODE=plain_direct`` is no escape either
+    (``quant_mla_q_fp8_pt`` / ``sparse_mla_fp8_pt`` are ivcore30 too).
+
+    ivcore11 therefore builds :class:`IluDeepseekV4Attention`, the bf16-KV stack
+    on the float ``mla_sparse``, float compressor and int8 indexer kernels that
+    *are* registered there. Both classes take the same constructor arguments and
+    build identically named submodules, so the weight names are unchanged apart
+    from the compressor (see :func:`_make_v4_fp8_weights_mapper`). The dense
+    linears still come from ``vllm_config.quant_config``, i.e. the block-FP8
+    checkpoint requantised to W8A8 INT8 on ivcore11.
+    """
+    if not is_ivcore11():
+        return IluDeepseekV4Fp8Attention(
+            vllm_config,
+            prefix=prefix,
+            topk_indices_buffer=topk_indices_buffer,
         )
-        if self.enabled:
-            self._flags.zero_()
-            self._next = 0
 
-    def acquire(self) -> torch.Tensor | None:
-        """Next zeroed flag, or None to let ixformer allocate a private one."""
-        if self._next >= self._flags.numel():
-            logger.warning_once(
-                "DeepSeek-V4 hc_pre: ran out of pre-zeroed RMSNorm fusion sync "
-                "flags (pool size %d); falling back to per-call allocation.",
-                self._flags.numel(),
-            )
-            return None
-        flag = self._flags[self._next : self._next + 1]
-        self._next += 1
-        return flag
+    attn = IluDeepseekV4Attention(
+        vllm_config,
+        prefix=prefix,
+        topk_indices_buffer=topk_indices_buffer,
+    )
 
+    # ``apply_quantized`` only validates shapes; the 64-alignment the kernel
+    # needs is checked here so an unsupported shard fails during model build
+    # rather than on the first decode.
+    from vllm_iluvatar.model_executor.layers.quantization.backends.grouped_bmm.deepseek_v4_wo_a import (  # noqa: E501
+        IluV4W8A8BMMLinearMethod,
+    )
 
-# ---------------------------------------------------------------------------
-# Inlined helpers (originally in vllm.model_executor.models.deepseek_v4).
-# ---------------------------------------------------------------------------
-# We deliberately do NOT `from vllm.model_executor.models.deepseek_v4 import ...`,
-# because that module pulls in `vllm.model_executor.layers.deepseek_v4_attention`
-# -> `vllm.model_executor.layers.sparse_attn_indexer`, which calls
-# `direct_register_custom_op("vllm::sparse_attn_indexer", ...)`. The Iluvatar
-# plugin uses the distinct ``vllm::ilu_sparse_attn_indexer`` op in
-# `vllm_iluvatar.model_executor.layers.sparse_attn_indexer`, so it can coexist
-# with the community indexer schema.
-#
-# `IluDeepseekV4MLP` is byte-identical to upstream. The model-output multi-head
-# fusion (originally `hc_head` eager PyTorch) is replaced by the fused
-# ixformer kernel `ixfops.hc_head` at the call site.
+    if isinstance(
+        attn.wo_a.quant_method, IluV4W8A8BMMLinearMethod
+    ) and not IluV4W8A8BMMLinearMethod.supports_geometry(
+        attn.wo_a.bmm_geom,
+        vllm_config.model_config.dtype,
+        attn.rope_head_dim,
+    ):
+        raise ValueError(
+            f"{prefix}.wo_a geometry {attn.wo_a.bmm_geom!r} is not supported by "
+            "the grouped INT8 output projection"
+        )
+    return attn
 
 
-class IluDeepseekV4MLP(nn.Module):
+class IluDeepseekV4Fp8MLP(nn.Module):
+    """Shared-expert MLP: block-FP8 ``gate_up_proj`` + ``down_proj``.
+
+    Community counterpart: ``DeepseekV4MLP``
+    (``vllm/models/deepseek_v4/nvidia/model.py:82-139``).  Re-implemented rather
+    than imported, but kept byte-compatible: the parameter names and the
+    intermediate-size round-up match the checkpoint mapping.
+
+    Intermediate round-up: block-FP8 shards in whole ``block_size[0]`` rows, so
+    the per-rank block count is rounded up and multiplied back out, keeping the
+    linear's even TP split block-aligned.  On this checkpoint the round-up is a
+    no-op, but it must stay so ``_pad_shared_expert_weight`` agrees.
+
+    ``forward`` runs ``gate_up_proj`` -> SwiGLU(clamp) -> ``down_proj``.  The
+    two projections are block-FP8 and dispatch to
+    ``IluFp8BlockScaledMMKernel``; ``act_fn`` is the community
+    ``SiluAndMulWithClamp`` (-> OOT ``IluSiluAndMulWithClamp``).
+    """
+
     def __init__(
         self,
         hidden_size: int,
@@ -238,17 +323,22 @@ class IluDeepseekV4MLP(nn.Module):
         swiglu_limit: float | None = None,
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
-        is_sequence_parallel: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
+
+        block_size = getattr(quant_config, "weight_block_size", None)
+        if block_size is not None:
+            tp_size = get_tensor_model_parallel_world_size()
+            n_local = cdiv(intermediate_size // block_size[0], tp_size)
+            intermediate_size = n_local * block_size[0] * tp_size
+        self.intermediate_size = intermediate_size
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
@@ -257,80 +347,112 @@ class IluDeepseekV4MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
-            disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.down_proj",
         )
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
-        if swiglu_limit is not None:
-            self.act_fn = SiluAndMulWithClamp(swiglu_limit)
-        else:
-            self.act_fn = SiluAndMul()
-
-        # add fused check for act + quant
-        if isinstance(self.act_fn, SiluAndMulWithClamp) and hasattr(
-            self.down_proj, "scheme"
-        ):
-            from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes import (
-                IluCompressedTensorsW8A8Int8,
-            )
-
-            if isinstance(self.down_proj.scheme, IluCompressedTensorsW8A8Int8):
-                self.act_fn.enable_fuse_quant()
-
-    def supports_prequantized_gate_up(self) -> bool:
-        return isinstance(
-            getattr(self.gate_up_proj, "scheme", None),
-            IluCompressedTensorsW8A8Int8,
+        # DS-V4 always ships ``swiglu_limit``, so there is no
+        # plain-``SiluAndMul`` branch.  ``SiluAndMulWithClamp`` resolves to the
+        # plugin's OOT ``IluSiluAndMulWithClamp``.
+        assert swiglu_limit is not None, (
+            "DeepSeek-V4 FP8 shared-expert MLP requires config.swiglu_limit"
         )
+        self.act_fn = SiluAndMulWithClamp(swiglu_limit)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # ``down_proj`` has ``reduce_results=False`` -- the MoE runner owns the
+        # single EP/TP all-reduce.
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
+        act = self.act_fn(gate_up)
+        out, _ = self.down_proj(act)
+        return out
 
 
-class IluDeepseekV4MoE(nn.Module, IluFusedMoEEP):
-    """Routed + shared expert MoE for ilu fork (FusedMoE only)."""
+class IluDeepseekV4Fp8MoE(nn.Module, IluFusedMoEEP):
+    """DS-V4-Flash FFN: routing gate + shared expert MLP + routed MXFP4 experts.
 
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        prefix: str = "",
-    ) -> None:
+    Community counterpart: ``DeepseekV4MoE.__init__`` /
+    ``_init_fused_moe_experts`` (``vllm/models/deepseek_v4/nvidia/model.py``
+    ``:513-603`` and ``:647-691``), minus the MegaMoE branch
+    (``kernel_config.moe_backend == "deep_gemm_mega_moe"`` needs a DeepGEMM
+    kernel Iluvatar does not have; never enabled here).
+
+    Owned parameters (the ``experts`` ones are created by community
+    ``Mxfp4MoEMethod.create_weights``, ``quantization/mxfp4.py:530-622``):
+
+    * ``gate.weight``                                 ``[256, 4096]``   bf16
+    * ``gate.e_score_correction_bias``                ``[256]``         fp32
+    * ``gate.tid2eid``                                ``[129280, 6]``   int32
+    * ``shared_experts.gate_up_proj.weight``           ``[512, 4096]``  fp8
+    * ``shared_experts.gate_up_proj.weight_scale_inv`` ``[4, 32]``      e8m0
+    * ``shared_experts.down_proj.weight``              ``[4096, 256]``  fp8
+    * ``shared_experts.down_proj.weight_scale_inv``    ``[32, 2]``      e8m0
+    * ``experts.routed_experts.w13_weight``       ``[32, 4096, 2048]``  uint8
+    * ``experts.routed_experts.w13_weight_scale`` ``[32, 4096, 128]``   uint8
+    * ``experts.routed_experts.w2_weight``       ``[32, 4096, 1024]``  uint8
+    * ``experts.routed_experts.w2_weight_scale`` ``[32, 4096, 64]``    uint8
+
+    ``gate.tid2eid`` and ``gate.e_score_correction_bias`` are mutually exclusive:
+    hash layers (``layer_id < config.num_hash_layers``, i.e. 0/1/2) route by
+    table lookup and get ``tid2eid``; the remaining 40 layers use
+    ``topk_method == "noaux_tc"`` and get the bias.
+
+    The routed shapes above are for EP8 (32 local experts holding the *full*
+    intermediate size).  Nothing here forces that split: ``FusedMoE`` derives it
+    from ``FusedMoEParallelConfig.make``, so a TP-only launch would give
+    different per-rank shapes.  The shared-expert MLP is TP-sharded either way.
+
+    ``IluFusedMoEEP`` is mixed in so converted W4A8 can take the full DP + EP
+    path and so a decode-only low-latency override can call
+    ``forward_dp_ep_deep_ep``. Native MXFP4 does not enter that mixin for
+    prefill; it does when ``select_gemm_impl`` exists and
+    ``VLLM_ILU_DECODE_EP_BACKEND=deepep_low_latency``.
+    """
+
+    def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
+        parallel_config = vllm_config.parallel_config
+
         self.prefix = prefix
+        self.tp_size = get_tensor_model_parallel_world_size()
 
-        self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.hidden_size = config.hidden_size
-
         self.n_routed_experts = config.n_routed_experts
-        self.n_activated_experts = config.num_experts_per_tok
-        self.moe_intermediate_size = config.moe_intermediate_size
         self.swiglu_limit = config.swiglu_limit
-        self.renormalize = config.norm_topk_prob
         self.scoring_func = getattr(config, "scoring_func", "sqrtsoftplus")
+        self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
 
+        # --- routing gate (community nvidia/model.py:554-583) ----------------
+        # ``out_dtype=float32``: the router runs in fp32 regardless of the
+        # activation dtype. ``quant_config`` is not forwarded -- GateLinear
+        # hard-codes ``quant_config=None`` on its ReplicatedLinear base, and the
+        # checkpoint stores ``ffn.gate.weight`` unquantised (bf16).
         self.gate = GateLinear(
-            config.hidden_size,
-            config.n_routed_experts,
-            out_dtype=torch.float32,
+            input_size=config.hidden_size,
+            output_size=config.n_routed_experts,
             bias=False,
+            out_dtype=torch.float32,
             prefix=f"{prefix}.gate",
         )
+        # Both attributes always exist; exactly one of them is a Parameter. The
+        # None-initialisation matters because FusedMoE / the forward read them
+        # unconditionally.
         self.gate.e_score_correction_bias = None
         self.gate.tid2eid = None
-        is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers
-        # FusedMoE always wants int32 indices on the routing path.
-        self.hash_indices_dtype = torch.int32
 
+        self.layer_id = extract_layer_index(prefix)
+        is_hash_moe = self.layer_id < config.num_hash_layers
+        # int32 on the FusedMoE path (community picks int64 only for MegaMoE).
+        # The checkpoint tensor is I64, so the loader converts on copy.
+        self.hash_indices_dtype = torch.int32
         if is_hash_moe:
+            # ``randint`` rather than ``empty``: with --load-format=dummy the
+            # table is used as an index, and garbage would fault
+            # (community nvidia/model.py:566-577).
             self.gate.tid2eid = nn.Parameter(
                 torch.randint(
                     0,
@@ -346,35 +468,50 @@ class IluDeepseekV4MoE(nn.Module, IluFusedMoEEP):
                 requires_grad=False,
             )
 
+        # --- shared expert (community nvidia/model.py:585-603) ---------------
         if config.n_shared_experts is None:
             self.shared_experts = None
         else:
-            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = IluDeepseekV4MLP(
+            self.shared_experts = IluDeepseekV4Fp8MLP(
                 hidden_size=config.hidden_size,
-                intermediate_size=intermediate_size,
+                intermediate_size=(
+                    config.moe_intermediate_size * config.n_shared_experts
+                ),
                 hidden_act=config.hidden_act,
                 swiglu_limit=self.swiglu_limit,
                 quant_config=quant_config,
+                # False: the routed path owns the final all-reduce, so the
+                # shared expert must not reduce its partial result twice
+                # (community passes ``self.use_mega_moe``, False here).
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )
 
-        self._init_fused_moe_experts(config, quant_config, prefix)
-        self.init_ep()
+        # --- routed experts (community nvidia/model.py:647-691) -------------
+        # The real expert split is owned by ``FusedMoE``
+        # (``FusedMoEParallelConfig.make`` -> ``routed_experts.expert_map`` /
+        # ``.local_num_experts``, which is what ``ilu_mxfp4_fused_experts()``
+        # reads); only the divisibility precondition is checked here.
+        eplb_config = parallel_config.eplb_config
+        n_physical_experts = self.n_routed_experts + eplb_config.num_redundant_experts
+        assert n_physical_experts % self.tp_size == 0, (
+            f"n_physical_experts={n_physical_experts} must be divisible by "
+            f"tp_size={self.tp_size}. Adjust num_redundant_experts."
+        )
 
-    def _init_fused_moe_experts(
-        self,
-        config,
-        quant_config: QuantizationConfig | None,
-        prefix: str,
-    ) -> None:
-        self.tp_rank = get_tensor_model_parallel_rank()
-        assert config.n_routed_experts % self.tp_size == 0
-        self.n_local_experts = config.n_routed_experts // self.tp_size
-        self.experts_start_idx = self.tp_rank * self.n_local_experts
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-
+        # ``FusedMoE`` is a factory returning a ``MoERunner``; the four routed
+        # parameters live on its ``routed_experts`` child, so their qualified
+        # names are ``{prefix}.experts.routed_experts.w*``. ``gate`` and
+        # ``shared_experts`` are handed in as well (community does the same) so
+        # the runner can fuse routing and the shared branch; they are the *same*
+        # module objects registered above, so ``named_parameters()`` reports
+        # them once, under the ``{prefix}.gate`` / ``{prefix}.shared_experts``
+        # names -- ``named_modules(remove_duplicate=True)`` visits the direct
+        # children first and then skips the aliased subtrees under ``experts``.
+        #
+        # ``quant_config.get_quant_method`` runs inside this call and decides the
+        # routed-expert method; it must be ``IluDeepseekV4FP8Config`` so we get
+        # ``IluMxfp4MoEMethod``. See the module docstring.
         self.experts = FusedMoEFactory(
             shared_experts=self.shared_experts,
             gate=self.gate,
@@ -391,38 +528,63 @@ class IluDeepseekV4MoE(nn.Module, IluFusedMoEEP):
             hash_indices_table=self.gate.tid2eid,
             swiglu_limit=self.swiglu_limit,
             router_logits_dtype=torch.float32,
+            enable_eplb=parallel_config.enable_eplb,
+            num_redundant_experts=eplb_config.num_redundant_experts,
         )
+        # W4A8 uses Hybrid EP on every DP + EP step, including independent
+        # original-weight compute methods declaring this capability. Any other
+        # method with ``select_gemm_impl`` (native MXFP4) stays on the
+        # community runner unless the decode override is deepep_low_latency.
+        method = self.experts._quant_method
+        method = getattr(method, "old_quant_method", method)
+        self._use_ilu_w4a8_ep = isinstance(
+            method, IluCompressedTensorsW4A8Int8MoEMethod
+        ) or getattr(method, "ilu_prefer_hybrid_ep", False)
+        # The 0.31 runner owns prefill. Opt decode into LL only.
+        self._ilu_decode_ll = (
+            not self._use_ilu_w4a8_ep
+            and hasattr(method, "select_gemm_impl")
+            and _DECODE_EP_BACKEND == "deepep_low_latency"
+            and self._should_use_forward_dp_ep()
+        )
+        if self._use_ilu_w4a8_ep or self._ilu_decode_ll:
+            self.init_ep()
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None = None,
-        shared_gate_up_input: tuple[torch.Tensor, torch.Tensor, torch.dtype]
-        | None = None,
     ) -> torch.Tensor:
+        """Use Hybrid EP for converted W4A8. Native MXFP4 stays on the
+        community runner unless the decode LL override is active.
+
+        Same shape as community ``DeepseekV4MoE.forward``.  There is **no**
+        ``tensor_model_parallel_all_reduce`` here: the runner owns the single
+        EP/TP all-reduce.  ``routed_scaling_factor`` is likewise handled by the
+        router (multiplied into ``topk_weights``).
+
+        Adapted to vLLM v0.31.0 (db9527a468): the runner always holds the gate (it was
+        constructed via ``FusedMoEFactory(gate=self.gate, ...)``), so
+        ``router_logits`` is a placeholder (``hidden_states``) and the real
+        gate GEMM runs inside the runner (see ``MoERunner._forward_impl``).
+        The community dropped the ``is_internal_router`` branch, so it is
+        dropped here too. An explicit LL decode override uses
+        ``forward_dp_ep_deep_ep``; prefill stays on this runner.
+        """
         if self.gate.tid2eid is not None:
             if input_ids is None:
                 raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
             input_ids = input_ids.to(dtype=self.hash_indices_dtype)
 
-        org_shape = hidden_states.shape
-        if self._should_use_forward_dp_ep():
-            final_hidden_states = self.forward_dp_ep(
-                hidden_states,
-                input_ids,
-                shared_gate_up_input=shared_gate_up_input,
-            )
-            return final_hidden_states.view(org_shape)
+        if getattr(self, "_ilu_decode_ll", False) and self._is_all_ranks_decode_only():
+            return self.forward_dp_ep_deep_ep(hidden_states, input_ids)
 
-        assert shared_gate_up_input is None
-        # Adapted to vLLM v0.31.0 (db9527a468): the runner always holds the gate (it was
-        # passed via ``FusedMoEFactory(gate=self.gate, ...)``), so it computes
-        # ``router_logits`` internally. ``router_logits=hidden_states`` is the
-        # community ``_forward_fused_moe`` placeholder convention; the runner
-        # overwrites it with ``self.gate(hidden_states)`` (see MoERunner
-        # ``_forward_impl``). The old ``is_internal_router`` branch (and the
-        # model-side ``self.gate`` call) is gone in the community, so it is
-        # dropped here too.
+        org_shape = hidden_states.shape
+        if (
+            getattr(self, "_use_ilu_w4a8_ep", False)
+            and self._should_use_forward_dp_ep()
+        ):
+            return self.forward_dp_ep(hidden_states, input_ids).view(org_shape)
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             router_logits=hidden_states,
@@ -431,12 +593,16 @@ class IluDeepseekV4MoE(nn.Module, IluFusedMoEEP):
         return final_hidden_states.view(org_shape)
 
 
-class IluDeepseekV4Attention(nn.Module):
-    """Top-level attention for an ilu DeepSeek-V4 layer.
+class IluDeepseekV4Fp8DecoderLayer(nn.Module):
+    """One DS-V4-Flash decoder layer: MLA attention + MoE FFN + MHC parameters.
 
-    Wires the per-layer modules required by ``load_weights`` and delegates
-    to :class:`IluDeepseekV4MultiHeadLatentAttentionWrapper`. ``forward``
-    (via the wrapper) raises ``NotImplementedError`` at stage 1.
+    Community counterpart: ``DeepseekV4DecoderLayer``
+    (``vllm/models/deepseek_v4/nvidia/model.py:794-867``).  The MHC parameter
+    shapes are derived, not hard-coded, so the mini config used by the unit
+    tests stays self-consistent:
+    ``mix_hc = (2 + hc_mult) * hc_mult`` (24 at ``hc_mult == 4``) and
+    ``hc_dim = hc_mult * hidden_size`` (16384 at the real ``hidden_size``).
+    All six are fp32 plain tensors loaded by ``default_weight_loader``.
     """
 
     def __init__(
@@ -444,227 +610,40 @@ class IluDeepseekV4Attention(nn.Module):
         vllm_config: VllmConfig,
         prefix: str,
         topk_indices_buffer: torch.Tensor | None = None,
-        aux_stream: torch.cuda.Stream | None = None,
-    ) -> None:
-        super().__init__()
-        config = vllm_config.model_config.hf_config
-        quant_config = vllm_config.quant_config
-        layer_id = extract_layer_index(prefix)
-
-        self.layer_id = layer_id
-        self.hidden_size = config.hidden_size
-        self.n_heads = config.num_attention_heads
-        tp_size = get_tensor_model_parallel_world_size()
-        assert self.n_heads % tp_size == 0
-        self.n_local_heads = self.n_heads // tp_size
-
-        self.q_lora_rank = config.q_lora_rank
-        self.o_lora_rank = config.o_lora_rank
-        self.head_dim = config.head_dim
-        self.rope_head_dim = config.qk_rope_head_dim
-        self.nope_head_dim = self.head_dim - self.rope_head_dim
-        self.n_groups = config.o_groups
-        self.n_local_groups = self.n_groups // tp_size
-        self.window_size = config.sliding_window
-
-        if layer_id < config.num_hidden_layers:
-            self.compress_ratio = max(1, config.compress_ratios[layer_id])
-        else:
-            self.compress_ratio = 1
-        self.eps = config.rms_norm_eps
-        self.max_position_embeddings = config.max_position_embeddings
-
-        # Per-head sparse-MLA attn sink (ixformer kernels require
-        # `attn_sink.shape == [h_q]`; h_q == n_local_heads, no head padding).
-        # Init to -inf so a missing/partial load leaves the sink in the
-        # "no effect" state (an attended row with -inf sink behaves as if
-        # the sink weren't merged into the online softmax).
-        self.attn_sink = nn.Parameter(
-            torch.full((self.n_local_heads,), -float("inf"), dtype=torch.float32),
-            requires_grad=False,
-        )
-
-        self.fused_wqa_wkv = MergedColumnParallelLinear(
-            self.hidden_size,
-            [self.q_lora_rank, self.head_dim],
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.fused_wqa_wkv",
-            disable_tp=True,
-        )
-        self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
-        self.wq_b = ColumnParallelLinear(
-            self.q_lora_rank,
-            self.n_heads * self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            return_bias=False,
-            prefix=f"{prefix}.wq_b",
-        )
-        self.kv_norm = RMSNorm(self.head_dim, self.eps)
-        self.wo_a = ColumnParallelLinear(
-            self.n_heads * self.head_dim // self.n_groups,
-            self.n_groups * self.o_lora_rank,
-            bias=False,
-            quant_config=quant_config,
-            return_bias=False,
-            prefix=f"{prefix}.wo_a",
-        )
-        self.wo_a.is_bmm = True
-        self.wo_a.bmm_batch_size = self.n_local_groups
-        self.wo_b = RowParallelLinear(
-            self.n_groups * self.o_lora_rank,
-            self.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=not _DS4_ALLREDUCE_MHC_POST,
-            return_bias=False,
-            prefix=f"{prefix}.wo_b",
-        )
-        self.softmax_scale = self.head_dim**-0.5
-        # The compressed-tensors IluQuantConfig path doesn't carry scale_fmt;
-        # default to ue8m0 for forward-time helpers (stage 1 doesn't use it).
-        self.scale_fmt = (
-            (config.quantization_config or {}).get("scale_fmt", "ue8m0")
-            if isinstance(config.quantization_config, dict)
-            else "ue8m0"
-        )
-
-        rope_parameters = config.rope_parameters
-        rope_parameters["rope_theta"] = (
-            config.compress_rope_theta if self.compress_ratio > 1 else config.rope_theta
-        )
-        if config.rope_parameters["rope_type"] != "default":
-            config.rope_parameters["rope_type"] = (
-                "deepseek_yarn"
-                if config.rope_parameters.get("apply_yarn_scaling", True)
-                else "deepseek_llama_scaling"
-            )
-        rope_parameters["mscale"] = 0
-        rope_parameters["mscale_all_dim"] = 0
-        rope_parameters["is_deepseek_v4"] = True
-        rope_parameters["rope_dim"] = self.rope_head_dim
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            max_position=self.max_position_embeddings,
-            rope_parameters=rope_parameters,
-            is_neox_style=False,
-            dtype=config.torch_dtype,
-        )
-
-        self.indexer = None
-        if self.compress_ratio == 4:
-            self.indexer = IluDeepseekV4Indexer(
-                vllm_config,
-                config=config,
-                hidden_size=self.hidden_size,
-                q_lora_rank=self.q_lora_rank,
-                quant_config=quant_config,
-                cache_config=vllm_config.cache_config,
-                topk_indices_buffer=topk_indices_buffer,
-                compress_ratio=self.compress_ratio,
-                prefix=f"{prefix}.indexer",
-            )
-
-        mla_modules = IluDeepseekV4MLAModules(
-            vllm_config=vllm_config,
-            fused_wqa_wkv=self.fused_wqa_wkv,
-            q_norm=self.q_norm,
-            wq_b=self.wq_b,
-            kv_norm=self.kv_norm,
-            wo_a=self.wo_a,
-            wo_b=self.wo_b,
-            attn_sink=self.attn_sink,
-            rotary_emb=self.rotary_emb,
-            indexer=self.indexer,
-            indexer_rotary_emb=self.rotary_emb,
-            topk_indices_buffer=topk_indices_buffer,
-            aux_stream=aux_stream,
-        )
-        self.mla_attn = IluDeepseekV4MultiHeadLatentAttentionWrapper(
-            hidden_size=self.hidden_size,
-            num_heads=self.n_local_heads,
-            head_dim=self.head_dim,
-            scale=self.softmax_scale,
-            qk_nope_head_dim=self.nope_head_dim,
-            qk_rope_head_dim=self.rope_head_dim,
-            v_head_dim=self.head_dim,
-            q_lora_rank=self.q_lora_rank,
-            kv_lora_rank=self.head_dim,
-            o_lora_rank=self.o_lora_rank,
-            mla_modules=mla_modules,
-            window_size=self.window_size,
-            compress_ratio=self.compress_ratio,
-            cache_config=vllm_config.cache_config,
-            quant_config=quant_config,
-            prefix=prefix,
-        )
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        llama_4_scaling: torch.Tensor | None,
-        fused_wqa_wkv_input: tuple[torch.Tensor, torch.Tensor, torch.dtype]
-        | None = None,
-    ):
-        return self.mla_attn(
-            positions,
-            hidden_states,
-            llama_4_scaling,
-            fused_wqa_wkv_input=fused_wqa_wkv_input,
-        )
-
-
-class IluDeepseekV4DecoderLayer(nn.Module):
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        prefix: str,
-        topk_indices_buffer: torch.Tensor | None = None,
-        aux_stream_dict: dict[EventType, torch.cuda.Stream] | None = None,
-        hc_pre_fusion: _HcPreNormFusion | None = None,
+        *,
+        skip_ffn: bool = False,
     ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
-
         self.rms_norm_eps = config.rms_norm_eps
-        self.attn = IluDeepseekV4Attention(
+
+        self.attn = _build_attention(
             vllm_config,
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
-            aux_stream=(
-                aux_stream_dict.get(EventType.Attention)
-                if aux_stream_dict is not None
-                else None
-            ),
         )
-        self.ffn = IluDeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
-        layer_id = extract_layer_index(prefix)
-        self.attn_pre_quant_enabled = (
-            0 <= layer_id < config.num_hidden_layers
-            and isinstance(
-                getattr(self.attn.fused_wqa_wkv, "scheme", None),
-                IluCompressedTensorsW8A8Int8,
-            )
-        )
-        self.ffn_pre_shared_quant_enabled = (
-            envs.VLLM_ILU_DECODE_EP_BACKEND == "deepep_low_latency"
-            and self.ffn.shared_experts is not None
-            and self.ffn.shared_experts.supports_prequantized_gate_up()
+        # V4.1's terminal KV-only producer exits before the FFN. Avoid
+        # constructing it at all: replacing it afterwards would leave MoE
+        # registrations (and their tensors) in static_forward_context.
+        self.ffn = (
+            PPMissingLayer()
+            if skip_ffn
+            else IluDeepseekV4Fp8MoE(vllm_config, prefix=f"{prefix}.ffn")
         )
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
+
+        # MHC (multi-head channel) scalars kept under community names, so the
+        # ixformer kernels take them straight (``hc_pre`` / ``hc_post`` below).
         self.hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
         self.hc_post_alpha = 2.0
+
         mix_hc = (2 + self.hc_mult) * self.hc_mult
         hc_dim = self.hc_mult * self.hidden_size
-        # All hc_* tensors are bf16/fp32 plain weights — load_weights walks
-        # them via default_weight_loader.
         self.hc_attn_fn = nn.Parameter(
             torch.empty((mix_hc, hc_dim), dtype=torch.float32),
             requires_grad=False,
@@ -679,32 +658,21 @@ class IluDeepseekV4DecoderLayer(nn.Module):
         self.hc_ffn_base = nn.Parameter(
             torch.empty(mix_hc, dtype=torch.float32), requires_grad=False
         )
+        # Community keeps this at a literal 3 (per-layer alpha / beta / gamma),
+        # independent of hc_mult: nvidia/model.py:853-866.
         self.hc_attn_scale = nn.Parameter(
             torch.empty(3, dtype=torch.float32), requires_grad=False
         )
         self.hc_ffn_scale = nn.Parameter(
             torch.empty(3, dtype=torch.float32), requires_grad=False
         )
-
-        # The fused epilogue always scales by a full-width weight, so it can
-        # only stand in for a plain weighted RMSNorm over the whole hidden_size.
-        # The target model hands its fusion state down to all of its layers and
-        # opens the step once; the MTP draft builds a bare decoder layer
-        # (mtp.py), which falls back to private state it opens itself.
-        self.hc_pre_fusion = None
-        self.owns_hc_pre_fusion = False
-        if _hc_pre_norm_fusion_available() and all(
-            norm.has_weight and norm.variance_size_override is None
-            for norm in (self.attn_norm, self.ffn_norm)
-        ):
-            self.owns_hc_pre_fusion = hc_pre_fusion is None
-            self.hc_pre_fusion = hc_pre_fusion or _HcPreNormFusion(
-                num_layers=1,
-                n_hc=self.hc_mult,
-                hidden_size=self.hidden_size,
-                dtype=vllm_config.model_config.dtype,
-                device=current_platform.device_type,
-            )
+        self.register_buffer(
+            "_hc_pre_workspace",
+            torch.zeros(1, dtype=torch.int32, device=current_platform.device_type)
+            if _HC_PRE_NORM_FUSION
+            else None,
+            persistent=False,
+        )
 
     def hc_pre(
         self,
@@ -712,14 +680,17 @@ class IluDeepseekV4DecoderLayer(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
-    ):
-        if _DS4_MHC_PRE_VERSION == "v3":
-            mhc_pre = ixfops.ds4_mhc_pre_v3
-        elif _DS4_MHC_PRE_VERSION == "v2":
-            mhc_pre = ixfops.ds4_mhc_pre_v2
-        else:
-            mhc_pre = ixfops.mhc_pre
-        post_mix, comb_mix, layer_input = mhc_pre(
+        norm: RMSNorm,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return normalized sub-layer input and the two MHC mixes."""
+        fuse_norm = (
+            self._hc_pre_workspace is not None
+            and norm.has_weight
+            and norm.variance_size_override is None
+            and norm.weight.dtype == x.dtype
+            and ixfops.enable_hc_pre_norm_fusion(*x.shape, x.dtype)
+        )
+        post_mix, comb_mix, layer_input = ixfops.ds4_mhc_pre_v2(
             residual=x,
             fn=hc_fn,
             hc_scale=hc_scale,
@@ -729,53 +700,12 @@ class IluDeepseekV4DecoderLayer(nn.Module):
             hc_sinkhorn_eps=self.hc_eps,
             hc_post_mult_value=self.hc_post_alpha,
             sinkhorn_repeat=self.hc_sinkhorn_iters,
+            workspace=self._hc_pre_workspace if fuse_norm else None,
+            need_rms=fuse_norm,
+            rms_weight=norm.weight if fuse_norm else None,
+            layer_rms_eps=norm.variance_epsilon,
         )
-        return layer_input, post_mix, comb_mix
-
-    def hc_pre_norm(
-        self,
-        x: torch.Tensor,
-        hc_fn: torch.Tensor,
-        hc_scale: torch.Tensor,
-        hc_base: torch.Tensor,
-        norm: RMSNorm,
-        emit_dynamic_int8: bool = False,
-    ):
-        """hc_pre followed by the sublayer ``norm``, fused where supported.
-
-        ds4_mhc_pre_v2 can normalize ``layer_input`` while it is still in
-        registers after the weighted sum (``need_rms=True``), which saves a
-        (T, hidden_size) global-memory round-trip vs. calling ``norm`` on the
-        kernel's output. Whether this step qualifies was settled by
-        ``_HcPreNormFusion.begin_step``.
-        """
-        if self.hc_pre_fusion is not None and self.hc_pre_fusion.enabled:
-            outputs = ixfops.ds4_mhc_pre_v2(
-                residual=x,
-                fn=hc_fn,
-                hc_scale=hc_scale,
-                hc_base=hc_base,
-                rms_eps=self.rms_norm_eps,
-                hc_pre_eps=self.hc_eps,
-                hc_sinkhorn_eps=self.hc_eps,
-                hc_post_mult_value=self.hc_post_alpha,
-                sinkhorn_repeat=self.hc_sinkhorn_iters,
-                workspace=self.hc_pre_fusion.acquire(),
-                need_rms=True,
-                rms_weight=norm.weight.data,
-                layer_rms_eps=norm.variance_epsilon,
-                emit_dynamic_int8=emit_dynamic_int8,
-            )
-            if emit_dynamic_int8:
-                post_mix, comb_mix, layer_input, quantized, scales = outputs
-                dynamic_int8_input = (quantized, scales, layer_input.dtype)
-            else:
-                post_mix, comb_mix, layer_input = outputs
-                dynamic_int8_input = None
-            return layer_input, post_mix, comb_mix, dynamic_int8_input
-
-        layer_input, post_mix, comb_mix = self.hc_pre(x, hc_fn, hc_scale, hc_base)
-        return norm(layer_input), post_mix, comb_mix, None
+        return (layer_input if fuse_norm else norm(layer_input)), post_mix, comb_mix
 
     def hc_post(
         self,
@@ -783,19 +713,14 @@ class IluDeepseekV4DecoderLayer(nn.Module):
         residual: torch.Tensor,
         post: torch.Tensor,
         comb: torch.Tensor,
-        *,
-        reduce_x: bool = False,
-    ):
-        if reduce_x:
-            out = torch.empty_like(residual)
-            return ixfops.allreduce_mhc_post(
-                x,
-                residual,
-                post,
-                comb,
-                out,
-                group=get_tp_group().device_group,
-            )
+    ) -> torch.Tensor:
+        """MHC post: fold the sub-layer output back into the ``hc_mult`` streams.
+
+        ``out[t,o,h] = post[t,o,0] * x[t,h] + sum_i comb[t,i,o] * residual[t,i,h]``
+        (W4A8 ``deepseek_v4/model.py:589-596``). ``comb`` is
+        ``[token, in_stream, out_stream]``; transposing it silently changes the
+        result, so it is passed through untouched.
+        """
         return ixfops.mhc_post(x, residual, post, comb)
 
     def forward(
@@ -804,86 +729,49 @@ class IluDeepseekV4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
     ) -> torch.Tensor:
-        # v2 feeds hc_*_fn straight into the same-dtype cuinfer GEMM
-        # (ixformer_linear), so cast the fp32 weights to x's dtype once on the
-        # first forward and cache in-place; later forwards hit the dtype guard
-        # and no-op. v1 / v3 keep fp32 fn.
-        if _DS4_MHC_PRE_VERSION == "v2":
-            if self.hc_attn_fn.dtype != x.dtype:
-                self.hc_attn_fn.data = self.hc_attn_fn.data.to(x.dtype)
-            if self.hc_ffn_fn.dtype != x.dtype:
-                self.hc_ffn_fn.data = self.hc_ffn_fn.data.to(x.dtype)
+        """MHC pre/post around attention and MoE."""
+        # ``ds4_mhc_pre_v2`` feeds ``fn`` straight into a same-dtype GEMM, so the
+        # fp32 checkpoint weights are cast once on the first forward and cached
+        # in place (W4A8 ``model.py:605-612``). ``hc_head_fn`` must stay fp32 --
+        # ``ds4_hc_head`` validates it as float32.
+        if self.hc_attn_fn.dtype != x.dtype:
+            self.hc_attn_fn.data = self.hc_attn_fn.data.to(x.dtype)
+        if self.hc_ffn_fn.dtype != x.dtype:
+            self.hc_ffn_fn.data = self.hc_ffn_fn.data.to(x.dtype)
 
-        if self.owns_hc_pre_fusion:
-            self.hc_pre_fusion.begin_step(x.shape[0])
-
-        decode_only = self.ffn._is_all_ranks_decode_only()
-
+        # --- attention sub-layer -------------------------------------------
         residual = x
-        emit_attn_quant = (
-            _DS4_MHC_DYNAMIC_INT8 and self.attn_pre_quant_enabled and decode_only
+        x, post, comb = self.hc_pre(
+            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base, self.attn_norm
         )
-        x, post, comb, attention_input = self.hc_pre_norm(
-            x,
-            self.hc_attn_fn,
-            self.hc_attn_scale,
-            self.hc_attn_base,
-            self.attn_norm,
-            emit_dynamic_int8=emit_attn_quant,
-        )
-        x = self.attn(
-            positions,
-            x,
-            None,
-            fused_wqa_wkv_input=attention_input,
-        )
-        x = self.hc_post(
-            x,
-            residual,
-            post,
-            comb,
-            reduce_x=_DS4_ALLREDUCE_MHC_POST,
-        )
-
-        residual = x
-        emit_ffn_quant = (
-            _DS4_MHC_DYNAMIC_INT8 and self.ffn_pre_shared_quant_enabled and decode_only
-        )
-        x, post, comb, shared_gate_up_input = self.hc_pre_norm(
-            x,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
-            self.ffn_norm,
-            emit_dynamic_int8=emit_ffn_quant,
-        )
-        x = self.ffn(
-            x,
-            input_ids,
-            shared_gate_up_input=shared_gate_up_input,
-        )
+        x = self.attn(positions, x, None)
         x = self.hc_post(x, residual, post, comb)
-        return x
+
+        # --- FFN sub-layer --------------------------------------------------
+        residual = x
+        x, post, comb = self.hc_pre(
+            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base, self.ffn_norm
+        )
+        x = self.ffn(x, input_ids)
+        return self.hc_post(x, residual, post, comb)
 
 
-def default_aux_hidden_state_layers(hf_config) -> tuple[int, ...]:
-    """Aux capture layers for a DSpark draft.
+class IluDeepseekV4Fp8Model(nn.Module):
+    """Embedding + 43 decoder layers + final norm + the global MHC head.
 
-    ``dspark_target_layer_ids`` names the *source* decoder layers; capture
-    happens after that layer runs, so the runner-facing ids are shifted by one
-    (same convention as community eagle3 / DFlash).
+    Community counterpart: ``DeepseekV4Model``
+    (``vllm/models/deepseek_v4/nvidia/model.py:960-1055``), single-stream
+    and without the MegaMoE / Eagle plumbing.
     """
-    layer_ids = getattr(hf_config, "dspark_target_layer_ids", None) or ()
-    return tuple(i + 1 for i in layer_ids)
 
-
-class IluDeepseekV4Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
 
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config
+        self.quant_config = quant_config
+        self.parallel_config = vllm_config.parallel_config
 
         self.vocab_size = config.vocab_size
         self.hc_eps = config.hc_eps
@@ -891,30 +779,13 @@ class IluDeepseekV4Model(nn.Module):
         self.hc_dim = self.hc_mult * config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
 
-        aux_stream_list = [torch.cuda.Stream() for _ in range(1)]
-        self.aux_stream_dict: dict[EventType, torch.cuda.Stream] = {
-            EventType.Attention: aux_stream_list[0],
-        }
-
+        # Shared across every indexer layer (community: nvidia/model.py:991).
+        # Community allocates on CPU; the W4A8 fork passes an explicit device
+        # (model.py:658-663). Following the fork.
         self.device = current_platform.device_type
-        if _DS4_MHC_PRE_VERSION == "v2":
-            logger.info(
-                "DeepSeek-V4 mhc_pre: using ds4_mhc_pre_v2 (bf16 GEMM + epilogue)"
-            )
-        elif _DS4_MHC_PRE_VERSION == "v3":
-            logger.info(
-                "DeepSeek-V4 mhc_pre: using ds4_mhc_pre_v3 (bf16 GEMM + split epilogue)"
-            )
-
-        # -1 is the "no token" sentinel. Consumers bound each row by the
-        # token's position, so they never read a row the indexer skipped, but
-        # an index buffer should still not start out as uninitialised memory.
-        self.topk_indices_buffer = torch.full(
-            (
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                config.index_topk,
-            ),
-            -1,
+        self.topk_indices_buffer = torch.empty(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            config.index_topk,
             dtype=torch.int32,
             device=self.device,
         )
@@ -929,47 +800,25 @@ class IluDeepseekV4Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        # Shared hc_pre + RMSNorm fusion state: one sync flag per fused call
-        # (every decoder layer makes two, attn + ffn), refreshed once per
-        # forward in forward() below for the steps that qualify.
-        self.hc_pre_fusion = (
-            _HcPreNormFusion(
-                num_layers=config.num_hidden_layers,
-                n_hc=self.hc_mult,
-                hidden_size=config.hidden_size,
-                dtype=vllm_config.model_config.dtype,
-                device=self.device,
-            )
-            if _hc_pre_norm_fusion_available()
-            else None
-        )
-        if self.hc_pre_fusion is not None:
-            logger.info(
-                "DeepSeek-V4 hc_pre: attn_norm / ffn_norm folded into the "
-                "ds4_mhc_pre_v2 epilogue on steps ixformer supports it"
-            )
-
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: IluDeepseekV4DecoderLayer(
+            lambda prefix: IluDeepseekV4Fp8DecoderLayer(
                 vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
-                aux_stream_dict=self.aux_stream_dict,
-                hc_pre_fusion=self.hc_pre_fusion,
             ),
             prefix=f"{prefix}.layers",
         )
-        # Populated by IluDeepseekV4ForCausalLM.set_aux_hidden_state_layers when
-        # a DSpark draft is active. Empty => forward keeps its single-tensor
-        # return, so MTP and non-speculative paths are unaffected.
-        self.aux_hidden_state_layers: tuple[int, ...] = ()
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
 
+        # Global MHC head: [hc_mult, hc_mult * hidden_size] /
+        # [hc_mult] / [1], all fp32.  Checkpoint keys are ``hc_head_fn`` /
+        # ``hc_head_base`` / ``hc_head_scale``, lifted to ``model.hc_head_*`` by
+        # the dot-less ``hc_head`` prefix rule in _make_fp8_weights_mapper().
         self.hc_head_fn = nn.Parameter(
             torch.empty(self.hc_mult, self.hc_dim, dtype=torch.float32),
             requires_grad=False,
@@ -983,7 +832,7 @@ class IluDeepseekV4Model(nn.Module):
 
         # Pre-hc_head residual stream buffer for the MTP draft. Only allocated
         # on the last PP rank -- that's where MTP target hidden states are
-        # produced.
+        # produced (W4A8 ``model.py:712-723``).
         if get_pp_group().is_last_rank:
             self._mtp_hidden_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
@@ -994,6 +843,19 @@ class IluDeepseekV4Model(nn.Module):
         else:
             self._mtp_hidden_buffer = None
 
+        # Populated by ``IluDeepseekV4Fp8ForCausalLM.set_aux_hidden_state_layers``
+        # when a DSpark draft is active. Empty => forward keeps its single-tensor
+        # return, so MTP and non-speculative paths are unaffected. Mirrors the
+        # W4A8 ``model.py`` aux-hidden plumbing.
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
+
+        # Filled by ``load_weights``, read by the Load_Verifier on
+        # ``IluDeepseekV4Fp8ForCausalLM``: the checkpoint-side names
+        # (post-mapper, pre-fusion) that the main loop handled.  Accumulated
+        # across every ``load_weights`` call of one load and cleared by
+        # ``reset_consumed_ckpt_names()``.
+        self.consumed_ckpt_names: set[str] = set()
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -1003,10 +865,10 @@ class IluDeepseekV4Model(nn.Module):
         dtype: torch.dtype,
         device: torch.device,
     ) -> IntermediateTensors:
-        # PP intermediate tensors carry the multi-stream hidden_states of
-        # shape (num_tokens, hc_mult, hidden_size) -- V4 expands the token
-        # embedding to hc_mult streams before the first decoder layer and
-        # keeps that shape until ds4_hc_head() collapses it on the last rank.
+        # PP intermediate tensors carry the multi-stream hidden_states of shape
+        # (num_tokens, hc_mult, hidden_size): V4 expands the token embedding to
+        # hc_mult streams before the first decoder layer and keeps that shape
+        # until the hc_head collapse on the last rank.
         return IntermediateTensors(
             {
                 "hidden_states": torch.zeros(
@@ -1017,6 +879,24 @@ class IluDeepseekV4Model(nn.Module):
             }
         )
 
+    def hc_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Collapse the ``hc_mult`` residual streams down to ``hidden_size``.
+
+        Community: ``vllm/models/deepseek_v4/nvidia/model.py:1137-1144``
+        (``hc_head_fused_kernel_tilelang`` over ``hc_head_fn`` / ``_scale`` /
+        ``_base``); here the ixformer kernel, as in W4A8 ``model.py:765-772``.
+        ``hc_head_fn`` stays fp32 -- unlike the per-layer ``hc_*_fn`` it is
+        validated as float32 by the kernel, so it must not be cast.
+        """
+        return ixfops.hc_head(
+            hidden_states,
+            self.hc_head_fn,
+            self.hc_head_scale,
+            self.hc_head_base,
+            rms_norm_eps=self.rms_norm_eps,
+            hc_eps=self.hc_eps,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1024,18 +904,28 @@ class IluDeepseekV4Model(nn.Module):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        """Embed -> 43 decoder layers -> hc_head -> norm.
+
+        Mirrors ``DeepseekV4Model.forward``
+        (``vllm/models/deepseek_v4/nvidia/model.py:1080-1145``) / W4A8
+        ``model.py:738-772``, minus the aux streams.
+        The token embedding is expanded to ``hc_mult`` streams before the loop
+        and stays that shape all the way to ``hc_head``: each layer does its own
+        closing ``hc_post``, so unlike NVIDIA there is no per-layer state to
+        thread and no deferred post to reconstruct here.
+        """
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
+            # (T, H) -> (T, hc_mult, H): every stream starts identical, which
+            # makes the plain hc_pre equivalent to community's broadcast pre.
+            # ``repeat`` also gives the contiguous tensor the kernels require.
             hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-
-        if self.hc_pre_fusion is not None:
-            self.hc_pre_fusion.begin_step(hidden_states.shape[0])
 
         aux_hidden_states: list[torch.Tensor] = []
         for idx, layer in enumerate(
@@ -1050,26 +940,118 @@ class IluDeepseekV4Model(nn.Module):
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
+        # Stash pre-hc_head residual for the MTP draft (only on last rank).
         num_tokens = hidden_states.shape[0]
+        assert self._mtp_hidden_buffer is not None
         self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
-        hidden_states = ixfops.hc_head(
-            hidden_states,
-            self.hc_head_fn,
-            self.hc_head_scale,
-            self.hc_head_base,
-            rms_norm_eps=self.rms_norm_eps,
-            hc_eps=self.hc_eps,
-        )
+        hidden_states = self.hc_head(hidden_states)
         hidden_states = self.norm(hidden_states)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
 
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        """Routed-expert name fragments, built once per ``load_weights`` call.
+
+        Community counterpart: ``DeepseekV4Model.get_expert_mapping``
+        (``nvidia/model.py:1277-1291``) minus its MegaMoE branch --
+        ``make_deepseek_v4_expert_params_mapping`` is only for
+        ``use_mega_moe``, which this model never enables.
+
+        The returned 4-tuples are ``(param_name, weight_name, expert_id,
+        shard_id)`` where both names are **fragments**, e.g.
+        ``("experts.routed_experts.w13_", "experts.7.w1.", 7, "w1")``. The
+        loader turns them into real names with
+        ``name.replace(weight_name, param_name)``, which is what folds
+        ``...ffn.experts.7.w1.weight`` into
+        ``...ffn.experts.routed_experts.w13_weight`` and
+        ``...ffn.experts.7.w1.weight_scale`` into
+        ``...ffn.experts.routed_experts.w13_weight_scale`` from the same entry.
+        """
+        return fused_moe_make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name="w1",
+            ckpt_down_proj_name="w2",
+            ckpt_up_proj_name="w3",
+            num_experts=self.config.n_routed_experts,
+        )
+
+    def _pad_shared_expert_weight(
+        self, name: str, loaded_weight: torch.Tensor
+    ) -> torch.Tensor:
+        """Zero-pad a block-FP8 shared-expert weight/scale on its intermediate axis.
+
+        Community counterpart: ``DeepseekV4Model._pad_shared_expert_weight``
+        (``nvidia/model.py:1259-1281``).
+
+        The intermediate axis is rounded up to a whole number of TP shards so
+        the ordinary column/row-parallel loaders below split it evenly and the
+        trailing ranks land on the zero pad. The axis is counted in *elements*
+        for weights (step = ``block_size[0]``) and in *blocks* for the
+        ``weight_scale_inv`` companions (step = 1); gate (``w1``) / up (``w3``)
+        are ``[I, H]`` so they pad dim 0, down (``w2`` -> ``down_proj``) is
+        ``[H, I]`` so it pads dim 1.
+
+        Must agree with the matching round-up in ``IluDeepseekV4Fp8MLP.__init__``
+        -- the pad is only correct if the layer was built at the padded size.
+
+        On this checkpoint (``I = 2048``, ``block = [128, 128]``, ``tp = 8``)
+        ``mult = 8 * 128 = 1024`` and ``cdiv(2048, 1024) * 1024 - 2048 == 0``, so
+        this is a **no-op that early-returns the input object itself**.  It stays
+        because a different checkpoint or TP size makes it fire.
+        """
+        block_size = getattr(self.quant_config, "weight_block_size", None)
+        assert block_size is not None
+        step = 1 if name.endswith("weight_scale_inv") else block_size[0]
+        dim = 1 if ".down_proj." in name else 0
+        mult = get_tensor_model_parallel_world_size() * step
+        pad = cdiv(loaded_weight.shape[dim], mult) * mult - loaded_weight.shape[dim]
+        if pad == 0:
+            return loaded_weight
+        pad_shape = list(loaded_weight.shape)
+        pad_shape[dim] = pad
+        return torch.cat([loaded_weight, loaded_weight.new_zeros(pad_shape)], dim=dim)
+
+    def reset_consumed_ckpt_names(self) -> None:
+        """Drop the Load_Verifier bookkeeping before a fresh load starts.
+
+        The clear must happen once per *load*, not once per ``load_weights``
+        call, because ``AutoWeightsLoader`` calls ``load_weights`` once per
+        contiguous run of ``model.*`` names (``itertools.groupby`` only merges
+        adjacent keys), so the method may be entered more than once.
+        """
+        self.consumed_ckpt_names = set()
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Stacked params shared by attention / shared_experts / compressor.
-        # Routed experts are handled below via expert_mapping.
+        """Main loading loop, transcribed from community ``nvidia/model.py:1150-1257``.
+
+        Names arriving here have already been rewritten by
+        ``hf_to_vllm_mapper`` and ``mtp.*`` has already been dropped by the
+        model ``WeightsMapper`` (``"mtp.": None``).
+
+        Four branches, in the order the community loop tries them:
+
+        1. **stacked fusion** -- three pairs of checkpoint tensors that share
+           one parameter: ``attn.wq_a`` / ``attn.wkv`` ->
+           ``attn.fused_wqa_wkv``, ``compressor.wkv`` / ``compressor.wgate`` ->
+           ``compressor.fused_wkv_wgate``, and the shared expert's ``w1`` /
+           ``w3`` -> ``gate_up_proj``.
+        2. **routed experts** -- ``expert_mapping`` is tried entry by entry with
+           ``return_success=True``, because a weight for a non-local expert
+           must not consume the slot of a replica that *is* local.  e8m0 scales
+           are re-interpreted with ``view(torch.uint8)`` to preserve the raw
+           exponent bytes.
+        3. **attn_sink** -- the checkpoint holds all ``num_attention_heads``
+           sinks; this rank takes its own head slice.
+        4. **plain** -- the parameter's own ``weight_loader`` (TP-aware) or
+           ``default_weight_loader``.
+
+        Every checkpoint name this loop *handles* is recorded in
+        ``self.consumed_ckpt_names`` for the Load_Verifier.
+        """
         stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
             ("gate_up_proj", "w1", 0),
             ("gate_up_proj", "w3", 1),
             ("attn.fused_wqa_wkv", "attn.wq_a", 0),
@@ -1079,7 +1061,11 @@ class IluDeepseekV4Model(nn.Module):
         ]
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        # Accumulate, never reset here -- this method may be entered more than
+        # once per load (see ``reset_consumed_ckpt_names``).
+        consumed_ckpt_names = self.consumed_ckpt_names
 
+        # attn_sink head slice for this rank (community nvidia/model.py:1163-1169).
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
         n_head = self.config.num_attention_heads
@@ -1087,16 +1073,39 @@ class IluDeepseekV4Model(nn.Module):
         head_rank_start = n_local_head * tp_rank
         head_rank_end = n_local_head * (tp_rank + 1)
 
+        # Built once: the mapping is O(num_experts * 3) tuples and independent of
+        # the weight being loaded (community nvidia/model.py:1171-1172).
         expert_mapping = self.get_expert_mapping()
 
+        # Same gate as community (nvidia/model.py:1174-1181): only block-FP8,
+        # non-sequence-parallel shared experts need the intermediate pad.
+        pad_shared_expert = (
+            getattr(self.quant_config, "weight_block_size", None) is not None
+            and not self.parallel_config.use_sequence_parallel_moe
+        )
+
         for name, loaded_weight in weights:
+            # ``name`` is rewritten in place by the stacked / expert branches, so
+            # keep the incoming checkpoint name for the Load_Verifier.
+            ckpt_name = name
+            # A missing subtree may have no routed-expert mapping at all.
+            # Drop it before mapping/padding, while keeping verifier coverage.
+            if is_pp_missing_parameter(name, self):
+                consumed_ckpt_names.add(ckpt_name)
+                continue
+            if pad_shared_expert and ".shared_experts." in name:
+                loaded_weight = self._pad_shared_expert_weight(name, loaded_weight)
             for param_name, weight_name, shard_id in stacked_params_mapping:
+                # Skip non-stacked layers and experts (experts handled below).
                 if ".experts." in name:
                     continue
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                # Skip params that don't live on this PP rank.
+
+                # Matched a stacked rule either way: on another PP rank the
+                # tensor is deliberately dropped, not unmapped.
+                consumed_ckpt_names.add(ckpt_name)
                 if is_pp_missing_parameter(name, self):
                     break
                 param = params_dict[name]
@@ -1106,42 +1115,82 @@ class IluDeepseekV4Model(nn.Module):
                 break
             else:
                 if ".experts." in name:
-                    # Note: the offline converter writes routed-expert
-                    # weight_scale as fp32 (channel) or [n_groups, ...]
-                    # group-int4 scales -- never as float8_e8m0fnu -- so we
-                    # do *not* need the upstream uint8-bitcast workaround.
-                    if is_pp_missing_parameter(name, self):
-                        continue
+                    # E8M0 scales are stored as float8_e8m0fnu in checkpoints but
+                    # the MoE param is uint8. copy_() would do a numeric
+                    # conversion (e.g. 2^-7 -> 0), destroying the raw exponent
+                    # bytes -- so re-interpret instead.
+                    if (
+                        "weight_scale" in name
+                        and loaded_weight.dtype == torch.float8_e8m0fnu
+                    ):
+                        loaded_weight = loaded_weight.view(torch.uint8)
+                    name_mapped: str | None = None
                     for mapping in expert_mapping:
-                        param_name, weight_name, expert_id, shard_id = mapping
+                        param_name, weight_name, expert_id, expert_shard_id = mapping
                         if weight_name not in name:
                             continue
-                        name_mapped = name.replace(weight_name, param_name)
+                        # A name match means the expert rules cover this tensor;
+                        # whether *this* rank owns the expert is a separate
+                        # question, answered by ``return_success`` below.
+                        consumed_ckpt_names.add(ckpt_name)
+                        candidate = name.replace(weight_name, param_name)
+                        if is_pp_missing_parameter(candidate, self):
+                            continue
+                        name_mapped = candidate
                         param = params_dict[name_mapped]
-                        weight_loader = cast(Callable[..., bool], param.weight_loader)
+                        # Ask the weight loader whether it actually consumed the
+                        # tensor: a non-local expert returns False and we must
+                        # keep trying, otherwise a replica that *is* local would
+                        # be skipped.
+                        weight_loader = typing.cast(
+                            Callable[..., bool], param.weight_loader
+                        )
                         success = weight_loader(
                             param,
                             loaded_weight,
                             name_mapped,
-                            shard_id=shard_id,
+                            shard_id=expert_shard_id,
                             expert_id=expert_id,
                             return_success=True,
                         )
                         if success:
                             name = name_mapped
                             break
-                    loaded_params.add(name_mapped)
+                    # Community adds ``name_mapped`` unconditionally here
+                    # (nvidia/model.py:1232). Two deliberate hardenings, both
+                    # no-ops on the happy path this checkpoint takes:
+                    #   * the ``None`` guard -- community raises NameError if no
+                    #     mapping matched at all; leaving the tensor unrecorded
+                    #     hands it to the unconsumed report instead;
+                    #   * assigning ``name_mapped`` only *after* the PP check, so
+                    #     a parameter this rank does not own is never reported as
+                    #     loaded (community would report it).
+                    # Loading behaviour itself -- which slice of which parameter
+                    # gets written -- is byte-identical to community.
+                    if name_mapped is not None:
+                        loaded_params.add(name_mapped)
                     continue
                 elif "attn_sink" in name:
+                    consumed_ckpt_names.add(ckpt_name)
                     if is_pp_missing_parameter(name, self):
                         continue
                     narrow_weight = loaded_weight[head_rank_start:head_rank_end]
                     n = narrow_weight.shape[0]
+                    # Front-fill only; the remaining padded_heads - n slots keep
+                    # their -inf initialisation.
                     params_dict[name][:n].copy_(narrow_weight)
                     loaded_params.add(name)
                     continue
                 else:
                     if is_pp_missing_parameter(name, self):
+                        # Owned by another PP rank: handled, not unmapped.
+                        consumed_ckpt_names.add(ckpt_name)
+                        continue
+                    if name not in params_dict:
+                        # No parameter of that name: leave it for the
+                        # unconsumed-tensor report instead of raising KeyError
+                        # deep inside the loop -- a missing mapper rule must
+                        # surface as a named list, not a stack trace.
                         continue
                     param = params_dict[name]
                     weight_loader = getattr(
@@ -1149,73 +1198,28 @@ class IluDeepseekV4Model(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
                     loaded_params.add(name)
+                    consumed_ckpt_names.add(ckpt_name)
                     continue
 
         return loaded_params
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=self.config.n_routed_experts,
-        )
 
+class IluDeepseekV4Fp8ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
+    """Top-level causal-LM for the raw-FP8 DeepSeek-V4-Flash checkpoint.
 
-def _make_ilu_deepseek_v4_weights_mapper() -> WeightsMapper:
-    """Translate ckpt names produced by ``convert_v4_to_w4a8.py`` to vLLM's
-    internal parameter names.
-
-    The converter already renamed ``.scale`` to ``.weight_scale`` (matching
-    both W4A8 MoE method's ``w13_weight_scale`` / ``w2_weight_scale`` and
-    W8A8 Linear scheme's ``weight_scale``), so no scale-suffix regex is
-    required here. Other rules mirror upstream (prefix lifts, gate.bias to
-    e_score_correction_bias, ``shared_experts.w2`` -> ``.down_proj``, and
-    moving compressor under ``mla_attn``).
+    Registered under the community arch name ``DeepseekV4ForCausalLM``
+    so the checkpoint is loaded unmodified.
     """
-    return WeightsMapper(
-        orig_to_new_prefix={
-            "layers.": "model.layers.",
-            "embed.": "model.embed.",
-            "norm.": "model.norm.",
-            "hc_head": "model.hc_head",
-            "mtp.": "model.mtp.",
-        },
-        # Reserved for future-compat; no-op today.
-        orig_to_new_regex={
-            re.compile(r"(?!)"): r"",
-        },
-        orig_to_new_suffix={
-            "head.weight": "lm_head.weight",
-            "embed.weight": "embed_tokens.weight",
-            ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
-        },
-        orig_to_new_substr={
-            ".attn.compressor.": ".attn.mla_attn.compressor.",
-            ".shared_experts.w2": ".shared_experts.down_proj",
-            # vLLM v0.31.0 (db9527a468) dropped AutoWeightsLoader.skip_substrs; the MTP
-            # weights are loaded by the separate IluDeepSeekV4MTPModel draft
-            # model, so the base model drops them here via the mapper (maps
-            # to None). The orig_to_new_prefix rename ``mtp.`` -> ``model.mtp.``
-            # runs first, then this substr rule drops the renamed name.
-            "mtp.": None,
-        },
-    )
 
-
-class IluDeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
-    """Top-level causal-LM for ilu fork's W4A8 DeepSeek-V4."""
-
-    model_cls = IluDeepseekV4Model
-    hf_to_vllm_mapper = _make_ilu_deepseek_v4_weights_mapper()
+    model_cls = IluDeepseekV4Fp8Model
+    hf_to_vllm_mapper = _make_v4_fp8_weights_mapper()
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.config = config
-        self.model_dtype = vllm_config.model_config.dtype
-        # No expert_dtype dispatch -- this class is bound to W4A8 only.
+        # No expert_dtype dispatch: this class is bound to the raw FP8 +
+        # MXFP4-experts checkpoint, i.e. community's ``expert_dtype == "fp4"``.
         self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -1228,14 +1232,24 @@ class IluDeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         else:
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.make_empty_intermediate_tensors = (
+        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.model.make_empty_intermediate_tensors
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        # Wired by the runner (``set_eagle3_aux_hidden_state_layers``) when a
+        # DSpark draft is active; enables the aux-hidden capture in the model.
+        self.model.aux_hidden_state_layers = tuple(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return default_aux_hidden_state_layers(self.config)
+
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        # Community: vllm/models/deepseek_v4/nvidia/model.py:1443-1448
+        # (self.logits_processor(self.lm_head, hidden_states)).
         return self.logits_processor(self.lm_head, hidden_states)
 
     def forward(
@@ -1245,94 +1259,174 @@ class IluDeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        # Community: vllm/models/deepseek_v4/nvidia/model.py:1450-1462
+        # (delegates straight to self.model).
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
-    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
-        self.model.aux_hidden_state_layers = tuple(layers)
+    def _tap_weight_names(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+        seen: dict[str, str],
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Pass ``weights`` through untouched while recording name + dtype.
 
-    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
-        return default_aux_hidden_state_layers(self.config)
+        ``AutoWeightsLoader`` drains the weight generator, so the only way to
+        learn which checkpoint tensors actually arrived is to tap the stream on
+        the way in.  Only two short strings per tensor are kept -- never the
+        tensor -- so the tap costs no extra host or device memory.
 
-    # NOTE: applied uniformly to skip_substrs in AutoWeightsLoader and to
-    # the post-load missing-param check below.
-    _LOAD_SKIP_SUBSTRS: tuple[str, ...] = ("mtp.",)
+        Names are recorded *mapped* (via ``apply_list``, same
+        ``_map_name_with_shard`` path as the stream ``apply``) so they line up
+        with what ``IluDeepseekV4Fp8Model.load_weights`` records as consumed.
+        Names the loader will drop (``mtp.*`` via the model mapper +
+        rotary leftovers via ``REMOVE_UNUSED_ROTARY_EMBEDS_MAPPER``, which
+        the loader composes internally) are not recorded.
+        """
+        mapper = (
+            self.hf_to_vllm_mapper
+            | AutoWeightsLoader.REMOVE_UNUSED_ROTARY_EMBEDS_MAPPER
+        )
+        for name, tensor in weights:
+            mapped = mapper.apply_list([name])
+            if mapped and not _is_load_skipped(mapped[0]):
+                seen[mapped[0]] = fp8_load_stats.dtype_name(tensor.dtype)
+            yield name, tensor
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # vLLM v0.31.0 (db9527a468) removed AutoWeightsLoader.skip_substrs; ``mtp.*`` weights
-        # are dropped by ``hf_to_vllm_mapper`` (``"mtp.": None`` in
-        # orig_to_new_substr) and loaded separately by IluDeepSeekV4MTPModel.
+        """Load the checkpoint, then run the Load_Verifier.
+
+        ``mtp.*`` is dropped by the model ``WeightsMapper`` (``"mtp.": None``),
+        matching the community ``nvidia/model.py`` load rules; the loading
+        rules themselves live in ``IluDeepseekV4Fp8Model.load_weights``.
+
+        Three closing steps, in this order -- statistics first so the numbers are
+        on record even when a check below fails, and the raise last so the
+        WARNING it would otherwise hide is already out:
+
+        1. **statistics**: the seven checkpoint-side categories plus the total,
+           one ``key=value`` line each.  Classification is the scanner logic in
+           ``fp8_load_stats``.
+        2. **unconsumed tensor report**: checkpoint tensors that arrived but
+           matched no rule, at WARNING level with a count and up to 20 names.
+           Catches a missing mapper rule silently dropping tensors.
+        3. **strict reverse check**: parameters that no weight ever filled,
+           excluding ``mtp.*`` and this rank's PP-missing parameters, raising
+           ``ValueError`` with a count and up to 20 names.  vLLM's own
+           missing-parameter check does not run for this model
+           (``DefaultModelLoader`` only performs it when
+           ``model_config.quantization is None``).
+
+        Steps 1/2 count **checkpoint tensors**, step 3 counts **parameters**.
+        Stacked fusion and expert merging are many-to-one, so the two totals
+        cannot be directly compared.
+        """
+        seen: dict[str, str] = {}
+        # Once per load, before the loader runs: ``IluDeepseekV4Fp8Model``
+        # accumulates and ``AutoWeightsLoader`` may enter its ``load_weights``
+        # several times (see ``reset_consumed_ckpt_names``).
+        self.model.reset_consumed_ckpt_names()
+        # vLLM v0.31.0 (db9527a468) removed AutoWeightsLoader.skip_substrs; ``mtp.*`` is
+        # dropped by ``hf_to_vllm_mapper`` (``"mtp.": None``) and loaded
+        # separately by IluDeepseekV4Fp8MTP. Rotary leftovers are dropped
+        # internally by the loader (REMOVE_UNUSED_ROTARY_EMBEDS_MAPPER).
         loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(
+            self._tap_weight_names(weights, seen), mapper=self.hf_to_vllm_mapper
+        )
 
-        # Strict reverse check: every nn.Parameter must be filled from the
-        # checkpoint. vLLM's DefaultModelLoader only runs this check when
-        # ``model_config.quantization is None`` (see
-        # ``vllm/model_executor/model_loader/default_loader.py``), we have to do it ourselves.
-        # Without this guard a missing scale / weight name mapping silently
-        # falls back to the parameter's init value and produces wrong results.
-        expected: set[str] = set()
-        for name, _ in self.named_parameters():
-            if any(s in name for s in self._LOAD_SKIP_SUBSTRS):
-                continue
-            if is_pp_missing_parameter(name, self):
-                continue
-            expected.add(name)
+        # ``IluDeepseekV4Fp8Model.load_weights`` sees names with the ``model.``
+        # prefix already stripped (AutoWeightsLoader hands each child module the
+        # weights below its own attribute name), so put it back.
+        consumed = {f"{_MODEL_PREFIX}{name}" for name in self.model.consumed_ckpt_names}
+        # Tensors that never reach that loop: parameters AutoWeightsLoader fills
+        # itself, i.e. everything *outside* the ``model.`` subtree
+        # (``lm_head.weight`` here), whose parameter name *is* the mapped
+        # checkpoint name. Names inside the subtree are deliberately **not**
+        # unioned in: ``loaded`` is parameter-side, and for every 1:1 tensor the
+        # parameter name equals the mapped checkpoint name, so unioning all of it
+        # made the report blind to a whole missing bookkeeping set -- that alias
+        # is why the 8-card WARNING looked like "only the stacked and expert
+        # branches lost their entries" when in fact none of them had survived.
+        consumed |= {name for name in loaded if not name.startswith(_MODEL_PREFIX)}
 
-        missing = expected - loaded
-        if missing:
-            preview = sorted(missing)[:20]
-            raise ValueError(
-                "[IluDeepseekV4ForCausalLM.load_weights] "
-                f"{len(missing)} parameter(s) were not initialized from the "
-                f"checkpoint. Showing up to 20:\n  " + "\n  ".join(preview)
+        # --- 1. statistics -------------------------------------------------
+        stats = fp8_load_stats.LoadStats()
+        for name, dtype in seen.items():
+            if name in consumed:
+                stats.record(name, dtype)
+        for line in stats.log_lines():
+            logger.info("%s", line)
+        unknown_note = stats.describe_unknown()
+        if unknown_note is not None:
+            logger.warning("Load statistics: %s", unknown_note)
+
+        # --- 2. unconsumed checkpoint tensors ------------------------------
+        unconsumed = sorted(name for name in seen if name not in consumed)
+        if unconsumed:
+            logger.warning(
+                "%d checkpoint tensor(s) were not consumed by any loading rule "
+                "(stacked / experts / attn_sink / default); a missing mapper rule "
+                "drops weights silently. First %d: %s",
+                len(unconsumed),
+                min(len(unconsumed), _MAX_REPORTED_NAMES),
+                unconsumed[:_MAX_REPORTED_NAMES],
             )
 
-        for module in self.modules():
-            if isinstance(module, IluDeepseekV4MultiHeadLatentAttentionWrapper):
-                module.process_weights_after_loading(self.model_dtype)
+        # --- 3. strict reverse check ---------------------------------------
+        expected = {
+            name
+            for name, _ in self.named_parameters()
+            if not _is_load_skipped(name) and not is_pp_missing_parameter(name, self)
+        }
+        missing = sorted(expected - loaded)
+        if missing:
+            raise ValueError(
+                f"{len(missing)} parameter(s) were never filled by "
+                f"{type(self).__name__}.load_weights. First "
+                f"{min(len(missing), _MAX_REPORTED_NAMES)}: "
+                f"{missing[:_MAX_REPORTED_NAMES]}"
+            )
 
-        # Optional sanity stats (helps first-run dispatch verification: routed
-        # vs. shared expert vs. bf16 base counts should be plausible).
-        n_routed = sum(1 for n in loaded if ".experts." in n and "shared" not in n)
-        n_shared = sum(1 for n in loaded if ".shared_experts." in n)
-        n_other = len(loaded) - n_routed - n_shared
-        logger.info(
-            "[IluDeepseekV4ForCausalLM.load_weights] loaded total=%d "
-            "(routed_experts=%d, shared_experts=%d, other=%d)",
+        logger.debug(
+            "[IluDeepseekV4Fp8ForCausalLM.load_weights] loaded %d parameter(s) "
+            "from %d checkpoint tensor(s)",
             len(loaded),
-            n_routed,
-            n_shared,
-            n_other,
+            len(seen),
         )
         return loaded
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()
-
 
 def register_model() -> None:
-    """Register the Iluvatar DeepSeek-V4 W4A8 causal-LM, MTP, and DSpark draft archs.
+    """Re-point the community DS-V4 arch at the Iluvatar raw-FP8 model.
 
-    Invoked by ``vllm_iluvatar.ilu_register.apply_oot_registrations`` during
-    register_general. The class paths are resolved lazily by ModelRegistry, so
-    importing mtp.py / dspark.py / attention.py is deferred until the model is
-    loaded (the ``vllm::ilu_deepseek_v4_attention`` custom op registers on that
-    import).
+    Invoked by ``vllm_iluvatar.ilu_register._register_models()``.  Keeping the
+    community arch name means the checkpoint's ``config.json`` stays untouched
+    and ``tokenizer_mode`` is still auto-selected as ``"deepseek_v4"`` by
+    community ``ModelConfig``.
+
+    Also overrides community ``DeepSeekV4MTPModel`` with the FP8 MTP draft so
+    ``--speculative-config method=mtp`` resolves without touching
+    ``_ILU_MTP_ARCH_MAP``, which keys on target archs this model does not use.
     """
     from vllm import ModelRegistry
 
     ModelRegistry.register_model(
-        "IluDeepseekV4ForCausalLM",
-        "vllm_iluvatar.models.deepseek_v4.model:IluDeepseekV4ForCausalLM",
+        "DeepseekV4ForCausalLM",
+        "vllm_iluvatar.models.deepseek_v4.model:IluDeepseekV4Fp8ForCausalLM",
     )
     ModelRegistry.register_model(
-        "IluDeepSeekV4MTPModel",
-        "vllm_iluvatar.models.deepseek_v4.mtp:IluDeepSeekV4MTP",
+        "DeepSeekV4MTPModel",
+        "vllm_iluvatar.models.deepseek_v4.mtp:IluDeepseekV4Fp8MTP",
     )
+    # DSpark block drafter for the FP8 checkpoint. Community assigns the draft
+    # arch ``DSparkDraftModel`` in ``SpeculativeConfig.__post_init__``; taking
+    # over that community name here is what routes the target to this draft,
+    # the same way ``DeepSeekV4MTPModel`` routes MTP, and is why
+    # ``config/speculative.py`` needs no DSpark arch remap at all.
     ModelRegistry.register_model(
-        "IluDSparkDraftModel",
-        "vllm_iluvatar.models.deepseek_v4.dspark:IluDSparkDeepseekV4ForCausalLM",
+        "DSparkDraftModel",
+        "vllm_iluvatar.models.deepseek_v4.dspark:IluDSparkDeepseekV4Fp8ForCausalLM",
     )

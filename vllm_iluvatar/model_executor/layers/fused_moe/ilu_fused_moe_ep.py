@@ -517,15 +517,15 @@ class IluFusedMoEEP:
         moe_config = runner.moe_config
         if moe_config.pcp_size > 1:
             raise NotImplementedError(
-                "IluDeepseekV4MoE.forward_dp_ep_deep_ep does not support PCP "
-                f"(pcp_size={moe_config.pcp_size})."
+                f"{type(self).__name__}.forward_dp_ep_deep_ep does not support "
+                f"PCP (pcp_size={moe_config.pcp_size})."
             )
         quant_method = runner._quant_method
         if moe_kernel is None:
             moe_kernel = self._get_forward_dp_ep_ll_moe_kernel()
             if moe_kernel is None:
                 raise NotImplementedError(
-                    "IluDeepseekV4MoE.forward_dp_ep_deep_ep requires the "
+                    f"{type(self).__name__}.forward_dp_ep_deep_ep requires the "
                     "DeepEP LL-style modular kernel path. "
                     f"Got quant method {quant_method.__class__.__name__}."
                 )
@@ -743,8 +743,8 @@ class IluFusedMoEEP:
         moe_config = runner.moe_config
         if moe_config.pcp_size > 1:
             raise NotImplementedError(
-                "IluDeepseekV4MoE.forward_dp_ep does not support PCP "
-                f"(pcp_size={moe_config.pcp_size})."
+                f"{type(self).__name__}.forward_dp_ep_naive does not support "
+                f"PCP (pcp_size={moe_config.pcp_size})."
             )
         quant_method = runner._quant_method
         shared_experts = runner.shared_experts
@@ -818,8 +818,9 @@ class IluFusedMoEEP:
 
         if runner._fused_output_is_reduced:
             raise NotImplementedError(
-                "IluDeepseekV4MoE.forward_dp_ep expects unreduced fused output "
-                "so shared and routed outputs can be added before the combine."
+                f"{type(self).__name__}.forward_dp_ep_naive expects unreduced "
+                "fused output so shared and routed outputs can be added "
+                "before the combine."
             )
 
         if shared_output is not None and fused_output.dtype == torch.float16:
@@ -884,8 +885,8 @@ class IluFusedMoEEP:
         moe_kernel = moe_kernel or self._get_forward_dp_ep_ll_moe_kernel()
         if moe_kernel is None:
             raise NotImplementedError(
-                "IluDeepseekV4MoE.forward_dp_ep requires an initialized "
-                "modular MoE kernel."
+                f"{type(self).__name__}._forward_dp_ep_flatten requires an "
+                "initialized modular MoE kernel."
             )
 
         # init props

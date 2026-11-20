@@ -17,7 +17,7 @@ from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp4_moe imp
 from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.moe.mxfp4_to_w4a8_tn import (
     IluMxfp4ToW4A8TNOnlineMoEMethod,
 )
-from vllm_iluvatar.models.deepseek_v4 import fp8_model as mod
+from vllm_iluvatar.models.deepseek_v4 import model as mod
 
 
 def make_moe(monkeypatch, kind, hash_layer=True):

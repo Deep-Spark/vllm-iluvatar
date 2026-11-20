@@ -252,3 +252,139 @@ def test_f4f8_sorted_experts_match_reference(cuda_device, monkeypatch, tokens):
     test_f4f8_loader_and_local_experts_match_reference(
         cuda_device, monkeypatch, tokens, 1, 0, True, 10.0
     )
+
+
+@requires_corex30
+def test_f4f8_select_gemm_impl_batched_experts_match_local(cuda_device):
+    from types import SimpleNamespace
+    import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+    from vllm.model_executor.layers.fused_moe import FusedMoEActivationFormat
+
+    device = torch.device(cuda_device)
+    torch.manual_seed(2026)
+    parallel = FusedMoEParallelConfig(
+        tp_size=1,
+        tp_rank=0,
+        pcp_size=1,
+        pcp_rank=0,
+        dp_size=1,
+        dp_rank=0,
+        ep_size=1,
+        ep_rank=0,
+        sp_size=1,
+        use_ep=True,
+        all2all_backend="allgather_reducescatter",
+        enable_eplb=False,
+    )
+    moe = FusedMoEConfig(
+        num_experts=_LOCAL_EXPERTS,
+        experts_per_token=2,
+        hidden_dim=_HIDDEN,
+        intermediate_size=_INTERMEDIATE,
+        num_local_experts=_LOCAL_EXPERTS,
+        num_logical_experts=_LOCAL_EXPERTS,
+        activation=MoEActivation.SILU,
+        device=device,
+        routing_method=RoutingMethodType.Default,
+        moe_parallel_config=parallel,
+        in_dtype=torch.bfloat16,
+        swiglu_limit=10.0,
+    )
+    layer = torch.nn.Module()
+    layer.moe_config = moe
+    layer.activation = MoEActivation.SILU
+    layer.swiglu_limit = 10.0
+    layer.apply_router_weight_on_input = False
+    layer.expert_map = None
+    layer._map_global_expert_id_to_local_expert_id = lambda i: i
+    method = IluF4F8MoEMethod(_config(), layer)
+    with torch.device(device):
+        method.create_weights(
+            layer, _LOCAL_EXPERTS, _HIDDEN, _INTERMEDIATE, torch.bfloat16
+        )
+    checkpoint = {
+        "w1": _projection(_LOCAL_EXPERTS, _HIDDEN, _INTERMEDIATE),
+        "w3": _projection(_LOCAL_EXPERTS, _HIDDEN, _INTERMEDIATE),
+        "w2": _projection(_LOCAL_EXPERTS, _INTERMEDIATE, _HIDDEN),
+    }
+    for shard, (packed, scales, _) in checkpoint.items():
+        weight = layer.w2_weight if shard == "w2" else layer.w13_weight
+        scale = layer.w2_weight_scale if shard == "w2" else layer.w13_weight_scale
+        for expert in range(_LOCAL_EXPERTS):
+            for param, tensor, suffix in [
+                (weight, packed[expert], "weight"),
+                (scale, scales[expert], "weight_scale"),
+            ]:
+                param.weight_loader(param, tensor, f"{shard}_{suffix}", shard, expert)
+    method.process_weights_after_loading(layer)
+    from vllm_iluvatar.model_executor.layers.fused_moe.prepare_finalize.ilu_deepep_ll import (
+        nvsm_dispatch_quant_kwargs,
+    )
+
+    qcfg = method.get_fused_moe_quant_config(layer)
+    assert qcfg is not None
+    assert nvsm_dispatch_quant_kwargs(qcfg) == {
+        "use_int8": False,
+        "use_fp8": True,
+        "fp8_format": torch.float8_e4m3fn,
+        "fp8_group_size": None,
+    }
+    method.moe_quant_config = qcfg
+
+    pf = SimpleNamespace(
+        activation_format=FusedMoEActivationFormat.BatchedExperts,
+        max_tokens_per_rank=8,
+        max_num_tokens_per_rank=lambda: 8,
+        num_dispatchers=lambda: 1,
+    )
+    batched = method.select_gemm_impl(pf, layer)
+
+    # Compare single-expert 4-token output between local apply and batched LL apply
+    init_workspace_manager(device)
+    x = (torch.randn(4, _HIDDEN, device=device) * 0.3).to(torch.bfloat16)
+    ids = torch.tensor([[0, 1], [0, 2], [1, 2], [0, 1]], dtype=torch.int32, device=device)
+    weights = torch.ones((4, 2), dtype=torch.float32, device=device)
+    ref_local = method.apply(layer, x, weights, ids, None, None)
+
+    batched_in = torch.zeros((_LOCAL_EXPERTS, 8, _HIDDEN), dtype=torch.float8_e4m3fn, device=device)
+    batched_scale = torch.ones((_LOCAL_EXPERTS, 8), dtype=torch.float32, device=device)
+    counts = torch.zeros((_LOCAL_EXPERTS,), dtype=torch.int32, device=device)
+    slot_map: list[tuple[int, int]] = []
+    from ixformer.inference.functions import dynamic_scaled_fp8_quant
+
+    x_fp8 = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    x_sc = torch.empty((4,), dtype=torch.float32, device=device)
+    dynamic_scaled_fp8_quant(x_fp8, x, x_sc)
+    cpu_counts = [0] * _LOCAL_EXPERTS
+    for tok in range(4):
+        for k in range(2):
+            e = int(ids[tok, k].item())
+            pos = cpu_counts[e]
+            cpu_counts[e] += 1
+            batched_in[e, pos] = x_fp8[tok]
+            batched_scale[e, pos] = x_sc[tok]
+            slot_map.append((tok, e * 8 + pos))
+    counts.copy_(torch.tensor(cpu_counts, dtype=torch.int32, device=device))
+    batched_out = torch.zeros((_LOCAL_EXPERTS, 8, _HIDDEN), dtype=torch.bfloat16, device=device)
+    meta = mk.ExpertTokensMetadata(expert_num_tokens=counts, expert_num_tokens_cpu=None)
+    batched.apply(
+        output=batched_out,
+        hidden_states=batched_in,
+        w1=layer.w13_weight,
+        w2=layer.w2_weight,
+        topk_weights=weights,
+        topk_ids=ids,
+        activation=MoEActivation.SILU,
+        global_num_experts=_LOCAL_EXPERTS,
+        expert_map=None,
+        a1q_scale=batched_scale,
+        a2_scale=None,
+        workspace13=torch.empty(0, device=device),
+        workspace2=torch.empty(0, device=device),
+        expert_tokens_meta=meta,
+    )
+    flat_out = batched_out.view(-1, _HIDDEN).float()
+    summed = torch.zeros((4, _HIDDEN), dtype=torch.float32, device=device)
+    for tok, idx in slot_map:
+        summed[tok] += flat_out[idx]
+    torch.testing.assert_close(summed.to(torch.bfloat16), ref_local, rtol=0.02, atol=0.002)

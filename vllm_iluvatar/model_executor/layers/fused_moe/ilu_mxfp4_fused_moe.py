@@ -68,6 +68,10 @@ import functools
 
 import torch
 from vllm import envs
+from vllm.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm.logger import init_logger
 
 from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (  # noqa: E501
@@ -607,6 +611,13 @@ def _ilu_mxfp4_fused_experts_ixformer(
         )
     )
 
+    # Real forwards drop each stage once its kernel returns. Profiling has no
+    # attn metadata and must keep the buffers, or the KV pool takes the headroom.
+    release_dead_stages = (
+        is_forward_context_available()
+        and get_forward_context().attn_metadata is not None
+    )
+
     # --- 2) Expand + per-token E4M3 -------------------------------------
     a1_fp8, a1_scale = ixfops.moe_expand_input_dynamic_scaled_fp8(
         hidden_states, dst_to_src, top_k
@@ -635,6 +646,8 @@ def _ilu_mxfp4_fused_experts_ixformer(
         fuse_swiglu=False,
         backend=gemm_backend,
     )
+    if release_dead_stages:
+        del a1_fp8, a1_scale
 
     # --- 4) SwiGLU + E4M3 -----------------------------------------------
     if swiglu_variant == _SWIGLUOAI_VARIANT:
@@ -667,6 +680,8 @@ def _ilu_mxfp4_fused_experts_ixformer(
             gemm1_out, dst_to_src, float(swiglu_limit), fp8_output=padded_a2
         )
     a2_fp8 = _zero_pad_last_dim(a2_fp8, w2_k)
+    if release_dead_stages:
+        del gemm1_out
 
     # --- 5) GEMM2 -------------------------------------------------------
     gemm2_out = torch.empty((M, H), dtype=torch.bfloat16, device=hidden_states.device)
@@ -682,6 +697,8 @@ def _ilu_mxfp4_fused_experts_ixformer(
         fuse_swiglu=False,
         backend=gemm_backend,
     )
+    if release_dead_stages:
+        del a2_fp8, a2_scale
 
     # --- 6) Gather + top-k weighted reduce (+ output_scale + residual) ---
     return ixfops.moe_gather_output_reduce_sum(

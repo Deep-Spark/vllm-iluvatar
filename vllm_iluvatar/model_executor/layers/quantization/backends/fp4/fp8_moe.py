@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEActivationFormat,
     FusedMoEMethodBase,
     FusedMoEQuantConfig,
+    RoutedExperts,
 )
 from vllm.model_executor.layers.fused_moe.config import mxfp4_w4a8_moe_quant_config
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
@@ -22,6 +25,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8Dynami
 
 from vllm_iluvatar import envs as ilu_envs
 from vllm_iluvatar.model_executor.layers.fused_moe.activation import swiglustep_limit
+from vllm_iluvatar.model_executor.layers.fused_moe.ilu_f4f8_experts import (
+    IluF4F8Experts,
+    ilu_f4f8_moe_backends_available,
+)
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
     _ixmm_backend_available,  # noqa: F401
 )
@@ -39,6 +46,52 @@ _IXMM_EXPERT_CHUNK = 4
 _IXMM_GROUP_SIZE = 256
 _FP4_MAX_MAG = 6.0
 logger = init_logger(__name__)
+
+
+def _resolve_fp8_moe_activation(
+    layer: RoutedExperts,
+) -> tuple[float, str, float | None]:
+    """Return ``(swiglu_limit, swiglu_variant, gemm1_clamp_limit)``."""
+    activation = getattr(layer, "activation", "silu")
+    activation = getattr(activation, "value", activation)
+    raw_limit = getattr(layer, "swiglu_limit", None)
+    if activation == "swiglustep":
+        limit = swiglustep_limit(raw_limit)
+        return limit, "step3_swiglustep", limit
+    if activation in ("silu", "swiglu"):
+        if raw_limit is not None:
+            limit_f = float(raw_limit)
+            if not math.isfinite(limit_f) or limit_f <= 0.0:
+                raise ValueError(
+                    f"swiglu_limit must be a finite positive float, got {raw_limit!r}"
+                )
+            return limit_f, "dsv4_clamp", limit_f
+        return 0.0, "step3_swiglustep", None
+    raise NotImplementedError(f"Unsupported FP8 MoE activation: {activation!r}")
+
+
+def _maybe_build_f4f8_experts(layer: RoutedExperts) -> IluF4F8Experts | None:
+    """Build ``IluF4F8Experts`` when packed ix30 weights match its contract."""
+    if getattr(layer, "_ilu_step5_native_activation", False):
+        return None
+    if getattr(layer, "apply_router_weight_on_input", False):
+        return None
+    if _get_ilu_output_scale(layer) != 1.0:
+        return None
+    activation = getattr(layer, "activation", "silu")
+    activation = getattr(activation, "value", activation)
+    if activation not in ("silu", "swiglu"):
+        return None
+    _, _, clamp_limit = _resolve_fp8_moe_activation(layer)
+    w13 = layer.w13_weight
+    w2 = layer.w2_weight
+    if w2.shape[1] * 2 != w13.shape[2] // 2 or w2.shape[2] != w13.shape[1] * 2:
+        return None
+    try:
+        supported, _ = ilu_f4f8_moe_backends_available()
+    except ImportError:
+        return None
+    return IluF4F8Experts(clamp_limit) if supported else None
 
 
 def preprocess_fp8_block_weight_for_ixmm(
@@ -208,6 +261,7 @@ class IluFp8MoEMethod(Fp8MoEMethod):
         self.fp8_backend = self.moe_kernel = None
         self.selection = None
         self._checkpoint_loader = self._compute = self._runtime_weights = None
+        self._f4f8_experts: IluF4F8Experts | None = None
         self.supports_pre_processed_weights = False
 
     @property
@@ -234,9 +288,7 @@ class IluFp8MoEMethod(Fp8MoEMethod):
         )
 
         activation = getattr(layer.activation, "value", layer.activation)
-        limit = getattr(layer, "swiglu_limit", None)
-        if activation == "swiglustep":
-            limit = swiglustep_limit(limit)
+        _, _, limit = _resolve_fp8_moe_activation(layer)
         return MoEComputeConfig(
             hidden=layer.moe_config.hidden_dim,
             intermediate=layer.moe_config.intermediate_size_per_partition,
@@ -323,6 +375,9 @@ class IluFp8MoEMethod(Fp8MoEMethod):
         compute.validate_weights(weights)
         self._runtime_weights, self._compute = weights, compute
         layer._ilu_mxfp4_ixmm = self.selection.name == "ixmm_fp4fp8"
+        self._f4f8_experts = (
+            _maybe_build_f4f8_experts(layer) if layer._ilu_mxfp4_ixmm else None
+        )
 
     def process_weights_after_loading(self, layer):
         loader = self._checkpoint_loader
@@ -437,6 +492,28 @@ class IluFp8MoEMethod(Fp8MoEMethod):
         residual = shared_experts_input
         if residual is not None and residual.shape[0] != x.shape[0]:
             residual = None
+        f4f8_experts = getattr(self, "_f4f8_experts", None)
+        if (
+            f4f8_experts is not None
+            and ilu_envs.VLLM_ILU_MXFP4_MOE_BACKEND in ("auto", "ixmm")
+            and x.is_cuda
+            and x.dtype is torch.bfloat16
+            and topk_ids.dtype is torch.int32
+            and topk_weights.dtype is torch.float32
+            and not getattr(layer, "apply_router_weight_on_input", False)
+            and _get_ilu_output_scale(layer) == 1.0
+        ):
+            return f4f8_experts.apply(
+                hidden_states=x,
+                w13=layer.w13_weight,
+                w13_scale=layer.w13_weight_scale,
+                w2=layer.w2_weight,
+                w2_scale=layer.w2_weight_scale,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                expert_map=layer.expert_map,
+                shared_expert_output=residual,
+            )
         # Preserve the measured Step5 W13 tile choice without selecting a
         # different weight format, quantization lifecycle or compute backend.
         mode = (

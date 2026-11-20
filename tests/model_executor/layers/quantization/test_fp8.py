@@ -356,3 +356,88 @@ def test_layer_limit_reaches_compute_contract(monkeypatch, limit):
     assert config.activation == "swiglustep"
     assert config.limit == limit
     assert config.intermediate == 128
+
+
+def test_silu_limit_routes_to_dsv4_clamp(monkeypatch):
+    mod = _load_moe_backend(monkeypatch)
+    method = object.__new__(mod.IluFp8MoEMethod)
+    layer = types.SimpleNamespace(
+        moe_config=types.SimpleNamespace(
+            hidden_dim=256, intermediate_size_per_partition=128, ep_rank=0
+        ),
+        local_num_experts=2,
+        global_num_experts=2,
+        activation="silu",
+        swiglu_limit=10.0,
+        apply_router_weight_on_input=False,
+    )
+    assert mod._resolve_fp8_moe_activation(layer) == (10.0, "dsv4_clamp", 10.0)
+    config = method._compute_config(layer)
+    assert config.activation == "silu"
+    assert config.limit == 10.0
+
+
+def test_maybe_build_f4f8_experts_guards_contract(monkeypatch):
+    mod = _load_moe_backend(monkeypatch)
+    monkeypatch.setattr(mod, "ilu_f4f8_moe_backends_available", lambda: (True, None))
+
+    valid_layer = types.SimpleNamespace(
+        activation="silu",
+        swiglu_limit=10.0,
+        apply_router_weight_on_input=False,
+        w13_weight=torch.empty((4, 256, 512), dtype=torch.uint8),
+        w2_weight=torch.empty((4, 128, 512), dtype=torch.uint8),
+    )
+    experts = mod._maybe_build_f4f8_experts(valid_layer)
+    assert experts is not None
+    assert experts.swiglu_limit == 10.0
+
+    # K-padded w2 (e.g. inter=128 padded to 256) or step5/swiglustep stays on mxfp4
+    padded_layer = types.SimpleNamespace(
+        activation="silu",
+        swiglu_limit=10.0,
+        apply_router_weight_on_input=False,
+        w13_weight=torch.empty((4, 256, 256), dtype=torch.uint8),
+        w2_weight=torch.empty((4, 128, 512), dtype=torch.uint8),
+    )
+    assert mod._maybe_build_f4f8_experts(padded_layer) is None
+
+    step5_layer = types.SimpleNamespace(
+        activation="silu",
+        swiglu_limit=10.0,
+        apply_router_weight_on_input=False,
+        _ilu_step5_native_activation=True,
+        w13_weight=torch.empty((4, 256, 512), dtype=torch.uint8),
+        w2_weight=torch.empty((4, 128, 512), dtype=torch.uint8),
+    )
+    assert mod._maybe_build_f4f8_experts(step5_layer) is None
+
+
+def test_activation_prequant_thread_local_and_contiguous_bf16_guards():
+    import threading
+    from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (
+        _lookup_activation_prequant,
+        clear_activation_prequant,
+        register_activation_prequant,
+    )
+
+    x = torch.randn(4, 64, dtype=torch.bfloat16)
+    qx = torch.zeros(4, 64, dtype=torch.float8_e4m3fn)
+    sx = torch.ones(4, dtype=torch.float32)
+
+    try:
+        register_activation_prequant(x, qx, sx)
+        assert _lookup_activation_prequant(x) == (qx, sx)
+        # Non-contiguous or non-bf16 views sharing data_ptr must miss.
+        assert _lookup_activation_prequant(torch.as_strided(x, (4, 64), (1, 4))) is None
+        assert _lookup_activation_prequant(x.view(torch.float16)[:, :64]) is None
+
+        other_thread_hit = []
+        t = threading.Thread(
+            target=lambda: other_thread_hit.append(_lookup_activation_prequant(x))
+        )
+        t.start()
+        t.join()
+        assert other_thread_hit == [None]
+    finally:
+        clear_activation_prequant()

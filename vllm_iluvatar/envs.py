@@ -204,6 +204,7 @@ if TYPE_CHECKING:
     VLLM_ILU_VIT_ATTN_OPT_LEVEL: int = 0
     VLLM_ILU_VIT_ATTN_LAYER: str = ""
     VLLM_ILU_GDN_ATTN_BACKEND: bool = False
+    VLLM_ILU_FORCE_NCCL_COMM: bool = False
     VLLM_ILU_CUDAGRAPH_ASYNC_REPLAY: bool = False
     VLLM_ILU_COMPACT_RAGGED_GATHER: bool = False
     VLLM_ILU_DP_VOCAB_GROUP_SIZE: int = 0
@@ -327,6 +328,10 @@ _ILU_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_V41_AGRS_TP1_RS": lambda: (
         _get("VLLM_ILU_V41_AGRS_TP1_RS", "VLLM_V41_AGRS_TP1_RS", "0").strip().lower()
         in _TRUE_VALS
+    ),
+    "VLLM_ILU_FORCE_NCCL_COMM": lambda: (
+        _get("VLLM_ILU_FORCE_NCCL_COMM", "VLLM_FORCE_NCCL_COMM", "0").strip().lower()
+        in (*_TRUE_VALS, "y")
     ),
     "VLLM_ILU_MOE_EP_RS_TP_AG": lambda: (
         _get("VLLM_ILU_MOE_EP_RS_TP_AG", "VLLM_MOE_EP_RS_TP_AG", "0").strip().lower()

@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+set -euo pipefail
+
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
+  cat <<'HELP'
+Usage: run_mr_decode.sh [--print-command|--serve]
+Required: MODEL_PATH, DEVICES. Uses the validated mr decode defaults.
+Overrides: HOST, PORT, MAX_MODEL_LEN, MAX_NUM_BATCHED_TOKENS,
+  MAX_NUM_SEQS, GPU_MEMORY_UTILIZATION, SPECULATIVE_CONFIG,
+  USE_REPLAYSSM, MAMBA_SSM_CACHE_DTYPE, ASYNC_SCHEDULING, DP_RPC_PORT.
+The default mode prints the command. --serve runs vLLM in the foreground.
+HELP
+  exit 0
+fi
+
+mode=${1:---print-command}
+case "$mode" in
+  --print-command|--serve) shift || true ;;
+  *) echo "usage: $0 [--print-command|--serve]" >&2; exit 2 ;;
+esac
+if (($#)); then echo "Unexpected arguments" >&2; exit 2; fi
+
+: "${MODEL_PATH:?Set MODEL_PATH to the GLM5Next W4A8 NN V1 checkpoint}"
+: "${DEVICES:?Set DEVICES to sixteen available MR device IDs}"
+export CUDA_VISIBLE_DEVICES="$DEVICES"
+export CUDA_HOME="${CUDA_HOME:-/usr/local/corex}"
+export CUDA_PATH="${CUDA_PATH:-$CUDA_HOME}"
+export TRITON_LIBCUDA_PATH="${TRITON_LIBCUDA_PATH:-$CUDA_HOME}"
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export VLLM_USE_V2_MODEL_RUNNER=1 VLLM_ILU_GDN_ATTN_BACKEND=1
+export VLLM_DISABLE_SHARED_EXPERTS_STREAM="${VLLM_DISABLE_SHARED_EXPERTS_STREAM:-1}"
+export VLLM_ILU_MOE_AG_SHARED_OVERLAP="${VLLM_ILU_MOE_AG_SHARED_OVERLAP:-0}"
+export VLLM_SSM_CONV_STATE_LAYOUT="${VLLM_SSM_CONV_STATE_LAYOUT:-SD}"
+export VLLM_FORCE_NCCL_COMM="${VLLM_FORCE_NCCL_COMM:-1}"
+export NCCL_P2P_LEVEL=SYS NCCL_GRAPH_REGISTER=0
+export VLLM_ILU_INDEXER_KV_DTYPE=int8
+export VLLM_ILU_GLM5NEXT_MLA_PROJ_W8A8=1 VLLM_ILU_GLM5NEXT_KDA_PROJ_W8A8=1
+export IXMM_W4A8_GRAPH_SMALL_M_THRESHOLD=192
+export VLLM_PORT="${VLLM_PORT:-31000}"
+export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-3600}"
+
+case "${ASYNC_SCHEDULING:-0}" in
+  0) scheduling_flag=--no-async-scheduling ;;
+  1) scheduling_flag=--async-scheduling ;;
+  *) echo "ASYNC_SCHEDULING must be 0 or 1" >&2; exit 2 ;;
+esac
+
+speculative_config='{"method":"mtp","num_speculative_tokens":5,"use_local_argmax_reduction":true,"index_share_for_mtp_iteration":true}'
+cmd=(vllm serve "$MODEL_PATH"
+  --served-model-name GLM-5-Next
+  --tensor-parallel-size 2 --data-parallel-size 8 --data-parallel-size-local 8
+  --pipeline-parallel-size 1 --enable-expert-parallel
+  --all2all-backend allgather_reducescatter
+  --quantization ilu_deepseek_v4_w4a8 --dtype bfloat16
+  --kv-cache-dtype bfloat16 --mamba-cache-dtype bfloat16
+  --block-size 256 --max-model-len "${MAX_MODEL_LEN:-131072}"
+  --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-2048}"
+  --max-num-seqs "${MAX_NUM_SEQS:-64}"
+  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.88}"
+  --safetensors-load-strategy prefetch --enable-prefix-caching "$scheduling_flag"
+  --data-parallel-rpc-port "${DP_RPC_PORT:-31080}"
+  -cc.cudagraph_mode=FULL_DECODE_ONLY
+  --speculative-config "${SPECULATIVE_CONFIG:-$speculative_config}"
+  --limit-mm-per-prompt '{"image":0,"video":0}'
+  --host "${HOST:-0.0.0.0}" --port "${PORT:-12477}")
+
+case "${USE_REPLAYSSM:-1}" in
+  0) ;;
+  1) cmd+=(--use-replayssm) ;;
+  *) echo "USE_REPLAYSSM must be 0 or 1" >&2; exit 2 ;;
+esac
+cmd+=(--mamba-ssm-cache-dtype "${MAMBA_SSM_CACHE_DTYPE:-bfloat16}")
+case "${MAMBA_CACHE_MODE:-align}" in
+  align) ;;
+  none) cmd+=(--no-enable-prefix-caching --mamba-cache-mode none) ;;
+  *) echo "MAMBA_CACHE_MODE must be align or none" >&2; exit 2 ;;
+esac
+
+case "$mode" in
+  --print-command) printf '%q ' "${cmd[@]}"; printf '\n' ;;
+  --serve) exec "${cmd[@]}" ;;
+esac

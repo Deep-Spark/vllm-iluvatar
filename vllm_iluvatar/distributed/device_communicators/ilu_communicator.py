@@ -24,6 +24,8 @@ from vllm.distributed.device_communicators.cuda_communicator import (
 )
 from vllm.distributed.utils import StatelessProcessGroup
 
+from vllm_iluvatar import envs as ilu_envs
+
 from .compact_ragged import compact_all_gather, compact_gather_beneficial
 
 
@@ -61,11 +63,7 @@ class IluCommunicator(CudaCommunicator):
             tcp_store_group,
             use_all2all=use_all2all,
         )
-        self.use_vllm_comm = os.environ.get("VLLM_FORCE_NCCL_COMM", None) not in [
-            "1",
-            "Y",
-            "y",
-        ]
+        self.use_vllm_comm = not ilu_envs.VLLM_ILU_FORCE_NCCL_COMM
         self.tcp_store_group = tcp_store_group
         self.is_stateless_group = _world.pg_map.get(cpu_group, None) is None
         self.use_vllm_comm = self.use_vllm_comm and not self.is_stateless_group

@@ -168,6 +168,115 @@ def test_multiworker_wrapper_supplies_order_and_resizes_wire_config():
         )
 
 
+def _uniform_groups(specs: dict):
+    spec = next(iter(specs.values()))
+    return [
+        KVCacheGroupSpec(
+            list(specs),
+            UniformTypeKVCacheSpecs(
+                block_size=spec.block_size,
+                kv_cache_specs=specs,
+            ),
+        )
+    ]
+
+
+def test_community_shrink_replans_keep_aligned_num_blocks():
+    """Community shrink re-calls from_groups; scratch must not be deducted twice."""
+    config = _config()
+    spec_small = {"layers.0.main": _single_uniform_group()[0]["layers.0.main"]}
+    spec_large = {"layers.1.main": spec_small["layers.0.main"]}
+    groups_by_layers = {
+        frozenset(spec_small): _uniform_groups(spec_small),
+        frozenset(spec_large): _uniform_groups(spec_large),
+    }
+    one_worker_planner = ilu_planning.make_get_kv_cache_config_from_groups(
+        community.get_kv_cache_config_from_groups
+    )
+
+    def community_shrink(_config, worker_specs, memories):
+        configs = [
+            one_worker_planner(
+                _config, groups_by_layers[frozenset(spec)], memory
+            )
+            for spec, memory in zip(worker_specs, memories)
+        ]
+        min_blocks = min(item.num_blocks for item in configs)
+        for index, item in enumerate(configs):
+            if item.num_blocks == min_blocks:
+                continue
+            groups = item.kv_cache_groups
+            configs[index] = one_worker_planner(
+                _config,
+                groups,
+                min_blocks * community._pool_bytes_per_block(groups),
+            )
+        return configs
+
+    patched_multiworker = ilu_planning.make_get_kv_cache_configs(community_shrink)
+    configs = patched_multiworker(
+        config,
+        [spec_small, spec_large],
+        [96 * 1024**2, 64 * 1024**2],
+    )
+
+    assert configs[0].num_blocks == configs[1].num_blocks
+    scheduler_planner = ilu_planning.make_generate_scheduler_kv_cache_config(
+        community.generate_scheduler_kv_cache_config
+    )
+    scheduler_config = scheduler_planner(configs)
+    assert scheduler_config.num_blocks == configs[0].num_blocks
+    for item in configs:
+        assert item.wire_kv_cache_config.num_blocks == item.num_blocks
+
+
+def test_community_shrink_with_transient_group_lists_and_tp_replicas():
+    """Fresh group lists (e.g. PP narrowing) and shared TP specs must align."""
+    config = _config()
+    base_spec = _single_uniform_group()[0]["layers.0.main"]
+    spec_pp0 = {"layers.0.main": base_spec}
+    spec_pp1_tp0 = {"layers.1.main": base_spec}
+    spec_pp1_tp1 = {"layers.1.main": base_spec}
+    inner_planner = ilu_planning.make_get_kv_cache_config_from_groups(
+        community.get_kv_cache_config_from_groups
+    )
+
+    def transient_wrapper(_config, kv_cache_groups, available_memory):
+        narrowed = [group for group in kv_cache_groups]
+        cfg = inner_planner(_config, narrowed, available_memory)
+        cfg.kv_cache_groups = kv_cache_groups
+        return cfg
+
+    def community_shrink(_config, worker_specs, memories):
+        configs = [
+            transient_wrapper(_config, _uniform_groups(spec), memory)
+            for spec, memory in zip(worker_specs, memories)
+        ]
+        min_blocks = min(item.num_blocks for item in configs)
+        for index, item in enumerate(configs):
+            if item.num_blocks == min_blocks:
+                continue
+            groups = item.kv_cache_groups
+            configs[index] = transient_wrapper(
+                _config,
+                groups,
+                min_blocks * community._pool_bytes_per_block(groups),
+            )
+        return configs
+
+    patched_multiworker = ilu_planning.make_get_kv_cache_configs(community_shrink)
+    configs = patched_multiworker(
+        config,
+        [spec_pp0, spec_pp1_tp0, spec_pp1_tp1],
+        [64 * 1024**2, 96 * 1024**2, 80 * 1024**2],
+    )
+
+    assert len({item.num_blocks for item in configs}) == 1
+    for item in configs:
+        assert item.wire_kv_cache_config.num_blocks == item.num_blocks
+
+
+
 def test_planning_wrapper_preserves_current_packed_layout():
     config = _config(connector="NixlConnector")
     config.kv_transfer_config.kv_connector_extra_config[
@@ -196,3 +305,34 @@ def test_planning_wrapper_preserves_current_packed_layout():
     assert packed_config.num_blocks == baseline.num_blocks
     assert packed_config.kv_cache_tensors == baseline.kv_cache_tensors
     assert all(tensor.block_stride > 0 for tensor in packed_config.kv_cache_tensors)
+
+
+def test_planning_activates_for_multiconnector_ilu_child():
+    config = _config("MultiConnector")
+    extra = {
+        "connectors": [
+            {
+                "kv_connector": "IluNixlPullConnector",
+                "kv_role": "kv_producer",
+                "kv_connector_extra_config": {
+                    "enable_fp8_ds_mla_wire_staging": "True"
+                },
+            },
+            {
+                "kv_connector": "OffloadingConnector",
+                "kv_role": "kv_both",
+                "kv_connector_extra_config": {"cpu_bytes_to_use": 1},
+            },
+        ]
+    }
+    config.kv_transfer_config.kv_connector_extra_config = extra
+    config.kv_transfer_config.get_from_extra_config.side_effect = (
+        lambda key, default: extra.get(key, default)
+    )
+    specs, groups = _single_uniform_group()
+    patched = ilu_planning.make_get_kv_cache_config_from_groups(
+        community.get_kv_cache_config_from_groups
+    )
+    planned = patched(config, groups, 64 * 1024**2, specs)
+    assert planned.wire_kv_cache_config is not None
+    assert planned.num_blocks > 0

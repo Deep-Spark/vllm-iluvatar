@@ -768,3 +768,76 @@ def test_metadata_defaults_to_vram_and_remote_descriptor_uses_dram():
     assert blocks_data == [(1000, 64, 0), (1128, 64, 0)]
     assert memory_type == "DRAM"
     assert worker.nixl_memory_type == "VRAM"
+
+
+def test_split_int8_indexer_kernel_blocks_use_manager_block_stride(monkeypatch):
+    from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.fp8_staging import (
+        _normalize_manager_blocks,
+    )
+
+    num_blocks = 4
+    kernel_blocks = 8
+    rows_per_kb = 64
+    source = torch.zeros(
+        (num_blocks * kernel_blocks, 1, rows_per_kb, 128), dtype=torch.uint8
+    )
+    scales = torch.ones((num_blocks * kernel_blocks, rows_per_kb), dtype=torch.float32)
+
+    norm_src = _normalize_manager_blocks(source, num_blocks, name="idx")
+    norm_scales = _normalize_manager_blocks(scales, num_blocks, name="idx.scales")
+    assert norm_src.shape == (num_blocks, kernel_blocks, 1, rows_per_kb, 128)
+    assert norm_src.stride(0) == kernel_blocks * rows_per_kb * 128
+    assert norm_scales.shape == (num_blocks, kernel_blocks, rows_per_kb)
+    assert norm_scales.stride(0) == kernel_blocks * rows_per_kb
+
+    captured = []
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                captured.append((grid, args, kwargs))
+
+            return launch
+
+    monkeypatch.setattr(
+        staging_module, "_transcode_split_int8_indexer_wire_kernel", FakeKernel()
+    )
+    src_spec = MLAAttentionSpec(
+        block_size=512,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.uint8,
+        tokens_per_state=1,
+        cache_dtype_str="int8_indexer_split",
+    )
+    wire_spec = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        tokens_per_state=1,
+        cache_dtype_str=None,
+        alignment=64,
+    )
+    destination = torch.zeros((8, 8448), dtype=torch.uint8)
+    staging = object.__new__(FP8DSMLAWireStaging)
+    staging._stage_indexer_pages(
+        norm_src,
+        destination,
+        torch.tensor([2], dtype=torch.int64),
+        torch.arange(8, dtype=torch.int64),
+        src_spec,
+        wire_spec,
+        num_tokens=512,
+        total_block_count=1,
+        chunk_offset=0,
+        already_zeroed=True,
+        source_scales=norm_scales,
+        layer_name="layers.20.attn.indexer.k_cache",
+    )
+    assert len(captured) == 1
+    grid, args, kwargs = captured[0]
+    assert grid == (512,)
+    assert args[6] == kernel_blocks * rows_per_kb * 128
+    assert args[7] == kernel_blocks * rows_per_kb
+    assert kwargs["SUB_BLOCKS"] == 8

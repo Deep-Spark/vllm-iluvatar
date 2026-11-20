@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.fp8_layout import (
     build_fp8_ds_mla_wire_config,
     get_fp8_ds_mla_wire_groups,
+    get_fp8_wire_scratch_blocks,
     use_fp8_ds_mla_wire_staging,
 )
 
@@ -96,6 +97,45 @@ def _deepseek_v4_compute_specs():
     return specs
 
 
+def _mock_multi_config(
+    *,
+    pull_connector: str = "IluNixlPullConnector",
+    child_staging: bool = True,
+    parent_staging: bool = False,
+    scratch_blocks=None,
+):
+    child_extra = {}
+    if child_staging:
+        child_extra["enable_fp8_ds_mla_wire_staging"] = "True"
+    if scratch_blocks is not None:
+        child_extra["fp8_wire_scratch_blocks"] = scratch_blocks
+    extra = {
+        "connectors": [
+            {
+                "kv_connector": pull_connector,
+                "kv_role": "kv_producer",
+                "kv_connector_extra_config": child_extra,
+            },
+            {
+                "kv_connector": "OffloadingConnector",
+                "kv_role": "kv_both",
+                "kv_connector_extra_config": {"cpu_bytes_to_use": 1},
+            },
+        ]
+    }
+    if parent_staging:
+        extra["enable_fp8_ds_mla_wire_staging"] = "True"
+    config = MagicMock()
+    transfer_config = config.kv_transfer_config = MagicMock()
+    transfer_config.kv_role = "kv_producer"
+    transfer_config.kv_connector = "MultiConnector"
+    transfer_config.kv_connector_extra_config = extra
+    transfer_config.get_from_extra_config.side_effect = lambda key, default: extra.get(
+        key, default
+    )
+    return config
+
+
 def test_wire_staging_gate_is_ilu_connector_only():
     assert use_fp8_ds_mla_wire_staging(_mock_vllm_config(staging=True))
     assert use_fp8_ds_mla_wire_staging(
@@ -104,6 +144,19 @@ def test_wire_staging_gate_is_ilu_connector_only():
     assert not use_fp8_ds_mla_wire_staging(
         _mock_vllm_config(staging=True, connector="NixlConnector")
     )
+
+
+def test_wire_staging_gate_reads_multiconnector_ilu_child():
+    assert use_fp8_ds_mla_wire_staging(_mock_multi_config())
+    assert use_fp8_ds_mla_wire_staging(
+        _mock_multi_config(child_staging=False, parent_staging=True)
+    )
+    assert not use_fp8_ds_mla_wire_staging(_mock_multi_config(child_staging=False))
+    assert not use_fp8_ds_mla_wire_staging(
+        _mock_multi_config(pull_connector="NixlConnector", parent_staging=True)
+    )
+    assert get_fp8_wire_scratch_blocks(_mock_multi_config(scratch_blocks="3")) == 3
+    assert get_fp8_wire_scratch_blocks(_mock_multi_config()) == 4
 
 
 def _layer_index(layer_name: str) -> int:
@@ -256,3 +309,174 @@ def test_pp8_projected_wire_layout_has_no_compute_group_aliases():
         ]
         build_fp8_ds_mla_wire_config(projected, wire_groups, num_blocks=8)
         start = end
+
+
+def test_dsv41_i8g64_and_split_indexer_map_to_fp8_wire():
+    config = _mock_vllm_config()
+    main_name = "layers.2.main"
+    idx_name = "layers.2.indexer.k_cache"
+    main = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        state_content_bytes=512,
+        tokens_per_state=2,
+        cache_dtype_str="i8g64",
+        storage_block_size=256,
+    )
+    indexer = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.uint8,
+        tokens_per_state=2,
+        cache_dtype_str="int8_indexer_split",
+    )
+    specs = {main_name: main, idx_name: indexer}
+    groups = [
+        KVCacheGroupSpec(
+            [main_name, idx_name],
+            UniformTypeKVCacheSpecs(block_size=256, kv_cache_specs=specs),
+        )
+    ]
+
+    wire_groups = get_fp8_ds_mla_wire_groups(config, groups, specs)
+    wire_specs = wire_groups[0].kv_cache_spec.kv_cache_specs
+
+    wire_main = wire_specs[main_name]
+    assert wire_main.dtype == torch.uint8
+    assert wire_main.cache_dtype_str == "fp8_ds_mla"
+    assert wire_main.model_version == "deepseek_v4"
+    assert wire_main.state_content_bytes == 584
+    assert wire_main.alignment == 64
+    assert getattr(wire_main, "storage_block_size", None) is None
+
+    wire_idx = wire_specs[idx_name]
+    assert wire_idx.dtype == torch.uint8
+    assert wire_idx.head_size == 132
+    assert wire_idx.cache_dtype_str is None
+    assert wire_idx.page_size_bytes == 8640
+
+
+def test_dsv41_i4g32_maps_to_fp8_wire():
+    config = _mock_vllm_config()
+    name = "layers.8.main"
+    spec = MLAAttentionSpec(
+        block_size=512,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        state_content_bytes=256,
+        tokens_per_state=2,
+        cache_dtype_str="i4g32",
+        storage_block_size=512,
+    )
+    specs = {name: spec}
+    groups = [
+        KVCacheGroupSpec(
+            [name],
+            UniformTypeKVCacheSpecs(block_size=512, kv_cache_specs=specs),
+        )
+    ]
+    wire = get_fp8_ds_mla_wire_groups(config, groups, specs)[0].kv_cache_spec
+    wire_spec = wire.kv_cache_specs[name]
+    assert wire_spec.cache_dtype_str == "fp8_ds_mla"
+    assert wire_spec.model_version == "deepseek_v4"
+    assert wire_spec.state_content_bytes == 584
+
+
+def test_fp8_wire_block_size_subblocks_match_d_payloads():
+    from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.fp8_layout import (
+        get_fp8_wire_block_size,
+        packed_bytes_per_block,
+        wire_sub_blocks_per_compute_block,
+    )
+
+    config = _mock_multi_config()
+    config.kv_transfer_config.kv_connector_extra_config["connectors"][0][
+        "kv_connector_extra_config"
+    ]["fp8_wire_block_size"] = 64
+    config.model_config.hf_config.model_type = "deepseek_v41"
+    assert get_fp8_wire_block_size(config) == 64
+
+    main_cr2 = MLAAttentionSpec(
+        block_size=512,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        state_content_bytes=256,
+        tokens_per_state=2,
+        cache_dtype_str="i4g32",
+        storage_block_size=512,
+    )
+    idx_cr2 = MLAAttentionSpec(
+        block_size=1024,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.uint8,
+        tokens_per_state=2,
+        cache_dtype_str="int8_indexer_split",
+    )
+    main_cr1 = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        state_content_bytes=256,
+        tokens_per_state=1,
+        cache_dtype_str="i4g32",
+        storage_block_size=256,
+    )
+    idx_cr1 = MLAAttentionSpec(
+        block_size=512,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.uint8,
+        tokens_per_state=1,
+        cache_dtype_str="int8_indexer_split",
+    )
+    specs = {
+        "layers.2.main": main_cr2,
+        "layers.2.indexer.k_cache": idx_cr2,
+        "layers.20.main": main_cr1,
+        "layers.20.indexer.k_cache": idx_cr1,
+    }
+    compute_groups = [
+        KVCacheGroupSpec(["layers.2.main"], main_cr2),
+        KVCacheGroupSpec(["layers.2.indexer.k_cache"], idx_cr2),
+        KVCacheGroupSpec(["layers.20.main"], main_cr1),
+        KVCacheGroupSpec(["layers.20.indexer.k_cache"], idx_cr1),
+    ]
+    wire_groups = get_fp8_ds_mla_wire_groups(config, compute_groups, specs)
+    w_main_cr2 = wire_groups[0].kv_cache_spec.kv_cache_specs["layers.2.main"]
+    w_idx_cr2 = wire_groups[1].kv_cache_spec.kv_cache_specs["layers.2.indexer.k_cache"]
+    w_main_cr1 = wire_groups[2].kv_cache_spec.kv_cache_specs["layers.20.main"]
+    w_idx_cr1 = wire_groups[3].kv_cache_spec.kv_cache_specs["layers.20.indexer.k_cache"]
+
+    assert w_main_cr2.block_size == 64
+    assert w_main_cr2.page_size_bytes == 18688
+    assert wire_sub_blocks_per_compute_block(main_cr2, w_main_cr2) == 8
+
+    assert w_idx_cr2.block_size == 64
+    assert w_idx_cr2.page_size_bytes == 4224
+    assert wire_sub_blocks_per_compute_block(idx_cr2, w_idx_cr2) == 16
+
+    assert w_main_cr1.block_size == 64
+    assert w_main_cr1.page_size_bytes == 37376
+    assert wire_sub_blocks_per_compute_block(main_cr1, w_main_cr1) == 4
+
+    assert w_idx_cr1.block_size == 64
+    assert w_idx_cr1.page_size_bytes == 8448
+    assert wire_sub_blocks_per_compute_block(idx_cr1, w_idx_cr1) == 8
+
+    wire_cfg = build_fp8_ds_mla_wire_config(compute_groups, wire_groups, num_blocks=4)
+    assert [t.block_stride for t in wire_cfg.kv_cache_tensors] == [18688, 4224, 37376, 8448]
+    assert [t.layer_stride for t in wire_cfg.kv_cache_tensors] == [
+        4 * 8 * 18688,
+        4 * 16 * 4224,
+        4 * 4 * 37376,
+        4 * 8 * 8448,
+    ]
+    assert packed_bytes_per_block(wire_groups, compute_groups=compute_groups) == 4 * 37376
+

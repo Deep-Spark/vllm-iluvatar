@@ -27,6 +27,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from vllm.config import ParallelConfig
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import get_dp_group
 from vllm.v1.worker.dp_utils import should_skip_dp_coordination
 from vllm.v1.worker.gpu.cudagraph_utils import (
@@ -36,6 +37,10 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.dp_utils import DPSyncState
 
 from vllm_iluvatar.v1.worker.dp_utils import set_last_all_ranks_decode_only
+from vllm_iluvatar.v1.worker.idle_dummy_state import (
+    is_idle_dummy_batch,
+    mark_idle_dummy_short_circuited,
+)
 
 _ORIGINAL_SYNC: Callable[..., Any] | None = None
 
@@ -58,15 +63,22 @@ def _publish_all_ranks_decode_only(
     uniform_decode: bool,
     dp_size: int,
     dp_rank: int,
-) -> None:
-    """Agree the per-rank uniform-decode vote. One bit, same group as V2 DP sync."""
-    bits = torch.zeros(dp_size, dtype=torch.int32)
-    bits[dp_rank] = int(bool(uniform_decode))
-    if should_skip_dp_coordination():
-        bits[:] = bits[dp_rank]
+) -> bool:
+    """Agree the per-rank uniform-decode and idle-dummy votes; return True if all idle."""
+    bits = torch.zeros((2, dp_size), dtype=torch.int32)
+    bits[0, dp_rank] = int(bool(uniform_decode))
+    bits[1, dp_rank] = int(is_idle_dummy_batch())
+    skip_coord = should_skip_dp_coordination()
+    if skip_coord:
+        bits[:] = bits[:, dp_rank, None]
     else:
         dist.all_reduce(bits, group=get_dp_group().cpu_group)
-    set_last_all_ranks_decode_only(_all_ranks_set(bits))
+    if not skip_coord and _all_ranks_set(bits[1]):
+        set_last_all_ranks_decode_only(False)
+        mark_idle_dummy_short_circuited()
+        return True
+    set_last_all_ranks_decode_only(_all_ranks_set(bits[0]))
+    return False
 
 
 def sync_cudagraph_and_dp_padding(
@@ -89,7 +101,13 @@ def sync_cudagraph_and_dp_padding(
     if os.environ.get("VLLM_ILU_MERGE_DP_SYNC", "1") == "1":
         from .merged_dp_sync import sync_cudagraph_and_dp_padding as sync
     else:
-        _publish_all_ranks_decode_only(uniform_decode, dp_size, dp_rank)
+        if _publish_all_ranks_decode_only(uniform_decode, dp_size, dp_rank):
+            return (
+                BatchExecutionDescriptor(
+                    cg_mode=CUDAGraphMode.NONE, num_tokens=0, num_reqs=0
+                ),
+                None,
+            )
         sync = _ORIGINAL_SYNC
     return sync(
         cudagraph_manager,

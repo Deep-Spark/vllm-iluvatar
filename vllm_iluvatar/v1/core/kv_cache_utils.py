@@ -53,8 +53,11 @@ How      : B2 "shared backing buffer": the K-scale storage shares the SAME
            still converge to the same num_blocks after the single re-plan.
 
            get_kv_cache_configs keeps the community planner and shrink loop;
-           an outer FP8 wrapper only supplies registration-order metadata and
+           an outer FP8 wrapper supplies registration-order metadata and
            resizes the worker-only wire plan after community re-planning.
+           Scratch reservation is tracked per worker layer-set count so the
+           shrink re-plan stays ``num_blocks = available // pool`` even when
+           outer wrappers copy or narrow ``kv_cache_groups``.
 Scope    : only active when attention quantization is enabled
            (VLLM_ILU_FLASH_ATTN_QUANT_TYPE / VLLM_ILU_MLA_ATTN_QUANT_TYPE);
            see ilu_patch/general_patches/patch_kv_cache_utils.py.
@@ -67,10 +70,10 @@ worker-only wire plan copied onto the scheduler config.
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 
 from vllm import envs
@@ -352,9 +355,25 @@ def get_kv_cache_config_from_groups(
     )
 
 
+def _groups_layer_key(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> frozenset[str]:
+    return frozenset(
+        layer_name for group in kv_cache_groups for layer_name in group.layer_names
+    )
+
+
 @dataclass
 class _OrderedWorkerSpecs:
     specs: Sequence[dict[str, KVCacheSpec]]
+    _remaining_scratch_by_layers: Counter[frozenset[str]] = field(
+        init=False, repr=False
+    )
+
+    def __post_init__(self) -> None:
+        self._remaining_scratch_by_layers = Counter(
+            frozenset(spec) for spec in self.specs
+        )
 
     def resolve(
         self, kv_cache_groups: list[KVCacheGroupSpec]
@@ -364,9 +383,7 @@ class _OrderedWorkerSpecs:
         vLLM 0.31 may re-plan a worker after finding the global minimum block
         count, so the same projected groups can be planned more than once.
         """
-        layer_names = {
-            layer_name for group in kv_cache_groups for layer_name in group.layer_names
-        }
+        layer_names = _groups_layer_key(kv_cache_groups)
         matches = [spec for spec in self.specs if set(spec) == layer_names]
         if not matches:
             raise RuntimeError(
@@ -374,6 +391,27 @@ class _OrderedWorkerSpecs:
                 "registration-ordered worker spec"
             )
         return matches[0]
+
+    def should_reserve_scratch(
+        self, kv_cache_groups: list[KVCacheGroupSpec]
+    ) -> bool:
+        """Deduct GPU scratch at most once per worker in ``specs``.
+
+        Outer wrappers (such as PP group narrowing) may pass a fresh transient
+        list per call, and community shrink re-invokes ``from_groups`` with
+        ``min_blocks * pool_bytes``. Keying by worker layer-set count avoids
+        address-reuse collisions and stops a second deduction on shrink.
+        """
+        return (
+            self._remaining_scratch_by_layers[_groups_layer_key(kv_cache_groups)] > 0
+        )
+
+    def mark_scratch_reserved(
+        self, kv_cache_groups: list[KVCacheGroupSpec]
+    ) -> None:
+        key = _groups_layer_key(kv_cache_groups)
+        if self._remaining_scratch_by_layers[key] > 0:
+            self._remaining_scratch_by_layers[key] -= 1
 
 
 _ordered_worker_specs: ContextVar[_OrderedWorkerSpecs | None] = ContextVar(
@@ -420,32 +458,48 @@ def make_get_kv_cache_config_from_groups(
             wire_groups = get_fp8_ds_mla_wire_groups(
                 vllm_config, kv_cache_groups, kv_cache_spec
             )
-            wire_bytes_per_block = packed_bytes_per_block(wire_groups)
+            wire_bytes_per_block = packed_bytes_per_block(
+                wire_groups, compute_groups=kv_cache_groups
+            )
             original_available_memory = available_memory
             scratch_blocks = get_fp8_wire_scratch_blocks(vllm_config)
             scratch_bytes = (
                 FP8_WIRE_SCRATCH_BUFFER_COUNT * scratch_blocks * wire_bytes_per_block
             )
-            if scratch_bytes > available_memory:
-                raise ValueError(
-                    "FP8 wire GPU scratch does not fit available KV memory: "
-                    f"required={scratch_bytes}, available={available_memory}, "
-                    f"scratch_buffers={FP8_WIRE_SCRATCH_BUFFER_COUNT}, "
-                    f"scratch_blocks={scratch_blocks}"
-                )
-            available_memory -= scratch_bytes
-            logger.info(
-                "Reserving GPU KV memory for pinned-host FP8 wire staging scratch: "
-                "scratch_buffers=%d, scratch_blocks=%d, "
-                "wire_bytes_per_block=%d, "
-                "scratch_bytes=%d, compute_budget=%d/%d bytes",
-                FP8_WIRE_SCRATCH_BUFFER_COUNT,
-                scratch_blocks,
-                wire_bytes_per_block,
-                scratch_bytes,
-                available_memory,
-                original_available_memory,
+            reserve_scratch = (
+                planning_context is None
+                or planning_context.should_reserve_scratch(kv_cache_groups)
             )
+            if reserve_scratch:
+                if scratch_bytes > available_memory:
+                    raise ValueError(
+                        "FP8 wire GPU scratch does not fit available KV memory: "
+                        f"required={scratch_bytes}, available={available_memory}, "
+                        f"scratch_buffers={FP8_WIRE_SCRATCH_BUFFER_COUNT}, "
+                        f"scratch_blocks={scratch_blocks}"
+                    )
+                available_memory -= scratch_bytes
+                if planning_context is not None:
+                    planning_context.mark_scratch_reserved(kv_cache_groups)
+                logger.info(
+                    "Reserving GPU KV memory for pinned-host FP8 wire staging scratch: "
+                    "scratch_buffers=%d, scratch_blocks=%d, "
+                    "wire_bytes_per_block=%d, "
+                    "scratch_bytes=%d, compute_budget=%d/%d bytes",
+                    FP8_WIRE_SCRATCH_BUFFER_COUNT,
+                    scratch_blocks,
+                    wire_bytes_per_block,
+                    scratch_bytes,
+                    available_memory,
+                    original_available_memory,
+                )
+            else:
+                logger.debug(
+                    "Skipping FP8 wire scratch reservation on community shrink "
+                    "re-plan: scratch_bytes=%d, available=%d",
+                    scratch_bytes,
+                    available_memory,
+                )
             if vllm_config.cache_config.num_gpu_blocks_override is not None:
                 logger.warning(
                     "num_gpu_blocks_override bypasses FP8 wire-staging "

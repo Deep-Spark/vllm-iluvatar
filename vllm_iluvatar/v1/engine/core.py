@@ -440,3 +440,71 @@ def _make_get_kv_cache_group_metadata(orig):
         return build_engine_group_metadata(self.vllm_config, kv_cache_config)
 
     return get_kv_cache_group_metadata
+
+
+def _has_nonempty_kv_connector_output(kv_out) -> bool:
+    if kv_out is None:
+        return False
+    return bool(
+        kv_out.finished_sending
+        or kv_out.finished_recving
+        or kv_out.failed_recving
+        or kv_out.invalid_block_ids
+        or (
+            kv_out.kv_connector_stats is not None
+            and not kv_out.kv_connector_stats.is_empty()
+        )
+        or kv_out.kv_cache_events is not None
+        or kv_out.kv_connector_worker_meta is not None
+    )
+
+
+def _make_multiproc_execute_dummy_batch(orig):
+    @wraps(orig)
+    def execute_dummy_batch(self):
+        import vllm.envs as envs
+
+        return self.collective_rpc(
+            "execute_dummy_batch",
+            unique_reply_rank=self.output_rank,
+            timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+            kv_output_aggregator=self.kv_output_aggregator,
+        )
+
+    return execute_dummy_batch
+
+
+def _make_base_executor_execute_dummy_batch(orig):
+    @wraps(orig)
+    def execute_dummy_batch(self):
+        outputs = self.collective_rpc("execute_dummy_batch")
+        if not outputs:
+            return None
+        kv_agg = getattr(self, "kv_output_aggregator", None)
+        if kv_agg is not None:
+            return kv_agg.aggregate(outputs, output_rank=0)
+        return outputs[0]
+
+    return execute_dummy_batch
+
+
+def _make_engine_core_execute_dummy_batch(orig):
+    @wraps(orig)
+    def execute_dummy_batch(self):
+        from vllm.v1.core.sched.output import SchedulerOutput
+
+        model_output = self.model_executor.execute_dummy_batch()
+        kv_out = getattr(model_output, "kv_connector_output", None)
+        if not _has_nonempty_kv_connector_output(kv_out):
+            return model_output
+        self._process_aborts_queue()
+        eco = self.scheduler.update_from_output(
+            SchedulerOutput.make_empty(), model_output
+        )
+        out_q = getattr(self, "output_queue", None)
+        if out_q is not None and eco:
+            for item in eco.items():
+                out_q.put_nowait(item)
+        return model_output
+
+    return execute_dummy_batch

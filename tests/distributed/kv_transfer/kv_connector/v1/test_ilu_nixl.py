@@ -174,6 +174,44 @@ def test_compatibility_hash_is_independent_of_stage_local_backend(monkeypatch):
     assert calls[0][1] == calls[1][1] == "ILU_NIXL_SEMANTIC_REGIONS_V1"
 
 
+@pytest.mark.parametrize("method", ["dspark", "mtp"])
+def test_compatibility_hash_matches_when_only_decode_enables_dspark_or_mtp(
+    method: str,
+):
+    def _make_worker(spec_cfg):
+        worker = object.__new__(IluNixlWorkerMixin)
+        worker.fp8_wire_staging_enabled = False
+        worker.vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                model="deepseek-v41",
+                dtype=torch.bfloat16,
+                get_total_num_kv_heads=lambda: 1,
+                get_head_size=lambda: 512,
+                get_total_num_hidden_layers=lambda: 40,
+            ),
+            cache_config=SimpleNamespace(cache_dtype="bfloat16", block_size=64),
+            scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+            speculative_config=spec_cfg,
+        )
+        return worker
+
+    prefill_hash = _make_worker(None)._compute_compatibility_hash(False)
+    decode_spec = SimpleNamespace(
+        method=method,
+        use_eagle=lambda: True,
+        kv_cache_dtype=None,
+        parallel_drafting=False,
+        draft_model_config=SimpleNamespace(
+            model="draft",
+            revision=None,
+            code_revision=None,
+            hf_config=SimpleNamespace(),
+        ),
+    )
+    decode_hash = _make_worker(decode_spec)._compute_compatibility_hash(False)
+    assert prefill_hash == decode_hash
+
+
 def test_detects_qwen_kv_first_fa_layout():
     worker = object.__new__(IluNixlWorkerMixin)
     worker.use_mla = False
@@ -331,8 +369,20 @@ def test_cache_identity_and_region_range_selection():
         == "indexer_k_cache"
     )
     assert (
-        IluNixlWorkerMixin._transfer_identity("model.layers.16.attn.swa_cache", 1)
-        == "16:swa_cache:group1"
+        IluNixlWorkerMixin._transfer_identity("model.layers.16.attn.swa_cache")
+        == "16:swa_cache"
+    )
+    assert (
+        IluNixlWorkerMixin._cache_kind_from_layer_name(
+            "model.layers.2.attn.kv_cache_scales"
+        )
+        == "main_mla_scales"
+    )
+    assert (
+        IluNixlWorkerMixin._cache_kind_from_layer_name(
+            "model.layers.2.attn.indexer.k_cache.kv_cache_scales"
+        )
+        == "indexer_k_cache_scales"
     )
 
     layer_region_ids = {
@@ -1461,3 +1511,533 @@ def test_glm5_flash_6_vs_6_hetero_pp_cross_cycle_mounting():
         # D_R6 is compact SSM slot 3; P_R0 is compact SSM slot 0.
         (3, 3): ([3], [0]),
     }
+
+
+def test_hma_failed_transfer_invalidates_all_non_empty_local_groups():
+    import queue
+
+    worker = object.__new__(IluNixlWorkerMixin)
+    worker._is_hma_required = True
+    worker._invalid_block_ids = queue.Queue()
+    worker._failed_recv_reqs = queue.Queue()
+    worker._recving_metadata = {
+        "req-hma": SimpleNamespace(local_block_ids=([3, 4], [], [11, 12]))
+    }
+    worker.xfer_stats = SimpleNamespace(record_failed_transfer=lambda: None)
+    worker.nixl_wrapper = None
+
+    worker._handle_failed_transfer("req-hma", None)
+
+    assert worker._invalid_block_ids.get_nowait() == {3, 4, 11, 12}
+    assert worker._failed_recv_reqs.get_nowait() == "req-hma"
+
+
+def test_draining_session_retains_dlists_until_inflight_read_finishes():
+    from collections import defaultdict
+
+    from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.session import (
+        RemoteSessionState,
+    )
+
+    released_dlists = []
+    removed_agents = []
+    worker = object.__new__(IluNixlWorkerMixin)
+    worker._remote_agents = defaultdict(dict, {"eng-old": {0: "agent-old"}})
+    worker.dst_xfer_side_handles = defaultdict(dict, {"eng-old": {0: 501}})
+    worker.kv_caches_base_addr = defaultdict(dict)
+    worker.dst_num_blocks = {"eng-old": 8}
+    worker.tp_mappings = {}
+    worker.transfer_topo = None
+    worker._engine_last_active = {"eng-old": 1.0}
+    worker._consumer_disconnect_grace = 30.0
+    worker.nixl_wrapper = SimpleNamespace(
+        release_dlist_handle=released_dlists.append,
+        remove_remote_agent=removed_agents.append,
+    )
+
+    session = worker._register_active_session(
+        "eng-old", "10.0.0.1", 5600, {0: "agent-old"}
+    )
+    session.add_inflight(9001)
+
+    # Peer restarts at same (host, port) with new engine_id -> old enters DRAINING.
+    worker._remote_agents["eng-new"][0] = "agent-new"
+    worker.dst_xfer_side_handles["eng-new"][0] = 502
+    worker._register_active_session("eng-new", "10.0.0.1", 5600, {0: "agent-new"})
+
+    assert session.state == RemoteSessionState.DRAINING
+    assert released_dlists == []
+    assert removed_agents == []
+
+    # Once handle 9001 finishes, progress releases old NIXL handles cleanly.
+    worker._on_handle_settled_for_session(9001, "eng-old")
+    worker._progress_draining_sessions(100.0)
+
+    assert session.state == RemoteSessionState.CLOSED
+    assert released_dlists == [501]
+    assert removed_agents == ["agent-old"]
+
+
+def test_rle_block_ids_and_structured_notifications():
+    from collections import defaultdict
+
+    from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.metadata import (
+        encode_structured_notif,
+    )
+    from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.pull_worker import (
+        IluNixlPullConnectorWorker,
+    )
+    from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_common import (
+        PoolDirectory,
+        encode_block_ids_rle,
+        resolve_remote_block_ids,
+    )
+
+    rle = encode_block_ids_rle(([10, 11, 12, 20], []))
+    assert rle == [[[10, 3], [20, 1]], []]
+    params = {"remote_block_ids_rle": rle}
+    assert resolve_remote_block_ids(params) == ([10, 11, 12, 20], [])
+
+    pdir = PoolDirectory()
+    pdir.record_exported(([1, 2],), [{1: "h1", 2: "h2"}])
+    assert pdir.filter_blocks_needing_export(0, [1, 2, 3], {1: "h1", 2: "h2_new"}) == [
+        2,
+        3,
+    ]
+
+    pw = object.__new__(IluNixlPullConnectorWorker)
+    pw.world_size = 1
+    pw.transfer_topo = SimpleNamespace(tp_ratio=lambda _: -2)
+    pw._reqs_to_send = {"r1": 100.0, "r2": 100.0}
+    pw._reqs_to_process = {"r1", "r2"}
+    pw.consumer_notification_counts_by_req = defaultdict(int)
+    pw.xfer_stats = SimpleNamespace(record_failed_transfer=lambda: None)
+    pw.nixl_wrapper = SimpleNamespace(
+        get_new_notifs=lambda: {
+            "d": [
+                encode_structured_notif(
+                    "r1",
+                    status="ok",
+                    remote_key=0,
+                    consumer_pp_rank=0,
+                    consumer_tp_rank=0,
+                    expected_consumers=2,
+                ),
+                # Duplicate from same sender -> ignored
+                encode_structured_notif(
+                    "r1",
+                    status="ok",
+                    remote_key=0,
+                    consumer_pp_rank=0,
+                    consumer_tp_rank=0,
+                    expected_consumers=2,
+                ),
+                # Fail on r2 -> released immediately without waiting for 2nd consumer
+                encode_structured_notif(
+                    "r2",
+                    status="fail",
+                    remote_key=0,
+                    consumer_pp_rank=0,
+                    consumer_tp_rank=0,
+                    expected_consumers=2,
+                ),
+            ]
+        }
+    )
+    assert pw._get_new_notifs() == {"r2"}
+    assert "r1" in pw._reqs_to_send and "r2" not in pw._reqs_to_send
+
+
+def test_glm5_hetero_mamba_align_uses_kernel_pages_and_preserves_kpool_tail():
+    """Regression test for GLM-5.3 hetero PD (D=2304/36, P=4480/70 -> 64-token pages).
+
+    Covers:
+    1) Shared-storage layout with ``_physical_blocks_per_logical_kv_block > 1``
+       bypasses ``_register_virtual_packed_kv_cache`` so both sides advertise
+       64-token kernel pages instead of 2304 vs 4480.
+    2) Upstream ``register_kv_caches`` registers the full shared
+       ``untyped_storage`` span, splits ``tokens_per_state=4`` indexer rows into
+       dense 64-token pages, and skips co-located ``KpoolTailSpec`` views.
+    3) ``_build_hma_transfer_regions`` emits ``kernel_blocks=1``,
+       ``block_tokens=64``, and ``block_stride=block_len`` so peer handshake
+       geometry checks succeed and ``virtual_packed`` stays False.
+    4) Non-V4.1 scheduler clip rules do not zero out ``KpoolTailSpec`` groups,
+       ``_align_group_blocks_with_start`` handles ``start_offset`` in scheduler
+       blocks when ``d_ppl != p_ppl``, and ``post_process_device_kv_on_receive``
+       zeroes stale physical pages without indexing out of bounds on
+       ``KpoolTailSpec`` / compressed indexer views.
+    """
+    from collections import defaultdict
+    from unittest.mock import MagicMock
+
+    import msgspec
+    from vllm.v1.kv_cache_interface import (
+        KpoolTailSpec,
+        KVCacheGroupSpec,
+        UniformTypeKVCacheSpecs,
+    )
+    from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.base_scheduler import (
+        IluNixlBaseConnectorScheduler,
+    )
+    from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.metadata import (
+        IluNixlAgentMetadata,
+    )
+    from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.pull_worker import (
+        IluNixlPullConnectorWorker,
+    )
+    from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.registration_mixin import (
+        _BlocksFirstTopologyBackend,
+    )
+
+    def _build_side(*, sched_block: int, ppl: int, n_logical: int, tp_size: int):
+        mla_name = "language_model.model.layers.3.self_attn.attn"
+        idx_name = "language_model.model.layers.3.self_attn.indexer.k_cache"
+        tail_name = "language_model.model.layers.3.self_attn.indexer.tail_cache"
+        mamba_name = "language_model.model.layers.0.self_attn"
+
+        mla_spec = MLAAttentionSpec(
+            block_size=sched_block,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.bfloat16,
+        )
+        idx_spec = MLAAttentionSpec(
+            block_size=sched_block,
+            num_kv_heads=1,
+            head_size=256,
+            dtype=torch.uint8,
+            tokens_per_state=4,
+        )
+        tail_spec = KpoolTailSpec(
+            block_size=16,
+            num_kv_heads=2,
+            head_size=128,
+            head_size_v=0,
+            dtype=torch.bfloat16,
+            sliding_window=16,
+            page_size_padded=idx_spec.page_size_bytes,
+        )
+        mamba_spec = MambaSpec(
+            shapes=((512 // tp_size, 3), (32 // tp_size, 64, 64)),
+            dtypes=(torch.bfloat16, torch.bfloat16),
+            block_size=sched_block,
+            page_size_padded=mla_spec.page_size_bytes,
+        )
+        attn_uniform = UniformTypeKVCacheSpecs.from_specs(
+            {mla_name: mla_spec, idx_name: idx_spec}
+        )
+        tail_uniform = UniformTypeKVCacheSpecs.from_specs({tail_name: tail_spec})
+        assert attn_uniform is not None and tail_uniform is not None
+
+        groups = [
+            KVCacheGroupSpec([mla_name, idx_name], attn_uniform),
+            KVCacheGroupSpec([tail_name], tail_uniform),
+            KVCacheGroupSpec([mamba_name], mamba_spec),
+        ]
+        mla_span = n_logical * mla_spec.page_size_bytes
+        idx_span = n_logical * idx_spec.page_size_bytes
+        total_bytes = mla_span + idx_span
+        backing = torch.ones(total_bytes, dtype=torch.uint8)
+
+        n_phys = n_logical * ppl
+        mla_view = torch.as_strided(
+            backing.view(torch.bfloat16),
+            size=(n_phys, 64, 1, 512),
+            stride=(64 * 512, 512, 512, 1),
+            storage_offset=0,
+        )
+        idx_view = torch.as_strided(
+            backing,
+            size=(n_phys // 2, 1, 32, 256),
+            stride=(8192, 8192, 256, 1),
+            storage_offset=mla_span,
+        )
+        tail_view = torch.as_strided(
+            backing.view(torch.bfloat16),
+            size=(n_logical, 2, 16, 128),
+            stride=(idx_spec.page_size_bytes // 2, 16 * 128, 128, 1),
+            storage_offset=mla_span // 2,
+        )
+        mamba_view = torch.as_strided(
+            backing,
+            size=(n_logical, mla_spec.page_size_bytes),
+            stride=(mla_spec.page_size_bytes, 1),
+            storage_offset=0,
+        )
+        kv_caches = {
+            mla_name: mla_view,
+            idx_name: idx_view,
+            tail_name: tail_view,
+            mamba_name: mamba_view,
+        }
+        kv_cfg = SimpleNamespace(
+            num_blocks=n_logical,
+            kv_cache_groups=groups,
+            transfer_groups=tuple(groups),
+            transfer_group_ids=(0, 1, 2),
+            transfer_group_index_by_layer={
+                mla_name: 0,
+                idx_name: 0,
+                tail_name: 1,
+                mamba_name: 2,
+            },
+            select_transfer_block_ids=lambda ids: tuple(ids),
+            kv_cache_tensors=[
+                SimpleNamespace(
+                    size=total_bytes,
+                    layers=[mla_name],
+                    layer_stride=mla_span,
+                    block_stride=mla_spec.page_size_bytes,
+                    offset=0,
+                ),
+                SimpleNamespace(
+                    size=total_bytes,
+                    layers=[mamba_name],
+                    layer_stride=mla_span,
+                    block_stride=mla_spec.page_size_bytes,
+                    offset=0,
+                ),
+                SimpleNamespace(
+                    size=total_bytes,
+                    layers=[idx_name],
+                    layer_stride=idx_span,
+                    block_stride=idx_spec.page_size_bytes,
+                    offset=mla_span,
+                ),
+                SimpleNamespace(
+                    size=total_bytes,
+                    layers=[tail_name],
+                    layer_stride=idx_span,
+                    block_stride=idx_spec.page_size_bytes,
+                    offset=mla_span,
+                ),
+            ],
+        )
+
+        worker = object.__new__(IluNixlPullConnectorWorker)
+        worker.vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                model="glm-5.3-flash",
+                dtype=torch.bfloat16,
+                hf_config=SimpleNamespace(model_type="glm5_next", num_hidden_layers=45),
+                use_mla=True,
+                get_total_num_kv_heads=lambda: 1,
+                get_head_size=lambda: 512,
+                get_total_num_hidden_layers=lambda: 45,
+            ),
+            cache_config=SimpleNamespace(
+                block_size=sched_block, cache_dtype="bfloat16", mamba_cache_mode="align"
+            ),
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=1,
+                decode_context_parallel_size=1,
+                prefill_context_parallel_size=1,
+            ),
+            scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+            speculative_config=None,
+            kv_transfer_config=SimpleNamespace(
+                kv_role="kv_consumer" if tp_size == 2 else "kv_producer",
+                get_from_extra_config=lambda _k, d=None: d,
+            ),
+        )
+        worker.dsv41_layout = None
+        worker.fp8_wire_staging_enabled = False
+        worker.use_host_buffer = False
+        worker.host_xfer_buffers = {}
+        worker.kv_buffer_device = "cpu"
+        worker.device_type = "cpu"
+        worker.device_id = 0
+        worker._mixed_mem_types = False
+        worker.nixl_memory_type = "DRAM"
+        worker.nixl_backends = ["UCX"]
+        worker.kv_cache_config = kv_cfg
+        worker.engine_id = "decode" if tp_size == 2 else "prefill"
+        worker.tp_rank = 0
+        worker.transfer_tp_rank = 0
+        worker.transfer_tp_size = tp_size
+        worker.world_size = tp_size
+        worker.pp_rank = 0
+        worker.pp_world_size = 1
+        worker.pp_size = 1
+        worker.pp_split = "45"
+        worker.dcp_size = 1
+        worker.pcp_size = 1
+        worker.use_mla = True
+        worker._has_mamba = True
+        worker._is_csa_linear = False
+        worker._ple_region_index = None
+        worker._supports_pp_hma = False
+        worker._has_packed_cache = True
+        worker._is_hma_required = True
+        worker.enable_permute_local_kv = False
+        worker.model_config = worker.vllm_config.model_config
+        worker.attn_backends = [_BlocksFirstTopologyBackend]
+        worker.backend_name = "FLASHMLA_SPARSE"
+        worker.kv_cache_layout = "LBHNC"
+        worker.host_buffer_kv_cache_layout = "LBHNC"
+        worker._layer_specs = {
+            mla_name: mla_spec,
+            idx_name: idx_spec,
+            tail_name: tail_spec,
+            mamba_name: mamba_spec,
+        }
+        worker._group_spec_types = (MLAAttentionSpec, KpoolTailSpec, MambaSpec)
+        worker._conv_decomp = SimpleNamespace(
+            local_conv_offsets=[(0, 512 // tp_size)],
+            remote_conv_offsets=lambda off, _r: [
+                (off * (512 // tp_size), 512 // tp_size)
+            ],
+            ssm_sizes=(1536 // tp_size, 4096 // tp_size),
+        )
+        worker._mamba_ssm_size = (1536 // tp_size, 4096 // tp_size)
+        worker._logical_num_blocks = n_logical
+        worker._scheduler_block_size = sched_block
+        worker._physical_blocks_per_logical_kv_block = ppl
+        worker.block_size = 64
+        worker.num_blocks = n_phys
+        worker._virtual_packed_regions = False
+        worker._registered_descs = []
+        worker.block_len_per_layer = []
+        worker.block_stride_per_layer = []
+        worker.region_group_ids = []
+        worker.region_names = []
+        worker.region_num_blocks = []
+        worker.region_members = []
+        worker._region_is_mla = []
+        worker._transfer_layer_region_indices = []
+        worker.region_mem_types = []
+        worker.dst_region_mem_types = {}
+        worker.dst_region_num_blocks = {}
+        worker.dst_region_group_ids = {}
+        worker.dst_uses_region_group_mapping = {}
+        worker.kv_caches_base_addr = defaultdict(dict)
+        worker.dst_num_blocks = {}
+        worker.src_xfer_handles_by_block_size = {}
+        worker.src_xfer_handles_by_tp_ratio = {}
+        worker.dst_xfer_side_handles = {worker.engine_id: {}, "prefill": {}}
+        worker._remote_agents = {}
+        worker.tp_mappings = {}
+        worker.local_region_ids_by_group = {}
+        worker.remote_region_ids_by_group = {}
+        worker._remote_pp_size_by_engine = {}
+        worker._remote_pp_split_by_engine = {}
+        worker._semantic_region_engines = set()
+        worker._compute_compatibility_hash = lambda _=None: "compat-glm53"
+
+        reg_calls = []
+        dlist_calls = []
+        nixl = MagicMock()
+        nixl.get_agent_metadata.return_value = b"agent"
+        nixl.get_reg_descs.side_effect = lambda ranges, mt: (ranges, mt)
+        nixl.register_memory.side_effect = lambda descs, backends=None: reg_calls.append(
+            descs
+        )
+        nixl.get_xfer_descs.side_effect = lambda arr, mt: (arr, mt)
+        nixl.prep_xfer_dlist.side_effect = lambda agent, descs: (
+            dlist_calls.append((agent, descs)) or len(dlist_calls)
+        )
+        nixl.add_remote_agent.return_value = "remote-p"
+        worker.nixl_wrapper = nixl
+        return worker, kv_caches, total_bytes, reg_calls, dlist_calls
+
+    d_worker, d_caches, d_total_bytes, d_regs, d_dlists = _build_side(
+        sched_block=2304, ppl=36, n_logical=4, tp_size=2
+    )
+    p_worker, p_caches, p_total_bytes, p_regs, _ = _build_side(
+        sched_block=4480, ppl=70, n_logical=4, tp_size=1
+    )
+
+    d_worker.register_kv_caches(d_caches)
+    p_worker.register_kv_caches(p_caches)
+
+    assert d_worker.block_size == 64 and p_worker.block_size == 64
+    assert not d_worker._virtual_packed_regions and not p_worker._virtual_packed_regions
+    assert d_regs[0][0] == [
+        (
+            d_caches["language_model.model.layers.3.self_attn.attn"]
+            .untyped_storage()
+            .data_ptr(),
+            d_total_bytes,
+            0,
+            "",
+        )
+    ]
+    assert p_regs[0][0] == [
+        (
+            p_caches["language_model.model.layers.3.self_attn.attn"]
+            .untyped_storage()
+            .data_ptr(),
+            p_total_bytes,
+            0,
+            "",
+        )
+    ]
+    reg_base, reg_len, _, _ = d_regs[0][0][0]
+    local_blocks_arr = d_dlists[0][1][0]
+    assert int(local_blocks_arr[:, 0].min()) >= reg_base
+    assert (
+        int((local_blocks_arr[:, 0] + local_blocks_arr[:, 1]).max())
+        <= reg_base + reg_len
+    )
+    assert d_worker.block_len_per_layer == [65536, 4096]
+    assert d_worker.block_stride_per_layer == [65536, 4096]
+
+    p_meta = msgspec.msgpack.decode(
+        p_worker.xfer_handshake_metadata.agent_metadata_bytes,
+        type=IluNixlAgentMetadata,
+    )
+    assert p_meta.block_size == 64
+    assert not d_worker._metadata_uses_virtual_packed_regions(p_meta)
+
+    agent_name = d_worker.add_remote_agent(
+        p_meta, remote_tp_rank=0, remote_tp_size=1, remote_pp_rank=0, remote_pp_size=1
+    )
+    assert agent_name == "remote-p"
+
+    # Non-V4.1 scheduler must NOT clip KpoolTailSpec group to [].
+    sched = object.__new__(IluNixlBaseConnectorScheduler)
+    sched.dsv41_layout = None
+    sched.kv_cache_config = d_worker.kv_cache_config
+    sched._is_hma_required = True
+    sched.blocks_per_sw = [0, 2, 0]
+    sched._ssm_spec_blocks = [None, None, 0]
+    sched._ssm_state_slots_are_positional = False
+    sched._init_ilu_transfer_clip_rules()
+    clipped = sched.get_exchange_clipped_blocks(([1, 2], [9], [3, 4]))
+    assert clipped == ([1, 2], [9], [4])
+
+    # _align_group_blocks_with_start handles start_offset with hetero ppl (36 vs 70).
+    remote_info = d_worker.transfer_topo.get_engine_info("prefill")
+    loc0, rem0 = d_worker._align_group_blocks_with_start(
+        list(range(72)),
+        list(range(70)),
+        local_group_idx=0,
+        num_local_groups=3,
+        remote_info=remote_info,
+        start_offset=0,
+    )
+    assert len(loc0) == len(rem0) == 70
+    loc1, rem1 = d_worker._align_group_blocks_with_start(
+        list(range(100, 136)),
+        list(range(70)),
+        local_group_idx=0,
+        num_local_groups=3,
+        remote_info=remote_info,
+        start_offset=1,
+    )
+    assert loc1 == list(range(100, 134))
+    assert rem1 == list(range(36, 70))
+
+    # Stale physical page zeroing (e.g. pages 70..71 >= n_logical=4) does not OOB
+    # on tail_cache (dim0=4) or compressed indexer_k_cache (dim0=72).
+    d_worker.post_process_device_kv_on_receive(
+        block_size_ratio=1,
+        block_ids_list=[(list(range(72)), 70)],
+        convert=False,
+    )
+    assert int(d_caches["language_model.model.layers.3.self_attn.attn"][70].view(torch.uint8).sum().item()) == 0
+    assert int(d_caches["language_model.model.layers.3.self_attn.attn"][69].view(torch.uint8).sum().item()) > 0
+
+
+

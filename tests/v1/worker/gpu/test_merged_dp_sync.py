@@ -31,6 +31,7 @@ def test_agreement_matches_upstream(monkeypatch, scenario, rank):
             [0, 0],
             [1, 2],
             [1, 1],
+            [0, 0],
         ],
         dtype=torch.int32,
     )
@@ -101,7 +102,83 @@ def test_agreement_matches_upstream(monkeypatch, scenario, rank):
         bool(data[6, rank]) if scenario == "skip" else bool(torch.all(data[6] == 1))
     )
     assert get_last_all_ranks_decode_only() == expected
-    assert calls == ([] if scenario == "skip" else [(6, 2), (7, 2)])
+    assert calls == ([] if scenario == "skip" else [(6, 2), (8, 2)])
+
+
+def test_all_idle_dummy_short_circuits_to_zero_tokens(monkeypatch):
+    from vllm_iluvatar.v1.worker.idle_dummy_state import (
+        idle_dummy_batch_scope,
+        was_idle_dummy_short_circuited,
+    )
+
+    def reduce(tensor, group):
+        # Simulate both DP ranks being in runtime idle_dummy_batch_scope.
+        tensor[:, 0] = tensor[:, 1]
+
+    monkeypatch.setattr(merged.dist, "all_reduce", reduce)
+    monkeypatch.setattr(
+        merged, "get_dp_group", lambda: SimpleNamespace(cpu_group="test")
+    )
+    monkeypatch.setattr(merged, "should_skip_dp_coordination", lambda: False)
+    manager = SimpleNamespace(
+        dispatch=lambda *a, **k: pytest.fail("dispatch should not run when all idle")
+    )
+    with idle_dummy_batch_scope():
+        desc, sync = merged.sync_cudagraph_and_dp_padding(
+            cudagraph_manager=manager,
+            desired_batch_desc=Desc(cg_mode=Mode.FULL, num_tokens=6, num_reqs=1),
+            num_tokens=6,
+            num_reqs=1,
+            uniform_token_count=6,
+            dp_size=2,
+            dp_rank=1,
+            uniform_decode=True,
+        )
+        assert was_idle_dummy_short_circuited() is True
+    assert desc == Desc(cg_mode=Mode.NONE, num_tokens=0, num_reqs=0)
+    assert sync is None
+    assert get_last_all_ranks_decode_only() is False
+
+
+def test_mixed_real_and_idle_dummy_runs_normal_agreement(monkeypatch):
+    from vllm_iluvatar.v1.worker.idle_dummy_state import (
+        idle_dummy_batch_scope,
+        was_idle_dummy_short_circuited,
+    )
+
+    def reduce(tensor, group):
+        # Rank 0 is running a real decode batch (row 7 == 0); rank 1 is idle dummy (row 7 == 1).
+        tensor[:, 0] = torch.tensor([6, Mode.FULL.value, 6, -1, 0, 1, 1, 0], dtype=torch.int32)
+
+    monkeypatch.setattr(merged.dist, "all_reduce", reduce)
+    monkeypatch.setattr(
+        merged, "get_dp_group", lambda: SimpleNamespace(cpu_group="test")
+    )
+    monkeypatch.setattr(merged, "should_skip_dp_coordination", lambda: False)
+    manager = SimpleNamespace(
+        dispatch=lambda nreq, ntok, uniform, **k: Desc(
+            cg_mode=Mode.FULL,
+            num_tokens=ntok,
+            num_reqs=nreq,
+            uniform_token_count=uniform,
+        )
+    )
+    with idle_dummy_batch_scope():
+        desc, sync = merged.sync_cudagraph_and_dp_padding(
+            cudagraph_manager=manager,
+            desired_batch_desc=Desc(cg_mode=Mode.FULL, num_tokens=6, num_reqs=1),
+            num_tokens=6,
+            num_reqs=1,
+            uniform_token_count=6,
+            dp_size=2,
+            dp_rank=1,
+            uniform_decode=True,
+        )
+        assert was_idle_dummy_short_circuited() is False
+    assert desc.num_tokens == 6
+    assert desc.cg_mode == Mode.FULL
+    assert sync is not None
+    assert get_last_all_ranks_decode_only() is True
 
 
 def test_signature():

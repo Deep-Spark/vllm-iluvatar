@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Producer-side DeepSeek-V4 BF16 -> packed FP8 wire staging."""
+"""Producer-side compute KV -> packed FP8 wire staging (DSv4 / DSv4.1)."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 
 import torch
 from vllm.config import VllmConfig
@@ -16,21 +17,28 @@ from vllm.models.deepseek_v4.common.ops.cache_utils import (
 from vllm.triton_utils import tl, triton
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
+    KVCacheGroupSpec,
     KVCacheSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
+    group_kernel_blocks,
 )
 
+from ..ilu_nixl_common.fp8_hetero import scatter_staging_rows_to_pool
 from .fp8_layout import (
     FP8_WIRE_SCRATCH_BUFFER_COUNT,
+    build_fp8_ds_mla_wire_config,
     get_fp8_wire_scratch_blocks,
     page_states,
+    wire_sub_blocks_per_compute_block,
 )
 
 logger = init_logger("vllm." + __name__)
 
 ByteSpan = tuple[int, int]
+_COMPRESSED_MAIN_FORMATS = frozenset({"i8g64", "i4g32"})
+_SPLIT_INDEXER_FORMAT = "int8_indexer_split"
 
 
 def _layer_specs(kv_cache_config: KVCacheConfig) -> dict[str, KVCacheSpec]:
@@ -44,14 +52,53 @@ def _layer_specs(kv_cache_config: KVCacheConfig) -> dict[str, KVCacheSpec]:
     return specs
 
 
-def _is_quantized_ds_v4_page(spec: KVCacheSpec) -> bool:
+def _is_fp8_ds_mla_wire_page(spec: KVCacheSpec) -> bool:
     return isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec)) and (
-        spec.model_version == "deepseek_v4" and spec.cache_dtype_str == "fp8_ds_mla"
+        spec.cache_dtype_str == "fp8_ds_mla"
     )
 
 
 def _is_indexer_cache(layer_name: str) -> bool:
     return ".indexer." in layer_name and layer_name.endswith(".k_cache")
+
+
+def _dequant_grouped_main_rows(
+    payload: torch.Tensor,
+    scales: torch.Tensor,
+    *,
+    format_name: str,
+    head_dim: int = 512,
+) -> torch.Tensor:
+    """Dequant ``i8g64`` / ``i4g32`` rows to BF16 for FP8 wire requantization."""
+    if format_name == "i8g64":
+        group_size, groups, payload_width = 64, 8, 512
+    elif format_name == "i4g32":
+        group_size, groups, payload_width = 32, 16, 256
+    else:
+        raise ValueError(f"Unsupported compressed main KV format: {format_name}")
+
+    flat = payload.reshape(-1, payload_width)
+    if flat.numel() == 0:
+        return payload.new_empty((0, head_dim), dtype=torch.bfloat16)
+    if format_name == "i8g64":
+        codes = flat.view(torch.int8).to(torch.float32)
+    else:
+        low = ((flat & 0xF).to(torch.int8) ^ 8) - 8
+        high = (((flat >> 4) & 0xF).to(torch.int8) ^ 8) - 8
+        codes = torch.empty(
+            flat.shape[0], head_dim, dtype=torch.float32, device=payload.device
+        )
+        codes[:, 0::2] = low.to(torch.float32)
+        codes[:, 1::2] = high.to(torch.float32)
+
+    scale = scales.reshape(-1, groups).to(torch.float32)
+    if codes.shape[0] != scale.shape[0]:
+        raise ValueError(
+            f"Compressed KV payload/scale row mismatch: {codes.shape[0]} vs "
+            f"{scale.shape[0]}"
+        )
+    group_ids = torch.arange(head_dim, device=payload.device) // group_size
+    return (codes * scale[:, group_ids]).to(torch.bfloat16)
 
 
 def merge_byte_intervals(intervals: Sequence[ByteSpan]) -> tuple[ByteSpan, ...]:
@@ -142,6 +189,31 @@ def select_scratch_buffer(chunk_index: int) -> int:
     return chunk_index % FP8_WIRE_SCRATCH_BUFFER_COUNT
 
 
+def _coalesce_contiguous_runs(
+    source_block_ids: Sequence[int],
+) -> list[tuple[int, int, int]]:
+    """Group consecutive ``source_block_ids`` into ``(dense_offset, dst_start, length)``."""
+    if not source_block_ids:
+        return []
+    runs: list[tuple[int, int, int]] = []
+    dense_start = 0
+    dst_start = int(source_block_ids[0])
+    run_len = 1
+    prev = dst_start
+    for idx in range(1, len(source_block_ids)):
+        cur = int(source_block_ids[idx])
+        if cur == prev + 1:
+            run_len += 1
+        else:
+            runs.append((dense_start, dst_start, run_len))
+            dense_start = idx
+            dst_start = cur
+            run_len = 1
+        prev = cur
+    runs.append((dense_start, dst_start, run_len))
+    return runs
+
+
 def copy_wire_rows_to_host(
     scratch_rows: torch.Tensor,
     wire_rows: torch.Tensor,
@@ -149,9 +221,11 @@ def copy_wire_rows_to_host(
     spans: Sequence[ByteSpan],
     *,
     non_blocking: bool = False,
+    h2h_threads: int = 4,
 ) -> None:
     """Copy selected HMA spans from dense scratch rows into host mirror rows."""
-    if len(source_block_ids) > scratch_rows.shape[0]:
+    n_blocks = len(source_block_ids)
+    if n_blocks > scratch_rows.shape[0]:
         raise ValueError("FP8 wire scratch does not contain all requested rows")
     effective_spans = tuple(spans)
     if not effective_spans:
@@ -165,10 +239,27 @@ def copy_wire_rows_to_host(
             raise ValueError(
                 f"FP8 wire copy span ({start}, {end}) is outside the host row"
             )
-    for dense_id, source_id in enumerate(source_block_ids):
+    if n_blocks == 0:
+        return
+
+    # Host-to-host path: use OpenMP C++ h2h_scatter (or vectorized span index_copy_).
+    if scratch_rows.device.type == "cpu" and wire_rows.device.type == "cpu":
+        scatter_staging_rows_to_pool(
+            scratch_rows,
+            wire_rows,
+            source_block_ids,
+            effective_spans,
+            num_threads=h2h_threads,
+        )
+        return
+
+    # Device-to-pinned-host path: coalesce consecutive block IDs into bulk 2D DMA copies
+    # on the active CUDA copy_stream without breaking stream ordering!
+    runs = _coalesce_contiguous_runs(source_block_ids)
+    for dense_off, dst_off, run_len in runs:
         for start, end in effective_spans:
-            wire_rows[source_id, start:end].copy_(
-                scratch_rows[dense_id, start:end],
+            wire_rows[dst_off : dst_off + run_len, start:end].copy_(
+                scratch_rows[dense_off : dense_off + run_len, start:end],
                 non_blocking=non_blocking,
             )
 
@@ -263,6 +354,79 @@ def _transcode_int8_indexer_wire_kernel(
     tl.store(destination_scale_ptr, wire_scale, mask=valid)
 
 
+@triton.jit
+def _transcode_split_int8_indexer_wire_kernel(
+    source_ptr,
+    scale_ptr,
+    destination_ptr,
+    source_block_ids_ptr,
+    destination_block_ids_ptr,
+    valid_entries_ptr,
+    source_block_stride,
+    scale_block_stride,
+    destination_block_stride,
+    cache_block_size,
+    HEAD_SIZE: tl.constexpr,
+    SUB_BLOCKS: tl.constexpr = 1,
+):
+    """Split INT8 indexer (uint8[128] + FP32 scale plane) -> D wire uint8[132]."""
+    row_idx = tl.program_id(0)
+    wire_page_idx = row_idx // cache_block_size
+    page_idx = wire_page_idx // SUB_BLOCKS
+    sub_idx = wire_page_idx % SUB_BLOCKS
+    block_offset = row_idx % cache_block_size
+    source_row_offset = sub_idx * cache_block_size + block_offset
+    valid = source_row_offset < tl.load(valid_entries_ptr + page_idx)
+    offsets = tl.arange(0, HEAD_SIZE)
+
+    source_block_id = tl.load(source_block_ids_ptr + page_idx).to(tl.int64)
+    source_block_base = source_block_id * source_block_stride
+    source_data_offset = source_block_base + source_row_offset * HEAD_SIZE
+    int8_bytes = tl.load(
+        source_ptr + source_data_offset + offsets,
+        mask=valid,
+        other=0,
+    )
+    int8_values = int8_bytes.to(tl.int8, bitcast=True).to(tl.float32)
+    source_scale = tl.load(
+        scale_ptr + source_block_id * scale_block_stride + source_row_offset,
+        mask=valid,
+        other=0.0,
+    )
+    values = int8_values * source_scale
+
+    amax = tl.max(tl.abs(values), axis=0)
+    exponent = tl.ceil(tl.log2(tl.maximum(amax, 1e-4) / 448.0))
+    wire_scale = tl.exp2(exponent)
+    quantized = tl.clamp(values / wire_scale, -448.0, 448.0)
+    fp8_bytes = quantized.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+
+    destination_block_id = tl.load(destination_block_ids_ptr + wire_page_idx).to(
+        tl.int64
+    )
+    destination_block_base = destination_block_id * destination_block_stride
+    destination_data_offset = destination_block_base + block_offset * HEAD_SIZE
+    tl.store(
+        destination_ptr + destination_data_offset + offsets,
+        fp8_bytes,
+        mask=valid,
+    )
+    destination_scale_offset = (
+        destination_block_base + cache_block_size * HEAD_SIZE + block_offset * 4
+    )
+    destination_scale_ptr = (destination_ptr + destination_scale_offset).to(
+        tl.pointer_type(tl.float32)
+    )
+    tl.store(destination_scale_ptr, wire_scale, mask=valid)
+
+
+def _is_layer_outermost_wire_config(wire_config: KVCacheConfig) -> bool:
+    return any(
+        int(getattr(tensor, "layer_stride", 0) or 0) > int(tensor.block_stride)
+        for tensor in wire_config.kv_cache_tensors
+    )
+
+
 def allocate_fp8_ds_mla_wire_caches(
     wire_config: KVCacheConfig,
     device: torch.device,
@@ -273,6 +437,51 @@ def allocate_fp8_ds_mla_wire_caches(
     """Allocate one packed backing and create all D-layout layer views."""
     if not wire_config.kv_cache_tensors:
         raise ValueError("FP8 DS MLA wire staging has no cache tensors")
+
+    view_num_blocks = wire_config.num_blocks if num_blocks is None else num_blocks
+    if view_num_blocks <= 0:
+        raise ValueError("FP8 DS MLA wire staging must allocate at least one block")
+    wire_specs = _layer_specs(wire_config)
+
+    if _is_layer_outermost_wire_config(wire_config):
+        layer_plans: list[tuple[str, int, int, int]] = []
+        offset = 0
+        for tensor_config in wire_config.kv_cache_tensors:
+            if tensor_config.block_stride <= 0:
+                raise ValueError("FP8 DS MLA wire staging must use a packed layout")
+            if len(tensor_config.layers) != 1:
+                raise ValueError(
+                    "Layer-outermost FP8 wire tensor must own one layer"
+                )
+            layer_name = tensor_config.layers[0]
+            spec = wire_specs[layer_name]
+            unit_bytes = wire_config.num_blocks * tensor_config.block_stride
+            if unit_bytes <= 0 or tensor_config.layer_stride % unit_bytes != 0:
+                raise ValueError(
+                    f"Unexpected layer_stride for {layer_name}: "
+                    f"{tensor_config.layer_stride}"
+                )
+            sub_blocks = tensor_config.layer_stride // unit_bytes
+            layer_bytes = view_num_blocks * sub_blocks * tensor_config.block_stride
+            layer_plans.append(
+                (layer_name, sub_blocks, int(spec.page_size_bytes), offset)
+            )
+            offset += layer_bytes
+        backing = torch.zeros(
+            offset,
+            dtype=torch.uint8,
+            device=device,
+            pin_memory=pin_memory,
+        )
+        wire_caches: dict[str, torch.Tensor] = {}
+        for layer_name, sub_blocks, page_bytes, layer_offset in layer_plans:
+            wire_caches[layer_name] = torch.as_strided(
+                backing,
+                size=(view_num_blocks * sub_blocks, page_bytes),
+                stride=(page_bytes, 1),
+                storage_offset=layer_offset,
+            )
+        return wire_caches
 
     first = wire_config.kv_cache_tensors[0]
     if first.block_stride <= 0:
@@ -285,9 +494,6 @@ def allocate_fp8_ds_mla_wire_caches(
             "FP8 DS MLA wire staging tensors must share one packed allocation"
         )
 
-    view_num_blocks = wire_config.num_blocks if num_blocks is None else num_blocks
-    if view_num_blocks <= 0:
-        raise ValueError("FP8 DS MLA wire staging must allocate at least one block")
     backing_size = (
         first.size if num_blocks is None else first.block_stride * view_num_blocks
     )
@@ -297,8 +503,7 @@ def allocate_fp8_ds_mla_wire_caches(
         device=device,
         pin_memory=pin_memory,
     )
-    wire_specs = _layer_specs(wire_config)
-    wire_caches: dict[str, torch.Tensor] = {}
+    wire_caches = {}
     for tensor_config in wire_config.kv_cache_tensors:
         for layer_name in tensor_config.layers:
             spec = wire_specs[layer_name]
@@ -327,6 +532,47 @@ def allocate_fp8_ds_mla_wire_scratch_caches(
     ]
 
 
+def _filter_groups_for_active_layers(
+    groups: list[KVCacheGroupSpec],
+    active_layers: set[str],
+) -> list[KVCacheGroupSpec]:
+    filtered: list[KVCacheGroupSpec] = []
+    for group in groups:
+        kept = [name for name in group.layer_names if name in active_layers]
+        if len(kept) == len(group.layer_names):
+            filtered.append(group)
+        elif not kept:
+            filtered.append(replace(group, layer_names=[]))
+        else:
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = UniformTypeKVCacheSpecs.from_specs(
+                    {name: spec.kv_cache_specs[name] for name in kept}
+                )
+                assert spec is not None
+            filtered.append(replace(group, layer_names=kept, kv_cache_spec=spec))
+    return filtered
+
+
+def _normalize_manager_blocks(
+    tensor: torch.Tensor,
+    num_blocks: int,
+    *,
+    name: str,
+) -> torch.Tensor:
+    """View kernel-block-split storage with manager block IDs on axis 0."""
+    if num_blocks <= 0 or tensor.shape[0] == num_blocks:
+        return tensor
+    grouped = group_kernel_blocks(tensor, num_blocks)
+    if not grouped[0].is_contiguous():
+        raise ValueError(
+            "FP8 wire staging requires contiguous kernel blocks within each "
+            f"manager block for {name}, got shape={tuple(grouped.shape)} "
+            f"stride={grouped.stride()}"
+        )
+    return grouped
+
+
 class FP8DSMLAWireStaging:
     """Pinned-host mirror of producer block IDs in D's packed FP8 wire layout.
 
@@ -341,23 +587,65 @@ class FP8DSMLAWireStaging:
         vllm_config: VllmConfig,
         compute_config: KVCacheConfig,
         compute_caches: dict[str, torch.Tensor],
+        kv_cache_scales: dict[str, torch.Tensor] | None = None,
     ) -> None:
         self.compute_config = compute_config
-        self.compute_caches = compute_caches
         self.num_blocks = compute_config.num_blocks
-        self.wire_config = getattr(compute_config, "wire_kv_cache_config", None)
-        if self.wire_config is None:
+        self.compute_caches = {
+            layer_name: _normalize_manager_blocks(
+                cache, self.num_blocks, name=layer_name
+            )
+            for layer_name, cache in compute_caches.items()
+        }
+        resolved_scales = dict(kv_cache_scales) if kv_cache_scales else {}
+        compilation_cfg = getattr(vllm_config, "compilation_config", None)
+        forward_context = (
+            getattr(compilation_cfg, "static_forward_context", {})
+            if compilation_cfg is not None
+            else {}
+        )
+        for layer_name in compute_caches:
+            if layer_name not in resolved_scales and layer_name in forward_context:
+                scales = getattr(forward_context[layer_name], "kv_cache_scales", None)
+                if isinstance(scales, torch.Tensor):
+                    resolved_scales[layer_name] = scales
+        self.kv_cache_scales = {
+            layer_name: _normalize_manager_blocks(
+                scale, self.num_blocks, name=f"{layer_name}.scales"
+            )
+            for layer_name, scale in resolved_scales.items()
+        }
+        raw_wire_config = getattr(compute_config, "wire_kv_cache_config", None)
+        if raw_wire_config is None:
             raise ValueError(
                 "FP8 DS MLA wire staging was not planned with the compute cache"
             )
-        if self.wire_config.num_blocks != self.num_blocks:
+        if raw_wire_config.num_blocks != self.num_blocks:
             raise ValueError(
                 "Compute and wire KV cache block counts must match: "
-                f"{self.num_blocks} != {self.wire_config.num_blocks}"
+                f"{self.num_blocks} != {raw_wire_config.num_blocks}"
             )
 
-        if not self.wire_config.kv_cache_tensors:
+        if not raw_wire_config.kv_cache_tensors:
             raise ValueError("FP8 DS MLA wire staging has no cache tensors")
+        if not compute_caches:
+            raise ValueError("FP8 DS MLA wire staging has no compute caches")
+
+        raw_wire_specs = _layer_specs(raw_wire_config)
+        active_layers = set(compute_caches)
+        if active_layers < set(raw_wire_specs):
+            filtered_compute_groups = _filter_groups_for_active_layers(
+                compute_config.kv_cache_groups, active_layers
+            )
+            filtered_wire_groups = _filter_groups_for_active_layers(
+                raw_wire_config.kv_cache_groups, active_layers
+            )
+            self.wire_config = build_fp8_ds_mla_wire_config(
+                filtered_compute_groups, filtered_wire_groups, self.num_blocks
+            )
+        else:
+            self.wire_config = raw_wire_config
+
         first = self.wire_config.kv_cache_tensors[0]
         self.block_stride = first.block_stride
         if self.block_stride <= 0:
@@ -366,8 +654,14 @@ class FP8DSMLAWireStaging:
         wire_specs = _layer_specs(self.wire_config)
         self.compute_specs = _layer_specs(compute_config)
         self.wire_specs = wire_specs
-        if not compute_caches:
-            raise ValueError("FP8 DS MLA wire staging has no compute caches")
+        self._is_layer_outermost = _is_layer_outermost_wire_config(self.wire_config)
+        self.sub_blocks_by_layer = {
+            layer_name: wire_sub_blocks_per_compute_block(
+                self.compute_specs[layer_name], wire_specs[layer_name]
+            )
+            for layer_name in wire_specs
+            if layer_name in self.compute_specs
+        }
         compute_device = next(iter(compute_caches.values())).device
         self.scratch_blocks = get_fp8_wire_scratch_blocks(vllm_config)
         self.wire_caches = allocate_fp8_ds_mla_wire_caches(
@@ -390,16 +684,25 @@ class FP8DSMLAWireStaging:
                     raise ValueError(
                         f"Preallocated wire cache is missing layer {layer_name}"
                     )
-                expected_shape = (self.num_blocks, spec.page_size_bytes)
+                sub_blocks = self.sub_blocks_by_layer.get(layer_name, 1)
+                expected_shape = (
+                    self.num_blocks * sub_blocks,
+                    spec.page_size_bytes,
+                )
                 if cache.shape != expected_shape:
                     raise ValueError(
                         f"Wire cache shape for {layer_name} is {cache.shape}, "
                         f"expected {expected_shape}"
                     )
-                if cache.stride(0) != self.block_stride:
+                expected_stride = (
+                    spec.page_size_bytes
+                    if self._is_layer_outermost
+                    else self.block_stride
+                )
+                if cache.stride(0) != expected_stride:
                     raise ValueError(
                         f"Wire cache block stride for {layer_name} is "
-                        f"{cache.stride(0)}, expected {self.block_stride}"
+                        f"{cache.stride(0)}, expected {expected_stride}"
                     )
         unexpected_layers = set(self.wire_caches) - expected_layers
         if unexpected_layers:
@@ -415,32 +718,67 @@ class FP8DSMLAWireStaging:
                 "Preallocated FP8 DS MLA wire caches must share one backing"
             )
         self.backing = next(iter(self.wire_caches.values()))
-        self.wire_rows = torch.as_strided(
-            self.backing,
-            size=(self.num_blocks, self.block_stride),
-            stride=(self.block_stride, 1),
-            storage_offset=0,
-        )
         self.scratch_backings = [
             next(iter(caches.values())) for caches in self.scratch_wire_cache_buffers
         ]
-        self.scratch_row_buffers = [
-            torch.as_strided(
-                scratch,
-                size=(self.scratch_blocks, self.block_stride),
+        if self._is_layer_outermost:
+            backing_ptr = self.backing.untyped_storage().data_ptr()
+            self.wire_layer_rows: dict[str, torch.Tensor] = {}
+            self.scratch_layer_rows: list[dict[str, torch.Tensor]] = [
+                {} for _ in range(FP8_WIRE_SCRATCH_BUFFER_COUNT)
+            ]
+            self.layer_compute_bytes: dict[str, int] = {}
+            for layer_name, wire_cache in self.wire_caches.items():
+                sub_blocks = self.sub_blocks_by_layer.get(layer_name, 1)
+                row_bytes = sub_blocks * int(wire_specs[layer_name].page_size_bytes)
+                self.layer_compute_bytes[layer_name] = row_bytes
+                self.wire_layer_rows[layer_name] = torch.as_strided(
+                    self.backing,
+                    size=(self.num_blocks, row_bytes),
+                    stride=(row_bytes, 1),
+                    storage_offset=wire_cache.data_ptr() - backing_ptr,
+                )
+            for buf_idx, caches in enumerate(self.scratch_wire_cache_buffers):
+                scratch_ptr = self.scratch_backings[buf_idx].untyped_storage().data_ptr()
+                for layer_name, sc in caches.items():
+                    row_bytes = self.layer_compute_bytes[layer_name]
+                    self.scratch_layer_rows[buf_idx][layer_name] = torch.as_strided(
+                        sc,
+                        size=(self.scratch_blocks, row_bytes),
+                        stride=(row_bytes, 1),
+                        storage_offset=sc.data_ptr() - scratch_ptr,
+                    )
+            self.wire_rows = None
+            self.scratch_row_buffers = []
+            if self.storage.nbytes() != first.size:
+                raise ValueError("Pinned CPU FP8 wire backing has an unexpected size")
+        else:
+            self.wire_layer_rows = {}
+            self.scratch_layer_rows = []
+            self.layer_compute_bytes = {}
+            self.wire_rows = torch.as_strided(
+                self.backing,
+                size=(self.num_blocks, self.block_stride),
                 stride=(self.block_stride, 1),
                 storage_offset=0,
             )
-            for scratch in self.scratch_backings
-        ]
-        if self.storage.nbytes() != self.num_blocks * self.block_stride:
-            raise ValueError("Pinned CPU FP8 wire backing has an unexpected size")
-        if any(
-            scratch.untyped_storage().nbytes()
-            != self.scratch_blocks * self.block_stride
-            for scratch in self.scratch_backings
-        ):
-            raise ValueError("GPU FP8 wire scratch has an unexpected size")
+            self.scratch_row_buffers = [
+                torch.as_strided(
+                    scratch,
+                    size=(self.scratch_blocks, self.block_stride),
+                    stride=(self.block_stride, 1),
+                    storage_offset=0,
+                )
+                for scratch in self.scratch_backings
+            ]
+            if self.storage.nbytes() != self.num_blocks * self.block_stride:
+                raise ValueError("Pinned CPU FP8 wire backing has an unexpected size")
+            if any(
+                scratch.untyped_storage().nbytes()
+                != self.scratch_blocks * self.block_stride
+                for scratch in self.scratch_backings
+            ):
+                raise ValueError("GPU FP8 wire scratch has an unexpected size")
         if self.backing.device.type != "cpu" or not self.backing.is_pinned():
             raise ValueError("CPU FP8 wire backing must be pinned host memory")
         if any(scratch.device != compute_device for scratch in self.scratch_backings):
@@ -461,11 +799,29 @@ class FP8DSMLAWireStaging:
                 for _ in range(FP8_WIRE_SCRATCH_BUFFER_COUNT)
             ]
         self._next_scratch_chunk = 0
+        self._dense_arange = torch.arange(
+            self.scratch_blocks, dtype=torch.int64, device=compute_device
+        )
+        max_sub_blocks = max(self.sub_blocks_by_layer.values(), default=1)
+        self._dense_sub_arange = (
+            torch.arange(
+                self.scratch_blocks * max_sub_blocks,
+                dtype=torch.int64,
+                device=compute_device,
+            )
+            if max_sub_blocks > 1
+            else self._dense_arange
+        )
 
         self.layer_to_group: dict[str, int] = {}
+        self.group_active_layers: list[list[str]] = [
+            [] for _ in compute_config.kv_cache_groups
+        ]
         for group_idx, group in enumerate(compute_config.kv_cache_groups):
             for layer_name in group.layer_names:
                 self.layer_to_group[layer_name] = group_idx
+                if layer_name in compute_caches:
+                    self.group_active_layers[group_idx].append(layer_name)
 
         missing = set(compute_caches) - set(self.wire_caches)
         if missing:
@@ -473,9 +829,18 @@ class FP8DSMLAWireStaging:
                 "Wire staging planner omitted compute cache layers: "
                 + ", ".join(sorted(missing))
             )
-        self.hma_copy_spans = build_hma_copy_spans(
-            self.compute_config, self.wire_config
-        )
+        if self._is_layer_outermost:
+            self.hma_copy_spans = tuple(
+                tuple(
+                    (0, self.layer_compute_bytes[layer_name])
+                    for layer_name in layers
+                )
+                for layers in self.group_active_layers
+            )
+        else:
+            self.hma_copy_spans = build_hma_copy_spans(
+                self.compute_config, self.wire_config
+            )
         for group_idx, spans in enumerate(self.hma_copy_spans):
             covered_bytes = sum(end - start for start, end in spans)
             logger.info(
@@ -512,6 +877,8 @@ class FP8DSMLAWireStaging:
         destination_block_ids: torch.Tensor,
         source_spec: KVCacheSpec,
         wire_spec: KVCacheSpec,
+        *,
+        already_zeroed: bool = False,
     ) -> None:
         if source_spec.real_page_size_bytes != wire_spec.real_page_size_bytes:
             raise ValueError(
@@ -530,13 +897,28 @@ class FP8DSMLAWireStaging:
                 "Unexpected source cache shape for REPACK_ONLY: "
                 f"got {selected_bytes.shape[1]} bytes, expected {real_size}"
             )
-        wire_rows = torch.zeros(
-            (source_block_ids.numel(), wire_spec.page_size_bytes),
-            dtype=torch.uint8,
-            device=source.device,
+        if not already_zeroed and real_size < wire_spec.page_size_bytes:
+            self._zero_destination_pages(destination, destination_block_ids)
+        destination[:, :real_size].index_copy_(
+            0, destination_block_ids, selected_bytes
         )
-        wire_rows[:, :real_size].copy_(selected_bytes)
-        destination.index_copy_(0, destination_block_ids, wire_rows)
+
+    @staticmethod
+    def _zero_destination_pages(
+        destination: torch.Tensor,
+        destination_block_ids: torch.Tensor,
+    ) -> None:
+        n_pages = destination_block_ids.numel()
+        if n_pages == 0:
+            return
+        # Fast contiguous slice zeroing when destination_block_ids is 0..n-1.
+        if (
+            destination_block_ids.device.type == "cpu"
+            and destination_block_ids.tolist() == list(range(n_pages))
+        ):
+            destination[:n_pages].zero_()
+            return
+        destination.index_fill_(0, destination_block_ids, 0)
 
     @staticmethod
     def _valid_entries_for_chunk(
@@ -568,6 +950,31 @@ class FP8DSMLAWireStaging:
         )
         return valid_tokens // int(source_spec.tokens_per_state)
 
+    @staticmethod
+    def _valid_token_count_for_chunk(
+        source_spec: MLAAttentionSpec | SlidingWindowMLASpec,
+        num_tokens: int,
+        total_block_count: int,
+        chunk_offset: int,
+        chunk_size: int,
+    ) -> int:
+        """Pure-Python exact valid row count without GPU->CPU boolean mask sync."""
+        block_size = int(source_spec.block_size)
+        tps = int(source_spec.tokens_per_state)
+        num_logical_pages = (num_tokens + block_size - 1) // block_size
+        first_logical_page = num_logical_pages - total_block_count
+        if first_logical_page < 0:
+            raise ValueError(
+                "More staging blocks were supplied than the token count requires"
+            )
+        total_valid = 0
+        for idx in range(chunk_size):
+            lp = first_logical_page + chunk_offset + idx
+            rem = num_tokens - lp * block_size
+            valid_tok = 0 if rem <= 0 else (block_size if rem >= block_size else rem)
+            total_valid += valid_tok // tps
+        return total_valid
+
     def _quantize_pages(
         self,
         source: torch.Tensor,
@@ -578,53 +985,87 @@ class FP8DSMLAWireStaging:
         num_tokens: int,
         total_block_count: int,
         chunk_offset: int,
+        *,
+        already_zeroed: bool = False,
+        source_scales: torch.Tensor | None = None,
+        layer_name: str | None = None,
+        wire_spec: MLAAttentionSpec | SlidingWindowMLASpec | None = None,
     ) -> None:
-        if source.dtype != torch.bfloat16:
+        format_name = source_spec.cache_dtype_str
+        compressed = format_name in _COMPRESSED_MAIN_FORMATS
+        if compressed:
+            if source.dtype != torch.uint8:
+                raise ValueError(
+                    f"Compressed main KV requires uint8 payload, got {source.dtype}"
+                )
+            if source_scales is None:
+                raise ValueError(
+                    "Compressed main KV wire staging needs paired FP16 scales"
+                    + (f" for {layer_name}" if layer_name else "")
+                )
+            if source_scales.dtype != torch.float16:
+                raise ValueError(
+                    f"Compressed main KV scales must be float16, got {source_scales.dtype}"
+                )
+        elif source.dtype != torch.bfloat16:
             raise ValueError(
                 f"QUANT_PACK requires a BF16 producer cache, got {source.dtype}"
             )
+        if source_spec.head_size != 512:
+            raise ValueError(
+                "FP8 DS MLA wire quantization requires head_size=512, "
+                f"got {source_spec.head_size}"
+            )
         tokens_per_page = page_states(source_spec)
-        selected = source.index_select(0, source_block_ids).contiguous()
-        selected = selected.reshape(
-            source_block_ids.numel(), tokens_per_page, source_spec.head_size
+        wire_tokens_per_page = (
+            page_states(wire_spec) if wire_spec is not None else tokens_per_page
         )
-        valid_entries = self._valid_entries_for_chunk(
+        chunk_size = source_block_ids.numel()
+        total_valid = self._valid_token_count_for_chunk(
             source_spec,
             num_tokens,
             total_block_count,
             chunk_offset,
-            source_block_ids.numel(),
-            source_block_ids.device,
+            chunk_size,
         )
-        entry_offsets = torch.arange(
-            tokens_per_page, dtype=torch.int64, device=source_block_ids.device
-        )
-        valid_mask = entry_offsets[None, :] < valid_entries[:, None]
-        rows = selected[valid_mask]
-        if rows.shape[1] != 512:
-            raise ValueError(
-                "DeepSeek-V4 FP8 wire quantization requires head_size=512, "
-                f"got {rows.shape[1]}"
-            )
-        slot_mapping = (
-            destination_block_ids[:, None] * tokens_per_page + entry_offsets[None, :]
-        )[valid_mask]
-        destination.index_copy_(
-            0,
-            destination_block_ids,
-            torch.zeros(
-                (source_block_ids.numel(), destination.shape[1]),
-                dtype=torch.uint8,
-                device=destination.device,
-            ),
-        )
-        if rows.numel() == 0:
+        if not already_zeroed:
+            self._zero_destination_pages(destination, destination_block_ids)
+        if total_valid == 0:
             return
+        selected = source.index_select(0, source_block_ids).contiguous()
+        if compressed:
+            assert format_name is not None
+            payload_width = 512 if format_name == "i8g64" else 256
+            flat_payload = selected.reshape(
+                chunk_size * tokens_per_page, payload_width
+            )[:total_valid]
+            selected_scales = source_scales.index_select(0, source_block_ids)
+            # Scales are [blocks, rows, groups] (or an equivalent strided view).
+            flat_scales = selected_scales.reshape(
+                chunk_size * tokens_per_page, selected_scales.shape[-1]
+            )[:total_valid]
+            flat_rows = _dequant_grouped_main_rows(
+                flat_payload,
+                flat_scales,
+                format_name=format_name,
+                head_dim=source_spec.head_size,
+            )
+        else:
+            flat_rows = selected.reshape(
+                chunk_size * tokens_per_page, source_spec.head_size
+            )[:total_valid]
+        entry_offsets = torch.arange(
+            wire_tokens_per_page, dtype=torch.int64, device=source_block_ids.device
+        )
+        flat_slots = (
+            destination_block_ids[:, None] * wire_tokens_per_page
+            + entry_offsets[None, :]
+        ).reshape(-1)[:total_valid]
         quantize_and_insert_k_cache(
-            rows,
+            flat_rows,
             destination,
-            slot_mapping,
-            block_size=tokens_per_page,
+            flat_slots,
+            block_size=wire_tokens_per_page,
             is_ue8m0=True,
             use_fnuz=False,
         )
@@ -640,20 +1081,71 @@ class FP8DSMLAWireStaging:
         num_tokens: int,
         total_block_count: int,
         chunk_offset: int,
+        *,
+        already_zeroed: bool = False,
+        source_scales: torch.Tensor | None = None,
+        layer_name: str | None = None,
     ) -> None:
         wire_page_states = page_states(wire_spec)
         source_page_states = page_states(source_spec)
         if (
             wire_spec.dtype != torch.uint8
             or wire_spec.head_size != 132
-            or wire_page_states != source_page_states
+            or source_page_states < wire_page_states
+            or source_page_states % wire_page_states != 0
         ):
             raise ValueError(
-                "Indexer wire cache must use D's uint8 [block, 64, 132] "
+                "Indexer wire cache must use D's uint8 [block, S, 132] "
                 f"layout, got dtype={wire_spec.dtype}, "
                 f"head_size={wire_spec.head_size}, "
                 f"page_states={wire_page_states} (source {source_page_states})"
             )
+        sub_blocks = source_page_states // wire_page_states
+
+        split_indexer = source_spec.cache_dtype_str == _SPLIT_INDEXER_FORMAT
+        if split_indexer:
+            if (
+                source.dtype != torch.uint8
+                or source_spec.head_size != 128
+                or source_spec.dtype != torch.uint8
+            ):
+                raise ValueError(
+                    "Split INT8 indexer requires uint8 head_size=128 payload, "
+                    f"got dtype={source.dtype}, head_size={source_spec.head_size}"
+                )
+            if source_scales is None or source_scales.dtype != torch.float32:
+                raise ValueError(
+                    "Split INT8 indexer wire staging needs paired float32 scales"
+                    + (f" for {layer_name}" if layer_name else "")
+                )
+            valid_entries = self._valid_entries_for_chunk(
+                source_spec,
+                num_tokens,
+                total_block_count,
+                chunk_offset,
+                source_block_ids.numel(),
+                source_block_ids.device,
+            )
+            if not already_zeroed:
+                self._zero_destination_pages(destination, destination_block_ids)
+            scale_block_stride = source_scales.stride(0)
+            _transcode_split_int8_indexer_wire_kernel[
+                (source_block_ids.numel() * source_page_states,)
+            ](
+                source.view(torch.uint8),
+                source_scales,
+                destination,
+                source_block_ids,
+                destination_block_ids,
+                valid_entries,
+                source.view(torch.uint8).stride(0),
+                scale_block_stride,
+                destination.stride(0),
+                wire_page_states,
+                HEAD_SIZE=128,
+                SUB_BLOCKS=sub_blocks,
+            )
+            return
 
         if source_spec.dtype == torch.uint8 and source_spec.head_size == 132:
             if source.dtype != torch.uint8:
@@ -670,15 +1162,8 @@ class FP8DSMLAWireStaging:
                 source_block_ids.numel(),
                 source_block_ids.device,
             )
-            destination.index_copy_(
-                0,
-                destination_block_ids,
-                torch.zeros(
-                    (source_block_ids.numel(), destination.shape[1]),
-                    dtype=torch.uint8,
-                    device=destination.device,
-                ),
-            )
+            if not already_zeroed:
+                self._zero_destination_pages(destination, destination_block_ids)
             _transcode_int8_indexer_wire_kernel[
                 (source_block_ids.numel() * tokens_per_page,)
             ](
@@ -696,62 +1181,53 @@ class FP8DSMLAWireStaging:
 
         if source.dtype != torch.bfloat16 or source_spec.head_size != 128:
             raise ValueError(
-                "Indexer wire staging requires a BF16 head_size=128 or "
-                "uint8 head_size=132 producer cache, "
+                "Indexer wire staging requires BF16 head_size=128, "
+                "uint8 head_size=132, or split INT8 head_size=128 producer cache, "
                 f"got dtype={source.dtype}, head_size={source_spec.head_size}"
             )
 
         tokens_per_page = source_page_states
-        selected = (
-            source.index_select(0, source_block_ids)
-            .contiguous()
-            .reshape(
-                source_block_ids.numel(),
-                tokens_per_page,
-                source_spec.head_size,
-            )
-        )
-        valid_entries = self._valid_entries_for_chunk(
+        chunk_size = source_block_ids.numel()
+        total_valid = self._valid_token_count_for_chunk(
             source_spec,
             num_tokens,
             total_block_count,
             chunk_offset,
-            source_block_ids.numel(),
-            source_block_ids.device,
+            chunk_size,
+        )
+        if not already_zeroed:
+            self._zero_destination_pages(destination, destination_block_ids)
+        if total_valid == 0:
+            return
+
+        selected = (
+            source.index_select(0, source_block_ids)
+            .contiguous()
+            .reshape(
+                chunk_size * tokens_per_page,
+                source_spec.head_size,
+            )[:total_valid]
         )
         entry_offsets = torch.arange(
-            tokens_per_page, dtype=torch.int64, device=source_block_ids.device
+            wire_page_states, dtype=torch.int64, device=source_block_ids.device
         )
-        valid_mask = entry_offsets[None, :] < valid_entries[:, None]
-        rows = selected[valid_mask]
         slot_mapping = (
-            destination_block_ids[:, None] * tokens_per_page + entry_offsets[None, :]
-        )[valid_mask]
-
-        destination.index_copy_(
-            0,
-            destination_block_ids,
-            torch.zeros(
-                (source_block_ids.numel(), destination.shape[1]),
-                dtype=torch.uint8,
-                device=destination.device,
-            ),
-        )
-        if rows.numel() == 0:
-            return
+            destination_block_ids[:, None] * wire_page_states + entry_offsets[None, :]
+        ).reshape(-1)[:total_valid]
 
         # Native D physically stores all 128-byte FP8 rows first, followed by
         # one FP32 UE8M0 scale per token. The final 192 bytes of each 8640-byte
         # wire page remain zero padding.
-        _quantize_indexer_wire_kernel[(rows.shape[0],)](
-            rows,
+        _quantize_indexer_wire_kernel[(total_valid,)](
+            selected,
             destination,
             slot_mapping,
-            rows.stride(0),
+            selected.stride(0),
             destination.stride(0),
             wire_page_states,
             HEAD_SIZE=128,
         )
+
 
     def _stage_group_chunk(
         self,
@@ -762,6 +1238,8 @@ class FP8DSMLAWireStaging:
         num_tokens: int,
         total_block_count: int,
         chunk_offset: int,
+        *,
+        already_zeroed: bool = False,
     ) -> None:
         for layer_name, source in self.compute_caches.items():
             if self.layer_to_group[layer_name] != group_idx:
@@ -769,6 +1247,14 @@ class FP8DSMLAWireStaging:
             source_spec = self.compute_specs[layer_name]
             wire_spec = self.wire_specs[layer_name]
             destination = destination_caches[layer_name]
+            source_scales = self.kv_cache_scales.get(layer_name)
+            sub_blocks = getattr(self, "sub_blocks_by_layer", {}).get(layer_name, 1)
+            if sub_blocks > 1:
+                dst_ids = self._dense_sub_arange[
+                    : destination_block_ids.numel() * sub_blocks
+                ]
+            else:
+                dst_ids = destination_block_ids
             if _is_indexer_cache(layer_name):
                 if not isinstance(source_spec, MLAAttentionSpec) or not isinstance(
                     wire_spec, MLAAttentionSpec
@@ -780,33 +1266,42 @@ class FP8DSMLAWireStaging:
                     source,
                     destination,
                     source_block_ids,
-                    destination_block_ids,
+                    dst_ids,
                     source_spec,
                     wire_spec,
                     num_tokens,
                     total_block_count,
                     chunk_offset,
+                    already_zeroed=already_zeroed,
+                    source_scales=source_scales,
+                    layer_name=layer_name,
                 )
-            elif _is_quantized_ds_v4_page(wire_spec):
+            elif _is_fp8_ds_mla_wire_page(wire_spec):
                 assert isinstance(source_spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+                assert isinstance(wire_spec, (MLAAttentionSpec, SlidingWindowMLASpec))
                 self._quantize_pages(
                     source,
                     destination,
                     source_block_ids,
-                    destination_block_ids,
+                    dst_ids,
                     source_spec,
                     num_tokens,
                     total_block_count,
                     chunk_offset,
+                    already_zeroed=already_zeroed,
+                    source_scales=source_scales,
+                    layer_name=layer_name,
+                    wire_spec=wire_spec,
                 )
             else:
                 self._copy_repacked_pages(
                     source,
                     destination,
                     source_block_ids,
-                    destination_block_ids,
+                    dst_ids,
                     source_spec,
                     wire_spec,
+                    already_zeroed=already_zeroed,
                 )
 
     def _enqueue_group_chunk(
@@ -823,7 +1318,6 @@ class FP8DSMLAWireStaging:
         buffer_idx = select_scratch_buffer(chunk_index)
         self._next_scratch_chunk += 1
         scratch_backing = self.scratch_backings[buffer_idx]
-        scratch_rows = self.scratch_row_buffers[buffer_idx]
         scratch_caches = self.scratch_wire_cache_buffers[buffer_idx]
         quant_done = self.quant_done_events[buffer_idx]
         copy_done = self.copy_done_events[buffer_idx]
@@ -831,7 +1325,14 @@ class FP8DSMLAWireStaging:
 
         if chunk_index >= FP8_WIRE_SCRATCH_BUFFER_COUNT:
             quant_stream.wait_event(copy_done)
-        scratch_rows[: len(source_id_list)].zero_()
+        if getattr(self, "_is_layer_outermost", False):
+            for layer_name in self.group_active_layers[group_idx]:
+                self.scratch_layer_rows[buffer_idx][layer_name][
+                    : len(source_id_list)
+                ].zero_()
+        else:
+            scratch_rows = self.scratch_row_buffers[buffer_idx]
+            scratch_rows[: len(source_id_list)].zero_()
         self._stage_group_chunk(
             group_idx,
             source_ids,
@@ -840,18 +1341,30 @@ class FP8DSMLAWireStaging:
             num_tokens,
             total_block_count,
             chunk_offset,
+            already_zeroed=True,
         )
         quant_done.record(quant_stream)
 
         with torch.cuda.stream(self.copy_stream):
             self.copy_stream.wait_event(quant_done)
-            copy_wire_rows_to_host(
-                scratch_rows,
-                self.wire_rows,
-                source_id_list,
-                self.hma_copy_spans[group_idx],
-                non_blocking=True,
-            )
+            if getattr(self, "_is_layer_outermost", False):
+                for layer_name in self.group_active_layers[group_idx]:
+                    row_bytes = self.layer_compute_bytes[layer_name]
+                    copy_wire_rows_to_host(
+                        self.scratch_layer_rows[buffer_idx][layer_name],
+                        self.wire_layer_rows[layer_name],
+                        source_id_list,
+                        ((0, row_bytes),),
+                        non_blocking=True,
+                    )
+            else:
+                copy_wire_rows_to_host(
+                    self.scratch_row_buffers[buffer_idx],
+                    self.wire_rows,
+                    source_id_list,
+                    self.hma_copy_spans[group_idx],
+                    non_blocking=True,
+                )
             copy_done.record(self.copy_stream)
 
     def export(self, block_ids: BlockIds, num_tokens: int) -> None:
@@ -874,15 +1387,6 @@ class FP8DSMLAWireStaging:
                 export_flags.append("skip=empty_span")
                 continue
             export_flags.append("export")
-        # logger.info(
-        #     "[PD-P] export tokens=%s %s",
-        #     num_tokens,
-        #     format_kv_group_page_log(
-        #         self.compute_config.kv_cache_groups,
-        #         block_ids,
-        #         extra=export_flags,
-        #     ),
-        # )
         for group_idx, ordered_ids in enumerate(block_ids):
             if export_flags[group_idx] != "export":
                 continue
@@ -894,11 +1398,19 @@ class FP8DSMLAWireStaging:
                 source_ids = torch.as_tensor(
                     source_id_list, dtype=torch.int64, device=compute_device
                 )
-                dense_ids = torch.arange(
-                    len(source_id_list),
-                    dtype=torch.int64,
-                    device=compute_device,
-                )
+                dense_arange = getattr(self, "_dense_arange", None)
+                if (
+                    dense_arange is not None
+                    and dense_arange.device == compute_device
+                    and len(source_id_list) <= dense_arange.numel()
+                ):
+                    dense_ids = dense_arange[: len(source_id_list)]
+                else:
+                    dense_ids = torch.arange(
+                        len(source_id_list),
+                        dtype=torch.int64,
+                        device=compute_device,
+                    )
                 self._enqueue_group_chunk(
                     group_idx,
                     source_id_list,
@@ -909,13 +1421,29 @@ class FP8DSMLAWireStaging:
                     chunk_offset,
                 )
 
-    def export_requests(self, requests: Sequence[tuple[BlockIds, int | None]]) -> None:
+    def export_requests(
+        self,
+        requests: Sequence[
+            tuple[BlockIds, int | None] | tuple[BlockIds, int | None, bool]
+        ],
+    ) -> None:
         if not requests:
             return
-        for block_ids, num_tokens in requests:
-            if num_tokens is None:
-                raise ValueError("FP8 wire staging export is missing num_tokens")
-            self.export(block_ids, num_tokens)
-        # wait_for_save is a publication barrier: D may issue READ immediately
-        # after the scheduler returns the remote block metadata.
-        self.copy_stream.synchronize()
+        need_sync = False
+        for entry in requests:
+            if len(entry) == 3:
+                block_ids, num_tokens, sync_save = entry
+            else:
+                block_ids, num_tokens = entry
+                sync_save = True
+            if sync_save:
+                need_sync = True
+            if any(block_ids):
+                if num_tokens is None:
+                    raise ValueError("FP8 wire staging export is missing num_tokens")
+                self.export(block_ids, num_tokens)
+        # Intermediate chunk-pipelined exports set sync_save=False so the main
+        # thread immediately enters the next forward chunk; the final chunk sets
+        # sync_save=True as the publication barrier before remote_block_ids leaves P.
+        if need_sync:
+            self.copy_stream.synchronize()

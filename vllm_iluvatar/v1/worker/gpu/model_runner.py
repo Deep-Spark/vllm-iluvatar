@@ -828,3 +828,41 @@ def make_recoverssm_profiling_teardown(original):
         return original(runner)
 
     return teardown
+
+
+def make_idle_dummy_short_circuit_execute_model(original_execute_model):
+    """Abort ``_dummy_run`` immediately when DP sync agrees all ranks are idle."""
+    from vllm_iluvatar.v1.worker.idle_dummy_state import (
+        AllRanksIdleDummyShortCircuit,
+        was_idle_dummy_short_circuited,
+    )
+
+    @wraps(original_execute_model)
+    def execute_model(self, scheduler_output, *args, **kwargs):
+        result = original_execute_model(self, scheduler_output, *args, **kwargs)
+        if (
+            kwargs.get("dummy_run", False)
+            and self.execute_model_state is None
+            and was_idle_dummy_short_circuited()
+        ):
+            raise AllRanksIdleDummyShortCircuit()
+        return result
+
+    return execute_model
+
+
+def make_idle_dummy_short_circuit_dummy_run(original_dummy_run):
+    """Catch all-idle DP short-circuit and restore KVConnector state cleanly."""
+    from vllm_iluvatar.v1.worker.idle_dummy_state import (
+        AllRanksIdleDummyShortCircuit,
+    )
+
+    @wraps(original_dummy_run)
+    def _dummy_run(self, *args, **kwargs):
+        try:
+            return original_dummy_run(self, *args, **kwargs)
+        except AllRanksIdleDummyShortCircuit:
+            self.kv_connector.set_disabled(False)
+            return None, None
+
+    return _dummy_run

@@ -22,6 +22,10 @@ from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.ubatch_utils import check_ubatch_thresholds, get_num_ubatches
 
 from vllm_iluvatar.v1.worker.dp_utils import set_last_all_ranks_decode_only
+from vllm_iluvatar.v1.worker.idle_dummy_state import (
+    is_idle_dummy_batch,
+    mark_idle_dummy_short_circuited,
+)
 
 
 def sync_cudagraph_and_dp_padding(
@@ -47,7 +51,8 @@ def sync_cudagraph_and_dp_padding(
     """
     assert dp_size > 1, "DP size must be greater than 1"
     group = get_dp_group().cpu_group
-    tensor = torch.zeros(7, dp_size, dtype=torch.int32, device="cpu")
+    skip_coord = should_skip_dp_coordination()
+    tensor = torch.zeros(8, dp_size, dtype=torch.int32, device="cpu")
     tensor[0][dp_rank] = num_tokens
     tensor[1][dp_rank] = desired_batch_desc.cg_mode.value
     tensor[2][dp_rank] = uniform_token_count or 0  # (0 means None)
@@ -55,10 +60,21 @@ def sync_cudagraph_and_dp_padding(
     tensor[4][dp_rank] = int(allow_ubatching)
     tensor[5][dp_rank] = num_reqs
     tensor[6][dp_rank] = int(uniform_decode)
-    if should_skip_dp_coordination():
+    tensor[7][dp_rank] = int(is_idle_dummy_batch())
+    if skip_coord:
         tensor[:] = tensor[:, dp_rank, None].clone()
     else:
         dist.all_reduce(tensor, group=group)
+
+    if not skip_coord and bool(torch.all(tensor[7] == 1).item()):
+        set_last_all_ranks_decode_only(False)
+        mark_idle_dummy_short_circuited()
+        return (
+            BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE, num_tokens=0, num_reqs=0
+            ),
+            None,
+        )
 
     set_last_all_ranks_decode_only(bool(torch.all(tensor[6] == 1).item()))
 

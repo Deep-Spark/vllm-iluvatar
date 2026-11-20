@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from functools import partial
+import time
 
 import torch
 import torch.distributed as dist
@@ -24,6 +25,10 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu_worker import Worker
 
 from vllm_iluvatar.ilu_util.arch import is_ivcore11
+from vllm_iluvatar.v1.worker.idle_dummy_state import (
+    idle_dummy_batch_scope,
+    was_idle_dummy_short_circuited,
+)
 
 from .pp_exchange import (
     defer_pp_send_wait,
@@ -756,12 +761,63 @@ class IluWorker(Worker):
                 self._indexer_kv_state = None
             self.model_runner.__class__ = orig_cls
 
-    def execute_dummy_batch(self) -> None:
+    def execute_dummy_batch(self):
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
+        short_circuited = False
         try:
-            self.model_runner._dummy_run(
-                num_tokens, uniform_decode=True, profile_seq_lens=1
-            )
+            with idle_dummy_batch_scope():
+                self.model_runner._dummy_run(
+                    num_tokens, uniform_decode=True, profile_seq_lens=1
+                )
+                short_circuited = was_idle_dummy_short_circuited()
         finally:
             if getattr(self, "prefix_state", None) is not None:
                 self.prefix_state.end_step()
+
+        model_output = _poll_kv_connector_output_after_dummy(self.model_runner)
+        if short_circuited and not _model_output_has_kv_events(model_output):
+            time.sleep(0.0005)
+        return model_output
+
+
+def _resolve_active_kv_connector(model_runner):
+    runner_kc = getattr(model_runner, "kv_connector", None)
+    if runner_kc is not None:
+        return getattr(runner_kc, "kv_connector", None)
+    try:
+        from vllm.distributed.kv_transfer import (
+            get_kv_transfer_group,
+            has_kv_transfer_group,
+        )
+    except ImportError:
+        return None
+    return get_kv_transfer_group() if has_kv_transfer_group() else None
+
+
+def _poll_kv_connector_output_after_dummy(model_runner):
+    kv_connector = _resolve_active_kv_connector(model_runner)
+    if kv_connector is None:
+        return None
+    import torch
+    from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
+
+    with torch.inference_mode():
+        transfer_results = kv_connector.get_transfer_results(set())
+        invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
+    kv_output = KVConnectorOutput(
+        finished_sending=transfer_results.finished_sending or None,
+        finished_recving=transfer_results.finished_recving or None,
+        failed_recving=transfer_results.failed_recving,
+        invalid_block_ids=invalid_block_ids,
+        kv_connector_stats=kv_connector.get_kv_connector_stats(),
+        kv_cache_events=kv_connector.get_kv_connector_kv_cache_events(),
+        kv_connector_worker_meta=kv_connector.build_connector_worker_meta(),
+    )
+    return ModelRunnerOutput.with_kv_conn_output_only(kv_output)
+
+
+def _model_output_has_kv_events(model_output) -> bool:
+    kv_out = getattr(model_output, "kv_connector_output", None)
+    if kv_out is None:
+        return False
+    return bool(kv_out.finished_recving or kv_out.finished_sending or kv_out.failed_recving)

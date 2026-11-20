@@ -15,7 +15,12 @@ from pathlib import Path
 from typing import Any
 
 SESSION_KEY = "_ilu_prefix_state_session"
-_NIXL_CONNECTORS = ("OptNixlConnector", "IluNixlPushConnector")
+_NIXL_CONNECTORS = (
+    "OptNixlConnector",
+    "IluNixlPushConnector",
+    "IluNixlPullConnector",
+    "IluNixlConnector",
+)
 
 
 @dataclass(frozen=True)

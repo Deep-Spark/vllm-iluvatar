@@ -19,6 +19,7 @@ import ixformer.inference.functions as ixf_ops  # type: ignore[import]
 import torch
 import torch.nn.functional as F
 from ixformer.core import config
+from ixformer.cuda import cuda_arch
 
 _USE_TORCH_OPS = config.IXFORMER_USE_TORCH_OPS
 
@@ -147,6 +148,20 @@ def mul_and_silu(out: torch.Tensor, x: torch.Tensor) -> None:
 def rms_norm(
     out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor, epsilon: float
 ) -> None:
+    if weight.ndim == 2:
+        # DFlash normalizes [layers, tokens, kv_heads, head_dim] with a
+        # distinct weight vector for each layer. The native API takes one
+        # weight vector, so preserve the grouped semantics per outer slice.
+        if (
+            input.ndim < 3
+            or input.shape[0] != weight.shape[0]
+            or input.shape[-1] != weight.shape[-1]
+            or out.shape != input.shape
+        ):
+            raise ValueError("Grouped RMSNorm requires matching outer groups and width")
+        for group in range(weight.shape[0]):
+            ixf_ops.rms_norm(input[group], weight[group], epsilon, out[group])
+        return
     ixf_ops.rms_norm(input, weight, epsilon, out)
 
 
@@ -990,15 +1005,7 @@ def sparse_prefill_fwd(
     )
 
 
-# Fused vocab-parallel embedding lookup (pure-torch ILU fallback).
-# Community v0.31.0 (db9527a468) ships a fused ``torch.ops._C.vocab_parallel_embedding`` kernel
-# (added at commit e2c8eeac40, "[kernel] Fused embedding kernel") used by
-# VocabParallelEmbedding.forward when ``use_fused_embedding`` is True (TP>1 +
-# cuda + unquantized). The Iluvatar plugin _C does not register that op, so
-# replicate the kernel's semantics — range mask, id shift, gather, out-of-shard
-# zeroing — in pure torch. This mirrors the community
-# ``get_masked_input_and_mask`` + ``embedding`` + masked_fill path used
-# before that fused kernel; an all-reduce over TP ranks still yields the full embedding.
+# The caller retains the TP all-reduce after this local shard lookup.
 def vocab_parallel_embedding(
     input_ids: torch.Tensor,
     weight: torch.Tensor,
@@ -1008,6 +1015,24 @@ def vocab_parallel_embedding(
     added_vocab_start_index: int,
     added_vocab_end_index: int,
 ) -> torch.Tensor:
+    if (
+        cuda_arch == "ivcore30"
+        and input_ids.is_cuda
+        and input_ids.ndim == 1
+        and input_ids.is_contiguous()
+        and input_ids.dtype in (torch.int32, torch.int64)
+        and weight.is_contiguous()
+    ):
+        return ixf_ops.vocab_parallel_embedding(
+            input_ids,
+            weight,
+            org_vocab_start_index,
+            org_vocab_end_index,
+            num_org_vocab_padding,
+            added_vocab_start_index,
+            added_vocab_end_index,
+        )
+
     input_ = input_ids.long()
     org_vocab_mask = (input_ >= org_vocab_start_index) & (input_ < org_vocab_end_index)
     added_vocab_mask = (input_ >= added_vocab_start_index) & (

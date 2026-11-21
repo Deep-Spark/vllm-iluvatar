@@ -65,6 +65,22 @@ def create_fp8_source_weights(
     )
 
 
+def publish_int8_weights(layer, weight, scale):
+    """Swap the source weight for the INT8 pair the W8A8 scheme reads.
+
+    The scheme looks the five names up by ``layer_param_names``; the three
+    activation-side ones stay ``None`` because every Iluvatar W8A8 linear
+    quantizes activations dynamically and symmetrically.
+    """
+    replace_parameter(layer, "weight", weight)
+    layer.register_parameter(
+        "weight_scale", torch.nn.Parameter(scale, requires_grad=False)
+    )
+    layer.input_scale = None
+    layer.input_zero_point = None
+    layer.azp_adj = None
+
+
 def finalize_fp8_to_int8(layer):
     from vllm_iluvatar.model_executor.layers.quantization.conversions.fp8_to_int8 import (
         _quantize_per_channel_int8,
@@ -89,10 +105,4 @@ def finalize_fp8_to_int8(layer):
         value = layer.weight.float() * scale[:, None]
         weight, scale = _quantize_per_channel_int8(value)
         del layer.weight_scale
-    replace_parameter(layer, "weight", weight)
-    layer.register_parameter(
-        "weight_scale", torch.nn.Parameter(scale, requires_grad=False)
-    )
-    layer.input_scale = None
-    layer.input_zero_point = None
-    layer.azp_adj = None
+    publish_int8_weights(layer, weight, scale)

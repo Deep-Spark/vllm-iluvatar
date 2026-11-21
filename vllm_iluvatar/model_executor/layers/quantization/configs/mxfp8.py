@@ -19,6 +19,9 @@ from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp8_moe imp
 from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.nvfp4_moe import (
     IluModelOptNvFp4MoEMethod,
 )
+from vllm_iluvatar.model_executor.layers.quantization.backends.mxfp8.linear import (
+    mxfp8_int8_linear_method,
+)
 
 
 @register_quantization_config("mxfp8")
@@ -29,14 +32,18 @@ class IluMxFp8Config(ModelOptMxFp8Config):
     Dispatch is based on the checkpoint format, independently of model
     architecture.
 
-    For ordinary MXFP8 checkpoints only ``FusedMoEMethodCls`` differs: the
-    inherited ``ModelOptQuantConfigBase.get_quant_method`` dispatches Linear
-    layers through ``LinearMethodCls`` (unchanged ``ModelOptMxFp8LinearMethod``,
-    which picks up ``IluMxfp8LinearKernel`` from the patched kernel list) and
-    ``RoutedExperts`` through ``FusedMoEMethodCls``.
+    For ordinary MXFP8 checkpoints on ivcore30 only ``FusedMoEMethodCls``
+    differs: the inherited ``ModelOptQuantConfigBase.get_quant_method``
+    dispatches Linear layers through the community ``build_linear_method``
+    (which picks up ``IluMxfp8LinearKernel`` from the patched kernel list) and
+    ``RoutedExperts`` through ``FusedMoEMethodCls``. On ivcore11 that kernel
+    patch is inactive and the dense default is INT8, so Linear is claimed by
+    ``mxfp8_int8_linear_method``.
 
     MiniMax checkpoints tag ``quant_method: "mxfp8"``. NVIDIA ModelOpt
-    checkpoints resolve to ``modelopt_mxfp8`` and stay on the community class.
+    checkpoints resolve to ``modelopt_mxfp8``, which ``configs/modelopt/mxfp8``
+    claims with its own sibling config; the two differ only in the registry
+    name and the expert method, and share this Linear dispatch.
     """
 
     def get_name(self) -> Any:
@@ -59,6 +66,9 @@ class IluMxFp8Config(ModelOptMxFp8Config):
         return result
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        linear_method = mxfp8_int8_linear_method(self, layer, prefix)
+        if linear_method is not None:
+            return linear_method
         if (
             getattr(self, "moe_quant_algo", "MXFP8") == "NVFP4"
             and isinstance(layer, RoutedExperts)

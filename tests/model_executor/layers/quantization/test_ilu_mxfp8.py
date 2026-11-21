@@ -19,8 +19,9 @@ Covered here:
   grid and its FP4 image in HBM.
 * ``process_weights_after_loading`` converts the MXFP8 tensors with the
   ``(1, 32)`` grid and UE8M0 decoding, requanting on the GPU.
-* the config only swaps ``FusedMoEMethodCls``; Linear stays on the community
-  method, which is what calls ``init_mxfp8_linear_kernel()``.
+* the config only swaps ``FusedMoEMethodCls``; Linear keeps reaching the
+  community method, which is what calls ``init_mxfp8_linear_kernel()``. (The
+  ivcore11 INT8 takeover in front of it lives in ``test_ilu_mxfp8_linear.py``.)
 """
 
 from __future__ import annotations
@@ -372,14 +373,26 @@ def test_unaligned_k_trips_the_real_ixmm_preprocess_guard(monkeypatch):
         )
 
 
-def test_minimax_mxfp8_is_shadowed_not_nvidia_modelopt():
-    """MiniMax-M3 tags ``quant_method: "mxfp8"``. NVIDIA ``modelopt_mxfp8`` is
-    left on the community class."""
+def test_both_mxfp8_tagging_conventions_are_claimed():
+    """MiniMax-M3 tags ``quant_method: "mxfp8"``; NVIDIA ModelOpt resolves to
+    ``modelopt_mxfp8``. Each registry name has its own ILU config.
+
+    ``_registration`` is imported explicitly because that is what makes the
+    answer independent of which other module happened to be imported first:
+    the registration is a side effect of importing the config module, and
+    nothing else in this file's import graph pulls in the ModelOpt one.
+    """
     from vllm.model_executor.layers.quantization import get_quantization_config
-    from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
+
+    from vllm_iluvatar.model_executor.layers.quantization import (  # noqa: F401
+        _registration,
+    )
+    from vllm_iluvatar.model_executor.layers.quantization.configs.modelopt.mxfp8 import (  # noqa: E501
+        IluModelOptMxFp8Config,
+    )
 
     assert get_quantization_config("mxfp8") is IluMxFp8Config
-    assert get_quantization_config("modelopt_mxfp8") is ModelOptMxFp8Config
+    assert get_quantization_config("modelopt_mxfp8") is IluModelOptMxFp8Config
 
 
 def test_config_only_swaps_the_moe_method():

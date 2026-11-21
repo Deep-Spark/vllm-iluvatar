@@ -23,6 +23,7 @@ class IxMMFP4FP8Backend(MoEComputeBackend):
     prefer_hybrid_ep = False
     supported_activations = ("silu", "swiglu", "swiglustep")
     requires_activation_limit = False
+    supports_prequantized_fp8 = True
 
     def gemm(self, weights, x, scale, prefix, layout, output=None, mode=None):
         return ops.group_gemm_fp4(
@@ -48,6 +49,7 @@ class IxMMFP4FP8Backend(MoEComputeBackend):
         output=None,
         residual=None,
         w13_gemm_mode=None,
+        quantized_input=None,
     ):
         if x.shape[0] == 0:
             return self.empty_standard_output(x, output, residual)
@@ -59,7 +61,35 @@ class IxMMFP4FP8Backend(MoEComputeBackend):
             expert_map=expert_map,
             group_layout=layout,
         )
-        q, scale = ops.moe_expand_input_dynamic_scaled_fp8(x, order, topk_ids.shape[-1])
+        if quantized_input is None:
+            q, scale = ops.moe_expand_input_dynamic_scaled_fp8(
+                x, order, topk_ids.shape[-1]
+            )
+        elif type(quantized_input[1]) is int or (
+            quantized_input[0].is_contiguous() and quantized_input[1].is_contiguous()
+        ):
+            # The native byte copy visits only local routes, preserving either
+            # the routed packet's inline scale or separate gathered FP8 scales.
+            source, source_scale = quantized_input
+            packed = type(source_scale) is int
+            q = workspace.get("input")
+            scale = workspace.get("input_scale").reshape(-1)
+            ops.moe_expand_input_ep(
+                hidden_states=source.view(torch.int8),
+                src_to_expert_row=inverse,
+                expand_tokens=topk_ids.numel(),
+                topk=topk_ids.shape[-1],
+                output=q.view(torch.int8),
+                output_scale=scale,
+                input_scale=None if packed else source_scale,
+                packed_scale_offset=source_scale if packed else None,
+            )
+        else:
+            from ..ilu_fp8_packed_dispatch import expand_prequantized_input
+
+            q, scale = expand_prequantized_input(
+                quantized_input[0], quantized_input[1], order, topk_ids.shape[-1]
+            )
         intermediate = workspace.get("gemm1")
         self.gemm(weights, q, scale, "w13", layout, intermediate, mode=w13_gemm_mode)
         del q, scale

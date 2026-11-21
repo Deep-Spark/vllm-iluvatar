@@ -16,8 +16,10 @@ from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend i
 )
 from vllm_iluvatar.model_executor.layers.quantization.common.mxfp4_loader import (
     Mxfp4LoadSpec,
-    Mxfp4UploadBuffer,
     make_mxfp4_loader,
+)
+from vllm_iluvatar.model_executor.layers.quantization.common.paired_moe_loader import (
+    ExpertUploadBuffer,
 )
 
 
@@ -73,7 +75,11 @@ def test_w4a8_runtime_weight_contract(backend, layout, source):
         loader = make_block_fp8_loader(spec, BlockFp8LoadSpec(e, k, n // 2, (128, 128)))
     with torch.device("cuda"):
         loader.create_weights(layer, {})
-    buffer = Mxfp4UploadBuffer(loader.staging_bytes, layer.w13_weight.device)
+    buffer = ExpertUploadBuffer(
+        loader.staging_bytes,
+        layer.w13_weight.device,
+        conversion_capacity=loader.conversion_bytes,
+    )
     loader.bind_upload_buffer(buffer)
     addresses = (buffer.host.data_ptr(), buffer.gpu.data_ptr())
     for expert in range(e):
@@ -251,6 +257,64 @@ def test_fp4fp8_independent_forward_matches_existing_contract(
         swiglu_variant=variant,
     )
     torch.testing.assert_close(merged, expected_merged, rtol=0, atol=0)
+    # Exercise the strided AllGather packet through the same Method/compute.
+    packet, _, _ = ops.moe_ep_pack_fp8_routed(x, scores, ids)
+    unpacked_scores, unpacked_ids = ops.moe_ep_unpack_fp8_routed_meta(packet, h, 2)
+    quantized = packet[:, :h].view(torch.float8_e4m3fn)
+    scales = packet[:, h : h + 4].view(torch.float32)[:, 0]
+    assert method.supports_decode_packed_fp8_dispatch
+    packed_result = method.apply(
+        layer,
+        (quantized, scales, x.dtype),
+        unpacked_scores,
+        unpacked_ids,
+        None,
+        residual,
+    )
+    torch.testing.assert_close(packed_result, merged, rtol=0.016, atol=0.016)
+    assert method.supports_prequant_fp8_dispatch
+    # Prefill AllGather returns separate contiguous q/scale tensors. Its native
+    # local-route expansion must preserve the strided gather's exact operands.
+    gathered_result = method.apply(
+        layer,
+        (quantized.contiguous(), scales.contiguous(), x.dtype),
+        unpacked_scores,
+        unpacked_ids,
+        None,
+        residual,
+    )
+    torch.testing.assert_close(gathered_result, packed_result, rtol=0, atol=0)
+
+    inline_input = (packet.view(torch.float8_e4m3fn), h, x.dtype)
+    inline_result = method.apply(
+        layer, inline_input, unpacked_scores, unpacked_ids, None, residual
+    )
+    torch.testing.assert_close(inline_result, packed_result, rtol=0, atol=0)
+    inline_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(inline_graph):
+        inline_captured = method.apply(
+            layer, inline_input, unpacked_scores, unpacked_ids, None, residual
+        )
+    next_packet, _, _ = ops.moe_ep_pack_fp8_routed(
+        x * 0.5, scores.flip(1).contiguous(), (ids + 1) % 4
+    )
+    packet.copy_(next_packet)
+    next_scores, next_ids = ops.moe_ep_unpack_fp8_routed_meta(packet, h, 2)
+    unpacked_scores.copy_(next_scores)
+    unpacked_ids.copy_(next_ids)
+    inline_graph.replay()
+    # Separate q/scale views see the updated packet, independently exercising
+    # the existing gather path as the byte-preserving expansion oracle.
+    replay_expected = method.apply(
+        layer,
+        (quantized, scales, x.dtype),
+        unpacked_scores,
+        unpacked_ids,
+        None,
+        residual,
+    )
+    torch.testing.assert_close(inline_captured, replay_expected, rtol=0, atol=0)
+
     with pytest.raises(RuntimeError, match="already been bound"):
         method._bind_compute(layer, runtime)
     # Replay with changed routing, so capture cannot freeze expert metadata.
@@ -307,3 +371,58 @@ def test_fp4fp8_independent_forward_matches_existing_contract(
     )
     torch.testing.assert_close(batched_out[0, :3], expected[0, :3], rtol=0, atol=0)
     torch.testing.assert_close(batched_out[1, :1], expected[1, :1], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("limit", [None, 10.0])
+def test_w4a8_prequantized_input_packet_and_norm_tuple(limit):
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+        MoEComputeConfig,
+        MoEWeights,
+        make_moe_compute,
+    )
+    from vllm_iluvatar.model_executor.layers.fused_moe.runner.ilu_int8_router_pack import (
+        pack_router_input,
+        unpack_router_input,
+    )
+    from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe import (
+        IluFp8MoEMethod,
+    )
+
+    torch.manual_seed(91)
+    h, intermediate, experts, rows, topk = 512, 256, 2, 17, 2
+    compute = make_moe_compute(
+        MoEComputeConfig(h, intermediate, experts, experts, limit=limit),
+        MoEComputeSelection("ixmm_w4a8", "NN", cuda_arch()),
+    )
+    tensors = []
+    for n, k in ((2 * intermediate, h), (h, intermediate)):
+        w = torch.empty((experts, k, n // 2), device="cuda", dtype=torch.int8)
+        s = torch.empty((experts, 1, n), device="cuda", dtype=torch.float32)
+        for expert in range(experts):
+            raw = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
+            scale = torch.full((n // 128, k // 128), 0.01, device="cuda")
+            ops.fp8_block_to_w4a8(
+                raw, scale, w[expert], s[expert], weight_format="ixmm_nn"
+            )
+        tensors.extend((w, s))
+    runtime = MoEWeights(compute.weight_spec, *tensors)
+    compute.validate_weights(runtime)
+    method = object.__new__(IluFp8MoEMethod)
+    method.selection = compute.selection
+    method._compute, method._runtime_weights = compute, runtime
+    layer = SimpleNamespace(expert_map=None)
+    assert method.supports_prequantized_input
+    assert method.supports_packed_int8_input
+    assert not method.supports_decode_packed_fp8_dispatch
+    x = torch.randn(rows, h, device="cuda", dtype=torch.bfloat16)
+    q, scale = ops.scaled_int8_quant(x)
+    ids = torch.randint(0, experts, (rows, topk), device="cuda", dtype=torch.int32)
+    weights = torch.rand(rows, topk, device="cuda")
+    residual = torch.randn_like(x) * 0.01
+    expected = method.apply(layer, (q, scale, x.dtype), weights, ids, None, residual)
+    logits = torch.randn(rows, experts, device="cuda")
+    packet, layout = pack_router_input(q, scale, logits, None)
+    packed, unpacked_logits, _ = unpack_router_input(packet, layout, x.dtype)
+    assert torch.equal(logits, unpacked_logits)
+    actual = method.apply(layer, packed, weights, ids, None, residual)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

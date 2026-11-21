@@ -48,6 +48,7 @@ def _mqa_logits(*args, **kwargs):
     owned_logits = kwargs.pop("owned_logits", None)
     previous_extent = kwargs.pop("previous_extent", None)
     kv_scales = kwargs.pop("kv_scales", None)
+    packed_queries = kwargs.pop("packed_queries", False)
     if kwargs.get("valid_lens") is None and ks is not None and ke is not None:
         kwargs["valid_lens"] = ke - ks
     # INT8 stores K in the same uint8 pages as FP8. Check the query first:
@@ -93,6 +94,7 @@ def _mqa_logits(*args, **kwargs):
         if previous_extent is not None:
             kwargs["previous_extent"] = previous_extent
         return ixfops.dsa_indexer_mqa_logits_with_kvcache_fp8(*args, **kwargs)
+    kwargs["packed_queries"] = packed_queries
     if envs.VLLM_ILU_GLM_DSA_NATIVE_MQA_LOGITS:
         kwargs.setdefault("backend", "ixformer_native")
     return ixfops.dsa_indexer_mqa_logits_with_kvcache(*args, **kwargs)
@@ -170,6 +172,7 @@ def _indexer_logits_and_topk(
     initialized_decode: bool = False,
     kv_scales: torch.Tensor | None = None,
     is_prefill: bool = False,
+    packed_queries: bool = False,
 ) -> None:
     """Score the indexer, mask to candidate blocks, then select the top-k.
 
@@ -255,6 +258,7 @@ def _indexer_logits_and_topk(
             owned_logits=owned_logits,
             previous_extent=previous_extent,
             kv_scales=kv_scales,
+            packed_queries=is_prefill or packed_queries,
         )
         _two_level_filter(
             logits,
@@ -486,12 +490,16 @@ def ilu_sparse_attn_indexer(
             decode_logits = logits_buffer[
                 :num_decode_tokens, : decode_metadata.max_context_len
             ]
+        score_q, packed_queries = decode_metadata.cu_seqlens_q, False
+        if kv_cache.dtype in (torch.bfloat16, torch.float16):
+            score_q, packed_queries = decode_metadata.float_score_queries()
         _indexer_logits_and_topk(
             candidate_blocks=candidate_blocks,
             candidate_block_size=candidate_block_size,
             candidate_write=candidate_write,
             q=q[:num_decode_tokens],
-            cu_seqlens_q=decode_metadata.cu_seqlens_q,
+            cu_seqlens_q=score_q,
+            packed_queries=packed_queries,
             cu_seqlens_kv=decode_metadata.cu_seqlens_kv,
             kv_cache=kv_cache,
             block_table=decode_metadata.block_table,

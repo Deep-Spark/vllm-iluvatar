@@ -84,11 +84,17 @@ class PairedLoadSession:
                     )
         self.collecting = False
         capacities = {}
+        conversion_capacities = {}
         for loader in self.loaders:
             device = loader._layer.w13_weight.device
             capacities[device] = max(capacities.get(device, 0), loader.staging_bytes)
+            conversion_capacities[device] = max(
+                conversion_capacities.get(device, 0), loader.conversion_bytes
+            )
         for device, capacity in capacities.items():
-            self.buffers[device] = ExpertUploadBuffer(capacity, device)
+            self.buffers[device] = ExpertUploadBuffer(
+                capacity, device, conversion_capacity=conversion_capacities[device]
+            )
             self._log_memory("staging_ready", device)
         for loader in self.loaders:
             loader.bind_upload_buffer(self.buffers[loader._layer.w13_weight.device])
@@ -104,11 +110,12 @@ class PairedLoadSession:
             self._log_memory("weights_copied", device)
         self.complete = True
         logger.info(
-            "Expert paired loading: pairs=%d opens=%d reads=%d staging_bytes=%s",
+            "Expert paired loading: pairs=%d opens=%d reads=%d staging_bytes=%s conversion_bytes=%s",
             len(self.pairs),
             self.readers.opens,
             self.readers.reads,
             list(capacities.values()),
+            list(conversion_capacities.values()),
         )
 
     def close(self):
@@ -138,11 +145,14 @@ class PairedLoadSession:
         if device.type == "cuda":
             stats = torch.cuda.memory_stats(device)
             logger.info(
-                "Paired expert upload memory: phase=%s allocated=%d reserved=%d segments=%d",
+                "Paired expert upload memory: phase=%s allocated=%d reserved=%d segments=%d "
+                "peak_allocated=%d peak_reserved=%d",
                 phase,
                 stats["allocated_bytes.all.current"],
                 stats["reserved_bytes.all.current"],
                 stats["segment.all.current"],
+                stats["allocated_bytes.all.peak"],
+                stats["reserved_bytes.all.peak"],
             )
 
 

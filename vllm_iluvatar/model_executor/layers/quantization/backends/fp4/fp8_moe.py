@@ -370,11 +370,70 @@ class IluFp8MoEMethod(Fp8MoEMethod):
             prepare_finalize,
         )
 
+    @property
+    def supports_prequantized_input(self):
+        # Available before weight loading, when models choose fused norm output.
+        from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+            get_moe_backend,
+        )
+
+        return get_moe_backend(self._select_compute()).supports_prequantized_int8
+
+    @property
+    def supports_packed_int8_input(self):
+        return self.supports_prequantized_input
+
+    @property
+    def supports_decode_packed_fp8_dispatch(self):
+        return self._compute is not None and self._compute.supports_prequantized_fp8
+
+    @property
+    def supports_prequant_fp8_dispatch(self):
+        return self._compute is not None and self._compute.supports_prequantized_fp8
+
     def apply(
         self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input
     ):
         if self._compute is None:
             raise RuntimeError("FP8 weights have not been finalized")
+        compute_kwargs = {}
+        output_dtype = x.dtype if isinstance(x, torch.Tensor) else x[2]
+        if isinstance(x, tuple):
+            q, scale, _ = x
+            packed = type(scale) is int
+            valid_dtype = (
+                q.dtype == torch.float8_e4m3fn
+                and self._compute.supports_prequantized_fp8
+            ) or (q.dtype == torch.int8 and self._compute.supports_prequantized_int8)
+            if (
+                not valid_dtype
+                or q.ndim != 2
+                or output_dtype not in (torch.float16, torch.bfloat16)
+            ):
+                raise ValueError(
+                    "Selected compute cannot consume this prequantized input"
+                )
+            if packed:
+                if (
+                    scale != self._compute.hidden
+                    or q.shape[1] < scale + 4
+                    or not q.is_contiguous()
+                ):
+                    raise ValueError("Invalid inline activation scale")
+            elif (
+                q.shape[1] != self._compute.hidden
+                or scale.dtype != torch.float32
+                or scale.device != q.device
+                or scale.numel() != q.shape[0]
+            ):
+                raise ValueError("Prequantized input requires one FP32 scale per token")
+            else:
+                scale = scale.reshape(-1)
+            x = q
+            compute_kwargs["quantized_input"] = (q, scale)
+            compute_kwargs["output"] = torch.empty(
+                (q.shape[0], self._compute.hidden), device=q.device, dtype=output_dtype
+            )
         residual = shared_experts_input
         if residual is not None and residual.shape[0] != x.shape[0]:
             residual = None
@@ -388,9 +447,9 @@ class IluFp8MoEMethod(Fp8MoEMethod):
             and 16 < topk_ids.shape[0] <= 64
             else None
         )
-        workspace = self._compute.workspace_spec(topk_ids.numel(), x.dtype).allocate(
-            x.device
-        )
+        workspace = self._compute.workspace_spec(
+            topk_ids.numel(), output_dtype
+        ).allocate(x.device)
         return self._compute.run_standard(
             x,
             self._runtime_weights,
@@ -400,6 +459,7 @@ class IluFp8MoEMethod(Fp8MoEMethod):
             workspace=workspace,
             residual=residual,
             w13_gemm_mode=mode,
+            **compute_kwargs,
         )
 
 

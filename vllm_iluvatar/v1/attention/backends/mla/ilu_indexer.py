@@ -8,7 +8,8 @@ from typing import Any
 
 import torch
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
@@ -263,6 +264,22 @@ class IluDeepSeekV32IndexerDecodeMetadata:
     per_req_decode_lens: torch.Tensor | None = None
     decode_is_uniform: bool = True
     write_max_decode_len: int = 0
+    uniform_score_q: torch.Tensor | None = None
+    score_q_is_complete: bool = False
+
+    def float_score_queries(self) -> tuple[torch.Tensor, bool]:
+        """Select a packed launch only when its row mapping holds on replay."""
+        ctx = get_forward_context()
+        if ctx.cudagraph_runtime_mode == CUDAGraphMode.NONE:
+            if self.score_q_is_complete:
+                return self.cu_seqlens_q, True
+        elif ctx.batch_descriptor is None or not ctx.batch_descriptor.uniform:
+            return self.cu_seqlens_q, False
+        # Uniform graph keys preserve Q per real request. The runner zeroes
+        # seq_lens for padded requests and decode spans give them zero visibility.
+        if self.uniform_score_q is not None:
+            return self.uniform_score_q, True
+        return self.cu_seqlens_q, False
 
 
 @dataclass
@@ -698,6 +715,16 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
+        self.uniform_score_offsets = {
+            width: torch.arange(
+                0,
+                (scheduler_config.max_num_seqs + 1) * width,
+                width,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            for width in {1, next_n}
+        }
         self.cu_seqlens_kv_buffer = torch.empty(
             (scheduler_config.max_num_seqs + 1,),
             dtype=torch.int32,
@@ -1036,6 +1063,15 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             max_kv_len=max_kv_len,
             per_req_decode_lens=self.per_req_decode_lens_buffer[:num_decodes],
             decode_is_uniform=(int(decode_lens_cpu.min().item()) == max_q_len),
+            score_q_is_complete=(num_real_decode_tokens == num_decode_tokens),
+            uniform_score_q=(
+                self.uniform_score_offsets[max_q_len][: num_decodes + 1]
+                if max_q_len in self.uniform_score_offsets
+                and num_decode_tokens == num_decodes * max_q_len
+                and not requires_padding
+                and int(decode_qsl_cpu[nonzero_lens.numel()]) == num_real_decode_tokens
+                else None
+            ),
             write_max_decode_len=max_q_len,
             # schedule_metadata=self.scheduler_metadata_buffer,
         )

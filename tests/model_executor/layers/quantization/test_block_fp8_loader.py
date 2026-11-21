@@ -228,3 +228,72 @@ def test_native_load_compute_contract(tmp_path, monkeypatch, mode, tp, ep, whole
                 )
         assert torch.equal(actual, expected)
         torch.testing.assert_close(actual_scale, es, rtol=1e-6, atol=0)
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_direct_parameter_writes_and_upload_cleanup(tmp_path, monkeypatch, fail):
+    from vllm_iluvatar.model_executor.layers.quantization.common import (
+        block_fp8_loader as module,
+    )
+
+    spec = MoEWeightSpec("ixinfer_w4a8_nn_v2", "NN", torch.int8, code_multiplier=18)
+    layers, loaders = [], []
+    pointers = []
+
+    def converter(weight, scale, output, output_scale, **kwargs):
+        pointers.append(
+            (
+                output.untyped_storage().data_ptr(),
+                output_scale.untyped_storage().data_ptr(),
+            )
+        )
+        output.fill_(3)
+        output_scale.fill_(2)
+        if fail:
+            raise RuntimeError("conversion failed")
+
+    monkeypatch.setattr(module, "_native_converter", lambda name: converter)
+    for m in (128, 256):
+        layer = torch.nn.Module()
+        layer._map_global_expert_id_to_local_expert_id = lambda e: e
+        loader = make_block_fp8_loader(spec, BlockFp8LoadSpec(1, 256, m, (128, 128)))
+        loader.create_weights(layer, {})
+        layers.append(layer)
+        loaders.append(loader)
+    destinations = {
+        (
+            getattr(layer, group + "_weight").untyped_storage().data_ptr(),
+            getattr(layer, group + "_" + loader.scale_parameter_name)
+            .untyped_storage()
+            .data_ptr(),
+        )
+        for loader, layer in zip(loaders, layers)
+        for group in ("w13", "w2")
+    }
+    session = PairedLoadSession(dict.fromkeys(loaders, "experts"))
+    session.bind()
+    try:
+        for index, (layer, loader) in enumerate(zip(layers, loaders)):
+            directory = tmp_path / str(index)
+            directory.mkdir()
+            _, refs = _checkpoint(
+                directory, 1, 256, loader.load_spec.intermediate, 1, torch.float32, True
+            )
+            _route(layer, refs, session, 1, whole=True)
+        if fail:
+            with pytest.raises(RuntimeError, match="conversion failed"):
+                session.finish()
+        else:
+            session.finish()
+            assert len(pointers) == 6
+            for loader in loaders:
+                weights = loader.finalize()
+                assert torch.all(weights.w13_weight == 3)
+                assert torch.all(weights.w2_weight_scale == 2)
+        slot = next(iter(session.buffers.values()))
+        assert slot.conversion.numel() == 0
+        assert pointers and all(pair in destinations for pair in pointers)
+    finally:
+        slots = list(session.buffers.values())
+        session.close()
+    assert all(slot.host is slot.gpu is slot.conversion is None for slot in slots)

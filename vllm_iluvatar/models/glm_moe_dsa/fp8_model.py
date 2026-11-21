@@ -158,7 +158,11 @@ def _consumes_int8_tuple(module: object) -> bool:
     if isinstance(getattr(module, "scheme", None), IluCompressedTensorsW8A8Int8):
         return True
     # Routed experts carry no ``scheme``; W4A8 NN is the method that unpacks.
-    return isinstance(_consumer_quant_method(module), IluW4A8NNMoEMethod)
+    method = _consumer_quant_method(module)
+    return (
+        isinstance(method, IluW4A8NNMoEMethod)
+        or getattr(method, "supports_prequantized_input", False) is True
+    )
 
 
 class IluGlmMoeDsaFp8DecoderLayer(IluGlmMoeDsaDecoderLayer):

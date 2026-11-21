@@ -113,6 +113,8 @@ class MoEComputeBackend(ABC):
     prefer_hybrid_ep: ClassVar[bool] = True
     supported_activations: ClassVar[tuple[str, ...]] = ("silu", "swiglu")
     requires_activation_limit: ClassVar[bool] = True
+    supports_prequantized_fp8: ClassVar[bool] = False
+    supports_prequantized_int8: ClassVar[bool] = False
 
     def __init__(self, config: MoEComputeConfig, selection):
         self.config = config

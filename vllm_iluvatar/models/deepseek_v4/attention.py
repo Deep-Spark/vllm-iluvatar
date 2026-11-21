@@ -2425,6 +2425,7 @@ class IluDeepseekV4Indexer(nn.Module):
                     max_kv_len=chunk.max_kv_len,
                     max_context_len=chunk.max_context_len,
                     valid_lens=chunk.valid_lens,
+                    packed_queries=True,
                 )
                 ixfops.dsa_update_topk_indices(
                     logits,
@@ -2454,9 +2455,10 @@ class IluDeepseekV4Indexer(nn.Module):
                 # cannot materialize a bf16 logits matrix with zero columns.
                 topk_buffer[:num_decode_tokens].fill_(-1)
                 return topk_buffer
+            score_q, packed_queries = decode_md.float_score_queries()
             logits = ixfops.dsa_indexer_mqa_logits_with_kvcache(
                 q[:num_decode_tokens],
-                decode_md.cu_seqlens_q,
+                score_q,
                 decode_md.cu_seqlens_kv,
                 kv_cache,
                 decode_md.block_table,
@@ -2465,6 +2467,7 @@ class IluDeepseekV4Indexer(nn.Module):
                 max_kv_len=decode_md.max_kv_len,
                 max_context_len=decode_md.max_context_len,
                 valid_lens=decode_md.valid_lens,
+                packed_queries=packed_queries,
             )
             ixfops.dsa_update_topk_indices(
                 logits,

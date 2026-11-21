@@ -523,9 +523,9 @@ class IluGlmMoeDsaModel(nn.Module):
 
         # GLM-5.2 is always sparse (V3.2 DSA indexer): the shared top-k buffer
         # is written by ``full`` layers and reused by ``skip_topk`` layers.
-        self.topk_indices_buffer = torch.empty(
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            config.index_topk,
+        self.topk_indices_buffer = torch.full(
+            (vllm_config.scheduler_config.max_num_batched_tokens, config.index_topk),
+            -1,
             dtype=torch.int32,
             device=self.device,
         )

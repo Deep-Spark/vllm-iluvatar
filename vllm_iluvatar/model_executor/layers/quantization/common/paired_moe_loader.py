@@ -28,7 +28,9 @@ def _native_converter(name):
 class ExpertUploadBuffer:
     """One synchronous upload slot shared by all layers in a load session."""
 
-    def __init__(self, capacity: int, device: torch.device):
+    def __init__(
+        self, capacity: int, device: torch.device, *, conversion_capacity: int = 0
+    ):
         self.device = torch.device(device)
         self.host = torch.empty(
             capacity,
@@ -37,6 +39,9 @@ class ExpertUploadBuffer:
             pin_memory=self.device.type == "cuda",
         )
         self.gpu = torch.empty(capacity, dtype=torch.uint8, device=self.device)
+        self.conversion = torch.empty(
+            conversion_capacity, dtype=torch.uint8, device=self.device
+        )
         self.owner = None
 
     def synchronize(self):
@@ -48,11 +53,15 @@ class ExpertUploadBuffer:
             self.synchronize()
         finally:
             self.owner = None
-            self.host = self.gpu = None
+            self.host = self.gpu = self.conversion = None
 
 
 class PairedMoEWeightLoader:
     scale_parameter_name = "weight_scale"
+
+    @property
+    def conversion_bytes(self):
+        return 0
 
     def expected_pairs(self):
         return (
@@ -66,6 +75,8 @@ class PairedMoEWeightLoader:
             raise RuntimeError(f"{self.source_name} upload session cannot be rebound")
         if buffer.host.numel() < self.staging_bytes:
             raise ValueError(f"{self.source_name} upload buffer is too small")
+        if buffer.conversion.numel() < self.conversion_bytes:
+            raise ValueError("Paired conversion buffer is too small")
         if self._layer.w13_weight.device != buffer.device:
             raise ValueError(f"{self.source_name} upload buffer is on the wrong device")
         self._upload_buffer = buffer

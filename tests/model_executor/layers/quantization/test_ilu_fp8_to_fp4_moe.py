@@ -206,7 +206,11 @@ def _feed(layer, ckpt, order):
         )
 
         loader.bind_upload_buffer(
-            ExpertUploadBuffer(loader.staging_bytes, layer.w13_weight.device)
+            ExpertUploadBuffer(
+                loader.staging_bytes,
+                layer.w13_weight.device,
+                conversion_capacity=loader.conversion_bytes,
+            )
         )
         # The original Method now consumes adjacent CPU pairs from the common
         # reader; arbitrary online arrival order remains tested on the runtime loader.

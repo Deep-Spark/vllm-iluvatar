@@ -312,8 +312,20 @@ class IluMoERunner(MoERunner):
             fused_out,
         )
 
-    def _prepare_routed_input(self, hidden_states, shared_input):
+    def _prepare_routed_input(self, hidden_states, shared_input, *, fp8=False):
         """Reuse norm quantization only when it describes the routed input."""
+        if fp8:
+            import ixformer.inference.functions as ixfops
+
+            quantized = torch.empty_like(hidden_states, dtype=torch.float8_e4m3fn)
+            scale = torch.empty(
+                (hidden_states.shape[0], 1),
+                device=hidden_states.device,
+                dtype=torch.float32,
+            )
+            if hidden_states.shape[0]:
+                ixfops.dynamic_scaled_fp8_quant(quantized, hidden_states, scale)
+            return quantized, scale, hidden_states.dtype
         if (
             isinstance(shared_input, tuple)
             and self.routed_input_transform is None
@@ -449,6 +461,17 @@ class IluMoERunner(MoERunner):
         schedule_shared = (
             ag_rs and self._shared_experts is not None and not self._fse_fuse_gate
         )
+        if (
+            ag_rs
+            and decode_only
+            and self._can_pack_fp8_dispatch(input_ids)
+            and int(metadata.num_tokens_across_dp_cpu.min()) > 0
+            and isinstance(hidden_states, torch.Tensor)
+            and hidden_states.dtype in (torch.bfloat16, torch.float16)
+        ):
+            return self._forward_impl_decode_packed_fp8(
+                hidden_states, shared_experts_input, schedule_shared
+            )
         if gate_after_dispatch:
             router_logits = None
         elif self.gate is not None:
@@ -458,16 +481,24 @@ class IluMoERunner(MoERunner):
             else:
                 router_logits, _ = self.gate(hidden_states)
 
+        prequant_fp8 = (
+            not decode_only
+            and getattr(self._quant_method, "supports_prequant_fp8_dispatch", False)
+            is True
+        )
         if (
             ag_rs
             and (not decode_only or packed_int8)
             and not dispatch_before_gate
-            and getattr(self._quant_method, "supports_prequantized_input", False)
-            is True
+            and (
+                prequant_fp8
+                or getattr(self._quant_method, "supports_prequantized_input", False)
+                is True
+            )
             and self.routed_experts.custom_routing_function is None
         ):
             hidden_states = self._prepare_routed_input(
-                hidden_states, shared_experts_input
+                hidden_states, shared_experts_input, fp8=prequant_fp8
             )
             shared_tensor = (
                 shared_experts_input[0]
@@ -475,11 +506,17 @@ class IluMoERunner(MoERunner):
                 else shared_experts_input
             )
             if (
-                self._shared_can_reuse_routed_quant()
+                not prequant_fp8
+                and self._shared_can_reuse_routed_quant()
                 and shared_tensor is not None
                 and shared_tensor.shape == hidden_states[0].shape
             ):
                 shared_experts_input = hidden_states
+            if prequant_fp8:
+                logger.info_once(
+                    "MoERunner FP8 prequant dispatch enabled, PCP=%s",
+                    self.moe_config.pcp_size,
+                )
 
         with self._sequence_parallel_context():
             stream = None
@@ -533,6 +570,117 @@ class IluMoERunner(MoERunner):
                     self._ag_shared_overlap_enabled,
                 )
             return self._maybe_combine(shared_output, hidden_states)
+
+    def _can_pack_fp8_dispatch(self, input_ids) -> bool:
+        # Collective choice uses replicated configuration and DP metadata.
+        return (
+            envs.VLLM_ILU_MOE_DECODE_PREQUANT_FP8
+            and getattr(
+                self._quant_method, "supports_decode_packed_fp8_dispatch", False
+            )
+            is True
+            and self.moe_config.pcp_size == 1
+            and self.moe_config.tp_size == 1
+            and not self.moe_config.is_sequence_parallel
+            and not self._ilu_elastic_ep
+            and self.routed_input_transform is None
+            and input_ids is None
+            and not self._fse_fuse_gate
+            and self.gate is not None
+            and self.routed_experts.custom_routing_function is None
+            and self.do_naive_dispatch_combine
+        )
+
+    def _forward_impl_decode_packed_fp8(
+        self,
+        hidden_states: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+        schedule_shared: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        import ixformer.inference.functions as ixfops
+
+        from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (  # noqa: E501
+            clear_activation_prequant,
+            register_activation_prequant,
+        )
+
+        assert self.gate is not None
+        hidden_size = int(hidden_states.shape[1])
+        compute_dtype = hidden_states.dtype
+
+        local_logits, _ = self.gate(hidden_states)
+        local_tw, local_ti = self.router.select_experts(
+            hidden_states=hidden_states,
+            router_logits=local_logits,
+            topk_indices_dtype=torch.int32,
+            input_ids=None,
+        )
+        top_k = int(local_ti.shape[1])
+
+        can_prequant_shared = (
+            schedule_shared
+            and isinstance(shared_experts_input, torch.Tensor)
+            and shared_experts_input.data_ptr() == hidden_states.data_ptr()
+            and shared_experts_input.shape == hidden_states.shape
+        )
+        pack_local, q_sh, s_sh = ixfops.moe_ep_pack_fp8_routed(
+            hidden_states,
+            local_tw,
+            local_ti,
+            emit_shared_prequant=can_prequant_shared,
+        )
+
+        with self._sequence_parallel_context():
+            dp_metadata = get_forward_context().dp_metadata
+            assert dp_metadata is not None
+            sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
+            assert sizes is not None
+            dist_group = (
+                get_ep_group()
+                if self.moe_config.is_sequence_parallel
+                else get_dp_group()
+            )
+
+            stream = None
+            if schedule_shared:
+                if can_prequant_shared and q_sh is not None and s_sh is not None:
+                    register_activation_prequant(shared_experts_input, q_sh, s_sh)
+                try:
+                    stream = self._shared_experts.begin_dispatch(
+                        shared_experts_input,
+                        overlap=self._ag_shared_overlap_enabled,
+                    )
+                finally:
+                    if can_prequant_shared:
+                        clear_activation_prequant()
+
+            gathered_pack = dist_group.all_gatherv(pack_local, dim=0, sizes=sizes)
+            shared_output = (
+                self._shared_experts.end_dispatch(stream) if schedule_shared else None
+            )
+            # Keep q_sh/s_sh alive across the aux-stream join above.
+            del q_sh, s_sh
+
+            topk_weights, topk_ids = ixfops.moe_ep_unpack_fp8_routed_meta(
+                gathered_pack, hidden_size, top_k
+            )
+            packed_arg = (
+                gathered_pack.view(torch.float8_e4m3fn),
+                hidden_size,
+                compute_dtype,
+            )
+            fused_out = self.routed_experts.forward_modular(
+                x=packed_arg,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                shared_experts=None,
+                shared_experts_input=None,
+            )
+            logger.info_once(
+                "MoERunner phase=decode, decode_packed_fp8=True, shared_overlap=%s",
+                self._ag_shared_overlap_enabled,
+            )
+            return self._maybe_combine(shared_output, fused_out)
 
     def _dispatch_packed_int8(self, hidden_states, router_logits, input_ids):
         from .ilu_int8_router_pack import pack_router_input, unpack_router_input
@@ -608,7 +756,7 @@ class IluMoERunner(MoERunner):
                 hidden_states, router_logits = result
 
         if self._needs_pcp_dispatch_combine:
-            # Preserve upstream PCP redistribution for both floating and INT8
+            # Preserve upstream PCP redistribution for floating and quantized
             # inputs. Scales and token IDs must follow exactly the same order.
             group = get_pcp_group()
             hidden_states = group.all_gather(hidden_states, dim=0)

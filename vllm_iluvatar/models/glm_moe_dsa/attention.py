@@ -574,6 +574,7 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
     """
 
     _fp8_kv_scale_calibration_enabled: bool = True
+    _allow_rms_rope_fp8_kv_fusion: bool = True
 
     def __init__(
         self,
@@ -708,6 +709,7 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
         fusion_heads_supported = self.num_heads in (8, 16, 32, 64)
         self._rms_rope_fp8_kv_fusion_available = (
             fusion_requested
+            and self._allow_rms_rope_fp8_kv_fusion
             and self.use_fp8_attn
             and fusion_op_available
             and fusion_heads_supported
@@ -720,6 +722,8 @@ class IluGlmMoeDsaSparseMLA(nn.Module, AttentionLayerBase):
             global _RMS_ROPE_FP8_KV_SKIP_LOGGED
             if not _RMS_ROPE_FP8_KV_SKIP_LOGGED:
                 reasons = []
+                if not self._allow_rms_rope_fp8_kv_fusion:
+                    reasons.append("disabled by model fusion policy")
                 if use_pcp:
                     reasons.append("PCP requires gathering normalized/rotated KV")
                 if not self.use_fp8_attn:

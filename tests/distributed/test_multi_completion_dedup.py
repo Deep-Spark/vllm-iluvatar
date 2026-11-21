@@ -174,12 +174,13 @@ class DistinctCompletionTests(base.MultiCompletionTests):
         compiled = compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])),
                            str(registration), 'exec')
         names = ('get_transfer_results', 'build_connector_worker_meta', 'update_connector_output')
-        for bits in range(1, 32):
+        for bits in range(1, 64):
             with self.subTest(marker_mask=bits):
                 multi = type('LoaderMulti', (), {name: (lambda self: None) for name in names})
                 agg = type('LoaderAggregate', (), {'aggregate': lambda self: None})
                 marked = [(getattr(multi, name), '_ilu_multi_completion_sources') for name in names]
                 marked += [(multi.get_transfer_results, '_ilu_multi_distinct_child_sends'),
+                           (multi.get_transfer_results, '_ilu_multi_mp_store_terminal_completion'),
                            (agg.aggregate, '_ilu_multi_distinct_worker_sends')]
                 for index, (method, name) in enumerate(marked):
                     if bits & (1 << index):
@@ -187,7 +188,7 @@ class DistinctCompletionTests(base.MultiCompletionTests):
                 scope = {'MultiConnector': multi, 'KVOutputAggregator': agg,
                          '_FINGERPRINTS': dict.fromkeys(names)}
                 exec(compiled, scope)
-                if bits == 31:
+                if bits == 63:
                     scope['_apply']()
                 else:
                     with self.assertRaisesRegex(RuntimeError, 'Partial or older'):

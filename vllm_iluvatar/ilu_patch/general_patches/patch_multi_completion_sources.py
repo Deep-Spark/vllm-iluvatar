@@ -37,6 +37,7 @@ def _apply() -> None:
     ]
     installed.extend((
         getattr(MultiConnector.get_transfer_results, "_ilu_multi_distinct_child_sends", False),
+        getattr(MultiConnector.get_transfer_results, "_ilu_multi_mp_store_terminal_completion", False),
         getattr(KVOutputAggregator.aggregate, "_ilu_multi_distinct_worker_sends", False),
     ))
     if all(installed):

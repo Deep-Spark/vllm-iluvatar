@@ -10,6 +10,7 @@ from __future__ import annotations
 from copy import copy
 from dataclasses import dataclass, field
 from functools import wraps
+import os
 from typing import Any
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -22,6 +23,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
 _MARK = "_ilu_multi_completion_sources"
 _DISTINCT_CHILDREN = "_ilu_multi_distinct_child_sends"
 _DISTINCT_WORKERS = "_ilu_multi_distinct_worker_sends"
+_MP_STORE_BARRIER = "_ilu_multi_mp_store_terminal_completion"
 
 
 def _merge(target: dict[str, set[int]], source: dict[str, set[int]]) -> None:
@@ -72,6 +74,56 @@ def _early_sends(child: Any, sends: set[str]) -> set[str]:
     return set()
 
 
+def _mp_eager_child(connectors: list[Any]) -> tuple[int, Any] | None:
+    if len(connectors) != 2:
+        return None
+    names = [type(child).__name__ for child in connectors]
+    if sorted(names) != ["LMCacheMPConnector", "OptNixlConnector"]:
+        return None
+    index = names.index("LMCacheMPConnector")
+    connector = connectors[index]
+    if (getattr(connector, "_can_store", False) is not True
+            or getattr(connector, "lazy_offload", None) is not False):
+        return None
+    return index, connector
+
+
+def _terminal_fence_profile(connector: Any, config: Any) -> bool:
+    # Deferred finalization can call get_finished before the last wait_for_save.
+    # Keep the initial device fence limited to the explicit synchronous profile.
+    # The rank aggregator holds RID failures until all receives complete. A
+    # legacy flat block-id failure can reach the scheduler before that fence.
+    if (getattr(connector, "_report_request_errors", False) is not True
+            or config is None or getattr(config, "speculative_config", None) is not None):
+        return False
+    scheduler = getattr(config, "scheduler_config", None)
+    if getattr(scheduler, "async_scheduling", None) is not False:
+        return False
+    child_config = getattr(getattr(connector, "_vllm_config", None), "kv_transfer_config", None)
+    extra = getattr(child_config, "kv_connector_extra_config", {}) or {}
+    mode = extra.get("lmcache.mp.mp_transfer_mode", os.getenv("LMCACHE_MP_TRANSFER_MODE"))
+    return (mode == "lmcache_driven"
+            and extra.get("lmcache.mp.transfer_intermediate_tensors", False) is False
+            and os.getenv("LMCACHE_ILUVATAR_TERMINAL_TRANSFERS") == "1"
+            and os.getenv("VLLM_ILUVATAR_TERMINAL_KV_OWNERSHIP", "1") == "1")
+
+
+def _mp_store_completion_gate(connectors: list[Any]) -> tuple[int, set[str]] | None:
+    match = _mp_eager_child(connectors)
+    if match is None:
+        return None
+    index, connector = match
+    adapter = getattr(connector, "worker_adapter", None)
+    enable = getattr(adapter, "_ilu_enable_terminal_transfer_fence", None)
+    if enable is None or not enable():
+        raise RuntimeError("MP worker rejected the configured terminal transfer fence")
+    returned = getattr(adapter, "_returned_finished", None)
+    if (getattr(adapter, "lazy_offload", None) is not False
+            or not isinstance(returned, set)):
+        raise RuntimeError("Unsupported non-lazy LMCache MP completion contract")
+    return index, returned
+
+
 def install_multi_completion_sources(cls: type) -> None:
     """Install three Multi-only adapters; standalone/single-child stay intact."""
     if getattr(cls.update_connector_output, _MARK, False):
@@ -79,6 +131,27 @@ def install_multi_completion_sources(cls: type) -> None:
     original_results = cls.get_transfer_results
     original_meta = cls.build_connector_worker_meta
     original_update = cls.update_connector_output
+    original_init = cls.__init__
+
+    @wraps(original_init)
+    def init(self: Any, *args, **kwargs) -> None:
+        original_init(self, *args, **kwargs)
+        match = _mp_eager_child(getattr(self, "_connectors", []))
+        if match is None:
+            return
+        _, child = match
+        if not _terminal_fence_profile(child, getattr(self, "_vllm_config", None)):
+            return
+        scheduler_adapter = getattr(child, "scheduler_adapter", None)
+        if scheduler_adapter is not None:
+            enable = getattr(child, "_ilu_enable_terminal_session_fence", None)
+            if enable is None:
+                raise RuntimeError("Terminal transfer fencing requires the matching LMCache plugin")
+            enable()
+        elif not callable(getattr(getattr(child, "worker_adapter", None),
+                                  "_ilu_enable_terminal_transfer_fence", None)):
+            raise RuntimeError("Terminal transfer fencing requires the matching LMCache plugin")
+        self._ilu_terminal_fence_profile = True
 
     @wraps(original_results)
     def get_transfer_results(self: Any, finished_req_ids: set[str]) -> Any:
@@ -89,6 +162,16 @@ def install_multi_completion_sources(cls: type) -> None:
             raise RuntimeError("Multi completion sources were not packed before the next drain")
         results = KVConnectorTransferResults()
         pending = _state(self, "_ilu_multi_worker_send_sources")
+        store_gate = (_mp_store_completion_gate(self._connectors)
+                      if getattr(self, "_ilu_terminal_fence_profile", False) else None)
+        if store_gate is not None:
+            _, returned_before_poll = store_gate
+            # Rebinding terminal metadata must not reopen an already reported
+            # worker completion. Inspect history before polling the children:
+            # a new LM report below updates that same set before it returns.
+            for request_id in list(self._extra_async_saves):
+                if request_id in returned_before_poll and request_id not in pending:
+                    del self._extra_async_saves[request_id]
         ready_sends: dict[str, set[int]] = {}
         ready_recvs: dict[str, set[int]] = {}
         for index, connector in enumerate(self._connectors):
@@ -98,6 +181,12 @@ def install_multi_completion_sources(cls: type) -> None:
             for request_id in child_results.finished_recving:
                 ready_recvs.setdefault(request_id, set()).add(index)
             for request_id in child_results.finished_sending:
+                if (store_gate is not None and index != store_gate[0]
+                        and request_id in store_gate[1] and request_id not in pending):
+                    # This worker's complete group was already reported. Still
+                    # drain child metadata, receive failures and other results;
+                    # only this duplicate/stale send credit is suppressed.
+                    continue
                 # Capture before the original extra-save counter can swallow it.
                 sources = pending.setdefault(request_id, set())
                 if index in sources:
@@ -107,6 +196,22 @@ def install_multi_completion_sources(cls: type) -> None:
                     continue
                 sources.add(index)
                 extra_pending = self._extra_async_saves.get(request_id)
+                if store_gate is not None:
+                    if not (extra_pending is None or
+                            (type(extra_pending) is int and extra_pending == 1)):
+                        raise RuntimeError("Invalid two-child MP async-save count")
+                    # Keep the declared cardinality until the whole group is
+                    # ready. A Nixl completion that predates terminal metadata
+                    # must not give the parent an irreversible rank credit.
+                    if (store_gate[0] not in sources
+                            or len(sources) < (extra_pending or 0) + 1):
+                        continue
+                    self._extra_async_saves.pop(request_id, None)
+                    results.finished_sending.add(request_id)
+                    ready_sends.setdefault(request_id, set()).update(
+                        pending.pop(request_id)
+                    )
+                    continue
                 if extra_pending is None:
                     results.finished_sending.add(request_id)
                     ready_sends.setdefault(request_id, set()).update(
@@ -200,6 +305,8 @@ def install_multi_completion_sources(cls: type) -> None:
     for method in (get_transfer_results, build_connector_worker_meta, update_connector_output):
         setattr(method, _MARK, True)
     setattr(get_transfer_results, _DISTINCT_CHILDREN, True)
+    setattr(get_transfer_results, _MP_STORE_BARRIER, True)
+    cls.__init__ = init
     cls.get_transfer_results = get_transfer_results
     cls.build_connector_worker_meta = build_connector_worker_meta
     cls.update_connector_output = update_connector_output

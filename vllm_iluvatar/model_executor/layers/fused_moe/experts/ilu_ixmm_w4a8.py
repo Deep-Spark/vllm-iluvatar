@@ -11,6 +11,9 @@ from .ilu_compute_backend import MoEComputeBackend, MoEWeightSpec, register_moe_
 class IxMMW4A8Backend(MoEComputeBackend):
     name = "ixmm_w4a8"
     priority = 30
+    supports_prequantized_int8 = True
+    # activation_dynamic_scaled_int8 preserves plain SwiGLU when limit is None.
+    requires_activation_limit = False
     supported_layouts = {"ivcore30": ("NN",)}
     weight_specs = {"NN": MoEWeightSpec("ixmm_w4a8_nn", "NN", torch.int8)}
 
@@ -37,6 +40,7 @@ class IxMMW4A8Backend(MoEComputeBackend):
         output=None,
         residual=None,
         w13_gemm_mode=None,
+        quantized_input=None,
     ):
         if x.shape[0] == 0:
             return self.empty_standard_output(x, output, residual)
@@ -58,7 +62,21 @@ class IxMMW4A8Backend(MoEComputeBackend):
         )
         q = workspace.get("input")
         scale = workspace.get("input_scale").reshape(-1)
-        ops.moe_expand_input_ep_dynamic_scaled_int8(x, inverse, q, scale, topk=k)
+        if quantized_input is None:
+            ops.moe_expand_input_ep_dynamic_scaled_int8(x, inverse, q, scale, topk=k)
+        else:
+            source, source_scale = quantized_input
+            packed = type(source_scale) is int
+            ops.moe_expand_input_ep(
+                hidden_states=source,
+                src_to_expert_row=inverse,
+                expand_tokens=topk_ids.numel(),
+                topk=k,
+                output=q,
+                output_scale=scale,
+                input_scale=None if packed else source_scale,
+                packed_scale_offset=source_scale if packed else None,
+            )
         intermediate = workspace.get("gemm1")
         self.gemm(weights, q, scale, "w13", layout, intermediate)
         del q, scale

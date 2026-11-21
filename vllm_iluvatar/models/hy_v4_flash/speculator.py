@@ -40,6 +40,7 @@ class FlashDFlySpeculator(DraftModelSpeculator):
         self.mask_token_id = vllm_config.model_config.hf_config.dfly_mask_token_id
         self.graphs = {}
         self.use_graph = False
+        self._capture_stream = None
 
     def load_draft_model(self, target_model, target_attn_layer_names):
         with torch.device(self.device):
@@ -80,13 +81,23 @@ class FlashDFlySpeculator(DraftModelSpeculator):
                 min(self.max_num_reqs, 1 << shift)
                 for shift in range((self.max_num_reqs - 1).bit_length() + 1)
             }
-            self.active.zero_()
-            for r in sorted(sizes, reverse=True):
-                self._step(r)
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
+            if self._capture_stream is None:
+                self._capture_stream = torch.cuda.Stream(device=self.device)
+            capture_stream = self._capture_stream
+            caller_stream = torch.cuda.current_stream(self.device)
+            capture_stream.wait_stream(caller_stream)
+            # cuBLASLt initializes workspaces per stream. Warming a different
+            # stream can leave the first allocation inside capture, which
+            # invalidates the graph on some CoreX driver versions.
+            with torch.cuda.stream(capture_stream):
+                self.active.zero_()
+                for r in sorted(sizes, reverse=True):
                     self._step(r)
-                self.graphs[r] = graph
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, stream=capture_stream):
+                        self._step(r)
+                    self.graphs[r] = graph
+            caller_stream.wait_stream(capture_stream)
             logger.info("HY4 DFly2 captured request sizes %s", sorted(self.graphs))
 
     @torch.inference_mode()

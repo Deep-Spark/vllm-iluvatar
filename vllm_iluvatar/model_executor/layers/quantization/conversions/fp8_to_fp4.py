@@ -104,6 +104,7 @@ def convert_to_ix30_fp4(
     source: Fp8SourceLayout,
     out_weight: torch.Tensor | None = None,
     out_scale: torch.Tensor | None = None,
+    scale_workspace: torch.Tensor | None = None,
     backend: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Convert ``[E, n, k]`` FP8 + block scale to the ix30 FP4 pair.
@@ -145,6 +146,7 @@ def convert_to_ix30_fp4(
         source.block_shape,
         out_weight=out_weight,
         out_scale=out_scale,
+        scale_workspace=scale_workspace,
         scale_format="running_acc",
         backend=backend,
     )

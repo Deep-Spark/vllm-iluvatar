@@ -154,9 +154,9 @@ class IluGlmMoeDsaMultiTokenPredictor(nn.Module):
         # indexer writes this buffer at draft step 0; steps 1+ reuse it
         # (index_share_for_mtp_iteration) via set_skip_topk / compact_topk_indices.
         topk_tokens = config.index_topk
-        self.topk_indices_buffer = torch.empty(
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            topk_tokens,
+        self.topk_indices_buffer = torch.full(
+            (vllm_config.scheduler_config.max_num_batched_tokens, topk_tokens),
+            -1,
             dtype=torch.int32,
             device=self.device,
         )

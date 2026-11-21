@@ -8,6 +8,46 @@ from vllm_iluvatar.models.hy_v4_flash.attention import FlashPageStorage
 from vllm_iluvatar.models.hy_v4_flash.config import HYV4FlashConfig
 
 
+def test_dfly_capture_warms_blas_on_capture_stream():
+    from vllm_iluvatar.models.hy_v4_flash.speculator import FlashDFlySpeculator
+
+    device = torch.device("cuda")
+    linear = torch.nn.Linear(
+        6144, 3072, bias=False, device=device, dtype=torch.bfloat16
+    )
+    with torch.no_grad():
+        linear.weight.fill_(1 / 1024)
+    inputs = torch.full((8, 6144), 0.125, device=device, dtype=torch.bfloat16)
+    output = torch.zeros((8, 3072), device=device, dtype=torch.bfloat16)
+
+    def step(rows):
+        output[:rows].copy_(linear(inputs[:rows]))
+
+    owner = SimpleNamespace(
+        use_graph=True,
+        device=device,
+        max_num_reqs=8,
+        active=torch.zeros(8, device=device, dtype=torch.bool),
+        graphs={},
+        _capture_stream=None,
+        _step=step,
+    )
+    FlashDFlySpeculator.capture(owner)
+    capture_stream = owner._capture_stream
+    FlashDFlySpeculator.capture(owner)
+    assert owner._capture_stream is capture_stream
+    assert set(owner.graphs) == {1, 2, 4, 8}
+    for rows, graph in owner.graphs.items():
+        for value in (0.125, 0.25):
+            inputs.fill_(value)
+            output.zero_()
+            graph.replay()
+            torch.cuda.synchronize()
+            # Exact binary inputs give the analytic dot product 6144*x/1024.
+            assert torch.all(output[:rows] == value * 6)
+            assert torch.all(output[rows:] == 0)
+
+
 def test_reject_unimplemented_index_layout():
     with pytest.raises(ValueError, match="compress_ratio=4"):
         HYV4FlashConfig(

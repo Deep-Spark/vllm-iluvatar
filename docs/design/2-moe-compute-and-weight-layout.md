@@ -118,11 +118,11 @@ MXFP4 回调校验目标与来源后，公共会话以 `(Loader, local expert, w
 
 这是一槽顺序协议，当前没有读盘/上传/转换流水并发。同步同时保护 pinned CPU 源和 GPU 输入，不能只等待转换结果而提前覆写 host 槽；这里也不使用 `empty_cache()` 或全设备 synchronize。固定容量约束仅覆盖本路径的上传槽，不代表普通参数、converter 内部或框架没有其他临时分配。
 
-payload 读取器默认缓存最多 16 个 safetensors 句柄，LRU 淘汰；同文件多 tensor 可复用句柄，跨越更多文件时可能重新打开。header 扫描单独打开并关闭文件，因此不能宣称每个文件只打开一次。日志记录 pairs/opens/reads/staging_bytes；opens/reads 是 payload reader 的计数，不包含 header 扫描和文件 prefetch。
+payload 读取器默认缓存最多 16 个 safetensors 句柄，LRU 淘汰；同文件多 tensor 可复用句柄，跨越更多文件时可能重新打开。header 扫描单独打开并关闭文件，因此不能宣称每个文件只打开一次。日志记录 pairs/opens/reads/staging_bytes/conversion_bytes；opens/reads 是 payload reader 的计数，不包含 header 扫描和文件 prefetch。
 
 ### 3.5 实际加载流程与异常清理
 
-图 6：通用映射、完整配对与固定上传槽（按实际调用顺序）
+图 6：MXFP4 的通用映射、完整配对与固定上传槽（按实际调用顺序）
 
 ![MXFP4 两阶段配对加载与异常清理](images/moe-paired-loading.png)
 
@@ -150,9 +150,11 @@ Flash 的模型映射只将整层 gate/up、down 表示为逐专家 `w1/w3/w2` �
 
 MXFP4 与 FP8 共享 `PairedMoEWeightLoader` 的最终参数分配、回调、目标切片、完整性校验，以及 `ExpertUploadBuffer`。block-FP8 的上传槽按单个本地投影计算：`N*K + 4*ceil(N/bn)*ceil(K/bk)` 字节。BF16 scale 在 CPU staging copy 时转换为 FP32；TP 分区从 block 内开始时，按原 block 的归属索引细化 scale 网格，之后再转换本地投影，避免先量化全局权重后切片。
 
+block-FP8 的 W4A8 和 FP4FP8 loader 共用上述上传槽，转换容量均为零。源权重和源 scale 一起从 pinned CPU 内存上传。W4A8 原生转换器直接写最终参数。FP4FP8 原生转换器按最终参数的行步长写 gate、up 或 down，在同次调用中计算并写出 ixmm 的 running-acc scale。会话等当前流完成该对转换后复用上传槽。
+
 FP8 加载阶段以 `w13_weight_scale_inv/w2_weight_scale_inv` 注册 scale 参数，使社区原有名称映射保持有效；这些参数的存储从创建时就是目标 scale 的大小和 dtype。加载完整性检查后将同一 Parameter 更名为 `*_weight_scale`，不保留重复参数或整层源 scale。计算只消费最终 `MoEWeights`。
 
-150 的 IxInfer NN/TN 与 300 的 IxMM W4A8 使用 IxFormer `fp8_block_to_w4a8`：一个原生 kernel 完成 block 反量化、全 K channel amax、INT8 RNE、除 18 后 INT4 RNE 和目标布局写入。IxInfer scale 不吸收倍率 18，IxMM scale 吸收。Loader 要求该 native backend 存在；缺失即报错。300 的 FP4FP8 继续使用 `preprocess_fp8_block_weight_for_ixmm`，保留其既有形状 fallback 与输出 view copy 契约，不能将其表述为所有形状均单次原生直接写入。
+150 的 IxInfer NN/TN 与 300 的 IxMM W4A8 使用 IxFormer `fp8_block_to_w4a8`：一个原生 kernel 完成 block 反量化、全 K channel amax、INT8 RNE、除 18 后 INT4 RNE 和目标布局写入。IxInfer scale 不吸收倍率 18，IxMM scale 吸收。Loader 要求该 native backend 存在；缺失即报错。300 的 FP4FP8 继续使用 `preprocess_fp8_block_weight_for_ixmm`，当 N 为 128 的倍数且 K 为 256 的倍数时原生直写模型切片，其他合法尺寸沿用 Torch 转换。
 
 普通 FP8 已有的 swiglustep、无 clamp 的 SiLU/SwiGLU、TP scale 细化与 W2 K padding 由源 Loader 和 FP4FP8 compute 各自负责。显式 online quant Method 保留其源转换与到达顺序约束，完成转换后也绑定公共 compute。`apply()` 传递 shared residual 和最终输出倍率；`select_gemm_impl()` 绑定同一实例的 Standard/Batched adapter。适配器数值验证与某个模型的分布式通信验收分别记录，不以接口存在性宣称所有模型均支持 LL。
 
@@ -239,6 +241,8 @@ classDiagram
 - **Standard adapter**：提供给采用 Standard Prepare/Finalize 的 modular kernel 使用。它是已实现的适配接口，不等于 MXFP4 已自动接通所有 Standard 通信 backend。
 
 现有 DeepSeek 模型接入中，W4A8 backend 通过 `prefer_hybrid_ep` 进入 Hybrid EP 入口；FP4FP8 默认沿用 runner，显式启用 LL decode override 时才在全 DP rank 均为纯 decode 的步骤切换。新模型复用 Method 时，仍需接通对应模型/runner 入口。
+
+GLM-5.2 的 block-FP8 Method 从当前计算 backend 取得输入能力。IxMM FP4FP8 可在 Prefill 的 AG/RS 分发前量化 routed activation。在纯 Decode、TP1、PCP1 且所有 DP rank 均有 token 时，启用 `VLLM_ILU_MOE_DECODE_PREQUANT_FP8` 可将 FP8 激活、scale 和路由信息打包，用一次 AllGather 分发，随后解出 TopK 元数据并归约专家输出。Runner 还会检查路由方式及共享专家配置。IxMM W4A8 NN 使用其 INT8 输入能力。
 
 当前 Method 保持 `moe_kernel=None`，不构造社区内部通信 kernel。因此不能把直接配置 `deepep_low_latency` 或 `deepep_high_throughput` 与上述 Hybrid LL decode 入口视为等价。
 
@@ -361,13 +365,13 @@ PNG 用于文档展示，SVG 保留可编辑图形，MMD 保留流程图源码�
 - **DeepSeek V4.1 / MXFP4**：保留既有验证范围。150 的 IxInfer W4A8 NN/TN 均覆盖 AG/RS 与 Hybrid LL/NVSM；300 的 IxMM FP4FP8、IxMM W4A8 NN 覆盖 AG/RS，Hybrid LL/NVSM 尚未验证。
 - **Hy4 Flash / block-FP8**：150 默认 IxInfer W4A8 NN v2，300 默认 IxMM FP4FP8；两机均完成 DP16+EP、AG/RS、DFly5、FULL_DECODE_ONLY，以及 PP8×TP1/TP2 的整模回归和全量 GSM8K。PP 用例验证本地专家计算与权重分片，不额外构成 Hybrid LL/NVSM 验证。原始 FP8 权重在加载时转换，不需要预转换 checkpoint。
 - **GLM-5.2-FP8 / block-FP8**：300 的 IxMM FP4FP8 + AG/RS 已验证，包含 TP2×DP4+EP8（4k 上下文）与 ModelZoo TP2×DP8+EP16（131072 上下文）、MTP3、FP8 KV 和 FULL_DECODE_ONLY。使用默认 `IluFp8MoEMethod` 配对 Loader 完成 FP8→FP4FP8，不需要额外的 `fp4-moe-inline.yaml` 或显式 online-quant 配置。起服及 curl 已验证，TP2×DP8 全量 GSM8K 已完成；性能结果另行记录，不将 GLM-5.3、GLM 的 PP8 或 Hybrid LL/NVSM 一并标为已验证。
-- **FP8 的其他 mode**：150 IxInfer TN 与 300 IxMM W4A8 NN 已有转换/compute 设备测试，尚未完成对应模型与通信组合的整模验收，矩阵保留“—”。显式 online-quant Method 的兼容单测与上述默认 block-FP8 路径分开统计。
+- **FP8 的其他 mode**：300 的 GLM-5.2 已验证 IxMM W4A8 NN 与 IxMM FP4FP8 的 AG/RS，覆盖 PP4×PCP4 Prefill 和 TP1×DP16、MTP3 Decode。两种配置均从原始 block-FP8 checkpoint 加载。150 IxInfer TN 已有转换/compute 设备测试，整模验收待补。显式 online-quant Method 的兼容单测与上述默认 block-FP8 路径分开统计。
 
 GLM 的 ModelZoo 复测保留了模型参数；已激活开发环境时需避免脚本重复加载 CoreX 覆盖 `PYTHONPATH`。README 的 64-token curl 在 thinking 模式下可能截断，关闭 thinking 的冒烟请求已返回 `2` 并正常 stop。这些启动环境和请求预算问题不要求改动默认 FP8 MoE 配置。该轮关服后曾出现设备异常并执行恢复，模型路径的已验证状态不代表设备收尾稳定性也已验收。
 
 验证依据：Hy4 Flash 150 示例、Hy4 Flash 300 示例、GLM-5.2-FP8 ModelZoo及 2026-11-20 的「[测试 GLM FP8 MoE 部署](codex://threads/01a1f671-3d8c-7182-a747-b375e9a2961d)」验证记录。Hy4 示例的历史成绩对应其记录版本，本次统一 FP8 实现的回归结果不覆盖写入历史成绩。
 
-本次 FP8 路径使用的 IxFormer 为 `0200d4b1f78aff47765a681c41d98f3b586326c6`，包含 150 原生 `fp8_block_to_w4a8`；构建 pin 的唯一来源为根目录 `Dockerfile`。
+本次 FP8 路径使用的 IxFormer 为 `196693f2c7a0a49ad233bce29604133b5514083f`，包含 W4A8、FP4FP8 权重直写和默认 ixattn 浮点 indexer。构建 pin 的唯一来源为根目录 `Dockerfile`。
 
 ### 8.2 通信与公共约束
 
@@ -375,7 +379,7 @@ GLM 的 ModelZoo 复测保留了模型参数；已激活开发环境时需避免
 
 - **AG/RS**：配置 `allgather_reducescatter`，本地专家计算经对应 Method 的 `apply() → backend.run_standard()`。DeepSeek V4.1 在 ivcore11 的 Hybrid Prefill／混合步骤使用该路径；本表 Hy4 Flash、GLM-5.2-FP8 的 EP 用例，以及 ivcore30 的既有 MXFP4 验证，在 Prefill 与 Decode 均使用该路径。
 - **Hybrid LL / NVSM**：基础通信仍为 AG/RS，显式配置 `VLLM_ILU_DECODE_EP_BACKEND=deepep_low_latency` 与 `VLLM_ILU_DISABLE_DEEPEP=1`。所有 DP rank 均为纯 Decode 时，经 `IluBatchedComputeExperts → backend.run_batched()` 使用 IxFormer NVSM dispatch/combine；其他步骤保持基础通信。这不包含原生 DeepEP LL/HT 或直接将 LL 配为基础 all2all backend。
-- **未验证的组合**：MXFP4 在 ivcore30 的两种 mode 已覆盖 AG/RS；FP8 当前模型验证覆盖各架构默认 mode 的 AG/RS。已有 backend/adapter 接口不足以构成其他 mode 或 LL/NVSM 的整模支持承诺，不将“未验证”写成“不支持”。
+- **未验证的组合**：MXFP4 在 ivcore30 的两种 mode 已覆盖 AG/RS；FP8 已验证各架构默认 mode 的 AG/RS，以及 300 上 GLM 的 IxMM W4A8 NN + AG/RS。已有 backend/adapter 接口不足以构成其他 mode 或 LL/NVSM 的整模支持承诺，不将“未验证”写成“不支持”。
 - **适配器边界**：当前 AG/RS 接线直接调用 Method，不经过 `IluStandardComputeExperts`。后者提供 Standard modular 协议接口，其独立通信接线不能由上述 AG/RS 结论代替。
 - **并行边界**：PP 属于模型并行拓扑，不是 MoE all2all backend。未启用 EP 时，本地专家同样通过 `apply → run_standard` 执行；P/D KV 传输也不属于本表的专家通信。
 

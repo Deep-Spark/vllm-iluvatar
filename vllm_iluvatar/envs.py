@@ -240,7 +240,9 @@ if TYPE_CHECKING:
     VLLM_ILU_GLM_MOE_PREPARE_FUSION: bool = False
     VLLM_ILU_GLM_DSA_PREPARE_FUSION: bool = False
     VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV: bool = True
+    VLLM_ILU_GLM_MTP_FP8_LM_HEAD: bool = True
     VLLM_ILU_GLM_DSA_FP8_ABSORB_UP: bool = True
+    VLLM_ILU_MOE_DECODE_PREQUANT_FP8: bool = True
     VLLM_ILU_GLM_DSA_TOPK_CONVERT_CACHE: bool = True
     VLLM_ILU_GLM_DSA_NATIVE_MQA_LOGITS: bool = False
     VLLM_ILU_INDEXER_KV_DTYPE: str = "bf16"
@@ -705,6 +707,10 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # (fp8_grouped_per_token_quant + fp8_per_channel_einsum) instead of BF16
     # grouped einsums off a dequantised kv_b_proj. Default on; set 0 for the
     # BF16 A/B baseline. Ignored by the W4A8 (marlin) path.
+    "VLLM_ILU_MOE_DECODE_PREQUANT_FP8": _bool_reader(
+        "VLLM_ILU_MOE_DECODE_PREQUANT_FP8", "1"
+    ),
+    "VLLM_ILU_GLM_MTP_FP8_LM_HEAD": _bool_reader("VLLM_ILU_GLM_MTP_FP8_LM_HEAD", "1"),
     "VLLM_ILU_GLM_DSA_FP8_ABSORB_UP": _bool_reader(
         "VLLM_ILU_GLM_DSA_FP8_ABSORB_UP", "1"
     ),

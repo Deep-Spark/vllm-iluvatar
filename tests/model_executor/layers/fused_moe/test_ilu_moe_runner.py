@@ -571,8 +571,9 @@ def test_precomputed_shared_stays_separate_until_combine(pcp_size):
 )
 @pytest.mark.parametrize("overlap", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("fp8", [False, True])
 def test_phase_schedule_uses_original_dispatch_and_join_before_gate(
-    decode, overlap, dtype
+    decode, overlap, dtype, fp8
 ):
     from types import SimpleNamespace
 
@@ -581,7 +582,8 @@ def test_phase_schedule_uses_original_dispatch_and_join_before_gate(
     runner = _make_stub_runner(in_dtype=dtype)
     runner.moe_config.moe_parallel_config.all2all_backend = "allgather_reducescatter"
     runner.routed_experts.quant_method.is_monolithic = False
-    runner.routed_experts.quant_method.supports_prequantized_input = True
+    runner.routed_experts.quant_method.supports_prequantized_input = not fp8
+    runner.routed_experts.quant_method.supports_prequant_fp8_dispatch = fp8
     runner.routed_experts.custom_routing_function = None
     runner.routed_input_transform = None
     runner._fse_fuse_gate = False
@@ -590,7 +592,7 @@ def test_phase_schedule_uses_original_dispatch_and_join_before_gate(
     runner._shared_can_reuse_routed_quant = lambda: False
     events = []
     x = torch.ones(3, 256, dtype=dtype)
-    q = x.to(torch.int8)
+    q = x.to(torch.float8_e4m3fn if fp8 else torch.int8)
     scale = torch.ones(3, 1)
     shared = x * 2
 
@@ -614,7 +616,8 @@ def test_phase_schedule_uses_original_dispatch_and_join_before_gate(
         if decode:
             assert value is x and logits is None
         else:
-            assert value[0] is q and value[2] == dtype
+            assert value[0].dtype == q.dtype and value[2] == dtype
+            torch.testing.assert_close(value[0].float(), q.float())
             torch.testing.assert_close(value[1], scale)
             assert logits is not None
         return value, logits, ids
@@ -662,15 +665,25 @@ def test_phase_schedule_uses_original_dispatch_and_join_before_gate(
                 dp_metadata=SimpleNamespace(all_ranks_decode_only=decode)
             ),
         )
+
+    def fp8_quant(output, source, output_scale):
+        assert source is x
+        output.copy_(q)
+        output_scale.copy_(scale)
+
     with (
         context_scope,
         context_patch,
         patch.object(ops, "scaled_int8_quant", return_value=(q, scale)) as quant,
+        patch.object(
+            ops, "dynamic_scaled_fp8_quant", side_effect=fp8_quant
+        ) as quant_fp8,
     ):
         if decode is None:
             assert get_forward_context().dp_metadata is None
         torch.testing.assert_close(runner._forward_impl(x, None, x), x * 3)
-    assert quant.call_count == (not decode)
+    assert quant.call_count == (not decode and not fp8)
+    assert quant_fp8.call_count == (not decode and fp8)
     assert events == (
         ["shared", "dispatch", "join", "gate", "experts"]
         if decode

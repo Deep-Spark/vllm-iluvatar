@@ -96,20 +96,26 @@ def _expand_quantized_rows(
     top_k: tl.constexpr,
     block_size: tl.constexpr,
     input_stride: tl.constexpr,
+    scale_stride: tl.constexpr,
 ):
     row = tl.program_id(0)
     columns = tl.program_id(1) * block_size + tl.arange(0, block_size)
     route = tl.load(routing_map + row)
     token = tl.maximum(route, 0) // top_k
     value = tl.load(
-        quantized_input + token * input_stride + columns,
+        quantized_input + token.to(tl.int64) * input_stride + columns,
         (route >= 0) & (columns < hidden_size),
         other=0,
     )
-    tl.store(output + row * hidden_size + columns, value, columns < hidden_size)
+    tl.store(
+        output + row.to(tl.int64) * hidden_size + columns, value, columns < hidden_size
+    )
     if tl.program_id(1) == 0:
         tl.store(
-            output_scales + row, tl.load(input_scales + token, route >= 0, other=1.0)
+            output_scales + row,
+            tl.load(
+                input_scales + token.to(tl.int64) * scale_stride, route >= 0, other=1.0
+            ),
         )
 
 
@@ -183,6 +189,7 @@ def expand_prequantized_input(quantized_input, input_scales, mapping, topk):
         topk,
         1024,
         quantized_input.stride(0),
+        input_scales.stride(0),
     )
     return output, output_scales
 

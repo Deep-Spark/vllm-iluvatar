@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU tests for GLM-5.2 official-FP8 weight streaming helpers."""
+"""GLM-5.2 official-FP8 weight streaming and draft-head regressions."""
 
 import pytest
 import torch
@@ -128,3 +128,48 @@ def test_consumes_int8_tuple_accepts_w8a8_linear_scheme():
     linear.scheme = object.__new__(IluCompressedTensorsW8A8Int8)
     # No quant_method on purpose: the scheme alone must settle it.
     assert _consumes_int8_tuple(linear)
+
+
+@pytest.mark.parametrize("tokens", [8, 32])
+@torch.inference_mode()
+def test_draft_fp8_head_preserves_source_and_replays_graph(tokens, default_vllm_config):
+    from types import SimpleNamespace
+
+    from vllm_iluvatar.ilu_util.arch import is_ivcore30
+    from vllm_iluvatar.model_executor.layers.quantization.configs.fp8 import (
+        IluFp8Config,
+    )
+    from vllm_iluvatar.models.glm_moe_dsa.fp8_mtp import _Fp8DraftLMHeadProxy
+
+    if not torch.cuda.is_available() or not is_ivcore30():
+        pytest.skip("draft FP8 head requires ivcore30")
+    torch.manual_seed(92)
+    source = torch.randn(256, 6144, device="cuda", dtype=torch.bfloat16)
+    before = source.clone()
+    shard = object()
+    head = SimpleNamespace(weight=source, tp_size=1, shard_indices=shard)
+    config = IluFp8Config(
+        is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128]
+    )
+    default_vllm_config.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    proxy = _Fp8DraftLMHeadProxy(head, config)
+    assert config.weight_block_size == [128, 128]
+    assert proxy.shard_indices is shard and proxy.tp_size == 1
+    assert head.weight is source and head.weight.dtype == torch.bfloat16
+    torch.testing.assert_close(source, before, rtol=0, atol=0)
+    weight = proxy.weight.float() * proxy.weight_scale[:, None]
+    torch.testing.assert_close(weight, source.float(), rtol=0.063, atol=1e-5)
+    x = torch.randn(tokens, 6144, device="cuda", dtype=torch.bfloat16)
+    sx = (x.float().abs().amax(-1, keepdim=True) / 448).clamp_min(1e-12)
+    qx = (x.float() / sx).clamp(-448, 448).to(torch.float8_e4m3fn)
+    reference = (qx.float() * sx) @ weight.T
+    for _ in range(3):
+        eager = proxy.quant_method.apply(proxy, x)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(eager.float(), reference, rtol=0.02, atol=0.5)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = proxy.quant_method.apply(proxy, x)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured, eager, rtol=0, atol=0)

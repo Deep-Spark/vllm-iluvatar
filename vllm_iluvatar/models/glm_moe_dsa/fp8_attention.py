@@ -16,7 +16,7 @@ What differs from W4A8, and why:
   can instead convert ``kv_b_proj`` to W8A16 at load time, and then
   ``IluGlmMoeDsaFp8MLAAttention`` keeps the base class rather than this one.
 
-* The RMSNorm+RoPE+FP8-KV-insert fusion is pinned off, see ``__init__``.
+* The RMSNorm+RoPE+FP8-KV-insert fusion is disabled by class policy.
 
 * Everything the base class already handles by feature detection is left
   alone. Notably the INT8 norm+quant fusion disarms itself: its guard requires
@@ -92,14 +92,11 @@ class IluGlmMoeDsaFp8SparseMLA(IluGlmMoeDsaSparseMLA):
     W_UV_S: torch.Tensor | None = None
     _absorb_logged: bool = False
 
+    # Calibration must not re-enable the legacy fusion on the FP8 path.
+    _allow_rms_rope_fp8_kv_fusion: bool = False
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # The fused RMSNorm+RoPE+FP8-KV-insert kernel gives wrong numerics, and
-        # ``VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV`` defaults to on -- the base class
-        # arms the fusion the moment an offline scale table freezes the scale in
-        # ``__init__``, so online calibration is the only reason FP8 has not hit
-        # it yet. Pin it off here instead of relying on the env switch.
-        self.use_rms_rope_fp8_kv_fusion = False
         self.use_fp8_absorb_up = envs.VLLM_ILU_GLM_DSA_FP8_ABSORB_UP
         self._install_absorb_hook()
 
@@ -259,12 +256,18 @@ class IluGlmMoeDsaFp8SparseMLA(IluGlmMoeDsaSparseMLA):
         return ixf_ops.fp8_per_channel_einsum(a, self.W_UK, a_s, self.W_UK_S)
 
     def _v_up_proj(self, x: torch.Tensor, outputs=None) -> torch.Tensor:
-        # FP8/einsum backends do not expose the Marlin direct-output contract.
-        if self.W_UV_S is None:
-            result = torch.einsum("thl,hvl->thv", x, self.W_UV)
-        else:
+        if self.W_UV_S is not None:
             a, a_s = ixf_ops.fp8_grouped_per_token_quant(x, x.shape[1])
-            result = ixf_ops.fp8_per_channel_einsum(a, self.W_UV, a_s, self.W_UV_S)
+            out = (
+                outputs.view(*x.shape[:2], self.W_UV.shape[1])
+                if outputs is not None
+                else None
+            )
+            result = ixf_ops.fp8_per_channel_einsum(
+                a, self.W_UV, a_s, self.W_UV_S, out=out
+            )
+            return outputs if outputs is not None else result
+        result = torch.einsum("thl,hvl->thv", x, self.W_UV)
         if outputs is not None:
             outputs.copy_(result)
             return outputs

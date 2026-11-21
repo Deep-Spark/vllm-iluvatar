@@ -74,6 +74,7 @@ def _kpool_mqa_logits(
     max_kv_len: int,
     max_context_len: int,
     indexer_type: IndexerType,
+    packed_queries: bool = False,
 ) -> torch.Tensor:
     if indexer_type == IndexerType.FP8:
         return ixfops.dsa_indexer_mqa_logits_with_kvcache_fp8(
@@ -100,7 +101,8 @@ def _kpool_mqa_logits(
             max_kv_len=max_kv_len,
             max_context_len=max_context_len,
             valid_lens=valid_lens,
-            backend="ixinfer",
+            backend="ixinfer" if indexer_type == IndexerType.INT8 else None,
+            packed_queries=packed_queries,
         )
     else:
         raise NotImplementedError(f"Unsupported indexer type: {indexer_type}")
@@ -272,6 +274,7 @@ def ilu_sparse_attn_indexer_kpool(
                 max_kv_len=chunk.max_kv_len,
                 max_context_len=chunk.max_context_len,
                 indexer_type=indexer_type,
+                packed_queries=True,
             )
             _select_pools_and_expand(
                 logits,
@@ -335,12 +338,15 @@ def ilu_sparse_attn_indexer_kpool(
 
         q_dec = q_quant[:num_decode_tokens]
         w_dec = weights[:num_decode_tokens]
+        score_q, packed_queries = decode_metadata.cu_seqlens_q, False
+        if indexer_type == IndexerType.BF16:
+            score_q, packed_queries = decode_metadata.float_score_queries()
         logits = _kpool_mqa_logits(
             q_dec,
             w_dec,
             kv_cache,
             decode_metadata.block_table,
-            decode_metadata.cu_seqlens_q,
+            score_q,
             decode_metadata.cu_seqlens_kv,
             decode_metadata.cu_seqlen_ks,
             decode_metadata.cu_seqlen_ke,
@@ -349,6 +355,7 @@ def ilu_sparse_attn_indexer_kpool(
             max_kv_len=decode_metadata.max_kv_len,
             max_context_len=decode_metadata.max_context_len,
             indexer_type=indexer_type,
+            packed_queries=packed_queries,
         )
         _select_pools_and_expand(
             logits,

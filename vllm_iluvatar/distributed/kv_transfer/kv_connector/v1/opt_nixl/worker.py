@@ -2020,7 +2020,11 @@ class NixlConnectorWorker:
         if self._send_tombstones.get(req_id, generation) is not None:
             # Duplicate or reordered PREPARED/CANCEL after terminal. Re-emit
             # completion so a peer retry can recover a lost proof.
-            self._put_completion(CompletionBatch(done_sending={req_id}))
+            self._put_completion(
+                CompletionBatch(
+                    done_sending={req_id}, send_generations={(req_id, generation)}
+                )
+            )
             return None
         state = self._send_requests.get(req_id)
         if state is None:
@@ -2034,6 +2038,7 @@ class NixlConnectorWorker:
             self._put_completion(
                 CompletionBatch(
                     done_sending={req_id},
+                    send_generations={(req_id, generation)},
                     failures={
                         req_id: (
                             "stale ownership generation "
@@ -2726,6 +2731,8 @@ class NixlConnectorWorker:
                 session.pending_send.discard(req_id)
                 session.inflight_send.discard(req_id)
         batch = CompletionBatch(done_sending={req_id})
+        if state is not None and state.generation:
+            batch.send_generations.add((req_id, state.generation))
         failure = self._send_failures.pop(req_id, None)
         if failure:
             batch.failures[req_id] = failure
@@ -2988,6 +2995,50 @@ class NixlConnectorWorker:
                 )
                 cache.index_copy_(0, indices, permuted_blocks)
 
+    def _ilu_replay_unbound_send_completions(
+        self, admissions: dict[ReqId, str | None]
+    ) -> None:
+        unbound = getattr(self, "_ilu_unbound_send_completions", None)
+        if unbound is None:
+            return
+        matched = {
+            (rid, generation)
+            for rid, generation in admissions.items()
+            if generation and unbound.consume(rid, generation)
+        }
+        if matched:
+            # This runs on the engine thread during bind. The next drain
+            # sees the replay even if LMCache reports its terminal in that
+            # same step, with no final local NIXL send metadata to replay it.
+            self._put_completion(CompletionBatch(
+                done_sending={rid for rid, _ in matched},
+                send_generations=matched,
+            ))
+
+    def _ilu_filter_send_completions(
+        self, batch: CompletionBatch, expected: dict[ReqId, str | None]
+    ) -> set[ReqId]:
+        finished = set()
+        unbound = getattr(self, "_ilu_unbound_send_completions", None)
+        for rid, generation in batch.send_generations:
+            if rid in expected:
+                if expected[rid] == generation:
+                    finished.add(rid)
+                continue
+            if unbound is None:
+                unbound = self._ilu_unbound_send_completions = RequestTombstoneStore(
+                    self._send_tombstones.ttl, self._send_tombstones.limit
+                )
+            # D can cancel before the P request arrives. Retain the real vote
+            # without granting credit to any request until an exact admission.
+            try:
+                unbound.record(rid, generation, RequestOwnershipState.TERMINAL)
+            except RuntimeError as error:
+                if not getattr(self, "_ilu_warned_unbound_send_capacity", False):
+                    logger.error("Unable to retain unbound NIXL completion: %s", error)
+                    self._ilu_warned_unbound_send_capacity = True
+        return finished
+
     def get_transfer_results(self) -> KVConnectorTransferResults:
         """Non-blockingly drain uvloop completions and run CUDA postprocess.
 
@@ -3029,8 +3080,15 @@ class NixlConnectorWorker:
         failed_recving = {
             req_id for req_id in merged.failures if req_id in merged.done_recving
         }
+        finished_sending = merged.done_sending
+        expected = getattr(self, "_ilu_multi_send_generations", None)
+        if expected is not None:
+            # The worker may drain after a new admission is already bound.
+            # Filter the generation captured when the actor emitted the vote,
+            # not a generation inferred from the current request ID.
+            finished_sending = self._ilu_filter_send_completions(merged, expected)
         return KVConnectorTransferResults(
-            finished_sending=merged.done_sending,
+            finished_sending=finished_sending,
             finished_recving=merged.done_recving,
             failed_recving=failed_recving,
         )

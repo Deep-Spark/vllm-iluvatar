@@ -43,18 +43,12 @@ class MPStoreBarrierTests(unittest.TestCase):
         lm = type("LMCacheMPConnector", (SimpleNamespace,), {})(**vars(lm_original))
         lm._can_store = can_store
         lm.lazy_offload = lazy
-        lm.worker_adapter = SimpleNamespace(lazy_offload=lazy, _returned_finished=set(),
-                                             _ilu_enable_terminal_transfer_fence=lambda: True)
-        original = lm.get_transfer_results
-
-        def results(ids):
-            value = original(ids)
-            # Explicit boundary input: the real non-lazy adapter records the
-            # IDs it returns before returning to Multi, including no-STORE IDs.
-            lm.worker_adapter._returned_finished.update(value.finished_sending)
-            return value
-
-        lm.get_transfer_results = results
+        lm.worker_adapter = SimpleNamespace(
+            lazy_offload=lazy,
+            _ilu_enable_terminal_transfer_fence=lambda *, generation_aware: generation_aware,
+        )
+        nx.connector_scheduler = SimpleNamespace(is_consumer=False)
+        nx.connector_worker = SimpleNamespace(is_consumer=False)
         worker = self.case.multi([lm, nx] if reverse else [nx, lm])
         worker._ilu_terminal_fence_profile = True
         return worker, nx, lm
@@ -116,7 +110,7 @@ class MPStoreBarrierTests(unittest.TestCase):
             child.scheduler_adapter = SimpleNamespace()
             with self.assertRaisesRegex(RuntimeError, 'requires the matching LMCache plugin'):
                 Multi([nixl, child])
-            child._ilu_enable_terminal_session_fence = lambda: None
+            child._ilu_enable_terminal_session_fence = lambda *, generation_aware: None
             self.assertTrue(Multi([nixl, child])._ilu_terminal_fence_profile)
         with patch.dict(os.environ, {'LMCACHE_ILUVATAR_TERMINAL_TRANSFERS': '0'}):
             self.assertFalse(hasattr(Multi([nixl, child]), '_ilu_terminal_fence_profile'))
@@ -224,11 +218,10 @@ class MPStoreBarrierTests(unittest.TestCase):
                 self.assertEqual(self.poll(worker).finished_sending, {"R"})
 
     def test_unsupported_recognized_mp_contract_fails_explicitly(self):
-        for field in ("lazy_offload", "_returned_finished"):
-            worker, _, lm = self.pair()
-            delattr(lm.worker_adapter, field)
-            with self.assertRaisesRegex(RuntimeError, "completion contract"):
-                self.poll(worker)
+        worker, _, lm = self.pair()
+        del lm.worker_adapter.lazy_offload
+        with self.assertRaisesRegex(RuntimeError, "completion contract"):
+            self.poll(worker)
 
     def test_invalid_two_child_extra_is_rejected(self):
         for extra in (0, -1, 2, True):
@@ -251,7 +244,7 @@ class MPStoreBarrierTests(unittest.TestCase):
             self.send(nx, rid)
             self.assertFalse(self.poll(worker).finished_sending)
             self.assert_drained(worker)
-        self.assertEqual(len(lm.worker_adapter._returned_finished), 1000)
+        self.assertFalse(hasattr(lm.worker_adapter, "_returned_finished"))
 
     def test_actual_mp_no_store_terminal_history_contract(self):
         source = os.environ.get("LMCACHE_ADAPTER_SOURCE")

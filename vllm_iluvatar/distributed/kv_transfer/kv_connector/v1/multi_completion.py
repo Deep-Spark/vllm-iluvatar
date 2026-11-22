@@ -108,20 +108,18 @@ def _terminal_fence_profile(connector: Any, config: Any) -> bool:
             and os.getenv("VLLM_ILUVATAR_TERMINAL_KV_OWNERSHIP", "1") == "1")
 
 
-def _mp_store_completion_gate(connectors: list[Any]) -> tuple[int, set[str]] | None:
+def _mp_store_completion_gate(connectors: list[Any]) -> int | None:
     match = _mp_eager_child(connectors)
     if match is None:
         return None
     index, connector = match
     adapter = getattr(connector, "worker_adapter", None)
     enable = getattr(adapter, "_ilu_enable_terminal_transfer_fence", None)
-    if enable is None or not enable():
-        raise RuntimeError("MP worker rejected the configured terminal transfer fence")
-    returned = getattr(adapter, "_returned_finished", None)
-    if (getattr(adapter, "lazy_offload", None) is not False
-            or not isinstance(returned, set)):
+    if getattr(adapter, "lazy_offload", None) is not False:
         raise RuntimeError("Unsupported non-lazy LMCache MP completion contract")
-    return index, returned
+    if enable is None or not enable(generation_aware=True):
+        raise RuntimeError("MP worker rejected the configured terminal transfer fence")
+    return index
 
 
 def install_multi_completion_sources(cls: type) -> None:
@@ -132,6 +130,10 @@ def install_multi_completion_sources(cls: type) -> None:
     original_meta = cls.build_connector_worker_meta
     original_update = cls.update_connector_output
     original_init = cls.__init__
+    original_new = getattr(cls, "on_new_request", None)
+    original_build = getattr(cls, "build_connector_meta", None)
+    original_bind = getattr(cls, "bind_connector_metadata", None)
+    original_finish = getattr(cls, "_aggregate_request_finished", None)
 
     @wraps(original_init)
     def init(self: Any, *args, **kwargs) -> None:
@@ -139,19 +141,94 @@ def install_multi_completion_sources(cls: type) -> None:
         match = _mp_eager_child(getattr(self, "_connectors", []))
         if match is None:
             return
-        _, child = match
+        mp_index, child = match
+        nixl = self._connectors[1 - mp_index]
         if not _terminal_fence_profile(child, getattr(self, "_vllm_config", None)):
             return
         scheduler_adapter = getattr(child, "scheduler_adapter", None)
+        native = (nixl.connector_scheduler if scheduler_adapter is not None
+                  else nixl.connector_worker)
+        if native.is_consumer:
+            return
         if scheduler_adapter is not None:
             enable = getattr(child, "_ilu_enable_terminal_session_fence", None)
             if enable is None:
                 raise RuntimeError("Terminal transfer fencing requires the matching LMCache plugin")
-            enable()
+            enable(generation_aware=True)
+            self._ilu_nixl_admissions = {}
+            self._ilu_nixl_retirements = set()
+            self._ilu_nixl_generation_sequence = 0
+            self._ilu_nixl_generation_authority = native
         elif not callable(getattr(getattr(child, "worker_adapter", None),
                                   "_ilu_enable_terminal_transfer_fence", None)):
             raise RuntimeError("Terminal transfer fencing requires the matching LMCache plugin")
+        else:
+            native._ilu_multi_send_generations = {}
+            self._ilu_nixl_worker = native
+            self._ilu_nixl_generation_sequence = -1
         self._ilu_terminal_fence_profile = True
+
+    def on_new_request(self: Any, request: Any) -> Any:
+        result = original_new(self, request)
+        admissions = getattr(self, "_ilu_nixl_admissions", None)
+        if admissions is not None:
+            params = request.kv_transfer_params
+            generation = None
+            if params and params.get("do_remote_decode"):
+                generation = self._ilu_nixl_generation_authority._request_generation(
+                    request.request_id, params
+                )
+            # Every admission invalidates any retained receipt for the same ID,
+            # including requests that do not use the NIXL data path at all.
+            admissions[request.request_id] = generation
+        return result
+
+    def build_connector_meta(self: Any, scheduler_output: Any) -> Any:
+        result = original_build(self, scheduler_output)
+        admissions = getattr(self, "_ilu_nixl_admissions", None)
+        if admissions is not None:
+            self._ilu_nixl_generation_sequence += 1
+            result._ilu_send_generation_delta = (
+                self._ilu_nixl_generation_sequence, admissions,
+                self._ilu_nixl_retirements
+            )
+            self._ilu_nixl_admissions = {}
+            self._ilu_nixl_retirements = set()
+        return result
+
+    def bind_connector_metadata(self: Any, metadata: Any) -> Any:
+        worker = getattr(self, "_ilu_nixl_worker", None)
+        if worker is not None:
+            delta = getattr(metadata, "_ilu_send_generation_delta", None)
+            if delta is None:
+                raise RuntimeError("Missing Multi send-generation metadata")
+            sequence, admissions, retirements = delta
+            if sequence < self._ilu_nixl_generation_sequence:
+                raise RuntimeError("Out-of-order Multi send-generation metadata")
+            if sequence == self._ilu_nixl_generation_sequence:
+                return original_bind(self, metadata)
+            self._ilu_nixl_generation_sequence = sequence
+            expected = worker._ilu_multi_send_generations
+            pending = _state(self, "_ilu_multi_worker_send_sources")
+            completed = self.__dict__.setdefault("_ilu_multi_terminal_completed", set())
+            # Apply invalidation before the original bind installs this step's
+            # async-save counts. A retirement and fresh admission can share an
+            # output; the new generation is authoritative in that case.
+            for request_id in retirements | admissions.keys():
+                expected.pop(request_id, None)
+                pending.pop(request_id, None)
+                self._extra_async_saves.pop(request_id, None)
+                completed.discard(request_id)
+            expected.update(admissions)
+            worker._ilu_replay_unbound_send_completions(admissions)
+        return original_bind(self, metadata)
+
+    def aggregate_request_finished(self: Any, request: Any, finish: Any) -> Any:
+        result = original_finish(self, request, finish)
+        retirements = getattr(self, "_ilu_nixl_retirements", None)
+        if retirements is not None and not result[0]:
+            retirements.add(request.request_id)
+        return result
 
     @wraps(original_results)
     def get_transfer_results(self: Any, finished_req_ids: set[str]) -> Any:
@@ -165,13 +242,9 @@ def install_multi_completion_sources(cls: type) -> None:
         store_gate = (_mp_store_completion_gate(self._connectors)
                       if getattr(self, "_ilu_terminal_fence_profile", False) else None)
         if store_gate is not None:
-            _, returned_before_poll = store_gate
-            # Rebinding terminal metadata must not reopen an already reported
-            # worker completion. Inspect history before polling the children:
-            # a new LM report below updates that same set before it returns.
-            for request_id in list(self._extra_async_saves):
-                if request_id in returned_before_poll and request_id not in pending:
-                    del self._extra_async_saves[request_id]
+            completed = self.__dict__.setdefault("_ilu_multi_terminal_completed", set())
+            for request_id in completed.intersection(self._extra_async_saves):
+                del self._extra_async_saves[request_id]
         ready_sends: dict[str, set[int]] = {}
         ready_recvs: dict[str, set[int]] = {}
         for index, connector in enumerate(self._connectors):
@@ -181,8 +254,7 @@ def install_multi_completion_sources(cls: type) -> None:
             for request_id in child_results.finished_recving:
                 ready_recvs.setdefault(request_id, set()).add(index)
             for request_id in child_results.finished_sending:
-                if (store_gate is not None and index != store_gate[0]
-                        and request_id in store_gate[1] and request_id not in pending):
+                if store_gate is not None and request_id in completed:
                     # This worker's complete group was already reported. Still
                     # drain child metadata, receive failures and other results;
                     # only this duplicate/stale send credit is suppressed.
@@ -203,10 +275,11 @@ def install_multi_completion_sources(cls: type) -> None:
                     # Keep the declared cardinality until the whole group is
                     # ready. A Nixl completion that predates terminal metadata
                     # must not give the parent an irreversible rank credit.
-                    if (store_gate[0] not in sources
+                    if (store_gate not in sources
                             or len(sources) < (extra_pending or 0) + 1):
                         continue
                     self._extra_async_saves.pop(request_id, None)
+                    completed.add(request_id)
                     results.finished_sending.add(request_id)
                     ready_sends.setdefault(request_id, set()).update(
                         pending.pop(request_id)
@@ -293,6 +366,9 @@ def install_multi_completion_sources(cls: type) -> None:
         # Stale removes only its source contribution. A real current Nixl early
         # completion still vetoes release; a sibling must not add it back.
         output.finished_sending = (approved_sends - early) or None
+        retirements = getattr(self, "_ilu_nixl_retirements", None)
+        if retirements is not None:
+            retirements.update(output.finished_sending or ())
         output.finished_recving = approved_recvs or None
         output.failed_recving = failed_recvs
         output.invalid_block_ids = invalid_blocks
@@ -310,6 +386,14 @@ def install_multi_completion_sources(cls: type) -> None:
     cls.get_transfer_results = get_transfer_results
     cls.build_connector_worker_meta = build_connector_worker_meta
     cls.update_connector_output = update_connector_output
+    if original_new is not None:
+        cls.on_new_request = wraps(original_new)(on_new_request)
+    if original_build is not None:
+        cls.build_connector_meta = wraps(original_build)(build_connector_meta)
+    if original_bind is not None:
+        cls.bind_connector_metadata = wraps(original_bind)(bind_connector_metadata)
+    if original_finish is not None:
+        cls._aggregate_request_finished = wraps(original_finish)(aggregate_request_finished)
 
 
 def install_multi_rank_completion_dedup(cls: type) -> None:

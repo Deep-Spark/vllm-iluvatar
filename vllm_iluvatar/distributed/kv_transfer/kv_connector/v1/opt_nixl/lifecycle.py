@@ -86,6 +86,10 @@ class RequestTombstoneStore:
         tombstone = self._items.get((req_id, generation))
         return None if tombstone is None else tombstone.state
 
+    def consume(self, req_id: ReqId, generation: str) -> bool:
+        self._prune(time.monotonic())
+        return self._items.pop((req_id, generation), None) is not None
+
     def record(
         self,
         req_id: ReqId,
@@ -179,6 +183,7 @@ class CompletionBatch:
     recv_metadata: dict[ReqId, Any] = field(default_factory=dict)
     invalid_block_ids: set[int] = field(default_factory=set)
     failures: dict[ReqId, str] = field(default_factory=dict)
+    send_generations: set[tuple[ReqId, str]] = field(default_factory=set)
 
     @property
     def is_empty(self) -> bool:
@@ -192,6 +197,7 @@ class CompletionBatch:
 
     def merge(self, other: CompletionBatch) -> None:
         self.done_sending.update(other.done_sending)
+        self.send_generations.update(other.send_generations)
         self.done_recving.update(other.done_recving)
         self.recv_metadata.update(other.recv_metadata)
         self.invalid_block_ids.update(other.invalid_block_ids)

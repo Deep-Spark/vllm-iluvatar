@@ -179,6 +179,46 @@ def test_deferred_views_and_unsupported_expert_data_transform(tmp_path):
         destination.copy_(view)
 
 
+def test_chunking_a_fused_expert_tensor_stays_deferred(tmp_path):
+    """A model holding one layer's experts fused splits gate from up with chunk.
+
+    ``Tensor.chunk`` dispatches to ``aten.split.Tensor``, whose several outputs
+    do not fit the single-output view replay; materializing instead would make
+    the callback reject the source (Hy4's ``experts.gate_up_proj``).
+    """
+    model = MappedModel(1)
+    files = checkpoint(tmp_path, model)
+    session = PairedLoadSession({model.loaders[0]: "block"})
+    session.bind()
+    try:
+        ref = next(
+            r for r in checkpoint_references(files) if r.source.name == "source_000"
+        )
+        tensor = DeferredCheckpointTensor(ref, session.readers)
+        rows = tensor.shape[0]
+
+        halves = tensor.chunk(2, dim=0)
+
+        assert session.readers.reads == 0
+        assert all(isinstance(half, DeferredCheckpointTensor) for half in halves)
+        assert [half.shape[0] for half in halves] == [rows // 2, rows - rows // 2]
+        # Each piece must replay to its own rows, not to the whole tensor.
+        whole = ref.read(session.readers)
+        for index, half in enumerate(halves):
+            destination = torch.empty(half.shape, dtype=half.dtype)
+            destination.copy_(half)
+            begin = index * (rows // 2)
+            assert torch.equal(destination, whole[begin : begin + half.shape[0]])
+        # An uneven split keeps the short tail rather than dropping it.
+        assert [piece.shape[0] for piece in tensor.chunk(3, dim=0)] == [
+            (rows + 2) // 3,
+            (rows + 2) // 3,
+            rows - 2 * ((rows + 2) // 3),
+        ]
+    finally:
+        session.close()
+
+
 def test_registered_loader_discovers_callbacks_and_releases_session(
     tmp_path, monkeypatch
 ):

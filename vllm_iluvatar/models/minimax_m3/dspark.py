@@ -5,6 +5,8 @@ Reuse the context-cache/proposal interface, Markov head and confidence head;
 the decoder preserves MiniMax's Gemma norms, partial RoPE and SwiGLU-OAI.
 """
 
+import functools
+
 import ixformer.inference.functions as ixf_ops
 import torch
 import torch.nn.functional as F
@@ -24,6 +26,34 @@ from .mxfp8.attention import MiniMAXGemmaRMSNorm
 from .mxfp8.model import MiniMaxM3MLP
 
 logger = init_logger(__name__)
+
+
+@functools.lru_cache(maxsize=1)
+def _ixmm_fp8_per_channel_available() -> bool:
+    """True iff this build can run the context-KV projection on ixmm.
+
+    The fast path below calls the FP8 per-channel GEMM directly instead of the
+    QKV layers' own quant method, so it needs that op to exist in ixmm --
+    ivcore11 offers only the ``torch`` backend for it, and executes MXFP8
+    linears as INT8 anyway. Probing the registry rather than the architecture
+    keeps this tied to what the kernel call actually requires.
+    """
+    try:
+        import ixformer.inference.backend_registry as registry
+    except ImportError:
+        return False
+    try:
+        return all(
+            "ixmm" in registry.registry.available_backends(op)
+            for op in ("fp8_per_channel_mm", "fp8_per_channel_gemv")
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "Failed to probe the ixmm FP8 per-channel GEMM; projecting the "
+            "DSpark context KV through the QKV layers instead.",
+            exc_info=True,
+        )
+        return False
 
 
 class IluMiniMaxDSparkDecoderLayer(DFlashQwen3DecoderLayer):
@@ -91,11 +121,15 @@ class IluMiniMaxDSparkModel(Qwen3DSparkModel):
 
     def _build_context_kv_buffers(self, layers_attn, has_bias):
         super()._build_context_kv_buffers(layers_attn, has_bias)
-        if has_bias or any(
-            proj.weight.dtype is not torch.float8_e4m3fn
-            or not hasattr(proj, "weight_scale")
-            or proj.weight_scale.ndim not in (1, 2)
-            for proj in self._context_qkv_projs
+        if (
+            has_bias
+            or not _ixmm_fp8_per_channel_available()
+            or any(
+                proj.weight.dtype is not torch.float8_e4m3fn
+                or not hasattr(proj, "weight_scale")
+                or proj.weight_scale.ndim not in (1, 2)
+                for proj in self._context_qkv_projs
+            )
         ):
             # Keep the existing projection path for other quantization methods.
             logger.info("MiniMax DSpark context KV-only MXFP8 path unavailable")

@@ -69,6 +69,17 @@ def _remap_mtp_quant_exclusions(
     if not patterns or exclusion_attr is None:
         return quant_config
 
+    # The checkpoint ships no per-MTP head: ``SharedHead`` builds one at
+    # ``<layer>.head`` and ``load_weights`` ties it to the target's
+    # ``lm_head.weight``, which the spec-decode runtime then swaps out for the
+    # target's module anyway. So the draft head holds unquantized bytes and the
+    # target's own exclusion is the one that applies to it -- but that pattern
+    # names ``lm_head``, not an MTP module, so the loop below cannot carry it.
+    # An opt-out config quantizes every prefix it was not told to skip, so
+    # leaving it out means the head is created in the checkpoint's format and
+    # then loaded with BF16 values and no scale.
+    head_excluded = any("lm_head" in pattern for pattern in patterns)
+
     extra: list[str] = []
     for offset in range(num_mtp_layers):
         # The VL target rewrites ``model.`` to ``language_model.model.`` on the
@@ -83,6 +94,8 @@ def _remap_mtp_quant_exclusions(
                 continue
             trailing_stars = pattern[len(stripped) :]
             extra.append(draft_prefix + stripped[idx + len(marker) :] + trailing_stars)
+        if head_excluded:
+            extra.append(draft_prefix + "head")
     if not extra:
         return quant_config
 

@@ -145,11 +145,10 @@ def test_mxfp4_explicit_mode_overrides_legacy_env(monkeypatch):
     ],
 )
 def test_fp8_compute_modes(device, mode, backend, layout):
-    from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe import (
-        select_fp8_compute,
+    """The public mode table every converted expert source resolves through."""
+    selection = ilu_compute.select_four_bit_expert_compute(
+        device, mode, source="block-FP8"
     )
-
-    selection = select_fp8_compute(device, mode)
     assert (selection.name, selection.layout) == (backend, layout)
 
 

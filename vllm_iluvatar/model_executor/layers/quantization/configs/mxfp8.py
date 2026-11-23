@@ -22,6 +22,12 @@ from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.nvfp4_moe imp
 from vllm_iluvatar.model_executor.layers.quantization.backends.mxfp8.linear import (
     mxfp8_int8_linear_method,
 )
+from vllm_iluvatar.model_executor.layers.quantization.backends.mxfp8.moe import (
+    mxfp8_w4a8_moe_method,
+)
+from vllm_iluvatar.model_executor.layers.quantization.backends.nvfp4.moe import (
+    IluModelOptNvFp4ToW4A8MoEMethod,
+)
 
 
 @register_quantization_config("mxfp8")
@@ -38,7 +44,9 @@ class IluMxFp8Config(ModelOptMxFp8Config):
     (which picks up ``IluMxfp8LinearKernel`` from the patched kernel list) and
     ``RoutedExperts`` through ``FusedMoEMethodCls``. On ivcore11 that kernel
     patch is inactive and the dense default is INT8, so Linear is claimed by
-    ``mxfp8_int8_linear_method``.
+    ``mxfp8_int8_linear_method`` and the routed experts by
+    ``mxfp8_w4a8_moe_method``, which converts to IxInfer W4A8 rather than the
+    ix30 FP4 that ``FusedMoEMethodCls`` needs ixmm for.
 
     MiniMax checkpoints tag ``quant_method: "mxfp8"``. NVIDIA ModelOpt
     checkpoints resolve to ``modelopt_mxfp8``, which ``configs/modelopt/mxfp8``
@@ -69,12 +77,27 @@ class IluMxFp8Config(ModelOptMxFp8Config):
         linear_method = mxfp8_int8_linear_method(self, layer, prefix)
         if linear_method is not None:
             return linear_method
+        if getattr(self, "moe_quant_algo", "MXFP8") == "MXFP8":
+            moe_method = mxfp8_w4a8_moe_method(self, layer, prefix)
+            if moe_method is not None:
+                return moe_method
         if (
             getattr(self, "moe_quant_algo", "MXFP8") == "NVFP4"
             and isinstance(layer, RoutedExperts)
             and not self.is_layer_excluded(prefix)
         ):
-            return IluModelOptNvFp4MoEMethod(
+            from vllm_iluvatar.ilu_util.arch import IVCORE11, cuda_arch
+
+            # ivcore11 has no ixmm, so the NVFP4 experts convert to IxInfer
+            # W4A8 instead of the ix30 FP4 layout. Everything else about the
+            # mixed checkpoint -- host staging, coverage validation, chunk
+            # size -- is identical.
+            method_cls = (
+                IluModelOptNvFp4ToW4A8MoEMethod
+                if cuda_arch() == IVCORE11
+                else IluModelOptNvFp4MoEMethod
+            )
+            return method_cls(
                 ModelOptNvFp4Config(
                     is_checkpoint_nvfp4_serialized=True,
                     group_size=16,

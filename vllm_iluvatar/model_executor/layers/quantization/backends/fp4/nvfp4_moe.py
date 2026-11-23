@@ -132,6 +132,10 @@ def _get_ilu_output_scale(layer: RoutedExperts) -> float:
 class IluModelOptNvFp4MoEMethod(ModelOptNvFp4FusedMoE):
     """NVFP4 routed-expert method backed by ``ilu_mxfp4_fused_experts()``."""
 
+    # What the conversion target requires of hidden / intermediate. ix30 packs
+    # in groups of 256; the ivcore11 W4A8 subclass only needs 32.
+    k_alignment = _IXMM_GROUP_SIZE
+
     # [ILU override] ModelOptNvFp4FusedMoE.__init__ — delta: skip the parent
     # body (it calls select_nvfp4_moe_backend, which off NVIDIA lands on MARLIN)
     # and mirror only the field initialisation ``create_weights`` needs.
@@ -188,10 +192,12 @@ class IluModelOptNvFp4MoEMethod(ModelOptNvFp4FusedMoE):
         if not self.moe.is_act_and_mul:
             raise NotImplementedError("NVFP4 ixmm experts require a gated activation")
         if (
-            hidden_size % _IXMM_GROUP_SIZE
-            or intermediate_size_per_partition % _IXMM_GROUP_SIZE
+            hidden_size % self.k_alignment
+            or intermediate_size_per_partition % self.k_alignment
         ):
-            raise ValueError("NVFP4 ixmm expert K dimensions must be divisible by 256")
+            raise ValueError(
+                f"NVFP4 expert K dimensions must be divisible by {self.k_alignment}"
+            )
         if self.validate_checkpoint:
             original_loader = extra_weight_attrs["weight_loader"]
             layer._ilu_nvfp4_loaded = {}

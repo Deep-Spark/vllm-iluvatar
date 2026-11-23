@@ -62,6 +62,10 @@ class MoEComputeConfig:
     limit: float | None = None
     output_scale: float = 1.0
     apply_router_weight_on_input: bool = False
+    # SwiGLU-OAI coefficients, None for every other activation. A backend whose
+    # activation op bakes them in has to reject a disagreeing checkpoint.
+    alpha: float | None = None
+    beta: float | None = None
 
 
 @dataclass(frozen=True)
@@ -135,17 +139,30 @@ class MoEComputeBackend(ABC):
         layouts = cls.supported_layouts.get(selection.arch, ())
         if selection.name != cls.name or selection.layout not in layouts:
             return f"{cls.name} cannot consume {selection.layout} on {selection.arch}"
-        spec = cls.weight_specs[selection.layout]
         if min(config.hidden, config.intermediate, config.local_num_experts) <= 0:
             return "Expert dimensions and local expert count must be positive"
-        if config.hidden % spec.alignment or config.intermediate % spec.alignment:
-            return f"{cls.name} requires {spec.alignment}-aligned dimensions"
+        dimensions = cls.dimension_error(config, selection.layout)
+        if dimensions is not None:
+            return dimensions
         if config.apply_router_weight_on_input:
             return "Compute backends require output TopK weighting"
         if config.activation not in cls.supported_activations:
             return f"{cls.name} does not support activation {config.activation}"
         if cls.requires_activation_limit and config.limit is None:
             return f"{cls.name} requires clamped SwiGLU"
+        return None
+
+    @classmethod
+    def dimension_error(cls, config, layout):
+        """Why this layout's kernels cannot take these dimensions, or None.
+
+        The default is the weight spec's single alignment, which a backend
+        overrides when its kernels state a rule per projection -- ``w13`` and
+        ``w2`` do not use hidden and intermediate in the same role.
+        """
+        spec = cls.weight_specs[layout]
+        if config.hidden % spec.alignment or config.intermediate % spec.alignment:
+            return f"{cls.name} requires {spec.alignment}-aligned dimensions"
         return None
 
     @property

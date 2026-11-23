@@ -2,6 +2,7 @@
 """Architecture/layout selection, including historical format aliases."""
 
 import pytest
+from conftest import requires_cuda
 
 from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
     select_moe_backend,
@@ -38,6 +39,152 @@ def test_selection(arch, name, layout, expected):
 def test_unsupported(arch, name, layout):
     with pytest.raises(ValueError):
         select_moe_backend(arch, name=name, layout=layout)
+
+
+def _support_error(arch, name, layout, **config_overrides):
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+        MoEComputeConfig,
+        MoEComputeSelection,
+        get_moe_backend,
+    )
+
+    config = MoEComputeConfig(
+        **{
+            "hidden": 6144,
+            "intermediate": 384,
+            "local_num_experts": 16,
+            "global_num_experts": 128,
+            "limit": 7.0,
+            **config_overrides,
+        }
+    )
+    selection = MoEComputeSelection(name, layout, arch)
+    return get_moe_backend(selection).support_error(config, selection)
+
+
+@pytest.mark.parametrize(
+    "layout,intermediate,admitted",
+    [
+        # MiniMax-M3 at TP8 (hidden 6144, intermediate 3072/8). Both layouts'
+        # kernels run it; the weight spec's single 256 used to turn it away.
+        ("NN", 384, True),
+        ("TN", 384, True),
+        # w13's N is 2 * intermediate, so NN's N % 128 bites at 288, not 256.
+        ("NN", 288, False),
+        # NN needs K % 64, TN needs K % 128; w2's K is the intermediate.
+        ("NN", 320, True),
+        ("TN", 320, False),
+        # Both need K >= 256, and w2's K is the intermediate.
+        ("NN", 192, False),
+    ],
+)
+def test_ixinfer_w4a8_admits_what_its_kernels_run(layout, intermediate, admitted):
+    error = _support_error(
+        "ivcore11", "ixinfer_w4a8", layout, intermediate=intermediate
+    )
+    assert (error is None) == admitted, error
+
+
+def test_other_backends_keep_the_single_alignment_rule():
+    # Only IxInfer states a per-projection rule. IxMM W4A8 still declares the
+    # weight spec's 256, so the same dimensions stay out.
+    assert "256-aligned" in _support_error("ivcore30", "ixmm_w4a8", "NN")
+    # IxMM FP4FP8 declares 32 and takes them.
+    assert _support_error("ivcore30", "ixmm_fp4fp8", "fp4fp8") is None
+
+
+@pytest.mark.parametrize("activation", ["swigluoai", "swigluoai_uninterleave"])
+@pytest.mark.parametrize(
+    "overrides,rejected_for",
+    [
+        ({"alpha": 1.702, "beta": 1.0}, None),
+        # Unset means the layer kept the activation's own default, which is
+        # what the op has compiled in.
+        ({}, None),
+        ({"alpha": 1.0}, "alpha"),
+        ({"beta": 0.0}, "beta"),
+        ({"limit": 8.0}, "limit"),
+    ],
+)
+def test_swigluoai_is_admitted_only_with_the_baked_coefficients(
+    activation, overrides, rejected_for
+):
+    # ``activation_swigluoai_dynamic_scaled_int8`` exposes no coefficients, so
+    # a checkpoint wanting different ones must be refused, not reinterpreted.
+    error = _support_error(
+        "ivcore11", "ixinfer_w4a8", "NN", activation=activation, **overrides
+    )
+    if rejected_for is None:
+        assert error is None, error
+    else:
+        assert error is not None and rejected_for in error
+
+
+def test_swigluoai_stays_unsupported_on_ixmm():
+    error = _support_error(
+        "ivcore30", "ixmm_fp4fp8", "fp4fp8", activation="swigluoai_uninterleave"
+    )
+    assert "does not support activation" in error
+
+
+def _ixinfer_backend(activation, rows=32, intermediate=384):
+    from vllm_iluvatar.ilu_util.arch import cuda_arch
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+        MoEComputeConfig,
+        MoEComputeSelection,
+    )
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_ixinfer_w4a8 import (
+        IxInferW4A8Backend,
+    )
+
+    config = MoEComputeConfig(
+        hidden=6144,
+        intermediate=intermediate,
+        local_num_experts=2,
+        global_num_experts=2,
+        activation=activation,
+        limit=7.0,
+    )
+    # TN is the one layout both architectures run, so this does not pin the
+    # test to the host's arch.
+    return IxInferW4A8Backend(
+        config, MoEComputeSelection("ixinfer_w4a8", "TN", cuda_arch())
+    )
+
+
+@requires_cuda
+def test_swigluoai_activation_matches_the_oai_formula():
+    import torch
+
+    rows, intermediate = 32, 384
+    backend = _ixinfer_backend("swigluoai_uninterleave", rows, intermediate)
+    workspace = backend.workspace_spec(rows, torch.bfloat16).allocate("cuda")
+    gemm1 = 3 * torch.randn(rows, 2 * intermediate, device="cuda", dtype=torch.bfloat16)
+    order = torch.arange(rows, dtype=torch.int32, device="cuda")
+
+    codes, scales = backend._activation_quant(gemm1, order, False, workspace)
+
+    # The op reads interleaved gate/up pairs; getting the halves-to-interleaved
+    # conversion wrong would mix the two branches and still look plausible.
+    gate = gemm1[:, :intermediate].float().clamp(max=7.0)
+    up = gemm1[:, intermediate:].float().clamp(-7.0, 7.0)
+    expected = gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
+    # One INT8 code is 1/127 of the row's amax; allow two.
+    tolerance = 2 * expected.abs().amax(dim=-1, keepdim=True) / 127
+    assert torch.all((codes.float() * scales.view(-1, 1) - expected).abs() <= tolerance)
+
+
+def test_only_swigluoai_pays_for_the_interleave_buffer():
+    import torch
+
+    assert (
+        "gemm1_interleaved"
+        in _ixinfer_backend("swigluoai").workspace_spec(8, torch.bfloat16).buffers
+    )
+    assert (
+        "gemm1_interleaved"
+        not in _ixinfer_backend("silu").workspace_spec(8, torch.bfloat16).buffers
+    )
 
 
 def test_registration_and_explicit_priority(monkeypatch):

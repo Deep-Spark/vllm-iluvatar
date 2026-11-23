@@ -11,6 +11,9 @@ from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
 from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.nvfp4_moe import (
     IluModelOptNvFp4MoEMethod,
 )
+from vllm_iluvatar.model_executor.layers.quantization.backends.nvfp4.moe import (
+    nvfp4_w4a8_moe_method,
+)
 
 
 @register_quantization_config("modelopt_fp4")
@@ -24,9 +27,13 @@ class IluModelOptNvFp4Config(ModelOptNvFp4Config):
 
     # [ILU override] ModelOptQuantConfigBase.get_quant_method — delta: routed
     # experts (not excluded) return IluModelOptNvFp4MoEMethod instead of
-    # community ModelOptNvFp4FusedMoE. Everything else (linear, attention, KV,
+    # community ModelOptNvFp4FusedMoE, or on ivcore11 the W4A8 sibling, since
+    # the ix30 FP4 layout needs ixmm. Everything else (linear, attention, KV,
     # excluded layers) is left to super().
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        moe_method = nvfp4_w4a8_moe_method(self, layer, prefix)
+        if moe_method is not None:
+            return moe_method
         if isinstance(layer, RoutedExperts) and not self.is_layer_excluded(prefix):
             return IluModelOptNvFp4MoEMethod(
                 quant_config=self, moe_config=layer.moe_config

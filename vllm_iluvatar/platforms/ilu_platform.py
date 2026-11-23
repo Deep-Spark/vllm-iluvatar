@@ -282,6 +282,12 @@ def _make_iluvatar_platform():
 
         @classmethod
         def check_and_update_config(cls, vllm_config) -> None:
+            spec = getattr(vllm_config, "speculative_config", None)
+            if (
+                getattr(spec, "rejection_sample_method", None) == "fly"
+                and not vllm_config.use_v2_model_runner
+            ):
+                raise ValueError("FLy verification requires Model Runner V2")
             model_config = getattr(vllm_config, "model_config", None)
             cache_config = getattr(vllm_config, "cache_config", None)
             compilation_config = getattr(vllm_config, "compilation_config", None)

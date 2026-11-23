@@ -355,6 +355,12 @@ def apply() -> None:
         return
     _applied = True
     try:
+        from vllm_iluvatar.envs import fly_rejection_enabled
+
+        if fly_rejection_enabled():
+            from vllm_iluvatar.ilu_patch.patch_fly import register
+
+            register()
         _patch_torch()
         # Real symm_mem import before stub so half-loaded ops get completed.
         _ensure_symm_mem_ops_registered()

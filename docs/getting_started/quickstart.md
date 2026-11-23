@@ -69,6 +69,10 @@ JSON
 !!! note "为什么用这个例子"
     本页的目标是「第一次跑通」，不是跑大模型或压测，所以这里特意选择一个加载快、单机能跑的 Qwen3 dense 模型，并把参数压到最小：`--tensor-parallel-size 1` 单卡即可启动，多卡时按设备数量调大，一般不需要 `--pipeline-parallel-size`（流水并行用于跨多机或超大模型）；`--enforce-eager` 跳过 CUDA Graph，启动路径最短，最容易定位环境和模型加载问题；其余参数（上下文长度、调度、kernel 环境变量等）都用默认值，不在本页堆调优项。大模型、MoE、量化、投机解码等场景有各自的推荐参数，不适合直接套用本页示例。
 
+## 可选的 FLy 投机验证
+
+在已配置投机解码的 Model Runner V2 服务上，设置 `VLLM_ILU_ENABLE_FLY_REJECTION=1`，并在现有 `--speculative-config` 中设置 `"rejection_sample_method":"fly"`。FLy 至少需要两个草稿 token；`fly_window_size` 必须小于草稿 token 数。正数 `fly_min_target_probability` 需要 `"draft_sample_method":"probabilistic"`。插件默认关闭此扩展。FLy 会改变采样分布，启用后请按业务数据验证精度。
+
 ## 其他模型
 
 不同模型的推荐启动参数不同，差异主要来自并行方式、量化格式、是否走投机解码（MTP 是投机解码的一种）、是否启用 CUDA Graph，以及 Model Runner V1 / V2 的选择。本页示例不适用于所有模型：

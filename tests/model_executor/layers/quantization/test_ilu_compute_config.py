@@ -130,7 +130,7 @@ def test_mxfp4_explicit_mode_overrides_legacy_env(monkeypatch):
         ),
     )
     monkeypatch.setattr(mod, "IluMxfp4MoEMethod", lambda config, selection: selection)
-    selected = mod.select_mxfp4_method(SimpleNamespace(moe_config=None), object())
+    selected = mod.make_mxfp4_method(SimpleNamespace(moe_config=None))
     assert selected.layout == "TN"
 
 

@@ -116,7 +116,7 @@ MXFP4 路径采用两阶段配对加载：阶段一运行模型原有映射建�
 | `fp8` | Linear | `IluFp8LinearMethod` | ✅ 默认 W8A8 INT8 | W8A8 INT8 | 无 |
 | `fp8` | MoE | `IluFp8MoEMethod` | ❌ 要求 ixmm + ivcore30 | W4A8 NN | 缺源格式接入 |
 | `mxfp8` | Linear | 社区 `ModelOptMxFp8LinearMethod` + `IluMxfp8LinearKernel` | ❌ kernel patch 被 arch 门槛跳过 | W8A8 INT8 | 缺转换路径 |
-| `mxfp8` | MoE | `IluMxFp8FusedMoE` / `IluMxFp8ToFp4OnlineMoE` | ❌ 目标格式是 ix30 FP4 | W4A8 NN | 缺源格式接入 |
+| `mxfp8` | MoE | `IluMxFp8MoEMethod` | ✅ 默认 `ixinfer_w4a8_nn_v2`（见 §6.3 完成说明） | W4A8 NN | 无 |
 | `modelopt_mxfp8` | Linear / MoE | `IluModelOptMxFp8Config` | ❌ 同 `mxfp8` | 同上 | 同上 |
 | MXFP4（DeepSeek V4 / V4.1） | MoE | `IluMxfp4MoEMethod` | ✅ 默认 `ixinfer_w4a8_nn_v2` | W4A8 NN | 无 |
 | DeepSeek V4（`deepseek_v4_fp8`） | Linear | **社区 `Fp8LinearMethod`** + `IluFp8BlockScaledMMKernel` | ❌ kernel patch 被 arch 门槛跳过 | W8A8 INT8 | 缺接管 |
@@ -179,7 +179,7 @@ ivcore30 的目标默认是 Linear `fp8` / MoE `ixmm_fp4fp8`，整体完成度�
 | `fp8` / DeepSeek V4 / V4.1 | Linear | `IluFp8LinearMethod` / 社区 `Fp8LinearMethod` + `IluFp8BlockScaledMMKernel` | ✅ 默认 `fp8`（auto→fp8；kernel patch 在 ivcore30 生效） | `fp8` | 无 |
 | `mxfp8` / `modelopt_mxfp8` | Linear | 社区 `ModelOptMxFp8LinearMethod` + `IluMxfp8LinearKernel` | ✅ 可用（patch 生效） | `fp8` 执行 | 无 |
 | MXFP4（DeepSeek V4 / V4.1） | MoE | `IluMxfp4MoEMethod` | ✅ 默认 `ixmm_fp4fp8` | `ixmm_fp4fp8` | 无 |
-| `fp8` / `mxfp8` / NVFP4 | MoE | `IluFp8MoEMethod` / `IluMxFp8FusedMoE` / `IluModelOptNvFp4MoEMethod` → ix30 FP4 | ⚠️ 可运行，走各自独立 FP4 Method | `ixmm_fp4fp8` | 仅差“是否统一到 `ixmm_fp4fp8` backend”——设计选择，非功能缺失，数值仍是 FP4 |
+| `fp8` / `mxfp8` / NVFP4 | MoE | `IluFp8MoEMethod` / `IluMxFp8MoEMethod` / `IluModelOptNvFp4MoEMethod` | ✅ 三者都经 `select_four_bit_expert_compute` 选到 `ixmm_fp4fp8` | `ixmm_fp4fp8` | 无（见 §6.3 完成说明） |
 | 无 `quantization_config`（BF16/FP16） | Linear / MoE | 未量化 Method | ❌ 现为 W16A16 | `fp8` / `ixmm_fp4fp8` | **缺默认入口（门槛 E，与 ivcore11 同）** |
 
 要点：
@@ -266,7 +266,9 @@ ivcore30 的目标默认是 Linear `fp8` / MoE `ixmm_fp4fp8`，整体完成度�
 
 ### 6.3 MXFP8 / NVFP4 MoE → IxInfer W4A8 NN
 
-ivcore11 上有三个方法现在把专家转成 **ix30 FP4**（ivcore30 路径），要落到 `ixinfer_w4a8_nn`：`IluMxFp8FusedMoE`（MXFP8 整层 host 暂存）、`IluMxFp8ToFp4OnlineMoE`（MXFP8 逐 shard 在线）、`IluModelOptNvFp4MoEMethod`（NVFP4）。计算 backend `IxInferW4A8Backend` 已有，只需为每个源写「反量化 → FP32 → 统一的 INT4 W4A8 NN 量化」的 Loader，复用各自已有的加载骨架。
+> **已完成（实现与下文的方案有出入）**：没有按「每个源各写一个 ivcore11 子类」落地，而是把三个类合并成两个与架构无关的 Method——`IluMxFp8MoEMethod`（MXFP8，继承 `IluFp8MoEMethod` 的配对流式加载）和 `IluModelOptNvFp4MoEMethod`（NVFP4，整层加载后分块转换）。目标 weight contract 由 `select_four_bit_expert_compute` 决定：ivcore11 `ixinfer_w4a8_nn_v2`，ivcore30 `ixmm_fp4fp8`。转换之后的生命周期全部来自 `MoEComputeBindingMixin`。`IluMxFp8FusedMoE` / `IluMxFp8ToFp4OnlineMoE` / `IluModelOptNvFp4ToW4A8MoEMethod` 已删除；下文保留为数值路径的设计依据。
+
+ivcore11 上有三个方法曾把专家转成 **ix30 FP4**（ivcore30 路径），要落到 `ixinfer_w4a8_nn`：`IluMxFp8FusedMoE`（MXFP8 整层 host 暂存）、`IluMxFp8ToFp4OnlineMoE`（MXFP8 逐 shard 在线）、`IluModelOptNvFp4MoEMethod`（NVFP4）。计算 backend `IxInferW4A8Backend` 已有，只需为每个源写「反量化 → FP32 → 统一的 INT4 W4A8 NN 量化」的 Loader，复用各自已有的加载骨架。
 
 **共用的 5 步（逐专家 shard `[N,K]`）：**
 

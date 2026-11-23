@@ -163,10 +163,10 @@ class IluFp8Config(Fp8Config):
             and not self._is_layer_skipped(prefix)
         ):
             from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp4_moe import (
-                IluMxfp4MoEMethod,
+                make_mxfp4_method,
             )
 
-            return IluMxfp4MoEMethod(layer.moe_config), "quantized"
+            return make_mxfp4_method(layer), "quantized"
 
         if (
             isinstance(layer, RoutedExperts)
@@ -199,7 +199,7 @@ class IluFp8Config(Fp8Config):
         )
 
         if isinstance(original_method, IluMxfp4MoEMethod):
-            return select_mxfp4_method(layer, original_method, runtime_method)
+            return select_mxfp4_method(original_method, runtime_method)
         from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe import (
             IluFp8MoEMethod,
             select_fp8_method,

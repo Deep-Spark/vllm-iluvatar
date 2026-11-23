@@ -205,7 +205,16 @@ class MoEComputeBackend(ABC):
                     f"{prefix}: weights/scales must be contiguous on one device"
                 )
 
-    def workspace_spec(self, rows, dtype, *, batched=False):
+    def standard_layout_width(self, rows, skip_sort):
+        """Columns of the Standard group layout; the width selects the kernel.
+
+        A backend whose routing op sorts experts by token count encodes that in
+        a third column, and reading a two-column layout is how the caller asks
+        it not to sort. The default has no such choice.
+        """
+        return self.standard_layout_columns
+
+    def workspace_spec(self, rows, dtype, *, batched=False, skip_sort=False):
         # rows is expanded Standard capacity (T * topk) or padded Batched rows.
         qdtype = self.activation_dtype
         return MoEWorkspaceSpec(
@@ -213,7 +222,7 @@ class MoEComputeBackend(ABC):
                 "layout": (
                     (
                         self.local_num_experts,
-                        2 if batched else self.standard_layout_columns,
+                        2 if batched else self.standard_layout_width(rows, skip_sort),
                     ),
                     torch.int32,
                 ),

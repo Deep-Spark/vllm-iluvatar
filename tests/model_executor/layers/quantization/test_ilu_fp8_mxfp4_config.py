@@ -62,11 +62,10 @@ def test_mxfp4_experts_use_ilu_method_and_keep_runtime_overlay(
     seen = []
 
     class Method:
-        def __init__(self, moe_config):
-            assert moe_config is layer.moe_config
+        def __init__(self, actual_layer):
+            assert actual_layer is layer
 
-    def select(actual_layer, original, runtime):
-        assert actual_layer is layer
+    def select(original, runtime):
         assert isinstance(original, Method)
         assert runtime is override
         return selected
@@ -75,6 +74,7 @@ def test_mxfp4_experts_use_ilu_method_and_keep_runtime_overlay(
         seen.append(kwargs)
         return override
 
+    monkeypatch.setattr(ilu_mxfp4, "make_mxfp4_method", Method)
     monkeypatch.setattr(ilu_mxfp4, "IluMxfp4MoEMethod", Method)
     monkeypatch.setattr(ilu_mxfp4, "select_mxfp4_method", select)
     monkeypatch.setattr(fp8, "resolve_ilu_runtime_method", resolve)

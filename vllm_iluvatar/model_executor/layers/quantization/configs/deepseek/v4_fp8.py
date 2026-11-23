@@ -91,13 +91,13 @@ class IluDeepseekV4FP8Config(DeepseekV4FP8Config):
             )
             if not skipped and self.moe_quant_algo != "NVFP4":
                 from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp4_moe import (  # noqa: E501
-                    IluMxfp4MoEMethod,
+                    make_mxfp4_method,
                 )
                 from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.config import (
                     resolve_ilu_runtime_method,
                 )
 
-                original = IluMxfp4MoEMethod(layer.moe_config)
+                original = make_mxfp4_method(layer)
                 runtime = resolve_ilu_runtime_method(
                     base_quant_config=self,
                     original_method=original,
@@ -109,7 +109,7 @@ class IluDeepseekV4FP8Config(DeepseekV4FP8Config):
                     select_mxfp4_method,
                 )
 
-                return select_mxfp4_method(layer, original, runtime)
+                return select_mxfp4_method(original, runtime)
         return super().get_quant_method(layer, prefix)
 
     def _int8_linear_method(self, layer: torch.nn.Module, prefix: str):

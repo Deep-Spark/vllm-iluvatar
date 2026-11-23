@@ -30,8 +30,7 @@ from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
     _SWIGLUOAI_VARIANT,
     ilu_mxfp4_fused_experts,
 )
-from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp8_moe import (
-    _SUPPORTED_ACTIVATIONS,
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.nvfp4_moe import (
     _get_ilu_output_scale,
 )
 from vllm_iluvatar.model_executor.layers.quantization.conversions.fp8_to_fp4 import (
@@ -53,6 +52,22 @@ from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.registry impor
 logger = init_logger(__name__)
 
 _DEFAULT_FP8_BLOCK = (128, 128)
+
+# Community activation -> the ixformer SwiGLU variant that reproduces exactly
+# its math. Anything else must fail loudly rather than compute a different
+# activation, so the set is explicit and closed.
+#
+#   swigluoai_uninterleave (MiniMax-M3): packed gate/up halves, ``alpha`` inside
+#       the sigmoid, ``beta`` offset on the up branch. Needs all three of
+#       swiglu_limit / swiglu_alpha / swiglu_beta.
+#   silu + a clamp limit (HY V4): community ``silu_and_mul_with_clamp`` computes
+#       ``silu(clamp(gate, max=limit)) * clamp(up, +-limit)``, which is exactly
+#       ``_DSV4_CLAMP_VARIANT``. HY V4 expresses the clamp purely through
+#       ``swiglu_limit`` and leaves ``activation`` at the "silu" default, so the
+#       limit -- not the activation name -- is what distinguishes it from plain
+#       SwiGLU. alpha/beta must be absent: M3's 1.702 / 1.0 would silently
+#       compute a different activation.
+_SUPPORTED_ACTIVATIONS = frozenset({"swigluoai_uninterleave", "silu"})
 
 # MXFP4 microscaling: 32 e2m1 values share one scale. ``_E2M1_LEVELS`` is the
 # full signed code book indexed by nibble, so quantization is a nearest-level

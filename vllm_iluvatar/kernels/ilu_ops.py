@@ -44,7 +44,9 @@ def rms_norm(
         # Kernel requires a weight tensor; pass ones.
         weight = torch.ones(x.shape[-1], device=x.device, dtype=x.dtype)
     assert variance_size is None
-    out = torch.empty_like(x)
+    # Q/K norm can receive transposed tensors from the Transformers backend.
+    # ixformer accepts strided inputs but requires a contiguous output buffer.
+    out = torch.empty_like(x, memory_format=torch.contiguous_format)
     ixf_ops.rms_norm(x, weight, epsilon, out)
     return out
 

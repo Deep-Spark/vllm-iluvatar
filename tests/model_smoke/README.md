@@ -20,6 +20,9 @@ tests/model_smoke/
 
 通用判定与服务测试放test_runner.py；以后模型专属的功能/正确性测试可放同目录test_<模型家族>.py，并明确其运行入口。Jenkins调度、GPU锁和权重同步工具的单测属于独立CI仓库，避免把基础设施测试复制到产品库。
 
+模型专属入口：[HunyuanOCR 单图验证](HUNYUANOCR.md)。该入口独立运行，
+尚待真实权重验收，不改变上述固定 CI 模型范围。
+
 ## CPU检查与运行入口
 
 ```bash

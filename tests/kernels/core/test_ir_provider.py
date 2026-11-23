@@ -127,3 +127,25 @@ def test_fused_add_rms_norm_matches_native(
     )
     torch.testing.assert_close(ilu_out, ref_out, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(ilu_res, ref_res, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("num_heads", [8, 16])
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("with_weight", [False, True])
+@torch.inference_mode()
+def test_rms_norm_transposed_qk(dtype, num_heads, batched, with_weight):
+    """HunyuanOCR normalizes [batch, heads, tokens, dim] after transposing."""
+    torch.manual_seed(42)
+    x = torch.randn(83, num_heads, 128, dtype=dtype, device="cuda:0").transpose(0, 1)
+    if batched:
+        x = x.unsqueeze(0)
+    assert not x.is_contiguous() and x.stride(-1) == 1
+    before = x.clone()
+    weight = torch.randn(128, dtype=dtype, device=x.device) if with_weight else None
+    out = ir.ops.rms_norm.impls["iluvatar"].impl_fn(x, weight, 1e-5)
+    ref = ir.ops.rms_norm.impls["native"].impl_fn(x, weight, 1e-5)
+    assert out.shape == x.shape and out.dtype == x.dtype
+    assert out.is_contiguous()
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(x, before, atol=0, rtol=0)

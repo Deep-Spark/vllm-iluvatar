@@ -262,3 +262,119 @@ def test_mtp_layer_uses_native_preprocessing_before_projection(monkeypatch, dtyp
     layer.mtp_block = decode
     assert layer(positions, hidden, embedding) is positions
     assert calls == ["native", "projection", "decoder"]
+
+
+CPU = torch.device("cpu")
+
+
+def int8_pair(prefix, rows, cols, seed):
+    generator = torch.Generator().manual_seed(seed)
+    weight = torch.randint(
+        -128, 127, (rows, cols), dtype=torch.int8, generator=generator
+    )
+    scale = torch.rand(rows, 1, generator=generator) + 0.1
+    return [(f"{prefix}.weight", weight), (f"{prefix}.weight_scale", scale)]
+
+
+def reference_dequant(weight, scale):
+    return (weight.to(torch.float32) * scale.to(torch.float32)).to(torch.bfloat16)
+
+
+def test_mtp_dequant_folds_int8_and_leaves_everything_else_alone():
+    from vllm_iluvatar.models.step5.mtp import _dequant_w8a8_dense_mtp_weights
+
+    (name, weight), (scale_name, scale) = int8_pair(
+        "model.layers.92.self_attn.q_proj", 64, 32, 1
+    )
+    passthrough = [
+        ("model.layers.7.mlp.down_proj.weight", weight),
+        ("model.layers.7.mlp.down_proj.weight_scale", scale),
+        ("model.layers.93.eh_proj.weight", torch.randn(8, 4, dtype=torch.bfloat16)),
+        ("model.layers.94.input_layernorm.weight", torch.ones(8)),
+    ]
+    stream = [(name, weight), (scale_name, scale)] + passthrough
+    folded = dict(_dequant_w8a8_dense_mtp_weights(iter(stream), CPU))
+
+    assert scale_name not in folded
+    assert folded[name].dtype is torch.bfloat16
+    assert torch.equal(folded[name], reference_dequant(weight, scale))
+    for other, tensor in passthrough:
+        assert folded[other] is tensor
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("cols", [16, 4096, 4097])
+def test_mtp_dequant_triton_kernel_matches_the_torch_reference(cols):
+    from vllm_iluvatar.models.step5.mtp import _dequant_w8a8_dense_mtp_weights
+
+    (name, weight), (scale_name, scale) = int8_pair(
+        "model.layers.94.mlp.gate_proj", 2048, cols, 2
+    )
+    stream = [(name, weight), (scale_name, scale)]
+    folded = dict(
+        _dequant_w8a8_dense_mtp_weights(iter(stream), torch.device("cuda"))
+    )
+    assert folded[name].device.type == "cuda"
+    assert torch.equal(folded[name].cpu(), reference_dequant(weight, scale))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_mtp_dequant_triton_kernel_handles_a_per_tensor_scale():
+    from vllm_iluvatar.models.step5.mtp import _dequant_w8a8_dense_mtp_weights
+
+    (name, weight), _ = int8_pair("model.layers.93.self_attn.o_proj", 1024, 256, 7)
+    scale = torch.tensor(0.0123)
+    stream = [(name, weight), (name + "_scale", scale)]
+    folded = dict(
+        _dequant_w8a8_dense_mtp_weights(iter(stream), torch.device("cuda"))
+    )
+    assert torch.equal(folded[name].cpu(), reference_dequant(weight, scale))
+
+
+@pytest.mark.parametrize("scale_first", [False, True])
+def test_mtp_dequant_streams_instead_of_materialising_the_checkpoint(scale_first):
+    from vllm_iluvatar.models.step5.mtp import _dequant_w8a8_dense_mtp_weights
+
+    pair = int8_pair("model.layers.92.mlp.up_proj", 32, 16, 3)
+    if scale_first:
+        pair.reverse()
+    stream = [("model.layers.0.mlp.down_proj.weight", torch.ones(4))] + pair
+    pulled = 0
+
+    def source():
+        nonlocal pulled
+        for item in stream:
+            pulled += 1
+            yield item
+
+    results = _dequant_w8a8_dense_mtp_weights(source(), CPU)
+    assert next(results) == stream[0] and pulled == 1
+    assert next(results)[0] == "model.layers.92.mlp.up_proj.weight" and pulled == 3
+    assert list(results) == []
+
+
+def test_mtp_dequant_passes_through_unpaired_halves_and_rejects_bad_shapes():
+    from vllm_iluvatar.models.step5.mtp import _dequant_w8a8_dense_mtp_weights
+
+    orphan_weight = torch.ones(8, 4, dtype=torch.int8)
+    orphan_scale = torch.ones(8, 1)
+    unpaired = dict(
+        _dequant_w8a8_dense_mtp_weights(
+            iter(
+                [
+                    ("model.layers.92.self_attn.k_proj.weight", orphan_weight),
+                    ("model.layers.93.self_attn.v_proj.weight_scale", orphan_scale),
+                ]
+            ),
+            CPU,
+        )
+    )
+    assert unpaired["model.layers.92.self_attn.k_proj.weight"] is orphan_weight
+    assert unpaired["model.layers.93.self_attn.v_proj.weight_scale"] is orphan_scale
+
+    mismatched = [
+        ("model.layers.92.mlp.down_proj.weight", orphan_weight),
+        ("model.layers.92.mlp.down_proj.weight_scale", torch.ones(5, 3)),
+    ]
+    with pytest.raises(RuntimeError, match="dequant shape mismatch"):
+        list(_dequant_w8a8_dense_mtp_weights(iter(mismatched), CPU))

@@ -8,6 +8,8 @@ import copy
 from collections.abc import Iterable
 
 import torch
+import triton
+import triton.language as tl
 from torch import nn
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -21,6 +23,9 @@ from .logits import Step5LogitsProcessor
 from .model import Step5DecoderLayer, Step5RMSNorm, _checkpoint_parameter_audit
 from .native_layers import Step5VocabParallelEmbedding
 from .runtime_contract import validate_step5_runtime
+
+_MTP_DENSE_LAYERS = (92, 93, 94)
+_DEQUANT_COLS_PER_BLOCK = 1024
 
 
 def draft_decoder_config(vllm_config: VllmConfig) -> VllmConfig:
@@ -213,7 +218,8 @@ class Step5MTP(_Step3p5MTP):
         # Draft construction clears quant_config (BF16 dense MTP). W4A8 kits still
         # store INT8 dense linears + weight_scale for layers 92–94; fold those into
         # BF16 before the community Step3.5 MTP loader runs.
-        loaded = super().load_weights(_dequant_w8a8_dense_mtp_weights(weights))
+        device = next(self.parameters()).device
+        loaded = super().load_weights(_dequant_w8a8_dense_mtp_weights(weights, device))
         expected, _ = _checkpoint_parameter_audit(self)
         missing = expected - loaded
         if missing:
@@ -223,44 +229,112 @@ class Step5MTP(_Step3p5MTP):
         return loaded
 
 
+@triton.jit
+def _dequant_int8_kernel(
+    WEIGHT,
+    SCALE,
+    OUT,
+    cols,
+    PER_ROW: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    live = col < cols
+    index = row * cols + col
+    value = tl.load(WEIGHT + index, live, other=0).to(tl.float32)
+    scale = tl.load(SCALE + row) if PER_ROW else tl.load(SCALE)
+    tl.store(OUT + index, (value * scale).to(tl.bfloat16), live)
+
+
+def _fold_int8_weight(
+    weight_name: str, weight: torch.Tensor, scale: torch.Tensor, device: torch.device
+) -> torch.Tensor:
+    """Dequantize one INT8 checkpoint weight into BF16 for the draft."""
+    try:
+        torch.broadcast_shapes(weight.shape, scale.shape)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Step5 MTP W8A8 dequant shape mismatch for {weight_name}: "
+            f"weight {tuple(weight.shape)} vs scale {tuple(scale.shape)}"
+        ) from exc
+    rows = weight.shape[0] if weight.dim() == 2 else 0
+    per_row = bool(rows) and scale.numel() == rows
+    if device.type != "cuda" or not rows or not (per_row or scale.numel() == 1):
+        return (weight.to(torch.float32) * scale.to(torch.float32)).to(torch.bfloat16)
+    # One pass on device: INT8 in, BF16 out, no host float32 copy and no upload
+    # of the widened weight. The parameter this feeds is already on `device`.
+    cols = weight.shape[1]
+    source = weight.contiguous().to(device)
+    factor = scale.reshape(-1).to(device=device, dtype=torch.float32)
+    out = torch.empty((rows, cols), dtype=torch.bfloat16, device=device)
+    _dequant_int8_kernel[(rows, triton.cdiv(cols, _DEQUANT_COLS_PER_BLOCK))](
+        source,
+        factor,
+        out,
+        cols,
+        PER_ROW=per_row,
+        BLOCK=_DEQUANT_COLS_PER_BLOCK,
+    )
+    return out
+
+
 def _dequant_w8a8_dense_mtp_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
+    device: torch.device,
 ) -> Iterable[tuple[str, torch.Tensor]]:
     """Fold INT8 + weight_scale MTP dense tensors into BF16 for the draft.
 
     Only layers 92–94 are rewritten. Other checkpoint tensors pass through
     unchanged so MoE / target-only W8A8 shards are not reinterpreted here.
+
+    Each tensor is forwarded as soon as it is known to need no rewrite, so the
+    checkpoint is never held in memory at once. Only one half of an unmatched
+    weight / weight_scale pair is buffered.
     """
-    materialised = list(weights)
-    by_name = {name: tensor for name, tensor in materialised}
-    dequanted: dict[str, torch.Tensor] = {}
-    drop: set[str] = set()
-    for name, scale in materialised:
-        if not name.endswith(".weight_scale"):
+    pending_weights: dict[str, torch.Tensor] = {}
+    pending_scales: dict[str, torch.Tensor] = {}
+
+    for name, tensor in weights:
+        if name.endswith(".weight_scale"):
+            stem = name[: -len("weight_scale")]
+            is_scale = True
+        elif name.endswith(".weight"):
+            stem = name[: -len("weight")]
+            is_scale = False
+        else:
+            yield name, tensor
             continue
-        if not any(f".layers.{index}." in name for index in (92, 93, 94)):
+
+        if not any(f".layers.{index}." in name for index in _MTP_DENSE_LAYERS):
+            yield name, tensor
             continue
-        weight_name = name[: -len("weight_scale")] + "weight"
-        weight = by_name.get(weight_name)
-        if weight is None or weight.dtype != torch.int8:
+
+        if is_scale:
+            weight = pending_weights.pop(stem, None)
+            if weight is None:
+                pending_scales[stem] = tensor
+                continue
+            weight_name = stem + "weight"
+            yield weight_name, _fold_int8_weight(weight_name, weight, tensor, device)
             continue
-        try:
-            torch.broadcast_shapes(weight.shape, scale.shape)
-        except RuntimeError as exc:
-            raise RuntimeError(
-                f"Step5 MTP W8A8 dequant shape mismatch for {weight_name}: "
-                f"weight {tuple(weight.shape)} vs scale {tuple(scale.shape)}"
-            ) from exc
-        dq = weight.to(torch.float32) * scale.to(dtype=torch.float32)
-        dequanted[weight_name] = dq.to(torch.bfloat16)
-        drop.add(name)
-        drop.add(weight_name)
-    for name, tensor in materialised:
-        if name in drop:
-            if name in dequanted:
-                yield name, dequanted[name]
+
+        if tensor.dtype != torch.int8:
+            yield name, tensor
+            scale = pending_scales.pop(stem, None)
+            if scale is not None:
+                yield stem + "weight_scale", scale
             continue
-        yield name, tensor
+        scale = pending_scales.pop(stem, None)
+        if scale is None:
+            pending_weights[stem] = tensor
+            continue
+        yield name, _fold_int8_weight(name, tensor, scale, device)
+
+    for stem, tensor in pending_weights.items():
+        yield stem + "weight", tensor
+    for stem, tensor in pending_scales.items():
+        yield stem + "weight_scale", tensor
 
 
 def register_model():

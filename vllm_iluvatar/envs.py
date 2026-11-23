@@ -43,6 +43,10 @@ def _bool_reader(name: str, default: str) -> Callable[[], bool]:
     return lambda: os.environ.get(name, default).strip().lower() in _TRUE_VALS
 
 
+# The startup hook reads this gate before vllm.envs is initialized.
+fly_rejection_enabled = _bool_reader("VLLM_ILU_ENABLE_FLY_REJECTION", "0")
+
+
 def _int_reader(
     name: str,
     default: int,
@@ -799,6 +803,7 @@ for _alias in ("VLLM_ILU_V41_PREFILL_FUSED_Q", "VLLM_V41_PREFILL_FUSED_Q"):
 #   VLLM_ILUVATAR_ENABLE_STARTUP_PATCH
 #       -> vllm_iluvatar/__init__.py (STARTUP_PATCH_ENV)
 _ILU_GUARD_ENV_VARS: dict[str, Callable[[], Any]] = {
+    "VLLM_ILU_ENABLE_FLY_REJECTION": fly_rejection_enabled,
     "VLLM_ILU_TOP_P_BF16_SORT": _bool_reader("VLLM_ILU_TOP_P_BF16_SORT", "1"),
     "VLLM_ILU_TOP_P_BF16_HIST": _bool_reader("VLLM_ILU_TOP_P_BF16_HIST", "0"),
     "VLLM_ILU_PD_PREFILL_KV_ONLY": _bool_reader("VLLM_ILU_PD_PREFILL_KV_ONLY", "1"),

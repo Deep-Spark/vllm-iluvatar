@@ -12,7 +12,7 @@ IluWorker — subclass of the community Worker with following overrides:
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import partial
 
 import torch
@@ -84,6 +84,15 @@ def _pcp_profile_local_tokens(num_tokens: int, pcp_size: int, max_num_reqs: int)
 
 class IluWorker(Worker):
     def _scoped_allocator_max_split(self, max_split_size_mb: int):
+        # CoreX 5.1 torch_iluvatar replaces torch.cuda.memory but does not
+        # expose the allocator-backend query. The upstream split-size scope
+        # is optional; preserve the allocator's existing settings in that case.
+        if not callable(getattr(torch.cuda.memory, "get_allocator_backend", None)):
+            logger.warning(
+                "Allocator backend query unavailable; keeping existing "
+                "allocator split settings during model loading."
+            )
+            return nullcontext()
         if (
             max_split_size_mb == 20
             and self.parallel_config.pipeline_parallel_size > 1

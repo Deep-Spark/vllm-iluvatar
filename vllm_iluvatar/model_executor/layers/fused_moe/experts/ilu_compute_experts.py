@@ -20,10 +20,12 @@ class _IluComputeExperts(FusedMoEExpertsModular):
         quant_config,
         max_num_tokens,
         num_dispatchers,
+        layer=None,
     ):
         super().__init__(moe_config, quant_config, max_num_tokens, num_dispatchers)
         self.backend = backend
         self.weights = weights
+        self.layer = layer
         self.local_num_experts = backend.local_num_experts
 
     @staticmethod
@@ -175,8 +177,16 @@ class IluStandardComputeExperts(_IluComputeExperts):
     ):
         if apply_router_weight_on_input:
             raise NotImplementedError("Original MXFP4 computes TopK weights on output")
+        # Local import: the layer-side policy lives on the quantization side,
+        # which imports this module.
+        from vllm_iluvatar.model_executor.layers.quantization.common.moe_compute_binding import (  # noqa: E501
+            decode_skip_sort,
+        )
+
         workspace = self.backend.workspace_spec(
-            topk_ids.numel(), output.dtype
+            topk_ids.numel(),
+            output.dtype,
+            skip_sort=self.layer is not None and decode_skip_sort(self.layer),
         ).allocate(hidden_states.device)
         self.backend.run_standard(
             hidden_states,
@@ -190,7 +200,9 @@ class IluStandardComputeExperts(_IluComputeExperts):
         return output
 
 
-def bind_compute_experts(backend, weights, moe_config, quant_config, prepare_finalize):
+def bind_compute_experts(
+    backend, weights, moe_config, quant_config, prepare_finalize, layer=None
+):
     """Bind only supported communication formats to the same per-layer backend."""
     fmt = prepare_finalize.activation_format
     if fmt == FusedMoEActivationFormat.BatchedExperts:
@@ -203,4 +215,4 @@ def bind_compute_experts(backend, weights, moe_config, quant_config, prepare_fin
         cls, capacity, dispatchers = IluStandardComputeExperts, None, None
     else:
         raise NotImplementedError(f"Unsupported communication activation format {fmt}")
-    return cls(backend, weights, moe_config, quant_config, capacity, dispatchers)
+    return cls(backend, weights, moe_config, quant_config, capacity, dispatchers, layer)

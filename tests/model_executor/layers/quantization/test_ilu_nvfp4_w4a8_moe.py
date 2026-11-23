@@ -5,7 +5,7 @@ The load-bearing claim is that NVFP4 restated as block-FP8 on a ``[1, 16]``
 grid is the *same tensor*, not an approximation: e2m1 magnitudes are exact in
 float8_e4m3fn and the two scale levels multiply into one. These tests pin that
 restatement, the conversion against the converter's own reference, and the
-ivcore11-only dispatch.
+properties of the shared method that the W4A8 target depends on.
 """
 
 import pytest
@@ -170,40 +170,6 @@ def test_whole_w13_conversion_equals_converting_the_halves():
     torch.testing.assert_close(whole_scale, split_scale, rtol=0, atol=0)
 
 
-def test_ivcore11_claims_nvfp4_experts(monkeypatch):
-    from vllm.model_executor.layers.fused_moe import RoutedExperts
-
-    from vllm_iluvatar.ilu_util import arch
-    from vllm_iluvatar.model_executor.layers.quantization.backends.nvfp4.moe import (
-        IluModelOptNvFp4ToW4A8MoEMethod,
-        nvfp4_w4a8_moe_method,
-    )
-
-    class _Config:
-        excluded = ()
-
-        def is_layer_excluded(self, prefix):
-            return prefix in self.excluded
-
-    layer = object.__new__(RoutedExperts)
-    layer.moe_config = object()
-    config = _Config()
-    monkeypatch.setattr(
-        IluModelOptNvFp4ToW4A8MoEMethod, "__init__", lambda s, c, m, **kw: None
-    )
-
-    monkeypatch.setattr(arch, "cuda_arch", lambda: "ivcore30")
-    assert nvfp4_w4a8_moe_method(config, layer, "experts") is None
-
-    monkeypatch.setattr(arch, "cuda_arch", lambda: "ivcore11")
-    assert isinstance(
-        nvfp4_w4a8_moe_method(config, layer, "experts"), IluModelOptNvFp4ToW4A8MoEMethod
-    )
-    assert nvfp4_w4a8_moe_method(config, torch.nn.Linear(4, 4), "dense") is None
-    config.excluded = ("experts",)
-    assert nvfp4_w4a8_moe_method(config, layer, "experts") is None
-
-
 def test_class_name_still_selects_the_modelopt_loading_protocol():
     """``ilu_routed_experts.weight_loader`` dispatches NVFP4 on the class name.
 
@@ -213,25 +179,40 @@ def test_class_name_still_selects_the_modelopt_loading_protocol():
     raises "quant method must be one of ..." because community's
     ``create_weights`` attaches no ``quant_method`` attribute to it.
     """
-    from vllm_iluvatar.model_executor.layers.quantization.backends.nvfp4.moe import (
-        IluModelOptNvFp4ToW4A8MoEMethod,
-    )
-
-    assert "ModelOpt" in IluModelOptNvFp4ToW4A8MoEMethod.__name__
-
-
-def test_w4a8_subclass_relaxes_the_ix30_k_alignment():
     from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.nvfp4_moe import (
         IluModelOptNvFp4MoEMethod,
     )
-    from vllm_iluvatar.model_executor.layers.quantization.backends.nvfp4.moe import (
-        IluModelOptNvFp4ToW4A8MoEMethod,
+
+    assert "ModelOpt" in IluModelOptNvFp4MoEMethod.__name__
+
+
+def test_k_alignment_follows_the_conversion_target(default_vllm_config):
+    """The requirement is the converter's, so it moves with the selection."""
+    from vllm_iluvatar.ilu_util.arch import cuda_arch
+    from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.nvfp4_moe import (
+        IluModelOptNvFp4MoEMethod,
     )
 
-    assert IluModelOptNvFp4MoEMethod.k_alignment == 256
-    assert IluModelOptNvFp4ToW4A8MoEMethod.k_alignment == 32
-    # The mixin must win over the ix30 method for everything post-conversion.
-    assert IluModelOptNvFp4ToW4A8MoEMethod.get_fused_moe_quant_config is not (
-        IluModelOptNvFp4MoEMethod.get_fused_moe_quant_config
+    method = object.__new__(IluModelOptNvFp4MoEMethod)
+    method.selection = None
+    assert method.k_alignment == (256 if cuda_arch() == "ivcore30" else 32)
+
+
+def test_the_post_conversion_lifecycle_comes_from_the_mixin():
+    """Nothing after the conversion may stay NVFP4-specific."""
+    from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.nvfp4_moe import (
+        IluModelOptNvFp4MoEMethod,
     )
-    assert IluModelOptNvFp4ToW4A8MoEMethod.apply is not IluModelOptNvFp4MoEMethod.apply
+    from vllm_iluvatar.model_executor.layers.quantization.common.moe_compute_binding import (
+        MoEComputeBindingMixin,
+    )
+
+    for name in (
+        "apply",
+        "get_fused_moe_quant_config",
+        "maybe_make_prepare_finalize",
+        "select_gemm_impl",
+    ):
+        assert getattr(IluModelOptNvFp4MoEMethod, name) is getattr(
+            MoEComputeBindingMixin, name
+        )

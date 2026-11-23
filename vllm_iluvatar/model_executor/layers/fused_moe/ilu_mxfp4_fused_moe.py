@@ -11,7 +11,8 @@ Why      : none of the community MXFP4 MoE backends (TRTLLM / DeepGEMM / Marlin 
            the compute. Keeping it in a standalone function -- rather than inside
            the quant method -- mirrors ``fused_moe.py::ilu_w16a16_fused_experts``
            and lets several MXFP4 methods share one implementation.
-How      : callers (currently ``IluMxfp4MoEMethod.apply``) call
+How      : callers (currently the runtime-quant MoE methods and V4.1's packed
+           decode dispatch) call
            ``ilu_mxfp4_fused_experts`` with explicit tensors. The signature takes
            no ``layer`` and no ``RoutedExperts`` attribute names, so a future
            GPT-OSS-MXFP4 or compressed-tensors-W4A4-MXFP4 method only has to
@@ -301,7 +302,7 @@ _VALID_SWIGLU_VARIANTS = (
 # i.e. plain ``silu(gate) * up``, and are deliberately NOT MiniMax-M3's values:
 # otherwise a caller that forgets to thread alpha/beta silently gets M3's
 # activation applied to some other checkpoint. Callers that require the real
-# values guard for ``None`` themselves (see ``IluMxFp8FusedMoE.apply``).
+# values guard for ``None`` themselves.
 _SWIGLUOAI_ALPHA = 1.0
 _SWIGLUOAI_BETA = 0.0
 

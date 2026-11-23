@@ -119,11 +119,28 @@ def test_swigluoai_is_admitted_only_with_the_baked_coefficients(
         assert error is not None and rejected_for in error
 
 
-def test_swigluoai_stays_unsupported_on_ixmm():
-    error = _support_error(
-        "ivcore30", "ixmm_fp4fp8", "fp4fp8", activation="swigluoai_uninterleave"
+def test_ixmm_takes_swigluoai_only_in_the_packed_form_and_only_clamped():
+    """Its op reads packed halves and takes alpha/beta, unlike IxInfer's."""
+    assert (
+        _support_error(
+            "ivcore30", "ixmm_fp4fp8", "fp4fp8", activation="swigluoai_uninterleave"
+        )
+        is None
     )
-    assert "does not support activation" in error
+    # The interleaved variant is a different memory layout, not a coefficient
+    # difference, so it must stay out rather than be reinterpreted.
+    assert "does not support activation" in _support_error(
+        "ivcore30", "ixmm_fp4fp8", "fp4fp8", activation="swigluoai"
+    )
+    # Every other activation here treats a missing limit as "no clamp"; this
+    # one has no unclamped form.
+    assert "clamp limit" in _support_error(
+        "ivcore30",
+        "ixmm_fp4fp8",
+        "fp4fp8",
+        activation="swigluoai_uninterleave",
+        limit=None,
+    )
 
 
 def _ixinfer_backend(activation, rows=32, intermediate=384):
@@ -210,6 +227,55 @@ def test_registration_and_explicit_priority(monkeypatch):
     # Import/dict order cannot change selection.
     monkeypatch.setattr(mod, "_BACKENDS", dict(reversed(list(mod._BACKENDS.items()))))
     assert mod.select_moe_backend("ivcore30").name == "test_extra"
+
+
+def test_only_small_ixmm_batches_may_skip_the_expert_sort():
+    """The group layout's width is how the caller asks for an unsorted route."""
+    import torch
+
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+        MoEComputeConfig,
+    )
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_ixmm_fp4fp8 import (
+        IxMMFP4FP8Backend,
+    )
+
+    def columns(rows, skip_sort):
+        backend = IxMMFP4FP8Backend(
+            MoEComputeConfig(512, 256, 2, 4, limit=10.0),
+            select_moe_backend("ivcore30"),
+        )
+        spec = backend.workspace_spec(rows, torch.bfloat16, skip_sort=skip_sort)
+        return spec.buffers["layout"][0][1]
+
+    assert columns(8, True) == 2
+    assert columns(8, False) == 3
+    # Past the bound the sort repays itself, so the opt-in is ignored.
+    assert columns(257, True) == 3
+    # IxInfer never sorts, so asking changes nothing there.
+    assert (
+        _ixinfer_backend("silu").workspace_spec(8, torch.bfloat16).buffers["layout"][0]
+        == _ixinfer_backend("silu")
+        .workspace_spec(8, torch.bfloat16, skip_sort=True)
+        .buffers["layout"][0]
+    )
+
+
+def test_decode_tile_mode_is_opt_in_and_shape_matched(monkeypatch):
+    from vllm_iluvatar import envs
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_ixmm_fp4fp8 import (
+        IxMMFP4FP8Backend,
+    )
+
+    mode = IxMMFP4FP8Backend._decode_mode
+    monkeypatch.setattr(envs, "VLLM_ILU_V41_DECODE_MOE_MODE1", True)
+    assert mode(768, 5120, 6) == 1
+    # Every part of the shape the tiling was measured on has to hold.
+    assert mode(769, 5120, 6) is None
+    assert mode(768, 4096, 6) is None
+    assert mode(768, 5120, 8) is None
+    monkeypatch.setattr(envs, "VLLM_ILU_V41_DECODE_MOE_MODE1", False)
+    assert mode(768, 5120, 6) is None
 
 
 def test_runtime_weights_validate_format_and_alias_parameters():
@@ -385,8 +451,9 @@ def test_standard_adapter_passes_caller_output_without_copy():
 
     adapter = object.__new__(IluStandardComputeExperts)
     adapter.weights = object()
+    adapter.layer = None
     adapter.backend = SimpleNamespace(
-        run_standard=run, workspace_spec=lambda *args: MoEWorkspaceSpec({})
+        run_standard=run, workspace_spec=lambda *args, **kwargs: MoEWorkspaceSpec({})
     )
     result = adapter.apply(
         output,

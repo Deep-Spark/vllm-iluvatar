@@ -21,9 +21,7 @@ from vllm_iluvatar.models.deepseek_v4 import model as mod
 
 
 def make_moe(monkeypatch, kind, hash_layer=True):
-    method = object.__new__(
-        IluMxfp4MoEMethod if kind == "native" else IluMxfp4ToW4A8TNOnlineMoEMethod
-    )
+    method = object.__new__(IluMxfp4ToW4A8TNOnlineMoEMethod)
     if kind in ("ixinfer_w4a8", "ixmm_w4a8", "ixmm_fp4fp8"):
         method = IluMxfp4MoEMethod(
             SimpleNamespace(max_capture_size=32),
@@ -66,7 +64,7 @@ def make_moe(monkeypatch, kind, hash_layer=True):
 
 @pytest.mark.parametrize(
     "kind",
-    ["native", "converted", "wrapped", "ixinfer_w4a8", "ixmm_w4a8", "ixmm_fp4fp8"],
+    ["converted", "wrapped", "ixinfer_w4a8", "ixmm_w4a8", "ixmm_fp4fp8"],
 )
 @pytest.mark.parametrize("eligible", [False, True])
 @pytest.mark.parametrize("hash_layer", [False, True])
@@ -74,7 +72,7 @@ def test_method_admission_and_forward(monkeypatch, kind, eligible, hash_layer):
     moe, runner, init = make_moe(monkeypatch, kind, hash_layer)
     # Independent W4A8 must keep the same communication path as converted
     # W4A8 without inheriting its compute class. FP4FP8 keeps the native path.
-    prefers_hybrid = kind not in ("native", "ixmm_fp4fp8")
+    prefers_hybrid = kind != "ixmm_fp4fp8"
     assert init.call_count == prefers_hybrid
     assert moe._ilu_decode_ll is False
     guard = Mock(return_value=eligible)
@@ -104,12 +102,12 @@ def test_method_admission_and_forward(monkeypatch, kind, eligible, hash_layer):
         assert routed_ids is None
 
 
-def test_native_mxfp4_decode_ll_override(monkeypatch):
+def test_fp4fp8_decode_ll_override(monkeypatch):
     monkeypatch.setattr(mod, "_DECODE_EP_BACKEND", "deepep_low_latency")
     monkeypatch.setattr(
         mod.IluDeepseekV4Fp8MoE, "_should_use_forward_dp_ep", lambda self: True
     )
-    moe, runner, init = make_moe(monkeypatch, "native", hash_layer=False)
+    moe, runner, init = make_moe(monkeypatch, "ixmm_fp4fp8", hash_layer=False)
     assert init.call_count == 1
     assert moe._ilu_decode_ll is True
     low_latency = Mock(return_value=torch.full((2, 8), 9.0))
@@ -123,7 +121,7 @@ def test_native_mxfp4_decode_ll_override(monkeypatch):
     runner.assert_not_called()
 
 
-@pytest.mark.parametrize("kind", ["native", "converted"])
+@pytest.mark.parametrize("kind", ["ixmm_fp4fp8", "converted"])
 def test_hash_routing_requires_input_ids(monkeypatch, kind):
     moe, runner, _ = make_moe(monkeypatch, kind)
     with pytest.raises(ValueError, match="requires input_ids"):

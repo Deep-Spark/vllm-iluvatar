@@ -1125,8 +1125,8 @@ def test_skip_sort_is_model_opt_in(
 ):
     from types import SimpleNamespace
 
-    from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp4_moe import (
-        _v41_decode_skip_sort,
+    from vllm_iluvatar.model_executor.layers.quantization.common.moe_compute_binding import (
+        decode_skip_sort,
     )
 
     monkeypatch.setenv("VLLM_ILU_V41_MOE_SKIP_SORT", str(int(enabled)))
@@ -1140,4 +1140,4 @@ def test_skip_sort_is_model_opt_in(
     )
     monkeypatch.setattr("vllm.forward_context.get_forward_context", lambda: ctx)
     layer = SimpleNamespace(_ilu_v41_skip_sort_supported=v41)
-    assert _v41_decode_skip_sort(layer) == expected
+    assert decode_skip_sort(layer) == expected

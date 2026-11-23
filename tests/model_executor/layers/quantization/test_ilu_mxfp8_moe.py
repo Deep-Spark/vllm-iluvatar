@@ -207,11 +207,13 @@ def test_native_load_matches_the_converter_reference(tmp_path, tp, ep):
 
 def test_loader_rejects_foreign_contracts_and_grids():
     spec = BlockFp8LoadSpec(2, 256, 256, MXFP8_BLOCK_SHAPE)
-    ixmm = MoEWeightSpec("ixmm_w4a8_nn", "NN", torch.int8)
+    unknown = MoEWeightSpec("ixinfer_w4a8_nn_v1", "NN", torch.int8)
     with pytest.raises(ValueError, match="No MXFP8 loader"):
-        make_mxfp8_loader(ixmm, spec)
+        make_mxfp8_loader(unknown, spec)
     # The spec must match the contract exactly, code multiplier included: the
     # IxInfer kernel applies 18 itself, so a spec without it would double it.
+    # ``ixmm_w4a8_nn`` is a real contract whose kernel does not, which is why
+    # the multiplier cannot be waved through on the format id alone.
     without_multiplier = MoEWeightSpec("ixinfer_w4a8_nn_v2", "NN", torch.int8)
     with pytest.raises(ValueError, match="No MXFP8 loader"):
         make_mxfp8_loader(without_multiplier, spec)
@@ -229,70 +231,55 @@ def test_weight_spec_carries_the_kernel_applied_multiplier():
     assert loader.source_scale_dtypes == (torch.uint8,)
 
 
-def test_ivcore11_claims_mxfp8_experts_under_both_tagging_conventions(monkeypatch):
-    from vllm.model_executor.layers.fused_moe import RoutedExperts
-
-    from vllm_iluvatar.ilu_util import arch
-    from vllm_iluvatar.model_executor.layers.quantization.backends.mxfp8.moe import (
-        IluMxFp8ToW4A8MoEMethod,
-        mxfp8_w4a8_moe_method,
+def test_every_block_fp8_target_is_reachable_from_mxfp8():
+    """The two sources differ only in the scale encoding, so a target either
+    loader can produce must not depend on which one the checkpoint picked."""
+    from vllm_iluvatar.model_executor.layers.quantization.common.block_fp8_loader import (
+        make_block_fp8_loader,
+    )
+    from vllm_iluvatar.model_executor.layers.quantization.common.mxfp8_loader import (
+        MxFp8ToFP4FP8Loader,
+        MxFp8ToW4A8Loader,
     )
 
-    class _Config:
-        excluded = ()
-
-        def is_layer_excluded(self, prefix):
-            return prefix in self.excluded
-
-    layer = object.__new__(RoutedExperts)
-    layer.moe_config = object()
-    config = _Config()
-    created = []
-    monkeypatch.setattr(
-        IluMxFp8ToW4A8MoEMethod,
-        "__init__",
-        lambda s, c, layer: created.append((c, layer)),
-    )
-
-    monkeypatch.setattr(arch, "cuda_arch", lambda: "ivcore30")
-    assert mxfp8_w4a8_moe_method(config, layer, "experts") is None
-
-    monkeypatch.setattr(arch, "cuda_arch", lambda: "ivcore11")
-    assert isinstance(
-        mxfp8_w4a8_moe_method(config, layer, "experts"), IluMxFp8ToW4A8MoEMethod
-    )
-    assert mxfp8_w4a8_moe_method(config, torch.nn.Linear(4, 4), "dense") is None
-    config.excluded = ("experts",)
-    assert mxfp8_w4a8_moe_method(config, layer, "experts") is None
+    spec = BlockFp8LoadSpec(2, 256, 256, MXFP8_BLOCK_SHAPE)
+    targets = {
+        "ixinfer_w4a8_nn_v2": (NN_SPEC, MxFp8ToW4A8Loader),
+        "ixmm_w4a8_nn": (
+            MoEWeightSpec("ixmm_w4a8_nn", "NN", torch.int8),
+            MxFp8ToW4A8Loader,
+        ),
+        "ixmm_fp4fp8": (
+            MoEWeightSpec(
+                "ixmm_fp4fp8", "fp4fp8", torch.uint8, scale_group_size=256, alignment=32
+            ),
+            MxFp8ToFP4FP8Loader,
+        ),
+    }
+    for weight_spec, expected in targets.values():
+        loader = make_mxfp8_loader(weight_spec, spec)
+        assert isinstance(loader, expected)
+        # Same target, same conversion: only the source decode may differ.
+        assert isinstance(loader, type(make_block_fp8_loader(weight_spec, spec)))
+        # Every target reads the same source, so the decode must not have forked.
+        assert loader.scale_parameter_name == "weight_scale"
+        assert loader.source_scale_dtypes == (torch.uint8,)
 
 
-def test_both_mxfp8_configs_route_experts_through_the_gate(monkeypatch):
-    """Neither tagging convention may reach the ix30 ``FusedMoEMethodCls``."""
+def test_both_mxfp8_configs_share_one_expert_method():
+    """Neither tagging convention may grow its own expert class again."""
     from vllm_iluvatar.model_executor.layers.quantization import (
         _registration,  # noqa: F401
     )
-    from vllm_iluvatar.model_executor.layers.quantization.configs import (
-        mxfp8 as minimax,
+    from vllm_iluvatar.model_executor.layers.quantization.backends.mxfp8.moe import (
+        IluMxFp8MoEMethod,
     )
-    from vllm_iluvatar.model_executor.layers.quantization.configs.modelopt import (
-        mxfp8 as modelopt,
+    from vllm_iluvatar.model_executor.layers.quantization.configs.modelopt.mxfp8 import (
+        IluModelOptMxFp8Config,
+    )
+    from vllm_iluvatar.model_executor.layers.quantization.configs.mxfp8 import (
+        IluMxFp8Config,
     )
 
-    sentinel = object()
-    pairs = (
-        (minimax, minimax.IluMxFp8Config),
-        (modelopt, modelopt.IluModelOptMxFp8Config),
-    )
-    for module, config_cls in pairs:
-        monkeypatch.setattr(
-            module, "mxfp8_w4a8_moe_method", lambda c, layer, p: sentinel
-        )
-        monkeypatch.setattr(
-            module, "mxfp8_int8_linear_method", lambda c, layer, p: None
-        )
-        config = object.__new__(config_cls)
-        config.moe_quant_algo = "MXFP8"
-        monkeypatch.setattr(
-            config_cls, "is_layer_excluded", lambda self, prefix: False, raising=False
-        )
-        assert config.get_quant_method(object(), "experts") is sentinel
+    assert IluMxFp8Config.FusedMoEMethodCls is IluMxFp8MoEMethod
+    assert IluModelOptMxFp8Config.FusedMoEMethodCls is IluMxFp8MoEMethod

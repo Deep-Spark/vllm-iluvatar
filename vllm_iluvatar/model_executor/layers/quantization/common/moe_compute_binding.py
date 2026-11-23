@@ -71,6 +71,37 @@ def get_ilu_output_scale(layer):
     return getattr(layer, "_ilu_output_scale", 1.0)
 
 
+def decode_skip_sort(layer) -> bool:
+    """Whether this step may route without sorting experts by token count.
+
+    Opt-in per model (DeepSeek-V4.1 sets ``_ilu_v41_skip_sort_supported`` on
+    its routed experts) and per deployment, and only for a step that carries
+    no prefill: the sort exists to schedule heavy experts first, which is
+    worth its kernel only once the GEMMs are large. The backend applies its
+    own row bound on top; this answers the question the layer owns.
+    """
+    from vllm_iluvatar import envs
+
+    if not (
+        getattr(layer, "_ilu_v41_skip_sort_supported", False)
+        and envs.VLLM_ILU_V41_MOE_SKIP_SORT
+    ):
+        return False
+    from vllm.forward_context import get_forward_context
+
+    ctx = get_forward_context()
+    if ctx.dp_metadata is not None:
+        return ctx.dp_metadata.all_ranks_decode_only
+    metadata = ctx.attn_metadata
+    if not isinstance(metadata, dict) or not metadata:
+        return False
+    return all(
+        getattr(value, "num_prefill_tokens", None) == 0
+        and getattr(value, "num_decode_tokens", 0) > 0
+        for value in metadata.values()
+    )
+
+
 class MoEComputeBindingMixin:
     """Select a backend, bind the converted weights, run them."""
 
@@ -176,6 +207,7 @@ class MoEComputeBindingMixin:
             self.moe,
             self.moe_quant_config,
             prepare_finalize,
+            layer,
         )
 
     def apply(
@@ -235,7 +267,7 @@ class MoEComputeBindingMixin:
             else None
         )
         workspace = self._compute.workspace_spec(
-            topk_ids.numel(), output_dtype
+            topk_ids.numel(), output_dtype, skip_sort=decode_skip_sort(layer)
         ).allocate(x.device)
         return self._compute.run_standard(
             x,

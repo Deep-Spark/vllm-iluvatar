@@ -113,8 +113,8 @@ class IxInferW4A8Backend(MoEComputeBackend):
     # [ILU override] MoEComputeBackend.workspace_spec -- delta: SwiGLU-OAI needs
     # a second [rows, 2I] buffer, because its op reads interleaved gate/up pairs
     # while the grouped GEMM writes packed halves.
-    def workspace_spec(self, rows, dtype, *, batched=False):
-        spec = super().workspace_spec(rows, dtype, batched=batched)
+    def workspace_spec(self, rows, dtype, *, batched=False, skip_sort=False):
+        spec = super().workspace_spec(rows, dtype, batched=batched, skip_sort=skip_sort)
         if self.config.activation not in _SWIGLUOAI_ACTIVATIONS:
             return spec
         return MoEWorkspaceSpec(

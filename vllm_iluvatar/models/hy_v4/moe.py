@@ -7,7 +7,7 @@ Both blocks are built entirely out of community infrastructure
 (`MergedColumnParallelLinear` / `RowParallelLinear` / `FusedMoEFactory` /
 `GateLinear`), all of which exist unchanged in the Iluvatar baseline. The
 Iluvatar delta for the routed experts lives in the quantization method
-(`IluModelOptMxFp8Config` -> `IluMxFp8FusedMoE`), which `FusedMoEFactory`
+(`IluModelOptMxFp8Config` -> `IluMxFp8MoEMethod`), which `FusedMoEFactory`
 reaches through ``quant_config``, so nothing model-side has to change.
 
 The FP32 sigmoid-top8 path uses BF16 operands with FP32 accumulation/output
@@ -16,8 +16,8 @@ weight is prepared after loading; other weights retain the FP32 fallback.
 The legacy grouped-topk path keeps its BF16/FP16 input contract.
 
 ``swiglu_limit`` is threaded through `FusedMoEFactory` so the clamp travels via
-the quant config to the expert backend; `IluMxFp8FusedMoE.apply` reads it off
-the layer and selects ixformer's ``dsv4_clamp`` SwiGLU variant.
+the quant config to the expert backend, which reads it off the layer and
+selects the clamped SwiGLU its kernels expose.
 """
 
 from __future__ import annotations

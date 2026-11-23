@@ -506,6 +506,8 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
             limit=getattr(layer, "swiglu_limit", None),
             output_scale=float(_get_ilu_output_scale(layer)),
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            alpha=getattr(layer, "swiglu_alpha", None),
+            beta=getattr(layer, "swiglu_beta", None),
         )
 
     def create_weights(

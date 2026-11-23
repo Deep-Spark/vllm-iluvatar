@@ -138,13 +138,13 @@ payload 读取器默认缓存最多 16 个 safetensors 句柄，LRU 淘汰；同
 
 此路径接受单 checkpoint 的顺序 safetensors lazy/default 或 prefetch 策略；拒绝多线程文件加载、eager/torchao、secondary weights。loader 注册覆盖 `auto/safetensors/pt/npcache` 的社区入口名称，但**实际选中文件必须是 safetensors**，不能据此宣称已支持 PT/npcache payload。无 MXFP4 回调的模型不受上述新路径限制。
 
-当前统一准入要求无 bias、无额外维度 padding 的 gated experts、clamped SiLU/SwiGLU、输出端 TopK 加权，以及 hidden/intermediate 满足 WeightSpec 的 256 对齐。预处理运行权重、EPLB 和不相容 expert placement 不属于此新路径支持范围。Method/Loader 只完成一轮创建和 finalize，重复创建或 finalize 拒绝。
+当前统一准入要求无 bias、无额外维度 padding 的 gated experts、clamped SiLU/SwiGLU（IxInfer W4A8 另接受 SwiGLU-OAI，见下）、输出端 TopK 加权，以及 backend 声明的维度规则。维度规则默认是 WeightSpec 的单一对齐值（IxMM FP4FP8 为 32，其余为 256），backend 可用 `dimension_error()` 覆盖成按投影的真实内核约束：IxInfer W4A8 的 `moe_w4a8_group_gemm/gemv` 要求 NN 下 `N % 128 == 0 && K % 64 == 0`、TN 下 `N % 16 == 0 && K % 128 == 0`，两者均需 `K >= 256`，而 `w13` 与 `w2` 的 N/K 取值不同。SwiGLU-OAI 走 `activation_swigluoai_dynamic_scaled_int8`，该算子把 limit=7.0、alpha=1.702、beta=1.0 编译在内且只接受 interleaved 布局，因此系数不符的 checkpoint 会被拒绝，batched（DeepEP LL）路径不支持该激活。预处理运行权重、EPLB 和不相容 expert placement 不属于此新路径支持范围。Method/Loader 只完成一轮创建和 finalize，重复创建或 finalize 拒绝。
 
 换模型不新增模型专用配对接口：先确认该模型原有映射是否保持可追溯的来源和允许的视图、回调是否具有相容的 projection/TP/EP 语义，以及激活与通信是否满足 backend 契约。直接绕过回调写 expert、未知 fused 源布局、加载中提前消费尚未转换的参数都不能仅凭“权重是 MXFP4”判定兼容。
 
 ### 3.7 block-FP8 使用同一生命周期
 
-`IluFp8MoEMethod` 与 MXFP4 一样在加载前选择目标 `MoEWeightSpec`，注册最终参数，完成配对转换后绑定公共 compute。`select_fp8_compute()` 使用相同的公共 mode 表；Config 先处理显式 runtime 转换，与非 auto compute 配置冲突时报错。源 checkpoint 是整层三维张量还是逐专家张量，不改变 Method、compute 或通信适配器。
+`IluFp8MoEMethod` 与 MXFP4 一样在加载前选择目标 `MoEWeightSpec`，注册最终参数，完成配对转换后绑定公共 compute。选择走 `MoEComputeBindingMixin._select_compute()`，与其他来源共用 `select_four_bit_expert_compute()` 的公共 mode 表，只以 `compute_source` 区分报错文案；Config 先处理显式 runtime 转换，与非 auto compute 配置冲突时报错。源 checkpoint 是整层三维张量还是逐专家张量，不改变 Method、compute 或通信适配器。
 
 Flash 的模型映射只将整层 gate/up、down 表示为逐专家 `w1/w3/w2` 的延迟视图，并调用社区签名的权重回调；普通模型沿用自己的映射。`BlockFp8WeightLoader` 接受 E4M3FN 和 BF16/FP32 乘法 block scale。它按完整 WeightSpec 选择转换器，不通过字符串模型名或 packed 开关裁剪计算能力。尚未实现的源格式仍明确拒绝。
 

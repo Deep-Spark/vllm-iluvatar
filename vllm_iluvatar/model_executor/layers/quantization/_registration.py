@@ -14,6 +14,8 @@ from .backends.grouped_bmm import glm_kv_b_proj as _glm_kv_b_proj
 from .backends.fp4 import fp8_moe as _fp8_moe
 from .backends.fp8 import linear as _fp8_linear
 from .backends.mxfp8 import linear as _mxfp8_linear
+from .backends.mxfp8 import moe as _mxfp8_moe
+from .backends.nvfp4 import moe as _nvfp4_moe
 
 # Runtime registry and method implementations must exist before configs start
 # resolving ``additional_config.ilu_quant`` groups.

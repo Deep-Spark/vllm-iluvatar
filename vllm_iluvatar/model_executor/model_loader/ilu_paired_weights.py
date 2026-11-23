@@ -98,6 +98,21 @@ class DeferredCheckpointTensor(torch.Tensor):
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
+        if func is torch.ops.aten.split.Tensor and isinstance(args[0], cls):
+            # ``Tensor.chunk`` lands here, and a model that stores a layer's
+            # experts as one fused tensor splits gate from up with it (Hy4's
+            # ``experts.gate_up_proj``). Each piece is a slice, which replays
+            # through the single-output path below; the last one is short when
+            # the dimension does not divide evenly.
+            value, size = args[0], args[1]
+            dim = args[2] if len(args) > 2 else kwargs.get("dim", 0)
+            length = value.reference.metadata.shape[dim]
+            return tuple(
+                torch.ops.aten.slice.Tensor(
+                    value, dim, begin, min(begin + size, length)
+                )
+                for begin in range(0, length, size)
+            )
         if func in cls._views and isinstance(args[0], cls):
             value = args[0]
             ref = value.reference

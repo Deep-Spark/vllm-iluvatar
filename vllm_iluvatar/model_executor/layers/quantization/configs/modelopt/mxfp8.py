@@ -32,9 +32,10 @@ How      : subclass, swap ``FusedMoEMethodCls`` to ``IluMxFp8ToFp4OnlineMoE``
            are untouched on ivcore30 -- they go through the inherited
            ``build_linear_method``, which picks up ``IluMxfp8LinearKernel``
            from the patched kernel list. On ivcore11 that patch is inactive, so
-           they are claimed by ``mxfp8_int8_linear_method`` instead.
+           they are claimed by ``mxfp8_int8_linear_method`` instead, and the
+           routed experts by ``mxfp8_w4a8_moe_method`` (ix30 FP4 needs ixmm).
 Scope    : ModelOpt MXFP8 checkpoints on Iluvatar corex30 (Hy4-preview), plus
-           the ivcore11 INT8 dense path.
+           the ivcore11 INT8 dense and W4A8 expert paths.
 Remove   : when community exposes a vendor MXFP8 MoE backend hook, and when
            ``LogitsProcessor`` accepts ``UnquantizedLinearMethod`` for an
            unquantized head (upstream #54160 does the latter).
@@ -57,6 +58,9 @@ from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp8_moe imp
 )
 from vllm_iluvatar.model_executor.layers.quantization.backends.mxfp8.linear import (
     mxfp8_int8_linear_method,
+)
+from vllm_iluvatar.model_executor.layers.quantization.backends.mxfp8.moe import (
+    mxfp8_w4a8_moe_method,
 )
 
 
@@ -81,6 +85,8 @@ class IluModelOptMxFp8Config(ModelOptMxFp8Config):
     #    selects.
     # 2. On ivcore11 a dense ``LinearBase`` runs the MXFP8 source as W8A8 INT8;
     #    see ``backends/mxfp8/linear.py``. ivcore30 keeps FP8 execution.
+    # 3. On ivcore11 routed experts convert to IxInfer W4A8 instead of ix30 FP4,
+    #    which needs ixmm; see ``backends/mxfp8/moe.py``.
     # Everything else delegates.
     def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> Any:
         if isinstance(layer, ParallelLMHead) and self.is_layer_excluded(prefix):
@@ -88,6 +94,9 @@ class IluModelOptMxFp8Config(ModelOptMxFp8Config):
         linear_method = mxfp8_int8_linear_method(self, layer, prefix)
         if linear_method is not None:
             return linear_method
+        moe_method = mxfp8_w4a8_moe_method(self, layer, prefix)
+        if moe_method is not None:
+            return moe_method
         return super().get_quant_method(layer, prefix)
 
 

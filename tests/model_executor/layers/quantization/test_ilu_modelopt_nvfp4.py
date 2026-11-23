@@ -8,7 +8,9 @@ import torch
 from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
 
 import vllm_iluvatar.model_executor.layers.quantization.backends.fp4.nvfp4_moe as impl
+import vllm_iluvatar.model_executor.layers.quantization.backends.nvfp4.moe as w4a8
 import vllm_iluvatar.model_executor.layers.quantization.configs.mxfp8 as mixed
+from vllm_iluvatar.ilu_util import arch
 
 
 def method(**kwargs):
@@ -201,9 +203,16 @@ def test_mixed_config_dispatch_and_exclusions(monkeypatch):
             ignored_layers=["ignored"],
         )
     )
-    selected = cfg.get_quant_method(Experts(), "experts")
-    assert type(selected) is impl.IluModelOptNvFp4MoEMethod
-    assert selected.stage_on_cpu and selected.validate_checkpoint
+    # The conversion target follows the architecture: ix30 FP4 needs ixmm, so
+    # ivcore11 converts the same checkpoint to IxInfer W4A8 instead.
+    for arch_name, expected in (
+        ("ivcore30", impl.IluModelOptNvFp4MoEMethod),
+        ("ivcore11", w4a8.IluModelOptNvFp4ToW4A8MoEMethod),
+    ):
+        monkeypatch.setattr(arch, "cuda_arch", lambda name=arch_name: name)
+        selected = cfg.get_quant_method(Experts(), "experts")
+        assert type(selected) is expected
+        assert selected.stage_on_cpu and selected.validate_checkpoint
     assert cfg.get_quant_method(Experts(), "ignored") is fallback
     assert cfg.get_quant_method(torch.nn.Linear(2, 2), "dense") is fallback
     normal = mixed.IluMxFp8Config.from_config({"quant_method": "mxfp8"})

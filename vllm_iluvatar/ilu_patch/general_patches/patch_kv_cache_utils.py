@@ -90,6 +90,14 @@ def _apply() -> None:
     }
     for name, replacement in replacements.items():
         p.rebind_module_func(community, name, replacement)
+    project_fn = getattr(community, "_project_kv_cache_groups_to_worker", None)
+    wrap_project = getattr(impl, "make_project_kv_cache_groups_to_worker", None)
+    if project_fn is not None and wrap_project is not None:
+        p.rebind_module_func(
+            community,
+            "_project_kv_cache_groups_to_worker",
+            wrap_project(project_fn),
+        )
     if quantized_cache:
         p.rebind_module_func(
             community, "_pool_bytes_per_block", impl._ilu_pool_bytes_per_block

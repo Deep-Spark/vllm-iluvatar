@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import msgspec
 import numpy as np
 
 
@@ -114,3 +115,92 @@ def resolve_remote_block_ids(params: dict[str, Any]) -> Any:
         params["remote_block_ids"] = expanded
         return expanded
     return params.get("remote_block_ids")
+
+
+def encode_push_reg_wire(reg_data: dict[str, Any]) -> bytes:
+    """Encode ``reg_data`` into msgpack bytes using RLE for ``local_block_ids``."""
+    local_blocks = reg_data.get("local_block_ids")
+    if local_blocks:
+        wire = dict(reg_data)
+        wire.pop("local_block_ids", None)
+        wire["local_block_ids_rle"] = encode_block_ids_rle(local_blocks)
+        return msgspec.msgpack.encode(wire)
+    return msgspec.msgpack.encode(reg_data)
+
+
+def decode_push_reg_wire(payload: bytes) -> dict[str, Any]:
+    """Decode msgpack ``PUSH_REG`` payload and transparently expand RLE block IDs."""
+    reg_data = msgspec.msgpack.decode(payload)
+    if isinstance(reg_data, dict) and "local_block_ids_rle" in reg_data:
+        rle = reg_data.pop("local_block_ids_rle")
+        reg_data["local_block_ids"] = decode_block_ids_rle(rle)
+    return reg_data
+
+
+# =====================================================================
+# V2 Push Completion / Error Notification Codec
+# =====================================================================
+
+
+@dataclass(frozen=True)
+class PushNotifParsed:
+    """Parsed P->D or D->P push notification with optional V2 writer identity & status."""
+
+    req_id: str
+    tp_size: int
+    pp_producers: int
+    src_pp: int | None = None
+    src_tp: int | None = None
+    status: str = "OK"
+
+
+def format_push_notif(
+    req_id: str,
+    tp_size: int,
+    pp_producers: int,
+    *,
+    src_pp: int | None = None,
+    src_tp: int | None = None,
+    status: str = "OK",
+) -> bytes:
+    """Format a push notification.
+
+    V2 format: ``{req_id}:{tp_size}:{pp_producers}@{src_pp},{src_tp},{OK|ERR}``.
+    Because ``@`` sits inside the rightmost ``:``-delimited token, ``req_id``
+    may safely contain arbitrary ``:`` or ``@`` characters without ambiguity.
+    """
+    if src_pp is not None and src_tp is not None:
+        return (
+            f"{req_id}:{tp_size}:{pp_producers}@{src_pp},{src_tp},{status}"
+        ).encode("utf-8")
+    return f"{req_id}:{tp_size}:{pp_producers}".encode("utf-8")
+
+
+def parse_push_notif(msg: str) -> PushNotifParsed:
+    """Parse V2 (`...@pp,tp,OK|ERR`) as well as legacy 3-part and 2-part notifications."""
+    parts = msg.rsplit(":", 2)
+    if len(parts) == 3 and parts[1].isdigit():
+        req_id, tp_str, tail = parts
+        if "@" in tail:
+            pp_str, meta = tail.split("@", 1)
+            src_pp_str, src_tp_str, status = meta.split(",", 2)
+            return PushNotifParsed(
+                req_id=req_id,
+                tp_size=int(tp_str),
+                pp_producers=int(pp_str),
+                src_pp=int(src_pp_str),
+                src_tp=int(src_tp_str),
+                status=status,
+            )
+        if tail.isdigit():
+            return PushNotifParsed(
+                req_id=req_id,
+                tp_size=int(tp_str),
+                pp_producers=int(tail),
+            )
+    req_id, tp_str = msg.rsplit(":", 1)
+    return PushNotifParsed(
+        req_id=req_id,
+        tp_size=int(tp_str),
+        pp_producers=1,
+    )

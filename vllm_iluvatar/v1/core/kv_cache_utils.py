@@ -105,6 +105,12 @@ from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.fp8_layout i
     packed_bytes_per_block,
     use_fp8_ds_mla_wire_staging,
 )
+from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_common.fp8_hetero.wire_layout import (
+    build_wire_config as build_push_wire_config,
+    get_wire_groups as get_push_wire_groups,
+    use_host_staging_wire,
+    wire_scratch_bytes as push_wire_scratch_bytes,
+)
 from vllm_iluvatar.models.deepseek_v41.offloading import (
     _GEOMETRY_ATTR,
     _has_native_offloading,
@@ -366,6 +372,7 @@ def _groups_layer_key(
 @dataclass
 class _OrderedWorkerSpecs:
     specs: Sequence[dict[str, KVCacheSpec]]
+    global_groups: list[KVCacheGroupSpec] | None = None
     _remaining_scratch_by_layers: Counter[frozenset[str]] = field(
         init=False, repr=False
     )
@@ -419,6 +426,24 @@ _ordered_worker_specs: ContextVar[_OrderedWorkerSpecs | None] = ContextVar(
 )
 
 
+def make_project_kv_cache_groups_to_worker(
+    original: Callable[..., list[KVCacheGroupSpec]],
+) -> Callable[..., list[KVCacheGroupSpec]]:
+    """Capture pre-projection global groups for PP host-wire planning."""
+
+    @wraps(original)
+    def _project_kv_cache_groups_to_worker(
+        global_kv_cache_groups: list[KVCacheGroupSpec],
+        worker_spec: dict[str, KVCacheSpec],
+    ) -> list[KVCacheGroupSpec]:
+        planning_context = _ordered_worker_specs.get()
+        if planning_context is not None:
+            planning_context.global_groups = global_kv_cache_groups
+        return original(global_kv_cache_groups, worker_spec)
+
+    return _project_kv_cache_groups_to_worker
+
+
 def make_get_kv_cache_config_from_groups(
     original: Callable[..., KVCacheConfig],
 ) -> Callable[..., KVCacheConfig]:
@@ -431,7 +456,9 @@ def make_get_kv_cache_config_from_groups(
         available_memory: int,
         kv_cache_spec: dict[str, KVCacheSpec] | None = None,
     ) -> KVCacheConfig:
-        if not use_fp8_ds_mla_wire_staging(vllm_config):
+        pull_wire = use_fp8_ds_mla_wire_staging(vllm_config)
+        push_wire = use_host_staging_wire(vllm_config)
+        if not pull_wire and not push_wire:
             return original(vllm_config, kv_cache_groups, available_memory)
 
         planning_context = _ordered_worker_specs.get()
@@ -447,6 +474,61 @@ def make_get_kv_cache_config_from_groups(
         # require registration-order metadata or reserve a second allocation.
         plan_wire_staging = bool(kv_cache_groups) and available_memory > 0
         wire_groups: list[KVCacheGroupSpec] | None = None
+        if push_wire:
+            if plan_wire_staging:
+                if kv_cache_spec is None:
+                    raise ValueError(
+                        "host wire planning needs the registration-ordered "
+                        "KV cache spec; get_kv_cache_config_from_groups must be "
+                        "reached through the wrapped get_kv_cache_configs"
+                    )
+                wire_groups = get_push_wire_groups(
+                    vllm_config,
+                    kv_cache_groups,
+                    kv_cache_spec,
+                    planning_context.global_groups if planning_context else None,
+                )
+                scratch_bytes = push_wire_scratch_bytes(
+                    vllm_config, kv_cache_groups, wire_groups
+                )
+                reserve_scratch = (
+                    planning_context is None
+                    or planning_context.should_reserve_scratch(kv_cache_groups)
+                )
+                if reserve_scratch:
+                    if scratch_bytes > available_memory:
+                        raise ValueError(
+                            "Host wire scratch does not fit the KV budget: "
+                            f"required={scratch_bytes}, available={available_memory}"
+                        )
+                    logger.info(
+                        "Reserving %d bytes of KV budget for host wire scratch "
+                        "(compute budget %d -> %d bytes)",
+                        scratch_bytes,
+                        available_memory,
+                        available_memory - scratch_bytes,
+                    )
+                    available_memory -= scratch_bytes
+                    if planning_context is not None:
+                        planning_context.mark_scratch_reserved(kv_cache_groups)
+                else:
+                    logger.debug(
+                        "Skipping host wire scratch reservation on community "
+                        "shrink re-plan: scratch_bytes=%d, available=%d",
+                        scratch_bytes,
+                        available_memory,
+                    )
+
+            kv_cache_config = original(vllm_config, kv_cache_groups, available_memory)
+            kv_cache_config.wire_kv_cache_config = (
+                build_push_wire_config(
+                    kv_cache_groups, wire_groups, kv_cache_config.num_blocks
+                )
+                if wire_groups is not None
+                else None
+            )
+            return kv_cache_config
+
         if plan_wire_staging:
             if kv_cache_spec is None:
                 raise ValueError(
@@ -559,7 +641,10 @@ def make_get_kv_cache_configs(
         kv_cache_specs: list[dict[str, KVCacheSpec]],
         available_memory: list[int],
     ) -> list[KVCacheConfig]:
-        if not use_fp8_ds_mla_wire_staging(vllm_config):
+        if not (
+            use_fp8_ds_mla_wire_staging(vllm_config)
+            or use_host_staging_wire(vllm_config)
+        ):
             return original(vllm_config, kv_cache_specs, available_memory)
 
         planning_context = _OrderedWorkerSpecs(kv_cache_specs)
@@ -588,6 +673,11 @@ def make_generate_scheduler_kv_cache_config(
         cfg = original(kv_cache_configs)
         if any(
             hasattr(worker_config, "wire_kv_cache_config")
+            and not getattr(
+                getattr(worker_config, "wire_kv_cache_config", None),
+                "_keep_on_scheduler",
+                False,
+            )
             for worker_config in kv_cache_configs
         ):
             cfg.wire_kv_cache_config = None

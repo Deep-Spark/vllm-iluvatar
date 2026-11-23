@@ -48,7 +48,12 @@ def target_pp_ranks(
     remote_start = 0
     for remote_pp_rank, num_layers in enumerate(remote_split):
         remote_end = remote_start + num_layers
-        if max(local_start, remote_start) < min(local_end, remote_end):
+        eff_remote_end = (
+            max(remote_end, local_end)
+            if remote_pp_rank == len(remote_split) - 1
+            else remote_end
+        )
+        if max(local_start, remote_start) < min(local_end, eff_remote_end):
             result.append(remote_pp_rank)
         remote_start = remote_end
     return result
@@ -183,6 +188,32 @@ def region_ids_for_layer_range(
     return selected
 
 
+def region_ids_for_mtp_layers(
+    layer_region_ids: dict[str, list[int]], target_total_layers: int
+) -> list[int]:
+    """Return MTP draft KV regions appended outside the target PP partition."""
+    selected: list[int] = []
+    layers: list[tuple[int, str, list[int]]] = []
+    for layer_name, region_ids in layer_region_ids.items():
+        try:
+            layer_idx = extract_layer_index(layer_name)
+        except (AssertionError, ValueError):
+            continue
+        if (
+            layer_idx >= target_total_layers
+            or "draft_model" in layer_name
+            or ".mtp_block." in layer_name
+            or ".mtp.layers." in layer_name
+        ):
+            layers.append((layer_idx, layer_name, region_ids))
+    for _, _, region_ids in sorted(layers):
+        for region_id in region_ids:
+            if region_id not in selected:
+                selected.append(region_id)
+    return selected
+
+
+
 def filter_group_region_ids(
     group_region_ids: list[list[int]] | list[np.ndarray],
     selected_region_ids: list[int],
@@ -213,6 +244,7 @@ def pair_hma_transfer_regions(
     *,
     overlap_start: int | None = None,
     overlap_end: int | None = None,
+    strict_identity_set: bool = False,
 ) -> tuple[list[RegionPairing], list[int], list[int]]:
     """Pair local and remote semantic regions into 4-tuple ``RegionPairing``s."""
     local_regions = regions_by_id(local_transfer_regions)
@@ -260,12 +292,24 @@ def pair_hma_transfer_regions(
                 if entry not in remote_by_identity[ident]:
                     remote_by_identity[ident].append(entry)
 
+    local_identities = set(local_by_identity)
+    remote_identities = set(remote_by_identity)
+    if strict_identity_set and local_identities != remote_identities:
+        raise RuntimeError(
+            "Heterogeneous PP HMA semantic alignment requires identical "
+            "cache identities on both peers; refusing a partial intersection. "
+            f"local_only={sorted(local_identities - remote_identities)[:8]}, "
+            f"remote_only={sorted(remote_identities - local_identities)[:8]}, "
+            f"local_regions={selected_local_region_ids}, "
+            f"remote_regions={selected_remote_region_ids}"
+        )
+
     def identity_sort_key(identity: str) -> tuple[int, str]:
         layer_idx, kind = identity.split(":", 1)
         return (int(layer_idx), kind)
 
     common_identities = sorted(
-        set(local_by_identity).intersection(remote_by_identity),
+        local_identities.intersection(remote_identities),
         key=identity_sort_key,
     )
     if not common_identities:
@@ -388,6 +432,9 @@ def align_hma_transfer_regions(
     local_transfer_regions: list[SemanticTransferRegion],
     remote_transfer_regions: list[SemanticTransferRegion],
     num_groups: int,
+    *,
+    overlap_start: int | None = None,
+    overlap_end: int | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray], list[int], list[int]]:
     """Align HMA regions while deferring TP-scaled block_len checks to handshake validation."""
     pairings, selected_local_ids, selected_remote_ids = pair_hma_transfer_regions(
@@ -396,6 +443,8 @@ def align_hma_transfer_regions(
         local_transfer_regions,
         remote_transfer_regions,
         num_groups=num_groups,
+        overlap_start=overlap_start,
+        overlap_end=overlap_end,
     )
     compact_remote_map = {
         region_id: compact_id
@@ -678,6 +727,205 @@ def build_mamba_hma_transfer_routes(
     )
 
 
+def select_pp_regions_and_pairings(
+    *,
+    local_pp_split: str,
+    local_pp_rank: int,
+    local_layer_region_ids: dict[str, list[int]],
+    local_region_ids_by_group: list[list[int]] | list[np.ndarray],
+    remote_pp_split: str,
+    remote_pp_rank: int,
+    remote_layer_region_ids: dict[str, list[int]],
+    remote_region_ids_by_group: list[list[int]] | list[np.ndarray],
+    is_hma_required: bool = False,
+    local_transfer_regions: list[SemanticTransferRegion] | None = None,
+    remote_transfer_regions: list[SemanticTransferRegion] | None = None,
+    include_final_stage_extra_layers: bool = False,
+    local_kv_layer_end: int | None = None,
+    remote_kv_layer_end: int | None = None,
+    allow_empty_skipped_overlap: bool = False,
+) -> tuple[
+    list[np.ndarray],
+    list[np.ndarray],
+    list[int],
+    list[int],
+    list[RegionPairing] | None,
+    bool,
+]:
+    """Select overlapping regions and optional HMA ``RegionPairing``s."""
+    local_start, local_end = pp_layer_range(
+        local_pp_split, local_pp_rank, local_layer_region_ids
+    )
+    remote_start, remote_end = pp_layer_range(
+        remote_pp_split, remote_pp_rank, remote_layer_region_ids
+    )
+    raw_overlap_start = max(local_start, remote_start)
+    raw_overlap_end = min(local_end, remote_end)
+    if raw_overlap_start >= raw_overlap_end:
+        raise RuntimeError(
+            "Heterogeneous PP handshake selected a remote PP stage "
+            "with no overlapping layers: "
+            f"local=[{local_start}, {local_end}), "
+            f"remote=[{remote_start}, {remote_end})."
+        )
+
+    if local_kv_layer_end is not None:
+        local_end = min(local_end, local_kv_layer_end)
+    if remote_kv_layer_end is not None:
+        remote_end = min(remote_end, remote_kv_layer_end)
+    overlap_start = max(local_start, remote_start)
+    overlap_end = min(local_end, remote_end)
+    num_groups = len(local_region_ids_by_group)
+    empty_groups = [np.asarray([], dtype=np.int64) for _ in range(num_groups)]
+    if overlap_start >= overlap_end:
+        return empty_groups, empty_groups, [], [], [], True
+
+    selected_local_region_ids = region_ids_for_layer_range(
+        local_layer_region_ids, overlap_start, overlap_end
+    )
+    selected_remote_region_ids = region_ids_for_layer_range(
+        remote_layer_region_ids, overlap_start, overlap_end
+    )
+
+    extra_overlap = False
+    if (
+        include_final_stage_extra_layers
+        and local_pp_rank == len(local_pp_split.split(",")) - 1
+        and remote_pp_rank == len(remote_pp_split.split(",")) - 1
+    ):
+        local_total_layers = sum(int(x) for x in local_pp_split.split(","))
+        remote_total_layers = sum(int(x) for x in remote_pp_split.split(","))
+        local_extra_region_ids = region_ids_for_mtp_layers(
+            local_layer_region_ids, local_total_layers
+        )
+        remote_extra_region_ids = region_ids_for_mtp_layers(
+            remote_layer_region_ids, remote_total_layers
+        )
+        if local_extra_region_ids and remote_extra_region_ids:
+            extra_overlap = True
+            selected_local_region_ids.extend(
+                region_id
+                for region_id in local_extra_region_ids
+                if region_id not in selected_local_region_ids
+            )
+            selected_remote_region_ids.extend(
+                region_id
+                for region_id in remote_extra_region_ids
+                if region_id not in selected_remote_region_ids
+            )
+
+    if (
+        not selected_local_region_ids and not selected_remote_region_ids
+    ) or (
+        allow_empty_skipped_overlap
+        and (not selected_local_region_ids or not selected_remote_region_ids)
+    ):
+        if allow_empty_skipped_overlap:
+            return empty_groups, empty_groups, [], [], [], True
+
+    if is_hma_required:
+        assert local_transfer_regions is not None
+        assert remote_transfer_regions is not None
+        pairings, selected_local_ids, selected_remote_ids = (
+            pair_hma_transfer_regions(
+                selected_local_region_ids,
+                selected_remote_region_ids,
+                local_transfer_regions,
+                remote_transfer_regions,
+                num_groups=num_groups,
+                overlap_start=None if extra_overlap else overlap_start,
+                overlap_end=None if extra_overlap else overlap_end,
+            )
+        )
+        if allow_empty_skipped_overlap and not pairings:
+            return empty_groups, empty_groups, [], [], [], True
+        compact_remote_map = {
+            region_id: compact_id
+            for compact_id, region_id in enumerate(selected_remote_ids)
+        }
+        local_by_group: list[list[int]] = [[] for _ in range(num_groups)]
+        remote_by_group: list[list[int]] = [[] for _ in range(num_groups)]
+        for pairing in pairings:
+            gid = pairing.local_group_id
+            if gid < num_groups and pairing.local_region_id not in local_by_group[gid]:
+                local_by_group[gid].append(pairing.local_region_id)
+                remote_by_group[gid].append(
+                    compact_remote_map[pairing.remote_region_id]
+                )
+        return (
+            [np.asarray(g, dtype=np.int64) for g in local_by_group],
+            [np.asarray(g, dtype=np.int64) for g in remote_by_group],
+            selected_local_ids,
+            selected_remote_ids,
+            pairings,
+            False,
+        )
+
+    return (
+        filter_group_region_ids(
+            local_region_ids_by_group,
+            selected_local_region_ids,
+            compact=False,
+        ),
+        filter_group_region_ids(
+            remote_region_ids_by_group,
+            selected_remote_region_ids,
+            compact=True,
+        ),
+        selected_local_region_ids,
+        selected_remote_region_ids,
+        None,
+        False,
+    )
+
+
+def select_pp_regions(
+    *,
+    local_pp_split: str,
+    local_pp_rank: int,
+    local_layer_region_ids: dict[str, list[int]],
+    local_region_ids_by_group: list[list[int]] | list[np.ndarray],
+    remote_pp_split: str,
+    remote_pp_rank: int,
+    remote_layer_region_ids: dict[str, list[int]],
+    remote_region_ids_by_group: list[list[int]] | list[np.ndarray],
+    is_hma_required: bool = False,
+    local_transfer_regions: list[SemanticTransferRegion] | None = None,
+    remote_transfer_regions: list[SemanticTransferRegion] | None = None,
+    include_final_stage_extra_layers: bool = False,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[int], list[int]]:
+    local_groups, remote_groups, sel_local, sel_remote, _, _ = (
+        select_pp_regions_and_pairings(
+            local_pp_split=local_pp_split,
+            local_pp_rank=local_pp_rank,
+            local_layer_region_ids=local_layer_region_ids,
+            local_region_ids_by_group=local_region_ids_by_group,
+            remote_pp_split=remote_pp_split,
+            remote_pp_rank=remote_pp_rank,
+            remote_layer_region_ids=remote_layer_region_ids,
+            remote_region_ids_by_group=remote_region_ids_by_group,
+            is_hma_required=is_hma_required,
+            local_transfer_regions=local_transfer_regions,
+            remote_transfer_regions=remote_transfer_regions,
+            include_final_stage_extra_layers=include_final_stage_extra_layers,
+        )
+    )
+    return local_groups, remote_groups, sel_local, sel_remote
+
+
+def _divisible_span_ratio(larger: int, smaller: int) -> int | None:
+    """How many ``smaller`` spans fit in ``larger``. ``None`` when not integral."""
+    if larger <= 0 or smaller <= 0:
+        return 1
+    if larger == smaller:
+        return 1
+    if larger < smaller:
+        larger, smaller = smaller, larger
+    if larger % smaller != 0:
+        return None
+    return larger // smaller
+
+
 def validate_region_geometry_pair(
     local_region: SemanticTransferRegion | None,
     remote_region: SemanticTransferRegion | None,
@@ -685,24 +933,312 @@ def validate_region_geometry_pair(
     identity: str,
     local_region_id: int,
     remote_region_id: int,
-) -> None:
+    is_ssm: bool = False,
+    allow_divisible_ratio: bool = True,
+) -> int:
+    """Return the scheduler-block ratio (>= 1) between the two regions.
+
+    Attention pages may differ by an integer ratio (P PP8 block 4480 vs D TP8
+    block 640). Mamba state is one slot and is copied 1:1; its ``block_tokens``
+    is only the scheduler span, so a ratio there does not split the state.
+    """
     if local_region is None or remote_region is None:
-        return
-    if local_region.kernel_blocks != remote_region.kernel_blocks:
+        return 1
+    if not allow_divisible_ratio:
+        if local_region.kernel_blocks != remote_region.kernel_blocks:
+            raise ValueError(
+                f"{identity} (local r{local_region_id}, remote r{remote_region_id}): "
+                "kernel blocks per scheduler block differ "
+                f"(local={local_region.kernel_blocks}, "
+                f"remote={remote_region.kernel_blocks})"
+            )
+        if (
+            local_region.block_tokens > 0
+            and remote_region.block_tokens > 0
+            and local_region.block_tokens != remote_region.block_tokens
+        ):
+            raise ValueError(
+                f"{identity} (local r{local_region_id}, remote r{remote_region_id}): "
+                "scheduler block_tokens differ "
+                f"(local={local_region.block_tokens}, "
+                f"remote={remote_region.block_tokens})"
+            )
+        return 1
+    where = (
+        f"{identity} (local r{local_region_id}, remote r{remote_region_id})"
+    )
+    if is_ssm and local_region.kernel_blocks == remote_region.kernel_blocks:
+        # Real mamba state is one slot on both sides; its block_tokens is only
+        # the scheduler span, so non-divisible spans (e.g. 4480 vs 2304) still
+        # copy 1:1.
+        if local_region.block_tokens > 0 and remote_region.block_tokens > 0:
+            ratio = _divisible_span_ratio(
+                local_region.block_tokens, remote_region.block_tokens
+            )
+            return max(ratio or 1, 1)
+        return 1
+    token_ratio = 1
+    if local_region.block_tokens > 0 and remote_region.block_tokens > 0:
+        token_ratio = _divisible_span_ratio(
+            local_region.block_tokens, remote_region.block_tokens
+        )
+        if token_ratio is None:
+            # When both sides expose multiple kernel pages (e.g. P 4480=70*64
+            # vs D 2304=36*64), page pairing aligns at the kernel-page level.
+            if (
+                local_region.kernel_blocks > 1
+                and remote_region.kernel_blocks > 1
+                and local_region.block_tokens % local_region.kernel_blocks == 0
+                and remote_region.block_tokens % remote_region.kernel_blocks == 0
+            ):
+                local_page_tokens = (
+                    local_region.block_tokens // local_region.kernel_blocks
+                )
+                remote_page_tokens = (
+                    remote_region.block_tokens // remote_region.kernel_blocks
+                )
+                page_ratio = _divisible_span_ratio(
+                    local_page_tokens, remote_page_tokens
+                )
+                if page_ratio is not None:
+                    return max(page_ratio, 1)
+            raise ValueError(
+                f"{where}: scheduler block_tokens differ and are not divisible "
+                f"(local={local_region.block_tokens}, "
+                f"remote={remote_region.block_tokens}, "
+                f"local_kblocks={local_region.kernel_blocks}, "
+                f"remote_kblocks={remote_region.kernel_blocks}, "
+                f"local_blen={local_region.block_len}, "
+                f"remote_blen={remote_region.block_len}, "
+                f"is_ssm={is_ssm})"
+            )
+    kernel_ratio = _divisible_span_ratio(
+        local_region.kernel_blocks, remote_region.kernel_blocks
+    )
+    if kernel_ratio is None:
         raise ValueError(
-            f"{identity} (local r{local_region_id}, remote r{remote_region_id}): "
-            "kernel blocks per scheduler block differ "
-            f"(local={local_region.kernel_blocks}, "
+            f"{where}: kernel blocks per scheduler block differ and are not "
+            f"divisible (local={local_region.kernel_blocks}, "
             f"remote={remote_region.kernel_blocks})"
         )
-    if (
-        local_region.block_tokens > 0
-        and remote_region.block_tokens > 0
-        and local_region.block_tokens != remote_region.block_tokens
+    if token_ratio != 1 and kernel_ratio != 1 and token_ratio != kernel_ratio:
+        # P stores 4480 tokens as 70 kernel pages of 64. D's 640-token block
+        # is one scheduler slot (kernel_blocks=1) even after the connector
+        # resyncs to the same 64-token page, so 70 == 7 * 10. The page pairing
+        # uses physical_blocks_per_logical; this check only requires that the
+        # kernel-page ratio is an integer multiple of the scheduler-block ratio.
+        if kernel_ratio % token_ratio != 0:
+            raise ValueError(
+                f"{where}: scheduler block ratio {token_ratio} does not match "
+                f"kernel-block ratio {kernel_ratio} "
+                f"(block_tokens local={local_region.block_tokens}, "
+                f"remote={remote_region.block_tokens}; "
+                f"kernel_blocks local={local_region.kernel_blocks}, "
+                f"remote={remote_region.kernel_blocks})"
+            )
+    return max(token_ratio, 1)
+
+
+def validate_pp_region_lengths(
+    *,
+    local_block_lens: list[int],
+    remote_block_lens: list[int],
+    selected_local_region_ids: list[int],
+    selected_remote_region_ids: list[int],
+    tp_ratio: int,
+    block_size_ratio: int,
+    replicated_region_ids: set[int],
+    model_replicated: bool,
+) -> None:
+    assert len(selected_local_region_ids) == len(selected_remote_region_ids), (
+        "Heterogeneous PP selected region count mismatch: "
+        f"local={len(selected_local_region_ids)}, "
+        f"remote={len(selected_remote_region_ids)}"
+    )
+    for pair_idx, (local_region_id, remote_region_id) in enumerate(
+        zip(selected_local_region_ids, selected_remote_region_ids)
     ):
-        raise ValueError(
-            f"{identity} (local r{local_region_id}, remote r{remote_region_id}): "
-            "scheduler block_tokens differ "
-            f"(local={local_region.block_tokens}, "
-            f"remote={remote_region.block_tokens})"
+        local_len = local_block_lens[local_region_id]
+        remote_len = remote_block_lens[remote_region_id]
+        replicated = model_replicated or local_region_id in replicated_region_ids
+        if replicated:
+            expected_remote_len = local_len // block_size_ratio
+        elif tp_ratio > 0:
+            expected_remote_len = (local_len * tp_ratio) // block_size_ratio
+        else:
+            assert block_size_ratio == 1, (
+                "Different local/remote block sizes are not supported "
+                "when P TP > D TP."
+            )
+            expected_remote_len = local_len // (-tp_ratio)
+        assert remote_len == expected_remote_len, (
+            "Heterogeneous PP selected region size mismatch at "
+            f"pair={pair_idx}: local_region={local_region_id}, "
+            f"remote_region={remote_region_id}, local={local_len}, "
+            f"remote={remote_len}, expected_remote={expected_remote_len}, "
+            f"tp_ratio={tp_ratio}, block_size_ratio={block_size_ratio}"
         )
+
+
+def validate_pp_hma_region_lengths(
+    *,
+    local_block_lens: list[int],
+    remote_block_lens: list[int],
+    local_region_ids_by_group: list[np.ndarray],
+    remote_region_ids_by_group: list[np.ndarray],
+    selected_remote_region_ids: list[int],
+    block_size_ratio: int,
+    tp_ratio: int = 1,
+    replicated_region_ids: set[int] | None = None,
+    hybrid_mla_mamba: bool = False,
+    group_spec_types: tuple[Any, ...] = (),
+    local_transfer_regions: list[SemanticTransferRegion] | None = None,
+    remote_transfer_regions: list[SemanticTransferRegion] | None = None,
+    routes: list[HmaTransferRoute] | None = None,
+    pairings: list[RegionPairing] | None = None,
+) -> None:
+    if block_size_ratio < 1:
+        raise AssertionError(
+            f"block_size_ratio must be positive, got {block_size_ratio}"
+        )
+    local_regions = regions_by_id(local_transfer_regions)
+    remote_regions = regions_by_id(remote_transfer_regions)
+
+    def check_pair(
+        l_rid: int, r_rid: int, *, is_ssm: bool, identity: str, context: str
+    ) -> None:
+        token_ratio = validate_region_geometry_pair(
+            local_regions.get(l_rid),
+            remote_regions.get(r_rid),
+            identity=identity,
+            local_region_id=l_rid,
+            remote_region_id=r_rid,
+            is_ssm=is_ssm,
+        )
+        local_block_len = local_block_lens[l_rid]
+        remote_block_len = remote_block_lens[r_rid]
+        if replicated_region_ids is None:
+            is_rep = not is_ssm
+        else:
+            is_rep = l_rid in replicated_region_ids
+        replicated = hybrid_mla_mamba or (not is_ssm and is_rep)
+        expected_remote_len = local_block_len // block_size_ratio
+        if not replicated:
+            expected_remote_len = (
+                local_block_len * tp_ratio
+                if tp_ratio >= 1
+                else local_block_len // (-tp_ratio)
+            )
+        acceptable = {expected_remote_len, local_block_len}
+        # Connector block sizes already match (kernel page). Scheduler blocks
+        # can still be 4480 vs 640, and one side may register that whole
+        # scheduler slot as a single page. Accept the token ratio and the
+        # kernel-page ratio (70/7=10) so either registration shape passes.
+        scales = {1, token_ratio}
+        local_region = local_regions.get(l_rid)
+        remote_region = remote_regions.get(r_rid)
+        if (
+            not is_ssm
+            and local_region is not None
+            and remote_region is not None
+            and remote_region.kernel_blocks > 0
+            and local_region.kernel_blocks > 0
+        ):
+            kernels = (
+                local_region.kernel_blocks,
+                remote_region.kernel_blocks,
+            )
+            big_k, small_k = max(kernels), min(kernels)
+            if small_k > 0 and big_k % small_k == 0:
+                scales.add(big_k // small_k)
+                if token_ratio > 1 and (big_k // small_k) % token_ratio == 0:
+                    scales.add((big_k // small_k) // token_ratio)
+        for scale in scales:
+            if scale <= 1:
+                continue
+            if local_block_len % scale == 0:
+                acceptable.add(local_block_len // scale)
+            acceptable.add(local_block_len * scale)
+            if expected_remote_len % scale == 0:
+                acceptable.add(expected_remote_len // scale)
+            acceptable.add(expected_remote_len * scale)
+        assert remote_block_len in acceptable, (
+            "KV cache selected region size must match between P and D "
+            f"when using HMA with heterogeneous PP at {context}: "
+            f"local_region={l_rid} local={local_block_len}, "
+            f"remote_region={r_rid} remote={remote_block_len}, "
+            f"expected_remote={expected_remote_len}, "
+            f"token_ratio={token_ratio}"
+        )
+
+    if routes is not None:
+        for route in routes:
+            if len(route.raw_local_region_ids) != len(route.raw_remote_region_ids):
+                raise AssertionError(
+                    "KV cache selected region count must match within each "
+                    "HMA route after semantic alignment: "
+                    f"group={route.local_group_idx}->{route.remote_group_idx}, "
+                    f"local={len(route.raw_local_region_ids)}, "
+                    f"remote={len(route.raw_remote_region_ids)}"
+                )
+            ident = f"group{route.local_group_idx}->group{route.remote_group_idx}"
+            for pair_idx, (local_region_id, remote_region_id) in enumerate(
+                zip(route.raw_local_region_ids, route.raw_remote_region_ids)
+            ):
+                check_pair(
+                    int(local_region_id),
+                    int(remote_region_id),
+                    is_ssm=route.is_ssm,
+                    identity=ident,
+                    context=f"{ident}, pair={pair_idx}",
+                )
+        return
+
+    if pairings is not None:
+        for pair_idx, pairing in enumerate(pairings):
+            is_ssm = (
+                pairing.local_group_id < len(group_spec_types)
+                and _is_ssm_spec(group_spec_types[pairing.local_group_id])
+            )
+            check_pair(
+                pairing.local_region_id,
+                pairing.remote_region_id,
+                is_ssm=is_ssm,
+                identity=pairing.identity,
+                context=(
+                    f"{pairing.identity} "
+                    f"(group={pairing.local_group_id}->{pairing.remote_group_id}, "
+                    f"pair={pair_idx})"
+                ),
+            )
+        return
+
+    assert len(local_region_ids_by_group) == len(remote_region_ids_by_group), (
+        "KV cache HMA group count must match after semantic alignment: "
+        f"local={len(local_region_ids_by_group)}, "
+        f"remote={len(remote_region_ids_by_group)}"
+    )
+    for group_idx, (local_group, remote_group) in enumerate(
+        zip(local_region_ids_by_group, remote_region_ids_by_group)
+    ):
+        if len(local_group) != len(remote_group):
+            raise AssertionError(
+                "KV cache selected region count must match within each "
+                "HMA group after semantic alignment: "
+                f"group={group_idx}, local={len(local_group)}, "
+                f"remote={len(remote_group)}"
+            )
+        is_ssm = (
+            group_idx < len(group_spec_types)
+            and _is_ssm_spec(group_spec_types[group_idx])
+        )
+        for pair_idx, (local_region_id, remote_compact_id) in enumerate(
+            zip(local_group, remote_group)
+        ):
+            check_pair(
+                int(local_region_id),
+                selected_remote_region_ids[int(remote_compact_id)],
+                is_ssm=is_ssm,
+                identity=f"group{group_idx}",
+                context=f"group={group_idx}, pair={pair_idx}",
+            )

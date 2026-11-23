@@ -76,5 +76,30 @@ class PoolDirectory:
         for bid in block_ids:
             self._hash_by_block.pop((group_idx, int(bid)), None)
 
+    def hit_prefix(self, blocks: Any) -> tuple[int, ...]:
+        """Per group: leading run of blocks the pool is known to cover."""
+        counts: list[int] = []
+        for group in getattr(blocks, "blocks", ()):
+            count = 0
+            for block in group:
+                if getattr(block, "is_null", False):
+                    count += 1
+                    continue
+                if getattr(block, "block_hash", None) is None:
+                    break
+                count += 1
+            counts.append(count)
+        return tuple(counts)
+
+    def record(self, blocks: Any) -> None:
+        """Mark every cached block of this request as mirrored."""
+        for g_idx, group in enumerate(getattr(blocks, "blocks", ())):
+            for block in group:
+                if getattr(block, "is_null", False):
+                    continue
+                b_hash = getattr(block, "block_hash", None)
+                if b_hash is not None:
+                    self._hash_by_block[(g_idx, int(block.block_id))] = b_hash
+
     def clear(self) -> None:
         self._hash_by_block.clear()

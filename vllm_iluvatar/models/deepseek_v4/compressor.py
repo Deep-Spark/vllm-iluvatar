@@ -23,6 +23,9 @@ from __future__ import annotations
 from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.fp8_layout import (
     use_fp8_ds_mla_wire_staging,
 )
+from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_common.fp8_hetero.wire_layout import (
+    use_hetero_fp8_wire,
+)
 
 # Community types bound by patch_compressor._apply().
 VllmConfig = None
@@ -35,7 +38,7 @@ SlidingWindowMLASpec = None
 # FP8 wire staging requires D-compatible native 4/8 state granularity.
 def _ilu_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
     is_fp8 = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
-    if use_fp8_ds_mla_wire_staging(vllm_config):
+    if use_fp8_ds_mla_wire_staging(vllm_config) or use_hetero_fp8_wire(vllm_config):
         block_size = self.block_size
     elif is_fp8:
         block_size = 16384 // (self.state_dim * 4)

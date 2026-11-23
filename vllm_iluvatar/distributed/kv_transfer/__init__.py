@@ -20,7 +20,7 @@ _ILU_KV_CONNECTORS = (
     ),
     (
         "IluNixlPushConnector",
-        "vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.opt_nixl",
+        "vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_push",
         "IluNixlPushConnector",
     ),
     (

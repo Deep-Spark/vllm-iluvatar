@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.utils import get_pp_indices
@@ -107,6 +107,23 @@ class Dsv41Layout:
         return min(self.num_hidden_layers, self.producer_layer_end + 1)
 
 
+def wire_dsv41_layout(
+    layout: Dsv41Layout | None,
+    *,
+    host_staging_producer: bool = False,
+    hetero_enabled: bool = False,
+) -> Dsv41Layout | None:
+    """Return the wire-visible DSv4.1 layout for handshake & format checks."""
+    if layout is not None and host_staging_producer and hetero_enabled:
+        return replace(
+            layout,
+            main_kv_format="none",
+            indexer_kv_layout="legacy",
+        )
+    return layout
+
+
+
 def resolve_dsv41_layout(vllm_config: "VllmConfig | Any") -> Dsv41Layout | None:
     """Derive V4.1 topology facts from ``vllm_config``, or None for other models."""
     if not is_dsv41_config(vllm_config):
@@ -132,6 +149,88 @@ def resolve_dsv41_layout(vllm_config: "VllmConfig | Any") -> Dsv41Layout | None:
         main_kv_format=resolve_main_kv_format_name(),
         indexer_kv_layout=resolve_indexer_kv_layout_name(),
     )
+
+
+def effective_pp_producers(
+    consumer_pp_rank: int,
+    consumer_pp_split: str,
+    producer_pp_split: str,
+    *,
+    dsv41_layout: Dsv41Layout | None = None,
+    kv_layer_end: int | None = None,
+) -> int:
+    """Count producer PP stages that own at least one transferable layer for ``consumer_pp_rank``.
+
+    Under DeepSeek-V4.1 ``swa_bounded_replay``, every SWA, compressor ring, and
+    PP forwarder replica is in ``skip_layers``, so ONLY ``kv_source_layers``
+    own transferable KV regions. Excluding source-free producer stages (such as
+    ``[3,6)`` in ``3,3,3,3,2,2,2,22``) lets empty producer ranks skip dummy
+    NIXL notifications completely while keeping D's expected count exact.
+    """
+    c_counts = [int(x) for x in consumer_pp_split.split(",")]
+    d_start = sum(c_counts[:consumer_pp_rank])
+    d_end = d_start + c_counts[consumer_pp_rank]
+
+    eff_layer_end = kv_layer_end
+    if eff_layer_end is None and dsv41_layout is not None:
+        eff_layer_end = dsv41_layout.kv_layer_end
+
+    if (
+        dsv41_layout is not None
+        and dsv41_layout.swa_bounded_replay
+        and dsv41_layout.kv_source_layers
+    ):
+        eff_d_end = min(d_end, eff_layer_end) if eff_layer_end is not None else d_end
+        if d_start >= eff_d_end:
+            return 0
+        target_sources = [
+            s for s in dsv41_layout.kv_source_layers if d_start <= s < eff_d_end
+        ]
+        if not target_sources:
+            return 0
+        p_counts = [int(x) for x in producer_pp_split.split(",")]
+        count = 0
+        p_start = 0
+        for num_layers in p_counts:
+            p_end = p_start + num_layers
+            eff_p_end = (
+                min(p_end, eff_layer_end) if eff_layer_end is not None else p_end
+            )
+            if p_start < eff_p_end and any(
+                p_start <= s < eff_p_end for s in target_sources
+            ):
+                count += 1
+            p_start = p_end
+        return count
+
+    if eff_layer_end is not None:
+        d_end = min(d_end, eff_layer_end)
+    if d_start >= d_end:
+        return 0
+    p_counts = [int(x) for x in producer_pp_split.split(",")]
+    count = 0
+    p_start = 0
+    for num_layers in p_counts:
+        p_end = p_start + num_layers
+        eff_p_end = (
+            min(p_end, eff_layer_end) if eff_layer_end is not None else p_end
+        )
+        if p_start < eff_p_end and max(d_start, p_start) < min(d_end, eff_p_end):
+            count += 1
+        p_start = p_end
+    return count
+
+
+def is_predictably_skipped_dsv41_stage(
+    dsv41_layout: Dsv41Layout | None,
+) -> bool:
+    """Whether empty/inactive stages are excluded from ``effective_pp_producers``."""
+    return bool(
+        dsv41_layout is not None
+        and dsv41_layout.swa_bounded_replay
+        and dsv41_layout.kv_source_layers
+    )
+
 
 
 def legal_decode_cut_layers(layout: Dsv41Layout) -> tuple[int, ...]:

@@ -138,7 +138,10 @@ class MemoryRegistrationPlanner:
                     "packed KV tensor offset must be smaller than allocation size"
                 )
             layer_stride = getattr(tensor_config, "layer_stride", 0) or 0
-            for layer_idx, layer_name in enumerate(tensor_config.layers):
+            members = getattr(tensor_config, "layers", None)
+            if members is None:
+                members = getattr(tensor_config, "shared_by", ())
+            for layer_idx, layer_name in enumerate(members):
                 self._packing_by_layer[layer_name] = PackedLayerInfo(
                     offset=tensor_config.offset + layer_idx * layer_stride,
                     block_stride=tensor_config.block_stride,

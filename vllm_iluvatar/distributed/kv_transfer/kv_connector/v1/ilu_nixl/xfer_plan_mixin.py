@@ -69,7 +69,23 @@ class IluNixlXferPlanMixin:
     _cache_kind_from_layer_name = staticmethod(cache_kind_from_layer_name)
     _regions_by_id = staticmethod(regions_by_id)
     _filter_group_region_ids = staticmethod(filter_group_region_ids)
-    _validate_region_geometry_pair = staticmethod(validate_region_geometry_pair)
+    @staticmethod
+    def _validate_region_geometry_pair(
+        local_region,
+        remote_region,
+        *,
+        identity: str,
+        local_region_id: int,
+        remote_region_id: int,
+    ) -> None:
+        validate_region_geometry_pair(
+            local_region,
+            remote_region,
+            identity=identity,
+            local_region_id=local_region_id,
+            remote_region_id=remote_region_id,
+            allow_divisible_ratio=False,
+        )
     _metadata_uses_virtual_packed_regions = staticmethod(
         metadata_uses_virtual_packed_regions
     )

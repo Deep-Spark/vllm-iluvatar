@@ -230,9 +230,23 @@ def build_packed_virtual_layout(
                 "Packed IluNixl layout has non-positive num_blocks or "
                 f"block_stride: N={num_blocks}, stride={tensor_stride}"
             )
+        def _layer_num_blocks(cache: torch.Tensor) -> int:
+            if is_block_outer:
+                return num_blocks
+            row_bytes = (
+                cache.stride(0) * cache.element_size()
+                if cache.ndim >= 2
+                else 0
+            )
+            if row_bytes > 0 and tensor_stride % row_bytes == 0:
+                k_blocks = tensor_stride // row_bytes
+                if k_blocks > 1 and int(cache.shape[0]) % k_blocks == 0:
+                    return int(cache.shape[0]) // k_blocks
+            return int(cache.shape[0])
+
         for layer_name in shared_by:
             cache = kv_caches[layer_name]
-            layer_num_blocks = num_blocks if is_block_outer else int(cache.shape[0])
+            layer_num_blocks = _layer_num_blocks(cache)
             page_size = int(specs[layer_name].page_size_bytes)
             last_end = (
                 layer_byte_offset(layer_name)
@@ -251,7 +265,7 @@ def build_packed_virtual_layout(
         for layer_name in shared_by:
             cache = kv_caches[layer_name]
             spec = specs[layer_name]
-            layer_num_blocks = num_blocks if is_block_outer else int(cache.shape[0])
+            layer_num_blocks = _layer_num_blocks(cache)
             if cache.untyped_storage().data_ptr() != backing_ptr:
                 raise ValueError(
                     f"Packed cache layer {layer_name} uses another backing"

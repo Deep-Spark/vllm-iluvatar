@@ -25,7 +25,6 @@ from vllm.v1.kv_cache_interface import (
     group_kernel_blocks,
 )
 
-from ..ilu_nixl_common.fp8_hetero import scatter_staging_rows_to_pool
 from .fp8_layout import (
     FP8_WIRE_SCRATCH_BUFFER_COUNT,
     build_fp8_ds_mla_wire_config,
@@ -221,7 +220,6 @@ def copy_wire_rows_to_host(
     spans: Sequence[ByteSpan],
     *,
     non_blocking: bool = False,
-    h2h_threads: int = 4,
 ) -> None:
     """Copy selected HMA spans from dense scratch rows into host mirror rows."""
     n_blocks = len(source_block_ids)
@@ -242,19 +240,7 @@ def copy_wire_rows_to_host(
     if n_blocks == 0:
         return
 
-    # Host-to-host path: use OpenMP C++ h2h_scatter (or vectorized span index_copy_).
-    if scratch_rows.device.type == "cpu" and wire_rows.device.type == "cpu":
-        scatter_staging_rows_to_pool(
-            scratch_rows,
-            wire_rows,
-            source_block_ids,
-            effective_spans,
-            num_threads=h2h_threads,
-        )
-        return
-
-    # Device-to-pinned-host path: coalesce consecutive block IDs into bulk 2D DMA copies
-    # on the active CUDA copy_stream without breaking stream ordering!
+    # Coalesce consecutive block IDs into bulk copies on the active CUDA copy stream.
     runs = _coalesce_contiguous_runs(source_block_ids)
     for dense_off, dst_off, run_len in runs:
         for start, end in effective_spans:

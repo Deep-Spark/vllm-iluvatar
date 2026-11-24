@@ -68,6 +68,10 @@ DeepSeek V4.1 普通 dense Linear 使用 `backends/fp8/deepseek_v41_linear.py` �
 
 ---
 
+### 2.1 ivcore11 原生 BF16/FP16 Linear
+
+ivcore11 加载原生 BF16/FP16 checkpoint 时，符合条件的 Linear 默认在加载后按输出通道量化为 INT8，并复用 W8A8 动态激活量化。用 `linear.native_backend` 选择 `auto`、`w8a8_int8` 或 `original`。`original` 保留 vLLM 选定的计算精度，具体是 BF16 还是 FP16 由 `--dtype` 决定，因此模式名不按 dtype 命名。Attention 可直接读取权重的 `kv_b_proj` 和 `wo_a` 保留原生布局。
+
 ## 3. INT8 Linear 的自动布局选择
 
 FP8→INT8 转换先生成 `[N, K]` 权重和 FP32 channel scale，其中 N、K 是当前 TP rank 的本地尺寸。`IluFp8LinearMethod` 创建 W8A8 scheme 时使用 `gemm_mode="PERF"`，后处理的 `_choose_format(N, K)` 优先查找 `perf_table[arch][N, K]`；未命中时，N 和 K 均为 64 的倍数则选择 NN，否则选择 TN。

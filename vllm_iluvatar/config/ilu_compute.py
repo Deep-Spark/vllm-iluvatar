@@ -16,7 +16,7 @@ def compute_options(section: str) -> dict:
         or raw.get("schema_version", 1) != 1
     ):
         raise ValueError("ilu_compute.schema_version must be 1")
-    allowed = {"linear": {"fp8_backend"}, "moe": {"mode"}}
+    allowed = {"linear": {"fp8_backend", "native_backend"}, "moe": {"mode"}}
     for key, fields in allowed.items():
         value = raw.get(key, {})
         if not isinstance(value, dict) or set(value) - fields:
@@ -38,6 +38,28 @@ def fp8_linear_backend() -> str:
     if backend == "w8a8_int8" and arch not in ("ivcore11", "ivcore30"):
         raise ValueError(f"INT8 W8A8 Linear backend is not supported on {arch}")
     return backend
+
+
+# Keeps whichever dtype vLLM selected for the native model, so the mode is
+# named after that intent rather than after one of the dtypes it may resolve to.
+NATIVE_PRECISION_MODE = "original"
+
+
+def native_linear_backend() -> str:
+    backend = compute_options("linear").get("native_backend", "auto")
+    if backend in ("auto", "w8a8_int8"):
+        return "w8a8_int8"
+    if backend == NATIVE_PRECISION_MODE:
+        return NATIVE_PRECISION_MODE
+    raise ValueError(f"Unsupported ilu_compute.linear.native_backend: {backend!r}")
+
+
+def native_moe_compute():
+    """The expert compute for a native checkpoint, or ``None`` to stay W16A16."""
+    mode = compute_options("moe").get("mode", "auto")
+    if mode == NATIVE_PRECISION_MODE:
+        return None
+    return select_four_bit_expert_compute("ivcore11", mode, source="native BF16/FP16")
 
 
 # Public four-bit expert execution modes. Backend/layout mechanics remain internal; source

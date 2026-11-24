@@ -471,6 +471,17 @@ def _make_iluvatar_platform():
                     ):
                         cache_config.prefix_match_unit = unit
                         cache_config.enable_mamba_shared_prefix_checkpoint = True
+
+            from vllm_iluvatar.model_executor.layers.quantization.configs.native import (
+                native_quant_config,
+            )
+
+            # vLLM resolves checkpoint quantization before this hook, so an
+            # unquantized checkpoint is still without a Config to dispatch from.
+            native = native_quant_config(vllm_config)
+            if native is not None:
+                vllm_config.quant_config = native
+
             from vllm_iluvatar.v1.worker.prefill_state.configuration import (
                 initialize_config,
             )

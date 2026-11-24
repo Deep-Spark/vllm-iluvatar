@@ -6,23 +6,17 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
-from vllm.model_executor.layers.quantization.utils import replace_parameter
+from vllm.model_executor.layers.linear import LinearBase
 
-from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes import (
-    IluCompressedTensorsW8A8Int8,
+from vllm_iluvatar.model_executor.layers.quantization.common.w8a8_linear import (
+    IluW8A8Int8LinearMethod,
 )
 
 _ALLOWED_OPTIONS = frozenset({"gemm_format", "mixed_strategy", "gemm_mode"})
 
 
-class _IluRuntimeW8A8Int8LinearMethod(LinearMethodBase):
-    """Shared load/compute surface for the two W8A8 source contracts.
-
-    Weights are created by the original method so the checkpoint's own
-    ``weight_loader`` keeps driving TP and fused-shard assembly; only the
-    resident format changes, in ``process_weights_after_loading``.
-    """
+class _IluRuntimeW8A8Int8LinearMethod(IluW8A8Int8LinearMethod):
+    """Validate the explicit runtime conversion and track its load state."""
 
     # Source ``weights.format`` and checkpoint dtypes this subclass accepts,
     # plus the original dispatch it is allowed to replace.
@@ -33,17 +27,7 @@ class _IluRuntimeW8A8Int8LinearMethod(LinearMethodBase):
 
     def __init__(self, context: Any) -> None:
         self.context = context
-        self.original_method = context.original_method
-        self.scheme = IluCompressedTensorsW8A8Int8(
-            strategy="channel",
-            is_static_input_scheme=False,
-            input_symmetric=True,
-            ilu_params={
-                "gemm_format": context.options.get("gemm_format", "TN"),
-                "mixed_strategy": context.options.get("mixed_strategy", "CHANNEL"),
-                "gemm_mode": context.options.get("gemm_mode", "PERF"),
-            },
-        )
+        super().__init__(context.original_method, **context.options)
 
     @classmethod
     def from_ilu_runtime_config(cls, context: Any):
@@ -116,49 +100,9 @@ class _IluRuntimeW8A8Int8LinearMethod(LinearMethodBase):
                 raise ValueError(f"{where}: runtime W8A8 requires {option}={required}")
         return cls(context)
 
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ) -> None:
-        self.original_method.create_weights(
-            layer,
-            input_size_per_partition,
-            output_partition_sizes,
-            input_size,
-            output_size,
-            params_dtype,
-            **extra_weight_attrs,
-        )
-        # UnquantizedLinearMethod does not set this, and the scheme reads it to
-        # tell a fused module from a plain one.
-        layer.logical_widths = output_partition_sizes
-        layer.scheme = self.scheme
-        # The scheme pads rather than rejecting shapes, so every selected layer
-        # is transformed and none falls back.
+    def create_weights(self, layer: torch.nn.Module, *weight_args, **weight_attrs):
+        super().create_weights(layer, *weight_args, **weight_attrs)
         self.context.record_shape_result(transformed=True)
-
-    def _quantize(self, layer: torch.nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        qweight, channel_scale = self._quantize(layer)
-        replace_parameter(layer, "weight", qweight)
-        layer.register_parameter(
-            "weight_scale",
-            torch.nn.Parameter(channel_scale, requires_grad=False),
-        )
-        # Dynamic symmetric activations: the scheme reads these by name and
-        # takes the no-zero-point path when they are absent.
-        layer.input_scale = None
-        layer.input_zero_point = None
-        layer.azp_adj = None
-        self.scheme.process_weights_after_loading(layer)
 
     def apply(
         self,
@@ -167,4 +111,4 @@ class _IluRuntimeW8A8Int8LinearMethod(LinearMethodBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self.context.assert_validation_complete()
-        return self.scheme.apply_weights(layer, x, bias)
+        return super().apply(layer, x, bias)

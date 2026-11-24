@@ -270,6 +270,20 @@ GLM-5.2 的 block-FP8 Method 从当前计算 backend 取得输入能力。IxMM F
 
 为兼容已有启动方式，在未提供 MoE compute 配置时，150 的旧 `VLLM_ILU_MOE_RUNTIME_LAYOUT` 可以覆盖布局默认值。显式 mode 优先。本文默认项均指未作这类覆盖的行为。
 
+#### ivcore11 原生 BF16/FP16 expert 权重
+
+原生 BF16/FP16 checkpoint 上，`moe.mode` 默认使用 `ixinfer_w4a8_nn_v2`，也可显式选 `ixinfer_w4a8_tn_v2` 或 `original`。W4A8 路径按 expert shard 生成打包权重及通道 scale。Down projection 的 scale 在 TP 切片前按完整 K 计算。选择 `original` 时使用 W16A16，具体精度由 vLLM 的 `--dtype` 决定。
+
+MoE 和 Linear 可独立选择，例如将 MoE 切到 TN，同时保留 Linear 的原生精度：
+
+```bash
+--additional-config '{"ilu_compute":{"moe":{"mode":"ixinfer_w4a8_tn_v2"},"linear":{"native_backend":"original"}}}'
+```
+
+原生模型的分发入口是 `configs/native.py`，实现位于 `backends/native/`，通过 `ilu_compute` 直接启用。由 inline.yaml 描述的显式转换仍使用 `ilu_runtime` 入口。
+
+该默认分发针对 ivcore11 的原生模型。已量化 checkpoint、显式 `ilu_quant` 和预转换 sharded-state 加载沿用各自的分发路径。
+
 ### 6.2 启用 Hybrid LL decode
 
 在已接入 Hybrid EP 的模型中，配置 DP>1、EP，并以 AG/RS 作为基础通信。LL/NVSM decode 的关键选项如下：

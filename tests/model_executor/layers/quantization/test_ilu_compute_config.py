@@ -176,3 +176,69 @@ def test_fp8_runtime_compute_conflict(monkeypatch):
     )
     assert select_fp8_method(original, runtime) is runtime
     assert select_fp8_method(original, None) is original
+
+
+@pytest.mark.parametrize(
+    "linear,moe,expected_linear,expected_layout",
+    [
+        ({}, {}, "w8a8_int8", "NN"),
+        (
+            {"native_backend": "w8a8_int8"},
+            {"mode": "ixinfer_w4a8_nn_v2"},
+            "w8a8_int8",
+            "NN",
+        ),
+        (
+            {"native_backend": "original"},
+            {"mode": "ixinfer_w4a8_tn_v2"},
+            "original",
+            "TN",
+        ),
+        (
+            {"native_backend": "original"},
+            {"mode": "original"},
+            "original",
+            None,
+        ),
+    ],
+)
+def test_native_compute_modes(
+    monkeypatch, linear, moe, expected_linear, expected_layout
+):
+    monkeypatch.setattr(
+        ilu_compute,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            additional_config={"ilu_compute": {"linear": linear, "moe": moe}}
+        ),
+    )
+    assert ilu_compute.native_linear_backend() == expected_linear
+    selection = ilu_compute.native_moe_compute()
+    if expected_layout is None:
+        assert selection is None
+    else:
+        assert (selection.name, selection.layout) == ("ixinfer_w4a8", expected_layout)
+
+
+@pytest.mark.parametrize(
+    "mode", ["bf16.fp16", "bf16", "fp16", "ixinfer_w4a8_nn", "w8a8_int8", ""]
+)
+def test_native_modes_take_only_their_canonical_spelling(monkeypatch, mode):
+    """``original`` is the only way to ask for the model's own precision."""
+    monkeypatch.setattr(
+        ilu_compute,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            additional_config={
+                "ilu_compute": {
+                    "linear": {"native_backend": mode},
+                    "moe": {"mode": mode},
+                }
+            }
+        ),
+    )
+    if mode != "w8a8_int8":
+        with pytest.raises(ValueError, match="native_backend"):
+            ilu_compute.native_linear_backend()
+    with pytest.raises(ValueError, match="native BF16/FP16 mode"):
+        ilu_compute.native_moe_compute()

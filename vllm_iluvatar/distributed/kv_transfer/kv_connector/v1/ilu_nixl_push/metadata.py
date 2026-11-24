@@ -108,6 +108,14 @@ class ReqMeta(NixlReqMeta):
     remote_block_starts: list[int] | None = None
     # Per P-side transfer-group chunk offset (-1 for tail-only state/ring groups).
     chunk_block_offsets: list[int] | None = None
+    # Prompt length used by E25 ConsumerPrefixState validation (-1 = unspecified).
+    prompt_token_len: int = -1
+
+    @property
+    def engine_id(self) -> str | None:
+        """Expose remote producer engine_id for E25 ConsumerPrefixState."""
+        remote = getattr(self, "remote", None)
+        return getattr(remote, "engine_id", None) if remote is not None else None
 
 
 @dataclass
@@ -212,12 +220,14 @@ class ChunkPushReqMeta:
 
 
 class IluNixlPushConnectorMetadata(NixlConnectorMetadata):
-    """NIXL metadata carrying remote PP topology and chunked-bulk send requests."""
+    """NIXL metadata carrying remote PP topology, chunked-bulk sends, and E25 receipts."""
 
     def __init__(self) -> None:
         super().__init__()
         self.reqs_to_send_chunked: dict[ReqId, ChunkPushReqMeta] = {}
         self.disconnected_engines: tuple[str, ...] = ()
+        self.source_full_ready_receipts: dict[str, Any] = {}
+        self.source_state_endpoints: dict[str, Any] = {}
 
     def _add_new_req(
         self,
@@ -226,6 +236,7 @@ class IluNixlPushConnectorMetadata(NixlConnectorMetadata):
         local_num_computed_blocks: tuple[int, ...] = (),
         awaiting_kvs: bool = False,
         remote_block_starts: list[int] | None = None,
+        prompt_token_len: int = -1,
     ) -> ReqMeta:
         return ReqMeta(
             local_block_ids=local_block_ids,
@@ -239,6 +250,7 @@ class IluNixlPushConnectorMetadata(NixlConnectorMetadata):
             remote_pp_size=kv_transfer_params.get("pp_size", 1),
             remote_pp_split=kv_transfer_params.get("pp_split", ""),
             remote_block_starts=remote_block_starts,
+            prompt_token_len=prompt_token_len,
         )
 
     def add_new_req_to_recv(
@@ -249,6 +261,7 @@ class IluNixlPushConnectorMetadata(NixlConnectorMetadata):
         local_num_computed_blocks: tuple[int, ...] = (),
         awaiting_kvs: bool = False,
         remote_block_starts: list[int] | None = None,
+        prompt_token_len: int = -1,
     ):
         from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
             RemoteMeta,
@@ -260,6 +273,7 @@ class IluNixlPushConnectorMetadata(NixlConnectorMetadata):
             local_num_computed_blocks,
             awaiting_kvs,
             remote_block_starts=remote_block_starts,
+            prompt_token_len=prompt_token_len,
         )
         req.remote = RemoteMeta(
             block_ids=kv_transfer_params["remote_block_ids"],

@@ -2,13 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Iluvatar NIXL push connector facade (chunked-bulk / non-layerwise)."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
     KVConnectorRole,
+    KVConnectorTransferResults,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
     NixlBaseConnector,
@@ -27,12 +28,56 @@ if TYPE_CHECKING:
 
 
 class IluNixlPushBaseConnector(NixlBaseConnector):
+    prefix_state: Any = None
+
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: "KVCacheConfig",
+    ):
+        super().__init__(vllm_config, role, kv_cache_config)
+        self.prefix_state = None
+
     @property
     def prefix_replay_alignment(self) -> int | None:
         """Optional token alignment for complete remote-prefix replay (V4.1 CR2)."""
         if self.connector_scheduler is None:
             return None
         return getattr(self.connector_scheduler, "prefix_replay_alignment", None)
+
+    def attach_prefix_state(self, context: Any) -> None:
+        """Attach DeepSeek-V4.1 E25 ProducerPrefixState / ConsumerPrefixState."""
+        self.prefix_state = context
+
+    def bind_connector_metadata(
+        self, connector_metadata: KVConnectorMetadata
+    ) -> None:
+        super().bind_connector_metadata(connector_metadata)
+        worker = getattr(self, "connector_worker", None)
+        if worker is not None:
+            worker.bind_connector_metadata(connector_metadata)
+        if self.prefix_state is not None:
+            self.prefix_state.bind_metadata(connector_metadata)
+
+    def get_transfer_results(
+        self, finished_req_ids: set[str]
+    ) -> KVConnectorTransferResults:
+        assert self.connector_worker is not None
+        if hasattr(self.connector_worker, "get_transfer_results"):
+            result = self.connector_worker.get_transfer_results()
+            if (
+                getattr(self, "kv_transfer_config", None) is not None
+                and self.kv_transfer_config.kv_role == "kv_producer"
+                and getattr(self.connector_worker, "pcp_rank", 0) > 0
+                and not getattr(self.connector_worker, "pcp_dcp_sharded", False)
+            ):
+                result.finished_sending.clear()
+        else:
+            result = super().get_transfer_results(finished_req_ids)
+        if self.prefix_state is not None:
+            self.prefix_state.receive_results(result)
+        return result
 
     def register_kv_caches(
         self,
@@ -97,13 +142,6 @@ class IluNixlPushConnector(IluNixlPushBaseConnector):
         assert isinstance(self.connector_worker, IluNixlPushConnectorWorker)
         assert isinstance(self._connector_metadata, NixlConnectorMetadata)
         self.connector_worker.start_load_kv(self._connector_metadata)
-
-    def bind_connector_metadata(
-        self, connector_metadata: KVConnectorMetadata
-    ) -> None:
-        super().bind_connector_metadata(connector_metadata)
-        if self.connector_worker is not None:
-            self.connector_worker.bind_connector_metadata(connector_metadata)
 
     def wait_for_save(self) -> None:
         # vLLM calls this after model.forward has enqueued the entire prefill

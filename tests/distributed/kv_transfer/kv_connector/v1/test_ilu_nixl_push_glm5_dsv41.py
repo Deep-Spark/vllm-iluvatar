@@ -2278,3 +2278,462 @@ def test_heartbeat_renewals_are_capped_so_blocks_eventually_free():
 
     w._handle_heartbeat("req-pin")  # over the cap -> force expiry
     assert w._reqs_to_send["req-pin"] <= time.perf_counter()
+
+
+# ========================================================================= #
+# DeepSeek-V4.1 E25 (attach_prefix_state) Tests for IluNixlPushConnector
+# ========================================================================= #
+
+
+def _e25_vllm_config(tmp_path, role: str = "kv_consumer", tp: int = 2, pp: int = 1):
+    hf = SimpleNamespace(
+        model_type="deepseek_v41_text",
+        num_hidden_layers=40,
+        sliding_window=128,
+        head_dim=512,
+        hidden_size=5120,
+        hc_mult=4,
+        index_topk=512,
+        candidate_topk_blocks=2048,
+        index_head_dim=128,
+        kv_source_layer_ids=[2, 8, 14, 20],
+        index_source_layer_ids=[2, 8, 14, 20, 24, 28, 32, 36],
+        compress_ratios=[0, 0] + [2] * 18 + [1] * 20,
+    )
+    extra: dict[str, Any] = {"prefix_state_root": str(tmp_path)}
+    transfer = SimpleNamespace(
+        kv_role=role,
+        kv_connector="IluNixlPushConnector",
+        engine_id="P" if role == "kv_producer" else "D",
+        kv_buffer_device="cuda",
+        kv_connector_extra_config=extra,
+        get_from_extra_config=lambda key, default=None: extra.get(key, default),
+    )
+    return SimpleNamespace(
+        kv_transfer_config=transfer,
+        use_v2_model_runner=True,
+        num_prefill_lookahead_tokens=0,
+        model_config=SimpleNamespace(
+            hf_text_config=hf,
+            hf_config=SimpleNamespace(text_config=hf),
+            use_mla=True,
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=tp,
+            pipeline_parallel_size=pp,
+            data_parallel_size=1,
+            data_parallel_index=0,
+            data_parallel_rank=0,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+        cache_config=SimpleNamespace(
+            block_size=64,
+            cache_dtype="bfloat16",
+            mamba_cache_mode="none",
+            swa_bounded_replay=True,
+        ),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+    )
+
+
+def _e25_kv_cache_config():
+    layer_names = [
+        "model.layers.2.attn",
+        "model.layers.2.attn.indexer.k_cache",
+        "model.layers.8.attn",
+        "model.layers.8.attn.indexer.k_cache",
+        "model.layers.14.attn",
+        "model.layers.14.attn.indexer.k_cache",
+        "model.layers.20.attn",
+        "model.layers.20.attn.indexer.k_cache",
+        "model.layers.0.attn.swa_cache",
+    ]
+    groups = []
+    for name in layer_names:
+        if name.endswith(".swa_cache"):
+            spec = SlidingWindowMLASpec(
+                block_size=64,
+                num_kv_heads=1,
+                head_size=512,
+                dtype=torch.bfloat16,
+                sliding_window=128,
+                bounded_replay=True,
+            )
+        else:
+            spec = MLAAttentionSpec(
+                block_size=64,
+                num_kv_heads=1,
+                head_size=128 if "indexer" in name else 512,
+                dtype=torch.bfloat16,
+            )
+        groups.append(KVCacheGroupSpec([name], spec))
+    return SimpleNamespace(
+        kv_cache_groups=groups,
+        transfer_groups=tuple(groups),
+        transfer_group_ids=tuple(range(len(groups))),
+        has_mamba_layers=False,
+        select_transfer_block_ids=lambda ids: tuple(ids),
+    )
+
+
+def test_push_connector_attach_prefix_state_and_worker_hooks(
+    monkeypatch, tmp_path
+):
+    """Worker facade attaches E25 state (standalone & MultiConnector) and forwards metadata/results."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorTransferResults,
+    )
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+    from vllm_iluvatar.v1.worker.prefill_state.consumer import (
+        ConsumerPrefixState,
+    )
+    from vllm_iluvatar.v1.worker.prefill_state.runtime import (
+        attach_prefix_state,
+    )
+
+    conn = object.__new__(IluNixlPushConnector)
+    worker_bound: list[Any] = []
+    state_bound: list[Any] = []
+    state_results: list[Any] = []
+    xfer_res = KVConnectorTransferResults(
+        finished_sending={"s1"},
+        finished_recving={"r1"},
+        failed_recving={"r2"},
+    )
+    conn.connector_worker = SimpleNamespace(
+        bind_connector_metadata=worker_bound.append,
+        get_transfer_results=lambda: xfer_res,
+        pcp_rank=0,
+        pcp_dcp_sharded=False,
+    )
+    conn.kv_transfer_config = SimpleNamespace(kv_role="kv_consumer")
+
+    fake_state = SimpleNamespace(
+        bind_metadata=state_bound.append,
+        receive_results=state_results.append,
+    )
+
+    # Standalone & MultiConnector discovery via runtime.attach_prefix_state
+    attach_prefix_state(conn, fake_state)
+    assert conn.prefix_state is fake_state
+    conn.prefix_state = None
+    attach_prefix_state(
+        SimpleNamespace(sub_connectors=[SimpleNamespace(), conn]),
+        fake_state,
+    )
+    assert conn.prefix_state is fake_state
+
+    meta = IluNixlPushConnectorMetadata()
+    meta.add_new_req_to_recv(
+        request_id="r1",
+        local_block_ids=([11, 12],),
+        kv_transfer_params={
+            "remote_block_ids": (),
+            "remote_engine_id": "P",
+            "remote_request_id": "r1",
+            "remote_host": "10.0.0.1",
+            "remote_port": 5600,
+            "tp_size": 2,
+            "pp_size": 4,
+            "pp_split": "5,5,5,25",
+        },
+        awaiting_kvs=True,
+        prompt_token_len=257,
+    )
+    meta.source_state_endpoints["r1"] = {
+        "engine_id": "P",
+        "addr": "10.0.0.1:5600",
+        "N": 257,
+        "token_sha256": "a" * 64,
+    }
+    meta.source_full_ready_receipts["r1"] = {"request_id": "r1", "N": 257}
+
+    # Verify IPC MsgpackEncoder/MsgpackDecoder round-trip (as used on SchedulerOutput).
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    wire_bytes = MsgpackEncoder().encode(meta)
+    decoded_meta = MsgpackDecoder().decode(wire_bytes)
+    assert decoded_meta.reqs_to_recv["r1"].prompt_token_len == 257
+    assert decoded_meta.reqs_to_recv["r1"].engine_id == "P"
+    assert (
+        decoded_meta.source_state_endpoints["r1"]["addr"] == "10.0.0.1:5600"
+    )
+    assert decoded_meta.source_full_ready_receipts["r1"]["N"] == 257
+
+    # Verify real ConsumerPrefixState.bind_metadata consumes decoded push metadata cleanly.
+    consumer = object.__new__(ConsumerPrefixState)
+    consumer._p21_ready = True
+    consumer._p21_full_ready = {}
+    consumer._p21_recv_metadata = {}
+    consumer._p21_wake = threading.Event()
+    consumer._p21_rank = 0
+    consumer._p21_result = tmp_path
+    consumer.bind_metadata(decoded_meta)
+    assert (tmp_path / "full_ready_0.json").exists()
+    assert consumer._p21_recv_metadata["r1"] == {
+        "prompt_token_len": 257,
+        "local_block_ids": ([11, 12],),
+        "engine_id": "P",
+        "source_endpoint": decoded_meta.source_state_endpoints["r1"],
+    }
+    assert consumer._p21_full_ready["r1"] == {"request_id": "r1", "N": 257}
+
+    conn.bind_connector_metadata(decoded_meta)
+    assert worker_bound == [decoded_meta]
+    assert state_bound == [decoded_meta]
+
+    got = conn.get_transfer_results(set())
+    assert got is xfer_res
+    assert state_results == [xfer_res]
+
+
+def test_push_scheduler_e25_lifecycle_receipts_and_proxy_peer_fallback(
+    tmp_path, monkeypatch
+):
+    """Push scheduler wires E25 create/allocated/completed/add_metadata/shutdown."""
+    from vllm_iluvatar.v1.worker.prefill_state.configuration import (
+        initialize_config,
+    )
+
+    monkeypatch.delenv("VLLM_ILU_NIXL_PROXY_ADDR", raising=False)
+    monkeypatch.delenv("IXLLM_ADDR_PD", raising=False)
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+
+    # Without initialize_config (no SESSION_KEY), scheduler skips E25 cleanly.
+    uninit_cfg = _e25_vllm_config(tmp_path, role="kv_consumer")
+    kv_cfg = _e25_kv_cache_config()
+    plain_sched = IluNixlPushConnectorScheduler(uninit_cfg, "D", kv_cfg)
+    assert plain_sched.prefix_state is None
+    plain_sched.shutdown()
+
+    # With initialize_config, E25 PrefixSchedulerState attaches automatically.
+    d_cfg = _e25_vllm_config(tmp_path, role="kv_consumer")
+    initialize_config(d_cfg)
+    sched = IluNixlPushConnectorScheduler(d_cfg, "D", kv_cfg)
+    assert sched.prefix_state is not None
+    assert sched.prefix_state.consumer is True
+
+    n = 257
+    req = SimpleNamespace(
+        request_id="req-e25-1",
+        num_prompt_tokens=n,
+        prompt_token_ids=list(range(n)),
+        num_computed_tokens=0,
+        replay_start=0,
+        kv_transfer_params={
+            "do_remote_prefill": True,
+            "remote_engine_id": "P",
+            "remote_host": "10.112.2.51",
+            "remote_port": "8020",
+            "tp_size": 2,
+            "pp_size": 4,
+            "pp_split": "5,5,5,25",
+        },
+    )
+    sched.on_new_request(req)
+
+    raw_blocks = [
+        [
+            SimpleNamespace(
+                block_id=g * 10 + j + 1,
+                block_hash="cached" if j == 0 else None,
+                is_null=False,
+            )
+            for j in range(5)
+        ]
+        for g in range(len(kv_cfg.kv_cache_groups))
+    ]
+    full_ids = tuple([b.block_id for b in grp] for grp in raw_blocks)
+    unhashed_ids = tuple(
+        [b.block_id for b in grp if b.block_hash is None] for grp in raw_blocks
+    )
+    blocks = SimpleNamespace(
+        blocks=raw_blocks,
+        get_block_ids=lambda: full_ids,
+        get_unhashed_block_ids_all_groups=lambda: unhashed_ids,
+    )
+
+    sched.update_state_after_alloc(req, blocks, num_external_tokens=193)
+    # allocated() ran BEFORE super() flipped do_remote_prefill to False.
+    assert not req.kv_transfer_params["do_remote_prefill"]
+    assert sched.prefix_state.requests["req-e25-1"]["external"] == 193
+
+    sched_out = SimpleNamespace(
+        finished_req_ids=set(),
+        preempted_req_ids=set(),
+        num_scheduled_tokens={"req-e25-1": 129},
+        kv_connector_block_state=SimpleNamespace(
+            get_block_ids=lambda rid: full_ids
+        ),
+    )
+    meta1 = sched.build_connector_meta(sched_out)
+    assert meta1.reqs_to_recv["req-e25-1"].prompt_token_len == n
+    assert meta1.reqs_to_recv["req-e25-1"].engine_id == "P"
+    assert (
+        meta1.source_state_endpoints["req-e25-1"]["addr"] == "10.112.2.51:8020"
+    )
+    assert not meta1.source_full_ready_receipts
+
+    # Complete KV receive via MRO (NixlPushConnectorScheduler -> Base -> PrefixSchedulerState).
+    sched.update_connector_output(
+        SimpleNamespace(
+            finished_sending=set(),
+            finished_recving={"req-e25-1"},
+            failed_recving=set(),
+            invalid_block_ids=set(),
+        )
+    )
+    assert "req-e25-1" not in sched._push_registration_deadlines
+    req.num_computed_tokens = req.replay_start = 128
+
+    meta2 = sched.build_connector_meta(sched_out)
+    receipt = meta2.source_full_ready_receipts["req-e25-1"]
+    assert receipt["H"] == 256
+    assert receipt["S"] == 128
+    assert receipt["query_rows"] == 129
+    assert receipt["remote_engine_id"] == "P"
+    assert receipt["groups"][0] == list(full_ids[0])
+    assert receipt["received_positions"][0][0] == {"logical": 1, "block_id": 2}
+
+    # Verify fail-closed on receive failure.
+    sched.update_connector_output(
+        SimpleNamespace(
+            finished_sending=set(),
+            finished_recving=set(),
+            failed_recving={"req-e25-1"},
+            invalid_block_ids=set(),
+        )
+    )
+    meta3 = sched.build_connector_meta(sched_out)
+    assert not meta3.source_full_ready_receipts
+
+    # Verify proxy cache side_channel_addr fallback when remote_host/port omitted on record.
+    sched._proxy_meta_cache["P-proxy"] = {
+        "side_channel_addr": "10.20.30.40:9100"
+    }
+    sched.prefix_state.requests["req-proxy"] = {
+        "request": SimpleNamespace(
+            num_prompt_tokens=256,
+            prompt_token_ids=list(range(256)),
+            num_computed_tokens=0,
+            replay_start=0,
+            kv_transfer_params={"remote_engine_id": "P-proxy"},
+        ),
+        "serial": 2,
+        "external": 256,
+        "local": 0,
+        "remote_engine_id": "P-proxy",
+        "received": False,
+        "failed": False,
+        "received_positions": {},
+    }
+    peers = sched._resolve_prefix_state_peers(
+        SimpleNamespace(reqs_to_recv={"req-proxy": object()})
+    )
+    assert peers["P-proxy"].addr == "10.20.30.40:9100"
+
+    sched.shutdown()
+    assert sched.prefix_state is None
+
+
+def test_push_handshake_listener_serves_e25_get_state_over_zmq(
+    tmp_path, monkeypatch
+):
+    """Push side-channel listener serves GET_STATE packets and UNSUPPORTED replies."""
+    import hashlib
+    import socket
+
+    import msgspec
+    import zmq
+
+    from tests.v1.worker.prefill_state.test_source_state import PacketTest
+    from vllm_iluvatar.v1.worker.prefill_state import source_state as pub
+    from vllm_iluvatar.v1.worker.prefill_state.configuration import (
+        PrefixGeometry,
+        initialize_config,
+    )
+
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "5,5,5,25")
+    monkeypatch.delenv("VLLM_ILU_PD_PREFILL_FULL_DEPTH", raising=False)
+    monkeypatch.delenv("VLLM_ILU_NIXL_PROXY_ADDR", raising=False)
+    monkeypatch.delenv("IXLLM_ADDR_PD", raising=False)
+
+    p_cfg = _e25_vllm_config(tmp_path, role="kv_producer", tp=2, pp=4)
+    initialize_config(p_cfg)
+    kv_cfg = _e25_kv_cache_config()
+    sched = IluNixlPushConnectorScheduler(p_cfg, "P", kv_cfg)
+    assert sched.prefix_state is not None
+    assert sched.prefix_state.consumer is False
+
+    # Stop background poll so we control publication deterministically in test.
+    sched.prefix_state.stop.set()
+    if sched.prefix_state.thread is not None:
+        sched.prefix_state.thread.join(timeout=2.0)
+        sched.prefix_state.thread = None
+
+    helper = PacketTest()
+    helper.wire = sched.prefix_state.wire
+    helper.source = sched.prefix_state.wire / "source"
+    helper.engine = "P"
+    helper.nonce = sched.prefix_state.nonce
+    n = 257
+    digest = hashlib.sha256(b"push-e25-prompt").hexdigest()
+    helper.digest = digest
+    helper.shards(rid="req-zmq", n=n, indexer_bytes=132)
+    sched.prefix_state.publisher.poll(10)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    ready = threading.Event()
+    stop = threading.Event()
+    listener = threading.Thread(
+        target=sched._nixl_handshake_listener,
+        args=({}, ready, stop, "127.0.0.1", port),
+        daemon=True,
+    )
+    listener.start()
+    assert ready.wait(timeout=2.0)
+
+    ctx = zmq.Context()
+    try:
+        sock = ctx.socket(zmq.REQ)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.setsockopt(zmq.RCVTIMEO, 2000)
+        sock.connect(f"tcp://127.0.0.1:{port}")
+
+        # 1. Valid published packet -> READY + verified payload via fetch_state.
+        reply, raw = pub.fetch_state(
+            sock,
+            "P",
+            "req-zmq",
+            tp=1,
+            n=n,
+            digest=digest,
+            geometry=PrefixGeometry(indexer_width=132),
+            ring_rows={2: 16, 8: 16, 14: 16},
+        )
+        assert reply["status"] == "READY"
+        assert len(raw) == reply["metadata"]["byte_count"] > 0
+
+        # 2. Consumer / disabled prefix_state -> immediate UNSUPPORTED (no timeout).
+        saved_state = sched.prefix_state
+        sched.prefix_state = None
+        unsupported_reply, unsupported_raw = pub.fetch_state(
+            sock, "P", "req-zmq", tp=0, n=n, digest=digest
+        )
+        assert unsupported_reply["status"] == "UNSUPPORTED"
+        assert unsupported_raw == b""
+        sched.prefix_state = saved_state
+
+        # 3. Disconnect message still works alongside GET_STATE on the same socket.
+        sock.send(msgspec.msgpack.encode(("disconnect", ["eng-dead", 7])))
+        assert sock.recv() == b"teardown_complete"
+        sock.close()
+    finally:
+        stop.set()
+        listener.join(timeout=2.0)
+        ctx.destroy(linger=0)
+        sched.shutdown()

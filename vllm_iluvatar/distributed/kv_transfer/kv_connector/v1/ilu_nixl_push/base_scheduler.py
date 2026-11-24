@@ -5,6 +5,7 @@
 import queue
 import threading
 import time
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import msgspec
@@ -50,7 +51,9 @@ def _parse_disconnect_payload(payload: object) -> tuple[str, int]:
 
 
 class IluNixlPushBaseConnectorScheduler(NixlBaseConnectorScheduler):
-    """Base scheduler propagating PP and V4.1 topology through connector metadata."""
+    """Base scheduler propagating PP, V4.1 topology, and E25 prefix state."""
+
+    prefix_state: Any = None
 
     def __init__(
         self,
@@ -73,6 +76,42 @@ class IluNixlPushBaseConnectorScheduler(NixlBaseConnectorScheduler):
         )
         self._remote_block_starts: dict[str, list[int]] = {}
         self._init_ilu_transfer_clip_rules()
+
+        # Optional E25 DeepSeek-V4.1 prefix-state reuse (attached when platform initialized session).
+        self.prefix_state = None
+        try:
+            from vllm_iluvatar.v1.worker.prefill_state.configuration import (
+                SESSION_KEY,
+                prefix_transfer_config,
+            )
+            from vllm_iluvatar.v1.worker.prefill_state.scheduler_state import (
+                PrefixSchedulerState,
+            )
+
+            transfer = prefix_transfer_config(vllm_config)
+            extra_cfg = getattr(transfer, "kv_connector_extra_config", None)
+            if isinstance(extra_cfg, dict) and SESSION_KEY in extra_cfg:
+                self.prefix_state = PrefixSchedulerState.create(
+                    vllm_config, self.kv_cache_config
+                )
+        except Exception:
+            logger.debug(
+                "PrefixSchedulerState unavailable; skipping E25 attach",
+                exc_info=True,
+            )
+
+    def shutdown(self) -> None:
+        prefix_state = getattr(self, "prefix_state", None)
+        if prefix_state is not None:
+            prefix_state.shutdown()
+            self.prefix_state = None
+        super().shutdown()
+
+    def update_connector_output(self, connector_output) -> None:
+        super().update_connector_output(connector_output)
+        prefix_state = getattr(self, "prefix_state", None)
+        if prefix_state is not None:
+            prefix_state.completed(connector_output)
 
     def _init_ilu_transfer_clip_rules(self) -> None:
         """Compute per-transfer-group V4.1 clip slices while keeping group seats."""
@@ -252,9 +291,22 @@ class IluNixlPushBaseConnectorScheduler(NixlBaseConnectorScheduler):
         host: str,
         port: int,
     ) -> None:
-        """Serve PP-aware NIXL handshakes and ``--opt-nixl-proxy`` disconnect ACKs."""
+        """Serve PP-aware NIXL handshakes, disconnect ACKs, and E25 prefix state."""
         path = make_zmq_path("tcp", host, port)
         logger.debug("Starting push handshake listener on path: %s", path)
+        get_state_tag = None
+        serve_state_fn = None
+        try:
+            from vllm_iluvatar.v1.worker.prefill_state.source_state import (
+                GET_STATE,
+                serve_state,
+            )
+
+            get_state_tag = GET_STATE
+            serve_state_fn = serve_state
+        except Exception:
+            logger.debug("E25 serve_state import skipped", exc_info=True)
+
         with zmq_ctx(zmq.ROUTER, path) as sock:
             sock.setsockopt(zmq.RCVTIMEO, 1000)
             ready_event.set()
@@ -272,6 +324,34 @@ class IluNixlPushBaseConnectorScheduler(NixlBaseConnectorScheduler):
                     logger.warning(
                         "Push handshake listener failed to decode ZMQ payload",
                         exc_info=True,
+                    )
+                    continue
+
+                # Optional E25 DSv4.1 prefix-state query on the shared side-channel socket.
+                if (
+                    serve_state_fn is not None
+                    and isinstance(decoded, (list, tuple))
+                    and decoded
+                    and decoded[0] == get_state_tag
+                ):
+                    prefix_state = getattr(self, "prefix_state", None)
+                    prefix_wire = (
+                        prefix_state.wire
+                        if prefix_state is not None and not prefix_state.consumer
+                        else None
+                    )
+                    state_reply, state_payload = serve_state_fn(
+                        prefix_wire,
+                        getattr(self, "engine_id", ""),
+                        decoded,
+                    )
+                    sock.send_multipart(
+                        (
+                            identity,
+                            b"",
+                            msgspec.msgpack.encode(state_reply),
+                            state_payload,
+                        )
                     )
                     continue
 
@@ -317,6 +397,56 @@ class IluNixlPushBaseConnectorScheduler(NixlBaseConnectorScheduler):
                 ts = msgspec.msgpack.encode(time.perf_counter())
                 sock.send_multipart((identity, b"", rank_payload, ts))
 
+    def _resolve_prefix_state_peers(self, meta) -> dict[str, Any]:
+        """Resolve producer ``host:port`` side-channel endpoints for E25 state pulls."""
+        prefix_state = getattr(self, "prefix_state", None)
+        if prefix_state is None:
+            return {}
+        peers: dict[str, Any] = {}
+        heartbeat_by_engine = getattr(self, "_heartbeat_by_engine", None) or {}
+        proxy_cache = getattr(self, "_proxy_meta_cache", None) or {}
+        peer_node_metas = getattr(self, "peer_node_metas", None) or {}
+        query_proxy = getattr(self, "_query_proxy_node_meta", None)
+
+        for rid, rec in prefix_state.requests.items():
+            r_eid = rec.get("remote_engine_id")
+            if not r_eid or r_eid in peers:
+                continue
+            req_obj = rec.get("request")
+            params = getattr(req_obj, "kv_transfer_params", None) or {}
+            r_host = params.get("remote_host")
+            r_port = params.get("remote_port")
+            if r_host and r_port is not None and str(r_port) != "":
+                peers[r_eid] = SimpleNamespace(addr=f"{r_host}:{r_port}")
+                continue
+            hb = heartbeat_by_engine.get(r_eid)
+            if (
+                hb is not None
+                and getattr(hb, "host", None)
+                and getattr(hb, "port", None)
+            ):
+                peers[r_eid] = SimpleNamespace(addr=f"{hb.host}:{hb.port}")
+                continue
+            peer = peer_node_metas.get(r_eid)
+            if peer is not None and getattr(peer, "addr", None):
+                peers[r_eid] = peer
+                continue
+            p_meta = proxy_cache.get(r_eid)
+            if (
+                p_meta is None
+                and rid in meta.reqs_to_recv
+                and callable(query_proxy)
+            ):
+                p_meta = query_proxy(r_eid)
+            side_addr = (
+                str(p_meta.get("side_channel_addr") or "")
+                if isinstance(p_meta, dict)
+                else ""
+            )
+            if side_addr:
+                peers[r_eid] = SimpleNamespace(addr=side_addr)
+        return peers
+
     def build_connector_meta(self, scheduler_output):
         # Keep in sync with vLLM v0.31.0 NixlBaseConnectorScheduler.build_connector_meta.
         meta = IluNixlPushConnectorMetadata()
@@ -343,6 +473,10 @@ class IluNixlPushBaseConnectorScheduler(NixlBaseConnectorScheduler):
             awaiting_kvs,
         ) in self._reqs_need_recv.items():
             assert req.kv_transfer_params is not None
+            prompt_len = getattr(req, "num_prompt_tokens", None)
+            if not isinstance(prompt_len, int):
+                ptoks = getattr(req, "prompt_token_ids", None)
+                prompt_len = len(ptoks) if ptoks is not None else -1
             meta.add_new_req_to_recv(
                 request_id=req_id,
                 local_block_ids=block_ids,
@@ -350,6 +484,7 @@ class IluNixlPushBaseConnectorScheduler(NixlBaseConnectorScheduler):
                 local_num_computed_blocks=cached,
                 awaiting_kvs=awaiting_kvs,
                 remote_block_starts=self._remote_block_starts.pop(req_id, None),
+                prompt_token_len=prompt_len,
             )
 
         if self.use_host_buffer:
@@ -365,6 +500,11 @@ class IluNixlPushBaseConnectorScheduler(NixlBaseConnectorScheduler):
             if now - self._last_heartbeat_time >= self._heartbeat_interval:
                 self._last_heartbeat_time = now
                 meta.heartbeat_by_engine = self._heartbeat_by_engine
+
+        prefix_state = getattr(self, "prefix_state", None)
+        if prefix_state is not None:
+            peers = self._resolve_prefix_state_peers(meta)
+            prefix_state.add_metadata(meta, scheduler_output, peers)
 
         self._reqs_need_recv.clear()
         self._remote_block_starts.clear()

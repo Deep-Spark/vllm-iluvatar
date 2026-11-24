@@ -269,6 +269,9 @@ class IluNixlPushConnectorScheduler(
     def update_state_after_alloc(
         self, request, blocks, num_external_tokens: int
     ):
+        prefix_state = getattr(self, "prefix_state", None)
+        if prefix_state is not None:
+            prefix_state.allocated(request, blocks, num_external_tokens)
         params = request.kv_transfer_params
         is_decode_registration = params is not None and params.get("do_remote_prefill")
         super().update_state_after_alloc(request, blocks, num_external_tokens)
@@ -296,6 +299,11 @@ class IluNixlPushConnectorScheduler(
                     request.request_id,
                 )
                 return
+            if (
+                prefix_state is not None
+                and request.request_id not in self._reqs_need_recv
+            ):
+                prefix_state.requests.pop(request.request_id, None)
             logger.warning(
                 "[push] D skip PUSH_REG %s: external_tokens=%d "
                 "(stock did not stage registration)",

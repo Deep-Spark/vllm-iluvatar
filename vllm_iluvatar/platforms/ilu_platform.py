@@ -56,6 +56,26 @@ _ILU_BACKEND_MODULE_PATHS = (
 _ILU_GDN_BACKEND_MODULE_PATH = "vllm_iluvatar.v1.attention.backends.ilu_gdn_attn"
 
 
+def _configure_model_processor(model_config) -> None:
+    """Keep HunyuanOCR image patches in the raster order used by its weights.
+
+    Transformers 5.14.1's fast HunyuanVL processor groups patches by merge-size
+    blocks; its PIL processor (also used by the official example) emits raster
+    order. Matching tensor shapes hide the resulting OCR corruption. Default to
+    PIL until the upstream fast processor has equivalent ordering and resizing.
+    Explicit processor choices remain available for upstream compatibility tests.
+    """
+    hf_config = getattr(model_config, "hf_config", None)
+    mm_config = getattr(model_config, "multimodal_config", None)
+    if getattr(hf_config, "model_type", None) != "hunyuan_vl" or mm_config is None:
+        return
+    kwargs = dict(mm_config.mm_processor_kwargs or {})
+    if kwargs.get("use_fast") is None:
+        kwargs["use_fast"] = False
+        mm_config.mm_processor_kwargs = kwargs
+        logger.info("ILU: select HunyuanOCR PIL processor for raster patch order")
+
+
 def _smoke_import_ilu_backend_modules() -> None:
     """Import every ILU override backend module to fail fast on import drift.
 
@@ -289,6 +309,7 @@ def _make_iluvatar_platform():
             ):
                 raise ValueError("FLy verification requires Model Runner V2")
             model_config = getattr(vllm_config, "model_config", None)
+            _configure_model_processor(model_config)
             cache_config = getattr(vllm_config, "cache_config", None)
             compilation_config = getattr(vllm_config, "compilation_config", None)
             scheduler_config = getattr(vllm_config, "scheduler_config", None)

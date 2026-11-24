@@ -16,7 +16,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEQuantConfig,
     RoutedExperts,
-    SharedExperts,
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEExpertsModular,
@@ -26,13 +25,6 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
 
-from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
-    _SWIGLUOAI_VARIANT,
-    ilu_mxfp4_fused_experts,
-)
-from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.nvfp4_moe import (
-    _get_ilu_output_scale,
-)
 from vllm_iluvatar.model_executor.layers.quantization.conversions.fp8_to_fp4 import (
     IX30_GROUP_SIZE,
     Fp8SourceLayout,
@@ -67,7 +59,11 @@ _DEFAULT_FP8_BLOCK = (128, 128)
 #       limit -- not the activation name -- is what distinguishes it from plain
 #       SwiGLU. alpha/beta must be absent: M3's 1.702 / 1.0 would silently
 #       compute a different activation.
-_SUPPORTED_ACTIVATIONS = frozenset({"swigluoai_uninterleave", "silu"})
+#
+# Lived in backends/fp4/mxfp8_moe.py until that module was deleted on
+# bgq_refactor; keep the constants next to this Method.
+_SWIGLUOAI_ACTIVATION = "swigluoai_uninterleave"
+_SUPPORTED_ACTIVATIONS = frozenset({_SWIGLUOAI_ACTIVATION, "silu"})
 
 # MXFP4 microscaling: 32 e2m1 values share one scale. ``_E2M1_LEVELS`` is the
 # full signed code book indexed by nibble, so quantization is a nearest-level
@@ -411,6 +407,51 @@ class IluFp16ToFp4OnlineMoEMethod(IluFp8ToFp4OnlineMoEMethod):
                 f"{dtype_name(loaded_weight.dtype)} for {weight_name!r}"
             )
 
+    def _compute_config(self, layer: RoutedExperts):
+        # Reuse mixin construction; only enforce this path's activation contract
+        # (MXFP8 / ``IxMMFP4FP8Backend.run_standard``): swigluoai needs
+        # limit+alpha+beta; clamped silu needs limit and must not carry alpha/beta
+        # (backend would otherwise default missing OAI coeffs).
+        from dataclasses import replace
+
+        cfg = super()._compute_config(layer)
+        if cfg.activation not in _SUPPORTED_ACTIVATIONS:
+            raise NotImplementedError(
+                "IluFp16ToFp4OnlineMoEMethod supports "
+                f"{sorted(_SUPPORTED_ACTIVATIONS)} routed experts; got "
+                f"activation {cfg.activation!r}."
+            )
+        if cfg.activation == _SWIGLUOAI_ACTIVATION:
+            missing = [
+                name
+                for name, value in (
+                    ("limit", cfg.limit),
+                    ("alpha", cfg.alpha),
+                    ("beta", cfg.beta),
+                )
+                if value is None
+            ]
+            if missing:
+                raise ValueError(
+                    "IluFp16ToFp4OnlineMoEMethod requires "
+                    f"{missing} on MoEComputeConfig for "
+                    f"{cfg.activation!r} routed experts."
+                )
+        else:
+            if cfg.limit is None:
+                raise ValueError(
+                    "IluFp16ToFp4OnlineMoEMethod requires limit on "
+                    f"MoEComputeConfig for {cfg.activation!r} routed experts."
+                )
+            if cfg.alpha is not None or cfg.beta is not None:
+                raise NotImplementedError(
+                    "IluFp16ToFp4OnlineMoEMethod maps clamped-silu onto DSv4 clamp "
+                    "SwiGLU (no alpha/beta); declare swigluoai_uninterleave instead."
+                )
+        if not isinstance(cfg.limit, float):
+            cfg = replace(cfg, limit=float(cfg.limit))
+        return cfg
+
     def get_fused_moe_quant_config(
         self, layer: RoutedExperts
     ) -> FusedMoEQuantConfig | None:
@@ -421,8 +462,9 @@ class IluFp16ToFp4OnlineMoEMethod(IluFp8ToFp4OnlineMoEMethod):
         routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> FusedMoEPrepareAndFinalizeModular | None:
         # Parent GLM method can install ``IluMoEBatchedExpertsFp8`` (silu /
-        # swiglustep). MiniMax compute is ``ilu_mxfp4_fused_experts`` via
-        # ``apply``, the same naive EP-group path MXFP8 uses.
+        # swiglustep). MiniMax FP4 stays on the naive EP-group
+        # ``IxMMFP4FP8Backend.run_standard`` path (same as MXFP8), which is the
+        # only path that carries swigluoai alpha/beta.
         return None
 
     def select_gemm_impl(
@@ -431,8 +473,9 @@ class IluFp16ToFp4OnlineMoEMethod(IluFp8ToFp4OnlineMoEMethod):
         layer: RoutedExperts,
     ) -> FusedMoEExpertsModular:
         raise NotImplementedError(
-            "IluFp16ToFp4OnlineMoEMethod uses apply() -> ilu_mxfp4_fused_experts; "
-            "GLM batched experts are not the MiniMax compute path"
+            "IluFp16ToFp4OnlineMoEMethod uses apply() -> "
+            "IxMMFP4FP8Backend.run_standard; GLM batched experts are not the "
+            "MiniMax FP4 compute path"
         )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
@@ -448,48 +491,3 @@ class IluFp16ToFp4OnlineMoEMethod(IluFp8ToFp4OnlineMoEMethod):
                     f"{int(bad_mask.sum().item())} non-finite values after "
                     f"load-time FP4 convert (local experts {bad_ids[:8]})"
                 )
-
-    def apply(
-        self,
-        layer: RoutedExperts,
-        x: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        shared_experts: SharedExperts | None,
-        shared_experts_input: torch.Tensor | None,
-    ) -> torch.Tensor:
-        activation = getattr(layer, "activation", None)
-        activation = getattr(activation, "value", activation)
-        if activation not in _SUPPORTED_ACTIVATIONS:
-            raise NotImplementedError(
-                "IluFp16ToFp4OnlineMoEMethod supports "
-                f"{sorted(_SUPPORTED_ACTIVATIONS)} routed experts; got "
-                f"activation {activation!r}"
-            )
-        missing = [
-            name
-            for name in ("swiglu_limit", "swiglu_alpha", "swiglu_beta")
-            if getattr(layer, name, None) is None
-        ]
-        if missing:
-            raise ValueError(
-                f"IluFp16ToFp4OnlineMoEMethod requires {missing} on the layer "
-                f"for {sorted(_SUPPORTED_ACTIVATIONS)} routed experts"
-            )
-        return ilu_mxfp4_fused_experts(
-            hidden_states=x,
-            w13_weight=layer.w13_weight,
-            w13_weight_scale=layer.w13_weight_scale,
-            w2_weight=layer.w2_weight,
-            w2_weight_scale=layer.w2_weight_scale,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            expert_map=layer.expert_map,
-            output_scale=_get_ilu_output_scale(layer),
-            extra_residual=shared_experts_input,
-            swiglu_limit=float(layer.swiglu_limit),
-            swiglu_alpha=layer.swiglu_alpha,
-            swiglu_beta=layer.swiglu_beta,
-            backend="ixmm",
-            swiglu_variant=_SWIGLUOAI_VARIANT,
-        )

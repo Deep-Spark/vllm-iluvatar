@@ -48,7 +48,6 @@ from vllm_iluvatar.model_executor.layers.quantization.conversions.nvfp4_to_w4a8 
 _IXMM_EXPERT_CHUNK = 4
 _NVFP4_GROUP_SIZE = 16
 _IXMM_GROUP_SIZE = 256
-_FP4_MAX_MAG = 6.0
 
 # What each conversion target needs of K. The requirement comes from the
 # converter, not the kernel: the ix30 repack groups 256 values per scale and
@@ -75,12 +74,9 @@ def preprocess_nvfp4_weight_for_ixmm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Convert one expert-chunk of NVFP4 weights to the ixmm ix30 format.
 
-    This is a NVFP4 counterpart of ixformer's
-    ``_preprocess_weight_for_ixmm_torch`` (``fp4/gemm/gemm.py:183-220``): the
-    only difference is step 2's dequant (per-16 e4m3 block scale times a
-    per-expert global scale instead of per-32 e8m0). Steps 3-7 reuse ixformer's
-    leaf helpers verbatim, which is what guarantees the output is byte-identical
-    to the MXFP4 ix30 tensors the compute path already accepts.
+    Thin wrapper around IxFormer ``nvfp4_to_fp4fp8`` (native CUDA; same
+    contract as the historical inlined torch path). Requires the matching
+    IxFormer build with the native backend registered.
 
     Args:
         weight:       ``[E, n, k/2]`` uint8, two e2m1 fp4 packed along ``k``.
@@ -91,45 +87,17 @@ def preprocess_nvfp4_weight_for_ixmm(
         ixmm_weight: ``[E, k/2, n]`` uint8 in ix30 packed layout.
         ixmm_scale:  ``[E, k/256, n]`` float32 running-acc ratio scale.
     """
-    # Lazy import keeps this module importable without ixformer (CPU-only unit
-    # tests), matching the MXFP4 method's lazy-import discipline.
-    from ixformer.inference.functions.ops.gemm.fp4.gemm import gemm as ixmm_gemm
-
-    expert, n_dim, packed_k = weight.shape
-    k = packed_k * 2
-    assert k % _IXMM_GROUP_SIZE == 0, f"k={k} must be a multiple of {_IXMM_GROUP_SIZE}"
-
-    # 1. Unpack uint8 -> nibbles [E, n, k].
-    nibbles = ixmm_gemm._unpack_int8_to_nibbles(weight)
-
-    # 2. NVFP4 dequant: fp4 magnitude * per-16 block scale * per-expert global.
-    block_scale = weight_scale.float()  # [E, n, k/16]
-    weight_float = ixmm_gemm._fp4_to_float(nibbles)  # [E, n, k]
-    weight_float = weight_float * block_scale.repeat_interleave(
-        _NVFP4_GROUP_SIZE, dim=-1
+    # Lazy import + native-only, matching MXFP4 / block-FP8 loaders.
+    from vllm_iluvatar.model_executor.layers.quantization.common.paired_moe_loader import (
+        _native_converter,
     )
-    weight_float = weight_float * global_scale.to(torch.float32).reshape(expert, 1, 1)
 
-    # 3. Transpose [E, n, k] -> [E, k, n].
-    weight_float = weight_float.transpose(1, 2).contiguous()
-
-    # 4. Per-256 absolute scale: amax / FP4_MAX_MAG.
-    groups_256 = k // _IXMM_GROUP_SIZE
-    grouped = weight_float.reshape(expert, groups_256, _IXMM_GROUP_SIZE, n_dim)
-    amax = grouped.abs().amax(dim=2)  # [E, groups, n]
-    ixmm_scale = (amax / _FP4_MAX_MAG).clamp(min=1e-12)
-
-    # 5. Re-quantise to fp4 nibbles [E, k, n].
-    normalized = grouped / ixmm_scale.unsqueeze(2)
-    new_nibbles = ixmm_gemm._quantize_fp4(normalized.reshape(expert, k, n_dim))
-
-    # 6. Pack into ix30 layout [E, k/2, n].
-    ixmm_weight = ixmm_gemm._pack_nibbles_ix30(new_nibbles)
-
-    # 7. Absolute scale -> running-acc ratio for the ixmm kernel.
-    ixmm_scale = ixmm_gemm.preprocess_group_scale_for_running_acc(ixmm_scale)
-
-    return ixmm_weight, ixmm_scale
+    return _native_converter("nvfp4_to_fp4fp8")(
+        weight,
+        weight_scale,
+        global_scale,
+        backend="ixformer_native",
+    )
 
 
 def _get_ilu_output_scale(layer: RoutedExperts) -> float:

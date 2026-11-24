@@ -113,6 +113,16 @@ class DeferredCheckpointTensor(torch.Tensor):
                 )
                 for begin in range(0, length, size)
             )
+        # ``RoutedExperts.load_weights`` unbinds a fused [E, ...] shard into
+        # per-expert rows (MiniMax-M2.5 block-FP8). Without this, unbind
+        # materializes and paired loading rejects the plain Tensor.
+        if func is torch.ops.aten.unbind.int and isinstance(args[0], cls):
+            value = args[0]
+            dim = args[1] if len(args) > 1 else kwargs.get("dim", 0)
+            length = value.reference.metadata.shape[dim]
+            return tuple(
+                torch.ops.aten.select.int(value, dim, index) for index in range(length)
+            )
         if func in cls._views and isinstance(args[0], cls):
             value = args[0]
             ref = value.reference

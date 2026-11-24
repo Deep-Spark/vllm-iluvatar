@@ -219,6 +219,38 @@ def test_chunking_a_fused_expert_tensor_stays_deferred(tmp_path):
         session.close()
 
 
+def test_unbinding_a_fused_expert_tensor_stays_deferred(tmp_path):
+    """Fused [E, ...] MoE shards are unbound into per-expert rows (MiniMax-M2).
+
+    ``Tensor.unbind`` must stay deferred like ``chunk``; materializing would make
+    paired block-FP8 loading reject the plain Tensor at ``PairedLoadSession.add``.
+    """
+    model = MappedModel(1)
+    files = checkpoint(tmp_path, model)
+    session = PairedLoadSession({model.loaders[0]: "block"})
+    session.bind()
+    try:
+        ref = next(
+            r for r in checkpoint_references(files) if r.source.name == "source_000"
+        )
+        tensor = DeferredCheckpointTensor(ref, session.readers)
+        rows = tensor.shape[0]
+
+        experts = tensor.unbind(0)
+
+        assert session.readers.reads == 0
+        assert len(experts) == rows
+        assert all(isinstance(expert, DeferredCheckpointTensor) for expert in experts)
+        assert all(expert.shape == tensor.shape[1:] for expert in experts)
+        whole = ref.read(session.readers)
+        for index, expert in enumerate(experts):
+            destination = torch.empty(expert.shape, dtype=expert.dtype)
+            destination.copy_(expert)
+            assert torch.equal(destination, whole[index])
+    finally:
+        session.close()
+
+
 def test_registered_loader_discovers_callbacks_and_releases_session(
     tmp_path, monkeypatch
 ):

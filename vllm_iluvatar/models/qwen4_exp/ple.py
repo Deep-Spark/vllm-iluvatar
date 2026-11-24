@@ -25,6 +25,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
+from vllm_iluvatar.config.ilu_compute import native_ple_backend
+from vllm_iluvatar.model_executor.layers.quantization.configs.native import (
+    IluNativeQuantConfig,
+)
+
 from .config import Qwen4ExpTextConfig
 from .ple_utils import copy_ple_embedding_shard_
 
@@ -343,11 +348,19 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             persistent=True,
         )
         divisor = int(config.make_ngram_vocab_size_divisible_by)
+        self.quantize_ngram_at_load = (
+            isinstance(quant_config, IluNativeQuantConfig)
+            and native_ple_backend() == "int8"
+        )
         self.ngram_embedding = Qwen4ExpNGramTable(
             ((offset + divisor - 1) // divisor) * divisor,
             self.head_dim,
-            quant_kind=_ple_embedding_quant_kind(
-                quant_config, f"{prefix}.ngram_embedding"
+            quant_kind=(
+                "int8"
+                if self.quantize_ngram_at_load
+                else _ple_embedding_quant_kind(
+                    quant_config, f"{prefix}.ngram_embedding"
+                )
             ),
             params_dtype=params_dtype or torch.get_default_dtype(),
             divisible_by=divisor,
@@ -485,6 +498,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             checkpoint_start=checkpoint_start,
             tp_start=embedding.shard_indices.org_vocab_start_index,
             tp_end=embedding.shard_indices.org_vocab_end_index,
+            destination_scale=(
+                embedding.weight_scale if self.quantize_ngram_at_load else None
+            ),
         )
         return True
 
@@ -514,6 +530,26 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 buffer.copy_(loaded_weight.to(device=buffer.device, dtype=buffer.dtype))
                 loaded.add(name)
                 continue
+            if self.quantize_ngram_at_load and name == "ngram_embedding.weight":
+                if loaded_weight.shape != (
+                    embedding.org_vocab_size,
+                    embedding.embedding_dim,
+                ):
+                    raise ValueError(
+                        f"Invalid native PLE table shape: {loaded_weight.shape}"
+                    )
+                copy_ple_embedding_shard_(
+                    embedding.weight,
+                    loaded_weight,
+                    checkpoint_start=0,
+                    tp_start=embedding.shard_indices.org_vocab_start_index,
+                    tp_end=embedding.shard_indices.org_vocab_end_index,
+                    destination_scale=embedding.weight_scale,
+                )
+                loaded.update(
+                    ("ngram_embedding.weight", "ngram_embedding.weight_scale")
+                )
+                continue
             if self._copy_ngram_shard(
                 name,
                 loaded_weight,
@@ -522,7 +558,17 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 embedding.embedding_dim,
             ):
                 loaded.add("ngram_embedding.weight")
+                if self.quantize_ngram_at_load:
+                    loaded.add("ngram_embedding.weight_scale")
                 continue
+            if (
+                self.quantize_ngram_at_load
+                and name.startswith("ngram_embedding.")
+                and name.endswith(".weight_scale")
+            ):
+                raise ValueError(
+                    f"Unexpected checkpoint scale for native PLE table: {name}"
+                )
             weight_scale = getattr(embedding, "weight_scale", None)
             if weight_scale is not None and self._copy_ngram_shard(
                 name,

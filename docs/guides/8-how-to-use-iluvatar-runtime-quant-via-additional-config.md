@@ -926,7 +926,34 @@ loader 按 128 的倍数拼接。GLM-5.2 的 `q_lora_rank=2048`、`intermediate_
 INT8 分支保留源 FP8 参数及 TP/fused loader，加载后转换为 per-channel INT8，
 再调用已有 W8A8 scheme 的布局、padding 与 GEMM/GEMV 选择。转换器支持
 128×128/32×32 block 和 FP32/E8M0 scales。Row-parallel channel scale 按本 rank
-的 K 分片计算，不保证与离线 full-K 量化字节一致。原生 BF16 不受此选项影响；
-需要转换时仍须显式 `ilu_quant`。已有 FP8 Linear online quant factory 继续有效，
+的 K 分片计算，不保证与离线 full-K 量化字节一致。原生 BF16/FP16 Linear 由下文的
+`linear.native_backend` 控制。已有 FP8 Linear online quant factory 继续有效，
 显式 FP8 执行与 INT8 target 冲突时拒绝。旧 compressed-tensors checkpoint
 继续使用其已有入口。所有权重转换发生在加载阶段，不进入 forward/Graph replay。
+
+## ivcore11 原生 BF16/FP16 checkpoint 的执行选择
+
+原生 checkpoint 的默认分发由 `additional_config.ilu_compute` 控制。每项可独立设置。
+
+| 配置项 | 默认 `auto` | 显式选项 |
+| --- | --- | --- |
+| `linear.native_backend` | `w8a8_int8` | `w8a8_int8`、`original` |
+| `moe.mode` | `ixinfer_w4a8_nn_v2` | `ixinfer_w4a8_nn_v2`、`ixinfer_w4a8_tn_v2`、`original` |
+| `ple.backend` | `int8` | `int8`、`original` |
+
+`ple.backend` 适用于带 PLE n-gram 表的原生 Qwen4Exp 模型。INT8 路径在加载时按
+TP 行范围分块量化，生成逐行 FP32 scale，推理时反量化查到的行。已量化 checkpoint
+沿用 checkpoint 指定的表格式。各项的 `original` 使用 `--dtype` 选定的 BF16 或
+FP16。省略任意配置项时，该项独立使用默认值。
+
+仅保留 PLE 表的原始精度：
+
+```bash
+--additional-config '{"ilu_compute":{"ple":{"backend":"original"}}}'
+```
+
+将三个部件均设为原始精度，可用于有足够显存的精度对照：
+
+```bash
+--additional-config '{"ilu_compute":{"linear":{"native_backend":"original"},"moe":{"mode":"original"},"ple":{"backend":"original"}}}'
+```

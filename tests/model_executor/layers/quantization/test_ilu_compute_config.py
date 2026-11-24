@@ -261,3 +261,16 @@ def test_native_modes_take_only_their_canonical_spelling(monkeypatch, mode):
             ilu_compute.native_linear_backend()
     with pytest.raises(ValueError, match="native BF16/FP16 mode"):
         ilu_compute.native_moe_compute()
+
+
+@pytest.mark.parametrize("setting", ["fp8", "", None, ["int8"], {"mode": "int8"}])
+def test_invalid_native_ple_backend(monkeypatch, setting):
+    monkeypatch.setattr(
+        ilu_compute,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            additional_config={"ilu_compute": {"ple": {"backend": setting}}}
+        ),
+    )
+    with pytest.raises(ValueError, match=r"ilu_compute[.]ple[.]backend"):
+        ilu_compute.native_ple_backend()

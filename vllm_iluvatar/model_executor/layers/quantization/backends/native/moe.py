@@ -124,9 +124,9 @@ class IluNativeToW4A8MoEMethod(MoEComputeBindingMixin, FusedMoEMethodBase):
                 source = loaded_weight
                 target, target_scale = param.data[local], scale.data[local]
                 k_start, k_size = rank * intermediate, intermediate
-            packed, channel_scale = _pack_weight(
-                source.to(param.device), layout, k_start, k_size
-            )
+            # Keep the BF16 input and FP32 intermediates on the checkpoint
+            # device. Upload only the packed weight and channel scales.
+            packed, channel_scale = _pack_weight(source, layout, k_start, k_size)
             target.copy_(packed)
             target_scale.copy_(channel_scale)
             self._loaded.add((local, shard_id))

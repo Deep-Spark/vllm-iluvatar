@@ -9,14 +9,18 @@ def compute_options(section: str) -> dict:
     raw = (config.additional_config or {}).get("ilu_compute", {})
     if not isinstance(raw, dict):
         raise ValueError("ilu_compute must be an object")
-    if set(raw) - {"schema_version", "linear", "moe"}:
+    allowed = {
+        "linear": {"fp8_backend", "native_backend"},
+        "moe": {"mode"},
+        "ple": {"backend"},
+    }
+    if set(raw) - {"schema_version", *allowed}:
         raise ValueError("Unknown ilu_compute field")
     if (
         type(raw.get("schema_version", 1)) is not int
         or raw.get("schema_version", 1) != 1
     ):
         raise ValueError("ilu_compute.schema_version must be 1")
-    allowed = {"linear": {"fp8_backend", "native_backend"}, "moe": {"mode"}}
     for key, fields in allowed.items():
         value = raw.get(key, {})
         if not isinstance(value, dict) or set(value) - fields:
@@ -52,6 +56,15 @@ def native_linear_backend() -> str:
     if backend == NATIVE_PRECISION_MODE:
         return NATIVE_PRECISION_MODE
     raise ValueError(f"Unsupported ilu_compute.linear.native_backend: {backend!r}")
+
+
+def native_ple_backend() -> str:
+    backend = compute_options("ple").get("backend", "auto")
+    if backend in ("auto", "int8"):
+        return "int8"
+    if backend == NATIVE_PRECISION_MODE:
+        return NATIVE_PRECISION_MODE
+    raise ValueError(f"Unsupported ilu_compute.ple.backend: {backend!r}")
 
 
 def native_moe_compute():

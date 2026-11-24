@@ -284,6 +284,14 @@ MoE 和 Linear 可独立选择，例如将 MoE 切到 TN，同时保留 Linear �
 
 该默认分发针对 ivcore11 的原生模型。已量化 checkpoint、显式 `ilu_quant` 和预转换 sharded-state 加载沿用各自的分发路径。
 
+#### ivcore11 原生 Qwen4Exp PLE n-gram 表
+
+`ilu_compute.ple.backend` 单独控制原生 BF16/FP16 checkpoint 的 PLE n-gram 表。
+`auto`（默认）和 `int8` 均在建表时分配 INT8 权重和逐行 FP32 scale。加载器只取与本
+TP rank 重叠的行，在 CPU 上分块量化并直接写入目标表。推理先查表，再反量化命中的行。
+`original` 按 vLLM 的 `--dtype` 分配 BF16/FP16 表。已量化 checkpoint 的 PLE
+格式由 checkpoint 的量化配置确定。
+
 ### 6.2 启用 Hybrid LL decode
 
 在已接入 Hybrid EP 的模型中，配置 DP>1、EP，并以 AG/RS 作为基础通信。LL/NVSM decode 的关键选项如下：

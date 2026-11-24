@@ -7,6 +7,10 @@ from dataclasses import dataclass
 import torch
 from vllm.config import VllmConfig
 
+from vllm_iluvatar.model_executor.layers.quantization.conversions.native_to_int8 import (
+    quantize_native_to_w8a8_int8,
+)
+
 
 def ple_conv_window_state_shape(
     vllm_config: VllmConfig,
@@ -68,8 +72,9 @@ def copy_ple_embedding_shard_(
     checkpoint_start: int,
     tp_start: int,
     tp_end: int,
+    destination_scale: torch.Tensor | None = None,
 ) -> int:
-    """Copy the overlapping rows of a PLE checkpoint shard into a TP table."""
+    """Copy overlapping TP rows, deriving per-row scales for native input."""
 
     if destination.ndim == 0 or loaded_weight.ndim != destination.ndim:
         raise ValueError("destination and loaded weight must have matching ranks")
@@ -91,5 +96,20 @@ def copy_ple_embedding_shard_(
     source = loaded_weight.narrow(0, overlap.source_start, overlap.row_count)
     target = destination.narrow(0, overlap.destination_start, overlap.row_count)
     with torch.no_grad():
-        target.copy_(source.to(device=target.device, dtype=target.dtype))
+        if destination_scale is None:
+            target.copy_(source.to(device=target.device, dtype=target.dtype))
+        else:
+            scales = destination_scale.narrow(
+                0, overlap.destination_start, overlap.row_count
+            )
+            # Quantize bounded CPU chunks and upload only quantized weights and
+            # scales. Never stage a full native checkpoint shard on the GPU.
+            chunk_rows = 32768
+            for start in range(0, overlap.row_count, chunk_rows):
+                count = min(chunk_rows, overlap.row_count - start)
+                packed, scale = quantize_native_to_w8a8_int8(
+                    source.narrow(0, start, count).cpu()
+                )
+                target.narrow(0, start, count).copy_(packed)
+                scales.narrow(0, start, count).copy_(scale)
     return overlap.row_count

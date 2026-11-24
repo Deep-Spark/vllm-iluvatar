@@ -37,6 +37,7 @@ def _make_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
     module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
     nn.Module.__init__(module)
     module.split_ngram_parts = 2
+    module.quantize_ngram_at_load = False
     module.register_buffer("layer_multipliers", torch.zeros(1, dtype=torch.long))
     module.register_buffer("ngram_heads_offsets", torch.zeros(1, dtype=torch.long))
     module.register_buffer("ngram_heads_vocab_sizes", torch.zeros(1, dtype=torch.long))
@@ -120,6 +121,97 @@ def test_ngram_embedding_loads_shards_and_ignores_legacy_token_lookup() -> None:
     torch.testing.assert_close(
         module.ngram_embedding.weight,
         torch.cat((shard_0[2:4], shard_1[0:2])),
+    )
+
+
+@pytest.mark.parametrize(
+    "settings,weight_dtype,has_scale",
+    [
+        ({}, torch.int8, True),
+        ({"backend": "auto"}, torch.int8, True),
+        ({"backend": "int8"}, torch.int8, True),
+        ({"backend": "original"}, torch.bfloat16, False),
+    ],
+)
+def test_native_ple_backend_dispatch(monkeypatch, settings, weight_dtype, has_scale):
+    from vllm_iluvatar.config import ilu_compute
+    from vllm_iluvatar.model_executor.layers.quantization.configs.native import (
+        IluNativeQuantConfig,
+    )
+
+    _single_rank(monkeypatch)
+    monkeypatch.setattr(
+        ilu_compute,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            additional_config={
+                "ilu_compute": {
+                    "linear": {"native_backend": "original"},
+                    "moe": {"mode": "original"},
+                    "ple": settings,
+                }
+            },
+        ),
+    )
+    config = SimpleNamespace(
+        ngram_size=3,
+        heads_per_ngram=1,
+        eos_token_id=3,
+        vocab_size=4,
+        split_ngram_parts=2,
+        ngram_vocab_size_base=11,
+        make_ngram_vocab_size_divisible_by=1,
+    )
+    embedding = Qwen4ExpNGramEmbedding(
+        config,
+        4,
+        0,
+        8,
+        1,
+        "ple",
+        quant_config=IluNativeQuantConfig(),
+        params_dtype=torch.bfloat16,
+    )
+    table = embedding.ngram_embedding
+    assert table.weight.dtype == weight_dtype
+    assert embedding.quantize_ngram_at_load is has_scale
+    if has_scale:
+        assert table.weight_scale.dtype == torch.float32
+    else:
+        assert table.weight_scale is None
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("split", [False, True])
+def test_native_ple_quantizes_only_tp_rows(dtype, split) -> None:
+    module = _make_ngram_embedding_for_load_test()
+    module.quantize_ngram_at_load = True
+    table = module.ngram_embedding
+    table.weight = torch.zeros(4, 2, dtype=torch.int8)
+    table.weight_scale = torch.zeros(4, 1, dtype=torch.float32)
+
+    checkpoint = torch.tensor(
+        [[1, 1], [2, 2], [0, 127], [0, 0], [-254, 254], [64, -127], [3, 3], [4, 4]],
+        dtype=dtype,
+    )
+    weights = (
+        [
+            ("ngram_embedding.shard_0.weight", checkpoint[:4]),
+            ("ngram_embedding.shard_1.weight", checkpoint[4:]),
+        ]
+        if split
+        else [("ngram_embedding.weight", checkpoint)]
+    )
+    assert module.load_weights(weights) == {
+        "ngram_embedding.weight",
+        "ngram_embedding.weight_scale",
+    }
+    torch.testing.assert_close(
+        table.weight,
+        torch.tensor([[0, 127], [0, 0], [-127, 127], [64, -127]], dtype=torch.int8),
+    )
+    torch.testing.assert_close(
+        table.weight_scale, torch.tensor([[1.0], [1.0], [2.0], [1.0]])
     )
 
 

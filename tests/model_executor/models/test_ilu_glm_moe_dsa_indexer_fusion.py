@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 import torch.nn.functional as F
+from vllm.config import CUDAGraphMode
 
 from vllm_iluvatar.model_executor.layers import sparse_attn_indexer as sparse
 from vllm_iluvatar.models.glm_moe_dsa import attention as attn
@@ -157,17 +158,22 @@ def install_metadata(monkeypatch, layer, slots, mode):
         cu_seqlen_ks=None,
         cu_seqlen_ke=None,
     )
-    decode = SimpleNamespace(
+    # The real dataclass, not a stand-in: it carries behaviour (score-query
+    # packing) that the indexer calls, and a stand-in would go stale silently
+    # the next time that behaviour grows.
+    decode = backend.IluDeepSeekV32IndexerDecodeMetadata(
+        block_table=None,
+        seq_lens=None,
+        decode_lens=None,
         requires_padding=False,
+        cu_seqlen_ks=None,
+        cu_seqlen_ke=None,
+        valid_lens=None,
+        cu_seqlens_kv=None,
+        cu_seqlens_q=None,
         max_context_len=16,
         max_q_len=1,
         max_kv_len=16,
-        valid_lens=None,
-        cu_seqlens_q=None,
-        cu_seqlens_kv=None,
-        block_table=None,
-        cu_seqlen_ks=None,
-        cu_seqlen_ke=None,
     )
     meta = backend.IluDeepseekV32IndexerMetadata(
         seq_lens=None,
@@ -185,9 +191,15 @@ def install_metadata(monkeypatch, layer, slots, mode):
         decode=decode,
         prefill=SimpleNamespace(chunks=[chunk]),
     )
-    context = SimpleNamespace(attn_metadata={layer.k_cache.prefix: meta})
-    monkeypatch.setattr(attn, "get_forward_context", lambda: context)
-    monkeypatch.setattr(sparse, "get_forward_context", lambda: context)
+    # Eager, so score-query packing stays off: a packed launch is only valid
+    # under a uniform graph key, which this suite never captures.
+    context = SimpleNamespace(
+        attn_metadata={layer.k_cache.prefix: meta},
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        batch_descriptor=None,
+    )
+    for module in (attn, sparse, backend):
+        monkeypatch.setattr(module, "get_forward_context", lambda: context)
     return context
 
 

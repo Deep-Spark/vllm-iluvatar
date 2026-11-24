@@ -375,6 +375,8 @@ def test_fp4fp8_independent_forward_matches_existing_contract(
 
 @pytest.mark.parametrize("limit", [None, 10.0])
 def test_w4a8_prequantized_input_packet_and_norm_tuple(limit):
+    if cuda_arch() != "ivcore30":
+        pytest.skip("ixmm_w4a8 and its ixmm_nn weight format require ivcore30")
     from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
         MoEComputeConfig,
         MoEWeights,

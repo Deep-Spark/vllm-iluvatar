@@ -19,9 +19,11 @@ import torch.multiprocessing as mp
 
 def _check_sparse_indexer(rank, device, group):
     """Compare actual sparse selection and decode against an unpartitioned run."""
+    from vllm.config import CUDAGraphMode
     from vllm.v1.attention.ops import pcp
 
     from vllm_iluvatar.model_executor.layers import sparse_attn_indexer as idx
+    from vllm_iluvatar.v1.attention.backends.mla import ilu_indexer
     from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
         IluDeepSeekV32IndexerDecodeMetadata,
         IluDeepseekV32IndexerMetadata,
@@ -103,10 +105,17 @@ def _check_sparse_indexer(rank, device, group):
             return out
 
         result = torch.full((padded, 128), -1, dtype=torch.int32, device=device)
-        with patch.object(
-            idx,
-            "get_forward_context",
-            return_value=SimpleNamespace(attn_metadata={"idx": meta}),
+        # The decode metadata reads the context too, from its own module, to
+        # decide whether a packed score-query launch survives graph replay.
+        # Eager keeps it unpacked, which is what this comparison expects.
+        context = SimpleNamespace(
+            attn_metadata={"idx": meta},
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            batch_descriptor=None,
+        )
+        with (
+            patch.object(idx, "get_forward_context", return_value=context),
+            patch.object(ilu_indexer, "get_forward_context", return_value=context),
         ):
             idx.ilu_sparse_attn_indexer(
                 local(keys),

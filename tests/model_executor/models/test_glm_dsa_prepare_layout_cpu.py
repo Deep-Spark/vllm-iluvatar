@@ -115,7 +115,9 @@ class PrepareLayoutCPU(unittest.TestCase):
             use_fp8_attn=True,
             kv_cache=torch.zeros((1, 64, 640), dtype=torch.uint8),
             _k_scale=torch.ones(1),
-            kv_b_proj=SimpleNamespace(weight=True),
+            # Empty but typed: _build_absorb reads the checkpoint dtype to rule
+            # out an INT8 up-projection, then drops the weight unread.
+            kv_b_proj=SimpleNamespace(weight=torch.empty(0, dtype=torch.float8_e4m3fn)),
         )
         with patch.dict(
             os.environ,

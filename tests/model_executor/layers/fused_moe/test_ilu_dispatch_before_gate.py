@@ -26,7 +26,10 @@ def runner(sp=2):
         do_naive_dispatch_combine=True,
         _kernel_handles_own_dispatch=False,
         _fse_fuse_gate=False,
+        # Both packed-dispatch fast paths are off: this suite pins the ordering
+        # of the generic AG-RS path, which they would replace wholesale.
         _can_pack_int8_dispatch=Mock(return_value=False),
+        _can_pack_fp8_dispatch=Mock(return_value=False),
         moe_config=SimpleNamespace(
             sp_size=sp,
             is_sequence_parallel=sp > 1,

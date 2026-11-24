@@ -125,14 +125,10 @@ class IluGlmMoeDsaFp8SparseMLA(IluGlmMoeDsaSparseMLA):
         quant_method.process_weights_after_loading = hooked
 
     def _read_kv_b_weight(self) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]:
-        """``(weight[H, nope+v, lora] e4m3, scale[H, nope+v] fp32, geometry)``.
+        """Return per-channel weights and scales in logical head order.
 
-        Runs after ``IluFp8BlockScaledMMKernel.process_weights_after_loading``
-        has requantised the weight in place to per-channel FP8, so the source
-        here is ``weight[N, K]`` e4m3 plus ``scale[N]`` -- not the original
-        128x128 block scale. That costs a little accuracy versus dequantising
-        straight from the block scale, but it is the same per-channel precision
-        every other FP8 linear in the model runs at.
+        FP8 linears keep [N, K] storage. On ivcore11, the W8A8 scheme
+        publishes INT8 weights in [K, N] with scales along N.
         """
         layer = self.kv_b_proj
         geom = layer.bmm_geom
@@ -152,6 +148,8 @@ class IluGlmMoeDsaFp8SparseMLA(IluGlmMoeDsaSparseMLA):
                 "IluGlmKVBProjW8A16Method)?"
             )
         weight = weight.data
+        if weight.dtype == torch.int8:
+            weight = weight.t()
         if tuple(weight.shape) != (heads * (nope + v), lora):
             raise ValueError(
                 f"{self.prefix}: kv_b_proj weight shape {tuple(weight.shape)} "
@@ -188,6 +186,9 @@ class IluGlmMoeDsaFp8SparseMLA(IluGlmMoeDsaSparseMLA):
         ``kv_b_proj.weight`` is dropped afterwards: nothing else reads it (the
         absorbed form is the only consumer) and it is ~14 MiB per layer.
         """
+        self.use_fp8_absorb_up = (
+            self.use_fp8_absorb_up and self.kv_b_proj.weight.dtype != torch.int8
+        )
         if self.use_fp8_absorb_up:
             self._build_fp8_absorb()
         else:

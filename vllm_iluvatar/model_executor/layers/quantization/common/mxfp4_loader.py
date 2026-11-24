@@ -35,6 +35,7 @@ class Mxfp4WeightLoader(PairedMoEWeightLoader, ABC):
     """
 
     source_name = "MXFP4"
+    source_alignment = 256
 
     def __init__(self, weight_spec: MoEWeightSpec, load_spec: Mxfp4LoadSpec):
         self.weight_spec = weight_spec
@@ -42,8 +43,8 @@ class Mxfp4WeightLoader(PairedMoEWeightLoader, ABC):
         if (
             load_spec.experts < 1
             or not 0 <= load_spec.tp_rank < load_spec.tp_size
-            or load_spec.hidden % 256
-            or load_spec.intermediate % 256
+            or load_spec.hidden % self.source_alignment
+            or load_spec.intermediate % self.source_alignment
         ):
             raise ValueError("Invalid or unaligned MXFP4 load geometry")
         self._layer = None
@@ -160,6 +161,10 @@ class Mxfp4WeightLoader(PairedMoEWeightLoader, ABC):
 
 
 class Mxfp4ToIxInferW4A8Loader(Mxfp4WeightLoader):
+    # The converter consumes one gate or up shard at a time in 32-value blocks.
+    # The compute backend separately validates the fused w13 and w2 geometries.
+    source_alignment = 32
+
     def convert_shard(self, weight, scale, target, target_scale):
         _native_converter("mxfp4_to_w4a8")(
             weight,

@@ -191,6 +191,32 @@ def test_swigluoai_activation_matches_the_oai_formula():
     assert torch.all((codes.float() * scales.view(-1, 1) - expected).abs() <= tolerance)
 
 
+def test_ixinfer_swiglustep_uses_step_activation(monkeypatch):
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts import (
+        ilu_ixinfer_w4a8 as mod,
+    )
+
+    assert (
+        _support_error(
+            "ivcore11", "ixinfer_w4a8", "NN", activation="swiglustep", limit=7.0
+        )
+        is None
+    )
+    assert "limit 7" in _support_error(
+        "ivcore11", "ixinfer_w4a8", "NN", activation="swiglustep", limit=3.0
+    )
+    monkeypatch.setattr(mod.ops, "activation_dynamic_scaled_int8", lambda **kw: kw)
+    backend = _ixinfer_backend("swiglustep")
+    intermediate, order = object(), object()
+    assert backend._activation_quant(intermediate, order, True, None) == {
+        "input": intermediate,
+        "act_type": "swiglustep",
+        "dst_to_src": order,
+        "output_format": 1,
+        "check_valid": True,
+    }
+
+
 def test_only_swigluoai_pays_for_the_interleave_buffer():
     import torch
 

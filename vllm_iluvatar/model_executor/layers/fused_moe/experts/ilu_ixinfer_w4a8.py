@@ -21,6 +21,8 @@ from .ilu_compute_backend import (
 
 # SwiGLU-OAI, in the two layouts a checkpoint can declare. The activation op is
 # interleaved-only, so the packed-halves variant is converted before the call.
+_SWIGLUSTEP = "swiglustep"
+_SWIGLUSTEP_LIMIT = 7.0
 _SWIGLUOAI = "swigluoai"
 _SWIGLUOAI_UNINTERLEAVE = "swigluoai_uninterleave"
 _SWIGLUOAI_ACTIVATIONS = (_SWIGLUOAI, _SWIGLUOAI_UNINTERLEAVE)
@@ -42,7 +44,7 @@ class IxInferW4A8Backend(MoEComputeBackend):
     requires_activation_limit = False
     priority = 20
     supported_layouts = {"ivcore11": ("NN", "TN"), "ivcore30": ("TN",)}
-    supported_activations = ("silu", "swiglu", *_SWIGLUOAI_ACTIVATIONS)
+    supported_activations = ("silu", "swiglu", _SWIGLUSTEP, *_SWIGLUOAI_ACTIVATIONS)
     weight_specs = {
         layout: MoEWeightSpec(
             f"ixinfer_w4a8_{layout.lower()}_v2", layout, torch.int8, code_multiplier=18
@@ -96,8 +98,15 @@ class IxInferW4A8Backend(MoEComputeBackend):
     @classmethod
     def support_error(cls, config, selection):
         error = super().support_error(config, selection)
-        if error is not None or config.activation not in _SWIGLUOAI_ACTIVATIONS:
+        if error is not None:
             return error
+        if config.activation == _SWIGLUSTEP and config.limit not in (
+            None,
+            _SWIGLUSTEP_LIMIT,
+        ):
+            return f"{cls.name} supports SwiGLUStep with limit 7, got {config.limit}"
+        if config.activation not in _SWIGLUOAI_ACTIVATIONS:
+            return None
         for name, value, baked in (
             ("limit", config.limit, _SWIGLUOAI_LIMIT),
             ("alpha", config.alpha, _SWIGLUOAI_ALPHA),
@@ -128,6 +137,14 @@ class IxInferW4A8Backend(MoEComputeBackend):
 
     def _activation_quant(self, intermediate, order, decode, workspace):
         """GEMM1 output -> activation -> per-row INT8 for GEMM2."""
+        if self.config.activation == _SWIGLUSTEP:
+            return ops.activation_dynamic_scaled_int8(
+                input=intermediate,
+                act_type=_SWIGLUSTEP,
+                dst_to_src=order,
+                output_format=int(decode),
+                check_valid=decode,
+            )
         if self.config.activation not in _SWIGLUOAI_ACTIVATIONS:
             # An infinite bound preserves checkpoints with plain SwiGLU.
             return ops.swiglu_limit_dynamic_scaled_int8(
@@ -317,12 +334,10 @@ class IxInferW4A8Backend(MoEComputeBackend):
         )
         del q, scale
         workspace.release("input", "input_scale")
-        if self.config.activation in _SWIGLUOAI_ACTIVATIONS:
-            # ``moe_group_gemv_swiglu_quant`` takes no activation argument; it
-            # is SwiGLU only. Computing it here would quietly be the wrong
-            # activation, so the batched (DeepEP LL) path refuses SwiGLU-OAI.
+        if self.config.activation in (_SWIGLUSTEP, *_SWIGLUOAI_ACTIVATIONS):
+            # The grouped activation only implements regular SwiGLU.
             raise NotImplementedError(
-                f"{self.name} batched experts have no SwiGLU-OAI activation op"
+                f"{self.name} batched experts do not support {self.config.activation}"
             )
         q, scale = ops.moe_group_gemv_swiglu_quant(
             input=intermediate,

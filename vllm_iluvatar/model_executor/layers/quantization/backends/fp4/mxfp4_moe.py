@@ -219,23 +219,25 @@ def make_mxfp4_method(layer):
     options = compute_options("moe")
     arch = cuda_arch()
     mode = options.get("mode", "auto")
-    if not options:
-        if envs.VLLM_ILU_MXFP4_MOE_BACKEND in ("torch", "ixformer_native"):
-            raise ValueError(
-                "VLLM_ILU_MXFP4_MOE_BACKEND=torch/ixformer_native no longer "
-                "selects a routed-expert method; routed MXFP4 always converts "
-                "to a compute backend's contract. Use ilu_compute.moe.mode to "
-                "pick one."
+    # Checked whatever else is configured: the point is that a launch script
+    # carrying this setting learns it stopped meaning anything, and someone who
+    # also passes ilu_compute.moe is exactly who has a stale script to clean up.
+    if envs.VLLM_ILU_MXFP4_MOE_BACKEND in ("torch", "ixformer_native"):
+        raise ValueError(
+            "VLLM_ILU_MXFP4_MOE_BACKEND=torch/ixformer_native no longer "
+            "selects a routed-expert method; routed MXFP4 always converts "
+            "to a compute backend's contract. Use ilu_compute.moe.mode to "
+            "pick one."
+        )
+    if not options and arch == "ivcore11":
+        # Preserve the existing default/legacy layout override when no explicit
+        # MoE configuration is supplied. An explicit mode always takes
+        # precedence.
+        layout = envs.VLLM_ILU_MOE_RUNTIME_LAYOUT
+        if layout:
+            mode = {"NN": "ixinfer_w4a8_nn_v2", "TN": "ixinfer_w4a8_tn_v2"}.get(
+                layout, layout
             )
-        if arch == "ivcore11":
-            # Preserve the existing default/legacy layout override when no
-            # explicit MoE configuration is supplied. An explicit mode always
-            # takes precedence.
-            layout = envs.VLLM_ILU_MOE_RUNTIME_LAYOUT
-            if layout:
-                mode = {"NN": "ixinfer_w4a8_nn_v2", "TN": "ixinfer_w4a8_tn_v2"}.get(
-                    layout, layout
-                )
     selection = select_mxfp4_compute(arch, mode)
     init_logger(__name__).info_once(
         "MXFP4 compute: %s / %s on %s (streaming weights)",

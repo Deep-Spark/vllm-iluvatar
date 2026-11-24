@@ -134,6 +134,25 @@ def test_mxfp4_explicit_mode_overrides_legacy_env(monkeypatch):
     assert selected.layout == "TN"
 
 
+@pytest.mark.parametrize("moe", [{}, {"mode": "ixinfer_w4a8_tn_v2"}])
+def test_mxfp4_rejects_the_retired_backend_env(monkeypatch, moe):
+    """A launch script still selecting a kernel must hear that it cannot."""
+    from vllm_iluvatar import envs
+    from vllm_iluvatar.model_executor.layers.quantization.backends.fp4 import (
+        mxfp4_moe as mod,
+    )
+
+    monkeypatch.setattr(arch, "cuda_arch", lambda: "ivcore30")
+    monkeypatch.setattr(envs, "VLLM_ILU_MXFP4_MOE_BACKEND", "torch")
+    monkeypatch.setattr(
+        ilu_compute,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(additional_config={"ilu_compute": {"moe": moe}}),
+    )
+    with pytest.raises(ValueError, match="no longer"):
+        mod.make_mxfp4_method(SimpleNamespace(moe_config=None))
+
+
 @pytest.mark.parametrize(
     "device,mode,backend,layout",
     [

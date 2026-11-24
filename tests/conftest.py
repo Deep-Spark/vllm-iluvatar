@@ -115,6 +115,27 @@ def reset_default_torch_device():
     torch.set_default_device(None)
 
 
+@pytest.fixture(autouse=True)
+def unshadow_ilu_env_readers():
+    """Drop plugin env attributes a test left behind on ``vllm_iluvatar.envs``.
+
+    The module declares its variables only under ``TYPE_CHECKING`` and serves
+    them from ``__getattr__``, so each read consults ``os.environ``. A test that
+    reaches for ``monkeypatch.setattr(envs, NAME, value)`` instead of
+    ``setenv`` is therefore doing something subtler than it looks: ``hasattr``
+    succeeds through ``__getattr__``, so monkeypatch restores by *assignment*
+    and leaves a real attribute that shadows the reader for the rest of the
+    process. Every later ``setenv`` of that variable then silently does nothing.
+    """
+    import vllm_iluvatar.envs as envs
+
+    before = set(vars(envs))
+    yield
+    for name in set(vars(envs)) - before:
+        if name.startswith("VLLM_IL"):
+            delattr(envs, name)
+
+
 @pytest.fixture()
 def cuda_device() -> str:
     if not _cuda_available():

@@ -101,6 +101,7 @@ def test_gate_linear_fallback_calls_replicated_linear_directly():
     gate.weight = torch.nn.Parameter(torch.eye(2, dtype=torch.float32))
     gate.input_size = 2
     gate.output_size = 2
+    gate.return_bias = True
     gate.out_dtype = None
     gate.allow_dsv3_router_gemm = False
     gate.allow_fp32_router_gemm = False
@@ -126,12 +127,29 @@ def test_gate_linear_fallback_calls_replicated_linear_directly():
     assert calls == [(gate, x)]
 
 
+@pytest.mark.parametrize("out_dtype", [None, torch.bfloat16])
+def test_gate_linear_fallback_preserves_tensor_only_output(out_dtype):
+    gate = IluGateLinear.__new__(IluGateLinear)
+    torch.nn.Module.__init__(gate)
+    gate.weight = torch.nn.Parameter(torch.eye(2))
+    gate.return_bias = False
+    gate.out_dtype = out_dtype
+    x = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+
+    with patch.object(ReplicatedLinear, "forward", lambda self, value: value):
+        output = gate.forward(x)
+
+    assert isinstance(output, torch.Tensor)
+    torch.testing.assert_close(output, x.to(out_dtype or x.dtype))
+
+
 def test_gate_linear_forward_casts_input_and_output_dtype_for_fallback():
     gate = IluGateLinear.__new__(IluGateLinear)
     torch.nn.Module.__init__(gate)
     gate.weight = torch.nn.Parameter(torch.eye(2, dtype=torch.float32))
     gate.input_size = 2
     gate.output_size = 2
+    gate.return_bias = True
     gate.out_dtype = torch.bfloat16
     x = torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)
 
@@ -153,6 +171,7 @@ def test_glm_bf16_gate_keeps_small_batch_fast_path():
     gate.weight = torch.nn.Parameter(torch.ones(256, 6144, dtype=torch.bfloat16))
     gate.bias = None
     gate.skip_bias_add = False
+    gate.return_bias = True
     gate.out_dtype = None
     gate.use_bf16_small_batch_gate = True
     x = torch.ones(2, 6144, dtype=torch.bfloat16)
@@ -176,6 +195,7 @@ def test_bf16_gate_shape_does_not_opt_other_models_into_glm_fast_path():
     gate.weight = torch.nn.Parameter(torch.ones(256, 6144, dtype=torch.bfloat16))
     gate.bias = None
     gate.skip_bias_add = False
+    gate.return_bias = True
     gate.out_dtype = None
     x = torch.ones(2, 6144, dtype=torch.bfloat16)
     expected = torch.full((2, 256), 7, dtype=torch.bfloat16)
@@ -237,6 +257,7 @@ def test_fp32_router_dispatch_preserves_weight_and_arch_contract(
         torch.ones(n, 6144, device="cuda", dtype=torch.float32)
     )
     gate.bias = None
+    gate.return_bias = True
     gate.out_dtype = torch.float32
     x = torch.zeros(m, 6144, device="cuda", dtype=dtype)
     calls = []

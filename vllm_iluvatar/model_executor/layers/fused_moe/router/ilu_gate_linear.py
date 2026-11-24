@@ -59,15 +59,17 @@ class IluGateLinear(GateLinear):
                 and x.data_ptr() % 16 == 0
                 and self.weight.data_ptr() % 16 == 0
             ):
-                return ixfops.router_gemm_bf16_fp32_fp32(
-                    x, self.weight, backend="ixformer_native"
-                ), None
+                return self._return(
+                    ixfops.router_gemm_bf16_fp32_fp32(
+                        x, self.weight, backend="ixformer_native"
+                    )
+                )
             if arch == IVCORE11 and 7 <= x.shape[0] <= 32:
-                return ixfops.router_gemm_bf16_fp32_fp32(
-                    x, self.weight, backend="torch"
-                ), None
+                return self._return(
+                    ixfops.router_gemm_bf16_fp32_fp32(x, self.weight, backend="torch")
+                )
             if arch == IVCORE30 and 128 <= x.shape[0] <= 4096:
-                return ixfops.mixed_type_linear(x, self.weight), None
+                return self._return(ixfops.mixed_type_linear(x, self.weight))
 
         # A model must explicitly opt in: the shape alone is not a model
         # identity and another model may also use a BF16 [256, 6144] gate.
@@ -85,9 +87,9 @@ class IluGateLinear(GateLinear):
             and self.out_dtype in (None, torch.bfloat16)
         ):
             bias = None if self.skip_bias_add else self.bias
-            return torch.nn.functional.linear(x, self.weight, bias), (
-                self.bias if self.skip_bias_add else None
-            )
+            output = torch.nn.functional.linear(x, self.weight, bias)
+            output_bias = self.bias if self.skip_bias_add else None
+            return (output, output_bias) if self.return_bias else output
 
         if self.out_dtype is not None and x.dtype != self.weight.dtype:
             x = x.to(self.weight.dtype)
@@ -109,9 +111,12 @@ class IluGateLinear(GateLinear):
             else:
                 output = ixfops.gemm_bf16_bf16_fp32(x, self.weight, format="TN")
             output_bias = self.bias if self.skip_bias_add else None
-            return output, output_bias
+            return (output, output_bias) if self.return_bias else output
 
-        output, output_bias = super(GateLinear, self).forward(x)
-        if self.out_dtype is not None and output.dtype != self.out_dtype:
-            output = output.to(self.out_dtype)
-        return output, output_bias
+        result = super(GateLinear, self).forward(x)
+        if self.out_dtype is None:
+            return result
+        if isinstance(result, tuple):
+            output, output_bias = result
+            return output.to(self.out_dtype), output_bias
+        return result.to(self.out_dtype)

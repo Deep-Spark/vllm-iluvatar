@@ -67,7 +67,10 @@ class Glm4MoE(_Glm4MoE):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        router_logits = self.gate(hidden_states.to(dtype=torch.bfloat16))
+        gate_output = self.gate(hidden_states.to(dtype=torch.bfloat16))
+        router_logits = (
+            gate_output[0] if isinstance(gate_output, tuple) else gate_output
+        )
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
@@ -91,6 +94,7 @@ def glm4_moe_bf16_router_overrides(model) -> None:
             continue
         mlp.__class__ = Glm4MoE
         mlp.gate.weight.data = mlp.gate.weight.data.to(torch.bfloat16)
+        mlp.gate.out_dtype = torch.bfloat16
         if mlp.gate.bias is not None:
             mlp.gate.bias.data = mlp.gate.bias.data.to(torch.bfloat16)
         if hasattr(mlp.gate, "e_score_correction_bias"):

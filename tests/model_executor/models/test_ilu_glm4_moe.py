@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_iluvatar.model_executor.models import glm4_moe as ilu_glm4_moe
@@ -55,6 +56,7 @@ def test_glm4_moe_bf16_router_overrides_swaps_mlp_and_converts_gate():
 
     assert mlp.__class__ is ilu_glm4_moe.Glm4MoE
     assert mlp.gate.weight.dtype == torch.bfloat16
+    assert mlp.gate.out_dtype == torch.bfloat16
     assert mlp.gate.e_score_correction_bias.dtype == torch.bfloat16
 
 
@@ -95,3 +97,20 @@ def test_glm4_moe_attention_forward_makes_split_qkv_contiguous():
     assert k.is_contiguous()
     assert v.is_contiguous()
     assert output.shape == (2, 8)
+
+
+@pytest.mark.parametrize("return_bias", [False, True])
+def test_glm4_moe_passes_tensor_logits_to_experts(return_bias):
+    logits = torch.ones(2, 3, dtype=torch.bfloat16)
+    hidden = torch.ones(2, 4, dtype=torch.bfloat16)
+
+    def gate(x):
+        assert x.dtype == torch.bfloat16
+        return (logits, None) if return_bias else logits
+
+    def experts(*, hidden_states, router_logits):
+        assert router_logits is logits
+        return hidden_states
+
+    moe = SimpleNamespace(gate=gate, experts=experts)
+    torch.testing.assert_close(ilu_glm4_moe.Glm4MoE.forward(moe, hidden), hidden)

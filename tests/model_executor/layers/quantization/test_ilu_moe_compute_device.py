@@ -191,7 +191,7 @@ def test_fp4fp8_independent_forward_matches_existing_contract(
         IxMMFP4FP8Backend,
     )
     from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
-        ilu_mxfp4_fused_experts,
+        _ilu_mxfp4_fused_experts_ixformer,
     )
 
     torch.manual_seed(52)
@@ -249,7 +249,7 @@ def test_fp4fp8_independent_forward_matches_existing_contract(
     destination = torch.empty_like(x)
     actual = forward(x, scores, ids, destination)
     assert actual is destination
-    reference = ilu_mxfp4_fused_experts(
+    reference = _ilu_mxfp4_fused_experts_ixformer(
         x,
         layer.w13_weight,
         layer.w13_weight_scale,
@@ -259,7 +259,12 @@ def test_fp4fp8_independent_forward_matches_existing_contract(
         ids,
         swiglu_limit=limit if limit is not None else 0.0,
         expert_map=layer.expert_map,
-        backend="ixmm",
+        output_scale=1.0,
+        extra_residual=None,
+        w13_bias=None,
+        w2_bias=None,
+        gemm_backend="ixmm",
+        gemm_mode=None,
         swiglu_variant=variant,
     )
     torch.testing.assert_close(actual, reference, rtol=0, atol=0)
@@ -276,7 +281,7 @@ def test_fp4fp8_independent_forward_matches_existing_contract(
     method._bind_compute(layer, runtime)
     residual = torch.randn_like(x) * 0.25
     merged = method.apply(layer, x, scores, ids, None, residual)
-    expected_merged = ilu_mxfp4_fused_experts(
+    expected_merged = _ilu_mxfp4_fused_experts_ixformer(
         x,
         runtime.w13_weight,
         runtime.w13_weight_scale,
@@ -288,7 +293,10 @@ def test_fp4fp8_independent_forward_matches_existing_contract(
         expert_map=layer.expert_map,
         output_scale=2.5,
         extra_residual=residual,
-        backend="ixmm",
+        w13_bias=None,
+        w2_bias=None,
+        gemm_backend="ixmm",
+        gemm_mode=None,
         swiglu_variant=variant,
     )
     torch.testing.assert_close(merged, expected_merged, rtol=0, atol=0)

@@ -16,7 +16,7 @@ tilelang MHC kernels and the model allocates three aux streams at build time.
   supported decode batches fold RMSNorm into ``ds4_mhc_pre_v2``.
 * ``IluDeepseekV4Fp8MoE.forward``: native MXFP4 stays on the community
   ``FusedMoE`` runner (``IluGateLinear``, ``ops.topk_hash_softplus_sqrt``,
-  ``IluMxfp4MoEMethod`` -> ``ilu_mxfp4_fused_experts()``). When
+  ``IluMxfp4MoEMethod`` -> ``IxMMFP4FP8Backend``). When
   ``VLLM_ILU_DECODE_EP_BACKEND=deepep_low_latency`` and every rank is
   decode-only, a method that implements ``select_gemm_impl`` (native MXFP4
   included) takes ``forward_dp_ep_deep_ep`` instead. Runtime-converted W4A8
@@ -490,8 +490,8 @@ class IluDeepseekV4Fp8MoE(nn.Module, IluFusedMoEEP):
         # --- routed experts (community nvidia/model.py:647-691) -------------
         # The real expert split is owned by ``FusedMoE``
         # (``FusedMoEParallelConfig.make`` -> ``routed_experts.expert_map`` /
-        # ``.local_num_experts``, which is what ``ilu_mxfp4_fused_experts()``
-        # reads); only the divisibility precondition is checked here.
+        # ``.local_num_experts``, which is what the expert compute reads); only
+        # the divisibility precondition is checked here.
         eplb_config = parallel_config.eplb_config
         n_physical_experts = self.n_routed_experts + eplb_config.num_redundant_experts
         assert n_physical_experts % self.tp_size == 0, (

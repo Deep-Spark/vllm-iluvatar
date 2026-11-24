@@ -157,7 +157,7 @@ def test_compute_config_forwards_swigluoai_clamp():
 
 
 def test_apply_delegates_to_bound_run_standard():
-    """apply must use IxMMFP4FP8Backend.run_standard, not ilu_mxfp4_fused_experts."""
+    """apply must go through the bound IxMMFP4FP8Backend, not call ops itself."""
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
     layer = _StubRoutedExperts(1, 0, {0: 0})

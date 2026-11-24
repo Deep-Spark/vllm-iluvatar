@@ -785,9 +785,9 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # production-safe behavior by default; an explicit 0 enables the upstream
     # async path for validated experiments.
     "VLLM_ILU_PP_SYNC_SENDRECV": _bool_reader("VLLM_ILU_PP_SYNC_SENDRECV", "1"),
-    # Selects the ilu_mxfp4_fused_experts compute backend. Defaults to "ixmm";
-    # "auto" -> ixmm when available else torch; "torch" forces the pure-torch
-    # fallback; "ixformer_native" is the correctness-only native kernel.
+    # No longer selects a compute backend: MXFP4 routed experts bind to
+    # IxMMFP4FP8Backend. Still read so that "torch" / "ixformer_native", which
+    # used to pick a different kernel, fail loudly instead of being ignored.
     "VLLM_ILU_MXFP4_MOE_BACKEND": lambda: (
         os.environ.get("VLLM_ILU_MXFP4_MOE_BACKEND", "ixmm").strip().lower()
     ),

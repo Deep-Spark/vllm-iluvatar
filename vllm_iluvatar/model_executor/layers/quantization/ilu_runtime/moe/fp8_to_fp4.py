@@ -18,7 +18,6 @@ from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
     _ixmm_backend_available,
-    ilu_mxfp4_fused_experts,
 )
 from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe import (
     _FP4_MAX_MAG,
@@ -67,7 +66,6 @@ __all__ = [
     "_get_ilu_output_scale",
     "_ixmm_backend_available",
     "_shrink_ll_max_tokens_to_decode",
-    "ilu_mxfp4_fused_experts",
     "preprocess_fp8_block_weight_for_ixmm",
     "swiglustep_limit",
 ]

@@ -8,8 +8,8 @@ import pytest
 import torch
 
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
+    _ilu_mxfp4_fused_experts_ixformer,
     _ixmm_backend_available,
-    ilu_mxfp4_fused_experts,
 )
 from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.batch_experts import (
     IluMoEBatchedExpertsFp8,
@@ -31,7 +31,7 @@ def _has_ixmm_ivcore30() -> bool:
     not _has_ixmm_ivcore30(), reason="requires an ivcore30 GPU with ixmm backend"
 )
 # ``activation`` is what ``RoutedExperts.activation`` reports and
-# ``legacy_variant`` the matching ``ilu_mxfp4_fused_experts`` step-4 op. The
+# ``legacy_variant`` the matching ixformer-pipeline step-4 op. The
 # ``silu`` row is DeepSeek-V4: the batched path maps it onto
 # ``moe_group_gemv_swiglu_quant_fp8(act_type="swiglu")``, whose clamp only
 # reproduces ``SiluAndMulWithClamp`` while a limit is supplied.
@@ -100,7 +100,7 @@ def test_batched_fp8_experts_match_legacy_fp4_fp8_path(
         device=device,
     )
 
-    legacy_output = ilu_mxfp4_fused_experts(
+    legacy_output = _ilu_mxfp4_fused_experts_ixformer(
         hidden_states=hidden_states,
         w13_weight=w1,
         w13_weight_scale=w1_scale,
@@ -109,7 +109,13 @@ def test_batched_fp8_experts_match_legacy_fp4_fp8_path(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         swiglu_limit=swiglu_limit,
-        backend="ixmm",
+        expert_map=None,
+        output_scale=1.0,
+        extra_residual=None,
+        w13_bias=None,
+        w2_bias=None,
+        gemm_backend="ixmm",
+        gemm_mode=None,
         swiglu_variant=legacy_variant,
     )
 

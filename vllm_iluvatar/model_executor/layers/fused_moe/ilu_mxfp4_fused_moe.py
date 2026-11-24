@@ -11,19 +11,18 @@ Why      : none of the community MXFP4 MoE backends (TRTLLM / DeepGEMM / Marlin 
            the compute. Keeping it in a standalone function -- rather than inside
            the quant method -- mirrors ``fused_moe.py::ilu_w16a16_fused_experts``
            and lets several MXFP4 methods share one implementation.
-How      : callers (currently the runtime-quant MoE methods and V4.1's packed
-           decode dispatch) call
-           ``ilu_mxfp4_fused_experts`` with explicit tensors. The signature takes
-           no ``layer`` and no ``RoutedExperts`` attribute names, so a future
-           GPT-OSS-MXFP4 or compressed-tensors-W4A4-MXFP4 method only has to
-           write its own wiring.
+How      : callers (currently V4.1's packed decode dispatch) call
+           ``_ilu_mxfp4_fused_experts_ixformer`` with explicit tensors. The
+           signature takes no ``layer`` and no ``RoutedExperts`` attribute
+           names, so a future GPT-OSS-MXFP4 or compressed-tensors-W4A4-MXFP4
+           method only has to write its own wiring.
 Scope    : routed MXFP4 experts on Iluvatar.
 Remove   : never as a whole -- it is the only implementation of this compute.
 
-Two implementations, one dispatcher
------------------------------------
-``ilu_mxfp4_fused_experts`` is the public entry point. It resolves a backend
-(``_resolve_backend``) and delegates to one of:
+Two implementations, no dispatcher
+----------------------------------
+Each caller names the implementation it wants. ``IxMMFP4FP8Backend`` is what
+converted checkpoints bind to; what remains here is:
 
 * ``_ilu_mxfp4_fused_experts_ixformer`` -- the production path. Six device
   kernels, no bf16 weight materialisation::
@@ -33,11 +32,10 @@ Two implementations, one dispatcher
         -> group_gemm_fp4(w13) -> swiglu_limit_dynamic_scaled_fp8
         -> group_gemm_fp4(w2)  -> moe_gather_output_reduce_sum(extra_residual=...)
 
-  The ``group_gemm_fp4`` backend is ``ixmm`` by default
-  (``VLLM_ILU_MXFP4_MOE_BACKEND``), which consumes the ix30 layout that
-  ``preprocess_weight_for_ixmm`` produces once at load time. ``ixformer_native``
-  consumes the original MXFP4 layout instead and must be requested explicitly:
-  its kernel is GEMV-shaped and unusable at prefill scale.
+  The ``group_gemm_fp4`` backend arrives as ``gemm_backend``. ``ixmm`` consumes
+  the ix30 layout that ``preprocess_weight_for_ixmm`` produces once at load
+  time; ``ixformer_native`` consumes the original MXFP4 layout instead and is
+  only worth asking for at decode scale, its kernel being GEMV-shaped.
 
 * ``ilu_mxfp4_fused_experts_torch`` -- pure torch, per-expert MXFP4 -> bf16
   dequant plus a grouped MLP. Not a dead migration artefact; see its docstring
@@ -59,8 +57,8 @@ Three invariants both implementations share:
 
 ixformer is deliberately **not** imported at module scope: the torch path must
 stay importable (and testable) on a plain CPU host. The ixformer import lives
-inside ``_ilu_mxfp4_fused_experts_ixformer``, behind the dispatcher's CUDA/arch
-gate.
+inside ``_ilu_mxfp4_fused_experts_ixformer``, whose callers are responsible for
+only reaching it on CUDA.
 """
 
 from __future__ import annotations
@@ -189,14 +187,12 @@ def ilu_mxfp4_fused_experts_torch(
 ) -> torch.Tensor:
     """Run the routed MXFP4 experts owned by this rank (pure-torch oracle).
 
-    Not on the production hot path, but not removable either -- it serves three
-    roles simultaneously:
+    Nothing in production calls it, but it is not removable either -- it serves
+    two roles simultaneously:
 
-    1. the numerical oracle for ``_ilu_mxfp4_fused_experts_ixformer``;
-    2. the only runnable path on non-ivcore30 hosts or when the ixmm wheel is
-       unavailable (cuBLAS bf16 matmul on the dequantised weights beats the
-       naive ``ixformer_native`` kernel at prefill scale);
-    3. the absolute accuracy baseline for the ixmm path, whose per-256
+    1. the numerical oracle for ``_ilu_mxfp4_fused_experts_ixformer``, and the
+       only one of the two that runs on a CPU host;
+    2. the absolute accuracy baseline for the ixmm path, whose per-256
        re-quantisation loses precision against the checkpoint's per-32 block
        scales and so can only be compared against this, never assumed equal.
 
@@ -270,14 +266,11 @@ def ilu_mxfp4_fused_experts_torch(
 # ixformer ep_moe + group_gemm_fp4 pipeline
 # ---------------------------------------------------------------------------
 
-# Backend names accepted by the dispatcher. Kept as plain strings (not an
-# enum) so they can be passed straight through to ``group_gemm_fp4``'s
-# ``backend=`` kwarg, which is itself a string.
-_TORCH_BACKEND = "torch"
+# ``group_gemm_fp4`` backend names. Kept as plain strings (not an enum) so they
+# can be passed straight through to its ``backend=`` kwarg, which is itself a
+# string.
 _IXFORMER_NATIVE_BACKEND = "ixformer_native"
 _IXMM_BACKEND = "ixmm"
-_VALID_BACKENDS = (_TORCH_BACKEND, _IXFORMER_NATIVE_BACKEND, _IXMM_BACKEND)
-_AUTO_BACKEND = "auto"
 
 # SwiGLU activation variants for the ixformer step-4 fusion. The default keeps
 # the DeepSeek-V4 / MXFP4 behaviour (clamp before silu, no no-clamp mode) so
@@ -332,8 +325,8 @@ def _ixmm_backend_available() -> bool:
 
     Mirrors ixformer's own ``_ixmm_available`` (``gemm.py:620``) but goes
     through the public registry so a missing ixformer import degrades to
-    ``False`` rather than raising. Cached because it is consulted per layer per
-    step in ``auto`` mode and the answer is fixed for the process.
+    ``False`` rather than raising. Cached because the answer is fixed for the
+    process.
     """
     try:
         import ixformer.inference.backend_registry as _registry  # type: ignore
@@ -342,138 +335,15 @@ def _ixmm_backend_available() -> bool:
     try:
         return _IXMM_BACKEND in _registry.registry.available_backends("group_gemm_fp4")
     except Exception:
-        # Not "ixmm is absent" but "the probe itself broke". Silently degrading
-        # here costs an order of magnitude of throughput with nothing in the
-        # log, so say it once.
+        # Not "ixmm is absent" but "the probe itself broke". Reporting it as
+        # absent is what the callers can act on, but doing so silently hides a
+        # broken build behind a slow path, so say it once.
         logger.warning(
-            "Failed to probe the ixmm group_gemm_fp4 backend; falling back to "
-            "the torch MXFP4 path.",
+            "Failed to probe the ixmm group_gemm_fp4 backend; treating it as "
+            "unavailable.",
             exc_info=True,
         )
         return False
-
-
-def _resolve_backend(
-    backend: str | None,
-    hidden_states: torch.Tensor,
-    *,
-    swiglu_limit: float | None,
-    w13_bias: torch.Tensor | None,
-    w2_bias: torch.Tensor | None,
-    w13_weight: torch.Tensor,
-    w13_weight_scale: torch.Tensor,
-    w2_weight: torch.Tensor,
-    w2_weight_scale: torch.Tensor,
-) -> str:
-    """Pick the compute backend for ``ilu_mxfp4_fused_experts``.
-
-    The return value is one of the ``group_gemm_fp4`` backend strings
-    (``"torch"`` / ``"ixformer_native"`` / ``"ixmm"``). ``"torch"`` means the
-    pure-torch oracle path is taken (no ixformer call at all).
-
-    A failed ixformer precondition falls back to ``"torch"`` only while weights
-    still use the original layout. ixmm preprocessing is not reversible here,
-    so an already-preprocessed layer fails fast instead of being misread by the
-    torch oracle. ``ixformer_native`` is never selected by ``auto``.
-    """
-    # 1) Resolve the requested backend (env var or call-site kwarg).
-    if backend is None:
-        import vllm.envs as envs
-
-        backend = envs.VLLM_ILU_MXFP4_MOE_BACKEND
-    if backend not in (_AUTO_BACKEND, *_VALID_BACKENDS):
-        raise ValueError(
-            f"Unknown MXFP4 MoE backend {backend!r}; expected one of "
-            f"{(_AUTO_BACKEND, *_VALID_BACKENDS)}"
-        )
-
-    raw_format = (
-        w13_weight.dtype is torch.uint8
-        and w2_weight.dtype is torch.uint8
-        and w13_weight_scale.dtype is torch.uint8
-        and w2_weight_scale.dtype is torch.uint8
-    )
-    original_format = (
-        w13_weight.dtype is torch.int8
-        and w2_weight.dtype is torch.int8
-        and w13_weight_scale.dtype in (torch.float8_e8m0fnu, torch.float32)
-        and w2_weight_scale.dtype in (torch.float8_e8m0fnu, torch.float32)
-    )
-    ixmm_format = (
-        w13_weight.dtype is torch.uint8
-        and w2_weight.dtype is torch.uint8
-        and w13_weight_scale.dtype is torch.float32
-        and w2_weight_scale.dtype is torch.float32
-    )
-
-    def torch_fallback(reason: str) -> str:
-        if ixmm_format:
-            raise RuntimeError(
-                "MXFP4 weights are already in ixmm's preprocessed layout and "
-                f"cannot fall back to the original-layout torch path: {reason}"
-            )
-        if not (raw_format or original_format):
-            raise RuntimeError(
-                "MXFP4 weights have an unsupported dtype/layout combination: "
-                f"w13=({w13_weight.dtype}, {w13_weight_scale.dtype}), "
-                f"w2=({w2_weight.dtype}, {w2_weight_scale.dtype})."
-            )
-        return _TORCH_BACKEND
-
-    if backend == _TORCH_BACKEND:
-        return torch_fallback("backend='torch' was requested")
-
-    # 2) Every ixformer backend, including an explicit one, must satisfy these
-    # hard preconditions. Explicit selection only controls the implementation;
-    # it must not bypass input validity checks.
-    if not hidden_states.is_cuda:
-        return torch_fallback("hidden_states is not a CUDA tensor")
-    try:
-        from vllm_iluvatar.ilu_util.arch import is_ivcore30
-
-        ivcore30 = is_ivcore30()
-    except Exception:
-        return torch_fallback("device architecture could not be determined")
-    if not ivcore30:
-        return torch_fallback("device architecture is not ivcore30")
-    if hidden_states.dtype is not torch.bfloat16:
-        return torch_fallback(f"activation dtype is {hidden_states.dtype}, not bf16")
-    if swiglu_limit is None:
-        return torch_fallback("swiglu_limit is None")
-    if w13_bias is not None or w2_bias is not None:
-        return torch_fallback("MoE bias is present")
-
-    # 3) Backend and weight layout are inseparable. ixmm consumes only the
-    # preprocessed ix30 layout; native consumes only the original MXFP4 layout.
-    if backend == _IXMM_BACKEND:
-        if not ixmm_format:
-            raise RuntimeError(
-                "MXFP4 MoE backend 'ixmm' requires weights preprocessed by "
-                "preprocess_weight_for_ixmm(): uint8 weights and float32 scales. "
-                f"Got w13=({w13_weight.dtype}, {w13_weight_scale.dtype}), "
-                f"w2=({w2_weight.dtype}, {w2_weight_scale.dtype})."
-            )
-        if not _ixmm_backend_available():
-            raise RuntimeError(
-                "MXFP4 MoE backend 'ixmm' is not available. Install the ixmm "
-                "wheel and rebuild ixformer with HAVE_IXMM on ivcore30."
-            )
-        return _IXMM_BACKEND
-
-    if backend == _IXFORMER_NATIVE_BACKEND:
-        if not original_format:
-            raise RuntimeError(
-                "MXFP4 MoE backend 'ixformer_native' requires original-layout "
-                "int8 weights with e8m0/float32 scales."
-            )
-        return _IXFORMER_NATIVE_BACKEND
-
-    # ``auto`` selects a backend compatible with the format produced at load
-    # time. Native is intentionally never automatic because its GEMV-shaped
-    # kernel is unusable for prefill-sized workloads.
-    if ixmm_format and _ixmm_backend_available():
-        return _IXMM_BACKEND
-    return torch_fallback("no compatible ixmm backend is available")
 
 
 def _ilu_mxfp4_fused_experts_ixformer(
@@ -731,110 +601,4 @@ def _ilu_mxfp4_fused_experts_ixformer(
         src_to_dst,
         extra_residual=extra_residual,
         scaling_factor=float(output_scale),
-    )
-
-
-def ilu_mxfp4_fused_experts(
-    hidden_states: torch.Tensor,
-    w13_weight: torch.Tensor,
-    w13_weight_scale: torch.Tensor,
-    w2_weight: torch.Tensor,
-    w2_weight_scale: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    *,
-    swiglu_limit: float | None = None,
-    expert_map: torch.Tensor | None = None,
-    output_scale: float = 1.0,
-    extra_residual: torch.Tensor | None = None,
-    w13_bias: torch.Tensor | None = None,
-    w2_bias: torch.Tensor | None = None,
-    backend: str | None = None,
-    w13_gemm_mode: int | None = None,
-    swiglu_variant: str = _DSV4_CLAMP_VARIANT,
-    swiglu_alpha: float | None = None,
-    swiglu_beta: float | None = None,
-    skip_moe_sort: bool = False,
-) -> torch.Tensor:
-    """Dispatcher for the routed MXFP4 expert compute.
-
-    Takes the same arguments as ``ilu_mxfp4_fused_experts_torch`` with
-    backend-specific options:
-
-    * ``backend``: force a ``group_gemm_fp4`` backend. ``None`` defers to
-      ``VLLM_ILU_MXFP4_MOE_BACKEND``, whose default is ``ixmm``.
-    * ``w13_gemm_mode``: override the W13 tile selection. Callers must ensure
-      the mode supports every expert's row count. W2 still selects its tile
-      automatically.
-    * ``swiglu_variant``: step-4 activation semantics. ``"dsv4_clamp"``
-      (default, DSv4/MXFP4, unchanged), ``"step3_swiglustep"`` (Step-3.7
-      NVFP4, clamp-after-silu + native no-clamp), or ``"swigluoai"``
-      (MiniMax-M3 MXFP8, community ``swigluoai_uninterleave`` semantics:
-      packed-halves gate/up, alpha inside the sigmoid, ``up + 1``). Only affects
-      the ixformer path; the torch fallback ignores it (see below).
-
-    There is no ``run_decode``: ``group_gemm_fp4`` picks gemv vs gemm itself
-    from ``M`` (``mode=None``, ``M <= 128`` -> gemv).
-
-    Returns the ``[T, H]`` rank-local partial; the runner's all-reduce
-    completes the EP/TP partials.
-    """
-    if hidden_states.shape[0] == 0:
-        # An empty batch has no backend-specific behaviour, and routing it into
-        # ``_resolve_backend`` would turn it into a hard error once the weights
-        # are in ixmm's layout (no torch fallback from there).
-        empty = torch.zeros_like(hidden_states)
-        if extra_residual is not None:
-            empty = empty + extra_residual
-        return empty
-    be = _resolve_backend(
-        backend,
-        hidden_states,
-        swiglu_limit=swiglu_limit,
-        w13_bias=w13_bias,
-        w2_bias=w2_bias,
-        w13_weight=w13_weight,
-        w13_weight_scale=w13_weight_scale,
-        w2_weight=w2_weight,
-        w2_weight_scale=w2_weight_scale,
-    )
-    if be == _TORCH_BACKEND:
-        return ilu_mxfp4_fused_experts_torch(
-            hidden_states,
-            w13_weight,
-            w13_weight_scale,
-            w2_weight,
-            w2_weight_scale,
-            topk_weights,
-            topk_ids,
-            swiglu_limit=swiglu_limit,
-            expert_map=expert_map,
-            output_scale=output_scale,
-            extra_residual=extra_residual,
-            w13_bias=w13_bias,
-            w2_bias=w2_bias,
-        )
-    # ``gemm_mode=None`` lets ``group_gemm_fp4`` auto-select: gemv when
-    # ``M = T * top_k <= 128``, else gemm.
-    return _ilu_mxfp4_fused_experts_ixformer(
-        hidden_states,
-        w13_weight,
-        w13_weight_scale,
-        w2_weight,
-        w2_weight_scale,
-        topk_weights,
-        topk_ids,
-        swiglu_limit=swiglu_limit,
-        expert_map=expert_map,
-        output_scale=output_scale,
-        extra_residual=extra_residual,
-        w13_bias=w13_bias,
-        w2_bias=w2_bias,
-        gemm_backend=be,
-        gemm_mode=None,
-        w13_gemm_mode=w13_gemm_mode,
-        swiglu_variant=swiglu_variant,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_beta=swiglu_beta,
-        skip_moe_sort=skip_moe_sort,
     )

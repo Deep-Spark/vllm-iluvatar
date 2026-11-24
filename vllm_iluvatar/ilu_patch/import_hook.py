@@ -23,7 +23,7 @@ Mechanism:
        a single finder at the front of ``sys.meta_path`` (no module is imported
        here — registration is cheap).
     2. When anything imports ``target_fullname``, the finder steps aside to let
-       the real finders build the spec, then wraps ``spec.loader.exec_module``.
+       the real finders build the spec, then wraps ``spec.loader`` per spec.
     3. After the community module body has executed (functions defined) and
        before the importer uses it, the callback fires with the loaded module.
     4. Fallback: if the target is already in ``sys.modules`` at registration
@@ -62,6 +62,30 @@ def _fire(fullname: str, module: object) -> None:
             raise
 
 
+class _PostImportLoader(importlib.abc.Loader):
+    """Scope a callback to one spec without modifying a shared real loader.
+
+    Finders such as pytest's assertion rewriter reuse one loader for many
+    modules. Replacing that loader's exec_module would leak this target's
+    callback into unrelated or still-initializing imports.
+    """
+
+    def __init__(self, loader, fullname: str):
+        self._loader = loader
+        self._fullname = fullname
+
+    def create_module(self, spec):
+        create_module = getattr(self._loader, "create_module", None)
+        return create_module(spec) if create_module is not None else None
+
+    def exec_module(self, module):
+        self._loader.exec_module(module)
+        _fire(self._fullname, module)
+
+    def __getattr__(self, name):
+        return getattr(self._loader, name)
+
+
 class _PostImportFinder(importlib.abc.MetaPathFinder):
     """Fires registered callbacks right after a target module is executed."""
 
@@ -83,13 +107,7 @@ class _PostImportFinder(importlib.abc.MetaPathFinder):
         if spec is None or spec.loader is None:
             return None
 
-        real_exec = spec.loader.exec_module
-
-        def exec_module(module, _real_exec=real_exec, _name=fullname):
-            _real_exec(module)
-            _fire(_name, module)
-
-        spec.loader.exec_module = exec_module  # type: ignore[assignment]
+        spec.loader = _PostImportLoader(spec.loader, fullname)
         return spec
 
 

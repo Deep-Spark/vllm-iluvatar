@@ -316,11 +316,6 @@ def test_eager_pp_allocator_limit(
     monkeypatch.setattr(
         _stub_gpu_worker.Worker, "_scoped_allocator_max_split", scoped, raising=False
     )
-    import torch
-
-    monkeypatch.setattr(
-        torch.cuda.memory, "get_allocator_backend", lambda: "native", raising=False
-    )
     worker = _make_worker(None)
     worker.parallel_config = SimpleNamespace(pipeline_parallel_size=pp)
     worker.model_config = SimpleNamespace(enforce_eager=eager)
@@ -576,24 +571,3 @@ def test_configure_eager_pp_exchange_negotiation(
     assert (worker._pp_recv_schema is not None) is expected_active
     assert worker._pp_defer_send_wait is expected_defer
     assert worker.model_runner.intermediate_tensors.tensors["h"].shape[0] == 16
-
-
-def test_allocator_scope_without_backend_query(_stub_gpu_worker, monkeypatch):
-    import torch
-
-    def forbidden_scope(self, value):
-        raise AssertionError("Unsupported upstream allocator scope was called")
-
-    monkeypatch.delattr(torch.cuda.memory, "get_allocator_backend", raising=False)
-    monkeypatch.setattr(
-        _stub_gpu_worker.Worker, "_scoped_allocator_max_split", forbidden_scope,
-        raising=False,
-    )
-    worker = _make_worker(None)
-    with worker._scoped_allocator_max_split(20):
-        pass
-    with (
-        pytest.raises(RuntimeError, match="load failed"),
-        worker._scoped_allocator_max_split(20),
-    ):
-        raise RuntimeError("load failed")

@@ -39,6 +39,7 @@ _INTERLEAVED = "gemm1_interleaved"
 class IxInferW4A8Backend(MoEComputeBackend):
     name = "ixinfer_w4a8"
     pack_version = 2
+    requires_activation_limit = False
     priority = 20
     supported_layouts = {"ivcore11": ("NN", "TN"), "ivcore30": ("TN",)}
     supported_activations = ("silu", "swiglu", *_SWIGLUOAI_ACTIVATIONS)
@@ -128,9 +129,10 @@ class IxInferW4A8Backend(MoEComputeBackend):
     def _activation_quant(self, intermediate, order, decode, workspace):
         """GEMM1 output -> activation -> per-row INT8 for GEMM2."""
         if self.config.activation not in _SWIGLUOAI_ACTIVATIONS:
+            # An infinite bound preserves checkpoints with plain SwiGLU.
             return ops.swiglu_limit_dynamic_scaled_int8(
                 input=intermediate,
-                limit=float(self.limit),
+                limit=float("inf") if self.limit is None else float(self.limit),
                 output_format=int(decode and self.pack_version == 2),
                 dst_to_src=order,
                 check_valid=decode,
@@ -326,7 +328,8 @@ class IxInferW4A8Backend(MoEComputeBackend):
             input=intermediate,
             expert_num_tokens=counts,
             max_num_tokens_per_expert=capacity,
-            limit=self.limit,
+            # The grouped kernel uses -1 to disable clamping.
+            limit=-1.0 if self.limit is None else self.limit,
         )
         del intermediate
         workspace.release("gemm1")

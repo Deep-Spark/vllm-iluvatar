@@ -72,6 +72,7 @@ from collections.abc import Callable, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
+from typing import Any
 
 from vllm import envs
 from vllm.config import VllmConfig
@@ -494,6 +495,73 @@ def _resize_wire_config(compute_config: KVCacheConfig) -> None:
         tensor.size = tensor.size // old_num_blocks * new_num_blocks
 
 
+_MOONCAKE_STORE_CONNECTORS = (
+    "IluMooncakeStoreConnector",
+    "MooncakeStoreConnector",
+)
+
+
+def _has_mooncake_store_connector(vllm_config: Any) -> bool:
+    transfer = getattr(vllm_config, "kv_transfer_config", None)
+    if transfer is None:
+        return False
+    if getattr(transfer, "kv_connector", None) in _MOONCAKE_STORE_CONNECTORS:
+        return True
+    if getattr(transfer, "kv_connector", None) != "MultiConnector":
+        return False
+
+    def _visit(children: Sequence[Any]) -> bool:
+        for child in children:
+            if not isinstance(child, dict):
+                continue
+            name = child.get("kv_connector")
+            if name in _MOONCAKE_STORE_CONNECTORS:
+                return True
+            if name == "MultiConnector":
+                nested = (child.get("kv_connector_extra_config") or {}).get(
+                    "connectors", ()
+                )
+                if _visit(nested):
+                    return True
+        return False
+
+    extra = getattr(transfer, "kv_connector_extra_config", None) or {}
+    return _visit(extra.get("connectors", ()))
+
+
+def _attach_mooncake_group_pp_owners(
+    vllm_config: Any,
+    configs: list[KVCacheConfig],
+) -> None:
+    parallel = getattr(vllm_config, "parallel_config", None)
+    pp_size = int(getattr(parallel, "pipeline_parallel_size", 1))
+    tp_size = max(1, int(getattr(parallel, "tensor_parallel_size", 1)))
+    if pp_size <= 1 or not configs:
+        return
+    groups = getattr(configs[0], "kv_cache_groups", None)
+    if not groups:
+        return
+
+    from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.mooncake_store.layout import (
+        STORE_GROUP_PP_OWNERS_ATTR,
+    )
+
+    num_groups = len(groups)
+    owners_by_group: list[list[int]] = [[] for _ in range(num_groups)]
+    for worker_idx, cfg in enumerate(configs):
+        pp_rank = (worker_idx // tp_size) % pp_size
+        worker_groups = getattr(cfg, "kv_cache_groups", ())
+        if len(worker_groups) != num_groups:
+            return
+        for gid, group in enumerate(worker_groups):
+            if group.layer_names and pp_rank not in owners_by_group[gid]:
+                owners_by_group[gid].append(pp_rank)
+
+    propagated = tuple(tuple(sorted(stages)) for stages in owners_by_group)
+    for cfg in configs:
+        setattr(cfg, STORE_GROUP_PP_OWNERS_ATTR, propagated)
+
+
 def make_get_kv_cache_configs(
     original: Callable[..., list[KVCacheConfig]],
 ) -> Callable[..., list[KVCacheConfig]]:
@@ -506,7 +574,10 @@ def make_get_kv_cache_configs(
         available_memory: list[int],
     ) -> list[KVCacheConfig]:
         if not use_fp8_ds_mla_wire_staging(vllm_config):
-            return original(vllm_config, kv_cache_specs, available_memory)
+            configs = original(vllm_config, kv_cache_specs, available_memory)
+            if _has_mooncake_store_connector(vllm_config):
+                _attach_mooncake_group_pp_owners(vllm_config, configs)
+            return configs
 
         planning_context = _OrderedWorkerSpecs(kv_cache_specs)
         token = _ordered_worker_specs.set(planning_context)
@@ -517,6 +588,8 @@ def make_get_kv_cache_configs(
 
         for config in configs:
             _resize_wire_config(config)
+        if _has_mooncake_store_connector(vllm_config):
+            _attach_mooncake_group_pp_owners(vllm_config, configs)
         return configs
 
     return get_kv_cache_configs
@@ -577,6 +650,8 @@ def _ilu_get_kv_cache_configs(vllm_config, kv_cache_specs, available_memory):
         kv_cache_specs,
         available_memory,
     )
+    if _has_mooncake_store_connector(vllm_config):
+        _attach_mooncake_group_pp_owners(vllm_config, configs)
     if not needs_geometry:
         return configs
 

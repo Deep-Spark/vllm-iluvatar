@@ -28,9 +28,37 @@ _ILU_KV_CONNECTORS = (
         "vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.opt_nixl",
         "OptNixlConnector",
     ),
+    (
+        "IluMooncakeStoreConnector",
+        "vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.mooncake_store",
+        "IluMooncakeStoreConnector",
+    ),
+    (
+        "MooncakeStoreConnector",
+        "vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.mooncake_store",
+        "MooncakeStoreConnector",
+    ),
 )
 
 __all__ = ["apply_kv_transfer_registrations"]
+
+
+def _registered_to_iluvatar(loader: object) -> bool:
+    closure = getattr(loader, "__closure__", None)
+    if closure:
+        for cell in closure:
+            try:
+                val = cell.cell_contents
+            except ValueError:
+                continue
+            if isinstance(val, str) and val.startswith("vllm_iluvatar."):
+                return True
+        return False
+    try:
+        current_cls = loader()  # type: ignore[operator]
+        return current_cls.__module__.startswith("vllm_iluvatar.")
+    except Exception:
+        return False
 
 
 def apply_kv_transfer_registrations() -> None:
@@ -42,8 +70,7 @@ def apply_kv_transfer_registrations() -> None:
     for name, module_path, class_name in _ILU_KV_CONNECTORS:
         registered = KVConnectorFactory._registry
         if name in registered:
-            current_cls = registered[name]()
-            if current_cls.__module__.startswith("vllm_iluvatar."):
+            if _registered_to_iluvatar(registered[name]):
                 logger.debug("ILU KV connector already registered: %s", name)
                 continue
             logger.info(

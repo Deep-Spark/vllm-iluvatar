@@ -7,11 +7,17 @@ from pathlib import Path
 import pytest
 import torch
 
+from tests.conftest import requires_corex30
 from tests.mxfp4_reference import mxfp4_channel_int4, pack_ixinfer
 from vllm_iluvatar.ilu_util.arch import cuda_arch
 from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+    MoEComputeConfig,
     get_moe_backend,
+    make_moe_compute,
     select_moe_backend,
+)
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp4_moe import (
+    select_mxfp4_compute,
 )
 from vllm_iluvatar.model_executor.layers.quantization.common.mxfp4_loader import (
     Mxfp4LoadSpec,
@@ -121,6 +127,177 @@ def loader_for(layer, backend, layout, device="cpu", tp=1, rank=0):
 
         loader.convert_shard = reference_convert
     return loader
+
+
+@requires_corex30
+def test_per32_mxfp4_routed_expert_gemm():
+    selection = select_mxfp4_compute("ivcore30", "ixmm_mxfp4fp8")
+    compute = make_moe_compute(MoEComputeConfig(512, 256, 2, 6, limit=7.0), selection)
+    layer = ExpertLayer()
+    loader = loader_for(layer, selection.name, selection.layout, "cuda", tp=2, rank=1)
+    generator = torch.Generator().manual_seed(43)
+    expected = {}
+    # Each group contains -1, 0, 1, 2 and one outlier of 3 in E2M1.
+    codes = torch.tensor([10, 0, 2, 4] * 7 + [10, 0, 2, 5], dtype=torch.uint8)
+    magnitude = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6])
+    for expert in (4, 5):
+        for shard in ("w1", "w3", "w2"):
+            offsets = torch.randint(32, (512, 16, 1), generator=generator)
+            nibble = codes[(torch.arange(32) + offsets) % 32].flatten(1)
+            packed = nibble[:, ::2] | (nibble[:, 1::2] << 4)
+            scale = torch.randint(
+                123, 131, (512, 16), dtype=torch.uint8, generator=generator
+            )
+            assert deliver(layer, shard, expert, scale, scale=True)
+            assert deliver(layer, shard, expert, packed)
+            values = magnitude[(nibble & 7).long()] * torch.where(nibble < 8, 1, -1)
+            values *= torch.exp2(scale.float() - 127).repeat_interleave(32, dim=1)
+            expected[expert, shard] = values[:, 256:] if shard == "w2" else values[256:]
+    weights = loader.finalize()
+    compute.validate_weights(weights)
+
+    for prefix, k in (("w13", 512), ("w2", 256)):
+        for rows in (32, 96):
+            # One-hot inputs sample K across scale groups in both GEMM modes.
+            columns = torch.randperm(k, generator=generator)[:rows]
+            x = torch.eye(k)[columns].to(torch.float8_e4m3fn).cuda()
+            layout = torch.tensor(
+                [[0, rows // 2, 0], [rows // 2, rows, 1]],
+                dtype=torch.int32,
+                device="cuda",
+            )
+            out = compute.gemm(
+                weights, x, torch.ones(rows, device="cuda"), prefix, layout
+            )
+            for i, expert in enumerate((4, 5)):
+                reference = (
+                    expected[expert, "w2"]
+                    if prefix == "w2"
+                    else torch.cat((expected[expert, "w1"], expected[expert, "w3"]))
+                )
+                span = slice(i * rows // 2, (i + 1) * rows // 2)
+                torch.testing.assert_close(
+                    out[span].cpu().float(), reference.T[columns[span]], rtol=0, atol=0
+                )
+
+
+@pytest.fixture
+def per32_diagonal_experts():
+    selection = select_mxfp4_compute("ivcore30", "ixmm_mxfp4fp8")
+    compute = make_moe_compute(MoEComputeConfig(512, 256, 2, 6, limit=7.0), selection)
+    layer = ExpertLayer()
+    loader = loader_for(layer, selection.name, selection.layout, "cuda")
+    diag = torch.arange(256)
+    for expert in (4, 5):
+        for shard in ("w1", "w3", "w2"):
+            n, k = (512, 256) if shard == "w2" else (256, 512)
+            codes = torch.zeros((n, k), dtype=torch.uint8)
+            codes[diag, diag] = 2  # E2M1 +1
+            # Expert 5 doubles the up projection through its UE8M0 scale.
+            exponent = 128 if expert == 5 and shard == "w3" else 127
+            scale = torch.full((n, k // 32), exponent, dtype=torch.uint8)
+            assert deliver(layer, shard, expert, codes[:, ::2] | (codes[:, 1::2] << 4))
+            assert deliver(layer, shard, expert, scale, scale=True)
+    return compute, loader.finalize()
+
+
+@requires_corex30
+def test_per32_gemm_prefers_explicit_ixmm(per32_diagonal_experts, monkeypatch):
+    from ixformer.core import config
+    from ixformer.inference.backend_registry import registry
+
+    compute, weights = per32_diagonal_experts
+    op = "group_gemm_mxfp4_fp8"
+    monkeypatch.setattr(config, "IXFORMER_KERNEL_BACKEND", f"{op}:torch")
+    resolve = registry.resolve
+    assert resolve(op) == "torch"
+    selected = []
+
+    def record_backend(name, *args, **kwargs):
+        backend = resolve(name, *args, **kwargs)
+        if name == op:
+            selected.append(backend)
+        return backend
+
+    monkeypatch.setattr(registry, "resolve", record_backend)
+    x = torch.zeros((2, 256), dtype=torch.float8_e4m3fn, device="cuda")
+    layout = torch.tensor([[0, 1], [1, 2]], dtype=torch.int32, device="cuda")
+    compute.gemm(weights, x, torch.ones(2, device="cuda"), "w2", layout)
+    assert selected == ["ixmm"]
+
+
+@requires_corex30
+def test_per32_standard_routing_and_topk(per32_diagonal_experts):
+    compute, weights = per32_diagonal_experts
+    # One live channel per token makes both per-token FP8 quantizations exact
+    # up to BF16 rounding. The two experts compute silu(x)*x and twice that.
+    x = torch.eye(4, 512, dtype=torch.bfloat16, device="cuda")
+    x *= torch.tensor([1, -1, 2, -2], device="cuda")[:, None]
+    ids = torch.tensor(
+        [[4, 5], [5, 4], [4, 1], [1, 5]], device="cuda", dtype=torch.int32
+    )
+    scores = torch.tensor(
+        [[0.25, 0.75], [0.25, 0.75], [0.5, 0.5], [0.5, 0.5]], device="cuda"
+    )
+    expert_map = torch.tensor([-1, -1, -1, -1, 0, 1], device="cuda", dtype=torch.int32)
+    actual = compute.run_standard(
+        x,
+        weights,
+        scores,
+        ids,
+        expert_map,
+        workspace=compute.workspace_spec(ids.numel(), x.dtype).allocate(x.device),
+    )
+    gain = torch.tensor([1.75, 1.25, 0.5, 1.0], device="cuda")
+    expected = torch.nn.functional.silu(x.float()) * x * gain[:, None]
+    torch.testing.assert_close(actual.float(), expected, rtol=0.016, atol=0)
+
+
+@requires_corex30
+def test_per32_batched_valid_rows(per32_diagonal_experts):
+    compute, weights = per32_diagonal_experts
+    capacity = 4
+    x = torch.eye(2 * capacity, 512, dtype=torch.bfloat16, device="cuda").view(
+        2, capacity, 512
+    )
+    x[1].neg_()
+    counts = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
+    output = torch.full_like(x, torch.nan)
+    actual = compute.run_batched(
+        x,
+        weights,
+        None,
+        counts,
+        output=output,
+        workspace=compute.workspace_spec(2 * capacity, x.dtype, batched=True).allocate(
+            x.device
+        ),
+    )
+    assert actual is output
+    for expert, valid_rows in enumerate((3, 1)):
+        rows = x[expert, :valid_rows].float()
+        expected = torch.nn.functional.silu(rows) * rows * (expert + 1)
+        torch.testing.assert_close(
+            output[expert, :valid_rows].float(), expected, rtol=0.016, atol=0
+        )
+
+
+@requires_corex30
+def test_per32_mxfp4_loader_rejects_reserved_scale():
+    layer = ExpertLayer()
+    loader = loader_for(layer, "ixmm_mxfp4fp8", "mxfp4fp8", "cuda")
+    for expert in (4, 5):
+        for shard in ("w1", "w3", "w2"):
+            n, k = (512, 256) if shard == "w2" else (256, 512)
+            scale = torch.full((n, k // 32), 127, dtype=torch.uint8)
+            if expert == 5 and shard == "w3":
+                scale[-1, -1] = 255
+            assert deliver(
+                layer, shard, expert, torch.zeros((n, k // 2), dtype=torch.uint8)
+            )
+            assert deliver(layer, shard, expert, scale, scale=True)
+    with pytest.raises(ValueError, match="non-finite"):
+        loader.finalize()
 
 
 @pytest.mark.parametrize(

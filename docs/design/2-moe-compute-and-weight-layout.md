@@ -266,6 +266,14 @@ GLM-5.2 的 block-FP8 Method 从当前计算 backend 取得输入能力。IxMM F
 --additional-config '{"ilu_compute":{"schema_version":1,"moe":{"mode":"ixmm_w4a8_nn"}}}'
 ```
 
+在 ivcore30 上加载 DeepSeek-V4.1-Flash 等 MXFP4 checkpoint 时，可为路由专家显式选择：
+
+```bash
+--additional-config '{"ilu_compute":{"moe":{"mode":"ixmm_mxfp4fp8"}}}'
+```
+
+`ixmm_mxfp4fp8` 将 E2M1 权重重排为 ix30 布局，保留 checkpoint 中每 32 个权重的原始 UE8M0 scale 字节。默认的 `ixmm_fp4fp8` 在加载时重新量化权重，使用每 256 个权重一组的 FP32 scale。两者均使用 FP8 激活。新模式需要 ixformer 提供 `pack_mxfp4_for_ixmm` 和 `group_gemm_mxfp4_fp8`。
+
 省略 mode 或选择 `auto` 时，150 默认 IxInfer W4A8 NN（`ixinfer_w4a8_nn_v2`），300 默认 IxMM FP4FP8（`ixmm_fp4fp8`）。显式 mode 必须符合当前架构的公共列表；此外，150 读取原始 block-FP8 checkpoint 时还支持显式指定 `ixmm_w4a8_nn` 或 `ixinfer_w4a8_nn_v1`（后者要求专家层 `tp_size == 1` 且 `local_num_experts >= 2`），两者仅开放给 block-FP8，MXFP4 在 150 上指定它们或其他不支持组合均报错。
 
 为兼容已有启动方式，在未提供 MoE compute 配置时，150 的旧 `VLLM_ILU_MOE_RUNTIME_LAYOUT` 可以覆盖布局默认值。显式 mode 优先。本文默认项均指未作这类覆盖的行为。
@@ -363,6 +371,7 @@ PNG 用于文档展示，SVG 保留可编辑图形，MMD 保留流程图源码�
 ### 8.1 模型验证范围
 
 - **DeepSeek V4.1 / MXFP4**：保留既有验证范围。150 的 IxInfer W4A8 NN/TN 均覆盖 AG/RS 与 Hybrid LL/NVSM；300 的 IxMM FP4FP8、IxMM W4A8 NN 覆盖 AG/RS，Hybrid LL/NVSM 尚未验证。2026-11-25 回归补充验证了 DeepSeek-V4.1-Flash-1017 在 150（TP2×DP8+EP16、IxInfer W4A8 NN v2、BF16 KV/indexer、block size 64、eager）与 300（TP2×DP4+EP8、IxMM W4A8 NN、FP8 KV、block size 128、eager）的起服与单请求生成。
+- **DeepSeek-V4.1-Flash-1017 / 原始 per-32 MX scale**：ivcore30、`ixmm_mxfp4fp8`、TP2×DP4+EP8、`allgather_reducescatter` 已验证起服及聊天请求。Standard 与 Batched 后端入口另有设备数值回归；Hybrid LL/NVSM 整模通信尚未验证。
 - **Hy4 Flash / block-FP8**：150 默认 IxInfer W4A8 NN v2，300 默认 IxMM FP4FP8；两机均完成 DP16+EP、AG/RS、DFly5、FULL_DECODE_ONLY，以及 PP8×TP1/TP2 的整模回归和全量 GSM8K。PP 用例验证本地专家计算与权重分片，不额外构成 Hybrid LL/NVSM 验证。原始 FP8 权重在加载时转换，不需要预转换 checkpoint。
 - **GLM-5.2-FP8 / block-FP8**：300 的 IxMM FP4FP8 + AG/RS 已验证，包含 TP2×DP4+EP8（4k 上下文）与 ModelZoo TP2×DP8+EP16（131072 上下文）、MTP3、FP8 KV 和 FULL_DECODE_ONLY。使用默认 `IluFp8MoEMethod` 配对 Loader 完成 FP8→FP4FP8，不需要额外的 `fp4-moe-inline.yaml` 或显式 online-quant 配置。起服及 curl 已验证，TP2×DP8 全量 GSM8K 已完成；性能结果另行记录，不将 GLM-5.2 的 PP8 或 Hybrid LL/NVSM 一并标为已验证。
 - **GLM-5.3-Flash / block-FP8（ivcore11 / BI-V150S）**：直接加载原始 FP8 checkpoint，Linear 自动转 W8A8 INT8，routed experts 转运行期 W4A8 布局，不需要预转换 checkpoint：
@@ -385,7 +394,7 @@ GLM-5.2 的 ModelZoo 复测保留了模型参数；已激活开发环境时需�
 
 - **AG/RS**：配置 `allgather_reducescatter`，本地专家计算经对应 Method 的 `apply() → backend.run_standard()`。DeepSeek V4.1 在 ivcore11 的 Hybrid Prefill／混合步骤使用该路径；本表 Hy4 Flash、GLM-5.2-FP8、GLM-5.3-Flash 的 EP 用例，以及 ivcore30 的既有 MXFP4 验证，在 Prefill 与 Decode 均使用该路径。
 - **Hybrid LL / NVSM**：基础通信仍为 AG/RS，显式配置 `VLLM_ILU_DECODE_EP_BACKEND=deepep_low_latency` 与 `VLLM_ILU_DISABLE_DEEPEP=1`。所有 DP rank 均为纯 Decode 时，经 `IluBatchedComputeExperts → backend.run_batched()` 使用 IxFormer NVSM dispatch/combine；其他步骤保持基础通信。这不包含原生 DeepEP LL/HT 或直接将 LL 配为基础 all2all backend。
-- **未验证与不支持的组合**：MXFP4 在 ivcore30 的两种 mode 已覆盖 AG/RS；FP8 已验证各架构默认 mode 的 AG/RS、150 上 GLM-5.3-Flash 的 IxMM W4A8 NN 与 IxInfer W4A8 NN v1 + AG/RS，以及 300 上 GLM-5.2 的 IxMM W4A8 NN + AG/RS。150 上的 `ixmm_w4a8_nn` 与 `ixinfer_w4a8_nn_v1` 明确不支持 BatchedExperts（即 Hybrid LL/NVSM，矩阵标为 `✗`）。其他已有 backend/adapter 接口不足以构成整模支持承诺，不将“未验证”写成“不支持”。
+- **未验证与不支持的组合**：MXFP4 在 ivcore30 的三种 mode 已覆盖 AG/RS；FP8 已验证各架构默认 mode 的 AG/RS、150 上 GLM-5.3-Flash 的 IxMM W4A8 NN 与 IxInfer W4A8 NN v1 + AG/RS，以及 300 上 GLM-5.2 的 IxMM W4A8 NN + AG/RS。150 上的 `ixmm_w4a8_nn` 与 `ixinfer_w4a8_nn_v1` 明确不支持 BatchedExperts（即 Hybrid LL/NVSM，矩阵标为 `✗`）。其他已有 backend/adapter 接口不足以构成整模支持承诺，不将“未验证”写成“不支持”。
 - **适配器边界**：当前 AG/RS 接线直接调用 Method，不经过 `IluStandardComputeExperts`。后者提供 Standard modular 协议接口，其独立通信接线不能由上述 AG/RS 结论代替。
 - **并行边界**：PP 属于模型并行拓扑，不是 MoE all2all backend。未启用 EP 时（如 GLM-5.3-Flash 与 Hy4 Flash 的 PP8 Prefill），本地专家同样通过 `apply → run_standard` 执行；P/D KV 传输也不属于本表的专家通信。
 

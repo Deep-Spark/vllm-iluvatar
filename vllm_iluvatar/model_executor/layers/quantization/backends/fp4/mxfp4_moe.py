@@ -607,7 +607,7 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
     def get_fused_moe_quant_config(self, layer):
         if getattr(self, "selection", None) is None:
             return self._legacy_get_fused_moe_quant_config(layer)
-        if self.selection.name == "ixmm_fp4fp8":
+        if self.selection.name in ("ixmm_fp4fp8", "ixmm_mxfp4fp8"):
             return mxfp4_w4a8_moe_quant_config(
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,

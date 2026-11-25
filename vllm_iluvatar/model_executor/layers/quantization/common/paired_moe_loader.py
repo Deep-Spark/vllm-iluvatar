@@ -128,7 +128,7 @@ class PairedMoEWeightLoader:
             offset = n if shard == "w3" else 0
             if self.weight_spec.layout == "TN":
                 target = target.narrow(0, offset, n)
-            elif self.weight_spec.scale_group_size == 256:
+            elif self.weight_spec.scale_group_size in (32, 256):
                 target = target.narrow(-1, offset, n)
             else:
                 target = target.narrow(-1, offset // 2, n // 2)
@@ -155,7 +155,11 @@ class PairedMoEWeightLoader:
                 self._layer.register_parameter(f"{group}_weight_scale", param)
         weights = MoEWeights.from_layer(self._layer, self.weight_spec)
         for scale in (weights.w13_weight_scale, weights.w2_weight_scale):
-            if not torch.isfinite(scale).all():
+            # UE8M0 block scales reserve byte 255 for NaN.
+            valid = (
+                scale != 255 if scale.dtype == torch.uint8 else torch.isfinite(scale)
+            )
+            if not valid.all():
                 self._failed = True
                 raise ValueError(f"Invalid or non-finite {self.source_name} weights")
         self._finalized = True

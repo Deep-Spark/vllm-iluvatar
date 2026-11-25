@@ -23,6 +23,8 @@ class MoEWeightSpec:
     alignment: int = 256
 
     def shapes(self, experts, n, k):
+        if self.scale_group_size == 32:
+            return (experts, k // 2, n), (experts, k // 32, n)
         if self.scale_group_size == 256:
             k = (k + 255) // 256 * 256
             return (experts, k // 2, n), (experts, k // 256, n)

@@ -33,7 +33,7 @@
 <body>
   <main>
     <h1>MoE 计算与通信支持矩阵</h1>
-    <p class="intro">原始 MXFP4 / block-FP8 → 配对 Loader → compute 运行权重 · 模型验证范围更新于 2026-11-25</p>
+    <p class="intro">原始 MXFP4 / block-FP8 → 配对 Loader → compute 运行权重 · 模型验证范围更新于 2026-11-26</p>
     <div class="table-container">
       <table aria-label="MoE 计算与通信支持矩阵">
         <thead><tr><th scope="col">架构</th><th scope="col">MoE Method / 源格式</th><th scope="col">计算 backend / mode</th><th scope="col">AG/RS</th><th scope="col">Hybrid LL<br>/ NVSM</th><th scope="col">验证模型 / 范围</th></tr></thead>
@@ -41,6 +41,7 @@
 <tr><th scope="row">ivcore11 / 150</th><td><code>IluMxfp4MoEMethod</code><span class="source">MXFP4 源权重</span></td><td>IxInfer W4A8 NN（默认）<code class="mode">ixinfer_w4a8_nn_v2</code></td><td><span class="status yes" aria-label="已验证模型组合">✓</span></td><td><span class="status yes" aria-label="已验证模型组合">✓</span></td><td class="models">DeepSeek V4.1</td></tr>
 <tr><th scope="row">ivcore11 / 150</th><td><code>IluMxfp4MoEMethod</code><span class="source">MXFP4 源权重</span></td><td>IxInfer W4A8 TN<code class="mode">ixinfer_w4a8_tn_v2</code></td><td><span class="status yes" aria-label="已验证模型组合">✓</span></td><td><span class="status yes" aria-label="已验证模型组合">✓</span></td><td class="models">DeepSeek V4.1</td></tr>
 <tr><th scope="row">ivcore30 / 300</th><td><code>IluMxfp4MoEMethod</code><span class="source">MXFP4 源权重</span></td><td>IxMM FP4FP8（默认）<code class="mode">ixmm_fp4fp8</code></td><td><span class="status yes" aria-label="已验证模型组合">✓</span></td><td><span class="status unknown" aria-label="未完成模型验证">—</span></td><td class="models">DeepSeek V4.1</td></tr>
+<tr><th scope="row">ivcore30 / 300</th><td><code>IluMxfp4MoEMethod</code><span class="source">MXFP4 源权重</span></td><td>IxMM MXFP4 × FP8（per-32）<code class="mode">ixmm_mxfp4fp8</code></td><td><span class="status yes" aria-label="已验证模型组合">✓</span></td><td><span class="status unknown" aria-label="未完成模型验证">—</span></td><td class="models">DeepSeek-V4.1-Flash<br>TP2×DP4+EP8</td></tr>
 <tr><th scope="row">ivcore30 / 300</th><td><code>IluMxfp4MoEMethod</code><span class="source">MXFP4 源权重</span></td><td>IxMM W4A8 NN<code class="mode">ixmm_w4a8_nn</code></td><td><span class="status yes" aria-label="已验证模型组合">✓</span></td><td><span class="status unknown" aria-label="未完成模型验证">—</span></td><td class="models">DeepSeek V4.1</td></tr>
 <tr class="section-start"><th scope="row">ivcore11 / 150</th><td><code>IluFp8MoEMethod</code><span class="source">block-FP8 源权重</span></td><td>IxInfer W4A8 NN（默认）<code class="mode">ixinfer_w4a8_nn_v2</code></td><td><span class="status yes" aria-label="已验证模型组合">✓</span></td><td><span class="status unknown" aria-label="未完成模型验证">—</span></td><td class="models">Hy4 Flash · DP16+EP / DFly5<br>GLM-5.3-Flash · PP8 Prefill / TP8 GSM8K</td></tr>
 <tr><th scope="row">ivcore11 / 150</th><td><code>IluFp8MoEMethod</code><span class="source">block-FP8 源权重</span></td><td>IxMM W4A8 NN（Decode 推荐）<code class="mode">ixmm_w4a8_nn</code></td><td><span class="status yes" aria-label="已验证模型组合">✓</span></td><td><span class="status no" aria-label="不支持">✗</span></td><td class="models">GLM-5.3-Flash · TP2×DP8+EP16 / MTP5</td></tr>

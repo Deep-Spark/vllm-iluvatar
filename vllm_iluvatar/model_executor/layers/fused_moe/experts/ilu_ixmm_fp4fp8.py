@@ -161,3 +161,33 @@ class IxMMFP4FP8Backend(MoEComputeBackend):
             output.reshape(-1, output.shape[-1]),
         )
         return output
+
+
+@register_moe_backend
+class IxMMMXFP4FP8Backend(IxMMFP4FP8Backend):
+    """Reuse FP8 routing and clamped SwiGLU with original per-32 MX scales."""
+
+    name = "ixmm_mxfp4fp8"
+    priority = 11
+    supported_layouts = {"ivcore30": ("mxfp4fp8",)}
+    weight_specs = {
+        "mxfp4fp8": MoEWeightSpec(
+            name,
+            "mxfp4fp8",
+            torch.uint8,
+            torch.uint8,
+            scale_group_size=32,
+        )
+    }
+
+    def gemm(self, weights, x, scale, prefix, layout, output=None, mode=None):
+        return ops.group_gemm_mxfp4_fp8(
+            x,
+            scale,
+            getattr(weights, prefix + "_weight"),
+            getattr(weights, prefix + "_weight_scale"),
+            layout,
+            output,
+            backend="ixmm",
+            mode=mode,
+        )

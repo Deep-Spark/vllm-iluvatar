@@ -3,7 +3,6 @@
 """Shared constants, lazy imports and helpers for the NIXL connector."""
 
 import contextlib
-import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -14,6 +13,10 @@ import zmq
 from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import make_zmq_socket
+
+from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.layer_names import (
+    find_number_on_layer_name as find_number_on_layer_name,
+)
 
 # Supported platforms and types of kv transfer buffer.
 # {device: tuple of supported kv buffer types}
@@ -291,12 +294,6 @@ class D2HManger:
             self.d2h_manager.transfer(
                 index
             )  # this c++ pushes tasks will work on other thread
-
-
-def find_number_on_layer_name(text: str) -> list[str]:
-    pattern = r"\.(0|100|[1-9]\d?)\."
-    result = re.findall(pattern, text)
-    return result
 
 
 @dataclass

@@ -78,17 +78,13 @@ def build_region_ids_by_group(
     return region_ids_by_group
 
 
-def is_virtual_packed_layout(
-    kv_cache_config: Any, kv_caches: dict[str, Any]
-) -> bool:
+def is_virtual_packed_layout(kv_cache_config: Any, kv_caches: dict[str, Any]) -> bool:
     tensors = getattr(kv_cache_config, "kv_cache_tensors", ()) or ()
     if not tensors or not kv_caches:
         return False
     if not any(getattr(tensor, "block_stride", 0) > 0 for tensor in tensors):
         return False
-    storage_ptrs = {
-        cache.untyped_storage().data_ptr() for cache in kv_caches.values()
-    }
+    storage_ptrs = {cache.untyped_storage().data_ptr() for cache in kv_caches.values()}
     return len(storage_ptrs) == 1
 
 
@@ -107,8 +103,7 @@ def virtual_slot_desc(
         )
     if slot_offset < 0:
         raise ValueError(
-            "Packed virtual slot offset must be non-negative: "
-            f"offset={slot_offset}"
+            f"Packed virtual slot offset must be non-negative: offset={slot_offset}"
         )
     if slot_offset < block_stride and slot_offset + page_size > block_stride:
         raise ValueError(
@@ -180,16 +175,13 @@ def build_packed_virtual_layout(
         shared_by = [
             layer_name
             for layer_name in members
-            if layer_name in kv_caches
-            and winning_tensor_idx.get(layer_name) == t_idx
+            if layer_name in kv_caches and winning_tensor_idx.get(layer_name) == t_idx
         ]
         if not shared_by:
             continue
         tensor_stride = int(tensor_config.block_stride)
         if tensor_stride <= 0:
-            raise ValueError(
-                "Packed IluNixl layout contains a non-packed tensor slot"
-            )
+            raise ValueError("Packed IluNixl layout contains a non-packed tensor slot")
         if int(tensor_config.size) != backing_nbytes:
             raise ValueError(
                 "Packed IluNixl slot size does not cover the registered "
@@ -203,8 +195,14 @@ def build_packed_virtual_layout(
         tensor_offset = int(tensor_config.offset)
         num_blocks = int(layout_config.num_blocks)
 
-        def layer_byte_offset(layer_name: str) -> int:
-            return tensor_offset + layer_positions[layer_name] * layer_stride
+        def layer_byte_offset(
+            layer_name: str,
+            *,
+            _tensor_offset: int = tensor_offset,
+            _layer_positions: dict[str, int] = layer_positions,
+            _layer_stride: int = layer_stride,
+        ) -> int:
+            return _tensor_offset + _layer_positions[layer_name] * _layer_stride
 
         missing_specs = [
             layer_name for layer_name in shared_by if layer_name not in specs
@@ -217,9 +215,7 @@ def build_packed_virtual_layout(
 
         block_span = tensor_stride * num_blocks
         is_block_outer = layer_stride == 0 or layer_stride < tensor_stride
-        if is_block_outer and (
-            block_span <= 0 or backing_nbytes % block_span != 0
-        ):
+        if is_block_outer and (block_span <= 0 or backing_nbytes % block_span != 0):
             raise ValueError(
                 "Packed IluNixl backing size is not a whole number of "
                 "num_blocks * block_stride: "
@@ -230,16 +226,19 @@ def build_packed_virtual_layout(
                 "Packed IluNixl layout has non-positive num_blocks or "
                 f"block_stride: N={num_blocks}, stride={tensor_stride}"
             )
-        def _layer_num_blocks(cache: torch.Tensor) -> int:
-            if is_block_outer:
-                return num_blocks
-            row_bytes = (
-                cache.stride(0) * cache.element_size()
-                if cache.ndim >= 2
-                else 0
-            )
-            if row_bytes > 0 and tensor_stride % row_bytes == 0:
-                k_blocks = tensor_stride // row_bytes
+
+        def _layer_num_blocks(
+            cache: torch.Tensor,
+            *,
+            _is_block_outer: bool = is_block_outer,
+            _num_blocks: int = num_blocks,
+            _tensor_stride: int = tensor_stride,
+        ) -> int:
+            if _is_block_outer:
+                return _num_blocks
+            row_bytes = cache.stride(0) * cache.element_size() if cache.ndim >= 2 else 0
+            if row_bytes > 0 and _tensor_stride % row_bytes == 0:
+                k_blocks = _tensor_stride // row_bytes
                 if k_blocks > 1 and int(cache.shape[0]) % k_blocks == 0:
                     return int(cache.shape[0]) // k_blocks
             return int(cache.shape[0])
@@ -259,9 +258,9 @@ def build_packed_virtual_layout(
                     f"{layer_name} end={last_end} > backing={backing_nbytes}"
                 )
 
-        semantic_slots: dict[
-            tuple[int, bool, str, int, int, int, int], list[str]
-        ] = defaultdict(list)
+        semantic_slots: dict[tuple[int, bool, str, int, int, int, int], list[str]] = (
+            defaultdict(list)
+        )
         for layer_name in shared_by:
             cache = kv_caches[layer_name]
             spec = specs[layer_name]
@@ -284,14 +283,12 @@ def build_packed_virtual_layout(
                 num_blocks=layer_num_blocks,
             )
             if is_dsv41 or kernel_blocks > 1:
-                payload_bytes = (
-                    MemoryRegistrationPlanner.scheduler_block_payload_bytes(
-                        layer_name=layer_name,
-                        tensor=cache,
-                        spec=spec,
-                        kernel_blocks=kernel_blocks,
-                        block_stride=tensor_stride,
-                    )
+                payload_bytes = MemoryRegistrationPlanner.scheduler_block_payload_bytes(
+                    layer_name=layer_name,
+                    tensor=cache,
+                    spec=spec,
+                    kernel_blocks=kernel_blocks,
+                    block_stride=tensor_stride,
                 )
             else:
                 payload_bytes = int(spec.page_size_bytes)
@@ -305,9 +302,7 @@ def build_packed_virtual_layout(
                 ),
                 kernel_blocks=kernel_blocks,
             )
-            is_mla_region = isinstance(
-                spec, (MLAAttentionSpec, SlidingWindowMLASpec)
-            )
+            is_mla_region = isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
             cache_kind = cache_kind_from_layer_name(layer_name)
             block_tokens = int(getattr(spec, "block_size", 0) or 0)
             semantic_slots[
@@ -380,9 +375,7 @@ def build_packed_virtual_layout(
                     kernel_blocks=kernel_blocks,
                     block_tokens=block_tokens,
                     num_blocks=layer_num_blocks,
-                    identity_groups={
-                        k: sorted(v) for k, v in identity_groups.items()
-                    },
+                    identity_groups={k: sorted(v) for k, v in identity_groups.items()},
                 )
             )
             region_is_mla.append(is_mla_region)
@@ -450,9 +443,9 @@ def append_paired_scale_regions(
 
     seen_addr_to_idx = {addr: idx for idx, addr in enumerate(base_addresses)}
     seen_addr_sizes = {entry[0]: entry[1] for entry in physical_data}
-    scale_slots: dict[
-        tuple[int, int, int, int, str, int, int], list[str]
-    ] = defaultdict(list)
+    scale_slots: dict[tuple[int, int, int, int, str, int, int], list[str]] = (
+        defaultdict(list)
+    )
 
     for layer_name in paired_layers:
         spec = specs[layer_name]
@@ -499,9 +492,7 @@ def append_paired_scale_regions(
             seen_addr_to_idx[scale_base] = backing_id
             seen_addr_sizes[scale_base] = scale_nbytes
             base_addresses.append(scale_base)
-            physical_data.append(
-                (scale_base, scale_nbytes, scale_reg.device_id, "")
-            )
+            physical_data.append((scale_base, scale_nbytes, scale_reg.device_id, ""))
 
         ((scale_offset, scale_payload_len),) = scale_reg.payload_segments
         scale_name = f"{layer_name}.kv_cache_scales"
@@ -575,9 +566,7 @@ def append_paired_scale_regions(
                 kernel_blocks=kernel_blocks,
                 block_tokens=block_tokens,
                 num_blocks=num_blocks,
-                identity_groups={
-                    k: sorted(v) for k, v in identity_groups.items()
-                },
+                identity_groups={k: sorted(v) for k, v in identity_groups.items()},
             )
         )
         region_is_mla.append(True)

@@ -40,9 +40,7 @@ class StageTask:
     requantize_block_ids: tuple[tuple[int, ...], ...] = ()
     is_last_chunk: bool = False
     make_writer_task: Callable[[], Any] = field(default=lambda: None)
-    enqueued_at: float = field(
-        default_factory=time.perf_counter if _TIMED else float
-    )
+    enqueued_at: float = field(default_factory=time.perf_counter if _TIMED else float)
 
 
 class HostWireStager(threading.Thread):
@@ -98,9 +96,7 @@ class HostWireStager(threading.Thread):
             trace.set_task(task.request_id, task.chunk_index)
             trace_begin = trace.now_ms()
         futures = []
-        num_groups = max(
-            len(task.quant_block_ids), len(task.requantize_block_ids)
-        )
+        num_groups = max(len(task.quant_block_ids), len(task.requantize_block_ids))
         for group_idx in range(num_groups):
             layers = self._group_layers(task.layer_names, group_idx)
             if not layers:

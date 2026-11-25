@@ -8,13 +8,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler import (
 )
 from vllm.logger import init_logger
 
+from ..ilu_nixl_common.dsv41 import compute_prefix_replay_alignment
 from ..ilu_nixl_common.types import (
     encode_block_ids_rle,
     resolve_remote_block_ids,
 )
 from .base_scheduler import IluNixlBaseConnectorScheduler
 from .fp8_layout import get_fp8_wire_block_size
-from ..ilu_nixl_common.dsv41 import compute_prefix_replay_alignment
 from .metadata import format_kv_group_page_log
 from .pp_utils import infer_pp_split
 
@@ -31,9 +31,7 @@ class IluNixlPullConnectorScheduler(
     def __init__(self, vllm_config, engine_id: str, kv_cache_config):
         super().__init__(vllm_config, engine_id, kv_cache_config)
         transfer_cfg = getattr(vllm_config, "kv_transfer_config", None)
-        is_consumer = (
-            transfer_cfg is not None and transfer_cfg.kv_role == "kv_consumer"
-        )
+        is_consumer = transfer_cfg is not None and transfer_cfg.kv_role == "kv_consumer"
         get_extra = getattr(transfer_cfg, "get_from_extra_config", None)
         rle_enabled_raw = (
             True if get_extra is None else get_extra("enable_rle_block_ids", True)
@@ -48,15 +46,10 @@ class IluNixlPullConnectorScheduler(
         if self.fp8_wire_staging_enabled:
             wire_bs = get_fp8_wire_block_size(vllm_config)
             if wire_bs is not None:
-                for group in getattr(
-                    self.kv_cache_config, "kv_cache_groups", ()
-                ):
+                for group in getattr(self.kv_cache_config, "kv_cache_groups", ()):
                     spec = group.kv_cache_spec
                     compute_bs = int(getattr(spec, "block_size", 0) or 0)
-                    if (
-                        compute_bs > wire_bs
-                        and compute_bs % wire_bs == 0
-                    ):
+                    if compute_bs > wire_bs and compute_bs % wire_bs == 0:
                         self._fp8_wire_group_ratios.append(compute_bs // wire_bs)
                     else:
                         self._fp8_wire_group_ratios.append(1)
@@ -185,9 +178,7 @@ class IluNixlPullConnectorScheduler(
                         [bid * ratio + sub for bid in grp for sub in range(ratio)]
                         if ratio > 1 and grp
                         else list(grp)
-                        for grp, ratio in zip(
-                            remote_ids, self._fp8_wire_group_ratios
-                        )
+                        for grp, ratio in zip(remote_ids, self._fp8_wire_group_ratios)
                     )
                     params["remote_block_ids"] = remote_ids
                 total_pages = sum(len(group) for group in remote_ids)
@@ -199,9 +190,8 @@ class IluNixlPullConnectorScheduler(
                     params.get("pp_size"),
                     params.get("pp_split"),
                 )
-                if (
-                    getattr(self, "_rle_enabled", False)
-                    and total_pages >= getattr(self, "_rle_min_blocks", _DEFAULT_RLE_MIN_BLOCKS)
+                if getattr(self, "_rle_enabled", False) and total_pages >= getattr(
+                    self, "_rle_min_blocks", _DEFAULT_RLE_MIN_BLOCKS
                 ):
                     params["remote_block_ids_rle"] = encode_block_ids_rle(remote_ids)
                     params["remote_block_ids"] = ()

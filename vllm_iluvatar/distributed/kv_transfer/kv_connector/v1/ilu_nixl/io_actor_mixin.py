@@ -41,7 +41,7 @@ class _IluCompletionBatch:
     recv_metadata: dict[str, Any] = field(default_factory=dict)
     enqueued_at: float = 0.0
 
-    def merge(self, other: "_IluCompletionBatch") -> None:
+    def merge(self, other: _IluCompletionBatch) -> None:
         self.done_sending.update(other.done_sending)
         self.done_recving.update(other.done_recving)
         self.failed_recving.update(other.failed_recving)
@@ -110,7 +110,9 @@ def _query_zmq_payloads_with_clock(
                     rtt = recv_t - send_times[idx]
                     if isinstance(remote_ts, (int, float)) and rtt < best_rtt:
                         best_rtt = rtt
-                        best_offset = float(remote_ts) - (send_times[idx] + recv_t) / 2.0
+                        best_offset = (
+                            float(remote_ts) - (send_times[idx] + recv_t) / 2.0
+                        )
 
     return fetched, best_offset
 
@@ -1098,9 +1100,9 @@ class IluNixlIoActorMixin:
     ) -> None:
         if not done_recving:
             return
-        block_ids_for_blocksize_post_process: dict[
-            int, list[tuple[list[int], int]]
-        ] = defaultdict(list)
+        block_ids_for_blocksize_post_process: dict[int, list[tuple[list[int], int]]] = (
+            defaultdict(list)
+        )
         block_ids_for_heterogeneous_attn_post_process: list[list[int]] = []
 
         for req_id in done_recving:
@@ -1237,5 +1239,3 @@ class IluNixlIoActorMixin:
         if hasattr(self, "_active_sessions"):
             self._active_sessions.clear()
         super().shutdown()
-
-

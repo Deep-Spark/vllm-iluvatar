@@ -196,9 +196,7 @@ def test_community_shrink_replans_keep_aligned_num_blocks():
 
     def community_shrink(_config, worker_specs, memories):
         configs = [
-            one_worker_planner(
-                _config, groups_by_layers[frozenset(spec)], memory
-            )
+            one_worker_planner(_config, groups_by_layers[frozenset(spec)], memory)
             for spec, memory in zip(worker_specs, memories)
         ]
         min_blocks = min(item.num_blocks for item in configs)
@@ -276,7 +274,6 @@ def test_community_shrink_with_transient_group_lists_and_tp_replicas():
         assert item.wire_kv_cache_config.num_blocks == item.num_blocks
 
 
-
 def test_planning_wrapper_preserves_current_packed_layout():
     config = _config(connector="NixlConnector")
     config.kv_transfer_config.kv_connector_extra_config[
@@ -314,9 +311,7 @@ def test_planning_activates_for_multiconnector_ilu_child():
             {
                 "kv_connector": "IluNixlPullConnector",
                 "kv_role": "kv_producer",
-                "kv_connector_extra_config": {
-                    "enable_fp8_ds_mla_wire_staging": "True"
-                },
+                "kv_connector_extra_config": {"enable_fp8_ds_mla_wire_staging": "True"},
             },
             {
                 "kv_connector": "OffloadingConnector",

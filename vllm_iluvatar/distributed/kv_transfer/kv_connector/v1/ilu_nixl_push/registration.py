@@ -67,11 +67,9 @@ class RegistrationMixin:
             return self._hetero_cfg.decode_block_size
         if self._wire_plan is None:
             return self.block_size
-        return min(
-            int(spec.block_size) for spec in self._wire_plan.wire_specs.values()
-        )
+        return min(int(spec.block_size) for spec in self._wire_plan.wire_specs.values())
 
-    def _is_packed_kv_cache(self, kv_caches: dict[str, "torch.Tensor"]) -> bool:
+    def _is_packed_kv_cache(self, kv_caches: dict[str, torch.Tensor]) -> bool:
         if not kv_caches or self._has_mamba or self.use_host_buffer:
             return False
         return is_virtual_packed_layout(self.kv_cache_config, kv_caches)
@@ -115,9 +113,7 @@ class RegistrationMixin:
             ),
         )
         main_kv_fmt = (
-            dsv41.main_kv_format
-            if dsv41 is not None
-            else resolve_main_kv_format_name()
+            dsv41.main_kv_format if dsv41 is not None else resolve_main_kv_format_name()
         )
         idx_kv_layout = (
             dsv41.indexer_kv_layout
@@ -201,9 +197,7 @@ class RegistrationMixin:
 
     def _register_empty_rank(self, original_kv_caches: dict[str, Any]) -> None:
         """Handle a PP stage where all local KV views are skipped (e.g. V4.1 SWA/forwarder)."""
-        logical_num_blocks = int(
-            getattr(self, "_logical_num_blocks", self.num_blocks)
-        )
+        logical_num_blocks = int(getattr(self, "_logical_num_blocks", self.num_blocks))
         if self._physical_blocks_per_logical_kv_block != 1:
             self.num_blocks = logical_num_blocks
             self.block_size = int(
@@ -248,13 +242,11 @@ class RegistrationMixin:
 
     def _register_virtual_packed_kv_cache(
         self,
-        kv_caches: dict[str, "torch.Tensor"],
+        kv_caches: dict[str, torch.Tensor],
         *,
-        kv_cache_scales: dict[str, "torch.Tensor"] | None = None,
+        kv_cache_scales: dict[str, torch.Tensor] | None = None,
     ) -> None:
-        logical_num_blocks = int(
-            getattr(self, "_logical_num_blocks", self.num_blocks)
-        )
+        logical_num_blocks = int(getattr(self, "_logical_num_blocks", self.num_blocks))
         if getattr(self, "_physical_blocks_per_logical_kv_block", 1) != 1:
             self.num_blocks = logical_num_blocks
             self.block_size = int(
@@ -320,8 +312,7 @@ class RegistrationMixin:
             region.block_stride for region in self.transfer_regions
         ]
         self.region_num_blocks = [
-            region.num_blocks or self.num_blocks
-            for region in self.transfer_regions
+            region.num_blocks or self.num_blocks for region in self.transfer_regions
         ]
         self.region_group_ids = [
             region.group_ids[0] if len(region.group_ids) == 1 else -1
@@ -341,26 +332,18 @@ class RegistrationMixin:
         self.transfer_topo = self._new_push_transfer_topology()
         self.compat_hash = self._compute_push_compat_hash()
 
-        descs = self.nixl_wrapper.get_reg_descs(
-            physical_data, backing_memory_type
-        )
+        descs = self.nixl_wrapper.get_reg_descs(physical_data, backing_memory_type)
         self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
         self._registered_descs.append(descs)
         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = base_addresses
         self.dst_num_blocks[self.engine_id] = self.num_blocks
         if hasattr(self, "dst_region_num_blocks"):
-            self.dst_region_num_blocks[self.engine_id] = list(
-                self.region_num_blocks
-            )
-            self.dst_region_group_ids[self.engine_id] = list(
-                self.region_group_ids
-            )
+            self.dst_region_num_blocks[self.engine_id] = list(self.region_num_blocks)
+            self.dst_region_group_ids[self.engine_id] = list(self.region_group_ids)
             self.dst_uses_region_group_mapping[self.engine_id] = (
                 self._uses_region_group_mapping
             )
-            self.dst_region_mem_types[self.engine_id] = list(
-                self.region_mem_types
-            )
+            self.dst_region_mem_types[self.engine_id] = list(self.region_mem_types)
         (
             self.src_xfer_handles_by_block_size[self.block_size],
             self.src_blocks_data,
@@ -368,9 +351,9 @@ class RegistrationMixin:
 
     def _setup_host_wire(
         self,
-        kv_caches: dict[str, "torch.Tensor"],
-        kv_cache_scales: dict[str, "torch.Tensor"] | None = None,
-    ) -> dict[str, "torch.Tensor"]:
+        kv_caches: dict[str, torch.Tensor],
+        kv_cache_scales: dict[str, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
         from ..ilu_nixl_common.fp8_hetero.host_pool import HostKVPool
         from ..ilu_nixl_common.fp8_hetero.stager import HostWireStager
         from ..ilu_nixl_common.fp8_hetero.staging import StagingPipeline
@@ -475,7 +458,7 @@ class RegistrationMixin:
     def _register_packed_kv_cache(
         self,
         storage: Any,
-        kv_caches: dict[str, "torch.Tensor"] | None = None,
+        kv_caches: dict[str, torch.Tensor] | None = None,
         active_layers: set[str] | None = None,
     ) -> None:
         parent_packed = getattr(super(), "_register_packed_kv_cache", None)
@@ -580,9 +563,9 @@ class RegistrationMixin:
         self._region_is_mla = region_is_mla
         self._region_page_ratios = region_page_ratios
         counts = [self.num_blocks * ratio for ratio in self._region_page_ratios]
-        self._region_desc_offsets = (
-            np.cumsum([0, *counts[:-1]], dtype=np.int64).tolist()
-        )
+        self._region_desc_offsets = np.cumsum(
+            [0, *counts[:-1]], dtype=np.int64
+        ).tolist()
         self.num_regions = len(base_addrs)
         self.num_descs = sum(counts)
         self.region_num_blocks = counts
@@ -653,9 +636,7 @@ class RegistrationMixin:
             logical_blocks = None
             ratios = region_page_ratios
         parts = []
-        for region_id, (base_addr, ratio) in enumerate(
-            zip(base_addresses, ratios)
-        ):
+        for region_id, (base_addr, ratio) in enumerate(zip(base_addresses, ratios)):
             region_blocks = (
                 logical_blocks
                 if logical_blocks is not None
@@ -669,9 +650,7 @@ class RegistrationMixin:
                 self.num_blocks,
             )
             addrs = (
-                base_addr
-                + region_blocks * self.packed_block_stride
-                + subblock_offsets
+                base_addr + region_blocks * self.packed_block_stride + subblock_offsets
             )
             parts.append(self._stack_descs(addrs, block_len, self.device_id))
         return np.concatenate(parts)
@@ -692,9 +671,7 @@ class RegistrationMixin:
         split_reads = len(plan.source_ranks_per_group[fa_group_idx])
         block_arange = np.arange(nixl_agent_meta.num_blocks, dtype=np.uint64)
         parts = []
-        for region_id, base_addr in enumerate(
-            nixl_agent_meta.kv_caches_base_addr
-        ):
+        for region_id, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
             replicated = self._is_region_replicated(region_id)
             block_len = self.block_len_per_layer[region_id]
             remote_block_len = block_len // block_size_ratio
@@ -714,17 +691,15 @@ class RegistrationMixin:
             )
         return np.concatenate(parts)
 
-    def initialize_host_xfer_buffer(
-        self, kv_caches: dict[str, "torch.Tensor"]
-    ) -> None:
+    def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
         if self._host_staging_producer:
             return
         super().initialize_host_xfer_buffer(kv_caches)
 
     def register_kv_caches(
         self,
-        kv_caches: dict[str, "torch.Tensor"],
-        kv_cache_scales: dict[str, "torch.Tensor"] | None = None,
+        kv_caches: dict[str, torch.Tensor],
+        kv_cache_scales: dict[str, torch.Tensor] | None = None,
     ) -> None:
         compute_caches = kv_caches
         skip_layers = get_skip_layers()
@@ -745,9 +720,7 @@ class RegistrationMixin:
             return
 
         if self._host_staging_producer:
-            self._setup_host_wire(
-                compute_caches, kv_cache_scales=kv_cache_scales
-            )
+            self._setup_host_wire(compute_caches, kv_cache_scales=kv_cache_scales)
             assert self._pool is not None
             self._register_packed_kv_cache(
                 self._pool.storage(),
@@ -761,9 +734,7 @@ class RegistrationMixin:
             self.transfer_regions = self._build_hma_transfer_regions(
                 self.layer_region_ids, self.region_ids_by_group
             )
-            self._local_desc_cumsum = exclusive_cumsum(
-                list(self.region_num_blocks)
-            )
+            self._local_desc_cumsum = exclusive_cumsum(list(self.region_num_blocks))
             self.compat_hash = self._compute_push_compat_hash()
             self._set_push_handshake_metadata()
             self._start_push_writer()
@@ -795,10 +766,9 @@ class RegistrationMixin:
             super().register_kv_caches(active_kv_caches)
 
         self.device_kv_caches = compute_caches
-        self.layer_region_ids = (
-            getattr(self, "layer_region_ids", None)
-            or self._build_layer_region_ids_from_kv_caches(active_kv_caches)
-        )
+        self.layer_region_ids = getattr(
+            self, "layer_region_ids", None
+        ) or self._build_layer_region_ids_from_kv_caches(active_kv_caches)
         self._normalize_single_pp_split(self.layer_region_ids)
         self.region_ids_by_group = self._build_region_ids_by_group(
             self.layer_region_ids
@@ -807,10 +777,7 @@ class RegistrationMixin:
             self.layer_region_ids, self.region_ids_by_group
         )
         self._local_desc_cumsum = exclusive_cumsum(
-            [
-                region.num_blocks or self.num_blocks
-                for region in self.transfer_regions
-            ]
+            [region.num_blocks or self.num_blocks for region in self.transfer_regions]
         )
         self.compat_hash = self._compute_push_compat_hash()
         self._set_push_handshake_metadata()

@@ -13,7 +13,9 @@ from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_common.dsv41
 
 def test_dequant_i8g64_matches_scale_broadcast():
     rows = 3
-    payload = torch.arange(rows * 512, dtype=torch.int8).view(rows, 512).view(torch.uint8)
+    payload = (
+        torch.arange(rows * 512, dtype=torch.int8).view(rows, 512).view(torch.uint8)
+    )
     scales = torch.full((rows, 8), 0.5, dtype=torch.float16)
     out = _dequant_grouped_main_rows(payload, scales, format_name="i8g64")
     assert out.dtype == torch.bfloat16

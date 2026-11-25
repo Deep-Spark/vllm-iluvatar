@@ -35,22 +35,25 @@ from __future__ import annotations
 
 import inspect
 import types
+from typing import TYPE_CHECKING
 
 from vllm.utils.math_utils import cdiv
 
 from vllm_iluvatar.ilu_patch import general_patch as p
 
+if TYPE_CHECKING:
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.request import Request
+
 _COMMUNITY_METHOD = (
-    "vllm.v1.core.kv_cache_manager.KVCacheManager."
-    "get_computed_blocks_for_connector"
+    "vllm.v1.core.kv_cache_manager.KVCacheManager.get_computed_blocks_for_connector"
 )
 _COMMUNITY_METHOD_SOURCE_SHA = (
     "e221a88f1656fcf55dc00973a47b5ca009c48140154ea2d4841688bff730eaa4"
 )
 
 _COMMUNITY_ZEROING_METHOD = (
-    "vllm.v1.core.kv_cache_manager.KVCacheManager."
-    "get_zeroing_block_ids_in_range"
+    "vllm.v1.core.kv_cache_manager.KVCacheManager.get_zeroing_block_ids_in_range"
 )
 _COMMUNITY_ZEROING_METHOD_SOURCE_SHA = (
     "0e29476c6ccea81ff5ba8d0d6276695361ee6ffe260f440c26ec3f0e22366f42"
@@ -192,8 +195,7 @@ def get_computed_blocks_for_connector(
 
     # >>> ILU MODIFICATION >>>
     if is_fa_swa_hybrid and any(
-        per_group_hits[gid] != per_group_hits[fa_group_id]
-        for gid in fa_group_ids
+        per_group_hits[gid] != per_group_hits[fa_group_id] for gid in fa_group_ids
     ):
         # Multiple FA/MLA groups (e.g. EAGLE/MTP drafter with drop_eagle_block)
         # disagreed on the prefix hit; only SWA groups may lag fa_group_id.
@@ -274,10 +276,5 @@ def _apply() -> None:
         ],
         strict=True,
     )
-    KVCacheManager.get_computed_blocks_for_connector = (
-        get_computed_blocks_for_connector
-    )
-    KVCacheManager.get_zeroing_block_ids_in_range = (
-        get_zeroing_block_ids_in_range
-    )
-
+    KVCacheManager.get_computed_blocks_for_connector = get_computed_blocks_for_connector
+    KVCacheManager.get_zeroing_block_ids_in_range = get_zeroing_block_ids_in_range

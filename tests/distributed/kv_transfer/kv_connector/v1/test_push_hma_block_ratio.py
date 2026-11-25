@@ -20,7 +20,9 @@ from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_push.xfer_pl
 )
 
 
-def _region(region_id: int, tokens: int, kernels: int, block_len: int) -> SemanticTransferRegion:
+def _region(
+    region_id: int, tokens: int, kernels: int, block_len: int
+) -> SemanticTransferRegion:
     return SemanticTransferRegion(
         region_id=region_id,
         block_len=block_len,
@@ -205,4 +207,3 @@ def test_geometry_accepts_non_divisible_scheduler_blocks_sharing_kernel_page():
     )
     assert local == [12 * 70 + 24 + i for i in range(46)]
     assert remote == [24 * 36 + i for i in range(36)] + [25 * 36 + i for i in range(10)]
-

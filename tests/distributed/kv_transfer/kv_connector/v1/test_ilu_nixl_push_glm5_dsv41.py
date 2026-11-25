@@ -8,13 +8,13 @@ import threading
 import time
 from collections import defaultdict
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 import torch
 from vllm.v1.kv_cache_interface import (
-    CircularBufferSpec,
     KpoolTailSpec,
     KVCacheGroupSpec,
     MambaSpec,
@@ -24,6 +24,14 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1 import skip_layers
+from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_common.dsv41 import (
+    compute_prefix_replay_alignment,
+    legal_decode_cut_layers,
+    resolve_dsv41_layout,
+    resolve_quantized_kv_format,
+    validate_decode_pp_split,
+    validate_dsv41_peer_handshake,
+)
 from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_push.base_scheduler import (
     IluNixlPushBaseConnectorScheduler,
 )
@@ -33,33 +41,18 @@ from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_push.base_wo
 from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_push.connector import (
     IluNixlPushConnector,
 )
-from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_common.dsv41 import (
-    Dsv41Layout,
-    compute_prefix_replay_alignment,
-    legal_decode_cut_layers,
-    resolve_dsv41_layout,
-    resolve_quantized_kv_format,
-    validate_decode_pp_split,
-    validate_dsv41_peer_handshake,
-)
-from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_common.semantic_pairing import (
-    build_mamba_hma_transfer_routes,
-    pair_hma_transfer_regions,
-)
 from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_push.metadata import (
     ChunkPushReqMeta,
-    HmaTransferRoute,
     IluNixlPushAgentMetadata,
     IluNixlPushConnectorMetadata,
     IluNixlPushTransferRegion,
-    RegionPairing,
 )
 from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_push.push_scheduler import (
     IluNixlPushConnectorScheduler,
 )
 from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_push.push_worker import (
-    IluNixlPushConnectorWorker,
     _CHUNK_PROGRESS_PREFIX,
+    IluNixlPushConnectorWorker,
 )
 
 
@@ -189,15 +182,11 @@ def test_glm5_flash_cache_kind_and_group_free_identity():
         == "kpool_tail_cache"
     )
     assert (
-        IluNixlPushWorkerMixin._cache_kind_from_layer_name(
-            "model.layers.0.self_attn"
-        )
+        IluNixlPushWorkerMixin._cache_kind_from_layer_name("model.layers.0.self_attn")
         == "mamba_cache"
     )
     assert (
-        IluNixlPushWorkerMixin._cache_kind_from_layer_name(
-            "model.layers.1.linear_attn"
-        )
+        IluNixlPushWorkerMixin._cache_kind_from_layer_name("model.layers.1.linear_attn")
         == "mamba_cache"
     )
     assert (
@@ -236,9 +225,7 @@ def test_glm5_flash_kpool_tail_preserved_under_clip_rules():
     assert tail_uniform is not None
     groups = [
         KVCacheGroupSpec(["model.layers.3.self_attn.mla_attn"], mla_spec),
-        KVCacheGroupSpec(
-            ["model.layers.3.self_attn.indexer.tail_cache"], tail_uniform
-        ),
+        KVCacheGroupSpec(["model.layers.3.self_attn.indexer.tail_cache"], tail_uniform),
     ]
     kv_cfg = SimpleNamespace(
         kv_cache_groups=groups,
@@ -689,8 +676,10 @@ def test_native_nixl_vram_v41_push_write_end_to_end(monkeypatch):
     nixl_api = pytest.importorskip("nixl._api")
     import time
     import uuid
+
     import msgspec
     from vllm.distributed.nixl_utils import NixlWrapper
+
     from vllm_iluvatar.models.deepseek_v41 import compressed_kv
     from vllm_iluvatar.models.deepseek_v41.compressed_kv import (
         PAYLOAD_PAGE_BYTES,
@@ -799,9 +788,7 @@ def test_native_nixl_vram_v41_push_write_end_to_end(monkeypatch):
 
         if role == "kv_producer":
             idx_t = torch.arange(total_bytes, dtype=torch.int64, device=device)
-            payload_buf = ((idx_t + (idx_t // page) * 31 + seed) % 251).to(
-                torch.uint8
-            )
+            payload_buf = ((idx_t + (idx_t // page) * 31 + seed) % 251).to(torch.uint8)
         else:
             payload_buf = torch.full(
                 (total_bytes,), 0xEE, dtype=torch.uint8, device=device
@@ -857,7 +844,7 @@ def test_native_nixl_vram_v41_push_write_end_to_end(monkeypatch):
             main_scale_buf.view(torch.uint8).fill_(0xEE)
 
         scale_views = {}
-        for lname in ([fwd_layer, main_layer] if include_forwarder else [main_layer]):
+        for lname in [fwd_layer, main_layer] if include_forwarder else [main_layer]:
             mp = main_scale_layout.placements[lname]
             scale_views[lname] = torch.as_strided(
                 main_scale_buf,
@@ -977,7 +964,11 @@ def test_native_nixl_vram_v41_push_write_end_to_end(monkeypatch):
             type=IluNixlPushAgentMetadata,
         )
         d_agent = p_worker.add_remote_agent(
-            d_meta, remote_tp_rank=0, remote_tp_size=1, remote_pp_rank=0, remote_pp_size=1
+            d_meta,
+            remote_tp_rank=0,
+            remote_tp_size=1,
+            remote_pp_rank=0,
+            remote_pp_size=1,
         )
         p_worker._remote_agents[d_worker.engine_id][0] = d_agent
 
@@ -1065,6 +1056,7 @@ def test_native_nixl_vram_glm5_flash_push_write_end_to_end(monkeypatch):
     monkeypatch.setattr(ssm_conv_mod, "is_conv_state_dim_first", lambda: True)
     import time
     import uuid
+
     import msgspec
     from vllm.distributed.nixl_utils import NixlWrapper
     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
@@ -1722,14 +1714,15 @@ def test_p0_async_chunk_handshake_never_blocks_writer():
 
 def test_p0_leader_push_reg_and_rle_wire_compression():
     """P0-2: Only D TP leader sends PUSH_REG, and block IDs use compact RLE on the wire."""
+    import msgspec
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
         PUSH_REG_NOTIF_PREFIX,
     )
+
     from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_common.types import (
         decode_push_reg_wire,
         encode_push_reg_wire,
     )
-    import msgspec
 
     contiguous_blocks = (list(range(100, 612)), [900, 901, 905])
     reg_payload = {
@@ -1764,9 +1757,9 @@ def test_p0_leader_push_reg_and_rle_wire_compression():
         dw._handshake_lock = threading.RLock()
         dw._remote_agents = {"p-eng": {p: f"p_agent_{p}" for p in range(8)}}
         dw.nixl_wrapper = SimpleNamespace(
-            send_notif=lambda agent, notif_msg=None, r=d_tp_rank: sent_by_rank.setdefault(
-                r, []
-            ).append((agent, notif_msg))
+            send_notif=lambda agent,
+            notif_msg=None,
+            r=d_tp_rank: sent_by_rank.setdefault(r, []).append((agent, notif_msg))
         )
         dw._ensure_handshake = lambda *a, **kw: None
         dw._send_registration_to_p("req-rle", reg_payload)
@@ -1817,7 +1810,9 @@ def test_p0_write_once_sealed_chunks_and_p1_hybrid_mamba_split_cadence():
     sched = IluNixlPushConnectorScheduler(vllm_cfg, "glm-p", kv_cfg)
     req = SimpleNamespace(
         request_id="req-glm-stream",
-        prompt_token_ids=list(range(321)),  # backoff 1 -> prefill_tokens = 320 (2.5 blocks of 128!)
+        prompt_token_ids=list(
+            range(321)
+        ),  # backoff 1 -> prefill_tokens = 320 (2.5 blocks of 128!)
         num_prompt_tokens=321,
         _all_token_ids=list(range(321)),
         max_tokens=16,
@@ -1998,9 +1993,6 @@ def test_p1_single_owner_handshake_executes_nixl_ops_on_writer_thread():
         w._push_writer_stop.set()
         w._push_writer_wake.set()
         w._push_writer_thread.join(timeout=2.0)
-
-
-
 
 
 def _lease_report_worker():
@@ -2377,9 +2369,7 @@ def _e25_kv_cache_config():
     )
 
 
-def test_push_connector_attach_prefix_state_and_worker_hooks(
-    monkeypatch, tmp_path
-):
+def test_push_connector_attach_prefix_state_and_worker_hooks(monkeypatch, tmp_path):
     """Worker facade attaches E25 state (standalone & MultiConnector) and forwards metadata/results."""
     from vllm.distributed.kv_transfer.kv_connector.v1.base import (
         KVConnectorTransferResults,
@@ -2456,9 +2446,7 @@ def test_push_connector_attach_prefix_state_and_worker_hooks(
     decoded_meta = MsgpackDecoder().decode(wire_bytes)
     assert decoded_meta.reqs_to_recv["r1"].prompt_token_len == 257
     assert decoded_meta.reqs_to_recv["r1"].engine_id == "P"
-    assert (
-        decoded_meta.source_state_endpoints["r1"]["addr"] == "10.0.0.1:5600"
-    )
+    assert decoded_meta.source_state_endpoints["r1"]["addr"] == "10.0.0.1:5600"
     assert decoded_meta.source_full_ready_receipts["r1"]["N"] == 257
 
     # Verify real ConsumerPrefixState.bind_metadata consumes decoded push metadata cleanly.
@@ -2563,16 +2551,12 @@ def test_push_scheduler_e25_lifecycle_receipts_and_proxy_peer_fallback(
         finished_req_ids=set(),
         preempted_req_ids=set(),
         num_scheduled_tokens={"req-e25-1": 129},
-        kv_connector_block_state=SimpleNamespace(
-            get_block_ids=lambda rid: full_ids
-        ),
+        kv_connector_block_state=SimpleNamespace(get_block_ids=lambda rid: full_ids),
     )
     meta1 = sched.build_connector_meta(sched_out)
     assert meta1.reqs_to_recv["req-e25-1"].prompt_token_len == n
     assert meta1.reqs_to_recv["req-e25-1"].engine_id == "P"
-    assert (
-        meta1.source_state_endpoints["req-e25-1"]["addr"] == "10.112.2.51:8020"
-    )
+    assert meta1.source_state_endpoints["req-e25-1"]["addr"] == "10.112.2.51:8020"
     assert not meta1.source_full_ready_receipts
 
     # Complete KV receive via MRO (NixlPushConnectorScheduler -> Base -> PrefixSchedulerState).
@@ -2609,9 +2593,7 @@ def test_push_scheduler_e25_lifecycle_receipts_and_proxy_peer_fallback(
     assert not meta3.source_full_ready_receipts
 
     # Verify proxy cache side_channel_addr fallback when remote_host/port omitted on record.
-    sched._proxy_meta_cache["P-proxy"] = {
-        "side_channel_addr": "10.20.30.40:9100"
-    }
+    sched._proxy_meta_cache["P-proxy"] = {"side_channel_addr": "10.20.30.40:9100"}
     sched.prefix_state.requests["req-proxy"] = {
         "request": SimpleNamespace(
             num_prompt_tokens=256,
@@ -2637,9 +2619,7 @@ def test_push_scheduler_e25_lifecycle_receipts_and_proxy_peer_fallback(
     assert sched.prefix_state is None
 
 
-def test_push_handshake_listener_serves_e25_get_state_over_zmq(
-    tmp_path, monkeypatch
-):
+def test_push_handshake_listener_serves_e25_get_state_over_zmq(tmp_path, monkeypatch):
     """Push side-channel listener serves GET_STATE packets and UNSUPPORTED replies."""
     import hashlib
     import socket

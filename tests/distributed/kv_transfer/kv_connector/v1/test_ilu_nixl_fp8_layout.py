@@ -471,12 +471,18 @@ def test_fp8_wire_block_size_subblocks_match_d_payloads():
     assert wire_sub_blocks_per_compute_block(idx_cr1, w_idx_cr1) == 8
 
     wire_cfg = build_fp8_ds_mla_wire_config(compute_groups, wire_groups, num_blocks=4)
-    assert [t.block_stride for t in wire_cfg.kv_cache_tensors] == [18688, 4224, 37376, 8448]
+    assert [t.block_stride for t in wire_cfg.kv_cache_tensors] == [
+        18688,
+        4224,
+        37376,
+        8448,
+    ]
     assert [t.layer_stride for t in wire_cfg.kv_cache_tensors] == [
         4 * 8 * 18688,
         4 * 16 * 4224,
         4 * 4 * 37376,
         4 * 8 * 8448,
     ]
-    assert packed_bytes_per_block(wire_groups, compute_groups=compute_groups) == 4 * 37376
-
+    assert (
+        packed_bytes_per_block(wire_groups, compute_groups=compute_groups) == 4 * 37376
+    )

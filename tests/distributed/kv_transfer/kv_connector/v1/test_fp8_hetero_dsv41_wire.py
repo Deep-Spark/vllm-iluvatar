@@ -44,9 +44,7 @@ def test_dsv41_compressed_main_maps_to_fp8_wire_alignment_64():
     assert wire.model_version == "deepseek_v4"
     assert wire.state_content_bytes == 584
     assert wire.alignment == 64
-    assert (
-        quant_kind_for("layers.0.main", wire, compute) == QUANT_PACK_COMPRESSED
-    )
+    assert quant_kind_for("layers.0.main", wire, compute) == QUANT_PACK_COMPRESSED
 
 
 def test_dsv41_bf16_main_maps_to_fp8_wire_alignment_64():
@@ -131,16 +129,15 @@ def test_wire_dsv41_layout_maps_hetero_staging_to_fp8_legacy():
         main_kv_format="i4g32",
         indexer_kv_layout="split",
     )
-    wire = wire_dsv41_layout(
-        layout, host_staging_producer=True, hetero_enabled=True
-    )
+    wire = wire_dsv41_layout(layout, host_staging_producer=True, hetero_enabled=True)
     assert wire is not None
     assert wire.main_kv_format == "none"
     assert wire.indexer_kv_layout == "legacy"
     assert wire.kv_source_layers == (2, 8, 14, 20)
-    assert wire_dsv41_layout(
-        layout, host_staging_producer=False, hetero_enabled=False
-    ) == layout
+    assert (
+        wire_dsv41_layout(layout, host_staging_producer=False, hetero_enabled=False)
+        == layout
+    )
 
 
 def test_compile_xfer_plan_carries_per_bucket_subpage_ratios():

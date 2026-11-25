@@ -19,6 +19,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 )
 from vllm.logger import init_logger
 
+from ..ilu_nixl_common.dsv41 import validate_dsv41_peer_handshake
 from ..ilu_nixl_common.memory_registration import validate_64bit_span
 from ..ilu_nixl_common.semantic_pairing import (
     align_hma_transfer_regions,
@@ -41,7 +42,6 @@ from ..ilu_nixl_common.virtual_packed_reg import (
     metadata_uses_virtual_packed_regions,
     transfer_groups_of,
 )
-from ..ilu_nixl_common.dsv41 import validate_dsv41_peer_handshake
 from .metadata import (
     IluNixlAgentMetadata,
     IluNixlTransferRegion,
@@ -69,6 +69,7 @@ class IluNixlXferPlanMixin:
     _cache_kind_from_layer_name = staticmethod(cache_kind_from_layer_name)
     _regions_by_id = staticmethod(regions_by_id)
     _filter_group_region_ids = staticmethod(filter_group_region_ids)
+
     @staticmethod
     def _validate_region_geometry_pair(
         local_region,
@@ -86,6 +87,7 @@ class IluNixlXferPlanMixin:
             remote_region_id=remote_region_id,
             allow_divisible_ratio=False,
         )
+
     _metadata_uses_virtual_packed_regions = staticmethod(
         metadata_uses_virtual_packed_regions
     )
@@ -100,9 +102,7 @@ class IluNixlXferPlanMixin:
     def _overlap_pp_count(
         cls, producer_pp_rank: int, producer_pp_split: str, consumer_pp_split: str
     ) -> int:
-        return overlap_pp_count(
-            producer_pp_rank, producer_pp_split, consumer_pp_split
-        )
+        return overlap_pp_count(producer_pp_rank, producer_pp_split, consumer_pp_split)
 
     @staticmethod
     def _effective_overlap_pp_count(
@@ -116,9 +116,7 @@ class IluNixlXferPlanMixin:
         )
 
     @classmethod
-    def _transfer_identity(
-        cls, layer_name: str, group_idx: int | None = None
-    ) -> str:
+    def _transfer_identity(cls, layer_name: str, group_idx: int | None = None) -> str:
         return transfer_identity(layer_name, group_idx)
 
     @classmethod
@@ -190,9 +188,7 @@ class IluNixlXferPlanMixin:
             num_local_groups=num_local_groups,
             group_spec_types=getattr(self, "_group_spec_types", None),
             ssm_region_indices=getattr(self, "_ssm_region_indices", None),
-            num_local_regions=getattr(
-                self, "num_regions", len(local_transfer_regions)
-            ),
+            num_local_regions=getattr(self, "num_regions", len(local_transfer_regions)),
             overlap_start=overlap_start,
             overlap_end=overlap_end,
         )
@@ -318,9 +314,7 @@ class IluNixlXferPlanMixin:
         local_offset = self.tp_rank % max(tp_ratio, 1)
         conv_offsets = self._conv_decomp.remote_conv_offsets(local_offset, tp_ratio)
         ssm_read_size = (
-            self._mamba_ssm_size[1]
-            if tp_ratio >= 1
-            else nixl_agent_meta.ssm_sizes[1]
+            self._mamba_ssm_size[1] if tp_ratio >= 1 else nixl_agent_meta.ssm_sizes[1]
         )
         remote_ratio = nixl_agent_meta.physical_blocks_per_logical_kv_block
         num_blocks = nixl_agent_meta.num_blocks // remote_ratio
@@ -339,14 +333,14 @@ class IluNixlXferPlanMixin:
             block_addrs = np.uint64(base_addr) + block_arange * np.uint64(page_stride)
             for offset, size in conv_offsets:
                 parts.append(
-                    stack_fn(block_addrs + np.uint64(offset), size, nixl_agent_meta.device_id)
+                    stack_fn(
+                        block_addrs + np.uint64(offset), size, nixl_agent_meta.device_id
+                    )
                 )
             ssm_addrs = block_addrs + np.uint64(
                 nixl_agent_meta.ssm_sizes[0] + local_offset * ssm_read_size
             )
-            parts.append(
-                stack_fn(ssm_addrs, ssm_read_size, nixl_agent_meta.device_id)
-            )
+            parts.append(stack_fn(ssm_addrs, ssm_read_size, nixl_agent_meta.device_id))
         return np.concatenate(parts) if parts else np.empty((0, 3), dtype=np.uint64)
 
     def _register_pp_remote_xfer_handle(
@@ -433,9 +427,7 @@ class IluNixlXferPlanMixin:
         )
 
         fa_blocks = (
-            np.concatenate(fa_parts)
-            if fa_parts
-            else np.empty((0, 3), dtype=np.uint64)
+            np.concatenate(fa_parts) if fa_parts else np.empty((0, 3), dtype=np.uint64)
         )
         if getattr(self, "_has_mamba", False):
             ssm_remote_ids = selected_ssm_remote_region_ids
@@ -731,10 +723,9 @@ class IluNixlXferPlanMixin:
         elif pairings is not None:
             group_spec_types = getattr(self, "_group_spec_types", ())
             for pair_idx, pairing in enumerate(pairings):
-                is_ssm = (
-                    pairing.local_group_id < len(group_spec_types)
-                    and _is_ssm_spec(group_spec_types[pairing.local_group_id])
-                )
+                is_ssm = pairing.local_group_id < len(
+                    group_spec_types
+                ) and _is_ssm_spec(group_spec_types[pairing.local_group_id])
                 check_pair(
                     pairing.local_region_id,
                     pairing.remote_region_id,
@@ -838,9 +829,7 @@ class IluNixlXferPlanMixin:
                     ident
                     for rid in selected_local_region_ids
                     if rid in local_regions_map
-                    for ident, _ in iter_region_identity_groups(
-                        local_regions_map[rid]
-                    )
+                    for ident, _ in iter_region_identity_groups(local_regions_map[rid])
                     if (
                         (layer_idx := int(ident.split(":", 1)[0])) < 0
                         or overlap_start <= layer_idx < overlap_end
@@ -950,18 +939,12 @@ class IluNixlXferPlanMixin:
             remote_swa_bounded_replay=getattr(
                 nixl_agent_meta, "swa_bounded_replay", None
             ),
-            remote_kv_source_layers=getattr(
-                nixl_agent_meta, "kv_source_layers", None
-            ),
+            remote_kv_source_layers=getattr(nixl_agent_meta, "kv_source_layers", None),
             remote_index_source_layers=getattr(
                 nixl_agent_meta, "index_source_layers", None
             ),
-            remote_compress_ratios=getattr(
-                nixl_agent_meta, "compress_ratios", None
-            ),
-            remote_main_kv_format=getattr(
-                nixl_agent_meta, "main_kv_format", "none"
-            ),
+            remote_compress_ratios=getattr(nixl_agent_meta, "compress_ratios", None),
+            remote_main_kv_format=getattr(nixl_agent_meta, "main_kv_format", "none"),
             remote_indexer_kv_layout=getattr(
                 nixl_agent_meta, "indexer_kv_layout", "legacy"
             ),
@@ -969,8 +952,7 @@ class IluNixlXferPlanMixin:
             local_indexer_kv_layout="legacy" if wire_staging else None,
         )
         is_hetero_pp_topology = remote_pp_size != self.pp_world_size or (
-            bool(nixl_agent_meta.pp_split)
-            and nixl_agent_meta.pp_split != self.pp_split
+            bool(nixl_agent_meta.pp_split) and nixl_agent_meta.pp_split != self.pp_split
         )
         remote_key = (
             remote_pp_rank * remote_tp_size + remote_tp_rank
@@ -1101,9 +1083,7 @@ class IluNixlXferPlanMixin:
                 selected_remote_region_ids,
                 pairings,
                 is_inactive_overlap,
-            ) = self._select_pp_regions_and_pairings(
-                nixl_agent_meta, remote_pp_rank
-            )
+            ) = self._select_pp_regions_and_pairings(nixl_agent_meta, remote_pp_rank)
 
         if engine_id not in self.dst_num_blocks:
             self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
@@ -1206,9 +1186,7 @@ class IluNixlXferPlanMixin:
         )
         local_cumsum = getattr(self, "_local_desc_cumsum", None)
         remote_cumsum = (
-            getattr(self, "_remote_desc_cumsum", {})
-            .get(engine_id, {})
-            .get(remote_key)
+            getattr(self, "_remote_desc_cumsum", {}).get(engine_id, {}).get(remote_key)
         )
         local_num_blocks = self.dst_num_blocks[self.engine_id]
         remote_num_blocks = self.dst_num_blocks[engine_id]
@@ -1255,9 +1233,7 @@ class IluNixlXferPlanMixin:
             )
         if pairings is None:
             pairings = (
-                getattr(self, "region_pairings", {})
-                .get(engine_id, {})
-                .get(remote_key)
+                getattr(self, "region_pairings", {}).get(engine_id, {}).get(remote_key)
             )
         if local_region_ids_by_group is None:
             local_region_ids_by_group = (
@@ -1348,9 +1324,8 @@ class IluNixlXferPlanMixin:
             for (local_gid, remote_gid), reg_pairs in sorted(bucketed.items()):
                 if not reg_pairs:
                     continue
-                is_ssm = (
-                    local_gid < len(group_spec_types)
-                    and _is_ssm_spec(group_spec_types[local_gid])
+                is_ssm = local_gid < len(group_spec_types) and _is_ssm_spec(
+                    group_spec_types[local_gid]
                 )
                 l_arr = np.asarray([pair[0] for pair in reg_pairs], dtype=np.int64)
                 r_arr = np.asarray([pair[1] for pair in reg_pairs], dtype=np.int64)
@@ -1402,9 +1377,8 @@ class IluNixlXferPlanMixin:
             ):
                 if len(l_arr) == 0:
                     continue
-                is_ssm = (
-                    gid < len(group_spec_types)
-                    and _is_ssm_spec(group_spec_types[gid])
+                is_ssm = gid < len(group_spec_types) and _is_ssm_spec(
+                    group_spec_types[gid]
                 )
                 if is_ssm:
                     lb = ssm_bases(
@@ -1580,12 +1554,8 @@ class IluNixlXferPlanMixin:
     ) -> tuple[list[int], list[int]]:
         if not local_blocks or not remote_blocks:
             return [], []
-        d_ppl = int(
-            getattr(self, "_physical_blocks_per_logical_kv_block", 1) or 1
-        )
-        p_ppl = int(
-            getattr(remote_info, "remote_physical_blocks_per_logical", 1) or 1
-        )
+        d_ppl = int(getattr(self, "_physical_blocks_per_logical_kv_block", 1) or 1)
+        p_ppl = int(getattr(remote_info, "remote_physical_blocks_per_logical", 1) or 1)
         if start_offset is not None and start_offset >= 0:
             if d_ppl == 1 and p_ppl == 1:
                 if len(remote_blocks) < start_offset + len(local_blocks):
@@ -1634,18 +1604,14 @@ class IluNixlXferPlanMixin:
         t_groups = transfer_groups_of(getattr(self, "kv_cache_config", None))
         if not t_groups or len(block_ids) <= len(t_groups):
             return super()._logical_to_kernel_block_ids(block_ids, ratio)
-        prefix = super()._logical_to_kernel_block_ids(
-            block_ids[: len(t_groups)], ratio
-        )
+        prefix = super()._logical_to_kernel_block_ids(block_ids[: len(t_groups)], ratio)
         return list(prefix) + [list(group) for group in block_ids[len(t_groups) :]]
 
     def _is_heterogeneous_pp_engine(self, engine_id: str) -> bool:
-        return (
-            getattr(self, "_remote_pp_size_by_engine", {}).get(
-                engine_id, self.pp_world_size
-            )
-            != self.pp_world_size
-            or engine_id in getattr(self, "_semantic_region_engines", ())
+        return getattr(self, "_remote_pp_size_by_engine", {}).get(
+            engine_id, self.pp_world_size
+        ) != self.pp_world_size or engine_id in getattr(
+            self, "_semantic_region_engines", ()
         )
 
     def _read_blocks_for_req(self, req_id: str, meta):
@@ -1655,19 +1621,20 @@ class IluNixlXferPlanMixin:
             return super()._read_blocks_for_req(req_id, meta)
 
         self._engine_last_active[engine_id] = time.perf_counter()
-        if getattr(self, "_bidirectional_kv_xfer_enabled", False) and hasattr(
-            self, "_is_turn2_read_expired"
+        if (
+            getattr(self, "_bidirectional_kv_xfer_enabled", False)
+            and hasattr(self, "_is_turn2_read_expired")
+            and self._is_turn2_read_expired(meta)
         ):
-            if self._is_turn2_read_expired(meta):
-                logger.warning(
-                    "Declining expired remote read for %s from engine %s.",
-                    req_id,
-                    engine_id,
-                )
-                if hasattr(self, "xfer_stats"):
-                    self.xfer_stats.record_kv_expired_req()
-                self._handle_failed_transfer(req_id, None)
-                return
+            logger.warning(
+                "Declining expired remote read for %s from engine %s.",
+                req_id,
+                engine_id,
+            )
+            if hasattr(self, "xfer_stats"):
+                self.xfer_stats.record_kv_expired_req()
+            self._handle_failed_transfer(req_id, None)
+            return
 
         plan = self.tp_mappings[engine_id]
         remote_info = self.transfer_topo.get_engine_info(engine_id)
@@ -1679,9 +1646,7 @@ class IluNixlXferPlanMixin:
         )
         remote_block_ids = meta.remote.block_ids
         local_block_ids = meta.local_physical_block_ids
-        inactive_keys = getattr(self, "_inactive_remote_keys", {}).get(
-            engine_id, set()
-        )
+        inactive_keys = getattr(self, "_inactive_remote_keys", {}).get(engine_id, set())
         active_remote_keys = [
             remote_key
             for remote_key in sorted(self._remote_agents.get(engine_id, ()))
@@ -1724,10 +1689,9 @@ class IluNixlXferPlanMixin:
         if engine_routes:
             for routes in engine_routes.values():
                 for route in routes:
-                    if (
-                        route.local_group_idx >= len(local_block_ids)
-                        or route.remote_group_idx >= len(remote_block_ids)
-                    ):
+                    if route.local_group_idx >= len(
+                        local_block_ids
+                    ) or route.remote_group_idx >= len(remote_block_ids):
                         raise RuntimeError(
                             "Cannot align producer and consumer KV cache groups "
                             f"for Mamba HMA route: local_group={route.local_group_idx}/"
@@ -1737,10 +1701,9 @@ class IluNixlXferPlanMixin:
         elif engine_pairings:
             for key_pairings in engine_pairings.values():
                 for pairing in key_pairings:
-                    if (
-                        pairing.local_group_id >= len(local_block_ids)
-                        or pairing.remote_group_id >= len(remote_block_ids)
-                    ):
+                    if pairing.local_group_id >= len(
+                        local_block_ids
+                    ) or pairing.remote_group_id >= len(remote_block_ids):
                         raise RuntimeError(
                             "Cannot align producer and consumer KV cache groups "
                             f"for region pairing {pairing.identity}: "
@@ -1785,15 +1748,13 @@ class IluNixlXferPlanMixin:
                     remote_rank=remote_key,
                     local_block_ids=[
                         list(local_block_ids[local_group_id])
-                        if remote_tp_rank
-                        in plan.source_ranks_per_group[local_group_id]
+                        if remote_tp_rank in plan.source_ranks_per_group[local_group_id]
                         else []
                         for local_group_id in transfer_group_ids
                     ],
                     remote_block_ids=[
                         list(remote_block_ids[remote_group_id])
-                        if remote_tp_rank
-                        in plan.source_ranks_per_group[local_group_id]
+                        if remote_tp_rank in plan.source_ranks_per_group[local_group_id]
                         else []
                         for remote_group_id, local_group_id in enumerate(
                             transfer_group_ids
@@ -1925,9 +1886,7 @@ class IluNixlXferPlanMixin:
             .get(remote_key)
         )
         pairings = (
-            getattr(self, "region_pairings", {})
-            .get(dst_engine_id, {})
-            .get(remote_key)
+            getattr(self, "region_pairings", {}).get(dst_engine_id, {}).get(remote_key)
         )
         if routes is None and pairings is None and remote_block_starts is None:
             local_block_ids, remote_block_ids = self._apply_prefix_caching(
@@ -2033,12 +1992,10 @@ class IluNixlXferPlanMixin:
                 [len(b.remote_bases) for b, _, _ in active_entries],
                 axis=0,
             )
-            local_block_descs_ids = (
-                all_local_bases[:, None] + local_rows
-            ).reshape(-1)
-            remote_block_descs_ids = (
-                all_remote_bases[:, None] + remote_rows
-            ).reshape(-1)
+            local_block_descs_ids = (all_local_bases[:, None] + local_rows).reshape(-1)
+            remote_block_descs_ids = (all_remote_bases[:, None] + remote_rows).reshape(
+                -1
+            )
         else:
             local_block_descs_ids = np.concatenate(
                 [
@@ -2092,5 +2049,3 @@ class IluNixlXferPlanMixin:
                 dst_engine_id, remote_request_id, remote_key
             )
             self._handle_failed_transfer(request_id, handle)
-
-

@@ -436,9 +436,7 @@ def allocate_fp8_ds_mla_wire_caches(
             if tensor_config.block_stride <= 0:
                 raise ValueError("FP8 DS MLA wire staging must use a packed layout")
             if len(tensor_config.layers) != 1:
-                raise ValueError(
-                    "Layer-outermost FP8 wire tensor must own one layer"
-                )
+                raise ValueError("Layer-outermost FP8 wire tensor must own one layer")
             layer_name = tensor_config.layers[0]
             spec = wire_specs[layer_name]
             unit_bytes = wire_config.num_blocks * tensor_config.block_stride
@@ -725,7 +723,9 @@ class FP8DSMLAWireStaging:
                     storage_offset=wire_cache.data_ptr() - backing_ptr,
                 )
             for buf_idx, caches in enumerate(self.scratch_wire_cache_buffers):
-                scratch_ptr = self.scratch_backings[buf_idx].untyped_storage().data_ptr()
+                scratch_ptr = (
+                    self.scratch_backings[buf_idx].untyped_storage().data_ptr()
+                )
                 for layer_name, sc in caches.items():
                     row_bytes = self.layer_compute_bytes[layer_name]
                     self.scratch_layer_rows[buf_idx][layer_name] = torch.as_strided(
@@ -818,8 +818,7 @@ class FP8DSMLAWireStaging:
         if self._is_layer_outermost:
             self.hma_copy_spans = tuple(
                 tuple(
-                    (0, self.layer_compute_bytes[layer_name])
-                    for layer_name in layers
+                    (0, self.layer_compute_bytes[layer_name]) for layer_name in layers
                 )
                 for layers in self.group_active_layers
             )
@@ -885,9 +884,7 @@ class FP8DSMLAWireStaging:
             )
         if not already_zeroed and real_size < wire_spec.page_size_bytes:
             self._zero_destination_pages(destination, destination_block_ids)
-        destination[:, :real_size].index_copy_(
-            0, destination_block_ids, selected_bytes
-        )
+        destination[:, :real_size].index_copy_(0, destination_block_ids, selected_bytes)
 
     @staticmethod
     def _zero_destination_pages(
@@ -1213,7 +1210,6 @@ class FP8DSMLAWireStaging:
             wire_page_states,
             HEAD_SIZE=128,
         )
-
 
     def _stage_group_chunk(
         self,

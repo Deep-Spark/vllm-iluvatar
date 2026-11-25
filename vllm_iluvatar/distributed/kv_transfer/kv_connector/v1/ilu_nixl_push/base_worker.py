@@ -10,7 +10,6 @@ from contextlib import suppress
 from typing import Any
 
 import numpy as np
-import torch
 from vllm.distributed.kv_transfer.kv_connector.utils import EngineTransferInfo
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorTransferResults,
@@ -28,6 +27,7 @@ from ..ilu_nixl_common.dsv41 import (
     validate_dsv41_peer_handshake,
     wire_dsv41_layout,
 )
+from ..ilu_nixl_common.memory_registration import MemoryRegistrationPlanner
 from ..ilu_nixl_common.semantic_pairing import (
     build_mamba_hma_transfer_routes,
     cache_kind_from_layer_name,
@@ -48,7 +48,6 @@ from ..ilu_nixl_common.virtual_packed_reg import (
     layer_to_groups,
     metadata_uses_virtual_packed_regions,
 )
-from ..ilu_nixl_common.memory_registration import MemoryRegistrationPlanner
 from .metadata import (
     HmaTransferRoute,
     IluNixlPushAgentMetadata,
@@ -105,9 +104,7 @@ class IluNixlPushWorkerMixin:
         )
 
     def _is_predictable_empty_producer(self) -> bool:
-        return is_predictably_skipped_dsv41_stage(
-            getattr(self, "dsv41_layout", None)
-        )
+        return is_predictably_skipped_dsv41_stage(getattr(self, "dsv41_layout", None))
 
     def _effective_pp_producers_for_remote(
         self, dst_engine_id: str, remote_pp_rank: int
@@ -127,9 +124,7 @@ class IluNixlPushWorkerMixin:
         return cache_kind_from_layer_name(layer_name)
 
     @classmethod
-    def _transfer_identity(
-        cls, layer_name: str, group_idx: int | None = None
-    ) -> str:
+    def _transfer_identity(cls, layer_name: str, group_idx: int | None = None) -> str:
         return transfer_identity(layer_name, group_idx)
 
     @staticmethod
@@ -139,9 +134,7 @@ class IluNixlPushWorkerMixin:
     def _should_split_virtual_region(self) -> bool:
         return bool(
             self.transfer_topo is not None
-            and getattr(
-                self.transfer_topo, "virtually_split_kv_in_blocks", False
-            )
+            and getattr(self.transfer_topo, "virtually_split_kv_in_blocks", False)
             and not self._has_mamba
         )
 
@@ -151,10 +144,9 @@ class IluNixlPushWorkerMixin:
         for actual_region_id in range(len(self.block_len_per_layer)):
             mapping[actual_region_id] = [next_region_id]
             next_region_id += 1
-            if (
-                IluNixlPushWorkerMixin._should_split_virtual_region(self)
-                and not self._is_region_replicated(actual_region_id)
-            ):
+            if IluNixlPushWorkerMixin._should_split_virtual_region(
+                self
+            ) and not self._is_region_replicated(actual_region_id):
                 mapping[actual_region_id].append(next_region_id)
                 next_region_id += 1
         return mapping
@@ -196,17 +188,15 @@ class IluNixlPushWorkerMixin:
         next_region_id = 0
         for actual_region_id, block_len in enumerate(self.block_len_per_layer):
             if region_id == next_region_id:
-                if (
-                    IluNixlPushWorkerMixin._should_split_virtual_region(self)
-                    and not self._is_region_replicated(actual_region_id)
-                ):
+                if IluNixlPushWorkerMixin._should_split_virtual_region(
+                    self
+                ) and not self._is_region_replicated(actual_region_id):
                     return block_len // 2
                 return block_len
             next_region_id += 1
-            if (
-                IluNixlPushWorkerMixin._should_split_virtual_region(self)
-                and not self._is_region_replicated(actual_region_id)
-            ):
+            if IluNixlPushWorkerMixin._should_split_virtual_region(
+                self
+            ) and not self._is_region_replicated(actual_region_id):
                 if region_id == next_region_id:
                     return block_len // 2
                 next_region_id += 1
@@ -286,13 +276,11 @@ class IluNixlPushWorkerMixin:
                 and logical_num_blocks > 0
             ):
                 with suppress(ValueError):
-                    kernel_blocks = (
-                        MemoryRegistrationPlanner.kernel_blocks_per_block(
-                            layer_name=sample_name,
-                            tensor=sample_cache,
-                            spec=sample_spec,
-                            num_blocks=logical_num_blocks,
-                        )
+                    kernel_blocks = MemoryRegistrationPlanner.kernel_blocks_per_block(
+                        layer_name=sample_name,
+                        tensor=sample_cache,
+                        spec=sample_spec,
+                        num_blocks=logical_num_blocks,
                     )
             physical_per_logical = int(
                 getattr(self, "_physical_blocks_per_logical_kv_block", 1) or 1
@@ -338,9 +326,7 @@ class IluNixlPushWorkerMixin:
                     kernel_blocks=kernel_blocks,
                     block_tokens=block_tokens,
                     num_blocks=reg_num_blocks,
-                    identity_groups={
-                        k: sorted(v) for k, v in identity_groups.items()
-                    },
+                    identity_groups={k: sorted(v) for k, v in identity_groups.items()},
                 )
             )
         if transfer_regions:
@@ -375,9 +361,7 @@ class IluNixlPushWorkerMixin:
             max_layer_idx = -1
             for layer_name in layer_region_ids:
                 try:
-                    max_layer_idx = max(
-                        max_layer_idx, extract_layer_index(layer_name)
-                    )
+                    max_layer_idx = max(max_layer_idx, extract_layer_index(layer_name))
                 except (AssertionError, ValueError):
                     continue
             total_layers = max_layer_idx + 1
@@ -471,9 +455,7 @@ class IluNixlPushWorkerMixin:
             hybrid_mla_mamba=hybrid_mla_mamba,
             group_spec_types=getattr(self, "_group_spec_types", ()),
             local_transfer_regions=getattr(self, "transfer_regions", None),
-            remote_transfer_regions=getattr(
-                nixl_agent_meta, "transfer_regions", None
-            ),
+            remote_transfer_regions=getattr(nixl_agent_meta, "transfer_regions", None),
             routes=routes,
             pairings=pairings,
         )
@@ -514,9 +496,7 @@ class IluNixlPushWorkerMixin:
             is_hma_required=self._is_hma_required,
             local_transfer_regions=self.transfer_regions,
             remote_transfer_regions=nixl_agent_meta.transfer_regions,
-            include_final_stage_extra_layers=IluNixlPushWorkerMixin._mtp_enabled(
-                self
-            ),
+            include_final_stage_extra_layers=IluNixlPushWorkerMixin._mtp_enabled(self),
             local_kv_layer_end=local_kv_layer_end,
             remote_kv_layer_end=getattr(nixl_agent_meta, "kv_layer_end", None),
             allow_empty_skipped_overlap=allow_empty,
@@ -577,13 +557,9 @@ class IluNixlPushWorkerMixin:
         assert self.transfer_topo is not None and self._conv_decomp is not None
         tp_ratio = self.transfer_topo.tp_ratio(remote_tp_size)
         local_offset = self.tp_rank % max(tp_ratio, 1)
-        conv_offsets = self._conv_decomp.remote_conv_offsets(
-            local_offset, tp_ratio
-        )
+        conv_offsets = self._conv_decomp.remote_conv_offsets(local_offset, tp_ratio)
         ssm_size = (
-            self._mamba_ssm_size[1]
-            if tp_ratio >= 1
-            else nixl_agent_meta.ssm_sizes[1]
+            self._mamba_ssm_size[1] if tp_ratio >= 1 else nixl_agent_meta.ssm_sizes[1]
         )
         remote_ratio = nixl_agent_meta.physical_blocks_per_logical_kv_block
         num_blocks = nixl_agent_meta.num_blocks // remote_ratio
@@ -612,14 +588,10 @@ class IluNixlPushWorkerMixin:
                     )
                 )
             ssm_addrs = (
-                block_addrs
-                + nixl_agent_meta.ssm_sizes[0]
-                + local_offset * ssm_size
+                block_addrs + nixl_agent_meta.ssm_sizes[0] + local_offset * ssm_size
             )
             parts.append(
-                self._stack_descs(
-                    ssm_addrs, ssm_size, nixl_agent_meta.device_id
-                )
+                self._stack_descs(ssm_addrs, ssm_size, nixl_agent_meta.device_id)
             )
         return np.concatenate(parts) if parts else np.empty((0, 3), dtype=np.uint64)
 
@@ -735,9 +707,7 @@ class IluNixlPushWorkerMixin:
         if len(blocks_data) == 0:
             self.dst_xfer_side_handles[engine_id][remote_key] = None
             return
-        mem_type = (
-            getattr(nixl_agent_meta, "kv_buffer_memory_type", None) or "VRAM"
-        )
+        mem_type = getattr(nixl_agent_meta, "kv_buffer_memory_type", None) or "VRAM"
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, mem_type)
         self.dst_xfer_side_handles[engine_id][remote_key] = (
             self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
@@ -774,12 +744,8 @@ class IluNixlPushWorkerMixin:
                     remote_block_size
                 )
                 self.src_xfer_handles_by_block_size[remote_block_size] = handle
-                self.src_blocks_data_by_block_size[remote_block_size] = (
-                    blocks_data
-                )
-            src_blocks_data = self.src_blocks_data_by_block_size[
-                remote_block_size
-            ]
+                self.src_blocks_data_by_block_size[remote_block_size] = blocks_data
+            src_blocks_data = self.src_blocks_data_by_block_size[remote_block_size]
 
         self.src_xfer_handles_by_tp_ratio[split_key] = []
         for handle_data in self._build_local_splits_from_plan(
@@ -803,14 +769,10 @@ class IluNixlPushWorkerMixin:
     ) -> CompiledXferPlan:
         remote_info = self.transfer_topo.get_engine_info(engine_id)
         routes = (
-            getattr(self, "_mamba_hma_routes", {})
-            .get(engine_id, {})
-            .get(remote_key)
+            getattr(self, "_mamba_hma_routes", {}).get(engine_id, {}).get(remote_key)
         )
         pairings = (
-            getattr(self, "region_pairings", {})
-            .get(engine_id, {})
-            .get(remote_key)
+            getattr(self, "region_pairings", {}).get(engine_id, {}).get(remote_key)
         )
         local_groups = (
             getattr(self, "local_region_ids_by_group", {})
@@ -858,9 +820,7 @@ class IluNixlPushWorkerMixin:
         )
         if not hasattr(self, "_compiled_xfer_plans"):
             self._compiled_xfer_plans = {}
-        self._compiled_xfer_plans.setdefault(engine_id, {})[
-            remote_key
-        ] = compiled
+        self._compiled_xfer_plans.setdefault(engine_id, {})[remote_key] = compiled
         return compiled
 
     def add_remote_agent(
@@ -890,9 +850,7 @@ class IluNixlPushWorkerMixin:
         validate_dsv41_peer_handshake(
             wire_dsv41_layout(
                 getattr(self, "dsv41_layout", None),
-                host_staging_producer=getattr(
-                    self, "_host_staging_producer", False
-                ),
+                host_staging_producer=getattr(self, "_host_staging_producer", False),
                 hetero_enabled=bool(
                     getattr(getattr(self, "_hetero_cfg", None), "enabled", False)
                 ),
@@ -901,18 +859,12 @@ class IluNixlPushWorkerMixin:
             remote_swa_bounded_replay=getattr(
                 nixl_agent_meta, "swa_bounded_replay", None
             ),
-            remote_kv_source_layers=getattr(
-                nixl_agent_meta, "kv_source_layers", None
-            ),
+            remote_kv_source_layers=getattr(nixl_agent_meta, "kv_source_layers", None),
             remote_index_source_layers=getattr(
                 nixl_agent_meta, "index_source_layers", None
             ),
-            remote_compress_ratios=getattr(
-                nixl_agent_meta, "compress_ratios", None
-            ),
-            remote_main_kv_format=getattr(
-                nixl_agent_meta, "main_kv_format", "none"
-            ),
+            remote_compress_ratios=getattr(nixl_agent_meta, "compress_ratios", None),
+            remote_main_kv_format=getattr(nixl_agent_meta, "main_kv_format", "none"),
             remote_indexer_kv_layout=getattr(
                 nixl_agent_meta, "indexer_kv_layout", "legacy"
             ),
@@ -967,24 +919,18 @@ class IluNixlPushWorkerMixin:
         if getattr(self, "_empty_producer_rank", False):
             if not hasattr(self, "_inactive_remote_keys"):
                 self._inactive_remote_keys = {}
-            self._inactive_remote_keys.setdefault(engine_id, set()).add(
-                remote_key
-            )
+            self._inactive_remote_keys.setdefault(engine_id, set()).add(remote_key)
             num_groups = len(self.region_ids_by_group)
-            empty_groups = [
-                np.asarray([], dtype=np.int64) for _ in range(num_groups)
-            ]
-            self.local_region_ids_by_group.setdefault(engine_id, {})[
-                remote_key
-            ] = empty_groups
-            self.remote_region_ids_by_group.setdefault(engine_id, {})[
-                remote_key
-            ] = empty_groups
+            empty_groups = [np.asarray([], dtype=np.int64) for _ in range(num_groups)]
+            self.local_region_ids_by_group.setdefault(engine_id, {})[remote_key] = (
+                empty_groups
+            )
+            self.remote_region_ids_by_group.setdefault(engine_id, {})[remote_key] = (
+                empty_groups
+            )
             if engine_id not in self.dst_num_blocks:
                 self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
-            return self.nixl_wrapper.add_remote_agent(
-                nixl_agent_meta.agent_metadata
-            )
+            return self.nixl_wrapper.add_remote_agent(nixl_agent_meta.agent_metadata)
 
         routes: list[HmaTransferRoute] | None = None
         pairings: list[RegionPairing] | None = None
@@ -1019,13 +965,10 @@ class IluNixlPushWorkerMixin:
             if (
                 IluNixlPushWorkerMixin._mtp_enabled(self)
                 and self.pp_rank == len(self.pp_split.split(",")) - 1
-                and remote_pp_rank
-                == len(nixl_agent_meta.pp_split.split(",")) - 1
+                and remote_pp_rank == len(nixl_agent_meta.pp_split.split(",")) - 1
             ):
                 local_total = sum(int(x) for x in self.pp_split.split(","))
-                remote_total = sum(
-                    int(x) for x in nixl_agent_meta.pp_split.split(",")
-                )
+                remote_total = sum(int(x) for x in nixl_agent_meta.pp_split.split(","))
                 local_extra = region_ids_for_mtp_layers(
                     self.layer_region_ids, local_total
                 )
@@ -1084,8 +1027,8 @@ class IluNixlPushWorkerMixin:
             if not hasattr(self, "_selected_ssm_remote_region_ids"):
                 self._selected_ssm_remote_region_ids = {}
             self._mamba_hma_routes.setdefault(engine_id, {})[remote_key] = routes
-            self._remote_fa_num_regions.setdefault(engine_id, {})[remote_key] = (
-                len(selected_remote_region_ids)
+            self._remote_fa_num_regions.setdefault(engine_id, {})[remote_key] = len(
+                selected_remote_region_ids
             )
             self._selected_ssm_remote_region_ids.setdefault(engine_id, {})[
                 remote_key
@@ -1117,22 +1060,18 @@ class IluNixlPushWorkerMixin:
         if is_inactive_overlap:
             if not hasattr(self, "_inactive_remote_keys"):
                 self._inactive_remote_keys = {}
-            self._inactive_remote_keys.setdefault(engine_id, set()).add(
-                remote_key
-            )
+            self._inactive_remote_keys.setdefault(engine_id, set()).add(remote_key)
             if pairings is not None:
                 if not hasattr(self, "region_pairings"):
                     self.region_pairings = {}
                 self.region_pairings.setdefault(engine_id, {})[remote_key] = []
-            self.local_region_ids_by_group.setdefault(engine_id, {})[
-                remote_key
-            ] = local_region_ids_by_group
-            self.remote_region_ids_by_group.setdefault(engine_id, {})[
-                remote_key
-            ] = remote_region_ids_by_group
-            return self.nixl_wrapper.add_remote_agent(
-                nixl_agent_meta.agent_metadata
+            self.local_region_ids_by_group.setdefault(engine_id, {})[remote_key] = (
+                local_region_ids_by_group
             )
+            self.remote_region_ids_by_group.setdefault(engine_id, {})[remote_key] = (
+                remote_region_ids_by_group
+            )
+            return self.nixl_wrapper.add_remote_agent(nixl_agent_meta.agent_metadata)
 
         if self._is_hma_required:
             self._validate_pp_hma_region_lengths(
@@ -1155,9 +1094,7 @@ class IluNixlPushWorkerMixin:
         if pairings is not None:
             if not hasattr(self, "region_pairings"):
                 self.region_pairings = {}
-            self.region_pairings.setdefault(engine_id, {})[
-                remote_key
-            ] = pairings
+            self.region_pairings.setdefault(engine_id, {})[remote_key] = pairings
         self.local_region_ids_by_group.setdefault(engine_id, {})[remote_key] = (
             local_region_ids_by_group
         )
@@ -1168,9 +1105,7 @@ class IluNixlPushWorkerMixin:
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata
         )
-        remote_virtual_packed = metadata_uses_virtual_packed_regions(
-            nixl_agent_meta
-        )
+        remote_virtual_packed = metadata_uses_virtual_packed_regions(nixl_agent_meta)
         if remote_virtual_packed:
             self.kv_caches_base_addr.setdefault(engine_id, {})[remote_key] = list(
                 nixl_agent_meta.kv_caches_base_addr

@@ -24,8 +24,7 @@ _MAX_QUEUED = 1 << 20
 _DRAIN_INTERVAL_S = 0.25
 
 _HEADERS = (
-    "# T task      req chunk nlayers t_begin_ms queue_wait_ms "
-    "futures_wait_ms total_ms",
+    "# T task      req chunk nlayers t_begin_ms queue_wait_ms futures_wait_ms total_ms",
     "# S submit    seq req chunk group kind nlayers blocks first_page bytes "
     "t_begin_ms blockids_h2d_ms zero_ms d2h_submit_ms",
     "# H submit'   seq wait_ev_ms gpu_quant_ms gpu_d2h_ms",
@@ -44,7 +43,8 @@ class _Trace:
         self._seq = 0
         self._dropped = 0
         self._gpu = "unk"
-        self._file = None
+        self._path: str | None = None
+        self._header_written = False
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._ctx = threading.local()
@@ -85,17 +85,6 @@ class _Trace:
         self._thread.start()
         atexit.register(self._final_flush)
 
-    def _open(self):
-        if self._file is None:
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            path = os.path.join(
-                OUTPUT_DIR, f"fp8_xfer_trace_gpu{self._gpu}_pid{os.getpid()}.log"
-            )
-            self._file = open(path, "a", encoding="utf-8", buffering=1 << 20)
-            self._file.write("\n".join(_HEADERS) + "\n")
-            logger.info("[fp8-xfer-trace] writing to %s", path)
-        return self._file
-
     def _drain_loop(self) -> None:
         while not self._stop.wait(_DRAIN_INTERVAL_S):
             self._flush()
@@ -110,11 +99,19 @@ class _Trace:
             dropped = self._dropped
             self._dropped = 0
         try:
-            handle = self._open()
-            handle.write("".join(" ".join(map(str, r)) + "\n" for r in batch))
-            if dropped:
-                handle.write(f"! dropped {dropped}\n")
-            handle.flush()
+            if self._path is None:
+                os.makedirs(OUTPUT_DIR, exist_ok=True)
+                self._path = os.path.join(
+                    OUTPUT_DIR, f"fp8_xfer_trace_gpu{self._gpu}_pid{os.getpid()}.log"
+                )
+                logger.info("[fp8-xfer-trace] writing to %s", self._path)
+            with open(self._path, "a", encoding="utf-8", buffering=1 << 20) as handle:
+                if not self._header_written:
+                    handle.write("\n".join(_HEADERS) + "\n")
+                    self._header_written = True
+                handle.write("".join(" ".join(map(str, r)) + "\n" for r in batch))
+                if dropped:
+                    handle.write(f"! dropped {dropped}\n")
         except Exception:
             logger.exception("[fp8-xfer-trace] flush failed, dropping batch")
 

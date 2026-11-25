@@ -21,8 +21,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 )
 
 from ..ilu_nixl_common.types import (
-    HmaTransferRoute,
-    RegionPairing,
+    HmaTransferRoute as HmaTransferRoute,
+)
+from ..ilu_nixl_common.types import (
+    RegionPairing as RegionPairing,
+)
+from ..ilu_nixl_common.types import (
     SemanticTransferRegion,
 )
 
@@ -156,6 +160,7 @@ def compute_ilu_push_compatibility_hash(
     """Compute PP/speculator-agnostic compatibility hash including V4.1 KV codecs."""
     from vllm import __version__ as vllm_version
     from vllm.config.utils import hash_factors
+
     from vllm_iluvatar.models.deepseek_v41.compressed_kv import format_factors
 
     model_config = vllm_config.model_config

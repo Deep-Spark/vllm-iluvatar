@@ -54,12 +54,10 @@ def resolve_swa_bounded_replay(vllm_config: Any) -> bool:
     if not getattr(vllm_config, "use_v2_model_runner", False):
         return False
     parallel_config = getattr(vllm_config, "parallel_config", None)
-    if (
+    return not (
         parallel_config is not None
         and getattr(parallel_config, "prefill_context_parallel_size", 1) > 1
-    ):
-        return False
-    return True
+    )
 
 
 def resolve_quantized_kv_format(name: str):
@@ -123,8 +121,7 @@ def wire_dsv41_layout(
     return layout
 
 
-
-def resolve_dsv41_layout(vllm_config: "VllmConfig | Any") -> Dsv41Layout | None:
+def resolve_dsv41_layout(vllm_config: VllmConfig | Any) -> Dsv41Layout | None:
     """Derive V4.1 topology facts from ``vllm_config``, or None for other models."""
     if not is_dsv41_config(vllm_config):
         return None
@@ -212,9 +209,7 @@ def effective_pp_producers(
     p_start = 0
     for num_layers in p_counts:
         p_end = p_start + num_layers
-        eff_p_end = (
-            min(p_end, eff_layer_end) if eff_layer_end is not None else p_end
-        )
+        eff_p_end = min(p_end, eff_layer_end) if eff_layer_end is not None else p_end
         if p_start < eff_p_end and max(d_start, p_start) < min(d_end, eff_p_end):
             count += 1
         p_start = p_end
@@ -230,7 +225,6 @@ def is_predictably_skipped_dsv41_stage(
         and dsv41_layout.swa_bounded_replay
         and dsv41_layout.kv_source_layers
     )
-
 
 
 def legal_decode_cut_layers(layout: Dsv41Layout) -> tuple[int, ...]:
@@ -446,7 +440,7 @@ def validate_dsv41_peer_handshake(
 
 def compute_prefix_replay_alignment(
     vllm_config: Any,
-    kv_cache_config: "KVCacheConfig",
+    kv_cache_config: KVCacheConfig,
     *,
     is_consumer: bool,
     has_mamba: bool,
@@ -461,9 +455,7 @@ def compute_prefix_replay_alignment(
             all_specs.update(spec.kv_cache_specs.values())
         else:
             all_specs.add(spec)
-    replay_specs = [
-        s for s in all_specs if getattr(s, "prefix_replay_tokens", 0)
-    ]
+    replay_specs = [s for s in all_specs if getattr(s, "prefix_replay_tokens", 0)]
     if not replay_specs:
         return None
     align_enabled = os.getenv("VLLM_ILU_V41_REMOTE_REPLAY_ALIGN2", "1") != "0"

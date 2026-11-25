@@ -25,6 +25,11 @@ from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.base_worker 
     IluNixlWorkerMixin,
     RegionPairing,
 )
+from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.metadata import (
+    IluNixlAgentMetadata,
+    IluNixlConnectorMetadata,
+    IluNixlTransferRegion,
+)
 from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_common.dsv41 import (
     Dsv41Layout,
     compute_prefix_replay_alignment,
@@ -32,11 +37,6 @@ from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_common.dsv41
     resolve_dsv41_layout,
     validate_decode_pp_split,
     validate_dsv41_peer_handshake,
-)
-from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.metadata import (
-    IluNixlAgentMetadata,
-    IluNixlConnectorMetadata,
-    IluNixlTransferRegion,
 )
 
 
@@ -174,7 +174,11 @@ def test_scheduler_clips_bounded_replay_and_ring_preserving_group_seats():
         bounded_replay=True,
     )
     ring_spec = CircularBufferSpec(
-        block_size=16, num_kv_heads=1, head_size=1024, head_size_v=0, dtype=torch.float32
+        block_size=16,
+        num_kv_heads=1,
+        head_size=1024,
+        head_size_v=0,
+        dtype=torch.float32,
     )
     groups = [
         KVCacheGroupSpec(["layers.2.attn"], main_spec),
@@ -323,13 +327,25 @@ def test_packed_registration_supports_multi_ratio_kernel_blocks_and_skip_layers(
     l_skip = "model.layers.2.attn.swa_cache"
 
     spec_r1 = MLAAttentionSpec(
-        block_size=128, num_kv_heads=1, head_size=16, dtype=torch.uint8, tokens_per_state=2
+        block_size=128,
+        num_kv_heads=1,
+        head_size=16,
+        dtype=torch.uint8,
+        tokens_per_state=2,
     )
     spec_r2 = MLAAttentionSpec(
-        block_size=64, num_kv_heads=1, head_size=16, dtype=torch.uint8, tokens_per_state=1
+        block_size=64,
+        num_kv_heads=1,
+        head_size=16,
+        dtype=torch.uint8,
+        tokens_per_state=1,
     )
     spec_r4 = MLAAttentionSpec(
-        block_size=64, num_kv_heads=1, head_size=16, dtype=torch.uint8, tokens_per_state=1
+        block_size=64,
+        num_kv_heads=1,
+        head_size=16,
+        dtype=torch.uint8,
+        tokens_per_state=1,
     )
     spec_skip = SlidingWindowMLASpec(
         block_size=64,
@@ -342,16 +358,28 @@ def test_packed_registration_supports_multi_ratio_kernel_blocks_and_skip_layers(
 
     kv_caches = {
         l_r1: torch.as_strided(
-            backing, size=(num_blocks * 1, 1, 64, 16), stride=(block_stride, 1024, 16, 1), storage_offset=0
+            backing,
+            size=(num_blocks * 1, 1, 64, 16),
+            stride=(block_stride, 1024, 16, 1),
+            storage_offset=0,
         ),
         l_r2: torch.as_strided(
-            backing, size=(num_blocks * 2, 1, 32, 16), stride=(block_stride // 2, 512, 16, 1), storage_offset=0
+            backing,
+            size=(num_blocks * 2, 1, 32, 16),
+            stride=(block_stride // 2, 512, 16, 1),
+            storage_offset=0,
         ),
         l_r4: torch.as_strided(
-            backing, size=(num_blocks * 4, 1, 16, 16), stride=(block_stride // 4, 256, 16, 1), storage_offset=0
+            backing,
+            size=(num_blocks * 4, 1, 16, 16),
+            stride=(block_stride // 4, 256, 16, 1),
+            storage_offset=0,
         ),
         l_skip: torch.as_strided(
-            backing, size=(num_blocks, 1, 64, 16), stride=(block_stride, 1024, 16, 1), storage_offset=page * 3
+            backing,
+            size=(num_blocks, 1, 64, 16),
+            stride=(block_stride, 1024, 16, 1),
+            storage_offset=page * 3,
         ),
     }
     # For dense multi-kernel splitting in LBNHC, each layer uses dense stride = page (1024):
@@ -613,10 +641,7 @@ def test_truncated_producer_overlap_skips_inactive_ranks_and_adjusts_notif_count
     ) == 4
     worker = object.__new__(IluNixlWorkerMixin)
     assert (
-        worker._effective_overlap_pp_count(
-            0, "40", "10,10,10,10", kv_layer_end=20
-        )
-        == 2
+        worker._effective_overlap_pp_count(0, "40", "10,10,10,10", kv_layer_end=20) == 2
     )
 
     # D stage 2 owns [20, 30), while P has kv_layer_end=20 -> inactive overlap!
@@ -1038,15 +1063,17 @@ def test_native_nixl_vram_v41_pull_read_end_to_end(monkeypatch):
     nixl_api = pytest.importorskip("nixl._api")
     import time
     import uuid
+
     import msgspec
-    from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_common.dsv41 import (
-        resolve_quantized_kv_format,
-    )
+
     from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.metadata import (
         IluNixlHandshakePayload,
     )
     from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.pull_worker import (
         IluNixlPullConnectorWorker,
+    )
+    from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_common.dsv41 import (
+        resolve_quantized_kv_format,
     )
     from vllm_iluvatar.models.deepseek_v41 import compressed_kv
     from vllm_iluvatar.models.deepseek_v41.compressed_kv import (
@@ -1106,7 +1133,9 @@ def test_native_nixl_vram_v41_pull_read_end_to_end(monkeypatch):
     page = PAYLOAD_PAGE_BYTES
 
     # Build LBNHC layout so r=1 (main) and r=2 (indexer) coexist on one VRAM buffer!
-    def _build_lbnhc_side(role: str, num_blocks: int, include_forwarder: bool, seed: int):
+    def _build_lbnhc_side(
+        role: str, num_blocks: int, include_forwarder: bool, seed: int
+    ):
         layer_list = [main_layer, idx_layer, swa_layer]
         if include_forwarder:
             layer_list.insert(0, fwd_layer)
@@ -1127,19 +1156,27 @@ def test_native_nixl_vram_v41_pull_read_end_to_end(monkeypatch):
         if include_forwarder:
             groups.append(
                 SimpleNamespace(
-                    layer_names=[fwd_layer], kv_cache_spec=main_spec, is_eagle_group=False
+                    layer_names=[fwd_layer],
+                    kv_cache_spec=main_spec,
+                    is_eagle_group=False,
                 )
             )
         groups.extend(
             [
                 SimpleNamespace(
-                    layer_names=[main_layer], kv_cache_spec=main_spec, is_eagle_group=False
+                    layer_names=[main_layer],
+                    kv_cache_spec=main_spec,
+                    is_eagle_group=False,
                 ),
                 SimpleNamespace(
-                    layer_names=[idx_layer], kv_cache_spec=idx_spec, is_eagle_group=False
+                    layer_names=[idx_layer],
+                    kv_cache_spec=idx_spec,
+                    is_eagle_group=False,
                 ),
                 SimpleNamespace(
-                    layer_names=[swa_layer], kv_cache_spec=swa_spec, is_eagle_group=False
+                    layer_names=[swa_layer],
+                    kv_cache_spec=swa_spec,
+                    is_eagle_group=False,
                 ),
             ]
         )
@@ -1154,7 +1191,9 @@ def test_native_nixl_vram_v41_pull_read_end_to_end(monkeypatch):
             idx_t = torch.arange(total_bytes, dtype=torch.int64, device=device)
             payload_buf = ((idx_t + (idx_t // page) * 31 + seed) % 251).to(torch.uint8)
         else:
-            payload_buf = torch.full((total_bytes,), 0xEE, dtype=torch.uint8, device=device)
+            payload_buf = torch.full(
+                (total_bytes,), 0xEE, dtype=torch.uint8, device=device
+            )
 
         slot_of = {lname: i for i, lname in enumerate(layer_list)}
         kv_caches = {}
@@ -1188,15 +1227,19 @@ def test_native_nixl_vram_v41_pull_read_end_to_end(monkeypatch):
         main_scale_layout = plan_scale_layout(kv_cfg, I8G64)
         main_scale_elems = main_scale_layout.scale_bytes // 2
         if role == "kv_producer":
-            s_idx = torch.arange(main_scale_layout.scale_bytes, dtype=torch.int64, device=device)
+            s_idx = torch.arange(
+                main_scale_layout.scale_bytes, dtype=torch.int64, device=device
+            )
             main_scale_raw = ((s_idx + 53) % 251).to(torch.uint8)
             main_scale_buf = main_scale_raw.view(torch.float16)
         else:
-            main_scale_buf = torch.empty(main_scale_elems, dtype=torch.float16, device=device)
+            main_scale_buf = torch.empty(
+                main_scale_elems, dtype=torch.float16, device=device
+            )
             main_scale_buf.view(torch.uint8).fill_(0xEE)
 
         scale_views = {}
-        for lname in ([fwd_layer, main_layer] if include_forwarder else [main_layer]):
+        for lname in [fwd_layer, main_layer] if include_forwarder else [main_layer]:
             mp = main_scale_layout.placements[lname]
             scale_views[lname] = torch.as_strided(
                 main_scale_buf,
@@ -1208,11 +1251,15 @@ def test_native_nixl_vram_v41_pull_read_end_to_end(monkeypatch):
         idx_scale_layout = plan_indexer_scales(kv_cfg)
         idx_scale_elems = idx_scale_layout.nbytes // 4
         if role == "kv_producer":
-            is_idx = torch.arange(idx_scale_layout.nbytes, dtype=torch.int64, device=device)
+            is_idx = torch.arange(
+                idx_scale_layout.nbytes, dtype=torch.int64, device=device
+            )
             idx_scale_raw = ((is_idx + 97) % 251).to(torch.uint8)
             idx_scale_buf = idx_scale_raw.view(torch.float32)
         else:
-            idx_scale_buf = torch.empty(idx_scale_elems, dtype=torch.float32, device=device)
+            idx_scale_buf = torch.empty(
+                idx_scale_elems, dtype=torch.float32, device=device
+            )
             idx_scale_buf.view(torch.uint8).fill_(0xEE)
         ip = idx_scale_layout.placements[idx_layer]
         # r=2 kernel blocks on indexer scales too: [num_blocks * 2, 256]
@@ -1220,7 +1267,9 @@ def test_native_nixl_vram_v41_pull_read_end_to_end(monkeypatch):
             ip.offset : ip.offset + num_blocks * ip.rows_per_manager_block
         ].view(num_blocks * 2, ip.rows_per_manager_block // 2)
 
-        vllm_cfg = _v41_vllm_config(role=role, pp_size=2 if include_forwarder else 1, tp_size=1)
+        vllm_cfg = _v41_vllm_config(
+            role=role, pp_size=2 if include_forwarder else 1, tp_size=1
+        )
         vllm_cfg.compilation_config.static_forward_context = {
             k: SimpleNamespace(kv_cache_scales=v) for k, v in scale_views.items()
         }
@@ -1324,9 +1373,13 @@ def test_native_nixl_vram_v41_pull_read_end_to_end(monkeypatch):
     p_side = d_side = None
     try:
         # Producer: 5 blocks, PP=2 ("20,20"), 4 groups (group 0=forwarder, 1=main, 2=idx, 3=swa)
-        p_side = _build_lbnhc_side("kv_producer", num_blocks=5, include_forwarder=True, seed=17)
+        p_side = _build_lbnhc_side(
+            "kv_producer", num_blocks=5, include_forwarder=True, seed=17
+        )
         # Consumer: 4 blocks, PP=1 ("40"), 3 groups (group 0=main, 1=idx, 2=swa)
-        d_side = _build_lbnhc_side("kv_consumer", num_blocks=4, include_forwarder=False, seed=0)
+        d_side = _build_lbnhc_side(
+            "kv_consumer", num_blocks=4, include_forwarder=False, seed=0
+        )
         torch.cuda.synchronize()
 
         p_w, d_w = p_side.worker, d_side.worker
@@ -1338,7 +1391,11 @@ def test_native_nixl_vram_v41_pull_read_end_to_end(monkeypatch):
             payload.agent_metadata_bytes
         )
         remote_name = d_w.add_remote_agent(
-            p_meta, remote_tp_rank=0, remote_tp_size=1, remote_pp_rank=0, remote_pp_size=2
+            p_meta,
+            remote_tp_rank=0,
+            remote_tp_size=1,
+            remote_pp_rank=0,
+            remote_pp_size=2,
         )
         d_w._remote_agents[p_w.engine_id][0] = remote_name
         # Register D on P so UCX reverse notification delivery works.
@@ -1411,7 +1468,12 @@ def test_native_nixl_vram_v41_pull_read_end_to_end(monkeypatch):
             )
         for untouched_b in (1, 3):
             assert d_side.kv_caches[main_layer][untouched_b].eq(0xEE).all()
-            assert d_side.scale_views[main_layer][untouched_b].view(torch.uint8).eq(0xEE).all()
+            assert (
+                d_side.scale_views[main_layer][untouched_b]
+                .view(torch.uint8)
+                .eq(0xEE)
+                .all()
+            )
 
         # Verify idx_layer blocks (r=2 kernel blocks per scheduler block!):
         # Scheduler block b owns kernel rows [2*b, 2*b+1]!
@@ -1422,11 +1484,19 @@ def test_native_nixl_vram_v41_pull_read_end_to_end(monkeypatch):
                 p_side.kv_caches[idx_layer][2 * src_b : 2 * src_b + 2].cpu(),
             )
             assert torch.equal(
-                d_side.scale_views[idx_layer][2 * dst_b : 2 * dst_b + 2].view(torch.uint8).cpu(),
-                p_side.scale_views[idx_layer][2 * src_b : 2 * src_b + 2].view(torch.uint8).cpu(),
+                d_side.scale_views[idx_layer][2 * dst_b : 2 * dst_b + 2]
+                .view(torch.uint8)
+                .cpu(),
+                p_side.scale_views[idx_layer][2 * src_b : 2 * src_b + 2]
+                .view(torch.uint8)
+                .cpu(),
             )
         for untouched_b in (0, 2):
-            assert d_side.kv_caches[idx_layer][2 * untouched_b : 2 * untouched_b + 2].eq(0xEE).all()
+            assert (
+                d_side.kv_caches[idx_layer][2 * untouched_b : 2 * untouched_b + 2]
+                .eq(0xEE)
+                .all()
+            )
             assert (
                 d_side.scale_views[idx_layer][2 * untouched_b : 2 * untouched_b + 2]
                 .view(torch.uint8)

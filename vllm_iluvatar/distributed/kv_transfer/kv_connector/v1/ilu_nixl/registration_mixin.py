@@ -20,6 +20,11 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.kv_cache_interface import KpoolTailSpec, UniformTypeKVCacheSpecs
 
+from ..ilu_nixl_common.dsv41 import (
+    resolve_dsv41_layout,
+    resolve_indexer_kv_layout_name,
+    resolve_main_kv_format_name,
+)
 from ..ilu_nixl_common.memory_registration import MemoryRegistrationPlanner
 from ..ilu_nixl_common.semantic_pairing import (
     cache_kind_from_layer_name,
@@ -36,11 +41,6 @@ from ..ilu_nixl_common.virtual_packed_reg import (
     virtual_slot_desc,
 )
 from ..skip_layers import get_skip_layers
-from ..ilu_nixl_common.dsv41 import (
-    resolve_dsv41_layout,
-    resolve_indexer_kv_layout_name,
-    resolve_main_kv_format_name,
-)
 from .metadata import (
     IluNixlAgentMetadata,
     IluNixlHandshakePayload,
@@ -88,9 +88,7 @@ class IluNixlRegistrationMixin:
     def _should_split_virtual_region(self) -> bool:
         return bool(
             self.transfer_topo is not None
-            and getattr(
-                self.transfer_topo, "virtually_split_kv_in_blocks", False
-            )
+            and getattr(self.transfer_topo, "virtually_split_kv_in_blocks", False)
             and not self._has_mamba
         )
 
@@ -217,9 +215,8 @@ class IluNixlRegistrationMixin:
         for actual_region_id in range(len(self.block_len_per_layer)):
             mapping[actual_region_id] = [next_region_id]
             next_region_id += 1
-            if (
-                self._should_split_virtual_region()
-                and not self._is_region_replicated(actual_region_id)
+            if self._should_split_virtual_region() and not self._is_region_replicated(
+                actual_region_id
             ):
                 mapping[actual_region_id].append(next_region_id)
                 next_region_id += 1
@@ -236,9 +233,8 @@ class IluNixlRegistrationMixin:
                     return block_len // 2
                 return block_len
             next_region_id += 1
-            if (
-                self._should_split_virtual_region()
-                and not self._is_region_replicated(actual_region_id)
+            if self._should_split_virtual_region() and not self._is_region_replicated(
+                actual_region_id
             ):
                 if region_id == next_region_id:
                     return block_len // 2
@@ -362,9 +358,7 @@ class IluNixlRegistrationMixin:
                 kernel_blocks = 1
                 block_tokens = int(getattr(self, "block_size", 0) or 0)
             else:
-                block_tokens = max(
-                    0, int(getattr(sample_spec, "block_size", 0) or 0)
-                )
+                block_tokens = max(0, int(getattr(sample_spec, "block_size", 0) or 0))
                 sample_cache = next(
                     (kv_caches[name] for name in shared_by if name in kv_caches),
                     None,
@@ -400,9 +394,7 @@ class IluNixlRegistrationMixin:
                     kernel_blocks=kernel_blocks,
                     block_tokens=block_tokens,
                     num_blocks=reg_num_blocks,
-                    identity_groups={
-                        k: sorted(v) for k, v in identity_groups.items()
-                    },
+                    identity_groups={k: sorted(v) for k, v in identity_groups.items()},
                 )
             )
         return transfer_regions
@@ -542,9 +534,7 @@ class IluNixlRegistrationMixin:
         self.device_kv_caches = kv_caches
         self._set_handshake_metadata(memory_type=memory_type)
 
-    def _uses_kv_first_fa_layout(
-        self, kv_caches: dict[str, torch.Tensor]
-    ) -> bool:
+    def _uses_kv_first_fa_layout(self, kv_caches: dict[str, torch.Tensor]) -> bool:
         if self.use_mla or self._has_mamba or not kv_caches:
             return False
         registered = [
@@ -559,9 +549,7 @@ class IluNixlRegistrationMixin:
             for cache in registered
         )
 
-    def _register_kv_first_fa_caches(
-        self, kv_caches: dict[str, torch.Tensor]
-    ) -> None:
+    def _register_kv_first_fa_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         if self.use_host_buffer:
             raise ValueError(
                 "Iluvatar K/V-first KV caches do not support a host transfer buffer"
@@ -666,8 +654,7 @@ class IluNixlRegistrationMixin:
             region.block_stride for region in self.transfer_regions
         ]
         self.region_num_blocks = [
-            region.num_blocks or self.num_blocks
-            for region in self.transfer_regions
+            region.num_blocks or self.num_blocks for region in self.transfer_regions
         ]
         self.num_regions = len(self.transfer_regions)
         self.num_descs = sum(self.region_num_blocks)
@@ -676,9 +663,7 @@ class IluNixlRegistrationMixin:
         self._dump_registered_regions()
 
     def _register_empty_rank(self, original_kv_caches: dict[str, Any]) -> None:
-        logical_num_blocks = int(
-            getattr(self, "_logical_num_blocks", self.num_blocks)
-        )
+        logical_num_blocks = int(getattr(self, "_logical_num_blocks", self.num_blocks))
         if self._physical_blocks_per_logical_kv_block != 1:
             self.num_blocks = logical_num_blocks
             self.block_size = int(
@@ -726,9 +711,7 @@ class IluNixlRegistrationMixin:
             raise ValueError(
                 "Packed virtual IluNixl regions cannot use a host transfer buffer"
             )
-        logical_num_blocks = int(
-            getattr(self, "_logical_num_blocks", self.num_blocks)
-        )
+        logical_num_blocks = int(getattr(self, "_logical_num_blocks", self.num_blocks))
         if getattr(self, "_physical_blocks_per_logical_kv_block", 1) != 1:
             self.num_blocks = logical_num_blocks
             self.block_size = int(
@@ -782,8 +765,7 @@ class IluNixlRegistrationMixin:
             region.block_stride for region in self.transfer_regions
         ]
         self.region_num_blocks = [
-            region.num_blocks or self.num_blocks
-            for region in self.transfer_regions
+            region.num_blocks or self.num_blocks for region in self.transfer_regions
         ]
         self.num_regions = len(self.transfer_regions)
         self.num_descs = sum(self.region_num_blocks)
@@ -917,10 +899,7 @@ class IluNixlRegistrationMixin:
             self.layer_region_ids, self.region_ids_by_group
         )
         self._local_desc_cumsum = self._exclusive_cumsum(
-            [
-                region.num_blocks or self.num_blocks
-                for region in self.transfer_regions
-            ]
+            [region.num_blocks or self.num_blocks for region in self.transfer_regions]
         )
         assert self.transfer_topo is not None
         self.compat_hash = self._compute_compatibility_hash(

@@ -16,6 +16,7 @@ from vllm.v1.kv_cache_interface import (
     KpoolTailSpec,
     SlidingWindowSpec,
 )
+
 from vllm_iluvatar.ilu_patch.general_patches import (
     patch_connector_divergent_hybrid_hits as patch,
 )
@@ -181,9 +182,7 @@ def test_get_zeroing_block_ids_in_range_includes_swa_window_blocks():
         coordinator=SimpleNamespace(single_type_managers=(fa_mgr, swa_mgr))
     )
 
-    ids = get_zeroing_block_ids_in_range(
-        manager, "req-1", 254 * 256, 256 * 256
-    )
+    ids = get_zeroing_block_ids_in_range(manager, "req-1", 254 * 256, 256 * 256)
 
     expected_fa = [100 + 254, 100 + 255]
     expected_swa = [500 + i for i in range(16)]
@@ -283,15 +282,11 @@ def test_community_method_drift_fails(monkeypatch):
     monkeypatch.setattr(patch, "_COMMUNITY_METHOD_SOURCE_SHA", "0" * 64)
 
     with pytest.raises(RuntimeError, match="community .* source changed"):
-        patch._check_community_method(
-            KVCacheManager.get_computed_blocks_for_connector
-        )
+        patch._check_community_method(KVCacheManager.get_computed_blocks_for_connector)
 
 
 def test_fingerprint_switch_skips_check(monkeypatch):
     monkeypatch.setattr(patch.p, "_enabled", lambda env: False)
     monkeypatch.setattr(patch, "_COMMUNITY_METHOD_SOURCE_SHA", "0" * 64)
 
-    patch._check_community_method(
-        KVCacheManager.get_computed_blocks_for_connector
-    )
+    patch._check_community_method(KVCacheManager.get_computed_blocks_for_connector)

@@ -107,8 +107,14 @@ from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.fp8_layout i
 )
 from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_common.fp8_hetero.wire_layout import (
     build_wire_config as build_push_wire_config,
+)
+from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_common.fp8_hetero.wire_layout import (
     get_wire_groups as get_push_wire_groups,
+)
+from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_common.fp8_hetero.wire_layout import (
     use_host_staging_wire,
+)
+from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl_common.fp8_hetero.wire_layout import (
     wire_scratch_bytes as push_wire_scratch_bytes,
 )
 from vllm_iluvatar.models.deepseek_v41.offloading import (
@@ -399,9 +405,7 @@ class _OrderedWorkerSpecs:
             )
         return matches[0]
 
-    def should_reserve_scratch(
-        self, kv_cache_groups: list[KVCacheGroupSpec]
-    ) -> bool:
+    def should_reserve_scratch(self, kv_cache_groups: list[KVCacheGroupSpec]) -> bool:
         """Deduct GPU scratch at most once per worker in ``specs``.
 
         Outer wrappers (such as PP group narrowing) may pass a fresh transient
@@ -409,13 +413,9 @@ class _OrderedWorkerSpecs:
         ``min_blocks * pool_bytes``. Keying by worker layer-set count avoids
         address-reuse collisions and stops a second deduction on shrink.
         """
-        return (
-            self._remaining_scratch_by_layers[_groups_layer_key(kv_cache_groups)] > 0
-        )
+        return self._remaining_scratch_by_layers[_groups_layer_key(kv_cache_groups)] > 0
 
-    def mark_scratch_reserved(
-        self, kv_cache_groups: list[KVCacheGroupSpec]
-    ) -> None:
+    def mark_scratch_reserved(self, kv_cache_groups: list[KVCacheGroupSpec]) -> None:
         key = _groups_layer_key(kv_cache_groups)
         if self._remaining_scratch_by_layers[key] > 0:
             self._remaining_scratch_by_layers[key] -= 1

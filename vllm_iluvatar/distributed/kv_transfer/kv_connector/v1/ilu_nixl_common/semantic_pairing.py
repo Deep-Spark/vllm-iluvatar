@@ -80,9 +80,7 @@ def effective_overlap_pp_count(
     kv_layer_end: int | None = None,
 ) -> int:
     if kv_layer_end is None:
-        return overlap_pp_count(
-            producer_pp_rank, producer_pp_split, consumer_pp_split
-        )
+        return overlap_pp_count(producer_pp_rank, producer_pp_split, consumer_pp_split)
     p_start, p_end = pp_layer_range(producer_pp_split, producer_pp_rank)
     p_end = min(p_end, kv_layer_end)
     if p_start >= p_end:
@@ -100,9 +98,7 @@ def effective_overlap_pp_count(
 
 def cache_kind_from_layer_name(layer_name: str) -> str:
     is_scale = layer_name.endswith(".kv_cache_scales")
-    base_name = (
-        layer_name.removesuffix(".kv_cache_scales") if is_scale else layer_name
-    )
+    base_name = layer_name.removesuffix(".kv_cache_scales") if is_scale else layer_name
     if ".swa_cache" in base_name:
         kind = "swa_cache"
     elif ".indexer.k_cache" in base_name:
@@ -113,11 +109,12 @@ def cache_kind_from_layer_name(layer_name: str) -> str:
         kind = "indexer_compressor"
     elif ".compressor.state_cache" in base_name:
         kind = "compressor_state_cache"
-    elif ".ilu_deepseek_v4_multi_head_latent_attention" in base_name:
-        kind = "main_mla"
-    elif ".ilu_glm_moe_dsa_attention" in base_name:
-        kind = "main_mla"
-    elif base_name.endswith(".mla_attn") or base_name.endswith(".attn"):
+    elif (
+        ".ilu_deepseek_v4_multi_head_latent_attention" in base_name
+        or ".ilu_glm_moe_dsa_attention" in base_name
+        or base_name.endswith(".mla_attn")
+        or base_name.endswith(".attn")
+    ):
         kind = "main_mla"
     elif base_name.endswith(".linear_attn") or base_name.endswith(".self_attn"):
         kind = "mamba_cache"
@@ -211,7 +208,6 @@ def region_ids_for_mtp_layers(
             if region_id not in selected:
                 selected.append(region_id)
     return selected
-
 
 
 def filter_group_region_ids(
@@ -349,9 +345,7 @@ def pair_hma_transfer_regions(
 
     by_group_pair: dict[tuple[int, int], list[RegionPairing]] = defaultdict(list)
     for pairing in raw_pairings:
-        by_group_pair[(pairing.local_group_id, pairing.remote_group_id)].append(
-            pairing
-        )
+        by_group_pair[(pairing.local_group_id, pairing.remote_group_id)].append(pairing)
 
     dedup_pairings: list[RegionPairing] = []
     selected_local_ids: list[int] = []
@@ -390,9 +384,7 @@ def pair_hma_transfer_regions(
                 continue
             prior_global_remote = global_local_to_remote.get(l_rid)
             prior_global_local = global_remote_to_local.get(r_rid)
-            if (
-                prior_global_remote is not None and prior_global_remote != r_rid
-            ) or (
+            if (prior_global_remote is not None and prior_global_remote != r_rid) or (
                 prior_global_local is not None and prior_global_local != l_rid
             ):
                 conflicts.append(
@@ -458,9 +450,7 @@ def align_hma_transfer_regions(
             continue
         if pairing.local_region_id not in local_groups[gid]:
             local_groups[gid].append(pairing.local_region_id)
-            remote_groups[gid].append(
-                compact_remote_map[pairing.remote_region_id]
-            )
+            remote_groups[gid].append(compact_remote_map[pairing.remote_region_id])
     return (
         [np.asarray(g, dtype=np.int64) for g in local_groups],
         [np.asarray(g, dtype=np.int64) for g in remote_groups],
@@ -540,9 +530,9 @@ def build_mamba_hma_transfer_routes(
             f"remote_regions={selected_remote_region_ids}"
         )
 
-    route_buckets: dict[
-        tuple[int, int], list[tuple[int, int, tuple[int, str]]]
-    ] = defaultdict(list)
+    route_buckets: dict[tuple[int, int], list[tuple[int, int, tuple[int, str]]]] = (
+        defaultdict(list)
+    )
     for key in common_keys:
         local_region_id, local_group_idx = local_by_key[key]
         remote_region_id, remote_group_idx = remote_by_key[key]
@@ -559,9 +549,7 @@ def build_mamba_hma_transfer_routes(
     fa_remote_to_local: dict[int, int] = {}
     selected_ssm_remote_ids: list[int] = []
 
-    for (local_group_idx, remote_group_idx), pairs in sorted(
-        route_buckets.items()
-    ):
+    for (local_group_idx, remote_group_idx), pairs in sorted(route_buckets.items()):
         if group_spec_types is not None and local_group_idx < len(group_spec_types):
             is_ssm = _is_ssm_spec(group_spec_types[local_group_idx])
         else:
@@ -574,8 +562,7 @@ def build_mamba_hma_transfer_routes(
 
         for local_region_id, remote_region_id, key in pairs:
             identity_str = (
-                f"{key[0]}:{key[1]}:group{local_group_idx}->"
-                f"group{remote_group_idx}"
+                f"{key[0]}:{key[1]}:group{local_group_idx}->group{remote_group_idx}"
             )
             prior_remote = local_to_remote.get(local_region_id)
             prior_local = remote_to_local.get(remote_region_id)
@@ -613,12 +600,8 @@ def build_mamba_hma_transfer_routes(
                 prior_fa_remote = fa_local_to_remote.get(local_region_id)
                 prior_fa_local = fa_remote_to_local.get(remote_region_id)
                 if (
-                    prior_fa_remote is not None
-                    and prior_fa_remote != remote_region_id
-                ) or (
-                    prior_fa_local is not None
-                    and prior_fa_local != local_region_id
-                ):
+                    prior_fa_remote is not None and prior_fa_remote != remote_region_id
+                ) or (prior_fa_local is not None and prior_fa_local != local_region_id):
                     conflicts.append(
                         {
                             "group": (local_group_idx, remote_group_idx),
@@ -654,8 +637,7 @@ def build_mamba_hma_transfer_routes(
     selected_fa_local_ids = [pair[0] for pair in fa_region_pairs]
     selected_fa_remote_ids = [pair[1] for pair in fa_region_pairs]
     compact_fa_remote_map = {
-        reg_id: compact_id
-        for compact_id, reg_id in enumerate(selected_fa_remote_ids)
+        reg_id: compact_id for compact_id, reg_id in enumerate(selected_fa_remote_ids)
     }
 
     total_local_regions = (
@@ -669,12 +651,10 @@ def build_mamba_hma_transfer_routes(
         else list(range(total_local_regions))
     )
     local_ssm_slot_map = {
-        int(reg_id): slot_idx
-        for slot_idx, reg_id in enumerate(local_ssm_regions)
+        int(reg_id): slot_idx for slot_idx, reg_id in enumerate(local_ssm_regions)
     }
     remote_ssm_slot_map = {
-        int(reg_id): slot_idx
-        for slot_idx, reg_id in enumerate(selected_ssm_remote_ids)
+        int(reg_id): slot_idx for slot_idx, reg_id in enumerate(selected_ssm_remote_ids)
     }
 
     routes: list[HmaTransferRoute] = []
@@ -814,28 +794,22 @@ def select_pp_regions_and_pairings(
                 if region_id not in selected_remote_region_ids
             )
 
-    if (
-        not selected_local_region_ids and not selected_remote_region_ids
-    ) or (
-        allow_empty_skipped_overlap
-        and (not selected_local_region_ids or not selected_remote_region_ids)
+    if allow_empty_skipped_overlap and (
+        not selected_local_region_ids or not selected_remote_region_ids
     ):
-        if allow_empty_skipped_overlap:
-            return empty_groups, empty_groups, [], [], [], True
+        return empty_groups, empty_groups, [], [], [], True
 
     if is_hma_required:
         assert local_transfer_regions is not None
         assert remote_transfer_regions is not None
-        pairings, selected_local_ids, selected_remote_ids = (
-            pair_hma_transfer_regions(
-                selected_local_region_ids,
-                selected_remote_region_ids,
-                local_transfer_regions,
-                remote_transfer_regions,
-                num_groups=num_groups,
-                overlap_start=None if extra_overlap else overlap_start,
-                overlap_end=None if extra_overlap else overlap_end,
-            )
+        pairings, selected_local_ids, selected_remote_ids = pair_hma_transfer_regions(
+            selected_local_region_ids,
+            selected_remote_region_ids,
+            local_transfer_regions,
+            remote_transfer_regions,
+            num_groups=num_groups,
+            overlap_start=None if extra_overlap else overlap_start,
+            overlap_end=None if extra_overlap else overlap_end,
         )
         if allow_empty_skipped_overlap and not pairings:
             return empty_groups, empty_groups, [], [], [], True
@@ -964,9 +938,7 @@ def validate_region_geometry_pair(
                 f"remote={remote_region.block_tokens})"
             )
         return 1
-    where = (
-        f"{identity} (local r{local_region_id}, remote r{remote_region_id})"
-    )
+    where = f"{identity} (local r{local_region_id}, remote r{remote_region_id})"
     if is_ssm and local_region.kernel_blocks == remote_region.kernel_blocks:
         # Real mamba state is one slot on both sides; its block_tokens is only
         # the scheduler span, so non-divisible spans (e.g. 4480 vs 2304) still
@@ -1021,21 +993,25 @@ def validate_region_geometry_pair(
             f"divisible (local={local_region.kernel_blocks}, "
             f"remote={remote_region.kernel_blocks})"
         )
-    if token_ratio != 1 and kernel_ratio != 1 and token_ratio != kernel_ratio:
+    if (
+        token_ratio != 1
+        and kernel_ratio != 1
+        and token_ratio != kernel_ratio
         # P stores 4480 tokens as 70 kernel pages of 64. D's 640-token block
         # is one scheduler slot (kernel_blocks=1) even after the connector
         # resyncs to the same 64-token page, so 70 == 7 * 10. The page pairing
         # uses physical_blocks_per_logical; this check only requires that the
         # kernel-page ratio is an integer multiple of the scheduler-block ratio.
-        if kernel_ratio % token_ratio != 0:
-            raise ValueError(
-                f"{where}: scheduler block ratio {token_ratio} does not match "
-                f"kernel-block ratio {kernel_ratio} "
-                f"(block_tokens local={local_region.block_tokens}, "
-                f"remote={remote_region.block_tokens}; "
-                f"kernel_blocks local={local_region.kernel_blocks}, "
-                f"remote={remote_region.kernel_blocks})"
-            )
+        and kernel_ratio % token_ratio != 0
+    ):
+        raise ValueError(
+            f"{where}: scheduler block ratio {token_ratio} does not match "
+            f"kernel-block ratio {kernel_ratio} "
+            f"(block_tokens local={local_region.block_tokens}, "
+            f"remote={remote_region.block_tokens}; "
+            f"kernel_blocks local={local_region.kernel_blocks}, "
+            f"remote={remote_region.kernel_blocks})"
+        )
     return max(token_ratio, 1)
 
 
@@ -1067,8 +1043,7 @@ def validate_pp_region_lengths(
             expected_remote_len = (local_len * tp_ratio) // block_size_ratio
         else:
             assert block_size_ratio == 1, (
-                "Different local/remote block sizes are not supported "
-                "when P TP > D TP."
+                "Different local/remote block sizes are not supported when P TP > D TP."
             )
             expected_remote_len = local_len // (-tp_ratio)
         assert remote_len == expected_remote_len, (
@@ -1196,9 +1171,8 @@ def validate_pp_hma_region_lengths(
 
     if pairings is not None:
         for pair_idx, pairing in enumerate(pairings):
-            is_ssm = (
-                pairing.local_group_id < len(group_spec_types)
-                and _is_ssm_spec(group_spec_types[pairing.local_group_id])
+            is_ssm = pairing.local_group_id < len(group_spec_types) and _is_ssm_spec(
+                group_spec_types[pairing.local_group_id]
             )
             check_pair(
                 pairing.local_region_id,
@@ -1228,9 +1202,8 @@ def validate_pp_hma_region_lengths(
                 f"group={group_idx}, local={len(local_group)}, "
                 f"remote={len(remote_group)}"
             )
-        is_ssm = (
-            group_idx < len(group_spec_types)
-            and _is_ssm_spec(group_spec_types[group_idx])
+        is_ssm = group_idx < len(group_spec_types) and _is_ssm_spec(
+            group_spec_types[group_idx]
         )
         for pair_idx, (local_region_id, remote_compact_id) in enumerate(
             zip(local_group, remote_group)

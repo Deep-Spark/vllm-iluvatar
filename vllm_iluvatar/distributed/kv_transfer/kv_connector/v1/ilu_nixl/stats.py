@@ -55,11 +55,9 @@ class IluNixlKVConnectorStats(NixlKVConnectorStats):
         self.data.setdefault("wake_duration", []).append(max(0.0, float(seconds)))
 
     def record_lease_hold_duration(self, seconds: float) -> None:
-        self.data.setdefault("lease_hold_duration", []).append(
-            max(0.0, float(seconds))
-        )
+        self.data.setdefault("lease_hold_duration", []).append(max(0.0, float(seconds)))
 
-    def clone_and_reset(self) -> "IluNixlKVConnectorStats":
+    def clone_and_reset(self) -> IluNixlKVConnectorStats:
         old = copy.copy(self)
         old.data = {k: list(v) for k, v in self.data.items()}
         self.reset()

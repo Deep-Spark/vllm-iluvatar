@@ -341,9 +341,7 @@ def compile_xfer_plan(
         for p in pairings:
             if p.remote_region_id not in selected_remote_order:
                 selected_remote_order.append(p.remote_region_id)
-        compact_remote_map = {
-            rid: idx for idx, rid in enumerate(selected_remote_order)
-        }
+        compact_remote_map = {rid: idx for idx, rid in enumerate(selected_remote_order)}
         bucketed: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
         for p in pairings:
             entry = (p.local_region_id, compact_remote_map[p.remote_region_id])
@@ -356,16 +354,11 @@ def compile_xfer_plan(
             else len(selected_remote_order)
         )
         for (local_gid, remote_gid), reg_pairs in sorted(bucketed.items()):
-            is_ssm = (
-                local_gid < len(group_spec_types)
-                and _is_ssm_spec(group_spec_types[local_gid])
+            is_ssm = local_gid < len(group_spec_types) and _is_ssm_spec(
+                group_spec_types[local_gid]
             )
-            local_reg_arr = np.asarray(
-                [pair[0] for pair in reg_pairs], dtype=np.int64
-            )
-            remote_reg_arr = np.asarray(
-                [pair[1] for pair in reg_pairs], dtype=np.int64
-            )
+            local_reg_arr = np.asarray([pair[0] for pair in reg_pairs], dtype=np.int64)
+            remote_reg_arr = np.asarray([pair[1] for pair in reg_pairs], dtype=np.int64)
             if is_ssm:
                 l_bases = _ssm_base_column(
                     local_reg_arr,
@@ -422,9 +415,8 @@ def compile_xfer_plan(
             default=0,
         )
     for group_idx in range(min(len(local_groups), len(remote_groups))):
-        is_ssm = (
-            group_idx < len(group_spec_types)
-            and _is_ssm_spec(group_spec_types[group_idx])
+        is_ssm = group_idx < len(group_spec_types) and _is_ssm_spec(
+            group_spec_types[group_idx]
         )
         l_regs = local_groups[group_idx]
         r_regs = remote_groups[group_idx]
@@ -467,9 +459,7 @@ def compile_xfer_plan(
                 local_page_ratio=(
                     1
                     if is_ssm
-                    else _bucket_local_page_ratio(
-                        l_regs, local_region_page_ratios
-                    )
+                    else _bucket_local_page_ratio(l_regs, local_region_page_ratios)
                 ),
             )
         )

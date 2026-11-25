@@ -65,8 +65,7 @@ class IluNixlPushBaseConnectorScheduler(NixlBaseConnectorScheduler):
         self.dsv41_layout = resolve_dsv41_layout(vllm_config)
         validate_decode_pp_split(vllm_config, self.dsv41_layout)
         is_consumer = (
-            getattr(vllm_config.kv_transfer_config, "kv_role", None)
-            == "kv_consumer"
+            getattr(vllm_config.kv_transfer_config, "kv_role", None) == "kv_consumer"
         )
         self.prefix_replay_alignment = compute_prefix_replay_alignment(
             vllm_config,
@@ -166,12 +165,10 @@ class IluNixlPushBaseConnectorScheduler(NixlBaseConnectorScheduler):
         ):
             return True
         ssm_blocks = getattr(self, "_ssm_spec_blocks", ())
-        if (
+        return (
             transfer_group_idx < len(ssm_blocks)
             and ssm_blocks[transfer_group_idx] is not None
-        ):
-            return True
-        return False
+        )
 
     def compute_remote_block_starts(self, blocks) -> list[int]:
         """Per D transfer group, index in P's block list of the first block D asks for.
@@ -208,9 +205,7 @@ class IluNixlPushBaseConnectorScheduler(NixlBaseConnectorScheduler):
             ]
 
         full_transfer = self.kv_cache_config.select_transfer_block_ids(full_all)
-        unhashed_transfer = self.kv_cache_config.select_transfer_block_ids(
-            unhashed_all
-        )
+        unhashed_transfer = self.kv_cache_config.select_transfer_block_ids(unhashed_all)
         starts: list[int] = []
         for idx, (full_grp, unhashed_grp) in enumerate(
             zip(full_transfer, unhashed_transfer)
@@ -224,9 +219,7 @@ class IluNixlPushBaseConnectorScheduler(NixlBaseConnectorScheduler):
     def get_exchange_clipped_blocks(
         self, block_ids: BlockIds, clip_ssm: bool = True
     ) -> BlockIds:
-        clipped = super().get_exchange_clipped_blocks(
-            block_ids, clip_ssm=clip_ssm
-        )
+        clipped = super().get_exchange_clipped_blocks(block_ids, clip_ssm=clip_ssm)
         if not clipped:
             return clipped
         ilu_clips = getattr(self, "_ilu_group_clips", ())
@@ -432,11 +425,7 @@ class IluNixlPushBaseConnectorScheduler(NixlBaseConnectorScheduler):
                 peers[r_eid] = peer
                 continue
             p_meta = proxy_cache.get(r_eid)
-            if (
-                p_meta is None
-                and rid in meta.reqs_to_recv
-                and callable(query_proxy)
-            ):
+            if p_meta is None and rid in meta.reqs_to_recv and callable(query_proxy):
                 p_meta = query_proxy(r_eid)
             side_addr = (
                 str(p_meta.get("side_channel_addr") or "")

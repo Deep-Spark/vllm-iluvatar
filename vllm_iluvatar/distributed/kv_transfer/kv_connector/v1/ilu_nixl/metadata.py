@@ -108,7 +108,7 @@ def encode_structured_notif(
     return (
         f"{ILU_STRUCTURED_NOTIF_PREFIX}{status}:{sender_tag}:"
         f"{expected_consumers}:{req_id}"
-    ).encode("utf-8")
+    ).encode()
 
 
 def decode_structured_notif(

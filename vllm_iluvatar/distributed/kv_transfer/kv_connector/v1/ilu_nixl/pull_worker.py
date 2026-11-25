@@ -99,8 +99,7 @@ class IluNixlPullConnectorWorker(IluNixlWorkerMixin, NixlPullConnectorWorker):
             seen_senders = self._notif_seen_senders_by_req[req_id]
             if sender_tag in seen_senders:
                 logger.warning(
-                    "Ignoring duplicate consumer notification for request %s "
-                    "from %s",
+                    "Ignoring duplicate consumer notification for request %s from %s",
                     req_id,
                     sender_tag,
                 )

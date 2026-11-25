@@ -287,9 +287,7 @@ def _to_fp8_ds_mla_wire_spec(
         # Bounded-replay skips compressor rings from transfer; keep geometry.
         return spec
     if isinstance(spec, MLAAttentionSpec):
-        target_bs = _resolve_target_wire_block_size(
-            spec, layer_name, wire_block_size
-        )
+        target_bs = _resolve_target_wire_block_size(spec, layer_name, wire_block_size)
         is_indexer_cache = layer_name is not None and ".indexer." in layer_name
         if is_indexer_cache:
             wire_head_size = (
@@ -410,7 +408,10 @@ def _to_fp8_ds_mla_wire_spec(
         elif spec.sliding_window == 128:
             block_size = 8
             align = 576
-        elif getattr(spec, "sliding_window", 0) and getattr(spec, "sliding_window", 0) > 0:
+        elif (
+            getattr(spec, "sliding_window", 0)
+            and getattr(spec, "sliding_window", 0) > 0
+        ):
             tps = max(1, int(getattr(spec, "tokens_per_state", 1) or 1))
             block_size = max(
                 1,

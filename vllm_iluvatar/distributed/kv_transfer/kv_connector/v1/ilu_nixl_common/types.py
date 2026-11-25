@@ -172,8 +172,8 @@ def format_push_notif(
     if src_pp is not None and src_tp is not None:
         return (
             f"{req_id}:{tp_size}:{pp_producers}@{src_pp},{src_tp},{status}"
-        ).encode("utf-8")
-    return f"{req_id}:{tp_size}:{pp_producers}".encode("utf-8")
+        ).encode()
+    return f"{req_id}:{tp_size}:{pp_producers}".encode()
 
 
 def parse_push_notif(msg: str) -> PushNotifParsed:

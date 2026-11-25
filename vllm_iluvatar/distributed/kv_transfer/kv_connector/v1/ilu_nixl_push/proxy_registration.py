@@ -37,7 +37,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
-    from vllm.config import VllmConfig
+    pass
 
 logger = init_logger(__name__)
 
@@ -87,9 +87,7 @@ class ProxyRegistrationMixin:
         self._proxy_writer: asyncio.StreamWriter | None = None
         self._proxy_server_addr: str = ""
         self._proxy_meta_cache: dict[str, dict[str, Any]] = {}
-        self._disconnected_peer_engines: queue.SimpleQueue[str] = (
-            queue.SimpleQueue()
-        )
+        self._disconnected_peer_engines: queue.SimpleQueue[str] = queue.SimpleQueue()
 
     def _stop_proxy_registration(self) -> None:
         stop = getattr(self, "_proxy_stop", None)
@@ -176,9 +174,7 @@ class ProxyRegistrationMixin:
         )
         return {
             "server_addr": getattr(self, "_proxy_server_addr", "") or _server_addr(),
-            "side_channel_addr": (
-                f"{self.side_channel_host}:{self.side_channel_port}"
-            ),
+            "side_channel_addr": (f"{self.side_channel_host}:{self.side_channel_port}"),
             "pp_size": int(getattr(parallel, "pipeline_parallel_size", 1)),
             "tp_size": int(getattr(parallel, "tensor_parallel_size", 1)),
             "engine_id": self.engine_id,
@@ -228,9 +224,7 @@ class ProxyRegistrationMixin:
             try:
                 self._proxy_writer = writer
                 node_info = self._proxy_node_info()
-                writer.write(
-                    msgspec.msgpack.encode((PUT_NODE_META_MSG, node_info, {}))
-                )
+                writer.write(msgspec.msgpack.encode((PUT_NODE_META_MSG, node_info, {})))
                 writer.write(INFO_DONE)
                 await writer.drain()
                 connected_at = time.monotonic()

@@ -24,9 +24,9 @@ from vllm.logger import init_logger
 from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.kv_cache_interface import CircularBufferSpec
 
+from ..ilu_nixl_common.dsv41 import resolve_dsv41_layout, validate_decode_pp_split
 from ..ilu_nixl_common.pool_directory import PoolDirectory
 from ..ilu_nixl_common.types import resolve_remote_block_ids
-from ..ilu_nixl_common.dsv41 import resolve_dsv41_layout, validate_decode_pp_split
 from .fp8_layout import use_fp8_ds_mla_wire_staging
 from .metadata import (
     GET_META_BATCH_MSG,
@@ -68,7 +68,9 @@ class IluNixlBaseConnectorScheduler(NixlBaseConnectorScheduler):
                     vllm_config, self.kv_cache_config
                 )
         except Exception:
-            logger.debug("PrefixSchedulerState unavailable; skipping E25 attach", exc_info=True)
+            logger.debug(
+                "PrefixSchedulerState unavailable; skipping E25 attach", exc_info=True
+            )
 
         self.fp8_wire_staging_enabled = use_fp8_ds_mla_wire_staging(vllm_config)
         if self.fp8_wire_staging_enabled:
@@ -134,8 +136,7 @@ class IluNixlBaseConnectorScheduler(NixlBaseConnectorScheduler):
                 else:
                     self._ilu_group_clips.append(slice(0, 1))
             elif not getattr(spec, "prefix_cacheable", True) and (
-                idx >= len(self._ssm_spec_blocks)
-                or self._ssm_spec_blocks[idx] is None
+                idx >= len(self._ssm_spec_blocks) or self._ssm_spec_blocks[idx] is None
             ):
                 self._ilu_group_clips.append(slice(0, 0))
             else:
@@ -143,15 +144,22 @@ class IluNixlBaseConnectorScheduler(NixlBaseConnectorScheduler):
 
     def _is_group_clipped(self, transfer_group_idx: int) -> bool:
         ilu_clips = getattr(self, "_ilu_group_clips", ())
-        if transfer_group_idx < len(ilu_clips) and ilu_clips[transfer_group_idx] is not None:
+        if (
+            transfer_group_idx < len(ilu_clips)
+            and ilu_clips[transfer_group_idx] is not None
+        ):
             return True
         blocks_per_sw = getattr(self, "blocks_per_sw", ())
-        if transfer_group_idx < len(blocks_per_sw) and blocks_per_sw[transfer_group_idx]:
+        if (
+            transfer_group_idx < len(blocks_per_sw)
+            and blocks_per_sw[transfer_group_idx]
+        ):
             return True
         ssm_blocks = getattr(self, "_ssm_spec_blocks", ())
-        if transfer_group_idx < len(ssm_blocks) and ssm_blocks[transfer_group_idx] is not None:
-            return True
-        return False
+        return (
+            transfer_group_idx < len(ssm_blocks)
+            and ssm_blocks[transfer_group_idx] is not None
+        )
 
     def compute_remote_block_starts(self, blocks) -> list[int]:
         """Per transfer group, index in P's block list of the first block D asks for."""
@@ -335,7 +343,9 @@ class IluNixlBaseConnectorScheduler(NixlBaseConnectorScheduler):
 
                 # 3. Single-rank handshake query (2-tuple global rank or 3-tuple (pp, tp))
                 if not isinstance(decoded_msg, (tuple, list)):
-                    logger.error("IluNixl listener: invalid handshake message %r", decoded_msg)
+                    logger.error(
+                        "IluNixl listener: invalid handshake message %r", decoded_msg
+                    )
                     continue
                 is_pp_aware_query = False
                 if len(decoded_msg) == 2:
@@ -345,11 +355,15 @@ class IluNixlBaseConnectorScheduler(NixlBaseConnectorScheduler):
                     target_rank = target_pp_rank * tp_size + target_tp_rank
                     is_pp_aware_query = True
                 else:
-                    logger.error("IluNixl listener: invalid handshake message %r", decoded_msg)
+                    logger.error(
+                        "IluNixl listener: invalid handshake message %r", decoded_msg
+                    )
                     continue
 
                 if msg_tag != GET_META_MSG:
-                    logger.warning("Connection listener got unexpected message %s", msg_tag)
+                    logger.warning(
+                        "Connection listener got unexpected message %s", msg_tag
+                    )
                     continue
                 if not isinstance(target_rank, int) or target_rank not in encoded_data:
                     logger.error(
@@ -438,9 +452,7 @@ class IluNixlBaseConnectorScheduler(NixlBaseConnectorScheduler):
         hashes_map: dict[str, list[dict[int, Any]]] = getattr(
             self, "_fp8_block_hashes", {}
         )
-        staged_map: dict[str, list[set[int]]] = getattr(
-            self, "_fp8_staged_blocks", {}
-        )
+        staged_map: dict[str, list[set[int]]] = getattr(self, "_fp8_staged_blocks", {})
         chunk_pipe = getattr(self, "_fp8_chunk_pipeline_enabled", False)
         n_compute_groups = len(self.kv_cache_config.kv_cache_groups)
 
@@ -552,9 +564,7 @@ class IluNixlBaseConnectorScheduler(NixlBaseConnectorScheduler):
             for g_id, grp_blocks in enumerate(exported_block_ids):
                 already = staged_sets[g_id] if staged_sets else set()
                 g_hashes = (
-                    req_hashes[g_id]
-                    if req_hashes and g_id < len(req_hashes)
-                    else None
+                    req_hashes[g_id] if req_hashes and g_id < len(req_hashes) else None
                 )
                 need_ids = [
                     bid

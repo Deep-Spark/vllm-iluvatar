@@ -20,13 +20,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
+from ..ilu_nixl_common.dsv41 import resolve_dsv41_layout, validate_decode_pp_split
 from ..ilu_nixl_common.types import (
     HmaTransferRoute as _HmaTransferRoute,
 )
 from ..ilu_nixl_common.types import (
     RegionPairing,
 )
-from ..ilu_nixl_common.dsv41 import resolve_dsv41_layout, validate_decode_pp_split
 from .fp8_layout import use_fp8_ds_mla_wire_staging
 from .io_actor_mixin import IluNixlIoActorMixin, _IluCompletionBatch
 from .metadata import IluNixlTransferRegion
@@ -132,7 +132,9 @@ class IluNixlWorkerMixin(
         self._selected_ssm_remote_region_ids: dict[str, dict[int, list[int]]] = {}
         self._remote_pp_size_by_engine: dict[str, int] = {}
         self._remote_pp_split_by_engine: dict[str, str] = {}
-        self._compiled_desc_buckets: dict[str, dict[int, list[_CompiledDescBucket]]] = {}
+        self._compiled_desc_buckets: dict[
+            str, dict[int, list[_CompiledDescBucket]]
+        ] = {}
         self._pending_heartbeats_by_engine: dict[str, set[str]] = defaultdict(set)
         self._handshake_payload_cache: dict[tuple[str, int, int], bytes] = {}
         self._active_sessions = {}
@@ -143,9 +145,7 @@ class IluNixlWorkerMixin(
         transfer_cfg = getattr(vllm_config, "kv_transfer_config", None)
         get_extra = getattr(transfer_cfg, "get_from_extra_config", None)
         self._consumer_disconnect_grace = float(
-            30.0
-            if get_extra is None
-            else get_extra("consumer_disconnect_grace", 30.0)
+            30.0 if get_extra is None else get_extra("consumer_disconnect_grace", 30.0)
         )
         io_thread_cfg = (
             True if get_extra is None else get_extra("enable_ilu_io_thread", True)

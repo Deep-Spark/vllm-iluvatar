@@ -279,9 +279,8 @@ def _to_wire_spec(
         )
 
     if isinstance(spec, SlidingWindowMLASpec):
-        if (
-            (_is_compressed_main_cache(spec) or _is_main_ds_v41_cache(spec))
-            and (layer_name is None or ".state_cache" not in layer_name)
+        if (_is_compressed_main_cache(spec) or _is_main_ds_v41_cache(spec)) and (
+            layer_name is None or ".state_cache" not in layer_name
         ):
             return _main_fp8_wire_spec(spec, model_version="deepseek_v4", alignment=64)
         if (
@@ -347,10 +346,7 @@ def _indexer_wire_spec(
     is_v41 = prefer_v41 or (
         getattr(spec, "model_version", None) == "deepseek_v41"
         or getattr(spec, "cache_dtype_str", None) == _SPLIT_INDEXER_DTYPE
-        or (
-            getattr(spec, "alignment", 576) != 576
-            and spec.head_size not in (128, 132)
-        )
+        or (getattr(spec, "alignment", 576) != 576 and spec.head_size not in (128, 132))
     )
     if spec.head_size in (128, 132):
         wire_head_size = 132
@@ -464,9 +460,7 @@ def group_page_ratios(
     for group, target_group in zip(compute_groups, target_groups):
         if not group.layer_names:
             ratios.append(
-                page_ratio_for(
-                    None, group.kv_cache_spec, target_group.kv_cache_spec
-                )
+                page_ratio_for(None, group.kv_cache_spec, target_group.kv_cache_spec)
             )
             continue
         group_ratios = {
@@ -699,9 +693,7 @@ def stage_unit_bytes(
             ratio = page_ratio_for(
                 layer_name, compute_specs[layer_name], target_specs[layer_name]
             )
-            per_batch[key] = (
-                per_batch.get(key, 0) + ratio * page_bytes[layer_name]
-            )
+            per_batch[key] = per_batch.get(key, 0) + ratio * page_bytes[layer_name]
     units = [0] * len(compute_groups)
     for (group_idx, _), value in per_batch.items():
         units[group_idx] = max(units[group_idx], value)
@@ -733,9 +725,7 @@ def wire_scratch_bytes(
     """GPU bytes to carve out of the KV budget for quantization scratch."""
     cfg = HeteroDtypeConfig.from_vllm_config(vllm_config)
     units = stage_unit_bytes(compute_groups, wire_groups, cfg.layerwise)
-    rows = stage_rows(
-        vllm_config, compute_groups, cfg.layerwise, cfg.staging_blocks
-    )
+    rows = stage_rows(vllm_config, compute_groups, cfg.layerwise, cfg.staging_blocks)
     return SCRATCH_BUFFER_COUNT * sum(r * u for r, u in zip(rows, units))
 
 
@@ -833,15 +823,13 @@ class WirePlan:
                     group_spec = replace(
                         group_spec,
                         kv_cache_specs={
-                            name: pool_specs[name]
-                            for name in group.layer_names
+                            name: pool_specs[name] for name in group.layer_names
                         },
                     )
                 else:
                     group_spec = pool_specs[group.layer_names[0]]
                     if any(
-                        pool_specs[name] != group_spec
-                        for name in group.layer_names[1:]
+                        pool_specs[name] != group_spec for name in group.layer_names[1:]
                     ):
                         raise ValueError(
                             "A non-uniform pool page expansion requires "
@@ -906,9 +894,7 @@ class WirePlan:
             byte_offset=byte_offset,
             quant_kind={
                 name: (
-                    quant_kind_for(
-                        name, target_specs[name], compute_specs[name]
-                    )
+                    quant_kind_for(name, target_specs[name], compute_specs[name])
                     if hetero
                     else COPY_ONLY
                 )

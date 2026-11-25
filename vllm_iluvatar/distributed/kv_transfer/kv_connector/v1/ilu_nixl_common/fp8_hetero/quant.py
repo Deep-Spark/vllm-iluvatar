@@ -51,9 +51,7 @@ def _quantize_indexer_wire_kernel(
     if SUBPAGE_RATIO > 1:
         p_block_id = raw_block_id // SUBPAGE_RATIO
         subpage_id = raw_block_id % SUBPAGE_RATIO
-        block_base = (
-            p_block_id * destination_block_stride + subpage_id * SUBPAGE_STRIDE
-        )
+        block_base = p_block_id * destination_block_stride + subpage_id * SUBPAGE_STRIDE
     else:
         block_base = raw_block_id * destination_block_stride
     data_offset = block_base + block_offset * HEAD_SIZE
@@ -134,8 +132,7 @@ def _valid_entries(
     block_size = source_spec.block_size
     compress_ratio = spec_tokens_per_state(source_spec)
     return [
-        min(max(num_valid_tokens - page * block_size, 0), block_size)
-        // compress_ratio
+        min(max(num_valid_tokens - page * block_size, 0), block_size) // compress_ratio
         for page in range(first_page, first_page + num_blocks)
     ]
 
@@ -188,9 +185,7 @@ def _dense_rows_and_slots(
         .contiguous()
         .reshape(num_blocks, tokens_per_page, source_spec.head_size)
     )
-    counts = _valid_entries(
-        source_spec, num_blocks, first_page, num_valid_tokens
-    )
+    counts = _valid_entries(source_spec, num_blocks, first_page, num_valid_tokens)
     flat = selected.reshape(-1, source_spec.head_size)
     total = sum(counts)
     prefix = all(c == tokens_per_page for c in counts[:-1])
@@ -258,13 +253,13 @@ def _dequant_compressed_rows(
         # Signed nibble: values 8..15 are negative.
         low = torch.where(low >= 8, low - 16, low)
         high = torch.where(high >= 8, high - 16, high)
-        values = torch.stack((low, high), dim=-1).reshape(
-            payload_rows.shape[0], head_dim
-        ).to(torch.float32)
-    else:
-        raise ValueError(
-            f"Unsupported compressed KV format for FP8 wire: {fmt_name}"
+        values = (
+            torch.stack((low, high), dim=-1)
+            .reshape(payload_rows.shape[0], head_dim)
+            .to(torch.float32)
         )
+    else:
+        raise ValueError(f"Unsupported compressed KV format for FP8 wire: {fmt_name}")
     scaled = values.view(-1, groups, group_size) * scale_rows.to(
         torch.float32
     ).unsqueeze(-1)
@@ -308,9 +303,7 @@ def _gather_compressed_rows(
         .contiguous()
         .reshape(num_blocks, tokens_per_page, scale_groups)
     )
-    counts = _valid_entries(
-        source_spec, num_blocks, first_page, num_valid_tokens
-    )
+    counts = _valid_entries(source_spec, num_blocks, first_page, num_valid_tokens)
     flat_payload = selected.reshape(num_blocks * tokens_per_page, selected.shape[-1])
     flat_scales = selected_scales.reshape(
         num_blocks * tokens_per_page, selected_scales.shape[-1]
@@ -457,12 +450,10 @@ def quantize_layer(
         )
         for start, end, count in _run_lengths(counts):
             if count:
-                selected = source.index_select(
-                    0, source_block_ids[start:end]
-                ).narrow(token_dim, 0, count)
-                destination_view[start:end].narrow(
+                selected = source.index_select(0, source_block_ids[start:end]).narrow(
                     token_dim, 0, count
-                ).copy_(selected)
+                )
+                destination_view[start:end].narrow(token_dim, 0, count).copy_(selected)
         return
 
     if kind == QUANT_PACK:
@@ -471,7 +462,11 @@ def quantize_layer(
                 f"QUANT_PACK requires a BF16 producer cache, got {source.dtype}"
             )
         rows, slot_mapping = _dense_rows_and_slots(
-            source, source_spec, source_block_ids, first_page, num_valid_tokens,
+            source,
+            source_spec,
+            source_block_ids,
+            first_page,
+            num_valid_tokens,
             num_manager_blocks=num_manager_blocks,
         )
         if rows.shape[1] != 512:
@@ -576,13 +571,10 @@ def quantize_layer(
             return
 
         # Split INT8 indexer: uint8 head_size=128 payload + FP32 scale plane.
-        if (
-            getattr(source_spec, "cache_dtype_str", None) == "int8_indexer_split"
-            or (
-                source.dtype == torch.uint8
-                and source_spec.head_size == 128
-                and source_scales is not None
-            )
+        if getattr(source_spec, "cache_dtype_str", None) == "int8_indexer_split" or (
+            source.dtype == torch.uint8
+            and source_spec.head_size == 128
+            and source_scales is not None
         ):
             if source_scales is None:
                 raise ValueError(
@@ -683,7 +675,11 @@ def quantize_layer(
                 f"got dtype={source.dtype}, head_size={source_spec.head_size}"
             )
         rows, slot_mapping = _dense_rows_and_slots(
-            source, source_spec, source_block_ids, first_page, num_valid_tokens,
+            source,
+            source_spec,
+            source_block_ids,
+            first_page,
+            num_valid_tokens,
             num_manager_blocks=num_manager_blocks,
         )
         if rows.numel() == 0:
@@ -720,7 +716,11 @@ def quantize_layer(
             f"{layer_name}: {source_real_size} != "
             f"{ratio} * {target_real_size}"
         )
-    selected = _group_manager_blocks(source, num_manager_blocks).index_select(0, source_block_ids).contiguous()
+    selected = (
+        _group_manager_blocks(source, num_manager_blocks)
+        .index_select(0, source_block_ids)
+        .contiguous()
+    )
     selected_bytes = selected.view(torch.uint8).reshape(source_block_ids.numel(), -1)
     if selected_bytes.shape[1] != source_real_size:
         raise ValueError(

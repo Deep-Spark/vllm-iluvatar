@@ -148,7 +148,9 @@ def test_mixed_real_and_idle_dummy_runs_normal_agreement(monkeypatch):
 
     def reduce(tensor, group):
         # Rank 0 is running a real decode batch (row 7 == 0); rank 1 is idle dummy (row 7 == 1).
-        tensor[:, 0] = torch.tensor([6, Mode.FULL.value, 6, -1, 0, 1, 1, 0], dtype=torch.int32)
+        tensor[:, 0] = torch.tensor(
+            [6, Mode.FULL.value, 6, -1, 0, 1, 1, 0], dtype=torch.int32
+        )
 
     monkeypatch.setattr(merged.dist, "all_reduce", reduce)
     monkeypatch.setattr(

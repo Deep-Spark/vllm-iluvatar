@@ -1676,6 +1676,7 @@ def test_glm5_hetero_mamba_align_uses_kernel_pages_and_preserves_kpool_tail():
         KVCacheGroupSpec,
         UniformTypeKVCacheSpecs,
     )
+
     from vllm_iluvatar.distributed.kv_transfer.kv_connector.v1.ilu_nixl.base_scheduler import (
         IluNixlBaseConnectorScheduler,
     )
@@ -1930,8 +1931,8 @@ def test_glm5_hetero_mamba_align_uses_kernel_pages_and_preserves_kpool_tail():
         nixl = MagicMock()
         nixl.get_agent_metadata.return_value = b"agent"
         nixl.get_reg_descs.side_effect = lambda ranges, mt: (ranges, mt)
-        nixl.register_memory.side_effect = lambda descs, backends=None: reg_calls.append(
-            descs
+        nixl.register_memory.side_effect = (
+            lambda descs, backends=None: reg_calls.append(descs)
         )
         nixl.get_xfer_descs.side_effect = lambda arr, mt: (arr, mt)
         nixl.prep_xfer_dlist.side_effect = lambda agent, descs: (
@@ -2036,8 +2037,21 @@ def test_glm5_hetero_mamba_align_uses_kernel_pages_and_preserves_kpool_tail():
         block_ids_list=[(list(range(72)), 70)],
         convert=False,
     )
-    assert int(d_caches["language_model.model.layers.3.self_attn.attn"][70].view(torch.uint8).sum().item()) == 0
-    assert int(d_caches["language_model.model.layers.3.self_attn.attn"][69].view(torch.uint8).sum().item()) > 0
-
-
-
+    assert (
+        int(
+            d_caches["language_model.model.layers.3.self_attn.attn"][70]
+            .view(torch.uint8)
+            .sum()
+            .item()
+        )
+        == 0
+    )
+    assert (
+        int(
+            d_caches["language_model.model.layers.3.self_attn.attn"][69]
+            .view(torch.uint8)
+            .sum()
+            .item()
+        )
+        > 0
+    )

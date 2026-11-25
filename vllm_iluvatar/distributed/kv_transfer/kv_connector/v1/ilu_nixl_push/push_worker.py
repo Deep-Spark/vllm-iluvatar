@@ -18,8 +18,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorTransferResults,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
-    NixlConnectorMetadata,
     PUSH_REG_NOTIF_PREFIX,
+    NixlConnectorMetadata,
     RemoteMeta,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
@@ -42,18 +42,6 @@ from ..ilu_nixl_common.dsv41 import (
     resolve_dsv41_layout,
     validate_decode_pp_split,
 )
-from ..ilu_nixl_common.types import (
-    format_push_notif,
-    parse_push_notif,
-)
-from .base_worker import IluNixlPushWorkerMixin
-from .chunk_tracker import (
-    BaseReqIndex,
-    ChunkTrackerMixin,
-    _CHUNK_PROGRESS_PREFIX,
-    _ChunkBulkTask,
-    request_id_match_keys,
-)
 from ..ilu_nixl_common.fp8_hetero.wire_layout import (
     HeteroDtypeConfig,
     WirePlan,
@@ -61,6 +49,17 @@ from ..ilu_nixl_common.fp8_hetero.wire_layout import (
 )
 from ..ilu_nixl_common.fp8_hetero.xfer_trace import ENABLED as TRACE
 from ..ilu_nixl_common.fp8_hetero.xfer_trace import trace
+from ..ilu_nixl_common.types import (
+    format_push_notif,
+    parse_push_notif,
+)
+from .base_worker import IluNixlPushWorkerMixin
+from .chunk_tracker import (
+    _CHUNK_PROGRESS_PREFIX,
+    ChunkTrackerMixin,
+    _ChunkBulkTask,
+    request_id_match_keys,
+)
 from .handshake import HandshakeMixin, _HandshakeInstallTask
 from .metadata import (
     ChunkPushPlan,
@@ -109,7 +108,7 @@ class IluNixlPushConnectorWorkerMixin(
     """Single-Owner Push PD worker mixin with Write-Once & CompiledXferPlan."""
 
     _hetero_cfg = HeteroDtypeConfig()
-    _wire_plan: "WirePlan | None" = None
+    _wire_plan: WirePlan | None = None
     _pool = None
     _pipeline = None
     _stager = None
@@ -151,9 +150,7 @@ class IluNixlPushConnectorWorkerMixin(
         self._pending_engine_evictions: set[str] = set()
 
         # V2 bitset notification state on D
-        self._recv_notif_bitsets: dict[str, set[tuple[int, int]]] = defaultdict(
-            set
-        )
+        self._recv_notif_bitsets: dict[str, set[tuple[int, int]]] = defaultdict(set)
         self._failed_pre_recvs: set[str] = set()
 
         parallel_config = getattr(vllm_config, "parallel_config", None)
@@ -259,9 +256,7 @@ class IluNixlPushConnectorWorkerMixin(
             self.kv_transfer_config.get_from_extra_config("kv_lease_duration", 30)
         )
         self._max_lease_renewals = int(
-            self.kv_transfer_config.get_from_extra_config(
-                "push_max_lease_renewals", 12
-            )
+            self.kv_transfer_config.get_from_extra_config("push_max_lease_renewals", 12)
         )
 
         # Chunked-bulk push state + O(1) request indices
@@ -327,9 +322,7 @@ class IluNixlPushConnectorWorkerMixin(
                             "remote_pp_size": getattr(
                                 meta, "remote_pp_size", meta.pp_size
                             ),
-                            "remote_pp_split": getattr(
-                                meta, "remote_pp_split", ""
-                            )
+                            "remote_pp_split": getattr(meta, "remote_pp_split", "")
                             or "",
                         }
                 else:
@@ -524,9 +517,9 @@ class IluNixlPushConnectorWorkerMixin(
                         for rid in done_send:
                             if hasattr(self, "_inflight_send_engines"):
                                 self._inflight_send_engines.pop(rid, None)
-                            target = getattr(
-                                self, "_inflight_send_targets", {}
-                            ).pop(rid, None)
+                            target = getattr(self, "_inflight_send_targets", {}).pop(
+                                rid, None
+                            )
                             if rid in failed_send and target is not None:
                                 failed_targets[rid] = target
                     for rid, (dst_eid, rem_req_id, rkeys) in failed_targets.items():
@@ -611,8 +604,7 @@ class IluNixlPushConnectorWorkerMixin(
             premature_done = {
                 rid
                 for rid in done_req_ids
-                if rid in open_req_ids
-                or self._chunk_matches_any(rid, open_req_ids)
+                if rid in open_req_ids or self._chunk_matches_any(rid, open_req_ids)
             }
             # Intermediate chunks complete before the final chunk is submitted;
             # suppress per-chunk completion here and let the terminal chunk emit
@@ -641,14 +633,10 @@ class IluNixlPushConnectorWorkerMixin(
     def _convert_remote_logical_block_ids(
         self, block_ids, remote_physical_per_logical: int
     ):
-        legacy_converter = getattr(
-            self, "_logical_to_remote_kernel_block_ids", None
-        )
+        legacy_converter = getattr(self, "_logical_to_remote_kernel_block_ids", None)
         if legacy_converter is not None:
             return legacy_converter(block_ids, remote_physical_per_logical)
-        return self._logical_to_kernel_block_ids(
-            block_ids, remote_physical_per_logical
-        )
+        return self._logical_to_kernel_block_ids(block_ids, remote_physical_per_logical)
 
     def _make_pp_aware_notif_id(
         self,
@@ -820,12 +808,8 @@ class IluNixlPushConnectorWorkerMixin(
         plan = self.tp_mappings[engine_id]
         remote_info = self.transfer_topo.get_engine_info(engine_id)
         tp_ratio = self.transfer_topo.tp_ratio(remote_info.remote_tp_size)
-        is_progress_only = meta.remote.request_id.startswith(
-            _CHUNK_PROGRESS_PREFIX
-        )
-        inactive_keys = getattr(self, "_inactive_remote_keys", {}).get(
-            engine_id, set()
-        )
+        is_progress_only = meta.remote.request_id.startswith(_CHUNK_PROGRESS_PREFIX)
+        inactive_keys = getattr(self, "_inactive_remote_keys", {}).get(engine_id, set())
         remote_agents = self._remote_agents.get(engine_id, {})
 
         if getattr(self, "_empty_producer_rank", False):
@@ -886,15 +870,16 @@ class IluNixlPushConnectorWorkerMixin(
             active_rkeys.append(remote_key)
             remote_tp_rank = remote_key % remote_info.remote_tp_size
 
-            def _group_targets_rank(g: int) -> bool:
-                is_ssm_grp = (
-                    g < len(group_spec_types)
-                    and _is_ssm_spec(group_spec_types[g])
+            def _group_targets_rank(
+                g: int, *, _remote_tp_rank: int = remote_tp_rank
+            ) -> bool:
+                is_ssm_grp = g < len(group_spec_types) and _is_ssm_spec(
+                    group_spec_types[g]
                 )
                 if is_ssm_grp:
                     return (
                         g < len(plan.source_ranks_per_group)
-                        and remote_tp_rank in plan.source_ranks_per_group[g]
+                        and _remote_tp_rank in plan.source_ranks_per_group[g]
                     )
                 if skip_replicated_mla_follower:
                     return False
@@ -902,29 +887,23 @@ class IluNixlPushConnectorWorkerMixin(
                     return True
                 return (
                     g < len(plan.source_ranks_per_group)
-                    and remote_tp_rank in plan.source_ranks_per_group[g]
+                    and _remote_tp_rank in plan.source_ranks_per_group[g]
                 )
 
             if uses_logical_pair_routing:
                 read_spec = ReadSpec(
                     remote_rank=remote_key,
                     local_block_ids=[
-                        list(local_logical_ids[g])
-                        if _group_targets_rank(g)
-                        else []
+                        list(local_logical_ids[g]) if _group_targets_rank(g) else []
                         for g in range(num_local_groups)
                     ],
-                    remote_block_ids=[
-                        list(grp) for grp in remote_logical_ids
-                    ],
+                    remote_block_ids=[list(grp) for grp in remote_logical_ids],
                 )
             else:
                 read_spec = ReadSpec(
                     remote_rank=remote_key,
                     local_block_ids=[
-                        list(local_logical_ids[g])
-                        if _group_targets_rank(g)
-                        else []
+                        list(local_logical_ids[g]) if _group_targets_rank(g) else []
                         for g in range(num_local_groups)
                     ],
                     remote_block_ids=[
@@ -938,21 +917,15 @@ class IluNixlPushConnectorWorkerMixin(
             if self._needs_split_local_xfer_handles(tp_ratio, plan):
                 split_idx = plan.all_source_ranks.index(remote_tp_rank)
                 split_key = (tp_ratio, remote_info.remote_block_size)
-                handles_by_ratio = self.src_xfer_handles_by_tp_ratio.get(
-                    split_key
-                )
+                handles_by_ratio = self.src_xfer_handles_by_tp_ratio.get(split_key)
                 if handles_by_ratio is None:
-                    handles_by_ratio = self.src_xfer_handles_by_tp_ratio[
-                        tp_ratio
-                    ]
+                    handles_by_ratio = self.src_xfer_handles_by_tp_ratio[tp_ratio]
                 local_xfer_side_handle = handles_by_ratio[split_idx]
             else:
                 local_xfer_side_handle = self._local_xfer_handle(
                     remote_info.remote_block_size
                 )
-            remote_xfer_side_handle = self.dst_xfer_side_handles[engine_id][
-                remote_key
-            ]
+            remote_xfer_side_handle = self.dst_xfer_side_handles[engine_id][remote_key]
             handle = self._xfer_blocks(
                 read_spec=read_spec,
                 dst_engine_id=engine_id,
@@ -1049,9 +1022,7 @@ class IluNixlPushConnectorWorkerMixin(
             or not any(remote_block_ids)
         ):
             if not is_progress_only:
-                agent_name = self._remote_agents.get(dst_engine_id, {}).get(
-                    remote_key
-                )
+                agent_name = self._remote_agents.get(dst_engine_id, {}).get(remote_key)
                 if agent_name is not None:
                     self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
             return None
@@ -1073,12 +1044,10 @@ class IluNixlPushConnectorWorkerMixin(
         ):
             if uses_logical_pair_routing:
                 local_block_ids = [
-                    expand_logical_group(grp, local_ratio)
-                    for grp in local_block_ids
+                    expand_logical_group(grp, local_ratio) for grp in local_block_ids
                 ]
                 remote_block_ids = [
-                    expand_logical_group(grp, remote_ratio)
-                    for grp in remote_block_ids
+                    expand_logical_group(grp, remote_ratio) for grp in remote_block_ids
                 ]
             local_block_ids, remote_block_ids = (
                 self._map_block_ids_for_block_size_ratio(
@@ -1159,17 +1128,9 @@ class IluNixlPushConnectorWorkerMixin(
                         req_id=request_id,
                         local_group_idx=l_gid,
                     )
-                    if (
-                        grp_local
-                        and not bucket.is_ssm
-                        and uses_logical_pair_routing
-                    ):
-                        grp_local = expand_logical_group(
-                            grp_local, bucket_local_ratio
-                        )
-                        grp_remote = expand_logical_group(
-                            grp_remote, remote_ratio
-                        )
+                    if grp_local and not bucket.is_ssm and uses_logical_pair_routing:
+                        grp_local = expand_logical_group(grp_local, bucket_local_ratio)
+                        grp_remote = expand_logical_group(grp_remote, remote_ratio)
             else:
                 grp_local = list(local_block_ids[l_gid])
                 grp_remote = list(remote_block_ids[r_gid])
@@ -1187,9 +1148,7 @@ class IluNixlPushConnectorWorkerMixin(
 
         if not local_descs_list:
             if not is_progress_only:
-                agent_name = self._remote_agents.get(dst_engine_id, {}).get(
-                    remote_key
-                )
+                agent_name = self._remote_agents.get(dst_engine_id, {}).get(remote_key)
                 if agent_name is not None:
                     self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
             return None
@@ -1227,9 +1186,7 @@ class IluNixlPushConnectorWorkerMixin(
             with self._sending_transfers_lock:
                 self._send_failures.add(request_id)
             # P0-4 Fast fail-closed notification to D so D frees blocks immediately!
-            self._emit_fast_err_notif(
-                remote_request_id, dst_engine_id, remote_key
-            )
+            self._emit_fast_err_notif(remote_request_id, dst_engine_id, remote_key)
             if not self._handle_failed_transfer(request_id, handle):
                 return handle
             return None
@@ -1334,9 +1291,7 @@ class IluNixlPushConnectorWorkerMixin(
                         parsed.src_tp,
                     )
                     self._recv_notif_bitsets.pop(recv_count_key, None)
-                    self.consumer_notification_counts_by_req.pop(
-                        recv_count_key, None
-                    )
+                    self.consumer_notification_counts_by_req.pop(recv_count_key, None)
                     self._fail_d_recv_notif(req_id)
                     continue
 
@@ -1345,14 +1300,10 @@ class IluNixlPushConnectorWorkerMixin(
                 producers_per_consumer = (
                     -tp_ratio if n_producers > self.world_size else 1
                 )
-                expected_notifications = (
-                    producers_per_consumer * parsed.pp_producers
-                )
+                expected_notifications = producers_per_consumer * parsed.pp_producers
                 if expected_notifications <= 0:
                     self._recv_notif_bitsets.pop(recv_count_key, None)
-                    self.consumer_notification_counts_by_req.pop(
-                        recv_count_key, None
-                    )
+                    self.consumer_notification_counts_by_req.pop(recv_count_key, None)
                     recv_req_id = self._resolve_recving_req_id(req_id)
                     if recv_req_id is not None:
                         self._complete_d_recv_notif(recv_req_id)
@@ -1386,9 +1337,7 @@ class IluNixlPushConnectorWorkerMixin(
                     )
                     continue
                 self._recv_notif_bitsets.pop(recv_count_key, None)
-                self.consumer_notification_counts_by_req.pop(
-                    recv_count_key, None
-                )
+                self.consumer_notification_counts_by_req.pop(recv_count_key, None)
                 recv_req_id = self._resolve_recving_req_id(req_id)
                 if recv_req_id is not None:
                     self._complete_d_recv_notif(recv_req_id)
@@ -1398,12 +1347,8 @@ class IluNixlPushConnectorWorkerMixin(
 
             n_consumers = parsed.tp_size
             tp_ratio = self.transfer_topo.tp_ratio(n_consumers)
-            consumers_per_producer = (
-                -tp_ratio if n_consumers > self.world_size else 1
-            )
-            expected_notifications = (
-                consumers_per_producer * parsed.pp_producers
-            )
+            consumers_per_producer = -tp_ratio if n_consumers > self.world_size else 1
+            expected_notifications = consumers_per_producer * parsed.pp_producers
             self.consumer_notification_counts_by_req[req_id] += 1
             if (
                 self.consumer_notification_counts_by_req[req_id]
@@ -1566,8 +1511,7 @@ class IluNixlPushConnectorWorkerMixin(
         retained = {
             req_id
             for req_id in done_sending
-            if req_id not in lease_expired
-            and self._chunk_should_retain(req_id)
+            if req_id not in lease_expired and self._chunk_should_retain(req_id)
         }
         if retained:
             done_sending -= retained

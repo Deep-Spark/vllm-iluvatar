@@ -147,9 +147,7 @@ class HandshakeMixin:
             return
         for remote_key, agent_name in agents.items():
             remote_pp_rank = remote_key // max(remote_tp_size, 1)
-            if not self._is_pp_leader_for_remote_stage(
-                remote_pp_rank, remote_pp_split
-            ):
+            if not self._is_pp_leader_for_remote_stage(remote_pp_rank, remote_pp_split):
                 self._push_obs_stats().skipped_redundant_push_regs += 1
                 continue
             try:
@@ -216,9 +214,7 @@ class HandshakeMixin:
             agents = dict(self._remote_agents.get(engine_id) or {})
         for remote_key, agent_name in agents.items():
             remote_pp_rank = remote_key // max(remote_tp_size, 1)
-            if not self._is_pp_leader_for_remote_stage(
-                remote_pp_rank, remote_pp_split
-            ):
+            if not self._is_pp_leader_for_remote_stage(remote_pp_rank, remote_pp_split):
                 continue
             try:
                 self.nixl_wrapper.send_notif(agent_name, notif_msg=hb_msg)
@@ -316,9 +312,7 @@ class HandshakeMixin:
                         handshake_bytes = sock.recv()
 
                     try:
-                        handshake_payload = handshake_decoder.decode(
-                            handshake_bytes
-                        )
+                        handshake_payload = handshake_decoder.decode(handshake_bytes)
                     except (msgspec.DecodeError, msgspec.ValidationError) as e:
                         raise RuntimeError(
                             "Failed to decode IluNixlPushHandshakePayload. This "
@@ -653,9 +647,7 @@ class HandshakeMixin:
                     if plan.decode_engine_id:
                         busy.add(plan.decode_engine_id)
                 for reg in getattr(self, "_chunk_registrations", {}).values():
-                    if isinstance(reg, dict) and (
-                        eid := reg.get("decode_engine_id")
-                    ):
+                    if isinstance(reg, dict) and (eid := reg.get("decode_engine_id")):
                         busy.add(eid)
         return busy
 
@@ -696,9 +688,7 @@ class HandshakeMixin:
         with self._handshake_lock:
             if getattr(self, "_handshake_futures", None):
                 return
-            replaced = set(self._remote_agents.keys()) - set(
-                push_by_addr.values()
-            )
+            replaced = set(self._remote_agents.keys()) - set(push_by_addr.values())
         if not replaced:
             return
         busy = self._engines_with_inflight_transfers()

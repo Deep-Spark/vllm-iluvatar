@@ -69,9 +69,7 @@ class PoolDirectory:
                 if b_hash is not None:
                     self._hash_by_block[(g_idx, b_int)] = b_hash
 
-    def invalidate_blocks(
-        self, group_idx: int, block_ids: Sequence[int]
-    ) -> None:
+    def invalidate_blocks(self, group_idx: int, block_ids: Sequence[int]) -> None:
         """Drop invalidated or overwritten block IDs from the ledger."""
         for bid in block_ids:
             self._hash_by_block.pop((group_idx, int(bid)), None)

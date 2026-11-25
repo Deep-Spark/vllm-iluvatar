@@ -110,9 +110,7 @@ def _group_contains_kpool_tail(spec) -> bool:
     if isinstance(spec, KpoolTailSpec):
         return True
     if isinstance(spec, UniformTypeKVCacheSpecs):
-        return any(
-            isinstance(s, KpoolTailSpec) for s in spec.kv_cache_specs.values()
-        )
+        return any(isinstance(s, KpoolTailSpec) for s in spec.kv_cache_specs.values())
     return False
 
 
@@ -146,8 +144,7 @@ class IluNixlPushConnectorScheduler(
             )
         )
         self._group_idx_to_xfer_idx: dict[int, int] = {
-            gid: xfer_idx
-            for xfer_idx, gid in enumerate(self._transfer_group_ids)
+            gid: xfer_idx for xfer_idx, gid in enumerate(self._transfer_group_ids)
         }
         self._kpool_tail_xfer_groups: tuple[bool, ...] = tuple(
             _group_contains_kpool_tail(group.kv_cache_spec)
@@ -177,9 +174,7 @@ class IluNixlPushConnectorScheduler(
         )
         target_config = getattr(kv_cache_config, "wire_kv_cache_config", None)
         if self._hetero_cfg.enabled and not is_consumer and target_config is None:
-            raise ValueError(
-                "hetero_kv_dtype scheduler requires wire_kv_cache_config"
-            )
+            raise ValueError("hetero_kv_dtype scheduler requires wire_kv_cache_config")
         self._wire_page_ratios = (
             group_page_ratios(
                 kv_cache_config.kv_cache_groups,
@@ -247,9 +242,7 @@ class IluNixlPushConnectorScheduler(
             "decode_engine_id": self.engine_id,
             "decode_host": self.side_channel_host,
             "decode_port": self.side_channel_port,
-            "decode_tp_size": (
-                self.vllm_config.parallel_config.tensor_parallel_size
-            ),
+            "decode_tp_size": (self.vllm_config.parallel_config.tensor_parallel_size),
             "decode_dcp_size": (
                 self.vllm_config.parallel_config.decode_context_parallel_size
             ),
@@ -266,9 +259,7 @@ class IluNixlPushConnectorScheduler(
             "remote_pp_split": params.get("pp_split", "") or "",
         }
 
-    def update_state_after_alloc(
-        self, request, blocks, num_external_tokens: int
-    ):
+    def update_state_after_alloc(self, request, blocks, num_external_tokens: int):
         prefix_state = getattr(self, "prefix_state", None)
         if prefix_state is not None:
             prefix_state.allocated(request, blocks, num_external_tokens)
@@ -289,9 +280,7 @@ class IluNixlPushConnectorScheduler(
         pending = self._push_pending_registrations.get(request.request_id)
         if pending is None:
             if num_external_tokens <= 0 and params is not None:
-                self._stage_release_only_registration(
-                    request.request_id, params
-                )
+                self._stage_release_only_registration(request.request_id, params)
                 self._stop_heartbeat(request.request_id)
                 params["do_remote_prefill"] = False
                 logger.info(
@@ -403,9 +392,7 @@ class IluNixlPushConnectorScheduler(
         if xfer_idx < len(kpool_groups) and kpool_groups[xfer_idx]:
             return True
         ilu_clips = getattr(self, "_ilu_group_clips", ())
-        if xfer_idx < len(ilu_clips) and ilu_clips[xfer_idx] == slice(0, 1):
-            return True
-        return False
+        return xfer_idx < len(ilu_clips) and ilu_clips[xfer_idx] == slice(0, 1)
 
     def _clip_tail_only_group_blocks(
         self, xfer_idx: int, group_blocks: list[int], page_ratio: int
@@ -458,9 +445,7 @@ class IluNixlPushConnectorScheduler(
                 return True
         # Under Write-Once sealed blocks, a group with larger block_size may
         # seal 0 blocks on an intermediate chunk while a smaller-block group seals >=1.
-        if not is_last_chunk:
-            return True
-        return False
+        return not is_last_chunk
 
     def _maybe_emit_chunk(
         self,
@@ -558,7 +543,9 @@ class IluNixlPushConnectorScheduler(
                     ),
                     end_quant_block,
                 )
-            quant_block_ids.append(tuple(group_blocks[quant_start_block:end_quant_block]))
+            quant_block_ids.append(
+                tuple(group_blocks[quant_start_block:end_quant_block])
+            )
             quant_first_pages.append(quant_start_block)
             next_quant_blocks[group_idx] = end_quant_block
 
@@ -606,9 +593,7 @@ class IluNixlPushConnectorScheduler(
                 candidate["prefill_tokens"] + target_block_size - 1
             ) // target_block_size
             retained = (
-                _retained_d_pages(
-                    candidate["prefill_tokens"], sw, target_block_size
-                )
+                _retained_d_pages(candidate["prefill_tokens"], sw, target_block_size)
                 if sw
                 else 0
             )
@@ -629,9 +614,7 @@ class IluNixlPushConnectorScheduler(
             if is_last_chunk and (request_id in self._chunk_committed):
                 # Check if every non-clipped group already emitted all its blocks earlier.
                 all_complete = all(
-                    self._xfer_group_allows_empty_chunk(
-                        xfer_idx, is_last_chunk=True
-                    )
+                    self._xfer_group_allows_empty_chunk(xfer_idx, is_last_chunk=True)
                     or next_target_blocks[self._transfer_group_ids[xfer_idx]] > 0
                     for xfer_idx in range(len(chunk_block_ids))
                 )
@@ -646,9 +629,7 @@ class IluNixlPushConnectorScheduler(
         if is_last_chunk and any(
             not group
             and next_target_blocks[self._transfer_group_ids[xfer_idx]] == 0
-            and not self._xfer_group_allows_empty_chunk(
-                xfer_idx, is_last_chunk=True
-            )
+            and not self._xfer_group_allows_empty_chunk(xfer_idx, is_last_chunk=True)
             for xfer_idx, group in enumerate(chunk_block_ids)
         ):
             if request_id in self._chunk_committed:
@@ -713,12 +694,8 @@ class IluNixlPushConnectorScheduler(
                 self._chunk_blocks.pop(request_id, None)
                 if cand := self._chunk_candidates.get(request_id):
                     cand["emitted_tokens"] = 0
-                    cand["emitted_target_blocks"] = [0] * len(
-                        self._chunk_block_sizes
-                    )
-                    cand["emitted_quant_blocks"] = [0] * len(
-                        self._chunk_block_sizes
-                    )
+                    cand["emitted_target_blocks"] = [0] * len(self._chunk_block_sizes)
+                    cand["emitted_quant_blocks"] = [0] * len(self._chunk_block_sizes)
             if request_id in block_table_updates:
                 self._chunk_blocks.pop(request_id, None)
                 new_blocks = block_table_updates[request_id]
@@ -740,13 +717,9 @@ class IluNixlPushConnectorScheduler(
         delay_free_blocks, params = super().request_finished(request, block_ids)
         if was_unallocated_remote_prefill:
             self._reqs_need_recv.pop(request.request_id, None)
-            self._stage_release_only_registration(
-                request.request_id, req_params
-            )
+            self._stage_release_only_registration(request.request_id, req_params)
         if params is not None:
-            params["pp_size"] = (
-                self.vllm_config.parallel_config.pipeline_parallel_size
-            )
+            params["pp_size"] = self.vllm_config.parallel_config.pipeline_parallel_size
             params["pp_split"] = self._pp_split
 
         if request.request_id in self._chunk_committed:

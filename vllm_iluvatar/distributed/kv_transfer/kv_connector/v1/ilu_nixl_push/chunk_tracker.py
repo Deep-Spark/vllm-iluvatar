@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import queue
 import time
 from collections import defaultdict
@@ -11,8 +12,8 @@ from functools import partial
 from typing import Any
 
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
-    NixlConnectorMetadata,
     PUSH_REG_NOTIF_PREFIX,
+    NixlConnectorMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     get_base_request_id,
@@ -177,9 +178,7 @@ class ChunkTrackerMixin:
 
     @staticmethod
     def _request_ids_match(left: str, right: str) -> bool:
-        return left == right or get_base_request_id(left) == get_base_request_id(
-            right
-        )
+        return left == right or get_base_request_id(left) == get_base_request_id(right)
 
     def _chunk_matches_any(self, request_id: str, live: set[str]) -> bool:
         if request_id in live:
@@ -223,9 +222,8 @@ class ChunkTrackerMixin:
     ) -> tuple[str, dict[str, Any]] | None:
         self._ensure_req_indices()
         chunk_regs = getattr(self, "_chunk_registrations", None)
-        if chunk_regs:
-            if request_id in chunk_regs:
-                return request_id, chunk_regs[request_id]
+        if chunk_regs and request_id in chunk_regs:
+            return request_id, chunk_regs[request_id]
         pending = self._pending_d_registrations
         if not pending:
             return None
@@ -355,9 +353,7 @@ class ChunkTrackerMixin:
         for req_id, chunk_meta in reqs.items():
             self._arm_one_chunk_request(req_id, chunk_meta)
 
-    def _arm_one_chunk_request(
-        self, req_id: str, chunk_meta: ChunkPushReqMeta
-    ) -> None:
+    def _arm_one_chunk_request(self, req_id: str, chunk_meta: ChunkPushReqMeta) -> None:
         self._ensure_req_indices()
         ordered_layers = tuple(self._ordered_local_layers())
         plan_key = (req_id, chunk_meta.chunk_index)
@@ -412,14 +408,10 @@ class ChunkTrackerMixin:
         if reg_id in self._pending_d_registrations:
             self._pending_d_registrations.pop(reg_id, None)
             self._pending_reg_index.discard(reg_id)
-            self._consumed_reg_bases[get_base_request_id(reg_id)] = (
-                time.perf_counter()
-            )
+            self._consumed_reg_bases[get_base_request_id(reg_id)] = time.perf_counter()
             cached_reg = dict(reg)
-            cached_reg["local_block_ids"] = (
-                self._normalize_immutable_remote_groups(
-                    cached_reg.get("local_block_ids", ())
-                )
+            cached_reg["local_block_ids"] = self._normalize_immutable_remote_groups(
+                cached_reg.get("local_block_ids", ())
             )
             self._chunk_registrations[req_id] = cached_reg
             reg = cached_reg
@@ -450,15 +442,11 @@ class ChunkTrackerMixin:
         )
         remote_block_starts = reg.get("remote_block_starts")
         release_only = bool(reg.get("notify_release_only"))
-        has_tail_only_offset = any(
-            off < 0 for off in chunk_meta.block_offsets
-        )
+        has_tail_only_offset = any(off < 0 for off in chunk_meta.block_offsets)
         has_hetero_pairings = bool(
             getattr(self, "region_pairings", {}).get(reg["decode_engine_id"])
             or getattr(self, "_mamba_hma_routes", {}).get(reg["decode_engine_id"])
-            or getattr(self, "_inactive_remote_keys", {}).get(
-                reg["decode_engine_id"]
-            )
+            or getattr(self, "_inactive_remote_keys", {}).get(reg["decode_engine_id"])
             or getattr(self, "_empty_producer_rank", False)
             or has_tail_only_offset
         )
@@ -470,9 +458,7 @@ class ChunkTrackerMixin:
             or not any(remote_groups)
             or not any(chunk_meta.local_block_ids)
         ):
-            chunk_reg["local_block_ids"] = tuple(
-                () for _ in chunk_meta.local_block_ids
-            )
+            chunk_reg["local_block_ids"] = tuple(() for _ in chunk_meta.local_block_ids)
         elif remote_block_starts is not None or has_hetero_pairings:
             for group_idx, offset in enumerate(chunk_meta.block_offsets):
                 if offset < -1:
@@ -502,9 +488,7 @@ class ChunkTrackerMixin:
                         f"{req_id} group={group_idx}: offset={offset}"
                     )
                 remote_group = (
-                    remote_groups[group_idx]
-                    if group_idx < len(remote_groups)
-                    else ()
+                    remote_groups[group_idx] if group_idx < len(remote_groups) else ()
                 )
                 selected_remote = remote_group[offset : offset + len(local_group)]
                 if len(selected_remote) != len(local_group):
@@ -620,17 +604,13 @@ class ChunkTrackerMixin:
                     chunk_meta = self._chunk_pending.get(plan_key)
                     match = self._find_matching_registration(req_id)
                     if chunk_meta is not None and match is not None:
-                        self._commit_chunk_plan_locked(
-                            plan_key, chunk_meta, match
-                        )
+                        self._commit_chunk_plan_locked(plan_key, chunk_meta, match)
                 continue
 
             if decode_engine_id not in self._chunk_handshake_watched:
                 self._chunk_handshake_watched.add(decode_engine_id)
 
-                def _on_chunk_hs_done(
-                    f, eid: str = decode_engine_id
-                ) -> None:
+                def _on_chunk_hs_done(f, eid: str = decode_engine_id) -> None:
                     self._chunk_handshake_watched.discard(eid)
                     if (err := f.exception()) is not None:
                         self._fail_pending_chunks_for_engine(eid, err)
@@ -673,9 +653,7 @@ class ChunkTrackerMixin:
         if chunk_meta is None:
             return
         if not layer_names:
-            self._chunk_inbox.put(
-                _ChunkBulkTask(req_id, chunk_index, "", event)
-            )
+            self._chunk_inbox.put(_ChunkBulkTask(req_id, chunk_index, "", event))
             return
         make_writer_task = partial(
             _ChunkBulkTask, req_id, chunk_index, layer_names[-1], None
@@ -738,9 +716,7 @@ class ChunkTrackerMixin:
                 if plan.is_last_chunk:
                     if not hasattr(self, "_tail_chunk_ready_at"):
                         self._tail_chunk_ready_at = {}
-                    self._tail_chunk_ready_at[plan.request_id] = (
-                        time.perf_counter()
-                    )
+                    self._tail_chunk_ready_at[plan.request_id] = time.perf_counter()
                 self._do_start_push_kv(
                     plan.request_id,
                     plan.local_block_ids,
@@ -843,7 +819,5 @@ class ChunkTrackerMixin:
                 if leftover:
                     lingering = (lingering or []) + leftover
         for handle in lingering or []:
-            try:
+            with contextlib.suppress(Exception):
                 self.nixl_wrapper.release_xfer_handle(handle)
-            except Exception:
-                pass

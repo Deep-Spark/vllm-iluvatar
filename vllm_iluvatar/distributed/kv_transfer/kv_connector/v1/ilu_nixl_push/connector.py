@@ -50,9 +50,7 @@ class IluNixlPushBaseConnector(NixlBaseConnector):
         """Attach DeepSeek-V4.1 E25 ProducerPrefixState / ConsumerPrefixState."""
         self.prefix_state = context
 
-    def bind_connector_metadata(
-        self, connector_metadata: KVConnectorMetadata
-    ) -> None:
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
         super().bind_connector_metadata(connector_metadata)
         worker = getattr(self, "connector_worker", None)
         if worker is not None:

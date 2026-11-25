@@ -12,9 +12,9 @@ IluWorker — subclass of the community Worker with following overrides:
 
 from __future__ import annotations
 
+import time
 from contextlib import contextmanager
 from functools import partial
-import time
 
 import torch
 import torch.distributed as dist
@@ -820,4 +820,6 @@ def _model_output_has_kv_events(model_output) -> bool:
     kv_out = getattr(model_output, "kv_connector_output", None)
     if kv_out is None:
         return False
-    return bool(kv_out.finished_recving or kv_out.finished_sending or kv_out.failed_recving)
+    return bool(
+        kv_out.finished_recving or kv_out.finished_sending or kv_out.failed_recving
+    )

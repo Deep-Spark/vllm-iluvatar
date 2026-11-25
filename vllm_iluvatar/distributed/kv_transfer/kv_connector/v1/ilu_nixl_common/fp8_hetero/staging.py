@@ -361,9 +361,7 @@ class StagingPipeline:
 
         return self._completion_pool.submit(self._finish_direct, g, i, seq)
 
-    def _record_device_times(
-        self, group_idx: int, slot: int
-    ) -> tuple[float, float]:
+    def _record_device_times(self, group_idx: int, slot: int) -> tuple[float, float]:
         events = self.prof_events
         out = [-1.0, -1.0]
         for idx, (key, first, last) in enumerate(

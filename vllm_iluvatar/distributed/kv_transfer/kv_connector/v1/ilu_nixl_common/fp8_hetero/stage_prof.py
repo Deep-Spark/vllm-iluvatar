@@ -84,7 +84,7 @@ class StageStats:
         self._context = ""
         self._io_lock = threading.Lock()
         self._gpu = "unk"
-        self._file = None
+        self._path: str | None = None
 
     def set_context(self, context: str) -> None:
         with self._lock:
@@ -96,16 +96,15 @@ class StageStats:
 
     def _write(self, lines: list[str]) -> None:
         with self._io_lock:
-            if self._file is None:
+            if self._path is None:
                 os.makedirs(OUTPUT_DIR, exist_ok=True)
-                path = os.path.join(
+                self._path = os.path.join(
                     OUTPUT_DIR,
                     f"fp8_stage_prof_gpu{self._gpu}_pid{os.getpid()}.log",
                 )
-                self._file = open(path, "a", encoding="utf-8")
-                logger.info("[fp8-stage-prof] writing to %s", path)
-            self._file.write("".join(f"{line}\n" for line in lines))
-            self._file.flush()
+                logger.info("[fp8-stage-prof] writing to %s", self._path)
+            with open(self._path, "a", encoding="utf-8") as handle:
+                handle.write("".join(f"{line}\n" for line in lines))
 
     def record(self, key: str, seconds: float) -> None:
         with self._lock:

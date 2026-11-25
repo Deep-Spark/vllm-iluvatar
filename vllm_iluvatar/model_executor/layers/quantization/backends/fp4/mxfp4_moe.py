@@ -44,6 +44,8 @@ answer independent of that subtlety altogether. ``__init__`` asserts both.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import torch
 from vllm.config import get_current_vllm_config_or_none
 
@@ -123,6 +125,19 @@ class IluMxfp4MoEMethod(MoEComputeBindingMixin, Mxfp4MoEMethod):
         self.ilu_weight_format = selection.layout
         self.ilu_prefer_hybrid_ep = get_moe_backend(selection).prefer_hybrid_ep
 
+    def _compute_config(self, layer):
+        config = super()._compute_config(layer)
+        unpadded = layer.moe_config.intermediate_size_per_partition_unpadded
+        if (
+            self.selection.name == "ixmm_fp4fp8"
+            and unpadded is not None
+            and unpadded != config.intermediate
+        ):
+            # Gate/up and activation use the logical width. Only the down
+            # projection needs extra K alignment in the weight contract.
+            return replace(config, intermediate=unpadded)
+        return config
+
     def create_weights(
         self,
         layer,
@@ -146,8 +161,11 @@ class IluMxfp4MoEMethod(MoEComputeBindingMixin, Mxfp4MoEMethod):
             self.moe.has_bias
             or not self.moe.is_act_and_mul
             or self.moe.hidden_dim_unpadded != hidden_size
-            or self.moe.intermediate_size_per_partition_unpadded
-            not in (None, intermediate_size_per_partition)
+            or (
+                self.selection.name != "ixmm_fp4fp8"
+                and self.moe.intermediate_size_per_partition_unpadded
+                not in (None, intermediate_size_per_partition)
+            )
         ):
             raise ValueError(
                 "MXFP4 streaming requires unpadded bias-free gated experts"
@@ -178,7 +196,7 @@ class IluMxfp4MoEMethod(MoEComputeBindingMixin, Mxfp4MoEMethod):
             Mxfp4LoadSpec(
                 num_experts,
                 hidden_size,
-                intermediate_size_per_partition,
+                backend.intermediate,
                 self.moe.tp_size,
                 self.moe.tp_rank,
             ),

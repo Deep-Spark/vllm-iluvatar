@@ -66,6 +66,50 @@ def test_requantizes_when_reuse_is_invalid(reuse, monkeypatch, reason):
     assert [call[0] for call in calls] == ["quant", "attention"]
 
 
+@pytest.mark.parametrize(
+    ("heads", "with_rope", "expected"),
+    [(8, False, "sparse"), (8, True, "inv_rope"), (16, True, "fmhadsa")],
+)
+def test_prefill_fp8_reader_respects_fmhadsa_head_buckets(
+    reuse, monkeypatch, heads, with_rope, expected
+):
+    obj, _, calls = reuse
+    q = torch.zeros(2, heads, 512, dtype=torch.bfloat16)
+    obj._q_fp8_pt = torch.empty_like(q, dtype=torch.float8_e4m3fn)
+    obj.attn_sink = torch.zeros(heads)
+    obj._prefill_q_source = None
+    seen = []
+
+    def reader(name):
+        def call(query, scale, cache, indices, output, *args, **kwargs):
+            assert query.shape == output.shape == (2, heads, 512)
+            seen.append(name)
+
+        return call
+
+    monkeypatch.setattr(attention, "_v41_prefill_fmhadsa", lambda: True)
+    monkeypatch.setattr(attention.ixfops, "fmhadsa", reader("fmhadsa"))
+    monkeypatch.setattr(attention.ixfops, "sparse_mla_fp8_pt", reader("sparse"))
+    monkeypatch.setattr(
+        attention.ixfops, "sparse_mla_fp8_pt_inv_rope", reader("inv_rope")
+    )
+    applied = obj._sparse_fp8_pt_mla(
+        q,
+        None,
+        None,
+        None,
+        None,
+        None,
+        torch.empty_like(q),
+        use_fmhadsa=True,
+        positions=torch.arange(2) if with_rope else None,
+        cos_sin_cache=torch.zeros(2, 64) if with_rope else None,
+    )
+    assert seen == [expected]
+    assert applied is (expected == "inv_rope")
+    assert [call[0] for call in calls] == ["quant"]
+
+
 def test_decode_insert_folds_q_quant(monkeypatch):
     ilu_envs.apply()
     monkeypatch.setenv("VLLM_ILU_V41_FUSED_Q_QUANT", "1")

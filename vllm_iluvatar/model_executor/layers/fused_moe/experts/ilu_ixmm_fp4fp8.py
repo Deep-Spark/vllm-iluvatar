@@ -169,21 +169,24 @@ class IxMMFP4FP8Backend(MoEComputeBackend):
         del q, scale
         workspace.release("input", "input_scale")
         padded_k = weights.w2_weight.shape[1] * 2
-        # The activation op writes every row and zeros the wider K tail, so
-        # GEMM2's K padding costs one allocation rather than a second pass.
-        q, scale = self._activation_quant(
-            intermediate,
-            order,
-            None
-            if padded_k == self.intermediate
-            else torch.empty(
+        # Only clamped SwiGLU accepts a wider output and zeroes its tail.
+        # SwiGLUStep and SwiGLU-OAI require the exact logical output width.
+        fp8_output = None
+        if (
+            padded_k > self.intermediate
+            and self.limit is not None
+            and self.config.activation not in ("swiglustep", _SWIGLUOAI)
+        ):
+            fp8_output = torch.empty(
                 (intermediate.shape[0], padded_k),
                 dtype=self.activation_dtype,
                 device=intermediate.device,
-            ),
-        )
+            )
+        q, scale = self._activation_quant(intermediate, order, fp8_output)
         del intermediate
         workspace.release("gemm1")
+        if q.shape[-1] < padded_k:
+            q = torch.nn.functional.pad(q, (0, padded_k - q.shape[-1]))
         out = workspace.get("gemm2")
         self.gemm(weights, q, scale, "w2", layout, out, mode=mode)
         del q, scale

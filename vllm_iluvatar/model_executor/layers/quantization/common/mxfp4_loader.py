@@ -189,7 +189,20 @@ class Mxfp4ToIxMMW4A8Loader(Mxfp4WeightLoader):
 
 
 class Mxfp4ToIxMMFP4FP8Loader(Mxfp4WeightLoader):
+    source_alignment = 32
+
+    def __init__(self, weight_spec, load_spec):
+        super().__init__(weight_spec, load_spec)
+        if load_spec.hidden % weight_spec.scale_group_size:
+            raise ValueError("MXFP4 IxMM gate/up K must be aligned to 256")
+
     def convert_shard(self, weight, scale, target, target_scale):
+        # Pad after TP slicing. Packed zero FP4 codes and the smallest E8M0
+        # scale do not change the maximum scale of the real blocks.
+        extra_bytes = target.shape[0] - weight.shape[1]
+        if extra_bytes:
+            weight = torch.nn.functional.pad(weight, (0, extra_bytes))
+            scale = torch.nn.functional.pad(scale, (0, extra_bytes // 16))
         _native_converter("mxfp4_to_fp4fp8")(
             weight,
             scale,

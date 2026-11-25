@@ -270,3 +270,41 @@ def test_native_converter_does_not_fall_back_to_torch(monkeypatch):
     with pytest.raises(RuntimeError, match="requires native"):
         _native_converter("mxfp4_to_w4a8")
     _native_converter.cache_clear()
+
+
+def test_ixmm_fp4fp8_tp8_slices_before_padding(monkeypatch):
+    from vllm_iluvatar.model_executor.layers.quantization.common import mxfp4_loader
+
+    selection = select_moe_backend("ivcore30", name="ixmm_fp4fp8", layout="fp4fp8")
+    spec = get_moe_backend(selection).weight_specs["fp4fp8"]
+    loader = make_mxfp4_loader(spec, Mxfp4LoadSpec(2, 512, 288, 8, 7))
+    layer = ExpertLayer()
+    loader.create_weights(layer, {})
+    loader.bind_upload_buffer(
+        Mxfp4UploadBuffer(loader.staging_bytes, layer.w2_weight.device)
+    )
+    assert layer.w13_weight.shape == (2, 256, 576)
+    assert layer.w2_weight.shape == (2, 256, 512)
+    assert layer.w2_weight_scale.shape == (2, 2, 512)
+
+    def capture(weight, scale, target, target_scale, *, backend):
+        assert backend == "ixformer_native"
+        assert weight.shape == (512, 256)
+        assert scale.shape == (512, 16)
+        assert (weight[:, :144] == 0x22).all()
+        assert (scale[:, :9] == 123).all()
+        assert (weight[:, 144:] == 0).all()
+        assert (scale[:, 9:] == 0).all()
+        target.zero_()
+        target_scale.fill_(1)
+
+    monkeypatch.setattr(mxfp4_loader, "_native_converter", lambda _: capture)
+    assert loader.source_shape("w13", False) == (2304, 256)
+    assert loader.source_shape("w2", False) == (512, 1152)
+    assert loader.source_shape("w2", True) == (512, 72)
+    weight = torch.full((512, 1152), 0x11, dtype=torch.uint8)
+    scale = torch.full((512, 72), 120, dtype=torch.uint8)
+    weight[:, 7 * 144 :] = 0x22
+    scale[:, 7 * 9 :] = 123
+    assert deliver(layer, "w2", 4, scale.view(torch.float8_e8m0fnu), scale=True)
+    assert deliver(layer, "w2", 4, weight)

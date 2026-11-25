@@ -182,8 +182,9 @@ def test_w4a8_runtime_weight_contract(backend, layout, source):
         ("silu", "step3_swiglustep", None),
     ],
 )
+@pytest.mark.parametrize("intermediate", [160, 256, 384])
 def test_fp4fp8_independent_forward_matches_existing_contract(
-    activation, variant, limit
+    activation, variant, limit, intermediate
 ):
     if cuda_arch() != "ivcore30":
         pytest.skip("FP4FP8 requires ivcore30")
@@ -195,11 +196,15 @@ def test_fp4fp8_independent_forward_matches_existing_contract(
     )
 
     torch.manual_seed(52)
-    h, i, e = 512, 256, 2
+    h, i, e = 512, intermediate, 2
     weights = []
-    for n, k in ((2 * i, h), (h, i)):
+    w2_k = (i + 255) // 256 * 256
+    for n, k in ((2 * i, h), (h, w2_k)):
         w = torch.randint(0, 256, (e, n, k // 2), device="cuda", dtype=torch.uint8)
         s = torch.full((e, n, k // 32), 120, device="cuda", dtype=torch.uint8)
+        if weights:
+            w[..., i // 2 :] = 0
+            s[..., i // 32 :] = 127
         weights.append(
             ops.preprocess_weight_for_ixmm(
                 w.view(torch.int8), s.view(torch.float8_e8m0fnu)
@@ -367,6 +372,11 @@ def test_fp4fp8_independent_forward_matches_existing_contract(
     ids.copy_((ids + 1) % 4)
     graph.replay()
     torch.testing.assert_close(captured, forward(x, scores, ids), rtol=0, atol=0)
+
+    # The legacy batched implementation only accepts an aligned GEMM2 K.
+    # Padded widths above exercise Standard and its CUDA Graph replay.
+    if i != w2_k:
+        return
 
     # Batched kernels have their own quantization/rounding path. Compare with
     # the previous batched implementation, without loosening bitwise parity.

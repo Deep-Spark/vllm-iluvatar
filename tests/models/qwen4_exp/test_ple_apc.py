@@ -110,6 +110,29 @@ def test_copy_funcs_track_the_state_shapes() -> None:
     assert funcs[2] is get_temporal_copy_spec
 
 
+def test_prefix_cache_copy_funcs_are_resolved_on_the_instance() -> None:
+    """The classmethod path calls get_mamba_state_copy_func without self."""
+    from vllm_iluvatar.models.qwen4_exp.model import (
+        Qwen4ExpForConditionalGeneration,
+    )
+
+    model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
+    nn.Module.__init__(model)
+    model.vllm_config = _vllm_config()
+
+    by_type = model.get_mamba_state_copy_funcs({"gdn"})
+
+    assert set(by_type) == {"gdn"}
+    assert by_type["gdn"][2] is get_temporal_copy_spec
+
+    outer = Qwen4ExpForConditionalGeneration.__new__(
+        Qwen4ExpForConditionalGeneration
+    )
+    nn.Module.__init__(outer)
+    outer.language_model = model
+    assert outer.get_mamba_state_copy_funcs({"gdn"})["gdn"][2] is get_temporal_copy_spec
+
+
 def test_mamba_copy_funcs_are_only_called_on_model_instances() -> None:
     worker_root = Path(vllm.__file__).resolve().parent / "v1" / "worker"
     call_lines = []

@@ -930,6 +930,17 @@ class Qwen4ExpForCausalLM(
             return funcs
         return (*funcs, get_temporal_copy_spec)
 
+    def get_mamba_state_copy_funcs(self, mamba_types):
+        """Serve prefix-cache copies from this instance.
+
+        The interface method is a classmethod and calls
+        ``get_mamba_state_copy_func`` with no instance. This helper reads
+        ``self.vllm_config``, so that path crashes engine init once prefix
+        caching is on. vLLM calls the method on the model instance.
+        """
+        copy_funcs = self.get_mamba_state_copy_func()
+        return {mamba_type: copy_funcs for mamba_type in mamba_types}
+
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
@@ -1181,6 +1192,11 @@ class Qwen4ExpForConditionalGeneration(
         self,
     ) -> tuple[MambaStateCopyFunc, ...]:
         return self.language_model.get_mamba_state_copy_func()
+
+    def get_mamba_state_copy_funcs(self, mamba_types):
+        """Same instance override as ``Qwen4ExpForCausalLM``."""
+        copy_funcs = self.get_mamba_state_copy_func()
+        return {mamba_type: copy_funcs for mamba_type in mamba_types}
 
 
 class Qwen4ExpMTP(nn.Module):

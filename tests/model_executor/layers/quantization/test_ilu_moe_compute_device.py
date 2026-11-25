@@ -38,7 +38,9 @@ from vllm_iluvatar.model_executor.layers.quantization.common.paired_moe_loader i
 )
 def test_w4a8_runtime_weight_contract(backend, layout, source):
     arch = cuda_arch()
-    ixmm_supported = arch == "ivcore30" or (arch == "ivcore11" and source == "block_fp8")
+    ixmm_supported = arch == "ivcore30" or (
+        arch == "ivcore11" and source == "block_fp8"
+    )
     if (backend == "ixmm_w4a8" and not ixmm_supported) or (
         backend.startswith("ixinfer_w4a8") and layout == "NN" and arch != "ivcore11"
     ):

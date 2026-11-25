@@ -241,6 +241,9 @@ if TYPE_CHECKING:
     VLLM_ILU_FUSE_NORM_QUANT: bool = True
     VLLM_ILU_FUSE_MOE_W13: bool = True
     VLLM_ILU_GLM_SAMPLING_MODE: str = "off"
+    VLLM_ILU_TOP_P_RADIX: bool = False
+    VLLM_ILU_MTP_REJECTION_FUSION: bool = False
+    VLLM_ILU_GLM_DRAFT_CUDAGRAPH: bool = False
     VLLM_ILU_GLM_MOE_PREPARE_FUSION: bool = False
     VLLM_ILU_GLM_DSA_PREPARE_FUSION: bool = False
     VLLM_ILU_GLM_DSA_RMS_ROPE_FP8_KV: bool = True
@@ -686,6 +689,9 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # IluGlm residual/RMSNorm+INT8 fusion. Default on (TP8 Graph ITL benefit);
     # set 0 to force the split RMSNorm path. Fail-closed at the call site.
     "VLLM_ILU_FUSE_NORM_QUANT": _bool_reader("VLLM_ILU_FUSE_NORM_QUANT", "1"),
+    "VLLM_ILU_TOP_P_RADIX": _bool_reader("VLLM_ILU_TOP_P_RADIX", "0"),
+    "VLLM_ILU_MTP_REJECTION_FUSION": _bool_reader("VLLM_ILU_MTP_REJECTION_FUSION", "0"),
+    "VLLM_ILU_GLM_DRAFT_CUDAGRAPH": _bool_reader("VLLM_ILU_GLM_DRAFT_CUDAGRAPH", "0"),
     # Compact-row W13+SwiGLU+INT8 fusion (native ixformer). Default on after
     # TP8 Graph ITL A/B showed benefit; set 0 for the split GEMV path.
     # Fail-closed for unsupported shapes / runtime errors.

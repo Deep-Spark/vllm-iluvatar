@@ -6,8 +6,8 @@ Corresponds to: vllm/v1/sample/rejection_sampler.py
 Target   : vllm.v1.sample.rejection_sampler.generate_uniform_probs
 Baseline : v0.31.0 (db9527a468)
 Why      : float64 CUDA uniforms read back as zeros on CoreX and force every
-           draft token to be accepted. rejection_sample and the greedy, random,
-           and recovered-token kernels stay on upstream.
+           draft token to be accepted. Opt-in CQ accept/recover handles V1
+           all-random deterministic drafts without changing upstream kernels.
 How      : rebind generate_uniform_probs after a signature check. Also
            fingerprint rejection_sample, because the float32 override only
            applies while upstream calls generate_uniform_probs by name.
@@ -26,9 +26,12 @@ from vllm_iluvatar.ilu_patch import general_patch as p
 
 _OVERRIDES = [
     "generate_uniform_probs",
+    "rejection_sample",
 ]
 
 _BASELINE_SOURCE_SHAS = {
+    # Native adapter mirrors this function's full-batch RNG draw policy.
+    "sample_recovered_tokens": "a9661935216650b56990382b6400f6b030c8441a734a613a9f6acfb0012c3412",
     "rejection_sample": (
         "adadcc804bccf89cc3568b637d14b90480f903d0a5de417719200ad6a284c747"
     ),
@@ -43,7 +46,7 @@ def register() -> None:
     p.register_once(
         __name__,
         _apply,
-        detail="float32 rejection-sampler uniforms",
+        detail="float32 uniforms and opt-in CQ rejection",
     )
 
 
@@ -77,6 +80,5 @@ def _apply() -> None:
 
     p.check_signatures(_m, impl, _OVERRIDES, strict=True)
     for name in _OVERRIDES:
-        # [ILU override] rejection sampler - delta: float32 uniforms.
-        # rejection_sample and the sampling kernels stay on upstream.
+        # Rebind already-loaded consumers as well as future imports.
         p.rebind_module_func(_m, name, getattr(impl, name))

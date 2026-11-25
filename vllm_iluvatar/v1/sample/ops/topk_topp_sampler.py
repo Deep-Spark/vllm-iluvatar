@@ -3,10 +3,9 @@
 
 Why:
     VLLM_ILU_GLM_SAMPLING_MODE optionally selects native CQ sorted/radix
-    sampling on ivcore30. apply_top_k_top_p stays on upstream, so the
-    community dispatch (Triton at eight rows or more, the PyTorch sort
-    below that) is unchanged. Unsupported contracts retain the original
-    sampler.
+    sampling on ivcore30. The independent TOP_P_RADIX flag enables the
+    native probability mask for ordinary sampling and MTP verification in
+    both runners. Disabled or unsupported contracts retain upstream dispatch.
 Remove:
     When upstream provides this GLM sampling path.
 """
@@ -18,6 +17,45 @@ from vllm.v1.sample.ops import topk_topp_sampler as _community
 
 # Keep the original method for unsupported contracts and the disabled mode.
 _original_forward_native = _community.TopKTopPSampler.forward_native
+_original_apply_top_k_top_p = _community.apply_top_k_top_p
+
+
+def _native_top_p_available(logits, k, p):
+    # Preserve upstream's small-sort tie policy. Native FP32 reductions may
+    # still move near-cutoff probabilities; this path is explicitly opt-in.
+    if (
+        k is not None
+        or p is None
+        or not logits.is_cuda
+        or logits.dtype != torch.float32
+        or logits.ndim != 2
+        or not logits.is_contiguous()
+        or logits.shape[1] <= 4096
+        or not 0 < logits.shape[0] <= 65535
+        or logits.numel() > 2**31 - 256
+        or p.dtype != torch.float32
+        or p.ndim != 1
+        or p.shape[0] != logits.shape[0]
+        or not p.is_contiguous()
+        or p.device != logits.device
+    ):
+        return False
+    from ixformer.inference import functions as F
+
+    from vllm_iluvatar.ilu_util.arch import is_ivcore30
+
+    return is_ivcore30() and hasattr(F, "apply_top_p_radix")
+
+
+def apply_top_k_top_p(logits, k, p):
+    """Opt-in CQ mask; no RNG draws and no change to disabled dispatch."""
+    from vllm import envs
+
+    if envs.VLLM_ILU_TOP_P_RADIX and _native_top_p_available(logits, k, p):
+        from ixformer.inference.functions import apply_top_p_radix
+
+        return apply_top_p_radix(logits, p)
+    return _original_apply_top_k_top_p(logits, k, p)
 
 
 def forward_native(self, logits, generators, k, p):

@@ -85,15 +85,20 @@ def _load_impl(monkeypatch, *, is_cpu: bool = False) -> ModuleType:
     return impl
 
 
-def test_patch_apply_rebinds_forward_native_only(monkeypatch):
+def test_patch_apply_rebinds_sampler_and_loaded_consumers(monkeypatch):
     from vllm_iluvatar.ilu_patch.general_patches import patch_topk_topp_sampler
 
     impl = _load_impl(monkeypatch, is_cpu=False)
     community = sys.modules["vllm.v1.sample.ops.topk_topp_sampler"]
     upstream_apply = community.apply_top_k_top_p
 
+    consumer = ModuleType("vllm.v1.worker.gpu.sample.sampler")
+    consumer.apply_top_k_top_p = upstream_apply
+    monkeypatch.setitem(sys.modules, consumer.__name__, consumer)
+
     patch_topk_topp_sampler._apply()
 
-    assert community.apply_top_k_top_p is upstream_apply
-    assert not hasattr(impl, "apply_top_k_top_p")
+    assert community.apply_top_k_top_p is impl.apply_top_k_top_p
+    assert consumer.apply_top_k_top_p is impl.apply_top_k_top_p
+    assert impl._original_apply_top_k_top_p is upstream_apply
     assert community.TopKTopPSampler.forward_native is impl.forward_native

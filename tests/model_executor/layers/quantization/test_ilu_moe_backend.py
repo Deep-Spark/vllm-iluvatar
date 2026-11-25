@@ -564,6 +564,7 @@ def test_adapter_protocol_binding_and_scaling(monkeypatch, batched):
         workspace_spec=workspace_spec,
         run_standard=standard,
         run_batched=batch,
+        validate_batched_activation=lambda: None,
     )
     adapter = bind_compute_experts(backend, weights, None, None, prepare)
     assert adapter.activation_format() == fmt
@@ -612,3 +613,47 @@ def test_adapter_protocol_binding_and_scaling(monkeypatch, batched):
                 None,
                 None,
             )
+
+
+@pytest.mark.parametrize(
+    "activation",
+    ["silu", "swiglu", "swiglustep", "swigluoai", "swigluoai_uninterleave"],
+)
+@pytest.mark.parametrize("batched", [False, True])
+def test_ixinfer_activation_at_binding(monkeypatch, activation, batched):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.fused_moe import FusedMoEActivationFormat
+    from vllm.model_executor.layers.fused_moe.modular_kernel import (
+        FusedMoEExpertsModular,
+    )
+
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_experts import (
+        bind_compute_experts,
+    )
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_ixinfer_w4a8 import (
+        IxInferW4A8Backend,
+    )
+
+    backend = object.__new__(IxInferW4A8Backend)
+    backend.config = SimpleNamespace(activation=activation)
+    backend.local_num_experts = 2
+    fmt = (
+        FusedMoEActivationFormat.BatchedExperts
+        if batched
+        else FusedMoEActivationFormat.Standard
+    )
+    prepare = SimpleNamespace(
+        activation_format=fmt,
+        max_num_tokens_per_rank=lambda: 4,
+        num_dispatchers=lambda: 1,
+    )
+    monkeypatch.setattr(FusedMoEExpertsModular, "__init__", lambda self, *args: None)
+    if batched and activation not in ("silu", "swiglu"):
+        with pytest.raises(
+            NotImplementedError, match=f"batched experts do not support {activation}"
+        ):
+            bind_compute_experts(backend, None, None, None, prepare)
+    else:
+        adapter = bind_compute_experts(backend, None, None, None, prepare)
+        assert adapter.activation_format() == fmt

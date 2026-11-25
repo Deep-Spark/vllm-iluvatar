@@ -44,6 +44,7 @@ class IxInferW4A8Backend(MoEComputeBackend):
     requires_activation_limit = False
     priority = 20
     supported_layouts = {"ivcore11": ("NN", "TN"), "ivcore30": ("TN",)}
+    supported_batched_activations = ("silu", "swiglu")
     supported_activations = ("silu", "swiglu", _SWIGLUSTEP, *_SWIGLUOAI_ACTIVATIONS)
     weight_specs = {
         layout: MoEWeightSpec(
@@ -312,6 +313,7 @@ class IxInferW4A8Backend(MoEComputeBackend):
         )
 
     def run_batched(self, x, weights, scale, counts, *, output, workspace):
+        self.validate_batched_activation()
         x = x.reshape(-1, x.shape[-1])
         if x.shape[0] == 0:
             return output
@@ -334,11 +336,6 @@ class IxInferW4A8Backend(MoEComputeBackend):
         )
         del q, scale
         workspace.release("input", "input_scale")
-        if self.config.activation in (_SWIGLUSTEP, *_SWIGLUOAI_ACTIVATIONS):
-            # The grouped activation only implements regular SwiGLU.
-            raise NotImplementedError(
-                f"{self.name} batched experts do not support {self.config.activation}"
-            )
         q, scale = ops.moe_group_gemv_swiglu_quant(
             input=intermediate,
             expert_num_tokens=counts,

@@ -117,6 +117,7 @@ class MoEComputeBackend(ABC):
     supports_batched_experts: ClassVar[bool] = True
     prefer_hybrid_ep: ClassVar[bool] = True
     supported_activations: ClassVar[tuple[str, ...]] = ("silu", "swiglu")
+    supported_batched_activations: ClassVar[tuple[str, ...] | None] = None
     requires_activation_limit: ClassVar[bool] = True
     supports_prequantized_fp8: ClassVar[bool] = False
     supports_prequantized_int8: ClassVar[bool] = False
@@ -133,6 +134,13 @@ class MoEComputeBackend(ABC):
         error = self.support_error(config, selection)
         if error is not None:
             raise NotImplementedError(error)
+
+    def validate_batched_activation(self):
+        allowed = self.supported_batched_activations
+        if allowed is not None and self.config.activation not in allowed:
+            raise NotImplementedError(
+                f"{self.name} batched experts do not support {self.config.activation}"
+            )
 
     @classmethod
     def support_error(cls, config, selection):

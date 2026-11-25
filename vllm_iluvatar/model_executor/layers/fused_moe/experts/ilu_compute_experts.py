@@ -210,6 +210,7 @@ def bind_compute_experts(
             raise NotImplementedError(
                 f"{backend.name} requires Standard expert activations"
             )
+        backend.validate_batched_activation()
         cls = IluBatchedComputeExperts
         capacity = prepare_finalize.max_num_tokens_per_rank()
         if capacity is None:

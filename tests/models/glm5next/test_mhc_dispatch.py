@@ -31,6 +31,29 @@ def test_sqrsum_handoff_kept_outside_splitk(monkeypatch, m, enabled):
         split.assert_not_called()
 
 
+def test_pre_v2_checks_rms_only_fusion(monkeypatch):
+    residual = torch.empty(32, 4, 4096, dtype=torch.bfloat16)
+    norm_weight = torch.ones(4096, dtype=residual.dtype)
+    supports_fusion = Mock(return_value=True)
+    pre = Mock(return_value=(None, None, None))
+    rms_norm = Mock()
+    monkeypatch.setattr(mhc.ixfops, "enable_hc_pre_norm_fusion", supports_fusion)
+    monkeypatch.setattr(mhc.ixfops, "ds4_mhc_pre_v2", pre)
+    monkeypatch.setattr(mhc.ixfops, "rms_norm", rms_norm)
+
+    mhc.mhc_pre(
+        residual, None, None, None, 1e-6, 1e-6, 2.0, 20, norm_weight=norm_weight
+    )
+
+    supports_fusion.assert_called_once_with(
+        *residual.shape, dtype=residual.dtype, emit_dynamic_int8=False
+    )
+    pre.assert_called_once()
+    assert pre.call_args.kwargs["need_rms"]
+    assert pre.call_args.kwargs["rms_weight"] is norm_weight
+    rms_norm.assert_not_called()
+
+
 @pytest.mark.parametrize("m", [15, 16, 120, 121])
 def test_splitk_never_skips_required_tp_allreduce(monkeypatch, m):
     monkeypatch.setattr(mhc.envs, "VLLM_ILU_GLM5NEXT_MHC_DECODE_SPLITK", True)

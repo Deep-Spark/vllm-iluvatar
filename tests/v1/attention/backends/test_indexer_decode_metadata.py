@@ -227,7 +227,6 @@ def test_metadata_graph_drives_valid_only_logits_and_topk():
             max_kv_len=1024,
             max_context_len=width,
             valid_lens=md["valid_lens"],
-            backend="ixinfer",
             mask_invalid=mask,
         )
         ops.dsa_update_topk_indices(

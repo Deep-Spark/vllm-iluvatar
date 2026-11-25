@@ -163,7 +163,10 @@ class IluMoEBatchedExpertsFp8(BaseBatchExperts):
         gemm_mode = 0
         if (
             hidden_size == 4096
-            and getattr(self.moe_config, "num_logical_experts", self.moe_config.num_experts) == 288
+            and getattr(
+                self.moe_config, "num_logical_experts", self.moe_config.num_experts
+            )
+            == 288
             and topk_ids is not None
             and topk_ids.ndim == 2
             and topk_ids.shape[1] == 8

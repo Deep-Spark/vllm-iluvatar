@@ -334,6 +334,7 @@ def _make_iluvatar_platform():
             from math import lcm
 
             from vllm.utils.math_utils import cdiv
+
             from vllm_iluvatar.models.glm5next.attention import (
                 GLM5NEXT_ARCHS,
                 glm5next_fp8_attn_enabled_for_config,
@@ -463,9 +464,7 @@ def _make_iluvatar_platform():
                     and getattr(cache_config, "mamba_cache_mode", None) == "align"
                     and getattr(cache_config, "prefix_match_unit", None) is None
                 ):
-                    unit = lcm(
-                        256, cls._get_indexer_block_alignment(vllm_config) or 1
-                    )
+                    unit = lcm(256, cls._get_indexer_block_alignment(vllm_config) or 1)
                     if (
                         not getattr(cache_config, "user_specified_block_size", False)
                         or cache_config.block_size % unit == 0

@@ -263,3 +263,31 @@ def test_draft_head_attachment_keeps_shared_target_unchanged(
     packed = shared.head.weight
     shared.head = shared.head
     assert shared.head.weight is packed
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or getattr(torch, "corex_arch", None) != "ivcore30",
+    reason="requires a CQ GPU",
+)
+@torch.inference_mode()
+def test_cq_graph_mixed_projection_tail(monkeypatch):
+    monkeypatch.setattr(arch, "cuda_arch", lambda: "ivcore30")
+    torch.manual_seed(18)
+    rows = 12288
+    weight = torch.randn(12576, 4096, dtype=torch.bfloat16, device="cuda")
+    layer, _ = make_layer(weight, rows)
+    x = torch.randn(2, 4096, dtype=torch.bfloat16, device="cuda")
+    original = x.clone()
+    layer.quant_method.apply_parts(layer, x)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        body, tail = layer.quant_method.apply_parts(layer, x)
+    for factor in (1.0, -0.5):
+        x.copy_(original * factor)
+        graph.replay()
+        eager_body, _ = layer.quant_method.apply_parts(layer, x)
+        expected_tail = (x.cpu().float() @ weight[rows:].cpu().float().T).bfloat16()
+        torch.testing.assert_close(body, eager_body)
+        torch.testing.assert_close(tail.cpu(), expected_tail, rtol=0.02, atol=0.08)

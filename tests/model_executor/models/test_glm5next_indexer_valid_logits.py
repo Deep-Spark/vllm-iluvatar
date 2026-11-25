@@ -86,7 +86,6 @@ def test_valid_logits_topk_replays_with_dirty_exterior(
             max_kv_len=kv_len,
             max_context_len=width,
             valid_lens=valid,
-            backend="ixinfer",
             mask_invalid=True,
         )
         indexer._select_pools_and_expand(

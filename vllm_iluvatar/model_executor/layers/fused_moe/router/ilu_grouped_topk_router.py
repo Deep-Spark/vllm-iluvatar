@@ -41,8 +41,13 @@ def grouped_topk(
     if e_score_correction_bias is not None:
         if is_ivcore30():
             group_scoring = "top2sum"
-            if e_score_correction_bias.dtype not in (gating_output.dtype, torch.float32):
-                e_score_correction_bias = e_score_correction_bias.to(gating_output.dtype)
+            if e_score_correction_bias.dtype not in (
+                gating_output.dtype,
+                torch.float32,
+            ):
+                e_score_correction_bias = e_score_correction_bias.to(
+                    gating_output.dtype
+                )
         elif e_score_correction_bias.dtype != gating_output.dtype:
             # Preserve the MR native/FlyDSL route and its bias dtype.
             e_score_correction_bias = e_score_correction_bias.to(gating_output.dtype)

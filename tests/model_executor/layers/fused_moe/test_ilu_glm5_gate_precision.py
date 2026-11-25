@@ -25,6 +25,7 @@ def test_glm_gate_fp32_logits(tokens, experts):
     )
     gate.bias = None
     gate.skip_bias_add = False
+    gate.return_bias = True
     gate.out_dtype = torch.float32
     x = torch.randn(tokens, 6144, device="cuda", dtype=torch.bfloat16)
 

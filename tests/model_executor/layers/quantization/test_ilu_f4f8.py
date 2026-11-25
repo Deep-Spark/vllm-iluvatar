@@ -257,6 +257,7 @@ def test_f4f8_sorted_experts_match_reference(cuda_device, monkeypatch, tokens):
 @requires_corex30
 def test_f4f8_select_gemm_impl_batched_experts_match_local(cuda_device):
     from types import SimpleNamespace
+
     import vllm.model_executor.layers.fused_moe.modular_kernel as mk
     from vllm.model_executor.layers.fused_moe import FusedMoEActivationFormat
 
@@ -342,11 +343,15 @@ def test_f4f8_select_gemm_impl_batched_experts_match_local(cuda_device):
     # Compare single-expert 4-token output between local apply and batched LL apply
     init_workspace_manager(device)
     x = (torch.randn(4, _HIDDEN, device=device) * 0.3).to(torch.bfloat16)
-    ids = torch.tensor([[0, 1], [0, 2], [1, 2], [0, 1]], dtype=torch.int32, device=device)
+    ids = torch.tensor(
+        [[0, 1], [0, 2], [1, 2], [0, 1]], dtype=torch.int32, device=device
+    )
     weights = torch.ones((4, 2), dtype=torch.float32, device=device)
     ref_local = method.apply(layer, x, weights, ids, None, None)
 
-    batched_in = torch.zeros((_LOCAL_EXPERTS, 8, _HIDDEN), dtype=torch.float8_e4m3fn, device=device)
+    batched_in = torch.zeros(
+        (_LOCAL_EXPERTS, 8, _HIDDEN), dtype=torch.float8_e4m3fn, device=device
+    )
     batched_scale = torch.ones((_LOCAL_EXPERTS, 8), dtype=torch.float32, device=device)
     counts = torch.zeros((_LOCAL_EXPERTS,), dtype=torch.int32, device=device)
     slot_map: list[tuple[int, int]] = []
@@ -365,7 +370,9 @@ def test_f4f8_select_gemm_impl_batched_experts_match_local(cuda_device):
             batched_scale[e, pos] = x_sc[tok]
             slot_map.append((tok, e * 8 + pos))
     counts.copy_(torch.tensor(cpu_counts, dtype=torch.int32, device=device))
-    batched_out = torch.zeros((_LOCAL_EXPERTS, 8, _HIDDEN), dtype=torch.bfloat16, device=device)
+    batched_out = torch.zeros(
+        (_LOCAL_EXPERTS, 8, _HIDDEN), dtype=torch.bfloat16, device=device
+    )
     meta = mk.ExpertTokensMetadata(expert_num_tokens=counts, expert_num_tokens_cpu=None)
     batched.apply(
         output=batched_out,
@@ -387,4 +394,6 @@ def test_f4f8_select_gemm_impl_batched_experts_match_local(cuda_device):
     summed = torch.zeros((4, _HIDDEN), dtype=torch.float32, device=device)
     for tok, idx in slot_map:
         summed[tok] += flat_out[idx]
-    torch.testing.assert_close(summed.to(torch.bfloat16), ref_local, rtol=0.02, atol=0.002)
+    torch.testing.assert_close(
+        summed.to(torch.bfloat16), ref_local, rtol=0.02, atol=0.002
+    )

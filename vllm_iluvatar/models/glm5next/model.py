@@ -390,7 +390,9 @@ class IluGlm5NextDecoderLayer(Glm5NextDecoderLayer):
                         and quant_config is not None
                         and (
                             quant_config.get_name() == "ilu_f4f8"
-                            or (is_ivcore30() and isinstance(quant_config, IluFp8Config))
+                            or (
+                                is_ivcore30() and isinstance(quant_config, IluFp8Config)
+                            )
                         )
                     )
                 ),
@@ -800,9 +802,7 @@ class IluGlm5NextModel(Glm5NextModel, EagleModelMixin):
                 input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
             )
         nt = positions.numel()
-        arm = (profile == "decode" and nt <= 6) or (
-            profile == "prefill" and nt > 64
-        )
+        arm = (profile == "decode" and nt <= 6) or (profile == "prefill" and nt > 64)
         if arm:
             torch.cuda.profiler.start()
         try:

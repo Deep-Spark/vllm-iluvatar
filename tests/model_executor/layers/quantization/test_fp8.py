@@ -358,7 +358,7 @@ def test_layer_limit_reaches_compute_contract(monkeypatch, limit):
     assert config.intermediate == 128
 
 
-def test_silu_limit_routes_to_dsv4_clamp(monkeypatch):
+def test_silu_limit_reaches_compute_contract(monkeypatch):
     mod = _load_moe_backend(monkeypatch)
     method = object.__new__(mod.IluFp8MoEMethod)
     layer = types.SimpleNamespace(
@@ -371,7 +371,6 @@ def test_silu_limit_routes_to_dsv4_clamp(monkeypatch):
         swiglu_limit=10.0,
         apply_router_weight_on_input=False,
     )
-    assert mod._resolve_fp8_moe_activation(layer) == (10.0, "dsv4_clamp", 10.0)
     config = method._compute_config(layer)
     assert config.activation == "silu"
     assert config.limit == 10.0
@@ -415,6 +414,7 @@ def test_maybe_build_f4f8_experts_guards_contract(monkeypatch):
 
 def test_activation_prequant_thread_local_and_contiguous_bf16_guards():
     import threading
+
     from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (
         _lookup_activation_prequant,
         clear_activation_prequant,

@@ -9,11 +9,11 @@ import triton
 import triton.language as tl
 import vllm.envs as envs
 from ixformer.cuda import cuda_arch
+from ixformer.inference import ixattn_backend
 from ixformer.inference.functions.models.glm5next import (
     fwht128_quant_int8_with_weights,
     global_pool_indices,
 )
-from ixformer.inference import ixattn_backend
 from torch import nn
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size

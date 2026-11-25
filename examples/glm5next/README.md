@@ -35,7 +35,7 @@ python3 quantize_fp8_to_ilu_f4f8.py \
 两个入口的服务模型名均为 `GLM-5-Next`。将 `--serve` 换成 `--print-command` 可查看 vLLM 参数。复现下表配置时，使用干净的服务 shell，由脚本设置模型参数。
 
 | 配置 | Prefill | Decode |
-|---|---|---|
+| --- | --- | --- |
 | 并行 | TP1 / PP8 / DP1，启用 EP，流水线分层 `7,6,6,6,6,5,5,4` | TP2 / PP1 / DP4，启用 EP |
 | 执行 | eager，异步调度，chunked prefill | `FULL_DECODE_ONLY` Graph，同步调度 |
 | MoE 通信 | AllGather/ReduceScatter | AllGather/ReduceScatter |
@@ -49,7 +49,7 @@ python3 quantize_fp8_to_ilu_f4f8.py \
 2026-11-19 在 CQ 18.10 使用上述离线权重和配置，各运行一轮腾讯微观脚本。P 和 D 各用八芯（四张双芯物理卡），核心频率 1.8 GHz、显存频率 1.6 GHz，ACS 关闭，GTS 已开启。
 
 | 场景 | 负载 | 该轮实测 | 服务日志中的 KV 容量 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | P | CC8，每请求实际未命中缓存的输入为 8,064 tokens | **26,041.78 未缓存输入 tok/s**，TTFT P50 为 1.792 s，P90 为 2.377 s | 单个 PP8 引擎 23,074,021 tokens |
 | D | CC64，每个 DP 16 个请求，输入 112,640 tokens，目标请求的测量窗口由背景请求全程覆盖，抢占数为 0 | **45.30 ms/step** | 每个 DP 4,233,145 tokens，四个 DP 合计 16,932,580 tokens |
 

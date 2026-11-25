@@ -87,7 +87,10 @@ def test_grouped_topk_cq_casts_non_fp32_mismatch_bias(monkeypatch, bias_dtype):
         monkeypatch,
         lambda *args, **kwargs: (
             captured.append(args[5])
-            or (torch.ones(1, 2, dtype=torch.float32), torch.zeros(1, 2, dtype=torch.int32))
+            or (
+                torch.ones(1, 2, dtype=torch.float32),
+                torch.zeros(1, 2, dtype=torch.int32),
+            )
         ),
     )
     gating_output = torch.tensor([[0.1, 0.2, 0.3, 0.4]], dtype=torch.bfloat16)

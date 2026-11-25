@@ -22,10 +22,10 @@ from vllm_iluvatar.ilu_patch.general_patches import patch_decode_bench_connector
 
 @pytest.mark.parametrize("startup_fill", [False, True])
 @pytest.mark.parametrize("ring_type", ["circular_buffer", "kpool_tail"])
-def test_decode_bench_zero_fills_ring_per_request(
-    monkeypatch, startup_fill, ring_type
-):
-    monkeypatch.setattr(decode_bench_connector, "CircularBufferSpec", CircularBufferSpec)
+def test_decode_bench_zero_fills_ring_per_request(monkeypatch, startup_fill, ring_type):
+    monkeypatch.setattr(
+        decode_bench_connector, "CircularBufferSpec", CircularBufferSpec
+    )
     patch_decode_bench_connector._apply()
 
     extra_config = {"startup_fill": startup_fill}
@@ -64,7 +64,10 @@ def test_decode_bench_zero_fills_ring_per_request(
     )
     request = SimpleNamespace(request_id="request", num_tokens=18)
     blocks = KVCacheBlocks(
-        ([KVCacheBlock(block_id=1), KVCacheBlock(block_id=2)], [KVCacheBlock(block_id=4)])
+        (
+            [KVCacheBlock(block_id=1), KVCacheBlock(block_id=2)],
+            [KVCacheBlock(block_id=4)],
+        )
     )
     scheduler.update_state_after_alloc(request, blocks, num_external_tokens=17)
     metadata = scheduler.build_connector_meta(SchedulerOutput.make_empty())
@@ -73,7 +76,9 @@ def test_decode_bench_zero_fills_ring_per_request(
         request.request_id: (([] if attention_at_startup else [1, 2], [4]), 17)
     }
 
-    worker = decode_bench_connector.DecodeBenchConnectorWorker(vllm_config, cache_config)
+    worker = decode_bench_connector.DecodeBenchConnectorWorker(
+        vllm_config, cache_config
+    )
     attention_cache = torch.zeros(8, 2)
     ring_cache = torch.ones(8, 2)
     worker.register_kv_caches({"attention": attention_cache, "ring": ring_cache})

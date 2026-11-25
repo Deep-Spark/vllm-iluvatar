@@ -395,7 +395,7 @@ class MoECPU(unittest.TestCase):
             fn = load(
                 ROUTER,
                 "grouped_topk",
-                {"torch": TORCH, "is_ivcore30": lambda: arch == "ivcore30"},
+                {"torch": TORCH, "is_ivcore30": lambda arch=arch: arch == "ivcore30"},
             )
             with patch.dict(sys.modules, modules(enabled, arch, ops)):
                 weights, _ = fn(

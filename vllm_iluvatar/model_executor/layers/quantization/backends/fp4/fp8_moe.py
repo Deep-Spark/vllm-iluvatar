@@ -48,26 +48,21 @@ _FP4_MAX_MAG = 6.0
 logger = init_logger(__name__)
 
 
-def _resolve_fp8_moe_activation(
-    layer: RoutedExperts,
-) -> tuple[float, str, float | None]:
-    """Return ``(swiglu_limit, swiglu_variant, gemm1_clamp_limit)``."""
+def _fp8_moe_clamp_limit(layer: RoutedExperts) -> float | None:
+    """Resolve the clamp while preserving legacy activation handling."""
     activation = getattr(layer, "activation", "silu")
     activation = getattr(activation, "value", activation)
-    raw_limit = getattr(layer, "swiglu_limit", None)
+    limit = getattr(layer, "swiglu_limit", None)
     if activation == "swiglustep":
-        limit = swiglustep_limit(raw_limit)
-        return limit, "step3_swiglustep", limit
-    if activation in ("silu", "swiglu"):
-        if raw_limit is not None:
-            limit_f = float(raw_limit)
-            if not math.isfinite(limit_f) or limit_f <= 0.0:
-                raise ValueError(
-                    f"swiglu_limit must be a finite positive float, got {raw_limit!r}"
-                )
-            return limit_f, "dsv4_clamp", limit_f
-        return 0.0, "step3_swiglustep", None
-    raise NotImplementedError(f"Unsupported FP8 MoE activation: {activation!r}")
+        return swiglustep_limit(limit)
+    if activation in ("silu", "swiglu") and limit is not None:
+        limit_f = float(limit)
+        if not math.isfinite(limit_f) or limit_f <= 0.0:
+            raise ValueError(
+                f"swiglu_limit must be a finite positive float, got {limit!r}"
+            )
+        return limit_f
+    return limit
 
 
 def _maybe_build_f4f8_experts(layer: RoutedExperts) -> IluF4F8Experts | None:
@@ -82,7 +77,7 @@ def _maybe_build_f4f8_experts(layer: RoutedExperts) -> IluF4F8Experts | None:
     activation = getattr(activation, "value", activation)
     if activation not in ("silu", "swiglu"):
         return None
-    _, _, clamp_limit = _resolve_fp8_moe_activation(layer)
+    clamp_limit = _fp8_moe_clamp_limit(layer)
     w13 = layer.w13_weight
     w2 = layer.w2_weight
     if w2.shape[1] * 2 != w13.shape[2] // 2 or w2.shape[2] != w13.shape[1] * 2:
@@ -288,7 +283,7 @@ class IluFp8MoEMethod(Fp8MoEMethod):
         )
 
         activation = getattr(layer.activation, "value", layer.activation)
-        _, _, limit = _resolve_fp8_moe_activation(layer)
+        limit = _fp8_moe_clamp_limit(layer)
         return MoEComputeConfig(
             hidden=layer.moe_config.hidden_dim,
             intermediate=layer.moe_config.intermediate_size_per_partition,

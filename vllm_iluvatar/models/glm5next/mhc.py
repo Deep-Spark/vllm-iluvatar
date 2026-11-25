@@ -87,20 +87,22 @@ def mhc_pre(
     residual = residual.contiguous()
     if sqrsum is not None and not _decode_splitk(residual):
         if _can_use_mhc_pre_fp8(want_fp8, norm_weight, sqrsum, residual.shape[0]):
-            post, comb, layer_input, _, fp8_h, h_scale = ixf_mhc.mhc_pre_with_sqrsum_fp8(
-                residual,
-                fn,
-                scale,
-                base,
-                sqrsum,
-                rms_eps,
-                hc_eps,
-                hc_eps,
-                post_mult,
-                sinkhorn_repeat,
-                None,
-                norm_weight,
-                norm_eps,
+            post, comb, layer_input, _, fp8_h, h_scale = (
+                ixf_mhc.mhc_pre_with_sqrsum_fp8(
+                    residual,
+                    fn,
+                    scale,
+                    base,
+                    sqrsum,
+                    rms_eps,
+                    hc_eps,
+                    hc_eps,
+                    post_mult,
+                    sinkhorn_repeat,
+                    None,
+                    norm_weight,
+                    norm_eps,
+                )
             )
             return post, comb, layer_input, fp8_h, h_scale
 
@@ -123,7 +125,7 @@ def mhc_pre(
         return post, comb, layer_input, None, None
 
     fuse_norm = norm_weight is not None and ixfops.enable_hc_pre_norm_fusion(
-        *residual.shape, dtype=residual.dtype
+        *residual.shape, dtype=residual.dtype, emit_dynamic_int8=False
     )
     post, comb, layer_input = ixfops.ds4_mhc_pre_v2(
         residual=residual,

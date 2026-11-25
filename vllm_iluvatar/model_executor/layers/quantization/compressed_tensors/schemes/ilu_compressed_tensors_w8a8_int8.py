@@ -758,7 +758,10 @@ class IluW8A8OnlineLinearMethod(LinearMethodBase):
         output = self.scheme.apply_weights(layer, flat, bias=None)
         tail = None
         if self.quantized_rows is not None:
-            tail = torch.nn.functional.linear(flat, layer.bf16_tail_weight)
+            if flat.is_cuda and self.scheme.arch == "ivcore30":
+                tail = ixf_ops.linear(flat, layer.bf16_tail_weight)
+            else:
+                tail = torch.nn.functional.linear(flat, layer.bf16_tail_weight)
         return output, tail
 
     def apply(self, layer, x, bias=None):

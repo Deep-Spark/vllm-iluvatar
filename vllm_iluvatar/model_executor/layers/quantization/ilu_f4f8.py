@@ -302,10 +302,10 @@ class IluF4F8MoEMethod(FusedMoEMethodBase):
         self, layer: RoutedExperts
     ) -> FusedMoEQuantConfig | None:
         from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe import (
-            _resolve_fp8_moe_activation,
+            _fp8_moe_clamp_limit,
         )
 
-        _, _, clamp_limit = _resolve_fp8_moe_activation(layer)
+        clamp_limit = _fp8_moe_clamp_limit(layer)
         return mxfp4_w4a8_moe_quant_config(
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,

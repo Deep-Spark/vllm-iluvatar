@@ -62,6 +62,10 @@ def select_four_bit_expert_compute(arch, mode, *, source):
     )
 
     modes = _EXPERT_MODES.get(arch, {})
+    if arch == "ivcore11" and source == "block-FP8" and mode == "ixmm_w4a8_nn":
+        return select_moe_backend(arch, name="ixmm_w4a8", layout="NN")
+    if arch == "ivcore11" and source == "block-FP8" and mode == "ixinfer_w4a8_nn_v1":
+        return select_moe_backend(arch, name="ixinfer_w4a8_nn_v1", layout="NN")
     if mode == "auto":
         mode = _EXPERT_DEFAULTS.get(arch)
     if not isinstance(mode, str) or mode not in modes:

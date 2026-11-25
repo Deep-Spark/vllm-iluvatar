@@ -189,11 +189,12 @@ class BlockFp8ToW4A8Loader(BlockFp8WeightLoader):
         _native_converter("fp8_block_to_w4a8")
 
     def convert_shard(self, weight, scale, target, target_scale):
-        fmt = (
-            "ixmm_nn"
-            if self.weight_spec.format_id == "ixmm_w4a8_nn"
-            else "ixinfer_" + self.weight_spec.layout.lower()
-        )
+        fmt = {
+            "ixmm_w4a8_nn": "ixmm_nn",
+            "ixinfer_w4a8_nn_v1": "ixinfer_nn_v1",
+            "ixinfer_w4a8_nn_v2": "ixinfer_nn",
+            "ixinfer_w4a8_tn_v2": "ixinfer_tn",
+        }[self.weight_spec.format_id]
         _native_converter("fp8_block_to_w4a8")(
             weight,
             scale,
@@ -230,7 +231,15 @@ class BlockFp8ToFP4FP8Loader(BlockFp8WeightLoader):
 
 
 def make_block_fp8_loader(weight_spec, load_spec):
+    if weight_spec.format_id == "ixinfer_w4a8_nn_v1" and load_spec.tp_size != 1:
+        raise ValueError(
+            "NN/v1 row scales require the full expert K before quantization"
+        )
     contracts = {
+        "ixinfer_w4a8_nn_v1": (
+            BlockFp8ToW4A8Loader,
+            MoEWeightSpec("ixinfer_w4a8_nn_v1", "NN", torch.int8),
+        ),
         "ixinfer_w4a8_tn_v2": (
             BlockFp8ToW4A8Loader,
             MoEWeightSpec("ixinfer_w4a8_tn_v2", "TN", torch.int8, code_multiplier=18),

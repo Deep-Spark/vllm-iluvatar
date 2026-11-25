@@ -194,6 +194,10 @@ def bind_compute_experts(backend, weights, moe_config, quant_config, prepare_fin
     """Bind only supported communication formats to the same per-layer backend."""
     fmt = prepare_finalize.activation_format
     if fmt == FusedMoEActivationFormat.BatchedExperts:
+        if not getattr(backend, "supports_batched_experts", True):
+            raise NotImplementedError(
+                f"{backend.name} requires Standard expert activations"
+            )
         cls = IluBatchedComputeExperts
         capacity = prepare_finalize.max_num_tokens_per_rank()
         if capacity is None:

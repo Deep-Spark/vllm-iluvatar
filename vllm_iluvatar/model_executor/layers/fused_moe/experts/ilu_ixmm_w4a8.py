@@ -14,8 +14,13 @@ class IxMMW4A8Backend(MoEComputeBackend):
     supports_prequantized_int8 = True
     # activation_dynamic_scaled_int8 preserves plain SwiGLU when limit is None.
     requires_activation_limit = False
-    supported_layouts = {"ivcore30": ("NN",)}
+    supported_layouts = {"ivcore11": ("NN",), "ivcore30": ("NN",)}
     weight_specs = {"NN": MoEWeightSpec("ixmm_w4a8_nn", "NN", torch.int8)}
+
+    @property
+    def supports_batched_experts(self) -> bool:
+        # The padded expert layout builder is provided by the ivcore30 backend.
+        return self.selection.arch == "ivcore30"
 
     def gemm(self, weights, x, scale, prefix, layout, output=None, mode=None):
         return ops.moe_w4a8_group_gemm_ixmm(
@@ -62,6 +67,9 @@ class IxMMW4A8Backend(MoEComputeBackend):
         )
         q = workspace.get("input")
         scale = workspace.get("input_scale").reshape(-1)
+        # BI150 uses the separate quantize and EP expand kernels.
+        if self.selection.arch == "ivcore11" and quantized_input is None:
+            quantized_input = ops.scaled_int8_quant(x)
         if quantized_input is None:
             ops.moe_expand_input_ep_dynamic_scaled_int8(x, inverse, q, scale, topk=k)
         else:

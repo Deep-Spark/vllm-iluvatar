@@ -138,6 +138,7 @@ def test_mxfp4_explicit_mode_overrides_legacy_env(monkeypatch):
     "device,mode,backend,layout",
     [
         ("ivcore11", "auto", "ixinfer_w4a8", "NN"),
+        ("ivcore11", "ixmm_w4a8_nn", "ixmm_w4a8", "NN"),
         ("ivcore11", "ixinfer_w4a8_tn_v2", "ixinfer_w4a8", "TN"),
         ("ivcore30", "auto", "ixmm_fp4fp8", "fp4fp8"),
         ("ivcore30", "ixmm_w4a8_nn", "ixmm_w4a8", "NN"),
@@ -150,6 +151,14 @@ def test_fp8_compute_modes(device, mode, backend, layout):
 
     selection = select_fp8_compute(device, mode)
     assert (selection.name, selection.layout) == (backend, layout)
+
+
+def test_bi150_nn_v1_only_accepts_block_fp8():
+    select = ilu_compute.select_four_bit_expert_compute
+    selection = select("ivcore11", "ixinfer_w4a8_nn_v1", source="block-FP8")
+    assert (selection.name, selection.layout) == ("ixinfer_w4a8_nn_v1", "NN")
+    with pytest.raises(ValueError, match="Unsupported"):
+        select("ivcore11", "ixinfer_w4a8_nn_v1", source="MXFP4")
 
 
 def test_fp8_runtime_compute_conflict(monkeypatch):

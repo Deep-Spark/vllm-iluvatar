@@ -24,14 +24,23 @@ from vllm_iluvatar.model_executor.layers.quantization.common.paired_moe_loader i
 
 
 @pytest.mark.parametrize(
-    "backend,layout",
-    [("ixinfer_w4a8", "TN"), ("ixinfer_w4a8", "NN"), ("ixmm_w4a8", "NN")],
+    "backend,layout,source",
+    [
+        (backend, layout, source)
+        for source in ("mxfp4", "block_fp8")
+        for backend, layout in (
+            ("ixinfer_w4a8", "TN"),
+            ("ixinfer_w4a8", "NN"),
+            ("ixmm_w4a8", "NN"),
+        )
+    ]
+    + [("ixinfer_w4a8_nn_v1", "NN", "block_fp8")],
 )
-@pytest.mark.parametrize("source", ["mxfp4", "block_fp8"])
 def test_w4a8_runtime_weight_contract(backend, layout, source):
     arch = cuda_arch()
-    if (backend == "ixmm_w4a8" and arch != "ivcore30") or (
-        backend == "ixinfer_w4a8" and layout == "NN" and arch != "ivcore11"
+    ixmm_supported = arch == "ivcore30" or (arch == "ivcore11" and source == "block_fp8")
+    if (backend == "ixmm_w4a8" and not ixmm_supported) or (
+        backend.startswith("ixinfer_w4a8") and layout == "NN" and arch != "ivcore11"
     ):
         pytest.skip("Not a supported architecture/layout combination")
     torch.manual_seed(41)
@@ -111,6 +120,25 @@ def test_w4a8_runtime_weight_contract(backend, layout, source):
             torch.tensor([[0, 17], [17, 33]], device="cuda", dtype=torch.int32),
             out,
             backend="ixmm",
+        )
+    elif backend == "ixinfer_w4a8_nn_v1":
+        from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+            MoEComputeConfig,
+            MoEWeights,
+        )
+
+        compute = get_moe_backend(selection)(
+            MoEComputeConfig(k, n // 2, e, e, limit=10), selection
+        )
+        compute.gemm(
+            MoEWeights.from_layer(layer, spec),
+            a,
+            sa,
+            "w13",
+            torch.tensor([17, 16], dtype=torch.int32, device="cuda"),
+            out.dtype,
+            decode=True,
+            output=out,
         )
     else:
         ops.moe_w4a8_group_gemm(
@@ -396,6 +424,7 @@ def test_w4a8_prequantized_input_packet_and_norm_tuple(limit):
         MoEComputeConfig(h, intermediate, experts, experts, limit=limit),
         MoEComputeSelection("ixmm_w4a8", "NN", cuda_arch()),
     )
+    assert compute.supports_batched_experts == (cuda_arch() == "ivcore30")
     tensors = []
     for n, k in ((2 * intermediate, h), (h, intermediate)):
         w = torch.empty((experts, k, n // 2), device="cuda", dtype=torch.int8)
@@ -422,6 +451,9 @@ def test_w4a8_prequantized_input_packet_and_norm_tuple(limit):
     weights = torch.rand(rows, topk, device="cuda")
     residual = torch.randn_like(x) * 0.01
     expected = method.apply(layer, (q, scale, x.dtype), weights, ids, None, residual)
+    if cuda_arch() == "ivcore11":
+        plain = method.apply(layer, x, weights, ids, None, residual)
+        torch.testing.assert_close(plain, expected, rtol=0, atol=0)
     logits = torch.randn(rows, experts, device="cuda")
     packet, layout = pack_router_input(q, scale, logits, None)
     packed, unpacked_logits, _ = unpack_router_input(packet, layout, x.dtype)

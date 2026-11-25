@@ -110,6 +110,7 @@ class MoEComputeBackend(ABC):
     activation_dtype: ClassVar[torch.dtype] = torch.int8
     standard_layout_columns: ClassVar[int] = 2
     requires_contiguous_experts: ClassVar[bool] = True
+    supports_batched_experts: ClassVar[bool] = True
     prefer_hybrid_ep: ClassVar[bool] = True
     supported_activations: ClassVar[tuple[str, ...]] = ("silu", "swiglu")
     requires_activation_limit: ClassVar[bool] = True

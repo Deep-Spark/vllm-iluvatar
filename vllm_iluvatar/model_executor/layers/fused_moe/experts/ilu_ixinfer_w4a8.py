@@ -18,6 +18,7 @@ from .ilu_compute_backend import MoEComputeBackend, MoEWeightSpec, register_moe_
 @register_moe_backend
 class IxInferW4A8Backend(MoEComputeBackend):
     name = "ixinfer_w4a8"
+    pack_version = 2
     priority = 20
     supported_layouts = {"ivcore11": ("NN", "TN"), "ivcore30": ("TN",)}
     weight_specs = {
@@ -81,9 +82,21 @@ class IxInferW4A8Backend(MoEComputeBackend):
             group_size=-1,
             output=output,
         )
+        if decode and self.pack_version == 1:
+            if dtype != torch.bfloat16:
+                raise ValueError("IxInfer NN/v1 Graph GEMM requires BF16 output")
+            if output is None:
+                output = torch.empty(
+                    (x.shape[0], args["w_scales"].shape[-1]),
+                    device=x.device,
+                    dtype=dtype,
+                )
+            args.update(i_scales=scale.reshape(-1).contiguous(), output=output)
+            ops.moe_w4a8_group_gemm(**args, version=1, enable_cuda_graph=True)
+            return output
         if decode:
             return self._gemv(**args, dense_tokens_per_experts=dense)
-        return ops.moe_w4a8_group_gemm(**args, version=2)
+        return ops.moe_w4a8_group_gemm(**args, version=self.pack_version)
 
     def run_standard(
         self,
@@ -106,6 +119,7 @@ class IxInferW4A8Backend(MoEComputeBackend):
         if metadata is not None and not torch.cuda.is_current_stream_capturing():
             decode = bool(metadata.all_ranks_decode_only)
         _ensure_cuda_graph_safe_dispatch(decode, ctx.attn_metadata)
+        gemv = decode and self.pack_version == 2
         start, end = self.local_range(expert_map)
         result = ops.moe_compute_token_index_ep(
             topk_ids=topk_ids,
@@ -113,10 +127,10 @@ class IxInferW4A8Backend(MoEComputeBackend):
             start_expert_id=start,
             end_expert_id=end,
             graph_safe=decode,
-            return_dense_expert_sizes=decode,
+            return_dense_expert_sizes=gemv,
         )
         inverse, order, counts, host_counts, rows = result[:5]
-        dense = result[5] if decode else None
+        dense = result[5] if gemv else None
         if decode:
             rows = topk_ids.numel()
         elif host_counts.sum() == 0:
@@ -127,7 +141,7 @@ class IxInferW4A8Backend(MoEComputeBackend):
             dst_tokens=rows,
             topk=topk_ids.shape[-1],
             src_to_dst=inverse,
-            output_format=int(decode),
+            output_format=int(gemv),
             check_valid=decode,
         )
         selected_counts = counts if decode else host_counts
@@ -146,7 +160,7 @@ class IxInferW4A8Backend(MoEComputeBackend):
         q, scale = ops.swiglu_limit_dynamic_scaled_int8(
             input=intermediate,
             limit=float(self.limit),
-            output_format=int(decode),
+            output_format=int(gemv),
             dst_to_src=order,
             check_valid=decode,
         )
@@ -219,3 +233,24 @@ class IxInferW4A8Backend(MoEComputeBackend):
             output=output.reshape(-1, output.shape[-1]),
         )
         return output
+
+
+@register_moe_backend
+class IxInferW4A8NNV1Backend(IxInferW4A8Backend):
+    """BI150 NN/v1: row scales include the INT4 divisor and Graph GEMM consumes device counts."""
+
+    name = "ixinfer_w4a8_nn_v1"
+    priority = 40
+    pack_version = 1
+    supports_batched_experts = False
+    supported_layouts = {"ivcore11": ("NN",)}
+    weight_specs = {"NN": MoEWeightSpec("ixinfer_w4a8_nn_v1", "NN", torch.int8)}
+
+    @classmethod
+    def support_error(cls, config, selection):
+        if config.local_num_experts < 2:
+            return "IxInfer NN/v1 Graph GEMM requires at least two local experts"
+        return super().support_error(config, selection)
+
+    def run_batched(self, x, weights, scale, counts, *, output, workspace):
+        raise NotImplementedError("IxInfer NN/v1 requires Standard expert activations")

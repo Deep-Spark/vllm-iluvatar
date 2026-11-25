@@ -154,7 +154,7 @@ block-FP8 的 W4A8 和 FP4FP8 loader 共用上述上传槽，转换容量均为�
 
 FP8 加载阶段以 `w13_weight_scale_inv/w2_weight_scale_inv` 注册 scale 参数，使社区原有名称映射保持有效；这些参数的存储从创建时就是目标 scale 的大小和 dtype。加载完整性检查后将同一 Parameter 更名为 `*_weight_scale`，不保留重复参数或整层源 scale。计算只消费最终 `MoEWeights`。
 
-150 的 IxInfer NN/TN 与 300 的 IxMM W4A8 使用 IxFormer `fp8_block_to_w4a8`：一个原生 kernel 完成 block 反量化、全 K channel amax、INT8 RNE、除 18 后 INT4 RNE 和目标布局写入。IxInfer scale 不吸收倍率 18，IxMM scale 吸收。Loader 要求该 native backend 存在；缺失即报错。300 的 FP4FP8 继续使用 `preprocess_fp8_block_weight_for_ixmm`，当 N 为 128 的倍数且 K 为 256 的倍数时原生直写模型切片，其他合法尺寸沿用 Torch 转换。
+150 的 IxInfer NN/TN v2、IxInfer NN v1 与 150/300 的 IxMM W4A8 NN 均使用 IxFormer `fp8_block_to_w4a8`：一个原生 kernel 完成 block 反量化、全 K channel amax、INT8 RNE、第二阶段 INT4 量化与目标布局写入。其中 IxInfer v2 的 scale 不吸收倍率 18；IxMM W4A8 NN 的 scale 吸收倍率 18；150 的 IxInfer NN v1（`ixinfer_w4a8_nn_v1`）按行计算 INT8 码与第二阶段整数除数并将该除数折入 FP32 scale（全零行除数为 1），要求专家层 `tp_size == 1` 以保证量化前拥有完整专家 K。Loader 要求该 native backend 存在；缺失即报错。300 的 FP4FP8 继续使用 `preprocess_fp8_block_weight_for_ixmm`，当 N 为 128 的倍数且 K 为 256 的倍数时原生直写模型切片，其他合法尺寸沿用 Torch 转换。
 
 普通 FP8 已有的 swiglustep、无 clamp 的 SiLU/SwiGLU、TP scale 细化与 W2 K padding 由源 Loader 和 FP4FP8 compute 各自负责。显式 online quant Method 保留其源转换与到达顺序约束，完成转换后也绑定公共 compute。`apply()` 传递 shared residual 和最终输出倍率；`select_gemm_impl()` 绑定同一实例的 Standard/Batched adapter。适配器数值验证与某个模型的分布式通信验收分别记录，不以接口存在性宣称所有模型均支持 LL。
 
@@ -193,7 +193,7 @@ backend 的注册名、架构和布局声明决定其可选范围；注册不等
 
 仅凭 TN/NN 名称不能判断权重能否跨 backend 复用。以 W4A8 为例，IxInfer v2 按 INT4 码值乘 18 解释权重，IxMM 直接消费码值，因此对应转换把倍率计入 IxMM 的 scale。即使某些布局具有相同字节排列，也必须比较完整 `WeightSpec`。
 
-对本地 N×K 投影，IxInfer TN/v2 使用 INT8 `[E,N,K/2]`，NN/v2 使用 INT8 `[E,K,N/2]`，两者 scale 为 FP32 `[E,1,N]`；IxMM W4A8 NN 的形状相同但 code/scale 语义不同。IxMM FP4FP8 使用 UINT8 `[E,K/2,N]` 和 FP32 `[E,K/256,N]`。`w13` 的 gate/up 分别写入两个 N 区间，w2 为 down 投影。Loader 根据完整 `format_id` 和 spec 选择 converter，compute 不持有整层对象或原始 checkpoint。
+对本地 N×K 投影，IxInfer TN/v2 使用 INT8 `[E,N,K/2]`，NN/v2 使用 INT8 `[E,K,N/2]`，两者 scale 为 FP32 `[E,1,N]`；IxMM W4A8 NN 与 IxInfer NN/v1 的张量形状同为 NN 布局，但 code/scale 语义不同。`IxInferW4A8NNV1Backend`（`ixinfer_w4a8_nn_v1`）将第二阶段整数除数折入行 scale，Decode 阶段调用带 device counts 的 Graph group GEMM（`version=1, enable_cuda_graph=True`，要求 BF16 输出且 `local_num_experts >= 2`），而非 v2 的 group GEMV。`IxMMW4A8Backend`（`ixmm_w4a8_nn`）同时支持 150（`ivcore11`）和 300（`ivcore30`）的 NN 布局；150 上 BF16 未预量化输入先调用 `scaled_int8_quant` 再执行 EP 展开，已量化输入直接展开。IxMM FP4FP8 使用 UINT8 `[E,K/2,N]` 和 FP32 `[E,K/256,N]`。`w13` 的 gate/up 分别写入两个 N 区间，w2 为 down 投影。Loader 根据完整 `format_id` 和 spec 选择 converter，compute 不持有整层对象或原始 checkpoint。
 
 MXFP4 到 W4A8 包含数值重量化，不能当成纯转置；FP4FP8 运行格式也有自己的 scale 分组约定。切换计算模式时，精度与性能应分别比较。
 
@@ -213,7 +213,7 @@ MXFP4 到 W4A8 包含数值重量化，不能当成纯转置；FP4FP8 运行格�
 
 `IluStandardComputeExperts` 与 `IluBatchedComputeExperts` 并列继承 `_IluComputeExperts`，薄基类再实现社区 `FusedMoEExpertsModular` 接口。基类组合 backend 与 `MoEWeights` 引用，保存本地 expert 数，并共享设备能力声明、激活与问题尺寸等协议信息；输入布局、workspace 输出形状、计算入口和归约策略由各自的适配器定义。
 
-Standard 与 Batched 的输入形状和输出语义不同，不能互相替代。让 Standard 继承 Batched 会使 token 布局路径继承 expert-major 路径的默认行为，尤其容易混淆有效 token 数、TopK 归约及输出缩放的归属。并列继承保留公共绑定逻辑，同时让每个适配器完整声明自己的协议。`bind_compute_experts()` 负责按输入格式构造适配器，不改变已确定的权重格式或计算 backend。
+Standard 与 Batched 的输入形状和输出语义不同，不能互相替代。让 Standard 继承 Batched 会使 token 布局路径继承 expert-major 路径的默认行为，尤其容易混淆有效 token 数、TopK 归约及输出缩放的归属。并列继承保留公共绑定逻辑，同时让每个适配器完整声明自己的协议。`bind_compute_experts()` 负责按输入格式构造适配器，不改变已确定的权重格式或计算 backend；绑定 `BatchedExperts` 前会检查 backend 的 `supports_batched_experts` 声明，对仅支持 Standard 的 backend（例如 150 上的 `ixmm_w4a8_nn` 与 `ixinfer_w4a8_nn_v1`）显式抛出 `NotImplementedError`。
 
 ```mermaid
 classDiagram
@@ -260,13 +260,13 @@ GLM-5.2 的 block-FP8 Method 从当前计算 backend 取得输入能力。IxMM F
 --additional-config '{"ilu_compute":{"schema_version":1,"moe":{"mode":"ixinfer_w4a8_tn_v2"}}}'
 ```
 
-在 300 上选择 IxMM W4A8 NN：
+在 300 上（或 150 的原始 block-FP8 checkpoint，如 GLM-5.3-Flash BI150 Decode）选择 IxMM W4A8 NN：
 
 ```bash
 --additional-config '{"ilu_compute":{"schema_version":1,"moe":{"mode":"ixmm_w4a8_nn"}}}'
 ```
 
-省略 mode 或选择 `auto` 时，150 默认 IxInfer W4A8 NN，300 默认 IxMM FP4FP8。显式 mode 必须符合当前架构的公共列表；不支持的组合报错。
+省略 mode 或选择 `auto` 时，150 默认 IxInfer W4A8 NN（`ixinfer_w4a8_nn_v2`），300 默认 IxMM FP4FP8（`ixmm_fp4fp8`）。显式 mode 必须符合当前架构的公共列表；此外，150 读取原始 block-FP8 checkpoint 时还支持显式指定 `ixmm_w4a8_nn` 或 `ixinfer_w4a8_nn_v1`（后者要求专家层 `tp_size == 1` 且 `local_num_experts >= 2`），两者仅开放给 block-FP8，MXFP4 在 150 上指定它们或其他不支持组合均报错。
 
 为兼容已有启动方式，在未提供 MoE compute 配置时，150 的旧 `VLLM_ILU_MOE_RUNTIME_LAYOUT` 可以覆盖布局默认值。显式 mode 优先。本文默认项均指未作这类覆盖的行为。
 
@@ -352,7 +352,7 @@ PNG 用于文档展示，SVG 保留可编辑图形，MMD 保留流程图源码�
 
 ## 8. 支持矩阵
 
-本表列出已接入统一 compute backend 的 **MoE Method** 及其计算、通信组合。`IluMxfp4MoEMethod` 读取原始 MXFP4 专家权重，`IluFp8MoEMethod` 读取原始 block-FP8 专家权重，两者均在加载时转换为所选 backend 的运行格式。FP8 已覆盖 Hy4 Flash 双架构回归，以及 GLM-5.2-FP8 在 300 上的通用逐专家加载与整模验证。旧预转换 W4A8 checkpoint 使用已有 Config/Method，不因复用部分算子就归入本表。
+本表列出已接入统一 compute backend 的 **MoE Method** 及其计算、通信组合。`IluMxfp4MoEMethod` 读取原始 MXFP4 专家权重，`IluFp8MoEMethod` 读取原始 block-FP8 专家权重，两者均在加载时转换为所选 backend 的运行格式。FP8 已覆盖 Hy4 Flash 双架构回归、GLM-5.2-FP8 在 300 上的通用逐专家加载与整模验证，以及 GLM-5.3-Flash 在 150 上的原始 FP8 整模加载、全量 GSM8K 与 Prefill/Decode 性能验收。旧预转换 W4A8 checkpoint 使用已有 Config/Method，不因复用部分算子就归入本表。
 
 ![MoE Method、计算 backend 与通信支持矩阵](images/moe-support-matrix.png)
 
@@ -362,31 +362,38 @@ PNG 用于文档展示，SVG 保留可编辑图形，MMD 保留流程图源码�
 
 ### 8.1 模型验证范围
 
-- **DeepSeek V4.1 / MXFP4**：保留既有验证范围。150 的 IxInfer W4A8 NN/TN 均覆盖 AG/RS 与 Hybrid LL/NVSM；300 的 IxMM FP4FP8、IxMM W4A8 NN 覆盖 AG/RS，Hybrid LL/NVSM 尚未验证。
+- **DeepSeek V4.1 / MXFP4**：保留既有验证范围。150 的 IxInfer W4A8 NN/TN 均覆盖 AG/RS 与 Hybrid LL/NVSM；300 的 IxMM FP4FP8、IxMM W4A8 NN 覆盖 AG/RS，Hybrid LL/NVSM 尚未验证。2026-11-25 回归补充验证了 DeepSeek-V4.1-Flash-1017 在 150（TP2×DP8+EP16、IxInfer W4A8 NN v2、BF16 KV/indexer、block size 64、eager）与 300（TP2×DP4+EP8、IxMM W4A8 NN、FP8 KV、block size 128、eager）的起服与单请求生成。
 - **Hy4 Flash / block-FP8**：150 默认 IxInfer W4A8 NN v2，300 默认 IxMM FP4FP8；两机均完成 DP16+EP、AG/RS、DFly5、FULL_DECODE_ONLY，以及 PP8×TP1/TP2 的整模回归和全量 GSM8K。PP 用例验证本地专家计算与权重分片，不额外构成 Hybrid LL/NVSM 验证。原始 FP8 权重在加载时转换，不需要预转换 checkpoint。
-- **GLM-5.2-FP8 / block-FP8**：300 的 IxMM FP4FP8 + AG/RS 已验证，包含 TP2×DP4+EP8（4k 上下文）与 ModelZoo TP2×DP8+EP16（131072 上下文）、MTP3、FP8 KV 和 FULL_DECODE_ONLY。使用默认 `IluFp8MoEMethod` 配对 Loader 完成 FP8→FP4FP8，不需要额外的 `fp4-moe-inline.yaml` 或显式 online-quant 配置。起服及 curl 已验证，TP2×DP8 全量 GSM8K 已完成；性能结果另行记录，不将 GLM-5.3、GLM 的 PP8 或 Hybrid LL/NVSM 一并标为已验证。
-- **FP8 的其他 mode**：300 的 GLM-5.2 已验证 IxMM W4A8 NN 与 IxMM FP4FP8 的 AG/RS，覆盖 PP4×PCP4 Prefill 和 TP1×DP16、MTP3 Decode。两种配置均从原始 block-FP8 checkpoint 加载。150 IxInfer TN 已有转换/compute 设备测试，整模验收待补。显式 online-quant Method 的兼容单测与上述默认 block-FP8 路径分开统计。
+- **GLM-5.2-FP8 / block-FP8**：300 的 IxMM FP4FP8 + AG/RS 已验证，包含 TP2×DP4+EP8（4k 上下文）与 ModelZoo TP2×DP8+EP16（131072 上下文）、MTP3、FP8 KV 和 FULL_DECODE_ONLY。使用默认 `IluFp8MoEMethod` 配对 Loader 完成 FP8→FP4FP8，不需要额外的 `fp4-moe-inline.yaml` 或显式 online-quant 配置。起服及 curl 已验证，TP2×DP8 全量 GSM8K 已完成；性能结果另行记录，不将 GLM-5.2 的 PP8 或 Hybrid LL/NVSM 一并标为已验证。
+- **GLM-5.3-Flash / block-FP8（ivcore11 / BI-V150S）**：直接加载原始 FP8 checkpoint，Linear 自动转 W8A8 INT8，routed experts 转运行期 W4A8 布局，不需要预转换 checkpoint：
+  - **Prefill（默认 `ixinfer_w4a8_nn_v2`）**：PP8×TP1×DP1、112,640 输入、前缀比例 93%、并发 8。首轮三轮同机对照中位数为 12,913.45 tokens/s（较离线 NN v2 中位数 12,950.11 tokens/s 低 0.28%，3/3 通过 5 s TTFT SLA、零抢占）；rebase 后精简脚本单轮复测 13,029.39 tokens/s（TTFT P50 3,277.46 ms、最大 4,788.01 ms、8/8 完成、零抢占）。TP8 并发 64 全量 GSM8K 为 1,287/1,319（97.574%，离线 1,280/1,319，+0.531 个百分点，零错误、零抢占）。
+  - **Decode（推荐 `ixmm_w4a8_nn`）**：TP2×DP8+EP16、AG/RS、MTP5、BF16 KV + INT8 indexer KV、FULL_DECODE_ONLY（112,640 输入、目标输出 600、32 并发）。同机三轮交替验收按协议 SSE interval P50 / 3.2 中位数为 **19.900 ms**（较同版本离线 NN v1 中位数 20.569 ms 快 0.669 ms / 3.25%，3/3 达 20 ms 门槛、32/32 完成、零抢占；目标请求实际 TPOT 中位数 17.116 ms，整轮 MTP 接受率 85.18%）；同机全量 GSM8K（并发 128）为 1,285/1,319（97.422%，离线 1,283/1,319，+0.152 个百分点，草稿接受率 65.57%）。rebase 后精简脚本单轮复测协议延迟 **19.972 ms**（SSE P50 63.910 ms、实际 TPOT 16.892 ms、MTP 接受率 80.71%、零抢占），全量 GSM8K 为 **1,287/1,319（97.574%）**（草稿接受率 63.40%、零错误、零抢占）。
+  - **Decode 备选路径（`ixinfer_w4a8_nn_v1`）**：同拓扑 TP2×DP8+EP16（EP 展开后专家层 `tp_size=1`）、AG/RS、MTP5、FULL_DECODE_ONLY。同机三轮折算延迟中位数 21.025 ms（较同版本离线 NN v1 20.561 ms 高 2.26%，实际 TPOT 中位数 12.753 ms），全量 GSM8K 为 1,288/1,319（97.650%）。默认 `ixinfer_w4a8_nn_v2` 在同一 Decode 拓扑下也可完成（32/32、零抢占），但因走 group GEMV 折算延迟中位数为 29.303 ms，故 150 上 GLM-5.3-Flash Decode 验收选用 `ixmm_w4a8_nn`，`ixinfer_w4a8_nn_v1` 保留为可选兼容路径。
+- **FP8 的其他 mode**：300 的 GLM-5.2 已验证 IxMM W4A8 NN 与 IxMM FP4FP8 的 AG/RS，覆盖 PP4×PCP4 Prefill、TP1×DP16 与 TP2×DP4+EP8 的 MTP3 Decode。两种配置均从原始 block-FP8 checkpoint 加载。150 IxInfer TN 已有转换/compute 设备测试，整模验收待补。显式 online-quant Method 的兼容单测与上述默认 block-FP8 路径分开统计。
 
-GLM 的 ModelZoo 复测保留了模型参数；已激活开发环境时需避免脚本重复加载 CoreX 覆盖 `PYTHONPATH`。README 的 64-token curl 在 thinking 模式下可能截断，关闭 thinking 的冒烟请求已返回 `2` 并正常 stop。这些启动环境和请求预算问题不要求改动默认 FP8 MoE 配置。该轮关服后曾出现设备异常并执行恢复，模型路径的已验证状态不代表设备收尾稳定性也已验收。
+2026-11-25 基于 IxFormer `ab834da4`（锁定 IxMM `d3f7de31`）与插件 `9836d56e` 完成了 4 模型、8 组“平台 × 配置”起服与 `/v1/chat/completions` 单请求回归：150 上覆盖 GLM-5.3-Flash（PP8 Prefill 与 TP2×DP8+EP16 Decode）、Hy4-Flash（PP8 Prefill）与 DeepSeek-V4.1-Flash-1017（TP2×DP8+EP16）；300 上覆盖 GLM-5.2-FP8（TP2×DP4+EP8，IxMM FP4FP8 与 IxMM W4A8 NN）、Hy4-Flash（PP8 Prefill）与 DeepSeek-V4.1-Flash-1017（TP2×DP4+EP8，IxMM W4A8 NN）。8/8 均成功加载、列出模型并返回 HTTP 200、`finish_reason=stop` 且最终答案为 `2`（GLM-5.3 与 Hy4 默认模板含 `<think>` 推理正文；该项仅验证起服与单请求生成，不替代全量精度与性能验收）。
 
-验证依据：Hy4 Flash 150 示例、Hy4 Flash 300 示例、GLM-5.2-FP8 ModelZoo及 2026-11-20 的「[测试 GLM FP8 MoE 部署](codex://threads/01a1f671-3d8c-7182-a747-b375e9a2961d)」验证记录。Hy4 示例的历史成绩对应其记录版本，本次统一 FP8 实现的回归结果不覆盖写入历史成绩。
+GLM-5.2 的 ModelZoo 复测保留了模型参数；已激活开发环境时需避免脚本重复加载 CoreX 覆盖 `PYTHONPATH`。README 的 64-token curl 在 thinking 模式下可能截断，关闭 thinking 的冒烟请求已返回 `2` 并正常 stop。这些启动环境和请求预算问题不要求改动默认 FP8 MoE 配置。该轮关服后曾出现设备异常并执行恢复，模型路径的已验证状态不代表设备收尾稳定性也已验收。
 
-本次 FP8 路径使用的 IxFormer 为 `196693f2c7a0a49ad233bce29604133b5514083f`，包含 W4A8、FP4FP8 权重直写和默认 ixattn 浮点 indexer。构建 pin 的唯一来源为根目录 `Dockerfile`。
+验证依据：Hy4 Flash 150 示例、Hy4 Flash 300 示例、GLM-5.2-FP8 ModelZoo、2026-11-20 的「[测试 GLM FP8 MoE 部署](codex://threads/01a1f671-3d8c-7182-a747-b375e9a2961d)」以及 2026-11-25 的 GLM-5.3-Flash BI150 原始 FP8 适配与多模型回归记录。Hy4 示例的历史成绩对应其记录版本，本次统一 FP8 实现的回归结果不覆盖写入历史成绩。
+
+本次 FP8 路径使用的 IxFormer 为 `ab834da418e21d0096a0d6fbd355ad912ea68aa5`（基于 master `b6deb368`，对应 IxFormer PR #834，锁定 IxMM `d3f7de31`），包含 W4A8（含 NN v1 行 scale 原生转换）、FP4FP8 权重直写和默认 ixattn 浮点 indexer。构建 pin 的唯一来源为根目录 `Dockerfile`。
 
 ### 8.2 通信与公共约束
 
 通信接口及适用条件：
 
-- **AG/RS**：配置 `allgather_reducescatter`，本地专家计算经对应 Method 的 `apply() → backend.run_standard()`。DeepSeek V4.1 在 ivcore11 的 Hybrid Prefill／混合步骤使用该路径；本表 Hy4 Flash、GLM-5.2-FP8 的 EP 用例，以及 ivcore30 的既有 MXFP4 验证，在 Prefill 与 Decode 均使用该路径。
+- **AG/RS**：配置 `allgather_reducescatter`，本地专家计算经对应 Method 的 `apply() → backend.run_standard()`。DeepSeek V4.1 在 ivcore11 的 Hybrid Prefill／混合步骤使用该路径；本表 Hy4 Flash、GLM-5.2-FP8、GLM-5.3-Flash 的 EP 用例，以及 ivcore30 的既有 MXFP4 验证，在 Prefill 与 Decode 均使用该路径。
 - **Hybrid LL / NVSM**：基础通信仍为 AG/RS，显式配置 `VLLM_ILU_DECODE_EP_BACKEND=deepep_low_latency` 与 `VLLM_ILU_DISABLE_DEEPEP=1`。所有 DP rank 均为纯 Decode 时，经 `IluBatchedComputeExperts → backend.run_batched()` 使用 IxFormer NVSM dispatch/combine；其他步骤保持基础通信。这不包含原生 DeepEP LL/HT 或直接将 LL 配为基础 all2all backend。
-- **未验证的组合**：MXFP4 在 ivcore30 的两种 mode 已覆盖 AG/RS；FP8 已验证各架构默认 mode 的 AG/RS，以及 300 上 GLM 的 IxMM W4A8 NN + AG/RS。已有 backend/adapter 接口不足以构成其他 mode 或 LL/NVSM 的整模支持承诺，不将“未验证”写成“不支持”。
+- **未验证与不支持的组合**：MXFP4 在 ivcore30 的两种 mode 已覆盖 AG/RS；FP8 已验证各架构默认 mode 的 AG/RS、150 上 GLM-5.3-Flash 的 IxMM W4A8 NN 与 IxInfer W4A8 NN v1 + AG/RS，以及 300 上 GLM-5.2 的 IxMM W4A8 NN + AG/RS。150 上的 `ixmm_w4a8_nn` 与 `ixinfer_w4a8_nn_v1` 明确不支持 BatchedExperts（即 Hybrid LL/NVSM，矩阵标为 `✗`）。其他已有 backend/adapter 接口不足以构成整模支持承诺，不将“未验证”写成“不支持”。
 - **适配器边界**：当前 AG/RS 接线直接调用 Method，不经过 `IluStandardComputeExperts`。后者提供 Standard modular 协议接口，其独立通信接线不能由上述 AG/RS 结论代替。
-- **并行边界**：PP 属于模型并行拓扑，不是 MoE all2all backend。未启用 EP 时，本地专家同样通过 `apply → run_standard` 执行；P/D KV 传输也不属于本表的专家通信。
+- **并行边界**：PP 属于模型并行拓扑，不是 MoE all2all backend。未启用 EP 时（如 GLM-5.3-Flash 与 Hy4 Flash 的 PP8 Prefill），本地专家同样通过 `apply → run_standard` 执行；P/D KV 传输也不属于本表的专家通信。
 
 公共约束：
 
 - Hybrid 自定义通信入口要求 DP>1、EP、PCP=1；LL hidden size 当前限定为 2048、2560、3072、4096、5120、6144、7168、8192，并需配置足够的 token 容量。
 - 当前 MXFP4 与 block-FP8 Method 均不支持 EPLB。W4A8 要求连续 expert placement；FP4FP8 backend 可使用 expert_map。
+- 150 上的 `ixinfer_w4a8_nn_v1` 仅面向原始 block-FP8，要求专家层 `tp_size == 1`、`local_num_experts >= 2`，且 Decode Graph GEMM 仅支持 BF16 输出。
 - 底层 registry 中的 ivcore30/IxInfer TN 不属于当前 MXFP4/block-FP8 公共 mode，不列入本表。
 
 维护矩阵时同步更新 HTML 源表与 PNG，保证 Method、mode、通信状态及默认标注一致。

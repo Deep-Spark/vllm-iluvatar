@@ -23,6 +23,7 @@
     .section-start > * { border-top: 3px solid #9cacc3; }
     .status { font-size: 24px; font-weight: 600; }
     .yes { color: #16803c; }
+    .no { color: #b42318; }
     .unknown { color: #737d8a; }
     .legend { display: flex; gap: 32px; margin-top: 16px; font-size: 14px; }
     .legend .status { font-size: 18px; vertical-align: middle; }
@@ -32,7 +33,7 @@
 <body>
   <main>
     <h1>MoE 计算与通信支持矩阵</h1>
-    <p class="intro">原始 MXFP4 / block-FP8 → 配对 Loader → compute 运行权重 · 模型验证范围更新于 2026-11-21</p>
+    <p class="intro">原始 MXFP4 / block-FP8 → 配对 Loader → compute 运行权重 · 模型验证范围更新于 2026-11-25</p>
     <div class="table-container">
       <table aria-label="MoE 计算与通信支持矩阵">
         <thead><tr><th scope="col">架构</th><th scope="col">MoE Method / 源格式</th><th scope="col">计算 backend / mode</th><th scope="col">AG/RS</th><th scope="col">Hybrid LL<br>/ NVSM</th><th scope="col">验证模型 / 范围</th></tr></thead>
@@ -41,20 +42,23 @@
 <tr><th scope="row">ivcore11 / 150</th><td><code>IluMxfp4MoEMethod</code><span class="source">MXFP4 源权重</span></td><td>IxInfer W4A8 TN<code class="mode">ixinfer_w4a8_tn_v2</code></td><td><span class="status yes" aria-label="已验证模型组合">✓</span></td><td><span class="status yes" aria-label="已验证模型组合">✓</span></td><td class="models">DeepSeek V4.1</td></tr>
 <tr><th scope="row">ivcore30 / 300</th><td><code>IluMxfp4MoEMethod</code><span class="source">MXFP4 源权重</span></td><td>IxMM FP4FP8（默认）<code class="mode">ixmm_fp4fp8</code></td><td><span class="status yes" aria-label="已验证模型组合">✓</span></td><td><span class="status unknown" aria-label="未完成模型验证">—</span></td><td class="models">DeepSeek V4.1</td></tr>
 <tr><th scope="row">ivcore30 / 300</th><td><code>IluMxfp4MoEMethod</code><span class="source">MXFP4 源权重</span></td><td>IxMM W4A8 NN<code class="mode">ixmm_w4a8_nn</code></td><td><span class="status yes" aria-label="已验证模型组合">✓</span></td><td><span class="status unknown" aria-label="未完成模型验证">—</span></td><td class="models">DeepSeek V4.1</td></tr>
-<tr class="section-start"><th scope="row">ivcore11 / 150</th><td><code>IluFp8MoEMethod</code><span class="source">block-FP8 源权重</span></td><td>IxInfer W4A8 NN（默认）<code class="mode">ixinfer_w4a8_nn_v2</code></td><td><span class="status yes" aria-label="已验证模型组合">✓</span></td><td><span class="status unknown" aria-label="未完成模型验证">—</span></td><td class="models">Hy4 Flash · DP16+EP / DFly5</td></tr>
+<tr class="section-start"><th scope="row">ivcore11 / 150</th><td><code>IluFp8MoEMethod</code><span class="source">block-FP8 源权重</span></td><td>IxInfer W4A8 NN（默认）<code class="mode">ixinfer_w4a8_nn_v2</code></td><td><span class="status yes" aria-label="已验证模型组合">✓</span></td><td><span class="status unknown" aria-label="未完成模型验证">—</span></td><td class="models">Hy4 Flash · DP16+EP / DFly5<br>GLM-5.3-Flash · PP8 Prefill / TP8 GSM8K</td></tr>
+<tr><th scope="row">ivcore11 / 150</th><td><code>IluFp8MoEMethod</code><span class="source">block-FP8 源权重</span></td><td>IxMM W4A8 NN（Decode 推荐）<code class="mode">ixmm_w4a8_nn</code></td><td><span class="status yes" aria-label="已验证模型组合">✓</span></td><td><span class="status no" aria-label="不支持">✗</span></td><td class="models">GLM-5.3-Flash · TP2×DP8+EP16 / MTP5</td></tr>
+<tr><th scope="row">ivcore11 / 150</th><td><code>IluFp8MoEMethod</code><span class="source">block-FP8 源权重</span></td><td>IxInfer W4A8 NN v1（可选）<code class="mode">ixinfer_w4a8_nn_v1</code></td><td><span class="status yes" aria-label="已验证模型组合">✓</span></td><td><span class="status no" aria-label="不支持">✗</span></td><td class="models">GLM-5.3-Flash · TP2×DP8+EP16 / MTP5</td></tr>
 <tr><th scope="row">ivcore11 / 150</th><td><code>IluFp8MoEMethod</code><span class="source">block-FP8 源权重</span></td><td>IxInfer W4A8 TN<code class="mode">ixinfer_w4a8_tn_v2</code></td><td><span class="status unknown" aria-label="未完成模型验证">—</span></td><td><span class="status unknown" aria-label="未完成模型验证">—</span></td><td class="models">仅转换 / compute 设备测试</td></tr>
 <tr><th scope="row">ivcore30 / 300</th><td><code>IluFp8MoEMethod</code><span class="source">block-FP8 源权重</span></td><td>IxMM FP4FP8（默认）<code class="mode">ixmm_fp4fp8</code></td><td><span class="status yes" aria-label="已验证模型组合">✓</span></td><td><span class="status unknown" aria-label="未完成模型验证">—</span></td><td class="models">Hy4 Flash · DP16+EP / DFly5<br>GLM-5.2-FP8 · TP2×DP4/DP8+EP / MTP3</td></tr>
-<tr><th scope="row">ivcore30 / 300</th><td><code>IluFp8MoEMethod</code><span class="source">block-FP8 源权重</span></td><td>IxMM W4A8 NN<code class="mode">ixmm_w4a8_nn</code></td><td><span class="status yes" aria-label="已验证模型组合">✓</span></td><td><span class="status unknown" aria-label="未完成模型验证">—</span></td><td class="models">GLM-5.2 · PP4×PCP4 / DP16+EP</td></tr>
+<tr><th scope="row">ivcore30 / 300</th><td><code>IluFp8MoEMethod</code><span class="source">block-FP8 源权重</span></td><td>IxMM W4A8 NN<code class="mode">ixmm_w4a8_nn</code></td><td><span class="status yes" aria-label="已验证模型组合">✓</span></td><td><span class="status unknown" aria-label="未完成模型验证">—</span></td><td class="models">GLM-5.2 · PP4×PCP4 / DP16+EP / TP2×DP4+EP8</td></tr>
         </tbody>
       </table>
     </div>
     <div class="legend" aria-label="符号说明">
       <span><span class="status yes">✓</span> 已验证的模型组合</span>
+      <span><span class="status no">✗</span> 不支持</span>
       <span><span class="status unknown">—</span> 尚未完成该组合的模型验证</span>
     </div>
     <p class="notes">“默认”仅指计算 mode；模型验证不自动扩展到其他模型或通信组合。150 的 FP8 → IxInfer TN 已完成设备测试。</p>
-    <p class="notes">Hy4 Flash 双架构另覆盖 PP8×TP1/TP2 与全量 GSM8K；GLM-5.2 默认 FP8 Loader 已验证，无需额外 online-quant 配置。</p>
-    <p class="notes">Hybrid LL/NVSM 为基础 AG/RS 上的纯 Decode override；不代表原生 DeepEP LL/HT。详细条件与验证依据见正文 §8。</p>
+    <p class="notes">150 上 ixmm_w4a8_nn 与 ixinfer_w4a8_nn_v1 仅开放给 block-FP8 且仅支持 Standard（不支持 Batched / Hybrid LL）；NN v1 另要求专家层 tp_size=1、local_num_experts≥2。</p>
+    <p class="notes">Hy4 Flash 双架构另覆盖 PP8×TP1/TP2 与全量 GSM8K；GLM-5.3-Flash 150 已完成 PP8 Prefill、TP2×DP8+EP16 Decode 与全量 GSM8K 验收；详细条件与依据见正文 §8。</p>
   </main>
 </body>
 </html>

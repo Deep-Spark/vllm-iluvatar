@@ -111,6 +111,13 @@ def register_activation_prequant(
         _prequant_table()[a.data_ptr()] = (a_fp8, a_scale)
 
 
+def unregister_activation_prequant(a: torch.Tensor) -> None:
+    """Drop a single registered pre-quant entry keyed by ``a``."""
+    table = getattr(_PREQUANT_LOCAL, "entries", None)
+    if table:
+        table.pop(a.data_ptr(), None)
+
+
 def clear_activation_prequant() -> None:
     """Drop all registered pre-quants (call once the consumers have run)."""
     table = getattr(_PREQUANT_LOCAL, "entries", None)

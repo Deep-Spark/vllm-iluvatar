@@ -164,6 +164,13 @@ class HYV4FlashMLASparseImpl(IluFlashMLASparseImpl):
                 _HYV4_FUSE_MLA_REMAP
                 and self.dcp_world_size == 1
                 and self.pcp_world_size == 1
+                and (
+                    num_tokens == 0
+                    or (
+                        attn_metadata.req_id_per_token.shape[0] >= num_tokens
+                        and topk_indices.shape[0] >= num_tokens
+                    )
+                )
             ):
                 if num_tokens == 0:
                     global_indices = torch.empty_like(topk_indices)
@@ -177,7 +184,7 @@ class HYV4FlashMLASparseImpl(IluFlashMLASparseImpl):
                         ixf_ops.triton_convert_req_index_to_global_index(
                             attn_metadata.req_id_per_token[:num_tokens],
                             attn_metadata.block_table,
-                            topk_indices,
+                            topk_indices[:num_tokens],
                             attn_metadata.block_size,
                             return_valid_counts=True,
                         )

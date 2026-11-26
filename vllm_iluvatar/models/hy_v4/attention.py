@@ -1366,8 +1366,10 @@ class HYV4MLAAttention(nn.Module):
             )
             if (
                 self.indexer is not None
+                and getattr(self.indexer, "use_fp8", False)
                 and self.is_sparse
                 and not self.skip_topk
+                and not is_breakable_cudagraph_enabled()
                 and positions.shape[1] == n
             ):
                 self.indexer._prefetched_mrope_table = (pos, cos_sin)
@@ -1408,149 +1410,191 @@ class HYV4MLAAttention(nn.Module):
             _MLA_KV_FUSE_LOGGED = True
         return True
 
+    @staticmethod
+    def _supports_activation_prequant(linear: nn.Module | None) -> bool:
+        if linear is None or getattr(linear, "weight", None) is None:
+            return False
+        if linear.weight.dtype != torch.float8_e4m3fn:
+            return False
+        from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (
+            IluFp8BlockScaledMMKernel,
+        )
+        from vllm_iluvatar.model_executor.layers.quantization.backends.fp8.linear import (
+            IluFp8LinearMethod,
+        )
+        from vllm_iluvatar.model_executor.layers.quantization.ilu_runtime.linear.native_to_fp8 import (
+            IluFp8PerChannelOnlineLinearMethod,
+        )
+
+        qm = getattr(linear, "quant_method", None)
+        if isinstance(qm, IluFp8PerChannelOnlineLinearMethod):
+            return True
+        if (
+            isinstance(qm, IluFp8LinearMethod)
+            and not qm.block_quant
+            and qm.int8_scheme is None
+        ):
+            return True
+        return isinstance(getattr(qm, "fp8_linear", None), IluFp8BlockScaledMMKernel)
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (
+            register_activation_prequant,
+            unregister_activation_prequant,
+        )
+
         q_c = None
-        if self.q_lora_rank is not None:
-            assert self.fused_qkv_a_proj is not None
-            assert self.q_a_layernorm is not None
-            assert self.q_b_proj is not None
-            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
-            q_c, kv_lora = qkv_lora.split(
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                dim=-1,
-            )
-            if (
-                os.environ.get("VLLM_ILU_HYV4_FUSE_QA_NORM_QUANT", "0") != "0"
-                and q_c.is_cuda
-                and q_c.ndim == 2
-                and q_c.shape[0] > 6
-                and q_c.shape[1] % 8 == 0
-                and q_c.stride(0) % 8 == 0
-                and getattr(self.q_b_proj, "weight", None) is not None
-                and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
-                and (
-                    self.indexer is None
-                    or (
-                        getattr(self.indexer.wq_b, "weight", None) is not None
-                        and self.indexer.wq_b.weight.dtype == torch.float8_e4m3fn
+        qc_prequant_registered = False
+        runs_indexer = (
+            self.indexer is not None and self.is_sparse and not self.skip_topk
+        )
+        try:
+            if self.q_lora_rank is not None:
+                assert self.fused_qkv_a_proj is not None
+                assert self.q_a_layernorm is not None
+                assert self.q_b_proj is not None
+                qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+                q_c, kv_lora = qkv_lora.split(
+                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                    dim=-1,
+                )
+                if (
+                    os.environ.get("VLLM_ILU_HYV4_FUSE_QA_NORM_QUANT", "0") != "0"
+                    and q_c.is_cuda
+                    and q_c.ndim == 2
+                    and q_c.shape[0] > 6
+                    and q_c.shape[1] % 8 == 0
+                    and q_c.stride(0) % 8 == 0
+                    and self._supports_activation_prequant(self.q_b_proj)
+                    and (
+                        not runs_indexer
+                        or self._supports_activation_prequant(self.indexer.wq_b)
                     )
-                )
-            ):
-                import ixformer.inference.functions as ixf_ops
+                ):
+                    import ixformer.inference.functions as ixf_ops
 
-                from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (
-                    register_activation_prequant,
-                )
-
-                qc_fp8, qc_scale = ixf_ops.fp8_per_token_dynamic_scaled(
-                    q_c,
-                    rms_weight=self.q_a_layernorm.weight,
-                    rms_eps=float(self.q_a_layernorm.variance_epsilon),
-                )
-                q_c = qkv_lora.view(-1)[: q_c.shape[0] * self.q_lora_rank].view(
-                    q_c.shape[0], self.q_lora_rank
-                )
-                register_activation_prequant(q_c, qc_fp8, qc_scale)
+                    qc_fp8, qc_scale = ixf_ops.fp8_per_token_dynamic_scaled(
+                        q_c,
+                        rms_weight=self.q_a_layernorm.weight,
+                        rms_eps=float(self.q_a_layernorm.variance_epsilon),
+                    )
+                    q_c = qkv_lora.view(-1)[: q_c.shape[0] * self.q_lora_rank].view(
+                        q_c.shape[0], self.q_lora_rank
+                    )
+                    register_activation_prequant(q_c, qc_fp8, qc_scale)
+                    qc_prequant_registered = True
+                else:
+                    q_c = self.q_a_layernorm(q_c)
+                q = self.q_b_proj(q_c)[0]
             else:
-                q_c = self.q_a_layernorm(q_c)
-            q = self.q_b_proj(q_c)[0]
-        else:
-            assert self.q_proj is not None
-            assert self.kv_a_proj_with_mqa is not None
-            q = self.q_proj(hidden_states)[0]
-            kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
+                assert self.q_proj is not None
+                assert self.kv_a_proj_with_mqa is not None
+                q = self.q_proj(hidden_states)[0]
+                kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
 
-        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            kv_c, k_pe = kv_lora.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
 
-        q = q.view(-1, self.num_local_heads, self.qk_head_dim)
-        # Add a head dim of 1 to k_pe.
-        k_pe = k_pe.unsqueeze(1)
-        kv_c_normed = self._prepare_mla_qkv(q, kv_c, k_pe, positions)
+            q = q.view(-1, self.num_local_heads, self.qk_head_dim)
+            # Add a head dim of 1 to k_pe.
+            k_pe = k_pe.unsqueeze(1)
+            kv_c_normed = self._prepare_mla_qkv(q, kv_c, k_pe, positions)
 
-        if llama_4_scaling is not None:
-            q *= llama_4_scaling
+            if llama_4_scaling is not None:
+                q *= llama_4_scaling
 
-        output_shape = (
-            hidden_states.shape[0],
-            self.num_local_heads * self.v_head_dim,
-        )
-        # HY4's elementwise gate is folded into the absorbed v-up store, so the
-        # gate GEMM has to run *before* attention and hand its logits over. The
-        # headwise variant reshapes the output and is left on the eager path.
-        fused_gate = (
-            self.gated_mla
-            and self.linear_gate is not None
-            and self.config.gating_type != "headwise"
-            and getattr(self.mla_attn, "fuse_gate", False)
-        )
-        gate_score = None
-        if is_breakable_cudagraph_enabled():
+            output_shape = (
+                hidden_states.shape[0],
+                self.num_local_heads * self.v_head_dim,
+            )
+            # HY4's elementwise gate is folded into the absorbed v-up store, so the
+            # gate GEMM has to run *before* attention and hand its logits over. The
+            # headwise variant reshapes the output and is left on the eager path.
+            fused_gate = (
+                self.gated_mla
+                and self.linear_gate is not None
+                and self.config.gating_type != "headwise"
+                and getattr(self.mla_attn, "fuse_gate", False)
+            )
+            gate_score = None
+            if is_breakable_cudagraph_enabled():
+                if fused_gate:
+                    gate_score = self.linear_gate(hidden_states)[0]
+                    self.mla_attn.gate_logits = gate_score
+                    self.mla_attn.gate_hidden_states = None
+                    self.mla_attn.linear_gate_ref = None
+                    self.mla_attn.gated_rows = 0
+                # Breakable CUDA graphs replay the eager segment without a Python
+                # return value, so it needs a caller-owned stable output buffer.
+                attn_out = torch.empty(
+                    output_shape, dtype=hidden_states.dtype, device=hidden_states.device
+                )
+                self._indexer_and_attn(
+                    hidden_states, q_c, positions, q, kv_c_normed, k_pe, attn_out
+                )
+            else:
+                # FULL_DECODE_ONLY (the HY4 path) captures the whole function and
+                # does not need the breakable in-place contract. Return the
+                # MLAAttention buffer directly, avoiding one [T,H*V] allocation and
+                # one full copy per layer.
+                if runs_indexer:
+                    self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+                if fused_gate:
+                    self.mla_attn.gate_logits = None
+                    self.mla_attn.gate_hidden_states = hidden_states
+                    self.mla_attn.linear_gate_ref = self.linear_gate
+                    self.mla_attn.gated_rows = 0
+                attn_out = self.mla_attn(
+                    q,
+                    kv_c_normed,
+                    k_pe,
+                    output_shape=output_shape,
+                )
+
             if fused_gate:
-                gate_score = self.linear_gate(hidden_states)[0]
-                self.mla_attn.gate_logits = gate_score
+                gated = self.mla_attn.gated_rows
+                self.mla_attn.gate_logits = None
                 self.mla_attn.gate_hidden_states = None
                 self.mla_attn.linear_gate_ref = None
-                self.mla_attn.gated_rows = 0
-            # Breakable CUDA graphs replay the eager segment without a Python
-            # return value, so it needs a caller-owned stable output buffer.
-            attn_out = torch.empty(
-                output_shape, dtype=hidden_states.dtype, device=hidden_states.device
-            )
-            self._indexer_and_attn(
-                hidden_states, q_c, positions, q, kv_c_normed, k_pe, attn_out
-            )
-        else:
-            # FULL_DECODE_ONLY (the HY4 path) captures the whole function and
-            # does not need the breakable in-place contract. Return the
-            # MLAAttention buffer directly, avoiding one [T,H*V] allocation and
-            # one full copy per layer.
-            if self.indexer is not None and self.is_sparse and not self.skip_topk:
-                self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
-            if fused_gate:
-                self.mla_attn.gate_logits = None
-                self.mla_attn.gate_hidden_states = hidden_states
-                self.mla_attn.linear_gate_ref = self.linear_gate
-                self.mla_attn.gated_rows = 0
-            attn_out = self.mla_attn(
-                q,
-                kv_c_normed,
-                k_pe,
-                output_shape=output_shape,
-            )
-
-        if fused_gate:
-            gated = self.mla_attn.gated_rows
+                if gated < attn_out.shape[0]:
+                    # Mixed batch: the dense-MHA prefill rows never reached the
+                    # gated v-up, so gate the tail here.
+                    tail_gate = (
+                        gate_score[gated:]
+                        if gate_score is not None
+                        else self.linear_gate(hidden_states[gated:])[0]
+                    )
+                    attn_out[gated:].mul_(tail_gate.sigmoid_())
+            elif self.gated_mla and self.linear_gate is not None:
+                gate_score = self.linear_gate(hidden_states)[0]
+                if self.config.gating_type == "headwise":
+                    gate_score = gate_score.unsqueeze(-1)
+                    attn_out = attn_out.reshape(
+                        *attn_out.shape[:-1], -1, self.v_head_dim
+                    )
+                    attn_out = attn_out * torch.sigmoid(gate_score)
+                    attn_out = attn_out.reshape(*attn_out.shape[:-2], -1)
+                else:
+                    # HY4 is ``elementwise``, one gate per output element. Both
+                    # operands are this layer's own freshly allocated buffers (the
+                    # gate GEMM output and, since O2, the MLAAttention output), so
+                    # gating in place drops two [num_tokens, heads * v_head_dim]
+                    # allocations per layer without aliasing anything o_proj reads.
+                    attn_out = attn_out.mul_(gate_score.sigmoid_())
+        finally:
+            if qc_prequant_registered and q_c is not None:
+                unregister_activation_prequant(q_c)
+            if self.indexer is not None:
+                self.indexer._prefetched_mrope_table = None
             self.mla_attn.gate_logits = None
             self.mla_attn.gate_hidden_states = None
             self.mla_attn.linear_gate_ref = None
-            if gated < attn_out.shape[0]:
-                # Mixed batch: the dense-MHA prefill rows never reached the
-                # gated v-up, so gate the tail here.
-                tail_gate = (
-                    gate_score[gated:]
-                    if gate_score is not None
-                    else self.linear_gate(hidden_states[gated:])[0]
-                )
-                attn_out[gated:].mul_(tail_gate.sigmoid_())
-        elif self.gated_mla and self.linear_gate is not None:
-            gate_score = self.linear_gate(hidden_states)[0]
-            if self.config.gating_type == "headwise":
-                gate_score = gate_score.unsqueeze(-1)
-                attn_out = attn_out.reshape(*attn_out.shape[:-1], -1, self.v_head_dim)
-                attn_out = attn_out * torch.sigmoid(gate_score)
-                attn_out = attn_out.reshape(*attn_out.shape[:-2], -1)
-            else:
-                # HY4 is ``elementwise``, one gate per output element. Both
-                # operands are this layer's own freshly allocated buffers (the
-                # gate GEMM output and, since O2, the MLAAttention output), so
-                # gating in place drops two [num_tokens, heads * v_head_dim]
-                # allocations per layer without aliasing anything o_proj reads.
-                attn_out = attn_out.mul_(gate_score.sigmoid_())
 
         out, _ = self.o_proj(attn_out)
         return out

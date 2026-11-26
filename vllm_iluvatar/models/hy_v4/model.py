@@ -365,11 +365,12 @@ class HYV4DecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if _ihc_fuse_norm():
             tokens = q_bytes.shape[0]
+            hidden_dim = layernorm.weight.shape[0]
             q_out = None
             scale_out = None
             if fuse_fp8 and tokens > 4:
                 q_out = torch.empty(
-                    (tokens, 6144),
+                    (tokens, hidden_dim),
                     dtype=torch.float8_e4m3fn,
                     device=q_bytes.device,
                 )
@@ -420,17 +421,19 @@ class HYV4DecoderLayer(nn.Module):
         if isinstance(hidden_states, tuple):
             q_bytes, scale = hidden_states
             if keep_fp8_res or (_pp_act_fp8_fused() and tokens >= 128):
-                hidden_states, post_gates = self._run_ihc_pre_fp8_boundary_and_norm(
-                    self.hc_attn_layer.hc_pre,
-                    self.input_layernorm,
-                    q_bytes,
-                    scale,
-                )
-                hidden_states = self.self_attn(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                )
-                clear_activation_prequant()
+                try:
+                    hidden_states, post_gates = self._run_ihc_pre_fp8_boundary_and_norm(
+                        self.hc_attn_layer.hc_pre,
+                        self.input_layernorm,
+                        q_bytes,
+                        scale,
+                    )
+                    hidden_states = self.self_attn(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                    )
+                finally:
+                    clear_activation_prequant()
                 if keep_fp8_res:
                     hidden_states = _ihc_post_fp8io(
                         hidden_states, q_bytes, scale, post_gates
@@ -441,6 +444,21 @@ class HYV4DecoderLayer(nn.Module):
                     )
             else:
                 hidden_states = _dequant_pp_act(q_bytes, scale)
+                try:
+                    hidden_states, post_gates, residual = self._run_ihc_pre_and_norm(
+                        self.hc_attn_layer, self.input_layernorm, hidden_states
+                    )
+                    hidden_states = self.self_attn(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                    )
+                finally:
+                    clear_activation_prequant()
+                hidden_states = self.hc_attn_layer.post(
+                    hidden_states, residual, post_gates
+                )
+        else:
+            try:
                 hidden_states, post_gates, residual = self._run_ihc_pre_and_norm(
                     self.hc_attn_layer, self.input_layernorm, hidden_states
                 )
@@ -448,19 +466,8 @@ class HYV4DecoderLayer(nn.Module):
                     positions=positions,
                     hidden_states=hidden_states,
                 )
+            finally:
                 clear_activation_prequant()
-                hidden_states = self.hc_attn_layer.post(
-                    hidden_states, residual, post_gates
-                )
-        else:
-            hidden_states, post_gates, residual = self._run_ihc_pre_and_norm(
-                self.hc_attn_layer, self.input_layernorm, hidden_states
-            )
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-            )
-            clear_activation_prequant()
             if keep_fp8_res:
                 hidden_states = _ihc_post_quant_fp8_boundary(
                     hidden_states, residual, post_gates
@@ -472,23 +479,27 @@ class HYV4DecoderLayer(nn.Module):
 
         if isinstance(hidden_states, tuple):
             q_bytes, scale = hidden_states
-            hidden_states, post_gates = self._run_ihc_pre_fp8_boundary_and_norm(
-                self.hc_mlp_layer.hc_pre,
-                self.post_attention_layernorm,
-                q_bytes,
-                scale,
-            )
-            hidden_states = self.mlp(hidden_states)
-            clear_activation_prequant()
+            try:
+                hidden_states, post_gates = self._run_ihc_pre_fp8_boundary_and_norm(
+                    self.hc_mlp_layer.hc_pre,
+                    self.post_attention_layernorm,
+                    q_bytes,
+                    scale,
+                )
+                hidden_states = self.mlp(hidden_states)
+            finally:
+                clear_activation_prequant()
             hidden_states = _ihc_post_fp8io(
                 hidden_states, q_bytes, scale, post_gates
             )
         else:
-            hidden_states, post_gates, residual = self._run_ihc_pre_and_norm(
-                self.hc_mlp_layer, self.post_attention_layernorm, hidden_states
-            )
-            hidden_states = self.mlp(hidden_states)
-            clear_activation_prequant()
+            try:
+                hidden_states, post_gates, residual = self._run_ihc_pre_and_norm(
+                    self.hc_mlp_layer, self.post_attention_layernorm, hidden_states
+                )
+                hidden_states = self.mlp(hidden_states)
+            finally:
+                clear_activation_prequant()
             if getattr(self, "_emit_pp_fp8", False) or keep_fp8_res:
                 assert post_gates is not None
                 hidden_states = _ihc_post_quant_fp8_boundary(
@@ -706,6 +717,8 @@ class HYV4Model(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        if self.topk_index_cache is not None:
+            self.topk_index_cache.clear()
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds

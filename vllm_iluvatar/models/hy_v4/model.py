@@ -57,6 +57,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm_iluvatar.envs import _ILU_CANONICAL_ONLY_ENV_VARS
 
 from .attention import (
     HYV4MLAAttention,
@@ -74,6 +75,111 @@ logger = init_logger(__name__)
 # IntermediateTensors key carrying the DSA top-k buffer across a pipeline
 # boundary whose first layer is shared. See ``HYV4Model``.
 _TOPK_INDICES_KEY = "topk_indices"
+_PP_ACT_SCALE_KEY = "hidden_states_scale"
+
+
+def _pp_act_fp8() -> bool:
+    return _ILU_CANONICAL_ONLY_ENV_VARS["VLLM_ILU_PP_ACT_FP8"]()
+
+
+def _pp_act_fp8_fused() -> bool:
+    return _ILU_CANONICAL_ONLY_ENV_VARS["VLLM_ILU_PP_ACT_FP8_FUSED"]()
+
+
+def _ihc_fp8_res() -> bool:
+    return _ILU_CANONICAL_ONLY_ENV_VARS["VLLM_ILU_IHC_FP8_RES"]()
+
+
+_pp_act_fp8_logged = False
+_pp_act_fp8_fused_logged = False
+_ihc_fp8_res_logged = False
+
+
+def _quant_pp_act(hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    import ixformer.inference.functions as ixfops
+
+    flat = hidden if hidden.dim() == 2 else hidden.flatten(1)
+    if flat.stride(-1) != 1:
+        flat = flat.contiguous()
+    q, scale = ixfops.fp8_per_token_dynamic_scaled(flat)
+    return q.view(torch.uint8), scale.reshape(-1)
+
+
+def _dequant_pp_act(q_bytes: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    import ixformer.inference.functions as ixfops
+
+    return ixfops.hy4_pp_fp8_dequant(q_bytes, scale)
+
+
+def _ihc_pre_fp8_boundary(
+    hc_pre: nn.Module, q_bytes: torch.Tensor, scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    import ixformer.inference.functions as ixfops
+
+    cached = getattr(hc_pre, "_ihc_w_fp8_cache", None)
+    if cached is None:
+        w_bf16 = hc_pre.hc_fn.weight.to(torch.bfloat16).contiguous()
+        w_fp8, w_scale = ixfops.fp8_per_token_dynamic_scaled(w_bf16)
+        cached = (w_fp8.contiguous(), w_scale.reshape(-1).contiguous())
+        hc_pre._ihc_w_fp8_cache = cached
+    w_fp8, w_scale = cached
+    tokens = q_bytes.shape[0]
+    n = 2 * hc_pre.hc_mult
+    if scale.dim() != 1:
+        scale = scale.reshape(tokens)
+    mixes = torch.empty((tokens, n), dtype=torch.bfloat16, device=q_bytes.device)
+    torch.ops._ixformer_C.fp8_per_channel_mm(
+        q_bytes.view(torch.float8_e4m3fn),
+        w_fp8,
+        scale,
+        w_scale,
+        mixes,
+        None,
+        None,
+        1.0,
+        0.0,
+        False,
+    )
+    return ixfops.ihc_pre_epilogue_fp8(
+        q_bytes,
+        scale,
+        mixes,
+        hc_pre.hc_scale,
+        hc_pre.hc_base,
+        norm_eps=float(hc_pre.layernorm_epsilon),
+        hc_eps=float(hc_pre.hc_eps),
+        magnitude=float(hc_pre.magnitude),
+    )
+
+
+def _ihc_post_fp8_boundary(
+    x: torch.Tensor,
+    q_bytes: torch.Tensor,
+    scale: torch.Tensor,
+    post: torch.Tensor,
+) -> torch.Tensor:
+    import ixformer.inference.functions as ixfops
+
+    return ixfops.fuse_ihc_post_fp8(x, q_bytes, scale, post)
+
+
+def _ihc_post_quant_fp8_boundary(
+    x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    import ixformer.inference.functions as ixfops
+
+    return ixfops.fuse_ihc_post_quant_fp8(x, residual, post)
+
+
+def _ihc_post_fp8io(
+    x: torch.Tensor,
+    q_bytes: torch.Tensor,
+    scale: torch.Tensor,
+    post: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    import ixformer.inference.functions as ixfops
+
+    return ixfops.fuse_ihc_post_fp8io(x, q_bytes, scale, post)
 
 
 def _normalize_hyv4_config(config: PretrainedConfig) -> PretrainedConfig:
@@ -191,23 +297,98 @@ class HYV4DecoderLayer(nn.Module):
     def _forward_ihc(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, None]:
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], None]:
         """iHC forward: each sub-block reduces and re-scatters the channels."""
-        hidden_states = self.hc_attn_layer.prepare_input(hidden_states)
-        hidden_states, post_gates, residual = self.hc_attn_layer.pre(hidden_states)
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
+        global _ihc_fp8_res_logged
+        tokens = (
+            hidden_states[0].shape[0]
+            if isinstance(hidden_states, tuple)
+            else hidden_states.shape[0]
         )
-        hidden_states = self.hc_attn_layer.post(hidden_states, residual, post_gates)
+        keep_fp8_res = _ihc_fp8_res() and tokens >= 128
+        if keep_fp8_res and not _ihc_fp8_res_logged:
+            _ihc_fp8_res_logged = True
+            logger.info("iHC residual FP8: tokens>=%d", tokens)
 
-        hidden_states = self.hc_mlp_layer.prepare_input(hidden_states)
-        hidden_states, post_gates, residual = self.hc_mlp_layer.pre(hidden_states)
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = self.hc_mlp_layer.post(hidden_states, residual, post_gates)
+        if isinstance(hidden_states, tuple):
+            q_bytes, scale = hidden_states
+            if keep_fp8_res or (_pp_act_fp8_fused() and tokens >= 128):
+                hidden_states, post_gates = _ihc_pre_fp8_boundary(
+                    self.hc_attn_layer.hc_pre, q_bytes, scale
+                )
+                hidden_states = self.input_layernorm(hidden_states)
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                )
+                if keep_fp8_res:
+                    hidden_states = _ihc_post_fp8io(
+                        hidden_states, q_bytes, scale, post_gates
+                    )
+                else:
+                    hidden_states = _ihc_post_fp8_boundary(
+                        hidden_states, q_bytes, scale, post_gates
+                    )
+            else:
+                hidden_states = _dequant_pp_act(q_bytes, scale)
+                hidden_states = self.hc_attn_layer.prepare_input(hidden_states)
+                hidden_states, post_gates, residual = self.hc_attn_layer.pre(
+                    hidden_states
+                )
+                hidden_states = self.input_layernorm(hidden_states)
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                )
+                hidden_states = self.hc_attn_layer.post(
+                    hidden_states, residual, post_gates
+                )
+        else:
+            hidden_states = self.hc_attn_layer.prepare_input(hidden_states)
+            hidden_states, post_gates, residual = self.hc_attn_layer.pre(
+                hidden_states
+            )
+            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+            if keep_fp8_res:
+                hidden_states = _ihc_post_quant_fp8_boundary(
+                    hidden_states, residual, post_gates
+                )
+            else:
+                hidden_states = self.hc_attn_layer.post(
+                    hidden_states, residual, post_gates
+                )
+
+        if isinstance(hidden_states, tuple):
+            q_bytes, scale = hidden_states
+            hidden_states, post_gates = _ihc_pre_fp8_boundary(
+                self.hc_mlp_layer.hc_pre, q_bytes, scale
+            )
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = _ihc_post_fp8io(
+                hidden_states, q_bytes, scale, post_gates
+            )
+        else:
+            hidden_states = self.hc_mlp_layer.prepare_input(hidden_states)
+            hidden_states, post_gates, residual = self.hc_mlp_layer.pre(
+                hidden_states
+            )
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            if getattr(self, "_emit_pp_fp8", False) or keep_fp8_res:
+                assert post_gates is not None
+                hidden_states = _ihc_post_quant_fp8_boundary(
+                    hidden_states, residual, post_gates
+                )
+            else:
+                hidden_states = self.hc_mlp_layer.post(
+                    hidden_states, residual, post_gates
+                )
 
         # Under iHC the residual is carried inside hidden_states.
         return hidden_states, None
@@ -307,6 +488,14 @@ class HYV4Model(nn.Module):
             and not get_pp_group().is_last_rank
             and hyv4_layer_skip_topk(config, self.end_layer)
         )
+        if (
+            _pp_act_fp8()
+            and _pp_act_fp8_fused()
+            and self.enable_ihc
+            and not get_pp_group().is_last_rank
+            and self.end_layer > self.start_layer
+        ):
+            self.layers[self.end_layer - 1]._emit_pp_fp8 = True
 
         # MoE hyperparameters (consumed by EPLB).
         self.expert_weights: MutableSequence[Sequence[torch.Tensor]] = []
@@ -378,14 +567,18 @@ class HYV4Model(nn.Module):
     def make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device
     ) -> IntermediateTensors:
-        tensors = {
-            key: torch.zeros(
+        tensors = {}
+        for key in self._pp_intermediate_keys:
+            buf_dtype = torch.uint8 if _pp_act_fp8() and key == "hidden_states" else dtype
+            tensors[key] = torch.zeros(
                 (batch_size, self._pp_intermediate_hidden),
-                dtype=dtype,
+                dtype=buf_dtype,
                 device=device,
             )
-            for key in self._pp_intermediate_keys
-        }
+        if _pp_act_fp8():
+            tensors[_PP_ACT_SCALE_KEY] = torch.zeros(
+                (batch_size,), dtype=torch.float32, device=device
+            )
         if self.recv_topk:
             tensors[_TOPK_INDICES_KEY] = torch.zeros(
                 (batch_size, self.config.index_topk),
@@ -410,6 +603,18 @@ class HYV4Model(nn.Module):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
+            if _pp_act_fp8():
+                scale = intermediate_tensors[_PP_ACT_SCALE_KEY]
+                if (
+                    _pp_act_fp8_fused()
+                    and self.enable_ihc
+                    and hidden_states.shape[0] >= 128
+                ):
+                    if scale.dim() != 1:
+                        scale = scale.reshape(hidden_states.shape[0])
+                    hidden_states = (hidden_states, scale)
+                else:
+                    hidden_states = _dequant_pp_act(hidden_states, scale)
             # In iHC mode the flattened [num_tokens, hc*h] tensor from the
             # previous PP stage is reshaped back to 3D by the first layer's
             # prepare_input, and residual is unused.
@@ -425,18 +630,59 @@ class HYV4Model(nn.Module):
             hidden_states, residual = layer(positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
-            num_tokens = hidden_states.shape[0]
-            if self.enable_ihc:
-                # hidden_states is [num_tokens, hc, h]; flatten the channel dim
-                # for PP transfer (matches the 2D receive buffer).
-                tensors = {"hidden_states": hidden_states.flatten(1)}
+            if isinstance(hidden_states, tuple):
+                global _pp_act_fp8_logged, _pp_act_fp8_fused_logged
+                q, scale = hidden_states
+                num_tokens = q.shape[0]
+                tensors = {"hidden_states": q, _PP_ACT_SCALE_KEY: scale}
+                if not _pp_act_fp8_logged:
+                    _pp_act_fp8_logged = True
+                    logger.info(
+                        "PP activation FP8: uint8 %s + scale %s",
+                        tuple(q.shape),
+                        tuple(scale.shape),
+                    )
+                if _pp_act_fp8_fused() and not _pp_act_fp8_fused_logged:
+                    _pp_act_fp8_fused_logged = True
+                    logger.info(
+                        "PP activation FP8 fused iHC: uint8 %s + scale %s",
+                        tuple(q.shape),
+                        tuple(scale.shape),
+                    )
             else:
-                tensors = {"hidden_states": hidden_states, "residual": residual}
+                num_tokens = hidden_states.shape[0]
+                if self.enable_ihc:
+                    flat = hidden_states.flatten(1)
+                else:
+                    flat = hidden_states
+                if _pp_act_fp8():
+                    q, scale = _quant_pp_act(flat)
+                    tensors = {"hidden_states": q, _PP_ACT_SCALE_KEY: scale}
+                    if not self.enable_ihc:
+                        tensors["residual"] = residual
+                    if not _pp_act_fp8_logged:
+                        _pp_act_fp8_logged = True
+                        logger.info(
+                            "PP activation FP8: bf16 %s -> uint8 %s + scale %s",
+                            tuple(flat.shape),
+                            tuple(q.shape),
+                            tuple(scale.shape),
+                        )
+                elif self.enable_ihc:
+                    tensors = {"hidden_states": flat}
+                else:
+                    tensors = {"hidden_states": hidden_states, "residual": residual}
             if self.send_topk:
                 assert self.topk_indices_buffer is not None
                 tensors[_TOPK_INDICES_KEY] = self.topk_indices_buffer[:num_tokens]
             return IntermediateTensors(tensors)
         if self.enable_ihc:
+            if isinstance(hidden_states, tuple):
+                q, scale = hidden_states
+                flat = _dequant_pp_act(q, scale)
+                hidden_states = flat.view(
+                    flat.shape[0], self.config.hc_mult, self.config.hidden_size
+                )
             hidden_states = self.hc_head(hidden_states)
         else:
             hidden_states = hidden_states + residual

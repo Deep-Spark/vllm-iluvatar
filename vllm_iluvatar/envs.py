@@ -306,6 +306,9 @@ if TYPE_CHECKING:
     VLLM_ILU_PP_MAX_CONCURRENT_BATCHES: int = 0
     VLLM_ILU_ENABLE_V2_PP_TOKEN_P2P: bool = False
     VLLM_ILU_PP_SYNC_SENDRECV: bool = True
+    VLLM_ILU_PP_ACT_FP8: bool = False
+    VLLM_ILU_PP_ACT_FP8_FUSED: bool = False
+    VLLM_ILU_IHC_FP8_RES: bool = False
 
     VLLM_ILU_MOE_RUNTIME_LAYOUT: str | None = None
     VLLM_ILU_MOE_W4A8_GEMV_PERF: bool = False
@@ -691,6 +694,9 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_PP_SYNC_SENDRECV": _bool_reader(
         "VLLM_ILU_PP_SYNC_SENDRECV", "1"
     ),
+    "VLLM_ILU_PP_ACT_FP8": _bool_reader("VLLM_ILU_PP_ACT_FP8", "0"),
+    "VLLM_ILU_PP_ACT_FP8_FUSED": _bool_reader("VLLM_ILU_PP_ACT_FP8_FUSED", "0"),
+    "VLLM_ILU_IHC_FP8_RES": _bool_reader("VLLM_ILU_IHC_FP8_RES", "0"),
     # Selects the ilu_mxfp4_fused_experts compute backend. Defaults to "ixmm";
     # "auto" -> ixmm when available else torch; "torch" forces the pure-torch
     # fallback; "ixformer_native" is the correctness-only native kernel.

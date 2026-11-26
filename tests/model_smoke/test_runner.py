@@ -186,7 +186,7 @@ class SmokeTests(unittest.TestCase):
             smoke.load_suite(suite)
 
     def test_bad_selection_never_runs(self):
-        for selected in ("", "unknown", "deepseek-r1,deepseek-r1"):
+        for selected in ("", "unknown", "glm-5-3,glm-5-3"):
             with self.assertRaises(ValueError):
                 smoke.load_plan(SMOKE / "suite.json", selected, SMOKE / "cases.json")
 

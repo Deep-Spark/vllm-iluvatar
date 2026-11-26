@@ -261,6 +261,8 @@ if TYPE_CHECKING:
     VLLM_ILU_GLM5_FP8_ATTN: bool = False
     VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP: bool = False
     VLLM_ILU_MOE_AG_SHARED_OVERLAP: bool = False
+    # DP/PCP=1: overlap local shared MLP with routed expert compute (not AG).
+    VLLM_ILU_MOE_SHARED_ROUTED_OVERLAP: bool = False
     VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP: bool = False
     VLLM_ILU_V41_AGRS_TP1_RS: bool = False
     VLLM_ILU_V41_PACKED_FP8_DISPATCH: bool = False
@@ -773,6 +775,12 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # MoERunner AG/RS: overlap local shared MLP with input dispatch.
     "VLLM_ILU_MOE_AG_SHARED_OVERLAP": _bool_reader(
         "VLLM_ILU_MOE_AG_SHARED_OVERLAP", "0"
+    ),
+    # MoERunner local path (DP=1, PCP=1): overlap shared MLP with routed
+    # experts. Distinct from AG_SHARED_OVERLAP, which only covers dispatch.
+    # Opt-in; restart workers after changing.
+    "VLLM_ILU_MOE_SHARED_ROUTED_OVERLAP": _bool_reader(
+        "VLLM_ILU_MOE_SHARED_ROUTED_OVERLAP", "0"
     ),
     # GLM indexer preparation fusion. Default 1; set 0 for the split path:
     # - glm_dsa_indexer_q_rope_weights: in-place RoPE on Q's first 64 dims

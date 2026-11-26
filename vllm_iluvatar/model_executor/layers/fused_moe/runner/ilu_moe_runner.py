@@ -81,6 +81,7 @@ class IluMoERunner(MoERunner):
     def __init__(self, *args, routed_scaling_factor: float = 1.0, **kwargs):
         super().__init__(*args, routed_scaling_factor=routed_scaling_factor, **kwargs)
         self._ag_shared_overlap_enabled = envs.VLLM_ILU_MOE_AG_SHARED_OVERLAP
+        self._shared_routed_overlap_enabled = envs.VLLM_ILU_MOE_SHARED_ROUTED_OVERLAP
         logger.info_once("Use Iluvatar MoERunner.")
 
         # Performance-path toggle: gather hidden states before the replicated
@@ -217,10 +218,14 @@ class IluMoERunner(MoERunner):
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
         shared_output: torch.Tensor | None = None,
+        shared_experts_overlapping: bool = False,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        # shared_output: already joined (AG path). shared_experts_overlapping:
+        # launched on aux and still in flight; caller joins after routed.
         shared_ready = shared_output is not None
+        skip_shared_launch = shared_ready or shared_experts_overlapping
         experts_order = SharedExpertsOrder.NONE
-        if not shared_ready and self._shared_experts is not None:
+        if not skip_shared_launch and self._shared_experts is not None:
             experts_order = self._shared_experts._determine_shared_experts_order(
                 shared_experts_input
             )
@@ -236,7 +241,7 @@ class IluMoERunner(MoERunner):
             experts_order == SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
         )
 
-        if not shared_ready:
+        if not skip_shared_launch:
             self._maybe_apply_shared_experts(
                 shared_experts_input, SharedExpertsOrder.NO_OVERLAP
             )
@@ -281,6 +286,10 @@ class IluMoERunner(MoERunner):
 
         if shared_ready:
             return shared_output, fused_out
+
+        if shared_experts_overlapping:
+            # Caller owns end_dispatch / wait; do not re-launch shared here.
+            return None, fused_out
 
         self._maybe_apply_shared_experts(
             shared_experts_input,
@@ -472,6 +481,17 @@ class IluMoERunner(MoERunner):
             return self._forward_impl_decode_packed_fp8(
                 hidden_states, shared_experts_input, schedule_shared
             )
+        # AG_SHARED_OVERLAP only covers dispatch. On DP=1/PCP=1 there is no
+        # collective dispatch, so join-before-experts hides nothing; use
+        # SHARED_ROUTED_OVERLAP to keep shared on aux through routed compute.
+        has_collective_dispatch = (
+            self.do_naive_dispatch_combine or self._needs_pcp_dispatch_combine
+        )
+        local_shared_routed_overlap = (
+            schedule_shared
+            and self._shared_routed_overlap_enabled
+            and not has_collective_dispatch
+        )
         if gate_after_dispatch:
             router_logits = None
         elif self.gate is not None:
@@ -523,7 +543,9 @@ class IluMoERunner(MoERunner):
             if schedule_shared:
                 stream = self._shared_experts.begin_dispatch(
                     shared_experts_input,
-                    overlap=self._ag_shared_overlap_enabled,
+                    overlap=(
+                        self._ag_shared_overlap_enabled or local_shared_routed_overlap
+                    ),
                 )
             if packed_int8:
                 hidden_states, router_logits, input_ids = self._dispatch_packed_int8(
@@ -539,8 +561,13 @@ class IluMoERunner(MoERunner):
                     router_logits,
                     input_ids,
                 )
+            # Join before experts only when overlapping dispatch, or when
+            # shared ran sync on the main stream. Local routed-overlap keeps
+            # the aux stream live through _apply_quant_method.
             shared_output = (
-                self._shared_experts.end_dispatch(stream) if schedule_shared else None
+                self._shared_experts.end_dispatch(stream)
+                if schedule_shared and not local_shared_routed_overlap
+                else None
             )
             # All dispatch (including PCP) is complete before the deferred gate.
             if gate_after_dispatch:
@@ -561,13 +588,18 @@ class IluMoERunner(MoERunner):
                     shared_experts_input=shared_experts_input,
                     input_ids=input_ids,
                     shared_output=shared_output,
+                    shared_experts_overlapping=local_shared_routed_overlap,
                 )
+            if local_shared_routed_overlap:
+                shared_output = self._shared_experts.end_dispatch(stream)
             if ag_rs:
                 logger.info_once(
-                    "MoERunner phase=%s, gate_after_dispatch=%s, shared_overlap=%s",
+                    "MoERunner phase=%s, gate_after_dispatch=%s, "
+                    "shared_overlap=%s, shared_routed_overlap=%s",
                     "decode" if decode_only else "prefill/mixed",
                     gate_after_dispatch,
                     self._ag_shared_overlap_enabled,
+                    local_shared_routed_overlap,
                 )
             return self._maybe_combine(shared_output, hidden_states)
 

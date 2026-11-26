@@ -68,6 +68,7 @@ def _make_stub_runner(
     obj.routed_scaling_factor = routed_scaling_factor
     obj.shared_experts_scaling_factor = 1.0
     obj._ag_shared_overlap_enabled = False
+    obj._shared_routed_overlap_enabled = False
     # Normally set in __init__ from envs; the stub bypasses __init__.
     obj._gather_before_gate_enabled = True
 
@@ -738,6 +739,84 @@ def test_runner_initializes_ag_shared_overlap_without_model_wiring(enabled):
         patch.object(MoERunner, "__init__", return_value=None),
         patch(f"{module}.get_current_vllm_config", return_value=config),
         patch(f"{module}.envs.VLLM_ILU_MOE_AG_SHARED_OVERLAP", enabled),
+        patch(f"{module}.envs.VLLM_ILU_MOE_SHARED_ROUTED_OVERLAP", False),
     ):
         IluMoERunner.__init__(runner)
     assert runner._ag_shared_overlap_enabled is enabled
+    assert runner._shared_routed_overlap_enabled is False
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_runner_initializes_shared_routed_overlap_without_model_wiring(enabled):
+    runner = _make_stub_runner()
+    module = "vllm_iluvatar.model_executor.layers.fused_moe.runner.ilu_moe_runner"
+    config = MagicMock()
+    config.parallel_config.enable_elastic_ep = False
+    with (
+        patch.object(MoERunner, "__init__", return_value=None),
+        patch(f"{module}.get_current_vllm_config", return_value=config),
+        patch(f"{module}.envs.VLLM_ILU_MOE_AG_SHARED_OVERLAP", False),
+        patch(f"{module}.envs.VLLM_ILU_MOE_SHARED_ROUTED_OVERLAP", enabled),
+    ):
+        IluMoERunner.__init__(runner)
+    assert runner._shared_routed_overlap_enabled is enabled
+
+
+def test_local_shared_routed_overlap_joins_after_experts():
+    """DP=1/PCP=1: shared must stay on aux through routed, then join."""
+    from types import SimpleNamespace
+
+    import ixformer.inference.functions as ops
+
+    runner = _make_stub_runner()
+    runner.moe_config.moe_parallel_config.all2all_backend = "allgather_reducescatter"
+    runner.moe_config.dp_size = 1
+    runner.moe_config.pcp_size = 1
+    runner.routed_experts.quant_method.is_monolithic = False
+    runner.routed_experts.quant_method.supports_prequantized_input = False
+    runner.routed_experts.custom_routing_function = None
+    runner.routed_input_transform = None
+    runner._fse_fuse_gate = False
+    runner._ag_shared_overlap_enabled = False
+    runner._shared_routed_overlap_enabled = True
+    runner._sequence_parallel_context = nullcontext
+    runner.gate = None
+    events = []
+    x = torch.ones(3, 256, dtype=torch.bfloat16)
+    shared = x * 2
+
+    def begin(value, *, overlap):
+        events.append("shared")
+        assert overlap is True
+        return "aux"
+
+    def join(stream):
+        events.append("join")
+        assert stream == "aux"
+        return shared
+
+    def dispatch(value, logits, ids):
+        events.append("dispatch")
+        return value, logits, ids
+
+    def apply(**kw):
+        events.append("experts")
+        assert kw["shared_output"] is None
+        assert kw["shared_experts_overlapping"] is True
+        return None, x
+
+    runner._shared_experts.begin_dispatch.side_effect = begin
+    runner._shared_experts.end_dispatch.side_effect = join
+    runner._maybe_dispatch = dispatch
+    runner._apply_quant_method = apply
+    runner._maybe_combine = lambda s, r: s + r
+    with (
+        patch(
+            "vllm_iluvatar.model_executor.layers.fused_moe.runner.ilu_moe_runner.get_forward_context",
+            return_value=SimpleNamespace(dp_metadata=None),
+        ),
+        patch.object(ops, "scaled_int8_quant") as quant,
+    ):
+        torch.testing.assert_close(runner._forward_impl(x, torch.zeros(3, 8), x), x * 3)
+    quant.assert_not_called()
+    assert events == ["shared", "dispatch", "experts", "join"]

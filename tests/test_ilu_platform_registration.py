@@ -63,6 +63,7 @@ def test_dsa_indexer_prepare_env_reader_defaults_on(monkeypatch):
     "name",
     [
         "VLLM_ILU_MOE_AG_SHARED_OVERLAP",
+        "VLLM_ILU_MOE_SHARED_ROUTED_OVERLAP",
     ],
 )
 def test_moe_all_gather_env_readers_are_opt_in(monkeypatch, name):

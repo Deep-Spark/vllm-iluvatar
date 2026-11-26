@@ -31,14 +31,23 @@ import ixformer.inference.functions as ixfops
 import torch
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
+from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (
+    register_activation_prequant,
+    sliced_activation_prequant,
+    unregister_activation_prequant,
+)
 from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
     IluDeepseekV32IndexerBackend,
     IluDeepseekV32IndexerMetadata,
+    IluDeepseekV32IndexerPrefillChunkMetadata,
 )
+
+logger = init_logger(__name__)
 
 # 4-byte fp32 ue8m0 scale per token (quant_block_size == index_head_dim).
 _INDEXER_FP8_SCALE_BYTES = 4
@@ -152,45 +161,15 @@ def _indexer_rope_table(
     return token_pos, table
 
 
-def hy4_fp8_indexer_forward(
+def _insert_indexer_k_cache(
     indexer,
-    hidden_states: torch.Tensor,
-    qr: torch.Tensor,
+    kw: torch.Tensor,
+    indexer_positions: torch.Tensor,
+    cos_sin: torch.Tensor,
     positions: torch.Tensor,
     rotary_emb: torch.nn.Module,
-) -> torch.Tensor:
-    """fp8 replacement for ``Indexer.forward``; ``indexer`` is that module."""
-    indexer_positions, cos_sin = _indexer_rope_table(
-        indexer, positions, rotary_emb, hidden_states
-    )
-    q, _ = indexer.wq_b(qr)
-    q = q.view(-1, indexer.n_head, indexer.head_dim)
-
-    kw, _ = indexer.wk_weights_proj(hidden_states)
-
-    # Fused forward-RoPE + per-(token, head) ue8m0 fp8 quant. The op folds
-    # softmax_scale, head_scale and the per-row q_scale into ``weights``, so
-    # ``weights_in`` is the raw projection slice, *not* the pre-scaled
-    # ``weights`` the bf16 path builds.
-    q_fp8, weights = ixfops.fused_indexer_q_rope_quant(
-        q,
-        indexer_positions,
-        cos_sin,
-        kw[:, indexer.head_dim :].contiguous(),
-        indexer.softmax_scale,
-        indexer.n_head_scale,
-        indexer.rope_dim,
-    )
-
-    topk_indices_buffer = indexer.topk_indices_buffer
-    attn_metadata = get_forward_context().attn_metadata
-    if not isinstance(attn_metadata, dict):
-        return topk_indices_buffer
-    md = attn_metadata.get(indexer.k_cache.prefix)
-    if md is None:
-        return topk_indices_buffer
-    assert isinstance(md, IluDeepseekV32IndexerMetadata)
-
+    md: IluDeepseekV32IndexerMetadata,
+) -> None:
     kv_cache = indexer.k_cache.kv_cache
     slot_mapping = md.slot_mapping
     if getattr(md, "pcp_world_size", 1) > 1:
@@ -237,6 +216,478 @@ def hy4_fp8_indexer_forward(
                 k_pe.copy_(k_pe_out.reshape(k_pe.shape))
         slots = slot_mapping.reshape(-1)[:n].contiguous()
         ixfops.hy4_indexer_k_fp8_insert(k, kv_cache, slots)
+
+
+def compute_offload_split_t(
+    md: IluDeepseekV32IndexerMetadata | None,
+    total_tokens: int,
+    index_topk: int,
+) -> tuple[int, int] | None:
+    """Deterministically split prefill query tokens between local head and offloaded tail.
+
+    Returns ``(split_t, prefill_end)`` where the receiver rank computes
+    ``[0, split_t)`` and the predecessor helper rank computes
+    ``[split_t, prefill_end)``, or ``None`` when the batch is too small /
+    decode-only. Uses CPU chunk metadata exclusively (zero GPU-CPU sync) and
+    snaps ``split_t`` to an 8-row CTA boundary inside the split request so
+    every ``dsa_indexer_mqa_logits_fp8_h32`` CTA stays bit-identical.
+    """
+    if (
+        md is None
+        or md.num_prefills <= 0
+        or md.prefill is None
+        or not md.prefill.chunks
+        or index_topk % 2 != 0
+        or getattr(md, "pcp_world_size", 1) > 1
+    ):
+        return None
+
+    chunks = md.prefill.chunks
+    prefill_start = chunks[0].token_start
+    prefill_end = chunks[-1].token_end
+    prefill_tokens = prefill_end - prefill_start
+    min_tokens = int(os.environ.get("VLLM_ILU_HYV4_PP_OFFLOAD_MIN_TOKENS", "256"))
+    if total_tokens < 128 or prefill_end != total_tokens or prefill_tokens < min_tokens:
+        return None
+
+    max_wire_tokens = total_tokens // 2
+    ratio = float(os.environ.get("VLLM_ILU_HYV4_PP_OFFLOAD_RATIO", "0.42"))
+    ratio = min(max(ratio, 0.05), 0.50)
+    desired_tail = min(int(round(prefill_tokens * ratio)), max_wire_tokens)
+    if desired_tail <= 0:
+        return None
+
+    raw_split_t = prefill_end - desired_tail
+    split_t = raw_split_t
+    for chunk in chunks:
+        if not (chunk.token_start <= raw_split_t < chunk.token_end):
+            continue
+        cu_q_cpu = (
+            chunk.cu_seqlens_q_cpu
+            if chunk.cu_seqlens_q_cpu is not None
+            else [int(x) for x in chunk.cu_seqlens_q.cpu().tolist()]
+        )
+        rel = raw_split_t - chunk.token_start
+        for b in range(chunk.num_reqs):
+            q_s = cu_q_cpu[b]
+            q_e = cu_q_cpu[b + 1]
+            if q_s <= rel < q_e:
+                aligned_rel = min(q_s + ((rel - q_s + 7) // 8) * 8, q_e)
+                split_t = chunk.token_start + aligned_rel
+                break
+        break
+
+    # Keep >10 Q CTAs (88+ rows at BQ=8) on both sides so neither half flips
+    # into the small-M score specialization.
+    min_half_tokens = int(
+        os.environ.get("VLLM_ILU_HYV4_PP_OFFLOAD_MIN_HALF_TOKENS", "88")
+    )
+    head_prefill_tokens = split_t - prefill_start
+    tail_tokens = prefill_end - split_t
+    if (
+        head_prefill_tokens < min_half_tokens
+        or tail_tokens < min_half_tokens
+        or tail_tokens > max_wire_tokens
+    ):
+        return None
+    return split_t, prefill_end
+
+
+def slice_indexer_prefill_chunk(
+    chunk: IluDeepseekV32IndexerPrefillChunkMetadata,
+    q_start: int,
+    q_end: int,
+) -> IluDeepseekV32IndexerPrefillChunkMetadata | None:
+    """Restrict ``chunk`` to global query token range ``[q_start, q_end)``."""
+    if chunk.token_end <= q_start or chunk.token_start >= q_end:
+        return None
+    if q_start <= chunk.token_start and chunk.token_end <= q_end:
+        return chunk
+
+    sub_start = max(chunk.token_start, q_start)
+    sub_end = min(chunk.token_end, q_end)
+    rel_s = sub_start - chunk.token_start
+    rel_e = sub_end - chunk.token_start
+    sub_m = rel_e - rel_s
+    if sub_m <= 0:
+        return None
+
+    cu_q_cpu = (
+        chunk.cu_seqlens_q_cpu
+        if chunk.cu_seqlens_q_cpu is not None
+        else [int(x) for x in chunk.cu_seqlens_q.cpu().tolist()]
+    )
+    b_lo = 0
+    while b_lo < chunk.num_reqs and cu_q_cpu[b_lo + 1] <= rel_s:
+        b_lo += 1
+    b_hi = b_lo
+    while b_hi < chunk.num_reqs and cu_q_cpu[b_hi] < rel_e:
+        b_hi += 1
+    sub_num_reqs = b_hi - b_lo
+    if sub_num_reqs <= 0:
+        return None
+
+    sub_cu_q_cpu = [
+        min(max(cu_q_cpu[b] - rel_s, 0), sub_m) for b in range(b_lo, b_hi + 1)
+    ]
+    sub_max_q = max(
+        sub_cu_q_cpu[i + 1] - sub_cu_q_cpu[i] for i in range(sub_num_reqs)
+    )
+    if (
+        b_lo == 0
+        and rel_s == 0
+        and cu_q_cpu[b_hi] == sub_m
+    ):
+        sub_cu_q = chunk.cu_seqlens_q[: b_hi + 1]
+    else:
+        sub_cu_q = (chunk.cu_seqlens_q[b_lo : b_hi + 1] - rel_s).clamp_(
+            0, sub_m
+        )
+
+    if b_lo == 0 and b_hi == chunk.num_reqs:
+        sub_cu_kv = chunk.cu_seq_lens
+        sub_bt = chunk.block_table
+        sub_max_ctx = chunk.max_context_len
+        sub_max_kv = chunk.max_kv_len
+        sub_total_seq = chunk.total_seq_lens
+        sub_seq_comp_cpu = chunk.seq_lens_comp_cpu
+    else:
+        if chunk.seq_lens_comp_cpu is not None:
+            sub_seq_comp_cpu = chunk.seq_lens_comp_cpu[b_lo:b_hi]
+        else:
+            cu_kv_cpu = [int(x) for x in chunk.cu_seq_lens.cpu().tolist()]
+            sub_seq_comp_cpu = [
+                cu_kv_cpu[b + 1] - cu_kv_cpu[b] for b in range(b_lo, b_hi)
+            ]
+        if b_lo == 0:
+            sub_cu_kv = chunk.cu_seq_lens[: b_hi + 1]
+        else:
+            sub_cu_kv = (
+                chunk.cu_seq_lens[b_lo : b_hi + 1]
+                - chunk.cu_seq_lens[b_lo : b_lo + 1]
+            )
+        sub_bt = chunk.block_table[b_lo:b_hi]
+        sub_max_ctx = max(sub_seq_comp_cpu) if sub_seq_comp_cpu else 0
+        sub_max_kv = sub_max_ctx
+        sub_total_seq = sum(sub_seq_comp_cpu)
+
+    return IluDeepseekV32IndexerPrefillChunkMetadata(
+        block_table=sub_bt,
+        cu_seqlen_ks=chunk.cu_seqlen_ks[rel_s:rel_e],
+        cu_seqlen_ke=chunk.cu_seqlen_ke[rel_s:rel_e],
+        valid_lens=chunk.valid_lens[rel_s:rel_e],
+        cu_seq_lens=sub_cu_kv,
+        cu_seqlens_q=sub_cu_q,
+        token_to_seq=chunk.token_to_seq,
+        total_seq_lens=sub_total_seq,
+        token_start=sub_start,
+        token_end=sub_end,
+        num_reqs=sub_num_reqs,
+        max_context_len=sub_max_ctx,
+        max_q_len=sub_max_q,
+        max_kv_len=sub_max_kv,
+        skip_kv_gather=chunk.skip_kv_gather,
+        context_lower_bound=0,
+        cu_seqlens_q_cpu=sub_cu_q_cpu,
+        seq_lens_comp_cpu=sub_seq_comp_cpu,
+    )
+
+
+def _run_prefill_chunks_range(
+    chunks: list[IluDeepseekV32IndexerPrefillChunkMetadata],
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_tokens: int,
+    out_buffer: torch.Tensor,
+    q_start: int,
+    q_end: int,
+    q_base_offset: int,
+) -> None:
+    for chunk in chunks:
+        sub = slice_indexer_prefill_chunk(chunk, q_start, q_end)
+        if sub is None or sub.max_context_len == 0:
+            continue
+        local_s = sub.token_start - q_base_offset
+        local_e = sub.token_end - q_base_offset
+        logits = ixfops.dsa_indexer_mqa_logits_with_kvcache_fp8(
+            q_fp8[local_s:local_e],
+            sub.cu_seqlens_q,
+            sub.cu_seq_lens,
+            kv_cache,
+            sub.block_table,
+            weights[local_s:local_e],
+            max_q_len=sub.max_q_len,
+            max_kv_len=sub.max_kv_len,
+            max_context_len=sub.max_context_len,
+            valid_lens=sub.valid_lens,
+            context_lower_bound=sub.context_lower_bound,
+        )
+        ixfops.dsa_update_topk_indices(
+            logits,
+            sub.cu_seqlen_ks,
+            sub.cu_seqlen_ke,
+            topk_tokens,
+            out_buffer[local_s:local_e],
+        )
+
+
+def hy4_fp8_indexer_forward_offload_sender(
+    indexer,
+    normed_hidden_states: torch.Tensor,
+    fused_qkv_a_proj: torch.nn.Module,
+    q_a_layernorm: torch.nn.Module,
+    q_lora_rank: int,
+    kv_lora_and_rope_dim: int,
+    supports_wq_b_prequant: bool,
+    positions: torch.Tensor,
+    rotary_emb: torch.nn.Module,
+    wire_out: torch.Tensor,
+) -> torch.Tensor:
+    """Predecessor-stage helper: sync mirrored K-cache and compute offloaded tail top-k.
+
+    ``wire_out`` is a physical ``(N, index_topk // 2)`` int32 plane. The tail
+    top-k is packed as a contiguous ``(tail_len, index_topk)`` view over the
+    leading ``tail_len * index_topk`` flat entries (capacity holds because
+    ``tail_len <= N // 2``). The receiver must use the same flat view; do not
+    read ``wire_out[split_t:prefill_end]`` as row-aligned ``(N, topk/2)`` rows.
+    """
+    indexer_positions, cos_sin = _indexer_rope_table(
+        indexer, positions, rotary_emb, normed_hidden_states
+    )
+    kw, _ = indexer.wk_weights_proj(normed_hidden_states)
+
+    attn_metadata = get_forward_context().attn_metadata
+    md = (
+        attn_metadata.get(indexer.k_cache.prefix)
+        if isinstance(attn_metadata, dict)
+        else None
+    )
+    if md is None:
+        # Startup memory profiling often has empty attn_metadata; still
+        # exercise the tail projection shapes so peak activation includes
+        # the helper workspace. Outside profiling this means the helper's
+        # indexer was never registered — offload silently no-ops and the
+        # receiver falls back to a full indexer.
+        logger.warning_once(
+            "HY4 PP offload sender missing indexer metadata for %s; "
+            "skipping tail top-k write (receiver will run full indexer if "
+            "split is also unavailable).",
+            getattr(indexer.k_cache, "prefix", "<unknown>"),
+        )
+        total = normed_hidden_states.shape[0]
+        if total >= 256:
+            half_s = total - (total // 2)
+            with sliced_activation_prequant(
+                normed_hidden_states, half_s, total
+            ) as sub_h:
+                qkv_lora = fused_qkv_a_proj(sub_h)[0]
+            q_c, _ = qkv_lora.split([q_lora_rank, kv_lora_and_rope_dim], dim=-1)
+            q_c = q_a_layernorm(q_c)
+            _ = indexer.wq_b(q_c)
+        return wire_out
+
+    assert isinstance(md, IluDeepseekV32IndexerMetadata)
+    # Gate before K-insert: compute_offload_split_t returns None for PCP>1 /
+    # mixed / tiny batches, while _insert_indexer_k_cache raises on PCP>1.
+    split_range = compute_offload_split_t(
+        md, normed_hidden_states.shape[0], indexer.topk_tokens
+    )
+    if split_range is None:
+        return wire_out
+
+    _insert_indexer_k_cache(
+        indexer, kw, indexer_positions, cos_sin, positions, rotary_emb, md
+    )
+
+    split_t, prefill_end = split_range
+    tail_len = prefill_end - split_t
+    with sliced_activation_prequant(
+        normed_hidden_states, split_t, prefill_end
+    ) as sub_hidden:
+        qkv_lora = fused_qkv_a_proj(sub_hidden)[0]
+
+    q_c, _ = qkv_lora.split([q_lora_rank, kv_lora_and_rope_dim], dim=-1)
+    qc_prequant_registered = False
+    try:
+        if (
+            os.environ.get("VLLM_ILU_HYV4_FUSE_QA_NORM_QUANT", "0") != "0"
+            and q_c.is_cuda
+            and q_c.ndim == 2
+            and q_c.shape[0] > 6
+            and q_c.shape[1] % 8 == 0
+            and q_c.stride(0) % 8 == 0
+            and supports_wq_b_prequant
+        ):
+            qc_fp8, qc_scale = ixfops.fp8_per_token_dynamic_scaled(
+                q_c,
+                rms_weight=q_a_layernorm.weight,
+                rms_eps=float(q_a_layernorm.variance_epsilon),
+            )
+            q_c = qkv_lora.view(-1)[: q_c.shape[0] * q_lora_rank].view(
+                q_c.shape[0], q_lora_rank
+            )
+            register_activation_prequant(q_c, qc_fp8, qc_scale)
+            qc_prequant_registered = True
+        else:
+            q_c = q_a_layernorm(q_c)
+        q_tail, _ = indexer.wq_b(q_c)
+    finally:
+        if qc_prequant_registered:
+            unregister_activation_prequant(q_c)
+
+    q_tail = q_tail.view(-1, indexer.n_head, indexer.head_dim)
+    q_fp8_tail, weights_tail = ixfops.fused_indexer_q_rope_quant(
+        q_tail,
+        indexer_positions[split_t:prefill_end].contiguous(),
+        cos_sin,
+        kw[split_t:prefill_end, indexer.head_dim :].contiguous(),
+        indexer.softmax_scale,
+        indexer.n_head_scale,
+        indexer.rope_dim,
+    )
+
+    topk_tokens = indexer.topk_tokens
+    # Flat pack into the (N, topk/2) plane — see docstring above.
+    topk_tail_out = wire_out.view(-1)[: tail_len * topk_tokens].view(
+        tail_len, topk_tokens
+    )
+    assert md.prefill is not None
+    _run_prefill_chunks_range(
+        md.prefill.chunks,
+        q_fp8_tail,
+        weights_tail,
+        indexer.k_cache.kv_cache,
+        topk_tokens,
+        topk_tail_out,
+        q_start=split_t,
+        q_end=prefill_end,
+        q_base_offset=split_t,
+    )
+    return wire_out
+
+
+def hy4_fp8_indexer_forward(
+    indexer,
+    hidden_states: torch.Tensor,
+    qr: torch.Tensor,
+    positions: torch.Tensor,
+    rotary_emb: torch.nn.Module,
+) -> torch.Tensor:
+    """fp8 replacement for ``Indexer.forward``; ``indexer`` is that module."""
+    topk_indices_buffer = indexer.topk_indices_buffer
+    attn_metadata = get_forward_context().attn_metadata
+    md = (
+        attn_metadata.get(indexer.k_cache.prefix)
+        if isinstance(attn_metadata, dict)
+        else None
+    )
+    offload_recv_wire = getattr(indexer, "_offload_recv_wire", None)
+    if offload_recv_wire is not None and isinstance(md, IluDeepseekV32IndexerMetadata):
+        split_range = compute_offload_split_t(
+            md, hidden_states.shape[0], indexer.topk_tokens
+        )
+        if split_range is not None:
+            split_t, prefill_end = split_range
+            tail_len = prefill_end - split_t
+            indexer_positions, cos_sin = _indexer_rope_table(
+                indexer, positions, rotary_emb, hidden_states
+            )
+            kw, _ = indexer.wk_weights_proj(hidden_states)
+            _insert_indexer_k_cache(
+                indexer, kw, indexer_positions, cos_sin, positions, rotary_emb, md
+            )
+
+            with sliced_activation_prequant(qr, 0, split_t) as qr_head:
+                q_head, _ = indexer.wq_b(qr_head)
+            q_head = q_head.view(-1, indexer.n_head, indexer.head_dim)
+            q_fp8_head, weights_head = ixfops.fused_indexer_q_rope_quant(
+                q_head,
+                indexer_positions[:split_t].contiguous(),
+                cos_sin,
+                kw[:split_t, indexer.head_dim :].contiguous(),
+                indexer.softmax_scale,
+                indexer.n_head_scale,
+                indexer.rope_dim,
+            )
+
+            topk_tokens = indexer.topk_tokens
+            topk_indices_buffer[split_t:prefill_end].copy_(
+                offload_recv_wire.view(-1)[: tail_len * topk_tokens].view(
+                    tail_len, topk_tokens
+                )
+            )
+            kv_cache = indexer.k_cache.kv_cache
+            assert md.prefill is not None
+            _run_prefill_chunks_range(
+                md.prefill.chunks,
+                q_fp8_head,
+                weights_head,
+                kv_cache,
+                topk_tokens,
+                topk_indices_buffer,
+                q_start=0,
+                q_end=split_t,
+                q_base_offset=0,
+            )
+
+            if md.num_decodes > 0:
+                assert md.decode is not None
+                num_decode_tokens = md.num_decode_tokens
+                if md.decode.max_context_len == 0:
+                    topk_indices_buffer[:num_decode_tokens].fill_(-1)
+                    return topk_indices_buffer
+                logits = ixfops.dsa_indexer_mqa_logits_with_kvcache_fp8(
+                    q_fp8_head[:num_decode_tokens],
+                    md.decode.cu_seqlens_q,
+                    md.decode.cu_seqlens_kv,
+                    kv_cache,
+                    md.decode.block_table,
+                    weights_head[:num_decode_tokens],
+                    max_q_len=md.decode.max_q_len,
+                    max_kv_len=md.decode.max_kv_len,
+                    max_context_len=md.decode.max_context_len,
+                    valid_lens=md.decode.valid_lens,
+                )
+                ixfops.dsa_update_topk_indices(
+                    logits,
+                    md.decode.cu_seqlen_ks,
+                    md.decode.cu_seqlen_ke,
+                    topk_tokens,
+                    topk_indices_buffer[:num_decode_tokens],
+                )
+            return topk_indices_buffer
+
+    indexer_positions, cos_sin = _indexer_rope_table(
+        indexer, positions, rotary_emb, hidden_states
+    )
+    q, _ = indexer.wq_b(qr)
+    q = q.view(-1, indexer.n_head, indexer.head_dim)
+
+    kw, _ = indexer.wk_weights_proj(hidden_states)
+
+    # Fused forward-RoPE + per-(token, head) ue8m0 fp8 quant. The op folds
+    # softmax_scale, head_scale and the per-row q_scale into ``weights``, so
+    # ``weights_in`` is the raw projection slice, *not* the pre-scaled
+    # ``weights`` the bf16 path builds.
+    q_fp8, weights = ixfops.fused_indexer_q_rope_quant(
+        q,
+        indexer_positions,
+        cos_sin,
+        kw[:, indexer.head_dim :].contiguous(),
+        indexer.softmax_scale,
+        indexer.n_head_scale,
+        indexer.rope_dim,
+    )
+
+    if not isinstance(attn_metadata, dict) or md is None:
+        return topk_indices_buffer
+    assert isinstance(md, IluDeepseekV32IndexerMetadata)
+
+    _insert_indexer_k_cache(
+        indexer, kw, indexer_positions, cos_sin, positions, rotary_emb, md
+    )
+    kv_cache = indexer.k_cache.kv_cache
 
     topk_tokens = indexer.topk_tokens
 

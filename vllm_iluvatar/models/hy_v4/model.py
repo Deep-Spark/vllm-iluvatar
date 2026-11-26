@@ -22,6 +22,7 @@ Remove   : when the Iluvatar vLLM baseline carries hy_v4 natively.
 from __future__ import annotations
 
 import os
+import time
 import typing
 from collections.abc import Callable, Iterable, MutableSequence, Sequence
 from itertools import islice
@@ -36,9 +37,11 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.utils import get_pp_indices
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -61,11 +64,15 @@ from vllm.sequence import IntermediateTensors
 from vllm_iluvatar.envs import _ILU_CANONICAL_ONLY_ENV_VARS
 
 from .attention import (
+    _HYV4_DSA_FP8_CACHE_DTYPES,
     HYV4MLAAttention,
+    Indexer,
+    build_hy4_ropes,
     compute_skip_topk_layers,
     hyv4_layer_skip_topk,
     is_skip_topk_indexer_weight,
 )
+from .fp8_indexer import hy4_fp8_indexer_forward_offload_sender
 from .hc import HYV4HCHeadLayer, HYV4HCLayer
 from .moe import HYV4FeedForward, HYV4MoEFused
 from .topk_index_cache import HYV4TopkIndexCache
@@ -76,6 +83,7 @@ logger = init_logger(__name__)
 # IntermediateTensors key carrying the DSA top-k buffer across a pipeline
 # boundary whose first layer is shared. See ``HYV4Model``.
 _TOPK_INDICES_KEY = "topk_indices"
+_OFFLOAD_FIRST_TOPK_KEY = "offload_first_topk"
 _PP_ACT_SCALE_KEY = "hidden_states_scale"
 
 
@@ -89,6 +97,90 @@ def _ihc_fp8_res() -> bool:
 
 def _ihc_fuse_norm() -> bool:
     return os.environ.get("VLLM_ILU_HYV4_FUSE_IHC_NORM", "1") != "0"
+
+
+def _pp_offload_first_indexer() -> bool:
+    return os.environ.get("VLLM_ILU_HYV4_PP_OFFLOAD_FIRST_INDEXER", "0") == "1"
+
+
+def _pp_pack_tensors() -> bool:
+    return os.environ.get("VLLM_ILU_HYV4_PP_PACK_TENSORS", "1") != "0"
+
+
+def _pp_stage_timer_enabled() -> bool:
+    return os.environ.get("VLLM_ILU_HYV4_STAGE_TIMER", "0") == "1"
+
+
+def compute_pp_packed_row_bytes(hidden_cols: int, topk_cols: int) -> int:
+    """Per-token byte width of a plane-major packed PP boundary tensor."""
+    return hidden_cols + topk_cols * 4 + 4
+
+
+def pack_hy4_pp_boundary(
+    pack_buf_2d: torch.Tensor,
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    topk: torch.Tensor | None = None,
+    *,
+    topk_cols: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Pack ``(q, topk, scale)`` into a single contiguous ``[N, W]`` uint8 buffer.
+
+    Layout in the flat ``N * W`` byte view is plane-major so every unpacked view
+    stays contiguous and 4-byte (in fact 4096-byte for HY4) aligned while
+    preserving ``dim 0 == num_tokens`` for ``sync_and_gather_intermediate_tensors``:
+      1. ``q``     : ``[0, N * hidden_cols)`` uint8 -> ``(N, hidden_cols)``
+      2. ``topk``  : ``[N * hidden_cols, + N * topk_cols * 4)`` int32 -> ``(N, topk_cols)``
+      3. ``scale`` : ``[..., N * W)`` float32 -> ``(N,)``
+
+    If ``topk is None`` and ``topk_cols > 0``, returns a writable ``(N, topk_cols)``
+    int32 view into plane 2 so callers (such as ``forward_offload``) can write
+    directly into the wire buffer with zero extra copy.
+    """
+    num_tokens, hidden_cols = q.shape
+    row_bytes = compute_pp_packed_row_bytes(hidden_cols, topk_cols)
+    out_2d = pack_buf_2d[:num_tokens]
+    assert out_2d.shape == (num_tokens, row_bytes) and out_2d.is_contiguous()
+    flat = out_2d.view(-1)
+    o_q = num_tokens * hidden_cols
+    o_tk = o_q + num_tokens * topk_cols * 4
+    o_end = o_tk + num_tokens * 4
+
+    flat[:o_q].view(num_tokens, hidden_cols).copy_(q)
+    flat[o_tk:o_end].view(torch.float32).copy_(scale.reshape(num_tokens))
+
+    topk_view: torch.Tensor | None = None
+    if topk_cols > 0:
+        topk_view = flat[o_q:o_tk].view(torch.int32).view(num_tokens, topk_cols)
+        if topk is not None:
+            topk_view.copy_(topk[:num_tokens])
+    return out_2d, topk_view
+
+
+def unpack_hy4_pp_boundary(
+    packed_2d: torch.Tensor,
+    hidden_cols: int,
+    topk_cols: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Zero-copy unpack of a ``[N, W]`` plane-major PP boundary tensor."""
+    if not packed_2d.is_contiguous():
+        packed_2d = packed_2d.contiguous()
+    num_tokens = packed_2d.shape[0]
+    row_bytes = compute_pp_packed_row_bytes(hidden_cols, topk_cols)
+    assert packed_2d.shape == (num_tokens, row_bytes)
+    flat = packed_2d.view(-1)
+    o_q = num_tokens * hidden_cols
+    o_tk = o_q + num_tokens * topk_cols * 4
+    o_end = o_tk + num_tokens * 4
+
+    q = flat[:o_q].view(num_tokens, hidden_cols)
+    scale = flat[o_tk:o_end].view(torch.float32)
+    topk = (
+        flat[o_q:o_tk].view(torch.int32).view(num_tokens, topk_cols)
+        if topk_cols > 0
+        else None
+    )
+    return q, scale, topk
 
 
 _pp_act_fp8_fused_logged = False
@@ -314,45 +406,9 @@ class HYV4DecoderLayer(nn.Module):
         *,
         fuse_fp8: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
-        global _ihc_fuse_norm_logged
-        hidden_states = hc_layer.prepare_input(hidden_states)
-        if _ihc_fuse_norm() and hc_layer.can_fuse_norm(hidden_states):
-            tokens = hidden_states.shape[0]
-            hidden_dim = hidden_states.shape[2]
-            q_out = None
-            scale_out = None
-            if fuse_fp8 and tokens > 4:
-                q_out = torch.empty(
-                    (tokens, hidden_dim),
-                    dtype=torch.float8_e4m3fn,
-                    device=hidden_states.device,
-                )
-                scale_out = torch.empty(
-                    (tokens,), dtype=torch.float32, device=hidden_states.device
-                )
-            normed, post_gates, residual = hc_layer.pre(
-                hidden_states,
-                rms_weight=layernorm.weight.data,
-                rms_eps=float(layernorm.variance_epsilon),
-                q_out=q_out,
-                scale_out=scale_out,
-            )
-            if q_out is not None and scale_out is not None:
-                from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (
-                    register_activation_prequant,
-                )
-
-                register_activation_prequant(normed, q_out, scale_out)
-            if not _ihc_fuse_norm_logged:
-                _ihc_fuse_norm_logged = True
-                logger.info(
-                    "HYV4 iHC pre + RMSNorm (+ FP8 quant) fusion armed "
-                    "(VLLM_ILU_HYV4_FUSE_IHC_NORM=1)"
-                )
-            return normed, post_gates, residual
-
-        reduced, post_gates, residual = hc_layer.pre(hidden_states)
-        return layernorm(reduced), post_gates, residual
+        return _run_ihc_pre_and_norm_impl(
+            hc_layer, layernorm, hidden_states, fuse_fp8=fuse_fp8
+        )
 
     def _run_ihc_pre_fp8_boundary_and_norm(
         self,
@@ -363,39 +419,9 @@ class HYV4DecoderLayer(nn.Module):
         *,
         fuse_fp8: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if _ihc_fuse_norm():
-            tokens = q_bytes.shape[0]
-            hidden_dim = layernorm.weight.shape[0]
-            q_out = None
-            scale_out = None
-            if fuse_fp8 and tokens > 4:
-                q_out = torch.empty(
-                    (tokens, hidden_dim),
-                    dtype=torch.float8_e4m3fn,
-                    device=q_bytes.device,
-                )
-                scale_out = torch.empty(
-                    (tokens,), dtype=torch.float32, device=q_bytes.device
-                )
-            normed, post_gates = _ihc_pre_fp8_boundary(
-                hc_pre,
-                q_bytes,
-                scale,
-                rms_weight=layernorm.weight.data,
-                rms_eps=float(layernorm.variance_epsilon),
-                q_out=q_out,
-                scale_out=scale_out,
-            )
-            if q_out is not None and scale_out is not None:
-                from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (
-                    register_activation_prequant,
-                )
-
-                register_activation_prequant(normed, q_out, scale_out)
-            return normed, post_gates
-
-        reduced, post_gates = _ihc_pre_fp8_boundary(hc_pre, q_bytes, scale)
-        return layernorm(reduced), post_gates
+        return _run_ihc_pre_fp8_boundary_and_norm_impl(
+            hc_pre, layernorm, q_bytes, scale, fuse_fp8=fuse_fp8
+        )
 
     def _forward_ihc(
         self,
@@ -514,6 +540,328 @@ class HYV4DecoderLayer(nn.Module):
         return hidden_states, None
 
 
+def _run_ihc_pre_and_norm_impl(
+    hc_layer: HYV4HCLayer,
+    layernorm: RMSNorm,
+    hidden_states: torch.Tensor,
+    *,
+    fuse_fp8: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    global _ihc_fuse_norm_logged
+    hidden_states = hc_layer.prepare_input(hidden_states)
+    if _ihc_fuse_norm() and hc_layer.can_fuse_norm(hidden_states):
+        tokens = hidden_states.shape[0]
+        hidden_dim = hidden_states.shape[2]
+        q_out = None
+        scale_out = None
+        if fuse_fp8 and tokens > 4:
+            q_out = torch.empty(
+                (tokens, hidden_dim),
+                dtype=torch.float8_e4m3fn,
+                device=hidden_states.device,
+            )
+            scale_out = torch.empty(
+                (tokens,), dtype=torch.float32, device=hidden_states.device
+            )
+        normed, post_gates, residual = hc_layer.pre(
+            hidden_states,
+            rms_weight=layernorm.weight.data,
+            rms_eps=float(layernorm.variance_epsilon),
+            q_out=q_out,
+            scale_out=scale_out,
+        )
+        if q_out is not None and scale_out is not None:
+            from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (
+                register_activation_prequant,
+            )
+
+            register_activation_prequant(normed, q_out, scale_out)
+        if not _ihc_fuse_norm_logged:
+            _ihc_fuse_norm_logged = True
+            logger.info(
+                "HYV4 iHC pre + RMSNorm (+ FP8 quant) fusion armed "
+                "(VLLM_ILU_HYV4_FUSE_IHC_NORM=1)"
+            )
+        return normed, post_gates, residual
+
+    reduced, post_gates, residual = hc_layer.pre(hidden_states)
+    return layernorm(reduced), post_gates, residual
+
+
+def _run_ihc_pre_fp8_boundary_and_norm_impl(
+    hc_pre: nn.Module,
+    layernorm: RMSNorm,
+    q_bytes: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    fuse_fp8: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if _ihc_fuse_norm():
+        tokens = q_bytes.shape[0]
+        hidden_dim = layernorm.weight.shape[0]
+        q_out = None
+        scale_out = None
+        if fuse_fp8 and tokens > 4:
+            q_out = torch.empty(
+                (tokens, hidden_dim),
+                dtype=torch.float8_e4m3fn,
+                device=q_bytes.device,
+            )
+            scale_out = torch.empty(
+                (tokens,), dtype=torch.float32, device=q_bytes.device
+            )
+        normed, post_gates = _ihc_pre_fp8_boundary(
+            hc_pre,
+            q_bytes,
+            scale,
+            rms_weight=layernorm.weight.data,
+            rms_eps=float(layernorm.variance_epsilon),
+            q_out=q_out,
+            scale_out=scale_out,
+        )
+        if q_out is not None and scale_out is not None:
+            from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (
+                register_activation_prequant,
+            )
+
+            register_activation_prequant(normed, q_out, scale_out)
+        return normed, post_gates
+
+    reduced, post_gates = _ihc_pre_fp8_boundary(hc_pre, q_bytes, scale)
+    return layernorm(reduced), post_gates
+
+
+def _compute_pp_first_indexer_offload_hops(
+    config: PretrainedConfig,
+    cache_config: CacheConfig | None,
+    pp_world_size: int,
+    *,
+    pcp_size: int = 1,
+) -> set[int]:
+    """Return sender PP ranks ``r`` that co-compute stage ``r+1``'s first full indexer.
+
+    Requires TP=1 and PCP=1: the helper's K-insert / MQA path is PCP=1-only, and
+    ``compute_offload_split_t`` also refuses PCP>1.
+    """
+    if (
+        not _pp_offload_first_indexer()
+        or pp_world_size <= 1
+        or pcp_size > 1
+        or not hasattr(config, "index_topk")
+        or config.index_topk % 2 != 0
+        or getattr(config, "q_lora_rank", None) is None
+        or cache_config is None
+        or (cache_config.cache_dtype or "auto") not in _HYV4_DSA_FP8_CACHE_DTYPES
+        or get_tensor_model_parallel_world_size() != 1
+    ):
+        return set()
+
+    cuts = [
+        get_pp_indices(config.num_hidden_layers, rank, pp_world_size)
+        for rank in range(pp_world_size)
+    ]
+    full_counts = [
+        sum(
+            1
+            for layer_idx in range(s, e)
+            if not hyv4_layer_skip_topk(config, layer_idx)
+        )
+        for s, e in cuts
+    ]
+    active_senders: set[int] = set()
+    for r in range(pp_world_size - 1):
+        if (r - 1) in active_senders:
+            continue
+        s_curr, e_curr = cuts[r]
+        s_next, e_next = cuts[r + 1]
+        if e_curr <= s_curr or e_next <= s_next:
+            continue
+        if hyv4_layer_skip_topk(config, s_next):
+            continue
+        if full_counts[r] < full_counts[r + 1]:
+            active_senders.add(r)
+    return active_senders
+
+
+class HYV4OffloadFirstIndexerAttn(nn.Module):
+    """Mirrored self-attn subset (``fused_qkv_a_proj`` + ``q_a_layernorm`` + ``indexer``).
+
+    Lives at ``layers[end_layer].self_attn`` on predecessor helper ranks while
+    marking all unused main-MLA projections as ``PPMissingLayer`` so checkpoint
+    loading reuses the exact canonical prefixes and FP8 online quant rules.
+    """
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        config: PretrainedConfig,
+        cache_config: CacheConfig,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.q_lora_rank = config.q_lora_rank
+        self.kv_lora_rank = config.kv_lora_rank
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+
+        self.fused_qkv_a_proj = MergedColumnParallelLinear(
+            self.hidden_size,
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.fused_qkv_a_proj",
+            disable_tp=True,
+        )
+        self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+        self.indexer_rope_emb, self.indexer_mrope_emb = build_hy4_ropes(
+            self.qk_rope_head_dim,
+            max_position_embeddings,
+            config.rope_parameters,
+        )
+        dummy_topk = torch.empty(
+            (1, config.index_topk),
+            dtype=torch.int32,
+            device=current_platform.device_type,
+        )
+        self.indexer = Indexer(
+            vllm_config,
+            config,
+            self.hidden_size,
+            self.q_lora_rank,
+            quant_config,
+            cache_config,
+            dummy_topk,
+            f"{prefix}.indexer",
+        )
+        self.indexer.mrope_emb = self.indexer_mrope_emb
+
+        self.q_b_proj = PPMissingLayer()
+        self.q_proj = PPMissingLayer()
+        self.kv_a_proj_with_mqa = PPMissingLayer()
+        self.kv_a_layernorm = PPMissingLayer()
+        self.kv_b_proj = PPMissingLayer()
+        self.o_proj = PPMissingLayer()
+        self.linear_gate = PPMissingLayer()
+
+
+class HYV4OffloadFirstIndexerLayer(nn.Module):
+    """Mirrored next-stage entry layer computing K-cache sync + tail top-k offload."""
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        vllm_config: VllmConfig,
+        cache_config: CacheConfig,
+        quant_config: QuantizationConfig | None,
+        layer_idx: int,
+        prefix: str,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.enable_ihc = getattr(config, "enable_ihc", False)
+        self.half_topk = config.index_topk // 2
+        self._wire_buf = torch.empty(
+            (vllm_config.scheduler_config.max_num_batched_tokens, self.half_topk),
+            dtype=torch.int32,
+            device=current_platform.device_type,
+        )
+
+        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.self_attn = HYV4OffloadFirstIndexerAttn(
+            vllm_config=vllm_config,
+            config=config,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
+        )
+        if self.enable_ihc:
+            self.hc_attn_layer = HYV4HCLayer(
+                config, layer_idx, prefix=f"{prefix}.hc_attn_layer"
+            )
+        else:
+            self.hc_attn_layer = PPMissingLayer()
+        self.mlp = PPMissingLayer()
+        self.post_attention_layernorm = PPMissingLayer()
+        self.hc_mlp_layer = PPMissingLayer()
+
+    def _get_wire_buf(self, num_tokens: int, device: torch.device) -> torch.Tensor:
+        if self._wire_buf.shape[0] < num_tokens or self._wire_buf.device != device:
+            self._wire_buf = torch.empty(
+                (num_tokens, self.half_topk),
+                dtype=torch.int32,
+                device=device,
+            )
+        return self._wire_buf[:num_tokens]
+
+    def forward_offload(
+        self,
+        positions: torch.Tensor,
+        pp_hidden: torch.Tensor,
+        pp_scale: torch.Tensor | None,
+        residual: torch.Tensor | None,
+        wire_out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (
+            clear_activation_prequant,
+        )
+
+        num_tokens = pp_hidden.shape[0]
+        if wire_out is None:
+            wire_out = self._get_wire_buf(num_tokens, pp_hidden.device)
+        attn = self.self_attn
+        supports_wq_b_prequant = HYV4MLAAttention._supports_activation_prequant(
+            attn.indexer.wq_b
+        )
+        try:
+            if self.enable_ihc:
+                assert isinstance(self.hc_attn_layer, HYV4HCLayer)
+                if pp_scale is not None:
+                    if num_tokens >= 128:
+                        normed, _ = _run_ihc_pre_fp8_boundary_and_norm_impl(
+                            self.hc_attn_layer.hc_pre,
+                            self.input_layernorm,
+                            pp_hidden,
+                            pp_scale,
+                        )
+                    else:
+                        deq = _dequant_pp_act(pp_hidden, pp_scale)
+                        normed, _, _ = _run_ihc_pre_and_norm_impl(
+                            self.hc_attn_layer, self.input_layernorm, deq
+                        )
+                else:
+                    normed, _, _ = _run_ihc_pre_and_norm_impl(
+                        self.hc_attn_layer, self.input_layernorm, pp_hidden
+                    )
+            else:
+                h = (
+                    _dequant_pp_act(pp_hidden, pp_scale)
+                    if pp_scale is not None
+                    else pp_hidden
+                )
+                if residual is not None:
+                    h = h + residual
+                normed = self.input_layernorm(h)
+
+            return hy4_fp8_indexer_forward_offload_sender(
+                indexer=attn.indexer,
+                normed_hidden_states=normed,
+                fused_qkv_a_proj=attn.fused_qkv_a_proj,
+                q_a_layernorm=attn.q_a_layernorm,
+                q_lora_rank=attn.q_lora_rank,
+                kv_lora_and_rope_dim=attn.kv_lora_rank + attn.qk_rope_head_dim,
+                supports_wq_b_prequant=supports_wq_b_prequant,
+                positions=positions,
+                rotary_emb=attn.indexer_rope_emb,
+                wire_out=wire_out,
+            )
+        finally:
+            clear_activation_prequant()
+            attn.indexer._prefetched_mrope_table = None
+
+
 class HYV4Model(nn.Module):
     """HY V4 backbone."""
 
@@ -608,6 +956,48 @@ class HYV4Model(nn.Module):
             and not get_pp_group().is_last_rank
             and hyv4_layer_skip_topk(config, self.end_layer)
         )
+        pp_group = get_pp_group()
+        offload_senders = _compute_pp_first_indexer_offload_hops(
+            config,
+            cache_config,
+            pp_group.world_size,
+            pcp_size=vllm_config.parallel_config.prefill_context_parallel_size,
+        )
+        self.send_offload_first_topk = pp_group.rank_in_group in offload_senders
+        self.recv_offload_first_topk = (
+            pp_group.rank_in_group > 0
+            and (pp_group.rank_in_group - 1) in offload_senders
+        )
+        self.offload_first_indexer_layer: HYV4OffloadFirstIndexerLayer | None = None
+        if self.send_offload_first_topk:
+            target_layer = self.end_layer
+            assert cache_config is not None
+            helper = HYV4OffloadFirstIndexerLayer(
+                config=config,
+                vllm_config=vllm_config,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                layer_idx=target_layer,
+                prefix=f"{prefix}.layers.{target_layer}",
+            )
+            self.layers[target_layer] = helper
+            self.offload_first_indexer_layer = helper
+            logger.info(
+                "HYV4 PP first-indexer offload sender armed on PP rank %d -> %d "
+                "(target layer %d)",
+                pp_group.rank_in_group,
+                pp_group.rank_in_group + 1,
+                target_layer,
+            )
+        elif self.recv_offload_first_topk:
+            logger.info(
+                "HYV4 PP first-indexer offload receiver armed on PP rank %d <- %d "
+                "(entry layer %d)",
+                pp_group.rank_in_group,
+                pp_group.rank_in_group - 1,
+                self.start_layer,
+            )
+
         if (
             _pp_act_fp8_fused()
             and self.enable_ihc
@@ -616,16 +1006,58 @@ class HYV4Model(nn.Module):
         ):
             self.layers[self.end_layer - 1]._emit_pp_fp8 = True
 
+        self._use_pp_packed_wire = (
+            pp_group.world_size > 1
+            and self.enable_ihc
+            and _pp_act_fp8_fused()
+            and _pp_pack_tensors()
+            and get_tensor_model_parallel_world_size() == 1
+        )
+        index_topk = int(getattr(config, "index_topk", 0))
+        self._pp_recv_topk_cols = (
+            index_topk
+            if self.recv_topk
+            else (index_topk // 2 if self.recv_offload_first_topk else 0)
+        )
+        self._pp_send_topk_cols = (
+            index_topk
+            if self.send_topk
+            else (index_topk // 2 if self.send_offload_first_topk else 0)
+        )
+        self._pp_recv_packed_row_bytes = compute_pp_packed_row_bytes(
+            self._pp_intermediate_hidden, self._pp_recv_topk_cols
+        )
+        self._pp_send_packed_row_bytes = compute_pp_packed_row_bytes(
+            self._pp_intermediate_hidden, self._pp_send_topk_cols
+        )
+        self._pp_max_batched_tokens = int(
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        self._pp_pack_bufs: list[torch.Tensor] = []
+        self._pp_pack_slot = 0
+        self._stage_timer_enabled = _pp_stage_timer_enabled()
+        self._stage_timer_steps = 0
+        self._stage_timer_max_steps = int(
+            os.environ.get("VLLM_ILU_HYV4_STAGE_TIMER_STEPS", "8")
+        )
+        if self._use_pp_packed_wire:
+            logger.info(
+                "HYV4 PP single-tensor boundary packing armed on PP rank %d "
+                "(recv_row_bytes=%d, send_row_bytes=%d)",
+                pp_group.rank_in_group,
+                self._pp_recv_packed_row_bytes if not pp_group.is_first_rank else 0,
+                self._pp_send_packed_row_bytes if not pp_group.is_last_rank else 0,
+            )
+
         # MoE hyperparameters (consumed by EPLB).
         self.expert_weights: MutableSequence[Sequence[torch.Tensor]] = []
         self.num_expert_groups = 1
         self.moe_layers: list[nn.Module] = []
         example_layer: HYV4MoEFused | None = None
         for layer in self.layers:
-            if isinstance(layer, PPMissingLayer):
+            if not isinstance(layer, HYV4DecoderLayer):
                 continue
 
-            assert isinstance(layer, HYV4DecoderLayer)
             if layer.block_type == "moe":
                 assert isinstance(layer.mlp, HYV4MoEFused)
                 example_layer = layer.mlp
@@ -660,7 +1092,7 @@ class HYV4Model(nn.Module):
         self.num_local_physical_experts = num_local_physical_experts
         self.num_redundant_experts = num_physical_experts - self.num_logical_experts
         for layer in self.layers:
-            if isinstance(layer, PPMissingLayer):
+            if not isinstance(layer, HYV4DecoderLayer):
                 continue
             if isinstance(layer.mlp, HYV4MoEFused):
                 moe = layer.mlp
@@ -683,9 +1115,62 @@ class HYV4Model(nn.Module):
             )
         return self._cached_expert_params_mapping
 
+    def _maybe_log_stage_timer(
+        self,
+        layer_ms: list[tuple[int, float]],
+        offload_ms: float,
+        *,
+        active: bool,
+    ) -> None:
+        if not active or not layer_ms:
+            return
+        total = sum(ms for _, ms in layer_ms) + offload_ms
+        parts = [f"L{idx}:{ms:.2f}" for idx, ms in layer_ms]
+        if offload_ms > 0:
+            parts.append(f"offload:{offload_ms:.2f}")
+        logger.info(
+            "HYV4_STAGE_TIMER rank=%d steps=%d total_ms=%.2f %s",
+            get_pp_group().rank_in_group,
+            self._stage_timer_steps + 1,
+            total,
+            " ".join(parts),
+        )
+        self._stage_timer_steps += 1
+
+    def _next_pp_pack_send_buf(
+        self, num_tokens: int, device: torch.device
+    ) -> torch.Tensor:
+        cap = max(num_tokens, self._pp_max_batched_tokens, 1)
+        if (
+            not self._pp_pack_bufs
+            or self._pp_pack_bufs[0].shape[0] < num_tokens
+            or self._pp_pack_bufs[0].device != device
+        ):
+            self._pp_pack_bufs = [
+                torch.empty(
+                    (cap, self._pp_send_packed_row_bytes),
+                    dtype=torch.uint8,
+                    device=device,
+                )
+                for _ in range(2)
+            ]
+        buf = self._pp_pack_bufs[self._pp_pack_slot]
+        self._pp_pack_slot ^= 1
+        return buf
+
     def make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device
     ) -> IntermediateTensors:
+        if self._use_pp_packed_wire:
+            return IntermediateTensors(
+                {
+                    "hidden_states": torch.zeros(
+                        (batch_size, self._pp_recv_packed_row_bytes),
+                        dtype=torch.uint8,
+                        device=device,
+                    )
+                }
+            )
         tensors = {}
         for key in self._pp_intermediate_keys:
             buf_dtype = (
@@ -708,6 +1193,12 @@ class HYV4Model(nn.Module):
                 dtype=torch.int32,
                 device=device,
             )
+        if self.recv_offload_first_topk:
+            tensors[_OFFLOAD_FIRST_TOPK_KEY] = torch.zeros(
+                (batch_size, self.config.index_topk // 2),
+                dtype=torch.int32,
+                device=device,
+            )
         return IntermediateTensors(tensors)
 
     def forward(
@@ -719,12 +1210,32 @@ class HYV4Model(nn.Module):
     ) -> torch.Tensor | IntermediateTensors:
         if self.topk_index_cache is not None:
             self.topk_index_cache.clear()
+        offload_recv_wire: torch.Tensor | None = None
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
             residual = None
+        elif self._use_pp_packed_wire:
+            assert intermediate_tensors is not None
+            q, scale, unpacked_topk = unpack_hy4_pp_boundary(
+                intermediate_tensors["hidden_states"],
+                self._pp_intermediate_hidden,
+                self._pp_recv_topk_cols,
+            )
+            if q.shape[0] >= 128:
+                hidden_states = (q, scale)
+            else:
+                hidden_states = _dequant_pp_act(q, scale)
+            residual = None
+            if self.recv_topk:
+                assert unpacked_topk is not None and self.topk_indices_buffer is not None
+                self.topk_indices_buffer[: unpacked_topk.shape[0]].copy_(unpacked_topk)
+                if self.topk_index_cache is not None:
+                    self.topk_index_cache.clear()
+            elif self.recv_offload_first_topk:
+                offload_recv_wire = unpacked_topk
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
@@ -746,15 +1257,98 @@ class HYV4Model(nn.Module):
                 self.topk_indices_buffer[: topk_indices.shape[0]].copy_(topk_indices)
                 if self.topk_index_cache is not None:
                     self.topk_index_cache.clear()
+            if self.recv_offload_first_topk:
+                offload_recv_wire = intermediate_tensors[_OFFLOAD_FIRST_TOPK_KEY]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states, residual = layer(positions, hidden_states, residual)
+        first_entry_indexer = None
+        if self.recv_offload_first_topk and self.start_layer < self.end_layer:
+            assert offload_recv_wire is not None
+            entry_layer = self.layers[self.start_layer]
+            assert isinstance(entry_layer, HYV4DecoderLayer)
+            first_entry_indexer = entry_layer.self_attn.indexer
+            assert first_entry_indexer is not None
+            first_entry_indexer._offload_recv_wire = offload_recv_wire
+
+        stage_timer_active = (
+            self._stage_timer_enabled
+            and self._stage_timer_steps < self._stage_timer_max_steps
+        )
+        layer_ms: list[tuple[int, float]] = []
+        offload_ms = 0.0
+        try:
+            if stage_timer_active:
+                torch.cuda.synchronize()
+            for layer_idx, layer in enumerate(
+                islice(self.layers, self.start_layer, self.end_layer),
+                start=self.start_layer,
+            ):
+                if stage_timer_active:
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter()
+                hidden_states, residual = layer(positions, hidden_states, residual)
+                if stage_timer_active:
+                    torch.cuda.synchronize()
+                    layer_ms.append((layer_idx, (time.perf_counter() - t0) * 1e3))
+        finally:
+            if first_entry_indexer is not None:
+                first_entry_indexer._offload_recv_wire = None
 
         if not get_pp_group().is_last_rank:
             global _pp_act_fp8_fused_logged
+            if self._use_pp_packed_wire:
+                if isinstance(hidden_states, tuple):
+                    q, scale = hidden_states
+                else:
+                    q, scale = _quant_pp_act(hidden_states.flatten(1))
+                if not _pp_act_fp8_fused_logged:
+                    _pp_act_fp8_fused_logged = True
+                    logger.info(
+                        "PP activation FP8 fused + single-tensor packed: "
+                        "uint8 %s + scale %s (row_bytes=%d)",
+                        tuple(q.shape),
+                        tuple(scale.shape),
+                        self._pp_send_packed_row_bytes,
+                    )
+                num_tokens = q.shape[0]
+                send_buf_2d = self._next_pp_pack_send_buf(num_tokens, q.device)
+                packed_2d, wire_view = pack_hy4_pp_boundary(
+                    send_buf_2d,
+                    q,
+                    scale,
+                    topk=(
+                        self.topk_indices_buffer[:num_tokens]
+                        if self.send_topk and self.topk_indices_buffer is not None
+                        else None
+                    ),
+                    topk_cols=self._pp_send_topk_cols,
+                )
+                if self.offload_first_indexer_layer is not None:
+                    assert wire_view is not None
+                    if stage_timer_active:
+                        torch.cuda.synchronize()
+                        t_off = time.perf_counter()
+                    self.offload_first_indexer_layer.forward_offload(
+                        positions=positions,
+                        pp_hidden=q,
+                        pp_scale=scale,
+                        residual=None,
+                        wire_out=wire_view,
+                    )
+                    if stage_timer_active:
+                        torch.cuda.synchronize()
+                        offload_ms = (time.perf_counter() - t_off) * 1e3
+                self._maybe_log_stage_timer(
+                    layer_ms, offload_ms, active=stage_timer_active
+                )
+                return IntermediateTensors({"hidden_states": packed_2d})
+
+            pp_hidden: torch.Tensor
+            pp_scale: torch.Tensor | None = None
             if isinstance(hidden_states, tuple):
                 q, scale = hidden_states
                 num_tokens = q.shape[0]
+                pp_hidden = q
+                pp_scale = scale
                 tensors = {"hidden_states": q, _PP_ACT_SCALE_KEY: scale}
                 if not _pp_act_fp8_fused_logged:
                     _pp_act_fp8_fused_logged = True
@@ -771,6 +1365,8 @@ class HYV4Model(nn.Module):
                     flat = hidden_states
                 if _pp_act_fp8_fused():
                     q, scale = _quant_pp_act(flat)
+                    pp_hidden = q
+                    pp_scale = scale
                     tensors = {"hidden_states": q, _PP_ACT_SCALE_KEY: scale}
                     if not self.enable_ihc:
                         tensors["residual"] = residual
@@ -783,13 +1379,34 @@ class HYV4Model(nn.Module):
                             tuple(scale.shape),
                         )
                 elif self.enable_ihc:
+                    pp_hidden = flat
                     tensors = {"hidden_states": flat}
                 else:
+                    pp_hidden = hidden_states
                     tensors = {"hidden_states": hidden_states, "residual": residual}
             if self.send_topk:
                 assert self.topk_indices_buffer is not None
                 tensors[_TOPK_INDICES_KEY] = self.topk_indices_buffer[:num_tokens]
+            if self.offload_first_indexer_layer is not None:
+                if stage_timer_active:
+                    torch.cuda.synchronize()
+                    t_off = time.perf_counter()
+                tensors[_OFFLOAD_FIRST_TOPK_KEY] = (
+                    self.offload_first_indexer_layer.forward_offload(
+                        positions=positions,
+                        pp_hidden=pp_hidden,
+                        pp_scale=pp_scale,
+                        residual=None if self.enable_ihc else residual,
+                    )
+                )
+                if stage_timer_active:
+                    torch.cuda.synchronize()
+                    offload_ms = (time.perf_counter() - t_off) * 1e3
+            self._maybe_log_stage_timer(
+                layer_ms, offload_ms, active=stage_timer_active
+            )
             return IntermediateTensors(tensors)
+        self._maybe_log_stage_timer(layer_ms, offload_ms, active=stage_timer_active)
         if self.enable_ihc:
             if isinstance(hidden_states, tuple):
                 q, scale = hidden_states
@@ -991,7 +1608,7 @@ class HYV4Model(nn.Module):
                     loaded_params.update(loaded_expert_param_names)
                     continue
                 if "learnable_sink_param" in name:
-                    if is_pp_missing_parameter(name, self):
+                    if is_pp_missing_parameter(name, self) or name not in params_dict:
                         continue
                     narrow_weight = loaded_weight[head_rank_start:head_rank_end]
                     n = narrow_weight.shape[0]

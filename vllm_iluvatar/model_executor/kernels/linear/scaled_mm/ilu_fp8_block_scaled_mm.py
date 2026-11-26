@@ -58,6 +58,8 @@ viable block-FP8 dense path.
 from __future__ import annotations
 
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import ClassVar
 
 import torch
@@ -215,6 +217,28 @@ def _apply_fp8_per_channel_gemv_nt_v2(
         backend=_IXMM_BACKEND,
     )
     return out[:logical_m].to(out_dtype)
+
+
+@contextmanager
+def sliced_activation_prequant(
+    a: torch.Tensor, start: int, end: int
+) -> Iterator[torch.Tensor]:
+    """Slice ``a[start:end]`` while propagating any registered FP8 pre-quant."""
+    orig = _lookup_activation_prequant(a)
+    sub = a[start:end]
+    if orig is None:
+        yield sub
+        return
+
+    a_fp8, a_scale = orig
+    register_activation_prequant(sub, a_fp8[start:end], a_scale[start:end])
+    try:
+        yield sub
+    finally:
+        if sub.data_ptr() == a.data_ptr():
+            register_activation_prequant(a, a_fp8, a_scale)
+        else:
+            unregister_activation_prequant(sub)
 
 
 def _e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:

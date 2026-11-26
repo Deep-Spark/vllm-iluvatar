@@ -237,6 +237,8 @@ class IluDeepseekV32IndexerPrefillChunkMetadata:
     # Proven minimum causal context over this Q subchunk, from exact prefill
     # CPU metadata. Zero means unknown; never infer this from cache capacity.
     context_lower_bound: int = 0
+    cu_seqlens_q_cpu: list[int] | None = None
+    seq_lens_comp_cpu: list[int] | None = None
 
 
 @dataclass
@@ -881,6 +883,7 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         full_q = int(prefill_query_start_loc[-1].item())
         sub_m = int(query_slice.stop - query_slice.start)
         if query_slice.start == 0 and query_slice.stop == full_q:
+            cu_seqlens_q_cpu = [int(x) for x in prefill_query_start_loc.tolist()]
             cu_seqlens_q = (
                 prefill_query_start_loc.to(torch.int32)
                 .pin_memory()
@@ -894,10 +897,12 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         else:
             # M-subchunk of a single overflowing request: one contiguous
             # query span, so cu_seqlens_q is simply [0, sub_m].
+            cu_seqlens_q_cpu = [0, sub_m]
             cu_seqlens_q = torch.tensor(
                 [0, sub_m], dtype=torch.int32, device=self.device
             )
             max_q_len = sub_m
+        seq_lens_comp_cpu = [int(x) for x in seq_lens_cpu_chunk_comp.tolist()]
 
         chunk_ks = cu_seqlen_ks[query_slice]
         chunk_ke = cu_seqlen_ke[query_slice]
@@ -939,6 +944,8 @@ class IluDeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             max_kv_len=max_context_len,
             skip_kv_gather=skip_kv_gather,
             context_lower_bound=context_lower_bound,
+            cu_seqlens_q_cpu=cu_seqlens_q_cpu,
+            seq_lens_comp_cpu=seq_lens_comp_cpu,
         )
 
     def _build_fused_decode_metadata(

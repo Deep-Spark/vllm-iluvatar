@@ -37,6 +37,7 @@ class IxMMFP4FP8Backend(MoEComputeBackend):
     standard_layout_columns = 3
     requires_contiguous_experts = False
     prefer_hybrid_ep = False
+    supported_batched_activations = ("silu", "swiglu", "swiglustep")
     supported_activations = ("silu", "swiglu", "swiglustep", _SWIGLUOAI)
     requires_activation_limit = False
     supports_prequantized_fp8 = True
@@ -201,12 +202,6 @@ class IxMMFP4FP8Backend(MoEComputeBackend):
         )
 
     def run_batched(self, x, weights, scale, counts, *, output, workspace):
-        if self.config.activation == _SWIGLUOAI:
-            # The batched GEMV fuses its own activation and offers only
-            # swiglu / swiglustep, so there is nowhere to put the OAI form.
-            raise NotImplementedError(
-                f"{self.name} batched experts do not support {_SWIGLUOAI}"
-            )
         experts = self.local_num_experts
         x = x.reshape(-1, x.shape[-1])
         capacity = x.shape[0] // experts

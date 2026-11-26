@@ -136,6 +136,14 @@ class IluMxfp4MoEMethod(MoEComputeBindingMixin, Mxfp4MoEMethod):
             # Gate/up and activation use the logical width. Only the down
             # projection needs extra K alignment in the weight contract.
             return replace(config, intermediate=unpadded)
+        if self.selection.name == "ixinfer_w4a8" and unpadded not in (
+            None,
+            config.intermediate,
+        ):
+            # NN requires 64-aligned down-projection K, TN requires 128.
+            alignment = 64 if self.selection.layout == "NN" else 128
+            width = (config.intermediate + alignment - 1) // alignment * alignment
+            return replace(config, intermediate=width)
         return config
 
     def create_weights(
@@ -162,7 +170,7 @@ class IluMxfp4MoEMethod(MoEComputeBindingMixin, Mxfp4MoEMethod):
             or not self.moe.is_act_and_mul
             or self.moe.hidden_dim_unpadded != hidden_size
             or (
-                self.selection.name != "ixmm_fp4fp8"
+                self.selection.name not in ("ixmm_fp4fp8", "ixinfer_w4a8")
                 and self.moe.intermediate_size_per_partition_unpadded
                 not in (None, intermediate_size_per_partition)
             )
@@ -199,6 +207,7 @@ class IluMxfp4MoEMethod(MoEComputeBindingMixin, Mxfp4MoEMethod):
                 backend.intermediate,
                 self.moe.tp_size,
                 self.moe.tp_rank,
+                self.moe.intermediate_size_per_partition_unpadded,
             ),
         )
         layer.params_dtype = params_dtype

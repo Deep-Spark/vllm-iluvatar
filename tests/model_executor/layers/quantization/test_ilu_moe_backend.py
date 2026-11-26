@@ -620,7 +620,8 @@ def test_adapter_protocol_binding_and_scaling(monkeypatch, batched):
     ["silu", "swiglu", "swiglustep", "swigluoai", "swigluoai_uninterleave"],
 )
 @pytest.mark.parametrize("batched", [False, True])
-def test_ixinfer_activation_at_binding(monkeypatch, activation, batched):
+@pytest.mark.parametrize("backend_name", ["ixinfer_w4a8", "ixmm_fp4fp8"])
+def test_activation_at_binding(monkeypatch, activation, batched, backend_name):
     from types import SimpleNamespace
 
     from vllm.model_executor.layers.fused_moe import FusedMoEActivationFormat
@@ -634,8 +635,15 @@ def test_ixinfer_activation_at_binding(monkeypatch, activation, batched):
     from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_ixinfer_w4a8 import (
         IxInferW4A8Backend,
     )
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_ixmm_fp4fp8 import (
+        IxMMFP4FP8Backend,
+    )
 
-    backend = object.__new__(IxInferW4A8Backend)
+    cls = IxInferW4A8Backend if backend_name == "ixinfer_w4a8" else IxMMFP4FP8Backend
+    if backend_name == "ixmm_fp4fp8" and activation == "swigluoai":
+        pytest.skip("Activation is not supported by this backend")
+    assert activation in cls.supported_activations
+    backend = object.__new__(cls)
     backend.config = SimpleNamespace(activation=activation)
     backend.local_num_experts = 2
     fmt = (
@@ -649,7 +657,10 @@ def test_ixinfer_activation_at_binding(monkeypatch, activation, batched):
         num_dispatchers=lambda: 1,
     )
     monkeypatch.setattr(FusedMoEExpertsModular, "__init__", lambda self, *args: None)
-    if batched and activation not in ("silu", "swiglu"):
+    unsupported = activation.startswith("swigluoai") or (
+        activation == "swiglustep" and backend_name == "ixinfer_w4a8"
+    )
+    if batched and unsupported:
         with pytest.raises(
             NotImplementedError, match=f"batched experts do not support {activation}"
         ):

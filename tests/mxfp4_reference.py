@@ -30,7 +30,7 @@ def mxfp4_channel_int4(weight, scale):
 def pack_ixinfer(values, layout):
     """Signed [N,K] values to IxInfer v2 TN/NN storage."""
     n, k = values.shape
-    if n % 128 or k % 64:
+    if k % 32 or (layout == "NN" and n % 32):
         raise ValueError("Original-weight W4A8 requires aligned expert dimensions")
     if layout == "NN":
         values = (

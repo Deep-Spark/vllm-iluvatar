@@ -101,11 +101,13 @@ def deliver(layer, shard, expert, tensor, scale=False):
     return param.weight_loader(param, tensor, name, shard, expert, return_success=True)
 
 
-def loader_for(layer, backend, layout, device="cpu", tp=1, rank=0):
+def loader_for(
+    layer, backend, layout, device="cpu", tp=1, rank=0, width=256, logical=None
+):
     arch = "ivcore11" if backend == "ixinfer_w4a8" else "ivcore30"
     selection = select_moe_backend(arch, name=backend, layout=layout)
     spec = get_moe_backend(selection).weight_specs[layout]
-    loader = make_mxfp4_loader(spec, Mxfp4LoadSpec(2, 512, 256, tp, rank))
+    loader = make_mxfp4_loader(spec, Mxfp4LoadSpec(2, 512, width, tp, rank, logical))
     with torch.device(device):
         loader.create_weights(layer, {})
     loader.bind_upload_buffer(
@@ -134,7 +136,7 @@ def loader_for(layer, backend, layout, device="cpu", tp=1, rank=0):
         ("ixmm_fp4fp8", "fp4fp8", "cuda"),
     ],
 )
-@pytest.mark.parametrize("tp,rank", [(1, 0), (2, 1)])
+@pytest.mark.parametrize("tp,rank", [(1, 0), (2, 1), (8, 7)])
 def test_streamed_shards_match_whole_expert(backend, layout, device, tp, rank):
     if device == "cuda":
         if not torch.cuda.is_available():
@@ -143,15 +145,19 @@ def test_streamed_shards_match_whole_expert(backend, layout, device, tp, rank):
             backend == "ixinfer_w4a8" and layout == "NN" and cuda_arch() != "ivcore11"
         ):
             pytest.skip("Unsupported device/backend combination")
+    if tp == 8 and backend != "ixinfer_w4a8":
+        pytest.skip("IxInfer TP8 padding case")
+    logical = 288 if tp == 8 else 256
+    width = (320 if layout == "NN" else 384) if tp == 8 else logical
     torch.manual_seed(43)
     layer = ExpertLayer()
-    loader = loader_for(layer, backend, layout, device, tp, rank)
+    loader = loader_for(layer, backend, layout, device, tp, rank, width, logical)
     pointers = {k: v.data_ptr() for k, v in layer.named_parameters()}
     sources = {}
     for shard, n, k in (
-        ("w1", 256 * tp, 512),
-        ("w3", 256 * tp, 512),
-        ("w2", 512, 256 * tp),
+        ("w1", logical * tp, 512),
+        ("w3", logical * tp, 512),
+        ("w2", 512, logical * tp),
     ):
         sources[shard] = (
             torch.randint(0, 256, (2, n, k // 2), dtype=torch.uint8),
@@ -180,16 +186,24 @@ def test_streamed_shards_match_whole_expert(backend, layout, device, tp, rank):
             if group == "w13":
                 tensor = torch.cat(
                     [
-                        sources[shard][int(scale)][:, rank * 256 : (rank + 1) * 256]
+                        torch.nn.functional.pad(
+                            sources[shard][int(scale)][
+                                :, rank * logical : (rank + 1) * logical
+                            ],
+                            (0, 0, 0, width - logical),
+                        )
                         for shard in ("w1", "w3")
                     ],
                     1,
                 )
             else:
-                length = 256 // (32 if scale else 2)
+                length = logical // (32 if scale else 2)
                 tensor = sources["w2"][int(scale)][
                     :, :, rank * length : (rank + 1) * length
                 ]
+                tensor = torch.nn.functional.pad(
+                    tensor, (0, (width - logical) // (32 if scale else 2))
+                )
             local.append(tensor.to(device).contiguous())
         w, s = local
         if backend == "ixmm_fp4fp8":

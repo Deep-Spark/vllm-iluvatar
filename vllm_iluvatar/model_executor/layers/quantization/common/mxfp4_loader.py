@@ -25,6 +25,15 @@ class Mxfp4LoadSpec:
     intermediate: int
     tp_size: int = 1
     tp_rank: int = 0
+    intermediate_unpadded: int | None = None
+
+    @property
+    def source_intermediate(self):
+        return (
+            self.intermediate
+            if self.intermediate_unpadded is None
+            else self.intermediate_unpadded
+        )
 
 
 class Mxfp4WeightLoader(PairedMoEWeightLoader, ABC):
@@ -43,6 +52,8 @@ class Mxfp4WeightLoader(PairedMoEWeightLoader, ABC):
         if (
             load_spec.experts < 1
             or not 0 <= load_spec.tp_rank < load_spec.tp_size
+            or not 0 < load_spec.source_intermediate <= load_spec.intermediate
+            or load_spec.source_intermediate % self.source_alignment
             or load_spec.hidden % self.source_alignment
             or load_spec.intermediate % self.source_alignment
         ):
@@ -63,7 +74,7 @@ class Mxfp4WeightLoader(PairedMoEWeightLoader, ABC):
     def source_shape(self, group, is_scale):
         cfg = self.load_spec
         divisor = 32 if is_scale else 2
-        global_i = cfg.intermediate * cfg.tp_size
+        global_i = cfg.source_intermediate * cfg.tp_size
         return (
             (global_i, cfg.hidden // divisor)
             if group == "w13"
@@ -109,9 +120,9 @@ class Mxfp4WeightLoader(PairedMoEWeightLoader, ABC):
         # TP partitioning occurs before quantization, matching the existing
         # per-partition conversion semantics. EP supplies tp_size=1 here.
         dim, length = (
-            (0, cfg.intermediate)
+            (0, cfg.source_intermediate)
             if group == "w13"
-            else (1, cfg.intermediate // divisor)
+            else (1, cfg.source_intermediate // divisor)
         )
         tensor = tensor.narrow(dim, cfg.tp_rank * length, length)
         buffer = self._upload_buffer
@@ -132,9 +143,12 @@ class Mxfp4WeightLoader(PairedMoEWeightLoader, ABC):
             buffer.owner = owner
             # Copy a possibly strided TP view directly into contiguous staging.
             offset, size = (nw, ns) if is_scale else (0, nw)
-            buffer.host[offset : offset + size].view(tensor.shape).copy_(
-                tensor.view(torch.uint8)
-            )
+            staged = buffer.host[offset : offset + size].view(n, k // divisor)
+            if staged.shape != tensor.shape:
+                # Pad each local gate/up separately, or the local K axis of down.
+                staged.narrow(dim, length, staged.size(dim) - length).zero_()
+                staged = staged.narrow(dim, 0, length)
+            staged.copy_(tensor.view(torch.uint8))
             if pending is None:
                 self._pending = (key, is_scale)
                 return True

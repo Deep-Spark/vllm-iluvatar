@@ -374,6 +374,8 @@ class HYV4MLAAttentionLayer(MLAAttention):
         # module so ``_v_up_proj`` can fold ``sigmoid * mul`` into its store,
         # and the number of leading rows that fold actually covered.
         self.gate_logits: torch.Tensor | None = None
+        self.gate_hidden_states: torch.Tensor | None = None
+        self.linear_gate_ref: nn.Module | None = None
         self.gated_rows = 0
 
     # [ILU override] MLAAttention.process_weights_after_loading — delta: keep an
@@ -520,29 +522,43 @@ class HYV4MLAAttentionLayer(MLAAttention):
         x = x.view(-1, self.num_heads, self.kv_lora_rank)
         out_3d = out.view(-1, self.num_heads, self.v_head_dim)
         gate = self.gate_logits
-        if self.fuse_gate:
-            # The module stopped applying the gate itself, so a missing or
-            # too-short hand-over must not silently drop it.
-            if gate is None:
-                raise RuntimeError(
-                    f"{self.layer_name}: gate folding is on but the attention "
-                    "module handed over no gate logits before attention ran."
-                )
-            if gate.shape[0] < x.shape[0]:
+        lazy_gate = (
+            self.fuse_gate
+            and gate is None
+            and self.linear_gate_ref is not None
+            and self.gate_hidden_states is not None
+        )
+        if self.fuse_gate and gate is None and not lazy_gate:
+            raise RuntimeError(
+                f"{self.layer_name}: gate folding is on but the attention "
+                "module handed over no gate logits before attention ran."
+            )
+        if x.shape[0] <= _FUSED_MAX_TOKENS:
+            if lazy_gate:
+                gate = self.linear_gate_ref(self.gate_hidden_states[: x.shape[0]])[0]
+            if self.fuse_gate and gate.shape[0] < x.shape[0]:
                 raise RuntimeError(
                     f"{self.layer_name}: gate logits cover {gate.shape[0]} "
                     f"tokens, attention produced {x.shape[0]}."
                 )
-        if gate is not None:
-            # In a mixed batch this runs on the leading MQA rows only; the dense
-            # MHA prefill rows bypass ``_v_up_proj`` entirely, so the module
-            # gates whatever ``gated_rows`` leaves over.
-            gate = gate[: x.shape[0]].view(x.shape[0], self.num_heads, self.v_head_dim)
-            self.gated_rows = x.shape[0]
-        if x.shape[0] <= _FUSED_MAX_TOKENS:
+            if gate is not None:
+                gate = gate[: x.shape[0]].view(
+                    x.shape[0], self.num_heads, self.v_head_dim
+                )
+                self.gated_rows = x.shape[0]
             ixf_ops.hy4_kv_up_gate(x, self.W_UV_FP8, self.W_UV_FP8_S, gate, out=out_3d)
             return
         a, a_s = ixf_ops.fp8_grouped_per_token_quant(x, x.shape[1])
+        if lazy_gate:
+            gate = self.linear_gate_ref(self.gate_hidden_states[: x.shape[0]])[0]
+        if self.fuse_gate and gate.shape[0] < x.shape[0]:
+            raise RuntimeError(
+                f"{self.layer_name}: gate logits cover {gate.shape[0]} "
+                f"tokens, attention produced {x.shape[0]}."
+            )
+        if gate is not None:
+            gate = gate[: x.shape[0]].view(x.shape[0], self.num_heads, self.v_head_dim)
+            self.gated_rows = x.shape[0]
         ixf_ops.hy4_fp8_einsum_gate(
             a, self.W_UV_FP8, a_s, self.W_UV_FP8_S, gate, out=out_3d
         )
@@ -1320,14 +1336,56 @@ class HYV4MLAAttention(nn.Module):
             return False
         n = q.shape[0]
         slots = slots.reshape(-1)
-        # The fused insert consumes a 1-D table; use the M-RoPE path for all
-        # three-row inputs without inspecting device values during capture.
-        if positions.ndim == 2:
-            return False
-        pos = positions.reshape(-1)
-        if slots.numel() < n or pos.numel() < n or kv_c.shape[0] < n:
+        if slots.numel() < n or kv_c.shape[0] < n:
             return False
         q_pe = q[..., self.qk_nope_head_dim :]
+        slots_1d = slots[:n].contiguous()
+        if positions.ndim == 2:
+            if (
+                positions.shape[0] != 3
+                or self.mrope_emb is None
+                or positions.shape[1] < n
+                or not q_pe.is_cuda
+                or n > 2560
+                or not hasattr(ixf_ops, "mrope_cos_sin_table")
+            ):
+                return False
+            section = getattr(self.mrope_emb, "_ixf_mrope_section", None)
+            if section is None:
+                return False
+            pos_2d = (
+                positions
+                if positions.shape[1] == n and positions.is_contiguous()
+                else positions[:, :n].contiguous()
+            )
+            pos, cos_sin = ixf_ops.mrope_cos_sin_table(
+                pos_2d,
+                self.mrope_emb._match_cos_sin_cache_dtype(q_pe),
+                section,
+                self.mrope_emb.mrope_interleaved,
+            )
+            if (
+                self.indexer is not None
+                and self.is_sparse
+                and not self.skip_topk
+                and positions.shape[1] == n
+            ):
+                self.indexer._prefetched_mrope_table = (pos, cos_sin)
+            pos_1d = (
+                pos.to(dtype=slots_1d.dtype).contiguous()
+                if pos.dtype != slots_1d.dtype
+                else pos.contiguous()
+            )
+        else:
+            pos = positions.reshape(-1)
+            if pos.numel() < n:
+                return False
+            pos_1d = (
+                pos[:n].to(dtype=slots_1d.dtype).contiguous()
+                if pos.dtype != slots_1d.dtype
+                else pos[:n].contiguous()
+            )
+            cos_sin = self.rotary_emb._match_cos_sin_cache_dtype(q_pe)
         ixf_ops.fused_glm_dsa_rmsnorm_rope_fp8_kv_insert(
             q_pe,
             k_pe,
@@ -1335,11 +1393,12 @@ class HYV4MLAAttention(nn.Module):
             self.kv_a_layernorm.weight,
             float(self.kv_a_layernorm.variance_epsilon),
             kv_cache,
-            slots[:n].contiguous(),
-            pos[:n].contiguous(),
-            self.rotary_emb._match_cos_sin_cache_dtype(q_pe),
+            slots_1d,
+            pos_1d,
+            cos_sin,
             self.mla_attn._k_scale,
             int(kv_cache.shape[1]),
+            variant=1 if positions.ndim == 2 else 2,
         )
         if not _MLA_KV_FUSE_LOGGED:
             logger.info(
@@ -1365,7 +1424,40 @@ class HYV4MLAAttention(nn.Module):
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
             )
-            q_c = self.q_a_layernorm(q_c)
+            if (
+                os.environ.get("VLLM_ILU_HYV4_FUSE_QA_NORM_QUANT", "0") != "0"
+                and q_c.is_cuda
+                and q_c.ndim == 2
+                and q_c.shape[0] > 6
+                and q_c.shape[1] % 8 == 0
+                and q_c.stride(0) % 8 == 0
+                and getattr(self.q_b_proj, "weight", None) is not None
+                and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
+                and (
+                    self.indexer is None
+                    or (
+                        getattr(self.indexer.wq_b, "weight", None) is not None
+                        and self.indexer.wq_b.weight.dtype == torch.float8_e4m3fn
+                    )
+                )
+            ):
+                import ixformer.inference.functions as ixf_ops
+
+                from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (
+                    register_activation_prequant,
+                )
+
+                qc_fp8, qc_scale = ixf_ops.fp8_per_token_dynamic_scaled(
+                    q_c,
+                    rms_weight=self.q_a_layernorm.weight,
+                    rms_eps=float(self.q_a_layernorm.variance_epsilon),
+                )
+                q_c = qkv_lora.view(-1)[: q_c.shape[0] * self.q_lora_rank].view(
+                    q_c.shape[0], self.q_lora_rank
+                )
+                register_activation_prequant(q_c, qc_fp8, qc_scale)
+            else:
+                q_c = self.q_a_layernorm(q_c)
             q = self.q_b_proj(q_c)[0]
         else:
             assert self.q_proj is not None
@@ -1397,12 +1489,13 @@ class HYV4MLAAttention(nn.Module):
             and getattr(self.mla_attn, "fuse_gate", False)
         )
         gate_score = None
-        if fused_gate:
-            gate_score = self.linear_gate(hidden_states)[0]
-            self.mla_attn.gate_logits = gate_score
-            self.mla_attn.gated_rows = 0
-
         if is_breakable_cudagraph_enabled():
+            if fused_gate:
+                gate_score = self.linear_gate(hidden_states)[0]
+                self.mla_attn.gate_logits = gate_score
+                self.mla_attn.gate_hidden_states = None
+                self.mla_attn.linear_gate_ref = None
+                self.mla_attn.gated_rows = 0
             # Breakable CUDA graphs replay the eager segment without a Python
             # return value, so it needs a caller-owned stable output buffer.
             attn_out = torch.empty(
@@ -1418,6 +1511,11 @@ class HYV4MLAAttention(nn.Module):
             # one full copy per layer.
             if self.indexer is not None and self.is_sparse and not self.skip_topk:
                 self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+            if fused_gate:
+                self.mla_attn.gate_logits = None
+                self.mla_attn.gate_hidden_states = hidden_states
+                self.mla_attn.linear_gate_ref = self.linear_gate
+                self.mla_attn.gated_rows = 0
             attn_out = self.mla_attn(
                 q,
                 kv_c_normed,
@@ -1428,11 +1526,17 @@ class HYV4MLAAttention(nn.Module):
         if fused_gate:
             gated = self.mla_attn.gated_rows
             self.mla_attn.gate_logits = None
+            self.mla_attn.gate_hidden_states = None
+            self.mla_attn.linear_gate_ref = None
             if gated < attn_out.shape[0]:
                 # Mixed batch: the dense-MHA prefill rows never reached the
                 # gated v-up, so gate the tail here.
-                assert gate_score is not None
-                attn_out[gated:].mul_(gate_score[gated:].sigmoid())
+                tail_gate = (
+                    gate_score[gated:]
+                    if gate_score is not None
+                    else self.linear_gate(hidden_states[gated:])[0]
+                )
+                attn_out[gated:].mul_(tail_gate.sigmoid_())
         elif self.gated_mla and self.linear_gate is not None:
             gate_score = self.linear_gate(hidden_states)[0]
             if self.config.gating_type == "headwise":

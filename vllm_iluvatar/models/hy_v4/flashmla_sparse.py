@@ -26,6 +26,7 @@ Remove   : when the base Iluvatar backend forwards sinks for every KV dtype.
 from __future__ import annotations
 
 import math
+import os
 from typing import ClassVar
 
 import torch
@@ -48,6 +49,9 @@ logger = init_logger(__name__)
 
 _HYV4_DSA_FP8_ROW_BYTES = 640
 _HYV4_DSA_FP8_E4M3_MAX = 448.0
+_HYV4_FUSE_MLA_REMAP = (
+    os.environ.get("VLLM_ILU_HYV4_FUSE_MLA_REMAP", "0") != "0"
+)
 
 
 class HYV4FlashMLASparseImpl(IluFlashMLASparseImpl):
@@ -156,18 +160,45 @@ class HYV4FlashMLASparseImpl(IluFlashMLASparseImpl):
             else None
         )
         if cached is None:
-            global_indices = triton_convert_req_index_to_global_index(
-                attn_metadata.req_id_per_token,
-                attn_metadata.block_table,
-                topk_indices,
-                BLOCK_SIZE=attn_metadata.block_size,
-                NUM_TOPK_TOKENS=topk_indices.shape[1],
-            )
-            topk_length = (
-                (global_indices.view(num_tokens, -1) >= 0).sum(dim=-1).to(torch.int32)
-            )
-            if self._topk_cache is not None and not self._reuses_topk_indices:
-                self._topk_cache.store(num_tokens, global_indices, topk_length)
+            if (
+                _HYV4_FUSE_MLA_REMAP
+                and self.dcp_world_size == 1
+                and self.pcp_world_size == 1
+            ):
+                if num_tokens == 0:
+                    global_indices = torch.empty_like(topk_indices)
+                    topk_length = torch.empty(
+                        (0,), dtype=torch.int32, device=topk_indices.device
+                    )
+                else:
+                    import ixformer.inference.functions as ixf_ops
+
+                    global_indices, topk_length = (
+                        ixf_ops.triton_convert_req_index_to_global_index(
+                            attn_metadata.req_id_per_token[:num_tokens],
+                            attn_metadata.block_table,
+                            topk_indices,
+                            attn_metadata.block_size,
+                            return_valid_counts=True,
+                        )
+                    )
+                if self._topk_cache is not None:
+                    self._topk_cache.store(num_tokens, global_indices, topk_length)
+            else:
+                global_indices = triton_convert_req_index_to_global_index(
+                    attn_metadata.req_id_per_token,
+                    attn_metadata.block_table,
+                    topk_indices,
+                    BLOCK_SIZE=attn_metadata.block_size,
+                    NUM_TOPK_TOKENS=topk_indices.shape[1],
+                )
+                topk_length = (
+                    (global_indices.view(num_tokens, -1) >= 0)
+                    .sum(dim=-1)
+                    .to(torch.int32)
+                )
+                if self._topk_cache is not None and not self._reuses_topk_indices:
+                    self._topk_cache.store(num_tokens, global_indices, topk_length)
         else:
             global_indices, topk_length = cached
         return global_indices, topk_length

@@ -65,6 +65,7 @@ gate.
 from __future__ import annotations
 
 import functools
+import os
 
 import torch
 from vllm import envs
@@ -76,6 +77,7 @@ from vllm.logger import init_logger
 
 from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (  # noqa: E501
     _e8m0_to_fp32,
+    _lookup_activation_prequant,
 )
 from vllm_iluvatar.model_executor.layers.activation import swiglu_clamp
 
@@ -619,9 +621,34 @@ def _ilu_mxfp4_fused_experts_ixformer(
     )
 
     # --- 2) Expand + per-token E4M3 -------------------------------------
-    a1_fp8, a1_scale = ixfops.moe_expand_input_dynamic_scaled_fp8(
-        hidden_states, dst_to_src, top_k
+    prequant = (
+        _lookup_activation_prequant(hidden_states)
+        if expert_map is None
+        and os.environ.get("VLLM_ILU_HYV4_MOE_EXPAND_PREQUANT", "0") != "0"
+        else None
     )
+    if prequant is not None:
+        q_fp8, q_scale = prequant
+        a1_fp8_i8 = torch.empty(
+            (M, H), dtype=torch.int8, device=hidden_states.device
+        )
+        a1_scale = torch.empty(
+            (M,), dtype=torch.float32, device=hidden_states.device
+        )
+        ixfops.moe_expand_input_ep(
+            q_fp8.view(torch.int8),
+            src_to_dst,
+            M,
+            top_k,
+            output=a1_fp8_i8,
+            input_scale=q_scale,
+            output_scale=a1_scale,
+        )
+        a1_fp8 = a1_fp8_i8.view(torch.float8_e4m3fn)
+    else:
+        a1_fp8, a1_scale = ixfops.moe_expand_input_dynamic_scaled_fp8(
+            hidden_states, dst_to_src, top_k
+        )
 
     # --- 3) GEMM1 (compact expert order, no fused swiglu: DSv4 needs clamp)
     gemm1_out = torch.empty(

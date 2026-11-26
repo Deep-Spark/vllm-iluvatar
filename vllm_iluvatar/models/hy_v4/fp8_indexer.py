@@ -132,6 +132,10 @@ def _indexer_rope_table(
     """
     if positions.ndim != 2:
         return positions.contiguous(), rotary_emb._match_cos_sin_cache_dtype(dtype_ref)
+    prefetched = getattr(indexer, "_prefetched_mrope_table", None)
+    if prefetched is not None:
+        indexer._prefetched_mrope_table = None
+        return prefetched
     mrope_emb = getattr(indexer, "mrope_emb", None)
     if mrope_emb is None or positions.shape[0] != 3:
         raise ValueError("HYV4 2-D positions require three rows and an M-RoPE module")

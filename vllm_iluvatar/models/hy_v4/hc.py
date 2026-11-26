@@ -211,7 +211,15 @@ class HYV4HCPreLayer(nn.Module):
             if base_noise_std > 0.0:
                 self.hc_base.add_(torch.randn_like(self.hc_base) * base_noise_std)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        rms_weight: torch.Tensor | None = None,
+        rms_eps: float = 0.0,
+        q_out: torch.Tensor | None = None,
+        scale_out: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Reduce the iHC channels and emit the post gates.
 
         Args:
@@ -233,6 +241,14 @@ class HYV4HCPreLayer(nn.Module):
                 norm_eps=self.layernorm_epsilon,
                 hc_eps=self.hc_eps,
                 magnitude=self.magnitude,
+                rms_weight=rms_weight,
+                rms_eps=rms_eps,
+                q_out=q_out,
+                scale_out=scale_out,
+            )
+        if rms_weight is not None or q_out is not None or scale_out is not None:
+            raise RuntimeError(
+                "HYV4HCPreLayer: fused rms_weight/q_out requires native iHC projection"
             )
 
         if (
@@ -389,7 +405,18 @@ class HYV4HCHeadLayer(nn.Module):
                     torch.randn_like(self.hc_head_base) * base_noise_std
                 )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def can_fuse_norm(self, x: torch.Tensor) -> bool:
+        return _ihc_ops() is not None and _native_projection_shape(
+            x, hc_mult=self.hc_mult, hidden_dim=self.hidden_size
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        rms_weight: torch.Tensor | None = None,
+        rms_eps: float = 0.0,
+    ) -> torch.Tensor:
         """Merge the iHC channels into a single hidden state.
 
         Args:
@@ -409,6 +436,8 @@ class HYV4HCHeadLayer(nn.Module):
                 self.hc_head_base,
                 norm_eps=self.config.rms_norm_eps,
                 hc_eps=self.hc_eps,
+                rms_weight=rms_weight,
+                rms_eps=rms_eps,
             )
 
         if (
@@ -513,8 +542,25 @@ class HYV4HCLayer(nn.Module):
             f"hc_mult={hc}, hidden_size={h}."
         )
 
+    def can_fuse_norm(self, hidden_states: torch.Tensor) -> bool:
+        return (
+            self.enable_ihc
+            and _ihc_ops() is not None
+            and _native_projection_shape(
+                hidden_states,
+                hc_mult=self.config.hc_mult,
+                hidden_dim=self.config.hidden_size,
+            )
+        )
+
     def pre(
-        self, hidden_states: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        rms_weight: torch.Tensor | None = None,
+        rms_eps: float = 0.0,
+        q_out: torch.Tensor | None = None,
+        scale_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         """Reduce the iHC channels and produce the post gates.
 
@@ -525,7 +571,13 @@ class HYV4HCLayer(nn.Module):
         """
         if not self.enable_ihc:
             return hidden_states, None, hidden_states
-        reduced, post_gates = self.hc_pre(hidden_states)
+        reduced, post_gates = self.hc_pre(
+            hidden_states,
+            rms_weight=rms_weight,
+            rms_eps=rms_eps,
+            q_out=q_out,
+            scale_out=scale_out,
+        )
         return reduced, post_gates, hidden_states
 
     def post(

@@ -45,6 +45,8 @@ answer independent of that subtlety altogether. ``__init__`` asserts both.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from vllm.config import get_current_vllm_config_or_none
@@ -71,6 +73,9 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
 from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 from vllm.model_executor.utils import replace_parameter
 
+from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (
+    _lookup_activation_prequant,
+)
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
     _ixmm_backend_available,
     ilu_mxfp4_fused_experts,
@@ -664,6 +669,13 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
         workspace = self._compute.workspace_spec(topk_ids.numel(), x.dtype).allocate(
             x.device
         )
+        prequant = (
+            _lookup_activation_prequant(x)
+            if layer.expert_map is None
+            and getattr(self._compute, "supports_prequantized_fp8", False)
+            and os.environ.get("VLLM_ILU_HYV4_MOE_EXPAND_PREQUANT", "0") != "0"
+            else None
+        )
         return self._compute.run_standard(
             x,
             self._runtime_weights,
@@ -672,6 +684,7 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
             layer.expert_map,
             workspace=workspace,
             residual=residual,
+            quantized_input=prequant,
         )
 
 

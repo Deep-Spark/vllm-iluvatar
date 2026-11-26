@@ -419,8 +419,18 @@ class IluFp8PerChannelOnlineLinearMethod(OnlineLinearBase):
         )
         bias = None if bias is None else bias.to(torch.bfloat16)
 
-        if not prequantized and _can_fuse_bf16_fp8_gemv(
-            x_2d, layer, self.gemm_format, bias
+        prequant = None
+        if not prequantized:
+            from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (
+                _lookup_activation_prequant,
+            )
+
+            prequant = _lookup_activation_prequant(x_2d)
+
+        if (
+            not prequantized
+            and prequant is None
+            and _can_fuse_bf16_fp8_gemv(x_2d, layer, self.gemm_format, bias)
         ):
             ixfops.per_channel_gemv_bf16_fp8_bf16(
                 x_2d, layer.weight, layer.weight_scale, output, bias
@@ -430,6 +440,8 @@ class IluFp8PerChannelOnlineLinearMethod(OnlineLinearBase):
         if prequantized:
             qx = x_2d
             scale_x = scale_x.reshape(-1)
+        elif prequant is not None:
+            qx, scale_x = prequant
         else:
             qx, scale_x = fp8_per_token_dynamic_scaled(x_2d)
         scale_w = layer.weight_scale

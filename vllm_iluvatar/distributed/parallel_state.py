@@ -41,6 +41,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from vllm import envs
+
 from vllm_iluvatar.ilu_util.arch import is_ivcore30 as _is_ivcore30_fn
 
 if TYPE_CHECKING:
@@ -348,12 +350,12 @@ def _ilu_irecv_tensor_dict_sync(
 
 
 def _make_isend_tensor_dict(orig):
-    """Wrapper: ivcore30 → blocking send; ivcore11 → community isend."""
+    """Use sync PP send on ivcore30 unless explicitly disabled by env."""
 
     def isend_tensor_dict(
         self, tensor_dict, dst=None, all_gather_group=None, all_gather_tensors=None
     ):
-        if _is_ivcore30_fn():
+        if _is_ivcore30_fn() and envs.VLLM_ILU_PP_SYNC_SENDRECV:
             return _ilu_isend_tensor_dict_sync(
                 self, tensor_dict, dst, all_gather_group, all_gather_tensors
             )
@@ -363,12 +365,12 @@ def _make_isend_tensor_dict(orig):
 
 
 def _make_irecv_tensor_dict(orig):
-    """Wrapper: ivcore30 → blocking recv; ivcore11 → community irecv."""
+    """Use sync PP recv on ivcore30 unless explicitly disabled by env."""
 
     def irecv_tensor_dict(
         self, src=None, all_gather_group=None, all_gather_tensors=None
     ):
-        if _is_ivcore30_fn():
+        if _is_ivcore30_fn() and envs.VLLM_ILU_PP_SYNC_SENDRECV:
             return _ilu_irecv_tensor_dict_sync(
                 self, src, all_gather_group, all_gather_tensors
             )

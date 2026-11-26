@@ -82,6 +82,7 @@ class FakeGroupCoordinator:
 def _patch_env(monkeypatch):
     """Disable fingerprint check — fake classes won't match real baselines."""
     monkeypatch.setenv("VLLM_ILU_PATCH_CHECK_FINGERPRINT", "0")
+    monkeypatch.setenv("VLLM_ILU_PP_SYNC_SENDRECV", "1")
 
 
 @pytest.fixture()
@@ -219,6 +220,25 @@ class TestIsendTensorDict:
             "ivcore11 should NOT call torch.distributed.send"
         )
 
+    def test_ivcore30_async_gate_delegates_to_original(
+        self, _set_ivcore30, torch_mock, monkeypatch
+    ):
+        """Opting out of sync mode restores the community async path."""
+        monkeypatch.setenv("VLLM_ILU_PP_SYNC_SENDRECV", "0")
+        gc = FakeGroupCoordinator(world_size=2, rank=0)
+        td = {"hidden": FakeTensor(4)}
+        delegate_called = []
+
+        def orig_isend(self, *args, **kwargs):
+            delegate_called.append(True)
+            return ["async_handle"]
+
+        handles = impl._make_isend_tensor_dict(orig_isend)(gc, td)
+
+        assert delegate_called
+        assert handles == ["async_handle"]
+        assert torch_mock._call_log == []
+
     def test_ivcore30_empty_tensor_skipped(self, _set_ivcore30, torch_mock):
         """Zero-numel tensors should be skipped (no send call)."""
         gc = FakeGroupCoordinator(world_size=2, rank=0)
@@ -271,6 +291,28 @@ class TestIrecvTensorDict:
         assert torch_mock._call_log == [], (
             "ivcore11 should NOT call torch.distributed.recv"
         )
+
+    def test_ivcore30_async_gate_delegates_to_original(
+        self, _set_ivcore30, torch_mock, monkeypatch
+    ):
+        """Opting out of sync mode restores the community async path."""
+        monkeypatch.setenv("VLLM_ILU_PP_SYNC_SENDRECV", "0")
+        gc = FakeGroupCoordinator(world_size=2, rank=1)
+        delegate_called = []
+
+        def orig_irecv(self, *args, **kwargs):
+            delegate_called.append(True)
+            return {"hidden": FakeTensor(4)}, ["async_handle"], []
+
+        tensor_dict, handles, postprocess = impl._make_irecv_tensor_dict(
+            orig_irecv
+        )(gc)
+
+        assert delegate_called
+        assert "hidden" in tensor_dict
+        assert handles == ["async_handle"]
+        assert postprocess == []
+        assert torch_mock._call_log == []
 
     def test_ivcore30_world_size_1_returns_none(self, _set_ivcore30, torch_mock):
         """Single-GPU should short-circuit and return (None, [], [])."""

@@ -88,6 +88,7 @@ class IluMoEBatchedExpertsFp8(BaseBatchExperts):
     ) -> torch.Tensor:
         del (
             topk_weights,
+            topk_ids,
             global_num_experts,
             expert_map,
             a2_scale,
@@ -158,21 +159,9 @@ class IluMoEBatchedExpertsFp8(BaseBatchExperts):
             ),
         )
 
-        # The GLM-5.3-Flash layout benefits from GEMV for small batches.
-        # Bound the live rows by the per-dispatcher router input size.
-        gemm_mode = 0
-        if (
-            hidden_size == 4096
-            and getattr(
-                self.moe_config, "num_logical_experts", self.moe_config.num_experts
-            )
-            == 288
-            and topk_ids is not None
-            and topk_ids.ndim == 2
-            and topk_ids.shape[1] == 8
-            and 0 < topk_ids.shape[0] * self.num_dispatchers <= 256
-        ):
-            gemm_mode = 1
+        # The padded expert capacity guarantees the 64-row GEMV limit
+        # even with skewed or replayed routing.
+        gemm_mode = int(0 < max_num_tokens_per_expert <= 64)
 
         # ix30-packed w1 is [expert, k/2, 2 * intermediate].
         inter_x2 = w1.shape[2]

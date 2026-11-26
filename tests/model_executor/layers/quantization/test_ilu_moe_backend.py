@@ -28,6 +28,7 @@ def test_selection(arch, name, layout, expected):
 @pytest.mark.parametrize(
     "arch,name,layout",
     [
+        ("ivcore11", "ixmm_w4a8", "TN"),
         ("ivcore11", "ixmm_fp4fp8", "auto"),
         ("ivcore30", "ixinfer_w4a8", "NN"),
         ("ivcore30", "missing", "auto"),

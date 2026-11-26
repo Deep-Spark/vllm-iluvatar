@@ -48,6 +48,9 @@ def eligible(sampler, logits, idx_mapping_np, *, return_logprobs=False):
     if budget.enabled and np.any(budget.use_thinking_budget[idx_mapping_np]):
         return False
     s = sampler.sampling_states
+    # Keep explicitly seeded rows on the upstream RNG path across batches.
+    if s.any_explicit_seed(idx_mapping_np):
+        return False
     t, p = s.temperature.np[idx_mapping_np], s.top_p.np[idx_mapping_np]
     return bool(
         np.all(np.isfinite(t) & (t >= 0))

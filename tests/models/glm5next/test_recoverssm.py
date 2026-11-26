@@ -303,6 +303,30 @@ def test_mixed_prefill_request_mapping_and_filtered_commit(mode):
         assert int(builder.group.computed_by_request[2]) == 7
 
 
+@pytest.mark.parametrize("mode", ["none", "align"])
+def test_overlong_decode_uses_prefill_without_entering_recoverssm(mode):
+    _, _, resources, builder = setup(mode)
+    assert resources.spec_query_len == 6
+    assert not resources.is_profiling
+
+    metadata = build(builder, common([6, 7, 1], [2, 1, 7]))
+
+    assert metadata.num_spec_decodes == 2
+    assert metadata.num_spec_decode_tokens == 7
+    assert metadata.num_prefills == 1
+    assert metadata.num_prefill_tokens == 7
+    assert metadata.non_spec_query_start_loc_cpu.tolist() == [0, 7]
+    assert metadata.non_spec_token_indx.cpu().tolist() == list(range(6, 13))
+    assert metadata.spec_token_indx.cpu().tolist() == [0, 1, 2, 3, 4, 5, 13]
+    assert builder.group.request_rows[:2].cpu().tolist() == [0, 2]
+
+    all_overlong = build(builder, common([7, 8], [1, 2]))
+    assert all_overlong.num_prefills == 2
+    assert all_overlong.num_prefill_tokens == 15
+    assert all_overlong.num_spec_decodes == 0
+    assert all_overlong.recoverssm_group is None
+
+
 def test_capture_and_profiling_do_not_enqueue_commit():
     _, layers, resources, builder = setup("none")
     metadata = build(builder, common([1, 0, 0], [8, 0, 0]))

@@ -45,12 +45,16 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     get_kv_quant_mode,
 )
+from vllm.v1.worker.workspace import current_workspace_manager
 
 from vllm_iluvatar.ilu_util.arch import is_ivcore11, is_ivcore30
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.schemes.ilu_compressed_tensors_w8a8_int8 import (  # noqa: E501
     IluW8A8OnlineLinearMethod,
 )
 from vllm_iluvatar.model_executor.layers.quantization.configs.fp8 import IluFp8Config
+from vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse import (
+    validate_ixattn_pool4_query_rows,
+)
 
 
 def resolve_glm5next_indexer_kv_dtype(
@@ -134,10 +138,6 @@ def glm5next_topk_buffer_width(
 
 
 logger = init_logger(__name__)
-
-# One set of query staging tensors per (device, capacity, heads, kv_lora_rank),
-# shared across every NoPE MLA layer in the process for zero-alloc CUDA graphs.
-_FP8_MLA_SCRATCH: dict[tuple, dict[str, torch.Tensor]] = {}
 
 # The architectures this module's layers back, for config-phase checks that run
 # before the model class is resolved.
@@ -232,10 +232,10 @@ def _fp8_mla_scratch(
     num_heads: int,
     kv_lora_rank: int,
 ) -> dict[str, torch.Tensor]:
-    key = (device, capacity, num_heads, kv_lora_rank)
-    scratch = _FP8_MLA_SCRATCH.get(key)
-    if scratch is None:
-        scratch = {
+    validate_ixattn_pool4_query_rows(capacity, name="max_num_batched_tokens")
+
+    def allocate() -> dict[str, torch.Tensor]:
+        return {
             "q_fp8": torch.empty(
                 (capacity, num_heads, kv_lora_rank),
                 dtype=torch.float8_e4m3fn,
@@ -249,8 +249,12 @@ def _fp8_mla_scratch(
             ),
             "unit_kv_scale": torch.ones((1,), dtype=torch.float32, device=device),
         }
-        _FP8_MLA_SCRATCH[key] = scratch
-    return scratch
+
+    # Fixed addresses are shared by the worker's MLA layers and graph replays.
+    return current_workspace_manager().get_persistent_resource(
+        ("glm5next_fp8_mla", device, capacity, num_heads, kv_lora_rank),
+        allocate,
+    )
 
 
 def _resolve_fp8_kv_scale(layer, scratch: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -296,6 +300,7 @@ def _fp8_mla_forward_mqa(
     num_tokens = q.shape[0]
     if num_tokens == 0:
         return q
+    validate_ixattn_pool4_query_rows(num_tokens)
     scratch = self._fp8_mla_scratch
     assert num_tokens <= scratch["q_fp8"].shape[0], (
         f"FP8 NoPE MLA staging holds {scratch['q_fp8'].shape[0]} tokens, "

@@ -34,6 +34,9 @@ from vllm_iluvatar.model_executor.layers.fused_moe.ilu_f4f8_experts import (
     IluF4F8Experts,
     ilu_f4f8_moe_backends_available,
 )
+from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.nvfp4_moe import (
+    _get_ilu_output_scale,
+)
 from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
     IluQuantConfig,
 )
@@ -323,9 +326,6 @@ class IluF4F8MoEMethod(FusedMoEMethodBase):
         from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe import (
             _shrink_ll_max_tokens_to_decode,
         )
-        from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.nvfp4_moe import (
-            _get_ilu_output_scale,
-        )
 
         if (
             prepare_finalize.activation_format
@@ -374,6 +374,7 @@ class IluF4F8MoEMethod(FusedMoEMethodBase):
             topk_ids=topk_ids,
             expert_map=layer.expert_map,
             shared_expert_output=shared_experts_input,
+            scaling_factor=_get_ilu_output_scale(layer),
         )
 
 

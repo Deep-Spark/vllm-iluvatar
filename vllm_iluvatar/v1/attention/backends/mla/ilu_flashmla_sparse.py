@@ -46,6 +46,20 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
+# The fixed ixAttn sparse MLA kernel maps Q rows to grid.y.
+_IXATTN_POOL4_MAX_QUERY_ROWS = 65535
+
+
+def validate_ixattn_pool4_query_rows(
+    rows: int, *, name: str = "Q rows per step"
+) -> None:
+    if rows > _IXATTN_POOL4_MAX_QUERY_ROWS:
+        raise ValueError(
+            f"CQ ixAttn pool4 requires {name} <= {_IXATTN_POOL4_MAX_QUERY_ROWS}, "
+            f"got {rows}. Lower max_num_batched_tokens and use chunked prefill."
+        )
+
+
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention.mla_attention import MLAAttention
     from vllm.model_executor.models.deepseek_v2 import Indexer
@@ -537,11 +551,6 @@ class IluFlashMLASparseImpl(
 
         vllm_config = get_current_vllm_config()
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        q_concat_shape = (max_tokens, num_heads, head_size)
-
-        (self.q_concat_buffer,) = current_workspace_manager().get_simultaneous(
-            (q_concat_shape, torch.bfloat16),
-        )
         self.use_int8_mla = envs.VLLM_ILU_MLA_ATTN_QUANT_TYPE == "INT8"
         self.use_pool4_decode = envs.VLLM_ILU_GLM5NEXT_MLA_POOL4_DECODE
         self.use_ixattn_kpool4 = (
@@ -553,6 +562,12 @@ class IluFlashMLASparseImpl(
             getattr(indexer, "compact_pool_indices", False)
         )
         self._reuse_ixattn_pool_indices = False
+        if self.use_ixattn_kpool4:
+            validate_ixattn_pool4_query_rows(max_tokens, name="max_num_batched_tokens")
+
+        (self.q_concat_buffer,) = current_workspace_manager().get_simultaneous(
+            ((max_tokens, num_heads, head_size), torch.bfloat16),
+        )
         if self.use_ixattn_kpool4:
             from ixformer.inference.ixattn_backend import ixattn_available
 
@@ -857,6 +872,7 @@ class IluFlashMLASparseImpl(
             rows = q.shape[0]
             if rows == 0:
                 return torch.empty_like(q)
+            validate_ixattn_pool4_query_rows(rows)
             if not kv_c_and_k_pe_cache.is_contiguous():
                 raise ValueError("ixattn pool4 requires a contiguous latent KV cache")
             pool_starts, token_counts = self._ixattn_physical_pool_rows(

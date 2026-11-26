@@ -22,6 +22,10 @@ DEVICES=0,1,2,3,6,7,4,5 HOST=0.0.0.0 PORT=8001 \
 bash run_cq_decode.sh --serve
 ```
 
+批量 F4F8 在单专家预留容量为 1–64 行时使用 GEMV，容量超过 64 行时使用 GEMM。
+
+CQ 的 ixAttn pool4（BF16 和 FP8 MLA）单步最多处理 65,535 行 Q。Prefill 和 Decode 的 `MAX_NUM_BATCHED_TOKENS` 都应不超过 65,535。较长上下文可以通过分块 prefill 处理。
+
 ## 3. 可选：从原始 FP8 权重生成离线 `ilu_f4f8` 模型
 
 如需提前离线打包权重以缩短服务冷启动时间，可执行：

@@ -87,15 +87,10 @@ class IluGlm5NextKDAMetadataBuilder(IluGDNAttentionMetadataBuilder):
         if m.is_prefilling is None or m.is_prefilling.device.type != "cpu":
             raise ValueError("GLM RecoverSSM requires CPU request-phase metadata")
         lengths = m.query_start_loc_cpu.diff()
-        active = (~m.is_prefilling) & (lengths > 0)
-        too_long = active & (lengths > resources.spec_query_len)
-        if bool(too_long.any()):
-            if not resources.is_profiling:
-                raise ValueError(
-                    "GLM RecoverSSM decode query length exceeds reserved T"
-                )
-            # Cost-table/dummy profiles may probe long rows; they use prefill.
-            active &= ~too_long
+        # Overlong decode rows use the shared non-spec prefill path.
+        active = (
+            (~m.is_prefilling) & (lengths > 0) & (lengths <= resources.spec_query_len)
+        )
         if int(active.sum()) > resources.record_capacity:
             raise ValueError("GLM RecoverSSM active requests exceed record capacity")
         pure_decode = not bool(((~active) & (lengths > 0)).any())

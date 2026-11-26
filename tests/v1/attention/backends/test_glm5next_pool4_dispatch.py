@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Check default decode dispatch and index representation without a model."""
 
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -386,13 +387,66 @@ def test_glm5next_fp8_attn_config_and_compact_pools(monkeypatch):
     assert attn_mod.glm5next_topk_buffer_width(cfg_fp8_cli, 2048, 4) == 512
 
 
+def test_ixattn_pool4_query_row_limit():
+    from vllm_iluvatar.models.glm5next.attention import (
+        _fp8_mla_forward_mqa,
+        _fp8_mla_scratch,
+    )
+    from vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse import (
+        IluFlashMLASparseImpl,
+        validate_ixattn_pool4_query_rows,
+    )
+
+    validate_ixattn_pool4_query_rows(65535, name="max_num_batched_tokens")
+    with pytest.raises(ValueError, match=r"max_num_batched_tokens <= 65535, got 65536"):
+        _fp8_mla_scratch(torch.device("cpu"), 65536, 64, 512)
+
+    q = SimpleNamespace(shape=(65536, 64, 512))
+    with pytest.raises(ValueError, match=r"Q rows per step <= 65535, got 65536"):
+        _fp8_mla_forward_mqa(None, q, None, None, None)
+    impl = SimpleNamespace(use_ixattn_kpool4=True)
+    with pytest.raises(ValueError, match=r"Q rows per step <= 65535, got 65536"):
+        IluFlashMLASparseImpl._forward_bf16_kv(impl, q, None, None, None)
+
+
+@pytest.fixture
+def isolated_workspace(monkeypatch):
+    from vllm.v1.worker import workspace
+
+    monkeypatch.setattr(workspace, "_manager", None)
+    return workspace
+
+
+def test_glm5next_fp8_mla_scratch_releases_with_worker(isolated_workspace):
+    from vllm_iluvatar.models.glm5next.attention import _fp8_mla_scratch
+
+    device = torch.device("cpu")
+    isolated_workspace.init_workspace_manager(device)
+    first_layer = _fp8_mla_scratch(device, 8192, 64, 512)
+    assert _fp8_mla_scratch(device, 8192, 64, 512) is first_layer
+    assert first_layer["q_fp8"].shape == (8192, 64, 512)
+    assert first_layer["q_scale"].shape == (8192, 64)
+    old_tensors = [weakref.ref(tensor) for tensor in first_layer.values()]
+    del first_layer
+    assert all(ref() is not None for ref in old_tensors)
+
+    isolated_workspace.reset_workspace_manager()
+    isolated_workspace.init_workspace_manager(device)
+    second_layer = _fp8_mla_scratch(device, 2048, 64, 512)
+    assert second_layer["q_fp8"].shape == (2048, 64, 512)
+    assert second_layer["q_scale"].shape == (2048, 64)
+    assert all(ref() is None for ref in old_tensors)
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or getattr(torch, "corex_arch", None) != "ivcore30",
     reason="ixattn GLM-5.3 FP8 sparse MLA requires ivcore30 GPU",
 )
 @pytest.mark.parametrize("num_tokens", [1, 4, 21])
 @pytest.mark.parametrize("num_heads", [32, 64])
-def test_glm5next_fp8_mla_e2e_layer_vs_bf16_and_cudagraph(num_tokens, num_heads):
+def test_glm5next_fp8_mla_e2e_layer_vs_bf16_and_cudagraph(
+    num_tokens, num_heads, isolated_workspace
+):
     from vllm_iluvatar.models.glm5next.attention import install_glm5next_fp8_mla
     from vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse import (
         IluFlashMLASparseImpl,
@@ -400,6 +454,7 @@ def test_glm5next_fp8_mla_e2e_layer_vs_bf16_and_cudagraph(num_tokens, num_heads)
 
     torch.manual_seed(42 + num_tokens + num_heads)
     device = torch.device("cuda")
+    isolated_workspace.init_workspace_manager(device)
     kv_lora_rank, qk_nope_dim, v_head_dim = 512, 256, 256
     block_size, num_blocks = 4608, 2
 

@@ -184,7 +184,9 @@ def test_f4f8_loader_and_local_experts_match_reference(
     weights = torch.rand(tokens, 2)
     weights /= weights.sum(-1, keepdim=True)
     shared = (torch.randn_like(x.float()) * 0.01).to(torch.bfloat16)
-    expected = shared.float().clone()
+    output_scale = 1.5 if use_ep else 1.0
+    layer._ilu_output_scale = output_scale
+    expected = torch.zeros_like(x, dtype=torch.float32)
     qx = _fp8_roundtrip(x.float())
     lo, hi = tp_rank * local_intermediate, (tp_rank + 1) * local_intermediate
     for expert in range(first_expert, first_expert + _LOCAL_EXPERTS):
@@ -208,6 +210,7 @@ def test_f4f8_loader_and_local_experts_match_reference(
         act = _fp8_roundtrip(F.silu(gate) * up)
         routed = (act @ checkpoint["w2"][2][expert, lo:hi]).to(torch.bfloat16).float()
         expected.index_add_(0, rows, routed * weights[rows, slots, None])
+    expected.mul_(output_scale).add_(shared)
     init_workspace_manager(device)
     # Unused compact rows are deliberately NaN: downstream kernels must mask
     # them, including partial expert tiles and experts with no routed tokens.
@@ -252,6 +255,88 @@ def test_f4f8_sorted_experts_match_reference(cuda_device, monkeypatch, tokens):
     test_f4f8_loader_and_local_experts_match_reference(
         cuda_device, monkeypatch, tokens, 1, 0, True, 10.0
     )
+
+
+@pytest.mark.parametrize(
+    "capacity, expert_tokens, logical_experts, hidden_size, topk, mode",
+    [
+        (1, 1, 16, 512, 2, 1),
+        (32, 16, 256, 3072, 6, 1),
+        (64, 64, 160, 2048, 4, 1),
+        (64, 64, 288, 4096, 8, 1),
+        (65, 65, 160, 2048, 4, 0),
+        (256, 32, 160, 2048, 4, 0),
+    ],
+)
+def test_batched_f4f8_gemv_requires_bounded_expert_rows(
+    monkeypatch,
+    capacity,
+    expert_tokens,
+    logical_experts,
+    hidden_size,
+    topk,
+    mode,
+):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+
+    from vllm_iluvatar.model_executor.layers.quantization.backends.fp4 import (
+        batch_experts,
+    )
+
+    moe_config = SimpleNamespace(
+        num_experts=logical_experts,
+        swiglu_limit=None,
+        swiglu_alpha=None,
+        swiglu_beta=None,
+        activation_situ_beta=None,
+        activation_situ_linear_beta=None,
+    )
+    quant_config = SimpleNamespace(
+        w1_scale=None,
+        w2_scale=None,
+        gemm1_clamp_limit=None,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+    )
+    experts = batch_experts.IluMoEBatchedExpertsFp8(
+        moe_config, quant_config, max_num_tokens=capacity, num_dispatchers=4
+    )
+    experts._scratch_cache = {}
+    ops = Mock()
+    ops.moe_group_gemv_swiglu_quant_fp8.return_value = (
+        torch.empty(capacity, 256, dtype=torch.float8_e4m3fn),
+        torch.ones(capacity),
+    )
+    monkeypatch.setattr(batch_experts, "ixff", ops)
+
+    output = torch.empty(1, capacity, hidden_size, dtype=torch.bfloat16)
+    experts.apply(
+        output=output,
+        hidden_states=torch.empty_like(output, dtype=torch.float8_e4m3fn),
+        w1=torch.empty(1, hidden_size // 2, 512, dtype=torch.uint8),
+        w2=torch.empty(1, 128, hidden_size, dtype=torch.uint8),
+        topk_weights=torch.ones(32, topk),
+        topk_ids=torch.arange(topk, dtype=torch.int32).expand(32, topk),
+        activation=MoEActivation.SILU,
+        global_num_experts=logical_experts,
+        expert_map=None,
+        a1q_scale=torch.ones(1, capacity),
+        a2_scale=None,
+        workspace13=torch.empty(0),
+        workspace2=torch.empty(0),
+        expert_tokens_meta=mk.ExpertTokensMetadata(
+            expert_num_tokens=torch.tensor([expert_tokens], dtype=torch.int32),
+            expert_num_tokens_cpu=None,
+        ),
+    )
+
+    assert [call.kwargs["mode"] for call in ops.group_gemm_fp4.call_args_list] == [
+        mode,
+        mode,
+    ]
 
 
 @requires_corex30

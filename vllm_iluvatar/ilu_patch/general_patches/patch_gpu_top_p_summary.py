@@ -51,10 +51,12 @@ def _apply():
         if eligible(self, logits, idx_mapping_np, return_logprobs=return_logprobs):
             n = logits.shape[0]
             cu = torch.arange(n + 1, device=logits.device, dtype=torch.int32)
-            sampled, _ = sample_summary(
+            sampled, counts = sample_summary(
                 self, logits, expanded_idx_mapping, cu, input_ids, pos, 1
             )
-            return sampled[:, 0], logits
+            # Ordinary sampling expects one token per completed prefill/decode
+            # row. Match upstream Gumbel argmax's first-index tie on all -inf.
+            return sampled[:, 0].masked_fill_(counts == 0, 0), logits
         return original_sample(
             self,
             logits,

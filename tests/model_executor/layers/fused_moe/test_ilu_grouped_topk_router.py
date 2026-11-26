@@ -75,7 +75,7 @@ def test_grouped_topk_delegates_cleanly_to_ixformer(monkeypatch, has_bias, cq):
     assert kwargs == {
         "renormalize": True,
         "routed_scaling_factor": 3.0,
-        "group_scoring_func": "top2sum" if has_bias and cq else "max",
+        "group_scoring_func": "top2sum" if has_bias else "max",
     }
 
 

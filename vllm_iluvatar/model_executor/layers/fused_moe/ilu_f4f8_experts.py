@@ -61,6 +61,7 @@ class IluF4F8Experts:
         topk_ids: torch.Tensor,
         expert_map: torch.Tensor | None,
         shared_expert_output: torch.Tensor | None = None,
+        scaling_factor: float = 1.0,
     ) -> torch.Tensor:
         from ixformer.inference.functions import (
             activation_dynamic_scaled_fp8,
@@ -159,5 +160,6 @@ class IluF4F8Experts:
             src_to_dst=src_to_dst,
             output=output,
             extra_residual=shared_expert_output,
+            scaling_factor=scaling_factor,
             backend="ixformer_native",
         )

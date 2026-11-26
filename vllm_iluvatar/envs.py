@@ -479,10 +479,10 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_MOE_RUNTIME_LAYOUT": _moe_runtime_layout,
     # Opt in to supported NN MoE W4A8 GEMV perf kernels; layout is separate.
     "VLLM_ILU_MOE_W4A8_GEMV_PERF": _bool_reader("VLLM_ILU_MOE_W4A8_GEMV_PERF", "0"),
-    # Quantize BF16 GLM5Next projections after loading; KDA gates stay BF16.
     "VLLM_ILU_GLM5NEXT_MHC_DECODE_SPLITK": _bool_reader(
         "VLLM_ILU_GLM5NEXT_MHC_DECODE_SPLITK", "0"
     ),
+    # Quantize BF16 GLM5Next projections after loading; KDA gates stay BF16.
     "VLLM_ILU_GLM5NEXT_DRAFT_HEAD_W8A8": _bool_reader(
         "VLLM_ILU_GLM5NEXT_DRAFT_HEAD_W8A8", "1"
     ),

@@ -14,7 +14,7 @@ def _request_bounds(
     Lengths,
     Compressed,
     Legacy,
-    B: tl.constexpr,
+    B,
     Ratio: tl.constexpr,
     Flat: tl.constexpr,
     BLOCK_B: tl.constexpr,
@@ -44,7 +44,7 @@ def _query_requests(
     rows,
     live,
     base,
-    B: tl.constexpr,
+    B,
     HAS_REQUEST_IDS: tl.constexpr,
     SEARCH_STEPS: tl.constexpr,
 ):
@@ -52,7 +52,7 @@ def _query_requests(
         req = tl.load(RequestIds + rows, live, 0)
     else:
         lo = tl.full(rows.shape, 0, tl.int32)
-        hi = tl.full(rows.shape, B, tl.int32)
+        hi = lo + B
         # First request whose exclusive query end exceeds this row. Repeated
         # boundaries (including empty requests in the middle) are skipped.
         for _ in range(SEARCH_STEPS):
@@ -62,10 +62,10 @@ def _query_requests(
             lo = tl.where(right, mid + 1, lo)
             hi = tl.where(right, hi, mid)
         req = lo
-    return tl.where(live, tl.minimum(req, max(B - 1, 0)), 0)
+    return tl.where(live, tl.minimum(req, tl.maximum(B - 1, 0)), 0)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["B", "P"])
 def _fused_decode_metadata(
     Q,
     L,
@@ -78,8 +78,8 @@ def _fused_decode_metadata(
     KS,
     KE,
     Valid,
-    B: tl.constexpr,
-    P: tl.constexpr,
+    B,
+    P,
     Ratio: tl.constexpr,
     Flat: tl.constexpr,
     HAS_REQUEST_IDS: tl.constexpr,
@@ -108,7 +108,7 @@ def _fused_decode_metadata(
         tl.store(Legacy + rows, 1, rows < P)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["B"])
 def _decode_request_metadata(
     Q,
     L,
@@ -117,7 +117,7 @@ def _decode_request_metadata(
     Lengths,
     Compressed,
     Legacy,
-    B: tl.constexpr,
+    B,
     Ratio: tl.constexpr,
     Flat: tl.constexpr,
     BLOCK_B: tl.constexpr,
@@ -125,7 +125,7 @@ def _decode_request_metadata(
     _request_bounds(Q, L, CQ, CK, Lengths, Compressed, Legacy, B, Ratio, Flat, BLOCK_B)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["B", "P"])
 def _decode_query_metadata(
     Q,
     L,
@@ -135,8 +135,8 @@ def _decode_query_metadata(
     KS,
     KE,
     Valid,
-    B: tl.constexpr,
-    P: tl.constexpr,
+    B,
+    P,
     Ratio: tl.constexpr,
     Flat: tl.constexpr,
     HAS_REQUEST_IDS: tl.constexpr,
@@ -203,6 +203,8 @@ def build_indexer_decode_metadata(
     if has_ids:
         assert ids.numel() >= p
     block_b = triton.next_power_of_2(max(b, 1))
+    # Derive the search bound from the tile size to share compiled variants.
+    search_steps = block_b.bit_length()
     common = (
         query_start_loc,
         seq_lens,
@@ -224,7 +226,7 @@ def build_indexer_decode_metadata(
             compress_ratio,
             flatten_decode_lens,
             has_ids,
-            b.bit_length(),
+            search_steps,
             block_b,
             triton.next_power_of_2(max(p, 1)),
             num_warps=4,
@@ -260,7 +262,7 @@ def build_indexer_decode_metadata(
                 compress_ratio,
                 flatten_decode_lens,
                 has_ids,
-                b.bit_length(),
+                search_steps,
                 256,
                 num_warps=4,
             )

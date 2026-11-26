@@ -79,7 +79,7 @@ def assert_outputs(actual, expected):
 @pytest.mark.parametrize(
     "counts,padded,origin",
     [
-        ([4, 2, 0], 8, 0),
+        ([4, 2, 0], 7, 0),
         ([1, 0, 1, 0], 8, 7),
         ([6] * 16, 96, 0),
         ([0] * 16, 96, 0),

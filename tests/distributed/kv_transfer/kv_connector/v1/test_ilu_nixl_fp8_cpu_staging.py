@@ -368,6 +368,8 @@ def test_export_alternates_ab_scratch_and_orders_events_across_requests(
         num_tokens,
         total_block_count,
         chunk_offset,
+        *,
+        already_zeroed=False,
     ):
         buffer_name = (
             "a" if destination_caches is staging.scratch_wire_cache_buffers[0] else "b"
@@ -381,6 +383,7 @@ def test_export_alternates_ab_scratch_and_orders_events_across_requests(
                 total_block_count,
                 chunk_offset,
                 buffer_name,
+                already_zeroed,
             )
         )
         for source_id, destination_id in zip(
@@ -416,9 +419,9 @@ def test_export_alternates_ab_scratch_and_orders_events_across_requests(
     )
 
     assert calls == [
-        (0, [7, 3], [0, 1], 3, 0, "a"),
-        (0, [9], [0], 3, 2, "b"),
-        (0, [2, 8], [0, 1], 2, 0, "a"),
+        (0, [7, 3], [0, 1], 3, 0, "a", True),
+        (0, [9], [0], 3, 2, "b", True),
+        (0, [2, 8], [0, 1], 2, 0, "a", True),
     ]
     assert events == [
         "quant:a",

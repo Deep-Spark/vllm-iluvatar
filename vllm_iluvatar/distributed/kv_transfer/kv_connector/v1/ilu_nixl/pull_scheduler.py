@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pull scheduler for the Ilu NIXL connector."""
 
+from collections.abc import Sequence
+
 from vllm import envs
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler import (
     NixlPullConnectorScheduler,
@@ -27,6 +29,12 @@ class IluNixlPullConnectorScheduler(
     IluNixlBaseConnectorScheduler, NixlPullConnectorScheduler
 ):
     """Pull scheduler that includes PP, V4.1 topology, E25 receipts, and RLE blocks."""
+
+    # Wire sub-blocks per compute block, one entry per KV group; ``__init__``
+    # replaces it with the planned list. The empty default means "compute and
+    # wire blocks are 1:1", so a scheduler that never ran the planner still
+    # publishes remote block ids unchanged.
+    _fp8_wire_group_ratios: Sequence[int] = ()
 
     def __init__(self, vllm_config, engine_id: str, kv_cache_config):
         super().__init__(vllm_config, engine_id, kv_cache_config)

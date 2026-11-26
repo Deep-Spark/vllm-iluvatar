@@ -356,7 +356,12 @@ def test_dsv41_i8g64_and_split_indexer_map_to_fp8_wire():
     assert wire_idx.dtype == torch.uint8
     assert wire_idx.head_size == 132
     assert wire_idx.cache_dtype_str is None
-    assert wire_idx.page_size_bytes == 8640
+    # One compute block stores block_size / tokens_per_state = 128 states at
+    # 132 B each (128 INT8 values + one FP32 scale): 128 * 132 = 16896. Without
+    # an ``fp8_wire_block_size`` override the wire page keeps the legacy 576 B
+    # alignment, so 16896 rounds up to 17280.
+    assert wire_idx.real_page_size_bytes == 128 * 132
+    assert wire_idx.page_size_bytes == 17280
 
 
 def test_dsv41_i4g32_maps_to_fp8_wire():

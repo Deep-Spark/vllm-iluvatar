@@ -1,6 +1,6 @@
 # 模型冒烟
 
-模型选择、启动配置、问题和判定与产品代码放在同一个PR里。当前覆盖11款固定ModelHub权重；只验证文本启动/作答/小并发，不代表全量精度、多模态或性能验收。已执行真实GPU冒烟；各模型是否通过以对应源码SHA的归档结果为准。
+模型选择、启动配置、问题和判定与产品代码放在同一个PR里。当前覆盖10款固定ModelHub权重；只验证文本启动/作答/小并发，不代表全量精度、多模态或性能验收。已执行真实GPU冒烟；各模型是否通过以对应源码SHA的归档结果为准。
 
 ```text
 tests/model_smoke/
@@ -36,7 +36,7 @@ python3 tests/model_smoke/runner.py --models all --output /work/model-smoke-resu
 
 普通pytest收集test_runner.py只运行CPU模拟服务测试，不启动真实大模型。真实模型冒烟由CI明确调用runner.py。完整pytest仍遵循产品tests/conftest.py的依赖/设备检查。
 
-## 11 款固定配置
+## 10 款固定配置
 
 每款只选一个代表配置，逻辑 GPU 上限16。完整命令参数以 models/ 下的模型JSON为准；每次运行将实际命令和环境写入 `launch.json`，除Hy4使用当前支持的eager模式外，其余模型使用 mode=0 的 FULL_DECODE_ONLY。
 
@@ -44,7 +44,6 @@ python3 tests/model_smoke/runner.py --models all --output /work/model-smoke-resu
 | --- | --- | --- | --- |
 | deepseek-v4-flash | DeepSeek-V4-Flash | 8×1×1 | 无 |
 | deepseek-v4-1-flash-1017 | DeepSeek-V4.1-Flash-1017 | 4×4×1 | DSpark 5 |
-| deepseek-r1 | DeepSeek-R1 | 4×4×1 | 无 |
 | glm-5-3 | GLM-5.3 | 4×4×1 | MTP 3 |
 | glm-5-3-flash | GLM-5.3-Flash | 2×8×1 | 无 |
 | step-3-5-flash | Step-3.5-Flash | 8×1×1 | 无 |
@@ -54,7 +53,7 @@ python3 tests/model_smoke/runner.py --models all --output /work/model-smoke-resu
 | qwen3-8-27b | Qwen3.8-27B（W8A8） | 4×1×1 | 无 |
 | qwen3-8-flash-next | Qwen3.8-Flash-Next | 8×1×1 | 无 |
 
-GLM-5.3 保留发布配置的并行、调度及投机组合；V4.1-1017 按CI要求使用TP4×PP4、DP1，不启用专家并行，使用V2异步调度，保留DSpark 5及原正确率门槛；其余按模型卡缩小上下文/并发/图捕获范围。R1 发布卡的 TP32 超过上限，采用原 modelzoo 的 TP4×PP4 参考布局。Step/M3 模型卡的临时运行时补丁不执行，CI 检验本次构建的产品 wheel。发布卡中的历史 worker 退出不作豁免。
+GLM-5.3 保留发布配置的并行、调度及投机组合；V4.1-1017 按CI要求使用TP4×PP4、DP1，不启用专家并行，使用V2异步调度，保留DSpark 5及原正确率门槛；其余按模型卡缩小上下文/并发/图捕获范围。Step/M3 模型卡的临时运行时补丁不执行，CI 检验本次构建的产品 wheel。发布卡中的历史 worker 退出不作豁免。
 
 V4.1-1017 含 Engram CPU offload；DP1不创建Engram DP共享组，因此设置dp_shared_memory=false。使用`safetensors-load-strategy=prefetch`、每rank一个预读线程，把本地权重分片预读到系统页缓存；不改变权重格式、数值或版本。20上503 GiB主存、64 GiB shm、无限memlock已完成下述验证；运行前仍须核对可用主存。固定配置失败按失败保留，不自动切调度模式或减少卡数。
 
@@ -68,7 +67,7 @@ Hy4在20重启后复测时，FULL_DECODE_ONLY仍在图捕获的分布式通信�
 
 权重唯一来源为ModelHub owner iluvatar-aiac-llmfp-inference的固定平台版本。源NFS仅用于复制，实际运行从20本地 `/opt/ci-models/<slug>/<平台版本>-<revision前12位>/` 只读加载。weights/ 下的独立清单包含全部发布文件的大小和SHA256，以及READY清单指纹；全部校验通过才发布本地目录。未就绪、版本不符、缺文件、软链接或NFS路径都拒绝运行。
 
-11款权重已完成同步和SHA256校验；本次清单拆分保持展开内容、缓存路径及READY指纹不变，不要求重新复制。后续通过独立CI仓库的 `ci/sync_model_weights.py --suite <产品库>/tests/model_smoke/suite.json --job-dir <任务目录>` 准备缓存。
+当前10款权重已完成同步和SHA256校验；本次清单拆分保持展开内容、缓存路径及READY指纹不变，不要求重新复制。后续通过独立CI仓库的 `ci/sync_model_weights.py --suite <产品库>/tests/model_smoke/suite.json --job-dir <任务目录>` 准备缓存。
 
 ## 服务、请求和通过标准
 
@@ -94,7 +93,7 @@ CI不再保存模型参数副本。选模结果包含所有模型配置的展开
 
 每款独立服务名、HTTP/master端口、进程组和缓存目录；只有服务清理结束才归还GPU配额。清理失败或套件收到终止信号时停止派发新模型，并终止本runner已创建的其他模型进程组；未完成项保持失败。普通模型判分失败仍保留结果，继续验证其余模型，不重试请求。
 
-每模型result.json增加allocated_devices、started_at/finished_at及timings，区分preflight、startup、requests、validation和cleanup耗时。11款权重版本、20/20答案判定与投机指标门槛保持不变；上述两款Qwen从TP8改为TP4。TP4兼容性和显存峰值须通过真卡验证。并行调度会竞争本机磁盘与主存，净加速收益以真卡运行结果为准，不把CPU并发测试当作性能结论。
+每模型result.json增加allocated_devices、started_at/finished_at及timings，区分preflight、startup、requests、validation和cleanup耗时。当前10款的权重版本、20/20答案判定与投机指标门槛保持不变；上述两款Qwen从TP8改为TP4。TP4兼容性和显存峰值须通过真卡验证。并行调度会竞争本机磁盘与主存，净加速收益以真卡运行结果为准，不把CPU并发测试当作性能结论。
 
 ## 冒烟问题与容量修正
 

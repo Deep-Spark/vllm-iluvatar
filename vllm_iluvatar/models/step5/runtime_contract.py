@@ -29,6 +29,7 @@ _FACADE_MODULES = {
     "sparse_gqa_fp8_workspace_size": "ixformer.inference.functions.models.step5.attention.fp8.sparse_gqa_fp8",
 }
 
+
 def _is_cuda(vllm_config):
     device = vllm_config.device_config
     return device.device_type == "cuda"
@@ -200,14 +201,16 @@ def validate_step5_runtime(vllm_config, *, draft=False):
             ):
                 if not callable(getattr(namespace, op, None)):
                     raise RuntimeError(f"missing {label}")
-            if "ixformer_native" not in registry.available_backends(op):
-                raise RuntimeError("native backend unavailable")
-            selected = registry.resolve(op, "ixformer_native")
-            if selected != "ixformer_native":
-                raise RuntimeError(f"forced native resolved to {selected!r}")
+            # paged_decode defaults to ixattn. The other Step5 ops stay native.
+            expected = "ixattn" if op == "paged_decode" else "ixformer_native"
+            if expected not in registry.available_backends(op):
+                raise RuntimeError(f"{expected} backend unavailable")
+            selected = registry.resolve(op, expected)
+            if selected != expected:
+                raise RuntimeError(f"forced {expected} resolved to {selected!r}")
             if op in defaults:
                 selected = registry.resolve(op)
-                if selected != "ixformer_native":
+                if selected != expected:
                     raise RuntimeError(f"default backend resolved to {selected!r}")
         except (AttributeError, KeyError, ValueError, RuntimeError) as exc:
             raise RuntimeError(f"Step5 {role} requires {op}: {exc}") from exc

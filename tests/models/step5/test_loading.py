@@ -24,8 +24,7 @@ def test_real_kv_placeholders_follow_cache_contract(cache_dtype):
         f"attn.{name}" for name in ("q_scale", "k_scale", "v_scale", "prob_scale")
     }
     zeros = {
-        f"attn.{name}"
-        for name in ("q_zero_point", "k_zero_point", "v_zero_point")
+        f"attn.{name}" for name in ("q_zero_point", "k_zero_point", "v_zero_point")
     }
     if cache_dtype == "auto":
         assert set(exemptions) == scales | zeros and expected == {"weight"}

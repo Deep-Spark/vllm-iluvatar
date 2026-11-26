@@ -57,7 +57,6 @@ from .logits import Step5LogitsProcessor
 from .native_layers import Step5GateLinear, Step5VocabParallelEmbedding
 from .runtime_contract import validate_step5_runtime
 
-
 # Compressed-tensors attention always allocates these. Zero points are unused.
 # Scales are checkpoint weights only for a quantized KV cache.
 _ATTN_KV_PLACEHOLDERS = (

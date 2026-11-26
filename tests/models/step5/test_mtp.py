@@ -311,9 +311,7 @@ def test_mtp_dequant_triton_kernel_matches_the_torch_reference(cols):
         "model.layers.94.mlp.gate_proj", 2048, cols, 2
     )
     stream = [(name, weight), (scale_name, scale)]
-    folded = dict(
-        _dequant_w8a8_dense_mtp_weights(iter(stream), torch.device("cuda"))
-    )
+    folded = dict(_dequant_w8a8_dense_mtp_weights(iter(stream), torch.device("cuda")))
     assert folded[name].device.type == "cuda"
     assert torch.equal(folded[name].cpu(), reference_dequant(weight, scale))
 
@@ -325,9 +323,7 @@ def test_mtp_dequant_triton_kernel_handles_a_per_tensor_scale():
     (name, weight), _ = int8_pair("model.layers.93.self_attn.o_proj", 1024, 256, 7)
     scale = torch.tensor(0.0123)
     stream = [(name, weight), (name + "_scale", scale)]
-    folded = dict(
-        _dequant_w8a8_dense_mtp_weights(iter(stream), torch.device("cuda"))
-    )
+    folded = dict(_dequant_w8a8_dense_mtp_weights(iter(stream), torch.device("cuda")))
     assert torch.equal(folded[name].cpu(), reference_dequant(weight, scale))
 
 

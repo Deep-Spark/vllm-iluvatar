@@ -511,7 +511,7 @@ def hy4_fp8_indexer_forward_offload_sender(
     qc_prequant_registered = False
     try:
         if (
-            os.environ.get("VLLM_ILU_HYV4_FUSE_QA_NORM_QUANT", "0") != "0"
+            os.environ.get("VLLM_ILU_HYV4_FUSE_QA_NORM_QUANT", "1") != "0"
             and q_c.is_cuda
             and q_c.ndim == 2
             and q_c.shape[0] > 6

@@ -81,6 +81,38 @@ def test_moe_all_gather_env_readers_are_opt_in(monkeypatch, name):
     assert reader() is False
 
 
+@pytest.mark.parametrize(
+    ("name", "default", "legacy"),
+    [
+        ("VLLM_ILU_HYV4_FUSE_QA_NORM_QUANT", True, None),
+        ("VLLM_ILU_HYV4_FUSE_MLA_REMAP", True, None),
+        ("VLLM_ILU_HYV4_FUSE_MLA_KV", True, None),
+        ("VLLM_ILU_HYV4_PP_ACT_FP8", False, "VLLM_ILU_PP_ACT_FP8_FUSED"),
+        ("VLLM_ILU_HYV4_IHC_FP8_RES", False, "VLLM_ILU_IHC_FP8_RES"),
+        ("VLLM_ILU_MXFP4_MOE_PREQUANT", False, "VLLM_ILU_HYV4_MOE_EXPAND_PREQUANT"),
+    ],
+)
+def test_hyv4_and_mxfp4_env_readers_registered(monkeypatch, name, default, legacy):
+    envs = importlib.import_module("vllm_iluvatar.envs")
+    monkeypatch.setattr(
+        vllm_envs, "environment_variables", dict(vllm_envs.environment_variables)
+    )
+    monkeypatch.delenv(name, raising=False)
+    if legacy is not None:
+        monkeypatch.delenv(legacy, raising=False)
+    envs.apply()
+    registered = vllm_envs.environment_variables
+    assert name in registered
+    assert registered[name]() is default
+    if legacy is not None:
+        assert legacy in registered
+        assert registered[legacy]() is default
+        monkeypatch.setenv(legacy, "0" if default else "1")
+        assert registered[name]() is not default
+        monkeypatch.setenv(name, "1" if default else "0")
+        assert registered[name]() is default
+
+
 def test_new_ilu_env_readers_are_registered(monkeypatch):
     envs = importlib.import_module("vllm_iluvatar.envs")
     monkeypatch.setattr(

@@ -673,7 +673,13 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
             _lookup_activation_prequant(x)
             if layer.expert_map is None
             and getattr(self._compute, "supports_prequantized_fp8", False)
-            and os.environ.get("VLLM_ILU_HYV4_MOE_EXPAND_PREQUANT", "0") != "0"
+            and (
+                os.environ.get("VLLM_ILU_MXFP4_MOE_PREQUANT")
+                or os.environ.get("VLLM_ILU_HYV4_MOE_EXPAND_PREQUANT", "0")
+            )
+            .strip()
+            .lower()
+            not in ("0", "false", "no", "off", "")
             else None
         )
         return self._compute.run_standard(

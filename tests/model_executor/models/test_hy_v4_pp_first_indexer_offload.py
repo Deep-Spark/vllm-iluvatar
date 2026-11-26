@@ -214,7 +214,8 @@ def test_gpu_first_indexer_offload_bitwise_exact(
 
     monkeypatch.setenv("VLLM_ILU_HYV4_FUSE_QA_NORM_QUANT", "1")
     monkeypatch.setenv("VLLM_ILU_HYV4_FUSE_INDEXER_K", "1")
-    monkeypatch.setenv("VLLM_ILU_HYV4_FAST_RADIX_TOPK", "1")
+    monkeypatch.setenv("IXFORMER_DSA_FAST_RADIX_TOPK", "1")
+    monkeypatch.setenv("VLLM_ILU_HYV4_FAST_RADIX_TOPK", "1")  # legacy alias
     monkeypatch.setenv("VLLM_ILU_HYV4_PP_OFFLOAD_RATIO", "0.45")
 
     torch.manual_seed(20261124)

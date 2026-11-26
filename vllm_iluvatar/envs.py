@@ -43,6 +43,19 @@ def _bool_reader(name: str, default: str) -> Callable[[], bool]:
     return lambda: os.environ.get(name, default).strip().lower() in _TRUE_VALS
 
 
+def _bool_reader_names(*names: str, default: str) -> Callable[[], bool]:
+    """Prefer the first set name among ``names``, else ``default``."""
+
+    def read() -> bool:
+        for name in names:
+            val = os.environ.get(name)
+            if val is not None:
+                return val.strip().lower() in _TRUE_VALS
+        return default.strip().lower() in _TRUE_VALS
+
+    return read
+
+
 # The startup hook reads this gate before vllm.envs is initialized.
 fly_rejection_enabled = _bool_reader("VLLM_ILU_ENABLE_FLY_REJECTION", "0")
 
@@ -200,6 +213,29 @@ if TYPE_CHECKING:
     VLLM_ILU_MLA_ATTN_QUANT_TYPE: str = ""
     VLLM_ILU_MLA_CHUNKED_PREFILL_MAX_WS_SIZE: int = 0
     VLLM_ILU_HYV4_FUSE_IHC: bool = True
+    VLLM_ILU_HYV4_NATIVE_MROPE: bool = True
+    VLLM_ILU_HYV4_FUSE_INDEXER_K: bool = True
+    VLLM_ILU_HYV4_FUSE_KV_UP: bool = True
+    VLLM_ILU_HYV4_FUSE_KV_UP_GATE: bool = True
+    VLLM_ILU_HYV4_FUSE_MLA_KV: bool = True
+    VLLM_ILU_HYV4_FUSE_IHC_NORM: bool = True
+    VLLM_ILU_HYV4_FUSE_QA_NORM_QUANT: bool = True
+    VLLM_ILU_HYV4_FUSE_MLA_REMAP: bool = True
+    VLLM_ILU_HYV4_PP_OFFLOAD_FIRST_INDEXER: bool = False
+    VLLM_ILU_HYV4_PP_OFFLOAD_RATIO: float = 0.42
+    VLLM_ILU_HYV4_PP_OFFLOAD_MIN_TOKENS: int = 256
+    VLLM_ILU_HYV4_PP_OFFLOAD_MIN_HALF_TOKENS: int = 88
+    VLLM_ILU_HYV4_PP_PACK_TENSORS: bool = True
+    VLLM_ILU_HYV4_PP_ACT_FP8: bool = False
+    VLLM_ILU_HYV4_IHC_FP8_RES: bool = False
+    VLLM_ILU_HYV4_STAGE_TIMER: bool = False
+    VLLM_ILU_HYV4_DSA_FP8_KV_SCALE: str = ""
+    VLLM_ILU_HYV4_DSA_FP8_KV_SCALE_PATH: str = ""
+    VLLM_ILU_MXFP4_MOE_PREQUANT: bool = False
+    # Legacy aliases kept for existing scripts / getattr call sites.
+    VLLM_ILU_PP_ACT_FP8_FUSED: bool = False
+    VLLM_ILU_IHC_FP8_RES: bool = False
+    VLLM_ILU_HYV4_MOE_EXPAND_PREQUANT: bool = False
     VLLM_ILU_USE_LORA_FUSION: bool = False
     VLLM_ILU_VIT_ATTN_OPT_LEVEL: int = 0
     VLLM_ILU_VIT_ATTN_LAYER: str = ""
@@ -308,8 +344,6 @@ if TYPE_CHECKING:
     VLLM_ILU_PP_MAX_CONCURRENT_BATCHES: int = 0
     VLLM_ILU_ENABLE_V2_PP_TOKEN_P2P: bool = False
     VLLM_ILU_PP_SYNC_SENDRECV: bool = True
-    VLLM_ILU_PP_ACT_FP8_FUSED: bool = False
-    VLLM_ILU_IHC_FP8_RES: bool = False
 
     VLLM_ILU_MOE_RUNTIME_LAYOUT: str | None = None
     VLLM_ILU_MOE_W4A8_GEMV_PERF: bool = False
@@ -522,6 +556,62 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
         os.environ.get("VLLM_ILU_INDEXER_KV_DTYPE", "bf16").strip().lower()
     ),
     "VLLM_ILU_HYV4_FUSE_IHC": _bool_reader("VLLM_ILU_HYV4_FUSE_IHC", "1"),
+    # HY V4 operator fuses: lossless with shape/capturing guards at call sites.
+    "VLLM_ILU_HYV4_NATIVE_MROPE": _bool_reader("VLLM_ILU_HYV4_NATIVE_MROPE", "1"),
+    "VLLM_ILU_HYV4_FUSE_INDEXER_K": _bool_reader("VLLM_ILU_HYV4_FUSE_INDEXER_K", "1"),
+    "VLLM_ILU_HYV4_FUSE_KV_UP": _bool_reader("VLLM_ILU_HYV4_FUSE_KV_UP", "1"),
+    "VLLM_ILU_HYV4_FUSE_KV_UP_GATE": _bool_reader("VLLM_ILU_HYV4_FUSE_KV_UP_GATE", "1"),
+    "VLLM_ILU_HYV4_FUSE_MLA_KV": _bool_reader("VLLM_ILU_HYV4_FUSE_MLA_KV", "1"),
+    "VLLM_ILU_HYV4_FUSE_IHC_NORM": _bool_reader("VLLM_ILU_HYV4_FUSE_IHC_NORM", "1"),
+    "VLLM_ILU_HYV4_FUSE_QA_NORM_QUANT": _bool_reader(
+        "VLLM_ILU_HYV4_FUSE_QA_NORM_QUANT", "1"
+    ),
+    "VLLM_ILU_HYV4_FUSE_MLA_REMAP": _bool_reader("VLLM_ILU_HYV4_FUSE_MLA_REMAP", "1"),
+    # HY V4 PP first-indexer offload (opt-in; needs PP>1 + PP_ACT_FP8).
+    "VLLM_ILU_HYV4_PP_OFFLOAD_FIRST_INDEXER": _bool_reader(
+        "VLLM_ILU_HYV4_PP_OFFLOAD_FIRST_INDEXER", "0"
+    ),
+    "VLLM_ILU_HYV4_PP_OFFLOAD_RATIO": lambda: float(
+        os.environ.get("VLLM_ILU_HYV4_PP_OFFLOAD_RATIO", "0.42")
+    ),
+    "VLLM_ILU_HYV4_PP_OFFLOAD_MIN_TOKENS": _int_reader(
+        "VLLM_ILU_HYV4_PP_OFFLOAD_MIN_TOKENS", 256, minimum=0
+    ),
+    "VLLM_ILU_HYV4_PP_OFFLOAD_MIN_HALF_TOKENS": _int_reader(
+        "VLLM_ILU_HYV4_PP_OFFLOAD_MIN_HALF_TOKENS", 88, minimum=0
+    ),
+    "VLLM_ILU_HYV4_PP_PACK_TENSORS": _bool_reader(
+        "VLLM_ILU_HYV4_PP_PACK_TENSORS", "1"
+    ),
+    # HY V4 PP boundary FP8 activation (lossy bandwidth trade; opt-in).
+    # Prefer VLLM_ILU_HYV4_PP_ACT_FP8; VLLM_ILU_PP_ACT_FP8_FUSED is legacy.
+    "VLLM_ILU_HYV4_PP_ACT_FP8": _bool_reader_names(
+        "VLLM_ILU_HYV4_PP_ACT_FP8",
+        "VLLM_ILU_PP_ACT_FP8_FUSED",
+        default="0",
+    ),
+    # HY V4 IHC residual FP8 path (opt-in). Legacy: VLLM_ILU_IHC_FP8_RES.
+    "VLLM_ILU_HYV4_IHC_FP8_RES": _bool_reader_names(
+        "VLLM_ILU_HYV4_IHC_FP8_RES",
+        "VLLM_ILU_IHC_FP8_RES",
+        default="0",
+    ),
+    "VLLM_ILU_HYV4_STAGE_TIMER": _bool_reader("VLLM_ILU_HYV4_STAGE_TIMER", "0"),
+    # Empty = online amax/448; a float applies the same static scale to all layers.
+    "VLLM_ILU_HYV4_DSA_FP8_KV_SCALE": lambda: os.environ.get(
+        "VLLM_ILU_HYV4_DSA_FP8_KV_SCALE", ""
+    ),
+    "VLLM_ILU_HYV4_DSA_FP8_KV_SCALE_PATH": lambda: os.environ.get(
+        "VLLM_ILU_HYV4_DSA_FP8_KV_SCALE_PATH", ""
+    ),
+    # Shared MXFP4 MoE: reuse registered FP8 activation prequant. Opt-in —
+    # not HY4-only; other MXFP4 models can enable after validating. Legacy
+    # alias: VLLM_ILU_HYV4_MOE_EXPAND_PREQUANT.
+    "VLLM_ILU_MXFP4_MOE_PREQUANT": _bool_reader_names(
+        "VLLM_ILU_MXFP4_MOE_PREQUANT",
+        "VLLM_ILU_HYV4_MOE_EXPAND_PREQUANT",
+        default="0",
+    ),
     "VLLM_ILU_CUDAGRAPH_ASYNC_REPLAY": _bool_reader(
         "VLLM_ILU_CUDAGRAPH_ASYNC_REPLAY", "0"
     ),
@@ -695,8 +785,6 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_PP_SYNC_SENDRECV": _bool_reader(
         "VLLM_ILU_PP_SYNC_SENDRECV", "1"
     ),
-    "VLLM_ILU_PP_ACT_FP8_FUSED": _bool_reader("VLLM_ILU_PP_ACT_FP8_FUSED", "0"),
-    "VLLM_ILU_IHC_FP8_RES": _bool_reader("VLLM_ILU_IHC_FP8_RES", "0"),
     # Selects the ilu_mxfp4_fused_experts compute backend. Defaults to "ixmm";
     # "auto" -> ixmm when available else torch; "torch" forces the pure-torch
     # fallback; "ixformer_native" is the correctness-only native kernel.
@@ -828,6 +916,17 @@ _ILU_ENV_ALIASES: dict[str, Callable[[], Any]] = {
 
 for _alias in ("VLLM_ILU_V41_PREFILL_FUSED_Q", "VLLM_V41_PREFILL_FUSED_Q"):
     _ILU_ENV_ALIASES[_alias] = _ILU_ENV_VARS["VLLM_ILU_V41_FUSED_Q_QUANT"]
+
+# Legacy names that resolve to renamed HYV4 / MXFP4 canonical readers.
+_ILU_ENV_ALIASES["VLLM_ILU_PP_ACT_FP8_FUSED"] = _ILU_CANONICAL_ONLY_ENV_VARS[
+    "VLLM_ILU_HYV4_PP_ACT_FP8"
+]
+_ILU_ENV_ALIASES["VLLM_ILU_IHC_FP8_RES"] = _ILU_CANONICAL_ONLY_ENV_VARS[
+    "VLLM_ILU_HYV4_IHC_FP8_RES"
+]
+_ILU_ENV_ALIASES["VLLM_ILU_HYV4_MOE_EXPAND_PREQUANT"] = _ILU_CANONICAL_ONLY_ENV_VARS[
+    "VLLM_ILU_MXFP4_MOE_PREQUANT"
+]
 
 
 # Iluvatar plugin control vars that are read directly via os.environ where they

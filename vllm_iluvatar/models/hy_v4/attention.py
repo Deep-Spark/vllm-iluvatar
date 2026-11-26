@@ -1304,6 +1304,10 @@ class HYV4MLAAttention(nn.Module):
         global _MLA_KV_FUSE_LOGGED
         if os.environ.get("VLLM_ILU_HYV4_FUSE_MLA_KV", "1") == "0":
             return False
+        # 2-D M-RoPE builds a cos/sin table with a dynamic alloc; skip under
+        # CUDA-graph capture so FULL_DECODE_ONLY can keep the default on.
+        if torch.cuda.is_current_stream_capturing():
+            return False
         impl = getattr(self.mla_attn, "impl", None)
         if impl is None or not getattr(impl, "use_fp8_attn", False):
             return False
@@ -1464,7 +1468,7 @@ class HYV4MLAAttention(nn.Module):
                     dim=-1,
                 )
                 if (
-                    os.environ.get("VLLM_ILU_HYV4_FUSE_QA_NORM_QUANT", "0") != "0"
+                    os.environ.get("VLLM_ILU_HYV4_FUSE_QA_NORM_QUANT", "1") != "0"
                     and q_c.is_cuda
                     and q_c.ndim == 2
                     and q_c.shape[0] > 6

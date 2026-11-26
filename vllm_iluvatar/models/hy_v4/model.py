@@ -88,27 +88,27 @@ _PP_ACT_SCALE_KEY = "hidden_states_scale"
 
 
 def _pp_act_fp8_fused() -> bool:
-    return _ILU_CANONICAL_ONLY_ENV_VARS["VLLM_ILU_PP_ACT_FP8_FUSED"]()
+    return _ILU_CANONICAL_ONLY_ENV_VARS["VLLM_ILU_HYV4_PP_ACT_FP8"]()
 
 
 def _ihc_fp8_res() -> bool:
-    return _ILU_CANONICAL_ONLY_ENV_VARS["VLLM_ILU_IHC_FP8_RES"]()
+    return _ILU_CANONICAL_ONLY_ENV_VARS["VLLM_ILU_HYV4_IHC_FP8_RES"]()
 
 
 def _ihc_fuse_norm() -> bool:
-    return os.environ.get("VLLM_ILU_HYV4_FUSE_IHC_NORM", "1") != "0"
+    return _ILU_CANONICAL_ONLY_ENV_VARS["VLLM_ILU_HYV4_FUSE_IHC_NORM"]()
 
 
 def _pp_offload_first_indexer() -> bool:
-    return os.environ.get("VLLM_ILU_HYV4_PP_OFFLOAD_FIRST_INDEXER", "0") == "1"
+    return _ILU_CANONICAL_ONLY_ENV_VARS["VLLM_ILU_HYV4_PP_OFFLOAD_FIRST_INDEXER"]()
 
 
 def _pp_pack_tensors() -> bool:
-    return os.environ.get("VLLM_ILU_HYV4_PP_PACK_TENSORS", "1") != "0"
+    return _ILU_CANONICAL_ONLY_ENV_VARS["VLLM_ILU_HYV4_PP_PACK_TENSORS"]()
 
 
 def _pp_stage_timer_enabled() -> bool:
-    return os.environ.get("VLLM_ILU_HYV4_STAGE_TIMER", "0") == "1"
+    return _ILU_CANONICAL_ONLY_ENV_VARS["VLLM_ILU_HYV4_STAGE_TIMER"]()
 
 
 def compute_pp_packed_row_bytes(hidden_cols: int, topk_cols: int) -> int:

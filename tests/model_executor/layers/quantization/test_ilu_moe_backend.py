@@ -144,7 +144,7 @@ def test_ixmm_takes_swigluoai_only_in_the_packed_form_and_only_clamped():
     )
 
 
-def _ixinfer_backend(activation, rows=32, intermediate=384):
+def _ixinfer_backend(activation, rows=32, intermediate=384, *, w2_k_padded=None):
     from vllm_iluvatar.ilu_util.arch import cuda_arch
     from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
         MoEComputeConfig,
@@ -161,6 +161,7 @@ def _ixinfer_backend(activation, rows=32, intermediate=384):
         global_num_experts=2,
         activation=activation,
         limit=7.0,
+        w2_k_padded=w2_k_padded,
     )
     # TN is the one layout both architectures run, so this does not pin the
     # test to the host's arch.
@@ -191,7 +192,34 @@ def test_swigluoai_activation_matches_the_oai_formula():
     assert torch.all((codes.float() * scales.view(-1, 1) - expected).abs() <= tolerance)
 
 
-def test_ixinfer_swiglustep_uses_step_activation(monkeypatch):
+@requires_cuda
+@pytest.mark.parametrize("width,padded", [(576, 640), (288, 384)])
+@pytest.mark.parametrize("decode", [False, True])
+def test_tn_w2_activation_padding_matches_zero_extended_input(width, padded, decode):
+    import torch
+
+    backend = _ixinfer_backend("silu", intermediate=width, w2_k_padded=padded)
+    reference = _ixinfer_backend("silu", intermediate=padded)
+    rows = 32
+    gemm1 = torch.randn(rows, 2 * width, dtype=torch.bfloat16, device="cuda")
+    order = torch.arange(rows, dtype=torch.int32, device="cuda")
+    zero_extended = torch.nn.functional.pad(
+        gemm1.view(rows, 2, width), (0, padded - width)
+    ).flatten(1)
+
+    codes, scales = backend._activation_quant(gemm1, order, decode, None)
+    expected_codes, expected_scales = reference._activation_quant(
+        zero_extended, order, decode, None
+    )
+
+    torch.testing.assert_close(codes, expected_codes, rtol=0, atol=0)
+    torch.testing.assert_close(scales, expected_scales, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("pack_version,expected_format", [(1, 0), (2, 1)])
+def test_ixinfer_swiglustep_uses_step_activation(
+    monkeypatch, pack_version, expected_format
+):
     from vllm_iluvatar.model_executor.layers.fused_moe.experts import (
         ilu_ixinfer_w4a8 as mod,
     )
@@ -207,12 +235,13 @@ def test_ixinfer_swiglustep_uses_step_activation(monkeypatch):
     )
     monkeypatch.setattr(mod.ops, "activation_dynamic_scaled_int8", lambda **kw: kw)
     backend = _ixinfer_backend("swiglustep")
+    monkeypatch.setattr(backend, "pack_version", pack_version)
     intermediate, order = object(), object()
     assert backend._activation_quant(intermediate, order, True, None) == {
         "input": intermediate,
         "act_type": "swiglustep",
         "dst_to_src": order,
-        "output_format": 1,
+        "output_format": expected_format,
         "check_valid": True,
     }
 

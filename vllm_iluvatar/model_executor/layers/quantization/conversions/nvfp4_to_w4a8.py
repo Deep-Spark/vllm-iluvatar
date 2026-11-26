@@ -30,6 +30,16 @@ NVFP4_BLOCK_SHAPE = (1, NVFP4_GROUP_SIZE)
 _E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
+def unpack_e2m1_to_e4m3(weight):
+    """Expand packed E2M1 nibbles exactly into E4M3 values."""
+    table = torch.tensor(_E2M1_MAGNITUDES, dtype=torch.float32, device=weight.device)
+    # Low nibble is the even k index, high nibble the odd one.
+    nibbles = torch.stack((weight & 0x0F, weight >> 4), dim=-1).flatten(-2)
+    values = table[(nibbles & 0x07).long()]
+    values = torch.where(nibbles & 0x08 != 0, -values, values)
+    return values.to(torch.float8_e4m3fn)
+
+
 def nvfp4_source_as_block_fp8(weight, weight_scale):
     """Unpack one expert chunk into ``float8_e4m3fn`` values and an FP32 grid.
 
@@ -41,12 +51,7 @@ def nvfp4_source_as_block_fp8(weight, weight_scale):
         ``[E, n, k]`` float8_e4m3fn values and ``[E, n, k/16]`` float32 scales.
         Both conversions are exact; the per-expert global scale is not applied.
     """
-    table = torch.tensor(_E2M1_MAGNITUDES, dtype=torch.float32, device=weight.device)
-    # Low nibble is the even k index, high nibble the odd one.
-    nibbles = torch.stack((weight & 0x0F, weight >> 4), dim=-1).flatten(-2)
-    values = table[(nibbles & 0x07).long()]
-    values = torch.where(nibbles & 0x08 != 0, -values, values)
-    return values.to(torch.float8_e4m3fn), weight_scale.float()
+    return unpack_e2m1_to_e4m3(weight), weight_scale.float()
 
 
 def convert_nvfp4_to_w4a8(

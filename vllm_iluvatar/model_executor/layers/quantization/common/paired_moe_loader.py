@@ -63,6 +63,18 @@ class PairedMoEWeightLoader:
     def conversion_bytes(self):
         return 0
 
+    @property
+    def w13_k(self):
+        return self.load_spec.hidden
+
+    @property
+    def w2_n(self):
+        return self.load_spec.hidden
+
+    @property
+    def w2_k(self):
+        return self.load_spec.intermediate
+
     def expected_pairs(self):
         return (
             (e, shard)
@@ -88,8 +100,8 @@ class PairedMoEWeightLoader:
         cfg = self.load_spec
         attrs = {k: v for k, v in weight_attrs.items() if k != "weight_loader"}
         for group, n, k in (
-            ("w13", 2 * cfg.intermediate, cfg.hidden),
-            ("w2", cfg.hidden, cfg.intermediate),
+            ("w13", 2 * cfg.intermediate, self.w13_k),
+            ("w2", self.w2_n, self.w2_k),
         ):
             shapes = self.weight_spec.shapes(cfg.experts, n, k)
             for is_scale, suffix, shape, dtype in (

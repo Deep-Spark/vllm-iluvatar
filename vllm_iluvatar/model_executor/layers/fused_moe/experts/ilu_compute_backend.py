@@ -66,6 +66,22 @@ class MoEComputeConfig:
     # activation op bakes them in has to reject a disagreeing checkpoint.
     alpha: float | None = None
     beta: float | None = None
+    # The logical intermediate is shared by gate/up and the activation.
+    w2_k_padded: int | None = None
+    w13_k_padded: int | None = None
+    w2_n_padded: int | None = None
+
+    @property
+    def w13_k(self):
+        return self.hidden if self.w13_k_padded is None else self.w13_k_padded
+
+    @property
+    def w2_n(self):
+        return self.hidden if self.w2_n_padded is None else self.w2_n_padded
+
+    @property
+    def w2_k(self):
+        return self.intermediate if self.w2_k_padded is None else self.w2_k_padded
 
 
 @dataclass(frozen=True)
@@ -184,8 +200,8 @@ class MoEComputeBackend(ABC):
             )
         device = weights.w13_weight.device
         for prefix, n, k in (
-            ("w13", 2 * self.intermediate, self.hidden),
-            ("w2", self.hidden, self.intermediate),
+            ("w13", 2 * self.intermediate, self.config.w13_k),
+            ("w2", self.config.w2_n, self.config.w2_k),
         ):
             w = getattr(weights, prefix + "_weight")
             s = getattr(weights, prefix + "_weight_scale")
@@ -235,10 +251,10 @@ class MoEComputeBackend(ABC):
                     torch.int32,
                 ),
                 "mapping": ((rows,), torch.int32),
-                "input": ((rows, self.hidden), qdtype),
+                "input": ((rows, self.config.w13_k), qdtype),
                 "input_scale": ((rows, 1), torch.float32),
                 "gemm1": ((rows, 2 * self.intermediate), dtype),
-                "gemm2": ((rows, self.hidden), dtype),
+                "gemm2": ((rows, self.config.w2_n), dtype),
             }
         )
 

@@ -266,7 +266,7 @@ GLM-5.2 的 block-FP8 Method 从当前计算 backend 取得输入能力。IxMM F
 --additional-config '{"ilu_compute":{"schema_version":1,"moe":{"mode":"ixmm_w4a8_nn"}}}'
 ```
 
-省略 mode 或选择 `auto` 时，150 默认 IxInfer W4A8 NN（`ixinfer_w4a8_nn_v2`），300 默认 IxMM FP4FP8（`ixmm_fp4fp8`）。显式 mode 必须符合当前架构的公共列表；此外，150 读取原始 block-FP8 checkpoint 时还支持显式指定 `ixmm_w4a8_nn` 或 `ixinfer_w4a8_nn_v1`（后者要求专家层 `tp_size == 1` 且 `local_num_experts >= 2`），两者仅开放给 block-FP8，MXFP4 在 150 上指定它们或其他不支持组合均报错。
+省略 mode 或选择 `auto` 时，150 默认 IxInfer W4A8 NN（`ixinfer_w4a8_nn_v2`），300 默认 IxMM FP4FP8（`ixmm_fp4fp8`）。150 上的 block-FP8、MXFP4、MXFP8 可显式指定 `ixinfer_w4a8_nn_v1`。`ixmm_w4a8_nn` 在 150 上仅开放给 block-FP8。
 
 为兼容已有启动方式，在未提供 MoE compute 配置时，150 的旧 `VLLM_ILU_MOE_RUNTIME_LAYOUT` 可以覆盖布局默认值。显式 mode 优先。本文默认项均指未作这类覆盖的行为。
 
@@ -415,7 +415,7 @@ GLM-5.2 的 ModelZoo 复测保留了模型参数；已激活开发环境时需�
 
 - Hybrid 自定义通信入口要求 DP>1、EP、PCP=1；LL hidden size 当前限定为 2048、2560、3072、4096、5120、6144、7168、8192，并需配置足够的 token 容量。
 - 当前 MXFP4 与 block-FP8 Method 均不支持 EPLB。W4A8 要求连续 expert placement；FP4FP8 backend 可使用 expert_map。
-- 150 上的 `ixinfer_w4a8_nn_v1` 仅面向原始 block-FP8，要求专家层 `tp_size == 1`、`local_num_experts >= 2`，且 Decode Graph GEMM 仅支持 BF16 输出。
+- 150 上的 `ixinfer_w4a8_nn_v1` 支持 block-FP8、MXFP4、MXFP8，要求专家层 `tp_size == 1`、`local_num_experts >= 2`，且 Decode Graph GEMM 仅支持 BF16 输出。
 - 底层 registry 中的 ivcore30/IxInfer TN 不属于当前 MXFP4/block-FP8 公共 mode，不列入本表。
 
 维护矩阵时同步更新 HTML 源表与 PNG，保证 Method、mode、通信状态及默认标注一致。

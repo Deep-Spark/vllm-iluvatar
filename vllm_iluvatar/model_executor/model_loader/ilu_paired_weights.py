@@ -7,6 +7,7 @@ inputs; MXFP4 callbacks retain descriptions until the complete plan is checked.
 
 from collections import OrderedDict
 from dataclasses import dataclass
+from os.path import abspath
 
 import torch
 from safetensors import safe_open
@@ -142,13 +143,26 @@ class DeferredCheckpointTensor(torch.Tensor):
         return func(*tree_map(materialize, args), **tree_map(materialize, kwargs))
 
 
-def checkpoint_references(files):
-    """Read headers only; reject duplicate names before yielding any sources."""
+def checkpoint_references(files, *, weight_map=None):
+    """Read headers and use the index to resolve sources for indexed tensors.
+
+    Some exporters omit auxiliary scales from the index. Still load those
+    from the selected shards, rejecting duplicates without an indexed source.
+    """
     references = []
+    if weight_map is not None:
+        weight_map = {name: abspath(file) for name, file in weight_map.items()}
+        selected_files = {abspath(file) for file in files}
+        indexed_names = {
+            name for name, file in weight_map.items() if file in selected_files
+        }
     seen = set()
     for file in files:
+        path = abspath(file)
         with safe_open(file, framework="pt", device="cpu") as reader:
             for name in reader.keys():  # noqa: SIM118
+                if weight_map is not None and weight_map.get(name, path) != path:
+                    continue
                 if name in seen:
                     raise ValueError(f"Duplicate checkpoint tensor: {name}")
                 seen.add(name)
@@ -160,6 +174,13 @@ def checkpoint_references(files):
                     )
                 meta = torch.empty(view.get_shape(), dtype=dtype, device="meta")
                 references.append(TensorReference(TensorSource(file, name), meta))
+    if weight_map is not None:
+        missing = indexed_names - seen
+        if missing:
+            name = min(missing)
+            raise ValueError(
+                f"Indexed checkpoint tensor {name} missing from {weight_map[name]}"
+            )
     return references
 
 

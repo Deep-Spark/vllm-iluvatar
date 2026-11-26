@@ -26,6 +26,9 @@ class Mxfp4LoadSpec:
     tp_size: int = 1
     tp_rank: int = 0
     intermediate_unpadded: int | None = None
+    w2_k_padded: int | None = None
+    w13_k_padded: int | None = None
+    w2_n_padded: int | None = None
 
     @property
     def source_intermediate(self):
@@ -56,6 +59,12 @@ class Mxfp4WeightLoader(PairedMoEWeightLoader, ABC):
             or load_spec.source_intermediate % self.source_alignment
             or load_spec.hidden % self.source_alignment
             or load_spec.intermediate % self.source_alignment
+            or self.w2_k < load_spec.intermediate
+            or self.w2_k % self.source_alignment
+            or self.w13_k < load_spec.hidden
+            or self.w13_k % self.source_alignment
+            or self.w2_n < load_spec.hidden
+            or self.w2_n % self.source_alignment
         ):
             raise ValueError("Invalid or unaligned MXFP4 load geometry")
         self._layer = None
@@ -67,9 +76,24 @@ class Mxfp4WeightLoader(PairedMoEWeightLoader, ABC):
         self._failed = False
 
     @property
-    def staging_bytes(self):
+    def w13_k(self):
         cfg = self.load_spec
-        return cfg.hidden * cfg.intermediate // 2 + cfg.hidden * cfg.intermediate // 32
+        return cfg.hidden if cfg.w13_k_padded is None else cfg.w13_k_padded
+
+    @property
+    def w2_n(self):
+        cfg = self.load_spec
+        return cfg.hidden if cfg.w2_n_padded is None else cfg.w2_n_padded
+
+    @property
+    def w2_k(self):
+        cfg = self.load_spec
+        return cfg.intermediate if cfg.w2_k_padded is None else cfg.w2_k_padded
+
+    @property
+    def staging_bytes(self):
+        values = max(self.load_spec.intermediate * self.w13_k, self.w2_n * self.w2_k)
+        return values // 2 + values // 32
 
     def source_shape(self, group, is_scale):
         cfg = self.load_spec
@@ -134,9 +158,7 @@ class Mxfp4WeightLoader(PairedMoEWeightLoader, ABC):
         if tensor.device.type != "cpu":
             raise ValueError("MXFP4 paired reader must supply CPU tensors")
         n, k = (
-            (cfg.intermediate, cfg.hidden)
-            if group == "w13"
-            else (cfg.hidden, cfg.intermediate)
+            (cfg.intermediate, self.w13_k) if group == "w13" else (self.w2_n, self.w2_k)
         )
         nw, ns = n * k // 2, n * k // 32
         try:
@@ -145,9 +167,10 @@ class Mxfp4WeightLoader(PairedMoEWeightLoader, ABC):
             offset, size = (nw, ns) if is_scale else (0, nw)
             staged = buffer.host[offset : offset + size].view(n, k // divisor)
             if staged.shape != tensor.shape:
-                # Pad each local gate/up separately, or the local K axis of down.
-                staged.narrow(dim, length, staged.size(dim) - length).zero_()
-                staged = staged.narrow(dim, 0, length)
+                # Padding follows the TP slice. Clear both tails in the
+                # shared staging buffer before copying the logical rectangle.
+                staged.zero_()
+                staged = staged[: tensor.shape[0], : tensor.shape[1]]
             staged.copy_(tensor.view(torch.uint8))
             if pending is None:
                 self._pending = (key, is_scale)
@@ -174,10 +197,13 @@ class Mxfp4WeightLoader(PairedMoEWeightLoader, ABC):
         """Convert one local source shard into its final parameter slice."""
 
 
-class Mxfp4ToIxInferW4A8Loader(Mxfp4WeightLoader):
-    # The converter consumes one gate or up shard at a time in 32-value blocks.
-    # The compute backend separately validates the fused w13 and w2 geometries.
-    source_alignment = 32
+class Mxfp4ToW4A8Loader(Mxfp4WeightLoader):
+    def __init__(self, weight_spec, load_spec, weight_format):
+        self.weight_format = weight_format
+        # IxInfer consumes 32-value source blocks and checks runtime geometry
+        # separately. Preserve the stricter source contract for IxMM W4A8.
+        self.source_alignment = 256 if weight_format == "ixmm_nn" else 32
+        super().__init__(weight_spec, load_spec)
 
     def convert_shard(self, weight, scale, target, target_scale):
         _native_converter("mxfp4_to_w4a8")(
@@ -185,19 +211,7 @@ class Mxfp4ToIxInferW4A8Loader(Mxfp4WeightLoader):
             scale,
             target,
             target_scale,
-            weight_format="ixinfer_" + self.weight_spec.layout.lower(),
-            backend="ixformer_native",
-        )
-
-
-class Mxfp4ToIxMMW4A8Loader(Mxfp4WeightLoader):
-    def convert_shard(self, weight, scale, target, target_scale):
-        _native_converter("mxfp4_to_w4a8")(
-            weight,
-            scale,
-            target,
-            target_scale,
-            weight_format="ixmm_nn",
+            weight_format=self.weight_format,
             backend="ixformer_native",
         )
 
@@ -228,21 +242,29 @@ class Mxfp4ToIxMMFP4FP8Loader(Mxfp4WeightLoader):
 
 def make_mxfp4_loader(weight_spec, load_spec):
     # Match complete semantic contracts, not just a shared TN/NN spelling.
+    if weight_spec.format_id == "ixinfer_w4a8_nn_v1" and load_spec.tp_size != 1:
+        raise ValueError(
+            "NN/v1 row scales require the full expert K before quantization"
+        )
     contracts = {
+        "ixinfer_w4a8_nn_v1": (
+            "ixinfer_nn_v1",
+            MoEWeightSpec("ixinfer_w4a8_nn_v1", "NN", torch.int8),
+        ),
         "ixinfer_w4a8_tn_v2": (
-            Mxfp4ToIxInferW4A8Loader,
+            "ixinfer_tn",
             MoEWeightSpec("ixinfer_w4a8_tn_v2", "TN", torch.int8, code_multiplier=18),
         ),
         "ixinfer_w4a8_nn_v2": (
-            Mxfp4ToIxInferW4A8Loader,
+            "ixinfer_nn",
             MoEWeightSpec("ixinfer_w4a8_nn_v2", "NN", torch.int8, code_multiplier=18),
         ),
         "ixmm_w4a8_nn": (
-            Mxfp4ToIxMMW4A8Loader,
+            "ixmm_nn",
             MoEWeightSpec("ixmm_w4a8_nn", "NN", torch.int8),
         ),
         "ixmm_fp4fp8": (
-            Mxfp4ToIxMMFP4FP8Loader,
+            None,
             MoEWeightSpec(
                 "ixmm_fp4fp8", "fp4fp8", torch.uint8, scale_group_size=256, alignment=32
             ),
@@ -251,4 +273,7 @@ def make_mxfp4_loader(weight_spec, load_spec):
     entry = contracts.get(weight_spec.format_id)
     if entry is None or entry[1] != weight_spec:
         raise ValueError(f"No MXFP4 loader for weight contract {weight_spec}")
-    return entry[0](weight_spec, load_spec)
+    weight_format, _ = entry
+    if weight_format is None:
+        return Mxfp4ToIxMMFP4FP8Loader(weight_spec, load_spec)
+    return Mxfp4ToW4A8Loader(weight_spec, load_spec, weight_format)

@@ -81,12 +81,17 @@ _EXPERT_MODES = {
     "ivcore11": {
         "ixinfer_w4a8_nn_v2": ("ixinfer_w4a8", "NN"),
         "ixinfer_w4a8_tn_v2": ("ixinfer_w4a8", "TN"),
+        "ixinfer_w4a8_nn_v1": ("ixinfer_w4a8_nn_v1", "NN"),
+        "ixmm_w4a8_nn": ("ixmm_w4a8", "NN"),
     },
     "ivcore30": {
         "ixmm_fp4fp8": ("ixmm_fp4fp8", "fp4fp8"),
         "ixmm_w4a8_nn": ("ixmm_w4a8", "NN"),
     },
 }
+# These ivcore11 modes can only load these source formats.
+_IVCORE11_CONVERTED_MODES = ("ixinfer_w4a8_nn_v1", "ixmm_w4a8_nn")
+_IVCORE11_CONVERTED_SOURCES = ("block-FP8", "MXFP4", "MXFP8")
 _EXPERT_DEFAULTS = {"ivcore11": "ixinfer_w4a8_nn_v2", "ivcore30": "ixmm_fp4fp8"}
 
 
@@ -97,15 +102,20 @@ def select_four_bit_expert_compute(arch, mode, *, source):
     )
 
     modes = _EXPERT_MODES.get(arch, {})
-    if arch == "ivcore11" and source == "block-FP8" and mode == "ixmm_w4a8_nn":
-        return select_moe_backend(arch, name="ixmm_w4a8", layout="NN")
-    if arch == "ivcore11" and source == "block-FP8" and mode == "ixinfer_w4a8_nn_v1":
-        return select_moe_backend(arch, name="ixinfer_w4a8_nn_v1", layout="NN")
     if mode == "auto":
         mode = _EXPERT_DEFAULTS.get(arch)
     if not isinstance(mode, str) or mode not in modes:
         raise ValueError(
             f"Unsupported {source} mode {mode!r} on {arch}; supported: {tuple(modes)}"
+        )
+    if (
+        arch == "ivcore11"
+        and mode in _IVCORE11_CONVERTED_MODES
+        and source not in _IVCORE11_CONVERTED_SOURCES
+    ):
+        raise ValueError(
+            f"Unsupported {source} mode {mode!r} on {arch}; "
+            f"requires one of {_IVCORE11_CONVERTED_SOURCES}"
         )
     name, layout = modes[mode]
     return select_moe_backend(arch, name=name, layout=layout)

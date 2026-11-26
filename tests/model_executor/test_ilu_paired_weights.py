@@ -157,6 +157,56 @@ def test_duplicate_sources_and_targets(tmp_path):
         session.close()
 
 
+def test_index_selects_tensor_sources_in_deferred_iterator(tmp_path, monkeypatch):
+    import json
+
+    first = tmp_path / "model-00001.safetensors"
+    second = tmp_path / "model-00002.safetensors"
+    save_file({"embedding": torch.zeros(1), "gate": torch.ones(1)}, first)
+    save_file(
+        {
+            "embedding": torch.ones(1),
+            "up": torch.ones(1),
+            "up.weight_scale_inv": torch.ones(1),
+        },
+        second,
+    )
+    index = tmp_path / "model.safetensors.index.json"
+    weight_map = {"embedding": second.name, "gate": first.name, "up": second.name}
+    index.write_text(json.dumps({"weight_map": weight_map}))
+
+    loader = IluDefaultModelLoader.__new__(IluDefaultModelLoader)
+    loader.load_config = SimpleNamespace(safetensors_load_strategy=None)
+    monkeypatch.setattr(
+        loader,
+        "_prepare_weights",
+        lambda *_: (str(tmp_path), [str(first), str(second)], True, index.name),
+    )
+    source = SimpleNamespace(
+        model_or_path=str(tmp_path),
+        subfolder=None,
+        revision=None,
+        fall_back_to_pt=False,
+        allow_patterns_overrides=None,
+        prefix="",
+    )
+    readers = SafetensorsReaders()
+    loader._paired_session = SimpleNamespace(readers=readers)
+    try:
+        references = dict(loader._deferred_iterator(source))
+        assert set(references) == set(weight_map) | {"up.weight_scale_inv"}
+        assert references["embedding"].reference.source.file == str(second)
+        torch.testing.assert_close(
+            references["embedding"].reference.read(readers), torch.ones(1)
+        )
+        weight_map["gate"] = second.name
+        index.write_text(json.dumps({"weight_map": weight_map}))
+        with pytest.raises(ValueError, match="Indexed checkpoint tensor gate missing"):
+            list(loader._deferred_iterator(source))
+    finally:
+        readers.close()
+
+
 def test_deferred_views_and_unsupported_expert_data_transform(tmp_path):
     model = MappedModel(1)
     files = checkpoint(tmp_path, model)

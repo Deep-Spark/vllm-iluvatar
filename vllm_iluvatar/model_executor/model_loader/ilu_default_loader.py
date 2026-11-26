@@ -8,8 +8,10 @@ Scope: block-FP8 and MXFP4 parameters opting into paired loading.
 Remove: when upstream provides deferred checkpoint sources and upload sessions.
 """
 
+import json
 import sys
 import time
+from pathlib import Path
 
 import torch
 from vllm.logger import init_logger
@@ -228,7 +230,7 @@ class IluDefaultModelLoader(DefaultModelLoader):
 
     def _deferred_iterator(self, source):
         self.counter_before_loading_weights = time.perf_counter()
-        _, files, safetensors, _ = self._prepare_weights(
+        directory, files, safetensors, index = self._prepare_weights(
             source.model_or_path,
             source.subfolder,
             source.revision,
@@ -238,7 +240,15 @@ class IluDefaultModelLoader(DefaultModelLoader):
         if not safetensors:
             raise ValueError("Paired expert loading requires a safetensors checkpoint")
         files = sorted(files, key=_natural_sort_key)
-        references = checkpoint_references(files)
+        index_path = Path(directory, index)
+        weight_map = None
+        if index_path.is_file():
+            with index_path.open(encoding="utf-8") as file:
+                weight_map = {
+                    name: Path(directory, shard)
+                    for name, shard in json.load(file)["weight_map"].items()
+                }
+        references = checkpoint_references(files, weight_map=weight_map)
         logger.info(
             "Paired expert checkpoint metadata: files=%d tensors=%d time=%.3fs",
             len(files),

@@ -57,7 +57,7 @@
       <span><span class="status unknown">—</span> 尚未完成该组合的模型验证</span>
     </div>
     <p class="notes">“默认”仅指计算 mode；模型验证不自动扩展到其他模型或通信组合。150 的 FP8 → IxInfer TN 已完成设备测试。</p>
-    <p class="notes">150 上 ixmm_w4a8_nn 与 ixinfer_w4a8_nn_v1 仅开放给 block-FP8 且仅支持 Standard（不支持 Batched / Hybrid LL）；NN v1 另要求专家层 tp_size=1、local_num_experts≥2。</p>
+    <p class="notes">BI150: ixmm_w4a8_nn supports block-FP8. ixinfer_w4a8_nn_v1 supports block-FP8, MXFP4 and MXFP8; it requires expert tp_size=1 and at least two local experts. Both modes use Standard experts.</p>
     <p class="notes">Hy4 Flash 双架构另覆盖 PP8×TP1/TP2 与全量 GSM8K；GLM-5.3-Flash 150 已完成 PP8 Prefill、TP2×DP8+EP16 Decode 与全量 GSM8K 验收；详细条件与依据见正文 §8。</p>
   </main>
 </body>

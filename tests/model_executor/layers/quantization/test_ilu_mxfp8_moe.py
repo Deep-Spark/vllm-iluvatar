@@ -207,7 +207,7 @@ def test_native_load_matches_the_converter_reference(tmp_path, tp, ep):
 
 def test_loader_rejects_foreign_contracts_and_grids():
     spec = BlockFp8LoadSpec(2, 256, 256, MXFP8_BLOCK_SHAPE)
-    unknown = MoEWeightSpec("ixinfer_w4a8_nn_v1", "NN", torch.int8)
+    unknown = MoEWeightSpec("ixinfer_w4a8_nn_v1", "NN", torch.int8, code_multiplier=18)
     with pytest.raises(ValueError, match="No MXFP8 loader"):
         make_mxfp8_loader(unknown, spec)
     # The spec must match the contract exactly, code multiplier included: the

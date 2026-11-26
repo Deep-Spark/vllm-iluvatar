@@ -34,13 +34,11 @@ from vllm_iluvatar.model_executor.layers.quantization.common.paired_moe_loader i
             ("ixmm_w4a8", "NN"),
         )
     ]
-    + [("ixinfer_w4a8_nn_v1", "NN", "block_fp8")],
+    + [("ixinfer_w4a8_nn_v1", "NN", "block_fp8"), ("ixmm_w4a8", "NN", "mxfp8")],
 )
 def test_w4a8_runtime_weight_contract(backend, layout, source):
     arch = cuda_arch()
-    ixmm_supported = arch == "ivcore30" or (
-        arch == "ivcore11" and source == "block_fp8"
-    )
+    ixmm_supported = arch in ("ivcore11", "ivcore30")
     if (backend == "ixmm_w4a8" and not ixmm_supported) or (
         backend.startswith("ixinfer_w4a8") and layout == "NN" and arch != "ivcore11"
     ):
@@ -65,17 +63,24 @@ def test_w4a8_runtime_weight_contract(backend, layout, source):
         # Independent decoded source and two-stage channel quantization oracle.
         # The GEMM consumes the real FP8 loader's native output below.
         raw = (torch.randn(e, n, k) * 30).to(torch.float8_e4m3fn)
-        scales = (torch.rand(e, n // 128, k // 128) + 0.1).to(torch.bfloat16)
-        decoded = raw.float() * scales.float().repeat_interleave(
-            128, 1
-        ).repeat_interleave(128, 2)
+        scale_rows, weight_cols, scale_cols = (
+            (1, 1, 32) if source == "mxfp8" else (128, 1, 128)
+        )
+        if source == "mxfp8":
+            scales = torch.randint(119, 123, (e, n, k // 32), dtype=torch.uint8)
+            block_scale = scales.view(torch.float8_e8m0fnu).float()
+        else:
+            scales = (torch.rand(e, n // 128, k // 128) + 0.1).to(torch.bfloat16)
+            block_scale = scales.float()
+        decoded = raw.float() * block_scale.repeat_interleave(
+            scale_rows, 1
+        ).repeat_interleave(scale_cols, 2)
         channel = decoded.abs().amax(-1) / 127
         channel = torch.where(channel == 0, 1.0, channel)
         logical = (
             (decoded / channel.unsqueeze(-1)).round().clamp(-127, 127) / 18
         ).round()
         logical, channel = logical.cuda(), channel.cuda()
-        scale_rows, weight_cols, scale_cols = 128, 1, 128
     layer = torch.nn.Module()
     layer._map_global_expert_id_to_local_expert_id = lambda expert: expert
     selection = select_moe_backend(arch, name=backend, layout=layout)
@@ -88,7 +93,14 @@ def test_w4a8_runtime_weight_contract(backend, layout, source):
             make_block_fp8_loader,
         )
 
-        loader = make_block_fp8_loader(spec, BlockFp8LoadSpec(e, k, n // 2, (128, 128)))
+        factory = make_block_fp8_loader
+        if source == "mxfp8":
+            from vllm_iluvatar.model_executor.layers.quantization.common.mxfp8_loader import (
+                make_mxfp8_loader,
+            )
+
+            factory = make_mxfp8_loader
+        loader = factory(spec, BlockFp8LoadSpec(e, k, n // 2, (scale_rows, scale_cols)))
     with torch.device("cuda"):
         loader.create_weights(layer, {})
     buffer = ExpertUploadBuffer(
@@ -172,6 +184,154 @@ def test_w4a8_runtime_weight_contract(backend, layout, source):
         ).to(torch.bfloat16)
     # BF16 epilogues may round scaling intermediates; budget two BF16 ULPs.
     torch.testing.assert_close(out, expected, rtol=0.016, atol=0.016)
+
+
+@pytest.mark.parametrize("layout", ["TN", "NN"])
+def test_mxfp4_w4a8_hidden_padding_and_graph_replay(monkeypatch, layout):
+    if cuda_arch() != "ivcore11":
+        pytest.skip("BI150 TN/NN v2 required")
+
+    from dataclasses import replace
+
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts import ilu_ixinfer_w4a8
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+        MoEComputeConfig,
+        make_moe_compute,
+    )
+    from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp4_moe import (
+        IluMxfp4MoEMethod,
+    )
+    from vllm_iluvatar.model_executor.layers.quantization.common.moe_compute_binding import (
+        MoEComputeBindingMixin,
+    )
+
+    torch.manual_seed(61)
+    hidden, intermediate, experts = 608, 256, 2
+    config = MoEComputeConfig(hidden, intermediate, experts, experts)
+    monkeypatch.setattr(MoEComputeBindingMixin, "_compute_config", lambda *_: config)
+    selection = select_moe_backend("ivcore11", name="ixinfer_w4a8", layout=layout)
+    layer = torch.nn.Module()
+    layer.moe_config = SimpleNamespace(
+        intermediate_size_per_partition_unpadded=intermediate,
+        hidden_dim_unpadded=hidden,
+        has_bias=False,
+        is_act_and_mul=True,
+        tp_size=1,
+        tp_rank=0,
+        max_capture_size=16,
+    )
+    layer.expert_map = None
+    layer._map_global_expert_id_to_local_expert_id = lambda index: index
+    method = IluMxfp4MoEMethod(layer.moe_config, selection)
+    with torch.device("cuda"):
+        method.create_weights(layer, experts, hidden, intermediate, torch.bfloat16)
+    loader = method._checkpoint_loader
+
+    compute = make_moe_compute(method._compute_config(layer), selection)
+    w13_k, w2_n = 640, (640 if layout == "NN" else hidden)
+    assert compute.config.w13_k == w13_k
+    assert compute.config.w2_n == w2_n
+    loader.bind_upload_buffer(
+        ExpertUploadBuffer(loader.staging_bytes, layer.w2_weight.device)
+    )
+
+    # Independently pack the zero-extended source and compare the runtime bytes.
+    from tests.mxfp4_reference import pack_ixinfer
+
+    for expert in range(experts):
+        expected_w13, expected_w13_scale = [], []
+        for shard, n, k in (
+            ("w1", intermediate, hidden),
+            ("w3", intermediate, hidden),
+            ("w2", hidden, intermediate),
+        ):
+            raw = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8)
+            scales = torch.full((n, k // 32), 121, dtype=torch.uint8)
+            group = "w2" if shard == "w2" else "w13"
+            for is_scale, tensor in ((False, raw), (True, scales)):
+                assert loader.load_shard(group, is_scale, tensor, shard, expert)
+            codes, channels = mxfp4_channel_int4(raw, scales)
+            if shard != "w2":
+                expected_w13.append(torch.nn.functional.pad(codes, (0, w13_k - hidden)))
+                expected_w13_scale.append(channels)
+                continue
+            codes = torch.nn.functional.pad(codes, (0, 0, 0, w2_n - hidden))
+            expected = pack_ixinfer(codes, layout).cuda()
+            torch.testing.assert_close(
+                layer.w2_weight[expert], expected, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                layer.w2_weight_scale[expert, :, :hidden], channels.cuda()
+            )
+        expected = pack_ixinfer(torch.cat(expected_w13), layout).cuda()
+        torch.testing.assert_close(layer.w13_weight[expert], expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            layer.w13_weight_scale[expert], torch.cat(expected_w13_scale, dim=-1).cuda()
+        )
+
+    weights = loader.finalize()
+    compute.validate_weights(weights)
+    reference = make_moe_compute(replace(compute.config, hidden=w2_n), selection)
+    ctx = SimpleNamespace(attn_metadata=None)
+    monkeypatch.setattr(ilu_ixinfer_w4a8, "get_forward_context", lambda: ctx)
+
+    x = torch.randn((16, hidden), device="cuda", dtype=torch.bfloat16)
+    ids = torch.randint(experts, (16, 2), device="cuda", dtype=torch.int32)
+    scores = torch.full((16, 2), 0.5, device="cuda")
+
+    def padded_x(value):
+        return torch.nn.functional.pad(value, (0, w13_k - hidden))
+
+    def standard(backend, inputs):
+        return backend.run_standard(
+            inputs,
+            weights,
+            scores,
+            ids,
+            None,
+            workspace=backend.workspace_spec(ids.numel(), x.dtype).allocate(x.device),
+        )
+
+    actual = standard(compute, x)
+    assert actual.shape == x.shape
+    torch.testing.assert_close(
+        actual, standard(reference, padded_x(x))[:, :hidden], rtol=0, atol=0
+    )
+
+    ctx.attn_metadata = SimpleNamespace(num_prefills=0, num_decodes=x.shape[0])
+    standard(compute, x)  # Warm up before capture.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = standard(compute, x)
+    x.mul_(0.5)
+    ids.copy_((ids + 1) % experts)
+    graph.replay()
+    torch.testing.assert_close(
+        captured, standard(reference, padded_x(x))[:, :hidden], rtol=0, atol=0
+    )
+
+    counts = torch.tensor([8, 8], device="cuda", dtype=torch.int32)
+    batched_x = x.reshape(experts, 8, hidden)
+
+    def batched(backend, inputs):
+        out = torch.empty((experts, 8, backend.hidden), device=x.device, dtype=x.dtype)
+        return backend.run_batched(
+            inputs,
+            weights,
+            None,
+            counts,
+            output=out,
+            workspace=backend.workspace_spec(16, x.dtype, batched=True).allocate(
+                x.device
+            ),
+        )
+
+    torch.testing.assert_close(
+        batched(compute, batched_x),
+        batched(reference, padded_x(batched_x))[..., :hidden],
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.parametrize(

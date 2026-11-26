@@ -136,14 +136,34 @@ class IluMxfp4MoEMethod(MoEComputeBindingMixin, Mxfp4MoEMethod):
             # Gate/up and activation use the logical width. Only the down
             # projection needs extra K alignment in the weight contract.
             return replace(config, intermediate=unpadded)
-        if self.selection.name == "ixinfer_w4a8" and unpadded not in (
-            None,
-            config.intermediate,
-        ):
-            # NN requires 64-aligned down-projection K, TN requires 128.
-            alignment = 64 if self.selection.layout == "NN" else 128
-            width = (config.intermediate + alignment - 1) // alignment * alignment
-            return replace(config, intermediate=width)
+        if self.selection.name == "ixinfer_w4a8":
+            from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_utils import (
+                W4A8GroupGemmInfo,
+            )
+
+            logical_width = config.intermediate if unpadded is None else unpadded
+            layout = self.selection.layout
+            # Keep hidden logical at the MoE interface. The two projections
+            # can require different runtime hidden widths.
+            w13 = W4A8GroupGemmInfo(layout, config.hidden, 2 * logical_width)
+            if layout == "TN":
+                # TN gate/up already meets N alignment at logical MXFP4 widths.
+                w2 = W4A8GroupGemmInfo(layout, logical_width, config.hidden)
+                return replace(
+                    config,
+                    intermediate=logical_width,
+                    w2_k_padded=w2.pad_k,
+                    w13_k_padded=w13.pad_k,
+                    w2_n_padded=w2.pad_n,
+                )
+            # NN's 64-aligned W2 K also aligns the fused W13 N (2 * K) to 128.
+            w2 = W4A8GroupGemmInfo(layout, config.intermediate, config.hidden)
+            return replace(
+                config,
+                intermediate=w2.pad_k,
+                w13_k_padded=w13.pad_k,
+                w2_n_padded=w2.pad_n,
+            )
         return config
 
     def create_weights(
@@ -199,6 +219,9 @@ class IluMxfp4MoEMethod(MoEComputeBindingMixin, Mxfp4MoEMethod):
             )
             if not torch.equal(layer.expert_map, expected):
                 raise ValueError("W4A8 compute requires contiguous expert placement")
+        source_width = self.moe.intermediate_size_per_partition_unpadded
+        if source_width is None:
+            source_width = intermediate_size_per_partition
         loader = make_mxfp4_loader(
             backend.weight_spec,
             Mxfp4LoadSpec(
@@ -207,7 +230,10 @@ class IluMxfp4MoEMethod(MoEComputeBindingMixin, Mxfp4MoEMethod):
                 backend.intermediate,
                 self.moe.tp_size,
                 self.moe.tp_rank,
-                self.moe.intermediate_size_per_partition_unpadded,
+                source_width,
+                backend.config.w2_k_padded,
+                backend.config.w13_k_padded,
+                backend.config.w2_n_padded,
             ),
         )
         layer.params_dtype = params_dtype

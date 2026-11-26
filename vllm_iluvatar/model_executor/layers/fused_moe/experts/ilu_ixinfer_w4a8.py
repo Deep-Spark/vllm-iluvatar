@@ -80,10 +80,16 @@ class IxInferW4A8Backend(MoEComputeBackend):
     # is 384 per rank. N and K differ per projection, so each is checked.
     @classmethod
     def dimension_error(cls, config, layout):
+        if config.w2_k < config.intermediate:
+            return f"{cls.name} w2 K is smaller than the logical intermediate width"
+        if min(config.w13_k, config.w2_n) < config.hidden:
+            return (
+                f"{cls.name} runtime hidden dimensions are smaller than logical hidden"
+            )
         n_multiple, k_multiple = cls._SHAPE_RULES[layout]
         for projection, n, k in (
-            ("w13", 2 * config.intermediate, config.hidden),
-            ("w2", config.hidden, config.intermediate),
+            ("w13", 2 * config.intermediate, config.w13_k),
+            ("w2", config.w2_n, config.w2_k),
         ):
             if n % n_multiple or k % k_multiple or k < cls._MIN_K:
                 return (
@@ -138,22 +144,25 @@ class IxInferW4A8Backend(MoEComputeBackend):
 
     def _activation_quant(self, intermediate, order, decode, workspace):
         """GEMM1 output -> activation -> per-row INT8 for GEMM2."""
+        quant_args = dict(
+            output_format=int(decode and self.pack_version == 2),
+            dst_to_src=order,
+            check_valid=decode,
+        )
+        if self.config.w2_k != self.intermediate:
+            quant_args["output_padding"] = self.config.w2_k - self.intermediate
         if self.config.activation == _SWIGLUSTEP:
             return ops.activation_dynamic_scaled_int8(
                 input=intermediate,
                 act_type=_SWIGLUSTEP,
-                dst_to_src=order,
-                output_format=int(decode),
-                check_valid=decode,
+                **quant_args,
             )
         if self.config.activation not in _SWIGLUOAI_ACTIVATIONS:
             # An infinite bound preserves checkpoints with plain SwiGLU.
             return ops.swiglu_limit_dynamic_scaled_int8(
                 input=intermediate,
                 limit=float("inf") if self.limit is None else float(self.limit),
-                output_format=int(decode and self.pack_version == 2),
-                dst_to_src=order,
-                check_valid=decode,
+                **quant_args,
             )
         if self.config.activation == _SWIGLUOAI_UNINTERLEAVE:
             rows, columns = intermediate.shape
@@ -164,9 +173,7 @@ class IxInferW4A8Backend(MoEComputeBackend):
             intermediate = interleaved
         return ops.activation_swigluoai_dynamic_scaled_int8(
             input=intermediate,
-            dst_to_src=order,
-            output_format=int(decode and self.pack_version == 2),
-            check_valid=decode,
+            **quant_args,
         )
 
     def _gemv(self, **args):
@@ -263,6 +270,8 @@ class IxInferW4A8Backend(MoEComputeBackend):
             rows = topk_ids.numel()
         elif host_counts.sum() == 0:
             return self.empty_standard_output(x, output, residual)
+        padding = self.config.w13_k - x.shape[-1]
+        padding_args = {"output_padding": padding} if padding else {}
         q, scale = ops.moe_expand_input_dynamic_scaled_int8(
             hidden_states=x,
             dst_to_src=order,
@@ -271,6 +280,7 @@ class IxInferW4A8Backend(MoEComputeBackend):
             src_to_dst=inverse,
             output_format=int(gemv),
             check_valid=decode,
+            **padding_args,
         )
         selected_counts = counts if decode else host_counts
         intermediate = self.gemm(
@@ -303,6 +313,8 @@ class IxInferW4A8Backend(MoEComputeBackend):
         )
         del q, scale
         workspace.release("input", "input_scale")
+        if self.config.w2_n != self.hidden:
+            out = out[:, : self.hidden].contiguous()
         return ops.moe_output_reduce_sum(
             input=out.view(x.shape[0], topk_ids.shape[-1], self.hidden),
             topk_weight=topk_weights,
@@ -321,6 +333,8 @@ class IxInferW4A8Backend(MoEComputeBackend):
             device=x.device, dtype=torch.int32, non_blocking=True
         ).contiguous()
         capacity = x.shape[0] // self.local_num_experts
+        if x.shape[-1] != self.config.w13_k:
+            x = torch.nn.functional.pad(x, (0, self.config.w13_k - x.shape[-1]))
         if x.dtype != torch.int8:
             x, scale = ops.scaled_int8_quant(x)
         elif scale is None:
@@ -336,6 +350,13 @@ class IxInferW4A8Backend(MoEComputeBackend):
         )
         del q, scale
         workspace.release("input", "input_scale")
+        if self.config.w2_k != self.intermediate:
+            # Grouped GEMV reorders INT8 columns during quantization. Pad the
+            # two BF16 halves before quantization to preserve that layout.
+            intermediate = torch.nn.functional.pad(
+                intermediate.view(-1, 2, self.intermediate),
+                (0, self.config.w2_k - self.intermediate),
+            ).flatten(1)
         q, scale = ops.moe_group_gemv_swiglu_quant(
             input=intermediate,
             expert_num_tokens=counts,
@@ -345,6 +366,11 @@ class IxInferW4A8Backend(MoEComputeBackend):
         )
         del intermediate
         workspace.release("gemm1")
+        output_rows = output.reshape(-1, output.shape[-1])
+        needs_crop = self.config.w2_n != self.hidden
+        gemm_output = (
+            workspace.get("gemm2", output_rows.shape[0]) if needs_crop else output_rows
+        )
         self.gemm(
             weights,
             q,
@@ -354,8 +380,10 @@ class IxInferW4A8Backend(MoEComputeBackend):
             output.dtype,
             decode=True,
             dense=dense,
-            output=output.reshape(-1, output.shape[-1]),
+            output=gemm_output,
         )
+        if needs_crop:
+            output_rows.copy_(gemm_output[:, : self.hidden])
         return output
 
 

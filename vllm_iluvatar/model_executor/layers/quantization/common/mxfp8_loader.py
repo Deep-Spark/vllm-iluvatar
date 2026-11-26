@@ -13,9 +13,8 @@ IxInfer W4A8 by default on ivcore11, the ix30 FP4 layout by default on
 ivcore30. The table below mirrors ``make_block_fp8_loader``'s, so an explicit
 ``moe`` mode reaches the same targets from either source.
 
-The code multiplier 18 is applied by the IxInfer kernel through the weight
-spec, and ``fp8_block_to_w4a8`` leaves it out of the channel scale for the
-``ixinfer_*`` formats. Nothing here may fold it in a second time.
+IxInfer v2 keeps the fixed multiplier 18 implicit. NN/v1 folds its
+per-channel divisor into the output scale during native conversion.
 """
 
 import torch
@@ -73,7 +72,15 @@ class MxFp8ToFP4FP8Loader(_MxFp8Source, BlockFp8ToFP4FP8Loader):
 
 
 def make_mxfp8_loader(weight_spec, load_spec):
+    if weight_spec.format_id == "ixinfer_w4a8_nn_v1" and load_spec.tp_size != 1:
+        raise ValueError(
+            "NN/v1 row scales require the full expert K before quantization"
+        )
     contracts = {
+        "ixinfer_w4a8_nn_v1": (
+            MxFp8ToW4A8Loader,
+            MoEWeightSpec("ixinfer_w4a8_nn_v1", "NN", torch.int8),
+        ),
         "ixinfer_w4a8_tn_v2": (
             MxFp8ToW4A8Loader,
             MoEWeightSpec("ixinfer_w4a8_tn_v2", "TN", torch.int8, code_multiplier=18),

@@ -96,7 +96,6 @@ def test_mxfp4_public_modes(monkeypatch, device, mode, expected):
 @pytest.mark.parametrize(
     "device,mode",
     [
-        ("ivcore11", "ixmm_w4a8_nn"),
         ("ivcore11", "ixmm_fp4fp8"),
         ("ivcore30", "ixinfer_w4a8_tn_v2"),
         ("ivcore30", "ixinfer_w4a8_nn_v2"),
@@ -171,12 +170,28 @@ def test_fp8_compute_modes(device, mode, backend, layout):
     assert (selection.name, selection.layout) == (backend, layout)
 
 
-def test_bi150_nn_v1_only_accepts_block_fp8():
+@pytest.mark.parametrize("source", ["block-FP8", "MXFP4", "MXFP8"])
+def test_bi150_ixmm_w4a8_sources(source):
+    selection = ilu_compute.select_four_bit_expert_compute(
+        "ivcore11", "ixmm_w4a8_nn", source=source
+    )
+    assert (selection.name, selection.layout) == ("ixmm_w4a8", "NN")
+
+
+@pytest.mark.parametrize("source", ["block-FP8", "MXFP4", "MXFP8"])
+def test_bi150_nn_v1_sources(source):
     select = ilu_compute.select_four_bit_expert_compute
-    selection = select("ivcore11", "ixinfer_w4a8_nn_v1", source="block-FP8")
+    selection = select("ivcore11", "ixinfer_w4a8_nn_v1", source=source)
     assert (selection.name, selection.layout) == ("ixinfer_w4a8_nn_v1", "NN")
     with pytest.raises(ValueError, match="Unsupported"):
-        select("ivcore11", "ixinfer_w4a8_nn_v1", source="MXFP4")
+        select("ivcore30", "ixinfer_w4a8_nn_v1", source=source)
+
+
+@pytest.mark.parametrize("mode", ["ixinfer_w4a8_nn_v1", "ixmm_w4a8_nn"])
+@pytest.mark.parametrize("source", ["native BF16/FP16", "NVFP4"])
+def test_bi150_converted_modes_reject_other_sources(mode, source):
+    with pytest.raises(ValueError, match="requires one of"):
+        ilu_compute.select_four_bit_expert_compute("ivcore11", mode, source=source)
 
 
 def test_fp8_runtime_compute_conflict(monkeypatch):

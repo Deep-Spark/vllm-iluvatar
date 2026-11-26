@@ -136,7 +136,7 @@ def _indexer_rope_table(
     if mrope_emb is None or positions.shape[0] != 3:
         raise ValueError("HYV4 2-D positions require three rows and an M-RoPE module")
     section = getattr(mrope_emb, "_ixf_mrope_section", None)
-    if positions.is_cuda and positions.shape[1] <= 16 and section is not None:
+    if positions.is_cuda and positions.shape[1] <= 2560 and section is not None:
         return ixfops.mrope_cos_sin_table(
             positions,
             mrope_emb._match_cos_sin_cache_dtype(dtype_ref),

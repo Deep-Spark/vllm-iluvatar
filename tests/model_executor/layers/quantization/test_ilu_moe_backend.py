@@ -15,6 +15,7 @@ from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend i
         ("ivcore30", "auto", "auto", ("ixmm_fp4fp8", "fp4fp8")),
         ("ivcore11", "ixinfer_w4a8", "TN", ("ixinfer_w4a8", "TN")),
         ("ivcore30", "ixinfer_w4a8", "auto", ("ixinfer_w4a8", "TN")),
+        ("ivcore11", "ixmm_w4a8", "auto", ("ixmm_w4a8", "NN")),
         ("ivcore30", "ixmm_w4a8", "auto", ("ixmm_w4a8", "NN")),
         ("ivcore30", "auto", "NN", ("ixmm_w4a8", "NN")),
     ],
@@ -27,7 +28,6 @@ def test_selection(arch, name, layout, expected):
 @pytest.mark.parametrize(
     "arch,name,layout",
     [
-        ("ivcore11", "ixmm_w4a8", "auto"),
         ("ivcore11", "ixmm_fp4fp8", "auto"),
         ("ivcore30", "ixinfer_w4a8", "NN"),
         ("ivcore30", "missing", "auto"),

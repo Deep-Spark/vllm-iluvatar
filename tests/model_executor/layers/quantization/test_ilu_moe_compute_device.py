@@ -45,6 +45,11 @@ def test_w4a8_runtime_weight_contract(backend, layout, source):
         backend.startswith("ixinfer_w4a8") and layout == "NN" and arch != "ivcore11"
     ):
         pytest.skip("Not a supported architecture/layout combination")
+    if backend == "ixmm_w4a8":
+        from ixformer.inference.ixmm_backend import ixmm_available
+
+        if not ixmm_available():
+            pytest.skip("ixformer was built without the ixmm backend")
     torch.manual_seed(41)
     e, n, k = 2, 512, 512
     if source == "mxfp4":

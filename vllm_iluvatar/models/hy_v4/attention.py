@@ -1404,7 +1404,7 @@ class HYV4MLAAttention(nn.Module):
             cos_sin,
             self.mla_attn._k_scale,
             int(kv_cache.shape[1]),
-            variant=1 if positions.ndim == 2 else 2,
+            variant=3 if positions.ndim == 2 else 2,
         )
         if not _MLA_KV_FUSE_LOGGED:
             logger.info(

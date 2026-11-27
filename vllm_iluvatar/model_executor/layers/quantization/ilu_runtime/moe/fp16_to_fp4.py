@@ -137,6 +137,8 @@ def convert_native_to_ix30_fp4(
 class IluFp16ToFp4OnlineMoEMethod(IluFp8ToFp4OnlineMoEMethod):
     """GLM load-time FP4 loader fed from MiniMax-M3 native BF16 expert shards."""
 
+    _use_cq_f4f8_experts = False
+
     @classmethod
     def from_ilu_runtime_config(cls, context: Any) -> IluFp16ToFp4OnlineMoEMethod:
         group = context.group

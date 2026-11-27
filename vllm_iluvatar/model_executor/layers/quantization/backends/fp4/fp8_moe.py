@@ -3,25 +3,32 @@
 
 from __future__ import annotations
 
+import math
+from dataclasses import replace
+
 import torch
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase
+from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
     resolve_fp8_moe_weight_block_shape,
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8Dynamic128Sym
 
+from vllm_iluvatar import envs as ilu_envs
+
 # Re-exported: ``ilu_runtime/moe/fp8_to_fp4.py`` and ``mxfp4_moe.py`` reach these
 # through this module, which predates the shared binding mixin.
-from vllm_iluvatar.model_executor.layers.fused_moe.activation import (  # noqa: F401
-    swiglustep_limit,
+from vllm_iluvatar.model_executor.layers.fused_moe.activation import swiglustep_limit
+from vllm_iluvatar.model_executor.layers.fused_moe.ilu_f4f8_experts import (
+    IluF4F8Experts,
+    ilu_f4f8_moe_backends_available,
 )
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
     _ixmm_backend_available,  # noqa: F401
 )
 from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.nvfp4_moe import (
-    _get_ilu_output_scale,  # noqa: F401
+    _get_ilu_output_scale,
 )
 from vllm_iluvatar.model_executor.layers.quantization.common.moe_compute_binding import (
     MoEComputeBindingMixin,
@@ -41,6 +48,47 @@ _IXMM_EXPERT_CHUNK = 4
 _IXMM_GROUP_SIZE = 256
 _FP4_MAX_MAG = 6.0
 logger = init_logger(__name__)
+
+
+def _fp8_moe_clamp_limit(layer: RoutedExperts) -> float | None:
+    """Resolve the clamp while preserving legacy activation handling."""
+    activation = getattr(layer, "activation", "silu")
+    activation = getattr(activation, "value", activation)
+    limit = getattr(layer, "swiglu_limit", None)
+    if activation == "swiglustep":
+        return swiglustep_limit(limit)
+    if activation in ("silu", "swiglu") and limit is not None:
+        limit_f = float(limit)
+        if not math.isfinite(limit_f) or limit_f <= 0.0:
+            raise ValueError(
+                f"swiglu_limit must be a finite positive float, got {limit!r}"
+            )
+        return limit_f
+    return limit
+
+
+def _maybe_build_f4f8_experts(layer: RoutedExperts) -> IluF4F8Experts | None:
+    """Build ``IluF4F8Experts`` when packed ix30 weights match its contract."""
+    if getattr(layer, "_ilu_step5_native_activation", False):
+        return None
+    if getattr(layer, "apply_router_weight_on_input", False):
+        return None
+    if _get_ilu_output_scale(layer) != 1.0:
+        return None
+    activation = getattr(layer, "activation", "silu")
+    activation = getattr(activation, "value", activation)
+    if activation not in ("silu", "swiglu"):
+        return None
+    clamp_limit = _fp8_moe_clamp_limit(layer)
+    w13 = layer.w13_weight
+    w2 = layer.w2_weight
+    if w2.shape[1] * 2 != w13.shape[2] // 2 or w2.shape[2] != w13.shape[1] * 2:
+        return None
+    try:
+        supported, _ = ilu_f4f8_moe_backends_available()
+    except ImportError:
+        return None
+    return IluF4F8Experts(clamp_limit) if supported else None
 
 
 def preprocess_fp8_block_weight_for_ixmm(
@@ -152,6 +200,7 @@ class IluFp8MoEMethod(MoEComputeBindingMixin, Fp8MoEMethod):
     """
 
     compute_source = "block-FP8"
+    _use_cq_f4f8_experts = True
 
     def __init__(self, quant_config, layer, ilu_params=None):
         if not isinstance(quant_config, Fp8Config):
@@ -180,10 +229,13 @@ class IluFp8MoEMethod(MoEComputeBindingMixin, Fp8MoEMethod):
         self.fp8_backend = self.moe_kernel = None
         self.selection = None
         self._checkpoint_loader = self._compute = self._runtime_weights = None
+        self._f4f8_experts: IluF4F8Experts | None = None
         self.supports_pre_processed_weights = False
 
     def _compute_config(self, layer):
         config = super()._compute_config(layer)
+        if config.activation in ("silu", "swiglu"):
+            config = replace(config, limit=_fp8_moe_clamp_limit(layer))
         return pad_online_w4a8_config(
             config,
             layer.moe_config.intermediate_size_per_partition_unpadded,
@@ -269,6 +321,48 @@ class IluFp8MoEMethod(MoEComputeBindingMixin, Fp8MoEMethod):
                 w2_n_padded=compute.w2_n_padded,
                 w2_k_padded=compute.w2_k_padded,
             ),
+        )
+
+    def _bind_compute(self, layer, weights=None):
+        super()._bind_compute(layer, weights)
+        if (
+            self._use_cq_f4f8_experts
+            and self.compute_source == "block-FP8"
+            and self.selection.name == "ixmm_fp4fp8"
+        ):
+            self._f4f8_experts = _maybe_build_f4f8_experts(layer)
+
+    def apply(
+        self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input
+    ):
+        f4f8_experts = getattr(self, "_f4f8_experts", None)
+        if (
+            f4f8_experts is not None
+            and ilu_envs.VLLM_ILU_MXFP4_MOE_BACKEND in ("auto", "ixmm")
+            and isinstance(x, torch.Tensor)
+            and x.is_cuda
+            and x.dtype is torch.bfloat16
+            and topk_ids.dtype is torch.int32
+            and topk_weights.dtype is torch.float32
+            and not getattr(layer, "apply_router_weight_on_input", False)
+            and _get_ilu_output_scale(layer) == 1.0
+        ):
+            residual = shared_experts_input
+            if residual is not None and residual.shape[0] != x.shape[0]:
+                residual = None
+            return f4f8_experts.apply(
+                hidden_states=x,
+                w13=layer.w13_weight,
+                w13_scale=layer.w13_weight_scale,
+                w2=layer.w2_weight,
+                w2_scale=layer.w2_weight_scale,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                expert_map=layer.expert_map,
+                shared_expert_output=residual,
+            )
+        return super().apply(
+            layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input
         )
 
     def process_weights_after_loading(self, layer):

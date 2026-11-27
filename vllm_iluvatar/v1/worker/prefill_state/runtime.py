@@ -27,17 +27,52 @@ class PrefixRuntime:
         self.vllm_config = runner.vllm_config
         self.device = runner.device
         self._table_updates = {}
+        from vllm_iluvatar.v1.worker.mm_replay.configuration import ReplayOptions
+        from vllm_iluvatar.v1.worker.mm_replay.identity import model_identity
+
+        options = ReplayOptions.from_config(self.vllm_config)
+        self._mm_prefix_reuse = options.prefix_reuse
+        self._mm_model_identity = (
+            model_identity(self.vllm_config.model_config)
+            if options.prefix_reuse
+            else None
+        )
 
     @staticmethod
-    def request_eligible(request):
-        # Token IDs alone do not identify image, embedding, or adapter inputs.
-        return (
+    def request_eligible(request, allow_mm=False):
+        # Image reuse additionally requires a certified complete input identity.
+        eligible = (
             request.prompt_token_ids is not None
             and request.prompt_len >= 128
             and request.prefill_token_ids == request.prompt_token_ids
-            and not request.mm_features
             and getattr(request, "prompt_embeds", None) is None
             and request.lora_request is None
+        )
+        if not eligible or not request.mm_features:
+            return eligible
+        if not allow_mm:
+            return False
+        from vllm_iluvatar.v1.worker.mm_replay.identity import feature_descriptors
+
+        try:
+            feature_descriptors(request.mm_features)
+        except (ValueError, AttributeError, TypeError):
+            return False
+        return True
+
+    def mm_input_identity(self, request, token_sha256):
+        if not request.mm_features or not self._mm_prefix_reuse:
+            return None
+        from vllm_iluvatar.v1.worker.mm_replay.identity import (
+            feature_descriptors,
+            request_identity,
+        )
+
+        return request_identity(
+            self._mm_model_identity,
+            token_sha256,
+            request.prompt_len,
+            feature_descriptors(request.mm_features),
         )
 
     def expand_blocks(self, blocks):

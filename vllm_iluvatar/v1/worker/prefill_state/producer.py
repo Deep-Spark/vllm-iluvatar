@@ -75,7 +75,7 @@ class ProducerPrefixState(PrefixRuntime):
         key = hashlib.sha256(
             np.asarray(tokens[:prompt_len], dtype=np.int32).tobytes()
         ).hexdigest()
-        eligible = self.request_eligible(request)
+        eligible = self.request_eligible(request, allow_mm=self._mm_prefix_reuse)
         hit, start, rows = replay_layout(prompt_len) if eligible else (prompt_len, 0, 0)
         with self._src_lock:
             pool = self._src_free.popleft() if eligible and self._src_free else None
@@ -88,6 +88,9 @@ class ProducerPrefixState(PrefixRuntime):
                 H=hit,
                 S=start,
                 token_sha256=key,
+                mm_input_digest=self.mm_input_identity(request, key)
+                if eligible
+                else None,
                 initial_computed=int(request.num_computed_tokens),
                 run_uuid=self._src_nonce,
                 engine_id=self._src_engine,
@@ -190,7 +193,7 @@ class ProducerPrefixState(PrefixRuntime):
         return tuple(index for begin, end in intervals for index in range(begin, end))
 
     def _scalar(self, state):
-        return {
+        result = {
             k: state[k]
             for k in (
                 "id",
@@ -207,6 +210,9 @@ class ProducerPrefixState(PrefixRuntime):
                 "add_mono_ns",
             )
         }
+        if state.get("mm_input_digest") is not None:
+            result["mm_input_digest"] = state["mm_input_digest"]
+        return result
 
     def initialize_cache(self):
         runner = self.model_runner

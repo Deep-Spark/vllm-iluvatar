@@ -119,11 +119,17 @@ class ConsumerPrefixState(PrefixRuntime):
                 idx=idx,
                 generation=gen,
                 N=request.prompt_len,
-                eligible=self.request_eligible(request),
+                eligible=self.request_eligible(request, allow_mm=self._mm_prefix_reuse),
                 token_sha256=hashlib.sha256(
                     np.asarray(tokens[: request.prompt_len], dtype=np.int32).tobytes()
                 ).hexdigest(),
                 blocks=self.initial_blocks(request),
+            )
+            state = self._p21_states[rid]
+            state["mm_input_digest"] = (
+                self.mm_input_identity(request, state["token_sha256"])
+                if state["eligible"]
+                else None
             )
             pkt = self._p21_packets.get(rid)
             if pkt is not None and pkt.get("idx") is None:
@@ -333,6 +339,7 @@ class ConsumerPrefixState(PrefixRuntime):
                             "generation": s["generation"],
                             "N": s["N"],
                             "token_sha256": s["token_sha256"],
+                            "mm_input_digest": s.get("mm_input_digest"),
                             "endpoint": self._p21_recv_metadata.get(rid, {}).get(
                                 "source_endpoint"
                             ),
@@ -388,6 +395,7 @@ class ConsumerPrefixState(PrefixRuntime):
                             state["N"],
                             state["token_sha256"],
                             geometry=self.geometry,
+                            mm_input_digest=state.get("mm_input_digest"),
                             ring_rows=self._p21_ring_rows,
                         )
                         if reply["status"] != "READY":
@@ -608,6 +616,7 @@ class ConsumerPrefixState(PrefixRuntime):
                         and N == state["N"] == meta["N"]
                         and meta["H"] == H
                         and meta["S"] == S
+                        and meta.get("mm_input_digest") == state.get("mm_input_digest")
                         and c == S
                         and int(q[i + 1] - q[i]) == rows
                         and state["idx"]

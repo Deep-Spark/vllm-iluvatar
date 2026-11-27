@@ -4,6 +4,7 @@
 
 import asyncio
 import contextlib
+import ctypes
 import os
 import queue
 import threading
@@ -147,6 +148,75 @@ BufferedRecvNotification = tuple[TransferNotificationStatus, NotifyPayload]
 
 logger = init_logger("vllm." + __name__)
 
+_NIXL_UCX_PROVIDER_LOADED = False
+
+
+def _load_nixl_ucx_provider() -> None:
+    """Load an ABI-matched userspace RDMA provider before UCX discovers devices.
+
+    CoreX 5.0.1 libibverbs may require a newer bnxt_re provider than the one
+    shipped by the base OS.  Preloading that provider globally is not safe
+    because IXCCL initializes earlier in the worker process and can segfault
+    while enumerating verbs devices.  Loading it here keeps the workaround
+    scoped to NIXL initialization, which runs after IXCCL is ready.
+    """
+    global _NIXL_UCX_PROVIDER_LOADED
+    provider = os.getenv("VLLM_ILUVATAR_NIXL_UCX_PROVIDER")
+    if not provider or _NIXL_UCX_PROVIDER_LOADED:
+        return
+    if not os.path.isfile(provider):
+        raise FileNotFoundError(
+            "VLLM_ILUVATAR_NIXL_UCX_PROVIDER does not exist: "
+            f"{provider}"
+        )
+    try:
+        ctypes.CDLL(provider, mode=ctypes.RTLD_GLOBAL)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Failed to load NIXL UCX provider {provider!r}: {exc}"
+        ) from exc
+    _NIXL_UCX_PROVIDER_LOADED = True
+    logger.info("Loaded NIXL UCX provider: %s", provider)
+
+
+def _rank_nixl_devices() -> str | None:
+    """Return the RDMA device list scoped to this worker's local GPU.
+
+    NIXL creates one UCX backend per process.  ``VLLM_NIXL_DEVICE_MAPPING``
+    maps a local GPU index to the preferred NIC connected to that GPU.  The
+    launch environment must still expose every locally reachable RoCE device
+    to UCX: NICs can live on different subnets, and UCX needs a matching device
+    when a peer advertises an address from another subnet.  NIXL 0.10 expects
+    an explicit UCX device spec including the port.
+    """
+    mapping = os.getenv("VLLM_NIXL_DEVICE_MAPPING", "").strip()
+    if not mapping:
+        return None
+    by_gpu: dict[int, list[str]] = {}
+    for entry in mapping.split(";"):
+        if not entry.strip():
+            continue
+        gpu_text, sep, names_text = entry.partition(":")
+        if not sep:
+            raise ValueError(f"Malformed VLLM_NIXL_DEVICE_MAPPING entry: {entry!r}")
+        names = [name.strip() for name in names_text.split(",") if name.strip()]
+        if not names:
+            raise ValueError(
+                f"No RDMA device in VLLM_NIXL_DEVICE_MAPPING entry: {entry!r}"
+            )
+        by_gpu[int(gpu_text)] = [
+            name if ":" in name else f"{name}:1" for name in names
+        ]
+    index = torch.cuda.current_device()
+    if index not in by_gpu:
+        raise RuntimeError(
+            f"VLLM_NIXL_DEVICE_MAPPING covers GPUs {sorted(by_gpu)}, but this "
+            f"rank runs on local GPU {index}: {mapping!r}"
+        )
+    devices = ",".join(by_gpu[index])
+    logger.info("NIXL on local GPU %d uses RDMA device(s) %s", index, devices)
+    return devices
+
 
 def byte_compatible_kv_layouts(
     local_layout: str,
@@ -206,6 +276,8 @@ class NixlConnectorWorker:
             "backends", ["UCX"]
         )
         non_ucx_backends = [b for b in self.nixl_backends if b != "UCX"]
+        if "UCX" in self.nixl_backends:
+            _load_nixl_ucx_provider()
         # Configure NIXL num_threads to avoid UAR exhaustion on Mellanox NICs.
         # Each UCX thread allocates UARs (doorbell pages) via DevX, and
         # excessive NIXL UAR usage can exhaust NIC UAR space. This can cause
@@ -221,6 +293,7 @@ class NixlConnectorWorker:
         self._nixl_polling = not enable_prog_thread
         if not enable_prog_thread and num_threads:
             raise ValueError("Polling NIXL requires num_threads=0")
+        device_list = _rank_nixl_devices()
         if nixl_agent_config is None:
             config = None
         else:
@@ -232,11 +305,18 @@ class NixlConnectorWorker:
             )
             if nixl_thread_sync_t is not None and not enable_prog_thread:
                 ucx_kwargs["sync_mode"] = nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT
-            config = (
-                nixl_agent_config(backends=self.nixl_backends, capture_telemetry=True)
-                if len(non_ucx_backends) > 0
-                else nixl_agent_config(**ucx_kwargs)
-            )
+            if device_list is not None:
+                # Create UCX ourselves so this rank can identify its preferred
+                # NIC.  Other backends are added after the agent starts.
+                config = nixl_agent_config(backends=[], **ucx_kwargs)
+            else:
+                config = (
+                    nixl_agent_config(
+                        backends=self.nixl_backends, capture_telemetry=True
+                    )
+                    if len(non_ucx_backends) > 0
+                    else nixl_agent_config(**ucx_kwargs)
+                )
         logger.info(
             "NIXL progress mode: background=%s num_threads=%s sync=%s",
             enable_prog_thread,
@@ -279,6 +359,10 @@ class NixlConnectorWorker:
             self.nixl_memory_type = "DRAM"
 
         self.nixl_wrapper = nixl_wrapper_cls(str(uuid.uuid4()), config)
+        if device_list is not None:
+            self.nixl_wrapper.create_backend("UCX", {"ucx_devices": device_list})
+            for backend in non_ucx_backends:
+                self.nixl_wrapper.create_backend(backend, {})
         # Map of engine_id -> [remote_agent0, remote_agent1, ...]
         self._remote_agents: dict[EngineId, list[str]] = {}
         # Local dlist layout (tuple of regions) -> prepped handle.  Shared by

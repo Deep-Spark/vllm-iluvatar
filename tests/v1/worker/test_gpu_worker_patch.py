@@ -323,6 +323,82 @@ def test_eager_pp_allocator_limit(
     assert seen == [expected]
 
 
+@pytest.mark.parametrize(
+    ("override", "expected", "fails"),
+    [
+        pytest.param({}, 21, False, id="w4a8-dspark"),
+        pytest.param({}, 21, True, id="load-error"),
+        pytest.param({"method": None}, 20, False, id="no-speculation"),
+        pytest.param({"method": "mtp"}, 20, False, id="other-speculator"),
+        pytest.param({"quantization": "deepseek_v41_fp8"}, 20, False, id="fp8"),
+        pytest.param({"model_type": "other"}, 20, False, id="other-model"),
+        pytest.param({"runner_v2": False}, 20, False, id="v1-runner"),
+        pytest.param({"ivcore11": False}, 20, False, id="other-device"),
+        pytest.param({"backend": "cudaMallocAsync"}, 20, False, id="async-allocator"),
+    ],
+)
+def test_dspark_allocator_limit_is_local_to_load(
+    _stub_gpu_worker, monkeypatch, override, expected, fails
+):
+    worker = _make_worker(SimpleNamespace(model_state=SimpleNamespace()))
+    gpu_worker = sys.modules["vllm_iluvatar.v1.worker.gpu_worker"]
+    settings = {
+        "runner_v2": True,
+        "method": "dspark",
+        "quantization": "compressed-tensors",
+        "model_type": "deepseek_v41",
+        "ivcore11": True,
+        "backend": "native",
+    }
+    settings.update(override)
+    method = settings["method"]
+    speculative = (
+        None
+        if method is None
+        else SimpleNamespace(use_dspark=lambda: method == "dspark")
+    )
+    monkeypatch.setattr(gpu_worker, "is_ivcore11", lambda: settings["ivcore11"])
+    monkeypatch.setattr(
+        gpu_worker.torch.cuda.memory,
+        "get_allocator_backend",
+        lambda: settings["backend"],
+    )
+    monkeypatch.setitem(
+        sys.modules, "vllm.envs", SimpleNamespace(VLLM_ILU_DP_VOCAB_GROUP_SIZE=0)
+    )
+    base = _stub_gpu_worker.Worker
+    monkeypatch.setattr(
+        base, "_scoped_allocator_max_split", lambda self, limit: limit, raising=False
+    )
+
+    def base_load(self):
+        assert self._scoped_allocator_max_split(20) == expected
+        assert self._scoped_allocator_max_split(32) == 32
+        if fails:
+            raise RuntimeError("load failed")
+        return "loaded"
+
+    monkeypatch.setattr(base, "load_model", base_load, raising=False)
+    worker.vllm_config = SimpleNamespace(
+        use_v2_model_runner=settings["runner_v2"],
+        speculative_config=speculative,
+    )
+    worker.model_config = SimpleNamespace(
+        quantization=settings["quantization"],
+        hf_config=SimpleNamespace(model_type=settings["model_type"]),
+        enforce_eager=False,
+    )
+    worker.parallel_config = SimpleNamespace(pipeline_parallel_size=1)
+
+    assert worker._scoped_allocator_max_split(20) == 20
+    if fails:
+        with pytest.raises(RuntimeError, match="load failed"):
+            worker.load_model()
+    else:
+        assert worker.load_model() == "loaded"
+    assert worker._scoped_allocator_max_split(20) == 20
+
+
 def test_pp_exchange_schema_and_drain(monkeypatch):
     import torch
 

@@ -91,8 +91,13 @@ class IluWorker(Worker):
     def _scoped_allocator_max_split(self, max_split_size_mb: int):
         if (
             max_split_size_mb == 20
-            and self.parallel_config.pipeline_parallel_size > 1
-            and self.model_config.enforce_eager
+            and (
+                (
+                    self.parallel_config.pipeline_parallel_size > 1
+                    and self.model_config.enforce_eager
+                )
+                or getattr(self, "_ilu_w4a8_dspark_loading", False)
+            )
         ):
             max_split_size_mb = 21
         return super()._scoped_allocator_max_split(max_split_size_mb)
@@ -266,7 +271,26 @@ class IluWorker(Worker):
             )
 
     def load_model(self, *args, **kwargs):
-        result = super().load_model(*args, **kwargs)
+        speculative = self.vllm_config.speculative_config
+        # Let the native allocator split its 20 MiB blocks during W4A8
+        # repacking and draft loading. Keep the original limit for profiling.
+        self._ilu_w4a8_dspark_loading = (
+            self.vllm_config.use_v2_model_runner
+            and speculative is not None
+            and speculative.use_dspark()
+            and self.model_config.quantization == "compressed-tensors"
+            and self.model_config.hf_config.model_type == "deepseek_v41"
+            and is_ivcore11()
+            and torch.cuda.memory.get_allocator_backend() == "native"
+        )
+        if self._ilu_w4a8_dspark_loading:
+            logger.info(
+                "Using allocator split limit of 21 MiB for W4A8 DSpark model loading"
+            )
+        try:
+            result = super().load_model(*args, **kwargs)
+        finally:
+            self._ilu_w4a8_dspark_loading = False
         configure = (
             getattr(self.model_runner.model_state, "configure_prefix_reuse", None)
             if self.vllm_config.use_v2_model_runner

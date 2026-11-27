@@ -330,19 +330,11 @@ def slice_indexer_prefill_chunk(
     sub_cu_q_cpu = [
         min(max(cu_q_cpu[b] - rel_s, 0), sub_m) for b in range(b_lo, b_hi + 1)
     ]
-    sub_max_q = max(
-        sub_cu_q_cpu[i + 1] - sub_cu_q_cpu[i] for i in range(sub_num_reqs)
-    )
-    if (
-        b_lo == 0
-        and rel_s == 0
-        and cu_q_cpu[b_hi] == sub_m
-    ):
+    sub_max_q = max(sub_cu_q_cpu[i + 1] - sub_cu_q_cpu[i] for i in range(sub_num_reqs))
+    if b_lo == 0 and rel_s == 0 and cu_q_cpu[b_hi] == sub_m:
         sub_cu_q = chunk.cu_seqlens_q[: b_hi + 1]
     else:
-        sub_cu_q = (chunk.cu_seqlens_q[b_lo : b_hi + 1] - rel_s).clamp_(
-            0, sub_m
-        )
+        sub_cu_q = (chunk.cu_seqlens_q[b_lo : b_hi + 1] - rel_s).clamp_(0, sub_m)
 
     if b_lo == 0 and b_hi == chunk.num_reqs:
         sub_cu_kv = chunk.cu_seq_lens
@@ -363,8 +355,7 @@ def slice_indexer_prefill_chunk(
             sub_cu_kv = chunk.cu_seq_lens[: b_hi + 1]
         else:
             sub_cu_kv = (
-                chunk.cu_seq_lens[b_lo : b_hi + 1]
-                - chunk.cu_seq_lens[b_lo : b_lo + 1]
+                chunk.cu_seq_lens[b_lo : b_hi + 1] - chunk.cu_seq_lens[b_lo : b_lo + 1]
             )
         sub_bt = chunk.block_table[b_lo:b_hi]
         sub_max_ctx = max(sub_seq_comp_cpu) if sub_seq_comp_cpu else 0

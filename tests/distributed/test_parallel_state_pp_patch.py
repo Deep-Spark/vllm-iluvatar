@@ -304,9 +304,7 @@ class TestIrecvTensorDict:
             delegate_called.append(True)
             return {"hidden": FakeTensor(4)}, ["async_handle"], []
 
-        tensor_dict, handles, postprocess = impl._make_irecv_tensor_dict(
-            orig_irecv
-        )(gc)
+        tensor_dict, handles, postprocess = impl._make_irecv_tensor_dict(orig_irecv)(gc)
 
         assert delegate_called
         assert "hidden" in tensor_dict

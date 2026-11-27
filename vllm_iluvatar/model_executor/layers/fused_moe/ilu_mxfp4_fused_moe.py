@@ -635,12 +635,8 @@ def _ilu_mxfp4_fused_experts_ixformer(
     )
     if prequant is not None:
         q_fp8, q_scale = prequant
-        a1_fp8_i8 = torch.empty(
-            (M, H), dtype=torch.int8, device=hidden_states.device
-        )
-        a1_scale = torch.empty(
-            (M,), dtype=torch.float32, device=hidden_states.device
-        )
+        a1_fp8_i8 = torch.empty((M, H), dtype=torch.int8, device=hidden_states.device)
+        a1_scale = torch.empty((M,), dtype=torch.float32, device=hidden_states.device)
         ixfops.moe_expand_input_ep(
             q_fp8.view(torch.int8),
             src_to_dst,

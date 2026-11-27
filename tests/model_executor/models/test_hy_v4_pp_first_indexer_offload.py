@@ -32,7 +32,29 @@ from vllm_iluvatar.v1.attention.backends.mla.ilu_indexer import (
 
 
 def _make_hy4_78_layer_config() -> SimpleNamespace:
-    full_layers = {0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49, 53, 57, 61, 65, 69, 73, 77}
+    full_layers = {
+        0,
+        1,
+        5,
+        9,
+        13,
+        17,
+        21,
+        25,
+        29,
+        33,
+        37,
+        41,
+        45,
+        49,
+        53,
+        57,
+        61,
+        65,
+        69,
+        73,
+        77,
+    }
     indexer_types = ["full" if i in full_layers else "shared" for i in range(78)]
     return SimpleNamespace(
         num_hidden_layers=78,
@@ -68,9 +90,7 @@ def test_compute_pp_first_indexer_offload_hops_hy4_pp16(monkeypatch):
         }
         assert _compute_pp_first_indexer_offload_hops(cfg, cache_cfg, 1) == set()
         assert (
-            _compute_pp_first_indexer_offload_hops(
-                cfg, cache_cfg, 16, pcp_size=2
-            )
+            _compute_pp_first_indexer_offload_hops(cfg, cache_cfg, 16, pcp_size=2)
             == set()
         )
         assert (
@@ -198,8 +218,6 @@ def test_gpu_first_indexer_offload_bitwise_exact(
 ):
     import ixformer.inference.functions as ixfops
     from vllm.config import (
-        CacheConfig,
-        SchedulerConfig,
         VllmConfig,
         set_current_vllm_config,
     )
@@ -207,10 +225,6 @@ def test_gpu_first_indexer_offload_bitwise_exact(
     from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 
     from vllm_iluvatar.models.hy_v4.attention import build_hy4_ropes
-    from vllm_iluvatar.models.hy_v4.model import (
-        _quant_pp_act,
-        _run_ihc_pre_fp8_boundary_and_norm_impl,
-    )
 
     monkeypatch.setenv("VLLM_ILU_HYV4_FUSE_QA_NORM_QUANT", "1")
     monkeypatch.setenv("VLLM_ILU_HYV4_FUSE_INDEXER_K", "1")
@@ -267,7 +281,11 @@ def test_gpu_first_indexer_offload_bitwise_exact(
 
     # Seed existing prefix KV cache identically across reference, sender, receiver.
     base_kv_cache = torch.randint(
-        0, 256, (total_blocks, block_size, head_dim + 4), dtype=torch.uint8, device=device
+        0,
+        256,
+        (total_blocks, block_size, head_dim + 4),
+        dtype=torch.uint8,
+        device=device,
     )
     kv_ref = base_kv_cache.clone()
     kv_sender = base_kv_cache.clone()
@@ -292,11 +310,20 @@ def test_gpu_first_indexer_offload_bitwise_exact(
         qa_norm = RMSNorm(q_lora_rank, eps=1e-6).to(device=device, dtype=dtype)
         k_norm = LayerNorm(head_dim, eps=1e-6).to(device=device, dtype=torch.float32)
 
-    w_qkv = (torch.randn(q_lora_rank + kv_lora_and_rope, hidden_size, device=device, dtype=dtype) * 0.02)
+    w_qkv = (
+        torch.randn(
+            q_lora_rank + kv_lora_and_rope, hidden_size, device=device, dtype=dtype
+        )
+        * 0.02
+    )
     w_qkv_fp8, w_qkv_s = ixfops.fp8_per_token_dynamic_scaled(w_qkv)
-    w_wq_b = (torch.randn(n_head * head_dim, q_lora_rank, device=device, dtype=dtype) * 0.02)
+    w_wq_b = (
+        torch.randn(n_head * head_dim, q_lora_rank, device=device, dtype=dtype) * 0.02
+    )
     w_wq_b_fp8, w_wq_b_s = ixfops.fp8_per_token_dynamic_scaled(w_wq_b)
-    w_wk = (torch.randn(head_dim + n_head, hidden_size, device=device, dtype=dtype) * 0.02)
+    w_wk = (
+        torch.randn(head_dim + n_head, hidden_size, device=device, dtype=dtype) * 0.02
+    )
     w_wk_fp8, w_wk_s = ixfops.fp8_per_token_dynamic_scaled(w_wk)
 
     def _make_fp8_linear(w_fp8: torch.Tensor, w_s: torch.Tensor):
@@ -379,7 +406,9 @@ def test_gpu_first_indexer_offload_bitwise_exact(
     fused_qkv_fn = _make_fp8_linear(w_qkv_fp8, w_qkv_s)
 
     # 1. Reference unsplit run on Rank 2k.
-    topk_ref = torch.full((total_tokens, topk_tokens), -7, dtype=torch.int32, device=device)
+    topk_ref = torch.full(
+        (total_tokens, topk_tokens), -7, dtype=torch.int32, device=device
+    )
     idx_ref = _make_indexer_stub(kv_ref, topk_ref, "layer9.k_cache")
     with set_forward_context({"layer9.k_cache": md}, vllm_cfg):
         register_activation_prequant(normed, normed_fp8, normed_s)
@@ -438,11 +467,13 @@ def test_gpu_first_indexer_offload_bitwise_exact(
         idx_recv._offload_recv_wire = None
         clear_activation_prequant()
 
-    assert torch.equal(kv_sender, kv_ref), "Sender mirrored K-cache diverged from reference"
+    assert torch.equal(kv_sender, kv_ref), (
+        "Sender mirrored K-cache diverged from reference"
+    )
     assert torch.equal(kv_recv, kv_ref), "Receiver K-cache diverged from reference"
-    assert torch.equal(
-        topk_recv, topk_ref
-    ), "Offloaded + local topk_indices diverged from unsplit reference"
+    assert torch.equal(topk_recv, topk_ref), (
+        "Offloaded + local topk_indices diverged from unsplit reference"
+    )
 
 
 @pytest.mark.parametrize("topk_cols", [0, 1024, 2048])
@@ -511,4 +542,3 @@ def test_pp_boundary_single_tensor_pack_unpack_roundtrip(
         assert torch.equal(tk_dst, tk_src)
     else:
         assert tk_dst is None
-

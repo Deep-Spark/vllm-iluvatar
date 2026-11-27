@@ -49,9 +49,7 @@ logger = init_logger(__name__)
 
 _HYV4_DSA_FP8_ROW_BYTES = 640
 _HYV4_DSA_FP8_E4M3_MAX = 448.0
-_HYV4_FUSE_MLA_REMAP = (
-    os.environ.get("VLLM_ILU_HYV4_FUSE_MLA_REMAP", "1") != "0"
-)
+_HYV4_FUSE_MLA_REMAP = os.environ.get("VLLM_ILU_HYV4_FUSE_MLA_REMAP", "1") != "0"
 
 
 class HYV4FlashMLASparseImpl(IluFlashMLASparseImpl):

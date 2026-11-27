@@ -61,6 +61,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+
 from vllm_iluvatar.envs import _ILU_CANONICAL_ONLY_ENV_VARS
 
 from .attention import (
@@ -515,9 +516,7 @@ class HYV4DecoderLayer(nn.Module):
                 hidden_states = self.mlp(hidden_states)
             finally:
                 clear_activation_prequant()
-            hidden_states = _ihc_post_fp8io(
-                hidden_states, q_bytes, scale, post_gates
-            )
+            hidden_states = _ihc_post_fp8io(hidden_states, q_bytes, scale, post_gates)
         else:
             try:
                 hidden_states, post_gates, residual = self._run_ihc_pre_and_norm(
@@ -1174,9 +1173,7 @@ class HYV4Model(nn.Module):
         tensors = {}
         for key in self._pp_intermediate_keys:
             buf_dtype = (
-                torch.uint8
-                if _pp_act_fp8_fused() and key == "hidden_states"
-                else dtype
+                torch.uint8 if _pp_act_fp8_fused() and key == "hidden_states" else dtype
             )
             tensors[key] = torch.zeros(
                 (batch_size, self._pp_intermediate_hidden),
@@ -1230,7 +1227,9 @@ class HYV4Model(nn.Module):
                 hidden_states = _dequant_pp_act(q, scale)
             residual = None
             if self.recv_topk:
-                assert unpacked_topk is not None and self.topk_indices_buffer is not None
+                assert (
+                    unpacked_topk is not None and self.topk_indices_buffer is not None
+                )
                 self.topk_indices_buffer[: unpacked_topk.shape[0]].copy_(unpacked_topk)
                 if self.topk_index_cache is not None:
                     self.topk_index_cache.clear()
@@ -1359,10 +1358,7 @@ class HYV4Model(nn.Module):
                     )
             else:
                 num_tokens = hidden_states.shape[0]
-                if self.enable_ihc:
-                    flat = hidden_states.flatten(1)
-                else:
-                    flat = hidden_states
+                flat = hidden_states.flatten(1) if self.enable_ihc else hidden_states
                 if _pp_act_fp8_fused():
                     q, scale = _quant_pp_act(flat)
                     pp_hidden = q
@@ -1402,9 +1398,7 @@ class HYV4Model(nn.Module):
                 if stage_timer_active:
                     torch.cuda.synchronize()
                     offload_ms = (time.perf_counter() - t_off) * 1e3
-            self._maybe_log_stage_timer(
-                layer_ms, offload_ms, active=stage_timer_active
-            )
+            self._maybe_log_stage_timer(layer_ms, offload_ms, active=stage_timer_active)
             return IntermediateTensors(tensors)
         self._maybe_log_stage_timer(layer_ms, offload_ms, active=stage_timer_active)
         if self.enable_ihc:

@@ -580,9 +580,7 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_HYV4_PP_OFFLOAD_MIN_HALF_TOKENS": _int_reader(
         "VLLM_ILU_HYV4_PP_OFFLOAD_MIN_HALF_TOKENS", 88, minimum=0
     ),
-    "VLLM_ILU_HYV4_PP_PACK_TENSORS": _bool_reader(
-        "VLLM_ILU_HYV4_PP_PACK_TENSORS", "1"
-    ),
+    "VLLM_ILU_HYV4_PP_PACK_TENSORS": _bool_reader("VLLM_ILU_HYV4_PP_PACK_TENSORS", "1"),
     # HY V4 PP boundary FP8 activation (lossy bandwidth trade; opt-in).
     # Prefer VLLM_ILU_HYV4_PP_ACT_FP8; VLLM_ILU_PP_ACT_FP8_FUSED is legacy.
     "VLLM_ILU_HYV4_PP_ACT_FP8": _bool_reader_names(
@@ -782,9 +780,7 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # operations because asynchronous operations were unreliable. Keep that
     # production-safe behavior by default; an explicit 0 enables the upstream
     # async path for validated experiments.
-    "VLLM_ILU_PP_SYNC_SENDRECV": _bool_reader(
-        "VLLM_ILU_PP_SYNC_SENDRECV", "1"
-    ),
+    "VLLM_ILU_PP_SYNC_SENDRECV": _bool_reader("VLLM_ILU_PP_SYNC_SENDRECV", "1"),
     # Selects the ilu_mxfp4_fused_experts compute backend. Defaults to "ixmm";
     # "auto" -> ixmm when available else torch; "torch" forces the pure-torch
     # fallback; "ixformer_native" is the correctness-only native kernel.

@@ -25,6 +25,10 @@ class BlockFp8LoadSpec:
     block_shape: tuple[int, int]
     tp_size: int = 1
     tp_rank: int = 0
+    runtime_intermediate: int | None = None
+    w13_k_padded: int | None = None
+    w2_n_padded: int | None = None
+    w2_k_padded: int | None = None
 
 
 class BlockFp8WeightLoader(PairedMoEWeightLoader):
@@ -54,6 +58,14 @@ class BlockFp8WeightLoader(PairedMoEWeightLoader):
             or not 0 <= c.tp_rank < c.tp_size
             or c.hidden % 32
             or c.intermediate % 32
+            or self.w13_half_n < c.intermediate
+            or self.w13_k < c.hidden
+            or self.w2_n < c.hidden
+            or self.w2_k < self.w13_half_n
+            or any(
+                value % 32
+                for value in (self.w13_half_n, self.w13_k, self.w2_n, self.w2_k)
+            )
         ):
             raise ValueError(f"Invalid {self.source_name} load geometry")
         self._layer = self._pending = self._upload_buffer = self._load_session = None
@@ -87,10 +99,39 @@ class BlockFp8WeightLoader(PairedMoEWeightLoader):
         return n, k, bn, bk
 
     @property
+    def w13_half_n(self):
+        c = self.load_spec
+        return (
+            c.intermediate if c.runtime_intermediate is None else c.runtime_intermediate
+        )
+
+    @property
+    def w13_k(self):
+        c = self.load_spec
+        return c.hidden if c.w13_k_padded is None else c.w13_k_padded
+
+    @property
+    def w2_n(self):
+        c = self.load_spec
+        return c.hidden if c.w2_n_padded is None else c.w2_n_padded
+
+    @property
+    def w2_k(self):
+        k = self.load_spec.w2_k_padded
+        return self.w13_half_n if k is None else k
+
+    def _runtime_geometry(self, group):
+        _, _, bn, bk = self._local_geometry(group)
+        n, k = (
+            (self.w13_half_n, self.w13_k) if group == "w13" else (self.w2_n, self.w2_k)
+        )
+        return n, k, bn, bk
+
+    @property
     def staging_bytes(self):
         return max(
             n * k + 4 * ((n + bn - 1) // bn) * ((k + bk - 1) // bk)
-            for n, k, bn, bk in (self._local_geometry(g) for g in ("w13", "w2"))
+            for n, k, bn, bk in (self._runtime_geometry(g) for g in ("w13", "w2"))
         )
 
     def validate_source_metadata(self, group, is_scale, shape, dtype):
@@ -172,15 +213,24 @@ class BlockFp8WeightLoader(PairedMoEWeightLoader):
             raise ValueError(
                 f"{self.source_name} paired reader must supply CPU tensors"
             )
-        n, k, bn, bk = self._local_geometry(group)
-        nw, ns = n * k, 4 * ((n + bn - 1) // bn) * ((k + bk - 1) // bk)
+        n, k, bn, bk = self._runtime_geometry(group)
+        scale_shape = ((n + bn - 1) // bn, (k + bk - 1) // bk)
+        nw, ns = n * k, 4 * scale_shape[0] * scale_shape[1]
         try:
             value = self._slice(tensor, group, is_scale)
             slot.owner = owner
             if is_scale:
-                slot.host[nw : nw + ns].view(torch.float32).view_as(value).copy_(value)
+                staged = slot.host[nw : nw + ns].view(torch.float32).view(scale_shape)
             else:
-                slot.host[:nw].view(torch.float8_e4m3fn).view_as(value).copy_(value)
+                staged = slot.host[:nw].view(torch.float8_e4m3fn).view(n, k)
+            if staged.shape != value.shape:
+                if is_scale:
+                    # Retain the original scale of any partially padded block.
+                    staged.fill_(1)
+                else:
+                    staged.zero_()
+                staged = staged[: value.shape[0], : value.shape[1]]
+            staged.copy_(value)
             if self._pending is None:
                 self._pending = (key, is_scale)
                 return True

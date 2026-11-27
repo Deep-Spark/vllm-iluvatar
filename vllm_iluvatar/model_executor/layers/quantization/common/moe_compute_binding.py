@@ -102,6 +102,47 @@ def decode_skip_sort(layer) -> bool:
     )
 
 
+def pad_online_w4a8_config(config, unpadded, selection):
+    """Compute the selected W4A8 runtime layout for a streaming checkpoint."""
+    if selection.name == "ixmm_w4a8":
+        from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_ixmm_w4a8 import (
+            IxMMW4A8Backend,
+        )
+
+        return IxMMW4A8Backend.padded_config(config)
+    if selection.name != "ixinfer_w4a8":
+        return config
+
+    from dataclasses import replace
+
+    from vllm_iluvatar.model_executor.layers.quantization.compressed_tensors.ilu_utils import (
+        W4A8GroupGemmInfo,
+    )
+
+    logical_width = config.intermediate if unpadded is None else unpadded
+    layout = selection.layout
+    w13 = W4A8GroupGemmInfo(layout, config.hidden, 2 * logical_width)
+    if layout == "TN":
+        # Pad the two gate/up halves equally when the fused N needs alignment.
+        w2 = W4A8GroupGemmInfo(layout, logical_width, config.hidden)
+        return replace(
+            config,
+            intermediate=w13.pad_n // 2,
+            w2_k_padded=w2.pad_k,
+            w13_k_padded=w13.pad_k,
+            w2_n_padded=w2.pad_n,
+        )
+
+    # A 64-aligned W2 K also aligns the fused W13 N (2 * K) to 128.
+    w2 = W4A8GroupGemmInfo(layout, config.intermediate, config.hidden)
+    return replace(
+        config,
+        intermediate=w2.pad_k,
+        w13_k_padded=w13.pad_k,
+        w2_n_padded=w2.pad_n,
+    )
+
+
 class MoEComputeBindingMixin:
     """Select a backend, bind the converted weights, run them."""
 

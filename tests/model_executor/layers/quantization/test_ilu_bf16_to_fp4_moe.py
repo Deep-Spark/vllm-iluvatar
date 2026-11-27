@@ -145,10 +145,15 @@ def test_example_config_builds_the_method():
 
 
 def test_compute_config_forwards_swigluoai_clamp():
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+        MoEComputeSelection,
+    )
+
     layer = _StubRoutedExperts(1, 0, {e: e for e in range(NUM_EXPERTS)})
     method = IluFp16ToFp4OnlineMoEMethod.from_ilu_runtime_config(
         _context(_moe_group(), layer)
     )
+    method.selection = MoEComputeSelection("ixmm_fp4fp8", "fp4fp8", "ivcore30")
     cfg = method._compute_config(layer)
     assert cfg.activation == "swigluoai_uninterleave"
     assert cfg.limit == 7.0

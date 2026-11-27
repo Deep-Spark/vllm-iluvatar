@@ -216,3 +216,98 @@ def test_the_post_conversion_lifecycle_comes_from_the_mixin():
         assert getattr(IluModelOptNvFp4MoEMethod, name) is getattr(
             MoEComputeBindingMixin, name
         )
+
+
+@pytest.mark.parametrize("layout,half,down_k", [("TN", 288, 384), ("NN", 320, 320)])
+def test_nvfp4_modelopt_conversion_pads_each_half(layout, half, down_k):
+    from types import SimpleNamespace
+
+    from ixformer.inference import functions as ops
+
+    from vllm_iluvatar.ilu_util.arch import cuda_arch
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+        select_moe_backend,
+    )
+    from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.nvfp4_moe import (
+        IluModelOptNvFp4MoEMethod,
+    )
+
+    if not torch.cuda.is_available() or cuda_arch() != "ivcore11":
+        pytest.skip("BI150 W4A8 required")
+    hidden, intermediate, experts = 608, 288, 2
+    method = object.__new__(IluModelOptNvFp4MoEMethod)
+    method.selection = select_moe_backend(
+        "ivcore11", name="ixinfer_w4a8", layout=layout
+    )
+    method._compute = None
+    method.validate_checkpoint = method.stage_on_cpu = False
+    method.expert_chunk_size = 1
+    layer = torch.nn.Module()
+    layer.moe_config = SimpleNamespace(
+        hidden_dim=hidden,
+        intermediate_size_per_partition=intermediate,
+        intermediate_size_per_partition_unpadded=intermediate,
+        ep_rank=0,
+    )
+    layer.local_num_experts = layer.global_num_experts = experts
+    layer.activation = "silu"
+    layer.apply_router_weight_on_input = False
+    result = {}
+    for group, n, k in (
+        ("w13", 2 * intermediate, hidden),
+        ("w2", hidden, intermediate),
+    ):
+        raw = torch.randint(256, (experts, n, k // 2), device="cuda", dtype=torch.uint8)
+        scales = torch.full((experts, n, k // 16), 0.5, device="cuda").to(
+            torch.float8_e4m3fn
+        )
+        globals_ = torch.full(
+            (experts, 2) if group == "w13" else (experts,), 0.25, device="cuda"
+        )
+        for suffix, tensor in (
+            ("_weight", raw),
+            ("_weight_scale", scales),
+            ("_weight_scale_2", globals_),
+        ):
+            layer.register_parameter(
+                group + suffix, torch.nn.Parameter(tensor, requires_grad=False)
+            )
+        result[group] = nvfp4_source_as_block_fp8(raw, scales)
+    method.process_weights_after_loading(layer)
+    compute = method._compute
+    assert (compute.intermediate, compute.config.w2_k) == (half, down_k)
+
+    for group, (values, scales) in result.items():
+        halves = 2 if group == "w13" else 1
+        n = 2 * half if group == "w13" else compute.config.w2_n
+        k = compute.config.w13_k if group == "w13" else down_k
+        packed = getattr(layer, group + "_weight")
+        channels = getattr(layer, group + "_weight_scale")
+        for e in range(experts):
+            expected_values = torch.zeros((n, k), device="cuda", dtype=values.dtype)
+            expected_scales = torch.zeros((n, k // 16), device="cuda")
+            for dst_v, src_v, dst_s, src_s in zip(
+                expected_values.chunk(halves),
+                values[e].chunk(halves),
+                expected_scales.chunk(halves),
+                scales[e].chunk(halves),
+                strict=True,
+            ):
+                dst_v[: src_v.shape[0], : src_v.shape[1]].copy_(src_v)
+                dst_s[: src_s.shape[0], : src_s.shape[1]].copy_(src_s)
+            expected_packed, expected_channels = (
+                torch.empty_like(packed[e]),
+                torch.empty_like(channels[e]),
+            )
+            ops.fp8_block_to_w4a8(
+                expected_values,
+                expected_scales,
+                expected_packed,
+                expected_channels,
+                block_shape=(1, 16),
+                weight_format="ixinfer_" + layout.lower(),
+            )
+            torch.testing.assert_close(packed[e], expected_packed, rtol=0, atol=0)
+            torch.testing.assert_close(
+                channels[e], expected_channels * 0.25, rtol=0, atol=0
+            )

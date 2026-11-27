@@ -54,7 +54,9 @@ class IluMxFp8MoEMethod(IluFp8MoEMethod):
         self._checkpoint_loader = self._compute = self._runtime_weights = None
         self.supports_pre_processed_weights = False
 
-    def _make_loader(self, weight_spec, num_experts, hidden_size, intermediate):
+    def _make_loader(
+        self, weight_spec, num_experts, hidden_size, intermediate, compute
+    ):
         from vllm_iluvatar.model_executor.layers.quantization.common.block_fp8_loader import (
             BlockFp8LoadSpec,
         )
@@ -72,6 +74,10 @@ class IluMxFp8MoEMethod(IluFp8MoEMethod):
                 MXFP8_BLOCK_SHAPE,
                 self.moe.tp_size,
                 self.moe.tp_rank,
+                runtime_intermediate=compute.intermediate,
+                w13_k_padded=compute.w13_k_padded,
+                w2_n_padded=compute.w2_n_padded,
+                w2_k_padded=compute.w2_k_padded,
             ),
         )
 

@@ -198,11 +198,10 @@ class Mxfp4WeightLoader(PairedMoEWeightLoader, ABC):
 
 
 class Mxfp4ToW4A8Loader(Mxfp4WeightLoader):
+    source_alignment = 32
+
     def __init__(self, weight_spec, load_spec, weight_format):
         self.weight_format = weight_format
-        # IxInfer consumes 32-value source blocks and checks runtime geometry
-        # separately. Preserve the stricter source contract for IxMM W4A8.
-        self.source_alignment = 256 if weight_format == "ixmm_nn" else 32
         super().__init__(weight_spec, load_spec)
 
     def convert_shard(self, weight, scale, target, target_scale):

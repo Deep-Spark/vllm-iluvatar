@@ -187,7 +187,8 @@ def test_w4a8_runtime_weight_contract(backend, layout, source):
 
 
 @pytest.mark.parametrize("layout", ["TN", "NN"])
-def test_mxfp4_w4a8_hidden_padding_and_graph_replay(monkeypatch, layout):
+@pytest.mark.parametrize("source", ["MXFP4", "block-FP8", "MXFP8"])
+def test_ixinfer_online_padding_and_graph_replay(monkeypatch, layout, source):
     if cuda_arch() != "ivcore11":
         pytest.skip("BI150 TN/NN v2 required")
 
@@ -198,15 +199,21 @@ def test_mxfp4_w4a8_hidden_padding_and_graph_replay(monkeypatch, layout):
         MoEComputeConfig,
         make_moe_compute,
     )
+    from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe import (
+        IluFp8MoEMethod,
+    )
     from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp4_moe import (
         IluMxfp4MoEMethod,
+    )
+    from vllm_iluvatar.model_executor.layers.quantization.backends.mxfp8.moe import (
+        IluMxFp8MoEMethod,
     )
     from vllm_iluvatar.model_executor.layers.quantization.common.moe_compute_binding import (
         MoEComputeBindingMixin,
     )
 
     torch.manual_seed(61)
-    hidden, intermediate, experts = 608, 256, 2
+    hidden, intermediate, experts = 608, 288, 2
     config = MoEComputeConfig(hidden, intermediate, experts, experts)
     monkeypatch.setattr(MoEComputeBindingMixin, "_compute_config", lambda *_: config)
     selection = select_moe_backend("ivcore11", name="ixinfer_w4a8", layout=layout)
@@ -216,13 +223,23 @@ def test_mxfp4_w4a8_hidden_padding_and_graph_replay(monkeypatch, layout):
         hidden_dim_unpadded=hidden,
         has_bias=False,
         is_act_and_mul=True,
-        tp_size=1,
-        tp_rank=0,
+        tp_size=2,
+        tp_rank=1,
         max_capture_size=16,
     )
     layer.expert_map = None
     layer._map_global_expert_id_to_local_expert_id = lambda index: index
-    method = IluMxfp4MoEMethod(layer.moe_config, selection)
+    if source == "MXFP4":
+        method = IluMxfp4MoEMethod(layer.moe_config, selection)
+    elif source == "MXFP8":
+        method = IluMxFp8MoEMethod(None, layer.moe_config)
+        method.selection = selection
+    else:
+        method = object.__new__(IluFp8MoEMethod)
+        method.moe = layer.moe_config
+        method.weight_block_size = (128, 128)
+        method._checkpoint_loader = None
+        method.selection = selection
     with torch.device("cuda"):
         method.create_weights(layer, experts, hidden, intermediate, torch.bfloat16)
     loader = method._checkpoint_loader
@@ -231,6 +248,10 @@ def test_mxfp4_w4a8_hidden_padding_and_graph_replay(monkeypatch, layout):
     w13_k, w2_n = 640, (640 if layout == "NN" else hidden)
     assert compute.config.w13_k == w13_k
     assert compute.config.w2_n == w2_n
+    runtime_i = 320 if layout == "NN" else intermediate
+    w2_k = 320 if layout == "NN" else 384
+    assert compute.intermediate == runtime_i
+    assert compute.config.w2_k == w2_k
     loader.bind_upload_buffer(
         ExpertUploadBuffer(loader.staging_bytes, layer.w2_weight.device)
     )
@@ -240,33 +261,84 @@ def test_mxfp4_w4a8_hidden_padding_and_graph_replay(monkeypatch, layout):
 
     for expert in range(experts):
         expected_w13, expected_w13_scale = [], []
-        for shard, n, k in (
-            ("w1", intermediate, hidden),
-            ("w3", intermediate, hidden),
-            ("w2", hidden, intermediate),
-        ):
-            raw = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8)
-            scales = torch.full((n, k // 32), 121, dtype=torch.uint8)
+        for shard in ("w1", "w3", "w2"):
             group = "w2" if shard == "w2" else "w13"
+            rows = (
+                slice(intermediate, 2 * intermediate) if group == "w13" else slice(None)
+            )
+            cols = (
+                slice(intermediate, 2 * intermediate) if group == "w2" else slice(None)
+            )
+            ws, ss = (
+                loader.source_shape(group, is_scale) for is_scale in (False, True)
+            )
+            if source == "MXFP4":
+                raw = torch.randint(0, 256, ws, dtype=torch.uint8)
+                scales = torch.randint(119, 124, ss, dtype=torch.uint8)
+                packed_cols = (
+                    slice(intermediate // 2, intermediate)
+                    if group == "w2"
+                    else slice(None)
+                )
+                scale_cols = (
+                    slice(intermediate // 32, intermediate // 16)
+                    if group == "w2"
+                    else slice(None)
+                )
+                codes, channels = mxfp4_channel_int4(
+                    raw[rows, packed_cols], scales[rows, scale_cols]
+                )
+            else:
+                raw = torch.randn(ws).to(torch.float8_e4m3fn)
+                exponents = torch.randint(119, 124, ss, dtype=torch.uint8)
+                block_scales = (exponents.to(torch.int32) << 23).view(torch.float32)
+                scales = block_scales if source == "block-FP8" else exponents
+                bn, bk = (128, 128) if source == "block-FP8" else (1, 32)
+                dense_scales = block_scales.repeat_interleave(bn, 0).repeat_interleave(
+                    bk, 1
+                )
+                dense = (
+                    raw.float()[rows, cols] * dense_scales[: ws[0], : ws[1]][rows, cols]
+                )
+                channels = dense.abs().amax(dim=-1, keepdim=True) / 127
+                channels = torch.where(channels == 0, 1.0, channels)
+                codes = (
+                    ((dense / channels).round().clamp(-127, 127) / 18)
+                    .round()
+                    .clamp(-8, 7)
+                    .to(torch.int8)
+                )
+                channels = channels.T
             for is_scale, tensor in ((False, raw), (True, scales)):
                 assert loader.load_shard(group, is_scale, tensor, shard, expert)
-            codes, channels = mxfp4_channel_int4(raw, scales)
             if shard != "w2":
-                expected_w13.append(torch.nn.functional.pad(codes, (0, w13_k - hidden)))
-                expected_w13_scale.append(channels)
+                expected_w13.append(
+                    torch.nn.functional.pad(
+                        codes, (0, w13_k - hidden, 0, runtime_i - intermediate)
+                    )
+                )
+                expected_w13_scale.append(
+                    torch.nn.functional.pad(
+                        channels, (0, runtime_i - intermediate), value=1.0
+                    )
+                )
                 continue
-            codes = torch.nn.functional.pad(codes, (0, 0, 0, w2_n - hidden))
+            codes = torch.nn.functional.pad(
+                codes, (0, w2_k - intermediate, 0, w2_n - hidden)
+            )
             expected = pack_ixinfer(codes, layout).cuda()
             torch.testing.assert_close(
                 layer.w2_weight[expert], expected, rtol=0, atol=0
             )
             torch.testing.assert_close(
-                layer.w2_weight_scale[expert, :, :hidden], channels.cuda()
+                getattr(layer, "w2_" + loader.scale_parameter_name)[expert, :, :hidden],
+                channels.cuda(),
             )
         expected = pack_ixinfer(torch.cat(expected_w13), layout).cuda()
         torch.testing.assert_close(layer.w13_weight[expert], expected, rtol=0, atol=0)
         torch.testing.assert_close(
-            layer.w13_weight_scale[expert], torch.cat(expected_w13_scale, dim=-1).cuda()
+            getattr(layer, "w13_" + loader.scale_parameter_name)[expert],
+            torch.cat(expected_w13_scale, dim=-1).cuda(),
         )
 
     weights = loader.finalize()
@@ -332,6 +404,163 @@ def test_mxfp4_w4a8_hidden_padding_and_graph_replay(monkeypatch, layout):
         rtol=0,
         atol=0,
     )
+
+
+@pytest.mark.parametrize(
+    "source,activation",
+    [
+        ("MXFP4", "swiglustep"),
+        ("block-FP8", "swiglustep"),
+        ("MXFP8", "swiglustep"),
+        ("MXFP8", "swigluoai_uninterleave"),
+    ],
+)
+def test_ixmm_online_padding_and_activation_graph(source, activation, monkeypatch):
+    from ixformer.inference.ixmm_backend import ixmm_available
+
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+        MoEComputeConfig,
+        make_moe_compute,
+    )
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_ixmm_w4a8 import (
+        IxMMW4A8Backend,
+    )
+    from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe import (
+        IluFp8MoEMethod,
+    )
+    from vllm_iluvatar.model_executor.layers.quantization.backends.mxfp8.moe import (
+        IluMxFp8MoEMethod,
+    )
+    from vllm_iluvatar.model_executor.layers.quantization.common.moe_compute_binding import (
+        MoEComputeBindingMixin,
+    )
+
+    if not ixmm_available():
+        pytest.skip("IxMM bridge required")
+    torch.manual_seed(73)
+    hidden, intermediate, experts = 608, 288, 2
+    config = IxMMW4A8Backend.padded_config(
+        MoEComputeConfig(
+            hidden,
+            intermediate,
+            experts,
+            experts,
+            activation=activation,
+            limit=3.0 if activation == "swiglustep" else 7.0,
+        )
+    )
+    assert (config.w13_k, config.w2_n, config.w2_k) == (640, 640, 320)
+    compute = make_moe_compute(
+        config, MoEComputeSelection("ixmm_w4a8", "NN", cuda_arch())
+    )
+    layer = torch.nn.Module()
+    layer._map_global_expert_id_to_local_expert_id = lambda index: index
+    layer.expert_map = None
+    if source == "MXFP4":
+        loader = make_mxfp4_loader(
+            compute.weight_spec,
+            Mxfp4LoadSpec(
+                experts,
+                hidden,
+                config.intermediate,
+                2,
+                1,
+                intermediate,
+                w13_k_padded=config.w13_k,
+                w2_n_padded=config.w2_n,
+            ),
+        )
+        with torch.device("cuda"):
+            loader.create_weights(layer, {})
+    else:
+        layer.moe_config = SimpleNamespace(
+            intermediate_size_per_partition_unpadded=intermediate,
+            hidden_dim_unpadded=hidden,
+            has_bias=False,
+            is_act_and_mul=True,
+            tp_size=2,
+            tp_rank=1,
+        )
+        # vLLM advertises the padded width, while source tensors remain logical.
+        monkeypatch.setattr(
+            MoEComputeBindingMixin, "_compute_config", lambda *_: config
+        )
+        if source == "MXFP8":
+            method = IluMxFp8MoEMethod(None, layer.moe_config)
+        else:
+            method = object.__new__(IluFp8MoEMethod)
+            method.moe = layer.moe_config
+            method.weight_block_size = (128, 128)
+            method._checkpoint_loader = None
+        method.selection = compute.selection
+        with torch.device("cuda"):
+            method.create_weights(
+                layer, experts, hidden, config.intermediate, torch.bfloat16
+            )
+        loader = method._checkpoint_loader
+        assert loader.source_shape("w2", False) == (hidden, 2 * intermediate)
+    loader.bind_upload_buffer(
+        ExpertUploadBuffer(loader.staging_bytes, layer.w2_weight.device)
+    )
+    for expert in range(experts):
+        for shard in ("w1", "w3", "w2"):
+            group = "w2" if shard == "w2" else "w13"
+            ws = loader.source_shape(group, False)
+            ss = loader.source_shape(group, True)
+            if source == "MXFP4":
+                raw = torch.randint(256, ws, dtype=torch.uint8)
+            else:
+                raw = torch.randn(ws).to(torch.float8_e4m3fn)
+            scale = (
+                torch.full(ss, 120, dtype=torch.uint8)
+                if source != "block-FP8"
+                else torch.full(ss, 0.01, dtype=torch.float32)
+            )
+            assert loader.load_shard(group, False, raw, shard, expert)
+            assert loader.load_shard(group, True, scale, shard, expert)
+    weights = loader.finalize()
+    compute.validate_weights(weights)
+
+    a = (
+        torch.randn(16, 2 * config.intermediate, device="cuda", dtype=torch.bfloat16)
+        * 8
+    )
+    gate, up = a.float().chunk(2, dim=-1)
+    if activation == "swiglustep":
+        expected = torch.nn.functional.silu(gate).clamp(max=3) * up.clamp(-3, 3)
+        q, s = compute._swiglustep_quant(a)
+    else:
+        gate = gate.clamp(max=7)
+        expected = gate * torch.sigmoid(1.702 * gate) * (up.clamp(-7, 7) + 1)
+        q, s = compute._swigluoai_quant(a)
+    tolerance = 2 * expected.abs().amax(dim=-1, keepdim=True) / 127
+    assert torch.all((q.float() * s.reshape(-1, 1) - expected).abs() <= tolerance)
+
+    x = torch.randn(16, hidden, device="cuda", dtype=torch.bfloat16)
+    ids = torch.randint(experts, (16, 2), device="cuda", dtype=torch.int32)
+    scores = torch.full((16, 2), 0.5, device="cuda")
+
+    def run():
+        return compute.run_standard(
+            x,
+            weights,
+            scores,
+            ids,
+            None,
+            workspace=compute.workspace_spec(ids.numel(), x.dtype).allocate(x.device),
+        )
+
+    eager = run()
+    assert eager.shape == x.shape
+    assert eager.isfinite().all()
+    assert eager.abs().max() > 0
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    x.mul_(0.5)
+    ids.copy_((ids + 1) % experts)
+    graph.replay()
+    torch.testing.assert_close(captured, run(), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(

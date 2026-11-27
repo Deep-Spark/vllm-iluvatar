@@ -25,6 +25,7 @@ from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.nvfp4_moe imp
 )
 from vllm_iluvatar.model_executor.layers.quantization.common.moe_compute_binding import (
     MoEComputeBindingMixin,
+    pad_online_w4a8_config,
 )
 from vllm_iluvatar.model_executor.layers.quantization.common.moe_compute_binding import (
     shrink_ll_max_tokens_to_decode as _shrink_ll_max_tokens_to_decode,  # noqa: F401
@@ -181,6 +182,14 @@ class IluFp8MoEMethod(MoEComputeBindingMixin, Fp8MoEMethod):
         self._checkpoint_loader = self._compute = self._runtime_weights = None
         self.supports_pre_processed_weights = False
 
+    def _compute_config(self, layer):
+        config = super()._compute_config(layer)
+        return pad_online_w4a8_config(
+            config,
+            layer.moe_config.intermediate_size_per_partition_unpadded,
+            self._select_compute(),
+        )
+
     def create_weights(
         self,
         layer,
@@ -196,20 +205,24 @@ class IluFp8MoEMethod(MoEComputeBindingMixin, Fp8MoEMethod):
 
         if self._checkpoint_loader is not None:
             raise RuntimeError("FP8 Method cannot create weights twice")
+        selection = self._select_compute()
+        unpadded = self.moe.intermediate_size_per_partition_unpadded
         if (
             self.moe.has_bias
             or not self.moe.is_act_and_mul
             or self.moe.hidden_dim_unpadded != hidden_size
-            or self.moe.intermediate_size_per_partition_unpadded
-            not in (None, intermediate_size_per_partition)
+            or (
+                selection.name not in ("ixinfer_w4a8", "ixmm_w4a8")
+                and unpadded not in (None, intermediate_size_per_partition)
+            )
         ):
             raise ValueError(
                 f"{self.compute_source} loading requires unpadded bias-free "
                 "gated experts"
             )
-        selection = self._select_compute()
         backend = get_moe_backend(selection)
-        error = backend.support_error(self._compute_config(layer), selection)
+        compute = self._compute_config(layer)
+        error = backend.support_error(compute, selection)
         if error:
             raise ValueError(error)
         if backend.requires_contiguous_experts and layer.expert_map is not None:
@@ -224,7 +237,8 @@ class IluFp8MoEMethod(MoEComputeBindingMixin, Fp8MoEMethod):
             backend.weight_specs[selection.layout],
             num_experts,
             hidden_size,
-            intermediate_size_per_partition,
+            intermediate_size_per_partition if unpadded is None else unpadded,
+            compute,
         )
         layer.params_dtype = params_dtype
         self.num_experts = layer.num_experts = num_experts
@@ -233,7 +247,9 @@ class IluFp8MoEMethod(MoEComputeBindingMixin, Fp8MoEMethod):
         loader.create_weights(layer, attrs)
         self._checkpoint_loader = loader
 
-    def _make_loader(self, weight_spec, num_experts, hidden_size, intermediate):
+    def _make_loader(
+        self, weight_spec, num_experts, hidden_size, intermediate, compute
+    ):
         from vllm_iluvatar.model_executor.layers.quantization.common.block_fp8_loader import (
             BlockFp8LoadSpec,
             make_block_fp8_loader,
@@ -248,6 +264,10 @@ class IluFp8MoEMethod(MoEComputeBindingMixin, Fp8MoEMethod):
                 tuple(self.weight_block_size),
                 self.moe.tp_size,
                 self.moe.tp_rank,
+                runtime_intermediate=compute.intermediate,
+                w13_k_padded=compute.w13_k_padded,
+                w2_n_padded=compute.w2_n_padded,
+                w2_k_padded=compute.w2_k_padded,
             ),
         )
 

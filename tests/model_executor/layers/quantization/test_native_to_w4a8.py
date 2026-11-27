@@ -37,3 +37,62 @@ def test_gate_up_shards_pack_into_fused_weight(layout):
     assert torch.equal(torch.cat((gate_scale, up_scale), dim=1), scale)
     axis = 1 if layout == "NN" else 0
     assert torch.equal(torch.cat((gate_pack, up_pack), dim=axis), packed)
+
+
+@pytest.mark.parametrize("layout,half,down_k", [("TN", 296, 384), ("NN", 320, 320)])
+def test_native_loader_pads_logical_tp_shards(layout, half, down_k):
+    from types import SimpleNamespace
+
+    from tests.mxfp4_reference import pack_ixinfer
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+        MoEWeights,
+        make_moe_compute,
+        select_moe_backend,
+    )
+    from vllm_iluvatar.model_executor.layers.quantization.backends.native.moe import (
+        IluNativeToW4A8MoEMethod,
+    )
+
+    hidden, intermediate = 603, 289
+    config = SimpleNamespace(
+        has_bias=False,
+        is_act_and_mul=True,
+        intermediate_size_per_partition=intermediate,
+        intermediate_size_per_partition_unpadded=intermediate,
+        hidden_dim=hidden,
+        moe_parallel_config=SimpleNamespace(tp_size=2),
+        tp_rank=0,
+        ep_rank=0,
+    )
+    layer = torch.nn.Module()
+    layer.moe_config = config
+    layer.local_num_experts = layer.global_num_experts = 1
+    layer.activation = "silu"
+    layer.apply_router_weight_on_input = False
+    layer._map_global_expert_id_to_local_expert_id = lambda index: index
+    selection = select_moe_backend("ivcore11", name="ixinfer_w4a8", layout=layout)
+    method = IluNativeToW4A8MoEMethod(config, selection)
+    method.create_weights(layer, 1, hidden, intermediate, torch.bfloat16)
+    compute = make_moe_compute(method._compute_config(layer), selection)
+    assert compute.intermediate == half
+    assert compute.config.w2_k == down_k
+
+    gate = torch.ones(2 * intermediate, hidden, dtype=torch.bfloat16)
+    up = -gate
+    down = torch.ones(hidden, 2 * intermediate, dtype=torch.bfloat16)
+    down[:, intermediate:] = 127  # Full checkpoint K controls the local codes.
+    for name, shard, value in (
+        ("w13", "w1", gate),
+        ("w13", "w3", up),
+        ("w2", "w2", down),
+    ):
+        weight = getattr(layer, name + "_weight")
+        assert weight.weight_loader(weight, value, name, shard, 0, True)
+
+    codes = torch.zeros(2 * half, compute.config.w13_k, dtype=torch.int8)
+    codes[:intermediate, :hidden] = 7
+    codes[half : half + intermediate, :hidden] = -7
+    assert torch.equal(layer.w13_weight[0], pack_ixinfer(codes, layout))
+    assert torch.count_nonzero(layer.w2_weight) == 0
+    assert torch.equal(layer.w2_weight_scale, torch.ones_like(layer.w2_weight_scale))
+    compute.validate_weights(MoEWeights.from_layer(layer, compute.weight_spec))

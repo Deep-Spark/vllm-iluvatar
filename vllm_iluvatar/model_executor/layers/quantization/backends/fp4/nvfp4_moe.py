@@ -34,6 +34,7 @@ from vllm.model_executor.utils import replace_parameter
 
 from vllm_iluvatar.model_executor.layers.quantization.common.moe_compute_binding import (
     MoEComputeBindingMixin,
+    pad_online_w4a8_config,
 )
 from vllm_iluvatar.model_executor.layers.quantization.common.weight_utils import (
     publish_derived_weight,
@@ -171,6 +172,17 @@ class IluModelOptNvFp4MoEMethod(MoEComputeBindingMixin, ModelOptNvFp4FusedMoE):
         )
         assert self.is_monolithic is False
 
+    def _compute_config(self, layer):
+        config = super()._compute_config(layer)
+        selection = self._select_compute()
+        if selection.name == "ixinfer_w4a8":
+            return pad_online_w4a8_config(
+                config,
+                layer.moe_config.intermediate_size_per_partition_unpadded,
+                selection,
+            )
+        return config
+
     def _target_spec(self):
         """The weight contract the selected compute backend consumes."""
         from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
@@ -274,9 +286,8 @@ class IluModelOptNvFp4MoEMethod(MoEComputeBindingMixin, ModelOptNvFp4FusedMoE):
             return
         self._validate_loaded_experts(layer)
         selection = self._select_compute()
-        error = get_moe_backend(selection).support_error(
-            self._compute_config(layer), selection
-        )
+        compute = self._compute_config(layer)
+        error = get_moe_backend(selection).support_error(compute, selection)
         if error:
             raise ValueError(error)
         spec = self._target_spec()
@@ -315,17 +326,34 @@ class IluModelOptNvFp4MoEMethod(MoEComputeBindingMixin, ModelOptNvFp4FusedMoE):
                 raise ValueError(f"Invalid global scales for {group}_weight")
 
             experts, n, packed_k = weight.shape
-            weight_shape, scale_shape = spec.shapes(experts, n, packed_k * 2)
+            runtime_n, runtime_k = n, packed_k * 2
+            if selection.name == "ixinfer_w4a8":
+                runtime_n, runtime_k = (
+                    (2 * compute.intermediate, compute.w13_k)
+                    if group == "w13"
+                    else (compute.w2_n, compute.w2_k)
+                )
+            weight_shape, scale_shape = spec.shapes(experts, runtime_n, runtime_k)
             out_weight = torch.empty(
                 weight_shape, dtype=spec.weight_dtype, device=device
             )
             out_scale = torch.empty(scale_shape, dtype=spec.scale_dtype, device=device)
             for begin in range(0, experts, self.expert_chunk_size):
                 end = min(begin + self.expert_chunk_size, experts)
+                chunk_weight = weight[begin:end].to(device)
+                chunk_scale = scale[begin:end].to(device)
+                if (runtime_n, runtime_k) != (n, packed_k * 2):
+                    halves = 2 if group == "w13" else 1
+                    chunk_weight = self._pad_chunk(
+                        chunk_weight, halves, runtime_n, runtime_k // 2
+                    )
+                    chunk_scale = self._pad_chunk(
+                        chunk_scale, halves, runtime_n, runtime_k // _NVFP4_GROUP_SIZE
+                    )
                 self._convert_chunk(
                     spec,
-                    weight[begin:end].to(device),
-                    scale[begin:end].to(device),
+                    chunk_weight,
+                    chunk_scale,
                     global_scale[begin:end].to(device),
                     out_weight[begin:end],
                     out_scale[begin:end],
@@ -348,6 +376,19 @@ class IluModelOptNvFp4MoEMethod(MoEComputeBindingMixin, ModelOptNvFp4FusedMoE):
         layer._already_called_process_weights_after_loading = True
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    @staticmethod
+    def _pad_chunk(tensor, halves, padded_n, padded_cols):
+        experts, n, cols = tensor.shape
+        # Pad both packed gate/up halves independently. Zero bytes represent
+        # zero FP4 codes and zero E4M3 block scales.
+        if padded_n < n or padded_cols < cols or (padded_n - n) % halves:
+            raise ValueError("NVFP4 runtime shape cannot contain the checkpoint shard")
+        values = tensor.view(torch.uint8).reshape(experts, halves, n // halves, cols)
+        padded = torch.nn.functional.pad(
+            values, (0, padded_cols - cols, 0, (padded_n - n) // halves)
+        )
+        return padded.view(tensor.dtype).reshape(experts, padded_n, padded_cols)
 
     @staticmethod
     def _convert_chunk(spec, weight, scale, global_scale, out_weight, out_scale):

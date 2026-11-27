@@ -85,11 +85,12 @@ def test_ixinfer_w4a8_admits_what_its_kernels_run(layout, intermediate, admitted
     assert (error is None) == admitted, error
 
 
-def test_other_backends_keep_the_single_alignment_rule():
-    # Only IxInfer states a per-projection rule. IxMM W4A8 still declares the
-    # weight spec's 256, so the same dimensions stay out.
-    assert "256-aligned" in _support_error("ivcore30", "ixmm_w4a8", "NN")
-    # IxMM FP4FP8 declares 32 and takes them.
+def test_ixmm_w4a8_applies_per_projection_alignment():
+    for width in (320, 384, 576):
+        assert _support_error("ivcore11", "ixmm_w4a8", "NN", intermediate=width) is None
+    assert "w13 N % 128" in _support_error(
+        "ivcore11", "ixmm_w4a8", "NN", intermediate=288
+    )
     assert _support_error("ivcore30", "ixmm_fp4fp8", "fp4fp8") is None
 
 

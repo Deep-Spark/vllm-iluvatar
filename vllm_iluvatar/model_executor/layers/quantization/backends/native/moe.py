@@ -11,10 +11,11 @@ from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend i
 )
 from vllm_iluvatar.model_executor.layers.quantization.common.moe_compute_binding import (
     MoEComputeBindingMixin,
+    pad_online_w4a8_config,
 )
 
 
-def _pack_weight(weight, layout, k_start=0, k_size=None):
+def _pack_weight(weight, layout, k_start=0, k_size=None, *, padded_shape=None):
     n, k = weight.shape
     value = weight.float()
     # w2's channel scale belongs to the full checkpoint K, including under TP.
@@ -23,6 +24,11 @@ def _pack_weight(weight, layout, k_start=0, k_size=None):
     k_size = k if k_size is None else k_size
     q8 = (value.narrow(1, k_start, k_size) / scale).round().clamp_(-127, 127)
     q4 = (q8 / 18).round().to(torch.int8)
+    if padded_shape is not None and padded_shape != (n, k_size):
+        padded_n, padded_k = padded_shape
+        q4 = torch.nn.functional.pad(q4, (0, padded_k - k_size, 0, padded_n - n))
+        scale = torch.nn.functional.pad(scale, (0, 0, 0, padded_n - n), value=1.0)
+        n, k_size = padded_shape
     if layout == "NN":
         tiles = q4.T.reshape(k_size // 32, 2, 16, n // 32, 2, 16)
         q4 = tiles.permute(0, 4, 2, 3, 1, 5).reshape(k_size, n)
@@ -41,6 +47,14 @@ class IluNativeToW4A8MoEMethod(MoEComputeBindingMixin, FusedMoEMethodBase):
         self._compute = self._runtime_weights = None
         self._loaded = set()
 
+    def _compute_config(self, layer):
+        config = super()._compute_config(layer)
+        return pad_online_w4a8_config(
+            config,
+            layer.moe_config.intermediate_size_per_partition_unpadded,
+            self.selection,
+        )
+
     def create_weights(
         self,
         layer,
@@ -54,18 +68,19 @@ class IluNativeToW4A8MoEMethod(MoEComputeBindingMixin, FusedMoEMethodBase):
             raise ValueError("Native W4A8 requires gated experts without bias")
         if params_dtype not in (torch.bfloat16, torch.float16):
             raise ValueError("Native W4A8 requires BF16/FP16 expert weights")
-        hidden, intermediate = hidden_size, intermediate_size_per_partition
+        hidden = hidden_size
+        unpadded = self.moe.intermediate_size_per_partition_unpadded
+        intermediate = intermediate_size_per_partition if unpadded is None else unpadded
+        compute = self._compute_config(layer)
         backend = get_moe_backend(self.selection)
         layout = self.selection.layout
-        error = backend.support_error(self._compute_config(layer), self.selection)
+        error = backend.support_error(compute, self.selection)
         if error is not None:
             raise ValueError(error)
         spec = backend.weight_specs[layout]
-        if layout == "NN" and intermediate % 32:
-            raise ValueError("IxInfer NN gate/up shards must be 32-aligned")
         for group, n, k in (
-            ("w13", 2 * intermediate, hidden),
-            ("w2", hidden, intermediate),
+            ("w13", 2 * compute.intermediate, compute.w13_k),
+            ("w2", compute.w2_n, compute.w2_k),
         ):
             weight_shape, scale_shape = spec.shapes(num_experts, n, k)
             weight = torch.nn.Parameter(
@@ -78,11 +93,11 @@ class IluNativeToW4A8MoEMethod(MoEComputeBindingMixin, FusedMoEMethodBase):
             layer.register_parameter(f"{group}_weight", weight)
             layer.register_parameter(f"{group}_weight_scale", scale)
             weight.weight_loader = self._make_loader(
-                layer, group, scale, hidden, intermediate
+                layer, group, scale, hidden, intermediate, compute
             )
         self._num_experts = num_experts
 
-    def _make_loader(self, layer, group, scale, hidden, intermediate):
+    def _make_loader(self, layer, group, scale, hidden, intermediate, compute):
         layout = self.selection.layout
         tp = self.moe.moe_parallel_config.tp_size
         rank = self.moe.tp_rank
@@ -105,14 +120,16 @@ class IluNativeToW4A8MoEMethod(MoEComputeBindingMixin, FusedMoEMethodBase):
                         f"Invalid gate/up expert shard {weight_name}: {loaded_weight.shape}"
                     )
                 source = loaded_weight.narrow(0, rank * intermediate, intermediate)
-                offset = 0 if shard_id == "w1" else intermediate
+                runtime_i = compute.intermediate
+                offset = 0 if shard_id == "w1" else runtime_i
                 target = param.data[local]
                 if layout == "NN":
-                    target = target.narrow(1, offset // 2, intermediate // 2)
+                    target = target.narrow(1, offset // 2, runtime_i // 2)
                 else:
-                    target = target.narrow(0, offset, intermediate)
-                target_scale = scale.data[local].narrow(1, offset, intermediate)
+                    target = target.narrow(0, offset, runtime_i)
+                target_scale = scale.data[local].narrow(1, offset, runtime_i)
                 k_start, k_size = 0, hidden
+                padded_shape = runtime_i, compute.w13_k
             else:
                 if shard_id != "w2" or loaded_weight.shape != (
                     hidden,
@@ -124,9 +141,12 @@ class IluNativeToW4A8MoEMethod(MoEComputeBindingMixin, FusedMoEMethodBase):
                 source = loaded_weight
                 target, target_scale = param.data[local], scale.data[local]
                 k_start, k_size = rank * intermediate, intermediate
+                padded_shape = compute.w2_n, compute.w2_k
             # Keep the BF16 input and FP32 intermediates on the checkpoint
             # device. Upload only the packed weight and channel scales.
-            packed, channel_scale = _pack_weight(source, layout, k_start, k_size)
+            packed, channel_scale = _pack_weight(
+                source, layout, k_start, k_size, padded_shape=padded_shape
+            )
             target.copy_(packed)
             target_scale.copy_(channel_scale)
             self._loaded.add((local, shard_id))

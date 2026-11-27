@@ -200,9 +200,9 @@ def _quant_pp_act(hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _dequant_pp_act(q_bytes: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    import ixformer.inference.functions as ixfops
+    from ixformer.inference.functions.models.hy4.ihc.fp8.ihc_fp8 import pp_fp8_dequant
 
-    return ixfops.hy4_pp_fp8_dequant(q_bytes, scale)
+    return pp_fp8_dequant(q_bytes, scale)
 
 
 def _ihc_pre_fp8_boundary(
@@ -216,6 +216,9 @@ def _ihc_pre_fp8_boundary(
     scale_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     import ixformer.inference.functions as ixfops
+    from ixformer.inference.functions.models.hy4.ihc.fp8.ihc_fp8 import (
+        ihc_pre_epilogue_fp8,
+    )
 
     cached = getattr(hc_pre, "_ihc_w_fp8_cache", None)
     if cached is None:
@@ -241,7 +244,7 @@ def _ihc_pre_fp8_boundary(
         0.0,
         False,
     )
-    return ixfops.ihc_pre_epilogue_fp8(
+    return ihc_pre_epilogue_fp8(
         q_bytes,
         scale,
         mixes,
@@ -263,17 +266,21 @@ def _ihc_post_fp8_boundary(
     scale: torch.Tensor,
     post: torch.Tensor,
 ) -> torch.Tensor:
-    import ixformer.inference.functions as ixfops
+    from ixformer.inference.functions.models.hy4.ihc.fp8.ihc_fp8 import (
+        fuse_ihc_post_fp8,
+    )
 
-    return ixfops.fuse_ihc_post_fp8(x, q_bytes, scale, post)
+    return fuse_ihc_post_fp8(x, q_bytes, scale, post)
 
 
 def _ihc_post_quant_fp8_boundary(
     x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    import ixformer.inference.functions as ixfops
+    from ixformer.inference.functions.models.hy4.ihc.fp8.ihc_fp8 import (
+        fuse_ihc_post_quant_fp8,
+    )
 
-    return ixfops.fuse_ihc_post_quant_fp8(x, residual, post)
+    return fuse_ihc_post_quant_fp8(x, residual, post)
 
 
 def _ihc_post_fp8io(
@@ -282,9 +289,11 @@ def _ihc_post_fp8io(
     scale: torch.Tensor,
     post: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    import ixformer.inference.functions as ixfops
+    from ixformer.inference.functions.models.hy4.ihc.fp8.ihc_fp8 import (
+        fuse_ihc_post_fp8io,
+    )
 
-    return ixfops.fuse_ihc_post_fp8io(x, q_bytes, scale, post)
+    return fuse_ihc_post_fp8io(x, q_bytes, scale, post)
 
 
 def _normalize_hyv4_config(config: PretrainedConfig) -> PretrainedConfig:

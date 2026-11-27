@@ -542,3 +542,55 @@ def test_pp_boundary_single_tensor_pack_unpack_roundtrip(
         assert torch.equal(tk_dst, tk_src)
     else:
         assert tk_dst is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CoreX GPU")
+def test_pp_fp8_boundary_operators():
+    from vllm_iluvatar.models.hy_v4 import model
+
+    tokens, hc, hidden = 8, 4, 6144
+    x = torch.ones((tokens, hidden), device="cuda", dtype=torch.bfloat16)
+    x *= torch.arange(1, tokens + 1, device=x.device)[:, None]
+    residual = torch.zeros((tokens, hc, hidden), device=x.device, dtype=x.dtype)
+    post = torch.ones((tokens, hc), device=x.device)
+
+    q, scale = model._ihc_post_quant_fp8_boundary(x, residual, post)
+    expected = x[:, None, :].expand_as(residual)
+    torch.testing.assert_close(scale, x[:, 0].float() / 448)
+    assert torch.all(q.view(torch.float8_e4m3fn).float() == 448)
+    decoded = model._dequant_pp_act(q, scale).view_as(residual)
+    torch.testing.assert_close(decoded, expected)
+    torch.testing.assert_close(
+        model._ihc_post_fp8_boundary(x, q, scale, post), 2 * expected
+    )
+    q_next, scale_next = model._ihc_post_fp8io(x, q, scale, post)
+    assert torch.equal(q_next, q)
+    torch.testing.assert_close(scale_next, 2 * scale)
+
+    # Zero projection gives pre gates of 1/2 and post gates of 1.
+    hc_pre = SimpleNamespace(
+        hc_mult=hc,
+        hc_fn=SimpleNamespace(weight=x.new_zeros((2 * hc, hc * hidden))),
+        hc_scale=post.new_ones(2),
+        hc_base=post.new_zeros(2 * hc),
+        layernorm_epsilon=1e-5,
+        hc_eps=0.0,
+        magnitude=2.0,
+    )
+    y, gates = model._ihc_pre_fp8_boundary(hc_pre, q, scale)
+    torch.testing.assert_close(y, 2 * x)
+    torch.testing.assert_close(gates, post)
+
+    q_out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    scale_out = torch.empty_like(scale)
+    normed, _ = model._ihc_pre_fp8_boundary(
+        hc_pre,
+        q,
+        scale,
+        rms_weight=torch.ones_like(x[0]),
+        q_out=q_out,
+        scale_out=scale_out,
+    )
+    torch.testing.assert_close(normed, torch.ones_like(x))
+    torch.testing.assert_close(scale_out, torch.full_like(scale, 1 / 448))
+    assert torch.all(q_out.float() == 448)

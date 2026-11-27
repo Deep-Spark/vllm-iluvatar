@@ -229,6 +229,7 @@ if TYPE_CHECKING:
     VLLM_ILU_HYV4_PP_ACT_FP8: bool = False
     VLLM_ILU_HYV4_IHC_FP8_RES: bool = False
     VLLM_ILU_HYV4_STAGE_TIMER: bool = False
+    VLLM_ILU_HYV4_STAGE_TIMER_STEPS: int = 8
     VLLM_ILU_HYV4_DSA_FP8_KV_SCALE: str = ""
     VLLM_ILU_HYV4_DSA_FP8_KV_SCALE_PATH: str = ""
     VLLM_ILU_MXFP4_MOE_PREQUANT: bool = False
@@ -595,6 +596,9 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
         default="0",
     ),
     "VLLM_ILU_HYV4_STAGE_TIMER": _bool_reader("VLLM_ILU_HYV4_STAGE_TIMER", "0"),
+    "VLLM_ILU_HYV4_STAGE_TIMER_STEPS": _int_reader(
+        "VLLM_ILU_HYV4_STAGE_TIMER_STEPS", 8, minimum=0
+    ),
     # Empty = online amax/448; a float applies the same static scale to all layers.
     "VLLM_ILU_HYV4_DSA_FP8_KV_SCALE": lambda: os.environ.get(
         "VLLM_ILU_HYV4_DSA_FP8_KV_SCALE", ""

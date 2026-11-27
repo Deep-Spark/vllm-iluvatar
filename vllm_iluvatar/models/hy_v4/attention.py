@@ -26,10 +26,11 @@ below.
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import math
 import os
-from functools import lru_cache
+from functools import cache, lru_cache
 from typing import cast
 
 import regex as re
@@ -60,6 +61,8 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
+from vllm_iluvatar.envs import _ILU_CANONICAL_ONLY_ENV_VARS
+from vllm_iluvatar.ilu_util.arch import cuda_arch, is_ivcore30
 from vllm_iluvatar.model_executor.layers.sparse_attn_indexer import (
     IluSparseAttnIndexer,
 )
@@ -180,7 +183,11 @@ def build_hy4_ropes(
         )
         # Host metadata is created once, outside forward/capture. Do not make
         # it a buffer: Module.to(cuda) must not move it to the device.
-        if os.environ.get("VLLM_ILU_HYV4_NATIVE_MROPE", "1") != "0":
+        if (
+            _ILU_CANONICAL_ONLY_ENV_VARS["VLLM_ILU_HYV4_NATIVE_MROPE"]()
+            and len(section) == 3
+            and sum(section) == head_size // 2
+        ):
             mrope._ixf_mrope_section = torch.tensor(
                 section, dtype=torch.int32, device="cpu"
             )
@@ -359,14 +366,32 @@ class HYV4MLAAttentionLayer(MLAAttention):
         if self.use_hyv4_fp8_attn:
             self._k_scale.fill_(init_scale)
             self._non_persistent_buffers_set.add("_k_scale")
-        self.fuse_v_up = os.environ.get(
-            "VLLM_ILU_HYV4_FUSE_KV_UP", "1"
-        ) != "0" and hasattr(_ixf_functions(), "hy4_kv_up_gate")
+        ixf_ops = _ixf_functions()
+        kv_lora_rank = getattr(self, "kv_lora_rank", None)
+        v_head_dim = getattr(self, "v_head_dim", None)
+        self.fuse_v_up = (
+            _ILU_CANONICAL_ONLY_ENV_VARS["VLLM_ILU_HYV4_FUSE_KV_UP"]()
+            and is_ivcore30()
+            and (
+                kv_lora_rank is None
+                or (128 <= kv_lora_rank <= 512 and kv_lora_rank % 64 == 0)
+            )
+            and (v_head_dim is None or v_head_dim % 16 == 0)
+            and all(
+                hasattr(ixf_ops, fn)
+                for fn in (
+                    "hy4_kv_up_gate",
+                    "hy4_fp8_einsum_gate",
+                    "fp8_grouped_per_token_quant",
+                    "alloc_readsafe_scale",
+                )
+            )
+        )
         # Folding the gate is separable from running v-up in FP8, which keeps
         # the two halves of this change independently switchable.
         self.fuse_gate = (
             self.fuse_v_up
-            and os.environ.get("VLLM_ILU_HYV4_FUSE_KV_UP_GATE", "1") != "0"
+            and _ILU_CANONICAL_ONLY_ENV_VARS["VLLM_ILU_HYV4_FUSE_KV_UP_GATE"]()
         )
         self.W_UV_FP8: torch.Tensor | None = None
         self.W_UV_FP8_S: torch.Tensor | None = None
@@ -417,6 +442,10 @@ class HYV4MLAAttentionLayer(MLAAttention):
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
         self._dequant_per_channel_kv_b(act_dtype)
         super().process_weights_after_loading(act_dtype)
+        if act_dtype != torch.bfloat16 or not is_ivcore30():
+            self.fp8_k_up = False
+            self.fuse_v_up = False
+            self.fuse_gate = False
         if self.fp8_k_up:
             # Community W_UK_T is [H, nope, latent]. GLM grouped einsum
             # consumes [H, latent, nope] with scales [H, latent].
@@ -520,6 +549,8 @@ class HYV4MLAAttentionLayer(MLAAttention):
             return
         ixf_ops = _ixf_functions()
         x = x.view(-1, self.num_heads, self.kv_lora_rank)
+        if not x.is_contiguous():
+            x = x.contiguous()
         out_3d = out.view(-1, self.num_heads, self.v_head_dim)
         gate = self.gate_logits
         lazy_gate = (
@@ -1302,11 +1333,15 @@ class HYV4MLAAttention(nn.Module):
         positions: torch.Tensor,
     ) -> bool:
         global _MLA_KV_FUSE_LOGGED
-        if os.environ.get("VLLM_ILU_HYV4_FUSE_MLA_KV", "1") == "0":
+        if not _ILU_CANONICAL_ONLY_ENV_VARS["VLLM_ILU_HYV4_FUSE_MLA_KV"]():
+            return False
+        if cuda_arch() not in ("ivcore11", "ivcore30"):
             return False
         # 2-D M-RoPE builds a cos/sin table with a dynamic alloc; skip under
         # CUDA-graph capture so FULL_DECODE_ONLY can keep the default on.
         if torch.cuda.is_current_stream_capturing():
+            return False
+        if self.qk_rope_head_dim != 64 or self.kv_lora_rank != 512:
             return False
         impl = getattr(self.mla_attn, "impl", None)
         if impl is None or not getattr(impl, "use_fp8_attn", False):
@@ -1320,10 +1355,25 @@ class HYV4MLAAttention(nn.Module):
             return False
         if q.shape[-2] not in (8, 16, 32, 64):
             return False
-        if self.kv_a_layernorm.weight.dtype != kv_c.dtype:
+        if (
+            q.dtype not in (torch.bfloat16, torch.float16)
+            or k_pe.dtype != q.dtype
+            or kv_c.dtype != q.dtype
+        ):
+            return False
+        if (
+            self.kv_a_layernorm.weight.dtype != kv_c.dtype
+            or not self.kv_a_layernorm.weight.is_contiguous()
+            or self.kv_a_layernorm.weight.shape != (512,)
+        ):
             return False
         kv_cache = self.mla_attn.kv_cache
-        if kv_cache.numel() == 0:
+        if (
+            kv_cache.numel() == 0
+            or kv_cache.ndim != 3
+            or kv_cache.dtype != torch.uint8
+            or kv_cache.shape[2] < 640
+        ):
             return False
         try:
             import ixformer.inference.functions as ixf_ops
@@ -1347,6 +1397,7 @@ class HYV4MLAAttention(nn.Module):
         if positions.ndim == 2:
             if (
                 positions.shape[0] != 3
+                or positions.dtype != torch.int64
                 or self.mrope_emb is None
                 or positions.shape[1] < n
                 or not q_pe.is_cuda
@@ -1441,6 +1492,56 @@ class HYV4MLAAttention(nn.Module):
             return True
         return isinstance(getattr(qm, "fp8_linear", None), IluFp8BlockScaledMMKernel)
 
+    @staticmethod
+    @cache
+    def _supports_ixf_rms_quant() -> bool:
+        try:
+            import ixformer.inference.functions as ixf_ops
+        except Exception:
+            return False
+        fn = getattr(ixf_ops, "fp8_per_token_dynamic_scaled", None)
+        if fn is None:
+            return False
+        try:
+            return "rms_weight" in inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            return False
+
+    @classmethod
+    def can_fuse_qa_norm_quant(
+        cls,
+        qkv_lora: torch.Tensor,
+        q_c: torch.Tensor,
+        q_a_layernorm: nn.Module,
+        *,
+        allow_breakable_cudagraph: bool = False,
+    ) -> bool:
+        if not _ILU_CANONICAL_ONLY_ENV_VARS["VLLM_ILU_HYV4_FUSE_QA_NORM_QUANT"]():
+            return False
+        if not allow_breakable_cudagraph and is_breakable_cudagraph_enabled():
+            return False
+        if not is_ivcore30() or not cls._supports_ixf_rms_quant():
+            return False
+        rms_weight = getattr(q_a_layernorm, "weight", None)
+        if rms_weight is None:
+            return False
+        return (
+            qkv_lora.is_contiguous()
+            and q_c.is_cuda
+            and q_c.dtype in (torch.float16, torch.bfloat16)
+            and q_c.ndim == 2
+            and q_c.shape[0] > 6
+            and q_c.shape[1] % 8 == 0
+            and q_c.stride(0) % 8 == 0
+            and q_c.stride(1) == 1
+            and q_c.data_ptr() % 16 == 0
+            and rms_weight.is_cuda
+            and rms_weight.is_contiguous()
+            and rms_weight.dtype == q_c.dtype
+            and rms_weight.numel() == q_c.shape[1]
+            and rms_weight.device == q_c.device
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1468,12 +1569,9 @@ class HYV4MLAAttention(nn.Module):
                     dim=-1,
                 )
                 if (
-                    os.environ.get("VLLM_ILU_HYV4_FUSE_QA_NORM_QUANT", "1") != "0"
-                    and q_c.is_cuda
-                    and q_c.ndim == 2
-                    and q_c.shape[0] > 6
-                    and q_c.shape[1] % 8 == 0
-                    and q_c.stride(0) % 8 == 0
+                    HYV4MLAAttention.can_fuse_qa_norm_quant(
+                        qkv_lora, q_c, self.q_a_layernorm
+                    )
                     and self._supports_activation_prequant(self.q_b_proj)
                     and (
                         not runs_indexer

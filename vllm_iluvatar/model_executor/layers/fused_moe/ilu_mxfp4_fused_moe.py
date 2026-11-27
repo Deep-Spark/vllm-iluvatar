@@ -65,7 +65,6 @@ gate.
 from __future__ import annotations
 
 import functools
-import os
 
 import torch
 from vllm import envs
@@ -624,13 +623,8 @@ def _ilu_mxfp4_fused_experts_ixformer(
     prequant = (
         _lookup_activation_prequant(hidden_states)
         if expert_map is None
-        and (
-            os.environ.get("VLLM_ILU_MXFP4_MOE_PREQUANT")
-            or os.environ.get("VLLM_ILU_HYV4_MOE_EXPAND_PREQUANT", "0")
-        )
-        .strip()
-        .lower()
-        not in ("0", "false", "no", "off", "")
+        and envs.VLLM_ILU_MXFP4_MOE_PREQUANT
+        and hasattr(ixfops, "moe_expand_input_ep")
         else None
     )
     if prequant is not None:

@@ -45,8 +45,6 @@ answer independent of that subtlety altogether. ``__init__`` asserts both.
 
 from __future__ import annotations
 
-import os
-
 import torch
 import torch.nn.functional as F
 from vllm.config import get_current_vllm_config_or_none
@@ -669,17 +667,13 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
         workspace = self._compute.workspace_spec(topk_ids.numel(), x.dtype).allocate(
             x.device
         )
+        from vllm_iluvatar import envs
+
         prequant = (
             _lookup_activation_prequant(x)
             if layer.expert_map is None
             and getattr(self._compute, "supports_prequantized_fp8", False)
-            and (
-                os.environ.get("VLLM_ILU_MXFP4_MOE_PREQUANT")
-                or os.environ.get("VLLM_ILU_HYV4_MOE_EXPAND_PREQUANT", "0")
-            )
-            .strip()
-            .lower()
-            not in ("0", "false", "no", "off", "")
+            and envs.VLLM_ILU_MXFP4_MOE_PREQUANT
             else None
         )
         return self._compute.run_standard(

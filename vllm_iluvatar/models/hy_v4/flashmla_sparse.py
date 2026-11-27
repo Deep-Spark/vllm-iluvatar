@@ -25,8 +25,9 @@ Remove   : when the base Iluvatar backend forwards sinks for every KV dtype.
 
 from __future__ import annotations
 
+import functools
+import inspect
 import math
-import os
 from typing import ClassVar
 
 import torch
@@ -37,6 +38,7 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
 )
 
+from vllm_iluvatar.envs import _ILU_CANONICAL_ONLY_ENV_VARS
 from vllm_iluvatar.v1.attention.backends.mla.ilu_flashmla_sparse import (
     IluFlashMLASparseBackend,
     IluFlashMLASparseImpl,
@@ -49,7 +51,23 @@ logger = init_logger(__name__)
 
 _HYV4_DSA_FP8_ROW_BYTES = 640
 _HYV4_DSA_FP8_E4M3_MAX = 448.0
-_HYV4_FUSE_MLA_REMAP = os.environ.get("VLLM_ILU_HYV4_FUSE_MLA_REMAP", "1") != "0"
+
+
+def _hyv4_fuse_mla_remap() -> bool:
+    return _ILU_CANONICAL_ONLY_ENV_VARS["VLLM_ILU_HYV4_FUSE_MLA_REMAP"]()
+
+
+@functools.lru_cache(maxsize=1)
+def _supports_ixf_mla_remap_valid_counts() -> bool:
+    try:
+        import ixformer.inference.functions as ixf_ops
+
+        fn = getattr(ixf_ops, "triton_convert_req_index_to_global_index", None)
+        if fn is None:
+            return False
+        return "return_valid_counts" in inspect.signature(fn).parameters
+    except Exception:
+        return False
 
 
 class HYV4FlashMLASparseImpl(IluFlashMLASparseImpl):
@@ -159,7 +177,8 @@ class HYV4FlashMLASparseImpl(IluFlashMLASparseImpl):
         )
         if cached is None:
             if (
-                _HYV4_FUSE_MLA_REMAP
+                _hyv4_fuse_mla_remap()
+                and _supports_ixf_mla_remap_valid_counts()
                 and not torch.cuda.is_current_stream_capturing()
                 and self.dcp_world_size == 1
                 and self.pcp_world_size == 1

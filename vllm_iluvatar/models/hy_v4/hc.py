@@ -18,6 +18,7 @@ the eager implementation.
 
 from __future__ import annotations
 
+import inspect
 from functools import cache
 
 import torch
@@ -129,8 +130,33 @@ def _native_projection_shape(x: torch.Tensor, *, hc_mult: int, hidden_dim: int) 
 
     # Must match ixformer's kIhcPreSmallBatch. Above this bound the native
     # GEMM rounds its weight and output to BF16, unlike the eager fallback.
-    return _native_shape(x, hc_mult=hc_mult, hidden_dim=hidden_dim) and (
-        not is_ivcore11() or x.shape[0] <= 64
+    return (
+        _native_shape(x, hc_mult=hc_mult, hidden_dim=hidden_dim)
+        and x.data_ptr() % 16 == 0
+        and (not is_ivcore11() or x.shape[0] <= 64)
+    )
+
+
+@cache
+def _supports_op_kwarg(fn: object, kwarg: str) -> bool:
+    try:
+        return kwarg in inspect.signature(fn).parameters  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+
+
+def _valid_fused_rms_weight(
+    rms_weight: torch.Tensor | None, *, hidden_dim: int
+) -> bool:
+    if rms_weight is None:
+        return True
+    return (
+        rms_weight.is_cuda
+        and rms_weight.dtype == torch.bfloat16
+        and rms_weight.dim() == 1
+        and rms_weight.shape[0] == hidden_dim
+        and rms_weight.is_contiguous()
+        and rms_weight.data_ptr() % 16 == 0
     )
 
 
@@ -405,9 +431,17 @@ class HYV4HCHeadLayer(nn.Module):
                     torch.randn_like(self.hc_head_base) * base_noise_std
                 )
 
-    def can_fuse_norm(self, x: torch.Tensor) -> bool:
-        return _ihc_ops() is not None and _native_projection_shape(
-            x, hc_mult=self.hc_mult, hidden_dim=self.hidden_size
+    def can_fuse_norm(
+        self, x: torch.Tensor, rms_weight: torch.Tensor | None = None
+    ) -> bool:
+        ops = _ihc_ops()
+        return (
+            ops is not None
+            and _supports_op_kwarg(ops.fuse_ihc_head, "rms_weight")
+            and _native_projection_shape(
+                x, hc_mult=self.hc_mult, hidden_dim=self.hidden_size
+            )
+            and _valid_fused_rms_weight(rms_weight, hidden_dim=self.hidden_size)
         )
 
     def forward(
@@ -438,6 +472,10 @@ class HYV4HCHeadLayer(nn.Module):
                 hc_eps=self.hc_eps,
                 rms_weight=rms_weight,
                 rms_eps=rms_eps,
+            )
+        if rms_weight is not None:
+            raise RuntimeError(
+                "HYV4HCHeadLayer: fused rms_weight requires native iHC projection"
             )
 
         if (
@@ -542,15 +580,30 @@ class HYV4HCLayer(nn.Module):
             f"hc_mult={hc}, hidden_size={h}."
         )
 
-    def can_fuse_norm(self, hidden_states: torch.Tensor) -> bool:
+    def can_fuse_norm(
+        self,
+        hidden_states: torch.Tensor,
+        rms_weight: torch.Tensor | None = None,
+    ) -> bool:
+        ops = _ihc_ops()
         return (
             self.enable_ihc
-            and _ihc_ops() is not None
+            and ops is not None
+            and _supports_op_kwarg(ops.fuse_ihc_pre, "rms_weight")
             and _native_projection_shape(
                 hidden_states,
                 hc_mult=self.config.hc_mult,
                 hidden_dim=self.config.hidden_size,
             )
+            and _valid_fused_rms_weight(rms_weight, hidden_dim=self.config.hidden_size)
+        )
+
+    def can_fuse_fp8_quant(self) -> bool:
+        ops = _ihc_ops()
+        return (
+            self.enable_ihc
+            and ops is not None
+            and _supports_op_kwarg(ops.fuse_ihc_pre, "q_out")
         )
 
     def pre(

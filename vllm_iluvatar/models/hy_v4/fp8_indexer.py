@@ -25,7 +25,8 @@ against ds4's 64:
 
 from __future__ import annotations
 
-import os
+import math
+from typing import Any
 
 import ixformer.inference.functions as ixfops
 import torch
@@ -36,6 +37,8 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
+from vllm_iluvatar.envs import _ILU_CANONICAL_ONLY_ENV_VARS
+from vllm_iluvatar.ilu_util.arch import is_ivcore30
 from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (
     register_activation_prequant,
     sliced_activation_prequant,
@@ -149,7 +152,14 @@ def _indexer_rope_table(
     if mrope_emb is None or positions.shape[0] != 3:
         raise ValueError("HYV4 2-D positions require three rows and an M-RoPE module")
     section = getattr(mrope_emb, "_ixf_mrope_section", None)
-    if positions.is_cuda and positions.shape[1] <= 2560 and section is not None:
+    if (
+        positions.is_cuda
+        and positions.dtype == torch.int64
+        and positions.stride(-1) == 1
+        and positions.shape[1] <= 2560
+        and section is not None
+        and hasattr(ixfops, "mrope_cos_sin_table")
+    ):
         return ixfops.mrope_cos_sin_table(
             positions,
             mrope_emb._match_cos_sin_cache_dtype(dtype_ref),
@@ -159,6 +169,52 @@ def _indexer_rope_table(
     table = _mixed_mrope_cos_sin(mrope_emb, positions, dtype_ref)
     token_pos = torch.arange(table.shape[0], device=table.device, dtype=positions.dtype)
     return token_pos, table
+
+
+def _can_fuse_indexer_k_insert(
+    indexer: Any,
+    k_raw: torch.Tensor,
+    cos_sin: torch.Tensor,
+    kv_cache: torch.Tensor,
+) -> bool:
+    if not _ILU_CANONICAL_ONLY_ENV_VARS[
+        "VLLM_ILU_HYV4_FUSE_INDEXER_K"
+    ]() or not hasattr(ixfops, "hy4_indexer_k_norm_rope_fp8_insert"):
+        return False
+    if not k_raw.is_cuda:
+        # Host-only unit tests mock ixfops; real execution is always CUDA.
+        return True
+    k_norm_weight = getattr(indexer.k_norm, "weight", None)
+    k_norm_bias = getattr(indexer.k_norm, "bias", None)
+    return (
+        is_ivcore30()
+        and k_raw.dtype == torch.bfloat16
+        and k_raw.ndim == 2
+        and k_raw.shape[1] == 128
+        and k_raw.stride(1) == 1
+        and cos_sin.is_cuda
+        and cos_sin.ndim == 2
+        and cos_sin.shape[1] == 64
+        and cos_sin.stride(1) == 1
+        and cos_sin.dtype in (torch.float32, torch.float16, torch.bfloat16)
+        and k_norm_weight is not None
+        and k_norm_bias is not None
+        and k_norm_weight.is_cuda
+        and k_norm_bias.is_cuda
+        and k_norm_weight.is_contiguous()
+        and k_norm_bias.is_contiguous()
+        and k_norm_weight.dtype == torch.float32
+        and k_norm_bias.dtype == torch.float32
+        and k_norm_weight.shape == (128,)
+        and k_norm_bias.shape == (128,)
+        and kv_cache.is_cuda
+        and kv_cache.ndim == 3
+        and kv_cache.dtype == torch.uint8
+        and kv_cache.shape[1] > 0
+        and kv_cache.shape[2] == 132
+        and kv_cache.stride(2) == 1
+        and kv_cache.stride(1) == 132
+    )
 
 
 def _insert_indexer_k_cache(
@@ -180,13 +236,16 @@ def _insert_indexer_k_cache(
     # carry slot_mapping == -1 and are skipped inside the kernel.
     num_tokens = slot_mapping.shape[0]
     n = min(num_tokens, kw.shape[0], int(indexer_positions.numel()))
+    if n <= 0:
+        return
     k_raw = kw[:n, : indexer.head_dim]
     pos = indexer_positions[:n].contiguous()
-    use_k_fuse = os.environ.get("VLLM_ILU_HYV4_FUSE_INDEXER_K", "1") != "0" and hasattr(
-        ixfops, "hy4_indexer_k_norm_rope_fp8_insert"
-    )
-    if use_k_fuse:
+    if _can_fuse_indexer_k_insert(indexer, k_raw, cos_sin, kv_cache):
+        if pos.dtype != torch.int64:
+            pos = pos.to(torch.int64)
         slots = slot_mapping.reshape(-1)[:n].contiguous()
+        if slots.dtype != torch.int64:
+            slots = slots.to(torch.int64)
         ixfops.hy4_indexer_k_norm_rope_fp8_insert(
             k_raw,
             indexer.k_norm.weight,
@@ -218,6 +277,46 @@ def _insert_indexer_k_cache(
         ixfops.hy4_indexer_k_fp8_insert(k, kv_cache, slots)
 
 
+# Leading 4 int32s (16 bytes, preserving 16-byte vector alignment for
+# dsa_update_topk_indices) in the (N, index_topk // 2) offload wire:
+#   header[0] = sent_split_t
+#   header[1] = sent_tail_len   (0 when sender did not populate tail top-k)
+#   header[2..3] = 0            (alignment padding)
+_OFFLOAD_WIRE_HEADER_INTS = 4
+
+
+def _clear_offload_wire_header(wire: torch.Tensor) -> None:
+    flat = wire.view(-1)
+    if flat.numel() >= _OFFLOAD_WIRE_HEADER_INTS:
+        flat[:_OFFLOAD_WIRE_HEADER_INTS].zero_()
+
+
+def _write_offload_wire_header(wire: torch.Tensor, split_t: int, tail_len: int) -> None:
+    flat = wire.view(-1)
+    assert flat.numel() >= _OFFLOAD_WIRE_HEADER_INTS
+    flat[0].fill_(split_t)
+    flat[1].fill_(tail_len)
+
+
+def _verify_offload_wire_header(
+    wire: torch.Tensor,
+    expected_split_t: int,
+    expected_tail_len: int,
+    topk_tokens: int,
+) -> tuple[bool, int, int]:
+    flat = wire.view(-1)
+    required = _OFFLOAD_WIRE_HEADER_INTS + expected_tail_len * topk_tokens
+    if flat.numel() < required:
+        return False, 0, 0
+    sent_split_t, sent_tail_len = (int(x) for x in flat[:2].to(device="cpu").tolist())
+    ok = (
+        sent_tail_len > 0
+        and sent_split_t == expected_split_t
+        and sent_tail_len == expected_tail_len
+    )
+    return ok, sent_split_t, sent_tail_len
+
+
 def compute_offload_split_t(
     md: IluDeepseekV32IndexerMetadata | None,
     total_tokens: int,
@@ -237,6 +336,7 @@ def compute_offload_split_t(
         or md.num_prefills <= 0
         or md.prefill is None
         or not md.prefill.chunks
+        or index_topk <= 0
         or index_topk % 2 != 0
         or getattr(md, "pcp_world_size", 1) > 1
     ):
@@ -246,12 +346,25 @@ def compute_offload_split_t(
     prefill_start = chunks[0].token_start
     prefill_end = chunks[-1].token_end
     prefill_tokens = prefill_end - prefill_start
-    min_tokens = int(os.environ.get("VLLM_ILU_HYV4_PP_OFFLOAD_MIN_TOKENS", "256"))
+    try:
+        min_tokens = _ILU_CANONICAL_ONLY_ENV_VARS[
+            "VLLM_ILU_HYV4_PP_OFFLOAD_MIN_TOKENS"
+        ]()
+        ratio = _ILU_CANONICAL_ONLY_ENV_VARS["VLLM_ILU_HYV4_PP_OFFLOAD_RATIO"]()
+        min_half_tokens = _ILU_CANONICAL_ONLY_ENV_VARS[
+            "VLLM_ILU_HYV4_PP_OFFLOAD_MIN_HALF_TOKENS"
+        ]()
+    except ValueError:
+        return None
+    if not math.isfinite(ratio):
+        return None
     if total_tokens < 128 or prefill_end != total_tokens or prefill_tokens < min_tokens:
         return None
 
-    max_wire_tokens = total_tokens // 2
-    ratio = float(os.environ.get("VLLM_ILU_HYV4_PP_OFFLOAD_RATIO", "0.42"))
+    wire_ints = total_tokens * (index_topk // 2)
+    if wire_ints <= _OFFLOAD_WIRE_HEADER_INTS:
+        return None
+    max_wire_tokens = (wire_ints - _OFFLOAD_WIRE_HEADER_INTS) // index_topk
     ratio = min(max(ratio, 0.05), 0.50)
     desired_tail = min(int(round(prefill_tokens * ratio)), max_wire_tokens)
     if desired_tail <= 0:
@@ -279,9 +392,6 @@ def compute_offload_split_t(
 
     # Keep >10 Q CTAs (88+ rows at BQ=8) on both sides so neither half flips
     # into the small-M score specialization.
-    min_half_tokens = int(
-        os.environ.get("VLLM_ILU_HYV4_PP_OFFLOAD_MIN_HALF_TOKENS", "88")
-    )
     head_prefill_tokens = split_t - prefill_start
     tail_tokens = prefill_end - split_t
     if (
@@ -437,16 +547,13 @@ def hy4_fp8_indexer_forward_offload_sender(
 ) -> torch.Tensor:
     """Predecessor-stage helper: sync mirrored K-cache and compute offloaded tail top-k.
 
-    ``wire_out`` is a physical ``(N, index_topk // 2)`` int32 plane. The tail
-    top-k is packed as a contiguous ``(tail_len, index_topk)`` view over the
-    leading ``tail_len * index_topk`` flat entries (capacity holds because
-    ``tail_len <= N // 2``). The receiver must use the same flat view; do not
-    read ``wire_out[split_t:prefill_end]`` as row-aligned ``(N, topk/2)`` rows.
+    ``wire_out`` is a physical ``(N, index_topk // 2)`` int32 plane. The
+    leading 4 int32s store ``[sent_split_t, sent_tail_len, 0, 0]`` (with
+    ``sent_tail_len == 0`` whenever the sender skipped tail computation), and
+    the tail top-k is packed immediately after as a contiguous
+    ``(tail_len, index_topk)`` view over ``flat[4 : 4 + tail_len * index_topk]``.
     """
-    indexer_positions, cos_sin = _indexer_rope_table(
-        indexer, positions, rotary_emb, normed_hidden_states
-    )
-    kw, _ = indexer.wk_weights_proj(normed_hidden_states)
+    _clear_offload_wire_header(wire_out)
 
     attn_metadata = get_forward_context().attn_metadata
     md = (
@@ -457,15 +564,14 @@ def hy4_fp8_indexer_forward_offload_sender(
     if md is None:
         # Startup memory profiling often has empty attn_metadata; still
         # exercise the tail projection shapes so peak activation includes
-        # the helper workspace. Outside profiling this means the helper's
-        # indexer was never registered — offload silently no-ops and the
-        # receiver falls back to a full indexer.
+        # the helper workspace. Outside profiling, header[1] == 0 tells the
+        # receiver to fall back cleanly to a full local indexer.
         logger.warning_once(
             "HY4 PP offload sender missing indexer metadata for %s; "
-            "skipping tail top-k write (receiver will run full indexer if "
-            "split is also unavailable).",
+            "marking wire tail_len=0 so receiver runs full local indexer.",
             getattr(indexer.k_cache, "prefix", "<unknown>"),
         )
+        _ = indexer.wk_weights_proj(normed_hidden_states)
         total = normed_hidden_states.shape[0]
         if total >= 256:
             half_s = total - (total // 2)
@@ -479,17 +585,25 @@ def hy4_fp8_indexer_forward_offload_sender(
         return wire_out
 
     assert isinstance(md, IluDeepseekV32IndexerMetadata)
-    # Gate before K-insert: compute_offload_split_t returns None for PCP>1 /
-    # mixed / tiny batches, while _insert_indexer_k_cache raises on PCP>1.
+    if getattr(md, "pcp_world_size", 1) > 1:
+        return wire_out
+
+    # Always synchronize the helper's mirrored K-cache even when this batch
+    # does not split queries (e.g. small prefill chunks, decode steps, or mixed
+    # steps) so subsequent offloaded prefill chunks see complete prior K slots.
+    indexer_positions, cos_sin = _indexer_rope_table(
+        indexer, positions, rotary_emb, normed_hidden_states
+    )
+    kw, _ = indexer.wk_weights_proj(normed_hidden_states)
+    _insert_indexer_k_cache(
+        indexer, kw, indexer_positions, cos_sin, positions, rotary_emb, md
+    )
+
     split_range = compute_offload_split_t(
         md, normed_hidden_states.shape[0], indexer.topk_tokens
     )
     if split_range is None:
         return wire_out
-
-    _insert_indexer_k_cache(
-        indexer, kw, indexer_positions, cos_sin, positions, rotary_emb, md
-    )
 
     split_t, prefill_end = split_range
     tail_len = prefill_end - split_t
@@ -501,14 +615,13 @@ def hy4_fp8_indexer_forward_offload_sender(
     q_c, _ = qkv_lora.split([q_lora_rank, kv_lora_and_rope_dim], dim=-1)
     qc_prequant_registered = False
     try:
-        if (
-            os.environ.get("VLLM_ILU_HYV4_FUSE_QA_NORM_QUANT", "1") != "0"
-            and q_c.is_cuda
-            and q_c.ndim == 2
-            and q_c.shape[0] > 6
-            and q_c.shape[1] % 8 == 0
-            and q_c.stride(0) % 8 == 0
-            and supports_wq_b_prequant
+        from .attention import HYV4MLAAttention
+
+        if supports_wq_b_prequant and HYV4MLAAttention.can_fuse_qa_norm_quant(
+            qkv_lora,
+            q_c,
+            q_a_layernorm,
+            allow_breakable_cudagraph=not torch.cuda.is_current_stream_capturing(),
         ):
             qc_fp8, qc_scale = ixfops.fp8_per_token_dynamic_scaled(
                 q_c,
@@ -539,8 +652,9 @@ def hy4_fp8_indexer_forward_offload_sender(
     )
 
     topk_tokens = indexer.topk_tokens
-    # Flat pack into the (N, topk/2) plane — see docstring above.
-    topk_tail_out = wire_out.view(-1)[: tail_len * topk_tokens].view(
+    payload_start = _OFFLOAD_WIRE_HEADER_INTS
+    payload_end = payload_start + tail_len * topk_tokens
+    topk_tail_out = wire_out.view(-1)[payload_start:payload_end].view(
         tail_len, topk_tokens
     )
     assert md.prefill is not None
@@ -555,6 +669,7 @@ def hy4_fp8_indexer_forward_offload_sender(
         q_end=prefill_end,
         q_base_offset=split_t,
     )
+    _write_offload_wire_header(wire_out, split_t, tail_len)
     return wire_out
 
 
@@ -581,73 +696,90 @@ def hy4_fp8_indexer_forward(
         if split_range is not None:
             split_t, prefill_end = split_range
             tail_len = prefill_end - split_t
-            indexer_positions, cos_sin = _indexer_rope_table(
-                indexer, positions, rotary_emb, hidden_states
-            )
-            kw, _ = indexer.wk_weights_proj(hidden_states)
-            _insert_indexer_k_cache(
-                indexer, kw, indexer_positions, cos_sin, positions, rotary_emb, md
-            )
-
-            with sliced_activation_prequant(qr, 0, split_t) as qr_head:
-                q_head, _ = indexer.wq_b(qr_head)
-            q_head = q_head.view(-1, indexer.n_head, indexer.head_dim)
-            q_fp8_head, weights_head = ixfops.fused_indexer_q_rope_quant(
-                q_head,
-                indexer_positions[:split_t].contiguous(),
-                cos_sin,
-                kw[:split_t, indexer.head_dim :].contiguous(),
-                indexer.softmax_scale,
-                indexer.n_head_scale,
-                indexer.rope_dim,
-            )
-
             topk_tokens = indexer.topk_tokens
-            topk_indices_buffer[split_t:prefill_end].copy_(
-                offload_recv_wire.view(-1)[: tail_len * topk_tokens].view(
-                    tail_len, topk_tokens
+            wire_ok, sent_split_t, sent_tail_len = _verify_offload_wire_header(
+                offload_recv_wire, split_t, tail_len, topk_tokens
+            )
+            if not wire_ok:
+                logger.warning_once(
+                    "HY4 PP offload receiver wire mismatch for %s "
+                    "(expected split_t=%d tail_len=%d, got split_t=%d tail_len=%d); "
+                    "falling back to full local indexer.",
+                    getattr(indexer.k_cache, "prefix", "<unknown>"),
+                    split_t,
+                    tail_len,
+                    sent_split_t,
+                    sent_tail_len,
                 )
-            )
-            kv_cache = indexer.k_cache.kv_cache
-            assert md.prefill is not None
-            _run_prefill_chunks_range(
-                md.prefill.chunks,
-                q_fp8_head,
-                weights_head,
-                kv_cache,
-                topk_tokens,
-                topk_indices_buffer,
-                q_start=0,
-                q_end=split_t,
-                q_base_offset=0,
-            )
+            else:
+                indexer_positions, cos_sin = _indexer_rope_table(
+                    indexer, positions, rotary_emb, hidden_states
+                )
+                kw, _ = indexer.wk_weights_proj(hidden_states)
+                _insert_indexer_k_cache(
+                    indexer, kw, indexer_positions, cos_sin, positions, rotary_emb, md
+                )
 
-            if md.num_decodes > 0:
-                assert md.decode is not None
-                num_decode_tokens = md.num_decode_tokens
-                if md.decode.max_context_len == 0:
-                    topk_indices_buffer[:num_decode_tokens].fill_(-1)
-                    return topk_indices_buffer
-                logits = ixfops.dsa_indexer_mqa_logits_with_kvcache_fp8(
-                    q_fp8_head[:num_decode_tokens],
-                    md.decode.cu_seqlens_q,
-                    md.decode.cu_seqlens_kv,
+                with sliced_activation_prequant(qr, 0, split_t) as qr_head:
+                    q_head, _ = indexer.wq_b(qr_head)
+                q_head = q_head.view(-1, indexer.n_head, indexer.head_dim)
+                q_fp8_head, weights_head = ixfops.fused_indexer_q_rope_quant(
+                    q_head,
+                    indexer_positions[:split_t].contiguous(),
+                    cos_sin,
+                    kw[:split_t, indexer.head_dim :].contiguous(),
+                    indexer.softmax_scale,
+                    indexer.n_head_scale,
+                    indexer.rope_dim,
+                )
+
+                payload_start = _OFFLOAD_WIRE_HEADER_INTS
+                payload_end = payload_start + tail_len * topk_tokens
+                topk_indices_buffer[split_t:prefill_end].copy_(
+                    offload_recv_wire.view(-1)[payload_start:payload_end].view(
+                        tail_len, topk_tokens
+                    )
+                )
+                kv_cache = indexer.k_cache.kv_cache
+                assert md.prefill is not None
+                _run_prefill_chunks_range(
+                    md.prefill.chunks,
+                    q_fp8_head,
+                    weights_head,
                     kv_cache,
-                    md.decode.block_table,
-                    weights_head[:num_decode_tokens],
-                    max_q_len=md.decode.max_q_len,
-                    max_kv_len=md.decode.max_kv_len,
-                    max_context_len=md.decode.max_context_len,
-                    valid_lens=md.decode.valid_lens,
-                )
-                ixfops.dsa_update_topk_indices(
-                    logits,
-                    md.decode.cu_seqlen_ks,
-                    md.decode.cu_seqlen_ke,
                     topk_tokens,
-                    topk_indices_buffer[:num_decode_tokens],
+                    topk_indices_buffer,
+                    q_start=0,
+                    q_end=split_t,
+                    q_base_offset=0,
                 )
-            return topk_indices_buffer
+
+                if md.num_decodes > 0:
+                    assert md.decode is not None
+                    num_decode_tokens = md.num_decode_tokens
+                    if md.decode.max_context_len == 0:
+                        topk_indices_buffer[:num_decode_tokens].fill_(-1)
+                        return topk_indices_buffer
+                    logits = ixfops.dsa_indexer_mqa_logits_with_kvcache_fp8(
+                        q_fp8_head[:num_decode_tokens],
+                        md.decode.cu_seqlens_q,
+                        md.decode.cu_seqlens_kv,
+                        kv_cache,
+                        md.decode.block_table,
+                        weights_head[:num_decode_tokens],
+                        max_q_len=md.decode.max_q_len,
+                        max_kv_len=md.decode.max_kv_len,
+                        max_context_len=md.decode.max_context_len,
+                        valid_lens=md.decode.valid_lens,
+                    )
+                    ixfops.dsa_update_topk_indices(
+                        logits,
+                        md.decode.cu_seqlen_ks,
+                        md.decode.cu_seqlen_ke,
+                        topk_tokens,
+                        topk_indices_buffer[:num_decode_tokens],
+                    )
+                return topk_indices_buffer
 
     indexer_positions, cos_sin = _indexer_rope_table(
         indexer, positions, rotary_emb, hidden_states

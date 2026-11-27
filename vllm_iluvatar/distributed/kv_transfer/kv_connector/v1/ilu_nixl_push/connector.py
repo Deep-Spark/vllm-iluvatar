@@ -77,6 +77,27 @@ class IluNixlPushBaseConnector(NixlBaseConnector):
             self.prefix_state.receive_results(result)
         return result
 
+    def get_finished_count(self) -> int | None:
+        kv_transfer_config = getattr(self, "kv_transfer_config", None) or getattr(
+            self, "_kv_transfer_config", None
+        )
+        kv_role = getattr(kv_transfer_config, "kv_role", None)
+        parallel_config = getattr(
+            getattr(self, "_vllm_config", None), "parallel_config", None
+        )
+        if parallel_config is None:
+            return None
+        pcp_size = int(
+            getattr(parallel_config, "prefill_context_parallel_size", 1) or 1
+        )
+        dcp_size = int(getattr(parallel_config, "decode_context_parallel_size", 1) or 1)
+        pcp_dcp_sharded = pcp_size > 1 and dcp_size > 1
+        if kv_role == "kv_producer" and pcp_size > 1 and not pcp_dcp_sharded:
+            tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
+            pp_size = int(getattr(parallel_config, "pipeline_parallel_size", 1) or 1)
+            return tp_size * pp_size
+        return None
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, torch.Tensor],

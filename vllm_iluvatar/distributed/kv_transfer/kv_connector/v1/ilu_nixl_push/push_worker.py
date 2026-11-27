@@ -290,6 +290,10 @@ class IluNixlPushConnectorWorkerMixin(
         super()._sync_block_size_with_kernel()
 
     def start_load_kv(self, metadata: NixlConnectorMetadata):
+        if getattr(self, "pcp_rank", 0) > 0 and not getattr(
+            self, "pcp_dcp_sharded", False
+        ):
+            return
         self._ensure_req_indices()
         if metadata.reqs_to_recv:
             for req_id in list(metadata.reqs_to_recv):

@@ -2717,3 +2717,112 @@ def test_push_handshake_listener_serves_e25_get_state_over_zmq(tmp_path, monkeyp
         listener.join(timeout=2.0)
         ctx.destroy(linger=0)
         sched.shutdown()
+
+
+def test_push_connector_pcp_finished_count_and_real_aggregator(tmp_path, monkeypatch):
+    """Replicated-PCP producer reports TP*PP completions and finishes in KVOutputAggregator."""
+    from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorRole,
+        KVConnectorTransferResults,
+    )
+    from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
+
+    monkeypatch.delenv("VLLM_ILU_NIXL_PROXY_ADDR", raising=False)
+    monkeypatch.delenv("IXLLM_ADDR_PD", raising=False)
+
+    def _pcp_cfg(*, role: str, tp: int, pp: int, pcp: int):
+        cfg = _e25_vllm_config(tmp_path, role=role, tp=tp, pp=pp)
+        cfg.parallel_config.prefill_context_parallel_size = pcp
+        cfg.parallel_config.decode_context_parallel_size = 1
+        cfg.parallel_config.world_size = tp * pp * pcp
+        return cfg
+
+    p_cfg = _pcp_cfg(role="kv_producer", tp=1, pp=1, pcp=2)
+    kv_cfg = _e25_kv_cache_config()
+    sched_conn = IluNixlPushConnector(p_cfg, KVConnectorRole.SCHEDULER, kv_cfg)
+    try:
+        assert sched_conn.get_finished_count() == 1
+        aggregator = KVOutputAggregator.from_connector(
+            sched_conn, world_size=p_cfg.parallel_config.world_size
+        )
+    finally:
+        sched_conn.shutdown()
+
+    def _make_worker_conn(pcp_rank: int) -> IluNixlPushConnector:
+        conn = object.__new__(IluNixlPushConnector)
+        conn.prefix_state = None
+        conn.kv_transfer_config = p_cfg.kv_transfer_config
+        conn._vllm_config = p_cfg
+        conn.connector_scheduler = None
+        conn.connector_worker = SimpleNamespace(
+            pcp_rank=pcp_rank,
+            pcp_dcp_sharded=False,
+            get_transfer_results=lambda: KVConnectorTransferResults(
+                finished_sending={"req-pcp-1"}
+            ),
+        )
+        return conn
+
+    res_rank0 = _make_worker_conn(0).get_transfer_results(set())
+    res_rank1 = _make_worker_conn(1).get_transfer_results(set())
+    assert res_rank0.finished_sending == {"req-pcp-1"}
+    assert res_rank1.finished_sending == set()
+
+    out0 = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        kv_connector_output=KVConnectorOutput(
+            finished_sending=res_rank0.finished_sending or None
+        ),
+    )
+    out1 = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        kv_connector_output=KVConnectorOutput(
+            finished_sending=res_rank1.finished_sending or None
+        ),
+    )
+    aggregated = aggregator.aggregate([out0, out1])
+    assert aggregated is not None
+    assert aggregated.kv_connector_output is not None
+    assert aggregated.kv_connector_output.finished_sending == {"req-pcp-1"}
+    assert "req-pcp-1" not in aggregator._send_remaining_count
+
+    # TP * PP > 1 with PCP > 1 expects TP * PP finished_sending reports.
+    tp2_pp2_conn = object.__new__(IluNixlPushConnector)
+    tp2_pp2_conn.kv_transfer_config = SimpleNamespace(kv_role="kv_producer")
+    tp2_pp2_conn._vllm_config = _pcp_cfg(role="kv_producer", tp=2, pp=2, pcp=2)
+    assert tp2_pp2_conn.get_finished_count() == 4
+
+    # PCP=1 and kv_consumer keep the default world_size aggregation.
+    pcp1_conn = object.__new__(IluNixlPushConnector)
+    pcp1_conn.kv_transfer_config = SimpleNamespace(kv_role="kv_producer")
+    pcp1_conn._vllm_config = _pcp_cfg(role="kv_producer", tp=2, pp=1, pcp=1)
+    assert pcp1_conn.get_finished_count() is None
+
+    cons_conn = object.__new__(IluNixlPushConnector)
+    cons_conn.kv_transfer_config = SimpleNamespace(kv_role="kv_consumer")
+    cons_conn._vllm_config = _pcp_cfg(role="kv_consumer", tp=2, pp=1, pcp=1)
+    assert cons_conn.get_finished_count() is None
+
+
+def test_push_worker_skips_nonzero_replicated_pcp_start_load_kv():
+    """Non-zero replicated PCP producer ranks ignore start_load_kv chunk arming."""
+    w = object.__new__(IluNixlPushConnectorWorker)
+    w.pcp_rank = 1
+    w.pcp_dcp_sharded = False
+    w._chunk_current = set()
+    w._chunk_pending = {}
+
+    meta = IluNixlPushConnectorMetadata()
+    meta.reqs_to_send_chunked["req-pcp-skip"] = ChunkPushReqMeta(
+        local_block_ids=([1, 2],),
+        decode_engine_id="D",
+        prefill_tokens=16,
+        chunk_index=0,
+        is_last_chunk=True,
+    )
+    w.start_load_kv(meta)
+    assert w._chunk_current == set()
+    assert w._chunk_pending == {}

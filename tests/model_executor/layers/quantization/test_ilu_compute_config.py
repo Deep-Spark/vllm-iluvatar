@@ -69,6 +69,7 @@ def test_explicit_fp8_rejects_ivcore11(monkeypatch):
         ("ivcore11", "ixinfer_w4a8_tn_v2", "ixinfer_w4a8_tn_v2"),
         ("ivcore30", "auto", "ixmm_fp4fp8"),
         ("ivcore30", "ixmm_fp4fp8", "ixmm_fp4fp8"),
+        ("ivcore30", "ixmm_mxfp4fp8", "ixmm_mxfp4fp8"),
         ("ivcore30", "ixmm_w4a8_nn", "ixmm_w4a8_nn"),
     ],
 )
@@ -98,6 +99,7 @@ def test_mxfp4_public_modes(monkeypatch, device, mode, expected):
     [
         ("ivcore11", "ixmm_w4a8_nn"),
         ("ivcore11", "ixmm_fp4fp8"),
+        ("ivcore11", "ixmm_mxfp4fp8"),
         ("ivcore30", "ixinfer_w4a8_tn_v2"),
         ("ivcore30", "ixinfer_w4a8_nn_v2"),
         ("ivcore11", "NN"),
@@ -151,6 +153,12 @@ def test_fp8_compute_modes(device, mode, backend, layout):
 
     selection = select_fp8_compute(device, mode)
     assert (selection.name, selection.layout) == (backend, layout)
+
+
+@pytest.mark.parametrize("mode", ["ixmm_mxfp4fp8"])
+def test_mxfp4_only_modes_reject_block_fp8(mode):
+    with pytest.raises(ValueError, match="Unsupported block-FP8 mode"):
+        ilu_compute.select_four_bit_expert_compute("ivcore30", mode, source="block-FP8")
 
 
 def test_bi150_nn_v1_only_accepts_block_fp8():

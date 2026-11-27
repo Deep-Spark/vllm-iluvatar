@@ -194,6 +194,13 @@ class Mxfp4ToIxMMFP4FP8Loader(Mxfp4WeightLoader):
         )
 
 
+class Mxfp4ToIxMMMXFP4FP8Loader(Mxfp4WeightLoader):
+    def convert_shard(self, weight, scale, target, target_scale):
+        from ixformer.inference import functions as ops
+
+        ops.pack_mxfp4_for_ixmm(weight, scale, target, target_scale)
+
+
 def make_mxfp4_loader(weight_spec, load_spec):
     # Match complete semantic contracts, not just a shared TN/NN spelling.
     contracts = {
@@ -208,6 +215,16 @@ def make_mxfp4_loader(weight_spec, load_spec):
         "ixmm_w4a8_nn": (
             Mxfp4ToIxMMW4A8Loader,
             MoEWeightSpec("ixmm_w4a8_nn", "NN", torch.int8),
+        ),
+        "ixmm_mxfp4fp8": (
+            Mxfp4ToIxMMMXFP4FP8Loader,
+            MoEWeightSpec(
+                "ixmm_mxfp4fp8",
+                "mxfp4fp8",
+                torch.uint8,
+                torch.uint8,
+                scale_group_size=32,
+            ),
         ),
         "ixmm_fp4fp8": (
             Mxfp4ToIxMMFP4FP8Loader,

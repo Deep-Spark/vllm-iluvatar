@@ -62,6 +62,8 @@ def select_four_bit_expert_compute(arch, mode, *, source):
     )
 
     modes = _EXPERT_MODES.get(arch, {})
+    if arch == "ivcore30" and source == "MXFP4":
+        modes = {**modes, "ixmm_mxfp4fp8": ("ixmm_mxfp4fp8", "mxfp4fp8")}
     if arch == "ivcore11" and source == "block-FP8" and mode == "ixmm_w4a8_nn":
         return select_moe_backend(arch, name="ixmm_w4a8", layout="NN")
     if arch == "ivcore11" and source == "block-FP8" and mode == "ixinfer_w4a8_nn_v1":

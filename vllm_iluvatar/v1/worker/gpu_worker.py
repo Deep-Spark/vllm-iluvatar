@@ -8,6 +8,7 @@ IluWorker — subclass of the community Worker with following overrides:
 3. ``shutdown`` for attention quantisation support.
 4. ``compile_or_warm_up_model`` to exclude simulated requests from KV calibration.
 5. ``execute_dummy_batch`` for Iluvatar DP idle-rank optimisation.
+6. ``init_device`` for optional ``VLLM_ILU_CUDA_MEM_FRACTION`` capping.
 """
 
 from __future__ import annotations
@@ -88,6 +89,19 @@ def _pcp_profile_local_tokens(num_tokens: int, pcp_size: int, max_num_reqs: int)
 
 
 class IluWorker(Worker):
+    def init_device(self):
+        super().init_device()
+        import vllm.envs as envs
+
+        fraction = envs.VLLM_ILU_CUDA_MEM_FRACTION
+        if fraction is not None:
+            torch.cuda.set_per_process_memory_fraction(fraction, self.device)
+            logger.info(
+                "Applied VLLM_ILU_CUDA_MEM_FRACTION=%.4f on device %s",
+                fraction,
+                self.device,
+            )
+
     def _scoped_allocator_max_split(self, max_split_size_mb: int):
         if (
             max_split_size_mb == 20

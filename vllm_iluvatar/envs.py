@@ -130,6 +130,24 @@ def _maybe_stripped(value: str) -> str | None:
     return value or None
 
 
+def _cuda_mem_fraction() -> float | None:
+    """Optional per-process CUDA caching allocator memory fraction in (0, 1]."""
+    raw = os.environ.get("VLLM_ILU_CUDA_MEM_FRACTION", "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"VLLM_ILU_CUDA_MEM_FRACTION must be a float in (0, 1], got {raw!r}"
+        ) from exc
+    if not (0.0 < value <= 1.0):
+        raise ValueError(
+            f"VLLM_ILU_CUDA_MEM_FRACTION must be in (0, 1], got {raw!r}"
+        )
+    return value
+
+
 def _decode_ep_backend() -> str | None:
     value = _maybe_stripped(os.environ.get("VLLM_ILU_DECODE_EP_BACKEND", ""))
     if value not in (None, "naive", "deepep_low_latency"):
@@ -791,6 +809,11 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Cap num_cpus for ray.init() fresh local cluster starts (see
     # patch_ray_init_num_cpus). 0/1 are clamped up to 1.
     "VLLM_ILU_RAY_NUM_CPUS": _int_reader("VLLM_ILU_RAY_NUM_CPUS", 16, minimum=1),
+    # Optional per-process PyTorch CUDA caching allocator memory fraction in
+    # (0, 1], applied in IluWorker.init_device() via
+    # torch.cuda.set_per_process_memory_fraction(). Empty/unset leaves
+    # PyTorch default (1.0) untouched.
+    "VLLM_ILU_CUDA_MEM_FRACTION": _cuda_mem_fraction,
 }
 
 

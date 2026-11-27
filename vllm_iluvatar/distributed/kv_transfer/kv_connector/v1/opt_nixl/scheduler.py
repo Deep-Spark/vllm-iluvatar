@@ -957,11 +957,14 @@ class NixlConnectorScheduler:
             return False, None
         # P side
         else:
-            if params.get("do_remote_decode"):
+            if params.get("do_remote_decode") or (
+                request.request_id in self._reqs_to_send
+                and request.request_id not in self._pending_worker_sends
+            ):
                 params["do_remote_decode"] = False
-                # when a reqs aborted, p workers will always get d block info and only notify info.:
-                # len(remote_block_ids) > 0 for normal abort
-                # len(remote_block_ids) == 0 for others, full cache then abort or abort before schedule.
+                # Allocation clears the routing flag before the final prefill
+                # chunk hands source blocks to the workers. A request finished
+                # in that interval has no local WRITE to wait for.
                 self._reqs_to_send.pop(request.request_id, None)
                 self._reqs_blocks.pop(request.request_id, None)
                 return False, None

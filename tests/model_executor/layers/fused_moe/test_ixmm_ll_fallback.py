@@ -16,13 +16,17 @@ def test_missing_interface_on_one_rank_falls_back_before_shmem_init(monkeypatch,
     group = SimpleNamespace(rank_in_group=rank, world_size=2, cpu_group=object())
     monkeypatch.setenv("VLLM_ILU_V41_IXMM_LL_DECODE", "1")
     monkeypatch.setenv("VLLM_ILU_IXMM_LL_LIBRARY", "routed.so")
-    runtime = Mock(uid_size=64, sizes={5: (128, 256)})
+    runtime = Mock(uid_size=64, sizes={5: (128, 256)}, tp_workspace_bytes=0)
     reason = "undefined symbol: ixmm_shmem_uid_size"
     loader = Mock(
         return_value=runtime, side_effect=AttributeError(reason) if rank else None
     )
     monkeypatch.setattr(decode, "IxmmLL", loader)
-    votes = [(True, None, (runtime.uid_size, runtime.sizes)), (True, reason, None)]
+    monkeypatch.setattr(decode, "get_tp_group", lambda: SimpleNamespace(world_size=1))
+    votes = [
+        (True, None, (runtime.uid_size, runtime.sizes, 1, 0)),
+        (True, reason, None),
+    ]
 
     def gather(output, vote, *, group):
         assert vote == votes[rank]
@@ -45,12 +49,12 @@ def test_missing_interface_on_one_rank_falls_back_before_shmem_init(monkeypatch,
 @pytest.mark.parametrize("rank", [0, 1])
 def test_empty_graph_plan_still_participates_in_vote(monkeypatch, rank):
     group = SimpleNamespace(rank_in_group=rank, world_size=2, cpu_group=object())
-    runtime = Mock(uid_size=64, sizes={5: (128, 256)})
+    runtime = Mock(uid_size=64, sizes={5: (128, 256)}, tp_workspace_bytes=0)
     loader = Mock(return_value=runtime)
     monkeypatch.setenv("VLLM_ILU_V41_IXMM_LL_DECODE", "1")
     monkeypatch.setattr(decode, "IxmmLL", loader)
     votes = [
-        (True, None, (64, runtime.sizes)),
+        (True, None, (64, runtime.sizes, 1, 0)),
         (True, "no decode graph workspace for this configuration", None),
     ]
 
@@ -59,7 +63,12 @@ def test_empty_graph_plan_still_participates_in_vote(monkeypatch, rank):
         output[:] = votes
 
     monkeypatch.setattr(decode.dist, "all_gather_object", gather)
-    assert decode.prepare("cuda", group, () if rank else (5,)) is None
+    assert (
+        decode.prepare(
+            "cuda", group, () if rank else (5,), SimpleNamespace(world_size=1)
+        )
+        is None
+    )
     runtime.initialize.assert_not_called()
 
 
@@ -123,18 +132,35 @@ def test_tp2_routed_and_shared_outputs(monkeypatch, chunks, rank):
         assert torch.all(ids[hidden.shape[0] :] == -1)
         return x
 
-    runtime = SimpleNamespace(dispatch_send=send, dispatch_recv=Mock())
-    group = Mock(world_size=2)
+    runtime = SimpleNamespace(
+        dispatch_send=send,
+        dispatch_recv=Mock(),
+        ops=SimpleNamespace(tp_join=object()),
+        tp_workspace=object(),
+    )
+    group = Mock(world_size=2, rank_in_group=rank)
 
-    def gather(local, dim):
-        shards = [
-            torch.nn.functional.pad(shard, (0, 0, 0, max(chunks) - n))
-            for shard, n in zip((full * 2).split(chunks), chunks, strict=True)
-        ]
-        torch.testing.assert_close(local, shards[rank])
-        return torch.cat(shards, dim)
+    def fused(
+        op,
+        local,
+        shared,
+        counts,
+        size,
+        routed_scale,
+        shared_scale,
+        out,
+        team,
+        stream,
+        workspace,
+    ):
+        assert op is runtime.ops.tp_join and workspace is runtime.tp_workspace
+        assert list(counts) == chunks and size == 2 and team == 0
+        torch.testing.assert_close(local, hidden)
+        torch.testing.assert_close(shared, full)
+        out.copy_(full * routed_scale + shared * shared_scale + 7)
 
-    group.all_gather.side_effect = gather
+    join = Mock(side_effect=fused)
+    monkeypatch.setattr(decode, "_call", join)
     group.all_reduce.side_effect = lambda x: x + 7
     monkeypatch.setattr(
         decode.torch.cuda, "current_stream", lambda: SimpleNamespace(cuda_stream=1)
@@ -159,5 +185,35 @@ def test_tp2_routed_and_shared_outputs(monkeypatch, chunks, rank):
         group,
     )
     torch.testing.assert_close(actual, full * 3 + 7)
-    assert group.all_gather.call_count == int(chunks is not None)
-    group.all_reduce.assert_called_once()
+    assert join.call_count == int(chunks is not None)
+    group.all_gather.assert_not_called()
+    assert group.all_reduce.call_count == int(chunks is None)
+
+
+@pytest.mark.parametrize(
+    "ep_rank,tp_ranks,valid",
+    [(8, [8, 9], True), (9, [8, 9], True), (8, [9, 8], False), (8, [8, 10], False)],
+)
+def test_tp_workspace_uses_ep_order_and_max_total_rows(
+    monkeypatch, ep_rank, tp_ranks, valid
+):
+    ep_group = SimpleNamespace(rank_in_group=ep_rank, ranks=list(range(16)))
+    tp_group = SimpleNamespace(world_size=2, ranks=tp_ranks)
+    monkeypatch.setenv("VLLM_ILU_DEEPEP_USE_SCATTER", "1")
+    monkeypatch.delenv(decode._WORLD_PAIRS, raising=False)
+    runtime = object.__new__(decode.IxmmLL)
+    runtime.capacities = (3, 5)
+    runtime._bind = Mock()
+    runtime.ops = Mock()
+    size = Mock(return_value=4096)
+    monkeypatch.setattr(decode, "_workspace_size", size)
+    if valid:
+        runtime.plan_tp_join(ep_group, tp_group)
+        size.assert_called_once_with(
+            runtime.ops.tp_workspace_size, 10, decode.HIDDEN, 2, True
+        )
+        assert runtime.tp_workspace_bytes == 4096
+    else:
+        with pytest.raises(ValueError, match="contiguous TP groups"):
+            runtime.plan_tp_join(ep_group, tp_group)
+        size.assert_not_called()

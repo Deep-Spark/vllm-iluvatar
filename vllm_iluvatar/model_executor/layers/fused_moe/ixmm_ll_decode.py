@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
+from vllm.distributed import get_tp_group
 from vllm.logger import init_logger
 
 from vllm_iluvatar import envs
@@ -53,6 +54,29 @@ _BINDINGS = {
     "init_shmem": ("ixmm_shmem_init", [C.c_int, C.c_int, C.c_void_p, C.c_size_t]),
     "allocate": ("ixmm_shmem_alloc", [C.c_size_t, C.POINTER(C.c_void_p)]),
 }
+
+_TP_BINDINGS = {
+    "tp_workspace_size": (
+        "_ZN4ixmm34fused_route_ag_shared_ar_workspaceElllbPm",
+        [C.c_int64] * 3 + [C.c_bool, _SIZE_OUT],
+    ),
+    "tp_join": (
+        "_ZN4ixmm29fused_route_ag_shared_ar_bf16EPK8DLTensorS2_PKiiffPS0_imS5_",
+        [
+            _TENSOR,
+            _TENSOR,
+            C.POINTER(C.c_int32),
+            C.c_int32,
+            C.c_float,
+            C.c_float,
+            _TENSOR,
+            C.c_int,
+            C.c_size_t,
+            _TENSOR,
+        ],
+    ),
+}
+_WORLD_PAIRS = "IXMM_FUSED_ROUTE_AG_SHARED_AR_WORLD_PAIRS"
 
 _caps_ptr = C.pythonapi.PyCapsule_GetPointer
 _caps_ptr.argtypes = [C.py_object, C.c_char_p]
@@ -106,11 +130,8 @@ class IxmmLL:
         if not self.uid_size:
             raise ValueError("IXMM was built without SHMEM host support")
         self.ops = SimpleNamespace()
-        for name, (symbol, argtypes) in _BINDINGS.items():
-            op = getattr(self.lib, symbol)
-            op.argtypes = argtypes
-            op.restype = C.c_int
-            setattr(self.ops, name, op)
+        self._bind(_BINDINGS)
+        self.tp_workspace_bytes = 0
         self.capacities = capacities
         self.sizes = {
             tokens: (
@@ -128,6 +149,32 @@ class IxmmLL:
             for tokens in capacities
         }
         self.buffers = {}
+
+    def _bind(self, bindings):
+        for name, (symbol, argtypes) in bindings.items():
+            op = getattr(self.lib, symbol)
+            op.argtypes = argtypes
+            op.restype = C.c_int
+            setattr(self.ops, name, op)
+
+    def plan_tp_join(self, ep, tp):
+        size = tp.world_size
+        if size == 1 or not (
+            envs.VLLM_ILU_DEEPEP_USE_SCATTER or envs.VLLM_ILU_LL_FUSED_AG_AR
+        ):
+            return
+        # WORLD_PAIRS addresses consecutive EP ranks in groups of TP size.
+        start = ep.rank_in_group // size * size
+        if list(ep.ranks[start : start + size]) != list(tp.ranks):
+            raise ValueError(
+                "IXMM TP join requires contiguous TP groups in EP rank order"
+            )
+        if os.environ.get(_WORLD_PAIRS, "1") != "1":
+            raise ValueError(f"IXMM TP join requires {_WORLD_PAIRS}=1")
+        self._bind(_TP_BINDINGS)
+        self.tp_workspace_bytes = _workspace_size(
+            self.ops.tp_workspace_size, max(self.capacities) * size, HIDDEN, size, True
+        )
 
     def capacity_for(self, local_tokens):
         index = bisect_left(self.capacities, local_tokens)
@@ -207,6 +254,16 @@ class IxmmLL:
                 act_scale=act_scale[:rows],
                 out=empty((tokens, HIDDEN), torch.bfloat16),
             )
+        if self.tp_workspace_bytes:
+            os.environ.setdefault(_WORLD_PAIRS, "1")
+            size = self.tp_workspace_bytes + 255
+            ptr = C.c_void_p()
+            _call(self.ops.allocate, size, C.byref(ptr))
+            storage = torch.as_tensor(CudaBytes(ptr.value, size), device=device)
+            offset = (-ptr.value) % 256
+            # All graph sizes and layers must pass this same full symmetric view.
+            self.tp_workspace = storage.narrow(0, offset, self.tp_workspace_bytes)
+            self.tp_workspace.zero_()
         torch.cuda.synchronize()
         dist.barrier(group=control)
         return True
@@ -234,7 +291,7 @@ class IxmmLL:
         )
 
 
-def prepare(device, group, capacities):
+def prepare(device, group, capacities, tp_group):
     # Cache both outcomes on the EP group. No library loads, object collectives
     # or host allocations occur inside CUDA graph capture or replay.
     if hasattr(group, "_ilu_v41_ixmm_ll"):
@@ -248,7 +305,13 @@ def prepare(device, group, capacities):
     elif enabled:
         try:
             runtime = IxmmLL(envs.VLLM_ILU_IXMM_LL_LIBRARY, capacities)
-            contract = (runtime.uid_size, runtime.sizes)
+            runtime.plan_tp_join(group, tp_group)
+            contract = (
+                runtime.uid_size,
+                runtime.sizes,
+                tp_group.world_size,
+                runtime.tp_workspace_bytes,
+            )
         except (OSError, AttributeError, ValueError, RuntimeError) as exc:
             reason = str(exc)
     else:
@@ -283,7 +346,10 @@ def prepare(device, group, capacities):
 
 def prepare_layer(layer, code_multiplier, group):
     runtime = prepare(
-        layer.w13_weight.device, group, layer._ilu_ixmm_ll_token_capacities
+        layer.w13_weight.device,
+        group,
+        layer._ilu_ixmm_ll_token_capacities,
+        get_tp_group(),
     )
     if runtime is None:
         return
@@ -372,17 +438,29 @@ def forward(
     shared = shared_layer(shared_input)
     runtime.dispatch_recv(buffers, stream)
     routed = experts(buffers, layer, ids, weights, layer.swiglu_limit)
+    if tp_chunk_sizes is not None:
+        # The fused op consumes the unpadded local slice and produces the full
+        # token order, including the correctly rounded routed + shared sum.
+        local_rows = tp_chunk_sizes[tp_group.rank_in_group]
+        counts = (C.c_int32 * tp_group.world_size)(*tp_chunk_sizes)
+        out = torch.empty_like(shared)
+        _call(
+            runtime.ops.tp_join,
+            routed[:local_rows],
+            shared,
+            counts,
+            tp_group.world_size,
+            routed_scale,
+            1.0,
+            out,
+            0,
+            stream,
+            runtime.tp_workspace,
+        )
+        return out
+    routed = routed[: shared.shape[0]]
     if routed_scale != 1.0:
         routed.mul_(routed_scale)
-    rows = max(tp_chunk_sizes) if tp_chunk_sizes is not None else shared.shape[0]
-    routed = routed[:rows]
     if tp_group.world_size > 1:
-        if tp_chunk_sizes is not None:
-            routed = tp_group.all_gather(routed, dim=0)
-            if sum(tp_chunk_sizes) != routed.shape[0]:
-                shards = routed.split(rows)
-                routed = torch.cat(
-                    [shard[:n] for shard, n in zip(shards, tp_chunk_sizes, strict=True)]
-                )
         shared = tp_group.all_reduce(shared)
     return shared + routed

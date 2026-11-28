@@ -232,7 +232,6 @@ class IluDeepseekV41MoE(nn.Module, IluFusedMoEEP):
         routed_experts = getattr(self.experts, "routed_experts", None)
         if routed_experts is not None:
             routed_experts._ilu_v41_skip_sort_supported = True
-            routed_experts._ilu_ixmm_ll_token_capacities = ()
             if (
                 ilu_envs.VLLM_ILU_DISABLE_DEEPEP
                 and (

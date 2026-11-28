@@ -42,6 +42,27 @@ def test_missing_interface_on_one_rank_falls_back_before_shmem_init(monkeypatch,
     assert warning.call_count == int(rank == 0)
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+def test_empty_graph_plan_still_participates_in_vote(monkeypatch, rank):
+    group = SimpleNamespace(rank_in_group=rank, world_size=2, cpu_group=object())
+    runtime = Mock(uid_size=64, sizes={5: (128, 256)})
+    loader = Mock(return_value=runtime)
+    monkeypatch.setenv("VLLM_ILU_V41_IXMM_LL_DECODE", "1")
+    monkeypatch.setattr(decode, "IxmmLL", loader)
+    votes = [
+        (True, None, (64, runtime.sizes)),
+        (True, "no decode graph workspace for this configuration", None),
+    ]
+
+    def gather(output, vote, *, group):
+        assert vote == votes[rank]
+        output[:] = votes
+
+    monkeypatch.setattr(decode.dist, "all_gather_object", gather)
+    assert decode.prepare("cuda", group, () if rank else (5,)) is None
+    runtime.initialize.assert_not_called()
+
+
 def test_missing_optional_library(tmp_path):
     with pytest.raises(OSError):
         decode.IxmmLL(str(tmp_path / "missing.so"), (5,))

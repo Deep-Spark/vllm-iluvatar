@@ -243,7 +243,9 @@ def prepare(device, group, capacities):
     enabled = envs.VLLM_ILU_V41_IXMM_LL_DECODE
     reason = None
     contract = None
-    if enabled:
+    if enabled and not capacities:
+        reason = "no decode graph workspace for this configuration"
+    elif enabled:
         try:
             runtime = IxmmLL(envs.VLLM_ILU_IXMM_LL_LIBRARY, capacities)
             contract = (runtime.uid_size, runtime.sizes)

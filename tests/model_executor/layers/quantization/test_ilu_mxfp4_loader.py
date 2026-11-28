@@ -101,11 +101,23 @@ def deliver(layer, shard, expert, tensor, scale=False):
     return param.weight_loader(param, tensor, name, shard, expert, return_success=True)
 
 
-def loader_for(layer, backend, layout, device="cpu", tp=1, rank=0):
+def loader_for(
+    layer,
+    backend,
+    layout,
+    device="cpu",
+    tp=1,
+    rank=0,
+    width=256,
+    logical=None,
+    w2_k_padded=None,
+):
     arch = "ivcore11" if backend == "ixinfer_w4a8" else "ivcore30"
     selection = select_moe_backend(arch, name=backend, layout=layout)
     spec = get_moe_backend(selection).weight_specs[layout]
-    loader = make_mxfp4_loader(spec, Mxfp4LoadSpec(2, 512, 256, tp, rank))
+    loader = make_mxfp4_loader(
+        spec, Mxfp4LoadSpec(2, 512, width, tp, rank, logical, w2_k_padded)
+    )
     with torch.device(device):
         loader.create_weights(layer, {})
     loader.bind_upload_buffer(
@@ -134,7 +146,7 @@ def loader_for(layer, backend, layout, device="cpu", tp=1, rank=0):
         ("ixmm_fp4fp8", "fp4fp8", "cuda"),
     ],
 )
-@pytest.mark.parametrize("tp,rank", [(1, 0), (2, 1)])
+@pytest.mark.parametrize("tp,rank", [(1, 0), (2, 1), (4, 3), (8, 7)])
 def test_streamed_shards_match_whole_expert(backend, layout, device, tp, rank):
     if device == "cuda":
         if not torch.cuda.is_available():
@@ -143,15 +155,22 @@ def test_streamed_shards_match_whole_expert(backend, layout, device, tp, rank):
             backend == "ixinfer_w4a8" and layout == "NN" and cuda_arch() != "ivcore11"
         ):
             pytest.skip("Unsupported device/backend combination")
+    if tp == 8 and backend != "ixinfer_w4a8":
+        pytest.skip("IxInfer TP8 padding case")
+    if tp == 4 and (backend, layout) != ("ixinfer_w4a8", "TN"):
+        pytest.skip("IxInfer TN TP4 padding case")
+    logical = {4: 576, 8: 288}.get(tp, 256)
+    width = 320 if tp == 8 and layout == "NN" else logical
+    w2_k = {4: 640, 8: 384}[tp] if layout == "TN" and tp in (4, 8) else width
     torch.manual_seed(43)
     layer = ExpertLayer()
-    loader = loader_for(layer, backend, layout, device, tp, rank)
+    loader = loader_for(layer, backend, layout, device, tp, rank, width, logical, w2_k)
     pointers = {k: v.data_ptr() for k, v in layer.named_parameters()}
     sources = {}
     for shard, n, k in (
-        ("w1", 256 * tp, 512),
-        ("w3", 256 * tp, 512),
-        ("w2", 512, 256 * tp),
+        ("w1", logical * tp, 512),
+        ("w3", logical * tp, 512),
+        ("w2", 512, logical * tp),
     ):
         sources[shard] = (
             torch.randint(0, 256, (2, n, k // 2), dtype=torch.uint8),
@@ -180,16 +199,24 @@ def test_streamed_shards_match_whole_expert(backend, layout, device, tp, rank):
             if group == "w13":
                 tensor = torch.cat(
                     [
-                        sources[shard][int(scale)][:, rank * 256 : (rank + 1) * 256]
+                        torch.nn.functional.pad(
+                            sources[shard][int(scale)][
+                                :, rank * logical : (rank + 1) * logical
+                            ],
+                            (0, 0, 0, width - logical),
+                        )
                         for shard in ("w1", "w3")
                     ],
                     1,
                 )
             else:
-                length = 256 // (32 if scale else 2)
+                length = logical // (32 if scale else 2)
                 tensor = sources["w2"][int(scale)][
                     :, :, rank * length : (rank + 1) * length
                 ]
+                tensor = torch.nn.functional.pad(
+                    tensor, (0, (w2_k - logical) // (32 if scale else 2))
+                )
             local.append(tensor.to(device).contiguous())
         w, s = local
         if backend == "ixmm_fp4fp8":
@@ -270,3 +297,145 @@ def test_native_converter_does_not_fall_back_to_torch(monkeypatch):
     with pytest.raises(RuntimeError, match="requires native"):
         _native_converter("mxfp4_to_w4a8")
     _native_converter.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "intermediate,unpadded,expected",
+    [(288, None, 320), (288, 288, 320), (320, 288, 320), (576, None, 576)],
+)
+def test_mxfp4_nn_runtime_geometry_aligns_both_projections(
+    monkeypatch, intermediate, unpadded, expected
+):
+    from types import SimpleNamespace
+
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+        MoEComputeConfig,
+        make_moe_compute,
+    )
+    from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp4_moe import (
+        IluMxfp4MoEMethod,
+    )
+    from vllm_iluvatar.model_executor.layers.quantization.common.moe_compute_binding import (
+        MoEComputeBindingMixin,
+    )
+
+    config = MoEComputeConfig(5120, intermediate, 2, 2)
+    monkeypatch.setattr(MoEComputeBindingMixin, "_compute_config", lambda *_: config)
+    method = object.__new__(IluMxfp4MoEMethod)
+    method.selection = select_moe_backend("ivcore11", name="ixinfer_w4a8", layout="NN")
+    layer = SimpleNamespace(
+        moe_config=SimpleNamespace(intermediate_size_per_partition_unpadded=unpadded)
+    )
+    runtime = method._compute_config(layer)
+    backend = make_moe_compute(runtime, method.selection)
+    assert backend.intermediate == expected
+    assert (2 * runtime.intermediate) % 128 == 0
+    assert runtime.w2_k % 64 == 0
+
+
+def test_ixmm_fp4fp8_tp8_slices_before_padding(monkeypatch):
+    from vllm_iluvatar.model_executor.layers.quantization.common import mxfp4_loader
+
+    selection = select_moe_backend("ivcore30", name="ixmm_fp4fp8", layout="fp4fp8")
+    spec = get_moe_backend(selection).weight_specs["fp4fp8"]
+    loader = make_mxfp4_loader(spec, Mxfp4LoadSpec(2, 512, 288, 8, 7))
+    layer = ExpertLayer()
+    loader.create_weights(layer, {})
+    loader.bind_upload_buffer(
+        Mxfp4UploadBuffer(loader.staging_bytes, layer.w2_weight.device)
+    )
+    assert layer.w13_weight.shape == (2, 256, 576)
+    assert layer.w2_weight.shape == (2, 256, 512)
+    assert layer.w2_weight_scale.shape == (2, 2, 512)
+
+    def capture(weight, scale, target, target_scale, *, backend):
+        assert backend == "ixformer_native"
+        assert weight.shape == (512, 256)
+        assert scale.shape == (512, 16)
+        assert (weight[:, :144] == 0x22).all()
+        assert (scale[:, :9] == 123).all()
+        assert (weight[:, 144:] == 0).all()
+        assert (scale[:, 9:] == 0).all()
+        target.zero_()
+        target_scale.fill_(1)
+
+    monkeypatch.setattr(mxfp4_loader, "_native_converter", lambda _: capture)
+    assert loader.source_shape("w13", False) == (2304, 256)
+    assert loader.source_shape("w2", False) == (512, 1152)
+    assert loader.source_shape("w2", True) == (512, 72)
+    weight = torch.full((512, 1152), 0x11, dtype=torch.uint8)
+    scale = torch.full((512, 72), 120, dtype=torch.uint8)
+    weight[:, 7 * 144 :] = 0x22
+    scale[:, 7 * 9 :] = 123
+    assert deliver(layer, "w2", 4, scale.view(torch.float8_e8m0fnu), scale=True)
+    assert deliver(layer, "w2", 4, weight)
+
+
+@pytest.mark.parametrize("source", ["MXFP4", "MXFP8"])
+def test_ixinfer_nn_v1_mx_shards(source):
+    from dataclasses import replace
+
+    from ixformer.inference import functions as ops
+
+    from vllm_iluvatar.config.ilu_compute import select_four_bit_expert_compute
+    from vllm_iluvatar.model_executor.layers.quantization.common.block_fp8_loader import (
+        BlockFp8LoadSpec,
+    )
+    from vllm_iluvatar.model_executor.layers.quantization.common.mxfp8_loader import (
+        make_mxfp8_loader,
+    )
+
+    selection = select_four_bit_expert_compute(
+        "ivcore11", "ixinfer_w4a8_nn_v1", source=source
+    )
+    spec = get_moe_backend(selection).weight_specs["NN"]
+    cfg = (
+        Mxfp4LoadSpec(1, 512, 256)
+        if source == "MXFP4"
+        else BlockFp8LoadSpec(1, 512, 256, (1, 32))
+    )
+    factory = make_mxfp4_loader if source == "MXFP4" else make_mxfp8_loader
+    with pytest.raises(ValueError, match="full expert K"):
+        factory(spec, replace(cfg, tp_size=2))
+    if not torch.cuda.is_available() or cuda_arch() != "ivcore11":
+        pytest.skip("BI150 native conversion required")
+    loader = factory(spec, cfg)
+    layer = ExpertLayer()
+    with torch.device("cuda"):
+        loader.create_weights(layer, {})
+    loader.bind_upload_buffer(
+        Mxfp4UploadBuffer(loader.staging_bytes, layer.w2_weight.device)
+    )
+    gen = torch.Generator().manual_seed(17)
+    for shard in ("w3", "w2", "w1"):
+        n, k = (512, 256) if shard == "w2" else (256, 512)
+        codes = torch.randint(16, (n, k), generator=gen, dtype=torch.uint8)
+        codes[0].zero_()
+        magnitudes = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+        values = (magnitudes[(codes & 7).long()] * torch.where(codes < 8, 1, -1)).to(
+            torch.float8_e4m3fn
+        )
+        raw = codes[:, ::2] | (codes[:, 1::2] << 4) if source == "MXFP4" else values
+        exponents = torch.randint(
+            116, 133, (n, k // 32), generator=gen, dtype=torch.uint8
+        )
+        assert deliver(layer, shard, 4, raw)
+        assert deliver(layer, shard, 4, exponents, scale=True)
+        w = torch.empty(k, n // 2, dtype=torch.int8, device="cuda")
+        s = torch.empty(1, n, device="cuda")
+        ops.fp8_block_to_w4a8(
+            values.cuda(),
+            exponents.view(torch.float8_e8m0fnu).float().cuda(),
+            w,
+            s,
+            block_shape=(1, 32),
+            weight_format="ixinfer_nn_v1",
+            backend="torch",
+        )
+        group = "w2" if shard == "w2" else "w13"
+        off = n if shard == "w3" else 0
+        actual = getattr(layer, group + "_weight")[0, :, off // 2 : (off + n) // 2]
+        actual_s = getattr(layer, group + "_weight_scale")[0, :, off : off + n]
+        torch.testing.assert_close(actual, w, rtol=0, atol=0)
+        torch.testing.assert_close(actual_s, s, rtol=2e-7, atol=0)
+    loader.finalize()

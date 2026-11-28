@@ -2,6 +2,7 @@
 """Architecture/layout selection, including historical format aliases."""
 
 import pytest
+from conftest import requires_cuda
 
 from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
     select_moe_backend,
@@ -40,6 +41,225 @@ def test_unsupported(arch, name, layout):
         select_moe_backend(arch, name=name, layout=layout)
 
 
+def _support_error(arch, name, layout, **config_overrides):
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+        MoEComputeConfig,
+        MoEComputeSelection,
+        get_moe_backend,
+    )
+
+    config = MoEComputeConfig(
+        **{
+            "hidden": 6144,
+            "intermediate": 384,
+            "local_num_experts": 16,
+            "global_num_experts": 128,
+            "limit": 7.0,
+            **config_overrides,
+        }
+    )
+    selection = MoEComputeSelection(name, layout, arch)
+    return get_moe_backend(selection).support_error(config, selection)
+
+
+@pytest.mark.parametrize(
+    "layout,intermediate,admitted",
+    [
+        # MiniMax-M3 at TP8 (hidden 6144, intermediate 3072/8). Both layouts'
+        # kernels run it; the weight spec's single 256 used to turn it away.
+        ("NN", 384, True),
+        ("TN", 384, True),
+        # w13's N is 2 * intermediate, so NN's N % 128 bites at 288, not 256.
+        ("NN", 288, False),
+        # NN needs K % 64, TN needs K % 128; w2's K is the intermediate.
+        ("NN", 320, True),
+        ("TN", 320, False),
+        # Both need K >= 256, and w2's K is the intermediate.
+        ("NN", 192, False),
+    ],
+)
+def test_ixinfer_w4a8_admits_what_its_kernels_run(layout, intermediate, admitted):
+    error = _support_error(
+        "ivcore11", "ixinfer_w4a8", layout, intermediate=intermediate
+    )
+    assert (error is None) == admitted, error
+
+
+def test_ixmm_w4a8_applies_per_projection_alignment():
+    for width in (320, 384, 576):
+        assert _support_error("ivcore11", "ixmm_w4a8", "NN", intermediate=width) is None
+    assert "w13 N % 128" in _support_error(
+        "ivcore11", "ixmm_w4a8", "NN", intermediate=288
+    )
+    assert _support_error("ivcore30", "ixmm_fp4fp8", "fp4fp8") is None
+
+
+@pytest.mark.parametrize("activation", ["swigluoai", "swigluoai_uninterleave"])
+@pytest.mark.parametrize(
+    "overrides,rejected_for",
+    [
+        ({"alpha": 1.702, "beta": 1.0}, None),
+        # Unset means the layer kept the activation's own default, which is
+        # what the op has compiled in.
+        ({}, None),
+        ({"alpha": 1.0}, "alpha"),
+        ({"beta": 0.0}, "beta"),
+        ({"limit": 8.0}, "limit"),
+    ],
+)
+def test_swigluoai_is_admitted_only_with_the_baked_coefficients(
+    activation, overrides, rejected_for
+):
+    # ``activation_swigluoai_dynamic_scaled_int8`` exposes no coefficients, so
+    # a checkpoint wanting different ones must be refused, not reinterpreted.
+    error = _support_error(
+        "ivcore11", "ixinfer_w4a8", "NN", activation=activation, **overrides
+    )
+    if rejected_for is None:
+        assert error is None, error
+    else:
+        assert error is not None and rejected_for in error
+
+
+def test_ixmm_takes_swigluoai_only_in_the_packed_form_and_only_clamped():
+    """Its op reads packed halves and takes alpha/beta, unlike IxInfer's."""
+    assert (
+        _support_error(
+            "ivcore30", "ixmm_fp4fp8", "fp4fp8", activation="swigluoai_uninterleave"
+        )
+        is None
+    )
+    # The interleaved variant is a different memory layout, not a coefficient
+    # difference, so it must stay out rather than be reinterpreted.
+    assert "does not support activation" in _support_error(
+        "ivcore30", "ixmm_fp4fp8", "fp4fp8", activation="swigluoai"
+    )
+    # Every other activation here treats a missing limit as "no clamp"; this
+    # one has no unclamped form.
+    assert "clamp limit" in _support_error(
+        "ivcore30",
+        "ixmm_fp4fp8",
+        "fp4fp8",
+        activation="swigluoai_uninterleave",
+        limit=None,
+    )
+
+
+def _ixinfer_backend(activation, rows=32, intermediate=384, *, w2_k_padded=None):
+    from vllm_iluvatar.ilu_util.arch import cuda_arch
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+        MoEComputeConfig,
+        MoEComputeSelection,
+    )
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_ixinfer_w4a8 import (
+        IxInferW4A8Backend,
+    )
+
+    config = MoEComputeConfig(
+        hidden=6144,
+        intermediate=intermediate,
+        local_num_experts=2,
+        global_num_experts=2,
+        activation=activation,
+        limit=7.0,
+        w2_k_padded=w2_k_padded,
+    )
+    # TN is the one layout both architectures run, so this does not pin the
+    # test to the host's arch.
+    return IxInferW4A8Backend(
+        config, MoEComputeSelection("ixinfer_w4a8", "TN", cuda_arch())
+    )
+
+
+@requires_cuda
+def test_swigluoai_activation_matches_the_oai_formula():
+    import torch
+
+    rows, intermediate = 32, 384
+    backend = _ixinfer_backend("swigluoai_uninterleave", rows, intermediate)
+    workspace = backend.workspace_spec(rows, torch.bfloat16).allocate("cuda")
+    gemm1 = 3 * torch.randn(rows, 2 * intermediate, device="cuda", dtype=torch.bfloat16)
+    order = torch.arange(rows, dtype=torch.int32, device="cuda")
+
+    codes, scales = backend._activation_quant(gemm1, order, False, workspace)
+
+    # The op reads interleaved gate/up pairs; getting the halves-to-interleaved
+    # conversion wrong would mix the two branches and still look plausible.
+    gate = gemm1[:, :intermediate].float().clamp(max=7.0)
+    up = gemm1[:, intermediate:].float().clamp(-7.0, 7.0)
+    expected = gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
+    # One INT8 code is 1/127 of the row's amax; allow two.
+    tolerance = 2 * expected.abs().amax(dim=-1, keepdim=True) / 127
+    assert torch.all((codes.float() * scales.view(-1, 1) - expected).abs() <= tolerance)
+
+
+@requires_cuda
+@pytest.mark.parametrize("width,padded", [(576, 640), (288, 384)])
+@pytest.mark.parametrize("decode", [False, True])
+def test_tn_w2_activation_padding_matches_zero_extended_input(width, padded, decode):
+    import torch
+
+    backend = _ixinfer_backend("silu", intermediate=width, w2_k_padded=padded)
+    reference = _ixinfer_backend("silu", intermediate=padded)
+    rows = 32
+    gemm1 = torch.randn(rows, 2 * width, dtype=torch.bfloat16, device="cuda")
+    order = torch.arange(rows, dtype=torch.int32, device="cuda")
+    zero_extended = torch.nn.functional.pad(
+        gemm1.view(rows, 2, width), (0, padded - width)
+    ).flatten(1)
+
+    codes, scales = backend._activation_quant(gemm1, order, decode, None)
+    expected_codes, expected_scales = reference._activation_quant(
+        zero_extended, order, decode, None
+    )
+
+    torch.testing.assert_close(codes, expected_codes, rtol=0, atol=0)
+    torch.testing.assert_close(scales, expected_scales, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("pack_version,expected_format", [(1, 0), (2, 1)])
+def test_ixinfer_swiglustep_uses_step_activation(
+    monkeypatch, pack_version, expected_format
+):
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts import (
+        ilu_ixinfer_w4a8 as mod,
+    )
+
+    assert (
+        _support_error(
+            "ivcore11", "ixinfer_w4a8", "NN", activation="swiglustep", limit=7.0
+        )
+        is None
+    )
+    assert "limit 7" in _support_error(
+        "ivcore11", "ixinfer_w4a8", "NN", activation="swiglustep", limit=3.0
+    )
+    monkeypatch.setattr(mod.ops, "activation_dynamic_scaled_int8", lambda **kw: kw)
+    backend = _ixinfer_backend("swiglustep")
+    monkeypatch.setattr(backend, "pack_version", pack_version)
+    intermediate, order = object(), object()
+    assert backend._activation_quant(intermediate, order, True, None) == {
+        "input": intermediate,
+        "act_type": "swiglustep",
+        "dst_to_src": order,
+        "output_format": expected_format,
+        "check_valid": True,
+    }
+
+
+def test_only_swigluoai_pays_for_the_interleave_buffer():
+    import torch
+
+    assert (
+        "gemm1_interleaved"
+        in _ixinfer_backend("swigluoai").workspace_spec(8, torch.bfloat16).buffers
+    )
+    assert (
+        "gemm1_interleaved"
+        not in _ixinfer_backend("silu").workspace_spec(8, torch.bfloat16).buffers
+    )
+
+
 def test_registration_and_explicit_priority(monkeypatch):
     from vllm_iluvatar.model_executor.layers.fused_moe.experts import (
         ilu_compute_backend as mod,
@@ -64,6 +284,55 @@ def test_registration_and_explicit_priority(monkeypatch):
     # Import/dict order cannot change selection.
     monkeypatch.setattr(mod, "_BACKENDS", dict(reversed(list(mod._BACKENDS.items()))))
     assert mod.select_moe_backend("ivcore30").name == "test_extra"
+
+
+def test_only_small_ixmm_batches_may_skip_the_expert_sort():
+    """The group layout's width is how the caller asks for an unsorted route."""
+    import torch
+
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+        MoEComputeConfig,
+    )
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_ixmm_fp4fp8 import (
+        IxMMFP4FP8Backend,
+    )
+
+    def columns(rows, skip_sort):
+        backend = IxMMFP4FP8Backend(
+            MoEComputeConfig(512, 256, 2, 4, limit=10.0),
+            select_moe_backend("ivcore30"),
+        )
+        spec = backend.workspace_spec(rows, torch.bfloat16, skip_sort=skip_sort)
+        return spec.buffers["layout"][0][1]
+
+    assert columns(8, True) == 2
+    assert columns(8, False) == 3
+    # Past the bound the sort repays itself, so the opt-in is ignored.
+    assert columns(257, True) == 3
+    # IxInfer never sorts, so asking changes nothing there.
+    assert (
+        _ixinfer_backend("silu").workspace_spec(8, torch.bfloat16).buffers["layout"][0]
+        == _ixinfer_backend("silu")
+        .workspace_spec(8, torch.bfloat16, skip_sort=True)
+        .buffers["layout"][0]
+    )
+
+
+def test_decode_tile_mode_is_opt_in_and_shape_matched(monkeypatch):
+    from vllm_iluvatar import envs
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_ixmm_fp4fp8 import (
+        IxMMFP4FP8Backend,
+    )
+
+    mode = IxMMFP4FP8Backend._decode_mode
+    monkeypatch.setattr(envs, "VLLM_ILU_V41_DECODE_MOE_MODE1", True)
+    assert mode(768, 5120, 6) == 1
+    # Every part of the shape the tiling was measured on has to hold.
+    assert mode(769, 5120, 6) is None
+    assert mode(768, 4096, 6) is None
+    assert mode(768, 5120, 8) is None
+    monkeypatch.setattr(envs, "VLLM_ILU_V41_DECODE_MOE_MODE1", False)
+    assert mode(768, 5120, 6) is None
 
 
 def test_runtime_weights_validate_format_and_alias_parameters():
@@ -239,8 +508,9 @@ def test_standard_adapter_passes_caller_output_without_copy():
 
     adapter = object.__new__(IluStandardComputeExperts)
     adapter.weights = object()
+    adapter.layer = None
     adapter.backend = SimpleNamespace(
-        run_standard=run, workspace_spec=lambda *args: MoEWorkspaceSpec({})
+        run_standard=run, workspace_spec=lambda *args, **kwargs: MoEWorkspaceSpec({})
     )
     result = adapter.apply(
         output,
@@ -324,6 +594,7 @@ def test_adapter_protocol_binding_and_scaling(monkeypatch, batched):
         workspace_spec=workspace_spec,
         run_standard=standard,
         run_batched=batch,
+        validate_batched_activation=lambda: None,
     )
     adapter = bind_compute_experts(backend, weights, None, None, prepare)
     assert adapter.activation_format() == fmt
@@ -372,3 +643,58 @@ def test_adapter_protocol_binding_and_scaling(monkeypatch, batched):
                 None,
                 None,
             )
+
+
+@pytest.mark.parametrize(
+    "activation",
+    ["silu", "swiglu", "swiglustep", "swigluoai", "swigluoai_uninterleave"],
+)
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("backend_name", ["ixinfer_w4a8", "ixmm_fp4fp8"])
+def test_activation_at_binding(monkeypatch, activation, batched, backend_name):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.fused_moe import FusedMoEActivationFormat
+    from vllm.model_executor.layers.fused_moe.modular_kernel import (
+        FusedMoEExpertsModular,
+    )
+
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_experts import (
+        bind_compute_experts,
+    )
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_ixinfer_w4a8 import (
+        IxInferW4A8Backend,
+    )
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_ixmm_fp4fp8 import (
+        IxMMFP4FP8Backend,
+    )
+
+    cls = IxInferW4A8Backend if backend_name == "ixinfer_w4a8" else IxMMFP4FP8Backend
+    if backend_name == "ixmm_fp4fp8" and activation == "swigluoai":
+        pytest.skip("Activation is not supported by this backend")
+    assert activation in cls.supported_activations
+    backend = object.__new__(cls)
+    backend.config = SimpleNamespace(activation=activation)
+    backend.local_num_experts = 2
+    fmt = (
+        FusedMoEActivationFormat.BatchedExperts
+        if batched
+        else FusedMoEActivationFormat.Standard
+    )
+    prepare = SimpleNamespace(
+        activation_format=fmt,
+        max_num_tokens_per_rank=lambda: 4,
+        num_dispatchers=lambda: 1,
+    )
+    monkeypatch.setattr(FusedMoEExpertsModular, "__init__", lambda self, *args: None)
+    unsupported = activation.startswith("swigluoai") or (
+        activation == "swiglustep" and backend_name == "ixinfer_w4a8"
+    )
+    if batched and unsupported:
+        with pytest.raises(
+            NotImplementedError, match=f"batched experts do not support {activation}"
+        ):
+            bind_compute_experts(backend, None, None, None, prepare)
+    else:
+        adapter = bind_compute_experts(backend, None, None, None, prepare)
+        assert adapter.activation_format() == fmt

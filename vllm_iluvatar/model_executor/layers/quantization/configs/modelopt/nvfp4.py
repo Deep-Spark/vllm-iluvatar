@@ -24,7 +24,8 @@ class IluModelOptNvFp4Config(ModelOptNvFp4Config):
 
     # [ILU override] ModelOptQuantConfigBase.get_quant_method — delta: routed
     # experts (not excluded) return IluModelOptNvFp4MoEMethod instead of
-    # community ModelOptNvFp4FusedMoE. Everything else (linear, attention, KV,
+    # community ModelOptNvFp4FusedMoE; that method picks its own conversion
+    # target per architecture. Everything else (linear, attention, KV,
     # excluded layers) is left to super().
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         if isinstance(layer, RoutedExperts) and not self.is_layer_excluded(prefix):

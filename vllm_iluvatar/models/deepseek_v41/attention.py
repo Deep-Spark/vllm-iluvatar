@@ -134,6 +134,7 @@ warnings.filterwarnings(
 _INDEX_TILE = 256
 _PACKED_MLA_HEADS = (1, 8, 16, 32, 64, 128)
 _PT_MLA_HEADS = (1, 4, 8, 16, 32, 64, 128)
+_FMHADSA_HEADS = (16, 32, 64, 128)
 _V41_PREFILL_FMHADSA_ENV = os.environ.get("IXFORMER_V41_FMHADSA", "1") == "1"
 
 
@@ -2767,6 +2768,11 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
         """Return whether the reader applied inverse RoPE to the output."""
         if q.shape[1] not in _PT_MLA_HEADS:
             raise ValueError(f"Unsupported per-tensor FP8 MLA head count: {q.shape[1]}")
+        # FMHADSA has no 8-head bucket (V4.1 at TP8). The per-tensor FP8
+        # reader already accepts the local width, including for inverse RoPE.
+        use_fmhadsa = (
+            use_fmhadsa and q.shape[1] in _FMHADSA_HEADS and _v41_prefill_fmhadsa()
+        )
         source = getattr(self, "_prefill_q_source", None)
         start = 0
         ready = False
@@ -2802,11 +2808,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             sparse_op = ixfops.sparse_mla_fp8_pt_inv_rope
             kwargs = {"positions": positions, "cos_sin_cache": cos_sin_cache}
         else:
-            sparse_op = (
-                ixfops.fmhadsa
-                if use_fmhadsa and _v41_prefill_fmhadsa()
-                else ixfops.sparse_mla_fp8_pt
-            )
+            sparse_op = ixfops.fmhadsa if use_fmhadsa else ixfops.sparse_mla_fp8_pt
             kwargs = {"backend": "ixformer_native"}
         sparse_op(
             q_fp8,
@@ -3024,7 +3026,7 @@ class IluDeepseekV41Attention(nn.Module, AttentionLayerBase):
             extra_cache = compressed_k_cache
         kwargs = (
             dict(
-                use_fmhadsa=_v41_prefill_fmhadsa(),
+                use_fmhadsa=True,
                 positions=positions,
                 prefill=True,
             )

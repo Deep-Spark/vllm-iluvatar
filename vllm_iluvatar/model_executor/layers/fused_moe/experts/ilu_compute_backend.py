@@ -62,6 +62,26 @@ class MoEComputeConfig:
     limit: float | None = None
     output_scale: float = 1.0
     apply_router_weight_on_input: bool = False
+    # SwiGLU-OAI coefficients, None for every other activation. A backend whose
+    # activation op bakes them in has to reject a disagreeing checkpoint.
+    alpha: float | None = None
+    beta: float | None = None
+    # The logical intermediate is shared by gate/up and the activation.
+    w2_k_padded: int | None = None
+    w13_k_padded: int | None = None
+    w2_n_padded: int | None = None
+
+    @property
+    def w13_k(self):
+        return self.hidden if self.w13_k_padded is None else self.w13_k_padded
+
+    @property
+    def w2_n(self):
+        return self.hidden if self.w2_n_padded is None else self.w2_n_padded
+
+    @property
+    def w2_k(self):
+        return self.intermediate if self.w2_k_padded is None else self.w2_k_padded
 
 
 @dataclass(frozen=True)
@@ -113,6 +133,7 @@ class MoEComputeBackend(ABC):
     supports_batched_experts: ClassVar[bool] = True
     prefer_hybrid_ep: ClassVar[bool] = True
     supported_activations: ClassVar[tuple[str, ...]] = ("silu", "swiglu")
+    supported_batched_activations: ClassVar[tuple[str, ...] | None] = None
     requires_activation_limit: ClassVar[bool] = True
     supports_prequantized_fp8: ClassVar[bool] = False
     supports_prequantized_int8: ClassVar[bool] = False
@@ -130,22 +151,42 @@ class MoEComputeBackend(ABC):
         if error is not None:
             raise NotImplementedError(error)
 
+    def validate_batched_activation(self):
+        allowed = self.supported_batched_activations
+        if allowed is not None and self.config.activation not in allowed:
+            raise NotImplementedError(
+                f"{self.name} batched experts do not support {self.config.activation}"
+            )
+
     @classmethod
     def support_error(cls, config, selection):
         layouts = cls.supported_layouts.get(selection.arch, ())
         if selection.name != cls.name or selection.layout not in layouts:
             return f"{cls.name} cannot consume {selection.layout} on {selection.arch}"
-        spec = cls.weight_specs[selection.layout]
         if min(config.hidden, config.intermediate, config.local_num_experts) <= 0:
             return "Expert dimensions and local expert count must be positive"
-        if config.hidden % spec.alignment or config.intermediate % spec.alignment:
-            return f"{cls.name} requires {spec.alignment}-aligned dimensions"
+        dimensions = cls.dimension_error(config, selection.layout)
+        if dimensions is not None:
+            return dimensions
         if config.apply_router_weight_on_input:
             return "Compute backends require output TopK weighting"
         if config.activation not in cls.supported_activations:
             return f"{cls.name} does not support activation {config.activation}"
         if cls.requires_activation_limit and config.limit is None:
             return f"{cls.name} requires clamped SwiGLU"
+        return None
+
+    @classmethod
+    def dimension_error(cls, config, layout):
+        """Why this layout's kernels cannot take these dimensions, or None.
+
+        The default is the weight spec's single alignment, which a backend
+        overrides when its kernels state a rule per projection -- ``w13`` and
+        ``w2`` do not use hidden and intermediate in the same role.
+        """
+        spec = cls.weight_specs[layout]
+        if config.hidden % spec.alignment or config.intermediate % spec.alignment:
+            return f"{cls.name} requires {spec.alignment}-aligned dimensions"
         return None
 
     @property
@@ -159,8 +200,8 @@ class MoEComputeBackend(ABC):
             )
         device = weights.w13_weight.device
         for prefix, n, k in (
-            ("w13", 2 * self.intermediate, self.hidden),
-            ("w2", self.hidden, self.intermediate),
+            ("w13", 2 * self.intermediate, self.config.w13_k),
+            ("w2", self.config.w2_n, self.config.w2_k),
         ):
             w = getattr(weights, prefix + "_weight")
             s = getattr(weights, prefix + "_weight_scale")
@@ -188,7 +229,16 @@ class MoEComputeBackend(ABC):
                     f"{prefix}: weights/scales must be contiguous on one device"
                 )
 
-    def workspace_spec(self, rows, dtype, *, batched=False):
+    def standard_layout_width(self, rows, skip_sort):
+        """Columns of the Standard group layout; the width selects the kernel.
+
+        A backend whose routing op sorts experts by token count encodes that in
+        a third column, and reading a two-column layout is how the caller asks
+        it not to sort. The default has no such choice.
+        """
+        return self.standard_layout_columns
+
+    def workspace_spec(self, rows, dtype, *, batched=False, skip_sort=False):
         # rows is expanded Standard capacity (T * topk) or padded Batched rows.
         qdtype = self.activation_dtype
         return MoEWorkspaceSpec(
@@ -196,15 +246,15 @@ class MoEComputeBackend(ABC):
                 "layout": (
                     (
                         self.local_num_experts,
-                        2 if batched else self.standard_layout_columns,
+                        2 if batched else self.standard_layout_width(rows, skip_sort),
                     ),
                     torch.int32,
                 ),
                 "mapping": ((rows,), torch.int32),
-                "input": ((rows, self.hidden), qdtype),
+                "input": ((rows, self.config.w13_k), qdtype),
                 "input_scale": ((rows, 1), torch.float32),
                 "gemm1": ((rows, 2 * self.intermediate), dtype),
-                "gemm2": ((rows, self.hidden), dtype),
+                "gemm2": ((rows, self.config.w2_n), dtype),
             }
         )
 

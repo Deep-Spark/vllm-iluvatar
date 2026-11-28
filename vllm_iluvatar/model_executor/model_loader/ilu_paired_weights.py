@@ -7,6 +7,7 @@ inputs; MXFP4 callbacks retain descriptions until the complete plan is checked.
 
 from collections import OrderedDict
 from dataclasses import dataclass
+from os.path import abspath
 
 import torch
 from safetensors import safe_open
@@ -98,6 +99,31 @@ class DeferredCheckpointTensor(torch.Tensor):
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
+        if func is torch.ops.aten.split.Tensor and isinstance(args[0], cls):
+            # ``Tensor.chunk`` lands here, and a model that stores a layer's
+            # experts as one fused tensor splits gate from up with it (Hy4's
+            # ``experts.gate_up_proj``). Each piece is a slice, which replays
+            # through the single-output path below; the last one is short when
+            # the dimension does not divide evenly.
+            value, size = args[0], args[1]
+            dim = args[2] if len(args) > 2 else kwargs.get("dim", 0)
+            length = value.reference.metadata.shape[dim]
+            return tuple(
+                torch.ops.aten.slice.Tensor(
+                    value, dim, begin, min(begin + size, length)
+                )
+                for begin in range(0, length, size)
+            )
+        # ``RoutedExperts.load_weights`` unbinds a fused [E, ...] shard into
+        # per-expert rows (MiniMax-M2.5 block-FP8). Without this, unbind
+        # materializes and paired loading rejects the plain Tensor.
+        if func is torch.ops.aten.unbind.int and isinstance(args[0], cls):
+            value = args[0]
+            dim = args[1] if len(args) > 1 else kwargs.get("dim", 0)
+            length = value.reference.metadata.shape[dim]
+            return tuple(
+                torch.ops.aten.select.int(value, dim, index) for index in range(length)
+            )
         if func in cls._views and isinstance(args[0], cls):
             value = args[0]
             ref = value.reference
@@ -117,13 +143,26 @@ class DeferredCheckpointTensor(torch.Tensor):
         return func(*tree_map(materialize, args), **tree_map(materialize, kwargs))
 
 
-def checkpoint_references(files):
-    """Read headers only; reject duplicate names before yielding any sources."""
+def checkpoint_references(files, *, weight_map=None):
+    """Read headers and use the index to resolve sources for indexed tensors.
+
+    Some exporters omit auxiliary scales from the index. Still load those
+    from the selected shards, rejecting duplicates without an indexed source.
+    """
     references = []
+    if weight_map is not None:
+        weight_map = {name: abspath(file) for name, file in weight_map.items()}
+        selected_files = {abspath(file) for file in files}
+        indexed_names = {
+            name for name, file in weight_map.items() if file in selected_files
+        }
     seen = set()
     for file in files:
+        path = abspath(file)
         with safe_open(file, framework="pt", device="cpu") as reader:
             for name in reader.keys():  # noqa: SIM118
+                if weight_map is not None and weight_map.get(name, path) != path:
+                    continue
                 if name in seen:
                     raise ValueError(f"Duplicate checkpoint tensor: {name}")
                 seen.add(name)
@@ -135,6 +174,13 @@ def checkpoint_references(files):
                     )
                 meta = torch.empty(view.get_shape(), dtype=dtype, device="meta")
                 references.append(TensorReference(TensorSource(file, name), meta))
+    if weight_map is not None:
+        missing = indexed_names - seen
+        if missing:
+            name = min(missing)
+            raise ValueError(
+                f"Indexed checkpoint tensor {name} missing from {weight_map[name]}"
+            )
     return references
 
 

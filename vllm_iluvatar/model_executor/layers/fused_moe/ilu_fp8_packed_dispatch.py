@@ -217,11 +217,7 @@ def maybe_packed_experts(owner, hidden_states, input_ids, ctx, group, sizes):
     communicator = group.device_communicator
     # Every collective decision uses replicated configuration/global DP state.
     if not (
-        type(owner).__module__
-        in (
-            "vllm_iluvatar.models.deepseek_v4.model",
-            "vllm_iluvatar.models.deepseek_v41.model",
-        )
+        type(owner).__module__ == "vllm_iluvatar.models.deepseek_v41.model"
         and type(runner._quant_method).__name__ == "IluMxfp4MoEMethod"
         and ctx.dp_metadata is not None
         and ctx.dp_metadata.all_ranks_decode_only

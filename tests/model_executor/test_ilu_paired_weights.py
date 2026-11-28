@@ -157,6 +157,56 @@ def test_duplicate_sources_and_targets(tmp_path):
         session.close()
 
 
+def test_index_selects_tensor_sources_in_deferred_iterator(tmp_path, monkeypatch):
+    import json
+
+    first = tmp_path / "model-00001.safetensors"
+    second = tmp_path / "model-00002.safetensors"
+    save_file({"embedding": torch.zeros(1), "gate": torch.ones(1)}, first)
+    save_file(
+        {
+            "embedding": torch.ones(1),
+            "up": torch.ones(1),
+            "up.weight_scale_inv": torch.ones(1),
+        },
+        second,
+    )
+    index = tmp_path / "model.safetensors.index.json"
+    weight_map = {"embedding": second.name, "gate": first.name, "up": second.name}
+    index.write_text(json.dumps({"weight_map": weight_map}))
+
+    loader = IluDefaultModelLoader.__new__(IluDefaultModelLoader)
+    loader.load_config = SimpleNamespace(safetensors_load_strategy=None)
+    monkeypatch.setattr(
+        loader,
+        "_prepare_weights",
+        lambda *_: (str(tmp_path), [str(first), str(second)], True, index.name),
+    )
+    source = SimpleNamespace(
+        model_or_path=str(tmp_path),
+        subfolder=None,
+        revision=None,
+        fall_back_to_pt=False,
+        allow_patterns_overrides=None,
+        prefix="",
+    )
+    readers = SafetensorsReaders()
+    loader._paired_session = SimpleNamespace(readers=readers)
+    try:
+        references = dict(loader._deferred_iterator(source))
+        assert set(references) == set(weight_map) | {"up.weight_scale_inv"}
+        assert references["embedding"].reference.source.file == str(second)
+        torch.testing.assert_close(
+            references["embedding"].reference.read(readers), torch.ones(1)
+        )
+        weight_map["gate"] = second.name
+        index.write_text(json.dumps({"weight_map": weight_map}))
+        with pytest.raises(ValueError, match="Indexed checkpoint tensor gate missing"):
+            list(loader._deferred_iterator(source))
+    finally:
+        readers.close()
+
+
 def test_deferred_views_and_unsupported_expert_data_transform(tmp_path):
     model = MappedModel(1)
     files = checkpoint(tmp_path, model)
@@ -177,6 +227,78 @@ def test_deferred_views_and_unsupported_expert_data_transform(tmp_path):
         session.close()
     with pytest.raises(RuntimeError, match="closed"):
         destination.copy_(view)
+
+
+def test_chunking_a_fused_expert_tensor_stays_deferred(tmp_path):
+    """A model holding one layer's experts fused splits gate from up with chunk.
+
+    ``Tensor.chunk`` dispatches to ``aten.split.Tensor``, whose several outputs
+    do not fit the single-output view replay; materializing instead would make
+    the callback reject the source (Hy4's ``experts.gate_up_proj``).
+    """
+    model = MappedModel(1)
+    files = checkpoint(tmp_path, model)
+    session = PairedLoadSession({model.loaders[0]: "block"})
+    session.bind()
+    try:
+        ref = next(
+            r for r in checkpoint_references(files) if r.source.name == "source_000"
+        )
+        tensor = DeferredCheckpointTensor(ref, session.readers)
+        rows = tensor.shape[0]
+
+        halves = tensor.chunk(2, dim=0)
+
+        assert session.readers.reads == 0
+        assert all(isinstance(half, DeferredCheckpointTensor) for half in halves)
+        assert [half.shape[0] for half in halves] == [rows // 2, rows - rows // 2]
+        # Each piece must replay to its own rows, not to the whole tensor.
+        whole = ref.read(session.readers)
+        for index, half in enumerate(halves):
+            destination = torch.empty(half.shape, dtype=half.dtype)
+            destination.copy_(half)
+            begin = index * (rows // 2)
+            assert torch.equal(destination, whole[begin : begin + half.shape[0]])
+        # An uneven split keeps the short tail rather than dropping it.
+        assert [piece.shape[0] for piece in tensor.chunk(3, dim=0)] == [
+            (rows + 2) // 3,
+            (rows + 2) // 3,
+            rows - 2 * ((rows + 2) // 3),
+        ]
+    finally:
+        session.close()
+
+
+def test_unbinding_a_fused_expert_tensor_stays_deferred(tmp_path):
+    """Fused [E, ...] MoE shards are unbound into per-expert rows (MiniMax-M2).
+
+    ``Tensor.unbind`` must stay deferred like ``chunk``; materializing would make
+    paired block-FP8 loading reject the plain Tensor at ``PairedLoadSession.add``.
+    """
+    model = MappedModel(1)
+    files = checkpoint(tmp_path, model)
+    session = PairedLoadSession({model.loaders[0]: "block"})
+    session.bind()
+    try:
+        ref = next(
+            r for r in checkpoint_references(files) if r.source.name == "source_000"
+        )
+        tensor = DeferredCheckpointTensor(ref, session.readers)
+        rows = tensor.shape[0]
+
+        experts = tensor.unbind(0)
+
+        assert session.readers.reads == 0
+        assert len(experts) == rows
+        assert all(isinstance(expert, DeferredCheckpointTensor) for expert in experts)
+        assert all(expert.shape == tensor.shape[1:] for expert in experts)
+        whole = ref.read(session.readers)
+        for index, expert in enumerate(experts):
+            destination = torch.empty(expert.shape, dtype=expert.dtype)
+            destination.copy_(expert)
+            assert torch.equal(destination, whole[index])
+    finally:
+        session.close()
 
 
 def test_registered_loader_discovers_callbacks_and_releases_session(

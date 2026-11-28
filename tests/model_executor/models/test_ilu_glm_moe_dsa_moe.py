@@ -161,57 +161,6 @@ def test_invalid_decode_override_rejected_when_read(monkeypatch):
         ilu_envs._decode_ep_backend()
 
 
-@pytest.mark.parametrize(
-    "backend",
-    ["allgather_reducescatter", "deepep_low_latency", "deepep_high_throughput"],
-)
-@pytest.mark.parametrize("decode", [False, True])
-def test_existing_dp_ep_dispatch_without_override(monkeypatch, backend, decode):
-    """Call DSv4's actual model entry; downstream kernels remain test doubles."""
-    from vllm_iluvatar.models.deepseek_v4.model import IluDeepseekV4MoE
-
-    monkeypatch.setattr(ep, "_DECODE_EP_BACKEND", None)
-    monkeypatch.setattr(
-        ep,
-        "get_forward_context",
-        lambda: SimpleNamespace(
-            dp_metadata=SimpleNamespace(all_ranks_decode_only=decode)
-        ),
-    )
-    moe = IluDeepseekV4MoE.__new__(IluDeepseekV4MoE)
-    torch.nn.Module.__init__(moe)
-    stub = _make_stub_moe(backend)
-    moe.experts = stub.experts
-    moe.gate = MagicMock()
-    moe.gate.tid2eid = torch.zeros(1)  # Exercise hash-routing input propagation.
-    moe.hash_indices_dtype = torch.int64
-    x = torch.zeros(2, 4)
-    ids = torch.tensor([1, 2], dtype=torch.int32)
-    q = torch.zeros_like(x, dtype=torch.int8)
-    shared = (q, torch.ones(2, 1), x.dtype)
-    moe.forward_dp_ep_naive = MagicMock(return_value=x + 1)
-    moe.forward_dp_ep_deep_ep = MagicMock(return_value=x + 2)
-    result = moe.forward(x, ids, shared_gate_up_input=shared)
-    selected = (
-        moe.forward_dp_ep_naive
-        if backend == "allgather_reducescatter"
-        else moe.forward_dp_ep_deep_ep
-    )
-    selected.assert_called_once()
-    call = selected.call_args
-    assert call.args[0] is x
-    assert call.args[1].dtype == torch.int64
-    torch.testing.assert_close(call.args[1], ids.long())
-    assert call.kwargs["shared_gate_up_input"] is shared
-    torch.testing.assert_close(
-        result, x + (1 if backend == "allgather_reducescatter" else 2)
-    )
-    moe.experts.assert_not_called()
-    if backend == "deepep_high_throughput":
-        assert call.kwargs["enable_fused_ag_ar"] is False
-        assert call.kwargs["moe_kernel"] is moe.experts._quant_method.moe_kernel
-
-
 def test_configured_ll_does_not_preinit_duplicate_handle(monkeypatch):
     monkeypatch.setattr(ep, "_DECODE_EP_BACKEND", "deepep_low_latency")
     monkeypatch.setattr(ep.IluFusedMoEEP, "_dp_ep_ll_preinit_done", False)

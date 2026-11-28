@@ -43,7 +43,8 @@ def swiglu_clamp(x: torch.Tensor, limit: float | None) -> torch.Tensor:
     ``gate = clamp(x[..., :d], max=limit)``, ``up = clamp(x[..., d:], +-limit)``,
     result ``silu(gate) * up``. Computed in fp32 and cast back to ``x.dtype``.
 
-    Used by the routed-expert activation in ``ilu_mxfp4_fused_experts()``
+    Used by the routed-expert activation in
+    ``ilu_mxfp4_fused_experts_torch()``
     (``layers/fused_moe/ilu_mxfp4_fused_moe.py``) and as the reference the
     kernel-backed ``IluSiluAndMulWithClamp`` below is checked against.
     """

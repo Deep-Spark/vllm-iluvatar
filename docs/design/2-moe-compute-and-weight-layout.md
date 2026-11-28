@@ -138,13 +138,13 @@ payload 读取器默认缓存最多 16 个 safetensors 句柄，LRU 淘汰；同
 
 此路径接受单 checkpoint 的顺序 safetensors lazy/default 或 prefetch 策略；拒绝多线程文件加载、eager/torchao、secondary weights。loader 注册覆盖 `auto/safetensors/pt/npcache` 的社区入口名称，但**实际选中文件必须是 safetensors**，不能据此宣称已支持 PT/npcache payload。无 MXFP4 回调的模型不受上述新路径限制。
 
-当前统一准入要求无 bias、无额外维度 padding 的 gated experts、clamped SiLU/SwiGLU、输出端 TopK 加权，以及 hidden/intermediate 满足 WeightSpec 的 256 对齐。预处理运行权重、EPLB 和不相容 expert placement 不属于此新路径支持范围。Method/Loader 只完成一轮创建和 finalize，重复创建或 finalize 拒绝。
+当前统一准入要求无 bias、无额外维度 padding 的 gated experts、clamped SiLU/SwiGLU（IxInfer W4A8 另接受 SwiGLU-OAI，见下）、输出端 TopK 加权，以及 backend 声明的维度规则。维度规则默认是 WeightSpec 的单一对齐值（IxMM FP4FP8 为 32，其余为 256），backend 可用 `dimension_error()` 覆盖成按投影的真实内核约束：IxInfer W4A8 的 `moe_w4a8_group_gemm/gemv` 要求 NN 下 `N % 128 == 0 && K % 64 == 0`、TN 下 `N % 16 == 0 && K % 128 == 0`，两者均需 `K >= 256`，而 `w13` 与 `w2` 的 N/K 取值不同。SwiGLU-OAI 走 `activation_swigluoai_dynamic_scaled_int8`，该算子把 limit=7.0、alpha=1.702、beta=1.0 编译在内且只接受 interleaved 布局，因此系数不符的 checkpoint 会被拒绝，batched（DeepEP LL）路径不支持该激活。预处理运行权重、EPLB 和不相容 expert placement 不属于此新路径支持范围。Method/Loader 只完成一轮创建和 finalize，重复创建或 finalize 拒绝。
 
 换模型不新增模型专用配对接口：先确认该模型原有映射是否保持可追溯的来源和允许的视图、回调是否具有相容的 projection/TP/EP 语义，以及激活与通信是否满足 backend 契约。直接绕过回调写 expert、未知 fused 源布局、加载中提前消费尚未转换的参数都不能仅凭“权重是 MXFP4”判定兼容。
 
 ### 3.7 block-FP8 使用同一生命周期
 
-`IluFp8MoEMethod` 与 MXFP4 一样在加载前选择目标 `MoEWeightSpec`，注册最终参数，完成配对转换后绑定公共 compute。`select_fp8_compute()` 使用相同的公共 mode 表；Config 先处理显式 runtime 转换，与非 auto compute 配置冲突时报错。源 checkpoint 是整层三维张量还是逐专家张量，不改变 Method、compute 或通信适配器。
+`IluFp8MoEMethod` 与 MXFP4 一样在加载前选择目标 `MoEWeightSpec`，注册最终参数，完成配对转换后绑定公共 compute。选择走 `MoEComputeBindingMixin._select_compute()`，与其他来源共用 `select_four_bit_expert_compute()` 的公共 mode 表，只以 `compute_source` 区分报错文案；Config 先处理显式 runtime 转换，与非 auto compute 配置冲突时报错。源 checkpoint 是整层三维张量还是逐专家张量，不改变 Method、compute 或通信适配器。
 
 Flash 的模型映射只将整层 gate/up、down 表示为逐专家 `w1/w3/w2` 的延迟视图，并调用社区签名的权重回调；普通模型沿用自己的映射。`BlockFp8WeightLoader` 接受 E4M3FN 和 BF16/FP32 乘法 block scale。它按完整 WeightSpec 选择转换器，不通过字符串模型名或 packed 开关裁剪计算能力。尚未实现的源格式仍明确拒绝。
 
@@ -266,9 +266,31 @@ GLM-5.2 的 block-FP8 Method 从当前计算 backend 取得输入能力。IxMM F
 --additional-config '{"ilu_compute":{"schema_version":1,"moe":{"mode":"ixmm_w4a8_nn"}}}'
 ```
 
-省略 mode 或选择 `auto` 时，150 默认 IxInfer W4A8 NN（`ixinfer_w4a8_nn_v2`），300 默认 IxMM FP4FP8（`ixmm_fp4fp8`）。显式 mode 必须符合当前架构的公共列表；此外，150 读取原始 block-FP8 checkpoint 时还支持显式指定 `ixmm_w4a8_nn` 或 `ixinfer_w4a8_nn_v1`（后者要求专家层 `tp_size == 1` 且 `local_num_experts >= 2`），两者仅开放给 block-FP8，MXFP4 在 150 上指定它们或其他不支持组合均报错。
+省略 mode 或选择 `auto` 时，150 默认 IxInfer W4A8 NN（`ixinfer_w4a8_nn_v2`），300 默认 IxMM FP4FP8（`ixmm_fp4fp8`）。150 上的 block-FP8、MXFP4、MXFP8 可显式指定 `ixinfer_w4a8_nn_v1`。`ixmm_w4a8_nn` 在 150 上仅开放给 block-FP8。
 
 为兼容已有启动方式，在未提供 MoE compute 配置时，150 的旧 `VLLM_ILU_MOE_RUNTIME_LAYOUT` 可以覆盖布局默认值。显式 mode 优先。本文默认项均指未作这类覆盖的行为。
+
+#### ivcore11 原生 BF16/FP16 expert 权重
+
+原生 BF16/FP16 checkpoint 上，`moe.mode` 默认使用 `ixinfer_w4a8_nn_v2`，也可显式选 `ixinfer_w4a8_tn_v2` 或 `original`。W4A8 路径按 expert shard 生成打包权重及通道 scale。Down projection 的 scale 在 TP 切片前按完整 K 计算。选择 `original` 时使用 W16A16，具体精度由 vLLM 的 `--dtype` 决定。
+
+MoE 和 Linear 可独立选择，例如将 MoE 切到 TN，同时保留 Linear 的原生精度：
+
+```bash
+--additional-config '{"ilu_compute":{"moe":{"mode":"ixinfer_w4a8_tn_v2"},"linear":{"native_backend":"original"}}}'
+```
+
+原生模型的分发入口是 `configs/native.py`，实现位于 `backends/native/`，通过 `ilu_compute` 直接启用。由 inline.yaml 描述的显式转换仍使用 `ilu_runtime` 入口。
+
+该默认分发针对 ivcore11 的原生模型。已量化 checkpoint、显式 `ilu_quant` 和预转换 sharded-state 加载沿用各自的分发路径。
+
+#### ivcore11 原生 Qwen4Exp PLE n-gram 表
+
+`ilu_compute.ple.backend` 单独控制原生 BF16/FP16 checkpoint 的 PLE n-gram 表。
+`auto`（默认）和 `int8` 均在建表时分配 INT8 权重和逐行 FP32 scale。加载器只取与本
+TP rank 重叠的行，在 CPU 上分块量化并直接写入目标表。推理先查表，再反量化命中的行。
+`original` 按 vLLM 的 `--dtype` 分配 BF16/FP16 表。已量化 checkpoint 的 PLE
+格式由 checkpoint 的量化配置确定。
 
 ### 6.2 启用 Hybrid LL decode
 
@@ -320,7 +342,7 @@ export VLLM_ILU_DISABLE_DEEPEP=1
 
 ### 7.2 通信接线
 
-- `vllm_iluvatar/models/deepseek_v4/fp8_model.py`：模型侧选择 runner 或 Hybrid EP 入口。
+- `vllm_iluvatar/models/deepseek_v4/model.py`：模型侧选择 runner 或 Hybrid EP 入口。
 - `vllm_iluvatar/model_executor/layers/fused_moe/ilu_fused_moe_ep.py`：AG/RS、LL decode kernel 组装、通信与计算串接、输出缩放。
 - 同目录 `prepare_finalize/ilu_deepep_ll.py`：LL 的 dispatch/combine、激活格式与有效 token 元数据。
 - 同目录 `runner/ilu_moe_runner.py`：普通 runner 的 dispatch/combine。
@@ -393,7 +415,7 @@ GLM-5.2 的 ModelZoo 复测保留了模型参数；已激活开发环境时需�
 
 - Hybrid 自定义通信入口要求 DP>1、EP、PCP=1；LL hidden size 当前限定为 2048、2560、3072、4096、5120、6144、7168、8192，并需配置足够的 token 容量。
 - 当前 MXFP4 与 block-FP8 Method 均不支持 EPLB。W4A8 要求连续 expert placement；FP4FP8 backend 可使用 expert_map。
-- 150 上的 `ixinfer_w4a8_nn_v1` 仅面向原始 block-FP8，要求专家层 `tp_size == 1`、`local_num_experts >= 2`，且 Decode Graph GEMM 仅支持 BF16 输出。
+- 150 上的 `ixinfer_w4a8_nn_v1` 支持 block-FP8、MXFP4、MXFP8，要求专家层 `tp_size == 1`、`local_num_experts >= 2`，且 Decode Graph GEMM 仅支持 BF16 输出。
 - 底层 registry 中的 ivcore30/IxInfer TN 不属于当前 MXFP4/block-FP8 公共 mode，不列入本表。
 
 维护矩阵时同步更新 HTML 源表与 PNG，保证 Method、mode、通信状态及默认标注一致。

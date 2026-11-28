@@ -96,7 +96,6 @@ def test_mxfp4_public_modes(monkeypatch, device, mode, expected):
 @pytest.mark.parametrize(
     "device,mode",
     [
-        ("ivcore11", "ixmm_w4a8_nn"),
         ("ivcore11", "ixmm_fp4fp8"),
         ("ivcore30", "ixinfer_w4a8_tn_v2"),
         ("ivcore30", "ixinfer_w4a8_nn_v2"),
@@ -130,8 +129,27 @@ def test_mxfp4_explicit_mode_overrides_legacy_env(monkeypatch):
         ),
     )
     monkeypatch.setattr(mod, "IluMxfp4MoEMethod", lambda config, selection: selection)
-    selected = mod.select_mxfp4_method(SimpleNamespace(moe_config=None), object())
+    selected = mod.make_mxfp4_method(SimpleNamespace(moe_config=None))
     assert selected.layout == "TN"
+
+
+@pytest.mark.parametrize("moe", [{}, {"mode": "ixinfer_w4a8_tn_v2"}])
+def test_mxfp4_rejects_the_retired_backend_env(monkeypatch, moe):
+    """A launch script still selecting a kernel must hear that it cannot."""
+    from vllm_iluvatar import envs
+    from vllm_iluvatar.model_executor.layers.quantization.backends.fp4 import (
+        mxfp4_moe as mod,
+    )
+
+    monkeypatch.setattr(arch, "cuda_arch", lambda: "ivcore30")
+    monkeypatch.setattr(envs, "VLLM_ILU_MXFP4_MOE_BACKEND", "torch")
+    monkeypatch.setattr(
+        ilu_compute,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(additional_config={"ilu_compute": {"moe": moe}}),
+    )
+    with pytest.raises(ValueError, match="no longer"):
+        mod.make_mxfp4_method(SimpleNamespace(moe_config=None))
 
 
 @pytest.mark.parametrize(
@@ -145,20 +163,35 @@ def test_mxfp4_explicit_mode_overrides_legacy_env(monkeypatch):
     ],
 )
 def test_fp8_compute_modes(device, mode, backend, layout):
-    from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe import (
-        select_fp8_compute,
+    """The public mode table every converted expert source resolves through."""
+    selection = ilu_compute.select_four_bit_expert_compute(
+        device, mode, source="block-FP8"
     )
-
-    selection = select_fp8_compute(device, mode)
     assert (selection.name, selection.layout) == (backend, layout)
 
 
-def test_bi150_nn_v1_only_accepts_block_fp8():
+@pytest.mark.parametrize("source", ["block-FP8", "MXFP4", "MXFP8"])
+def test_bi150_ixmm_w4a8_sources(source):
+    selection = ilu_compute.select_four_bit_expert_compute(
+        "ivcore11", "ixmm_w4a8_nn", source=source
+    )
+    assert (selection.name, selection.layout) == ("ixmm_w4a8", "NN")
+
+
+@pytest.mark.parametrize("source", ["block-FP8", "MXFP4", "MXFP8"])
+def test_bi150_nn_v1_sources(source):
     select = ilu_compute.select_four_bit_expert_compute
-    selection = select("ivcore11", "ixinfer_w4a8_nn_v1", source="block-FP8")
+    selection = select("ivcore11", "ixinfer_w4a8_nn_v1", source=source)
     assert (selection.name, selection.layout) == ("ixinfer_w4a8_nn_v1", "NN")
     with pytest.raises(ValueError, match="Unsupported"):
-        select("ivcore11", "ixinfer_w4a8_nn_v1", source="MXFP4")
+        select("ivcore30", "ixinfer_w4a8_nn_v1", source=source)
+
+
+@pytest.mark.parametrize("mode", ["ixinfer_w4a8_nn_v1", "ixmm_w4a8_nn"])
+@pytest.mark.parametrize("source", ["native BF16/FP16", "NVFP4"])
+def test_bi150_converted_modes_reject_other_sources(mode, source):
+    with pytest.raises(ValueError, match="requires one of"):
+        ilu_compute.select_four_bit_expert_compute("ivcore11", mode, source=source)
 
 
 def test_fp8_runtime_compute_conflict(monkeypatch):
@@ -177,3 +210,82 @@ def test_fp8_runtime_compute_conflict(monkeypatch):
     )
     assert select_fp8_method(original, runtime) is runtime
     assert select_fp8_method(original, None) is original
+
+
+@pytest.mark.parametrize(
+    "linear,moe,expected_linear,expected_layout",
+    [
+        ({}, {}, "w8a8_int8", "NN"),
+        (
+            {"native_backend": "w8a8_int8"},
+            {"mode": "ixinfer_w4a8_nn_v2"},
+            "w8a8_int8",
+            "NN",
+        ),
+        (
+            {"native_backend": "original"},
+            {"mode": "ixinfer_w4a8_tn_v2"},
+            "original",
+            "TN",
+        ),
+        (
+            {"native_backend": "original"},
+            {"mode": "original"},
+            "original",
+            None,
+        ),
+    ],
+)
+def test_native_compute_modes(
+    monkeypatch, linear, moe, expected_linear, expected_layout
+):
+    monkeypatch.setattr(
+        ilu_compute,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            additional_config={"ilu_compute": {"linear": linear, "moe": moe}}
+        ),
+    )
+    assert ilu_compute.native_linear_backend() == expected_linear
+    selection = ilu_compute.native_moe_compute()
+    if expected_layout is None:
+        assert selection is None
+    else:
+        assert (selection.name, selection.layout) == ("ixinfer_w4a8", expected_layout)
+
+
+@pytest.mark.parametrize(
+    "mode", ["bf16.fp16", "bf16", "fp16", "ixinfer_w4a8_nn", "w8a8_int8", ""]
+)
+def test_native_modes_take_only_their_canonical_spelling(monkeypatch, mode):
+    """``original`` is the only way to ask for the model's own precision."""
+    monkeypatch.setattr(
+        ilu_compute,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            additional_config={
+                "ilu_compute": {
+                    "linear": {"native_backend": mode},
+                    "moe": {"mode": mode},
+                }
+            }
+        ),
+    )
+    if mode != "w8a8_int8":
+        with pytest.raises(ValueError, match="native_backend"):
+            ilu_compute.native_linear_backend()
+    with pytest.raises(ValueError, match="native BF16/FP16 mode"):
+        ilu_compute.native_moe_compute()
+
+
+@pytest.mark.parametrize("setting", ["fp8", "", None, ["int8"], {"mode": "int8"}])
+def test_invalid_native_ple_backend(monkeypatch, setting):
+    monkeypatch.setattr(
+        ilu_compute,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            additional_config={"ilu_compute": {"ple": {"backend": setting}}}
+        ),
+    )
+    with pytest.raises(ValueError, match=r"ilu_compute[.]ple[.]backend"):
+        ilu_compute.native_ple_backend()

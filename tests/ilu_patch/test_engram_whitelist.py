@@ -28,7 +28,7 @@ def test_ilu_v41_arch_is_an_engram_model():
     assert model_has_engram_layers(_model("IluDeepseekV41ForCausalLM", [1, 14]))
     assert model_has_engram_layers(_model("DeepseekV41ForCausalLM", [1]))
     assert not model_has_engram_layers(_model("IluDeepseekV41ForCausalLM", []))
-    assert not model_has_engram_layers(_model("IluDeepseekV4ForCausalLM", [1]))
+    assert not model_has_engram_layers(_model("DeepseekV4ForCausalLM", [1]))
 
 
 def test_ilu_engram_rejects_ubatch():

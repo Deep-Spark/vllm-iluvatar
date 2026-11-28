@@ -24,15 +24,17 @@ Why      : two independent failures on the community class.
               (``enable_lm_head_fp32``), and community ``LogitsProcessor``
               accepts only ``UnquantizedEmbeddingMethod`` for a head whose dtype
               differs from the model dtype, so it raises.
-How      : subclass, swap ``FusedMoEMethodCls`` to ``IluMxFp8ToFp4OnlineMoE``
-           (load-time MXFP8 -> ix30 FP4; the host-staging ``IluMxFp8FusedMoE``
-           peak does not fit Hy4, see that module's docstring), and narrow the
-           excluded-``ParallelLMHead`` case to ``UnquantizedEmbeddingMethod``.
-           Both are one-line deltas; no method body is copied. Dense linears
-           are untouched -- they go through
-           the inherited ``ModelOptMxFp8LinearMethod``, which picks up
-           ``IluMxfp8LinearKernel`` from the patched kernel list.
-Scope    : ModelOpt MXFP8 checkpoints on Iluvatar corex30 (Hy4-preview).
+How      : subclass, swap ``FusedMoEMethodCls`` to ``IluMxFp8MoEMethod``
+           (shard-by-shard MXFP8 conversion into whichever expert contract the
+           architecture selected), and narrow the excluded-``ParallelLMHead``
+           case to ``UnquantizedEmbeddingMethod``. Both are one-line deltas; no
+           method body is copied. Dense linears are untouched on ivcore30 --
+           they go through the inherited ``build_linear_method``, which picks
+           up ``IluMxfp8LinearKernel`` from the patched kernel list. On
+           ivcore11 that patch is inactive, so they are claimed by
+           ``mxfp8_int8_linear_method`` instead.
+Scope    : ModelOpt MXFP8 checkpoints on Iluvatar corex30 (Hy4-preview), plus
+           the ivcore11 INT8 dense and W4A8 expert paths.
 Remove   : when community exposes a vendor MXFP8 MoE backend hook, and when
            ``LogitsProcessor`` accepts ``UnquantizedLinearMethod`` for an
            unquantized head (upstream #54160 does the latter).
@@ -50,14 +52,17 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
 
-from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp8_moe import (  # noqa: E501
-    IluMxFp8ToFp4OnlineMoE,
+from vllm_iluvatar.model_executor.layers.quantization.backends.mxfp8.linear import (
+    mxfp8_int8_linear_method,
+)
+from vllm_iluvatar.model_executor.layers.quantization.backends.mxfp8.moe import (
+    IluMxFp8MoEMethod,
 )
 
 
 @register_quantization_config("modelopt_mxfp8")
 class IluModelOptMxFp8Config(ModelOptMxFp8Config):
-    """ModelOpt MXFP8 whose routed experts use the Iluvatar ix30 compute path.
+    """ModelOpt MXFP8 whose routed experts use the Iluvatar expert compute path.
 
     Sibling of ``IluMxFp8Config`` (``ilu_mxfp8.py``), which covers the
     MiniMax-style ``quant_method: "mxfp8"`` tagging. The two differ only in the
@@ -67,17 +72,24 @@ class IluModelOptMxFp8Config(ModelOptMxFp8Config):
     def get_name(self) -> Any:
         return "modelopt_mxfp8"
 
-    # [ILU override] ModelOptQuantConfigBase.get_quant_method — delta: an
-    # excluded ``ParallelLMHead`` gets ``UnquantizedEmbeddingMethod`` instead of
-    # ``UnquantizedLinearMethod``. Both are unquantized and both expose the same
-    # ``apply``; the difference is only that community ``LogitsProcessor``
-    # isinstance-checks for the embedding one before taking the fp32-accumulate
-    # path that HY V4's ``head_dtype="float32"`` selects. Everything else
-    # delegates.
+    # [ILU override] ModelOptQuantConfigBase.get_quant_method — two deltas.
+    # 1. An excluded ``ParallelLMHead`` gets ``UnquantizedEmbeddingMethod``
+    #    instead of ``UnquantizedLinearMethod``. Both are unquantized and both
+    #    expose the same ``apply``; the difference is only that community
+    #    ``LogitsProcessor`` isinstance-checks for the embedding one before
+    #    taking the fp32-accumulate path that HY V4's ``head_dtype="float32"``
+    #    selects.
+    # 2. On ivcore11 a dense ``LinearBase`` runs the MXFP8 source as W8A8 INT8;
+    #    see ``backends/mxfp8/linear.py``. ivcore30 keeps FP8 execution.
+    # Everything else delegates. Routed experts need no branch: the shared
+    # method selects its own target contract per architecture.
     def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> Any:
         if isinstance(layer, ParallelLMHead) and self.is_layer_excluded(prefix):
             return UnquantizedEmbeddingMethod()
+        linear_method = mxfp8_int8_linear_method(self, layer, prefix)
+        if linear_method is not None:
+            return linear_method
         return super().get_quant_method(layer, prefix)
 
 
-IluModelOptMxFp8Config.FusedMoEMethodCls = IluMxFp8ToFp4OnlineMoE
+IluModelOptMxFp8Config.FusedMoEMethodCls = IluMxFp8MoEMethod

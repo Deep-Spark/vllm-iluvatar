@@ -98,16 +98,6 @@ def test_remaps_deepseek_v32_after_community_routing():
     assert result.architectures == ["DeepseekV32MTPModel"]
 
 
-def test_remaps_deepseek_v4_after_community_routing():
-    orig = _make_orig([], out_architectures=["DeepSeekV4MTPModel"])
-    wrapped = make_hf_config_override(orig)
-
-    cfg = _FakeHFConfig(["IluDeepseekV4ForCausalLM"])
-    result = wrapped(cfg)
-
-    assert result.architectures == ["IluDeepSeekV4MTPModel"]
-
-
 def test_remaps_hy_v4_after_community_routing():
     orig = _make_orig([], out_architectures=["DeepSeekMTPModel"])
     wrapped = make_hf_config_override(orig)
@@ -180,32 +170,23 @@ def test_preserves_orig_metadata():
     assert wrapped.__name__ == "hf_config_override"
 
 
-# --- factory: DSpark post-init remap ----------------------------------------
+# --- factory: DSpark post-init ----------------------------------------------
 
 
-def test_post_init_remaps_dspark_draft_for_ilu_deepseek_v4():
+def test_post_init_never_remaps_the_dspark_draft_arch():
+    # Every ilu DSpark draft registers itself under the community
+    # ``DSparkDraftModel`` name, so there is nothing left to remap here.
     calls = []
 
     def orig(self):
         calls.append(self)
 
     wrapped = make_post_init(orig)
-    cfg = _FakeSpeculativeConfig(target_architectures=["IluDeepseekV4ForCausalLM"])
-
-    wrapped(cfg)
-
-    assert calls == [cfg]
-    assert cfg.draft_model_config.hf_config.architectures == ["IluDSparkDraftModel"]
-    assert cfg.draft_model_config.architectures == ["IluDSparkDraftModel"]
-    assert cfg.update_arch_calls == 1
-
-
-def test_post_init_leaves_non_ilu_dspark_draft_unchanged():
-    wrapped = make_post_init(lambda self: None)
     cfg = _FakeSpeculativeConfig(target_architectures=["DeepseekV32ForCausalLM"])
 
     wrapped(cfg)
 
+    assert calls == [cfg]
     assert cfg.draft_model_config.hf_config.architectures == ["DSparkDraftModel"]
     assert cfg.update_arch_calls == 0
 
@@ -214,7 +195,7 @@ def test_post_init_skips_non_dspark_methods():
     wrapped = make_post_init(lambda self: None)
     cfg = _FakeSpeculativeConfig(
         method="mtp",
-        target_architectures=["IluDeepseekV4ForCausalLM"],
+        target_architectures=["DeepseekV32ForCausalLM"],
     )
 
     wrapped(cfg)

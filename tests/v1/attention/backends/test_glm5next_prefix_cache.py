@@ -37,6 +37,7 @@ def test_glm5next_prefix_policy(
     from vllm_iluvatar.platforms.ilu_platform import IluPlatform
 
     monkeypatch.setattr(ilu_arch, "is_ivcore30", lambda: cq)
+    monkeypatch.setattr(ilu_arch, "is_ivcore11", lambda: not cq)
     monkeypatch.setattr(
         IluPlatform.__mro__[1],
         "check_and_update_config",
@@ -45,6 +46,8 @@ def test_glm5next_prefix_policy(
     config = SimpleNamespace(
         model_config=SimpleNamespace(
             architectures=[arch],
+            quantization=None,
+            dtype=torch.bfloat16,
             is_hybrid=True,
             hf_text_config=SimpleNamespace(index_kpool=4),
             tokenizer_mode="auto",
@@ -60,6 +63,8 @@ def test_glm5next_prefix_policy(
             block_size=explicit_block or 64,
         ),
         quant_config=None,
+        additional_config=None,
+        load_config=SimpleNamespace(load_format="auto"),
         compilation_config=None,
         scheduler_config=None,
         parallel_config=SimpleNamespace(worker_cls="custom"),

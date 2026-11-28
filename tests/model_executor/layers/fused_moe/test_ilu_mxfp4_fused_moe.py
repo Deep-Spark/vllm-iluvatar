@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU-only tests for ``ilu_mxfp4_fused_experts`` (Phase 1 torch path).
+"""CPU-only tests for ``ilu_mxfp4_fused_experts_torch`` (Phase 1 torch path).
 
 This is the compute layer the DeepSeek-V4 FP8 routed experts run on: MXFP4 ->
 bf16 dequant per expert plus a grouped ``w13 -> SwiGLU(clamp) -> w2`` MLP,
@@ -33,16 +33,11 @@ import torch
 import vllm_iluvatar._C  # noqa: F401
 
 from vllm_iluvatar.model_executor.layers.activation import swiglu_clamp
-from vllm_iluvatar.model_executor.layers.fused_moe import (
-    ilu_mxfp4_fused_moe,
-)
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
     MXFP4_BLOCK,
     _ilu_mxfp4_fused_experts_ixformer,
-    _resolve_backend,
     _swigluoai_uninterleave,
     dequant_mxfp4_to_bf16,
-    ilu_mxfp4_fused_experts,
     ilu_mxfp4_fused_experts_torch,
 )
 
@@ -521,211 +516,8 @@ def test_w13_bias_changes_the_result(weights, hidden_states):
 
 
 # ---------------------------------------------------------------------------
-# dispatcher + dtype normalisation + ixformer pipeline wiring
+# dtype normalisation + ixformer pipeline wiring
 # ---------------------------------------------------------------------------
-
-
-class _FakeHidden:
-    """Minimal stand-in for ``hidden_states`` in ``_resolve_backend`` unit tests.
-
-    Only the three attributes the auto path reads (``is_cuda``, ``shape``,
-    ``dtype``) are populated, so the fallback matrix can be exercised without a
-    real CUDA tensor. ``w13_weight`` is covered separately via the ``w13_weight``
-    kwarg (only ``.dtype`` is read).
-    """
-
-    def __init__(self, *, is_cuda=True, num_tokens=5, dtype=torch.bfloat16):
-        self.is_cuda = is_cuda
-        self.shape = (num_tokens, _H)
-        self.dtype = dtype
-
-
-def _resolve_auto(
-    hidden_states,
-    *,
-    swiglu_limit=_SWIGLU_LIMIT,
-    w13_bias=None,
-    w2_bias=None,
-    w13_weight_dtype=torch.int8,
-):
-    """Call ``_resolve_backend`` on the explicit ``auto`` path with the
-    ``is_ivcore30`` gate forced True, so the only variables are the fallback
-    conditions.
-
-    ``_resolve_backend`` imports ``is_ivcore30`` lazily from
-    ``vllm_iluvatar.ilu_util.arch`` at call time, so patching that module's
-    attribute is sufficient.
-    """
-    import vllm_iluvatar.ilu_util.arch as arch
-
-    saved = arch.is_ivcore30
-    arch.is_ivcore30 = lambda: True
-    try:
-        w13 = type("_W", (), {"dtype": w13_weight_dtype})()
-        w2 = type("_W", (), {"dtype": w13_weight_dtype})()
-        scale_dtype = (
-            torch.float32 if w13_weight_dtype is torch.uint8 else torch.float8_e8m0fnu
-        )
-        s13 = type("_S", (), {"dtype": scale_dtype})()
-        s2 = type("_S", (), {"dtype": scale_dtype})()
-        return _resolve_backend(
-            "auto",
-            hidden_states,
-            swiglu_limit=swiglu_limit,
-            w13_bias=w13_bias,
-            w2_bias=w2_bias,
-            w13_weight=w13,
-            w13_weight_scale=s13,
-            w2_weight=w2,
-            w2_weight_scale=s2,
-        )
-    finally:
-        arch.is_ivcore30 = saved
-
-
-def test_resolve_backend_explicit_torch_bypasses_ixformer_conditions():
-    hs = _FakeHidden(is_cuda=False, num_tokens=0, dtype=torch.float16)
-    assert (
-        _resolve_backend(
-            "torch",
-            hs,
-            swiglu_limit=None,
-            w13_bias=None,
-            w2_bias=None,
-            w13_weight=type("_W", (), {"dtype": torch.uint8})(),
-            w13_weight_scale=type("_S", (), {"dtype": torch.uint8})(),
-            w2_weight=type("_W", (), {"dtype": torch.uint8})(),
-            w2_weight_scale=type("_S", (), {"dtype": torch.uint8})(),
-        )
-        == "torch"
-    )
-
-
-def test_resolve_backend_unknown_name_is_rejected():
-    hs = _FakeHidden()
-    with pytest.raises(ValueError, match="Unknown MXFP4 MoE backend"):
-        _resolve_backend(
-            "nonsense",
-            hs,
-            swiglu_limit=_SWIGLU_LIMIT,
-            w13_bias=None,
-            w2_bias=None,
-            w13_weight=type("_W", (), {"dtype": torch.int8})(),
-            w13_weight_scale=type("_S", (), {"dtype": torch.float8_e8m0fnu})(),
-            w2_weight=type("_W", (), {"dtype": torch.int8})(),
-            w2_weight_scale=type("_S", (), {"dtype": torch.float8_e8m0fnu})(),
-        )
-
-
-def test_resolve_backend_auto_cpu_falls_back_to_torch(monkeypatch):
-    """``is_cuda=False`` is the first hard condition (§3.4 row 2). Even with
-    ``is_ivcore30`` forced True the answer must be torch."""
-    hs = _FakeHidden(is_cuda=False)
-    assert _resolve_auto(hs) == "torch"
-
-
-def test_resolve_backend_auto_non_ivcore30_falls_back_to_torch(monkeypatch):
-    """Condition 2: ``is_ivcore30()`` False -> torch, even on a CUDA tensor."""
-    import vllm_iluvatar.ilu_util.arch as arch
-
-    monkeypatch.setattr(arch, "is_ivcore30", lambda: False)
-    hs = _FakeHidden(is_cuda=True)
-    assert (
-        _resolve_backend(
-            None,
-            hs,
-            swiglu_limit=_SWIGLU_LIMIT,
-            w13_bias=None,
-            w2_bias=None,
-            w13_weight=type("_W", (), {"dtype": torch.int8})(),
-            w13_weight_scale=type("_S", (), {"dtype": torch.float8_e8m0fnu})(),
-            w2_weight=type("_W", (), {"dtype": torch.int8})(),
-            w2_weight_scale=type("_S", (), {"dtype": torch.float8_e8m0fnu})(),
-        )
-        == "torch"
-    )
-
-
-def test_resolve_backend_auto_zero_tokens_falls_back_to_torch():
-    hs = _FakeHidden(is_cuda=True, num_tokens=0)
-    assert _resolve_auto(hs) == "torch"
-
-
-def test_resolve_backend_auto_non_bf16_falls_back_to_torch():
-    hs = _FakeHidden(is_cuda=True, dtype=torch.float16)
-    assert _resolve_auto(hs) == "torch"
-
-
-def test_resolve_backend_auto_no_swiglu_limit_falls_back_to_torch():
-    hs = _FakeHidden(is_cuda=True)
-    assert _resolve_auto(hs, swiglu_limit=None) == "torch"
-
-
-def test_resolve_backend_auto_with_bias_falls_back_to_torch():
-    hs = _FakeHidden(is_cuda=True)
-    bias = torch.zeros(4, 2 * _I, dtype=torch.bfloat16)
-    assert _resolve_auto(hs, w13_bias=bias) == "torch"
-    assert _resolve_auto(hs, w2_bias=bias) == "torch"
-
-
-def test_resolve_backend_auto_ixmm_format_selects_ixmm(monkeypatch):
-    hs = _FakeHidden(is_cuda=True)
-    monkeypatch.setattr(ilu_mxfp4_fused_moe, "_ixmm_backend_available", lambda: True)
-    assert _resolve_auto(hs, w13_weight_dtype=torch.uint8) == "ixmm"
-
-
-def test_resolve_backend_explicit_ixmm_rejects_original_layout(monkeypatch):
-    import vllm_iluvatar.ilu_util.arch as arch
-
-    monkeypatch.setattr(arch, "is_ivcore30", lambda: True)
-    hs = _FakeHidden(is_cuda=True)
-    with pytest.raises(RuntimeError, match="preprocess_weight_for_ixmm"):
-        _resolve_backend(
-            "ixmm",
-            hs,
-            swiglu_limit=_SWIGLU_LIMIT,
-            w13_bias=None,
-            w2_bias=None,
-            w13_weight=type("_W", (), {"dtype": torch.int8})(),
-            w13_weight_scale=type("_S", (), {"dtype": torch.float8_e8m0fnu})(),
-            w2_weight=type("_W", (), {"dtype": torch.int8})(),
-            w2_weight_scale=type("_S", (), {"dtype": torch.float8_e8m0fnu})(),
-        )
-
-
-def test_dispatcher_on_cpu_routes_to_torch_and_does_not_import_ixformer(
-    weights, hidden_states, monkeypatch
-):
-    """End-to-end dispatcher behaviour on CPU: must produce the torch result
-    and must not pull ixformer into ``sys.modules`` (§6 CPU suite)."""
-    w13, w13_scale, w2, w2_scale = weights
-    topk_weights, topk_ids = _rand_routing(_TOKENS, 4, _TOPK, seed=14)
-
-    before = {k for k in sys.modules if k.startswith("ixformer")}
-    got = ilu_mxfp4_fused_experts(
-        hidden_states,
-        w13,
-        w13_scale,
-        w2,
-        w2_scale,
-        topk_weights,
-        topk_ids,
-        swiglu_limit=_SWIGLU_LIMIT,
-    )
-    after = {k for k in sys.modules if k.startswith("ixformer")}
-    assert after == before, f"dispatcher imported ixformer: {after - before}"
-
-    want = ilu_mxfp4_fused_experts_torch(
-        hidden_states,
-        w13,
-        w13_scale,
-        w2,
-        w2_scale,
-        topk_weights,
-        topk_ids,
-        swiglu_limit=_SWIGLU_LIMIT,
-    )
-    torch.testing.assert_close(got, want)
 
 
 def test_dequant_is_dtype_agnostic_after_normalisation():
@@ -1125,8 +917,8 @@ def test_skip_sort_is_model_opt_in(
 ):
     from types import SimpleNamespace
 
-    from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.mxfp4_moe import (
-        _v41_decode_skip_sort,
+    from vllm_iluvatar.model_executor.layers.quantization.common.moe_compute_binding import (
+        decode_skip_sort,
     )
 
     monkeypatch.setenv("VLLM_ILU_V41_MOE_SKIP_SORT", str(int(enabled)))
@@ -1140,4 +932,4 @@ def test_skip_sort_is_model_opt_in(
     )
     monkeypatch.setattr("vllm.forward_context.get_forward_context", lambda: ctx)
     layer = SimpleNamespace(_ilu_v41_skip_sort_supported=v41)
-    assert _v41_decode_skip_sort(layer) == expected
+    assert decode_skip_sort(layer) == expected

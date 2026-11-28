@@ -66,6 +66,22 @@ class IluUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        if getattr(layer, "_ilu_require_native_expert_weights", False):
+            original_loader = extra_weight_attrs["weight_loader"]
+
+            @wraps(original_loader)
+            def load_native_weight(param, loaded_weight, weight_name, *args, **kwargs):
+                if loaded_weight.dtype not in (torch.bfloat16, torch.float16):
+                    raise ValueError(
+                        f"{weight_name}: expected BF16/FP16 expert weights, "
+                        f"got {loaded_weight.dtype}"
+                    )
+                return original_loader(
+                    param, loaded_weight, weight_name, *args, **kwargs
+                )
+
+            extra_weight_attrs["weight_loader"] = load_native_weight
+
         super().create_weights(
             layer,
             num_experts,

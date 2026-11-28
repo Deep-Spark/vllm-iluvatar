@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from vllm_iluvatar.models.deepseek_v4.model import (
-    IluDeepseekV4Model,
+    IluDeepseekV4Fp8Model,
     default_aux_hidden_state_layers,
 )
 
@@ -44,7 +44,7 @@ class _Identity:
 
 
 def _stub_model(*, num_layers: int, hc_mult: int, hidden_size: int, max_tokens: int):
-    model = object.__new__(IluDeepseekV4Model)
+    model = object.__new__(IluDeepseekV4Fp8Model)
     # Bypass nn.Module.__setattr__ (object was not Module-inited).
     d = model.__dict__
     d["hc_mult"] = hc_mult
@@ -55,7 +55,6 @@ def _stub_model(*, num_layers: int, hc_mult: int, hidden_size: int, max_tokens: 
     d["end_layer"] = num_layers
     d["layers"] = [_FakeDecoderLayer(i) for i in range(num_layers)]
     d["aux_hidden_state_layers"] = ()
-    d["hc_pre_fusion"] = None
     d["norm"] = _Identity()
     d["hc_head_fn"] = torch.empty(0)
     d["hc_head_scale"] = torch.empty(0)
@@ -91,7 +90,7 @@ def test_aux_forward_mean_pools_and_uses_shifted_layer_ids():
             side_effect=_fake_hc_head,
         ),
     ):
-        out = IluDeepseekV4Model.forward(
+        out = IluDeepseekV4Fp8Model.forward(
             model,
             input_ids=input_ids,
             positions=positions,
@@ -133,7 +132,7 @@ def test_aux_forward_without_capture_returns_single_tensor():
             side_effect=lambda hs, *a, **k: hs.mean(dim=1),
         ),
     ):
-        out = IluDeepseekV4Model.forward(
+        out = IluDeepseekV4Fp8Model.forward(
             model,
             input_ids=torch.zeros(T, dtype=torch.long),
             positions=torch.arange(T),

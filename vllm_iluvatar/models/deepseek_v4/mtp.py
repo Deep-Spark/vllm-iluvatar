@@ -1,26 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""MTP (Multi-Token Prediction) draft model for the iluvatar W4A8 DeepSeek-V4.
+"""MTP (Multi-Token Prediction) draft model for the iluvatar *raw FP8* DeepSeek-V4.
 
-This is the ilu counterpart of :mod:`vllm.models.deepseek_v4.nvidia.mtp`.
-The structure mirrors the nvidia draft model, but it is wired against the ilu
-fork's pieces instead of the upstream FP8/FP4 ones:
+Iluvatar counterpart of community ``vllm.models.deepseek_v4.nvidia.mtp``, wired
+against :mod:`.model` / :mod:`.fp8_attention`:
 
-* ``mtp_block`` is an :class:`IluDeepseekV4DecoderLayer` whose ``forward``
-  returns a *single* tensor (the ilu layer applies ``hc_post`` inline), so the
-  nvidia 4-tuple unpack + explicit ``mtp_block.hc_post(...)`` is dropped.
-* ``hc_head`` is computed with ``ixfops.hc_head`` (the ilu kernel) rather
-  than the nvidia ``HCHeadOp``.
-* MoE experts use the plain :class:`FusedMoE` mapping -- there is no MegaMoE
-  path, ``use_mega_moe`` flag, or ``finalize_mega_moe_weights`` step.
-* The offline converter already writes ``.weight_scale`` (fp32) scales, so the
-  nvidia ``.scale`` -> ``.weight_scale_inv`` rewrite and the E8M0 uint8-bitcast
-  workaround are both removed. The ilu-specific name renames
-  (``compressor`` -> ``mla_attn.compressor``, ``shared_experts.w2`` ->
-  ``down_proj``, ``ffn.gate.bias`` -> ``e_score_correction_bias``) are applied
-  here, matching :func:`_make_ilu_deepseek_v4_weights_mapper` in ``model.py``.
+* ``mtp_block`` is an :class:`IluDeepseekV4Fp8DecoderLayer` whose ``forward``
+  returns a single ``(T, hc_mult, H)`` tensor (``hc_post`` applied inline), so
+  the nvidia 4-tuple unpack + explicit post is dropped.
+* ``hc_head`` uses ``ixfops.hc_head``.
+* No aux streams (FP8 attention does not take ``aux_stream_dict``).
+* Raw-FP8 scale rewrite (``.scale`` -> ``weight_scale`` / ``weight_scale_inv``)
+  and E8M0 ``view(uint8)`` for routed-expert scales match :mod:`.model` /
+  community nvidia MTP.
+* No ``.attn.compressor.`` -> ``.attn.mla_attn.compressor.`` rename, unlike
+  ``model._make_v4_fp8_weights_mapper``: the MTP layer is dense
+  (``compress_ratio == 1``), so it has no compressor weights on either arch.
+* Registered as community ``DeepSeekV4MTPModel`` (see ``model.register_model``).
 """
 
+from __future__ import annotations
+
+import re
 import typing
 from collections.abc import Callable, Iterable
 
@@ -30,6 +30,7 @@ import torch.nn as nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
+    get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -50,22 +51,24 @@ from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.utils.multi_stream_utils import EventType
+from vllm.utils.math_utils import cdiv
 
-from .model import IluDeepseekV4DecoderLayer
+from .model import IluDeepseekV4Fp8DecoderLayer
 
 logger = init_logger(__name__)
 
-# Keep the plugin logger under ``vllm.`` so INFO messages use vLLM's handler.
+# MoE expert scales land on Mxfp4MoEMethod's ``w{1,2,3}_weight_scale``; every
+# other FP8 linear scale is Fp8LinearMethod's ``weight_scale_inv``.  Same rule
+# as ``_make_fp8_weights_mapper`` / community nvidia MTP.
+_EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 
 
-class IluDeepSeekV4MultiTokenPredictorLayer(nn.Module):
+class IluDeepseekV4Fp8MultiTokenPredictorLayer(nn.Module):
     def __init__(
         self,
         vllm_config: VllmConfig,
         topk_indices_buffer: torch.Tensor,
         prefix: str,
-        aux_stream_dict: dict[EventType, torch.cuda.Stream] | None = None,
     ) -> None:
         super().__init__()
 
@@ -78,10 +81,8 @@ class IluDeepSeekV4MultiTokenPredictorLayer(nn.Module):
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # V4 keeps e_/h_proj separate (rather than the fused eh_proj of V3).
-        # Under ilu W4A8 v1 these dispatch to UnquantizedLinearMethod (BF16);
-        # v2 may bind them to W8A8 via ``dense_linears`` -- either way the
-        # quant_config decides, so we just pass it through.
+        # V4 keeps e_/h_proj separate. Raw-FP8 checkpoints store both as
+        # block-FP8 (e_proj/h_proj.weight + .scale); quant_config decides.
         self.e_proj = ReplicatedLinear(
             config.hidden_size,
             config.hidden_size,
@@ -118,11 +119,10 @@ class IluDeepSeekV4MultiTokenPredictorLayer(nn.Module):
         self.shared_head = SharedHead(
             config=config, prefix=prefix, quant_config=quant_config
         )
-        self.mtp_block = IluDeepseekV4DecoderLayer(
+        self.mtp_block = IluDeepseekV4Fp8DecoderLayer(
             vllm_config,
             prefix,
             topk_indices_buffer=topk_indices_buffer,
-            aux_stream_dict=aux_stream_dict,
         )
 
     def forward(
@@ -147,7 +147,7 @@ class IluDeepSeekV4MultiTokenPredictorLayer(nn.Module):
         hidden_states = self.h_proj(previous_hidden_states) + self.e_proj(
             inputs_embeds
         ).unsqueeze(-2)
-        # The ilu decoder layer applies hc_post inline and returns a single
+        # The FP8 decoder layer applies hc_post inline and returns a single
         # (T, hc_mult, D) tensor -- no nvidia-style 4-tuple / explicit hc_post.
         hidden_states = self.mtp_block(hidden_states, positions, None)
         # Return the flat pre-hc_head residual so it can be re-fed as the next
@@ -156,7 +156,7 @@ class IluDeepSeekV4MultiTokenPredictorLayer(nn.Module):
         return hidden_states.flatten(1)
 
 
-class IluDeepSeekV4MultiTokenPredictor(nn.Module):
+class IluDeepseekV4Fp8MultiTokenPredictor(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -172,21 +172,12 @@ class IluDeepSeekV4MultiTokenPredictor(nn.Module):
             device=self.device,
         )
 
-        # Single Attention aux stream, mirroring IluDeepseekV4Model (the ilu
-        # decoder layer only consumes EventType.Attention).
-        aux_stream_list = [torch.cuda.Stream() for _ in range(1)]
-        aux_stream_dict: dict[EventType, torch.cuda.Stream] = {
-            EventType.Attention: aux_stream_list[0],
-        }
-
-        # to map the exact layer index from weights
         self.layers = torch.nn.ModuleDict(
             {
-                str(idx): IluDeepSeekV4MultiTokenPredictorLayer(
+                str(idx): IluDeepseekV4Fp8MultiTokenPredictorLayer(
                     vllm_config,
                     self.topk_indices_buffer,
                     f"{prefix}.layers.{idx}",
-                    aux_stream_dict=aux_stream_dict,
                 )
                 for idx in range(
                     self.mtp_start_layer_idx,
@@ -250,27 +241,65 @@ class IluDeepSeekV4MultiTokenPredictor(nn.Module):
         return logits
 
 
-@support_torch_compile
-class IluDeepSeekV4MTP(nn.Module, SupportsPP):
-    """W4A8 MTP draft model.
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "hidden_states": 0,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+    }
+)
+class IluDeepseekV4Fp8MTP(nn.Module, SupportsPP):
+    """FP8 MTP draft model.
 
     ``SupportsPP`` only gates ``ModelConfig.verify_with_parallel_config``: vLLM
     places the *whole* drafter on the last PP rank
     (``gpu_model_runner``: ``if self.speculative_config and
     get_pp_group().is_last_rank``), so this model is never split across stages
     and never exchanges PP intermediate tensors.
+
+    The one real PP consequence is the token embedding: the proposer only
+    aliases the target's ``embed_tokens`` into the draft when
+    ``get_pp_group().world_size == 1`` (``llm_base_proposer``), and on the last
+    PP rank the target's own ``embed_tokens`` is a ``PPMissingLayer`` anyway.
+    With PP > 1 the draft therefore loads the checkpoint's top-level
+    ``embed.weight`` itself (see ``load_weights``).
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
-        self.model = IluDeepSeekV4MultiTokenPredictor(
+
+        self.load_own_embed_tokens = get_pp_group().world_size > 1
+
+        self.pad_shared_expert = (
+            getattr(self.quant_config, "weight_block_size", None) is not None
+            and not vllm_config.parallel_config.use_sequence_parallel_moe
+        )
+        self.model = IluDeepseekV4Fp8MultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        return IntermediateTensors(
+            {
+                "hidden_states": torch.zeros(
+                    (batch_size, self.config.hc_mult, self.config.hidden_size),
+                    dtype=dtype,
+                    device=device,
+                ),
+            }
+        )
 
     def forward(
         self,
@@ -293,9 +322,24 @@ class IluDeepSeekV4MTP(nn.Module, SupportsPP):
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
 
+    def _pad_shared_expert_weight(
+        self, name: str, loaded_weight: torch.Tensor
+    ) -> torch.Tensor:
+        """Same pad as ``IluDeepseekV4Fp8Model._pad_shared_expert_weight``."""
+        block_size = getattr(self.quant_config, "weight_block_size", None)
+        assert block_size is not None
+        step = 1 if name.endswith("weight_scale_inv") else block_size[0]
+        dim = 1 if ".down_proj." in name else 0
+        mult = get_tensor_model_parallel_world_size() * step
+        pad = cdiv(loaded_weight.shape[dim], mult) * mult - loaded_weight.shape[dim]
+        if pad == 0:
+            return loaded_weight
+        pad_shape = list(loaded_weight.shape)
+        pad_shape[dim] = pad
+        return torch.cat([loaded_weight, loaded_weight.new_zeros(pad_shape)], dim=dim)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Weight name remapping for checkpoint compatibility.
-        # Maps checkpoint weight paths to model parameter paths.
         WEIGHT_NAME_REMAPPING: dict[str, str] = {
             ".emb.tok_emb.weight": ".embed_tokens.weight",
             ".head.weight": ".shared_head.head.weight",
@@ -312,15 +356,13 @@ class IluDeepSeekV4MTP(nn.Module, SupportsPP):
             subnames = name.split(".")
             for subname in subnames:
                 try:
-                    # we return the first encountered integer
                     return int(subname)
                 except ValueError:
                     continue
             return 0
 
-        # Mirrors IluDeepseekV4Model.load_weights: shared_experts gate/up,
-        # attention wqa/wkv fuse, and the compressor wkv/wgate fuse. There is
-        # no MegaMoE-specific entry.
+        # Same stacked fusion as the FP8 target. Compressor entries are
+        # no-ops on the Flash MTP layer (dense, no compressor tensors).
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "w1", 0),
@@ -333,7 +375,6 @@ class IluDeepSeekV4MTP(nn.Module, SupportsPP):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
-        # TP for attention
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
         n_head = self.config.num_attention_heads
@@ -341,7 +382,6 @@ class IluDeepSeekV4MTP(nn.Module, SupportsPP):
         head_rank_start = n_local_head * tp_rank
         head_rank_end = n_local_head * (tp_rank + 1)
 
-        # Plain FusedMoE expert mapping (no MegaMoE).
         expert_mapping = fused_moe_make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="w1",
@@ -350,7 +390,27 @@ class IluDeepSeekV4MTP(nn.Module, SupportsPP):
             num_experts=self.config.n_routed_experts,
         )
 
+        # MXFP4 (expert_dtype=fp4) -> weight_scale; block-FP8 experts would
+        # use weight_scale_inv. Matches community nvidia MTP.
+        expert_scale_suffix = (
+            ".weight_scale"
+            if getattr(self.config, "expert_dtype", "fp4") == "fp4"
+            else ".weight_scale_inv"
+        )
+
         for name, loaded_weight in weights:
+            # Target-side top-level token embedding. Only needed when the
+            # proposer will not alias the target's embedding into the draft
+            # (PP > 1); otherwise it is skipped like every other target tensor.
+            if name == "embed.weight":
+                if not self.load_own_embed_tokens:
+                    continue
+                param = params_dict["model.embed_tokens.weight"]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add("model.embed_tokens.weight")
+                continue
+
             mtp_layer_idx = _find_mtp_layer_idx(name)
             # V4 checkpoints store MTP weights as `mtp.{i}.*`; remap to
             # `model.layers.{num_hidden_layers + i}.*` so that
@@ -370,12 +430,20 @@ class IluDeepSeekV4MTP(nn.Module, SupportsPP):
             if spec_layer != self.model.mtp_start_layer_idx and ".layers" not in name:
                 continue
 
-            # ilu-specific: the MLA compressor lives under ``mla_attn`` in the
-            # vLLM module tree (matches the main model's WeightsMapper).
-            name = name.replace(".attn.compressor.", ".attn.mla_attn.compressor.")
+            if name.endswith(".scale"):
+                suffix = (
+                    expert_scale_suffix
+                    if _EXPERT_SCALE_RE.search(name)
+                    else ".weight_scale_inv"
+                )
+                name = name.removesuffix(".scale") + suffix
+
+            if ".shared_experts.w2" in name:
+                name = name.replace(".shared_experts.w2", ".shared_experts.down_proj")
+            if self.pad_shared_expert and ".shared_experts." in name:
+                loaded_weight = self._pad_shared_expert_weight(name, loaded_weight)
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Skip non-stacked layers and experts (experts handled below).
                 if ".experts." in name:
                     continue
                 if weight_name not in name:
@@ -389,9 +457,12 @@ class IluDeepSeekV4MTP(nn.Module, SupportsPP):
                 break
             else:
                 if ".experts." in name:
-                    # The offline converter writes routed-expert weight_scale as
-                    # fp32 (channel) or [n_groups, ...] group-int4 scales -- never
-                    # float8_e8m0fnu -- so no uint8-bitcast workaround is needed.
+                    # E8M0 scales must be bitcast, not numerically converted.
+                    if (
+                        "weight_scale" in name
+                        and loaded_weight.dtype == torch.float8_e8m0fnu
+                    ):
+                        loaded_weight = loaded_weight.view(torch.uint8)
                     for mapping in expert_mapping:
                         param_name, weight_name, expert_id, expert_shard_id = mapping
                         if weight_name not in name:
@@ -421,13 +492,7 @@ class IluDeepSeekV4MTP(nn.Module, SupportsPP):
                     loaded_params.add(name)
                     continue
                 else:
-                    if ".shared_experts.w2" in name:
-                        name = name.replace(
-                            ".shared_experts.w2", ".shared_experts.down_proj"
-                        )
                     if name.endswith(".ffn.gate.bias"):
-                        # ``e_score_correction_bias`` lives on the gate under a
-                        # different attribute name.
                         name = name.replace(
                             ".ffn.gate.bias",
                             ".ffn.gate.e_score_correction_bias",
@@ -457,7 +522,28 @@ class IluDeepSeekV4MTP(nn.Module, SupportsPP):
                     f"Use a checkpoint that includes MTP layer weights, "
                     f"or disable speculative decoding."
                 )
-        logger.info_once("ilu MTP draft model loaded: %d params", len(loaded_params))
+
+        # Strict reverse check: every parameter must have received a weight.
+        # Exclude tensors the proposer replaces post-load via sharing; under
+        # PP > 1 embed_tokens is not shared and must have been loaded above.
+        _SHARE_EXCLUDED = {"shared_head.head"}
+        if not self.load_own_embed_tokens:
+            _SHARE_EXCLUDED.add("embed_tokens")
+        all_params = set(dict(self.named_parameters()).keys())
+        unfilled = sorted(
+            name
+            for name in all_params - loaded_params
+            if not any(excl in name for excl in _SHARE_EXCLUDED)
+        )
+        if unfilled:
+            raise ValueError(
+                f"FP8 MTP: {len(unfilled)} parameter(s) were never filled "
+                f"by load_weights. First 20: {unfilled[:20]}"
+            )
+
+        logger.info_once(
+            "ilu FP8 MTP draft model loaded: %d params", len(loaded_params)
+        )
         return loaded_params
 
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
@@ -487,11 +573,9 @@ class IluDeepSeekV4MTP(nn.Module, SupportsPP):
                     shared_weight = True
                 break
         if not spec_layer_weight:
-            # treat rest weights as weights for transformer layer block
             name = name.replace(
                 f"model.layers.{spec_layer}.", f"model.layers.{spec_layer}.mtp_block."
             )
         elif shared_weight:
-            # treat shared weights as top level weights
             name = name.replace(f"model.layers.{spec_layer}.", "model.")
         return name

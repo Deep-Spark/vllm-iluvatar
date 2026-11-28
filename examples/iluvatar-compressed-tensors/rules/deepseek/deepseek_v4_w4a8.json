@@ -4,7 +4,7 @@
   "model_config_patch": {
     "expert_dtype": "w4a8",
     "architectures": [
-      "IluDeepseekV4ForCausalLM"
+      "DeepseekV4ForCausalLM"
     ]
   },
   "default_action": "keep",

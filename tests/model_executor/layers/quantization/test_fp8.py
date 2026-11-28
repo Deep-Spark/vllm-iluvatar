@@ -340,11 +340,19 @@ def test_preprocess_pads_k_to_ixmm_group_boundary(monkeypatch):
 
 @pytest.mark.parametrize("limit", [3.0, 10.0])
 def test_layer_limit_reaches_compute_contract(monkeypatch, limit):
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+        MoEComputeSelection,
+    )
+
     mod = _load_moe_backend(monkeypatch)
     method = object.__new__(mod.IluFp8MoEMethod)
+    method.selection = MoEComputeSelection("ixinfer_w4a8", "TN", "ivcore11")
     layer = types.SimpleNamespace(
         moe_config=types.SimpleNamespace(
-            hidden_dim=256, intermediate_size_per_partition=128, ep_rank=0
+            hidden_dim=256,
+            intermediate_size_per_partition=128,
+            intermediate_size_per_partition_unpadded=None,
+            ep_rank=0,
         ),
         local_num_experts=2,
         global_num_experts=2,
@@ -356,14 +364,23 @@ def test_layer_limit_reaches_compute_contract(monkeypatch, limit):
     assert config.activation == "swiglustep"
     assert config.limit == limit
     assert config.intermediate == 128
+    assert config.w2_k == 256
 
 
 def test_silu_limit_reaches_compute_contract(monkeypatch):
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+        MoEComputeSelection,
+    )
+
     mod = _load_moe_backend(monkeypatch)
     method = object.__new__(mod.IluFp8MoEMethod)
+    method.selection = MoEComputeSelection("ixinfer_w4a8", "TN", "ivcore11")
     layer = types.SimpleNamespace(
         moe_config=types.SimpleNamespace(
-            hidden_dim=256, intermediate_size_per_partition=128, ep_rank=0
+            hidden_dim=256,
+            intermediate_size_per_partition=128,
+            intermediate_size_per_partition_unpadded=None,
+            ep_rank=0,
         ),
         local_num_experts=2,
         global_num_experts=2,

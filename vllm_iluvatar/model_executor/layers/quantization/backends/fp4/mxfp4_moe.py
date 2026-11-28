@@ -10,11 +10,10 @@ Why      : community ``Mxfp4MoEMethod`` picks a backend through
            can only return NVIDIA-specific backends (TRTLLM / DeepGEMM / Marlin /
            FlashInfer) or raise ``NotImplementedError``. Iluvatar needs the
            community weight layout with an Iluvatar compute.
-How      : subclass the community Method. Selected compute backends declare
-           final weight contracts; MXFP4 loaders convert paired checkpoint
+How      : subclass the community Method. The selected compute backend declares
+           a final weight contract; the MXFP4 loader converts paired checkpoint
            shards directly into those parameters. Post-load only finalizes and
-           binds compute. Unselected legacy torch/native and runtime-quant
-           entry points retain their existing implementation.
+           binds compute.
 Scope    : routed MXFP4 experts on Iluvatar; selected by
            ``IluDeepseekV4FP8Config.get_quant_method``.
 Remove   : when community exposes a vendor MXFP4 MoE backend hook.
@@ -39,104 +38,64 @@ None``, so the ``hasattr`` guard passes and the attribute access raises
 ``AttributeError: 'NoneType' object has no attribute 'is_monolithic'``. That is
 exactly the EP-only crash the retired patch P3
 (``patch_dsv4_moe_modular_kernel``) worked around. Not setting the attribute
-makes ``hasattr`` false; the explicit ``is_monolithic`` override below makes the
+makes ``hasattr`` false; the mixin's explicit ``is_monolithic`` makes the
 answer independent of that subtlety altogether. ``__init__`` asserts both.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import torch
-import torch.nn.functional as F
 from vllm.config import get_current_vllm_config_or_none
 
 # Same import surface community ``quantization/mxfp4.py:8-15`` uses -- the
 # package root, not the defining modules, which is what keeps this free of the
 # fused_moe <-> quantization import cycle.
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoEActivationFormat,
     FusedMoEConfig,
     FusedMoEMethodBase,
-    FusedMoEQuantConfig,
-    RoutedExperts,
-    SharedExperts,
-)
-from vllm.model_executor.layers.fused_moe.config import (
-    mxfp4_w4a8_moe_quant_config,
-)
-from vllm.model_executor.layers.fused_moe.modular_kernel import (
-    FusedMoEExpertsModular,
-    FusedMoEPrepareAndFinalizeModular,
 )
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
 from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
-from vllm.model_executor.utils import replace_parameter
 
-from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (
-    _lookup_activation_prequant,
-)
-from vllm_iluvatar.model_executor.layers.fused_moe.ilu_mxfp4_fused_moe import (
-    _ixmm_backend_available,
-    ilu_mxfp4_fused_experts,
+from vllm_iluvatar.model_executor.layers.quantization.common.moe_compute_binding import (
+    MoEComputeBindingMixin,
+    pad_online_w4a8_config,
 )
 
-_IXMM_EXPERT_CHUNK = 4
 
+class IluMxfp4MoEMethod(MoEComputeBindingMixin, Mxfp4MoEMethod):
+    """MXFP4 checkpoint shards converted straight into the selected contract.
 
-def _get_ilu_output_scale(layer: RoutedExperts) -> float:
-    """The runner-side output scale, ``1.0`` unless a kernel opted in.
+    The source's counterpart of ``IluFp8MoEMethod`` / ``IluMxFp8MoEMethod``:
+    the loader writes the compute backend's final parameters as shards arrive,
+    and everything after that is the shared lifecycle. MXFP4 keeps its own
+    ``create_weights`` because it has its own loader and because streaming
+    needs a sequential checkpoint reader.
 
-    Same helper the other Iluvatar MoE methods carry (``ilu_auto_awq.py:67``,
-    ``ilu_auto_gptq.py:64``, ``ilu_compressed_tensors_moe_w4a8_int8.py:52``).
-    ``IluMoERunner.__init__`` (``runner/ilu_moe_runner.py:67``) writes the
-    attribute from the runner's ``routed_scaling_factor``, which the ``FusedMoE``
-    factory pins to ``1.0`` whenever ``apply_routed_scale_to_output`` is False
-    (``layer.py:414-416``) -- the default, and our case.
-
-    Do **not** substitute ``layer.routed_scaling_factor``: that one is
-    router-aligned (``1.5`` for DeepSeek-V4, ``layer.py:385-387``) and the router
-    has already multiplied it into ``topk_weights``.
+    ``selection`` is injected rather than resolved lazily: ``make_mxfp4_method``
+    owns the policy, and the loader the constructor has to reach needs the
+    answer.
     """
-    return getattr(layer, "_ilu_output_scale", 1.0)
 
-
-def _v41_decode_skip_sort(layer) -> bool:
-    from vllm_iluvatar import envs
-
-    if not (
-        getattr(layer, "_ilu_v41_skip_sort_supported", False)
-        and envs.VLLM_ILU_V41_MOE_SKIP_SORT
-    ):
-        return False
-    from vllm.forward_context import get_forward_context
-
-    ctx = get_forward_context()
-    if ctx.dp_metadata is not None:
-        return ctx.dp_metadata.all_ranks_decode_only
-    metadata = ctx.attn_metadata
-    if not isinstance(metadata, dict) or not metadata:
-        return False
-    return all(
-        getattr(value, "num_prefill_tokens", None) == 0
-        and getattr(value, "num_decode_tokens", 0) > 0
-        for value in metadata.values()
-    )
-
-
-class IluMxfp4MoEMethod(Mxfp4MoEMethod):
-    """Load MXFP4 checkpoints and compose the selected runtime expert backend.
-
-    Explicit torch/native modes retain the original checkpoint execution path.
-    """
+    compute_source = "MXFP4"
 
     # [ILU override] Mxfp4MoEMethod.__init__ — delta: skip the parent body (it
     # calls select_deepseek_v4_mxfp4_moe_backend, which off ROCm either returns
     # an NVIDIA-only backend or raises) and mirror its remaining field
-    # initialisation, minus ``experts_cls``.
+    # initialisation, minus ``experts_cls``. Then record the selected backend's
+    # identity, which ``deepseek_v4/model.py`` reads to decide hybrid EP and
+    # the lifecycle below reads to build the loader and the compute.
     #
     # Mirrors community ``mxfp4.py:478-489``. If that constructor grows a field
     # the asserts below will not catch it, but every consumer of a missing field
     # raises ``AttributeError`` loudly rather than computing a wrong number.
-    def __init__(self, moe: FusedMoEConfig, selection=None):
+    def __init__(self, moe: FusedMoEConfig, selection):
+        from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+            get_moe_backend,
+        )
+
         # Skip Mxfp4MoEMethod.__init__, run its base directly.
         FusedMoEMethodBase.__init__(self, moe)
         self.weight_dtype = "mxfp4"
@@ -153,363 +112,32 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
         self.w13_precision_config = None
         self.w2_precision_config = None
 
-        self.selection = selection
-        self._compute = None
-        self._runtime_weights = None
-        self._checkpoint_loader = None
-        if selection is not None:
-            self.ilu_compute_backend = selection.name
-            self.ilu_weight_format = selection.layout
-            from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
-                get_moe_backend,
-            )
-
-            self.ilu_prefer_hybrid_ep = get_moe_backend(selection).prefer_hybrid_ep
-
         assert not hasattr(self, "experts_cls"), (
-            "IluMxfp4MoEMethod must not define experts_cls; community "
+            f"{type(self).__name__} must not define experts_cls; community "
             "is_monolithic() would dereference it (see module docstring)"
         )
         assert self.is_monolithic is False
 
-    # [ILU override] FusedMoEMethodBase.is_monolithic — delta: constant False.
-    # We always take the modular path (router first, then
-    # ``RoutedExperts.forward_modular`` -> ``apply``), so the answer never
-    # depends on ``moe_kernel`` / ``experts_cls`` introspection.
-    @property
-    def is_monolithic(self) -> bool:
-        return False
-
-    # [ILU override] Mxfp4MoEMethod.supports_eplb — delta: community returns
-    # True. Phase 1's torch expert loop records no expert load, so claiming EPLB
-    # support would silently disable rebalancing. Returning False makes
-    # ``RoutedExperts.__init__`` (``routed_experts.py:138-150``) raise
-    # ``NotImplementedError`` when EPLB is requested, which is the same
-    # behaviour as the W4A8 method.
-    @property
-    def supports_eplb(self) -> bool:
-        return False
-
-    # [ILU override] Mxfp4MoEMethod.process_weights_after_loading — delta:
-    # Re-labels or converts MXFP4 tensors to the target layout at load time.
-    # The selected backend always sees the layout matching its dtype contract.
-    #
-    #   w*_weight       uint8 [E, n, k/2] -> int8
-    #       Reason §2.2: ``group_gemm_fp4`` dispatches on ``weight.dtype``; the
-    #       original MXFP4 layout MUST be ``int8`` or it gets misread as the
-    #       ixmm preprocessed ``uint8 [E, k/2, n]`` format (silently wrong on
-    #       symmetric shapes, e.g. some TP splits of w2).
-    #   w*_weight_scale uint8 [E, n, k/32] -> float8_e8m0fnu
-    #       Reason §2.1: the facade's ``.float()`` converts a ``uint8`` to
-    #       0..255 integers, not ``2**(v-127)``; the e8m0 decode only fires for
-    #       an fp8 dtype view. Passing raw uint8 scales silently scales the
-    #       weights by ~1e38.
-    #
-    def _legacy_process_weights_after_loading(self, layer: RoutedExperts) -> None:
-        import vllm.envs as envs
-
-        backend = (
-            getattr(self, "compute_backend", None) or envs.VLLM_ILU_MXFP4_MOE_BACKEND
-        )
-        if backend not in ("auto", "torch", "ixformer_native", "ixmm"):
-            raise ValueError(
-                "VLLM_ILU_MXFP4_MOE_BACKEND must be one of auto/torch/"
-                f"ixformer_native/ixmm, got {backend!r}"
-            )
-
-        use_ixmm = backend == "ixmm" or (
-            backend == "auto" and _ixmm_backend_available()
-        )
-        if backend == "ixmm" and not _ixmm_backend_available():
-            raise RuntimeError(
-                "VLLM_ILU_MXFP4_MOE_BACKEND=ixmm, but ixmm is unavailable. "
-                "Install the ixmm wheel and rebuild ixformer with HAVE_IXMM "
-                "for ivcore30."
-            )
-
-        if use_ixmm:
-            # Lazy import keeps CPU/native-only imports independent of ixformer.
-            import ixformer.inference.functions as ixfops  # type: ignore
-
-        for w_name, s_name in (
-            ("w13_weight", "w13_weight_scale"),
-            ("w2_weight", "w2_weight_scale"),
-        ):
-            w = getattr(layer, w_name)
-            s = getattr(layer, s_name)
-            assert w.dtype is torch.uint8 and w.is_contiguous(), (
-                f"{w_name} expected uint8 contiguous, got {w.dtype} "
-                f"contiguous={w.is_contiguous()}"
-            )
-            assert s.dtype is torch.uint8 and s.is_contiguous(), (
-                f"{s_name} expected uint8 contiguous, got {s.dtype} "
-                f"contiguous={s.is_contiguous()}"
-            )
-
-            w_int8 = w.data.view(torch.int8)
-            s_e8m0 = s.data.view(torch.float8_e8m0fnu)
-            if not use_ixmm:
-                replace_parameter(layer, w_name, w_int8)
-                replace_parameter(layer, s_name, s_e8m0)
-                continue
-
-            # Chunk by expert to cap preprocessing temporaries. For DSv4 w13,
-            # processing all 32 local experts at once would require several GB.
-            weight_parts: list[torch.Tensor] = []
-            scale_parts: list[torch.Tensor] = []
-            packed_k = w.shape[2]
-            # The TP shard of the down projection may end inside an ixmm
-            # scale group. Match the activation padding in the MoE runner.
-            pad_k = (-(packed_k * 2) % 256) if w_name == "w2_weight" else 0
-            for begin in range(0, w_int8.shape[0], _IXMM_EXPERT_CHUNK):
-                end = min(begin + _IXMM_EXPERT_CHUNK, w_int8.shape[0])
-                weight_chunk = w_int8[begin:end]
-                scale_chunk = s_e8m0[begin:end]
-                if pad_k:
-                    weight_chunk = F.pad(weight_chunk, (0, pad_k // 2))
-                    # E8M0 byte 127 encodes 1.0; padded FP4 nibbles encode zero.
-                    scale_chunk = F.pad(
-                        scale_chunk.view(torch.uint8), (0, pad_k // 32), value=127
-                    ).view(torch.float8_e8m0fnu)
-                ixmm_weight, ixmm_scale = ixfops.preprocess_weight_for_ixmm(
-                    weight_chunk,
-                    scale_chunk,
-                )
-                weight_parts.append(ixmm_weight)
-                scale_parts.append(ixmm_scale)
-
-            ixmm_weight = torch.cat(weight_parts, dim=0).contiguous()
-            ixmm_scale = torch.cat(scale_parts, dim=0).contiguous()
-            expected_weight_shape = (w.shape[0], packed_k + pad_k // 2, w.shape[1])
-            expected_scale_shape = (
-                w.shape[0],
-                (packed_k * 2 + pad_k) // 256,
-                w.shape[1],
-            )
-            if ixmm_weight.dtype is not torch.uint8:
-                raise TypeError(
-                    f"preprocess_weight_for_ixmm returned {ixmm_weight.dtype} "
-                    f"for {w_name}, expected torch.uint8"
-                )
-            if ixmm_scale.dtype is not torch.float32:
-                raise TypeError(
-                    f"preprocess_weight_for_ixmm returned {ixmm_scale.dtype} "
-                    f"for {s_name}, expected torch.float32"
-                )
-            if tuple(ixmm_weight.shape) != expected_weight_shape:
-                raise ValueError(
-                    f"preprocess_weight_for_ixmm returned shape "
-                    f"{tuple(ixmm_weight.shape)} for {w_name}, expected "
-                    f"{expected_weight_shape}"
-                )
-            if tuple(ixmm_scale.shape) != expected_scale_shape:
-                raise ValueError(
-                    f"preprocess_weight_for_ixmm returned shape "
-                    f"{tuple(ixmm_scale.shape)} for {s_name}, expected "
-                    f"{expected_scale_shape}"
-                )
-            replace_parameter(layer, w_name, ixmm_weight)
-            replace_parameter(layer, s_name, ixmm_scale)
-
-        layer._ilu_mxfp4_ixmm = use_ixmm
-
-    # [ILU override] Mxfp4MoEMethod.get_fused_moe_quant_config — delta: describe
-    # the ix30 tensors ``process_weights_after_loading`` left on the layer (FP8
-    # activations over MXFP4 weights) instead of returning None.
-    #
-    # ``apply`` still reads the weights straight off the layer, and no community
-    # MoE kernel is built either way -- ``moe_kernel`` stays ``None``, so
-    # ``topk_indices_dtype`` stays None
-    # (``fused_moe_method_base.py:109-112``) and the router still emits the
-    # int32 ids ``ilu_mxfp4_fused_experts`` expects. The config exists for the
-    # batched DP+EP path: ``select_gemm_impl`` hands ``w1_scale`` / ``w2_scale``
-    # to ``IluMoEBatchedExpertsFp8``, and ``nvsm_dispatch_quant_kwargs``
-    # (``prepare_finalize/ilu_deepep_ll.py:42-68``) reads the ``"mxfp4"`` weight
-    # dtype to put the LL dispatch into FP8 mode. Without it that helper falls
-    # back to ``use_int8=VLLM_ILU_DEEPEP_USE_INT8, use_fp8=False`` and the
-    # dispatched activations no longer match what the experts consume.
-    #
-    # ``gemm1_clamp_limit`` carries DeepSeek-V4's ``swiglu_limit`` through to the
-    # batched activation; see ``select_gemm_impl`` for why a missing limit is a
-    # hard error rather than "no clamp".
-    def _legacy_get_fused_moe_quant_config(
-        self, layer: RoutedExperts
-    ) -> FusedMoEQuantConfig | None:
-        return mxfp4_w4a8_moe_quant_config(
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
-        )
-
-    # [ILU override] — delta: return None.
-    #
-    # vLLM v0.31.0 (db9527a468) has no
-    # ``FusedMoEMethodBase.maybe_make_prepare_finalize``. The factory is the
-    # free function ``all2all_utils.maybe_make_prepare_finalize``, and nothing
-    # on this pin calls it through the quant method. With
-    # ``allow_new_interface`` left false it returns None for naive /
-    # allgather_reducescatter (``all2all_utils.py:189``; the AG-RS branch at
-    # ``:392`` also requires the flag). Returning None here keeps
-    # ``moe_kernel`` unset, so ``supports_internal_mk`` stays False and
-    # ``IluFusedMoEEP`` keeps driving dispatch/combine.
-    #
-    # The low-latency kernel is built in
-    # ``IluFusedMoEEP._get_forward_dp_ep_ll_moe_kernel`` via
-    # ``select_gemm_impl``, and only when the configured backend is not
-    # already ``deepep_low_latency``. That function returns ``moe_kernel``
-    # for a configured LL backend; this method leaves it None, so
-    # ``forward_dp_ep_deep_ep`` raises ``NotImplementedError``. The supported
-    # MXFP4 entry is ``VLLM_ILU_DECODE_EP_BACKEND=deepep_low_latency`` on top
-    # of a non-LL configured backend.
-    def maybe_make_prepare_finalize(
-        self,
-        routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
-    ) -> FusedMoEPrepareAndFinalizeModular | None:
-        return None
-
-    # [ILU override] FusedMoEMethodBase.select_gemm_impl — delta: build the
-    # batched FP4-weight / FP8-activation experts instead of raising.
-    #
-    # Reached from ``IluFusedMoEEP._get_forward_dp_ep_ll_moe_kernel`` when
-    # ``VLLM_ILU_DECODE_EP_BACKEND=deepep_low_latency`` and the configured
-    # backend is not itself ``deepep_low_latency``. Under ``ixmm`` our
-    # ``process_weights_after_loading`` leaves exactly the ix30 pair
-    # (``uint8 [E, k/2, n]`` weight + ``float32 [E, k/256, n]`` running-acc
-    # scale) that ``IluMoEBatchedExpertsFp8`` was written against -- the same
-    # tensors ``IluFp8MoEMethod`` produces by dequantising block-FP8 -- so the
-    # experts are reused verbatim rather than reimplemented here.
-    def _legacy_select_gemm_impl(
-        self,
-        prepare_finalize: FusedMoEPrepareAndFinalizeModular,
-        layer: RoutedExperts,
-    ) -> FusedMoEExpertsModular:
-        # Private import on purpose: the LL decode sizing rule belongs to
-        # whichever method owns the NVSHMEM buffer, and both FP8 and MXFP4
-        # routed experts share one.
-        from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.batch_experts import (  # noqa: E501
-            IluMoEBatchedExpertsFp8,
-        )
-        from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe import (
-            _shrink_ll_max_tokens_to_decode,
-        )
-
-        if (
-            prepare_finalize.activation_format
-            != FusedMoEActivationFormat.BatchedExperts
-        ):
-            raise NotImplementedError(
-                "IluMoEBatchedExpertsFp8 requires the batched activation format, "
-                f"got {prepare_finalize.activation_format}"
-            )
-
-        # The fallback layouts keep the checkpoint's ``int8 [E, n, k/2]``
-        # weights and ``float8_e8m0fnu`` scales, which the batched experts
-        # reject by dtype. Fail here instead of at the first decode step.
-        if not getattr(layer, "_ilu_mxfp4_ixmm", False):
-            raise NotImplementedError(
-                "batched MXFP4 experts require the ixmm weight layout; "
-                "VLLM_ILU_MXFP4_MOE_BACKEND resolved to a torch / "
-                "ixformer_native layout. Use the configured all2all backend "
-                "(no decode override) or set VLLM_ILU_MXFP4_MOE_BACKEND=ixmm."
-            )
-
-        assert self.moe_quant_config is not None
-        activation = getattr(layer.activation, "value", layer.activation)
-        swiglu_limit = self.moe_quant_config.gemm1_clamp_limit
-        if activation in ("silu", "swiglu"):
-            # ``IluMoEBatchedExpertsFp8`` maps silu/swiglu onto
-            # ``moe_group_gemv_swiglu_quant_fp8(act_type="swiglu")``, whose
-            # clamp is DeepSeek-V4's ``SiluAndMulWithClamp`` only while a limit
-            # is supplied -- a ``None`` silently degrades to plain SwiGLU
-            # instead of raising the way the legacy ``dsv4_clamp`` variant does.
-            if swiglu_limit is None or swiglu_limit <= 0:
-                raise ValueError(
-                    "batched MXFP4 experts need a positive swiglu_limit for "
-                    f"activation {activation!r} (clamp-before-silu), got "
-                    f"{swiglu_limit!r}"
-                )
-        elif activation != "swiglustep":
-            raise NotImplementedError(
-                "batched MXFP4 experts support silu/swiglu (clamped) and "
-                f"swiglustep activations, got {activation!r}"
-            )
-
-        _shrink_ll_max_tokens_to_decode(prepare_finalize)
-        max_num_tokens = prepare_finalize.max_num_tokens_per_rank()
-        if max_num_tokens is None:
-            raise ValueError("batched MXFP4 experts require max_num_tokens")
-        return IluMoEBatchedExpertsFp8(
-            moe_config=self.moe,
-            quant_config=self.moe_quant_config,
-            max_num_tokens=max_num_tokens,
-            num_dispatchers=prepare_finalize.num_dispatchers(),
-            swiglu_limit=swiglu_limit,
-            # ``apply`` folds this into ``ilu_mxfp4_fused_experts``'
-            # ``output_scale``; the batched combine reads it back off the
-            # experts (``ilu_fused_moe_ep.py:889-896``), so pass it through
-            # rather than letting the two paths disagree if it ever leaves 1.0.
-            runner_scaling_factor=_get_ilu_output_scale(layer),
-        )
-
-    # [ILU override] Mxfp4MoEMethod.apply — delta: wiring only. Community
-    # delegates to ``self.moe_kernel.apply``; we call the plugin's compute
-    # function with explicit tensors.
-    #
-    # ``shared_experts`` is accepted for signature compatibility and
-    # deliberately unused: the community modular kernel only calls it under
-    # ``SharedExpertsOrder.MK_INTERNAL_OVERLAPPED``, which requires
-    # ``mk_can_overlap_shared_experts`` (``fused_moe_method_base.py:45-50``,
-    # ``moe_kernel is not None``) and is therefore unreachable here. The shared
-    # output arrives through ``shared_experts_input`` instead -- see
-    # ``ilu_mxfp4_fused_experts``' ``extra_residual``.
-    #
-    # ``run_decode`` is not passed: ``group_gemm_fp4`` auto-selects gemv/gemm via
-    # ``mode=None``, and computing it cost a ``torch.cuda.is_available()`` plus a
-    # scan of the whole ``attn_metadata`` dict for every MoE layer on every step.
-    # ``backend=None`` lets ``VLLM_ILU_MXFP4_MOE_BACKEND`` decide (default ixmm).
-    def _legacy_apply(
-        self,
-        layer: RoutedExperts,
-        x: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        shared_experts: SharedExperts | None,
-        shared_experts_input: torch.Tensor | None,
-    ) -> torch.Tensor:
-        return ilu_mxfp4_fused_experts(
-            hidden_states=x,
-            w13_weight=layer.w13_weight,
-            w13_weight_scale=layer.w13_weight_scale,
-            w2_weight=layer.w2_weight,
-            w2_weight_scale=layer.w2_weight_scale,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            swiglu_limit=getattr(layer, "swiglu_limit", None),
-            expert_map=layer.expert_map,
-            output_scale=_get_ilu_output_scale(layer),
-            extra_residual=shared_experts_input,
-            w13_bias=getattr(layer, "w13_bias", None),
-            w2_bias=getattr(layer, "w2_bias", None),
-            backend=None,
-            skip_moe_sort=_v41_decode_skip_sort(layer),
-        )
+        self.selection = selection
+        self._compute = None
+        self._runtime_weights = None
+        self._checkpoint_loader = None
+        self.ilu_compute_backend = selection.name
+        self.ilu_weight_format = selection.layout
+        self.ilu_prefer_hybrid_ep = get_moe_backend(selection).prefer_hybrid_ep
 
     def _compute_config(self, layer):
-        from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
-            MoEComputeConfig,
-        )
-
-        return MoEComputeConfig(
-            hidden=layer.moe_config.hidden_dim,
-            intermediate=layer.moe_config.intermediate_size_per_partition,
-            local_num_experts=layer.local_num_experts,
-            global_num_experts=layer.global_num_experts,
-            ep_rank=layer.moe_config.ep_rank,
-            activation=getattr(layer.activation, "value", layer.activation),
-            limit=getattr(layer, "swiglu_limit", None),
-            output_scale=float(_get_ilu_output_scale(layer)),
-            apply_router_weight_on_input=layer.apply_router_weight_on_input,
-        )
+        config = super()._compute_config(layer)
+        unpadded = layer.moe_config.intermediate_size_per_partition_unpadded
+        if (
+            self.selection.name == "ixmm_fp4fp8"
+            and unpadded is not None
+            and unpadded != config.intermediate
+        ):
+            # Gate/up and activation use the logical width. Only the down
+            # projection needs extra K alignment in the weight contract.
+            return replace(config, intermediate=unpadded)
+        return pad_online_w4a8_config(config, unpadded, self.selection)
 
     def create_weights(
         self,
@@ -520,15 +148,6 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
         params_dtype,
         **attrs,
     ):
-        if self.selection is None:
-            return super().create_weights(
-                layer,
-                num_experts,
-                hidden_size,
-                intermediate_size_per_partition,
-                params_dtype,
-                **attrs,
-            )
         from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
             make_moe_compute,
         )
@@ -543,8 +162,11 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
             self.moe.has_bias
             or not self.moe.is_act_and_mul
             or self.moe.hidden_dim_unpadded != hidden_size
-            or self.moe.intermediate_size_per_partition_unpadded
-            not in (None, intermediate_size_per_partition)
+            or (
+                self.selection.name not in ("ixmm_fp4fp8", "ixinfer_w4a8", "ixmm_w4a8")
+                and self.moe.intermediate_size_per_partition_unpadded
+                not in (None, intermediate_size_per_partition)
+            )
         ):
             raise ValueError(
                 "MXFP4 streaming requires unpadded bias-free gated experts"
@@ -570,14 +192,21 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
             )
             if not torch.equal(layer.expert_map, expected):
                 raise ValueError("W4A8 compute requires contiguous expert placement")
+        source_width = self.moe.intermediate_size_per_partition_unpadded
+        if source_width is None:
+            source_width = intermediate_size_per_partition
         loader = make_mxfp4_loader(
             backend.weight_spec,
             Mxfp4LoadSpec(
                 num_experts,
                 hidden_size,
-                intermediate_size_per_partition,
+                backend.intermediate,
                 self.moe.tp_size,
                 self.moe.tp_rank,
+                source_width,
+                backend.config.w2_k_padded,
+                backend.config.w13_k_padded,
+                backend.config.w2_n_padded,
             ),
         )
         layer.params_dtype = params_dtype
@@ -589,103 +218,14 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
         self.supports_pre_processed_weights = False
 
     def process_weights_after_loading(self, layer):
-        if getattr(self, "selection", None) is None:
-            return self._legacy_process_weights_after_loading(layer)
-        from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
-            make_moe_compute,
-        )
-
-        if self._compute is not None or self._checkpoint_loader is None:
+        if self._checkpoint_loader is None:
             raise RuntimeError("MXFP4 weights must be created once before finalization")
         if self._checkpoint_loader._layer is not layer:
             raise ValueError("MXFP4 Method can only finalize its own layer")
-        weights = self._checkpoint_loader.finalize()
-        # Runner-owned output scaling is installed after create_weights. Freeze
-        # it now, before any Experts adapter or graph captures the backend.
-        compute = make_moe_compute(self._compute_config(layer), self.selection)
-        compute.validate_weights(weights)
-        self._runtime_weights, self._compute = weights, compute
-        layer._ilu_mxfp4_ixmm = self.selection.name == "ixmm_fp4fp8"
-
-    def get_fused_moe_quant_config(self, layer):
-        if getattr(self, "selection", None) is None:
-            return self._legacy_get_fused_moe_quant_config(layer)
-        if self.selection.name == "ixmm_fp4fp8":
-            return mxfp4_w4a8_moe_quant_config(
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
-            )
-        return FusedMoEQuantConfig.make(
-            torch.int8,
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            per_act_token_quant=True,
-            weight_dtype="int4",
-        )
-
-    def select_gemm_impl(self, prepare_finalize, layer):
-        if getattr(self, "selection", None) is None:
-            return self._legacy_select_gemm_impl(prepare_finalize, layer)
-        if self._compute is None:
-            raise RuntimeError(
-                "MXFP4 weights must be finalized before binding communication"
-            )
-        if (
-            prepare_finalize.activation_format
-            == FusedMoEActivationFormat.BatchedExperts
-        ):
-            from vllm_iluvatar.model_executor.layers.quantization.backends.fp4.fp8_moe import (
-                _shrink_ll_max_tokens_to_decode,
-            )
-
-            _shrink_ll_max_tokens_to_decode(prepare_finalize)
-        from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_experts import (
-            bind_compute_experts,
-        )
-
-        return bind_compute_experts(
-            self._compute,
-            self._runtime_weights,
-            self.moe,
-            self.moe_quant_config,
-            prepare_finalize,
-        )
-
-    def apply(
-        self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input
-    ):
-        if getattr(self, "selection", None) is None:
-            return self._legacy_apply(
-                layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input
-            )
-        if self._compute is None:
-            raise RuntimeError("MXFP4 weights have not been finalized")
-        residual = shared_experts_input
-        if residual is not None and residual.shape[0] != x.shape[0]:
-            residual = None
-        workspace = self._compute.workspace_spec(topk_ids.numel(), x.dtype).allocate(
-            x.device
-        )
-        from vllm_iluvatar import envs
-
-        prequant = (
-            _lookup_activation_prequant(x)
-            if layer.expert_map is None
-            and getattr(self._compute, "supports_prequantized_fp8", False)
-            and envs.VLLM_ILU_MXFP4_MOE_PREQUANT
-            else None
-        )
-        return self._compute.run_standard(
-            x,
-            self._runtime_weights,
-            topk_weights,
-            topk_ids,
-            layer.expert_map,
-            workspace=workspace,
-            residual=residual,
-            quantized_input=prequant,
-        )
+        # Runner-owned output scaling is installed after create_weights. The
+        # mixin freezes it into the compute now, before any Experts adapter or
+        # graph captures the backend.
+        self._bind_compute(layer, self._checkpoint_loader.finalize())
 
 
 def select_mxfp4_compute(arch, mode="auto"):
@@ -694,8 +234,8 @@ def select_mxfp4_compute(arch, mode="auto"):
     return select_four_bit_expert_compute(arch, mode, source="MXFP4")
 
 
-def select_mxfp4_method(layer, original, runtime=None):
-    """Quantization-owned policy: source compatibility and legacy entry points."""
+def make_mxfp4_method(layer):
+    """The MXFP4 routed-expert Method for this build's selected compute."""
     from vllm.logger import init_logger
 
     from vllm_iluvatar import envs
@@ -703,23 +243,22 @@ def select_mxfp4_method(layer, original, runtime=None):
     from vllm_iluvatar.ilu_util.arch import cuda_arch
 
     options = compute_options("moe")
-    if runtime is not None:
-        if any(value != "auto" for value in options.values()):
-            raise ValueError(
-                "Explicit ilu_quant MoE conversion cannot be combined with ilu_compute.moe overrides yet"
-            )
-        return runtime
     arch = cuda_arch()
-    if (
-        not options
-        and arch == "ivcore30"
-        and envs.VLLM_ILU_MXFP4_MOE_BACKEND in ("torch", "ixformer_native")
-    ):
-        return original
     mode = options.get("mode", "auto")
+    # Checked whatever else is configured: the point is that a launch script
+    # carrying this setting learns it stopped meaning anything, and someone who
+    # also passes ilu_compute.moe is exactly who has a stale script to clean up.
+    if envs.VLLM_ILU_MXFP4_MOE_BACKEND in ("torch", "ixformer_native"):
+        raise ValueError(
+            "VLLM_ILU_MXFP4_MOE_BACKEND=torch/ixformer_native no longer "
+            "selects a routed-expert method; routed MXFP4 always converts "
+            "to a compute backend's contract. Use ilu_compute.moe.mode to "
+            "pick one."
+        )
     if not options and arch == "ivcore11":
         # Preserve the existing default/legacy layout override when no explicit
-        # MoE configuration is supplied. An explicit mode always takes precedence.
+        # MoE configuration is supplied. An explicit mode always takes
+        # precedence.
         layout = envs.VLLM_ILU_MOE_RUNTIME_LAYOUT
         if layout:
             mode = {"NN": "ixinfer_w4a8_nn_v2", "TN": "ixinfer_w4a8_tn_v2"}.get(
@@ -733,3 +272,17 @@ def select_mxfp4_method(layer, original, runtime=None):
         arch,
     )
     return IluMxfp4MoEMethod(layer.moe_config, selection)
+
+
+def select_mxfp4_method(original, runtime=None):
+    """Let a validated ``ilu_quant`` conversion replace the checkpoint's method."""
+    from vllm_iluvatar.config.ilu_compute import compute_options
+
+    if runtime is None:
+        return original
+    if any(value != "auto" for value in compute_options("moe").values()):
+        raise ValueError(
+            "Explicit ilu_quant MoE conversion cannot be combined with "
+            "ilu_compute.moe overrides yet"
+        )
+    return runtime

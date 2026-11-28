@@ -6,6 +6,22 @@ import torch
 
 from .ilu_compute_backend import MoEComputeBackend, MoEWeightSpec, register_moe_backend
 
+# MiniMax-M3 stores gate and up as packed halves and names the activation after
+# that layout; the ixformer op reads the same packing, so no interleave step
+# stands between GEMM1 and it. Unlike ivcore11's INT8 counterpart it takes the
+# three coefficients as arguments, so any checkpoint's values are runnable.
+_SWIGLUOAI = "swigluoai_uninterleave"
+_SWIGLUOAI_DEFAULTS = {"alpha": 1.702, "beta": 1.0}
+
+# Above this many expanded rows the sort pays for itself: ixmm schedules heavy
+# experts first, and the imbalance only matters once the GEMMs are large
+# enough. The bound is the one the pre-backend MXFP4 path measured.
+_SKIP_SORT_MAX_ROWS = 256
+
+# Grouped-GEMM tiling for DeepSeek-V4.1's decode step. Mode 1 is a win only for
+# that model's shape, so the guard is the shape itself rather than a model name.
+_V41_DECODE = {"max_rows": 768, "hidden": 5120, "top_k": 6}
+
 
 @register_moe_backend
 class IxMMFP4FP8Backend(MoEComputeBackend):
@@ -21,9 +37,59 @@ class IxMMFP4FP8Backend(MoEComputeBackend):
     standard_layout_columns = 3
     requires_contiguous_experts = False
     prefer_hybrid_ep = False
-    supported_activations = ("silu", "swiglu", "swiglustep")
+    supported_batched_activations = ("silu", "swiglu", "swiglustep")
+    supported_activations = ("silu", "swiglu", "swiglustep", _SWIGLUOAI)
     requires_activation_limit = False
     supports_prequantized_fp8 = True
+
+    # [ILU override] MoEComputeBackend.standard_layout_width -- delta: a third
+    # column means ``[start, end, expert_id]`` sorted by descending token
+    # count; two means ``[start, end]`` in natural expert order, which skips
+    # the sort kernel. Only a model that opted in may ask, and only for a
+    # batch small enough that the scheduling gain cannot repay the sort.
+    def standard_layout_width(self, rows, skip_sort):
+        return 2 if skip_sort and rows <= _SKIP_SORT_MAX_ROWS else 3
+
+    @classmethod
+    def support_error(cls, config, selection):
+        error = super().support_error(config, selection)
+        if error is None and config.activation == _SWIGLUOAI and config.limit is None:
+            # The other activations treat a missing limit as "no clamp"; this
+            # one has no unclamped form.
+            return f"{cls.name} requires a clamp limit for {_SWIGLUOAI}"
+        return error
+
+    @staticmethod
+    def _decode_mode(rows, hidden, top_k):
+        """Grouped-GEMM tile mode for this step, or ``None`` to auto-select."""
+        from vllm_iluvatar import envs
+
+        matches = rows <= _V41_DECODE["max_rows"] and (hidden, top_k) == (
+            _V41_DECODE["hidden"],
+            _V41_DECODE["top_k"],
+        )
+        return 1 if envs.VLLM_ILU_V41_DECODE_MOE_MODE1 and matches else None
+
+    def _activation_quant(self, intermediate, order, fp8_output=None):
+        """GEMM1 output -> activation -> per-token FP8 for GEMM2."""
+        if self.config.activation == _SWIGLUOAI:
+            return ops.swigluoai_uninterleave_dynamic_scaled_fp8(
+                intermediate,
+                order,
+                float(self.limit),
+                **{
+                    name: float(getattr(self.config, name) or default)
+                    for name, default in _SWIGLUOAI_DEFAULTS.items()
+                },
+                fp8_output=fp8_output,
+            )
+        if self.config.activation == "swiglustep" or self.limit is None:
+            return ops.swiglustep_dynamic_scaled_fp8(
+                intermediate, order, float(self.limit or 0.0), fp8_output=fp8_output
+            )
+        return ops.swiglu_limit_dynamic_scaled_fp8(
+            intermediate, order, float(self.limit), fp8_output=fp8_output
+        )
 
     def gemm(self, weights, x, scale, prefix, layout, output=None, mode=None):
         return ops.group_gemm_fp4(
@@ -90,25 +156,40 @@ class IxMMFP4FP8Backend(MoEComputeBackend):
             q, scale = expand_prequantized_input(
                 quantized_input[0], quantized_input[1], order, topk_ids.shape[-1]
             )
+        mode = self._decode_mode(topk_ids.numel(), self.hidden, topk_ids.shape[-1])
         intermediate = workspace.get("gemm1")
-        self.gemm(weights, q, scale, "w13", layout, intermediate, mode=w13_gemm_mode)
+        self.gemm(
+            weights,
+            q,
+            scale,
+            "w13",
+            layout,
+            intermediate,
+            mode=w13_gemm_mode if w13_gemm_mode is not None else mode,
+        )
         del q, scale
         workspace.release("input", "input_scale")
-        if self.config.activation == "swiglustep" or self.limit is None:
-            q, scale = ops.swiglustep_dynamic_scaled_fp8(
-                intermediate, order, float(self.limit or 0.0)
-            )
-        else:
-            q, scale = ops.swiglu_limit_dynamic_scaled_fp8(
-                intermediate, order, float(self.limit)
-            )
         padded_k = weights.w2_weight.shape[1] * 2
-        if q.shape[-1] != padded_k:
-            q = torch.nn.functional.pad(q, (0, padded_k - q.shape[-1]))
+        # Only clamped SwiGLU accepts a wider output and zeroes its tail.
+        # SwiGLUStep and SwiGLU-OAI require the exact logical output width.
+        fp8_output = None
+        if (
+            padded_k > self.intermediate
+            and self.limit is not None
+            and self.config.activation not in ("swiglustep", _SWIGLUOAI)
+        ):
+            fp8_output = torch.empty(
+                (intermediate.shape[0], padded_k),
+                dtype=self.activation_dtype,
+                device=intermediate.device,
+            )
+        q, scale = self._activation_quant(intermediate, order, fp8_output)
         del intermediate
         workspace.release("gemm1")
+        if q.shape[-1] < padded_k:
+            q = torch.nn.functional.pad(q, (0, padded_k - q.shape[-1]))
         out = workspace.get("gemm2")
-        self.gemm(weights, q, scale, "w2", layout, out)
+        self.gemm(weights, q, scale, "w2", layout, out, mode=mode)
         del q, scale
         workspace.release("input", "input_scale")
         return ops.moe_gather_output_reduce_sum(

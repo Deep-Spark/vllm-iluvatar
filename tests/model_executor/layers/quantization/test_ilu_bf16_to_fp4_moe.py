@@ -72,6 +72,7 @@ class _StubRoutedExperts(RoutedExperts):
             num_local_experts=len(local_experts),
             tp_rank=tp_rank,
             tp_size=tp_size,
+            ep_rank=0,
             moe_parallel_config=SimpleNamespace(tp_size=tp_size),
         )
         self.expert_map_manager = _ExpertMapManager(local_experts)
@@ -80,6 +81,13 @@ class _StubRoutedExperts(RoutedExperts):
         self.quant_config = None
         self.quant_method = None
         self.activation = "swigluoai_uninterleave"
+        # Bind-time ``_compute_config`` / ``run_standard`` need MiniMax clamp.
+        self.swiglu_limit = 7.0
+        self.swiglu_alpha = 1.702
+        self.swiglu_beta = 1.0
+        self.local_num_experts = len(local_experts)
+        self.global_num_experts = max(local_experts, default=-1) + 1
+        self.apply_router_weight_on_input = False
         self.prefix = "language_model.model.layers.3.block_sparse_moe.experts"
         self._loaded_expert_biases = set()
 
@@ -134,6 +142,65 @@ def test_example_config_builds_the_method():
     assert method.max_pending_shards == 8
     assert method.maybe_make_prepare_finalize() is None
     assert method.get_fused_moe_quant_config(layer) is None
+
+
+def test_compute_config_forwards_swigluoai_clamp():
+    from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+        MoEComputeSelection,
+    )
+
+    layer = _StubRoutedExperts(1, 0, {e: e for e in range(NUM_EXPERTS)})
+    method = IluFp16ToFp4OnlineMoEMethod.from_ilu_runtime_config(
+        _context(_moe_group(), layer)
+    )
+    method.selection = MoEComputeSelection("ixmm_fp4fp8", "fp4fp8", "ivcore30")
+    cfg = method._compute_config(layer)
+    assert cfg.activation == "swigluoai_uninterleave"
+    assert cfg.limit == 7.0
+    assert cfg.alpha == 1.702
+    assert cfg.beta == 1.0
+
+
+def test_apply_delegates_to_bound_run_standard():
+    """apply must go through the bound IxMMFP4FP8Backend, not call ops itself."""
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+    layer = _StubRoutedExperts(1, 0, {0: 0})
+    method = IluFp16ToFp4OnlineMoEMethod(
+        Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=list(BLOCK),
+        ),
+        layer,
+        source=Fp8SourceLayout(format="fp8-block", block_shape=BLOCK),
+    )
+    calls = []
+
+    class _Compute:
+        supports_prequantized_fp8 = True
+        supports_prequantized_int8 = False
+        hidden = HIDDEN
+
+        def workspace_spec(self, n, dtype, *, batched=False, skip_sort=False):
+            class _Spec:
+                def allocate(self, device):
+                    return {"layout": None}
+
+            return _Spec()
+
+        def run_standard(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return torch.zeros(1, HIDDEN)
+
+    method._compute = _Compute()
+    method._runtime_weights = object()
+    x = torch.zeros(1, HIDDEN)
+    topk_w = torch.ones(1, 1)
+    topk_ids = torch.zeros(1, 1, dtype=torch.int32)
+    out = method.apply(layer, x, topk_w, topk_ids, None, None)
+    assert out.shape == (1, HIDDEN)
+    assert len(calls) == 1
 
 
 def test_factory_requires_unquantized_original_method():
@@ -415,10 +482,14 @@ def test_load_time_fp4_moe_matches_bf16_reference(hidden, inter, experts, monkey
                 expert_id=e,
                 return_success=True,
             )
+    # MiniMax-M3 activation parameters must be on the layer before bind
+    # (``process_weights_after_loading`` -> ``_compute_config``).
+    layer.swiglu_limit, layer.swiglu_alpha, layer.swiglu_beta = 7.0, 1.702, 1.0
+    layer.local_num_experts = experts
+    layer.global_num_experts = experts
+    layer.apply_router_weight_on_input = False
     method.process_weights_after_loading(layer)
 
-    # MiniMax-M3 activation parameters (config.swiglu_*).
-    layer.swiglu_limit, layer.swiglu_alpha, layer.swiglu_beta = 7.0, 1.702, 1.0
     layer._expert_map = None
     layer._ilu_output_scale = 1.0
 

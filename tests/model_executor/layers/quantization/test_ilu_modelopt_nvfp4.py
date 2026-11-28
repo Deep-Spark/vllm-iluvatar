@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """NVFP4 dispatch, host staging, local-expert coverage and activation contracts."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -9,19 +10,35 @@ from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
 
 import vllm_iluvatar.model_executor.layers.quantization.backends.fp4.nvfp4_moe as impl
 import vllm_iluvatar.model_executor.layers.quantization.configs.mxfp8 as mixed
+from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
+    MoEComputeSelection,
+)
+
+# The conversion tests pin the ix30 target, which is selected on ivcore30; the
+# method reaches it from any host because selection is an explicit field.
+IX30 = MoEComputeSelection("ixmm_fp4fp8", "fp4fp8", "ivcore30")
 
 
-def method(**kwargs):
-    return impl.IluModelOptNvFp4MoEMethod(
+def method(selection=IX30, **kwargs):
+    m = impl.IluModelOptNvFp4MoEMethod(
         ModelOptNvFp4Config(is_checkpoint_nvfp4_serialized=True, group_size=16),
         MagicMock(),
         **kwargs,
     )
+    m.selection = selection
+    return m
 
 
 def weights():
     layer = torch.nn.Module()
     layer.num_experts = 2
+    # What ``_compute_config`` reads: hidden 256, intermediate 256, 2 experts.
+    layer.moe_config = SimpleNamespace(
+        hidden_dim=256, intermediate_size_per_partition=256, ep_rank=0
+    )
+    layer.local_num_experts = layer.global_num_experts = 2
+    layer.activation = "silu"
+    layer.apply_router_weight_on_input = False
     for name, shape, dtype in (
         ("w13_weight", (2, 512, 128), torch.uint8),
         ("w2_weight", (2, 256, 128), torch.uint8),
@@ -45,7 +62,6 @@ def weights():
 @pytest.mark.parametrize("stage_on_cpu", [False, True])
 def test_conversion_is_bounded_and_idempotent(monkeypatch, stage_on_cpu):
     calls = []
-    monkeypatch.setattr(impl, "_ixmm_backend_available", lambda: True)
 
     def convert(w, s, g):
         calls.append(w.shape[0])
@@ -69,26 +85,26 @@ def test_conversion_is_bounded_and_idempotent(monkeypatch, stage_on_cpu):
 
 
 @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
-def test_invalid_global_scales_fail_before_conversion(monkeypatch, bad):
-    monkeypatch.setattr(impl, "_ixmm_backend_available", lambda: True)
+def test_invalid_global_scales_fail_before_conversion(bad):
     layer = weights()
     layer.w13_weight_scale_2.data.fill_(bad)
     with pytest.raises(ValueError, match="global scales"):
         method().process_weights_after_loading(layer)
 
 
-def test_gate_up_scales_must_match(monkeypatch):
-    monkeypatch.setattr(impl, "_ixmm_backend_available", lambda: True)
+def test_gate_up_scales_must_match():
     layer = weights()
     layer.w13_weight_scale_2.data[:, 1] = 2
     with pytest.raises(ValueError, match="gate/up"):
         method().process_weights_after_loading(layer)
 
 
-def test_missing_backend_fails_loudly(monkeypatch):
-    monkeypatch.setattr(impl, "_ixmm_backend_available", lambda: False)
-    with pytest.raises(RuntimeError, match="requires the ixmm"):
-        method().process_weights_after_loading(weights())
+def test_an_activation_the_backend_cannot_run_fails_before_conversion():
+    """The conversion target also decides which activations are runnable."""
+    layer = weights()
+    layer.activation = "gelu"
+    with pytest.raises(ValueError, match="activation gelu"):
+        method().process_weights_after_loading(layer)
 
 
 def test_loader_tracks_only_successful_local_experts(monkeypatch):
@@ -132,55 +148,13 @@ def test_loader_tracks_only_successful_local_experts(monkeypatch):
         m._validate_loaded_experts(layer)
 
 
-@pytest.mark.parametrize(
-    "activation,limit,variant",
-    [
-        ("silu", 0.0, "step3_swiglustep"),
-        ("swiglustep", 9.0, "step3_swiglustep"),
-        ("swigluoai_uninterleave", 9.0, "swigluoai"),
-    ],
-)
-def test_activation_dispatch_preserves_scale_and_shared_output(
-    monkeypatch, activation, limit, variant
-):
+def test_swigluoai_needs_an_explicit_clamp():
+    """It has no unclamped form, and ``requires_activation_limit`` is off."""
     layer = weights()
-    layer.activation = activation
-    layer.swiglu_limit, layer.swiglu_alpha, layer.swiglu_beta = 9.0, 1.702, 1.0
-    layer.expert_map = object()
-    layer._ilu_output_scale = 2.0
-    residual = object()
-    monkeypatch.setattr(impl, "ilu_mxfp4_fused_experts", lambda **kwargs: kwargs)
-    got = method().apply(layer, object(), object(), object(), None, residual)
-    assert got["swiglu_variant"] == variant and got["swiglu_limit"] == limit
-    assert got["extra_residual"] is residual
-    assert got["expert_map"] is layer.expert_map and got["output_scale"] == 2.0
-    if variant == "swigluoai":
-        assert got["swiglu_alpha"] == 1.702 and got["swiglu_beta"] == 1.0
-
-
-@pytest.mark.parametrize(
-    "activation,missing",
-    [
-        ("swigluoai_uninterleave", "swiglu_limit"),
-        ("swigluoai_uninterleave", "swiglu_alpha"),
-        ("swigluoai_uninterleave", "swiglu_beta"),
-        ("swiglustep", "swiglu_limit"),
-    ],
-)
-def test_activation_parameters_are_not_defaulted(activation, missing):
-    layer = weights()
-    layer.activation = activation
-    layer.swiglu_limit, layer.swiglu_alpha, layer.swiglu_beta = 7.0, 1.702, 1.0
-    setattr(layer, missing, None)
-    with pytest.raises(ValueError, match="explicit"):
-        method().apply(layer, None, None, None, None, None)
-
-
-def test_unknown_activation_is_rejected():
-    layer = weights()
-    layer.activation = "gelu"
-    with pytest.raises(NotImplementedError, match="activation"):
-        method().apply(layer, None, None, None, None, None)
+    layer.activation = "swigluoai_uninterleave"
+    layer.swiglu_alpha, layer.swiglu_beta = 1.702, 1.0
+    with pytest.raises(ValueError, match="clamp limit"):
+        method().process_weights_after_loading(layer)
 
 
 def test_mixed_config_dispatch_and_exclusions(monkeypatch):
@@ -201,6 +175,8 @@ def test_mixed_config_dispatch_and_exclusions(monkeypatch):
             ignored_layers=["ignored"],
         )
     )
+    # One method on both architectures; the conversion target is its own
+    # decision, so the config does not branch on the arch any more.
     selected = cfg.get_quant_method(Experts(), "experts")
     assert type(selected) is impl.IluModelOptNvFp4MoEMethod
     assert selected.stage_on_cpu and selected.validate_checkpoint

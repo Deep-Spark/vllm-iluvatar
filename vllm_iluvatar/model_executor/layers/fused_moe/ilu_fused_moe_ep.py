@@ -932,6 +932,29 @@ class IluFusedMoEEP:
                 else shared_gate_up_input
             )
             if (
+                hasattr(routed_experts, "_ixmm_ll_scales")
+                and orig_num_tokens in (6, 12, 18)
+                and not apply_router_weight_on_input
+                and pre_xform_trunc_size is None
+                and torch.cuda.is_current_stream_capturing()
+                and self._is_all_ranks_decode_only()
+            ):
+                from vllm_iluvatar.model_executor.layers.fused_moe import ixmm_ll_decode
+
+                stream = current_stream().cuda_stream
+                ids = topk_ids.to(torch.int32).contiguous()
+                buffers = ixmm_ll_decode.dispatch_send(hidden_states, ids, stream)
+                shared_output = runner.shared_experts._layer(shared_layer_input)
+                ixmm_ll_decode.dispatch_recv(buffers, stream)
+                output = ixmm_ll_decode.experts(
+                    buffers, routed_experts, ids, topk_weights.float().contiguous(),
+                    routed_experts.swiglu_limit,
+                )
+                scale = float(getattr(fused_experts, "runner_scaling_factor", 1.0))
+                if scale != 1.0:
+                    output.mul_(scale)
+                return shared_output + output
+            if (
                 getattr(self, "_ll_shared_dispatch_overlap_enabled", False)
                 and orig_num_tokens > 0
             ):

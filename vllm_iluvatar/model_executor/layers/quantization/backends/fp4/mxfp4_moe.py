@@ -602,6 +602,11 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
         compute = make_moe_compute(self._compute_config(layer), self.selection)
         compute.validate_weights(weights)
         self._runtime_weights, self._compute = weights, compute
+        if getattr(layer, "_ilu_ixmm_ll_decode", False) and self.selection.layout == "NN":
+            from vllm.distributed import get_ep_group
+            from vllm_iluvatar.model_executor.layers.fused_moe import ixmm_ll_decode
+
+            ixmm_ll_decode.prepare_layer(layer, weights.spec.code_multiplier, get_ep_group())
         layer._ilu_mxfp4_ixmm = self.selection.name == "ixmm_fp4fp8"
 
     def get_fused_moe_quant_config(self, layer):

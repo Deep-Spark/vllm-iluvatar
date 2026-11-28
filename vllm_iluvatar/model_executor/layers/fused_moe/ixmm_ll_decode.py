@@ -172,6 +172,9 @@ class IxmmLL:
                 torch.cuda.current_stream().cuda_stream,
             )
             combine.zero_()
+            # Complete the stream-side SHMEM barrier before the next
+            # symmetric allocation enters a host-side SHMEM collective.
+            torch.cuda.current_stream().synchronize()
 
             def empty(shape, dtype):
                 return torch.empty(shape, dtype=dtype, device=device)

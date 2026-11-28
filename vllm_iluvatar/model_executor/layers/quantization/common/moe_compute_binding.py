@@ -294,6 +294,17 @@ class MoEComputeBindingMixin:
             compute_kwargs["output"] = torch.empty(
                 (q.shape[0], self._compute.hidden), device=q.device, dtype=output_dtype
             )
+        elif (
+            self.compute_source == "MXFP4"
+            and layer.expert_map is None
+            and self._compute.supports_prequantized_fp8
+            and ilu_envs.VLLM_ILU_MXFP4_MOE_PREQUANT
+        ):
+            from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_mm import (
+                _lookup_activation_prequant,
+            )
+
+            compute_kwargs["quantized_input"] = _lookup_activation_prequant(x)
         residual = shared_experts_input
         if residual is not None and residual.shape[0] != x.shape[0]:
             residual = None

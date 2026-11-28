@@ -10,9 +10,6 @@ import torch.distributed as dist
 from vllm.logger import init_logger
 
 from vllm_iluvatar import envs
-from vllm_iluvatar.model_executor.layers.fused_moe.experts.ilu_compute_backend import (
-    MoEWorkspaceSpec,
-)
 
 logger = init_logger(__name__)
 TOKENS = (6, 12, 18)
@@ -190,13 +187,9 @@ class IxmmLL:
                 natural=empty((EXPERTS, 3), torch.int32),
                 hot=empty((EXPERTS, 3), torch.int32),
                 routes=torch.full((rows,), -1, dtype=torch.int32, device=device),
-                compute=MoEWorkspaceSpec(
-                    {
-                        "fc1": ((rows, 2 * INTERMEDIATE), torch.bfloat16),
-                        "act": ((rows, INTERMEDIATE), torch.int8),
-                        "act_scale": ((rows,), torch.float32),
-                    }
-                ),
+                fc1=empty((rows, 2 * INTERMEDIATE), torch.bfloat16),
+                act=empty((rows, INTERMEDIATE), torch.int8),
+                act_scale=empty((rows,), torch.float32),
                 out=empty((tokens, HIDDEN), torch.bfloat16),
             )
         torch.cuda.synchronize()
@@ -291,12 +284,6 @@ def prepare_layer(layer, code_multiplier, group):
 def experts(b, layer, ids, topk_weights, limit):
     from ixformer.inference.functions import moe_group_gemm_swiglu_quant
 
-    workspace = b.compute.allocate(b.out.device)
-    fc1, act, act_scale = (
-        workspace.get("fc1"),
-        workspace.get("act"),
-        workspace.get("act_scale"),
-    )
     scale1, scale2 = layer._ixmm_ll_scales
     stream = torch.cuda.current_stream().cuda_stream
     _call(
@@ -306,24 +293,24 @@ def experts(b, layer, ids, topk_weights, limit):
         b.recv_scale,
         scale1,
         b.hot,
-        fc1,
+        b.fc1,
         None,
         0,
         1.0,
         stream,
     )
     moe_group_gemm_swiglu_quant(
-        fc1,
-        i8_output=act,
-        output_scales=act_scale,
+        b.fc1,
+        i8_output=b.act,
+        output_scales=b.act_scale,
         limit=limit,
         group_layout=b.hot,
         backend="ixformer_native",
     )
     _call(
         b.ops.combine,
-        act,
-        act_scale,
+        b.act,
+        b.act_scale,
         layer.w2_weight,
         scale2,
         b.natural,

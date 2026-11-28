@@ -53,6 +53,7 @@ from vllm_iluvatar.model_executor.kernels.linear.scaled_mm.ilu_fp8_block_scaled_
 from vllm_iluvatar.model_executor.layers.fused_moe.ilu_fused_moe_ep import (
     _DECODE_EP_BACKEND,
     IluFusedMoEEP,
+    decode_graph_token_capacities,
 )
 from vllm_iluvatar.models.deepseek_v4.fp8_model import (
     IluDeepseekV4Fp8ForCausalLM,
@@ -231,9 +232,9 @@ class IluDeepseekV41MoE(nn.Module, IluFusedMoEEP):
         routed_experts = getattr(self.experts, "routed_experts", None)
         if routed_experts is not None:
             routed_experts._ilu_v41_skip_sort_supported = True
-            routed_experts._ilu_ixmm_ll_decode = (
-                tp_size == 1
-                and ilu_envs.VLLM_ILU_DISABLE_DEEPEP
+            routed_experts._ilu_ixmm_ll_token_capacities = ()
+            if (
+                ilu_envs.VLLM_ILU_DISABLE_DEEPEP
                 and (
                     _DECODE_EP_BACKEND == "deepep_low_latency"
                     or (
@@ -243,14 +244,20 @@ class IluDeepseekV41MoE(nn.Module, IluFusedMoEEP):
                     )
                 )
                 and parallel_config.enable_expert_parallel
-                and parallel_config.data_parallel_size == 16
+                and self.experts.moe_config.ep_size == 16
+                and self.experts.moe_config.pcp_size == 1
+                and parallel_config.expert_placement_strategy == "linear"
+                and not parallel_config.use_ubatching
                 and not parallel_config.enable_eplb
                 and config.n_routed_experts == 384
                 and config.num_experts_per_tok == 6
                 and config.hidden_size == 5120
                 and config.moe_intermediate_size == 2304
                 and self.shared_experts is not None
-            )
+            ):
+                routed_experts._ilu_ixmm_ll_token_capacities = (
+                    decode_graph_token_capacities(vllm_config, tp_size)
+                )
         quant = self.experts._quant_method
         quant = getattr(quant, "old_quant_method", quant)
         parallel = self.experts.moe_config.moe_parallel_config

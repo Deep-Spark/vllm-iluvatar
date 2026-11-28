@@ -603,7 +603,7 @@ class IluMxfp4MoEMethod(Mxfp4MoEMethod):
         compute.validate_weights(weights)
         self._runtime_weights, self._compute = weights, compute
         if (
-            getattr(layer, "_ilu_ixmm_ll_decode", False)
+            getattr(layer, "_ilu_ixmm_ll_token_capacities", ())
             and weights.spec.format_id == "ixinfer_w4a8_nn_v2"
         ):
             from vllm.distributed import get_ep_group

@@ -3,6 +3,7 @@
 
 import ctypes as C
 import os
+from bisect import bisect_left
 from types import SimpleNamespace
 
 import torch
@@ -12,7 +13,6 @@ from vllm.logger import init_logger
 from vllm_iluvatar import envs
 
 logger = init_logger(__name__)
-TOKENS = (6, 12, 18)
 EXPERTS, RANKS, HIDDEN, INTERMEDIATE, TOPK = 24, 16, 5120, 2304, 6
 
 # Exact exported LP64 C++ signatures from the IXMM communication/GEMM headers.
@@ -96,7 +96,7 @@ def _workspace_size(function, *args):
 class IxmmLL:
     """EP-group-owned communication buffers retain their addresses across graph replays."""
 
-    def __init__(self, path):
+    def __init__(self, path, capacities):
         if not path:
             raise ValueError("VLLM_ILU_IXMM_LL_LIBRARY is unset")
         self.lib = C.CDLL(path, mode=os.RTLD_LOCAL | os.RTLD_DEEPBIND)
@@ -111,8 +111,9 @@ class IxmmLL:
             op.argtypes = argtypes
             op.restype = C.c_int
             setattr(self.ops, name, op)
-        self.sizes = [
-            (
+        self.capacities = capacities
+        self.sizes = {
+            tokens: (
                 _workspace_size(
                     self.ops.dispatch_size, tokens, HIDDEN, RANKS, EXPERTS, TOPK
                 ),
@@ -124,9 +125,15 @@ class IxmmLL:
                     TOPK,
                 ),
             )
-            for tokens in TOKENS
-        ]
+            for tokens in capacities
+        }
         self.buffers = {}
+
+    def capacity_for(self, local_tokens):
+        index = bisect_left(self.capacities, local_tokens)
+        if local_tokens > 0 and index < len(self.capacities):
+            return self.capacities[index]
+        return None
 
     def initialize(self, device, group):
         uid = C.create_string_buffer(self.uid_size)
@@ -148,9 +155,17 @@ class IxmmLL:
             return False
         uid.raw = raw
         _call(self.ops.init_shmem, rank, group.world_size, uid, self.uid_size)
-        for tokens, (dispatch_size, combine_size) in zip(
-            TOKENS, self.sizes, strict=True
-        ):
+        # Decode graphs run serially on this group. Scratch can overlap across
+        # shapes; dispatch/combine signal words must remain private to each shape.
+        max_rows = EXPERTS * RANKS * max(self.sizes)
+        fc1 = torch.empty(
+            (max_rows, 2 * INTERMEDIATE), dtype=torch.bfloat16, device=device
+        )
+        act = torch.empty((max_rows, INTERMEDIATE), dtype=torch.int8, device=device)
+        act_scale = torch.empty(max_rows, dtype=torch.float32, device=device)
+        recv = torch.empty((max_rows, HIDDEN), dtype=torch.int8, device=device)
+        recv_scale = torch.empty(max_rows, dtype=torch.float32, device=device)
+        for tokens, (dispatch_size, combine_size) in self.sizes.items():
             rows = EXPERTS * RANKS * tokens
             size = dispatch_size + combine_size + 8192
             ptr = C.c_void_p()
@@ -182,14 +197,14 @@ class IxmmLL:
                 combine=combine,
                 rank=rank,
                 scale=empty((tokens,), torch.float32),
-                recv=empty((rows, HIDDEN), torch.int8),
-                recv_scale=empty((rows,), torch.float32),
+                recv=recv[:rows],
+                recv_scale=recv_scale[:rows],
                 natural=empty((EXPERTS, 3), torch.int32),
                 hot=empty((EXPERTS, 3), torch.int32),
                 routes=torch.full((rows,), -1, dtype=torch.int32, device=device),
-                fc1=empty((rows, 2 * INTERMEDIATE), torch.bfloat16),
-                act=empty((rows, INTERMEDIATE), torch.int8),
-                act_scale=empty((rows,), torch.float32),
+                fc1=fc1[:rows],
+                act=act[:rows],
+                act_scale=act_scale[:rows],
                 out=empty((tokens, HIDDEN), torch.bfloat16),
             )
         torch.cuda.synchronize()
@@ -219,7 +234,7 @@ class IxmmLL:
         )
 
 
-def prepare(device, group):
+def prepare(device, group, capacities):
     # Cache both outcomes on the EP group. No library loads, object collectives
     # or host allocations occur inside CUDA graph capture or replay.
     if hasattr(group, "_ilu_v41_ixmm_ll"):
@@ -230,7 +245,7 @@ def prepare(device, group):
     contract = None
     if enabled:
         try:
-            runtime = IxmmLL(envs.VLLM_ILU_IXMM_LL_LIBRARY)
+            runtime = IxmmLL(envs.VLLM_ILU_IXMM_LL_LIBRARY, capacities)
             contract = (runtime.uid_size, runtime.sizes)
         except (OSError, AttributeError, ValueError, RuntimeError) as exc:
             reason = str(exc)
@@ -265,7 +280,9 @@ def prepare(device, group):
 
 
 def prepare_layer(layer, code_multiplier, group):
-    runtime = prepare(layer.w13_weight.device, group)
+    runtime = prepare(
+        layer.w13_weight.device, group, layer._ilu_ixmm_ll_token_capacities
+    )
     if runtime is None:
         return
     if tuple(layer.w13_weight.shape) != (EXPERTS, HIDDEN, INTERMEDIATE):
@@ -323,3 +340,47 @@ def experts(b, layer, ids, topk_weights, limit):
         b.combine,
     )
     return b.out
+
+
+def forward(
+    runtime,
+    capacity,
+    hidden,
+    ids,
+    weights,
+    layer,
+    shared_layer,
+    shared_input,
+    routed_scale,
+    tp_chunk_sizes,
+    tp_group,
+):
+    """Overlap shared compute with IXMM transit, then join the two TP results."""
+    ids = ids.to(torch.int32).contiguous()
+    weights = weights.float().contiguous()
+    padding = capacity - hidden.shape[0]
+    if padding:
+        # All PEs use identical IXMM strides. Inactive rows have no route.
+        hidden = torch.nn.functional.pad(hidden, (0, 0, 0, padding))
+        ids = torch.nn.functional.pad(ids, (0, 0, 0, padding), value=-1)
+        weights = torch.nn.functional.pad(weights, (0, 0, 0, padding))
+
+    stream = torch.cuda.current_stream().cuda_stream
+    buffers = runtime.dispatch_send(hidden, ids, stream)
+    shared = shared_layer(shared_input)
+    runtime.dispatch_recv(buffers, stream)
+    routed = experts(buffers, layer, ids, weights, layer.swiglu_limit)
+    if routed_scale != 1.0:
+        routed.mul_(routed_scale)
+    rows = max(tp_chunk_sizes) if tp_chunk_sizes is not None else shared.shape[0]
+    routed = routed[:rows]
+    if tp_group.world_size > 1:
+        if tp_chunk_sizes is not None:
+            routed = tp_group.all_gather(routed, dim=0)
+            if sum(tp_chunk_sizes) != routed.shape[0]:
+                shards = routed.split(rows)
+                routed = torch.cat(
+                    [shard[:n] for shard, n in zip(shards, tp_chunk_sizes, strict=True)]
+                )
+        shared = tp_group.all_reduce(shared)
+    return shared + routed

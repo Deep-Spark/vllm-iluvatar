@@ -931,9 +931,10 @@ class IluFusedMoEEP:
                 if shared_gate_up_input is None
                 else shared_gate_up_input
             )
+            ixmm_ll = getattr(routed_experts, "_ilu_ixmm_ll", None)
             if (
-                hasattr(routed_experts, "_ixmm_ll_scales")
-                and orig_num_tokens in (6, 12, 18)
+                ixmm_ll is not None
+                and orig_num_tokens in ixmm_ll.buffers
                 and not apply_router_weight_on_input
                 and pre_xform_trunc_size is None
                 and torch.cuda.is_current_stream_capturing()
@@ -943,11 +944,14 @@ class IluFusedMoEEP:
 
                 stream = current_stream().cuda_stream
                 ids = topk_ids.to(torch.int32).contiguous()
-                buffers = ixmm_ll_decode.dispatch_send(hidden_states, ids, stream)
+                buffers = ixmm_ll.dispatch_send(hidden_states, ids, stream)
                 shared_output = runner.shared_experts._layer(shared_layer_input)
-                ixmm_ll_decode.dispatch_recv(buffers, stream)
+                ixmm_ll.dispatch_recv(buffers, stream)
                 output = ixmm_ll_decode.experts(
-                    buffers, routed_experts, ids, topk_weights.float().contiguous(),
+                    buffers,
+                    routed_experts,
+                    ids,
+                    topk_weights.float().contiguous(),
                     routed_experts.swiglu_limit,
                 )
                 scale = float(getattr(fused_experts, "runner_scaling_factor", 1.0))

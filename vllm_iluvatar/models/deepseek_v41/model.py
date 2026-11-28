@@ -232,8 +232,16 @@ class IluDeepseekV41MoE(nn.Module, IluFusedMoEEP):
         if routed_experts is not None:
             routed_experts._ilu_v41_skip_sort_supported = True
             routed_experts._ilu_ixmm_ll_decode = (
-                ilu_envs.VLLM_ILU_V41_IXMM_LL_DECODE
-                and tp_size == 1
+                tp_size == 1
+                and ilu_envs.VLLM_ILU_DISABLE_DEEPEP
+                and (
+                    _DECODE_EP_BACKEND == "deepep_low_latency"
+                    or (
+                        _DECODE_EP_BACKEND is None
+                        and self.experts.moe_config.moe_parallel_config.all2all_backend
+                        == "deepep_low_latency"
+                    )
+                )
                 and parallel_config.enable_expert_parallel
                 and parallel_config.data_parallel_size == 16
                 and not parallel_config.enable_eplb

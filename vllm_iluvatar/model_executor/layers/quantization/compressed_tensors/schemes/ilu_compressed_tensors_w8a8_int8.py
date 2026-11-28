@@ -624,7 +624,7 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
                 and i_s is None
                 and i_zp is None
             ):
-                # WO-B and fused Q-A/KV SME paths load 16 rows at a time. Reserve
+                # WO-B and fused Q-A/KV kernels load 16 rows at a time. Reserve
                 # the full tail tile in storage while keeping logical M intact.
                 rows = x.shape[0]
                 padded_rows = (rows + 15) // 16 * 16

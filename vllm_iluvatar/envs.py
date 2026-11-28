@@ -261,6 +261,7 @@ if TYPE_CHECKING:
     VLLM_ILU_GLM5_FP8_ATTN: bool = False
     VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP: bool = False
     VLLM_ILU_MOE_AG_SHARED_OVERLAP: bool = False
+    VLLM_ILU_IXMM_LL_LIBRARY: str
     VLLM_ILU_V41_IXMM_LL_DECODE: bool = False
     VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP: bool = False
     VLLM_ILU_V41_AGRS_TP1_RS: bool = False
@@ -745,6 +746,9 @@ _ILU_CANONICAL_ONLY_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP": _bool_reader(
         "VLLM_ILU_GLM_LL_SHARED_DISPATCH_OVERLAP", "0"
     ),
+    "VLLM_ILU_IXMM_LL_LIBRARY": lambda: os.environ.get(
+        "VLLM_ILU_IXMM_LL_LIBRARY", ""
+    ).strip(),
     "VLLM_ILU_V41_IXMM_LL_DECODE": _bool_reader("VLLM_ILU_V41_IXMM_LL_DECODE", "0"),
     "VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP": _bool_reader(
         "VLLM_ILU_V41_LL_SHARED_DISPATCH_OVERLAP", "0"

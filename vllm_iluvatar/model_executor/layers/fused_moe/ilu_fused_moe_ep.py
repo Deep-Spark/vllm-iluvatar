@@ -30,7 +30,7 @@ from types import MethodType
 import ixformer.distributed as ixfd
 import torch
 from vllm import envs
-from vllm.config import get_current_vllm_config_or_none
+from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config_or_none
 from vllm.distributed import (
     get_dp_group,
     get_ep_group,
@@ -86,6 +86,34 @@ def _decode_max_tokens_per_rank_from_config(vllm_config) -> int:
             getattr(speculative_config, "num_speculative_tokens", 0) or 0
         )
     return max_num_seqs * (1 + num_spec_tokens)
+
+
+def decode_graph_token_capacities(config: VllmConfig, tp_size: int) -> tuple[int, ...]:
+    """Symmetric send capacity per EP rank for each uniform decode graph."""
+    compilation = config.compilation_config
+    if (
+        config.model_config.enforce_eager
+        or compilation.cudagraph_mode.decode_mode() == CUDAGraphMode.NONE
+    ):
+        return ()
+    sizes = compilation.cudagraph_capture_sizes or ()
+    limit = _decode_max_tokens_per_rank_from_config(config)
+    query_len = 1 + config.num_speculative_tokens
+    shards = tp_size if VLLM_ILU_DEEPEP_USE_SCATTER or VLLM_ILU_LL_FUSED_AG_AR else 1
+    if compilation.cudagraph_mode.separate_routine():
+        # MRV2 rounds each configured key up to a whole decode request.
+        # Shorter/varlen graphs can use the next larger symmetric capacity.
+        upper = min(limit, compilation.max_cudagraph_capture_size or limit)
+        sizes = [
+            min(((n + query_len - 1) // query_len) * query_len, upper)
+            for n in sizes
+            if 0 < n <= upper
+        ]
+    else:
+        # A mixed graph may round the largest decode batch up to the next key.
+        upper = min((n for n in sizes if n >= limit), default=limit)
+        sizes = [n for n in sizes if 0 < n <= upper]
+    return tuple(sorted({(n + shards - 1) // shards for n in sizes}))
 
 
 def _decode_ll_max_tokens_per_rank() -> int:
@@ -931,6 +959,35 @@ class IluFusedMoEEP:
                 if shared_gate_up_input is None
                 else shared_gate_up_input
             )
+            ixmm_ll = getattr(routed_experts, "_ilu_ixmm_ll", None)
+            local_tokens = (
+                max_tp_chunk_size if tp_chunk_sizes is not None else orig_num_tokens
+            )
+            capacity = (
+                ixmm_ll.capacity_for(local_tokens) if ixmm_ll is not None else None
+            )
+            if (
+                capacity is not None
+                and not apply_router_weight_on_input
+                and pre_xform_trunc_size is None
+                and torch.cuda.is_current_stream_capturing()
+                and self._is_all_ranks_decode_only()
+            ):
+                from vllm_iluvatar.model_executor.layers.fused_moe import ixmm_ll_decode
+
+                return ixmm_ll_decode.forward(
+                    ixmm_ll,
+                    capacity,
+                    hidden_states,
+                    topk_ids,
+                    topk_weights,
+                    routed_experts,
+                    runner.shared_experts._layer,
+                    shared_layer_input,
+                    float(getattr(fused_experts, "runner_scaling_factor", 1.0)),
+                    tp_chunk_sizes,
+                    get_tp_group(),
+                )
             if (
                 getattr(self, "_ll_shared_dispatch_overlap_enabled", False)
                 and orig_num_tokens > 0

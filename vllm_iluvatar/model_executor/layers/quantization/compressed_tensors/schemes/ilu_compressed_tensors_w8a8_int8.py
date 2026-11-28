@@ -614,9 +614,32 @@ class IluCompressedTensorsW8A8Int8(CompressedTensorsScheme):
             x_zp = None
         else:
             out_dtype = x.dtype
-            x_q, x_s, x_zp = ops.scaled_int8_quant(
-                x.contiguous(), i_s, i_zp, symmetric=symmetric
-            )
+            if (
+                (self.gemm_info.n, self.gemm_info.k) in ((5120, 8192), (1792, 5120))
+                and x.ndim == 2
+                and 0 < x.shape[0] <= 32
+                and x.shape[0] % 16 != 0
+                and x.shape[1] == self.gemm_info.k
+                and symmetric
+                and i_s is None
+                and i_zp is None
+            ):
+                # WO-B and fused Q-A/KV kernels load 16 rows at a time. Reserve
+                # the full tail tile in storage while keeping logical M intact.
+                rows = x.shape[0]
+                padded_rows = (rows + 15) // 16 * 16
+                x_q = torch.empty(
+                    (padded_rows, self.gemm_info.k), device=x.device, dtype=torch.int8
+                )[:rows]
+                x_s = torch.empty(
+                    (padded_rows, 1), device=x.device, dtype=torch.float32
+                )[:rows]
+                ixf_ops.dynamic_scaled_int8_quant(x_q, x.contiguous(), x_s)
+                x_zp = None
+            else:
+                x_q, x_s, x_zp = ops.scaled_int8_quant(
+                    x.contiguous(), i_s, i_zp, symmetric=symmetric
+                )
 
         if x_zp is not None:
             # Currently, static is always per-tensor and dynamic is per-token
